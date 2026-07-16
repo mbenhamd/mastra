@@ -50,6 +50,7 @@ import {
 } from '@mastra/core/storage';
 import type {
   AcquireSessionLeaseInput,
+  AgentSignalDispatchState,
   AgentSignalResultEvidence,
   AgentSignalResultStatus,
   AppendWorkspaceActionJournalEntryResult,
@@ -125,6 +126,10 @@ import type {
   ThreadDeleteFenceLease,
   WithThreadDeleteFenceInput,
   WorkspaceActionJournalEntry,
+  CompareAndSwapSignalDispatchInput,
+  CompareAndSwapSignalDispatchResult,
+  CompareAndSwapSignalTerminalInput,
+  CompareAndSwapSignalTerminalResult,
   WriteMessageResultEvidenceResult,
 } from '@mastra/core/storage';
 import { parseSqlIdentifier } from '@mastra/core/utils';
@@ -1972,7 +1977,22 @@ export class HarnessPG extends HarnessStorage {
             namespacedRecord.admissionId ?? namespacedRecord.signalId,
           );
         }
+        if (
+          current.operationKind !== undefined &&
+          namespacedRecord.operationKind !== undefined &&
+          current.operationKind !== namespacedRecord.operationKind
+        ) {
+          throw new HarnessStorageAdmissionConflictError(
+            namespacedRecord.sessionId,
+            'signal',
+            namespacedRecord.admissionId ?? namespacedRecord.signalId,
+          );
+        }
         if (isTerminalMessageEvidence(current)) {
+          await tx.commit();
+          return { created: false, applied: false, evidence: current };
+        }
+        if (isDispatchFencedAdmission(current)) {
           await tx.commit();
           return { created: false, applied: false, evidence: current };
         }
@@ -1980,23 +2000,37 @@ export class HarnessPG extends HarnessStorage {
           ...namespacedRecord,
           modeId: namespacedRecord.modeId ?? current.modeId,
           modelId: namespacedRecord.modelId ?? current.modelId,
+          operationKind: namespacedRecord.operationKind ?? current.operationKind,
+          dispatch: namespacedRecord.dispatch ?? current.dispatch,
           createdAt: current.createdAt,
         };
-        await tx.execute({
+        const update = await tx.execute({
           sql: `UPDATE ${TABLE_HARNESS_MESSAGE_RESULTS}
-                SET run_id = ?, mode_id = ?, model_id = ?, status = ?, result = ?, error = ?, updated_at = ?
-                WHERE id = ?`,
+                SET run_id = ?, mode_id = ?, model_id = ?, operation_kind = ?, status = ?, dispatch = ?, result = ?, error = ?, updated_at = ?
+                WHERE id = ? AND status = 'pending'
+                  AND operation_kind IS NOT DISTINCT FROM ?
+                  AND dispatch IS NOT DISTINCT FROM CAST(? AS jsonb)
+                  AND run_id IS NOT DISTINCT FROM ?`,
           args: [
             namespacedRecord.runId ?? null,
             updated.modeId ?? null,
             updated.modelId ?? null,
+            updated.operationKind ?? null,
             namespacedRecord.status,
+            updated.dispatch === undefined ? null : JSON.stringify(updated.dispatch),
             'result' in namespacedRecord ? JSON.stringify(namespacedRecord.result) : null,
             'error' in namespacedRecord ? JSON.stringify(namespacedRecord.error) : null,
             namespacedRecord.updatedAt,
             id,
+            current.operationKind ?? null,
+            current.dispatch === undefined ? null : JSON.stringify(current.dispatch),
+            current.runId ?? null,
           ],
         });
+        if (update.rowsAffected === 0) {
+          await tx.commit();
+          return { created: false, applied: false, evidence: current };
+        }
         await tx.commit();
         return { created: false, applied: true, evidence: updated };
       } else {
@@ -2004,8 +2038,8 @@ export class HarnessPG extends HarnessStorage {
         await tx.execute({
           sql: `INSERT INTO ${TABLE_HARNESS_MESSAGE_RESULTS}
                 (id, harness_name, session_id, resource_id, thread_id, signal_id, run_id, mode_id, model_id,
-                 admission_id, admission_hash, status, result, error, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                 admission_id, admission_hash, operation_kind, status, dispatch, result, error, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           args: [
             id,
             namespacedRecord.harnessName,
@@ -2018,7 +2052,9 @@ export class HarnessPG extends HarnessStorage {
             namespacedRecord.modelId ?? null,
             namespacedRecord.admissionId ?? null,
             namespacedRecord.admissionHash ?? null,
+            namespacedRecord.operationKind ?? null,
             namespacedRecord.status,
+            namespacedRecord.dispatch === undefined ? null : JSON.stringify(namespacedRecord.dispatch),
             'result' in namespacedRecord ? JSON.stringify(namespacedRecord.result) : null,
             'error' in namespacedRecord ? JSON.stringify(namespacedRecord.error) : null,
             namespacedRecord.createdAt,
@@ -2042,6 +2078,139 @@ export class HarnessPG extends HarnessStorage {
         );
       }
       throw err;
+    }
+  }
+
+  async compareAndSwapSignalDispatch(
+    input: CompareAndSwapSignalDispatchInput,
+  ): Promise<CompareAndSwapSignalDispatchResult> {
+    await this.#ensureMessageResultsTable();
+    const harnessName = this.#resolveHarnessName(input.harnessName);
+    const id = messageEvidenceId({ harnessName, sessionId: input.sessionId, signalId: input.signalId });
+    const tx = await this.#client.transaction('write');
+    try {
+      const selected = await tx.execute({
+        sql: `SELECT * FROM ${TABLE_HARNESS_MESSAGE_RESULTS} WHERE id = ? LIMIT 1 FOR UPDATE`,
+        args: [id],
+      });
+      const row = selected.rows[0];
+      if (!row) {
+        throw new HarnessStorageAdmissionConflictError(input.sessionId, 'signal', input.admissionId);
+      }
+      const current = rowToMessageResultEvidence(row as Record<string, unknown>);
+      if (
+        current.resourceId !== input.resourceId ||
+        current.threadId !== input.threadId ||
+        current.admissionId !== input.admissionId ||
+        current.admissionHash !== input.admissionHash
+      ) {
+        throw new HarnessStorageAdmissionConflictError(input.sessionId, 'signal', input.admissionId);
+      }
+      if (!isSignalAdmissionEvidence(current)) {
+        throw new HarnessStorageAdmissionConflictError(input.sessionId, 'signal', input.admissionId);
+      }
+      if (isTerminalMessageEvidence(current) || !signalDispatchMatches(current, input.expected)) {
+        await tx.commit();
+        return { applied: false, evidence: current };
+      }
+      const evidence: AgentSignalResultEvidence = {
+        ...(current as Extract<AgentSignalResultEvidence, { status: 'pending' }>),
+        operationKind: 'signal',
+        dispatch: input.next,
+        ...(input.next.state === 'reserved' ? { runId: undefined } : { runId: input.next.runId }),
+        updatedAt: input.updatedAt,
+      };
+      await tx.execute({
+        sql: `UPDATE ${TABLE_HARNESS_MESSAGE_RESULTS}
+              SET run_id = ?, operation_kind = 'signal', dispatch = ?, updated_at = ?
+              WHERE id = ? AND operation_kind IS NOT DISTINCT FROM ?`,
+        args: [
+          input.next.state === 'reserved' ? null : input.next.runId,
+          JSON.stringify(input.next),
+          input.updatedAt,
+          id,
+          current.operationKind ?? null,
+        ],
+      });
+      await tx.commit();
+      return { applied: true, evidence };
+    } catch (error) {
+      if (!tx.closed) await tx.rollback();
+      throw error;
+    }
+  }
+
+  async compareAndSwapSignalTerminal(
+    input: CompareAndSwapSignalTerminalInput,
+  ): Promise<CompareAndSwapSignalTerminalResult> {
+    await this.#ensureMessageResultsTable();
+    const harnessName = this.#resolveHarnessName(input.harnessName);
+    const id = messageEvidenceId({ harnessName, sessionId: input.sessionId, signalId: input.signalId });
+    const tx = await this.#client.transaction('write');
+    try {
+      const selected = await tx.execute({
+        sql: `SELECT * FROM ${TABLE_HARNESS_MESSAGE_RESULTS} WHERE id = ? LIMIT 1 FOR UPDATE`,
+        args: [id],
+      });
+      const row = selected.rows[0];
+      if (!row) {
+        throw new HarnessStorageAdmissionConflictError(input.sessionId, 'signal', input.admissionId);
+      }
+      const current = rowToMessageResultEvidence(row as Record<string, unknown>);
+      if (
+        current.resourceId !== input.resourceId ||
+        current.threadId !== input.threadId ||
+        current.admissionId !== input.admissionId ||
+        current.admissionHash !== input.admissionHash
+      ) {
+        throw new HarnessStorageAdmissionConflictError(input.sessionId, 'signal', input.admissionId);
+      }
+      if (!isSignalAdmissionEvidence(current)) {
+        throw new HarnessStorageAdmissionConflictError(input.sessionId, 'signal', input.admissionId);
+      }
+      if (isTerminalMessageEvidence(current) || !signalDispatchMatches(current, input.expected)) {
+        await tx.commit();
+        return { applied: false, evidence: current };
+      }
+      if (
+        input.expected.state === 'reserved' ||
+        (input.terminal.runId !== undefined && input.terminal.runId !== input.expected.runId)
+      ) {
+        throw new HarnessStorageAdmissionConflictError(input.sessionId, 'signal', input.admissionId);
+      }
+      const terminal = input.terminal;
+      await tx.execute({
+        sql: `UPDATE ${TABLE_HARNESS_MESSAGE_RESULTS}
+              SET run_id = ?, mode_id = ?, model_id = ?, operation_kind = 'signal', status = ?, result = ?, error = ?, updated_at = ?
+              WHERE id = ? AND operation_kind IS NOT DISTINCT FROM ?`,
+        args: [
+          input.expected.runId,
+          terminal.modeId ?? current.modeId ?? null,
+          terminal.modelId ?? current.modelId ?? null,
+          terminal.status,
+          terminal.status === 'completed' ? JSON.stringify(terminal.result) : null,
+          terminal.status === 'failed' ? JSON.stringify(terminal.error) : null,
+          input.updatedAt,
+          id,
+          current.operationKind ?? null,
+        ],
+      });
+      const evidence: AgentSignalResultEvidence = {
+        ...current,
+        ...terminal,
+        operationKind: 'signal',
+        runId: input.expected.runId,
+        modeId: terminal.modeId ?? current.modeId,
+        modelId: terminal.modelId ?? current.modelId,
+        dispatch: input.expected,
+        createdAt: current.createdAt,
+        updatedAt: input.updatedAt,
+      };
+      await tx.commit();
+      return { applied: true, evidence };
+    } catch (error) {
+      if (!tx.closed) await tx.rollback();
+      throw error;
     }
   }
 
@@ -5095,7 +5264,7 @@ export class HarnessPG extends HarnessStorage {
     await this.#db.alterTable({
       tableName: TABLE_HARNESS_MESSAGE_RESULTS,
       schema: TABLE_SCHEMAS[TABLE_HARNESS_MESSAGE_RESULTS],
-      ifNotExists: ['mode_id', 'model_id'],
+      ifNotExists: ['mode_id', 'model_id', 'operation_kind', 'dispatch'],
     });
   }
 
@@ -6474,7 +6643,10 @@ function parseJson(value: unknown): any {
     try {
       return JSON.parse(value);
     } catch {
-      return undefined;
+      // node-postgres already decodes JSONB scalar strings, so a value such
+      // as `"winner"` reaches us as the bare string `winner`. Preserve that
+      // decoded value instead of treating it as malformed JSON text.
+      return value;
     }
   }
   return value;
@@ -6849,6 +7021,10 @@ function rowToMessageResultEvidence(row: Record<string, unknown>): AgentSignalRe
     ...(row.model_id == null ? {} : { modelId: String(row.model_id) }),
     ...(row.admission_id == null ? {} : { admissionId: String(row.admission_id) }),
     ...(row.admission_hash == null ? {} : { admissionHash: String(row.admission_hash) }),
+    ...(row.operation_kind == null
+      ? {}
+      : { operationKind: String(row.operation_kind) as AgentSignalResultEvidence['operationKind'] }),
+    ...(row.dispatch == null ? {} : { dispatch: parseJson(row.dispatch) as AgentSignalDispatchState }),
     createdAt: Number(row.created_at),
     updatedAt: Number(row.updated_at),
   };
@@ -6884,6 +7060,42 @@ function tombstoneId(record: OperationAdmissionTombstone): string {
 
 function messageEvidenceId(record: Pick<AgentSignalResultEvidence, 'harnessName' | 'sessionId' | 'signalId'>): string {
   return stableHarnessRowId([record.harnessName, record.sessionId, record.signalId]);
+}
+
+function normalizedSignalDispatch(record: AgentSignalResultEvidence): AgentSignalDispatchState | undefined {
+  if (record.dispatch !== undefined) return record.dispatch;
+  return record.status === 'pending' && record.runId === undefined ? { state: 'reserved' } : undefined;
+}
+
+function signalDispatchMatches(record: AgentSignalResultEvidence, expected: AgentSignalDispatchState): boolean {
+  // This branch is reached only after `isSignalAdmissionEvidence` proved an
+  // explicit or narrowly migratable signal row. `runId` matches state; it
+  // never classifies the operation as a signal.
+  if (record.dispatch === undefined && record.status === 'pending' && record.runId !== undefined) {
+    return expected.state === 'accepted' && expected.runId === record.runId;
+  }
+  return sameSignalDispatch(normalizedSignalDispatch(record), expected);
+}
+
+function sameSignalDispatch(a: AgentSignalDispatchState | undefined, b: AgentSignalDispatchState | undefined): boolean {
+  if (a == null || b == null) return a == null && b == null;
+  if (a.state !== b.state) return false;
+  if (a.state === 'reserved' || b.state === 'reserved') return a.state === b.state;
+  if (
+    !sameOptionalDispatchField(a.attemptId, b.attemptId) ||
+    !sameOptionalDispatchField(a.delivery, b.delivery) ||
+    !sameOptionalDispatchField(a.runId, b.runId)
+  ) {
+    return false;
+  }
+  if (a.state === 'dispatching' && b.state === 'dispatching') {
+    return sameOptionalDispatchField(a.claimExpiresAt, b.claimExpiresAt);
+  }
+  return a.state === 'accepted' && b.state === 'accepted' && sameOptionalDispatchField(a.acceptedAt, b.acceptedAt);
+}
+
+function sameOptionalDispatchField(a: unknown, b: unknown): boolean {
+  return (a ?? undefined) === (b ?? undefined);
 }
 
 function stableHarnessRowId(parts: unknown[]): string {
@@ -6929,6 +7141,15 @@ function sameMessageEvidenceIdentity(a: AgentSignalResultEvidence, b: AgentSigna
 
 function isTerminalMessageEvidence(record: AgentSignalResultEvidence): boolean {
   return record.status === 'completed' || record.status === 'failed';
+}
+
+function isSignalAdmissionEvidence(record: AgentSignalResultEvidence): boolean {
+  if (record.operationKind !== undefined) return record.operationKind === 'signal';
+  return record.dispatch !== undefined || record.signalId.startsWith('harness-channel-signal-');
+}
+
+function isDispatchFencedAdmission(record: AgentSignalResultEvidence): boolean {
+  return record.admissionId !== undefined && record.admissionHash !== undefined && isSignalAdmissionEvidence(record);
 }
 
 function isTerminalQueueReceipt(receipt: QueueAdmissionReceipt): boolean {

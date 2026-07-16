@@ -3,6 +3,7 @@ import type {
   AcquireSessionLeaseInput,
   AgentSignalResultEvidence,
   AgentSignalResultStatus,
+  AgentSignalDispatchState,
   AppendWorkspaceActionJournalEntryResult,
   AttachmentReference,
   AttachmentRecord,
@@ -83,6 +84,59 @@ export interface WriteMessageResultEvidenceResult {
   /** True only when this write changed the durable evidence row. */
   applied: boolean;
   evidence?: AgentSignalResultEvidence;
+}
+
+export interface CompareAndSwapSignalDispatchInput {
+  harnessName?: string;
+  sessionId: string;
+  resourceId: string;
+  threadId: string;
+  signalId: string;
+  admissionId: string;
+  admissionHash: string;
+  expected: AgentSignalDispatchState;
+  next: AgentSignalDispatchState;
+  updatedAt: number;
+}
+
+export interface CompareAndSwapSignalDispatchResult {
+  applied: boolean;
+  evidence: AgentSignalResultEvidence;
+}
+
+export interface CompareAndSwapSignalTerminalInput {
+  harnessName?: string;
+  sessionId: string;
+  resourceId: string;
+  threadId: string;
+  signalId: string;
+  admissionId: string;
+  admissionHash: string;
+  expected: AgentSignalDispatchState;
+  terminal:
+    | {
+        status: 'completed';
+        signalId: string;
+        runId: string;
+        result: unknown;
+        modeId?: string;
+        modelId?: string;
+      }
+    | {
+        status: 'failed';
+        signalId: string;
+        runId?: string;
+        error: { code: string; message: string };
+        modeId?: string;
+        modelId?: string;
+      };
+  updatedAt: number;
+}
+
+export interface CompareAndSwapSignalTerminalResult {
+  applied: boolean;
+  /** The durable winner, whether this writer applied or lost the fence. */
+  evidence: AgentSignalResultEvidence;
 }
 
 /**
@@ -346,6 +400,14 @@ export class HarnessStorageChannelDiagnosticsUnsupportedError extends HarnessSto
   readonly code = 'harness.storage.channel_diagnostics_unsupported' as const;
   constructor() {
     super('HarnessStorage channel diagnostics must be implemented by this storage adapter');
+  }
+}
+
+export class HarnessStorageSignalDispatchUnsupportedError extends HarnessStorageDomainError {
+  readonly name = 'HarnessStorageSignalDispatchUnsupportedError';
+  readonly code = 'harness.storage.signal_dispatch_unsupported' as const;
+  constructor() {
+    super('Harness storage adapter does not support durable signal dispatch fencing');
   }
 }
 
@@ -853,6 +915,27 @@ export abstract class HarnessStorage extends StorageDomain {
   }): Promise<AgentSignalResultStatus | OperationAdmissionTombstone | null>;
 
   abstract writeMessageResultEvidence(record: AgentSignalResultEvidence): Promise<WriteMessageResultEvidenceResult>;
+
+  /**
+   * Atomically compare-and-swap the durable execution owner for an admitted
+   * signal. The base fails closed so older custom adapters remain source
+   * compatible but cannot silently provide unfenced admitted dispatch.
+   */
+  async compareAndSwapSignalDispatch(
+    _input: CompareAndSwapSignalDispatchInput,
+  ): Promise<CompareAndSwapSignalDispatchResult> {
+    throw new HarnessStorageSignalDispatchUnsupportedError();
+  }
+
+  /**
+   * Atomically settle an admitted signal only while the caller still owns the
+   * expected dispatch attempt. The durable winner is returned on a lost CAS.
+   */
+  async compareAndSwapSignalTerminal(
+    _input: CompareAndSwapSignalTerminalInput,
+  ): Promise<CompareAndSwapSignalTerminalResult> {
+    throw new HarnessStorageSignalDispatchUnsupportedError();
+  }
 
   abstract loadQueueResultEvidence(opts: {
     harnessName?: string;

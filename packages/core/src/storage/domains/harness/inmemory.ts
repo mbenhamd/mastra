@@ -27,7 +27,13 @@ import {
   HarnessStorageWakeupClaimConflictError,
   HarnessStorageWakeupTransitionError,
 } from './base';
-import type { WriteMessageResultEvidenceResult } from './base';
+import type {
+  CompareAndSwapSignalDispatchInput,
+  CompareAndSwapSignalDispatchResult,
+  CompareAndSwapSignalTerminalInput,
+  CompareAndSwapSignalTerminalResult,
+  WriteMessageResultEvidenceResult,
+} from './base';
 import {
   applyPlanTaskPatch,
   comparePlanTaskOrder,
@@ -39,6 +45,7 @@ import {
 import type {
   AcquireSessionLeaseInput,
   AgentSignalResultEvidence,
+  AgentSignalDispatchState,
   AgentSignalResultStatus,
   AppendWorkspaceActionJournalEntryResult,
   AttachmentReference,
@@ -860,17 +867,128 @@ export class InMemoryHarness extends HarnessStorage {
         namespacedRecord.admissionId ?? namespacedRecord.signalId,
       );
     }
+    if (
+      existing?.operationKind !== undefined &&
+      namespacedRecord.operationKind !== undefined &&
+      existing.operationKind !== namespacedRecord.operationKind
+    ) {
+      throw new HarnessStorageAdmissionConflictError(
+        namespacedRecord.sessionId,
+        'signal',
+        namespacedRecord.admissionId ?? namespacedRecord.signalId,
+      );
+    }
     if (existing && isTerminalMessageEvidence(existing)) {
+      return { created: false, applied: false, evidence: cloneJson(existing) };
+    }
+    // Once an admitted signal has an explicit durable discriminator or
+    // dispatch fence, only the compare-and-swap dispatch/terminal APIs may
+    // mutate it. Message admissions deliberately remain on this generic path.
+    if (existing && isDispatchFencedAdmission(existing)) {
       return { created: false, applied: false, evidence: cloneJson(existing) };
     }
     const stored = {
       ...namespacedRecord,
+      ...(namespacedRecord.dispatch === undefined && existing?.dispatch !== undefined
+        ? { dispatch: existing.dispatch }
+        : {}),
+      ...(namespacedRecord.operationKind === undefined && existing?.operationKind !== undefined
+        ? { operationKind: existing.operationKind }
+        : {}),
       createdAt: existing?.createdAt ?? namespacedRecord.createdAt,
     };
     this.db.harnessMessageResultEvidence.set(key, cloneJson(stored));
     return existing === undefined
       ? { created: true, applied: true }
       : { created: false, applied: true, evidence: cloneJson(stored) };
+  }
+
+  async compareAndSwapSignalDispatch(
+    input: CompareAndSwapSignalDispatchInput,
+  ): Promise<CompareAndSwapSignalDispatchResult> {
+    const harnessName = resolveHarnessName(input.harnessName, this.harnessName);
+    const key = messageEvidenceKey(harnessName, input.sessionId, input.signalId);
+    const existing = this.db.harnessMessageResultEvidence.get(key);
+    if (
+      !existing ||
+      existing.resourceId !== input.resourceId ||
+      existing.threadId !== input.threadId ||
+      existing.admissionId !== input.admissionId ||
+      existing.admissionHash !== input.admissionHash
+    ) {
+      throw new HarnessStorageAdmissionConflictError(input.sessionId, 'signal', input.admissionId);
+    }
+    if (!isSignalAdmissionEvidence(existing)) {
+      throw new HarnessStorageAdmissionConflictError(input.sessionId, 'signal', input.admissionId);
+    }
+    if (isTerminalMessageEvidence(existing)) {
+      return { applied: false, evidence: cloneJson(existing) };
+    }
+    if (!signalDispatchMatches(existing, input.expected)) {
+      return { applied: false, evidence: cloneJson(existing) };
+    }
+    const pending = existing as Extract<AgentSignalResultEvidence, { status: 'pending' }>;
+    const next: AgentSignalResultEvidence = {
+      ...pending,
+      operationKind: 'signal',
+      dispatch: cloneJson(input.next),
+      ...(input.next.state === 'reserved' ? { runId: undefined } : { runId: input.next.runId }),
+      updatedAt: input.updatedAt,
+    };
+    this.db.harnessMessageResultEvidence.set(key, cloneJson(next));
+    return { applied: true, evidence: cloneJson(next) };
+  }
+
+  async compareAndSwapSignalTerminal(
+    input: CompareAndSwapSignalTerminalInput,
+  ): Promise<CompareAndSwapSignalTerminalResult> {
+    const harnessName = resolveHarnessName(input.harnessName, this.harnessName);
+    const key = messageEvidenceKey(harnessName, input.sessionId, input.signalId);
+    const existing = this.db.harnessMessageResultEvidence.get(key);
+    if (
+      !existing ||
+      existing.resourceId !== input.resourceId ||
+      existing.threadId !== input.threadId ||
+      existing.admissionId !== input.admissionId ||
+      existing.admissionHash !== input.admissionHash
+    ) {
+      throw new HarnessStorageAdmissionConflictError(input.sessionId, 'signal', input.admissionId);
+    }
+    if (!isSignalAdmissionEvidence(existing)) {
+      throw new HarnessStorageAdmissionConflictError(input.sessionId, 'signal', input.admissionId);
+    }
+    if (isTerminalMessageEvidence(existing)) {
+      return { applied: false, evidence: cloneJson(existing) };
+    }
+    if (!signalDispatchMatches(existing, input.expected)) {
+      return { applied: false, evidence: cloneJson(existing) };
+    }
+    if (
+      input.expected.state === 'reserved' ||
+      (input.terminal.runId !== undefined && input.terminal.runId !== input.expected.runId)
+    ) {
+      throw new HarnessStorageAdmissionConflictError(input.sessionId, 'signal', input.admissionId);
+    }
+    const terminal: AgentSignalResultEvidence = {
+      ...existing,
+      ...cloneJson(input.terminal),
+      harnessName,
+      sessionId: input.sessionId,
+      resourceId: input.resourceId,
+      threadId: input.threadId,
+      signalId: input.signalId,
+      runId: input.expected.runId,
+      admissionId: input.admissionId,
+      admissionHash: input.admissionHash,
+      operationKind: 'signal',
+      modeId: input.terminal.modeId ?? existing.modeId,
+      modelId: input.terminal.modelId ?? existing.modelId,
+      dispatch: cloneJson(input.expected),
+      createdAt: existing.createdAt,
+      updatedAt: input.updatedAt,
+    };
+    this.db.harnessMessageResultEvidence.set(key, cloneJson(terminal));
+    return { applied: true, evidence: cloneJson(terminal) };
   }
 
   async loadQueueResultEvidence({
@@ -3294,8 +3412,53 @@ function sameMessageEvidenceIdentity(a: AgentSignalResultEvidence, b: AgentSigna
   );
 }
 
+function normalizedSignalDispatch(record: AgentSignalResultEvidence): AgentSignalDispatchState | undefined {
+  if (record.dispatch !== undefined) return record.dispatch;
+  return record.status === 'pending' && record.runId === undefined ? { state: 'reserved' } : undefined;
+}
+
+function signalDispatchMatches(record: AgentSignalResultEvidence, expected: AgentSignalDispatchState): boolean {
+  if (record.dispatch === undefined && record.status === 'pending' && record.runId !== undefined) {
+    // This branch is reached only after `isSignalAdmissionEvidence` proved an
+    // explicit signal discriminator (or the stable pre-discriminator signal-id
+    // namespace). The run id matches state; it never classifies the operation.
+    return expected.state === 'accepted' && expected.runId === record.runId;
+  }
+  return sameSignalDispatch(normalizedSignalDispatch(record), expected);
+}
+
+function isSignalAdmissionEvidence(record: AgentSignalResultEvidence): boolean {
+  if (record.operationKind !== undefined) return record.operationKind === 'signal';
+  return record.dispatch !== undefined || record.signalId.startsWith('harness-channel-signal-');
+}
+
+function sameSignalDispatch(a: AgentSignalDispatchState | undefined, b: AgentSignalDispatchState | undefined): boolean {
+  if (a == null || b == null) return a == null && b == null;
+  if (a.state !== b.state) return false;
+  if (a.state === 'reserved' || b.state === 'reserved') return a.state === b.state;
+  if (
+    !sameOptionalDispatchField(a.attemptId, b.attemptId) ||
+    !sameOptionalDispatchField(a.delivery, b.delivery) ||
+    !sameOptionalDispatchField(a.runId, b.runId)
+  ) {
+    return false;
+  }
+  if (a.state === 'dispatching' && b.state === 'dispatching') {
+    return sameOptionalDispatchField(a.claimExpiresAt, b.claimExpiresAt);
+  }
+  return a.state === 'accepted' && b.state === 'accepted' && sameOptionalDispatchField(a.acceptedAt, b.acceptedAt);
+}
+
+function sameOptionalDispatchField(a: unknown, b: unknown): boolean {
+  return (a ?? undefined) === (b ?? undefined);
+}
+
 function isTerminalMessageEvidence(record: AgentSignalResultEvidence): boolean {
   return record.status === 'completed' || record.status === 'failed';
+}
+
+function isDispatchFencedAdmission(record: AgentSignalResultEvidence): boolean {
+  return record.admissionId !== undefined && record.admissionHash !== undefined && isSignalAdmissionEvidence(record);
 }
 
 function isTerminalQueueReceipt(receipt: QueueAdmissionReceipt): boolean {

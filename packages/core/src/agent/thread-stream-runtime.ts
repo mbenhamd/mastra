@@ -205,6 +205,13 @@ type PendingContinuation<OUTPUT = unknown> = {
   streamOptions?: AgentExecutionOptions<OUTPUT>;
 };
 
+type CachedCallerSignal = {
+  result: SendAgentSignalResult;
+  /** Harness dispatch attempt that owns a still-pending native acknowledgement. */
+  admissionAttemptId?: string;
+  status: 'pending' | 'accepted' | 'rejected';
+};
+
 type AgentThreadRuntimeState = {
   threadRunsById: Map<string, AgentThreadRunRecord<any>>;
   threadRunsByStreamId: Map<string, AgentThreadRunRecord<any>>;
@@ -232,10 +239,13 @@ type AgentThreadRuntimeState = {
   abortedRunIds: Set<string>;
   abortedRunCleanupTimersByRunId: Map<string, ReturnType<typeof setTimeout>>;
   rejectedRunErrorsByRunId: Map<string, RejectedRunErrorRecord>;
-  acceptedCallerSignals: Map<string, SendAgentSignalResult>;
+  acceptedCallerSignals: Map<string, CachedCallerSignal>;
   callerSignalIdsByRunId: Map<string, Set<string>>;
   /** Bounded stable signal-id admissions retained beyond run termination. */
-  signalAdmissionsByThread: Map<string, Map<string, { payloadKey: string; runId: string; expiresAt: number }>>;
+  signalAdmissionsByThread: Map<
+    string,
+    Map<string, { payloadKey: string; runId: string; expiresAt: number; admissionAttemptId?: string }>
+  >;
   /** One unref'd sweep timer evicts expired admissions across otherwise-idle threads. */
   signalAdmissionCleanupTimer?: ReturnType<typeof setTimeout>;
   /** Process-attempt lease owner tokens keyed by the stable public run id. */
@@ -1295,6 +1305,7 @@ export class AgentThreadStreamRuntime {
     key: string,
     runId: string,
     signal: AgentSignal,
+    options: { admissionAttemptId?: string; allowAttemptSupersede?: boolean } = {},
   ): { disposition: 'accepted' | 'duplicate' | 'conflict'; runId: string } {
     const signalId = signal.id;
     const payloadKey = callerSignalPayloadKey(signal);
@@ -1306,12 +1317,32 @@ export class AgentThreadStreamRuntime {
     }
     const retained = admissions.get(signalId);
     if (retained !== undefined) {
+      if (
+        retained.payloadKey === payloadKey &&
+        options.allowAttemptSupersede === true &&
+        options.admissionAttemptId !== undefined &&
+        retained.admissionAttemptId !== undefined &&
+        retained.admissionAttemptId !== options.admissionAttemptId
+      ) {
+        admissions.set(signalId, {
+          payloadKey,
+          runId,
+          expiresAt: now + SIGNAL_ADMISSION_TOMBSTONE_TTL_MS,
+          admissionAttemptId: options.admissionAttemptId,
+        });
+        return { disposition: 'accepted', runId };
+      }
       return {
         disposition: retained.payloadKey === payloadKey ? 'duplicate' : 'conflict',
         runId: retained.runId,
       };
     }
-    admissions.set(signalId, { payloadKey, runId, expiresAt: now + SIGNAL_ADMISSION_TOMBSTONE_TTL_MS });
+    admissions.set(signalId, {
+      payloadKey,
+      runId,
+      expiresAt: now + SIGNAL_ADMISSION_TOMBSTONE_TTL_MS,
+      ...(options.admissionAttemptId !== undefined ? { admissionAttemptId: options.admissionAttemptId } : {}),
+    });
     while (admissions.size > MAX_SIGNAL_ADMISSION_TOMBSTONES_PER_THREAD) {
       const oldest = admissions.keys().next().value;
       if (oldest === undefined) break;
@@ -3263,6 +3294,14 @@ export class AgentThreadStreamRuntime {
     );
 
     const scopedRunId = target.runId;
+    // Harness durable admission retries retain the public signal/run identity
+    // but acquire a new dispatch attempt after the previous claim expires. A
+    // permanently-pending native acknowledgement from the old attempt must not
+    // pin that retry to the same cached Promise forever. This is intentionally
+    // an AgentThreadStreamRuntime concern: the runtime owns this cache and the
+    // stable signal-id tombstone that preserves same-payload idempotence.
+    const admissionAttemptId = (target as SendAgentSignalOptions<OUTPUT> & { _signalAdmissionAttemptId?: string })
+      ._signalAdmissionAttemptId;
     const signalPayloadKey = callerSignalPayloadKey(signalInput);
     const callerSignalKey =
       callerSignalId !== undefined && signalPayloadKey !== undefined
@@ -3271,8 +3310,18 @@ export class AgentThreadStreamRuntime {
           )
         : undefined;
     if (callerSignalKey) {
-      const accepted = state.acceptedCallerSignals.get(callerSignalKey);
-      if (accepted) return accepted as SendAgentSignalResult<OUTPUT>;
+      const cached = state.acceptedCallerSignals.get(callerSignalKey);
+      if (cached) {
+        const supersedesPendingAttempt =
+          cached.status === 'pending' &&
+          admissionAttemptId !== undefined &&
+          cached.admissionAttemptId !== undefined &&
+          cached.admissionAttemptId !== admissionAttemptId;
+        if (!supersedesPendingAttempt && cached.status !== 'rejected') {
+          return cached.result as SendAgentSignalResult<OUTPUT>;
+        }
+        state.acceptedCallerSignals.delete(callerSignalKey);
+      }
     }
     const acceptSignal = <T extends SendAgentSignalResult<OUTPUT>>(
       result: T,
@@ -3280,7 +3329,20 @@ export class AgentThreadStreamRuntime {
       cache = true,
     ): T => {
       if (callerSignalKey && cache) {
-        state.acceptedCallerSignals.set(callerSignalKey, result as SendAgentSignalResult);
+        const cached: CachedCallerSignal = {
+          result: result as SendAgentSignalResult,
+          admissionAttemptId,
+          status: 'pending',
+        };
+        state.acceptedCallerSignals.set(callerSignalKey, cached);
+        void result.accepted.then(
+          () => {
+            if (state.acceptedCallerSignals.get(callerSignalKey) === cached) cached.status = 'accepted';
+          },
+          () => {
+            if (state.acceptedCallerSignals.get(callerSignalKey) === cached) cached.status = 'rejected';
+          },
+        );
         if (acceptedRunId) {
           const signalIds = state.callerSignalIdsByRunId.get(acceptedRunId) ?? new Set<string>();
           signalIds.add(callerSignalKey);
@@ -3560,7 +3622,10 @@ export class AgentThreadStreamRuntime {
       );
     }
 
-    const idleSignalDisposition = this.#rememberSignalPayloadForRun(state, key, runId, signal);
+    const idleSignalDisposition = this.#rememberSignalPayloadForRun(state, key, runId, signal, {
+      admissionAttemptId,
+      allowAttemptSupersede: true,
+    });
     if (idleSignalDisposition.disposition === 'conflict') {
       throw new Error(`Agent signal id "${signal.id}" was already accepted with a different payload`);
     }

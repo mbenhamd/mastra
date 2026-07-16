@@ -63,6 +63,7 @@ import {
 import type {
   GoalJudgeDecision,
   GoalState,
+  AgentSignalDispatchState,
   AgentSignalResultEvidence,
   AgentSignalResultStatus,
   HarnessAssistantDraft,
@@ -256,7 +257,15 @@ type SignalAdmission = {
   modelId: string;
   identity: SignalAdmissionIdentity;
   createdAt: number;
+  dispatch: AgentSignalDispatchState;
 };
+
+type SignalDispatchingState = Extract<AgentSignalDispatchState, { state: 'dispatching' }>;
+type SignalAcceptedDispatchState = Extract<AgentSignalDispatchState, { state: 'accepted' }>;
+type SignalSettlementAdmission = Pick<
+  SignalAdmission,
+  'admissionId' | 'admissionHash' | 'modeId' | 'modelId' | 'dispatch'
+>;
 
 type Deferred<T> = {
   promise: Promise<T>;
@@ -331,6 +340,10 @@ const ASK_USER_TOOL_NAME = ASK_USER_TOOL_ID;
 const SUBMIT_PLAN_TOOL_NAME = SUBMIT_PLAN_TOOL_ID;
 const MESSAGE_ADMISSION_DURABLE_WAIT_TIMEOUT_MS = 30_000;
 const MESSAGE_ADMISSION_DURABLE_WAIT_INTERVAL_MS = 100;
+const SIGNAL_DISPATCH_CLAIM_TTL_MS = 30_000;
+const SIGNAL_DISPATCH_CLAIM_RENEW_MS = 10_000;
+const SIGNAL_ACCEPTED_RECOVERY_STALE_MS = 30_000;
+const SIGNAL_NATIVE_ACCEPT_TIMEOUT_MS = 30_000;
 const MESSAGE_RESULT_EVIDENCE_BACKGROUND_OBSERVE_TIMEOUT_MS = 5_000;
 const QUEUE_ACCEPTED_RECOVERY_STALE_MS = 30_000;
 const QUEUE_POST_RUN_FINALIZATION_RETRY_MS = 1_000;
@@ -1372,7 +1385,7 @@ export class Session {
   private readonly _messageTokenAccountingReservations = new Map<string, Deferred<void>>();
   private readonly _messageAdmissionStarts = new Map<string, MessageAdmissionStart>();
   /** Serializes terminal evidence + event projection for one admitted signal. */
-  private readonly _signalResultSettlements = new Map<string, Promise<void>>();
+  private readonly _signalResultSettlements = new Map<string, Promise<AgentSignalResultEvidence | undefined>>();
   private _eventPersistenceTail: Promise<void> = Promise.resolve();
   /** HARD latch — unrecoverable durable-log failure (id unparseable, or §S4.1 backlog overflow). */
   private _eventPersistenceError: unknown;
@@ -5902,6 +5915,7 @@ export class Session {
               runId: admissionIdentity.runId,
               modeId: effectiveModeId,
               modelId: effectiveModelId,
+              operationKind: 'message',
               admissionId: opts.admissionId!,
               admissionHash,
             },
@@ -5967,6 +5981,7 @@ export class Session {
                 runId: admissionIdentity.runId,
                 modeId: effectiveModeId,
                 modelId: effectiveModelId,
+                operationKind: 'message',
                 admissionId: opts.admissionId!,
                 admissionHash,
                 error: projectHarnessPublicError(err),
@@ -6018,6 +6033,7 @@ export class Session {
         runId: signal.runId,
         modeId: effectiveModeId,
         modelId: effectiveModelId,
+        operationKind: 'message',
         admissionId: opts.admissionId!,
         admissionHash,
         createdAt: now,
@@ -6039,6 +6055,7 @@ export class Session {
               runId: signal.runId,
               modeId: effectiveModeId,
               modelId: effectiveModelId,
+              operationKind: 'message',
               ...(opts.admissionId !== undefined ? { admissionId: opts.admissionId } : {}),
               ...(admissionHash !== undefined ? { admissionHash } : {}),
             },
@@ -6064,6 +6081,7 @@ export class Session {
             runId: signal.runId,
             modeId: effectiveModeId,
             modelId: effectiveModelId,
+            operationKind: 'message',
             error: projectHarnessPublicError(err),
             admissionId: opts.admissionId!,
             admissionHash: admissionHash!,
@@ -6122,6 +6140,7 @@ export class Session {
                 runId: signal.runId,
                 modeId: effectiveModeId,
                 modelId: effectiveModelId,
+                operationKind: 'message',
                 error: projectHarnessPublicError(err),
                 admissionId: opts.admissionId!,
                 admissionHash: admissionHash!,
@@ -6187,6 +6206,7 @@ export class Session {
                 runId: signal.runId,
                 modeId: effectiveModeId,
                 modelId: effectiveModelId,
+                operationKind: 'message',
                 result: full,
                 admissionId: opts.admissionId!,
                 admissionHash: admissionHash!,
@@ -6218,6 +6238,7 @@ export class Session {
                 runId: signal.runId,
                 modeId: effectiveModeId,
                 modelId: effectiveModelId,
+                operationKind: 'message',
                 error: projectHarnessPublicError(err),
                 admissionId: opts.admissionId!,
                 admissionHash: admissionHash!,
@@ -6284,6 +6305,7 @@ export class Session {
                 runId: signal.runId,
                 modeId: effectiveModeId,
                 modelId: effectiveModelId,
+                operationKind: 'message',
                 result: full,
                 admissionId: opts.admissionId!,
                 admissionHash: admissionHash!,
@@ -6324,6 +6346,7 @@ export class Session {
               runId: signal.runId,
               modeId: effectiveModeId,
               modelId: effectiveModelId,
+              operationKind: 'message',
               error: projectHarnessPublicError(err),
               admissionId: opts.admissionId!,
               admissionHash: admissionHash!,
@@ -6541,6 +6564,7 @@ export class Session {
                   runId,
                   modeId: duplicateModeId,
                   modelId: duplicateModelId,
+                  operationKind: 'message',
                   result: cached.full,
                   admissionId: evidence.admissionId,
                   admissionHash: evidence.admissionHash,
@@ -6607,6 +6631,7 @@ export class Session {
                 runId,
                 modeId: duplicateModeId,
                 modelId: duplicateModelId,
+                operationKind: 'message',
                 result: cached.full,
                 admissionId: evidence.admissionId,
                 admissionHash: evidence.admissionHash,
@@ -6752,6 +6777,11 @@ export class Session {
     applied: boolean;
     evidence?: AgentSignalResultEvidence | OperationAdmissionTombstone;
   }> {
+    if (status.admissionId !== undefined && status.admissionHash !== undefined && status.operationKind === undefined) {
+      throw new Error(
+        `Invalid Harness admission evidence for session "${this.id}" signal "${status.signalId}": operationKind is required`,
+      );
+    }
     const now = Date.now();
     this._operationEvidenceSignalIds.add(status.signalId);
     try {
@@ -6856,8 +6886,8 @@ export class Session {
     outcome:
       | { status: 'completed'; runId: string; result: AgentResult }
       | { status: 'failed'; runId?: string; error: { code: string; message: string } },
-    admission?: Pick<SignalAdmission, 'admissionId' | 'admissionHash' | 'modeId' | 'modelId'>,
-  ): Promise<void> {
+    admission?: SignalSettlementAdmission,
+  ): Promise<AgentSignalResultEvidence | undefined> {
     const inFlight = this._signalResultSettlements.get(signalId);
     if (inFlight !== undefined) return inFlight;
     const settlement = this._settleSignalResultOnce(signalId, outcome, admission).finally(() => {
@@ -6874,8 +6904,8 @@ export class Session {
     outcome:
       | { status: 'completed'; runId: string; result: AgentResult }
       | { status: 'failed'; runId?: string; error: { code: string; message: string } },
-    admission?: Pick<SignalAdmission, 'admissionId' | 'admissionHash' | 'modeId' | 'modelId'>,
-  ): Promise<void> {
+    admission?: SignalSettlementAdmission,
+  ): Promise<AgentSignalResultEvidence | undefined> {
     // A signal-owned run can suspend and later resume through a rehydrated
     // Session. `PendingResume` intentionally carries only the public
     // correlation signal id, so recover the private admission identity from
@@ -6884,7 +6914,7 @@ export class Session {
     // pending forever. Non-admitted signal ids keep their historical
     // best-effort behavior.
     let retainedAdmission = admission;
-    if (signalId.startsWith('harness-channel-signal-')) {
+    if (retainedAdmission === undefined) {
       const retained = await this._storage.loadMessageResultEvidence({
         harnessName: this._record.harnessName,
         sessionId: this.id,
@@ -6893,50 +6923,122 @@ export class Session {
         signalId,
       });
       if (retained && 'status' in retained) {
-        if (retained.status === 'completed' || retained.status === 'failed') return;
+        if (retained.status === 'completed' || retained.status === 'failed') {
+          return retained as AgentSignalResultEvidence;
+        }
         const admitted = retained as AgentSignalResultEvidence;
-        if (
-          retainedAdmission === undefined &&
-          admitted.admissionId !== undefined &&
-          admitted.admissionHash !== undefined
-        ) {
+        if (admitted.admissionId !== undefined && admitted.admissionHash !== undefined) {
+          const identity = this._signalAdmissionIdentity(admitted.admissionId);
           retainedAdmission = {
             admissionId: admitted.admissionId,
             admissionHash: admitted.admissionHash,
             modeId: admitted.modeId ?? this._record.modeId,
             modelId: admitted.modelId ?? this._record.modelId,
+            dispatch: this._signalDispatchState(admitted, identity),
           };
         }
       }
     }
-    if (outcome.status === 'completed') {
-      const write = await this._writeMessageResultEvidenceBestEffort({
+    if (retainedAdmission !== undefined) {
+      // Reserved admissions and synchronous pre-dispatch failures remain
+      // retryable. Only a concrete dispatch attempt can own terminal evidence.
+      if (retainedAdmission.dispatch.state === 'reserved') {
+        const retained = await this._storage.loadMessageResultEvidence({
+          harnessName: this._record.harnessName,
+          sessionId: this.id,
+          resourceId: this.resourceId,
+          threadId: this.threadId,
+          signalId,
+        });
+        return retained && 'status' in retained ? (retained as AgentSignalResultEvidence) : undefined;
+      }
+      const terminal =
+        outcome.status === 'completed'
+          ? {
+              status: 'completed' as const,
+              signalId,
+              runId: outcome.runId,
+              result: outcome.result,
+              modeId: retainedAdmission.modeId,
+              modelId: retainedAdmission.modelId,
+            }
+          : {
+              status: 'failed' as const,
+              signalId,
+              ...(outcome.runId !== undefined ? { runId: outcome.runId } : {}),
+              error: outcome.error,
+              modeId: retainedAdmission.modeId,
+              modelId: retainedAdmission.modelId,
+            };
+      const write = await this._storage.compareAndSwapSignalTerminal({
+        harnessName: this._record.harnessName,
+        sessionId: this.id,
+        resourceId: this.resourceId,
+        threadId: this.threadId,
+        signalId,
+        admissionId: retainedAdmission.admissionId,
+        admissionHash: retainedAdmission.admissionHash,
+        expected: retainedAdmission.dispatch,
+        terminal,
+        updatedAt: Date.now(),
+      });
+      await this._cleanupOperationEvidenceIfDeleted({ signalId });
+      // The loser adopts the durable winner by returning without rewriting or
+      // projecting its stale run/result as the operation terminal.
+      if (!write.applied) return write.evidence;
+      if (outcome.status === 'completed') {
+        this._emit({ type: 'signal_completed', runId: outcome.runId, signalId, result: outcome.result });
+      } else {
+        this._emit({
+          type: 'signal_failed',
+          signalId,
+          ...(outcome.runId !== undefined ? { runId: outcome.runId } : {}),
+          error: outcome.error,
+        });
+      }
+      return write.evidence;
+    } else if (outcome.status === 'completed') {
+      await this._writeMessageResultEvidenceBestEffort({
         status: 'completed',
         signalId,
         runId: outcome.runId,
         result: outcome.result,
-        ...(retainedAdmission ?? {}),
       });
-      // Storage is the cross-process CAS. Only the actor that changed pending
-      // evidence to terminal may publish the terminal operation event.
-      if (retainedAdmission !== undefined && write?.applied === false) return;
+    } else {
+      await this._writeMessageResultEvidenceBestEffort({
+        status: 'failed',
+        signalId,
+        ...(outcome.runId !== undefined ? { runId: outcome.runId } : {}),
+        error: outcome.error,
+      });
+    }
+    if (outcome.status === 'completed') {
       this._emit({ type: 'signal_completed', runId: outcome.runId, signalId, result: outcome.result });
       return;
     }
-    const write = await this._writeMessageResultEvidenceBestEffort({
-      status: 'failed',
-      signalId,
-      ...(outcome.runId !== undefined ? { runId: outcome.runId } : {}),
-      error: outcome.error,
-      ...(retainedAdmission ?? {}),
-    });
-    if (retainedAdmission !== undefined && write?.applied === false) return;
     this._emit({
       type: 'signal_failed',
       signalId,
       ...(outcome.runId !== undefined ? { runId: outcome.runId } : {}),
       error: outcome.error,
     });
+    return undefined;
+  }
+
+  /** Resolve every local handle from the terminal evidence that won durable CAS. */
+  private async _adoptSignalSettlement(
+    signalId: string,
+    evidence: AgentSignalResultEvidence | undefined,
+    local: { status: 'completed'; result: AgentResult } | { status: 'failed'; error: unknown },
+    abortSignal?: AbortSignal,
+  ): Promise<AgentResult> {
+    if (evidence === undefined) {
+      if (local.status === 'completed') return local.result;
+      throw local.error;
+    }
+    if (evidence.status === 'completed') return evidence.result as AgentResult;
+    if (evidence.status === 'failed') throw publicErrorProjectionToError(evidence.error);
+    return this._awaitDurableSignalResult({ signalId }, abortSignal, { waitIndefinitely: true });
   }
 
   private _computeMessageAdmissionHashes(
@@ -7047,9 +7149,235 @@ export class Session {
   private _signalAdmissionCanRedispatch(
     evidence: AgentSignalResultEvidence | OperationAdmissionTombstone | undefined,
   ): boolean {
-    return (
-      evidence !== undefined && 'status' in evidence && evidence.status === 'pending' && evidence.runId === undefined
-    );
+    // Every non-terminal receipt re-enters the durable dispatch state machine.
+    // `dispatching` receipts wait/reclaim by claim expiry; `accepted` receipts
+    // attach to a live run or take the explicit idle-recovery/active-loss path.
+    // Neither state is exposed as accepted merely because it carries a run id.
+    return evidence !== undefined && 'status' in evidence && evidence.status === 'pending';
+  }
+
+  private _signalDispatchState(
+    evidence: AgentSignalResultEvidence,
+    identity: SignalAdmissionIdentity,
+  ): AgentSignalDispatchState {
+    if (evidence.dispatch !== undefined) return evidence.dispatch;
+    if (evidence.runId !== undefined) {
+      // Rows written before durable dispatch fencing already treated a persisted
+      // run id as accepted. Preserve that recovery meaning without allowing new
+      // unfenced writes to take this compatibility path.
+      return {
+        state: 'accepted',
+        attemptId: 'legacy',
+        delivery: evidence.runId === identity.idleRunId ? 'idle' : 'active',
+        runId: evidence.runId,
+        acceptedAt: evidence.updatedAt,
+      };
+    }
+    return { state: 'reserved' };
+  }
+
+  private async _compareAndSwapSignalDispatch(
+    admission: SignalAdmission,
+    expected: AgentSignalDispatchState,
+    next: AgentSignalDispatchState,
+  ): Promise<{ applied: boolean; evidence: AgentSignalResultEvidence }> {
+    const result = await this._storage.compareAndSwapSignalDispatch({
+      harnessName: this._record.harnessName,
+      sessionId: this.id,
+      resourceId: this.resourceId,
+      threadId: this.threadId,
+      signalId: admission.identity.signalId,
+      admissionId: admission.admissionId,
+      admissionHash: admission.admissionHash,
+      expected,
+      next,
+      updatedAt: Date.now(),
+    });
+    admission.dispatch = this._signalDispatchState(result.evidence, admission.identity);
+    return result;
+  }
+
+  private async _loadSignalAdmissionEvidence(admission: SignalAdmission): Promise<AgentSignalResultEvidence> {
+    const loaded = await this._storage.loadMessageResultEvidence({
+      harnessName: this._record.harnessName,
+      sessionId: this.id,
+      resourceId: this.resourceId,
+      threadId: this.threadId,
+      signalId: admission.identity.signalId,
+    });
+    if (!loaded || !('status' in loaded)) {
+      throw new HarnessValidationError('signal().admissionId', 'signal admission evidence has expired');
+    }
+    const evidence = loaded as AgentSignalResultEvidence;
+    admission.dispatch = this._signalDispatchState(evidence, admission.identity);
+    return evidence;
+  }
+
+  private async _claimSignalDispatch(
+    admission: SignalAdmission,
+    planned: { delivery: 'idle' | 'active'; runId: string },
+    canAttachRun: (runId: string) => boolean,
+    isRunActive: (runId: string) => boolean,
+    abortSignal?: AbortSignal,
+  ): Promise<
+    | { kind: 'owned'; dispatch: SignalDispatchingState; recoveringAccepted: boolean }
+    | { kind: 'duplicate'; evidence: AgentSignalResultEvidence }
+    | { kind: 'active-lost'; dispatch: SignalDispatchingState }
+  > {
+    let evidence = await this._loadSignalAdmissionEvidence(admission);
+    while (true) {
+      throwIfAborted(abortSignal, 'signal().admissionId');
+      if (evidence.status !== 'pending') return { kind: 'duplicate', evidence };
+      const dispatch = this._signalDispatchState(evidence, admission.identity);
+      if (dispatch.state === 'accepted') {
+        if (canAttachRun(dispatch.runId)) return { kind: 'duplicate', evidence };
+        const recoverAt = dispatch.acceptedAt + SIGNAL_ACCEPTED_RECOVERY_STALE_MS;
+        if (Date.now() < recoverAt) {
+          await delay(Math.min(MESSAGE_ADMISSION_DURABLE_WAIT_INTERVAL_MS, recoverAt - Date.now()), abortSignal);
+          evidence = await this._loadSignalAdmissionEvidence(admission);
+          continue;
+        }
+        const reclaimed: SignalDispatchingState = {
+          state: 'dispatching',
+          attemptId: `signal-dispatch-${randomUUID()}`,
+          claimExpiresAt: Date.now() + SIGNAL_DISPATCH_CLAIM_TTL_MS,
+          delivery: dispatch.delivery,
+          runId: dispatch.runId,
+        };
+        const swapped = await this._compareAndSwapSignalDispatch(admission, dispatch, reclaimed);
+        if (swapped.evidence.status !== 'pending') return { kind: 'duplicate', evidence: swapped.evidence };
+        if (!swapped.applied) {
+          evidence = swapped.evidence;
+          continue;
+        }
+        return dispatch.delivery === 'active'
+          ? { kind: 'active-lost', dispatch: reclaimed }
+          : { kind: 'owned', dispatch: reclaimed, recoveringAccepted: true };
+      }
+      if (dispatch.state === 'dispatching' && dispatch.claimExpiresAt > Date.now()) {
+        await delay(
+          Math.min(MESSAGE_ADMISSION_DURABLE_WAIT_INTERVAL_MS, dispatch.claimExpiresAt - Date.now()),
+          abortSignal,
+        );
+        evidence = await this._loadSignalAdmissionEvidence(admission);
+        continue;
+      }
+      const next: SignalDispatchingState = {
+        state: 'dispatching',
+        attemptId: `signal-dispatch-${randomUUID()}`,
+        claimExpiresAt: Date.now() + SIGNAL_DISPATCH_CLAIM_TTL_MS,
+        delivery: dispatch.state === 'dispatching' ? dispatch.delivery : planned.delivery,
+        runId: dispatch.state === 'dispatching' ? dispatch.runId : planned.runId,
+      };
+      const swapped = await this._compareAndSwapSignalDispatch(admission, dispatch, next);
+      if (swapped.evidence.status !== 'pending') return { kind: 'duplicate', evidence: swapped.evidence };
+      if (!swapped.applied) {
+        evidence = swapped.evidence;
+        continue;
+      }
+      if (dispatch.state === 'dispatching' && next.delivery === 'active' && !isRunActive(next.runId)) {
+        return { kind: 'active-lost', dispatch: next };
+      }
+      return { kind: 'owned', dispatch: next, recoveringAccepted: false };
+    }
+  }
+
+  private _startSignalDispatchClaimHeartbeat(
+    admission: SignalAdmission,
+    initial: SignalDispatchingState,
+  ): {
+    stop: () => Promise<SignalDispatchingState>;
+  } {
+    let current = initial;
+    let failure: unknown;
+    let tail = Promise.resolve();
+    const interval = setInterval(() => {
+      tail = tail.then(async () => {
+        if (failure !== undefined) return;
+        const renewed: SignalDispatchingState = {
+          ...current,
+          claimExpiresAt: Date.now() + SIGNAL_DISPATCH_CLAIM_TTL_MS,
+        };
+        try {
+          const swapped = await this._compareAndSwapSignalDispatch(admission, current, renewed);
+          if (!swapped.applied) {
+            failure = new HarnessConfigError('signal()', 'durable signal dispatch claim was lost');
+            return;
+          }
+          current = renewed;
+        } catch (error) {
+          failure = error;
+        }
+      });
+    }, SIGNAL_DISPATCH_CLAIM_RENEW_MS);
+    interval.unref?.();
+    return {
+      stop: async () => {
+        clearInterval(interval);
+        await tail;
+        if (failure !== undefined) throw failure;
+        return current;
+      },
+    };
+  }
+
+  private async _acceptSignalDispatch(
+    admission: SignalAdmission,
+    dispatching: SignalDispatchingState,
+  ): Promise<AgentSignalResultEvidence> {
+    const accepted: SignalAcceptedDispatchState = {
+      state: 'accepted',
+      attemptId: dispatching.attemptId,
+      delivery: dispatching.delivery,
+      runId: dispatching.runId,
+      acceptedAt: Date.now(),
+    };
+    const swapped = await this._compareAndSwapSignalDispatch(admission, dispatching, accepted);
+    if (!swapped.applied) {
+      const current = this._signalDispatchState(swapped.evidence, admission.identity);
+      if (
+        current.state !== 'accepted' ||
+        current.attemptId !== accepted.attemptId ||
+        current.delivery !== accepted.delivery ||
+        current.runId !== accepted.runId
+      ) {
+        throw new HarnessConfigError('signal()', 'durable signal acceptance lost its dispatch claim');
+      }
+    }
+    return swapped.evidence;
+  }
+
+  private _awaitSignalNativeAcceptance<T>(
+    accepted: Promise<T>,
+    abortSignal?: AbortSignal,
+    interrupted?: Promise<never>,
+  ): Promise<T> {
+    throwIfAborted(abortSignal, 'signal().admissionId');
+    return new Promise<T>((resolve, reject) => {
+      let settled = false;
+      const finish = (callback: () => void) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        abortSignal?.removeEventListener('abort', onAbort);
+        callback();
+      };
+      const onAbort = () =>
+        finish(() => reject(abortSignal?.reason ?? new HarnessValidationError('signal()', 'operation aborted')));
+      const timer = setTimeout(() => {
+        finish(() => reject(new HarnessValidationError('signal().admissionId', 'native signal acceptance timed out')));
+      }, SIGNAL_NATIVE_ACCEPT_TIMEOUT_MS);
+      timer.unref?.();
+      abortSignal?.addEventListener('abort', onAbort, { once: true });
+      accepted.then(
+        value => finish(() => resolve(value)),
+        error => finish(() => reject(error)),
+      );
+      interrupted?.then(
+        value => finish(() => resolve(value)),
+        error => finish(() => reject(error)),
+      );
+    });
   }
 
   private _signalFromAdmissionEvidence(
@@ -7101,6 +7429,12 @@ export class Session {
     if (!('status' in evidence)) {
       throw new HarnessValidationError('signal().admissionId', 'duplicate signal result evidence has expired');
     }
+    if (evidence.status === 'pending' && this._signalDispatchState(evidence, identity).state !== 'accepted') {
+      throw new HarnessValidationError(
+        'signal().admissionId',
+        'pending signal admission has not crossed durable native acceptance',
+      );
+    }
     if (evidence.runId === undefined) {
       if (evidence.status === 'failed') throw publicErrorProjectionToError(evidence.error);
       throw new HarnessValidationError('signal().admissionId', 'pending signal admission was not dispatched');
@@ -7124,6 +7458,7 @@ export class Session {
                 admissionHash: evidence.admissionHash,
                 modeId: duplicateModeId,
                 modelId: evidence.modelId ?? this._record.modelId,
+                dispatch: this._signalDispatchState(evidence, identity),
               }
             : undefined;
         if (cached.ok) {
@@ -7131,7 +7466,7 @@ export class Session {
             cached.full.finishReason === 'suspended'
               ? this._awaitDurableSignalResult(evidence, opts.abortSignal, { waitIndefinitely: true })
               : (async () => {
-                  await this._settleSignalResult(
+                  const settled = await this._settleSignalResult(
                     evidence.signalId,
                     {
                       status: 'completed',
@@ -7140,11 +7475,16 @@ export class Session {
                     },
                     admission,
                   );
-                  return cached.full as AgentResult;
+                  return this._adoptSignalSettlement(
+                    evidence.signalId,
+                    settled,
+                    { status: 'completed', result: cached.full as AgentResult },
+                    opts.abortSignal,
+                  );
                 })();
         } else {
           result = (async () => {
-            await this._settleSignalResult(
+            const settled = await this._settleSignalResult(
               evidence.signalId,
               {
                 status: 'failed',
@@ -7153,14 +7493,55 @@ export class Session {
               },
               admission,
             );
-            throw cached.err;
+            return this._adoptSignalSettlement(
+              evidence.signalId,
+              settled,
+              { status: 'failed', error: cached.err },
+              opts.abortSignal,
+            );
           })();
         }
       } else if (this._runCompletionPromises.has(evidence.runId)) {
-        result = this._awaitRunCompletion(evidence.runId).then(full =>
-          full.finishReason === 'suspended'
-            ? this._awaitDurableSignalResult(evidence, opts.abortSignal, { waitIndefinitely: true })
-            : (full as AgentResult),
+        const admission =
+          evidence.admissionId !== undefined && evidence.admissionHash !== undefined
+            ? {
+                admissionId: evidence.admissionId,
+                admissionHash: evidence.admissionHash,
+                modeId: duplicateModeId,
+                modelId: evidence.modelId ?? this._record.modelId,
+                dispatch: this._signalDispatchState(evidence, identity),
+              }
+            : undefined;
+        result = this._awaitRunCompletion(evidence.runId).then(
+          async full => {
+            if (full.finishReason === 'suspended') {
+              return this._awaitDurableSignalResult(evidence, opts.abortSignal, { waitIndefinitely: true });
+            }
+            const settled = await this._settleSignalResult(
+              evidence.signalId,
+              { status: 'completed', runId: evidence.runId!, result: full as AgentResult },
+              admission,
+            );
+            return this._adoptSignalSettlement(
+              evidence.signalId,
+              settled,
+              { status: 'completed', result: full as AgentResult },
+              opts.abortSignal,
+            );
+          },
+          async err => {
+            const settled = await this._settleSignalResult(
+              evidence.signalId,
+              { status: 'failed', runId: evidence.runId, error: projectHarnessPublicError(err) },
+              admission,
+            );
+            return this._adoptSignalSettlement(
+              evidence.signalId,
+              settled,
+              { status: 'failed', error: err },
+              opts.abortSignal,
+            );
+          },
         );
       } else if (agent.getRunOutput(evidence.runId) || subscription.activeRunId() === evidence.runId) {
         // Rehydrated accepted run: this Session has no original continuation to
@@ -7173,12 +7554,13 @@ export class Session {
                 admissionHash: evidence.admissionHash,
                 modeId: duplicateModeId,
                 modelId: evidence.modelId ?? this._record.modelId,
+                dispatch: this._signalDispatchState(evidence, identity),
               }
             : undefined;
         result = this._awaitRunCompletion(evidence.runId).then(
           async full => {
             if (full.finishReason !== 'suspended') {
-              await this._settleSignalResult(
+              const settled = await this._settleSignalResult(
                 evidence.signalId,
                 {
                   status: 'completed',
@@ -7187,27 +7569,31 @@ export class Session {
                 },
                 admission,
               );
+              return this._adoptSignalSettlement(
+                evidence.signalId,
+                settled,
+                { status: 'completed', result: full as AgentResult },
+                opts.abortSignal,
+              );
             }
-            return full.finishReason === 'suspended'
-              ? this._awaitDurableSignalResult(evidence, opts.abortSignal, { waitIndefinitely: true })
-              : (full as AgentResult);
+            return this._awaitDurableSignalResult(evidence, opts.abortSignal, { waitIndefinitely: true });
           },
           async err => {
-            let thrown = err;
-            try {
-              await this._settleSignalResult(
-                evidence.signalId,
-                {
-                  status: 'failed',
-                  runId: evidence.runId,
-                  error: projectHarnessPublicError(err),
-                },
-                admission,
-              );
-            } catch (evidenceErr) {
-              thrown = evidenceErr;
-            }
-            throw redactPublicBoundaryRejection(thrown);
+            const settled = await this._settleSignalResult(
+              evidence.signalId,
+              {
+                status: 'failed',
+                runId: evidence.runId,
+                error: projectHarnessPublicError(err),
+              },
+              admission,
+            );
+            return this._adoptSignalSettlement(
+              evidence.signalId,
+              settled,
+              { status: 'failed', error: err },
+              opts.abortSignal,
+            );
           },
         );
       } else {
@@ -7235,10 +7621,11 @@ export class Session {
   // -------------------------------------------------------------------------
   // signal() — §4.2.
   //
-  // Optimistic user-message primitive. Resolves with the routing decision
-  // (`id`, `runId`, `willInterleave`) on the first await tick so callers
-  // can render an optimistic transcript row before the turn completes,
-  // then await `result` for the eventual `AgentResult`.
+  // Optimistic user-message primitive. Without `admissionId`, resolves with the
+  // routing decision (`id`, `runId`, `willInterleave`) on the first await tick.
+  // An admitted call first awaits its durable reservation and authoritative
+  // native acceptance. Neither form awaits run completion; callers await
+  // `result` for the eventual `AgentResult`.
   //
   // Two delivery shapes:
   //
@@ -7372,6 +7759,13 @@ export class Session {
     // currently registered mode + agent.
     const effectiveModeId = redispatchEvidence?.modeId ?? opts.mode ?? this._record.modeId;
     const effectiveModelId = redispatchEvidence?.modelId ?? this._record.modelId;
+    const redispatchPreservesIdleDelivery =
+      redispatchEvidence !== undefined &&
+      signalAdmissionIdentity !== undefined &&
+      (() => {
+        const dispatch = this._signalDispatchState(redispatchEvidence, signalAdmissionIdentity);
+        return dispatch.state !== 'reserved' && dispatch.delivery === 'idle';
+      })();
     const mode = this._harness._getMode(effectiveModeId);
     const agent = this._harness.getAgentForMode(effectiveModeId);
 
@@ -7455,14 +7849,19 @@ export class Session {
           promise: signalAdmissionStart.promise,
         });
 
-        const reserved = await this._writeMessageResultEvidence({
-          status: 'pending',
-          signalId: identity.signalId,
-          modeId: effectiveModeId,
-          modelId: effectiveModelId,
-          admissionId: opts.admissionId,
-          admissionHash,
-        });
+        const reserved =
+          existing !== undefined && 'status' in existing
+            ? { created: false, evidence: existing }
+            : await this._writeMessageResultEvidence({
+                status: 'pending',
+                signalId: identity.signalId,
+                modeId: effectiveModeId,
+                modelId: effectiveModelId,
+                operationKind: 'signal',
+                admissionId: opts.admissionId,
+                admissionHash,
+                dispatch: { state: 'reserved' },
+              });
         const reservedEvidence =
           reserved.evidence ??
           (!reserved.created
@@ -7488,6 +7887,10 @@ export class Session {
           identity,
           createdAt:
             reservedEvidence !== undefined && 'status' in reservedEvidence ? reservedEvidence.createdAt : Date.now(),
+          dispatch:
+            reservedEvidence !== undefined && 'status' in reservedEvidence
+              ? this._signalDispatchState(reservedEvidence, identity)
+              : { state: 'reserved' },
         };
       } catch (err) {
         signalAdmissionStart?.reject(err);
@@ -7496,50 +7899,86 @@ export class Session {
       }
     }
 
-    const recordSignalAdmissionDispatch = async (runId: string) => {
+    let signalAdmissionNativeAccepted = false;
+    let signalAdmissionNativeDispatchStarted = false;
+
+    const resolveSignalAdmissionStart = (evidence: AgentSignalResultEvidence | OperationAdmissionTombstone) => {
+      if (signalAdmission === undefined) return;
+      signalAdmissionStart?.resolve(evidence);
+      this._messageAdmissionStarts.delete(signalAdmission.admissionId);
+    };
+
+    const rejectSignalAdmissionStart = (err: unknown) => {
+      if (signalAdmission === undefined) return;
+      signalAdmissionStart?.reject(err);
+      this._messageAdmissionStarts.delete(signalAdmission.admissionId);
+    };
+
+    const recordSignalAdmissionDispatch = async (dispatching: SignalDispatchingState) => {
       if (signalAdmission === undefined) return;
       try {
-        const recorded = await this._writeMessageResultEvidence({
-          status: 'pending',
-          signalId: signalAdmission.identity.signalId,
-          runId,
-          modeId: signalAdmission.modeId,
-          modelId: signalAdmission.modelId,
-          admissionId: signalAdmission.admissionId,
-          admissionHash: signalAdmission.admissionHash,
-        });
-        const evidence =
-          recorded.evidence ??
-          (await this._resolveMessageAdmissionDuplicate({
-            admissionId: signalAdmission.admissionId,
-            admissionHash: signalAdmission.admissionHash,
-          }));
-        if (evidence === undefined) {
-          throw new HarnessConfigError('signal()', 'signal admission evidence was not recorded');
-        }
-        signalAdmissionStart?.resolve(evidence);
-        this._messageAdmissionStarts.delete(signalAdmission.admissionId);
+        const evidence = await this._acceptSignalDispatch(signalAdmission, dispatching);
+        resolveSignalAdmissionStart(evidence);
       } catch (err) {
-        signalAdmissionStart?.reject(err);
-        this._messageAdmissionStarts.delete(signalAdmission.admissionId);
+        rejectSignalAdmissionStart(err);
         throw err;
+      }
+    };
+
+    const releaseSignalDispatch = async (dispatching: SignalDispatchingState) => {
+      if (signalAdmission === undefined) return;
+      const released = await this._compareAndSwapSignalDispatch(signalAdmission, dispatching, { state: 'reserved' });
+      if (!released.applied) {
+        throw new HarnessConfigError('signal()', 'durable signal dispatch claim could not be released');
       }
     };
 
     const failSignalAdmissionBeforeDispatch = async (err: unknown) => {
       if (signalAdmission === undefined) return;
-      try {
-        if (internal?.expectedAdmissionHash === undefined) {
-          await this._settleSignalResult(
-            signalAdmission.identity.signalId,
-            { status: 'failed', error: projectHarnessPublicError(err) },
-            signalAdmission,
-          );
-        }
-      } finally {
-        signalAdmissionStart?.reject(err);
-        this._messageAdmissionStarts.delete(signalAdmission.admissionId);
+      // No native acceptance means no actor owns a terminal write. Keep the
+      // reservation retryable and only release same-process waiters.
+      rejectSignalAdmissionStart(err);
+    };
+
+    const isSignalRunActive = (runId: string) => {
+      const pendingResume = this._record.pendingResume;
+      return (
+        this._runCompletionPromises.has(runId) ||
+        sub.activeRunId() === runId ||
+        (pendingResume !== undefined &&
+          pendingResume.originSignalId === signalAdmission?.identity.signalId &&
+          pendingResume.runId === runId)
+      );
+    };
+    const canAttachSignalRun = (runId: string) =>
+      isSignalRunActive(runId) || this._completedRuns.has(runId) || agent.getRunOutput(runId) !== undefined;
+
+    const returnClaimOutcome = async (
+      claim:
+        | { kind: 'duplicate'; evidence: AgentSignalResultEvidence }
+        | { kind: 'active-lost'; dispatch: SignalDispatchingState },
+    ): Promise<SessionSignalResult> => {
+      if (claim.kind === 'duplicate') {
+        resolveSignalAdmissionStart(claim.evidence);
+        return this._returnDuplicateSignalResult(claim.evidence, opts, signalAdmission!.identity);
       }
+
+      const err = new HarnessConfigError(
+        'signal().admissionId',
+        `accepted active signal run "${claim.dispatch.runId}" is no longer live; refusing to reroute the admitted signal to a different run`,
+      );
+      await this._settleSignalResult(
+        signalAdmission!.identity.signalId,
+        {
+          status: 'failed',
+          runId: claim.dispatch.runId,
+          error: projectHarnessPublicError(err),
+        },
+        signalAdmission,
+      );
+      const evidence = await this._loadSignalAdmissionEvidence(signalAdmission!);
+      resolveSignalAdmissionStart(evidence);
+      return this._returnDuplicateSignalResult(evidence, opts, signalAdmission!.identity);
     };
 
     // The awaited durable reservation can outlive the run observed above.
@@ -7569,15 +8008,10 @@ export class Session {
     const returnInterleavedSignalResult = async (
       dispatched: { signal: CreatedAgentSignal },
       runId: string,
+      willInterleaveResult = true,
     ): Promise<SessionSignalResult> => {
       const signalId = dispatched.signal.id;
-      if (signalAdmission !== undefined) {
-        try {
-          await recordSignalAdmissionDispatch(runId);
-        } catch (err) {
-          throw internal === undefined ? redactPublicBoundaryRejection(err) : err;
-        }
-      } else {
+      if (signalAdmission === undefined) {
         this._writeMessageResultEvidenceBestEffortInBackground({
           status: 'pending',
           signalId,
@@ -7588,38 +8022,38 @@ export class Session {
       const completion = this._awaitRunCompletion(runId);
       void completion.catch(() => {});
       const runResult = this._trackBackgroundTurnCompletion(
-        completion
-          .then(async full => {
-            if (full.finishReason !== 'suspended') {
-              await this._settleSignalResult(
-                signalId,
-                {
-                  status: 'completed',
-                  runId,
-                  result: full as AgentResult,
-                },
-                signalAdmission,
-              );
-            }
-            return full as AgentResult;
-          })
-          .catch(async err => {
-            let thrown = err;
-            try {
-              await this._settleSignalResult(
-                signalId,
-                {
-                  status: 'failed',
-                  runId,
-                  error: projectHarnessPublicError(err),
-                },
-                signalAdmission,
-              );
-            } catch (evidenceErr) {
-              thrown = evidenceErr;
-            }
-            throw redactPublicBoundaryRejection(thrown);
-          }),
+        completion.then(
+          async full => {
+            if (full.finishReason === 'suspended') return full as AgentResult;
+            const settled = await this._settleSignalResult(
+              signalId,
+              {
+                status: 'completed',
+                runId,
+                result: full as AgentResult,
+              },
+              signalAdmission,
+            );
+            return this._adoptSignalSettlement(
+              signalId,
+              settled,
+              { status: 'completed', result: full as AgentResult },
+              opts.abortSignal,
+            );
+          },
+          async err => {
+            const settled = await this._settleSignalResult(
+              signalId,
+              {
+                status: 'failed',
+                runId,
+                error: projectHarnessPublicError(err),
+              },
+              signalAdmission,
+            );
+            return this._adoptSignalSettlement(signalId, settled, { status: 'failed', error: err }, opts.abortSignal);
+          },
+        ),
       );
       const result =
         signalAdmission === undefined
@@ -7633,11 +8067,123 @@ export class Session {
       return {
         id: signalId,
         runId,
-        willInterleave: true,
+        willInterleave: willInterleaveResult,
         accepted: true,
         signal: dispatched.signal,
         result,
       };
+    };
+
+    const dispatchAdmittedActiveSignal = async (
+      contents: AgentSignalContents,
+      runId: string,
+      ownedClaim?: { kind: 'owned'; dispatch: SignalDispatchingState; recoveringAccepted: boolean },
+    ): Promise<SessionSignalResult | undefined> => {
+      const admission = signalAdmission!;
+      const claim =
+        ownedClaim ??
+        (await this._claimSignalDispatch(
+          admission,
+          { delivery: 'active', runId },
+          canAttachSignalRun,
+          isSignalRunActive,
+          opts.abortSignal,
+        ));
+      if (claim.kind !== 'owned') return returnClaimOutcome(claim);
+
+      // An expired idle attempt keeps its deterministic idle identity even if a
+      // different run happens to be active during recovery. Hand it back to the
+      // owned-turn path; that path will reclaim and replay the same idle run id.
+      if (claim.dispatch.delivery === 'idle') {
+        await releaseSignalDispatch(claim.dispatch);
+        return undefined;
+      }
+
+      let dispatching = claim.dispatch;
+      const heartbeat = this._startSignalDispatchClaimHeartbeat(admission, dispatching);
+      let heartbeatStopped = false;
+      let claimOwned = true;
+      const stopHeartbeat = async () => {
+        if (heartbeatStopped) return dispatching;
+        heartbeatStopped = true;
+        try {
+          dispatching = await heartbeat.stop();
+          return dispatching;
+        } catch (err) {
+          claimOwned = false;
+          throw err;
+        }
+      };
+
+      try {
+        const dispatched = agent.sendSignal(
+          {
+            id: admission.identity.signalId,
+            createdAt: new Date(admission.createdAt),
+            acceptedAt: new Date(admission.createdAt),
+            type: 'user-message',
+            contents: contents as never,
+          },
+          {
+            runId: dispatching.runId,
+            resourceId: this.resourceId,
+            threadId: this.threadId,
+            ifIdle: { behavior: 'discard', streamOptions: {} as never },
+            _signalAdmissionAttemptId: dispatching.attemptId,
+          } as never,
+        );
+        // Once sendSignal returns, a rejected/lost `accepted` acknowledgement is
+        // ambiguous: the native runtime or broker may already have accepted the
+        // exact fenced signal. Keep the dispatching claim for expiry recovery;
+        // only a synchronous pre-send throw or an explicit non-acceptance action
+        // below proves it is safe to release.
+        signalAdmissionNativeDispatchStarted = true;
+        const accepted = await this._awaitSignalNativeAcceptance(dispatched.accepted, opts.abortSignal);
+        if (accepted.action === 'discard') {
+          await stopHeartbeat();
+          await releaseSignalDispatch(dispatching);
+          signalAdmissionNativeDispatchStarted = false;
+          return undefined;
+        }
+        if (accepted.action === 'blocked') {
+          await stopHeartbeat();
+          await releaseSignalDispatch(dispatching);
+          claimOwned = false;
+          signalAdmissionNativeDispatchStarted = false;
+          throw new HarnessConfigError('signal()', 'signal delivery was blocked by a suspended thread');
+        }
+        if (accepted.action !== 'deliver') {
+          throw new HarnessConfigError('signal()', `active signal delivery was not accepted (${accepted.action})`);
+        }
+
+        signalAdmissionNativeAccepted = true;
+        if (accepted.runId !== dispatching.runId) {
+          throw new HarnessConfigError(
+            'signal()',
+            `active signal was accepted by run "${accepted.runId}" instead of its fenced run "${dispatching.runId}"`,
+          );
+        }
+        await stopHeartbeat();
+        await recordSignalAdmissionDispatch(dispatching);
+        return returnInterleavedSignalResult(dispatched, accepted.runId);
+      } catch (err) {
+        let thrown = err;
+        if (!heartbeatStopped) {
+          try {
+            await stopHeartbeat();
+          } catch (heartbeatErr) {
+            thrown = heartbeatErr;
+          }
+        }
+        if (!signalAdmissionNativeDispatchStarted && !signalAdmissionNativeAccepted && claimOwned) {
+          try {
+            await releaseSignalDispatch(dispatching);
+          } catch (releaseErr) {
+            thrown = releaseErr;
+          }
+        }
+        throw thrown;
+      }
     };
 
     const dispatchOwnedSignal = async (): Promise<SessionSignalResult> => {
@@ -7693,67 +8239,158 @@ export class Session {
         ]);
         assertOwnedSignalTurnNotDeleted();
         this._assertOpenForTurn('signal()');
-        if (signalAdmission !== undefined) {
-          const finalActiveRunId = sub.activeRunId();
-          if (finalActiveRunId !== null) assertActiveSignalOverrides(finalActiveRunId);
-        }
+        if (signalAdmission === undefined) {
+          dispatched = agent.sendSignal(
+            {
+              ...(internal?.signalId !== undefined ? { id: internal.signalId } : {}),
+              type: 'user-message',
+              contents: signalContents as never,
+            },
+            {
+              resourceId: this.resourceId,
+              threadId: this.threadId,
+              ifIdle: { behavior: 'wake', streamOptions: baseExecOptions as never },
+            },
+          );
+          // Preserve the historical optimistic boundary for ordinary signals:
+          // callers receive the handle without waiting for distributed lease or
+          // provider preflight.
+          ownedRunId = dispatched.runId;
+        } else {
+          while (true) {
+            const finalActiveRunId = sub.activeRunId();
+            const recoveringOriginalIdleDelivery =
+              redispatchPreservesIdleDelivery ||
+              (signalAdmission.dispatch.state !== 'reserved' && signalAdmission.dispatch.delivery === 'idle');
+            if (finalActiveRunId !== null && !recoveringOriginalIdleDelivery) {
+              assertActiveSignalOverrides(finalActiveRunId);
+              const activeResult = await dispatchAdmittedActiveSignal(signalContents, finalActiveRunId);
+              if (activeResult !== undefined) {
+                finishOwnedSignalTurn();
+                return activeResult;
+              }
+            }
 
-        dispatched = agent.sendSignal(
-          {
-            ...(signalAdmission !== undefined
-              ? {
+            const claim = await this._claimSignalDispatch(
+              signalAdmission,
+              { delivery: 'idle', runId: signalAdmission.identity.idleRunId },
+              canAttachSignalRun,
+              isSignalRunActive,
+              opts.abortSignal,
+            );
+            if (claim.kind !== 'owned') {
+              finishOwnedSignalTurn();
+              return returnClaimOutcome(claim);
+            }
+            if (claim.dispatch.delivery === 'active') {
+              const activeResult = await dispatchAdmittedActiveSignal(signalContents, claim.dispatch.runId, claim);
+              if (activeResult !== undefined) {
+                finishOwnedSignalTurn();
+                return activeResult;
+              }
+              continue;
+            }
+
+            let dispatching = claim.dispatch;
+            const heartbeat = this._startSignalDispatchClaimHeartbeat(signalAdmission, dispatching);
+            let heartbeatStopped = false;
+            let claimOwned = true;
+            const stopHeartbeat = async () => {
+              if (heartbeatStopped) return dispatching;
+              heartbeatStopped = true;
+              try {
+                dispatching = await heartbeat.stop();
+                return dispatching;
+              } catch (err) {
+                claimOwned = false;
+                throw err;
+              }
+            };
+            try {
+              dispatched = agent.sendSignal(
+                {
                   id: signalAdmission.identity.signalId,
                   createdAt: new Date(signalAdmission.createdAt),
                   acceptedAt: new Date(signalAdmission.createdAt),
+                  type: 'user-message',
+                  contents: signalContents as never,
+                },
+                {
+                  runId: dispatching.runId,
+                  resourceId: this.resourceId,
+                  threadId: this.threadId,
+                  _signalAdmissionAttemptId: dispatching.attemptId,
+                  ifIdle: {
+                    behavior: 'wake',
+                    streamOptions: baseExecOptions as never,
+                    _failClosedOnLeaseError: true,
+                  } as never,
+                } as never,
+              );
+              signalAdmissionNativeDispatchStarted = true;
+              const accepted = await this._awaitSignalNativeAcceptance(
+                dispatched.accepted,
+                turnAbortSignal,
+                activeTurnWaiter.promise,
+              );
+              if (accepted.action === 'blocked' || accepted.action === 'discard' || accepted.action === 'persist') {
+                await stopHeartbeat();
+                await releaseSignalDispatch(dispatching);
+                claimOwned = false;
+                signalAdmissionNativeDispatchStarted = false;
+                throw new HarnessConfigError(
+                  'signal()',
+                  accepted.action === 'blocked'
+                    ? 'signal delivery was blocked by a suspended thread'
+                    : `signal delivery was not accepted (${accepted.action})`,
+                );
+              }
+              signalAdmissionNativeAccepted = true;
+              if (accepted.runId !== dispatching.runId) {
+                throw new HarnessConfigError(
+                  'signal()',
+                  `idle signal was accepted by run "${accepted.runId}" instead of its fenced run "${dispatching.runId}"`,
+                );
+              }
+              await stopHeartbeat();
+              await recordSignalAdmissionDispatch(dispatching);
+              ownedRunId = accepted.runId;
+              if (accepted.action === 'deliver') admittedDeliveryRunId = accepted.runId;
+              break;
+            } catch (err) {
+              let thrown = err;
+              if (!heartbeatStopped) {
+                try {
+                  await stopHeartbeat();
+                } catch (heartbeatErr) {
+                  thrown = heartbeatErr;
                 }
-              : internal?.signalId !== undefined
-                ? { id: internal.signalId }
-                : {}),
-            type: 'user-message',
-            contents: signalContents as never,
-          },
-          {
-            ...(signalAdmission !== undefined ? { runId: signalAdmission.identity.idleRunId } : {}),
-            resourceId: this.resourceId,
-            threadId: this.threadId,
-            ifIdle: {
-              behavior: 'wake',
-              streamOptions: baseExecOptions as never,
-              ...(signalAdmission !== undefined ? { _failClosedOnLeaseError: true } : {}),
-            } as never,
-          },
-        );
-        // Preserve the historical optimistic boundary for ordinary signals:
-        // callers receive the handle without waiting for distributed lease or
-        // provider preflight. Admitted calls await the native acceptance
-        // action because their durable run identity must describe where the
-        // signal actually landed.
-        ownedRunId = dispatched.runId;
-        if (signalAdmission !== undefined) {
-          const accepted = await Promise.race([dispatched.accepted, activeTurnWaiter.promise]);
-          if (accepted.action === 'deliver') {
-            admittedDeliveryRunId = accepted.runId;
-          } else if (accepted.action === 'wake') {
-            ownedRunId = accepted.runId;
-          } else {
-            throw new HarnessConfigError(
-              'signal()',
-              accepted.action === 'blocked'
-                ? 'signal delivery was blocked by a suspended thread'
-                : `signal delivery was not accepted (${accepted.action})`,
-            );
+              }
+              if (!signalAdmissionNativeDispatchStarted && !signalAdmissionNativeAccepted && claimOwned) {
+                try {
+                  await releaseSignalDispatch(dispatching);
+                } catch (releaseErr) {
+                  thrown = releaseErr;
+                }
+              }
+              throw thrown;
+            }
           }
         }
       } catch (err) {
         finishOwnedSignalTurn();
         let thrown = err;
-        if (err instanceof AgentThreadSignalAdmissionError && signalAdmission !== undefined) {
+        if ((signalAdmissionNativeAccepted || signalAdmissionNativeDispatchStarted) && signalAdmission !== undefined) {
+          // Native/broker acceptance crossed the execution boundary. A failed
+          // durable accept CAS must leave the dispatching fence recoverable;
+          // terminalizing it here would falsely claim the side effect failed.
+          rejectSignalAdmissionStart(err);
+        } else if (err instanceof AgentThreadSignalAdmissionError && signalAdmission !== undefined) {
           // Strict admitted wakes have not crossed the execution boundary when
           // the lease backend rejects acquisition. Keep their durable no-run
           // reservation redispatchable, but release same-process waiters so a
           // later retry can make a fresh admission attempt.
-          signalAdmissionStart?.reject(err);
-          this._messageAdmissionStarts.delete(signalAdmission.admissionId);
+          rejectSignalAdmissionStart(err);
         } else {
           try {
             await failSignalAdmissionBeforeDispatch(err);
@@ -7773,7 +8410,15 @@ export class Session {
 
       if (admittedDeliveryRunId !== undefined) {
         finishOwnedSignalTurn();
-        return returnInterleavedSignalResult(dispatched, admittedDeliveryRunId);
+        // A distributed duplicate of the same deterministic idle wake loses the
+        // lease and is reported by the native runtime as `deliver`, even though it
+        // landed on the operation's original idle run. Preserve the durable
+        // receipt's routing semantics instead of misreporting an active interleave.
+        return returnInterleavedSignalResult(
+          dispatched,
+          admittedDeliveryRunId,
+          admittedDeliveryRunId !== signalAdmission?.identity.idleRunId,
+        );
       }
 
       // §10.2 agent_start carries the runId — emit it now the run is dispatched.
@@ -7785,15 +8430,7 @@ export class Session {
       // for this non-`admissionId` path — the run terminal below is the live
       // settlement.
       const ownedSignalId = dispatched.signal.id;
-      if (signalAdmission !== undefined) {
-        try {
-          await recordSignalAdmissionDispatch(ownedRunId);
-        } catch (err) {
-          turnAbortController.abort(err);
-          finishOwnedSignalTurn();
-          throw internal === undefined ? redactPublicBoundaryRejection(err) : err;
-        }
-      } else {
+      if (signalAdmission === undefined) {
         this._writeMessageResultEvidenceBestEffortInBackground({
           status: 'pending',
           signalId: ownedSignalId,
@@ -7806,6 +8443,8 @@ export class Session {
       const completionOrDelete = Promise.race([completion, activeTurnWaiter.promise]);
       let agentEndEmitted = false;
       let signalSettled = false;
+      let signalSettlementEvidence: AgentSignalResultEvidence | undefined;
+      let settledLocalResult: AgentResult | undefined;
 
       // Background continuation runs the post-turn bookkeeping so the
       // caller's `result` promise resolves with the final AgentResult.
@@ -7848,7 +8487,7 @@ export class Session {
             // goal-judge / active-turn-waiter rejection cannot flip an already
             // answered signal to `signal_failed`.
             if (full.finishReason !== 'suspended') {
-              await this._settleSignalResult(
+              signalSettlementEvidence = await this._settleSignalResult(
                 ownedSignalId,
                 {
                   status: 'completed',
@@ -7857,10 +8496,18 @@ export class Session {
                 },
                 signalAdmission,
               );
+              settledLocalResult = full as AgentResult;
               signalSettled = true;
             }
             await Promise.race([this._runGoalJudge(full, false), activeTurnWaiter.promise]);
-            return full as AgentResult;
+            return signalSettled
+              ? this._adoptSignalSettlement(
+                  ownedSignalId,
+                  signalSettlementEvidence,
+                  { status: 'completed', result: settledLocalResult! },
+                  opts.abortSignal,
+                )
+              : (full as AgentResult);
           })
           .catch(async err => {
             if (!agentEndEmitted) {
@@ -7873,21 +8520,37 @@ export class Session {
             }
             // Don't re-settle a signal already answered as completed (a post-run
             // goal-judge/abort rejection must not flip a terminal result).
-            let thrown = err;
-            if (!signalSettled) {
+            if (signalSettled) {
               try {
-                await this._settleSignalResult(
+                return await this._adoptSignalSettlement(
                   ownedSignalId,
-                  {
-                    status: 'failed',
-                    runId: ownedRunId,
-                    error: projectHarnessPublicError(err),
-                  },
-                  signalAdmission,
+                  signalSettlementEvidence,
+                  { status: 'completed', result: settledLocalResult! },
+                  opts.abortSignal,
                 );
-              } catch (evidenceErr) {
-                thrown = evidenceErr;
+              } catch (winnerError) {
+                throw redactPublicBoundaryRejection(winnerError);
               }
+            }
+            let thrown = err;
+            try {
+              const settled = await this._settleSignalResult(
+                ownedSignalId,
+                {
+                  status: 'failed',
+                  runId: ownedRunId,
+                  error: projectHarnessPublicError(err),
+                },
+                signalAdmission,
+              );
+              return await this._adoptSignalSettlement(
+                ownedSignalId,
+                settled,
+                { status: 'failed', error: err },
+                opts.abortSignal,
+              );
+            } catch (evidenceErr) {
+              thrown = evidenceErr;
             }
             // §13.3f.1 — `handle.result` is a public §4.2b boundary; redact a raw
             // cause before rejecting it (safe `.message`, raw `.cause`
@@ -7961,7 +8624,6 @@ export class Session {
     }
 
     if (willInterleave) {
-      let delivered: { dispatched: { signal: CreatedAgentSignal }; runId: string } | undefined;
       try {
         this._assertOpenForTurn('signal()');
         const interleavedContents = await this._buildSignalContentsWithAttachments(opts.content, internal?.attachments);
@@ -7973,43 +8635,21 @@ export class Session {
         const finalActiveRunId = sub.activeRunId();
         if (finalActiveRunId !== null) {
           assertActiveSignalOverrides(finalActiveRunId);
-          const dispatched = agent.sendSignal(
-            {
-              id: signalAdmission!.identity.signalId,
-              createdAt: new Date(signalAdmission!.createdAt),
-              acceptedAt: new Date(signalAdmission!.createdAt),
-              type: 'user-message',
-              contents: interleavedContents as never,
-            },
-            {
-              resourceId: this.resourceId,
-              threadId: this.threadId,
-              ifIdle: { behavior: 'discard', streamOptions: {} as never },
-            },
-          );
-          const accepted = await dispatched.accepted;
-          if (accepted.action === 'deliver') {
-            delivered = { dispatched, runId: accepted.runId };
-          } else if (accepted.action !== 'discard') {
-            throw new HarnessConfigError(
-              'signal()',
-              accepted.action === 'blocked'
-                ? 'signal delivery was blocked by a suspended thread'
-                : `active signal delivery was not accepted (${accepted.action})`,
-            );
-          }
+          const delivered = await dispatchAdmittedActiveSignal(interleavedContents, finalActiveRunId);
+          if (delivered !== undefined) return delivered;
         }
       } catch (err) {
         let thrown = err;
-        try {
-          await failSignalAdmissionBeforeDispatch(err);
-        } catch (evidenceErr) {
-          thrown = evidenceErr;
+        if (signalAdmissionNativeAccepted || signalAdmissionNativeDispatchStarted) {
+          rejectSignalAdmissionStart(err);
+        } else {
+          try {
+            await failSignalAdmissionBeforeDispatch(err);
+          } catch (evidenceErr) {
+            thrown = evidenceErr;
+          }
         }
         throw internal === undefined ? redactPublicBoundaryRejection(thrown) : thrown;
-      }
-      if (delivered !== undefined) {
-        return returnInterleavedSignalResult(delivered.dispatched, delivered.runId);
       }
       return dispatchOwnedSignal();
     }

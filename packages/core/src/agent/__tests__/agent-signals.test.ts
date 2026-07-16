@@ -3401,6 +3401,65 @@ describe('Agent signals', () => {
     subscription.unsubscribe();
   });
 
+  it('does not reuse a pending native acknowledgement for a newer durable admission attempt', async () => {
+    const pubsub = new EventEmitterPubSub();
+    const runtime = new AgentThreadStreamRuntime();
+    const target = { resourceId: 'attempt-retry-resource', threadId: 'attempt-retry-thread' };
+    const runId = 'attempt-retry-run';
+    const signal = { id: 'attempt-retry-signal', type: 'user-message' as const, contents: 'execute once' };
+    const agent = {
+      id: 'attempt-retry-agent',
+      stream: vi.fn(() => new Promise<never>(() => {})),
+    } as any;
+
+    const first = runtime.sendSignal(
+      agent,
+      signal,
+      {
+        ...target,
+        runId,
+        ifIdle: { behavior: 'wake' },
+        _signalAdmissionAttemptId: 'attempt-a',
+      } as any,
+      pubsub,
+    );
+    let firstSettled = false;
+    void first.accepted.finally(() => {
+      firstSettled = true;
+    });
+    await nextTick();
+    expect(firstSettled).toBe(false);
+    expect(agent.stream).toHaveBeenCalledTimes(1);
+
+    const retry = runtime.sendSignal(
+      agent,
+      signal,
+      {
+        ...target,
+        runId,
+        ifIdle: { behavior: 'wake' },
+        _signalAdmissionAttemptId: 'attempt-b',
+      } as any,
+      pubsub,
+    );
+    await expect(retry.accepted).resolves.toMatchObject({ action: 'deliver', runId });
+    expect(agent.stream).toHaveBeenCalledTimes(1);
+    expect(() =>
+      runtime.sendSignal(
+        agent,
+        { ...signal, contents: 'conflicting retry' },
+        {
+          ...target,
+          runId,
+          ifIdle: { behavior: 'wake' },
+          _signalAdmissionAttemptId: 'attempt-c',
+        } as any,
+        pubsub,
+      ),
+    ).toThrow('already accepted with a different payload');
+    runtime.resetForTests();
+  });
+
   it('retains stable signal admission through the run-completed publication window', async () => {
     const pubsub = new BlockingRunCompletedPubSub();
     const ownerRuntime = new AgentThreadStreamRuntime();
