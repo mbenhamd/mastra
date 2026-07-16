@@ -191,6 +191,9 @@ describe('@mastra/inngest actor signal threading (hermetic)', () => {
     expect(sendSpy).toHaveBeenCalledTimes(1);
     const sentData = (sendSpy.mock.calls[0]![0] as any).data;
     expect(sentData.actor).toEqual(actor);
+    expect(sentData.executionGeneration).toEqual(expect.any(String));
+    expect(sentData.lifecycleResumeAttempt).toBe(0);
+    expect(sentData.lifecycleStepStates).toEqual({});
   });
 
   it('forwards a re-supplied actor through the resume event payload (per-call contract)', async () => {
@@ -242,6 +245,11 @@ describe('@mastra/inngest actor signal threading (hermetic)', () => {
         resumeLabels: {},
         waitingPaths: {},
         timestamp: Date.now(),
+        executionGeneration: 'actor-resume-execution',
+        lifecycleResumeAttempt: 2,
+        lifecycleStepStates: {
+          '0:suspendable-step': { stepCallId: 'actor-resume-step-call', stepAttempt: 1 },
+        },
       } as any,
     });
 
@@ -252,6 +260,11 @@ describe('@mastra/inngest actor signal threading (hermetic)', () => {
     expect(sendSpy).toHaveBeenCalledTimes(1);
     const sentData = (sendSpy.mock.calls[0]![0] as any).data;
     expect(sentData.actor).toEqual(actor);
+    expect(sentData.executionGeneration).toBe('actor-resume-execution');
+    expect(sentData.lifecycleResumeAttempt).toBe(3);
+    expect(sentData.lifecycleStepStates).toEqual({
+      '0:suspendable-step': { stepCallId: 'actor-resume-step-call', stepAttempt: 1 },
+    });
   });
 
   it('serializes actor on the start (_start) path', async () => {
@@ -338,6 +351,9 @@ describe('@mastra/inngest actor signal threading (hermetic)', () => {
         resumeLabels: {},
         waitingPaths: {},
         timestamp: Date.now(),
+        executionGeneration: 'actor-time-travel-previous-execution',
+        lifecycleResumeAttempt: 0,
+        lifecycleStepStates: {},
       } as any,
     });
 
@@ -347,7 +363,12 @@ describe('@mastra/inngest actor signal threading (hermetic)', () => {
     await run.timeTravel({ step: 's', inputData: { value: 'ok' }, actor });
 
     expect(sendSpy).toHaveBeenCalledTimes(1);
-    expect((sendSpy.mock.calls[0]![0] as any).data.actor).toEqual(actor);
+    const sentData = (sendSpy.mock.calls[0]![0] as any).data;
+    expect(sentData.actor).toEqual(actor);
+    expect(sentData.executionGeneration).toEqual(expect.any(String));
+    expect(sentData.executionGeneration).not.toBe('actor-time-travel-previous-execution');
+    expect(sentData.lifecycleResumeAttempt).toBe(0);
+    expect(sentData.lifecycleStepStates).toEqual({});
   });
 
   it('forwards actor into the nested-workflow RESUME invoke payload', async () => {
@@ -386,10 +407,36 @@ describe('@mastra/inngest actor signal threading (hermetic)', () => {
     const mastra = new Mastra({ logger: false, storage: new MockStore() });
     const engine = new InngestExecutionEngine(mastra, fakeStep, 0, {});
     const pubsub: any = { publish: vi.fn().mockResolvedValue(undefined) };
+    const workflowsStore = await mastra.getStorage()!.getStore('workflows');
+    await workflowsStore!.persistWorkflowSnapshot({
+      workflowName: 'nested-resume-workflow',
+      runId: 'nested-run',
+      snapshot: {
+        runId: 'nested-run',
+        serializedStepGraph: [],
+        status: 'suspended',
+        value: {},
+        context: { input: { value: 'ok' } },
+        activePaths: [],
+        suspendedPaths: { 'nested-step': [0] },
+        activeStepsPath: {},
+        resumeLabels: {},
+        waitingPaths: {},
+        timestamp: Date.now(),
+        executionGeneration: 'nested-resume-execution',
+        lifecycleResumeAttempt: 4,
+        lifecycleStepStates: {},
+      },
+    });
 
     const result = await engine.executeWorkflowStep({
       step: nestedWorkflow as any,
-      stepResults: {},
+      stepResults: {
+        'nested-step': {
+          status: 'suspended',
+          suspendPayload: { __workflow_meta: { runId: 'nested-run' } },
+        },
+      },
       executionContext: {
         workflowId: 'parent',
         runId: 'parent-run',
@@ -409,5 +456,8 @@ describe('@mastra/inngest actor signal threading (hermetic)', () => {
     expect(invokeData).toHaveLength(1);
     expect(invokeData[0].resume).toBeDefined(); // confirms we hit the resume branch
     expect(invokeData[0].actor).toEqual(actor);
+    expect(invokeData[0].executionGeneration).toBe('nested-resume-execution');
+    expect(invokeData[0].lifecycleResumeAttempt).toBe(5);
+    expect(invokeData[0].lifecycleStepStates).toEqual({});
   });
 });

@@ -1,10 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
 import { createStep, createWorkflow } from '..';
 import { EventEmitterPubSub } from '../../../events/event-emitter';
 import type { Event } from '../../../events/types';
 import { Mastra } from '../../../mastra';
 import { MockStore } from '../../../storage/mock';
+import { createEmptyWorkflowSnapshot } from '../../../storage/workflow-snapshot';
 
 function makeStartEvent(workflowId: string, runId: string): Event {
   return {
@@ -13,6 +14,9 @@ function makeStartEvent(workflowId: string, runId: string): Event {
     data: {
       workflowId,
       runId,
+      executionGeneration: `dispatch-generation:${workflowId}:${runId}`,
+      lifecycleResumeAttempt: 0,
+      lifecycleStepStates: {},
       executionPath: [0],
       stepResults: {},
       prevResult: { status: 'success', output: {} },
@@ -23,6 +27,55 @@ function makeStartEvent(workflowId: string, runId: string): Event {
 }
 
 describe('WorkflowEventProcessor #dispatch', () => {
+  it('acknowledges a late cancel without overwriting a terminal run', async () => {
+    const pubsub = new EventEmitterPubSub();
+    const mastra = new Mastra({
+      logger: false,
+      storage: new MockStore(),
+      workflows: {} as any,
+      pubsub,
+    });
+    const workflows = await mastra.getStorage()!.getStore('workflows');
+    await workflows!.persistWorkflowSnapshot({
+      workflowName: 'completed-workflow',
+      runId: 'completed-run',
+      snapshot: {
+        ...createEmptyWorkflowSnapshot('completed-run'),
+        status: 'success',
+        executionGeneration: 'completed-generation',
+        lifecycleResumeAttempt: 0,
+        lifecycleStepStates: {},
+      },
+    });
+    const publish = vi.spyOn(pubsub, 'publish');
+
+    await expect(
+      mastra.handleWorkflowEvent({
+        type: 'workflow.cancel',
+        runId: 'completed-run',
+        data: {
+          workflowId: 'completed-workflow',
+          runId: 'completed-run',
+          executionGeneration: 'completed-generation',
+          lifecycleResumeAttempt: 0,
+          lifecycleStepStates: {},
+          executionPath: [],
+          stepResults: {},
+          prevResult: { status: 'canceled' },
+          activeStepsPath: {},
+          requestContext: {},
+        },
+      } as Event),
+    ).resolves.toEqual({ ok: true });
+
+    await expect(
+      workflows!.loadWorkflowSnapshot({ workflowName: 'completed-workflow', runId: 'completed-run' }),
+    ).resolves.toMatchObject({ status: 'success' });
+    expect(publish).not.toHaveBeenCalled();
+
+    await mastra.shutdown();
+  });
+
   it('resolves the workflow by its `id` even when registered under a different key (issue #16471)', async () => {
     // Workflow has id "daily-report" but is registered as { dailyReport }.
     // The scheduler emits `workflow.start` with workflowId="daily-report",
@@ -92,6 +145,9 @@ describe('WorkflowEventProcessor #dispatch', () => {
       data: {
         workflowId: 'ghost-workflow',
         runId: 'run-1',
+        executionGeneration: 'dispatch-generation:ghost-workflow:run-1',
+        lifecycleResumeAttempt: 0,
+        lifecycleStepStates: {},
         executionPath: [],
         stepResults: {},
         prevResult: { status: 'failed', error: { message: 'gone' } as any },

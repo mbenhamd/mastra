@@ -27,6 +27,7 @@ import type { ExecuteSleepParams, ExecuteSleepUntilParams } from './handlers/sle
 import { executeSleep as executeSleepHandler, executeSleepUntil as executeSleepUntilHandler } from './handlers/sleep';
 import type { ExecuteStepParams } from './handlers/step';
 import { executeStep as executeStepHandler } from './handlers/step';
+import { publishWorkflowLifecycleEvent, requireWorkflowExecutionGeneration } from './lifecycle-events';
 import type { ConditionFunction, ConditionFunctionParams, Step } from './step';
 import type {
   FormattedWorkflowResult,
@@ -88,6 +89,45 @@ export class DefaultExecutionEngine extends ExecutionEngine {
   /** Clears the last-persisted-status entry for a run (used on run cleanup). */
   clearLastPersistedStatus(runId: string): void {
     this.lastPersistedStatusByRun.delete(runId);
+  }
+
+  async getAuthoritativeExecutionDisposition(params: {
+    workflowId: string;
+    runId: string;
+    executionGeneration: string;
+  }): Promise<WorkflowRunStatus | 'superseded' | undefined> {
+    const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
+    const snapshot = await workflowsStore?.loadWorkflowSnapshot({
+      workflowName: params.workflowId,
+      runId: params.runId,
+    });
+    if (!snapshot) return undefined;
+    if (snapshot.executionGeneration !== params.executionGeneration) return 'superseded';
+    if (
+      snapshot.status === 'success' ||
+      snapshot.status === 'failed' ||
+      snapshot.status === 'canceled' ||
+      snapshot.status === 'tripwire' ||
+      snapshot.status === 'bailed'
+    ) {
+      // executeEntry persists this execution's own step result before control
+      // returns here. Do not mistake that local write for an independently
+      // settled owner: doing so skips bail normalization, workflow callbacks,
+      // and the canonical workflow terminal sequence. A remote terminal write
+      // remains distinguishable because it did not update this engine-local
+      // persisted-status marker.
+      if (this.getLastPersistedStatus(params.runId) === snapshot.status) return undefined;
+      return snapshot.status;
+    }
+    return undefined;
+  }
+
+  private async isAuthoritativelyCanceled(params: {
+    workflowId: string;
+    runId: string;
+    executionGeneration: string;
+  }): Promise<boolean> {
+    return (await this.getAuthoritativeExecutionDisposition(params)) === 'canceled';
   }
 
   /**
@@ -424,7 +464,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
    */
   async executeStepWithRetry<T>(
     stepId: string,
-    runStep: () => Promise<T>,
+    runStep: (retryCount: number) => Promise<T>,
     params: {
       retries: number;
       delay: number;
@@ -444,6 +484,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
           error: Error;
           endedAt: number;
           tripwire?: StepTripwireInfo;
+          retryCount?: number;
         };
       }
   > {
@@ -452,7 +493,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
         await new Promise(resolve => setTimeout(resolve, params.delay));
       }
       try {
-        const result = await this.wrapDurableOperation(stepId, runStep);
+        const result = await this.wrapDurableOperation(stepId, () => runStep(i));
         return { ok: true, result };
       } catch (e) {
         const isNonRetryable = e instanceof MastraNonRetryableError;
@@ -488,6 +529,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
               status: 'failed',
               error: errorInstance,
               endedAt: Date.now(),
+              retryCount: i,
               ...(isNonRetryable && { nonRetryable: true as const }),
               // Preserve TripWire data as plain object for proper serialization
               tripwire:
@@ -712,6 +754,9 @@ export class DefaultExecutionEngine extends ExecutionEngine {
   async execute<TState, TInput, TOutput>(params: {
     workflowId: string;
     runId: string;
+    executionGeneration: string;
+    lifecycleResumeAttempt: number;
+    lifecycleStepStates: Record<string, { stepCallId: string; stepAttempt: number }>;
     resourceId?: string;
     disableScorers?: boolean;
     graph: ExecutionGraph;
@@ -766,11 +811,27 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       timeTravel,
       perStep,
     } = params;
+    const executionGeneration = requireWorkflowExecutionGeneration(
+      params.executionGeneration,
+      `Default workflow engine ${params.workflowId}/${params.runId}`,
+    );
+    const lifecycleResumeAttempt = params.lifecycleResumeAttempt;
+    const lifecycleStepStates = params.lifecycleStepStates;
     const { attempts = 0, delay = 0 } = retryConfig ?? {};
     const steps = graph.steps;
 
     //clear retryCounts
     this.retryCounts.clear();
+
+    await publishWorkflowLifecycleEvent({
+      pubsub: params.pubsub,
+      workflowId,
+      runId,
+      executionGeneration,
+      event: params.resume
+        ? { type: 'workflow.resumed', resumeAttempt: lifecycleResumeAttempt, resumeData: params.resume.resumePayload }
+        : { type: 'workflow.started', resumeAttempt: lifecycleResumeAttempt, input },
+    });
 
     if (steps.length === 0) {
       const empty_graph_error = new MastraError({
@@ -781,6 +842,25 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       });
 
       workflowSpan?.error({ error: empty_graph_error });
+      await publishWorkflowLifecycleEvent({
+        pubsub: params.pubsub,
+        workflowId,
+        runId,
+        executionGeneration,
+        event: { type: 'workflow.failed', resumeAttempt: lifecycleResumeAttempt, error: empty_graph_error },
+      });
+      await publishWorkflowLifecycleEvent({
+        pubsub: params.pubsub,
+        workflowId,
+        runId,
+        executionGeneration,
+        event: {
+          type: 'workflow.finished',
+          resumeAttempt: lifecycleResumeAttempt,
+          status: 'failed',
+          error: empty_graph_error,
+        },
+      });
       throw empty_graph_error;
     }
 
@@ -811,6 +891,9 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       const executionContext: ExecutionContext = {
         workflowId,
         runId,
+        executionGeneration,
+        lifecycleResumeAttempt,
+        lifecycleStepStates,
         executionPath: [i],
         stepExecutionPath,
         activeStepsPath: {},
@@ -855,13 +938,49 @@ export class DefaultExecutionEngine extends ExecutionEngine {
         currentRequestContext = this.deserializeRequestContext(lastOutput.requestContext);
       }
 
+      const authoritativeDisposition = await this.getAuthoritativeExecutionDisposition({
+        workflowId,
+        runId,
+        executionGeneration,
+      });
+      if (authoritativeDisposition) {
+        // A terminal transition (or a newer generation) completed while user
+        // code was still awaiting. The owner already published its terminal
+        // lifecycle sequence, so return the durable outcome without appending
+        // duplicate step/workflow events after workflow.finished.
+        const authoritativeStatus = authoritativeDisposition === 'superseded' ? 'canceled' : authoritativeDisposition;
+        const authoritativeResult = (await this.fmtReturnValue(
+          params.pubsub,
+          stepResults,
+          { ...lastOutput.result, status: authoritativeStatus },
+          undefined,
+          stepExecutionPath,
+        )) as any;
+        if (authoritativeStatus === 'failed' || authoritativeStatus === 'tripwire') {
+          workflowSpan?.error({
+            error: authoritativeResult.error ?? new Error(`Workflow ended with status ${authoritativeStatus}`),
+            attributes: { status: authoritativeStatus },
+          });
+        } else {
+          workflowSpan?.end({
+            output: authoritativeResult.result,
+            attributes: { status: authoritativeStatus },
+          });
+        }
+        this.clearLastPersistedStatus(runId);
+        return {
+          ...authoritativeResult,
+          ...(params.outputOptions?.includeState ? { state: lastState } : {}),
+        };
+      }
+
       // if step result is not success, stop and return
       if (lastOutput.result.status !== 'success') {
         if (lastOutput.result.status === 'bailed') {
           lastOutput.result.status = 'success';
         }
 
-        const result = (await this.fmtReturnValue(
+        let result = (await this.fmtReturnValue(
           params.pubsub,
           stepResults,
           lastOutput.result,
@@ -892,6 +1011,11 @@ export class DefaultExecutionEngine extends ExecutionEngine {
           requestContext: currentRequestContext,
           tracingContext: persistTracingContext,
         });
+
+        if (await this.isAuthoritativelyCanceled({ workflowId, runId, executionGeneration })) {
+          result = { ...result, status: 'canceled', result: undefined, error: undefined };
+          lastOutput.result.status = 'canceled';
+        }
 
         if (result.error) {
           workflowSpan?.error({
@@ -932,6 +1056,52 @@ export class DefaultExecutionEngine extends ExecutionEngine {
             type: 'watch',
             runId,
             data: { type: 'workflow-paused', payload: {} },
+          });
+        }
+
+        if (result.status === 'suspended') {
+          await publishWorkflowLifecycleEvent({
+            pubsub: params.pubsub,
+            workflowId,
+            runId,
+            executionGeneration,
+            event: {
+              type: 'workflow.suspended',
+              resumeAttempt: lifecycleResumeAttempt,
+              suspendedStepIds: Object.keys(lastOutput.mutableContext.suspendedPaths),
+            },
+          });
+        } else if (result.status !== 'paused') {
+          if (result.status === 'failed' || result.status === 'tripwire') {
+            await publishWorkflowLifecycleEvent({
+              pubsub: params.pubsub,
+              workflowId,
+              runId,
+              executionGeneration,
+              event: { type: 'workflow.failed', resumeAttempt: lifecycleResumeAttempt, error: result.error },
+            });
+          } else if (result.status === 'canceled') {
+            await publishWorkflowLifecycleEvent({
+              pubsub: params.pubsub,
+              workflowId,
+              runId,
+              executionGeneration,
+              event: { type: 'workflow.canceled', resumeAttempt: lifecycleResumeAttempt },
+            });
+          }
+
+          await publishWorkflowLifecycleEvent({
+            pubsub: params.pubsub,
+            workflowId,
+            runId,
+            executionGeneration,
+            event: {
+              type: 'workflow.finished',
+              resumeAttempt: lifecycleResumeAttempt,
+              status: result.status,
+              result: result.result,
+              error: result.error,
+            },
           });
         }
 
@@ -991,7 +1161,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
     }
 
     // after all steps are successful, return result
-    const result = (await this.fmtReturnValue(
+    let result = (await this.fmtReturnValue(
       params.pubsub,
       stepResults,
       lastOutput.result,
@@ -1010,6 +1180,10 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       error: result.error,
       requestContext: currentRequestContext,
     });
+
+    if (await this.isAuthoritativelyCanceled({ workflowId, runId, executionGeneration })) {
+      result = { ...result, status: 'canceled', result: undefined, error: undefined };
+    }
 
     workflowSpan?.end({
       output: result.result,
@@ -1031,6 +1205,30 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       requestContext: currentRequestContext,
       state: lastState,
       stepExecutionPath,
+    });
+
+    if (result.status === 'canceled') {
+      await publishWorkflowLifecycleEvent({
+        pubsub: params.pubsub,
+        workflowId,
+        runId,
+        executionGeneration,
+        event: { type: 'workflow.canceled', resumeAttempt: lifecycleResumeAttempt },
+      });
+    }
+
+    await publishWorkflowLifecycleEvent({
+      pubsub: params.pubsub,
+      workflowId,
+      runId,
+      executionGeneration,
+      event: {
+        type: 'workflow.finished',
+        resumeAttempt: lifecycleResumeAttempt,
+        status: result.status,
+        result: result.result,
+        error: result.error,
+      },
     });
 
     // Drop the last-persisted-status tracker for terminal runs so the map

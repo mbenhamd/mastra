@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
+import { InMemoryServerCache } from '../../../cache/inmemory';
+import { CachingPubSub } from '../../../events/caching-pubsub';
 import { EventEmitterPubSub } from '../../../events/event-emitter';
+import type { PubSub } from '../../../events/pubsub';
 import { Mastra } from '../../../mastra';
 import { MockStore } from '../../../storage/mock';
+import { getWorkflowLifecycleTopic } from '../../lifecycle-events';
 import { WorkflowEventProcessor } from './index';
 
 class TestWorkflowEventProcessor extends WorkflowEventProcessor {
@@ -16,17 +20,24 @@ class TestWorkflowEventProcessor extends WorkflowEventProcessor {
   }
 }
 
-async function persistRunStatus(mastra: Mastra, status: string) {
+async function persistRunStatus(mastra: Mastra, status: string, executionGeneration?: string) {
   const workflowsStore = await mastra.getStorage()!.getStore('workflows');
   await workflowsStore!.persistWorkflowSnapshot({
     workflowName: 'wf',
     runId: 'run-1',
-    snapshot: { status, context: {}, activePaths: [], timestamp: Date.now(), value: {}, runId: 'run-1' } as any,
+    snapshot: {
+      status,
+      context: {},
+      activePaths: [],
+      timestamp: Date.now(),
+      value: {},
+      runId: 'run-1',
+      executionGeneration,
+    } as any,
   });
 }
 
-function setup(topicCleanupDelayMs?: number) {
-  const pubsub = new EventEmitterPubSub();
+function setup(topicCleanupDelayMs?: number, pubsub: PubSub = new EventEmitterPubSub()) {
   const mastra = new Mastra({
     logger: false,
     storage: new MockStore(),
@@ -41,6 +52,9 @@ function setup(topicCleanupDelayMs?: number) {
 const baseArgs = {
   workflowId: 'wf',
   runId: 'run-1',
+  executionGeneration: 'test-execution-generation',
+  lifecycleResumeAttempt: 0,
+  lifecycleStepStates: {},
   executionPath: [],
   resumeSteps: [],
   stepResults: {},
@@ -59,6 +73,13 @@ describe('WorkflowEventProcessor per-run topic cleanup', () => {
     expect(clearTopicSpy).not.toHaveBeenCalled();
     await vi.waitFor(() => {
       expect(clearTopicSpy).toHaveBeenCalledWith('workflow.events.v2.run-1');
+      expect(clearTopicSpy).toHaveBeenCalledWith(
+        getWorkflowLifecycleTopic({
+          workflowId: baseArgs.workflowId,
+          runId: baseArgs.runId,
+          executionGeneration: baseArgs.executionGeneration,
+        }),
+      );
     });
 
     await mastra.shutdown();
@@ -119,6 +140,26 @@ describe('WorkflowEventProcessor per-run topic cleanup', () => {
     await mastra.shutdown();
   });
 
+  it('does not clear exact replay history before its declared retention horizon', async () => {
+    vi.useFakeTimers();
+    try {
+      const pubsub = new CachingPubSub(new EventEmitterPubSub(), new InMemoryServerCache(), {
+        indexedReplay: { retentionMs: 100, maxEvents: 100 },
+      });
+      const { mastra, processor, clearTopicSpy } = setup(10, pubsub);
+
+      await processor.callProcessWorkflowEnd({ ...baseArgs });
+      await vi.advanceTimersByTimeAsync(99);
+      expect(clearTopicSpy).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(clearTopicSpy).toHaveBeenCalledWith('workflow.events.v2.run-1');
+      await mastra.shutdown();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('skips deletion when the run is active again at fire time (cross-process restart)', async () => {
     const { mastra, processor, clearTopicSpy } = setup(10);
 
@@ -132,6 +173,50 @@ describe('WorkflowEventProcessor per-run topic cleanup', () => {
     expect(clearTopicSpy).not.toHaveBeenCalled();
 
     await mastra.shutdown();
+  });
+
+  it('does not let an old generation clear a newer generation shared topic', async () => {
+    vi.useFakeTimers();
+    try {
+      const { mastra, processor, clearTopicSpy } = setup(10);
+
+      await processor.callProcessWorkflowEnd({ ...baseArgs });
+      await persistRunStatus(mastra, 'success', 'newer-execution-generation');
+      await vi.advanceTimersByTimeAsync(10);
+
+      expect(clearTopicSpy).not.toHaveBeenCalledWith('workflow.events.v2.run-1');
+      expect(clearTopicSpy).toHaveBeenCalledWith(
+        getWorkflowLifecycleTopic({
+          workflowId: baseArgs.workflowId,
+          runId: baseArgs.runId,
+          executionGeneration: baseArgs.executionGeneration,
+        }),
+      );
+
+      await mastra.shutdown();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('retains independent cleanup timers when workflows reuse a run id', async () => {
+    vi.useFakeTimers();
+    try {
+      const { mastra, processor, clearTopicSpy } = setup(10);
+      const first = { ...baseArgs, workflowId: 'workflow-a', executionGeneration: 'generation-a' };
+      const second = { ...baseArgs, workflowId: 'workflow-b', executionGeneration: 'generation-b' };
+
+      await processor.callProcessWorkflowEnd(first);
+      await processor.callProcessWorkflowEnd(second);
+      await vi.advanceTimersByTimeAsync(10);
+
+      expect(clearTopicSpy).toHaveBeenCalledWith(getWorkflowLifecycleTopic(first));
+      expect(clearTopicSpy).toHaveBeenCalledWith(getWorkflowLifecycleTopic(second));
+
+      await mastra.shutdown();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('proceeds with deletion when the persisted status is terminal', async () => {
@@ -151,28 +236,33 @@ describe('WorkflowEventProcessor per-run topic cleanup', () => {
   });
 
   it('cancels a pending cleanup when the run restarts in-process', async () => {
-    const { mastra, processor, clearTopicSpy } = setup(30);
+    vi.useFakeTimers();
+    try {
+      const { mastra, processor, clearTopicSpy } = setup(30);
 
-    await processor.callProcessWorkflowEnd({ ...baseArgs });
+      await processor.callProcessWorkflowEnd({ ...baseArgs });
 
-    // A timeTravel/restart re-enters through processWorkflowStart with the
-    // same runId. The minimal workflow here may make later phases of start
-    // throw — the cancellation happens first and is what's under test.
-    await processor
-      .callProcessWorkflowStart({
-        ...baseArgs,
-        workflow: { id: 'wf', options: {}, stepGraph: [] },
-      })
-      .catch(() => {});
+      // A timeTravel/restart re-enters through processWorkflowStart with the
+      // same runId. The minimal workflow here may make later phases of start
+      // throw — the cancellation happens first and is what's under test.
+      await processor
+        .callProcessWorkflowStart({
+          ...baseArgs,
+          workflow: { id: 'wf', options: {}, stepGraph: [] },
+        })
+        .catch(() => {});
 
-    // Force the persisted status terminal so the fire-time status guard would
-    // NOT protect the topic. Only the in-process timer cancellation can
-    // prevent deletion here — this isolates the layer under test.
-    await persistRunStatus(mastra, 'success');
+      // Force the persisted status terminal so the fire-time status guard would
+      // NOT protect the topic. Only the in-process timer cancellation can
+      // prevent deletion here — this isolates the layer under test.
+      await persistRunStatus(mastra, 'success');
 
-    await new Promise(resolve => setTimeout(resolve, 80));
-    expect(clearTopicSpy).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(80);
+      expect(clearTopicSpy).not.toHaveBeenCalled();
 
-    await mastra.shutdown();
+      await mastra.shutdown();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

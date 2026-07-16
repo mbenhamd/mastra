@@ -163,6 +163,9 @@ export async function executeParallel(
         timeTravel,
         resume,
         executionContext: {
+          executionGeneration: executionContext.executionGeneration,
+          lifecycleResumeAttempt: executionContext.lifecycleResumeAttempt,
+          lifecycleStepStates: executionContext.lifecycleStepStates,
           activeStepsPath: executionContext.activeStepsPath,
           workflowId,
           runId,
@@ -484,6 +487,9 @@ export async function executeConditional(
         restart,
         timeTravel,
         executionContext: {
+          executionGeneration: executionContext.executionGeneration,
+          lifecycleResumeAttempt: executionContext.lifecycleResumeAttempt,
+          lifecycleStepStates: executionContext.lifecycleStepStates,
           workflowId,
           runId,
           executionPath: [...executionContext.executionPath, entry.steps.indexOf(step)],
@@ -969,6 +975,8 @@ export async function executeForeach(
   let canceledResult: ForeachStepResult | null = null;
   let inFlight = 0;
   let resolveCompletion: (() => void) | undefined;
+  const lifecycleResultEmissions: Promise<void>[] = [];
+  const lifecycleResultEmissionErrors: unknown[] = [];
 
   /** Publish a workflow-step-progress event for a single foreach iteration. */
   const emitIterationProgress = (
@@ -1021,6 +1029,13 @@ export async function executeForeach(
       disableScorers,
       serializedStepGraph,
       perStep,
+      deferLifecycleResult: emission => {
+        lifecycleResultEmissions.push(
+          emission.catch(error => {
+            lifecycleResultEmissionErrors.push(error);
+          }),
+        );
+      },
     });
 
   /** Handle a non-success result (suspended or failed). Kills the queue so remaining items are skipped. */
@@ -1177,6 +1192,8 @@ export async function executeForeach(
       resolveCompletion = resolve;
     });
   }
+  await Promise.all(lifecycleResultEmissions);
+  if (lifecycleResultEmissionErrors.length > 0) throw lifecycleResultEmissionErrors[0];
 
   // Handle cancellation
   if (canceledResult) {

@@ -6,7 +6,11 @@ import type { SerializedError } from '@mastra/core/error';
 import type { PubSub } from '@mastra/core/events';
 import type { Mastra } from '@mastra/core/mastra';
 import type { EntityType } from '@mastra/core/observability';
-import { DefaultExecutionEngine, createTimeTravelExecutionParams } from '@mastra/core/workflows';
+import {
+  DefaultExecutionEngine,
+  createTimeTravelExecutionParams,
+  requireWorkflowExecutionGeneration,
+} from '@mastra/core/workflows';
 import type {
   ExecutionContext,
   Step,
@@ -112,7 +116,7 @@ export class InngestExecutionEngine extends DefaultExecutionEngine {
    */
   async executeStepWithRetry<T>(
     stepId: string,
-    runStep: () => Promise<T>,
+    runStep: (retryCount: number) => Promise<T>,
     params: {
       retries: number;
       delay: number;
@@ -122,15 +126,20 @@ export class InngestExecutionEngine extends DefaultExecutionEngine {
     },
   ): Promise<
     | { ok: true; result: T }
-    | { ok: false; error: { status: 'failed'; error: Error; endedAt: number; nonRetryable?: true } }
+    | {
+        ok: false;
+        error: { status: 'failed'; error: Error; endedAt: number; nonRetryable?: true; retryCount?: number };
+      }
   > {
     for (let i = 0; i < params.retries + 1; i++) {
       if (i > 0 && params.delay) {
         await new Promise(resolve => setTimeout(resolve, params.delay));
       }
       try {
-        //removed retry config with RetryAfterError from wrapDurableOperation, since we're manually handling retries here
-        const result = await this.wrapDurableOperation(stepId, runStep);
+        // Every attempt needs its own Inngest step id. On function replay the
+        // failed attempt is restored from durable history and the loop advances
+        // to the next id without re-running the user callback.
+        const result = await this.wrapDurableOperation(`${stepId}.attempt.${i}`, () => runStep(i));
         return { ok: true, result };
       } catch (e) {
         const isNonRetryable = isNonRetryableStepFailure(e);
@@ -151,6 +160,7 @@ export class InngestExecutionEngine extends DefaultExecutionEngine {
               ok: false,
               error: {
                 ...cause,
+                retryCount: i,
                 ...(isNonRetryable && { nonRetryable: true as const }),
               },
             };
@@ -171,6 +181,7 @@ export class InngestExecutionEngine extends DefaultExecutionEngine {
               status: 'failed',
               error: errorInstance,
               endedAt: Date.now(),
+              retryCount: i,
               ...(isNonRetryable && { nonRetryable: true as const }),
             },
           };
@@ -178,7 +189,10 @@ export class InngestExecutionEngine extends DefaultExecutionEngine {
       }
     }
     // Should never reach here, but TypeScript needs it
-    return { ok: false, error: { status: 'failed', error: new Error('Unknown error'), endedAt: Date.now() } };
+    return {
+      ok: false,
+      error: { status: 'failed', error: new Error('Unknown error'), endedAt: Date.now(), retryCount: params.retries },
+    };
   }
 
   /**
@@ -522,6 +536,22 @@ export class InngestExecutionEngine extends DefaultExecutionEngine {
           workflowName: step.id,
           runId: runId,
         });
+        if (!snapshot) {
+          throw new NonRetriableError(`Cannot resume nested workflow run ${step.id}/${runId}: snapshot not found`);
+        }
+        if (snapshot.status !== 'suspended') {
+          throw new NonRetriableError(
+            `Cannot resume nested workflow run ${step.id}/${runId}: workflow run is not suspended`,
+          );
+        }
+        const lifecycleExecution = {
+          executionGeneration: requireWorkflowExecutionGeneration(
+            snapshot.executionGeneration,
+            `Nested Inngest workflow resume ${step.id}/${runId}`,
+          ),
+          lifecycleResumeAttempt: (snapshot.lifecycleResumeAttempt ?? 0) + 1,
+          lifecycleStepStates: snapshot.lifecycleStepStates ?? {},
+        };
 
         const invokeResp = (await this.inngestStep.invoke(`workflow.${executionContext.workflowId}.step.${step.id}`, {
           function: step.getFunction(),
@@ -541,6 +571,7 @@ export class InngestExecutionEngine extends DefaultExecutionEngine {
             perStep,
             tracingOptions: nestedTracingContext,
             actor,
+            ...lifecycleExecution,
           },
         })) as any;
         result = invokeResp.result;

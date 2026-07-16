@@ -73,14 +73,18 @@ import type {
   StepMetadata,
   CreateWorkflowParams,
   InferSchemaOutput,
+  WorkflowLifecycleEventCallback,
+  WorkflowLifecycleWatchOptions,
 } from '../../workflows/types';
 import { PUBSUB_SYMBOL, STREAM_FORMAT_SYMBOL } from '../constants';
+import { createWorkflowExecutionGeneration } from '../lifecycle-events';
 import { validateCron } from '../scheduler/cron';
 import type { WorkflowScheduleConfig } from '../scheduler/types';
 import { forwardAgentStreamChunk } from '../stream-utils';
 import type { StreamChunkWriter } from '../stream-utils';
 import { Workflow, Run } from '../workflow';
 import type { AgentStepOptions, RunWithRawInput } from '../workflow';
+import { watchWorkflowLifecycleEvents } from '../workflow-lifecycle';
 import { EventedExecutionEngine } from './execution-engine';
 import { isEventedForeachSuspensionResult } from './foreach-suspension';
 import { isTripwireChunk, createTripWireFromChunk, getTextDeltaFromChunk } from './helpers';
@@ -1703,8 +1707,14 @@ export class EventedWorkflow<
     }
 
     if (!existsInStorage && shouldPersistSnapshot) {
+      const lifecycleExecution = {
+        executionGeneration: createWorkflowExecutionGeneration(),
+        lifecycleResumeAttempt: 0,
+        lifecycleStepStates: {},
+      };
       const initialSnapshot: WorkflowRunState = {
         runId: runIdToUse,
+        ...lifecycleExecution,
         status: 'pending',
         value: {},
         context: {} as WorkflowRunState['context'],
@@ -1722,10 +1732,20 @@ export class EventedWorkflow<
         workflowName: this.id,
         runId: runIdToUse,
         resourceId: options?.resourceId,
-        snapshot: this.options?.pruneSnapshot
-          ? this.options.pruneSnapshot({ snapshot: initialSnapshot, workflowStatus: 'pending' })
-          : initialSnapshot,
+        snapshot: {
+          ...(this.options?.pruneSnapshot
+            ? this.options.pruneSnapshot({ snapshot: initialSnapshot, workflowStatus: 'pending' })
+            : initialSnapshot),
+          ...lifecycleExecution,
+        },
       });
+    }
+
+    if (
+      workflowsStore &&
+      ((!existsInStorage && shouldPersistSnapshot) || (existsInStorage && existingRun?.status === 'pending'))
+    ) {
+      await run.getLifecycleExecutionIdentity();
     }
 
     return run as RunWithRawInput<TEngineType, TSteps, TState, TInput, TOutput, unknown, TRawInput>;
@@ -1739,6 +1759,11 @@ export class EventedRun<
   TInput = unknown,
   TOutput = unknown,
 > extends Run<TEngineType, TSteps, TState, TInput, TOutput> {
+  private abortHandlerInstalled = false;
+  private abortHandlerController?: AbortController;
+  private abortHandler?: () => void;
+  private cancelDispatchPromise?: Promise<boolean>;
+
   constructor(params: {
     workflowId: string;
     runId: string;
@@ -1761,6 +1786,19 @@ export class EventedRun<
   }) {
     super(params);
     this.serializedStepGraph = params.serializedStepGraph;
+    this.setupAbortHandler();
+  }
+
+  protected override beginLifecycleExecution() {
+    // Restart/time-travel creates a new execution lineage on the same Run
+    // handle. Cancellation state is lineage-scoped too: an already-aborted
+    // controller and a memoized cancel dispatch from the previous generation
+    // must never leak into the new one.
+    this.detachAbortHandler();
+    this.cancelDispatchPromise = undefined;
+    const lifecycleExecution = super.beginLifecycleExecution();
+    this.setupAbortHandler();
+    return lifecycleExecution;
   }
 
   /**
@@ -1768,21 +1806,51 @@ export class EventedRun<
    * This ensures consistent cancellation behavior whether abort() is called directly or via cancel().
    */
   private setupAbortHandler(): void {
+    if (this.abortHandlerInstalled) return;
+
+    const abortController = this.abortController;
     const abortHandler = () => {
-      this.mastra?.pubsub
-        .publish('workflows', {
-          type: 'workflow.cancel',
-          runId: this.runId,
-          data: {
-            workflowId: this.workflowId,
+      void this.dispatchCancelEvent();
+    };
+    this.abortHandlerController = abortController;
+    this.abortHandler = abortHandler;
+    this.abortHandlerInstalled = true;
+    abortController.signal.addEventListener('abort', abortHandler, { once: true });
+  }
+
+  private detachAbortHandler(): void {
+    if (this.abortHandlerController && this.abortHandler) {
+      this.abortHandlerController.signal.removeEventListener('abort', this.abortHandler);
+    }
+    this.abortHandlerController = undefined;
+    this.abortHandler = undefined;
+    this.abortHandlerInstalled = false;
+  }
+
+  private dispatchCancelEvent(): Promise<boolean> {
+    if (!this.cancelDispatchPromise) {
+      this.cancelDispatchPromise = this.getLifecycleExecutionTuple()
+        .then(async identity => {
+          if (!this.mastra?.pubsub) return false;
+          await this.mastra?.pubsub.publish('workflows', {
+            type: 'workflow.cancel',
             runId: this.runId,
-          },
+            data: {
+              workflowId: identity.workflowId,
+              runId: identity.runId,
+              executionGeneration: identity.executionGeneration,
+              lifecycleResumeAttempt: identity.lifecycleResumeAttempt,
+              lifecycleStepStates: identity.lifecycleStepStates,
+            },
+          });
+          return true;
         })
         .catch(err => {
           this.mastra?.getLogger()?.error(`Failed to publish workflow.cancel for runId ${this.runId}:`, err);
+          return false;
         });
-    };
-    this.abortController.signal.addEventListener('abort', abortHandler, { once: true });
+    }
+    return this.cancelDispatchPromise;
   }
 
   async start({
@@ -1817,6 +1885,9 @@ export class EventedRun<
 
     const inputDataToUse = await this._validateInput(inputData ?? ({} as TInput));
     const initialStateToUse = await this._validateInitialState(initialState ?? ({} as TState));
+    const lifecycleExecution = this.startLifecycleExecution();
+    await this.assertLifecycleExecutionAdmission(lifecycleExecution);
+    this.workflowRunStatus = 'running';
 
     const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
     // Always persist the initial run record regardless of shouldPersistSnapshot.
@@ -1824,6 +1895,7 @@ export class EventedRun<
     // aggregation (aggregateBranchResults reads stepResults via storage).
     const initialRunSnapshot: WorkflowRunState = {
       runId: this.runId,
+      ...lifecycleExecution,
       serializedStepGraph: this.serializedStepGraph,
       status: 'running',
       value: {},
@@ -1840,16 +1912,17 @@ export class EventedRun<
       workflowName: this.workflowId,
       runId: this.runId,
       resourceId: this.resourceId,
-      snapshot: this.executionEngine.options?.pruneSnapshot
-        ? this.executionEngine.options.pruneSnapshot({ snapshot: initialRunSnapshot, workflowStatus: 'running' })
-        : initialRunSnapshot,
+      snapshot: {
+        ...(this.executionEngine.options?.pruneSnapshot
+          ? this.executionEngine.options.pruneSnapshot({ snapshot: initialRunSnapshot, workflowStatus: 'running' })
+          : initialRunSnapshot),
+        ...lifecycleExecution,
+      },
     });
 
     if (!this.mastra?.pubsub) {
       throw new Error('Mastra instance with pubsub is required for workflow execution');
     }
-
-    this.setupAbortHandler();
 
     // The evented engine runs steps from serialized pubsub events, which can't
     // carry the non-serializable AISpan. Create the WORKFLOW_RUN span here and
@@ -1877,6 +1950,7 @@ export class EventedRun<
       result = await this.executionEngine.execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({
         workflowId: this.workflowId,
         runId: this.runId,
+        ...lifecycleExecution,
         resourceId: this.resourceId,
         graph: this.executionGraph,
         serializedStepGraph: this.serializedStepGraph,
@@ -1905,6 +1979,7 @@ export class EventedRun<
       this.mastra?.__unregisterRunTracingContext(this.runId);
       this.cleanup?.();
     }
+    this.workflowRunStatus = result.status;
 
     return result;
   }
@@ -1939,6 +2014,9 @@ export class EventedRun<
 
     const inputDataToUse = await this._validateInput(inputData ?? ({} as TInput));
     const initialStateToUse = await this._validateInitialState(initialState ?? ({} as TState));
+    const lifecycleExecution = this.startLifecycleExecution();
+    await this.assertLifecycleExecutionAdmission(lifecycleExecution);
+    this.workflowRunStatus = 'running';
 
     const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
     // Always persist the initial run record regardless of shouldPersistSnapshot.
@@ -1946,6 +2024,7 @@ export class EventedRun<
     // aggregation (aggregateBranchResults reads stepResults via storage).
     const initialRunSnapshot: WorkflowRunState = {
       runId: this.runId,
+      ...lifecycleExecution,
       serializedStepGraph: this.serializedStepGraph,
       status: 'running',
       value: {},
@@ -1962,9 +2041,12 @@ export class EventedRun<
       workflowName: this.workflowId,
       runId: this.runId,
       resourceId: this.resourceId,
-      snapshot: this.executionEngine.options?.pruneSnapshot
-        ? this.executionEngine.options.pruneSnapshot({ snapshot: initialRunSnapshot, workflowStatus: 'running' })
-        : initialRunSnapshot,
+      snapshot: {
+        ...(this.executionEngine.options?.pruneSnapshot
+          ? this.executionEngine.options.pruneSnapshot({ snapshot: initialRunSnapshot, workflowStatus: 'running' })
+          : initialRunSnapshot),
+        ...lifecycleExecution,
+      },
     });
 
     if (!this.mastra?.pubsub) {
@@ -1978,6 +2060,7 @@ export class EventedRun<
       data: {
         workflowId: this.workflowId,
         runId: this.runId,
+        ...lifecycleExecution,
         prevResult: { status: 'success', output: inputDataToUse },
         requestContext: requestContext.toJSON(),
         initialState: initialStateToUse,
@@ -2383,15 +2466,16 @@ export class EventedRun<
       throw new Error('Mastra instance with pubsub is required for workflow execution');
     }
 
-    this.setupAbortHandler();
-
     // Extract state from snapshot - could be in context.__state or in value
     const resumeState = (snapshot?.context as any)?.__state ?? snapshot?.value ?? {};
+    const lifecycleExecution = this.restoreLifecycleExecution(snapshot);
+    this.workflowRunStatus = 'running';
 
     const executionResultPromise = this.executionEngine
       .execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({
         workflowId: this.workflowId,
         runId: this.runId,
+        ...lifecycleExecution,
         graph: this.executionGraph,
         serializedStepGraph: this.serializedStepGraph,
         input: snapshot?.context?.input as TInput,
@@ -2411,6 +2495,7 @@ export class EventedRun<
         outputOptions: params.outputOptions,
       })
       .then(result => {
+        this.workflowRunStatus = result.status;
         if (result.status !== 'suspended') {
           this.closeStreamAction?.().catch(() => {});
         }
@@ -2457,19 +2542,77 @@ export class EventedRun<
     };
   }
 
+  override async watchLifecycle(
+    cb: WorkflowLifecycleEventCallback,
+    options?: WorkflowLifecycleWatchOptions,
+  ): Promise<() => Promise<void>> {
+    if (!this.mastra?.pubsub) {
+      throw new MastraError({
+        id: 'WORKFLOW_LIFECYCLE_PUBSUB_REQUIRED',
+        domain: ErrorDomain.MASTRA_WORKFLOW,
+        category: ErrorCategory.USER,
+        text: 'A Mastra instance with PubSub is required to watch an evented workflow lifecycle',
+        details: { workflowId: this.workflowId, runId: this.runId },
+      });
+    }
+
+    const executionGeneration =
+      options?.executionGeneration ?? (await this.getLifecycleExecutionIdentity()).executionGeneration;
+    return watchWorkflowLifecycleEvents({
+      pubsub: this.mastra.pubsub,
+      workflowId: this.workflowId,
+      runId: this.runId,
+      executionGeneration,
+      callback: cb,
+      options,
+    });
+  }
+
   async cancel() {
-    // Update storage directly for immediate status update (same pattern as Inngest)
     const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
-    await workflowsStore?.updateWorkflowState({
+    const snapshot = await workflowsStore?.loadWorkflowSnapshot({
       workflowName: this.workflowId,
       runId: this.runId,
-      opts: {
-        status: 'canceled',
-      },
     });
+    if (
+      snapshot &&
+      (snapshot.status === 'success' ||
+        snapshot.status === 'failed' ||
+        snapshot.status === 'canceled' ||
+        snapshot.status === 'tripwire' ||
+        snapshot.status === 'bailed') &&
+      !this.hasActiveLifecycleExecution(snapshot.executionGeneration)
+    ) {
+      this.workflowRunStatus = snapshot.status;
+      return;
+    }
+
+    // Reserve pending-run lifecycle identity before changing status. The abort
+    // handler needs this exact generation even when execution never started.
+    await this.getLifecycleExecutionIdentity();
+
+    // Let the event processor observe the admitted nonterminal snapshot before
+    // applying the local fallback update. Persisting `canceled` first would make
+    // its monotonic terminal guard correctly discard this new cancellation.
+    const dispatched = await this.dispatchCancelEvent();
+
+    // Successful publication may only mean "enqueued" on a remote transport.
+    // Keep the admitted nonterminal snapshot intact for the worker's monotonic
+    // generation/status guard. Use a direct status fallback only when dispatch
+    // itself failed and there is no worker that can observe the cancellation.
+    if (!dispatched) {
+      await workflowsStore?.updateWorkflowState({
+        workflowName: this.workflowId,
+        runId: this.runId,
+        opts: {
+          status: 'canceled',
+        },
+      });
+    }
 
     // Trigger abort signal - the abort handler will publish the workflow.cancel event
     // This ensures consistent behavior whether cancel() or abort() is called
+    this.workflowRunStatus = 'canceled';
     this.abortController.abort();
   }
 }

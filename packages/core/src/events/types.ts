@@ -10,6 +10,8 @@ export type Event = {
    * Enables efficient resume from a specific position.
    */
   index?: number;
+  /** Indexed-log generation that owns this cursor, when exact replay is enabled. */
+  logGeneration?: string;
   /**
    * How many times this message has been delivered (including this attempt).
    * Starts at 1 for the first delivery. Incremented on each nack/redelivery.
@@ -17,6 +19,16 @@ export type Event = {
    */
   deliveryAttempt?: number;
 };
+
+/**
+ * Event accepted by a PubSub transport.
+ *
+ * Most publishers omit identity and let the transport assign it. Decorators
+ * that retain or route an event may provide identity first; downstream
+ * transports must preserve those values so every delivery describes the same
+ * logical event.
+ */
+export type PublishEvent = Omit<Event, 'id' | 'createdAt'> & Partial<Pick<Event, 'id' | 'createdAt'>>;
 
 /**
  * Per-subscription batching policy.
@@ -95,4 +107,8 @@ export interface SubscribeOptions {
  *               Not calling either ack or nack leaves the message in-flight until the
  *               backend's ack deadline expires (typically 10s for GCP).
  */
-export type EventCallback = (event: Event, ack?: () => Promise<void>, nack?: () => Promise<void>) => void;
+export type EventCallback = (
+  event: Event,
+  ack?: () => Promise<void>,
+  nack?: () => Promise<void>,
+) => void | Promise<void>;

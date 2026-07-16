@@ -1,5 +1,76 @@
 import { MastraBase } from '../base';
 
+export type IndexedLogScope = 'process' | 'durable';
+
+export type IndexedLogRetention = {
+  /** Maximum age of a retained entry. */
+  maxAgeMs: number;
+  /** Maximum number of entries retained for one log. */
+  maxEntries: number;
+};
+
+export type IndexedLogEntry<T> = {
+  cursor: number;
+  storedAt: number;
+  value: T;
+};
+
+export type IndexedLogAppendResult<T> = IndexedLogEntry<T> & {
+  /** Generation atomically associated with the appended cursor. */
+  logGeneration: string;
+};
+
+export type IndexedLogReadResult<T> = {
+  /**
+   * Contiguous entries after the requested cursor. Implementations may return
+   * a bounded page; callers continue until they reach `nextCursor`.
+   */
+  entries: IndexedLogEntry<T>[];
+  /**
+   * Changes whenever a deleted or fully expired log is recreated. An empty
+   * generation returned before the first append must remain stable until that
+   * append (or explicit deletion), so a subscriber can safely wait for the
+   * first event longer than the configured event-retention window.
+   */
+  logGeneration: string;
+  /** Earliest cursor still available. Equals nextCursor when the log is empty. */
+  firstCursor: number;
+  /** Cursor that will be assigned by the next append. */
+  nextCursor: number;
+};
+
+/**
+ * Optional cache capability for an exact retained log.
+ *
+ * Implementations must allocate the cursor and append the entry atomically.
+ * A cache that only exposes separate `increment()` and `listPush()` operations
+ * does not satisfy this contract: concurrent publishers could append in a
+ * different order from cursor allocation.
+ */
+export interface AtomicIndexedLogCache {
+  readonly indexedLogScope: IndexedLogScope;
+
+  appendIndexedLogEntry<T>(key: string, value: T, retention: IndexedLogRetention): Promise<IndexedLogAppendResult<T>>;
+
+  readIndexedLogEntries<T>(
+    key: string,
+    afterCursor: number,
+    retention: IndexedLogRetention,
+  ): Promise<IndexedLogReadResult<T>>;
+
+  deleteIndexedLog(key: string): Promise<void>;
+}
+
+export function isAtomicIndexedLogCache(cache: MastraServerCache): cache is MastraServerCache & AtomicIndexedLogCache {
+  const candidate = cache as MastraServerCache & Partial<AtomicIndexedLogCache>;
+  return (
+    (candidate.indexedLogScope === 'process' || candidate.indexedLogScope === 'durable') &&
+    typeof candidate.appendIndexedLogEntry === 'function' &&
+    typeof candidate.readIndexedLogEntries === 'function' &&
+    typeof candidate.deleteIndexedLog === 'function'
+  );
+}
+
 export abstract class MastraServerCache extends MastraBase {
   constructor({ name }: { name: string }) {
     super({

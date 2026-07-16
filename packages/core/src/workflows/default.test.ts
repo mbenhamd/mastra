@@ -168,6 +168,9 @@ describe('DefaultExecutionEngine.executeConditional error handling', () => {
       executionContext: {
         workflowId,
         runId,
+        executionGeneration: 'test-execution-generation',
+        lifecycleResumeAttempt: 0,
+        lifecycleStepStates: {},
         executionPath,
         suspendedPaths: {} as Record<string, number[]>,
         retryConfig: {
@@ -407,6 +410,9 @@ describe('DefaultExecutionEngine.executeEntry resume payload handling', () => {
       executionContext: {
         workflowId,
         runId,
+        executionGeneration: 'test-execution-generation',
+        lifecycleResumeAttempt: 0,
+        lifecycleStepStates: {},
         executionPath: [1],
         stepExecutionPath: [],
         suspendedPaths: {},
@@ -475,6 +481,9 @@ describe('DefaultExecutionEngine.executeEntry resume payload handling', () => {
       executionContext: {
         workflowId,
         runId,
+        executionGeneration: 'test-execution-generation',
+        lifecycleResumeAttempt: 0,
+        lifecycleStepStates: {},
         executionPath: [1],
         stepExecutionPath: [],
         suspendedPaths: {},
@@ -548,6 +557,9 @@ describe('DefaultExecutionEngine.executeEntry resume payload handling', () => {
       executionContext: {
         workflowId,
         runId,
+        executionGeneration: 'test-execution-generation',
+        lifecycleResumeAttempt: 0,
+        lifecycleStepStates: {},
         executionPath: [1],
         stepExecutionPath: [],
         suspendedPaths: {},
@@ -623,6 +635,9 @@ describe('DefaultExecutionEngine.executeLoop resume payload handling', () => {
       executionContext: {
         workflowId,
         runId,
+        executionGeneration: 'test-execution-generation',
+        lifecycleResumeAttempt: 0,
+        lifecycleStepStates: {},
         executionPath: [0],
         stepExecutionPath: [],
         suspendedPaths: {},
@@ -700,6 +715,9 @@ describe('DefaultExecutionEngine.executeLoop cancellation', () => {
       executionContext: {
         workflowId,
         runId,
+        executionGeneration: 'test-execution-generation',
+        lifecycleResumeAttempt: 0,
+        lifecycleStepStates: {},
         executionPath: [0],
         stepExecutionPath: [],
         suspendedPaths: {},
@@ -763,6 +781,9 @@ describe('DefaultExecutionEngine.executeLoop cancellation', () => {
       executionContext: {
         workflowId,
         runId,
+        executionGeneration: 'test-execution-generation',
+        lifecycleResumeAttempt: 0,
+        lifecycleStepStates: {},
         executionPath: [0],
         stepExecutionPath: [],
         suspendedPaths: {},
@@ -835,6 +856,9 @@ describe('DefaultExecutionEngine.executeForeach cancellation', () => {
       executionContext: {
         workflowId,
         runId,
+        executionGeneration: 'test-execution-generation',
+        lifecycleResumeAttempt: 0,
+        lifecycleStepStates: {},
         executionPath: [0],
         stepExecutionPath: [],
         suspendedPaths: {},
@@ -892,6 +916,9 @@ describe('DefaultExecutionEngine.executeForeach cancellation', () => {
       executionContext: {
         workflowId,
         runId,
+        executionGeneration: 'test-execution-generation',
+        lifecycleResumeAttempt: 0,
+        lifecycleStepStates: {},
         executionPath: [0],
         stepExecutionPath: [],
         suspendedPaths: {},
@@ -962,6 +989,9 @@ describe('DefaultExecutionEngine.executeForeach concurrency', () => {
       executionContext: {
         workflowId,
         runId,
+        executionGeneration: 'test-execution-generation',
+        lifecycleResumeAttempt: 0,
+        lifecycleStepStates: {},
         executionPath: [0],
         stepExecutionPath: [],
         suspendedPaths: {},

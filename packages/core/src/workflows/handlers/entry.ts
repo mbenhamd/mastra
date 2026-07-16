@@ -184,6 +184,9 @@ export async function persistStepUpdate(
 
     const snapshot: WorkflowRunState = {
       runId,
+      executionGeneration: executionContext.executionGeneration,
+      lifecycleResumeAttempt: executionContext.lifecycleResumeAttempt,
+      lifecycleStepStates: executionContext.lifecycleStepStates,
       status: workflowStatus,
       value: executionContext.state,
       context: stepResults as any,
@@ -203,11 +206,31 @@ export async function persistStepUpdate(
     };
 
     const workflowsStore = await engine.mastra?.getStorage()?.getStore('workflows');
+    const authoritativeSnapshot = await workflowsStore?.loadWorkflowSnapshot({ workflowName: workflowId, runId });
+    if (
+      authoritativeSnapshot &&
+      (authoritativeSnapshot.executionGeneration !== executionContext.executionGeneration ||
+        authoritativeSnapshot.status === 'success' ||
+        authoritativeSnapshot.status === 'failed' ||
+        authoritativeSnapshot.status === 'canceled' ||
+        authoritativeSnapshot.status === 'tripwire' ||
+        authoritativeSnapshot.status === 'bailed')
+    ) {
+      return;
+    }
+    const snapshotToPersist = engine.options?.pruneSnapshot
+      ? engine.options.pruneSnapshot({ snapshot, workflowStatus })
+      : snapshot;
     await workflowsStore?.persistWorkflowSnapshot({
       workflowName: workflowId,
       runId,
       resourceId,
-      snapshot: engine.options?.pruneSnapshot ? engine.options.pruneSnapshot({ snapshot, workflowStatus }) : snapshot,
+      snapshot: {
+        ...snapshotToPersist,
+        executionGeneration: snapshot.executionGeneration,
+        lifecycleResumeAttempt: snapshot.lifecycleResumeAttempt,
+        lifecycleStepStates: snapshot.lifecycleStepStates,
+      },
     });
     engine.setLastPersistedStatus(runId, workflowStatus);
   });
@@ -321,6 +344,9 @@ export async function executeEntry(
       stepResults,
       resume,
       executionContext: {
+        executionGeneration: executionContext.executionGeneration,
+        lifecycleResumeAttempt: executionContext.lifecycleResumeAttempt,
+        lifecycleStepStates: executionContext.lifecycleStepStates,
         workflowId,
         runId,
         executionPath: [...executionContext.executionPath, idx!],
@@ -395,6 +421,9 @@ export async function executeEntry(
         stepResults,
         resume,
         executionContext: {
+          executionGeneration: executionContext.executionGeneration,
+          lifecycleResumeAttempt: executionContext.lifecycleResumeAttempt,
+          lifecycleStepStates: executionContext.lifecycleStepStates,
           workflowId,
           runId,
           executionPath: [...executionContext.executionPath, idx!],
@@ -434,6 +463,9 @@ export async function executeEntry(
         restart,
         timeTravel,
         executionContext: {
+          executionGeneration: executionContext.executionGeneration,
+          lifecycleResumeAttempt: executionContext.lifecycleResumeAttempt,
+          lifecycleStepStates: executionContext.lifecycleStepStates,
           workflowId,
           runId,
           executionPath: [...executionContext.executionPath, idx!],

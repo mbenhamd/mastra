@@ -16,11 +16,38 @@ import type { ChunkType, WorkflowStreamEvent } from '../stream/types';
 import type { Tool, ToolExecutionContext } from '../tools';
 import type { DynamicArgument } from '../types';
 import type { ExecutionEngine } from './execution-engine';
+import type { WorkflowExecutionGeneration, WorkflowLifecycleEnvelope } from './lifecycle-events';
 import type { WorkflowScheduleInput } from './scheduler/types';
 import type { ConditionFunction, ExecuteFunction, ExecuteFunctionParams, LoopConditionFunction, Step } from './step';
 import type { WorkflowTerminalRecoveryEnvelopeV1 } from './terminal-recovery/types';
 
 export type OutputWriter<TChunk = any> = (chunk: TChunk, options?: { messageId?: string }) => Promise<void>;
+
+export type WorkflowLifecycleEventCallback = (event: WorkflowLifecycleEnvelope) => void | Promise<void>;
+export type WorkflowLifecycleErrorCallback = (error: Error) => void | Promise<void>;
+
+export type WorkflowLifecycleWatchOptions = {
+  /** Exact execution lineage to reconnect after a restart or time-travel takeover. */
+  executionGeneration?: WorkflowExecutionGeneration;
+  /**
+   * Resume strictly after this committed cursor. Omit to replay from the
+   * beginning of retained history.
+   */
+  afterCursor?: number;
+  /** Log generation returned with the event at `afterCursor`. */
+  afterLogGeneration?: string;
+  /**
+   * Allow exact replay whose retained log only lives in the current process.
+   * Intended for local development and tests. Durable replay is required by
+   * default so restartable consumers never silently depend on process memory.
+   */
+  allowProcessLocalReplay?: boolean;
+  /**
+   * Receives terminal replay failures that happen after setup, such as the
+   * retained log expiring or being cleared while this watcher is active.
+   */
+  onError?: WorkflowLifecycleErrorCallback;
+};
 
 /**
  * Options for `Run.start()` beyond the generic `inputData`/`initialState`/`requestContext` fields.
@@ -551,6 +578,15 @@ export interface WorkflowRunState {
   resumeLabels: Record<string, WorkflowResumeLabel>;
   waitingPaths: Record<string, number[]>;
   timestamp: number;
+  /**
+   * Opaque execution lineage identity. It is stable across suspend/resume and
+   * changes for restart and time-travel executions.
+   */
+  executionGeneration?: string;
+  /** Zero-based durable resume cycle within the execution generation. */
+  lifecycleResumeAttempt?: number;
+  /** Stable step-call identities and one-based attempt counts by execution coordinate. */
+  lifecycleStepStates?: Record<string, { stepCallId: string; stepAttempt: number }>;
   /** Tripwire data when status is 'tripwire' */
   tripwire?: StepTripwireInfo;
   stepExecutionPath?: string[];
@@ -1147,6 +1183,9 @@ export type SubsetOf<TStepState, TState> =
 export type ExecutionContext = {
   workflowId: string;
   runId: string;
+  executionGeneration?: string;
+  lifecycleResumeAttempt?: number;
+  lifecycleStepStates?: Record<string, { stepCallId: string; stepAttempt: number }>;
   executionPath: number[];
   stepExecutionPath?: string[];
   activeStepsPath: Record<string, number[]>;

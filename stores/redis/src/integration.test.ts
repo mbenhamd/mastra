@@ -144,6 +144,108 @@ describe('RedisServerCache Integration', () => {
       expect(after).toBeNull();
     });
   });
+
+  describe('atomic indexed log', () => {
+    it('allocates concurrent cursors in the same order as retained entries', async () => {
+      const retention = { maxAgeMs: 60_000, maxEntries: 100 };
+      const appended = await Promise.all(
+        Array.from({ length: 40 }, (_, index) =>
+          cache.appendIndexedLogEntry('indexed-concurrent', { index }, retention),
+        ),
+      );
+      const retained = await cache.readIndexedLogEntries<{ index: number }>('indexed-concurrent', -1, retention);
+
+      expect(appended.map(entry => entry.cursor).sort((a, b) => a - b)).toEqual(
+        Array.from({ length: 40 }, (_, index) => index),
+      );
+      expect(new Set(appended.map(entry => entry.logGeneration))).toEqual(new Set([retained.logGeneration]));
+      expect(retained.entries.map(entry => entry.cursor)).toEqual(Array.from({ length: 40 }, (_, index) => index));
+      expect(retained.logGeneration).toEqual(expect.any(String));
+      expect(retained.firstCursor).toBe(0);
+      expect(retained.nextCursor).toBe(40);
+    });
+
+    it('reports the retained floor after count and age pruning', async () => {
+      const countRetention = { maxAgeMs: 60_000, maxEntries: 2 };
+      await cache.appendIndexedLogEntry('indexed-count', 'zero', countRetention);
+      await cache.appendIndexedLogEntry('indexed-count', 'one', countRetention);
+      await cache.appendIndexedLogEntry('indexed-count', 'two', countRetention);
+
+      await expect(cache.readIndexedLogEntries('indexed-count', -1, countRetention)).resolves.toMatchObject({
+        firstCursor: 1,
+        nextCursor: 3,
+        entries: [
+          { cursor: 1, value: 'one' },
+          { cursor: 2, value: 'two' },
+        ],
+      });
+
+      const ageRetention = { maxAgeMs: 300, maxEntries: 10 };
+      await cache.appendIndexedLogEntry('indexed-age', 'old', ageRetention);
+      await new Promise(resolve => setTimeout(resolve, 200));
+      await cache.appendIndexedLogEntry('indexed-age', 'new', ageRetention);
+      await new Promise(resolve => setTimeout(resolve, 150));
+
+      await expect(cache.readIndexedLogEntries('indexed-age', -1, ageRetention)).resolves.toMatchObject({
+        firstCursor: 1,
+        nextCursor: 2,
+        entries: [{ cursor: 1, value: 'new' }],
+      });
+    });
+
+    it('deletes retained entries and resets an empty range', async () => {
+      const retention = { maxAgeMs: 60_000, maxEntries: 10 };
+      await cache.appendIndexedLogEntry('indexed-delete', { id: 'event' }, retention);
+      const beforeDelete = await cache.readIndexedLogEntries('indexed-delete', -1, retention);
+
+      await cache.deleteIndexedLog('indexed-delete');
+
+      const afterDelete = await cache.readIndexedLogEntries('indexed-delete', -1, retention);
+      expect(afterDelete).toEqual({
+        logGeneration: expect.any(String),
+        firstCursor: 0,
+        nextCursor: 0,
+        entries: [],
+      });
+      expect(afterDelete.logGeneration).not.toBe(beforeDelete.logGeneration);
+    });
+
+    it('keeps an empty log generation stable until the first append', async () => {
+      const retention = { maxAgeMs: 50, maxEntries: 10 };
+      const first = await cache.readIndexedLogEntries('indexed-empty', -1, retention);
+
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      const second = await cache.readIndexedLogEntries('indexed-empty', -1, retention);
+      const appended = await cache.appendIndexedLogEntry('indexed-empty', 'first', retention);
+      const afterAppend = await cache.readIndexedLogEntries('indexed-empty', -1, retention);
+
+      expect(second.logGeneration).toBe(first.logGeneration);
+      expect(appended.cursor).toBe(0);
+      expect(afterAppend.logGeneration).toBe(first.logGeneration);
+    });
+
+    it('recreates a fully expired non-empty log when retention becomes shorter', async () => {
+      const key = 'indexed-shortened-retention';
+      const original = { maxAgeMs: 5_000, maxEntries: 10 };
+      const shortened = { maxAgeMs: 50, maxEntries: 10 };
+      const firstAppend = await cache.appendIndexedLogEntry(key, 'old', original);
+
+      await new Promise(resolve => setTimeout(resolve, 75));
+
+      const recreated = await cache.readIndexedLogEntries(key, -1, shortened);
+      const nextAppend = await cache.appendIndexedLogEntry(key, 'new', shortened);
+
+      expect(recreated).toEqual({
+        entries: [],
+        logGeneration: expect.any(String),
+        firstCursor: 0,
+        nextCursor: 0,
+      });
+      expect(recreated.logGeneration).not.toBe(firstAppend.logGeneration);
+      expect(nextAppend).toMatchObject({ cursor: 0, logGeneration: recreated.logGeneration, value: 'new' });
+    });
+  });
 });
 
 describe('CachingPubSub with Redis Integration', () => {
@@ -192,6 +294,36 @@ describe('CachingPubSub with Redis Integration', () => {
   });
 
   describe('resumable streams with Redis backend', () => {
+    it('replays exact indexed history through a fresh cache and pubsub instance', async () => {
+      const topic = 'exact-restart';
+      const indexedReplay = { retentionMs: 60_000, maxEvents: 10 };
+      const first = new CachingPubSub(new EventEmitterPubSub(), cache, { indexedReplay });
+
+      await first.publish(topic, { type: 'zero', runId: 'run-exact', data: { value: 0 } });
+      await first.publish(topic, { type: 'one', runId: 'run-exact', data: { value: 1 } });
+      const firstRange = await first.getIndexedReplayRange(topic);
+
+      const restartedCache = new RedisServerCache(
+        { client: redis },
+        {
+          keyPrefix: 'pubsub-test:',
+          ttlSeconds: 60,
+        },
+      );
+      const restarted = new CachingPubSub(new EventEmitterPubSub(), restartedCache, { indexedReplay });
+      const received: Event[] = [];
+
+      await restarted.subscribeFromOffset(topic, 0, event => {
+        received.push(event);
+      });
+
+      expect(received.map(event => [event.type, event.index])).toEqual([
+        ['zero', 0],
+        ['one', 1],
+      ]);
+      await expect(restarted.getIndexedReplayRange(topic)).resolves.toEqual(firstRange);
+    });
+
     it('should replay events to late subscriber', async () => {
       const topic = 'test-stream-1';
       const receivedEvents: Event[] = [];

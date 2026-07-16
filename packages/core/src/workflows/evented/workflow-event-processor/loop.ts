@@ -19,6 +19,9 @@ export async function processWorkflowLoop(
     workflowId,
     prevResult,
     runId,
+    executionGeneration,
+    lifecycleResumeAttempt,
+    lifecycleStepStates,
     executionPath,
     stepResults,
     activeStepsPath,
@@ -45,6 +48,8 @@ export async function processWorkflowLoop(
     stepResult: StepResult<any, any, any, any>;
   },
 ) {
+  const lifecycleExecution = { executionGeneration, lifecycleResumeAttempt, lifecycleStepStates };
+
   // Get current state from stepResult, stepResults or passed state
   const currentState = resolveCurrentState({ stepResult, stepResults, state });
 
@@ -81,6 +86,7 @@ export async function processWorkflowLoop(
   // resume metadata. Otherwise the body would keep receiving the same resumeData on every
   // iteration (and e.g. never re-suspend).
   const loopAgainData = {
+    ...lifecycleExecution,
     parentWorkflow,
     workflowId,
     runId,
@@ -111,6 +117,7 @@ export async function processWorkflowLoop(
     outputOptions,
   };
   const loopEndData = {
+    ...lifecycleExecution,
     parentWorkflow,
     workflowId,
     runId,
@@ -158,6 +165,9 @@ export async function processWorkflowForEach(
     workflowId,
     prevResult,
     runId,
+    executionGeneration,
+    lifecycleResumeAttempt,
+    lifecycleStepStates,
     executionPath,
     stepResults,
     activeStepsPath,
@@ -183,6 +193,8 @@ export async function processWorkflowForEach(
     step: Extract<StepFlowEntry, { type: 'foreach' }>;
   },
 ) {
+  const lifecycleExecution = { executionGeneration, lifecycleResumeAttempt, lifecycleStepStates };
+
   // Get current state from stepResults or passed state
   const currentState = resolveCurrentState({ stepResults, state });
   const currentResult: Extract<StepResult<any, any, any, any>, { status: 'success' }> = stepResults[
@@ -203,6 +215,7 @@ export async function processWorkflowForEach(
       type: 'workflow.fail',
       runId,
       data: {
+        ...lifecycleExecution,
         parentWorkflow,
         workflowId,
         runId,
@@ -239,6 +252,7 @@ export async function processWorkflowForEach(
         type: 'workflow.fail',
         runId,
         data: {
+          ...lifecycleExecution,
           parentWorkflow,
           workflowId,
           runId,
@@ -270,6 +284,7 @@ export async function processWorkflowForEach(
         type: 'workflow.step.run',
         runId,
         data: {
+          ...lifecycleExecution,
           parentWorkflow,
           workflowId,
           runId,
@@ -313,6 +328,7 @@ export async function processWorkflowForEach(
           type: 'workflow.fail',
           runId,
           data: {
+            ...lifecycleExecution,
             parentWorkflow,
             workflowId,
             runId,
@@ -359,6 +375,7 @@ export async function processWorkflowForEach(
         type: 'workflow.step.end',
         runId,
         data: {
+          ...lifecycleExecution,
           parentWorkflow,
           workflowId,
           runId,
@@ -460,6 +477,7 @@ export async function processWorkflowForEach(
             type: 'workflow.step.run',
             runId,
             data: {
+              ...lifecycleExecution,
               parentWorkflow,
               workflowId,
               runId,
@@ -531,6 +549,7 @@ export async function processWorkflowForEach(
       type: 'workflow.step.run',
       runId,
       data: {
+        ...lifecycleExecution,
         parentWorkflow,
         workflowId,
         runId,
@@ -593,6 +612,7 @@ export async function processWorkflowForEach(
         type: 'workflow.step.run',
         runId,
         data: {
+          ...lifecycleExecution,
           parentWorkflow,
           workflowId,
           runId,
@@ -642,6 +662,7 @@ export async function processWorkflowForEach(
     type: 'workflow.step.run',
     runId,
     data: {
+      ...lifecycleExecution,
       parentWorkflow,
       workflowId,
       runId,

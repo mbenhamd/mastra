@@ -2,7 +2,7 @@ import EventEmitter from 'node:events';
 import type { IMastraLogger } from '../../logger';
 import { PubSub } from '../pubsub';
 import type { LeaseProvider, PubSubDeliveryMode } from '../pubsub';
-import type { Event, EventCallback, SubscribeOptions } from '../types';
+import type { Event, EventCallback, PublishEvent, SubscribeOptions } from '../types';
 import { AckHandleBuffer } from './ack-handle-buffer';
 
 export interface EventEmitterPubSubOptions {
@@ -13,9 +13,9 @@ export interface EventEmitterPubSubOptions {
   logger?: IMastraLogger;
 }
 
-// Reused for the fan-out delivery path where ack/nack are no-ops: the process
-// is the broker, there is no transport-level redelivery to negotiate. Hoisted
-// to module scope so we don't allocate two new closures per emitted event.
+// Reused for batched fan-out delivery where AckHandleBuffer requires concrete
+// handles even though the process is the broker. Hoisted to module scope so we
+// don't allocate two new closures per emitted event.
 const NOOP_ACK = async (): Promise<void> => {};
 
 export class EventEmitterPubSub extends PubSub implements LeaseProvider {
@@ -85,13 +85,34 @@ export class EventEmitterPubSub extends PubSub implements LeaseProvider {
     }
   }
 
-  async publish(
-    topic: string,
-    event: Omit<Event, 'id' | 'createdAt'>,
-    _options?: { localOnly?: boolean },
-  ): Promise<void> {
-    const id = crypto.randomUUID();
-    const createdAt = new Date();
+  private logSubscriberError(topic: string, err: unknown): void {
+    const message = `[EventEmitterPubSub] subscriber failed for ${topic}`;
+    if (this.logger) {
+      this.logger.error(message, err);
+    } else {
+      console.error(message, err);
+    }
+  }
+
+  private invokeSubscriber(topic: string, callback: () => void | Promise<void>): void {
+    try {
+      const result = callback();
+      if (result) {
+        void result.catch(err => {
+          this.logSubscriberError(topic, err);
+        });
+      }
+    } catch (err) {
+      this.logSubscriberError(topic, err);
+    }
+  }
+
+  async publish(topic: string, event: PublishEvent, _options?: { localOnly?: boolean }): Promise<void> {
+    // Decorators such as CachingPubSub assign identity before handing the
+    // event to the transport. Preserve it so live delivery and retained replay
+    // describe the same logical event.
+    const id = event.id ?? crypto.randomUUID();
+    const createdAt = event.createdAt ?? new Date();
     this.emitter.emit(topic, {
       ...event,
       id,
@@ -145,7 +166,10 @@ export class EventEmitterPubSub extends PubSub implements LeaseProvider {
       this.subscribeWithGroup(topic, cb, options.group);
     } else {
       const wrapper = (event: Event) => {
-        cb(event, NOOP_ACK, NOOP_ACK);
+        // Fan-out delivery has no broker acknowledgement or redelivery
+        // mechanism. Leave the optional handles absent so consumers can
+        // distinguish that from a transport which can honor nack().
+        this.invokeSubscriber(topic, () => cb(event));
       };
       let byCb = this.fanoutWrappers.get(topic);
       if (!byCb) {
@@ -351,7 +375,7 @@ export class EventEmitterPubSub extends PubSub implements LeaseProvider {
         this.logBufferError(topic, err, { phase: 'cb' });
       });
     } else {
-      member(eventWithAttempt, ack, nack);
+      this.invokeSubscriber(topic, () => member(eventWithAttempt, ack, nack));
     }
   }
 

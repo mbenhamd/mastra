@@ -56,6 +56,17 @@ import type { DynamicArgument } from '../types';
 import { PUBSUB_SYMBOL, STREAM_FORMAT_SYMBOL } from './constants';
 import { DefaultExecutionEngine } from './default';
 import type { ExecutionEngine, ExecutionGraph } from './execution-engine';
+import {
+  createWorkflowExecutionGeneration,
+  getWorkflowLifecycleTopic,
+  publishWorkflowLifecycleEvent,
+  requireWorkflowExecutionGeneration,
+} from './lifecycle-events';
+import type {
+  WorkflowExecutionGeneration,
+  WorkflowLifecycleExecutionIdentity,
+  WorkflowStepLifecycleStateMap,
+} from './lifecycle-events';
 import type {
   ConditionFunction,
   ExecuteFunction,
@@ -95,9 +106,12 @@ import type {
   OutputWriter,
   StepMetadata,
   WorkflowRunStartOptions,
+  WorkflowLifecycleEventCallback,
+  WorkflowLifecycleWatchOptions,
   ForeachOptions,
 } from './types';
 import { cleanStepResult, createRestartExecutionParams, createTimeTravelExecutionParams } from './utils';
+import { watchWorkflowLifecycleEvents } from './workflow-lifecycle';
 
 // Options that can be passed when wrapping an agent with createStep
 // These work for both stream() (v2) and streamLegacy() (v1) methods
@@ -2430,7 +2444,7 @@ export class Workflow<
         workflowSteps: this.steps,
         validateInputs: this.#options?.validateInputs,
         workflowEngineType: this.engineType,
-        pubsub: options?.pubsub,
+        pubsub: options?.pubsub ?? this.#mastra?.pubsub,
       });
 
     this.#runs.set(runIdToUse, run);
@@ -2439,6 +2453,7 @@ export class Workflow<
       workflowStatus: run.workflowRunStatus,
       stepResults: {},
     });
+    const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
 
     // A freshly-minted run for a workflow that never persists a snapshot (e.g. the
     // transient processor workflows from #17344) cannot have a stored row, so this
@@ -2464,9 +2479,14 @@ export class Workflow<
     }
 
     if (!existsInStorage && shouldPersistSnapshot) {
-      const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
+      const lifecycleExecution = {
+        executionGeneration: createWorkflowExecutionGeneration(),
+        lifecycleResumeAttempt: 0,
+        lifecycleStepStates: {},
+      };
       const initialSnapshot: WorkflowRunState = {
         runId: runIdToUse,
+        ...lifecycleExecution,
         status: 'pending',
         value: {},
         // @ts-expect-error - context type mismatch
@@ -2485,10 +2505,23 @@ export class Workflow<
         workflowName: this.id,
         runId: runIdToUse,
         resourceId: options?.resourceId,
-        snapshot: this.#options.pruneSnapshot
-          ? this.#options.pruneSnapshot({ snapshot: initialSnapshot, workflowStatus: 'pending' })
-          : initialSnapshot,
+        snapshot: {
+          ...(this.#options.pruneSnapshot
+            ? this.#options.pruneSnapshot({ snapshot: initialSnapshot, workflowStatus: 'pending' })
+            : initialSnapshot),
+          ...lifecycleExecution,
+        },
       });
+    }
+
+    // A persisted pending run owns its lifecycle lineage from admission. Hydrate
+    // the returned handle before it can start; legacy pending rows without the
+    // complete tuple fail closed in getLifecycleExecutionIdentity().
+    if (
+      workflowsStore &&
+      ((!existsInStorage && shouldPersistSnapshot) || (existsInStorage && existingRun?.status === 'pending'))
+    ) {
+      await run.getLifecycleExecutionIdentity();
     }
 
     return run as RunWithRawInput<TEngineType, TSteps, TState, TInput, TOutput, TRequestContext, TRawInput>;
@@ -2641,10 +2674,30 @@ export class Workflow<
     // Skip the watch relay in that case — events are already on the shared pubsub
     // and relaying with the same runId would cause an infinite event loop.
     const useSharedPubsub = !!this.#options?.sharePubsub;
-    const nestedPubsub = useSharedPubsub ? pubsub : undefined;
-    const run = isResume
+    // Top-level runs inherit the Mastra PubSub so their lifecycle is durable,
+    // but a non-sharing nested workflow must retain its own process-local event
+    // bus. Passing `undefined` here would make createRun() inherit Mastra's
+    // PubSub too, and the nested-watch relay would consume its own publication
+    // forever because parent and child intentionally share the same run id.
+    const nestedPubsub = useSharedPubsub ? pubsub : new EventEmitterPubSub();
+    let run = isResume
       ? await this.createRun({ runId: resume.runId, resourceId, pubsub: nestedPubsub })
       : await this.createRun({ runId, resourceId, pubsub: nestedPubsub });
+    const existingNestedRunIsTerminal =
+      run.workflowRunStatus === 'success' ||
+      run.workflowRunStatus === 'failed' ||
+      run.workflowRunStatus === 'canceled' ||
+      run.workflowRunStatus === 'tripwire' ||
+      run.workflowRunStatus === 'bailed';
+    if (!isResume && existingNestedRunIsTerminal) {
+      // Loop and foreach iterations intentionally invoke a nested workflow
+      // repeatedly under the parent run id. Replace the previous terminal row
+      // with a fresh pending lineage before starting the next logical
+      // invocation; otherwise lifecycle admission correctly rejects the stale
+      // terminal generation loaded by createRun().
+      await this.deleteWorkflowRunById(run.runId);
+      run = await this.createRun({ runId: run.runId, resourceId, pubsub: nestedPubsub });
+    }
     const nestedAbortCb = () => {
       abort();
     };
@@ -2726,6 +2779,35 @@ export class Workflow<
 
     if (res.state) {
       await setState(res.state);
+    }
+
+    // A workflow that persists only resumable states must retire that resume
+    // artifact after a terminal nested execution. Otherwise a loop that invokes
+    // the same nested workflow again under the parent run id sees the prior
+    // `suspended` row and either resumes stale work or fails lifecycle admission.
+    // This also keeps the in-memory run map from reusing a terminal handle for
+    // the next logical nested invocation.
+    const terminalStatus = res.status === 'success' || res.status === 'failed' || res.status === 'tripwire';
+    if (
+      terminalStatus &&
+      !this.#options.shouldPersistSnapshot({ workflowStatus: res.status, stepResults: res.steps })
+    ) {
+      try {
+        await this.deleteWorkflowRunById(run.runId);
+      } catch (error) {
+        // Snapshot cleanup is best-effort and must not replace a successful
+        // workflow result with a storage error.
+        this.logger.warn('Failed to delete terminal nested workflow run', {
+          workflowId: this.id,
+          runId: run.runId,
+          error,
+        });
+      } finally {
+        // deleteWorkflowRunById is a no-op without storage. Always retire the
+        // local handle so a later logical invocation cannot reuse this terminal
+        // run object.
+        this.#runs.delete(run.runId);
+      }
     }
 
     if (suspendedSteps?.length) {
@@ -3083,6 +3165,10 @@ export class Run<
   TRequestContext extends Record<string, any> | unknown = unknown,
 > {
   #abortController?: AbortController;
+  #executionGeneration?: string;
+  #lifecycleResumeAttempt = 0;
+  #lifecycleStepStates: WorkflowStepLifecycleStateMap = {};
+  #activeExecutionGenerations = new Map<string, number>();
   protected pubsub: PubSub;
   /**
    * Unique identifier for this workflow
@@ -3222,19 +3308,225 @@ export class Run<
     return this.#abortController;
   }
 
+  /** @internal Replace execution-scoped cancellation state for a fresh lineage. */
+  protected resetAbortController(): void {
+    this.#abortController = new AbortController();
+  }
+
+  /** @internal Establish a fresh lifecycle lineage for start, restart, or time travel. */
+  protected beginLifecycleExecution(): {
+    executionGeneration: WorkflowExecutionGeneration;
+    lifecycleResumeAttempt: number;
+    lifecycleStepStates: WorkflowStepLifecycleStateMap;
+  } {
+    this.resetAbortController();
+    const executionGeneration = createWorkflowExecutionGeneration();
+    this.#executionGeneration = executionGeneration;
+    this.#lifecycleResumeAttempt = 0;
+    this.#lifecycleStepStates = {};
+    return {
+      executionGeneration,
+      lifecycleResumeAttempt: this.#lifecycleResumeAttempt,
+      lifecycleStepStates: this.#lifecycleStepStates,
+    };
+  }
+
+  /** @internal Reuse a lineage reserved by a pre-start lifecycle subscriber. */
+  protected startLifecycleExecution(): {
+    executionGeneration: WorkflowExecutionGeneration;
+    lifecycleResumeAttempt: number;
+    lifecycleStepStates: WorkflowStepLifecycleStateMap;
+  } {
+    if (this.workflowRunStatus === 'pending' && this.#executionGeneration) {
+      return {
+        executionGeneration: this.#executionGeneration,
+        lifecycleResumeAttempt: this.#lifecycleResumeAttempt,
+        lifecycleStepStates: this.#lifecycleStepStates,
+      };
+    }
+    return this.beginLifecycleExecution();
+  }
+
+  /** @internal Hydrate lifecycle identity without advancing the resume counter. */
+  protected hydrateLifecycleExecution(snapshot: WorkflowRunState): {
+    executionGeneration: WorkflowExecutionGeneration;
+    lifecycleResumeAttempt: number;
+    lifecycleStepStates: WorkflowStepLifecycleStateMap;
+  } {
+    const executionGeneration = requireWorkflowExecutionGeneration(
+      snapshot.executionGeneration,
+      `Workflow run ${this.workflowId}/${this.runId}`,
+    );
+    this.#executionGeneration = executionGeneration;
+    this.#lifecycleResumeAttempt = snapshot.lifecycleResumeAttempt ?? 0;
+    this.#lifecycleStepStates = snapshot.lifecycleStepStates ?? {};
+    return {
+      executionGeneration,
+      lifecycleResumeAttempt: this.#lifecycleResumeAttempt,
+      lifecycleStepStates: this.#lifecycleStepStates,
+    };
+  }
+
+  /** @internal Restore the same lifecycle lineage when a suspended run resumes. */
+  protected restoreLifecycleExecution(snapshot: WorkflowRunState): {
+    executionGeneration: WorkflowExecutionGeneration;
+    lifecycleResumeAttempt: number;
+    lifecycleStepStates: WorkflowStepLifecycleStateMap;
+  } {
+    const { executionGeneration } = this.hydrateLifecycleExecution(snapshot);
+    this.#lifecycleResumeAttempt += 1;
+    return {
+      executionGeneration,
+      lifecycleResumeAttempt: this.#lifecycleResumeAttempt,
+      lifecycleStepStates: this.#lifecycleStepStates,
+    };
+  }
+
+  /**
+   * Resolve the exact identity needed by lifecycle replay/subscription.
+   *
+   * Before a fresh start this reserves the generation that `start()` will use.
+   * For an existing execution it resolves the persisted generation without
+   * minting a replacement or advancing its durable resume counter.
+   */
+  async getLifecycleExecutionIdentity(): Promise<WorkflowLifecycleExecutionIdentity> {
+    const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
+    const snapshot = await workflowsStore?.loadWorkflowSnapshot({
+      workflowName: this.workflowId,
+      runId: this.runId,
+    });
+
+    let executionGeneration: string;
+    if (snapshot) {
+      if (
+        snapshot.status === 'pending' &&
+        (typeof snapshot.executionGeneration !== 'string' ||
+          snapshot.executionGeneration.length === 0 ||
+          snapshot.lifecycleResumeAttempt !== 0 ||
+          typeof snapshot.lifecycleStepStates !== 'object' ||
+          snapshot.lifecycleStepStates === null ||
+          Array.isArray(snapshot.lifecycleStepStates) ||
+          Object.keys(snapshot.lifecycleStepStates).length !== 0)
+      ) {
+        throw new TypeError(
+          `Workflow run ${this.workflowId}/${this.runId} pending snapshot requires a complete lifecycle lineage`,
+        );
+      }
+      executionGeneration = this.hydrateLifecycleExecution(snapshot).executionGeneration;
+    } else if (this.workflowRunStatus === 'pending') {
+      executionGeneration = this.startLifecycleExecution().executionGeneration;
+    } else {
+      executionGeneration = requireWorkflowExecutionGeneration(
+        this.#executionGeneration,
+        `Workflow run ${this.workflowId}/${this.runId}`,
+      );
+    }
+
+    return {
+      workflowId: this.workflowId,
+      runId: this.runId,
+      executionGeneration,
+      topic: getWorkflowLifecycleTopic({
+        workflowId: this.workflowId,
+        runId: this.runId,
+        executionGeneration,
+      }),
+    };
+  }
+
+  /** @internal Resolve the public identity together with its durable resume tuple. */
+  protected async getLifecycleExecutionTuple(): Promise<
+    WorkflowLifecycleExecutionIdentity & {
+      lifecycleResumeAttempt: number;
+      lifecycleStepStates: WorkflowStepLifecycleStateMap;
+    }
+  > {
+    const identity = await this.getLifecycleExecutionIdentity();
+    return {
+      ...identity,
+      lifecycleResumeAttempt: this.#lifecycleResumeAttempt,
+      lifecycleStepStates: Object.fromEntries(
+        Object.entries(this.#lifecycleStepStates).map(([key, state]) => [key, { ...state }]),
+      ),
+    };
+  }
+
+  /** @internal Fail closed when another fresh-run creator owns the durable lineage. */
+  protected async assertLifecycleExecutionAdmission(lifecycleExecution: {
+    executionGeneration: WorkflowExecutionGeneration;
+    lifecycleResumeAttempt: number;
+    lifecycleStepStates: WorkflowStepLifecycleStateMap;
+  }): Promise<void> {
+    const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
+    const snapshot = await workflowsStore?.loadWorkflowSnapshot({
+      workflowName: this.workflowId,
+      runId: this.runId,
+    });
+    if (!snapshot) return;
+
+    const persistedStates = Object.entries(snapshot.lifecycleStepStates ?? {});
+    const suppliedStateKeys = Object.keys(lifecycleExecution.lifecycleStepStates);
+    const sameStates =
+      persistedStates.length === suppliedStateKeys.length &&
+      persistedStates.every(
+        ([coordinate, state]) =>
+          lifecycleExecution.lifecycleStepStates[coordinate]?.stepCallId === state.stepCallId &&
+          lifecycleExecution.lifecycleStepStates[coordinate]?.stepAttempt === state.stepAttempt,
+      );
+    if (
+      snapshot.status !== 'pending' ||
+      snapshot.executionGeneration !== lifecycleExecution.executionGeneration ||
+      snapshot.lifecycleResumeAttempt !== lifecycleExecution.lifecycleResumeAttempt ||
+      !sameStates
+    ) {
+      throw new Error(`Workflow run ${this.workflowId}/${this.runId} lifecycle execution admission is stale`);
+    }
+  }
+
   /**
    * Cancels the workflow execution.
    * This aborts any running execution and updates the workflow status to 'canceled' in storage.
    */
   async cancel() {
+    const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
+    let snapshot: WorkflowRunState | null | undefined;
+    try {
+      snapshot = await workflowsStore?.loadWorkflowSnapshot({
+        workflowName: this.workflowId,
+        runId: this.runId,
+      });
+    } catch {
+      snapshot = undefined;
+    }
+
+    if (
+      snapshot &&
+      (snapshot.status === 'success' ||
+        snapshot.status === 'failed' ||
+        snapshot.status === 'canceled' ||
+        snapshot.status === 'tripwire' ||
+        snapshot.status === 'bailed') &&
+      !this.hasActiveLifecycleExecution(snapshot.executionGeneration)
+    ) {
+      this.workflowRunStatus = snapshot.status;
+      return;
+    }
+
+    let reservedExecutionGeneration: string | undefined;
+    try {
+      reservedExecutionGeneration = (await this.getLifecycleExecutionIdentity()).executionGeneration;
+    } catch {
+      // Identity reservation is best-effort here. Cancellation must still abort
+      // and persist status when storage itself is unavailable.
+    }
+
     // Abort any running execution and update in-memory status
     this.abortController.abort();
     this.workflowRunStatus = 'canceled';
 
-    // Update workflow status in storage to 'canceled'
-    // This is necessary for suspended/waiting workflows where the abort signal won't be checked
+    // Persist cancellation before best-effort lifecycle delivery. A transport
+    // outage must never leave a suspended or waiting run active in storage.
     try {
-      const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
       await workflowsStore?.updateWorkflowState({
         workflowName: this.workflowId,
         runId: this.runId,
@@ -3243,8 +3535,53 @@ export class Run<
         },
       });
     } catch {
-      // Storage errors should not prevent cancellation from succeeding
-      // The abort signal and in-memory status are already updated
+      // The abort signal and in-memory status remain authoritative when the
+      // storage adapter itself is unavailable.
+    }
+
+    const executionGeneration =
+      snapshot?.executionGeneration ?? reservedExecutionGeneration ?? this.#executionGeneration;
+    const resumeAttempt = snapshot?.lifecycleResumeAttempt ?? this.#lifecycleResumeAttempt;
+    // An actively running execution owns its terminal emission. Suspended,
+    // waiting, and pending runs have no active engine to observe abort.
+    if (executionGeneration && !this.hasActiveLifecycleExecution(executionGeneration)) {
+      try {
+        await publishWorkflowLifecycleEvent({
+          pubsub: this.pubsub,
+          workflowId: this.workflowId,
+          runId: this.runId,
+          executionGeneration,
+          event: { type: 'workflow.canceled', resumeAttempt },
+        });
+        await publishWorkflowLifecycleEvent({
+          pubsub: this.pubsub,
+          workflowId: this.workflowId,
+          runId: this.runId,
+          executionGeneration,
+          event: { type: 'workflow.finished', resumeAttempt, status: 'canceled' },
+        });
+      } catch {
+        // Cancellation is already durable. Lifecycle delivery remains
+        // best-effort when the configured transport is unavailable.
+      }
+    }
+  }
+
+  protected hasActiveLifecycleExecution(executionGeneration: string | undefined): boolean {
+    return executionGeneration !== undefined && (this.#activeExecutionGenerations.get(executionGeneration) ?? 0) > 0;
+  }
+
+  async #withActiveExecution<T>(executionGeneration: string, execute: () => Promise<T>): Promise<T> {
+    this.#activeExecutionGenerations.set(
+      executionGeneration,
+      (this.#activeExecutionGenerations.get(executionGeneration) ?? 0) + 1,
+    );
+    try {
+      return await execute();
+    } finally {
+      const remaining = (this.#activeExecutionGenerations.get(executionGeneration) ?? 1) - 1;
+      if (remaining === 0) this.#activeExecutionGenerations.delete(executionGeneration);
+      else this.#activeExecutionGenerations.set(executionGeneration, remaining);
     }
   }
 
@@ -3381,30 +3718,38 @@ export class Run<
     const initialStateToUse = await this._validateInitialState(initialState ?? ({} as TState));
     await this._validateRequestContext(requestContext as RequestContext);
 
-    const result = await this.executionEngine.execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({
-      workflowId: this.workflowId,
-      runId: this.runId,
-      resourceId: this.resourceId,
-      disableScorers: this.disableScorers,
-      graph: this.executionGraph,
-      serializedStepGraph: this.serializedStepGraph,
-      input: inputDataToUse,
-      initialState: initialStateToUse,
-      pubsub: this.pubsub,
-      retryConfig: this.retryConfig,
-      requestContext: (requestContext ?? new RequestContext()) as RequestContext,
-      actor,
-      abortController: this.abortController,
-      outputWriter,
-      workflowSpan,
-      format,
-      outputOptions,
-      perStep,
-    });
+    const lifecycleExecution = this.startLifecycleExecution();
+    await this.assertLifecycleExecutionAdmission(lifecycleExecution);
+    this.workflowRunStatus = 'running';
+
+    const result = await this.#withActiveExecution(lifecycleExecution.executionGeneration, () =>
+      this.executionEngine.execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({
+        workflowId: this.workflowId,
+        runId: this.runId,
+        ...lifecycleExecution,
+        resourceId: this.resourceId,
+        disableScorers: this.disableScorers,
+        graph: this.executionGraph,
+        serializedStepGraph: this.serializedStepGraph,
+        input: inputDataToUse,
+        initialState: initialStateToUse,
+        pubsub: this.pubsub,
+        retryConfig: this.retryConfig,
+        requestContext: (requestContext ?? new RequestContext()) as RequestContext,
+        actor,
+        abortController: this.abortController,
+        outputWriter,
+        workflowSpan,
+        format,
+        outputOptions,
+        perStep,
+      }),
+    );
 
     if (result.status !== 'suspended') {
       this.cleanup?.();
     }
+    this.workflowRunStatus = result.status;
 
     result.traceId = traceId;
     result.spanId = spanId;
@@ -3956,6 +4301,30 @@ export class Run<
     return this.watch(cb);
   }
 
+  /**
+   * Watch this run as a replayable lifecycle stream.
+   *
+   * Unlike `watch()`, each delivery retains its stable event identity and
+   * cursor. The callback may be async; successful completion acknowledges the
+   * delivery, while rejection negatively acknowledges it when supported by
+   * the configured transport.
+   */
+  async watchLifecycle(
+    cb: WorkflowLifecycleEventCallback,
+    options?: WorkflowLifecycleWatchOptions,
+  ): Promise<() => Promise<void>> {
+    const executionGeneration =
+      options?.executionGeneration ?? (await this.getLifecycleExecutionIdentity()).executionGeneration;
+    return watchWorkflowLifecycleEvents({
+      pubsub: this.pubsub,
+      workflowId: this.workflowId,
+      runId: this.runId,
+      executionGeneration,
+      callback: cb,
+      options,
+    });
+  }
+
   async resume<TResume>(
     params: {
       resumeData?: TResume;
@@ -4221,11 +4590,17 @@ export class Run<
 
     const traceId = workflowSpan?.externalTraceId;
     const spanId = workflowSpan?.id;
+    const { executionGeneration, lifecycleResumeAttempt, lifecycleStepStates } =
+      this.restoreLifecycleExecution(snapshot);
+    this.workflowRunStatus = 'running';
 
-    const executionResultPromise = this.executionEngine
-      .execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({
+    const executionResultPromise = this.#withActiveExecution(executionGeneration, () =>
+      this.executionEngine.execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({
         workflowId: this.workflowId,
         runId: this.runId,
+        executionGeneration,
+        lifecycleResumeAttempt,
+        lifecycleStepStates,
         resourceId: this.resourceId,
         graph: this.executionGraph,
         serializedStepGraph: this.serializedStepGraph,
@@ -4250,15 +4625,16 @@ export class Run<
         outputOptions: params.outputOptions,
         outputWriter: params.outputWriter,
         perStep: params.perStep,
-      })
-      .then(result => {
-        if (!params.isVNext && result.status !== 'suspended') {
-          this.closeStreamAction?.().catch(() => {});
-        }
-        result.traceId = traceId;
-        result.spanId = spanId;
-        return result;
-      });
+      }),
+    ).then(result => {
+      this.workflowRunStatus = result.status;
+      if (!params.isVNext && result.status !== 'suspended') {
+        this.closeStreamAction?.().catch(() => {});
+      }
+      result.traceId = traceId;
+      result.spanId = spanId;
+      return result;
+    });
 
     this.executionResults = executionResultPromise;
 
@@ -4325,22 +4701,32 @@ export class Run<
     const traceId = workflowSpan?.externalTraceId;
     const spanId = workflowSpan?.id;
 
-    const result = await this.executionEngine.execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({
-      workflowId: this.workflowId,
+    const lifecycleExecution = this.beginLifecycleExecution();
+    await workflowsStore?.updateWorkflowState({
+      workflowName: this.workflowId,
       runId: this.runId,
-      resourceId: this.resourceId,
-      disableScorers: this.disableScorers,
-      graph: this.executionGraph,
-      serializedStepGraph: this.serializedStepGraph,
-      restart: restartData,
-      pubsub: this.pubsub,
-      retryConfig: this.retryConfig,
-      requestContext: requestContextToUse as RequestContext,
-      actor,
-      abortController: this.abortController,
-      outputWriter,
-      workflowSpan,
+      opts: { status: 'running', ...lifecycleExecution },
     });
+
+    const result = await this.#withActiveExecution(lifecycleExecution.executionGeneration, () =>
+      this.executionEngine.execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({
+        workflowId: this.workflowId,
+        runId: this.runId,
+        ...lifecycleExecution,
+        resourceId: this.resourceId,
+        disableScorers: this.disableScorers,
+        graph: this.executionGraph,
+        serializedStepGraph: this.serializedStepGraph,
+        restart: restartData,
+        pubsub: this.pubsub,
+        retryConfig: this.retryConfig,
+        requestContext: requestContextToUse as RequestContext,
+        actor,
+        abortController: this.abortController,
+        outputWriter,
+        workflowSpan,
+      }),
+    );
 
     if (result.status !== 'suspended') {
       this.cleanup?.();
@@ -4463,24 +4849,34 @@ export class Run<
     const traceId = workflowSpan?.externalTraceId;
     const spanId = workflowSpan?.id;
 
-    const result = await this.executionEngine.execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({
-      workflowId: this.workflowId,
+    const lifecycleExecution = this.beginLifecycleExecution();
+    await workflowsStore?.updateWorkflowState({
+      workflowName: this.workflowId,
       runId: this.runId,
-      resourceId: this.resourceId,
-      disableScorers: this.disableScorers,
-      graph: this.executionGraph,
-      timeTravel: timeTravelData,
-      serializedStepGraph: this.serializedStepGraph,
-      pubsub: this.pubsub,
-      retryConfig: this.retryConfig,
-      requestContext: requestContextToUse as RequestContext,
-      actor,
-      abortController: this.abortController,
-      outputWriter,
-      workflowSpan,
-      outputOptions,
-      perStep,
+      opts: { status: 'running', ...lifecycleExecution },
     });
+
+    const result = await this.#withActiveExecution(lifecycleExecution.executionGeneration, () =>
+      this.executionEngine.execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({
+        workflowId: this.workflowId,
+        runId: this.runId,
+        ...lifecycleExecution,
+        resourceId: this.resourceId,
+        disableScorers: this.disableScorers,
+        graph: this.executionGraph,
+        timeTravel: timeTravelData,
+        serializedStepGraph: this.serializedStepGraph,
+        pubsub: this.pubsub,
+        retryConfig: this.retryConfig,
+        requestContext: requestContextToUse as RequestContext,
+        actor,
+        abortController: this.abortController,
+        outputWriter,
+        workflowSpan,
+        outputOptions,
+        perStep,
+      }),
+    );
 
     if (result.status !== 'suspended') {
       this.cleanup?.();

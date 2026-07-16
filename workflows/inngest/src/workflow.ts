@@ -1,11 +1,17 @@
 import { randomUUID } from 'node:crypto';
 import { emitErrorEvent } from '@mastra/core/agent/durable';
+import { InMemoryServerCache } from '@mastra/core/cache';
 import { RequestContext } from '@mastra/core/di';
+import { CachingPubSub } from '@mastra/core/events';
 import type { PubSub } from '@mastra/core/events';
 import type { Mastra } from '@mastra/core/mastra';
 import { SpanType, EntityType } from '@mastra/core/observability';
 import type { WorkflowRuns } from '@mastra/core/storage';
-import { Workflow } from '@mastra/core/workflows';
+import {
+  Workflow,
+  createWorkflowExecutionGeneration,
+  requireWorkflowExecutionGeneration,
+} from '@mastra/core/workflows';
 import type {
   Step,
   StepResult,
@@ -13,6 +19,7 @@ import type {
   StepFlowEntry,
   WorkflowResult,
   WorkflowRunState,
+  WorkflowRunStatus,
   WorkflowStreamEvent,
   Run,
   RunWithRawInput,
@@ -27,8 +34,80 @@ import type {
   InngestFlowControlConfig,
   InngestFlowCronConfig,
   InngestWorkflowConfig,
+  InngestWorkflowPubSubFactory,
   InngestWorkflowRunState,
 } from './types';
+
+export const INNGEST_WORKFLOW_LIFECYCLE_REPLAY = {
+  retentionMs: 24 * 60 * 60 * 1000,
+  maxEvents: 10_000,
+} as const;
+
+function requireLifecycleEventTuple(params: {
+  workflowId: string;
+  runId: string;
+  executionGeneration: unknown;
+  lifecycleResumeAttempt: unknown;
+  lifecycleStepStates: unknown;
+}) {
+  const owner = `Inngest workflow event ${params.workflowId}/${params.runId}`;
+  const executionGeneration = requireWorkflowExecutionGeneration(params.executionGeneration, owner);
+  if (
+    typeof params.lifecycleResumeAttempt !== 'number' ||
+    !Number.isSafeInteger(params.lifecycleResumeAttempt) ||
+    params.lifecycleResumeAttempt < 0
+  ) {
+    throw new NonRetriableError(`${owner} requires a non-negative lifecycle resume attempt`);
+  }
+  if (
+    typeof params.lifecycleStepStates !== 'object' ||
+    params.lifecycleStepStates === null ||
+    Array.isArray(params.lifecycleStepStates)
+  ) {
+    throw new NonRetriableError(`${owner} requires lifecycle step states`);
+  }
+
+  const lifecycleStepStates: Record<string, { stepCallId: string; stepAttempt: number }> = {};
+  for (const [coordinate, value] of Object.entries(params.lifecycleStepStates)) {
+    if (
+      typeof value !== 'object' ||
+      value === null ||
+      Array.isArray(value) ||
+      typeof (value as { stepCallId?: unknown }).stepCallId !== 'string' ||
+      (value as { stepCallId: string }).stepCallId.length === 0 ||
+      typeof (value as { stepAttempt?: unknown }).stepAttempt !== 'number' ||
+      !Number.isSafeInteger((value as { stepAttempt: number }).stepAttempt) ||
+      (value as { stepAttempt: number }).stepAttempt < 1
+    ) {
+      throw new NonRetriableError(`${owner} has invalid lifecycle step state at ${coordinate}`);
+    }
+    lifecycleStepStates[coordinate] = {
+      stepCallId: (value as { stepCallId: string }).stepCallId,
+      stepAttempt: (value as { stepAttempt: number }).stepAttempt,
+    };
+  }
+
+  return {
+    executionGeneration,
+    lifecycleResumeAttempt: params.lifecycleResumeAttempt,
+    lifecycleStepStates,
+  };
+}
+
+function lifecycleStepStatesEqual(
+  left: Record<string, { stepCallId: string; stepAttempt: number }> | undefined,
+  right: Record<string, { stepCallId: string; stepAttempt: number }>,
+): boolean {
+  const leftEntries = Object.entries(left ?? {});
+  const rightKeys = Object.keys(right);
+  return (
+    leftEntries.length === rightKeys.length &&
+    leftEntries.every(
+      ([coordinate, state]) =>
+        right[coordinate]?.stepCallId === state.stepCallId && right[coordinate]?.stepAttempt === state.stepAttempt,
+    )
+  );
+}
 
 export class InngestWorkflow<
   TEngineType = InngestEngineType,
@@ -56,14 +135,14 @@ export class InngestWorkflow<
   private cronFunction: ReturnType<Inngest['createFunction']> | undefined;
   private readonly flowControlConfig?: InngestFlowControlConfig;
   private readonly cronConfig?: InngestFlowCronConfig<TRawInput, TState>;
+  private readonly fallbackLifecycleCache = new InMemoryServerCache();
   /**
    * Optional override that lets a host (e.g. `createInngestAgent`) provide the
-   * PubSub instance used by workflow steps for publishing chunk/finish events.
-   * When set, the workflow function uses this factory instead of constructing
-   * a fresh `InngestPubSub`. This is what lets `DurableAgent.observe()` see
-   * cached history when the agent wraps its PubSub in a `CachingPubSub`.
+   * PubSub instance used by workflow steps. Lifecycle delivery requires exact
+   * indexed replay, so factories that return a `CachingPubSub` must configure
+   * its `indexedReplay` option.
    */
-  #pubsubFactory?: (defaultPubsub: PubSub) => PubSub;
+  #pubsubFactory?: InngestWorkflowPubSubFactory;
 
   constructor(
     params: InngestWorkflowConfig<
@@ -87,6 +166,7 @@ export class InngestWorkflow<
       inputData,
       initialState,
       schedule,
+      pubsubFactory,
       ...workflowParams
     } = params;
 
@@ -108,6 +188,7 @@ export class InngestWorkflow<
 
     this.#mastra = params.mastra!;
     this.inngest = inngest;
+    this.#pubsubFactory = pubsubFactory;
 
     if (cron) {
       this.cronConfig = { cron, inputData, initialState };
@@ -152,7 +233,7 @@ export class InngestWorkflow<
    * (e.g. a single agent-scoped cache) without collapsing per-workflow channel
    * isolation.
    */
-  __setPubsubFactory(factory: (defaultPubsub: PubSub) => PubSub) {
+  __setPubsubFactory(factory: InngestWorkflowPubSubFactory) {
     this.#pubsubFactory = factory;
     const updateNested = (step: StepFlowEntry) => {
       if (
@@ -176,8 +257,26 @@ export class InngestWorkflow<
    * a host (e.g. `createInngestAgent`) wired the workflow to its agent pubsub
    * without having to drive a real Inngest invocation.
    */
-  __getPubsubFactory(): ((defaultPubsub: PubSub) => PubSub) | undefined {
+  __getPubsubFactory(): InngestWorkflowPubSubFactory | undefined {
     return this.#pubsubFactory;
+  }
+
+  private lifecyclePubsub(defaultPubsub: PubSub): PubSub {
+    const candidate = this.#pubsubFactory?.(defaultPubsub) ?? defaultPubsub;
+    let replayable: PubSub;
+    if (candidate.indexedReplay) {
+      replayable = candidate;
+    } else if (candidate instanceof CachingPubSub) {
+      throw new TypeError(
+        'Inngest workflow lifecycle events require CachingPubSub indexedReplay; configure indexedReplay on the existing wrapper',
+      );
+    } else {
+      replayable = new CachingPubSub(candidate, this.#mastra?.serverCache ?? this.fallbackLifecycleCache, {
+        indexedReplay: INNGEST_WORKFLOW_LIFECYCLE_REPLAY,
+      });
+    }
+
+    return replayable;
   }
 
   __registerMastra(mastra: Mastra) {
@@ -213,10 +312,9 @@ export class InngestWorkflow<
   }): Promise<RunWithRawInput<TEngineType, TSteps, TState, TInput, TOutput, TRequestContext, TRawInput>> {
     if (options?.pubsub) {
       throw new TypeError(
-        'Inngest createRun({ pubsub }) is unsupported because remote function replicas cannot reconstruct a per-run PubSub object',
+        'Inngest createRun({ pubsub }) is unsupported because remote function replicas cannot reconstruct a per-run PubSub object; set pubsubFactory on the workflow instead',
       );
     }
-
     const runIdToUse = options?.runId || randomUUID();
     const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
     const existingSnapshot = (await workflowsStore?.loadWorkflowSnapshot({
@@ -224,6 +322,8 @@ export class InngestWorkflow<
       runId: runIdToUse,
     })) as InngestWorkflowRunState | null | undefined;
     const persistedDisableScorers = existingSnapshot?.runOptions?.disableScorers;
+    const defaultPubsub = new InngestPubSub(this.inngest, this.id);
+    const pubsub = this.lifecyclePubsub(defaultPubsub);
 
     // Return a new Run instance with object parameters
     const existingInMemoryRun = this.runs.get(runIdToUse);
@@ -245,6 +345,7 @@ export class InngestWorkflow<
         stateSchema: this.stateSchema,
         requestContextSchema: this.requestContextSchema,
         disableScorers: persistedDisableScorers ?? options?.disableScorers,
+        pubsub,
       },
       this.inngest,
     );
@@ -259,13 +360,23 @@ export class InngestWorkflow<
 
     const existsInStorage = Boolean(existingSnapshot);
 
+    if (existingSnapshot?.status) {
+      run.workflowRunStatus = existingSnapshot.status as WorkflowRunStatus;
+    }
+
     if (!existsInStorage && shouldPersistSnapshot) {
+      const lifecycleExecution = {
+        executionGeneration: createWorkflowExecutionGeneration(),
+        lifecycleResumeAttempt: 0,
+        lifecycleStepStates: {},
+      };
       await workflowsStore?.persistWorkflowSnapshot({
         workflowName: this.id,
         runId: runIdToUse,
         resourceId: options?.resourceId,
         snapshot: {
           runId: runIdToUse,
+          ...lifecycleExecution,
           status: 'pending',
           value: {},
           context: {},
@@ -289,6 +400,13 @@ export class InngestWorkflow<
       });
     }
 
+    if (
+      workflowsStore &&
+      ((!existsInStorage && shouldPersistSnapshot) || (existsInStorage && existingSnapshot?.status === 'pending'))
+    ) {
+      await run.getLifecycleExecutionIdentity();
+    }
+
     return run as RunWithRawInput<TEngineType, TSteps, TState, TInput, TOutput, TRequestContext, TRawInput>;
   }
 
@@ -301,7 +419,6 @@ export class InngestWorkflow<
       {
         id: `workflow.${this.id}.cron`,
         retries: 0,
-        cancelOn: [{ event: `cancel.workflow.${this.id}` }],
         triggers: { cron: this.cronConfig?.cron ?? '' },
         ...this.flowControlConfig,
       },
@@ -331,7 +448,12 @@ export class InngestWorkflow<
       {
         id: `workflow.${this.id}`,
         retries: 0,
-        cancelOn: [{ event: `cancel.workflow.${this.id}` }],
+        cancelOn: [
+          {
+            event: `cancel.workflow.${this.id}`,
+            if: 'async.data.runId == event.data.runId && async.data.executionGeneration == event.data.executionGeneration && async.data.lifecycleResumeAttempt == event.data.lifecycleResumeAttempt',
+          },
+        ],
         triggers: { event: `workflow.${this.id}` },
         // Spread flow control configuration
         ...this.flowControlConfig,
@@ -350,6 +472,9 @@ export class InngestWorkflow<
           tracingOptions,
           actor,
           disableScorers,
+          executionGeneration: suppliedExecutionGeneration,
+          lifecycleResumeAttempt: suppliedLifecycleResumeAttempt,
+          lifecycleStepStates: suppliedLifecycleStepStates,
         } = event.data;
 
         if (!runId) {
@@ -357,6 +482,148 @@ export class InngestWorkflow<
             return randomUUID();
           });
         }
+
+        const hasSuppliedLifecycleState =
+          suppliedExecutionGeneration !== undefined ||
+          suppliedLifecycleResumeAttempt !== undefined ||
+          suppliedLifecycleStepStates !== undefined;
+
+        // Resolve lifecycle identity inside an Inngest durable step. Run-created
+        // events supply the exact lineage reserved before dispatch. Direct or
+        // cron starts mint it once here, while legacy/direct resume events
+        // recover and advance the persisted lineage exactly once under replay.
+        const lifecycleExecution = await step.run(`workflow.${this.id}.lifecycle.execution`, async () => {
+          if (hasSuppliedLifecycleState) {
+            if (
+              suppliedExecutionGeneration === undefined ||
+              suppliedLifecycleResumeAttempt === undefined ||
+              suppliedLifecycleStepStates === undefined
+            ) {
+              throw new NonRetriableError(
+                `Inngest workflow event ${this.id}/${runId} requires a complete lifecycle execution tuple`,
+              );
+            }
+            const suppliedLifecycleExecution = requireLifecycleEventTuple({
+              workflowId: this.id,
+              runId,
+              executionGeneration: suppliedExecutionGeneration,
+              lifecycleResumeAttempt: suppliedLifecycleResumeAttempt,
+              lifecycleStepStates: suppliedLifecycleStepStates,
+            });
+            const workflowsStore = await this.#mastra?.getStorage()?.getStore('workflows');
+            if (!workflowsStore) {
+              throw new NonRetriableError(`Workflow storage is required to execute run ${runId}`);
+            }
+            const snapshot = await workflowsStore.loadWorkflowSnapshot({
+              workflowName: this.id,
+              runId,
+            });
+            if (!snapshot) {
+              throw new NonRetriableError(`Cannot execute run ${runId}: snapshot not found`);
+            }
+            if (
+              snapshot.executionGeneration !== suppliedLifecycleExecution.executionGeneration ||
+              snapshot.lifecycleResumeAttempt !== suppliedLifecycleExecution.lifecycleResumeAttempt ||
+              !lifecycleStepStatesEqual(snapshot.lifecycleStepStates, suppliedLifecycleExecution.lifecycleStepStates)
+            ) {
+              throw new NonRetriableError(`Cannot execute run ${runId}: lifecycle execution tuple is stale`);
+            }
+            if (
+              resume ? snapshot.status !== 'running' : snapshot.status !== 'pending' && snapshot.status !== 'running'
+            ) {
+              throw new NonRetriableError(`Cannot execute run ${runId}: lifecycle execution is not admitted`);
+            }
+            return suppliedLifecycleExecution;
+          }
+
+          if (resume) {
+            const workflowsStore = await this.#mastra?.getStorage()?.getStore('workflows');
+            if (!workflowsStore) {
+              throw new NonRetriableError(`Workflow storage is required to resume run ${runId}`);
+            }
+            const snapshot = await workflowsStore.loadWorkflowSnapshot({
+              workflowName: this.id,
+              runId,
+            });
+            if (!snapshot) {
+              throw new NonRetriableError(`Cannot resume run ${runId}: snapshot not found`);
+            }
+            if (snapshot.status !== 'suspended') {
+              throw new NonRetriableError(`Cannot resume run ${runId}: workflow run is not suspended`);
+            }
+            const restoredLifecycleExecution = {
+              executionGeneration: requireWorkflowExecutionGeneration(
+                snapshot.executionGeneration,
+                `Inngest workflow resume ${this.id}/${runId}`,
+              ),
+              lifecycleResumeAttempt: (snapshot.lifecycleResumeAttempt ?? 0) + 1,
+              lifecycleStepStates: snapshot.lifecycleStepStates ?? {},
+            };
+            await workflowsStore.updateWorkflowState({
+              workflowName: this.id,
+              runId,
+              opts: {
+                status: 'running',
+                ...restoredLifecycleExecution,
+              },
+            });
+            return restoredLifecycleExecution;
+          }
+
+          const freshLifecycleExecution = {
+            executionGeneration: createWorkflowExecutionGeneration(),
+            lifecycleResumeAttempt: 0,
+            lifecycleStepStates: {},
+          };
+          const workflowsStore = await this.#mastra?.getStorage()?.getStore('workflows');
+          if (workflowsStore) {
+            const snapshot = await workflowsStore.loadWorkflowSnapshot({
+              workflowName: this.id,
+              runId,
+            });
+            if (snapshot) {
+              if (snapshot.status !== 'pending') {
+                throw new NonRetriableError(`Cannot start run ${runId}: workflow run is not pending`);
+              }
+              return requireLifecycleEventTuple({
+                workflowId: this.id,
+                runId,
+                executionGeneration: snapshot.executionGeneration,
+                lifecycleResumeAttempt: snapshot.lifecycleResumeAttempt,
+                lifecycleStepStates: snapshot.lifecycleStepStates,
+              });
+            }
+            if (
+              this.options.shouldPersistSnapshot({
+                workflowStatus: 'pending',
+                stepResults: {},
+              })
+            ) {
+              await workflowsStore.persistWorkflowSnapshot({
+                workflowName: this.id,
+                runId,
+                resourceId,
+                snapshot: {
+                  runId,
+                  ...freshLifecycleExecution,
+                  status: 'pending',
+                  value: initialState ?? {},
+                  context: inputData === undefined ? {} : { input: inputData },
+                  activePaths: [],
+                  activeStepsPath: {},
+                  waitingPaths: {},
+                  serializedStepGraph: this.serializedStepGraph,
+                  suspendedPaths: {},
+                  resumeLabels: {},
+                  result: undefined,
+                  error: undefined,
+                  timestamp: Date.now(),
+                },
+              });
+            }
+          }
+          return freshLifecycleExecution;
+        });
 
         // Create InngestPubSub instance. Publishes go through `inngest.realtime.publish()`
         // (Inngest SDK v4 client API), which auto-includes the current runId from the
@@ -368,7 +635,7 @@ export class InngestWorkflow<
         // wrap this default - typically with a `CachingPubSub` so `observe()` can replay
         // cached history - without disturbing per-workflow channel isolation.
         const defaultPubsub = new InngestPubSub(this.inngest, this.id);
-        const pubsub: PubSub = this.#pubsubFactory?.(defaultPubsub) ?? defaultPubsub;
+        const pubsub = this.lifecyclePubsub(defaultPubsub);
 
         // Create requestContext before execute so we can reuse it in finalize
         const requestContext: RequestContext = new RequestContext(Object.entries(event.data.requestContext ?? {}));
@@ -404,11 +671,40 @@ export class InngestWorkflow<
 
         const engine = new InngestExecutionEngine(this.#mastra, step, attempt, this.options);
 
+        // `step.run` memoizes lifecycle resolution across retries. Re-read the
+        // authoritative snapshot outside that memoized step immediately before
+        // execution so a stale retry cannot execute after another generation
+        // has taken over the same run id.
+        const workflowsStore = await this.#mastra?.getStorage()?.getStore('workflows');
+        const authoritativeSnapshot = await workflowsStore?.loadWorkflowSnapshot({
+          workflowName: this.id,
+          runId,
+        });
+        if (hasSuppliedLifecycleState && !authoritativeSnapshot) {
+          throw new NonRetriableError(`Cannot execute run ${runId}: snapshot not found`);
+        }
+        if (
+          authoritativeSnapshot &&
+          (authoritativeSnapshot.executionGeneration !== lifecycleExecution.executionGeneration ||
+            authoritativeSnapshot.lifecycleResumeAttempt !== lifecycleExecution.lifecycleResumeAttempt)
+        ) {
+          throw new NonRetriableError(`Cannot execute run ${runId}: lifecycle execution tuple is stale`);
+        }
+        if (authoritativeSnapshot?.lifecycleStepStates) {
+          lifecycleExecution.lifecycleStepStates = Object.fromEntries(
+            Object.entries(authoritativeSnapshot.lifecycleStepStates).map(([coordinate, state]) => [
+              coordinate,
+              { ...state },
+            ]),
+          );
+        }
+
         let result: WorkflowResult<TState, TInput, TOutput, TSteps>;
         try {
           result = await engine.execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({
             workflowId: this.id,
             runId,
+            ...lifecycleExecution,
             resourceId,
             disableScorers,
             graph: this.executionGraph,
@@ -553,6 +849,7 @@ export class InngestWorkflow<
                     result: result.status === 'success' ? toSnapshotResult(result.result) : undefined,
                     error: result.status === 'failed' ? result.error : undefined,
                     timestamp: Date.now(),
+                    ...lifecycleExecution,
                     ...(disableScorers !== undefined
                       ? {
                           runOptions: {

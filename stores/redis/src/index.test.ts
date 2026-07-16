@@ -13,6 +13,8 @@ function createMockClient(): RedisClient & { [key: string]: ReturnType<typeof vi
     del: vi.fn(),
     expire: vi.fn(),
     scan: vi.fn(),
+    incr: vi.fn(),
+    eval: vi.fn(),
   };
 }
 
@@ -190,6 +192,81 @@ describe('RedisServerCache', () => {
     });
   });
 
+  describe('atomic indexed log', () => {
+    it('keeps ordinary cache operations available when a custom client has no eval capability', async () => {
+      delete mockClient.eval;
+      mockClient.set.mockResolvedValue('OK');
+
+      await cache.set('ordinary-key', { value: true });
+
+      expect(mockClient.set).toHaveBeenCalledWith('mastra:cache:ordinary-key', '{"value":true}', 'EX', 300);
+      await expect(
+        cache.appendIndexedLogEntry('events', { id: 'event-0' }, { maxAgeMs: 60_000, maxEntries: 10 }),
+      ).rejects.toThrow(/require a client eval implementation or RedisServerCacheOptions\.evalScript adapter/);
+    });
+
+    it('advertises durable scope and decodes an atomic append response', async () => {
+      mockClient.eval.mockResolvedValue(['4', '1767225600000', '{"id":"event-4"}', 'generation-a']);
+
+      const result = await cache.appendIndexedLogEntry(
+        'events',
+        { id: 'event-4' },
+        { maxAgeMs: 60_000, maxEntries: 10 },
+      );
+
+      expect(cache.indexedLogScope).toBe('durable');
+      expect(result).toEqual({
+        cursor: 4,
+        storedAt: 1767225600000,
+        value: { id: 'event-4' },
+        logGeneration: 'generation-a',
+      });
+      expect(mockClient.eval).toHaveBeenCalledWith(
+        expect.any(String),
+        1,
+        'mastra:cache:events',
+        '{"id":"event-4"}',
+        '60000',
+        '10',
+        expect.any(String),
+      );
+    });
+
+    it('decodes retained range metadata and entries', async () => {
+      mockClient.eval.mockResolvedValue([
+        'generation-a',
+        '3',
+        '5',
+        '3',
+        '1767225600000',
+        '{"id":"event-3"}',
+        '4',
+        '1767225600001',
+        '{"id":"event-4"}',
+      ]);
+
+      await expect(
+        cache.readIndexedLogEntries<{ id: string }>('events', 2, { maxAgeMs: 60_000, maxEntries: 10 }),
+      ).resolves.toEqual({
+        logGeneration: 'generation-a',
+        firstCursor: 3,
+        nextCursor: 5,
+        entries: [
+          { cursor: 3, storedAt: 1767225600000, value: { id: 'event-3' } },
+          { cursor: 4, storedAt: 1767225600001, value: { id: 'event-4' } },
+        ],
+      });
+    });
+
+    it('deletes the complete indexed log key', async () => {
+      mockClient.del.mockResolvedValue(1);
+
+      await cache.deleteIndexedLog('events');
+
+      expect(mockClient.del).toHaveBeenCalledWith('mastra:cache:events');
+    });
+  });
+
   describe('upstashPreset', () => {
     it('should use upstash-style set with expiry', async () => {
       const upstashCache = new RedisServerCache({ client: mockClient }, upstashPreset);
@@ -209,6 +286,19 @@ describe('RedisServerCache', () => {
 
       // Upstash uses { match, count } style
       expect(mockClient.scan).toHaveBeenCalledWith('0', { match: 'mastra:cache:*', count: 100 });
+    });
+
+    it('uses Upstash array arguments for indexed-log scripts', async () => {
+      const upstashCache = new RedisServerCache({ client: mockClient }, upstashPreset);
+      mockClient.eval.mockResolvedValue(['0', '1767225600000', '{}', 'generation-a']);
+
+      await upstashCache.appendIndexedLogEntry('events', {}, { maxAgeMs: 1000, maxEntries: 2 });
+
+      expect(mockClient.eval).toHaveBeenCalledWith(
+        expect.any(String),
+        ['mastra:cache:events'],
+        ['{}', '1000', '2', expect.any(String)],
+      );
     });
   });
 
@@ -266,6 +356,21 @@ describe('RedisServerCache', () => {
       expect(result).toEqual(['a', 'b']);
       expect(nodeMock.lRange).toHaveBeenCalledWith('mastra:cache:my-list', 0, -1);
       expect(nodeMock.lrange).not.toHaveBeenCalled();
+    });
+
+    it('uses node-redis key and argument objects for indexed-log scripts', async () => {
+      const nodeMock: any = {
+        ...createMockClient(),
+        eval: vi.fn().mockResolvedValue(['0', '1767225600000', '{}', 'generation-a']),
+      };
+      const nodeCache = new RedisServerCache({ client: nodeMock }, nodeRedisPreset);
+
+      await nodeCache.appendIndexedLogEntry('events', {}, { maxAgeMs: 1000, maxEntries: 2 });
+
+      expect(nodeMock.eval).toHaveBeenCalledWith(expect.any(String), {
+        keys: ['mastra:cache:events'],
+        arguments: ['{}', '1000', '2', expect.any(String)],
+      });
     });
   });
 });

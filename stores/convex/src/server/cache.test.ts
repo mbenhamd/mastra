@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { handleCacheOperation, mastraCache } from './cache';
 
@@ -37,6 +37,7 @@ function createCtx(options: { failListItemInsert?: boolean } = {}) {
     },
     query(table: string) {
       const filters: Array<(row: Row) => boolean> = [];
+      let order: 'asc' | 'desc' = 'asc';
 
       const query = {
         withIndex(_index: string, cb: (q: any) => any) {
@@ -57,13 +58,18 @@ function createCtx(options: { failListItemInsert?: boolean } = {}) {
           cb(builder);
           return query;
         },
+        order(direction: 'asc' | 'desc') {
+          order = direction;
+          return query;
+        },
         async collect() {
-          return rows(table)
+          const collected = rows(table)
             .filter(row => filters.every(filter => filter(row)))
             .sort((a, b) => {
               if (a.key !== b.key) return String(a.key).localeCompare(String(b.key));
               return (a.index ?? 0) - (b.index ?? 0);
             });
+          return order === 'desc' ? collected.reverse() : collected;
         },
         async first() {
           return (await query.collect())[0] ?? null;
@@ -91,6 +97,10 @@ async function clearUntilSettled(ctx: ReturnType<typeof createCtx>, keyPrefix: s
 }
 
 describe('mastraCache server handler', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it('lets mutation write failures propagate for Convex rollback', async () => {
     const ctx = createCtx({ failListItemInsert: true });
 
@@ -500,5 +510,170 @@ describe('mastraCache server handler', () => {
         expiresAt: null,
       }),
     ).resolves.toEqual({ ok: true, result: 1 });
+  });
+
+  it('atomically appends indexed entries and reports the retained floor', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+    const ctx = createCtx();
+    const retention = { maxAgeMs: 60_000, maxEntries: 2 };
+
+    await expect(
+      handleCacheOperation(ctx as any, {
+        op: 'appendIndexedLog',
+        key: 'mastra:cache:indexed',
+        keyPrefix: 'mastra:cache:',
+        value: 'zero',
+        retention,
+        proposedLogGeneration: 'generation-a',
+      }),
+    ).resolves.toEqual({
+      ok: true,
+      result: { cursor: 0, storedAt: Date.now(), value: 'zero', logGeneration: 'generation-a' },
+    });
+    await handleCacheOperation(ctx as any, {
+      op: 'appendIndexedLog',
+      key: 'mastra:cache:indexed',
+      keyPrefix: 'mastra:cache:',
+      value: 'one',
+      retention,
+      proposedLogGeneration: 'ignored-generation',
+    });
+    await handleCacheOperation(ctx as any, {
+      op: 'appendIndexedLog',
+      key: 'mastra:cache:indexed',
+      keyPrefix: 'mastra:cache:',
+      value: 'two',
+      retention,
+      proposedLogGeneration: 'ignored-generation',
+    });
+
+    await expect(
+      handleCacheOperation(ctx as any, {
+        op: 'readIndexedLog',
+        key: 'mastra:cache:indexed',
+        keyPrefix: 'mastra:cache:',
+        afterCursor: -1,
+        retention,
+        proposedLogGeneration: 'ignored-generation',
+      }),
+    ).resolves.toEqual({
+      ok: true,
+      result: {
+        entries: [
+          { cursor: 1, storedAt: Date.now(), value: 'one' },
+          { cursor: 2, storedAt: Date.now(), value: 'two' },
+        ],
+        logGeneration: 'generation-a',
+        firstCursor: 1,
+        nextCursor: 3,
+      },
+    });
+  });
+
+  it('keeps an empty generation stable and recreates an expired non-empty log', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+    const ctx = createCtx();
+    const retention = { maxAgeMs: 100, maxEntries: 10 };
+    const read = (proposedLogGeneration: string) =>
+      handleCacheOperation(ctx as any, {
+        op: 'readIndexedLog',
+        key: 'mastra:cache:indexed',
+        keyPrefix: 'mastra:cache:',
+        afterCursor: -1,
+        retention,
+        proposedLogGeneration,
+      });
+
+    await expect(read('empty-generation')).resolves.toMatchObject({
+      ok: true,
+      result: { logGeneration: 'empty-generation', firstCursor: 0, nextCursor: 0 },
+    });
+    await vi.advanceTimersByTimeAsync(1_000);
+    await expect(read('ignored-generation')).resolves.toMatchObject({
+      ok: true,
+      result: { logGeneration: 'empty-generation', firstCursor: 0, nextCursor: 0 },
+    });
+
+    await handleCacheOperation(ctx as any, {
+      op: 'appendIndexedLog',
+      key: 'mastra:cache:indexed',
+      keyPrefix: 'mastra:cache:',
+      value: 'event',
+      retention,
+      proposedLogGeneration: 'ignored-generation',
+    });
+    await vi.advanceTimersByTimeAsync(101);
+
+    await expect(read('recreated-generation')).resolves.toEqual({
+      ok: true,
+      result: {
+        entries: [],
+        logGeneration: 'recreated-generation',
+        firstCursor: 0,
+        nextCursor: 0,
+      },
+    });
+  });
+
+  it('rejects malformed indexed-log requests before mutating storage', async () => {
+    const ctx = createCtx();
+
+    await expect(
+      handleCacheOperation(ctx as any, {
+        op: 'appendIndexedLog',
+        key: 'mastra:cache:indexed',
+        keyPrefix: 'mastra:cache:',
+        value: 'event',
+        retention: { maxAgeMs: 0, maxEntries: 10 },
+        proposedLogGeneration: 'generation-a',
+      }),
+    ).resolves.toEqual({ ok: false, error: 'Indexed log retention requires positive safe-integer limits' });
+    await expect(
+      handleCacheOperation(ctx as any, {
+        op: 'readIndexedLog',
+        key: 'mastra:cache:indexed',
+        keyPrefix: 'mastra:cache:',
+        afterCursor: Number.NaN,
+        retention: { maxAgeMs: 100, maxEntries: 10 },
+        proposedLogGeneration: 'generation-a',
+      }),
+    ).resolves.toEqual({ ok: false, error: 'Indexed log afterCursor must be a safe integer' });
+  });
+
+  it('recreates a fully expired log when a reader shortens retention', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+    const ctx = createCtx();
+
+    await handleCacheOperation(ctx as any, {
+      op: 'appendIndexedLog',
+      key: 'mastra:cache:indexed',
+      keyPrefix: 'mastra:cache:',
+      value: 'old',
+      retention: { maxAgeMs: 10_000, maxEntries: 10 },
+      proposedLogGeneration: 'generation-a',
+    });
+    await vi.advanceTimersByTimeAsync(101);
+
+    await expect(
+      handleCacheOperation(ctx as any, {
+        op: 'readIndexedLog',
+        key: 'mastra:cache:indexed',
+        keyPrefix: 'mastra:cache:',
+        afterCursor: -1,
+        retention: { maxAgeMs: 100, maxEntries: 10 },
+        proposedLogGeneration: 'generation-b',
+      }),
+    ).resolves.toEqual({
+      ok: true,
+      result: {
+        entries: [],
+        logGeneration: 'generation-b',
+        firstCursor: 0,
+        nextCursor: 0,
+      },
+    });
   });
 });

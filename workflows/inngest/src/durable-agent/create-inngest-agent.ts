@@ -53,13 +53,17 @@ import { CachingPubSub } from '@mastra/core/events';
 import type { PubSub } from '@mastra/core/events';
 import type { Mastra } from '@mastra/core/mastra';
 import { SpanType, EntityType } from '@mastra/core/observability';
+import { RequestContext } from '@mastra/core/request-context';
 import type { MastraModelOutput, ChunkType, FullOutput, MastraOnFinishCallback } from '@mastra/core/stream';
 import type { Workflow } from '@mastra/core/workflows';
 import type { Inngest } from 'inngest';
 
 import { InngestPubSub } from '../pubsub';
-import type { InngestWorkflow } from '../workflow';
-import { createInngestDurableAgenticWorkflow, InngestDurableStepIds } from './create-inngest-agentic-workflow';
+import { INNGEST_WORKFLOW_LIFECYCLE_REPLAY, InngestWorkflow } from '../workflow';
+import {
+  createInngestDurableAgenticWorkflow,
+  createInngestDurableAgenticWorkflowIds,
+} from './create-inngest-agentic-workflow';
 
 /**
  * Internal sentinel used by {@link InngestAgent.generate} and
@@ -107,7 +111,12 @@ export interface CreateInngestAgentOptions {
    * When provided, the pubsub is wrapped with CachingPubSub.
    */
   cache?: MastraServerCache;
-  /** Mastra instance for observability (optional, set automatically when registered with Mastra) */
+  /**
+   * Optional early Mastra reference. Durable execution still requires this
+   * wrapper to be registered as an agent on the same Mastra instance and that
+   * instance to have workflow storage. Normal Mastra registration sets this
+   * reference automatically.
+   */
   mastra?: Mastra;
 }
 
@@ -512,15 +521,19 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
   let proxyRef: InngestAgent<TOutput> | undefined;
 
   // Create the durable workflow for this agent
-  // Mastra's addWorkflow handles deduplication, so creating multiple times is fine
-  const workflow = createInngestDurableAgenticWorkflow({ inngest });
+  // Parent and nested workflow IDs are both namespaced to the public durable
+  // agent ID. Mastra and Inngest therefore register every agent's complete
+  // function tree without allowing one wrapper's transport/cache factory to
+  // become the accidental owner for all durable agents.
+  const workflowIds = createInngestDurableAgenticWorkflowIds(agentId);
+  const workflow = createInngestDurableAgenticWorkflow({ inngest, workflowIds });
 
   // Track whether user provided a custom cache (if not, we'll inherit from mastra)
   let _customCache = cache;
 
   // Set up pubsub with lazy CachingPubSub creation
   // CachingPubSub is an internal implementation detail - users just configure cache and pubsub separately
-  let innerPubsub: PubSub = customPubsub ?? new InngestPubSub(inngest, InngestDurableStepIds.AGENTIC_LOOP);
+  let innerPubsub: PubSub = customPubsub ?? new InngestPubSub(inngest, workflowIds.AGENTIC_LOOP);
   let _cachingPubsub: PubSub | null = null;
 
   // Resolve the cache that backs CachingPubSub history.
@@ -548,10 +561,17 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
   function getPubsub(): PubSub {
     if (!_cachingPubsub) {
       if (innerPubsub instanceof CachingPubSub) {
+        if (!innerPubsub.indexedReplay) {
+          throw new TypeError(
+            'Inngest durable agents require CachingPubSub indexedReplay so agent observers and workflow lifecycle publishers share one exact replay log',
+          );
+        }
         _cachingPubsub = innerPubsub;
-        _customCache = _customCache ?? mastra?.serverCache;
+        _customCache = innerPubsub.cache;
       } else {
-        _cachingPubsub = new CachingPubSub(innerPubsub, resolveCache());
+        _cachingPubsub = new CachingPubSub(innerPubsub, resolveCache(), {
+          indexedReplay: INNGEST_WORKFLOW_LIFECYCLE_REPLAY,
+        });
       }
     }
     return _cachingPubsub;
@@ -565,12 +585,19 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
   // agent-stream replay.
   // The chained `.commit()` builder loses the InngestWorkflow subtype, so cast back.
   (workflow as unknown as InngestWorkflow).__setPubsubFactory(defaultPubsub => {
+    // A caller-supplied transport is the live delivery contract for both
+    // observers and workflow publishers. Sharing only its cache would make
+    // events replayable after reconnect while starving observers that were
+    // already attached to the caller's live transport.
+    if (customPubsub) return getPubsub();
     // If the caller already supplied a CachingPubSub upstream, defer to it.
     if (defaultPubsub instanceof CachingPubSub) return defaultPubsub;
     // Ensure the agent's CachingPubSub (and its cache) is resolved so workflow
     // events and agent.stream events share the same history backend.
     getPubsub();
-    return new CachingPubSub(defaultPubsub, resolveCache());
+    return new CachingPubSub(defaultPubsub, resolveCache(), {
+      indexedReplay: INNGEST_WORKFLOW_LIFECYCLE_REPLAY,
+    });
   });
 
   // Lazily resolve cache
@@ -581,24 +608,65 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
   }
 
   /**
-   * Trigger the workflow via Inngest event
+   * Resolve the workflow instance used for durable dispatch.
+   *
+   * The public durable-agent examples register the wrapper with Mastra before
+   * execution. Fail closed when that contract is missing: direct `inngest.send`
+   * would bypass the run's persisted lifecycle tuple and deterministic event ID.
+   */
+  function getAdmittedWorkflow(): InngestWorkflow {
+    if (!mastra || !mastra.getStorage()) {
+      throw new TypeError(
+        'Inngest durable-agent execution requires registration with a Mastra instance configured with workflow storage',
+      );
+    }
+
+    let registeredWorkflow: unknown;
+    try {
+      registeredWorkflow = mastra.getWorkflow(workflowIds.AGENTIC_LOOP);
+    } catch {
+      // Normalize Mastra's registry lookup error to the durable-agent contract
+      // exposed below.
+    }
+    if (!(registeredWorkflow instanceof InngestWorkflow)) {
+      throw new TypeError(
+        'Inngest durable-agent execution requires its durable workflow to be registered on the Mastra instance',
+      );
+    }
+
+    const admittedWorkflow = workflow as InngestWorkflow;
+    // This wrapper owns a deterministic per-agent workflow ID. Register the
+    // local instance with the same Mastra storage before using InngestRun's
+    // canonical admission path.
+    admittedWorkflow.__registerMastra(mastra);
+    return admittedWorkflow;
+  }
+
+  function requestContextFromEntries(entries: unknown): RequestContext {
+    const requestContext = new RequestContext();
+    if (!entries || typeof entries !== 'object' || Array.isArray(entries)) return requestContext;
+
+    for (const [key, value] of Object.entries(entries)) {
+      requestContext.set(key, value);
+    }
+    return requestContext;
+  }
+
+  /**
+   * Trigger the workflow through InngestRun so lifecycle identity is admitted
+   * before dispatch and the event receives its deterministic dispatch ID.
    */
   async function triggerWorkflow(
     runId: string,
     workflowInput: any,
     tracingOptions?: { traceId: string; parentSpanId: string },
+    resourceId?: string,
   ): Promise<void> {
-    const eventName = `workflow.${InngestDurableStepIds.AGENTIC_LOOP}`;
-
-    await inngest.send({
-      name: eventName,
-      data: {
-        inputData: workflowInput,
-        runId,
-        resourceId: workflowInput.state?.resourceId,
-        requestContext: workflowInput.requestContextEntries ?? {},
-        tracingOptions,
-      },
+    const run = await getAdmittedWorkflow().createRun({ runId, resourceId });
+    await run.startAsync({
+      inputData: workflowInput,
+      requestContext: requestContextFromEntries(workflowInput.requestContextEntries),
+      tracingOptions,
     });
   }
 
@@ -815,9 +883,12 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
       // Track the trigger promise on the registry so generate() can await suspend
       // snapshot persistence before returning.
       const workflowExecution = ready
-        .then(() => triggerWorkflow(runId, workflowInput, tracingOptions))
-        .catch(error => {
-          void emitError(runId, error);
+        .then(() => triggerWorkflow(runId, workflowInput, tracingOptions, resourceId))
+        .catch(async error => {
+          // The trigger failure is already contained by this workflow promise.
+          // Contain a secondary realtime outage as well so best-effort terminal
+          // notification cannot become an unhandled rejection.
+          await emitError(runId, error).catch(() => {});
         });
       const trackedEntry = globalRunRegistry.get(runId);
       if (trackedEntry) {
@@ -967,43 +1038,31 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
         closeOnSuspend: (resumeOptions as any)?.[CLOSE_ON_SUSPEND] === true,
       });
 
-      // Load the workflow snapshot to build proper resume data
-      // This mirrors InngestRun._resume() which loads the snapshot, finds the suspended step,
-      // and sends an event to the same trigger name (not a .resume suffix)
-      const eventName = `workflow.${InngestDurableStepIds.AGENTIC_LOOP}`;
-
       const workflowExecution = ready
         .then(async () => {
-          const workflowsStore = await mastra?.getStorage()?.getStore('workflows');
-          const snapshot: any = await workflowsStore?.loadWorkflowSnapshot({
-            workflowName: InngestDurableStepIds.AGENTIC_LOOP,
+          const admittedWorkflow = getAdmittedWorkflow();
+          const workflowsStore = await mastra!.getStorage()!.getStore('workflows');
+          if (!workflowsStore) {
+            throw new TypeError('Cannot resume Inngest durable-agent run: workflow storage is unavailable');
+          }
+          const snapshot = await workflowsStore.loadWorkflowSnapshot({
+            workflowName: workflowIds.AGENTIC_LOOP,
             runId,
           });
+          if (!snapshot) {
+            throw new TypeError(`Cannot resume Inngest durable-agent run ${runId}: snapshot not found`);
+          }
 
           // Find the suspended step from the snapshot
-          const suspendedStepIds = snapshot?.suspendedPaths ? Object.keys(snapshot.suspendedPaths) : [];
-          const steps = suspendedStepIds.length > 0 ? suspendedStepIds : [];
-
-          await inngest.send({
-            name: eventName,
-            data: {
-              inputData: resumeData,
-              initialState: snapshot?.value ?? {},
-              runId,
-              resourceId: resumeOptions?.resourceId,
-              requestContext: snapshot?.requestContext ?? {},
-              stepResults: snapshot?.context,
-              resume: {
-                steps,
-                stepResults: snapshot?.context,
-                resumePayload: resumeData,
-                resumePath: steps[0] ? snapshot?.suspendedPaths?.[steps[0]] : undefined,
-              },
-            },
+          const steps = Object.keys(snapshot.suspendedPaths ?? {});
+          const run = await admittedWorkflow.createRun({ runId, resourceId: resumeOptions?.resourceId });
+          await run.resumeAsync({
+            resumeData,
+            step: steps,
           });
         })
-        .catch(error => {
-          void emitError(runId, error);
+        .catch(async error => {
+          await emitError(runId, error).catch(() => {});
         });
 
       existingEntry.workflowExecution = workflowExecution;

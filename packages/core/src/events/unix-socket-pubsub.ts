@@ -7,12 +7,12 @@ import { dirname } from 'node:path';
 import { decode, encode } from './codec';
 import { PubSub } from './pubsub';
 import type { PubSubDeliveryMode } from './pubsub';
-import type { Event, EventCallback, SubscribeOptions } from './types';
+import type { Event, EventCallback, PublishEvent, SubscribeOptions } from './types';
 
 type ClientFrame =
   | { type: 'subscribe'; topic: string }
   | { type: 'unsubscribe'; topic: string }
-  | { type: 'publish'; topic: string; event: Omit<Event, 'id' | 'createdAt'>; localOnly?: boolean }
+  | { type: 'publish'; topic: string; event: PublishEvent; localOnly?: boolean }
   | { type: 'ack'; id?: string }
   | { type: 'nack'; id?: string };
 
@@ -185,11 +185,7 @@ export class UnixSocketPubSub extends PubSub {
     return this.#isBroker ? this.#brokerClients.size : 0;
   }
 
-  async publish(
-    topic: string,
-    event: Omit<Event, 'id' | 'createdAt'>,
-    options?: { localOnly?: boolean },
-  ): Promise<void> {
+  async publish(topic: string, event: PublishEvent, options?: { localOnly?: boolean }): Promise<void> {
     await this.#ensureStarted();
 
     // `localOnly` events stay entirely within the publishing process. They are
@@ -202,9 +198,9 @@ export class UnixSocketPubSub extends PubSub {
     if (options?.localOnly) {
       const localEvent: Event = {
         ...event,
-        id: randomUUID(),
-        createdAt: new Date(),
-        deliveryAttempt: 1,
+        id: event.id ?? randomUUID(),
+        createdAt: event.createdAt ?? new Date(),
+        deliveryAttempt: event.deliveryAttempt ?? 1,
       };
       this.#deliverLocal(topic, localEvent);
       return;
@@ -659,17 +655,12 @@ export class UnixSocketPubSub extends PubSub {
     this.#deliverLocal(frame.topic, frame.event);
   }
 
-  async #publishFromBroker(
-    topic: string,
-    event: Omit<Event, 'id' | 'createdAt'>,
-    sourceClient?: BrokerClient,
-    localOnly?: boolean,
-  ) {
+  async #publishFromBroker(topic: string, event: PublishEvent, sourceClient?: BrokerClient, localOnly?: boolean) {
     const brokerEvent: Event = {
       ...event,
-      id: randomUUID(),
-      createdAt: new Date(),
-      deliveryAttempt: 1,
+      id: event.id ?? randomUUID(),
+      createdAt: event.createdAt ?? new Date(),
+      deliveryAttempt: event.deliveryAttempt ?? 1,
     };
 
     this.#deliverLocal(topic, brokerEvent);
@@ -741,10 +732,12 @@ export class UnixSocketPubSub extends PubSub {
         nack,
       );
       if (result && typeof (result as Promise<void>).catch === 'function') {
-        void (result as Promise<void>).catch(() => {});
+        void (result as Promise<void>).catch(() => nack()).catch(() => {});
       }
     } catch {
-      // Ignore subscriber failures so one callback cannot poison topic delivery.
+      // Route synchronous failures through the same bounded redelivery path as
+      // explicit nacks while keeping other topic subscribers isolated.
+      void nack().catch(() => {});
     }
   }
 

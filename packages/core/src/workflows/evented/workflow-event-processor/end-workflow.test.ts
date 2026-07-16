@@ -40,6 +40,9 @@ describe('WorkflowEventProcessor #endWorkflow', () => {
         serializedStepGraph: [],
         waitingPaths: {},
         timestamp: Date.now(),
+        executionGeneration: 'end-workflow-generation',
+        lifecycleResumeAttempt: 0,
+        lifecycleStepStates: {},
       } as any,
     });
 
@@ -53,6 +56,9 @@ describe('WorkflowEventProcessor #endWorkflow', () => {
       {
         workflowId: 'wf',
         runId: 'run-1',
+        executionGeneration: 'end-workflow-generation',
+        lifecycleResumeAttempt: 0,
+        lifecycleStepStates: {},
         executionPath: [],
         resumeSteps: [],
         stepResults: {},

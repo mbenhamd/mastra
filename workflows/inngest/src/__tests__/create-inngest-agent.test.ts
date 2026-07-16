@@ -16,7 +16,8 @@ import { DefaultStorage } from '@mastra/libsql';
 import { Inngest } from 'inngest';
 import { describe, it, expect, vi } from 'vitest';
 
-import { InngestDurableStepIds } from '../durable-agent/create-inngest-agentic-workflow';
+import { createInngestDurableAgenticWorkflowIds } from '../durable-agent/create-inngest-agentic-workflow';
+import { collectInngestFunctions } from '../functions';
 import { createInngestAgent, isInngestAgent } from '../index';
 
 // Mock model for testing
@@ -48,6 +49,8 @@ function createMockModel() {
 }
 
 const INNGEST_PORT = 4100;
+
+const workflowIdsFor = createInngestDurableAgenticWorkflowIds;
 
 describe('createInngestAgent factory function', () => {
   const inngest = new Inngest({
@@ -104,7 +107,7 @@ describe('createInngestAgent factory function', () => {
 
     expect(Array.isArray(workflows)).toBe(true);
     expect(workflows.length).toBe(1);
-    expect(workflows[0].id).toBe(InngestDurableStepIds.AGENTIC_LOOP);
+    expect(workflows[0].id).toBe(workflowIdsFor('workflows-test').AGENTIC_LOOP);
   });
 
   it('should prepare for durable execution', async () => {
@@ -162,6 +165,11 @@ describe('createInngestAgent observe-replay wiring', () => {
     const durableAgent = createInngestAgent({ agent: makeAgent('observe-replay-default'), inngest });
 
     expect(durableAgent.pubsub).toBeInstanceOf(CachingPubSub);
+    expect(durableAgent.pubsub.indexedReplay).toMatchObject({
+      scope: 'process',
+      retentionMs: expect.any(Number),
+      maxEvents: expect.any(Number),
+    });
     expect(durableAgent.cache).toBeInstanceOf(InMemoryServerCache);
   });
 
@@ -175,6 +183,43 @@ describe('createInngestAgent observe-replay wiring', () => {
 
     expect(durableAgent.cache).toBe(customCache);
     expect(durableAgent.pubsub).toBeInstanceOf(CachingPubSub);
+    expect(durableAgent.pubsub.indexedReplay).toBeDefined();
+  });
+
+  it('shares a caller-provided exact CachingPubSub live path with workflow publishers', async () => {
+    const customCache = new InMemoryServerCache();
+    const customPubsub = new CachingPubSub(new EventEmitterPubSub(), customCache, {
+      indexedReplay: { retentionMs: 60_000, maxEvents: 100 },
+    });
+    const durableAgent = createInngestAgent({
+      agent: makeAgent('observe-replay-custom-pubsub-cache'),
+      inngest,
+      pubsub: customPubsub,
+    });
+
+    expect(durableAgent.pubsub).toBe(customPubsub);
+    expect(durableAgent.cache).toBe(customCache);
+
+    const [workflow] = durableAgent.getDurableWorkflows() as any[];
+    const factory = workflow.__getPubsubFactory?.();
+    const workflowPubsub = factory(new EventEmitterPubSub());
+    expect(workflowPubsub).toBe(customPubsub);
+
+    const runId = 'custom-live-path-run';
+    const topic = AGENT_STREAM_TOPIC(runId);
+    const received: any[] = [];
+    await durableAgent.pubsub.subscribeWithReplay(topic, event => {
+      received.push(event);
+    });
+    await workflowPubsub.publish(topic, {
+      type: AgentStreamEventTypes.CHUNK,
+      runId,
+      data: { chunk: 'live-from-workflow' },
+    } as any);
+
+    await vi.waitFor(() => {
+      expect(received.map(event => event.data)).toContainEqual({ chunk: 'live-from-workflow' });
+    });
   });
 
   // The next two tests mirror packages/core/src/agent/durable/__tests__/resumable-streams.test.ts
@@ -248,7 +293,7 @@ describe('createInngestAgent observe-replay wiring', () => {
     swapInnerToInProcess(durableAgent);
 
     const workflows = durableAgent.getDurableWorkflows();
-    const workflow = workflows.find((w: any) => w.id === InngestDurableStepIds.AGENTIC_LOOP) as any;
+    const workflow = workflows.find((w: any) => w.id === workflowIdsFor('observe-replay-factory').AGENTIC_LOOP) as any;
     expect(workflow).toBeDefined();
 
     const factory = workflow.__getPubsubFactory?.();
@@ -383,7 +428,7 @@ describe('createInngestAgent with Mastra auto-registration', () => {
     expect(registeredAgent?.id).toBe('auto-reg-agent');
 
     // Verify workflow is auto-registered
-    const workflow = mastra.getWorkflow(InngestDurableStepIds.AGENTIC_LOOP);
+    const workflow = mastra.getWorkflow(workflowIdsFor('auto-reg-agent').AGENTIC_LOOP);
     expect(workflow).toBeDefined();
   });
 
@@ -413,11 +458,11 @@ describe('createInngestAgent with Mastra auto-registration', () => {
     expect(registeredAgent).toBeDefined();
 
     // Verify workflow is auto-registered
-    const workflow = mastra.getWorkflow(InngestDurableStepIds.AGENTIC_LOOP);
+    const workflow = mastra.getWorkflow(workflowIdsFor('add-agent-agent').AGENTIC_LOOP);
     expect(workflow).toBeDefined();
   });
 
-  it('should work with multiple durable agents sharing the same workflow', () => {
+  it('registers distinct parent and nested Inngest functions for multiple durable agents', async () => {
     const agent1 = new Agent({
       id: 'multi-agent-1',
       name: 'Multi Agent 1',
@@ -451,9 +496,177 @@ describe('createInngestAgent with Mastra auto-registration', () => {
     expect(mastra.getAgentById('multi-agent-1')).toBeDefined();
     expect(mastra.getAgentById('multi-agent-2')).toBeDefined();
 
-    // Verify workflow is registered (only once)
-    const workflow = mastra.getWorkflow(InngestDurableStepIds.AGENTIC_LOOP);
-    expect(workflow).toBeDefined();
+    const firstIds = workflowIdsFor('multi-agent-1');
+    const secondIds = workflowIdsFor('multi-agent-2');
+    expect(firstIds).not.toEqual(secondIds);
+    expect(Object.keys(mastra.listWorkflows())).toEqual(
+      expect.arrayContaining([firstIds.AGENTIC_LOOP, secondIds.AGENTIC_LOOP]),
+    );
+    expect(Object.keys(mastra.listWorkflows())).toHaveLength(2);
+
+    const functionIds = collectInngestFunctions({ mastra }).map(fn => fn.id());
+    expect(functionIds).toEqual(
+      expect.arrayContaining([
+        `workflow.${firstIds.AGENTIC_LOOP}`,
+        `workflow.${firstIds.AGENTIC_EXECUTION}`,
+        `workflow.${secondIds.AGENTIC_LOOP}`,
+        `workflow.${secondIds.AGENTIC_EXECUTION}`,
+      ]),
+    );
+    expect(new Set(functionIds).size).toBe(4);
+
+    await mastra.shutdown();
+  });
+
+  it('isolates each durable agent workflow publisher and replay cache', async () => {
+    const firstCache = new InMemoryServerCache();
+    const secondCache = new InMemoryServerCache();
+    const firstPubsub = new CachingPubSub(new EventEmitterPubSub(), firstCache, {
+      indexedReplay: { retentionMs: 60_000, maxEvents: 100 },
+    });
+    const secondPubsub = new CachingPubSub(new EventEmitterPubSub(), secondCache, {
+      indexedReplay: { retentionMs: 60_000, maxEvents: 100 },
+    });
+    const durableAgent1 = createInngestAgent({
+      agent: new Agent({
+        id: 'multi-transport-1',
+        name: 'Multi Transport 1',
+        instructions: 'Test',
+        model: createMockModel() as any,
+      }),
+      inngest,
+      pubsub: firstPubsub,
+    });
+    const durableAgent2 = createInngestAgent({
+      agent: new Agent({
+        id: 'multi-transport-2',
+        name: 'Multi Transport 2',
+        instructions: 'Test',
+        model: createMockModel() as any,
+      }),
+      inngest,
+      pubsub: secondPubsub,
+    });
+    const mastra = new Mastra({
+      storage: new DefaultStorage({ id: 'multi-transport-storage', url: ':memory:' }),
+      agents: { durableAgent1, durableAgent2 },
+    });
+
+    try {
+      const firstWorkflow = mastra.getWorkflow(workflowIdsFor('multi-transport-1').AGENTIC_LOOP) as any;
+      const secondWorkflow = mastra.getWorkflow(workflowIdsFor('multi-transport-2').AGENTIC_LOOP) as any;
+      const firstPublisher = firstWorkflow.__getPubsubFactory?.()(new EventEmitterPubSub());
+      const secondPublisher = secondWorkflow.__getPubsubFactory?.()(new EventEmitterPubSub());
+      expect(firstPublisher).toBe(firstPubsub);
+      expect(secondPublisher).toBe(secondPubsub);
+
+      const replayTopic = AGENT_STREAM_TOPIC('multi-transport-replay-1');
+      await firstPublisher.publish(replayTopic, {
+        type: AgentStreamEventTypes.CHUNK,
+        runId: 'multi-transport-replay-1',
+        data: { owner: 'first' },
+      });
+
+      const firstReplay: any[] = [];
+      const wrongReplay: any[] = [];
+      await firstPubsub.subscribeWithReplay(replayTopic, event => firstReplay.push(event));
+      await secondPubsub.subscribeWithReplay(replayTopic, event => wrongReplay.push(event));
+      expect(firstReplay.map(event => event.data)).toEqual([{ owner: 'first' }]);
+      expect(wrongReplay).toEqual([]);
+
+      const liveTopic = AGENT_STREAM_TOPIC('multi-transport-live-2');
+      const secondLive: any[] = [];
+      const wrongLive: any[] = [];
+      await secondPubsub.subscribeWithReplay(liveTopic, event => secondLive.push(event));
+      await firstPubsub.subscribeWithReplay(liveTopic, event => wrongLive.push(event));
+      await secondPublisher.publish(liveTopic, {
+        type: AgentStreamEventTypes.CHUNK,
+        runId: 'multi-transport-live-2',
+        data: { owner: 'second' },
+      });
+      await vi.waitFor(() => expect(secondLive.map(event => event.data)).toEqual([{ owner: 'second' }]));
+      expect(wrongLive).toEqual([]);
+    } finally {
+      await mastra.shutdown();
+    }
+  });
+
+  it('persists each durable-agent start only under its owning workflow ID', async () => {
+    const firstPubsub = new CachingPubSub(new EventEmitterPubSub(), new InMemoryServerCache(), {
+      indexedReplay: { retentionMs: 60_000, maxEvents: 100 },
+    });
+    const secondPubsub = new CachingPubSub(new EventEmitterPubSub(), new InMemoryServerCache(), {
+      indexedReplay: { retentionMs: 60_000, maxEvents: 100 },
+    });
+    const durableAgent1 = createInngestAgent({
+      agent: new Agent({
+        id: 'multi-snapshot-1',
+        name: 'Multi Snapshot 1',
+        instructions: 'Test',
+        model: createMockModel() as any,
+      }),
+      inngest,
+      pubsub: firstPubsub,
+    });
+    const durableAgent2 = createInngestAgent({
+      agent: new Agent({
+        id: 'multi-snapshot-2',
+        name: 'Multi Snapshot 2',
+        instructions: 'Test',
+        model: createMockModel() as any,
+      }),
+      inngest,
+      pubsub: secondPubsub,
+    });
+    const mastra = new Mastra({
+      logger: false,
+      storage: new DefaultStorage({ id: 'multi-snapshot-storage', url: ':memory:' }),
+      agents: { durableAgent1, durableAgent2 },
+    });
+    const sendSpy = vi.spyOn(inngest as any, 'send').mockResolvedValue({ ids: ['test-event'] } as any);
+    const firstRunId = 'multi-snapshot-run-1';
+    const secondRunId = 'multi-snapshot-run-2';
+    const first = await durableAgent1.stream([{ role: 'user', content: 'first' }], { runId: firstRunId });
+    const second = await durableAgent2.stream([{ role: 'user', content: 'second' }], { runId: secondRunId });
+
+    try {
+      for (const runId of [firstRunId, secondRunId]) {
+        const deadline = Date.now() + 1_000;
+        let execution = globalRunRegistry.get(runId)?.workflowExecution;
+        while (!execution && Date.now() < deadline) {
+          await new Promise(resolve => setTimeout(resolve, 0));
+          execution = globalRunRegistry.get(runId)?.workflowExecution;
+        }
+        expect(execution).toBeInstanceOf(Promise);
+        await expect(execution).resolves.toBeUndefined();
+      }
+
+      const firstIds = workflowIdsFor('multi-snapshot-1');
+      const secondIds = workflowIdsFor('multi-snapshot-2');
+      expect(sendSpy.mock.calls.map(call => call[0].name)).toEqual([
+        `workflow.${firstIds.AGENTIC_LOOP}`,
+        `workflow.${secondIds.AGENTIC_LOOP}`,
+      ]);
+
+      const workflowsStore = await mastra.getStorage()!.getStore('workflows');
+      await expect(
+        workflowsStore.loadWorkflowSnapshot({ workflowName: firstIds.AGENTIC_LOOP, runId: firstRunId }),
+      ).resolves.toMatchObject({ status: 'running', runId: firstRunId });
+      await expect(
+        workflowsStore.loadWorkflowSnapshot({ workflowName: secondIds.AGENTIC_LOOP, runId: secondRunId }),
+      ).resolves.toMatchObject({ status: 'running', runId: secondRunId });
+      await expect(
+        workflowsStore.loadWorkflowSnapshot({ workflowName: secondIds.AGENTIC_LOOP, runId: firstRunId }),
+      ).resolves.toBeNull();
+      await expect(
+        workflowsStore.loadWorkflowSnapshot({ workflowName: firstIds.AGENTIC_LOOP, runId: secondRunId }),
+      ).resolves.toBeNull();
+    } finally {
+      first.cleanup();
+      second.cleanup();
+      sendSpy.mockRestore();
+      await mastra.shutdown();
+    }
   });
 });
 
@@ -477,11 +690,10 @@ describe('InngestAgent parity surface', () => {
     baseUrl: `http://localhost:${INNGEST_PORT}`,
   });
 
-  // Replace inngest.send with a no-op so stream()/resume() don't attempt
-  // a real network roundtrip; the only thing under test here is the
-  // non-durable preparation/registry path on the agent itself.
+  // Replace inngest.send so stream()/resume() don't attempt a real network
+  // roundtrip. InngestRun admission requires the returned event id.
   function stubInngestSend(target: Inngest = inngest) {
-    return vi.spyOn(target as any, 'send').mockResolvedValue(undefined as any);
+    return vi.spyOn(target as any, 'send').mockResolvedValue({ ids: ['test-event'] } as any);
   }
 
   function makeAgent(id: string) {
@@ -499,8 +711,13 @@ describe('InngestAgent parity surface', () => {
   // inner with an in-process broker so the surface tests stay self-contained.
   function makeIsolatedAgent(id: string) {
     const durableAgent = createInngestAgent({ agent: makeAgent(id), inngest });
+    const mastra = new Mastra({
+      logger: false,
+      storage: new DefaultStorage({ id: `${id}-storage`, url: ':memory:' }),
+      agents: { [id]: durableAgent },
+    });
     (durableAgent.pubsub as any).inner = new EventEmitterPubSub();
-    return durableAgent;
+    return { durableAgent, mastra };
   }
 
   it('threads widened execution options through prepare() into workflow input', async () => {
@@ -531,7 +748,7 @@ describe('InngestAgent parity surface', () => {
     // Slice 2: stream() must own an AbortController, expose it via
     // result.abort, and surface its signal on the run-registry entry so the
     // durable LLM step (when co-located) can short-circuit.
-    const durableAgent = makeIsolatedAgent('parity-abort');
+    const { durableAgent, mastra } = makeIsolatedAgent('parity-abort');
     const sendSpy = stubInngestSend();
 
     const result = await durableAgent.stream([{ role: 'user', content: 'hi' }]);
@@ -544,9 +761,11 @@ describe('InngestAgent parity surface', () => {
       result.abort('user-cancelled');
 
       expect(entry?.abortSignal?.aborted).toBe(true);
+      await entry?.workflowExecution;
     } finally {
       result.cleanup();
       sendSpy.mockRestore();
+      await mastra.shutdown();
     }
   });
 
@@ -554,7 +773,7 @@ describe('InngestAgent parity surface', () => {
     // External signal must be wired through so either source (caller's
     // signal or result.abort) flips the registry-tracked AbortSignal that
     // workflow steps observe.
-    const durableAgent = makeIsolatedAgent('parity-abort-external');
+    const { durableAgent, mastra } = makeIsolatedAgent('parity-abort-external');
     const sendSpy = stubInngestSend();
 
     const external = new AbortController();
@@ -570,9 +789,11 @@ describe('InngestAgent parity surface', () => {
       // The forwarded controller is flipped synchronously by the abort
       // event listener installed in stream().
       expect(entry?.abortSignal?.aborted).toBe(true);
+      await entry?.workflowExecution;
     } finally {
       result.cleanup();
       sendSpy.mockRestore();
+      await mastra.shutdown();
     }
   });
 
@@ -580,7 +801,8 @@ describe('InngestAgent parity surface', () => {
     // generate()/resumeGenerate() rely on awaiting workflowExecution after a
     // suspend to make sure the snapshot has landed before they return. This
     // covers the registration side of that contract.
-    const durableAgent = makeIsolatedAgent('parity-workflow-exec');
+    const { durableAgent, mastra } = makeIsolatedAgent('parity-workflow-exec');
+    const workflowIds = workflowIdsFor('parity-workflow-exec');
     const sendSpy = stubInngestSend();
 
     const result = await durableAgent.stream([{ role: 'user', content: 'hi' }]);
@@ -596,18 +818,134 @@ describe('InngestAgent parity surface', () => {
         entry = globalRunRegistry.get(result.runId);
       }
       expect(entry?.workflowExecution).toBeInstanceOf(Promise);
-      // The promise should settle once inngest.send resolves (stubbed to
-      // undefined). Awaiting it shouldn't throw.
+      // The promise should settle once the admitted Inngest dispatch resolves.
       await expect(entry?.workflowExecution).resolves.toBeUndefined();
-      expect(sendSpy).toHaveBeenCalled();
+      expect(sendSpy).toHaveBeenCalledTimes(1);
+
+      const dispatch = sendSpy.mock.calls[0]?.[0];
+      expect(dispatch).toMatchObject({
+        id: expect.stringMatching(/^miwd:v1:/),
+        name: `workflow.${workflowIds.AGENTIC_LOOP}`,
+        data: {
+          runId: result.runId,
+          executionGeneration: expect.any(String),
+          lifecycleResumeAttempt: 0,
+          lifecycleStepStates: {},
+        },
+      });
+
+      const workflowsStore = await mastra.getStorage()!.getStore('workflows');
+      await expect(
+        workflowsStore.loadWorkflowSnapshot({
+          workflowName: workflowIds.AGENTIC_LOOP,
+          runId: result.runId,
+        }),
+      ).resolves.toMatchObject({
+        status: 'running',
+        executionGeneration: dispatch.data.executionGeneration,
+        lifecycleResumeAttempt: 0,
+        lifecycleStepStates: {},
+      });
+    } finally {
+      result.cleanup();
+      sendSpy.mockRestore();
+      await mastra.shutdown();
+    }
+  });
+
+  it('fails closed instead of directly dispatching when the agent is not registered with workflow storage', async () => {
+    const durableAgent = createInngestAgent({ agent: makeAgent('parity-unregistered-dispatch'), inngest });
+    (durableAgent.pubsub as any).inner = new EventEmitterPubSub();
+    const sendSpy = stubInngestSend();
+    let resolveError!: () => void;
+    const errorSeen = new Promise<void>(resolve => {
+      resolveError = resolve;
+    });
+
+    const result = await durableAgent.stream([{ role: 'user', content: 'hi' }], {
+      onError: () => resolveError(),
+    });
+    try {
+      await errorSeen;
+      expect(sendSpy).not.toHaveBeenCalled();
     } finally {
       result.cleanup();
       sendSpy.mockRestore();
     }
   });
 
+  it.each(['factory-option', 'manual-setter'] as const)(
+    'rejects an unserved Mastra instance supplied through %s',
+    async registrationPath => {
+      const mastra = new Mastra({
+        logger: false,
+        storage: new DefaultStorage({ id: `parity-unserved-${registrationPath}-storage`, url: ':memory:' }),
+      });
+      const durableAgent = createInngestAgent({
+        agent: makeAgent(`parity-unserved-${registrationPath}`),
+        inngest,
+        ...(registrationPath === 'factory-option' ? { mastra } : {}),
+      });
+      if (registrationPath === 'manual-setter') {
+        durableAgent.__setMastra(mastra);
+      }
+      (durableAgent.pubsub as any).inner = new EventEmitterPubSub();
+      const sendSpy = stubInngestSend();
+      let resolveError!: () => void;
+      const errorSeen = new Promise<void>(resolve => {
+        resolveError = resolve;
+      });
+
+      const result = await durableAgent.stream([{ role: 'user', content: 'hi' }], {
+        onError: () => resolveError(),
+      });
+      try {
+        await errorSeen;
+        expect(mastra.listWorkflows()).toEqual({});
+        expect(sendSpy).not.toHaveBeenCalled();
+      } finally {
+        result.cleanup();
+        sendSpy.mockRestore();
+        await mastra.shutdown();
+      }
+    },
+  );
+
+  it('does not dispatch a second sequential start for the same admitted run', async () => {
+    const { durableAgent, mastra } = makeIsolatedAgent('parity-single-start-admission');
+    const sendSpy = stubInngestSend();
+    const runId = 'single-start-admission-run';
+    const first = await durableAgent.stream([{ role: 'user', content: 'first' }], { runId });
+
+    try {
+      const firstExecution = globalRunRegistry.get(runId)?.workflowExecution;
+      await expect(firstExecution).resolves.toBeUndefined();
+      expect(sendSpy).toHaveBeenCalledTimes(1);
+      first.cleanup();
+
+      let resolveError!: () => void;
+      const errorSeen = new Promise<void>(resolve => {
+        resolveError = resolve;
+      });
+      const second = await durableAgent.stream([{ role: 'user', content: 'second' }], {
+        runId,
+        onError: () => resolveError(),
+      });
+      try {
+        await errorSeen;
+        expect(sendSpy).toHaveBeenCalledTimes(1);
+      } finally {
+        second.cleanup();
+      }
+    } finally {
+      first.cleanup();
+      sendSpy.mockRestore();
+      await mastra.shutdown();
+    }
+  });
+
   it('forwards requestContext entries into the workflow trigger event', async () => {
-    const durableAgent = makeIsolatedAgent('parity-request-context-trigger');
+    const { durableAgent, mastra } = makeIsolatedAgent('parity-request-context-trigger');
     const sendSpy = stubInngestSend();
     const requestContext = new RequestContext();
     requestContext.set('userId', 'user-1');
@@ -638,28 +976,41 @@ describe('InngestAgent parity surface', () => {
     } finally {
       result.cleanup();
       sendSpy.mockRestore();
+      await mastra.shutdown();
     }
   });
 
   it('forwards persisted requestContext entries into the workflow resume event', async () => {
-    const durableAgent = makeIsolatedAgent('parity-request-context-resume');
+    const { durableAgent, mastra } = makeIsolatedAgent('parity-request-context-resume');
+    const workflowIds = workflowIdsFor('parity-request-context-resume');
     const sendSpy = stubInngestSend();
     const runId = 'request-context-resume-run';
-    const loadWorkflowSnapshot = vi.fn().mockResolvedValue({
-      value: { retainedState: true },
-      context: {},
-      suspendedPaths: { 'agentic-loop': ['agentic-loop'] },
-      requestContext: {
-        userId: 'user-1',
-        organizationId: 'org-1',
+    const workflowsStore = await mastra.getStorage()!.getStore('workflows');
+    const [workflow] = durableAgent.getDurableWorkflows() as any[];
+    await workflowsStore.persistWorkflowSnapshot({
+      workflowName: workflowIds.AGENTIC_LOOP,
+      runId,
+      snapshot: {
+        runId,
+        executionGeneration: 'request-context-resume-generation',
+        lifecycleResumeAttempt: 0,
+        lifecycleStepStates: {},
+        status: 'suspended',
+        value: { retainedState: true },
+        context: {},
+        suspendedPaths: { 'agentic-loop': [0] },
+        activePaths: [],
+        activeStepsPath: {},
+        waitingPaths: {},
+        resumeLabels: {},
+        serializedStepGraph: workflow.serializedStepGraph,
+        requestContext: {
+          userId: 'user-1',
+          organizationId: 'org-1',
+        },
+        timestamp: Date.now(),
       },
     });
-    const mastra = {
-      getStorage: () => ({
-        getStore: async () => ({ loadWorkflowSnapshot }),
-      }),
-    };
-    (durableAgent as any).__setMastra(mastra);
 
     const result = await durableAgent.resume(runId, { answer: 'approved' });
     try {
@@ -671,23 +1022,37 @@ describe('InngestAgent parity surface', () => {
       }
       await expect(entry?.workflowExecution).resolves.toBeUndefined();
 
-      expect(loadWorkflowSnapshot).toHaveBeenCalledWith({
-        workflowName: InngestDurableStepIds.AGENTIC_LOOP,
-        runId,
-      });
-      expect(sendSpy).toHaveBeenCalledWith(
-        expect.objectContaining({
-          data: expect.objectContaining({
-            requestContext: {
-              userId: 'user-1',
-              organizationId: 'org-1',
-            },
+      expect(sendSpy).toHaveBeenCalledTimes(1);
+      expect(sendSpy.mock.calls[0]?.[0]).toMatchObject({
+        id: expect.stringMatching(/^miwd:v1:/),
+        name: `workflow.${workflowIds.AGENTIC_LOOP}`,
+        data: {
+          runId,
+          executionGeneration: 'request-context-resume-generation',
+          lifecycleResumeAttempt: 1,
+          lifecycleStepStates: {},
+          requestContext: {
+            userId: 'user-1',
+            organizationId: 'org-1',
+          },
+          resume: expect.objectContaining({
+            steps: ['agentic-loop'],
+            resumePayload: { answer: 'approved' },
           }),
-        }),
-      );
+        },
+      });
+      await expect(
+        workflowsStore.loadWorkflowSnapshot({ workflowName: workflowIds.AGENTIC_LOOP, runId }),
+      ).resolves.toMatchObject({
+        status: 'running',
+        executionGeneration: 'request-context-resume-generation',
+        lifecycleResumeAttempt: 1,
+        lifecycleStepStates: {},
+      });
     } finally {
       result.cleanup();
       sendSpy.mockRestore();
+      await mastra.shutdown();
     }
   });
 

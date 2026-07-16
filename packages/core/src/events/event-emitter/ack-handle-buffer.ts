@@ -114,10 +114,9 @@ export class AckHandleBuffer {
           if (this.disposed) break;
           const entry = byEvent.get(ev);
           try {
-            // The declared EventCallback return type is `void`, but real
-            // implementations frequently return a Promise. Await both kinds
-            // so per-event isolation actually waits for the cb to settle.
-            await (this.cb(ev, entry?.ack, entry?.nack) as void | Promise<void>);
+            // Await each callback so per-event isolation includes asynchronous
+            // processing before the buffer advances to the next delivery.
+            await this.cb(ev, entry?.ack, entry?.nack);
           } catch (err) {
             this.onError?.(err, { phase: 'cb' });
           }

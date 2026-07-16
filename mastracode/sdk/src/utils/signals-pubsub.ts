@@ -3,7 +3,7 @@ import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { PubSub, UnixSocketPubSub } from '@mastra/core/events';
-import type { PubSubDeliveryMode, Event, EventCallback, SubscribeOptions } from '@mastra/core/events';
+import type { EventCallback, PublishEvent, PubSubDeliveryMode, SubscribeOptions } from '@mastra/core/events';
 
 const THREAD_STREAM_PREFIX = 'agent.thread-stream.';
 
@@ -44,11 +44,7 @@ class SignalsPubSub extends PubSub {
     return ['push'];
   }
 
-  async publish(
-    topic: string,
-    event: Omit<Event, 'id' | 'createdAt'>,
-    options?: { localOnly?: boolean },
-  ): Promise<void> {
+  async publish(topic: string, event: PublishEvent, options?: { localOnly?: boolean }): Promise<void> {
     const socket = await this.#getOrCreate(topic);
     await socket.publish(topic, event, options);
   }

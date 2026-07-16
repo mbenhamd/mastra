@@ -2641,7 +2641,14 @@ export type StorageWorkspaceRef =
 // ============================================
 
 export interface UpdateWorkflowStateOptions {
-  status: WorkflowRunStatus;
+  /** New run status when the patch represents a status transition. */
+  status?: WorkflowRunStatus;
+  /** Opaque workflow execution lineage, distinct from internal registry generation. */
+  executionGeneration?: string;
+  /** Zero-based durable resume cycle within the execution lineage. */
+  lifecycleResumeAttempt?: number;
+  /** Stable lifecycle call identity and attempt state by execution coordinate. */
+  lifecycleStepStates?: Record<string, { stepCallId: string; stepAttempt: number }>;
   result?: WorkflowRunState['result'];
   error?: SerializedError;
   suspendedPaths?: Record<string, number[]>;

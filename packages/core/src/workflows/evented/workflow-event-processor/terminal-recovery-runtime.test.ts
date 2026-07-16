@@ -8,31 +8,45 @@ import { WORKFLOW_TERMINAL_FOREACH_RUN_KEY } from '../../terminal-continuation';
 import {
   WorkflowEventProcessor,
   createNestedWorkflowRunId,
+  createNestedWorkflowExecutionGeneration,
   resolveNestedWorkflowDispatchRunId,
   resolveNestedWorkflowLoopIteration,
   resolveNestedWorkflowOwnedRunId,
 } from '.';
 import type { ProcessorArgs } from '.';
 
+function withLifecycleExecution(args: ProcessorArgs): ProcessorArgs {
+  return {
+    executionGeneration: `test-generation:${args.workflowId}:${args.runId}`,
+    lifecycleResumeAttempt: 0,
+    lifecycleStepStates: {},
+    ...args,
+  };
+}
+
 class ExposedWorkflowEventProcessor extends WorkflowEventProcessor {
   finish(args: ProcessorArgs) {
-    return this.endWorkflow(args);
+    return this.endWorkflow(withLifecycleExecution(args));
   }
 
   fail(args: ProcessorArgs) {
-    return this.processWorkflowFail(args);
+    return this.processWorkflowFail(withLifecycleExecution(args));
   }
 
   cancel(args: ProcessorArgs) {
-    return this.processWorkflowCancel(args);
+    return this.processWorkflowCancel(withLifecycleExecution(args));
   }
 
   start(args: ProcessorArgs & { initialState?: Record<string, any> }) {
-    return this.processWorkflowStart(args);
+    return this.processWorkflowStart(
+      withLifecycleExecution(args) as ProcessorArgs & {
+        initialState?: Record<string, any>;
+      },
+    );
   }
 
   runStep(args: ProcessorArgs) {
-    return this.processWorkflowStepRun(args);
+    return this.processWorkflowStepRun(withLifecycleExecution(args));
   }
 }
 
@@ -50,6 +64,12 @@ async function setup() {
 
 function workflow(id: string, serializedStepGraph: ProcessorArgs['workflow']['serializedStepGraph'] = []) {
   return { id, serializedStepGraph, options: {} } as ProcessorArgs['workflow'];
+}
+
+function workflowControlCalls(publish: ReturnType<typeof vi.spyOn>) {
+  return publish.mock.calls
+    .filter(([channel]) => !String(channel).startsWith('workflow.lifecycle.v1.'))
+    .map(([channel, event]) => [channel, event.type]);
 }
 
 function terminalArgs(
@@ -191,6 +211,23 @@ describe('WorkflowEventProcessor terminal recovery evidence', () => {
     );
   });
 
+  it('derives child execution lineage from the parent lineage and stable child coordinate', () => {
+    const base = {
+      parentWorkflowId: 'parent',
+      parentRunId: 'parent-run',
+      parentExecutionGeneration: 'parent-generation-a',
+      nestedWorkflowId: 'child',
+      nestedRunId: 'child-run',
+      stepId: 'child',
+      executionPath: [0],
+    };
+    expect(createNestedWorkflowExecutionGeneration(base)).toBe(createNestedWorkflowExecutionGeneration(base));
+    expect(createNestedWorkflowExecutionGeneration(base)).toMatch(/^wfeg:v1:[a-f0-9]{64}$/);
+    expect(createNestedWorkflowExecutionGeneration(base)).not.toBe(
+      createNestedWorkflowExecutionGeneration({ ...base, parentExecutionGeneration: 'parent-generation-b' }),
+    );
+  });
+
   it('rejects unbounded or non-canonical nested execution coordinates', () => {
     const base = {
       parentWorkflowId: 'parent',
@@ -233,6 +270,9 @@ describe('WorkflowEventProcessor terminal recovery evidence', () => {
       resumeSteps: [],
       prevResult: { status: 'success', output: {} },
       requestContext: {},
+      executionGeneration: 'parent-generation-a',
+      lifecycleResumeAttempt: 0,
+      lifecycleStepStates: {},
     };
     const publish = vi.spyOn(mastra.pubsub, 'publish');
 
@@ -241,10 +281,22 @@ describe('WorkflowEventProcessor terminal recovery evidence', () => {
 
     const starts = publish.mock.calls
       .map(([, event]) => event)
-      .filter(event => event.type === 'workflow.start') as Array<{ data: { runId: string } }>;
+      .filter(event => event.type === 'workflow.start') as Array<{
+      data: { runId: string; executionGeneration: string };
+    }>;
     expect(starts).toHaveLength(2);
     expect(starts[0]!.data.runId).toMatch(/^wfn:v1:[a-f0-9]{64}$/);
     expect(starts[1]!.data.runId).toBe(starts[0]!.data.runId);
+    expect(starts[0]!.data.executionGeneration).toMatch(/^wfeg:v1:[a-f0-9]{64}$/);
+    expect(starts[1]!.data.executionGeneration).toBe(starts[0]!.data.executionGeneration);
+
+    await processor.runStep(structuredClone({ ...args, executionGeneration: 'parent-generation-b' }));
+    const nextParentStart = publish.mock.calls
+      .map(([, event]) => event)
+      .filter(event => event.type === 'workflow.start')
+      .at(-1)!;
+    expect(nextParentStart.data.runId).toBe(starts[0]!.data.runId);
+    expect(nextParentStart.data.executionGeneration).not.toBe(starts[0]!.data.executionGeneration);
     await mastra.shutdown();
   });
 
@@ -916,7 +968,7 @@ describe('WorkflowEventProcessor terminal recovery evidence', () => {
       await expect(workflows.loadWorkflowSnapshot({ workflowName: 'child', runId: childRunId })).resolves.toEqual(
         retained,
       );
-      expect(publish.mock.calls.map(([channel, event]) => [channel, event.type])).toEqual([
+      expect(workflowControlCalls(publish)).toEqual([
         [`workflow.events.v2.${childRunId}`, 'watch'],
         ['workflows', 'workflow.step.run'],
       ]);
@@ -1115,7 +1167,7 @@ describe('WorkflowEventProcessor terminal recovery evidence', () => {
     };
 
     await processor.start(startArgs);
-    expect(publish.mock.calls.map(([channel, event]) => [channel, event.type])).toEqual([
+    expect(workflowControlCalls(publish)).toEqual([
       ['workflow.events.v2.top-level-run', 'watch'],
       ['workflows', 'workflow.step.run'],
     ]);
@@ -1151,7 +1203,7 @@ describe('WorkflowEventProcessor terminal recovery evidence', () => {
         input: { status: 'success', output: {} },
       },
     });
-    expect(publish.mock.calls.map(([channel, event]) => [channel, event.type])).toEqual([
+    expect(workflowControlCalls(publish)).toEqual([
       ['workflow.events.v2.accepted-child-run', 'watch'],
       ['workflows', 'workflow.step.run'],
     ]);
@@ -1212,7 +1264,7 @@ describe('WorkflowEventProcessor terminal recovery evidence', () => {
     ).resolves.toEqual({ status: 'missing_ancestry' });
     const retainedParent = await workflows.loadWorkflowSnapshot({ workflowName: 'parent', runId: parentRunId });
     expect(retainedParent?.context.child).toBeUndefined();
-    expect(publish.mock.calls.map(([channel, event]) => [channel, event.type])).toEqual([
+    expect(workflowControlCalls(publish)).toEqual([
       ['workflow.events.v2.transient-child-run', 'watch'],
       ['workflows', 'workflow.step.run'],
     ]);

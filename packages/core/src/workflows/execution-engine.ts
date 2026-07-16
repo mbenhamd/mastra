@@ -156,6 +156,10 @@ export abstract class ExecutionEngine extends MastraBase {
   abstract execute<TState, TInput, TOutput>(params: {
     workflowId: string;
     runId: string;
+    /** Opaque workflow execution lineage, distinct from registry ownership generation. */
+    executionGeneration: string;
+    lifecycleResumeAttempt: number;
+    lifecycleStepStates: Record<string, { stepCallId: string; stepAttempt: number }>;
     resourceId?: string;
     disableScorers?: boolean;
     graph: ExecutionGraph;
