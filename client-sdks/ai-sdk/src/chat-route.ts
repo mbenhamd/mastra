@@ -24,84 +24,210 @@ import type {
   V6UIMessageStream,
 } from './public-types';
 
-/**
- * Scans a v6 UIMessage array for the most recent 'approval-responded' tool
- * part in the last trailing assistant message only. When found, splits the
- * composite approvalId ("${runId}::${toolCallId}") to recover the runId and
- * toolCallId needed for a targeted resumeStream.
- *
- * Only the last trailing assistant message is inspected so that approval
- * responses from earlier turns are never re-processed. Within that message,
- * parts are scanned in reverse so the decision the user just acted on wins
- * over any earlier 'approval-responded' parts that have not yet transitioned
- * to 'output-available'.
- *
- * Returns null when no approval response is present (normal chat turn).
- */
-export function extractV6NativeApproval(
-  messages: V6UIMessage[],
-): { resumeData: Record<string, unknown>; runId: string; toolCallId: string } | null {
-  // Only inspect the actual trailing message. If a user has already sent a
-  // follow-up turn after an approval response, we must treat that as a normal
-  // chat submission rather than replaying the stale approval response.
-  const lastAssistantMsg = messages.at(-1);
-  if (!lastAssistantMsg || lastAssistantMsg.role !== 'assistant') return null;
+export interface V6NativeApprovalResponse {
+  resumeData: Record<string, unknown>;
+  runId: string;
+  toolCallId: string;
+}
 
-  const parts = lastAssistantMsg.parts ?? [];
-  // Preserve every runtime part that claims to be an approval response until
-  // after validation. Filtering through `isToolUIPart` first would silently
-  // discard a malformed newest response and could replay an older valid one.
-  const respondedParts = parts.filter(
-    part =>
-      typeof part === 'object' &&
-      part !== null &&
-      'state' in part &&
-      (part as { state?: unknown }).state === 'approval-responded',
+type V6NativeApprovalInspection =
+  | { status: 'none' | 'historical-only' | 'invalid'; approvals: [] }
+  | { status: 'valid'; approvals: V6NativeApprovalResponse[] };
+
+function claimsV6NativeApprovalResponse(part: unknown): boolean {
+  return (
+    typeof part === 'object' &&
+    part !== null &&
+    'state' in part &&
+    (part as { state?: unknown }).state === 'approval-responded'
   );
-  const part = respondedParts.at(-1);
-  if (!part || !isToolUIPart(part) || part.state !== 'approval-responded') return null;
-  if (
-    !part.approval ||
-    typeof part.approval.id !== 'string' ||
-    typeof part.approval.approved !== 'boolean' ||
-    (part.approval.reason != null && typeof part.approval.reason !== 'string')
-  ) {
-    return null;
+}
+
+/**
+ * Collects every valid approval response from the trailing assistant message.
+ * A single AI SDK v6 response stream can only mutate that active UI message;
+ * historical assistant messages cannot be patched through this contract.
+ */
+function inspectV6NativeApprovals(messages: V6UIMessage[]): V6NativeApprovalInspection {
+  const separator = APPROVAL_ID_SEPARATOR;
+  const trailingMessage = messages.at(-1);
+
+  // A trailing user message is always a normal chat turn. Historical approval
+  // parts may remain in full-history transports, but they must not consume the
+  // user's new request.
+  if (!trailingMessage || trailingMessage.role !== 'assistant') {
+    return { status: 'none', approvals: [] };
   }
 
-  // Never fall back to an older decision when the latest response is malformed,
-  // and reject duplicate identities rather than applying last-writer-wins.
-  const earlierParts = respondedParts.slice(0, -1);
-  if (
-    earlierParts.some(
-      earlier =>
-        !isToolUIPart(earlier) ||
-        earlier.state !== 'approval-responded' ||
-        !earlier.approval ||
-        typeof earlier.approval.id !== 'string' ||
-        typeof earlier.approval.approved !== 'boolean' ||
-        (earlier.approval.reason != null && typeof earlier.approval.reason !== 'string') ||
-        earlier.toolCallId === part.toolCallId ||
-        earlier.approval.id === part.approval.id,
-    )
-  ) {
-    return null;
+  const respondedParts = (trailingMessage.parts ?? []).filter(claimsV6NativeApprovalResponse);
+  if (respondedParts.length === 0) {
+    const hasPendingApproval = (trailingMessage.parts ?? []).some(
+      part => isToolUIPart(part) && part.state === 'approval-requested',
+    );
+    const hasHistoricalResponse = messages
+      .slice(0, -1)
+      .some(message => message.role === 'assistant' && (message.parts ?? []).some(claimsV6NativeApprovalResponse));
+    return {
+      status: hasPendingApproval && hasHistoricalResponse ? 'historical-only' : 'none',
+      approvals: [],
+    };
   }
 
-  const suffix = `${APPROVAL_ID_SEPARATOR}${part.toolCallId}`;
-  if (!part.approval.id.endsWith(suffix)) return null;
-  const runId = part.approval.id.slice(0, -suffix.length);
-  const toolCallId = part.toolCallId;
-  if (!runId || !toolCallId) return null;
+  const approvals: V6NativeApprovalResponse[] = [];
+  const approvalIds = new Set<string>();
+  const toolCallIds = new Set<string>();
 
-  return {
-    resumeData: {
-      approved: part.approval.approved,
-      ...(part.approval.reason != null ? { reason: part.approval.reason } : {}),
+  for (const part of respondedParts) {
+    // Fail closed if any runtime part claims to be an approval response but
+    // does not satisfy the v6 tool-part contract. Otherwise malformed input
+    // could fall through to a normal agent stream.
+    if (
+      !isToolUIPart(part) ||
+      part.state !== 'approval-responded' ||
+      !part.approval ||
+      typeof part.approval.id !== 'string' ||
+      typeof part.approval.approved !== 'boolean' ||
+      (part.approval.reason != null && typeof part.approval.reason !== 'string') ||
+      typeof part.toolCallId !== 'string' ||
+      part.toolCallId.length === 0
+    ) {
+      return { status: 'invalid', approvals: [] };
+    }
+
+    // Match the visible tool-call ID as an exact suffix instead of splitting
+    // on the final separator. Provider-issued run and tool-call IDs may both
+    // contain the separator.
+    const toolCallId = part.toolCallId;
+    const suffix = `${separator}${toolCallId}`;
+    if (!part.approval.id.endsWith(suffix)) return { status: 'invalid', approvals: [] };
+    const runId = part.approval.id.slice(0, -suffix.length);
+    if (!runId) return { status: 'invalid', approvals: [] };
+
+    // Multiple decisions for one visible card or composite approval identity
+    // in the active message are ambiguous and must not execute.
+    if (approvalIds.has(part.approval.id) || toolCallIds.has(toolCallId)) {
+      return { status: 'invalid', approvals: [] };
+    }
+    approvalIds.add(part.approval.id);
+    toolCallIds.add(toolCallId);
+
+    approvals.push({
+      resumeData: {
+        approved: part.approval.approved,
+        ...(part.approval.reason != null ? { reason: part.approval.reason } : {}),
+      },
+      runId,
+      toolCallId,
+    });
+  }
+
+  return { status: 'valid', approvals };
+}
+
+export function extractV6NativeApprovals(messages: V6UIMessage[]): V6NativeApprovalResponse[] {
+  return inspectV6NativeApprovals(messages).approvals;
+}
+
+/** Streams exact approval targets sequentially as one v6 UI-message response. */
+function streamV6ApprovalResumes(args: {
+  agent: { resumeStream: (resumeData: unknown, options: unknown) => Promise<unknown> };
+  approvals: V6NativeApprovalResponse[];
+  baseOptions: Record<string, unknown>;
+  structuredOutput?: unknown;
+  messages: V6UIMessage[];
+  lastMessageId?: string;
+  sendStart: boolean;
+  sendFinish: boolean;
+  sendReasoning: boolean;
+  sendSources: boolean;
+  onError?: (error: unknown) => string;
+  messageMetadata?: UIMessageStreamOptionsV6<V6UIMessage>['messageMetadata'];
+}): ReadableStream<any> {
+  const { agent, approvals, baseOptions, structuredOutput, messages, lastMessageId } = args;
+  const { sendStart, sendFinish, sendReasoning, sendSources, onError, messageMetadata } = args;
+
+  return createUIMessageStreamV6<any>({
+    originalMessages: messages,
+    onError,
+    execute: async ({ writer }) => {
+      let startWritten = false;
+      let successfulLegs = 0;
+      let firstResolvedTargetError: unknown;
+      let finalFinish: any;
+
+      for (const approval of approvals) {
+        try {
+          const result = await agent.resumeStream(approval.resumeData, {
+            ...baseOptions,
+            runId: approval.runId,
+            toolCallId: approval.toolCallId,
+            ...(structuredOutput ? { structuredOutput } : {}),
+          });
+          let legFinish: any;
+
+          for await (const part of toAISdkStream(result as Parameters<typeof toAISdkStream>[0], {
+            from: 'agent',
+            version: 'v6',
+            lastMessageId,
+            sendStart,
+            sendFinish,
+            sendReasoning,
+            sendSources,
+            onError,
+            messageMetadata,
+          })) {
+            if (part.type === 'start') {
+              if (startWritten) continue;
+              startWritten = true;
+              writer.write(part);
+              continue;
+            }
+            // Resume streams can emit tool continuation chunks before their
+            // start chunk. Frame the combined response before forwarding any
+            // such content, then suppress the late duplicate start.
+            if (!startWritten && sendStart) {
+              writer.write({ type: 'start', ...(lastMessageId ? { messageId: lastMessageId } : {}) } as any);
+              startWritten = true;
+            }
+            // Hold each leg's finish until all candidates have been attempted,
+            // then emit only the final successful leg's metadata.
+            if (part.type === 'finish') {
+              legFinish = part;
+              continue;
+            }
+            writer.write(part);
+            // Error and abort chunks are terminal in the AI SDK UI protocol.
+            // Do not execute later approval side effects after the client has
+            // already stopped applying this response.
+            if (part.type === 'error' || part.type === 'abort') return;
+          }
+          // The last successful leg owns final framing even when it emitted no
+          // finish chunk. Do not leak metadata from an earlier successful leg.
+          finalFinish = legFinish;
+          successfulLegs++;
+        } catch (error) {
+          const id = (error as { id?: string } | undefined)?.id;
+          if (id !== 'AGENT_RESUME_TOOL_CALL_NOT_SUSPENDED' && id !== 'AGENT_RESUME_NO_SNAPSHOT_FOUND') {
+            throw error;
+          }
+          firstResolvedTargetError ??= error;
+        }
+      }
+
+      // Re-sent history may contain already-resolved responses alongside a new
+      // one. Skip only core's exact "not suspended" errors; if none of the
+      // targets resumed, surface the typed error instead of silently dropping
+      // a potentially valid approval.
+      if (successfulLegs === 0 && firstResolvedTargetError) throw firstResolvedTargetError;
+
+      if (!startWritten && sendStart) {
+        writer.write({ type: 'start', ...(lastMessageId ? { messageId: lastMessageId } : {}) } as any);
+      }
+      if (sendFinish) {
+        writer.write(finalFinish ?? ({ type: 'finish' } as any));
+      }
     },
-    runId,
-    toolCallId,
-  };
+  }) as ReadableStream<any>;
 }
 
 export type ChatStreamHandlerParams<
@@ -453,14 +579,6 @@ export async function handleChatStream<OUTPUT = undefined>({
     throw new Error('Messages must be an array of UIMessage objects');
   }
 
-  // For v6: if the user called approve() on the client, AI SDK v6 re-submits the
-  // conversation with the tool part transitioned to 'approval-responded'. Detect
-  // this and route to resumeStream instead of stream.
-  const nativeApproval = version === 'v6' && !resumeData ? extractV6NativeApproval(messages as V6UIMessage[]) : null;
-
-  const effectiveResumeData = nativeApproval?.resumeData ?? resumeData;
-  const effectiveRunId = nativeApproval?.runId ?? runId;
-
   // Capture the last assistant message ID for the stream response.
   // This helps the frontend identify which message the response corresponds to.
   let lastMessageId: string | undefined;
@@ -490,16 +608,47 @@ export async function handleChatStream<OUTPUT = undefined>({
   const baseOptions = {
     ...defaultOptionsRest,
     ...restOptions,
-    ...(effectiveRunId && { runId: effectiveRunId }),
-    ...(nativeApproval?.toolCallId && { toolCallId: nativeApproval.toolCallId }),
+    ...(runId && { runId }),
     requestContext: requestContext || defaultOptions?.requestContext,
     ...(Object.keys(mergedProviderOptions).length > 0 && { providerOptions: mergedProviderOptions }),
   };
 
-  const result = effectiveResumeData
+  // AI SDK v6 mutates approval responses on assistant tool parts. Its client
+  // stream state can continue only the trailing assistant message, so resume
+  // every valid approval on that message and fail closed when the only claimed
+  // response lives in earlier history. A trailing user remains a normal turn.
+  if (version === 'v6' && !resumeData && trigger !== 'regenerate-message') {
+    const inspection = inspectV6NativeApprovals(messages as V6UIMessage[]);
+    if (inspection.status === 'invalid') {
+      throw new Error('AI SDK v6 approval responses on the trailing assistant message are malformed or ambiguous');
+    }
+    if (inspection.status === 'historical-only') {
+      throw new Error(
+        'AI SDK v6 cannot safely resume an approval response from an earlier assistant message through one UI message stream',
+      );
+    }
+    if (inspection.status === 'valid') {
+      return streamV6ApprovalResumes({
+        agent: agentObj as unknown as Parameters<typeof streamV6ApprovalResumes>[0]['agent'],
+        approvals: inspection.approvals,
+        baseOptions,
+        structuredOutput,
+        messages: messages as V6UIMessage[],
+        lastMessageId,
+        sendStart,
+        sendFinish,
+        sendReasoning,
+        sendSources,
+        onError,
+        messageMetadata: messageMetadata as UIMessageStreamOptionsV6<V6UIMessage>['messageMetadata'],
+      });
+    }
+  }
+
+  const result = resumeData
     ? structuredOutput
-      ? await agentObj.resumeStream(effectiveResumeData, { ...baseOptions, structuredOutput })
-      : await agentObj.resumeStream(effectiveResumeData, baseOptions as AgentExecutionOptionsBase<unknown>)
+      ? await agentObj.resumeStream(resumeData, { ...baseOptions, structuredOutput })
+      : await agentObj.resumeStream(resumeData, baseOptions as AgentExecutionOptionsBase<unknown>)
     : structuredOutput
       ? await agentObj.stream(messagesToSend, { ...baseOptions, structuredOutput })
       : await agentObj.stream(messagesToSend, baseOptions as AgentExecutionOptionsBase<unknown>);

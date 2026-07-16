@@ -547,7 +547,7 @@ export class Agent<
   #pubsub?: PubSub;
   #inheritedPubSub?: PubSub;
   #memory?: DynamicArgument<MastraMemory, TRequestContext>;
-  #skills?: AgentSkillsInput;
+  #skills?: AgentSkillsInput<TRequestContext>;
   #skillsFormat?: SkillFormat;
   #workflows?: DynamicArgument<Record<string, AnyWorkflow>, TRequestContext>;
   #defaultGenerateOptionsLegacy: DynamicArgument<AgentGenerateOptions, TRequestContext>;
@@ -1316,7 +1316,7 @@ export class Agent<
     if (this.#skills) {
       let resolvedInputs: SkillInput[];
       if (typeof this.#skills === 'function') {
-        resolvedInputs = await this.#skills({ requestContext: rc });
+        resolvedInputs = await this.#skills({ requestContext: rc as RequestContext<TRequestContext> });
       } else {
         resolvedInputs = this.#skills;
       }
@@ -4966,6 +4966,24 @@ export class Agent<
             let effectivePrompt = inputData.prompt;
             let effectiveInstructions = inputData.instructions;
             let effectiveMaxSteps = inputData.maxSteps;
+            // Cap the LLM-provided maxSteps at the sub-agent's own configured
+            // default so the supervisor's model can reduce, but never expand,
+            // the developer-defined step budget. `onDelegationStart`'s
+            // `modifiedMaxSteps` (developer code) below bypasses this cap.
+            const subAgentMaxStepsCap = resolvedDefaultOptions?.maxSteps;
+            if (
+              typeof effectiveMaxSteps === 'number' &&
+              typeof subAgentMaxStepsCap === 'number' &&
+              effectiveMaxSteps > subAgentMaxStepsCap
+            ) {
+              this.logger.warn('Delegation maxSteps exceeds sub-agent default, capping', {
+                agent: this.name,
+                targetAgent: agentName,
+                requestedMaxSteps: effectiveMaxSteps,
+                cappedMaxSteps: subAgentMaxStepsCap,
+              });
+              effectiveMaxSteps = subAgentMaxStepsCap;
+            }
             if (delegation?.onDelegationStart) {
               try {
                 const startResult = await delegation.onDelegationStart(delegationStartContext);
