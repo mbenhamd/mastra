@@ -4873,7 +4873,7 @@ export type PostAgentsAgentIdGenerate_Body = {
               id: string;
               [x: string]: unknown;
             };
-        resource: string;
+        resource?: string | undefined;
         options?:
           | {
               [key: string]: any;
@@ -5048,7 +5048,7 @@ export type PostAgentsAgentIdGenerateVnext_Body = {
               id: string;
               [x: string]: unknown;
             };
-        resource: string;
+        resource?: string | undefined;
         options?:
           | {
               [key: string]: any;
@@ -5225,7 +5225,7 @@ export type PostAgentsAgentIdStream_Body = {
               id: string;
               [x: string]: unknown;
             };
-        resource: string;
+        resource?: string | undefined;
         options?:
           | {
               [key: string]: any;
@@ -5400,7 +5400,7 @@ export type PostAgentsAgentIdStreamUntilIdle_Body = {
               id: string;
               [x: string]: unknown;
             };
-        resource: string;
+        resource?: string | undefined;
         options?:
           | {
               [key: string]: any;
@@ -5580,7 +5580,7 @@ export type PostAgentsAgentIdStreamVnext_Body = {
               id: string;
               [x: string]: unknown;
             };
-        resource: string;
+        resource?: string | undefined;
         options?:
           | {
               [key: string]: any;
@@ -5915,7 +5915,7 @@ export type PostAgentsAgentIdSendMessage_Body =
                               id: string;
                               [x: string]: unknown;
                             };
-                        resource: string;
+                        resource?: string | undefined;
                         options?:
                           | {
                               [key: string]: any;
@@ -6301,7 +6301,7 @@ export type PostAgentsAgentIdQueueMessage_Body =
                               id: string;
                               [x: string]: unknown;
                             };
-                        resource: string;
+                        resource?: string | undefined;
                         options?:
                           | {
                               [key: string]: any;
@@ -6686,7 +6686,7 @@ export type PostAgentsAgentIdSignals_Body =
                               id: string;
                               [x: string]: unknown;
                             };
-                        resource: string;
+                        resource?: string | undefined;
                         options?:
                           | {
                               [key: string]: any;
@@ -7256,7 +7256,7 @@ export type PostAgentsAgentIdResumeStream_Body = {
               id: string;
               [x: string]: unknown;
             };
-        resource: string;
+        resource?: string | undefined;
         options?:
           | {
               [key: string]: any;
@@ -7652,7 +7652,7 @@ export type PostAgentsAgentIdResumeStreamUntilIdle_Body = {
               id: string;
               [x: string]: unknown;
             };
-        resource: string;
+        resource?: string | undefined;
         options?:
           | {
               [key: string]: any;
@@ -7832,7 +7832,7 @@ export type PostAgentsAgentIdNetwork_Body = {
               id: string;
               [x: string]: unknown;
             };
-        resource: string;
+        resource?: string | undefined;
         options?:
           | {
               [key: string]: any;
@@ -8483,7 +8483,7 @@ export type PostAgentsAgentIdStreamVNext_Body = {
               id: string;
               [x: string]: unknown;
             };
-        resource: string;
+        resource?: string | undefined;
         options?:
           | {
               [key: string]: any;
@@ -8663,7 +8663,7 @@ export type PostAgentsAgentIdStreamVnextUi_Body = {
               id: string;
               [x: string]: unknown;
             };
-        resource: string;
+        resource?: string | undefined;
         options?:
           | {
               [key: string]: any;
@@ -8845,7 +8845,7 @@ export type PostAgentsAgentIdStreamUi_Body = {
               id: string;
               [x: string]: unknown;
             };
-        resource: string;
+        resource?: string | undefined;
         options?:
           | {
               [key: string]: any;
@@ -21147,7 +21147,7 @@ export type PostAgentsAgentIdGenerateLegacy_Body = {
               id: string;
               [x: string]: unknown;
             };
-        resource: string;
+        resource?: string | undefined;
         options?:
           | {
               [key: string]: any;
@@ -21327,7 +21327,7 @@ export type PostAgentsAgentIdStreamLegacy_Body = {
               id: string;
               [x: string]: unknown;
             };
-        resource: string;
+        resource?: string | undefined;
         options?:
           | {
               [key: string]: any;
@@ -93883,6 +93883,11 @@ export type PostAgentControllerControllerIdSessionsResourceIdMessages_QueryParam
 
 export type PostAgentControllerControllerIdSessionsResourceIdMessages_Body = {
   message: string;
+  requestContext?:
+    | {
+        [key: string]: any;
+      }
+    | undefined;
   files?:
     | {
         data: string;
@@ -93935,6 +93940,11 @@ export type PostAgentControllerControllerIdSessionsResourceIdSteer_QueryParams =
 
 export type PostAgentControllerControllerIdSessionsResourceIdSteer_Body = {
   message: string;
+  requestContext?:
+    | {
+        [key: string]: any;
+      }
+    | undefined;
 };
 
 export type PostAgentControllerControllerIdSessionsResourceIdSteer_Response = {
@@ -93980,6 +93990,11 @@ export type PostAgentControllerControllerIdSessionsResourceIdFollowUp_QueryParam
 
 export type PostAgentControllerControllerIdSessionsResourceIdFollowUp_Body = {
   message: string;
+  requestContext?:
+    | {
+        [key: string]: any;
+      }
+    | undefined;
 };
 
 export type PostAgentControllerControllerIdSessionsResourceIdFollowUp_Response = {
@@ -94063,6 +94078,11 @@ export type PostAgentControllerControllerIdSessionsResourceIdToolApproval_QueryP
 export type PostAgentControllerControllerIdSessionsResourceIdToolApproval_Body = {
   toolCallId: string;
   approved: boolean;
+  requestContext?:
+    | {
+        [key: string]: any;
+      }
+    | undefined;
 };
 
 export type PostAgentControllerControllerIdSessionsResourceIdToolApproval_Response = {
@@ -94109,6 +94129,11 @@ export type PostAgentControllerControllerIdSessionsResourceIdToolSuspension_Quer
 export type PostAgentControllerControllerIdSessionsResourceIdToolSuspension_Body = {
   toolCallId: string;
   resumeData: any;
+  requestContext?:
+    | {
+        [key: string]: any;
+      }
+    | undefined;
 };
 
 export type PostAgentControllerControllerIdSessionsResourceIdToolSuspension_Response = {

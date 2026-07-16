@@ -2,8 +2,8 @@ import { ReadableStream } from 'node:stream/web';
 import { readUIMessageStream } from '@internal/ai-v6';
 import { ChunkFrom } from '@mastra/core/stream';
 import type { MastraModelOutput } from '@mastra/core/stream';
-import { describe, expect, it, vi } from 'vitest';
-import { handleChatStream, extractV6NativeApproval } from '../chat-route';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { handleChatStream, extractV6NativeApprovals } from '../chat-route';
 import { toAISdkStream, toAISdkV5Stream } from '../convert-streams';
 import { convertMastraChunkToAISDKv5, convertMastraChunkToAISDKv6, APPROVAL_ID_SEPARATOR } from '../helpers';
 
@@ -178,7 +178,7 @@ describe('tool-call-approval chunk conversion (issue #12878)', () => {
   });
 });
 
-describe('extractV6NativeApproval', () => {
+describe('extractV6NativeApprovals', () => {
   it('returns runId and approved:true from an approval-responded part', () => {
     const approvalId = `run-123${APPROVAL_ID_SEPARATOR}tooluse_abc123`;
     const messages = [
@@ -197,13 +197,15 @@ describe('extractV6NativeApproval', () => {
       },
     ];
 
-    const result = extractV6NativeApproval(messages as any);
+    const result = extractV6NativeApprovals(messages as any);
 
-    expect(result).toEqual({
-      resumeData: { approved: true },
-      runId: 'run-123',
-      toolCallId: 'tooluse_abc123',
-    });
+    expect(result).toEqual([
+      {
+        resumeData: { approved: true },
+        runId: 'run-123',
+        toolCallId: 'tooluse_abc123',
+      },
+    ]);
   });
 
   it('preserves separator-bearing run and tool-call IDs', () => {
@@ -224,11 +226,13 @@ describe('extractV6NativeApproval', () => {
       },
     ];
 
-    expect(extractV6NativeApproval(messages as any)).toEqual({
-      resumeData: { approved: true },
-      runId: 'run::opaque',
-      toolCallId,
-    });
+    expect(extractV6NativeApprovals(messages as any)).toEqual([
+      {
+        resumeData: { approved: true },
+        runId: 'run::opaque',
+        toolCallId,
+      },
+    ]);
   });
 
   it('rejects a composite approval ID that conflicts with the visible tool-call ID', () => {
@@ -248,7 +252,7 @@ describe('extractV6NativeApproval', () => {
       },
     ];
 
-    expect(extractV6NativeApproval(messages as any)).toBeNull();
+    expect(extractV6NativeApprovals(messages as any)).toEqual([]);
   });
 
   it('does not fall back to an older valid response when the latest response is malformed', () => {
@@ -275,7 +279,7 @@ describe('extractV6NativeApproval', () => {
       },
     ];
 
-    expect(extractV6NativeApproval(messages as any)).toBeNull();
+    expect(extractV6NativeApprovals(messages as any)).toEqual([]);
   });
 
   it('rejects a malformed latest approval response without throwing', () => {
@@ -294,8 +298,8 @@ describe('extractV6NativeApproval', () => {
       },
     ];
 
-    expect(() => extractV6NativeApproval(messages as any)).not.toThrow();
-    expect(extractV6NativeApproval(messages as any)).toBeNull();
+    expect(() => extractV6NativeApprovals(messages as any)).not.toThrow();
+    expect(extractV6NativeApprovals(messages as any)).toEqual([]);
   });
 
   it('rejects a latest approval response without a boolean decision', () => {
@@ -315,7 +319,7 @@ describe('extractV6NativeApproval', () => {
       },
     ];
 
-    expect(extractV6NativeApproval(messages as any)).toBeNull();
+    expect(extractV6NativeApprovals(messages as any)).toEqual([]);
   });
 
   it('rejects a malformed earlier approval response without throwing', () => {
@@ -341,8 +345,8 @@ describe('extractV6NativeApproval', () => {
       },
     ];
 
-    expect(() => extractV6NativeApproval(messages as any)).not.toThrow();
-    expect(extractV6NativeApproval(messages as any)).toBeNull();
+    expect(() => extractV6NativeApprovals(messages as any)).not.toThrow();
+    expect(extractV6NativeApprovals(messages as any)).toEqual([]);
   });
 
   it('rejects duplicate responded identities in the trailing assistant message', () => {
@@ -370,7 +374,7 @@ describe('extractV6NativeApproval', () => {
       },
     ];
 
-    expect(extractV6NativeApproval(messages as any)).toBeNull();
+    expect(extractV6NativeApprovals(messages as any)).toEqual([]);
   });
 
   it('targets the answered call when another tool call is still awaiting approval', () => {
@@ -400,11 +404,13 @@ describe('extractV6NativeApproval', () => {
       },
     ];
 
-    expect(extractV6NativeApproval(messages as any)).toEqual({
-      resumeData: { approved: true },
-      runId: 'run-shared',
-      toolCallId: 'tooluse_second',
-    });
+    expect(extractV6NativeApprovals(messages as any)).toEqual([
+      {
+        resumeData: { approved: true },
+        runId: 'run-shared',
+        toolCallId: 'tooluse_second',
+      },
+    ]);
   });
 
   it('includes reason when the user denied with a reason', () => {
@@ -425,13 +431,15 @@ describe('extractV6NativeApproval', () => {
       },
     ];
 
-    const result = extractV6NativeApproval(messages as any);
+    const result = extractV6NativeApprovals(messages as any);
 
-    expect(result).toEqual({
-      resumeData: { approved: false, reason: 'Not safe' },
-      runId: 'run-456',
-      toolCallId: 'tooluse_xyz',
-    });
+    expect(result).toEqual([
+      {
+        resumeData: { approved: false, reason: 'Not safe' },
+        runId: 'run-456',
+        toolCallId: 'tooluse_xyz',
+      },
+    ]);
   });
 
   it('omits reason when not provided', () => {
@@ -452,12 +460,12 @@ describe('extractV6NativeApproval', () => {
       },
     ];
 
-    const result = extractV6NativeApproval(messages as any);
+    const result = extractV6NativeApprovals(messages as any);
 
-    expect(result?.resumeData).not.toHaveProperty('reason');
+    expect(result[0]?.resumeData).not.toHaveProperty('reason');
   });
 
-  it('returns null when no approval-responded part exists', () => {
+  it('returns an empty list when no approval-responded part exists', () => {
     const messages = [
       { role: 'user' as const, id: 'msg-1', parts: [{ type: 'text', text: 'hello' }] },
       {
@@ -475,10 +483,31 @@ describe('extractV6NativeApproval', () => {
       },
     ];
 
-    expect(extractV6NativeApproval(messages as any)).toBeNull();
+    expect(extractV6NativeApprovals(messages as any)).toEqual([]);
   });
 
-  it('returns null when the approval id has no separator', () => {
+  it('skips a part whose composite approval id embeds a different toolCallId', () => {
+    const approvalId = `run-123${APPROVAL_ID_SEPARATOR}tooluse_other`;
+    const messages = [
+      {
+        role: 'assistant' as const,
+        id: 'msg-1',
+        parts: [
+          {
+            type: 'tool-myTool',
+            toolCallId: 'tooluse_abc123',
+            state: 'approval-responded' as const,
+            input: {},
+            approval: { id: approvalId, approved: true },
+          },
+        ],
+      },
+    ];
+
+    expect(extractV6NativeApprovals(messages as any)).toEqual([]);
+  });
+
+  it('returns an empty list when the approval id has no separator', () => {
     const messages = [
       {
         role: 'assistant' as const,
@@ -495,10 +524,10 @@ describe('extractV6NativeApproval', () => {
       },
     ];
 
-    expect(extractV6NativeApproval(messages as any)).toBeNull();
+    expect(extractV6NativeApprovals(messages as any)).toEqual([]);
   });
 
-  it('picks the most recent approval-responded part when one assistant message has several (issue #17899)', () => {
+  it('collects every approval response when one assistant message has several (issue #17899)', () => {
     const messages = [
       {
         role: 'assistant' as const,
@@ -522,11 +551,12 @@ describe('extractV6NativeApproval', () => {
       },
     ];
 
-    const result = extractV6NativeApproval(messages as any);
+    const result = extractV6NativeApprovals(messages as any);
 
-    expect(result?.runId).toBe('new-run');
-    expect(result?.resumeData.approved).toBe(false);
-    expect(result?.resumeData.reason).toBe('changed mind');
+    expect(result).toEqual([
+      { resumeData: { approved: true }, runId: 'old-run', toolCallId: 'old-call' },
+      { resumeData: { approved: false, reason: 'changed mind' }, runId: 'new-run', toolCallId: 'new-call' },
+    ]);
   });
 
   it('does not replay an older approval when the newest responded part is structurally malformed', () => {
@@ -551,10 +581,10 @@ describe('extractV6NativeApproval', () => {
       },
     ];
 
-    expect(extractV6NativeApproval(messages as any)).toBeNull();
+    expect(extractV6NativeApprovals(messages as any)).toEqual([]);
   });
 
-  it('scans from the end and picks the most recent approval-responded part', () => {
+  it('extracts only responses from the trailing assistant message', () => {
     const messages = [
       {
         role: 'assistant' as const,
@@ -584,13 +614,12 @@ describe('extractV6NativeApproval', () => {
       },
     ];
 
-    const result = extractV6NativeApproval(messages as any);
+    const result = extractV6NativeApprovals(messages as any);
 
-    expect(result?.runId).toBe('new-run');
-    expect(result?.resumeData.approved).toBe(false);
+    expect(result).toEqual([{ resumeData: { approved: false }, runId: 'new-run', toolCallId: 'new-call' }]);
   });
 
-  it('ignores earlier approval responses once a later user follow-up exists', () => {
+  it('does not consume historical responses when a user message is trailing', () => {
     const messages = [
       {
         role: 'assistant' as const,
@@ -612,45 +641,147 @@ describe('extractV6NativeApproval', () => {
       },
     ];
 
-    expect(extractV6NativeApproval(messages as any)).toBeNull();
+    expect(extractV6NativeApprovals(messages as any)).toEqual([]);
+  });
+
+  it('uses only the trailing response when history repeats a toolCallId for another run', () => {
+    const part = (runId: string, approved: boolean) => ({
+      type: 'tool-myTool',
+      toolCallId: 'shared-call',
+      state: 'approval-responded' as const,
+      input: {},
+      approval: { id: `${runId}${APPROVAL_ID_SEPARATOR}shared-call`, approved },
+    });
+    const messages = [
+      { role: 'assistant', id: 'msg-1', parts: [part('run-1', true)] },
+      { role: 'assistant', id: 'msg-2', parts: [part('run-2', false)] },
+    ];
+
+    expect(extractV6NativeApprovals(messages as any)).toEqual([
+      { resumeData: { approved: false }, runId: 'run-2', toolCallId: 'shared-call' },
+    ]);
+  });
+
+  it('uses the trailing response when an exact target is repeated across messages', () => {
+    const part = (approved: boolean) => ({
+      type: 'tool-myTool',
+      toolCallId: 'same-call',
+      state: 'approval-responded' as const,
+      input: {},
+      approval: { id: `same-run${APPROVAL_ID_SEPARATOR}same-call`, approved },
+    });
+    const messages = [
+      { role: 'assistant', id: 'msg-1', parts: [part(false)] },
+      { role: 'assistant', id: 'msg-2', parts: [part(true)] },
+    ];
+
+    expect(extractV6NativeApprovals(messages as any)).toEqual([
+      { resumeData: { approved: true }, runId: 'same-run', toolCallId: 'same-call' },
+    ]);
   });
 });
 
 describe('handleChatStream v6 native approve() resume flow', () => {
-  const emptyStream = {
+  const emptyResult = () => ({
     fullStream: new ReadableStream({
-      start(c) {
-        c.close();
+      start(controller) {
+        controller.close();
       },
     }),
-  };
+  });
+
+  const approvalPart = (runId: string, toolCallId: string, approved = true) => ({
+    type: 'tool-myTool',
+    toolCallId,
+    state: 'approval-responded',
+    input: {},
+    approval: { id: `${runId}${APPROVAL_ID_SEPARATOR}${toolCallId}`, approved },
+  });
+
+  const requestedPart = (runId: string, toolCallId: string) => ({
+    type: 'tool-myTool',
+    toolCallId,
+    state: 'approval-requested',
+    input: {},
+    approval: { id: `${runId}${APPROVAL_ID_SEPARATOR}${toolCallId}` },
+  });
+
+  const assistantMessage = (id: string, parts: any[]) => ({
+    id,
+    role: 'assistant',
+    parts,
+  });
+
+  const resumeResult = (runId: string, toolCallId: string, output: Record<string, unknown>, finishReason = 'stop') => ({
+    fullStream: new ReadableStream({
+      start(controller) {
+        controller.enqueue({ type: 'start', runId, from: ChunkFrom.AGENT, payload: {} });
+        controller.enqueue({
+          type: 'tool-result',
+          runId,
+          from: ChunkFrom.AGENT,
+          payload: {
+            toolCallId,
+            toolName: 'myTool',
+            args: {},
+            result: output,
+          },
+        });
+        controller.enqueue({
+          type: 'finish',
+          runId,
+          from: ChunkFrom.AGENT,
+          payload: {
+            stepResult: { reason: finishReason },
+            output: { usage: {} },
+          },
+        });
+        controller.close();
+      },
+    }),
+  });
+
+  const terminalResult = (runId: string, type: 'error' | 'abort') => ({
+    fullStream: new ReadableStream({
+      start(controller) {
+        controller.enqueue(
+          type === 'error'
+            ? {
+                type,
+                runId,
+                from: ChunkFrom.AGENT,
+                payload: { error: new Error('resume failed') },
+              }
+            : { type, runId, from: ChunkFrom.AGENT, payload: {} },
+        );
+        controller.close();
+      },
+    }),
+  });
 
   const mockAgent = {
-    stream: vi.fn().mockResolvedValue(emptyStream),
-    resumeStream: vi.fn().mockResolvedValue(emptyStream),
+    stream: vi.fn(),
+    resumeStream: vi.fn(),
   };
 
   const mockMastra = {
     getAgentById: vi.fn().mockReturnValue(mockAgent),
   };
 
-  it('calls resumeStream with correct runId and resumeData when messages contain approval-responded', async () => {
-    vi.clearAllMocks();
+  beforeEach(() => {
+    mockAgent.stream.mockReset().mockImplementation(async () => emptyResult());
+    mockAgent.resumeStream.mockReset().mockImplementation(async () => emptyResult());
+    mockMastra.getAgentById.mockReset().mockReturnValue(mockAgent);
+  });
 
+  it('calls resumeStream with correct runId and resumeData when messages contain approval-responded', async () => {
     const messages = [
-      {
-        id: 'msg-1',
-        role: 'assistant',
-        parts: [
-          {
-            type: 'tool-myTool',
-            toolCallId: 'tooluse_abc123',
-            state: 'approval-responded',
-            input: { param: 'value' },
-            approval: { id: `run-123${APPROVAL_ID_SEPARATOR}tooluse_abc123`, approved: true },
-          },
-        ],
-      },
+      assistantMessage('msg-1', [
+        {
+          ...approvalPart('run-123', 'tooluse_abc123'),
+          input: { param: 'value' },
+        },
+      ]),
     ];
 
     await handleChatStream({
@@ -669,8 +800,6 @@ describe('handleChatStream v6 native approve() resume flow', () => {
   });
 
   it('calls stream() for a normal (non-approval) message', async () => {
-    vi.clearAllMocks();
-
     const messages = [{ id: 'msg-1', role: 'user', parts: [{ type: 'text', text: 'hello' }] }];
 
     await handleChatStream({
@@ -685,23 +814,7 @@ describe('handleChatStream v6 native approve() resume flow', () => {
   });
 
   it('explicit resumeData/runId takes precedence over message scanning', async () => {
-    vi.clearAllMocks();
-
-    const messages = [
-      {
-        id: 'msg-1',
-        role: 'assistant',
-        parts: [
-          {
-            type: 'tool-myTool',
-            toolCallId: 'tooluse_abc123',
-            state: 'approval-responded',
-            input: {},
-            approval: { id: `run-from-msg${APPROVAL_ID_SEPARATOR}tooluse_abc123`, approved: true },
-          },
-        ],
-      },
-    ];
+    const messages = [assistantMessage('msg-1', [approvalPart('run-from-msg', 'tooluse_abc123')])];
 
     await handleChatStream({
       mastra: mockMastra as any,
@@ -714,6 +827,358 @@ describe('handleChatStream v6 native approve() resume flow', () => {
       { approved: true },
       expect.objectContaining({ runId: 'explicit-run' }),
     );
+  });
+
+  it('rejects an earlier-only approval response when a pending card is trailing', async () => {
+    const messages = [
+      assistantMessage('msg-1', [approvalPart('old-run', 'old-call')]),
+      assistantMessage('msg-2', [requestedPart('new-run', 'new-call')]),
+    ];
+
+    await expect(
+      handleChatStream({
+        mastra: mockMastra as any,
+        agentId: 'test-agent',
+        version: 'v6',
+        params: { messages } as any,
+      }),
+    ).rejects.toThrow(/cannot safely resume an approval response from an earlier assistant message/);
+
+    expect(mockAgent.resumeStream).not.toHaveBeenCalled();
+    expect(mockAgent.stream).not.toHaveBeenCalled();
+  });
+
+  it('does not consume a later user message as an approval resume', async () => {
+    const messages = [
+      assistantMessage('msg-1', [approvalPart('old-run', 'old-call')]),
+      { id: 'msg-2', role: 'user', parts: [{ type: 'text', text: 'What happened?' }] },
+    ];
+
+    const stream = await handleChatStream({
+      mastra: mockMastra as any,
+      agentId: 'test-agent',
+      version: 'v6',
+      params: { messages } as any,
+    });
+    await collectChunks(stream);
+
+    expect(mockAgent.stream).toHaveBeenCalledTimes(1);
+    expect(mockAgent.resumeStream).not.toHaveBeenCalled();
+  });
+
+  it('allows a normal assistant continuation when only history contains an approval response', async () => {
+    const messages = [
+      assistantMessage('msg-old', [approvalPart('old-run', 'old-call')]),
+      assistantMessage('msg-current', [
+        {
+          type: 'tool-myTool',
+          toolCallId: 'client-call',
+          state: 'output-available',
+          input: {},
+          output: { ok: true },
+        },
+      ]),
+    ];
+
+    const stream = await handleChatStream({
+      mastra: mockMastra as any,
+      agentId: 'test-agent',
+      version: 'v6',
+      params: { messages } as any,
+    });
+    await collectChunks(stream);
+
+    expect(mockAgent.stream).toHaveBeenCalledTimes(1);
+    expect(mockAgent.resumeStream).not.toHaveBeenCalled();
+  });
+
+  it('isolates a trailing approval from history that repeats the same toolCallId', async () => {
+    const trailingMessage = assistantMessage('msg-current', [approvalPart('new-run', 'shared-call', false)]);
+    const messages = [assistantMessage('msg-old', [approvalPart('old-run', 'shared-call')]), trailingMessage];
+    mockAgent.resumeStream.mockResolvedValueOnce(resumeResult('new-run', 'shared-call', { resumed: 'new-run' }));
+
+    const stream = await handleChatStream({
+      mastra: mockMastra as any,
+      agentId: 'test-agent',
+      version: 'v6',
+      params: { messages } as any,
+    });
+    const states: any[] = [];
+    for await (const state of readUIMessageStream({
+      message: trailingMessage as any,
+      stream: stream as any,
+      terminateOnError: true,
+    })) {
+      states.push(state);
+    }
+
+    expect(mockAgent.resumeStream).toHaveBeenCalledTimes(1);
+    expect(mockAgent.resumeStream).toHaveBeenCalledWith(
+      { approved: false },
+      expect.objectContaining({ runId: 'new-run', toolCallId: 'shared-call' }),
+    );
+    expect(states.at(-1)?.parts).toContainEqual(
+      expect.objectContaining({
+        toolCallId: 'shared-call',
+        state: 'output-available',
+        output: { resumed: 'new-run' },
+      }),
+    );
+  });
+
+  it('rejects a malformed trailing approval response without falling through', async () => {
+    const messages = [
+      assistantMessage('msg-1', [
+        {
+          type: 'text',
+          state: 'approval-responded',
+          text: 'not a tool response',
+        },
+      ]),
+    ];
+
+    await expect(
+      handleChatStream({
+        mastra: mockMastra as any,
+        agentId: 'test-agent',
+        version: 'v6',
+        params: { messages } as any,
+      }),
+    ).rejects.toThrow(/malformed or ambiguous/);
+
+    expect(mockAgent.stream).not.toHaveBeenCalled();
+    expect(mockAgent.resumeStream).not.toHaveBeenCalled();
+  });
+
+  it('rejects duplicate decisions for one trailing tool card without executing either', async () => {
+    const messages = [
+      assistantMessage('msg-1', [approvalPart('run-1', 'same-call', true), approvalPart('run-1', 'same-call', false)]),
+    ];
+
+    await expect(
+      handleChatStream({
+        mastra: mockMastra as any,
+        agentId: 'test-agent',
+        version: 'v6',
+        params: { messages } as any,
+      }),
+    ).rejects.toThrow(/malformed or ambiguous/);
+
+    expect(mockAgent.stream).not.toHaveBeenCalled();
+    expect(mockAgent.resumeStream).not.toHaveBeenCalled();
+  });
+
+  it('surfaces the core error when no approval target can be resumed', async () => {
+    mockAgent.resumeStream.mockRejectedValueOnce(
+      Object.assign(new Error('target is not suspended'), { id: 'AGENT_RESUME_TOOL_CALL_NOT_SUSPENDED' }),
+    );
+    const messages = [assistantMessage('msg-1', [approvalPart('run-1', 'call-B')])];
+
+    const stream = await handleChatStream({
+      mastra: mockMastra as any,
+      agentId: 'test-agent',
+      version: 'v6',
+      params: { messages } as any,
+    });
+    const chunks = await collectChunks(stream);
+
+    expect(chunks).toContainEqual(expect.objectContaining({ type: 'error' }));
+    expect(mockAgent.stream).not.toHaveBeenCalled();
+  });
+
+  it('resumes multiple exact targets sequentially and keeps one framed response', async () => {
+    mockAgent.resumeStream
+      .mockResolvedValueOnce(resumeResult('run-1', 'call-A', { resumed: 'A' }, 'length'))
+      .mockResolvedValueOnce(resumeResult('run-2', 'call-B', { resumed: 'B' }));
+    const trailingMessage = assistantMessage('msg-batch', [
+      approvalPart('run-1', 'call-A'),
+      approvalPart('run-2', 'call-B'),
+    ]);
+
+    const stream = await handleChatStream({
+      mastra: mockMastra as any,
+      agentId: 'test-agent',
+      version: 'v6',
+      params: { messages: [trailingMessage] } as any,
+      messageMetadata: ({ part }: any) =>
+        part?.type === 'finish' ? { finishReason: part.rawFinishReason } : undefined,
+    });
+    const [readerStream, rawStream] = stream.tee();
+    const states: any[] = [];
+    for await (const state of readUIMessageStream({
+      message: trailingMessage as any,
+      stream: readerStream as any,
+      terminateOnError: true,
+    })) {
+      states.push(state);
+    }
+    const chunks = await collectChunks(rawStream);
+
+    expect(mockAgent.resumeStream).toHaveBeenCalledTimes(2);
+    expect(mockAgent.resumeStream).toHaveBeenNthCalledWith(
+      1,
+      { approved: true },
+      expect.objectContaining({ runId: 'run-1', toolCallId: 'call-A' }),
+    );
+    expect(mockAgent.resumeStream).toHaveBeenNthCalledWith(
+      2,
+      { approved: true },
+      expect.objectContaining({ runId: 'run-2', toolCallId: 'call-B' }),
+    );
+    expect(chunks[0]?.type).toBe('start');
+    expect(chunks.filter(chunk => chunk.type === 'start')).toHaveLength(1);
+    expect(chunks.filter(chunk => chunk.type === 'tool-output-available')).toEqual([
+      expect.objectContaining({ toolCallId: 'call-A', output: { resumed: 'A' } }),
+      expect.objectContaining({ toolCallId: 'call-B', output: { resumed: 'B' } }),
+    ]);
+    expect(chunks.filter(chunk => chunk.type === 'finish')).toEqual([
+      expect.objectContaining({ messageMetadata: { finishReason: 'stop' } }),
+    ]);
+    expect(states.at(-1)?.parts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          toolCallId: 'call-A',
+          state: 'output-available',
+          output: { resumed: 'A' },
+        }),
+        expect.objectContaining({
+          toolCallId: 'call-B',
+          state: 'output-available',
+          output: { resumed: 'B' },
+        }),
+      ]),
+    );
+  });
+
+  it('does not reuse finish metadata when the final successful resume leg is empty', async () => {
+    const finishStream = {
+      fullStream: new ReadableStream({
+        start(controller) {
+          controller.enqueue({ type: 'start', runId: 'run-1', from: ChunkFrom.AGENT, payload: {} });
+          controller.enqueue({
+            type: 'finish',
+            runId: 'run-1',
+            from: ChunkFrom.AGENT,
+            payload: { stepResult: { reason: 'length' }, output: { usage: {} } },
+          });
+          controller.close();
+        },
+      }),
+    };
+    mockAgent.resumeStream.mockResolvedValueOnce(finishStream).mockResolvedValueOnce(emptyResult());
+    const trailingMessage = assistantMessage('msg-batch', [
+      approvalPart('run-1', 'call-A'),
+      approvalPart('run-2', 'call-B'),
+    ]);
+
+    const stream = await handleChatStream({
+      mastra: mockMastra as any,
+      agentId: 'test-agent',
+      version: 'v6',
+      params: { messages: [trailingMessage] } as any,
+      messageMetadata: ({ part }: any) =>
+        part?.type === 'finish' ? { finishReason: part.rawFinishReason } : undefined,
+    });
+    const chunks = await collectChunks(stream);
+    const finishChunks = chunks.filter(chunk => chunk.type === 'finish');
+
+    expect(mockAgent.resumeStream).toHaveBeenCalledTimes(2);
+    expect(finishChunks).toHaveLength(1);
+    expect(finishChunks[0]).not.toHaveProperty('messageMetadata');
+  });
+
+  it.each(['AGENT_RESUME_TOOL_CALL_NOT_SUSPENDED', 'AGENT_RESUME_NO_SNAPSHOT_FOUND'])(
+    'skips the exact stale target error %s and continues the trailing batch',
+    async errorId => {
+      mockAgent.resumeStream
+        .mockRejectedValueOnce(Object.assign(new Error('already resolved'), { id: errorId }))
+        .mockResolvedValueOnce(resumeResult('run-2', 'call-B', { resumed: 'B' }));
+      const trailingMessage = assistantMessage('msg-batch', [
+        approvalPart('run-1', 'call-A'),
+        approvalPart('run-2', 'call-B'),
+      ]);
+
+      const stream = await handleChatStream({
+        mastra: mockMastra as any,
+        agentId: 'test-agent',
+        version: 'v6',
+        params: { messages: [trailingMessage] } as any,
+      });
+      const chunks = await collectChunks(stream);
+
+      expect(mockAgent.resumeStream).toHaveBeenCalledTimes(2);
+      expect(chunks).toContainEqual(
+        expect.objectContaining({
+          type: 'tool-output-available',
+          toolCallId: 'call-B',
+          output: { resumed: 'B' },
+        }),
+      );
+    },
+  );
+
+  it('stops the trailing batch on a fatal resume error', async () => {
+    mockAgent.resumeStream.mockRejectedValueOnce(
+      Object.assign(new Error('wrong owner'), { id: 'AGENT_RESUME_OWNER_MISMATCH' }),
+    );
+    const trailingMessage = assistantMessage('msg-batch', [
+      approvalPart('run-1', 'call-A'),
+      approvalPart('run-2', 'call-B'),
+    ]);
+
+    const stream = await handleChatStream({
+      mastra: mockMastra as any,
+      agentId: 'test-agent',
+      version: 'v6',
+      params: { messages: [trailingMessage] } as any,
+    });
+    const chunks = await collectChunks(stream);
+
+    expect(mockAgent.resumeStream).toHaveBeenCalledTimes(1);
+    expect(chunks).toContainEqual(expect.objectContaining({ type: 'error' }));
+  });
+
+  it.each(['error', 'abort'] as const)('stops the trailing batch after an in-band %s chunk', async terminalType => {
+    mockAgent.resumeStream.mockResolvedValueOnce(terminalResult('run-1', terminalType));
+    const trailingMessage = assistantMessage('msg-batch', [
+      approvalPart('run-1', 'call-A'),
+      approvalPart('run-2', 'call-B'),
+    ]);
+
+    const stream = await handleChatStream({
+      mastra: mockMastra as any,
+      agentId: 'test-agent',
+      version: 'v6',
+      params: { messages: [trailingMessage] } as any,
+    });
+    const chunks = await collectChunks(stream);
+
+    expect(mockAgent.resumeStream).toHaveBeenCalledTimes(1);
+    expect(chunks).toContainEqual(expect.objectContaining({ type: terminalType }));
+  });
+
+  it('honors disabled start and finish framing for a trailing approval batch', async () => {
+    mockAgent.resumeStream
+      .mockResolvedValueOnce(resumeResult('run-1', 'call-A', { resumed: 'A' }))
+      .mockResolvedValueOnce(resumeResult('run-2', 'call-B', { resumed: 'B' }));
+    const trailingMessage = assistantMessage('msg-batch', [
+      approvalPart('run-1', 'call-A'),
+      approvalPart('run-2', 'call-B'),
+    ]);
+
+    const stream = await handleChatStream({
+      mastra: mockMastra as any,
+      agentId: 'test-agent',
+      version: 'v6',
+      params: { messages: [trailingMessage] } as any,
+      sendStart: false,
+      sendFinish: false,
+    });
+    const chunks = await collectChunks(stream);
+
+    expect(chunks.filter(chunk => chunk.type === 'start')).toHaveLength(0);
+    expect(chunks.filter(chunk => chunk.type === 'finish')).toHaveLength(0);
+    expect(chunks.filter(chunk => chunk.type === 'tool-output-available')).toHaveLength(2);
   });
 });
 
