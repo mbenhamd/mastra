@@ -2,12 +2,11 @@ name: mastra-workflow-tests
 
 services:
   inngest-test:
-    image: inngest/inngest:v1.34.0
+    image: inngest/inngest:v1.34.0@sha256:4e1a3ab68036114bbdf2208d3a3ab8a135a106bb39199bdef031794294e60852
     container_name: mastra-inngest-test
-    # Match the isolated package-suite handler port.
-    # Auto-discovery will find the handler when running on host.docker.internal
-    command: inngest dev -p 4200 -u http://host.docker.internal:4201/inngest/api --poll-interval=1
-    ports:
-      - '4200:4200'
-    extra_hosts:
-      - 'host.docker.internal:host-gateway'
+    labels:
+      io.mastra.test-runtime: inngest
+    # Linux host networking keeps both package-suite endpoints on the reviewed
+    # 4200/4201 pair without discovering or embedding a machine-specific IP.
+    network_mode: host
+    command: inngest dev -p 4200 -u http://127.0.0.1:4201/inngest/api --poll-interval=1
