@@ -23,6 +23,8 @@ async function reserveBranchLifecycleAttempts({
   executionGeneration: suppliedExecutionGeneration,
   lifecycleResumeAttempt = 0,
   lifecycleStepStates,
+  lifecycleIncomingStepStates,
+  lifecycleAttemptBaselineCaptured = false,
   branches,
 }: {
   workflowsStore?: WorkflowsStorage;
@@ -31,6 +33,8 @@ async function reserveBranchLifecycleAttempts({
   executionGeneration?: string;
   lifecycleResumeAttempt?: number;
   lifecycleStepStates?: Record<string, { stepCallId: string; stepAttempt: number }>;
+  lifecycleIncomingStepStates?: Record<string, { stepCallId: string; stepAttempt: number }>;
+  lifecycleAttemptBaselineCaptured?: boolean;
   branches: Array<{ stepId: string; executionPath: number[] }>;
 }): Promise<{
   executionGeneration?: string;
@@ -53,7 +57,7 @@ async function reserveBranchLifecycleAttempts({
     `Evented workflow branch reservation ${workflowId}/${runId}`,
   );
   for (const branch of branches) {
-    const { state } = getOrCreateWorkflowStepLifecycleState({
+    const { key, state } = getOrCreateWorkflowStepLifecycleState({
       workflowId,
       runId,
       executionGeneration,
@@ -61,7 +65,18 @@ async function reserveBranchLifecycleAttempts({
       executionPath: branch.executionPath,
       states,
     });
-    state.stepAttempt += 1;
+    // Mirror the serial dispatch guard (see processWorkflowStepRun). Every
+    // producer carries the attempt baseline that existed before this semantic
+    // branch dispatch. The first delivery advances N -> N+1. A broker
+    // redelivery sees durable N+1 while still carrying N, so it reuses the same
+    // lifecycle identity instead of re-firing the branch under a fresh attempt.
+    const incomingStepAttempt = lifecycleAttemptBaselineCaptured
+      ? (lifecycleIncomingStepStates?.[key]?.stepAttempt ?? 0)
+      : undefined;
+    const retainedRedeliveryAttempt = incomingStepAttempt !== undefined && state.stepAttempt > incomingStepAttempt;
+    if (!retainedRedeliveryAttempt) {
+      state.stepAttempt += 1;
+    }
   }
 
   await workflowsStore.updateWorkflowState({
@@ -192,6 +207,8 @@ export async function processWorkflowParallel(
     executionGeneration,
     lifecycleResumeAttempt,
     lifecycleStepStates,
+    lifecycleIncomingStepStates,
+    lifecycleAttemptBaselineCaptured,
   }: ProcessorArgs,
   {
     pubsub,
@@ -253,6 +270,8 @@ export async function processWorkflowParallel(
     executionGeneration,
     lifecycleResumeAttempt,
     lifecycleStepStates,
+    lifecycleIncomingStepStates,
+    lifecycleAttemptBaselineCaptured,
     branches: branches.map(({ nestedStep, executionPath }) => ({ stepId: nestedStep.step.id, executionPath })),
   });
 
@@ -307,6 +326,8 @@ export async function processWorkflowConditional(
     executionGeneration,
     lifecycleResumeAttempt,
     lifecycleStepStates,
+    lifecycleIncomingStepStates,
+    lifecycleAttemptBaselineCaptured,
   }: ProcessorArgs,
   {
     pubsub,
@@ -359,6 +380,8 @@ export async function processWorkflowConditional(
       executionGeneration,
       lifecycleResumeAttempt,
       lifecycleStepStates,
+      lifecycleIncomingStepStates,
+      lifecycleAttemptBaselineCaptured,
       branches: [{ stepId: onlyStepToRun.step.id, executionPath: branchExecutionPath }],
     });
     activeStepsPath[onlyStepToRun.step.id] = executionPath.concat([stepIndex]);
@@ -397,6 +420,8 @@ export async function processWorkflowConditional(
       executionGeneration,
       lifecycleResumeAttempt,
       lifecycleStepStates,
+      lifecycleIncomingStepStates,
+      lifecycleAttemptBaselineCaptured,
       branches: selectedBranches,
     });
     const lifecycleExecution = {
