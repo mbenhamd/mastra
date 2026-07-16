@@ -2787,12 +2787,7 @@ export class Workflow<
     // `suspended` row and either resumes stale work or fails lifecycle admission.
     // This also keeps the in-memory run map from reusing a terminal handle for
     // the next logical nested invocation.
-    const terminalStatus =
-      res.status === 'success' ||
-      res.status === 'failed' ||
-      res.status === 'canceled' ||
-      res.status === 'tripwire' ||
-      res.status === 'bailed';
+    const terminalStatus = res.status === 'success' || res.status === 'failed' || res.status === 'tripwire';
     if (
       terminalStatus &&
       !this.#options.shouldPersistSnapshot({ workflowStatus: res.status, stepResults: res.steps })
