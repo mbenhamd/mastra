@@ -4,6 +4,42 @@ import { getToolHookSnapshotTarget } from '../tools/tool-hooks';
 const DEFAULT_RUN_KEY = '__default__';
 const MAX_RETAINED_FENCES_PER_CONTEXT = 64;
 const MAX_SNAPSHOTTED_TOOL_OBJECTS = 10_000;
+const REGEXP_COMPILE = Object.getOwnPropertyDescriptor(RegExp.prototype, 'compile')?.value as
+  | ((pattern: string, flags?: string) => RegExp)
+  | undefined;
+const DESCRIPTOR_ONLY_STATE_TAGS = new Set([
+  '[object Object]',
+  '[object Array]',
+  '[object Function]',
+  '[object AsyncFunction]',
+  '[object GeneratorFunction]',
+  '[object AsyncGeneratorFunction]',
+  '[object Error]',
+]);
+const OPAQUE_INTRINSIC_PROTOTYPES = new Set<object>(
+  [
+    'WeakRef',
+    'FinalizationRegistry',
+    'URL',
+    'URLSearchParams',
+    'Headers',
+    'Request',
+    'Response',
+    'Blob',
+    'File',
+    'FormData',
+    'AbortController',
+    'AbortSignal',
+    'ReadableStream',
+    'WritableStream',
+    'TransformStream',
+  ].flatMap(name => {
+    const constructor = (globalThis as Record<string, unknown>)[name];
+    if (typeof constructor !== 'function') return [];
+    const prototype = (constructor as { prototype?: unknown }).prototype;
+    return isObjectLike(prototype) ? [prototype] : [];
+  }),
+);
 const PROTECTED_TOOL_DEFINITION_KEYS = Object.freeze([
   'id',
   'name',
@@ -71,10 +107,13 @@ const SCHEMA_DEFINITION_KEYS = new Set<PropertyKey>([
   'innerType',
   'schema',
 ]);
+const NO_DEEP_DEFINITION_KEYS = new Set<PropertyKey>();
 const INTRINSIC_PROTOTYPES = new Set<object>([
   Object.prototype,
   Function.prototype,
   Array.prototype,
+  ArrayBuffer.prototype,
+  DataView.prototype,
   Map.prototype,
   Set.prototype,
   WeakMap.prototype,
@@ -83,6 +122,19 @@ const INTRINSIC_PROTOTYPES = new Set<object>([
   RegExp.prototype,
   Promise.prototype,
   Error.prototype,
+  Object.getPrototypeOf(Uint8Array.prototype),
+  Uint8Array.prototype,
+  Uint8ClampedArray.prototype,
+  Uint16Array.prototype,
+  Uint32Array.prototype,
+  Int8Array.prototype,
+  Int16Array.prototype,
+  Int32Array.prototype,
+  Float32Array.prototype,
+  Float64Array.prototype,
+  BigInt64Array.prototype,
+  BigUint64Array.prototype,
+  ...(typeof SharedArrayBuffer === 'undefined' ? [] : [SharedArrayBuffer.prototype]),
 ]);
 
 interface OwnDescriptorSnapshot {
@@ -109,15 +161,33 @@ interface ToolObjectSnapshot {
   readonly descriptors: readonly OwnDescriptorSnapshot[];
   readonly accessorValues: readonly AccessorValueSnapshot[];
   readonly children: readonly ToolObjectSnapshot[];
+  readonly builtInState?: BuiltInStateSnapshot;
   readonly trackedKeys?: readonly PropertyKey[];
   readonly prototypeSnapshots?: readonly PrototypeSnapshot[];
 }
+
+type BuiltInStateSnapshot =
+  | { readonly kind: 'map'; readonly entries: readonly (readonly [unknown, unknown])[] }
+  | { readonly kind: 'set'; readonly values: readonly unknown[] }
+  | { readonly kind: 'date'; readonly time: number }
+  | { readonly kind: 'regexp'; readonly source: string; readonly flags: string }
+  | {
+      readonly kind: 'bytes';
+      readonly buffer: ArrayBufferLike;
+      readonly byteLength: number;
+      readonly bytes: Uint8Array;
+    };
 
 export interface ToolSurfaceFence {
   readonly allowedNames: readonly string[];
   readonly originalTools: Readonly<Record<string, unknown>>;
   readonly originalToolDescriptors: Readonly<Record<string, PropertyDescriptorMap>>;
   readonly originalToolSnapshots?: Readonly<Record<string, ToolObjectSnapshot>>;
+}
+
+export interface ProcessorToolSurfaceView {
+  readonly tools: Record<string, unknown>;
+  readonly fence: ToolSurfaceFence;
 }
 
 interface RegisteredToolSurfaceFence {
@@ -231,6 +301,124 @@ function freezePrototypeSnapshots(state: ObjectGraphSnapshotState): readonly Pro
   );
 }
 
+function isSharedArrayBuffer(value: object): value is SharedArrayBuffer {
+  return typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer;
+}
+
+function readArrayBufferByteLength(buffer: ArrayBufferLike): number {
+  if (buffer instanceof ArrayBuffer) {
+    return Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength')!.get!.call(buffer);
+  }
+  if (isSharedArrayBuffer(buffer)) {
+    return Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength')!.get!.call(buffer);
+  }
+  throw new Error('unsupported backing buffer');
+}
+
+function readViewBuffer(view: ArrayBufferView): ArrayBufferLike {
+  if (view instanceof DataView) {
+    return Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer')!.get!.call(view);
+  }
+  const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype);
+  return Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')!.get!.call(view);
+}
+
+function assertFixedLengthBuffer(buffer: ArrayBufferLike): void {
+  if (buffer instanceof ArrayBuffer) {
+    const resizable = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'resizable')?.get?.call(buffer);
+    if (resizable) throw new Error('resizable ArrayBuffer state cannot be retained safely');
+    return;
+  }
+  if (isSharedArrayBuffer(buffer)) {
+    throw new Error('SharedArrayBuffer executable state cannot be retained safely');
+  }
+}
+
+function snapshotBuiltInState(
+  target: object,
+): { snapshot: BuiltInStateSnapshot; childValues: readonly unknown[] } | undefined {
+  if (target instanceof WeakMap || target instanceof WeakSet || target instanceof Promise) {
+    throw new Error('WeakMap, WeakSet, and Promise executable state cannot be snapshotted safely');
+  }
+  if (target instanceof Map) {
+    const entries = Array.from(
+      Map.prototype.entries.call(target) as IterableIterator<readonly [unknown, unknown]>,
+      ([key, value]) => Object.freeze([key, value] as const),
+    );
+    return {
+      snapshot: { kind: 'map', entries: Object.freeze(entries) },
+      childValues: entries.flatMap(([key, value]) => [key, value]),
+    };
+  }
+  if (target instanceof Set) {
+    const values = Array.from(Set.prototype.values.call(target) as IterableIterator<unknown>);
+    return {
+      snapshot: { kind: 'set', values: Object.freeze(values) },
+      childValues: values,
+    };
+  }
+  if (target instanceof Date) {
+    return {
+      snapshot: { kind: 'date', time: Date.prototype.getTime.call(target) },
+      childValues: [],
+    };
+  }
+  if (target instanceof RegExp) {
+    if (!REGEXP_COMPILE) throw new Error('RegExp executable state cannot be restored safely');
+    const source = Object.getOwnPropertyDescriptor(RegExp.prototype, 'source')!.get!.call(target);
+    const flags = Object.getOwnPropertyDescriptor(RegExp.prototype, 'flags')!.get!.call(target);
+    return { snapshot: { kind: 'regexp', source, flags }, childValues: [] };
+  }
+  if (target instanceof ArrayBuffer || isSharedArrayBuffer(target) || ArrayBuffer.isView(target)) {
+    const buffer = target instanceof ArrayBuffer || isSharedArrayBuffer(target) ? target : readViewBuffer(target);
+    assertFixedLengthBuffer(buffer);
+    const byteLength = readArrayBufferByteLength(buffer);
+    const bytes = Uint8Array.from(new Uint8Array(buffer));
+    return {
+      snapshot: { kind: 'bytes', buffer, byteLength, bytes },
+      childValues: [],
+    };
+  }
+  // Ordinary objects, arrays, functions, errors, and user-defined class
+  // instances have descriptor/prototype state that the graph snapshot below
+  // can observe. Other branded objects may hide mutable state in internal
+  // slots. Reject those unless they have an explicit snapshot/restore policy
+  // above; treating their own descriptors as complete would fail open.
+  const stateTag = Object.prototype.toString.call(target);
+  let prototype: object | null = target;
+  let hasOpaqueIntrinsicPrototype = false;
+  while ((prototype = Object.getPrototypeOf(prototype)) !== null) {
+    if (OPAQUE_INTRINSIC_PROTOTYPES.has(prototype)) {
+      hasOpaqueIntrinsicPrototype = true;
+      break;
+    }
+  }
+  // Object.prototype.toString() is not a trustworthy brand check by itself:
+  // an ordinary class may define Symbol.toStringTag, while an opaque object
+  // may spoof "Object". Known opaque platform prototypes remain fail-closed;
+  // otherwise a descriptor-visible user class is handled like an ordinary
+  // object regardless of its cosmetic tag.
+  let hasDescriptorVisibleToStringTag = false;
+  prototype = target;
+  while (prototype !== null && !INTRINSIC_PROTOTYPES.has(prototype)) {
+    if (Object.hasOwn(prototype, Symbol.toStringTag)) {
+      hasDescriptorVisibleToStringTag = true;
+      break;
+    }
+    prototype = Object.getPrototypeOf(prototype);
+  }
+  if (hasOpaqueIntrinsicPrototype || (!DESCRIPTOR_ONLY_STATE_TAGS.has(stateTag) && !hasDescriptorVisibleToStringTag)) {
+    throw new Error(`${stateTag} internal-slot executable state cannot be snapshotted safely`);
+  }
+  return undefined;
+}
+
+function isTypedArrayIndex(key: PropertyKey): boolean {
+  if (typeof key !== 'string' || key === '') return false;
+  const index = Number(key);
+  return Number.isInteger(index) && index >= 0 && String(index) === key;
+}
+
 function snapshotObjectGraph(
   target: object,
   state: ObjectGraphSnapshotState,
@@ -242,24 +430,46 @@ function snapshotObjectGraph(
   retainSnapshotObject(state);
 
   const prototype = Object.getPrototypeOf(target);
-  snapshotPrototypeChain(target, state, trackedKeys);
-  const trackedKeySet = trackedKeys ? new Set(trackedKeys) : undefined;
+  const builtIn = snapshotBuiltInState(target);
+  const functionDefinitionKeys = typeof target === 'function' && !trackedKeys ? Reflect.ownKeys(target) : undefined;
+  const effectiveTrackedKeys = trackedKeys ?? functionDefinitionKeys;
+  snapshotPrototypeChain(target, state, effectiveTrackedKeys);
+  const trackedKeySet = effectiveTrackedKeys ? new Set(effectiveTrackedKeys) : undefined;
   const descriptors = Reflect.ownKeys(target)
-    .filter(key => !trackedKeySet || trackedKeySet.has(key))
+    .filter(
+      key =>
+        (!trackedKeySet || trackedKeySet.has(key)) && !(builtIn?.snapshot.kind === 'bytes' && isTypedArrayIndex(key)),
+    )
     .map(key => {
       const descriptor = Object.getOwnPropertyDescriptor(target, key);
       if (!descriptor) throw new Error(`Replacement tool property ${String(key)} disappeared while being snapshotted.`);
       return Object.freeze({ key, descriptor: Object.freeze({ ...descriptor }) });
     });
   const children = descriptors.flatMap(({ key, descriptor }) => {
-    if (!shouldSnapshotNestedDefinition(target, key, deepKeys)) return [];
     if (!('value' in descriptor) || !isObjectLike(descriptor.value)) return [];
-    if (typeof descriptor.value === 'function') return [];
+    // A function's own descriptors are executable-definition state, but
+    // object-valued properties are also commonly used for last-invocation
+    // metadata (request context, AbortSignal, provider response, and so on).
+    // Capture the descriptor identity without recursively treating that live
+    // runtime graph as tool configuration. Function-valued properties still
+    // receive their own descriptor snapshot.
+    if (typeof target === 'function' && typeof descriptor.value !== 'function') return [];
+    if (!shouldSnapshotNestedDefinition(target, key, deepKeys) && typeof descriptor.value !== 'function') {
+      return [];
+    }
     const child = snapshotObjectGraph(descriptor.value, state);
     return child ? [child] : [];
   });
+  for (const value of builtIn?.childValues ?? []) {
+    if (!isObjectLike(value)) continue;
+    const child = snapshotObjectGraph(value, state);
+    if (child) children.push(child);
+  }
   const accessorValues = descriptors.flatMap(({ key, descriptor }) => {
-    if (!shouldSnapshotNestedDefinition(target, key, deepKeys)) return [];
+    // Do not invoke function-owned accessors while fencing. Mock functions and
+    // user functions may expose throwing or live runtime accessors (`mock`,
+    // `arguments`, `lastContext`) that aren't executable definitions.
+    if (typeof target === 'function' || !shouldSnapshotNestedDefinition(target, key, deepKeys)) return [];
     if (
       'value' in descriptor ||
       (!descriptor.enumerable && !SCHEMA_DEFINITION_KEYS.has(key)) ||
@@ -282,7 +492,8 @@ function snapshotObjectGraph(
     descriptors: Object.freeze(descriptors),
     accessorValues: Object.freeze(accessorValues),
     children: Object.freeze(children),
-    ...(trackedKeys ? { trackedKeys: Object.freeze([...trackedKeys]) } : {}),
+    ...(builtIn ? { builtInState: Object.freeze(builtIn.snapshot) } : {}),
+    ...(effectiveTrackedKeys ? { trackedKeys: Object.freeze([...effectiveTrackedKeys]) } : {}),
   });
 }
 
@@ -322,6 +533,191 @@ function snapshotToolImplementation(tool: object): ToolObjectSnapshot {
     children: hookTargetSnapshot ? Object.freeze([...snapshot.children, hookTargetSnapshot]) : snapshot.children,
     prototypeSnapshots: freezePrototypeSnapshots(state),
   });
+}
+
+interface ProcessorCloneState {
+  readonly seen: Map<object, object>;
+  readonly retained: { count: number };
+}
+
+function retainProcessorClone(state: ProcessorCloneState): void {
+  state.retained.count++;
+  if (state.retained.count > MAX_SNAPSHOTTED_TOOL_OBJECTS) {
+    throw new Error(
+      `Replacement tool implementation exceeds the ${MAX_SNAPSHOTTED_TOOL_OBJECTS}-object processor-view limit.`,
+    );
+  }
+}
+
+function cloneProcessorPrototype(prototype: object | null, state: ProcessorCloneState): object | null {
+  if (prototype === null || INTRINSIC_PROTOTYPES.has(prototype) || OPAQUE_INTRINSIC_PROTOTYPES.has(prototype)) {
+    return prototype;
+  }
+  return cloneProcessorObject(prototype, state);
+}
+
+function cloneProcessorBuiltIn(target: object, state: ProcessorCloneState): object | undefined {
+  if (target instanceof Map) {
+    const clone = new Map();
+    state.seen.set(target, clone);
+    for (const [key, value] of Map.prototype.entries.call(target) as IterableIterator<[unknown, unknown]>) {
+      clone.set(cloneProcessorValue(key, state), cloneProcessorValue(value, state));
+    }
+    return clone;
+  }
+  if (target instanceof Set) {
+    const clone = new Set();
+    state.seen.set(target, clone);
+    for (const value of Set.prototype.values.call(target) as IterableIterator<unknown>) {
+      clone.add(cloneProcessorValue(value, state));
+    }
+    return clone;
+  }
+  if (target instanceof Date) {
+    const clone = new Date(Date.prototype.getTime.call(target));
+    state.seen.set(target, clone);
+    return clone;
+  }
+  if (target instanceof RegExp) {
+    const source = Object.getOwnPropertyDescriptor(RegExp.prototype, 'source')!.get!.call(target);
+    const flags = Object.getOwnPropertyDescriptor(RegExp.prototype, 'flags')!.get!.call(target);
+    const clone = new RegExp(source, flags);
+    clone.lastIndex = (target as RegExp).lastIndex;
+    state.seen.set(target, clone);
+    return clone;
+  }
+  if (target instanceof ArrayBuffer) {
+    const clone = target.slice(0);
+    state.seen.set(target, clone);
+    return clone;
+  }
+  if (ArrayBuffer.isView(target)) {
+    const sourceBuffer = readViewBuffer(target);
+    assertFixedLengthBuffer(sourceBuffer);
+    const clonedBuffer = sourceBuffer instanceof ArrayBuffer ? sourceBuffer.slice(0) : undefined;
+    if (!clonedBuffer) throw new Error('SharedArrayBuffer executable state cannot be retained safely');
+    const clone =
+      target instanceof DataView
+        ? new DataView(clonedBuffer, target.byteOffset, target.byteLength)
+        : new (target.constructor as new (buffer: ArrayBuffer, byteOffset: number, length: number) => object)(
+            clonedBuffer,
+            target.byteOffset,
+            (target as unknown as { length: number }).length,
+          );
+    state.seen.set(target, clone);
+    return clone;
+  }
+  return undefined;
+}
+
+function cloneProcessorValue(value: unknown, state: ProcessorCloneState): unknown {
+  return isObjectLike(value) ? cloneProcessorObject(value, state) : value;
+}
+
+function cloneProcessorObject(
+  target: object,
+  state: ProcessorCloneState,
+  trackedKeys?: readonly PropertyKey[],
+  deepKeys?: ReadonlySet<PropertyKey>,
+): object {
+  const existing = state.seen.get(target);
+  if (existing) return existing;
+  retainProcessorClone(state);
+
+  const builtInClone = cloneProcessorBuiltIn(target, state);
+  let clone: object;
+  if (builtInClone) {
+    clone = builtInClone;
+  } else if (typeof target === 'function') {
+    const original = target as (...args: unknown[]) => unknown;
+    clone = function (this: unknown, ...args: unknown[]) {
+      return Reflect.apply(original, this, args);
+    };
+    state.seen.set(target, clone);
+    Reflect.setPrototypeOf(clone, cloneProcessorPrototype(Object.getPrototypeOf(target), state));
+  } else {
+    clone = Object.create(cloneProcessorPrototype(Object.getPrototypeOf(target), state));
+    state.seen.set(target, clone);
+  }
+
+  const trackedKeySet = trackedKeys ? new Set(trackedKeys) : undefined;
+  for (const key of Reflect.ownKeys(target)) {
+    if (trackedKeySet && !trackedKeySet.has(key)) continue;
+    if (ArrayBuffer.isView(target) && isTypedArrayIndex(key)) continue;
+    const descriptor = Object.getOwnPropertyDescriptor(target, key);
+    if (!descriptor) continue;
+
+    let processorDescriptor: PropertyDescriptor;
+    if ('value' in descriptor) {
+      let processorValue = descriptor.value;
+      if (isObjectLike(descriptor.value)) {
+        if (typeof descriptor.value === 'function' || shouldSnapshotNestedDefinition(target, key, deepKeys)) {
+          processorValue = cloneProcessorValue(descriptor.value, state);
+        } else if (typeof target === 'function' && isPlainDefinitionContainer(descriptor.value)) {
+          // Give processors a shallow copy of object-valued function metadata
+          // so direct edits don't alter the retained function. Nested runtime
+          // handles remain runtime state and aren't recursively traversed.
+          processorValue = cloneProcessorObject(
+            descriptor.value,
+            state,
+            Reflect.ownKeys(descriptor.value),
+            NO_DEEP_DEFINITION_KEYS,
+          );
+        }
+      }
+      processorDescriptor = {
+        ...descriptor,
+        value: processorValue,
+      };
+    } else if (
+      descriptor.get &&
+      (descriptor.enumerable || SCHEMA_DEFINITION_KEYS.has(key)) &&
+      (typeof target === 'function' || shouldSnapshotNestedDefinition(target, key, deepKeys))
+    ) {
+      let value: unknown;
+      try {
+        value = Reflect.get(target, key);
+      } catch (error) {
+        throw new Error(`Cannot materialize accessor-backed replacement tool property "${String(key)}".`, {
+          cause: error,
+        });
+      }
+      processorDescriptor = {
+        value: cloneProcessorValue(value, state),
+        writable: false,
+        enumerable: descriptor.enumerable,
+        configurable: descriptor.configurable,
+      };
+    } else {
+      processorDescriptor = descriptor;
+    }
+
+    const current = Object.getOwnPropertyDescriptor(clone, key);
+    if (current && !current.configurable && !sameDescriptor(current, processorDescriptor)) continue;
+    Reflect.defineProperty(clone, key, processorDescriptor);
+  }
+  return clone;
+}
+
+/**
+ * Give durable input processors an isolated executable-definition view. Any
+ * irreversible descriptor or private-class mutation is confined to this view;
+ * successful validation materializes the registered implementations instead.
+ */
+export function createProcessorToolSurfaceView(fence: ToolSurfaceFence): ProcessorToolSurfaceView {
+  const state: ProcessorCloneState = { seen: new Map(), retained: { count: 0 } };
+  const tools: Record<string, unknown> = {};
+  for (const toolName of fence.allowedNames) {
+    const originalTool = fence.originalTools[toolName];
+    defineRecordValue(
+      tools,
+      toolName,
+      isObjectLike(originalTool)
+        ? cloneProcessorObject(originalTool, state, undefined, DEEP_PROTECTED_TOOL_DEFINITION_KEYS)
+        : originalTool,
+    );
+  }
+  return { tools, fence: immutableFence(tools, fence.allowedNames) };
 }
 
 function sameDescriptor(current: PropertyDescriptor | undefined, original: PropertyDescriptor): boolean {
@@ -399,15 +795,98 @@ function matchesSnapshotView(current: unknown, snapshot: ToolObjectSnapshot): bo
   const trackedKeys = snapshot.trackedKeys ? new Set(snapshot.trackedKeys) : undefined;
   for (const key of Reflect.ownKeys(current)) {
     if (trackedKeys && !trackedKeys.has(key)) continue;
+    if (snapshot.builtInState?.kind === 'bytes' && isTypedArrayIndex(key)) continue;
     if (!expectedKeys.has(key)) return false;
   }
-  return snapshot.descriptors.every(({ key, descriptor }) =>
-    sameViewDescriptor(Object.getOwnPropertyDescriptor(current, key), descriptor),
-  );
+  if (
+    !snapshot.descriptors.every(({ key, descriptor }) =>
+      sameViewDescriptor(Object.getOwnPropertyDescriptor(current, key), descriptor),
+    )
+  ) {
+    return false;
+  }
+  return snapshot.builtInState ? matchesBuiltInState(current, snapshot.builtInState) : true;
+}
+
+function matchesBuiltInState(target: object, snapshot: BuiltInStateSnapshot): boolean {
+  try {
+    if (snapshot.kind === 'map') {
+      const entries = Array.from(Map.prototype.entries.call(target) as IterableIterator<readonly [unknown, unknown]>);
+      return (
+        entries.length === snapshot.entries.length &&
+        entries.every(
+          ([key, value], index) =>
+            Object.is(key, snapshot.entries[index]![0]) && Object.is(value, snapshot.entries[index]![1]),
+        )
+      );
+    }
+    if (snapshot.kind === 'set') {
+      const values = Array.from(Set.prototype.values.call(target) as IterableIterator<unknown>);
+      return (
+        values.length === snapshot.values.length &&
+        values.every((value, index) => Object.is(value, snapshot.values[index]))
+      );
+    }
+    if (snapshot.kind === 'date') return Object.is(Date.prototype.getTime.call(target), snapshot.time);
+    if (snapshot.kind === 'regexp') {
+      return (
+        Object.getOwnPropertyDescriptor(RegExp.prototype, 'source')!.get!.call(target) === snapshot.source &&
+        Object.getOwnPropertyDescriptor(RegExp.prototype, 'flags')!.get!.call(target) === snapshot.flags
+      );
+    }
+
+    const currentBuffer =
+      target instanceof ArrayBuffer || isSharedArrayBuffer(target) ? target : readViewBuffer(target as ArrayBufferView);
+    if (currentBuffer !== snapshot.buffer || readArrayBufferByteLength(currentBuffer) !== snapshot.byteLength) {
+      return false;
+    }
+    const currentBytes = new Uint8Array(currentBuffer);
+    return currentBytes.every((value, index) => value === snapshot.bytes[index]);
+  } catch {
+    return false;
+  }
+}
+
+function restoreBuiltInState(target: object, snapshot: BuiltInStateSnapshot): boolean {
+  if (matchesBuiltInState(target, snapshot)) return false;
+
+  if (snapshot.kind === 'map') {
+    Map.prototype.clear.call(target);
+    for (const [key, value] of snapshot.entries) Map.prototype.set.call(target, key, value);
+    return true;
+  }
+  if (snapshot.kind === 'set') {
+    Set.prototype.clear.call(target);
+    for (const value of snapshot.values) Set.prototype.add.call(target, value);
+    return true;
+  }
+  if (snapshot.kind === 'date') {
+    Date.prototype.setTime.call(target, snapshot.time);
+    return true;
+  }
+  if (snapshot.kind === 'regexp') {
+    if (!REGEXP_COMPILE) throw new Error('RegExp source or flags changed and cannot be restored');
+    Reflect.apply(REGEXP_COMPILE, target, [snapshot.source, snapshot.flags]);
+    return true;
+  }
+
+  const currentBuffer =
+    target instanceof ArrayBuffer || isSharedArrayBuffer(target) ? target : readViewBuffer(target as ArrayBufferView);
+  if (currentBuffer !== snapshot.buffer || readArrayBufferByteLength(currentBuffer) !== snapshot.byteLength) {
+    throw new Error('binary backing buffer identity or length changed and cannot be restored');
+  }
+  new Uint8Array(currentBuffer).set(snapshot.bytes);
+  return true;
 }
 
 function restoreObjectGraph(snapshot: ToolObjectSnapshot): boolean {
   let changed = false;
+  // Restore internal slots first. In particular, RegExp.prototype.compile()
+  // also resets lastIndex; restoring own descriptors afterwards returns the
+  // complete RegExp state to its exact captured baseline. Doing this before
+  // any fallible descriptor cleanup also prevents a failed restore from
+  // leaving the registered object's internal state poisoned.
+  if (snapshot.builtInState) changed = restoreBuiltInState(snapshot.target, snapshot.builtInState) || changed;
   if (Object.getPrototypeOf(snapshot.target) !== snapshot.prototype) {
     changed = true;
     if (!Reflect.setPrototypeOf(snapshot.target, snapshot.prototype)) {
@@ -418,6 +897,7 @@ function restoreObjectGraph(snapshot: ToolObjectSnapshot): boolean {
   const trackedKeys = snapshot.trackedKeys ? new Set(snapshot.trackedKeys) : undefined;
   for (const key of Reflect.ownKeys(snapshot.target)) {
     if (trackedKeys && !trackedKeys.has(key)) continue;
+    if (snapshot.builtInState?.kind === 'bytes' && isTypedArrayIndex(key)) continue;
     if (!originalKeys.has(key)) {
       changed = true;
       if (!Reflect.deleteProperty(snapshot.target, key)) {
@@ -772,6 +1252,97 @@ export function enforceToolSurfaceFence(
   return providerTools;
 }
 
+/**
+ * Materialize only processor-selected tools when every selected implementation
+ * is still the exact implementation captured by the fence.
+ *
+ * Durable execution uses this stricter variant because its tool-call step may
+ * run on another worker and rebuild tools from the registered Agent. Arbitrary
+ * processor-created implementations and closure decorators cannot be rebuilt
+ * there. The check also restores any in-place mutation before it fails so a
+ * retained registry tool can't poison a later step or retry.
+ */
+export function enforceReconstructibleToolSurface(
+  tools: Record<string, unknown>,
+  fence: ToolSurfaceFence,
+  processorViewFence: ToolSurfaceFence = fence,
+): Record<string, unknown> {
+  let violation: { toolName: string; action: 'add' | 'replace' | 'mutate' } | undefined;
+  const restoreFenceAndDetectMutation = (candidateFence: ToolSurfaceFence) => {
+    for (const toolName of candidateFence.allowedNames) {
+      const processorTool = candidateFence.originalTools[toolName];
+      try {
+        if (restoreOriginalToolDescriptors(toolName, processorTool, candidateFence) && !violation) {
+          violation = { toolName, action: 'mutate' };
+        }
+      } catch {
+        // The processor may have made its isolated view non-configurable or
+        // non-extensible. That view is disposable; the registered executable
+        // remains pristine and the durable attempt still fails closed.
+        violation ??= { toolName, action: 'mutate' };
+      }
+    }
+  };
+  const restoreAndDetectMutation = () => {
+    restoreFenceAndDetectMutation(processorViewFence);
+    // A processor can retain a closure over the registered function instead of
+    // mutating the isolated view it receives. Validate both graphs at every
+    // untrusted trap boundary; shallow function-owned object identity catches
+    // replacement without traversing invocation context internals.
+    if (processorViewFence !== fence) restoreFenceAndDetectMutation(fence);
+  };
+
+  restoreAndDetectMutation();
+  let surfaceKeys: readonly PropertyKey[];
+  try {
+    surfaceKeys = Reflect.ownKeys(tools);
+  } catch {
+    restoreAndDetectMutation();
+    violation ??= { toolName: '<tool surface>', action: 'replace' };
+    surfaceKeys = [];
+  }
+  // A Proxy ownKeys trap can mutate a retained executable before returning.
+  restoreAndDetectMutation();
+
+  const providerTools: Record<string, unknown> = {};
+  for (const toolName of surfaceKeys) {
+    if (violation) break;
+    if (typeof toolName !== 'string') continue;
+
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Reflect.getOwnPropertyDescriptor(tools, toolName);
+    } catch {
+      violation = { toolName, action: 'replace' };
+    }
+    // A stateful descriptor trap gets exactly one read and cannot leave a
+    // mutation behind for this or a later tool.
+    restoreAndDetectMutation();
+    if (violation) break;
+    if (!descriptor?.enumerable) continue;
+
+    if (!Object.hasOwn(processorViewFence.originalTools, toolName)) {
+      violation = { toolName, action: 'add' };
+      break;
+    }
+    if (!('value' in descriptor) || descriptor.value !== processorViewFence.originalTools[toolName]) {
+      violation = { toolName, action: 'replace' };
+      break;
+    }
+    defineRecordValue(providerTools, toolName, fence.originalTools[toolName]);
+  }
+
+  // Catch a mutation performed by the final descriptor trap after its return.
+  restoreAndDetectMutation();
+
+  if (violation) {
+    throw new Error(
+      `Durable input processors cannot ${violation.action} executable tool "${violation.toolName}". Durable tool surfaces must remain reconstructible from the registered agent; remove tools to narrow the surface, or use beforeToolCall/afterToolCall hooks for around-call behavior.`,
+    );
+  }
+  return providerTools;
+}
+
 /** Recreate the complete trusted tool map for a same-process resume. */
 export function materializeToolSurfaceFence(fence: ToolSurfaceFence): Record<string, unknown> {
   return enforceToolSurfaceFence(fence.originalTools as Record<string, unknown>, fence);
@@ -785,24 +1356,39 @@ export function enforceActiveToolsFence(
 ): string[] {
   const allowedNames = new Set(fence.allowedNames);
   const visibleNames = new Set(visibleToolNames);
-  return (activeTools ?? fence.allowedNames).filter(
+  // Always return a plain array. A processor may return an Array Proxy or
+  // subclass whose iterator/species runs user code while the selection is
+  // read; callers must perform this materialization before their final
+  // executable-surface restore/check.
+  return Array.from(activeTools ?? fence.allowedNames).filter(
     toolName => allowedNames.has(toolName) && visibleNames.has(toolName),
   );
 }
 
-/** Fail before provider invocation when a forced tool choice is outside the ceiling. */
+/** Materialize a stable choice and fail when a forced tool is outside the visible ceiling. */
 export function enforceToolChoiceFence(
   toolChoice: string | { type?: string; toolName?: string } | undefined,
   fence: ToolSurfaceFence,
-): void {
-  if (
-    toolChoice &&
-    typeof toolChoice === 'object' &&
-    typeof toolChoice.toolName === 'string' &&
-    !fence.allowedNames.includes(toolChoice.toolName)
-  ) {
-    throw new Error(
-      `Forced toolChoice names tool "${toolChoice.toolName}" outside the execution's replacement tool surface.`,
-    );
+  visibleToolNames: Iterable<string> = fence.allowedNames,
+): string | { type?: string; toolName?: string } | undefined {
+  if (!toolChoice || typeof toolChoice !== 'object') return toolChoice;
+
+  let type: unknown;
+  let toolName: unknown;
+  try {
+    type = Reflect.get(toolChoice, 'type');
+    toolName = Reflect.get(toolChoice, 'toolName');
+  } catch (error) {
+    throw new Error('Cannot read processor-provided toolChoice while materializing the provider request.', {
+      cause: error,
+    });
   }
+  const visibleNames = new Set(visibleToolNames);
+  if (typeof toolName === 'string' && (!fence.allowedNames.includes(toolName) || !visibleNames.has(toolName))) {
+    throw new Error(`Forced toolChoice names tool "${toolName}" outside the execution's replacement tool surface.`);
+  }
+  return {
+    ...(type !== undefined ? { type: type as string } : {}),
+    ...(toolName !== undefined ? { toolName: toolName as string } : {}),
+  };
 }

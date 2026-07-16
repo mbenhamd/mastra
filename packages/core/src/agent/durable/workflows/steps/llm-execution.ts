@@ -35,8 +35,10 @@ import { createStep } from '../../../../workflows/workflow';
 import { enforceChannelToolFence, readChannelToolFence } from '../../../channel-tool-fence';
 import { MessageList } from '../../../message-list';
 import {
+  createProcessorToolSurfaceView,
   createToolSurfaceFence,
   enforceActiveToolsFence,
+  enforceReconstructibleToolSurface,
   enforceToolChoiceFence,
   enforceToolSurfaceFence,
 } from '../../../tool-surface-fence';
@@ -308,6 +310,9 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
             let currentTools = tools as unknown as ToolSet;
             let currentToolChoice = execOptions.toolChoice as ToolChoice<ToolSet> | undefined;
             let currentActiveTools = execOptions.activeTools;
+            let reconstructibleToolSurface: ReturnType<typeof createToolSurfaceFence> | undefined;
+            let processorToolSurfaceView: ReturnType<typeof createProcessorToolSurfaceView> | undefined;
+            let processorSelectedTools: Record<string, unknown> | undefined;
             const toolSurfaceFence = execOptions.toolSurfaceFence
               ? createToolSurfaceFence(currentTools as unknown as Record<string, unknown>, execOptions.toolSurfaceFence)
               : undefined;
@@ -321,7 +326,9 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                 toolSurfaceFence,
                 Object.keys(currentTools),
               );
-              enforceToolChoiceFence(currentToolChoice as any, toolSurfaceFence);
+              currentToolChoice = enforceToolChoiceFence(currentToolChoice as any, toolSurfaceFence) as
+                | ToolChoice<ToolSet>
+                | undefined;
             }
             let currentModelSettings: Record<string, unknown> = { ...(execOptions.modelSettings ?? {}) };
             let currentProviderOptions: SharedProviderOptions | undefined = mergeProviderOptions(
@@ -372,6 +379,14 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
               ? [...baseInputProcessors, new PrepareStepProcessor({ prepareStep: registryEntry.prepareStep })]
               : baseInputProcessors;
             if (stepInputProcessors.length) {
+              // A durable tool-call can execute on another worker, where the
+              // only valid implementation is the one reconstructed from the
+              // registered Agent/workspace surface. Give processors an
+              // isolated name map, then reject executable mutations before the
+              // provider can observe a tool the executor cannot reproduce.
+              reconstructibleToolSurface = createToolSurfaceFence(currentTools as unknown as Record<string, unknown>);
+              processorToolSurfaceView = createProcessorToolSurfaceView(reconstructibleToolSurface);
+              currentTools = processorToolSurfaceView.tools as ToolSet;
               const inputStepWriter = pubsub
                 ? {
                     custom: async (data: { type: string }) => {
@@ -428,7 +443,33 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                 );
                 currentMessageId = merged.messageId;
                 currentModel = merged.model as typeof currentModel;
-                currentTools = merged.tools as ToolSet;
+                // Materialize processor-returned selection controls before the
+                // final executable check. Array/choice Proxies can run traps
+                // while they are read, but neither the provider nor later
+                // setup receives those untrusted containers.
+                let selectionControlError: unknown;
+                let hasSelectionControlError = false;
+                try {
+                  currentActiveTools = enforceActiveToolsFence(merged.activeTools, reconstructibleToolSurface);
+                  currentToolChoice = enforceToolChoiceFence(merged.toolChoice as any, reconstructibleToolSurface) as
+                    | ToolChoice<ToolSet>
+                    | undefined;
+                } catch (error) {
+                  selectionControlError = error;
+                  hasSelectionControlError = true;
+                }
+                currentProviderOptions = merged.providerOptions;
+                currentModelSettings = merged.modelSettings ?? {};
+                structuredOutput = merged.structuredOutput;
+                processorSelectedTools = merged.tools as unknown as Record<string, unknown>;
+                // This must run after the untrusted selection controls above:
+                // their traps may have mutated one of the retained tools.
+                currentTools = enforceReconstructibleToolSurface(
+                  merged.tools as unknown as Record<string, unknown>,
+                  reconstructibleToolSurface,
+                  processorToolSurfaceView.fence,
+                ) as ToolSet;
+                if (hasSelectionControlError) throw selectionControlError;
                 // §14.7 INC-1b: re-enforce the channel tool fence after a processor may have
                 // re-introduced a reserved channel tool name (no-op unless this is a
                 // channel-bound turn that stamped a reserved set onto the requestContext).
@@ -436,11 +477,17 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                 if (channelToolFence) {
                   enforceChannelToolFence(currentTools as unknown as Record<string, unknown>, channelToolFence);
                 }
-                currentToolChoice = merged.toolChoice as ToolChoice<ToolSet> | undefined;
-                currentActiveTools = merged.activeTools;
-                currentProviderOptions = merged.providerOptions;
-                currentModelSettings = merged.modelSettings ?? {};
-                structuredOutput = merged.structuredOutput;
+                const reconstructibleVisibleToolNames = Object.keys(currentTools);
+                currentActiveTools = enforceActiveToolsFence(
+                  currentActiveTools,
+                  reconstructibleToolSurface,
+                  reconstructibleVisibleToolNames,
+                );
+                currentToolChoice = enforceToolChoiceFence(
+                  currentToolChoice as any,
+                  reconstructibleToolSurface,
+                  reconstructibleVisibleToolNames,
+                ) as ToolChoice<ToolSet> | undefined;
                 // PF-1790: re-enforce the immutable replacement tool ceiling after
                 // processors may have mutated tools/activeTools/toolChoice. The
                 // fence can narrow per step but never expand or swap executables.
@@ -449,12 +496,17 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                     currentTools as unknown as Record<string, unknown>,
                     toolSurfaceFence,
                   ) as ToolSet;
+                  const replacementVisibleToolNames = Object.keys(currentTools);
                   currentActiveTools = enforceActiveToolsFence(
                     currentActiveTools,
                     toolSurfaceFence,
-                    Object.keys(currentTools),
+                    replacementVisibleToolNames,
                   );
-                  enforceToolChoiceFence(currentToolChoice as any, toolSurfaceFence);
+                  currentToolChoice = enforceToolChoiceFence(
+                    currentToolChoice as any,
+                    toolSurfaceFence,
+                    replacementVisibleToolNames,
+                  ) as ToolChoice<ToolSet> | undefined;
                 }
               } catch (error) {
                 // Handle TripWire from processInputStep — emit tripwire chunk and
@@ -655,6 +707,36 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                 logger?.error?.('Error in processLLMRequest processors:', error);
                 throw error;
               }
+            }
+
+            // processLLMRequest runs after processInputStep and may share the
+            // same processor instance. Re-check the already-plain surface at
+            // the last processor boundary so a retained reference cannot
+            // mutate a registered executable between initial materialization
+            // and the provider request.
+            if (reconstructibleToolSurface) {
+              if (processorSelectedTools && processorToolSurfaceView) {
+                enforceReconstructibleToolSurface(
+                  processorSelectedTools,
+                  reconstructibleToolSurface,
+                  processorToolSurfaceView.fence,
+                );
+              }
+              currentTools = enforceReconstructibleToolSurface(
+                currentTools as unknown as Record<string, unknown>,
+                reconstructibleToolSurface,
+              ) as ToolSet;
+              const reconstructibleVisibleToolNames = Object.keys(currentTools);
+              currentActiveTools = enforceActiveToolsFence(
+                currentActiveTools,
+                reconstructibleToolSurface,
+                reconstructibleVisibleToolNames,
+              );
+              currentToolChoice = enforceToolChoiceFence(
+                currentToolChoice as any,
+                reconstructibleToolSurface,
+                reconstructibleVisibleToolNames,
+              ) as ToolChoice<ToolSet> | undefined;
             }
 
             // Enable defer mode - step-finish won't auto-close the step span

@@ -1333,7 +1333,11 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
               toolSurfaceFence,
               Object.keys(currentStep.tools ?? {}),
             ) as typeof currentStep.activeTools;
-            enforceToolChoiceFence(currentStep.toolChoice as any, toolSurfaceFence);
+            currentStep.toolChoice = enforceToolChoiceFence(
+              currentStep.toolChoice as any,
+              toolSurfaceFence,
+              Object.keys(currentStep.tools ?? {}),
+            ) as typeof currentStep.toolChoice;
           }
 
           // §4.2e PRE-EXPOSURE gate: when a session threads a per-tool permission
