@@ -98,3 +98,37 @@ export function createToolRecoveryFingerprint(value: unknown): string {
     .update(stableStringify(normalizeRecoveryValue(value, new Map(), '$tool')))
     .digest('hex');
 }
+
+/** Install cold-recovery metadata without charging every ordinary tool construction for it. */
+export function defineLazyToolRecoveryFingerprint(target: object, compute: () => string): void {
+  let cachedFingerprint: string | undefined;
+  let resolved = false;
+  const install = (fingerprint: string) => {
+    cachedFingerprint = fingerprint;
+    resolved = true;
+    if (Object.getOwnPropertyDescriptor(target, 'recoveryFingerprint')?.configurable) {
+      Object.defineProperty(target, 'recoveryFingerprint', {
+        configurable: true,
+        enumerable: true,
+        value: fingerprint,
+        writable: true,
+      });
+    }
+  };
+  Object.defineProperty(target, 'recoveryFingerprint', {
+    configurable: true,
+    enumerable: true,
+    get() {
+      if (resolved) return cachedFingerprint!;
+      const fingerprint = compute();
+      install(fingerprint);
+      return fingerprint;
+    },
+    set(fingerprint: string) {
+      if (Object.isFrozen(target)) {
+        throw new TypeError('Cannot assign to read only property recoveryFingerprint');
+      }
+      install(fingerprint);
+    },
+  });
+}

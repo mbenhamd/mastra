@@ -7,7 +7,7 @@
 
 import type { LanguageModelV2 } from '@ai-sdk/provider-v5';
 import { MockLanguageModelV2, convertArrayToReadableStream } from '@internal/ai-sdk-v5/test';
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { z } from 'zod';
 import { EventEmitterPubSub } from '../../../events/event-emitter';
 import { createTool } from '../../../tools';
@@ -271,6 +271,37 @@ describe('DurableAgent tool registration', () => {
         metadata: { key: 'foo', value: 123 },
       },
     });
+  });
+
+  it('rejects runtime-only tool identity before durable execution starts', async () => {
+    class RuntimeOnlyPolicy extends RegExp {
+      override test(value: string): boolean {
+        return value.startsWith('internal:') && super.test(value);
+      }
+    }
+
+    const doStream = vi.fn();
+    const execute = vi.fn();
+    const runtimeOnlyTool = createTool({
+      id: 'runtime-only-tool',
+      description: 'Uses configuration that cannot be recovered durably.',
+      providerOptions: { policy: new RuntimeOnlyPolicy('reports', 'u') } as any,
+      execute,
+    });
+    const baseAgent = new Agent({
+      id: 'runtime-only-tool-agent',
+      name: 'Runtime-only Tool Agent',
+      instructions: 'Use tools',
+      model: new MockLanguageModelV2({ doStream }) as LanguageModelV2,
+      tools: { runtimeOnlyTool },
+    });
+    const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+    await expect(durableAgent.prepare('Run the tool')).rejects.toThrow(
+      'Cannot create a durable recovery fingerprint for RegExp subclass',
+    );
+    expect(doStream).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
   });
 });
 
