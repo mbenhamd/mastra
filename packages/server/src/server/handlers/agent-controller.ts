@@ -1270,7 +1270,7 @@ export const GET_AGENT_CONTROLLER_GOAL_ROUTE = createRoute({
       const threadId = session.thread.getId();
       if (!threadId) return { goal: undefined };
       const agent = getAgentForSession(controller, session);
-      const record = await agent.getObjective({ threadId });
+      const record = await agent.getObjective({ resourceId: session.identity.getResourceId(), threadId });
       return { goal: record ?? undefined };
     } catch (error) {
       return handleError(error, 'error reading controller goal');
@@ -1333,6 +1333,7 @@ export const UPDATE_AGENT_CONTROLLER_GOAL_ROUTE = createRoute({
       if (!threadId) throw new HTTPException(400, { message: 'session has no active thread' });
       const agent = getAgentForSession(controller, session);
       const record = await agent.updateObjectiveOptions({
+        resourceId: session.identity.getResourceId(),
         threadId,
         ...(judgeModelId !== undefined ? { judgeModelId } : {}),
         ...(maxRuns !== undefined ? { maxRuns } : {}),
@@ -1364,7 +1365,7 @@ export const CLEAR_AGENT_CONTROLLER_GOAL_ROUTE = createRoute({
       const threadId = session.thread.getId();
       if (!threadId) throw new HTTPException(400, { message: 'session has no active thread' });
       const agent = getAgentForSession(controller, session);
-      await agent.clearObjective({ threadId });
+      await agent.clearObjective({ resourceId: session.identity.getResourceId(), threadId });
       return { ok: true };
     } catch (error) {
       return handleError(error, 'error clearing controller goal');

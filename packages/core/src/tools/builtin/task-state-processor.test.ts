@@ -10,6 +10,7 @@ import { TASKS_REQUEST_CONTEXT_KEY, TASK_STATE_TYPE } from './task-tools';
 import type { TaskItemSnapshot } from './task-tools';
 
 const THREAD_ID = 'thread-1';
+const RESOURCE_ID = 'resource-1';
 
 const TASKS: TaskItemSnapshot[] = [
   { id: 'a', content: 'Task A', status: 'in_progress', activeForm: 'Doing A' },
@@ -34,7 +35,14 @@ async function createProcessor(storeTasks?: TaskItemSnapshot[]) {
   const storage = new InMemoryStore();
   const mastra = new Mastra({ storage, logger: false });
   const threadStateStore = await storage.getStore('threadState');
-  if (storeTasks) await threadStateStore!.setState({ threadId: THREAD_ID, type: TASK_STATE_TYPE, value: storeTasks });
+  if (storeTasks) {
+    await threadStateStore!.setState({
+      resourceId: RESOURCE_ID,
+      threadId: THREAD_ID,
+      type: TASK_STATE_TYPE,
+      value: storeTasks,
+    });
+  }
   const processor = new TaskStateProcessor();
   processor.__registerMastra(mastra as any);
   return { processor, storage };
@@ -52,7 +60,7 @@ function createArgs(options: {
   }
   return {
     threadId: THREAD_ID,
-    resourceId: 'resource-1',
+    resourceId: RESOURCE_ID,
     messages: [],
     requestContext,
     contextWindow: { hasSnapshot: options.hasSnapshot ?? true },

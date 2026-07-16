@@ -1,4 +1,5 @@
-import { ThreadStateStorage } from './base';
+import { encodeThreadStateScope, ThreadStateStorage } from './base';
+import type { ThreadStateKey } from './base';
 
 function clone<T>(value: T): T {
   return value === undefined ? value : (structuredClone(value) as T);
@@ -7,9 +8,9 @@ function clone<T>(value: T): T {
 /**
  * In-memory implementation of {@link ThreadStateStorage}.
  *
- * Holds each thread's state in a `Map<threadId, Map<type, value>>`. Stored
- * values are cloned on read and write so callers cannot mutate the backing
- * value.
+ * Holds each resource/thread scope in a `Map<scope, Map<type, value>>`.
+ * Stored values are cloned on read and write so callers cannot mutate the
+ * backing value.
  *
  * This is the default thread-state store wired by the composite store: task
  * tracking works out of the box without a configured backend. It is **not**
@@ -17,34 +18,36 @@ function clone<T>(value: T): T {
  * `@mastra/libsql`) for state that must survive a restart.
  */
 export class InMemoryThreadStateStorage extends ThreadStateStorage {
-  private readonly stateByThread = new Map<string, Map<string, unknown>>();
+  private readonly stateByScope = new Map<string, Map<string, unknown>>();
 
   async init(): Promise<void> {
     // No-op for in-memory store.
   }
 
-  async getState<T = unknown>({ threadId, type }: { threadId: string; type: string }): Promise<T | undefined> {
-    const value = this.stateByThread.get(threadId)?.get(type);
+  async getState<T = unknown>(args: ThreadStateKey): Promise<T | undefined> {
+    const value = this.stateByScope.get(encodeThreadStateScope(args))?.get(args.type);
     return value === undefined ? undefined : clone(value as T);
   }
 
-  async setState<T = unknown>({ threadId, type, value }: { threadId: string; type: string; value: T }): Promise<void> {
-    let byType = this.stateByThread.get(threadId);
+  async setState<T = unknown>(args: ThreadStateKey & { value: T }): Promise<void> {
+    const scope = encodeThreadStateScope(args);
+    let byType = this.stateByScope.get(scope);
     if (!byType) {
       byType = new Map<string, unknown>();
-      this.stateByThread.set(threadId, byType);
+      this.stateByScope.set(scope, byType);
     }
-    byType.set(type, clone(value));
+    byType.set(args.type, clone(args.value));
   }
 
-  async deleteState({ threadId, type }: { threadId: string; type: string }): Promise<void> {
-    const byType = this.stateByThread.get(threadId);
+  async deleteState(args: ThreadStateKey): Promise<void> {
+    const scope = encodeThreadStateScope(args);
+    const byType = this.stateByScope.get(scope);
     if (!byType) return;
-    byType.delete(type);
-    if (byType.size === 0) this.stateByThread.delete(threadId);
+    byType.delete(args.type);
+    if (byType.size === 0) this.stateByScope.delete(scope);
   }
 
   async dangerouslyClearAll(): Promise<void> {
-    this.stateByThread.clear();
+    this.stateByScope.clear();
   }
 }

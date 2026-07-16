@@ -288,7 +288,7 @@ describe('DurableAgent goal step', () => {
     });
 
     // Verify objective is marked as done
-    const record = await durableAgent.getObjective({ threadId: THREAD });
+    const record = await durableAgent.getObjective({ threadId: THREAD, resourceId: RESOURCE });
     expect(record?.status).toBe('done');
     expect(record?.runsUsed).toBe(1);
   });
@@ -424,7 +424,7 @@ describe('DurableAgent goal step', () => {
     });
 
     // Objective should be paused
-    const record = await durableAgent.getObjective({ threadId: THREAD });
+    const record = await durableAgent.getObjective({ threadId: THREAD, resourceId: RESOURCE });
     expect(record?.status).toBe('paused');
   });
 });

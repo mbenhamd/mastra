@@ -9,6 +9,7 @@ import { GOAL_REQUEST_CONTEXT_KEY, GOAL_STATE_TYPE } from './objective';
 import { GoalStateProcessor } from './state-processor';
 
 const THREAD_ID = 'thread-1';
+const RESOURCE_ID = 'resource-1';
 
 function objective(overrides: Partial<GoalObjectiveRecord> = {}): GoalObjectiveRecord {
   return {
@@ -26,7 +27,9 @@ async function createProcessor(stored?: GoalObjectiveRecord) {
   const storage = new InMemoryStore();
   const mastra = new Mastra({ storage, logger: false });
   const store = await storage.getStore('threadState');
-  if (stored) await store!.setState({ threadId: THREAD_ID, type: GOAL_STATE_TYPE, value: stored });
+  if (stored) {
+    await store!.setState({ resourceId: RESOURCE_ID, threadId: THREAD_ID, type: GOAL_STATE_TYPE, value: stored });
+  }
   const processor = new GoalStateProcessor();
   processor.__registerMastra(mastra as any);
   return { processor, storage };
@@ -47,7 +50,7 @@ function createArgs(options: {
   }
   return {
     threadId: THREAD_ID,
-    resourceId: 'resource-1',
+    resourceId: RESOURCE_ID,
     messages: [],
     requestContext,
     contextWindow: { hasSnapshot: options.hasSnapshot ?? true },

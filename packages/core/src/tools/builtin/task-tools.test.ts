@@ -16,6 +16,7 @@ import type { TaskItem, TaskItemSnapshot } from './task-tools';
 type TaskInput = { id?: string; content: string; status: TaskItem['status']; activeForm: string };
 
 const THREAD_ID = 'thread-1';
+const RESOURCE_ID = 'resource-1';
 
 /**
  * Build a tool execution context for the agnostic task tools.
@@ -29,6 +30,7 @@ function createToolContext(
   initialTasks: TaskInput[] = [],
   options: {
     memory?: boolean;
+    threadState?: boolean;
     onEvent?: (event: { type: 'task_updated'; tasks: TaskItemSnapshot[] }) => void;
     bridge?: 'harness' | 'controller';
   } = {},
@@ -37,7 +39,12 @@ function createToolContext(
   const requestContext = new RequestContext();
   const store = new InMemoryThreadStateStorage();
   if (initialTasks.length > 0) {
-    void store.setState({ threadId: THREAD_ID, type: TASK_STATE_TYPE, value: assignTaskIds(initialTasks) });
+    void store.setState({
+      resourceId: RESOURCE_ID,
+      threadId: THREAD_ID,
+      type: TASK_STATE_TYPE,
+      value: assignTaskIds(initialTasks),
+    });
   }
   if (options.onEvent) {
     requestContext.set(options.bridge ?? 'harness', { emitEvent: options.onEvent });
@@ -45,16 +52,18 @@ function createToolContext(
 
   const mastra = {
     getStorage: () => ({
-      getStore: (name: string) => (name === 'threadState' ? store : undefined),
+      getStore: (name: string) => (name === 'threadState' && options.threadState !== false ? store : undefined),
     }),
   };
 
   return {
     requestContext,
-    agent: memory ? { threadId: THREAD_ID, resourceId: 'resource-1' } : {},
+    agent: memory ? { threadId: THREAD_ID, resourceId: RESOURCE_ID } : {},
     mastra,
     getTasks: () =>
-      store.getState<TaskItemSnapshot[]>({ threadId: THREAD_ID, type: TASK_STATE_TYPE }).then(t => t ?? []),
+      store
+        .getState<TaskItemSnapshot[]>({ resourceId: RESOURCE_ID, threadId: THREAD_ID, type: TASK_STATE_TYPE })
+        .then(t => t ?? []),
   };
 }
 
@@ -80,6 +89,15 @@ describe('task tools require memory', () => {
     expect(result.content).toContain('require agent memory');
     expect(result.summary).toMatchObject({ total: 0, hasTasks: false, allCompleted: false });
     expect(result.incompleteTasks).toEqual([]);
+  });
+
+  it('task_check fails closed when thread-state storage is unavailable', async () => {
+    const ctx = createToolContext([], { threadState: false });
+    const result = await (taskCheckTool as any).execute({}, ctx);
+
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain('require agent memory');
+    expect(result.summary).toMatchObject({ total: 0, hasTasks: false, allCompleted: false });
   });
 });
 
@@ -237,6 +255,25 @@ describe('taskUpdateTool', () => {
     expect(await ctx.getTasks()).toEqual([
       { id: 'a', content: 'Task A', status: 'pending', activeForm: 'Doing A' },
       { id: 'b', content: 'Task B', status: 'in_progress', activeForm: 'Doing B' },
+    ]);
+  });
+
+  it('does not lose accepted updates from concurrent tool calls', async () => {
+    const ctx = createToolContext([
+      { id: 'a', content: 'Task A', status: 'pending', activeForm: 'Doing A' },
+      { id: 'b', content: 'Task B', status: 'pending', activeForm: 'Doing B' },
+    ]);
+
+    const [first, second] = await Promise.all([
+      (taskUpdateTool as any).execute({ id: 'a', content: 'Task A updated' }, ctx),
+      (taskUpdateTool as any).execute({ id: 'b', content: 'Task B updated' }, ctx),
+    ]);
+
+    expect(first.isError).toBe(false);
+    expect(second.isError).toBe(false);
+    expect(await ctx.getTasks()).toEqual([
+      { id: 'a', content: 'Task A updated', status: 'pending', activeForm: 'Doing A' },
+      { id: 'b', content: 'Task B updated', status: 'pending', activeForm: 'Doing B' },
     ]);
   });
 });

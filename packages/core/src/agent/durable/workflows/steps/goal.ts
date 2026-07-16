@@ -7,20 +7,19 @@ import { runStreamCompletionScorers } from '../../../../loop/network/validation'
 import type { StreamCompletionContext } from '../../../../loop/network/validation';
 import { createProcessorSendSignal } from '../../../../processors/send-signal';
 import { RequestContext } from '../../../../request-context';
-import type { GoalObjectiveRecord } from '../../../../storage/domains/thread-state/base';
 import type { ChunkType, GoalEvaluationActivity } from '../../../../stream/types';
 import { ChunkFrom } from '../../../../stream/types';
 import { PUBSUB_SYMBOL } from '../../../../workflows/constants';
 import { createStep } from '../../../../workflows/workflow';
 import type { ResolvedGoalStore } from '../../../goal';
 import {
+  commitGoalEvaluation,
   createGoalScorer,
   GOAL_SCORE_WAITING,
   GOAL_SCORER_ID,
   readObjective,
   resolveEffectiveGoalSettings,
   resolveGoalStore,
-  writeObjective,
 } from '../../../goal';
 import { MessageList } from '../../../message-list';
 import type { ToolsInput } from '../../../types';
@@ -166,6 +165,7 @@ export function createDurableGoalStep() {
       }
 
       const threadId = initData.state?.threadId;
+      const resourceId = initData.state?.resourceId;
 
       // Reconstruct requestContext from serialized entries for resolvers.
       const requestContext = new RequestContext();
@@ -176,19 +176,20 @@ export function createDurableGoalStep() {
       }
 
       const store = (await resolveGoalStore(mastra as any)) as ResolvedGoalStore | undefined;
-      const record = await readObjective(store, threadId);
+      const record = await readObjective(store, resourceId, threadId);
 
       // No active objective → no gating, no chunk.
       if (!record || record.status !== 'active' || !store || !threadId) {
         return state;
       }
 
-      const effective = resolveEffectiveGoalSettings(record, {
+      const agentDefaults = {
         judgeModelId: typeof goalConfig.judge === 'string' ? goalConfig.judge : undefined,
         maxRuns: goalConfig.maxRuns,
         prompt: goalConfig.prompt,
         maxSteps: goalConfig.maxSteps,
-      });
+      };
+      const effective = resolveEffectiveGoalSettings(record, agentDefaults);
 
       // Defensive budget guard.
       const nextState: typeof state = { ...state };
@@ -417,29 +418,38 @@ export function createDurableGoalStep() {
         !result.complete &&
         result.scorers.some(s => s.scorerId === GOAL_SCORER_ID && s.score === GOAL_SCORE_WAITING);
 
-      // Increment runs and update status.
-      const runsUsed = record.runsUsed + 1;
-      const maxRunsReached = runsUsed >= effective.maxRuns;
-      let status: GoalObjectiveRecord['status'] = record.status;
-      let pausedReason: string | undefined;
-      if (judgeFailed) {
-        status = 'paused';
-        pausedReason = erroredScorer?.reason ?? 'The goal judge failed to evaluate the objective.';
-      } else if (result.complete) {
-        status = 'done';
-      } else if (maxRunsReached && !waiting) {
-        status = 'paused';
-        pausedReason = `Ran out of evaluation budget (${effective.maxRuns} runs) before reaching the goal — raise maxRuns to resume.`;
-      }
+      // Increment runs and update status, atomically against the record as it
+      // stands now. `record` above was read *before* the judge call awaited, so
+      // it may be stale: a user pause/clear (TUI `/goal`) or another worker
+      // resuming this run can have written the slot meanwhile.
+      const commit = await commitGoalEvaluation({
+        store,
+        resourceId,
+        threadId,
+        requestContext,
+        evaluated: record,
+        agentDefaults,
+        decision: {
+          judgeFailed,
+          judgeFailureReason: erroredScorer?.reason,
+          complete: result.complete,
+          waiting,
+        },
+      });
 
-      const updated: GoalObjectiveRecord = {
-        ...record,
-        runsUsed,
-        status,
-        pausedReason: status === 'paused' ? pausedReason : undefined,
-        updatedAt: Date.now(),
-      };
-      await writeObjective(store, threadId, updated, requestContext);
+      // A concurrent writer owns the objective now, so this verdict was dropped
+      // rather than clobbering them. Whatever they decided (paused, cleared,
+      // already judged) means this step must not force another iteration.
+      if (!commit?.applied) {
+        if (nextState.lastStepResult) {
+          nextState.lastStepResult = {
+            ...nextState.lastStepResult,
+            isContinued: false,
+          };
+        }
+        return nextState;
+      }
+      const { runsUsed, maxRunsReached, status, pausedReason } = commit;
 
       // Continuation decision.
       const shouldContinue = !result.complete && !waiting && !judgeFailed && !maxRunsReached;
@@ -454,7 +464,7 @@ export function createDurableGoalStep() {
       const goalEvaluationPayload = {
         objective: record.objective,
         iteration: runsUsed,
-        maxRuns: effective.maxRuns,
+        maxRuns: commit.maxRuns,
         passed: result.complete,
         status,
         pausedReason,
@@ -491,8 +501,8 @@ export function createDurableGoalStep() {
 
       const feedback = result.completionReason ?? 'The goal is not yet complete.';
       const continuation = shouldContinue
-        ? `[Goal attempt ${runsUsed}/${effective.maxRuns}] The goal is not yet complete. Judge feedback: ${feedback}\n\nContinue working toward the goal: ${record.objective}`
-        : `${status} (${runsUsed}/${effective.maxRuns})\n${goalEvaluationPayload.reason ?? ''}`;
+        ? `[Goal attempt ${runsUsed}/${commit.maxRuns}] The goal is not yet complete. Judge feedback: ${feedback}\n\nContinue working toward the goal: ${record.objective}`
+        : `${status} (${runsUsed}/${commit.maxRuns})\n${goalEvaluationPayload.reason ?? ''}`;
       await sendSignal({
         type: 'system-reminder',
         contents: continuation,

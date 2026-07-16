@@ -1,6 +1,6 @@
 import type { MastraUnion } from '../../action';
 import type { RequestContext } from '../../request-context';
-import type { GoalObjectiveRecord } from '../../storage/domains/thread-state/base';
+import type { GoalObjectiveRecord, ThreadStateMutation } from '../../storage/domains/thread-state/base';
 
 // =============================================================================
 // Goal objective: durable thread state + state-signal projection
@@ -114,9 +114,15 @@ export function resolveEffectiveGoalSettings(
  * silently passing the duck-typed `isThreadStateStore` guard.
  */
 export type ResolvedGoalStore = {
-  getState<T = unknown>(args: { threadId: string; type: string }): Promise<T | undefined>;
-  setState(args: { threadId: string; type: string; value: GoalObjectiveRecord }): Promise<void>;
-  deleteState(args: { threadId: string; type: string }): Promise<void>;
+  getState<T = unknown>(args: { resourceId: string; threadId: string; type: string }): Promise<T | undefined>;
+  setState(args: { resourceId: string; threadId: string; type: string; value: GoalObjectiveRecord }): Promise<void>;
+  deleteState(args: { resourceId: string; threadId: string; type: string }): Promise<void>;
+  mutateState<T = unknown, TResult = void>(args: {
+    resourceId: string;
+    threadId: string;
+    type: string;
+    mutate: (current: T | undefined) => ThreadStateMutation<T, TResult>;
+  }): Promise<TResult>;
 };
 
 function isThreadStateStore(value: unknown): value is ResolvedGoalStore {
@@ -124,7 +130,8 @@ function isThreadStateStore(value: unknown): value is ResolvedGoalStore {
     !!value &&
     typeof (value as ResolvedGoalStore).getState === 'function' &&
     typeof (value as ResolvedGoalStore).setState === 'function' &&
-    typeof (value as ResolvedGoalStore).deleteState === 'function'
+    typeof (value as ResolvedGoalStore).deleteState === 'function' &&
+    typeof (value as ResolvedGoalStore).mutateState === 'function'
   );
 }
 
@@ -141,10 +148,11 @@ export async function resolveGoalStore(mastra: MastraUnion | undefined): Promise
 /** Read the current objective record for a thread from the store. */
 export async function readObjective(
   store: ResolvedGoalStore | undefined,
+  resourceId: string | undefined,
   threadId: string | undefined,
 ): Promise<GoalObjectiveRecord | undefined> {
-  if (!store || !threadId) return undefined;
-  return store.getState<GoalObjectiveRecord>({ threadId, type: GOAL_STATE_TYPE });
+  if (!store || !resourceId || !threadId) return undefined;
+  return store.getState<GoalObjectiveRecord>({ resourceId, threadId, type: GOAL_STATE_TYPE });
 }
 
 /**
@@ -153,24 +161,218 @@ export async function readObjective(
  */
 export async function writeObjective(
   store: ResolvedGoalStore | undefined,
+  resourceId: string | undefined,
   threadId: string | undefined,
   record: GoalObjectiveRecord,
   requestContext?: RequestContext,
 ): Promise<void> {
-  if (!store || !threadId) return;
-  await store.setState({ threadId, type: GOAL_STATE_TYPE, value: record });
+  if (!store || !resourceId || !threadId) return;
+  // Use the mutation lane even for full replacement so this write is ordered
+  // with a goal verdict that may currently be committing in another turn.
+  await store.mutateState<GoalObjectiveRecord, void>({
+    resourceId,
+    threadId,
+    type: GOAL_STATE_TYPE,
+    mutate: () => ({ operation: 'set', value: record, result: undefined }),
+  });
   requestContext?.set(GOAL_REQUEST_CONTEXT_KEY, record);
 }
 
 /** Drop the objective for a thread. */
 export async function clearObjective(
   store: ResolvedGoalStore | undefined,
+  resourceId: string | undefined,
   threadId: string | undefined,
   requestContext?: RequestContext,
 ): Promise<void> {
-  if (!store || !threadId) return;
-  await store.deleteState({ threadId, type: GOAL_STATE_TYPE });
+  if (!store || !resourceId || !threadId) return;
+  // Clear through the same lane as verdict commits. Otherwise the base
+  // in-memory implementation can read the old objective, yield, observe this
+  // deletion, and then resurrect the old record with its verdict.
+  await store.mutateState<GoalObjectiveRecord, void>({
+    resourceId,
+    threadId,
+    type: GOAL_STATE_TYPE,
+    mutate: () => ({ operation: 'delete', result: undefined }),
+  });
   requestContext?.set(GOAL_REQUEST_CONTEXT_KEY, undefined);
+}
+
+// -----------------------------------------------------------------------------
+// Atomic objective mutation
+// -----------------------------------------------------------------------------
+//
+// `readObjective` + `writeObjective` is a read-modify-write. It is safe only
+// when nothing else can touch the slot in between. Every caller that derives its
+// next record from the current one (the goal steps, which read, then `await` a
+// judge model call, then write; `updateObjectiveOptions`, which reads, merges,
+// then writes) must instead decide inside `mutateState`, where the adapter
+// serializes the read and the write against other writers.
+
+/** What an objective mutator decided to do with the slot it was handed. */
+export type ObjectiveMutation<TResult> =
+  | { operation: 'set'; value: GoalObjectiveRecord; result: TResult }
+  | { operation: 'keep'; result: TResult };
+
+/**
+ * Atomically read-modify-write the objective slot.
+ *
+ * `mutate` receives the record as it stands *inside* the store's lock, so it
+ * must derive its new record from that argument and never from an earlier read.
+ * It is synchronous (and may be re-invoked by adapters that retry on conflict),
+ * so it must stay deterministic and side-effect free — no model calls, no I/O.
+ */
+export async function mutateObjective<TResult extends { record: GoalObjectiveRecord | undefined }>(
+  store: ResolvedGoalStore | undefined,
+  resourceId: string | undefined,
+  threadId: string | undefined,
+  mutate: (current: GoalObjectiveRecord | undefined) => ObjectiveMutation<TResult>,
+  requestContext?: RequestContext,
+): Promise<TResult | undefined> {
+  if (!store || !resourceId || !threadId) return undefined;
+  const result = await store.mutateState<GoalObjectiveRecord, TResult>({
+    resourceId,
+    threadId,
+    type: GOAL_STATE_TYPE,
+    mutate,
+  });
+  requestContext?.set(GOAL_REQUEST_CONTEXT_KEY, result.record);
+  return result;
+}
+
+/** The judge's verdict for one goal evaluation, as the loop steps compute it. */
+export interface GoalJudgeDecision {
+  judgeFailed: boolean;
+  judgeFailureReason?: string;
+  complete: boolean;
+  waiting: boolean;
+}
+
+/** Outcome of committing a judge verdict to the durable objective. */
+export interface GoalEvaluationCommit {
+  /**
+   * `false` when the verdict was discarded because a concurrent writer owned the
+   * slot. The caller must not treat the evaluation as having happened: stop the
+   * auto-loop and leave the objective to whoever changed it.
+   */
+  applied: boolean;
+  /** The record as it now stands, whether this commit wrote it or not. */
+  record: GoalObjectiveRecord | undefined;
+  runsUsed: number;
+  maxRuns: number;
+  maxRunsReached: boolean;
+  status: GoalObjectiveRecord['status'];
+  pausedReason: string | undefined;
+}
+
+/**
+ * Identity of the objective a verdict belongs to. A `setObjective` mid-judge
+ * replaces the record (new `id`) while leaving it `active`, so the status gate
+ * alone would let the previous objective's verdict land on the new one.
+ */
+function isSameObjective(a: GoalObjectiveRecord, b: GoalObjectiveRecord): boolean {
+  if (a.id !== undefined && b.id !== undefined) return a.id === b.id;
+  return a.objective === b.objective && a.startedAt === b.startedAt;
+}
+
+/**
+ * Commit one judge verdict to the durable objective, atomically.
+ *
+ * The budget increment and the status transition are derived from the record as
+ * it stands at write time, not from the pre-judge read the verdict was computed
+ * against — the judge call between them is an `await`, during which a user can
+ * pause or clear the objective (TUI `/goal`), or a second worker resuming the
+ * same run can land its own evaluation. Those writers are strictly fresher, so
+ * they win: the verdict is dropped (`applied: false`) rather than clobbering
+ * them back to a stale `active`/`runsUsed`.
+ */
+export async function commitGoalEvaluation(args: {
+  store: ResolvedGoalStore | undefined;
+  resourceId: string | undefined;
+  threadId: string | undefined;
+  requestContext?: RequestContext;
+  /** The record the judge actually evaluated (this step's pre-judge read). */
+  evaluated: GoalObjectiveRecord;
+  agentDefaults: AgentGoalConfigDefaults | undefined;
+  decision: GoalJudgeDecision;
+}): Promise<GoalEvaluationCommit | undefined> {
+  const { store, resourceId, threadId, requestContext, evaluated, agentDefaults, decision } = args;
+  // Resolved out here: `mutate` must be deterministic across retries.
+  const now = Date.now();
+
+  return mutateObjective<GoalEvaluationCommit>(
+    store,
+    resourceId,
+    threadId,
+    current => {
+      if (!current || current.status !== 'active' || !isSameObjective(current, evaluated)) {
+        return {
+          operation: 'keep',
+          result: {
+            applied: false,
+            record: current,
+            runsUsed: current?.runsUsed ?? evaluated.runsUsed,
+            maxRuns: resolveEffectiveGoalSettings(current ?? evaluated, agentDefaults).maxRuns,
+            maxRunsReached: false,
+            status: current?.status ?? evaluated.status,
+            pausedReason: current?.pausedReason,
+          },
+        };
+      }
+
+      // Budget is resolved from the live record too: a concurrent
+      // `updateObjectiveOptions` may have raised `maxRuns` to keep the goal
+      // going, and parking it on the stale budget would undo exactly that.
+      const effective = resolveEffectiveGoalSettings(current, agentDefaults);
+      const runsUsed = current.runsUsed + 1;
+      const maxRunsReached = runsUsed >= effective.maxRuns;
+
+      // Precedence: judge failure → paused; complete → done; budget exhausted →
+      // paused. A "waiting" decision does NOT change the persisted status — the
+      // record stays `active` so the next agent turn is still judged; only
+      // `isContinued` is set to false (by the caller) to stop the auto-loop and
+      // give the user a chance to provide input.
+      let status: GoalObjectiveRecord['status'] = current.status;
+      let pausedReason: string | undefined;
+      if (decision.judgeFailed) {
+        status = 'paused';
+        pausedReason = decision.judgeFailureReason ?? 'The goal judge failed to evaluate the objective.';
+      } else if (decision.complete) {
+        status = 'done';
+      } else if (maxRunsReached && !decision.waiting) {
+        // Budget exhausted without reaching the goal: park it (visibly) instead
+        // of leaving it `active` but stuck. Raising maxRuns + setting status
+        // back to `active` (updateObjectiveOptions) resumes evaluation.
+        status = 'paused';
+        pausedReason = `Ran out of evaluation budget (${effective.maxRuns} runs) before reaching the goal — raise maxRuns to resume.`;
+      }
+
+      const value: GoalObjectiveRecord = {
+        ...current,
+        runsUsed,
+        status,
+        // Only persist a pause reason while parked; clear it otherwise so a
+        // resumed/continuing objective does not carry a stale reason.
+        pausedReason: status === 'paused' ? pausedReason : undefined,
+        updatedAt: now,
+      };
+
+      return {
+        operation: 'set',
+        value,
+        result: {
+          applied: true,
+          record: value,
+          runsUsed,
+          maxRuns: effective.maxRuns,
+          maxRunsReached,
+          status,
+          pausedReason,
+        },
+      };
+    },
+    requestContext,
+  );
 }
 
 function isGoalObjectiveRecord(value: unknown): value is GoalObjectiveRecord {
