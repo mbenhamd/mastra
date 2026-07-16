@@ -291,16 +291,23 @@ describe('goal step waiting semantics', () => {
   });
 
   it('falls back to the objective judge when a dynamic judge resolver returns undefined', async () => {
-    const fallbackJudge = createMockModel({
-      objectGenerationMode: 'json',
-      mockText: { decision: 'done', reason: 'fallback judge resolved' },
-    });
-    const { record, chunk } = await runGoalStep('done', makeRecord({ judgeModelId: fallbackJudge as any }), {
-      undefinedJudgeResolver: true,
-    });
+    const streamSpy = vi.spyOn(Agent.prototype, 'stream').mockResolvedValue({
+      object: Promise.resolve({ decision: 'done', reason: 'fallback judge resolved' }),
+    } as any);
+    try {
+      const { record, chunk } = await runGoalStep('done', makeRecord({ judgeModelId: 'openai/gpt-5-mini' }), {
+        undefinedJudgeResolver: true,
+      });
 
-    expect(record.status).toBe('done');
-    expect(chunk.payload.reason).toBe('fallback judge resolved');
+      const judgeAgent = streamSpy.mock.instances[0] as Agent;
+      const judgeModel = await judgeAgent.getModel();
+      expect(judgeModel.provider).toBe('openai');
+      expect(judgeModel.modelId).toBe('gpt-5-mini');
+      expect(record.status).toBe('done');
+      expect(chunk.payload.reason).toBe('fallback judge resolved');
+    } finally {
+      streamSpy.mockRestore();
+    }
   });
 
   it('marks the objective done and stops the loop on a done decision', async () => {

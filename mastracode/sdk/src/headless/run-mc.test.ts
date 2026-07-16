@@ -189,6 +189,9 @@ function makeFakeGoalHarness(options: FakeGoalHarnessOptions = {}) {
     }),
     respondToToolApproval: vi.fn(),
     respondToToolSuspension: vi.fn().mockResolvedValue(undefined),
+    identity: {
+      getResourceId: vi.fn(() => 'resource-1'),
+    },
     model: {
       switch: vi.fn(() => options.modelSwitch ?? Promise.resolve()),
     },
@@ -229,6 +232,7 @@ function makeFakeGoalHarness(options: FakeGoalHarnessOptions = {}) {
     run,
     started,
     controller,
+    fakeAgent,
     session,
     unsubscribe,
     emit: (event: AgentControllerEvent) => listener?.(event),
@@ -408,6 +412,10 @@ describe('runMC', () => {
     it('settles an explicit abort exactly once without waiting for agent_end', async () => {
       const harness = makeFakeGoalHarness({ abortEvent: goalEvaluationEvent() });
       await harness.started;
+      expect(harness.fakeAgent.getObjective).toHaveBeenCalledWith({
+        resourceId: 'resource-1',
+        threadId: 'thread-1',
+      });
 
       harness.run.abort();
       const result = await harness.run.result;
