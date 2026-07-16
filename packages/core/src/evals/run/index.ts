@@ -851,6 +851,7 @@ function validateEvalsInputs(
         }
         if (Array.isArray(turn.scorers) && turn.scorers.length > 0) {
           hasAnyTurnAssertions = true;
+          const scorerConfigIndicesForItem = new Map<string, number>();
           let seenThresholdsForTurn = seenTurnScorerThresholds.get(t);
           if (!seenThresholdsForTurn) {
             seenThresholdsForTurn = new Map();
@@ -900,6 +901,27 @@ function validateEvalsInputs(
             if (!existing) {
               seenThresholdsForTurn.set(scorer.id, { threshold, dataIndex: i, scorerConfigIndex });
             }
+
+            const previousScorerConfigIndex = scorerConfigIndicesForItem.get(scorer.id);
+            if (previousScorerConfigIndex !== undefined) {
+              throw new MastraError({
+                domain: 'SCORER',
+                id: 'DUPLICATE_PER_TURN_SCORER',
+                category: 'USER',
+                text:
+                  `Per-turn scorer "${scorer.id}" is configured more than once at data item ${i}, turn index ${t}: ` +
+                  `scorer configurations ${previousScorerConfigIndex} and ${scorerConfigIndex}. ` +
+                  'Configure each scorer ID once per item/turn so every data item has equal aggregation weight.',
+                details: {
+                  dataIndex: i,
+                  turnIndex: t,
+                  scorerId: scorer.id,
+                  firstScorerConfigIndex: previousScorerConfigIndex,
+                  conflictingScorerConfigIndex: scorerConfigIndex,
+                },
+              });
+            }
+            scorerConfigIndicesForItem.set(scorer.id, scorerConfigIndex);
           }
         }
       }

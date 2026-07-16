@@ -1955,6 +1955,40 @@ describe('runEvals', () => {
       expect(scorer.run).not.toHaveBeenCalled();
     });
 
+    it('rejects homogeneous duplicate scorer IDs within one item and turn before execution', async () => {
+      const counter = { count: 0 };
+      const agent = createTurnAgent('duplicateTurnScorerAgent', counter);
+      const scorer = createMockScorer('duplicate-turn-scorer', 0.8);
+      const generateSpy = vi.spyOn(agent, 'generate');
+
+      await expect(
+        runEvals({
+          data: [
+            {
+              turns: [
+                {
+                  input: 'one item',
+                  scorers: [
+                    { scorer, threshold: 0.4 },
+                    { scorer, threshold: 0.4 },
+                  ],
+                },
+              ],
+            },
+          ],
+          target: agent,
+          concurrency: 2,
+        }),
+      ).rejects.toThrow(
+        'Per-turn scorer "duplicate-turn-scorer" is configured more than once at data item 0, turn index 0: ' +
+          'scorer configurations 0 and 1.',
+      );
+
+      expect(counter.count).toBe(0);
+      expect(generateSpy).not.toHaveBeenCalled();
+      expect(scorer.run).not.toHaveBeenCalled();
+    });
+
     it('rejects bare and threshold-bearing entries for one turn scorer before execution', async () => {
       const counter = { count: 0 };
       const agent = createTurnAgent('bareThresholdTurnAgent', counter);
