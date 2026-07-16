@@ -35,6 +35,7 @@ vi.mock('node:http', async () => {
 
 import type { OAuthCallbackServer } from './oauth-callback-server.js';
 import { createOAuthCallbackServer, getCallbackUrlCandidates } from './oauth-callback-server.js';
+import { hasSameLoopbackCallbackTarget } from './oauth-loopback.js';
 
 const STATE = 'expected-state';
 
@@ -42,11 +43,11 @@ const STATE = 'expected-state';
  * Finds a port that is currently free by binding an ephemeral port and
  * releasing it. Keeps tests independent of hardcoded port availability.
  */
-async function getFreePort(): Promise<number> {
+async function getFreePort(hostname = '127.0.0.1'): Promise<number> {
   return new Promise((resolve, reject) => {
     const probe = createServer();
     probe.once('error', reject);
-    probe.listen(0, '127.0.0.1', () => {
+    probe.listen(0, hostname, () => {
       const address = probe.address();
       if (!address || typeof address === 'string') {
         reject(new Error('Failed to probe for a free port'));
@@ -71,7 +72,11 @@ function closeServer(server: HttpServer): Promise<void> {
   });
 }
 
-function mockNextServerBinding(actualPort: number, portsInUse: number[] = []) {
+function mockNextServerBinding(
+  actualPort: number,
+  portsInUse: number[] = [],
+  address: { address: string; family: 'IPv4' | 'IPv6' } = { address: '127.0.0.1', family: 'IPv4' },
+) {
   const server = new EventEmitter() as unknown as HttpServer;
   const listen = vi.fn((port: number, _hostname: string) => {
     queueMicrotask(() => {
@@ -85,8 +90,9 @@ function mockNextServerBinding(actualPort: number, portsInUse: number[] = []) {
   });
 
   server.listen = listen as unknown as HttpServer['listen'];
-  server.address = vi.fn(() => ({ address: '127.0.0.1', family: 'IPv4', port: actualPort }));
+  server.address = vi.fn(() => ({ ...address, port: actualPort }));
   server.closeIdleConnections = vi.fn();
+  server.closeAllConnections = vi.fn();
   server.close = vi.fn((callback?: (error?: Error) => void) => {
     queueMicrotask(() => callback?.());
     return server;
@@ -132,17 +138,46 @@ describe('getCallbackUrlCandidates', () => {
     expect(candidates.map(url => Number(url.port))).toEqual([0]);
   });
 
+  it('normalizes verified IPv4 and IPv6 loopback literals', () => {
+    expect(getCallbackUrlCandidates('http://127.1:0/oauth/callback')[0]!.toString()).toBe(
+      'http://127.0.0.1:0/oauth/callback',
+    );
+    expect(getCallbackUrlCandidates('http://[0:0:0:0:0:0:0:1]:0/oauth/callback')[0]!.toString()).toBe(
+      'http://[::1]:0/oauth/callback',
+    );
+  });
+
   it.each(['https://127.0.0.1/oauth/callback', 'ftp://127.0.0.1/oauth/callback'])(
     'rejects a non-HTTP callback URL: %s',
     redirectUrl => {
-      expect(() => getCallbackUrlCandidates(redirectUrl)).toThrow(/must use HTTP and a loopback hostname/);
+      expect(() => getCallbackUrlCandidates(redirectUrl)).toThrow(/must use HTTP and a loopback IP literal/);
     },
   );
 
-  it('rejects a non-loopback HTTP callback URL', () => {
-    expect(() => getCallbackUrlCandidates('http://example.com/oauth/callback')).toThrow(
-      /must use HTTP and a loopback hostname/,
-    );
+  it.each(['http://localhost/oauth/callback', 'http://example.com/oauth/callback'])(
+    'rejects a hostname instead of resolving it: %s',
+    redirectUrl => {
+      expect(() => getCallbackUrlCandidates(redirectUrl)).toThrow(/must use HTTP and a loopback IP literal/);
+    },
+  );
+
+  it.each([
+    'http://user@127.0.0.1:5533/oauth/callback',
+    'http://user:secret@127.0.0.1:5533/oauth/callback',
+    'http://127.0.0.1:5533/oauth/callback#fragment',
+    'http://127.0.0.1:5533/oauth/callback#',
+  ])('rejects callback URL userinfo and fragments: %s', redirectUrl => {
+    expect(() => getCallbackUrlCandidates(redirectUrl)).toThrow(/without userinfo or a fragment/);
+  });
+
+  it('matches persisted ephemeral callbacks only when the port is the sole difference', () => {
+    const configured = 'http://127.0.0.1:0/oauth/callback?tenant=one';
+    const prior = 'http://127.0.0.1:43123/oauth/callback?tenant=one';
+
+    expect(hasSameLoopbackCallbackTarget(configured, prior)).toBe(true);
+    expect(hasSameLoopbackCallbackTarget(prior, 'http://127.0.0.2:43124/oauth/callback?tenant=one')).toBe(false);
+    expect(hasSameLoopbackCallbackTarget(prior, 'http://127.0.0.1:43124/other?tenant=one')).toBe(false);
+    expect(hasSameLoopbackCallbackTarget(prior, 'http://127.0.0.1:43124/oauth/callback?tenant=two')).toBe(false);
   });
 });
 
@@ -291,6 +326,19 @@ describe('createOAuthCallbackServer', () => {
     expect(callbackServer.url.toString()).toBe('http://127.0.0.1:43123/oauth/callback');
   });
 
+  it('binds a normalized IPv6 loopback literal without hostname resolution', async () => {
+    const { listen } = mockNextServerBinding(43123, [], { address: '::1', family: 'IPv6' });
+
+    callbackServer = await createOAuthCallbackServer({
+      redirectUrl: 'http://[0:0:0:0:0:0:0:1]:0/oauth/callback',
+      state: STATE,
+    });
+
+    expect(listen).toHaveBeenCalledWith(0, '::1');
+    expect(callbackServer.port).toBe(43123);
+    expect(callbackServer.url.toString()).toBe('http://[::1]:43123/oauth/callback');
+  });
+
   it('reconciles the returned URL with the actual server address port', async () => {
     const { listen } = mockNextServerBinding(60999);
 
@@ -308,28 +356,43 @@ describe('createOAuthCallbackServer', () => {
     'rejects a non-HTTP callback URL before creating a server: %s',
     async redirectUrl => {
       await expect(createOAuthCallbackServer({ redirectUrl, state: STATE })).rejects.toThrow(
-        /must use HTTP and a loopback hostname/,
+        /must use HTTP and a loopback IP literal/,
       );
       expect(createdServers).toHaveLength(0);
     },
   );
 
-  it('rejects a non-loopback callback URL before creating a server', async () => {
-    await expect(
-      createOAuthCallbackServer({ redirectUrl: 'http://example.com/oauth/callback', state: STATE }),
-    ).rejects.toThrow(/must use HTTP and a loopback hostname/);
+  it.each(['http://localhost/oauth/callback', 'http://example.com/oauth/callback'])(
+    'rejects a callback hostname before creating a server: %s',
+    async redirectUrl => {
+      await expect(createOAuthCallbackServer({ redirectUrl, state: STATE })).rejects.toThrow(
+        /must use HTTP and a loopback IP literal/,
+      );
+      expect(createdServers).toHaveLength(0);
+    },
+  );
+
+  it.each([
+    'http://user@127.0.0.1:5533/oauth/callback',
+    'http://127.0.0.1:5533/oauth/callback#fragment',
+    'http://127.0.0.1:5533/oauth/callback#',
+  ])('rejects callback URL userinfo or a fragment before creating a server: %s', async redirectUrl => {
+    await expect(createOAuthCallbackServer({ redirectUrl, state: STATE })).rejects.toThrow(
+      /without userinfo or a fragment/,
+    );
     expect(createdServers).toHaveLength(0);
   });
 
-  it('binds the hostname from the redirect URL', async () => {
-    const port = await getFreePort();
+  it('binds the IPv4 loopback literal from the redirect URL', async () => {
+    const hostname = '127.0.0.2';
+    const port = await getFreePort(hostname);
     callbackServer = await createOAuthCallbackServer({
-      redirectUrl: `http://localhost:${port}/oauth/callback`,
+      redirectUrl: `http://${hostname}:${port}/oauth/callback`,
       state: STATE,
     });
 
     const pending = callbackServer.waitForCode();
-    const response = await fetch(`http://localhost:${port}/oauth/callback?code=auth-code-123&state=${STATE}`);
+    const response = await fetch(`http://${hostname}:${port}/oauth/callback?code=auth-code-123&state=${STATE}`);
 
     expect(response.status).toBe(200);
     await expect(pending).resolves.toEqual({ code: 'auth-code-123', state: STATE });
@@ -366,6 +429,34 @@ describe('createOAuthCallbackServer', () => {
       // close() must not wait for the keep-alive socket's timeout to release
       // the port; without closeIdleConnections this close() hangs.
       await server.close();
+      callbackServer = undefined;
+
+      const reclaimed = await occupyPort(port);
+      await closeServer(reclaimed);
+    } finally {
+      socket.destroy();
+    }
+  });
+
+  it('bounds close when a peer leaves an active HTTP request incomplete', async () => {
+    const server = await startCallbackServer();
+    const { port } = server;
+    const socket = await new Promise<Socket>((resolve, reject) => {
+      const client = connect(port, '127.0.0.1', () => resolve(client));
+      client.once('error', reject);
+    });
+    socket.on('error', () => {});
+
+    try {
+      // Omit the terminating blank line so Node keeps this request active
+      // indefinitely rather than classifying the connection as idle.
+      socket.write(`GET /oauth/callback HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n`);
+
+      const closeResult = await Promise.race([
+        server.close().then(() => 'closed' as const),
+        new Promise<'timeout'>(resolve => setTimeout(() => resolve('timeout'), 1_000)),
+      ]);
+      expect(closeResult).toBe('closed');
       callbackServer = undefined;
 
       const reclaimed = await occupyPort(port);

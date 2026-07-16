@@ -2,4 +2,4 @@
 '@mastra/mcp': patch
 ---
 
-Fixed MCP OAuth callback servers to validate loopback HTTP URLs, bind default and ephemeral ports correctly, and report the actual callback URL.
+Fixed MCP OAuth callback servers to require loopback IP literals, preserve port-zero client identity during token refresh, bind default and ephemeral ports correctly, and make connection cleanup bounded.
