@@ -348,11 +348,11 @@ export class InngestTestRuntimeManager {
   }
 
   async ensureReady(expectedFunctionIds: readonly string[] = []): Promise<void> {
-    await this.ensureRuntimeStarted();
-
-    const registration = this.registrationTail.then(() => this.waitForFunctionRegistration(expectedFunctionIds));
-    this.registrationTail = registration.catch(() => undefined);
     try {
+      await this.ensureRuntimeStarted();
+
+      const registration = this.registrationTail.then(() => this.waitForFunctionRegistration(expectedFunctionIds));
+      this.registrationTail = registration.catch(() => undefined);
       await registration;
     } catch (error) {
       try {
@@ -416,7 +416,10 @@ export class InngestTestRuntimeManager {
   }
 
   private async ensureRuntimeStarted(): Promise<void> {
-    if (this.ready) return;
+    if (this.ready) {
+      await this.assertRuntimeOwnership();
+      return;
+    }
     if (this.stopRequested) {
       throw new Error('Inngest test runtime manager has already been stopped.');
     }
@@ -550,13 +553,16 @@ export class InngestTestRuntimeManager {
     const deadline = this.dependencies.now() + this.config.startupTimeoutMs;
     while (this.dependencies.now() < deadline) {
       this.throwIfStopRequested();
+      this.assertManagedProcessRunning();
       try {
         const response = await this.fetchWithTimeout(this.config.endpoints.handlerUrl, {
           method: 'GET',
         });
+        this.assertManagedProcessRunning();
         if (response.ok || response.status === 405) return;
       } catch {
         this.throwIfStopRequested();
+        this.assertManagedProcessRunning();
         // The handler is still starting.
       }
       await this.sleepUntilNextPoll();
@@ -572,6 +578,14 @@ export class InngestTestRuntimeManager {
     await this.waitForHandler();
     await this.triggerRegistration();
 
+    // A successful handler PUT means this exact handler completed its
+    // out-of-band registration request. When no concrete IDs are available,
+    // that is stronger evidence than accepting any function left in the dev
+    // server's registry from an earlier test.
+    if (expectedFunctionIds.length === 0) {
+      return;
+    }
+
     const registrationTimeoutMs = this.config.registrationTimeoutMs;
     const deadline = this.dependencies.now() + registrationTimeoutMs;
     let nextRegistrationRetry = this.dependencies.now() + REGISTRATION_RETRY_INTERVAL_MS;
@@ -579,11 +593,13 @@ export class InngestTestRuntimeManager {
     let bestMissingFunctionIds = [...expectedFunctionIds];
 
     while (this.dependencies.now() < deadline) {
+      this.assertManagedProcessRunning();
       try {
         const response = await this.fetchWithTimeout(this.config.endpoints.devServerUrl);
+        this.assertManagedProcessRunning();
         if (response.ok) {
           const candidates = getFunctionCandidates(await response.json());
-          if (expectedFunctionIds.length === 0 && candidates.length > 0) return;
+          this.assertManagedProcessRunning();
 
           const missingFunctionIds = expectedFunctionIds.filter(
             expectedId => !candidates.some(candidate => functionIdMatches(expectedId, candidate)),
@@ -593,10 +609,14 @@ export class InngestTestRuntimeManager {
             bestMatchCount = matchCount;
             bestMissingFunctionIds = missingFunctionIds;
           }
-          if (missingFunctionIds.length === 0) return;
+          if (missingFunctionIds.length === 0) {
+            await this.assertRuntimeOwnership();
+            return;
+          }
         }
       } catch {
         this.throwIfStopRequested();
+        this.assertManagedProcessRunning();
         // The registry is not ready yet.
       }
 
@@ -615,9 +635,11 @@ export class InngestTestRuntimeManager {
   }
 
   private async triggerRegistration(): Promise<void> {
+    await this.assertRuntimeOwnership();
     const response = await this.fetchWithTimeout(this.config.endpoints.handlerUrl, {
       method: 'PUT',
     });
+    await this.assertRuntimeOwnership();
     if (!response.ok) {
       throw new Error(`Inngest handler registration returned HTTP ${response.status}.`);
     }
@@ -641,10 +663,19 @@ export class InngestTestRuntimeManager {
 
   private assertManagedProcessRunning(): void {
     if (this.config.mode === 'docker' && (!this.dockerProcess || this.dockerProcess.hasExited())) {
-      throw new Error('Owned Inngest Docker process exited before the test runtime became ready.');
+      throw new Error('Owned Inngest Docker process is not running.');
     }
     if (this.config.mode === 'host' && (!this.hostProcess || this.hostProcess.hasExited())) {
-      throw new Error('Owned Inngest host process exited before the test runtime became ready.');
+      throw new Error('Owned Inngest host process is not running.');
+    }
+  }
+
+  private async assertRuntimeOwnership(): Promise<void> {
+    this.throwIfStopRequested();
+    this.assertManagedProcessRunning();
+    if (this.config.mode === 'docker') {
+      await this.assertOwnedDockerContainerReady();
+      this.assertManagedProcessRunning();
     }
   }
 

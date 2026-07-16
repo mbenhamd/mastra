@@ -181,7 +181,7 @@ function createSuccessfulFetch(expectedFunctionIds: readonly string[] = []) {
 }
 
 describe('InngestTestRuntimeManager', () => {
-  it('uses one immutable digest-pinned Docker topology and removes its container', async () => {
+  it('uses one immutable digest-pinned Docker topology for the default package suite', async () => {
     const endpoints = createLocalTestEndpoints({ inngestPort: 43123, handlerPort: 43124 });
     const config = createInngestTestRuntimeConfig(endpoints, {}, 'linux');
     const harness = createRuntimeHarness(createSuccessfulFetch(['workflow.ready']));
@@ -201,6 +201,8 @@ describe('InngestTestRuntimeManager', () => {
       scripts?: Record<string, string>;
     };
     expect(packageJson.scripts).not.toHaveProperty('test:docker');
+    expect(packageJson.scripts?.test).toContain("--exclude='src/__tests__/adapters/**'");
+    expect(packageJson.scripts?.['test:integration']).toContain('src/__tests__/adapters/');
 
     const workflowSource = readFileSync(
       new URL('../../../../.github/workflows/papersflow-fork-pr.yml', import.meta.url),
@@ -361,6 +363,126 @@ describe('InngestTestRuntimeManager', () => {
     expect(harness.spawnCommand.mock.calls.filter(([file]) => file === 'docker')).toHaveLength(1);
   });
 
+  it('uses the successful current-handler PUT instead of accepting a stale registry entry', async () => {
+    const endpoints = createLocalTestEndpoints({ inngestPort: 4200, handlerPort: 4201 });
+    const config = createInngestTestRuntimeConfig(endpoints, {});
+    let devRequests = 0;
+    let registrationRequests = 0;
+    const harness = createRuntimeHarness(async (input, init) => {
+      if (input.endsWith('/dev')) {
+        devRequests += 1;
+        return jsonResponse({ functions: [{ id: 'workflow.stale' }] });
+      }
+      if (init?.method === 'PUT') {
+        registrationRequests += 1;
+        return new Response();
+      }
+      if (init?.method === 'GET') return new Response();
+      throw new Error(`Unexpected request: ${init?.method ?? 'GET'} ${input}`);
+    });
+    const manager = new InngestTestRuntimeManager(config, harness.dependencies);
+
+    await manager.ensureReady();
+    await manager.stop();
+
+    expect(registrationRequests).toBe(1);
+    expect(devRequests).toBe(1);
+  });
+
+  it('rejects owned-process death after initial readiness and before registration', async () => {
+    const endpoints = createLocalTestEndpoints({ inngestPort: 4200, handlerPort: 4201 });
+    const config = createInngestTestRuntimeConfig(endpoints, {});
+    let markProcessExited = () => undefined;
+    let registrationRequests = 0;
+    const harness = createRuntimeHarness(async (input, init) => {
+      if (input.endsWith('/dev')) return jsonResponse({ functions: [{ id: 'workflow.stale' }] });
+      if (init?.method === 'GET') {
+        markProcessExited();
+        return new Response();
+      }
+      if (init?.method === 'PUT') {
+        registrationRequests += 1;
+        return new Response();
+      }
+      throw new Error(`Unexpected request: ${init?.method ?? 'GET'} ${input}`);
+    });
+    markProcessExited = harness.markProcessExited;
+    const manager = new InngestTestRuntimeManager(config, harness.dependencies);
+
+    await expect(manager.ensureReady()).rejects.toThrow(/Owned Inngest Docker process is not running/);
+
+    expect(registrationRequests).toBe(0);
+    expect(harness.signalListeners.size).toBe(0);
+  });
+
+  it('rejects owned-process death while polling explicit function registration', async () => {
+    const endpoints = createLocalTestEndpoints({ inngestPort: 4200, handlerPort: 4201 });
+    const config = createInngestTestRuntimeConfig(endpoints, {});
+    let devRequests = 0;
+    let markProcessExited = () => undefined;
+    const harness = createRuntimeHarness(async (input, init) => {
+      if (input.endsWith('/dev')) {
+        devRequests += 1;
+        if (devRequests > 1) markProcessExited();
+        return jsonResponse({ functions: [{ id: 'workflow.stale' }] });
+      }
+      if (init?.method === 'GET' || init?.method === 'PUT') return new Response();
+      throw new Error(`Unexpected request: ${init?.method ?? 'GET'} ${input}`);
+    });
+    markProcessExited = harness.markProcessExited;
+    const manager = new InngestTestRuntimeManager(config, harness.dependencies);
+
+    await expect(manager.ensureReady(['workflow.current'])).rejects.toThrow(
+      /Owned Inngest Docker process is not running/,
+    );
+
+    expect(devRequests).toBe(2);
+    expect(harness.signalListeners.size).toBe(0);
+  });
+
+  it('revalidates process and container ownership between ensureReady calls', async () => {
+    const endpoints = createLocalTestEndpoints({ inngestPort: 4200, handlerPort: 4201 });
+    const config = createInngestTestRuntimeConfig(endpoints, {});
+    const harness = createRuntimeHarness(createSuccessfulFetch(['workflow.current']));
+    const manager = new InngestTestRuntimeManager(config, harness.dependencies);
+
+    await manager.ensureReady(['workflow.current']);
+    harness.markProcessExited();
+
+    await expect(manager.ensureReady(['workflow.current'])).rejects.toThrow(
+      /Owned Inngest Docker process is not running/,
+    );
+    expect(harness.signalListeners.size).toBe(0);
+  });
+
+  it('does not adopt a replacement container between ensureReady calls', async () => {
+    const endpoints = createLocalTestEndpoints({ inngestPort: 4200, handlerPort: 4201 });
+    const config = createInngestTestRuntimeConfig(endpoints, {});
+    const dockerState: MockDockerState = { container: null };
+    const harness = createRuntimeHarness(createSuccessfulFetch(['workflow.current']), { dockerState });
+    const manager = new InngestTestRuntimeManager(config, harness.dependencies);
+
+    await manager.ensureReady(['workflow.current']);
+    dockerState.container = {
+      id: 'container-replacement',
+      running: true,
+      image: INNGEST_TEST_DOCKER_IMAGE,
+      runtimeLabel: 'inngest',
+      ownerToken: 'replacement-owner',
+    };
+
+    await expect(manager.ensureReady(['workflow.current'])).rejects.toThrow(
+      /is not owned by this Inngest test runtime manager/,
+    );
+    expect(dockerState.container).toMatchObject({
+      id: 'container-replacement',
+      running: true,
+      ownerToken: 'replacement-owner',
+    });
+    expect(harness.runCommand.mock.calls.filter(([, args]) => args[0] === 'rm')).toHaveLength(0);
+    expect(harness.signalListeners.size).toBe(0);
+  });
+
   it('fences concurrent managers that both inspect the fixed container name before either spawn', async () => {
     const endpoints = createLocalTestEndpoints({ inngestPort: 4200, handlerPort: 4201 });
     const config = createInngestTestRuntimeConfig(endpoints, {});
@@ -397,7 +519,7 @@ describe('InngestTestRuntimeManager', () => {
     const winnerIndex = results.findIndex(result => result.status === 'fulfilled');
     const failedResult = results.find(result => result.status === 'rejected');
     expect(String(failedResult && 'reason' in failedResult ? failedResult.reason : '')).toMatch(
-      /Owned Inngest Docker process exited before the test runtime became ready/,
+      /Owned Inngest Docker process is not running/,
     );
 
     const winnerManager = winnerIndex === 0 ? firstManager : secondManager;
@@ -456,7 +578,7 @@ describe('InngestTestRuntimeManager', () => {
     const manager = new InngestTestRuntimeManager(config, harness.dependencies);
 
     await expect(manager.ensureReady(['workflow.unrelated'])).rejects.toThrow(
-      /Owned Inngest Docker process exited before the test runtime became ready/,
+      /Owned Inngest Docker process is not running/,
     );
 
     expect(harness.dependencies.fetch).toHaveBeenCalledTimes(1);
