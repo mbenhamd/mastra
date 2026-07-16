@@ -15,6 +15,7 @@ import { createHonoServer } from '@mastra/deployer/server';
 import { DefaultStorage } from '@mastra/libsql';
 import { Inngest } from 'inngest';
 
+import { createInngestDurableAgenticWorkflowIds } from '../durable-agent/create-inngest-agentic-workflow';
 import { serve as inngestServe } from '../index';
 import {
   createInngestTestRuntimeConfig,
@@ -74,6 +75,22 @@ export function getSharedMastra(): Mastra {
     throw new Error('Shared Mastra not initialized. Call setupSharedTestInfrastructure() first.');
   }
   return sharedMastra;
+}
+
+/**
+ * Re-register the shared test app after adding a dynamically-created durable
+ * agent and wait until both of that agent's Inngest functions are visible.
+ */
+export async function registerSharedAgentFunctions(agentId: string): Promise<void> {
+  if (!sharedRuntime) {
+    throw new Error('Shared Inngest runtime not initialized. Call setupSharedTestInfrastructure() first.');
+  }
+
+  const workflowIds = createInngestDurableAgenticWorkflowIds(agentId);
+  await sharedRuntime.ensureReady([
+    `workflow.${workflowIds.AGENTIC_LOOP}`,
+    `workflow.${workflowIds.AGENTIC_EXECUTION}`,
+  ]);
 }
 
 /**
@@ -175,12 +192,21 @@ export async function setupSharedTestInfrastructure(): Promise<void> {
           {
             path: '/inngest/api',
             method: 'ALL',
-            createHandler: async ({ mastra }) =>
-              inngestServe({
-                mastra,
-                inngest,
-                ...runtime.registerOptions,
-              }) as unknown as ApiRouteHandler,
+            createHandler: async ({ mastra }) => {
+              // Tests add a uniquely named durable agent for each case after
+              // the HTTP server has started. Recreate Inngest's Hono handler
+              // per request so registration PUTs see the current Mastra
+              // workflow registry rather than the setup-time snapshot.
+              const handler: ApiRouteHandler = async (...args) => {
+                const currentHandler = inngestServe({
+                  mastra,
+                  inngest,
+                  ...runtime.registerOptions,
+                }) as unknown as ApiRouteHandler;
+                return currentHandler(...args);
+              };
+              return handler;
+            },
           },
         ],
       },
