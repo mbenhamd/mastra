@@ -174,7 +174,9 @@ export function createDurableAgentStream<OUTPUT = undefined>(
   // Track subscription state
   let isSubscribed = false;
   let cancelled = false;
+  let streamSettled = false;
   let controller: ReadableStreamDefaultController<ChunkType<OUTPUT>> | null = null;
+  const acceptedEventIds = new Set<string>();
 
   // Promise that resolves when subscription is established
   let resolveReady: () => void;
@@ -198,8 +200,33 @@ export function createDurableAgentStream<OUTPUT = undefined>(
   // surface it in onError when the FINISH event arrives with reason 'error'.
   let lastErrorMessage: string | undefined;
 
+  /**
+   * Pubsub transports may redeliver an event after reconnect or nack. User
+   * callbacks are side effects, so accept each logical envelope once and let
+   * the first terminal event settle this stream segment. The transport-owned
+   * event id is stable across replay and redelivery; distinct chunks retain
+   * distinct ids even when their payloads are identical.
+   */
+  const acceptEvent = (event: Event): boolean => {
+    if (streamSettled) return false;
+
+    if (acceptedEventIds.has(event.id)) return false;
+    acceptedEventIds.add(event.id);
+
+    const settlesSegment =
+      event.type === AgentStreamEventTypes.FINISH ||
+      event.type === AgentStreamEventTypes.ERROR ||
+      event.type === AgentStreamEventTypes.ABORT ||
+      (closeOnSuspend && event.type === AgentStreamEventTypes.SUSPENDED);
+    if (settlesSegment) {
+      streamSettled = true;
+    }
+
+    return true;
+  };
+
   const handleEvent = async (event: Event) => {
-    if (!controller) return;
+    if (!controller || !acceptEvent(event)) return;
 
     // Parse the event data as AgentStreamEvent
     const streamEvent = event as unknown as AgentStreamEvent;
@@ -213,8 +240,9 @@ export function createDurableAgentStream<OUTPUT = undefined>(
             const errPayload = (chunk as any).payload;
             lastErrorMessage = errPayload?.error?.message || errPayload?.message || 'LLM execution error';
           }
-          safeEnqueue(controller, chunk as ChunkType<OUTPUT>);
-          await onChunk?.(chunk as ChunkType<OUTPUT>);
+          if (safeEnqueue(controller, chunk as ChunkType<OUTPUT>)) {
+            await onChunk?.(chunk as ChunkType<OUTPUT>);
+          }
           break;
         }
 
@@ -429,6 +457,8 @@ export function createDurableAgentStream<OUTPUT = undefined>(
   // if cleanup runs before the subscription promise resolves.
   const cleanup = () => {
     cancelled = true;
+    streamSettled = true;
+    acceptedEventIds.clear();
     if (isSubscribed) {
       isSubscribed = false;
       const topic = AGENT_STREAM_TOPIC(runId);
