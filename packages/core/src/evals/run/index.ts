@@ -752,7 +752,7 @@ function validateEvalsInputs(
   const turnAssertionPlan: TurnAssertionPlan = new Map();
   const seenTurnScorerThresholds = new Map<
     number,
-    Map<string, { threshold: ThresholdConfig | undefined; dataIndex: number }>
+    Map<string, { threshold: ThresholdConfig | undefined; dataIndex: number; scorerConfigIndex: number }>
   >();
   if (data.length === 0) {
     throw new MastraError({
@@ -852,7 +852,8 @@ function validateEvalsInputs(
 
           // Validate and reconcile per-turn threshold configs upfront so errors
           // surface deterministically before any target or scorer execution.
-          for (const entry of turn.scorers) {
+          for (let scorerConfigIndex = 0; scorerConfigIndex < turn.scorers.length; scorerConfigIndex++) {
+            const entry = turn.scorers[scorerConfigIndex]!;
             const scorer = isScorerWithThreshold(entry) ? entry.scorer : entry;
             const threshold = isScorerWithThreshold(entry) ? entry.threshold : undefined;
             addUnique(plannedTurn.scorerIds, scorer.id);
@@ -874,20 +875,23 @@ function validateEvalsInputs(
                 category: 'USER',
                 text:
                   `Per-turn scorer "${scorer.id}" at turn index ${t} has inconsistent thresholds: ` +
-                  `${firstThreshold} in data item ${existing.dataIndex} and ${conflictingThreshold} in data item ${i}. ` +
+                  `${firstThreshold} at data item ${existing.dataIndex}, scorer configuration ${existing.scorerConfigIndex} ` +
+                  `and ${conflictingThreshold} at data item ${i}, scorer configuration ${scorerConfigIndex}. ` +
                   'Use one identical threshold configuration for this turn/scorer pair.',
                 details: {
                   turnIndex: t,
                   scorerId: scorer.id,
                   firstDataIndex: existing.dataIndex,
+                  firstScorerConfigIndex: existing.scorerConfigIndex,
                   firstThreshold,
                   conflictingDataIndex: i,
+                  conflictingScorerConfigIndex: scorerConfigIndex,
                   conflictingThreshold,
                 },
               });
             }
             if (!existing) {
-              seenThresholdsForTurn.set(scorer.id, { threshold, dataIndex: i });
+              seenThresholdsForTurn.set(scorer.id, { threshold, dataIndex: i, scorerConfigIndex });
             }
           }
         }

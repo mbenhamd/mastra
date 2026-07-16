@@ -1911,7 +1911,71 @@ describe('runEvals', () => {
         }),
       ).rejects.toThrow(
         'Per-turn scorer "shared-turn-threshold" at turn index 0 has inconsistent thresholds: ' +
-          '0.2 in data item 0 and 0.9 in data item 1.',
+          '0.2 at data item 0, scorer configuration 0 and ' +
+          '0.9 at data item 1, scorer configuration 0.',
+      );
+
+      expect(counter.count).toBe(0);
+      expect(generateSpy).not.toHaveBeenCalled();
+      expect(scorer.run).not.toHaveBeenCalled();
+    });
+
+    it('identifies conflicting scorer configurations within the same turn item before execution', async () => {
+      const counter = { count: 0 };
+      const agent = createTurnAgent('sameItemTurnThresholdAgent', counter);
+      const scorer = createMockScorer('same-item-threshold', 0.8);
+      const generateSpy = vi.spyOn(agent, 'generate');
+
+      await expect(
+        runEvals({
+          data: [
+            {
+              turns: [
+                {
+                  input: 'one item',
+                  scorers: [
+                    { scorer, threshold: 0.2 },
+                    { scorer, threshold: 0.9 },
+                  ],
+                },
+              ],
+            },
+          ],
+          target: agent,
+          concurrency: 2,
+        }),
+      ).rejects.toThrow(
+        'Per-turn scorer "same-item-threshold" at turn index 0 has inconsistent thresholds: ' +
+          '0.2 at data item 0, scorer configuration 0 and ' +
+          '0.9 at data item 0, scorer configuration 1.',
+      );
+
+      expect(counter.count).toBe(0);
+      expect(generateSpy).not.toHaveBeenCalled();
+      expect(scorer.run).not.toHaveBeenCalled();
+    });
+
+    it('rejects bare and threshold-bearing entries for one turn scorer before execution', async () => {
+      const counter = { count: 0 };
+      const agent = createTurnAgent('bareThresholdTurnAgent', counter);
+      const scorer = createMockScorer('bare-threshold-conflict', 0.8);
+      const generateSpy = vi.spyOn(agent, 'generate');
+
+      await expect(
+        runEvals({
+          data: [
+            { turns: [{ input: 'bare item', scorers: [scorer] }] },
+            {
+              turns: [{ input: 'threshold item', scorers: [{ scorer, threshold: { min: 0.4 } }] }],
+            },
+          ],
+          target: agent,
+          concurrency: 2,
+        }),
+      ).rejects.toThrow(
+        'Per-turn scorer "bare-threshold-conflict" at turn index 0 has inconsistent thresholds: ' +
+          'none at data item 0, scorer configuration 0 and ' +
+          '{ min: 0.4 } at data item 1, scorer configuration 0.',
       );
 
       expect(counter.count).toBe(0);
