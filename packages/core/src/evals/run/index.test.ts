@@ -1890,6 +1890,102 @@ describe('runEvals', () => {
       expect(result.turnResults![0]!.thresholdResults![0]!.passed).toBe(false);
     });
 
+    it('rejects heterogeneous thresholds for the same turn scorer before concurrent target execution', async () => {
+      const counter = { count: 0 };
+      const agent = createTurnAgent('heterogeneousTurnThresholdAgent', counter);
+      const scorer = createMockScorer('shared-turn-threshold', 0.8);
+      const generateSpy = vi.spyOn(agent, 'generate');
+
+      await expect(
+        runEvals({
+          data: [
+            {
+              turns: [{ input: 'first item', scorers: [{ scorer, threshold: 0.2 }] }],
+            },
+            {
+              turns: [{ input: 'second item', scorers: [{ scorer, threshold: 0.9 }] }],
+            },
+          ],
+          target: agent,
+          concurrency: 2,
+        }),
+      ).rejects.toThrow(
+        'Per-turn scorer "shared-turn-threshold" at turn index 0 has inconsistent thresholds: ' +
+          '0.2 in data item 0 and 0.9 in data item 1.',
+      );
+
+      expect(counter.count).toBe(0);
+      expect(generateSpy).not.toHaveBeenCalled();
+      expect(scorer.run).not.toHaveBeenCalled();
+    });
+
+    it('retains homogeneous concurrent thresholds in deterministic declaration order', async () => {
+      const counter = { count: 0 };
+      const agent = createTurnAgent('homogeneousTurnThresholdAgent', counter);
+      let releaseSlowScorer!: () => void;
+      const fastScorerReached = new Promise<void>(resolve => {
+        releaseSlowScorer = resolve;
+      });
+
+      const zetaScorer = createScorer({
+        id: 'zeta-turn-threshold',
+        description: 'Completes the second data item first',
+      }).generateScore(async ({ run }: any) => {
+        if (run.input === 'slow-first') {
+          await fastScorerReached;
+        } else {
+          releaseSlowScorer();
+        }
+        return 0.8;
+      });
+      const alphaScorer = createMockScorer('alpha-turn-threshold', 0.6);
+      vi.spyOn(zetaScorer, 'run');
+
+      const result = await runEvals({
+        data: [
+          {
+            turns: [
+              {
+                input: 'slow-first',
+                scorers: [
+                  { scorer: zetaScorer, threshold: 0.2 },
+                  { scorer: alphaScorer, threshold: { min: 0.3, max: 0.9 } },
+                ],
+              },
+            ],
+          },
+          {
+            turns: [
+              {
+                input: 'fast-second',
+                scorers: [
+                  { scorer: alphaScorer, threshold: { max: 0.9, min: 0.3 } },
+                  { scorer: zetaScorer, threshold: 0.2 },
+                ],
+              },
+            ],
+          },
+        ],
+        target: agent,
+        concurrency: 2,
+      });
+
+      expect(counter.count).toBe(2);
+      expect(zetaScorer.run).toHaveBeenCalledTimes(2);
+      expect(alphaScorer.run).toHaveBeenCalledTimes(2);
+      expect(result.verdict).toBe('passed');
+      expect(result.turnResults![0]!.thresholdResults).toEqual([
+        { id: 'zeta-turn-threshold', passed: true, averageScore: 0.8, threshold: 0.2 },
+        {
+          id: 'alpha-turn-threshold',
+          passed: true,
+          averageScore: 0.6,
+          threshold: { min: 0.3, max: 0.9 },
+        },
+      ]);
+      expect(Object.keys(result.turnResults![0]!.scores!)).toEqual(['zeta-turn-threshold', 'alpha-turn-threshold']);
+    });
+
     it('rejects an empty turns array', async () => {
       const agent = createTurnAgent('emptyTurnsAgent');
       await expect(

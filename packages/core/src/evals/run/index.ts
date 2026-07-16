@@ -134,6 +134,12 @@ type ScoredTurn = {
   scores: Array<{ id: string; score: number }>;
 };
 type ItemTurnResults = ScoredTurn[];
+type TurnAssertionPlanEntry = {
+  gateIds: string[];
+  scorerIds: string[];
+  thresholds: Map<string, ThresholdConfig>;
+};
+type TurnAssertionPlan = Map<number, TurnAssertionPlanEntry>;
 
 type RunEvalsResult = {
   scores: Record<string, any>;
@@ -263,7 +269,7 @@ export async function runEvals(config: {
   // Normalize ScorerEntry[] into bare scorers + threshold metadata
   const { bareScorers, thresholdMap } = normalizeScorerEntries(scorers);
 
-  validateEvalsInputs(data, bareScorers, target, gates);
+  const turnAssertionPlan = validateEvalsInputs(data, bareScorers, target, gates);
 
   let totalItems = 0;
   const scoreAccumulator = new ScoreAccumulator();
@@ -391,7 +397,8 @@ export async function runEvals(config: {
   };
 
   // Aggregate per-turn assertions (by turn index across data items).
-  const turnAggregate = perItemTurnResults.length > 0 ? aggregateTurnResults(perItemTurnResults) : undefined;
+  const turnAggregate =
+    perItemTurnResults.length > 0 ? aggregateTurnResults(perItemTurnResults, turnAssertionPlan) : undefined;
   if (turnAggregate && turnAggregate.turnResults.length > 0) {
     result.turnResults = turnAggregate.turnResults;
   }
@@ -517,8 +524,15 @@ async function scoreTurn(
   return { gates, thresholds, scores, rawResults };
 }
 
-/** Aggregates per-item turn results by turn index, averaging scores across items. */
-function aggregateTurnResults(perItemTurnResults: ItemTurnResults[]): {
+/**
+ * Aggregates per-item turn results by turn index, averaging scores across items.
+ * The preflight plan preserves input declaration order regardless of concurrent
+ * item completion order.
+ */
+function aggregateTurnResults(
+  perItemTurnResults: ItemTurnResults[],
+  assertionPlan: TurnAssertionPlan,
+): {
   turnResults: TurnResult[];
   turnGatesPassed: boolean;
   turnThresholdsPassed: boolean;
@@ -565,12 +579,16 @@ function aggregateTurnResults(perItemTurnResults: ItemTurnResults[]): {
 
   for (const index of [...byIndex.keys()].sort((a, b) => a - b)) {
     const bucket = byIndex.get(index)!;
+    const planned = assertionPlan.get(index);
     const turnResult: TurnResult = { index };
 
     if (bucket.gates.size > 0) {
       hasTurnGates = true;
       turnResult.gateResults = [];
-      for (const [id, gateScores] of bucket.gates) {
+      const gateIds = planned?.gateIds ?? [...bucket.gates.keys()].sort();
+      for (const id of gateIds) {
+        const gateScores = bucket.gates.get(id);
+        if (!gateScores) continue;
         const score = average(gateScores);
         const passed = score >= 1.0;
         if (!passed) turnGatesPassed = false;
@@ -581,7 +599,12 @@ function aggregateTurnResults(perItemTurnResults: ItemTurnResults[]): {
     if (bucket.thresholds.size > 0) {
       hasTurnThresholds = true;
       turnResult.thresholdResults = [];
-      for (const [id, { scores: thresholdScores, threshold }] of bucket.thresholds) {
+      const thresholdIds = planned ? [...planned.thresholds.keys()] : [...bucket.thresholds.keys()].sort();
+      for (const id of thresholdIds) {
+        const aggregate = bucket.thresholds.get(id);
+        if (!aggregate) continue;
+        const { scores: thresholdScores, threshold: observedThreshold } = aggregate;
+        const threshold = planned?.thresholds.get(id) ?? observedThreshold;
         const averageScore = average(thresholdScores);
         const passed = checkThresholdPassed(averageScore, threshold);
         if (!passed) turnThresholdsPassed = false;
@@ -591,7 +614,10 @@ function aggregateTurnResults(perItemTurnResults: ItemTurnResults[]): {
 
     if (bucket.scores.size > 0) {
       turnResult.scores = {};
-      for (const [id, scorerScores] of bucket.scores) {
+      const scorerIds = planned?.scorerIds ?? [...bucket.scores.keys()].sort();
+      for (const id of scorerIds) {
+        const scorerScores = bucket.scores.get(id);
+        if (!scorerScores) continue;
         turnResult.scores[id] = average(scorerScores);
       }
     }
@@ -674,6 +700,28 @@ function normalizeScorerEntries(
   return { bareScorers, thresholdMap };
 }
 
+function thresholdsAreEqual(a: ThresholdConfig | undefined, b: ThresholdConfig | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  if (typeof a === 'number' || typeof b === 'number') {
+    return typeof a === 'number' && typeof b === 'number' && a === b;
+  }
+  return a.min === b.min && a.max === b.max;
+}
+
+function formatThreshold(threshold: ThresholdConfig | undefined): string {
+  if (threshold === undefined) return 'none';
+  if (typeof threshold === 'number') return String(threshold);
+
+  const bounds: string[] = [];
+  if (threshold.min !== undefined) bounds.push(`min: ${threshold.min}`);
+  if (threshold.max !== undefined) bounds.push(`max: ${threshold.max}`);
+  return `{ ${bounds.join(', ')} }`;
+}
+
+function addUnique(items: string[], item: string): void {
+  if (!items.includes(item)) items.push(item);
+}
+
 function isWorkflow(target: Agent | Workflow): target is Workflow {
   return target instanceof Workflow;
 }
@@ -699,8 +747,13 @@ function validateEvalsInputs(
   scorers: MastraScorer<any, any, any, any>[] | WorkflowScorerConfig | AgentScorerConfig,
   target: Agent | Workflow,
   gates?: MastraScorer<any, any, any, any>[],
-): void {
+): TurnAssertionPlan {
   const hasGates = !!gates && gates.length > 0;
+  const turnAssertionPlan: TurnAssertionPlan = new Map();
+  const seenTurnScorerThresholds = new Map<
+    number,
+    Map<string, { threshold: ThresholdConfig | undefined; dataIndex: number }>
+  >();
   if (data.length === 0) {
     throw new MastraError({
       domain: 'SCORER',
@@ -778,15 +831,63 @@ function validateEvalsInputs(
             text: `Invalid data item at index ${i}: turn ${t} must be an object with an 'input' property`,
           });
         }
+        let plannedTurn = turnAssertionPlan.get(t);
+        if (!plannedTurn) {
+          plannedTurn = { gateIds: [], scorerIds: [], thresholds: new Map() };
+          turnAssertionPlan.set(t, plannedTurn);
+        }
         if (Array.isArray(turn.gates) && turn.gates.length > 0) {
           hasAnyTurnAssertions = true;
+          for (const gate of turn.gates) {
+            addUnique(plannedTurn.gateIds, gate.id);
+          }
         }
         if (Array.isArray(turn.scorers) && turn.scorers.length > 0) {
           hasAnyTurnAssertions = true;
-          // Validate per-turn threshold bounds upfront so errors surface before execution.
+          let seenThresholdsForTurn = seenTurnScorerThresholds.get(t);
+          if (!seenThresholdsForTurn) {
+            seenThresholdsForTurn = new Map();
+            seenTurnScorerThresholds.set(t, seenThresholdsForTurn);
+          }
+
+          // Validate and reconcile per-turn threshold configs upfront so errors
+          // surface deterministically before any target or scorer execution.
           for (const entry of turn.scorers) {
+            const scorer = isScorerWithThreshold(entry) ? entry.scorer : entry;
+            const threshold = isScorerWithThreshold(entry) ? entry.threshold : undefined;
+            addUnique(plannedTurn.scorerIds, scorer.id);
+
             if (isScorerWithThreshold(entry)) {
               validateThresholdConfig(entry.threshold, entry.scorer.id);
+              if (!plannedTurn.thresholds.has(scorer.id)) {
+                plannedTurn.thresholds.set(scorer.id, entry.threshold);
+              }
+            }
+
+            const existing = seenThresholdsForTurn.get(scorer.id);
+            if (existing && !thresholdsAreEqual(existing.threshold, threshold)) {
+              const firstThreshold = formatThreshold(existing.threshold);
+              const conflictingThreshold = formatThreshold(threshold);
+              throw new MastraError({
+                domain: 'SCORER',
+                id: 'INCONSISTENT_PER_TURN_SCORER_THRESHOLD',
+                category: 'USER',
+                text:
+                  `Per-turn scorer "${scorer.id}" at turn index ${t} has inconsistent thresholds: ` +
+                  `${firstThreshold} in data item ${existing.dataIndex} and ${conflictingThreshold} in data item ${i}. ` +
+                  'Use one identical threshold configuration for this turn/scorer pair.',
+                details: {
+                  turnIndex: t,
+                  scorerId: scorer.id,
+                  firstDataIndex: existing.dataIndex,
+                  firstThreshold,
+                  conflictingDataIndex: i,
+                  conflictingThreshold,
+                },
+              });
+            }
+            if (!existing) {
+              seenThresholdsForTurn.set(scorer.id, { threshold, dataIndex: i });
             }
           }
         }
@@ -841,6 +942,8 @@ function validateEvalsInputs(
       text: 'Agent scorers must be an array of scorers or an AgentScorerConfig',
     });
   }
+
+  return turnAssertionPlan;
 }
 
 async function executeTarget(
