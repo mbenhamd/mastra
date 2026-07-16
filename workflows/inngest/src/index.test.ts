@@ -23,8 +23,6 @@ import { createHonoServer } from '@mastra/deployer/server';
 import { DefaultStorage } from '@mastra/libsql';
 import { Observability } from '@mastra/observability';
 import { MockLanguageModelV1 } from 'ai/test';
-import { execaCommand } from 'execa';
-import type { ResultPromise } from 'execa';
 import { Inngest } from 'inngest';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -37,158 +35,41 @@ import {
   HANDLER_PORT as DURABLE_AGENT_HANDLER_PORT,
   INNGEST_PORT as DURABLE_AGENT_INNGEST_PORT,
 } from './__tests__/durable-agent.test.utils';
+import {
+  createInngestTestRuntimeConfig,
+  createLocalTestEndpoints,
+  InngestTestRuntimeManager,
+} from './__tests__/inngest-test-runtime';
+import type { LocalTestEndpoints } from './__tests__/inngest-test-runtime';
 import type { InngestWorkflow } from './workflow';
 import { init, serve as inngestServe } from './index';
-
-interface LocalTestPorts {
-  readonly inngestPort: number;
-  readonly handlerPort: number;
-}
-
-interface LocalTestEndpoints {
-  readonly ports: LocalTestPorts;
-  readonly clientBaseUrl: string;
-  readonly devServerUrl: string;
-  readonly handlerUrl: string;
-  readonly dockerServeOrigin: string;
-  readonly servePath: string;
-  readonly standaloneCliCommand: string;
-}
 
 interface LocalTestContext {
   endpoints: LocalTestEndpoints;
 }
 
-interface LocalInngestLaunchOptions {
-  cwd: string;
-  stdio: 'ignore';
-  reject: false;
-}
-
-type LocalInngestLauncher = (command: string, options: LocalInngestLaunchOptions) => ResultPromise;
-
-function createLocalTestEndpoints(ports: LocalTestPorts, servePath: string = '/inngest/api'): LocalTestEndpoints {
-  const immutablePorts = Object.freeze({
-    inngestPort: ports.inngestPort,
-    handlerPort: ports.handlerPort,
-  });
-  const clientBaseUrl = `http://localhost:${immutablePorts.inngestPort}`;
-  const handlerUrl = `http://localhost:${immutablePorts.handlerPort}${servePath}`;
-
-  return Object.freeze({
-    ports: immutablePorts,
-    clientBaseUrl,
-    devServerUrl: `${clientBaseUrl}/dev`,
-    handlerUrl,
-    dockerServeOrigin: `http://host.docker.internal:${immutablePorts.handlerPort}`,
-    servePath,
-    standaloneCliCommand: `npx inngest-cli dev -p ${immutablePorts.inngestPort} -u ${handlerUrl} --poll-interval=1 --retry-interval=1`,
-  });
-}
-
 const LOCAL_TEST_ENDPOINTS = createLocalTestEndpoints({ inngestPort: 4200, handlerPort: 4201 });
+const INNGEST_TEST_RUNTIME = new InngestTestRuntimeManager(createInngestTestRuntimeConfig(LOCAL_TEST_ENDPOINTS));
+const ACTIVE_TEST_ENDPOINTS = INNGEST_TEST_RUNTIME.config.endpoints;
 
-const launchLocalInngest: LocalInngestLauncher = (command, options) => execaCommand(command, options);
+vi.setConfig({ hookTimeout: 150_000 });
 
 function getLocalTestEndpoints(context: unknown): LocalTestEndpoints {
   return (context as LocalTestContext).endpoints;
 }
 
-// Inngest dev server process (managed via inngest-cli, no Docker required)
-let standaloneInngestProcess: ResultPromise | null = null;
-
-// Whether an Inngest server is already listening on the suite's configured port.
-let inngestServerRunning = false;
-// Whether that already-running server is *Docker* specifically. Only Docker requires
-// rewriting the SDK origin to `host.docker.internal` so the container can reach the
-// host. A host-side `inngest-cli dev` should keep `localhost`.
-let useDockerInngest = false;
-
-/** Best-effort check whether this process is itself running inside a container. */
-function isInsideContainer(): boolean {
-  try {
-    if (fs.existsSync('/.dockerenv')) return true;
-    if (fs.existsSync('/run/.containerenv')) return true;
-    const cgroup = fs.readFileSync('/proc/1/cgroup', 'utf8');
-    if (/docker|kubepods|containerd/.test(cgroup)) return true;
-  } catch {
-    // /proc/1/cgroup doesn't exist on macOS hosts; fall through.
-  }
-  return false;
-}
-
-/**
- * Detect whether an Inngest server is already running, and whether it's running
- * inside Docker (vs a host `inngest-cli dev`). Must be called once at startup
- * before any tests run.
- *
- * "Server reachable on the configured port" alone isn't sufficient — a host-side CLI
- * satisfies that probe too, and treating it as Docker would incorrectly rewrite
- * the SDK origin to `host.docker.internal`. We therefore require an explicit
- * Docker indicator: an env var, a docker-compose-managed container running on
- * the host, or this process being inside a container itself.
- */
-async function detectDockerInngest(endpoints: LocalTestEndpoints): Promise<boolean> {
-  try {
-    const response = await fetch(endpoints.devServerUrl, { signal: AbortSignal.timeout(1000) });
-    if (!response.ok) return false;
-    inngestServerRunning = true;
-  } catch {
-    return false;
-  }
-
-  // Explicit opt-in / opt-out via env wins.
-  if (process.env.MASTRA_INNGEST_TEST_DOCKER === '1') {
-    useDockerInngest = true;
-    return true;
-  }
-  if (process.env.MASTRA_INNGEST_TEST_DOCKER === '0') {
-    return false;
-  }
-
-  // We're inside a container — the host of the dev server is irrelevant; Docker mode applies.
-  if (isInsideContainer()) {
-    useDockerInngest = true;
-    return true;
-  }
-
-  // Host machine: only treat as Docker if we can confirm a docker-compose-managed
-  // container with the expected name is up.
-  try {
-    const result = await execaCommand('docker ps --filter name=mastra-inngest-test --format {{.Names}}', {
-      reject: false,
-    });
-    if (typeof result.stdout === 'string' && result.stdout.includes('mastra-inngest-test')) {
-      useDockerInngest = true;
-      return true;
-    }
-  } catch {
-    // docker CLI unavailable — assume host inngest-cli, not Docker.
-  }
-  return false;
-}
-
-// Detect Docker at module load time with the same endpoints used by every test.
-await detectDockerInngest(LOCAL_TEST_ENDPOINTS);
-
 /**
  * Get additional serve options for tests that need Inngest registration to
- * point at a non-default origin/path. When the dev server is running in Docker,
- * the container can't reach `localhost`, so we rewrite the SDK origin to
- * `host.docker.internal`. When running against a host-side `inngest-cli dev`,
- * `localhost` works fine and no override is needed.
- *
- * The handler origin and path derive from the same port pair used by the client,
- * reset helper, registration poll, standalone CLI, and Hono listener.
+ * point at the runtime manager's immutable callback origin/path.
  */
 function getDockerRegisterOptions(
-  endpoints: LocalTestEndpoints = LOCAL_TEST_ENDPOINTS,
-  dockerMode: boolean = useDockerInngest,
+  endpoints: LocalTestEndpoints = ACTIVE_TEST_ENDPOINTS,
+  serveOrigin: string | null | undefined = INNGEST_TEST_RUNTIME.config.registrationServeOrigin,
 ) {
-  if (dockerMode) {
+  if (serveOrigin) {
     return {
       registerOptions: {
-        serveOrigin: endpoints.dockerServeOrigin,
+        serveOrigin,
         servePath: endpoints.servePath,
       },
     };
@@ -197,97 +78,25 @@ function getDockerRegisterOptions(
 }
 
 /**
- * Wait for `expectedFnIds` to all be registered with the dev server, ignoring
- * any stale registrations from earlier tests. If `expectedFnIds` is empty, fall
- * back to waiting for at least one function (best effort).
+ * Keep existing test call sites explicit about their endpoint contract while
+ * delegating daemon lifecycle and registration readiness to one owner.
  */
-async function waitForFunctionRegistration(endpoints: LocalTestEndpoints, expectedFnIds: string[] = []): Promise<void> {
-  const maxAttempts = 20;
-  const matches = (id: string, candidate: string) =>
-    candidate === id || candidate.endsWith(`-${id}`) || candidate.endsWith(`.${id}`);
-  for (let i = 0; i < maxAttempts; i++) {
-    try {
-      const response = await fetch(endpoints.devServerUrl);
-      const data = await response.json();
-      const fns = (data.functions ?? []) as Array<{ slug?: string; id?: string; name?: string }>;
-      const candidates = fns.flatMap(f => [f.slug, f.id, f.name].filter(Boolean) as string[]);
-      if (expectedFnIds.length > 0) {
-        if (expectedFnIds.every(id => candidates.some(c => matches(id, c)))) return;
-      } else if (fns.length > 0) {
-        return;
-      }
-    } catch {
-      // Keep trying
-    }
-    await new Promise(resolve => setTimeout(resolve, 500));
+async function resetInngest(endpoints: LocalTestEndpoints, expectedFnIds: string[] = []) {
+  if (endpoints !== ACTIVE_TEST_ENDPOINTS) {
+    throw new Error('Inngest tests must use the runtime manager endpoint configuration.');
   }
+  await INNGEST_TEST_RUNTIME.ensureReady(expectedFnIds);
 }
 
-/**
- * Start a fresh inngest-cli dev server, killing any existing one first.
- * If a server is already running (Docker or host CLI), just trigger registration
- * without starting a new server.
- *
- * PF-2050 owns daemon lifecycle, stale-listener policy, and awaited teardown.
- * This helper only ensures every existing path consumes the supplied endpoints.
- */
-async function resetInngest(
-  endpoints: LocalTestEndpoints,
-  expectedFnIds: string[] = [],
-  launcher: LocalInngestLauncher = launchLocalInngest,
-) {
-  if (inngestServerRunning) {
-    // Server (Docker or host CLI) is already running — just trigger registration
-    try {
-      await fetch(endpoints.handlerUrl, { method: 'PUT' });
-    } catch {
-      // Ignore - handler may not be up yet
-    }
-
-    await waitForFunctionRegistration(endpoints, expectedFnIds);
-    return;
-  }
-
-  // Kill existing inngest dev server if running
-  if (standaloneInngestProcess) {
-    standaloneInngestProcess.kill();
-    standaloneInngestProcess = null;
-    await new Promise(resolve => setTimeout(resolve, 500));
-  }
-
-  // Start inngest-cli dev server
-  standaloneInngestProcess = launcher(endpoints.standaloneCliCommand, {
-    cwd: import.meta.dirname,
-    stdio: 'ignore',
-    reject: false,
-  });
-
-  // Wait for it to be ready
-  for (let i = 0; i < 30; i++) {
-    try {
-      const response = await fetch(endpoints.devServerUrl);
-      if (response.ok) break;
-    } catch {
-      // Keep trying
-    }
-    await new Promise(resolve => setTimeout(resolve, 500));
-  }
-
-  // Trigger registration by sending PUT to the handler
-  try {
-    await fetch(endpoints.handlerUrl, { method: 'PUT' });
-  } catch {
-    // Ignore
-  }
-
-  await waitForFunctionRegistration(endpoints, expectedFnIds);
-}
+afterAll(async () => {
+  await INNGEST_TEST_RUNTIME.stop();
+});
 
 describe('MastraInngestWorkflow', () => {
   let globServer: any;
 
   beforeEach<LocalTestContext>(async ctx => {
-    ctx.endpoints = LOCAL_TEST_ENDPOINTS;
+    ctx.endpoints = ACTIVE_TEST_ENDPOINTS;
     globServer?.close();
 
     vi.restoreAllMocks();
@@ -304,194 +113,35 @@ describe('MastraInngestWorkflow', () => {
         handlerUrl: 'http://localhost:43124/inngest/api',
         dockerServeOrigin: 'http://host.docker.internal:43124',
         servePath: '/inngest/api',
-        standaloneCliCommand:
-          'npx inngest-cli dev -p 43123 -u http://localhost:43124/inngest/api --poll-interval=1 --retry-interval=1',
       });
-      expect(getLocalTestEndpoints(ctx)).toBe(LOCAL_TEST_ENDPOINTS);
+      expect(getLocalTestEndpoints(ctx)).toBe(ACTIVE_TEST_ENDPOINTS);
       expect(LOCAL_TEST_ENDPOINTS.ports).toEqual({
         inngestPort: ADAPTER_INNGEST_PORT,
         handlerPort: ADAPTER_HANDLER_PORT,
       });
       expect(LOCAL_TEST_ENDPOINTS.ports.inngestPort).not.toBe(DURABLE_AGENT_INNGEST_PORT);
       expect(LOCAL_TEST_ENDPOINTS.ports.handlerPort).not.toBe(DURABLE_AGENT_HANDLER_PORT);
-      expect(getDockerRegisterOptions(endpoints, false)).toEqual({});
-      expect(getDockerRegisterOptions(endpoints, true)).toEqual({
+      expect(getDockerRegisterOptions(endpoints, null)).toEqual({});
+      expect(getDockerRegisterOptions(endpoints, endpoints.dockerServeOrigin)).toEqual({
         registerOptions: {
           serveOrigin: 'http://host.docker.internal:43124',
           servePath: '/inngest/api',
         },
       });
+      expect(INNGEST_TEST_RUNTIME.config.endpoints.ports).toBe(LOCAL_TEST_ENDPOINTS.ports);
+      expect(INNGEST_TEST_RUNTIME.config.dockerNetwork).toBe('host');
+      expect(INNGEST_TEST_RUNTIME.config.registrationServeOrigin).toBe('http://127.0.0.1:4201');
 
       const dockerCompose = fs.readFileSync(path.resolve(import.meta.dirname, '../docker-compose.yaml'), 'utf8');
       expect(dockerCompose).toContain(
-        `command: inngest dev -p ${LOCAL_TEST_ENDPOINTS.ports.inngestPort} -u ${LOCAL_TEST_ENDPOINTS.dockerServeOrigin}${LOCAL_TEST_ENDPOINTS.servePath} --poll-interval=1`,
+        `command: inngest dev -p ${LOCAL_TEST_ENDPOINTS.ports.inngestPort} -u ${INNGEST_TEST_RUNTIME.config.registrationServeOrigin}${LOCAL_TEST_ENDPOINTS.servePath} --poll-interval=1`,
       );
-      expect(dockerCompose).toContain(
-        `- '${LOCAL_TEST_ENDPOINTS.ports.inngestPort}:${LOCAL_TEST_ENDPOINTS.ports.inngestPort}'`,
-      );
-    });
-
-    it('probes the supplied non-default dev-server endpoint during detection', async () => {
-      const endpoints = createLocalTestEndpoints({ inngestPort: 43123, handlerPort: 43124 });
-      const previousServerRunning = inngestServerRunning;
-      const previousDockerMode = useDockerInngest;
-      const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response());
-      vi.stubEnv('MASTRA_INNGEST_TEST_DOCKER', '0');
-      inngestServerRunning = false;
-      useDockerInngest = false;
-
-      try {
-        await expect(detectDockerInngest(endpoints)).resolves.toBe(false);
-        expect(fetchMock).toHaveBeenCalledTimes(1);
-        expect(fetchMock.mock.calls[0]?.[0]).toBe(endpoints.devServerUrl);
-        expect(inngestServerRunning).toBe(true);
-        expect(useDockerInngest).toBe(false);
-      } finally {
-        inngestServerRunning = previousServerRunning;
-        useDockerInngest = previousDockerMode;
-        vi.unstubAllEnvs();
-        fetchMock.mockRestore();
-      }
-    });
-
-    it('uses supplied non-default endpoints for handler registration and polling', async () => {
-      const endpoints = createLocalTestEndpoints({ inngestPort: 43123, handlerPort: 43124 });
-      const previousServerRunning = inngestServerRunning;
-      const previousProcess = standaloneInngestProcess;
-      const fetchMock = vi
-        .spyOn(globalThis, 'fetch')
-        .mockResolvedValueOnce(new Response())
-        .mockResolvedValueOnce(
-          new Response(JSON.stringify({ functions: [{ id: 'workflow.port-wiring' }] }), {
-            headers: { 'content-type': 'application/json' },
-          }),
-        );
-      inngestServerRunning = true;
-
-      try {
-        await resetInngest(endpoints, ['workflow.port-wiring']);
-        expect(fetchMock).toHaveBeenCalledTimes(2);
-        expect(fetchMock).toHaveBeenNthCalledWith(1, endpoints.handlerUrl, { method: 'PUT' });
-        expect(fetchMock).toHaveBeenNthCalledWith(2, endpoints.devServerUrl);
-        expect(standaloneInngestProcess).toBe(previousProcess);
-      } finally {
-        inngestServerRunning = previousServerRunning;
-        fetchMock.mockRestore();
-      }
-    });
-
-    it('launches the primary standalone lane with the supplied endpoint command', async () => {
-      const endpoints = createLocalTestEndpoints({ inngestPort: 43123, handlerPort: 43124 });
-      const previousServerRunning = inngestServerRunning;
-      const previousProcess = standaloneInngestProcess;
-      const fakeProcess = { kill: vi.fn() } as unknown as ResultPromise;
-      const launcher = vi.fn<LocalInngestLauncher>(() => fakeProcess);
-      const fetchMock = vi
-        .spyOn(globalThis, 'fetch')
-        .mockResolvedValueOnce(new Response())
-        .mockResolvedValueOnce(new Response())
-        .mockResolvedValueOnce(
-          new Response(JSON.stringify({ functions: [{ id: 'workflow.primary-launch' }] }), {
-            headers: { 'content-type': 'application/json' },
-          }),
-        );
-      inngestServerRunning = false;
-      standaloneInngestProcess = null;
-
-      try {
-        await resetInngest(endpoints, ['workflow.primary-launch'], launcher);
-        expect(launcher).toHaveBeenCalledOnce();
-        expect(launcher).toHaveBeenCalledWith(endpoints.standaloneCliCommand, {
-          cwd: import.meta.dirname,
-          stdio: 'ignore',
-          reject: false,
-        });
-        expect(fetchMock.mock.calls.map(([input]) => input)).toEqual([
-          endpoints.devServerUrl,
-          endpoints.handlerUrl,
-          endpoints.devServerUrl,
-        ]);
-        expect(standaloneInngestProcess).toBe(fakeProcess);
-      } finally {
-        inngestServerRunning = previousServerRunning;
-        standaloneInngestProcess = previousProcess;
-        fetchMock.mockRestore();
-      }
-    });
-
-    it('uses supplied non-default endpoints in the shared handler and polling helpers', async () => {
-      const endpoints = createLocalTestEndpoints({ inngestPort: 43123, handlerPort: 43124 });
-      const fetchMock = vi
-        .spyOn(globalThis, 'fetch')
-        .mockResolvedValueOnce(new Response())
-        .mockResolvedValueOnce(
-          new Response(JSON.stringify({ functions: [{ id: 'workflow.shared-port-wiring' }] }), {
-            headers: { 'content-type': 'application/json' },
-          }),
-        );
-
-      try {
-        await expect(waitForSharedHandler(endpoints, 1, 0)).resolves.toBe(true);
-        await expect(waitForSharedFunctionRegistration(endpoints, ['workflow.shared-port-wiring'], 1)).resolves.toBe(
-          true,
-        );
-        expect(fetchMock).toHaveBeenNthCalledWith(1, endpoints.handlerUrl, { method: 'GET' });
-        expect(fetchMock).toHaveBeenNthCalledWith(2, endpoints.devServerUrl);
-      } finally {
-        fetchMock.mockRestore();
-      }
-    });
-
-    it('launches the shared standalone lane with the supplied endpoint command', async () => {
-      const endpoints = createLocalTestEndpoints({ inngestPort: 43123, handlerPort: 43124 });
-      const previousServerRunning = _sharedInngestServerRunning;
-      const previousProcess = sharedInngestProcess;
-      const fakeProcess = { kill: vi.fn() } as unknown as ResultPromise;
-      const launcher = vi.fn<LocalInngestLauncher>(() => fakeProcess);
-      const fetchMock = vi
-        .spyOn(globalThis, 'fetch')
-        .mockResolvedValueOnce(new Response())
-        .mockResolvedValueOnce(new Response(null, { status: 503 }))
-        .mockResolvedValueOnce(new Response())
-        .mockResolvedValueOnce(new Response())
-        .mockResolvedValueOnce(
-          new Response(JSON.stringify({ functions: [{ id: 'workflow.shared-launch' }] }), {
-            headers: { 'content-type': 'application/json' },
-          }),
-        );
-      _sharedInngestServerRunning = false;
-      sharedInngestProcess = null;
-
-      try {
-        await startSharedInngest(endpoints, ['workflow.shared-launch'], launcher);
-        expect(launcher).toHaveBeenCalledOnce();
-        expect(launcher).toHaveBeenCalledWith(endpoints.standaloneCliCommand, {
-          cwd: import.meta.dirname,
-          stdio: 'ignore',
-          reject: false,
-        });
-        expect(fetchMock.mock.calls.map(([input]) => input)).toEqual([
-          endpoints.handlerUrl,
-          endpoints.devServerUrl,
-          endpoints.devServerUrl,
-          endpoints.handlerUrl,
-          endpoints.devServerUrl,
-        ]);
-        expect(sharedInngestProcess).toBe(fakeProcess);
-      } finally {
-        _sharedInngestServerRunning = previousServerRunning;
-        sharedInngestProcess = previousProcess;
-        fetchMock.mockRestore();
-      }
+      expect(dockerCompose).toContain('network_mode: host');
     });
   });
 
   afterAll(async () => {
     globServer?.close();
-    if (standaloneInngestProcess) {
-      standaloneInngestProcess.kill();
-      standaloneInngestProcess = null;
-    }
   });
 
   describe.sequential('FGA actor signal', () => {
@@ -2040,11 +1690,8 @@ describe('MastraInngestWorkflow', () => {
         steps: [step1],
       });
 
-      workflow
-        .then(step1)
-        .sleepUntil(new Date(Date.now() + 1000))
-        .then(step2)
-        .commit();
+      const sleepUntil = new Date(Date.now() + 1000);
+      workflow.then(step1).sleepUntil(sleepUntil).then(step2).commit();
 
       const mastra = new Mastra({
         storage: new DefaultStorage({
@@ -2074,7 +1721,6 @@ describe('MastraInngestWorkflow', () => {
       await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
-      const startTime = Date.now();
       const result = await run.start({ inputData: {} });
       const endTime = Date.now();
 
@@ -2095,7 +1741,7 @@ describe('MastraInngestWorkflow', () => {
         // endedAt: expect.any(Number),
       });
 
-      expect(endTime - startTime).toBeGreaterThan(1000);
+      expect(endTime).toBeGreaterThanOrEqual(sleepUntil.getTime());
 
       srv.close();
     });
@@ -14974,180 +14620,8 @@ describe('MastraInngestWorkflow', () => {
 // Shared infrastructure - created once for all shared suite tests
 let sharedInngest: Inngest;
 let sharedMastra: Mastra;
-let sharedServer: ServerType;
+let sharedServer: ServerType | undefined;
 let sharedStorage: DefaultStorage;
-let sharedInngestProcess: ResultPromise | null = null;
-
-// Whether the shared Inngest dev server is already running on the suite port (Docker
-// or host CLI), as opposed to one we start ourselves. Tracked for diagnostics
-// but not read directly — the actual switching happens via `usingDocker` below.
-let _sharedInngestServerRunning = false;
-// Whether that already-running shared server is *Docker* specifically. Only
-// Docker requires rewriting the SDK origin to `host.docker.internal`.
-let usingDocker = false;
-
-/**
- * Wait for handler to be responding to requests
- */
-async function waitForSharedHandler(
-  endpoints: LocalTestEndpoints,
-  maxAttempts = 30,
-  intervalMs = 100,
-): Promise<boolean> {
-  for (let i = 0; i < maxAttempts; i++) {
-    try {
-      const response = await fetch(endpoints.handlerUrl, { method: 'GET' });
-      // The handler returns 200 on GET with function info
-      if (response.ok || response.status === 405) {
-        console.log(`[waitForSharedHandler] Handler ready after ${i + 1} attempts`);
-        return true;
-      }
-    } catch {
-      // Connection refused, keep trying
-    }
-    await new Promise(resolve => setTimeout(resolve, intervalMs));
-  }
-  console.log('[waitForSharedHandler] Handler not ready after max attempts');
-  return false;
-}
-
-/**
- * Wait until the shared dev server reports `expectedFnIds` are all registered.
- * Falls back to "any function present" if no expected ids are passed.
- */
-async function waitForSharedFunctionRegistration(
-  endpoints: LocalTestEndpoints,
-  expectedFnIds: string[] = [],
-  maxAttempts = 30,
-): Promise<boolean> {
-  const matches = (id: string, candidate: string) =>
-    candidate === id || candidate.endsWith(`-${id}`) || candidate.endsWith(`.${id}`);
-  for (let i = 0; i < maxAttempts; i++) {
-    try {
-      const response = await fetch(endpoints.devServerUrl);
-      const data = await response.json();
-      const fns = (data.functions ?? []) as Array<{ slug?: string; id?: string; name?: string }>;
-      const candidates = fns.flatMap(f => [f.slug, f.id, f.name].filter(Boolean) as string[]);
-      if (expectedFnIds.length > 0) {
-        if (expectedFnIds.every(id => candidates.some(c => matches(id, c)))) {
-          console.log(`[waitForSharedFunctionRegistration] all ${expectedFnIds.length} expected functions registered`);
-          return true;
-        }
-      } else if (fns.length > 0) {
-        return true;
-      }
-    } catch {
-      // Keep trying
-    }
-    if (i === Math.floor(maxAttempts / 3)) {
-      // Re-trigger registration mid-wait in case the first PUT raced startup
-      try {
-        await fetch(endpoints.handlerUrl, { method: 'PUT' });
-      } catch {
-        // Ignore
-      }
-    }
-    await new Promise(resolve => setTimeout(resolve, 1000));
-  }
-  return false;
-}
-
-/**
- * Ensure the Inngest dev server is running and has registered our functions.
- *
- * Uses the npm-installed inngest-cli binary (no Docker required).
- * The dev server polls the handler URL for function definitions.
- */
-async function startSharedInngest(
-  endpoints: LocalTestEndpoints,
-  expectedFnIds: string[] = [],
-  launcher: LocalInngestLauncher = launchLocalInngest,
-) {
-  // First, verify the handler is responding
-  console.log('[startSharedInngest] Verifying handler is responding...');
-  const handlerReady = await waitForSharedHandler(endpoints);
-  if (!handlerReady) {
-    throw new Error('Handler not responding on port ' + endpoints.ports.handlerPort);
-  }
-
-  // Check if a server is already running (Docker or host CLI). Don't equate
-  // "port reachable" with "Docker" — that would break host inngest-cli setups.
-  try {
-    const response = await fetch(endpoints.devServerUrl);
-    if (response.ok) {
-      _sharedInngestServerRunning = true;
-      console.log(`[startSharedInngest] Inngest already running on port ${endpoints.ports.inngestPort}`);
-      // Trigger registration so the running server picks up *this* run's
-      // workflows (its previous registry may be stale from an earlier suite).
-      try {
-        await fetch(endpoints.handlerUrl, { method: 'PUT' });
-      } catch {
-        // Ignore
-      }
-      const ok = await waitForSharedFunctionRegistration(endpoints, expectedFnIds);
-      if (!ok && expectedFnIds.length > 0) {
-        throw new Error(`[startSharedInngest] expected functions not registered: ${expectedFnIds.join(', ')}`);
-      }
-      return;
-    }
-  } catch {
-    // Not running yet
-  }
-
-  // Start the inngest dev server as a background process using the npm CLI
-  console.log('[startSharedInngest] Starting Inngest dev server via inngest-cli...');
-  sharedInngestProcess = launcher(endpoints.standaloneCliCommand, {
-    cwd: import.meta.dirname,
-    stdio: 'ignore',
-    reject: false,
-  });
-
-  // Wait for the dev server to be ready
-  console.log('[startSharedInngest] Waiting for Inngest dev server to be ready...');
-  for (let i = 0; i < 30; i++) {
-    try {
-      const response = await fetch(endpoints.devServerUrl);
-      if (response.ok) {
-        console.log(`[startSharedInngest] Inngest dev server ready after ${i + 1} attempts`);
-        break;
-      }
-    } catch {
-      // Keep trying
-    }
-    await new Promise(resolve => setTimeout(resolve, 500));
-  }
-
-  // Trigger registration by sending PUT to the handler
-  // This makes the handler send its function definitions to the dev server
-  console.log('[startSharedInngest] Triggering function registration via PUT...');
-  try {
-    await fetch(endpoints.handlerUrl, { method: 'PUT' });
-  } catch (e) {
-    console.log('[startSharedInngest] PUT registration failed:', e);
-  }
-
-  // Wait for the *expected* set of functions to register, not just "any"
-  console.log('[startSharedInngest] Waiting for function registration...');
-  const ok = await waitForSharedFunctionRegistration(endpoints, expectedFnIds);
-  if (!ok) {
-    if (expectedFnIds.length > 0) {
-      throw new Error(
-        `[startSharedInngest] expected functions not registered after polling: ${expectedFnIds.join(', ')}`,
-      );
-    }
-    throw new Error('[startSharedInngest] No functions registered after 30 attempts - aborting test suite');
-  }
-}
-
-/**
- * Stop the Inngest dev server
- */
-async function stopSharedInngest() {
-  if (sharedInngestProcess) {
-    sharedInngestProcess.kill();
-    sharedInngestProcess = null;
-  }
-}
 
 createWorkflowTestSuite({
   name: 'Workflow (Inngest Engine)',
@@ -15157,7 +14631,7 @@ createWorkflowTestSuite({
     if (!sharedInngest) {
       sharedInngest = new Inngest({
         id: 'mastra-workflow-tests',
-        baseUrl: LOCAL_TEST_ENDPOINTS.clientBaseUrl,
+        baseUrl: ACTIVE_TEST_ENDPOINTS.clientBaseUrl,
       });
     }
     return init(sharedInngest);
@@ -15173,39 +14647,6 @@ createWorkflowTestSuite({
    * 3. Wait for sync to complete
    */
   registerWorkflows: async (registry: WorkflowRegistry) => {
-    // Detect whether a server is already running (Docker or host CLI). Don't
-    // equate "port reachable" with "Docker" — only set `usingDocker` when we
-    // can confirm it via an explicit Docker indicator.
-    try {
-      const response = await fetch(LOCAL_TEST_ENDPOINTS.devServerUrl);
-      if (response.ok) {
-        _sharedInngestServerRunning = true;
-        if (process.env.MASTRA_INNGEST_TEST_DOCKER === '1') {
-          usingDocker = true;
-        } else if (process.env.MASTRA_INNGEST_TEST_DOCKER === '0') {
-          usingDocker = false;
-        } else if (isInsideContainer()) {
-          usingDocker = true;
-        } else {
-          try {
-            const psResult = await execaCommand('docker ps --filter name=mastra-inngest-test --format {{.Names}}', {
-              reject: false,
-            });
-            if (typeof psResult.stdout === 'string' && psResult.stdout.includes('mastra-inngest-test')) {
-              usingDocker = true;
-            }
-          } catch {
-            // docker CLI unavailable — assume host inngest-cli, not Docker.
-          }
-        }
-        console.log(
-          `[registerWorkflows] dev server reachable on port ${LOCAL_TEST_ENDPOINTS.ports.inngestPort} (usingDocker=${usingDocker})`,
-        );
-      }
-    } catch {
-      // Not running yet, will use inngest-cli
-    }
-
     // Collect all workflows from registry
     const workflows: Record<string, InngestWorkflow<any, any, any, any, any, any, any>> = {};
     for (const [id, entry] of Object.entries(registry)) {
@@ -15218,8 +14659,7 @@ createWorkflowTestSuite({
       url: ':memory:',
     });
 
-    // When using Docker, the Inngest container needs to reach the host via host.docker.internal
-    const serveOrigin = usingDocker ? LOCAL_TEST_ENDPOINTS.dockerServeOrigin : undefined;
+    const serveOrigin = INNGEST_TEST_RUNTIME.config.registrationServeOrigin;
     console.log(`[registerWorkflows] serveOrigin=${serveOrigin}`);
 
     // Create Mastra with all workflows
@@ -15229,13 +14669,13 @@ createWorkflowTestSuite({
       server: {
         apiRoutes: [
           {
-            path: LOCAL_TEST_ENDPOINTS.servePath,
+            path: ACTIVE_TEST_ENDPOINTS.servePath,
             method: 'ALL',
             createHandler: async ({ mastra }) => {
               const opts = {
                 mastra,
                 inngest: sharedInngest,
-                registerOptions: serveOrigin ? { serveOrigin, servePath: LOCAL_TEST_ENDPOINTS.servePath } : undefined,
+                registerOptions: serveOrigin ? { serveOrigin, servePath: ACTIVE_TEST_ENDPOINTS.servePath } : undefined,
               };
               console.log(
                 '[createHandler] inngestServe options:',
@@ -15261,21 +14701,24 @@ createWorkflowTestSuite({
     const app = await createHonoServer(sharedMastra);
     sharedServer = serve({
       fetch: app.fetch,
-      port: LOCAL_TEST_ENDPOINTS.ports.handlerPort,
+      port: ACTIVE_TEST_ENDPOINTS.ports.handlerPort,
     });
-    console.log(`[registerWorkflows] Handler server started on port ${LOCAL_TEST_ENDPOINTS.ports.handlerPort}`);
+    console.log(`[registerWorkflows] Handler server started on port ${ACTIVE_TEST_ENDPOINTS.ports.handlerPort}`);
 
-    // Wait for handler to be fully ready before starting Inngest
-    await new Promise(resolve => setTimeout(resolve, 500));
-
-    // Now start Inngest (this also triggers registration via PUT with url body).
-    // We pass through the expected function ids so the registration wait verifies
-    // *our* workflows have synced — not just that the dev server has at least one
-    // function left over from a previous suite.
-    const expectedFnIds = Object.keys(workflows).map(id => `workflow.${id}`);
+    const expectedFnIds = [...new Set(Object.values(workflows).map(workflow => `workflow.${workflow.id}`))];
+    console.log(
+      `[registerWorkflows] Waiting for ${expectedFnIds.length} unique functions from ` +
+        `${Object.keys(workflows).length} registry entries`,
+    );
     console.log('[registerWorkflows] Starting Inngest...');
-    await startSharedInngest(LOCAL_TEST_ENDPOINTS, expectedFnIds);
-    console.log('[registerWorkflows] Inngest started and functions registered');
+    try {
+      await INNGEST_TEST_RUNTIME.ensureReady(expectedFnIds);
+      console.log('[registerWorkflows] Inngest started and functions registered');
+    } catch (error) {
+      await new Promise<void>(resolve => sharedServer.close(() => resolve()));
+      sharedServer = undefined;
+      throw error;
+    }
   },
 
   // Provide access to storage for tests that need to spy on storage operations
@@ -15291,8 +14734,8 @@ createWorkflowTestSuite({
     // Close server
     if (sharedServer) {
       await new Promise<void>(resolve => sharedServer.close(() => resolve()));
+      sharedServer = undefined;
     }
-    await stopSharedInngest();
   },
 
   beforeEach: async () => {

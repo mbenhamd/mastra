@@ -239,35 +239,6 @@ jobs:
           docker logs mastra-fork-pubsub-emulator
           exit 1
 
-      - name: Start pinned Inngest dev server when index suite is owned
-        env:
-          BASE_SHA: ${{ steps.trusted-base.outputs.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          if git diff --quiet "${BASE_SHA}...${HEAD_SHA}" -- workflows/inngest/src/index.test.ts; then
-            echo 'Inngest index suite unchanged; no dev server required.'
-            exit 0
-          fi
-          # Do not execute the PR-controlled Compose file. The trusted workflow
-          # starts the exact reviewed image and endpoint topology; the validator
-          # separately parses the changed Compose file for the PF-2042 trio.
-          docker run --detach --name mastra-inngest-test \
-            --add-host host.docker.internal:host-gateway \
-            --publish 4200:4200 \
-            inngest/inngest@sha256:4e1a3ab68036114bbdf2208d3a3ab8a135a106bb39199bdef031794294e60852 \
-            inngest dev -p 4200 \
-              -u http://host.docker.internal:4201/inngest/api \
-              --poll-interval=1
-          for _attempt in {1..60}; do
-            if curl --fail --silent --show-error http://127.0.0.1:4200/dev >/dev/null 2>&1; then
-              echo 'MASTRA_INNGEST_TEST_DOCKER=1' >> "$GITHUB_ENV"
-              exit 0
-            fi
-            sleep 1
-          done
-          docker logs mastra-inngest-test
-          exit 1
-
       - name: Validate fork PR
         env:
           BASE_SHA: ${{ steps.trusted-base.outputs.sha }}
@@ -328,10 +299,3 @@ jobs:
               /bin/bash "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash"
               ;;
           esac
-
-      - name: Stop pinned Inngest dev server
-        if: always()
-        run: |
-          if docker container inspect mastra-inngest-test >/dev/null 2>&1; then
-            docker rm --force mastra-inngest-test
-          fi
