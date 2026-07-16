@@ -41,6 +41,8 @@ import { createExecuteWriteOperationWithRetry, safeStringify } from '../../db/ut
 import { withClientWriteLock } from '../../db/write-lock';
 import { runPrune, resolveTargets } from '../../retention';
 
+const MAX_RESUME_CAS_ATTEMPTS = 100;
+
 export class WorkflowsLibSQL extends WorkflowsStorage {
   /**
    * Workflow run snapshots accumulate as runs execute. Anchored on `updatedAt`
@@ -97,40 +99,65 @@ export class WorkflowsLibSQL extends WorkflowsStorage {
     return this.executeWithRetry(
       () =>
         withClientWriteLock(this.#client, async () => {
-          const tx = await this.#client.transaction('write');
-          try {
-            const row = await tx.execute({
+          // A bare LibSQL `:memory:` database is private to each connection.
+          // Interactive transactions move the client onto another connection,
+          // which therefore cannot see the initialized schema. Use an optimistic
+          // compare-and-swap instead: the conditional UPDATE is one atomic
+          // statement across local and remote clients, and a changed predecessor
+          // retries the complete read/transform/write operation.
+          for (let attempt = 0; attempt < MAX_RESUME_CAS_ATTEMPTS; attempt++) {
+            const row = await this.#client.execute({
               sql: `SELECT json(snapshot) as snapshot, resourceId FROM ${TABLE_WORKFLOW_SNAPSHOT} WHERE workflow_name = ? AND run_id = ?`,
               args: [workflowName, runId],
             });
             const retained = row.rows?.[0];
-            const snapshot = retained?.snapshot
+            const serializedSnapshot = retained?.snapshot;
+            const snapshot = serializedSnapshot
               ? this.materializeResumeSnapshot(
-                  typeof retained.snapshot === 'string' ? JSON.parse(retained.snapshot) : retained.snapshot,
+                  typeof serializedSnapshot === 'string' ? JSON.parse(serializedSnapshot) : serializedSnapshot,
                 )
               : undefined;
             const outcome = mutate(snapshot);
             const { snapshot: updatedSnapshot, ...publicResult } = outcome;
-            if (updatedSnapshot && retained) {
-              const retainedResourceId =
-                (retained.resourceId as string | null | undefined) ?? updatedSnapshot.resourceId ?? resourceId ?? null;
-              await tx.execute({
-                sql: `UPDATE ${TABLE_WORKFLOW_SNAPSHOT} SET resourceId = ?, snapshot = jsonb(?), updatedAt = ? WHERE workflow_name = ? AND run_id = ?`,
-                args: [
-                  retainedResourceId,
-                  safeStringify(updatedSnapshot),
-                  new Date().toISOString(),
-                  workflowName,
-                  runId,
-                ],
+            if (!updatedSnapshot) return publicResult as T;
+
+            const retainedResourceId =
+              (retained?.resourceId as string | null | undefined) ?? updatedSnapshot.resourceId ?? resourceId ?? null;
+            if (!retained || serializedSnapshot === undefined || serializedSnapshot === null) {
+              const now = new Date().toISOString();
+              const inserted = await this.#client.execute({
+                sql: `INSERT INTO ${TABLE_WORKFLOW_SNAPSHOT} (workflow_name, run_id, resourceId, snapshot, createdAt, updatedAt)
+                      VALUES (?, ?, ?, jsonb(?), ?, ?)
+                      ON CONFLICT(workflow_name, run_id) DO NOTHING`,
+                args: [workflowName, runId, retainedResourceId, safeStringify(updatedSnapshot), now, now],
               });
+              if (inserted.rowsAffected === 1) return publicResult as T;
+
+              await new Promise(resolve => setTimeout(resolve, Math.min(attempt + 1, 10)));
+              continue;
             }
-            await tx.commit();
-            return publicResult as T;
-          } catch (error) {
-            if (!tx.closed) await tx.rollback();
-            throw error;
+
+            const updated = await this.#client.execute({
+              sql: `UPDATE ${TABLE_WORKFLOW_SNAPSHOT}
+                    SET resourceId = ?, snapshot = jsonb(?), updatedAt = ?
+                    WHERE workflow_name = ? AND run_id = ? AND json(snapshot) = ?`,
+              args: [
+                retainedResourceId,
+                safeStringify(updatedSnapshot),
+                new Date().toISOString(),
+                workflowName,
+                runId,
+                String(serializedSnapshot),
+              ],
+            });
+            if (updated.rowsAffected === 1) return publicResult as T;
+
+            await new Promise(resolve => setTimeout(resolve, Math.min(attempt + 1, 10)));
           }
+
+          throw new Error(
+            `Workflow resume mutation did not converge after ${MAX_RESUME_CAS_ATTEMPTS} compare-and-swap attempts`,
+          );
         }),
       operation,
     );
@@ -181,54 +208,11 @@ export class WorkflowsLibSQL extends WorkflowsStorage {
   }
 
   async persistWorkflowStepUpdate(input: PersistWorkflowStepUpdateInput): Promise<PersistWorkflowStepUpdateResult> {
-    return this.executeWithRetry(
-      () =>
-        withClientWriteLock(this.#client, async () => {
-          const tx = await this.#client.transaction('write');
-          try {
-            const row = await tx.execute({
-              sql: `SELECT json(snapshot) as snapshot, resourceId FROM ${TABLE_WORKFLOW_SNAPSHOT} WHERE workflow_name = ? AND run_id = ?`,
-              args: [input.workflowName, input.runId],
-            });
-            const retained = row.rows?.[0];
-            const snapshot = retained?.snapshot
-              ? this.materializeResumeSnapshot(
-                  typeof retained.snapshot === 'string' ? JSON.parse(retained.snapshot) : retained.snapshot,
-                )
-              : undefined;
-            const outcome = persistWorkflowStepUpdateRecord(snapshot, input, value =>
-              this.materializeResumeSnapshot(value),
-            );
-            const { snapshot: updatedSnapshot, ...result } = outcome;
-            if (updatedSnapshot) {
-              const now = new Date().toISOString();
-              const retainedResourceId =
-                (retained?.resourceId as string | null | undefined) ??
-                updatedSnapshot.resourceId ??
-                input.resourceId ??
-                null;
-              await tx.execute({
-                sql: `INSERT INTO ${TABLE_WORKFLOW_SNAPSHOT} (workflow_name, run_id, resourceId, snapshot, createdAt, updatedAt)
-                      VALUES (?, ?, ?, jsonb(?), ?, ?)
-                      ON CONFLICT(workflow_name, run_id)
-                      DO UPDATE SET resourceId = excluded.resourceId, snapshot = excluded.snapshot, updatedAt = excluded.updatedAt`,
-                args: [
-                  input.workflowName,
-                  input.runId,
-                  retainedResourceId,
-                  safeStringify(updatedSnapshot),
-                  now,
-                  now,
-                ],
-              });
-            }
-            await tx.commit();
-            return result;
-          } catch (error) {
-            if (!tx.closed) await tx.rollback();
-            throw error;
-          }
-        }),
+    return this.mutateWorkflowResume(
+      input.workflowName,
+      input.runId,
+      input.resourceId,
+      snapshot => persistWorkflowStepUpdateRecord(snapshot, input, value => this.materializeResumeSnapshot(value)),
       'persistWorkflowStepUpdate',
     );
   }

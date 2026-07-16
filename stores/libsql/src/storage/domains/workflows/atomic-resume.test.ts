@@ -1,8 +1,10 @@
 import { createClient } from '@libsql/client';
 import { expectAtomicWorkflowResumeStorageContract } from '@internal/storage-test-utils';
 import { InMemoryDB, TABLE_SCHEMAS, TABLE_WORKFLOW_SNAPSHOT, WorkflowsInMemory } from '@mastra/core/storage';
-import { describe, it } from 'vitest';
+import type { WorkflowRunState } from '@mastra/core/workflows';
+import { describe, expect, it } from 'vitest';
 import { LibSQLDB } from '../../db';
+import { LibSQLStore } from '../..';
 import { WorkflowsLibSQL } from '.';
 
 describe('atomic workflow resume storage contract', () => {
@@ -15,7 +17,7 @@ describe('atomic workflow resume storage contract', () => {
     });
   });
 
-  it('holds for LibSQL transactions and JSON materialization', async () => {
+  it('holds across LibSQL clients and JSON materialization', async () => {
     const client = createClient({ url: 'file::memory:?cache=shared' });
     const concurrentClient = createClient({ url: 'file::memory:?cache=shared' });
     const primary = new WorkflowsLibSQL({ client, maxRetries: 5, initialBackoffMs: 1 });
@@ -34,6 +36,57 @@ describe('atomic workflow resume storage contract', () => {
     } finally {
       client.close();
       concurrentClient.close();
+    }
+  });
+
+  it('holds for the standard isolated :memory: store', async () => {
+    const store = new LibSQLStore({ id: 'atomic-resume-bare-memory', url: ':memory:' });
+    try {
+      await store.init();
+      const workflows = await store.getStore('workflows');
+      await expectAtomicWorkflowResumeStorageContract({
+        primary: workflows!,
+        workflowName: 'atomic-resume-bare-memory',
+      });
+    } finally {
+      await store.close();
+    }
+  });
+
+  it('inserts an ordinary unfenced first step update', async () => {
+    const store = new LibSQLStore({ id: 'first-step-update-bare-memory', url: ':memory:' });
+    try {
+      await store.init();
+      const workflows = (await store.getStore('workflows'))!;
+      const snapshot = {
+        runId: 'first-step-update-run',
+        status: 'running',
+        value: {},
+        context: {},
+        serializedStepGraph: [],
+        activePaths: [],
+        activeStepsPath: {},
+        suspendedPaths: {},
+        resumeLabels: {},
+        waitingPaths: {},
+        timestamp: 1,
+      } as WorkflowRunState;
+
+      await expect(
+        workflows.persistWorkflowStepUpdate({
+          workflowName: 'first-step-update-workflow',
+          runId: snapshot.runId,
+          snapshot,
+        }),
+      ).resolves.toEqual({ status: 'persisted' });
+      await expect(
+        workflows.loadWorkflowSnapshot({
+          workflowName: 'first-step-update-workflow',
+          runId: snapshot.runId,
+        }),
+      ).resolves.toMatchObject({ runId: snapshot.runId, status: 'running' });
+    } finally {
+      await store.close();
     }
   });
 });
