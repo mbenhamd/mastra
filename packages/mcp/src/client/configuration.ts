@@ -21,24 +21,52 @@ import type { MastraMCPServerDefinition, MCPServerAuthState } from './client';
 import { isReconnectableMCPError } from './error-utils';
 import { createOAuthCallbackServer, getCallbackUrlCandidates } from './oauth-callback-server';
 import type { OAuthCallbackServer } from './oauth-callback-server';
+import { hasSameLoopbackCallbackTarget, normalizeLoopbackCallbackUrl } from './oauth-loopback';
 import { MCPOAuthClientProvider } from './oauth-provider';
 import { MCPClientServerProxy } from './server-proxy';
 
 const mcpClientInstances = new Map<string, InstanceType<typeof MCPClient>>();
 const TOOL_DISCOVERY_MAX_ATTEMPTS = 2;
 
-// Matches the entire 127.0.0.0/8 range in dotted-quad form. `URL` normalizes
-// IPv4 hosts to four octets (so `127.1` becomes `127.0.0.1`), so anchoring the
-// pattern is enough — and it rejects lookalikes like `127.evil.com` that a
-// prefix check would wrongly accept and leak the authorization code to.
-const LOOPBACK_IPV4 = /^127\.(?:\d{1,3})\.(?:\d{1,3})\.(?:\d{1,3})$/;
+function clientRegistrationCanBeReused(
+  redirectUris: string[],
+  configuredRedirectUrl: URL,
+  boundRedirectUrl: URL,
+): boolean {
+  const boundRedirect = boundRedirectUrl.toString();
+  if (
+    redirectUris.some(uri => {
+      try {
+        return normalizeLoopbackCallbackUrl(uri).url.toString() === boundRedirect;
+      } catch {
+        return false;
+      }
+    })
+  ) {
+    return true;
+  }
 
-// Whether a hostname is a loopback address authenticate() accepts for the
-// provider's redirect URL (RFC 8252 loopback redirection). Kept in sync with the
-// mastracode config parser, which accepts any 127.0.0.0/8 host, so a config that
-// parses (e.g. 127.0.0.2) does not later fail here.
-function isLoopbackHostname(hostname: string): boolean {
-  return hostname === 'localhost' || hostname === '[::1]' || hostname === '::1' || LOOPBACK_IPV4.test(hostname);
+  // A :0 preference intentionally binds a different ephemeral port in each
+  // process. Preserve a persisted client registration when its prior concrete
+  // callback differs only by that port, so its refresh token remains paired
+  // with the client_id that the authorization server issued it to.
+  if (configuredRedirectUrl.port !== '0' || !hasSameLoopbackCallbackTarget(configuredRedirectUrl, boundRedirectUrl)) {
+    return false;
+  }
+
+  return redirectUris.some(uri => {
+    try {
+      const registeredRedirectUrl = normalizeLoopbackCallbackUrl(uri).url;
+      return (
+        registeredRedirectUrl.port !== '' &&
+        registeredRedirectUrl.port !== '0' &&
+        hasSameLoopbackCallbackTarget(configuredRedirectUrl, registeredRedirectUrl) &&
+        hasSameLoopbackCallbackTarget(registeredRedirectUrl, boundRedirectUrl)
+      );
+    } catch {
+      return false;
+    }
+  });
 }
 
 /**
@@ -790,9 +818,7 @@ To fix this you have three different options:
         for (const controller of this.authAbortControllersByServer.values()) {
           controller.abort();
         }
-        await Promise.allSettled(
-          Array.from(this.authCallbackServersByServer.values()).map(server => server.close()),
-        );
+        await Promise.allSettled(Array.from(this.authCallbackServersByServer.values()).map(server => server.close()));
         await Promise.allSettled(pendingFlows);
         this.authAbortControllersByServer.clear();
         this.authCallbackServersByServer.clear();
@@ -857,7 +883,7 @@ To fix this you have three different options:
    *
    * @param serverName - The name of the server to authenticate (must match a key in `servers`)
    * @param options.timeoutMs - How long to wait for the browser callback (default 5 minutes)
-   * @throws {Error} If the server has no MCPOAuthClientProvider or its redirect URL is not loopback
+   * @throws {Error} If the server has no MCPOAuthClientProvider or its redirect URL is not a loopback IP literal
    *
    * @example
    * ```typescript
@@ -933,10 +959,12 @@ To fix this you have three different options:
       }
       provider = candidateProvider;
 
-      const redirectUrl = new URL(provider.redirectUrl.toString());
-      if (redirectUrl.protocol !== 'http:' || !isLoopbackHostname(redirectUrl.hostname)) {
+      let redirectUrl: URL;
+      try {
+        redirectUrl = normalizeLoopbackCallbackUrl(provider.redirectUrl).url;
+      } catch (error) {
         throw new Error(
-          `Cannot authenticate MCP server ${serverName}: the provider's redirect URL must be a loopback address, got ${redirectUrl.origin}.`,
+          `Cannot authenticate MCP server ${serverName}: ${error instanceof Error ? error.message : String(error)}`,
         );
       }
 
@@ -955,12 +983,21 @@ To fix this you have three different options:
       // Point the authorization request at the callback URL that actually
       // bound, and register every fallback candidate during dynamic client
       // registration so a future fallback port still matches a registered URI.
-      provider.applyResolvedRedirectUrl(callbackServer.url, getCallbackUrlCandidates(redirectUrl));
+      const boundRedirectUrl = callbackServer.url;
+      // Port 0 has no stable pre-bind URI: register only the reconciled
+      // ephemeral URL rather than guessed low ports that were never bound.
+      const registeredRedirectUrls =
+        redirectUrl.port === '0' ? [boundRedirectUrl] : getCallbackUrlCandidates(redirectUrl);
+      provider.applyResolvedRedirectUrl(boundRedirectUrl, registeredRedirectUrls);
 
-      // Discard a stored client registration that does not cover the bound
-      // callback URL — the authorization server would reject its redirect_uri.
+      // Reuse an exact callback registration, or a prior concrete callback port
+      // for a :0 preference so the SDK can refresh with the persisted client
+      // identity. Other mismatches require a new dynamic registration.
       const clientInfo = (await provider.clientInformation()) as Partial<OAuthClientInformationFull> | undefined;
-      if (clientInfo?.redirect_uris && !clientInfo.redirect_uris.includes(callbackServer.url.toString())) {
+      if (
+        clientInfo?.redirect_uris &&
+        !clientRegistrationCanBeReused(clientInfo.redirect_uris, redirectUrl, boundRedirectUrl)
+      ) {
         await provider.invalidateCredentials('client');
       }
 

@@ -32,6 +32,8 @@ interface FakeAuthorizationServer {
   authorizeRedirectUris: string[];
   /** How many refresh_token grants the token endpoint served. */
   refreshGrantCount: number;
+  /** Client identity used by each successful refresh_token grant. */
+  refreshClientIds: string[];
   /** Access tokens currently accepted by the protected MCP server. */
   validTokens: Set<string>;
   /** When true, the authorization endpoint denies with error=access_denied. */
@@ -56,14 +58,15 @@ function sendJson(res: ServerResponse, statusCode: number, payload: unknown): vo
 async function startFakeAuthorizationServer(port: number): Promise<FakeAuthorizationServer> {
   const url = `http://127.0.0.1:${port}`;
   const clientsById = new Map<string, ClientRegistration>();
-  const pendingCodes = new Map<string, { codeChallenge: string; redirectUri: string }>();
-  const refreshTokens = new Set<string>();
+  const pendingCodes = new Map<string, { clientId: string; codeChallenge: string; redirectUri: string }>();
+  const refreshTokens = new Map<string, string>();
 
   const state: FakeAuthorizationServer = {
     url,
     registrations: [],
     authorizeRedirectUris: [],
     refreshGrantCount: 0,
+    refreshClientIds: [],
     validTokens: new Set(),
     denyAuthorization: false,
     close: () =>
@@ -124,7 +127,7 @@ async function startFakeAuthorizationServer(port: number): Promise<FakeAuthoriza
         location.searchParams.set('error', 'access_denied');
       } else {
         const code = `code-${randomUUID()}`;
-        pendingCodes.set(code, { codeChallenge, redirectUri });
+        pendingCodes.set(code, { clientId, codeChallenge, redirectUri });
         location.searchParams.set('code', code);
       }
       location.searchParams.set('state', oauthState);
@@ -136,22 +139,34 @@ async function startFakeAuthorizationServer(port: number): Promise<FakeAuthoriza
     if (requestUrl.pathname === '/token' && req.method === 'POST') {
       const params = new URLSearchParams(await readBody(req));
       const grantType = params.get('grant_type');
+      let tokenClientId: string;
 
       if (grantType === 'authorization_code') {
         const pending = pendingCodes.get(params.get('code') ?? '');
+        const clientId = params.get('client_id') ?? '';
         const verifier = params.get('code_verifier') ?? '';
         const challenge = createHash('sha256').update(verifier).digest('base64url');
-        if (!pending || pending.codeChallenge !== challenge) {
+        if (
+          !pending ||
+          pending.clientId !== clientId ||
+          pending.redirectUri !== params.get('redirect_uri') ||
+          pending.codeChallenge !== challenge
+        ) {
           sendJson(res, 400, { error: 'invalid_grant' });
           return;
         }
         pendingCodes.delete(params.get('code')!);
+        tokenClientId = clientId;
       } else if (grantType === 'refresh_token') {
-        if (!refreshTokens.has(params.get('refresh_token') ?? '')) {
+        const clientId = params.get('client_id') ?? '';
+        const refreshToken = params.get('refresh_token') ?? '';
+        if (!clientId || refreshTokens.get(refreshToken) !== clientId) {
           sendJson(res, 400, { error: 'invalid_grant' });
           return;
         }
         state.refreshGrantCount += 1;
+        state.refreshClientIds.push(clientId);
+        tokenClientId = clientId;
       } else {
         sendJson(res, 400, { error: 'unsupported_grant_type' });
         return;
@@ -160,7 +175,7 @@ async function startFakeAuthorizationServer(port: number): Promise<FakeAuthoriza
       const accessToken = `access-${randomUUID()}`;
       const refreshToken = `refresh-${randomUUID()}`;
       state.validTokens.add(accessToken);
-      refreshTokens.add(refreshToken);
+      refreshTokens.set(refreshToken, tokenClientId);
       sendJson(res, 200, {
         access_token: accessToken,
         token_type: 'Bearer',
@@ -294,7 +309,10 @@ describe('MCPClient OAuth authorization flow', () => {
     const ports = allocatePortBlock();
     const authServer = await startFakeAuthorizationServer(ports.authPort);
     const mcpServer = await startProtectedMcpServer(ports.mcpPort, authServer);
-    cleanups.push(() => mcpServer.close(), () => authServer.close());
+    cleanups.push(
+      () => mcpServer.close(),
+      () => authServer.close(),
+    );
     return { authServer, mcpServer, ports, callbackUrl: ports.callbackUrl };
   };
 
@@ -312,7 +330,10 @@ describe('MCPClient OAuth authorization flow', () => {
   it('marks the server as needs-auth when the connection is rejected with a 401', async () => {
     const { mcpServer, callbackUrl } = await setup();
     const authorizationUrls: URL[] = [];
-    const provider = createProvider({ callbackUrl, onRedirectToAuthorization: url => void authorizationUrls.push(url) });
+    const provider = createProvider({
+      callbackUrl,
+      onRedirectToAuthorization: url => void authorizationUrls.push(url),
+    });
     const mcp = track(createClient(mcpServer.url, provider));
 
     await expect(mcp.reconnectServer('fixture')).rejects.toThrow();
@@ -344,6 +365,71 @@ describe('MCPClient OAuth authorization flow', () => {
     const tokens = await provider.tokens();
     expect(tokens?.access_token).toBeDefined();
     expect(authServer.validTokens.has(tokens!.access_token)).toBe(true);
+  });
+
+  it('authenticates with port 0 and registers only the actual ephemeral callback URL', async () => {
+    const { authServer, mcpServer } = await setup();
+    const callbackUrl = 'http://127.0.0.1:0/oauth/callback';
+    const provider = createProvider({ callbackUrl, onRedirectToAuthorization: driveBrowser });
+    const mcp = track(createClient(mcpServer.url, provider));
+
+    await mcp.authenticate('fixture');
+
+    expect(mcp.getServerAuthState('fixture')).toBe('authorized');
+    expect(authServer.authorizeRedirectUris).toHaveLength(1);
+    const resolvedRedirectUrl = authServer.authorizeRedirectUris[0]!;
+    expect(Number(new URL(resolvedRedirectUrl).port)).toBeGreaterThan(0);
+    expect(authServer.registrations[0]!.redirect_uris).toEqual([resolvedRedirectUrl]);
+    // The provider restores the configured preference after the session.
+    expect(provider.redirectUrl.toString()).toBe(callbackUrl);
+  });
+
+  it('preserves a port-zero client identity when an expired access token refreshes on reconnect', async () => {
+    const { authServer, mcpServer } = await setup();
+    const callbackUrl = 'http://127.0.0.1:0/oauth/callback';
+    const storage = new InMemoryOAuthStorage();
+    const firstProvider = createProvider({ callbackUrl, storage, onRedirectToAuthorization: driveBrowser });
+    const firstMcp = track(createClient(mcpServer.url, firstProvider));
+
+    await firstMcp.authenticate('fixture');
+    const registration = authServer.registrations[0]!;
+    const originalCallbackUrl = new URL(registration.redirect_uris[0]!);
+    const originalTokens = await firstProvider.tokens();
+    authServer.validTokens.delete(originalTokens!.access_token);
+    await firstMcp.disconnect();
+
+    // Keep the first ephemeral port unavailable so the second authenticate()
+    // session must bind a different port while sharing the persisted client
+    // registration and refresh token.
+    const callbackPortBlocker = createServer();
+    await new Promise<void>((resolve, reject) => {
+      callbackPortBlocker.once('error', reject);
+      callbackPortBlocker.listen(Number(originalCallbackUrl.port), '127.0.0.1', resolve);
+    });
+    cleanups.push(
+      () =>
+        new Promise<void>((resolve, reject) => {
+          callbackPortBlocker.close(error => (error ? reject(error) : resolve()));
+        }),
+    );
+
+    const secondProvider = createProvider({
+      callbackUrl,
+      storage,
+      onRedirectToAuthorization: () => {
+        throw new Error('Browser flow must not run when the persisted client can refresh');
+      },
+    });
+    const secondMcp = track(createClient(mcpServer.url, secondProvider));
+
+    await secondMcp.authenticate('fixture');
+
+    expect(secondMcp.getServerAuthState('fixture')).toBe('authorized');
+    expect(authServer.registrations).toHaveLength(1);
+    expect((await secondProvider.clientInformation())?.client_id).toBe(registration.client_id);
+    expect(authServer.refreshGrantCount).toBe(1);
+    expect(authServer.refreshClientIds).toEqual([registration.client_id]);
+    expect(authServer.authorizeRedirectUris).toHaveLength(1);
   });
 
   it('reconnects with persisted tokens without a new browser flow', async () => {
@@ -680,14 +766,17 @@ describe('MCPClient OAuth authorization flow', () => {
     await expect(mcp.authenticate('fixture')).rejects.toThrow(/not configured with an MCPOAuthClientProvider/);
   });
 
-  it('rejects a redirect URL whose hostname only looks like loopback', async () => {
+  it.each([
+    'http://localhost:9999/oauth/callback',
+    'http://127.evil.com:9999/oauth/callback',
+    'http://user@127.0.0.1:9999/oauth/callback',
+    'http://127.0.0.1:9999/oauth/callback#fragment',
+  ])('rejects an unsafe callback URL before starting authorization: %s', async callbackUrl => {
     const { mcpServer } = await setup();
-    // 127.evil.com is not a loopback address; a naive startsWith('127.') check
-    // would wrongly accept it and bind the callback server for an attacker host.
-    const provider = createProvider({ callbackUrl: 'http://127.evil.com:9999/oauth/callback' });
+    const provider = createProvider({ callbackUrl });
     const mcp = track(createClient(mcpServer.url, provider));
 
-    await expect(mcp.authenticate('fixture')).rejects.toThrow(/loopback address/);
+    await expect(mcp.authenticate('fixture')).rejects.toThrow(/loopback IP literal|userinfo|fragment/);
     expect(mcp.getServerAuthState('fixture')).not.toBe('authorized');
   });
 });

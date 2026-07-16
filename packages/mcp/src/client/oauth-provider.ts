@@ -73,7 +73,7 @@ export interface MCPOAuthClientProviderOptions {
    * This should be a URL your application controls that can handle
    * the authorization code callback.
    *
-   * @example 'http://localhost:3000/oauth/callback'
+   * @example 'http://127.0.0.1:3000/oauth/callback'
    */
   redirectUrl: string | URL;
 
@@ -128,9 +128,9 @@ export interface MCPOAuthClientProviderOptions {
  *
  * // Create the OAuth provider
  * const oauthProvider = new MCPOAuthClientProvider({
- *   redirectUrl: 'http://localhost:3000/oauth/callback',
+ *   redirectUrl: 'http://127.0.0.1:3000/oauth/callback',
  *   clientMetadata: {
- *     redirect_uris: ['http://localhost:3000/oauth/callback'],
+ *     redirect_uris: ['http://127.0.0.1:3000/oauth/callback'],
  *     client_name: 'My MCP Client',
  *     grant_types: ['authorization_code', 'refresh_token'],
  *     response_types: ['code'],
@@ -392,9 +392,9 @@ export class MCPOAuthClientProvider implements OAuthClientProvider {
  * @example
  * ```typescript
  * const provider = createSimpleTokenProvider('my-access-token', {
- *   redirectUrl: 'http://localhost:3000/callback',
+ *   redirectUrl: 'http://127.0.0.1:3000/callback',
  *   clientMetadata: {
- *     redirect_uris: ['http://localhost:3000/callback'],
+ *     redirect_uris: ['http://127.0.0.1:3000/callback'],
  *     client_name: 'Test Client',
  *   },
  * });

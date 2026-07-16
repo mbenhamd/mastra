@@ -12,6 +12,7 @@
 import { timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 import type { Server as HttpServer } from 'node:http';
+import { normalizeLoopbackCallbackUrl } from './oauth-loopback';
 
 /**
  * How many sequential ports to try after the preferred port when it is in use.
@@ -22,6 +23,13 @@ const CALLBACK_PORT_FALLBACK_RANGE = 10;
  * Default time to wait for the browser to deliver the authorization code.
  */
 const DEFAULT_CALLBACK_TIMEOUT_MS = 5 * 60 * 1000;
+
+/**
+ * How long graceful close may wait before active callback connections are
+ * forcibly terminated. This bounds cleanup when a local peer sends only a
+ * partial HTTP request and never completes its headers.
+ */
+const CALLBACK_CLOSE_GRACE_MS = 100;
 
 const SUCCESS_HTML = `<!DOCTYPE html>
 <html>
@@ -46,12 +54,13 @@ const ERROR_HTML = `<!DOCTYPE html>
  */
 export interface OAuthCallbackServerOptions {
   /**
-   * The redirect URL the authorization server will send the browser back to.
-   * Its port is the preferred port to bind; if that port is in use, the next
-   * sequential ports are tried (see getCallbackUrlCandidates). The server
-   * binds the URL's hostname — prefer the literal `127.0.0.1` over
-   * `localhost` (RFC 8252 §8.3) so the browser and server agree on the
-   * address family.
+   * The plain HTTP loopback URL the authorization server will send the browser
+   * back to. Its nonzero port is the preferred port to bind; if that port is
+   * in use, the next sequential ports are tried (see
+   * getCallbackUrlCandidates). Port 0 asks the OS to choose one ephemeral port
+   * and does not use fallback candidates. The server requires an IPv4 or IPv6
+   * loopback IP literal and binds that exact address without hostname
+   * resolution. Userinfo and URL fragments are rejected.
    *
    * @example 'http://127.0.0.1:5533/oauth/callback'
    */
@@ -115,30 +124,54 @@ export interface OAuthCallbackServer {
   close(): Promise<void>;
 }
 
-/**
- * Returns the candidate callback URLs for a redirect URL: the URL itself on
- * its preferred port, followed by the sequential fallback-port variants that
- * createOAuthCallbackServer will try when the preferred port is in use.
- *
- * This is the single source of the candidate list: register all of these as
- * redirect_uris during dynamic client registration so a fallback-bound
- * callback URL always matches a registered URI.
- */
-export function getCallbackUrlCandidates(redirectUrl: string | URL): URL[] {
-  const base = new URL(redirectUrl.toString());
-  const preferredPort = base.port ? Number(base.port) : base.protocol === 'https:' ? 443 : 80;
+interface CallbackUrlCandidate {
+  url: URL;
+  port: number;
+}
 
-  const candidates: URL[] = [];
-  for (let offset = 0; offset <= CALLBACK_PORT_FALLBACK_RANGE; offset++) {
+interface CallbackServerPlan {
+  candidates: CallbackUrlCandidate[];
+  hostname: string;
+}
+
+function getCallbackServerPlan(redirectUrl: string | URL): CallbackServerPlan {
+  const { url: base, hostname } = normalizeLoopbackCallbackUrl(redirectUrl);
+
+  // Keep the numeric port separate from URL.port. The URL implementation
+  // canonicalizes the default HTTP port to an empty string, so reading the
+  // candidate URL back would turn a requested port 80 into Number('') === 0.
+  // An explicit port 0 remains meaningful and asks Node to choose an
+  // ephemeral port; server.address() reconciles that actual port after bind.
+  const preferredPort = base.port === '' ? 80 : Number(base.port);
+
+  const candidates: CallbackUrlCandidate[] = [];
+  const fallbackRange = preferredPort === 0 ? 0 : CALLBACK_PORT_FALLBACK_RANGE;
+  for (let offset = 0; offset <= fallbackRange; offset++) {
     const port = preferredPort + offset;
     // Assigning an out-of-range port to URL.port is silently ignored, which
     // would leave the candidate on the previous port — stop at the valid max.
     if (port > 65535) break;
     const candidate = new URL(base.toString());
     candidate.port = String(port);
-    candidates.push(candidate);
+    candidates.push({ url: candidate, port });
   }
-  return candidates;
+  return { candidates, hostname };
+}
+
+/**
+ * Returns the candidate callback URLs for a redirect URL: the URL itself on
+ * its preferred port, followed by the sequential fallback-port variants that
+ * createOAuthCallbackServer will try when a nonzero preferred port is in use.
+ * Port 0 has no guessed fallback candidates because the OS selects its actual
+ * ephemeral port during binding.
+ *
+ * For nonzero ports this is the single source of the dynamic-registration
+ * list: register every candidate so a fallback-bound callback URL matches a
+ * registered URI. For port 0, register only the actual URL returned by
+ * createOAuthCallbackServer after binding.
+ */
+export function getCallbackUrlCandidates(redirectUrl: string | URL): URL[] {
+  return getCallbackServerPlan(redirectUrl).candidates.map(candidate => candidate.url);
 }
 
 /**
@@ -174,6 +207,43 @@ function listen(server: HttpServer, port: number, hostname: string): Promise<Nod
   });
 }
 
+function closeServer(server: HttpServer): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let completed = false;
+    let forceCloseTimer: NodeJS.Timeout | undefined;
+
+    const finish = (error?: unknown) => {
+      if (completed) return;
+      completed = true;
+      clearTimeout(forceCloseTimer);
+
+      if (error && (error as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING') {
+        reject(error);
+      } else {
+        resolve();
+      }
+    };
+
+    try {
+      // Stop accepting connections first. Once the grace period expires,
+      // force-close any request that is still active (including incomplete
+      // headers that closeIdleConnections cannot classify as idle).
+      server.close(error => finish(error));
+      server.closeIdleConnections();
+      forceCloseTimer = setTimeout(() => {
+        try {
+          server.closeAllConnections();
+        } catch (error) {
+          finish(error);
+        }
+      }, CALLBACK_CLOSE_GRACE_MS);
+      forceCloseTimer.unref?.();
+    } catch (error) {
+      finish(error);
+    }
+  });
+}
+
 /**
  * Starts a one-shot loopback HTTP server that captures the OAuth
  * authorization code.
@@ -202,8 +272,10 @@ function listen(server: HttpServer, port: number, hostname: string): Promise<Nod
  * ```
  */
 export async function createOAuthCallbackServer(options: OAuthCallbackServerOptions): Promise<OAuthCallbackServer> {
-  const candidates = getCallbackUrlCandidates(options.redirectUrl);
-  const callbackPath = candidates[0]!.pathname;
+  // Validation and numeric port derivation happen before the HTTP server is
+  // created, so unsupported redirect URLs cannot allocate a local listener.
+  const { candidates, hostname } = getCallbackServerPlan(options.redirectUrl);
+  const callbackPath = candidates[0]!.url.pathname;
 
   let settled = false;
   let resolveCode: (result: OAuthCallbackResult) => void;
@@ -227,7 +299,7 @@ export async function createOAuthCallbackServer(options: OAuthCallbackServerOpti
   };
 
   const server = createServer((req, res) => {
-    const url = new URL(req.url ?? '', 'http://localhost');
+    const url = new URL(req.url ?? '', 'http://127.0.0.1');
     if (url.pathname !== callbackPath) {
       res.statusCode = 404;
       res.end('Not found');
@@ -275,27 +347,26 @@ export async function createOAuthCallbackServer(options: OAuthCallbackServerOpti
     settle({ result: { code, state } });
   });
 
-  // Bind the hostname the redirect URL names (brackets stripped for IPv6
-  // literals) so e.g. http://localhost or http://[::1] redirects actually
-  // reach the server rather than an unbound 127.0.0.1 socket.
-  const hostname = candidates[0]!.hostname.replace(/^\[|\]$/g, '');
-
   let boundUrl: URL | undefined;
   let boundPort: number | undefined;
   for (const candidate of candidates) {
-    const candidatePort = Number(candidate.port);
-    const error = await listen(server, candidatePort, hostname);
+    const error = await listen(server, candidate.port, hostname);
     if (!error) {
-      boundUrl = candidate;
-      // Preserve the port we actually listened on. Reading URL.port back would
-      // return '' for the default 80/443, losing the effective port.
-      boundPort = candidatePort;
+      const address = server.address();
+      if (!address || typeof address === 'string') {
+        await closeServer(server);
+        throw new Error('Failed to determine the bound OAuth callback server address.');
+      }
+
+      boundPort = address.port;
+      boundUrl = new URL(candidate.url.toString());
+      boundUrl.port = String(boundPort);
       break;
     }
   }
   if (!boundUrl || boundPort === undefined) {
-    const firstPort = Number(candidates[0]!.port);
-    const lastPort = Number(candidates[candidates.length - 1]!.port);
+    const firstPort = candidates[0]!.port;
+    const lastPort = candidates[candidates.length - 1]!.port;
     throw new Error(`Failed to start OAuth callback server: ports ${firstPort}-${lastPort} are all in use`);
   }
 
@@ -307,6 +378,8 @@ export async function createOAuthCallbackServer(options: OAuthCallbackServerOpti
   server.on('error', error => {
     settle({ error: error instanceof Error ? error : new Error(String(error)) });
   });
+
+  let closePromise: Promise<void> | undefined;
 
   return {
     url: boundUrl,
@@ -325,22 +398,13 @@ export async function createOAuthCallbackServer(options: OAuthCallbackServerOpti
     },
 
     close() {
+      if (closePromise) {
+        return closePromise;
+      }
+
       settle({ error: new Error('OAuth callback server closed before receiving an authorization code') });
-      // Browsers keep the callback connection alive after the response, and
-      // server.close() waits for every socket to end — without this the port
-      // stays held until the keep-alive timeout expires.
-      server.closeIdleConnections();
-      return new Promise<void>((resolve, reject) => {
-        server.close(error => {
-          // Closing twice is fine (e.g. an explicit cancel followed by the
-          // flow's own cleanup); only real errors propagate.
-          if (error && (error as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING') {
-            reject(error);
-          } else {
-            resolve();
-          }
-        });
-      });
+      closePromise = closeServer(server);
+      return closePromise;
     },
   };
 }
