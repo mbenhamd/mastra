@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Client } from '@libsql/client';
 import { createClient } from '@libsql/client';
+import { TABLE_THREAD_STATE } from '@mastra/core/storage';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { ThreadStateLibSQL } from './index';
@@ -67,6 +68,36 @@ describe('ThreadStateLibSQL', () => {
   it('scopes state per resource', async () => {
     await store.setState({ resourceId: RESOURCE_ID, threadId: 'thread-1', type: 'task', value: tasks() });
     expect(await store.getState({ resourceId: 'resource-2', threadId: 'thread-1', type: 'task' })).toBeUndefined();
+  });
+
+  // Rows written by @mastra/libsql <= 1.16.0 key on the bare threadId, while
+  // every read here binds encodeThreadStateScope. There is deliberately no
+  // fallback read: serving a legacy row would have to guess which resource
+  // owned it, and guessing wrong hands one resource's state to another. The
+  // changeset declares this a breaking change and requires draining or
+  // migrating thread state before upgrading, so a miss is the specified
+  // outcome rather than an oversight. This test exists because the break is
+  // otherwise invisible -- the row is still there, the query just cannot
+  // address it.
+  it('does not serve a legacy row keyed on the bare threadId', async () => {
+    await client.execute({
+      sql: `INSERT INTO "${TABLE_THREAD_STATE}" ("threadId", "type", "value", "createdAt", "updatedAt")
+            VALUES (?, ?, ?, ?, ?)`,
+      args: ['thread-1', 'task', JSON.stringify(tasks()), new Date().toISOString(), new Date().toISOString()],
+    });
+
+    expect(await store.getState({ resourceId: RESOURCE_ID, threadId: 'thread-1', type: 'task' })).toBeUndefined();
+
+    // The legacy row is orphaned, not overwritten: a scoped write lands beside
+    // it under a different primary key, so both rows coexist until retention
+    // prunes the old one.
+    await store.setState({ resourceId: RESOURCE_ID, threadId: 'thread-1', type: 'task', value: tasks() });
+    const rows = await client.execute({
+      sql: `SELECT "threadId" FROM "${TABLE_THREAD_STATE}" WHERE "type" = ? ORDER BY "threadId"`,
+      args: ['task'],
+    });
+    expect(rows.rows).toHaveLength(2);
+    expect(rows.rows.map(row => row.threadId)).toContain('thread-1');
   });
 
   it('deletes a single (threadId, type)', async () => {
