@@ -3,41 +3,28 @@ import { Agent } from '../../../agent';
 import { GOAL_STATE_TYPE, GOAL_SCORE_WAITING } from '../../../agent/goal';
 import { RequestContext } from '../../../request-context';
 import type { GoalObjectiveRecord } from '../../../storage/domains/thread-state/base';
+import { InMemoryThreadStateStorage } from '../../../storage/domains/thread-state/inmemory';
 import { createMockModel } from '../../../test-utils/llm-mock';
 import { createGoalStep } from './goal-step';
 
 const THREAD_ID = 'thread-1';
 const RESOURCE_ID = 'resource-1';
 
-function stateKey(resourceId: string, threadId: string, type: string): string {
-  return `${resourceId}:${threadId}:${type}`;
+/**
+ * The real in-memory thread-state store, so the goal step is exercised against
+ * the actual storage contract (including its atomic `mutateState`) rather than a
+ * mock that could drift from it.
+ */
+async function createStore(initial?: GoalObjectiveRecord) {
+  const store = new InMemoryThreadStateStorage();
+  if (initial) {
+    await store.setState({ resourceId: RESOURCE_ID, threadId: THREAD_ID, type: GOAL_STATE_TYPE, value: initial });
+  }
+  return store;
 }
 
-/** Minimal in-memory thread-state store matching ResolvedGoalStore. */
-function createStore(initial?: GoalObjectiveRecord) {
-  const states = new Map<string, GoalObjectiveRecord>();
-  if (initial) states.set(stateKey(RESOURCE_ID, THREAD_ID, GOAL_STATE_TYPE), initial);
-  return {
-    states,
-    getState: async ({ resourceId, threadId, type }: { resourceId: string; threadId: string; type: string }) =>
-      states.get(stateKey(resourceId, threadId, type)),
-    setState: async ({
-      resourceId,
-      threadId,
-      type,
-      value,
-    }: {
-      resourceId: string;
-      threadId: string;
-      type: string;
-      value: GoalObjectiveRecord;
-    }) => {
-      states.set(stateKey(resourceId, threadId, type), value);
-    },
-    deleteState: async ({ resourceId, threadId, type }: { resourceId: string; threadId: string; type: string }) => {
-      states.delete(stateKey(resourceId, threadId, type));
-    },
-  };
+function readStore(store: InMemoryThreadStateStorage): Promise<GoalObjectiveRecord | undefined> {
+  return store.getState<GoalObjectiveRecord>({ resourceId: RESOURCE_ID, threadId: THREAD_ID, type: GOAL_STATE_TYPE });
 }
 
 function makeRecord(over?: Partial<GoalObjectiveRecord>): GoalObjectiveRecord {
@@ -66,9 +53,15 @@ async function runGoalStep(
     undefinedJudgeResolver?: boolean;
     dbMessages?: any[];
     useMemory?: boolean;
+    /**
+     * Runs while the judge call is awaiting, i.e. after the goal step's
+     * pre-judge read and before its write — the window a concurrent writer
+     * (user pause/clear, another worker) actually lands in.
+     */
+    duringJudge?: (store: InMemoryThreadStateStorage) => Promise<void>;
   },
 ) {
-  const store = createStore(record);
+  const store = await createStore(record);
   const chunks: any[] = [];
   const messages: any[] = [];
   const dataParts: any[] = [];
@@ -169,7 +162,20 @@ async function runGoalStep(
     agentName: 'Agent',
   } as any);
 
-  await (step as any).execute({ inputData });
+  // Land a concurrent write in the read → judge → write window by hooking the
+  // judge's own model call, which is the `await` that opens that window.
+  const judgeSpy = opts?.duringJudge
+    ? vi.spyOn(Agent.prototype, 'stream').mockImplementation((async () => {
+        await opts.duringJudge!(store);
+        return { object: Promise.resolve({ decision, reason: `r:${decision}` }) };
+      }) as any)
+    : undefined;
+
+  try {
+    await (step as any).execute({ inputData });
+  } finally {
+    judgeSpy?.mockRestore();
+  }
 
   // The goal step emits a pending chunk (loading indicator) followed by the
   // final result chunk. Pick the result chunk (non-pending) for assertions.
@@ -180,7 +186,8 @@ async function runGoalStep(
     chunk: resultChunk,
     pendingChunk: goalChunks.find(c => c.payload.pending),
     goalChunks,
-    record: store.states.get(stateKey(RESOURCE_ID, THREAD_ID, GOAL_STATE_TYPE))!,
+    record: (await readStore(store))!,
+    store,
     stepResult,
     messages,
     dataParts,
@@ -498,5 +505,114 @@ describe('goal step budget-exhaustion semantics', () => {
     expect(messages[0].content.metadata.signal.metadata.goalEvaluation.reason).toContain('budget');
     expect(chunk.payload.status).toBe('paused');
     expect(chunk.payload.reason).toContain('budget');
+  });
+});
+
+describe('goal step concurrent-write semantics', () => {
+  // The goal step reads the objective, awaits a judge model call, then writes.
+  // Anything that lands in that window is strictly fresher than the record the
+  // verdict was computed against, so the verdict must never clobber it.
+
+  it('does not clobber a pause that lands while the judge is running', async () => {
+    const { record, stepResult, goalChunks } = await runGoalStep('continue', makeRecord({ id: 'goal-1' }), {
+      // The user pauses from the TUI (`updateObjectiveOptions`) mid-judge.
+      duringJudge: async store => {
+        const current = (await readStore(store))!;
+        await store.setState({
+          resourceId: RESOURCE_ID,
+          threadId: THREAD_ID,
+          type: GOAL_STATE_TYPE,
+          value: { ...current, status: 'paused', pausedReason: 'user paused', updatedAt: Date.now() },
+        });
+      },
+    });
+
+    // The pause survives: the step must not write back the `active` status it
+    // read before the judge ran.
+    expect(record.status).toBe('paused');
+    expect(record.pausedReason).toBe('user paused');
+    // The verdict was discarded wholesale, so it must not burn budget either.
+    expect(record.runsUsed).toBe(0);
+    // A paused goal must not keep the agent looping.
+    expect(stepResult.isContinued).toBe(false);
+    // The pre-judge "pending" indicator is emitted, but the discarded verdict
+    // must not surface as a final evaluation chunk.
+    expect(goalChunks.filter(c => !c.payload.pending)).toHaveLength(0);
+  });
+
+  it('does not resurrect an objective cleared while the judge is running', async () => {
+    const { store, stepResult } = await runGoalStep('continue', makeRecord({ id: 'goal-1' }), {
+      duringJudge: async store => {
+        await store.deleteState({ resourceId: RESOURCE_ID, threadId: THREAD_ID, type: GOAL_STATE_TYPE });
+      },
+    });
+
+    expect(await readStore(store)).toBeUndefined();
+    expect(stepResult.isContinued).toBe(false);
+  });
+
+  it('does not apply a verdict to an objective replaced while the judge is running', async () => {
+    const { record, stepResult } = await runGoalStep('done', makeRecord({ id: 'goal-1' }), {
+      // `setObjective` mid-judge: a *different* objective, still `active`. The
+      // previous objective's "done" verdict must not complete it.
+      duringJudge: async store => {
+        await store.setState({
+          resourceId: RESOURCE_ID,
+          threadId: THREAD_ID,
+          type: GOAL_STATE_TYPE,
+          value: makeRecord({ id: 'goal-2', objective: 'something else entirely' }),
+        });
+      },
+    });
+
+    expect(record.id).toBe('goal-2');
+    expect(record.status).toBe('active');
+    expect(record.runsUsed).toBe(0);
+    expect(stepResult.isContinued).toBe(false);
+  });
+
+  it('counts budget from the record at write time, not the pre-judge read', async () => {
+    const { record } = await runGoalStep('continue', makeRecord({ id: 'goal-1', runsUsed: 5 }), {
+      // A second worker resuming the same run lands its own evaluation while
+      // this judge is in flight. Both read runsUsed=5; both must not write 6.
+      duringJudge: async store => {
+        const current = (await readStore(store))!;
+        await store.setState({
+          resourceId: RESOURCE_ID,
+          threadId: THREAD_ID,
+          type: GOAL_STATE_TYPE,
+          value: { ...current, runsUsed: current.runsUsed + 1, updatedAt: Date.now() },
+        });
+      },
+    });
+
+    // Two judge calls burned → the budget must have advanced by two.
+    expect(record.runsUsed).toBe(7);
+  });
+
+  it('honours a maxRuns raise that lands while the judge is running', async () => {
+    const { record, chunk, stepResult } = await runGoalStep(
+      'continue',
+      makeRecord({ id: 'goal-1', runsUsed: 4, maxRuns: 5 }),
+      {
+        // The user raises the budget mid-judge to keep the goal going. Parking
+        // it on the stale budget would undo exactly that.
+        duringJudge: async store => {
+          const current = (await readStore(store))!;
+          await store.setState({
+            resourceId: RESOURCE_ID,
+            threadId: THREAD_ID,
+            type: GOAL_STATE_TYPE,
+            value: { ...current, maxRuns: 20, updatedAt: Date.now() },
+          });
+        },
+      },
+    );
+
+    expect(record.status).toBe('active');
+    expect(record.runsUsed).toBe(5);
+    expect(chunk.payload.maxRuns).toBe(20);
+    expect(chunk.payload.maxRunsReached).toBe(false);
+    expect(stepResult.isContinued).toBe(true);
   });
 });

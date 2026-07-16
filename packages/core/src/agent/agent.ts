@@ -130,7 +130,14 @@ import {
   snapshotAgentExecutionOptionsWithRequestContexts,
   snapshotAgentExecutionValue,
 } from './execution-snapshot';
-import { GoalSignalProvider, resolveGoalStore, readObjective, writeObjective, clearObjective } from './goal';
+import {
+  GoalSignalProvider,
+  resolveGoalStore,
+  readObjective,
+  writeObjective,
+  clearObjective,
+  mutateObjective,
+} from './goal';
 import { buildMcpServerGuidance } from './mcp-guidance';
 import { MessageList } from './message-list';
 import type { MessageInput, MessageListInput, UIMessageWithMetadata, MastraDBMessage } from './message-list';
@@ -1124,6 +1131,10 @@ export class Agent<
    * Partially update the options of the active objective. Only provided fields
    * are persisted into the record (so the precedence over agent config is
    * remembered in thread state). No-ops when no objective is set.
+   *
+   * Merged inside the store's lock: this is how a user pauses or re-budgets a
+   * goal while the goal step is mid-judge, so reading the record outside the
+   * write would let the two races drop each other's fields.
    */
   async updateObjectiveOptions(options: {
     resourceId: string;
@@ -1134,19 +1145,26 @@ export class Agent<
     status?: GoalObjectiveRecord['status'];
   }): Promise<GoalObjectiveRecord | undefined> {
     const store = await resolveGoalStore(this.#mastra as MastraUnion | undefined);
-    const existing = await readObjective(store, options.resourceId, options.threadId);
-    if (!store || !existing) return undefined;
+    const now = Date.now();
+    const commit = await mutateObjective<{ record: GoalObjectiveRecord | undefined }>(
+      store,
+      options.resourceId,
+      options.threadId,
+      current => {
+        if (!current) return { operation: 'keep', result: { record: undefined } };
 
-    const updated: GoalObjectiveRecord = {
-      ...existing,
-      updatedAt: Date.now(),
-      ...(options.judgeModelId !== undefined ? { judgeModelId: options.judgeModelId } : {}),
-      ...(options.maxRuns !== undefined && options.maxRuns > 0 ? { maxRuns: options.maxRuns } : {}),
-      ...(options.prompt !== undefined ? { prompt: options.prompt } : {}),
-      ...(options.status !== undefined ? { status: options.status } : {}),
-    };
-    await writeObjective(store, options.resourceId, options.threadId, updated);
-    return updated;
+        const updated: GoalObjectiveRecord = {
+          ...current,
+          updatedAt: now,
+          ...(options.judgeModelId !== undefined ? { judgeModelId: options.judgeModelId } : {}),
+          ...(options.maxRuns !== undefined && options.maxRuns > 0 ? { maxRuns: options.maxRuns } : {}),
+          ...(options.prompt !== undefined ? { prompt: options.prompt } : {}),
+          ...(options.status !== undefined ? { status: options.status } : {}),
+        };
+        return { operation: 'set', value: updated, result: { record: updated } };
+      },
+    );
+    return commit?.record;
   }
 
   /**

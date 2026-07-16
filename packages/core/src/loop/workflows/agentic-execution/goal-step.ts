@@ -1,13 +1,13 @@
 import { generateId } from '@internal/ai-sdk-v5';
 import type { ToolSet } from '@internal/ai-sdk-v5';
 import {
+  commitGoalEvaluation,
   createGoalScorer,
   GOAL_SCORE_WAITING,
   GOAL_SCORER_ID,
   readObjective,
   resolveEffectiveGoalSettings,
   resolveGoalStore,
-  writeObjective,
 } from '../../../agent/goal';
 import type { ResolvedGoalStore } from '../../../agent/goal';
 import type { ToolsInput } from '../../../agent/types';
@@ -15,7 +15,6 @@ import type { MastraScorer } from '../../../evals';
 import { resolveModelConfig } from '../../../llm';
 import type { MastraLanguageModel } from '../../../llm/model/shared.types';
 import { createProcessorSendSignal } from '../../../processors/send-signal';
-import type { GoalObjectiveRecord } from '../../../storage/domains/thread-state/base';
 import { safeEnqueue } from '../../../stream/base';
 import type { ChunkType, GoalEvaluationActivity } from '../../../stream/types';
 import { ChunkFrom } from '../../../stream/types';
@@ -131,12 +130,13 @@ export function createGoalStep<Tools extends ToolSet = ToolSet, OUTPUT = undefin
         return inputData;
       }
 
-      const effective = resolveEffectiveGoalSettings(record, {
+      const agentDefaults = {
         judgeModelId: typeof goal.judge === 'string' ? goal.judge : undefined,
         maxRuns: goal.maxRuns,
         prompt: goal.prompt,
         maxSteps: goal.maxSteps,
-      });
+      };
+      const effective = resolveEffectiveGoalSettings(record, agentDefaults);
 
       // Defensive budget guard. Normally an objective that exhausts its budget is
       // parked as `paused` (below), and the `status !== 'active'` gate above stops
@@ -405,38 +405,35 @@ export function createGoalStep<Tools extends ToolSet = ToolSet, OUTPUT = undefin
         !result.complete &&
         result.scorers.some(s => s.scorerId === GOAL_SCORER_ID && s.score === GOAL_SCORE_WAITING);
 
-      // Increment runs and update status. Precedence: judge failure → paused;
-      // complete → done; budget exhausted → paused. A "waiting" decision does
-      // NOT change the persisted status — the record stays `active` so the next
-      // agent turn is still judged; only `isContinued` is set to false (below)
-      // to stop the auto-loop and give the user a chance to provide input.
-      const runsUsed = record.runsUsed + 1;
-      const maxRunsReached = runsUsed >= effective.maxRuns;
-      let status: GoalObjectiveRecord['status'] = record.status;
-      let pausedReason: string | undefined;
-      if (judgeFailed) {
-        status = 'paused';
-        pausedReason = erroredScorer?.reason ?? 'The goal judge failed to evaluate the objective.';
-      } else if (result.complete) {
-        status = 'done';
-      } else if (maxRunsReached && !waiting) {
-        // Budget exhausted without reaching the goal: park it (visibly) instead
-        // of leaving it `active` but stuck. Raising maxRuns + setting status
-        // back to `active` (updateObjectiveOptions) resumes evaluation.
-        status = 'paused';
-        pausedReason = `Ran out of evaluation budget (${effective.maxRuns} runs) before reaching the goal — raise maxRuns to resume.`;
-      }
+      // Increment runs and update status, atomically against the record as it
+      // stands now. `record` above was read *before* the judge call awaited, so
+      // it may be stale: a user pause/clear (TUI `/goal`) or a second worker
+      // resuming this run can have written the slot meanwhile.
+      const commit = await commitGoalEvaluation({
+        store,
+        resourceId,
+        threadId,
+        requestContext,
+        evaluated: record,
+        agentDefaults,
+        decision: {
+          judgeFailed,
+          judgeFailureReason: erroredScorer?.reason,
+          complete: result.complete,
+          waiting,
+        },
+      });
 
-      const updated: GoalObjectiveRecord = {
-        ...record,
-        runsUsed,
-        status,
-        // Only persist a pause reason while parked; clear it otherwise so a
-        // resumed/continuing objective does not carry a stale reason.
-        pausedReason: status === 'paused' ? pausedReason : undefined,
-        updatedAt: Date.now(),
-      };
-      await writeObjective(store, resourceId, threadId, updated, requestContext);
+      // A concurrent writer owns the objective now, so this verdict was dropped
+      // rather than clobbering them. Whatever they decided (paused, cleared,
+      // already judged) means this step must not force another iteration.
+      if (!commit?.applied) {
+        if (inputData.stepResult) {
+          inputData.stepResult.isContinued = false;
+        }
+        return inputData;
+      }
+      const { runsUsed, maxRunsReached, status, pausedReason } = commit;
 
       // The goal gate makes the final continuation decision: complete, parked,
       // waiting for user input, or budget reached → stop; otherwise force
@@ -450,7 +447,7 @@ export function createGoalStep<Tools extends ToolSet = ToolSet, OUTPUT = undefin
       const goalEvaluationPayload = {
         objective: record.objective,
         iteration: runsUsed,
-        maxRuns: effective.maxRuns,
+        maxRuns: commit.maxRuns,
         passed: result.complete,
         status,
         pausedReason,
@@ -484,8 +481,8 @@ export function createGoalStep<Tools extends ToolSet = ToolSet, OUTPUT = undefin
       });
       const feedback = result.completionReason ?? 'The goal is not yet complete.';
       const continuation = shouldContinue
-        ? `[Goal attempt ${runsUsed}/${effective.maxRuns}] The goal is not yet complete. Judge feedback: ${feedback}\n\nContinue working toward the goal: ${record.objective}`
-        : `${status} (${runsUsed}/${effective.maxRuns})\n${goalEvaluationPayload.reason ?? ''}`;
+        ? `[Goal attempt ${runsUsed}/${commit.maxRuns}] The goal is not yet complete. Judge feedback: ${feedback}\n\nContinue working toward the goal: ${record.objective}`
+        : `${status} (${runsUsed}/${commit.maxRuns})\n${goalEvaluationPayload.reason ?? ''}`;
       await sendSignal({
         type: 'system-reminder',
         contents: continuation,

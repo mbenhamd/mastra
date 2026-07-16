@@ -27,10 +27,15 @@ export {
   readObjective,
   writeObjective,
   clearObjective,
+  mutateObjective,
+  commitGoalEvaluation,
   getObjectiveFromRequestContext,
   type EffectiveGoalSettings,
   type AgentGoalConfigDefaults,
   type ResolvedGoalStore,
+  type ObjectiveMutation,
+  type GoalJudgeDecision,
+  type GoalEvaluationCommit,
 } from './objective';
 
 export { createGoalScorer } from './scorer';
