@@ -56,22 +56,38 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   policy lands. Admission requires the exact same-repository Linear branch and
   `main` base, and requires the checked PR head itself to have exactly two
   parents: the current protected-base tip first and reviewed upstream commit
-  `712b864aa1ed12b14c54390ec17b69de163c37f7` second. The trusted policy runs
-  Git's merge machinery over those parents, requires exactly the three
-  rehearsed content conflicts, substitutes only the reviewed regular-file
-  blobs for Server agents, the lockfile, and the workspace policy, and requires
-  the PR head to equal that reconstructed tree. Wrong parents, extra parents, a
-  non-merge head, a forged same-parent tree, changed conflict paths, changed
-  resolutions, or different PR metadata fail before install. The lane installs
-  the complete reconciled workspace with pnpm hooks and lifecycle scripts
-  disabled, runs the shared Harness, AgentController, evented-workflow, Server,
-  SDK, and MastraCode plan, then validates every runtime surface in the reviewed
-  132-file incoming delta. The additional plan includes Core replay suites, AI
-  SDK A2A transformation, the full MCP client contract, the deterministic MCP
-  registry list contract, Server agent authorization, docs, and a deterministic
-  Memory transform/recording compatibility check. The nested Memory integration package's broad native
-  suite is deliberately not presented as clean-runner evidence because it is
-  outside the frozen root workspace and warms FastEmbed during global setup.
+  `4fb4d881bc107acee13890ad4d78661016c510ed` second. The trusted policy runs
+  Git's merge machinery over those parents, requires exactly six rehearsed
+  content conflicts, 18 base/ours/theirs stage entries, and 26 conflict
+  regions, substitutes the six reviewed regular-file conflict resolutions,
+  and applies two exact PF-2053 truthfulness overlays for the approval replay
+  E2E and changeset. The final frozen rehearsal against base
+  `711010569312141e3792be3e864ce20f010d433b` reconstructs tree
+  `61e80433d05f7bf97bd51950ebab786c0a829a29`; production admission derives the
+  expected tree from the current protected-base tip plus the same eight pinned
+  blobs. The reviewed files are the AI SDK approval unit test, replay E2E, chat
+  route, approval changeset, Core Agent stream fallback, Server agents,
+  lockfile, and workspace policy.
+  Wrong parents, extra parents, a non-merge head, a forged same-parent tree,
+  changed conflict paths, changed resolutions or overlays, or different PR
+  metadata fail before install. The lane installs the complete reconciled
+  workspace with pnpm hooks and lifecycle scripts disabled, runs the shared
+  Harness, AgentController, evented-workflow, Server, SDK, and MastraCode plan,
+  then validates every runtime surface across the 313 incoming paths from the
+  merge base to official upstream and the 312 paths in the reconciled
+  first-parent merge result. The counts differ because the reviewed
+  reconciliation preserves or refines fork behavior rather than accepting
+  every upstream path byte-for-byte. The additional plan includes Core replay
+  suites, structured-output fallback, goal, model-capability registry,
+  supervisor delegation-budget enforcement, request-context-schema inference
+  for dynamic skills, AI SDK A2A transformation, PF-2053
+  trailing-message approval extraction and replay, the native ACP
+  `createClient`/process-lifecycle contract, the full MCP client contract, the
+  deterministic MCP registry list contract, Server agent authorization, docs,
+  and a deterministic Memory transform/recording compatibility check. The
+  nested Memory integration package's broad native suite is deliberately not
+  presented as clean-runner evidence because it is outside the frozen root
+  workspace and warms FastEmbed during global setup.
 - `.github/workflows/papersflow-fork-pr.yml` always builds and type-checks Core,
   runs explicit affected-package checks for Okta Auth, Stagehand, Internal Core, CLI,
   Codemod, Deployer, MCP, Memory, Server, AI SDK, shared Storage Test Utils,
@@ -174,10 +190,26 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   integration suite, admit another adapter file or live Inngest test, or admit
   `workflows/inngest/package.json`. For that exact three-file exception only,
   the validator does not claim a package-wide typecheck/build: clean fork
-  `main` and reviewed upstream `712b864a` both have the pre-existing
+  `main` and the reviewed official-upstream snapshot both have the pre-existing
   `createRun`/`RunWithRawInput` mismatch tracked by PF-2051. Any broader Inngest
   source change, including PF-2007, still enters the native package checks and
-  remains blocked until that baseline is repaired.
+  remains blocked until that baseline is repaired. PF-2050 owns the exact
+  seven-file transition from the trusted-workflow/CLI split lifecycle to one
+  package runtime manager: the atomic trio, the manager source and focused
+  manager test, `workflows/inngest/package.json`, and
+  `.github/workflows/papersflow-fork-pr.yml`. Admission proves that the manifest
+  only removes the failure-unsafe `test:docker` script, the lockfile is
+  unchanged, and the workflow only removes its legacy Inngest start/environment
+  mutation/cleanup steps. Unrelated manifest or workflow edits and any
+  reintroduced duplicate owner fail closed. The manager-owned surface runs
+  native Inngest typecheck/build/lint, the focused lifecycle test, and the live
+  index suite; the validator validates Compose structure but does not prestart a
+  second daemon. Default Linux uses host networking with the reviewed
+  `127.0.0.1` callback, while nested Docker remains an explicit
+  network-and-URL configuration. Later manager-source changes force
+  `src/__tests__/inngest-test-runtime.test.ts`; both the helper and its focused
+  test are owned paths. Other unowned Inngest helpers and tests remain
+  fail-closed.
   PostgreSQL and Redis cache production paths likewise force their newly owned
   thread-state/indexed-log regressions. Other unprovisioned Store-provider tests
   fail closed for the same reason.
@@ -244,10 +276,14 @@ sources inside a newly admitted PF-2044 workspace. They also accept the atomic
 PF-2042 Inngest test/Compose/adapter-launcher trio, reject each unpaired member,
 reject a valid-but-misaligned port topology, reject the Inngest manifest and
 unknown live tests, and propagate Compose validation failure before executing
-package commands. PF-2045 fixtures
-separately create the three genuine content conflicts, prove the accepted
-reconstructed merge tree, and exercise wrong-upstream, wrong-first-parent,
-forged-same-parent-tree, extra-parent, non-merge, and wrong-metadata failures.
+package commands. PF-2045 fixtures separately create the six genuine content
+conflicts, prove the accepted reconstructed merge tree, the exact frozen
+rehearsal-tree assertion, all six conflict resolutions, and both PF-2053
+non-conflict overlays. They also prove that a benign non-conflicting
+protected-base advance reconstructs and passes, and exercise wrong-upstream,
+wrong-first-parent, forged-resolution, forged-overlay,
+forged-same-parent-tree, protected-base conflict-input drift, extra-parent,
+non-merge, and wrong-metadata failures.
 
 Do not register a self-hosted runner for public PR code. Keep canonical
 release, secret, cloud, and scheduled workflows gated to `mastra-ai/mastra`
