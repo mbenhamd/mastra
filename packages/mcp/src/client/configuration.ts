@@ -21,25 +21,12 @@ import type { MastraMCPServerDefinition, MCPServerAuthState } from './client';
 import { isReconnectableMCPError } from './error-utils';
 import { createOAuthCallbackServer, getCallbackUrlCandidates } from './oauth-callback-server';
 import type { OAuthCallbackServer } from './oauth-callback-server';
+import { isLoopbackHostname } from './oauth-loopback';
 import { MCPOAuthClientProvider } from './oauth-provider';
 import { MCPClientServerProxy } from './server-proxy';
 
 const mcpClientInstances = new Map<string, InstanceType<typeof MCPClient>>();
 const TOOL_DISCOVERY_MAX_ATTEMPTS = 2;
-
-// Matches the entire 127.0.0.0/8 range in dotted-quad form. `URL` normalizes
-// IPv4 hosts to four octets (so `127.1` becomes `127.0.0.1`), so anchoring the
-// pattern is enough — and it rejects lookalikes like `127.evil.com` that a
-// prefix check would wrongly accept and leak the authorization code to.
-const LOOPBACK_IPV4 = /^127\.(?:\d{1,3})\.(?:\d{1,3})\.(?:\d{1,3})$/;
-
-// Whether a hostname is a loopback address authenticate() accepts for the
-// provider's redirect URL (RFC 8252 loopback redirection). Kept in sync with the
-// mastracode config parser, which accepts any 127.0.0.0/8 host, so a config that
-// parses (e.g. 127.0.0.2) does not later fail here.
-function isLoopbackHostname(hostname: string): boolean {
-  return hostname === 'localhost' || hostname === '[::1]' || hostname === '::1' || LOOPBACK_IPV4.test(hostname);
-}
 
 /**
  * Configuration options for creating an MCPClient instance.
@@ -936,7 +923,7 @@ To fix this you have three different options:
       const redirectUrl = new URL(provider.redirectUrl.toString());
       if (redirectUrl.protocol !== 'http:' || !isLoopbackHostname(redirectUrl.hostname)) {
         throw new Error(
-          `Cannot authenticate MCP server ${serverName}: the provider's redirect URL must be a loopback address, got ${redirectUrl.origin}.`,
+          `Cannot authenticate MCP server ${serverName}: the provider's redirect URL must use HTTP and a loopback address, got ${redirectUrl.origin}.`,
         );
       }
 
@@ -955,7 +942,12 @@ To fix this you have three different options:
       // Point the authorization request at the callback URL that actually
       // bound, and register every fallback candidate during dynamic client
       // registration so a future fallback port still matches a registered URI.
-      provider.applyResolvedRedirectUrl(callbackServer.url, getCallbackUrlCandidates(redirectUrl));
+      const boundRedirectUrl = callbackServer.url;
+      // Port 0 has no stable pre-bind URI: register only the reconciled
+      // ephemeral URL rather than guessed low ports that were never bound.
+      const registeredRedirectUrls =
+        redirectUrl.port === '0' ? [boundRedirectUrl] : getCallbackUrlCandidates(redirectUrl);
+      provider.applyResolvedRedirectUrl(boundRedirectUrl, registeredRedirectUrls);
 
       // Discard a stored client registration that does not cover the bound
       // callback URL — the authorization server would reject its redirect_uri.

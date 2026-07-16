@@ -346,6 +346,23 @@ describe('MCPClient OAuth authorization flow', () => {
     expect(authServer.validTokens.has(tokens!.access_token)).toBe(true);
   });
 
+  it('authenticates with port 0 and registers only the actual ephemeral callback URL', async () => {
+    const { authServer, mcpServer } = await setup();
+    const callbackUrl = 'http://127.0.0.1:0/oauth/callback';
+    const provider = createProvider({ callbackUrl, onRedirectToAuthorization: driveBrowser });
+    const mcp = track(createClient(mcpServer.url, provider));
+
+    await mcp.authenticate('fixture');
+
+    expect(mcp.getServerAuthState('fixture')).toBe('authorized');
+    expect(authServer.authorizeRedirectUris).toHaveLength(1);
+    const resolvedRedirectUrl = authServer.authorizeRedirectUris[0]!;
+    expect(Number(new URL(resolvedRedirectUrl).port)).toBeGreaterThan(0);
+    expect(authServer.registrations[0]!.redirect_uris).toEqual([resolvedRedirectUrl]);
+    // The provider restores the configured preference after the session.
+    expect(provider.redirectUrl.toString()).toBe(callbackUrl);
+  });
+
   it('reconnects with persisted tokens without a new browser flow', async () => {
     const { mcpServer, callbackUrl } = await setup();
     const storage = new InMemoryOAuthStorage();

@@ -12,6 +12,7 @@
 import { timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 import type { Server as HttpServer } from 'node:http';
+import { isLoopbackHostname } from './oauth-loopback';
 
 /**
  * How many sequential ports to try after the preferred port when it is in use.
@@ -46,12 +47,13 @@ const ERROR_HTML = `<!DOCTYPE html>
  */
 export interface OAuthCallbackServerOptions {
   /**
-   * The redirect URL the authorization server will send the browser back to.
-   * Its port is the preferred port to bind; if that port is in use, the next
-   * sequential ports are tried (see getCallbackUrlCandidates). The server
-   * binds the URL's hostname — prefer the literal `127.0.0.1` over
-   * `localhost` (RFC 8252 §8.3) so the browser and server agree on the
-   * address family.
+   * The plain HTTP loopback URL the authorization server will send the browser
+   * back to. Its nonzero port is the preferred port to bind; if that port is
+   * in use, the next sequential ports are tried (see
+   * getCallbackUrlCandidates). Port 0 asks the OS to choose one ephemeral port
+   * and does not use fallback candidates. The server binds the URL's hostname
+   * — prefer the literal `127.0.0.1` over `localhost` (RFC 8252 §8.3) so the
+   * browser and server agree on the address family.
    *
    * @example 'http://127.0.0.1:5533/oauth/callback'
    */
@@ -115,30 +117,52 @@ export interface OAuthCallbackServer {
   close(): Promise<void>;
 }
 
-/**
- * Returns the candidate callback URLs for a redirect URL: the URL itself on
- * its preferred port, followed by the sequential fallback-port variants that
- * createOAuthCallbackServer will try when the preferred port is in use.
- *
- * This is the single source of the candidate list: register all of these as
- * redirect_uris during dynamic client registration so a fallback-bound
- * callback URL always matches a registered URI.
- */
-export function getCallbackUrlCandidates(redirectUrl: string | URL): URL[] {
-  const base = new URL(redirectUrl.toString());
-  const preferredPort = base.port ? Number(base.port) : base.protocol === 'https:' ? 443 : 80;
+interface CallbackUrlCandidate {
+  url: URL;
+  port: number;
+}
 
-  const candidates: URL[] = [];
-  for (let offset = 0; offset <= CALLBACK_PORT_FALLBACK_RANGE; offset++) {
+function getCallbackCandidates(redirectUrl: string | URL): CallbackUrlCandidate[] {
+  const base = new URL(redirectUrl.toString());
+  if (base.protocol !== 'http:' || !isLoopbackHostname(base.hostname)) {
+    throw new Error(`OAuth callback redirect URL must use HTTP and a loopback hostname, got ${base.origin}.`);
+  }
+
+  // Keep the numeric port separate from URL.port. The URL implementation
+  // canonicalizes the default HTTP port to an empty string, so reading the
+  // candidate URL back would turn a requested port 80 into Number('') === 0.
+  // An explicit port 0 remains meaningful and asks Node to choose an
+  // ephemeral port; server.address() reconciles that actual port after bind.
+  const preferredPort = base.port === '' ? 80 : Number(base.port);
+
+  const candidates: CallbackUrlCandidate[] = [];
+  const fallbackRange = preferredPort === 0 ? 0 : CALLBACK_PORT_FALLBACK_RANGE;
+  for (let offset = 0; offset <= fallbackRange; offset++) {
     const port = preferredPort + offset;
     // Assigning an out-of-range port to URL.port is silently ignored, which
     // would leave the candidate on the previous port — stop at the valid max.
     if (port > 65535) break;
     const candidate = new URL(base.toString());
     candidate.port = String(port);
-    candidates.push(candidate);
+    candidates.push({ url: candidate, port });
   }
   return candidates;
+}
+
+/**
+ * Returns the candidate callback URLs for a redirect URL: the URL itself on
+ * its preferred port, followed by the sequential fallback-port variants that
+ * createOAuthCallbackServer will try when a nonzero preferred port is in use.
+ * Port 0 has no guessed fallback candidates because the OS selects its actual
+ * ephemeral port during binding.
+ *
+ * For nonzero ports this is the single source of the dynamic-registration
+ * list: register every candidate so a fallback-bound callback URL matches a
+ * registered URI. For port 0, register only the actual URL returned by
+ * createOAuthCallbackServer after binding.
+ */
+export function getCallbackUrlCandidates(redirectUrl: string | URL): URL[] {
+  return getCallbackCandidates(redirectUrl).map(candidate => candidate.url);
 }
 
 /**
@@ -202,8 +226,10 @@ function listen(server: HttpServer, port: number, hostname: string): Promise<Nod
  * ```
  */
 export async function createOAuthCallbackServer(options: OAuthCallbackServerOptions): Promise<OAuthCallbackServer> {
-  const candidates = getCallbackUrlCandidates(options.redirectUrl);
-  const callbackPath = candidates[0]!.pathname;
+  // Validation and numeric port derivation happen before the HTTP server is
+  // created, so unsupported redirect URLs cannot allocate a local listener.
+  const candidates = getCallbackCandidates(options.redirectUrl);
+  const callbackPath = candidates[0]!.url.pathname;
 
   let settled = false;
   let resolveCode: (result: OAuthCallbackResult) => void;
@@ -278,24 +304,28 @@ export async function createOAuthCallbackServer(options: OAuthCallbackServerOpti
   // Bind the hostname the redirect URL names (brackets stripped for IPv6
   // literals) so e.g. http://localhost or http://[::1] redirects actually
   // reach the server rather than an unbound 127.0.0.1 socket.
-  const hostname = candidates[0]!.hostname.replace(/^\[|\]$/g, '');
+  const hostname = candidates[0]!.url.hostname.replace(/^\[|\]$/g, '');
 
   let boundUrl: URL | undefined;
   let boundPort: number | undefined;
   for (const candidate of candidates) {
-    const candidatePort = Number(candidate.port);
-    const error = await listen(server, candidatePort, hostname);
+    const error = await listen(server, candidate.port, hostname);
     if (!error) {
-      boundUrl = candidate;
-      // Preserve the port we actually listened on. Reading URL.port back would
-      // return '' for the default 80/443, losing the effective port.
-      boundPort = candidatePort;
+      const address = server.address();
+      if (!address || typeof address === 'string') {
+        await new Promise<void>(resolve => server.close(() => resolve()));
+        throw new Error('Failed to determine the bound OAuth callback server address.');
+      }
+
+      boundPort = address.port;
+      boundUrl = new URL(candidate.url.toString());
+      boundUrl.port = String(boundPort);
       break;
     }
   }
   if (!boundUrl || boundPort === undefined) {
-    const firstPort = Number(candidates[0]!.port);
-    const lastPort = Number(candidates[candidates.length - 1]!.port);
+    const firstPort = candidates[0]!.port;
+    const lastPort = candidates[candidates.length - 1]!.port;
     throw new Error(`Failed to start OAuth callback server: ports ${firstPort}-${lastPort} are all in use`);
   }
 
