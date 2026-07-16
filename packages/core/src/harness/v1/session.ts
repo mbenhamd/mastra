@@ -33,7 +33,8 @@ import { z } from 'zod';
 
 import { Agent } from '../../agent';
 import type { AgentExecutionOptionsBase } from '../../agent/agent.types';
-import type { AgentSignalContents } from '../../agent/signals';
+import { createSignal } from '../../agent/signals';
+import type { AgentSignalContents, CreatedAgentSignal } from '../../agent/signals';
 import { AgentThreadOutputDrainError, isAgentThreadOutputDrainTeardownError } from '../../agent/thread-stream-runtime';
 import {
   captureSuspendedToolSurfaceFenceLease,
@@ -237,6 +238,20 @@ import type {
 type MessageAdmissionIdentity = {
   signalId: string;
   runId: string;
+};
+
+type SignalAdmissionIdentity = {
+  signalId: string;
+  idleRunId: string;
+};
+
+type SignalAdmission = {
+  admissionId: string;
+  admissionHash: string;
+  modeId: string;
+  modelId: string;
+  identity: SignalAdmissionIdentity;
+  createdAt: number;
 };
 
 type Deferred<T> = {
@@ -6700,14 +6715,15 @@ export class Session {
   }
 
   /**
-   * @internal §14.2 deterministic per-`admissionId` signal id for the channel
-   * signal-delivery admission path. Unlike {@link _messageAdmissionIdentity},
-   * only the `signalId` is deterministic — a signal interleaves into whatever
-   * run is active, so its `runId` is not predetermined and is recorded on the
-   * reservation after dispatch. The id is namespaced (`harness-channel-signal-`)
-   * so it never collides with the message/queue admission id spaces.
+   * Deterministic identity for a caller-admitted `signal()` operation. Active
+   * delivery reuses the already-running run id; an idle wake uses `idleRunId`.
+   * Keeping both values deterministic lets a retry distinguish the two routing
+   * shapes from durable evidence without adding another receipt store.
+   *
+   * The signal-id prefix predates the public admission surface and is retained
+   * so channel-ingress retries admitted by older processes resolve the same row.
    */
-  private _channelSignalAdmissionSignalId(admissionId: string): string {
+  private _signalAdmissionIdentity(admissionId: string): SignalAdmissionIdentity {
     const digest = sha256CanonicalJson({
       kind: 'channel-signal-admission',
       harnessName: this._record.harnessName,
@@ -6716,7 +6732,10 @@ export class Session {
       threadId: this.threadId,
       admissionId,
     });
-    return `harness-channel-signal-${digest.slice(0, 32)}`;
+    return {
+      signalId: `harness-channel-signal-${digest.slice(0, 32)}`,
+      idleRunId: `harness-channel-wake-${digest.slice(32, 64)}`,
+    };
   }
 
   private async _writeMessageResultEvidence(
@@ -6726,7 +6745,7 @@ export class Session {
     const now = Date.now();
     this._operationEvidenceSignalIds.add(status.signalId);
     try {
-      const result = await this._storage.writeMessageResultEvidence({
+      const evidence: AgentSignalResultEvidence = {
         ...status,
         harnessName: this._record.harnessName,
         sessionId: this.id,
@@ -6734,9 +6753,10 @@ export class Session {
         threadId: this.threadId,
         createdAt: now,
         updatedAt: now,
-      });
+      };
+      const result = await this._storage.writeMessageResultEvidence(evidence);
       await this._cleanupOperationEvidenceIfDeleted(status);
-      return result;
+      return result.created ? { created: true, evidence } : result;
     } catch (err) {
       if (err instanceof HarnessStorageAdmissionConflictError && status.admissionId && status.admissionHash) {
         const duplicate = await this._resolveMessageAdmissionDuplicate({
@@ -6819,13 +6839,43 @@ export class Session {
     outcome:
       | { status: 'completed'; runId: string; result: AgentResult }
       | { status: 'failed'; runId?: string; error: { code: string; message: string } },
+    admission?: Pick<SignalAdmission, 'admissionId' | 'admissionHash' | 'modeId' | 'modelId'>,
   ): Promise<void> {
+    // A signal-owned run can suspend and later resume through a rehydrated
+    // Session. `PendingResume` intentionally carries only the public
+    // correlation signal id, so recover the private admission identity from
+    // its durable evidence before terminalizing. Without this, the storage
+    // identity fence rejects the terminal update and the admitted row remains
+    // pending forever. Non-admitted signal ids keep their historical
+    // best-effort behavior.
+    let retainedAdmission = admission;
+    if (retainedAdmission === undefined && signalId.startsWith('harness-channel-signal-')) {
+      const retained = await this._storage.loadMessageResultEvidence({
+        harnessName: this._record.harnessName,
+        sessionId: this.id,
+        resourceId: this.resourceId,
+        threadId: this.threadId,
+        signalId,
+      });
+      if (retained && 'status' in retained) {
+        const admitted = retained as AgentSignalResultEvidence;
+        if (admitted.admissionId !== undefined && admitted.admissionHash !== undefined) {
+          retainedAdmission = {
+            admissionId: admitted.admissionId,
+            admissionHash: admitted.admissionHash,
+            modeId: admitted.modeId ?? this._record.modeId,
+            modelId: admitted.modelId ?? this._record.modelId,
+          };
+        }
+      }
+    }
     if (outcome.status === 'completed') {
       await this._writeMessageResultEvidenceBestEffort({
         status: 'completed',
         signalId,
         runId: outcome.runId,
         result: outcome.result,
+        ...(retainedAdmission ?? {}),
       });
       this._emit({ type: 'signal_completed', runId: outcome.runId, signalId, result: outcome.result });
       return;
@@ -6835,6 +6885,7 @@ export class Session {
       signalId,
       ...(outcome.runId !== undefined ? { runId: outcome.runId } : {}),
       error: outcome.error,
+      ...(retainedAdmission ?? {}),
     });
     this._emit({
       type: 'signal_failed',
@@ -6914,6 +6965,179 @@ export class Session {
     };
   }
 
+  private _computeSignalAdmissionHash(
+    opts: Pick<SessionSignalOptions, 'content' | 'mode'>,
+    attachments: PersistedAttachment[],
+    requestContext?: PersistedRequestContextInput,
+  ): string {
+    return sha256CanonicalJson({
+      kind: 'signal',
+      content: opts.content,
+      ...(opts.mode !== undefined ? { mode: opts.mode } : {}),
+      attachments: attachments.map(attachment => ({
+        kind: attachment.kind,
+        name: attachment.name,
+        mimeType: attachment.mimeType,
+        ...(attachment.kind === 'ref'
+          ? {
+              attachmentId: attachment.attachmentId,
+              resourceId: this.resourceId,
+              ownerSessionId: attachment.ownerSessionId,
+              bytes: attachment.bytes,
+              sha256: attachment.sha256,
+              source: attachment.source,
+              attachmentKind: attachment.attachmentKind ?? 'file',
+              ...(attachment.primitiveType ? { primitiveType: attachment.primitiveType } : {}),
+              ...(attachment.elementType ? { elementType: attachment.elementType } : {}),
+              ...(attachment.renderer ? { renderer: attachment.renderer } : {}),
+              ...(attachment.schemaId ? { schemaId: attachment.schemaId } : {}),
+              ...(attachment.metadata ? { metadata: cloneAttachmentMetadata(attachment.metadata) } : {}),
+              ...(attachment.object ? { object: attachment.object } : {}),
+            }
+          : { url: attachment.url }),
+      })),
+      ...(requestContext ? { requestContext: clonePersistedRequestContext(requestContext) } : {}),
+    });
+  }
+
+  private _signalAdmissionCanRedispatch(
+    evidence: AgentSignalResultEvidence | OperationAdmissionTombstone | undefined,
+  ): boolean {
+    return (
+      evidence !== undefined && 'status' in evidence && evidence.status === 'pending' && evidence.runId === undefined
+    );
+  }
+
+  private _signalFromAdmissionEvidence(
+    evidence: AgentSignalResultEvidence,
+    opts: SessionSignalOptions,
+  ): CreatedAgentSignal {
+    const createdAt = Number.isFinite(evidence.createdAt) ? new Date(evidence.createdAt) : new Date();
+    return createSignal({
+      id: evidence.signalId,
+      type: 'user-message',
+      contents: opts.content,
+      createdAt,
+      acceptedAt: createdAt,
+    });
+  }
+
+  private async _awaitDurableSignalResult(
+    evidence: AgentSignalResultEvidence,
+    abortSignal?: AbortSignal,
+  ): Promise<AgentResult> {
+    const deadline = Date.now() + MESSAGE_ADMISSION_DURABLE_WAIT_TIMEOUT_MS;
+    while (true) {
+      throwIfAborted(abortSignal, 'signal().admissionId');
+      const latest = await this._storage.loadMessageResultEvidence({
+        harnessName: this._record.harnessName,
+        sessionId: this.id,
+        resourceId: this.resourceId,
+        threadId: this.threadId,
+        signalId: evidence.signalId,
+      });
+      if (!latest || !('status' in latest)) {
+        throw new HarnessValidationError('signal().admissionId', 'duplicate signal result evidence has expired');
+      }
+      if (latest.status === 'completed') return latest.result as AgentResult;
+      if (latest.status === 'failed') throw publicErrorProjectionToError(latest.error);
+      if (Date.now() >= deadline) {
+        throw new HarnessValidationError('signal().admissionId', 'pending signal admission is not live');
+      }
+      await delay(MESSAGE_ADMISSION_DURABLE_WAIT_INTERVAL_MS, abortSignal);
+    }
+  }
+
+  private async _returnDuplicateSignalResult(
+    evidence: AgentSignalResultEvidence | OperationAdmissionTombstone,
+    opts: SessionSignalOptions,
+    identity: SignalAdmissionIdentity,
+  ): Promise<SessionSignalResult> {
+    if (!('status' in evidence)) {
+      throw new HarnessValidationError('signal().admissionId', 'duplicate signal result evidence has expired');
+    }
+    if (evidence.runId === undefined) {
+      if (evidence.status === 'failed') throw publicErrorProjectionToError(evidence.error);
+      throw new HarnessValidationError('signal().admissionId', 'pending signal admission was not dispatched');
+    }
+
+    let result: Promise<AgentResult>;
+    if (evidence.status === 'completed') {
+      result = Promise.resolve(evidence.result as AgentResult);
+    } else if (evidence.status === 'failed') {
+      result = Promise.reject(publicErrorProjectionToError(evidence.error));
+    } else {
+      const duplicateModeId = evidence.modeId ?? opts.mode ?? this._record.modeId;
+      const agent = this._harness.getAgentForMode(duplicateModeId);
+      const subscription = await this._ensureThreadSubscription(agent);
+      const cached = this._completedRuns.get(evidence.runId);
+      if (cached) {
+        result = cached.ok ? Promise.resolve(cached.full as AgentResult) : Promise.reject(cached.err);
+      } else if (this._runCompletionPromises.has(evidence.runId)) {
+        result = this._awaitRunCompletion(evidence.runId).then(full => full as AgentResult);
+      } else if (agent.getRunOutput(evidence.runId) || subscription.activeRunId() === evidence.runId) {
+        // Rehydrated accepted run: this Session has no original continuation to
+        // terminalize the signal evidence. Attach one to the recovered run so a
+        // restart does not leave a durable admitted row pending forever.
+        const admission =
+          evidence.admissionId !== undefined && evidence.admissionHash !== undefined
+            ? {
+                admissionId: evidence.admissionId,
+                admissionHash: evidence.admissionHash,
+                modeId: duplicateModeId,
+                modelId: evidence.modelId ?? this._record.modelId,
+              }
+            : undefined;
+        result = this._awaitRunCompletion(evidence.runId).then(
+          async full => {
+            if (full.finishReason !== 'suspended') {
+              await this._settleSignalResult(
+                evidence.signalId,
+                {
+                  status: 'completed',
+                  runId: evidence.runId!,
+                  result: full as AgentResult,
+                },
+                admission,
+              );
+            }
+            return full as AgentResult;
+          },
+          async err => {
+            let thrown = err;
+            try {
+              await this._settleSignalResult(
+                evidence.signalId,
+                {
+                  status: 'failed',
+                  runId: evidence.runId,
+                  error: projectHarnessPublicError(err),
+                },
+                admission,
+              );
+            } catch (evidenceErr) {
+              thrown = evidenceErr;
+            }
+            throw redactPublicBoundaryRejection(thrown);
+          },
+        );
+      } else {
+        result = this._awaitDurableSignalResult(evidence, opts.abortSignal);
+      }
+    }
+    void result.catch(() => {});
+
+    const signal = this._signalFromAdmissionEvidence(evidence, opts);
+    return {
+      id: evidence.signalId,
+      runId: evidence.runId,
+      willInterleave: evidence.runId !== identity.idleRunId,
+      accepted: true,
+      signal,
+      result,
+    };
+  }
+
   // -------------------------------------------------------------------------
   // signal() — §4.2.
   //
@@ -6964,12 +7188,24 @@ export class Session {
        * ingress.
        */
       signalId?: string;
+      /**
+       * Durable channel-inbox hash computed before runtime admission. Public
+       * callers never supply it; the signal path recomputes the normalized hash
+       * and fails closed if recovery input drifted.
+       */
+      expectedAdmissionHash?: string;
     },
   ): Promise<SessionSignalResult> {
     this._assertLive('signal()');
     this._assertOpenForTurn('signal()');
     if (typeof opts.content !== 'string') {
       throw new HarnessValidationError('signal()', '`content` must be a string');
+    }
+    if (opts.admissionId !== undefined && opts.admissionId.length === 0) {
+      throw new HarnessValidationError('signal().admissionId', 'admissionId must be a non-empty string');
+    }
+    if (opts.admissionId !== undefined && opts.additionalTools !== undefined) {
+      throw new HarnessValidationError('signal().admissionId', 'admissionId cannot be combined with additionalTools');
     }
 
     // §4.4c: validate caller request context before the thread subscription
@@ -6988,6 +7224,56 @@ export class Session {
     const mode = this._harness._getMode(effectiveModeId);
     const agent = this._harness.getAgentForMode(effectiveModeId);
 
+    // Resolve an already-admitted retry before consulting today's active-run
+    // topology. The original receipt owns routing identity: a completed idle
+    // wake must not become an override conflict merely because another run is
+    // active when the caller retries it.
+    const signalAdmissionHash =
+      opts.admissionId !== undefined
+        ? this._computeSignalAdmissionHash(opts, internal?.attachments ?? [], persistedRequestContext)
+        : undefined;
+    const signalAdmissionIdentity =
+      opts.admissionId !== undefined ? this._signalAdmissionIdentity(opts.admissionId) : undefined;
+    if (
+      signalAdmissionHash !== undefined &&
+      internal?.expectedAdmissionHash !== undefined &&
+      internal.expectedAdmissionHash !== signalAdmissionHash
+    ) {
+      throw new HarnessAdmissionConflictError(
+        this.id,
+        opts.admissionId!,
+        internal.expectedAdmissionHash,
+        signalAdmissionHash,
+      );
+    }
+    if (opts.admissionId !== undefined && signalAdmissionHash !== undefined && signalAdmissionIdentity !== undefined) {
+      try {
+        const existing = await this._resolveMessageAdmissionDuplicate({
+          admissionId: opts.admissionId,
+          admissionHash: signalAdmissionHash,
+        });
+        if (existing !== undefined && !this._signalAdmissionCanRedispatch(existing)) {
+          this._assertOpenForTurn('signal()');
+          return this._returnDuplicateSignalResult(existing, opts, signalAdmissionIdentity);
+        }
+        const inFlight = this._messageAdmissionStarts.get(opts.admissionId);
+        if (inFlight !== undefined) {
+          if (inFlight.admissionHash !== signalAdmissionHash) {
+            throw new HarnessAdmissionConflictError(
+              this.id,
+              opts.admissionId,
+              inFlight.admissionHash,
+              signalAdmissionHash,
+            );
+          }
+          const admitted = await inFlight.promise;
+          return this._returnDuplicateSignalResult(admitted, opts, signalAdmissionIdentity);
+        }
+      } catch (err) {
+        throw internal === undefined ? redactPublicBoundaryRejection(err) : err;
+      }
+    }
+
     // Open the thread subscription before reading `activeRunId()` so the
     // routing decision sees the live runtime state.
     const subscriptionWaiter = this._createActiveTurnWaiter();
@@ -7000,11 +7286,11 @@ export class Session {
     this._assertLive('signal()');
     this._assertOpenForTurn('signal()');
 
-    const activeRunId = sub.activeRunId();
-    const willInterleave = activeRunId !== null;
+    let activeRunId = sub.activeRunId();
+    let willInterleave = activeRunId !== null;
 
     // Active-delivery + per-turn overrides → reject at admission.
-    if (willInterleave) {
+    const assertActiveSignalOverrides = (runId: string) => {
       // §3 / §4.5a: the in-flight run's surface (mode/model/tools) is committed
       // at start, so a signal that *carries* a per-turn mode override and drains
       // into the active run is rejected regardless of the override's value —
@@ -7012,10 +7298,10 @@ export class Session {
       // default. (The session-default comparison missed the case where the
       // active run itself started with a per-turn mode override.)
       if (opts.mode !== undefined) {
-        throw new HarnessOverrideConflictError(this.id, activeRunId!, ['mode']);
+        throw new HarnessOverrideConflictError(this.id, runId, ['mode']);
       }
       if (opts.additionalTools !== undefined) {
-        throw new HarnessOverrideConflictError(this.id, activeRunId!, ['addTools']);
+        throw new HarnessOverrideConflictError(this.id, runId, ['addTools']);
       }
       // Request context cannot reach an in-flight run's tools (its streamOptions
       // were committed at start), so reject rather than silently drop the app bag.
@@ -7024,6 +7310,153 @@ export class Session {
           'signal().requestContext',
           'cannot be supplied on an active-delivery signal — the in-flight run already committed its request context and could not receive a new app bag',
         );
+      }
+    };
+    if (activeRunId !== null) {
+      assertActiveSignalOverrides(activeRunId);
+    }
+
+    let signalAdmission: SignalAdmission | undefined;
+    let signalAdmissionStart: Deferred<AgentSignalResultEvidence | OperationAdmissionTombstone> | undefined;
+    if (opts.admissionId !== undefined && signalAdmissionHash !== undefined && signalAdmissionIdentity !== undefined) {
+      const admissionHash = signalAdmissionHash;
+      const identity = signalAdmissionIdentity;
+      try {
+        const existing = await this._resolveMessageAdmissionDuplicate({
+          admissionId: opts.admissionId,
+          admissionHash,
+        });
+        if (existing !== undefined && !this._signalAdmissionCanRedispatch(existing)) {
+          this._assertOpenForTurn('signal()');
+          return this._returnDuplicateSignalResult(existing, opts, identity);
+        }
+
+        const inFlight = this._messageAdmissionStarts.get(opts.admissionId);
+        if (inFlight !== undefined) {
+          if (inFlight.admissionHash !== admissionHash) {
+            throw new HarnessAdmissionConflictError(this.id, opts.admissionId, inFlight.admissionHash, admissionHash);
+          }
+          const admitted = await inFlight.promise;
+          return this._returnDuplicateSignalResult(admitted, opts, identity);
+        }
+
+        signalAdmissionStart = createDeferred<AgentSignalResultEvidence | OperationAdmissionTombstone>();
+        void signalAdmissionStart.promise.catch(() => {});
+        this._messageAdmissionStarts.set(opts.admissionId, {
+          admissionHash,
+          modeId: effectiveModeId,
+          modelId: this._record.modelId,
+          promise: signalAdmissionStart.promise,
+        });
+
+        const reserved = await this._writeMessageResultEvidence({
+          status: 'pending',
+          signalId: identity.signalId,
+          modeId: effectiveModeId,
+          modelId: this._record.modelId,
+          admissionId: opts.admissionId,
+          admissionHash,
+        });
+        const reservedEvidence =
+          reserved.evidence ??
+          (!reserved.created
+            ? await this._resolveMessageAdmissionDuplicate({
+                admissionId: opts.admissionId,
+                admissionHash,
+              })
+            : undefined);
+        if (
+          !reserved.created &&
+          reservedEvidence !== undefined &&
+          !this._signalAdmissionCanRedispatch(reservedEvidence)
+        ) {
+          signalAdmissionStart.resolve(reservedEvidence);
+          this._messageAdmissionStarts.delete(opts.admissionId);
+          return this._returnDuplicateSignalResult(reservedEvidence, opts, identity);
+        }
+        signalAdmission = {
+          admissionId: opts.admissionId,
+          admissionHash,
+          modeId: effectiveModeId,
+          modelId: this._record.modelId,
+          identity,
+          createdAt:
+            reservedEvidence !== undefined && 'status' in reservedEvidence ? reservedEvidence.createdAt : Date.now(),
+        };
+      } catch (err) {
+        signalAdmissionStart?.reject(err);
+        this._messageAdmissionStarts.delete(opts.admissionId);
+        throw internal === undefined ? redactPublicBoundaryRejection(err) : err;
+      }
+    }
+
+    const recordSignalAdmissionDispatch = async (runId: string) => {
+      if (signalAdmission === undefined) return;
+      try {
+        const recorded = await this._writeMessageResultEvidence({
+          status: 'pending',
+          signalId: signalAdmission.identity.signalId,
+          runId,
+          modeId: signalAdmission.modeId,
+          modelId: signalAdmission.modelId,
+          admissionId: signalAdmission.admissionId,
+          admissionHash: signalAdmission.admissionHash,
+        });
+        const evidence =
+          recorded.evidence ??
+          (await this._resolveMessageAdmissionDuplicate({
+            admissionId: signalAdmission.admissionId,
+            admissionHash: signalAdmission.admissionHash,
+          }));
+        if (evidence === undefined) {
+          throw new HarnessConfigError('signal()', 'signal admission evidence was not recorded');
+        }
+        signalAdmissionStart?.resolve(evidence);
+        this._messageAdmissionStarts.delete(signalAdmission.admissionId);
+      } catch (err) {
+        signalAdmissionStart?.reject(err);
+        this._messageAdmissionStarts.delete(signalAdmission.admissionId);
+        throw err;
+      }
+    };
+
+    const failSignalAdmissionBeforeDispatch = async (err: unknown) => {
+      if (signalAdmission === undefined) return;
+      try {
+        if (internal?.expectedAdmissionHash === undefined) {
+          await this._settleSignalResult(
+            signalAdmission.identity.signalId,
+            { status: 'failed', error: projectHarnessPublicError(err) },
+            signalAdmission,
+          );
+        }
+      } finally {
+        signalAdmissionStart?.reject(err);
+        this._messageAdmissionStarts.delete(signalAdmission.admissionId);
+      }
+    };
+
+    // The awaited durable reservation can outlive the run observed above.
+    // Re-read the authoritative subscription immediately afterward so a signal
+    // never reports/interprets an interleave after that run already ended (or
+    // owns an idle turn after a new run appeared during admission). This closes
+    // the routing window introduced specifically by durable admission I/O.
+    const admittedActiveRunId = sub.activeRunId();
+    if (admittedActiveRunId !== activeRunId) {
+      activeRunId = admittedActiveRunId;
+      willInterleave = activeRunId !== null;
+      if (activeRunId !== null) {
+        try {
+          assertActiveSignalOverrides(activeRunId);
+        } catch (err) {
+          let thrown = err;
+          try {
+            await failSignalAdmissionBeforeDispatch(err);
+          } catch (evidenceErr) {
+            thrown = evidenceErr;
+          }
+          throw internal === undefined ? redactPublicBoundaryRejection(thrown) : thrown;
+        }
       }
     }
 
@@ -7081,11 +7514,20 @@ export class Session {
 
         dispatched = agent.sendSignal(
           {
-            ...(internal?.signalId !== undefined ? { id: internal.signalId } : {}),
+            ...(signalAdmission !== undefined
+              ? {
+                  id: signalAdmission.identity.signalId,
+                  createdAt: new Date(signalAdmission.createdAt),
+                  acceptedAt: new Date(signalAdmission.createdAt),
+                }
+              : internal?.signalId !== undefined
+                ? { id: internal.signalId }
+                : {}),
             type: 'user-message',
             contents: signalContents as never,
           },
           {
+            ...(signalAdmission !== undefined ? { runId: signalAdmission.identity.idleRunId } : {}),
             resourceId: this.resourceId,
             threadId: this.threadId,
             ifIdle: { behavior: 'wake', streamOptions: baseExecOptions as never },
@@ -7093,6 +7535,12 @@ export class Session {
         );
       } catch (err) {
         finishOwnedSignalTurn();
+        let thrown = err;
+        try {
+          await failSignalAdmissionBeforeDispatch(err);
+        } catch (evidenceErr) {
+          thrown = evidenceErr;
+        }
         // §13.3f.1 — signal() is a public §4.2b boundary; the dispatch setup
         // (_buildRequestContext / _buildSignalContentsWithAttachments /
         // agent.sendSignal) can reject with a raw provider/storage/runtime error.
@@ -7100,7 +7548,7 @@ export class Session {
         // pass through unchanged). The trusted `internal` channel-ingress hook is
         // NOT a public §4.2b caller — the recovery worker needs the concrete
         // error for failure classification / re-dispatch, so it is exempt.
-        throw internal === undefined ? redactPublicBoundaryRejection(err) : err;
+        throw internal === undefined ? redactPublicBoundaryRejection(thrown) : thrown;
       }
 
       // §10.2 agent_start carries the runId — emit it now the run is dispatched.
@@ -7112,11 +7560,21 @@ export class Session {
       // for this non-`admissionId` path — the run terminal below is the live
       // settlement.
       const ownedSignalId = dispatched.signal.id;
-      this._writeMessageResultEvidenceBestEffortInBackground({
-        status: 'pending',
-        signalId: ownedSignalId,
-        runId: dispatched.runId,
-      });
+      if (signalAdmission !== undefined) {
+        try {
+          await recordSignalAdmissionDispatch(dispatched.runId);
+        } catch (err) {
+          turnAbortController.abort(err);
+          finishOwnedSignalTurn();
+          throw internal === undefined ? redactPublicBoundaryRejection(err) : err;
+        }
+      } else {
+        this._writeMessageResultEvidenceBestEffortInBackground({
+          status: 'pending',
+          signalId: ownedSignalId,
+          runId: dispatched.runId,
+        });
+      }
 
       // Register the completion waiter before any terminal chunks land.
       const completion = this._awaitRunCompletion(dispatched.runId);
@@ -7165,11 +7623,15 @@ export class Session {
             // goal-judge / active-turn-waiter rejection cannot flip an already
             // answered signal to `signal_failed`.
             if (full.finishReason !== 'suspended') {
-              await this._settleSignalResult(ownedSignalId, {
-                status: 'completed',
-                runId: dispatched.runId,
-                result: full as AgentResult,
-              });
+              await this._settleSignalResult(
+                ownedSignalId,
+                {
+                  status: 'completed',
+                  runId: dispatched.runId,
+                  result: full as AgentResult,
+                },
+                signalAdmission,
+              );
               signalSettled = true;
             }
             await Promise.race([this._runGoalJudge(full, false), activeTurnWaiter.promise]);
@@ -7186,19 +7648,28 @@ export class Session {
             }
             // Don't re-settle a signal already answered as completed (a post-run
             // goal-judge/abort rejection must not flip a terminal result).
+            let thrown = err;
             if (!signalSettled) {
-              await this._settleSignalResult(ownedSignalId, {
-                status: 'failed',
-                runId: dispatched.runId,
-                error: projectHarnessPublicError(err),
-              });
+              try {
+                await this._settleSignalResult(
+                  ownedSignalId,
+                  {
+                    status: 'failed',
+                    runId: dispatched.runId,
+                    error: projectHarnessPublicError(err),
+                  },
+                  signalAdmission,
+                );
+              } catch (evidenceErr) {
+                thrown = evidenceErr;
+              }
             }
             // §13.3f.1 — `handle.result` is a public §4.2b boundary; redact a raw
             // cause before rejecting it (safe `.message`, raw `.cause`
             // local-only). The durable `signal_failed` evidence above is already
             // projected via `projectHarnessPublicError`, so only the in-process
             // promise rejection changes.
-            throw redactPublicBoundaryRejection(err);
+            throw redactPublicBoundaryRejection(thrown);
           })
           .finally(() => {
             finishOwnedSignalTurn();
@@ -7235,7 +7706,15 @@ export class Session {
       this._assertOpenForTurn('signal()');
       dispatched = agent.sendSignal(
         {
-          ...(internal?.signalId !== undefined ? { id: internal.signalId } : {}),
+          ...(signalAdmission !== undefined
+            ? {
+                id: signalAdmission.identity.signalId,
+                createdAt: new Date(signalAdmission.createdAt),
+                acceptedAt: new Date(signalAdmission.createdAt),
+              }
+            : internal?.signalId !== undefined
+              ? { id: internal.signalId }
+              : {}),
           type: 'user-message',
           contents: interleavedContents as never,
         },
@@ -7246,24 +7725,38 @@ export class Session {
         },
       );
     } catch (err) {
+      let thrown = err;
+      try {
+        await failSignalAdmissionBeforeDispatch(err);
+      } catch (evidenceErr) {
+        thrown = evidenceErr;
+      }
       // §13.3f.1 — active-delivery signal() is ALSO a public §4.2b boundary; its
       // dispatch setup (_buildSignalContentsWithAttachments / agent.sendSignal)
       // can reject with a raw provider/storage/runtime error. Redact before
       // rejecting the caller (Harness-own closing/deleted errors pass through).
       // The trusted `internal` channel-ingress recovery worker is exempt — it
       // needs the concrete error for failure classification / re-dispatch.
-      throw internal === undefined ? redactPublicBoundaryRejection(err) : err;
+      throw internal === undefined ? redactPublicBoundaryRejection(thrown) : thrown;
     }
 
     // §4.2f: record durable per-`signalId` pending evidence on acceptance so
     // `lookupMessageResult(signalId)` answers across restarts (not just the
     // process-local run map).
     const interleavedSignalId = dispatched.signal.id;
-    this._writeMessageResultEvidenceBestEffortInBackground({
-      status: 'pending',
-      signalId: interleavedSignalId,
-      runId: dispatched.runId,
-    });
+    if (signalAdmission !== undefined) {
+      try {
+        await recordSignalAdmissionDispatch(dispatched.runId);
+      } catch (err) {
+        throw internal === undefined ? redactPublicBoundaryRejection(err) : err;
+      }
+    } else {
+      this._writeMessageResultEvidenceBestEffortInBackground({
+        status: 'pending',
+        signalId: interleavedSignalId,
+        runId: dispatched.runId,
+      });
+    }
 
     // Shared completion promise with whichever caller owns the run.
     const completion = this._awaitRunCompletion(dispatched.runId);
@@ -7279,25 +7772,38 @@ export class Session {
       completion
         .then(async full => {
           if (full.finishReason !== 'suspended') {
-            await this._settleSignalResult(interleavedSignalId, {
-              status: 'completed',
-              runId: dispatched.runId,
-              result: full as AgentResult,
-            });
+            await this._settleSignalResult(
+              interleavedSignalId,
+              {
+                status: 'completed',
+                runId: dispatched.runId,
+                result: full as AgentResult,
+              },
+              signalAdmission,
+            );
           }
           return full as AgentResult;
         })
         .catch(async err => {
-          await this._settleSignalResult(interleavedSignalId, {
-            status: 'failed',
-            runId: dispatched.runId,
-            error: projectHarnessPublicError(err),
-          });
+          let thrown = err;
+          try {
+            await this._settleSignalResult(
+              interleavedSignalId,
+              {
+                status: 'failed',
+                runId: dispatched.runId,
+                error: projectHarnessPublicError(err),
+              },
+              signalAdmission,
+            );
+          } catch (evidenceErr) {
+            thrown = evidenceErr;
+          }
           // §13.3f.1 — `handle.result` is a public §4.2b boundary (same as the
           // idle-wake branch above); redact a raw cause before rejecting it. The
           // durable `signal_failed` evidence already uses projectHarnessPublicError,
           // so only the in-process promise rejection changes.
-          throw redactPublicBoundaryRejection(err);
+          throw redactPublicBoundaryRejection(thrown);
         }),
     );
     void result.catch(() => {});
@@ -10917,69 +11423,6 @@ export class Session {
   }
 
   /**
-   * @internal §14.2 channel signal-admission duplicate resolution. Decides
-   * whether existing reservation evidence proves a run was already DISPATCHED
-   * (so the caller short-circuits without re-dispatching) or not (so the caller
-   * re-dispatches under the deterministic signalId — closing the pre-dispatch
-   * lost-signal window from C2/C7).
-   *
-   * - `failed`: rethrow the projected error (matches the message/queue
-   *   duplicate-of-failed contract).
-   * - `completed`: the run already answered — short-circuit to its identity.
-   * - `pending` WITH a recorded `runId`: a run was durably dispatched under this
-   *   admissionId — short-circuit to that real run (no double interleave/wake).
-   * - `pending` WITHOUT a `runId`: the reservation committed but the dispatch
-   *   never recorded a run (pre-dispatch crash window). Return `undefined` so the
-   *   caller (re-)dispatches; NEVER fabricate `runId === signalId` (C7).
-   * - tombstone / missing `status`: expired evidence — throw.
-   * - `undefined` input (no evidence): `undefined` (caller proceeds to reserve).
-   */
-  /**
-   * @internal §14.2 idempotency resolver for a replayed channel-signal admission.
-   *
-   * Channel-signal operation-admission evidence is intentionally a pre-dispatch
-   * BARRIER, not the durable answer. `_admitChannelSignalTurn` reserves `pending`
-   * evidence keyed by the deterministic signalId WITH admissionId/admissionHash,
-   * then records the dispatched `runId` on that same `pending` row. The run's
-   * completed/failed terminal settles through `_settleSignalResult`, which writes
-   * evidence WITHOUT admissionId/admissionHash (it is the shared terminal for all
-   * signals, channel or not, and carries no admission identity). Because
-   * `sameMessageEvidenceIdentity` (storage) compares admissionId+admissionHash,
-   * that terminal write is an identity mismatch the best-effort path swallows —
-   * so this evidence row stays `pending` (with a runId) for the lifetime of the
-   * operation. That is by design and matches §14.2 ("answer read-only from a
-   * stored row that is already terminal or accepted/queued"): the DURABLE answer
-   * for an idempotent channel duplicate lives on the channel INBOX row plus the
-   * run terminal, not on this admission record. The `failed` branch below is
-   * therefore defensive — it never fires for channel signals because the failure
-   * terminal never reaches this row — and the `pending + runId` branch is the
-   * live short-circuit that re-resolves a replay to its original run without
-   * re-dispatching.
-   */
-  private _channelSignalDispatchedDuplicate(
-    evidence: AgentSignalResultEvidence | OperationAdmissionTombstone | undefined,
-  ): { runId: string; signalId: string; willInterleave: boolean } | undefined {
-    if (evidence === undefined) return undefined;
-    if (!('status' in evidence)) {
-      throw new HarnessValidationError(
-        'admitChannelSignalTurn().admissionId',
-        'duplicate channel signal admission evidence has expired',
-      );
-    }
-    if (evidence.status === 'failed') {
-      throw publicErrorProjectionToError(evidence.error);
-    }
-    // A `pending` reservation with no durable `runId` was never delivered to a
-    // run — signal re-dispatch, do not short-circuit to a fabricated identity.
-    if (evidence.status === 'pending' && evidence.runId === undefined) return undefined;
-    return {
-      runId: evidence.runId!,
-      signalId: evidence.signalId,
-      willInterleave: false,
-    };
-  }
-
-  /**
    * @internal §14.2 channel ingress admission via the SIGNAL path. The
    * interactive counterpart to {@link _admitChannelQueueTurn}: an inbound that
    * the channel policy selected `delivery: 'signal'` for interleaves into an
@@ -11010,74 +11453,21 @@ export class Session {
         'expectedAdmissionHash must be a non-empty string',
       );
     }
-    // §14.2 idempotency barrier (signal analogue of the queue path's
-    // `admissionId`-keyed `queueAdmissionReceipts` de-dup). The deterministic
-    // per-`admissionId` signal id ties the dispatched run to a durable
-    // reservation written BEFORE dispatch. On the admitted→accepted recovery
-    // crash window the worker replays this method against the still-pending
-    // row, but the existing reservation short-circuits to the ORIGINAL run
-    // instead of firing a second interleave/wake (double model turn / spend).
-    const signalId = this._channelSignalAdmissionSignalId(opts.admissionId);
-    const existing = await this._resolveMessageAdmissionDuplicate({
-      admissionId: opts.admissionId,
-      admissionHash: opts.expectedAdmissionHash,
-    });
-    const dispatchedDuplicate = this._channelSignalDispatchedDuplicate(existing);
-    if (dispatchedDuplicate !== undefined) return dispatchedDuplicate;
-    // Reserve the admissionId durably BEFORE dispatch. The conflict-detecting
-    // write rejects a payload-mismatched replay and resolves a concurrent winner
-    // to its evidence (returned and short-circuited here, never double-dispatched).
-    const reserved = await this._writeMessageResultEvidence({
-      status: 'pending',
-      signalId,
-      admissionId: opts.admissionId,
-      admissionHash: opts.expectedAdmissionHash,
-    });
-    if (!reserved.created) {
-      const reservedDuplicate = this._channelSignalDispatchedDuplicate(reserved.evidence);
-      if (reservedDuplicate !== undefined) return reservedDuplicate;
-      // The reservation already exists but carries NO durable runId: a crash
-      // between reserving and recording the dispatched run (the pre-dispatch
-      // lost-signal window, C2/C7). The signal was never delivered to a run, so
-      // fall through and (re-)dispatch under the SAME deterministic signalId — a
-      // real run is created exactly once on recovery instead of fabricating a
-      // runId for a run that never started. This is safe because channel-ingress
-      // admission for a given admissionId is SERIALIZED by the durable inbox-row
-      // claim (admitChannelInbound's initial claim / recoverChannelInboxOnce's
-      // reclaim), so `_admitChannelSignalTurn` never runs concurrently for the
-      // same admissionId — a pending-without-runId reservation is always the
-      // single claimant's own crashed prior attempt, never a live concurrent run.
-    }
+    // Public and channel callers share one admission path. The only channel-only
+    // inputs are the already-persisted attachments/request context and the hash
+    // the inbox row committed before runtime dispatch.
     const handle = await this.signal(
       {
         content: opts.content,
+        admissionId: opts.admissionId,
         ...(opts.mode !== undefined ? { mode: opts.mode } : {}),
       },
       {
         persistedRequestContext: opts.requestContext,
-        signalId,
+        expectedAdmissionHash: opts.expectedAdmissionHash,
         ...(opts.attachments !== undefined ? { attachments: opts.attachments } : {}),
       },
     );
-    // Record the dispatched run on the durable reservation BEFORE returning so the
-    // recovery worker can distinguish "dispatched" (pending + runId) from
-    // "never dispatched" (pending + no runId) and only re-dispatch the latter.
-    // Awaited (not best-effort/background): the reservation's runId is the
-    // recovery discriminator for the lost-signal window, not a convenience field.
-    // The conflicting-write path resolves a concurrent winner to its evidence;
-    // the same-signal runId update never conflicts (runId is not part of the
-    // admission identity), so a duplicate here returns the already-recorded run.
-    const recordedRun = await this._writeMessageResultEvidence({
-      status: 'pending',
-      signalId,
-      runId: handle.runId,
-      admissionId: opts.admissionId,
-      admissionHash: opts.expectedAdmissionHash,
-    });
-    if (!recordedRun.created) {
-      const recordedDuplicate = this._channelSignalDispatchedDuplicate(recordedRun.evidence);
-      if (recordedDuplicate !== undefined) return recordedDuplicate;
-    }
     // The shared run terminal settles `handle.result` in the background (§4.2f /
     // §21); the bridge persists `runId`/`signalId` synchronously and does not
     // await the answer here. Swallow so an unawaited rejection is not unhandled.
@@ -11113,34 +11503,7 @@ export class Session {
     attachments: PersistedAttachment[],
     requestContext: PersistedRequestContextInput,
   ): string {
-    return sha256CanonicalJson({
-      kind: 'signal',
-      content: opts.content,
-      ...(opts.mode !== undefined ? { mode: opts.mode } : {}),
-      attachments: attachments.map(attachment => ({
-        kind: attachment.kind,
-        name: attachment.name,
-        mimeType: attachment.mimeType,
-        ...(attachment.kind === 'ref'
-          ? {
-              attachmentId: attachment.attachmentId,
-              resourceId: this.resourceId,
-              ownerSessionId: attachment.ownerSessionId,
-              bytes: attachment.bytes,
-              sha256: attachment.sha256,
-              source: attachment.source,
-              attachmentKind: attachment.attachmentKind ?? 'file',
-              ...(attachment.primitiveType ? { primitiveType: attachment.primitiveType } : {}),
-              ...(attachment.elementType ? { elementType: attachment.elementType } : {}),
-              ...(attachment.renderer ? { renderer: attachment.renderer } : {}),
-              ...(attachment.schemaId ? { schemaId: attachment.schemaId } : {}),
-              ...(attachment.metadata ? { metadata: cloneAttachmentMetadata(attachment.metadata) } : {}),
-              ...(attachment.object ? { object: attachment.object } : {}),
-            }
-          : { url: attachment.url }),
-      })),
-      requestContext: clonePersistedRequestContext(requestContext),
-    });
+    return this._computeSignalAdmissionHash(opts, attachments, requestContext);
   }
 
   private async _admitQueue(

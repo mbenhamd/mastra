@@ -1900,6 +1900,14 @@ export interface SessionSignalOptions {
   /** Free-form user content. Matches `message().content`. */
   content: string;
 
+  /**
+   * Optional idempotency key for retry-safe active interleaves and idle wakes.
+   * Reusing the key with the same normalized payload returns the original
+   * signal/run/result identity; reusing it with a different payload rejects
+   * before another signal is dispatched.
+   */
+  admissionId?: string;
+
   /** Per-turn mode override (same semantics as `message().mode`). */
   mode?: string;
 
