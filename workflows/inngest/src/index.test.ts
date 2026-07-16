@@ -23,115 +23,54 @@ import { createHonoServer } from '@mastra/deployer/server';
 import { DefaultStorage } from '@mastra/libsql';
 import { Observability } from '@mastra/observability';
 import { MockLanguageModelV1 } from 'ai/test';
-import { execaCommand } from 'execa';
-import type { ResultPromise } from 'execa';
 import { Inngest } from 'inngest';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { z } from 'zod';
+import {
+  HANDLER_PORT as ADAPTER_HANDLER_PORT,
+  INNGEST_PORT as ADAPTER_INNGEST_PORT,
+} from './__tests__/adapters/_utils';
+import {
+  HANDLER_PORT as DURABLE_AGENT_HANDLER_PORT,
+  INNGEST_PORT as DURABLE_AGENT_INNGEST_PORT,
+} from './__tests__/durable-agent.test.utils';
+import {
+  createInngestTestRuntimeConfig,
+  createLocalTestEndpoints,
+  InngestTestRuntimeManager,
+} from './__tests__/inngest-test-runtime';
+import type { LocalTestEndpoints } from './__tests__/inngest-test-runtime';
 import type { InngestWorkflow } from './workflow';
 import { init, serve as inngestServe } from './index';
 
 interface LocalTestContext {
-  inngestPort: number;
-  handlerPort: number;
-  srv?: any;
+  endpoints: LocalTestEndpoints;
 }
 
-// Inngest dev server process (managed via inngest-cli, no Docker required)
-let standaloneInngestProcess: ResultPromise | null = null;
+const LOCAL_TEST_ENDPOINTS = createLocalTestEndpoints({ inngestPort: 4200, handlerPort: 4201 });
+const INNGEST_TEST_RUNTIME = new InngestTestRuntimeManager(createInngestTestRuntimeConfig(LOCAL_TEST_ENDPOINTS));
+const ACTIVE_TEST_ENDPOINTS = INNGEST_TEST_RUNTIME.config.endpoints;
 
-// Whether an Inngest server is already listening on port 4000 (Docker or host CLI)
-let inngestServerRunning = false;
-// Whether that already-running server is *Docker* specifically. Only Docker requires
-// rewriting the SDK origin to `host.docker.internal` so the container can reach the
-// host. A host-side `inngest-cli dev` should keep `localhost`.
-let useDockerInngest = false;
+vi.setConfig({ hookTimeout: 150_000 });
 
-/** Best-effort check whether this process is itself running inside a container. */
-function isInsideContainer(): boolean {
-  try {
-    if (fs.existsSync('/.dockerenv')) return true;
-    if (fs.existsSync('/run/.containerenv')) return true;
-    const cgroup = fs.readFileSync('/proc/1/cgroup', 'utf8');
-    if (/docker|kubepods|containerd/.test(cgroup)) return true;
-  } catch {
-    // /proc/1/cgroup doesn't exist on macOS hosts; fall through.
-  }
-  return false;
+function getLocalTestEndpoints(context: unknown): LocalTestEndpoints {
+  return (context as LocalTestContext).endpoints;
 }
-
-/**
- * Detect whether an Inngest server is already running, and whether it's running
- * inside Docker (vs a host `inngest-cli dev`). Must be called once at startup
- * before any tests run.
- *
- * "Server reachable on port 4000" alone isn't sufficient — a host-side CLI
- * satisfies that probe too, and treating it as Docker would incorrectly rewrite
- * the SDK origin to `host.docker.internal`. We therefore require an explicit
- * Docker indicator: an env var, a docker-compose-managed container running on
- * the host, or this process being inside a container itself.
- */
-async function detectDockerInngest(): Promise<boolean> {
-  try {
-    const response = await fetch('http://localhost:4000/dev', { signal: AbortSignal.timeout(1000) });
-    if (!response.ok) return false;
-    inngestServerRunning = true;
-  } catch {
-    return false;
-  }
-
-  // Explicit opt-in / opt-out via env wins.
-  if (process.env.MASTRA_INNGEST_TEST_DOCKER === '1') {
-    useDockerInngest = true;
-    return true;
-  }
-  if (process.env.MASTRA_INNGEST_TEST_DOCKER === '0') {
-    return false;
-  }
-
-  // We're inside a container — the host of the dev server is irrelevant; Docker mode applies.
-  if (isInsideContainer()) {
-    useDockerInngest = true;
-    return true;
-  }
-
-  // Host machine: only treat as Docker if we can confirm a docker-compose-managed
-  // container with the expected name is up.
-  try {
-    const result = await execaCommand('docker ps --filter name=mastra-inngest-test --format {{.Names}}', {
-      reject: false,
-    });
-    if (typeof result.stdout === 'string' && result.stdout.includes('mastra-inngest-test')) {
-      useDockerInngest = true;
-      return true;
-    }
-  } catch {
-    // docker CLI unavailable — assume host inngest-cli, not Docker.
-  }
-  return false;
-}
-
-// Detect Docker at module load time
-await detectDockerInngest();
 
 /**
  * Get additional serve options for tests that need Inngest registration to
- * point at a non-default origin/path. When the dev server is running in Docker,
- * the container can't reach `localhost`, so we rewrite the SDK origin to
- * `host.docker.internal`. When running against a host-side `inngest-cli dev`,
- * `localhost` works fine and no override is needed.
- *
- * `handlerPort` and `servePath` default to the values used by the legacy
- * per-test setups (4001, `/inngest/api`); pass explicit values from any test
- * that binds to a different port or mount path.
+ * point at the runtime manager's immutable callback origin/path.
  */
-function getDockerRegisterOptions(handlerPort: number = 4001, servePath: string = '/inngest/api') {
-  if (useDockerInngest) {
+function getDockerRegisterOptions(
+  endpoints: LocalTestEndpoints = ACTIVE_TEST_ENDPOINTS,
+  serveOrigin: string | null | undefined = INNGEST_TEST_RUNTIME.config.registrationServeOrigin,
+) {
+  if (serveOrigin) {
     return {
       registerOptions: {
-        serveOrigin: `http://host.docker.internal:${handlerPort}`,
-        servePath,
+        serveOrigin,
+        servePath: endpoints.servePath,
       },
     };
   }
@@ -139,109 +78,77 @@ function getDockerRegisterOptions(handlerPort: number = 4001, servePath: string 
 }
 
 /**
- * Wait for `expectedFnIds` to all be registered with the dev server, ignoring
- * any stale registrations from earlier tests. If `expectedFnIds` is empty, fall
- * back to waiting for at least one function (best effort).
+ * Keep existing test call sites explicit about their endpoint contract while
+ * delegating daemon lifecycle and registration readiness to one owner.
  */
-async function waitForFunctionRegistration(expectedFnIds: string[] = []): Promise<void> {
-  const maxAttempts = 20;
-  const matches = (id: string, candidate: string) =>
-    candidate === id || candidate.endsWith(`-${id}`) || candidate.endsWith(`.${id}`);
-  for (let i = 0; i < maxAttempts; i++) {
-    try {
-      const response = await fetch('http://localhost:4000/dev');
-      const data = await response.json();
-      const fns = (data.functions ?? []) as Array<{ slug?: string; id?: string; name?: string }>;
-      const candidates = fns.flatMap(f => [f.slug, f.id, f.name].filter(Boolean) as string[]);
-      if (expectedFnIds.length > 0) {
-        if (expectedFnIds.every(id => candidates.some(c => matches(id, c)))) return;
-      } else if (fns.length > 0) {
-        return;
-      }
-    } catch {
-      // Keep trying
-    }
-    await new Promise(resolve => setTimeout(resolve, 500));
+async function resetInngest(endpoints: LocalTestEndpoints, expectedFnIds: string[] = []) {
+  if (endpoints !== ACTIVE_TEST_ENDPOINTS) {
+    throw new Error('Inngest tests must use the runtime manager endpoint configuration.');
   }
+  await INNGEST_TEST_RUNTIME.ensureReady(expectedFnIds);
 }
 
-/**
- * Start a fresh inngest-cli dev server, killing any existing one first.
- * If a server is already running (Docker or host CLI), just trigger registration
- * without starting a new server.
- */
-async function resetInngest(expectedFnIds: string[] = []) {
-  if (inngestServerRunning) {
-    // Server (Docker or host CLI) is already running — just trigger registration
-    try {
-      await fetch('http://localhost:4001/inngest/api', { method: 'PUT' });
-    } catch {
-      // Ignore - handler may not be up yet
-    }
-
-    await waitForFunctionRegistration(expectedFnIds);
-    return;
-  }
-
-  // Kill existing inngest dev server if running
-  if (standaloneInngestProcess) {
-    standaloneInngestProcess.kill();
-    standaloneInngestProcess = null;
-    await new Promise(resolve => setTimeout(resolve, 500));
-  }
-
-  // Start inngest-cli dev server
-  standaloneInngestProcess = execaCommand(
-    `npx inngest-cli dev -p 4000 -u http://localhost:4001/inngest/api --poll-interval=1 --retry-interval=1`,
-    { cwd: import.meta.dirname, stdio: 'ignore', reject: false },
-  );
-
-  // Wait for it to be ready
-  for (let i = 0; i < 30; i++) {
-    try {
-      const response = await fetch('http://localhost:4000/dev');
-      if (response.ok) break;
-    } catch {
-      // Keep trying
-    }
-    await new Promise(resolve => setTimeout(resolve, 500));
-  }
-
-  // Trigger registration by sending PUT to the handler
-  try {
-    await fetch('http://localhost:4001/inngest/api', { method: 'PUT' });
-  } catch {
-    // Ignore
-  }
-
-  await waitForFunctionRegistration(expectedFnIds);
-}
+afterAll(async () => {
+  await INNGEST_TEST_RUNTIME.stop();
+});
 
 describe('MastraInngestWorkflow', () => {
   let globServer: any;
 
   beforeEach<LocalTestContext>(async ctx => {
-    ctx.inngestPort = 4100;
-    ctx.handlerPort = 4101;
-
+    ctx.endpoints = ACTIVE_TEST_ENDPOINTS;
     globServer?.close();
 
     vi.restoreAllMocks();
   });
 
+  describe('test infrastructure port wiring', () => {
+    it('derives every endpoint from one non-default port pair', ctx => {
+      const endpoints = createLocalTestEndpoints({ inngestPort: 43123, handlerPort: 43124 });
+
+      expect(endpoints).toEqual({
+        ports: { inngestPort: 43123, handlerPort: 43124 },
+        clientBaseUrl: 'http://localhost:43123',
+        devServerUrl: 'http://localhost:43123/dev',
+        handlerUrl: 'http://localhost:43124/inngest/api',
+        dockerServeOrigin: 'http://host.docker.internal:43124',
+        servePath: '/inngest/api',
+      });
+      expect(getLocalTestEndpoints(ctx)).toBe(ACTIVE_TEST_ENDPOINTS);
+      expect(LOCAL_TEST_ENDPOINTS.ports).toEqual({
+        inngestPort: ADAPTER_INNGEST_PORT,
+        handlerPort: ADAPTER_HANDLER_PORT,
+      });
+      expect(LOCAL_TEST_ENDPOINTS.ports.inngestPort).not.toBe(DURABLE_AGENT_INNGEST_PORT);
+      expect(LOCAL_TEST_ENDPOINTS.ports.handlerPort).not.toBe(DURABLE_AGENT_HANDLER_PORT);
+      expect(getDockerRegisterOptions(endpoints, null)).toEqual({});
+      expect(getDockerRegisterOptions(endpoints, endpoints.dockerServeOrigin)).toEqual({
+        registerOptions: {
+          serveOrigin: 'http://host.docker.internal:43124',
+          servePath: '/inngest/api',
+        },
+      });
+      expect(INNGEST_TEST_RUNTIME.config.endpoints.ports).toBe(LOCAL_TEST_ENDPOINTS.ports);
+      expect(INNGEST_TEST_RUNTIME.config.dockerNetwork).toBe('host');
+      expect(INNGEST_TEST_RUNTIME.config.registrationServeOrigin).toBe('http://127.0.0.1:4201');
+
+      const dockerCompose = fs.readFileSync(path.resolve(import.meta.dirname, '../docker-compose.yaml'), 'utf8');
+      expect(dockerCompose).toContain(
+        `command: inngest dev -p ${LOCAL_TEST_ENDPOINTS.ports.inngestPort} -u ${INNGEST_TEST_RUNTIME.config.registrationServeOrigin}${LOCAL_TEST_ENDPOINTS.servePath} --poll-interval=1`,
+      );
+      expect(dockerCompose).toContain('network_mode: host');
+    });
+  });
+
   afterAll(async () => {
     globServer?.close();
-    if (standaloneInngestProcess) {
-      standaloneInngestProcess.kill();
-      standaloneInngestProcess = null;
-    }
   });
 
   describe.sequential('FGA actor signal', () => {
     it('bypasses membership resolution for a trusted system actor across a nested-workflow step boundary', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -311,7 +218,7 @@ describe('MastraInngestWorkflow', () => {
           fga: fgaProvider,
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -323,9 +230,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const requestContext = new RequestContext();
       requestContext.set('organizationId', 'org-1');
@@ -355,7 +262,7 @@ describe('MastraInngestWorkflow', () => {
       const t0 = Date.now();
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -405,7 +312,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -417,12 +324,12 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
       console.log(`[TIMING] server setup: ${Date.now() - t1}ms`);
 
       const t2 = Date.now();
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
       console.log(`[TIMING] resetInngest: ${Date.now() - t2}ms`);
 
       const t3 = Date.now();
@@ -465,7 +372,7 @@ describe('MastraInngestWorkflow', () => {
     it('should execute a single step workflow successfully', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -498,7 +405,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -510,9 +417,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.start({ inputData: {} });
@@ -529,7 +436,7 @@ describe('MastraInngestWorkflow', () => {
     it('should execute a single step in a workflow when perStep is true', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -572,7 +479,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -584,9 +491,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const runId = 'test-run-id';
       const run = await workflow.createRun({
@@ -614,7 +521,7 @@ describe('MastraInngestWorkflow', () => {
     it('should throw error when restart is called on inngest workflow', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -647,7 +554,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -659,9 +566,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       await expect(run.restart()).rejects.toThrowError('restart() is not supported on inngest workflows');
@@ -672,7 +579,7 @@ describe('MastraInngestWorkflow', () => {
     it('should execute a single step workflow successfully with state', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -719,7 +626,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -731,9 +638,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.start({
@@ -755,7 +662,7 @@ describe('MastraInngestWorkflow', () => {
     it('should execute multiple runs of a workflow', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -816,7 +723,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -828,10 +735,10 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
 
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const [result1, result2] = await Promise.all([
         (async () => {
@@ -897,7 +804,7 @@ describe('MastraInngestWorkflow', () => {
     it('should execute a single step nested workflow successfully with state', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -957,7 +864,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -969,9 +876,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.start({
@@ -993,7 +900,7 @@ describe('MastraInngestWorkflow', () => {
     it('should execute a single step in a nested workflow when perStep is true', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -1069,7 +976,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -1081,9 +988,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.start({
@@ -1105,7 +1012,7 @@ describe('MastraInngestWorkflow', () => {
     it('should execute a single step nested workflow successfully with state being set by the nested workflow', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -1180,7 +1087,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -1192,9 +1099,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.start({
@@ -1216,7 +1123,7 @@ describe('MastraInngestWorkflow', () => {
     it('should execute multiple steps in parallel', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -1261,7 +1168,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -1273,9 +1180,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.start({ inputData: {} });
@@ -1294,7 +1201,7 @@ describe('MastraInngestWorkflow', () => {
     it('should execute only one step when there are multiple steps in parallel and perStep is true', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -1339,7 +1246,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -1351,9 +1258,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.start({ inputData: {}, perStep: true });
@@ -1393,7 +1300,7 @@ describe('MastraInngestWorkflow', () => {
     it('should execute multiple steps in parallel with state', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -1441,7 +1348,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -1453,9 +1360,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.start({ inputData: {}, initialState: { value: 'test-state' } });
@@ -1488,7 +1395,7 @@ describe('MastraInngestWorkflow', () => {
     it('should execute steps sequentially', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -1537,7 +1444,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -1549,9 +1456,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.start({ inputData: {} });
@@ -1569,7 +1476,7 @@ describe('MastraInngestWorkflow', () => {
     it('should execute a sleep step', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -1612,7 +1519,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -1624,9 +1531,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const startTime = Date.now();
@@ -1658,7 +1565,7 @@ describe('MastraInngestWorkflow', () => {
     it('should execute a sleep step with fn parameter', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -1707,7 +1614,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -1719,9 +1626,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const startTime = Date.now();
@@ -1753,7 +1660,7 @@ describe('MastraInngestWorkflow', () => {
     it('should execute a a sleep until step', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -1783,11 +1690,8 @@ describe('MastraInngestWorkflow', () => {
         steps: [step1],
       });
 
-      workflow
-        .then(step1)
-        .sleepUntil(new Date(Date.now() + 1000))
-        .then(step2)
-        .commit();
+      const sleepUntil = new Date(Date.now() + 1000);
+      workflow.then(step1).sleepUntil(sleepUntil).then(step2).commit();
 
       const mastra = new Mastra({
         storage: new DefaultStorage({
@@ -1800,7 +1704,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -1812,12 +1716,11 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
-      const startTime = Date.now();
       const result = await run.start({ inputData: {} });
       const endTime = Date.now();
 
@@ -1838,7 +1741,7 @@ describe('MastraInngestWorkflow', () => {
         // endedAt: expect.any(Number),
       });
 
-      expect(endTime - startTime).toBeGreaterThan(1000);
+      expect(endTime).toBeGreaterThanOrEqual(sleepUntil.getTime());
 
       srv.close();
     });
@@ -1846,7 +1749,7 @@ describe('MastraInngestWorkflow', () => {
     it('should execute a sleep until step with fn parameter', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -1895,7 +1798,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -1907,9 +1810,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const startTime = Date.now();
@@ -1941,7 +1844,7 @@ describe('MastraInngestWorkflow', () => {
     it('should throw error if waitForEvent is used', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -1988,7 +1891,7 @@ describe('MastraInngestWorkflow', () => {
     it('should persist a workflow run with resourceId', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -2021,7 +1924,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -2033,9 +1936,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun({ resourceId: 'test-resource-id' });
       const result = await run.start({ inputData: {} });
@@ -2057,7 +1960,7 @@ describe('MastraInngestWorkflow', () => {
     it('should be able to abort workflow execution in between steps', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -2101,7 +2004,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -2113,9 +2016,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const p = run.start({ inputData: { value: 'test' } });
@@ -2142,7 +2045,7 @@ describe('MastraInngestWorkflow', () => {
     it('should be able to abort workflow execution during a step', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -2202,7 +2105,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -2214,9 +2117,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const p = run.start({ inputData: { value: 'test' } });
@@ -2252,7 +2155,7 @@ describe('MastraInngestWorkflow', () => {
     it('should resolve trigger data', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -2291,7 +2194,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -2303,10 +2206,10 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
 
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.start({ inputData: { inputData: 'test-input' } });
@@ -2320,7 +2223,7 @@ describe('MastraInngestWorkflow', () => {
     it('should provide access to step results and trigger data via getStepResult helper', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -2381,7 +2284,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -2393,9 +2296,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.start({ inputData: { inputValue: 'test-input' } });
@@ -2414,7 +2317,7 @@ describe('MastraInngestWorkflow', () => {
     it('should resolve trigger data from context', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -2450,7 +2353,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -2462,9 +2365,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       await run.start({ inputData: { inputData: 'test-input' } });
@@ -2481,7 +2384,7 @@ describe('MastraInngestWorkflow', () => {
     it('should resolve trigger data from getInitData', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -2527,7 +2430,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -2539,9 +2442,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.start({ inputData: { cool: 'test-input' } });
@@ -2560,7 +2463,7 @@ describe('MastraInngestWorkflow', () => {
     it('should resolve variables from previous steps', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -2611,7 +2514,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -2623,9 +2526,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       await run.start({ inputData: {} });
@@ -2646,7 +2549,7 @@ describe('MastraInngestWorkflow', () => {
     it('should follow conditional chains', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -2716,7 +2619,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -2728,9 +2631,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.start({ inputData: { status: 'success' } });
@@ -2749,7 +2652,7 @@ describe('MastraInngestWorkflow', () => {
     it('should follow conditional chains and run only one step when perStep is true', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -2842,7 +2745,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -2853,9 +2756,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.start({
@@ -2881,7 +2784,7 @@ describe('MastraInngestWorkflow', () => {
     it('should follow conditional chains with state', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -2969,7 +2872,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -2981,9 +2884,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.start({ inputData: { status: 'success' }, initialState: { value: 'test-state' } });
@@ -3004,7 +2907,7 @@ describe('MastraInngestWorkflow', () => {
     it('should handle failing dependencies', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -3049,7 +2952,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -3061,9 +2964,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       let result: Awaited<ReturnType<typeof run.start>> | undefined = undefined;
@@ -3086,7 +2989,7 @@ describe('MastraInngestWorkflow', () => {
     it('should support simple string conditions', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -3157,7 +3060,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -3169,9 +3072,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.start({ inputData: { status: 'success' } });
@@ -3190,7 +3093,7 @@ describe('MastraInngestWorkflow', () => {
     it('should support custom condition functions', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -3242,7 +3145,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -3254,9 +3157,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.start({ inputData: { count: 5 } });
@@ -3277,7 +3180,7 @@ describe('MastraInngestWorkflow', () => {
     it('should handle step execution errors', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -3311,7 +3214,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -3323,9 +3226,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
 
@@ -3342,7 +3245,7 @@ describe('MastraInngestWorkflow', () => {
     it('should preserve custom error properties through Inngest serialization', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -3381,7 +3284,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -3393,9 +3296,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.start({ inputData: {} });
@@ -3432,7 +3335,7 @@ describe('MastraInngestWorkflow', () => {
     it('should preserve error cause chains through Inngest serialization', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -3477,7 +3380,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -3489,9 +3392,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.start({ inputData: {} });
@@ -3539,7 +3442,7 @@ describe('MastraInngestWorkflow', () => {
     it('should handle step execution errors within branches', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -3591,7 +3494,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -3603,9 +3506,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.start({ inputData: {} });
@@ -3622,7 +3525,7 @@ describe('MastraInngestWorkflow', () => {
     it('should handle step execution errors within nested workflows', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -3682,7 +3585,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -3694,9 +3597,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await mainWorkflow.createRun();
       const result = await run.start({ inputData: {} });
@@ -3714,7 +3617,7 @@ describe('MastraInngestWorkflow', () => {
     it('should handle nested AND/OR conditions', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -3809,7 +3712,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -3821,9 +3724,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.start({ inputData: {} });
@@ -3840,7 +3743,7 @@ describe('MastraInngestWorkflow', () => {
     it('should run an until loop', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -3914,7 +3817,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -3926,9 +3829,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await counterWorkflow.createRun();
       const result = await run.start({ inputData: { target: 10, value: 0 } });
@@ -3947,7 +3850,7 @@ describe('MastraInngestWorkflow', () => {
     it('should run a while loop', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -4021,7 +3924,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -4033,9 +3936,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await counterWorkflow.createRun();
       const result = await run.start({ inputData: { target: 10, value: 0 } });
@@ -4055,7 +3958,7 @@ describe('MastraInngestWorkflow', () => {
     it('should run a single item concurrency (default) for loop', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -4112,7 +4015,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -4124,9 +4027,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await counterWorkflow.createRun();
       const result = await run.start({ inputData: [{ value: 1 }, { value: 22 }, { value: 333 }] });
@@ -4148,7 +4051,7 @@ describe('MastraInngestWorkflow', () => {
     it('should run foreach with nested workflow', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -4242,7 +4145,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -4254,9 +4157,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await dynamicWorkflowOrchestrator.createRun();
       const result = await run.start({ inputData: { elements: ['a', 'b', 'c'] } });
@@ -4272,7 +4175,7 @@ describe('MastraInngestWorkflow', () => {
     it('should run the if-then branch', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -4390,7 +4293,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -4402,9 +4305,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await counterWorkflow.createRun();
       const result = await run.start({ inputData: { startValue: 1 } });
@@ -4423,7 +4326,7 @@ describe('MastraInngestWorkflow', () => {
     it('should run the else branch', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -4542,7 +4445,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -4554,9 +4457,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await counterWorkflow.createRun();
       const result = await run.start({ inputData: { startValue: 6 } });
@@ -4577,7 +4480,7 @@ describe('MastraInngestWorkflow', () => {
     it.skip('should validate trigger data against schema', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -4638,7 +4541,7 @@ describe('MastraInngestWorkflow', () => {
     it('should run multiple chains in parallel', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -4715,7 +4618,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -4727,9 +4630,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.start({ inputData: {} });
@@ -4745,7 +4648,7 @@ describe('MastraInngestWorkflow', () => {
     it('should retry a step default 0 times', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -4785,7 +4688,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -4797,9 +4700,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.start({ inputData: {} });
@@ -4817,7 +4720,7 @@ describe('MastraInngestWorkflow', () => {
     it('should retry a step with a custom retry config', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -4861,7 +4764,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -4873,9 +4776,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.start({ inputData: {} });
@@ -4893,7 +4796,7 @@ describe('MastraInngestWorkflow', () => {
     it('should retry a step with step retries option, overriding the workflow retry config', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -4939,7 +4842,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -4951,9 +4854,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.start({ inputData: {} });
@@ -4973,7 +4876,7 @@ describe('MastraInngestWorkflow', () => {
     it('should be able to use all action types in a workflow', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -5019,7 +4922,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -5031,9 +4934,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.start({ inputData: {} });
@@ -5058,7 +4961,7 @@ describe('MastraInngestWorkflow', () => {
     it('should return the correct runId', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow } = init(inngest);
@@ -5080,7 +4983,7 @@ describe('MastraInngestWorkflow', () => {
     it('should handle basic suspend and resume flow with async await syntax', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -5176,7 +5079,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -5188,9 +5091,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await promptEvalWorkflow.createRun();
 
@@ -5274,7 +5177,7 @@ describe('MastraInngestWorkflow', () => {
     it('should handle basic suspend and resume single step flow with async await syntax and perStep:true', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -5370,7 +5273,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -5381,9 +5284,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await promptEvalWorkflow.createRun();
 
@@ -5453,7 +5356,7 @@ describe('MastraInngestWorkflow', () => {
     it('should handle basic suspend and resume flow with async await syntax with state', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -5549,7 +5452,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -5561,9 +5464,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await promptEvalWorkflow.createRun();
 
@@ -5705,7 +5608,7 @@ describe('MastraInngestWorkflow', () => {
     it('should handle consecutive nested workflows with suspend/resume', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -5775,7 +5678,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -5787,9 +5690,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await mainWorkflow.createRun();
 
@@ -5823,7 +5726,7 @@ describe('MastraInngestWorkflow', () => {
     it('should maintain correct step status after resuming in branching workflows - #6419', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -5883,7 +5786,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -5895,9 +5798,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await testWorkflow.createRun();
 
@@ -5950,7 +5853,7 @@ describe('MastraInngestWorkflow', () => {
     it('should have access to the correct inputValue when resuming a step preceded by a .map step', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -6069,7 +5972,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -6081,9 +5984,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await promptEvalWorkflow.createRun();
 
@@ -6227,7 +6130,7 @@ describe('MastraInngestWorkflow', () => {
     it('should throw error if trying to timetravel a workflow execution that is still running', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -6280,7 +6183,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -6292,9 +6195,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const runId = 'test-run-id';
 
@@ -6342,7 +6245,7 @@ describe('MastraInngestWorkflow', () => {
     it('should throw error if validateInputs is true and trying to timetravel a workflow execution with invalid inputData', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -6398,7 +6301,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -6410,9 +6313,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
 
@@ -6426,7 +6329,7 @@ describe('MastraInngestWorkflow', () => {
     it('should throw error if trying to timetravel to a non-existent step', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -6478,7 +6381,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -6490,9 +6393,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
 
@@ -6506,7 +6409,7 @@ describe('MastraInngestWorkflow', () => {
     it('should timeTravel a workflow execution', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -6559,7 +6462,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -6571,9 +6474,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.timeTravel({
@@ -6680,7 +6583,7 @@ describe('MastraInngestWorkflow', () => {
     it('should timeTravel a workflow execution and run only one step when perStep is true', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -6732,7 +6635,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -6743,9 +6646,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.timeTravel({
@@ -6797,7 +6700,7 @@ describe('MastraInngestWorkflow', () => {
     it('should timeTravel a workflow execution that was previously ran', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -6854,7 +6757,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -6866,9 +6769,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const failedRun = await run.start({ inputData: { value: 0 } });
@@ -6987,7 +6890,7 @@ describe('MastraInngestWorkflow', () => {
     it('should timeTravel a workflow execution that was previously ran and run only one step when perStep is true', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -7042,7 +6945,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -7055,9 +6958,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const failedRun = await run.start({ inputData: { value: 0 } });
@@ -7112,7 +7015,7 @@ describe('MastraInngestWorkflow', () => {
     it('should timeTravel a workflow execution that has nested workflows', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -7186,7 +7089,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -7198,9 +7101,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.timeTravel({
@@ -7361,7 +7264,7 @@ describe('MastraInngestWorkflow', () => {
     it('should successfully suspend and resume a timeTravelled workflow execution', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -7453,7 +7356,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -7465,9 +7368,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await promptEvalWorkflow.createRun();
 
@@ -7552,7 +7455,7 @@ describe('MastraInngestWorkflow', () => {
     it('should timetravel a suspended workflow execution', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -7644,7 +7547,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -7656,9 +7559,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await promptEvalWorkflow.createRun();
 
@@ -7739,7 +7642,7 @@ describe('MastraInngestWorkflow', () => {
     it('should timeTravel workflow execution for a do-until workflow', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -7794,7 +7697,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -7805,10 +7708,10 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
 
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await dowhileWorkflow.createRun();
       const result = await run.timeTravel({
@@ -7875,7 +7778,7 @@ describe('MastraInngestWorkflow', () => {
     it('should timeTravel workflow execution for workflow with parallel steps', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -7972,7 +7875,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -7983,9 +7886,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await testParallelWorkflow.createRun();
 
@@ -8268,7 +8171,7 @@ describe('MastraInngestWorkflow', () => {
     it('should timeTravel workflow execution for workflow with parallel steps and run just the timeTravelled step when perStep is true', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -8364,7 +8267,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -8376,9 +8279,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await testParallelWorkflow.createRun();
       const result = await run.timeTravel({
@@ -8541,7 +8444,7 @@ describe('MastraInngestWorkflow', () => {
     it('should timeTravel to step in conditional chains', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -8639,7 +8542,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -8652,9 +8555,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.timeTravel({
@@ -8682,7 +8585,7 @@ describe('MastraInngestWorkflow', () => {
     it('should timeTravel to step in conditional chains and run just one step when perStep is true', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -8780,7 +8683,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -8793,9 +8696,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.timeTravel({
@@ -8829,7 +8732,7 @@ describe('MastraInngestWorkflow', () => {
 
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -8904,7 +8807,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -8916,9 +8819,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.start({
@@ -8945,7 +8848,7 @@ describe('MastraInngestWorkflow', () => {
 
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -9047,7 +8950,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -9059,9 +8962,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.start({
@@ -9092,7 +8995,7 @@ describe('MastraInngestWorkflow', () => {
     it('should be able to nest workflows', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -9194,7 +9097,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -9206,9 +9109,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await counterWorkflow.createRun();
       const result = await run.start({ inputData: { startValue: 0 } });
@@ -9238,7 +9141,7 @@ describe('MastraInngestWorkflow', () => {
     it('should be able to nest workflows with conditions', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -9350,7 +9253,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -9362,9 +9265,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await counterWorkflow.createRun();
       const result = await run.start({ inputData: { startValue: 0 } });
@@ -9395,7 +9298,7 @@ describe('MastraInngestWorkflow', () => {
       it('should execute if-branch', async ctx => {
         const inngest = new Inngest({
           id: 'mastra',
-          baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+          baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
         });
 
         const { createWorkflow, createStep } = init(inngest);
@@ -9511,7 +9414,7 @@ describe('MastraInngestWorkflow', () => {
           server: {
             apiRoutes: [
               {
-                path: '/inngest/api',
+                path: getLocalTestEndpoints(ctx).servePath,
                 method: 'ALL',
                 createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
               },
@@ -9526,9 +9429,9 @@ describe('MastraInngestWorkflow', () => {
 
         const srv = (globServer = serve({
           fetch: app.fetch,
-          port: (ctx as any).handlerPort,
+          port: getLocalTestEndpoints(ctx).ports.handlerPort,
         }));
-        await resetInngest();
+        await resetInngest(getLocalTestEndpoints(ctx));
 
         const run = await counterWorkflow.createRun();
         const result = await run.start({ inputData: { startValue: 0 } });
@@ -9559,7 +9462,7 @@ describe('MastraInngestWorkflow', () => {
       it('should execute else-branch', async ctx => {
         const inngest = new Inngest({
           id: 'mastra',
-          baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+          baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
         });
 
         const { createWorkflow, createStep } = init(inngest);
@@ -9675,7 +9578,7 @@ describe('MastraInngestWorkflow', () => {
           server: {
             apiRoutes: [
               {
-                path: '/inngest/api',
+                path: getLocalTestEndpoints(ctx).servePath,
                 method: 'ALL',
                 createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
               },
@@ -9690,9 +9593,9 @@ describe('MastraInngestWorkflow', () => {
 
         const srv = (globServer = serve({
           fetch: app.fetch,
-          port: (ctx as any).handlerPort,
+          port: getLocalTestEndpoints(ctx).ports.handlerPort,
         }));
-        await resetInngest();
+        await resetInngest(getLocalTestEndpoints(ctx));
 
         const run = await counterWorkflow.createRun();
         const result = await run.start({ inputData: { startValue: 0 } });
@@ -9724,7 +9627,7 @@ describe('MastraInngestWorkflow', () => {
       it('should execute nested else and if-branch', async ctx => {
         const inngest = new Inngest({
           id: 'mastra',
-          baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+          baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
         });
 
         const { createWorkflow, createStep } = init(inngest);
@@ -9877,7 +9780,7 @@ describe('MastraInngestWorkflow', () => {
           server: {
             apiRoutes: [
               {
-                path: '/inngest/api',
+                path: getLocalTestEndpoints(ctx).servePath,
                 method: 'ALL',
                 createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
               },
@@ -9892,9 +9795,9 @@ describe('MastraInngestWorkflow', () => {
 
         const srv = (globServer = serve({
           fetch: app.fetch,
-          port: (ctx as any).handlerPort,
+          port: getLocalTestEndpoints(ctx).ports.handlerPort,
         }));
-        await resetInngest();
+        await resetInngest(getLocalTestEndpoints(ctx));
 
         const run = await counterWorkflow.createRun();
         const result = await run.start({ inputData: { startValue: 1 } });
@@ -9928,7 +9831,7 @@ describe('MastraInngestWorkflow', () => {
       it('should be able to suspend nested workflow step', async ctx => {
         const inngest = new Inngest({
           id: 'mastra',
-          baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+          baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
         });
 
         const { createWorkflow, createStep } = init(inngest);
@@ -10037,7 +9940,7 @@ describe('MastraInngestWorkflow', () => {
           server: {
             apiRoutes: [
               {
-                path: '/inngest/api',
+                path: getLocalTestEndpoints(ctx).servePath,
                 method: 'ALL',
                 createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
               },
@@ -10049,9 +9952,9 @@ describe('MastraInngestWorkflow', () => {
 
         const srv = (globServer = serve({
           fetch: app.fetch,
-          port: (ctx as any).handlerPort,
+          port: getLocalTestEndpoints(ctx).ports.handlerPort,
         }));
-        await resetInngest();
+        await resetInngest(getLocalTestEndpoints(ctx));
 
         const run = await counterWorkflow.createRun();
         const result = await run.start({ inputData: { startValue: 0 } });
@@ -10088,7 +9991,7 @@ describe('MastraInngestWorkflow', () => {
       it('should be able to spec out workflow result via variables', async ctx => {
         const inngest = new Inngest({
           id: 'mastra',
-          baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+          baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
         });
 
         const { createWorkflow, createStep } = init(inngest);
@@ -10188,7 +10091,7 @@ describe('MastraInngestWorkflow', () => {
           server: {
             apiRoutes: [
               {
-                path: '/inngest/api',
+                path: getLocalTestEndpoints(ctx).servePath,
                 method: 'ALL',
                 createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
               },
@@ -10203,9 +10106,9 @@ describe('MastraInngestWorkflow', () => {
 
         const srv = (globServer = serve({
           fetch: app.fetch,
-          port: (ctx as any).handlerPort,
+          port: getLocalTestEndpoints(ctx).ports.handlerPort,
         }));
-        await resetInngest();
+        await resetInngest(getLocalTestEndpoints(ctx));
 
         const run = await counterWorkflow.createRun();
         const result = await run.start({ inputData: { startValue: 0 } });
@@ -10236,7 +10139,7 @@ describe('MastraInngestWorkflow', () => {
     it('should be able to suspend nested workflow step in a nested workflow step', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -10380,7 +10283,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -10392,9 +10295,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await counterWorkflow.createRun();
       const result = await run.start({ inputData: { startValue: 0 } });
@@ -10440,7 +10343,7 @@ describe('MastraInngestWorkflow', () => {
     it('should be able clone workflows as steps', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep, cloneStep, cloneWorkflow } = init(inngest);
@@ -10546,7 +10449,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -10558,9 +10461,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await counterWorkflow.createRun();
       const result = await run.start({ inputData: { startValue: 0 } });
@@ -10593,7 +10496,7 @@ describe('MastraInngestWorkflow', () => {
     it('should inject requestContext dependencies into steps during run', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -10630,7 +10533,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -10642,9 +10545,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.start({ requestContext });
@@ -10658,7 +10561,7 @@ describe('MastraInngestWorkflow', () => {
     it.skip('should inject requestContext dependencies into steps during resume', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -10721,7 +10624,7 @@ describe('MastraInngestWorkflow', () => {
     it('should have access to requestContext from before suspension during workflow resume', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -10794,7 +10697,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -10805,9 +10708,9 @@ describe('MastraInngestWorkflow', () => {
       const app = await createHonoServer(mastra);
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await incrementWorkflow.createRun();
       const result = await run.start({ inputData: { value: 0 } });
@@ -10826,7 +10729,7 @@ describe('MastraInngestWorkflow', () => {
     it('should not show removed requestContext values in subsequent steps', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -10903,7 +10806,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -10914,9 +10817,9 @@ describe('MastraInngestWorkflow', () => {
       const app = await createHonoServer(mastra);
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await incrementWorkflow.createRun();
       const result = await run.start({ inputData: { value: 0 } });
@@ -10937,7 +10840,7 @@ describe('MastraInngestWorkflow', () => {
     it('should inject inngest step primitives into steps during run', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -10973,7 +10876,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -10985,9 +10888,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.start({});
@@ -11003,7 +10906,7 @@ describe('MastraInngestWorkflow', () => {
     it('should generate a stream', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -11044,7 +10947,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -11056,9 +10959,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const runId = 'test-run-id';
       let watchData: StreamEvent[] = [];
@@ -11066,7 +10969,7 @@ describe('MastraInngestWorkflow', () => {
         runId,
       });
 
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const { stream, getWorkflowState } = run.streamLegacy({ inputData: {} });
 
@@ -11079,7 +10982,7 @@ describe('MastraInngestWorkflow', () => {
 
       const executionResult = await getWorkflowState();
 
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       srv.close();
 
@@ -11128,7 +11031,7 @@ describe('MastraInngestWorkflow', () => {
     it('should handle basic sleep waiting flow', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -11169,7 +11072,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -11181,9 +11084,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const runId = 'test-run-id';
       let watchData: StreamEvent[] = [];
@@ -11191,7 +11094,7 @@ describe('MastraInngestWorkflow', () => {
         runId,
       });
 
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const { stream, getWorkflowState } = run.streamLegacy({ inputData: {} });
 
@@ -11204,7 +11107,7 @@ describe('MastraInngestWorkflow', () => {
 
       const executionResult = await getWorkflowState();
 
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       srv.close();
 
@@ -11263,7 +11166,7 @@ describe('MastraInngestWorkflow', () => {
     it('should handle basic sleep waiting flow with fn parameter', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -11309,7 +11212,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -11321,9 +11224,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const runId = 'test-run-id';
       let watchData: StreamEvent[] = [];
@@ -11331,7 +11234,7 @@ describe('MastraInngestWorkflow', () => {
         runId,
       });
 
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const { stream, getWorkflowState } = run.streamLegacy({ inputData: {} });
 
@@ -11344,7 +11247,7 @@ describe('MastraInngestWorkflow', () => {
 
       const executionResult = await getWorkflowState();
 
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       srv.close();
 
@@ -11403,7 +11306,7 @@ describe('MastraInngestWorkflow', () => {
     it('should handle basic suspend and resume flow', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -11491,7 +11394,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -11503,10 +11406,10 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
 
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await promptEvalWorkflow.createRun();
 
@@ -11572,7 +11475,7 @@ describe('MastraInngestWorkflow', () => {
     it('should be able to use an agent as a step', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -11677,7 +11580,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -11689,10 +11592,10 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
 
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun({
         runId: 'test-run-id',
@@ -11839,7 +11742,7 @@ describe('MastraInngestWorkflow', () => {
       it('should run experiment with workflow target', async ctx => {
         const inngest = new Inngest({
           id: 'mastra',
-          baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+          baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
         });
 
         const { createWorkflow, createStep } = init(inngest);
@@ -11873,7 +11776,7 @@ describe('MastraInngestWorkflow', () => {
           server: {
             apiRoutes: [
               {
-                path: '/inngest/api',
+                path: getLocalTestEndpoints(ctx).servePath,
                 method: 'ALL',
                 createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
               },
@@ -11885,10 +11788,10 @@ describe('MastraInngestWorkflow', () => {
 
         const srv = (globServer = serve({
           fetch: app.fetch,
-          port: (ctx as any).handlerPort,
+          port: getLocalTestEndpoints(ctx).ports.handlerPort,
         }));
 
-        await resetInngest();
+        await resetInngest(getLocalTestEndpoints(ctx));
 
         const result = await runEvals({
           data: [
@@ -11909,7 +11812,7 @@ describe('MastraInngestWorkflow', () => {
     it('should generate a stream', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -11950,7 +11853,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -11962,9 +11865,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const runId = 'test-run-id';
       let watchData: StreamEvent[] = [];
@@ -11972,7 +11875,7 @@ describe('MastraInngestWorkflow', () => {
         runId,
       });
 
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const streamOutput = run.stream({ inputData: {} });
 
@@ -12038,7 +11941,7 @@ describe('MastraInngestWorkflow', () => {
     it('should emit step-result and step-finish events when step fails', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -12078,7 +11981,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -12090,9 +11993,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const runId = 'test-run-id';
       let watchData: StreamEvent[] = [];
@@ -12100,7 +12003,7 @@ describe('MastraInngestWorkflow', () => {
         runId,
       });
 
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const streamOutput = run.stream({ inputData: {} });
 
@@ -12167,7 +12070,7 @@ describe('MastraInngestWorkflow', () => {
     it('should generate a stream with custom events', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -12216,7 +12119,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -12228,9 +12131,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const runId = 'test-run-id';
       let watchData: StreamEvent[] = [];
@@ -12315,7 +12218,7 @@ describe('MastraInngestWorkflow', () => {
     it('should handle basic sleep waiting flow', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -12356,7 +12259,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -12368,9 +12271,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const runId = 'test-run-id';
       let watchData: StreamEvent[] = [];
@@ -12378,7 +12281,7 @@ describe('MastraInngestWorkflow', () => {
         runId,
       });
 
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const streamOutput = run.stream({ inputData: {} });
 
@@ -12455,7 +12358,7 @@ describe('MastraInngestWorkflow', () => {
     it('should handle basic suspend and resume flow', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -12543,7 +12446,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -12555,10 +12458,10 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
 
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await promptEvalWorkflow.createRun();
 
@@ -12618,7 +12521,7 @@ describe('MastraInngestWorkflow', () => {
     it('should be able to use an agent as a step', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -12729,7 +12632,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -12741,10 +12644,10 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
 
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun({
         runId: 'test-run-id',
@@ -12874,7 +12777,7 @@ describe('MastraInngestWorkflow', () => {
       it('should run experiment with workflow target', async ctx => {
         const inngest = new Inngest({
           id: 'mastra',
-          baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+          baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
         });
 
         const { createWorkflow, createStep } = init(inngest);
@@ -12908,7 +12811,7 @@ describe('MastraInngestWorkflow', () => {
           server: {
             apiRoutes: [
               {
-                path: '/inngest/api',
+                path: getLocalTestEndpoints(ctx).servePath,
                 method: 'ALL',
                 createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
               },
@@ -12920,10 +12823,10 @@ describe('MastraInngestWorkflow', () => {
 
         const srv = (globServer = serve({
           fetch: app.fetch,
-          port: (ctx as any).handlerPort,
+          port: getLocalTestEndpoints(ctx).ports.handlerPort,
         }));
 
-        await resetInngest();
+        await resetInngest(getLocalTestEndpoints(ctx));
 
         const result = await runEvals({
           data: [
@@ -12944,7 +12847,7 @@ describe('MastraInngestWorkflow', () => {
     it('should handle long-running steps with eventual consistency', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -12995,7 +12898,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -13007,10 +12910,10 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
 
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.start({ inputData: {} });
@@ -13032,7 +12935,7 @@ describe('MastraInngestWorkflow', () => {
     it('should accept workflow configuration with flow control properties', async ctx => {
       const inngest = new Inngest({
         id: 'mastra-flow-control',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -13077,7 +12980,7 @@ describe('MastraInngestWorkflow', () => {
     it('should handle workflow configuration with partial flow control properties', async ctx => {
       const inngest = new Inngest({
         id: 'mastra-partial-flow-control',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -13113,7 +13016,7 @@ describe('MastraInngestWorkflow', () => {
     it('should handle workflow configuration without flow control properties (backward compatibility)', async ctx => {
       const inngest = new Inngest({
         id: 'mastra-backward-compat',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -13149,7 +13052,7 @@ describe('MastraInngestWorkflow', () => {
     it('should support all flow control configuration types', async ctx => {
       const inngest = new Inngest({
         id: 'mastra-all-flow-control',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -13202,7 +13105,7 @@ describe('MastraInngestWorkflow', () => {
     it('should execute workflow via cron schedule', async ctx => {
       const inngest = new Inngest({
         id: 'mastra-cron-test',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -13243,7 +13146,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -13259,10 +13162,10 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
 
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       // Poll for workflow runs until we find at least one, or timeout
       const maxWaitTime = 75 * 1000; // 75 seconds max
@@ -13301,7 +13204,7 @@ describe('MastraInngestWorkflow', () => {
     it('should execute workflow via cron schedule with initialState', async ctx => {
       const inngest = new Inngest({
         id: 'mastra-cron-initial-state-test',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -13344,7 +13247,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -13360,10 +13263,10 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
 
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       // Poll for workflow runs until we find at least one, or timeout
       const maxWaitTime = 75 * 1000; // 75 seconds max
@@ -13401,7 +13304,7 @@ describe('MastraInngestWorkflow', () => {
   });
 
   describe('serve function with user-supplied functions', () => {
-    it('should merge user-supplied functions with workflow functions', async _ctx => {
+    it('should merge user-supplied functions with workflow functions', async ctx => {
       const inngest = new Inngest({
         id: 'test-inngest-serve',
       });
@@ -13449,7 +13352,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) =>
                 inngestServe({
@@ -13591,7 +13494,7 @@ describe('MastraInngestWorkflow', () => {
     it('should use shouldPersistSnapshot option', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -13639,7 +13542,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -13655,9 +13558,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       // Create a few runs
       const run1 = await workflow.createRun();
@@ -13683,7 +13586,7 @@ describe('MastraInngestWorkflow', () => {
     it('should get workflow run by id from storage', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -13714,7 +13617,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -13730,9 +13633,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       // Create a few runs
       const run1 = await workflow.createRun();
@@ -13759,7 +13662,7 @@ describe('MastraInngestWorkflow', () => {
     it('should pass structured output from agent step to next step with correct types', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -13850,7 +13753,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -13866,9 +13769,9 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun({ runId: 'structured-output-test' });
       const streamOutput = run.stream({
@@ -13896,7 +13799,7 @@ describe('MastraInngestWorkflow', () => {
     it('should start workflow and complete successfully', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -13929,7 +13832,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -13941,10 +13844,10 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
 
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       // Extra delay to ensure Inngest has fully synced functions
       await new Promise(resolve => setTimeout(resolve, 2000));
@@ -13977,7 +13880,7 @@ describe('MastraInngestWorkflow', () => {
     it('should call onFinish callback when workflow completes successfully', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -14022,7 +13925,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -14034,10 +13937,10 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
 
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.start({ inputData: {} });
@@ -14053,7 +13956,7 @@ describe('MastraInngestWorkflow', () => {
     it('should call onFinish and onError callbacks when workflow fails', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -14098,7 +14001,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -14110,10 +14013,10 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
 
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.start({ inputData: {} });
@@ -14130,7 +14033,7 @@ describe('MastraInngestWorkflow', () => {
     it('should not call onError when workflow succeeds', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -14171,7 +14074,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -14183,10 +14086,10 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
 
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.start({ inputData: {} });
@@ -14200,7 +14103,7 @@ describe('MastraInngestWorkflow', () => {
     it('should support async onFinish callback', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -14242,7 +14145,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -14254,10 +14157,10 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
 
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.start({ inputData: {} });
@@ -14272,7 +14175,7 @@ describe('MastraInngestWorkflow', () => {
     it('should swallow callback errors and not fail the workflow', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -14311,7 +14214,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -14323,10 +14226,10 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
 
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.start({ inputData: {} });
@@ -14340,7 +14243,7 @@ describe('MastraInngestWorkflow', () => {
     it('should provide all expected properties in onFinish callback', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -14381,7 +14284,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -14393,10 +14296,10 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
 
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.start({ inputData: { inputValue: 'test-input' } });
@@ -14431,7 +14334,7 @@ describe('MastraInngestWorkflow', () => {
     it('should provide all expected properties in onError callback', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -14472,7 +14375,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -14484,10 +14387,10 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
 
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.start({ inputData: { inputValue: 'test-input' } });
@@ -14528,7 +14431,7 @@ describe('MastraInngestWorkflow', () => {
 
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -14584,7 +14487,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -14596,10 +14499,10 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
 
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.start({ inputData: { value: 'test' } });
@@ -14627,7 +14530,7 @@ describe('MastraInngestWorkflow', () => {
 
       const inngest = new Inngest({
         id: 'mastra',
-        baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
       });
 
       const { createWorkflow, createStep } = init(inngest);
@@ -14680,7 +14583,7 @@ describe('MastraInngestWorkflow', () => {
         server: {
           apiRoutes: [
             {
-              path: '/inngest/api',
+              path: getLocalTestEndpoints(ctx).servePath,
               method: 'ALL',
               createHandler: async ({ mastra }) => inngestServe({ mastra, inngest, ...getDockerRegisterOptions() }),
             },
@@ -14692,10 +14595,10 @@ describe('MastraInngestWorkflow', () => {
 
       const srv = (globServer = serve({
         fetch: app.fetch,
-        port: (ctx as any).handlerPort,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
       }));
 
-      await resetInngest();
+      await resetInngest(getLocalTestEndpoints(ctx));
 
       const run = await workflow.createRun();
       const result = await run.start({ inputData: { value: 'test' } });
@@ -14717,171 +14620,8 @@ describe('MastraInngestWorkflow', () => {
 // Shared infrastructure - created once for all shared suite tests
 let sharedInngest: Inngest;
 let sharedMastra: Mastra;
-let sharedServer: ServerType;
+let sharedServer: ServerType | undefined;
 let sharedStorage: DefaultStorage;
-let sharedInngestProcess: ResultPromise | null = null;
-
-const SHARED_INNGEST_PORT = 4000;
-const SHARED_HANDLER_PORT = 4001;
-
-// Whether the shared Inngest dev server is already running on port 4000 (Docker
-// or host CLI), as opposed to one we start ourselves. Tracked for diagnostics
-// but not read directly — the actual switching happens via `usingDocker` below.
-let _sharedInngestServerRunning = false;
-// Whether that already-running shared server is *Docker* specifically. Only
-// Docker requires rewriting the SDK origin to `host.docker.internal`.
-let usingDocker = false;
-
-/**
- * Wait for handler to be responding to requests
- */
-async function waitForSharedHandler(maxAttempts = 30, intervalMs = 100): Promise<boolean> {
-  const handlerUrl = `http://localhost:${SHARED_HANDLER_PORT}/inngest/api`;
-  for (let i = 0; i < maxAttempts; i++) {
-    try {
-      const response = await fetch(handlerUrl, { method: 'GET' });
-      // The handler returns 200 on GET with function info
-      if (response.ok || response.status === 405) {
-        console.log(`[waitForSharedHandler] Handler ready after ${i + 1} attempts`);
-        return true;
-      }
-    } catch {
-      // Connection refused, keep trying
-    }
-    await new Promise(resolve => setTimeout(resolve, intervalMs));
-  }
-  console.log('[waitForSharedHandler] Handler not ready after max attempts');
-  return false;
-}
-
-/**
- * Wait until the shared dev server reports `expectedFnIds` are all registered.
- * Falls back to "any function present" if no expected ids are passed.
- */
-async function waitForSharedFunctionRegistration(expectedFnIds: string[] = [], maxAttempts = 30): Promise<boolean> {
-  const matches = (id: string, candidate: string) =>
-    candidate === id || candidate.endsWith(`-${id}`) || candidate.endsWith(`.${id}`);
-  for (let i = 0; i < maxAttempts; i++) {
-    try {
-      const response = await fetch(`http://localhost:${SHARED_INNGEST_PORT}/dev`);
-      const data = await response.json();
-      const fns = (data.functions ?? []) as Array<{ slug?: string; id?: string; name?: string }>;
-      const candidates = fns.flatMap(f => [f.slug, f.id, f.name].filter(Boolean) as string[]);
-      if (expectedFnIds.length > 0) {
-        if (expectedFnIds.every(id => candidates.some(c => matches(id, c)))) {
-          console.log(`[waitForSharedFunctionRegistration] all ${expectedFnIds.length} expected functions registered`);
-          return true;
-        }
-      } else if (fns.length > 0) {
-        return true;
-      }
-    } catch {
-      // Keep trying
-    }
-    if (i === Math.floor(maxAttempts / 3)) {
-      // Re-trigger registration mid-wait in case the first PUT raced startup
-      try {
-        await fetch(`http://localhost:${SHARED_HANDLER_PORT}/inngest/api`, { method: 'PUT' });
-      } catch {
-        // Ignore
-      }
-    }
-    await new Promise(resolve => setTimeout(resolve, 1000));
-  }
-  return false;
-}
-
-/**
- * Ensure the Inngest dev server is running and has registered our functions.
- *
- * Uses the npm-installed inngest-cli binary (no Docker required).
- * The dev server polls the handler URL for function definitions.
- */
-async function startSharedInngest(expectedFnIds: string[] = []) {
-  // First, verify the handler is responding
-  console.log('[startSharedInngest] Verifying handler is responding...');
-  const handlerReady = await waitForSharedHandler();
-  if (!handlerReady) {
-    throw new Error('Handler not responding on port ' + SHARED_HANDLER_PORT);
-  }
-
-  // Check if a server is already running (Docker or host CLI). Don't equate
-  // "port reachable" with "Docker" — that would break host inngest-cli setups.
-  try {
-    const response = await fetch(`http://localhost:${SHARED_INNGEST_PORT}/dev`);
-    if (response.ok) {
-      _sharedInngestServerRunning = true;
-      console.log(`[startSharedInngest] Inngest already running on port ${SHARED_INNGEST_PORT}`);
-      // Trigger registration so the running server picks up *this* run's
-      // workflows (its previous registry may be stale from an earlier suite).
-      try {
-        await fetch(`http://localhost:${SHARED_HANDLER_PORT}/inngest/api`, { method: 'PUT' });
-      } catch {
-        // Ignore
-      }
-      const ok = await waitForSharedFunctionRegistration(expectedFnIds);
-      if (!ok && expectedFnIds.length > 0) {
-        throw new Error(`[startSharedInngest] expected functions not registered: ${expectedFnIds.join(', ')}`);
-      }
-      return;
-    }
-  } catch {
-    // Not running yet
-  }
-
-  // Start the inngest dev server as a background process using the npm CLI
-  console.log('[startSharedInngest] Starting Inngest dev server via inngest-cli...');
-  sharedInngestProcess = execaCommand(
-    `npx inngest-cli dev -p ${SHARED_INNGEST_PORT} -u http://localhost:${SHARED_HANDLER_PORT}/inngest/api --poll-interval=1 --retry-interval=1`,
-    { cwd: import.meta.dirname, stdio: 'ignore', reject: false },
-  );
-
-  // Wait for the dev server to be ready
-  console.log('[startSharedInngest] Waiting for Inngest dev server to be ready...');
-  for (let i = 0; i < 30; i++) {
-    try {
-      const response = await fetch(`http://localhost:${SHARED_INNGEST_PORT}/dev`);
-      if (response.ok) {
-        console.log(`[startSharedInngest] Inngest dev server ready after ${i + 1} attempts`);
-        break;
-      }
-    } catch {
-      // Keep trying
-    }
-    await new Promise(resolve => setTimeout(resolve, 500));
-  }
-
-  // Trigger registration by sending PUT to the handler
-  // This makes the handler send its function definitions to the dev server
-  console.log('[startSharedInngest] Triggering function registration via PUT...');
-  try {
-    await fetch(`http://localhost:${SHARED_HANDLER_PORT}/inngest/api`, { method: 'PUT' });
-  } catch (e) {
-    console.log('[startSharedInngest] PUT registration failed:', e);
-  }
-
-  // Wait for the *expected* set of functions to register, not just "any"
-  console.log('[startSharedInngest] Waiting for function registration...');
-  const ok = await waitForSharedFunctionRegistration(expectedFnIds);
-  if (!ok) {
-    if (expectedFnIds.length > 0) {
-      throw new Error(
-        `[startSharedInngest] expected functions not registered after polling: ${expectedFnIds.join(', ')}`,
-      );
-    }
-    throw new Error('[startSharedInngest] No functions registered after 30 attempts - aborting test suite');
-  }
-}
-
-/**
- * Stop the Inngest dev server
- */
-async function stopSharedInngest() {
-  if (sharedInngestProcess) {
-    sharedInngestProcess.kill();
-    sharedInngestProcess = null;
-  }
-}
 
 createWorkflowTestSuite({
   name: 'Workflow (Inngest Engine)',
@@ -14891,7 +14631,7 @@ createWorkflowTestSuite({
     if (!sharedInngest) {
       sharedInngest = new Inngest({
         id: 'mastra-workflow-tests',
-        baseUrl: `http://localhost:${SHARED_INNGEST_PORT}`,
+        baseUrl: ACTIVE_TEST_ENDPOINTS.clientBaseUrl,
       });
     }
     return init(sharedInngest);
@@ -14907,39 +14647,6 @@ createWorkflowTestSuite({
    * 3. Wait for sync to complete
    */
   registerWorkflows: async (registry: WorkflowRegistry) => {
-    // Detect whether a server is already running (Docker or host CLI). Don't
-    // equate "port reachable" with "Docker" — only set `usingDocker` when we
-    // can confirm it via an explicit Docker indicator.
-    try {
-      const response = await fetch(`http://localhost:${SHARED_INNGEST_PORT}/dev`);
-      if (response.ok) {
-        _sharedInngestServerRunning = true;
-        if (process.env.MASTRA_INNGEST_TEST_DOCKER === '1') {
-          usingDocker = true;
-        } else if (process.env.MASTRA_INNGEST_TEST_DOCKER === '0') {
-          usingDocker = false;
-        } else if (isInsideContainer()) {
-          usingDocker = true;
-        } else {
-          try {
-            const psResult = await execaCommand('docker ps --filter name=mastra-inngest-test --format {{.Names}}', {
-              reject: false,
-            });
-            if (typeof psResult.stdout === 'string' && psResult.stdout.includes('mastra-inngest-test')) {
-              usingDocker = true;
-            }
-          } catch {
-            // docker CLI unavailable — assume host inngest-cli, not Docker.
-          }
-        }
-        console.log(
-          `[registerWorkflows] dev server reachable on port ${SHARED_INNGEST_PORT} (usingDocker=${usingDocker})`,
-        );
-      }
-    } catch {
-      // Not running yet, will use inngest-cli
-    }
-
     // Collect all workflows from registry
     const workflows: Record<string, InngestWorkflow<any, any, any, any, any, any, any>> = {};
     for (const [id, entry] of Object.entries(registry)) {
@@ -14952,8 +14659,7 @@ createWorkflowTestSuite({
       url: ':memory:',
     });
 
-    // When using Docker, the Inngest container needs to reach the host via host.docker.internal
-    const serveOrigin = usingDocker ? `http://host.docker.internal:${SHARED_HANDLER_PORT}` : undefined;
+    const serveOrigin = INNGEST_TEST_RUNTIME.config.registrationServeOrigin;
     console.log(`[registerWorkflows] serveOrigin=${serveOrigin}`);
 
     // Create Mastra with all workflows
@@ -14963,13 +14669,13 @@ createWorkflowTestSuite({
       server: {
         apiRoutes: [
           {
-            path: '/inngest/api',
+            path: ACTIVE_TEST_ENDPOINTS.servePath,
             method: 'ALL',
             createHandler: async ({ mastra }) => {
               const opts = {
                 mastra,
                 inngest: sharedInngest,
-                registerOptions: serveOrigin ? { serveOrigin, servePath: '/inngest/api' } : undefined,
+                registerOptions: serveOrigin ? { serveOrigin, servePath: ACTIVE_TEST_ENDPOINTS.servePath } : undefined,
               };
               console.log(
                 '[createHandler] inngestServe options:',
@@ -14995,21 +14701,24 @@ createWorkflowTestSuite({
     const app = await createHonoServer(sharedMastra);
     sharedServer = serve({
       fetch: app.fetch,
-      port: SHARED_HANDLER_PORT,
+      port: ACTIVE_TEST_ENDPOINTS.ports.handlerPort,
     });
-    console.log(`[registerWorkflows] Handler server started on port ${SHARED_HANDLER_PORT}`);
+    console.log(`[registerWorkflows] Handler server started on port ${ACTIVE_TEST_ENDPOINTS.ports.handlerPort}`);
 
-    // Wait for handler to be fully ready before starting Inngest
-    await new Promise(resolve => setTimeout(resolve, 500));
-
-    // Now start Inngest (this also triggers registration via PUT with url body).
-    // We pass through the expected function ids so the registration wait verifies
-    // *our* workflows have synced — not just that the dev server has at least one
-    // function left over from a previous suite.
-    const expectedFnIds = Object.keys(workflows).map(id => `workflow.${id}`);
+    const expectedFnIds = [...new Set(Object.values(workflows).map(workflow => `workflow.${workflow.id}`))];
+    console.log(
+      `[registerWorkflows] Waiting for ${expectedFnIds.length} unique functions from ` +
+        `${Object.keys(workflows).length} registry entries`,
+    );
     console.log('[registerWorkflows] Starting Inngest...');
-    await startSharedInngest(expectedFnIds);
-    console.log('[registerWorkflows] Inngest started and functions registered');
+    try {
+      await INNGEST_TEST_RUNTIME.ensureReady(expectedFnIds);
+      console.log('[registerWorkflows] Inngest started and functions registered');
+    } catch (error) {
+      await new Promise<void>(resolve => sharedServer.close(() => resolve()));
+      sharedServer = undefined;
+      throw error;
+    }
   },
 
   // Provide access to storage for tests that need to spy on storage operations
@@ -15025,8 +14734,8 @@ createWorkflowTestSuite({
     // Close server
     if (sharedServer) {
       await new Promise<void>(resolve => sharedServer.close(() => resolve()));
+      sharedServer = undefined;
     }
-    await stopSharedInngest();
   },
 
   beforeEach: async () => {
