@@ -822,7 +822,7 @@ describe('HarnessPG', () => {
     const harness = store.stores.harness;
     expect(harness).toBeDefined();
 
-    await harness!.writeMessageResultEvidence({
+    const terminalEvidence = {
       harnessName: 'default',
       sessionId: 'session-1',
       resourceId: 'resource-1',
@@ -833,10 +833,19 @@ describe('HarnessPG', () => {
       modelId: 'model-1',
       admissionId: 'admission-1',
       admissionHash: 'hash-1',
-      status: 'completed',
+      status: 'completed' as const,
       result: { ok: true },
       createdAt: 1,
       updatedAt: 2,
+    };
+    await expect(harness!.writeMessageResultEvidence(terminalEvidence)).resolves.toEqual({
+      created: true,
+      applied: true,
+    });
+    await expect(harness!.writeMessageResultEvidence(terminalEvidence)).resolves.toMatchObject({
+      created: false,
+      applied: false,
+      evidence: { status: 'completed', admissionId: 'admission-1' },
     });
 
     await expect(
