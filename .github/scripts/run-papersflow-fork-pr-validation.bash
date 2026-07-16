@@ -1289,6 +1289,7 @@ run_validator_self_tests() {
     "$fixture_repo/pubsub/redis-streams/src" \
     "$fixture_repo/stores/convex/src/cache" \
     "$fixture_repo/stores/convex/src/server" \
+    "$fixture_repo/stores/libsql/src/storage/domains/harness" \
     "$fixture_repo/workflows/inngest/src/__tests__/adapters" \
     "$fixture_repo/workflows/inngest/src" \
     "$fixture_repo/node_modules" \
@@ -1368,6 +1369,11 @@ run_validator_self_tests() {
     printf '%s\n' 'export const convexServerCache = true;' > stores/convex/src/server/cache.ts
     printf '%s\n' "import { it } from 'vitest';" "it('convex server cache', () => {});" \
       > stores/convex/src/server/cache.test.ts
+    printf '%s\n' '{}' > stores/libsql/package.json
+    printf '%s\n' 'export const harnessStorage = true;' \
+      > stores/libsql/src/storage/domains/harness/index.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('libsql harness storage', () => {});" \
+      > stores/libsql/src/storage/domains/harness/index.test.ts
     printf '%s\n' \
       '{"scripts":{"test":"vitest run","test:workflow":"vitest run --no-isolate --retry=1 src/index.test.ts","test:docker":"docker-compose up -d && vitest run --no-isolate --retry=1 --exclude='\''src/__tests__/adapters/**'\'' && docker-compose down"}}' \
       > workflows/inngest/package.json
@@ -2641,6 +2647,100 @@ NODE
   assert_contains 'Required redis-streams test service is unavailable at 127.0.0.1:6381.' "$output"
   if grep -Fq -- '--dir pubsub/redis-streams exec vitest run' "$command_log"; then
     echo 'Unavailable Redis Streams fixture executed its Vitest file.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'export const harnessStorage = "source-only-head";' \
+      > stores/libsql/src/storage/domains/harness/index.ts
+    git add .
+    git commit -q -m 'libsql harness production-only change'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/libsql-harness-production-success.log"
+  run_fixture "$head_sha" "$output"
+  assert_contains 'Forcing PF-2044 owned suites to run for source-only changes:' "$output"
+  assert_contains 'stores/libsql/src/storage/domains/harness/index.test.ts' "$output"
+  assert_contains '--filter ./stores/libsql --fail-if-no-match exec tsc --noEmit' "$command_log"
+  assert_contains '--filter ./stores/libsql --fail-if-no-match build:lib' "$command_log"
+  assert_contains '--filter ./stores/libsql --fail-if-no-match lint' "$command_log"
+  assert_contains '--dir stores/libsql exec vitest run' "$command_log"
+  assert_contains 'src/storage/domains/harness/index.test.ts' "$command_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' "it('libsql harness storage head', () => {});" \
+      >> stores/libsql/src/storage/domains/harness/index.test.ts
+    git add .
+    git commit -q -m 'libsql harness test-only change'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/libsql-harness-test-success.log"
+  run_fixture "$head_sha" "$output"
+  assert_contains '--filter ./stores/libsql --fail-if-no-match exec tsc --noEmit' "$command_log"
+  assert_contains '--filter ./stores/libsql --fail-if-no-match build:lib' "$command_log"
+  assert_contains '--filter ./stores/libsql --fail-if-no-match lint' "$command_log"
+  assert_contains '--dir stores/libsql exec vitest run' "$command_log"
+  assert_contains 'src/storage/domains/harness/index.test.ts' "$command_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'export const unreviewedHarnessStorage = true;' \
+      > stores/libsql/src/storage/domains/harness/unreviewed.ts
+    git add .
+    git commit -q -m 'unreviewed libsql harness source'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/libsql-harness-unknown-source-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Unknown LibSQL Harness source unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'stores/libsql/src/storage/domains/harness/unreviewed.ts' "$output"
+  assert_contains 'outside the PF-2044 owned source-and-test maps' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Unknown LibSQL Harness source fixture executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' "import { it } from 'vitest';" "it('unreviewed libsql harness', () => {});" \
+      > stores/libsql/src/storage/domains/harness/unreviewed.test.ts
+    git add .
+    git commit -q -m 'unreviewed libsql harness test'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/libsql-harness-unknown-test-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Unknown LibSQL Harness test unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'stores/libsql/src/storage/domains/harness/unreviewed.test.ts' "$output"
+  assert_contains 'outside the PF-2044 owned service and runtime contracts' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Unknown LibSQL Harness test fixture executed package commands.' >&2
     cat "$command_log" >&2
     exit 1
   fi
@@ -4062,6 +4162,7 @@ while IFS= read -r file; do
         pubsub/redis-streams/src/pubsub.test.ts | \
         stores/convex/src/cache/index.test.ts | \
         stores/convex/src/server/cache.test.ts | \
+        stores/libsql/src/storage/domains/harness/index.test.ts | \
         stores/libsql/src/storage/domains/thread-state/index.test.ts | \
         workflows/inngest/src/__tests__/create-inngest-agent.test.ts | \
         workflows/inngest/src/__tests__/inngest-test-runtime.test.ts | \
@@ -4098,6 +4199,9 @@ while IFS= read -r file; do
       ;;
     stores/libsql/src/storage/domains/thread-state/index.ts)
       queue_owned_workspace_test "$file" stores/libsql/src/storage/domains/thread-state/index.test.ts
+      ;;
+    stores/libsql/src/storage/domains/harness/index.ts)
+      queue_owned_workspace_test "$file" stores/libsql/src/storage/domains/harness/index.test.ts
       ;;
     workflows/inngest/src/durable-agent/create-inngest-agent.ts | \
       workflows/inngest/src/durable-agent/index.ts)
@@ -5186,6 +5290,7 @@ if (( ${#detected_tests[@]} > 0 )); then
       printf '%s\n' "$file" >> "$unsupported_tests"
     elif [[ "$file" == stores/convex/src/cache/index.test.ts || \
       "$file" == stores/convex/src/server/cache.test.ts || \
+      "$file" == stores/libsql/src/storage/domains/harness/index.test.ts || \
       "$file" == stores/libsql/src/storage/domains/thread-state/index.test.ts ]]; then
       printf '%s\n' "$file" >> "$changed_tests"
     elif [[ "$file" == stores/* && "$file" != stores/_test-utils/* && \
