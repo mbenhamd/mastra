@@ -39,12 +39,12 @@ function mockPubsub() {
   return { publish: vi.fn(), subscribe: vi.fn(), unsubscribe: vi.fn(), flush: vi.fn() };
 }
 
-function makeInitData() {
+function makeInitData(options: Record<string, unknown> = { requireToolApproval: false }) {
   return {
     runId: RUN_ID,
     runtimeBindingId: RUNTIME_BINDING_ID,
     agentId: 'greeter',
-    options: { requireToolApproval: false },
+    options,
     state: { threadId: 'thread-1', resourceId: 'user-1', memoryConfig: undefined, threadExists: false },
   };
 }
@@ -55,6 +55,61 @@ afterEach(() => {
 });
 
 describe('durable tool-call cross-process workspace tool resolution', () => {
+  it('fails closed before rebuilding or executing a tool when per-run hooks were lost', async () => {
+    const step = createDurableToolCallStep();
+    const execution = (step as any).execute({
+      inputData: { toolCallId: 'call-guarded', toolName: 'skill', args: { secret: 'tool-secret' } },
+      mastra: { getLogger: () => undefined, listTools: () => ({}) },
+      suspend: vi.fn(),
+      resumeData: undefined,
+      requestContext: new Map(),
+      getInitData: () =>
+        makeInitData({
+          requireToolApproval: false,
+          toolHookPolicy: {
+            kind: 'run-registry',
+            id: 'secret-policy-id',
+            beforeToolCall: true,
+            afterToolCall: false,
+          },
+        }),
+      [PUBSUB_SYMBOL]: mockPubsub(),
+    });
+
+    await expect(execution).rejects.toMatchObject({ id: 'DURABLE_AGENT_TOOL_HOOK_POLICY_UNAVAILABLE' });
+    await expect(execution).rejects.not.toThrow(/secret-policy-id|tool-secret/);
+    expect(resolveRuntime.rebuildRunToolsFromMastra).not.toHaveBeenCalled();
+  });
+
+  it('checks per-run hook identity before accepting provider-executed output', async () => {
+    const step = createDurableToolCallStep();
+    const execution = (step as any).execute({
+      inputData: {
+        toolCallId: 'call-provider-executed',
+        toolName: 'providerTool',
+        args: {},
+        providerExecuted: true,
+        output: { unsafe: true },
+      },
+      mastra: { getLogger: () => undefined, listTools: () => ({}) },
+      suspend: vi.fn(),
+      resumeData: undefined,
+      requestContext: new Map(),
+      getInitData: () =>
+        makeInitData({
+          toolHookPolicy: {
+            kind: 'run-registry',
+            id: 'provider-policy-id',
+            beforeToolCall: true,
+            afterToolCall: true,
+          },
+        }),
+      [PUBSUB_SYMBOL]: mockPubsub(),
+    });
+
+    await expect(execution).rejects.toMatchObject({ id: 'DURABLE_AGENT_TOOL_HOOK_POLICY_UNAVAILABLE' });
+  });
+
   it('rebuilds the workspace `skill` tool from Mastra when the run registry is empty', async () => {
     // Simulate the connect() worker: no registry entry for this run at all.
     expect(globalRunRegistry.has(RUN_ID)).toBe(false);
@@ -82,9 +137,9 @@ describe('durable tool-call cross-process workspace tool resolution', () => {
       expect.objectContaining({ runId: RUN_ID, agentId: 'greeter' }),
     );
     // …and the `skill` tool it returned was executed with the workspace forwarded.
+    expect(result.error).toBeUndefined();
     expect(executeMock).toHaveBeenCalledTimes(1);
     expect(executeMock.mock.calls[0][1]).toEqual(expect.objectContaining({ workspace }));
-    expect(result.error).toBeUndefined();
     expect(result.result).toEqual({ content: 'Hello, wonderful human!' });
   });
 

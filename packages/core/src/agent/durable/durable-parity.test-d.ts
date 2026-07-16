@@ -82,7 +82,9 @@ type ConsumedDuringPreparation =
   // `toolSurfaceFence` name ceiling plus the registry's immutable
   // `replacementToolSurface`.
   | 'toolsetsMode'
-  // Hooks are passed to getToolsForExecution() during preparation
+  // Hooks are passed to getToolsForExecution() during preparation. Per-run
+  // closures also receive an opaque serialized policy marker and a registry
+  // binding under different durable-internal key names.
   | 'hooks'
   // Delegation config contains closures; stored on registry indirectly via
   // getToolsForExecution() which wires delegation into tool definitions
@@ -140,6 +142,7 @@ type PhantomSerializedKeys = Exclude<
   | 'isTaskComplete' // shadow of isTaskComplete (scorer names only)
   | 'structuredOutput' // serialized form of structuredOutput
   | 'toolSurfaceFence' // PF-1790: derived name ceiling from toolsets + toolsetsMode: 'replace'
+  | 'toolHookPolicy' // opaque shadow of per-execution hooks
 >;
 
 describe('DurableAgent ↔ Agent parity gate', () => {

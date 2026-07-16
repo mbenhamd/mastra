@@ -24,9 +24,15 @@ import { DurableStepIds } from '../constants';
 import { createDurableAgent } from '../create-durable-agent';
 import type { DurableAgent } from '../durable-agent';
 import { globalRunRegistry } from '../run-registry';
+import type { SerializableDurableOptions } from '../types';
 import { serializeModelConfig } from '../utils/serialize-state';
 
-function makeSnapshot(runId: string, status: WorkflowRunStatus, agentId: string): WorkflowRunState {
+function makeSnapshot(
+  runId: string,
+  status: WorkflowRunStatus,
+  agentId: string,
+  options: SerializableDurableOptions = {},
+): WorkflowRunState {
   return {
     runId,
     status,
@@ -43,7 +49,7 @@ function makeSnapshot(runId: string, status: WorkflowRunStatus, agentId: string)
         toolsMetadata: [],
         modelConfig: serializeModelConfig(makeMockModel() as any),
         runtimeBindings: {},
-        options: {},
+        options,
         requestContextEntries: { userId: 'u-1' },
         state: { threadId: 't', resourceId: 'r' },
         messageId: `message-${runId}`,
@@ -87,19 +93,25 @@ function createDurableWithStore(agentId: string) {
   return { agent, store };
 }
 
-async function seed(store: InMemoryStore, runId: string, status: WorkflowRunStatus, agentId: string) {
+async function seed(
+  store: InMemoryStore,
+  runId: string,
+  status: WorkflowRunStatus,
+  agentId: string,
+  options: SerializableDurableOptions = {},
+) {
   const workflows = (await store.getStore('workflows'))!;
   await workflows.persistWorkflowSnapshot({
     workflowName: DurableStepIds.AGENTIC_LOOP,
     runId,
     resourceId: 'r',
-    snapshot: makeSnapshot(runId, status, agentId),
+    snapshot: makeSnapshot(runId, status, agentId, options),
   });
   await workflows.persistWorkflowSnapshot({
     workflowName: DurableStepIds.AGENTIC_EXECUTION,
     runId,
     resourceId: 'r',
-    snapshot: makeSnapshot(runId, status, agentId),
+    snapshot: makeSnapshot(runId, status, agentId, options),
   });
 }
 
@@ -202,6 +214,24 @@ describe('DurableAgent.recover(runId)', () => {
     stubWorkflow(agent, 'success');
 
     await expect(agent.recover('missing-run')).rejects.toThrow(/no persisted workflow snapshot/i);
+  });
+
+  it('fails closed before restart when persisted per-execution tool hooks cannot be reconstructed', async () => {
+    await seed(store, 'run-hook-policy', 'running', 'agent-A', {
+      toolHookPolicy: {
+        kind: 'run-registry',
+        id: 'process-local-policy',
+        beforeToolCall: true,
+        afterToolCall: false,
+      },
+    });
+    const getWorkflow = vi.spyOn(agent, 'getWorkflow');
+
+    await expect(agent.recover('run-hook-policy')).rejects.toMatchObject({
+      id: 'DURABLE_AGENT_TOOL_HOOK_POLICY_UNAVAILABLE',
+    });
+    expect(getWorkflow).not.toHaveBeenCalled();
+    expect(agent.runRegistry.has('run-hook-policy')).toBe(false);
   });
 
   it('throws when the persisted snapshot is not a durable-agent workflow', async () => {
