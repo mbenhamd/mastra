@@ -47,6 +47,29 @@ function legacyPendingSnapshot(id: string, serializedStepGraph: SerializedStepFl
   };
 }
 
+function legacySuspendedSnapshot(id: string, serializedStepGraph: SerializedStepFlowEntry[]): WorkflowRunState {
+  return {
+    runId: id,
+    status: 'suspended',
+    value: {},
+    context: {
+      'only-step': {
+        status: 'suspended',
+        payload: {},
+        suspendPayload: {},
+        startedAt: Date.now(),
+      },
+    } as WorkflowRunState['context'],
+    activePaths: [],
+    activeStepsPath: {},
+    serializedStepGraph,
+    suspendedPaths: { 'only-step': [0] },
+    resumeLabels: {},
+    waitingPaths: {},
+    timestamp: Date.now(),
+  };
+}
+
 class AdmissionInspectingEngine extends ExecutionEngine {
   readonly observations: Array<{
     kind: 'restart' | 'timeTravel';
@@ -210,6 +233,39 @@ describe('workflow lifecycle identity admission', () => {
     await expect(
       workflowsStore.loadWorkflowSnapshot({ workflowName: workflowId, runId: 'legacy-pending-run' }),
     ).resolves.not.toHaveProperty('executionGeneration');
+
+    await mastra.shutdown();
+  });
+
+  /**
+   * The companion to the legacy *pending* case above, and the asymmetry is
+   * deliberate: a pending snapshot is rejected up front by `createRun` with an
+   * explicit "complete lifecycle lineage" TypeError, while a suspended one is
+   * admitted and only fails when `resume` restores its lineage
+   * (`restoreLifecycleExecution` -> `requireWorkflowExecutionGeneration`).
+   *
+   * Failing closed here is the documented contract, not an accident: snapshots
+   * written before this release carry no `executionGeneration`, and minting a
+   * replacement would silently detach the resumed execution from the lifecycle
+   * history a durable consumer already projected. `.changeset/easy-swans-see.md`
+   * declares this a major break and requires operators to drain in-flight runs
+   * — above all runs parked on a human-approval suspend — before upgrading.
+   */
+  it('fails closed for a persisted suspended snapshot without lifecycle lineage', async () => {
+    const storage = new MockStore();
+    const workflow = makeWorkflow();
+    const mastra = new Mastra({ logger: false, storage, workflows: { [workflowId]: workflow } });
+    const workflowsStore = await storage.getStore('workflows');
+    await workflowsStore.persistWorkflowSnapshot({
+      workflowName: workflowId,
+      runId: 'legacy-suspended-run',
+      snapshot: legacySuspendedSnapshot('legacy-suspended-run', workflow.serializedStepGraph),
+    });
+
+    const run = await workflow.createRun({ runId: 'legacy-suspended-run' });
+    await expect(run.resume({ step: 'only-step', resumeData: {} })).rejects.toThrow(
+      'requires a reserved workflow execution generation',
+    );
 
     await mastra.shutdown();
   });
