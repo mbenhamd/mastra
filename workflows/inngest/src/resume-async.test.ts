@@ -147,4 +147,20 @@ describe('InngestRun.resumeAsync()', () => {
     });
     expect(snap?.status).toBe('suspended');
   });
+
+  it('rolls back the snapshot to suspended when event dispatch returns no id', async () => {
+    const { run, workflowsStore } = await createSuspendedRun();
+
+    sendMock.mockResolvedValueOnce({ ids: [] });
+
+    await expect(run.resumeAsync({ step: 'step1', resumeData: { resumed: 'world' } })).rejects.toThrow(
+      'Event ID is not set',
+    );
+
+    const snap = await workflowsStore.loadWorkflowSnapshot({
+      workflowName: 'resume-async-wf',
+      runId: run.runId,
+    });
+    expect(snap?.status).toBe('suspended');
+  });
 });

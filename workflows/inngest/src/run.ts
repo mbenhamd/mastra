@@ -4,6 +4,7 @@ import { getErrorFromUnknown } from '@mastra/core/error';
 import type { Mastra } from '@mastra/core/mastra';
 import type { TracingContext, TracingOptions } from '@mastra/core/observability';
 import type { RequestContext } from '@mastra/core/request-context';
+import type { StandardSchemaWithJSON } from '@mastra/core/schema';
 import { WorkflowRunOutput, ChunkFrom } from '@mastra/core/stream';
 import { createTimeTravelExecutionParams, Run, hydrateSerializedStepErrors } from '@mastra/core/workflows';
 import type {
@@ -22,7 +23,7 @@ import type {
 import { NonRetriableError } from 'inngest';
 import type { Inngest } from 'inngest';
 import { subscribe } from 'inngest/realtime';
-import type { InngestEngineType } from './types';
+import type { InngestEngineType, InngestWorkflowRunState } from './types';
 
 export class InngestRun<
   TEngineType = InngestEngineType,
@@ -38,7 +39,8 @@ export class InngestRun<
   TState = unknown,
   TInput = unknown,
   TOutput = unknown,
-> extends Run<TEngineType, TSteps, TState, TInput, TOutput> {
+  TRequestContext extends Record<string, any> | unknown = unknown,
+> extends Run<TEngineType, TSteps, TState, TInput, TOutput, TRequestContext> {
   private inngest: Inngest;
   serializedStepGraph: SerializedStepFlowEntry[];
   #mastra: Mastra;
@@ -60,6 +62,10 @@ export class InngestRun<
       workflowSteps: Record<string, StepWithComponent>;
       workflowEngineType: WorkflowEngineType;
       validateInputs?: boolean;
+      inputSchema?: StandardSchemaWithJSON<TInput>;
+      stateSchema?: StandardSchemaWithJSON<TState>;
+      requestContextSchema?: StandardSchemaWithJSON<TRequestContext>;
+      disableScorers?: boolean;
     },
     inngest: Inngest,
   ) {
@@ -285,7 +291,7 @@ export class InngestRun<
         : {
             initialState: TState;
           }) & {
-        requestContext?: RequestContext;
+        requestContext?: RequestContext<TRequestContext>;
         actor?: ActorSignal;
         outputWriter?: OutputWriter;
         tracingContext?: TracingContext;
@@ -298,6 +304,122 @@ export class InngestRun<
       },
   ): Promise<WorkflowResult<TState, TInput, TOutput, TSteps>> {
     return this._start(args);
+  }
+
+  private getDurableDisableScorers(snapshot?: InngestWorkflowRunState | null): boolean | undefined {
+    return snapshot?.runOptions?.disableScorers ?? this.disableScorers;
+  }
+
+  /**
+   * Validate a start request, durably transition it to running, and dispatch the
+   * Inngest event. The previous snapshot is restored if dispatch fails or does
+   * not return an event id, so callers never leave an unaccepted run as running.
+   */
+  private async startAndSendEvent({
+    inputData,
+    initialState,
+    outputOptions,
+    tracingOptions,
+    format,
+    requestContext,
+    actor,
+    perStep,
+  }: {
+    inputData?: TInput;
+    requestContext?: RequestContext<TRequestContext>;
+    actor?: ActorSignal;
+    initialState?: TState;
+    tracingOptions?: TracingOptions;
+    outputOptions?: {
+      includeState?: boolean;
+      includeResumeLabels?: boolean;
+    };
+    format?: 'legacy' | 'vnext' | undefined;
+    perStep?: boolean;
+  }): Promise<{ eventId: string }> {
+    const inputDataToUse = await this._validateInput(inputData);
+    const initialStateToUse = await this._validateInitialState(initialState ?? ({} as TState));
+    await this._validateRequestContext(requestContext as RequestContext);
+
+    const workflowsStore = await this.#mastra.getStorage()?.getStore('workflows');
+    const previousSnapshot = (await workflowsStore?.loadWorkflowSnapshot({
+      workflowName: this.workflowId,
+      runId: this.runId,
+    })) as InngestWorkflowRunState | null | undefined;
+    const disableScorers = this.getDurableDisableScorers(previousSnapshot);
+
+    await workflowsStore?.persistWorkflowSnapshot({
+      workflowName: this.workflowId,
+      runId: this.runId,
+      resourceId: this.resourceId,
+      snapshot: {
+        runId: this.runId,
+        serializedStepGraph: this.serializedStepGraph,
+        status: 'running',
+        value: {},
+        context: {} as any,
+        activePaths: [],
+        suspendedPaths: {},
+        activeStepsPath: {},
+        resumeLabels: {},
+        waitingPaths: {},
+        timestamp: Date.now(),
+        ...(disableScorers !== undefined
+          ? {
+              runOptions: {
+                disableScorers,
+              },
+            }
+          : {}),
+      } as InngestWorkflowRunState,
+    });
+
+    try {
+      const eventOutput = await this.inngest.send({
+        name: `workflow.${this.workflowId}`,
+        data: {
+          inputData: inputDataToUse,
+          initialState: initialStateToUse,
+          runId: this.runId,
+          resourceId: this.resourceId,
+          outputOptions,
+          tracingOptions,
+          format,
+          requestContext: requestContext ? Object.fromEntries(requestContext.entries()) : {},
+          actor,
+          perStep,
+          disableScorers,
+        },
+      });
+
+      const eventId = eventOutput.ids[0];
+      if (!eventId) {
+        throw new Error('Event ID is not set');
+      }
+
+      return { eventId };
+    } catch (error) {
+      if (workflowsStore) {
+        try {
+          if (previousSnapshot) {
+            await workflowsStore.persistWorkflowSnapshot({
+              workflowName: this.workflowId,
+              runId: this.runId,
+              resourceId: this.resourceId,
+              snapshot: previousSnapshot,
+            });
+          } else {
+            await workflowsStore.deleteWorkflowRunById({
+              workflowName: this.workflowId,
+              runId: this.runId,
+            });
+          }
+        } catch (rollbackError) {
+          console.error('Failed to rollback snapshot during start error recovery:', rollbackError);
+        }
+      }
+      throw error;
+    }
   }
 
   /**
@@ -321,7 +443,7 @@ export class InngestRun<
         : {
             initialState: TState;
           }) & {
-        requestContext?: RequestContext;
+        requestContext?: RequestContext<TRequestContext>;
         actor?: ActorSignal;
         tracingOptions?: TracingOptions;
         outputOptions?: {
@@ -331,51 +453,7 @@ export class InngestRun<
         perStep?: boolean;
       },
   ): Promise<{ runId: string }> {
-    // Persist initial snapshot
-    const workflowsStore = await this.#mastra.getStorage()?.getStore('workflows');
-    await workflowsStore?.persistWorkflowSnapshot({
-      workflowName: this.workflowId,
-      runId: this.runId,
-      resourceId: this.resourceId,
-      snapshot: {
-        runId: this.runId,
-        serializedStepGraph: this.serializedStepGraph,
-        status: 'running',
-        value: {},
-        context: {} as any,
-        activePaths: [],
-        suspendedPaths: {},
-        activeStepsPath: {},
-        resumeLabels: {},
-        waitingPaths: {},
-        timestamp: Date.now(),
-      },
-    });
-
-    // Validate inputs
-    const inputDataToUse = await this._validateInput(args.inputData);
-    const initialStateToUse = await this._validateInitialState(args.initialState ?? ({} as TState));
-
-    // Send event to Inngest (fire-and-forget)
-    const eventOutput = await this.inngest.send({
-      name: `workflow.${this.workflowId}`,
-      data: {
-        inputData: inputDataToUse,
-        initialState: initialStateToUse,
-        runId: this.runId,
-        resourceId: this.resourceId,
-        outputOptions: args.outputOptions,
-        tracingOptions: args.tracingOptions,
-        requestContext: args.requestContext ? Object.fromEntries(args.requestContext.entries()) : {},
-        actor: args.actor,
-        perStep: args.perStep,
-      },
-    });
-
-    const eventId = eventOutput.ids[0];
-    if (!eventId) {
-      throw new Error('Event ID is not set');
-    }
+    await this.startAndSendEvent(args);
 
     // Return immediately - NO POLLING
     return { runId: this.runId };
@@ -392,7 +470,7 @@ export class InngestRun<
     perStep,
   }: {
     inputData?: TInput;
-    requestContext?: RequestContext;
+    requestContext?: RequestContext<TRequestContext>;
     actor?: ActorSignal;
     initialState?: TState;
     tracingOptions?: TracingOptions;
@@ -403,51 +481,16 @@ export class InngestRun<
     format?: 'legacy' | 'vnext' | undefined;
     perStep?: boolean;
   }): Promise<WorkflowResult<TState, TInput, TOutput, TSteps>> {
-    const workflowsStore = await this.#mastra.getStorage()?.getStore('workflows');
-    await workflowsStore?.persistWorkflowSnapshot({
-      workflowName: this.workflowId,
-      runId: this.runId,
-      resourceId: this.resourceId,
-      snapshot: {
-        runId: this.runId,
-        serializedStepGraph: this.serializedStepGraph,
-        status: 'running',
-        value: {},
-        context: {} as any,
-        activePaths: [],
-        suspendedPaths: {},
-        activeStepsPath: {},
-        resumeLabels: {},
-        waitingPaths: {},
-        timestamp: Date.now(),
-      },
+    const { eventId } = await this.startAndSendEvent({
+      inputData,
+      initialState,
+      outputOptions,
+      tracingOptions,
+      format,
+      requestContext,
+      actor,
+      perStep,
     });
-
-    const inputDataToUse = await this._validateInput(inputData);
-    const initialStateToUse = await this._validateInitialState(initialState ?? ({} as TState));
-
-    const eventName = `workflow.${this.workflowId}`;
-
-    const eventOutput = await this.inngest.send({
-      name: eventName,
-      data: {
-        inputData: inputDataToUse,
-        initialState: initialStateToUse,
-        runId: this.runId,
-        resourceId: this.resourceId,
-        outputOptions,
-        tracingOptions,
-        format,
-        requestContext: requestContext ? Object.fromEntries(requestContext.entries()) : {},
-        actor,
-        perStep,
-      },
-    });
-
-    const eventId = eventOutput.ids[0];
-    if (!eventId) {
-      throw new Error('Event ID is not set');
-    }
 
     const runOutput = await this.getRunOutput(eventId);
     const result = runOutput?.output?.result;
@@ -473,7 +516,7 @@ export class InngestRun<
       | string
       | string[];
     label?: string;
-    requestContext?: RequestContext;
+    requestContext?: RequestContext<TRequestContext>;
     actor?: ActorSignal;
     perStep?: boolean;
   }): Promise<WorkflowResult<TState, TInput, TOutput, TSteps>> {
@@ -505,7 +548,7 @@ export class InngestRun<
       | string
       | string[];
     label?: string;
-    requestContext?: RequestContext;
+    requestContext?: RequestContext<TRequestContext>;
     actor?: ActorSignal;
     perStep?: boolean;
   }): Promise<{ eventId: string }> {
@@ -546,6 +589,7 @@ export class InngestRun<
     const persistedRequestContext = (snapshot as any)?.requestContext ?? {};
     const newRequestContext = params.requestContext ? Object.fromEntries(params.requestContext.entries()) : {};
     const mergedRequestContext = { ...persistedRequestContext, ...newRequestContext };
+    const disableScorers = this.getDurableDisableScorers(snapshot as InngestWorkflowRunState);
 
     // Mark the snapshot as 'running' before sending the event so that
     // snapshot-based polling doesn't return the stale suspended/paused result.
@@ -562,9 +606,8 @@ export class InngestRun<
       } as any,
     });
 
-    let eventOutput;
     try {
-      eventOutput = await this.inngest.send({
+      const eventOutput = await this.inngest.send({
         name: `workflow.${this.workflowId}`,
         data: {
           inputData: resumeDataToUse,
@@ -587,8 +630,16 @@ export class InngestRun<
           // persist a membership-bypass signal into durable storage.
           actor: params.actor,
           perStep: params.perStep,
+          disableScorers,
         },
       });
+
+      const eventId = eventOutput.ids[0];
+      if (!eventId) {
+        throw new Error('Event ID is not set');
+      }
+
+      return { eventId };
     } catch (err) {
       // Rollback: restore the original snapshot so the run isn't stuck in 'running'.
       // The rollback itself can fail (e.g. transient storage error); log it but
@@ -605,13 +656,6 @@ export class InngestRun<
       }
       throw err;
     }
-
-    const eventId = eventOutput.ids[0];
-    if (!eventId) {
-      throw new Error('Event ID is not set');
-    }
-
-    return { eventId };
   }
 
   async _resume<TResume>(params: {
@@ -622,7 +666,7 @@ export class InngestRun<
       | string
       | string[];
     label?: string;
-    requestContext?: RequestContext;
+    requestContext?: RequestContext<TRequestContext>;
     actor?: ActorSignal;
     perStep?: boolean;
   }): Promise<WorkflowResult<TState, TInput, TOutput, TSteps>> {
@@ -656,7 +700,7 @@ export class InngestRun<
       | string
       | string[];
     label?: string;
-    requestContext?: RequestContext;
+    requestContext?: RequestContext<TRequestContext>;
     actor?: ActorSignal;
     perStep?: boolean;
   }): Promise<{ runId: string }> {
@@ -676,7 +720,7 @@ export class InngestRun<
       | string[];
     context?: TimeTravelContext<any, any, any, any>;
     nestedStepsContext?: Record<string, TimeTravelContext<any, any, any, any>>;
-    requestContext?: RequestContext;
+    requestContext?: RequestContext<TRequestContext>;
     actor?: ActorSignal;
     tracingOptions?: TracingOptions;
     outputOptions?: {
@@ -708,7 +752,7 @@ export class InngestRun<
       | string[];
     context?: TimeTravelContext<any, any, any, any>;
     nestedStepsContext?: Record<string, TimeTravelContext<any, any, any, any>>;
-    requestContext?: RequestContext;
+    requestContext?: RequestContext<TRequestContext>;
     actor?: ActorSignal;
     tracingOptions?: TracingOptions;
     outputOptions?: {
@@ -747,7 +791,7 @@ export class InngestRun<
 
     let snapshotForRollback = snapshot;
     if (!snapshot) {
-      const pendingSnapshot = {
+      const pendingSnapshot: InngestWorkflowRunState = {
         runId: this.runId,
         serializedStepGraph: this.serializedStepGraph,
         status: 'pending' as const,
@@ -759,6 +803,13 @@ export class InngestRun<
         resumeLabels: {},
         waitingPaths: {},
         timestamp: Date.now(),
+        ...(this.disableScorers !== undefined
+          ? {
+              runOptions: {
+                disableScorers: this.disableScorers,
+              },
+            }
+          : {}),
       };
       await workflowsStore.persistWorkflowSnapshot({
         workflowName: this.workflowId,
@@ -793,6 +844,7 @@ export class InngestRun<
 
     // Save previous snapshot for rollback if send fails
     const previousSnapshot = snapshotForRollback;
+    const disableScorers = this.getDurableDisableScorers(previousSnapshot as InngestWorkflowRunState | null);
 
     // Mark the snapshot as 'running' before sending the event so that
     // snapshot-based polling doesn't return the stale result from a previous run.
@@ -812,12 +864,19 @@ export class InngestRun<
         resumeLabels: {},
         waitingPaths: {},
         timestamp: Date.now(),
-      },
+        ...(disableScorers !== undefined
+          ? {
+              runOptions: {
+                disableScorers,
+              },
+            }
+          : {}),
+      } as InngestWorkflowRunState,
     });
 
-    let eventOutput;
+    let eventId: string;
     try {
-      eventOutput = await this.inngest.send({
+      const eventOutput = await this.inngest.send({
         name: `workflow.${this.workflowId}`,
         data: {
           initialState: timeTravelData.state,
@@ -830,8 +889,15 @@ export class InngestRun<
           requestContext: params.requestContext ? Object.fromEntries(params.requestContext.entries()) : {},
           actor: params.actor,
           perStep: params.perStep,
+          disableScorers,
         },
       });
+
+      const dispatchedEventId = eventOutput.ids[0];
+      if (!dispatchedEventId) {
+        throw new Error('Event ID is not set');
+      }
+      eventId = dispatchedEventId;
     } catch (err) {
       // Rollback: restore the previous snapshot so the run isn't stuck in 'running'.
       // The rollback itself can fail (e.g. transient storage error); log it but
@@ -849,11 +915,6 @@ export class InngestRun<
         }
       }
       throw err;
-    }
-
-    const eventId = eventOutput.ids[0];
-    if (!eventId) {
-      throw new Error('Event ID is not set');
     }
     const runOutput = await this.getRunOutput(eventId);
     const result = runOutput?.output?.result;
@@ -898,7 +959,7 @@ export class InngestRun<
     inputData,
     requestContext,
     actor,
-  }: { inputData?: TInput; requestContext?: RequestContext; actor?: ActorSignal } = {}): {
+  }: { inputData?: TInput; requestContext?: RequestContext<TRequestContext>; actor?: ActorSignal } = {}): {
     stream: ReadableStream<StreamEvent>;
     getWorkflowState: () => Promise<WorkflowResult<TState, TInput, TOutput, TSteps>>;
   } {
@@ -969,7 +1030,7 @@ export class InngestRun<
     perStep,
   }: {
     inputData?: TInput;
-    requestContext?: RequestContext;
+    requestContext?: RequestContext<TRequestContext>;
     actor?: ActorSignal;
     tracingContext?: TracingContext;
     tracingOptions?: TracingOptions;
@@ -1080,7 +1141,7 @@ export class InngestRun<
       | string[];
     context?: TimeTravelContext<any, any, any, any>;
     nestedStepsContext?: Record<string, TimeTravelContext<any, any, any, any>>;
-    requestContext?: RequestContext;
+    requestContext?: RequestContext<TRequestContext>;
     actor?: ActorSignal;
     tracingContext?: TracingContext;
     tracingOptions?: TracingOptions;

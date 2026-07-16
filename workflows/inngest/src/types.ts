@@ -1,4 +1,11 @@
-import type { Step, WorkflowConfig } from '@mastra/core/workflows';
+import type { InferPublicSchemaInput, PublicSchema } from '@mastra/core/schema';
+import type {
+  CreateWorkflowParams,
+  InferSchemaOutput,
+  Step,
+  WorkflowConfig,
+  WorkflowRunState,
+} from '@mastra/core/workflows';
 import type { Inngest } from 'inngest';
 
 // Extract Inngest's native flow control configuration types from createFunction first argument
@@ -24,9 +31,37 @@ export type InngestWorkflowConfig<
   TInput,
   TOutput,
   TSteps extends Step<string, any, any, any, any, any, InngestEngineType>[],
-> = WorkflowConfig<TWorkflowId, TState, TInput, TOutput, TSteps> &
+  TRequestContext extends Record<string, any> | unknown = unknown,
+  TRawInput = TInput,
+> = Omit<WorkflowConfig<TWorkflowId, TState, TInput, TOutput, TSteps, TRequestContext>, 'inputSchema'> & {
+  inputSchema: PublicSchema<TInput, TRawInput>;
+} & InngestFlowControlConfig &
+  InngestFlowCronConfig<TRawInput, TState>;
+
+/**
+ * Inngest-specific durable run options stored alongside the native workflow snapshot.
+ * These values must survive worker replacement so later resume/time-travel events keep
+ * the same execution semantics as the original run.
+ */
+export type InngestWorkflowRunState = WorkflowRunState & {
+  runOptions?: {
+    disableScorers?: boolean;
+  };
+};
+
+/**
+ * Schema-typed Inngest workflow configuration.
+ */
+export type CreateInngestWorkflowParams<
+  TWorkflowId extends string = string,
+  TStateSchema extends PublicSchema<any> | undefined = undefined,
+  TInputSchema extends PublicSchema<any> = PublicSchema<any>,
+  TOutputSchema extends PublicSchema<any> = PublicSchema<any>,
+  TSteps extends Step[] = Step[],
+  TRequestContextSchema extends PublicSchema<any> | undefined = undefined,
+> = CreateWorkflowParams<TWorkflowId, TStateSchema, TInputSchema, TOutputSchema, TSteps, TRequestContextSchema> &
   InngestFlowControlConfig &
-  InngestFlowCronConfig<TInput, TState>;
+  InngestFlowCronConfig<InferPublicSchemaInput<TInputSchema>, InferSchemaOutput<TStateSchema>>;
 
 // Compile-time compatibility assertion
 export type _AssertInngestCompatibility =

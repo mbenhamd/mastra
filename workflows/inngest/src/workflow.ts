@@ -15,6 +15,7 @@ import type {
   WorkflowRunState,
   WorkflowStreamEvent,
   Run,
+  RunWithRawInput,
 } from '@mastra/core/workflows';
 import { NonRetriableError } from 'inngest';
 import type { Inngest } from 'inngest';
@@ -26,6 +27,7 @@ import type {
   InngestFlowControlConfig,
   InngestFlowCronConfig,
   InngestWorkflowConfig,
+  InngestWorkflowRunState,
 } from './types';
 
 export class InngestWorkflow<
@@ -44,14 +46,16 @@ export class InngestWorkflow<
   TInput = unknown,
   TOutput = unknown,
   TPrevSchema = TInput,
-> extends Workflow<TEngineType, TSteps, TWorkflowId, TState, TInput, TOutput, TPrevSchema> {
+  TRequestContext extends Record<string, any> | unknown = unknown,
+  TRawInput = TInput,
+> extends Workflow<TEngineType, TSteps, TWorkflowId, TState, TInput, TOutput, TPrevSchema, TRequestContext, TRawInput> {
   #mastra: Mastra;
   public inngest: Inngest;
 
   private function: ReturnType<Inngest['createFunction']> | undefined;
   private cronFunction: ReturnType<Inngest['createFunction']> | undefined;
   private readonly flowControlConfig?: InngestFlowControlConfig;
-  private readonly cronConfig?: InngestFlowCronConfig<TInput, TState>;
+  private readonly cronConfig?: InngestFlowCronConfig<TRawInput, TState>;
   /**
    * Optional override that lets a host (e.g. `createInngestAgent`) provide the
    * PubSub instance used by workflow steps for publishing chunk/finish events.
@@ -67,14 +71,32 @@ export class InngestWorkflow<
       TState,
       TInput,
       TOutput,
-      TSteps & Step<string, any, any, any, any, any, InngestEngineType>[]
+      TSteps & Step<string, any, any, any, any, any, InngestEngineType>[],
+      TRequestContext,
+      TRawInput
     >,
     inngest: Inngest,
   ) {
-    const { concurrency, rateLimit, throttle, debounce, priority, cron, inputData, initialState, ...workflowParams } =
-      params;
+    const {
+      concurrency,
+      rateLimit,
+      throttle,
+      debounce,
+      priority,
+      cron,
+      inputData,
+      initialState,
+      schedule,
+      ...workflowParams
+    } = params;
 
-    super(workflowParams as WorkflowConfig<TWorkflowId, TState, TInput, TOutput, TSteps>);
+    if (schedule !== undefined) {
+      throw new TypeError(
+        'Inngest workflows do not support the Core schedule option; use cron, inputData, and initialState instead',
+      );
+    }
+
+    super(workflowParams as WorkflowConfig<TWorkflowId, TState, TInput, TOutput, TSteps, TRequestContext>);
 
     this.engineType = 'inngest';
 
@@ -185,12 +207,27 @@ export class InngestWorkflow<
   async createRun(options?: {
     runId?: string;
     resourceId?: string;
-  }): Promise<Run<TEngineType, TSteps, TState, TInput, TOutput>> {
+    disableScorers?: boolean;
+    /** Inngest functions execute remotely, so per-run PubSub objects cannot be reconstructed. */
+    pubsub?: PubSub;
+  }): Promise<RunWithRawInput<TEngineType, TSteps, TState, TInput, TOutput, TRequestContext, TRawInput>> {
+    if (options?.pubsub) {
+      throw new TypeError(
+        'Inngest createRun({ pubsub }) is unsupported because remote function replicas cannot reconstruct a per-run PubSub object',
+      );
+    }
+
     const runIdToUse = options?.runId || randomUUID();
+    const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
+    const existingSnapshot = (await workflowsStore?.loadWorkflowSnapshot({
+      workflowName: this.id,
+      runId: runIdToUse,
+    })) as InngestWorkflowRunState | null | undefined;
+    const persistedDisableScorers = existingSnapshot?.runOptions?.disableScorers;
 
     // Return a new Run instance with object parameters
     const existingInMemoryRun = this.runs.get(runIdToUse);
-    const newRun = new InngestRun<TEngineType, TSteps, TState, TInput, TOutput>(
+    const newRun = new InngestRun<TEngineType, TSteps, TState, TInput, TOutput, TRequestContext>(
       {
         workflowId: this.id,
         runId: runIdToUse,
@@ -204,10 +241,14 @@ export class InngestWorkflow<
         workflowSteps: this.steps,
         workflowEngineType: this.engineType,
         validateInputs: this.options.validateInputs,
+        inputSchema: this.inputSchema,
+        stateSchema: this.stateSchema,
+        requestContextSchema: this.requestContextSchema,
+        disableScorers: persistedDisableScorers ?? options?.disableScorers,
       },
       this.inngest,
     );
-    const run = (existingInMemoryRun ?? newRun) as Run<TEngineType, TSteps, TState, TInput, TOutput>;
+    const run = (existingInMemoryRun ?? newRun) as Run<TEngineType, TSteps, TState, TInput, TOutput, TRequestContext>;
 
     this.runs.set(runIdToUse, run);
 
@@ -216,15 +257,9 @@ export class InngestWorkflow<
       stepResults: {},
     });
 
-    const existingStoredRun = await this.getWorkflowRunById(runIdToUse, {
-      withNestedWorkflows: false,
-    });
-
-    // Check if run exists in persistent storage (not just in-memory)
-    const existsInStorage = existingStoredRun && !existingStoredRun.isFromInMemory;
+    const existsInStorage = Boolean(existingSnapshot);
 
     if (!existsInStorage && shouldPersistSnapshot) {
-      const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
       await workflowsStore?.persistWorkflowSnapshot({
         workflowName: this.id,
         runId: runIdToUse,
@@ -243,11 +278,18 @@ export class InngestWorkflow<
           result: undefined,
           error: undefined,
           timestamp: Date.now(),
+          ...(run.disableScorers !== undefined
+            ? {
+                runOptions: {
+                  disableScorers: run.disableScorers,
+                },
+              }
+            : {}),
         },
       });
     }
 
-    return run;
+    return run as RunWithRawInput<TEngineType, TSteps, TState, TInput, TOutput, TRequestContext, TRawInput>;
   }
 
   //createCronFunction is only called if cronConfig.cron is defined.
@@ -307,6 +349,7 @@ export class InngestWorkflow<
           perStep,
           tracingOptions,
           actor,
+          disableScorers,
         } = event.data;
 
         if (!runId) {
@@ -367,6 +410,7 @@ export class InngestWorkflow<
             workflowId: this.id,
             runId,
             resourceId,
+            disableScorers,
             graph: this.executionGraph,
             serializedStepGraph: this.serializedStepGraph,
             input: inputData,
@@ -509,7 +553,14 @@ export class InngestWorkflow<
                     result: result.status === 'success' ? toSnapshotResult(result.result) : undefined,
                     error: result.status === 'failed' ? result.error : undefined,
                     timestamp: Date.now(),
-                  },
+                    ...(disableScorers !== undefined
+                      ? {
+                          runOptions: {
+                            disableScorers,
+                          },
+                        }
+                      : {}),
+                  } as InngestWorkflowRunState,
                 });
               }
             }

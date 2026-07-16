@@ -8,18 +8,30 @@ import type { TracingContext } from '@mastra/core/observability';
 import { EntityType, SpanType } from '@mastra/core/observability';
 import type { Processor, ProcessorStepOutput, ProcessorStepInputSchema, OutputResult } from '@mastra/core/processors';
 import { ProcessorRunner, ProcessorStepOutputSchema, ProcessorStepSchema } from '@mastra/core/processors';
-import type { InferPublicSchema, PublicSchema, StandardSchemaWithJSON } from '@mastra/core/schema';
+import type {
+  InferPublicSchema,
+  InferPublicSchemaInput,
+  PublicSchema,
+  StandardSchemaWithJSON,
+} from '@mastra/core/schema';
 import { toStandardSchema } from '@mastra/core/schema';
 import type { ChunkType, LanguageModelUsage } from '@mastra/core/stream';
 import type { ToolExecutionContext } from '@mastra/core/tools';
 import { Tool, createTool } from '@mastra/core/tools';
 import type { DynamicArgument } from '@mastra/core/types';
-import type { Step, AgentStepOptions, StepParams, ToolStep, StepMetadata } from '@mastra/core/workflows';
+import type {
+  Step,
+  AgentStepOptions,
+  StepParams,
+  ToolStep,
+  StepMetadata,
+  InferSchemaOutput,
+} from '@mastra/core/workflows';
 import { Workflow } from '@mastra/core/workflows';
 import { PUBSUB_SYMBOL, STREAM_FORMAT_SYMBOL } from '@mastra/core/workflows/_constants';
 import type { Inngest } from 'inngest';
 import { z } from 'zod';
-import type { InngestEngineType, InngestWorkflowConfig } from './types';
+import type { CreateInngestWorkflowParams, InngestEngineType, InngestWorkflowConfig } from './types';
 import { InngestWorkflow } from './workflow';
 
 export * from './workflow';
@@ -1103,28 +1115,93 @@ function createStepFromProcessor<TProcessorId extends string>(
 }
 
 export function init(inngest: Inngest) {
+  function createInngestWorkflow<
+    TWorkflowId extends string = string,
+    TInputSchema extends PublicSchema<any> = PublicSchema<any>,
+    TOutputSchema extends PublicSchema<any> = PublicSchema<any>,
+    TStateSchema extends PublicSchema<any> | undefined = undefined,
+    TSteps extends Step<string, any, any, any, any, any, InngestEngineType>[] = Step<
+      string,
+      any,
+      any,
+      any,
+      any,
+      any,
+      InngestEngineType
+    >[],
+    TRequestContextSchema extends PublicSchema<any> | undefined = undefined,
+  >(
+    params: CreateInngestWorkflowParams<
+      TWorkflowId,
+      TStateSchema,
+      TInputSchema,
+      TOutputSchema,
+      TSteps,
+      TRequestContextSchema
+    >,
+  ): InngestWorkflow<
+    InngestEngineType,
+    TSteps,
+    TWorkflowId,
+    InferSchemaOutput<TStateSchema>,
+    InferPublicSchema<TInputSchema>,
+    InferPublicSchema<TOutputSchema>,
+    InferPublicSchema<TInputSchema>,
+    InferSchemaOutput<TRequestContextSchema>,
+    InferPublicSchemaInput<TInputSchema>
+  >;
+  /**
+   * Preserve the original explicit generic parameter order for callers that
+   * supplied output types rather than relying on schema inference. Transformed
+   * schemas can provide their raw input as the final optional generic without
+   * shifting the existing workflow, state, input, output, steps, or request
+   * context positions.
+   */
+  function createInngestWorkflow<
+    TWorkflowId extends string = string,
+    TState = any,
+    TInput = any,
+    TOutput = any,
+    TSteps extends Step<string, any, any, any, any, any, InngestEngineType>[] = Step<
+      string,
+      any,
+      any,
+      any,
+      any,
+      any,
+      InngestEngineType
+    >[],
+    TRequestContext extends Record<string, any> | unknown = unknown,
+    TRawInput = TInput,
+  >(
+    params: InngestWorkflowConfig<TWorkflowId, TState, TInput, TOutput, TSteps, TRequestContext, TRawInput>,
+  ): InngestWorkflow<
+    InngestEngineType,
+    TSteps,
+    TWorkflowId,
+    TState,
+    TInput,
+    TOutput,
+    TInput,
+    TRequestContext,
+    TRawInput
+  >;
+  function createInngestWorkflow(
+    params: InngestWorkflowConfig<
+      string,
+      any,
+      any,
+      any,
+      Step<string, any, any, any, any, any, InngestEngineType>[],
+      any
+    >,
+  ) {
+    return new InngestWorkflow(params, inngest);
+  }
+
   return {
     createTool,
-    createWorkflow<
-      TWorkflowId extends string = string,
-      TState = any,
-      TInput = any,
-      TOutput = any,
-      TSteps extends Step<string, any, any, any, any, any, InngestEngineType>[] = Step<
-        string,
-        any,
-        any,
-        any,
-        any,
-        any,
-        InngestEngineType
-      >[],
-    >(params: InngestWorkflowConfig<TWorkflowId, TState, TInput, TOutput, TSteps>) {
-      return new InngestWorkflow<InngestEngineType, TSteps, TWorkflowId, TState, TInput, TOutput, TInput>(
-        params,
-        inngest,
-      );
-    },
+    createWorkflow: createInngestWorkflow,
     createStep,
     cloneStep<TStepId extends string>(
       step: Step<TStepId, any, any, any, any, any, InngestEngineType>,
@@ -1160,14 +1237,28 @@ export function init(inngest: Inngest) {
         InngestEngineType
       >[],
       TPrev = TInput,
+      TRequestContext extends Record<string, any> | unknown = unknown,
+      TRawInput = TInput,
     >(
-      workflow: Workflow<InngestEngineType, TSteps, string, TState, TInput, TOutput, TPrev>,
+      workflow: Workflow<InngestEngineType, TSteps, string, TState, TInput, TOutput, TPrev, TRequestContext, TRawInput>,
       opts: { id: TWorkflowId },
-    ): Workflow<InngestEngineType, TSteps, TWorkflowId, TState, TInput, TOutput, TPrev> {
-      const wf: Workflow<InngestEngineType, TSteps, TWorkflowId, TState, TInput, TOutput, TPrev> = new Workflow({
+    ): Workflow<InngestEngineType, TSteps, TWorkflowId, TState, TInput, TOutput, TPrev, TRequestContext, TRawInput> {
+      const wf: Workflow<
+        InngestEngineType,
+        TSteps,
+        TWorkflowId,
+        TState,
+        TInput,
+        TOutput,
+        TPrev,
+        TRequestContext,
+        TRawInput
+      > = new Workflow({
         id: opts.id,
         inputSchema: workflow.inputSchema,
         outputSchema: workflow.outputSchema,
+        stateSchema: workflow.stateSchema,
+        requestContextSchema: workflow.requestContextSchema,
         steps: workflow.stepDefs,
         mastra: workflow.mastra,
         options: workflow.options,
