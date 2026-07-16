@@ -861,14 +861,16 @@ export class InMemoryHarness extends HarnessStorage {
       );
     }
     if (existing && isTerminalMessageEvidence(existing)) {
-      return { created: false, evidence: cloneJson(existing) };
+      return { created: false, applied: false, evidence: cloneJson(existing) };
     }
     const stored = {
       ...namespacedRecord,
       createdAt: existing?.createdAt ?? namespacedRecord.createdAt,
     };
     this.db.harnessMessageResultEvidence.set(key, cloneJson(stored));
-    return existing === undefined ? { created: true } : { created: false, evidence: cloneJson(stored) };
+    return existing === undefined
+      ? { created: true, applied: true }
+      : { created: false, applied: true, evidence: cloneJson(stored) };
   }
 
   async loadQueueResultEvidence({

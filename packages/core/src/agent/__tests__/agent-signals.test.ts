@@ -183,6 +183,15 @@ class RejectFirstRunCompletedPubSub extends EventEmitterPubSub {
   }
 }
 
+class RejectSignalEnqueuedPubSub extends EventEmitterPubSub {
+  override async publish(topic: string, event: Parameters<PubSub['publish']>[1]): Promise<void> {
+    if ((event as { data?: { type?: string } }).data?.type === 'signal-enqueued') {
+      throw new Error('injected signal enqueue publication failure');
+    }
+    await super.publish(topic, event);
+  }
+}
+
 async function readNextRun(iterator: AsyncIterator<any>) {
   let runId: string | undefined;
   let text = '';
@@ -3241,6 +3250,336 @@ describe('Agent signals', () => {
     await pubsub.releaseLease('remote-resource\u0000remote-thread', 'remote-run-1');
     ownerSubscription.unsubscribe();
     senderSubscription.unsubscribe();
+  });
+
+  it('deduplicates stable signal ids delivered by multiple runtime instances', async () => {
+    const pubsub = new EventEmitterPubSub();
+    const ownerRuntime = new AgentThreadStreamRuntime();
+    const senderRuntimeA = new AgentThreadStreamRuntime();
+    const senderRuntimeB = new AgentThreadStreamRuntime();
+    const owner = new Agent({
+      id: 'remote-idempotent-agent',
+      name: 'Remote Idempotent Owner Agent',
+      instructions: 'Test',
+      model: createTextStreamModel('owner response'),
+    });
+    const senderA = new Agent({
+      id: 'remote-idempotent-agent',
+      name: 'Remote Idempotent Sender A',
+      instructions: 'Test',
+      model: createTextStreamModel('sender response'),
+    });
+    const senderB = new Agent({
+      id: 'remote-idempotent-agent',
+      name: 'Remote Idempotent Sender B',
+      instructions: 'Test',
+      model: createTextStreamModel('sender response'),
+    });
+    let finishRun!: () => void;
+    const output = {
+      runId: 'remote-idempotent-run',
+      status: 'running',
+      fullStream: (async function* () {})(),
+      _waitUntilFinished: () => new Promise<void>(resolve => (finishRun = resolve)),
+    } as any;
+    const target = { resourceId: 'remote-idempotent-resource', threadId: 'remote-idempotent-thread' };
+    const threadTopic = `agent.thread-stream.${encodeURIComponent(`${target.resourceId}\u0000${target.threadId}`)}`;
+    const observedSignals: any[] = [];
+    await pubsub.subscribe(threadTopic, event => {
+      if (event.data?.type === 'signal-enqueued') observedSignals.push(event.data);
+    });
+
+    const ownerSubscription = await ownerRuntime.subscribeToThread(owner, target, pubsub);
+    const senderSubscriptionA = await senderRuntimeA.subscribeToThread(senderA, target, pubsub);
+    const senderSubscriptionB = await senderRuntimeB.subscribeToThread(senderB, target, pubsub);
+    await pubsub.acquireLease('remote-idempotent-resource\u0000remote-idempotent-thread', output.runId, 15_000);
+    ownerRuntime.registerRun(
+      owner,
+      output,
+      { runId: output.runId, memory: { resource: target.resourceId, thread: target.threadId } } as any,
+      pubsub,
+    );
+    await waitForCondition(
+      () => senderSubscriptionA.activeRunId() === output.runId && senderSubscriptionB.activeRunId() === output.runId,
+    );
+
+    const stableSignal = { id: 'stable-remote-signal', type: 'user-message' as const, contents: 'once only' };
+    const acceptedA = await senderRuntimeA.sendSignal(senderA, stableSignal, target, pubsub).accepted;
+    expect(acceptedA).toMatchObject({ action: 'deliver', runId: output.runId });
+    const firstDrain = ownerRuntime.drainPendingSignals(output.runId, pubsub);
+    const acceptedB = await senderRuntimeB.sendSignal(senderB, stableSignal, target, pubsub).accepted;
+    expect(acceptedB).toMatchObject({ action: 'deliver', runId: output.runId });
+    // Sender B already observed sender A's admission, so its exact retry is
+    // suppressed before another broker publication.
+    expect(observedSignals).toHaveLength(1);
+    expect(firstDrain).toMatchObject([{ id: stableSignal.id, contents: stableSignal.contents }]);
+    expect(ownerRuntime.drainPendingSignals(output.runId, pubsub)).toEqual([]);
+
+    expect(() =>
+      senderRuntimeB.sendSignal(senderB, { ...stableSignal, contents: 'conflicting replay' }, target, pubsub),
+    ).toThrow('already accepted with a different payload');
+    expect(ownerRuntime.drainPendingSignals(output.runId, pubsub)).toEqual([]);
+
+    finishRun();
+    await nextTick();
+    await pubsub.releaseLease('remote-idempotent-resource\u0000remote-idempotent-thread', output.runId);
+    ownerSubscription.unsubscribe();
+    senderSubscriptionA.unsubscribe();
+    senderSubscriptionB.unsubscribe();
+  });
+
+  it('uses process-attempt lease owners when two runtimes share a stable public wake run id', async () => {
+    const pubsub = new EventEmitterPubSub();
+    const runtimeA = new AgentThreadStreamRuntime();
+    const runtimeB = new AgentThreadStreamRuntime();
+    const target = { resourceId: 'stable-wake-resource', threadId: 'stable-wake-thread' };
+    const runId = 'stable-public-wake-run';
+    const signal = { id: 'stable-public-wake-signal', type: 'user-message' as const, contents: 'execute once' };
+    const makeOutput = () =>
+      ({
+        runId,
+        status: 'running',
+        fullStream: (async function* () {})(),
+        _waitUntilFinished: () => new Promise<void>(() => {}),
+      }) as any;
+    const agentA = { id: 'stable-wake-agent', stream: vi.fn(async () => makeOutput()) } as any;
+    const agentB = { id: 'stable-wake-agent', stream: vi.fn(async () => makeOutput()) } as any;
+    const subscriptionA = await runtimeA.subscribeToThread(agentA, target, pubsub);
+    const subscriptionB = await runtimeB.subscribeToThread(agentB, target, pubsub);
+
+    const dispatchedA = runtimeA.sendSignal(agentA, signal, { ...target, runId, ifIdle: { behavior: 'wake' } }, pubsub);
+    const dispatchedB = runtimeB.sendSignal(agentB, signal, { ...target, runId, ifIdle: { behavior: 'wake' } }, pubsub);
+    const accepted = await Promise.all([dispatchedA.accepted, dispatchedB.accepted]);
+
+    expect(accepted.map(result => result.action).sort()).toEqual(['deliver', 'wake']);
+    expect(accepted).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ action: 'deliver', runId }),
+        expect.objectContaining({ action: 'wake', runId }),
+      ]),
+    );
+    expect(agentA.stream.mock.calls.length + agentB.stream.mock.calls.length).toBe(1);
+    const winnerRuntime = accepted[0]!.action === 'wake' ? runtimeA : runtimeB;
+    expect(winnerRuntime.getThreadState(target, pubsub)).toBe('active');
+    expect(winnerRuntime.drainPendingSignals(runId, pubsub)).toEqual([]);
+
+    runtimeA.abortRun(runId, pubsub);
+    runtimeB.abortRun(runId, pubsub);
+    subscriptionA.unsubscribe();
+    subscriptionB.unsubscribe();
+  });
+
+  it('rejects a lost-lease delivery when broker publication fails and permits a retry', async () => {
+    const pubsub = new RejectSignalEnqueuedPubSub();
+    const runtime = new AgentThreadStreamRuntime();
+    const target = { resourceId: 'failed-publish-resource', threadId: 'failed-publish-thread' };
+    const key = `${target.resourceId}\u0000${target.threadId}`;
+    const runId = 'failed-publish-stable-run';
+    const signal = { id: 'failed-publish-stable-signal', type: 'user-message' as const, contents: 'do not drop' };
+    const agent = {
+      id: 'failed-publish-agent',
+      stream: vi.fn(async () => ({
+        runId,
+        status: 'running',
+        fullStream: (async function* () {})(),
+        _waitUntilFinished: () => new Promise<void>(() => {}),
+      })),
+    } as any;
+    const subscription = await runtime.subscribeToThread(agent, target, pubsub);
+    await pubsub.acquireLease(key, 'winning-run', 15_000);
+
+    const first = runtime.sendSignal(agent, signal, { ...target, runId, ifIdle: { behavior: 'wake' } }, pubsub);
+    await expect(first.accepted).rejects.toThrow('injected signal enqueue publication failure');
+    expect(agent.stream).not.toHaveBeenCalled();
+
+    await pubsub.releaseLease(key, 'winning-run');
+    const retry = runtime.sendSignal(agent, signal, { ...target, runId, ifIdle: { behavior: 'wake' } }, pubsub);
+    await expect(retry.accepted).resolves.toMatchObject({ action: 'wake', runId });
+    expect(agent.stream).toHaveBeenCalledTimes(1);
+
+    runtime.abortRun(runId, pubsub);
+    subscription.unsubscribe();
+  });
+
+  it('retains stable signal admission through the run-completed publication window', async () => {
+    const pubsub = new BlockingRunCompletedPubSub();
+    const ownerRuntime = new AgentThreadStreamRuntime();
+    const senderRuntimeA = new AgentThreadStreamRuntime();
+    const senderRuntimeB = new AgentThreadStreamRuntime();
+    const target = { resourceId: 'terminal-window-resource', threadId: 'terminal-window-thread' };
+    const owner = new Agent({
+      id: 'terminal-window-agent',
+      name: 'Terminal Window Owner',
+      instructions: 'Test',
+      model: createTextStreamModel('owner terminal-window response'),
+    });
+    const senderA = new Agent({
+      id: 'terminal-window-agent',
+      name: 'Terminal Window Sender A',
+      instructions: 'Test',
+      model: createTextStreamModel('sender terminal-window response'),
+    });
+    const senderB = new Agent({
+      id: 'terminal-window-agent',
+      name: 'Terminal Window Sender B',
+      instructions: 'Test',
+      model: createTextStreamModel('sender terminal-window response'),
+    });
+    let finishRun!: () => void;
+    const finished = new Promise<void>(resolve => {
+      finishRun = resolve;
+    });
+    const output = {
+      runId: 'terminal-window-run',
+      status: 'running',
+      fullStream: (async function* () {})(),
+      _waitUntilFinished: () => finished,
+    } as any;
+    const signal = { id: 'terminal-window-signal', type: 'user-message' as const, contents: 'once at terminal' };
+    const ownerSubscription = await ownerRuntime.subscribeToThread(owner, target, pubsub);
+    const senderSubscriptionA = await senderRuntimeA.subscribeToThread(senderA, target, pubsub);
+    const senderSubscriptionB = await senderRuntimeB.subscribeToThread(senderB, target, pubsub);
+    await pubsub.acquireLease(`${target.resourceId}\u0000${target.threadId}`, output.runId, 15_000);
+    const completion = ownerRuntime.registerRun(
+      owner,
+      output,
+      { runId: output.runId, memory: { resource: target.resourceId, thread: target.threadId } } as any,
+      pubsub,
+    );
+    await waitForCondition(
+      () => senderSubscriptionA.activeRunId() === output.runId && senderSubscriptionB.activeRunId() === output.runId,
+    );
+    // Retain B's observed run projection but stop it from observing A's first
+    // signal admission, forcing the terminal-window retry through the broker.
+    senderSubscriptionB.unsubscribe();
+
+    const first = senderRuntimeA.sendSignal(senderA, signal, target, pubsub);
+    await expect(first.accepted).resolves.toMatchObject({ action: 'deliver', runId: output.runId });
+    expect(ownerRuntime.drainPendingSignals(output.runId, pubsub)).toMatchObject([
+      { id: signal.id, contents: signal.contents },
+    ]);
+
+    finishRun();
+    await waitForCondition(() => pubsub.sawRunCompleted);
+    const retry = senderRuntimeB.sendSignal(senderB, signal, target, pubsub);
+    await expect(retry.accepted).resolves.toMatchObject({ action: 'deliver', runId: output.runId });
+    expect(ownerRuntime.drainPendingSignals(output.runId, pubsub)).toEqual([]);
+
+    pubsub.unblockRunCompleted();
+    await completion;
+    ownerSubscription.unsubscribe();
+    senderSubscriptionA.unsubscribe();
+  });
+
+  it('evicts retained stable signal admissions after their terminal-window TTL', async () => {
+    vi.useFakeTimers();
+    try {
+      const pubsub = new EventEmitterPubSub();
+      const runtime = new AgentThreadStreamRuntime();
+      const target = { resourceId: 'admission-ttl-resource', threadId: 'admission-ttl-thread' };
+      let finishRun!: () => void;
+      const finished = new Promise<void>(resolve => {
+        finishRun = resolve;
+      });
+      const stream = vi.fn(async (_signal: unknown, options: { runId: string }) => ({
+        runId: options.runId,
+        status: 'running',
+        fullStream: (async function* () {})(),
+        _waitUntilFinished: () => new Promise<void>(() => {}),
+      }));
+      const agent = { id: 'admission-ttl-agent', stream } as any;
+      const activeRunId = 'admission-ttl-active-run';
+      const completion = runtime.registerRun(
+        agent,
+        {
+          runId: activeRunId,
+          status: 'running',
+          fullStream: (async function* () {})(),
+          _waitUntilFinished: () => finished,
+        } as any,
+        { runId: activeRunId, memory: { resource: target.resourceId, thread: target.threadId } } as any,
+        pubsub,
+      );
+      const signal = { id: 'admission-ttl-signal', type: 'user-message' as const, contents: 'expires later' };
+      await expect(runtime.sendSignal(agent, signal, target, pubsub).accepted).resolves.toMatchObject({
+        action: 'deliver',
+        runId: activeRunId,
+      });
+      expect(runtime.drainPendingSignals(activeRunId, pubsub)).toHaveLength(1);
+      finishRun();
+      await completion;
+
+      const retained = runtime.sendSignal(agent, signal, target, pubsub);
+      await expect(retained.accepted).resolves.toMatchObject({ action: 'deliver', runId: activeRunId });
+      expect(stream).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(5 * 60 * 1000 + 1);
+      const expired = runtime.sendSignal(agent, signal, target, pubsub);
+      await expect(expired.accepted).resolves.toMatchObject({ action: 'wake', runId: expired.runId });
+      expect(expired.runId).not.toBe(activeRunId);
+      expect(stream).toHaveBeenCalledTimes(1);
+      runtime.abortRun(expired.runId, pubsub);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not enqueue the owned wake signal again when PubSub redelivers it', async () => {
+    const pubsub = new EventEmitterPubSub();
+    const runtime = new AgentThreadStreamRuntime();
+    const runId = 'stable-owned-wake-run';
+    const target = { resourceId: 'stable-owned-resource', threadId: 'stable-owned-thread' };
+    let releaseStream!: () => void;
+    const streamGate = new Promise<void>(resolve => {
+      releaseStream = resolve;
+    });
+    const agent = {
+      id: 'stable-owned-agent',
+      stream: vi.fn(async () => {
+        await streamGate;
+        return {
+          runId,
+          status: 'running',
+          fullStream: (async function* () {})(),
+          _waitUntilFinished: () => new Promise<void>(() => {}),
+        } as any;
+      }),
+    } as any;
+    const subscription = await runtime.subscribeToThread(agent, target, pubsub);
+    const signal = {
+      id: 'stable-owned-signal',
+      type: 'user-message' as const,
+      contents: 'initial wake input',
+      createdAt: new Date(),
+    };
+
+    const dispatched = runtime.sendSignal(
+      agent,
+      signal,
+      {
+        ...target,
+        runId,
+        ifIdle: { behavior: 'wake', streamOptions: { memory: target } as any },
+      },
+      pubsub,
+    );
+    await pubsub.publish(`agent.thread-stream.${encodeURIComponent(`${target.resourceId}\u0000${target.threadId}`)}`, {
+      type: 'signal-enqueued',
+      runId,
+      data: {
+        type: 'signal-enqueued',
+        runId,
+        signal,
+        sourceId: 'redelivering-runtime',
+      },
+    });
+    expect(runtime.drainPendingSignals(runId, pubsub)).toEqual([]);
+
+    releaseStream();
+    await expect(dispatched.accepted).resolves.toMatchObject({ action: 'wake', runId });
+    expect(agent.stream).toHaveBeenCalledTimes(1);
+    expect(runtime.abortRun(runId, pubsub)).toBe(true);
+    subscription.unsubscribe();
   });
 
   it('wakes a new run instead of delivering to a stale remote active run id', async () => {

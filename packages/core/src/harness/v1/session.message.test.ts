@@ -769,7 +769,7 @@ describe('Session.message() — default path', () => {
     class CompletedEvidenceFailingStorage extends InMemoryHarness {
       readonly writes: string[] = [];
 
-      override async writeMessageResultEvidence(record: any): Promise<{ created: boolean }> {
+      override async writeMessageResultEvidence(record: any): Promise<{ created: boolean; applied: boolean }> {
         this.writes.push(record.status);
         if (record.status === 'completed') throw new Error('completed evidence unavailable');
         return super.writeMessageResultEvidence(record);
@@ -808,7 +808,7 @@ describe('Session.message() — default path', () => {
       readonly writes: any[] = [];
       pendingAttempts = 0;
 
-      override async writeMessageResultEvidence(record: any): Promise<{ created: boolean }> {
+      override async writeMessageResultEvidence(record: any): Promise<{ created: boolean; applied: boolean }> {
         this.writes.push(record);
         if (record.admissionId === 'stream-pending-failure' && record.status === 'pending') {
           this.pendingAttempts++;
@@ -915,7 +915,7 @@ describe('Session.message() — default path', () => {
     class StallingFailedEvidenceStorage extends InMemoryHarness {
       pendingAttempts = 0;
 
-      override async writeMessageResultEvidence(record: any): Promise<{ created: boolean }> {
+      override async writeMessageResultEvidence(record: any): Promise<{ created: boolean; applied: boolean }> {
         if (record.admissionId === 'stream-pending-stalled-failure' && record.status === 'pending') {
           this.pendingAttempts++;
           if (this.pendingAttempts === 2) {

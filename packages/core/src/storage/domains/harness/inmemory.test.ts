@@ -1220,6 +1220,45 @@ describe('InMemoryHarness admission storage contract', () => {
       }),
     ).resolves.toMatchObject({ status: 'completed', result: { text: 'new' } });
   });
+
+  it('reports only the durable terminal evidence writer as applied', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const pending = {
+      harnessName: 'default',
+      sessionId: 'session-1',
+      resourceId: 'resource-1',
+      threadId: 'thread-1',
+      signalId: 'signal-1',
+      runId: 'run-1',
+      admissionId: 'admission-1',
+      admissionHash: 'hash-1',
+      status: 'pending' as const,
+      createdAt: 1000,
+      updatedAt: 1000,
+    };
+
+    await expect(storage.writeMessageResultEvidence(pending)).resolves.toEqual({
+      created: true,
+      applied: true,
+    });
+
+    const completed = {
+      ...pending,
+      status: 'completed' as const,
+      result: { text: 'done' },
+      updatedAt: 2000,
+    };
+    await expect(storage.writeMessageResultEvidence(completed)).resolves.toMatchObject({
+      created: false,
+      applied: true,
+      evidence: { status: 'completed', result: { text: 'done' } },
+    });
+    await expect(storage.writeMessageResultEvidence(completed)).resolves.toMatchObject({
+      created: false,
+      applied: false,
+      evidence: { status: 'completed', result: { text: 'done' } },
+    });
+  });
 });
 
 describe('InMemoryHarness provider callback binding ledger', () => {

@@ -1405,7 +1405,7 @@ describe('HarnessLibSQL message result evidence', () => {
         createdAt: 1000,
         updatedAt: 2000,
       }),
-    ).resolves.toEqual({ created: true });
+    ).resolves.toEqual({ created: true, applied: true });
 
     await expect(
       storage.writeMessageResultEvidence({
@@ -1426,6 +1426,7 @@ describe('HarnessLibSQL message result evidence', () => {
       }),
     ).resolves.toMatchObject({
       created: false,
+      applied: false,
       evidence: { admissionId: 'admission-1', admissionHash: 'hash-1', status: 'completed' },
     });
 
@@ -1445,6 +1446,7 @@ describe('HarnessLibSQL message result evidence', () => {
       }),
     ).resolves.toMatchObject({
       created: false,
+      applied: false,
       evidence: { admissionId: 'admission-1', admissionHash: 'hash-1', status: 'completed' },
     });
 

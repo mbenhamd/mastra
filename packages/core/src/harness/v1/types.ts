@@ -1904,7 +1904,9 @@ export interface SessionSignalOptions {
    * Optional idempotency key for retry-safe active interleaves and idle wakes.
    * Reusing the key with the same normalized payload returns the original
    * signal/run/result identity; reusing it with a different payload rejects
-   * before another signal is dispatched.
+   * before another signal is dispatched. If the admitted run suspends, its
+   * `result` remains pending until the resumed run completes or fails, so a
+   * retry observes the same terminal result before and after process restart.
    */
   admissionId?: string;
 

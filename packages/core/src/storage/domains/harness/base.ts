@@ -80,6 +80,8 @@ import type {
 
 export interface WriteMessageResultEvidenceResult {
   created: boolean;
+  /** True only when this write changed the durable evidence row. */
+  applied: boolean;
   evidence?: AgentSignalResultEvidence;
 }
 

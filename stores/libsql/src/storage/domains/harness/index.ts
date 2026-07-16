@@ -1515,7 +1515,7 @@ export class HarnessLibSQL extends HarnessStorage {
         }
         if (isTerminalMessageEvidence(current)) {
           await tx.commit();
-          return { created: false, evidence: current };
+          return { created: false, applied: false, evidence: current };
         }
         const updated = {
           ...namespacedRecord,
@@ -1539,7 +1539,7 @@ export class HarnessLibSQL extends HarnessStorage {
           ],
         });
         await tx.commit();
-        return { created: false, evidence: updated };
+        return { created: false, applied: true, evidence: updated };
       } else {
         created = true;
         await tx.execute({
@@ -1568,13 +1568,13 @@ export class HarnessLibSQL extends HarnessStorage {
         });
       }
       await tx.commit();
-      return { created };
+      return { created, applied: true };
     } catch (err) {
       if (!tx.closed) await tx.rollback();
       if (isUniqueConstraintError(err)) {
         const current = await loadCurrent();
         if (current && sameMessageEvidenceIdentity(current as AgentSignalResultEvidence, namespacedRecord)) {
-          return { created: false, evidence: current };
+          return { created: false, applied: false, evidence: current };
         }
         throw new HarnessStorageAdmissionConflictError(
           namespacedRecord.sessionId,
