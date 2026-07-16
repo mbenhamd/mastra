@@ -291,6 +291,7 @@ export function runMC<TState extends Record<string, unknown>>(options: RunMCOpti
     try {
       if (options.model) {
         const available = await controller.listAvailableModels();
+        if (settled) return;
         const match = available.find(m => m.id === options.model);
         if (!match) return fail(`Unknown model: "${options.model}"`);
         if (!match.hasApiKey) {
@@ -298,10 +299,12 @@ export function runMC<TState extends Record<string, unknown>>(options: RunMCOpti
           return fail(`Model "${options.model}" has no API key configured.${keyHint}`);
         }
         await session.model.switch({ modelId: options.model });
+        if (settled) return;
       } else if (options.mode) {
         const modelId = options.modeDefaults?.[options.mode];
         if (modelId) {
           const available = await controller.listAvailableModels();
+          if (settled) return;
           const match = available.find(m => m.id === modelId);
           if (!match) return fail(`Unknown model "${modelId}" configured for mode "${options.mode}"`);
           if (!match.hasApiKey) {
@@ -309,6 +312,7 @@ export function runMC<TState extends Record<string, unknown>>(options: RunMCOpti
             return fail(`Model "${modelId}" (mode: ${options.mode}) has no API key configured.${keyHint}`);
           }
           await session.model.switch({ modelId });
+          if (settled) return;
         }
         // No configured model for mode → fall through to default (no failure).
       }
@@ -445,10 +449,12 @@ export function runMC<TState extends Record<string, unknown>>(options: RunMCOpti
       const thread = options.thread;
       if (thread?.id) {
         const resolved = await resolveThread(session, thread.id);
+        if (settled) return;
         if ('error' in resolved) return fail(resolved.error);
         await session.thread.switch({ threadId: resolved.threadId });
       } else if (thread?.continueLatest) {
         const threads = await session.thread.list();
+        if (settled) return;
         if (threads.length > 0) {
           const sorted = [...threads].sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime());
           await session.thread.switch({ threadId: sorted[0]!.id });

@@ -139,6 +139,12 @@ interface FakeGoalHarnessOptions {
   maxTurns?: number;
   abortEvent?: AgentControllerEvent;
   policy?: ResolutionPolicy;
+  model?: string;
+  availableModels?: Promise<Array<{ id: string; hasApiKey: boolean; apiKeyEnvVar?: string }>>;
+  modelSwitch?: Promise<void>;
+  thinkingLevel?: 'high';
+  thread?: { id?: string; continueLatest?: boolean };
+  threadList?: Promise<Array<{ id: string; updatedAt: Date }>>;
 }
 
 function makeFakeGoalHarness(options: FakeGoalHarnessOptions = {}) {
@@ -164,6 +170,9 @@ function makeFakeGoalHarness(options: FakeGoalHarnessOptions = {}) {
   const controller = {
     getCurrentAgent: vi.fn(() => fakeAgent),
     setResourceId: vi.fn(),
+    listAvailableModels: vi.fn(
+      () => options.availableModels ?? Promise.resolve([{ id: options.model ?? 'mock-model', hasApiKey: true }]),
+    ),
   };
   const session = {
     subscribe: vi.fn((handler: (event: AgentControllerEvent) => void) => {
@@ -180,10 +189,18 @@ function makeFakeGoalHarness(options: FakeGoalHarnessOptions = {}) {
     }),
     respondToToolApproval: vi.fn(),
     respondToToolSuspension: vi.fn().mockResolvedValue(undefined),
+    model: {
+      switch: vi.fn(() => options.modelSwitch ?? Promise.resolve()),
+    },
+    state: {
+      set: vi.fn().mockResolvedValue(undefined),
+    },
     thread: {
       getId: vi.fn(() => 'thread-1'),
       getById: vi.fn().mockResolvedValue({ id: 'thread-1' }),
       create: vi.fn(),
+      list: vi.fn(() => options.threadList ?? Promise.resolve([])),
+      switch: vi.fn().mockResolvedValue(undefined),
     },
   };
   const goalManager = {
@@ -203,11 +220,15 @@ function makeFakeGoalHarness(options: FakeGoalHarnessOptions = {}) {
     ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
     ...(options.maxTurns !== undefined ? { maxTurns: options.maxTurns } : {}),
     ...(options.policy ? { policy: options.policy } : {}),
+    ...(options.model ? { model: options.model } : {}),
+    ...(options.thinkingLevel ? { thinkingLevel: options.thinkingLevel } : {}),
+    ...(options.thread ? { thread: options.thread } : {}),
   });
 
   return {
     run,
     started,
+    controller,
     session,
     unsubscribe,
     emit: (event: AgentControllerEvent) => listener?.(event),
@@ -427,6 +448,81 @@ describe('runMC', () => {
       harness.emit(goalEvaluationEvent({ status: 'paused' }));
       expect(await harness.run.result).toBe(result);
       expect(harness.unsubscribe).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not mutate setup after abort settles during a deferred model lookup', async () => {
+      const abortController = new AbortController();
+      let resolveModels!: (models: Array<{ id: string; hasApiKey: boolean }>) => void;
+      const availableModels = new Promise<Array<{ id: string; hasApiKey: boolean }>>(resolve => {
+        resolveModels = resolve;
+      });
+      const harness = makeFakeGoalHarness({
+        signal: abortController.signal,
+        model: 'mock-model',
+        availableModels,
+      });
+
+      expect(harness.controller.listAvailableModels).toHaveBeenCalledTimes(1);
+      abortController.abort();
+      const result = await harness.run.result;
+      resolveModels([{ id: 'mock-model', hasApiKey: true }]);
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(result.status).toBe('aborted');
+      expect(harness.session.model.switch).not.toHaveBeenCalled();
+      expect(harness.session.subscribe).not.toHaveBeenCalled();
+      expect(harness.session.sendSignal).not.toHaveBeenCalled();
+    });
+
+    it('does not continue setup after abort settles during a model switch', async () => {
+      const abortController = new AbortController();
+      let resolveSwitch!: () => void;
+      const modelSwitch = new Promise<void>(resolve => {
+        resolveSwitch = resolve;
+      });
+      const harness = makeFakeGoalHarness({
+        signal: abortController.signal,
+        model: 'mock-model',
+        modelSwitch,
+        thinkingLevel: 'high',
+      });
+      await vi.waitFor(() => expect(harness.session.model.switch).toHaveBeenCalledTimes(1));
+
+      abortController.abort();
+      const result = await harness.run.result;
+      resolveSwitch();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(result.status).toBe('aborted');
+      expect(harness.session.state.set).not.toHaveBeenCalled();
+      expect(harness.session.subscribe).not.toHaveBeenCalled();
+      expect(harness.session.sendSignal).not.toHaveBeenCalled();
+    });
+
+    it('does not switch threads after abort settles during a deferred thread lookup', async () => {
+      const abortController = new AbortController();
+      let resolveThreads!: (threads: Array<{ id: string; updatedAt: Date }>) => void;
+      const threadList = new Promise<Array<{ id: string; updatedAt: Date }>>(resolve => {
+        resolveThreads = resolve;
+      });
+      const harness = makeFakeGoalHarness({
+        signal: abortController.signal,
+        thread: { continueLatest: true },
+        threadList,
+      });
+
+      expect(harness.session.thread.list).toHaveBeenCalledTimes(1);
+      abortController.abort();
+      const result = await harness.run.result;
+      resolveThreads([{ id: 'newest-thread', updatedAt: new Date() }]);
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(result.status).toBe('aborted');
+      expect(harness.session.thread.switch).not.toHaveBeenCalled();
+      expect(harness.session.sendSignal).not.toHaveBeenCalled();
     });
 
     it('keeps maxTurns precedence when abort races a terminal goal evaluation', async () => {
