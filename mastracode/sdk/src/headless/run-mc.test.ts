@@ -407,7 +407,8 @@ describe('runMC', () => {
       expect(result.status).toBe('aborted');
       expect(harness.session.abort).toHaveBeenCalledTimes(1);
       expect(harness.session.sendSignal).not.toHaveBeenCalled();
-      expect(harness.unsubscribe).toHaveBeenCalledTimes(1);
+      expect(harness.session.subscribe).not.toHaveBeenCalled();
+      expect(harness.unsubscribe).not.toHaveBeenCalled();
     });
 
     it('settles an in-flight external abort exactly once', async () => {

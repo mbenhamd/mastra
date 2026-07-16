@@ -261,8 +261,10 @@ export function runMC<TState extends Record<string, unknown>>(options: RunMCOpti
 
   if (options.signal) {
     if (options.signal.aborted) {
-      // Defer so the caller can attach iteration / result handlers first.
-      queueMicrotask(() => abort());
+      // Settle before the asynchronous setup pipeline can switch models,
+      // mutate threads, or dispatch work. Promise reactions still run in a
+      // microtask, so callers can safely attach result/iteration handlers.
+      abort();
     } else {
       const onAbort = () => abort();
       options.signal.addEventListener('abort', onAbort, { once: true });
@@ -282,6 +284,7 @@ export function runMC<TState extends Record<string, unknown>>(options: RunMCOpti
 
   // Kick off the run asynchronously so the MCRun handle is returned synchronously.
   void (async () => {
+    if (settled) return;
     armTimeout();
 
     // --- Config resolution (model / mode / thinking) ---
