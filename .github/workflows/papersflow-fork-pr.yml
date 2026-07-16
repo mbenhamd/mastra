@@ -121,7 +121,8 @@ jobs:
           VALIDATION_LANE: ${{ steps.install-policy.outputs.lane }}
         run: |
           if [[ "$VALIDATION_LANE" == 'pf558-upstream-sync' || \
-            "$VALIDATION_LANE" == 'pf2009-upstream-sync' ]]; then
+            "$VALIDATION_LANE" == 'pf2009-upstream-sync' || \
+            "$VALIDATION_LANE" == 'pf2045-upstream-sync' ]]; then
             # Nested workspace manifests are part of the reconciled source
             # tree, not part of the exact pre-install allowlist. Suppress all
             # lifecycle scripts; validation executes only the explicit commands
@@ -170,17 +171,101 @@ jobs:
           fi
           /bin/bash "$pf2009_policy_script" --self-test-pf2009-upstream-sync
 
+          pf2045_policy_script="${RUNNER_TEMP}/pf2045-policy-self-test.bash"
+          if grep -Fq -- '--self-test-pf2045-upstream-sync' "$policy_script"; then
+            cp "$policy_script" "$pf2045_policy_script"
+          elif [[ "$HEAD_REPOSITORY" == "$GITHUB_REPOSITORY" && \
+            "$HEAD_REF" == 'ci/pf-2044-owned-validation-targets' && \
+            "$BASE_REF" == 'main' ]]; then
+            echo 'Bootstrapping the PF-2045 topology/tree fixtures from the PF-2044 policy branch.'
+            /usr/bin/git show "${HEAD_SHA}:${script_path}" > "$pf2045_policy_script"
+          else
+            echo 'The trusted base does not contain the PF-2045 admission fixtures.' >&2
+            exit 1
+          fi
+          /bin/bash "$pf2045_policy_script" --self-test-pf2045-upstream-sync
+
       - name: Start Redis test service
         run: |
           docker run --detach --name mastra-fork-redis --publish 6380:6379 \
             redis:8-alpine redis-server --requirepass redis_password
-          for attempt in {1..30}; do
+          for _attempt in {1..30}; do
             if docker exec mastra-fork-redis redis-cli -a redis_password ping 2>/dev/null | grep -q PONG; then
               exit 0
             fi
             sleep 1
           done
           docker logs mastra-fork-redis
+          exit 1
+
+      - name: Start Redis Streams test service when owned
+        env:
+          BASE_SHA: ${{ steps.trusted-base.outputs.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if git diff --quiet "${BASE_SHA}...${HEAD_SHA}" -- pubsub/redis-streams; then
+            echo 'Redis Streams workspace unchanged; no port 6381 service required.'
+            exit 0
+          fi
+          docker run --detach --name mastra-fork-redis-streams --publish 6381:6379 \
+            redis@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005
+          for _attempt in {1..30}; do
+            if docker exec mastra-fork-redis-streams redis-cli ping 2>/dev/null | grep -q PONG; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs mastra-fork-redis-streams
+          exit 1
+
+      - name: Start Google Cloud PubSub emulator when owned
+        env:
+          BASE_SHA: ${{ steps.trusted-base.outputs.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if git diff --quiet "${BASE_SHA}...${HEAD_SHA}" -- pubsub/google-cloud-pubsub; then
+            echo 'Google Cloud PubSub workspace unchanged; no emulator required.'
+            exit 0
+          fi
+          docker run --detach --name mastra-fork-pubsub-emulator --publish 8085:8085 \
+            gcr.io/google.com/cloudsdktool/google-cloud-cli@sha256:873834701bc92f5fd5052cd5f5e572246caaf24b3e3b79e741ba1b29f7a291c6 \
+            gcloud beta emulators pubsub start --host-port=0.0.0.0:8085
+          for _attempt in {1..60}; do
+            if timeout 1 bash -c '</dev/tcp/127.0.0.1/8085' 2>/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs mastra-fork-pubsub-emulator
+          exit 1
+
+      - name: Start pinned Inngest dev server when index suite is owned
+        env:
+          BASE_SHA: ${{ steps.trusted-base.outputs.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if git diff --quiet "${BASE_SHA}...${HEAD_SHA}" -- workflows/inngest/src/index.test.ts; then
+            echo 'Inngest index suite unchanged; no dev server required.'
+            exit 0
+          fi
+          # Do not execute the PR-controlled Compose file. The trusted workflow
+          # starts the exact reviewed image and endpoint topology; the validator
+          # separately parses the changed Compose file for the PF-2042 trio.
+          docker run --detach --name mastra-inngest-test \
+            --add-host host.docker.internal:host-gateway \
+            --publish 4200:4200 \
+            inngest/inngest@sha256:4e1a3ab68036114bbdf2208d3a3ab8a135a106bb39199bdef031794294e60852 \
+            inngest dev -p 4200 \
+              -u http://host.docker.internal:4201/inngest/api \
+              --poll-interval=1
+          for _attempt in {1..60}; do
+            if curl --fail --silent --show-error http://127.0.0.1:4200/dev >/dev/null 2>&1; then
+              echo 'MASTRA_INNGEST_TEST_DOCKER=1' >> "$GITHUB_ENV"
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs mastra-inngest-test
           exit 1
 
       - name: Validate fork PR
@@ -194,7 +279,21 @@ jobs:
           VALIDATION_LANE: ${{ steps.install-policy.outputs.lane }}
         run: |
           script_path=".github/scripts/run-papersflow-fork-pr-validation.bash"
-          if [[ "${HEAD_REPOSITORY}" == "${GITHUB_REPOSITORY}" && \
+          # Once PF-2044 is present on the protected base, always prefer that
+          # trusted copy. The exact branch bootstrap is only reachable while
+          # the protected base still lacks the PF-2045 marker.
+          if /usr/bin/git cat-file -e "${BASE_SHA}:${script_path}" && \
+            /usr/bin/git show "${BASE_SHA}:${script_path}" | \
+              grep -Fq -- '--self-test-pf2045-upstream-sync'; then
+            /usr/bin/git show "${BASE_SHA}:${script_path}" \
+              > "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash"
+          elif [[ "${HEAD_REPOSITORY}" == "${GITHUB_REPOSITORY}" && \
+            "${HEAD_REF}" == 'ci/pf-2044-owned-validation-targets' && \
+            "${BASE_REF}" == 'main' ]]; then
+            echo 'Bootstrapping the validator from the exact PF-2044 policy branch.'
+            /usr/bin/git show "${HEAD_SHA}:${script_path}" \
+              > "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash"
+          elif [[ "${HEAD_REPOSITORY}" == "${GITHUB_REPOSITORY}" && \
             "${PR_NUMBER}" == '278' && \
             "${HEAD_REF}" == 'ci/pf-2009-upstream-sync-validation' && \
             "${BASE_REF}" == 'main' ]]; then
@@ -221,7 +320,18 @@ jobs:
               /bin/bash "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash" \
                 --validate-pf2009-upstream-sync
               ;;
+            pf2045-upstream-sync)
+              /bin/bash "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash" \
+                --validate-pf2045-upstream-sync
+              ;;
             *)
               /bin/bash "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash"
               ;;
           esac
+
+      - name: Stop pinned Inngest dev server
+        if: always()
+        run: |
+          if docker container inspect mastra-inngest-test >/dev/null 2>&1; then
+            docker rm --force mastra-inngest-test
+          fi

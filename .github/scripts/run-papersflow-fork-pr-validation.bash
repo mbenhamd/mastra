@@ -50,6 +50,131 @@ pf2009_config() {
     PF2009_LOCKFILE_SHA256 PF2009_DEPENDENCY_GRAPH_SHA256
 }
 
+pf2042_config() {
+  PF2042_INNGEST_TEST_BLOB="${PAPERSFLOW_PF2042_INNGEST_TEST_BLOB:-f6ce426a4f389d45c2c5f345cca5b511b4a85885}"
+  PF2042_INNGEST_TEST_SHA256="${PAPERSFLOW_PF2042_INNGEST_TEST_SHA256:-f50ee827b50e669c16009ca492a87df81631e9ad8d65bd853d2fabacb5b56b34}"
+  PF2042_INNGEST_COMPOSE_BLOB="${PAPERSFLOW_PF2042_INNGEST_COMPOSE_BLOB:-db69236f8e87d48f192d889e0951b7b972105935}"
+  PF2042_INNGEST_COMPOSE_SHA256="${PAPERSFLOW_PF2042_INNGEST_COMPOSE_SHA256:-a71433863378c1bcb46a331598ee671efcb117e4d29ffb69d37f68c21b5ef267}"
+  PF2042_INNGEST_ADAPTER_BLOB="${PAPERSFLOW_PF2042_INNGEST_ADAPTER_BLOB:-1318d79a99dd7a19149cd14aadade33d99167b5c}"
+  PF2042_INNGEST_ADAPTER_SHA256="${PAPERSFLOW_PF2042_INNGEST_ADAPTER_SHA256:-260f3de91533e4234b0388c55ec8a55e985594bc882d14095372439d56dd61dc}"
+  readonly \
+    PF2042_INNGEST_TEST_BLOB PF2042_INNGEST_TEST_SHA256 \
+    PF2042_INNGEST_COMPOSE_BLOB PF2042_INNGEST_COMPOSE_SHA256 \
+    PF2042_INNGEST_ADAPTER_BLOB PF2042_INNGEST_ADAPTER_SHA256
+}
+
+pf2045_config() {
+  PF2045_HEAD_REPOSITORY="${PAPERSFLOW_PF2045_HEAD_REPOSITORY:-mbenhamd/mastra}"
+  PF2045_HEAD_REF="${PAPERSFLOW_PF2045_HEAD_REF:-feature/pf-2045-mastra-fork-merge-official-main-through-712b864a-before-the}"
+  PF2045_BASE_REF="${PAPERSFLOW_PF2045_BASE_REF:-main}"
+  PF2045_UPSTREAM_PARENT="${PAPERSFLOW_PF2045_UPSTREAM_PARENT:-712b864aa1ed12b14c54390ec17b69de163c37f7}"
+  PF2045_CONFLICT_STAGES="${PAPERSFLOW_PF2045_CONFLICT_STAGES:-$(cat <<'EOF'
+100644 a01701c323899b10e9c0145ae2f62c9f3a1b0f26 1	packages/server/src/server/handlers/agents.ts
+100644 c56099bdd0207548e7ae85c71e3eb9c0fd1a2b52 2	packages/server/src/server/handlers/agents.ts
+100644 7c0d9a104e449a8ae9770d507671415f8059eb48 3	packages/server/src/server/handlers/agents.ts
+100644 3cc4556f8fd061e8a15cb545f64257f7dd77f993 1	pnpm-lock.yaml
+100644 11f12c4885dc79ada34d724bb64e63f413f4eb2a 2	pnpm-lock.yaml
+100644 ed262980285eb65d820141cb4d2d2fd8e11d31dd 3	pnpm-lock.yaml
+100644 5ace0c307607cacf36f7b120549b492cf867dfac 1	pnpm-workspace.yaml
+100644 10c6a79cbf59cac968146ceae7c2e376471544af 2	pnpm-workspace.yaml
+100644 fa4157364d838a3d32e6b9f28b0d888121d73752 3	pnpm-workspace.yaml
+EOF
+)}"
+  PF2045_AGENTS_BLOB="${PAPERSFLOW_PF2045_AGENTS_BLOB:-2374de06de2e73898b31844ad6ae672dcb9fa537}"
+  PF2045_AGENTS_SHA256="${PAPERSFLOW_PF2045_AGENTS_SHA256:-d31254afb5b298b5df1b1f6ffac78d27bdd47aa04b3654304a9adc8b777d012b}"
+  PF2045_LOCKFILE_BLOB="${PAPERSFLOW_PF2045_LOCKFILE_BLOB:-ad0a3ec2019a15c71baaca0f8f333ae3987b3403}"
+  PF2045_LOCKFILE_SHA256="${PAPERSFLOW_PF2045_LOCKFILE_SHA256:-16c40e0d8b068a21893a6dcc5c80e3f41db3e63424151621c25f20427520a95c}"
+  PF2045_WORKSPACE_BLOB="${PAPERSFLOW_PF2045_WORKSPACE_BLOB:-10c6a79cbf59cac968146ceae7c2e376471544af}"
+  PF2045_WORKSPACE_SHA256="${PAPERSFLOW_PF2045_WORKSPACE_SHA256:-eeb02bff3f4b79eebca83103bf114f48c097a5d985ba72789a5a73a0408408fb}"
+  readonly \
+    PF2045_HEAD_REPOSITORY PF2045_HEAD_REF PF2045_BASE_REF PF2045_UPSTREAM_PARENT \
+    PF2045_CONFLICT_STAGES \
+    PF2045_AGENTS_BLOB PF2045_AGENTS_SHA256 PF2045_LOCKFILE_BLOB PF2045_LOCKFILE_SHA256 \
+    PF2045_WORKSPACE_BLOB PF2045_WORKSPACE_SHA256
+}
+
+verify_pf2045_reviewed_tree() (
+  : "${BASE_SHA:?BASE_SHA is required}"
+  : "${HEAD_SHA:?HEAD_SHA is required}"
+
+  local merge_tree_output merge_tree_status synthetic_tree expected_tree actual_tree
+  local expected_stages actual_stages temporary_index
+  local path blob expected_sha actual_sha head_entry
+
+  merge_tree_output="$(mktemp)"
+  expected_stages="$(mktemp)"
+  actual_stages="$(mktemp)"
+  temporary_index="$(mktemp)"
+  rm -f "$temporary_index"
+  trap 'rm -f "$merge_tree_output" "$expected_stages" "$actual_stages" "$temporary_index"' EXIT
+
+  set +e
+  git merge-tree --write-tree "$BASE_SHA" "$PF2045_UPSTREAM_PARENT" > "$merge_tree_output" 2>&1
+  merge_tree_status=$?
+  set -e
+  if (( merge_tree_status != 1 )); then
+    echo 'PF-2045 reviewed merge must produce exactly the three rehearsed content conflicts.' >&2
+    cat "$merge_tree_output" >&2
+    return 1
+  fi
+
+  synthetic_tree="$(sed -n '1p' "$merge_tree_output")"
+  if ! [[ "$synthetic_tree" =~ ^[0-9a-f]{40,64}$ ]] ||
+    [[ "$(git cat-file -t "$synthetic_tree" 2>/dev/null || true)" != tree ]]; then
+    echo 'PF-2045 merge-tree did not produce a valid synthetic tree.' >&2
+    cat "$merge_tree_output" >&2
+    return 1
+  fi
+
+  printf '%s\n' "$PF2045_CONFLICT_STAGES" | LC_ALL=C sort > "$expected_stages"
+  sed -nE '/^100644 [0-9a-f]{40,64} [123]\t.*$/p' "$merge_tree_output" |
+    LC_ALL=C sort > "$actual_stages"
+  if ! cmp -s "$expected_stages" "$actual_stages" ||
+    [[ "$(grep -Ec $'^[0-9]{6} [0-9a-f]{40,64} [123]\t' "$merge_tree_output" || true)" != 9 ]]; then
+    echo 'PF-2045 merge conflict inputs differ from the nine reviewed base/ours/theirs blobs.' >&2
+    diff -u "$expected_stages" "$actual_stages" >&2 || true
+    cat "$merge_tree_output" >&2
+    return 1
+  fi
+
+  while IFS='|' read -r path blob expected_sha; do
+    if [[ "$(git cat-file -t "$blob" 2>/dev/null || true)" != blob ]]; then
+      echo "PF-2045 reviewed resolution blob is unavailable: $path ($blob)" >&2
+      return 1
+    fi
+    actual_sha="$(git cat-file blob "$blob" | sha256sum | awk '{print $1}')"
+    if [[ "$actual_sha" != "$expected_sha" ]]; then
+      echo "PF-2045 reviewed resolution SHA-256 mismatch: $path" >&2
+      return 1
+    fi
+    head_entry="$(git ls-tree "$HEAD_SHA" -- "$path")"
+    if [[ "$head_entry" != $'100644 blob '"$blob"$'\t'"$path" ]]; then
+      echo "PF-2045 head does not contain the reviewed regular-file resolution: $path" >&2
+      return 1
+    fi
+  done <<EOF
+packages/server/src/server/handlers/agents.ts|$PF2045_AGENTS_BLOB|$PF2045_AGENTS_SHA256
+pnpm-lock.yaml|$PF2045_LOCKFILE_BLOB|$PF2045_LOCKFILE_SHA256
+pnpm-workspace.yaml|$PF2045_WORKSPACE_BLOB|$PF2045_WORKSPACE_SHA256
+EOF
+
+  GIT_INDEX_FILE="$temporary_index" git read-tree "$synthetic_tree"
+  GIT_INDEX_FILE="$temporary_index" git update-index --add --cacheinfo \
+    100644 "$PF2045_AGENTS_BLOB" packages/server/src/server/handlers/agents.ts
+  GIT_INDEX_FILE="$temporary_index" git update-index --add --cacheinfo \
+    100644 "$PF2045_LOCKFILE_BLOB" pnpm-lock.yaml
+  GIT_INDEX_FILE="$temporary_index" git update-index --add --cacheinfo \
+    100644 "$PF2045_WORKSPACE_BLOB" pnpm-workspace.yaml
+  expected_tree="$(GIT_INDEX_FILE="$temporary_index" git write-tree)"
+  actual_tree="$(git rev-parse "$HEAD_SHA^{tree}")"
+  if [[ "$actual_tree" != "$expected_tree" ]]; then
+    echo 'PF-2045 head tree does not match the reconstructed reviewed merge tree.' >&2
+    echo "expected: $expected_tree" >&2
+    echo "actual:   $actual_tree" >&2
+    return 1
+  fi
+)
+
 git_blob_sha256() {
   local revision="$1"
   local path="$2"
@@ -60,6 +185,63 @@ git_regular_file_at_revision() {
   local revision="$1"
   local path="$2"
   git ls-tree "$revision" -- "$path" | grep -Eq '^100(644|755) blob '
+}
+
+verify_reviewed_regular_blob() {
+  local revision="$1"
+  local path="$2"
+  local expected_blob="$3"
+  local expected_sha="$4"
+  local entry actual_sha
+
+  entry="$(git ls-tree "$revision" -- "$path")"
+  if [[ "$entry" != $'100644 blob '"$expected_blob"$'\t'"$path" ]]; then
+    echo "Reviewed regular-file content mismatch: $path" >&2
+    return 1
+  fi
+  actual_sha="$(git cat-file blob "$expected_blob" | sha256sum | awk '{print $1}')"
+  if [[ "$actual_sha" != "$expected_sha" ]]; then
+    echo "Reviewed regular-file SHA-256 mismatch: $path" >&2
+    return 1
+  fi
+}
+
+verify_pf2042_inngest_topology() {
+  : "${HEAD_SHA:?HEAD_SHA is required}"
+  pf2042_config
+
+  verify_reviewed_regular_blob \
+    "$HEAD_SHA" workflows/inngest/src/index.test.ts \
+    "$PF2042_INNGEST_TEST_BLOB" "$PF2042_INNGEST_TEST_SHA256"
+  verify_reviewed_regular_blob \
+    "$HEAD_SHA" workflows/inngest/docker-compose.yaml \
+    "$PF2042_INNGEST_COMPOSE_BLOB" "$PF2042_INNGEST_COMPOSE_SHA256"
+  verify_reviewed_regular_blob \
+    "$HEAD_SHA" workflows/inngest/src/__tests__/adapters/_utils.ts \
+    "$PF2042_INNGEST_ADAPTER_BLOB" "$PF2042_INNGEST_ADAPTER_SHA256"
+
+  node - <<'NODE'
+const fs = require('node:fs');
+const compose = fs.readFileSync('workflows/inngest/docker-compose.yaml', 'utf8');
+const adapter = fs.readFileSync('workflows/inngest/src/__tests__/adapters/_utils.ts', 'utf8');
+const test = fs.readFileSync('workflows/inngest/src/index.test.ts', 'utf8');
+const requiredCompose = [
+  'image: inngest/inngest:v1.34.0',
+  'container_name: mastra-inngest-test',
+  'command: inngest dev -p 4200 -u http://host.docker.internal:4201/inngest/api --poll-interval=1',
+  "- '4200:4200'",
+  "- 'host.docker.internal:host-gateway'",
+];
+for (const fragment of requiredCompose) {
+  if (!compose.includes(fragment)) throw new Error(`PF-2042 Compose topology is missing: ${fragment}`);
+}
+for (const fragment of ['export const INNGEST_PORT = 4200;', 'export const HANDLER_PORT = 4201;']) {
+  if (!adapter.includes(fragment)) throw new Error(`PF-2042 adapter topology is missing: ${fragment}`);
+}
+if (!test.includes('createLocalTestEndpoints({ inngestPort: 4200, handlerPort: 4201 })')) {
+  throw new Error('PF-2042 index suite does not derive its local endpoints from 4200/4201.');
+}
+NODE
 }
 
 git_dependency_graph_sha256() {
@@ -104,6 +286,34 @@ classify_install_lane() (
     .npmrc .pnpmfile.cjs pnpmfile.cjs package.json pnpm-workspace.yaml \
     patches packages/server/package.json |
     sort -u > "$manifest_changes"
+
+  # PF-2045 is topology- and tree-bound. Its future merge commit hash cannot be
+  # pinned before this policy lands, so admission reconstructs the merge from
+  # the current protected-base tip and reviewed upstream parent, substitutes
+  # only the three rehearsed resolution blobs, and requires the checked head to
+  # have that exact tree. The lane installs with hooks and lifecycle scripts
+  # disabled and runs only the explicit trusted-base validation plan below.
+  pf2045_config
+  if [[ "${HEAD_REPOSITORY:-}" == "$PF2045_HEAD_REPOSITORY" && \
+    "${HEAD_REF:-}" == "$PF2045_HEAD_REF" && "${BASE_REF:-}" == "$PF2045_BASE_REF" ]]; then
+    local merge_topology
+    merge_topology="$(git rev-list --parents -n 1 "$HEAD_SHA")"
+    if [[ "$merge_topology" != "$HEAD_SHA $BASE_SHA $PF2045_UPSTREAM_PARENT" ]]; then
+      echo 'PF-2045 head is not the exact reviewed two-parent upstream merge topology.' >&2
+      echo "expected: $HEAD_SHA $BASE_SHA $PF2045_UPSTREAM_PARENT" >&2
+      echo "actual:   $merge_topology" >&2
+      return 1
+    fi
+    if ! git merge-base --is-ancestor "$PF2045_UPSTREAM_PARENT" "$HEAD_SHA"; then
+      echo 'PF-2045 does not contain the reviewed official upstream parent.' >&2
+      return 1
+    fi
+    verify_pf2045_reviewed_tree
+
+    echo 'PF-2045 exact two-parent upstream merge and reconstructed tree accepted from trusted base policy.'
+    emit_validation_lane pf2045-upstream-sync
+    return
+  fi
 
   if [[ ! -s "$manifest_changes" ]]; then
     emit_validation_lane standard
@@ -528,6 +738,189 @@ run_pf2009_admission_self_tests() (
   echo 'PF-2009 upstream-sync admission fixtures passed.'
 )
 
+run_pf2045_admission_self_tests() (
+  local script_path test_root fixture_repo common_sha base_sha upstream_parent head_sha output
+  local octopus_head non_merge_head forged_tree forged_head extra_parent drift_base drift_head
+  local agents_blob agents_sha lockfile_blob lockfile_sha workspace_blob workspace_sha
+  local fixture_conflict_stages path
+  script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+  test_root="$(mktemp -d)"
+  fixture_repo="$test_root/repo"
+  pf2045_fixture_cleanup() {
+    local status=$?
+    trap - EXIT
+    if (( status != 0 )); then
+      echo 'PF-2045 admission fixture failed; captured classifier output follows:' >&2
+      find "$test_root" -maxdepth 1 -type f -name '*.log' -print -exec sed -n '1,240p' {} \; >&2 || true
+    fi
+    rm -rf -- "$test_root"
+    exit "$status"
+  }
+  trap pf2045_fixture_cleanup EXIT
+
+  mkdir -p "$fixture_repo"
+  git -C "$fixture_repo" init -q -b main
+  git -C "$fixture_repo" config user.email validator@example.invalid
+  git -C "$fixture_repo" config user.name 'PF-2045 admission fixture'
+  printf '{"name":"fixture"}\n' > "$fixture_repo/package.json"
+  mkdir -p "$fixture_repo/packages/server/src/server/handlers"
+  printf 'export const options = { memory: clientMemory };\n' \
+    > "$fixture_repo/packages/server/src/server/handlers/agents.ts"
+  printf 'packages: []\nproviderUtils: old\n' > "$fixture_repo/pnpm-workspace.yaml"
+  printf 'lockfileVersion: 9.0\ngraph: old\n' > "$fixture_repo/pnpm-lock.yaml"
+  git -C "$fixture_repo" add .
+  git -C "$fixture_repo" commit -q -m common
+  common_sha="$(git -C "$fixture_repo" rev-parse HEAD)"
+
+  printf 'export const options = { ...params, requestContext };\n' \
+    > "$fixture_repo/packages/server/src/server/handlers/agents.ts"
+  printf 'packages: []\nproviderUtils: vitest-4.1.10\n' > "$fixture_repo/pnpm-workspace.yaml"
+  printf 'lockfileVersion: 9.0\ngraph: fork\n' > "$fixture_repo/pnpm-lock.yaml"
+  git -C "$fixture_repo" commit -q -am fork
+  base_sha="$(git -C "$fixture_repo" rev-parse HEAD)"
+
+  git -C "$fixture_repo" switch -q -c upstream "$common_sha"
+  printf 'export const options = { ...params, memory: authorizedMemoryOption };\n' \
+    > "$fixture_repo/packages/server/src/server/handlers/agents.ts"
+  printf 'packages: []\nproviderUtils: adds-3.0.28\n' > "$fixture_repo/pnpm-workspace.yaml"
+  printf 'lockfileVersion: 9.0\ngraph: upstream\n' > "$fixture_repo/pnpm-lock.yaml"
+  git -C "$fixture_repo" commit -q -am upstream
+  upstream_parent="$(git -C "$fixture_repo" rev-parse HEAD)"
+  non_merge_head="$upstream_parent"
+
+  git -C "$fixture_repo" switch -q main
+  if git -C "$fixture_repo" merge -q --no-ff --no-commit upstream; then
+    echo 'PF-2045 fixture unexpectedly merged without the three reviewed conflicts.' >&2
+    return 1
+  fi
+  printf 'export const options = { ...params, requestContext, memory: authorizedMemoryOption };\n' \
+    > "$fixture_repo/packages/server/src/server/handlers/agents.ts"
+  printf 'packages: []\nproviderUtils: vitest-4.1.10-and-3.0.28\n' > "$fixture_repo/pnpm-workspace.yaml"
+  printf 'lockfileVersion: 9.0\ngraph: reconciled\n' > "$fixture_repo/pnpm-lock.yaml"
+  git -C "$fixture_repo" add \
+    packages/server/src/server/handlers/agents.ts pnpm-workspace.yaml pnpm-lock.yaml
+  git -C "$fixture_repo" commit -q -m 'PF-2045 upstream merge'
+  head_sha="$(git -C "$fixture_repo" rev-parse HEAD)"
+  agents_blob="$(git -C "$fixture_repo" rev-parse "$head_sha:packages/server/src/server/handlers/agents.ts")"
+  agents_sha="$(git -C "$fixture_repo" show "$head_sha:packages/server/src/server/handlers/agents.ts" | sha256sum | awk '{print $1}')"
+  lockfile_blob="$(git -C "$fixture_repo" rev-parse "$head_sha:pnpm-lock.yaml")"
+  lockfile_sha="$(git -C "$fixture_repo" show "$head_sha:pnpm-lock.yaml" | sha256sum | awk '{print $1}')"
+  workspace_blob="$(git -C "$fixture_repo" rev-parse "$head_sha:pnpm-workspace.yaml")"
+  workspace_sha="$(git -C "$fixture_repo" show "$head_sha:pnpm-workspace.yaml" | sha256sum | awk '{print $1}')"
+  fixture_conflict_stages="$({
+    for path in \
+      packages/server/src/server/handlers/agents.ts \
+      pnpm-lock.yaml \
+      pnpm-workspace.yaml; do
+      printf '100644 %s 1\t%s\n' "$(git -C "$fixture_repo" rev-parse "$common_sha:$path")" "$path"
+      printf '100644 %s 2\t%s\n' "$(git -C "$fixture_repo" rev-parse "$base_sha:$path")" "$path"
+      printf '100644 %s 3\t%s\n' "$(git -C "$fixture_repo" rev-parse "$upstream_parent:$path")" "$path"
+    done
+  } | LC_ALL=C sort)"
+
+  run_fixture_admission() {
+    local fixture_head="$1"
+    local fixture_output="$2"
+    shift 2
+    (
+      cd "$fixture_repo"
+      env \
+        GITHUB_OUTPUT= \
+        BASE_SHA="$base_sha" HEAD_SHA="$fixture_head" PR_NUMBER=999 \
+        HEAD_REPOSITORY=mbenhamd/mastra \
+        HEAD_REF=feature/pf-2045-mastra-fork-merge-official-main-through-712b864a-before-the \
+        BASE_REF=main \
+        PAPERSFLOW_PF2045_UPSTREAM_PARENT="$upstream_parent" \
+        PAPERSFLOW_PF2045_CONFLICT_STAGES="$fixture_conflict_stages" \
+        PAPERSFLOW_PF2045_AGENTS_BLOB="$agents_blob" \
+        PAPERSFLOW_PF2045_AGENTS_SHA256="$agents_sha" \
+        PAPERSFLOW_PF2045_LOCKFILE_BLOB="$lockfile_blob" \
+        PAPERSFLOW_PF2045_LOCKFILE_SHA256="$lockfile_sha" \
+        PAPERSFLOW_PF2045_WORKSPACE_BLOB="$workspace_blob" \
+        PAPERSFLOW_PF2045_WORKSPACE_SHA256="$workspace_sha" \
+        "$@" bash "$script_path" --classify-install
+    ) > "$fixture_output" 2>&1
+  }
+
+  output="$test_root/approved.log"
+  run_fixture_admission "$head_sha" "$output"
+  grep -Fxq 'lane=pf2045-upstream-sync' "$output"
+
+  git -C "$fixture_repo" switch -q main
+  printf 'not part of the reviewed merge\n' > "$fixture_repo/forged.txt"
+  git -C "$fixture_repo" add forged.txt
+  forged_tree="$(git -C "$fixture_repo" write-tree)"
+  forged_head="$(printf 'forged same-parent tree\n' | git -C "$fixture_repo" commit-tree \
+    "$forged_tree" -p "$base_sha" -p "$upstream_parent")"
+  git -C "$fixture_repo" reset -q --hard "$head_sha"
+  output="$test_root/forged-tree.log"
+  if run_fixture_admission "$forged_head" "$output"; then
+    echo 'PF-2045 forged tree with the reviewed parents unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'does not match the reconstructed reviewed merge tree' "$output"
+
+  git -C "$fixture_repo" switch -q -c drift-base "$base_sha"
+  printf 'export const options = { ...params, requestContext, forkGuard: true };\n' \
+    > "$fixture_repo/packages/server/src/server/handlers/agents.ts"
+  git -C "$fixture_repo" commit -q -am 'advance protected base conflict input'
+  drift_base="$(git -C "$fixture_repo" rev-parse HEAD)"
+  drift_head="$(printf 'discarded protected-base guard\n' | git -C "$fixture_repo" commit-tree \
+    "$head_sha^{tree}" -p "$drift_base" -p "$upstream_parent")"
+  output="$test_root/base-stage-drift.log"
+  if run_fixture_admission "$drift_head" "$output" BASE_SHA="$drift_base"; then
+    echo 'PF-2045 merge that discarded a newer protected-base conflict input unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'merge conflict inputs differ from the nine reviewed' "$output"
+
+  output="$test_root/wrong-upstream-parent.log"
+  if run_fixture_admission "$head_sha" "$output" PAPERSFLOW_PF2045_UPSTREAM_PARENT="$base_sha"; then
+    echo 'Wrong PF-2045 upstream parent unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'not the exact reviewed two-parent upstream merge topology' "$output"
+
+  output="$test_root/wrong-first-parent.log"
+  if run_fixture_admission "$head_sha" "$output" BASE_SHA="$upstream_parent"; then
+    echo 'Wrong PF-2045 first parent unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'not the exact reviewed two-parent upstream merge topology' "$output"
+
+  git -C "$fixture_repo" switch -q main
+  git -C "$fixture_repo" reset -q --hard "$base_sha"
+  git -C "$fixture_repo" switch -q -c extra
+  printf 'extra\n' > "$fixture_repo/extra.txt"
+  git -C "$fixture_repo" add extra.txt
+  git -C "$fixture_repo" commit -q -m extra
+  extra_parent="$(git -C "$fixture_repo" rev-parse HEAD)"
+  octopus_head="$(printf 'unreviewed octopus merge\n' | git -C "$fixture_repo" commit-tree \
+    "$head_sha^{tree}" -p "$base_sha" -p "$upstream_parent" -p "$extra_parent")"
+  output="$test_root/extra-parent.log"
+  if run_fixture_admission "$octopus_head" "$output"; then
+    echo 'PF-2045 octopus merge unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'not the exact reviewed two-parent upstream merge topology' "$output"
+
+  output="$test_root/wrong-metadata.log"
+  if run_fixture_admission "$head_sha" "$output" HEAD_REF=feature/not-pf-2045; then
+    echo 'Wrong PF-2045 branch metadata unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'do not match a reviewed upstream-sync lane' "$output"
+
+  output="$test_root/non-merge-head.log"
+  if run_fixture_admission "$non_merge_head" "$output" BASE_SHA="$base_sha"; then
+    echo 'Non-merge PF-2045 head unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'not the exact reviewed two-parent upstream merge topology' "$output"
+
+  echo 'PF-2045 upstream-sync topology and reconstructed-tree admission fixtures passed.'
+)
+
 case "${1:-}" in
   --classify-install)
     classify_install_lane
@@ -541,6 +934,14 @@ case "${1:-}" in
     run_pf2009_admission_self_tests
     exit
     ;;
+  --self-test-pf2045-upstream-sync)
+    run_pf2045_admission_self_tests
+    exit
+    ;;
+  --validate-pf2042-reviewed-topology)
+    verify_pf2042_inngest_topology
+    exit
+    ;;
 esac
 
 run_validator_self_tests() {
@@ -549,8 +950,14 @@ run_validator_self_tests() {
   local fixture_repo
   local mock_bin
   local command_log
+  local docker_log
+  local service_log
   local base_sha
   local head_sha
+  local inngest_trio_head_sha
+  local fixture_inngest_test_blob fixture_inngest_test_sha
+  local fixture_inngest_compose_blob fixture_inngest_compose_sha
+  local fixture_inngest_adapter_blob fixture_inngest_adapter_sha
   local output
   local status
 
@@ -561,6 +968,8 @@ run_validator_self_tests() {
   fixture_repo="$test_root/repo"
   mock_bin="$test_root/bin"
   command_log="$test_root/pnpm.log"
+  docker_log="$test_root/docker.log"
+  service_log="$test_root/services.log"
   mkdir -p \
     "$fixture_repo/client-sdks/client-js/src/resources" \
     "$fixture_repo/packages/cli/src/commands/api" \
@@ -569,6 +978,12 @@ run_validator_self_tests() {
     "$fixture_repo/packages/core/src/harness/v1" \
     "$fixture_repo/packages/server/src/server/handlers" \
     "$fixture_repo/packages/server/src/server/server-adapter/routes" \
+    "$fixture_repo/pubsub/google-cloud-pubsub/src" \
+    "$fixture_repo/pubsub/redis-streams/src" \
+    "$fixture_repo/stores/convex/src/cache" \
+    "$fixture_repo/stores/convex/src/server" \
+    "$fixture_repo/workflows/inngest/src/__tests__/adapters" \
+    "$fixture_repo/workflows/inngest/src" \
     "$fixture_repo/node_modules" \
     "$mock_bin"
   # The production validator is copied to RUNNER_TEMP and resolves TypeScript
@@ -604,6 +1019,13 @@ run_validator_self_tests() {
     'done' \
     >> "$mock_bin/pnpm"
   chmod +x "$mock_bin/pnpm"
+  # Expanded only inside the emitted mock.
+  # shellcheck disable=SC2016
+  printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' \
+    'printf '\''%s\n'\'' "$*" >> "${MOCK_DOCKER_LOG:?}"' \
+    'if [[ "${MOCK_DOCKER_FAIL:-0}" == 1 ]]; then exit 19; fi' \
+    > "$mock_bin/docker"
+  chmod +x "$mock_bin/docker"
 
   (
     cd "$fixture_repo"
@@ -622,6 +1044,30 @@ run_validator_self_tests() {
       > packages/core/src/auth/ee/interfaces/permissions.generated.ts
     printf '%s\n' '{}' > packages/server/package.json
     printf '%s\n' 'export default {};' > packages/server/vitest.config.ts
+    printf '%s\n' '{}' > pubsub/google-cloud-pubsub/package.json
+    printf '%s\n' 'export const googleCloudPubSub = true;' > pubsub/google-cloud-pubsub/src/index.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('google pubsub', () => {});" \
+      > pubsub/google-cloud-pubsub/src/group.test.ts
+    printf '%s\n' '{}' > pubsub/redis-streams/package.json
+    printf '%s\n' 'export const redisStreams = true;' > pubsub/redis-streams/src/index.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('redis streams', () => {});" \
+      > pubsub/redis-streams/src/pubsub.test.ts
+    printf '%s\n' 'services:' '  redis:' '    image: redis:8-alpine' \
+      > pubsub/redis-streams/docker-compose.yaml
+    printf '%s\n' '{}' > stores/convex/package.json
+    printf '%s\n' 'export const convexCache = true;' > stores/convex/src/cache/index.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('convex cache', () => {});" \
+      > stores/convex/src/cache/index.test.ts
+    printf '%s\n' 'export const convexServerCache = true;' > stores/convex/src/server/cache.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('convex server cache', () => {});" \
+      > stores/convex/src/server/cache.test.ts
+    printf '%s\n' '{}' > workflows/inngest/package.json
+    printf '%s\n' 'services:' '  inngest:' '    image: inngest/inngest:v1.13.1' \
+      > workflows/inngest/docker-compose.yaml
+    printf '%s\n' 'export const adapterInngestPort = 43123;' \
+      > workflows/inngest/src/__tests__/adapters/_utils.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('self-hosting inngest', () => {});" \
+      > workflows/inngest/src/index.test.ts
     printf '%s\n' "export const route = 'base';" > packages/server/src/server/server-adapter/routes/index.ts
     printf '%s\n' 'export type RouteTypes = { source: "base" };' \
       'export type HarnessRoute = { source: "base" };' \
@@ -668,6 +1114,8 @@ run_validator_self_tests() {
       env \
         PATH="$mock_bin:$PATH" \
         MOCK_PNPM_LOG="$command_log" \
+        MOCK_DOCKER_LOG="$docker_log" \
+        MOCK_SERVICE_LOG="$service_log" \
         BASE_SHA="$base_sha" \
         HEAD_SHA="$fixture_head" \
         "$@" \
@@ -680,6 +1128,16 @@ run_validator_self_tests() {
     local file="$2"
     if ! grep -Fq -- "$expected" "$file"; then
       echo "Expected fixture output to contain: $expected" >&2
+      cat "$file" >&2
+      exit 1
+    fi
+  }
+
+  assert_not_contains() {
+    local unexpected="$1"
+    local file="$2"
+    if grep -Fq -- "$unexpected" "$file"; then
+      echo "Expected fixture output not to contain: $unexpected" >&2
       cat "$file" >&2
       exit 1
     fi
@@ -1375,6 +1833,415 @@ run_validator_self_tests() {
   assert_contains 'packages/server/src/server/handlers/external.integration.test.ts' "$output"
   assert_contains 'Failing closed instead of reporting incomplete validation as successful.' "$output"
 
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      'services:' \
+      '  inngest-test:' \
+      '    image: inngest/inngest:v1.34.0' \
+      '    container_name: mastra-inngest-test' \
+      '    command: inngest dev -p 4200 -u http://host.docker.internal:4201/inngest/api --poll-interval=1' \
+      '    ports:' \
+      "      - '4200:4200'" \
+      '    extra_hosts:' \
+      "      - 'host.docker.internal:host-gateway'" \
+      > workflows/inngest/docker-compose.yaml
+    printf '%s\n' \
+      'export const INNGEST_PORT = 4200;' \
+      'export const HANDLER_PORT = 4201;' \
+      > workflows/inngest/src/__tests__/adapters/_utils.ts
+    printf '%s\n' \
+      "import { it } from 'vitest';" \
+      'const createLocalTestEndpoints = (ports: unknown) => ports;' \
+      'const LOCAL_TEST_ENDPOINTS = createLocalTestEndpoints({ inngestPort: 4200, handlerPort: 4201 });' \
+      "it('fixed self-hosting topology', () => LOCAL_TEST_ENDPOINTS);" \
+      > workflows/inngest/src/index.test.ts
+    git add .
+    git commit -q -m 'paired Inngest self-hosting topology change'
+    git rev-parse HEAD
+  )"
+  inngest_trio_head_sha="$head_sha"
+  fixture_inngest_test_blob="$(git -C "$fixture_repo" rev-parse "$head_sha:workflows/inngest/src/index.test.ts")"
+  fixture_inngest_test_sha="$(git -C "$fixture_repo" show "$head_sha:workflows/inngest/src/index.test.ts" | sha256sum | awk '{print $1}')"
+  fixture_inngest_compose_blob="$(git -C "$fixture_repo" rev-parse "$head_sha:workflows/inngest/docker-compose.yaml")"
+  fixture_inngest_compose_sha="$(git -C "$fixture_repo" show "$head_sha:workflows/inngest/docker-compose.yaml" | sha256sum | awk '{print $1}')"
+  fixture_inngest_adapter_blob="$(git -C "$fixture_repo" rev-parse "$head_sha:workflows/inngest/src/__tests__/adapters/_utils.ts")"
+  fixture_inngest_adapter_sha="$(git -C "$fixture_repo" show "$head_sha:workflows/inngest/src/__tests__/adapters/_utils.ts" | sha256sum | awk '{print $1}')"
+  : > "$command_log"
+  : > "$docker_log"
+  : > "$service_log"
+  output="$test_root/inngest-paired-topology-success.log"
+  run_fixture "$head_sha" "$output" \
+    PAPERSFLOW_PF2042_INNGEST_TEST_BLOB="$fixture_inngest_test_blob" \
+    PAPERSFLOW_PF2042_INNGEST_TEST_SHA256="$fixture_inngest_test_sha" \
+    PAPERSFLOW_PF2042_INNGEST_COMPOSE_BLOB="$fixture_inngest_compose_blob" \
+    PAPERSFLOW_PF2042_INNGEST_COMPOSE_SHA256="$fixture_inngest_compose_sha" \
+    PAPERSFLOW_PF2042_INNGEST_ADAPTER_BLOB="$fixture_inngest_adapter_blob" \
+    PAPERSFLOW_PF2042_INNGEST_ADAPTER_SHA256="$fixture_inngest_adapter_sha"
+  assert_contains 'compose -f workflows/inngest/docker-compose.yaml config --quiet' "$docker_log"
+  assert_contains 'PF-2042 exact Inngest test/Compose/adapter trio: deferring the package-wide typecheck and build baseline to PF-2051.' "$output"
+  assert_contains 'exec eslint workflows/inngest/src/index.test.ts workflows/inngest/src/__tests__/adapters/_utils.ts' "$command_log"
+  assert_contains '--filter ./packages/deployer --fail-if-no-match build:lib' "$command_log"
+  assert_contains '--filter ./stores/libsql --fail-if-no-match build:lib' "$command_log"
+  assert_contains '--filter ./observability/mastra --fail-if-no-match build' "$command_log"
+  assert_contains 'inngest-dev-server 127.0.0.1:4200' "$service_log"
+  assert_not_contains '--filter ./workflows/inngest --fail-if-no-match exec tsc --noEmit' "$command_log"
+  assert_not_contains '--filter ./workflows/inngest --fail-if-no-match build' "$command_log"
+  assert_not_contains '--filter ./workflows/inngest --fail-if-no-match lint' "$command_log"
+  assert_contains '--dir workflows/inngest exec vitest run --reporter=dot --reporter=json' "$command_log"
+  assert_contains 'src/index.test.ts' "$command_log"
+
+  : > "$command_log"
+  : > "$docker_log"
+  output="$test_root/inngest-invalid-compose-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output" \
+    PAPERSFLOW_PF2042_INNGEST_TEST_BLOB="$fixture_inngest_test_blob" \
+    PAPERSFLOW_PF2042_INNGEST_TEST_SHA256="$fixture_inngest_test_sha" \
+    PAPERSFLOW_PF2042_INNGEST_COMPOSE_BLOB="$fixture_inngest_compose_blob" \
+    PAPERSFLOW_PF2042_INNGEST_COMPOSE_SHA256="$fixture_inngest_compose_sha" \
+    PAPERSFLOW_PF2042_INNGEST_ADAPTER_BLOB="$fixture_inngest_adapter_blob" \
+    PAPERSFLOW_PF2042_INNGEST_ADAPTER_SHA256="$fixture_inngest_adapter_sha" \
+    MOCK_DOCKER_FAIL=1
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Invalid Inngest Compose fixture unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'compose -f workflows/inngest/docker-compose.yaml config --quiet' "$docker_log"
+  if [[ -s "$command_log" ]]; then
+    echo 'Invalid Inngest Compose fixture executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$inngest_trio_head_sha"
+    sed -i \
+      -e 's/dev -p 4200/dev -p 43123/' \
+      -e "s/'4200:4200'/'43123:43123'/" \
+      workflows/inngest/docker-compose.yaml
+    git add .
+    git commit -q -m 'misalign reviewed Inngest topology'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  : > "$docker_log"
+  output="$test_root/inngest-misaligned-topology-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output" \
+    PAPERSFLOW_PF2042_INNGEST_TEST_BLOB="$fixture_inngest_test_blob" \
+    PAPERSFLOW_PF2042_INNGEST_TEST_SHA256="$fixture_inngest_test_sha" \
+    PAPERSFLOW_PF2042_INNGEST_COMPOSE_BLOB="$fixture_inngest_compose_blob" \
+    PAPERSFLOW_PF2042_INNGEST_COMPOSE_SHA256="$fixture_inngest_compose_sha" \
+    PAPERSFLOW_PF2042_INNGEST_ADAPTER_BLOB="$fixture_inngest_adapter_blob" \
+    PAPERSFLOW_PF2042_INNGEST_ADAPTER_SHA256="$fixture_inngest_adapter_sha"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Misaligned PF-2042 Inngest topology unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'Reviewed regular-file content mismatch: workflows/inngest/docker-compose.yaml' "$output"
+  if [[ -s "$command_log" || -s "$docker_log" ]]; then
+    echo 'Misaligned PF-2042 Inngest topology executed validation commands.' >&2
+    cat "$command_log" "$docker_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' '    ports:' "      - '43123:43123'" \
+      >> workflows/inngest/docker-compose.yaml
+    git add .
+    git commit -q -m 'unpaired Inngest Compose change'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  : > "$docker_log"
+  : > "$service_log"
+  output="$test_root/inngest-unpaired-compose-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Unpaired Inngest Compose fixture unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'self-hosting Inngest test, Compose topology, and adapter launcher must change together' "$output"
+  if [[ -s "$command_log" || -s "$docker_log" ]]; then
+    echo 'Unpaired Inngest Compose fixture executed validation commands.' >&2
+    cat "$command_log" "$docker_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' "it('unpaired self-hosting topology', () => {});" \
+      >> workflows/inngest/src/index.test.ts
+    git add .
+    git commit -q -m 'unpaired Inngest self-hosting test change'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  : > "$docker_log"
+  output="$test_root/inngest-unpaired-test-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Unpaired Inngest test fixture unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'self-hosting Inngest test, Compose topology, and adapter launcher must change together' "$output"
+  if [[ -s "$command_log" || -s "$docker_log" ]]; then
+    echo 'Unpaired Inngest test fixture executed validation commands.' >&2
+    cat "$command_log" "$docker_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'export const adapterHandlerPort = 43124;' \
+      >> workflows/inngest/src/__tests__/adapters/_utils.ts
+    git add .
+    git commit -q -m 'unpaired Inngest adapter launcher change'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  : > "$docker_log"
+  output="$test_root/inngest-unpaired-adapter-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Unpaired Inngest adapter launcher fixture unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'self-hosting Inngest test, Compose topology, and adapter launcher must change together' "$output"
+  if [[ -s "$command_log" || -s "$docker_log" ]]; then
+    echo 'Unpaired Inngest adapter launcher fixture executed validation commands.' >&2
+    cat "$command_log" "$docker_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' '{"scripts":{"test":"echo unreviewed"}}' > workflows/inngest/package.json
+    git add .
+    git commit -q -m 'unreviewed Inngest manifest change'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  : > "$docker_log"
+  output="$test_root/inngest-manifest-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Inngest manifest fixture unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'workflows/inngest/package.json' "$output"
+  assert_contains 'require dedicated validation' "$output"
+  if [[ -s "$command_log" || -s "$docker_log" ]]; then
+    echo 'Inngest manifest fixture executed validation commands.' >&2
+    cat "$command_log" "$docker_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' "import { it } from 'vitest';" "it('unreviewed live Inngest', () => {});" \
+      > workflows/inngest/src/unreviewed-live.test.ts
+    git add .
+    git commit -q -m 'unreviewed live Inngest test'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  : > "$docker_log"
+  output="$test_root/inngest-unknown-live-test-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Unknown live Inngest test fixture unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'workflows/inngest/src/unreviewed-live.test.ts' "$output"
+  assert_contains 'outside the PF-2044 owned service and runtime contracts' "$output"
+  if [[ -s "$command_log" || -s "$docker_log" ]]; then
+    echo 'Unknown live Inngest test fixture executed validation commands.' >&2
+    cat "$command_log" "$docker_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'export const googleCloudPubSub = "source-only-head";' \
+      > pubsub/google-cloud-pubsub/src/index.ts
+    git add .
+    git commit -q -m 'google pubsub production-only change'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  : > "$service_log"
+  output="$test_root/google-pubsub-production-success.log"
+  run_fixture "$head_sha" "$output"
+  assert_contains 'Forcing PF-2044 owned suites to run for source-only changes:' "$output"
+  assert_contains 'pubsub/google-cloud-pubsub/src/group.test.ts' "$output"
+  assert_contains '--filter ./pubsub/google-cloud-pubsub --fail-if-no-match exec tsc --noEmit' "$command_log"
+  assert_contains '--filter ./pubsub/google-cloud-pubsub --fail-if-no-match build' "$command_log"
+  assert_contains '--filter ./pubsub/google-cloud-pubsub --fail-if-no-match lint' "$command_log"
+  assert_contains '--dir pubsub/google-cloud-pubsub exec vitest run' "$command_log"
+  assert_contains 'google-cloud-pubsub-emulator 127.0.0.1:8085' "$service_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' "it('redis streams head', () => {});" \
+      >> pubsub/redis-streams/src/pubsub.test.ts
+    git add .
+    git commit -q -m 'redis streams test-only change'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  : > "$service_log"
+  output="$test_root/redis-streams-test-success.log"
+  run_fixture "$head_sha" "$output"
+  assert_contains '--filter ./pubsub/redis-streams --fail-if-no-match exec tsc --noEmit' "$command_log"
+  assert_contains '--filter ./pubsub/redis-streams --fail-if-no-match build' "$command_log"
+  assert_contains '--filter ./pubsub/redis-streams --fail-if-no-match lint' "$command_log"
+  assert_contains '--dir pubsub/redis-streams exec vitest run' "$command_log"
+  assert_contains 'redis-streams 127.0.0.1:6381' "$service_log"
+
+  : > "$command_log"
+  : > "$service_log"
+  output="$test_root/redis-streams-service-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output" MOCK_UNAVAILABLE_SERVICE=redis-streams
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Unavailable Redis Streams service unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'Required redis-streams test service is unavailable at 127.0.0.1:6381.' "$output"
+  if grep -Fq -- '--dir pubsub/redis-streams exec vitest run' "$command_log"; then
+    echo 'Unavailable Redis Streams fixture executed its Vitest file.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'export const unreviewed = true;' \
+      > pubsub/google-cloud-pubsub/src/unreviewed.ts
+    git add .
+    git commit -q -m 'unreviewed owned-workspace source'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  : > "$service_log"
+  output="$test_root/unknown-owned-source-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Unknown owned-workspace source unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'pubsub/google-cloud-pubsub/src/unreviewed.ts' "$output"
+  assert_contains 'outside the PF-2044 owned source-and-test maps' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Unknown owned-workspace source fixture executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'services:' '  redis:' '    image: unreviewed:latest' \
+      > pubsub/redis-streams/docker-compose.yaml
+    git add .
+    git commit -q -m 'unreviewed owned-workspace Compose change'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  : > "$service_log"
+  output="$test_root/unknown-owned-compose-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Unknown owned-workspace Compose change unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'pubsub/redis-streams/docker-compose.yaml' "$output"
+  assert_contains 'outside the PF-2044 owned source-and-test maps' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Unknown owned-workspace Compose fixture executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    rm pubsub/google-cloud-pubsub/src/group.test.ts
+    ln -s index.ts pubsub/google-cloud-pubsub/src/group.test.ts
+    git add .
+    git commit -q -m 'replace owned regression with symlink'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  : > "$service_log"
+  output="$test_root/owned-test-symlink-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Symlinked owned regression unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'pubsub/google-cloud-pubsub/src/group.test.ts' "$output"
+  assert_contains 'outside the PF-2044 owned service and runtime contracts' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Symlinked owned regression fixture executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
   echo 'PapersFlow fork validator fixtures passed.'
 }
 
@@ -1856,6 +2723,189 @@ run_pf2009_upstream_sync_validation() {
   run_upstream_sync_validation pf2009-upstream-sync PF-2009
 }
 
+run_pf2045_memory_transform_smoke() (
+  : "${BASE_SHA:?BASE_SHA is required}"
+
+  local smoke_file base_recording_file recording_path
+  smoke_file="$(mktemp packages/memory/integration-tests/.pf2045-transform-request.XXXXXX.ts)"
+  base_recording_file="$(mktemp)"
+  recording_path='packages/memory/__recordings__/memory-integration-tests-src-agent-memory-v5.json'
+  trap 'rm -f "$smoke_file" "$base_recording_file"' EXIT
+  git show "$BASE_SHA:$recording_path" > "$base_recording_file"
+  cat > "$smoke_file" <<'TS'
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import { transformRequest } from './src/transform-request';
+
+type Recording = {
+  hash: string;
+  request: { url: string; body: { messages?: Array<{ role?: string; content?: unknown }> } };
+};
+
+const readRecordings = (path: string): Recording[] => {
+  const parsed = JSON.parse(fs.readFileSync(path, 'utf8')) as { recordings?: unknown };
+  assert.ok(Array.isArray(parsed.recordings), `${path} must contain a recordings array`);
+  return parsed.recordings as Recording[];
+};
+
+const findReasoningRequest = (recordings: Recording[]): Recording[] =>
+  recordings.filter(
+    recording =>
+      recording.request.url === 'https://openrouter.ai/api/v1/chat/completions' &&
+      recording.request.body.messages?.some(
+        message => message.role === 'user' && message.content === 'What is 2+2? Think through this carefully.',
+      ),
+  );
+
+const baseMatches = findReasoningRequest(readRecordings(process.argv[2]!));
+const incomingMatches = findReasoningRequest(readRecordings(process.argv[3]!));
+assert.equal(baseMatches.length, 1, 'base recording must contain exactly one reviewed OpenRouter reasoning request');
+assert.equal(incomingMatches.length, 1, 'incoming recording must contain exactly one reviewed OpenRouter reasoning request');
+
+const baseRecording = baseMatches[0]!;
+const incomingRecording = incomingMatches[0]!;
+assert.equal(typeof baseRecording.request.body.messages?.[0]?.content, 'string');
+assert.ok(Array.isArray(incomingRecording.request.body.messages?.[0]?.content));
+const transformedIncomingRecording = transformRequest({
+  url: incomingRecording.request.url,
+  body: incomingRecording.request.body,
+});
+assert.equal(transformedIncomingRecording.url, baseRecording.request.url);
+assert.deepEqual(
+  transformedIncomingRecording.body,
+  baseRecording.request.body,
+  'the incoming OpenRouter recording must normalize to the exact previously replayable request signature',
+);
+
+const textParts = [
+  { type: 'text', text: 'You are a helpful assistant ' },
+  { type: 'text', text: 'that thinks through problems.' },
+];
+const openRouter = transformRequest({
+  url: 'https://openrouter.ai/api/v1/chat/completions',
+  body: { messages: [{ role: 'system', content: textParts }] },
+});
+assert.equal(
+  (openRouter.body as { messages: Array<{ content: unknown }> }).messages[0]?.content,
+  'You are a helpful assistant that thinks through problems.',
+);
+
+const otherProvider = transformRequest({
+  url: 'https://api.openai.com/v1/chat/completions',
+  body: { messages: [{ role: 'system', content: textParts }] },
+});
+assert.deepEqual(
+  (otherProvider.body as { messages: Array<{ content: unknown }> }).messages[0]?.content,
+  textParts,
+);
+
+const mixedContent = [{ type: 'text', text: 'caption' }, { type: 'image_url', image_url: 'https://example.invalid' }];
+const mixed = transformRequest({
+  url: 'https://openrouter.ai/api/v1/chat/completions',
+  body: { messages: [{ role: 'user', content: mixedContent }] },
+});
+assert.deepEqual((mixed.body as { messages: Array<{ content: unknown }> }).messages[0]?.content, mixedContent);
+TS
+  run_with_validation_budget 300 pnpm exec tsx "$smoke_file" "$base_recording_file" "$recording_path"
+)
+
+run_pf2045_resolution_semantic_assertions() {
+  run_with_validation_budget 60 node - <<'NODE'
+const fs = require('node:fs');
+const agents = fs.readFileSync('packages/server/src/server/handlers/agents.ts', 'utf8');
+if (!/\.\.\.params,\s*requestContext,\s*memory:\s*authorizedMemoryOption,/.test(agents)) {
+  throw new Error('PF-2045 agents.ts does not preserve request context plus authorized memory in the network call.');
+}
+
+const workspace = fs.readFileSync('pnpm-workspace.yaml', 'utf8').split(/\r?\n/);
+for (const version of ['3.0.25', '3.0.28']) {
+  const key = `  '@ai-sdk/provider-utils@${version}':`;
+  const start = workspace.indexOf(key);
+  if (start < 0) throw new Error(`Missing ${key}`);
+  let end = start + 1;
+  while (end < workspace.length && !/^  '[^']+':/.test(workspace[end])) end += 1;
+  if (!workspace.slice(start + 1, end).some(line => line.trim() === 'vitest: 4.1.10')) {
+    throw new Error(`${key} must resolve the catalog-aligned Vitest 4.1.10.`);
+  }
+}
+if (!workspace.some(line => line === '  inngest-cli: false')) {
+  throw new Error('PF-2045 must preserve the fork allowBuilds policy for inngest-cli.');
+}
+NODE
+}
+
+run_pf2045_incoming_validation() {
+  : "${BASE_SHA:?BASE_SHA is required}"
+  : "${HEAD_SHA:?HEAD_SHA is required}"
+
+  echo 'Validating every reviewed runtime surface incoming from official 712b864a.'
+
+  mapfile -t pf2045_format_files < <(
+    git diff --no-renames --name-only "$BASE_SHA..$HEAD_SHA" |
+      grep -E '\.(cjs|css|js|json|jsx|md|mdx|mjs|ts|tsx|ya?ml)$' || true
+  )
+  if (( ${#pf2045_format_files[@]} > 0 )); then
+    run_with_validation_budget 600 pnpm exec prettier --check "${pf2045_format_files[@]}"
+  fi
+
+  run_with_validation_budget 600 pnpm --filter ./client-sdks/ai-sdk --fail-if-no-match exec tsc --noEmit
+  run_with_validation_budget 900 pnpm --filter ./client-sdks/ai-sdk --fail-if-no-match build:lib
+  run_with_validation_budget 600 pnpm --filter ./client-sdks/ai-sdk --fail-if-no-match lint
+
+  run_with_validation_budget 600 pnpm --filter ./packages/mcp --fail-if-no-match exec tsc --noEmit
+  run_with_validation_budget 900 pnpm --filter ./packages/mcp --fail-if-no-match build:lib
+  run_with_validation_budget 600 pnpm --filter ./packages/mcp --fail-if-no-match lint
+
+  run_with_validation_budget 600 pnpm --filter ./packages/memory --fail-if-no-match check
+  run_with_validation_budget 900 pnpm --filter ./packages/memory --fail-if-no-match build:lib
+  run_with_validation_budget 600 pnpm --filter ./packages/memory --fail-if-no-match lint
+
+  run_with_validation_budget 900 pnpm --filter ./packages/mcp-registry-registry --fail-if-no-match build
+  run_with_validation_budget 600 pnpm --filter ./packages/mcp-registry-registry --fail-if-no-match build:cli
+  run_with_validation_budget 600 pnpm --filter ./packages/mcp-registry-registry --fail-if-no-match lint
+
+  run_with_validation_budget 600 pnpm --dir docs validate
+  run_with_validation_budget 600 pnpm --dir docs lint:remark
+
+  run_with_validation_budget 900 env LLM_TEST_MODE=replay \
+    pnpm --dir packages/core exec vitest run --reporter=dot \
+      src/a2a/a2a-agent.test.ts \
+      src/agent/__tests__/scorers.test.ts \
+      src/agent/__tests__/stream.e2e.test.ts \
+      src/agent/__tests__/stream.test.ts \
+      src/agent/__tests__/tool-calls-finish-reason.e2e.test.ts \
+      src/agent/__tests__/tool-handling.e2e.test.ts \
+      src/agent/__tests__/tool-handling.test.ts \
+      src/agent/__tests__/workspace-tools-openai.e2e.test.ts \
+      src/evals/run/index.test.ts \
+      src/evals/run/multi-turn.scenario.test.ts \
+      src/llm/model/cloudflare-workers-ai-url.test.ts \
+      src/llm/model/embedding-router.e2e.test.ts \
+      src/llm/model/gateways/models-dev.test.ts \
+      src/llm/model/router-custom-provider.test.ts \
+      src/tools/provider-tools.e2e.test.ts
+  run_with_validation_budget 600 \
+    pnpm --dir client-sdks/ai-sdk exec vitest run --reporter=dot \
+      src/__tests__/transform-agent-a2a-stream.test.ts
+  run_with_validation_budget 600 pnpm --filter ./packages/mcp --fail-if-no-match test:client
+  run_with_validation_budget 600 \
+    pnpm --dir packages/server exec vitest run --reporter=dot \
+      src/server/handlers/agents.test.ts
+  run_with_validation_budget 600 \
+    pnpm --dir packages/mcp-registry-registry exec vitest run --reporter=dot \
+      src/registry/__tests__/list-registries.test.ts
+
+  run_pf2045_resolution_semantic_assertions
+  run_pf2045_memory_transform_smoke
+
+  echo 'PF-2045 reviewed incoming runtime validation passed.'
+}
+
+run_pf2045_upstream_sync_validation() {
+  run_upstream_sync_validation pf2045-upstream-sync PF-2045
+  run_pf2045_incoming_validation
+}
+
 case "${1:-}" in
   --self-test-stagehand)
     run_stagehand_validation_self_test
@@ -1871,6 +2921,15 @@ case "${1:-}" in
     ;;
   --validate-pf2009-upstream-sync)
     run_pf2009_upstream_sync_validation
+    exit
+    ;;
+  --validate-pf2045-upstream-sync)
+    run_pf2045_upstream_sync_validation
+    exit
+    ;;
+  --validate-pf2045-resolution-contracts)
+    run_pf2045_resolution_semantic_assertions
+    run_pf2045_memory_transform_smoke
     exit
     ;;
   '') ;;
@@ -1890,6 +2949,7 @@ changed_lockfile_importers="$(mktemp)"
 changed_workspaces="$(mktemp)"
 changed_tests="$(mktemp)"
 forced_mastracode_tests="$(mktemp)"
+forced_workspace_tests="$(mktemp)"
 delegated_docs_tests="$(mktemp)"
 deleted_tests="$(mktemp)"
 fixer_test_result="$(mktemp)"
@@ -1900,9 +2960,12 @@ missing_mastracode_tests="$(mktemp)"
 unsupported_mastracode_tests="$(mktemp)"
 unsupported_mastracode_sources="$(mktemp)"
 unsupported_tests="$(mktemp)"
+unsupported_owned_workspace_sources="$(mktemp)"
+unsupported_owned_workspace_tests="$(mktemp)"
+unsupported_owned_workspace_pairs="$(mktemp)"
 unsupported_workspaces="$(mktemp)"
 workspace_candidates="$(mktemp)"
-trap 'rm -f "$changed_files" "$changed_lockfile_importers" "$changed_workspaces" "$changed_tests" "$forced_mastracode_tests" "$delegated_docs_tests" "$deleted_tests" "$fixer_test_result" "$root_vitest_config_list" "$unowned_files" "$unsupported_inputs" "$missing_mastracode_tests" "$unsupported_mastracode_tests" "$unsupported_mastracode_sources" "$unsupported_tests" "$unsupported_workspaces" "$workspace_candidates"' EXIT
+trap 'rm -f "$changed_files" "$changed_lockfile_importers" "$changed_workspaces" "$changed_tests" "$forced_mastracode_tests" "$forced_workspace_tests" "$delegated_docs_tests" "$deleted_tests" "$fixer_test_result" "$root_vitest_config_list" "$unowned_files" "$unsupported_inputs" "$missing_mastracode_tests" "$unsupported_mastracode_tests" "$unsupported_mastracode_sources" "$unsupported_tests" "$unsupported_owned_workspace_sources" "$unsupported_owned_workspace_tests" "$unsupported_owned_workspace_pairs" "$unsupported_workspaces" "$workspace_candidates"' EXIT
 
 # Treat renames as a delete plus an add so both ownership boundaries are
 # validated. Otherwise moving a generated artifact out of its canonical path
@@ -1971,7 +3034,7 @@ while IFS= read -r workspace; do
     continue
   fi
   case "$workspace" in
-    auth/okta | browser/stagehand | packages/_internal-core | packages/cli | packages/codemod | packages/core | packages/deployer | packages/mcp | packages/memory | packages/server | client-sdks/ai-sdk | stores/_test-utils | stores/pg | stores/redis | mastracode | docs) ;;
+    auth/okta | browser/stagehand | packages/_internal-core | packages/cli | packages/codemod | packages/core | packages/deployer | packages/mcp | packages/memory | packages/server | client-sdks/ai-sdk | stores/_test-utils | stores/convex | stores/libsql | stores/pg | stores/redis | mastracode | mastracode/sdk | mastracode/tui | pubsub/google-cloud-pubsub | pubsub/redis-streams | workflows/inngest | docs) ;;
     *) printf '%s\n' "$workspace" >> "$unsupported_workspaces" ;;
   esac
 done < "$changed_workspaces"
@@ -2003,6 +3066,12 @@ grep -E '^(package\.json|pnpm-workspace\.yaml|patches/)' "$changed_files" \
 # Server validation invokes package-owned scripts. Reject manifest edits before
 # any PR-controlled Server command can weaken or replace those checks.
 grep -Fx 'packages/server/package.json' "$changed_files" >> "$unsupported_inputs" || true
+# PF-2044 owns source and test execution for these workspaces, not mutable
+# package-command definitions. Their manifests remain fail-closed until the
+# separate dependency-policy target owns script and dependency changes.
+grep -E \
+  '^(mastracode/(sdk|tui)|pubsub/(google-cloud-pubsub|redis-streams)|stores/(convex|libsql)|workflows/inngest)/package\.json$' \
+  "$changed_files" >> "$unsupported_inputs" || true
 
 if grep -Fxq 'pnpm-lock.yaml' "$changed_files"; then
   node - "$merge_base_sha" "$HEAD_SHA" > "$changed_lockfile_importers" <<'NODE'
@@ -2087,6 +3156,39 @@ git_regular_file_at_head() {
   git ls-tree "$HEAD_SHA" -- "$1" | grep -Eq '^100(644|755) blob '
 }
 
+inngest_index_test_changed=false
+inngest_compose_changed=false
+inngest_adapter_utils_changed=false
+inngest_pf2042_trio_only=false
+grep -Fxq 'workflows/inngest/src/index.test.ts' "$changed_files" && inngest_index_test_changed=true
+grep -Fxq 'workflows/inngest/docker-compose.yaml' "$changed_files" && inngest_compose_changed=true
+grep -Fxq 'workflows/inngest/src/__tests__/adapters/_utils.ts' "$changed_files" && inngest_adapter_utils_changed=true
+inngest_pf2042_changed_count=0
+[[ "$inngest_index_test_changed" == true ]] && ((inngest_pf2042_changed_count += 1))
+[[ "$inngest_compose_changed" == true ]] && ((inngest_pf2042_changed_count += 1))
+[[ "$inngest_adapter_utils_changed" == true ]] && ((inngest_pf2042_changed_count += 1))
+if { (( inngest_pf2042_changed_count > 0 && inngest_pf2042_changed_count < 3 )); } || {
+  (( inngest_pf2042_changed_count == 3 )) &&
+    { ! git_regular_file_at_head workflows/inngest/src/index.test.ts ||
+      ! git_regular_file_at_head workflows/inngest/docker-compose.yaml ||
+      ! git_regular_file_at_head workflows/inngest/src/__tests__/adapters/_utils.ts; }
+}; then
+  printf '%s\n' \
+    workflows/inngest/src/index.test.ts \
+    workflows/inngest/docker-compose.yaml \
+    workflows/inngest/src/__tests__/adapters/_utils.ts \
+    >> "$unsupported_owned_workspace_pairs"
+fi
+if (( inngest_pf2042_changed_count == 3 )) &&
+  ! grep -E '^workflows/inngest/' "$changed_files" |
+    grep -Ev '^(workflows/inngest/src/index\.test\.ts|workflows/inngest/docker-compose\.yaml|workflows/inngest/src/__tests__/adapters/_utils\.ts)$' |
+    grep -q .; then
+  inngest_pf2042_trio_only=true
+fi
+if [[ "$inngest_pf2042_trio_only" == true ]]; then
+  verify_pf2042_inngest_topology
+fi
+
 while IFS= read -r file; do
   if [[ "$file" =~ ^mastracode/.*\.(cjs|cts|js|jsx|mjs|mts|ts|tsx)$ ]]; then
     if grep -Eq '\.(test|spec)\.(cjs|cts|js|jsx|mjs|mts|ts|tsx)$|\.test-d\.ts$' <<< "$file"; then
@@ -2097,6 +3199,7 @@ while IFS= read -r file; do
           mastracode/tui/src/tui/components/login-dialog.test.ts | \
             mastracode/tui/src/tui/event-dispatch.test.ts | \
             mastracode/tui/src/tui/notify.test.ts | \
+            mastracode/tui/src/tui/__tests__/goal-manager.test.ts | \
             mastracode/sdk/src/utils/__tests__/signals-pubsub.test.ts) ;;
           *) printf '%s\n' "$file" >> "$unsupported_mastracode_tests" ;;
         esac
@@ -2113,6 +3216,9 @@ while IFS= read -r file; do
         ;;
       mastracode/tui/src/tui/notify.ts)
         required_test="mastracode/tui/src/tui/notify.test.ts"
+        ;;
+      mastracode/tui/src/tui/goal-manager.ts)
+        required_test="mastracode/tui/src/tui/__tests__/goal-manager.test.ts"
         ;;
       mastracode/sdk/src/utils/signals-pubsub.ts)
         required_test="mastracode/sdk/src/utils/__tests__/signals-pubsub.test.ts"
@@ -2139,12 +3245,130 @@ while IFS= read -r file; do
   fi
 done < "$changed_files"
 
+queue_owned_workspace_test() {
+  local source_file="$1"
+  local test_file="$2"
+  if ! git_regular_file_at_head "$source_file" || ! git_regular_file_at_head "$test_file"; then
+    printf '%s\n' "$source_file" >> "$unsupported_owned_workspace_sources"
+  elif ! grep -Fxq "$test_file" "$changed_files"; then
+    printf '%s\n' "$test_file" >> "$forced_workspace_tests"
+  fi
+}
+
+# These are executable ownership maps, not passive workspace allowlists. A
+# production-only change forces its native regression file to run; an unknown
+# source or test in a newly admitted workspace fails closed until its runtime
+# and service contract are reviewed explicitly.
+while IFS= read -r file; do
+  if [[ "$file" =~ ^(pubsub/(google-cloud-pubsub|redis-streams)|stores/(convex|libsql)|workflows/inngest)/ ]] &&
+    ! [[ "$file" =~ \.(cjs|cts|js|jsx|mjs|mts|ts|tsx)$ ]]; then
+    if [[ "$file" == 'workflows/inngest/docker-compose.yaml' && "$inngest_pf2042_trio_only" == true ]]; then
+      continue
+    fi
+    printf '%s\n' "$file" >> "$unsupported_owned_workspace_sources"
+    continue
+  fi
+
+  if ! [[ "$file" =~ ^(pubsub/(google-cloud-pubsub|redis-streams)|stores/(convex|libsql)|workflows/inngest)/.*\.(cjs|cts|js|jsx|mjs|mts|ts|tsx)$ ]]; then
+    continue
+  fi
+
+  if grep -Eq '\.(test|spec)\.(cjs|cts|js|jsx|mjs|mts|ts|tsx)$|\.test-d\.ts$' <<< "$file"; then
+    case "$file" in
+      pubsub/google-cloud-pubsub/src/group.test.ts | \
+        pubsub/redis-streams/src/pubsub.test.ts | \
+        stores/convex/src/cache/index.test.ts | \
+        stores/convex/src/server/cache.test.ts | \
+        stores/libsql/src/storage/domains/thread-state/index.test.ts | \
+        workflows/inngest/src/__tests__/create-inngest-agent.test.ts | \
+        workflows/inngest/src/actor-signal.test.ts | \
+        workflows/inngest/src/durable-agent/create-inngest-agentic-workflow.test.ts | \
+        workflows/inngest/src/index.test.ts | \
+        workflows/inngest/src/lifecycle-execution.test.ts | \
+        workflows/inngest/src/pubsub.test.ts | \
+        workflows/inngest/src/resume-async.test.ts) ;;
+      *) printf '%s\n' "$file" >> "$unsupported_owned_workspace_tests" ;;
+    esac
+    if ! git_regular_file_at_head "$file"; then
+      printf '%s\n' "$file" >> "$unsupported_owned_workspace_tests"
+    fi
+    continue
+  fi
+
+  case "$file" in
+    pubsub/google-cloud-pubsub/src/index.ts)
+      queue_owned_workspace_test "$file" pubsub/google-cloud-pubsub/src/group.test.ts
+      ;;
+    pubsub/redis-streams/src/index.ts)
+      queue_owned_workspace_test "$file" pubsub/redis-streams/src/pubsub.test.ts
+      ;;
+    stores/convex/src/cache/index.ts | stores/convex/src/cache/types.ts)
+      queue_owned_workspace_test "$file" stores/convex/src/cache/index.test.ts
+      ;;
+    stores/convex/src/schema.ts)
+      queue_owned_workspace_test "$file" stores/convex/src/cache/index.test.ts
+      queue_owned_workspace_test "$file" stores/convex/src/server/cache.test.ts
+      ;;
+    stores/convex/src/server/cache.ts)
+      queue_owned_workspace_test "$file" stores/convex/src/server/cache.test.ts
+      ;;
+    stores/libsql/src/storage/domains/thread-state/index.ts)
+      queue_owned_workspace_test "$file" stores/libsql/src/storage/domains/thread-state/index.test.ts
+      ;;
+    workflows/inngest/src/durable-agent/create-inngest-agent.ts | \
+      workflows/inngest/src/durable-agent/index.ts)
+      queue_owned_workspace_test "$file" workflows/inngest/src/__tests__/create-inngest-agent.test.ts
+      ;;
+    workflows/inngest/src/durable-agent/create-inngest-agentic-workflow.ts)
+      queue_owned_workspace_test "$file" workflows/inngest/src/durable-agent/create-inngest-agentic-workflow.test.ts
+      ;;
+    workflows/inngest/src/pubsub.ts)
+      queue_owned_workspace_test "$file" workflows/inngest/src/pubsub.test.ts
+      ;;
+    workflows/inngest/src/execution-engine.ts | workflows/inngest/src/types.ts | workflows/inngest/src/workflow.ts)
+      queue_owned_workspace_test "$file" workflows/inngest/src/lifecycle-execution.test.ts
+      ;;
+    workflows/inngest/src/run.ts)
+      queue_owned_workspace_test "$file" workflows/inngest/src/lifecycle-execution.test.ts
+      queue_owned_workspace_test "$file" workflows/inngest/src/resume-async.test.ts
+      ;;
+    workflows/inngest/src/__tests__/adapters/_utils.ts)
+      # PF-2042 owns this launcher helper only as part of the atomic
+      # index.test/Compose/adapter topology trio. It is linted directly below;
+      # no adapter integration suite is admitted by this exception.
+      if [[ "$inngest_pf2042_trio_only" != true ]]; then
+        printf '%s\n' "$file" >> "$unsupported_owned_workspace_sources"
+      fi
+      ;;
+    *) printf '%s\n' "$file" >> "$unsupported_owned_workspace_sources" ;;
+  esac
+done < "$changed_files"
+
+# Existing PostgreSQL and Redis validation already owns their service-backed
+# workspaces broadly. These exact PF-2026/PF-2007 production paths additionally
+# force the regressions that prove the newly introduced behavior, so a later
+# source-only conflict resolution cannot silently degrade to compile coverage.
+while IFS= read -r file; do
+  case "$file" in
+    stores/pg/src/storage/domains/thread-state/index.ts | stores/pg/src/storage/index.ts)
+      queue_owned_workspace_test "$file" stores/pg/src/storage/domains/thread-state/index.test.ts
+      ;;
+    stores/redis/src/cache.ts)
+      queue_owned_workspace_test "$file" stores/redis/src/index.test.ts
+      queue_owned_workspace_test "$file" stores/redis/src/integration.test.ts
+      ;;
+  esac
+done < "$changed_files"
+
 sort -u -o "$unsupported_inputs" "$unsupported_inputs"
 sort -u -o "$missing_mastracode_tests" "$missing_mastracode_tests"
 sort -u -o "$unsupported_mastracode_tests" "$unsupported_mastracode_tests"
 sort -u -o "$unsupported_mastracode_sources" "$unsupported_mastracode_sources"
+sort -u -o "$unsupported_owned_workspace_sources" "$unsupported_owned_workspace_sources"
+sort -u -o "$unsupported_owned_workspace_tests" "$unsupported_owned_workspace_tests"
+sort -u -o "$unsupported_owned_workspace_pairs" "$unsupported_owned_workspace_pairs"
 
-if [[ -s "$unsupported_workspaces" || -s "$unsupported_inputs" || -s "$deleted_tests" || -s "$missing_mastracode_tests" || -s "$unsupported_mastracode_tests" || -s "$unsupported_mastracode_sources" ]]; then
+if [[ -s "$unsupported_workspaces" || -s "$unsupported_inputs" || -s "$deleted_tests" || -s "$missing_mastracode_tests" || -s "$unsupported_mastracode_tests" || -s "$unsupported_mastracode_sources" || -s "$unsupported_owned_workspace_sources" || -s "$unsupported_owned_workspace_tests" || -s "$unsupported_owned_workspace_pairs" ]]; then
   if [[ -s "$unsupported_workspaces" ]]; then
     echo "These changed workspaces do not have an owned fork-safe validation target:" >&2
     cat "$unsupported_workspaces" >&2
@@ -2166,8 +3390,20 @@ if [[ -s "$unsupported_workspaces" || -s "$unsupported_inputs" || -s "$deleted_t
     cat "$missing_mastracode_tests" >&2
   fi
   if [[ -s "$unsupported_mastracode_tests" ]]; then
-    echo "These MastraCode tests are outside the three owned regression files:" >&2
+    echo "These MastraCode tests are outside the owned regression files:" >&2
     cat "$unsupported_mastracode_tests" >&2
+  fi
+  if [[ -s "$unsupported_owned_workspace_sources" ]]; then
+    echo "These files are outside the PF-2044 owned source-and-test maps:" >&2
+    cat "$unsupported_owned_workspace_sources" >&2
+  fi
+  if [[ -s "$unsupported_owned_workspace_tests" ]]; then
+    echo "These tests are outside the PF-2044 owned service and runtime contracts:" >&2
+    cat "$unsupported_owned_workspace_tests" >&2
+  fi
+  if [[ -s "$unsupported_owned_workspace_pairs" ]]; then
+    echo "The PF-2042 self-hosting Inngest test, Compose topology, and adapter launcher must change together as regular files:" >&2
+    cat "$unsupported_owned_workspace_pairs" >&2
   fi
   echo "Failing closed instead of reporting Core-only validation as workspace coverage." >&2
   exit 1
@@ -2316,6 +3552,29 @@ ensure_deployer_prerequisites() {
   deployer_prerequisites_built=true
 }
 
+inngest_prerequisites_built=false
+ensure_inngest_prerequisites() {
+  if [[ "$inngest_prerequisites_built" == true ]]; then
+    return
+  fi
+
+  # The Inngest suites runtime-import these workspace packages through their
+  # published dist exports. A clean install has no generated dist tree, so
+  # build the exact runtime prerequisites before typechecking or invoking any
+  # admitted Inngest test file.
+  ensure_deployer_prerequisites
+  run_with_validation_budget 900 pnpm --filter ./stores/libsql --fail-if-no-match build:lib
+  run_with_validation_budget 900 pnpm --filter ./observability/mastra --fail-if-no-match build
+  inngest_prerequisites_built=true
+}
+
+if [[ "$inngest_index_test_changed" == true ]]; then
+  # PF-2042 owns one exact live-dev-server topology. Validate the reviewed
+  # Compose shape without starting it here; index.test.ts self-hosts the fixed
+  # non-default Inngest CLI + handler endpoints in the unprivileged test process.
+  run_with_validation_budget 120 docker compose -f workflows/inngest/docker-compose.yaml config --quiet
+fi
+
 mapfile -t prettier_files < <(
   while IFS= read -r file; do
     if [[ -f "$file" && "$file" =~ \.(cjs|css|js|json|jsx|md|mdx|mjs|ts|tsx|ya?ml)$ ]]; then
@@ -2330,6 +3589,9 @@ fi
 
 run_with_validation_budget 900 pnpm build:core
 run_with_validation_budget 600 pnpm --filter ./packages/core --fail-if-no-match check
+if workspace_changed packages/core; then
+  run_with_validation_budget 600 pnpm --filter ./packages/core --fail-if-no-match lint
+fi
 if [[ -z "${MOCK_PNPM_LOG:-}" ]]; then
   # The Vitest selection self-check drives real pnpm/vitest processes. Inside
   # the validator's own fixture harness pnpm is a command-logging mock, so the
@@ -2500,15 +3762,67 @@ fi
 
 if workspace_changed stores/pg; then
   run_with_validation_budget 600 pnpm --filter ./stores/pg --fail-if-no-match exec tsc --noEmit
-  run_with_validation_budget 900 pnpm turbo build --filter ./stores/pg
+  run_with_validation_budget 900 pnpm --filter ./stores/pg --fail-if-no-match build:lib
+  run_with_validation_budget 600 pnpm --filter ./stores/pg --fail-if-no-match lint
 fi
 
 if workspace_changed stores/redis; then
-  run_with_validation_budget 600 pnpm --dir stores/redis exec tsc --noEmit
-  run_with_validation_budget 900 pnpm --dir stores/redis build:lib
+  run_with_validation_budget 600 pnpm --filter ./stores/redis --fail-if-no-match exec tsc --noEmit
+  run_with_validation_budget 900 pnpm --filter ./stores/redis --fail-if-no-match build:lib
+  run_with_validation_budget 600 pnpm --filter ./stores/redis --fail-if-no-match lint
 fi
 
-if workspace_changed mastracode; then
+if workspace_changed stores/convex; then
+  run_with_validation_budget 600 pnpm --filter ./stores/convex --fail-if-no-match exec tsc --noEmit
+  run_with_validation_budget 900 pnpm --filter ./stores/convex --fail-if-no-match build:lib
+  run_with_validation_budget 600 pnpm --filter ./stores/convex --fail-if-no-match lint
+fi
+
+if workspace_changed stores/libsql; then
+  run_with_validation_budget 600 pnpm --filter ./stores/libsql --fail-if-no-match exec tsc --noEmit
+  run_with_validation_budget 900 pnpm --filter ./stores/libsql --fail-if-no-match build:lib
+  run_with_validation_budget 600 pnpm --filter ./stores/libsql --fail-if-no-match lint
+fi
+
+if workspace_changed pubsub/google-cloud-pubsub; then
+  run_with_validation_budget 600 pnpm --filter ./pubsub/google-cloud-pubsub --fail-if-no-match exec tsc --noEmit
+  run_with_validation_budget 900 pnpm --filter ./pubsub/google-cloud-pubsub --fail-if-no-match build
+  run_with_validation_budget 600 pnpm --filter ./pubsub/google-cloud-pubsub --fail-if-no-match lint
+fi
+
+if workspace_changed pubsub/redis-streams; then
+  run_with_validation_budget 600 pnpm --filter ./pubsub/redis-streams --fail-if-no-match exec tsc --noEmit
+  run_with_validation_budget 900 pnpm --filter ./pubsub/redis-streams --fail-if-no-match build
+  run_with_validation_budget 600 pnpm --filter ./pubsub/redis-streams --fail-if-no-match lint
+fi
+
+if workspace_changed workflows/inngest; then
+  ensure_inngest_prerequisites
+fi
+
+if workspace_changed workflows/inngest && [[ "$inngest_pf2042_trio_only" == false ]]; then
+  run_with_validation_budget 600 pnpm --filter ./workflows/inngest --fail-if-no-match exec tsc --noEmit
+  run_with_validation_budget 900 pnpm --filter ./workflows/inngest --fail-if-no-match build
+  run_with_validation_budget 600 pnpm --filter ./workflows/inngest --fail-if-no-match lint
+elif [[ "$inngest_pf2042_trio_only" == true ]]; then
+  # PF-2051 owns the pre-existing createRun/RunWithRawInput type mismatch in
+  # workflow.ts. Do not misreport the PF-2042 three-file infrastructure fix as
+  # package-wide type coverage while that clean-base failure remains. The
+  # reviewed test file is still formatted, linted directly, and run in full;
+  # every other Inngest source/test continues through the normal owned map and
+  # package gates above.
+  echo 'PF-2042 exact Inngest test/Compose/adapter trio: deferring the package-wide typecheck and build baseline to PF-2051.'
+  run_with_validation_budget 600 pnpm exec eslint \
+    workflows/inngest/src/index.test.ts \
+    workflows/inngest/src/__tests__/adapters/_utils.ts
+fi
+
+mastracode_prerequisites_built=false
+ensure_mastracode_prerequisites() {
+  if [[ "$mastracode_prerequisites_built" == true ]]; then
+    return
+  fi
+
   # MastraCode's Vitest setup mocks these workspace packages, but Vite still
   # resolves their exported dist entries before applying the mocks
   # (settings.ts lazily imports @mastra/stagehand; the TUI imports
@@ -2516,6 +3830,11 @@ if workspace_changed mastracode; then
   run_with_validation_budget 900 pnpm --filter ./signals/github --fail-if-no-match build:lib
   run_with_validation_budget 900 pnpm --filter ./browser/stagehand --fail-if-no-match build
   run_with_validation_budget 900 pnpm --filter ./browser/agent-browser --fail-if-no-match build
+  mastracode_prerequisites_built=true
+}
+
+if workspace_changed mastracode || workspace_changed mastracode/sdk || workspace_changed mastracode/tui; then
+  ensure_mastracode_prerequisites
   mapfile -t mastracode_lint_files < <(
     while IFS= read -r file; do
       if [[ -f "$file" && "$file" =~ ^mastracode/.*\.(ts|tsx|js|jsx|mjs|cjs)$ ]]; then
@@ -2526,6 +3845,21 @@ if workspace_changed mastracode; then
   if (( ${#mastracode_lint_files[@]} > 0 )); then
     run_with_validation_budget 600 pnpm exec eslint "${mastracode_lint_files[@]}"
   fi
+fi
+
+if workspace_changed mastracode/sdk; then
+  run_with_validation_budget 600 pnpm --filter ./mastracode/sdk --fail-if-no-match check
+  run_with_validation_budget 900 pnpm --filter ./mastracode/sdk --fail-if-no-match build:lib
+  run_with_validation_budget 600 pnpm --filter ./mastracode/sdk --fail-if-no-match lint
+fi
+
+if workspace_changed mastracode/tui; then
+  # TUI imports the SDK package through its published entrypoints, so build the
+  # exact direct workspace before compiling and testing the TUI.
+  run_with_validation_budget 900 pnpm --filter ./mastracode/sdk --fail-if-no-match build:lib
+  run_with_validation_budget 600 pnpm --filter ./mastracode/tui --fail-if-no-match check
+  run_with_validation_budget 900 pnpm --filter ./mastracode/tui --fail-if-no-match build:lib
+  run_with_validation_budget 600 pnpm --filter ./mastracode/tui --fail-if-no-match lint
 fi
 
 is_explicit_fork_safe_test() {
@@ -3049,6 +4383,7 @@ if (( ${#detected_tests[@]} > 0 )); then
       "$file" != mastracode/tui/src/tui/components/login-dialog.test.ts && \
       "$file" != mastracode/tui/src/tui/event-dispatch.test.ts && \
       "$file" != mastracode/tui/src/tui/notify.test.ts && \
+      "$file" != mastracode/tui/src/tui/__tests__/goal-manager.test.ts && \
       "$file" != mastracode/sdk/src/utils/__tests__/signals-pubsub.test.ts ]]; then
       printf '%s\n' "$file" >> "$unsupported_tests"
     elif [[ "$file" =~ integration\.(test|spec)\. && \
@@ -3057,6 +4392,10 @@ if (( ${#detected_tests[@]} > 0 )); then
       "$file" != packages/deployer/src/deploy/log.integration.test.ts && \
       "$file" != stores/pg/* && "$file" != stores/redis/* ]]; then
       printf '%s\n' "$file" >> "$unsupported_tests"
+    elif [[ "$file" == stores/convex/src/cache/index.test.ts || \
+      "$file" == stores/convex/src/server/cache.test.ts || \
+      "$file" == stores/libsql/src/storage/domains/thread-state/index.test.ts ]]; then
+      printf '%s\n' "$file" >> "$changed_tests"
     elif [[ "$file" == stores/* && "$file" != stores/_test-utils/* && \
       "$file" != stores/pg/* && "$file" != stores/redis/* ]]; then
       printf '%s\n' "$file" >> "$unsupported_tests"
@@ -3085,6 +4424,11 @@ if [[ -s "$forced_mastracode_tests" ]]; then
   sort -u "$forced_mastracode_tests"
   sort -u "$forced_mastracode_tests" >> "$changed_tests"
 fi
+if [[ -s "$forced_workspace_tests" ]]; then
+  echo "Forcing PF-2044 owned suites to run for source-only changes:"
+  sort -u "$forced_workspace_tests"
+  sort -u "$forced_workspace_tests" >> "$changed_tests"
+fi
 sort -u -o "$changed_tests" "$changed_tests"
 
 if [[ -s "$delegated_docs_tests" ]]; then
@@ -3104,6 +4448,71 @@ if workspace_changed stores/_test-utils &&
   echo "Storage test utility changes must include a changed Vitest file in stores/_test-utils." >&2
   echo "Failing closed instead of accepting unexecuted shared conformance helpers." >&2
   exit 1
+fi
+
+require_test_service() {
+  local service_name="$1"
+  local host="$2"
+  local port="$3"
+
+  if [[ -n "${MOCK_SERVICE_LOG:-}" ]]; then
+    printf '%s %s:%s\n' "$service_name" "$host" "$port" >> "$MOCK_SERVICE_LOG"
+    if [[ "${MOCK_UNAVAILABLE_SERVICE:-}" == "$service_name" ]]; then
+      echo "Required ${service_name} test service is unavailable at ${host}:${port}." >&2
+      return 1
+    fi
+    return
+  fi
+
+  node - "$service_name" "$host" "$port" <<'NODE'
+const net = require('node:net');
+
+const [serviceName, host, rawPort] = process.argv.slice(2);
+const port = Number(rawPort);
+const deadline = Date.now() + 20_000;
+
+function probe() {
+  const socket = net.createConnection({ host, port });
+  let settled = false;
+  const finish = success => {
+    if (settled) return;
+    settled = true;
+    socket.destroy();
+    if (success) process.exit(0);
+    if (Date.now() >= deadline) {
+      console.error(`Required ${serviceName} test service is unavailable at ${host}:${port}.`);
+      process.exit(1);
+    }
+    setTimeout(probe, 500);
+  };
+  socket.setTimeout(1_000);
+  socket.once('connect', () => finish(true));
+  socket.once('timeout', () => finish(false));
+  socket.once('error', () => finish(false));
+}
+
+probe();
+NODE
+}
+
+# A service-backed test is never treated as coverage merely because Vitest can
+# be invoked. Prove the exact disposable endpoint is reachable before running
+# any package command that might retry, skip, or hang when infrastructure is
+# missing. In-process Convex/LibSQL/Inngest tests deliberately need no probe.
+if grep -Eq '^stores/pg/.*\.(test|spec)\.' "$changed_tests"; then
+  require_test_service postgres 127.0.0.1 5434
+fi
+if grep -Eq '^stores/redis/.*\.(test|spec)\.' "$changed_tests"; then
+  require_test_service redis-store 127.0.0.1 6380
+fi
+if grep -Fxq 'pubsub/google-cloud-pubsub/src/group.test.ts' "$changed_tests"; then
+  require_test_service google-cloud-pubsub-emulator 127.0.0.1 8085
+fi
+if grep -Fxq 'pubsub/redis-streams/src/pubsub.test.ts' "$changed_tests"; then
+  require_test_service redis-streams 127.0.0.1 6381
+fi
+if grep -Fxq 'workflows/inngest/src/index.test.ts' "$changed_tests"; then
+  require_test_service inngest-dev-server 127.0.0.1 4200
 fi
 
 if [[ ! -s "$changed_tests" ]]; then

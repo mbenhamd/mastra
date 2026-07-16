@@ -51,10 +51,32 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   the PF-558 exception reusable. Exact same-repository policy PR `#278`, its
   branch, and its `main` base may bootstrap the new validator once; every later
   PR loads it from protected base.
+- PF-2045 has a topology- and tree-bound upstream-sync lane for the next
+  official-main merge because its merge commit cannot be known before the
+  policy lands. Admission requires the exact same-repository Linear branch and
+  `main` base, and requires the checked PR head itself to have exactly two
+  parents: the current protected-base tip first and reviewed upstream commit
+  `712b864aa1ed12b14c54390ec17b69de163c37f7` second. The trusted policy runs
+  Git's merge machinery over those parents, requires exactly the three
+  rehearsed content conflicts, substitutes only the reviewed regular-file
+  blobs for Server agents, the lockfile, and the workspace policy, and requires
+  the PR head to equal that reconstructed tree. Wrong parents, extra parents, a
+  non-merge head, a forged same-parent tree, changed conflict paths, changed
+  resolutions, or different PR metadata fail before install. The lane installs
+  the complete reconciled workspace with pnpm hooks and lifecycle scripts
+  disabled, runs the shared Harness, AgentController, evented-workflow, Server,
+  SDK, and MastraCode plan, then validates every runtime surface in the reviewed
+  132-file incoming delta. The additional plan includes Core replay suites, AI
+  SDK A2A transformation, the full MCP client contract, the deterministic MCP
+  registry list contract, Server agent authorization, docs, and a deterministic
+  Memory transform/recording compatibility check. The nested Memory integration package's broad native
+  suite is deliberately not presented as clean-runner evidence because it is
+  outside the frozen root workspace and warms FastEmbed during global setup.
 - `.github/workflows/papersflow-fork-pr.yml` always builds and type-checks Core,
   runs explicit affected-package checks for Okta Auth, Stagehand, Internal Core, CLI,
   Codemod, Deployer, MCP, Memory, Server, AI SDK, shared Storage Test Utils,
-  PostgreSQL, and Redis, and
+  PostgreSQL, Redis, Convex, LibSQL, Google Cloud PubSub, Redis Streams,
+  Inngest, and the MastraCode SDK/TUI, and
   executes each supported changed Vitest file in full. The stateful Core Agent
   signal suite is the sole exception: the validator maps changed lines to named
   `it()`/`test()` cases with the TypeScript AST and runs each selected case in a
@@ -127,7 +149,37 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   integration-test packages, integration-test filename variants, explicit
   provider E2E files, and PostgreSQL pooler/performance suites fail closed until
   a dedicated fork-safe workflow provides their required setup.
-  Store-provider tests other than the provisioned PostgreSQL and Redis suites
+  The PF-2044 ownership map additionally admits only the exact Convex cache,
+  LibSQL thread-state, Google Cloud PubSub group, Redis Streams PubSub, and
+  Inngest regression files needed by the reviewed PF-2026/PF-2007 footprints.
+  A production-only change in those paths forces its paired native test to run;
+  an unrecognized source or test fails closed. Convex's admitted tests are
+  mocked/in-process, LibSQL uses a local database, and the admitted Inngest
+  files mock transport or execute in process. Other Convex or Inngest tests
+  remain rejected because they require credentials or a dedicated dev server.
+  PF-2042 has one additional exact exception:
+  `workflows/inngest/src/index.test.ts`, `workflows/inngest/docker-compose.yaml`,
+  and `workflows/inngest/src/__tests__/adapters/_utils.ts` must change together
+  and remain regular files with the exact reviewed Git blobs and SHA-256
+  digests. Trusted semantic assertions additionally bind the Compose image,
+  command, port mapping, host gateway, adapter constants, and index-suite
+  endpoint constructor to ports 4200/4201. The validator runs
+  `docker compose config --quiet`, directly lints both TypeScript files, then
+  runs the full `index.test.ts` through a trusted-workflow-started
+  digest-pinned `inngest/inngest:v1.34.0` dev server on the workspace's reviewed fixed,
+  non-default Inngest CLI/handler endpoint pair. The workflow never starts the
+  PR-controlled Compose file; the validator parses it after the trusted content
+  and endpoint checks. The service is probed before Vitest and removed in an
+  always-running cleanup step. It does not execute an adapter
+  integration suite, admit another adapter file or live Inngest test, or admit
+  `workflows/inngest/package.json`. For that exact three-file exception only,
+  the validator does not claim a package-wide typecheck/build: clean fork
+  `main` and reviewed upstream `712b864a` both have the pre-existing
+  `createRun`/`RunWithRawInput` mismatch tracked by PF-2051. Any broader Inngest
+  source change, including PF-2007, still enters the native package checks and
+  remains blocked until that baseline is repaired.
+  PostgreSQL and Redis cache production paths likewise force their newly owned
+  thread-state/indexed-log regressions. Other unprovisioned Store-provider tests
   fail closed for the same reason.
 - Stagehand changes build and lint the package, then run its browser-independent
   Vitest suite. The `profile-lifecycle` test remains fail-closed because it
@@ -135,10 +187,12 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   dedicated browser-capable validation lane. Maintainers can exercise the
   workspace classification and command selection locally with
   `.github/scripts/run-papersflow-fork-pr-validation.bash --self-test-stagehand`.
-- Actual `mastracode/**` changes build the GitHub Signals test prerequisite,
-  run changed-file ESLint, and execute the PF-1878 login-dialog, event-dispatch,
-  and notification Vitest files in full. Each of those three production files
-  must remain a regular file and change with its matching regular test; every
+- Actual `mastracode/**` changes build the GitHub Signals, Stagehand, and
+  Agent Browser test prerequisites, run the native SDK/TUI build, typecheck,
+  and lint commands, and execute the PF-1878 login-dialog, event-dispatch, and
+  notification files plus the PF-2026 goal-manager and PF-2007 SDK
+  signals-pubsub regression files in full. A production-only edit forces its
+  matching regular test to run; every
   other MastraCode production JS/TS source, unit test, and nested E2E test fails closed until the targeted
   validator owns its workspace build prerequisites and test configuration. The
   canonical MastraCode build and E2E workflow stays available by manual dispatch
@@ -150,8 +204,13 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   validation scripts are loaded from the PR's trusted base commit. The first
   same-repository rollout may bootstrap only the new policy fixtures from its
   exact CI branch; external PRs may not.
-- Redis and PostgreSQL are disposable job services matching the repository test
-  ports and credentials, not shared runtime infrastructure.
+- Redis cache and PostgreSQL are disposable job services matching the
+  repository test ports and credentials. Redis Streams on port 6381 and the
+  Google Cloud PubSub emulator on port 8085 start only when their owned
+  workspaces change; both newly owned service images are pinned by immutable
+  multi-architecture digest. The validator probes each required endpoint and fails
+  before Vitest when the service is unavailable; none are shared runtime
+  infrastructure.
 - `pull_request_target` metadata workflows may use GitHub-hosted runners only
   when they check out trusted default-branch automation rather than PR code.
 - Starsling remains available only to same-repository branches in the canonical
@@ -167,6 +226,7 @@ or command plan:
 .github/scripts/run-papersflow-fork-pr-validation.bash --self-test
 .github/scripts/run-papersflow-fork-pr-validation.bash --self-test-pf558-upstream-sync
 .github/scripts/run-papersflow-fork-pr-validation.bash --self-test-pf2009-upstream-sync
+.github/scripts/run-papersflow-fork-pr-validation.bash --self-test-pf2045-upstream-sync
 ```
 
 The fixtures use an isolated temporary Git repository and mocked package
@@ -178,6 +238,16 @@ run route consistency coverage and the exact fork-safe favorites integration
 test, reject exact and ordinary Server tests when their changed or newly
 reachable local dependencies gain unsafe runtime requirements, distinguish real
 imports from comments, and keep other integration-named tests fail-closed.
+They also prove production-only forced-test selection, direct test selection,
+native command routing, service-unavailable failure, and rejection of unknown
+sources inside a newly admitted PF-2044 workspace. They also accept the atomic
+PF-2042 Inngest test/Compose/adapter-launcher trio, reject each unpaired member,
+reject a valid-but-misaligned port topology, reject the Inngest manifest and
+unknown live tests, and propagate Compose validation failure before executing
+package commands. PF-2045 fixtures
+separately create the three genuine content conflicts, prove the accepted
+reconstructed merge tree, and exercise wrong-upstream, wrong-first-parent,
+forged-same-parent-tree, extra-parent, non-merge, and wrong-metadata failures.
 
 Do not register a self-hosted runner for public PR code. Keep canonical
 release, secret, cloud, and scheduled workflows gated to `mastra-ai/mastra`
