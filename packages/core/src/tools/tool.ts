@@ -4,7 +4,11 @@ import { RequestContext } from '../request-context';
 import { toStandardSchema } from '../schema';
 import type { PublicSchema, StandardSchemaWithJSON, InferPublicSchema, InferPublicSchemaInput } from '../schema';
 import type { SuspendOptions } from '../workflows';
-import { createToolRecoveryFingerprint, normalizeToolRecoverySchemaIdentity } from './recovery-fingerprint';
+import {
+  createToolRecoveryFingerprint,
+  defineLazyToolRecoveryFingerprint,
+  normalizeToolRecoverySchemaIdentity,
+} from './recovery-fingerprint';
 import type {
   McpMetadata,
   MCPToolProperties,
@@ -92,7 +96,7 @@ export class Tool<
   id: TId;
 
   /** @internal Binding to the original implementation used by durable cold recovery. */
-  recoveryFingerprint: string;
+  recoveryFingerprint!: string;
 
   /** Description of what the tool does */
   description: string;
@@ -280,16 +284,16 @@ export class Tool<
   constructor(opts: ToolAction<TSchemaIn, TSchemaOut, TSuspendSchema, TResumeSchema, TContext, TId, TRequestContext>) {
     (this as any)[MASTRA_TOOL_MARKER] = true;
     this.id = opts.id;
-    this.recoveryFingerprint = createToolRecoveryFingerprint({
+    const recoverySchemas = {
+      input: opts.inputSchema,
+      output: opts.outputSchema,
+      suspend: opts.suspendSchema,
+      resume: opts.resumeSchema,
+      requestContext: opts.requestContextSchema,
+    };
+    const recoveryIdentity = {
       id: opts.id,
       description: opts.description,
-      schemas: {
-        input: normalizeToolRecoverySchemaIdentity(opts.inputSchema),
-        output: normalizeToolRecoverySchemaIdentity(opts.outputSchema),
-        suspend: normalizeToolRecoverySchemaIdentity(opts.suspendSchema),
-        resume: normalizeToolRecoverySchemaIdentity(opts.resumeSchema),
-        requestContext: normalizeToolRecoverySchemaIdentity(opts.requestContextSchema),
-      },
       execute: opts.execute,
       requireApproval: opts.requireApproval,
       strict: opts.strict,
@@ -304,7 +308,19 @@ export class Tool<
       onInputDelta: opts.onInputDelta,
       onInputAvailable: opts.onInputAvailable,
       onOutput: opts.onOutput,
-    });
+    };
+    defineLazyToolRecoveryFingerprint(this, () =>
+      createToolRecoveryFingerprint({
+        ...recoveryIdentity,
+        schemas: {
+          input: normalizeToolRecoverySchemaIdentity(recoverySchemas.input),
+          output: normalizeToolRecoverySchemaIdentity(recoverySchemas.output),
+          suspend: normalizeToolRecoverySchemaIdentity(recoverySchemas.suspend),
+          resume: normalizeToolRecoverySchemaIdentity(recoverySchemas.resume),
+          requestContext: normalizeToolRecoverySchemaIdentity(recoverySchemas.requestContext),
+        },
+      }),
+    );
     this.description = opts.description;
     this.inputSchema = opts.inputSchema ? toStandardSchema(opts.inputSchema) : undefined;
     this.outputSchema = opts.outputSchema ? toStandardSchema(opts.outputSchema) : undefined;
