@@ -47,6 +47,9 @@ interface MutableResult {
   threadId?: string;
 }
 
+type GoalEvaluationEvent = Extract<AgentControllerEvent, { type: 'goal_evaluation' }>;
+type TerminalGoalStatus = Extract<RunMCStatus, 'done' | 'paused'>;
+
 function aggregate(event: AgentControllerEvent, acc: MutableResult): void {
   switch (event.type) {
     case 'message_end':
@@ -172,6 +175,13 @@ export function runMC<TState extends Record<string, unknown>>(options: RunMCOpti
   let maxTurnsExceeded = false;
   let assistantTurns = 0;
   let settled = false;
+  let terminalGoalEvaluation:
+    | {
+        status: TerminalGoalStatus;
+        event: GoalEvaluationEvent;
+      }
+    | undefined;
+  let nonSuspendedAgentEndObserved = false;
   let unsubscribe: (() => void) | undefined;
   let removeAbortListener: (() => void) | undefined;
   let resolveResult!: (r: RunMCResult) => void;
@@ -212,6 +222,26 @@ export function runMC<TState extends Record<string, unknown>>(options: RunMCOpti
     if (maxTurnsExceeded) return 'max_turns';
     if (aborted) return 'aborted';
     return undefined;
+  }
+
+  function terminalGoalStatus(event: GoalEvaluationEvent): TerminalGoalStatus | undefined {
+    if (event.payload.status === 'done') return 'done';
+    if (event.payload.status === 'paused' || event.payload.waitingForUser || event.payload.maxRunsReached) {
+      return 'paused';
+    }
+    return undefined;
+  }
+
+  function maybeFinishTerminalGoal(): void {
+    if (!goal || !terminalGoalEvaluation || !nonSuspendedAgentEndObserved) return;
+    const { status, event } = terminalGoalEvaluation;
+    finish(status, {
+      objective: goal.objective,
+      goalEvent: event,
+      reason: event.payload.reason ?? event.payload.results?.[0]?.reason,
+      iterations: event.payload.iteration,
+      maxRuns: event.payload.maxRuns,
+    });
   }
 
   function requestAbort(): void {
@@ -330,6 +360,14 @@ export function runMC<TState extends Record<string, unknown>>(options: RunMCOpti
       aggregate(event, acc);
       queue.push(event);
 
+      if (event.type === 'agent_start' && goal) {
+        // The subscribed stream can close one controller run on a model finish,
+        // then open another for the following goal chunk. Do not let that prior
+        // run's end satisfy a terminal evaluation from the newly started run.
+        terminalGoalEvaluation = undefined;
+        nonSuspendedAgentEndObserved = false;
+      }
+
       if (event.type === 'agent_end') {
         acc.finishReason = event.reason;
       }
@@ -356,20 +394,10 @@ export function runMC<TState extends Record<string, unknown>>(options: RunMCOpti
       }
 
       if (event.type === 'goal_evaluation' && goal && !event.payload.pending) {
-        const terminalStatus =
-          event.payload.status === 'done'
-            ? 'done'
-            : event.payload.status === 'paused' || event.payload.waitingForUser || event.payload.maxRunsReached
-              ? 'paused'
-              : undefined;
+        const terminalStatus = terminalGoalStatus(event);
         if (terminalStatus) {
-          finish(terminalStatus, {
-            objective: goal.objective,
-            goalEvent: event,
-            reason: event.payload.reason ?? event.payload.results?.[0]?.reason,
-            iterations: event.payload.iteration,
-            maxRuns: event.payload.maxRuns,
-          });
+          terminalGoalEvaluation = { status: terminalStatus, event };
+          maybeFinishTerminalGoal();
         }
         return;
       }
@@ -378,16 +406,20 @@ export function runMC<TState extends Record<string, unknown>>(options: RunMCOpti
         if (timedOut) {
           finish('timeout');
         } else if (event.reason === 'error') {
-          finish('error');
+          fail('Agent run ended with an error before reporting details.');
         } else if (maxTurnsExceeded && event.reason !== 'complete') {
           // The cap forced an abort while the agent still had work to do.
           finish('max_turns');
         } else if ((event.reason === 'aborted' || aborted) && !maxTurnsExceeded) {
           finish('aborted');
         } else if (goal) {
-          // Complete goal evaluations can arrive after the agent stream ends,
-          // and suspended tools may auto-resume into another agent run. Keep
-          // waiting for those paths; only the terminal cases above settle here.
+          // Goal evaluation and the corresponding non-suspended agent_end can
+          // arrive in either order. A suspended end is only an intermediate
+          // boundary because the resolution policy may auto-resume the tool.
+          if (event.reason !== 'suspended') {
+            nonSuspendedAgentEndObserved = true;
+            maybeFinishTerminalGoal();
+          }
           return;
         } else {
           finish('completed');

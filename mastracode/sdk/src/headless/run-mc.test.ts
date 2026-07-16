@@ -9,6 +9,7 @@ import { LibSQLStore } from '@mastra/libsql';
 import { describe, it, expect, vi } from 'vitest';
 import z from 'zod';
 
+import { renderJsonResult } from './format.js';
 import { runMC } from './run-mc.js';
 import type { ResolutionPolicy } from './types.js';
 
@@ -461,6 +462,22 @@ describe('runMC', () => {
 
       expect(result.status).toBe('error');
       expect(result.finishReason).toBe('error');
+      expect(result.error).toEqual({
+        name: 'Error',
+        message: 'Agent run ended with an error before reporting details.',
+      });
+      // Human mode prints result.error.message, while JSON mode serializes the
+      // same structured diagnostic.
+      expect(`Error: ${result.error!.message}\n`).toBe(
+        'Error: Agent run ended with an error before reporting details.\n',
+      );
+      expect(JSON.parse(renderJsonResult(result))).toMatchObject({
+        status: 'error',
+        error: {
+          name: 'Error',
+          message: 'Agent run ended with an error before reporting details.',
+        },
+      });
       harness.emit(goalEvaluationEvent());
       expect(await harness.run.result).toBe(result);
       expect(harness.unsubscribe).toHaveBeenCalledTimes(1);
@@ -477,6 +494,8 @@ describe('runMC', () => {
       });
 
       harness.emit(event);
+      await expectResultPending(harness.run.result);
+      harness.emit({ type: 'agent_end', reason: 'complete' });
       const result = await harness.run.result;
 
       expect(result).toMatchObject({
@@ -498,6 +517,8 @@ describe('runMC', () => {
       });
 
       harness.emit(event);
+      await expectResultPending(harness.run.result);
+      harness.emit({ type: 'agent_end', reason: 'complete' });
       const result = await harness.run.result;
 
       expect(result).toMatchObject({
@@ -527,6 +548,7 @@ describe('runMC', () => {
       const harness = makeFakeGoalHarness();
       await harness.started;
 
+      harness.emit({ type: 'agent_start' });
       harness.emit(goalEvaluationEvent({ pending: true }));
       harness.emit({ type: 'agent_end', reason: 'complete' });
       await expectResultPending(harness.run.result);
@@ -541,7 +563,7 @@ describe('runMC', () => {
       });
     });
 
-    it('keeps suspended auto-resume runs open until the goal becomes terminal', async () => {
+    it('waits for the resumed agent_end when terminal goal evaluation arrives first', async () => {
       const policy: ResolutionPolicy = {
         onToolApproval: () => 'approve',
         onSuspension: () => ({ resumeData: { answer: 'continue' } }),
@@ -563,8 +585,29 @@ describe('runMC', () => {
         resumeData: { answer: 'continue' },
       });
 
-      harness.emit(goalEvaluationEvent());
-      expect((await harness.run.result).status).toBe('done');
+      const terminalEvaluation = goalEvaluationEvent();
+      harness.emit({ type: 'agent_start' });
+      harness.emit({ type: 'agent_end', reason: 'complete' });
+      await expectResultPending(harness.run.result);
+
+      // Core opens a fresh controller run when the goal chunk follows a model
+      // finish. The prior complete boundary must not authorize this evaluation.
+      harness.emit({ type: 'agent_start' });
+      harness.emit(terminalEvaluation);
+      await expectResultPending(harness.run.result);
+
+      harness.emit({ type: 'agent_end', reason: 'complete' });
+      const result = await harness.run.result;
+
+      expect(result).toMatchObject({
+        status: 'done',
+        finishReason: 'complete',
+        goalEvent: terminalEvaluation,
+      });
+      harness.emit(goalEvaluationEvent({ status: 'paused' }));
+      harness.emit({ type: 'agent_end', reason: 'complete' });
+      expect(await harness.run.result).toBe(result);
+      expect(harness.unsubscribe).toHaveBeenCalledTimes(1);
     });
   });
 
