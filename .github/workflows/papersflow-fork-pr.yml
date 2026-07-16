@@ -279,19 +279,19 @@ jobs:
           VALIDATION_LANE: ${{ steps.install-policy.outputs.lane }}
         run: |
           script_path=".github/scripts/run-papersflow-fork-pr-validation.bash"
-          # Once PF-2044 is present on the protected base, always prefer that
-          # trusted copy. The exact branch bootstrap is only reachable while
-          # the protected base still lacks the PF-2045 marker.
-          if /usr/bin/git cat-file -e "${BASE_SHA}:${script_path}" && \
-            /usr/bin/git show "${BASE_SHA}:${script_path}" | \
-              grep -Fq -- '--self-test-pf2045-upstream-sync'; then
-            /usr/bin/git show "${BASE_SHA}:${script_path}" \
-              > "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash"
-          elif [[ "${HEAD_REPOSITORY}" == "${GITHUB_REPOSITORY}" && \
+          # This exact same-repository policy branch is the sole bootstrap for
+          # incremental validator updates. Every other PR uses the protected
+          # base copy, including after the original PF-2044 policy merged.
+          if [[ "${HEAD_REPOSITORY}" == "${GITHUB_REPOSITORY}" && \
             "${HEAD_REF}" == 'ci/pf-2044-owned-validation-targets' && \
             "${BASE_REF}" == 'main' ]]; then
             echo 'Bootstrapping the validator from the exact PF-2044 policy branch.'
             /usr/bin/git show "${HEAD_SHA}:${script_path}" \
+              > "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash"
+          elif /usr/bin/git cat-file -e "${BASE_SHA}:${script_path}" && \
+            /usr/bin/git show "${BASE_SHA}:${script_path}" | \
+              grep -Fq -- '--self-test-pf2045-upstream-sync'; then
+            /usr/bin/git show "${BASE_SHA}:${script_path}" \
               > "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash"
           elif [[ "${HEAD_REPOSITORY}" == "${GITHUB_REPOSITORY}" && \
             "${PR_NUMBER}" == '278' && \
