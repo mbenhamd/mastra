@@ -10,8 +10,10 @@ import {
   clearSuspendedToolSurfaceFence,
   clearToolSurfaceFence,
   consumeToolSurfaceFenceRestore,
+  createProcessorToolSurfaceView,
   createToolSurfaceFence,
   enforceActiveToolsFence,
+  enforceReconstructibleToolSurface,
   enforceToolChoiceFence,
   enforceToolSurfaceFence,
   readToolSurfaceFence,
@@ -56,6 +58,20 @@ describe('replacement tool surface fence', () => {
     expect(() => enforceToolChoiceFence({ toolName: 'hiddenTool' }, fence)).toThrow(
       /outside the execution's replacement tool surface/,
     );
+  });
+
+  it('materializes processor toolChoice Proxies into a stable plain value', () => {
+    const fence = createToolSurfaceFence({ modeTool: {} });
+    const choiceTarget = { type: 'tool', toolName: 'modeTool' };
+    const get = vi.fn(Reflect.get);
+    const choice = new Proxy(choiceTarget, { get });
+
+    const materialized = enforceToolChoiceFence(choice, fence);
+    choiceTarget.toolName = 'hiddenTool';
+
+    expect(materialized).toEqual({ type: 'tool', toolName: 'modeTool' });
+    expect(Object.getPrototypeOf(materialized!)).toBe(Object.prototype);
+    expect(get).toHaveBeenCalledTimes(2);
   });
 
   it('clears a prior execution fence when the RequestContext is reused', () => {
@@ -114,6 +130,217 @@ describe('replacement tool surface fence', () => {
     expect(providerTools).toEqual({ modeTool });
     expect(modeTool.inputSchema.shape.query.kind).toBe('string');
     expect(modeTool.configuration.approval.required).toBe(true);
+  });
+
+  it('restores mutable built-in state nested under protected tool configuration', () => {
+    const config = {
+      map: new Map([['mode', 'trusted']]),
+      set: new Set(['trusted']),
+      date: new Date('2026-01-01T00:00:00.000Z'),
+      regexp: /trusted/giu,
+      bytes: new Uint8Array([1, 2, 3]),
+    };
+    const modeTool = { config };
+    const fence = createToolSurfaceFence({ modeTool });
+
+    config.map.set('mode', 'mutated');
+    config.set.delete('trusted');
+    config.set.add('mutated');
+    config.date.setUTCFullYear(2030);
+    config.regexp.lastIndex = 4;
+    config.bytes[1] = 9;
+    enforceToolSurfaceFence({ modeTool }, fence);
+
+    expect([...config.map]).toEqual([['mode', 'trusted']]);
+    expect([...config.set]).toEqual(['trusted']);
+    expect(config.date.toISOString()).toBe('2026-01-01T00:00:00.000Z');
+    expect(config.regexp.lastIndex).toBe(0);
+    expect([...config.bytes]).toEqual([1, 2, 3]);
+  });
+
+  it('rejects and restores a Map mutation that can change durable execution behavior', () => {
+    const config = new Map([['mode', 'trusted']]);
+    const modeTool = {
+      config,
+      execute: vi.fn(() => config.get('mode')),
+    };
+    const fence = createToolSurfaceFence({ modeTool });
+    config.set('mode', 'mutated');
+
+    expect(() => enforceReconstructibleToolSurface({ modeTool }, fence)).toThrow(
+      /cannot mutate executable tool "modeTool"/,
+    );
+    expect(config.get('mode')).toBe('trusted');
+    expect(modeTool.execute()).toBe('trusted');
+  });
+
+  it('restores RegExp.compile mutations to the exact retry baseline', () => {
+    const regexp = /trusted/giu;
+    regexp.lastIndex = 3;
+    const modeTool = {
+      config: regexp,
+      execute: vi.fn(() => ({ source: regexp.source, flags: regexp.flags, lastIndex: regexp.lastIndex })),
+    };
+    const fence = createToolSurfaceFence({ modeTool });
+
+    regexp.compile('mutated', 'm');
+    regexp.lastIndex = 9;
+
+    expect(() => enforceReconstructibleToolSurface({ modeTool }, fence)).toThrow(
+      /cannot mutate executable tool "modeTool"/,
+    );
+    expect({ source: regexp.source, flags: regexp.flags, lastIndex: regexp.lastIndex }).toEqual({
+      source: 'trusted',
+      flags: 'giu',
+      lastIndex: 3,
+    });
+    expect(() => enforceReconstructibleToolSurface({ modeTool }, fence)).not.toThrow();
+    expect(modeTool.execute()).toEqual({ source: 'trusted', flags: 'giu', lastIndex: 3 });
+  });
+
+  it('restores direct executable state retained on a protected function object', () => {
+    const execute = Object.assign(vi.fn(), { mode: 'trusted' });
+    const modeTool = { execute };
+    const fence = createToolSurfaceFence({ modeTool });
+
+    execute.mode = 'mutated';
+
+    expect(() => enforceReconstructibleToolSurface({ modeTool }, fence)).toThrow(
+      /cannot mutate executable tool "modeTool"/,
+    );
+    expect(execute.mode).toBe('trusted');
+  });
+
+  it('captures function-owned invocation context by identity without recursively traversing it', () => {
+    const lastContext = {
+      requestContext: new RequestContext(),
+      abortSignal: new AbortController().signal,
+    };
+    const execute = Object.assign(vi.fn(), {
+      lastContext,
+      mode: 'trusted',
+    });
+    const modeTool = { execute };
+
+    const fence = createToolSurfaceFence({ modeTool });
+
+    expect(() => enforceReconstructibleToolSurface({ modeTool }, fence)).not.toThrow();
+    expect(execute.lastContext).toBe(lastContext);
+    expect(execute.mode).toBe('trusted');
+  });
+
+  it('rejects a closure bypass that replaces object-valued state on the registered execute function', () => {
+    const execute = Object.assign(vi.fn(), { policy: { mode: 'trusted' } });
+    const modeTool = { execute };
+    const trustedFence = createToolSurfaceFence({ modeTool });
+    const processorView = createProcessorToolSurfaceView(trustedFence);
+    const processorClosure = () => {
+      execute.policy = { mode: 'poisoned' };
+      return processorView.tools;
+    };
+
+    const processorTools = processorClosure();
+
+    expect(() => enforceReconstructibleToolSurface(processorTools, trustedFence, processorView.fence)).toThrow(
+      /cannot mutate executable tool "modeTool"/,
+    );
+    expect(execute.policy).toEqual({ mode: 'trusted' });
+  });
+
+  it('isolates irreversible processor mutations and gives the next retry a pristine baseline', () => {
+    const modeTool = { execute: vi.fn(), config: { mode: 'trusted' } };
+    const trustedFence = createToolSurfaceFence({ modeTool });
+    const firstAttempt = createProcessorToolSurfaceView(trustedFence);
+
+    Object.freeze(firstAttempt.tools.modeTool);
+
+    expect(() => enforceReconstructibleToolSurface(firstAttempt.tools, trustedFence, firstAttempt.fence)).toThrow(
+      /cannot mutate executable tool "modeTool"/,
+    );
+    expect(Object.isExtensible(modeTool)).toBe(true);
+    expect(modeTool.config.mode).toBe('trusted');
+
+    const retryAttempt = createProcessorToolSurfaceView(trustedFence);
+    expect(enforceReconstructibleToolSurface(retryAttempt.tools, trustedFence, retryAttempt.fence)).toEqual({
+      modeTool,
+    });
+  });
+
+  it('keeps private class state off the processor view', () => {
+    class PrivateConfiguration {
+      #mode = 'trusted';
+
+      setMode(mode: string) {
+        this.#mode = mode;
+      }
+
+      readMode() {
+        return this.#mode;
+      }
+    }
+    const configuration = new PrivateConfiguration();
+    const modeTool = { config: configuration };
+    const trustedFence = createToolSurfaceFence({ modeTool });
+    const processorView = createProcessorToolSurfaceView(trustedFence);
+    const processorConfiguration = (processorView.tools.modeTool as typeof modeTool).config;
+
+    expect(() => processorConfiguration.setMode('mutated')).toThrow(/private member/);
+    expect(configuration.readMode()).toBe('trusted');
+    expect(enforceReconstructibleToolSurface(processorView.tools, trustedFence, processorView.fence)).toEqual({
+      modeTool,
+    });
+  });
+
+  it('fails closed while capturing protected built-ins whose internal state cannot be restored safely', () => {
+    expect(() => createToolSurfaceFence({ modeTool: { config: new WeakMap() } })).toThrow(
+      /cannot be snapshotted safely/,
+    );
+    expect(() => createToolSurfaceFence({ modeTool: { config: Promise.resolve('pending') } })).toThrow(
+      /cannot be snapshotted safely/,
+    );
+    expect(() => createToolSurfaceFence({ modeTool: { config: new WeakRef({}) } })).toThrow(
+      /internal-slot executable state cannot be snapshotted safely/,
+    );
+    expect(() => createToolSurfaceFence({ modeTool: { config: new URLSearchParams('mode=trusted') } })).toThrow(
+      /internal-slot executable state cannot be snapshotted safely/,
+    );
+    if (typeof SharedArrayBuffer !== 'undefined') {
+      expect(() => createToolSurfaceFence({ modeTool: { config: new SharedArrayBuffer(4) } })).toThrow(
+        /cannot be retained safely/,
+      );
+    }
+  });
+
+  it('continues to snapshot ordinary instances of user-defined classes', () => {
+    class ToolConfiguration {
+      mode = 'trusted';
+    }
+    const config = new ToolConfiguration();
+    const modeTool = { config };
+    const fence = createToolSurfaceFence({ modeTool });
+
+    config.mode = 'mutated';
+    enforceToolSurfaceFence({ modeTool }, fence);
+
+    expect(config.mode).toBe('trusted');
+  });
+
+  it('treats Symbol.toStringTag on an ordinary class as cosmetic rather than an opaque brand', () => {
+    class TaggedConfiguration {
+      mode = 'trusted';
+
+      get [Symbol.toStringTag]() {
+        return 'PapersFlowToolConfiguration';
+      }
+    }
+    const config = new TaggedConfiguration();
+    const modeTool = { config };
+    const fence = createToolSurfaceFence({ modeTool });
+
+    config.mode = 'mutated';
+    enforceToolSurfaceFence({ modeTool }, fence);
+
+    expect(config.mode).toBe('trusted');
   });
 
   it('preserves mutable runtime state that is not part of the tool definition', () => {
@@ -331,6 +558,32 @@ describe('replacement tool surface fence', () => {
     expect(providerTools).toEqual({ modeTool });
     expect(Object.getPrototypeOf(providerTools)).toBe(Object.prototype);
     expect(providerTools).not.toBe(processorTools);
+  });
+
+  it('rejects a stateful processor Proxy without leaving its trapped mutation behind', () => {
+    const originalExecute = vi.fn();
+    const injectedExecute = vi.fn();
+    const modeTool = { execute: originalExecute };
+    const fence = createToolSurfaceFence({ modeTool });
+    let enumeration = 0;
+    const ownKeys = vi.fn(() => {
+      enumeration++;
+      if (enumeration === 1) return ['modeTool'];
+      modeTool.execute = injectedExecute;
+      return [];
+    });
+    const getOwnPropertyDescriptor = vi.fn(() => {
+      modeTool.execute = injectedExecute;
+      return { value: modeTool, writable: true, enumerable: true, configurable: true };
+    });
+    const processorTools = new Proxy<Record<string, unknown>>({}, { ownKeys, getOwnPropertyDescriptor });
+
+    expect(() => enforceReconstructibleToolSurface(processorTools, fence)).toThrow(
+      /cannot mutate executable tool "modeTool"/,
+    );
+    expect(modeTool.execute).toBe(originalExecute);
+    expect(ownKeys).toHaveBeenCalledOnce();
+    expect(getOwnPropertyDescriptor).toHaveBeenCalledOnce();
   });
 
   it('rejects a persisted name ceiling without every concrete own implementation', () => {

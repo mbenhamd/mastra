@@ -4,18 +4,15 @@
  * There was previously no hook coverage anywhere under `agent/durable/`. These
  * tests pin how `beforeToolCall`/`afterToolCall` behave on the durable path.
  *
- * The durable path applies the hook layer once, at preparation time
- * (`preparation.ts` → `getToolsForExecution({ hooks })`), and the durable
- * tool-call step dispatches from that same preparation-time surface
+ * The durable path applies the hook layer through
+ * `getToolsForExecution({ hooks })`, and the durable tool-call step dispatches
+ * from that registry-backed or worker-reconstructed executable surface
  * (`registryEntry.tools` / `replacementToolSurface`, see
  * `workflows/steps/tool-call.ts`) rather than from the surface an input
- * processor returns to the `llm-execution` step. That step's tool surface only
- * decides what the MODEL is shown.
- *
- * Consequence, pinned by the last two tests: a durable input processor's
- * tool-surface mutations never reach execution at all. This is a durable
- * limitation that is broader than tool hooks (it applies with or without
- * hooks), so it is documented here rather than worked around in the hook layer.
+ * processor returns to the `llm-execution` step. To keep those surfaces
+ * truthful across worker reconstruction, durable input processors may remove
+ * tools but cannot add, replace, decorate, or mutate executable definitions.
+ * Around-call behavior belongs in the reconstructible hook layer.
  */
 
 import { MockLanguageModelV2, convertArrayToReadableStream } from '@internal/ai-sdk-v5/test';
@@ -26,6 +23,7 @@ import type { ProcessInputStepArgs } from '../../../processors';
 import { createTool } from '../../../tools';
 import type { CoreTool } from '../../../tools/types';
 import { Agent } from '../../agent';
+import { createToolSurfaceFence, enforceReconstructibleToolSurface } from '../../tool-surface-fence';
 import { createDurableAgent } from '../create-durable-agent';
 
 function createToolCallThenTextModel(
@@ -292,12 +290,7 @@ describe('DurableAgent tool hooks', () => {
     expect(afterToolCall).not.toHaveBeenCalled();
   });
 
-  // ---------------------------------------------------------------------------
-  // Known durable limitation (NOT a hook defect) — see file header.
-  // These two tests pin current behavior so a change is caught deliberately.
-  // ---------------------------------------------------------------------------
-
-  it('KNOWN GAP: a processor-ADDED durable tool is shown to the model but is not executable', async () => {
+  it('fails before provider execution when a processor adds a durable tool', async () => {
     const execute = vi.fn(async () => ({ message: 'dynamic' }));
     const beforeToolCall = vi.fn();
     const afterToolCall = vi.fn();
@@ -317,7 +310,10 @@ describe('DurableAgent tool hooks', () => {
       inputProcessors: [
         {
           id: 'add-dynamic-tool',
-          processInputStep: ({ tools }) => ({ tools: { ...tools, dynamicTool } }),
+          processInputStep: ({ tools }) => {
+            (tools as Record<string, CoreTool>).dynamicTool = dynamicTool;
+            return { tools };
+          },
         },
       ],
       hooks: { beforeToolCall, afterToolCall },
@@ -328,19 +324,15 @@ describe('DurableAgent tool hooks', () => {
     const chunks = await drain(output.fullStream as unknown as ReadableStream<any>);
     await cleanup();
 
-    // The durable tool-call step resolves executables from the preparation-time
-    // registry, which never saw the processor-added tool: the call fails with
-    // ToolNotFoundError instead of running. Hooks are moot — there is nothing to
-    // wrap. Wrapping the llm-execution step's surface would NOT fix this.
-    const toolError = chunks.find((c: any) => c.type === 'tool-error');
-    expect(toolError?.payload?.error?.name).toBe('ToolNotFoundError');
-    expect(visibleToolNames[0]).toContain('dynamicTool');
+    const error = chunks.find((c: any) => c.type === 'error');
+    expect(error?.payload?.error?.message).toMatch(/cannot add executable tool "dynamicTool"/);
+    expect(visibleToolNames).toEqual([]);
     expect(execute).not.toHaveBeenCalled();
     expect(beforeToolCall).not.toHaveBeenCalled();
     expect(afterToolCall).not.toHaveBeenCalled();
   });
 
-  it('KNOWN GAP: a processor-DECORATED durable tool executes the undecorated original, hooked exactly once', async () => {
+  it('fails before provider execution when a processor decorates a durable tool', async () => {
     const baseExecute = vi.fn(async () => ({ message: 'base' }));
     const decoratorCalls: string[] = [];
     const beforeToolCall = vi.fn();
@@ -386,19 +378,392 @@ describe('DurableAgent tool hooks', () => {
     const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
 
     const { output, cleanup } = await durableAgent.stream('run it');
-    await drain(output.fullStream as unknown as ReadableStream<any>);
+    const chunks = await drain(output.fullStream as unknown as ReadableStream<any>);
     await cleanup();
 
-    // The decorator never reaches execution (same registry-dispatch reason as
-    // above), so the hook layer is NOT inverted on the durable path: it still
-    // sits outside the executed tool and fires exactly once.
+    const error = chunks.find((c: any) => c.type === 'error');
+    expect(error?.payload?.error?.message).toMatch(/cannot replace executable tool "decoratedTool"/);
     expect(processInputStep).toHaveBeenCalled();
     expect(decoratorCalls).toEqual([]);
-    expect(baseExecute).toHaveBeenCalledOnce();
-    expect(beforeToolCall).toHaveBeenCalledOnce();
-    expect(afterToolCall).toHaveBeenCalledOnce();
-    expect(afterToolCall).toHaveBeenCalledWith(
-      expect.objectContaining({ toolName: 'decoratedTool', output: { message: 'base' } }),
+    expect(baseExecute).not.toHaveBeenCalled();
+    expect(beforeToolCall).not.toHaveBeenCalled();
+    expect(afterToolCall).not.toHaveBeenCalled();
+  });
+
+  it('fails before provider execution when a processor replaces a durable tool', async () => {
+    const baseExecute = vi.fn(async () => ({ message: 'base' }));
+    const replacementExecute = vi.fn(async () => ({ message: 'replacement' }));
+    const visibleToolNames: string[][] = [];
+    const replacementTool = createTool({
+      id: 'stableTool',
+      description: 'replacement implementation',
+      inputSchema: z.object({}),
+      execute: replacementExecute,
+    });
+    const baseAgent = new Agent({
+      id: 'durable-replaced-tool-agent',
+      name: 'Durable Replaced Tool Agent',
+      instructions: 'use the tool',
+      model: createToolCallThenTextModel('stableTool', {}, 'done', tools => visibleToolNames.push(tools)) as any,
+      tools: {
+        stableTool: createTool({
+          id: 'stableTool',
+          description: 'registered implementation',
+          inputSchema: z.object({}),
+          execute: baseExecute,
+        }),
+      },
+      inputProcessors: [
+        {
+          id: 'replace-tool',
+          processInputStep: ({ tools }) => ({ tools: { ...tools, stableTool: replacementTool } }),
+        },
+      ],
+    });
+    const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+    const { output, cleanup } = await durableAgent.stream('run it');
+    const chunks = await drain(output.fullStream as unknown as ReadableStream<any>);
+    await cleanup();
+
+    const error = chunks.find((c: any) => c.type === 'error');
+    expect(error?.payload?.error?.message).toMatch(/cannot replace executable tool "stableTool"/);
+    expect(visibleToolNames).toEqual([]);
+    expect(baseExecute).not.toHaveBeenCalled();
+    expect(replacementExecute).not.toHaveBeenCalled();
+  });
+
+  it('restores an in-place executable mutation before failing the durable run', async () => {
+    const baseExecute = vi.fn(async () => ({ message: 'base' }));
+    const mutatedExecute = vi.fn(async () => ({ message: 'mutated' }));
+    const registeredTool = createTool({
+      id: 'mutatedTool',
+      description: 'registered implementation',
+      inputSchema: z.object({}),
+      execute: baseExecute,
+    });
+    const registeredExecute = registeredTool.execute;
+    const baseAgent = new Agent({
+      id: 'durable-mutated-tool-agent',
+      name: 'Durable Mutated Tool Agent',
+      instructions: 'use the tool',
+      model: createToolCallThenTextModel('mutatedTool', {}, 'done') as any,
+      tools: { mutatedTool: registeredTool },
+      inputProcessors: [
+        {
+          id: 'mutate-tool-in-place',
+          processInputStep: ({ tools }) => {
+            (tools as Record<string, CoreTool>).mutatedTool!.execute = mutatedExecute;
+            return { tools };
+          },
+        },
+      ],
+    });
+    const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+    const { output, cleanup } = await durableAgent.stream('run it');
+    const chunks = await drain(output.fullStream as unknown as ReadableStream<any>);
+    await cleanup();
+
+    const error = chunks.find((c: any) => c.type === 'error');
+    expect(error?.payload?.error?.message).toMatch(/cannot mutate executable tool "mutatedTool"/);
+    expect(registeredTool.execute).toBe(registeredExecute);
+    expect(baseExecute).not.toHaveBeenCalled();
+    expect(mutatedExecute).not.toHaveBeenCalled();
+  });
+
+  it('keeps an irreversible processor mutation from poisoning the next durable run', async () => {
+    const execute = vi.fn(async () => ({ message: 'trusted' }));
+    const registeredTool = createTool({
+      id: 'retrySafeTool',
+      description: 'registered implementation',
+      inputSchema: z.object({}),
+      execute,
+    });
+    let processorCalls = 0;
+    const baseAgent = new Agent({
+      id: 'durable-irreversible-mutation-agent',
+      name: 'Durable Irreversible Mutation Agent',
+      instructions: 'use the tool',
+      model: createToolCallThenTextModel('retrySafeTool', {}, 'done') as any,
+      tools: { retrySafeTool: registeredTool },
+      inputProcessors: [
+        {
+          id: 'freeze-first-tool-view',
+          processInputStep: ({ tools }) => {
+            processorCalls++;
+            if (processorCalls === 1) Object.freeze((tools as Record<string, CoreTool>).retrySafeTool);
+            return { tools };
+          },
+        },
+      ],
+    });
+    const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+    const first = await durableAgent.stream('run it');
+    const firstChunks = await drain(first.output.fullStream as unknown as ReadableStream<any>);
+    await first.cleanup();
+
+    expect(firstChunks.find((chunk: any) => chunk.type === 'error')?.payload?.error?.message).toMatch(
+      /cannot mutate executable tool "retrySafeTool"/,
     );
+    expect(Object.isExtensible(registeredTool)).toBe(true);
+    expect(execute).not.toHaveBeenCalled();
+
+    const retry = await durableAgent.stream('run it again');
+    await drain(retry.output.fullStream as unknown as ReadableStream<any>);
+    await retry.cleanup();
+
+    expect(execute).toHaveBeenCalledOnce();
+  });
+
+  it('rejects a late mutation from a processor-returned activeTools Proxy', async () => {
+    const baseExecute = vi.fn(async () => ({ message: 'base' }));
+    const injectedExecute = vi.fn(async () => ({ message: 'injected' }));
+    const visibleToolNames: string[][] = [];
+    const registeredTool = createTool({
+      id: 'stableTool',
+      description: 'trusted description',
+      inputSchema: z.object({}),
+      execute: baseExecute,
+    });
+    let processorTool: CoreTool | undefined;
+    let processorExecute: CoreTool['execute'];
+    let processorDescription: string | undefined;
+    const baseAgent = new Agent({
+      id: 'durable-active-tools-proxy-agent',
+      name: 'Durable Active Tools Proxy Agent',
+      instructions: 'use the stable tool',
+      model: createToolCallThenTextModel('stableTool', {}, 'done', tools => visibleToolNames.push(tools)) as any,
+      tools: { stableTool: registeredTool },
+      inputProcessors: [
+        {
+          id: 'late-active-tools-mutation',
+          processInputStep: ({ tools }) => {
+            processorTool = (tools as Record<string, CoreTool>).stableTool;
+            processorExecute = processorTool?.execute;
+            processorDescription = processorTool?.description;
+            return {
+              tools,
+              activeTools: new Proxy(['stableTool'], {
+                get(target, key, receiver) {
+                  processorTool!.execute = injectedExecute;
+                  processorTool!.description = 'injected description';
+                  return Reflect.get(target, key, receiver);
+                },
+              }),
+            };
+          },
+        },
+      ],
+    });
+    const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+    const { output, cleanup } = await durableAgent.stream('run it');
+    const chunks = await drain(output.fullStream as unknown as ReadableStream<any>);
+    await cleanup();
+
+    const error = chunks.find((c: any) => c.type === 'error');
+    expect(error?.payload?.error?.message).toMatch(/cannot mutate executable tool "stableTool"/);
+    expect(processorTool?.execute).toBe(processorExecute);
+    expect(processorTool?.description).toBe(processorDescription);
+    expect(visibleToolNames).toEqual([]);
+    expect(baseExecute).not.toHaveBeenCalled();
+    expect(injectedExecute).not.toHaveBeenCalled();
+  });
+
+  it('rejects a late mutation from a processor-returned toolChoice Proxy', async () => {
+    const baseExecute = vi.fn(async () => ({ message: 'base' }));
+    const injectedExecute = vi.fn(async () => ({ message: 'injected' }));
+    const visibleToolNames: string[][] = [];
+    let processorTool: CoreTool | undefined;
+    let processorExecute: CoreTool['execute'];
+    const baseAgent = new Agent({
+      id: 'durable-tool-choice-proxy-agent',
+      name: 'Durable Tool Choice Proxy Agent',
+      instructions: 'use the stable tool',
+      model: createToolCallThenTextModel('stableTool', {}, 'done', tools => visibleToolNames.push(tools)) as any,
+      tools: {
+        stableTool: createTool({
+          id: 'stableTool',
+          description: 'trusted description',
+          inputSchema: z.object({}),
+          execute: baseExecute,
+        }),
+      },
+      inputProcessors: [
+        {
+          id: 'late-tool-choice-mutation',
+          processInputStep: ({ tools }) => {
+            processorTool = (tools as Record<string, CoreTool>).stableTool;
+            processorExecute = processorTool?.execute;
+            return {
+              tools,
+              toolChoice: new Proxy(
+                { type: 'tool' as const, toolName: 'stableTool' },
+                {
+                  get(target, key, receiver) {
+                    processorTool!.execute = injectedExecute;
+                    return Reflect.get(target, key, receiver);
+                  },
+                },
+              ),
+            };
+          },
+        },
+      ],
+    });
+    const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+    const { output, cleanup } = await durableAgent.stream('run it');
+    const chunks = await drain(output.fullStream as unknown as ReadableStream<any>);
+    await cleanup();
+
+    const error = chunks.find((c: any) => c.type === 'error');
+    expect(error?.payload?.error?.message).toMatch(/cannot mutate executable tool "stableTool"/);
+    expect(processorTool?.execute).toBe(processorExecute);
+    expect(visibleToolNames).toEqual([]);
+    expect(baseExecute).not.toHaveBeenCalled();
+    expect(injectedExecute).not.toHaveBeenCalled();
+  });
+
+  it('allows a processor to narrow the durable tool surface', async () => {
+    const keptExecute = vi.fn(async () => ({ message: 'kept' }));
+    const removedExecute = vi.fn(async () => ({ message: 'removed' }));
+    const visibleToolNames: string[][] = [];
+    const baseAgent = new Agent({
+      id: 'durable-narrowed-tool-agent',
+      name: 'Durable Narrowed Tool Agent',
+      instructions: 'use the kept tool',
+      model: createToolCallThenTextModel('keptTool', {}, 'done', tools => visibleToolNames.push(tools)) as any,
+      tools: {
+        keptTool: createTool({
+          id: 'keptTool',
+          description: 'kept',
+          inputSchema: z.object({}),
+          execute: keptExecute,
+        }),
+        removedTool: createTool({
+          id: 'removedTool',
+          description: 'removed',
+          inputSchema: z.object({}),
+          execute: removedExecute,
+        }),
+      },
+      inputProcessors: [
+        {
+          id: 'narrow-tools',
+          processInputStep: ({ tools }) => {
+            const { removedTool: _removedTool, ...keptTools } = tools as Record<string, CoreTool>;
+            return { tools: keptTools };
+          },
+        },
+      ],
+    });
+    const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+    const { output, cleanup } = await durableAgent.stream('run it', {
+      activeTools: ['keptTool', 'removedTool'],
+    });
+    const chunks = await drain(output.fullStream as unknown as ReadableStream<any>);
+    await cleanup();
+
+    expect(chunks.find((chunk: any) => chunk.type === 'error')).toBeUndefined();
+    expect(visibleToolNames).not.toHaveLength(0);
+    expect(visibleToolNames.every(names => names.includes('keptTool') && !names.includes('removedTool'))).toBe(true);
+    expect(keptExecute).toHaveBeenCalledOnce();
+    expect(removedExecute).not.toHaveBeenCalled();
+  });
+
+  it('allows a processor to return the unchanged durable tool surface', async () => {
+    const execute = vi.fn(async () => ({ message: 'same' }));
+    const processInputStep = vi.fn(({ tools }: ProcessInputStepArgs) => ({ tools }));
+    const baseAgent = new Agent({
+      id: 'durable-same-tool-agent',
+      name: 'Durable Same Tool Agent',
+      instructions: 'use the tool',
+      model: createToolCallThenTextModel('sameTool', {}, 'done') as any,
+      tools: {
+        sameTool: createTool({
+          id: 'sameTool',
+          description: 'same',
+          inputSchema: z.object({}),
+          execute,
+        }),
+      },
+      inputProcessors: [{ id: 'same-tools', processInputStep }],
+    });
+    const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+    const { output, cleanup } = await durableAgent.stream('run it');
+    const chunks = await drain(output.fullStream as unknown as ReadableStream<any>);
+    await cleanup();
+
+    expect(chunks.find((chunk: any) => chunk.type === 'error')).toBeUndefined();
+    expect(processInputStep).toHaveBeenCalled();
+    expect(execute).toHaveBeenCalledOnce();
+  });
+
+  it('does not treat a function-owned last invocation context as executable definition state', async () => {
+    type ContextRecordingExecute = CoreTool['execute'] & { lastContext?: unknown };
+    let execute: ContextRecordingExecute;
+    execute = Object.assign(async (_input: unknown, context: unknown) => {
+      execute.lastContext = context;
+      return { message: 'same' };
+    }, {});
+    const baseAgent = new Agent({
+      id: 'durable-function-runtime-context-agent',
+      name: 'Durable Function Runtime Context Agent',
+      instructions: 'use the tool',
+      model: createToolCallThenTextModel('contextTool', {}, 'done') as any,
+      tools: {
+        contextTool: createTool({
+          id: 'contextTool',
+          description: 'records its last invocation context',
+          inputSchema: z.object({}),
+          execute,
+        }),
+      },
+      inputProcessors: [{ id: 'same-tools', processInputStep: ({ tools }) => ({ tools }) }],
+    });
+    const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+    const first = await durableAgent.stream('run it');
+    const firstChunks = await drain(first.output.fullStream as unknown as ReadableStream<any>);
+    await first.cleanup();
+
+    expect(firstChunks.find((chunk: any) => chunk.type === 'error')).toBeUndefined();
+    expect(execute.lastContext).toBeDefined();
+
+    const second = await durableAgent.stream('run it again');
+    const secondChunks = await drain(second.output.fullStream as unknown as ReadableStream<any>);
+    await second.cleanup();
+
+    expect(secondChunks.find((chunk: any) => chunk.type === 'error')).toBeUndefined();
+  });
+
+  it('accepts a registered tool surface reconstructed on the current worker', async () => {
+    const execute = vi.fn(async () => ({ ok: true }));
+    const baseAgent = new Agent({
+      id: 'durable-reconstructed-tool-agent',
+      name: 'Durable Reconstructed Tool Agent',
+      instructions: 'use the tool',
+      model: createToolCallThenTextModel('reconstructedTool', {}, 'done') as any,
+      tools: {
+        reconstructedTool: createTool({
+          id: 'reconstructedTool',
+          description: 'registered tool',
+          inputSchema: z.object({}),
+          execute,
+        }),
+      },
+      hooks: { beforeToolCall: vi.fn() },
+    });
+    const firstWorkerSurface = await baseAgent.getToolsForExecution({});
+    const reconstructedSurface = await baseAgent.getToolsForExecution({});
+    const fence = createToolSurfaceFence(reconstructedSurface);
+
+    expect(reconstructedSurface.reconstructedTool).not.toBe(firstWorkerSurface.reconstructedTool);
+    expect(enforceReconstructibleToolSurface({ ...reconstructedSurface }, fence)).toEqual(reconstructedSurface);
   });
 });
