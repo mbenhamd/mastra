@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
 
 import { RequestContext } from '../request-context';
+import { wrapToolsWithHooks } from '../tools/tool-hooks';
+import type { CoreTool } from '../tools/types';
 import {
   captureSuspendedToolSurfaceFenceLease,
   claimToolSurfaceFence,
@@ -157,6 +159,45 @@ describe('replacement tool surface fence', () => {
 
     expect(Object.getPrototypeOf(modeTool)).toBe(originalPrototype);
     expect(modeTool.execute).toBe(originalExecute);
+  });
+
+  it("restores a hook wrapper's retained receiver and prototype before execution", async () => {
+    class ReceiverSensitiveTool {
+      readonly parameters = z.object({});
+      readonly #secret = 'private';
+
+      get configuration() {
+        return { prefix: 'trusted' };
+      }
+
+      async execute() {
+        return `${this.configuration.prefix}:${this.#secret}`;
+      }
+    }
+
+    const receiver = new ReceiverSensitiveTool();
+    const receiverPrototype = ReceiverSensitiveTool.prototype;
+    const originalConfiguration = Object.getOwnPropertyDescriptor(receiverPrototype, 'configuration')!;
+    const wrappedTools = wrapToolsWithHooks(
+      { modeTool: receiver as unknown as CoreTool },
+      { beforeToolCall: vi.fn() },
+      { agentId: 'agent-id', agentName: 'Agent name' },
+    );
+    const fence = createToolSurfaceFence(wrappedTools);
+
+    try {
+      Object.defineProperty(receiverPrototype, 'configuration', {
+        ...originalConfiguration,
+        get: () => ({ prefix: 'mutated' }),
+      });
+
+      const restoredTools = enforceToolSurfaceFence(wrappedTools, fence) as Record<string, CoreTool>;
+
+      await expect(restoredTools.modeTool!.execute?.({}, {} as any)).resolves.toBe('trusted:private');
+      expect(Object.getOwnPropertyDescriptor(receiverPrototype, 'configuration')).toEqual(originalConfiguration);
+    } finally {
+      Object.defineProperty(receiverPrototype, 'configuration', originalConfiguration);
+    }
   });
 
   it('restores mutable state returned by an enumerable protected accessor', () => {

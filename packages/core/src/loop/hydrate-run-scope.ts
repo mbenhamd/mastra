@@ -64,5 +64,12 @@ export function hydrateRunScopeFromInternal(mastra: Mastra, runId: string, inter
   if (internal.drainPendingSignals) scope.set(DRAIN_PENDING_SIGNALS_KEY, internal.drainPendingSignals);
   if (internal.initialSignalEchoes) scope.set(INITIAL_SIGNAL_ECHOES_KEY, internal.initialSignalEchoes);
   if (internal.toolPayloadTransform) scope.set(TOOL_PAYLOAD_TRANSFORM_KEY, internal.toolPayloadTransform);
-  if (internal.toolHooks) scope.set(TOOL_HOOKS_KEY, internal.toolHooks);
+  // Hooks are execution-segment scoped. A same-process resume can reuse the
+  // run scope, so absence here must clear the prior segment's closures instead
+  // of letting final-loop wrapping resurrect them.
+  if (internal.toolHooks?.beforeToolCall || internal.toolHooks?.afterToolCall) {
+    scope.set(TOOL_HOOKS_KEY, internal.toolHooks);
+  } else {
+    scope.delete(TOOL_HOOKS_KEY);
+  }
 }

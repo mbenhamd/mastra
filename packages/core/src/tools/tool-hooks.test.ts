@@ -88,6 +88,19 @@ describe('wrapToolsWithHooks', () => {
     expect(runBefore).toHaveBeenCalledOnce();
   });
 
+  it('removes an earlier hook binding when the effective hooks are empty', async () => {
+    const execute = vi.fn(async () => 'result');
+    const initialBefore = vi.fn();
+    const initial = wrapToolsWithHooks({ example: makeTool(execute) }, { beforeToolCall: initialBefore }, metadata);
+
+    const final = wrapToolsWithHooks(initial, undefined, metadata);
+    const output = await final.example!.execute?.({}, {} as any);
+
+    expect(output).toBe('result');
+    expect(execute).toHaveBeenCalledOnce();
+    expect(initialBefore).not.toHaveBeenCalled();
+  });
+
   it('wraps a processor replacement with a new executor', async () => {
     const initialExecute = vi.fn(async () => 'initial');
     const replacementExecute = vi.fn(async () => 'replacement');

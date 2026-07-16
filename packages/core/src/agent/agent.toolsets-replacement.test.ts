@@ -581,39 +581,60 @@ describe('Agent replacement toolsets', () => {
     'retains the original replacement surface across direct Agent suspension and resume',
     { timeout: 30_000 },
     async () => {
+      // This is deliberately a same-process contract. Per-call hook closures
+      // are not serializable; defining a cross-process recovery policy for
+      // them is separate work and must fail closed rather than fabricate one.
       const visibleToolNames: string[][] = [];
       const approvedExecute = vi.fn().mockResolvedValue('approved');
+      const freshExecute = vi.fn().mockResolvedValue('fresh');
+      const configuredBefore = vi.fn();
+      const initialBefore = vi.fn();
+      const resumedBefore = vi.fn();
+      const afterToolCall = vi.fn();
       let callCount = 0;
       const model = new MockLanguageModelV2({
         doStream: async options => {
           visibleToolNames.push((options.tools ?? []).map(tool => tool.name));
           callCount++;
-          return {
-            rawCall: { rawPrompt: null, rawSettings: {} },
-            warnings: [],
-            stream: convertArrayToReadableStream(
-              callCount === 1
+          const content =
+            callCount === 1
+              ? [
+                  { type: 'stream-start' as const, warnings: [] },
+                  { type: 'response-metadata' as const, id: 'initial', modelId: 'mock', timestamp: new Date(0) },
+                  {
+                    type: 'tool-call' as const,
+                    toolCallId: 'approval-call',
+                    toolName: 'approvalTool',
+                    input: '{}',
+                    providerExecuted: false,
+                  },
+                  { type: 'finish' as const, finishReason: 'tool-calls' as const, usage },
+                ]
+              : callCount === 2
                 ? [
-                    { type: 'stream-start', warnings: [] },
-                    { type: 'response-metadata', id: 'initial', modelId: 'mock', timestamp: new Date(0) },
+                    { type: 'stream-start' as const, warnings: [] },
+                    { type: 'response-metadata' as const, id: 'resumed', modelId: 'mock', timestamp: new Date(0) },
                     {
-                      type: 'tool-call',
-                      toolCallId: 'approval-call',
-                      toolName: 'approvalTool',
+                      type: 'tool-call' as const,
+                      toolCallId: 'fresh-call',
+                      toolName: 'freshTool',
                       input: '{}',
                       providerExecuted: false,
                     },
-                    { type: 'finish', finishReason: 'tool-calls', usage },
+                    { type: 'finish' as const, finishReason: 'tool-calls' as const, usage },
                   ]
                 : [
-                    { type: 'stream-start', warnings: [] },
-                    { type: 'response-metadata', id: 'resumed', modelId: 'mock', timestamp: new Date(0) },
-                    { type: 'text-start', id: 'text-1' },
-                    { type: 'text-delta', id: 'text-1', delta: 'done' },
-                    { type: 'text-end', id: 'text-1' },
-                    { type: 'finish', finishReason: 'stop', usage },
-                  ],
-            ),
+                    { type: 'stream-start' as const, warnings: [] },
+                    { type: 'response-metadata' as const, id: 'final', modelId: 'mock', timestamp: new Date(0) },
+                    { type: 'text-start' as const, id: 'text-1' },
+                    { type: 'text-delta' as const, id: 'text-1', delta: 'done' },
+                    { type: 'text-end' as const, id: 'text-1' },
+                    { type: 'finish' as const, finishReason: 'stop' as const, usage },
+                  ];
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: convertArrayToReadableStream(content),
           };
         },
       });
@@ -623,6 +644,7 @@ describe('Agent replacement toolsets', () => {
         instructions: 'test',
         model,
         tools: { adminTool: testTool('adminTool') },
+        hooks: { beforeToolCall: configuredBefore, afterToolCall },
       });
       new Mastra({ agents: { agent }, logger: false, storage: new InMemoryStore() });
       const requestContext = new RequestContext();
@@ -633,23 +655,162 @@ describe('Agent replacement toolsets', () => {
         requireApproval: true,
         execute: approvedExecute,
       });
+      const freshTool = createTool({
+        id: 'freshTool',
+        description: 'freshTool',
+        inputSchema: z.object({}),
+        execute: freshExecute,
+      });
       const initial = await agent.stream('start', {
         runId: 'resume-replacement-run',
         requestContext,
         toolsetsMode: 'replace',
-        toolsets: { approval: { approvalTool } },
+        toolsets: { approval: { approvalTool, freshTool } },
+        hooks: { beforeToolCall: initialBefore },
       });
       const suspended = await initial.getFullOutput();
       expect(suspended.finishReason).toBe('suspended');
 
       const resumed = await agent.resumeStream(
         { approved: true },
-        { runId: initial.runId, toolCallId: 'approval-call', requestContext },
+        {
+          runId: initial.runId,
+          toolCallId: 'approval-call',
+          requestContext,
+          hooks: { beforeToolCall: resumedBefore },
+        },
       );
       await resumed.getFullOutput();
 
-      expect(visibleToolNames).toEqual([['approvalTool'], ['approvalTool']]);
+      expect(visibleToolNames).toEqual([
+        ['approvalTool', 'freshTool'],
+        ['approvalTool', 'freshTool'],
+        ['approvalTool', 'freshTool'],
+      ]);
+      expect(configuredBefore).not.toHaveBeenCalled();
+      // The already-suspended approval call belongs to the initial segment and
+      // retains that segment's hook. A fresh call produced after resume uses
+      // the hook rebound while materializing the claimed same-process fence.
+      expect(initialBefore).toHaveBeenCalledOnce();
+      expect(initialBefore).toHaveBeenCalledWith(expect.objectContaining({ toolName: 'approvalTool' }));
+      expect(resumedBefore).toHaveBeenCalledOnce();
+      expect(resumedBefore).toHaveBeenCalledWith(expect.objectContaining({ toolName: 'freshTool' }));
       expect(approvedExecute).toHaveBeenCalledOnce();
+      expect(freshExecute).toHaveBeenCalledOnce();
+      expect(afterToolCall).toHaveBeenCalledTimes(2);
+      expect(readToolSurfaceFence(requestContext, initial.runId)).toBeUndefined();
+    },
+  );
+
+  it(
+    'does not retain an initial per-call hook for fresh replacement calls after same-process resume',
+    { timeout: 30_000 },
+    async () => {
+      const visibleToolNames: string[][] = [];
+      const approvedExecute = vi.fn().mockResolvedValue('approved');
+      const freshExecute = vi.fn().mockResolvedValue('fresh');
+      const initialBefore = vi.fn();
+      let callCount = 0;
+      const model = new MockLanguageModelV2({
+        doStream: async options => {
+          visibleToolNames.push((options.tools ?? []).map(tool => tool.name));
+          callCount++;
+          const content =
+            callCount === 1
+              ? [
+                  { type: 'stream-start' as const, warnings: [] },
+                  { type: 'response-metadata' as const, id: 'initial', modelId: 'mock', timestamp: new Date(0) },
+                  {
+                    type: 'tool-call' as const,
+                    toolCallId: 'approval-call',
+                    toolName: 'approvalTool',
+                    input: '{}',
+                    providerExecuted: false,
+                  },
+                  { type: 'finish' as const, finishReason: 'tool-calls' as const, usage },
+                ]
+              : callCount === 2
+                ? [
+                    { type: 'stream-start' as const, warnings: [] },
+                    { type: 'response-metadata' as const, id: 'resumed', modelId: 'mock', timestamp: new Date(0) },
+                    {
+                      type: 'tool-call' as const,
+                      toolCallId: 'fresh-call',
+                      toolName: 'freshTool',
+                      input: '{}',
+                      providerExecuted: false,
+                    },
+                    { type: 'finish' as const, finishReason: 'tool-calls' as const, usage },
+                  ]
+                : [
+                    { type: 'stream-start' as const, warnings: [] },
+                    { type: 'response-metadata' as const, id: 'final', modelId: 'mock', timestamp: new Date(0) },
+                    { type: 'text-start' as const, id: 'text-1' },
+                    { type: 'text-delta' as const, id: 'text-1', delta: 'done' },
+                    { type: 'text-end' as const, id: 'text-1' },
+                    { type: 'finish' as const, finishReason: 'stop' as const, usage },
+                  ];
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: convertArrayToReadableStream(content),
+          };
+        },
+      });
+      const agent = new Agent({
+        id: 'resume-cleared-hook-agent',
+        name: 'resume-cleared-hook-agent',
+        instructions: 'test',
+        model,
+      });
+      new Mastra({ agents: { agent }, logger: false, storage: new InMemoryStore() });
+      const requestContext = new RequestContext();
+      const approvalTool = createTool({
+        id: 'approvalTool',
+        description: 'approvalTool',
+        inputSchema: z.object({}),
+        requireApproval: true,
+        execute: approvedExecute,
+      });
+      const freshTool = createTool({
+        id: 'freshTool',
+        description: 'freshTool',
+        inputSchema: z.object({}),
+        execute: freshExecute,
+      });
+      const initial = await agent.stream('start', {
+        runId: 'resume-cleared-hook-run',
+        requestContext,
+        toolsetsMode: 'replace',
+        toolsets: { approval: { approvalTool, freshTool } },
+        hooks: { beforeToolCall: initialBefore },
+      });
+      const suspended = await initial.getFullOutput();
+      expect(suspended.finishReason).toBe('suspended');
+
+      const resumed = await agent.resumeStream(
+        { approved: true },
+        {
+          runId: initial.runId,
+          toolCallId: 'approval-call',
+          requestContext,
+        },
+      );
+      await resumed.getFullOutput();
+
+      expect(visibleToolNames).toEqual([
+        ['approvalTool', 'freshTool'],
+        ['approvalTool', 'freshTool'],
+        ['approvalTool', 'freshTool'],
+      ]);
+      // The pending approval belongs to the initial segment and keeps that
+      // segment's hook. The fresh post-resume call passes through final-loop
+      // re-fencing with an empty effective binding and must not resurrect it.
+      expect(initialBefore).toHaveBeenCalledOnce();
+      expect(initialBefore).toHaveBeenCalledWith(expect.objectContaining({ toolName: 'approvalTool' }));
+      expect(initialBefore).not.toHaveBeenCalledWith(expect.objectContaining({ toolName: 'freshTool' }));
+      expect(approvedExecute).toHaveBeenCalledOnce();
+      expect(freshExecute).toHaveBeenCalledOnce();
       expect(readToolSurfaceFence(requestContext, initial.runId)).toBeUndefined();
     },
   );

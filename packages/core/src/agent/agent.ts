@@ -6155,7 +6155,11 @@ export class Agent<
             `Cannot resume replacement tool surface for run ${runId ?? '<unknown>'}: the persisted and in-process tool ceilings disagree.`,
           );
         }
-        return materializeToolSurfaceFence(existingFence) as Record<string, CoreTool>;
+        return wrapToolsWithHooks(
+          materializeToolSurfaceFence(existingFence) as Record<string, CoreTool>,
+          this.resolveToolHooks(hooks),
+          { agentId, agentName },
+        );
       }
     } else if (registerToolSurfaceFence && readToolSurfaceFence(requestContext, runId)) {
       throw new Error(
@@ -6219,6 +6223,7 @@ export class Agent<
           logger,
         ) as typeof formattedTools;
       }
+      formattedTools = wrapToolsWithHooks(formattedTools, this.resolveToolHooks(hooks), { agentId, agentName });
       const fence = registerToolSurfaceFence
         ? stampToolSurfaceFence(requestContext, runId, formattedTools, fenceOwnerId)
         : createToolSurfaceFence(formattedTools);

@@ -19,6 +19,22 @@ type HookWrappedExecute = ToolExecute & {
 };
 
 /**
+ * Returns the receiver retained by a hook wrapper without invoking a tool
+ * accessor. Replacement-surface fences use this to protect the executable
+ * object graph hidden behind the wrapper closure.
+ *
+ * @internal
+ */
+export function getToolHookSnapshotTarget(tool: object): CoreTool | undefined {
+  const executeDescriptor = Object.getOwnPropertyDescriptor(tool, 'execute');
+  if (!executeDescriptor || !('value' in executeDescriptor) || typeof executeDescriptor.value !== 'function') {
+    return undefined;
+  }
+
+  return (executeDescriptor.value as HookWrappedExecute)[TOOL_HOOK_WRAPPER_STATE]?.originalReceiver;
+}
+
+/**
  * Removes the agent hook layer before tools are exposed to input processors.
  * Processors can then decorate an existing executor without closing over an
  * already-hooked function that would fire again after the final surface is
@@ -127,7 +143,8 @@ function wrapToolWithHooks(
  *
  * Reapplying the same binding is idempotent, including after a processor
  * shallow-clones a tool object. A changed executor is treated as a replacement
- * and receives the effective hook binding exactly once.
+ * and receives the effective hook binding exactly once. An empty effective
+ * binding removes any wrapper retained from an earlier execution segment.
  *
  * @internal
  */
@@ -136,7 +153,7 @@ export function wrapToolsWithHooks(
   hooks: ToolHooks | undefined,
   metadata: { agentId: string; agentName: string },
 ): Record<string, CoreTool> {
-  if (!hooks?.beforeToolCall && !hooks?.afterToolCall) return tools;
+  if (!hooks?.beforeToolCall && !hooks?.afterToolCall) return unwrapToolsFromHooks(tools);
 
   return Object.fromEntries(
     Object.entries(tools).map(([toolName, tool]) => [toolName, wrapToolWithHooks(toolName, tool, hooks, metadata)]),

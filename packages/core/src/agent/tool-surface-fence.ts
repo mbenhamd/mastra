@@ -1,4 +1,5 @@
 import type { RequestContext } from '../request-context';
+import { getToolHookSnapshotTarget } from '../tools/tool-hooks';
 
 const DEFAULT_RUN_KEY = '__default__';
 const MAX_RETAINED_FENCES_PER_CONTEXT = 64;
@@ -298,7 +299,29 @@ function snapshotToolImplementation(tool: object): ToolObjectSnapshot {
     [...PROTECTED_TOOL_DEFINITION_KEYS, ...symbolKeys],
     DEEP_PROTECTED_TOOL_DEFINITION_KEYS,
   )!;
-  return Object.freeze({ ...snapshot, prototypeSnapshots: freezePrototypeSnapshots(state) });
+  // Hook wrapping deliberately clones a tool while retaining the true method
+  // receiver in the execute closure. Snapshot that receiver as part of the
+  // same graph so a later processor cannot mutate its prototype/configuration
+  // outside the replacement fence. Keeping the original receiver also
+  // preserves class private-field semantics when the hook invokes execute.
+  const hookSnapshotTarget = getToolHookSnapshotTarget(tool);
+  const hookTargetSnapshot =
+    hookSnapshotTarget && hookSnapshotTarget !== tool
+      ? snapshotObjectGraph(
+          hookSnapshotTarget,
+          state,
+          [
+            ...PROTECTED_TOOL_DEFINITION_KEYS,
+            ...Reflect.ownKeys(hookSnapshotTarget).filter((key): key is symbol => typeof key === 'symbol'),
+          ],
+          DEEP_PROTECTED_TOOL_DEFINITION_KEYS,
+        )
+      : undefined;
+  return Object.freeze({
+    ...snapshot,
+    children: hookTargetSnapshot ? Object.freeze([...snapshot.children, hookTargetSnapshot]) : snapshot.children,
+    prototypeSnapshots: freezePrototypeSnapshots(state),
+  });
 }
 
 function sameDescriptor(current: PropertyDescriptor | undefined, original: PropertyDescriptor): boolean {

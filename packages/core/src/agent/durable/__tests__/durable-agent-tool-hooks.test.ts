@@ -22,15 +22,22 @@ import { MockLanguageModelV2, convertArrayToReadableStream } from '@internal/ai-
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { z } from 'zod';
 import { EventEmitterPubSub } from '../../../events/event-emitter';
+import type { ProcessInputStepArgs } from '../../../processors';
 import { createTool } from '../../../tools';
 import type { CoreTool } from '../../../tools/types';
 import { Agent } from '../../agent';
 import { createDurableAgent } from '../create-durable-agent';
 
-function createToolCallThenTextModel(toolName: string, args: Record<string, unknown>, finalText: string) {
+function createToolCallThenTextModel(
+  toolName: string,
+  args: Record<string, unknown>,
+  finalText: string,
+  onVisibleTools?: (toolNames: string[]) => void,
+) {
   let callCount = 0;
   return new MockLanguageModelV2({
-    doStream: async () => {
+    doStream: async options => {
+      onVisibleTools?.((options.tools ?? []).map(tool => tool.name));
       callCount++;
       if (callCount === 1) {
         return {
@@ -175,6 +182,116 @@ describe('DurableAgent tool hooks', () => {
     expect(afterToolCall).not.toHaveBeenCalled();
   });
 
+  it('runs a configured short-circuit hook exactly once for a durable replacement toolset', async () => {
+    const execute = vi.fn(async () => ({ ok: true }));
+    const beforeToolCall = vi.fn(() => ({ proceed: false as const, output: { message: 'blocked' } }));
+    const afterToolCall = vi.fn();
+    const replacementTool = createTool({
+      id: 'replacementTool',
+      description: 'replacement',
+      inputSchema: z.object({}),
+      execute,
+    });
+
+    const baseAgent = new Agent({
+      id: 'durable-replacement-configured-hook-agent',
+      name: 'Durable Replacement Configured Hook Agent',
+      instructions: 'use the tool',
+      model: createToolCallThenTextModel('replacementTool', {}, 'done') as any,
+      hooks: { beforeToolCall, afterToolCall },
+    });
+    const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+    const { output, cleanup } = await durableAgent.stream('run it', {
+      toolsets: { mode: { replacementTool } },
+      toolsetsMode: 'replace',
+    });
+    await drain(output.fullStream as unknown as ReadableStream<any>);
+    await cleanup();
+
+    expect(beforeToolCall).toHaveBeenCalledOnce();
+    expect(beforeToolCall).toHaveBeenCalledWith(expect.objectContaining({ toolName: 'replacementTool' }));
+    expect(execute).not.toHaveBeenCalled();
+    expect(afterToolCall).not.toHaveBeenCalled();
+  });
+
+  it('runs before, execute, and after exactly once for a proceeding durable replacement toolset', async () => {
+    const calls: string[] = [];
+    const execute = vi.fn(async () => {
+      calls.push('execute');
+      return { ok: true };
+    });
+    const beforeToolCall = vi.fn(() => {
+      calls.push('before');
+    });
+    const afterToolCall = vi.fn(() => {
+      calls.push('after');
+    });
+    const replacementTool = createTool({
+      id: 'replacementTool',
+      description: 'replacement',
+      inputSchema: z.object({}),
+      execute,
+    });
+
+    const baseAgent = new Agent({
+      id: 'durable-replacement-proceeding-hook-agent',
+      name: 'Durable Replacement Proceeding Hook Agent',
+      instructions: 'use the tool',
+      model: createToolCallThenTextModel('replacementTool', {}, 'done') as any,
+      hooks: { beforeToolCall, afterToolCall },
+    });
+    const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+    const { output, cleanup } = await durableAgent.stream('run it', {
+      toolsets: { mode: { replacementTool } },
+      toolsetsMode: 'replace',
+    });
+    await drain(output.fullStream as unknown as ReadableStream<any>);
+    await cleanup();
+
+    expect(beforeToolCall).toHaveBeenCalledOnce();
+    expect(execute).toHaveBeenCalledOnce();
+    expect(afterToolCall).toHaveBeenCalledOnce();
+    expect(calls).toEqual(['before', 'execute', 'after']);
+  });
+
+  it('runs a per-call short-circuit hook exactly once for a durable replacement toolset', async () => {
+    const execute = vi.fn(async () => ({ ok: true }));
+    const configuredBefore = vi.fn();
+    const runBefore = vi.fn(() => ({ proceed: false as const, output: { message: 'blocked' } }));
+    const afterToolCall = vi.fn();
+    const replacementTool = createTool({
+      id: 'replacementTool',
+      description: 'replacement',
+      inputSchema: z.object({}),
+      execute,
+    });
+
+    const baseAgent = new Agent({
+      id: 'durable-replacement-run-hook-agent',
+      name: 'Durable Replacement Run Hook Agent',
+      instructions: 'use the tool',
+      model: createToolCallThenTextModel('replacementTool', {}, 'done') as any,
+      hooks: { beforeToolCall: configuredBefore, afterToolCall },
+    });
+    const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+    const { output, cleanup } = await durableAgent.stream('run it', {
+      toolsets: { mode: { replacementTool } },
+      toolsetsMode: 'replace',
+      hooks: { beforeToolCall: runBefore },
+    });
+    await drain(output.fullStream as unknown as ReadableStream<any>);
+    await cleanup();
+
+    expect(configuredBefore).not.toHaveBeenCalled();
+    expect(runBefore).toHaveBeenCalledOnce();
+    expect(runBefore).toHaveBeenCalledWith(expect.objectContaining({ toolName: 'replacementTool' }));
+    expect(execute).not.toHaveBeenCalled();
+    expect(afterToolCall).not.toHaveBeenCalled();
+  });
+
   // ---------------------------------------------------------------------------
   // Known durable limitation (NOT a hook defect) — see file header.
   // These two tests pin current behavior so a change is caught deliberately.
@@ -184,6 +301,7 @@ describe('DurableAgent tool hooks', () => {
     const execute = vi.fn(async () => ({ message: 'dynamic' }));
     const beforeToolCall = vi.fn();
     const afterToolCall = vi.fn();
+    const visibleToolNames: string[][] = [];
     const dynamicTool = createTool({
       id: 'dynamicTool',
       description: 'processor-added durable tool',
@@ -195,7 +313,7 @@ describe('DurableAgent tool hooks', () => {
       id: 'durable-added-tool-agent',
       name: 'Durable Added Tool Agent',
       instructions: 'use the tool',
-      model: createToolCallThenTextModel('dynamicTool', {}, 'done') as any,
+      model: createToolCallThenTextModel('dynamicTool', {}, 'done', tools => visibleToolNames.push(tools)) as any,
       inputProcessors: [
         {
           id: 'add-dynamic-tool',
@@ -216,6 +334,7 @@ describe('DurableAgent tool hooks', () => {
     // wrap. Wrapping the llm-execution step's surface would NOT fix this.
     const toolError = chunks.find((c: any) => c.type === 'tool-error');
     expect(toolError?.payload?.error?.name).toBe('ToolNotFoundError');
+    expect(visibleToolNames[0]).toContain('dynamicTool');
     expect(execute).not.toHaveBeenCalled();
     expect(beforeToolCall).not.toHaveBeenCalled();
     expect(afterToolCall).not.toHaveBeenCalled();
@@ -226,6 +345,22 @@ describe('DurableAgent tool hooks', () => {
     const decoratorCalls: string[] = [];
     const beforeToolCall = vi.fn();
     const afterToolCall = vi.fn();
+    const processInputStep = vi.fn(({ tools }: ProcessInputStepArgs) => {
+      const target = (tools as Record<string, CoreTool>).decoratedTool!;
+      const inner = target.execute!;
+      return {
+        tools: {
+          ...tools,
+          decoratedTool: {
+            ...target,
+            execute: async (input: any, ctx: any) => {
+              decoratorCalls.push('decorator');
+              return inner(input, ctx);
+            },
+          } as CoreTool,
+        },
+      };
+    });
 
     const baseAgent = new Agent({
       id: 'durable-decorated-tool-agent',
@@ -243,22 +378,7 @@ describe('DurableAgent tool hooks', () => {
       inputProcessors: [
         {
           id: 'decorate-tool',
-          processInputStep: ({ tools }) => {
-            const target = (tools as Record<string, CoreTool>).decoratedTool!;
-            const inner = target.execute!;
-            return {
-              tools: {
-                ...tools,
-                decoratedTool: {
-                  ...target,
-                  execute: async (input: any, ctx: any) => {
-                    decoratorCalls.push('decorator');
-                    return inner(input, ctx);
-                  },
-                } as CoreTool,
-              },
-            };
-          },
+          processInputStep,
         },
       ],
       hooks: { beforeToolCall, afterToolCall },
@@ -272,6 +392,7 @@ describe('DurableAgent tool hooks', () => {
     // The decorator never reaches execution (same registry-dispatch reason as
     // above), so the hook layer is NOT inverted on the durable path: it still
     // sits outside the executed tool and fires exactly once.
+    expect(processInputStep).toHaveBeenCalled();
     expect(decoratorCalls).toEqual([]);
     expect(baseExecute).toHaveBeenCalledOnce();
     expect(beforeToolCall).toHaveBeenCalledOnce();

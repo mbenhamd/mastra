@@ -188,6 +188,18 @@ describe('hydrateRunScopeFromInternal', () => {
     mastra.__releaseRunScope('run-1');
   });
 
+  it('clears hooks when a later execution segment has no effective hook callbacks', () => {
+    const mastra = makeMastra();
+    mastra.__createRunScope('run-1');
+    const scope = mastra.__getRunScope('run-1')!;
+
+    scope.set(TOOL_HOOKS_KEY, { beforeToolCall: () => undefined });
+    hydrateRunScopeFromInternal(mastra, 'run-1', {});
+
+    expect(scope.has(TOOL_HOOKS_KEY)).toBe(false);
+    mastra.__releaseRunScope('run-1');
+  });
+
   it('does not change refcount (caller still owns the original hold)', () => {
     const mastra = makeMastra();
     mastra.__createRunScope('run-1');
