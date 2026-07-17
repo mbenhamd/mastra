@@ -40,6 +40,7 @@ function makeStartEvent(workflowId: string, runId: string, internal = true): Eve
     data: {
       workflowId,
       runId,
+      executionGeneration: `cross-process-generation:${workflowId}:${runId}`,
       executionPath: [0],
       stepResults: {},
       prevResult: { status: 'success', output: {} },
