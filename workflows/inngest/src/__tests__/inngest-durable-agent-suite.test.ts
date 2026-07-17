@@ -16,6 +16,7 @@ import { InngestPubSub } from '../pubsub';
 import {
   getSharedInngest,
   getSharedMastra,
+  registerSharedAgentFunctions,
   setupSharedTestInfrastructure,
   teardownSharedTestInfrastructure,
   generateTestId,
@@ -53,6 +54,11 @@ createDurableAgentTestSuite({
 
     // Register with Mastra so workflow can look it up
     mastra.addAgent(inngestAgent);
+
+    // The shared server predates this per-test agent. Prove that both of its
+    // namespaced Inngest functions are registered before any test dispatches
+    // work to the wrapper.
+    await registerSharedAgentFunctions(agent.id);
 
     return inngestAgent as unknown as DurableAgentLike;
   },

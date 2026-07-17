@@ -3,10 +3,12 @@ import type { DurableAgenticWorkflowInput } from '../types';
 import { mapDurableIterationToLLMInput } from './map-llm-input';
 
 describe('mapDurableIterationToLLMInput', () => {
-  it('preserves the registry-required recovery guard for nested LLM steps', () => {
+  it('preserves runtime identity and recovery guards for nested LLM steps', () => {
     const input = {
       runId: 'registry-required-run',
+      runtimeBindingId: 'binding-1',
       agentId: 'registry-required-agent',
+      runtimeBindings: { memory: 'memory-1', workspace: 'workspace-1' },
       runtimeResolution: 'registry-required',
       messageListState: {},
       toolsMetadata: [],
@@ -16,6 +18,13 @@ describe('mapDurableIterationToLLMInput', () => {
       messageId: 'message-1',
     } as DurableAgenticWorkflowInput;
 
-    expect(mapDurableIterationToLLMInput(input).runtimeResolution).toBe('registry-required');
+    expect(mapDurableIterationToLLMInput(input)).toEqual(
+      expect.objectContaining({
+        runId: 'registry-required-run',
+        runtimeBindingId: 'binding-1',
+        runtimeBindings: { memory: 'memory-1', workspace: 'workspace-1' },
+        runtimeResolution: 'registry-required',
+      }),
+    );
   });
 });

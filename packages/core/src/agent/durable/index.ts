@@ -192,6 +192,7 @@ export {
   calculateAccumulatedUsage,
   buildStepRecord,
   createBaseIterationStateUpdate,
+  mapDurableIterationToLLMInput,
   resolveDurableToolCallConcurrency,
 } from './workflows/shared';
 export type {
