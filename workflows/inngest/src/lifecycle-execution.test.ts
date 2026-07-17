@@ -1,11 +1,12 @@
 import { EventEmitterPubSub } from '@mastra/core/events';
 import { Mastra } from '@mastra/core/mastra';
 import { MockStore } from '@mastra/core/storage';
-import { Inngest } from 'inngest';
+import { Inngest, StepError } from 'inngest';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 import { InngestExecutionEngine } from './execution-engine';
 import { init } from './index';
+import { inngestWorkflowResumeOperationHash } from './resume-operation';
 
 function createDurableStep() {
   const results = new Map<string, unknown>();
@@ -521,13 +522,23 @@ describe('Inngest workflow lifecycle execution identity', () => {
     const lifecycleStepStates = {
       '["only-step",[0],null,null]': { stepCallId: 'supplied-step-call', stepAttempt: 2 },
     };
+    const resumeOperationHash = inngestWorkflowResumeOperationHash({
+      workflowId: workflow.id,
+      runId: 'supplied-resume-run',
+      inputData: { value: 'after' },
+      steps: ['only-step'],
+      resumePayload: { value: 'after' },
+      resumePath: [0],
+      requestContext: {},
+      perStep: false,
+    });
     await workflowsStore!.persistWorkflowSnapshot({
       workflowName: workflow.id,
       runId: 'supplied-resume-run',
       snapshot: {
         runId: 'supplied-resume-run',
         serializedStepGraph: [],
-        status: 'running',
+        status: 'suspended',
         value: {},
         context: {},
         activePaths: [],
@@ -537,10 +548,23 @@ describe('Inngest workflow lifecycle execution identity', () => {
         waitingPaths: {},
         timestamp: Date.now(),
         executionGeneration: 'supplied-resume-generation',
-        lifecycleResumeAttempt: 2,
+        lifecycleResumeAttempt: 1,
         lifecycleStepStates,
       },
     });
+    await expect(
+      workflowsStore!.admitWorkflowResume({
+        workflowName: workflow.id,
+        runId: 'supplied-resume-run',
+        resumeOperationHash,
+        operationReplayContext: { version: 1, steps: ['only-step'], resumePath: [0] },
+        executionGeneration: 'supplied-resume-generation',
+        lifecycleResumeAttempt: 1,
+        lifecycleStepStates,
+        nextLifecycleResumeAttempt: 2,
+        requestContext: {},
+      }),
+    ).resolves.toMatchObject({ status: 'admitted' });
     const execute = vi.spyOn(InngestExecutionEngine.prototype, 'execute').mockImplementation(async () => {
       const reserved = await workflowsStore!.loadWorkflowSnapshot({
         workflowName: workflow.id,
@@ -560,13 +584,13 @@ describe('Inngest workflow lifecycle execution identity', () => {
         data: {
           runId: 'supplied-resume-run',
           inputData: { value: 'after' },
-          initialState: {},
           resume: {
             steps: ['only-step'],
-            stepResults: {},
             resumePayload: { value: 'after' },
             resumePath: [0],
           },
+          receiptKey: 'supplied-receipt',
+          resumeOperationHash,
           executionGeneration: 'supplied-resume-generation',
           lifecycleResumeAttempt: 2,
           lifecycleStepStates,
@@ -701,17 +725,23 @@ describe('Inngest workflow lifecycle execution identity', () => {
       attempt: 0,
     };
 
-    await inngestFunction.fn(invocation);
-    await inngestFunction.fn(invocation);
+    const firstResult = await inngestFunction.fn(invocation);
+    const replayResult = await inngestFunction.fn(invocation);
 
     const firstExecution = execute.mock.calls[0]![0] as any;
-    const replayExecution = execute.mock.calls[1]![0] as any;
     expect(firstExecution.executionGeneration).toBe('persisted-resume-generation');
-    expect(replayExecution.executionGeneration).toBe('persisted-resume-generation');
     expect(firstExecution.lifecycleResumeAttempt).toBe(3);
-    expect(replayExecution.lifecycleResumeAttempt).toBe(3);
     expect(firstExecution.lifecycleStepStates).toEqual({
       '0:only-step': { stepCallId: 'persisted-step-call', stepAttempt: 1 },
+    });
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(replayResult).toMatchObject({
+      runId: firstResult.runId,
+      result: {
+        status: firstResult.result.status,
+        state: firstResult.result.state,
+        result: firstResult.result.result,
+      },
     });
   });
 
@@ -973,6 +1003,238 @@ describe('Inngest workflow lifecycle execution identity', () => {
       error: expect.objectContaining({ message: expect.stringContaining('workflow run is not suspended') }),
     });
     expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it('rolls back pre-acceptance nested invoke failures without overwriting accepted terminal state', async () => {
+    const inngest = new Inngest({ id: 'mastra-nested-resume-rollback' });
+    const { createWorkflow, createStep } = init(inngest);
+    const childStep = createStep({
+      id: 'child-step',
+      inputSchema: z.object({ value: z.string() }),
+      outputSchema: z.object({ value: z.string() }),
+      execute: async ({ inputData }) => inputData,
+    });
+    const child = createWorkflow({
+      id: 'child-resume-rollback',
+      inputSchema: z.object({ value: z.string() }),
+      outputSchema: z.object({ value: z.string() }),
+      steps: [childStep],
+    })
+      .then(childStep)
+      .commit();
+    const mastra = new Mastra({ logger: false, storage: new MockStore() });
+    const workflowsStore = await mastra.getStorage()!.getStore('workflows');
+    const suspendedSnapshot = {
+      runId: 'suspended-child-run',
+      serializedStepGraph: [],
+      status: 'suspended' as const,
+      value: {},
+      context: { input: { value: 'before' } },
+      activePaths: [],
+      suspendedPaths: { 'child-step': [0] },
+      activeStepsPath: {},
+      resumeLabels: {},
+      waitingPaths: {},
+      timestamp: 123,
+      executionGeneration: 'suspended-child-generation',
+      lifecycleResumeAttempt: 4,
+      lifecycleStepStates: {},
+    };
+    await workflowsStore!.persistWorkflowSnapshot({
+      workflowName: child.id,
+      runId: suspendedSnapshot.runId,
+      snapshot: suspendedSnapshot,
+    });
+    const params = {
+      step: child as any,
+      stepResults: {
+        [child.id]: {
+          status: 'suspended',
+          suspendPayload: { __workflow_meta: { runId: suspendedSnapshot.runId } },
+        },
+      },
+      executionContext: {
+        workflowId: 'parent',
+        runId: 'parent-run',
+        executionPath: [0],
+        suspendedPaths: {},
+        state: {},
+      } as any,
+      resume: { steps: [child.id], resumePayload: { value: 'after' } },
+      prevOutput: {},
+      inputData: { value: 'after' },
+      pubsub: { publish: vi.fn() } as any,
+      startedAt: Date.now(),
+    };
+
+    const failedStep = createDurableStep();
+    failedStep.invoke.mockRejectedValue(new Error('nested invoke unavailable'));
+    const failedResult = await new InngestExecutionEngine(mastra, failedStep as any, 0, {}).executeWorkflowStep(
+      params as any,
+    );
+
+    expect(failedResult).toMatchObject({
+      status: 'failed',
+      error: expect.objectContaining({ message: 'nested invoke unavailable' }),
+    });
+    await expect(
+      workflowsStore!.loadWorkflowSnapshot({ workflowName: child.id, runId: suspendedSnapshot.runId }),
+    ).resolves.toMatchObject({
+      ...suspendedSnapshot,
+      resumeRollbackReceipt: {
+        runId: suspendedSnapshot.runId,
+        lifecycleResumeAttempt: 5,
+        resumeOperationHash: expect.stringMatching(/^sha256:/),
+      },
+    });
+
+    const retryStep = createDurableStep();
+    retryStep.invoke.mockResolvedValue({
+      result: { status: 'success', result: { value: 'after' }, steps: {}, state: {} },
+      runId: suspendedSnapshot.runId,
+    });
+    const retryResult = await new InngestExecutionEngine(mastra, retryStep as any, 0, {}).executeWorkflowStep(
+      params as any,
+    );
+
+    expect(retryResult).toMatchObject({ status: 'success' });
+    expect(retryStep.invoke.mock.calls[0]![1].data).toMatchObject({
+      executionGeneration: suspendedSnapshot.executionGeneration,
+      lifecycleResumeAttempt: 5,
+    });
+
+    await workflowsStore!.persistWorkflowSnapshot({
+      workflowName: child.id,
+      runId: suspendedSnapshot.runId,
+      snapshot: suspendedSnapshot,
+    });
+    const genericTerminalStep = createDurableStep();
+    genericTerminalStep.invoke.mockImplementation(async () => {
+      await workflowsStore!.updateWorkflowState({
+        workflowName: child.id,
+        runId: suspendedSnapshot.runId,
+        opts: {
+          status: 'failed',
+          executionGeneration: suspendedSnapshot.executionGeneration,
+          lifecycleResumeAttempt: 5,
+          lifecycleStepStates: {},
+        },
+      });
+      throw new StepError('workflow.parent.step.child-resume-rollback', {
+        name: 'Error',
+        message: 'child execution failed',
+      });
+    });
+
+    const genericTerminalResult = await new InngestExecutionEngine(
+      mastra,
+      genericTerminalStep as any,
+      0,
+      {},
+    ).executeWorkflowStep(params as any);
+
+    expect(genericTerminalResult).toMatchObject({
+      status: 'failed',
+      error: expect.objectContaining({
+        message: expect.stringContaining('failed without authoritative terminal resume evidence'),
+      }),
+    });
+    await expect(
+      workflowsStore!.loadWorkflowSnapshot({ workflowName: child.id, runId: suspendedSnapshot.runId }),
+    ).resolves.toMatchObject({
+      status: 'failed',
+      executionGeneration: suspendedSnapshot.executionGeneration,
+      lifecycleResumeAttempt: 5,
+    });
+
+    await workflowsStore!.persistWorkflowSnapshot({
+      workflowName: child.id,
+      runId: suspendedSnapshot.runId,
+      snapshot: suspendedSnapshot,
+    });
+    const exactReceiptStep = createDurableStep();
+    exactReceiptStep.invoke.mockImplementation(async (_function: unknown, invocation: any) => {
+      const current = await workflowsStore!.loadWorkflowSnapshot({
+        workflowName: child.id,
+        runId: suspendedSnapshot.runId,
+      });
+      await expect(
+        workflowsStore!.finalizeWorkflowResume({
+          workflowName: child.id,
+          runId: suspendedSnapshot.runId,
+          resumeOperationHash: invocation.data.resumeOperationHash,
+          executionGeneration: invocation.data.executionGeneration,
+          lifecycleResumeAttempt: invocation.data.lifecycleResumeAttempt,
+          lifecycleStepStates: current!.lifecycleStepStates ?? {},
+          shouldPersistSnapshot: true,
+          receiptKey: invocation.data.receiptKey,
+          snapshot: { ...current!, status: 'failed' },
+          result: {
+            status: 'failed',
+            steps: {},
+            error: { name: 'Error', message: 'child execution failed with receipt' },
+          },
+        }),
+      ).resolves.toMatchObject({ status: 'finalized' });
+      throw new StepError('workflow.parent.step.child-resume-rollback', {
+        name: 'Error',
+        message: 'child execution failed with receipt',
+      });
+    });
+
+    const exactReceiptResult = await new InngestExecutionEngine(
+      mastra,
+      exactReceiptStep as any,
+      0,
+      {},
+    ).executeWorkflowStep(params as any);
+
+    expect(exactReceiptResult).toMatchObject({ status: 'failed' });
+    expect((exactReceiptResult as any).error?.message).not.toContain(
+      'failed without authoritative terminal resume evidence',
+    );
+    await expect(
+      workflowsStore!.loadWorkflowSnapshot({ workflowName: child.id, runId: suspendedSnapshot.runId }),
+    ).resolves.toMatchObject({
+      resumeResultReceipt: {
+        receiptKey: expect.stringMatching(/^miwr:v1:/),
+        result: { status: 'failed' },
+      },
+    });
+
+    await workflowsStore!.persistWorkflowSnapshot({
+      workflowName: child.id,
+      runId: suspendedSnapshot.runId,
+      snapshot: suspendedSnapshot,
+    });
+    const missingTerminalEvidenceStep = createDurableStep();
+    missingTerminalEvidenceStep.invoke.mockRejectedValue(
+      new StepError('workflow.parent.step.child-resume-rollback', {
+        name: 'Error',
+        message: 'child execution disappeared',
+      }),
+    );
+
+    const missingTerminalResult = await new InngestExecutionEngine(
+      mastra,
+      missingTerminalEvidenceStep as any,
+      0,
+      {},
+    ).executeWorkflowStep(params as any);
+
+    expect(missingTerminalResult).toMatchObject({
+      status: 'failed',
+      error: expect.objectContaining({
+        message: expect.stringContaining('failed without authoritative terminal resume evidence'),
+      }),
+    });
+    await expect(
+      workflowsStore!.loadWorkflowSnapshot({ workflowName: child.id, runId: suspendedSnapshot.runId }),
+    ).resolves.toMatchObject({
+      status: 'running',
+      lifecycleResumeAttempt: 5,
+      resumeCheckpoint: { runId: suspendedSnapshot.runId },
+    });
   });
 
   it('rejects resume dispatch when the persisted run is not suspended', async () => {

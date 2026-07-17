@@ -97,16 +97,32 @@ describe('Inngest createRun contract', () => {
     });
   });
 
-  it('passes disableScorers from the remote event into the execution engine', async () => {
+  it('passes disableScorers into the engine and preserves its request context snapshot update', async () => {
     const { mastra, workflow } = createTestWorkflow();
     workflow.__setPubsubFactory(() => new EventEmitterPubSub());
-    const execute = vi.spyOn(InngestExecutionEngine.prototype, 'execute').mockResolvedValue({
-      status: 'success',
-      input: { count: 4, mode: 'safe' },
-      steps: {},
-      result: { count: 4 },
-      state: {},
-    } as never);
+    const workflowsStore = await mastra.getStorage()!.getStore('workflows');
+    const execute = vi.spyOn(InngestExecutionEngine.prototype, 'execute').mockImplementation(async () => {
+      const pendingSnapshot = await workflowsStore!.loadWorkflowSnapshot({
+        workflowName: workflow.id,
+        runId: 'remote-run',
+      });
+      await workflowsStore!.persistWorkflowSnapshot({
+        workflowName: workflow.id,
+        runId: 'remote-run',
+        snapshot: {
+          ...pendingSnapshot!,
+          status: 'running',
+          requestContext: { tenantId: 'tenant-remote' },
+        },
+      });
+      return {
+        status: 'success',
+        input: { count: 4, mode: 'safe' },
+        steps: {},
+        result: { count: 4 },
+        state: {},
+      } as never;
+    });
     const inngestFunction = workflow.getFunction() as unknown as {
       fn: (context: {
         event: { data: Record<string, unknown> };
@@ -122,6 +138,7 @@ describe('Inngest createRun contract', () => {
           initialState: {},
           runId: 'remote-run',
           disableScorers: true,
+          requestContext: { tenantId: 'tenant-remote' },
         },
       },
       step: {
@@ -131,7 +148,6 @@ describe('Inngest createRun contract', () => {
     });
 
     expect(execute).toHaveBeenCalledWith(expect.objectContaining({ disableScorers: true }));
-    const workflowsStore = await mastra.getStorage()!.getStore('workflows');
     await expect(
       workflowsStore!.loadWorkflowSnapshot({
         workflowName: workflow.id,
@@ -142,6 +158,7 @@ describe('Inngest createRun contract', () => {
       runOptions: {
         disableScorers: true,
       },
+      requestContext: { tenantId: 'tenant-remote' },
     });
   });
 
@@ -297,6 +314,80 @@ describe('Inngest createRun contract', () => {
         }),
       }),
     );
+  });
+
+  it('rehydrates resourceId for a cold resume after worker replacement', async () => {
+    const storage = new MockStore();
+    const firstWorker = createTestWorkflow(storage);
+    const firstRun = await firstWorker.workflow.createRun({
+      runId: 'cold-resource-resume-run',
+      resourceId: 'resource-1',
+    });
+    const workflowsStore = await firstWorker.mastra.getStorage()!.getStore('workflows');
+    const pendingSnapshot = await workflowsStore!.loadWorkflowSnapshot({
+      workflowName: firstWorker.workflow.id,
+      runId: firstRun.runId,
+    });
+    await workflowsStore!.persistWorkflowSnapshot({
+      workflowName: firstWorker.workflow.id,
+      runId: firstRun.runId,
+      resourceId: 'resource-1',
+      snapshot: {
+        ...pendingSnapshot!,
+        status: 'suspended',
+        context: { input: { count: 10, mode: 'safe' } },
+        suspendedPaths: { 'parse-input': [0] },
+      },
+    });
+
+    const replacementWorker = createTestWorkflow(storage);
+    const replacementSend = vi
+      .spyOn(replacementWorker.inngest, 'send')
+      .mockResolvedValue({ ids: ['resume-event'] } as never);
+    const getWorkflowRunById = vi
+      .spyOn(workflowsStore!, 'getWorkflowRunById')
+      .mockRejectedValue(new Error('workflow row lookup is unavailable'));
+    const replacementRun = await replacementWorker.workflow.createRun({ runId: firstRun.runId });
+
+    await replacementRun.resumeAsync({
+      step: 'parse-input',
+      resumeData: { count: 11 },
+    });
+
+    expect(replacementSend).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          runId: firstRun.runId,
+          resourceId: 'resource-1',
+        }),
+      }),
+    );
+    expect(getWorkflowRunById).not.toHaveBeenCalled();
+    await expect(
+      workflowsStore!.loadWorkflowSnapshot({
+        workflowName: firstWorker.workflow.id,
+        runId: firstRun.runId,
+      }),
+    ).resolves.toMatchObject({ resourceId: 'resource-1' });
+  });
+
+  it('does not require a workflow-row lookup when no durable snapshot exists', async () => {
+    const { mastra, workflow } = createTestWorkflow();
+    const workflowsStore = await mastra.getStorage()!.getStore('workflows');
+    const getWorkflowRunById = vi
+      .spyOn(workflowsStore!, 'getWorkflowRunById')
+      .mockRejectedValue(new Error('workflow table is not initialized'));
+
+    const run = await workflow.createRun({ runId: 'new-run-without-snapshot' });
+
+    expect(run.runId).toBe('new-run-without-snapshot');
+    expect(getWorkflowRunById).not.toHaveBeenCalled();
+    await expect(
+      workflowsStore!.loadWorkflowSnapshot({
+        workflowName: workflow.id,
+        runId: run.runId,
+      }),
+    ).resolves.toMatchObject({ status: 'pending' });
   });
 
   it('preserves a persisted explicit false over a later truthy reattachment option', async () => {

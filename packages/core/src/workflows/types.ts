@@ -562,9 +562,77 @@ export type WorkflowTerminalDestinationReceiptRecord = WorkflowTerminalDestinati
       }
   );
 
+export interface WorkflowLifecycleFenceV1 {
+  executionGeneration: string;
+  lifecycleResumeAttempt: number;
+  lifecycleStepStates: Record<string, { stepCallId: string; stepAttempt: number }>;
+  fenceHash: `sha256:${string}`;
+}
+
+/**
+ * Minimal transport-independent data needed to reconstruct a resume operation
+ * after terminal snapshot cleanup. The complete operation remains identified
+ * by `resumeOperationHash`; this context only supplies the path information
+ * that no longer exists on a terminal snapshot.
+ */
+export interface WorkflowResumeOperationReplayContextV1 {
+  version: 1;
+  steps: string[];
+  resumePath?: number[];
+  label?: string;
+}
+
+/** Storage-owned immutable copy of the last policy-approved pre-resume state. */
+export interface WorkflowResumeCheckpointV1 extends WorkflowLifecycleFenceV1 {
+  version: 1;
+  runId: string;
+  /** Canonical identity of the admitted resume payload and durable execution options. */
+  resumeOperationHash: `sha256:${string}`;
+  operationReplayContext: WorkflowResumeOperationReplayContextV1;
+  checkpointHash: `sha256:${string}`;
+  snapshot: WorkflowRunState;
+}
+
+export interface WorkflowResumeResultDataV1 {
+  status: WorkflowRunStatus;
+  input?: unknown;
+  steps: Record<string, SerializedStepResult<any, any, any, any>>;
+  state?: Record<string, unknown>;
+  result?: unknown;
+  error?: SerializedError;
+  tripwire?: StepTripwireInfo;
+  stepExecutionPath?: string[];
+  resumeLabels?: Record<string, WorkflowResumeLabel>;
+}
+
+/** Bounded terminal/intermediate result evidence retained outside snapshot policy. */
+export interface WorkflowResumeResultReceiptV1 extends WorkflowLifecycleFenceV1 {
+  version: 1;
+  runId: string;
+  receiptKey: string;
+  resumeOperationHash: `sha256:${string}`;
+  operationReplayContext: WorkflowResumeOperationReplayContextV1;
+  receiptHash: `sha256:${string}`;
+  result: WorkflowResumeResultDataV1;
+  createdAt: number;
+  consumedBy?: string;
+  consumedAt?: number;
+}
+
+/** Exact evidence that an admitted resume was restored before external acceptance. */
+export interface WorkflowResumeRollbackReceiptV1 extends WorkflowLifecycleFenceV1 {
+  version: 1;
+  runId: string;
+  resumeOperationHash: `sha256:${string}`;
+  rolledBackAt: number;
+  rollbackHash: `sha256:${string}`;
+}
+
 export interface WorkflowRunState {
   // Core state info
   runId: string;
+  /** Durable owner retained with the snapshot so intermediate writes remain self-contained. */
+  resourceId?: string;
   status: WorkflowRunStatus;
   result?: any;
   error?: SerializedError;
@@ -587,6 +655,12 @@ export interface WorkflowRunState {
   lifecycleResumeAttempt?: number;
   /** Stable step-call identities and one-based attempt counts by execution coordinate. */
   lifecycleStepStates?: Record<string, { stepCallId: string; stepAttempt: number }>;
+  /** Present only while one resume attempt owns the run. */
+  resumeCheckpoint?: WorkflowResumeCheckpointV1;
+  /** Canonical bounded resume-result evidence retained outside snapshot policy. */
+  resumeResultReceipt?: WorkflowResumeResultReceiptV1;
+  /** Exact idempotency evidence for a completed checkpoint rollback. */
+  resumeRollbackReceipt?: WorkflowResumeRollbackReceiptV1;
   /** Tripwire data when status is 'tripwire' */
   tripwire?: StepTripwireInfo;
   stepExecutionPath?: string[];
@@ -1186,6 +1260,8 @@ export type ExecutionContext = {
   executionGeneration?: string;
   lifecycleResumeAttempt?: number;
   lifecycleStepStates?: Record<string, { stepCallId: string; stepAttempt: number }>;
+  /** Storage-owned identity for an atomically admitted resume attempt. */
+  resumeOperationHash?: `sha256:${string}`;
   executionPath: number[];
   stepExecutionPath?: string[];
   activeStepsPath: Record<string, number[]>;

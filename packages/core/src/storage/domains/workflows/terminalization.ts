@@ -327,9 +327,10 @@ const WORKFLOW_RUN_STATUSES = [
   'pending',
   'canceled',
   'bailed',
+  'skipped',
   'paused',
 ] as const;
-const WORKFLOW_RUN_TERMINAL_STATUSES = ['success', 'failed', 'tripwire', 'canceled', 'bailed'] as const;
+const WORKFLOW_RUN_TERMINAL_STATUSES = ['success', 'failed', 'tripwire', 'canceled', 'bailed', 'skipped'] as const;
 type WorkflowNestedRunTerminalStatus = (typeof WORKFLOW_RUN_TERMINAL_STATUSES)[number];
 
 const WORKFLOW_RUN_REQUIRED_SNAPSHOT_FIELDS = new Set([

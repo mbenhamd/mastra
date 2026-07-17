@@ -9,6 +9,9 @@ import type {
   StepResult,
   WorkflowRunState,
   WorkflowRunStatus,
+  WorkflowResumeResultDataV1,
+  WorkflowResumeResultReceiptV1,
+  WorkflowResumeOperationReplayContextV1,
   WorkflowTerminalStatus,
   WorkflowTerminalizationClaimedRecord,
   WorkflowTerminalEffectKind,
@@ -67,6 +70,97 @@ export interface WorkflowRun {
   resourceId?: string;
 }
 
+export interface WorkflowResumeCapabilities {
+  atomicResumeVersion?: 1;
+  fencedStepUpdateVersion?: 1;
+}
+
+export interface PersistWorkflowStepUpdateInput {
+  workflowName: string;
+  runId: string;
+  resourceId?: string;
+  expectedResumeOperationHash?: `sha256:${string}`;
+  expectedExecutionGeneration?: string;
+  expectedLifecycleResumeAttempt?: number;
+  snapshot: WorkflowRunState;
+}
+
+export type PersistWorkflowStepUpdateResult = {
+  status:
+    | 'persisted'
+    | 'stale_execution'
+    | 'protected_state'
+    | 'finalized'
+    | 'missing_run'
+    | 'invalid_snapshot'
+    | 'unsupported';
+};
+
+interface WorkflowResumeFenceInput {
+  workflowName: string;
+  runId: string;
+  resumeOperationHash: `sha256:${string}`;
+  executionGeneration: string;
+  lifecycleResumeAttempt: number;
+  lifecycleStepStates: Record<string, { stepCallId: string; stepAttempt: number }>;
+}
+
+/** Atomically captures the suspended state and admits exactly one next resume attempt. */
+export interface AdmitWorkflowResumeInput extends WorkflowResumeFenceInput {
+  nextLifecycleResumeAttempt: number;
+  operationReplayContext: WorkflowResumeOperationReplayContextV1;
+  resourceId?: string;
+  requestContext?: Record<string, unknown>;
+}
+
+export type AdmitWorkflowResumeResult =
+  | { status: 'admitted' | 'already_admitted'; fenceHash: `sha256:${string}` }
+  | {
+      status: 'fence_conflict' | 'checkpoint_conflict' | 'operation_conflict' | 'missing_run' | 'unsupported';
+    };
+
+/** Restores only the checkpoint still owned by the exact admitted lifecycle fence. */
+export interface RollbackWorkflowResumeInput extends WorkflowResumeFenceInput {
+  resourceId?: string;
+}
+
+export type RollbackWorkflowResumeResult =
+  | { status: 'rolled_back' | 'already_rolled_back' }
+  | { status: 'fence_conflict' | 'checkpoint_conflict' | 'missing_run' | 'unsupported' };
+
+/**
+ * Finalizes one admitted resume attempt. Result receipts are deliberately
+ * outside shouldPersistSnapshot policy and are bounded by storage validation.
+ */
+export interface FinalizeWorkflowResumeInput extends WorkflowResumeFenceInput {
+  resourceId?: string;
+  shouldPersistSnapshot: boolean;
+  snapshot: WorkflowRunState;
+  receiptKey: string;
+  result: WorkflowResumeResultDataV1;
+}
+
+export type FinalizeWorkflowResumeResult =
+  | { status: 'finalized' | 'already_finalized'; receipt?: WorkflowResumeResultReceiptV1 }
+  | {
+      status: 'fence_conflict' | 'checkpoint_conflict' | 'receipt_conflict' | 'missing_run' | 'unsupported';
+    };
+
+/** Idempotently acknowledges the exact receipt selected by an awaited caller. */
+export interface ConsumeWorkflowResumeResultInput {
+  workflowName: string;
+  runId: string;
+  resumeOperationHash: `sha256:${string}`;
+  executionGeneration: string;
+  lifecycleResumeAttempt: number;
+  receiptKey: string;
+  consumerId: string;
+}
+
+export type ConsumeWorkflowResumeResult =
+  | { status: 'consumed' | 'already_consumed'; receipt: WorkflowResumeResultReceiptV1 }
+  | { status: 'fence_conflict' | 'receipt_conflict' | 'missing_receipt' | 'missing_run' | 'unsupported' };
+
 export interface ClaimWorkflowTerminalizationInput {
   workflowName: string;
   runId: string;
@@ -121,7 +215,7 @@ export interface GetWorkflowRunTerminalStatusInput {
 
 export type DurableWorkflowRunTerminalStatus = Extract<
   WorkflowRunStatus,
-  'success' | 'failed' | 'canceled' | 'tripwire' | 'bailed'
+  'success' | 'failed' | 'canceled' | 'tripwire' | 'bailed' | 'skipped'
 >;
 
 export type GetWorkflowRunTerminalStatusResult =
