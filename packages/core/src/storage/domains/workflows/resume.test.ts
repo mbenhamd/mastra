@@ -6,6 +6,7 @@ import {
   admitWorkflowResumeRecord,
   finalizeWorkflowResumeRecord,
   materializeWorkflowResumeOperationHash,
+  persistWorkflowStepUpdateRecord,
   rollbackWorkflowResumeRecord,
   WORKFLOW_RESUME_RESULT_RECEIPT_MAX_BYTES,
 } from './resume';
@@ -55,6 +56,184 @@ function admissionInput(operation: unknown = { step: 'wait', payload: { approved
 }
 
 describe('atomic workflow resume records', () => {
+  it('persists exactly one completed result for the next ordinary resume attempt', () => {
+    const existing = suspendedSnapshot();
+    const nextAttempt = existing.lifecycleResumeAttempt! + 1;
+    const ordinaryInput = {
+      workflowName: 'workflow-1',
+      runId: existing.runId,
+      resourceId: existing.resourceId,
+      expectedExecutionGeneration: existing.executionGeneration,
+      expectedLifecycleResumeAttempt: nextAttempt,
+    };
+
+    expect(
+      persistWorkflowStepUpdateRecord(
+        existing,
+        {
+          ...ordinaryInput,
+          snapshot: {
+            ...existing,
+            status: 'running',
+            lifecycleResumeAttempt: nextAttempt,
+          },
+        },
+        materialize,
+      ),
+    ).toEqual({ status: 'protected_state' });
+
+    for (const status of ['waiting', 'pending'] as const) {
+      expect(
+        persistWorkflowStepUpdateRecord(
+          existing,
+          {
+            ...ordinaryInput,
+            snapshot: {
+              ...existing,
+              status,
+              lifecycleResumeAttempt: nextAttempt,
+            },
+          },
+          materialize,
+        ),
+      ).toEqual({ status: 'protected_state' });
+    }
+
+    expect(
+      persistWorkflowStepUpdateRecord(
+        existing,
+        {
+          ...ordinaryInput,
+          snapshot: {
+            ...existing,
+            status: 'suspended',
+            executionGeneration: 'wfeg:different-generation',
+            lifecycleResumeAttempt: nextAttempt,
+          },
+        },
+        materialize,
+      ),
+    ).toEqual({ status: 'stale_execution' });
+
+    for (const lineage of [
+      { expected: undefined, existing: existing.executionGeneration, proposed: undefined },
+      { expected: '', existing: existing.executionGeneration, proposed: '' },
+      { expected: existing.executionGeneration, existing: existing.executionGeneration, proposed: undefined },
+      { expected: existing.executionGeneration, existing: undefined, proposed: existing.executionGeneration },
+    ]) {
+      expect(
+        persistWorkflowStepUpdateRecord(
+          { ...existing, executionGeneration: lineage.existing },
+          {
+            ...ordinaryInput,
+            expectedExecutionGeneration: lineage.expected,
+            snapshot: {
+              ...existing,
+              status: 'suspended',
+              executionGeneration: lineage.proposed,
+              lifecycleResumeAttempt: nextAttempt,
+            },
+          },
+          materialize,
+        ),
+      ).toEqual({ status: 'stale_execution' });
+    }
+
+    for (const attempts of [
+      { existing: existing.lifecycleResumeAttempt, expected: nextAttempt, proposed: nextAttempt + 1 },
+      { existing: undefined, expected: 1, proposed: undefined },
+    ]) {
+      expect(
+        persistWorkflowStepUpdateRecord(
+          { ...existing, lifecycleResumeAttempt: attempts.existing },
+          {
+            ...ordinaryInput,
+            expectedLifecycleResumeAttempt: attempts.expected,
+            snapshot: {
+              ...existing,
+              status: 'suspended',
+              lifecycleResumeAttempt: attempts.proposed,
+            },
+          },
+          materialize,
+        ),
+      ).toEqual({ status: 'stale_execution' });
+    }
+
+    const persisted = persistWorkflowStepUpdateRecord(
+      existing,
+      {
+        ...ordinaryInput,
+        snapshot: {
+          ...existing,
+          status: 'suspended',
+          value: { winner: true },
+          lifecycleResumeAttempt: nextAttempt,
+          lifecycleStepStates: { wait: { stepCallId: 'wfsc:wait-1', stepAttempt: 2 } },
+        },
+      },
+      materialize,
+    );
+    expect(persisted).toMatchObject({
+      status: 'persisted',
+      snapshot: {
+        status: 'suspended',
+        value: { winner: true },
+        lifecycleResumeAttempt: nextAttempt,
+      },
+    });
+
+    expect(
+      persistWorkflowStepUpdateRecord(
+        persisted.snapshot,
+        {
+          ...ordinaryInput,
+          snapshot: {
+            ...existing,
+            status: 'suspended',
+            value: { stale: true },
+            lifecycleResumeAttempt: nextAttempt,
+          },
+        },
+        materialize,
+      ),
+    ).toEqual({ status: 'stale_execution' });
+
+    expect(
+      persistWorkflowStepUpdateRecord(
+        existing,
+        {
+          ...ordinaryInput,
+          expectedLifecycleResumeAttempt: nextAttempt + 1,
+          snapshot: {
+            ...existing,
+            status: 'suspended',
+            lifecycleResumeAttempt: nextAttempt + 1,
+          },
+        },
+        materialize,
+      ),
+    ).toEqual({ status: 'stale_execution' });
+
+    const admission = admissionInput();
+    const admitted = admitWorkflowResumeRecord(existing, admission, 10, materialize);
+    expect(
+      persistWorkflowStepUpdateRecord(
+        admitted.snapshot,
+        {
+          ...ordinaryInput,
+          expectedLifecycleResumeAttempt: admission.nextLifecycleResumeAttempt + 1,
+          snapshot: {
+            ...admitted.snapshot!,
+            status: 'suspended',
+            lifecycleResumeAttempt: admission.nextLifecycleResumeAttempt + 1,
+          },
+        },
+        materialize,
+      ),
+    ).toEqual({ status: 'stale_execution' });
+  });
+
   it('keeps operation identity strict when storage snapshots support rich values', () => {
     expect(() => materializeWorkflowResumeOperationHash({ payload: new Map([['key', 'value']]) })).toThrow(
       'unsupported object prototype',

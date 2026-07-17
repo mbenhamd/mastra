@@ -475,7 +475,34 @@ export function persistWorkflowStepUpdateRecord(
   ) {
     return { status: 'stale_execution' };
   }
+  const isUnadmittedOrdinaryResume =
+    input.expectedResumeOperationHash === undefined &&
+    input.expectedLifecycleResumeAttempt !== undefined &&
+    input.expectedLifecycleResumeAttempt > 0;
+  const isOrdinaryResumeResultStatus =
+    proposed.status === 'suspended' || proposed.status === 'paused' || TERMINAL_STATUSES.has(proposed.status);
   if (
+    isUnadmittedOrdinaryResume &&
+    (proposed.lifecycleResumeAttempt !== input.expectedLifecycleResumeAttempt ||
+      typeof input.expectedExecutionGeneration !== 'string' ||
+      input.expectedExecutionGeneration.length === 0 ||
+      existing.executionGeneration !== input.expectedExecutionGeneration ||
+      proposed.executionGeneration !== input.expectedExecutionGeneration)
+  ) {
+    return { status: 'stale_execution' };
+  }
+  if (isUnadmittedOrdinaryResume && !isOrdinaryResumeResultStatus) {
+    return { status: 'protected_state' };
+  }
+  if (isUnadmittedOrdinaryResume) {
+    const existingResumeAttempt = existing.lifecycleResumeAttempt ?? 0;
+    if (existing.status !== 'suspended' && existing.status !== 'paused') {
+      return { status: 'stale_execution' };
+    }
+    if (existing.resumeCheckpoint !== undefined || input.expectedLifecycleResumeAttempt !== existingResumeAttempt + 1) {
+      return { status: 'stale_execution' };
+    }
+  } else if (
     input.expectedLifecycleResumeAttempt !== undefined &&
     existing.lifecycleResumeAttempt !== undefined &&
     existing.lifecycleResumeAttempt !== input.expectedLifecycleResumeAttempt
