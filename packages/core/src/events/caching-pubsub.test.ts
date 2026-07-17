@@ -1084,6 +1084,12 @@ describe('CachingPubSub', () => {
 describe('CachingPubSub exact indexed replay', () => {
   const indexedReplay = { retentionMs: 60_000, maxEvents: 100 };
 
+  function durableIndexedCache(): InMemoryServerCache {
+    const cache = new InMemoryServerCache();
+    Object.defineProperty(cache, 'indexedLogScope', { value: 'durable' });
+    return cache;
+  }
+
   class ManualPubSub extends PubSub {
     callback?: EventCallback;
     published: Event[] = [];
@@ -1145,6 +1151,58 @@ describe('CachingPubSub exact indexed replay', () => {
 
     await expect(exact.getHistory('local-exact-topic')).resolves.toMatchObject([
       { type: 'local', index: 0, data: { nonSerializable: expect.any(Function) } },
+    ]);
+  });
+
+  it('rejects localOnly events for durable exact replay by default', async () => {
+    const cache = durableIndexedCache();
+    const inner = new EventEmitterPubSub();
+    const innerPublish = vi.spyOn(inner, 'publish');
+    const append = vi.spyOn(cache, 'appendIndexedLogEntry');
+    const exact = new CachingPubSub(inner, cache, { indexedReplay });
+
+    await expect(
+      exact.publish(
+        'local-durable-topic',
+        { type: 'local', runId: 'run', data: { nonSerializable: () => 'same-process' } },
+        { localOnly: true },
+      ),
+    ).rejects.toThrow('cannot provide durable exact replay for a localOnly event');
+
+    expect(append).not.toHaveBeenCalled();
+    expect(innerPublish).not.toHaveBeenCalled();
+  });
+
+  it('explicitly passes durable localOnly events through without retaining them', async () => {
+    const cache = durableIndexedCache();
+    const inner = new EventEmitterPubSub();
+    const innerPublish = vi.spyOn(inner, 'publish');
+    const append = vi.spyOn(cache, 'appendIndexedLogEntry');
+    const exact = new CachingPubSub(inner, cache, {
+      indexedReplay,
+      durableLocalOnly: 'passthrough',
+    });
+    const received = vi.fn();
+    const data = { nonSerializable: () => 'same-process' };
+    await inner.subscribe('local-durable-topic', received);
+
+    await exact.publish('local-durable-topic', { type: 'local', runId: 'run', data }, { localOnly: true });
+
+    expect(innerPublish).toHaveBeenCalledWith(
+      'local-durable-topic',
+      { type: 'local', runId: 'run', data },
+      { localOnly: true },
+    );
+    expect(received).toHaveBeenCalledTimes(1);
+    expect(received.mock.calls[0]![0].data).toBe(data);
+    expect(append).not.toHaveBeenCalled();
+    await expect(exact.getHistory('local-durable-topic')).resolves.toEqual([]);
+
+    await exact.publish('portable-durable-topic', { type: 'portable', runId: 'run', data: { value: 1 } });
+
+    expect(append).toHaveBeenCalledTimes(1);
+    await expect(exact.getHistory('portable-durable-topic')).resolves.toMatchObject([
+      { type: 'portable', index: 0, data: { value: 1 } },
     ]);
   });
 

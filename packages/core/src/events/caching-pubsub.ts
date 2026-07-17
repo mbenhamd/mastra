@@ -37,6 +37,17 @@ export interface CachingPubSubOptions {
    * best-effort behavior and are not advertised as restart-safe.
    */
   indexedReplay?: CachingPubSubIndexedReplayOptions;
+  /**
+   * Policy for `localOnly` publishes when exact indexed replay uses a durable
+   * cache.
+   *
+   * Durable exact replay rejects these publishes by default because an event
+   * that stays in one process cannot also be part of shared retained history.
+   * Set this to `passthrough` only when local-only topics are intentionally
+   * excluded from replay. The event bypasses the cache and is forwarded to the
+   * inner PubSub with its locality option intact.
+   */
+  durableLocalOnly?: 'reject' | 'passthrough';
 }
 
 /**
@@ -77,6 +88,7 @@ export class CachingPubSub extends PubSub {
   private readonly logger?: IMastraLogger;
   private readonly indexedLog?: AtomicIndexedLogCache;
   private readonly indexedLogRetention?: IndexedLogRetention;
+  private readonly durableLocalOnly: 'reject' | 'passthrough';
   /** Maps original callbacks to their wrapped versions for proper unsubscribe */
   private callbackMap = new Map<EventCallback, EventCallback>();
   private subscriptionDrains = new Map<EventCallback, () => Promise<void>>();
@@ -90,6 +102,7 @@ export class CachingPubSub extends PubSub {
     super();
     this.keyPrefix = options.keyPrefix ?? 'pubsub:';
     this.logger = options.logger;
+    this.durableLocalOnly = options.durableLocalOnly ?? 'reject';
 
     if (options.indexedReplay) {
       if (!Number.isSafeInteger(options.indexedReplay.retentionMs) || options.indexedReplay.retentionMs <= 0) {
@@ -230,9 +243,18 @@ export class CachingPubSub extends PubSub {
       return;
     }
 
+    if (
+      options?.localOnly &&
+      this.indexedLog?.indexedLogScope === 'durable' &&
+      this.durableLocalOnly === 'passthrough'
+    ) {
+      await this.inner.publish(topic, event, options);
+      return;
+    }
+
     if (options?.localOnly && this.indexedLog?.indexedLogScope === 'durable') {
       throw new Error(
-        'CachingPubSub cannot provide durable exact replay for a localOnly event; use a process-scoped indexed cache or a separate topic',
+        'CachingPubSub cannot provide durable exact replay for a localOnly event; use a process-scoped indexed cache, a separate topic, or explicitly configure durableLocalOnly passthrough for non-replayable topics',
       );
     }
 
