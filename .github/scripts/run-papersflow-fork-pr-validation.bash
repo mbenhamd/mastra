@@ -1289,7 +1289,10 @@ run_validator_self_tests() {
     "$fixture_repo/pubsub/redis-streams/src" \
     "$fixture_repo/stores/convex/src/cache" \
     "$fixture_repo/stores/convex/src/server" \
+    "$fixture_repo/stores/_test-utils/src/domains/workflows" \
     "$fixture_repo/stores/libsql/src/storage/domains/harness" \
+    "$fixture_repo/stores/libsql/src/storage/domains/workflows" \
+    "$fixture_repo/stores/pg/src/storage/domains/workflows" \
     "$fixture_repo/workflows/inngest/src/__tests__/adapters" \
     "$fixture_repo/workflows/inngest/src" \
     "$fixture_repo/node_modules" \
@@ -1341,6 +1344,41 @@ run_validator_self_tests() {
     git config user.email validator@example.test
     git config user.name 'Fork validator fixture'
     printf '%s\n' '{}' > package.json
+    printf '%s\n' \
+      "lockfileVersion: '9.0'" \
+      '' \
+      'importers:' \
+      '' \
+      '  workflows/inngest:' \
+      '    devDependencies:' \
+      "      '@ai-sdk/openai':" \
+      '        specifier: ^1.3.24' \
+      '        version: 1.3.24(zod@4.4.3)' \
+      '      inngest-cli:' \
+      '        specifier: ^1.26.0' \
+      '        version: 1.27.0(encoding@0.1.13)' \
+      '      vitest:' \
+      '        specifier: ^4.1.0' \
+      '        version: 4.1.0' \
+      '' \
+      'packages:' \
+      '' \
+      '  inngest-cli@1.27.0:' \
+      '    resolution: {integrity: sha512-fixture}' \
+      '    hasBin: true' \
+      '  vitest@4.1.0:' \
+      '    resolution: {integrity: sha512-retained}' \
+      '' \
+      'snapshots:' \
+      '' \
+      '  inngest-cli@1.27.0(encoding@0.1.13):' \
+      '    dependencies:' \
+      '      debug: 4.4.3' \
+      '    transitivePeerDependencies:' \
+      '      - encoding' \
+      '  vitest@4.1.0: {}' \
+      '' \
+      > pnpm-lock.yaml
     printf '%s\n' '{}' > client-sdks/client-js/package.json
     printf '%s\n' \
       '{"compilerOptions":{"module":"NodeNext","moduleResolution":"NodeNext","noEmit":true,"strict":true}}' \
@@ -1369,13 +1407,27 @@ run_validator_self_tests() {
     printf '%s\n' 'export const convexServerCache = true;' > stores/convex/src/server/cache.ts
     printf '%s\n' "import { it } from 'vitest';" "it('convex server cache', () => {});" \
       > stores/convex/src/server/cache.test.ts
+    printf '%s\n' '{}' > stores/_test-utils/package.json
+    printf '%s\n' 'export const atomicResumeConformance = true;' \
+      > stores/_test-utils/src/domains/workflows/atomic-resume.ts
+    printf '%s\n' "export { atomicResumeConformance } from './domains/workflows/atomic-resume';" \
+      > stores/_test-utils/src/index.ts
     printf '%s\n' '{}' > stores/libsql/package.json
     printf '%s\n' 'export const harnessStorage = true;' \
       > stores/libsql/src/storage/domains/harness/index.ts
     printf '%s\n' "import { it } from 'vitest';" "it('libsql harness storage', () => {});" \
       > stores/libsql/src/storage/domains/harness/index.test.ts
+    printf '%s\n' 'export const libsqlWorkflowStorage = true;' \
+      > stores/libsql/src/storage/domains/workflows/index.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('libsql atomic resume', () => {});" \
+      > stores/libsql/src/storage/domains/workflows/atomic-resume.test.ts
+    printf '%s\n' '{}' > stores/pg/package.json
+    printf '%s\n' 'export const pgWorkflowStorage = true;' \
+      > stores/pg/src/storage/domains/workflows/index.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('pg atomic resume', () => {});" \
+      > stores/pg/src/storage/domains/workflows/atomic-resume.test.ts
     printf '%s\n' \
-      '{"scripts":{"test":"vitest run","test:workflow":"vitest run --no-isolate --retry=1 src/index.test.ts","test:docker":"docker-compose up -d && vitest run --no-isolate --retry=1 --exclude='\''src/__tests__/adapters/**'\'' && docker-compose down"}}' \
+      '{"scripts":{"test":"vitest run","test:workflow":"vitest run --no-isolate --retry=1 src/index.test.ts","test:docker":"docker-compose up -d && vitest run --no-isolate --retry=1 --exclude='\''src/__tests__/adapters/**'\'' && docker-compose down"},"devDependencies":{"@ai-sdk/openai":"^1.3.24","inngest-cli":"^1.26.0"}}' \
       > workflows/inngest/package.json
     printf '%s\n' 'services:' '  inngest:' '    image: inngest/inngest:v1.13.1' \
       > workflows/inngest/docker-compose.yaml
@@ -1383,6 +1435,23 @@ run_validator_self_tests() {
       > workflows/inngest/src/__tests__/adapters/_utils.ts
     printf '%s\n' "import { it } from 'vitest';" "it('self-hosting inngest', () => {});" \
       > workflows/inngest/src/index.test.ts
+    printf '%s\n' 'export const resumeOperation = true;' > workflows/inngest/src/resume-operation.ts
+    printf '%s\n' 'export const run = true;' > workflows/inngest/src/run.ts
+    printf '%s\n' 'export const workflow = true;' > workflows/inngest/src/workflow.ts
+    printf '%s\n' 'export const durableAgentTestUtils = true;' \
+      > workflows/inngest/src/__tests__/durable-agent.test.utils.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('durable test utility', () => {});" \
+      > workflows/inngest/src/__tests__/durable-agent.test.utils.test.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('create run contract', () => {});" \
+      > workflows/inngest/src/create-run-contract.test.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('lifecycle execution', () => {});" \
+      > workflows/inngest/src/lifecycle-execution.test.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('resume async', () => {});" \
+      > workflows/inngest/src/resume-async.test.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('stream terminal', () => {});" \
+      > workflows/inngest/src/run-stream-terminal.test.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('serve terminal', () => {});" \
+      > workflows/inngest/src/serve.test.ts
     printf '%s\n' \
       'name: Fork validation fixture' \
       'jobs:' \
@@ -2482,30 +2551,23 @@ NODE
   head_sha="$(
     cd "$fixture_repo"
     git reset -q --hard "$base_sha"
-    printf '%s\n' "it('unpaired self-hosting topology', () => {});" \
+    printf '%s\n' "it('ordinary index regression', () => {});" \
       >> workflows/inngest/src/index.test.ts
     git add .
-    git commit -q -m 'unpaired Inngest self-hosting test change'
+    git commit -q -m 'ordinary Inngest index test change'
     git rev-parse HEAD
   )"
   : > "$command_log"
   : > "$docker_log"
-  output="$test_root/inngest-unpaired-test-failure.log"
-  set +e
+  : > "$service_log"
+  output="$test_root/inngest-index-test-success.log"
   run_fixture "$head_sha" "$output"
-  status=$?
-  set -e
-  if (( status == 0 )); then
-    echo 'Unpaired Inngest test fixture unexpectedly passed.' >&2
-    cat "$output" >&2
-    exit 1
-  fi
-  assert_contains 'self-hosting Inngest test, Compose topology, and adapter launcher must change together' "$output"
-  if [[ -s "$command_log" || -s "$docker_log" ]]; then
-    echo 'Unpaired Inngest test fixture executed validation commands.' >&2
-    cat "$command_log" "$docker_log" >&2
-    exit 1
-  fi
+  assert_contains 'compose -f workflows/inngest/docker-compose.yaml config --quiet' "$docker_log"
+  assert_contains '--filter ./workflows/inngest --fail-if-no-match exec tsc --noEmit' "$command_log"
+  assert_contains '--filter ./workflows/inngest --fail-if-no-match build' "$command_log"
+  assert_contains '--filter ./workflows/inngest --fail-if-no-match lint' "$command_log"
+  assert_contains 'src/index.test.ts' "$command_log"
+  assert_contains 'inngest-dev-server 127.0.0.1:4200' "$service_log"
 
   head_sha="$(
     cd "$fixture_repo"
@@ -2531,6 +2593,151 @@ NODE
   assert_contains 'self-hosting Inngest test, Compose topology, and adapter launcher must change together' "$output"
   if [[ -s "$command_log" || -s "$docker_log" ]]; then
     echo 'Unpaired Inngest adapter launcher fixture executed validation commands.' >&2
+    cat "$command_log" "$docker_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'export const atomicResumeConformance = "head";' \
+      > stores/_test-utils/src/domains/workflows/atomic-resume.ts
+    printf '%s\n' "export { atomicResumeConformance } from './domains/workflows/atomic-resume';" \
+      'export const atomicResumeExport = "head";' \
+      > stores/_test-utils/src/index.ts
+    printf '%s\n' "it('libsql atomic resume head', () => {});" \
+      >> stores/libsql/src/storage/domains/workflows/atomic-resume.test.ts
+    printf '%s\n' "it('pg atomic resume head', () => {});" \
+      >> stores/pg/src/storage/domains/workflows/atomic-resume.test.ts
+    git add .
+    git commit -q -m 'exercise atomic resume conformance adapters'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  : > "$service_log"
+  output="$test_root/atomic-resume-conformance-success.log"
+  if ! run_fixture "$head_sha" "$output"; then
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains '--filter ./stores/libsql --fail-if-no-match exec tsc --noEmit' "$command_log"
+  assert_contains '--filter ./stores/pg --fail-if-no-match exec tsc --noEmit' "$command_log"
+  assert_contains 'src/storage/domains/workflows/atomic-resume.test.ts' "$command_log"
+  assert_contains 'postgres 127.0.0.1:5434' "$service_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'export const resumeOperation = "head";' \
+      > workflows/inngest/src/resume-operation.ts
+    printf '%s\n' "it('create run contract head', () => {});" \
+      >> workflows/inngest/src/create-run-contract.test.ts
+    git add .
+    git commit -q -m 'exercise owned Inngest resume operation'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  : > "$docker_log"
+  output="$test_root/inngest-resume-operation-success.log"
+  if ! run_fixture "$head_sha" "$output"; then
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'Forcing PF-2044 owned suites to run for source-only changes:' "$output"
+  assert_contains 'workflows/inngest/src/lifecycle-execution.test.ts' "$output"
+  assert_contains 'workflows/inngest/src/resume-async.test.ts' "$output"
+  assert_contains 'src/create-run-contract.test.ts' "$command_log"
+  assert_contains 'src/lifecycle-execution.test.ts' "$command_log"
+  assert_contains 'src/resume-async.test.ts' "$command_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    node - <<'NODE'
+const fs = require('node:fs');
+const manifestPath = 'workflows/inngest/package.json';
+const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+delete manifest.devDependencies['@ai-sdk/openai'];
+delete manifest.devDependencies['inngest-cli'];
+fs.writeFileSync(manifestPath, `${JSON.stringify(manifest)}\n`);
+NODE
+    printf '%s\n' \
+      "lockfileVersion: '9.0'" \
+      '' \
+      'importers:' \
+      '' \
+      '  workflows/inngest:' \
+      '    devDependencies:' \
+      '      vitest:' \
+      '        specifier: ^4.1.0' \
+      '        version: 4.1.0' \
+      '' \
+      'packages:' \
+      '' \
+      '  vitest@4.1.0:' \
+      '    resolution: {integrity: sha512-retained}' \
+      '' \
+      'snapshots:' \
+      '' \
+      '  vitest@4.1.0: {}' \
+      '' \
+      > pnpm-lock.yaml
+    printf '%s\n' 'export const durableAgentTestUtils = "head";' \
+      > workflows/inngest/src/__tests__/durable-agent.test.utils.ts
+    printf '%s\n' "it('durable test utility head', () => {});" \
+      >> workflows/inngest/src/__tests__/durable-agent.test.utils.test.ts
+    printf '%s\n' "it('terminal index head', () => {});" \
+      >> workflows/inngest/src/index.test.ts
+    printf '%s\n' 'export const run = "terminal-head";' > workflows/inngest/src/run.ts
+    printf '%s\n' 'export const workflow = "terminal-head";' > workflows/inngest/src/workflow.ts
+    printf '%s\n' "it('stream terminal head', () => {});" \
+      >> workflows/inngest/src/run-stream-terminal.test.ts
+    printf '%s\n' "it('serve terminal head', () => {});" \
+      >> workflows/inngest/src/serve.test.ts
+    git add .
+    git commit -q -m 'exercise deterministic terminal delivery'
+    git rev-parse HEAD
+  )"
+  inngest_pf2057_head_sha="$head_sha"
+  : > "$command_log"
+  : > "$docker_log"
+  : > "$service_log"
+  output="$test_root/inngest-pf2057-terminal-success.log"
+  if ! run_fixture "$head_sha" "$output"; then
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains '--filter ./workflows/inngest --fail-if-no-match exec tsc --noEmit' "$command_log"
+  assert_contains 'src/__tests__/durable-agent.test.utils.test.ts' "$command_log"
+  assert_contains 'src/index.test.ts' "$command_log"
+  assert_contains 'src/lifecycle-execution.test.ts' "$command_log"
+  assert_contains 'src/resume-async.test.ts' "$command_log"
+  assert_contains 'src/run-stream-terminal.test.ts' "$command_log"
+  assert_contains 'src/serve.test.ts' "$command_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$inngest_pf2057_head_sha"
+    printf '%s\n' '# unreviewed lockfile mutation' >> pnpm-lock.yaml
+    git add pnpm-lock.yaml
+    git commit -q -m 'tamper deterministic terminal dependency cleanup'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  : > "$docker_log"
+  output="$test_root/inngest-pf2057-lock-tamper-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'PF-2057 tampered lockfile fixture unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'PF-2057 pnpm-lock.yaml may only remove the reviewed Inngest importer and inngest-cli graph blocks.' "$output"
+  if [[ -s "$command_log" || -s "$docker_log" ]]; then
+    echo 'PF-2057 tampered lockfile fixture executed validation commands.' >&2
     cat "$command_log" "$docker_log" >&2
     exit 1
   fi
@@ -3798,7 +4005,94 @@ grep -E '^(package\.json|pnpm-workspace\.yaml|patches/)' "$changed_files" \
 # Server validation invokes package-owned scripts. Reject manifest edits before
 # any PR-controlled Server command can weaken or replace those checks.
 grep -Fx 'packages/server/package.json' "$changed_files" >> "$unsupported_inputs" || true
-if grep -Fxq 'pnpm-lock.yaml' "$changed_files"; then
+
+verify_pf2057_inngest_dependency_cleanup() {
+  node - "$merge_base_sha" "$HEAD_SHA" <<'NODE'
+const { execFileSync } = require('node:child_process');
+const { isDeepStrictEqual } = require('node:util');
+
+const [baseSha, headSha] = process.argv.slice(2);
+const readAt = (sha, path) =>
+  execFileSync('git', ['show', `${sha}:${path}`], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+
+const manifestPath = 'workflows/inngest/package.json';
+const baseManifest = JSON.parse(readAt(baseSha, manifestPath));
+const headManifest = JSON.parse(readAt(headSha, manifestPath));
+for (const [dependency, version] of [
+  ['@ai-sdk/openai', '^1.3.24'],
+  ['inngest-cli', '^1.26.0'],
+]) {
+  if (baseManifest.devDependencies?.[dependency] !== version) {
+    throw new Error(`PF-2057 base no longer contains the reviewed ${dependency}@${version} devDependency.`);
+  }
+}
+const expectedManifest = structuredClone(baseManifest);
+delete expectedManifest.devDependencies['@ai-sdk/openai'];
+delete expectedManifest.devDependencies['inngest-cli'];
+if (!isDeepStrictEqual(headManifest, expectedManifest)) {
+  throw new Error('PF-2057 package.json may only remove the two reviewed unused devDependencies.');
+}
+
+const baseLock = readAt(baseSha, 'pnpm-lock.yaml');
+const headLock = readAt(headSha, 'pnpm-lock.yaml');
+const lines = baseLock.split('\n');
+
+function indentation(line) {
+  return line.length - line.trimStart().length;
+}
+
+function sectionEnd(start) {
+  const startIndent = indentation(lines[start]);
+  let end = start + 1;
+  while (end < lines.length && (lines[end] === '' || indentation(lines[end]) > startIndent)) end += 1;
+  return end;
+}
+
+function findUniqueLine(marker, start = 0, end = lines.length) {
+  const matches = [];
+  for (let index = start; index < end; index += 1) {
+    if (lines[index] === marker) matches.push(index);
+  }
+  if (matches.length !== 1) {
+    throw new Error(`PF-2057 expected exactly one lockfile line ${JSON.stringify(marker)}, found ${matches.length}.`);
+  }
+  return matches[0];
+}
+
+function removeBlock(marker, start = 0, end = lines.length) {
+  const blockStart = findUniqueLine(marker, start, end);
+  lines.splice(blockStart, sectionEnd(blockStart) - blockStart);
+}
+
+function importerBounds() {
+  const start = findUniqueLine('  workflows/inngest:');
+  return [start + 1, sectionEnd(start)];
+}
+
+for (const marker of ["      '@ai-sdk/openai':", '      inngest-cli:']) {
+  const [start, end] = importerBounds();
+  removeBlock(marker, start, end);
+}
+removeBlock('  inngest-cli@1.27.0:');
+removeBlock('  inngest-cli@1.27.0(encoding@0.1.13):');
+
+if (lines.join('\n') !== headLock) {
+  throw new Error('PF-2057 pnpm-lock.yaml may only remove the reviewed Inngest importer and inngest-cli graph blocks.');
+}
+NODE
+}
+
+inngest_pf2057_dependency_cleanup=false
+inngest_manifest_changed=false
+lockfile_changed=false
+grep -Fxq 'workflows/inngest/package.json' "$changed_files" && inngest_manifest_changed=true
+grep -Fxq 'pnpm-lock.yaml' "$changed_files" && lockfile_changed=true
+if [[ "$inngest_manifest_changed" == true && "$lockfile_changed" == true ]] &&
+  verify_pf2057_inngest_dependency_cleanup; then
+  inngest_pf2057_dependency_cleanup=true
+fi
+
+if [[ "$lockfile_changed" == true && "$inngest_pf2057_dependency_cleanup" == false ]]; then
   node - "$merge_base_sha" "$HEAD_SHA" > "$changed_lockfile_importers" <<'NODE'
 const { execFileSync } = require('node:child_process');
 
@@ -3986,7 +4280,7 @@ NODE
 )
 
 inngest_pf2050_coordination=false
-if grep -Fxq 'workflows/inngest/package.json' "$changed_files"; then
+if [[ "$inngest_manifest_changed" == true && "$inngest_pf2057_dependency_cleanup" == false ]]; then
   if verify_pf2050_inngest_coordination; then
     inngest_pf2050_coordination=true
   else
@@ -3998,10 +4292,13 @@ if grep -Fxq 'workflows/inngest/package.json' "$changed_files"; then
 fi
 
 # PF-2044 owns source and test execution for these workspaces, not mutable
-# package-command definitions. PF-2050 is the one reviewed exception: a
-# script-only removal paired with the exact workflow/runtime-manager surface.
+# package-command definitions. PF-2050 admits one script-only removal paired
+# with its exact workflow/runtime-manager surface; PF-2057 admits only the
+# reviewed unused dependency removals and their byte-exact lockfile cleanup.
 while IFS= read -r path; do
-  if [[ "$path" == 'workflows/inngest/package.json' && "$inngest_pf2050_coordination" == true ]]; then
+  if [[ "$path" == 'workflows/inngest/package.json' ]] &&
+    { [[ "$inngest_pf2050_coordination" == true ]] ||
+      [[ "$inngest_pf2057_dependency_cleanup" == true ]]; }; then
     continue
   fi
   printf '%s\n' "$path" >> "$unsupported_inputs"
@@ -4022,7 +4319,10 @@ inngest_pf2042_changed_count=0
 [[ "$inngest_index_test_changed" == true ]] && ((inngest_pf2042_changed_count += 1))
 [[ "$inngest_compose_changed" == true ]] && ((inngest_pf2042_changed_count += 1))
 [[ "$inngest_adapter_utils_changed" == true ]] && ((inngest_pf2042_changed_count += 1))
-if { (( inngest_pf2042_changed_count > 0 && inngest_pf2042_changed_count < 3 )); } || {
+if {
+  [[ "$inngest_compose_changed" == true || "$inngest_adapter_utils_changed" == true ]] &&
+    (( inngest_pf2042_changed_count < 3 ));
+} || {
   (( inngest_pf2042_changed_count == 3 )) &&
     { ! git_regular_file_at_head workflows/inngest/src/index.test.ts ||
       ! git_regular_file_at_head workflows/inngest/docker-compose.yaml ||
@@ -4129,6 +4429,20 @@ queue_owned_workspace_test() {
   fi
 }
 
+storage_atomic_resume_conformance_owned=false
+if grep -Eq '^stores/_test-utils/src/(domains/workflows/atomic-resume\.ts|index\.ts)$' "$changed_files" &&
+  ! grep -E '^stores/_test-utils/' "$changed_files" |
+    grep -Ev '^stores/_test-utils/src/(domains/workflows/atomic-resume\.ts|index\.ts)$' |
+    grep -q .; then
+  storage_atomic_resume_conformance_owned=true
+  while IFS= read -r file; do
+    queue_owned_workspace_test "$file" stores/libsql/src/storage/domains/workflows/atomic-resume.test.ts
+    queue_owned_workspace_test "$file" stores/pg/src/storage/domains/workflows/atomic-resume.test.ts
+  done < <(
+    grep -E '^stores/_test-utils/src/(domains/workflows/atomic-resume\.ts|index\.ts)$' "$changed_files"
+  )
+fi
+
 # These are executable ownership maps, not passive workspace allowlists. A
 # production-only change forces its native regression file to run; an unknown
 # source or test in a newly admitted workspace fails closed until its runtime
@@ -4136,7 +4450,9 @@ queue_owned_workspace_test() {
 while IFS= read -r file; do
   if [[ "$file" =~ ^(pubsub/(google-cloud-pubsub|redis-streams)|stores/(convex|libsql)|workflows/inngest)/ ]] &&
     ! [[ "$file" =~ \.(cjs|cts|js|jsx|mjs|mts|ts|tsx)$ ]]; then
-    if [[ "$file" == 'workflows/inngest/package.json' && "$inngest_pf2050_coordination" == true ]]; then
+    if [[ "$file" == 'workflows/inngest/package.json' ]] &&
+      { [[ "$inngest_pf2050_coordination" == true ]] ||
+        [[ "$inngest_pf2057_dependency_cleanup" == true ]]; }; then
       continue
     fi
     if [[ "$file" == 'workflows/inngest/docker-compose.yaml' ]] &&
@@ -4164,14 +4480,19 @@ while IFS= read -r file; do
         stores/convex/src/server/cache.test.ts | \
         stores/libsql/src/storage/domains/harness/index.test.ts | \
         stores/libsql/src/storage/domains/thread-state/index.test.ts | \
+        stores/libsql/src/storage/domains/workflows/atomic-resume.test.ts | \
         workflows/inngest/src/__tests__/create-inngest-agent.test.ts | \
+        workflows/inngest/src/__tests__/durable-agent.test.utils.test.ts | \
         workflows/inngest/src/__tests__/inngest-test-runtime.test.ts | \
         workflows/inngest/src/actor-signal.test.ts | \
+        workflows/inngest/src/create-run-contract.test.ts | \
         workflows/inngest/src/durable-agent/create-inngest-agentic-workflow.test.ts | \
         workflows/inngest/src/index.test.ts | \
         workflows/inngest/src/lifecycle-execution.test.ts | \
         workflows/inngest/src/pubsub.test.ts | \
-        workflows/inngest/src/resume-async.test.ts) ;;
+        workflows/inngest/src/resume-async.test.ts | \
+        workflows/inngest/src/run-stream-terminal.test.ts | \
+        workflows/inngest/src/serve.test.ts) ;;
       *) printf '%s\n' "$file" >> "$unsupported_owned_workspace_tests" ;;
     esac
     if ! git_regular_file_at_head "$file"; then
@@ -4203,6 +4524,12 @@ while IFS= read -r file; do
     stores/libsql/src/storage/domains/harness/index.ts)
       queue_owned_workspace_test "$file" stores/libsql/src/storage/domains/harness/index.test.ts
       ;;
+    stores/libsql/src/storage/domains/workflows/index.ts)
+      queue_owned_workspace_test "$file" stores/libsql/src/storage/domains/workflows/atomic-resume.test.ts
+      ;;
+    workflows/inngest/src/__tests__/durable-agent.test.utils.ts)
+      queue_owned_workspace_test "$file" workflows/inngest/src/__tests__/durable-agent.test.utils.test.ts
+      ;;
     workflows/inngest/src/durable-agent/create-inngest-agent.ts | \
       workflows/inngest/src/durable-agent/index.ts)
       queue_owned_workspace_test "$file" workflows/inngest/src/__tests__/create-inngest-agent.test.ts
@@ -4217,6 +4544,10 @@ while IFS= read -r file; do
       queue_owned_workspace_test "$file" workflows/inngest/src/lifecycle-execution.test.ts
       ;;
     workflows/inngest/src/run.ts)
+      queue_owned_workspace_test "$file" workflows/inngest/src/lifecycle-execution.test.ts
+      queue_owned_workspace_test "$file" workflows/inngest/src/resume-async.test.ts
+      ;;
+    workflows/inngest/src/resume-operation.ts)
       queue_owned_workspace_test "$file" workflows/inngest/src/lifecycle-execution.test.ts
       queue_owned_workspace_test "$file" workflows/inngest/src/resume-async.test.ts
       ;;
@@ -5291,7 +5622,8 @@ if (( ${#detected_tests[@]} > 0 )); then
     elif [[ "$file" == stores/convex/src/cache/index.test.ts || \
       "$file" == stores/convex/src/server/cache.test.ts || \
       "$file" == stores/libsql/src/storage/domains/harness/index.test.ts || \
-      "$file" == stores/libsql/src/storage/domains/thread-state/index.test.ts ]]; then
+      "$file" == stores/libsql/src/storage/domains/thread-state/index.test.ts || \
+      "$file" == stores/libsql/src/storage/domains/workflows/atomic-resume.test.ts ]]; then
       printf '%s\n' "$file" >> "$changed_tests"
     elif [[ "$file" == stores/* && "$file" != stores/_test-utils/* && \
       "$file" != stores/pg/* && "$file" != stores/redis/* ]]; then
@@ -5341,6 +5673,7 @@ if [[ -s "$unsupported_tests" ]]; then
 fi
 
 if workspace_changed stores/_test-utils &&
+  [[ "$storage_atomic_resume_conformance_owned" == false ]] &&
   ! grep -Eq '^stores/_test-utils/.*\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs|mts|cts)$' "$changed_tests"; then
   echo "Storage test utility changes must include a changed Vitest file in stores/_test-utils." >&2
   echo "Failing closed instead of accepting unexecuted shared conformance helpers." >&2
