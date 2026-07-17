@@ -221,9 +221,9 @@ export async function persistStepUpdate(
       );
     }
     if (workflowsStore && resumeCapabilities?.fencedStepUpdateVersion !== 1) {
-      // Compatibility path for ordinary runs on custom adapters which do not
-      // participate in atomic resume. Resumed execution never reaches this
-      // path, because it carries the storage-owned resume operation identity.
+      // Compatibility path for custom adapters which do not implement the
+      // storage-locked step mutation. Capability-enabled adapters keep every
+      // write, including ordinary default resumes, behind that mutation lock.
       const authoritativeSnapshot = await workflowsStore.loadWorkflowSnapshot({ workflowName: workflowId, runId });
       if (
         authoritativeSnapshot &&

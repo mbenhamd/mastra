@@ -219,7 +219,7 @@ describe('persistStepUpdate — suspended overwrite guard', () => {
     expect(engine.getLastPersistedStatus('run-1')).toBe('pending');
   });
 
-  it('preserves authoritative resource, run options, and resume checkpoint across an intermediate write', async () => {
+  it('rejects an unhashed ordinary writer while a storage-admitted checkpoint is active', async () => {
     const checkpoint = { version: 1, marker: 'storage-owned' } as never;
     store.snapshot = {
       runId: 'run-1',
@@ -257,14 +257,95 @@ describe('persistStepUpdate — suspended overwrite guard', () => {
       requestContext: new RequestContext(),
     });
 
-    expect(store.calls.at(-1)?.snapshot).toMatchObject({
-      value: { after: true },
-    });
+    expect(store.calls).toHaveLength(0);
     expect(store.snapshot).toMatchObject({
       resourceId: 'resource-from-storage',
       runOptions: { disableScorers: true },
       resumeCheckpoint: checkpoint,
-      value: { after: true },
+      value: { before: true },
+    });
+  });
+
+  it('persists the first completed result for an ordinary next resume attempt', async () => {
+    store.snapshot = {
+      runId: 'run-1',
+      resourceId: 'resource-1',
+      status: 'suspended',
+      value: {},
+      context: {},
+      activePaths: [],
+      activeStepsPath: {},
+      suspendedPaths: { approval: [0] },
+      resumeLabels: {},
+      waitingPaths: {},
+      serializedStepGraph: [],
+      timestamp: 1,
+      executionGeneration: 'wfeg:generation',
+      lifecycleResumeAttempt: 0,
+      lifecycleStepStates: {},
+    } as WorkflowRunState;
+    const resumedExecutionContext = baseExecutionContext({
+      executionGeneration: 'wfeg:generation',
+      lifecycleResumeAttempt: 1,
+      lifecycleStepStates: { approval: { stepCallId: 'wfsc:approval', stepAttempt: 2 } },
+    });
+
+    await engine.persistStepUpdate({
+      workflowId: 'wf',
+      runId: 'run-1',
+      resourceId: 'resource-1',
+      stepResults: {},
+      serializedStepGraph: [],
+      executionContext: resumedExecutionContext,
+      workflowStatus: 'running',
+      requestContext: new RequestContext(),
+    });
+
+    expect(store.calls).toHaveLength(0);
+    expect(store.snapshot).toMatchObject({
+      status: 'suspended',
+      lifecycleResumeAttempt: 0,
+    });
+
+    await engine.persistStepUpdate({
+      workflowId: 'wf',
+      runId: 'run-1',
+      resourceId: 'resource-1',
+      stepResults: {},
+      serializedStepGraph: [],
+      executionContext: resumedExecutionContext,
+      workflowStatus: 'waiting',
+      requestContext: new RequestContext(),
+    });
+
+    expect(store.calls).toHaveLength(0);
+    expect(store.snapshot).toMatchObject({
+      status: 'suspended',
+      lifecycleResumeAttempt: 0,
+    });
+
+    await engine.persistStepUpdate({
+      workflowId: 'wf',
+      runId: 'run-1',
+      resourceId: 'resource-1',
+      stepResults: {},
+      serializedStepGraph: [],
+      executionContext: resumedExecutionContext,
+      workflowStatus: 'suspended',
+      requestContext: new RequestContext(),
+    });
+
+    expect(store.calls).toHaveLength(1);
+    expect(store.calls[0]).toMatchObject({
+      expectedExecutionGeneration: 'wfeg:generation',
+      expectedLifecycleResumeAttempt: 1,
+      expectedResumeOperationHash: undefined,
+    });
+    expect(store.snapshot).toMatchObject({
+      status: 'suspended',
+      executionGeneration: 'wfeg:generation',
+      lifecycleResumeAttempt: 1,
+      lifecycleStepStates: { approval: { stepCallId: 'wfsc:approval', stepAttempt: 2 } },
     });
   });
 

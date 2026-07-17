@@ -42,6 +42,7 @@ export async function expectAtomicWorkflowResumeStorageContract(options: {
   const runIds = {
     main: 'run-main',
     conflict: 'run-conflict',
+    ordinary: 'run-ordinary-resume',
     rollback: 'run-rollback',
     race: 'run-rollback-finalize-race',
     skipped: 'run-skipped',
@@ -107,6 +108,52 @@ export async function expectAtomicWorkflowResumeStorageContract(options: {
     expect(options.primary.getWorkflowResumeCapabilities()).toEqual({
       atomicResumeVersion: 1,
       fencedStepUpdateVersion: 1,
+    });
+
+    const ordinarySnapshot = suspendedSnapshot(runIds.ordinary, resourceId);
+    await options.primary.persistWorkflowSnapshot({
+      workflowName: options.workflowName,
+      runId: runIds.ordinary,
+      resourceId,
+      snapshot: ordinarySnapshot,
+    });
+    const ordinaryUpdates = await Promise.all([
+      options.primary.persistWorkflowStepUpdate({
+        workflowName: options.workflowName,
+        runId: runIds.ordinary,
+        resourceId,
+        expectedExecutionGeneration: ordinarySnapshot.executionGeneration,
+        expectedLifecycleResumeAttempt: 1,
+        snapshot: {
+          ...ordinarySnapshot,
+          status: 'suspended',
+          value: { winner: 'primary' },
+          lifecycleResumeAttempt: 1,
+        },
+      }),
+      secondary.persistWorkflowStepUpdate({
+        workflowName: options.workflowName,
+        runId: runIds.ordinary,
+        resourceId,
+        expectedExecutionGeneration: ordinarySnapshot.executionGeneration,
+        expectedLifecycleResumeAttempt: 1,
+        snapshot: {
+          ...ordinarySnapshot,
+          status: 'suspended',
+          value: { winner: 'secondary' },
+          lifecycleResumeAttempt: 1,
+        },
+      }),
+    ]);
+    expect(ordinaryUpdates.map(result => result.status).sort()).toEqual(['persisted', 'stale_execution']);
+    const ordinaryWinner =
+      ordinaryUpdates.findIndex(result => result.status === 'persisted') === 0 ? 'primary' : 'secondary';
+    await expect(
+      options.primary.loadWorkflowSnapshot({ workflowName: options.workflowName, runId: runIds.ordinary }),
+    ).resolves.toMatchObject({
+      status: 'suspended',
+      value: { winner: ordinaryWinner },
+      lifecycleResumeAttempt: 1,
     });
 
     const admission = admissionFor(runIds.main);

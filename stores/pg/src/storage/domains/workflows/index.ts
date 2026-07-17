@@ -375,14 +375,17 @@ export class WorkflowsPG extends WorkflowsStorage {
           await t.none(
             `INSERT INTO ${this.workflowSnapshotTableName()}
                (workflow_name, run_id, "resourceId", snapshot, "createdAt", "updatedAt", "createdAtZ", "updatedAtZ")
-             VALUES ($1, $2, $3, $4, $5, $5, $5, $5)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              ON CONFLICT (workflow_name, run_id) DO UPDATE
-             SET "resourceId" = $3, snapshot = $4, "updatedAt" = $5, "updatedAtZ" = $5`,
+             SET "resourceId" = $3, snapshot = $4, "updatedAt" = $6, "updatedAtZ" = $8`,
             [
               input.workflowName,
               input.runId,
               retainedResourceId,
               sanitizeJsonForPg(JSON.stringify(updatedSnapshot)),
+              now,
+              now,
+              now,
               now,
             ],
           );
