@@ -29,7 +29,7 @@ const filterAfterRecentTools = new ToolCallFilter({
 
 // Preserve compact model-facing output for filtered completed tool results
 const filterWithCompactToolHistory = new ToolCallFilter({
-  preserveModelOutput: true,
+  preserveModelOutputFor: ['publicSearch'],
   maxModelOutputBytes: 4096,
 })
 ```
@@ -68,6 +68,13 @@ const filterWithCompactToolHistory = new ToolCallFilter({
               'Preserves compact model-facing output from completed filtered tool results with providerMetadata.mastra.modelOutput. Raw tool args and raw results are removed',
             isOptional: true,
             defaultValue: 'false',
+          },
+          {
+            name: 'preserveModelOutputFor',
+            type: 'string[]',
+            description:
+              'Preserves compact model-facing output only for the listed filtered tools. An explicit empty list preserves none and takes precedence over preserveModelOutput',
+            isOptional: true,
           },
           {
             name: 'maxModelOutputBytes',
@@ -140,6 +147,15 @@ Mastra preserves text, JSON, error text, and error JSON output shapes stored on 
 ```typescript
 const filter = new ToolCallFilter({
   preserveModelOutput: true,
+  maxModelOutputBytes: 4096,
+})
+```
+
+Use `preserveModelOutputFor` when only named tools are safe to retain. An explicit empty list preserves no compact output. If this option is omitted, `preserveModelOutput: true` keeps its existing preserve-all behavior.
+
+```typescript
+const filter = new ToolCallFilter({
+  preserveModelOutputFor: ['publicSearch'],
   maxModelOutputBytes: 4096,
 })
 ```

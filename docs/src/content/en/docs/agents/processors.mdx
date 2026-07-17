@@ -420,6 +420,14 @@ new ToolCallFilter({
 })
 ```
 
+Set `preserveModelOutputFor` to an explicit tool-name allowlist when only selected compact outputs are safe to retain. An empty list retains none.
+
+```typescript
+new ToolCallFilter({
+  preserveModelOutputFor: ['publicSearch'],
+})
+```
+
 See the [`ToolCallFilter` reference](/reference/processors/tool-call-filter) for configuration options and the [Memory Processors](/docs/memory/memory-processors#manual-control-and-deduplication) page for pre-memory filtering.
 
 ### `ToolSearchProcessor`

@@ -26,6 +26,7 @@ export class ToolCallFilter implements Processor {
   private exclude: string[] | 'all';
   private filterAfterToolSteps: number | undefined;
   private preserveModelOutput: boolean;
+  private preserveModelOutputFor: string[] | undefined;
   private maxModelOutputBytes: number | undefined;
 
   /**
@@ -34,6 +35,7 @@ export class ToolCallFilter implements Processor {
    * @param options.exclude List of specific tool names to exclude. If not provided, all tool calls are excluded.
    * @param options.filterAfterToolSteps Enable agentic loop step filtering and preserve tool calls/results from this many recent tool-producing steps.
    * @param options.preserveModelOutput Preserve sanitized model-facing output from completed filtered tool results with providerMetadata.mastra.modelOutput.
+   * @param options.preserveModelOutputFor Preserve compact model output only for these tool names. An empty list preserves none.
    * @param options.maxModelOutputBytes Maximum UTF-8 bytes retained from each preserved model output. Oversized output is deterministically truncated.
    */
   constructor(options: ToolCallFilterOptions = {}) {
@@ -42,6 +44,7 @@ export class ToolCallFilter implements Processor {
     this.exclude = normalizeToolCallFilterExclude(exclude);
     this.filterAfterToolSteps = resolvedOptions.filterAfterToolSteps;
     this.preserveModelOutput = resolvedOptions.preserveModelOutput ?? false;
+    this.preserveModelOutputFor = resolvedOptions.preserveModelOutputFor;
     this.maxModelOutputBytes = normalizeToolCallFilterMaxModelOutputBytes(
       (resolvedOptions as { maxModelOutputBytes?: unknown }).maxModelOutputBytes,
     );
@@ -127,6 +130,7 @@ export class ToolCallFilter implements Processor {
       {
         exclude: this.exclude === 'all' ? undefined : this.exclude,
         preserveModelOutput: this.preserveModelOutput,
+        ...(this.preserveModelOutputFor === undefined ? {} : { preserveModelOutputFor: this.preserveModelOutputFor }),
         ...(this.maxModelOutputBytes === undefined ? {} : { maxModelOutputBytes: this.maxModelOutputBytes }),
       },
       preserveToolCallIds,

@@ -7,12 +7,18 @@ const MAX_MODEL_OUTPUT_TRAVERSAL_NODES = 10_000;
 export type ToolCallFilteringOptions = {
   exclude?: string[];
   preserveModelOutput?: boolean;
+  /**
+   * Tool names whose compact model output may be retained when their raw tool
+   * payload is filtered. When provided, this allowlist takes precedence over
+   * `preserveModelOutput`; an empty list retains no model output.
+   */
+  preserveModelOutputFor?: string[];
   maxModelOutputBytes?: number;
 };
 
 type NormalizedToolCallFilteringOptions = {
   exclude: string[] | 'all';
-  preserveModelOutput: boolean;
+  preserveModelOutputFor: string[] | 'all';
   maxModelOutputBytes?: number;
 };
 
@@ -47,6 +53,17 @@ export function normalizeToolCallFilterMaxModelOutputBytes(maxModelOutputBytes: 
   return Math.floor(maxModelOutputBytes);
 }
 
+function normalizePreservedModelOutputTools(
+  preserveModelOutput: boolean | undefined,
+  preserveModelOutputFor: unknown,
+): string[] | 'all' {
+  if (preserveModelOutputFor === undefined) return preserveModelOutput ? 'all' : [];
+  if (!Array.isArray(preserveModelOutputFor) || preserveModelOutputFor.some(toolName => typeof toolName !== 'string')) {
+    throw new TypeError('Tool call filter options.preserveModelOutputFor must be an array of strings when provided');
+  }
+  return preserveModelOutputFor;
+}
+
 function getOwnDataProperty(value: object, key: PropertyKey): OwnDataProperty {
   const descriptor = Object.getOwnPropertyDescriptor(value, key);
   if (!descriptor) return { kind: 'missing' };
@@ -62,7 +79,10 @@ function normalizeOptions(options: ToolCallFilteringOptions | null): NormalizedT
   );
   return {
     exclude: normalizeToolCallFilterExclude(exclude),
-    preserveModelOutput: resolvedOptions.preserveModelOutput ?? false,
+    preserveModelOutputFor: normalizePreservedModelOutputTools(
+      resolvedOptions.preserveModelOutput,
+      (resolvedOptions as { preserveModelOutputFor?: unknown }).preserveModelOutputFor,
+    ),
     ...(maxModelOutputBytes === undefined
       ? {}
       : {
@@ -526,7 +546,10 @@ function getPreservedModelOutputPart(
   part: MastraToolInvocationPart,
   options: NormalizedToolCallFilteringOptions,
 ): { type: 'text'; text: string } | null {
-  if (!options.preserveModelOutput || part.toolInvocation.state !== 'result') {
+  if (
+    part.toolInvocation.state !== 'result' ||
+    (options.preserveModelOutputFor !== 'all' && !options.preserveModelOutputFor.includes(part.toolInvocation.toolName))
+  ) {
     return null;
   }
 
@@ -567,6 +590,39 @@ function getPreservedModelOutputPart(
   } catch {
     return null;
   }
+}
+
+/**
+ * Extract compact model-output text from completed tool results that the
+ * configured raw-tool filter would remove. The returned parts are newly
+ * allocated and never retain provider metadata or raw tool payloads.
+ */
+export function getPreservedModelOutputParts(
+  messages: MastraDBMessage[],
+  options: ToolCallFilteringOptions | null = {},
+): Array<{ type: 'text'; text: string }> {
+  const normalizedOptions = normalizeOptions(options);
+  const seenToolCallIds = new Set<string>();
+  const preservedParts: Array<{ type: 'text'; text: string }> = [];
+
+  for (const message of messages) {
+    for (const part of getToolInvocations(message)) {
+      if (normalizedOptions.exclude !== 'all' && !normalizedOptions.exclude.includes(part.toolInvocation.toolName)) {
+        continue;
+      }
+
+      const toolCallId = getToolCallId(part.toolInvocation);
+      if (toolCallId && seenToolCallIds.has(toolCallId)) continue;
+
+      const preservedPart = getPreservedModelOutputPart(part, normalizedOptions);
+      if (!preservedPart) continue;
+
+      if (toolCallId) seenToolCallIds.add(toolCallId);
+      preservedParts.push(preservedPart);
+    }
+  }
+
+  return preservedParts;
 }
 
 function buildContent(
