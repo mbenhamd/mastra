@@ -931,6 +931,10 @@ export type WorkflowStreamEvent =
           };
         };
         metadata: Record<string, any>;
+        /** Engine-native result details retained alongside the canonical terminal fields. */
+        status?: WorkflowRunStatus;
+        result?: unknown;
+        error?: unknown;
       };
     })
   | (BaseChunkType & {

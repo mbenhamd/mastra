@@ -46,6 +46,37 @@ export const INNGEST_WORKFLOW_LIFECYCLE_REPLAY = {
   maxEvents: 10_000,
 } as const;
 
+export function createInngestWorkflowTerminalPayload(result: {
+  status: WorkflowRunStatus;
+  result?: unknown;
+  error?: unknown;
+}): Extract<WorkflowStreamEvent, { type: 'workflow-finish' }>['payload'] & {
+  status: WorkflowRunStatus;
+  result?: unknown;
+  error?: unknown;
+} {
+  const terminalError =
+    result.status === 'failed' && result.error !== undefined
+      ? getErrorFromUnknown(result.error, { serializeStack: true }).toJSON()
+      : undefined;
+  const errorMessage = terminalError?.message;
+
+  return {
+    workflowStatus: result.status,
+    output: {
+      usage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+      },
+    },
+    metadata: terminalError === undefined ? {} : { error: terminalError, errorMessage },
+    status: result.status,
+    result: result.status === 'success' ? result.result : undefined,
+    error: terminalError,
+  };
+}
+
 function requireLifecycleEventTuple(params: {
   workflowId: string;
   runId: string;
@@ -1046,9 +1077,7 @@ export class InngestWorkflow<
                 data: {
                   type: 'workflow-finish',
                   payload: {
-                    status: result.status,
-                    result: result.status === 'success' ? result.result : undefined,
-                    error: result.status === 'failed' ? result.error : undefined,
+                    ...createInngestWorkflowTerminalPayload(result),
                     ...(resume
                       ? {
                           workflowResult: publishedWorkflowResult,

@@ -13,12 +13,8 @@ type AggregatedLanguageModelUsage = Required<LanguageModelUsage> & {
   cacheCreationInputTokens: number;
 };
 
-export class WorkflowRunOutput<
-  TResult extends WorkflowResult<any, any, any, any> = WorkflowResult<any, any, any, any>,
-> implements MastraBaseStream<WorkflowStreamEvent> {
-  #status: WorkflowRunStatus = 'running';
-  #tripwireData: StepTripwireData | undefined;
-  #usageCount: AggregatedLanguageModelUsage = {
+function createUsageCount(): AggregatedLanguageModelUsage {
+  return {
     inputTokens: 0,
     outputTokens: 0,
     totalTokens: 0,
@@ -26,19 +22,40 @@ export class WorkflowRunOutput<
     cacheCreationInputTokens: 0,
     reasoningTokens: 0,
   };
+}
+
+function createDelayedPromises<TResult>() {
+  return {
+    usage: new DelayedPromise<LanguageModelUsage>(),
+    result: new DelayedPromise<TResult>(),
+  };
+}
+
+function getErrorMessage(error: unknown): string | undefined {
+  if (error instanceof Error) return error.message;
+  if (typeof error !== 'object' || error === null) return undefined;
+  const message = (error as { message?: unknown }).message;
+  return typeof message === 'string' ? message : undefined;
+}
+
+export class WorkflowRunOutput<
+  TResult extends WorkflowResult<any, any, any, any> = WorkflowResult<any, any, any, any>,
+> implements MastraBaseStream<WorkflowStreamEvent> {
+  #status: WorkflowRunStatus = 'running';
+  #tripwireData: StepTripwireData | undefined;
+  #usageCount = createUsageCount();
   #consumptionStarted = false;
-  #baseStream: ReadableStream<WorkflowStreamEvent>;
+  #baseStream!: ReadableStream<WorkflowStreamEvent>;
   #emitter = new EventEmitter();
   #bufferedChunks: WorkflowStreamEvent[] = [];
 
   #streamFinished = false;
+  #terminalDelivered = false;
+  #streamGeneration = 0;
 
   #streamError: Error | undefined;
 
-  #delayedPromises = {
-    usage: new DelayedPromise<LanguageModelUsage>(),
-    result: new DelayedPromise<TResult>(),
-  };
+  #delayedPromises = createDelayedPromises<TResult>();
 
   /**
    * Unique identifier for this workflow run
@@ -58,105 +75,211 @@ export class WorkflowRunOutput<
     workflowId: string;
     stream: ReadableStream<WorkflowStreamEvent>;
   }) {
-    const self = this;
     this.runId = runId;
     this.workflowId = workflowId;
+    this.#attachStream(stream);
+  }
+
+  #attachStream(stream: ReadableStream<WorkflowStreamEvent>) {
+    const generation = ++this.#streamGeneration;
 
     this.#baseStream = stream;
+    this.#streamFinished = false;
+    this.#consumptionStarted = false;
+    this.#terminalDelivered = false;
+    this.#status = 'running';
+    this.#tripwireData = undefined;
+    this.#usageCount = createUsageCount();
+    this.#streamError = undefined;
+    this.#bufferedChunks = [];
+    this.#emitter = new EventEmitter();
+    this.#delayedPromises = createDelayedPromises<TResult>();
+
     stream
       .pipeTo(
         new WritableStream({
-          start() {
-            const chunk: WorkflowStreamEvent = {
+          start: () => {
+            if (generation !== this.#streamGeneration) return;
+
+            this.#emitChunk({
               type: 'workflow-start',
-              runId: self.runId,
+              runId: this.runId,
               from: ChunkFrom.WORKFLOW,
               payload: {
-                workflowId: self.workflowId,
+                workflowId: this.workflowId,
               },
-            } as WorkflowStreamEvent;
-
-            self.#bufferedChunks.push(chunk);
-            self.#emitter.emit('chunk', chunk);
+            } as WorkflowStreamEvent);
           },
-          write(chunk) {
-            if (chunk.type !== 'workflow-step-finish') {
-              self.#bufferedChunks.push(chunk);
-              self.#emitter.emit('chunk', chunk);
-            }
-
-            if (chunk.type === 'workflow-step-output') {
-              if ('output' in chunk.payload && chunk.payload.output) {
-                const output = chunk.payload.output;
-                if (output.type === 'finish') {
-                  if (output.payload && 'usage' in output.payload && output.payload.usage) {
-                    self.#updateUsageCount(output.payload.usage);
-                  } else if (output.payload && 'output' in output.payload && output.payload.output) {
-                    const outputPayload = output.payload.output;
-                    if ('usage' in outputPayload && outputPayload.usage) {
-                      self.#updateUsageCount(outputPayload.usage);
-                    }
-                  }
-                }
-              }
-            } else if (chunk.type === 'workflow-canceled') {
-              self.#status = 'canceled';
-            } else if (chunk.type === 'workflow-step-suspended') {
-              self.#status = 'suspended';
-            } else if (chunk.type === 'workflow-step-result' && chunk.payload.status === 'failed') {
-              // Check if the failure was due to a tripwire
-              if (chunk.payload.tripwire) {
-                self.#status = 'tripwire';
-                self.#tripwireData = chunk.payload.tripwire;
-              } else {
-                self.#status = 'failed';
-              }
-            } else if (chunk.type === 'workflow-paused') {
-              self.#status = 'paused';
-            }
+          write: chunk => {
+            if (generation !== this.#streamGeneration) return;
+            this.#acceptChunk(chunk);
           },
-          close() {
-            if (self.#status === 'running') {
-              self.#status = 'success';
-            }
-
-            self.#emitter.emit('chunk', {
-              type: 'workflow-finish',
-              runId: self.runId,
-              from: ChunkFrom.WORKFLOW,
-              payload: {
-                workflowStatus: self.#status,
-                metadata: self.#streamError
-                  ? {
-                      error: self.#streamError,
-                      errorMessage: self.#streamError?.message,
-                    }
-                  : {},
-                output: {
-                  usage: self.#usageCount,
-                },
-                // Include tripwire data when status is 'tripwire'
-                ...(self.#status === 'tripwire' && self.#tripwireData ? { tripwire: self.#tripwireData } : {}),
-              },
-            });
-
-            self.#delayedPromises.usage.resolve(self.#usageCount);
-
-            Object.entries(self.#delayedPromises).forEach(([key, promise]) => {
-              if (promise.status.type === 'pending') {
-                promise.reject(new Error(`promise '${key}' was not resolved or rejected when stream finished`));
-              }
-            });
-
-            self.#streamFinished = true;
-            self.#emitter.emit('finish');
+          close: () => {
+            this.#finishStream(generation);
           },
         }),
       )
       .catch(reason => {
-        // eslint-disable-next-line no-console
-        console.log(' something went wrong', reason);
+        const error = reason instanceof Error ? reason : new Error(String(reason));
+        this.#finishStream(generation, error);
       });
+  }
+
+  #emitChunk(chunk: WorkflowStreamEvent) {
+    this.#bufferedChunks.push(chunk);
+    this.#emitter.emit('chunk', chunk);
+  }
+
+  #acceptChunk(chunk: WorkflowStreamEvent) {
+    if (this.#terminalDelivered) return;
+
+    if (chunk.type === 'workflow-finish') {
+      // Some workflow engines publish a minimal `{ runId }` finish marker to
+      // end their watch transport. It is not the public terminal payload and
+      // must not suppress the canonical terminal synthesized on stream close.
+      const terminal = this.#normalizeTerminal(chunk);
+      if (!terminal) return;
+
+      this.#terminalDelivered = true;
+      this.#status = terminal.payload.workflowStatus;
+      this.#emitChunk(terminal);
+      return;
+    }
+
+    if (chunk.type !== 'workflow-step-finish') {
+      this.#emitChunk(chunk);
+    }
+
+    if (chunk.type === 'workflow-step-output') {
+      if ('output' in chunk.payload && chunk.payload) {
+        const output = chunk.payload.output;
+        if (output?.type === 'finish') {
+          if (output.payload && 'usage' in output.payload && output.payload.usage) {
+            this.#updateUsageCount(output.payload.usage);
+          } else if (output.payload && 'output' in output.payload && output.payload.output) {
+            const outputPayload = output.payload.output;
+            if ('usage' in outputPayload && outputPayload.usage) {
+              this.#updateUsageCount(outputPayload.usage);
+            }
+          }
+        }
+      }
+    } else if (chunk.type === 'workflow-canceled') {
+      this.#status = 'canceled';
+    } else if (chunk.type === 'workflow-step-suspended') {
+      this.#status = 'suspended';
+    } else if (chunk.type === 'workflow-step-result' && chunk.payload.status === 'failed') {
+      if (chunk.payload.tripwire) {
+        this.#status = 'tripwire';
+        this.#tripwireData = chunk.payload.tripwire;
+      } else {
+        this.#status = 'failed';
+      }
+    } else if (chunk.type === 'workflow-paused') {
+      this.#status = 'paused';
+    }
+  }
+
+  #normalizeTerminal(chunk: Extract<WorkflowStreamEvent, { type: 'workflow-finish' }>) {
+    const payload = chunk.payload as unknown as Record<string, unknown>;
+    const status = payload.workflowStatus ?? payload.status;
+    if (typeof status !== 'string') return undefined;
+
+    const error = payload.error;
+    const metadata =
+      typeof payload.metadata === 'object' && payload.metadata !== null && !Array.isArray(payload.metadata)
+        ? { ...(payload.metadata as Record<string, unknown>) }
+        : {};
+    if (error !== undefined) {
+      metadata.error ??= error;
+      metadata.errorMessage ??= getErrorMessage(error);
+    }
+
+    const output =
+      typeof payload.output === 'object' && payload.output !== null && !Array.isArray(payload.output)
+        ? (payload.output as Record<string, unknown>)
+        : {};
+    const terminalUsage =
+      typeof output.usage === 'object' && output.usage !== null && !Array.isArray(output.usage)
+        ? output.usage
+        : undefined;
+    const hasObservedUsage =
+      (this.#usageCount.inputTokens ?? 0) > 0 ||
+      (this.#usageCount.outputTokens ?? 0) > 0 ||
+      (this.#usageCount.totalTokens ?? 0) > 0;
+    if (!hasObservedUsage && terminalUsage) {
+      this.#updateUsageCount(
+        terminalUsage as {
+          inputTokens?: `${number}` | number;
+          outputTokens?: `${number}` | number;
+          totalTokens?: `${number}` | number;
+          reasoningTokens?: `${number}` | number;
+          cachedInputTokens?: `${number}` | number;
+          cacheCreationInputTokens?: `${number}` | number;
+        },
+      );
+    }
+    const usage = this.#usageCount;
+
+    return {
+      ...chunk,
+      payload: {
+        ...payload,
+        workflowStatus: status as WorkflowRunStatus,
+        output: {
+          ...output,
+          usage,
+        },
+        metadata,
+      },
+    } as Extract<WorkflowStreamEvent, { type: 'workflow-finish' }>;
+  }
+
+  #finishStream(generation: number, error?: Error) {
+    if (generation !== this.#streamGeneration || this.#streamFinished) return;
+
+    if (error && !this.#terminalDelivered) {
+      if (this.#delayedPromises.result.status.type === 'pending') {
+        this.#status = 'failed';
+        this.#streamError = error;
+        this.#delayedPromises.result.reject(error);
+      }
+    } else if (this.#status === 'running') {
+      this.#status = 'success';
+    }
+
+    if (!this.#terminalDelivered) {
+      this.#terminalDelivered = true;
+      this.#emitChunk({
+        type: 'workflow-finish',
+        runId: this.runId,
+        from: ChunkFrom.WORKFLOW,
+        payload: {
+          workflowStatus: this.#status,
+          metadata: this.#streamError
+            ? {
+                error: this.#streamError,
+                errorMessage: this.#streamError.message,
+              }
+            : {},
+          output: {
+            usage: this.#usageCount,
+          },
+          ...(this.#status === 'tripwire' && this.#tripwireData ? { tripwire: this.#tripwireData } : {}),
+        },
+      } as WorkflowStreamEvent);
+    }
+
+    this.#delayedPromises.usage.resolve(this.#usageCount);
+
+    Object.entries(this.#delayedPromises).forEach(([key, promise]) => {
+      if (promise.status.type === 'pending') {
+        promise.reject(new Error(`promise '${key}' was not resolved or rejected when stream finished`));
+      }
+    });
+
+    this.#streamFinished = true;
+    this.#emitter.emit('finish');
   }
 
   #getDelayedPromise<T>(promise: DelayedPromise<T>): Promise<T> {
@@ -213,118 +336,30 @@ export class WorkflowRunOutput<
    * @internal
    */
   updateResults(results: TResult) {
-    this.#delayedPromises.result.resolve(results);
+    if (this.#delayedPromises.result.status.type === 'pending') {
+      this.#delayedPromises.result.resolve(results);
+      if (!this.#terminalDelivered) {
+        this.#status = results.status;
+      }
+    }
   }
 
   /**
    * @internal
    */
   rejectResults(error: Error) {
-    this.#delayedPromises.result.reject(error);
-    this.#status = 'failed';
-    this.#streamError = error;
+    if (this.#delayedPromises.result.status.type === 'pending') {
+      this.#delayedPromises.result.reject(error);
+      this.#status = 'failed';
+      this.#streamError = error;
+    }
   }
 
   /**
    * @internal
    */
   resume(stream: ReadableStream<WorkflowStreamEvent>) {
-    this.#baseStream = stream;
-    this.#streamFinished = false;
-    this.#consumptionStarted = false;
-    this.#status = 'running';
-    this.#delayedPromises = {
-      usage: new DelayedPromise<LanguageModelUsage>(),
-      result: new DelayedPromise<TResult>(),
-    };
-
-    const self = this;
-    stream
-      .pipeTo(
-        new WritableStream({
-          start() {
-            const chunk: WorkflowStreamEvent = {
-              type: 'workflow-start',
-              runId: self.runId,
-              from: ChunkFrom.WORKFLOW,
-              payload: {
-                workflowId: self.workflowId,
-              },
-            } as WorkflowStreamEvent;
-
-            self.#bufferedChunks.push(chunk);
-            self.#emitter.emit('chunk', chunk);
-          },
-          write(chunk) {
-            if (chunk.type !== 'workflow-step-finish') {
-              self.#bufferedChunks.push(chunk);
-              self.#emitter.emit('chunk', chunk);
-            }
-
-            if (chunk.type === 'workflow-step-output') {
-              if ('output' in chunk.payload && chunk.payload.output) {
-                const output = chunk.payload.output;
-                if (output.type === 'finish') {
-                  if (output.payload && 'usage' in output.payload && output.payload.usage) {
-                    self.#updateUsageCount(output.payload.usage);
-                  } else if (output.payload && 'output' in output.payload && output.payload.output) {
-                    const outputPayload = output.payload.output;
-                    if ('usage' in outputPayload && outputPayload.usage) {
-                      self.#updateUsageCount(outputPayload.usage);
-                    }
-                  }
-                }
-              }
-            } else if (chunk.type === 'workflow-canceled') {
-              self.#status = 'canceled';
-            } else if (chunk.type === 'workflow-step-suspended') {
-              self.#status = 'suspended';
-            } else if (chunk.type === 'workflow-step-result' && chunk.payload.status === 'failed') {
-              // Check if the failure was due to a tripwire
-              if (chunk.payload.tripwire) {
-                self.#status = 'tripwire';
-                self.#tripwireData = chunk.payload.tripwire;
-              } else {
-                self.#status = 'failed';
-              }
-            } else if (chunk.type === 'workflow-paused') {
-              self.#status = 'paused';
-            }
-          },
-          close() {
-            if (self.#status === 'running') {
-              self.#status = 'success';
-            }
-
-            self.#emitter.emit('chunk', {
-              type: 'workflow-finish',
-              runId: self.runId,
-              from: ChunkFrom.WORKFLOW,
-              payload: {
-                workflowStatus: self.#status,
-                metadata: self.#streamError
-                  ? {
-                      error: self.#streamError,
-                      errorMessage: self.#streamError?.message,
-                    }
-                  : {},
-                output: {
-                  usage: self.#usageCount,
-                },
-                // Include tripwire data when status is 'tripwire'
-                ...(self.#status === 'tripwire' && self.#tripwireData ? { tripwire: self.#tripwireData } : {}),
-              },
-            });
-
-            self.#streamFinished = true;
-            self.#emitter.emit('finish');
-          },
-        }),
-      )
-      .catch(reason => {
-        // eslint-disable-next-line no-console
-        console.log(' something went wrong', reason);
-      });
+    this.#attachStream(stream);
   }
 
   async consumeStream(options?: Parameters<typeof consumeStream>[0]): Promise<void> {
