@@ -2,4 +2,12 @@
 '@mastra/core': minor
 ---
 
-Added an explicit local-only passthrough policy for durable exact replay compositions.
+Added `durableLocalOnly: 'passthrough'` so local-only events can publish
+without retained history when durable exact replay is enabled.
+
+```typescript
+new CachingPubSub(inner, durableCache, {
+  indexedReplay: { retentionMs: 60_000, maxEvents: 100 },
+  durableLocalOnly: 'passthrough',
+});
+```
