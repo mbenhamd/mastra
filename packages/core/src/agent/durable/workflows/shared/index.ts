@@ -24,3 +24,4 @@ export { calculateAccumulatedUsage, buildStepRecord, createBaseIterationStateUpd
 export type { IterationStateUpdateInput, StepRecord } from './iteration-state';
 
 export { resolveDurableToolCallConcurrency } from './tool-call-concurrency';
+export { mapDurableIterationToLLMInput } from '../map-llm-input';

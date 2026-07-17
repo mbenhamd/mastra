@@ -11,6 +11,7 @@ import {
   durableAgenticOutputSchema,
   baseIterationStateSchema,
   createBaseIterationStateUpdate,
+  mapDurableIterationToLLMInput,
   resolveDurableToolCallConcurrency,
 } from '@mastra/core/agent/durable';
 import type {
@@ -179,23 +180,7 @@ export function createInngestDurableAgenticWorkflow(options: InngestDurableAgent
     .map(
       async ({ inputData }) => {
         const state = inputData as IterationState;
-        return {
-          runId: state.runId,
-          agentId: state.agentId,
-          agentName: state.agentName,
-          messageListState: state.messageListState,
-          toolsMetadata: state.toolsMetadata,
-          modelConfig: state.modelConfig,
-          options: state.options,
-          state: state.state,
-          messageId: state.messageId,
-          // Pass agent span data so model spans can use it as parent
-          agentSpanData: state.agentSpanData,
-          // Pass model span data (ONE span for entire agent run)
-          modelSpanData: state.modelSpanData,
-          // Pass step index for continuation (step: 0, 1, 2, ...)
-          stepIndex: state.stepIndex,
-        };
+        return mapDurableIterationToLLMInput(state);
       },
       { id: 'map-to-llm-input' },
     )
@@ -203,9 +188,14 @@ export function createInngestDurableAgenticWorkflow(options: InngestDurableAgent
     .then(llmExecutionStep)
     // Step 2: Extract tool calls as array for foreach
     .map(
-      async ({ inputData }) => {
+      async ({ inputData, getInitData }) => {
         const llmOutput = inputData as DurableLLMStepOutput;
-        return (llmOutput.toolCalls ?? []) as DurableToolCallInput[];
+        const iterationCount = (getInitData() as IterationState).iterationCount;
+        return (llmOutput.toolCalls ?? []).map(toolCall => ({
+          ...toolCall,
+          iterationCount,
+          stepSpanData: llmOutput.stepSpanData,
+        })) as DurableToolCallInput[];
       },
       { id: 'extract-tool-calls' },
     )
