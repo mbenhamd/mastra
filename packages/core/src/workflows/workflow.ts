@@ -3505,7 +3505,8 @@ export class Run<
         snapshot.status === 'failed' ||
         snapshot.status === 'canceled' ||
         snapshot.status === 'tripwire' ||
-        snapshot.status === 'bailed') &&
+        snapshot.status === 'bailed' ||
+        snapshot.status === 'skipped') &&
       !this.hasActiveLifecycleExecution(snapshot.executionGeneration)
     ) {
       this.workflowRunStatus = snapshot.status;

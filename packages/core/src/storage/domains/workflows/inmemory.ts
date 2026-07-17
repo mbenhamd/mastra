@@ -48,11 +48,21 @@ import type {
   BindWorkflowNestedRunOwnershipResult,
   AdmitWorkflowNestedRunInput,
   AdmitWorkflowNestedRunResult,
+  AdmitWorkflowResumeInput,
+  AdmitWorkflowResumeResult,
+  ConsumeWorkflowResumeResult,
+  ConsumeWorkflowResumeResultInput,
+  FinalizeWorkflowResumeInput,
+  FinalizeWorkflowResumeResult,
+  PersistWorkflowStepUpdateInput,
+  PersistWorkflowStepUpdateResult,
   PersistWorkflowTerminalRecoveryAncestryInput,
   PersistWorkflowTerminalRecoveryAncestryResult,
   GetWorkflowTerminalRecoveryAncestryResult,
   ReleaseWorkflowTerminalizationInput,
   ReleaseWorkflowTerminalizationResult,
+  RollbackWorkflowResumeInput,
+  RollbackWorkflowResumeResult,
   StorageWorkflowRun,
   WorkflowRun,
   WorkflowRuns,
@@ -60,6 +70,7 @@ import type {
   UpdateWorkflowStateOptions,
   WorkflowTerminalContinuationPlanRecord,
   WorkflowTerminalizationCapabilities,
+  WorkflowResumeCapabilities,
 } from '../../types';
 import {
   createEmptyWorkflowSnapshot,
@@ -68,6 +79,13 @@ import {
 } from '../../workflow-snapshot';
 import type { InMemoryDB, WorkflowTerminalParentRevisionState } from '../inmemory-db';
 import { WorkflowsStorage } from './base';
+import {
+  admitWorkflowResumeRecord,
+  consumeWorkflowResumeResultRecord,
+  finalizeWorkflowResumeRecord,
+  persistWorkflowStepUpdateRecord,
+  rollbackWorkflowResumeRecord,
+} from './resume';
 import {
   advanceWorkflowTerminalizationRecord,
   bindWorkflowNestedRunOwnershipRecord,
@@ -142,7 +160,7 @@ export function cloneRunData<T>(value: T): T {
   return deepCloneForRun(value, new WeakMap()) as T;
 }
 
-const TERMINAL_PARENT_STATUSES = ['success', 'failed', 'canceled', 'tripwire', 'bailed'] as const;
+const TERMINAL_PARENT_STATUSES = ['success', 'failed', 'canceled', 'tripwire', 'bailed', 'skipped'] as const;
 type TerminalParentStatus = (typeof TERMINAL_PARENT_STATUSES)[number];
 
 function isTerminalParentStatus(value: unknown): value is TerminalParentStatus {
@@ -329,6 +347,82 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       parentApplicationVersion: 1,
       recoveryVersion: 1,
     };
+  }
+
+  getWorkflowResumeCapabilities(): WorkflowResumeCapabilities {
+    return { atomicResumeVersion: 1, fencedStepUpdateVersion: 1 };
+  }
+
+  private applyWorkflowResumeMutation(
+    workflowName: string,
+    runId: string,
+    resourceId: string | undefined,
+    mutate: (snapshot: WorkflowRunState | undefined) => { status: string; snapshot?: WorkflowRunState },
+  ) {
+    const key = this.getWorkflowKey(workflowName, runId);
+    const existing = this.db.workflows.get(key);
+    const existingSnapshot = existing?.snapshot
+      ? cloneRunData(typeof existing.snapshot === 'string' ? JSON.parse(existing.snapshot) : existing.snapshot)
+      : undefined;
+    const result = mutate(existingSnapshot);
+    const { snapshot: updatedSnapshot, ...publicResult } = result;
+    if (updatedSnapshot && existing) {
+      this.db.workflows.set(key, {
+        ...existing,
+        resourceId: existing.resourceId ?? resourceId ?? updatedSnapshot.resourceId,
+        snapshot: cloneRunData(updatedSnapshot),
+        updatedAt: new Date(),
+      });
+      this.bumpParentRevision(key);
+    }
+    return publicResult;
+  }
+
+  async admitWorkflowResume(input: AdmitWorkflowResumeInput): Promise<AdmitWorkflowResumeResult> {
+    return this.applyWorkflowResumeMutation(input.workflowName, input.runId, input.resourceId, snapshot =>
+      admitWorkflowResumeRecord(snapshot, input, Date.now(), cloneRunData),
+    ) as AdmitWorkflowResumeResult;
+  }
+
+  async rollbackWorkflowResume(input: RollbackWorkflowResumeInput): Promise<RollbackWorkflowResumeResult> {
+    return this.applyWorkflowResumeMutation(input.workflowName, input.runId, input.resourceId, snapshot =>
+      rollbackWorkflowResumeRecord(snapshot, input, Date.now(), cloneRunData),
+    ) as RollbackWorkflowResumeResult;
+  }
+
+  async finalizeWorkflowResume(input: FinalizeWorkflowResumeInput): Promise<FinalizeWorkflowResumeResult> {
+    return this.applyWorkflowResumeMutation(input.workflowName, input.runId, input.resourceId, snapshot =>
+      finalizeWorkflowResumeRecord(snapshot, input, Date.now(), cloneRunData),
+    ) as FinalizeWorkflowResumeResult;
+  }
+
+  async consumeWorkflowResumeResult(input: ConsumeWorkflowResumeResultInput): Promise<ConsumeWorkflowResumeResult> {
+    return this.applyWorkflowResumeMutation(input.workflowName, input.runId, undefined, snapshot =>
+      consumeWorkflowResumeResultRecord(snapshot, input, Date.now(), cloneRunData),
+    ) as ConsumeWorkflowResumeResult;
+  }
+
+  async persistWorkflowStepUpdate(input: PersistWorkflowStepUpdateInput): Promise<PersistWorkflowStepUpdateResult> {
+    const key = this.getWorkflowKey(input.workflowName, input.runId);
+    const existing = this.db.workflows.get(key);
+    const existingSnapshot = existing?.snapshot
+      ? cloneRunData(typeof existing.snapshot === 'string' ? JSON.parse(existing.snapshot) : existing.snapshot)
+      : undefined;
+    const outcome = persistWorkflowStepUpdateRecord(existingSnapshot, input, cloneRunData);
+    const { snapshot, ...result } = outcome;
+    if (snapshot) {
+      const now = new Date();
+      this.db.workflows.set(key, {
+        workflow_name: input.workflowName,
+        run_id: input.runId,
+        resourceId: existing?.resourceId ?? snapshot.resourceId ?? input.resourceId,
+        snapshot: cloneRunData(snapshot),
+        createdAt: existing?.createdAt ?? now,
+        updatedAt: now,
+      });
+      this.bumpParentRevision(key);
+    }
+    return result;
   }
 
   async persistWorkflowTerminalRecoveryAncestry(

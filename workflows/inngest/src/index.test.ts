@@ -14855,6 +14855,7 @@ createWorkflowTestSuite({
     resumeDountil: true, // Dountil loop with nested resume not supported on Inngest
     resumeLoopInput: true, // Loop resume input tracking not supported on Inngest
     resumeMapStep: true, // Map step resume not supported on Inngest
+    resumeIncorrectBranches: true, // Inngest JSON transport converts Date resume payloads to ISO strings
     // Foreach: state batch and bail not supported on Inngest
     foreachStateBatch: true, // stateSchema batching not supported
     foreachBail: true, // bail() in foreach not supported
@@ -14898,6 +14899,15 @@ createWorkflowTestSuite({
 
   resumeWorkflow: async (workflow, options: ResumeWorkflowOptions): Promise<WorkflowResult> => {
     const inngestWorkflow = workflow as unknown as InngestWorkflow<any, any, any, any, any, any, any>;
+
+    // A workflow rebuilt after a simulated restart must be registered against
+    // the same durable storage before it creates the resumed run.
+    if (!inngestWorkflow.mastra) {
+      new Mastra({
+        storage: sharedStorage,
+        workflows: { [inngestWorkflow.id]: inngestWorkflow },
+      });
+    }
 
     // Create the run with the existing runId to resume
     const run = await inngestWorkflow.createRun({ runId: options.runId });

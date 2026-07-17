@@ -728,6 +728,7 @@ function validateStoredParentSnapshotForContinuation(parentSnapshot: WorkflowRun
       'tripwire',
       'canceled',
       'bailed',
+      'skipped',
       'paused',
       'waiting',
     ].includes(String(parentSnapshot.status)) ||

@@ -20,7 +20,7 @@ export type WorkflowTerminalExecutionMode = 'continuous';
 export type WorkflowTerminalActiveParentStatus = Extract<WorkflowRunStatus, 'running' | 'waiting' | 'suspended'>;
 
 /** @internal Parent states for which an already-terminal no-op is truthful. */
-export type WorkflowTerminalFinalParentStatus = 'success' | 'failed' | 'canceled' | 'tripwire' | 'bailed';
+export type WorkflowTerminalFinalParentStatus = 'success' | 'failed' | 'canceled' | 'tripwire' | 'bailed' | 'skipped';
 
 /** @internal Canonicalizers always return a dense isolated array. */
 export type WorkflowTerminalPath = number[];

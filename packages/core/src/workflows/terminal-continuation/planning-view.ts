@@ -26,6 +26,7 @@ const PARENT_STATUSES = new Set<WorkflowRunStatus>([
   'canceled',
   'tripwire',
   'bailed',
+  'skipped',
 ]);
 const CHILD_STATUSES: ReadonlySet<unknown> = new Set(['success', 'failed', 'canceled']);
 const MAX_PLANNER_COLLECTION_ITEMS = 100_000;

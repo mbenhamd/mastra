@@ -25,11 +25,13 @@ import type {
   TimeTravelContext,
   WorkflowEngineType,
   WorkflowResult,
+  WorkflowResumeResultDataV1,
   WorkflowStreamEvent,
 } from '@mastra/core/workflows';
 import { NonRetriableError } from 'inngest';
 import type { Inngest } from 'inngest';
 import { subscribe } from 'inngest/realtime';
+import { inngestWorkflowResumeOperationHash } from './resume-operation';
 import type { InngestEngineType, InngestWorkflowRunState } from './types';
 
 export function unwrapWorkflowRealtimeData(data: any): any {
@@ -43,25 +45,74 @@ export function unwrapWorkflowRealtimeData(data: any): any {
   return isPubSubEnvelope ? data.data : data;
 }
 
+type WorkflowResumeReceiptExpectation = {
+  receiptKey: string;
+  resumeOperationHash: `sha256:${string}`;
+  executionGeneration: string;
+  lifecycleResumeAttempt: number;
+};
+
+const RESUME_TERMINAL_STATUSES = new Set(['success', 'failed', 'canceled', 'tripwire', 'bailed', 'skipped']);
+
+let realtimeSubscribe: typeof subscribe = subscribe;
+
+/** @internal Test-only transport seam for deterministic realtime/polling race coverage. */
+export function __setInngestRealtimeSubscribeForTests(next?: typeof subscribe): void {
+  realtimeSubscribe = next ?? subscribe;
+}
+
+function hydrateWorkflowResumeResult(result: WorkflowResumeResultDataV1): Record<string, unknown> {
+  const hydrated: Record<string, unknown> = {
+    ...result,
+    steps: hydrateSerializedStepErrors(result.steps),
+  };
+  if (result.error !== undefined) {
+    hydrated.error = getErrorFromUnknown(result.error, { serializeStack: false });
+  }
+  addSuspensionDetailsFromSnapshot(hydrated, {
+    context: hydrated.steps,
+  } as InngestWorkflowRunState);
+  return hydrated;
+}
+
+function addSuspensionDetailsFromSnapshot(
+  result: Record<string, unknown>,
+  snapshot: InngestWorkflowRunState | null | undefined,
+): void {
+  if (result.status !== 'suspended' || !snapshot?.context) return;
+
+  const suspendPayload: Record<string, unknown> = {};
+  const suspended = Object.entries(snapshot.context).flatMap(([stepId, stepResult]) => {
+    if (stepResult?.status !== 'suspended') return [];
+
+    const { __workflow_meta: workflowMeta, ...payload } = stepResult.suspendPayload ?? {};
+    suspendPayload[stepId] = payload;
+    return [[stepId, ...(workflowMeta?.path ?? [])]];
+  });
+
+  result.suspended = suspended;
+  result.suspendPayload = suspendPayload;
+}
+
 function inngestWorkflowDispatchId(params: {
   kind: 'start' | 'resume' | 'time-travel' | 'cancel';
   workflowId: string;
   runId: string;
   executionGeneration: string;
   lifecycleResumeAttempt: number;
+  resumeOperationHash?: `sha256:${string}`;
 }): string {
+  const identity: Array<string | number> = [
+    params.kind,
+    params.workflowId,
+    params.runId,
+    params.executionGeneration,
+    params.lifecycleResumeAttempt,
+  ];
+  if (params.resumeOperationHash !== undefined) identity.push(params.resumeOperationHash);
   const digest = createHash('sha256')
     .update('mastra.inngest.workflow-dispatch.v1\0', 'utf8')
-    .update(
-      JSON.stringify([
-        params.kind,
-        params.workflowId,
-        params.runId,
-        params.executionGeneration,
-        params.lifecycleResumeAttempt,
-      ]),
-      'utf8',
-    )
+    .update(JSON.stringify(identity), 'utf8')
     .digest('hex');
   return `miwd:v1:${digest}`;
 }
@@ -121,7 +172,7 @@ export class InngestRun<
    * Get run output using hybrid approach: realtime subscription + polling fallback.
    * Resolves as soon as either method detects completion.
    */
-  async getRunOutput(_eventId: string, maxWaitMs = 300000) {
+  async getRunOutput(_eventId: string, maxWaitMs = 300000, resumeReceipt?: WorkflowResumeReceiptExpectation) {
     const storage = this.#mastra?.getStorage();
     const workflowsStore = await storage?.getStore('workflows');
     if (!workflowsStore) {
@@ -166,7 +217,7 @@ export class InngestRun<
 
       const startRealtimeSubscription = async () => {
         try {
-          realtimeStreamPromise = subscribe(
+          realtimeStreamPromise = realtimeSubscribe(
             {
               channel: `workflow:${this.workflowId}:${this.runId}`,
               topics: ['watch'],
@@ -178,6 +229,35 @@ export class InngestRun<
               const event = unwrapWorkflowRealtimeData(message.data);
 
               if (event?.type === 'workflow-finish') {
+                const richWorkflowResult = event.payload?.workflowResult as WorkflowResumeResultDataV1 | undefined;
+                if (resumeReceipt) {
+                  if (
+                    !richWorkflowResult ||
+                    event.payload?.receiptKey !== resumeReceipt.receiptKey ||
+                    event.payload?.resumeOperationHash !== resumeReceipt.resumeOperationHash ||
+                    event.payload?.executionGeneration !== resumeReceipt.executionGeneration ||
+                    event.payload?.lifecycleResumeAttempt !== resumeReceipt.lifecycleResumeAttempt
+                  ) {
+                    return;
+                  }
+                  const consumed = await workflowsStore.consumeWorkflowResumeResult({
+                    workflowName: this.workflowId,
+                    runId: this.runId,
+                    ...resumeReceipt,
+                    consumerId: resumeReceipt.receiptKey,
+                  });
+                  if (consumed.status !== 'consumed' && consumed.status !== 'already_consumed') {
+                    // The finish notification can race the durable receipt or
+                    // another stale consumer. Only the exact durable receipt
+                    // may complete a resumed caller; polling remains active.
+                    return;
+                  }
+                  handleResult(
+                    { output: { result: hydrateWorkflowResumeResult(consumed.receipt.result) } },
+                    'realtime-receipt',
+                  );
+                  return;
+                }
                 // Got the finish event - load snapshot and resolve
                 const snapshot = await workflowsStore?.loadWorkflowSnapshot({
                   workflowName: this.workflowId,
@@ -199,6 +279,7 @@ export class InngestRun<
                   realtimeResult.error = getErrorFromUnknown(rawError, { serializeStack: false });
                 }
                 if (snapshot?.value !== undefined) realtimeResult.state = snapshot.value;
+                addSuspensionDetailsFromSnapshot(realtimeResult, snapshot as InngestWorkflowRunState | null);
                 const result = { output: { result: realtimeResult } };
 
                 handleResult(result, 'realtime');
@@ -237,6 +318,37 @@ export class InngestRun<
               runId: this.runId,
             });
 
+            if (resumeReceipt) {
+              const receipt = snapshot?.resumeResultReceipt;
+              if (
+                receipt?.receiptKey === resumeReceipt.receiptKey &&
+                receipt.resumeOperationHash === resumeReceipt.resumeOperationHash &&
+                receipt.executionGeneration === resumeReceipt.executionGeneration &&
+                receipt.lifecycleResumeAttempt === resumeReceipt.lifecycleResumeAttempt
+              ) {
+                const consumed = await workflowsStore.consumeWorkflowResumeResult({
+                  workflowName: this.workflowId,
+                  runId: this.runId,
+                  ...resumeReceipt,
+                  consumerId: resumeReceipt.receiptKey,
+                });
+                if (consumed.status === 'consumed' || consumed.status === 'already_consumed') {
+                  handleResult(
+                    { output: { result: hydrateWorkflowResumeResult(consumed.receipt.result) } },
+                    'polling-receipt',
+                  );
+                  return;
+                }
+                pollTimeoutId = setTimeout(poll, 150 + Math.random() * 100);
+                return;
+              }
+
+              // A resumed run is complete only at its fenced receipt boundary.
+              // Intermediate terminal/suspended snapshots must not win the race.
+              pollTimeoutId = setTimeout(poll, 150 + Math.random() * 100);
+              return;
+            }
+
             // Still running or in an intermediate state — schedule next poll
             // 'running' = initial state, 'waiting' = sleeping/waiting, 'pending' = not yet started
             if (
@@ -263,6 +375,7 @@ export class InngestRun<
               pollingResult.error = getErrorFromUnknown(snapshot.error, { serializeStack: false });
             }
             if (snapshot.value !== undefined) pollingResult.state = snapshot.value;
+            addSuspensionDetailsFromSnapshot(pollingResult, snapshot as InngestWorkflowRunState);
 
             handleResult({ output: { result: pollingResult } }, `polling-${snapshot.status}`);
           } catch (error) {
@@ -302,7 +415,8 @@ export class InngestRun<
         snapshotBeforeDispatch.status === 'failed' ||
         snapshotBeforeDispatch.status === 'canceled' ||
         snapshotBeforeDispatch.status === 'tripwire' ||
-        snapshotBeforeDispatch.status === 'bailed')
+        snapshotBeforeDispatch.status === 'bailed' ||
+        snapshotBeforeDispatch.status === 'skipped')
     ) {
       this.workflowRunStatus = snapshotBeforeDispatch.status;
       return;
@@ -342,7 +456,8 @@ export class InngestRun<
         snapshotAfterDispatch.status === 'failed' ||
         snapshotAfterDispatch.status === 'canceled' ||
         snapshotAfterDispatch.status === 'tripwire' ||
-        snapshotAfterDispatch.status === 'bailed')
+        snapshotAfterDispatch.status === 'bailed' ||
+        snapshotAfterDispatch.status === 'skipped')
     ) {
       this.workflowRunStatus = snapshotAfterDispatch.status;
       return;
@@ -663,8 +778,9 @@ export class InngestRun<
    * but does NOT wait for the workflow result. Shared by `_resume()` (which polls
    * for the result afterwards) and `resumeAsync()` (which returns immediately).
    *
-   * Send-time failures (invalid resume data, event send failure) reject synchronously,
-   * and the snapshot is rolled back to its prior state on send failure.
+   * Invalid resume data and pre-acceptance send failures reject synchronously.
+   * Ambiguous send failures retain the admitted checkpoint and deterministic
+   * event identity so an identical retry can safely recover a lost send ack.
    */
   async _resumeAndSendEvent<TResume>(params: {
     resumeData?: TResume;
@@ -677,12 +793,18 @@ export class InngestRun<
     requestContext?: RequestContext<TRequestContext>;
     actor?: ActorSignal;
     perStep?: boolean;
-  }): Promise<{ eventId: string }> {
+  }): Promise<{ eventId: string; receipt: WorkflowResumeReceiptExpectation }> {
     const storage = this.#mastra?.getStorage();
 
     const workflowsStore = await storage?.getStore('workflows');
     if (!workflowsStore) {
       throw new NonRetriableError(`Workflow storage is required to resume run ${this.runId}`);
+    }
+    const resumeCapabilities = workflowsStore.getWorkflowResumeCapabilities();
+    if (resumeCapabilities.atomicResumeVersion !== 1 || resumeCapabilities.fencedStepUpdateVersion !== 1) {
+      throw new NonRetriableError(
+        `Workflow storage for ${this.workflowId}/${this.runId} does not support atomic resume admission and fenced step updates`,
+      );
     }
     const snapshot = await workflowsStore.loadWorkflowSnapshot({
       workflowName: this.workflowId,
@@ -691,12 +813,23 @@ export class InngestRun<
     if (!snapshot) {
       throw new NonRetriableError(`Cannot resume run ${this.runId}: snapshot not found`);
     }
-    if (snapshot.status !== 'suspended') {
+    const terminalReceipt =
+      RESUME_TERMINAL_STATUSES.has(snapshot.status) && snapshot.resumeResultReceipt
+        ? snapshot.resumeResultReceipt
+        : undefined;
+    const resumeSource =
+      snapshot.status === 'running' && snapshot.resumeCheckpoint
+        ? snapshot.resumeCheckpoint.snapshot
+        : snapshot.status === 'suspended'
+          ? snapshot
+          : undefined;
+    if (!resumeSource && !terminalReceipt) {
       throw new NonRetriableError(`Cannot resume run ${this.runId}: workflow run is not suspended`);
     }
+    const resourceId = this.resourceId ?? snapshot.resourceId ?? resumeSource?.resourceId;
 
     // Support label-based resume: look up step from resumeLabels
-    const snapshotResumeLabel = params.label ? snapshot.resumeLabels?.[params.label] : undefined;
+    const snapshotResumeLabel = params.label ? resumeSource?.resumeLabels?.[params.label] : undefined;
     const stepParam = snapshotResumeLabel?.stepId ?? params.step;
 
     let steps: string[] = [];
@@ -710,91 +843,143 @@ export class InngestRun<
       }
     }
 
+    if (!stepParam && terminalReceipt) {
+      steps = [...terminalReceipt.operationReplayContext.steps];
+    }
+
+    if (terminalReceipt && params.label !== terminalReceipt.operationReplayContext.label) {
+      throw new NonRetriableError(
+        `Cannot resume run ${this.runId}: terminal result belongs to a different resume operation`,
+      );
+    }
+
     const suspendedStep = this.workflowSteps[steps?.[0] ?? ''];
 
     const resumeDataToUse = await this._validateResumeData(params.resumeData, suspendedStep);
-    const lifecycleExecution = this.restoreLifecycleExecution(snapshot);
-
     // Merge persisted requestContext from snapshot with any new values from params
-    const persistedRequestContext = (snapshot as any)?.requestContext ?? {};
+    const persistedRequestContext = snapshot.requestContext ?? resumeSource?.requestContext ?? {};
     const newRequestContext = params.requestContext ? Object.fromEntries(params.requestContext.entries()) : {};
     const mergedRequestContext = { ...persistedRequestContext, ...newRequestContext };
     const disableScorers = this.getDurableDisableScorers(snapshot as InngestWorkflowRunState);
-
-    // Mark the snapshot as 'running' before sending the event so that
-    // snapshot-based polling doesn't return the stale suspended/paused result.
-    await workflowsStore.persistWorkflowSnapshot({
+    const retainedTerminalSteps = terminalReceipt?.operationReplayContext.steps;
+    const terminalSelectionMatches =
+      retainedTerminalSteps !== undefined &&
+      retainedTerminalSteps.length === steps.length &&
+      retainedTerminalSteps.every((step, index) => step === steps[index]);
+    const resumePath = terminalReceipt
+      ? terminalSelectionMatches
+        ? terminalReceipt.operationReplayContext.resumePath
+        : undefined
+      : steps[0]
+        ? (resumeSource?.suspendedPaths?.[steps[0]] as number[] | undefined)
+        : undefined;
+    const resumeOperationHash = inngestWorkflowResumeOperationHash({
+      workflowId: this.workflowId,
+      runId: this.runId,
+      resourceId,
+      inputData: resumeDataToUse,
+      steps,
+      resumePayload: resumeDataToUse,
+      resumePath,
+      requestContext: mergedRequestContext,
+      perStep: params.perStep ?? false,
+      disableScorers,
+    });
+    if (terminalReceipt?.resumeOperationHash === resumeOperationHash) {
+      const receipt = terminalReceipt;
+      return {
+        eventId: receipt.receiptKey,
+        receipt: {
+          receiptKey: receipt.receiptKey,
+          resumeOperationHash: receipt.resumeOperationHash,
+          executionGeneration: receipt.executionGeneration,
+          lifecycleResumeAttempt: receipt.lifecycleResumeAttempt,
+        },
+      };
+    }
+    if (terminalReceipt) {
+      throw new NonRetriableError(
+        `Cannot resume run ${this.runId}: terminal result belongs to a different resume operation`,
+      );
+    }
+    if (!resumeSource) {
+      throw new NonRetriableError(`Cannot resume run ${this.runId}: workflow run is not suspended`);
+    }
+    const lifecycleExecution = this.restoreLifecycleExecution(resumeSource);
+    const receiptKey = inngestWorkflowDispatchId({
+      kind: 'resume',
+      workflowId: this.workflowId,
+      runId: this.runId,
+      executionGeneration: lifecycleExecution.executionGeneration,
+      lifecycleResumeAttempt: lifecycleExecution.lifecycleResumeAttempt,
+      resumeOperationHash,
+    });
+    const admission = await workflowsStore.admitWorkflowResume({
       workflowName: this.workflowId,
       runId: this.runId,
-      resourceId: this.resourceId,
-      snapshot: {
-        ...snapshot,
-        status: 'running',
-        result: undefined,
-        error: undefined,
-        timestamp: Date.now(),
-        ...lifecycleExecution,
-      } as any,
+      resourceId,
+      resumeOperationHash,
+      operationReplayContext: {
+        version: 1,
+        steps,
+        ...(resumePath === undefined ? {} : { resumePath }),
+        ...(params.label === undefined ? {} : { label: params.label }),
+      },
+      executionGeneration: lifecycleExecution.executionGeneration,
+      lifecycleResumeAttempt: resumeSource.lifecycleResumeAttempt ?? 0,
+      lifecycleStepStates: resumeSource.lifecycleStepStates ?? {},
+      nextLifecycleResumeAttempt: lifecycleExecution.lifecycleResumeAttempt,
+      requestContext: mergedRequestContext,
     });
+    if (admission.status !== 'admitted' && admission.status !== 'already_admitted') {
+      throw new NonRetriableError(`Cannot resume run ${this.runId}: atomic admission failed with ${admission.status}`);
+    }
     this.workflowRunStatus = 'running';
 
-    try {
-      const eventOutput = await this.inngest.send({
-        id: inngestWorkflowDispatchId({
-          kind: 'resume',
-          workflowId: this.workflowId,
-          runId: this.runId,
-          executionGeneration: lifecycleExecution.executionGeneration,
-          lifecycleResumeAttempt: lifecycleExecution.lifecycleResumeAttempt,
-        }),
-        name: `workflow.${this.workflowId}`,
-        data: {
-          inputData: resumeDataToUse,
-          initialState: snapshot?.value ?? {},
-          runId: this.runId,
-          workflowId: this.workflowId,
-          stepResults: snapshot?.context as any,
-          resume: {
-            steps,
-            stepResults: snapshot?.context as any,
-            resumePayload: resumeDataToUse,
-            resumePath: steps?.[0] ? (snapshot?.suspendedPaths?.[steps?.[0]] as any) : undefined,
-          },
-          requestContext: mergedRequestContext,
-          // `actor` is a per-call trust signal, not rehydrated from the snapshot like
-          // `requestContext` is above. This intentionally matches the default engine,
-          // which passes `actor: params.actor` on resume and never reads it from the
-          // snapshot (see packages/core/src/workflows/workflow.ts `_resume`). The caller
-          // (a trusted background system) re-supplies `actor` on each resume; we never
-          // persist a membership-bypass signal into durable storage.
-          actor: params.actor,
-          perStep: params.perStep,
-          disableScorers,
-          ...lifecycleExecution,
+    const eventOutput = await this.inngest.send({
+      id: receiptKey,
+      name: `workflow.${this.workflowId}`,
+      data: {
+        inputData: resumeDataToUse,
+        runId: this.runId,
+        resourceId,
+        workflowId: this.workflowId,
+        resume: {
+          steps,
+          resumePayload: resumeDataToUse,
+          resumePath,
+          label: params.label,
         },
-      });
-      const eventId = eventOutput.ids[0];
-      if (!eventId) {
-        throw new Error('Event ID is not set');
-      }
-      return { eventId };
-    } catch (err) {
-      // Rollback: restore the original snapshot so the run isn't stuck in 'running'.
-      // The rollback itself can fail (e.g. transient storage error); log it but
-      // always rethrow the original error so the underlying failure isn't masked.
-      try {
-        await workflowsStore.persistWorkflowSnapshot({
-          workflowName: this.workflowId,
-          runId: this.runId,
-          resourceId: this.resourceId,
-          snapshot: snapshot as any,
-        });
-      } catch (rollbackErr) {
-        console.error('Failed to rollback snapshot during resume error recovery:', rollbackErr);
-      }
-      this.workflowRunStatus = snapshot.status;
-      throw err;
+        receiptKey,
+        resumeOperationHash,
+        requestContext: mergedRequestContext,
+        // `actor` is a per-call trust signal, not rehydrated from the snapshot like
+        // `requestContext` is above. This intentionally matches the default engine,
+        // which passes `actor: params.actor` on resume and never reads it from the
+        // snapshot (see packages/core/src/workflows/workflow.ts `_resume`). The caller
+        // (a trusted background system) re-supplies `actor` on each resume; we never
+        // persist a membership-bypass signal into durable storage.
+        actor: params.actor,
+        perStep: params.perStep,
+        disableScorers,
+        ...lifecycleExecution,
+      },
+    });
+    const eventId = eventOutput.ids[0];
+    if (!eventId) {
+      // A missing acknowledgement is an ambiguous external effect. Retain the
+      // admitted checkpoint so an identical deterministic dispatch can retry.
+      throw new Error('Event ID is not set');
     }
+    return {
+      eventId,
+      receipt: {
+        receiptKey,
+        resumeOperationHash,
+        executionGeneration: lifecycleExecution.executionGeneration,
+        lifecycleResumeAttempt: lifecycleExecution.lifecycleResumeAttempt,
+      },
+    };
   }
 
   async _resume<TResume>(params: {
@@ -809,10 +994,11 @@ export class InngestRun<
     actor?: ActorSignal;
     perStep?: boolean;
   }): Promise<WorkflowResult<TState, TInput, TOutput, TSteps>> {
-    const { eventId } = await this._resumeAndSendEvent(params);
-    const runOutput = await this.getRunOutput(eventId);
+    const { eventId, receipt } = await this._resumeAndSendEvent(params);
+    const runOutput = await this.getRunOutput(eventId, 300000, receipt);
     const result = runOutput?.output?.result;
     this.hydrateFailedResult(result);
+
     this.workflowRunStatus = result.status;
     return result;
   }
@@ -822,10 +1008,10 @@ export class InngestRun<
    * Returns immediately with the runId after sending the resume event to Inngest.
    * The workflow continues executing independently in Inngest.
    *
-   * Mirrors `startAsync()`: send-time failures (invalid resume data, event send
-   * failure) still reject synchronously and roll back the snapshot, but the result
-   * is never polled via `getRunOutput()`. This avoids the polling-based 404 race when
-   * you don't need the resolved result inline.
+   * Invalid input and send failures still reject synchronously, but an ambiguous
+   * send acknowledgement retains the admitted checkpoint and deterministic event
+   * identity for an identical retry. The result is never polled via
+   * `getRunOutput()`.
    *
    * NOTE: this is exposed over HTTP / the client SDK as `resume-no-wait` / `resumeNoWait()`,
    * not `resumeAsync`, because the existing `resumeAsync()` client/server surface awaits the

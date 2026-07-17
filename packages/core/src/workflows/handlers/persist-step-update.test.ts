@@ -9,28 +9,52 @@
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { RequestContext } from '../../di';
+import { persistWorkflowStepUpdateRecord } from '../../storage/domains/workflows/resume';
+import type {
+  PersistWorkflowStepUpdateInput,
+  PersistWorkflowStepUpdateResult,
+  WorkflowResumeCapabilities,
+} from '../../storage/types';
 import { DefaultExecutionEngine } from '../default';
-import type { ExecutionContext, WorkflowRunStatus } from '../types';
+import type { ExecutionContext, WorkflowRunState, WorkflowRunStatus } from '../types';
 
-type PersistArgs = Parameters<Awaited<ReturnType<typeof getStore>>['persistWorkflowSnapshot']>[0];
+type PersistArgs = PersistWorkflowStepUpdateInput;
 
 interface FakeWorkflowsStore {
+  persistWorkflowStepUpdate: (args: PersistArgs) => Promise<PersistWorkflowStepUpdateResult>;
   persistWorkflowSnapshot: (args: PersistArgs) => Promise<void>;
+  loadWorkflowSnapshot: () => Promise<WorkflowRunState | null>;
+  getWorkflowResumeCapabilities: () => WorkflowResumeCapabilities;
   calls: PersistArgs[];
+  legacyCalls: PersistArgs[];
+  snapshot: WorkflowRunState | null;
 }
 
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-async function getStore() {
-  return {
-    persistWorkflowSnapshot: async (_args: { snapshot: any; runId: string; workflowName: string }) => {},
-  };
-}
-
-function makeFakeMastra() {
+function makeFakeMastra(
+  capabilities: WorkflowResumeCapabilities = {
+    atomicResumeVersion: 1,
+    fencedStepUpdateVersion: 1,
+  },
+) {
   const store: FakeWorkflowsStore = {
     calls: [],
+    legacyCalls: [],
+    snapshot: null,
+    getWorkflowResumeCapabilities: () => capabilities,
+    loadWorkflowSnapshot: vi.fn(async () => store.snapshot),
     persistWorkflowSnapshot: vi.fn(async args => {
-      store.calls.push(args);
+      store.legacyCalls.push(args);
+      store.snapshot = structuredClone(args.snapshot);
+    }),
+    persistWorkflowStepUpdate: vi.fn(async args => {
+      const outcome = persistWorkflowStepUpdateRecord(store.snapshot ?? undefined, args, value =>
+        structuredClone(value),
+      );
+      if (outcome.status === 'persisted' && outcome.snapshot) {
+        store.calls.push(args);
+        store.snapshot = outcome.snapshot;
+      }
+      return { status: outcome.status };
     }) as any,
   };
   const mastra = {
@@ -41,8 +65,11 @@ function makeFakeMastra() {
   return { mastra, store };
 }
 
-function makeEngine(shouldPersistSnapshot: (params: { workflowStatus: WorkflowRunStatus }) => boolean) {
-  const { mastra, store } = makeFakeMastra();
+function makeEngine(
+  shouldPersistSnapshot: (params: { workflowStatus: WorkflowRunStatus }) => boolean,
+  capabilities?: WorkflowResumeCapabilities,
+) {
+  const { mastra, store } = makeFakeMastra(capabilities);
   const engine = new DefaultExecutionEngine({
     mastra,
     options: {
@@ -190,6 +217,160 @@ describe('persistStepUpdate — suspended overwrite guard', () => {
     expect(store.calls.map(c => c.snapshot.status)).toEqual(['pending']);
     // No running snapshot means the tracker was never updated past pending.
     expect(engine.getLastPersistedStatus('run-1')).toBe('pending');
+  });
+
+  it('preserves authoritative resource, run options, and resume checkpoint across an intermediate write', async () => {
+    const checkpoint = { version: 1, marker: 'storage-owned' } as never;
+    store.snapshot = {
+      runId: 'run-1',
+      resourceId: 'resource-from-storage',
+      status: 'running',
+      value: { before: true },
+      context: {},
+      activePaths: [],
+      activeStepsPath: {},
+      suspendedPaths: {},
+      resumeLabels: {},
+      waitingPaths: {},
+      serializedStepGraph: [],
+      timestamp: 1,
+      executionGeneration: 'wfeg:generation',
+      lifecycleResumeAttempt: 1,
+      lifecycleStepStates: {},
+      resumeCheckpoint: checkpoint,
+      runOptions: { disableScorers: true },
+    } as WorkflowRunState;
+
+    await engine.persistStepUpdate({
+      workflowId: 'wf',
+      runId: 'run-1',
+      resourceId: undefined,
+      stepResults: {},
+      serializedStepGraph: [],
+      executionContext: baseExecutionContext({
+        executionGeneration: 'wfeg:generation',
+        lifecycleResumeAttempt: 1,
+        lifecycleStepStates: { step: { stepCallId: 'wfsc:step', stepAttempt: 1 } },
+        state: { after: true },
+      }),
+      workflowStatus: 'running',
+      requestContext: new RequestContext(),
+    });
+
+    expect(store.calls.at(-1)?.snapshot).toMatchObject({
+      value: { after: true },
+    });
+    expect(store.snapshot).toMatchObject({
+      resourceId: 'resource-from-storage',
+      runOptions: { disableScorers: true },
+      resumeCheckpoint: checkpoint,
+      value: { after: true },
+    });
+  });
+
+  it('cannot overwrite a finalized receipt with a stale step writer', async () => {
+    const receipt = { version: 1, receiptKey: 'receipt-final' } as never;
+    store.snapshot = {
+      runId: 'run-1',
+      resourceId: 'resource-from-storage',
+      status: 'success',
+      value: { winner: true },
+      context: {},
+      activePaths: [],
+      activeStepsPath: {},
+      suspendedPaths: {},
+      resumeLabels: {},
+      waitingPaths: {},
+      serializedStepGraph: [],
+      timestamp: 2,
+      executionGeneration: 'wfeg:generation',
+      lifecycleResumeAttempt: 1,
+      lifecycleStepStates: {},
+      resumeResultReceipt: receipt,
+    } as WorkflowRunState;
+
+    await engine.persistStepUpdate({
+      workflowId: 'wf',
+      runId: 'run-1',
+      resourceId: 'resource-stale',
+      stepResults: {},
+      serializedStepGraph: [],
+      executionContext: baseExecutionContext({
+        executionGeneration: 'wfeg:generation',
+        lifecycleResumeAttempt: 1,
+        lifecycleStepStates: {},
+        state: { stale: true },
+      }),
+      workflowStatus: 'running',
+      requestContext: new RequestContext(),
+    });
+
+    expect(store.calls).toHaveLength(0);
+    expect(store.snapshot).toMatchObject({
+      status: 'success',
+      value: { winner: true },
+      resumeResultReceipt: receipt,
+    });
+    expect(engine.getLastPersistedStatus('run-1')).toBeUndefined();
+  });
+
+  it('keeps ordinary custom adapters on the legacy snapshot persistence path', async () => {
+    ({ engine, store } = makeEngine(() => true, {}));
+
+    await persist(engine, 'run-1', 'pending');
+    await persist(engine, 'run-1', 'running');
+
+    expect(store.calls).toHaveLength(0);
+    expect(store.legacyCalls.map(call => call.snapshot.status)).toEqual(['pending', 'running']);
+    expect(store.snapshot).toMatchObject({ status: 'running' });
+  });
+
+  it('fails closed for a resumed write when atomic resume lacks fenced step updates', async () => {
+    ({ engine, store } = makeEngine(() => true, { atomicResumeVersion: 1 }));
+
+    await expect(
+      engine.persistStepUpdate({
+        workflowId: 'wf',
+        runId: 'run-1',
+        resourceId: 'resource-1',
+        stepResults: {},
+        serializedStepGraph: [],
+        executionContext: baseExecutionContext({
+          executionGeneration: 'wfeg:generation',
+          lifecycleResumeAttempt: 1,
+          lifecycleStepStates: {},
+          resumeOperationHash: `sha256:${'a'.repeat(64)}`,
+        }),
+        workflowStatus: 'running',
+        requestContext: new RequestContext(),
+      }),
+    ).rejects.toThrow('does not support atomic resume admission and fenced resumed step updates');
+    expect(store.calls).toHaveLength(0);
+    expect(store.legacyCalls).toHaveLength(0);
+  });
+
+  it('fails closed for a resumed write when fenced step updates lack atomic resume', async () => {
+    ({ engine, store } = makeEngine(() => true, { fencedStepUpdateVersion: 1 }));
+
+    await expect(
+      engine.persistStepUpdate({
+        workflowId: 'wf',
+        runId: 'run-1',
+        resourceId: 'resource-1',
+        stepResults: {},
+        serializedStepGraph: [],
+        executionContext: baseExecutionContext({
+          executionGeneration: 'wfeg:generation',
+          lifecycleResumeAttempt: 1,
+          lifecycleStepStates: {},
+          resumeOperationHash: `sha256:${'a'.repeat(64)}`,
+        }),
+        workflowStatus: 'running',
+        requestContext: new RequestContext(),
+      }),
+    ).rejects.toThrow('does not support atomic resume admission and fenced resumed step updates');
+    expect(store.calls).toHaveLength(0);
+    expect(store.legacyCalls).toHaveLength(0);
   });
 });
 
