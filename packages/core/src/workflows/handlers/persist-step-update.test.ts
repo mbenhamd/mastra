@@ -8,13 +8,13 @@
  */
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { RequestContext } from '../../di';
 import { persistWorkflowStepUpdateRecord } from '../../storage/domains/workflows/resume';
 import type {
   PersistWorkflowStepUpdateInput,
   PersistWorkflowStepUpdateResult,
   WorkflowResumeCapabilities,
 } from '../../storage/types';
-import { RequestContext } from '../../di';
 import { DefaultExecutionEngine } from '../default';
 import type { ExecutionContext, WorkflowRunState, WorkflowRunStatus } from '../types';
 

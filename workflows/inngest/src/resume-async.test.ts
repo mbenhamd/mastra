@@ -431,6 +431,61 @@ describe('InngestRun.resumeAsync()', () => {
     });
   });
 
+  it('hydrates the next suspended path from an exact durable receipt', async () => {
+    const { run, workflowsStore } = await createSuspendedRun();
+    await run.resumeAsync({ step: 'step1', resumeData: { resumed: 'world' } });
+    const event = sendMock.mock.calls[0]![0];
+    const current = await workflowsStore.loadWorkflowSnapshot({
+      workflowName: 'resume-async-wf',
+      runId: run.runId,
+    });
+    const suspendedStep = {
+      status: 'suspended' as const,
+      suspendPayload: {
+        prompt: 'again',
+        __workflow_meta: { path: [] },
+      },
+    };
+    const outputPromise = run.getRunOutput('evt_123', 2_000, {
+      receiptKey: event.data.receiptKey,
+      resumeOperationHash: event.data.resumeOperationHash,
+      executionGeneration: event.data.executionGeneration,
+      lifecycleResumeAttempt: event.data.lifecycleResumeAttempt,
+    } as never);
+
+    await workflowsStore.finalizeWorkflowResume({
+      workflowName: 'resume-async-wf',
+      runId: run.runId,
+      resourceId: current!.resourceId,
+      resumeOperationHash: event.data.resumeOperationHash,
+      executionGeneration: current!.executionGeneration!,
+      lifecycleResumeAttempt: current!.lifecycleResumeAttempt!,
+      lifecycleStepStates: current!.lifecycleStepStates!,
+      shouldPersistSnapshot: true,
+      receiptKey: event.data.receiptKey,
+      snapshot: {
+        ...current!,
+        status: 'suspended',
+        context: { step1: suspendedStep },
+        suspendedPaths: { step1: [0] },
+      },
+      result: {
+        status: 'suspended',
+        steps: { step1: suspendedStep },
+      },
+    });
+
+    await expect(outputPromise).resolves.toMatchObject({
+      output: {
+        result: {
+          status: 'suspended',
+          suspended: [['step1']],
+          suspendPayload: { step1: { prompt: 'again' } },
+        },
+      },
+    });
+  });
+
   it('ignores minimal and stale finish events until the exact durable resume receipt wins', async () => {
     const { run, workflowsStore } = await createSuspendedRun();
     await run.resumeAsync({ step: 'step1', resumeData: { resumed: 'world' } });

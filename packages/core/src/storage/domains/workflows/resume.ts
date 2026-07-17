@@ -1,5 +1,13 @@
 import { createHash } from 'node:crypto';
 import type {
+  WorkflowLifecycleFenceV1,
+  WorkflowResumeCheckpointV1,
+  WorkflowResumeOperationReplayContextV1,
+  WorkflowResumeRollbackReceiptV1,
+  WorkflowResumeResultReceiptV1,
+  WorkflowRunState,
+} from '../../../workflows';
+import type {
   AdmitWorkflowResumeInput,
   AdmitWorkflowResumeResult,
   ConsumeWorkflowResumeResult,
@@ -11,14 +19,6 @@ import type {
   RollbackWorkflowResumeInput,
   RollbackWorkflowResumeResult,
 } from '../../types';
-import type {
-  WorkflowLifecycleFenceV1,
-  WorkflowResumeCheckpointV1,
-  WorkflowResumeOperationReplayContextV1,
-  WorkflowResumeRollbackReceiptV1,
-  WorkflowResumeResultReceiptV1,
-  WorkflowRunState,
-} from '../../../workflows';
 
 export const WORKFLOW_RESUME_RESULT_RECEIPT_MAX_BYTES = 8 * 1024 * 1024;
 
@@ -207,7 +207,9 @@ function checkpointIntegrityValue(value: unknown, seen = new Map<object, number>
 }
 
 function checkpointIntegrityHash(value: unknown): `sha256:${string}` {
-  return `sha256:${createHash('sha256').update(JSON.stringify(checkpointIntegrityValue(value)), 'utf8').digest('hex')}`;
+  return `sha256:${createHash('sha256')
+    .update(JSON.stringify(checkpointIntegrityValue(value)), 'utf8')
+    .digest('hex')}`;
 }
 
 function isHash(value: unknown): value is `sha256:${string}` {

@@ -30,8 +30,8 @@ import { NonRetriableError } from 'inngest';
 import type { Inngest } from 'inngest';
 import { InngestExecutionEngine } from './execution-engine';
 import { InngestPubSub } from './pubsub';
-import { InngestRun } from './run';
 import { inngestWorkflowResumeOperationHash } from './resume-operation';
+import { InngestRun } from './run';
 import type {
   InngestEngineType,
   InngestFlowControlConfig,
@@ -479,6 +479,7 @@ export class InngestWorkflow<
           disableScorers,
           receiptKey,
           resumeOperationHash: suppliedResumeOperationHash,
+          parentExecution,
           executionGeneration: suppliedExecutionGeneration,
           lifecycleResumeAttempt: suppliedLifecycleResumeAttempt,
           lifecycleStepStates: suppliedLifecycleStepStates,
@@ -533,6 +534,7 @@ export class InngestWorkflow<
               ? inngestWorkflowResumeOperationHash({
                   workflowId: this.id,
                   runId,
+                  parentExecution,
                   resourceId,
                   inputData,
                   steps: resume.steps ?? [],
@@ -587,6 +589,7 @@ export class InngestWorkflow<
             const resumeOperationHash = inngestWorkflowResumeOperationHash({
               workflowId: this.id,
               runId,
+              parentExecution,
               resourceId,
               inputData,
               steps: resume.steps ?? [],
@@ -611,10 +614,7 @@ export class InngestWorkflow<
               lifecycleStepStates: snapshot.lifecycleStepStates ?? {},
             };
             const resumeCapabilities = workflowsStore.getWorkflowResumeCapabilities();
-            if (
-              resumeCapabilities.atomicResumeVersion !== 1 ||
-              resumeCapabilities.fencedStepUpdateVersion !== 1
-            ) {
+            if (resumeCapabilities.atomicResumeVersion !== 1 || resumeCapabilities.fencedStepUpdateVersion !== 1) {
               throw new NonRetriableError(
                 `Workflow storage for ${this.id}/${runId} does not support atomic resume admission and fenced step updates`,
               );
@@ -762,6 +762,7 @@ export class InngestWorkflow<
           ? inngestWorkflowResumeOperationHash({
               workflowId: this.id,
               runId,
+              parentExecution,
               resourceId,
               inputData,
               steps: resume.steps ?? [],
@@ -940,11 +941,10 @@ export class InngestWorkflow<
               stepResults: result.steps,
             });
             const workflowsStore = await mastra?.getStorage()?.getStore('workflows');
-            const existingSnapshot =
-              (await workflowsStore?.loadWorkflowSnapshot({
-                workflowName: this.id,
-                runId,
-              })) as InngestWorkflowRunState | undefined;
+            const existingSnapshot = (await workflowsStore?.loadWorkflowSnapshot({
+              workflowName: this.id,
+              runId,
+            })) as InngestWorkflowRunState | undefined;
             const serializedError =
               result.status === 'failed'
                 ? getErrorFromUnknown(result.error, { serializeStack: true }).toJSON()

@@ -3,6 +3,12 @@ import { materializeWorkflowResumeOperationHash } from '@mastra/core/storage';
 export interface InngestWorkflowResumeOperation {
   workflowId: string;
   runId: string;
+  parentExecution?: {
+    workflowId: string;
+    runId: string;
+    executionGeneration?: string;
+    lifecycleResumeAttempt?: number;
+  };
   resourceId?: string;
   inputData?: unknown;
   steps: string[];

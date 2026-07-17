@@ -144,12 +144,7 @@ export async function expectAtomicWorkflowResumeStorageContract(options: {
       },
     });
 
-    const sameFinalization = finalizationFor(
-      admission,
-      admitted!,
-      'receipt:atomic-resume-contract',
-      'same',
-    );
+    const sameFinalization = finalizationFor(admission, admitted!, 'receipt:atomic-resume-contract', 'same');
     const sameFinalizations = await Promise.all([
       options.primary.finalizeWorkflowResume(sameFinalization),
       secondary.finalizeWorkflowResume(sameFinalization),

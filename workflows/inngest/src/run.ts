@@ -31,8 +31,8 @@ import type {
 import { NonRetriableError } from 'inngest';
 import type { Inngest } from 'inngest';
 import { subscribe } from 'inngest/realtime';
-import type { InngestEngineType, InngestWorkflowRunState } from './types';
 import { inngestWorkflowResumeOperationHash } from './resume-operation';
+import type { InngestEngineType, InngestWorkflowRunState } from './types';
 
 export function unwrapWorkflowRealtimeData(data: any): any {
   const isPubSubEnvelope =
@@ -69,6 +69,9 @@ function hydrateWorkflowResumeResult(result: WorkflowResumeResultDataV1): Record
   if (result.error !== undefined) {
     hydrated.error = getErrorFromUnknown(result.error, { serializeStack: false });
   }
+  addSuspensionDetailsFromSnapshot(hydrated, {
+    context: hydrated.steps,
+  } as InngestWorkflowRunState);
   return hydrated;
 }
 

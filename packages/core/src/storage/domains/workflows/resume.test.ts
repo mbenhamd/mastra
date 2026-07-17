@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { WorkflowRunState } from '../../../workflows';
 import type { AdmitWorkflowResumeInput } from '../../types';
+import { cloneRunData } from './inmemory';
 import {
   admitWorkflowResumeRecord,
   finalizeWorkflowResumeRecord,
@@ -8,7 +9,6 @@ import {
   rollbackWorkflowResumeRecord,
   WORKFLOW_RESUME_RESULT_RECEIPT_MAX_BYTES,
 } from './resume';
-import { cloneRunData } from './inmemory';
 
 const materialize = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 
@@ -72,9 +72,7 @@ describe('atomic workflow resume records', () => {
 
     expect(dateA).not.toBe(dateB);
     expect(customA).not.toBe(customB);
-    expect(dateA).toBe(
-      materializeWorkflowResumeOperationHash({ at: { toJSON: () => '2026-01-01T00:00:00.000Z' } }),
-    );
+    expect(dateA).toBe(materializeWorkflowResumeOperationHash({ at: { toJSON: () => '2026-01-01T00:00:00.000Z' } }));
   });
 
   it('retains one storage-owned JSON checkpoint and restores it without an event snapshot', () => {

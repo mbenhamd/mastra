@@ -80,6 +80,13 @@ import {
 import type { InMemoryDB, WorkflowTerminalParentRevisionState } from '../inmemory-db';
 import { WorkflowsStorage } from './base';
 import {
+  admitWorkflowResumeRecord,
+  consumeWorkflowResumeResultRecord,
+  finalizeWorkflowResumeRecord,
+  persistWorkflowStepUpdateRecord,
+  rollbackWorkflowResumeRecord,
+} from './resume';
+import {
   advanceWorkflowTerminalizationRecord,
   bindWorkflowNestedRunOwnershipRecord,
   captureWorkflowRunIdentity,
@@ -123,13 +130,6 @@ import {
   sameWorkflowTerminalRecoveryAncestry,
   WORKFLOW_TERMINAL_PARENT_APPLICATION_CONSUMER_ID,
 } from './terminalization';
-import {
-  admitWorkflowResumeRecord,
-  consumeWorkflowResumeResultRecord,
-  finalizeWorkflowResumeRecord,
-  persistWorkflowStepUpdateRecord,
-  rollbackWorkflowResumeRecord,
-} from './resume';
 
 /**
  * Deep-clone in-memory workflow state.

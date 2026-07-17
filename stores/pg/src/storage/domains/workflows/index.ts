@@ -363,9 +363,7 @@ export class WorkflowsPG extends WorkflowsStorage {
           [input.workflowName, input.runId],
         );
         const snapshot = row?.snapshot
-          ? this.materializeResumeSnapshot(
-              typeof row.snapshot === 'string' ? JSON.parse(row.snapshot) : row.snapshot,
-            )
+          ? this.materializeResumeSnapshot(typeof row.snapshot === 'string' ? JSON.parse(row.snapshot) : row.snapshot)
           : undefined;
         const outcome = persistWorkflowStepUpdateRecord(snapshot, input, value =>
           this.materializeResumeSnapshot(value),
