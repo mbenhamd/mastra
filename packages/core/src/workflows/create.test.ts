@@ -113,7 +113,7 @@ describe('cloneWorkflow', () => {
     expect(clone).not.toBe(original);
   });
 
-  it('clones normalized transient workflow options without enabling persistence', () => {
+  it('clones the durable fallback policy for transient workflows', () => {
     const original = createWorkflow({
       id: 'transient-original',
       inputSchema: z.object({ v: z.number() }),
@@ -126,6 +126,6 @@ describe('cloneWorkflow', () => {
     const clone = cloneWorkflow(original, { id: 'transient-clone' });
 
     expect(clone.options.executionMode).toBe('transient');
-    expect(clone.options.shouldPersistSnapshot({ stepResults: {}, workflowStatus: 'success' })).toBe(false);
+    expect(clone.options.shouldPersistSnapshot({ stepResults: {}, workflowStatus: 'success' })).toBe(true);
   });
 });

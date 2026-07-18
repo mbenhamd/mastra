@@ -742,9 +742,11 @@ export interface WorkflowOptions {
   tracingPolicy?: TracingPolicy;
   validateInputs?: boolean;
   /**
-   * `transient` is for internal, generated-ID executions that never persist or
-   * resume. Explicit and custom-generated run IDs retain durable admission.
-   * The evented engine requires durable execution and rejects this mode.
+   * `transient` skips persistence and durable lifecycle reconciliation only
+   * when a run uses Mastra's built-in generated ID. Explicit and custom-generated
+   * run IDs use the workflow's configured snapshot policy and lifecycle checks.
+   * Transient runs cannot suspend, resume, restart, or time travel. The evented
+   * engine requires durable execution and rejects this mode.
    */
   executionMode?: WorkflowExecutionMode;
   /**

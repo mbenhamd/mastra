@@ -8,6 +8,8 @@ const allProcessorWorkflowPhases = [
   'outputStep',
 ] as const satisfies readonly ProcessorWorkflowPhase[];
 
+const declaredProcessorWorkflowPhases = new WeakMap<ProcessorWorkflow, readonly ProcessorWorkflowPhase[]>();
+
 /**
  * Type guard to check if an object is a Workflow that can be used as a processor.
  *
@@ -41,7 +43,7 @@ export function getProcessorWorkflowPhases(
   processorOrWorkflow: Processor | ProcessorWorkflow,
 ): readonly ProcessorWorkflowPhase[] {
   if (isProcessorWorkflow(processorOrWorkflow)) {
-    return processorOrWorkflow.__processorPhases ?? allProcessorWorkflowPhases;
+    return declaredProcessorWorkflowPhases.get(processorOrWorkflow) ?? allProcessorWorkflowPhases;
   }
 
   const phases: ProcessorWorkflowPhase[] = [];
@@ -53,7 +55,28 @@ export function getProcessorWorkflowPhases(
   return phases;
 }
 
-/** Preserve arbitrary workflow compatibility while honoring explicit combined-workflow capabilities. */
+/**
+ * Declare exactly which processor phases a workflow consumes.
+ *
+ * Unannotated workflows remain compatible with every phase. Annotating a
+ * workflow lets the Agent avoid admitting it for phases that cannot affect its
+ * output. The same workflow instance is returned for convenient composition.
+ */
+export function setProcessorWorkflowPhases<TWorkflow extends ProcessorWorkflow>(
+  workflow: TWorkflow,
+  phases: readonly ProcessorWorkflowPhase[],
+): TWorkflow {
+  declaredProcessorWorkflowPhases.set(workflow, Object.freeze([...new Set(phases)]));
+  return workflow;
+}
+
+/** Preserve unannotated workflow compatibility while honoring declared capabilities. */
 export function processorWorkflowSupportsPhase(workflow: ProcessorWorkflow, phase: ProcessorWorkflowPhase): boolean {
-  return workflow.__processorPhases?.includes(phase) ?? true;
+  return declaredProcessorWorkflowPhases.get(workflow)?.includes(phase) ?? true;
+}
+
+/** @internal Whether an annotation excludes at least one processor phase. */
+export function processorWorkflowHasPhaseRestrictions(workflow: ProcessorWorkflow): boolean {
+  const declaredPhases = declaredProcessorWorkflowPhases.get(workflow);
+  return Boolean(declaredPhases && allProcessorWorkflowPhases.some(phase => !declaredPhases.includes(phase)));
 }

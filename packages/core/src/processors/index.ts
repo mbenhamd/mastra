@@ -811,8 +811,6 @@ export type ProcessorWorkflowPhase = ProcessorStepOutput['phase'];
  * The workflow must accept ProcessorStepInput and return ProcessorStepOutput.
  */
 export type ProcessorWorkflow = Workflow<any, any, string, any, ProcessorStepOutput, ProcessorStepOutput, any> & {
-  /** @internal Phases that at least one step in this processor workflow can consume. */
-  __processorPhases?: readonly ProcessorWorkflowPhase[];
   /** @internal Processors in a combined workflow that compute state signals after input-step execution. */
   __stateSignalProcessors?: Processor[];
 };
@@ -840,7 +838,9 @@ export type ErrorProcessorOrWorkflow<TTripwireMetadata = unknown> = ErrorProcess
 export {
   getProcessorWorkflowPhases,
   isProcessorWorkflow,
+  processorWorkflowHasPhaseRestrictions,
   processorWorkflowSupportsPhase,
+  setProcessorWorkflowPhases,
 } from './is-processor-workflow';
 
 export * from './processors';

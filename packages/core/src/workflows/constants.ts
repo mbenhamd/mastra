@@ -5,6 +5,16 @@ export const PUBSUB_SYMBOL = Symbol('pubsub');
 // Symbol used to pass stream format preferences through step context.
 export const STREAM_FORMAT_SYMBOL = Symbol('stream_format');
 
+// Symbol used to propagate process-local execution into nested workflow runs.
+// It never crosses a storage or transport boundary.
+export const TRANSIENT_EXECUTION_SYMBOL = Symbol('transient_execution');
+
+// Symbol used by ProcessorRunner to request process-local execution while
+// preserving collision checks for explicit or custom-generated run IDs.
+// Unlike TRANSIENT_EXECUTION_SYMBOL, this does not force an inherited nested
+// run ID to be transient.
+export const PROCESSOR_EXECUTION_SYMBOL = Symbol('processor_execution');
+
 // Symbol used to identify results from nested workflow execution.
 //
 // When a workflow contains another workflow as a step, the inner workflow's execute()

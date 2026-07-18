@@ -158,6 +158,13 @@ export async function persistStepUpdate(
     phase,
   } = params;
 
+  // A transient run is a per-execution decision. The workflow-level callback
+  // may still describe the durable fallback used by explicit/custom run IDs,
+  // so do not consult it for this execution.
+  if (executionContext.transientExecution) {
+    return;
+  }
+
   const operationId = `workflow.${workflowId}.run.${runId}.path.${JSON.stringify(executionContext.executionPath)}.stepUpdate${phase ? `.${phase}` : ''}`;
 
   await engine.wrapDurableOperation(operationId, async () => {
