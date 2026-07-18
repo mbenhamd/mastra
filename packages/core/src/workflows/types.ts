@@ -75,6 +75,8 @@ export type WorkflowEngineType = string;
  */
 export type WorkflowType = 'default' | 'processor';
 
+export type WorkflowExecutionMode = 'durable' | 'transient';
+
 export type RestartExecutionParams = {
   activePaths: number[];
   activeStepsPath: Record<string, number[]>;
@@ -740,6 +742,12 @@ export interface WorkflowOptions {
   tracingPolicy?: TracingPolicy;
   validateInputs?: boolean;
   /**
+   * `transient` is for internal, generated-ID executions that never persist or
+   * resume. Explicit and custom-generated run IDs retain durable admission.
+   * The evented engine requires durable execution and rejects this mode.
+   */
+  executionMode?: WorkflowExecutionMode;
+  /**
    * When true, nested runs created by execute() share the parent's pubsub
    * instance instead of creating an isolated one. Used by durable agent
    * workflows so inner step events reach the outer subscriber.
@@ -1257,6 +1265,8 @@ export type SubsetOf<TStepState, TState> =
 export type ExecutionContext = {
   workflowId: string;
   runId: string;
+  /** Skip remote lifecycle reconciliation for an explicitly transient run. */
+  transientExecution?: boolean;
   executionGeneration?: string;
   lifecycleResumeAttempt?: number;
   lifecycleStepStates?: Record<string, { stepCallId: string; stepAttempt: number }>;

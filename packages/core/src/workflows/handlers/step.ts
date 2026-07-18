@@ -317,6 +317,7 @@ export async function executeStep(
       const authoritativeDisposition = await engine.getAuthoritativeExecutionDisposition({
         workflowId,
         runId,
+        transientExecution: executionContext.transientExecution,
         executionGeneration,
       });
       if (authoritativeDisposition) {
@@ -628,6 +629,7 @@ export async function executeStep(
   const authoritativeDisposition = await engine.getAuthoritativeExecutionDisposition({
     workflowId,
     runId,
+    transientExecution: executionContext.transientExecution,
     executionGeneration,
   });
   if (authoritativeDisposition) {

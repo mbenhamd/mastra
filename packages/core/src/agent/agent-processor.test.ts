@@ -2569,6 +2569,10 @@ describe('v1 model - output processors', () => {
 
 describe('Workflow as Processor', () => {
   it('should use the agent logger for internal combined processor workflows', async () => {
+    const passthroughProcessor: Processor = {
+      id: 'passthrough-processor',
+      processInput: async ({ messages }) => messages,
+    };
     const failingProcessor: Processor = {
       id: 'failing-processor',
       processInput: async () => {
@@ -2589,7 +2593,7 @@ describe('Workflow as Processor', () => {
           warnings: [],
         }),
       }),
-      inputProcessors: [failingProcessor],
+      inputProcessors: [passthroughProcessor, failingProcessor],
     });
 
     const logger = {

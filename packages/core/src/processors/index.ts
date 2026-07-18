@@ -804,11 +804,15 @@ export type ProcessorTypes<TTripwireMetadata = unknown> =
   | OutputProcessor<TTripwireMetadata>
   | ErrorProcessor<TTripwireMetadata>;
 
+export type ProcessorWorkflowPhase = ProcessorStepOutput['phase'];
+
 /**
  * A Workflow that can be used as a processor.
  * The workflow must accept ProcessorStepInput and return ProcessorStepOutput.
  */
 export type ProcessorWorkflow = Workflow<any, any, string, any, ProcessorStepOutput, ProcessorStepOutput, any> & {
+  /** @internal Phases that at least one step in this processor workflow can consume. */
+  __processorPhases?: readonly ProcessorWorkflowPhase[];
   /** @internal Processors in a combined workflow that compute state signals after input-step execution. */
   __stateSignalProcessors?: Processor[];
 };
@@ -833,7 +837,11 @@ export type OutputProcessorOrWorkflow<TTripwireMetadata = unknown> =
  */
 export type ErrorProcessorOrWorkflow<TTripwireMetadata = unknown> = ErrorProcessor<TTripwireMetadata>;
 
-export { isProcessorWorkflow } from './is-processor-workflow';
+export {
+  getProcessorWorkflowPhases,
+  isProcessorWorkflow,
+  processorWorkflowSupportsPhase,
+} from './is-processor-workflow';
 
 export * from './processors';
 export { PrefillErrorHandler } from './prefill-error-handler';

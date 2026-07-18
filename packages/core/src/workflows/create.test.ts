@@ -67,6 +67,17 @@ describe('createEventedWorkflow', () => {
     expect(wf.id).toBe('forced-evented');
     expect(wf.engineType).toBe('evented');
   });
+
+  it('rejects transient execution because the evented engine requires storage', () => {
+    expect(() =>
+      createEventedWorkflow({
+        id: 'transient-evented',
+        inputSchema: z.object({ v: z.number() }),
+        outputSchema: z.object({ v: z.number() }),
+        options: { executionMode: 'transient' },
+      }),
+    ).toThrow('Evented workflows require durable execution');
+  });
 });
 
 describe('cloneWorkflow', () => {
@@ -100,5 +111,21 @@ describe('cloneWorkflow', () => {
 
     expect(clone.id).not.toBe(original.id);
     expect(clone).not.toBe(original);
+  });
+
+  it('clones normalized transient workflow options without enabling persistence', () => {
+    const original = createWorkflow({
+      id: 'transient-original',
+      inputSchema: z.object({ v: z.number() }),
+      outputSchema: z.object({ v: z.number() }),
+      options: { executionMode: 'transient' },
+    })
+      .then(noop)
+      .commit();
+
+    const clone = cloneWorkflow(original, { id: 'transient-clone' });
+
+    expect(clone.options.executionMode).toBe('transient');
+    expect(clone.options.shouldPersistSnapshot({ stepResults: {}, workflowStatus: 'success' })).toBe(false);
   });
 });

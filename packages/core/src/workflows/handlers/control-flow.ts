@@ -163,6 +163,7 @@ export async function executeParallel(
         timeTravel,
         resume,
         executionContext: {
+          transientExecution: executionContext.transientExecution,
           executionGeneration: executionContext.executionGeneration,
           lifecycleResumeAttempt: executionContext.lifecycleResumeAttempt,
           lifecycleStepStates: executionContext.lifecycleStepStates,
@@ -487,6 +488,7 @@ export async function executeConditional(
         restart,
         timeTravel,
         executionContext: {
+          transientExecution: executionContext.transientExecution,
           executionGeneration: executionContext.executionGeneration,
           lifecycleResumeAttempt: executionContext.lifecycleResumeAttempt,
           lifecycleStepStates: executionContext.lifecycleStepStates,

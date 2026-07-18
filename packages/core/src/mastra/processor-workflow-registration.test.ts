@@ -9,8 +9,8 @@ import { Mastra } from './index';
 /**
  * Tests for processor workflow registration in Mastra.addAgent.
  *
- * When an agent is added to Mastra, its configured processors should be
- * automatically converted to workflows and registered with Mastra.
+ * When an agent is added to Mastra, lone processors stay directly registered;
+ * only processor chains and explicit workflows are registered as workflows.
  */
 describe('Processor Workflow Registration', () => {
   // Helper to wait for async workflow registration
@@ -27,7 +27,7 @@ describe('Processor Workflow Registration', () => {
     });
 
   describe('Static processor registration', () => {
-    it('should register input processor workflow when agent has static inputProcessors', async () => {
+    it('should register a lone static input processor without a synthetic workflow', async () => {
       const inputProcessor: InputProcessorOrWorkflow = {
         id: 'test-input-processor',
         processInput: async ({ messages }) => messages,
@@ -49,13 +49,11 @@ describe('Processor Workflow Registration', () => {
       // Wait for async registration
       await waitForWorkflowRegistration();
 
-      // Should have registered the input processor workflow
-      const workflow = mastra.getWorkflow('test-agent-input-processor');
-      expect(workflow).toBeDefined();
-      expect(workflow.id).toBe('test-agent-input-processor');
+      expect(mastra.listProcessors()?.['test-input-processor']).toBe(inputProcessor);
+      expect(() => mastra.getWorkflow('test-agent-input-processor')).toThrow();
     });
 
-    it('should register output processor workflow when agent has static outputProcessors', async () => {
+    it('should register a lone static output processor without a synthetic workflow', async () => {
       const outputProcessor: OutputProcessorOrWorkflow = {
         id: 'test-output-processor',
         processOutputResult: async ({ messages }) => messages,
@@ -77,13 +75,11 @@ describe('Processor Workflow Registration', () => {
       // Wait for async registration
       await waitForWorkflowRegistration();
 
-      // Should have registered the output processor workflow
-      const workflow = mastra.getWorkflow('test-agent-output-output-processor');
-      expect(workflow).toBeDefined();
-      expect(workflow.id).toBe('test-agent-output-output-processor');
+      expect(mastra.listProcessors()?.['test-output-processor']).toBe(outputProcessor);
+      expect(() => mastra.getWorkflow('test-agent-output-output-processor')).toThrow();
     });
 
-    it('should register input and output processor workflows without registering error processors', async () => {
+    it('should directly register lone input/output processors without registering error processors', async () => {
       const inputProcessor: InputProcessorOrWorkflow = {
         id: 'test-input',
         processInput: async ({ messages }) => messages,
@@ -117,12 +113,11 @@ describe('Processor Workflow Registration', () => {
       // Wait for async registration
       await waitForWorkflowRegistration();
 
-      // Should only register workflow-backed input/output processors
-      const inputWorkflow = mastra.getWorkflow('test-agent-both-input-processor');
-      const outputWorkflow = mastra.getWorkflow('test-agent-both-output-processor');
-
-      expect(inputWorkflow).toBeDefined();
-      expect(outputWorkflow).toBeDefined();
+      expect(mastra.listProcessors()?.['test-input']).toBe(inputProcessor);
+      expect(mastra.listProcessors()?.['test-output']).toBe(outputProcessor);
+      expect(mastra.listProcessors()?.['test-error']).toBeUndefined();
+      expect(() => mastra.getWorkflow('test-agent-both-input-processor')).toThrow();
+      expect(() => mastra.getWorkflow('test-agent-both-output-processor')).toThrow();
       expect(() => mastra.getWorkflow('test-agent-both-error-processor')).toThrow();
     });
 
@@ -149,7 +144,7 @@ describe('Processor Workflow Registration', () => {
   });
 
   describe('Function-based processor registration', () => {
-    it('should register workflow when inputProcessors is a function', async () => {
+    it('should directly register a lone function-based input processor', async () => {
       const inputProcessor: InputProcessorOrWorkflow = {
         id: 'dynamic-input-processor',
         processInput: async ({ messages }) => messages,
@@ -176,12 +171,11 @@ describe('Processor Workflow Registration', () => {
       // The function should have been called
       expect(processorFn).toHaveBeenCalled();
 
-      // Should have registered the workflow
-      const workflow = mastra.getWorkflow('test-agent-fn-input-processor');
-      expect(workflow).toBeDefined();
+      expect(mastra.listProcessors()?.['dynamic-input-processor']).toBe(inputProcessor);
+      expect(() => mastra.getWorkflow('test-agent-fn-input-processor')).toThrow();
     });
 
-    it('should register workflow when outputProcessors is a function', async () => {
+    it('should directly register a lone function-based output processor', async () => {
       const outputProcessor: OutputProcessorOrWorkflow = {
         id: 'dynamic-output-processor',
         processOutputResult: async ({ messages }) => messages,
@@ -208,9 +202,8 @@ describe('Processor Workflow Registration', () => {
       // The function should have been called
       expect(processorFn).toHaveBeenCalled();
 
-      // Should have registered the workflow
-      const workflow = mastra.getWorkflow('test-agent-output-fn-output-processor');
-      expect(workflow).toBeDefined();
+      expect(mastra.listProcessors()?.['dynamic-output-processor']).toBe(outputProcessor);
+      expect(() => mastra.getWorkflow('test-agent-output-fn-output-processor')).toThrow();
     });
   });
 
@@ -326,7 +319,7 @@ describe('Processor Workflow Registration', () => {
   });
 
   describe('Adding agents after construction', () => {
-    it('should register processor workflows when agent is added via addAgent', async () => {
+    it('should directly register a lone processor when an agent is added via addAgent', async () => {
       const mastra = new Mastra({
         logger: false,
       });
@@ -349,9 +342,8 @@ describe('Processor Workflow Registration', () => {
       // Wait for async registration
       await waitForWorkflowRegistration();
 
-      // Should have registered the workflow
-      const workflow = mastra.getWorkflow('late-added-agent-input-processor');
-      expect(workflow).toBeDefined();
+      expect(mastra.listProcessors()?.['late-added-processor']).toBe(inputProcessor);
+      expect(() => mastra.getWorkflow('late-added-agent-input-processor')).toThrow();
     });
   });
 });

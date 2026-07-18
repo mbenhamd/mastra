@@ -3714,5 +3714,42 @@ describe('ProcessorRunner', () => {
         }),
       ]);
     });
+
+    it('provides sendSignal to a directly executed stream processor', async () => {
+      const chunks: unknown[] = [];
+      const receivedSendSignal = vi.fn();
+      runner = new ProcessorRunner({
+        inputProcessors: [],
+        outputProcessors: [
+          {
+            id: 'stream-signal-processor',
+            processOutputStream: async ({ part, sendSignal: processorSendSignal }) => {
+              receivedSendSignal(processorSendSignal);
+              await processorSendSignal?.({
+                type: 'system-reminder',
+                contents: 'stream reminder',
+              });
+              return part;
+            },
+          },
+        ],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+
+      await runner.processPart(
+        { type: 'text-delta', payload: { text: 'signal', id: 'text-1' }, runId: '1', from: ChunkFrom.AGENT },
+        new Map(),
+        undefined,
+        undefined,
+        messageList,
+        0,
+        { custom: async chunk => chunks.push(chunk) },
+      );
+
+      expect(receivedSendSignal).toHaveBeenCalledWith(expect.any(Function));
+      expect(messageList.get.all.db().at(-1)?.role).toBe('signal');
+      expect(chunks).toEqual([expect.objectContaining({ type: 'data-signal' })]);
+    });
   });
 });

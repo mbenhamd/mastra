@@ -1595,6 +1595,9 @@ export class EventedWorkflow<
   #schedules: WorkflowScheduleConfig[];
 
   constructor(params: WorkflowConfig<TWorkflowId, TState, TInput, TOutput, TSteps>) {
+    if (params.options?.executionMode === 'transient') {
+      throw new Error('Evented workflows require durable execution');
+    }
     super(params);
     this.engineType = 'evented';
     if (!params.schedule) {

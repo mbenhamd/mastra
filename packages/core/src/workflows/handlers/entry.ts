@@ -389,6 +389,7 @@ export async function executeEntry(
       stepResults,
       resume,
       executionContext: {
+        transientExecution: executionContext.transientExecution,
         executionGeneration: executionContext.executionGeneration,
         lifecycleResumeAttempt: executionContext.lifecycleResumeAttempt,
         lifecycleStepStates: executionContext.lifecycleStepStates,
@@ -466,6 +467,7 @@ export async function executeEntry(
         stepResults,
         resume,
         executionContext: {
+          transientExecution: executionContext.transientExecution,
           executionGeneration: executionContext.executionGeneration,
           lifecycleResumeAttempt: executionContext.lifecycleResumeAttempt,
           lifecycleStepStates: executionContext.lifecycleStepStates,
@@ -508,6 +510,7 @@ export async function executeEntry(
         restart,
         timeTravel,
         executionContext: {
+          transientExecution: executionContext.transientExecution,
           executionGeneration: executionContext.executionGeneration,
           lifecycleResumeAttempt: executionContext.lifecycleResumeAttempt,
           lifecycleStepStates: executionContext.lifecycleStepStates,

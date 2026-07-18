@@ -1679,11 +1679,15 @@ export class Workflow<
     this.type = type ?? 'default';
     this.#options = {
       validateInputs: options.validateInputs ?? true,
+      executionMode: options.executionMode ?? 'durable',
       // Processor workflows carry live process-local values such as MessageList,
       // AbortSignal, and processor-state Maps. They are transient and cannot be
-      // resumed safely from a JSON snapshot unless a caller explicitly supplies
-      // a different persistence policy.
-      shouldPersistSnapshot: options.shouldPersistSnapshot ?? (this.type === 'processor' ? () => false : () => true),
+      // resumed safely from a JSON snapshot. Explicit transient mode makes that
+      // invariant part of the workflow contract.
+      shouldPersistSnapshot:
+        options.executionMode === 'transient'
+          ? () => false
+          : (options.shouldPersistSnapshot ?? (this.type === 'processor' ? () => false : () => true)),
       pruneSnapshot: options.pruneSnapshot,
       tracingPolicy: options.tracingPolicy,
       onFinish: options.onFinish,
@@ -2422,6 +2426,9 @@ export class Workflow<
         resourceId: options?.resourceId,
       }) ||
       randomUUID();
+    const usesCustomGeneratedRunId = !options?.runId && Boolean(this.#mastra?.getIdGenerator());
+    const transientExecution =
+      this.#options.executionMode === 'transient' && !options?.runId && !usesCustomGeneratedRunId;
 
     // Return a new Run instance with object parameters
     const run =
@@ -2444,6 +2451,7 @@ export class Workflow<
         workflowSteps: this.steps,
         validateInputs: this.#options?.validateInputs,
         workflowEngineType: this.engineType,
+        transientExecution,
         pubsub: options?.pubsub ?? this.#mastra?.pubsub,
       });
 
@@ -2463,7 +2471,6 @@ export class Workflow<
     // persists snapshots cannot already exist in storage in normal operation.
     // Custom generators may be deterministic, so retain the collision/status
     // read whenever one is configured.
-    const usesCustomGeneratedRunId = !options?.runId && Boolean(this.#mastra?.getIdGenerator());
     const existingRun =
       shouldPersistSnapshot || options?.runId || usesCustomGeneratedRunId
         ? await this.getWorkflowRunById(runIdToUse, { withNestedWorkflows: false })
@@ -3230,6 +3237,9 @@ export class Run<
 
   readonly workflowEngineType: WorkflowEngineType;
 
+  /** True only for an explicit transient workflow using Mastra's built-in generated run ID. */
+  readonly transientExecution: boolean;
+
   /**
    * The storage for this run
    */
@@ -3276,6 +3286,7 @@ export class Run<
     workflowSteps: Record<string, StepWithComponent>;
     validateInputs?: boolean;
     workflowEngineType: WorkflowEngineType;
+    transientExecution?: boolean;
     /** Optional pubsub instance. If not provided, a new EventEmitterPubSub is created. */
     pubsub?: PubSub;
   }) {
@@ -3298,6 +3309,7 @@ export class Run<
     this.requestContextSchema = params.requestContextSchema;
     this.workflowRunStatus = 'pending';
     this.workflowEngineType = params.workflowEngineType;
+    this.transientExecution = params.transientExecution ?? false;
   }
 
   public get abortController(): AbortController {
@@ -3390,6 +3402,21 @@ export class Run<
    * minting a replacement or advancing its durable resume counter.
    */
   async getLifecycleExecutionIdentity(): Promise<WorkflowLifecycleExecutionIdentity> {
+    if (this.transientExecution) {
+      const executionGeneration =
+        this.workflowRunStatus === 'pending'
+          ? this.startLifecycleExecution().executionGeneration
+          : requireWorkflowExecutionGeneration(
+              this.#executionGeneration,
+              `Transient workflow run ${this.workflowId}/${this.runId}`,
+            );
+      return {
+        workflowId: this.workflowId,
+        runId: this.runId,
+        executionGeneration,
+        topic: getWorkflowLifecycleTopic({ workflowId: this.workflowId, runId: this.runId, executionGeneration }),
+      };
+    }
     const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
     const snapshot = await workflowsStore?.loadWorkflowSnapshot({
       workflowName: this.workflowId,
@@ -3457,6 +3484,7 @@ export class Run<
     lifecycleResumeAttempt: number;
     lifecycleStepStates: WorkflowStepLifecycleStateMap;
   }): Promise<void> {
+    if (this.transientExecution) return;
     const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
     const snapshot = await workflowsStore?.loadWorkflowSnapshot({
       workflowName: this.workflowId,
@@ -3485,10 +3513,11 @@ export class Run<
 
   /**
    * Cancels the workflow execution.
-   * This aborts any running execution and updates the workflow status to 'canceled' in storage.
+   * This aborts any running execution and, for durable runs, updates the
+   * workflow status to 'canceled' in storage.
    */
   async cancel() {
-    const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
+    const workflowsStore = this.transientExecution ? undefined : await this.mastra?.getStorage()?.getStore('workflows');
     let snapshot: WorkflowRunState | null | undefined;
     try {
       snapshot = await workflowsStore?.loadWorkflowSnapshot({
@@ -3570,6 +3599,12 @@ export class Run<
 
   protected hasActiveLifecycleExecution(executionGeneration: string | undefined): boolean {
     return executionGeneration !== undefined && (this.#activeExecutionGenerations.get(executionGeneration) ?? 0) > 0;
+  }
+
+  private assertDurableLifecycleOperation(operation: 'resume' | 'restart' | 'time travel'): void {
+    if (this.transientExecution) {
+      throw new Error(`Transient workflow runs cannot ${operation}`);
+    }
   }
 
   async #withActiveExecution<T>(executionGeneration: string, execute: () => Promise<T>): Promise<T> {
@@ -3727,6 +3762,7 @@ export class Run<
       this.executionEngine.execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({
         workflowId: this.workflowId,
         runId: this.runId,
+        transientExecution: this.transientExecution,
         ...lifecycleExecution,
         resourceId: this.resourceId,
         disableScorers: this.disableScorers,
@@ -4443,6 +4479,7 @@ export class Run<
       actor?: ActorSignal;
     } & Partial<ObservabilityContext>,
   ): Promise<WorkflowResult<TState, TInput, TOutput, TSteps>> {
+    this.assertDurableLifecycleOperation('resume');
     const observabilityContext = resolveObservabilityContext(params);
     const workflowsStore = await this.#mastra?.getStorage()?.getStore('workflows');
     const snapshot = await workflowsStore?.loadWorkflowSnapshot({
@@ -4658,6 +4695,7 @@ export class Run<
     tracingOptions?: TracingOptions;
     actor?: ActorSignal;
   } & Partial<ObservabilityContext>): Promise<WorkflowResult<TState, TInput, TOutput, TSteps>> {
+    this.assertDurableLifecycleOperation('restart');
     const observabilityContext = resolveObservabilityContext(rest);
     const allowedEngines = ['default', 'evented'];
     if (!allowedEngines.includes(this.workflowEngineType)) {
@@ -4776,6 +4814,7 @@ export class Run<
     perStep?: boolean;
     actor?: ActorSignal;
   } & Partial<ObservabilityContext>): Promise<WorkflowResult<TState, TInput, TOutput, TSteps>> {
+    this.assertDurableLifecycleOperation('time travel');
     const observabilityContext = resolveObservabilityContext(rest);
     if (!stepParam || (Array.isArray(stepParam) && stepParam.length === 0)) {
       throw new Error('Step is required and must be a valid step or array of steps');

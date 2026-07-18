@@ -27,7 +27,7 @@ import { Agent } from '../agent';
 const AGENT_ID = 'processor-noise-agent';
 const PROCESSOR_WORKFLOW_ID = `${AGENT_ID}-input-processor`;
 
-function createDummyModel() {
+function createDummyModel(textDeltaCount = 1) {
   return new MockLanguageModelV2({
     doGenerate: async () => ({
       rawCall: { rawPrompt: null, rawSettings: {} },
@@ -43,7 +43,11 @@ function createDummyModel() {
         { type: 'stream-start', warnings: [] },
         { type: 'response-metadata', id: 'id-0', modelId: 'mock-model-id', timestamp: new Date(0) },
         { type: 'text-start', id: 'text-1' },
-        { type: 'text-delta', id: 'text-1', delta: 'Dummy response' },
+        ...Array.from({ length: textDeltaCount }, (_, index) => ({
+          type: 'text-delta' as const,
+          id: 'text-1',
+          delta: `Dummy response ${index}`,
+        })),
         { type: 'text-end', id: 'text-1' },
         { type: 'finish', finishReason: 'stop', usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 } },
       ]),
@@ -51,11 +55,14 @@ function createDummyModel() {
   });
 }
 
-// A minimal no-op input processor. A single non-workflow processor forces the agent to build
-// the internal `createWorkflow(...)` processor workflow (the branch that triggers the bug),
-// without pulling in @mastra/memory.
+// Two minimal no-op processors force the agent to build the internal
+// `createWorkflow(...)` processor workflow without pulling in @mastra/memory.
 const noopInputProcessor: Processor = {
   id: 'noop-input-processor',
+  processInput: async ({ messages }) => messages,
+};
+const secondNoopInputProcessor: Processor = {
+  id: 'second-noop-input-processor',
   processInput: async ({ messages }) => messages,
 };
 
@@ -66,7 +73,7 @@ function buildAgentWithProcessor(idGenerator?: () => string) {
     name: AGENT_ID,
     instructions: 'test',
     model: createDummyModel(),
-    inputProcessors: [noopInputProcessor],
+    inputProcessors: [noopInputProcessor, secondNoopInputProcessor],
   });
   const mastra = new Mastra({
     agents: { [AGENT_ID]: agent },
@@ -78,13 +85,118 @@ function buildAgentWithProcessor(idGenerator?: () => string) {
 }
 
 describe('agent processor-workflow storage noise (issue #17137 follow-up to #17344)', () => {
+  it('does not admit a result-only output processor workflow for streamed parts', async () => {
+    const storage = new InMemoryStore();
+    const processOutputResult = vi.fn(async ({ messages }) => messages);
+    const agent = new Agent({
+      id: AGENT_ID,
+      name: AGENT_ID,
+      instructions: 'test',
+      model: createDummyModel(12),
+      outputProcessors: [{ id: 'result-only-output-processor', processOutputResult }],
+    });
+    const mastra = new Mastra({
+      agents: { [AGENT_ID]: agent },
+      storage,
+      logger: false,
+    });
+    const workflowsStore = (await storage.getStore('workflows'))!;
+    const read = vi.spyOn(workflowsStore, 'loadWorkflowSnapshot');
+
+    const stream = await mastra.getAgent(AGENT_ID).stream('Hello!');
+    for await (const _part of stream.fullStream) {
+      // Consume the provider-free stream so output stream/result processors finish.
+    }
+
+    const processorWorkflowReads = read.mock.calls.filter(
+      ([input]) => input.workflowName === `${AGENT_ID}-output-processor`,
+    );
+    expect(processorWorkflowReads).toEqual([]);
+    expect(processOutputResult).toHaveBeenCalledTimes(1);
+  });
+
+  it('skips unsupported stream phases for a combined result-only processor workflow', async () => {
+    const storage = new InMemoryStore();
+    const firstResult = vi.fn(async ({ messages }) => messages);
+    const secondResult = vi.fn(async ({ messages }) => messages);
+    const agent = new Agent({
+      id: AGENT_ID,
+      name: AGENT_ID,
+      instructions: 'test',
+      model: createDummyModel(12),
+      outputProcessors: [
+        { id: 'first-result-only-processor', processOutputResult: firstResult },
+        { id: 'second-result-only-processor', processOutputResult: secondResult },
+      ],
+    });
+    const mastra = new Mastra({ agents: { [AGENT_ID]: agent }, storage, logger: false });
+    const workflowsStore = (await storage.getStore('workflows'))!;
+    const read = vi.spyOn(workflowsStore, 'loadWorkflowSnapshot');
+
+    const stream = await mastra.getAgent(AGENT_ID).stream('Hello!');
+    for await (const _part of stream.fullStream) {
+      // Consume the provider-free stream so output stream/result processors finish.
+    }
+
+    const processorWorkflowReads = read.mock.calls.filter(
+      ([input]) => input.workflowName === `${AGENT_ID}-output-processor`,
+    );
+    expect(processorWorkflowReads).toEqual([]);
+    expect(firstResult).toHaveBeenCalledTimes(1);
+    expect(secondResult).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves mixed processor order and state without durable lifecycle reads', async () => {
+    const storage = new InMemoryStore();
+    const resultOrder: string[] = [];
+    let textDeltaCountInResult = 0;
+    const streamAwareProcessor: Processor = {
+      id: 'stream-aware-processor',
+      processOutputStream: async ({ part, state }) => {
+        if (part.type === 'text-delta') {
+          state.textDeltaCount = Number(state.textDeltaCount ?? 0) + 1;
+        }
+        return part;
+      },
+      processOutputResult: async ({ messages, state }) => {
+        textDeltaCountInResult = Number(state.textDeltaCount ?? 0);
+        resultOrder.push('stream-aware');
+        return messages;
+      },
+    };
+    const resultOnlyProcessor: Processor = {
+      id: 'result-only-processor',
+      processOutputResult: async ({ messages }) => {
+        resultOrder.push('result-only');
+        return messages;
+      },
+    };
+    const agent = new Agent({
+      id: AGENT_ID,
+      name: AGENT_ID,
+      instructions: 'test',
+      model: createDummyModel(12),
+      outputProcessors: [streamAwareProcessor, resultOnlyProcessor],
+    });
+    const mastra = new Mastra({ agents: { [AGENT_ID]: agent }, storage, logger: false });
+    const workflowsStore = (await storage.getStore('workflows'))!;
+    const read = vi.spyOn(workflowsStore, 'loadWorkflowSnapshot');
+    const streamedText: string[] = [];
+
+    const stream = await mastra.getAgent(AGENT_ID).stream('Hello!');
+    for await (const part of stream.fullStream) {
+      if (part.type === 'text-delta') streamedText.push(part.payload.text);
+    }
+
+    expect(streamedText).toHaveLength(12);
+    expect(textDeltaCountInResult).toBe(12);
+    expect(resultOrder).toEqual(['stream-aware', 'result-only']);
+    expect(read.mock.calls.filter(([input]) => input.workflowName === `${AGENT_ID}-output-processor`)).toEqual([]);
+  });
+
   it('does not read storage (getWorkflowRunById) for the internal processor workflow on generate', async () => {
-    // #19015 short-circuits createRun's storage existence read for transient workflows
-    // (shouldPersistSnapshot: () => false) that mint a fresh runId. The internal
-    // processor workflow is exactly that, so its createRun no longer calls
-    // getWorkflowRunById at all. This strictly subsumes the original #17137/#17344
-    // no-noise goal: a lookup that never runs can never hit the "storage is not
-    // initialized" branch.
+    // Explicit transient execution skips both createRun collision lookup and
+    // execution-time lifecycle reconciliation when Mastra mints the run ID.
     const seen: Array<{ id: string; hasStorage: boolean }> = [];
     const original = (Workflow.prototype as unknown as { getWorkflowRunById: (...a: unknown[]) => unknown })
       .getWorkflowRunById;

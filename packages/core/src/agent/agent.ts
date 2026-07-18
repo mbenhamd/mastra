@@ -68,9 +68,10 @@ import type {
   InputProcessorOrWorkflow,
   OutputProcessorOrWorkflow,
   ProcessorWorkflow,
+  ProcessorWorkflowPhase,
   Processor,
 } from '../processors/index';
-import { ProcessorStepSchema, isProcessorWorkflow } from '../processors/index';
+import { ProcessorStepSchema, getProcessorWorkflowPhases, isProcessorWorkflow } from '../processors/index';
 import { SkillsProcessor } from '../processors/processors/skills';
 import { WorkspaceInstructionsProcessor } from '../processors/processors/workspace-instructions';
 import type { ProcessorState } from '../processors/runner';
@@ -1709,6 +1710,13 @@ export class Agent<
       return [];
     }
 
+    // A single processor already has direct phase dispatch, shared state, tracing,
+    // and tripwire handling in ProcessorRunner. Wrapping it adds workflow lifecycle
+    // work without adding ordering or composition semantics.
+    if (validProcessors.length === 1 && !isProcessorWorkflow(validProcessors[0]!)) {
+      return validProcessors as T[];
+    }
+
     // If after filtering we have a single workflow, mark it as processor type and return
     if (validProcessors.length === 1 && isProcessorWorkflow(validProcessors[0]!)) {
       const workflow = validProcessors[0]!;
@@ -1731,9 +1739,9 @@ export class Agent<
       type: 'processor',
       options: {
         validateInputs: false,
-        // Internal processor workflows are transient and non-resumable, so they must never
-        // write snapshot rows to the user's storage (mirrors the execution-workflow fix in #17344).
-        shouldPersistSnapshot: () => false,
+        // Combined processor workflows carry live process-local values and use
+        // generated run IDs. They cannot be persisted or resumed.
+        executionMode: 'transient',
         tracingPolicy: {
           // mark all workflow spans related to processor execution as internal
           internal: InternalSpans.WORKFLOW,
@@ -1743,8 +1751,12 @@ export class Agent<
     workflow.__setLogger(this.logger);
 
     const stateSignalProcessors: Processor[] = [];
+    const processorPhases = new Set<ProcessorWorkflowPhase>();
 
     for (const [index, processorOrWorkflow] of validProcessors.entries()) {
+      for (const phase of getProcessorWorkflowPhases(processorOrWorkflow)) {
+        processorPhases.add(phase);
+      }
       // Convert processor to step, or use workflow directly (nested workflows are allowed)
       let step: Step<string, unknown, any, any, any, any>;
       if (isProcessorWorkflow(processorOrWorkflow)) {
@@ -1773,21 +1785,24 @@ export class Agent<
     // the configured ID generator and runtime context. Fresh built-in run IDs
     // skip the guaranteed-miss storage lookup; explicit or custom-generated
     // IDs still use the registered storage for collision/status checks. With
-    // shouldPersistSnapshot:()=>false above, processor runs are never written.
+    // transient execution above, processor runs are never written.
     if (this.#mastra && isProcessorWorkflow(committedWorkflow)) {
       committedWorkflow.__registerMastra(this.#mastra);
     }
     if (stateSignalProcessors.length > 0 && isProcessorWorkflow(committedWorkflow)) {
       committedWorkflow.__stateSignalProcessors = stateSignalProcessors;
     }
+    if (isProcessorWorkflow(committedWorkflow)) {
+      committedWorkflow.__processorPhases = [...processorPhases];
+    }
 
-    // The resulting workflow is compatible with both Input and Output processor types
+    // The resulting workflow is compatible with both Input and Output processor types.
     return [committedWorkflow];
   }
 
   /**
    * Resolves and returns output processors from agent configuration.
-   * All processors are combined into a single workflow for consistency.
+   * Processor chains are combined; a lone plain processor stays direct.
    * @internal
    */
   private async listResolvedOutputProcessors(
@@ -1880,7 +1895,7 @@ export class Agent<
 
   /**
    * Resolves and returns input processors from agent configuration.
-   * All processors are combined into a single workflow for consistency.
+   * Processor chains are combined; a lone plain processor stays direct.
    * @internal
    */
   private async listResolvedInputProcessors(
@@ -2072,7 +2087,8 @@ export class Agent<
   public async getConfiguredProcessorWorkflows(): Promise<ProcessorWorkflow[]> {
     const workflows: ProcessorWorkflow[] = [];
 
-    // Get input processors (static or from function)
+    // Get input processors (static or from function). Lone processors register
+    // directly; only composed or explicit workflows are returned.
     if (this.#inputProcessors) {
       const inputProcessors =
         typeof this.#inputProcessors === 'function'
@@ -2083,11 +2099,15 @@ export class Agent<
       for (const p of combined) {
         if (isProcessorWorkflow(p)) {
           workflows.push(p);
+        } else if (this.#mastra) {
+          this.#mastra.addProcessor(p);
+          this.#mastra.addProcessorConfiguration(p, this.id, 'input');
         }
       }
     }
 
-    // Get output processors (static or from function)
+    // Get output processors (static or from function). Lone processors register
+    // directly; only composed or explicit workflows are returned.
     if (this.#outputProcessors) {
       const outputProcessors =
         typeof this.#outputProcessors === 'function'
@@ -2098,6 +2118,9 @@ export class Agent<
       for (const p of combined) {
         if (isProcessorWorkflow(p)) {
           workflows.push(p);
+        } else if (this.#mastra) {
+          this.#mastra.addProcessor(p);
+          this.#mastra.addProcessorConfiguration(p, this.id, 'output');
         }
       }
     }

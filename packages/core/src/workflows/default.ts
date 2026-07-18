@@ -94,8 +94,10 @@ export class DefaultExecutionEngine extends ExecutionEngine {
   async getAuthoritativeExecutionDisposition(params: {
     workflowId: string;
     runId: string;
+    transientExecution?: boolean;
     executionGeneration: string;
   }): Promise<WorkflowRunStatus | 'superseded' | undefined> {
+    if (params.transientExecution) return undefined;
     const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
     const snapshot = await workflowsStore?.loadWorkflowSnapshot({
       workflowName: params.workflowId,
@@ -755,6 +757,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
   async execute<TState, TInput, TOutput>(params: {
     workflowId: string;
     runId: string;
+    transientExecution?: boolean;
     executionGeneration: string;
     lifecycleResumeAttempt: number;
     lifecycleStepStates: Record<string, { stepCallId: string; stepAttempt: number }>;
@@ -893,6 +896,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       const executionContext: ExecutionContext = {
         workflowId,
         runId,
+        transientExecution: params.transientExecution,
         executionGeneration,
         lifecycleResumeAttempt,
         lifecycleStepStates,
@@ -941,11 +945,9 @@ export class DefaultExecutionEngine extends ExecutionEngine {
         currentRequestContext = this.deserializeRequestContext(lastOutput.requestContext);
       }
 
-      const authoritativeDisposition = await this.getAuthoritativeExecutionDisposition({
-        workflowId,
-        runId,
-        executionGeneration,
-      });
+      const authoritativeDisposition = params.transientExecution
+        ? undefined
+        : await this.getAuthoritativeExecutionDisposition({ workflowId, runId, executionGeneration });
       if (authoritativeDisposition) {
         // A terminal transition (or a newer generation) completed while user
         // code was still awaiting. The owner already published its terminal
@@ -1015,7 +1017,10 @@ export class DefaultExecutionEngine extends ExecutionEngine {
           tracingContext: persistTracingContext,
         });
 
-        if (await this.isAuthoritativelyCanceled({ workflowId, runId, executionGeneration })) {
+        if (
+          !params.transientExecution &&
+          (await this.isAuthoritativelyCanceled({ workflowId, runId, executionGeneration }))
+        ) {
           result = { ...result, status: 'canceled', result: undefined, error: undefined };
           lastOutput.result.status = 'canceled';
         }
@@ -1184,7 +1189,10 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       requestContext: currentRequestContext,
     });
 
-    if (await this.isAuthoritativelyCanceled({ workflowId, runId, executionGeneration })) {
+    if (
+      !params.transientExecution &&
+      (await this.isAuthoritativelyCanceled({ workflowId, runId, executionGeneration }))
+    ) {
       result = { ...result, status: 'canceled', result: undefined, error: undefined };
     }
 

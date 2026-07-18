@@ -156,6 +156,8 @@ export abstract class ExecutionEngine extends MastraBase {
   abstract execute<TState, TInput, TOutput>(params: {
     workflowId: string;
     runId: string;
+    /** Skip remote lifecycle reconciliation for an explicitly transient run. */
+    transientExecution?: boolean;
     /** Opaque workflow execution lineage, distinct from registry ownership generation. */
     executionGeneration: string;
     lifecycleResumeAttempt: number;

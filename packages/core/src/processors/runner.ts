@@ -20,7 +20,7 @@ import type { RequestContext } from '../request-context';
 import type { ChunkType } from '../stream';
 import type { MastraModelOutput } from '../stream/base/output';
 import type { LanguageModelUsage, ProviderMetadata } from '../stream/types';
-import { isProcessorWorkflow } from './is-processor-workflow';
+import { isProcessorWorkflow, processorWorkflowSupportsPhase } from './is-processor-workflow';
 import { createProcessorSendSignal } from './send-signal';
 import {
   summarizeActiveToolsForSpan,
@@ -602,6 +602,7 @@ export class ProcessorRunner {
 
       // Handle workflow as processor
       if (isProcessorWorkflow(processorOrWorkflow)) {
+        if (!processorWorkflowSupportsPhase(processorOrWorkflow, 'outputResult')) continue;
         await this.executeWorkflowAsProcessor(
           processorOrWorkflow,
           {
@@ -780,6 +781,7 @@ export class ProcessorRunner {
       for (const [index, processorOrWorkflow] of this.outputProcessors.entries()) {
         // Handle workflows for stream processing
         if (isProcessorWorkflow(processorOrWorkflow)) {
+          if (!processorWorkflowSupportsPhase(processorOrWorkflow, 'outputStream')) continue;
           if (!processedPart) continue;
 
           // Get or create state for this workflow
@@ -833,6 +835,8 @@ export class ProcessorRunner {
         const processor = processorOrWorkflow;
         try {
           if (processor.processOutputStream && processedPart) {
+            if (processedPart.type.startsWith('data-') && !processor.processDataParts) continue;
+
             // Get or create state for this processor
             let state = processorStates.get(processor.id);
             if (!state) {
@@ -854,13 +858,14 @@ export class ProcessorRunner {
               state: state.customState,
               agent: this.agent,
               abort: <TMetadata = unknown>(reason?: string, options?: TripWireOptions<TMetadata>): never => {
-                throw new TripWire(reason || `Stream part blocked by ${processor.id}`, options, processor.id);
+                throw new TripWire(reason || `Tripwire triggered by ${processor.id}`, options, processor.id);
               },
               ...createObservabilityContext({ currentSpan: state.span }),
               requestContext,
               messageList,
               retryCount,
               writer,
+              ...(messageList ? { sendSignal: createProcessorSendSignal({ messageList, writer }) } : {}),
             });
 
             // Track output chunk and update processedPart
@@ -1111,6 +1116,7 @@ export class ProcessorRunner {
 
       // Handle workflow as processor
       if (isProcessorWorkflow(processorOrWorkflow)) {
+        if (!processorWorkflowSupportsPhase(processorOrWorkflow, 'input')) continue;
         const currentSystemMessages = messageList.getSystemMessages();
         await this.executeWorkflowAsProcessor(
           processorOrWorkflow,
@@ -1246,7 +1252,7 @@ export class ProcessorRunner {
           }
 
           processableMessages = messageList.get.input.db();
-        } else {
+        } else if (Array.isArray(result)) {
           // Processor returned an array - stop recording before clear/add (that's just internal plumbing)
           mutations = messageList.stopRecording();
 
@@ -1279,6 +1285,13 @@ export class ProcessorRunner {
             }
 
             // Use messageList.get.input.db() for consistency with MessageList return type
+            processableMessages = messageList.get.input.db();
+          }
+        } else {
+          // Match the workflow adapter: unsupported return shapes are ignored,
+          // while any in-place MessageList mutations still take effect.
+          mutations = messageList.stopRecording();
+          if (mutations.length > 0) {
             processableMessages = messageList.get.input.db();
           }
         }
@@ -1370,6 +1383,7 @@ export class ProcessorRunner {
 
       // Handle workflow as processor with inputStep phase
       if (isProcessorWorkflow(processorOrWorkflow)) {
+        if (!processorWorkflowSupportsPhase(processorOrWorkflow, 'inputStep')) continue;
         const currentSystemMessages = messageList.getSystemMessages();
         const result = await this.executeWorkflowAsProcessor(
           processorOrWorkflow,
@@ -1858,6 +1872,7 @@ export class ProcessorRunner {
 
       // Handle workflow as processor with outputStep phase
       if (isProcessorWorkflow(processorOrWorkflow)) {
+        if (!processorWorkflowSupportsPhase(processorOrWorkflow, 'outputStep')) continue;
         const currentSystemMessages = messageList.getSystemMessages();
         await this.executeWorkflowAsProcessor(
           processorOrWorkflow,
