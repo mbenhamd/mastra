@@ -21,7 +21,11 @@ import type { ChunkType } from '../stream';
 import type { MastraModelOutput } from '../stream/base/output';
 import type { LanguageModelUsage, ProviderMetadata } from '../stream/types';
 import { PROCESSOR_EXECUTION_SYMBOL } from '../workflows/constants';
-import { isProcessorWorkflow, processorWorkflowSupportsPhase } from './is-processor-workflow';
+import {
+  isProcessorWorkflow,
+  processorWorkflowRequiresDurableExecution,
+  processorWorkflowSupportsPhase,
+} from './is-processor-workflow';
 import { createProcessorSendSignal } from './send-signal';
 import {
   summarizeActiveToolsForSpan,
@@ -511,10 +515,16 @@ export class ProcessorRunner {
   ): Promise<ProcessorStepOutput> {
     // Create a run and start the workflow
     // Processor inputs contain process-local objects (MessageList, AbortSignal,
-    // state Maps) and have no resume surface. Run custom workflows transiently
-    // too, while createRun retains collision handling for caller-owned or
-    // custom-generated IDs.
-    const run = await workflow.createRun({ [PROCESSOR_EXECUTION_SYMBOL]: true });
+    // state Maps) and have no resume surface. Run default-engine custom
+    // workflows transiently too, while createRun retains collision handling
+    // for caller-owned or custom-generated IDs.
+    // Evented workflows require durable state for event aggregation, scheduling,
+    // resume, and cancellation. Evented processor workflows and default-engine
+    // wrappers containing them therefore retain their authoritative durable
+    // lifecycle while phase gating still prevents per-part admission.
+    const run = processorWorkflowRequiresDurableExecution(workflow)
+      ? await workflow.createRun()
+      : await workflow.createRun({ [PROCESSOR_EXECUTION_SYMBOL]: true });
     const result = await run.start({
       // Cast to allow processorStates/abortSignal - passed through to workflow processor steps
       // but not part of the official ProcessorStepOutput schema
@@ -608,7 +618,9 @@ export class ProcessorRunner {
       // Handle workflow as processor
       if (isProcessorWorkflow(processorOrWorkflow)) {
         if (!processorWorkflowSupportsPhase(processorOrWorkflow, 'outputResult')) continue;
-        await this.executeWorkflowAsProcessor(
+        const messagesBeforeWorkflow = [...processableMessages];
+        const systemMessagesBeforeWorkflow = [...messageList.getSystemMessages()];
+        const workflowResult = await this.executeWorkflowAsProcessor(
           processorOrWorkflow,
           {
             phase: 'outputResult',
@@ -621,6 +633,17 @@ export class ProcessorRunner {
           requestContext,
           writer,
         );
+        ProcessorRunner.applyWorkflowResultToMessageList({
+          result: workflowResult,
+          messageList,
+          idsBeforeProcessing,
+          check,
+          defaultSource: 'response',
+          messagesBeforeWorkflow,
+          messagesAfterWorkflow: messageList.get.response.db(),
+          systemMessagesBeforeWorkflow,
+          systemMessagesAfterWorkflow: messageList.getSystemMessages(),
+        });
         continue;
       }
 
@@ -1129,8 +1152,9 @@ export class ProcessorRunner {
       // Handle workflow as processor
       if (isProcessorWorkflow(processorOrWorkflow)) {
         if (!processorWorkflowSupportsPhase(processorOrWorkflow, 'input')) continue;
-        const currentSystemMessages = messageList.getSystemMessages();
-        await this.executeWorkflowAsProcessor(
+        const messagesBeforeWorkflow = [...processableMessages];
+        const currentSystemMessages = [...messageList.getSystemMessages()];
+        const workflowResult = await this.executeWorkflowAsProcessor(
           processorOrWorkflow,
           {
             phase: 'input',
@@ -1142,6 +1166,17 @@ export class ProcessorRunner {
           observabilityContext,
           requestContext,
         );
+        ProcessorRunner.applyWorkflowResultToMessageList({
+          result: workflowResult,
+          messageList,
+          idsBeforeProcessing: inputIds,
+          check,
+          defaultSource: 'input',
+          messagesBeforeWorkflow,
+          messagesAfterWorkflow: messageList.get.input.db(),
+          systemMessagesBeforeWorkflow: currentSystemMessages,
+          systemMessagesAfterWorkflow: messageList.getSystemMessages(),
+        });
         continue;
       }
 
@@ -1396,10 +1431,12 @@ export class ProcessorRunner {
       // Handle workflow as processor with inputStep phase
       if (isProcessorWorkflow(processorOrWorkflow)) {
         if (!processorWorkflowSupportsPhase(processorOrWorkflow, 'inputStep')) continue;
-        const currentSystemMessages = messageList.getSystemMessages();
+        const messagesBeforeWorkflow = [...processableMessages];
+        const currentSystemMessages = [...messageList.getSystemMessages()];
         const result = await this.executeWorkflowAsProcessor(
           processorOrWorkflow,
           {
+            ...stepInput,
             phase: 'inputStep',
             messages: processableMessages,
             messageList,
@@ -1413,14 +1450,34 @@ export class ProcessorRunner {
                   return nextMessageId;
                 }
               : undefined,
-            ...stepInput,
           },
           observabilityContext,
           requestContext,
           writer,
           args.abortSignal,
         );
-        Object.assign(stepInput, result);
+        ProcessorRunner.applyWorkflowResultToMessageList({
+          result,
+          messageList,
+          idsBeforeProcessing,
+          check,
+          defaultSource: 'input',
+          messagesBeforeWorkflow,
+          messagesAfterWorkflow: messageList.get.all.db(),
+          systemMessagesBeforeWorkflow: currentSystemMessages,
+          systemMessagesAfterWorkflow: messageList.getSystemMessages(),
+        });
+        const workflowStepResult: RunProcessInputStepResult = {};
+        if (result.model !== undefined) workflowStepResult.model = result.model;
+        if (result.messageId !== undefined) workflowStepResult.messageId = result.messageId;
+        if (result.tools !== undefined) workflowStepResult.tools = result.tools;
+        if (result.toolChoice !== undefined) workflowStepResult.toolChoice = result.toolChoice;
+        if (result.activeTools !== undefined) workflowStepResult.activeTools = result.activeTools;
+        if (result.providerOptions !== undefined) workflowStepResult.providerOptions = result.providerOptions;
+        if (result.modelSettings !== undefined) workflowStepResult.modelSettings = result.modelSettings;
+        if (result.structuredOutput !== undefined) workflowStepResult.structuredOutput = result.structuredOutput;
+        if (result.retryCount !== undefined) workflowStepResult.retryCount = result.retryCount;
+        Object.assign(stepInput, workflowStepResult);
         await this.runWorkflowComputeStateSignals({
           workflow: processorOrWorkflow,
           messageList,
@@ -1885,8 +1942,9 @@ export class ProcessorRunner {
       // Handle workflow as processor with outputStep phase
       if (isProcessorWorkflow(processorOrWorkflow)) {
         if (!processorWorkflowSupportsPhase(processorOrWorkflow, 'outputStep')) continue;
-        const currentSystemMessages = messageList.getSystemMessages();
-        await this.executeWorkflowAsProcessor(
+        const messagesBeforeWorkflow = [...processableMessages];
+        const currentSystemMessages = [...messageList.getSystemMessages()];
+        const workflowResult = await this.executeWorkflowAsProcessor(
           processorOrWorkflow,
           {
             phase: 'outputStep',
@@ -1906,6 +1964,17 @@ export class ProcessorRunner {
           requestContext,
           writer,
         );
+        ProcessorRunner.applyWorkflowResultToMessageList({
+          result: workflowResult,
+          messageList,
+          idsBeforeProcessing,
+          check,
+          defaultSource: 'response',
+          messagesBeforeWorkflow,
+          messagesAfterWorkflow: messageList.get.all.db(),
+          systemMessagesBeforeWorkflow: currentSystemMessages,
+          systemMessagesAfterWorkflow: messageList.getSystemMessages(),
+        });
         continue;
       }
 
@@ -2219,6 +2288,61 @@ export class ProcessorRunner {
     }
 
     return { retry: false };
+  }
+
+  private static applyWorkflowResultToMessageList({
+    result,
+    messageList,
+    idsBeforeProcessing,
+    check,
+    defaultSource,
+    messagesBeforeWorkflow,
+    messagesAfterWorkflow,
+    systemMessagesBeforeWorkflow,
+    systemMessagesAfterWorkflow,
+  }: {
+    result: ProcessorStepOutput;
+    messageList: MessageList;
+    idsBeforeProcessing: string[];
+    check: ReturnType<MessageList['makeMessageSourceChecker']>;
+    defaultSource: 'input' | 'response';
+    messagesBeforeWorkflow: unknown[];
+    messagesAfterWorkflow: unknown[];
+    systemMessagesBeforeWorkflow: unknown[];
+    systemMessagesAfterWorkflow: unknown[];
+  }) {
+    if (result.messageList && result.messageList !== messageList) {
+      throw new MastraError({
+        category: 'USER',
+        domain: 'AGENT',
+        id: 'PROCESSOR_RETURNED_EXTERNAL_MESSAGE_LIST',
+        text: `Processor workflow returned a MessageList instance other than the one that was passed in as an argument. New external message list instances are not supported. Use the messageList argument instead.`,
+      });
+    }
+    const messageListChanged = !areProcessorMessageArraysEqual(messagesBeforeWorkflow, messagesAfterWorkflow);
+    const returnedMessagesArePassThrough = areProcessorMessageArraysEqual(messagesBeforeWorkflow, result.messages);
+    if (result.messages && (!messageListChanged || !returnedMessagesArePassThrough)) {
+      ProcessorRunner.applyMessagesToMessageList(
+        result.messages as MastraDBMessage[],
+        messageList,
+        idsBeforeProcessing,
+        check,
+        defaultSource,
+      );
+    }
+    const systemMessagesChanged = !areProcessorMessageArraysEqual(
+      systemMessagesBeforeWorkflow,
+      systemMessagesAfterWorkflow,
+    );
+    const returnedSystemMessagesArePassThrough = areProcessorMessageArraysEqual(
+      systemMessagesBeforeWorkflow,
+      result.systemMessages,
+    );
+    if (result.systemMessages && (!systemMessagesChanged || !returnedSystemMessagesArePassThrough)) {
+      messageList.replaceAllSystemMessages(
+        result.systemMessages as Parameters<MessageList['replaceAllSystemMessages']>[0],
+      );
+    }
   }
 
   static applyMessagesToMessageList(

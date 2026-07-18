@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   getProcessorWorkflowPhases,
   processorWorkflowHasPhaseRestrictions,
+  processorWorkflowRequiresDurableExecution,
   processorWorkflowSupportsPhase,
   setProcessorWorkflowPhases,
 } from './is-processor-workflow';
@@ -47,5 +48,21 @@ describe('processor workflow phase capabilities', () => {
     setProcessorWorkflowPhases(workflow, ['input', 'inputStep', 'outputStream', 'outputResult', 'outputStep']);
 
     expect(processorWorkflowHasPhaseRestrictions(workflow)).toBe(false);
+  });
+
+  it('requires durable execution for workflows with nested evented descendants', () => {
+    const workflow = {
+      ...processorWorkflowStub(),
+      engineType: 'default',
+      steps: {
+        wrapper: {
+          engineType: 'default',
+          steps: { evented: { engineType: 'evented' } },
+        },
+      },
+    } as unknown as ProcessorWorkflow;
+
+    expect(processorWorkflowRequiresDurableExecution(workflow)).toBe(true);
+    expect(processorWorkflowRequiresDurableExecution(processorWorkflowStub())).toBe(false);
   });
 });

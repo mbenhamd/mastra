@@ -76,6 +76,7 @@ import {
   getProcessorWorkflowPhases,
   isProcessorWorkflow,
   processorWorkflowHasPhaseRestrictions,
+  processorWorkflowRequiresDurableExecution,
   setProcessorWorkflowPhases,
 } from '../processors/index';
 import { SkillsProcessor } from '../processors/processors/skills';
@@ -1706,6 +1707,9 @@ export class Agent<
       if (!workflow.type) {
         workflow.type = 'processor';
       }
+      if (this.#mastra) {
+        workflow.__registerMastra(this.#mastra);
+      }
       return [workflow];
     }
 
@@ -1716,19 +1720,28 @@ export class Agent<
       return [];
     }
 
-    // A phase-restricted custom workflow must remain a top-level processor.
-    // Nesting it in a synthetic workflow whose capabilities are the union of
-    // the whole chain would execute the nested workflow during phases it
-    // explicitly excluded. ProcessorRunner preserves order while applying the
-    // phase guard to each returned item.
+    // Phase-restricted workflows and workflows with evented descendants must
+    // remain top-level processors. A synthetic workflow would either execute a
+    // restricted child during an excluded phase or place a durable evented child
+    // beneath a transient parent that cannot propagate suspension.
+    // ProcessorRunner preserves order while applying the phase guard to each item.
     if (
       validProcessors.some(
-        processor => isProcessorWorkflow(processor) && processorWorkflowHasPhaseRestrictions(processor),
+        processor =>
+          isProcessorWorkflow(processor) &&
+          (processorWorkflowHasPhaseRestrictions(processor) || processorWorkflowRequiresDurableExecution(processor)),
       )
     ) {
-      for (const processor of validProcessors) {
-        if (isProcessorWorkflow(processor) && !processor.type) {
-          processor.type = 'processor';
+      for (const [index, processor] of validProcessors.entries()) {
+        if (isProcessorWorkflow(processor)) {
+          if (!processor.type) {
+            processor.type = 'processor';
+          }
+          if (this.#mastra) {
+            processor.__registerMastra(this.#mastra);
+          }
+        } else {
+          processor.processorIndex = index;
         }
       }
       return validProcessors as T[];
@@ -1747,6 +1760,9 @@ export class Agent<
       // Mark the workflow as a processor workflow if not already set
       if (!workflow.type) {
         workflow.type = 'processor';
+      }
+      if (this.#mastra) {
+        workflow.__registerMastra(this.#mastra);
       }
       return [workflow];
     }

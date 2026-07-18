@@ -2425,6 +2425,9 @@ export class Workflow<
     if (!this.executionGraph.steps) {
       throw new Error('Uncommitted step flow changes detected. Call .commit() to register the steps.');
     }
+    if (this.engineType === 'evented' && options?.[TRANSIENT_EXECUTION_SYMBOL] === true) {
+      throw new Error('Evented workflows cannot run inside transient workflows');
+    }
     const runIdToUse =
       options?.runId ||
       this.#mastra?.generateId({
@@ -2435,15 +2438,21 @@ export class Workflow<
       }) ||
       randomUUID();
     const usesCustomGeneratedRunId = !options?.runId && Boolean(this.#mastra?.getIdGenerator());
+    const isNestedExecution = Object.prototype.hasOwnProperty.call(options ?? {}, TRANSIENT_EXECUTION_SYMBOL);
     const transientExecution =
-      options?.[TRANSIENT_EXECUTION_SYMBOL] ??
-      ((this.#options.executionMode === 'transient' || options?.[PROCESSOR_EXECUTION_SYMBOL] === true) &&
-        !options?.runId &&
-        !usesCustomGeneratedRunId);
+      this.engineType !== 'evented' &&
+      (options?.[TRANSIENT_EXECUTION_SYMBOL] === true ||
+        ((this.#options.executionMode === 'transient' || options?.[PROCESSOR_EXECUTION_SYMBOL] === true) &&
+          (!options?.runId || isNestedExecution) &&
+          !usesCustomGeneratedRunId));
+    const cachedRun = this.#runs.get(runIdToUse);
+    if (cachedRun && cachedRun.transientExecution !== transientExecution) {
+      throw new Error(`Workflow run ${this.id}/${runIdToUse} cannot change execution mode`);
+    }
 
     // Return a new Run instance with object parameters
     const run =
-      this.#runs.get(runIdToUse) ??
+      cachedRun ??
       new Run({
         workflowId: this.id,
         stateSchema: this.stateSchema,
@@ -2474,7 +2483,7 @@ export class Workflow<
         workflowStatus: run.workflowRunStatus,
         stepResults: {},
       });
-    const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
+    const workflowsStore = transientExecution ? undefined : await this.mastra?.getStorage()?.getStore('workflows');
 
     // A freshly-minted run for a workflow that never persists a snapshot (e.g. the
     // transient processor workflows from #17344) cannot have a stored row, so this
@@ -2485,7 +2494,7 @@ export class Workflow<
     // Custom generators may be deterministic, so retain the collision/status
     // read whenever one is configured.
     const existingRun =
-      shouldPersistSnapshot || options?.runId || usesCustomGeneratedRunId
+      !transientExecution && (shouldPersistSnapshot || options?.runId || usesCustomGeneratedRunId)
         ? await this.getWorkflowRunById(runIdToUse, { withNestedWorkflows: false })
         : undefined;
 
@@ -2702,18 +2711,20 @@ export class Workflow<
     // PubSub too, and the nested-watch relay would consume its own publication
     // forever because parent and child intentionally share the same run id.
     const nestedPubsub = useSharedPubsub ? pubsub : new EventEmitterPubSub();
+    const inheritedTransientOptions: { [TRANSIENT_EXECUTION_SYMBOL]?: boolean } =
+      inheritedTransientExecution === undefined ? {} : { [TRANSIENT_EXECUTION_SYMBOL]: inheritedTransientExecution };
     let run = isResume
       ? await this.createRun({
           runId: resume.runId,
           resourceId,
           pubsub: nestedPubsub,
-          [TRANSIENT_EXECUTION_SYMBOL]: inheritedTransientExecution,
+          ...inheritedTransientOptions,
         })
       : await this.createRun({
           runId,
           resourceId,
           pubsub: nestedPubsub,
-          [TRANSIENT_EXECUTION_SYMBOL]: inheritedTransientExecution,
+          ...inheritedTransientOptions,
         });
     const existingNestedRunIsTerminal =
       run.workflowRunStatus === 'success' ||
@@ -2727,12 +2738,16 @@ export class Workflow<
       // with a fresh pending lineage before starting the next logical
       // invocation; otherwise lifecycle admission correctly rejects the stale
       // terminal generation loaded by createRun().
-      await this.deleteWorkflowRunById(run.runId);
+      if (run.transientExecution) {
+        this.#runs.delete(run.runId);
+      } else {
+        await this.deleteWorkflowRunById(run.runId);
+      }
       run = await this.createRun({
         runId: run.runId,
         resourceId,
         pubsub: nestedPubsub,
-        [TRANSIENT_EXECUTION_SYMBOL]: inheritedTransientExecution,
+        ...inheritedTransientOptions,
       });
     }
     const nestedAbortCb = () => {
@@ -3555,6 +3570,18 @@ export class Run<
    */
   async cancel() {
     const workflowsStore = this.transientExecution ? undefined : await this.mastra?.getStorage()?.getStore('workflows');
+    if (
+      this.transientExecution &&
+      (this.workflowRunStatus === 'success' ||
+        this.workflowRunStatus === 'failed' ||
+        this.workflowRunStatus === 'canceled' ||
+        this.workflowRunStatus === 'tripwire' ||
+        this.workflowRunStatus === 'bailed' ||
+        this.workflowRunStatus === 'skipped') &&
+      !this.hasActiveLifecycleExecution(this.#executionGeneration)
+    ) {
+      return;
+    }
     let snapshot: WorkflowRunState | null | undefined;
     try {
       snapshot = await workflowsStore?.loadWorkflowSnapshot({
@@ -3765,6 +3792,9 @@ export class Run<
       perStep?: boolean;
       actor?: ActorSignal;
     } & Partial<ObservabilityContext>): Promise<WorkflowResult<TState, TInput, TOutput, TSteps>> {
+    if (this.transientExecution && perStep) {
+      throw new Error('Transient workflow runs cannot use per-step execution');
+    }
     const observabilityContext = resolveObservabilityContext(rest);
     // note: this span is ended inside this.executionEngine.execute()
     const workflowSpan = getOrCreateSpan({

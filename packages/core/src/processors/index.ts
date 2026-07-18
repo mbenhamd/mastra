@@ -839,6 +839,7 @@ export {
   getProcessorWorkflowPhases,
   isProcessorWorkflow,
   processorWorkflowHasPhaseRestrictions,
+  processorWorkflowRequiresDurableExecution,
   processorWorkflowSupportsPhase,
   setProcessorWorkflowPhases,
 } from './is-processor-workflow';

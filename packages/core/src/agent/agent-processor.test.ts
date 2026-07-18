@@ -9,7 +9,7 @@ import { isProcessorWorkflow } from '../processors/index';
 import { ProcessorStepInputSchema, ProcessorStepOutputSchema } from '../processors/step-schema';
 import { RequestContext } from '../request-context';
 import { createTool } from '../tools/tool';
-import { createStep, createWorkflow, isProcessor } from '../workflows';
+import { createEventedWorkflow, createStep, createWorkflow, isProcessor } from '../workflows';
 import type { MastraDBMessage } from './types';
 import { Agent } from './index';
 
@@ -3310,6 +3310,79 @@ describe('Workflow as Processor', () => {
       expect(resolvedProcessors).toHaveLength(1);
       expect(isProcessorWorkflow(resolvedProcessors[0])).toBe(true);
       expect(resolvedProcessors[0]?.__stateSignalProcessors).toEqual([stateProcessor]);
+    });
+
+    it('keeps an evented processor workflow top-level in a mixed chain', async () => {
+      const eventedStep = createStep({
+        id: 'evented-result-step',
+        inputSchema: ProcessorStepInputSchema,
+        outputSchema: ProcessorStepOutputSchema,
+        execute: async ({ inputData }) => inputData,
+      });
+      const eventedWorkflow = createEventedWorkflow({
+        id: 'evented-result-workflow',
+        inputSchema: ProcessorStepInputSchema,
+        outputSchema: ProcessorStepOutputSchema,
+      })
+        .then(eventedStep)
+        .commit();
+      const outputProcessor = {
+        id: 'plain-result-processor',
+        processOutputResult: async ({ messages }: any) => messages,
+      };
+      const agent = new Agent({
+        id: 'test-agent',
+        name: 'Test Agent',
+        instructions: 'test',
+        model: testModel,
+        outputProcessors: [eventedWorkflow, outputProcessor],
+      });
+
+      const resolvedProcessors = await agent.listOutputProcessors();
+
+      expect(resolvedProcessors).toEqual([eventedWorkflow, outputProcessor]);
+      expect(eventedWorkflow.engineType).toBe('evented');
+      expect(outputProcessor).toHaveProperty('processorIndex', 1);
+    });
+
+    it('keeps a default wrapper with an evented descendant top-level in a mixed chain', async () => {
+      const eventedStep = createStep({
+        id: 'nested-evented-result-step',
+        inputSchema: ProcessorStepInputSchema,
+        outputSchema: ProcessorStepOutputSchema,
+        execute: async ({ inputData }) => inputData,
+      });
+      const eventedWorkflow = createEventedWorkflow({
+        id: 'nested-evented-result-workflow',
+        inputSchema: ProcessorStepInputSchema,
+        outputSchema: ProcessorStepOutputSchema,
+      })
+        .then(eventedStep)
+        .commit();
+      const wrapperWorkflow = createWorkflow({
+        id: 'default-evented-wrapper',
+        inputSchema: ProcessorStepInputSchema,
+        outputSchema: ProcessorStepOutputSchema,
+      })
+        .then(eventedWorkflow as never)
+        .commit();
+      const outputProcessor = {
+        id: 'plain-after-evented-wrapper',
+        processOutputResult: async ({ messages }: any) => messages,
+      };
+      const agent = new Agent({
+        id: 'test-agent',
+        name: 'Test Agent',
+        instructions: 'test',
+        model: testModel,
+        outputProcessors: [wrapperWorkflow, outputProcessor],
+      });
+
+      const resolvedProcessors = await agent.listOutputProcessors();
+
+      expect(resolvedProcessors).toEqual([wrapperWorkflow, outputProcessor]);
+      expect(wrapperWorkflow.engineType).toBe('default');
+      expect(outputProcessor).toHaveProperty('processorIndex', 1);
     });
 
     it('should return individual output processors, not a combined workflow', async () => {

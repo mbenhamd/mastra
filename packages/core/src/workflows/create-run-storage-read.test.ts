@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
+import { EventEmitterPubSub } from '../events/event-emitter';
 import { Mastra } from '../mastra';
 import { MockStore } from '../storage/mock';
+import { PUBSUB_SYMBOL, TRANSIENT_EXECUTION_SYMBOL } from './constants';
 import { createWorkflow as createEventedWorkflow } from './evented';
 import type { WorkflowRunState } from './types';
 import { createStep, createWorkflow } from './index';
@@ -108,6 +110,33 @@ function createApprovalStep(id: string) {
 }
 
 describe('explicitly transient workflow lifecycle reads', () => {
+  it('rejects an evented child inherited by a transient parent before durable admission', async () => {
+    const step = createStep({
+      id: 'evented-child-step',
+      inputSchema: ioSchema,
+      outputSchema: ioSchema,
+      execute: async ({ inputData }) => inputData,
+    });
+    const workflow = createEventedWorkflow({
+      id: 'evented-child-of-transient-parent',
+      inputSchema: ioSchema,
+      outputSchema: ioSchema,
+    })
+      .then(step)
+      .commit();
+    const storage = new MockStore();
+    new Mastra({ logger: false, storage, workflows: { [workflow.id]: workflow } });
+    const workflowsStore = (await storage.getStore('workflows'))!;
+    const lookup = vi.spyOn(workflowsStore, 'getWorkflowRunById');
+    const persist = vi.spyOn(workflowsStore, 'persistWorkflowSnapshot');
+
+    await expect(workflow.createRun({ [TRANSIENT_EXECUTION_SYMBOL]: true })).rejects.toThrow(
+      'Evented workflows cannot run inside transient workflows',
+    );
+    expect(lookup).not.toHaveBeenCalled();
+    expect(persist).not.toHaveBeenCalled();
+  });
+
   it('skips lifecycle reads for a built-in generated run ID', async () => {
     const workflow = buildExplicitlyTransientWorkflow('explicit-transient-generated');
     const storage = new MockStore();
@@ -122,6 +151,47 @@ describe('explicitly transient workflow lifecycle reads', () => {
     expect(run.transientExecution).toBe(true);
     expect(read).not.toHaveBeenCalled();
     expect(persist).not.toHaveBeenCalled();
+  });
+
+  it('preserves a completed transient run status when cancel is called later', async () => {
+    const workflow = buildExplicitlyTransientWorkflow('explicit-transient-cancel-after-success');
+    const storage = new MockStore();
+    new Mastra({ logger: false, storage, workflows: { [workflow.id]: workflow } });
+    const workflowsStore = (await storage.getStore('workflows'))!;
+    const read = vi.spyOn(workflowsStore, 'loadWorkflowSnapshot');
+    const update = vi.spyOn(workflowsStore, 'updateWorkflowState');
+
+    const run = await workflow.createRun();
+    const lifecycleEvents: string[] = [];
+    const unwatch = run.watch(event => lifecycleEvents.push(event.type));
+    await expect(run.start({ inputData: { value: 'complete' } })).resolves.toMatchObject({ status: 'success' });
+    const eventsAfterCompletion = [...lifecycleEvents];
+    await run.cancel();
+    unwatch();
+
+    expect(run.workflowRunStatus).toBe('success');
+    expect(lifecycleEvents).toEqual(eventsAfterCompletion);
+    expect(read).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  it('rejects reusing an in-memory run ID with a different execution mode', async () => {
+    const workflow = buildExplicitlyTransientWorkflow('explicit-transient-mode-reuse');
+    const storage = new MockStore();
+    new Mastra({ logger: false, storage, workflows: { [workflow.id]: workflow } });
+    const workflowsStore = (await storage.getStore('workflows'))!;
+    const lookup = vi.spyOn(workflowsStore, 'getWorkflowRunById');
+
+    const transientRun = await workflow.createRun();
+    await expect(workflow.createRun({ runId: transientRun.runId })).rejects.toThrow(
+      `Workflow run ${workflow.id}/${transientRun.runId} cannot change execution mode`,
+    );
+
+    const durableRun = await workflow.createRun({ runId: 'durable-mode-reuse' });
+    await expect(workflow.createRun({ runId: durableRun.runId, [TRANSIENT_EXECUTION_SYMBOL]: true })).rejects.toThrow(
+      `Workflow run ${workflow.id}/${durableRun.runId} cannot change execution mode`,
+    );
+    expect(lookup).toHaveBeenCalledTimes(1);
   });
 
   it('propagates transient execution through parallel child contexts', async () => {
@@ -238,6 +308,7 @@ describe('explicitly transient workflow lifecycle reads', () => {
     new Mastra({ logger: false, storage, workflows: { [parent.id]: parent } });
     const workflowsStore = (await storage.getStore('workflows'))!;
     const read = vi.spyOn(workflowsStore, 'loadWorkflowSnapshot');
+    const lookup = vi.spyOn(workflowsStore, 'getWorkflowRunById');
     const persist = vi.spyOn(workflowsStore, 'persistWorkflowSnapshot');
     const remove = vi.spyOn(workflowsStore, 'deleteWorkflowRunById');
 
@@ -249,8 +320,68 @@ describe('explicitly transient workflow lifecycle reads', () => {
       error: expect.objectContaining({ message: 'Transient workflow runs cannot suspend' }),
     });
     expect(read).not.toHaveBeenCalled();
+    expect(lookup).not.toHaveBeenCalled();
     expect(persist).not.toHaveBeenCalled();
     expect(remove).not.toHaveBeenCalled();
+  });
+
+  it('honors a transient child nested under a durable parent', async () => {
+    const childStep = createStep({
+      id: 'nested-own-transient-step',
+      inputSchema: ioSchema,
+      outputSchema: ioSchema,
+      execute: async ({ inputData }) => inputData,
+    });
+    const child = createWorkflow({
+      id: 'nested-own-transient-child',
+      inputSchema: ioSchema,
+      outputSchema: ioSchema,
+      steps: [childStep],
+      options: { executionMode: 'transient' },
+    })
+      .then(childStep)
+      .commit();
+    const parent = createWorkflow({
+      id: 'durable-parent-with-transient-child',
+      inputSchema: ioSchema,
+      outputSchema: ioSchema,
+      steps: [child],
+    })
+      .then(child)
+      .commit();
+    const storage = new MockStore();
+    new Mastra({ logger: false, storage, workflows: { [parent.id]: parent } });
+    const workflowsStore = (await storage.getStore('workflows'))!;
+    const lookup = vi.spyOn(workflowsStore, 'getWorkflowRunById');
+    const persist = vi.spyOn(workflowsStore, 'persistWorkflowSnapshot');
+    const remove = vi.spyOn(workflowsStore, 'deleteWorkflowRunById');
+
+    const run = await parent.createRun();
+    await expect(run.start({ inputData: { value: 'nested' } })).resolves.toMatchObject({ status: 'success' });
+
+    expect(lookup.mock.calls.filter(([input]) => input.workflowName === child.id)).toEqual([]);
+    expect(persist.mock.calls.filter(([input]) => input.workflowName === child.id)).toEqual([]);
+    expect(remove.mock.calls.filter(([input]) => input.workflowName === child.id)).toEqual([]);
+  });
+
+  it('rejects per-step execution before a transient run can become unrecoverably paused', async () => {
+    const workflow = buildExplicitlyTransientWorkflow('explicit-transient-per-step');
+    const storage = new MockStore();
+    new Mastra({ logger: false, storage, workflows: { [workflow.id]: workflow } });
+    const workflowsStore = (await storage.getStore('workflows'))!;
+    const read = vi.spyOn(workflowsStore, 'loadWorkflowSnapshot');
+    const lookup = vi.spyOn(workflowsStore, 'getWorkflowRunById');
+    const persist = vi.spyOn(workflowsStore, 'persistWorkflowSnapshot');
+
+    const run = await workflow.createRun();
+
+    await expect(run.start({ inputData: { value: 'per-step' }, perStep: true })).rejects.toThrow(
+      'Transient workflow runs cannot use per-step execution',
+    );
+    expect(run.workflowRunStatus).toBe('pending');
+    expect(read).not.toHaveBeenCalled();
+    expect(lookup).not.toHaveBeenCalled();
+    expect(persist).not.toHaveBeenCalled();
   });
 
   it('rejects durable replay operations without reading storage', async () => {
@@ -285,6 +416,34 @@ describe('explicitly transient workflow lifecycle reads', () => {
 
     expect(run.transientExecution).toBe(false);
     expect(read).toHaveBeenCalled();
+    expect(persist).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps an explicit run ID durable when execute is called without a transient marker', async () => {
+    const workflow = buildExplicitlyTransientWorkflow('explicit-transient-direct-execute');
+    const storage = new MockStore();
+    const mastra = new Mastra({ logger: false, storage, workflows: { [workflow.id]: workflow } });
+    const workflowsStore = (await storage.getStore('workflows'))!;
+    const lookup = vi.spyOn(workflowsStore, 'getWorkflowRunById');
+    const persist = vi.spyOn(workflowsStore, 'persistWorkflowSnapshot');
+
+    await expect(
+      workflow.execute({
+        runId: 'direct-server-run-id',
+        inputData: { value: 'server' },
+        state: {},
+        setState: vi.fn(async () => undefined),
+        suspend: vi.fn(),
+        [PUBSUB_SYMBOL]: new EventEmitterPubSub(),
+        mastra,
+        abort: vi.fn(),
+        abortSignal: new AbortController().signal,
+        engine: 'default',
+        bail: vi.fn(),
+      }),
+    ).resolves.toEqual({ value: 'server' });
+
+    expect(lookup).toHaveBeenCalledWith({ runId: 'direct-server-run-id', workflowName: workflow.id });
     expect(persist).toHaveBeenCalledTimes(1);
   });
 

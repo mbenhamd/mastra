@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod/v4';
+import type { ProcessorWorkflow } from '../processors';
+import { getProcessorWorkflowPhases, setProcessorWorkflowPhases } from '../processors/is-processor-workflow';
 import { createWorkflow, createEventedWorkflow, cloneWorkflow } from './create';
 import { createStep, Workflow } from './workflow';
 
@@ -127,5 +129,20 @@ describe('cloneWorkflow', () => {
 
     expect(clone.options.executionMode).toBe('transient');
     expect(clone.options.shouldPersistSnapshot({ stepResults: {}, workflowStatus: 'success' })).toBe(true);
+  });
+
+  it('preserves declared processor phases on a cloned workflow', () => {
+    const original = createWorkflow({
+      id: 'processor-phase-original',
+      inputSchema: z.any(),
+      outputSchema: z.any(),
+    })
+      .then(noop as never)
+      .commit();
+    setProcessorWorkflowPhases(original as unknown as ProcessorWorkflow, ['outputResult']);
+
+    const clone = cloneWorkflow(original, { id: 'processor-phase-clone' });
+
+    expect(getProcessorWorkflowPhases(clone as unknown as ProcessorWorkflow)).toEqual(['outputResult']);
   });
 });

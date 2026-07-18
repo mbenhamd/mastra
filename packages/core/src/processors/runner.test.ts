@@ -3880,5 +3880,178 @@ describe('ProcessorRunner', () => {
       expect(createRun).toHaveBeenCalledTimes(1);
       expect(start.mock.calls[0]?.[0].inputData).toMatchObject({ phase: 'outputResult' });
     });
+
+    it('forwards workflow-returned messages to the next processor in a split chain', async () => {
+      const original = createMessage('original result', 'assistant');
+      const transformed = {
+        ...original,
+        content: { ...original.content, parts: [{ type: 'text' as const, text: 'workflow result' }] },
+      };
+      const start = vi.fn(async ({ inputData }: { inputData: Record<string, unknown> }) => ({
+        status: 'success',
+        result: { ...inputData, messages: [transformed] },
+        steps: {},
+      }));
+      const workflow = setProcessorWorkflowPhases(
+        {
+          id: 'transforming-result-workflow',
+          inputSchema: {},
+          outputSchema: {},
+          execute: () => undefined,
+          createRun: vi.fn(async () => ({ start })),
+        } as unknown as ProcessorWorkflow,
+        ['outputResult'],
+      );
+      const downstream = vi.fn(
+        async ({ messages }: Parameters<NonNullable<Processor['processOutputResult']>>[0]) => messages,
+      );
+      runner = new ProcessorRunner({
+        inputProcessors: [],
+        outputProcessors: [workflow, { id: 'downstream-result-processor', processOutputResult: downstream }],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+      messageList.add([original], 'response');
+
+      await runner.runOutputProcessors(messageList);
+
+      expect(downstream).toHaveBeenCalledTimes(1);
+      expect(downstream.mock.calls[0]?.[0].messages).toEqual([transformed]);
+      expect(messageList.get.response.db()).toEqual([transformed]);
+    });
+
+    it('preserves in-place message mutations when workflow output only passes through stale input', async () => {
+      const original = createMessage('sensitive result', 'assistant');
+      const redacted = {
+        ...original,
+        content: { ...original.content, parts: [{ type: 'text' as const, text: 'redacted result' }] },
+      };
+      const mutatingStep = createStep({
+        id: 'mutate-shared-message-list',
+        inputSchema: ProcessorStepSchema,
+        outputSchema: ProcessorStepSchema,
+        execute: async ({ inputData }) => {
+          inputData.messageList?.removeByIds([original.id]);
+          inputData.messageList?.add(redacted, 'response', { merge: false });
+          return inputData;
+        },
+      });
+      const workflow = setProcessorWorkflowPhases(
+        createWorkflow({
+          id: 'in-place-result-workflow',
+          inputSchema: ProcessorStepSchema,
+          outputSchema: ProcessorStepSchema,
+          options: { validateInputs: false },
+        })
+          .then(mutatingStep)
+          .commit() as unknown as ProcessorWorkflow,
+        ['outputResult'],
+      );
+      runner = new ProcessorRunner({
+        inputProcessors: [],
+        outputProcessors: [workflow],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+      messageList.add(original, 'response');
+
+      await runner.runOutputProcessors(messageList);
+
+      expect(messageList.get.response.db()).toEqual([redacted]);
+    });
+
+    it('passes reconciled input-step messages to the next split workflow', async () => {
+      const original = createMessage('sensitive input');
+      const redacted = {
+        ...original,
+        content: { ...original.content, parts: [{ type: 'text' as const, text: 'redacted input' }] },
+      };
+      const mutatingStep = createStep({
+        id: 'mutate-input-step-message-list',
+        inputSchema: ProcessorStepSchema,
+        outputSchema: ProcessorStepSchema,
+        execute: async ({ inputData }) => {
+          inputData.messageList?.removeByIds([original.id]);
+          inputData.messageList?.add(redacted, 'input', { merge: false });
+          return inputData;
+        },
+      });
+      const mutatingWorkflow = setProcessorWorkflowPhases(
+        createWorkflow({
+          id: 'in-place-input-step-workflow',
+          inputSchema: ProcessorStepSchema,
+          outputSchema: ProcessorStepSchema,
+          options: { validateInputs: false },
+        })
+          .then(mutatingStep)
+          .commit() as unknown as ProcessorWorkflow,
+        ['inputStep'],
+      );
+      const seenMessages = vi.fn();
+      const observingWorkflow = setProcessorWorkflowPhases(
+        {
+          id: 'observing-input-step-workflow',
+          inputSchema: {},
+          outputSchema: {},
+          execute: () => undefined,
+          createRun: vi.fn(async () => ({
+            start: async ({ inputData }: { inputData: Record<string, unknown> }) => {
+              seenMessages(inputData.messages);
+              return { status: 'success', result: inputData, steps: {} };
+            },
+          })),
+        } as unknown as ProcessorWorkflow,
+        ['inputStep'],
+      );
+      runner = new ProcessorRunner({
+        inputProcessors: [mutatingWorkflow, observingWorkflow],
+        outputProcessors: [],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+      messageList.add(original, 'input');
+
+      await runner.runProcessInputStep({
+        messageList,
+        stepNumber: 0,
+        steps: [],
+        model: {} as any,
+      });
+
+      expect(seenMessages).toHaveBeenCalledWith([redacted]);
+      expect(messageList.get.input.db()).toEqual([redacted]);
+    });
+
+    it('does not request transient execution for a workflow with an evented descendant', async () => {
+      const start = vi.fn(async ({ inputData }: { inputData: Record<string, unknown> }) => ({
+        status: 'success',
+        result: inputData,
+        steps: {},
+      }));
+      const createRun = vi.fn(async () => ({ start }));
+      const workflow = setProcessorWorkflowPhases(
+        {
+          id: 'default-wrapper-with-evented-child',
+          inputSchema: {},
+          outputSchema: {},
+          execute: () => undefined,
+          engineType: 'default',
+          steps: { child: { engineType: 'evented' } },
+          createRun,
+        } as unknown as ProcessorWorkflow,
+        ['input'],
+      );
+      runner = new ProcessorRunner({
+        inputProcessors: [workflow],
+        outputProcessors: [],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+      messageList.add(createMessage('input'), 'input');
+
+      await runner.runInputProcessors(messageList);
+
+      expect(createRun).toHaveBeenCalledWith();
+    });
   });
 });
