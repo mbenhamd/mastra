@@ -10,16 +10,33 @@
  */
 
 import { convertArrayToReadableStream, MockLanguageModelV2 } from '@internal/ai-sdk-v5/test';
-import { bench, describe } from 'vitest';
+import { afterAll, beforeAll, bench, describe } from 'vitest';
 
 import { Mastra } from '../mastra';
 import type { Processor } from '../processors';
 import { InMemoryStore } from '../storage';
+import { Workflow } from '../workflows/workflow';
 
 import { Agent } from './agent';
 
 const partCounts = [1, 10, 100, 500, 2_000] as const;
 const bounded = { time: 0, iterations: 1, warmupIterations: 0, warmupTime: 0 } as const;
+const workflowAdmissions = new Map<string, number>();
+const originalCreateRun = (Workflow.prototype as unknown as { createRun: (...args: unknown[]) => unknown }).createRun;
+
+beforeAll(() => {
+  (Workflow.prototype as unknown as { createRun: (...args: unknown[]) => unknown }).createRun = function (
+    this: Workflow,
+    ...args: unknown[]
+  ) {
+    workflowAdmissions.set(this.id, (workflowAdmissions.get(this.id) ?? 0) + 1);
+    return originalCreateRun.apply(this, args);
+  };
+});
+
+afterAll(() => {
+  (Workflow.prototype as unknown as { createRun: (...args: unknown[]) => unknown }).createRun = originalCreateRun;
+});
 
 function createModel(textDeltaCount: number) {
   return new MockLanguageModelV2({
@@ -72,6 +89,7 @@ function createScenario(textDeltaCount: number) {
   return async () => {
     await instrumentation;
     const readsBefore = processorWorkflowStorageReads;
+    const admissionsBefore = workflowAdmissions.get(processorWorkflowId) ?? 0;
     const stream = await mastra.getAgent(agentId).stream('go');
     for await (const _part of stream.fullStream) {
       // Consume the complete turn inside the measured benchmark callback.
@@ -80,11 +98,19 @@ function createScenario(textDeltaCount: number) {
     if (reads !== 0) {
       throw new Error(`Expected 0 processor workflow storage reads for ${textDeltaCount} parts, received ${reads}`);
     }
+    const admissions = (workflowAdmissions.get(processorWorkflowId) ?? 0) - admissionsBefore;
+    if (admissions !== 1) {
+      throw new Error(`Expected 1 final-phase workflow admission for ${textDeltaCount} parts, received ${admissions}`);
+    }
   };
 }
 
 describe('result-only processor stream scaling', () => {
   for (const partCount of partCounts) {
-    bench(`${partCount} text deltas / 0 processor workflow storage reads`, createScenario(partCount), bounded);
+    bench(
+      `${partCount} text deltas / 1 workflow admission / 0 processor workflow storage reads`,
+      createScenario(partCount),
+      bounded,
+    );
   }
 });

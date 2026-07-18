@@ -30,7 +30,7 @@ function defineCreateRunStorageReadTests(
       .commit();
 
   describe(`${engine} createRun storage existence read`, () => {
-    it('skips a guaranteed-miss read for a generated transient run', async () => {
+    it('skips a guaranteed-miss read for a generated non-persisting run', async () => {
       const storage = new MockStore();
       const workflow = buildWorkflow(`${engine}-transient-generated`, false);
       new Mastra({ logger: false, storage, workflows: { [workflow.id]: workflow } });
@@ -56,7 +56,7 @@ function defineCreateRunStorageReadTests(
       expect(read).toHaveBeenCalledTimes(1);
     });
 
-    it('still reads storage when a transient workflow receives an explicit runId', async () => {
+    it('still reads storage when a non-persisting workflow receives an explicit runId', async () => {
       const storage = new MockStore();
       const workflow = buildWorkflow(`${engine}-transient-explicit`, false);
       new Mastra({ logger: false, storage, workflows: { [workflow.id]: workflow } });
@@ -91,6 +91,22 @@ function buildExplicitlyTransientWorkflow(id: string) {
     .commit();
 }
 
+function createApprovalStep(id: string) {
+  return createStep({
+    id,
+    inputSchema: ioSchema,
+    outputSchema: ioSchema,
+    suspendSchema: z.object({ waiting: z.boolean() }),
+    resumeSchema: z.object({ approved: z.boolean() }),
+    execute: async ({ inputData, resumeData, suspend }) => {
+      if (!resumeData?.approved) {
+        await suspend({ waiting: true });
+      }
+      return inputData;
+    },
+  });
+}
+
 describe('explicitly transient workflow lifecycle reads', () => {
   it('skips lifecycle reads for a built-in generated run ID', async () => {
     const workflow = buildExplicitlyTransientWorkflow('explicit-transient-generated');
@@ -98,12 +114,14 @@ describe('explicitly transient workflow lifecycle reads', () => {
     new Mastra({ logger: false, storage, workflows: { [workflow.id]: workflow } });
     const workflowsStore = (await storage.getStore('workflows'))!;
     const read = vi.spyOn(workflowsStore, 'loadWorkflowSnapshot');
+    const persist = vi.spyOn(workflowsStore, 'persistWorkflowSnapshot');
 
     const run = await workflow.createRun();
     await run.start({ inputData: { value: 'generated' } });
 
     expect(run.transientExecution).toBe(true);
     expect(read).not.toHaveBeenCalled();
+    expect(persist).not.toHaveBeenCalled();
   });
 
   it('propagates transient execution through parallel child contexts', async () => {
@@ -139,20 +157,100 @@ describe('explicitly transient workflow lifecycle reads', () => {
     expect(read).not.toHaveBeenCalled();
   });
 
-  it('cancels a transient run without creating durable state', async () => {
+  it('cancels a transient run without creating durable state or allowing a later start', async () => {
     const workflow = buildExplicitlyTransientWorkflow('explicit-transient-cancel');
     const storage = new MockStore();
     new Mastra({ logger: false, storage, workflows: { [workflow.id]: workflow } });
     const workflowsStore = (await storage.getStore('workflows'))!;
     const read = vi.spyOn(workflowsStore, 'loadWorkflowSnapshot');
     const update = vi.spyOn(workflowsStore, 'updateWorkflowState');
+    const persist = vi.spyOn(workflowsStore, 'persistWorkflowSnapshot');
 
     const run = await workflow.createRun();
     await run.cancel();
 
     expect(run.workflowRunStatus).toBe('canceled');
+    await expect(run.start({ inputData: { value: 'must-not-run' } })).rejects.toThrow(
+      'lifecycle execution admission is stale',
+    );
+    expect(run.workflowRunStatus).toBe('canceled');
     expect(read).not.toHaveBeenCalled();
     expect(update).not.toHaveBeenCalled();
+    expect(persist).not.toHaveBeenCalled();
+  });
+
+  it('fails a transient suspension attempt without creating durable state', async () => {
+    const approval = createApprovalStep('transient-approval');
+    const workflow = createWorkflow({
+      id: 'explicit-transient-suspend',
+      inputSchema: ioSchema,
+      outputSchema: ioSchema,
+      steps: [approval],
+      options: { executionMode: 'transient' },
+    })
+      .then(approval)
+      .commit();
+    const storage = new MockStore();
+    new Mastra({ logger: false, storage, workflows: { [workflow.id]: workflow } });
+    const workflowsStore = (await storage.getStore('workflows'))!;
+    const read = vi.spyOn(workflowsStore, 'loadWorkflowSnapshot');
+    const persist = vi.spyOn(workflowsStore, 'persistWorkflowSnapshot');
+
+    const run = await workflow.createRun();
+    const result = await run.start({ inputData: { value: 'suspend' } });
+
+    expect(result).toMatchObject({
+      status: 'failed',
+      error: expect.objectContaining({ message: 'Transient workflow runs cannot suspend' }),
+    });
+    expect(read).not.toHaveBeenCalled();
+    expect(persist).not.toHaveBeenCalled();
+  });
+
+  it('propagates transient execution into nested workflows without storage cleanup calls', async () => {
+    const childStep = createStep({
+      id: 'nested-transient-suspend-step',
+      inputSchema: ioSchema,
+      outputSchema: ioSchema,
+      execute: async ({ inputData, suspend }) => {
+        await suspend();
+        return inputData;
+      },
+    });
+    const child = createWorkflow({
+      id: 'nested-transient-child',
+      inputSchema: ioSchema,
+      outputSchema: ioSchema,
+      steps: [childStep],
+    })
+      .then(childStep)
+      .commit();
+    const parent = createWorkflow({
+      id: 'nested-transient-parent',
+      inputSchema: ioSchema,
+      outputSchema: ioSchema,
+      steps: [child],
+      options: { executionMode: 'transient' },
+    })
+      .then(child)
+      .commit();
+    const storage = new MockStore();
+    new Mastra({ logger: false, storage, workflows: { [parent.id]: parent } });
+    const workflowsStore = (await storage.getStore('workflows'))!;
+    const read = vi.spyOn(workflowsStore, 'loadWorkflowSnapshot');
+    const persist = vi.spyOn(workflowsStore, 'persistWorkflowSnapshot');
+    const remove = vi.spyOn(workflowsStore, 'deleteWorkflowRunById');
+
+    const run = await parent.createRun();
+    const result = await run.start({ inputData: { value: 'nested-suspend' } });
+
+    expect(result).toMatchObject({
+      status: 'failed',
+      error: expect.objectContaining({ message: 'Transient workflow runs cannot suspend' }),
+    });
+    expect(read).not.toHaveBeenCalled();
+    expect(persist).not.toHaveBeenCalled();
+    expect(remove).not.toHaveBeenCalled();
   });
 
   it('rejects durable replay operations without reading storage', async () => {
@@ -180,12 +278,14 @@ describe('explicitly transient workflow lifecycle reads', () => {
     new Mastra({ logger: false, storage, workflows: { [workflow.id]: workflow } });
     const workflowsStore = (await storage.getStore('workflows'))!;
     const read = vi.spyOn(workflowsStore, 'loadWorkflowSnapshot');
+    const persist = vi.spyOn(workflowsStore, 'persistWorkflowSnapshot');
 
     const run = await workflow.createRun({ runId: 'caller-owned-run-id' });
     await run.start({ inputData: { value: 'explicit' } });
 
     expect(run.transientExecution).toBe(false);
     expect(read).toHaveBeenCalled();
+    expect(persist).toHaveBeenCalledTimes(1);
   });
 
   it('retains lifecycle reads for a custom-generated run ID', async () => {
@@ -199,12 +299,52 @@ describe('explicitly transient workflow lifecycle reads', () => {
     });
     const workflowsStore = (await storage.getStore('workflows'))!;
     const read = vi.spyOn(workflowsStore, 'loadWorkflowSnapshot');
+    const persist = vi.spyOn(workflowsStore, 'persistWorkflowSnapshot');
 
     const run = await workflow.createRun();
     await run.start({ inputData: { value: 'custom' } });
 
     expect(run.transientExecution).toBe(false);
     expect(read).toHaveBeenCalled();
+    expect(persist).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves durable cancellation for an explicit run ID', async () => {
+    const workflow = buildExplicitlyTransientWorkflow('explicit-transient-durable-cancel');
+    const storage = new MockStore();
+    new Mastra({ logger: false, storage, workflows: { [workflow.id]: workflow } });
+    const workflowsStore = (await storage.getStore('workflows'))!;
+    const update = vi.spyOn(workflowsStore, 'updateWorkflowState');
+
+    const run = await workflow.createRun({ runId: 'durable-cancel-run-id' });
+    await run.cancel();
+
+    expect(run.transientExecution).toBe(false);
+    expect(run.workflowRunStatus).toBe('canceled');
+    expect(update).toHaveBeenCalled();
+  });
+
+  it('preserves durable suspend and resume for an explicit run ID', async () => {
+    const approval = createApprovalStep('approval');
+    const workflow = createWorkflow({
+      id: 'explicit-transient-durable-resume',
+      inputSchema: ioSchema,
+      outputSchema: ioSchema,
+      steps: [approval],
+      options: { executionMode: 'transient' },
+    })
+      .then(approval)
+      .commit();
+    const storage = new MockStore();
+    new Mastra({ logger: false, storage, workflows: { [workflow.id]: workflow } });
+
+    const run = await workflow.createRun({ runId: 'durable-resume-run-id' });
+    await expect(run.start({ inputData: { value: 'resume' } })).resolves.toMatchObject({ status: 'suspended' });
+    await expect(run.resume({ step: 'approval', resumeData: { approved: true } })).resolves.toMatchObject({
+      status: 'success',
+    });
+
+    expect(run.transientExecution).toBe(false);
   });
 });
 
@@ -216,7 +356,7 @@ function defineCustomIdGeneratorCollisionTest(
     it('retains the storage read and synchronizes status for a deterministic generated ID', async () => {
       const runId = 'deterministic-run-id';
       const workflow = workflowFactory({
-        id: `${engine}-transient-deterministic`,
+        id: `${engine}-non-persisting-deterministic`,
         inputSchema: ioSchema,
         outputSchema: ioSchema,
         options: { shouldPersistSnapshot: () => false },

@@ -15,7 +15,7 @@ import type { ObservabilityContext, Span } from '../../observability';
 import { executeWithContext } from '../../observability/utils';
 import { ToolStream } from '../../tools/stream';
 import type { DynamicArgument } from '../../types';
-import { PUBSUB_SYMBOL, STREAM_FORMAT_SYMBOL } from '../constants';
+import { PUBSUB_SYMBOL, STREAM_FORMAT_SYMBOL, TRANSIENT_EXECUTION_SYMBOL } from '../constants';
 import type { DefaultExecutionEngine } from '../default';
 import {
   getOrCreateWorkflowStepLifecycleState,
@@ -460,6 +460,9 @@ export async function executeStep(
         getInitData: () => stepResults?.input as any,
         getStepResult: getStepResult.bind(null, stepResults),
         suspend: async (suspendPayload?: any, suspendOptions?: SuspendOptions): Promise<void> => {
+          if (executionContext.transientExecution) {
+            throw new Error('Transient workflow runs cannot suspend');
+          }
           const { suspendData, validationError: suspendValidationError } = await validateStepSuspendData({
             suspendData: suspendPayload,
             step,
@@ -523,6 +526,7 @@ export async function executeStep(
             : undefined,
         [PUBSUB_SYMBOL]: pubsub,
         [STREAM_FORMAT_SYMBOL]: executionContext.format,
+        [TRANSIENT_EXECUTION_SYMBOL]: executionContext.transientExecution,
         engine: engine.getEngineContext(),
         abortSignal: abortController?.signal,
         writer: new ToolStream(

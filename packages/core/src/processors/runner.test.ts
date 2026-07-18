@@ -8,6 +8,7 @@ import { RequestContext } from '../request-context';
 import type { ChunkType } from '../stream';
 import { ChunkFrom } from '../stream/types';
 import { createStep, createWorkflow } from '../workflows';
+import { setProcessorWorkflowPhases } from './is-processor-workflow';
 import { ProcessorRunner } from './runner';
 import { ProcessorStepSchema } from './step-schema';
 import type { Processor, ProcessorWorkflow } from './index';
@@ -626,6 +627,28 @@ describe('ProcessorRunner', () => {
         .map(part => (part as TextPart).text);
 
       expect(assistantTexts).toEqual(['initial response', 'message from processor 1', 'message from processor 3']);
+    });
+
+    it('ignores unsupported output-result return shapes while preserving in-place mutations', async () => {
+      runner = new ProcessorRunner({
+        inputProcessors: [],
+        outputProcessors: [
+          {
+            id: 'in-place-output-processor',
+            processOutputResult: async ({ messageList: receivedMessageList }) => {
+              receivedMessageList.addSystem('in-place result');
+              return { unsupported: true } as never;
+            },
+          },
+        ],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+      messageList.add([createMessage('initial response', 'assistant')], 'response');
+
+      await expect(runner.runOutputProcessors(messageList)).resolves.toBe(messageList);
+
+      expect(messageList.getSystemMessages().map(message => message.content)).toEqual(['in-place result']);
     });
   });
 
@@ -1808,6 +1831,35 @@ describe('ProcessorRunner', () => {
       });
 
       expect(executionOrder).toEqual(['processor1', 'processor2']);
+    });
+
+    it('ignores unsupported output-step return shapes while preserving in-place mutations', async () => {
+      runner = new ProcessorRunner({
+        inputProcessors: [],
+        outputProcessors: [
+          {
+            id: 'in-place-output-step-processor',
+            processOutputStep: async ({ messageList: receivedMessageList }) => {
+              receivedMessageList.addSystem('in-place step');
+              return { unsupported: true } as never;
+            },
+          },
+        ],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+      messageList.add([createMessage('initial', 'assistant')], 'response');
+
+      await expect(
+        runner.runProcessOutputStep({
+          steps: [],
+          messages: messageList.get.all.db(),
+          messageList,
+          stepNumber: 0,
+        }),
+      ).resolves.toBe(messageList);
+
+      expect(messageList.getSystemMessages().map(message => message.content)).toEqual(['in-place step']);
     });
 
     it('should receive step context in processOutputStep', async () => {
@@ -3750,6 +3802,83 @@ describe('ProcessorRunner', () => {
       expect(receivedSendSignal).toHaveBeenCalledWith(expect.any(Function));
       expect(messageList.get.all.db().at(-1)?.role).toBe('signal');
       expect(chunks).toEqual([expect.objectContaining({ type: 'data-signal' })]);
+    });
+
+    it('retains skipped data parts in direct processor stream history', async () => {
+      const seenStreamParts: ChunkType[][] = [];
+      const processorStates = new Map();
+      runner = new ProcessorRunner({
+        inputProcessors: [],
+        outputProcessors: [
+          {
+            id: 'regular-stream-processor',
+            processOutputStream: async ({ part, streamParts }) => {
+              seenStreamParts.push([...streamParts]);
+              return part;
+            },
+          },
+        ],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+
+      await runner.processPart(
+        { type: 'data-custom', data: { value: 1 } } as ChunkType,
+        processorStates,
+        undefined,
+        undefined,
+        messageList,
+      );
+      await runner.processPart(
+        { type: 'text-delta', payload: { text: 'visible', id: 'text-1' }, runId: '1', from: ChunkFrom.AGENT },
+        processorStates,
+        undefined,
+        undefined,
+        messageList,
+      );
+
+      expect(seenStreamParts).toHaveLength(1);
+      expect(seenStreamParts[0]?.map(part => part.type)).toEqual(['data-custom', 'text-delta']);
+    });
+
+    it('honors declared phases for custom processor workflows', async () => {
+      const start = vi.fn(async ({ inputData }: { inputData: Record<string, unknown> }) => ({
+        status: 'success',
+        result: inputData,
+        steps: {},
+      }));
+      const createRun = vi.fn(async () => ({ start }));
+      const workflow = setProcessorWorkflowPhases(
+        {
+          id: 'custom-result-only-workflow',
+          inputSchema: {},
+          outputSchema: {},
+          execute: () => undefined,
+          createRun,
+        } as unknown as ProcessorWorkflow,
+        ['outputResult'],
+      );
+      runner = new ProcessorRunner({
+        inputProcessors: [],
+        outputProcessors: [workflow],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+
+      await runner.processPart(
+        { type: 'text-delta', payload: { text: 'skip', id: 'text-1' }, runId: '1', from: ChunkFrom.AGENT },
+        new Map(),
+        undefined,
+        undefined,
+        messageList,
+      );
+      expect(createRun).not.toHaveBeenCalled();
+
+      messageList.add([createMessage('final result', 'assistant')], 'response');
+      await runner.runOutputProcessors(messageList);
+
+      expect(createRun).toHaveBeenCalledTimes(1);
+      expect(start.mock.calls[0]?.[0].inputData).toMatchObject({ phase: 'outputResult' });
     });
   });
 });

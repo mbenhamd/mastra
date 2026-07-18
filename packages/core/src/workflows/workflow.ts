@@ -53,7 +53,12 @@ import { ChunkFrom } from '../stream/types';
 import { Tool } from '../tools/tool';
 import type { ToolExecutionContext } from '../tools/types';
 import type { DynamicArgument } from '../types';
-import { PUBSUB_SYMBOL, STREAM_FORMAT_SYMBOL } from './constants';
+import {
+  PROCESSOR_EXECUTION_SYMBOL,
+  PUBSUB_SYMBOL,
+  STREAM_FORMAT_SYMBOL,
+  TRANSIENT_EXECUTION_SYMBOL,
+} from './constants';
 import { DefaultExecutionEngine } from './default';
 import type { ExecutionEngine, ExecutionGraph } from './execution-engine';
 import {
@@ -1682,12 +1687,11 @@ export class Workflow<
       executionMode: options.executionMode ?? 'durable',
       // Processor workflows carry live process-local values such as MessageList,
       // AbortSignal, and processor-state Maps. They are transient and cannot be
-      // resumed safely from a JSON snapshot. Explicit transient mode makes that
-      // invariant part of the workflow contract.
-      shouldPersistSnapshot:
-        options.executionMode === 'transient'
-          ? () => false
-          : (options.shouldPersistSnapshot ?? (this.type === 'processor' ? () => false : () => true)),
+      // resumed safely from a JSON snapshot unless a caller explicitly supplies
+      // a different persistence policy. Transient execution is decided per run
+      // in createRun(), so explicit and custom-generated IDs can fall back to
+      // this configured policy.
+      shouldPersistSnapshot: options.shouldPersistSnapshot ?? (this.type === 'processor' ? () => false : () => true),
       pruneSnapshot: options.pruneSnapshot,
       tracingPolicy: options.tracingPolicy,
       onFinish: options.onFinish,
@@ -2408,6 +2412,10 @@ export class Workflow<
     disableScorers?: boolean;
     /** Optional pubsub instance for streaming events. If not provided, a new EventEmitterPubSub is created. */
     pubsub?: PubSub;
+    /** @internal Execute a top-level processor workflow process-locally when its run ID is built in. */
+    [PROCESSOR_EXECUTION_SYMBOL]?: boolean;
+    /** @internal Inherit process-local execution from a transient parent workflow. */
+    [TRANSIENT_EXECUTION_SYMBOL]?: boolean;
   }): Promise<RunWithRawInput<TEngineType, TSteps, TState, TInput, TOutput, TRequestContext, TRawInput>> {
     if (this.stepFlow.length === 0) {
       throw new Error(
@@ -2428,7 +2436,10 @@ export class Workflow<
       randomUUID();
     const usesCustomGeneratedRunId = !options?.runId && Boolean(this.#mastra?.getIdGenerator());
     const transientExecution =
-      this.#options.executionMode === 'transient' && !options?.runId && !usesCustomGeneratedRunId;
+      options?.[TRANSIENT_EXECUTION_SYMBOL] ??
+      ((this.#options.executionMode === 'transient' || options?.[PROCESSOR_EXECUTION_SYMBOL] === true) &&
+        !options?.runId &&
+        !usesCustomGeneratedRunId);
 
     // Return a new Run instance with object parameters
     const run =
@@ -2457,10 +2468,12 @@ export class Workflow<
 
     this.#runs.set(runIdToUse, run);
 
-    const shouldPersistSnapshot = this.#options.shouldPersistSnapshot({
-      workflowStatus: run.workflowRunStatus,
-      stepResults: {},
-    });
+    const shouldPersistSnapshot =
+      !transientExecution &&
+      this.#options.shouldPersistSnapshot({
+        workflowStatus: run.workflowRunStatus,
+        stepResults: {},
+      });
     const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
 
     // A freshly-minted run for a workflow that never persists a snapshot (e.g. the
@@ -2576,6 +2589,7 @@ export class Workflow<
     resume,
     timeTravel,
     [PUBSUB_SYMBOL]: pubsub,
+    [TRANSIENT_EXECUTION_SYMBOL]: inheritedTransientExecution,
     mastra,
     requestContext,
     abort,
@@ -2611,6 +2625,7 @@ export class Workflow<
       forEachIndex?: number;
     };
     [PUBSUB_SYMBOL]: PubSub;
+    [TRANSIENT_EXECUTION_SYMBOL]?: boolean;
     mastra: Mastra;
     requestContext?: RequestContext<TRequestContext>;
     engine: DefaultEngineType;
@@ -2688,8 +2703,18 @@ export class Workflow<
     // forever because parent and child intentionally share the same run id.
     const nestedPubsub = useSharedPubsub ? pubsub : new EventEmitterPubSub();
     let run = isResume
-      ? await this.createRun({ runId: resume.runId, resourceId, pubsub: nestedPubsub })
-      : await this.createRun({ runId, resourceId, pubsub: nestedPubsub });
+      ? await this.createRun({
+          runId: resume.runId,
+          resourceId,
+          pubsub: nestedPubsub,
+          [TRANSIENT_EXECUTION_SYMBOL]: inheritedTransientExecution,
+        })
+      : await this.createRun({
+          runId,
+          resourceId,
+          pubsub: nestedPubsub,
+          [TRANSIENT_EXECUTION_SYMBOL]: inheritedTransientExecution,
+        });
     const existingNestedRunIsTerminal =
       run.workflowRunStatus === 'success' ||
       run.workflowRunStatus === 'failed' ||
@@ -2703,7 +2728,12 @@ export class Workflow<
       // invocation; otherwise lifecycle admission correctly rejects the stale
       // terminal generation loaded by createRun().
       await this.deleteWorkflowRunById(run.runId);
-      run = await this.createRun({ runId: run.runId, resourceId, pubsub: nestedPubsub });
+      run = await this.createRun({
+        runId: run.runId,
+        resourceId,
+        pubsub: nestedPubsub,
+        [TRANSIENT_EXECUTION_SYMBOL]: inheritedTransientExecution,
+      });
     }
     const nestedAbortCb = () => {
       abort();
@@ -2795,7 +2825,9 @@ export class Workflow<
     // This also keeps the in-memory run map from reusing a terminal handle for
     // the next logical nested invocation.
     const terminalStatus = res.status === 'success' || res.status === 'failed' || res.status === 'tripwire';
-    if (
+    if (terminalStatus && run.transientExecution) {
+      this.#runs.delete(run.runId);
+    } else if (
       terminalStatus &&
       !this.#options.shouldPersistSnapshot({ workflowStatus: res.status, stepResults: res.steps })
     ) {
@@ -3237,7 +3269,7 @@ export class Run<
 
   readonly workflowEngineType: WorkflowEngineType;
 
-  /** True only for an explicit transient workflow using Mastra's built-in generated run ID. */
+  /** @internal True when a transient-mode workflow uses Mastra's built-in generated run ID. */
   readonly transientExecution: boolean;
 
   /**
@@ -3484,7 +3516,12 @@ export class Run<
     lifecycleResumeAttempt: number;
     lifecycleStepStates: WorkflowStepLifecycleStateMap;
   }): Promise<void> {
-    if (this.transientExecution) return;
+    if (this.transientExecution) {
+      if (this.workflowRunStatus !== 'pending') {
+        throw new Error(`Workflow run ${this.workflowId}/${this.runId} lifecycle execution admission is stale`);
+      }
+      return;
+    }
     const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
     const snapshot = await workflowsStore?.loadWorkflowSnapshot({
       workflowName: this.workflowId,

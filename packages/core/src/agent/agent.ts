@@ -71,7 +71,13 @@ import type {
   ProcessorWorkflowPhase,
   Processor,
 } from '../processors/index';
-import { ProcessorStepSchema, getProcessorWorkflowPhases, isProcessorWorkflow } from '../processors/index';
+import {
+  ProcessorStepSchema,
+  getProcessorWorkflowPhases,
+  isProcessorWorkflow,
+  processorWorkflowHasPhaseRestrictions,
+  setProcessorWorkflowPhases,
+} from '../processors/index';
 import { SkillsProcessor } from '../processors/processors/skills';
 import { WorkspaceInstructionsProcessor } from '../processors/processors/workspace-instructions';
 import type { ProcessorState } from '../processors/runner';
@@ -1710,6 +1716,24 @@ export class Agent<
       return [];
     }
 
+    // A phase-restricted custom workflow must remain a top-level processor.
+    // Nesting it in a synthetic workflow whose capabilities are the union of
+    // the whole chain would execute the nested workflow during phases it
+    // explicitly excluded. ProcessorRunner preserves order while applying the
+    // phase guard to each returned item.
+    if (
+      validProcessors.some(
+        processor => isProcessorWorkflow(processor) && processorWorkflowHasPhaseRestrictions(processor),
+      )
+    ) {
+      for (const processor of validProcessors) {
+        if (isProcessorWorkflow(processor) && !processor.type) {
+          processor.type = 'processor';
+        }
+      }
+      return validProcessors as T[];
+    }
+
     // A single processor already has direct phase dispatch, shared state, tracing,
     // and tripwire handling in ProcessorRunner. Wrapping it adds workflow lifecycle
     // work without adding ordering or composition semantics.
@@ -1784,8 +1808,8 @@ export class Agent<
     // Register the parent Mastra instance so this internal workflow receives
     // the configured ID generator and runtime context. Fresh built-in run IDs
     // skip the guaranteed-miss storage lookup; explicit or custom-generated
-    // IDs still use the registered storage for collision/status checks. With
-    // transient execution above, processor runs are never written.
+    // IDs still use the registered storage for collision/status checks. The
+    // processor workflow's snapshot policy keeps its live values process-local.
     if (this.#mastra && isProcessorWorkflow(committedWorkflow)) {
       committedWorkflow.__registerMastra(this.#mastra);
     }
@@ -1793,7 +1817,7 @@ export class Agent<
       committedWorkflow.__stateSignalProcessors = stateSignalProcessors;
     }
     if (isProcessorWorkflow(committedWorkflow)) {
-      committedWorkflow.__processorPhases = [...processorPhases];
+      setProcessorWorkflowPhases(committedWorkflow, [...processorPhases]);
     }
 
     // The resulting workflow is compatible with both Input and Output processor types.

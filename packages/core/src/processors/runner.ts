@@ -20,6 +20,7 @@ import type { RequestContext } from '../request-context';
 import type { ChunkType } from '../stream';
 import type { MastraModelOutput } from '../stream/base/output';
 import type { LanguageModelUsage, ProviderMetadata } from '../stream/types';
+import { PROCESSOR_EXECUTION_SYMBOL } from '../workflows/constants';
 import { isProcessorWorkflow, processorWorkflowSupportsPhase } from './is-processor-workflow';
 import { createProcessorSendSignal } from './send-signal';
 import {
@@ -509,7 +510,11 @@ export class ProcessorRunner {
     abortSignal?: AbortSignal,
   ): Promise<ProcessorStepOutput> {
     // Create a run and start the workflow
-    const run = await workflow.createRun();
+    // Processor inputs contain process-local objects (MessageList, AbortSignal,
+    // state Maps) and have no resume surface. Run custom workflows transiently
+    // too, while createRun retains collision handling for caller-owned or
+    // custom-generated IDs.
+    const run = await workflow.createRun({ [PROCESSOR_EXECUTION_SYMBOL]: true });
     const result = await run.start({
       // Cast to allow processorStates/abortSignal - passed through to workflow processor steps
       // but not part of the official ProcessorStepOutput schema
@@ -698,20 +703,22 @@ export class ProcessorRunner {
           if (mutations.length > 0) {
             processableMessages = processResult.get.response.db();
           }
-        } else {
-          if (processResult) {
-            const deletedIds = idsBeforeProcessing.filter(
-              (i: string) => !processResult.some((m: MastraDBMessage) => m.id === i),
-            );
-            if (deletedIds.length) {
-              messageList.removeByIds(deletedIds);
-            }
-            processableMessages = processResult || [];
-            for (const message of processResult) {
-              messageList.removeByIds([message.id]);
-              messageList.add(message, check.getSource(message) || 'response', { merge: false });
-            }
+        } else if (Array.isArray(processResult)) {
+          const deletedIds = idsBeforeProcessing.filter(
+            (i: string) => !processResult.some((m: MastraDBMessage) => m.id === i),
+          );
+          if (deletedIds.length) {
+            messageList.removeByIds(deletedIds);
           }
+          processableMessages = processResult;
+          for (const message of processResult) {
+            messageList.removeByIds([message.id]);
+            messageList.add(message, check.getSource(message) || 'response', { merge: false });
+          }
+        } else if (mutations.length > 0) {
+          // Match the workflow adapter: unsupported return shapes do not replace
+          // messages, but in-place MessageList mutations remain authoritative.
+          processableMessages = messageList.get.response.db();
         }
 
         processorSpan?.end({
@@ -835,8 +842,6 @@ export class ProcessorRunner {
         const processor = processorOrWorkflow;
         try {
           if (processor.processOutputStream && processedPart) {
-            if (processedPart.type.startsWith('data-') && !processor.processDataParts) continue;
-
             // Get or create state for this processor
             let state = processorStates.get(processor.id);
             if (!state) {
@@ -851,6 +856,13 @@ export class ProcessorRunner {
 
             // Track input chunk (before processor transformation)
             state.addInputPart(processedPart);
+
+            // Match the workflow adapter: data parts are part of stream history
+            // even when this processor has not opted in to transform them.
+            if (processedPart.type.startsWith('data-') && !processor.processDataParts) {
+              state.addOutputPart(processedPart);
+              continue;
+            }
 
             const result = await processor.processOutputStream({
               part: processedPart as ChunkType,
@@ -1980,7 +1992,7 @@ export class ProcessorRunner {
             });
           }
           // Processor returned the same messageList - mutations have been applied
-        } else if (result) {
+        } else if (Array.isArray(result)) {
           // Processor returned an array - apply changes to messageList
           const deletedIds = idsBeforeProcessing.filter(
             (i: string) => !result.some((m: MastraDBMessage) => m.id === i),

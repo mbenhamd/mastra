@@ -19,8 +19,11 @@
 import { convertArrayToReadableStream, MockLanguageModelV2 } from '@internal/ai-sdk-v5/test';
 import { describe, expect, it, vi } from 'vitest';
 import { Mastra } from '../../mastra';
+import { setProcessorWorkflowPhases } from '../../processors';
 import type { Processor } from '../../processors';
+import { ProcessorStepInputSchema, ProcessorStepOutputSchema } from '../../processors/step-schema';
 import { InMemoryStore } from '../../storage';
+import { createStep, createWorkflow } from '../../workflows';
 import { Workflow } from '../../workflows/workflow';
 import { Agent } from '../agent';
 
@@ -84,6 +87,19 @@ function buildAgentWithProcessor(idGenerator?: () => string) {
   return { mastra, storage };
 }
 
+function spyOnWorkflowAdmissions() {
+  const workflowIds: string[] = [];
+  const original = (Workflow.prototype as unknown as { createRun: (...args: unknown[]) => unknown }).createRun;
+  const spy = vi.spyOn(Workflow.prototype as unknown as Record<string, any>, 'createRun').mockImplementation(function (
+    this: any,
+    ...args: unknown[]
+  ) {
+    workflowIds.push(this.id);
+    return original.apply(this, args);
+  });
+  return { spy, workflowIds };
+}
+
 describe('agent processor-workflow storage noise (issue #17137 follow-up to #17344)', () => {
   it('does not admit a result-only output processor workflow for streamed parts', async () => {
     const storage = new InMemoryStore();
@@ -102,15 +118,21 @@ describe('agent processor-workflow storage noise (issue #17137 follow-up to #173
     });
     const workflowsStore = (await storage.getStore('workflows'))!;
     const read = vi.spyOn(workflowsStore, 'loadWorkflowSnapshot');
+    const admissions = spyOnWorkflowAdmissions();
 
-    const stream = await mastra.getAgent(AGENT_ID).stream('Hello!');
-    for await (const _part of stream.fullStream) {
-      // Consume the provider-free stream so output stream/result processors finish.
+    try {
+      const stream = await mastra.getAgent(AGENT_ID).stream('Hello!');
+      for await (const _part of stream.fullStream) {
+        // Consume the provider-free stream so output stream/result processors finish.
+      }
+    } finally {
+      admissions.spy.mockRestore();
     }
 
     const processorWorkflowReads = read.mock.calls.filter(
       ([input]) => input.workflowName === `${AGENT_ID}-output-processor`,
     );
+    expect(admissions.workflowIds.filter(id => id === `${AGENT_ID}-output-processor`)).toEqual([]);
     expect(processorWorkflowReads).toEqual([]);
     expect(processOutputResult).toHaveBeenCalledTimes(1);
   });
@@ -132,18 +154,72 @@ describe('agent processor-workflow storage noise (issue #17137 follow-up to #173
     const mastra = new Mastra({ agents: { [AGENT_ID]: agent }, storage, logger: false });
     const workflowsStore = (await storage.getStore('workflows'))!;
     const read = vi.spyOn(workflowsStore, 'loadWorkflowSnapshot');
+    const admissions = spyOnWorkflowAdmissions();
 
-    const stream = await mastra.getAgent(AGENT_ID).stream('Hello!');
-    for await (const _part of stream.fullStream) {
-      // Consume the provider-free stream so output stream/result processors finish.
+    try {
+      const stream = await mastra.getAgent(AGENT_ID).stream('Hello!');
+      for await (const _part of stream.fullStream) {
+        // Consume the provider-free stream so output stream/result processors finish.
+      }
+    } finally {
+      admissions.spy.mockRestore();
     }
 
     const processorWorkflowReads = read.mock.calls.filter(
       ([input]) => input.workflowName === `${AGENT_ID}-output-processor`,
     );
+    expect(admissions.workflowIds.filter(id => id === `${AGENT_ID}-output-processor`)).toEqual([
+      `${AGENT_ID}-output-processor`,
+    ]);
     expect(processorWorkflowReads).toEqual([]);
     expect(firstResult).toHaveBeenCalledTimes(1);
     expect(secondResult).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps a phase-restricted custom workflow outside a mixed synthetic chain', async () => {
+    const finalResult = vi.fn(async ({ messages }) => messages);
+    const resultWorkflow = setProcessorWorkflowPhases(
+      createWorkflow({
+        id: 'custom-result-only-workflow',
+        inputSchema: ProcessorStepInputSchema,
+        outputSchema: ProcessorStepOutputSchema,
+      })
+        .then(createStep({ id: 'custom-final-result', processOutputResult: finalResult }))
+        .commit(),
+      ['outputResult'],
+    );
+    const streamPart = vi.fn(async ({ part }) => part);
+    const streamProcessor: Processor = {
+      id: 'stream-processor',
+      processOutputStream: streamPart,
+    };
+    const agent = new Agent({
+      id: AGENT_ID,
+      name: AGENT_ID,
+      instructions: 'test',
+      model: createDummyModel(12),
+      outputProcessors: [resultWorkflow, streamProcessor],
+    });
+    const storage = new InMemoryStore();
+    const mastra = new Mastra({ agents: { [AGENT_ID]: agent }, storage, logger: false });
+    const workflowsStore = (await storage.getStore('workflows'))!;
+    const read = vi.spyOn(workflowsStore, 'loadWorkflowSnapshot');
+    const persist = vi.spyOn(workflowsStore, 'persistWorkflowSnapshot');
+    const createCustomRun = vi.spyOn(resultWorkflow, 'createRun');
+
+    const resolvedProcessors = await agent.listOutputProcessors();
+    expect(resolvedProcessors).toEqual([resultWorkflow, streamProcessor]);
+
+    const stream = await mastra.getAgent(AGENT_ID).stream('Hello!');
+    for await (const _part of stream.fullStream) {
+      // Consume all phases so an accidental nested admission is observable.
+    }
+
+    expect(streamPart.mock.calls.length).toBeGreaterThan(1);
+    expect(createCustomRun).toHaveBeenCalledTimes(1);
+    expect(read.mock.calls.filter(([input]) => input.workflowName === resultWorkflow.id)).toEqual([]);
+    expect(persist.mock.calls.filter(([input]) => input.workflowName === resultWorkflow.id)).toEqual([]);
+    expect(finalResult).toHaveBeenCalledTimes(1);
   });
 
   it('preserves mixed processor order and state without durable lifecycle reads', async () => {
