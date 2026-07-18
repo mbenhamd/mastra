@@ -3960,6 +3960,79 @@ describe('ProcessorRunner', () => {
       expect(messageList.get.response.db()).toEqual([redacted]);
     });
 
+    it('does not replay workflow message results already applied by processor steps', async () => {
+      const original = createMessage('original result', 'assistant');
+      const transformed = {
+        ...original,
+        content: { ...original.content, parts: [{ type: 'text' as const, text: 'transformed result' }] },
+      };
+      const processor: Processor = {
+        id: 'transform-once',
+        processOutputResult: async () => [transformed],
+      };
+      const workflow = setProcessorWorkflowPhases(
+        createWorkflow({
+          id: 'already-applied-result-workflow',
+          inputSchema: ProcessorStepSchema,
+          outputSchema: ProcessorStepSchema,
+          options: { validateInputs: false },
+        })
+          .then(createStep(processor))
+          .commit() as unknown as ProcessorWorkflow,
+        ['outputResult'],
+      );
+      const applyMessages = vi.spyOn(ProcessorRunner, 'applyMessagesToMessageList');
+      runner = new ProcessorRunner({
+        inputProcessors: [],
+        outputProcessors: [workflow],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+      messageList.add(original, 'response');
+
+      try {
+        await runner.runOutputProcessors(messageList);
+
+        expect(applyMessages).toHaveBeenCalledTimes(1);
+        expect(messageList.get.response.db()).toEqual([transformed]);
+      } finally {
+        applyMessages.mockRestore();
+      }
+    });
+
+    it('does not replay workflow system messages already applied by processor steps', async () => {
+      const original = createMessage('original input');
+      const replacementSystemMessages = [{ role: 'system' as const, content: 'replacement instruction' }];
+      const processor: Processor = {
+        id: 'replace-system-once',
+        processInput: async ({ messages }) => ({ messages, systemMessages: replacementSystemMessages }),
+      };
+      const workflow = setProcessorWorkflowPhases(
+        createWorkflow({
+          id: 'already-applied-system-workflow',
+          inputSchema: ProcessorStepSchema,
+          outputSchema: ProcessorStepSchema,
+          options: { validateInputs: false },
+        })
+          .then(createStep(processor))
+          .commit() as unknown as ProcessorWorkflow,
+        ['input'],
+      );
+      runner = new ProcessorRunner({
+        inputProcessors: [workflow],
+        outputProcessors: [],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+      messageList.add(original, 'input');
+      const replaceSystemMessages = vi.spyOn(messageList, 'replaceAllSystemMessages');
+
+      await runner.runInputProcessors(messageList);
+
+      expect(replaceSystemMessages).toHaveBeenCalledTimes(1);
+      expect(messageList.getSystemMessages()).toEqual(replacementSystemMessages);
+    });
+
     it('passes reconciled input-step messages to the next split workflow', async () => {
       const original = createMessage('sensitive input');
       const redacted = {
@@ -4052,6 +4125,54 @@ describe('ProcessorRunner', () => {
       await runner.runInputProcessors(messageList);
 
       expect(createRun).toHaveBeenCalledWith();
+    });
+
+    it('classifies workflow durability only once across output stream chunks', async () => {
+      let stepsReads = 0;
+      const start = vi.fn(async ({ inputData }: { inputData: Record<string, unknown> }) => ({
+        status: 'success',
+        result: inputData,
+        steps: {},
+      }));
+      const workflow = setProcessorWorkflowPhases(
+        {
+          id: 'cached-evented-descendant-workflow',
+          inputSchema: {},
+          outputSchema: {},
+          execute: () => undefined,
+          engineType: 'default',
+          get steps() {
+            stepsReads += 1;
+            return { child: { engineType: 'evented' } };
+          },
+          createRun: vi.fn(async () => ({ start })),
+        } as unknown as ProcessorWorkflow,
+        ['outputStream'],
+      );
+      runner = new ProcessorRunner({
+        inputProcessors: [],
+        outputProcessors: [workflow],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+
+      for (const [index, text] of ['first', 'second'].entries()) {
+        await runner.processPart(
+          {
+            type: 'text-delta',
+            payload: { text, id: `text-${index}` },
+            runId: '1',
+            from: ChunkFrom.AGENT,
+          },
+          new Map(),
+          undefined,
+          undefined,
+          messageList,
+        );
+      }
+
+      expect(start).toHaveBeenCalledTimes(2);
+      expect(stepsReads).toBe(1);
     });
   });
 });

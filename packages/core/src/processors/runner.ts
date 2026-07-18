@@ -274,6 +274,7 @@ export class ProcessorRunner {
   private readonly logger: IMastraLogger;
   private readonly agentName: string;
   private readonly agent?: Agent<any, any, any, any>;
+  private readonly processorWorkflowDurability = new WeakMap<ProcessorWorkflow, boolean>();
   /**
    * Shared processor state that persists across loop iterations.
    * Used by all processor methods (input and output) to share state.
@@ -319,6 +320,17 @@ export class ProcessorRunner {
       this.processorStates.set(processorId, state);
     }
     return state;
+  }
+
+  private requiresDurableProcessorWorkflowExecution(workflow: ProcessorWorkflow): boolean {
+    const cached = this.processorWorkflowDurability.get(workflow);
+    if (cached !== undefined) {
+      return cached;
+    }
+
+    const requiresDurableExecution = processorWorkflowRequiresDurableExecution(workflow);
+    this.processorWorkflowDurability.set(workflow, requiresDurableExecution);
+    return requiresDurableExecution;
   }
 
   private async runComputeStateSignal({
@@ -522,7 +534,7 @@ export class ProcessorRunner {
     // resume, and cancellation. Evented processor workflows and default-engine
     // wrappers containing them therefore retain their authoritative durable
     // lifecycle while phase gating still prevents per-part admission.
-    const run = processorWorkflowRequiresDurableExecution(workflow)
+    const run = this.requiresDurableProcessorWorkflowExecution(workflow)
       ? await workflow.createRun()
       : await workflow.createRun({ [PROCESSOR_EXECUTION_SYMBOL]: true });
     const result = await run.start({
@@ -2319,9 +2331,9 @@ export class ProcessorRunner {
         text: `Processor workflow returned a MessageList instance other than the one that was passed in as an argument. New external message list instances are not supported. Use the messageList argument instead.`,
       });
     }
-    const messageListChanged = !areProcessorMessageArraysEqual(messagesBeforeWorkflow, messagesAfterWorkflow);
     const returnedMessagesArePassThrough = areProcessorMessageArraysEqual(messagesBeforeWorkflow, result.messages);
-    if (result.messages && (!messageListChanged || !returnedMessagesArePassThrough)) {
+    const returnedMessagesAlreadyApplied = areProcessorMessageArraysEqual(messagesAfterWorkflow, result.messages);
+    if (result.messages && !returnedMessagesArePassThrough && !returnedMessagesAlreadyApplied) {
       ProcessorRunner.applyMessagesToMessageList(
         result.messages as MastraDBMessage[],
         messageList,
@@ -2330,15 +2342,15 @@ export class ProcessorRunner {
         defaultSource,
       );
     }
-    const systemMessagesChanged = !areProcessorMessageArraysEqual(
-      systemMessagesBeforeWorkflow,
-      systemMessagesAfterWorkflow,
-    );
     const returnedSystemMessagesArePassThrough = areProcessorMessageArraysEqual(
       systemMessagesBeforeWorkflow,
       result.systemMessages,
     );
-    if (result.systemMessages && (!systemMessagesChanged || !returnedSystemMessagesArePassThrough)) {
+    const returnedSystemMessagesAlreadyApplied = areProcessorMessageArraysEqual(
+      systemMessagesAfterWorkflow,
+      result.systemMessages,
+    );
+    if (result.systemMessages && !returnedSystemMessagesArePassThrough && !returnedSystemMessagesAlreadyApplied) {
       messageList.replaceAllSystemMessages(
         result.systemMessages as Parameters<MessageList['replaceAllSystemMessages']>[0],
       );

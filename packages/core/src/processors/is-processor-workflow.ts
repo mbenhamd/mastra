@@ -100,14 +100,14 @@ export function processorWorkflowRequiresDurableExecution(workflow: ProcessorWor
     }
     visited.add(candidate);
 
-    const record = candidate as { engineType?: unknown; steps?: unknown };
-    if (record.engineType === 'evented') {
+    const { engineType, steps } = candidate as { engineType?: unknown; steps?: unknown };
+    if (engineType === 'evented') {
       return true;
     }
-    if (!record.steps || typeof record.steps !== 'object') {
+    if (!steps || typeof steps !== 'object') {
       return false;
     }
-    return Object.values(record.steps).some(visit);
+    return Object.values(steps).some(visit);
   };
 
   return visit(workflow);
