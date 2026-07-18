@@ -8,12 +8,13 @@ import {
 } from './is-processor-workflow';
 import type { ProcessorWorkflow } from './index';
 
-function processorWorkflowStub(): ProcessorWorkflow {
+function processorWorkflowStub(overrides: Record<string, unknown> = {}): ProcessorWorkflow {
   return {
     id: 'processor-workflow',
     inputSchema: {},
     outputSchema: {},
     execute: () => undefined,
+    ...overrides,
   } as unknown as ProcessorWorkflow;
 }
 
@@ -64,5 +65,17 @@ describe('processor workflow phase capabilities', () => {
 
     expect(processorWorkflowRequiresDurableExecution(workflow)).toBe(true);
     expect(processorWorkflowRequiresDurableExecution(processorWorkflowStub())).toBe(false);
+  });
+
+  it.each(['inngest', 'temporal'])('treats the %s engine as durable', engineType => {
+    expect(processorWorkflowRequiresDurableExecution(processorWorkflowStub({ engineType }))).toBe(true);
+    expect(
+      processorWorkflowRequiresDurableExecution(
+        processorWorkflowStub({
+          engineType: 'default',
+          steps: { child: { engineType } },
+        }),
+      ),
+    ).toBe(true);
   });
 });

@@ -90,7 +90,7 @@ export function processorWorkflowHasPhaseRestrictions(workflow: ProcessorWorkflo
   return Boolean(declaredPhases && allProcessorWorkflowPhases.some(phase => !declaredPhases.includes(phase)));
 }
 
-/** Evented workflows and wrappers containing them require durable parent execution. */
+/** Non-default workflow engines and wrappers containing them require durable parent execution. */
 export function processorWorkflowRequiresDurableExecution(workflow: ProcessorWorkflow): boolean {
   const visited = new Set<object>();
 
@@ -101,7 +101,7 @@ export function processorWorkflowRequiresDurableExecution(workflow: ProcessorWor
     visited.add(candidate);
 
     const { engineType, steps } = candidate as { engineType?: unknown; steps?: unknown };
-    if (engineType === 'evented') {
+    if (typeof engineType === 'string' && engineType !== 'default') {
       return true;
     }
     if (!steps || typeof steps !== 'object') {

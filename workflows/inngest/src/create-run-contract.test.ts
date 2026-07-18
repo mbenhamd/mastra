@@ -2,6 +2,7 @@ import { EventEmitterPubSub } from '@mastra/core/events';
 import { Mastra } from '@mastra/core/mastra';
 import { RequestContext } from '@mastra/core/request-context';
 import { MockStore } from '@mastra/core/storage';
+import { TRANSIENT_EXECUTION_SYMBOL } from '@mastra/core/workflows/_constants';
 import { Inngest } from 'inngest';
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
@@ -568,6 +569,14 @@ describe('Inngest createRun contract', () => {
 
     await expect(workflow.createRun({ pubsub: new EventEmitterPubSub() })).rejects.toThrow(
       'Inngest createRun({ pubsub }) is unsupported because remote function replicas cannot reconstruct a per-run PubSub object',
+    );
+  });
+
+  it('rejects transient execution inherited from a parent workflow', async () => {
+    const { workflow } = createTestWorkflow();
+
+    await expect(workflow.createRun({ [TRANSIENT_EXECUTION_SYMBOL]: true })).rejects.toThrow(
+      'Inngest workflows cannot run inside transient workflows',
     );
   });
 
