@@ -103,6 +103,11 @@ type MessageListAddOptions = {
   merge?: boolean;
 };
 
+type MessageListInternalAddOptions = {
+  assumeNew?: boolean;
+  deferFinalization?: boolean;
+};
+
 export class MessageList {
   private messages: MastraDBMessage[] = [];
 
@@ -317,6 +322,53 @@ export class MessageList {
         options,
       );
     }
+    return this;
+  }
+
+  /**
+   * Replace a processor-returned message history after its source ownership has
+   * been captured. The caller supplies the complete ID removal set, allowing
+   * source indexes and transcript ordering to be rebuilt once instead of once
+   * per message.
+   *
+   * @internal ProcessorRunner reconciliation only.
+   */
+  public replaceMessagesForProcessor(
+    replacements: Array<{ message: MastraDBMessage; source: MessageSource }>,
+    idsToRemove: readonly string[],
+  ): this {
+    if (idsToRemove.length > 0) {
+      this.removeByIds([...idsToRemove]);
+    }
+
+    const lastIndexById = new Map<string, number>();
+    for (const [index, { message }] of replacements.entries()) {
+      lastIndexById.set(message.id, index);
+    }
+
+    for (const [index, { message, source }] of replacements.entries()) {
+      if (message.role === 'system') {
+        const systemText =
+          (message.content.content as string | undefined) ??
+          message.content.parts?.map(part => (part.type === 'text' ? part.text : '')).join('\n') ??
+          '';
+        this.addSystem(systemText);
+        continue;
+      }
+
+      // Match the prior last-write-wins behavior for malformed histories with
+      // duplicate IDs while keeping the valid unique-ID path linear.
+      if (lastIndexById.get(message.id) !== index) {
+        continue;
+      }
+
+      if (this.isRecording) {
+        this.recordedEvents.push({ type: 'add', source, count: 1 });
+      }
+      this.addOne(message, source, { merge: false }, { assumeNew: true, deferFinalization: true });
+    }
+
+    this.finalizeMessageOrder();
     return this;
   }
 
@@ -1469,7 +1521,12 @@ export class MessageList {
     };
   }
 
-  private addOne(message: MessageInput, messageSource: MessageSource, options: MessageListAddOptions = {}) {
+  private addOne(
+    message: MessageInput,
+    messageSource: MessageSource,
+    options: MessageListAddOptions = {},
+    internalOptions: MessageListInternalAddOptions = {},
+  ) {
     if (
       (!(`content` in message) ||
         (!message.content &&
@@ -1535,6 +1592,18 @@ export class MessageList {
           acceptedAt,
         },
       };
+    }
+
+    if (internalOptions.assumeNew) {
+      this.messages.push(messageV2);
+      this.pushMessageToSource(messageV2, messageSource);
+      // Deferred finalization must still advance the ordering watermark so a
+      // following input signal receives a strictly later transcript timestamp.
+      this.updateLastCreatedAt(messageV2);
+      if (!internalOptions.deferFinalization) {
+        this.finalizeMessageOrder();
+      }
+      return this;
     }
 
     const { exists, shouldReplace, id } = this.shouldReplaceMessage(messageV2);
@@ -1674,14 +1743,18 @@ export class MessageList {
       this.pushMessageToSource(messageV2, messageSource);
     }
 
+    this.finalizeMessageOrder();
+
+    return this;
+  }
+
+  private finalizeMessageOrder(): void {
     for (const storedMessage of this.messages) {
       this.updateLastCreatedAt(storedMessage);
     }
 
     // make sure messages are always stored in order of when they were created!
     this.messages.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
-
-    return this;
   }
 
   private pushMessageToSource(messageV2: MastraDBMessage, messageSource: MessageSource) {

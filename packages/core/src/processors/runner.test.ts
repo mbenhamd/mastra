@@ -3921,6 +3921,45 @@ describe('ProcessorRunner', () => {
       expect(start.mock.calls[0]?.[0].inputData).toMatchObject({ phase: 'outputResult' });
     });
 
+    it('skips output-step history preparation for result-only workflows', async () => {
+      const createRun = vi.fn();
+      const workflow = setProcessorWorkflowPhases(
+        {
+          id: 'result-only-history-skip-workflow',
+          inputSchema: {},
+          outputSchema: {},
+          execute: () => undefined,
+          createRun,
+        } as unknown as ProcessorWorkflow,
+        ['outputResult'],
+      );
+      runner = new ProcessorRunner({
+        inputProcessors: [],
+        outputProcessors: [workflow],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+      messageList.add(
+        Array.from({ length: 50 }, (_, index) => createMessage(`history ${index}`, 'assistant')),
+        'response',
+        { merge: false },
+      );
+      const stepMessages = messageList.get.all.db();
+      const readAllMessages = vi.spyOn(messageList.get.all, 'db');
+      const makeSourceChecker = vi.spyOn(messageList, 'makeMessageSourceChecker');
+
+      await runner.runProcessOutputStep({
+        steps: [],
+        messages: stepMessages,
+        messageList,
+        stepNumber: 0,
+      });
+
+      expect(createRun).not.toHaveBeenCalled();
+      expect(readAllMessages).not.toHaveBeenCalled();
+      expect(makeSourceChecker).not.toHaveBeenCalled();
+    });
+
     it('forwards workflow-returned messages to the next processor in a split chain', async () => {
       const original = createMessage('original result', 'assistant');
       const transformed = {
@@ -4003,9 +4042,12 @@ describe('ProcessorRunner', () => {
         content: { ...message.content, parts: [{ type: 'text' as const, text: `replacement ${index}` }] },
       }));
       replacements.push(createMessage('new message', 'assistant'));
-      messageList.add(originals, 'response');
+      messageList.add(originals, 'response', { merge: false });
       const check = messageList.makeMessageSourceChecker();
       const removeByIds = vi.spyOn(messageList, 'removeByIds');
+      const replaceMessages = vi.spyOn(messageList, 'replaceMessagesForProcessor');
+      const add = vi.spyOn(messageList, 'add');
+      const finalize = vi.spyOn(messageList as any, 'finalizeMessageOrder');
 
       ProcessorRunner.applyMessagesToMessageList(
         replacements,
@@ -4016,7 +4058,78 @@ describe('ProcessorRunner', () => {
       );
 
       expect(removeByIds).toHaveBeenCalledTimes(1);
+      expect(replaceMessages).toHaveBeenCalledTimes(1);
+      expect(add).not.toHaveBeenCalled();
+      expect(finalize).toHaveBeenCalledTimes(1);
       expect(messageList.get.response.db()).toEqual(replacements);
+    });
+
+    it('preserves source ownership during bulk workflow reconciliation', () => {
+      const memory = createMessage('memory');
+      const input = createMessage('input');
+      const response = createMessage('response', 'assistant');
+      const context = createMessage('context');
+      messageList.add(memory, 'memory', { merge: false });
+      messageList.add(input, 'input', { merge: false });
+      messageList.add(response, 'response', { merge: false });
+      messageList.add(context, 'context', { merge: false });
+      const originals = messageList.get.all.db();
+      const check = messageList.makeMessageSourceChecker();
+      const replacements = originals.map(message => ({
+        ...message,
+        content: {
+          ...message.content,
+          parts: message.content.parts.map(part =>
+            part.type === 'text' ? { ...part, text: `${part.text} updated` } : part,
+          ),
+        },
+      }));
+
+      ProcessorRunner.applyMessagesToMessageList(
+        replacements,
+        messageList,
+        originals.map(message => message.id),
+        check,
+      );
+
+      const sourcesAfter = messageList.makeMessageSourceChecker();
+      expect(replacements.map(message => sourcesAfter.getSource(message))).toEqual([
+        'memory',
+        'input',
+        'response',
+        'context',
+      ]);
+    });
+
+    it('keeps bulk-reconciled input signals in strict transcript order', () => {
+      const baseline = createMessage('baseline', 'assistant');
+      baseline.createdAt = new Date('2026-01-01T00:00:00.000Z');
+      messageList.add(baseline, 'response', { merge: false });
+      const check = messageList.makeMessageSourceChecker();
+      const signalCreatedAt = new Date('2025-01-01T00:00:00.000Z');
+      const signals = [
+        createSignal({ id: 'processor-signal-1', type: 'user-message', contents: 'first', createdAt: signalCreatedAt }),
+        createSignal({
+          id: 'processor-signal-2',
+          type: 'user-message',
+          contents: 'second',
+          createdAt: signalCreatedAt,
+        }),
+      ].map(signal => signal.toDBMessage({ threadId: 'test-thread' }));
+
+      ProcessorRunner.applyMessagesToMessageList(signals, messageList, [], check);
+
+      const [firstSignal, secondSignal] = messageList.get.input.db();
+      expect(firstSignal?.createdAt.getTime()).toBe(baseline.createdAt.getTime() + 1);
+      expect(secondSignal?.createdAt.getTime()).toBe(baseline.createdAt.getTime() + 2);
+      expect(firstSignal?.content.metadata?.signal).toMatchObject({
+        createdAt: firstSignal?.createdAt.toISOString(),
+        acceptedAt: signalCreatedAt.toISOString(),
+      });
+      expect(secondSignal?.content.metadata?.signal).toMatchObject({
+        createdAt: secondSignal?.createdAt.toISOString(),
+        acceptedAt: signalCreatedAt.toISOString(),
+      });
     });
 
     it('preserves in-place message mutations when workflow output only passes through stale input', async () => {

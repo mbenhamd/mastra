@@ -646,18 +646,24 @@ export class ProcessorRunner {
     result?: OutputResult,
   ): Promise<MessageList> {
     for (const [index, processorOrWorkflow] of this.outputProcessors.entries()) {
+      const workflow = isProcessorWorkflow(processorOrWorkflow) ? processorOrWorkflow : undefined;
+      if (workflow) {
+        if (!processorWorkflowSupportsPhase(workflow, 'outputResult')) continue;
+      } else if (!(processorOrWorkflow as Processor).processOutputResult) {
+        continue;
+      }
+
       const allNewMessages = messageList.get.response.db();
       let processableMessages: MastraDBMessage[] = [...allNewMessages];
       const idsBeforeProcessing = processableMessages.map((m: MastraDBMessage) => m.id);
       const check = messageList.makeMessageSourceChecker();
 
       // Handle workflow as processor
-      if (isProcessorWorkflow(processorOrWorkflow)) {
-        if (!processorWorkflowSupportsPhase(processorOrWorkflow, 'outputResult')) continue;
+      if (workflow) {
         const messagesBeforeWorkflow = [...processableMessages];
         const systemMessagesBeforeWorkflow = [...messageList.getSystemMessages()];
         const workflowResult = await this.executeWorkflowAsProcessor(
-          processorOrWorkflow,
+          workflow,
           {
             phase: 'outputResult',
             messages: processableMessages,
@@ -684,18 +690,13 @@ export class ProcessorRunner {
       }
 
       // Handle regular processor
-      const processor = processorOrWorkflow;
+      const processor = processorOrWorkflow as Processor;
       const abort = <TMetadata = unknown>(reason?: string, options?: TripWireOptions<TMetadata>): never => {
         throw new TripWire(reason || `Tripwire triggered by ${processor.id}`, options, processor.id);
       };
 
       // Use the processOutputResult method if available
-      const processMethod = processor.processOutputResult?.bind(processor);
-
-      if (!processMethod) {
-        // Skip processors that don't implement processOutputResult
-        continue;
-      }
+      const processMethod = processor.processOutputResult!.bind(processor);
 
       const outputMessagesBefore = processableMessages;
       const outputSystemMessagesBefore = messageList.getAllSystemMessages();
@@ -1186,17 +1187,23 @@ export class ProcessorRunner {
     retryCount: number = 0,
   ): Promise<MessageList> {
     for (const [index, processorOrWorkflow] of this.inputProcessors.entries()) {
+      const workflow = isProcessorWorkflow(processorOrWorkflow) ? processorOrWorkflow : undefined;
+      if (workflow) {
+        if (!processorWorkflowSupportsPhase(workflow, 'input')) continue;
+      } else if (!(processorOrWorkflow as Processor).processInput) {
+        continue;
+      }
+
       let processableMessages: MastraDBMessage[] = messageList.get.input.db();
       const inputIds = processableMessages.map((m: MastraDBMessage) => m.id);
       const check = messageList.makeMessageSourceChecker();
 
       // Handle workflow as processor
-      if (isProcessorWorkflow(processorOrWorkflow)) {
-        if (!processorWorkflowSupportsPhase(processorOrWorkflow, 'input')) continue;
+      if (workflow) {
         const messagesBeforeWorkflow = [...processableMessages];
         const currentSystemMessages = [...messageList.getSystemMessages()];
         const workflowResult = await this.executeWorkflowAsProcessor(
-          processorOrWorkflow,
+          workflow,
           {
             phase: 'input',
             messages: processableMessages,
@@ -1222,18 +1229,13 @@ export class ProcessorRunner {
       }
 
       // Handle regular processor
-      const processor = processorOrWorkflow;
+      const processor = processorOrWorkflow as Processor;
       const abort = <TMetadata = unknown>(reason?: string, options?: TripWireOptions<TMetadata>): never => {
         throw new TripWire(reason || `Tripwire triggered by ${processor.id}`, options, processor.id);
       };
 
       // Use the processInput method if available
-      const processMethod = processor.processInput?.bind(processor);
-
-      if (!processMethod) {
-        // Skip processors that don't implement processInput
-        continue;
-      }
+      const processMethod = processor.processInput!.bind(processor);
 
       const currentSystemMessages = messageList.getSystemMessages();
       const inputMessagesBefore = processableMessages;
@@ -1465,17 +1467,26 @@ export class ProcessorRunner {
 
     // Run through all input processors that have processInputStep
     for (const [index, processorOrWorkflow] of processors.entries()) {
+      const workflow = isProcessorWorkflow(processorOrWorkflow) ? processorOrWorkflow : undefined;
+      if (workflow) {
+        if (!processorWorkflowSupportsPhase(workflow, 'inputStep')) continue;
+      } else if (
+        !(processorOrWorkflow as Processor).processInputStep &&
+        !(processorOrWorkflow as Processor).computeStateSignal
+      ) {
+        continue;
+      }
+
       const processableMessages: MastraDBMessage[] = messageList.get.all.db();
       const idsBeforeProcessing = processableMessages.map((m: MastraDBMessage) => m.id);
       const check = messageList.makeMessageSourceChecker();
 
       // Handle workflow as processor with inputStep phase
-      if (isProcessorWorkflow(processorOrWorkflow)) {
-        if (!processorWorkflowSupportsPhase(processorOrWorkflow, 'inputStep')) continue;
+      if (workflow) {
         const messagesBeforeWorkflow = [...processableMessages];
         const currentSystemMessages = [...messageList.getSystemMessages()];
         const result = await this.executeWorkflowAsProcessor(
-          processorOrWorkflow,
+          workflow,
           {
             ...stepInput,
             phase: 'inputStep',
@@ -1520,7 +1531,7 @@ export class ProcessorRunner {
         if (result.retryCount !== undefined) workflowStepResult.retryCount = result.retryCount;
         Object.assign(stepInput, workflowStepResult);
         await this.runWorkflowComputeStateSignals({
-          workflow: processorOrWorkflow,
+          workflow,
           messageList,
           stepNumber,
           steps,
@@ -1545,11 +1556,6 @@ export class ProcessorRunner {
       // Handle regular processor
       const processor = processorOrWorkflow as Processor;
       const processMethod = processor.processInputStep?.bind(processor);
-      const computeStateSignal = processor.computeStateSignal?.bind(processor);
-      if (!processMethod && !computeStateSignal) {
-        // Skip processors that don't implement per-step input hooks
-        continue;
-      }
 
       const abort = <TMetadata = unknown>(reason?: string, options?: TripWireOptions<TMetadata>): never => {
         throw new TripWire(reason || `Tripwire triggered by ${processor.id}`, options, processor.id);
@@ -1976,17 +1982,23 @@ export class ProcessorRunner {
 
     // Run through all output processors that have processOutputStep
     for (const [index, processorOrWorkflow] of this.outputProcessors.entries()) {
+      const workflow = isProcessorWorkflow(processorOrWorkflow) ? processorOrWorkflow : undefined;
+      if (workflow) {
+        if (!processorWorkflowSupportsPhase(workflow, 'outputStep')) continue;
+      } else if (!(processorOrWorkflow as Processor).processOutputStep) {
+        continue;
+      }
+
       const processableMessages: MastraDBMessage[] = messageList.get.all.db();
       const idsBeforeProcessing = processableMessages.map((m: MastraDBMessage) => m.id);
       const check = messageList.makeMessageSourceChecker();
 
       // Handle workflow as processor with outputStep phase
-      if (isProcessorWorkflow(processorOrWorkflow)) {
-        if (!processorWorkflowSupportsPhase(processorOrWorkflow, 'outputStep')) continue;
+      if (workflow) {
         const messagesBeforeWorkflow = [...processableMessages];
         const currentSystemMessages = [...messageList.getSystemMessages()];
         const workflowResult = await this.executeWorkflowAsProcessor(
-          processorOrWorkflow,
+          workflow,
           {
             phase: 'outputStep',
             messages: processableMessages,
@@ -2020,13 +2032,8 @@ export class ProcessorRunner {
       }
 
       // Handle regular processor
-      const processor = processorOrWorkflow;
-      const processMethod = processor.processOutputStep?.bind(processor);
-
-      if (!processMethod) {
-        // Skip processors that don't implement processOutputStep
-        continue;
-      }
+      const processor = processorOrWorkflow as Processor;
+      const processMethod = processor.processOutputStep!.bind(processor);
 
       const abort = <TMetadata = unknown>(reason?: string, options?: TripWireOptions<TMetadata>): never => {
         throw new TripWire(reason || `Tripwire triggered by ${processor.id}`, options, processor.id);
@@ -2391,36 +2398,20 @@ export class ProcessorRunner {
     check: ReturnType<MessageList['makeMessageSourceChecker']>,
     defaultSource: 'input' | 'response' = 'input',
   ) {
-    const returnedIds = new Set(messages.map(message => message.id));
-    const idsToReplace = new Set(messages.map(message => message.id));
+    const returnedIds = new Set<string>();
+    for (const message of messages) {
+      returnedIds.add(message.id);
+    }
+    const idsToReplace = new Set(returnedIds);
     for (const id of idsBeforeProcessing) {
       if (!returnedIds.has(id)) {
         idsToReplace.add(id);
       }
     }
-    if (idsToReplace.size > 0) {
-      messageList.removeByIds([...idsToReplace]);
-    }
-
-    // Re-add messages with correct sources
-    const addedIds = new Set<string>();
-    for (const message of messages) {
-      // Preserve the previous last-write-wins behavior for malformed arrays
-      // containing duplicate IDs without penalizing the normal unique-ID path.
-      if (addedIds.has(message.id)) {
-        messageList.removeByIds([message.id]);
-      }
-      addedIds.add(message.id);
-      if (message.role === 'system') {
-        const systemText =
-          (message.content.content as string | undefined) ??
-          message.content.parts?.map(p => (p.type === 'text' ? p.text : '')).join('\n') ??
-          '';
-        messageList.addSystem(systemText);
-      } else {
-        messageList.add(message, check.getSource(message) || defaultSource, { merge: false });
-      }
-    }
+    messageList.replaceMessagesForProcessor(
+      messages.map(message => ({ message, source: check.getSource(message) || defaultSource })),
+      [...idsToReplace],
+    );
   }
 
   static async validateAndFormatProcessInputStepResult(
