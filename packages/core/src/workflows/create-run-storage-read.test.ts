@@ -3,7 +3,7 @@ import { z } from 'zod/v4';
 import { EventEmitterPubSub } from '../events/event-emitter';
 import { Mastra } from '../mastra';
 import { MockStore } from '../storage/mock';
-import { PUBSUB_SYMBOL, TRANSIENT_EXECUTION_SYMBOL } from './constants';
+import { PROCESSOR_EXECUTION_SYMBOL, PUBSUB_SYMBOL, TRANSIENT_EXECUTION_SYMBOL } from './constants';
 import { createWorkflow as createEventedWorkflow } from './evented';
 import type { WorkflowRunState } from './types';
 import { createStep, createWorkflow } from './index';
@@ -110,6 +110,25 @@ function createApprovalStep(id: string) {
 }
 
 describe('explicitly transient workflow lifecycle reads', () => {
+  it('keeps transient processor lifecycle events off the registered Mastra pubsub', async () => {
+    const workflow = buildExplicitlyTransientWorkflow('transient-processor-local-pubsub');
+    const storage = new MockStore();
+    const configuredPubsub = new EventEmitterPubSub();
+    new Mastra({
+      logger: false,
+      pubsub: configuredPubsub,
+      storage,
+      workflows: { [workflow.id]: workflow },
+    });
+    const publish = vi.spyOn(configuredPubsub, 'publish');
+
+    const run = await workflow.createRun({ [PROCESSOR_EXECUTION_SYMBOL]: true });
+    await run.start({ inputData: { value: 'local' } });
+
+    expect(run.transientExecution).toBe(true);
+    expect(publish).not.toHaveBeenCalled();
+  });
+
   it('rejects an evented child inherited by a transient parent before durable admission', async () => {
     const step = createStep({
       id: 'evented-child-step',

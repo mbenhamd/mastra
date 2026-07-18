@@ -2439,10 +2439,11 @@ export class Workflow<
       randomUUID();
     const usesCustomGeneratedRunId = !options?.runId && Boolean(this.#mastra?.getIdGenerator());
     const isNestedExecution = Object.prototype.hasOwnProperty.call(options ?? {}, TRANSIENT_EXECUTION_SYMBOL);
+    const isProcessorExecution = options?.[PROCESSOR_EXECUTION_SYMBOL] === true;
     const transientExecution =
       this.engineType !== 'evented' &&
       (options?.[TRANSIENT_EXECUTION_SYMBOL] === true ||
-        ((this.#options.executionMode === 'transient' || options?.[PROCESSOR_EXECUTION_SYMBOL] === true) &&
+        ((this.#options.executionMode === 'transient' || isProcessorExecution) &&
           (!options?.runId || isNestedExecution) &&
           !usesCustomGeneratedRunId));
     const cachedRun = this.#runs.get(runIdToUse);
@@ -2472,7 +2473,11 @@ export class Workflow<
         validateInputs: this.#options?.validateInputs,
         workflowEngineType: this.engineType,
         transientExecution,
-        pubsub: options?.pubsub ?? this.#mastra?.pubsub,
+        // A top-level transient processor is process-local even when its
+        // registered Mastra uses a network-backed lifecycle broker. Nested
+        // workflows still receive their parent's explicit per-run pubsub, and
+        // explicit/custom IDs remain durable and retain the Mastra pubsub.
+        pubsub: options?.pubsub ?? (transientExecution && isProcessorExecution ? undefined : this.#mastra?.pubsub),
       });
 
     this.#runs.set(runIdToUse, run);
