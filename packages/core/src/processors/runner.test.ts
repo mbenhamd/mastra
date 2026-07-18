@@ -1,6 +1,7 @@
 import type { TextPart } from '@internal/ai-sdk-v4';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { MessageList } from '../agent/message-list';
+import { CacheKeyGenerator } from '../agent/message-list/cache/CacheKeyGenerator';
 import { createSignal } from '../agent/signals';
 import { TripWire } from '../agent/trip-wire';
 import type { IMastraLogger } from '../logger';
@@ -3804,6 +3805,45 @@ describe('ProcessorRunner', () => {
       expect(chunks).toEqual([expect.objectContaining({ type: 'data-signal' })]);
     });
 
+    it('reuses sendSignal across direct stream processors and chunks', async () => {
+      const receivedSendSignals: unknown[] = [];
+      const captureSignal = (id: string): Processor => ({
+        id,
+        processOutputStream: async ({ part, sendSignal }) => {
+          receivedSendSignals.push(sendSignal);
+          return part;
+        },
+      });
+      runner = new ProcessorRunner({
+        inputProcessors: [],
+        outputProcessors: [captureSignal('first-stream-processor'), captureSignal('second-stream-processor')],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+      const processorStates = new Map();
+      const writer = { custom: vi.fn(async () => undefined) };
+
+      for (const [index, text] of ['first', 'second'].entries()) {
+        await runner.processPart(
+          {
+            type: 'text-delta',
+            payload: { text, id: `text-${index}` },
+            runId: '1',
+            from: ChunkFrom.AGENT,
+          },
+          processorStates,
+          undefined,
+          undefined,
+          messageList,
+          0,
+          writer,
+        );
+      }
+
+      expect(receivedSendSignals).toHaveLength(4);
+      expect(receivedSendSignals.every(sendSignal => sendSignal === receivedSendSignals[0])).toBe(true);
+    });
+
     it('retains skipped data parts in direct processor stream history', async () => {
       const seenStreamParts: ChunkType[][] = [];
       const processorStates = new Map();
@@ -3918,6 +3958,65 @@ describe('ProcessorRunner', () => {
       expect(downstream).toHaveBeenCalledTimes(1);
       expect(downstream.mock.calls[0]?.[0].messages).toEqual([transformed]);
       expect(messageList.get.response.db()).toEqual([transformed]);
+    });
+
+    it('avoids content hashing for pass-through workflow message histories', async () => {
+      const messages = Array.from({ length: 50 }, (_, index) => createMessage(`message ${index}`, 'assistant'));
+      const start = vi.fn(async ({ inputData }: { inputData: Record<string, unknown> }) => ({
+        status: 'success',
+        result: inputData,
+        steps: {},
+      }));
+      const workflow = setProcessorWorkflowPhases(
+        {
+          id: 'pass-through-result-workflow',
+          inputSchema: {},
+          outputSchema: {},
+          execute: () => undefined,
+          createRun: vi.fn(async () => ({ start })),
+        } as unknown as ProcessorWorkflow,
+        ['outputResult'],
+      );
+      runner = new ProcessorRunner({
+        inputProcessors: [],
+        outputProcessors: [workflow],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+      messageList.add(messages, 'response', { merge: false });
+      const hashParts = vi.spyOn(CacheKeyGenerator, 'fromDBParts');
+
+      try {
+        await runner.runOutputProcessors(messageList);
+
+        expect(hashParts).not.toHaveBeenCalled();
+        expect(messageList.get.response.db().map(message => message.id)).toEqual(messages.map(message => message.id));
+      } finally {
+        hashParts.mockRestore();
+      }
+    });
+
+    it('reconciles returned workflow histories with one bulk removal', () => {
+      const originals = Array.from({ length: 50 }, (_, index) => createMessage(`original ${index}`, 'assistant'));
+      const replacements = originals.slice(0, -1).map((message, index) => ({
+        ...message,
+        content: { ...message.content, parts: [{ type: 'text' as const, text: `replacement ${index}` }] },
+      }));
+      replacements.push(createMessage('new message', 'assistant'));
+      messageList.add(originals, 'response');
+      const check = messageList.makeMessageSourceChecker();
+      const removeByIds = vi.spyOn(messageList, 'removeByIds');
+
+      ProcessorRunner.applyMessagesToMessageList(
+        replacements,
+        messageList,
+        originals.map(message => message.id),
+        check,
+        'response',
+      );
+
+      expect(removeByIds).toHaveBeenCalledTimes(1);
+      expect(messageList.get.response.db()).toEqual(replacements);
     });
 
     it('preserves in-place message mutations when workflow output only passes through stale input', async () => {

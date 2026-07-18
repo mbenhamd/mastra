@@ -168,7 +168,10 @@ function areProcessorMessageArraysEqual(before: unknown[] | undefined, after: un
 
   return (
     before.length === after.length &&
-    before.every((message, index) => messagesAreEqual(message as MessageInput, after[index] as MessageInput))
+    before.every(
+      (message, index) =>
+        message === after[index] || messagesAreEqual(message as MessageInput, after[index] as MessageInput),
+    )
   );
 }
 
@@ -275,6 +278,13 @@ export class ProcessorRunner {
   private readonly agentName: string;
   private readonly agent?: Agent<any, any, any, any>;
   private readonly processorWorkflowDurability = new WeakMap<ProcessorWorkflow, boolean>();
+  private readonly streamProcessorSendSignals = new WeakMap<
+    MessageList,
+    {
+      writer?: ProcessorStreamWriter;
+      sendSignal: ReturnType<typeof createProcessorSendSignal>;
+    }
+  >();
   /**
    * Shared processor state that persists across loop iterations.
    * Used by all processor methods (input and output) to share state.
@@ -331,6 +341,20 @@ export class ProcessorRunner {
     const requiresDurableExecution = processorWorkflowRequiresDurableExecution(workflow);
     this.processorWorkflowDurability.set(workflow, requiresDurableExecution);
     return requiresDurableExecution;
+  }
+
+  private getStreamProcessorSendSignal(
+    messageList: MessageList,
+    writer?: ProcessorStreamWriter,
+  ): ReturnType<typeof createProcessorSendSignal> {
+    const cached = this.streamProcessorSendSignals.get(messageList);
+    if (cached && cached.writer === writer) {
+      return cached.sendSignal;
+    }
+
+    const sendSignal = createProcessorSendSignal({ messageList, writer });
+    this.streamProcessorSendSignals.set(messageList, { writer, sendSignal });
+    return sendSignal;
   }
 
   private async runComputeStateSignal({
@@ -819,6 +843,7 @@ export class ProcessorRunner {
     try {
       let processedPart: ChunkType<OUTPUT> | null | undefined = part;
       const isFinishChunk = part.type === 'finish';
+      let directProcessorSendSignal: ReturnType<typeof createProcessorSendSignal> | undefined;
 
       for (const [index, processorOrWorkflow] of this.outputProcessors.entries()) {
         // Handle workflows for stream processing
@@ -912,7 +937,11 @@ export class ProcessorRunner {
               messageList,
               retryCount,
               writer,
-              ...(messageList ? { sendSignal: createProcessorSendSignal({ messageList, writer }) } : {}),
+              ...(messageList
+                ? {
+                    sendSignal: (directProcessorSendSignal ??= this.getStreamProcessorSendSignal(messageList, writer)),
+                  }
+                : {}),
             });
 
             // Track output chunk and update processedPart
@@ -2331,9 +2360,11 @@ export class ProcessorRunner {
         text: `Processor workflow returned a MessageList instance other than the one that was passed in as an argument. New external message list instances are not supported. Use the messageList argument instead.`,
       });
     }
-    const returnedMessagesArePassThrough = areProcessorMessageArraysEqual(messagesBeforeWorkflow, result.messages);
-    const returnedMessagesAlreadyApplied = areProcessorMessageArraysEqual(messagesAfterWorkflow, result.messages);
-    if (result.messages && !returnedMessagesArePassThrough && !returnedMessagesAlreadyApplied) {
+    if (
+      result.messages &&
+      !areProcessorMessageArraysEqual(messagesBeforeWorkflow, result.messages) &&
+      !areProcessorMessageArraysEqual(messagesAfterWorkflow, result.messages)
+    ) {
       ProcessorRunner.applyMessagesToMessageList(
         result.messages as MastraDBMessage[],
         messageList,
@@ -2342,15 +2373,11 @@ export class ProcessorRunner {
         defaultSource,
       );
     }
-    const returnedSystemMessagesArePassThrough = areProcessorMessageArraysEqual(
-      systemMessagesBeforeWorkflow,
-      result.systemMessages,
-    );
-    const returnedSystemMessagesAlreadyApplied = areProcessorMessageArraysEqual(
-      systemMessagesAfterWorkflow,
-      result.systemMessages,
-    );
-    if (result.systemMessages && !returnedSystemMessagesArePassThrough && !returnedSystemMessagesAlreadyApplied) {
+    if (
+      result.systemMessages &&
+      !areProcessorMessageArraysEqual(systemMessagesBeforeWorkflow, result.systemMessages) &&
+      !areProcessorMessageArraysEqual(systemMessagesAfterWorkflow, result.systemMessages)
+    ) {
       messageList.replaceAllSystemMessages(
         result.systemMessages as Parameters<MessageList['replaceAllSystemMessages']>[0],
       );
@@ -2364,14 +2391,26 @@ export class ProcessorRunner {
     check: ReturnType<MessageList['makeMessageSourceChecker']>,
     defaultSource: 'input' | 'response' = 'input',
   ) {
-    const deletedIds = idsBeforeProcessing.filter(i => !messages.some(m => m.id === i));
-    if (deletedIds.length) {
-      messageList.removeByIds(deletedIds);
+    const returnedIds = new Set(messages.map(message => message.id));
+    const idsToReplace = new Set(messages.map(message => message.id));
+    for (const id of idsBeforeProcessing) {
+      if (!returnedIds.has(id)) {
+        idsToReplace.add(id);
+      }
+    }
+    if (idsToReplace.size > 0) {
+      messageList.removeByIds([...idsToReplace]);
     }
 
     // Re-add messages with correct sources
+    const addedIds = new Set<string>();
     for (const message of messages) {
-      messageList.removeByIds([message.id]);
+      // Preserve the previous last-write-wins behavior for malformed arrays
+      // containing duplicate IDs without penalizing the normal unique-ID path.
+      if (addedIds.has(message.id)) {
+        messageList.removeByIds([message.id]);
+      }
+      addedIds.add(message.id);
       if (message.role === 'system') {
         const systemText =
           (message.content.content as string | undefined) ??

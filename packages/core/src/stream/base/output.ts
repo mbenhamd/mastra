@@ -8,7 +8,7 @@ import { ErrorCategory, ErrorDomain, MastraError } from '../../error';
 import { getErrorFromUnknown } from '../../error/utils.js';
 import type { ScorerRunInputForAgent, ScorerRunOutputForAgent } from '../../evals';
 import { getRootExportSpan, resolveObservabilityContext } from '../../observability';
-import type { OutputResult } from '../../processors';
+import type { OutputResult, ProcessorStreamWriter } from '../../processors';
 // Inlined to avoid importing structured-output.ts which pulls in the agent
 // barrel and creates an ESM init-time cycle.
 const STRUCTURED_OUTPUT_PROCESSOR_NAME = 'structured-output';
@@ -342,6 +342,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
         string,
         ProcessorState<OUTPUT>
       >;
+      let streamWriter: ProcessorStreamWriter | undefined;
 
       processedStream = stream.pipeThrough(
         new TransformStream<ChunkType<OUTPUT>, ChunkType<OUTPUT>>({
@@ -383,7 +384,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
               }
 
               // Create a ProcessorStreamWriter from the controller so processOutputStream can emit custom chunks
-              const streamWriter = {
+              streamWriter ??= {
                 custom: async (data: { type: string }) => controller.enqueue(data as ChunkType<OUTPUT>),
               };
 
