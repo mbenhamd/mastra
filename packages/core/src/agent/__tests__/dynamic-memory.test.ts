@@ -2,9 +2,12 @@ import { simulateReadableStream } from '@internal/ai-sdk-v4';
 import { MockLanguageModelV1 } from '@internal/ai-sdk-v4/test';
 import { convertArrayToReadableStream, MockLanguageModelV2 } from '@internal/ai-sdk-v5/test';
 import { describe, expect, it } from 'vitest';
+import { z } from 'zod/v4';
+import { Mastra } from '../../mastra';
 import { MockMemory } from '../../memory/mock';
 import { RequestContext } from '../../request-context';
 import { InMemoryStore } from '../../storage';
+import { createTool } from '../../tools';
 import { Agent } from '../agent';
 
 function dynamicMemoryTest(version: 'v1' | 'v2') {
@@ -184,6 +187,358 @@ function dynamicMemoryTest(version: 'v1' | 'v2') {
       expect(thread).toBeDefined();
       expect(thread?.resourceId).toBe('user-1');
     });
+
+    if (version === 'v2') {
+      it('should resolve dynamic memory once per execution', async () => {
+        const mockMemory = new MockMemory({ storage: new InMemoryStore() });
+        let resolverCalls = 0;
+
+        const agent = new Agent({
+          id: 'single-resolution-memory-agent',
+          name: 'Single Resolution Memory Agent',
+          instructions: 'test agent',
+          model: dummyModel,
+          memory: async () => {
+            resolverCalls += 1;
+            await new Promise(resolve => setTimeout(resolve, 5));
+            return mockMemory;
+          },
+        });
+
+        const response = await agent.generate('test message', {
+          memory: {
+            resource: 'user-1',
+            thread: 'single-resolution-thread',
+          },
+        });
+
+        expect(response.text).toBe('Dummy response');
+        expect(resolverCalls).toBe(1);
+      });
+
+      it('should resolve dynamic memory once for each follow-up execution', async () => {
+        const mockMemory = new MockMemory({ storage: new InMemoryStore() });
+        let resolverCalls = 0;
+        const agent = new Agent({
+          id: 'follow-up-memory-agent',
+          name: 'Follow-up Memory Agent',
+          instructions: 'test agent',
+          model: dummyModel,
+          memory: () => {
+            resolverCalls += 1;
+            return mockMemory;
+          },
+        });
+        const memory = {
+          resource: 'user-1',
+          thread: 'follow-up-thread',
+        };
+
+        await agent.generate('first message', { memory });
+        expect(resolverCalls).toBe(1);
+
+        await agent.generate('follow-up message', { memory });
+        expect(resolverCalls).toBe(2);
+      });
+
+      it('should isolate dynamic memory across concurrent executions', async () => {
+        const memories = new Map([
+          ['first', new MockMemory({ storage: new InMemoryStore() })],
+          ['second', new MockMemory({ storage: new InMemoryStore() })],
+        ]);
+        const resolverCalls = new Map<string, number>();
+        const agent = new Agent({
+          id: 'concurrent-memory-agent',
+          name: 'Concurrent Memory Agent',
+          instructions: 'test agent',
+          model: dummyModel,
+          memory: async ({ requestContext }) => {
+            const execution = requestContext.get('execution') as string;
+            resolverCalls.set(execution, (resolverCalls.get(execution) ?? 0) + 1);
+            await new Promise(resolve => setTimeout(resolve, execution === 'first' ? 10 : 1));
+            return memories.get(execution)!;
+          },
+        });
+
+        const firstContext = new RequestContext();
+        firstContext.set('execution', 'first');
+        const secondContext = new RequestContext();
+        secondContext.set('execution', 'second');
+
+        await Promise.all([
+          agent.generate('first message', {
+            requestContext: firstContext,
+            memory: { resource: 'first-user', thread: 'first-thread' },
+          }),
+          agent.generate('second message', {
+            requestContext: secondContext,
+            memory: { resource: 'second-user', thread: 'second-thread' },
+          }),
+        ]);
+
+        expect(Object.fromEntries(resolverCalls)).toEqual({ first: 1, second: 1 });
+        await expect(memories.get('first')!.getThreadById({ threadId: 'first-thread' })).resolves.toMatchObject({
+          resourceId: 'first-user',
+        });
+        await expect(memories.get('second')!.getThreadById({ threadId: 'second-thread' })).resolves.toMatchObject({
+          resourceId: 'second-user',
+        });
+        await expect(memories.get('first')!.getThreadById({ threadId: 'second-thread' })).resolves.toBeNull();
+        await expect(memories.get('second')!.getThreadById({ threadId: 'first-thread' })).resolves.toBeNull();
+      });
+
+      it('should use one dynamic memory instance for processors, tools, and finish handling', async () => {
+        const resolvedMemories: MockMemory[] = [];
+        const processorMemories = new Set<MockMemory>();
+        let toolMemory: unknown;
+        let modelCalls = 0;
+        const model = new MockLanguageModelV2({
+          doGenerate: async () => {
+            modelCalls += 1;
+            if (modelCalls === 1) {
+              return {
+                rawCall: { rawPrompt: null, rawSettings: {} },
+                finishReason: 'tool-calls' as const,
+                usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+                content: [
+                  {
+                    type: 'tool-call' as const,
+                    toolCallId: 'memory-tool-call',
+                    toolName: 'inspect-memory',
+                    input: '{}',
+                  },
+                ],
+                warnings: [],
+              };
+            }
+            return {
+              rawCall: { rawPrompt: null, rawSettings: {} },
+              finishReason: 'stop' as const,
+              usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+              content: [{ type: 'text' as const, text: 'done' }],
+              warnings: [],
+            };
+          },
+        });
+        const inspectMemory = createTool({
+          id: 'inspect-memory',
+          description: 'Records the memory instance provided to the tool.',
+          inputSchema: z.object({}),
+          execute: async (_input, context) => {
+            toolMemory = context.memory;
+            return { ok: true };
+          },
+        });
+        const agent = new Agent({
+          id: 'memory-identity-agent',
+          name: 'Memory Identity Agent',
+          instructions: 'Call inspect-memory once.',
+          model,
+          tools: { inspectMemory },
+          memory: () => {
+            const memory = new MockMemory({ storage: new InMemoryStore() });
+            const getInputProcessors = memory.getInputProcessors.bind(memory);
+            const getOutputProcessors = memory.getOutputProcessors.bind(memory);
+            memory.getInputProcessors = async (...args) => {
+              processorMemories.add(memory);
+              return getInputProcessors(...args);
+            };
+            memory.getOutputProcessors = async (...args) => {
+              processorMemories.add(memory);
+              return getOutputProcessors(...args);
+            };
+            resolvedMemories.push(memory);
+            return memory;
+          },
+        });
+
+        const response = await agent.generate('inspect memory', {
+          maxSteps: 2,
+          memory: { resource: 'user-1', thread: 'memory-identity-thread' },
+        });
+
+        expect(response.text).toBe('done');
+        expect(modelCalls).toBe(2);
+        expect(resolvedMemories).toHaveLength(1);
+        expect([...processorMemories]).toEqual([resolvedMemories[0]]);
+        expect(toolMemory).toBe(resolvedMemories[0]);
+        await expect(resolvedMemories[0]!.getThreadById({ threadId: 'memory-identity-thread' })).resolves.toMatchObject(
+          { resourceId: 'user-1' },
+        );
+      });
+
+      it('should stop before model or tool execution when dynamic memory resolution fails', async () => {
+        let modelCalls = 0;
+        let toolCalls = 0;
+        const model = new MockLanguageModelV2({
+          doGenerate: async () => {
+            modelCalls += 1;
+            return {
+              rawCall: { rawPrompt: null, rawSettings: {} },
+              finishReason: 'stop',
+              usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+              content: [{ type: 'text', text: 'should not run' }],
+              warnings: [],
+            };
+          },
+        });
+        const agent = new Agent({
+          id: 'failing-memory-agent',
+          name: 'Failing Memory Agent',
+          instructions: 'test agent',
+          model,
+          tools: {
+            unreachable: createTool({
+              id: 'unreachable',
+              description: 'should not execute',
+              inputSchema: z.object({}),
+              execute: async () => {
+                toolCalls += 1;
+                return {};
+              },
+            }),
+          },
+          memory: async () => {
+            throw new Error('memory resolution failed');
+          },
+        });
+
+        await expect(
+          agent.generate('test message', {
+            memory: { resource: 'user-1', thread: 'failure-thread' },
+          }),
+        ).rejects.toThrow('memory resolution failed');
+        expect(modelCalls).toBe(0);
+        expect(toolCalls).toBe(0);
+      });
+
+      it('should not re-resolve dynamic memory when model execution fails', async () => {
+        let resolverCalls = 0;
+        const agent = new Agent({
+          id: 'model-error-memory-agent',
+          name: 'Model Error Memory Agent',
+          instructions: 'test agent',
+          model: new MockLanguageModelV2({
+            doGenerate: async () => {
+              throw new Error('model failed');
+            },
+          }),
+          memory: () => {
+            resolverCalls += 1;
+            return new MockMemory({ storage: new InMemoryStore() });
+          },
+        });
+
+        await expect(
+          agent.generate('test message', {
+            memory: { resource: 'user-1', thread: 'model-error-thread' },
+          }),
+        ).rejects.toThrow('model failed');
+        expect(resolverCalls).toBe(1);
+      });
+
+      it('should resolve dynamic memory once for each suspend and resume execution boundary', async () => {
+        const resolvedMemories: MockMemory[] = [];
+        let modelCalls = 0;
+        const model = new MockLanguageModelV2({
+          doStream: async () => {
+            modelCalls += 1;
+            if (modelCalls === 1) {
+              return {
+                rawCall: { rawPrompt: null, rawSettings: {} },
+                warnings: [],
+                stream: convertArrayToReadableStream([
+                  { type: 'stream-start', warnings: [] },
+                  { type: 'response-metadata', id: 'id-1', modelId: 'mock-model-id', timestamp: new Date(0) },
+                  {
+                    type: 'tool-call',
+                    toolCallId: 'approval-call',
+                    toolName: 'approval-tool',
+                    input: '{}',
+                    providerExecuted: false,
+                  },
+                  {
+                    type: 'finish',
+                    finishReason: 'tool-calls',
+                    usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+                  },
+                ]),
+              };
+            }
+            return {
+              rawCall: { rawPrompt: null, rawSettings: {} },
+              warnings: [],
+              stream: convertArrayToReadableStream([
+                { type: 'stream-start', warnings: [] },
+                { type: 'response-metadata', id: 'id-2', modelId: 'mock-model-id', timestamp: new Date(0) },
+                { type: 'text-start', id: 'text-1' },
+                { type: 'text-delta', id: 'text-1', delta: 'approved' },
+                { type: 'text-end', id: 'text-1' },
+                {
+                  type: 'finish',
+                  finishReason: 'stop',
+                  usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+                },
+              ]),
+            };
+          },
+        });
+        const approvalTool = createTool({
+          id: 'approval-tool',
+          description: 'Records the memory instance after approval.',
+          inputSchema: z.object({}),
+          requireApproval: true,
+          execute: async () => ({ approved: true }),
+        });
+        const agent = new Agent({
+          id: 'resume-memory-agent',
+          name: 'Resume Memory Agent',
+          instructions: 'Call approval-tool once.',
+          model,
+          tools: { approvalTool },
+          memory: () => {
+            const memory = new MockMemory({ storage: new InMemoryStore() });
+            resolvedMemories.push(memory);
+            return memory;
+          },
+        });
+        const mastra = new Mastra({
+          agents: { agent },
+          storage: new InMemoryStore(),
+          logger: false,
+        });
+        const registeredAgent = mastra.getAgent('agent');
+
+        const stream = await registeredAgent.stream('approve the tool', {
+          memory: { resource: 'user-1', thread: 'resume-memory-thread' },
+          maxSteps: 2,
+        });
+        for await (const _chunk of stream.fullStream) {
+          // Drain until the approval suspension is durable.
+        }
+        expect(resolvedMemories).toHaveLength(1);
+
+        const resumed = await registeredAgent.resumeStream(
+          { approved: true },
+          {
+            runId: stream.runId,
+            toolCallId: 'approval-call',
+            memory: { resource: 'user-1', thread: 'resume-memory-thread' },
+            maxSteps: 2,
+          },
+        );
+        for await (const _chunk of resumed.fullStream) {
+          // Drain the resumed execution through its terminal result.
+        }
+
+        expect(await resumed.text).toBe('approved');
+        expect(modelCalls).toBe(2);
+        expect(resolvedMemories).toHaveLength(2);
+        await expect(resolvedMemories[1]!.getThreadById({ threadId: 'resume-memory-thread' })).resolves.toMatchObject({
+          resourceId: 'user-1',
+        });
+      });
+    }
 
     it('should work with memory in stream method with dynamic configuration', async () => {
       const storage = new InMemoryStore();

@@ -1647,16 +1647,18 @@ export class Agent<
     outputProcessorOverrides,
     errorProcessorOverrides,
     processorStates,
+    memory,
   }: {
     requestContext: RequestContext;
     inputProcessorOverrides?: InputProcessorOrWorkflow[];
     outputProcessorOverrides?: OutputProcessorOrWorkflow[];
     errorProcessorOverrides?: ErrorProcessorOrWorkflow[];
     processorStates?: Map<string, ProcessorState>;
+    memory?: MastraMemory;
   }): Promise<ProcessorRunner> {
     // Resolve processors - overrides replace user-configured but auto-derived (memory, skills) are kept
-    const inputProcessors = await this.listResolvedInputProcessors(requestContext, inputProcessorOverrides);
-    const outputProcessors = await this.listResolvedOutputProcessors(requestContext, outputProcessorOverrides);
+    const inputProcessors = await this.listResolvedInputProcessors(requestContext, inputProcessorOverrides, memory);
+    const outputProcessors = await this.listResolvedOutputProcessors(requestContext, outputProcessorOverrides, memory);
     const errorProcessors =
       errorProcessorOverrides ??
       (this.#errorProcessors
@@ -1808,6 +1810,7 @@ export class Agent<
   private async listResolvedOutputProcessors(
     requestContext?: RequestContext,
     configuredProcessorOverrides?: OutputProcessorOrWorkflow[],
+    resolvedMemory?: MastraMemory,
   ): Promise<OutputProcessorOrWorkflow[]> {
     // Get configured output processors - use overrides if provided (from generate/stream options),
     // otherwise use agent constructor processors
@@ -1823,7 +1826,7 @@ export class Agent<
 
     // Get memory output processors (with deduplication)
     // Use getMemory() to ensure storage is injected from Mastra if not explicitly configured
-    const memory = await this.getMemory({ requestContext: requestContext || new RequestContext() });
+    const memory = resolvedMemory ?? (await this.getMemory({ requestContext: requestContext || new RequestContext() }));
 
     const memoryProcessors = memory ? await memory.getOutputProcessors(configuredProcessors, requestContext) : [];
 
@@ -1846,6 +1849,7 @@ export class Agent<
   private async resolveInputProcessors(
     requestContext?: RequestContext,
     configuredProcessorOverrides?: InputProcessorOrWorkflow[],
+    resolvedMemory?: MastraMemory,
   ): Promise<InputProcessorOrWorkflow[]> {
     // Get configured input processors - use overrides if provided (from generate/stream options),
     // otherwise use agent constructor processors
@@ -1861,7 +1865,7 @@ export class Agent<
 
     // Get memory input processors (with deduplication)
     // Use getMemory() to ensure storage is injected from Mastra if not explicitly configured
-    const memory = await this.getMemory({ requestContext: requestContext || new RequestContext() });
+    const memory = resolvedMemory ?? (await this.getMemory({ requestContext: requestContext || new RequestContext() }));
 
     const memoryProcessors = memory ? await memory.getInputProcessors(configuredProcessors, requestContext) : [];
 
@@ -1901,8 +1905,9 @@ export class Agent<
   private async listResolvedInputProcessors(
     requestContext?: RequestContext,
     configuredProcessorOverrides?: InputProcessorOrWorkflow[],
+    resolvedMemory?: MastraMemory,
   ): Promise<InputProcessorOrWorkflow[]> {
-    const processors = await this.resolveInputProcessors(requestContext, configuredProcessorOverrides);
+    const processors = await this.resolveInputProcessors(requestContext, configuredProcessorOverrides, resolvedMemory);
     return this.combineProcessorsIntoWorkflow(processors, `${this.id}-input-processor`);
   }
 
@@ -1914,8 +1919,9 @@ export class Agent<
   private async listResolvedLLMRequestProcessors(
     requestContext?: RequestContext,
     configuredProcessorOverrides?: InputProcessorOrWorkflow[],
+    resolvedMemory?: MastraMemory,
   ): Promise<InputProcessorOrWorkflow[]> {
-    return this.resolveInputProcessors(requestContext, configuredProcessorOverrides);
+    return this.resolveInputProcessors(requestContext, configuredProcessorOverrides, resolvedMemory);
   }
 
   /**
@@ -3697,6 +3703,7 @@ export class Agent<
     resourceId,
     threadId,
     requestContext,
+    memory,
     mastraProxy,
     memoryConfig,
     autoResumeSuspendedTools,
@@ -3709,6 +3716,7 @@ export class Agent<
     resourceId?: string;
     threadId?: string;
     requestContext: RequestContext;
+    memory?: MastraMemory;
     mastraProxy?: MastraUnion;
     memoryConfig?: MemoryConfigInternal;
     autoResumeSuspendedTools?: boolean;
@@ -3723,9 +3731,6 @@ export class Agent<
       this.logger.debug('Skipping memory tools (agent network context)', { agent: this.name, runId });
       return convertedMemoryTools;
     }
-
-    // Get memory tools if available
-    const memory = await this.getMemory({ requestContext });
 
     // Skip memory tools if there's no usable context — thread-scoped needs threadId, resource-scoped needs resourceId
     if (!threadId && !resourceId) {
@@ -3860,6 +3865,7 @@ export class Agent<
     resourceId,
     threadId,
     requestContext,
+    memory,
     mastraProxy,
     autoResumeSuspendedTools,
     backgroundTaskEnabled,
@@ -3871,6 +3877,7 @@ export class Agent<
     resourceId?: string;
     threadId?: string;
     requestContext: RequestContext;
+    memory?: MastraMemory;
     mastraProxy?: MastraUnion;
     autoResumeSuspendedTools?: boolean;
     backgroundTaskEnabled?: boolean;
@@ -3887,8 +3894,6 @@ export class Agent<
     const channelTools = this.#agentChannels.getTools();
 
     if (Object.keys(channelTools).length > 0) {
-      const memory = await this.getMemory({ requestContext });
-
       for (const [toolName, tool] of Object.entries(channelTools)) {
         const options: ToolOptions = {
           name: toolName,
@@ -4092,6 +4097,7 @@ export class Agent<
     resourceId,
     threadId,
     requestContext,
+    memory,
     mastraProxy,
     outputWriter,
     autoResumeSuspendedTools,
@@ -4105,6 +4111,7 @@ export class Agent<
     resourceId?: string;
     threadId?: string;
     requestContext: RequestContext;
+    memory?: MastraMemory;
     mastraProxy?: MastraUnion;
     outputWriter?: OutputWriter;
     autoResumeSuspendedTools?: boolean;
@@ -4134,7 +4141,6 @@ export class Agent<
       }
 
       const workspace = await this.getWorkspace({ requestContext });
-      const memory = await this.getMemory({ requestContext });
       const model = await this.getModel({ requestContext });
 
       for (const [toolName, tool] of Object.entries(loadedTools)) {
@@ -4186,12 +4192,14 @@ export class Agent<
     messageList,
     inputProcessorOverrides,
     processorStates,
+    memory,
     ...observabilityContext
   }: {
     requestContext: RequestContext;
     messageList: MessageList;
     inputProcessorOverrides?: InputProcessorOrWorkflow[];
     processorStates?: Map<string, ProcessorState>;
+    memory?: MastraMemory;
   } & ObservabilityContext): Promise<{
     messageList: MessageList;
     tripwire?: {
@@ -4217,6 +4225,7 @@ export class Agent<
         requestContext,
         inputProcessorOverrides,
         processorStates,
+        memory,
       });
       try {
         messageList = await runner.runInputProcessors(messageList, observabilityContext, requestContext, 0);
@@ -4507,14 +4516,18 @@ export class Agent<
     vectorMessageSearch,
     memoryConfig,
     requestContext,
+    memory: resolvedMemory,
   }: {
     resourceId?: string;
     threadId: string;
     vectorMessageSearch: string;
     memoryConfig?: MemoryConfigInternal;
     requestContext: RequestContext;
+    memory?: MastraMemory;
   }): Promise<{ messages: MastraDBMessage[] }> {
-    const memory = await this.getMemory({ requestContext });
+    // Execution callers pass their already-resolved instance; standalone
+    // memory-message reads preserve their existing dynamic resolution behavior.
+    const memory = resolvedMemory ?? (await this.getMemory({ requestContext }));
     if (!memory) {
       return { messages: [] };
     }
@@ -4546,6 +4559,7 @@ export class Agent<
     resourceId,
     threadId,
     requestContext,
+    memory,
     mastraProxy,
     outputWriter,
     autoResumeSuspendedTools,
@@ -4558,6 +4572,7 @@ export class Agent<
     resourceId?: string;
     threadId?: string;
     requestContext: RequestContext;
+    memory?: MastraMemory;
     mastraProxy?: MastraUnion;
     outputWriter?: OutputWriter;
     autoResumeSuspendedTools?: boolean;
@@ -4567,8 +4582,6 @@ export class Agent<
   } & Partial<ObservabilityContext>) {
     const observabilityContext = resolveObservabilityContext(rest);
     let toolsForRequest: Record<string, CoreTool> = {};
-
-    const memory = await this.getMemory({ requestContext });
 
     // Mastra tools passed into the Agent
     const assignedTools = await this.listTools({ requestContext });
@@ -4624,6 +4637,7 @@ export class Agent<
     resourceId,
     toolsets,
     requestContext,
+    memory,
     mastraProxy,
     outputWriter,
     autoResumeSuspendedTools,
@@ -4637,6 +4651,7 @@ export class Agent<
     resourceId?: string;
     toolsets: ToolsetsInput;
     requestContext: RequestContext;
+    memory?: MastraMemory;
     mastraProxy?: MastraUnion;
     outputWriter?: OutputWriter;
     autoResumeSuspendedTools?: boolean;
@@ -4647,7 +4662,6 @@ export class Agent<
     const observabilityContext = resolveObservabilityContext(rest);
     let toolsForRequest: Record<string, CoreTool> = {};
 
-    const memory = await this.getMemory({ requestContext });
     const toolsFromToolsets = Object.values(toolsets || {});
 
     if (toolsFromToolsets.length > 0) {
@@ -4701,6 +4715,7 @@ export class Agent<
     threadId,
     resourceId,
     requestContext,
+    memory,
     mastraProxy,
     clientTools,
     autoResumeSuspendedTools,
@@ -4713,6 +4728,7 @@ export class Agent<
     threadId?: string;
     resourceId?: string;
     requestContext: RequestContext;
+    memory?: MastraMemory;
     mastraProxy?: MastraUnion;
     clientTools?: ToolsInput;
     autoResumeSuspendedTools?: boolean;
@@ -4722,7 +4738,6 @@ export class Agent<
   } & Partial<ObservabilityContext>) {
     const observabilityContext = resolveObservabilityContext(rest);
     let toolsForRequest: Record<string, CoreTool> = {};
-    const memory = await this.getMemory({ requestContext });
     // Convert client tools
     const clientToolsForInput = Object.entries(clientTools || {});
     if (clientToolsForInput.length > 0) {
@@ -4821,6 +4836,7 @@ export class Agent<
     threadId,
     resourceId,
     requestContext,
+    memory,
     methodType,
     autoResumeSuspendedTools,
     delegation,
@@ -4834,6 +4850,7 @@ export class Agent<
     threadId?: string;
     resourceId?: string;
     requestContext: RequestContext;
+    memory?: MastraMemory;
     methodType: AgentMethodType;
     autoResumeSuspendedTools?: boolean;
     delegation?: DelegationConfig;
@@ -5615,7 +5632,7 @@ export class Agent<
                       threadId,
                       resourceId,
                     };
-                    const supervisorMemory = await this.getMemory({ requestContext });
+                    const supervisorMemory = memory;
                     if (supervisorMemory) {
                       try {
                         await supervisorMemory.saveMessages({
@@ -5694,7 +5711,7 @@ export class Agent<
                       threadId,
                       resourceId,
                     };
-                    const supervisorMemory = await this.getMemory({ requestContext });
+                    const supervisorMemory = memory;
                     if (supervisorMemory) {
                       try {
                         await supervisorMemory.saveMessages({
@@ -5762,7 +5779,7 @@ export class Agent<
           resourceId,
           logger: this.logger,
           mastra: this.#mastra,
-          memory: await this.getMemory({ requestContext }),
+          memory,
           agentName: toolAgentName,
           agentId,
           requestContext,
@@ -5794,6 +5811,7 @@ export class Agent<
     threadId,
     resourceId,
     requestContext,
+    memory,
     methodType,
     autoResumeSuspendedTools,
     backgroundTaskEnabled,
@@ -5805,6 +5823,7 @@ export class Agent<
     threadId?: string;
     resourceId?: string;
     requestContext: RequestContext;
+    memory?: MastraMemory;
     methodType: AgentMethodType;
     autoResumeSuspendedTools?: boolean;
     backgroundTaskEnabled?: boolean;
@@ -6040,7 +6059,7 @@ export class Agent<
           resourceId,
           logger: this.logger,
           mastra: this.#mastra,
-          memory: await this.getMemory({ requestContext }),
+          memory,
           agentName,
           agentId,
           requestContext,
@@ -6156,6 +6175,7 @@ export class Agent<
     resourceId,
     runId,
     requestContext,
+    memory: resolvedMemory,
     outputWriter,
     methodType,
     memoryConfig,
@@ -6179,6 +6199,7 @@ export class Agent<
     resourceId?: string;
     runId?: string;
     requestContext: RequestContext;
+    memory?: MastraMemory;
     outputWriter?: OutputWriter;
     methodType: AgentMethodType;
     memoryConfig?: MemoryConfigInternal;
@@ -6197,6 +6218,9 @@ export class Agent<
     const observabilityContext = resolveObservabilityContext(rest);
     let mastraProxy = undefined;
     const logger = this.logger;
+    // Execution callers pass their already-resolved instance; standalone tool
+    // assembly still resolves once here and shares it across every tool source.
+    const memory = resolvedMemory ?? (await this.getMemory({ requestContext }));
 
     if (this.#mastra) {
       mastraProxy = createMastraProxy({ mastra: this.#mastra, logger });
@@ -6240,6 +6264,7 @@ export class Agent<
         resourceId,
         threadId,
         requestContext,
+        memory,
         ...observabilityContext,
         mastraProxy,
         toolsets: toolsets ?? {},
@@ -6260,6 +6285,7 @@ export class Agent<
           resourceId,
           threadId,
           requestContext,
+          memory,
           ...observabilityContext,
           mastraProxy,
           autoResumeSuspendedTools,
@@ -6298,6 +6324,7 @@ export class Agent<
       resourceId,
       threadId,
       requestContext,
+      memory,
       ...observabilityContext,
       mastraProxy,
       outputWriter,
@@ -6312,6 +6339,7 @@ export class Agent<
       resourceId,
       threadId,
       requestContext,
+      memory,
       ...observabilityContext,
       mastraProxy,
       memoryConfig,
@@ -6326,6 +6354,7 @@ export class Agent<
       resourceId,
       threadId,
       requestContext,
+      memory,
       ...observabilityContext,
       mastraProxy,
       toolsets: toolsets!,
@@ -6341,6 +6370,7 @@ export class Agent<
       resourceId,
       threadId,
       requestContext,
+      memory,
       ...observabilityContext,
       mastraProxy,
       clientTools: clientTools!,
@@ -6355,6 +6385,7 @@ export class Agent<
       resourceId,
       threadId,
       requestContext,
+      memory,
       methodType,
       ...observabilityContext,
       autoResumeSuspendedTools,
@@ -6369,6 +6400,7 @@ export class Agent<
       resourceId,
       threadId,
       requestContext,
+      memory,
       methodType,
       ...observabilityContext,
       autoResumeSuspendedTools,
@@ -6412,6 +6444,7 @@ export class Agent<
       resourceId,
       threadId,
       requestContext,
+      memory,
       ...observabilityContext,
       mastraProxy,
       autoResumeSuspendedTools,
@@ -6438,6 +6471,7 @@ export class Agent<
       resourceId,
       threadId,
       requestContext,
+      memory,
       ...observabilityContext,
       mastraProxy,
       outputWriter,
@@ -7635,7 +7669,16 @@ export class Agent<
       mastra: this.#mastra,
     });
 
-    const memory = await this.getMemory({ requestContext });
+    // A dynamic memory factory may perform remote lookup and may return a
+    // request-specific instance. Resolve it exactly once at the execution
+    // boundary, then close every downstream capability over that instance.
+    let memory: MastraMemory | undefined;
+    try {
+      memory = await this.getMemory({ requestContext });
+    } catch (error) {
+      agentSpan?.error({ error: error as Error, endSpan: true });
+      throw error;
+    }
     // Reuse early workspace (resolved earlier for browser context) to avoid
     // duplicate factory resolution which could create different instances
     const workspace = earlyWorkspace;
@@ -7650,7 +7693,7 @@ export class Agent<
       agent: this,
       agentName: this.name,
       logger: this.logger,
-      getMemory: this.getMemory.bind(this),
+      getMemory: async (_options?: { requestContext?: RequestContext }) => memory,
       getModel: this.getModel.bind(this),
       generateMessageId: this.#mastra?.generateId?.bind(this.#mastra) || (() => randomUUID()),
       mastra: this.#mastra,
@@ -7658,32 +7701,34 @@ export class Agent<
         '_agentNetworkAppend' in this
           ? Boolean((this as unknown as { _agentNetworkAppend: unknown })._agentNetworkAppend)
           : undefined,
-      convertTools: this.convertTools.bind(this),
+      convertTools: (args: Parameters<typeof this.convertTools>[0]) => this.convertTools({ ...args, memory }),
       resolveToolHooks: (runHooks?: ToolHooks) => this.resolveToolHooks(runHooks),
-      getMemoryMessages: this.getMemoryMessages.bind(this),
-      runInputProcessors: this.__runInputProcessors.bind(this),
-      executeOnFinish: this.#executeOnFinish.bind(this),
+      getMemoryMessages: (args: Parameters<typeof this.getMemoryMessages>[0]) =>
+        this.getMemoryMessages({ ...args, memory }),
+      runInputProcessors: (args: Parameters<typeof this.__runInputProcessors>[0]) =>
+        this.__runInputProcessors({ ...args, memory }),
+      executeOnFinish: (args: AgentExecuteOnFinishOptions) => this.#executeOnFinish(args, memory),
       inputProcessors: async ({
         requestContext,
         overrides,
       }: {
         requestContext: RequestContext;
         overrides?: InputProcessorOrWorkflow[];
-      }) => this.listResolvedInputProcessors(requestContext, overrides),
+      }) => this.listResolvedInputProcessors(requestContext, overrides, memory),
       llmRequestInputProcessors: async ({
         requestContext,
         overrides,
       }: {
         requestContext: RequestContext;
         overrides?: InputProcessorOrWorkflow[];
-      }) => this.listResolvedLLMRequestProcessors(requestContext, overrides),
+      }) => this.listResolvedLLMRequestProcessors(requestContext, overrides, memory),
       outputProcessors: async ({
         requestContext,
         overrides,
       }: {
         requestContext: RequestContext;
         overrides?: OutputProcessorOrWorkflow[];
-      }) => this.listResolvedOutputProcessors(requestContext, overrides),
+      }) => this.listResolvedOutputProcessors(requestContext, overrides, memory),
       errorProcessors: async ({
         requestContext,
         overrides,
@@ -7814,23 +7859,26 @@ export class Agent<
    * Handles post-execution tasks including memory persistence and title generation.
    * @internal
    */
-  async #executeOnFinish({
-    result,
-    readOnlyMemory,
-    thread: threadAfter,
-    threadId,
-    resourceId,
-    memoryConfig,
-    outputText,
-    requestContext,
-    agentSpan,
-    runId,
-    messageList,
-    threadExists,
-    structuredOutput = false,
-    overrideScorers,
-    _toolSurfaceFenceOwnerId,
-  }: AgentExecuteOnFinishOptions) {
+  async #executeOnFinish(
+    {
+      result,
+      readOnlyMemory,
+      thread: threadAfter,
+      threadId,
+      resourceId,
+      memoryConfig,
+      outputText,
+      requestContext,
+      agentSpan,
+      runId,
+      messageList,
+      threadExists,
+      structuredOutput = false,
+      overrideScorers,
+      _toolSurfaceFenceOwnerId,
+    }: AgentExecuteOnFinishOptions,
+    memory?: MastraMemory,
+  ) {
     const observabilityContext = createObservabilityContext({ currentSpan: agentSpan });
 
     const resToLog = {
@@ -7858,7 +7906,6 @@ export class Agent<
     });
 
     // re-read the latest thread so metadata written mid-run (working memory, processors) isn't overwritten
-    const memory = await this.getMemory({ requestContext });
     const thread = (!readOnlyMemory && threadId ? await memory?.getThreadById({ threadId }) : undefined) ?? threadAfter;
 
     // Add LLM response messages to the list
