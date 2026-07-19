@@ -2699,8 +2699,14 @@ NODE
   assert_contains '--filter ./workflows/temporal --fail-if-no-match build' "$command_log"
   assert_contains '--filter ./workflows/temporal --fail-if-no-match lint' "$command_log"
   assert_contains 'src/workflow.test.ts' "$command_log"
-  temporal_build_line="$(grep -nF -- '--filter ./workflows/temporal --fail-if-no-match build' "$command_log" | head -n 1 | cut -d: -f1)"
-  temporal_typecheck_line="$(grep -nF -- '--filter ./workflows/temporal --fail-if-no-match exec tsc --noEmit' "$command_log" | head -n 1 | cut -d: -f1)"
+  temporal_build_line="$(
+    awk -v command='--filter ./workflows/temporal --fail-if-no-match build' \
+      '$0 == command { print NR; exit }' "$command_log"
+  )"
+  temporal_typecheck_line="$(
+    awk -v command='--filter ./workflows/temporal --fail-if-no-match exec tsc --noEmit' \
+      '$0 == command { print NR; exit }' "$command_log"
+  )"
   if [[ -z "$temporal_build_line" || -z "$temporal_typecheck_line" ]] ||
     (( temporal_build_line >= temporal_typecheck_line )); then
     echo 'Temporal validation must build its self-imported dist types before typechecking a clean checkout.' >&2
