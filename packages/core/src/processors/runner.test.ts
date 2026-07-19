@@ -8,6 +8,7 @@ import type { IMastraLogger } from '../logger';
 import { RequestContext } from '../request-context';
 import type { ChunkType } from '../stream';
 import { ChunkFrom } from '../stream/types';
+import * as utils from '../utils';
 import { createStep, createWorkflow } from '../workflows';
 import { setProcessorWorkflowPhases } from './is-processor-workflow';
 import { ProcessorRunner, ProcessorState } from './runner';
@@ -4204,11 +4205,13 @@ describe('ProcessorRunner', () => {
     });
 
     it('preserves workflow-returned message role changes when ids and parts are unchanged', async () => {
-      const original = createMessage('same content', 'assistant');
-      const transformed = { ...original, role: 'user' as const };
+      const originals = Array.from({ length: 50 }, (_, index) => createMessage(`same content ${index}`, 'assistant'));
+      const transformed = originals.map((message, index) =>
+        index === originals.length - 1 ? { ...message, role: 'user' as const } : { ...message },
+      );
       const start = vi.fn(async ({ inputData }: { inputData: Record<string, unknown> }) => ({
         status: 'success',
-        result: { ...inputData, messages: [transformed] },
+        result: { ...inputData, messages: transformed },
         steps: {},
       }));
       const workflow = setProcessorWorkflowPhases(
@@ -4230,12 +4233,18 @@ describe('ProcessorRunner', () => {
         logger: mockLogger,
         agentName: 'test-agent',
       });
-      messageList.add([original], 'response');
+      messageList.add(originals, 'response', { merge: false });
+      const semanticComparison = vi.spyOn(utils, 'deepEqual');
 
-      await runner.runOutputProcessors(messageList);
+      try {
+        await runner.runOutputProcessors(messageList);
 
-      expect(downstream.mock.calls[0]?.[0].messages).toEqual([transformed]);
-      expect(messageList.get.all.db()).toEqual([transformed]);
+        expect(downstream.mock.calls[0]?.[0].messages).toEqual(transformed);
+        expect(messageList.get.all.db()).toEqual(transformed);
+        expect(semanticComparison).toHaveBeenCalledTimes(originals.length);
+      } finally {
+        semanticComparison.mockRestore();
+      }
     });
 
     it('avoids content hashing for pass-through workflow message histories', async () => {

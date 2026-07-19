@@ -198,7 +198,44 @@ function areProcessorMessageArraysSemanticallyEqual(
     return before === after;
   }
 
-  return before.every((message, index) => message === after[index] || deepEqual(message, after[index]));
+  for (let index = 0; index < before.length; index++) {
+    if (before[index] !== after[index] && !deepEqual(before[index], after[index])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function haveSameProcessorMessageReferences(before: unknown[], after: unknown[]): boolean {
+  if (before === after) return true;
+  if (before.length !== after.length) return false;
+  for (let index = 0; index < before.length; index++) {
+    if (before[index] !== after[index]) return false;
+  }
+  return true;
+}
+
+function matchesAnyUniqueProcessorMessageSnapshot(
+  messages: unknown[],
+  first: unknown[],
+  second: unknown[],
+  third?: unknown[],
+): boolean {
+  if (areProcessorMessageArraysSemanticallyEqual(first, messages)) return true;
+
+  if (!haveSameProcessorMessageReferences(first, second)) {
+    if (areProcessorMessageArraysSemanticallyEqual(second, messages)) return true;
+  }
+
+  if (
+    third &&
+    !haveSameProcessorMessageReferences(first, third) &&
+    !haveSameProcessorMessageReferences(second, third)
+  ) {
+    return areProcessorMessageArraysSemanticallyEqual(third, messages);
+  }
+
+  return false;
 }
 
 function buildProcessInputStepSpanInput(args: {
@@ -2345,27 +2382,33 @@ export class ProcessorRunner {
         text: `Processor workflow returned a MessageList instance other than the one that was passed in as an argument. New external message list instances are not supported. Use the messageList argument instead.`,
       });
     }
-    if (
-      result.messages &&
-      !(
-        result.messageList === messageList &&
-        areProcessorMessageArraysSemanticallyEqual(messageList.get.all.db(), result.messages)
-      ) &&
-      !areProcessorMessageArraysSemanticallyEqual(messagesBeforeWorkflow, result.messages) &&
-      !areProcessorMessageArraysSemanticallyEqual(messagesAfterWorkflow, result.messages)
-    ) {
-      ProcessorRunner.applyMessagesToMessageList(
-        result.messages as MastraDBMessage[],
-        messageList,
-        idsBeforeProcessing,
-        check,
-        defaultSource,
-      );
+    if (result.messages) {
+      const liveMessages = result.messageList === messageList ? messageList.get.all.db() : undefined;
+      const resultAlreadyApplied = liveMessages
+        ? matchesAnyUniqueProcessorMessageSnapshot(
+            result.messages,
+            liveMessages,
+            messagesBeforeWorkflow,
+            messagesAfterWorkflow,
+          )
+        : matchesAnyUniqueProcessorMessageSnapshot(result.messages, messagesBeforeWorkflow, messagesAfterWorkflow);
+      if (!resultAlreadyApplied) {
+        ProcessorRunner.applyMessagesToMessageList(
+          result.messages as MastraDBMessage[],
+          messageList,
+          idsBeforeProcessing,
+          check,
+          defaultSource,
+        );
+      }
     }
     if (
       result.systemMessages &&
-      !areProcessorMessageArraysSemanticallyEqual(systemMessagesBeforeWorkflow, result.systemMessages) &&
-      !areProcessorMessageArraysSemanticallyEqual(systemMessagesAfterWorkflow, result.systemMessages)
+      !matchesAnyUniqueProcessorMessageSnapshot(
+        result.systemMessages,
+        systemMessagesBeforeWorkflow,
+        systemMessagesAfterWorkflow,
+      )
     ) {
       messageList.replaceAllSystemMessages(
         result.systemMessages as Parameters<MessageList['replaceAllSystemMessages']>[0],
