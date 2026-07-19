@@ -10,6 +10,7 @@ import { FGADeniedError } from '../../auth/ee/fga-check';
 import type { IFGAProvider } from '../../auth/ee/interfaces/fga';
 import { EventEmitterPubSub } from '../../events';
 import { Mastra } from '../../mastra';
+import { createRunScope } from '../../mastra/run-scope';
 import { MASTRA_RESOURCE_ID_KEY, RequestContext } from '../../request-context';
 import { Agent } from '../agent';
 
@@ -32,6 +33,8 @@ function createMockMastra(
   getStorage: () => unknown = () => undefined,
   getMemory: () => unknown = () => undefined,
 ) {
+  const runScopes = new Map<string, ReturnType<typeof createRunScope>>();
+  const runScopeRefcounts = new Map<string, number>();
   return {
     getServer: () => (fgaProvider ? { fga: fgaProvider } : {}),
     getLogger: () => undefined,
@@ -41,6 +44,25 @@ function createMockMastra(
     getVersionOverrides: () => undefined,
     generateId: () => 'test-run-id',
     listGateways: () => [],
+    __getRunScope: (runId: string) => runScopes.get(runId),
+    __createRunScope: (runId: string) => {
+      let scope = runScopes.get(runId);
+      if (!scope) {
+        scope = createRunScope();
+        runScopes.set(runId, scope);
+      }
+      runScopeRefcounts.set(runId, (runScopeRefcounts.get(runId) ?? 0) + 1);
+      return scope;
+    },
+    __releaseRunScope: (runId: string) => {
+      const next = (runScopeRefcounts.get(runId) ?? 0) - 1;
+      if (next <= 0) {
+        runScopeRefcounts.delete(runId);
+        runScopes.delete(runId);
+      } else {
+        runScopeRefcounts.set(runId, next);
+      }
+    },
     __registerInternalWorkflow: vi.fn(),
     __unregisterInternalWorkflow: vi.fn(),
   } as any;
@@ -373,17 +395,37 @@ describe('Agent FGA checks', () => {
     it('should reject streamUntilIdle before resolving memory when FGA is configured without a user', async () => {
       const fgaProvider = createMockFGAProvider(true);
       const getMemory = vi.fn();
-      const mastra = createMockMastra(fgaProvider, () => undefined, getMemory);
+      const mastra = createMockMastra(fgaProvider);
 
       const agent = new Agent({
         id: 'test-agent',
         name: 'test-agent',
         instructions: 'test',
         model: createMockModel(),
+        memory: getMemory,
       });
       (agent as any).__registerMastra(mastra);
 
       await expect(agent.streamUntilIdle('test')).rejects.toThrow(FGADeniedError);
+      expect(getMemory).not.toHaveBeenCalled();
+      expect(fgaProvider.require).not.toHaveBeenCalled();
+    });
+
+    it('should reject stream untilIdle before resolving memory when FGA is configured without a user', async () => {
+      const fgaProvider = createMockFGAProvider(true);
+      const getMemory = vi.fn();
+      const mastra = createMockMastra(fgaProvider);
+
+      const agent = new Agent({
+        id: 'test-agent',
+        name: 'test-agent',
+        instructions: 'test',
+        model: createMockModel(),
+        memory: getMemory,
+      });
+      (agent as any).__registerMastra(mastra);
+
+      await expect(agent.stream('test', { untilIdle: true })).rejects.toThrow(FGADeniedError);
       expect(getMemory).not.toHaveBeenCalled();
       expect(fgaProvider.require).not.toHaveBeenCalled();
     });
@@ -1423,6 +1465,32 @@ describe('Agent FGA checks', () => {
   });
 
   describe('resumeStreamUntilIdle()', () => {
+    it('should reject resumeStream untilIdle before resolving memory for denied users', async () => {
+      const fgaProvider = createMockFGAProvider(false);
+      const getMemory = vi.fn();
+      const mastra = createMockMastra(fgaProvider);
+
+      const agent = new Agent({
+        id: 'test-agent',
+        name: 'test-agent',
+        instructions: 'test',
+        model: {} as any,
+        memory: getMemory,
+      });
+      (agent as any).__registerMastra(mastra);
+
+      const requestContext = new RequestContext();
+      requestContext.set('user', { id: 'user-1' });
+
+      await expect(
+        agent.resumeStream(
+          { approved: true },
+          { runId: 'missing-run-id', requestContext: requestContext as any, untilIdle: true },
+        ),
+      ).rejects.toThrow(FGADeniedError);
+      expect(getMemory).not.toHaveBeenCalled();
+    });
+
     it('should reject denied users before resumeStreamUntilIdle resolves memory', async () => {
       const fgaProvider = createMockFGAProvider(false);
       const getMemory = vi.fn();

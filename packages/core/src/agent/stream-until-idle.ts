@@ -22,6 +22,7 @@ import type { BackgroundTaskManager } from '../background-tasks/manager';
 import { runIdleLoop } from '../loop/shared/stream-until-idle-helpers';
 import type { MastraModelOutput } from '../stream/base/output';
 import type { Agent } from './agent';
+import type { ResolvedAgentMemory, ResolvedAgentMemoryHandoff } from './execution-memory';
 import type { MessageListInput } from './message-list';
 
 /**
@@ -72,6 +73,24 @@ export interface StreamUntilIdleDeps {
    * `runStreamUntilIdle` falls through to a plain `agent.stream` call.
    */
   bgManager: BackgroundTaskManager | undefined;
+  /** Keep live memory in runScope and pass only its random token downstream. */
+  prepareResolvedMemoryHandoff: (
+    runId: string,
+    resolvedMemory: ResolvedAgentMemory,
+    executionMemoryId?: string,
+  ) => Promise<ResolvedAgentMemoryHandoff>;
+  /** Generate the concrete run id required to key a fresh execution handoff. */
+  resolveRunId: (options: Record<string, any>) => string;
+}
+
+function withDefaultOptions(
+  options: Record<string, any>,
+  defaultOptions: Record<string, any>,
+): Record<string | symbol, any> {
+  return {
+    ...options,
+    [STREAM_UNTIL_IDLE_DEFAULT_OPTIONS]: defaultOptions,
+  };
 }
 
 /**
@@ -89,12 +108,25 @@ export async function runStreamUntilIdle<OUTPUT>(
   messages: MessageListInput,
   streamOptions: (Record<string, any> & { maxIdleMs?: number }) | undefined,
   deps: StreamUntilIdleDeps,
+  executionMemoryId?: string,
 ): Promise<MastraModelOutput<OUTPUT>> {
   return runIdleLoop<ReturnType<typeof agentForIdleLoop>, MastraModelOutput<OUTPUT>, MastraModelOutput<OUTPUT>>(
     agentForIdleLoop(agent, streamOptions),
     streamOptions,
     deps,
-    opts => agent.stream(messages, opts as any) as Promise<MastraModelOutput<OUTPUT>>,
+    async (opts, memory, defaultOptions, mergedOptions) => {
+      const runId = mergedOptions.runId ?? deps.resolveRunId(mergedOptions);
+      const handoff = await deps.prepareResolvedMemoryHandoff(runId, { value: memory }, executionMemoryId);
+      try {
+        return await (agent.stream as any)(
+          messages,
+          withDefaultOptions({ ...opts, runId }, defaultOptions),
+          handoff.executionMemoryId,
+        );
+      } finally {
+        handoff.release();
+      }
+    },
     opts => (agent.stream as any)([], opts) as Promise<{ fullStream: ReadableStream<any> }>,
     (first, ctx) => {
       // No ctx means no bgManager / no memory — fall through without wrapping.
@@ -136,12 +168,28 @@ export async function runResumeStreamUntilIdle<OUTPUT>(
   resumeData: any,
   streamOptions: (Record<string, any> & { maxIdleMs?: number; runId?: string; toolCallId?: string }) | undefined,
   deps: StreamUntilIdleDeps,
+  executionMemoryId?: string,
 ): Promise<MastraModelOutput<OUTPUT>> {
   return runIdleLoop<ReturnType<typeof agentForIdleLoop>, MastraModelOutput<OUTPUT>, MastraModelOutput<OUTPUT>>(
     agentForIdleLoop(agent, streamOptions),
     streamOptions,
     deps,
-    opts => agent.resumeStream(resumeData, opts as any) as Promise<MastraModelOutput<OUTPUT>>,
+    async (opts, memory, defaultOptions, mergedOptions) => {
+      const runId = mergedOptions.runId as string | undefined;
+      const resolvedOptions = withDefaultOptions(runId ? { ...opts, runId } : opts, defaultOptions);
+      if (!runId) {
+        // Preserve resumeStream's missing-run error path; it exits before
+        // #execute, so there is no second memory resolution to suppress.
+        return (agent.resumeStream as any)(resumeData, resolvedOptions, executionMemoryId);
+      }
+
+      const handoff = await deps.prepareResolvedMemoryHandoff(runId, { value: memory }, executionMemoryId);
+      try {
+        return await (agent.resumeStream as any)(resumeData, resolvedOptions, handoff.executionMemoryId);
+      } finally {
+        handoff.release();
+      }
+    },
     opts => (agent.stream as any)([], opts) as Promise<{ fullStream: ReadableStream<any> }>,
     (first, ctx) => {
       if (!ctx) return first;

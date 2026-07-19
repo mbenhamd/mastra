@@ -1,7 +1,7 @@
 import { simulateReadableStream } from '@internal/ai-sdk-v4';
 import { MockLanguageModelV1 } from '@internal/ai-sdk-v4/test';
 import { convertArrayToReadableStream, MockLanguageModelV2 } from '@internal/ai-sdk-v5/test';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
 import { Mastra } from '../../mastra';
 import { MockMemory } from '../../memory/mock';
@@ -188,7 +188,132 @@ function dynamicMemoryTest(version: 'v1' | 'v2') {
       expect(thread?.resourceId).toBe('user-1');
     });
 
+    if (version === 'v1') {
+      it('should resolve dynamic memory once for generateLegacy', async () => {
+        const mockMemory = new MockMemory({ storage: new InMemoryStore() });
+        let resolverCalls = 0;
+        const agent = new Agent({
+          id: 'legacy-generate-single-memory-agent',
+          name: 'Legacy Generate Single Memory Agent',
+          instructions: 'test agent',
+          model: dummyModel,
+          memory: () => {
+            resolverCalls += 1;
+            return mockMemory;
+          },
+        });
+
+        const response = await agent.generateLegacy('test message', {
+          memory: { resource: 'user-1', thread: 'legacy-generate-thread' },
+        });
+
+        expect(response.text).toBe('Dummy response');
+        expect(resolverCalls).toBe(1);
+      });
+
+      it('should resolve dynamic memory once for streamLegacy', async () => {
+        const mockMemory = new MockMemory({ storage: new InMemoryStore() });
+        let resolverCalls = 0;
+        const model = new MockLanguageModelV1({
+          doStream: async () => ({
+            stream: simulateReadableStream({
+              chunks: [
+                { type: 'text-delta', textDelta: 'Dummy response' },
+                {
+                  type: 'finish',
+                  finishReason: 'stop',
+                  logprobs: undefined,
+                  usage: { completionTokens: 2, promptTokens: 1 },
+                },
+              ],
+            }),
+            rawCall: { rawPrompt: null, rawSettings: {} },
+          }),
+        });
+        const agent = new Agent({
+          id: 'legacy-stream-single-memory-agent',
+          name: 'Legacy Stream Single Memory Agent',
+          instructions: 'test agent',
+          model,
+          memory: () => {
+            resolverCalls += 1;
+            return mockMemory;
+          },
+        });
+
+        const response = await agent.streamLegacy('test message', {
+          memory: { resource: 'user-1', thread: 'legacy-stream-thread' },
+        });
+        for await (const _chunk of response.textStream) {
+          // Drain finish handling and output processors.
+        }
+
+        expect(resolverCalls).toBe(1);
+      });
+
+      it('should preserve a single no-memory result for generateLegacy', async () => {
+        const agent = new Agent({
+          id: 'legacy-no-memory-agent',
+          name: 'Legacy No Memory Agent',
+          instructions: 'test agent',
+          model: dummyModel,
+        });
+        const getMemory = vi.spyOn(agent, 'getMemory');
+
+        const response = await agent.generateLegacy('test message');
+
+        expect(response.text).toBe('Dummy response');
+        expect(getMemory).toHaveBeenCalledTimes(1);
+      });
+
+      it.each(['generateLegacy', 'streamLegacy'] as const)(
+        'should surface a %s memory failure after one resolution attempt',
+        async method => {
+          const resolverError = new Error(`legacy ${method} memory failed`);
+          let resolverCalls = 0;
+          const agent = new Agent({
+            id: `legacy-memory-failure-${method}`,
+            name: `Legacy Memory Failure ${method}`,
+            instructions: 'test agent',
+            model: dummyModel,
+            memory: () => {
+              resolverCalls += 1;
+              throw resolverError;
+            },
+          });
+
+          await expect((agent[method] as any)('test message')).rejects.toBe(resolverError);
+          expect(resolverCalls).toBe(1);
+        },
+      );
+    }
+
     if (version === 'v2') {
+      it.each(['generateLegacy', 'streamLegacy'] as const)(
+        'should reject a v2 model in %s before resolving dynamic memory',
+        async method => {
+          let resolverCalls = 0;
+          const agent = new Agent({
+            id: `legacy-model-guard-${method}`,
+            name: `Legacy Model Guard ${method}`,
+            instructions: 'test agent',
+            model: dummyModel,
+            memory: () => {
+              resolverCalls += 1;
+              return new MockMemory({ storage: new InMemoryStore() });
+            },
+          });
+
+          await expect((agent[method] as any)('test message')).rejects.toMatchObject({
+            id:
+              method === 'generateLegacy'
+                ? 'AGENT_GENERATE_V2_MODEL_NOT_SUPPORTED'
+                : 'AGENT_STREAM_V2_MODEL_NOT_SUPPORTED',
+          });
+          expect(resolverCalls).toBe(0);
+        },
+      );
+
       it('should resolve dynamic memory once per execution', async () => {
         const mockMemory = new MockMemory({ storage: new InMemoryStore() });
         let resolverCalls = 0;
@@ -239,6 +364,104 @@ function dynamicMemoryTest(version: 'v1' | 'v2') {
 
         await agent.generate('follow-up message', { memory });
         expect(resolverCalls).toBe(2);
+      });
+
+      it('should resolve dynamic memory once for a stream execution', async () => {
+        const mockMemory = new MockMemory({ storage: new InMemoryStore() });
+        let resolverCalls = 0;
+        const agent = new Agent({
+          id: 'single-resolution-stream-memory-agent',
+          name: 'Single Resolution Stream Memory Agent',
+          instructions: 'test agent',
+          model: dummyModel,
+          memory: () => {
+            resolverCalls += 1;
+            return mockMemory;
+          },
+        });
+
+        const response = await agent.stream('test message', {
+          memory: { resource: 'user-1', thread: 'single-resolution-stream-thread' },
+        });
+        for await (const _chunk of response.fullStream) {
+          // Drain finish handling and output processors.
+        }
+
+        expect(resolverCalls).toBe(1);
+      });
+
+      it('should reuse a no-memory resolution across the whole execution', async () => {
+        const agent = new Agent({
+          id: 'no-memory-resolution-agent',
+          name: 'No Memory Resolution Agent',
+          instructions: 'test agent',
+          model: dummyModel,
+        });
+        const getMemory = vi.spyOn(agent, 'getMemory');
+
+        await agent.generate('test message');
+
+        expect(getMemory).toHaveBeenCalledTimes(1);
+      });
+
+      it('should reuse idle-wrapper memory for the initial execution', async () => {
+        const mockMemory = new MockMemory({ storage: new InMemoryStore() });
+        let resolverCalls = 0;
+        const agent = new Agent({
+          id: 'until-idle-single-memory-agent',
+          name: 'Until Idle Single Memory Agent',
+          instructions: 'test agent',
+          model: dummyModel,
+          memory: () => {
+            resolverCalls += 1;
+            return mockMemory;
+          },
+        });
+
+        const response = await agent.stream('test message', {
+          untilIdle: true,
+          memory: { resource: 'user-1', thread: 'until-idle-single-memory-thread' },
+        });
+        for await (const _chunk of response.fullStream) {
+          // Drain the wrapper's initial execution.
+        }
+
+        expect(resolverCalls).toBe(1);
+      });
+
+      it('should reuse one dynamic default context for idle-wrapper memory and execution', async () => {
+        const mockMemory = new MockMemory({ storage: new InMemoryStore() });
+        const memoryScopes: string[] = [];
+        const instructionScopes: string[] = [];
+        let defaultOptionsCalls = 0;
+        const agent = new Agent({
+          id: 'until-idle-default-context-agent',
+          name: 'Until Idle Default Context Agent',
+          instructions: ({ requestContext }) => {
+            instructionScopes.push(requestContext.get('scope') as string);
+            return 'test agent';
+          },
+          model: dummyModel,
+          defaultOptions: () => {
+            defaultOptionsCalls += 1;
+            const requestContext = new RequestContext();
+            requestContext.set('scope', `scope-${defaultOptionsCalls}`);
+            return { requestContext };
+          },
+          memory: ({ requestContext }) => {
+            memoryScopes.push(requestContext.get('scope') as string);
+            return mockMemory;
+          },
+        });
+
+        const response = await agent.stream('test message', { untilIdle: true });
+        for await (const _chunk of response.fullStream) {
+          // Drain the wrapper's initial execution.
+        }
+
+        expect(defaultOptionsCalls).toBe(1);
+        expect(memoryScopes).toEqual(['scope-1']);
+        expect(instructionScopes).toEqual(['scope-1']);
       });
 
       it('should isolate dynamic memory across concurrent executions', async () => {
@@ -366,6 +589,50 @@ function dynamicMemoryTest(version: 'v1' | 'v2') {
           { resourceId: 'user-1' },
         );
       });
+
+      it.each(['generate', 'stream'] as const)(
+        'should reuse delegated sub-agent memory for %s transcript persistence',
+        async methodType => {
+          const memory = new MockMemory({ storage: new InMemoryStore() });
+          let resolverCalls = 0;
+          const subAgent = new Agent({
+            id: 'dynamic-memory-sub-agent',
+            name: 'Dynamic Memory Sub-agent',
+            instructions: 'Return a delegated result.',
+            model: dummyModel,
+            memory: () => {
+              resolverCalls += 1;
+              return memory;
+            },
+          });
+          const parentAgent = new Agent({
+            id: 'dynamic-memory-parent-agent',
+            name: 'Dynamic Memory Parent Agent',
+            instructions: 'Delegate work.',
+            model: dummyModel,
+            agents: { subAgent },
+          });
+          const tools = await parentAgent['convertTools']({
+            requestContext: new RequestContext(),
+            methodType,
+          });
+          // Background eligibility discovery is outside the sub-agent execution
+          // boundary and currently resolves its full tool surface once.
+          const resolverCallsBeforeExecution = resolverCalls;
+
+          const result = (await tools['agent-subAgent']!.execute?.({ prompt: 'Do the delegated work.' }, {
+            toolCallId: 'dynamic-memory-sub-agent-call',
+            messages: [],
+          } as any)) as { text: string; subAgentThreadId: string; subAgentResourceId: string };
+
+          expect(result.text).toBe('Dummy response');
+          expect(resolverCallsBeforeExecution).toBe(1);
+          expect(resolverCalls - resolverCallsBeforeExecution).toBe(1);
+          await expect(memory.getThreadById({ threadId: result.subAgentThreadId })).resolves.toMatchObject({
+            resourceId: result.subAgentResourceId,
+          });
+        },
+      );
 
       it('should stop before model or tool execution when dynamic memory resolution fails', async () => {
         let modelCalls = 0;
@@ -510,6 +777,7 @@ function dynamicMemoryTest(version: 'v1' | 'v2') {
         const registeredAgent = mastra.getAgent('agent');
 
         const stream = await registeredAgent.stream('approve the tool', {
+          untilIdle: true,
           memory: { resource: 'user-1', thread: 'resume-memory-thread' },
           maxSteps: 2,
         });
@@ -521,6 +789,7 @@ function dynamicMemoryTest(version: 'v1' | 'v2') {
         const resumed = await registeredAgent.resumeStream(
           { approved: true },
           {
+            untilIdle: true,
             runId: stream.runId,
             toolCallId: 'approval-call',
             memory: { resource: 'user-1', thread: 'resume-memory-thread' },

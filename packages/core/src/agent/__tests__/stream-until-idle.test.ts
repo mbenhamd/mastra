@@ -2,6 +2,7 @@ import { convertArrayToReadableStream, MockLanguageModelV2 } from '@internal/ai-
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { Mastra } from '../../mastra';
 import { MockMemory } from '../../memory';
+import { RequestContext } from '../../request-context';
 import { MockStore } from '../../storage';
 import { Agent } from '../agent';
 
@@ -119,6 +120,10 @@ describe('Agent.streamUntilIdle', () => {
 
   it('re-invokes stream when a background task completes', async () => {
     const memory = new MockMemory();
+    let memoryResolverCalls = 0;
+    let defaultOptionsCalls = 0;
+    const memoryScopes: string[] = [];
+    const instructionScopes: string[] = [];
     const { model, getCallCount } = makeScriptedModel([
       textResponse('first response'),
       textResponse('continuation response'),
@@ -127,9 +132,22 @@ describe('Agent.streamUntilIdle', () => {
     const agent = new Agent({
       id: 'a2',
       name: 'a2',
-      instructions: 'test',
+      instructions: ({ requestContext }) => {
+        instructionScopes.push(requestContext.get('scope') as string);
+        return 'test';
+      },
       model,
-      memory,
+      defaultOptions: () => {
+        defaultOptionsCalls += 1;
+        const requestContext = new RequestContext();
+        requestContext.set('scope', `turn-${defaultOptionsCalls}`);
+        return { requestContext };
+      },
+      memory: ({ requestContext }) => {
+        memoryResolverCalls += 1;
+        memoryScopes.push(requestContext.get('scope') as string);
+        return memory;
+      },
     });
     mastra.addAgent(agent, 'a2');
 
@@ -168,6 +186,11 @@ describe('Agent.streamUntilIdle', () => {
 
     // Initial turn + one continuation = 2 LLM calls
     expect(getCallCount()).toBe(2);
+    // Each turn is its own execution boundary; neither turn resolves memory twice.
+    expect(memoryResolverCalls).toBe(2);
+    expect(defaultOptionsCalls).toBe(2);
+    expect(memoryScopes).toEqual(['turn-1', 'turn-2']);
+    expect(instructionScopes).toEqual(['turn-1', 'turn-2']);
   });
 
   it('serializes continuations (only one inner stream at a time)', async () => {
