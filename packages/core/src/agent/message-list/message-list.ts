@@ -344,7 +344,7 @@ export class MessageList {
 
     const lastIndexById = new Map<string, number>();
     for (const [index, { message }] of replacements.entries()) {
-      lastIndexById.set(message.id, index);
+      if (message.id) lastIndexById.set(message.id, index);
     }
 
     for (const [index, { message, source }] of replacements.entries()) {
@@ -353,13 +353,18 @@ export class MessageList {
           (message.content.content as string | undefined) ??
           message.content.parts?.map(part => (part.type === 'text' ? part.text : '')).join('\n') ??
           '';
-        this.addSystem(systemText);
+        if (systemText) {
+          this.addSystem({
+            ...message,
+            content: { ...message.content, content: systemText },
+          });
+        }
         continue;
       }
 
       // Match the prior last-write-wins behavior for malformed histories with
       // duplicate IDs while keeping the valid unique-ID path linear.
-      if (lastIndexById.get(message.id) !== index) {
+      if (message.id && lastIndexById.get(message.id) !== index) {
         continue;
       }
 

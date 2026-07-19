@@ -91,6 +91,51 @@ describe('ProcessorRunner', () => {
       }
     });
 
+    it('hydrates each processor replacement that has an empty message ID', () => {
+      const replacements = [
+        { ...createMessage('first empty ID'), id: '' },
+        { ...createMessage('second empty ID'), id: '' },
+      ];
+
+      messageList.replaceMessagesForProcessor(
+        replacements.map(message => ({ message, source: 'input' as const })),
+        [],
+      );
+
+      const stored = messageList.get.input.db();
+      expect(stored).toHaveLength(2);
+      expect(stored.map(message => message.content.parts[0])).toEqual([
+        expect.objectContaining({ text: 'first empty ID' }),
+        expect.objectContaining({ text: 'second empty ID' }),
+      ]);
+      expect(stored.every(message => message.id.length > 0)).toBe(true);
+      expect(new Set(stored.map(message => message.id)).size).toBe(2);
+    });
+
+    it('preserves provider metadata on processor-returned system messages', () => {
+      const providerMetadata = { openai: { itemId: 'system-item' } };
+      const systemMessage = {
+        ...createMessage('processor instruction'),
+        role: 'system' as const,
+        content: {
+          format: 2 as const,
+          content: 'processor instruction',
+          parts: [{ type: 'text' as const, text: 'processor instruction' }],
+          providerMetadata,
+        },
+      };
+
+      messageList.replaceMessagesForProcessor([{ message: systemMessage, source: 'input' }], []);
+
+      expect(messageList.getSystemMessages()).toEqual([
+        {
+          role: 'system',
+          content: 'processor instruction',
+          experimental_providerMetadata: providerMetadata,
+        },
+      ]);
+    });
+
     it('should run input processors in order', async () => {
       const executionOrder: string[] = [];
       const inputProcessors: Processor[] = [

@@ -799,6 +799,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       includeResumeLabels?: boolean;
     };
     perStep?: boolean;
+    commitTerminalStatus?: (status: WorkflowRunStatus) => void;
     /** Trace IDs for creating child spans in durable execution */
     tracingIds?: {
       traceId: string;
@@ -1037,22 +1038,6 @@ export class DefaultExecutionEngine extends ExecutionEngine {
           lastOutput.result.status = 'canceled';
         }
 
-        if (result.error) {
-          workflowSpan?.error({
-            error: result.error,
-            attributes: {
-              status: result.status,
-            },
-          });
-        } else {
-          workflowSpan?.end({
-            output: result.result,
-            attributes: {
-              status: result.status,
-            },
-          });
-        }
-
         if (lastOutput.result.status !== 'paused') {
           // Invoke lifecycle callbacks before returning
           await this.invokeLifecycleCallbacks({
@@ -1071,12 +1056,40 @@ export class DefaultExecutionEngine extends ExecutionEngine {
           });
         }
 
+        // A lifecycle callback can yield while Run.cancel() wins ownership of
+        // the terminal transition. Reconcile before committing any terminal
+        // status or publishing the lifecycle sequence for it.
+        if (params.abortController.signal.aborted) {
+          result = { ...result, status: 'canceled', result: undefined, error: undefined };
+          lastOutput.result.status = 'canceled';
+        }
+
+        if (result.error) {
+          workflowSpan?.error({
+            error: result.error,
+            attributes: {
+              status: result.status,
+            },
+          });
+        } else {
+          workflowSpan?.end({
+            output: result.result,
+            attributes: {
+              status: result.status,
+            },
+          });
+        }
+
         if (!suppressLifecycleEvents && lastOutput.result.status === 'paused') {
           await params.pubsub.publish(`workflow.events.v2.${runId}`, {
             type: 'watch',
             runId,
             data: { type: 'workflow-paused', payload: {} },
           });
+          if (params.abortController.signal.aborted) {
+            result = { ...result, status: 'canceled', result: undefined, error: undefined };
+            lastOutput.result.status = 'canceled';
+          }
         }
 
         if (!suppressLifecycleEvents) {
@@ -1092,7 +1105,18 @@ export class DefaultExecutionEngine extends ExecutionEngine {
                 suspendedStepIds: Object.keys(lastOutput.mutableContext.suspendedPaths),
               },
             });
-          } else if (result.status !== 'paused') {
+            if (params.abortController.signal.aborted) {
+              result = { ...result, status: 'canceled', result: undefined, error: undefined };
+              lastOutput.result.status = 'canceled';
+            }
+          }
+
+          if (result.status !== 'suspended' && result.status !== 'paused') {
+            // This synchronous callback is the terminal commit boundary. No
+            // awaited work may occur between the last abort reconciliation
+            // above and this call.
+            params.commitTerminalStatus?.(result.status);
+
             if (result.status === 'failed' || result.status === 'tripwire') {
               await publishWorkflowLifecycleEvent({
                 pubsub: params.pubsub,
@@ -1125,6 +1149,8 @@ export class DefaultExecutionEngine extends ExecutionEngine {
               },
             });
           }
+        } else if (result.status !== 'suspended' && result.status !== 'paused') {
+          params.commitTerminalStatus?.(result.status);
         }
 
         // Drop the last-persisted-status tracker for early terminal exits
@@ -1238,6 +1264,10 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       result = { ...result, status: 'canceled', result: undefined, error: undefined };
     }
 
+    // Establish the terminal owner synchronously after the last cancellation
+    // check and before any lifecycle publication can yield.
+    params.commitTerminalStatus?.(result.status);
+
     if (!suppressLifecycleEvents && result.status === 'canceled') {
       await publishWorkflowLifecycleEvent({
         pubsub: params.pubsub,
@@ -1262,13 +1292,6 @@ export class DefaultExecutionEngine extends ExecutionEngine {
           error: result.error,
         },
       });
-    }
-
-    // A lifecycle transport can also yield while the run is still active.
-    // Reconcile once more before returning so Run never overwrites a concurrent
-    // cancellation with the result formatted before terminal delivery.
-    if (params.abortController.signal.aborted) {
-      result = { ...result, status: 'canceled', result: undefined, error: undefined };
     }
 
     workflowSpan?.end({

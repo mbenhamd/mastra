@@ -195,5 +195,11 @@ export abstract class ExecutionEngine extends MastraBase {
       includeResumeLabels?: boolean;
     };
     perStep?: boolean;
+    /**
+     * Atomically records the terminal status immediately before lifecycle
+     * publication. Once committed, a concurrent cancellation is too late to
+     * replace the status represented by `workflow.finished`.
+     */
+    commitTerminalStatus?: (status: WorkflowRunStatus) => void;
   }): Promise<TOutput>;
 }

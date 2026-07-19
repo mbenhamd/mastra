@@ -268,6 +268,141 @@ describe('explicitly transient workflow lifecycle reads', () => {
     expect(run.abortController.signal.aborted).toBe(true);
   });
 
+  it('preserves a transient cancellation that arrives during failed lifecycle callbacks', async () => {
+    const failingStep = createStep({
+      id: 'failed-callback-step',
+      inputSchema: ioSchema,
+      outputSchema: ioSchema,
+      execute: async () => {
+        throw new Error('expected failure');
+      },
+    });
+    const workflow = createWorkflow({
+      id: 'explicit-transient-failed-callback-cancel',
+      inputSchema: ioSchema,
+      outputSchema: ioSchema,
+      steps: [failingStep],
+      options: { executionMode: 'transient' },
+    })
+      .then(failingStep)
+      .commit();
+    new Mastra({ logger: false, workflows: { [workflow.id]: workflow } });
+    const executionEngine = (workflow as any).executionEngine;
+    const invokeLifecycleCallbacks = executionEngine.invokeLifecycleCallbacks.bind(executionEngine);
+    let markCallbackStarted!: () => void;
+    const callbackStarted = new Promise<void>(resolve => {
+      markCallbackStarted = resolve;
+    });
+    let releaseCallback!: () => void;
+    const callbackGate = new Promise<void>(resolve => {
+      releaseCallback = resolve;
+    });
+    vi.spyOn(executionEngine, 'invokeLifecycleCallbacks').mockImplementation(async (...args: any[]) => {
+      markCallbackStarted();
+      await callbackGate;
+      return invokeLifecycleCallbacks(...args);
+    });
+
+    const run = await workflow.createRun();
+    const resultPromise = run.start({ inputData: { value: 'cancel-failed-callback' } });
+    await callbackStarted;
+    await run.cancel();
+    releaseCallback();
+
+    await expect(resultPromise).resolves.toMatchObject({ status: 'canceled', result: undefined, error: undefined });
+    expect(run.workflowRunStatus).toBe('canceled');
+    expect(run.abortController.signal.aborted).toBe(true);
+  });
+
+  it('admits only one concurrent start for the same transient Run instance', async () => {
+    let executionCount = 0;
+    let markExecutionStarted!: () => void;
+    const executionStarted = new Promise<void>(resolve => {
+      markExecutionStarted = resolve;
+    });
+    let releaseExecution!: () => void;
+    const executionGate = new Promise<void>(resolve => {
+      releaseExecution = resolve;
+    });
+    const guardedStep = createStep({
+      id: 'single-admission-step',
+      inputSchema: ioSchema,
+      outputSchema: ioSchema,
+      execute: async ({ inputData }) => {
+        executionCount += 1;
+        markExecutionStarted();
+        await executionGate;
+        return inputData;
+      },
+    });
+    const workflow = createWorkflow({
+      id: 'explicit-transient-concurrent-start',
+      inputSchema: ioSchema,
+      outputSchema: ioSchema,
+      steps: [guardedStep],
+      options: { executionMode: 'transient' },
+    })
+      .then(guardedStep)
+      .commit();
+    new Mastra({ logger: false, workflows: { [workflow.id]: workflow } });
+    const run = await workflow.createRun();
+
+    const settledPromise = Promise.allSettled([
+      run.start({ inputData: { value: 'first' } }),
+      run.start({ inputData: { value: 'second' } }),
+    ]);
+    await executionStarted;
+    releaseExecution();
+    const settled = await settledPromise;
+
+    expect(executionCount).toBe(1);
+    expect(settled.filter(result => result.status === 'fulfilled')).toHaveLength(1);
+    expect(settled.filter(result => result.status === 'rejected')).toEqual([
+      expect.objectContaining({
+        reason: expect.objectContaining({ message: expect.stringContaining('admission is stale') }),
+      }),
+    ]);
+  });
+
+  it('does not cancel after terminal lifecycle publication has committed its status', async () => {
+    const workflow = buildExplicitlyTransientWorkflow('explicit-transient-terminal-publication-commit');
+    const configuredPubsub = new EventEmitterPubSub();
+    const publish = configuredPubsub.publish.bind(configuredPubsub);
+    let markFinishedPublicationStarted!: () => void;
+    const finishedPublicationStarted = new Promise<void>(resolve => {
+      markFinishedPublicationStarted = resolve;
+    });
+    let releaseFinishedPublication!: () => void;
+    const finishedPublicationGate = new Promise<void>(resolve => {
+      releaseFinishedPublication = resolve;
+    });
+    vi.spyOn(configuredPubsub, 'publish').mockImplementation(async (topic, event, options) => {
+      if (event.data?.event?.type === 'workflow.finished') {
+        markFinishedPublicationStarted();
+        await finishedPublicationGate;
+      }
+      return publish(topic, event, options);
+    });
+    new Mastra({
+      logger: false,
+      pubsub: configuredPubsub,
+      workflows: { [workflow.id]: workflow },
+    });
+
+    const run = await workflow.createRun();
+    const resultPromise = run.start({ inputData: { value: 'terminal-publication' } });
+    await finishedPublicationStarted;
+    await run.cancel();
+    releaseFinishedPublication();
+
+    await expect(resultPromise).resolves.toMatchObject({
+      status: 'success',
+      result: { value: 'terminal-publication' },
+    });
+    expect(run.workflowRunStatus).toBe('success');
+    expect(run.abortController.signal.aborted).toBe(false);
+  });
+
   it('rejects reusing an in-memory run ID with a different execution mode', async () => {
     const workflow = buildExplicitlyTransientWorkflow('explicit-transient-mode-reuse');
     const storage = new MockStore();

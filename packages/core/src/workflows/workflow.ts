@@ -3268,6 +3268,10 @@ export class Run<
   #lifecycleResumeAttempt = 0;
   #lifecycleStepStates: WorkflowStepLifecycleStateMap = {};
   #activeExecutionGenerations = new Map<string, number>();
+  #committedTerminalStatus?: {
+    executionGeneration: WorkflowExecutionGeneration;
+    status: WorkflowRunStatus;
+  };
   protected pubsub: PubSub;
   /**
    * Unique identifier for this workflow
@@ -3424,6 +3428,7 @@ export class Run<
     lifecycleStepStates: WorkflowStepLifecycleStateMap;
   } {
     this.resetAbortController();
+    this.#committedTerminalStatus = undefined;
     const executionGeneration = createWorkflowExecutionGeneration();
     this.#executionGeneration = executionGeneration;
     this.#lifecycleResumeAttempt = 0;
@@ -3576,12 +3581,6 @@ export class Run<
     lifecycleResumeAttempt: number;
     lifecycleStepStates: WorkflowStepLifecycleStateMap;
   }): Promise<void> {
-    if (this.transientExecution) {
-      if (this.workflowRunStatus !== 'pending') {
-        throw new Error(`Workflow run ${this.workflowId}/${this.runId} lifecycle execution admission is stale`);
-      }
-      return;
-    }
     const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
     const snapshot = await workflowsStore?.loadWorkflowSnapshot({
       workflowName: this.workflowId,
@@ -3614,7 +3613,10 @@ export class Run<
    * workflow status to 'canceled' in storage.
    */
   async cancel() {
+    if (this.restoreCommittedTerminalStatus()) return;
+
     const workflowsStore = this.transientExecution ? undefined : await this.mastra?.getStorage()?.getStore('workflows');
+    if (this.restoreCommittedTerminalStatus()) return;
     if (
       this.transientExecution &&
       (this.workflowRunStatus === 'success' ||
@@ -3636,6 +3638,7 @@ export class Run<
     } catch {
       snapshot = undefined;
     }
+    if (this.restoreCommittedTerminalStatus()) return;
 
     if (
       snapshot &&
@@ -3658,6 +3661,11 @@ export class Run<
       // Identity reservation is best-effort here. Cancellation must still abort
       // and persist status when storage itself is unavailable.
     }
+
+    // No await may occur between this final ownership check and aborting. The
+    // engine's synchronous terminal commit and cancellation therefore have a
+    // single deterministic winner.
+    if (this.restoreCommittedTerminalStatus()) return;
 
     // Abort any running execution and update in-memory status
     this.abortController.abort();
@@ -3711,6 +3719,24 @@ export class Run<
 
   protected hasActiveLifecycleExecution(executionGeneration: string | undefined): boolean {
     return executionGeneration !== undefined && (this.#activeExecutionGenerations.get(executionGeneration) ?? 0) > 0;
+  }
+
+  private commitTerminalStatus(executionGeneration: WorkflowExecutionGeneration, status: WorkflowRunStatus): void {
+    const committed = this.#committedTerminalStatus;
+    if (committed && committed.executionGeneration === executionGeneration && committed.status !== status) {
+      throw new Error(
+        `Workflow run ${this.workflowId}/${this.runId} cannot replace committed terminal status ${committed.status} with ${status}`,
+      );
+    }
+    this.#committedTerminalStatus = { executionGeneration, status };
+    this.workflowRunStatus = status;
+  }
+
+  private restoreCommittedTerminalStatus(): boolean {
+    const committed = this.#committedTerminalStatus;
+    if (!committed || committed.executionGeneration !== this.#executionGeneration) return false;
+    this.workflowRunStatus = committed.status;
+    return true;
   }
 
   private assertDurableLifecycleOperation(operation: 'resume' | 'restart' | 'time travel'): void {
@@ -3870,9 +3896,18 @@ export class Run<
       const initialStateToUse = await this._validateInitialState(initialState ?? ({} as TState));
       await this._validateRequestContext(requestContext as RequestContext);
 
+      if (this.transientExecution && this.workflowRunStatus !== 'pending') {
+        throw new Error(`Workflow run ${this.workflowId}/${this.runId} lifecycle execution admission is stale`);
+      }
       const lifecycleExecution = this.startLifecycleExecution();
-      await this.assertLifecycleExecutionAdmission(lifecycleExecution);
-      this.workflowRunStatus = 'running';
+      if (this.transientExecution) {
+        // Claim the process-local run without yielding. A second start cannot
+        // reserve a new lineage between admission and this status transition.
+        this.workflowRunStatus = 'running';
+      } else {
+        await this.assertLifecycleExecutionAdmission(lifecycleExecution);
+        this.workflowRunStatus = 'running';
+      }
 
       const result = await this.#withActiveExecution(lifecycleExecution.executionGeneration, () =>
         this.executionEngine.execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({
@@ -3896,6 +3931,7 @@ export class Run<
           format,
           outputOptions,
           perStep,
+          commitTerminalStatus: status => this.commitTerminalStatus(lifecycleExecution.executionGeneration, status),
         }),
       );
 
@@ -4785,6 +4821,7 @@ export class Run<
         outputOptions: params.outputOptions,
         outputWriter: params.outputWriter,
         perStep: params.perStep,
+        commitTerminalStatus: status => this.commitTerminalStatus(executionGeneration, status),
       }),
     ).then(result => {
       this.workflowRunStatus = result.status;
@@ -4886,6 +4923,7 @@ export class Run<
         abortController: this.abortController,
         outputWriter,
         workflowSpan,
+        commitTerminalStatus: status => this.commitTerminalStatus(lifecycleExecution.executionGeneration, status),
       }),
     );
 
@@ -5037,6 +5075,7 @@ export class Run<
         workflowSpan,
         outputOptions,
         perStep,
+        commitTerminalStatus: status => this.commitTerminalStatus(lifecycleExecution.executionGeneration, status),
       }),
     );
 
