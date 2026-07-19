@@ -804,6 +804,8 @@ export type ProcessorTypes<TTripwireMetadata = unknown> =
   | OutputProcessor<TTripwireMetadata>
   | ErrorProcessor<TTripwireMetadata>;
 
+export type ProcessorWorkflowPhase = ProcessorStepOutput['phase'];
+
 /**
  * A Workflow that can be used as a processor.
  * The workflow must accept ProcessorStepInput and return ProcessorStepOutput.
@@ -833,7 +835,15 @@ export type OutputProcessorOrWorkflow<TTripwireMetadata = unknown> =
  */
 export type ErrorProcessorOrWorkflow<TTripwireMetadata = unknown> = ErrorProcessor<TTripwireMetadata>;
 
-export { isProcessorWorkflow } from './is-processor-workflow';
+export {
+  copyProcessorWorkflowTraits,
+  getProcessorWorkflowPhases,
+  isProcessorWorkflow,
+  processorWorkflowHasPhaseRestrictions,
+  processorWorkflowRequiresDurableExecution,
+  processorWorkflowSupportsPhase,
+  setProcessorWorkflowPhases,
+} from './is-processor-workflow';
 
 export * from './processors';
 export { PrefillErrorHandler } from './prefill-error-handler';

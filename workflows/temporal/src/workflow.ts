@@ -1,5 +1,8 @@
+import type { PubSub } from '@mastra/core/events';
 import { Workflow, createStep } from '@mastra/core/workflows';
-import type { Step, WorkflowConfig } from '@mastra/core/workflows';
+import type { RunWithRawInput, Step, WorkflowConfig } from '@mastra/core/workflows';
+import { TRANSIENT_EXECUTION_SYMBOL } from '@mastra/core/workflows/_constants';
+import type { PROCESSOR_EXECUTION_SYMBOL } from '@mastra/core/workflows/_constants';
 import type { Client } from '@temporalio/client';
 import { TemporalRun } from './run';
 import type { TemporalEngineType } from './types';
@@ -43,7 +46,19 @@ export class TemporalWorkflow<
     this.startToCloseTimeout = temporalParams.startToCloseTimeout ?? '1 minute';
   }
 
-  async createRun(options?: { runId?: string; resourceId?: string; disableScorers?: boolean }) {
+  async createRun(options?: {
+    runId?: string;
+    resourceId?: string;
+    disableScorers?: boolean;
+    pubsub?: PubSub;
+    /** @internal Accepted for substitutability; Temporal processor workflows remain durable. */
+    [PROCESSOR_EXECUTION_SYMBOL]?: boolean;
+    /** @internal Temporal cannot inherit process-local execution from a parent workflow. */
+    [TRANSIENT_EXECUTION_SYMBOL]?: boolean;
+  }): Promise<RunWithRawInput<TemporalEngineType, TSteps, TState, TInput, TOutput, TRequestContext, TInput>> {
+    if (options?.[TRANSIENT_EXECUTION_SYMBOL] === true) {
+      throw new TypeError('Temporal workflows cannot run inside transient workflows');
+    }
     const runId = options?.runId ?? crypto.randomUUID();
     const run = new TemporalRun<TSteps, TState, TInput, TOutput, TRequestContext>(
       {
@@ -64,6 +79,7 @@ export class TemporalWorkflow<
         validateInputs: this.options.validateInputs,
         workflowEngineType: this.engineType,
         cleanup: undefined,
+        pubsub: options?.pubsub,
       },
       {
         client: this.temporalClient,
@@ -72,7 +88,7 @@ export class TemporalWorkflow<
     );
 
     this.runs.set(runId, run);
-    return run;
+    return run as RunWithRawInput<TemporalEngineType, TSteps, TState, TInput, TOutput, TRequestContext, TInput>;
   }
 }
 

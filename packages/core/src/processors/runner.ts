@@ -20,7 +20,13 @@ import type { RequestContext } from '../request-context';
 import type { ChunkType } from '../stream';
 import type { MastraModelOutput } from '../stream/base/output';
 import type { LanguageModelUsage, ProviderMetadata } from '../stream/types';
-import { isProcessorWorkflow } from './is-processor-workflow';
+import { deepEqual } from '../utils';
+import { PROCESSOR_EXECUTION_SYMBOL } from '../workflows/constants';
+import {
+  isProcessorWorkflow,
+  processorWorkflowRequiresDurableExecution,
+  processorWorkflowSupportsPhase,
+} from './is-processor-workflow';
 import { createProcessorSendSignal } from './send-signal';
 import {
   summarizeActiveToolsForSpan,
@@ -65,6 +71,26 @@ async function invokeOnViolation(processor: Processor, error: TripWire): Promise
   } catch {
     // onViolation errors are silently caught
   }
+}
+
+function outputProcessorSupportsStream(processorOrWorkflow: ProcessorOrWorkflow): boolean {
+  return isProcessorWorkflow(processorOrWorkflow)
+    ? processorWorkflowSupportsPhase(processorOrWorkflow, 'outputStream')
+    : Boolean(processorOrWorkflow.processOutputStream);
+}
+
+export function outputProcessorsSupportStream(outputProcessors: readonly ProcessorOrWorkflow[] | undefined): boolean {
+  return Boolean(outputProcessors?.some(outputProcessorSupportsStream));
+}
+
+function outputProcessorSupportsResult(processorOrWorkflow: ProcessorOrWorkflow): boolean {
+  return isProcessorWorkflow(processorOrWorkflow)
+    ? processorWorkflowSupportsPhase(processorOrWorkflow, 'outputResult')
+    : Boolean(processorOrWorkflow.processOutputResult);
+}
+
+export function outputProcessorsSupportResult(outputProcessors: readonly ProcessorOrWorkflow[] | undefined): boolean {
+  return Boolean(outputProcessors?.some(outputProcessorSupportsResult));
 }
 
 /**
@@ -163,8 +189,68 @@ function areProcessorMessageArraysEqual(before: unknown[] | undefined, after: un
 
   return (
     before.length === after.length &&
-    before.every((message, index) => messagesAreEqual(message as MessageInput, after[index] as MessageInput))
+    before.every(
+      (message, index) =>
+        message === after[index] || messagesAreEqual(message as MessageInput, after[index] as MessageInput),
+    )
   );
+}
+
+function areProcessorMessageArraysSemanticallyEqual(
+  before: unknown[] | undefined,
+  after: unknown[] | undefined,
+): boolean {
+  if (before === after) {
+    return true;
+  }
+
+  if (!before || !after || before.length !== after.length) {
+    return before === after;
+  }
+
+  for (let index = 0; index < before.length; index++) {
+    if (before[index] !== after[index] && !deepEqual(before[index], after[index])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function haveSameProcessorMessageReferences(before: unknown[], after: unknown[]): boolean {
+  if (before === after) return true;
+  if (before.length !== after.length) return false;
+  for (let index = 0; index < before.length; index++) {
+    if (before[index] !== after[index]) return false;
+  }
+  return true;
+}
+
+function matchesAnyUniqueProcessorMessageSnapshot(
+  messages: unknown[],
+  first: unknown[],
+  second: unknown[],
+  third?: unknown[],
+): boolean {
+  // Check every unique snapshot by reference before recursively comparing any
+  // message. Workflow steps commonly return the live post-workflow history, so
+  // considering a stale pre-workflow snapshot first can otherwise walk the
+  // entire transcript before reaching the reference-identical candidate.
+  if (haveSameProcessorMessageReferences(first, messages)) return true;
+
+  const secondIsUnique = !haveSameProcessorMessageReferences(first, second);
+  if (secondIsUnique && haveSameProcessorMessageReferences(second, messages)) return true;
+
+  const thirdIsUnique =
+    third !== undefined &&
+    !haveSameProcessorMessageReferences(first, third) &&
+    (!secondIsUnique || !haveSameProcessorMessageReferences(second, third));
+  if (thirdIsUnique && haveSameProcessorMessageReferences(third, messages)) return true;
+
+  if (areProcessorMessageArraysSemanticallyEqual(first, messages)) return true;
+  if (secondIsUnique && areProcessorMessageArraysSemanticallyEqual(second, messages)) return true;
+  if (thirdIsUnique) return areProcessorMessageArraysSemanticallyEqual(third, messages);
+
+  return false;
 }
 
 function buildProcessInputStepSpanInput(args: {
@@ -266,9 +352,22 @@ export class ProcessorRunner {
   public readonly inputProcessors: ProcessorOrWorkflow[];
   public readonly outputProcessors: ProcessorOrWorkflow[];
   public readonly errorProcessors: ErrorProcessorOrWorkflow[];
+  public readonly hasOutputStreamProcessors: boolean;
+  private readonly outputStreamProcessors: Array<{
+    index: number;
+    processorOrWorkflow: ProcessorOrWorkflow;
+  }>;
   private readonly logger: IMastraLogger;
   private readonly agentName: string;
   private readonly agent?: Agent<any, any, any, any>;
+  private readonly processorWorkflowDurability = new WeakMap<ProcessorWorkflow, boolean>();
+  private readonly streamProcessorSendSignals = new WeakMap<
+    MessageList,
+    {
+      writer?: ProcessorStreamWriter;
+      sendSignal: ReturnType<typeof createProcessorSendSignal>;
+    }
+  >();
   /**
    * Shared processor state that persists across loop iterations.
    * Used by all processor methods (input and output) to share state.
@@ -296,6 +395,13 @@ export class ProcessorRunner {
     this.inputProcessors = inputProcessors ?? [];
     this.outputProcessors = outputProcessors ?? [];
     this.errorProcessors = errorProcessors ?? [];
+    this.outputStreamProcessors = [];
+    for (const [index, processorOrWorkflow] of this.outputProcessors.entries()) {
+      if (outputProcessorSupportsStream(processorOrWorkflow)) {
+        this.outputStreamProcessors.push({ index, processorOrWorkflow });
+      }
+    }
+    this.hasOutputStreamProcessors = this.outputStreamProcessors.length > 0;
     this.logger = logger;
     this.agentName = agentName;
     this.agent = agent;
@@ -314,6 +420,47 @@ export class ProcessorRunner {
       this.processorStates.set(processorId, state);
     }
     return state;
+  }
+
+  private requiresDurableProcessorWorkflowExecution(workflow: ProcessorWorkflow): boolean {
+    const cached = this.processorWorkflowDurability.get(workflow);
+    if (cached !== undefined) {
+      return cached;
+    }
+
+    const requiresDurableExecution = processorWorkflowRequiresDurableExecution(workflow);
+    this.processorWorkflowDurability.set(workflow, requiresDurableExecution);
+    return requiresDurableExecution;
+  }
+
+  private getStreamProcessorSendSignal(
+    messageList: MessageList,
+    writer?: ProcessorStreamWriter,
+  ): ReturnType<typeof createProcessorSendSignal> {
+    const cached = this.streamProcessorSendSignals.get(messageList);
+    if (cached && cached.writer === writer) {
+      return cached.sendSignal;
+    }
+
+    const sendSignal = createProcessorSendSignal({ messageList, writer });
+    this.streamProcessorSendSignals.set(messageList, { writer, sendSignal });
+    return sendSignal;
+  }
+
+  private takeNextReprocessPart<OUTPUT>(
+    processorStates: Map<string, ProcessorState<OUTPUT>>,
+  ): ChunkType<OUTPUT> | undefined {
+    for (const { processorOrWorkflow } of this.outputStreamProcessors) {
+      const state = processorStates.get(processorOrWorkflow.id);
+      if (!state) continue;
+      const custom = state.customState as Record<string, unknown>;
+      const stashed = custom[REPROCESS_PART_KEY];
+      if (stashed) {
+        delete custom[REPROCESS_PART_KEY];
+        return stashed as ChunkType<OUTPUT>;
+      }
+    }
+    return undefined;
   }
 
   private async runComputeStateSignal({
@@ -509,7 +656,17 @@ export class ProcessorRunner {
     abortSignal?: AbortSignal,
   ): Promise<ProcessorStepOutput> {
     // Create a run and start the workflow
-    const run = await workflow.createRun();
+    // Processor inputs contain process-local objects (MessageList, AbortSignal,
+    // state Maps) and have no resume surface. Run default-engine custom
+    // workflows transiently too, while createRun retains collision handling
+    // for caller-owned or custom-generated IDs.
+    // Evented workflows require durable state for event aggregation, scheduling,
+    // resume, and cancellation. Evented processor workflows and default-engine
+    // wrappers containing them therefore retain their authoritative durable
+    // lifecycle while phase gating still prevents per-part admission.
+    const run = this.requiresDurableProcessorWorkflowExecution(workflow)
+      ? await workflow.createRun()
+      : await workflow.createRun({ [PROCESSOR_EXECUTION_SYMBOL]: true });
     const result = await run.start({
       // Cast to allow processorStates/abortSignal - passed through to workflow processor steps
       // but not part of the official ProcessorStepOutput schema
@@ -595,15 +752,24 @@ export class ProcessorRunner {
     result?: OutputResult,
   ): Promise<MessageList> {
     for (const [index, processorOrWorkflow] of this.outputProcessors.entries()) {
+      const workflow = isProcessorWorkflow(processorOrWorkflow) ? processorOrWorkflow : undefined;
+      if (workflow) {
+        if (!processorWorkflowSupportsPhase(workflow, 'outputResult')) continue;
+      } else if (!(processorOrWorkflow as Processor).processOutputResult) {
+        continue;
+      }
+
       const allNewMessages = messageList.get.response.db();
       let processableMessages: MastraDBMessage[] = [...allNewMessages];
       const idsBeforeProcessing = processableMessages.map((m: MastraDBMessage) => m.id);
       const check = messageList.makeMessageSourceChecker();
 
       // Handle workflow as processor
-      if (isProcessorWorkflow(processorOrWorkflow)) {
-        await this.executeWorkflowAsProcessor(
-          processorOrWorkflow,
+      if (workflow) {
+        const messagesBeforeWorkflow = [...processableMessages];
+        const systemMessagesBeforeWorkflow = [...messageList.getSystemMessages()];
+        const workflowResult = await this.executeWorkflowAsProcessor(
+          workflow,
           {
             phase: 'outputResult',
             messages: processableMessages,
@@ -615,22 +781,28 @@ export class ProcessorRunner {
           requestContext,
           writer,
         );
+        ProcessorRunner.applyWorkflowResultToMessageList({
+          result: workflowResult,
+          messageList,
+          idsBeforeProcessing,
+          check,
+          defaultSource: 'response',
+          messagesBeforeWorkflow,
+          messagesAfterWorkflow: messageList.get.response.db(),
+          systemMessagesBeforeWorkflow,
+          systemMessagesAfterWorkflow: messageList.getSystemMessages(),
+        });
         continue;
       }
 
       // Handle regular processor
-      const processor = processorOrWorkflow;
+      const processor = processorOrWorkflow as Processor;
       const abort = <TMetadata = unknown>(reason?: string, options?: TripWireOptions<TMetadata>): never => {
         throw new TripWire(reason || `Tripwire triggered by ${processor.id}`, options, processor.id);
       };
 
       // Use the processOutputResult method if available
-      const processMethod = processor.processOutputResult?.bind(processor);
-
-      if (!processMethod) {
-        // Skip processors that don't implement processOutputResult
-        continue;
-      }
+      const processMethod = processor.processOutputResult!.bind(processor);
 
       const outputMessagesBefore = processableMessages;
       const outputSystemMessagesBefore = messageList.getAllSystemMessages();
@@ -697,20 +869,19 @@ export class ProcessorRunner {
           if (mutations.length > 0) {
             processableMessages = processResult.get.response.db();
           }
-        } else {
-          if (processResult) {
-            const deletedIds = idsBeforeProcessing.filter(
-              (i: string) => !processResult.some((m: MastraDBMessage) => m.id === i),
-            );
-            if (deletedIds.length) {
-              messageList.removeByIds(deletedIds);
-            }
-            processableMessages = processResult || [];
-            for (const message of processResult) {
-              messageList.removeByIds([message.id]);
-              messageList.add(message, check.getSource(message) || 'response', { merge: false });
-            }
-          }
+        } else if (Array.isArray(processResult)) {
+          ProcessorRunner.applyMessagesToMessageList(
+            processResult,
+            messageList,
+            idsBeforeProcessing,
+            check,
+            'response',
+          );
+          processableMessages = processResult;
+        } else if (mutations.length > 0) {
+          // Match the workflow adapter: unsupported return shapes do not replace
+          // messages, but in-place MessageList mutations remain authoritative.
+          processableMessages = messageList.get.response.db();
         }
 
         processorSpan?.end({
@@ -769,15 +940,16 @@ export class ProcessorRunner {
     tripwireOptions?: TripWireOptions<unknown>;
     processorId?: string;
   }> {
-    if (!this.outputProcessors.length) {
+    if (!this.hasOutputStreamProcessors) {
       return { part, blocked: false };
     }
 
     try {
       let processedPart: ChunkType<OUTPUT> | null | undefined = part;
       const isFinishChunk = part.type === 'finish';
+      let directProcessorSendSignal: ReturnType<typeof createProcessorSendSignal> | undefined;
 
-      for (const [index, processorOrWorkflow] of this.outputProcessors.entries()) {
+      for (const { index, processorOrWorkflow } of this.outputStreamProcessors) {
         // Handle workflows for stream processing
         if (isProcessorWorkflow(processorOrWorkflow)) {
           if (!processedPart) continue;
@@ -832,7 +1004,7 @@ export class ProcessorRunner {
 
         const processor = processorOrWorkflow;
         try {
-          if (processor.processOutputStream && processedPart) {
+          if (processedPart) {
             // Get or create state for this processor
             let state = processorStates.get(processor.id);
             if (!state) {
@@ -848,19 +1020,31 @@ export class ProcessorRunner {
             // Track input chunk (before processor transformation)
             state.addInputPart(processedPart);
 
-            const result = await processor.processOutputStream({
+            // Match the workflow adapter: data parts are part of stream history
+            // even when this processor has not opted in to transform them.
+            if (processedPart.type.startsWith('data-') && !processor.processDataParts) {
+              state.addOutputPart(processedPart);
+              continue;
+            }
+
+            const result = await processor.processOutputStream!({
               part: processedPart as ChunkType,
               streamParts: state.streamParts as ChunkType[],
               state: state.customState,
               agent: this.agent,
               abort: <TMetadata = unknown>(reason?: string, options?: TripWireOptions<TMetadata>): never => {
-                throw new TripWire(reason || `Stream part blocked by ${processor.id}`, options, processor.id);
+                throw new TripWire(reason || `Tripwire triggered by ${processor.id}`, options, processor.id);
               },
               ...createObservabilityContext({ currentSpan: state.span }),
               requestContext,
               messageList,
               retryCount,
               writer,
+              ...(messageList
+                ? {
+                    sendSignal: (directProcessorSendSignal ??= this.getStreamProcessorSendSignal(messageList, writer)),
+                  }
+                : {}),
             });
 
             // Track output chunk and update processedPart
@@ -950,6 +1134,15 @@ export class ProcessorRunner {
       processorId?: string;
     }>
   > {
+    if (!this.hasOutputStreamProcessors) {
+      return [];
+    }
+
+    let next = this.takeNextReprocessPart(processorStates);
+    if (!next) {
+      return [];
+    }
+
     const results: Array<{
       part: ChunkType<OUTPUT> | null | undefined;
       blocked: boolean;
@@ -958,23 +1151,9 @@ export class ProcessorRunner {
       processorId?: string;
     }> = [];
 
-    // Pull the next stashed part (if any) from processor states, in processor order.
-    const takeNext = (): ChunkType<OUTPUT> | undefined => {
-      for (const state of processorStates.values()) {
-        const custom = state.customState as Record<string, unknown>;
-        const stashed = custom[REPROCESS_PART_KEY];
-        if (stashed) {
-          delete custom[REPROCESS_PART_KEY];
-          return stashed as ChunkType<OUTPUT>;
-        }
-      }
-      return undefined;
-    };
-
     // Bound the loop defensively to avoid an infinite cycle if a processor were
     // to keep restashing the same part.
     let guard = 0;
-    let next = takeNext();
     while (next && guard++ < 1000) {
       const result = await this.processPart(
         next,
@@ -989,7 +1168,7 @@ export class ProcessorRunner {
       if (result.blocked) {
         break;
       }
-      next = takeNext();
+      next = this.takeNextReprocessPart(processorStates);
     }
 
     return results;
@@ -1105,15 +1284,23 @@ export class ProcessorRunner {
     retryCount: number = 0,
   ): Promise<MessageList> {
     for (const [index, processorOrWorkflow] of this.inputProcessors.entries()) {
+      const workflow = isProcessorWorkflow(processorOrWorkflow) ? processorOrWorkflow : undefined;
+      if (workflow) {
+        if (!processorWorkflowSupportsPhase(workflow, 'input')) continue;
+      } else if (!(processorOrWorkflow as Processor).processInput) {
+        continue;
+      }
+
       let processableMessages: MastraDBMessage[] = messageList.get.input.db();
       const inputIds = processableMessages.map((m: MastraDBMessage) => m.id);
       const check = messageList.makeMessageSourceChecker();
 
       // Handle workflow as processor
-      if (isProcessorWorkflow(processorOrWorkflow)) {
-        const currentSystemMessages = messageList.getSystemMessages();
-        await this.executeWorkflowAsProcessor(
-          processorOrWorkflow,
+      if (workflow) {
+        const messagesBeforeWorkflow = [...processableMessages];
+        const currentSystemMessages = [...messageList.getSystemMessages()];
+        const workflowResult = await this.executeWorkflowAsProcessor(
+          workflow,
           {
             phase: 'input',
             messages: processableMessages,
@@ -1124,22 +1311,28 @@ export class ProcessorRunner {
           observabilityContext,
           requestContext,
         );
+        ProcessorRunner.applyWorkflowResultToMessageList({
+          result: workflowResult,
+          messageList,
+          idsBeforeProcessing: inputIds,
+          check,
+          defaultSource: 'input',
+          messagesBeforeWorkflow,
+          messagesAfterWorkflow: messageList.get.input.db(),
+          systemMessagesBeforeWorkflow: currentSystemMessages,
+          systemMessagesAfterWorkflow: messageList.getSystemMessages(),
+        });
         continue;
       }
 
       // Handle regular processor
-      const processor = processorOrWorkflow;
+      const processor = processorOrWorkflow as Processor;
       const abort = <TMetadata = unknown>(reason?: string, options?: TripWireOptions<TMetadata>): never => {
         throw new TripWire(reason || `Tripwire triggered by ${processor.id}`, options, processor.id);
       };
 
       // Use the processInput method if available
-      const processMethod = processor.processInput?.bind(processor);
-
-      if (!processMethod) {
-        // Skip processors that don't implement processInput
-        continue;
-      }
+      const processMethod = processor.processInput!.bind(processor);
 
       const currentSystemMessages = messageList.getSystemMessages();
       const inputMessagesBefore = processableMessages;
@@ -1215,70 +1408,24 @@ export class ProcessorRunner {
 
           messageList.replaceAllSystemMessages(result.systemMessages);
 
-          // Handle regular messages
-          const regularMessages = result.messages;
-          if (regularMessages) {
-            const deletedIds = inputIds.filter(i => !regularMessages.some(m => m.id === i));
-            if (deletedIds.length) {
-              messageList.removeByIds(deletedIds);
-            }
-
-            // Separate any new system messages from other messages (backward compat)
-            const newSystemMessages = regularMessages.filter(m => m.role === 'system');
-            const nonSystemMessages = regularMessages.filter(m => m.role !== 'system');
-
-            // Add any new system messages from the messages array
-            for (const sysMsg of newSystemMessages) {
-              const systemText =
-                (sysMsg.content.content as string | undefined) ??
-                sysMsg.content.parts?.map(p => (p.type === 'text' ? p.text : '')).join('\n') ??
-                '';
-              messageList.addSystem(systemText);
-            }
-
-            // Add non-system messages normally
-            if (nonSystemMessages.length > 0) {
-              for (const message of nonSystemMessages) {
-                messageList.removeByIds([message.id]);
-                messageList.add(message, check.getSource(message) || 'input', { merge: false });
-              }
-            }
+          if (result.messages) {
+            ProcessorRunner.applyMessagesToMessageList(result.messages, messageList, inputIds, check, 'input');
           }
 
           processableMessages = messageList.get.input.db();
-        } else {
+        } else if (Array.isArray(result)) {
           // Processor returned an array - stop recording before clear/add (that's just internal plumbing)
           mutations = messageList.stopRecording();
 
-          if (result) {
-            // Clear and re-add since processor worked with array. clear all messages, the new result array is all messages in the list (new input but also any messages added by other processors, memory for ex)
-            const deletedIds = inputIds.filter(i => !result.some(m => m.id === i));
-            if (deletedIds.length) {
-              messageList.removeByIds(deletedIds);
-            }
+          ProcessorRunner.applyMessagesToMessageList(result, messageList, inputIds, check, 'input');
 
-            // Separate system messages from other messages since they need different handling
-            const systemMessages = result.filter(m => m.role === 'system');
-            const nonSystemMessages = result.filter(m => m.role !== 'system');
-
-            // Add system messages using addSystem
-            for (const sysMsg of systemMessages) {
-              const systemText =
-                (sysMsg.content.content as string | undefined) ??
-                sysMsg.content.parts?.map(p => (p.type === 'text' ? p.text : '')).join('\n') ??
-                '';
-              messageList.addSystem(systemText);
-            }
-
-            // Add non-system messages normally
-            if (nonSystemMessages.length > 0) {
-              for (const message of nonSystemMessages) {
-                messageList.removeByIds([message.id]);
-                messageList.add(message, check.getSource(message) || 'input', { merge: false });
-              }
-            }
-
-            // Use messageList.get.input.db() for consistency with MessageList return type
+          // Use messageList.get.input.db() for consistency with MessageList return type
+          processableMessages = messageList.get.input.db();
+        } else {
+          // Match the workflow adapter: unsupported return shapes are ignored,
+          // while any in-place MessageList mutations still take effect.
+          mutations = messageList.stopRecording();
+          if (mutations.length > 0) {
             processableMessages = messageList.get.input.db();
           }
         }
@@ -1364,16 +1511,28 @@ export class ProcessorRunner {
 
     // Run through all input processors that have processInputStep
     for (const [index, processorOrWorkflow] of processors.entries()) {
+      const workflow = isProcessorWorkflow(processorOrWorkflow) ? processorOrWorkflow : undefined;
+      if (workflow) {
+        if (!processorWorkflowSupportsPhase(workflow, 'inputStep')) continue;
+      } else if (
+        !(processorOrWorkflow as Processor).processInputStep &&
+        !(processorOrWorkflow as Processor).computeStateSignal
+      ) {
+        continue;
+      }
+
       const processableMessages: MastraDBMessage[] = messageList.get.all.db();
       const idsBeforeProcessing = processableMessages.map((m: MastraDBMessage) => m.id);
       const check = messageList.makeMessageSourceChecker();
 
       // Handle workflow as processor with inputStep phase
-      if (isProcessorWorkflow(processorOrWorkflow)) {
-        const currentSystemMessages = messageList.getSystemMessages();
+      if (workflow) {
+        const messagesBeforeWorkflow = [...processableMessages];
+        const currentSystemMessages = [...messageList.getSystemMessages()];
         const result = await this.executeWorkflowAsProcessor(
-          processorOrWorkflow,
+          workflow,
           {
+            ...stepInput,
             phase: 'inputStep',
             messages: processableMessages,
             messageList,
@@ -1387,16 +1546,36 @@ export class ProcessorRunner {
                   return nextMessageId;
                 }
               : undefined,
-            ...stepInput,
           },
           observabilityContext,
           requestContext,
           writer,
           args.abortSignal,
         );
-        Object.assign(stepInput, result);
+        ProcessorRunner.applyWorkflowResultToMessageList({
+          result,
+          messageList,
+          idsBeforeProcessing,
+          check,
+          defaultSource: 'input',
+          messagesBeforeWorkflow,
+          messagesAfterWorkflow: messageList.get.all.db(),
+          systemMessagesBeforeWorkflow: currentSystemMessages,
+          systemMessagesAfterWorkflow: messageList.getSystemMessages(),
+        });
+        const workflowStepResult: RunProcessInputStepResult = {};
+        if (result.model !== undefined) workflowStepResult.model = result.model;
+        if (result.messageId !== undefined) workflowStepResult.messageId = result.messageId;
+        if (result.tools !== undefined) workflowStepResult.tools = result.tools;
+        if (result.toolChoice !== undefined) workflowStepResult.toolChoice = result.toolChoice;
+        if (result.activeTools !== undefined) workflowStepResult.activeTools = result.activeTools;
+        if (result.providerOptions !== undefined) workflowStepResult.providerOptions = result.providerOptions;
+        if (result.modelSettings !== undefined) workflowStepResult.modelSettings = result.modelSettings;
+        if (result.structuredOutput !== undefined) workflowStepResult.structuredOutput = result.structuredOutput;
+        if (result.retryCount !== undefined) workflowStepResult.retryCount = result.retryCount;
+        Object.assign(stepInput, workflowStepResult);
         await this.runWorkflowComputeStateSignals({
-          workflow: processorOrWorkflow,
+          workflow,
           messageList,
           stepNumber,
           steps,
@@ -1421,11 +1600,6 @@ export class ProcessorRunner {
       // Handle regular processor
       const processor = processorOrWorkflow as Processor;
       const processMethod = processor.processInputStep?.bind(processor);
-      const computeStateSignal = processor.computeStateSignal?.bind(processor);
-      if (!processMethod && !computeStateSignal) {
-        // Skip processors that don't implement per-step input hooks
-        continue;
-      }
 
       const abort = <TMetadata = unknown>(reason?: string, options?: TripWireOptions<TMetadata>): never => {
         throw new TripWire(reason || `Tripwire triggered by ${processor.id}`, options, processor.id);
@@ -1852,15 +2026,23 @@ export class ProcessorRunner {
 
     // Run through all output processors that have processOutputStep
     for (const [index, processorOrWorkflow] of this.outputProcessors.entries()) {
+      const workflow = isProcessorWorkflow(processorOrWorkflow) ? processorOrWorkflow : undefined;
+      if (workflow) {
+        if (!processorWorkflowSupportsPhase(workflow, 'outputStep')) continue;
+      } else if (!(processorOrWorkflow as Processor).processOutputStep) {
+        continue;
+      }
+
       const processableMessages: MastraDBMessage[] = messageList.get.all.db();
       const idsBeforeProcessing = processableMessages.map((m: MastraDBMessage) => m.id);
       const check = messageList.makeMessageSourceChecker();
 
       // Handle workflow as processor with outputStep phase
-      if (isProcessorWorkflow(processorOrWorkflow)) {
-        const currentSystemMessages = messageList.getSystemMessages();
-        await this.executeWorkflowAsProcessor(
-          processorOrWorkflow,
+      if (workflow) {
+        const messagesBeforeWorkflow = [...processableMessages];
+        const currentSystemMessages = [...messageList.getSystemMessages()];
+        const workflowResult = await this.executeWorkflowAsProcessor(
+          workflow,
           {
             phase: 'outputStep',
             messages: processableMessages,
@@ -1879,17 +2061,23 @@ export class ProcessorRunner {
           requestContext,
           writer,
         );
+        ProcessorRunner.applyWorkflowResultToMessageList({
+          result: workflowResult,
+          messageList,
+          idsBeforeProcessing,
+          check,
+          defaultSource: 'response',
+          messagesBeforeWorkflow,
+          messagesAfterWorkflow: messageList.get.all.db(),
+          systemMessagesBeforeWorkflow: currentSystemMessages,
+          systemMessagesAfterWorkflow: messageList.getSystemMessages(),
+        });
         continue;
       }
 
       // Handle regular processor
-      const processor = processorOrWorkflow;
-      const processMethod = processor.processOutputStep?.bind(processor);
-
-      if (!processMethod) {
-        // Skip processors that don't implement processOutputStep
-        continue;
-      }
+      const processor = processorOrWorkflow as Processor;
+      const processMethod = processor.processOutputStep!.bind(processor);
 
       const abort = <TMetadata = unknown>(reason?: string, options?: TripWireOptions<TMetadata>): never => {
         throw new TripWire(reason || `Tripwire triggered by ${processor.id}`, options, processor.id);
@@ -1965,28 +2153,14 @@ export class ProcessorRunner {
             });
           }
           // Processor returned the same messageList - mutations have been applied
-        } else if (result) {
-          // Processor returned an array - apply changes to messageList
-          const deletedIds = idsBeforeProcessing.filter(
-            (i: string) => !result.some((m: MastraDBMessage) => m.id === i),
+        } else if (Array.isArray(result)) {
+          ProcessorRunner.applyMessagesToMessageList(
+            result as MastraDBMessage[],
+            messageList,
+            idsBeforeProcessing,
+            check,
+            'response',
           );
-          if (deletedIds.length) {
-            messageList.removeByIds(deletedIds);
-          }
-
-          // Re-add messages with correct sources
-          for (const message of result) {
-            messageList.removeByIds([message.id]);
-            if (message.role === 'system') {
-              const systemText =
-                (message.content.content as string | undefined) ??
-                message.content.parts?.map((p: any) => (p.type === 'text' ? p.text : '')).join('\n') ??
-                '';
-              messageList.addSystem(systemText);
-            } else {
-              messageList.add(message, check.getSource(message) || 'response', { merge: false });
-            }
-          }
         }
 
         processorSpan?.end({
@@ -2194,6 +2368,69 @@ export class ProcessorRunner {
     return { retry: false };
   }
 
+  private static applyWorkflowResultToMessageList({
+    result,
+    messageList,
+    idsBeforeProcessing,
+    check,
+    defaultSource,
+    messagesBeforeWorkflow,
+    messagesAfterWorkflow,
+    systemMessagesBeforeWorkflow,
+    systemMessagesAfterWorkflow,
+  }: {
+    result: ProcessorStepOutput;
+    messageList: MessageList;
+    idsBeforeProcessing: string[];
+    check: ReturnType<MessageList['makeMessageSourceChecker']>;
+    defaultSource: 'input' | 'response';
+    messagesBeforeWorkflow: unknown[];
+    messagesAfterWorkflow: unknown[];
+    systemMessagesBeforeWorkflow: unknown[];
+    systemMessagesAfterWorkflow: unknown[];
+  }) {
+    if (result.messageList && result.messageList !== messageList) {
+      throw new MastraError({
+        category: 'USER',
+        domain: 'AGENT',
+        id: 'PROCESSOR_RETURNED_EXTERNAL_MESSAGE_LIST',
+        text: `Processor workflow returned a MessageList instance other than the one that was passed in as an argument. New external message list instances are not supported. Use the messageList argument instead.`,
+      });
+    }
+    if (result.messages) {
+      const liveMessages = result.messageList === messageList ? messageList.get.all.db() : undefined;
+      const resultAlreadyApplied = liveMessages
+        ? matchesAnyUniqueProcessorMessageSnapshot(
+            result.messages,
+            liveMessages,
+            messagesBeforeWorkflow,
+            messagesAfterWorkflow,
+          )
+        : matchesAnyUniqueProcessorMessageSnapshot(result.messages, messagesBeforeWorkflow, messagesAfterWorkflow);
+      if (!resultAlreadyApplied) {
+        ProcessorRunner.applyMessagesToMessageList(
+          result.messages as MastraDBMessage[],
+          messageList,
+          idsBeforeProcessing,
+          check,
+          defaultSource,
+        );
+      }
+    }
+    if (
+      result.systemMessages &&
+      !matchesAnyUniqueProcessorMessageSnapshot(
+        result.systemMessages,
+        systemMessagesBeforeWorkflow,
+        systemMessagesAfterWorkflow,
+      )
+    ) {
+      messageList.replaceAllSystemMessages(
+        result.systemMessages as Parameters<MessageList['replaceAllSystemMessages']>[0],
+      );
+    }
+  }
+
   static applyMessagesToMessageList(
     messages: MastraDBMessage[],
     messageList: MessageList,
@@ -2201,24 +2438,15 @@ export class ProcessorRunner {
     check: ReturnType<MessageList['makeMessageSourceChecker']>,
     defaultSource: 'input' | 'response' = 'input',
   ) {
-    const deletedIds = idsBeforeProcessing.filter(i => !messages.some(m => m.id === i));
-    if (deletedIds.length) {
-      messageList.removeByIds(deletedIds);
-    }
-
-    // Re-add messages with correct sources
+    const idsToReplace = new Set(idsBeforeProcessing);
     for (const message of messages) {
-      messageList.removeByIds([message.id]);
-      if (message.role === 'system') {
-        const systemText =
-          (message.content.content as string | undefined) ??
-          message.content.parts?.map(p => (p.type === 'text' ? p.text : '')).join('\n') ??
-          '';
-        messageList.addSystem(systemText);
-      } else {
-        messageList.add(message, check.getSource(message) || defaultSource, { merge: false });
-      }
+      idsToReplace.add(message.id);
     }
+    messageList.replaceMessagesForProcessor(
+      messages,
+      idsToReplace,
+      message => check.getSource(message) || defaultSource,
+    );
   }
 
   static async validateAndFormatProcessInputStepResult(

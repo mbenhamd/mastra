@@ -749,7 +749,9 @@ describe('workflow lifecycle watching', () => {
       pubsub,
     });
     const reopenedRun = await reopenedWorkflow.createRun({ runId: reopenedRunId });
+    const snapshotReads = vi.spyOn(workflowsStore, 'loadWorkflowSnapshot');
     await reopenedRun.cancel();
+    expect(snapshotReads).toHaveBeenCalledTimes(1);
 
     const history = await pubsub.getHistory(identity.topic);
     expect(history.map(item => (item.data as WorkflowLifecycleRecord).event.type)).toEqual([

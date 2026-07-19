@@ -219,6 +219,25 @@ describe('persistStepUpdate — suspended overwrite guard', () => {
     expect(engine.getLastPersistedStatus('run-1')).toBe('pending');
   });
 
+  it('skips a transient execution even when the durable fallback policy persists', async () => {
+    ({ engine, store } = makeEngine(() => true));
+
+    await engine.persistStepUpdate({
+      workflowId: 'wf',
+      runId: 'transient-run',
+      resourceId: 'resource-1',
+      stepResults: {},
+      serializedStepGraph: [],
+      executionContext: baseExecutionContext({ runId: 'transient-run', transientExecution: true }),
+      workflowStatus: 'running',
+      requestContext: new RequestContext(),
+    });
+
+    expect(store.calls).toHaveLength(0);
+    expect(store.legacyCalls).toHaveLength(0);
+    expect(engine.getLastPersistedStatus('transient-run')).toBeUndefined();
+  });
+
   it('rejects an unhashed ordinary writer while a storage-admitted checkpoint is active', async () => {
     const checkpoint = { version: 1, marker: 'storage-owned' } as never;
     store.snapshot = {

@@ -61,6 +61,7 @@ describe('workflowLoopStream', () => {
     const processor: Processor = {
       id: 'writer-capture',
       name: 'Writer Capture',
+      processDataParts: true,
       processOutputStream: async ({ part, writer }) => {
         receivedWriter = writer;
         return part;

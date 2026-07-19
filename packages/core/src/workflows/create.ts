@@ -13,6 +13,7 @@
  * By keeping the Workflow class in `workflow.ts` and the factories here,
  * neither module needs to import the other's runtime dependencies.
  */
+import { copyProcessorWorkflowTraits } from '../processors/is-processor-workflow';
 import type { InferPublicSchema, InferPublicSchemaInput, PublicSchema } from '../schema';
 import { createWorkflow as createEventedWorkflowImpl } from './evented/workflow';
 import type { Step } from './step';
@@ -116,5 +117,5 @@ export function cloneWorkflow<
 
   wf.setStepFlow(workflow.stepGraph);
   wf.commit();
-  return wf;
+  return copyProcessorWorkflowTraits(workflow, wf);
 }

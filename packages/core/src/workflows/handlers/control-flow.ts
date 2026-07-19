@@ -11,6 +11,7 @@ import { ToolStream } from '../../tools/stream';
 import { selectFields } from '../../utils';
 import { PUBSUB_SYMBOL, STREAM_FORMAT_SYMBOL } from '../constants';
 import type { DefaultExecutionEngine } from '../default';
+import { workflowLifecycleEventsAreSuppressed } from '../lifecycle-events';
 import type { ConditionFunction, InnerOutput, LoopConditionFunction, Step } from '../step';
 import { getStepResult } from '../step';
 import type {
@@ -163,6 +164,7 @@ export async function executeParallel(
         timeTravel,
         resume,
         executionContext: {
+          transientExecution: executionContext.transientExecution,
           executionGeneration: executionContext.executionGeneration,
           lifecycleResumeAttempt: executionContext.lifecycleResumeAttempt,
           lifecycleStepStates: executionContext.lifecycleStepStates,
@@ -487,6 +489,7 @@ export async function executeConditional(
         restart,
         timeTravel,
         executionContext: {
+          transientExecution: executionContext.transientExecution,
           executionGeneration: executionContext.executionGeneration,
           lifecycleResumeAttempt: executionContext.lifecycleResumeAttempt,
           lifecycleStepStates: executionContext.lifecycleStepStates,
@@ -895,6 +898,7 @@ export async function executeForeach(
   } = params;
 
   const observabilityContext = resolveObservabilityContext(rest);
+  const suppressLifecycleEvents = workflowLifecycleEventsAreSuppressed(pubsub);
 
   const { step, opts } = entry;
   const results: any[] = [];
@@ -928,18 +932,20 @@ export async function executeForeach(
     executionContext,
   });
 
-  await pubsub.publish(`workflow.events.v2.${runId}`, {
-    type: 'watch',
-    runId,
-    data: {
-      type: 'workflow-step-start',
-      payload: {
-        id: step.id,
-        ...stepInfo,
-        status: 'running',
+  if (!suppressLifecycleEvents) {
+    await pubsub.publish(`workflow.events.v2.${runId}`, {
+      type: 'watch',
+      runId,
+      data: {
+        type: 'workflow-step-start',
+        payload: {
+          id: step.id,
+          ...stepInfo,
+          status: 'running',
+        },
       },
-    },
-  });
+    });
+  }
 
   const prevPayload = stepResults[step.id];
   const foreachIndexObj: Record<number, any> = {};
@@ -983,8 +989,9 @@ export async function executeForeach(
     k: number,
     iterationStatus: 'success' | 'suspended' | 'failed',
     iterationOutput?: unknown,
-  ) =>
-    pubsub.publish(`workflow.events.v2.${runId}`, {
+  ) => {
+    if (suppressLifecycleEvents) return;
+    return pubsub.publish(`workflow.events.v2.${runId}`, {
       type: 'watch',
       runId,
       data: {
@@ -999,6 +1006,7 @@ export async function executeForeach(
         },
       },
     });
+  };
 
   /** Drain all queued (not yet in-flight) tasks and kill the queue. */
   const killQueue = () => {
@@ -1244,29 +1252,31 @@ export async function executeForeach(
       errorOptions: { error: finalErrorResult.error },
     });
 
-    await pubsub.publish(`workflow.events.v2.${runId}`, {
-      type: 'watch',
-      runId,
-      data: {
-        type: 'workflow-step-result',
-        payload: {
-          id: step.id,
-          ...execResults,
+    if (!suppressLifecycleEvents) {
+      await pubsub.publish(`workflow.events.v2.${runId}`, {
+        type: 'watch',
+        runId,
+        data: {
+          type: 'workflow-step-result',
+          payload: {
+            id: step.id,
+            ...execResults,
+          },
         },
-      },
-    });
+      });
 
-    await pubsub.publish(`workflow.events.v2.${runId}`, {
-      type: 'watch',
-      runId,
-      data: {
-        type: 'workflow-step-finish',
-        payload: {
-          id: step.id,
-          metadata: {},
+      await pubsub.publish(`workflow.events.v2.${runId}`, {
+        type: 'watch',
+        runId,
+        data: {
+          type: 'workflow-step-finish',
+          payload: {
+            id: step.id,
+            metadata: {},
+          },
         },
-      },
-    });
+      });
+    }
 
     return finalErrorResult;
   }
@@ -1280,29 +1290,31 @@ export async function executeForeach(
       },
     });
 
-    await pubsub.publish(`workflow.events.v2.${runId}`, {
-      type: 'watch',
-      runId,
-      data: {
-        type: 'workflow-step-result',
-        payload: {
-          id: step.id,
-          ...exitResult,
+    if (!suppressLifecycleEvents) {
+      await pubsub.publish(`workflow.events.v2.${runId}`, {
+        type: 'watch',
+        runId,
+        data: {
+          type: 'workflow-step-result',
+          payload: {
+            id: step.id,
+            ...exitResult,
+          },
         },
-      },
-    });
+      });
 
-    await pubsub.publish(`workflow.events.v2.${runId}`, {
-      type: 'watch',
-      runId,
-      data: {
-        type: 'workflow-step-finish',
-        payload: {
-          id: step.id,
-          metadata: {},
+      await pubsub.publish(`workflow.events.v2.${runId}`, {
+        type: 'watch',
+        runId,
+        data: {
+          type: 'workflow-step-finish',
+          payload: {
+            id: step.id,
+            metadata: {},
+          },
         },
-      },
-    });
+      });
+    }
 
     return exitResult as StepResult<any, any, any, any>;
   }
@@ -1318,17 +1330,19 @@ export async function executeForeach(
       endOptions: { output: foreachIndexObj[foreachIndex] },
     });
 
-    await pubsub.publish(`workflow.events.v2.${runId}`, {
-      type: 'watch',
-      runId,
-      data: {
-        type: 'workflow-step-suspended',
-        payload: {
-          id: step.id,
-          ...foreachIndexObj[foreachIndex],
+    if (!suppressLifecycleEvents) {
+      await pubsub.publish(`workflow.events.v2.${runId}`, {
+        type: 'watch',
+        runId,
+        data: {
+          type: 'workflow-step-suspended',
+          payload: {
+            id: step.id,
+            ...foreachIndexObj[foreachIndex],
+          },
         },
-      },
-    });
+      });
+    }
 
     executionContext.suspendedPaths[step.id] = executionContext.executionPath;
     executionContext.resumeLabels = { ...resumeLabels, ...executionContext.resumeLabels };
@@ -1352,31 +1366,33 @@ export async function executeForeach(
     } as StepSuspended<any, any, any>;
   }
 
-  await pubsub.publish(`workflow.events.v2.${runId}`, {
-    type: 'watch',
-    runId,
-    data: {
-      type: 'workflow-step-result',
-      payload: {
-        id: step.id,
-        status: 'success',
-        output: results,
-        endedAt: Date.now(),
+  if (!suppressLifecycleEvents) {
+    await pubsub.publish(`workflow.events.v2.${runId}`, {
+      type: 'watch',
+      runId,
+      data: {
+        type: 'workflow-step-result',
+        payload: {
+          id: step.id,
+          status: 'success',
+          output: results,
+          endedAt: Date.now(),
+        },
       },
-    },
-  });
+    });
 
-  await pubsub.publish(`workflow.events.v2.${runId}`, {
-    type: 'watch',
-    runId,
-    data: {
-      type: 'workflow-step-finish',
-      payload: {
-        id: step.id,
-        metadata: {},
+    await pubsub.publish(`workflow.events.v2.${runId}`, {
+      type: 'watch',
+      runId,
+      data: {
+        type: 'workflow-step-finish',
+        payload: {
+          id: step.id,
+          metadata: {},
+        },
       },
-    },
-  });
+    });
+  }
 
   await engine.endChildSpan({
     span: loopSpan,

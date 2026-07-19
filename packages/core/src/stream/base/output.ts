@@ -8,11 +8,16 @@ import { ErrorCategory, ErrorDomain, MastraError } from '../../error';
 import { getErrorFromUnknown } from '../../error/utils.js';
 import type { ScorerRunInputForAgent, ScorerRunOutputForAgent } from '../../evals';
 import { getRootExportSpan, resolveObservabilityContext } from '../../observability';
-import type { OutputResult } from '../../processors';
+import type { OutputResult, ProcessorStreamWriter } from '../../processors';
 // Inlined to avoid importing structured-output.ts which pulls in the agent
 // barrel and creates an ESM init-time cycle.
 const STRUCTURED_OUTPUT_PROCESSOR_NAME = 'structured-output';
-import { ProcessorState, ProcessorRunner } from '../../processors/runner';
+import {
+  ProcessorState,
+  ProcessorRunner,
+  outputProcessorsSupportResult,
+  outputProcessorsSupportStream,
+} from '../../processors/runner';
 import type { WorkflowRunStatus } from '../../workflows';
 import { DelayedPromise, consumeStream } from '../aisdk/v5/compat';
 import type { ConsumeStreamOptions } from '../aisdk/v5/compat';
@@ -319,7 +324,12 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
     }
 
     // Create processor runner if outputProcessors are provided
-    if (options.outputProcessors?.length) {
+    if (
+      options.outputProcessors?.length &&
+      (options.isLLMExecutionStep
+        ? outputProcessorsSupportStream(options.outputProcessors)
+        : outputProcessorsSupportResult(options.outputProcessors))
+    ) {
       this.processorRunner = new ProcessorRunner({
         inputProcessors: [],
         outputProcessors: options.outputProcessors,
@@ -336,12 +346,13 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
     // Apply output processors if they exist
     let processedStream = stream;
     const processorRunner = this.processorRunner;
-    if (processorRunner && options.isLLMExecutionStep) {
+    if (processorRunner?.hasOutputStreamProcessors && options.isLLMExecutionStep) {
       // Use shared processor states if provided, otherwise create new ones
       const processorStates = (options.processorStates || new Map<string, ProcessorState>()) as Map<
         string,
         ProcessorState<OUTPUT>
       >;
+      let streamWriter: ProcessorStreamWriter | undefined;
 
       processedStream = stream.pipeThrough(
         new TransformStream<ChunkType<OUTPUT>, ChunkType<OUTPUT>>({
@@ -383,7 +394,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
               }
 
               // Create a ProcessorStreamWriter from the controller so processOutputStream can emit custom chunks
-              const streamWriter = {
+              streamWriter ??= {
                 custom: async (data: { type: string }) => controller.enqueue(data as ChunkType<OUTPUT>),
               };
 

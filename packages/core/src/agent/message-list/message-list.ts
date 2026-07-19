@@ -103,6 +103,11 @@ type MessageListAddOptions = {
   merge?: boolean;
 };
 
+type MessageListInternalAddOptions = {
+  assumeNew?: boolean;
+  deferFinalization?: boolean;
+};
+
 export class MessageList {
   private messages: MastraDBMessage[] = [];
 
@@ -320,6 +325,61 @@ export class MessageList {
     return this;
   }
 
+  /**
+   * Replace a processor-returned message history after its source ownership has
+   * been captured. The caller supplies the complete ID removal set, allowing
+   * source indexes and transcript ordering to be rebuilt once instead of once
+   * per message.
+   *
+   * @internal ProcessorRunner reconciliation only.
+   */
+  public replaceMessagesForProcessor(
+    replacements: readonly MastraDBMessage[],
+    idsToRemove: ReadonlySet<string>,
+    getSource: (message: MastraDBMessage) => MessageSource,
+  ): this {
+    if (idsToRemove.size > 0) {
+      this.removeByIdSet(idsToRemove);
+    }
+    const retainedMessageCount = this.messages.length;
+
+    const lastIndexById = new Map<string, number>();
+    for (const [index, message] of replacements.entries()) {
+      if (message.id) lastIndexById.set(message.id, index);
+    }
+
+    for (const [index, message] of replacements.entries()) {
+      if (message.role === 'system') {
+        const systemText =
+          (message.content.content as string | undefined) ??
+          message.content.parts?.map(part => (part.type === 'text' ? part.text : '')).join('\n') ??
+          '';
+        if (systemText) {
+          this.addSystem({
+            ...message,
+            content: { ...message.content, content: systemText },
+          });
+        }
+        continue;
+      }
+
+      // Match the prior last-write-wins behavior for malformed histories with
+      // duplicate IDs while keeping the valid unique-ID path linear.
+      if (message.id && lastIndexById.get(message.id) !== index) {
+        continue;
+      }
+
+      const source = getSource(message);
+      if (this.isRecording) {
+        this.recordedEvents.push({ type: 'add', source, count: 1 });
+      }
+      this.addOne(message, source, { merge: false }, { assumeNew: true, deferFinalization: true });
+    }
+
+    this.mergeAppendedMessagesInOrder(retainedMessageCount);
+    return this;
+  }
+
   public serialize(): SerializedMessageListState {
     return this.stateManager.serializeAll({
       messages: this.messages,
@@ -502,11 +562,14 @@ export class MessageList {
    * @param ids - Array of message IDs to remove
    * @returns Array of removed messages
    */
-  public removeByIds(ids: string[]): MastraDBMessage[] {
-    const idsSet = new Set(ids);
+  public removeByIds(ids: readonly string[]): MastraDBMessage[] {
+    return this.removeByIdSet(new Set(ids));
+  }
+
+  private removeByIdSet(ids: ReadonlySet<string>): MastraDBMessage[] {
     const removed: MastraDBMessage[] = [];
     this.messages = this.messages.filter(m => {
-      if (idsSet.has(m.id)) {
+      if (ids.has(m.id)) {
         removed.push(m);
         this.stateManager.removeMessage(m);
         return false;
@@ -516,7 +579,7 @@ export class MessageList {
     if (this.isRecording && removed.length > 0) {
       this.recordedEvents.push({
         type: 'removeByIds',
-        ids,
+        ids: [...ids],
         count: removed.length,
       });
     }
@@ -1469,7 +1532,12 @@ export class MessageList {
     };
   }
 
-  private addOne(message: MessageInput, messageSource: MessageSource, options: MessageListAddOptions = {}) {
+  private addOne(
+    message: MessageInput,
+    messageSource: MessageSource,
+    options: MessageListAddOptions = {},
+    internalOptions: MessageListInternalAddOptions = {},
+  ) {
     if (
       (!(`content` in message) ||
         (!message.content &&
@@ -1535,6 +1603,18 @@ export class MessageList {
           acceptedAt,
         },
       };
+    }
+
+    if (internalOptions.assumeNew) {
+      this.messages.push(messageV2);
+      this.pushMessageToSource(messageV2, messageSource);
+      // Deferred finalization must still advance the ordering watermark so a
+      // following input signal receives a strictly later transcript timestamp.
+      this.updateLastCreatedAt(messageV2);
+      if (!internalOptions.deferFinalization) {
+        this.finalizeMessageOrder();
+      }
+      return this;
     }
 
     const { exists, shouldReplace, id } = this.shouldReplaceMessage(messageV2);
@@ -1674,14 +1754,72 @@ export class MessageList {
       this.pushMessageToSource(messageV2, messageSource);
     }
 
+    this.finalizeMessageOrder();
+
+    return this;
+  }
+
+  private finalizeMessageOrder(): void {
     for (const storedMessage of this.messages) {
       this.updateLastCreatedAt(storedMessage);
     }
 
     // make sure messages are always stored in order of when they were created!
     this.messages.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+  }
 
-    return this;
+  /**
+   * Merge processor replacements into the already ordered retained transcript.
+   * Normal processor histories are chronological, so the common path stays
+   * linear and avoids sorting the entire transcript. Malformed out-of-order
+   * replacement histories retain the historical sorting behavior as a fallback.
+   */
+  private mergeAppendedMessagesInOrder(appendedStartIndex: number): void {
+    if (appendedStartIndex >= this.messages.length) return;
+
+    let appendedInOrder = true;
+    for (let index = appendedStartIndex + 1; index < this.messages.length; index += 1) {
+      if (this.messages[index]!.createdAt.getTime() < this.messages[index - 1]!.createdAt.getTime()) {
+        appendedInOrder = false;
+        break;
+      }
+    }
+
+    if (appendedStartIndex === 0) {
+      if (!appendedInOrder) {
+        this.messages.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+      }
+      return;
+    }
+
+    const lastRetainedTimestamp = this.messages[appendedStartIndex - 1]!.createdAt.getTime();
+    const firstAppendedTimestamp = this.messages[appendedStartIndex]!.createdAt.getTime();
+    if (appendedInOrder && lastRetainedTimestamp <= firstAppendedTimestamp) return;
+
+    const retained = this.messages.slice(0, appendedStartIndex);
+    const appended = this.messages.slice(appendedStartIndex);
+    if (!appendedInOrder) {
+      appended.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+    }
+
+    const merged = new Array<MastraDBMessage>(retained.length + appended.length);
+    let mergedIndex = 0;
+    let retainedIndex = 0;
+    let appendedIndex = 0;
+    while (retainedIndex < retained.length && appendedIndex < appended.length) {
+      if (retained[retainedIndex]!.createdAt.getTime() <= appended[appendedIndex]!.createdAt.getTime()) {
+        merged[mergedIndex++] = retained[retainedIndex++]!;
+      } else {
+        merged[mergedIndex++] = appended[appendedIndex++]!;
+      }
+    }
+    while (retainedIndex < retained.length) {
+      merged[mergedIndex++] = retained[retainedIndex++]!;
+    }
+    while (appendedIndex < appended.length) {
+      merged[mergedIndex++] = appended[appendedIndex++]!;
+    }
+    this.messages = merged;
   }
 
   private pushMessageToSource(messageV2: MastraDBMessage, messageSource: MessageSource) {

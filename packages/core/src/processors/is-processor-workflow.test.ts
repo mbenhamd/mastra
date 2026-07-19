@@ -1,0 +1,92 @@
+import { describe, expect, it } from 'vitest';
+import {
+  copyProcessorWorkflowTraits,
+  getProcessorWorkflowPhases,
+  processorWorkflowHasPhaseRestrictions,
+  processorWorkflowRequiresDurableExecution,
+  processorWorkflowSupportsPhase,
+  setProcessorWorkflowPhases,
+} from './is-processor-workflow';
+import type { ProcessorWorkflow } from './index';
+
+function processorWorkflowStub(overrides: Record<string, unknown> = {}): ProcessorWorkflow {
+  return {
+    id: 'processor-workflow',
+    inputSchema: {},
+    outputSchema: {},
+    execute: () => undefined,
+    ...overrides,
+  } as unknown as ProcessorWorkflow;
+}
+
+describe('processor workflow phase capabilities', () => {
+  it('keeps unannotated workflows compatible with every phase', () => {
+    const workflow = processorWorkflowStub();
+
+    expect(getProcessorWorkflowPhases(workflow)).toEqual([
+      'input',
+      'inputStep',
+      'outputStream',
+      'outputResult',
+      'outputStep',
+    ]);
+    expect(processorWorkflowHasPhaseRestrictions(workflow)).toBe(false);
+    expect(processorWorkflowSupportsPhase(workflow, 'outputStream')).toBe(true);
+  });
+
+  it('exposes a supported annotation for custom and nested processor workflows', () => {
+    const workflow = processorWorkflowStub();
+
+    expect(setProcessorWorkflowPhases(workflow, ['outputResult', 'outputResult'])).toBe(workflow);
+    expect(getProcessorWorkflowPhases(workflow)).toEqual(['outputResult']);
+    expect(processorWorkflowHasPhaseRestrictions(workflow)).toBe(true);
+    expect(processorWorkflowSupportsPhase(workflow, 'outputResult')).toBe(true);
+    expect(processorWorkflowSupportsPhase(workflow, 'outputStream')).toBe(false);
+  });
+
+  it('does not treat an explicit all-phase annotation as restrictive', () => {
+    const workflow = processorWorkflowStub();
+
+    setProcessorWorkflowPhases(workflow, ['input', 'inputStep', 'outputStream', 'outputResult', 'outputStep']);
+
+    expect(processorWorkflowHasPhaseRestrictions(workflow)).toBe(false);
+  });
+
+  it('requires durable execution for workflows with nested evented descendants', () => {
+    const workflow = {
+      ...processorWorkflowStub(),
+      engineType: 'default',
+      steps: {
+        wrapper: {
+          engineType: 'default',
+          steps: { evented: { engineType: 'evented' } },
+        },
+      },
+    } as unknown as ProcessorWorkflow;
+
+    expect(processorWorkflowRequiresDurableExecution(workflow)).toBe(true);
+    expect(processorWorkflowRequiresDurableExecution(processorWorkflowStub())).toBe(false);
+  });
+
+  it.each(['inngest', 'temporal'])('treats the %s engine as durable', engineType => {
+    expect(processorWorkflowRequiresDurableExecution(processorWorkflowStub({ engineType }))).toBe(true);
+    expect(
+      processorWorkflowRequiresDurableExecution(
+        processorWorkflowStub({
+          engineType: 'default',
+          steps: { child: { engineType } },
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it('propagates durable provenance through repeated base-workflow clones', () => {
+    const source = setProcessorWorkflowPhases(processorWorkflowStub({ engineType: 'inngest' }), ['outputResult']);
+    const firstClone = copyProcessorWorkflowTraits(source, processorWorkflowStub({ engineType: 'default' }));
+    const secondClone = copyProcessorWorkflowTraits(firstClone, processorWorkflowStub({ engineType: 'default' }));
+
+    expect(getProcessorWorkflowPhases(secondClone)).toEqual(['outputResult']);
+    expect(processorWorkflowRequiresDurableExecution(firstClone)).toBe(true);
+    expect(processorWorkflowRequiresDurableExecution(secondClone)).toBe(true);
+  });
+});

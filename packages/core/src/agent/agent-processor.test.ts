@@ -9,7 +9,7 @@ import { isProcessorWorkflow } from '../processors/index';
 import { ProcessorStepInputSchema, ProcessorStepOutputSchema } from '../processors/step-schema';
 import { RequestContext } from '../request-context';
 import { createTool } from '../tools/tool';
-import { createStep, createWorkflow, isProcessor } from '../workflows';
+import { createEventedWorkflow, createStep, createWorkflow, isProcessor } from '../workflows';
 import type { MastraDBMessage } from './types';
 import { Agent } from './index';
 
@@ -2569,6 +2569,10 @@ describe('v1 model - output processors', () => {
 
 describe('Workflow as Processor', () => {
   it('should use the agent logger for internal combined processor workflows', async () => {
+    const passthroughProcessor: Processor = {
+      id: 'passthrough-processor',
+      processInput: async ({ messages }) => messages,
+    };
     const failingProcessor: Processor = {
       id: 'failing-processor',
       processInput: async () => {
@@ -2589,7 +2593,7 @@ describe('Workflow as Processor', () => {
           warnings: [],
         }),
       }),
-      inputProcessors: [failingProcessor],
+      inputProcessors: [passthroughProcessor, failingProcessor],
     });
 
     const logger = {
@@ -3253,7 +3257,7 @@ describe('Workflow as Processor', () => {
       expect(isProcessorWorkflow(configuredProcessors[1])).toBe(false);
     });
 
-    it('should preserve state signal processors on resolved combined input workflows', async () => {
+    it('keeps mixed input and state-signal phases direct', async () => {
       const stateProcessor = {
         id: 'state-proc',
         name: 'State Processor',
@@ -3276,12 +3280,13 @@ describe('Workflow as Processor', () => {
 
       const resolvedProcessors = await agent.listInputProcessors();
 
-      expect(resolvedProcessors).toHaveLength(1);
-      expect(isProcessorWorkflow(resolvedProcessors[0])).toBe(true);
-      expect(resolvedProcessors[0]?.__stateSignalProcessors).toEqual([stateProcessor]);
+      expect(resolvedProcessors).toEqual([stateProcessor, inputProcessor]);
+      expect(resolvedProcessors.every(processor => !isProcessorWorkflow(processor))).toBe(true);
+      expect(stateProcessor).toHaveProperty('processorIndex', 0);
+      expect(inputProcessor).toHaveProperty('processorIndex', 1);
     });
 
-    it('should preserve state signal only processors on resolved combined input workflows', async () => {
+    it('keeps state-signal-only processors direct beside input processors', async () => {
       const stateProcessor = {
         id: 'state-only-proc',
         name: 'State Only Processor',
@@ -3303,9 +3308,83 @@ describe('Workflow as Processor', () => {
 
       const resolvedProcessors = await agent.listInputProcessors();
 
-      expect(resolvedProcessors).toHaveLength(1);
-      expect(isProcessorWorkflow(resolvedProcessors[0])).toBe(true);
-      expect(resolvedProcessors[0]?.__stateSignalProcessors).toEqual([stateProcessor]);
+      expect(resolvedProcessors).toEqual([stateProcessor, inputProcessor]);
+      expect(resolvedProcessors.every(processor => !isProcessorWorkflow(processor))).toBe(true);
+      expect(stateProcessor).toHaveProperty('processorIndex', 0);
+      expect(inputProcessor).toHaveProperty('processorIndex', 1);
+    });
+
+    it('keeps an evented processor workflow top-level in a mixed chain', async () => {
+      const eventedStep = createStep({
+        id: 'evented-result-step',
+        inputSchema: ProcessorStepInputSchema,
+        outputSchema: ProcessorStepOutputSchema,
+        execute: async ({ inputData }) => inputData,
+      });
+      const eventedWorkflow = createEventedWorkflow({
+        id: 'evented-result-workflow',
+        inputSchema: ProcessorStepInputSchema,
+        outputSchema: ProcessorStepOutputSchema,
+      })
+        .then(eventedStep)
+        .commit();
+      const outputProcessor = {
+        id: 'plain-result-processor',
+        processOutputResult: async ({ messages }: any) => messages,
+      };
+      const agent = new Agent({
+        id: 'test-agent',
+        name: 'Test Agent',
+        instructions: 'test',
+        model: testModel,
+        outputProcessors: [eventedWorkflow, outputProcessor],
+      });
+
+      const resolvedProcessors = await agent.listOutputProcessors();
+
+      expect(resolvedProcessors).toEqual([eventedWorkflow, outputProcessor]);
+      expect(eventedWorkflow.engineType).toBe('evented');
+      expect(outputProcessor).toHaveProperty('processorIndex', 1);
+    });
+
+    it('keeps a default wrapper with an evented descendant top-level in a mixed chain', async () => {
+      const eventedStep = createStep({
+        id: 'nested-evented-result-step',
+        inputSchema: ProcessorStepInputSchema,
+        outputSchema: ProcessorStepOutputSchema,
+        execute: async ({ inputData }) => inputData,
+      });
+      const eventedWorkflow = createEventedWorkflow({
+        id: 'nested-evented-result-workflow',
+        inputSchema: ProcessorStepInputSchema,
+        outputSchema: ProcessorStepOutputSchema,
+      })
+        .then(eventedStep)
+        .commit();
+      const wrapperWorkflow = createWorkflow({
+        id: 'default-evented-wrapper',
+        inputSchema: ProcessorStepInputSchema,
+        outputSchema: ProcessorStepOutputSchema,
+      })
+        .then(eventedWorkflow as never)
+        .commit();
+      const outputProcessor = {
+        id: 'plain-after-evented-wrapper',
+        processOutputResult: async ({ messages }: any) => messages,
+      };
+      const agent = new Agent({
+        id: 'test-agent',
+        name: 'Test Agent',
+        instructions: 'test',
+        model: testModel,
+        outputProcessors: [wrapperWorkflow, outputProcessor],
+      });
+
+      const resolvedProcessors = await agent.listOutputProcessors();
+
+      expect(resolvedProcessors).toEqual([wrapperWorkflow, outputProcessor]);
+      expect(wrapperWorkflow.engineType).toBe('default');
+      expect(outputProcessor).toHaveProperty('processorIndex', 1);
     });
 
     it('should return individual output processors, not a combined workflow', async () => {

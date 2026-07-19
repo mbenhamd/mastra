@@ -378,6 +378,7 @@ describe('Workflow (Evented Engine Specific)', () => {
       add: vi.fn(),
       addSystem: vi.fn(),
       removeByIds: vi.fn(),
+      replaceMessagesForProcessor: vi.fn(),
       startRecording: vi.fn(),
       stopRecording: vi.fn(() => []),
       makeMessageSourceChecker: vi.fn(() => ({ getSource: () => 'input' })),

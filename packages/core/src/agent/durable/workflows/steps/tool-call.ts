@@ -9,7 +9,7 @@ import type { MastraMemory } from '../../../../memory/memory';
 import type { MemoryConfig } from '../../../../memory/types';
 import type { ExportedSpan, SpanType } from '../../../../observability';
 import type { ProcessorState } from '../../../../processors';
-import { ProcessorRunner } from '../../../../processors/runner';
+import { ProcessorRunner, outputProcessorsSupportStream } from '../../../../processors/runner';
 import type { ChunkType } from '../../../../stream/types';
 import { ChunkFrom } from '../../../../stream/types';
 import { findProviderToolByName } from '../../../../tools/provider-tool-utils';
@@ -149,18 +149,38 @@ async function processChunkThroughOutputProcessors(
   logger: any,
   messageList?: MessageList,
 ): Promise<ChunkType | null> {
-  if (!registryEntry?.outputProcessors?.length || !registryEntry.processorStates) {
+  if (!registryEntry?.processorStates) {
     return chunk;
   }
 
   try {
-    const runner = new ProcessorRunner({
-      inputProcessors: [],
-      outputProcessors: registryEntry.outputProcessors,
-      logger,
-      agentName,
-      processorStates: registryEntry.processorStates,
-    });
+    if (registryEntry.outputProcessorRunner === undefined) {
+      registryEntry.outputProcessorRunner = outputProcessorsSupportStream(registryEntry.outputProcessors)
+        ? new ProcessorRunner({
+            inputProcessors: [],
+            outputProcessors: registryEntry.outputProcessors,
+            logger,
+            agentName,
+            processorStates: registryEntry.processorStates,
+          })
+        : null;
+    }
+    const runner = registryEntry.outputProcessorRunner;
+    if (!runner) return chunk;
+
+    let writer = registryEntry.outputProcessorWriter;
+    if (pubsub && (!writer || writer.pubsub !== pubsub || writer.runId !== runId)) {
+      writer = {
+        pubsub,
+        runId,
+        writer: {
+          async custom(data) {
+            await emitChunkEvent(pubsub, runId, data as ChunkType);
+          },
+        },
+      };
+      registryEntry.outputProcessorWriter = writer;
+    }
 
     const {
       part: processed,
@@ -175,13 +195,7 @@ async function processChunkThroughOutputProcessors(
       registryEntry.requestContext,
       messageList,
       0,
-      pubsub
-        ? {
-            custom: async (data: { type: string }) => {
-              await emitChunkEvent(pubsub, runId, data as ChunkType);
-            },
-          }
-        : undefined,
+      pubsub ? writer?.writer : undefined,
     );
 
     if (blocked) {

@@ -156,6 +156,8 @@ export abstract class ExecutionEngine extends MastraBase {
   abstract execute<TState, TInput, TOutput>(params: {
     workflowId: string;
     runId: string;
+    /** Skip remote lifecycle reconciliation for an explicitly transient run. */
+    transientExecution?: boolean;
     /** Opaque workflow execution lineage, distinct from registry ownership generation. */
     executionGeneration: string;
     lifecycleResumeAttempt: number;
@@ -193,5 +195,11 @@ export abstract class ExecutionEngine extends MastraBase {
       includeResumeLabels?: boolean;
     };
     perStep?: boolean;
+    /**
+     * Atomically records the terminal status immediately before lifecycle
+     * publication. Once committed, a concurrent cancellation is too late to
+     * replace the status represented by `workflow.finished`.
+     */
+    commitTerminalStatus?: (status: WorkflowRunStatus) => void;
   }): Promise<TOutput>;
 }
