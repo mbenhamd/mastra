@@ -20,6 +20,7 @@ import type { RequestContext } from '../request-context';
 import type { ChunkType } from '../stream';
 import type { MastraModelOutput } from '../stream/base/output';
 import type { LanguageModelUsage, ProviderMetadata } from '../stream/types';
+import { deepEqual } from '../utils';
 import { PROCESSOR_EXECUTION_SYMBOL } from '../workflows/constants';
 import {
   isProcessorWorkflow,
@@ -183,6 +184,21 @@ function areProcessorMessageArraysEqual(before: unknown[] | undefined, after: un
         message === after[index] || messagesAreEqual(message as MessageInput, after[index] as MessageInput),
     )
   );
+}
+
+function areProcessorMessageArraysSemanticallyEqual(
+  before: unknown[] | undefined,
+  after: unknown[] | undefined,
+): boolean {
+  if (before === after) {
+    return true;
+  }
+
+  if (!before || !after || before.length !== after.length) {
+    return before === after;
+  }
+
+  return before.every((message, index) => message === after[index] || deepEqual(message, after[index]));
 }
 
 function buildProcessInputStepSpanInput(args: {
@@ -2332,10 +2348,11 @@ export class ProcessorRunner {
     if (
       result.messages &&
       !(
-        result.messageList === messageList && areProcessorMessageArraysEqual(messageList.get.all.db(), result.messages)
+        result.messageList === messageList &&
+        areProcessorMessageArraysSemanticallyEqual(messageList.get.all.db(), result.messages)
       ) &&
-      !areProcessorMessageArraysEqual(messagesBeforeWorkflow, result.messages) &&
-      !areProcessorMessageArraysEqual(messagesAfterWorkflow, result.messages)
+      !areProcessorMessageArraysSemanticallyEqual(messagesBeforeWorkflow, result.messages) &&
+      !areProcessorMessageArraysSemanticallyEqual(messagesAfterWorkflow, result.messages)
     ) {
       ProcessorRunner.applyMessagesToMessageList(
         result.messages as MastraDBMessage[],
@@ -2347,8 +2364,8 @@ export class ProcessorRunner {
     }
     if (
       result.systemMessages &&
-      !areProcessorMessageArraysEqual(systemMessagesBeforeWorkflow, result.systemMessages) &&
-      !areProcessorMessageArraysEqual(systemMessagesAfterWorkflow, result.systemMessages)
+      !areProcessorMessageArraysSemanticallyEqual(systemMessagesBeforeWorkflow, result.systemMessages) &&
+      !areProcessorMessageArraysSemanticallyEqual(systemMessagesAfterWorkflow, result.systemMessages)
     ) {
       messageList.replaceAllSystemMessages(
         result.systemMessages as Parameters<MessageList['replaceAllSystemMessages']>[0],

@@ -2480,10 +2480,12 @@ export class Workflow<
       throw new Error(`Workflow run ${this.id}/${runIdToUse} cannot change execution mode`);
     }
 
-    // Return a new Run instance with object parameters
-    const run =
-      cachedRun ??
-      new Run({
+    // Return a new Run instance with object parameters. A transient handle can
+    // be replaced under the same ID before its stale start attempt fails, so
+    // its cleanup must retire only the cache slot it still owns.
+    let run = cachedRun;
+    if (!run) {
+      run = new Run({
         workflowId: this.id,
         stateSchema: this.stateSchema,
         inputSchema: this.inputSchema,
@@ -2496,7 +2498,11 @@ export class Workflow<
         retryConfig: this.retryConfig,
         serializedStepGraph: this.serializedStepGraph,
         disableScorers: options?.disableScorers,
-        cleanup: () => this.#runs.delete(runIdToUse),
+        cleanup: () => {
+          if (this.#runs.get(runIdToUse) === run) {
+            this.#runs.delete(runIdToUse);
+          }
+        },
         tracingPolicy: this.#options?.tracingPolicy,
         workflowSteps: this.steps,
         validateInputs: this.#options?.validateInputs,
@@ -2510,6 +2516,7 @@ export class Workflow<
           options?.pubsub ??
           (transientExecution && isProcessorExecution ? transientProcessorPubSub : this.#mastra?.pubsub),
       });
+    }
 
     this.#runs.set(runIdToUse, run);
 

@@ -4203,6 +4203,41 @@ describe('ProcessorRunner', () => {
       expect(messageList.get.response.db()).toEqual([transformed]);
     });
 
+    it('preserves workflow-returned message role changes when ids and parts are unchanged', async () => {
+      const original = createMessage('same content', 'assistant');
+      const transformed = { ...original, role: 'user' as const };
+      const start = vi.fn(async ({ inputData }: { inputData: Record<string, unknown> }) => ({
+        status: 'success',
+        result: { ...inputData, messages: [transformed] },
+        steps: {},
+      }));
+      const workflow = setProcessorWorkflowPhases(
+        {
+          id: 'role-transforming-result-workflow',
+          inputSchema: {},
+          outputSchema: {},
+          execute: () => undefined,
+          createRun: vi.fn(async () => ({ start })),
+        } as unknown as ProcessorWorkflow,
+        ['outputResult'],
+      );
+      const downstream = vi.fn(
+        async ({ messages }: Parameters<NonNullable<Processor['processOutputResult']>>[0]) => messages,
+      );
+      runner = new ProcessorRunner({
+        inputProcessors: [],
+        outputProcessors: [workflow, { id: 'role-observer', processOutputResult: downstream }],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+      messageList.add([original], 'response');
+
+      await runner.runOutputProcessors(messageList);
+
+      expect(downstream.mock.calls[0]?.[0].messages).toEqual([transformed]);
+      expect(messageList.get.all.db()).toEqual([transformed]);
+    });
+
     it('avoids content hashing for pass-through workflow message histories', async () => {
       const messages = Array.from({ length: 50 }, (_, index) => createMessage(`message ${index}`, 'assistant'));
       const start = vi.fn(async ({ inputData }: { inputData: Record<string, unknown> }) => ({

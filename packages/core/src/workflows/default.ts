@@ -1216,13 +1216,6 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       result = { ...result, status: 'canceled', result: undefined, error: undefined };
     }
 
-    workflowSpan?.end({
-      output: result.result,
-      attributes: {
-        status: result.status,
-      },
-    });
-
     await this.invokeLifecycleCallbacks({
       status: result.status,
       result: result.result,
@@ -1237,6 +1230,13 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       state: lastState,
       stepExecutionPath,
     });
+
+    // Cancellation remains authoritative until every awaited terminal hook has
+    // completed. A hook may yield long enough for Run.cancel() to abort this
+    // execution after the earlier terminal-state check.
+    if (params.abortController.signal.aborted) {
+      result = { ...result, status: 'canceled', result: undefined, error: undefined };
+    }
 
     if (!suppressLifecycleEvents && result.status === 'canceled') {
       await publishWorkflowLifecycleEvent({
@@ -1263,6 +1263,20 @@ export class DefaultExecutionEngine extends ExecutionEngine {
         },
       });
     }
+
+    // A lifecycle transport can also yield while the run is still active.
+    // Reconcile once more before returning so Run never overwrites a concurrent
+    // cancellation with the result formatted before terminal delivery.
+    if (params.abortController.signal.aborted) {
+      result = { ...result, status: 'canceled', result: undefined, error: undefined };
+    }
+
+    workflowSpan?.end({
+      output: result.result,
+      attributes: {
+        status: result.status,
+      },
+    });
 
     // Drop the last-persisted-status tracker for terminal runs so the map
     // does not grow unbounded across many runs served by the same engine.

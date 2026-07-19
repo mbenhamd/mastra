@@ -238,6 +238,36 @@ describe('explicitly transient workflow lifecycle reads', () => {
     expect(persist).not.toHaveBeenCalled();
   });
 
+  it('preserves a transient cancellation that arrives during terminal lifecycle callbacks', async () => {
+    const workflow = buildExplicitlyTransientWorkflow('explicit-transient-callback-cancel');
+    new Mastra({ logger: false, workflows: { [workflow.id]: workflow } });
+    const executionEngine = (workflow as any).executionEngine;
+    const invokeLifecycleCallbacks = executionEngine.invokeLifecycleCallbacks.bind(executionEngine);
+    let markCallbackStarted!: () => void;
+    const callbackStarted = new Promise<void>(resolve => {
+      markCallbackStarted = resolve;
+    });
+    let releaseCallback!: () => void;
+    const callbackGate = new Promise<void>(resolve => {
+      releaseCallback = resolve;
+    });
+    vi.spyOn(executionEngine, 'invokeLifecycleCallbacks').mockImplementation(async (...args: any[]) => {
+      markCallbackStarted();
+      await callbackGate;
+      return invokeLifecycleCallbacks(...args);
+    });
+
+    const run = await workflow.createRun();
+    const resultPromise = run.start({ inputData: { value: 'cancel-during-callback' } });
+    await callbackStarted;
+    await run.cancel();
+    releaseCallback();
+
+    await expect(resultPromise).resolves.toMatchObject({ status: 'canceled', result: undefined });
+    expect(run.workflowRunStatus).toBe('canceled');
+    expect(run.abortController.signal.aborted).toBe(true);
+  });
+
   it('rejects reusing an in-memory run ID with a different execution mode', async () => {
     const workflow = buildExplicitlyTransientWorkflow('explicit-transient-mode-reuse');
     const storage = new MockStore();
@@ -312,7 +342,12 @@ describe('explicitly transient workflow lifecycle reads', () => {
     await expect(run.start({ inputData: { value: 'must-not-run' } })).rejects.toThrow(
       'lifecycle execution admission is stale',
     );
+    const cachedReplacement = await workflow.createRun({
+      runId: run.runId,
+      [TRANSIENT_EXECUTION_SYMBOL]: true,
+    });
     expect(run.workflowRunStatus).toBe('canceled');
+    expect(cachedReplacement).toBe(replacement);
     expect(read).not.toHaveBeenCalled();
     expect(update).not.toHaveBeenCalled();
     expect(persist).not.toHaveBeenCalled();
