@@ -2438,8 +2438,9 @@ export class ProcessorRunner {
       idsToReplace.add(message.id);
     }
     messageList.replaceMessagesForProcessor(
-      messages.map(message => ({ message, source: check.getSource(message) || defaultSource })),
-      [...idsToReplace],
+      messages,
+      idsToReplace,
+      message => check.getSource(message) || defaultSource,
     );
   }
 

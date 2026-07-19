@@ -334,20 +334,21 @@ export class MessageList {
    * @internal ProcessorRunner reconciliation only.
    */
   public replaceMessagesForProcessor(
-    replacements: Array<{ message: MastraDBMessage; source: MessageSource }>,
-    idsToRemove: readonly string[],
+    replacements: readonly MastraDBMessage[],
+    idsToRemove: ReadonlySet<string>,
+    getSource: (message: MastraDBMessage) => MessageSource,
   ): this {
-    if (idsToRemove.length > 0) {
-      this.removeByIds(idsToRemove);
+    if (idsToRemove.size > 0) {
+      this.removeByIdSet(idsToRemove);
     }
     const retainedMessageCount = this.messages.length;
 
     const lastIndexById = new Map<string, number>();
-    for (const [index, { message }] of replacements.entries()) {
+    for (const [index, message] of replacements.entries()) {
       if (message.id) lastIndexById.set(message.id, index);
     }
 
-    for (const [index, { message, source }] of replacements.entries()) {
+    for (const [index, message] of replacements.entries()) {
       if (message.role === 'system') {
         const systemText =
           (message.content.content as string | undefined) ??
@@ -368,6 +369,7 @@ export class MessageList {
         continue;
       }
 
+      const source = getSource(message);
       if (this.isRecording) {
         this.recordedEvents.push({ type: 'add', source, count: 1 });
       }
@@ -561,10 +563,13 @@ export class MessageList {
    * @returns Array of removed messages
    */
   public removeByIds(ids: readonly string[]): MastraDBMessage[] {
-    const idsSet = new Set(ids);
+    return this.removeByIdSet(new Set(ids));
+  }
+
+  private removeByIdSet(ids: ReadonlySet<string>): MastraDBMessage[] {
     const removed: MastraDBMessage[] = [];
     this.messages = this.messages.filter(m => {
-      if (idsSet.has(m.id)) {
+      if (ids.has(m.id)) {
         removed.push(m);
         this.stateManager.removeMessage(m);
         return false;

@@ -97,10 +97,7 @@ describe('ProcessorRunner', () => {
         { ...createMessage('second empty ID'), id: '' },
       ];
 
-      messageList.replaceMessagesForProcessor(
-        replacements.map(message => ({ message, source: 'input' as const })),
-        [],
-      );
+      messageList.replaceMessagesForProcessor(replacements, new Set(), () => 'input');
 
       const stored = messageList.get.input.db();
       expect(stored).toHaveLength(2);
@@ -125,7 +122,7 @@ describe('ProcessorRunner', () => {
         },
       };
 
-      messageList.replaceMessagesForProcessor([{ message: systemMessage, source: 'input' }], []);
+      messageList.replaceMessagesForProcessor([systemMessage], new Set(), () => 'input');
 
       expect(messageList.getSystemMessages()).toEqual([
         {
@@ -4350,8 +4347,9 @@ describe('ProcessorRunner', () => {
         'response',
       );
 
-      expect(removeByIds).toHaveBeenCalledTimes(1);
+      expect(removeByIds).not.toHaveBeenCalled();
       expect(replaceMessages).toHaveBeenCalledTimes(1);
+      expect(replaceMessages).toHaveBeenCalledWith(replacements, expect.any(Set), expect.any(Function));
       expect(add).not.toHaveBeenCalled();
       expect(mergeAppended).toHaveBeenCalledTimes(1);
       expect(messageList.get.response.db()).toEqual(replacements);
