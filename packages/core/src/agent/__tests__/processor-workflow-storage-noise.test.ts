@@ -198,7 +198,6 @@ describe('agent processor-workflow storage noise (issue #17137 follow-up to #173
       name: AGENT_ID,
       instructions: 'test',
       model: createDummyModel(12),
-      outputProcessors: [resultWorkflow, streamProcessor],
     });
     const storage = new InMemoryStore();
     const mastra = new Mastra({ agents: { [AGENT_ID]: agent }, storage, logger: false });
@@ -207,15 +206,17 @@ describe('agent processor-workflow storage noise (issue #17137 follow-up to #173
     const persist = vi.spyOn(workflowsStore, 'persistWorkflowSnapshot');
     const createCustomRun = vi.spyOn(resultWorkflow, 'createRun');
 
-    const resolvedProcessors = await agent.listOutputProcessors();
-    expect(resolvedProcessors).toEqual([resultWorkflow, streamProcessor]);
+    expect(resultWorkflow.mastra).toBeUndefined();
 
-    const stream = await mastra.getAgent(AGENT_ID).stream('Hello!');
+    const stream = await mastra.getAgent(AGENT_ID).stream('Hello!', {
+      outputProcessors: [resultWorkflow, streamProcessor],
+    });
     for await (const _part of stream.fullStream) {
       // Consume all phases so an accidental nested admission is observable.
     }
 
     expect(streamPart.mock.calls.length).toBeGreaterThan(1);
+    expect(resultWorkflow.mastra).toBe(mastra);
     expect(createCustomRun).toHaveBeenCalledTimes(1);
     expect(read.mock.calls.filter(([input]) => input.workflowName === resultWorkflow.id)).toEqual([]);
     expect(persist.mock.calls.filter(([input]) => input.workflowName === resultWorkflow.id)).toEqual([]);
@@ -258,15 +259,21 @@ describe('agent processor-workflow storage noise (issue #17137 follow-up to #173
     const workflowsStore = (await storage.getStore('workflows'))!;
     const read = vi.spyOn(workflowsStore, 'loadWorkflowSnapshot');
     const streamedText: string[] = [];
+    const admissions = spyOnWorkflowAdmissions();
 
-    const stream = await mastra.getAgent(AGENT_ID).stream('Hello!');
-    for await (const part of stream.fullStream) {
-      if (part.type === 'text-delta') streamedText.push(part.payload.text);
+    try {
+      const stream = await mastra.getAgent(AGENT_ID).stream('Hello!');
+      for await (const part of stream.fullStream) {
+        if (part.type === 'text-delta') streamedText.push(part.payload.text);
+      }
+    } finally {
+      admissions.spy.mockRestore();
     }
 
     expect(streamedText).toHaveLength(12);
     expect(textDeltaCountInResult).toBe(12);
     expect(resultOrder).toEqual(['stream-aware', 'result-only']);
+    expect(admissions.workflowIds.filter(id => id === `${AGENT_ID}-output-processor`)).toEqual([]);
     expect(read.mock.calls.filter(([input]) => input.workflowName === `${AGENT_ID}-output-processor`)).toEqual([]);
   });
 

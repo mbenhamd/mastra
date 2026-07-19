@@ -3,7 +3,7 @@ import { z } from 'zod/v4';
 import { sanitizeToolName } from '../../../agent/message-list/utils/tool-name';
 import { createObservabilityContext, EntityType, SpanType } from '../../../observability';
 import type { ProcessorState } from '../../../processors';
-import { ProcessorRunner } from '../../../processors/runner';
+import { ProcessorRunner, outputProcessorsSupportStream } from '../../../processors/runner';
 import type { ChunkType, ProviderMetadata } from '../../../stream/types';
 import { ChunkFrom } from '../../../stream/types';
 import {
@@ -41,7 +41,7 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
    * 3. Blocking/tripwire works correctly for tool results
    */
   const processorRunner =
-    rest.outputProcessors?.length && rest.logger
+    outputProcessorsSupportStream(rest.outputProcessors) && rest.logger
       ? new ProcessorRunner({
           inputProcessors: [],
           outputProcessors: rest.outputProcessors,

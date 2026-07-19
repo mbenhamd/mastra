@@ -8,7 +8,8 @@ const allProcessorWorkflowPhases = [
   'outputStep',
 ] as const satisfies readonly ProcessorWorkflowPhase[];
 
-const declaredProcessorWorkflowPhases = new WeakMap<ProcessorWorkflow, readonly ProcessorWorkflowPhase[]>();
+const declaredProcessorWorkflowPhases = new WeakMap<object, readonly ProcessorWorkflowPhase[]>();
+const durableProcessorWorkflowClones = new WeakSet<object>();
 
 /**
  * Type guard to check if an object is a Workflow that can be used as a processor.
@@ -70,6 +71,21 @@ export function setProcessorWorkflowPhases<TWorkflow extends ProcessorWorkflow>(
   return workflow;
 }
 
+/** @internal Preserve processor execution traits when a workflow is cloned. */
+export function copyProcessorWorkflowTraits<TWorkflow extends object>(source: object, target: TWorkflow): TWorkflow {
+  const declaredPhases = declaredProcessorWorkflowPhases.get(source);
+  if (declaredPhases) {
+    declaredProcessorWorkflowPhases.set(target, declaredPhases);
+  }
+  // Some engine integrations intentionally clone into the base Workflow class.
+  // Preserve the source's durable boundary without changing the clone's runtime
+  // engine, which would otherwise make a phase-restricted clone look transient.
+  if (processorWorkflowRequiresDurableExecution(source as ProcessorWorkflow)) {
+    durableProcessorWorkflowClones.add(target);
+  }
+  return target;
+}
+
 /** Preserve unannotated workflow compatibility while honoring declared capabilities. */
 export function processorWorkflowSupportsPhase(workflow: ProcessorWorkflow, phase: ProcessorWorkflowPhase): boolean {
   return declaredProcessorWorkflowPhases.get(workflow)?.includes(phase) ?? true;
@@ -79,4 +95,31 @@ export function processorWorkflowSupportsPhase(workflow: ProcessorWorkflow, phas
 export function processorWorkflowHasPhaseRestrictions(workflow: ProcessorWorkflow): boolean {
   const declaredPhases = declaredProcessorWorkflowPhases.get(workflow);
   return Boolean(declaredPhases && allProcessorWorkflowPhases.some(phase => !declaredPhases.includes(phase)));
+}
+
+/** Non-default workflow engines and wrappers containing them require durable parent execution. */
+export function processorWorkflowRequiresDurableExecution(workflow: ProcessorWorkflow): boolean {
+  const visited = new Set<object>();
+
+  const visit = (candidate: unknown): boolean => {
+    if (!candidate || typeof candidate !== 'object' || visited.has(candidate)) {
+      return false;
+    }
+    visited.add(candidate);
+
+    if (durableProcessorWorkflowClones.has(candidate)) {
+      return true;
+    }
+
+    const { engineType, steps } = candidate as { engineType?: unknown; steps?: unknown };
+    if (typeof engineType === 'string' && engineType !== 'default') {
+      return true;
+    }
+    if (!steps || typeof steps !== 'object') {
+      return false;
+    }
+    return Object.values(steps).some(visit);
+  };
+
+  return visit(workflow);
 }

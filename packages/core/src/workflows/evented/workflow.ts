@@ -25,7 +25,6 @@ import {
 } from '../../observability';
 import type { ObservabilityContext, TracingContext, TracingPolicy } from '../../observability';
 import { executeWithContext } from '../../observability/utils';
-import type { OutputResult, Processor, ProcessorStreamWriter } from '../../processors';
 import {
   ProcessorRunner,
   ProcessorState,
@@ -33,6 +32,8 @@ import {
   ProcessorStepSchema,
   createProcessorSendSignal,
 } from '../../processors';
+import type { OutputResult, Processor, ProcessorStreamWriter } from '../../processors';
+import { copyProcessorWorkflowTraits } from '../../processors/is-processor-workflow';
 import {
   summarizeActiveToolsForSpan,
   summarizeProcessorModelForSpan,
@@ -76,7 +77,7 @@ import type {
   WorkflowLifecycleEventCallback,
   WorkflowLifecycleWatchOptions,
 } from '../../workflows/types';
-import { PUBSUB_SYMBOL, STREAM_FORMAT_SYMBOL } from '../constants';
+import { PUBSUB_SYMBOL, STREAM_FORMAT_SYMBOL, TRANSIENT_EXECUTION_SYMBOL } from '../constants';
 import { createWorkflowExecutionGeneration } from '../lifecycle-events';
 import { validateCron } from '../scheduler/cron';
 import type { WorkflowScheduleConfig } from '../scheduler/types';
@@ -126,7 +127,7 @@ export function cloneWorkflow<
 
   wf.setStepFlow(workflow.stepGraph);
   wf.commit();
-  return wf;
+  return copyProcessorWorkflowTraits(workflow, wf);
 }
 
 export function cloneStep<TStepId extends string>(
@@ -1627,6 +1628,7 @@ export class EventedWorkflow<
     runId?: string;
     resourceId?: string;
     disableScorers?: boolean;
+    [TRANSIENT_EXECUTION_SYMBOL]?: boolean;
   }): Promise<RunWithRawInput<TEngineType, TSteps, TState, TInput, TOutput, unknown, TRawInput>> {
     if (this.stepFlow.length === 0) {
       throw new Error(
@@ -1635,6 +1637,9 @@ export class EventedWorkflow<
     }
     if (!this.executionGraph.steps) {
       throw new Error('Uncommitted step flow changes detected. Call .commit() to register the steps.');
+    }
+    if (options?.[TRANSIENT_EXECUTION_SYMBOL] === true) {
+      throw new Error('Evented workflows cannot run inside transient workflows');
     }
 
     const usesCustomGeneratedRunId = !options?.runId && Boolean(this.mastra?.getIdGenerator());

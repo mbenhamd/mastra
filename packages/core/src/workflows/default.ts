@@ -27,7 +27,11 @@ import type { ExecuteSleepParams, ExecuteSleepUntilParams } from './handlers/sle
 import { executeSleep as executeSleepHandler, executeSleepUntil as executeSleepUntilHandler } from './handlers/sleep';
 import type { ExecuteStepParams } from './handlers/step';
 import { executeStep as executeStepHandler } from './handlers/step';
-import { publishWorkflowLifecycleEvent, requireWorkflowExecutionGeneration } from './lifecycle-events';
+import {
+  publishWorkflowLifecycleEvent,
+  requireWorkflowExecutionGeneration,
+  workflowLifecycleEventsAreSuppressed,
+} from './lifecycle-events';
 import type { ConditionFunction, ConditionFunctionParams, Step } from './step';
 import type {
   FormattedWorkflowResult,
@@ -795,6 +799,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       includeResumeLabels?: boolean;
     };
     perStep?: boolean;
+    commitTerminalStatus?: (status: WorkflowRunStatus) => void;
     /** Trace IDs for creating child spans in durable execution */
     tracingIds?: {
       traceId: string;
@@ -822,21 +827,24 @@ export class DefaultExecutionEngine extends ExecutionEngine {
     );
     const lifecycleResumeAttempt = params.lifecycleResumeAttempt;
     const lifecycleStepStates = params.lifecycleStepStates;
+    const suppressLifecycleEvents = workflowLifecycleEventsAreSuppressed(params.pubsub);
     const { attempts = 0, delay = 0 } = retryConfig ?? {};
     const steps = graph.steps;
 
     //clear retryCounts
     this.retryCounts.clear();
 
-    await publishWorkflowLifecycleEvent({
-      pubsub: params.pubsub,
-      workflowId,
-      runId,
-      executionGeneration,
-      event: params.resume
-        ? { type: 'workflow.resumed', resumeAttempt: lifecycleResumeAttempt, resumeData: params.resume.resumePayload }
-        : { type: 'workflow.started', resumeAttempt: lifecycleResumeAttempt, input },
-    });
+    if (!suppressLifecycleEvents) {
+      await publishWorkflowLifecycleEvent({
+        pubsub: params.pubsub,
+        workflowId,
+        runId,
+        executionGeneration,
+        event: params.resume
+          ? { type: 'workflow.resumed', resumeAttempt: lifecycleResumeAttempt, resumeData: params.resume.resumePayload }
+          : { type: 'workflow.started', resumeAttempt: lifecycleResumeAttempt, input },
+      });
+    }
 
     if (steps.length === 0) {
       const empty_graph_error = new MastraError({
@@ -847,25 +855,27 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       });
 
       workflowSpan?.error({ error: empty_graph_error });
-      await publishWorkflowLifecycleEvent({
-        pubsub: params.pubsub,
-        workflowId,
-        runId,
-        executionGeneration,
-        event: { type: 'workflow.failed', resumeAttempt: lifecycleResumeAttempt, error: empty_graph_error },
-      });
-      await publishWorkflowLifecycleEvent({
-        pubsub: params.pubsub,
-        workflowId,
-        runId,
-        executionGeneration,
-        event: {
-          type: 'workflow.finished',
-          resumeAttempt: lifecycleResumeAttempt,
-          status: 'failed',
-          error: empty_graph_error,
-        },
-      });
+      if (!suppressLifecycleEvents) {
+        await publishWorkflowLifecycleEvent({
+          pubsub: params.pubsub,
+          workflowId,
+          runId,
+          executionGeneration,
+          event: { type: 'workflow.failed', resumeAttempt: lifecycleResumeAttempt, error: empty_graph_error },
+        });
+        await publishWorkflowLifecycleEvent({
+          pubsub: params.pubsub,
+          workflowId,
+          runId,
+          executionGeneration,
+          event: {
+            type: 'workflow.finished',
+            resumeAttempt: lifecycleResumeAttempt,
+            status: 'failed',
+            error: empty_graph_error,
+          },
+        });
+      }
       throw empty_graph_error;
     }
 
@@ -1003,42 +1013,29 @@ export class DefaultExecutionEngine extends ExecutionEngine {
               }
             : {};
 
-        await this.persistStepUpdate({
-          workflowId,
-          runId,
-          resourceId,
-          stepResults: lastOutput.stepResults,
-          serializedStepGraph: params.serializedStepGraph,
-          executionContext,
-          workflowStatus: result.status,
-          result: result.result,
-          error: result.error,
-          requestContext: currentRequestContext,
-          tracingContext: persistTracingContext,
-        });
+        if (!executionContext.transientExecution) {
+          await this.persistStepUpdate({
+            workflowId,
+            runId,
+            resourceId,
+            stepResults: lastOutput.stepResults,
+            serializedStepGraph: params.serializedStepGraph,
+            executionContext,
+            workflowStatus: result.status,
+            result: result.result,
+            error: result.error,
+            requestContext: currentRequestContext,
+            tracingContext: persistTracingContext,
+          });
+        }
 
         if (
-          !params.transientExecution &&
-          (await this.isAuthoritativelyCanceled({ workflowId, runId, executionGeneration }))
+          params.abortController.signal.aborted ||
+          (!params.transientExecution &&
+            (await this.isAuthoritativelyCanceled({ workflowId, runId, executionGeneration })))
         ) {
           result = { ...result, status: 'canceled', result: undefined, error: undefined };
           lastOutput.result.status = 'canceled';
-        }
-
-        if (result.error) {
-          workflowSpan?.error({
-            error: result.error,
-            attributes: {
-              status: result.status,
-            },
-          });
-        } else {
-          workflowSpan?.end({
-            output: result.result,
-            attributes: {
-              status: result.status,
-            },
-          });
         }
 
         if (lastOutput.result.status !== 'paused') {
@@ -1059,58 +1056,101 @@ export class DefaultExecutionEngine extends ExecutionEngine {
           });
         }
 
-        if (lastOutput.result.status === 'paused') {
+        // A lifecycle callback can yield while Run.cancel() wins ownership of
+        // the terminal transition. Reconcile before committing any terminal
+        // status or publishing the lifecycle sequence for it.
+        if (params.abortController.signal.aborted) {
+          result = { ...result, status: 'canceled', result: undefined, error: undefined };
+          lastOutput.result.status = 'canceled';
+        }
+
+        if (result.error) {
+          workflowSpan?.error({
+            error: result.error,
+            attributes: {
+              status: result.status,
+            },
+          });
+        } else {
+          workflowSpan?.end({
+            output: result.result,
+            attributes: {
+              status: result.status,
+            },
+          });
+        }
+
+        if (!suppressLifecycleEvents && lastOutput.result.status === 'paused') {
           await params.pubsub.publish(`workflow.events.v2.${runId}`, {
             type: 'watch',
             runId,
             data: { type: 'workflow-paused', payload: {} },
           });
+          if (params.abortController.signal.aborted) {
+            result = { ...result, status: 'canceled', result: undefined, error: undefined };
+            lastOutput.result.status = 'canceled';
+          }
         }
 
-        if (result.status === 'suspended') {
-          await publishWorkflowLifecycleEvent({
-            pubsub: params.pubsub,
-            workflowId,
-            runId,
-            executionGeneration,
-            event: {
-              type: 'workflow.suspended',
-              resumeAttempt: lifecycleResumeAttempt,
-              suspendedStepIds: Object.keys(lastOutput.mutableContext.suspendedPaths),
-            },
-          });
-        } else if (result.status !== 'paused') {
-          if (result.status === 'failed' || result.status === 'tripwire') {
+        if (!suppressLifecycleEvents) {
+          if (result.status === 'suspended') {
             await publishWorkflowLifecycleEvent({
               pubsub: params.pubsub,
               workflowId,
               runId,
               executionGeneration,
-              event: { type: 'workflow.failed', resumeAttempt: lifecycleResumeAttempt, error: result.error },
+              event: {
+                type: 'workflow.suspended',
+                resumeAttempt: lifecycleResumeAttempt,
+                suspendedStepIds: Object.keys(lastOutput.mutableContext.suspendedPaths),
+              },
             });
-          } else if (result.status === 'canceled') {
-            await publishWorkflowLifecycleEvent({
-              pubsub: params.pubsub,
-              workflowId,
-              runId,
-              executionGeneration,
-              event: { type: 'workflow.canceled', resumeAttempt: lifecycleResumeAttempt },
-            });
+            if (params.abortController.signal.aborted) {
+              result = { ...result, status: 'canceled', result: undefined, error: undefined };
+              lastOutput.result.status = 'canceled';
+            }
           }
 
-          await publishWorkflowLifecycleEvent({
-            pubsub: params.pubsub,
-            workflowId,
-            runId,
-            executionGeneration,
-            event: {
-              type: 'workflow.finished',
-              resumeAttempt: lifecycleResumeAttempt,
-              status: result.status,
-              result: result.result,
-              error: result.error,
-            },
-          });
+          if (result.status !== 'suspended' && result.status !== 'paused') {
+            // This synchronous callback is the terminal commit boundary. No
+            // awaited work may occur between the last abort reconciliation
+            // above and this call.
+            params.commitTerminalStatus?.(result.status);
+
+            if (result.status === 'failed' || result.status === 'tripwire') {
+              await publishWorkflowLifecycleEvent({
+                pubsub: params.pubsub,
+                workflowId,
+                runId,
+                executionGeneration,
+                event: { type: 'workflow.failed', resumeAttempt: lifecycleResumeAttempt, error: result.error },
+              });
+            } else if (result.status === 'canceled') {
+              await publishWorkflowLifecycleEvent({
+                pubsub: params.pubsub,
+                workflowId,
+                runId,
+                executionGeneration,
+                event: { type: 'workflow.canceled', resumeAttempt: lifecycleResumeAttempt },
+              });
+            }
+
+            await publishWorkflowLifecycleEvent({
+              pubsub: params.pubsub,
+              workflowId,
+              runId,
+              executionGeneration,
+              event: {
+                type: 'workflow.finished',
+                resumeAttempt: lifecycleResumeAttempt,
+                status: result.status,
+                result: result.result,
+                error: result.error,
+              },
+            });
+          }
+        } else if (result.status !== 'suspended' && result.status !== 'paused') {
+          params.commitTerminalStatus?.(result.status);
         }
 
         // Drop the last-persisted-status tracker for early terminal exits
@@ -1139,22 +1179,26 @@ export class DefaultExecutionEngine extends ExecutionEngine {
           undefined,
           stepExecutionPath,
         )) as any;
-        await this.persistStepUpdate({
-          workflowId,
-          runId,
-          resourceId,
-          stepResults: lastOutput.stepResults,
-          serializedStepGraph: params.serializedStepGraph,
-          executionContext: lastExecutionContext!,
-          workflowStatus: 'paused',
-          requestContext: currentRequestContext,
-        });
+        if (!lastExecutionContext!.transientExecution) {
+          await this.persistStepUpdate({
+            workflowId,
+            runId,
+            resourceId,
+            stepResults: lastOutput.stepResults,
+            serializedStepGraph: params.serializedStepGraph,
+            executionContext: lastExecutionContext!,
+            workflowStatus: 'paused',
+            requestContext: currentRequestContext,
+          });
+        }
 
-        await params.pubsub.publish(`workflow.events.v2.${runId}`, {
-          type: 'watch',
-          runId,
-          data: { type: 'workflow-paused', payload: {} },
-        });
+        if (!suppressLifecycleEvents) {
+          await params.pubsub.publish(`workflow.events.v2.${runId}`, {
+            type: 'watch',
+            runId,
+            data: { type: 'workflow-paused', payload: {} },
+          });
+        }
 
         workflowSpan?.end({
           attributes: {
@@ -1176,32 +1220,27 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       undefined,
       stepExecutionPath,
     )) as any;
-    await this.persistStepUpdate({
-      workflowId,
-      runId,
-      resourceId,
-      stepResults: lastOutput.stepResults,
-      serializedStepGraph: params.serializedStepGraph,
-      executionContext: lastExecutionContext!,
-      workflowStatus: result.status,
-      result: result.result,
-      error: result.error,
-      requestContext: currentRequestContext,
-    });
+    if (!lastExecutionContext!.transientExecution) {
+      await this.persistStepUpdate({
+        workflowId,
+        runId,
+        resourceId,
+        stepResults: lastOutput.stepResults,
+        serializedStepGraph: params.serializedStepGraph,
+        executionContext: lastExecutionContext!,
+        workflowStatus: result.status,
+        result: result.result,
+        error: result.error,
+        requestContext: currentRequestContext,
+      });
+    }
 
     if (
-      !params.transientExecution &&
-      (await this.isAuthoritativelyCanceled({ workflowId, runId, executionGeneration }))
+      params.abortController.signal.aborted ||
+      (!params.transientExecution && (await this.isAuthoritativelyCanceled({ workflowId, runId, executionGeneration })))
     ) {
       result = { ...result, status: 'canceled', result: undefined, error: undefined };
     }
-
-    workflowSpan?.end({
-      output: result.result,
-      attributes: {
-        status: result.status,
-      },
-    });
 
     await this.invokeLifecycleCallbacks({
       status: result.status,
@@ -1218,7 +1257,28 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       stepExecutionPath,
     });
 
-    if (result.status === 'canceled') {
+    // Cancellation remains authoritative until every awaited terminal hook has
+    // completed. A hook may yield long enough for Run.cancel() to abort this
+    // execution after the earlier terminal-state check.
+    if (params.abortController.signal.aborted) {
+      result = { ...result, status: 'canceled', result: undefined, error: undefined };
+    }
+
+    // Establish the terminal owner synchronously after the last cancellation
+    // check and before any lifecycle publication can yield.
+    params.commitTerminalStatus?.(result.status);
+
+    // Finalize the workflow span before terminal transport awaits. Lifecycle
+    // publication can fail after the result is already persisted and committed;
+    // that transport error must not leave the completed run span open.
+    workflowSpan?.end({
+      output: result.result,
+      attributes: {
+        status: result.status,
+      },
+    });
+
+    if (!suppressLifecycleEvents && result.status === 'canceled') {
       await publishWorkflowLifecycleEvent({
         pubsub: params.pubsub,
         workflowId,
@@ -1228,19 +1288,21 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       });
     }
 
-    await publishWorkflowLifecycleEvent({
-      pubsub: params.pubsub,
-      workflowId,
-      runId,
-      executionGeneration,
-      event: {
-        type: 'workflow.finished',
-        resumeAttempt: lifecycleResumeAttempt,
-        status: result.status,
-        result: result.result,
-        error: result.error,
-      },
-    });
+    if (!suppressLifecycleEvents) {
+      await publishWorkflowLifecycleEvent({
+        pubsub: params.pubsub,
+        workflowId,
+        runId,
+        executionGeneration,
+        event: {
+          type: 'workflow.finished',
+          resumeAttempt: lifecycleResumeAttempt,
+          status: result.status,
+          result: result.result,
+          error: result.error,
+        },
+      });
+    }
 
     // Drop the last-persisted-status tracker for terminal runs so the map
     // does not grow unbounded across many runs served by the same engine.

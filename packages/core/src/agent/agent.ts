@@ -76,6 +76,7 @@ import {
   getProcessorWorkflowPhases,
   isProcessorWorkflow,
   processorWorkflowHasPhaseRestrictions,
+  processorWorkflowRequiresDurableExecution,
   setProcessorWorkflowPhases,
 } from '../processors/index';
 import { SkillsProcessor } from '../processors/processors/skills';
@@ -1718,6 +1719,9 @@ export class Agent<
       if (!workflow.type) {
         workflow.type = 'processor';
       }
+      if (this.#mastra && workflow.mastra !== this.#mastra) {
+        workflow.__registerMastra(this.#mastra);
+      }
       return [workflow];
     }
 
@@ -1728,19 +1732,33 @@ export class Agent<
       return [];
     }
 
-    // A phase-restricted custom workflow must remain a top-level processor.
-    // Nesting it in a synthetic workflow whose capabilities are the union of
-    // the whole chain would execute the nested workflow during phases it
-    // explicitly excluded. ProcessorRunner preserves order while applying the
-    // phase guard to each returned item.
+    const processorPhaseSignatures = new Set(
+      validProcessors.map(processor => [...getProcessorWorkflowPhases(processor)].sort().join('\0')),
+    );
+
+    // Phase-restricted workflows, heterogeneous phase sets, and workflows with
+    // durable descendants must remain top-level processors. A synthetic
+    // workflow would otherwise admit every child whenever the union supports a
+    // phase, or place a durable child beneath a transient parent.
+    // ProcessorRunner preserves order while applying the phase guard to each item.
     if (
+      processorPhaseSignatures.size > 1 ||
       validProcessors.some(
-        processor => isProcessorWorkflow(processor) && processorWorkflowHasPhaseRestrictions(processor),
+        processor =>
+          isProcessorWorkflow(processor) &&
+          (processorWorkflowHasPhaseRestrictions(processor) || processorWorkflowRequiresDurableExecution(processor)),
       )
     ) {
-      for (const processor of validProcessors) {
-        if (isProcessorWorkflow(processor) && !processor.type) {
-          processor.type = 'processor';
+      for (const [index, processor] of validProcessors.entries()) {
+        if (isProcessorWorkflow(processor)) {
+          if (!processor.type) {
+            processor.type = 'processor';
+          }
+          if (this.#mastra && processor.mastra !== this.#mastra) {
+            processor.__registerMastra(this.#mastra);
+          }
+        } else {
+          processor.processorIndex = index;
         }
       }
       return validProcessors as T[];
@@ -1759,6 +1777,9 @@ export class Agent<
       // Mark the workflow as a processor workflow if not already set
       if (!workflow.type) {
         workflow.type = 'processor';
+      }
+      if (this.#mastra && workflow.mastra !== this.#mastra) {
+        workflow.__registerMastra(this.#mastra);
       }
       return [workflow];
     }
@@ -2124,52 +2145,50 @@ export class Agent<
   }
 
   /**
-   * Returns configured processor workflows for registration with Mastra.
-   * This excludes memory-derived processors to avoid triggering memory factory functions.
+   * Resolves configured processors without registering them. This excludes
+   * memory-derived processors to avoid triggering memory factory functions.
    * @internal
    */
-  public async getConfiguredProcessorWorkflows(): Promise<ProcessorWorkflow[]> {
-    const workflows: ProcessorWorkflow[] = [];
+  public async getResolvedConfiguredProcessors(requestContext?: RequestContext): Promise<{
+    inputProcessors: InputProcessorOrWorkflow[];
+    outputProcessors: OutputProcessorOrWorkflow[];
+  }> {
+    const ctx = (requestContext || new RequestContext()) as RequestContext<TRequestContext>;
+    let inputProcessors: InputProcessorOrWorkflow[] = [];
+    let outputProcessors: OutputProcessorOrWorkflow[] = [];
 
-    // Get input processors (static or from function). Lone processors register
-    // directly; only composed or explicit workflows are returned.
     if (this.#inputProcessors) {
-      const inputProcessors =
+      const configuredInputProcessors =
         typeof this.#inputProcessors === 'function'
-          ? await this.#inputProcessors({ requestContext: new RequestContext() as RequestContext<TRequestContext> })
+          ? await this.#inputProcessors({ requestContext: ctx })
           : this.#inputProcessors;
-
-      const combined = this.combineProcessorsIntoWorkflow(inputProcessors, `${this.id}-input-processor`);
-      for (const p of combined) {
-        if (isProcessorWorkflow(p)) {
-          workflows.push(p);
-        } else if (this.#mastra) {
-          this.#mastra.addProcessor(p);
-          this.#mastra.addProcessorConfiguration(p, this.id, 'input');
-        }
-      }
+      inputProcessors = this.combineProcessorsIntoWorkflow(
+        configuredInputProcessors,
+        `${this.id}-input-processor`,
+      ) as InputProcessorOrWorkflow[];
     }
 
-    // Get output processors (static or from function). Lone processors register
-    // directly; only composed or explicit workflows are returned.
     if (this.#outputProcessors) {
-      const outputProcessors =
+      const configuredOutputProcessors =
         typeof this.#outputProcessors === 'function'
-          ? await this.#outputProcessors({ requestContext: new RequestContext() as RequestContext<TRequestContext> })
+          ? await this.#outputProcessors({ requestContext: ctx })
           : this.#outputProcessors;
-
-      const combined = this.combineProcessorsIntoWorkflow(outputProcessors, `${this.id}-output-processor`);
-      for (const p of combined) {
-        if (isProcessorWorkflow(p)) {
-          workflows.push(p);
-        } else if (this.#mastra) {
-          this.#mastra.addProcessor(p);
-          this.#mastra.addProcessorConfiguration(p, this.id, 'output');
-        }
-      }
+      outputProcessors = this.combineProcessorsIntoWorkflow(
+        configuredOutputProcessors,
+        `${this.id}-output-processor`,
+      ) as OutputProcessorOrWorkflow[];
     }
 
-    return workflows;
+    return { inputProcessors, outputProcessors };
+  }
+
+  /**
+   * Returns configured processor workflows without mutating Mastra registries.
+   * @internal
+   */
+  public async getConfiguredProcessorWorkflows(requestContext?: RequestContext): Promise<ProcessorWorkflow[]> {
+    const { inputProcessors, outputProcessors } = await this.getResolvedConfiguredProcessors(requestContext);
+    return [...inputProcessors, ...outputProcessors].filter(isProcessorWorkflow);
   }
 
   /**

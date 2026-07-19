@@ -7,7 +7,12 @@ import type { CoreMessage } from '@mastra/core/llm';
 import type { TracingContext } from '@mastra/core/observability';
 import { EntityType, SpanType } from '@mastra/core/observability';
 import type { Processor, ProcessorStepOutput, ProcessorStepInputSchema, OutputResult } from '@mastra/core/processors';
-import { ProcessorRunner, ProcessorStepOutputSchema, ProcessorStepSchema } from '@mastra/core/processors';
+import {
+  copyProcessorWorkflowTraits,
+  ProcessorRunner,
+  ProcessorStepOutputSchema,
+  ProcessorStepSchema,
+} from '@mastra/core/processors';
 import type {
   InferPublicSchema,
   InferPublicSchemaInput,
@@ -1266,7 +1271,7 @@ export function init(inngest: Inngest) {
 
       wf.setStepFlow(workflow.stepGraph);
       wf.commit();
-      return wf;
+      return copyProcessorWorkflowTraits(workflow, wf);
     },
   };
 }

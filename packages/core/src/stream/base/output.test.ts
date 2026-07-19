@@ -2,6 +2,7 @@ import { ReadableStream } from 'node:stream/web';
 import { describe, expect, it, vi } from 'vitest';
 import { MessageList } from '../../agent/message-list';
 import type { Processor, ProcessorStreamWriter } from '../../processors';
+import { ProcessorRunner } from '../../processors/runner';
 import { ChunkFrom } from '../types';
 import type { ChunkType } from '../types';
 import { MastraModelOutput } from './output';
@@ -81,6 +82,77 @@ function createFinishChunk(
 }
 
 describe('MastraModelOutput', () => {
+  it('bypasses the per-chunk processor transform when only result processors are configured', async () => {
+    const processPart = vi.spyOn(ProcessorRunner.prototype, 'processPart');
+    const runId = 'result-only-inner-run';
+    const resultOnlyProcessor: Processor = {
+      id: 'result-only-inner-processor',
+      processOutputResult: async ({ messages }) => messages,
+    };
+    const output = new MastraModelOutput({
+      model: { modelId: 'test-model', provider: 'test', version: 'v3' },
+      stream: createChunkStream([createStepFinishChunk(runId), createFinishChunk(runId)]),
+      messageList: new MessageList({ threadId: 'test-thread' }),
+      messageId: 'msg-1',
+      options: {
+        runId,
+        isLLMExecutionStep: true,
+        outputProcessors: [resultOnlyProcessor],
+      },
+    });
+
+    try {
+      expect(output.processorRunner).toBeUndefined();
+      await output.consumeStream();
+      expect(processPart).not.toHaveBeenCalled();
+    } finally {
+      processPart.mockRestore();
+    }
+  });
+
+  it.each([
+    [
+      'stream',
+      {
+        id: 'stream-only-outer-processor',
+        processOutputStream: async ({ part }: Parameters<NonNullable<Processor['processOutputStream']>>[0]) => part,
+      },
+    ],
+    [
+      'step',
+      {
+        id: 'step-only-outer-processor',
+        processOutputStep: async ({ messages }: Parameters<NonNullable<Processor['processOutputStep']>>[0]) => ({
+          messages,
+        }),
+      },
+    ],
+  ] satisfies Array<[string, Processor]>)(
+    'skips outer finalization for %s-only processors',
+    async (_phase, processor) => {
+      const runOutputProcessors = vi.spyOn(ProcessorRunner.prototype, 'runOutputProcessors');
+      const runId = `${_phase}-only-outer-run`;
+      const output = new MastraModelOutput({
+        model: { modelId: 'test-model', provider: 'test', version: 'v3' },
+        stream: createChunkStream([createStepFinishChunk(runId), createFinishChunk(runId)]),
+        messageList: new MessageList({ threadId: 'test-thread' }),
+        messageId: 'msg-1',
+        options: {
+          runId,
+          outputProcessors: [processor],
+        },
+      });
+
+      try {
+        expect(output.processorRunner).toBeUndefined();
+        await output.consumeStream();
+        expect(runOutputProcessors).not.toHaveBeenCalled();
+      } finally {
+        runOutputProcessors.mockRestore();
+      }
+    },
+  );
+
   describe('writer in output processors (outer context)', () => {
     it('should pass a defined writer to processOutputResult', async () => {
       let receivedWriter: ProcessorStreamWriter | undefined;

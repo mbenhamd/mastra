@@ -26,6 +26,8 @@ import type {
   Run,
   RunWithRawInput,
 } from '@mastra/core/workflows';
+import { TRANSIENT_EXECUTION_SYMBOL } from '@mastra/core/workflows/_constants';
+import type { PROCESSOR_EXECUTION_SYMBOL } from '@mastra/core/workflows/_constants';
 import { NonRetriableError } from 'inngest';
 import type { Inngest } from 'inngest';
 import { InngestExecutionEngine } from './execution-engine';
@@ -343,7 +345,14 @@ export class InngestWorkflow<
     disableScorers?: boolean;
     /** Inngest functions execute remotely, so per-run PubSub objects cannot be reconstructed. */
     pubsub?: PubSub;
+    /** @internal Accepted for substitutability; Inngest processor workflows remain durable. */
+    [PROCESSOR_EXECUTION_SYMBOL]?: boolean;
+    /** @internal Inngest cannot inherit process-local execution from a parent workflow. */
+    [TRANSIENT_EXECUTION_SYMBOL]?: boolean;
   }): Promise<RunWithRawInput<TEngineType, TSteps, TState, TInput, TOutput, TRequestContext, TRawInput>> {
+    if (options?.[TRANSIENT_EXECUTION_SYMBOL] === true) {
+      throw new TypeError('Inngest workflows cannot run inside transient workflows');
+    }
     if (options?.pubsub) {
       throw new TypeError(
         'Inngest createRun({ pubsub }) is unsupported because remote function replicas cannot reconstruct a per-run PubSub object; set pubsubFactory on the workflow instead',
