@@ -168,6 +168,20 @@ async function processChunkThroughOutputProcessors(
     const runner = registryEntry.outputProcessorRunner;
     if (!runner) return chunk;
 
+    let writer = registryEntry.outputProcessorWriter;
+    if (pubsub && (!writer || writer.pubsub !== pubsub || writer.runId !== runId)) {
+      writer = {
+        pubsub,
+        runId,
+        writer: {
+          async custom(data) {
+            await emitChunkEvent(pubsub, runId, data as ChunkType);
+          },
+        },
+      };
+      registryEntry.outputProcessorWriter = writer;
+    }
+
     const {
       part: processed,
       blocked,
@@ -181,13 +195,7 @@ async function processChunkThroughOutputProcessors(
       registryEntry.requestContext,
       messageList,
       0,
-      pubsub
-        ? {
-            custom: async (data: { type: string }) => {
-              await emitChunkEvent(pubsub, runId, data as ChunkType);
-            },
-          }
-        : undefined,
+      pubsub ? writer?.writer : undefined,
     );
 
     if (blocked) {

@@ -345,23 +345,25 @@ export async function executeStep(
           requestContext: engine.serializeRequestContext(requestContext),
         };
       }
-      const emitOperationId = `workflow.${workflowId}.run.${runId}.step.${step.id}.emit_result`;
-      await engine.wrapDurableOperation(emitOperationId, async () => {
-        await emitStepResultEvents({
-          stepId: step.id,
-          stepCallId,
-          stepAttempt: lifecycleStepState.stepAttempt,
-          workflowId,
-          executionGeneration,
-          execResults: stepResult,
-          pubsub,
-          runId,
-          // Inngest's nested-workflow hook already emits the legacy result
-          // stream inside its own durable operation. Add only the canonical
-          // lifecycle transitions here.
-          emitLegacy: false,
+      if (!suppressLifecycleEvents) {
+        const emitOperationId = `workflow.${workflowId}.run.${runId}.step.${step.id}.emit_result`;
+        await engine.wrapDurableOperation(emitOperationId, async () => {
+          await emitStepResultEvents({
+            stepId: step.id,
+            stepCallId,
+            stepAttempt: lifecycleStepState.stepAttempt,
+            workflowId,
+            executionGeneration,
+            execResults: stepResult,
+            pubsub,
+            runId,
+            // Inngest's nested-workflow hook already emits the legacy result
+            // stream inside its own durable operation. Add only the canonical
+            // lifecycle transitions here.
+            emitLegacy: false,
+          });
         });
-      });
+      }
       return {
         result: stepResult,
         stepResults: { [step.id]: stepResult },

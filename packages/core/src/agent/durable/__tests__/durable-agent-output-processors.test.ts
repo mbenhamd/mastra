@@ -87,10 +87,14 @@ describe('DurableAgent output processors for tool chunks', () => {
   it('tool-result chunks are processed through output processors', async () => {
     const processedChunks: any[] = [];
     const toolChunkRunnerCalls = new Map<ProcessorRunner, number>();
+    const toolChunkRunnerWriters = new Map<ProcessorRunner, Set<unknown>>();
     const originalProcessPart = ProcessorRunner.prototype.processPart;
     const processPart = vi.spyOn(ProcessorRunner.prototype, 'processPart').mockImplementation(function (part, ...args) {
       if (part.type === 'tool-result' || part.type === 'tool-error') {
         toolChunkRunnerCalls.set(this, (toolChunkRunnerCalls.get(this) ?? 0) + 1);
+        const writers = toolChunkRunnerWriters.get(this) ?? new Set<unknown>();
+        writers.add(args[5]);
+        toolChunkRunnerWriters.set(this, writers);
       }
       return originalProcessPart.call(this, part, ...args);
     });
@@ -155,6 +159,7 @@ describe('DurableAgent output processors for tool chunks', () => {
       expect(toolResultChunks).toHaveLength(2);
       expect(toolResultChunks.every((chunk: any) => chunk.payload.result === '[REDACTED]')).toBe(true);
       expect([...toolChunkRunnerCalls.values()].sort()).toEqual([2, 2]);
+      expect([...toolChunkRunnerWriters.values()].map(writers => writers.size).sort()).toEqual([1, 1]);
     } finally {
       processPart.mockRestore();
     }

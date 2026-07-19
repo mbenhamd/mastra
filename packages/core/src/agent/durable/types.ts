@@ -11,13 +11,19 @@ import type { z } from 'zod';
 import type { ActorSignal } from '../../auth/ee/fga-check';
 import type { BackgroundTaskManager } from '../../background-tasks/manager';
 import type { AgentBackgroundConfig } from '../../background-tasks/types';
+import type { PubSub } from '../../events/pubsub';
 import type { SystemMessage } from '../../llm';
 import type { ProviderOptions } from '../../llm/model/provider-options';
 import type { MastraLanguageModel } from '../../llm/model/shared.types';
 import type { MastraMemory } from '../../memory/memory';
 import type { MemoryConfig } from '../../memory/types';
 import type { AIModelGenerationSpan, Span, SpanType, TracingContext, TracingOptions } from '../../observability';
-import type { InputProcessorOrWorkflow, OutputProcessorOrWorkflow, ErrorProcessorOrWorkflow } from '../../processors';
+import type {
+  InputProcessorOrWorkflow,
+  OutputProcessorOrWorkflow,
+  ErrorProcessorOrWorkflow,
+  ProcessorStreamWriter,
+} from '../../processors';
 import type { ProcessorRunner, ProcessorState } from '../../processors/runner';
 import type { RequestContext, VersionOverrides } from '../../request-context';
 import type { ChunkType } from '../../stream/types';
@@ -651,6 +657,12 @@ export interface RunRegistryEntry {
   processorStates?: Map<string, ProcessorState>;
   /** Lazily cached runner for durable tool-result and tool-error stream chunks. */
   outputProcessorRunner?: ProcessorRunner | null;
+  /** Stable writer cache for the runner's current run/pubsub pair. */
+  outputProcessorWriter?: {
+    pubsub: PubSub;
+    runId: string;
+    writer: ProcessorStreamWriter;
+  };
   /** Background task manager instance (non-serializable) */
   backgroundTaskManager?: BackgroundTaskManager;
   /** Agent background tasks configuration */
