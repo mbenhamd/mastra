@@ -1295,6 +1295,7 @@ run_validator_self_tests() {
     "$fixture_repo/stores/pg/src/storage/domains/workflows" \
     "$fixture_repo/workflows/inngest/src/__tests__/adapters" \
     "$fixture_repo/workflows/inngest/src" \
+    "$fixture_repo/workflows/temporal/src" \
     "$fixture_repo/node_modules" \
     "$mock_bin"
   # The production validator is copied to RUNNER_TEMP and resolves TypeScript
@@ -1452,6 +1453,11 @@ run_validator_self_tests() {
       > workflows/inngest/src/run-stream-terminal.test.ts
     printf '%s\n' "import { it } from 'vitest';" "it('serve terminal', () => {});" \
       > workflows/inngest/src/serve.test.ts
+    printf '%s\n' 'export const inngest = true;' > workflows/inngest/src/index.ts
+    printf '%s\n' '{}' > workflows/temporal/package.json
+    printf '%s\n' 'export const temporalWorkflow = true;' > workflows/temporal/src/workflow.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('temporal workflow contract', () => {});" \
+      > workflows/temporal/src/workflow.test.ts
     printf '%s\n' \
       'name: Fork validation fixture' \
       'jobs:' \
@@ -2649,6 +2655,77 @@ NODE
   assert_contains 'src/create-run-contract.test.ts' "$command_log"
   assert_contains 'src/lifecycle-execution.test.ts' "$command_log"
   assert_contains 'src/resume-async.test.ts' "$command_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'export const inngest = "processor-traits-head";' \
+      > workflows/inngest/src/index.ts
+    git add .
+    git commit -q -m 'exercise Inngest processor trait clone contract'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  : > "$docker_log"
+  output="$test_root/inngest-index-contract-success.log"
+  if ! run_fixture "$head_sha" "$output"; then
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'Forcing PF-2044 owned suites to run for source-only changes:' "$output"
+  assert_contains 'workflows/inngest/src/create-run-contract.test.ts' "$output"
+  assert_contains '--filter ./workflows/inngest --fail-if-no-match exec tsc --noEmit' "$command_log"
+  assert_contains 'src/create-run-contract.test.ts' "$command_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'export const temporalWorkflow = "transient-boundary-head";' \
+      > workflows/temporal/src/workflow.ts
+    git add .
+    git commit -q -m 'exercise Temporal transient boundary contract'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/temporal-workflow-contract-success.log"
+  if ! run_fixture "$head_sha" "$output"; then
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'Forcing PF-2044 owned suites to run for source-only changes:' "$output"
+  assert_contains 'workflows/temporal/src/workflow.test.ts' "$output"
+  assert_contains '--filter ./workflows/temporal --fail-if-no-match exec tsc --noEmit' "$command_log"
+  assert_contains '--filter ./workflows/temporal --fail-if-no-match build' "$command_log"
+  assert_contains '--filter ./workflows/temporal --fail-if-no-match lint' "$command_log"
+  assert_contains 'src/workflow.test.ts' "$command_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'export const unreviewedTemporalSource = true;' \
+      > workflows/temporal/src/unreviewed.ts
+    git add .
+    git commit -q -m 'add unreviewed Temporal source'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/temporal-unknown-source-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Unknown Temporal source fixture unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'workflows/temporal/src/unreviewed.ts' "$output"
+  assert_contains 'outside the PF-2044 owned source-and-test maps' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Unknown Temporal source fixture executed validation commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
 
   head_sha="$(
     cd "$fixture_repo"
@@ -3973,7 +4050,7 @@ while IFS= read -r workspace; do
     continue
   fi
   case "$workspace" in
-    auth/okta | browser/stagehand | packages/_internal-core | packages/cli | packages/codemod | packages/core | packages/deployer | packages/mcp | packages/memory | packages/server | client-sdks/ai-sdk | stores/_test-utils | stores/convex | stores/libsql | stores/pg | stores/redis | mastracode | mastracode/sdk | mastracode/tui | pubsub/google-cloud-pubsub | pubsub/redis-streams | workflows/inngest | docs) ;;
+    auth/okta | browser/stagehand | packages/_internal-core | packages/cli | packages/codemod | packages/core | packages/deployer | packages/mcp | packages/memory | packages/server | client-sdks/ai-sdk | stores/_test-utils | stores/convex | stores/libsql | stores/pg | stores/redis | mastracode | mastracode/sdk | mastracode/tui | pubsub/google-cloud-pubsub | pubsub/redis-streams | workflows/inngest | workflows/temporal | docs) ;;
     *) printf '%s\n' "$workspace" >> "$unsupported_workspaces" ;;
   esac
 done < "$changed_workspaces"
@@ -4448,7 +4525,7 @@ fi
 # source or test in a newly admitted workspace fails closed until its runtime
 # and service contract are reviewed explicitly.
 while IFS= read -r file; do
-  if [[ "$file" =~ ^(pubsub/(google-cloud-pubsub|redis-streams)|stores/(convex|libsql)|workflows/inngest)/ ]] &&
+  if [[ "$file" =~ ^(pubsub/(google-cloud-pubsub|redis-streams)|stores/(convex|libsql)|workflows/(inngest|temporal))/ ]] &&
     ! [[ "$file" =~ \.(cjs|cts|js|jsx|mjs|mts|ts|tsx)$ ]]; then
     if [[ "$file" == 'workflows/inngest/package.json' ]] &&
       { [[ "$inngest_pf2050_coordination" == true ]] ||
@@ -4468,7 +4545,7 @@ while IFS= read -r file; do
     continue
   fi
 
-  if ! [[ "$file" =~ ^(pubsub/(google-cloud-pubsub|redis-streams)|stores/(convex|libsql)|workflows/inngest)/.*\.(cjs|cts|js|jsx|mjs|mts|ts|tsx)$ ]]; then
+  if ! [[ "$file" =~ ^(pubsub/(google-cloud-pubsub|redis-streams)|stores/(convex|libsql)|workflows/(inngest|temporal))/.*\.(cjs|cts|js|jsx|mjs|mts|ts|tsx)$ ]]; then
     continue
   fi
 
@@ -4492,7 +4569,8 @@ while IFS= read -r file; do
         workflows/inngest/src/pubsub.test.ts | \
         workflows/inngest/src/resume-async.test.ts | \
         workflows/inngest/src/run-stream-terminal.test.ts | \
-        workflows/inngest/src/serve.test.ts) ;;
+        workflows/inngest/src/serve.test.ts | \
+        workflows/temporal/src/workflow.test.ts) ;;
       *) printf '%s\n' "$file" >> "$unsupported_owned_workspace_tests" ;;
     esac
     if ! git_regular_file_at_head "$file"; then
@@ -4540,6 +4618,9 @@ while IFS= read -r file; do
     workflows/inngest/src/pubsub.ts)
       queue_owned_workspace_test "$file" workflows/inngest/src/pubsub.test.ts
       ;;
+    workflows/inngest/src/index.ts)
+      queue_owned_workspace_test "$file" workflows/inngest/src/create-run-contract.test.ts
+      ;;
     workflows/inngest/src/execution-engine.ts | workflows/inngest/src/types.ts | workflows/inngest/src/workflow.ts)
       queue_owned_workspace_test "$file" workflows/inngest/src/lifecycle-execution.test.ts
       ;;
@@ -4565,6 +4646,9 @@ while IFS= read -r file; do
       if (( inngest_pf2042_changed_count != 3 )); then
         printf '%s\n' "$file" >> "$unsupported_owned_workspace_sources"
       fi
+      ;;
+    workflows/temporal/src/workflow.ts)
+      queue_owned_workspace_test "$file" workflows/temporal/src/workflow.test.ts
       ;;
     *) printf '%s\n' "$file" >> "$unsupported_owned_workspace_sources" ;;
   esac
@@ -5041,6 +5125,12 @@ elif [[ "$inngest_pf2042_trio_only" == true ]]; then
   run_with_validation_budget 600 pnpm exec eslint \
     workflows/inngest/src/index.test.ts \
     workflows/inngest/src/__tests__/adapters/_utils.ts
+fi
+
+if workspace_changed workflows/temporal; then
+  run_with_validation_budget 600 pnpm --filter ./workflows/temporal --fail-if-no-match exec tsc --noEmit
+  run_with_validation_budget 900 pnpm --filter ./workflows/temporal --fail-if-no-match build
+  run_with_validation_budget 600 pnpm --filter ./workflows/temporal --fail-if-no-match lint
 fi
 
 mastracode_prerequisites_built=false

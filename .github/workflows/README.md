@@ -210,6 +210,14 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   `src/__tests__/inngest-test-runtime.test.ts`; both the helper and its focused
   test are owned paths. Other unowned Inngest helpers and tests remain
   fail-closed.
+  PF-2236 additionally owns two process-local durable-boundary contracts.
+  Changes to `workflows/inngest/src/index.ts` force
+  `src/create-run-contract.test.ts`, which exercises clone metadata against a
+  mocked Inngest transport. Changes to `workflows/temporal/src/workflow.ts`
+  force `src/workflow.test.ts`, whose fake Temporal client proves option
+  admission without starting a Temporal service. Both paths run their native
+  workspace typecheck, build, and lint before the focused Vitest file. Other
+  Temporal sources, tests, manifests, and non-code inputs remain fail-closed.
   PostgreSQL and Redis cache production paths likewise force their newly owned
   thread-state/indexed-log regressions. Other unprovisioned Store-provider tests
   fail closed for the same reason.
