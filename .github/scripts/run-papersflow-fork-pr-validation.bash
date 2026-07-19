@@ -50,6 +50,19 @@ pf2009_config() {
     PF2009_LOCKFILE_SHA256 PF2009_DEPENDENCY_GRAPH_SHA256
 }
 
+pf2247_config() {
+  PF2247_HEAD_REPOSITORY="${PAPERSFLOW_PF2247_HEAD_REPOSITORY:-mbenhamd/mastra}"
+  PF2247_HEAD_REF="${PAPERSFLOW_PF2247_HEAD_REF:-feature/pf-2247-upstream-sync-a81d3c24}"
+  PF2247_BASE_REF="${PAPERSFLOW_PF2247_BASE_REF:-main}"
+  PF2247_MERGE_COMMIT="${PAPERSFLOW_PF2247_MERGE_COMMIT:-8dc172076b4fe7fbf984afe3bd0a7d76da21df12}"
+  PF2247_FORK_PARENT="${PAPERSFLOW_PF2247_FORK_PARENT:-b2222c28f151592e396ff02a40c41ac8d6f0ca40}"
+  PF2247_UPSTREAM_PARENT="${PAPERSFLOW_PF2247_UPSTREAM_PARENT:-a81d3c2499092b2c0578f5d8785ddc32e6f7bc39}"
+  PF2247_REVIEWED_TREE="${PAPERSFLOW_PF2247_REVIEWED_TREE:-3b5ab0370820fc076bb8bc0fb864463fbb5bd4ed}"
+  readonly \
+    PF2247_HEAD_REPOSITORY PF2247_HEAD_REF PF2247_BASE_REF PF2247_MERGE_COMMIT \
+    PF2247_FORK_PARENT PF2247_UPSTREAM_PARENT PF2247_REVIEWED_TREE
+}
+
 pf2042_config() {
   PF2042_INNGEST_TEST_BLOB="${PAPERSFLOW_PF2042_INNGEST_TEST_BLOB:-f6ce426a4f389d45c2c5f345cca5b511b4a85885}"
   PF2042_INNGEST_TEST_SHA256="${PAPERSFLOW_PF2042_INNGEST_TEST_SHA256:-f50ee827b50e669c16009ca492a87df81631e9ad8d65bd853d2fabacb5b56b34}"
@@ -284,6 +297,52 @@ EOF
   fi
 )
 
+verify_pf2247_reviewed_merge() (
+  : "${BASE_SHA:?BASE_SHA is required}"
+  : "${HEAD_SHA:?HEAD_SHA is required}"
+
+  local merge_topology actual_tree protected_merge_base
+
+  if [[ "$HEAD_SHA" != "$PF2247_MERGE_COMMIT" ]]; then
+    echo 'PF-2247 head is not the exact reviewed merge commit.' >&2
+    echo "expected: $PF2247_MERGE_COMMIT" >&2
+    echo "actual:   $HEAD_SHA" >&2
+    return 1
+  fi
+
+  merge_topology="$(git rev-list --parents -n 1 "$HEAD_SHA")"
+  if [[ "$merge_topology" != "$HEAD_SHA $PF2247_FORK_PARENT $PF2247_UPSTREAM_PARENT" ]]; then
+    echo 'PF-2247 head is not the exact reviewed two-parent upstream merge topology.' >&2
+    echo "expected: $HEAD_SHA $PF2247_FORK_PARENT $PF2247_UPSTREAM_PARENT" >&2
+    echo "actual:   $merge_topology" >&2
+    return 1
+  fi
+
+  actual_tree="$(git rev-parse "$HEAD_SHA^{tree}")"
+  if [[ "$actual_tree" != "$PF2247_REVIEWED_TREE" ]]; then
+    echo 'PF-2247 head tree does not match the reviewed merge tree.' >&2
+    echo "expected: $PF2247_REVIEWED_TREE" >&2
+    echo "actual:   $actual_tree" >&2
+    return 1
+  fi
+
+  if ! git merge-base --is-ancestor "$PF2247_FORK_PARENT" "$BASE_SHA"; then
+    echo 'PF-2247 protected base does not descend from the reviewed fork parent.' >&2
+    return 1
+  fi
+  protected_merge_base="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
+  if [[ "$protected_merge_base" != "$PF2247_FORK_PARENT" ]]; then
+    echo 'PF-2247 protected base and reviewed head no longer meet at the reviewed fork parent.' >&2
+    echo "expected: $PF2247_FORK_PARENT" >&2
+    echo "actual:   $protected_merge_base" >&2
+    return 1
+  fi
+  if ! git merge-base --is-ancestor "$PF2247_UPSTREAM_PARENT" "$HEAD_SHA"; then
+    echo 'PF-2247 head does not contain the reviewed official upstream parent.' >&2
+    return 1
+  fi
+)
+
 git_blob_sha256() {
   local revision="$1"
   local path="$2"
@@ -395,6 +454,19 @@ classify_install_lane() (
     .npmrc .pnpmfile.cjs pnpmfile.cjs package.json pnpm-workspace.yaml \
     patches packages/server/package.json |
     sort -u > "$manifest_changes"
+
+  # PF-2247 is frozen to one reviewed merge commit, tree, branch, repository,
+  # and parent pair. The policy PR advances protected main after that merge was
+  # constructed, so the checked PR base may descend from (but must meet the
+  # feature head exactly at) the reviewed fork parent.
+  pf2247_config
+  if [[ "${HEAD_REPOSITORY:-}" == "$PF2247_HEAD_REPOSITORY" && \
+    "${HEAD_REF:-}" == "$PF2247_HEAD_REF" && "${BASE_REF:-}" == "$PF2247_BASE_REF" ]]; then
+    verify_pf2247_reviewed_merge
+    echo 'PF-2247 exact two-parent upstream merge and reviewed tree accepted from trusted base policy.'
+    emit_validation_lane pf2247-upstream-sync
+    return
+  fi
 
   # PF-2045 is topology- and tree-bound. Its future merge commit hash cannot be
   # pinned before this policy lands, so admission reconstructs the merge from
@@ -1227,6 +1299,162 @@ run_pf2045_admission_self_tests() (
   echo 'PF-2045 upstream-sync topology and reconstructed-tree admission fixtures passed.'
 )
 
+run_pf2247_admission_self_tests() (
+  local script_path test_root fixture_repo common_sha fork_parent upstream_parent
+  local reviewed_head reviewed_tree protected_base forged_tree forged_head
+  local reversed_head extra_parent octopus_head non_merge_head output
+
+  script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+  test_root="$(mktemp -d)"
+  fixture_repo="$test_root/repo"
+  pf2247_fixture_cleanup() {
+    local status=$?
+    trap - EXIT
+    if (( status != 0 )); then
+      echo 'PF-2247 admission fixture failed; captured classifier output follows:' >&2
+      find "$test_root" -maxdepth 1 -type f -name '*.log' -print -exec sed -n '1,240p' {} \; >&2 || true
+    fi
+    rm -rf -- "$test_root"
+    exit "$status"
+  }
+  trap pf2247_fixture_cleanup EXIT
+  mkdir -p "$fixture_repo"
+
+  git -C "$fixture_repo" init -q -b main
+  git -C "$fixture_repo" config user.email validator@example.invalid
+  git -C "$fixture_repo" config user.name 'PF-2247 admission fixture'
+  printf '{"name":"fixture","version":"1.0.0"}\n' > "$fixture_repo/package.json"
+  git -C "$fixture_repo" add package.json
+  git -C "$fixture_repo" commit -q -m common
+  common_sha="$(git -C "$fixture_repo" rev-parse HEAD)"
+
+  git -C "$fixture_repo" switch -q -c upstream
+  printf '{"name":"fixture","version":"2.0.0"}\n' > "$fixture_repo/package.json"
+  printf 'official upstream\n' > "$fixture_repo/upstream.txt"
+  git -C "$fixture_repo" add package.json upstream.txt
+  git -C "$fixture_repo" commit -q -m upstream
+  upstream_parent="$(git -C "$fixture_repo" rev-parse HEAD)"
+
+  git -C "$fixture_repo" switch -q main
+  printf 'fork work\n' > "$fixture_repo/fork.txt"
+  git -C "$fixture_repo" add fork.txt
+  git -C "$fixture_repo" commit -q -m fork
+  fork_parent="$(git -C "$fixture_repo" rev-parse HEAD)"
+  git -C "$fixture_repo" merge -q --no-ff upstream -m 'reviewed upstream merge'
+  reviewed_head="$(git -C "$fixture_repo" rev-parse HEAD)"
+  reviewed_tree="$(git -C "$fixture_repo" rev-parse "$reviewed_head^{tree}")"
+
+  git -C "$fixture_repo" switch -q -c protected-base "$fork_parent"
+  mkdir -p "$fixture_repo/.github"
+  printf 'trusted policy advance\n' > "$fixture_repo/.github/policy.txt"
+  git -C "$fixture_repo" add .github/policy.txt
+  git -C "$fixture_repo" commit -q -m 'advance protected policy'
+  protected_base="$(git -C "$fixture_repo" rev-parse HEAD)"
+
+  git -C "$fixture_repo" switch -q --detach "$reviewed_head"
+  printf 'not reviewed\n' > "$fixture_repo/forged.txt"
+  git -C "$fixture_repo" add forged.txt
+  forged_tree="$(git -C "$fixture_repo" write-tree)"
+  git -C "$fixture_repo" reset -q --hard "$reviewed_head"
+  forged_head="$(printf 'forged tree\n' | git -C "$fixture_repo" commit-tree \
+    "$forged_tree" -p "$fork_parent" -p "$upstream_parent")"
+  reversed_head="$(printf 'reversed parents\n' | git -C "$fixture_repo" commit-tree \
+    "$reviewed_tree" -p "$upstream_parent" -p "$fork_parent")"
+  extra_parent="$(printf 'extra parent\n' | git -C "$fixture_repo" commit-tree \
+    "$common_sha^{tree}" -p "$common_sha")"
+  octopus_head="$(printf 'octopus merge\n' | git -C "$fixture_repo" commit-tree \
+    "$reviewed_tree" -p "$fork_parent" -p "$upstream_parent" -p "$extra_parent")"
+  non_merge_head="$(printf 'not a merge\n' | git -C "$fixture_repo" commit-tree \
+    "$reviewed_tree" -p "$fork_parent")"
+
+  run_fixture_admission() {
+    local fixture_head="$1"
+    local fixture_output="$2"
+    shift 2
+    (
+      cd "$fixture_repo"
+      env \
+        GITHUB_OUTPUT= \
+        BASE_SHA="$protected_base" HEAD_SHA="$fixture_head" PR_NUMBER=999 \
+        HEAD_REPOSITORY=mbenhamd/mastra \
+        HEAD_REF=feature/pf-2247-upstream-sync-a81d3c24 \
+        BASE_REF=main \
+        PAPERSFLOW_PF2247_MERGE_COMMIT="$reviewed_head" \
+        PAPERSFLOW_PF2247_FORK_PARENT="$fork_parent" \
+        PAPERSFLOW_PF2247_UPSTREAM_PARENT="$upstream_parent" \
+        PAPERSFLOW_PF2247_REVIEWED_TREE="$reviewed_tree" \
+        "$@" bash "$script_path" --classify-install
+    ) > "$fixture_output" 2>&1
+  }
+
+  output="$test_root/approved.log"
+  run_fixture_admission "$reviewed_head" "$output"
+  grep -Fxq 'lane=pf2247-upstream-sync' "$output"
+
+  output="$test_root/forged-tree.log"
+  if run_fixture_admission "$forged_head" "$output" \
+    PAPERSFLOW_PF2247_MERGE_COMMIT="$forged_head"; then
+    echo 'PF-2247 forged tree with the reviewed parents unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'head tree does not match the reviewed merge tree' "$output"
+
+  output="$test_root/reversed-parents.log"
+  if run_fixture_admission "$reversed_head" "$output" \
+    PAPERSFLOW_PF2247_MERGE_COMMIT="$reversed_head"; then
+    echo 'PF-2247 reversed parent order unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'not the exact reviewed two-parent upstream merge topology' "$output"
+
+  output="$test_root/octopus.log"
+  if run_fixture_admission "$octopus_head" "$output" \
+    PAPERSFLOW_PF2247_MERGE_COMMIT="$octopus_head"; then
+    echo 'PF-2247 octopus merge unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'not the exact reviewed two-parent upstream merge topology' "$output"
+
+  output="$test_root/non-merge.log"
+  if run_fixture_admission "$non_merge_head" "$output" \
+    PAPERSFLOW_PF2247_MERGE_COMMIT="$non_merge_head"; then
+    echo 'PF-2247 non-merge head unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'not the exact reviewed two-parent upstream merge topology' "$output"
+
+  output="$test_root/wrong-head.log"
+  if run_fixture_admission "$reviewed_head" "$output" \
+    PAPERSFLOW_PF2247_MERGE_COMMIT="$fork_parent"; then
+    echo 'PF-2247 head that differs from the reviewed commit unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'head is not the exact reviewed merge commit' "$output"
+
+  output="$test_root/untrusted-base.log"
+  if run_fixture_admission "$reviewed_head" "$output" BASE_SHA="$common_sha"; then
+    echo 'PF-2247 base outside the reviewed fork lineage unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'protected base does not descend from the reviewed fork parent' "$output"
+
+  output="$test_root/base-contained-in-head.log"
+  if run_fixture_admission "$reviewed_head" "$output" BASE_SHA="$reviewed_head"; then
+    echo 'PF-2247 base/head intersection beyond the reviewed fork parent unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'no longer meet at the reviewed fork parent' "$output"
+
+  output="$test_root/wrong-metadata.log"
+  if run_fixture_admission "$reviewed_head" "$output" HEAD_REF=feature/not-pf-2247; then
+    echo 'Wrong PF-2247 branch metadata unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'do not match a reviewed upstream-sync lane' "$output"
+
+  echo 'PF-2247 exact-commit, topology, tree, ancestry, and metadata admission fixtures passed.'
+)
+
 case "${1:-}" in
   --classify-install)
     classify_install_lane
@@ -1242,6 +1470,10 @@ case "${1:-}" in
     ;;
   --self-test-pf2045-upstream-sync)
     run_pf2045_admission_self_tests
+    exit
+    ;;
+  --self-test-pf2247-upstream-sync)
+    run_pf2247_admission_self_tests
     exit
     ;;
   --validate-pf2042-reviewed-topology)
@@ -3612,6 +3844,31 @@ run_pf2009_upstream_sync_validation() {
   run_upstream_sync_validation pf2009-upstream-sync PF-2009
 }
 
+run_pf2247_upstream_sync_validation() {
+  run_upstream_sync_validation pf2247-upstream-sync PF-2247
+
+  echo 'Validating the complete PF-2247 reconciled workspace and corrected merge boundaries.'
+  run_with_validation_budget 1200 pnpm run build
+  run_with_validation_budget 900 pnpm run lint
+  run_with_validation_budget 600 \
+    pnpm --dir packages/core exec vitest run --reporter=dot \
+      src/agent/durable/__tests__/agent-config-durable.test.ts \
+      src/agent/durable/__tests__/durable-agent-memory.test.ts \
+      src/mastra/recover-all-durable-agents.test.ts \
+      src/workflows/default.test.ts
+  run_with_validation_budget 600 \
+    pnpm --dir workflows/inngest exec vitest run --no-isolate --reporter=dot \
+      src/create-run-contract.test.ts \
+      src/__tests__/create-inngest-agent.test.ts \
+      src/__tests__/proxyref-verification.test.ts
+  run_with_validation_budget 600 \
+    pnpm --dir packages/server exec vitest run --reporter=dot \
+      src/server/handlers/agents.test.ts -t RECOVER_ROUTE
+  run_with_validation_budget 600 pnpm --dir deployers/sandbox test
+
+  echo 'PF-2247 complete workspace and merge-boundary validation passed.'
+}
+
 run_pf2045_memory_transform_smoke() (
   : "${BASE_SHA:?BASE_SHA is required}"
 
@@ -3956,6 +4213,10 @@ case "${1:-}" in
     ;;
   --validate-pf2045-upstream-sync)
     run_pf2045_upstream_sync_validation
+    exit
+    ;;
+  --validate-pf2247-upstream-sync)
+    run_pf2247_upstream_sync_validation
     exit
     ;;
   --validate-pf2045-resolution-contracts)

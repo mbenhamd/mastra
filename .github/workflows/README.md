@@ -270,6 +270,7 @@ or command plan:
 .github/scripts/run-papersflow-fork-pr-validation.bash --self-test-pf558-upstream-sync
 .github/scripts/run-papersflow-fork-pr-validation.bash --self-test-pf2009-upstream-sync
 .github/scripts/run-papersflow-fork-pr-validation.bash --self-test-pf2045-upstream-sync
+.github/scripts/run-papersflow-fork-pr-validation.bash --self-test-pf2247-upstream-sync
 ```
 
 The fixtures use an isolated temporary Git repository and mocked package
@@ -294,7 +295,11 @@ non-conflict overlays. They also prove that a benign non-conflicting
 protected-base advance reconstructs and passes, and exercise wrong-upstream,
 wrong-first-parent, forged-resolution, forged-overlay,
 forged-same-parent-tree, protected-base conflict-input drift, extra-parent,
-non-merge, and wrong-metadata failures.
+non-merge, and wrong-metadata failures. PF-2247 fixtures separately bind its
+trusted lane to the exact reviewed merge commit, ordered parent pair, tree,
+repository metadata, and protected-base intersection. They reject forged trees,
+reversed and extra parents, non-merge heads, unreviewed base lineages, and
+wrong branch metadata.
 
 Do not register a self-hosted runner for public PR code. Keep canonical
 release, secret, cloud, and scheduled workflows gated to `mastra-ai/mastra`
