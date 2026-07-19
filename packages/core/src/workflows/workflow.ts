@@ -583,19 +583,22 @@ function createStepFromAgent<TStepId extends string, TStepOutput>(
       }
 
       let tripwireChunk: any = null;
+      const suppressLegacyWatchEvents = workflowLifecycleEventsAreSuppressed(pubsub);
 
       if (streamFormat === 'legacy') {
-        await pubsub.publish(`workflow.events.v2.${runId}`, {
-          type: 'watch',
-          runId,
-          data: { type: 'tool-call-streaming-start', ...(toolData ?? {}) },
-        });
+        if (!suppressLegacyWatchEvents) {
+          await pubsub.publish(`workflow.events.v2.${runId}`, {
+            type: 'watch',
+            runId,
+            data: { type: 'tool-call-streaming-start', ...(toolData ?? {}) },
+          });
+        }
         for await (const chunk of stream) {
           if (chunk.type === 'tripwire') {
             tripwireChunk = chunk;
             break;
           }
-          if (chunk.type === 'text-delta') {
+          if (!suppressLegacyWatchEvents && chunk.type === 'text-delta') {
             await pubsub.publish(`workflow.events.v2.${runId}`, {
               type: 'watch',
               runId,
@@ -603,11 +606,13 @@ function createStepFromAgent<TStepId extends string, TStepOutput>(
             });
           }
         }
-        await pubsub.publish(`workflow.events.v2.${runId}`, {
-          type: 'watch',
-          runId,
-          data: { type: 'tool-call-streaming-finish', ...(toolData ?? {}) },
-        });
+        if (!suppressLegacyWatchEvents) {
+          await pubsub.publish(`workflow.events.v2.${runId}`, {
+            type: 'watch',
+            runId,
+            data: { type: 'tool-call-streaming-finish', ...(toolData ?? {}) },
+          });
+        }
       } else {
         for await (const chunk of stream) {
           await forwardAgentStreamChunk({ writer, chunk });

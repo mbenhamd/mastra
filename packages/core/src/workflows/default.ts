@@ -1071,7 +1071,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
           });
         }
 
-        if (lastOutput.result.status === 'paused') {
+        if (!suppressLifecycleEvents && lastOutput.result.status === 'paused') {
           await params.pubsub.publish(`workflow.events.v2.${runId}`, {
             type: 'watch',
             runId,
@@ -1166,11 +1166,13 @@ export class DefaultExecutionEngine extends ExecutionEngine {
           });
         }
 
-        await params.pubsub.publish(`workflow.events.v2.${runId}`, {
-          type: 'watch',
-          runId,
-          data: { type: 'workflow-paused', payload: {} },
-        });
+        if (!suppressLifecycleEvents) {
+          await params.pubsub.publish(`workflow.events.v2.${runId}`, {
+            type: 'watch',
+            runId,
+            data: { type: 'workflow-paused', payload: {} },
+          });
+        }
 
         workflowSpan?.end({
           attributes: {

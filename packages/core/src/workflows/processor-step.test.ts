@@ -29,6 +29,7 @@ function createMockMessageList(messages: MastraDBMessage[] = []): MessageList {
     getAllSystemMessages: vi.fn(() => []),
     getSystemMessages: vi.fn(() => []),
     replaceAllSystemMessages: vi.fn(),
+    replaceMessagesForProcessor: vi.fn(),
   } as unknown as MessageList;
   return mockMessageList;
 }

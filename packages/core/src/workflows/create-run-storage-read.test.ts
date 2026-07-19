@@ -447,6 +447,38 @@ describe('explicitly transient workflow lifecycle reads', () => {
     }
   });
 
+  it('keeps transient foreach processor runs off legacy lifecycle emit paths', async () => {
+    const worker = createStep({
+      id: 'transient-foreach-worker',
+      inputSchema: z.string(),
+      outputSchema: z.string(),
+      execute: async ({ inputData }) => inputData.toUpperCase(),
+    });
+    const workflow = createWorkflow({
+      id: 'transient-foreach-processor',
+      inputSchema: z.array(z.string()),
+      outputSchema: z.array(z.string()),
+      steps: [worker],
+      options: { executionMode: 'transient' },
+    })
+      .foreach(worker, { concurrency: 2 })
+      .commit();
+    new Mastra({ logger: false, workflows: { [workflow.id]: workflow } });
+    const durableOperation = vi.spyOn((workflow as any).executionEngine, 'wrapDurableOperation');
+
+    const run = await workflow.createRun({ [PROCESSOR_EXECUTION_SYMBOL]: true });
+    await expect(run.start({ inputData: ['first', 'second', 'third'] })).resolves.toMatchObject({
+      status: 'success',
+      result: ['FIRST', 'SECOND', 'THIRD'],
+    });
+
+    expect(
+      durableOperation.mock.calls.filter(([operationId]) =>
+        ['.running_ev', '.emit_result'].some(suffix => String(operationId).endsWith(suffix)),
+      ),
+    ).toEqual([]);
+  });
+
   it('honors a transient child nested under a durable parent', async () => {
     const childStep = createStep({
       id: 'nested-own-transient-step',

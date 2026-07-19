@@ -11,12 +11,13 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { z } from 'zod';
 import { EventEmitterPubSub } from '../../../events/event-emitter';
 import { Mastra } from '../../../mastra';
+import { ProcessorRunner } from '../../../processors/runner';
 import { InMemoryStore } from '../../../storage';
 import { createTool } from '../../../tools';
 import { Agent } from '../../agent';
 import { createDurableAgent } from '../create-durable-agent';
 
-function createToolCallingModel(toolName: string, toolArgs: Record<string, unknown>) {
+function createToolCallingModel(toolName: string, toolArgs: Record<string, unknown>, toolCallCount = 1) {
   let callCount = 0;
   return new MockLanguageModelV2({
     doStream: async () => {
@@ -27,14 +28,14 @@ function createToolCallingModel(toolName: string, toolArgs: Record<string, unkno
           stream: convertArrayToReadableStream([
             { type: 'stream-start', warnings: [] },
             { type: 'response-metadata', id: 'resp-1', modelId: 'mock', timestamp: new Date(0) },
-            {
-              type: 'tool-call',
-              id: 'tc-1',
-              toolCallType: 'function',
-              toolCallId: 'tc-1',
+            ...Array.from({ length: toolCallCount }, (_, index) => ({
+              type: 'tool-call' as const,
+              id: `tc-${index + 1}`,
+              toolCallType: 'function' as const,
+              toolCallId: `tc-${index + 1}`,
               toolName,
               args: JSON.stringify(toolArgs),
-            },
+            })),
             {
               type: 'finish',
               finishReason: 'tool-calls',
@@ -85,6 +86,14 @@ describe('DurableAgent output processors for tool chunks', () => {
 
   it('tool-result chunks are processed through output processors', async () => {
     const processedChunks: any[] = [];
+    const toolChunkRunnerCalls = new Map<ProcessorRunner, number>();
+    const originalProcessPart = ProcessorRunner.prototype.processPart;
+    const processPart = vi.spyOn(ProcessorRunner.prototype, 'processPart').mockImplementation(function (part, ...args) {
+      if (part.type === 'tool-result' || part.type === 'tool-error') {
+        toolChunkRunnerCalls.set(this, (toolChunkRunnerCalls.get(this) ?? 0) + 1);
+      }
+      return originalProcessPart.call(this, part, ...args);
+    });
 
     const outputProcessor = {
       id: 'test-redactor',
@@ -117,7 +126,7 @@ describe('DurableAgent output processors for tool chunks', () => {
       id: 'processor-agent',
       name: 'Processor Agent',
       instructions: 'You are a helpful agent.',
-      model: createToolCallingModel('getWeather', { city: 'NYC' }) as LanguageModelV2,
+      model: createToolCallingModel('getWeather', { city: 'NYC' }, 2) as LanguageModelV2,
       tools: { getWeather: weatherTool },
       outputProcessors: [outputProcessor as any],
     });
@@ -130,20 +139,25 @@ describe('DurableAgent output processors for tool chunks', () => {
       pubsub,
     });
 
-    const result = await durableAgent.stream('What is the weather in NYC?', {
-      maxSteps: 3,
-    });
+    try {
+      const result = await durableAgent.stream('What is the weather in NYC?', {
+        maxSteps: 3,
+      });
 
-    const chunks = await drain(result.fullStream);
+      const chunks = await drain(result.fullStream);
 
-    // Output processor should have seen the tool-result chunk
-    expect(processedChunks.length).toBeGreaterThan(0);
-    expect(processedChunks[0].type).toBe('tool-result');
+      // Both the mapping and durable emission runners should see each tool-result chunk.
+      expect(processedChunks).toHaveLength(4);
+      expect(processedChunks.every(chunk => chunk.type === 'tool-result')).toBe(true);
 
-    // The emitted tool-result chunk should have the redacted result
-    const toolResultChunks = chunks.filter((c: any) => c.type === 'tool-result');
-    expect(toolResultChunks.length).toBeGreaterThan(0);
-    expect(toolResultChunks[0].payload.result).toBe('[REDACTED]');
+      // The emitted tool-result chunks should have the redacted result.
+      const toolResultChunks = chunks.filter((c: any) => c.type === 'tool-result');
+      expect(toolResultChunks).toHaveLength(2);
+      expect(toolResultChunks.every((chunk: any) => chunk.payload.result === '[REDACTED]')).toBe(true);
+      expect([...toolChunkRunnerCalls.values()].sort()).toEqual([2, 2]);
+    } finally {
+      processPart.mockRestore();
+    }
   });
 
   it('output processor can block tool-result chunks with tripwire', async () => {

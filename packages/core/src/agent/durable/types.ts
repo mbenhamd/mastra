@@ -18,7 +18,7 @@ import type { MastraMemory } from '../../memory/memory';
 import type { MemoryConfig } from '../../memory/types';
 import type { AIModelGenerationSpan, Span, SpanType, TracingContext, TracingOptions } from '../../observability';
 import type { InputProcessorOrWorkflow, OutputProcessorOrWorkflow, ErrorProcessorOrWorkflow } from '../../processors';
-import type { ProcessorState } from '../../processors/runner';
+import type { ProcessorRunner, ProcessorState } from '../../processors/runner';
 import type { RequestContext, VersionOverrides } from '../../request-context';
 import type { ChunkType } from '../../stream/types';
 import type {
@@ -649,6 +649,8 @@ export interface RunRegistryEntry {
   errorProcessors?: ErrorProcessorOrWorkflow[];
   /** Processor state map (carried across steps) */
   processorStates?: Map<string, ProcessorState>;
+  /** Lazily cached runner for durable tool-result and tool-error stream chunks. */
+  outputProcessorRunner?: ProcessorRunner | null;
   /** Background task manager instance (non-serializable) */
   backgroundTaskManager?: BackgroundTaskManager;
   /** Agent background tasks configuration */

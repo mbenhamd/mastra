@@ -149,18 +149,24 @@ async function processChunkThroughOutputProcessors(
   logger: any,
   messageList?: MessageList,
 ): Promise<ChunkType | null> {
-  if (!outputProcessorsSupportStream(registryEntry?.outputProcessors) || !registryEntry?.processorStates) {
+  if (!registryEntry?.processorStates) {
     return chunk;
   }
 
   try {
-    const runner = new ProcessorRunner({
-      inputProcessors: [],
-      outputProcessors: registryEntry.outputProcessors,
-      logger,
-      agentName,
-      processorStates: registryEntry.processorStates,
-    });
+    if (registryEntry.outputProcessorRunner === undefined) {
+      registryEntry.outputProcessorRunner = outputProcessorsSupportStream(registryEntry.outputProcessors)
+        ? new ProcessorRunner({
+            inputProcessors: [],
+            outputProcessors: registryEntry.outputProcessors,
+            logger,
+            agentName,
+            processorStates: registryEntry.processorStates,
+          })
+        : null;
+    }
+    const runner = registryEntry.outputProcessorRunner;
+    if (!runner) return chunk;
 
     const {
       part: processed,
