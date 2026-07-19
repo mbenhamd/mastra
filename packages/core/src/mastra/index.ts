@@ -46,8 +46,8 @@ import type {
 } from '../observability';
 import { NoOpObservability, noOpLoggerContext, noOpMetricsContext } from '../observability';
 import { initContextStorage } from '../observability/context-storage';
-import { isProcessorWorkflow } from '../processors';
 import type { Processor } from '../processors';
+import { isProcessorWorkflow } from '../processors/is-processor-workflow';
 import { Schedules } from '../schedules/schedules';
 import type { SchedulesConfig, ScheduleHooks } from '../schedules/types';
 import type { MastraServerBase } from '../server/base';

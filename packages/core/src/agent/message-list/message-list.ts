@@ -338,8 +338,9 @@ export class MessageList {
     idsToRemove: readonly string[],
   ): this {
     if (idsToRemove.length > 0) {
-      this.removeByIds([...idsToRemove]);
+      this.removeByIds(idsToRemove);
     }
+    const retainedMessageCount = this.messages.length;
 
     const lastIndexById = new Map<string, number>();
     for (const [index, { message }] of replacements.entries()) {
@@ -368,7 +369,7 @@ export class MessageList {
       this.addOne(message, source, { merge: false }, { assumeNew: true, deferFinalization: true });
     }
 
-    this.finalizeMessageOrder();
+    this.mergeAppendedMessagesInOrder(retainedMessageCount);
     return this;
   }
 
@@ -554,7 +555,7 @@ export class MessageList {
    * @param ids - Array of message IDs to remove
    * @returns Array of removed messages
    */
-  public removeByIds(ids: string[]): MastraDBMessage[] {
+  public removeByIds(ids: readonly string[]): MastraDBMessage[] {
     const idsSet = new Set(ids);
     const removed: MastraDBMessage[] = [];
     this.messages = this.messages.filter(m => {
@@ -568,7 +569,7 @@ export class MessageList {
     if (this.isRecording && removed.length > 0) {
       this.recordedEvents.push({
         type: 'removeByIds',
-        ids,
+        ids: [...ids],
         count: removed.length,
       });
     }
@@ -1755,6 +1756,60 @@ export class MessageList {
 
     // make sure messages are always stored in order of when they were created!
     this.messages.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+  }
+
+  /**
+   * Merge processor replacements into the already ordered retained transcript.
+   * Normal processor histories are chronological, so the common path stays
+   * linear and avoids sorting the entire transcript. Malformed out-of-order
+   * replacement histories retain the historical sorting behavior as a fallback.
+   */
+  private mergeAppendedMessagesInOrder(appendedStartIndex: number): void {
+    if (appendedStartIndex >= this.messages.length) return;
+
+    let appendedInOrder = true;
+    for (let index = appendedStartIndex + 1; index < this.messages.length; index += 1) {
+      if (this.messages[index]!.createdAt.getTime() < this.messages[index - 1]!.createdAt.getTime()) {
+        appendedInOrder = false;
+        break;
+      }
+    }
+
+    if (appendedStartIndex === 0) {
+      if (!appendedInOrder) {
+        this.messages.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+      }
+      return;
+    }
+
+    const lastRetainedTimestamp = this.messages[appendedStartIndex - 1]!.createdAt.getTime();
+    const firstAppendedTimestamp = this.messages[appendedStartIndex]!.createdAt.getTime();
+    if (appendedInOrder && lastRetainedTimestamp <= firstAppendedTimestamp) return;
+
+    const retained = this.messages.slice(0, appendedStartIndex);
+    const appended = this.messages.slice(appendedStartIndex);
+    if (!appendedInOrder) {
+      appended.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+    }
+
+    const merged = new Array<MastraDBMessage>(retained.length + appended.length);
+    let mergedIndex = 0;
+    let retainedIndex = 0;
+    let appendedIndex = 0;
+    while (retainedIndex < retained.length && appendedIndex < appended.length) {
+      if (retained[retainedIndex]!.createdAt.getTime() <= appended[appendedIndex]!.createdAt.getTime()) {
+        merged[mergedIndex++] = retained[retainedIndex++]!;
+      } else {
+        merged[mergedIndex++] = appended[appendedIndex++]!;
+      }
+    }
+    while (retainedIndex < retained.length) {
+      merged[mergedIndex++] = retained[retainedIndex++]!;
+    }
+    while (appendedIndex < appended.length) {
+      merged[mergedIndex++] = appended[appendedIndex++]!;
+    }
+    this.messages = merged;
   }
 
   private pushMessageToSource(messageV2: MastraDBMessage, messageSource: MessageSource) {

@@ -351,6 +351,50 @@ describe('explicitly transient workflow lifecycle reads', () => {
     expect(remove).not.toHaveBeenCalled();
   });
 
+  it('keeps process-local lifecycle suppression through nested processor workflows', async () => {
+    const childStep = createStep({
+      id: 'nested-suppressed-child-step',
+      inputSchema: ioSchema,
+      outputSchema: ioSchema,
+      execute: async ({ inputData }) => inputData,
+    });
+    const child = createWorkflow({
+      id: 'nested-suppressed-child',
+      inputSchema: ioSchema,
+      outputSchema: ioSchema,
+      steps: [childStep],
+    })
+      .then(childStep)
+      .commit();
+    const parent = createWorkflow({
+      id: 'nested-suppressed-parent',
+      inputSchema: ioSchema,
+      outputSchema: ioSchema,
+      steps: [child],
+      type: 'processor',
+    })
+      .then(child)
+      .commit();
+    new Mastra({ logger: false, workflows: { [parent.id]: parent } });
+    const eventEmitterPublish = vi.spyOn(EventEmitterPubSub.prototype, 'publish');
+    const parentDurableOperation = vi.spyOn((parent as any).executionEngine, 'wrapDurableOperation');
+    const childDurableOperation = vi.spyOn((child as any).executionEngine, 'wrapDurableOperation');
+
+    try {
+      const run = await parent.createRun({ [PROCESSOR_EXECUTION_SYMBOL]: true });
+      await expect(run.start({ inputData: { value: 'nested' } })).resolves.toMatchObject({ status: 'success' });
+
+      expect(eventEmitterPublish).not.toHaveBeenCalled();
+      expect(
+        [...parentDurableOperation.mock.calls, ...childDurableOperation.mock.calls].filter(([operationId]) =>
+          String(operationId).endsWith('.emit_result'),
+        ),
+      ).toEqual([]);
+    } finally {
+      eventEmitterPublish.mockRestore();
+    }
+  });
+
   it('honors a transient child nested under a durable parent', async () => {
     const childStep = createStep({
       id: 'nested-own-transient-step',

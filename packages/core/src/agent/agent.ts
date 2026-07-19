@@ -1707,7 +1707,7 @@ export class Agent<
       if (!workflow.type) {
         workflow.type = 'processor';
       }
-      if (this.#mastra) {
+      if (this.#mastra && workflow.mastra !== this.#mastra) {
         workflow.__registerMastra(this.#mastra);
       }
       return [workflow];
@@ -1742,7 +1742,7 @@ export class Agent<
           if (!processor.type) {
             processor.type = 'processor';
           }
-          if (this.#mastra) {
+          if (this.#mastra && processor.mastra !== this.#mastra) {
             processor.__registerMastra(this.#mastra);
           }
         } else {
@@ -1766,7 +1766,7 @@ export class Agent<
       if (!workflow.type) {
         workflow.type = 'processor';
       }
-      if (this.#mastra) {
+      if (this.#mastra && workflow.mastra !== this.#mastra) {
         workflow.__registerMastra(this.#mastra);
       }
       return [workflow];

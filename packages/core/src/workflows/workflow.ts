@@ -67,6 +67,7 @@ import {
   publishWorkflowLifecycleEvent,
   requireWorkflowExecutionGeneration,
   SUPPRESS_WORKFLOW_LIFECYCLE_EVENTS,
+  workflowLifecycleEventsAreSuppressed,
 } from './lifecycle-events';
 import type {
   WorkflowExecutionGeneration,
@@ -2731,10 +2732,12 @@ export class Workflow<
     // Forward the parent run's resourceId into the nested run so that
     // child workflow snapshots preserve the tenant/resource association.
     // When sharePubsub is enabled (e.g. durable agent workflows), pass the parent
-    // pubsub so inner step events are visible to the outer subscriber.
-    // Skip the watch relay in that case — events are already on the shared pubsub
-    // and relaying with the same runId would cause an infinite event loop.
-    const useSharedPubsub = !!this.#options?.sharePubsub;
+    // pubsub so inner step events are visible to the outer subscriber. A
+    // suppressing process-local channel is also reused so nesting cannot
+    // resurrect lifecycle construction and relay work that the parent drops.
+    // Skip the watch relay in either case — events are already shared or
+    // intentionally suppressed.
+    const useSharedPubsub = !!this.#options?.sharePubsub || workflowLifecycleEventsAreSuppressed(pubsub);
     // Top-level runs inherit the Mastra PubSub so their lifecycle is durable,
     // but a non-sharing nested workflow must retain its own process-local event
     // bus. Passing `undefined` here would make createRun() inherit Mastra's

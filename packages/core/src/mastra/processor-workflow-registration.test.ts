@@ -276,6 +276,11 @@ describe('Processor Workflow Registration', () => {
       const workflow = mastra.getWorkflow('custom-input-workflow');
       expect(workflow).toBeDefined();
       expect(workflow.id).toBe('custom-input-workflow');
+
+      const registerMastra = vi.spyOn(processorWorkflow, '__registerMastra');
+      await agent.getConfiguredProcessorWorkflows();
+      await agent.getConfiguredProcessorWorkflows();
+      expect(registerMastra).not.toHaveBeenCalled();
     });
   });
 

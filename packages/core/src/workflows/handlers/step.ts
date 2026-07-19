@@ -651,7 +651,7 @@ export async function executeStep(
     execResults = { ...execResults, status: 'canceled', endedAt: Date.now() };
   }
 
-  if (!authoritativeDisposition) {
+  if (!authoritativeDisposition && !suppressLifecycleEvents) {
     const emitOperationId = `workflow.${workflowId}.run.${runId}.step.${step.id}.emit_result`;
     const lifecycleResultEmission = engine.wrapDurableOperation(emitOperationId, async () => {
       await emitStepResultEvents({
@@ -663,7 +663,7 @@ export async function executeStep(
         execResults: { ...stepInfo, ...execResults } as StepResult<any, any, any, any>,
         pubsub,
         runId,
-        emitLegacy: !skipEmits && !suppressLifecycleEvents,
+        emitLegacy: !skipEmits,
       });
     });
     if (deferLifecycleResult) {

@@ -2238,6 +2238,40 @@ describe('ProcessorRunner', () => {
       messageList.add(originals, 'response', { merge: false });
       const replaceMessages = vi.spyOn(messageList, 'replaceMessagesForProcessor');
       const add = vi.spyOn(messageList, 'add');
+      const sort = vi.spyOn(Array.prototype, 'sort');
+
+      try {
+        await runner.runProcessOutputStep({
+          steps: [],
+          messages: messageList.get.all.db(),
+          messageList,
+          stepNumber: 0,
+        });
+
+        expect(replaceMessages).toHaveBeenCalledTimes(1);
+        expect(add).not.toHaveBeenCalled();
+        expect(sort).not.toHaveBeenCalled();
+        expect(messageList.get.response.db()).toEqual(replacements);
+      } finally {
+        sort.mockRestore();
+      }
+    });
+
+    it('retains chronological ordering for malformed out-of-order processor histories', async () => {
+      const early = { ...createMessage('early', 'assistant'), createdAt: new Date(1) };
+      const late = { ...createMessage('late', 'assistant'), createdAt: new Date(2) };
+      runner = new ProcessorRunner({
+        inputProcessors: [],
+        outputProcessors: [
+          {
+            id: 'out-of-order-output-step-processor',
+            processOutputStep: async () => [late, early],
+          },
+        ],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+      messageList.add([early, late], 'response', { merge: false });
 
       await runner.runProcessOutputStep({
         steps: [],
@@ -2246,9 +2280,7 @@ describe('ProcessorRunner', () => {
         stepNumber: 0,
       });
 
-      expect(replaceMessages).toHaveBeenCalledTimes(1);
-      expect(add).not.toHaveBeenCalled();
-      expect(messageList.get.response.db()).toEqual(replacements);
+      expect(messageList.get.response.db().map(message => message.id)).toEqual([early.id, late.id]);
     });
 
     it('should receive usage data in processOutputStep', async () => {
@@ -4080,7 +4112,7 @@ describe('ProcessorRunner', () => {
       const removeByIds = vi.spyOn(messageList, 'removeByIds');
       const replaceMessages = vi.spyOn(messageList, 'replaceMessagesForProcessor');
       const add = vi.spyOn(messageList, 'add');
-      const finalize = vi.spyOn(messageList as any, 'finalizeMessageOrder');
+      const mergeAppended = vi.spyOn(messageList as any, 'mergeAppendedMessagesInOrder');
 
       ProcessorRunner.applyMessagesToMessageList(
         replacements,
@@ -4093,7 +4125,7 @@ describe('ProcessorRunner', () => {
       expect(removeByIds).toHaveBeenCalledTimes(1);
       expect(replaceMessages).toHaveBeenCalledTimes(1);
       expect(add).not.toHaveBeenCalled();
-      expect(finalize).toHaveBeenCalledTimes(1);
+      expect(mergeAppended).toHaveBeenCalledTimes(1);
       expect(messageList.get.response.db()).toEqual(replacements);
     });
 
