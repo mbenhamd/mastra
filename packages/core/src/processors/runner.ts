@@ -231,19 +231,24 @@ function matchesAnyUniqueProcessorMessageSnapshot(
   second: unknown[],
   third?: unknown[],
 ): boolean {
-  if (areProcessorMessageArraysSemanticallyEqual(first, messages)) return true;
+  // Check every unique snapshot by reference before recursively comparing any
+  // message. Workflow steps commonly return the live post-workflow history, so
+  // considering a stale pre-workflow snapshot first can otherwise walk the
+  // entire transcript before reaching the reference-identical candidate.
+  if (haveSameProcessorMessageReferences(first, messages)) return true;
 
-  if (!haveSameProcessorMessageReferences(first, second)) {
-    if (areProcessorMessageArraysSemanticallyEqual(second, messages)) return true;
-  }
+  const secondIsUnique = !haveSameProcessorMessageReferences(first, second);
+  if (secondIsUnique && haveSameProcessorMessageReferences(second, messages)) return true;
 
-  if (
-    third &&
+  const thirdIsUnique =
+    third !== undefined &&
     !haveSameProcessorMessageReferences(first, third) &&
-    !haveSameProcessorMessageReferences(second, third)
-  ) {
-    return areProcessorMessageArraysSemanticallyEqual(third, messages);
-  }
+    (!secondIsUnique || !haveSameProcessorMessageReferences(second, third));
+  if (thirdIsUnique && haveSameProcessorMessageReferences(third, messages)) return true;
+
+  if (areProcessorMessageArraysSemanticallyEqual(first, messages)) return true;
+  if (secondIsUnique && areProcessorMessageArraysSemanticallyEqual(second, messages)) return true;
+  if (thirdIsUnique) return areProcessorMessageArraysSemanticallyEqual(third, messages);
 
   return false;
 }

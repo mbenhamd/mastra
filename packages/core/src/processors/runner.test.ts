@@ -4289,6 +4289,54 @@ describe('ProcessorRunner', () => {
       }
     });
 
+    it('checks a live workflow history before deep-comparing its stale snapshot', async () => {
+      const originals = Array.from({ length: 50 }, (_, index) => createMessage(`original ${index}`, 'assistant'));
+      const transformed = originals.map((message, index) => ({
+        ...message,
+        content: { ...message.content, parts: [{ type: 'text' as const, text: `transformed ${index}` }] },
+      }));
+      const start = vi.fn(async ({ inputData }: { inputData: Record<string, unknown> }) => {
+        const activeMessageList = inputData.messageList as MessageList;
+        activeMessageList.replaceMessagesForProcessor(
+          transformed,
+          new Set(originals.map(message => message.id)),
+          () => 'response',
+        );
+        return {
+          status: 'success',
+          result: { phase: inputData.phase, messages: transformed },
+          steps: {},
+        };
+      });
+      const workflow = setProcessorWorkflowPhases(
+        {
+          id: 'live-history-result-workflow',
+          inputSchema: {},
+          outputSchema: {},
+          execute: () => undefined,
+          createRun: vi.fn(async () => ({ start })),
+        } as unknown as ProcessorWorkflow,
+        ['outputResult'],
+      );
+      runner = new ProcessorRunner({
+        inputProcessors: [],
+        outputProcessors: [workflow],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+      messageList.add(originals, 'response', { merge: false });
+      const semanticComparison = vi.spyOn(utils, 'deepEqual');
+
+      try {
+        await runner.runOutputProcessors(messageList);
+
+        expect(messageList.get.response.db()).toEqual(transformed);
+        expect(semanticComparison).not.toHaveBeenCalled();
+      } finally {
+        semanticComparison.mockRestore();
+      }
+    });
+
     it('avoids content hashing for pass-through workflow message histories', async () => {
       const messages = Array.from({ length: 50 }, (_, index) => createMessage(`message ${index}`, 'assistant'));
       const start = vi.fn(async ({ inputData }: { inputData: Record<string, unknown> }) => ({
