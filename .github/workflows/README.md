@@ -218,6 +218,9 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   admission without starting a Temporal service. Both paths run their native
   workspace typecheck, build, and lint before the focused Vitest file. Other
   Temporal sources, tests, manifests, and non-code inputs remain fail-closed.
+  Temporal builds before its self-typecheck because clean checkouts do not yet
+  have the package's `dist` declarations used by integration-fixture
+  self-imports.
   PostgreSQL and Redis cache production paths likewise force their newly owned
   thread-state/indexed-log regressions. Other unprovisioned Store-provider tests
   fail closed for the same reason.
