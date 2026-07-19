@@ -8,7 +8,7 @@ import type { TracingContext } from '@mastra/core/observability';
 import { EntityType, SpanType } from '@mastra/core/observability';
 import type { Processor, ProcessorStepOutput, ProcessorStepInputSchema, OutputResult } from '@mastra/core/processors';
 import {
-  copyProcessorWorkflowPhases,
+  copyProcessorWorkflowTraits,
   ProcessorRunner,
   ProcessorStepOutputSchema,
   ProcessorStepSchema,
@@ -1271,7 +1271,7 @@ export function init(inngest: Inngest) {
 
       wf.setStepFlow(workflow.stepGraph);
       wf.commit();
-      return copyProcessorWorkflowPhases(workflow, wf);
+      return copyProcessorWorkflowTraits(workflow, wf);
     },
   };
 }

@@ -1,6 +1,10 @@
 import { EventEmitterPubSub } from '@mastra/core/events';
 import { Mastra } from '@mastra/core/mastra';
-import { getProcessorWorkflowPhases, setProcessorWorkflowPhases } from '@mastra/core/processors';
+import {
+  getProcessorWorkflowPhases,
+  processorWorkflowRequiresDurableExecution,
+  setProcessorWorkflowPhases,
+} from '@mastra/core/processors';
 import { RequestContext } from '@mastra/core/request-context';
 import { MockStore } from '@mastra/core/storage';
 import { TRANSIENT_EXECUTION_SYMBOL } from '@mastra/core/workflows/_constants';
@@ -60,6 +64,7 @@ describe('Inngest createRun contract', () => {
     const clone = cloneWorkflow(workflow, { id: 'final-only-workflow-clone' });
 
     expect(getProcessorWorkflowPhases(clone)).toEqual(['outputResult']);
+    expect(processorWorkflowRequiresDurableExecution(clone)).toBe(true);
   });
 
   it('validates raw input and serializes disableScorers through startAsync', async () => {

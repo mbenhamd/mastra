@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  copyProcessorWorkflowTraits,
   getProcessorWorkflowPhases,
   processorWorkflowHasPhaseRestrictions,
   processorWorkflowRequiresDurableExecution,
@@ -77,5 +78,15 @@ describe('processor workflow phase capabilities', () => {
         }),
       ),
     ).toBe(true);
+  });
+
+  it('propagates durable provenance through repeated base-workflow clones', () => {
+    const source = setProcessorWorkflowPhases(processorWorkflowStub({ engineType: 'inngest' }), ['outputResult']);
+    const firstClone = copyProcessorWorkflowTraits(source, processorWorkflowStub({ engineType: 'default' }));
+    const secondClone = copyProcessorWorkflowTraits(firstClone, processorWorkflowStub({ engineType: 'default' }));
+
+    expect(getProcessorWorkflowPhases(secondClone)).toEqual(['outputResult']);
+    expect(processorWorkflowRequiresDurableExecution(firstClone)).toBe(true);
+    expect(processorWorkflowRequiresDurableExecution(secondClone)).toBe(true);
   });
 });

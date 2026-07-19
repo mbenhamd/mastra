@@ -3828,72 +3828,79 @@ export class Run<
       perStep?: boolean;
       actor?: ActorSignal;
     } & Partial<ObservabilityContext>): Promise<WorkflowResult<TState, TInput, TOutput, TSteps>> {
-    if (this.transientExecution && perStep) {
-      throw new Error('Transient workflow runs cannot use per-step execution');
+    try {
+      if (this.transientExecution && perStep) {
+        throw new Error('Transient workflow runs cannot use per-step execution');
+      }
+      const observabilityContext = resolveObservabilityContext(rest);
+      // note: this span is ended inside this.executionEngine.execute()
+      const workflowSpan = getOrCreateSpan({
+        type: SpanType.WORKFLOW_RUN,
+        name: `workflow run: '${this.workflowId}'`,
+        entityType: EntityType.WORKFLOW_RUN,
+        entityId: this.workflowId,
+        entityName: this.workflowId,
+        input: inputData,
+        metadata: {
+          resourceId: this.resourceId,
+          runId: this.runId,
+        },
+        tracingPolicy: this.tracingPolicy,
+        tracingOptions,
+        tracingContext: observabilityContext.tracingContext,
+        requestContext: requestContext as RequestContext,
+        mastra: this.#mastra,
+      });
+
+      const traceId = workflowSpan?.externalTraceId;
+      const spanId = workflowSpan?.id;
+      const inputDataToUse = await this._validateInput(inputData);
+      const initialStateToUse = await this._validateInitialState(initialState ?? ({} as TState));
+      await this._validateRequestContext(requestContext as RequestContext);
+
+      const lifecycleExecution = this.startLifecycleExecution();
+      await this.assertLifecycleExecutionAdmission(lifecycleExecution);
+      this.workflowRunStatus = 'running';
+
+      const result = await this.#withActiveExecution(lifecycleExecution.executionGeneration, () =>
+        this.executionEngine.execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({
+          workflowId: this.workflowId,
+          runId: this.runId,
+          transientExecution: this.transientExecution,
+          ...lifecycleExecution,
+          resourceId: this.resourceId,
+          disableScorers: this.disableScorers,
+          graph: this.executionGraph,
+          serializedStepGraph: this.serializedStepGraph,
+          input: inputDataToUse,
+          initialState: initialStateToUse,
+          pubsub: this.pubsub,
+          retryConfig: this.retryConfig,
+          requestContext: (requestContext ?? new RequestContext()) as RequestContext,
+          actor,
+          abortController: this.abortController,
+          outputWriter,
+          workflowSpan,
+          format,
+          outputOptions,
+          perStep,
+        }),
+      );
+
+      if (result.status !== 'suspended') {
+        this.cleanup?.();
+      }
+      this.workflowRunStatus = result.status;
+
+      result.traceId = traceId;
+      result.spanId = spanId;
+      return result;
+    } catch (error) {
+      if (this.transientExecution) {
+        this.cleanup?.();
+      }
+      throw error;
     }
-    const observabilityContext = resolveObservabilityContext(rest);
-    // note: this span is ended inside this.executionEngine.execute()
-    const workflowSpan = getOrCreateSpan({
-      type: SpanType.WORKFLOW_RUN,
-      name: `workflow run: '${this.workflowId}'`,
-      entityType: EntityType.WORKFLOW_RUN,
-      entityId: this.workflowId,
-      entityName: this.workflowId,
-      input: inputData,
-      metadata: {
-        resourceId: this.resourceId,
-        runId: this.runId,
-      },
-      tracingPolicy: this.tracingPolicy,
-      tracingOptions,
-      tracingContext: observabilityContext.tracingContext,
-      requestContext: requestContext as RequestContext,
-      mastra: this.#mastra,
-    });
-
-    const traceId = workflowSpan?.externalTraceId;
-    const spanId = workflowSpan?.id;
-    const inputDataToUse = await this._validateInput(inputData);
-    const initialStateToUse = await this._validateInitialState(initialState ?? ({} as TState));
-    await this._validateRequestContext(requestContext as RequestContext);
-
-    const lifecycleExecution = this.startLifecycleExecution();
-    await this.assertLifecycleExecutionAdmission(lifecycleExecution);
-    this.workflowRunStatus = 'running';
-
-    const result = await this.#withActiveExecution(lifecycleExecution.executionGeneration, () =>
-      this.executionEngine.execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({
-        workflowId: this.workflowId,
-        runId: this.runId,
-        transientExecution: this.transientExecution,
-        ...lifecycleExecution,
-        resourceId: this.resourceId,
-        disableScorers: this.disableScorers,
-        graph: this.executionGraph,
-        serializedStepGraph: this.serializedStepGraph,
-        input: inputDataToUse,
-        initialState: initialStateToUse,
-        pubsub: this.pubsub,
-        retryConfig: this.retryConfig,
-        requestContext: (requestContext ?? new RequestContext()) as RequestContext,
-        actor,
-        abortController: this.abortController,
-        outputWriter,
-        workflowSpan,
-        format,
-        outputOptions,
-        perStep,
-      }),
-    );
-
-    if (result.status !== 'suspended') {
-      this.cleanup?.();
-    }
-    this.workflowRunStatus = result.status;
-
-    result.traceId = traceId;
-    result.spanId = spanId;
-    return result;
   }
 
   /**

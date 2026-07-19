@@ -485,14 +485,39 @@ describe('explicitly transient workflow lifecycle reads', () => {
     const persist = vi.spyOn(workflowsStore, 'persistWorkflowSnapshot');
 
     const run = await workflow.createRun();
+    expect(workflow.runs.size).toBe(1);
 
     await expect(run.start({ inputData: { value: 'per-step' }, perStep: true })).rejects.toThrow(
       'Transient workflow runs cannot use per-step execution',
     );
     expect(run.workflowRunStatus).toBe('pending');
+    expect(workflow.runs.size).toBe(0);
     expect(read).not.toHaveBeenCalled();
     expect(lookup).not.toHaveBeenCalled();
     expect(persist).not.toHaveBeenCalled();
+  });
+
+  it('retires a transient run when workflow input validation rejects', async () => {
+    const workflow = createWorkflow({
+      id: 'explicit-transient-invalid-input',
+      inputSchema: ioSchema,
+      outputSchema: ioSchema,
+      options: { executionMode: 'transient', validateInputs: true },
+    })
+      .then(
+        createStep({
+          id: 'validated-passthrough',
+          inputSchema: ioSchema,
+          outputSchema: ioSchema,
+          execute: async ({ inputData }) => inputData,
+        }),
+      )
+      .commit();
+    const run = await workflow.createRun();
+
+    await expect(run.start({ inputData: { value: 1 } as never })).rejects.toThrow('Invalid input data');
+
+    expect(workflow.runs.size).toBe(0);
   });
 
   it('rejects durable replay operations without reading storage', async () => {

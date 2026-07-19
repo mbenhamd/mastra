@@ -1,8 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod/v4';
 import type { ProcessorWorkflow } from '../processors';
-import { getProcessorWorkflowPhases, setProcessorWorkflowPhases } from '../processors/is-processor-workflow';
+import {
+  getProcessorWorkflowPhases,
+  processorWorkflowRequiresDurableExecution,
+  setProcessorWorkflowPhases,
+} from '../processors/is-processor-workflow';
 import { createWorkflow, createEventedWorkflow, cloneWorkflow } from './create';
+import { cloneWorkflow as cloneEventedWorkflow } from './evented/workflow';
 import { createStep, Workflow } from './workflow';
 
 /**
@@ -144,5 +149,21 @@ describe('cloneWorkflow', () => {
     const clone = cloneWorkflow(original, { id: 'processor-phase-clone' });
 
     expect(getProcessorWorkflowPhases(clone as unknown as ProcessorWorkflow)).toEqual(['outputResult']);
+  });
+
+  it('preserves the durable processor boundary on an evented clone', () => {
+    const original = createEventedWorkflow({
+      id: 'evented-processor-original',
+      inputSchema: z.any(),
+      outputSchema: z.any(),
+    })
+      .then(noop as never)
+      .commit();
+    setProcessorWorkflowPhases(original as unknown as ProcessorWorkflow, ['outputResult']);
+
+    const clone = cloneEventedWorkflow(original, { id: 'evented-processor-clone' });
+
+    expect(getProcessorWorkflowPhases(clone as unknown as ProcessorWorkflow)).toEqual(['outputResult']);
+    expect(processorWorkflowRequiresDurableExecution(clone as unknown as ProcessorWorkflow)).toBe(true);
   });
 });

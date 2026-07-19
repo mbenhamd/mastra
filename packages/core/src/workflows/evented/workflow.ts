@@ -33,7 +33,7 @@ import {
   createProcessorSendSignal,
 } from '../../processors';
 import type { OutputResult, Processor, ProcessorStreamWriter } from '../../processors';
-import { copyProcessorWorkflowPhases } from '../../processors/is-processor-workflow';
+import { copyProcessorWorkflowTraits } from '../../processors/is-processor-workflow';
 import {
   summarizeActiveToolsForSpan,
   summarizeProcessorModelForSpan,
@@ -127,7 +127,7 @@ export function cloneWorkflow<
 
   wf.setStepFlow(workflow.stepGraph);
   wf.commit();
-  return copyProcessorWorkflowPhases(workflow, wf);
+  return copyProcessorWorkflowTraits(workflow, wf);
 }
 
 export function cloneStep<TStepId extends string>(

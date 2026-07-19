@@ -9,6 +9,7 @@ const allProcessorWorkflowPhases = [
 ] as const satisfies readonly ProcessorWorkflowPhase[];
 
 const declaredProcessorWorkflowPhases = new WeakMap<object, readonly ProcessorWorkflowPhase[]>();
+const durableProcessorWorkflowClones = new WeakSet<object>();
 
 /**
  * Type guard to check if an object is a Workflow that can be used as a processor.
@@ -70,11 +71,17 @@ export function setProcessorWorkflowPhases<TWorkflow extends ProcessorWorkflow>(
   return workflow;
 }
 
-/** @internal Preserve phase capabilities when a workflow is cloned. */
-export function copyProcessorWorkflowPhases<TWorkflow extends object>(source: object, target: TWorkflow): TWorkflow {
+/** @internal Preserve processor execution traits when a workflow is cloned. */
+export function copyProcessorWorkflowTraits<TWorkflow extends object>(source: object, target: TWorkflow): TWorkflow {
   const declaredPhases = declaredProcessorWorkflowPhases.get(source);
   if (declaredPhases) {
     declaredProcessorWorkflowPhases.set(target, declaredPhases);
+  }
+  // Some engine integrations intentionally clone into the base Workflow class.
+  // Preserve the source's durable boundary without changing the clone's runtime
+  // engine, which would otherwise make a phase-restricted clone look transient.
+  if (processorWorkflowRequiresDurableExecution(source as ProcessorWorkflow)) {
+    durableProcessorWorkflowClones.add(target);
   }
   return target;
 }
@@ -99,6 +106,10 @@ export function processorWorkflowRequiresDurableExecution(workflow: ProcessorWor
       return false;
     }
     visited.add(candidate);
+
+    if (durableProcessorWorkflowClones.has(candidate)) {
+      return true;
+    }
 
     const { engineType, steps } = candidate as { engineType?: unknown; steps?: unknown };
     if (typeof engineType === 'string' && engineType !== 'default') {
