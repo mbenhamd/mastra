@@ -3672,12 +3672,14 @@ export class Run<
       return;
     }
 
-    let reservedExecutionGeneration: string | undefined;
-    try {
-      reservedExecutionGeneration = (await this.getLifecycleExecutionIdentity()).executionGeneration;
-    } catch {
-      // Identity reservation is best-effort here. Cancellation must still abort
-      // and persist status when storage itself is unavailable.
+    let reservedExecutionGeneration = snapshot?.executionGeneration;
+    if (!reservedExecutionGeneration) {
+      try {
+        reservedExecutionGeneration = (await this.getLifecycleExecutionIdentity()).executionGeneration;
+      } catch {
+        // Identity reservation is best-effort here. Cancellation must still abort
+        // and persist status when storage itself is unavailable.
+      }
     }
 
     // No await may occur between this final ownership check and aborting. The
@@ -3700,8 +3702,7 @@ export class Run<
       },
     });
 
-    const executionGeneration =
-      snapshot?.executionGeneration ?? reservedExecutionGeneration ?? this.#executionGeneration;
+    const executionGeneration = reservedExecutionGeneration ?? this.#executionGeneration;
     const resumeAttempt = snapshot?.lifecycleResumeAttempt ?? this.#lifecycleResumeAttempt;
     // An actively running execution owns its terminal emission. Suspended,
     // waiting, and pending runs have no active engine to observe abort.

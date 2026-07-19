@@ -83,6 +83,16 @@ export function outputProcessorsSupportStream(outputProcessors: readonly Process
   return Boolean(outputProcessors?.some(outputProcessorSupportsStream));
 }
 
+function outputProcessorSupportsResult(processorOrWorkflow: ProcessorOrWorkflow): boolean {
+  return isProcessorWorkflow(processorOrWorkflow)
+    ? processorWorkflowSupportsPhase(processorOrWorkflow, 'outputResult')
+    : Boolean(processorOrWorkflow.processOutputResult);
+}
+
+export function outputProcessorsSupportResult(outputProcessors: readonly ProcessorOrWorkflow[] | undefined): boolean {
+  return Boolean(outputProcessors?.some(outputProcessorSupportsResult));
+}
+
 /**
  * Implementation of processor state management
  */
@@ -2423,15 +2433,9 @@ export class ProcessorRunner {
     check: ReturnType<MessageList['makeMessageSourceChecker']>,
     defaultSource: 'input' | 'response' = 'input',
   ) {
-    const returnedIds = new Set<string>();
+    const idsToReplace = new Set(idsBeforeProcessing);
     for (const message of messages) {
-      returnedIds.add(message.id);
-    }
-    const idsToReplace = new Set(returnedIds);
-    for (const id of idsBeforeProcessing) {
-      if (!returnedIds.has(id)) {
-        idsToReplace.add(id);
-      }
+      idsToReplace.add(message.id);
     }
     messageList.replaceMessagesForProcessor(
       messages.map(message => ({ message, source: check.getSource(message) || defaultSource })),

@@ -12,7 +12,12 @@ import type { OutputResult, ProcessorStreamWriter } from '../../processors';
 // Inlined to avoid importing structured-output.ts which pulls in the agent
 // barrel and creates an ESM init-time cycle.
 const STRUCTURED_OUTPUT_PROCESSOR_NAME = 'structured-output';
-import { ProcessorState, ProcessorRunner, outputProcessorsSupportStream } from '../../processors/runner';
+import {
+  ProcessorState,
+  ProcessorRunner,
+  outputProcessorsSupportResult,
+  outputProcessorsSupportStream,
+} from '../../processors/runner';
 import type { WorkflowRunStatus } from '../../workflows';
 import { DelayedPromise, consumeStream } from '../aisdk/v5/compat';
 import type { ConsumeStreamOptions } from '../aisdk/v5/compat';
@@ -321,7 +326,9 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
     // Create processor runner if outputProcessors are provided
     if (
       options.outputProcessors?.length &&
-      (!options.isLLMExecutionStep || outputProcessorsSupportStream(options.outputProcessors))
+      (options.isLLMExecutionStep
+        ? outputProcessorsSupportStream(options.outputProcessors)
+        : outputProcessorsSupportResult(options.outputProcessors))
     ) {
       this.processorRunner = new ProcessorRunner({
         inputProcessors: [],
