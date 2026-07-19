@@ -257,8 +257,14 @@ describe('explicitly transient workflow lifecycle reads', () => {
 
     const run = await workflow.createRun();
     await run.cancel();
+    const replacement = await workflow.createRun({
+      runId: run.runId,
+      [TRANSIENT_EXECUTION_SYMBOL]: true,
+    });
 
     expect(run.workflowRunStatus).toBe('canceled');
+    expect(replacement).not.toBe(run);
+    expect(replacement.transientExecution).toBe(true);
     await expect(run.start({ inputData: { value: 'must-not-run' } })).rejects.toThrow(
       'lifecycle execution admission is stale',
     );
@@ -266,6 +272,7 @@ describe('explicitly transient workflow lifecycle reads', () => {
     expect(read).not.toHaveBeenCalled();
     expect(update).not.toHaveBeenCalled();
     expect(persist).not.toHaveBeenCalled();
+    await replacement.cancel();
   });
 
   it('fails a transient suspension attempt without creating durable state', async () => {

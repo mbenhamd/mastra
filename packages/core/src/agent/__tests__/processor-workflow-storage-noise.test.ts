@@ -259,15 +259,21 @@ describe('agent processor-workflow storage noise (issue #17137 follow-up to #173
     const workflowsStore = (await storage.getStore('workflows'))!;
     const read = vi.spyOn(workflowsStore, 'loadWorkflowSnapshot');
     const streamedText: string[] = [];
+    const admissions = spyOnWorkflowAdmissions();
 
-    const stream = await mastra.getAgent(AGENT_ID).stream('Hello!');
-    for await (const part of stream.fullStream) {
-      if (part.type === 'text-delta') streamedText.push(part.payload.text);
+    try {
+      const stream = await mastra.getAgent(AGENT_ID).stream('Hello!');
+      for await (const part of stream.fullStream) {
+        if (part.type === 'text-delta') streamedText.push(part.payload.text);
+      }
+    } finally {
+      admissions.spy.mockRestore();
     }
 
     expect(streamedText).toHaveLength(12);
     expect(textDeltaCountInResult).toBe(12);
     expect(resultOrder).toEqual(['stream-aware', 'result-only']);
+    expect(admissions.workflowIds.filter(id => id === `${AGENT_ID}-output-processor`)).toEqual([]);
     expect(read.mock.calls.filter(([input]) => input.workflowName === `${AGENT_ID}-output-processor`)).toEqual([]);
   });
 

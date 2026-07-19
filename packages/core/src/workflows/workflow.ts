@@ -18,8 +18,8 @@ import { RequestContext } from '../di';
 import { ErrorCategory, ErrorDomain, MastraError } from '../error';
 import type { MastraScorers } from '../evals';
 import { EventEmitterPubSub } from '../events/event-emitter';
-import type { PubSub } from '../events/pubsub';
-import type { Event } from '../events/types';
+import { PubSub } from '../events/pubsub';
+import type { Event, EventCallback, PublishEvent, SubscribeOptions } from '../events/types';
 import type { IMastraLogger } from '../logger';
 import { RegisteredLogger } from '../logger';
 import type { Mastra } from '../mastra';
@@ -66,6 +66,7 @@ import {
   getWorkflowLifecycleTopic,
   publishWorkflowLifecycleEvent,
   requireWorkflowExecutionGeneration,
+  SUPPRESS_WORKFLOW_LIFECYCLE_EVENTS,
 } from './lifecycle-events';
 import type {
   WorkflowExecutionGeneration,
@@ -117,6 +118,28 @@ import type {
 } from './types';
 import { cleanStepResult, createRestartExecutionParams, createTimeTravelExecutionParams } from './utils';
 import { watchWorkflowLifecycleEvents } from './workflow-lifecycle';
+
+class TransientProcessorPubSub extends PubSub {
+  readonly [SUPPRESS_WORKFLOW_LIFECYCLE_EVENTS] = true as const;
+
+  publish(_topic: string, _event: PublishEvent): Promise<void> {
+    return Promise.resolve();
+  }
+
+  subscribe(_topic: string, _cb: EventCallback, _options?: SubscribeOptions): Promise<void> {
+    return Promise.resolve();
+  }
+
+  unsubscribe(_topic: string, _cb: EventCallback): Promise<void> {
+    return Promise.resolve();
+  }
+
+  flush(): Promise<void> {
+    return Promise.resolve();
+  }
+}
+
+const transientProcessorPubSub = new TransientProcessorPubSub();
 
 // Options that can be passed when wrapping an agent with createStep
 // These work for both stream() (v2) and streamLegacy() (v1) methods
@@ -2477,7 +2500,9 @@ export class Workflow<
         // registered Mastra uses a network-backed lifecycle broker. Nested
         // workflows still receive their parent's explicit per-run pubsub, and
         // explicit/custom IDs remain durable and retain the Mastra pubsub.
-        pubsub: options?.pubsub ?? (transientExecution && isProcessorExecution ? undefined : this.#mastra?.pubsub),
+        pubsub:
+          options?.pubsub ??
+          (transientExecution && isProcessorExecution ? transientProcessorPubSub : this.#mastra?.pubsub),
       });
 
     this.#runs.set(runIdToUse, run);
@@ -3663,6 +3688,9 @@ export class Run<
         // Cancellation is already durable. Lifecycle delivery remains
         // best-effort when the configured transport is unavailable.
       }
+    }
+    if (this.transientExecution && !this.hasActiveLifecycleExecution(executionGeneration)) {
+      this.cleanup?.();
     }
   }
 

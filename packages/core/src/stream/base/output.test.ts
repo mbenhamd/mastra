@@ -2,6 +2,7 @@ import { ReadableStream } from 'node:stream/web';
 import { describe, expect, it, vi } from 'vitest';
 import { MessageList } from '../../agent/message-list';
 import type { Processor, ProcessorStreamWriter } from '../../processors';
+import { ProcessorRunner } from '../../processors/runner';
 import { ChunkFrom } from '../types';
 import type { ChunkType } from '../types';
 import { MastraModelOutput } from './output';
@@ -81,6 +82,33 @@ function createFinishChunk(
 }
 
 describe('MastraModelOutput', () => {
+  it('bypasses the per-chunk processor transform when only result processors are configured', async () => {
+    const processPart = vi.spyOn(ProcessorRunner.prototype, 'processPart');
+    const runId = 'result-only-inner-run';
+    const resultOnlyProcessor: Processor = {
+      id: 'result-only-inner-processor',
+      processOutputResult: async ({ messages }) => messages,
+    };
+    const output = new MastraModelOutput({
+      model: { modelId: 'test-model', provider: 'test', version: 'v3' },
+      stream: createChunkStream([createStepFinishChunk(runId), createFinishChunk(runId)]),
+      messageList: new MessageList({ threadId: 'test-thread' }),
+      messageId: 'msg-1',
+      options: {
+        runId,
+        isLLMExecutionStep: true,
+        outputProcessors: [resultOnlyProcessor],
+      },
+    });
+
+    try {
+      await output.consumeStream();
+      expect(processPart).not.toHaveBeenCalled();
+    } finally {
+      processPart.mockRestore();
+    }
+  });
+
   describe('writer in output processors (outer context)', () => {
     it('should pass a defined writer to processOutputResult', async () => {
       let receivedWriter: ProcessorStreamWriter | undefined;

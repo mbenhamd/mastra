@@ -2218,6 +2218,39 @@ describe('ProcessorRunner', () => {
       expect(allMessages[1].role).toBe('assistant');
     });
 
+    it('reconciles a long output-step history in one batch', async () => {
+      const originals = Array.from({ length: 50 }, (_, index) => createMessage(`original ${index}`, 'assistant'));
+      const replacements = originals.map((message, index) => ({
+        ...message,
+        content: { ...message.content, parts: [{ type: 'text' as const, text: `replacement ${index}` }] },
+      }));
+      runner = new ProcessorRunner({
+        inputProcessors: [],
+        outputProcessors: [
+          {
+            id: 'bulk-output-step-processor',
+            processOutputStep: async () => replacements,
+          },
+        ],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+      messageList.add(originals, 'response', { merge: false });
+      const replaceMessages = vi.spyOn(messageList, 'replaceMessagesForProcessor');
+      const add = vi.spyOn(messageList, 'add');
+
+      await runner.runProcessOutputStep({
+        steps: [],
+        messages: messageList.get.all.db(),
+        messageList,
+        stepNumber: 0,
+      });
+
+      expect(replaceMessages).toHaveBeenCalledTimes(1);
+      expect(add).not.toHaveBeenCalled();
+      expect(messageList.get.response.db()).toEqual(replacements);
+    });
+
     it('should receive usage data in processOutputStep', async () => {
       let receivedUsage: unknown = undefined;
 

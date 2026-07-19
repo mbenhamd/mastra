@@ -21,6 +21,7 @@ import {
   getOrCreateWorkflowStepLifecycleState,
   publishWorkflowLifecycleEvent,
   requireWorkflowExecutionGeneration,
+  workflowLifecycleEventsAreSuppressed,
 } from '../lifecycle-events';
 import type { Step, SuspendOptions } from '../step';
 import { getStepResult } from '../step';
@@ -110,16 +111,19 @@ export async function executeStep(
   const lifecycleStepStates = executionContext.lifecycleStepStates ?? {};
   executionContext.executionGeneration = executionGeneration;
   executionContext.lifecycleStepStates = lifecycleStepStates;
-  const { state: lifecycleStepState } = getOrCreateWorkflowStepLifecycleState({
-    workflowId,
-    runId,
-    executionGeneration,
-    stepId: step.id,
-    executionPath: executionContext.executionPath,
-    foreachIndex: executionContext.foreachIndex,
-    iterationCount,
-    states: lifecycleStepStates,
-  });
+  const suppressLifecycleEvents = workflowLifecycleEventsAreSuppressed(pubsub);
+  const lifecycleStepState = suppressLifecycleEvents
+    ? { stepCallId: '', stepAttempt: 0 }
+    : getOrCreateWorkflowStepLifecycleState({
+        workflowId,
+        runId,
+        executionGeneration,
+        stepId: step.id,
+        executionPath: executionContext.executionPath,
+        foreachIndex: executionContext.foreachIndex,
+        iterationCount,
+        states: lifecycleStepStates,
+      }).state;
   const stepCallId = lifecycleStepState.stepCallId;
 
   const { inputData, validationError: inputValidationError } = await validateStepInput({
@@ -213,7 +217,9 @@ export async function executeStep(
   });
 
   const operationId = `workflow.${workflowId}.run.${runId}.step.${step.id}.running_ev`;
-  lifecycleStepState.stepAttempt += 1;
+  if (!suppressLifecycleEvents) {
+    lifecycleStepState.stepAttempt += 1;
+  }
   await engine.onStepExecutionStart({
     step,
     inputData,
@@ -222,29 +228,31 @@ export async function executeStep(
     stepCallId,
     stepInfo,
     operationId,
-    skipEmits,
+    skipEmits: skipEmits || suppressLifecycleEvents,
   });
-  await publishWorkflowLifecycleEvent({
-    pubsub,
-    workflowId,
-    runId,
-    executionGeneration,
-    event: isResume
-      ? {
-          type: 'step.resumed',
-          stepId: step.id,
-          stepCallId,
-          stepAttempt: lifecycleStepState.stepAttempt,
-          resumeData: resumeDataToUse,
-        }
-      : {
-          type: 'step.started',
-          stepId: step.id,
-          stepCallId,
-          stepAttempt: lifecycleStepState.stepAttempt,
-          input: inputData,
-        },
-  });
+  if (!suppressLifecycleEvents) {
+    await publishWorkflowLifecycleEvent({
+      pubsub,
+      workflowId,
+      runId,
+      executionGeneration,
+      event: isResume
+        ? {
+            type: 'step.resumed',
+            stepId: step.id,
+            stepCallId,
+            stepAttempt: lifecycleStepState.stepAttempt,
+            resumeData: resumeDataToUse,
+          }
+        : {
+            type: 'step.started',
+            stepId: step.id,
+            stepCallId,
+            stepAttempt: lifecycleStepState.stepAttempt,
+            input: inputData,
+          },
+    });
+  }
 
   await engine.persistStepUpdate({
     workflowId,
@@ -388,7 +396,7 @@ export async function executeStep(
       }
 
       lifecycleStepState.stepAttempt = initialStepAttempt + retryCount;
-      if (retryCount > 0) {
+      if (retryCount > 0 && !suppressLifecycleEvents) {
         await publishWorkflowLifecycleEvent({
           pubsub,
           workflowId,
@@ -655,7 +663,7 @@ export async function executeStep(
         execResults: { ...stepInfo, ...execResults } as StepResult<any, any, any, any>,
         pubsub,
         runId,
-        emitLegacy: !skipEmits,
+        emitLegacy: !skipEmits && !suppressLifecycleEvents,
       });
     });
     if (deferLifecycleResult) {

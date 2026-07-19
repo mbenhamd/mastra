@@ -1720,12 +1720,17 @@ export class Agent<
       return [];
     }
 
-    // Phase-restricted workflows and workflows with evented descendants must
-    // remain top-level processors. A synthetic workflow would either execute a
-    // restricted child during an excluded phase or place a durable evented child
-    // beneath a transient parent that cannot propagate suspension.
+    const processorPhaseSignatures = new Set(
+      validProcessors.map(processor => [...getProcessorWorkflowPhases(processor)].sort().join('\0')),
+    );
+
+    // Phase-restricted workflows, heterogeneous phase sets, and workflows with
+    // durable descendants must remain top-level processors. A synthetic
+    // workflow would otherwise admit every child whenever the union supports a
+    // phase, or place a durable child beneath a transient parent.
     // ProcessorRunner preserves order while applying the phase guard to each item.
     if (
+      processorPhaseSignatures.size > 1 ||
       validProcessors.some(
         processor =>
           isProcessorWorkflow(processor) &&

@@ -3257,7 +3257,7 @@ describe('Workflow as Processor', () => {
       expect(isProcessorWorkflow(configuredProcessors[1])).toBe(false);
     });
 
-    it('should preserve state signal processors on resolved combined input workflows', async () => {
+    it('keeps mixed input and state-signal phases direct', async () => {
       const stateProcessor = {
         id: 'state-proc',
         name: 'State Processor',
@@ -3280,12 +3280,13 @@ describe('Workflow as Processor', () => {
 
       const resolvedProcessors = await agent.listInputProcessors();
 
-      expect(resolvedProcessors).toHaveLength(1);
-      expect(isProcessorWorkflow(resolvedProcessors[0])).toBe(true);
-      expect(resolvedProcessors[0]?.__stateSignalProcessors).toEqual([stateProcessor]);
+      expect(resolvedProcessors).toEqual([stateProcessor, inputProcessor]);
+      expect(resolvedProcessors.every(processor => !isProcessorWorkflow(processor))).toBe(true);
+      expect(stateProcessor).toHaveProperty('processorIndex', 0);
+      expect(inputProcessor).toHaveProperty('processorIndex', 1);
     });
 
-    it('should preserve state signal only processors on resolved combined input workflows', async () => {
+    it('keeps state-signal-only processors direct beside input processors', async () => {
       const stateProcessor = {
         id: 'state-only-proc',
         name: 'State Only Processor',
@@ -3307,9 +3308,10 @@ describe('Workflow as Processor', () => {
 
       const resolvedProcessors = await agent.listInputProcessors();
 
-      expect(resolvedProcessors).toHaveLength(1);
-      expect(isProcessorWorkflow(resolvedProcessors[0])).toBe(true);
-      expect(resolvedProcessors[0]?.__stateSignalProcessors).toEqual([stateProcessor]);
+      expect(resolvedProcessors).toEqual([stateProcessor, inputProcessor]);
+      expect(resolvedProcessors.every(processor => !isProcessorWorkflow(processor))).toBe(true);
+      expect(stateProcessor).toHaveProperty('processorIndex', 0);
+      expect(inputProcessor).toHaveProperty('processorIndex', 1);
     });
 
     it('keeps an evented processor workflow top-level in a mixed chain', async () => {

@@ -17,6 +17,7 @@ import {
   mergeWorkflowStepLifecycleStates,
   parseWorkflowLifecycleRecord,
   publishWorkflowLifecycleEvent,
+  SUPPRESS_WORKFLOW_LIFECYCLE_EVENTS,
 } from './lifecycle-events';
 import type { WorkflowLifecycleEvent, WorkflowLifecycleRecord, WorkflowLifecycleRecordError } from './lifecycle-events';
 import { createStep } from './workflow';
@@ -39,6 +40,23 @@ function stepEvents(records: Array<{ record: WorkflowLifecycleRecord }>) {
 }
 
 describe('canonical workflow lifecycle model', () => {
+  it('skips canonical lifecycle publication for marked process-local channels', async () => {
+    const pubsub = Object.assign(new EventEmitterPubSub(), {
+      [SUPPRESS_WORKFLOW_LIFECYCLE_EVENTS]: true as const,
+    });
+    const publish = vi.spyOn(pubsub, 'publish');
+
+    await publishWorkflowLifecycleEvent({
+      pubsub,
+      workflowId: 'process-local-workflow',
+      runId: 'process-local-run',
+      executionGeneration: 'process-local-generation',
+      event: { type: 'workflow.started', resumeAttempt: 0 },
+    });
+
+    expect(publish).not.toHaveBeenCalled();
+  });
+
   it('clears a terminal lifecycle topic only after its advertised replay retention and minimum reconnect window', async () => {
     class RetainedPubSub extends EventEmitterPubSub {
       override get indexedReplay() {

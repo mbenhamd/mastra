@@ -274,6 +274,7 @@ export class ProcessorRunner {
   public readonly inputProcessors: ProcessorOrWorkflow[];
   public readonly outputProcessors: ProcessorOrWorkflow[];
   public readonly errorProcessors: ErrorProcessorOrWorkflow[];
+  public readonly hasOutputStreamProcessors: boolean;
   private readonly logger: IMastraLogger;
   private readonly agentName: string;
   private readonly agent?: Agent<any, any, any, any>;
@@ -312,6 +313,11 @@ export class ProcessorRunner {
     this.inputProcessors = inputProcessors ?? [];
     this.outputProcessors = outputProcessors ?? [];
     this.errorProcessors = errorProcessors ?? [];
+    this.hasOutputStreamProcessors = this.outputProcessors.some(processorOrWorkflow =>
+      isProcessorWorkflow(processorOrWorkflow)
+        ? processorWorkflowSupportsPhase(processorOrWorkflow, 'outputStream')
+        : Boolean(processorOrWorkflow.processOutputStream),
+    );
     this.logger = logger;
     this.agentName = agentName;
     this.agent = agent;
@@ -2110,27 +2116,13 @@ export class ProcessorRunner {
           }
           // Processor returned the same messageList - mutations have been applied
         } else if (Array.isArray(result)) {
-          // Processor returned an array - apply changes to messageList
-          const deletedIds = idsBeforeProcessing.filter(
-            (i: string) => !result.some((m: MastraDBMessage) => m.id === i),
+          ProcessorRunner.applyMessagesToMessageList(
+            result as MastraDBMessage[],
+            messageList,
+            idsBeforeProcessing,
+            check,
+            'response',
           );
-          if (deletedIds.length) {
-            messageList.removeByIds(deletedIds);
-          }
-
-          // Re-add messages with correct sources
-          for (const message of result) {
-            messageList.removeByIds([message.id]);
-            if (message.role === 'system') {
-              const systemText =
-                (message.content.content as string | undefined) ??
-                message.content.parts?.map((p: any) => (p.type === 'text' ? p.text : '')).join('\n') ??
-                '';
-              messageList.addSystem(systemText);
-            } else {
-              messageList.add(message, check.getSource(message) || 'response', { merge: false });
-            }
-          }
         }
 
         processorSpan?.end({

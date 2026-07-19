@@ -336,7 +336,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
     // Apply output processors if they exist
     let processedStream = stream;
     const processorRunner = this.processorRunner;
-    if (processorRunner && options.isLLMExecutionStep) {
+    if (processorRunner?.hasOutputStreamProcessors && options.isLLMExecutionStep) {
       // Use shared processor states if provided, otherwise create new ones
       const processorStates = (options.processorStates || new Map<string, ProcessorState>()) as Map<
         string,

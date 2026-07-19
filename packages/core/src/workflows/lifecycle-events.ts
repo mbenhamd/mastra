@@ -2,6 +2,18 @@ import { createHash, randomUUID } from 'node:crypto';
 
 import type { PubSub } from '../events/pubsub';
 
+/** @internal Marks a process-local channel that intentionally drops workflow lifecycle delivery. */
+export const SUPPRESS_WORKFLOW_LIFECYCLE_EVENTS: unique symbol = Symbol('mastra.suppressWorkflowLifecycleEvents');
+
+type WorkflowLifecycleSuppressingPubSub = PubSub & {
+  [SUPPRESS_WORKFLOW_LIFECYCLE_EVENTS]?: true;
+};
+
+/** @internal Avoid lifecycle identity/event construction for unobserved process-local executions. */
+export function workflowLifecycleEventsAreSuppressed(pubsub: PubSub): boolean {
+  return Boolean((pubsub as WorkflowLifecycleSuppressingPubSub)[SUPPRESS_WORKFLOW_LIFECYCLE_EVENTS]);
+}
+
 /**
  * Opaque identity for one execution lineage of a workflow run.
  *
@@ -325,6 +337,8 @@ export async function publishWorkflowLifecycleEvent<TEvent extends WorkflowLifec
   executionGeneration: WorkflowExecutionGeneration;
   event: TEvent;
 }): Promise<void> {
+  if (workflowLifecycleEventsAreSuppressed(params.pubsub)) return;
+
   const record: WorkflowLifecycleRecord<TEvent> = {
     schemaVersion: 1,
     workflowId: params.workflowId,
