@@ -46,6 +46,7 @@ import type {
 } from '../observability';
 import { NoOpObservability, noOpLoggerContext, noOpMetricsContext } from '../observability';
 import { initContextStorage } from '../observability/context-storage';
+import { isProcessorWorkflow } from '../processors';
 import type { Processor } from '../processors';
 import { Schedules } from '../schedules/schedules';
 import type { SchedulesConfig, ScheduleHooks } from '../schedules/types';
@@ -2799,14 +2800,26 @@ export class Mastra<
 
     agents[agentKey] = mastraAgent;
 
-    // Register configured processor workflows from the agent
+    // Resolve function-based configurations once during agent registration.
+    // Later metadata reads stay side-effect free so dynamic factories cannot
+    // grow the process-wide processor registries on every request.
     // Use .then() to handle async resolution without blocking the constructor
     // This excludes memory-derived processors to avoid triggering memory factory functions
     mastraAgent
-      .getConfiguredProcessorWorkflows()
-      .then(processorWorkflows => {
-        for (const workflow of processorWorkflows) {
-          this.addWorkflow(workflow, workflow.id);
+      .getResolvedConfiguredProcessors()
+      .then(({ inputProcessors, outputProcessors }) => {
+        for (const [type, processors] of [
+          ['input', inputProcessors],
+          ['output', outputProcessors],
+        ] as const) {
+          for (const processor of processors) {
+            if (isProcessorWorkflow(processor)) {
+              this.addWorkflow(processor, processor.id);
+            } else {
+              this.addProcessor(processor);
+              this.addProcessorConfiguration(processor, mastraAgent.id, type);
+            }
+          }
         }
       })
       .catch(err => {

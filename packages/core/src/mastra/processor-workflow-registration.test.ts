@@ -205,6 +205,40 @@ describe('Processor Workflow Registration', () => {
       expect(mastra.listProcessors()?.['dynamic-output-processor']).toBe(outputProcessor);
       expect(() => mastra.getWorkflow('test-agent-output-fn-output-processor')).toThrow();
     });
+
+    it('keeps repeated dynamic processor introspection side-effect free', async () => {
+      let resolution = 0;
+      const processorFn = vi.fn(() => {
+        resolution += 1;
+        return [
+          {
+            id: `dynamic-introspection-${resolution}`,
+            processInput: async ({ messages }: any) => messages,
+          },
+        ];
+      });
+      const agent = new Agent({
+        id: 'dynamic-introspection-agent',
+        name: 'Dynamic Introspection Agent',
+        instructions: 'Test',
+        model: createMockModel(),
+        inputProcessors: processorFn as unknown as () => InputProcessorOrWorkflow[],
+      });
+      const mastra = new Mastra({ logger: false, agents: { dynamic: agent } });
+      await waitForWorkflowRegistration();
+      const registeredProcessorIds = Object.keys(mastra.listProcessors() ?? {});
+      const registeredConfigurationIds = [...mastra.listProcessorConfigurations().keys()];
+
+      await agent.getConfiguredProcessorWorkflows();
+      await agent.getConfiguredProcessorWorkflows();
+
+      expect(processorFn).toHaveBeenCalledTimes(3);
+      expect(Object.keys(mastra.listProcessors() ?? {})).toEqual(registeredProcessorIds);
+      expect([...mastra.listProcessorConfigurations().keys()]).toEqual(registeredConfigurationIds);
+      expect(registeredProcessorIds).toContain('dynamic-introspection-1');
+      expect(registeredProcessorIds).not.toContain('dynamic-introspection-2');
+      expect(registeredProcessorIds).not.toContain('dynamic-introspection-3');
+    });
   });
 
   describe('Workflow processor registration', () => {

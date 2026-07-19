@@ -639,11 +639,9 @@ async function formatAgentList({
   let serializedInputProcessors: ReturnType<typeof getSerializedProcessors> = [];
   let serializedOutputProcessors: ReturnType<typeof getSerializedProcessors> = [];
   try {
-    const configuredProcessorWorkflows = await agent.getConfiguredProcessorWorkflows();
-    const inputProcessorWorkflows = configuredProcessorWorkflows.filter(w => w.id.endsWith('-input-processor'));
-    const outputProcessorWorkflows = configuredProcessorWorkflows.filter(w => w.id.endsWith('-output-processor'));
-    serializedInputProcessors = getSerializedProcessors(inputProcessorWorkflows);
-    serializedOutputProcessors = getSerializedProcessors(outputProcessorWorkflows);
+    const { inputProcessors, outputProcessors } = await agent.getResolvedConfiguredProcessors(requestContext);
+    serializedInputProcessors = getSerializedProcessors(inputProcessors);
+    serializedOutputProcessors = getSerializedProcessors(outputProcessors);
   } catch (error) {
     logger.error('Error getting configured processors for agent', { agentName: agent.name, error });
   }
@@ -935,11 +933,9 @@ async function formatAgent({
   let serializedInputProcessors: ReturnType<typeof getSerializedProcessors> = [];
   let serializedOutputProcessors: ReturnType<typeof getSerializedProcessors> = [];
   try {
-    const configuredProcessorWorkflows = await agent.getConfiguredProcessorWorkflows();
-    const inputProcessorWorkflows = configuredProcessorWorkflows.filter(w => w.id.endsWith('-input-processor'));
-    const outputProcessorWorkflows = configuredProcessorWorkflows.filter(w => w.id.endsWith('-output-processor'));
-    serializedInputProcessors = getSerializedProcessors(inputProcessorWorkflows);
-    serializedOutputProcessors = getSerializedProcessors(outputProcessorWorkflows);
+    const { inputProcessors, outputProcessors } = await agent.getResolvedConfiguredProcessors(requestContext);
+    serializedInputProcessors = getSerializedProcessors(inputProcessors);
+    serializedOutputProcessors = getSerializedProcessors(outputProcessors);
   } catch (error) {
     mastra.getLogger().error('Error getting configured processors for agent', { agentName: agent.name, error });
   }

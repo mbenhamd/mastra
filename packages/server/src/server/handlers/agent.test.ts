@@ -213,14 +213,14 @@ describe('Agent Handlers', () => {
         description: 'A test agent with input and output processors',
         inputProcessors: [
           {
-            id: 'agent-with-core-processors-input-processor',
-            name: 'agent-with-core-processors-input-processor',
+            id: 'unicode-normalizer',
+            name: 'Unicode Normalizer',
           },
         ],
         outputProcessors: [
           {
-            id: 'agent-with-core-processors-output-processor',
-            name: 'agent-with-core-processors-output-processor',
+            id: 'token-limiter',
+            name: 'Token Limiter',
           },
         ],
       });
