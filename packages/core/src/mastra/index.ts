@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import type { Agent } from '../agent';
+import { createDurableAgent } from '../agent/durable/create-durable-agent';
 import { agentThreadStreamRuntime } from '../agent/thread-stream-runtime';
-import type { DurableAgentLike } from '../agent/types';
-import { isDurableAgentLike } from '../agent/types';
+import type { DurableAgentLike, RecoverableDurableAgentLike } from '../agent/types';
+import { isDurableAgentLike, isRecoverableDurableAgentLike } from '../agent/types';
 import type { AgentController } from '../agent-controller';
 import { BackgroundTaskManager } from '../background-tasks';
 import type { BackgroundTaskManagerConfig } from '../background-tasks/types';
@@ -81,6 +82,7 @@ import { computeNextFireAt } from '../workflows/scheduler';
 import type { WorkflowScheduleConfig, SchedulerConfig, Scheduler } from '../workflows/scheduler';
 import type { AnyWorkspace, RegisteredWorkspace, Workspace } from '../workspace';
 import { createOnScorerHook } from './hooks';
+import { __registerMastraCtor } from './mastra-ctor-holder';
 import type { RunScope } from './run-scope';
 import { createRunScope } from './run-scope';
 import type { VersionOverrides, VersionSelector } from './types';
@@ -2690,6 +2692,26 @@ export class Mastra<
       throw createUndefinedPrimitiveError('agent', agent, key);
     }
 
+    // Auto-wrap regular Agents that opted in via AgentConfig.durable.
+    // The wrapped agent then flows into the isDurableAgentLike branch below,
+    // which handles __setMastra, workflow registration, and channel routes.
+    //
+    // Statically importing `createDurableAgent` here is safe because `agent.ts`
+    // imports `Mastra` type-only, so there is no `agent → mastra` runtime edge
+    // to close the init cycle. See the import note in `agent/agent.ts`.
+    //
+    // A standalone durable `Agent` satisfies `isDurableAgentLike` via a
+    // self-referential `.agent` getter (see `Agent#agent`), so we must
+    // discriminate against a real wrapper by checking `agent.agent !== agent`.
+    // Real wrappers (e.g. `DurableAgent`, `InngestAgent`) point `.agent` at a
+    // distinct inner `Agent`; the standalone placeholder points at itself.
+    const isRealDurableWrapper = isDurableAgentLike(agent) && (agent as DurableAgentLike).agent !== (agent as unknown);
+    if (!isRealDurableWrapper && (agent as Agent).durable) {
+      const durableOption = (agent as Agent).durable;
+      const opts = durableOption === true ? {} : { ...(durableOption as object) };
+      agent = createDurableAgent({ agent: agent as Agent, ...opts }) as unknown as A;
+    }
+
     // Handle durable agent wrappers (e.g., InngestAgent)
     // These wrap a regular Agent with execution engine-specific capabilities
     if (isDurableAgentLike(agent)) {
@@ -4083,25 +4105,10 @@ export class Mastra<
       return { agents: 0, recovered: 0, succeeded: 0, failed: 0 };
     }
 
-    // Duck-type on the presence of `recoverActiveRuns()` rather than
-    // `instanceof DurableAgent` — importing the concrete class here would
-    // pull the entire durable-agent module into `mastra/index.ts` and
-    // introduce a runtime import cycle (`Mastra` <-> `DurableAgent`).
-    // The recovery API is only surfaced by default-engine `DurableAgent`
-    // instances; Inngest-style wrappers legitimately lack it and are
-    // skipped automatically.
-    type RecoverableDurableAgent = {
-      id: string;
-      recoverActiveRuns(): Promise<{
-        recovered: Array<{ runId: string }>;
-        succeeded: number;
-        failed: number;
-      }>;
-    };
-    const durableAgents: RecoverableDurableAgent[] = [];
+    const durableAgents: RecoverableDurableAgentLike[] = [];
     for (const agent of Object.values(this.#agents ?? {})) {
-      if (agent && typeof (agent as any).recoverActiveRuns === 'function') {
-        durableAgents.push(agent as unknown as RecoverableDurableAgent);
+      if (agent && isRecoverableDurableAgentLike(agent)) {
+        durableAgents.push(agent);
       }
     }
 
@@ -7240,3 +7247,9 @@ export class Mastra<
     return this.#serverCache;
   }
 }
+
+// Publish the constructor so `Agent`'s ephemeral-Mastra path can build one
+// without a static `agent → mastra` runtime import (which would re-create the
+// init cycle documented in `agent/agent.ts`). Runs once, after the class above
+// is initialized. See `./mastra-ctor-holder`.
+__registerMastraCtor(Mastra);

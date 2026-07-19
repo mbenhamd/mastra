@@ -7,6 +7,7 @@ import type { ZodType as ZodTypev4 } from 'zod/v4';
 import type { ActorSignal } from '../auth/ee';
 import type { AgentBackgroundConfig } from '../background-tasks';
 import type { MastraBrowser } from '../browser';
+import type { MastraServerCache } from '../cache/base';
 import type { AgentChannels } from '../channels/agent-channels';
 import type { ChannelConfig } from '../channels/types';
 import type { MastraScorer, MastraScorers, ScoringSamplingConfig } from '../evals';
@@ -526,6 +527,33 @@ export interface GoalConfig {
   scorer?: MastraScorer | string;
 }
 
+/**
+ * Options for opting an {@link Agent} into durable execution via
+ * {@link AgentConfigBase.durable}.
+ *
+ * - `true`  → wrap with `createDurableAgent` using defaults on Mastra registration.
+ * - object  → forwarded to `createDurableAgent` (cache, pubsub, maxSteps,
+ *   cleanupTimeoutMs, id, name).
+ *
+ * See `packages/core/src/agent/durable/create-durable-agent.ts`.
+ */
+export type AgentDurableOption =
+  | boolean
+  | {
+      /** See createDurableAgent options: cache backend for resumable streams. */
+      cache?: MastraServerCache | false;
+      /** See createDurableAgent options: pubsub instance for streaming events. */
+      pubsub?: PubSub;
+      /** See createDurableAgent options: maximum steps for the agentic loop. */
+      maxSteps?: number;
+      /** Auto-cleanup timer for durable stream state (ms). */
+      cleanupTimeoutMs?: number;
+      /** Optional id override (defaults to agent.id). */
+      id?: string;
+      /** Optional name override (defaults to agent.name). */
+      name?: string;
+    };
+
 interface AgentConfigBase<
   TAgentId extends string = string,
   TTools extends ToolsInput = ToolsInput,
@@ -656,6 +684,24 @@ interface AgentConfigBase<
    * Workflows that the agent can execute. Can be static or dynamically resolved.
    */
   workflows?: DynamicArgument<Record<string, Workflow<any, any, any, any, any, any, any, any>>, TRequestContext>;
+  /**
+   * Opt this agent into durable execution.
+   *
+   * - `true` → wraps with `createDurableAgent` using defaults when the agent is
+   *   registered on a `Mastra` instance.
+   * - object → forwarded to `createDurableAgent` (cache, pubsub, maxSteps,
+   *   cleanupTimeoutMs, id, name).
+   *
+   * Ignored when the agent is used standalone (not attached to a `Mastra`
+   * instance). See {@link AgentDurableOption}.
+   *
+   * @example
+   * ```typescript
+   * new Agent({ id: 'my-agent', instructions: '…', model, durable: true });
+   * new Agent({ id: 'my-agent', instructions: '…', model, durable: { maxSteps: 10 } });
+   * ```
+   */
+  durable?: AgentDurableOption;
   /**
    * Default options used when calling `generate()`.
    */
@@ -933,6 +979,8 @@ export type AgentMemoryOption = {
   thread: string | (Partial<StorageThreadType> & { id: string });
   resource?: string;
   options?: MemoryConfigInternal;
+  /** Callback fired when a thread title is generated and persisted to storage. */
+  onTitleGenerated?: (title: string) => void | Promise<void>;
 };
 
 /**
@@ -1141,6 +1189,7 @@ export type AgentExecuteOnFinishOptions = {
   overrideScorers?: MastraScorers | Record<string, { scorer: MastraScorer['name']; sampling?: ScoringSamplingConfig }>;
   /** Internal tool-fence lease for this execution. */
   _toolSurfaceFenceOwnerId?: string;
+  onTitleGenerated?: (title: string) => void | Promise<void>;
 };
 
 export type AgentMethodType = 'generate' | 'stream' | 'generateLegacy' | 'streamLegacy';
@@ -1198,6 +1247,28 @@ export interface DurableAgentLike {
 }
 
 /**
+ * A durable-agent wrapper whose execution engine supports Mastra-driven run
+ * recovery. External execution engines (for example Inngest) intentionally do
+ * not expose this capability because they own their own recovery lifecycle.
+ */
+export interface RecoverableDurableAgentLike extends DurableAgentLike {
+  /** Explicit capability marker; method presence alone is insufficient because wrappers may proxy base Agent methods. */
+  readonly supportsRunRecovery: true;
+  /**
+   * Recover active runs for this durable agent.
+   */
+  recoverActiveRuns(): Promise<{
+    recovered: Array<{ runId: string }>;
+    succeeded: number;
+    failed: number;
+  }>;
+  /**
+   * Recover a specific run for this durable agent.
+   */
+  recover(runId: string, options?: any): Promise<any>;
+}
+
+/**
  * Type guard to check if an object is a DurableAgentLike wrapper.
  */
 export function isDurableAgentLike(obj: any): obj is DurableAgentLike {
@@ -1210,5 +1281,15 @@ export function isDurableAgentLike(obj: any): obj is DurableAgentLike {
     typeof obj.agent === 'object' &&
     typeof obj.agent.id === 'string' &&
     typeof obj.stream === 'function'
+  );
+}
+
+/** Check whether a durable wrapper explicitly supports Mastra-driven run recovery. */
+export function isRecoverableDurableAgentLike(obj: any): obj is RecoverableDurableAgentLike {
+  return (
+    isDurableAgentLike(obj) &&
+    obj.supportsRunRecovery === true &&
+    typeof obj.recover === 'function' &&
+    typeof obj.recoverActiveRuns === 'function'
   );
 }

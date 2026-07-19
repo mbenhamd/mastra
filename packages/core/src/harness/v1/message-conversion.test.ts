@@ -249,4 +249,31 @@ describe('convertStoredMessageToHarnessMessage', () => {
       },
     ]);
   });
+
+  it('preserves URL-backed AI SDK v5 file parts', () => {
+    const message: StoredMessageRow = {
+      id: 'assistant-url-file',
+      role: 'assistant',
+      createdAt: new Date('2026-05-01T00:00:05.000Z'),
+      content: {
+        parts: [
+          {
+            type: 'file',
+            url: 'https://example.com/report.pdf',
+            mediaType: 'application/pdf',
+            filename: 'report.pdf',
+          },
+        ],
+      },
+    };
+
+    expect(convertStoredMessageToHarnessMessage(message).content).toEqual([
+      {
+        type: 'file',
+        data: 'https://example.com/report.pdf',
+        mediaType: 'application/pdf',
+        filename: 'report.pdf',
+      },
+    ]);
+  });
 });

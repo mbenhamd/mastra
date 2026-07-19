@@ -154,17 +154,11 @@ export type {
   TaskIdFieldMapping,
 } from './contracts';
 
-/**
- * `HarnessMessage` and `HarnessMessageContent` are stable cross-runtime
- * interfaces (spec §11.1). Harness v1 aliases AgentController's canonical
- * message definitions so renderers can consume either runtime without a
- * duplicated type contract.
- */
 export type {
-  AgentControllerMessage as HarnessMessage,
-  AgentControllerMessageContent as HarnessMessageContent,
-  AgentControllerMessageContent as HarnessMessageContentPart,
-} from '../../agent-controller/types';
+  HarnessMessage,
+  HarnessMessageContent,
+  HarnessMessageContent as HarnessMessageContentPart,
+} from './types';
 
 /**
  * Goal-loop primitive types (§4.7). `GoalState` lives in `SessionRecord.goal`

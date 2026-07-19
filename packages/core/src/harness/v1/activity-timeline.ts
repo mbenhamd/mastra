@@ -17,10 +17,8 @@
  * projection); the entry/source kind enums already reserve them.
  */
 
-import type { AgentControllerMessage as HarnessMessage } from '../../agent-controller/types';
-
 import { HarnessValidationError } from './errors';
-import type { ActivityTimelineEntry, ActivityTimelineOptions, SessionActivityTimeline } from './types';
+import type { ActivityTimelineEntry, ActivityTimelineOptions, HarnessMessage, SessionActivityTimeline } from './types';
 
 /** Default + hard cap on entries returned in one page (server-bounded). */
 export const ACTIVITY_TIMELINE_DEFAULT_LIMIT = 100;

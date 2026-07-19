@@ -7,7 +7,7 @@
 
 import type { LanguageModelV2 } from '@ai-sdk/provider-v5';
 import { MockLanguageModelV2, convertArrayToReadableStream } from '@internal/ai-sdk-v5/test';
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { z } from 'zod';
 import { EventEmitterPubSub } from '../../../events/event-emitter';
 import { MockMemory } from '../../../memory/mock';
@@ -690,15 +690,21 @@ describe('DurableAgent memory edge cases', () => {
         memory: mockMemory,
       });
       const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+      const onTitleGenerated = vi.fn(async (title: string) => {
+        const persistedThread = await mockMemory.getThreadById({ threadId: 'thread-title' });
+        expect(persistedThread?.title).toBe(title);
+      });
 
       const result = await durableAgent.stream('What is the weather like today?', {
-        memory: { thread: 'thread-title', resource: 'resource-title' },
+        memory: { thread: 'thread-title', resource: 'resource-title', onTitleGenerated },
       });
       for await (const _chunk of result.fullStream as AsyncIterable<any>) {
       }
 
       const thread = await mockMemory.getThreadById({ threadId: 'thread-title' });
       expect(thread?.title).toBe('Generated Thread Title');
+      expect(onTitleGenerated).toHaveBeenCalledOnce();
+      expect(onTitleGenerated).toHaveBeenCalledWith('Generated Thread Title');
       result.cleanup();
     });
 

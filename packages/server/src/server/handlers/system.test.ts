@@ -14,6 +14,7 @@ type MockStorage = {
       constructor?: { name?: string };
       runtimeTracingStrategy?: 'realtime' | 'batch-with-updates' | 'insert-only' | 'event-sourced';
       getCapabilities?: () => unknown;
+      getFeatures?: () => readonly ('delta-polling' | 'metrics' | 'logs')[] | undefined;
     };
   };
 };
@@ -453,6 +454,43 @@ describe('System Handlers', () => {
         observabilityStorageType: 'MockObservabilityStore',
         observabilityRuntimeStrategy: 'realtime',
         observabilityStorageCapabilities: mockObservabilityStorageCapabilities,
+      });
+    });
+
+    it('should derive stable observability capabilities when bundling changes the storage class name', async () => {
+      const result = await GET_SYSTEM_PACKAGES_ROUTE.handler({
+        mastra: createMockMastra(false, {
+          name: 'PostgresStoreVNext',
+          stores: {
+            observability: {
+              constructor: { name: '_ObservabilityStoragePostgresVNext' },
+              runtimeTracingStrategy: 'insert-only',
+              getFeatures: () => ['metrics', 'logs'],
+            },
+          },
+        }),
+      } as any);
+
+      expect(result).toMatchObject({
+        observabilityStorageType: '_ObservabilityStoragePostgresVNext',
+        observabilityStorageCapabilities: {
+          tracing: {
+            preferredStrategy: 'insert-only',
+            supportedStrategies: ['insert-only'],
+            runtimeStrategy: 'insert-only',
+          },
+          logs: { persist: true, list: true },
+          metrics: {
+            persist: true,
+            list: true,
+            aggregate: true,
+            breakdown: true,
+            timeSeries: true,
+            percentiles: true,
+            discovery: true,
+          },
+          persistence: 'unknown',
+        },
       });
     });
 

@@ -1,4 +1,6 @@
 import { Agent } from '@mastra/core/agent';
+import { createDurableAgent } from '@mastra/core/agent/durable';
+import type { DurableAgent } from '@mastra/core/agent/durable';
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
 import { PROVIDER_REGISTRY } from '@mastra/core/llm';
 import { Mastra } from '@mastra/core/mastra';
@@ -578,6 +580,7 @@ describe('Agent Routes Authorization', () => {
   let storage: InMemoryStore;
   let mockMemory: MockMemory;
   let mockAgent: Agent;
+  let mockDurableAgent: DurableAgent;
   let mastra: Mastra;
 
   beforeEach(() => {
@@ -1430,6 +1433,34 @@ describe('Agent Routes Authorization', () => {
   });
 
   describe('RECOVER_ROUTE', () => {
+    beforeEach(() => {
+      mockAgent = new Agent({
+        id: 'test-agent',
+        name: 'test-agent',
+        instructions: 'test-instructions',
+        // Use a shape that satisfies `isSupportedLanguageModel` so background
+        // durable-workflow initialization does not trigger an unhandled
+        // `AGENT_GET_MODEL_MISSING_MODEL_INSTANCE` rejection from
+        // `resolveModelConfig`.
+        model: { specificationVersion: 'v2' } as any,
+        memory: mockMemory,
+      });
+      mockDurableAgent = createDurableAgent({
+        agent: mockAgent,
+        id: 'test-durable-agent',
+        name: 'test-durable-agent',
+      });
+
+      mastra = new Mastra({
+        agents: {
+          'test-agent': mockAgent,
+          'test-durable-agent': mockDurableAgent,
+        },
+        storage,
+        logger: false,
+      });
+    });
+
     async function persistDurableAgenticLoopRun({
       runId,
       resourceId,
@@ -1448,7 +1479,12 @@ describe('Agent Routes Authorization', () => {
           runId,
           status,
           value: {},
-          context: {},
+          context: {
+            input: {
+              agentId: 'test-durable-agent',
+              __workflowKind: 'durable-agent',
+            },
+          } as any,
           activePaths: [],
           activeStepsPath: {},
           serializedStepGraph: [],
@@ -1491,10 +1527,42 @@ describe('Agent Routes Authorization', () => {
       );
     });
 
-    it('should return 403 when runId belongs to a different resource', async () => {
-      // Add a recover method to make the agent look durable.
-      (mockAgent as any).recover = vi.fn();
+    it('should return 400 for an external durable wrapper without the built-in recovery capability', async () => {
+      const recover = vi.fn();
+      mastra.addAgent(
+        {
+          id: 'external-durable-agent',
+          name: 'External durable agent',
+          agent: new Agent({
+            id: 'external-underlying-agent',
+            name: 'External underlying agent',
+            instructions: 'test',
+            model: { specificationVersion: 'v2' } as any,
+          }),
+          stream: vi.fn(),
+          recover,
+          recoverActiveRuns: vi.fn(),
+        } as any,
+        'external-durable-agent',
+      );
 
+      await expect(
+        RECOVER_ROUTE.handler({
+          mastra,
+          agentId: 'external-durable-agent',
+          requestContext: createContextWithReservedKeys({}),
+          abortSignal: new AbortController().signal,
+          runId: 'external-run-id',
+        } as any),
+      ).rejects.toThrow(
+        new HTTPException(400, {
+          message: 'Agent does not support recover. Only durable agents (createDurableAgent) can recover runs.',
+        }),
+      );
+      expect(recover).not.toHaveBeenCalled();
+    });
+
+    it('should return 403 when runId belongs to a different resource', async () => {
       await persistDurableAgenticLoopRun({ runId: 'recover-run-owned-by-b', resourceId: 'user-b' });
 
       const requestContext = createContextWithReservedKeys({ resourceId: 'user-a' });
@@ -1502,7 +1570,7 @@ describe('Agent Routes Authorization', () => {
       await expect(
         RECOVER_ROUTE.handler({
           mastra,
-          agentId: 'test-agent',
+          agentId: 'test-durable-agent',
           requestContext,
           abortSignal: new AbortController().signal,
           runId: 'recover-run-owned-by-b',
@@ -1510,14 +1578,12 @@ describe('Agent Routes Authorization', () => {
       ).rejects.toThrow(
         new HTTPException(403, { message: 'Access denied: workflow run belongs to a different resource' }),
       );
-
-      delete (mockAgent as any).recover;
     });
 
     it('should call agent.recover(runId, { abortSignal }) and return fullStream', async () => {
       const expectedStream = new ReadableStream();
       const recoverMock = vi.fn().mockResolvedValue({ fullStream: expectedStream });
-      (mockAgent as any).recover = recoverMock;
+      (mockDurableAgent as any).recover = recoverMock;
 
       await persistDurableAgenticLoopRun({ runId: 'recover-run-1' });
 
@@ -1526,7 +1592,7 @@ describe('Agent Routes Authorization', () => {
 
       const result = await RECOVER_ROUTE.handler({
         mastra,
-        agentId: 'test-agent',
+        agentId: 'test-durable-agent',
         requestContext,
         abortSignal: abortController.signal,
         runId: 'recover-run-1',
@@ -1535,12 +1601,12 @@ describe('Agent Routes Authorization', () => {
       expect(recoverMock).toHaveBeenCalledWith('recover-run-1', { abortSignal: abortController.signal });
       expect(result).toBe(expectedStream);
 
-      delete (mockAgent as any).recover;
+      delete (mockDurableAgent as any).recover;
     });
 
     it('should stash version overrides on requestContext before calling agent.recover()', async () => {
       const recoverMock = vi.fn().mockResolvedValue({ fullStream: new ReadableStream() });
-      (mockAgent as any).recover = recoverMock;
+      (mockDurableAgent as any).recover = recoverMock;
 
       await persistDurableAgenticLoopRun({ runId: 'recover-run-versions' });
 
@@ -1548,7 +1614,7 @@ describe('Agent Routes Authorization', () => {
 
       await RECOVER_ROUTE.handler({
         mastra,
-        agentId: 'test-agent',
+        agentId: 'test-durable-agent',
         requestContext,
         abortSignal: new AbortController().signal,
         runId: 'recover-run-versions',
@@ -1566,7 +1632,7 @@ describe('Agent Routes Authorization', () => {
         defaultStatus: 'published',
       });
 
-      delete (mockAgent as any).recover;
+      delete (mockDurableAgent as any).recover;
     });
   });
 

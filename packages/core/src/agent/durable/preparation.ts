@@ -881,6 +881,8 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
               title,
             });
           }
+
+          await execOptions?.memory?.onTitleGenerated?.(title);
         }
       : undefined,
     // Signal messages already in the messageList at run start (from persisted

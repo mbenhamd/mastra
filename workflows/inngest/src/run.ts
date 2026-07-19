@@ -1424,8 +1424,8 @@ export class InngestRun<
     const self = this;
     const stream = new ReadableStream<WorkflowStreamEvent>({
       async start(controller) {
-        // TODO: fix this, watch doesn't have a type
-        const unwatch = self.watch(async ({ type, from = ChunkFrom.WORKFLOW, payload }) => {
+        const unwatch = self.watch(async (event: WorkflowStreamEvent) => {
+          const { type, from = ChunkFrom.WORKFLOW, payload } = event;
           controller.enqueue({
             type,
             runId: self.runId,
@@ -1530,8 +1530,8 @@ export class InngestRun<
     const self = this;
     const stream = new ReadableStream<WorkflowStreamEvent>({
       async start(controller) {
-        // TODO: fix this, watch doesn't have a type
-        const unwatch = self.watch(async ({ type, from = ChunkFrom.WORKFLOW, payload }) => {
+        const unwatch = self.watch(async (event: WorkflowStreamEvent) => {
+          const { type, from = ChunkFrom.WORKFLOW, payload } = event;
           controller.enqueue({
             type,
             runId: self.runId,

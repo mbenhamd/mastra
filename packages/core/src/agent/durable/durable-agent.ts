@@ -478,6 +478,9 @@ export class DurableAgent<
   TTools extends ToolsInput = ToolsInput,
   TOutput = undefined,
 > extends Agent<TAgentId, TTools, TOutput> {
+  /** Explicitly identifies the built-in recovery lifecycle to structural consumers. */
+  readonly supportsRunRecovery = true as const;
+
   /** The wrapped agent */
   readonly #wrappedAgent: Agent<TAgentId, TTools, TOutput>;
 

@@ -30,7 +30,7 @@ import { toast } from '@mastra/playground-ui/utils/toast';
 import { CircleSlashIcon, ExternalLinkIcon } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router';
-import { useMastraPackages } from '@/domains/configuration/hooks/use-mastra-packages';
+import { useObservabilityStorageCapabilities } from '@/domains/configuration/hooks/use-observability-storage-capabilities';
 import { LatencyCard } from '@/domains/metrics/components/latency-card';
 import { MemoryCard } from '@/domains/metrics/components/memory-card';
 import {
@@ -45,38 +45,6 @@ import { ModelUsageCostCard } from '@/domains/metrics/components/model-usage-cos
 import { TokenUsageByAgentCard } from '@/domains/metrics/components/token-usage-by-agent-card';
 import { TokenUsageTimelineCard } from '@/domains/metrics/components/token-usage-timeline-card';
 import { TracesVolumeCard } from '@/domains/metrics/components/traces-volume-card';
-
-const ANALYTICS_OBSERVABILITY_TYPES = new Set([
-  'ObservabilityStorageClickhouseVNext',
-  'ObservabilityStorageDuckDB',
-  'ObservabilityInMemory',
-  'ObservabilitySpanner',
-  'ObservabilityStoragePostgresVNext',
-]);
-
-type MetricsStorageCapabilities = {
-  persist?: boolean | 'unknown';
-  list?: boolean | 'unknown';
-  aggregate?: boolean | 'unknown';
-  breakdown?: boolean | 'unknown';
-  timeSeries?: boolean | 'unknown';
-  percentiles?: boolean | 'unknown';
-  discovery?: boolean | 'unknown';
-};
-
-function supportsMetricsDashboard(metricsCapabilities: MetricsStorageCapabilities | undefined) {
-  if (!metricsCapabilities) return false;
-
-  return (
-    metricsCapabilities.persist === true &&
-    metricsCapabilities.list === true &&
-    metricsCapabilities.aggregate === true &&
-    metricsCapabilities.breakdown === true &&
-    metricsCapabilities.timeSeries === true &&
-    metricsCapabilities.percentiles === true &&
-    metricsCapabilities.discovery === true
-  );
-}
 
 const PERIOD_PARAM = 'period';
 const DATE_FROM_PARAM = 'dateFrom';
@@ -213,17 +181,12 @@ function MetricsContent() {
   const { filterTokens, setFilterTokens } = useMetrics();
   const [autoFocusFilterFieldId, setAutoFocusFilterFieldId] = useState<string | undefined>();
 
-  const { data: packagesData, error: packagesError, isLoading: isPackagesLoading } = useMastraPackages();
-  const observabilityType = packagesData?.observabilityStorageType;
-  const metricsCapabilities = packagesData?.observabilityStorageCapabilities?.metrics;
-  const supportsMetrics = metricsCapabilities
-    ? supportsMetricsDashboard(metricsCapabilities)
-    : observabilityType
-      ? ANALYTICS_OBSERVABILITY_TYPES.has(observabilityType)
-      : false;
-  const isInMemory =
-    packagesData?.observabilityStorageCapabilities?.persistence === 'memory' ||
-    observabilityType === 'ObservabilityInMemory';
+  const {
+    supportsMetrics,
+    isInMemory,
+    isLoading: isPackagesLoading,
+    error: packagesError,
+  } = useObservabilityStorageCapabilities();
   const metricsQueriesEnabled = supportsMetrics && !isPackagesLoading;
   const { error, isLoading: isMetricsLoading } = useAgentRunsKpiMetrics({ enabled: metricsQueriesEnabled });
   const loadError = packagesError ?? error;
