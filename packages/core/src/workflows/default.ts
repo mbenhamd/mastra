@@ -1268,6 +1268,16 @@ export class DefaultExecutionEngine extends ExecutionEngine {
     // check and before any lifecycle publication can yield.
     params.commitTerminalStatus?.(result.status);
 
+    // Finalize the workflow span before terminal transport awaits. Lifecycle
+    // publication can fail after the result is already persisted and committed;
+    // that transport error must not leave the completed run span open.
+    workflowSpan?.end({
+      output: result.result,
+      attributes: {
+        status: result.status,
+      },
+    });
+
     if (!suppressLifecycleEvents && result.status === 'canceled') {
       await publishWorkflowLifecycleEvent({
         pubsub: params.pubsub,
@@ -1293,13 +1303,6 @@ export class DefaultExecutionEngine extends ExecutionEngine {
         },
       });
     }
-
-    workflowSpan?.end({
-      output: result.result,
-      attributes: {
-        status: result.status,
-      },
-    });
 
     // Drop the last-persisted-status tracker for terminal runs so the map
     // does not grow unbounded across many runs served by the same engine.

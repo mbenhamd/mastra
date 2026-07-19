@@ -347,21 +347,22 @@ describe('explicitly transient workflow lifecycle reads', () => {
     new Mastra({ logger: false, workflows: { [workflow.id]: workflow } });
     const run = await workflow.createRun();
 
-    const settledPromise = Promise.allSettled([
-      run.start({ inputData: { value: 'first' } }),
-      run.start({ inputData: { value: 'second' } }),
-    ]);
+    const winningResult = run.start({ inputData: { value: 'first' } });
     await executionStarted;
+    await expect(run.start({ inputData: { value: 'second' } })).rejects.toThrow('admission is stale');
+
+    // The rejected start shares the same Run object, so it must not retire the
+    // cache entry still owned by the active execution.
+    expect(workflow.runs.get(run.runId)).toBe(run);
+
     releaseExecution();
-    const settled = await settledPromise;
+    await expect(winningResult).resolves.toMatchObject({
+      status: 'success',
+      result: { value: 'first' },
+    });
 
     expect(executionCount).toBe(1);
-    expect(settled.filter(result => result.status === 'fulfilled')).toHaveLength(1);
-    expect(settled.filter(result => result.status === 'rejected')).toEqual([
-      expect.objectContaining({
-        reason: expect.objectContaining({ message: expect.stringContaining('admission is stale') }),
-      }),
-    ]);
+    expect(workflow.runs.has(run.runId)).toBe(false);
   });
 
   it('does not cancel after terminal lifecycle publication has committed its status', async () => {
@@ -695,6 +696,62 @@ describe('explicitly transient workflow lifecycle reads', () => {
     ).toEqual([]);
   });
 
+  it('isolates concurrent nested workflow runs inside a transient foreach', async () => {
+    const childRunIds: string[] = [];
+    let markFirstChildStarted!: () => void;
+    const firstChildStarted = new Promise<void>(resolve => {
+      markFirstChildStarted = resolve;
+    });
+    let releaseChildren!: () => void;
+    const childrenGate = new Promise<void>(resolve => {
+      releaseChildren = resolve;
+    });
+    const childStep = createStep({
+      id: 'nested-transient-foreach-child-step',
+      inputSchema: z.string(),
+      outputSchema: z.string(),
+      execute: async ({ inputData, runId }) => {
+        childRunIds.push(runId);
+        markFirstChildStarted();
+        await childrenGate;
+        return inputData.toUpperCase();
+      },
+    });
+    const child = createWorkflow({
+      id: 'nested-transient-foreach-child',
+      inputSchema: z.string(),
+      outputSchema: z.string(),
+      steps: [childStep],
+    })
+      .then(childStep)
+      .commit();
+    const parent = createWorkflow({
+      id: 'nested-transient-foreach-parent',
+      inputSchema: z.array(z.string()),
+      outputSchema: z.array(z.string()),
+      steps: [child],
+      options: { executionMode: 'transient' },
+    })
+      .foreach(child, { concurrency: 2 })
+      .commit();
+    new Mastra({ logger: false, workflows: { [parent.id]: parent } });
+
+    const run = await parent.createRun();
+    const resultPromise = run.start({ inputData: ['first', 'second'] });
+    await firstChildStarted;
+    // Give the sibling worker a turn while the first nested run is still active.
+    await new Promise(resolve => setTimeout(resolve, 0));
+    releaseChildren();
+
+    await expect(resultPromise).resolves.toMatchObject({
+      status: 'success',
+      result: ['FIRST', 'SECOND'],
+    });
+    expect(childRunIds).toHaveLength(2);
+    expect(new Set(childRunIds).size).toBe(2);
+    expect(child.runs.size).toBe(0);
+  });
+
   it('honors a transient child nested under a durable parent', async () => {
     const childStep = createStep({
       id: 'nested-own-transient-step',
@@ -876,6 +933,35 @@ describe('explicitly transient workflow lifecycle reads', () => {
     expect(run.transientExecution).toBe(false);
     expect(run.workflowRunStatus).toBe('canceled');
     expect(update).toHaveBeenCalled();
+  });
+
+  it('rejects when durable cancellation cannot be persisted', async () => {
+    const workflow = buildExplicitlyTransientWorkflow('explicit-transient-durable-cancel-write-failure');
+    const storage = new MockStore();
+    const pubsub = new EventEmitterPubSub();
+    new Mastra({ logger: false, storage, workflows: { [workflow.id]: workflow } });
+    const workflowsStore = (await storage.getStore('workflows'))!;
+    const update = vi.spyOn(workflowsStore, 'updateWorkflowState').mockRejectedValueOnce(new Error('storage offline'));
+    const publish = vi.spyOn(pubsub, 'publish');
+    const run = await workflow.createRun({ runId: 'durable-cancel-write-failure', pubsub });
+
+    await expect(run.cancel()).rejects.toThrow('storage offline');
+
+    expect(update).toHaveBeenCalledWith({
+      workflowName: workflow.id,
+      runId: run.runId,
+      opts: { status: 'canceled' },
+    });
+    expect(run.abortController.signal.aborted).toBe(true);
+    expect(run.workflowRunStatus).toBe('canceled');
+    await expect(
+      workflowsStore.loadWorkflowSnapshot({ workflowName: workflow.id, runId: run.runId }),
+    ).resolves.toMatchObject({ status: 'pending' });
+    expect(
+      publish.mock.calls.some(([, event]) =>
+        ['workflow.canceled', 'workflow.finished'].includes(String(event.data?.event?.type)),
+      ),
+    ).toBe(false);
   });
 
   it('preserves durable suspend and resume for an explicit run ID', async () => {

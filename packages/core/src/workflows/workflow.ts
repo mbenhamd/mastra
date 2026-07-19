@@ -2480,12 +2480,12 @@ export class Workflow<
       throw new Error(`Workflow run ${this.id}/${runIdToUse} cannot change execution mode`);
     }
 
-    // Return a new Run instance with object parameters. A transient handle can
-    // be replaced under the same ID before its stale start attempt fails, so
-    // its cleanup must retire only the cache slot it still owns.
-    let run = cachedRun;
-    if (!run) {
-      run = new Run({
+    // Return a new Run instance with object parameters. A handle can be
+    // replaced under the same ID before its stale operation settles, so each
+    // cleanup closure must retire only the cache slot owned by that exact
+    // instance.
+    const createRunHandle = (): Run<TEngineType, TSteps, TState, TInput, TOutput, TRequestContext> => {
+      const createdRun = new Run<TEngineType, TSteps, TState, TInput, TOutput, TRequestContext>({
         workflowId: this.id,
         stateSchema: this.stateSchema,
         inputSchema: this.inputSchema,
@@ -2499,7 +2499,7 @@ export class Workflow<
         serializedStepGraph: this.serializedStepGraph,
         disableScorers: options?.disableScorers,
         cleanup: () => {
-          if (this.#runs.get(runIdToUse) === run) {
+          if (this.#runs.get(runIdToUse) === createdRun) {
             this.#runs.delete(runIdToUse);
           }
         },
@@ -2516,7 +2516,10 @@ export class Workflow<
           options?.pubsub ??
           (transientExecution && isProcessorExecution ? transientProcessorPubSub : this.#mastra?.pubsub),
       });
-    }
+      return createdRun;
+    };
+
+    let run = cachedRun ?? createRunHandle();
 
     this.#runs.set(runIdToUse, run);
 
@@ -2543,6 +2546,16 @@ export class Workflow<
 
     // Check if run exists in persistent storage (not just in-memory)
     const existsInStorage = existingRun && !existingRun.isFromInMemory;
+
+    // A non-pending cached handle without a corresponding durable row belongs
+    // to an earlier storage binding (or to a deleted run). Reusing it would
+    // hydrate a fresh pending snapshot and then immediately mint a different
+    // generation at start admission. Replace the whole handle so stale stream,
+    // cancellation, and lifecycle state cannot leak into the new run.
+    if (cachedRun && !existsInStorage && shouldPersistSnapshot && cachedRun.workflowRunStatus !== 'pending') {
+      run = createRunHandle();
+      this.#runs.set(runIdToUse, run);
+    }
 
     // If a run exists in storage, update the run's status to reflect the actual state
     // This fixes the issue where createRun checks storage but doesn't use the stored data
@@ -2758,6 +2771,11 @@ export class Workflow<
     const nestedPubsub = useSharedPubsub ? pubsub : new EventEmitterPubSub();
     const inheritedTransientOptions: { [TRANSIENT_EXECUTION_SYMBOL]?: boolean } =
       inheritedTransientExecution === undefined ? {} : { [TRANSIENT_EXECUTION_SYMBOL]: inheritedTransientExecution };
+    // A transient nested invocation has no resume surface or durable identity to
+    // preserve. Give every invocation its own process-local run ID so concurrent
+    // foreach iterations cannot share one cached Run and reject each other at
+    // admission.
+    const nestedRunId = inheritedTransientExecution === true && !isResume ? randomUUID() : runId;
     let run = isResume
       ? await this.createRun({
           runId: resume.runId,
@@ -2766,7 +2784,7 @@ export class Workflow<
           ...inheritedTransientOptions,
         })
       : await this.createRun({
-          runId,
+          runId: nestedRunId,
           resourceId,
           pubsub: nestedPubsub,
           ...inheritedTransientOptions,
@@ -3671,20 +3689,16 @@ export class Run<
     this.abortController.abort();
     this.workflowRunStatus = 'canceled';
 
-    // Persist cancellation before best-effort lifecycle delivery. A transport
-    // outage must never leave a suspended or waiting run active in storage.
-    try {
-      await workflowsStore?.updateWorkflowState({
-        workflowName: this.workflowId,
-        runId: this.runId,
-        opts: {
-          status: 'canceled',
-        },
-      });
-    } catch {
-      // The abort signal and in-memory status remain authoritative when the
-      // storage adapter itself is unavailable.
-    }
+    // Persist cancellation before best-effort lifecycle delivery. The local
+    // abort remains set if this write fails, but cancel() must reject rather
+    // than advertise a terminal state that another process cannot observe.
+    await workflowsStore?.updateWorkflowState({
+      workflowName: this.workflowId,
+      runId: this.runId,
+      opts: {
+        status: 'canceled',
+      },
+    });
 
     const executionGeneration =
       snapshot?.executionGeneration ?? reservedExecutionGeneration ?? this.#executionGeneration;
@@ -3944,7 +3958,7 @@ export class Run<
       result.spanId = spanId;
       return result;
     } catch (error) {
-      if (this.transientExecution) {
+      if (this.transientExecution && !this.hasActiveLifecycleExecution(this.#executionGeneration)) {
         this.cleanup?.();
       }
       throw error;

@@ -370,6 +370,70 @@ describe('canonical workflow lifecycle model', () => {
     expect(records.at(-1)?.record.event).toMatchObject({ type: 'workflow.finished', status: 'success' });
   });
 
+  it('ends the workflow span before a terminal lifecycle publication failure escapes', async () => {
+    const pubsub = new EventEmitterPubSub();
+    const publish = pubsub.publish.bind(pubsub);
+    vi.spyOn(pubsub, 'publish').mockImplementation(async (topic, event, options) => {
+      if (topic.startsWith('workflow.lifecycle.v1.') && event.data?.event?.type === 'workflow.finished') {
+        throw new Error('terminal transport unavailable');
+      }
+      return publish(topic, event, options);
+    });
+    const step = createStep({
+      id: 'terminal-publication-step',
+      inputSchema: z.object({ value: z.number() }),
+      outputSchema: z.object({ value: z.number() }),
+      execute: async ({ inputData }) => inputData,
+    });
+    const workflow = createWorkflow({
+      id: 'terminal-publication-span',
+      inputSchema: z.object({ value: z.number() }),
+      outputSchema: z.object({ value: z.number() }),
+      steps: [step],
+    })
+      .then(step)
+      .commit();
+    new Mastra({ logger: false, workflows: { [workflow.id]: workflow } });
+
+    const stepSpan = {
+      id: 'step-span',
+      traceId: 'trace',
+      externalTraceId: 'trace',
+      createChildSpan: vi.fn(),
+      end: vi.fn(),
+      error: vi.fn(),
+      getParentSpanId: vi.fn(),
+    };
+    const endWorkflowSpan = vi.fn();
+    const workflowSpan = {
+      id: 'workflow-span',
+      traceId: 'trace',
+      externalTraceId: 'trace',
+      createChildSpan: vi.fn(() => stepSpan),
+      end: endWorkflowSpan,
+      error: vi.fn(),
+      getParentSpanId: vi.fn(),
+    };
+    const parentSpan = {
+      createChildSpan: vi.fn(() => workflowSpan),
+    };
+    const run = await workflow.createRun({ runId: 'terminal-publication-span-run', pubsub });
+
+    await expect(
+      run.start({
+        inputData: { value: 1 },
+        tracingContext: { currentSpan: parentSpan as never },
+      }),
+    ).rejects.toThrow('terminal transport unavailable');
+
+    expect(endWorkflowSpan).toHaveBeenCalledOnce();
+    expect(endWorkflowSpan).toHaveBeenCalledWith({
+      output: { value: 1 },
+      attributes: { status: 'success' },
+    });
+    expect(run.workflowRunStatus).toBe('success');
+  });
+
   it('emits explicit step and workflow failure terminals', async () => {
     const pubsub = new EventEmitterPubSub();
     const publish = vi.spyOn(pubsub, 'publish');
