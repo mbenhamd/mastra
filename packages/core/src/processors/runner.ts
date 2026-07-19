@@ -379,6 +379,22 @@ export class ProcessorRunner {
     return sendSignal;
   }
 
+  private takeNextReprocessPart<OUTPUT>(
+    processorStates: Map<string, ProcessorState<OUTPUT>>,
+  ): ChunkType<OUTPUT> | undefined {
+    for (const { processorOrWorkflow } of this.outputStreamProcessors) {
+      const state = processorStates.get(processorOrWorkflow.id);
+      if (!state) continue;
+      const custom = state.customState as Record<string, unknown>;
+      const stashed = custom[REPROCESS_PART_KEY];
+      if (stashed) {
+        delete custom[REPROCESS_PART_KEY];
+        return stashed as ChunkType<OUTPUT>;
+      }
+    }
+    return undefined;
+  }
+
   private async runComputeStateSignal({
     processor,
     messageList,
@@ -1054,6 +1070,11 @@ export class ProcessorRunner {
       return [];
     }
 
+    let next = this.takeNextReprocessPart(processorStates);
+    if (!next) {
+      return [];
+    }
+
     const results: Array<{
       part: ChunkType<OUTPUT> | null | undefined;
       blocked: boolean;
@@ -1062,23 +1083,9 @@ export class ProcessorRunner {
       processorId?: string;
     }> = [];
 
-    // Pull the next stashed part (if any) from processor states, in processor order.
-    const takeNext = (): ChunkType<OUTPUT> | undefined => {
-      for (const state of processorStates.values()) {
-        const custom = state.customState as Record<string, unknown>;
-        const stashed = custom[REPROCESS_PART_KEY];
-        if (stashed) {
-          delete custom[REPROCESS_PART_KEY];
-          return stashed as ChunkType<OUTPUT>;
-        }
-      }
-      return undefined;
-    };
-
     // Bound the loop defensively to avoid an infinite cycle if a processor were
     // to keep restashing the same part.
     let guard = 0;
-    let next = takeNext();
     while (next && guard++ < 1000) {
       const result = await this.processPart(
         next,
@@ -1093,7 +1100,7 @@ export class ProcessorRunner {
       if (result.blocked) {
         break;
       }
-      next = takeNext();
+      next = this.takeNextReprocessPart(processorStates);
     }
 
     return results;

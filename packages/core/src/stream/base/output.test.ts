@@ -102,6 +102,7 @@ describe('MastraModelOutput', () => {
     });
 
     try {
+      expect(output.processorRunner).toBeUndefined();
       await output.consumeStream();
       expect(processPart).not.toHaveBeenCalled();
     } finally {

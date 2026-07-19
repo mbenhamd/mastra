@@ -10,7 +10,7 @@ import type { ChunkType } from '../stream';
 import { ChunkFrom } from '../stream/types';
 import { createStep, createWorkflow } from '../workflows';
 import { setProcessorWorkflowPhases } from './is-processor-workflow';
-import { ProcessorRunner } from './runner';
+import { ProcessorRunner, ProcessorState } from './runner';
 import { ProcessorStepSchema } from './step-schema';
 import type { Processor, ProcessorWorkflow } from './index';
 
@@ -1236,6 +1236,29 @@ describe('ProcessorRunner', () => {
 
       const results = await runner.drainReprocessParts(processorStates);
       expect(results).toEqual([]);
+    });
+
+    it('does not scan unrelated processor states for reprocess parts', async () => {
+      runner = new ProcessorRunner({
+        inputProcessors: [{ id: 'input-only', processInput: async ({ messages }) => messages }],
+        outputProcessors: [{ id: 'stream-only', processOutputStream: async ({ part }) => part }],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+      const processorStates = new Map<string, ProcessorState>();
+      const unrelatedState = new ProcessorState();
+      unrelatedState.customState = new Proxy(
+        {},
+        {
+          get() {
+            throw new Error('unrelated state was scanned');
+          },
+        },
+      );
+      processorStates.set('input-only', unrelatedState);
+      await runner.processPart(makeTextDelta('primary'), processorStates);
+
+      await expect(runner.drainReprocessParts(processorStates)).resolves.toEqual([]);
     });
 
     it('stops draining and reports the blocked result when a reprocessed part is aborted', async () => {

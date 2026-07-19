@@ -219,21 +219,18 @@ export async function executeStep(
     executionContext,
   });
 
-  const operationId = `workflow.${workflowId}.run.${runId}.step.${step.id}.running_ev`;
   if (!suppressLifecycleEvents) {
     lifecycleStepState.stepAttempt += 1;
-  }
-  await engine.onStepExecutionStart({
-    step,
-    inputData,
-    pubsub,
-    executionContext,
-    stepCallId,
-    stepInfo,
-    operationId,
-    skipEmits: skipEmits || suppressLifecycleEvents,
-  });
-  if (!suppressLifecycleEvents) {
+    await engine.onStepExecutionStart({
+      step,
+      inputData,
+      pubsub,
+      executionContext,
+      stepCallId,
+      stepInfo,
+      operationId: `workflow.${workflowId}.run.${runId}.step.${step.id}.running_ev`,
+      skipEmits,
+    });
     await publishWorkflowLifecycleEvent({
       pubsub,
       workflowId,
@@ -327,12 +324,13 @@ export async function executeStep(
       }
 
       const stepResult = { ...stepInfo, ...workflowResult } as StepResult<any, any, any, any>;
-      const authoritativeDisposition = await engine.getAuthoritativeExecutionDisposition({
-        workflowId,
-        runId,
-        transientExecution: executionContext.transientExecution,
-        executionGeneration,
-      });
+      const authoritativeDisposition = executionContext.transientExecution
+        ? undefined
+        : await engine.getAuthoritativeExecutionDisposition({
+            workflowId,
+            runId,
+            executionGeneration,
+          });
       if (authoritativeDisposition) {
         delete executionContext.activeStepsPath[step.id];
         const canceledStepResult = {
@@ -643,12 +641,13 @@ export async function executeStep(
     execResults = { ...execResults, status: 'canceled', endedAt: Date.now() };
   }
 
-  const authoritativeDisposition = await engine.getAuthoritativeExecutionDisposition({
-    workflowId,
-    runId,
-    transientExecution: executionContext.transientExecution,
-    executionGeneration,
-  });
+  const authoritativeDisposition = executionContext.transientExecution
+    ? undefined
+    : await engine.getAuthoritativeExecutionDisposition({
+        workflowId,
+        runId,
+        executionGeneration,
+      });
   if (authoritativeDisposition) {
     // The durable terminal owner has already emitted its workflow terminal.
     // Convert the local result to a stop signal, but suppress this worker's

@@ -423,6 +423,10 @@ describe('explicitly transient workflow lifecycle reads', () => {
     const eventEmitterPublish = vi.spyOn(EventEmitterPubSub.prototype, 'publish');
     const parentDurableOperation = vi.spyOn((parent as any).executionEngine, 'wrapDurableOperation');
     const childDurableOperation = vi.spyOn((child as any).executionEngine, 'wrapDurableOperation');
+    const parentStepStart = vi.spyOn((parent as any).executionEngine, 'onStepExecutionStart');
+    const childStepStart = vi.spyOn((child as any).executionEngine, 'onStepExecutionStart');
+    const parentDisposition = vi.spyOn((parent as any).executionEngine, 'getAuthoritativeExecutionDisposition');
+    const childDisposition = vi.spyOn((child as any).executionEngine, 'getAuthoritativeExecutionDisposition');
 
     try {
       const run = await parent.createRun({ [PROCESSOR_EXECUTION_SYMBOL]: true });
@@ -434,6 +438,10 @@ describe('explicitly transient workflow lifecycle reads', () => {
           String(operationId).endsWith('.emit_result'),
         ),
       ).toEqual([]);
+      expect(parentStepStart).not.toHaveBeenCalled();
+      expect(childStepStart).not.toHaveBeenCalled();
+      expect(parentDisposition).not.toHaveBeenCalled();
+      expect(childDisposition).not.toHaveBeenCalled();
     } finally {
       eventEmitterPublish.mockRestore();
     }
