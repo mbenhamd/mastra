@@ -37,6 +37,7 @@ export const TERMINAL_BG_CHUNKS = new Set([
 // ---------------------------------------------------------------------------
 
 export interface ResolvedScope {
+  memory: MastraMemory | undefined;
   threadId: string | undefined;
   resourceId: string | undefined;
   scopeKey: string | null;
@@ -45,16 +46,16 @@ export interface ResolvedScope {
 /**
  * Resolve memory / thread / resource for this call, matching `#execute`
  * semantics (RequestContext-scoped keys override caller-supplied memory
- * args). Returns `null` when no memory backend is configured — caller
- * falls through to a plain stream in that case.
+ * args). The resolved value is returned even when it is `undefined` so the
+ * underlying first turn can reuse that result instead of invoking a dynamic
+ * memory factory again.
  */
 export async function resolveScope(
   agent: { getMemory: (opts?: any) => Promise<MastraMemory | undefined> },
   mergedOptions: Record<string, any>,
-): Promise<ResolvedScope | null> {
+): Promise<ResolvedScope> {
   const requestContext = (mergedOptions?.requestContext as RequestContext | undefined) ?? new RequestContext();
   const memory = await agent.getMemory({ requestContext });
-  if (!memory) return null;
 
   const threadIdFromContext = requestContext.get(MASTRA_THREAD_ID_KEY) as string | undefined;
   const resourceIdFromContext = requestContext.get(MASTRA_RESOURCE_ID_KEY) as string | undefined;
@@ -67,7 +68,7 @@ export async function resolveScope(
   const resourceId = resourceIdFromContext ?? (mergedOptions?.memory?.resource as string | undefined);
   const scopeKey = threadId || resourceId ? `${threadId ?? ''}|${resourceId ?? ''}` : null;
 
-  return { threadId, resourceId, scopeKey };
+  return { memory, threadId, resourceId, scopeKey };
 }
 
 // ---------------------------------------------------------------------------
@@ -239,7 +240,7 @@ export interface IdleLoopContext {
  * Generic idle-loop wrapper. Drives the full lifecycle:
  * 1. Merge options + resolve scope (early-return if no bgManager / no memory)
  * 2. Acquire stream slot
- * 3. Run first turn via `firstTurn(opts)`
+ * 3. Run first turn via `firstTurn(opts, memory, defaultOptions)`
  * 4. Subscribe to `bgManager.stream()` for bg-task events
  * 5. On terminal bg events, queue and process continuations via `streamForContinuation`
  * 6. Idle timer fires `forceClose` if nothing happens for `maxIdleMs`
@@ -266,7 +267,12 @@ export async function runIdleLoop<
   agent: TAgent,
   streamOptions: (Record<string, any> & { maxIdleMs?: number }) | undefined,
   deps: IdleLoopDeps,
-  firstTurn: (opts: Record<string, any>) => Promise<TFirstResult>,
+  firstTurn: (
+    opts: Record<string, any>,
+    memory: MastraMemory | undefined,
+    defaultOptions: Record<string, any>,
+    mergedOptions: Record<string, any>,
+  ) => Promise<TFirstResult>,
   streamForContinuation: (opts: Record<string, any>) => Promise<{ fullStream: ReadableStream<any> }>,
   buildResult: (first: TFirstResult, ctx: IdleLoopContext) => TReturn,
   hooks?: PostPipeHooks,
@@ -285,8 +291,11 @@ export async function runIdleLoop<
 
   // Without a background task manager or memory, there's no continuation to
   // orchestrate — fall through to the plain underlying call with no wrapping.
-  if (!deps.bgManager || !scope) {
-    return buildResult(await firstTurn(restStreamOptions as Record<string, any>), null!);
+  if (!deps.bgManager || !scope.memory) {
+    return buildResult(
+      await firstTurn(restStreamOptions as Record<string, any>, scope.memory, defaultOptions, mergedOptions),
+      null!,
+    );
   }
 
   const { threadId, resourceId, scopeKey } = scope;
@@ -487,7 +496,7 @@ export async function runIdleLoop<
   clearIdleTimer();
   let first: TFirstResult;
   try {
-    first = await firstTurn(initialStreamOpts);
+    first = await firstTurn(initialStreamOpts, scope.memory, defaultOptions, mergedOptions);
   } catch (err) {
     forceClose();
     throw err;

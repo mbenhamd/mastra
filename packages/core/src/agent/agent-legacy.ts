@@ -35,6 +35,7 @@ import type { ChunkType } from '../stream/types';
 import type { CoreTool, ToolHooks } from '../tools/types';
 import type { DynamicArgument } from '../types';
 import type { OutputWriter } from '../workflows';
+import type { ResolvedAgentMemory } from './execution-memory';
 import { MessageList } from './message-list';
 import type { MastraDBMessage, MessageListInput, UIMessageWithMetadata } from './message-list/index';
 import type {
@@ -113,6 +114,7 @@ export interface AgentLegacyCapabilities {
       memoryConfig?: MemoryConfigInternal;
       inputProcessors?: InputProcessorOrWorkflow[];
       hooks?: ToolHooks;
+      resolvedMemory?: ResolvedAgentMemory;
     } & ObservabilityContext,
   ): Promise<Record<string, CoreTool>>;
 
@@ -122,6 +124,7 @@ export interface AgentLegacyCapabilities {
       requestContext: RequestContext;
       messageList: MessageList;
       inputProcessorOverrides?: InputProcessorOrWorkflow[];
+      resolvedMemory?: ResolvedAgentMemory;
     } & ObservabilityContext,
   ): Promise<{
     messageList: MessageList;
@@ -148,6 +151,7 @@ export interface AgentLegacyCapabilities {
       backgroundTaskEnabled?: boolean;
       providerOptions?: ProviderOptions;
       hooks?: ToolHooks;
+      resolvedMemory?: ResolvedAgentMemory;
     },
   ): Promise<{
     messageList: MessageList;
@@ -196,13 +200,18 @@ export interface AgentLegacyCapabilities {
   /** Agent network append flag */
   _agentNetworkAppend?: boolean;
   /** List resolved output processors */
-  listResolvedOutputProcessors(requestContext?: RequestContext): Promise<OutputProcessorOrWorkflow[]>;
+  listResolvedOutputProcessors(
+    requestContext?: RequestContext,
+    configuredProcessorOverrides?: OutputProcessorOrWorkflow[],
+    resolvedMemory?: ResolvedAgentMemory,
+  ): Promise<OutputProcessorOrWorkflow[]>;
   /** Run output processors */
   __runOutputProcessors(
     args: {
       requestContext: RequestContext;
       messageList: MessageList;
       outputProcessorOverrides?: OutputProcessorOrWorkflow[];
+      resolvedMemory?: ResolvedAgentMemory;
     } & ObservabilityContext,
   ): Promise<{
     messageList: MessageList;
@@ -256,6 +265,7 @@ export class AgentLegacyHandler {
     inputProcessors,
     providerOptions,
     hooks,
+    resolveMemory,
     ...rest
   }: {
     instructions: AgentInstructions;
@@ -274,6 +284,7 @@ export class AgentLegacyHandler {
     inputProcessors?: InputProcessorOrWorkflow[];
     providerOptions?: ProviderOptions;
     hooks?: ToolHooks;
+    resolveMemory: () => Promise<ResolvedAgentMemory>;
   } & Partial<ObservabilityContext>) {
     const observabilityContext = resolveObservabilityContext(rest);
     return {
@@ -309,7 +320,14 @@ export class AgentLegacyHandler {
 
         const innerObservabilityContext = createObservabilityContext({ currentSpan: agentSpan });
 
-        const memory = await this.capabilities.getMemory({ requestContext });
+        let resolvedMemory: ResolvedAgentMemory;
+        try {
+          resolvedMemory = await resolveMemory();
+        } catch (error) {
+          agentSpan?.error({ error: error as Error, endSpan: true });
+          throw error;
+        }
+        const memory = resolvedMemory.value;
 
         const threadId = thread?.id;
 
@@ -326,6 +344,7 @@ export class AgentLegacyHandler {
           memoryConfig,
           inputProcessors,
           hooks,
+          resolvedMemory,
         });
 
         let messageList = new MessageList({
@@ -345,6 +364,7 @@ export class AgentLegacyHandler {
             ...innerObservabilityContext,
             messageList,
             inputProcessorOverrides: inputProcessors,
+            resolvedMemory,
           });
           // Run processInputStep for step 0 (legacy path compatibility)
           if (!tripwire) {
@@ -360,6 +380,7 @@ export class AgentLegacyHandler {
               threadId,
               resourceId,
               hooks,
+              resolvedMemory,
             });
             if (inputStepResult.tools) {
               convertedTools = inputStepResult.tools;
@@ -448,6 +469,7 @@ export class AgentLegacyHandler {
           ...innerObservabilityContext,
           messageList,
           inputProcessorOverrides: inputProcessors,
+          resolvedMemory,
         });
         messageList = processedMessageList;
 
@@ -468,6 +490,7 @@ export class AgentLegacyHandler {
             threadId,
             resourceId,
             hooks,
+            resolvedMemory,
           });
           if (inputStepResult.tools) {
             convertedTools = inputStepResult.tools;
@@ -551,7 +574,8 @@ export class AgentLegacyHandler {
         });
 
         // re-read the latest thread so metadata written mid-run (working memory, processors) isn't overwritten
-        const memory = await this.capabilities.getMemory({ requestContext });
+        const resolvedMemory = await resolveMemory();
+        const memory = resolvedMemory.value;
         const thread = (threadId ? await memory?.getThreadById({ threadId }) : undefined) ?? threadAfter;
 
         if (memory && resourceId && thread) {
@@ -756,6 +780,7 @@ export class AgentLegacyHandler {
       };
     }>;
     llm: MastraLLMV1;
+    resolveMemory: () => Promise<ResolvedAgentMemory>;
   }> {
     const {
       context,
@@ -811,7 +836,35 @@ export class AgentLegacyHandler {
       model: (args as { model?: DynamicArgument<MastraModelConfig> }).model,
     });
 
-    const memory = await this.capabilities.getMemory({ requestContext });
+    const specificationVersion = llm.getModel().specificationVersion;
+    if (specificationVersion !== 'v1') {
+      const legacyMethod = methodType === 'generate' ? 'generateLegacy' : 'streamLegacy';
+      this.capabilities.logger.error(
+        `Models with specificationVersion "${specificationVersion}" are not supported for ${legacyMethod}. Please use ${methodType}() instead.`,
+        {
+          modelId: llm.getModel().modelId,
+          specificationVersion,
+        },
+      );
+      throw new MastraError({
+        id: methodType === 'generate' ? 'AGENT_GENERATE_V2_MODEL_NOT_SUPPORTED' : 'AGENT_STREAM_V2_MODEL_NOT_SUPPORTED',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        details: {
+          modelId: llm.getModel().modelId,
+          specificationVersion,
+        },
+        text: `Models with specificationVersion "${specificationVersion}" are not supported for ${legacyMethod}(). Please use ${methodType}() instead.`,
+      });
+    }
+
+    let resolvedMemoryPromise: Promise<ResolvedAgentMemory> | undefined;
+    const resolveMemory = () => {
+      resolvedMemoryPromise ??= Promise.resolve(this.capabilities.getMemory({ requestContext })).then(value => ({
+        value,
+      }));
+      return resolvedMemoryPromise;
+    };
 
     const { before, after } = this.__primitive({
       messages,
@@ -830,6 +883,7 @@ export class AgentLegacyHandler {
       inputProcessors,
       providerOptions: args.providerOptions,
       hooks,
+      resolveMemory,
       ...resolveObservabilityContext(args as Partial<ObservabilityContext>),
     });
 
@@ -840,8 +894,10 @@ export class AgentLegacyHandler {
 
     return {
       llm: llm as MastraLLMV1,
+      resolveMemory,
       before: async () => {
         const beforeResult = await before();
+        const memory = (await resolveMemory()).value;
         const { messageObjects, convertedTools, agentSpan } = beforeResult;
         threadExists = beforeResult.threadExists || false;
         threadCreatedByStep = false;
@@ -969,32 +1025,15 @@ export class AgentLegacyHandler {
       await this.capabilities.assertAgentExecutionPreflight(mergedGenerateOptions.requestContext);
     }
 
-    const { llm, before, after } = await this.prepareLLMOptions(messages, mergedGenerateOptions as any, 'generate');
-
-    if (llm.getModel().specificationVersion !== 'v1') {
-      const specVersion = llm.getModel().specificationVersion;
-      this.capabilities.logger.error(
-        `Models with specificationVersion "${specVersion}" are not supported for generateLegacy. Please use generate() instead.`,
-        {
-          modelId: llm.getModel().modelId,
-          specificationVersion: specVersion,
-        },
-      );
-
-      throw new MastraError({
-        id: 'AGENT_GENERATE_V2_MODEL_NOT_SUPPORTED',
-        domain: ErrorDomain.AGENT,
-        category: ErrorCategory.USER,
-        details: {
-          modelId: llm.getModel().modelId,
-          specificationVersion: specVersion,
-        },
-        text: `Models with specificationVersion "${specVersion}" are not supported for generateLegacy(). Please use generate() instead.`,
-      });
-    }
+    const { llm, before, after, resolveMemory } = await this.prepareLLMOptions(
+      messages,
+      mergedGenerateOptions as any,
+      'generate',
+    );
 
     const llmToUse = llm as MastraLLMV1;
     const beforeResult = await before();
+    const resolvedMemory = await resolveMemory();
     const { messageList, requestContext: contextWithMemory } = beforeResult;
     const traceId = beforeResult.agentSpan?.externalTraceId;
     const spanId = beforeResult.agentSpan?.id;
@@ -1072,6 +1111,7 @@ export class AgentLegacyHandler {
         ...observabilityContext,
         outputProcessorOverrides: finalOutputProcessors,
         messageList, // Use the full message list with complete conversation history
+        resolvedMemory,
       });
 
       // Handle tripwire for output processors
@@ -1202,6 +1242,7 @@ export class AgentLegacyHandler {
       requestContext: contextWithMemory || new RequestContext(),
       ...observabilityContext,
       messageList, // Use the full message list with complete conversation history
+      resolvedMemory,
     });
 
     // Handle tripwire for output processors
@@ -1321,31 +1362,14 @@ export class AgentLegacyHandler {
       await this.capabilities.assertAgentExecutionPreflight(mergedStreamOptions.requestContext);
     }
 
-    const { llm, before, after } = await this.prepareLLMOptions(messages, mergedStreamOptions as any, 'stream');
-
-    if (llm.getModel().specificationVersion !== 'v1') {
-      const specVersion = llm.getModel().specificationVersion;
-      this.capabilities.logger.error(
-        `Models with specificationVersion "${specVersion}" are not supported for streamLegacy. Please use stream() instead.`,
-        {
-          modelId: llm.getModel().modelId,
-          specificationVersion: specVersion,
-        },
-      );
-
-      throw new MastraError({
-        id: 'AGENT_STREAM_V2_MODEL_NOT_SUPPORTED',
-        domain: ErrorDomain.AGENT,
-        category: ErrorCategory.USER,
-        details: {
-          modelId: llm.getModel().modelId,
-          specificationVersion: specVersion,
-        },
-        text: `Models with specificationVersion "${specVersion}" are not supported for streamLegacy(). Please use stream() instead.`,
-      });
-    }
+    const { llm, before, after, resolveMemory } = await this.prepareLLMOptions(
+      messages,
+      mergedStreamOptions as any,
+      'stream',
+    );
 
     const beforeResult = await before();
+    const resolvedMemory = await resolveMemory();
     const traceId = beforeResult.agentSpan?.externalTraceId;
     const spanId = beforeResult.agentSpan?.id;
 
@@ -1434,7 +1458,11 @@ export class AgentLegacyHandler {
         experimental_output,
         ...observabilityContext,
         requestContext,
-        outputProcessors: await this.capabilities.listResolvedOutputProcessors(requestContext),
+        outputProcessors: await this.capabilities.listResolvedOutputProcessors(
+          requestContext,
+          undefined,
+          resolvedMemory,
+        ),
         onFinish: async result => {
           try {
             messageList.add(result.response.messages, 'response');
@@ -1444,6 +1472,7 @@ export class AgentLegacyHandler {
               requestContext,
               ...observabilityContext,
               messageList,
+              resolvedMemory,
             });
 
             // End agent span with tripwire details if output processor aborted
@@ -1522,6 +1551,7 @@ export class AgentLegacyHandler {
             requestContext,
             ...observabilityContext,
             messageList,
+            resolvedMemory,
           });
 
           // End agent span with tripwire details if output processor aborted
