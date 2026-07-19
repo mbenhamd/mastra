@@ -9,7 +9,7 @@ import type { MastraMemory } from '../../../../memory/memory';
 import type { MemoryConfig } from '../../../../memory/types';
 import type { ExportedSpan, SpanType } from '../../../../observability';
 import type { ProcessorState } from '../../../../processors';
-import { ProcessorRunner } from '../../../../processors/runner';
+import { ProcessorRunner, outputProcessorsSupportStream } from '../../../../processors/runner';
 import type { ChunkType } from '../../../../stream/types';
 import { ChunkFrom } from '../../../../stream/types';
 import { findProviderToolByName } from '../../../../tools/provider-tool-utils';
@@ -149,7 +149,7 @@ async function processChunkThroughOutputProcessors(
   logger: any,
   messageList?: MessageList,
 ): Promise<ChunkType | null> {
-  if (!registryEntry?.outputProcessors?.length || !registryEntry.processorStates) {
+  if (!outputProcessorsSupportStream(registryEntry?.outputProcessors) || !registryEntry?.processorStates) {
     return chunk;
   }
 

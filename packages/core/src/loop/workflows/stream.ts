@@ -5,7 +5,7 @@ import { readToolSurfaceFence } from '../../agent/tool-surface-fence';
 import { getErrorFromUnknown } from '../../error';
 import { ConsoleLogger } from '../../logger';
 import { createObservabilityContext } from '../../observability';
-import { ProcessorRunner } from '../../processors/runner';
+import { ProcessorRunner, outputProcessorsSupportStream } from '../../processors/runner';
 import type { ProcessorState } from '../../processors/runner';
 import { RequestContext } from '../../request-context';
 import { safeClose, safeEnqueue } from '../../stream/base';
@@ -43,11 +43,11 @@ export function workflowLoopStream<Tools extends ToolSet = ToolSet, OUTPUT = und
       // Share the loop's processorStates map so these chunks see the same per-processor state
       // that the main model-output stream path populates; otherwise the runner would build an
       // isolated empty state map and break state continuity across the step lifecycle.
-      const hasOutputProcessors = rest.outputProcessors && rest.outputProcessors.length > 0;
-      const dataChunkProcessorStates = hasOutputProcessors
+      const hasOutputStreamProcessors = outputProcessorsSupportStream(rest.outputProcessors);
+      const dataChunkProcessorStates = hasOutputStreamProcessors
         ? (rest.processorStates ?? new Map<string, ProcessorState>())
         : undefined;
-      const dataChunkProcessorRunner = hasOutputProcessors
+      const dataChunkProcessorRunner = hasOutputStreamProcessors
         ? new ProcessorRunner({
             outputProcessors: rest.outputProcessors,
             logger: rest.logger || new ConsoleLogger({ level: 'error' }),

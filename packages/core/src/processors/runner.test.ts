@@ -53,6 +53,43 @@ describe('ProcessorRunner', () => {
   });
 
   describe('Input Processors', () => {
+    it.each([
+      ['array', false],
+      ['object', true],
+    ] as const)('reconciles a long direct input %s result in one batch', async (_shape, asObject) => {
+      const originals = Array.from({ length: 50 }, (_, index) => createMessage(`original input ${index}`));
+      const replacements = originals.map((message, index) => ({
+        ...message,
+        content: { ...message.content, parts: [{ type: 'text' as const, text: `replacement input ${index}` }] },
+      }));
+      runner = new ProcessorRunner({
+        inputProcessors: [
+          {
+            id: 'bulk-input-processor',
+            processInput: async () => (asObject ? { messages: replacements, systemMessages: [] } : replacements),
+          },
+        ],
+        outputProcessors: [],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+      messageList.add(originals, 'input', { merge: false });
+      const replaceMessages = vi.spyOn(messageList, 'replaceMessagesForProcessor');
+      const add = vi.spyOn(messageList, 'add');
+      const sort = vi.spyOn(Array.prototype, 'sort');
+
+      try {
+        await runner.runInputProcessors(messageList);
+
+        expect(replaceMessages).toHaveBeenCalledTimes(1);
+        expect(add).not.toHaveBeenCalled();
+        expect(sort).not.toHaveBeenCalled();
+        expect(messageList.get.input.db()).toEqual(replacements);
+      } finally {
+        sort.mockRestore();
+      }
+    });
+
     it('should run input processors in order', async () => {
       const executionOrder: string[] = [];
       const inputProcessors: Processor[] = [
@@ -518,6 +555,40 @@ describe('ProcessorRunner', () => {
   });
 
   describe('Output Processors', () => {
+    it('reconciles a long direct output-result history in one batch', async () => {
+      const originals = Array.from({ length: 50 }, (_, index) => createMessage(`original ${index}`, 'assistant'));
+      const replacements = originals.map((message, index) => ({
+        ...message,
+        content: { ...message.content, parts: [{ type: 'text' as const, text: `replacement ${index}` }] },
+      }));
+      runner = new ProcessorRunner({
+        inputProcessors: [],
+        outputProcessors: [
+          {
+            id: 'bulk-output-result-processor',
+            processOutputResult: async () => replacements,
+          },
+        ],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+      messageList.add(originals, 'response', { merge: false });
+      const replaceMessages = vi.spyOn(messageList, 'replaceMessagesForProcessor');
+      const add = vi.spyOn(messageList, 'add');
+      const sort = vi.spyOn(Array.prototype, 'sort');
+
+      try {
+        await runner.runOutputProcessors(messageList);
+
+        expect(replaceMessages).toHaveBeenCalledTimes(1);
+        expect(add).not.toHaveBeenCalled();
+        expect(sort).not.toHaveBeenCalled();
+        expect(messageList.get.response.db()).toEqual(replacements);
+      } finally {
+        sort.mockRestore();
+      }
+    });
+
     it('should run output processors in order', async () => {
       const outputProcessors: Processor[] = [
         {
@@ -654,6 +725,26 @@ describe('ProcessorRunner', () => {
   });
 
   describe('Stream Processing', () => {
+    it('bypasses the processor chain when every output processor is final-only', async () => {
+      runner = new ProcessorRunner({
+        inputProcessors: [],
+        outputProcessors: [{ id: 'final-only', processOutputResult: async ({ messages }) => messages }],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+      const entries = vi.spyOn(runner.outputProcessors, 'entries');
+      const part = {
+        type: 'text-delta' as const,
+        payload: { text: 'unchanged', id: 'text-1' },
+        runId: '1',
+        from: ChunkFrom.AGENT,
+      };
+
+      await expect(runner.processPart(part, new Map())).resolves.toEqual({ part, blocked: false });
+      await expect(runner.drainReprocessParts(new Map())).resolves.toEqual([]);
+      expect(entries).not.toHaveBeenCalled();
+    });
+
     it('should process text chunks through output processors', async () => {
       const outputProcessors: Processor[] = [
         {
@@ -4198,6 +4289,7 @@ describe('ProcessorRunner', () => {
     });
 
     it('preserves in-place message mutations when workflow output only passes through stale input', async () => {
+      const remembered = createMessage('remembered input');
       const original = createMessage('sensitive result', 'assistant');
       const redacted = {
         ...original,
@@ -4230,11 +4322,13 @@ describe('ProcessorRunner', () => {
         logger: mockLogger,
         agentName: 'test-agent',
       });
+      messageList.add(remembered, 'memory', { merge: false });
       messageList.add(original, 'response');
 
       await runner.runOutputProcessors(messageList);
 
       expect(messageList.get.response.db()).toEqual([redacted]);
+      expect(messageList.get.all.db()).toEqual([remembered, redacted]);
     });
 
     it('does not replay workflow message results already applied by processor steps', async () => {
@@ -4275,6 +4369,74 @@ describe('ProcessorRunner', () => {
       } finally {
         applyMessages.mockRestore();
       }
+    });
+
+    it('does not replay an unchanged live MessageList result over remembered output history', async () => {
+      const processor: Processor = {
+        id: 'return-live-output-message-list',
+        processOutputResult: async ({ messageList: receivedMessageList }) => receivedMessageList,
+      };
+      const workflow = setProcessorWorkflowPhases(
+        createWorkflow({
+          id: 'live-output-message-list-workflow',
+          inputSchema: ProcessorStepSchema,
+          outputSchema: ProcessorStepSchema,
+          options: { validateInputs: false },
+        })
+          .then(createStep(processor))
+          .commit() as unknown as ProcessorWorkflow,
+        ['outputResult'],
+      );
+      runner = new ProcessorRunner({
+        inputProcessors: [],
+        outputProcessors: [workflow],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+      const remembered = createMessage('remembered input');
+      const response = createMessage('response', 'assistant');
+      messageList.add(remembered, 'memory', { merge: false });
+      messageList.add(response, 'response', { merge: false });
+      const replaceMessages = vi.spyOn(messageList, 'replaceMessagesForProcessor');
+
+      await runner.runOutputProcessors(messageList);
+
+      expect(replaceMessages).not.toHaveBeenCalled();
+      expect(messageList.get.all.db()).toEqual([remembered, response]);
+    });
+
+    it('does not replay an unchanged live MessageList result over response history during input processing', async () => {
+      const processor: Processor = {
+        id: 'return-live-input-message-list',
+        processInput: async ({ messageList: receivedMessageList }) => receivedMessageList,
+      };
+      const workflow = setProcessorWorkflowPhases(
+        createWorkflow({
+          id: 'live-input-message-list-workflow',
+          inputSchema: ProcessorStepSchema,
+          outputSchema: ProcessorStepSchema,
+          options: { validateInputs: false },
+        })
+          .then(createStep(processor))
+          .commit() as unknown as ProcessorWorkflow,
+        ['input'],
+      );
+      runner = new ProcessorRunner({
+        inputProcessors: [workflow],
+        outputProcessors: [],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+      const input = createMessage('input');
+      const priorResponse = createMessage('prior response', 'assistant');
+      messageList.add(input, 'input', { merge: false });
+      messageList.add(priorResponse, 'response', { merge: false });
+      const replaceMessages = vi.spyOn(messageList, 'replaceMessagesForProcessor');
+
+      await runner.runInputProcessors(messageList);
+
+      expect(replaceMessages).not.toHaveBeenCalled();
+      expect(messageList.get.all.db()).toEqual([input, priorResponse]);
     });
 
     it('does not replay workflow system messages already applied by processor steps', async () => {

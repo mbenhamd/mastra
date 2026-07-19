@@ -121,12 +121,14 @@ describe('explicitly transient workflow lifecycle reads', () => {
       workflows: { [workflow.id]: workflow },
     });
     const publish = vi.spyOn(configuredPubsub, 'publish');
+    const persistStepUpdate = vi.spyOn((workflow as any).executionEngine, 'persistStepUpdate');
 
     const run = await workflow.createRun({ [PROCESSOR_EXECUTION_SYMBOL]: true });
     await run.start({ inputData: { value: 'local' } });
 
     expect(run.transientExecution).toBe(true);
     expect(publish).not.toHaveBeenCalled();
+    expect(persistStepUpdate).not.toHaveBeenCalled();
   });
 
   it('rejects an evented child inherited by a transient parent before durable admission', async () => {
@@ -203,27 +205,28 @@ describe('explicitly transient workflow lifecycle reads', () => {
     const update = vi.spyOn(workflowsStore, 'updateWorkflowState');
     const persist = vi.spyOn(workflowsStore, 'persistWorkflowSnapshot');
 
-    let markTerminalPersisted!: () => void;
-    const terminalPersisted = new Promise<void>(resolve => {
-      markTerminalPersisted = resolve;
+    let markTerminalFormatted!: () => void;
+    const terminalFormatted = new Promise<void>(resolve => {
+      markTerminalFormatted = resolve;
     });
     let releaseFinalization!: () => void;
     const finalizationGate = new Promise<void>(resolve => {
       releaseFinalization = resolve;
     });
     const executionEngine = (workflow as any).executionEngine;
-    const persistStepUpdate = executionEngine.persistStepUpdate.bind(executionEngine);
-    vi.spyOn(executionEngine, 'persistStepUpdate').mockImplementation(async (params: any) => {
-      await persistStepUpdate(params);
-      if (params.workflowStatus === 'success') {
-        markTerminalPersisted();
+    const fmtReturnValue = executionEngine.fmtReturnValue.bind(executionEngine);
+    vi.spyOn(executionEngine, 'fmtReturnValue').mockImplementation(async (...args: any[]) => {
+      const result = await fmtReturnValue(...args);
+      if (result.status === 'success') {
+        markTerminalFormatted();
         await finalizationGate;
       }
+      return result;
     });
 
     const run = await workflow.createRun();
     const resultPromise = run.start({ inputData: { value: 'cancel-during-finalization' } });
-    await terminalPersisted;
+    await terminalFormatted;
     await run.cancel();
     releaseFinalization();
 

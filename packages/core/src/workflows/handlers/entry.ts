@@ -656,16 +656,18 @@ export async function executeEntry(
       startedAt,
     };
     executionContext.activeStepsPath[entry.id] = executionContext.executionPath;
-    await engine.persistStepUpdate({
-      workflowId,
-      runId,
-      resourceId,
-      serializedStepGraph,
-      stepResults,
-      executionContext,
-      workflowStatus: 'waiting',
-      requestContext,
-    });
+    if (!executionContext.transientExecution) {
+      await engine.persistStepUpdate({
+        workflowId,
+        runId,
+        resourceId,
+        serializedStepGraph,
+        stepResults,
+        executionContext,
+        workflowStatus: 'waiting',
+        requestContext,
+      });
+    }
 
     await engine.executeSleep({
       workflowId,
@@ -686,16 +688,18 @@ export async function executeEntry(
 
     delete executionContext.activeStepsPath[entry.id];
 
-    await engine.persistStepUpdate({
-      workflowId,
-      runId,
-      resourceId,
-      serializedStepGraph,
-      stepResults,
-      executionContext,
-      workflowStatus: 'running',
-      requestContext,
-    });
+    if (!executionContext.transientExecution) {
+      await engine.persistStepUpdate({
+        workflowId,
+        runId,
+        resourceId,
+        serializedStepGraph,
+        stepResults,
+        executionContext,
+        workflowStatus: 'running',
+        requestContext,
+      });
+    }
 
     const endedAt = Date.now();
     const stepInfo = {
@@ -761,16 +765,18 @@ export async function executeEntry(
     };
     executionContext.activeStepsPath[entry.id] = executionContext.executionPath;
 
-    await engine.persistStepUpdate({
-      workflowId,
-      runId,
-      resourceId,
-      serializedStepGraph,
-      stepResults,
-      executionContext,
-      workflowStatus: 'waiting',
-      requestContext,
-    });
+    if (!executionContext.transientExecution) {
+      await engine.persistStepUpdate({
+        workflowId,
+        runId,
+        resourceId,
+        serializedStepGraph,
+        stepResults,
+        executionContext,
+        workflowStatus: 'waiting',
+        requestContext,
+      });
+    }
 
     await engine.executeSleepUntil({
       workflowId,
@@ -791,16 +797,18 @@ export async function executeEntry(
 
     delete executionContext.activeStepsPath[entry.id];
 
-    await engine.persistStepUpdate({
-      workflowId,
-      runId,
-      resourceId,
-      serializedStepGraph,
-      stepResults,
-      executionContext,
-      workflowStatus: 'running',
-      requestContext,
-    });
+    if (!executionContext.transientExecution) {
+      await engine.persistStepUpdate({
+        workflowId,
+        runId,
+        resourceId,
+        serializedStepGraph,
+        stepResults,
+        executionContext,
+        workflowStatus: 'running',
+        requestContext,
+      });
+    }
 
     const endedAt = Date.now();
     const stepInfo = {
@@ -850,16 +858,18 @@ export async function executeEntry(
     execResults = { ...execResults, status: 'canceled' };
   }
 
-  await engine.persistStepUpdate({
-    workflowId,
-    runId,
-    resourceId,
-    serializedStepGraph,
-    stepResults,
-    executionContext,
-    workflowStatus: execResults.status === 'success' ? 'running' : execResults.status,
-    requestContext,
-  });
+  if (!executionContext.transientExecution) {
+    await engine.persistStepUpdate({
+      workflowId,
+      runId,
+      resourceId,
+      serializedStepGraph,
+      stepResults,
+      executionContext,
+      workflowStatus: execResults.status === 'success' ? 'running' : execResults.status,
+      requestContext,
+    });
+  }
 
   if (execResults.status === 'canceled') {
     await pubsub.publish(`workflow.events.v2.${runId}`, {

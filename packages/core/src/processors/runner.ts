@@ -72,6 +72,16 @@ async function invokeOnViolation(processor: Processor, error: TripWire): Promise
   }
 }
 
+export function outputProcessorsSupportStream(outputProcessors: readonly ProcessorOrWorkflow[] | undefined): boolean {
+  return Boolean(
+    outputProcessors?.some(processorOrWorkflow =>
+      isProcessorWorkflow(processorOrWorkflow)
+        ? processorWorkflowSupportsPhase(processorOrWorkflow, 'outputStream')
+        : Boolean(processorOrWorkflow.processOutputStream),
+    ),
+  );
+}
+
 /**
  * Implementation of processor state management
  */
@@ -313,11 +323,7 @@ export class ProcessorRunner {
     this.inputProcessors = inputProcessors ?? [];
     this.outputProcessors = outputProcessors ?? [];
     this.errorProcessors = errorProcessors ?? [];
-    this.hasOutputStreamProcessors = this.outputProcessors.some(processorOrWorkflow =>
-      isProcessorWorkflow(processorOrWorkflow)
-        ? processorWorkflowSupportsPhase(processorOrWorkflow, 'outputStream')
-        : Boolean(processorOrWorkflow.processOutputStream),
-    );
+    this.hasOutputStreamProcessors = outputProcessorsSupportStream(this.outputProcessors);
     this.logger = logger;
     this.agentName = agentName;
     this.agent = agent;
@@ -770,17 +776,14 @@ export class ProcessorRunner {
             processableMessages = processResult.get.response.db();
           }
         } else if (Array.isArray(processResult)) {
-          const deletedIds = idsBeforeProcessing.filter(
-            (i: string) => !processResult.some((m: MastraDBMessage) => m.id === i),
+          ProcessorRunner.applyMessagesToMessageList(
+            processResult,
+            messageList,
+            idsBeforeProcessing,
+            check,
+            'response',
           );
-          if (deletedIds.length) {
-            messageList.removeByIds(deletedIds);
-          }
           processableMessages = processResult;
-          for (const message of processResult) {
-            messageList.removeByIds([message.id]);
-            messageList.add(message, check.getSource(message) || 'response', { merge: false });
-          }
         } else if (mutations.length > 0) {
           // Match the workflow adapter: unsupported return shapes do not replace
           // messages, but in-place MessageList mutations remain authoritative.
@@ -843,7 +846,7 @@ export class ProcessorRunner {
     tripwireOptions?: TripWireOptions<unknown>;
     processorId?: string;
   }> {
-    if (!this.outputProcessors.length) {
+    if (!this.hasOutputStreamProcessors) {
       return { part, blocked: false };
     }
 
@@ -1038,6 +1041,10 @@ export class ProcessorRunner {
       processorId?: string;
     }>
   > {
+    if (!this.hasOutputStreamProcessors) {
+      return [];
+    }
+
     const results: Array<{
       part: ChunkType<OUTPUT> | null | undefined;
       blocked: boolean;
@@ -1317,34 +1324,8 @@ export class ProcessorRunner {
 
           messageList.replaceAllSystemMessages(result.systemMessages);
 
-          // Handle regular messages
-          const regularMessages = result.messages;
-          if (regularMessages) {
-            const deletedIds = inputIds.filter(i => !regularMessages.some(m => m.id === i));
-            if (deletedIds.length) {
-              messageList.removeByIds(deletedIds);
-            }
-
-            // Separate any new system messages from other messages (backward compat)
-            const newSystemMessages = regularMessages.filter(m => m.role === 'system');
-            const nonSystemMessages = regularMessages.filter(m => m.role !== 'system');
-
-            // Add any new system messages from the messages array
-            for (const sysMsg of newSystemMessages) {
-              const systemText =
-                (sysMsg.content.content as string | undefined) ??
-                sysMsg.content.parts?.map(p => (p.type === 'text' ? p.text : '')).join('\n') ??
-                '';
-              messageList.addSystem(systemText);
-            }
-
-            // Add non-system messages normally
-            if (nonSystemMessages.length > 0) {
-              for (const message of nonSystemMessages) {
-                messageList.removeByIds([message.id]);
-                messageList.add(message, check.getSource(message) || 'input', { merge: false });
-              }
-            }
+          if (result.messages) {
+            ProcessorRunner.applyMessagesToMessageList(result.messages, messageList, inputIds, check, 'input');
           }
 
           processableMessages = messageList.get.input.db();
@@ -1352,37 +1333,10 @@ export class ProcessorRunner {
           // Processor returned an array - stop recording before clear/add (that's just internal plumbing)
           mutations = messageList.stopRecording();
 
-          if (result) {
-            // Clear and re-add since processor worked with array. clear all messages, the new result array is all messages in the list (new input but also any messages added by other processors, memory for ex)
-            const deletedIds = inputIds.filter(i => !result.some(m => m.id === i));
-            if (deletedIds.length) {
-              messageList.removeByIds(deletedIds);
-            }
+          ProcessorRunner.applyMessagesToMessageList(result, messageList, inputIds, check, 'input');
 
-            // Separate system messages from other messages since they need different handling
-            const systemMessages = result.filter(m => m.role === 'system');
-            const nonSystemMessages = result.filter(m => m.role !== 'system');
-
-            // Add system messages using addSystem
-            for (const sysMsg of systemMessages) {
-              const systemText =
-                (sysMsg.content.content as string | undefined) ??
-                sysMsg.content.parts?.map(p => (p.type === 'text' ? p.text : '')).join('\n') ??
-                '';
-              messageList.addSystem(systemText);
-            }
-
-            // Add non-system messages normally
-            if (nonSystemMessages.length > 0) {
-              for (const message of nonSystemMessages) {
-                messageList.removeByIds([message.id]);
-                messageList.add(message, check.getSource(message) || 'input', { merge: false });
-              }
-            }
-
-            // Use messageList.get.input.db() for consistency with MessageList return type
-            processableMessages = messageList.get.input.db();
-          }
+          // Use messageList.get.input.db() for consistency with MessageList return type
+          processableMessages = messageList.get.input.db();
         } else {
           // Match the workflow adapter: unsupported return shapes are ignored,
           // while any in-place MessageList mutations still take effect.
@@ -2361,6 +2315,9 @@ export class ProcessorRunner {
     }
     if (
       result.messages &&
+      !(
+        result.messageList === messageList && areProcessorMessageArraysEqual(messageList.get.all.db(), result.messages)
+      ) &&
       !areProcessorMessageArraysEqual(messagesBeforeWorkflow, result.messages) &&
       !areProcessorMessageArraysEqual(messagesAfterWorkflow, result.messages)
     ) {

@@ -1003,19 +1003,21 @@ export class DefaultExecutionEngine extends ExecutionEngine {
               }
             : {};
 
-        await this.persistStepUpdate({
-          workflowId,
-          runId,
-          resourceId,
-          stepResults: lastOutput.stepResults,
-          serializedStepGraph: params.serializedStepGraph,
-          executionContext,
-          workflowStatus: result.status,
-          result: result.result,
-          error: result.error,
-          requestContext: currentRequestContext,
-          tracingContext: persistTracingContext,
-        });
+        if (!executionContext.transientExecution) {
+          await this.persistStepUpdate({
+            workflowId,
+            runId,
+            resourceId,
+            stepResults: lastOutput.stepResults,
+            serializedStepGraph: params.serializedStepGraph,
+            executionContext,
+            workflowStatus: result.status,
+            result: result.result,
+            error: result.error,
+            requestContext: currentRequestContext,
+            tracingContext: persistTracingContext,
+          });
+        }
 
         if (
           params.abortController.signal.aborted ||
@@ -1140,16 +1142,18 @@ export class DefaultExecutionEngine extends ExecutionEngine {
           undefined,
           stepExecutionPath,
         )) as any;
-        await this.persistStepUpdate({
-          workflowId,
-          runId,
-          resourceId,
-          stepResults: lastOutput.stepResults,
-          serializedStepGraph: params.serializedStepGraph,
-          executionContext: lastExecutionContext!,
-          workflowStatus: 'paused',
-          requestContext: currentRequestContext,
-        });
+        if (!lastExecutionContext!.transientExecution) {
+          await this.persistStepUpdate({
+            workflowId,
+            runId,
+            resourceId,
+            stepResults: lastOutput.stepResults,
+            serializedStepGraph: params.serializedStepGraph,
+            executionContext: lastExecutionContext!,
+            workflowStatus: 'paused',
+            requestContext: currentRequestContext,
+          });
+        }
 
         await params.pubsub.publish(`workflow.events.v2.${runId}`, {
           type: 'watch',
@@ -1177,18 +1181,20 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       undefined,
       stepExecutionPath,
     )) as any;
-    await this.persistStepUpdate({
-      workflowId,
-      runId,
-      resourceId,
-      stepResults: lastOutput.stepResults,
-      serializedStepGraph: params.serializedStepGraph,
-      executionContext: lastExecutionContext!,
-      workflowStatus: result.status,
-      result: result.result,
-      error: result.error,
-      requestContext: currentRequestContext,
-    });
+    if (!lastExecutionContext!.transientExecution) {
+      await this.persistStepUpdate({
+        workflowId,
+        runId,
+        resourceId,
+        stepResults: lastOutput.stepResults,
+        serializedStepGraph: params.serializedStepGraph,
+        executionContext: lastExecutionContext!,
+        workflowStatus: result.status,
+        result: result.result,
+        error: result.error,
+        requestContext: currentRequestContext,
+      });
+    }
 
     if (
       params.abortController.signal.aborted ||
