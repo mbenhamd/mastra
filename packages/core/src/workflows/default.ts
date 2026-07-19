@@ -1018,8 +1018,9 @@ export class DefaultExecutionEngine extends ExecutionEngine {
         });
 
         if (
-          !params.transientExecution &&
-          (await this.isAuthoritativelyCanceled({ workflowId, runId, executionGeneration }))
+          params.abortController.signal.aborted ||
+          (!params.transientExecution &&
+            (await this.isAuthoritativelyCanceled({ workflowId, runId, executionGeneration })))
         ) {
           result = { ...result, status: 'canceled', result: undefined, error: undefined };
           lastOutput.result.status = 'canceled';
@@ -1190,8 +1191,8 @@ export class DefaultExecutionEngine extends ExecutionEngine {
     });
 
     if (
-      !params.transientExecution &&
-      (await this.isAuthoritativelyCanceled({ workflowId, runId, executionGeneration }))
+      params.abortController.signal.aborted ||
+      (!params.transientExecution && (await this.isAuthoritativelyCanceled({ workflowId, runId, executionGeneration })))
     ) {
       result = { ...result, status: 'canceled', result: undefined, error: undefined };
     }

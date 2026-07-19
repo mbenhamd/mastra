@@ -113,7 +113,10 @@ export async function executeStep(
   executionContext.lifecycleStepStates = lifecycleStepStates;
   const suppressLifecycleEvents = workflowLifecycleEventsAreSuppressed(pubsub);
   const lifecycleStepState = suppressLifecycleEvents
-    ? { stepCallId: '', stepAttempt: 0 }
+    ? // `ToolStream` does not serialize `callId` for workflow-step output. The
+      // empty local placeholder therefore avoids lifecycle identity work without
+      // removing any stream field; only the suppressed lifecycle records use it.
+      { stepCallId: '', stepAttempt: 0 }
     : getOrCreateWorkflowStepLifecycleState({
         workflowId,
         runId,

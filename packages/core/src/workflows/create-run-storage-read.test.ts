@@ -194,6 +194,47 @@ describe('explicitly transient workflow lifecycle reads', () => {
     expect(update).not.toHaveBeenCalled();
   });
 
+  it('preserves a transient cancellation that arrives during terminal finalization', async () => {
+    const workflow = buildExplicitlyTransientWorkflow('explicit-transient-late-cancel');
+    const storage = new MockStore();
+    new Mastra({ logger: false, storage, workflows: { [workflow.id]: workflow } });
+    const workflowsStore = (await storage.getStore('workflows'))!;
+    const read = vi.spyOn(workflowsStore, 'loadWorkflowSnapshot');
+    const update = vi.spyOn(workflowsStore, 'updateWorkflowState');
+    const persist = vi.spyOn(workflowsStore, 'persistWorkflowSnapshot');
+
+    let markTerminalPersisted!: () => void;
+    const terminalPersisted = new Promise<void>(resolve => {
+      markTerminalPersisted = resolve;
+    });
+    let releaseFinalization!: () => void;
+    const finalizationGate = new Promise<void>(resolve => {
+      releaseFinalization = resolve;
+    });
+    const executionEngine = (workflow as any).executionEngine;
+    const persistStepUpdate = executionEngine.persistStepUpdate.bind(executionEngine);
+    vi.spyOn(executionEngine, 'persistStepUpdate').mockImplementation(async (params: any) => {
+      await persistStepUpdate(params);
+      if (params.workflowStatus === 'success') {
+        markTerminalPersisted();
+        await finalizationGate;
+      }
+    });
+
+    const run = await workflow.createRun();
+    const resultPromise = run.start({ inputData: { value: 'cancel-during-finalization' } });
+    await terminalPersisted;
+    await run.cancel();
+    releaseFinalization();
+
+    await expect(resultPromise).resolves.toMatchObject({ status: 'canceled', result: undefined });
+    expect(run.workflowRunStatus).toBe('canceled');
+    expect(run.abortController.signal.aborted).toBe(true);
+    expect(read).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
+    expect(persist).not.toHaveBeenCalled();
+  });
+
   it('rejects reusing an in-memory run ID with a different execution mode', async () => {
     const workflow = buildExplicitlyTransientWorkflow('explicit-transient-mode-reuse');
     const storage = new MockStore();
