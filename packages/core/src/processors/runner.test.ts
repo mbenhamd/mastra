@@ -745,6 +745,31 @@ describe('ProcessorRunner', () => {
       expect(entries).not.toHaveBeenCalled();
     });
 
+    it('traverses only the cached stream-capable subset in a mixed processor chain', async () => {
+      const streamProcessor = vi.fn(async ({ part }: { part: ChunkType }) => part);
+      runner = new ProcessorRunner({
+        inputProcessors: [],
+        outputProcessors: [
+          { id: 'result-only', processOutputResult: async ({ messages }) => messages },
+          { id: 'stream-capable', processOutputStream: streamProcessor },
+          { id: 'step-only', processOutputStep: async ({ messages }) => messages },
+        ],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+      const entries = vi.spyOn(runner.outputProcessors, 'entries');
+      const part = {
+        type: 'text-delta' as const,
+        payload: { text: 'processed once', id: 'text-1' },
+        runId: '1',
+        from: ChunkFrom.AGENT,
+      };
+
+      await expect(runner.processPart(part, new Map())).resolves.toEqual({ part, blocked: false });
+      expect(streamProcessor).toHaveBeenCalledTimes(1);
+      expect(entries).not.toHaveBeenCalled();
+    });
+
     it('should process text chunks through output processors', async () => {
       const outputProcessors: Processor[] = [
         {

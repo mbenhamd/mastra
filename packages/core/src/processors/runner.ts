@@ -72,14 +72,14 @@ async function invokeOnViolation(processor: Processor, error: TripWire): Promise
   }
 }
 
+function outputProcessorSupportsStream(processorOrWorkflow: ProcessorOrWorkflow): boolean {
+  return isProcessorWorkflow(processorOrWorkflow)
+    ? processorWorkflowSupportsPhase(processorOrWorkflow, 'outputStream')
+    : Boolean(processorOrWorkflow.processOutputStream);
+}
+
 export function outputProcessorsSupportStream(outputProcessors: readonly ProcessorOrWorkflow[] | undefined): boolean {
-  return Boolean(
-    outputProcessors?.some(processorOrWorkflow =>
-      isProcessorWorkflow(processorOrWorkflow)
-        ? processorWorkflowSupportsPhase(processorOrWorkflow, 'outputStream')
-        : Boolean(processorOrWorkflow.processOutputStream),
-    ),
-  );
+  return Boolean(outputProcessors?.some(outputProcessorSupportsStream));
 }
 
 /**
@@ -285,6 +285,10 @@ export class ProcessorRunner {
   public readonly outputProcessors: ProcessorOrWorkflow[];
   public readonly errorProcessors: ErrorProcessorOrWorkflow[];
   public readonly hasOutputStreamProcessors: boolean;
+  private readonly outputStreamProcessors: Array<{
+    index: number;
+    processorOrWorkflow: ProcessorOrWorkflow;
+  }>;
   private readonly logger: IMastraLogger;
   private readonly agentName: string;
   private readonly agent?: Agent<any, any, any, any>;
@@ -323,7 +327,13 @@ export class ProcessorRunner {
     this.inputProcessors = inputProcessors ?? [];
     this.outputProcessors = outputProcessors ?? [];
     this.errorProcessors = errorProcessors ?? [];
-    this.hasOutputStreamProcessors = outputProcessorsSupportStream(this.outputProcessors);
+    this.outputStreamProcessors = [];
+    for (const [index, processorOrWorkflow] of this.outputProcessors.entries()) {
+      if (outputProcessorSupportsStream(processorOrWorkflow)) {
+        this.outputStreamProcessors.push({ index, processorOrWorkflow });
+      }
+    }
+    this.hasOutputStreamProcessors = this.outputStreamProcessors.length > 0;
     this.logger = logger;
     this.agentName = agentName;
     this.agent = agent;
@@ -855,10 +865,9 @@ export class ProcessorRunner {
       const isFinishChunk = part.type === 'finish';
       let directProcessorSendSignal: ReturnType<typeof createProcessorSendSignal> | undefined;
 
-      for (const [index, processorOrWorkflow] of this.outputProcessors.entries()) {
+      for (const { index, processorOrWorkflow } of this.outputStreamProcessors) {
         // Handle workflows for stream processing
         if (isProcessorWorkflow(processorOrWorkflow)) {
-          if (!processorWorkflowSupportsPhase(processorOrWorkflow, 'outputStream')) continue;
           if (!processedPart) continue;
 
           // Get or create state for this workflow
@@ -911,7 +920,7 @@ export class ProcessorRunner {
 
         const processor = processorOrWorkflow;
         try {
-          if (processor.processOutputStream && processedPart) {
+          if (processedPart) {
             // Get or create state for this processor
             let state = processorStates.get(processor.id);
             if (!state) {
@@ -934,7 +943,7 @@ export class ProcessorRunner {
               continue;
             }
 
-            const result = await processor.processOutputStream({
+            const result = await processor.processOutputStream!({
               part: processedPart as ChunkType,
               streamParts: state.streamParts as ChunkType[],
               state: state.customState,
