@@ -836,6 +836,7 @@ export type OutputProcessorOrWorkflow<TTripwireMetadata = unknown> =
 export type ErrorProcessorOrWorkflow<TTripwireMetadata = unknown> = ErrorProcessor<TTripwireMetadata>;
 
 export {
+  copyProcessorWorkflowPhases,
   getProcessorWorkflowPhases,
   isProcessorWorkflow,
   processorWorkflowHasPhaseRestrictions,

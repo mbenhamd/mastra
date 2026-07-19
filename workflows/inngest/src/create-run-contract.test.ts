@@ -1,5 +1,6 @@
 import { EventEmitterPubSub } from '@mastra/core/events';
 import { Mastra } from '@mastra/core/mastra';
+import { getProcessorWorkflowPhases, setProcessorWorkflowPhases } from '@mastra/core/processors';
 import { RequestContext } from '@mastra/core/request-context';
 import { MockStore } from '@mastra/core/storage';
 import { TRANSIENT_EXECUTION_SYMBOL } from '@mastra/core/workflows/_constants';
@@ -42,6 +43,25 @@ function createTestWorkflow(storage = new MockStore()) {
 }
 
 describe('Inngest createRun contract', () => {
+  it('preserves processor phase restrictions when cloning a workflow', () => {
+    const inngest = new Inngest({ id: 'clone-processor-phase-contract', isDev: true });
+    const { createStep, createWorkflow, cloneWorkflow } = init(inngest);
+    const step = createStep({
+      id: 'final-only-step',
+      inputSchema: z.any(),
+      outputSchema: z.any(),
+      execute: async ({ inputData }) => inputData,
+    });
+    const workflow = setProcessorWorkflowPhases(
+      createWorkflow({ id: 'final-only-workflow', inputSchema: z.any(), outputSchema: z.any() }).then(step).commit(),
+      ['outputResult'],
+    );
+
+    const clone = cloneWorkflow(workflow, { id: 'final-only-workflow-clone' });
+
+    expect(getProcessorWorkflowPhases(clone)).toEqual(['outputResult']);
+  });
+
   it('validates raw input and serializes disableScorers through startAsync', async () => {
     const { inngest, mastra, workflow } = createTestWorkflow();
     const send = vi.spyOn(inngest, 'send').mockResolvedValue({ ids: ['event-1'] } as never);
