@@ -19,7 +19,7 @@ import { InMemoryStore } from '../storage';
 import { Agent } from './agent';
 
 const resolverDelays = [0, 25, 100] as const;
-const bounded = { time: 0, iterations: 3, warmupIterations: 1, warmupTime: 0 } as const;
+const bounded = { time: 0, iterations: 3, warmupIterations: 1, warmupTime: 0, throws: true } as const;
 
 function createScenario(resolverDelay: number) {
   const memory = new MockMemory({ storage: new InMemoryStore() });
