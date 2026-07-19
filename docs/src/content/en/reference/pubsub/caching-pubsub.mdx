@@ -75,10 +75,41 @@ const pubsub = withCaching(new EventEmitterPubSub(), new InMemoryServerCache())
         description: 'Logger for errors. Falls back to `console.error` when omitted.',
         isOptional: true,
       },
+      {
+        name: 'indexedReplay',
+        type: 'CachingPubSubIndexedReplayOptions',
+        description:
+          'Enables exact indexed replay when the cache supports atomic indexed logs. Sets retained history age and event-count limits.',
+        isOptional: true,
+      },
+      {
+        name: 'durableLocalOnly',
+        type: "'reject' | 'passthrough'",
+        description:
+          'Controls local-only publishes with durable exact replay. Passthrough skips retained history and forwards the event to the inner pub/sub.',
+        isOptional: true,
+        defaultValue: 'reject',
+      },
     ],
   },
 ]}
 />
+
+### Compose durable replay with local-only topics
+
+Durable exact replay rejects `localOnly` publishes by default because a process-local event can't also be part of shared retained history. If the same `CachingPubSub` carries intentionally non-replayable local topics, opt into passthrough explicitly:
+
+```typescript
+const pubsub = new CachingPubSub(innerPubSub, durableCache, {
+  indexedReplay: {
+    retentionMs: 24 * 60 * 60 * 1000,
+    maxEvents: 10_000,
+  },
+  durableLocalOnly: 'passthrough',
+})
+```
+
+With passthrough enabled, `localOnly` events bypass the cache and retain their locality option when forwarded to the inner pub/sub. Other events still use durable exact indexed replay. Only use this option when local-only topics don't require replay.
 
 ## Properties
 

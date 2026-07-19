@@ -1883,10 +1883,11 @@ export interface ListMessagesOptions {
 // ---------------------------------------------------------------------------
 // session.signal() / session.injectSystemReminder() — spec §4.2.
 //
-// `signal()` is the optimistic user-message primitive: it resolves with
-// the routing decision (runId + willInterleave) on the first await tick
-// so callers can render an optimistic transcript row before the turn
-// completes, then await `result` for the eventual `AgentResult`.
+// `signal()` is the optimistic user-message primitive. Without `admissionId`,
+// it resolves with the routing decision (runId + willInterleave) on the first
+// await tick. An admitted call first awaits its durable reservation and
+// authoritative native acceptance. Neither form awaits run completion; callers
+// await `result` for the eventual `AgentResult`.
 //
 // `injectSystemReminder()` is the system-reminder injection primitive used
 // by goal-judge continuations and other harness-internal nudges. System
@@ -1899,6 +1900,20 @@ export interface ListMessagesOptions {
 export interface SessionSignalOptions {
   /** Free-form user content. Matches `message().content`. */
   content: string;
+
+  /**
+   * Optional idempotency key for retry-safe active interleaves and idle wakes.
+   * Reusing the key with the same normalized payload returns the original
+   * signal/run/result identity; reusing it with a different payload rejects
+   * before another signal is dispatched. If the admitted run suspends, its
+   * `result` remains pending until the resumed run completes or fails, so a
+   * retry observes the same terminal result before and after process restart.
+   * The stable run id is an at-least-once execution identity: recovery never
+   * invents a second cold run identity for the same admission, but a crash or
+   * lost acknowledgement can repeat provider or tool side effects. This key
+   * does not make those external effects exactly once.
+   */
+  admissionId?: string;
 
   /** Per-turn mode override (same semantics as `message().mode`). */
   mode?: string;
@@ -1926,7 +1941,10 @@ export interface SessionSignalOptions {
   requestContext?: RequestContextInput;
 }
 
-/** Result returned by `Session.signal(...)` (resolved on the first await tick). */
+/**
+ * Result returned by `Session.signal(...)`. Ordinary calls resolve on the first
+ * await tick; admitted calls resolve after durable and native acceptance.
+ */
 export interface SessionSignalResult {
   /** Stable signal id — keys the optimistic transcript row. */
   id: string;

@@ -9,6 +9,10 @@ import { init, serve, createServe, connect } from './index';
 // Mock the inngest framework-specific serve functions using vi.hoisted to ensure
 // mocks are created before module imports capture the real functions
 const mocks = vi.hoisted(() => {
+  // `--no-isolate` may have cached ./index through an earlier test file before
+  // these adapter mocks were registered. Reload this file's module graph so
+  // the default serve export captures the adapters owned by this test.
+  vi.resetModules();
   return {
     honoServe: vi.fn(() => () => Promise.resolve(new Response())),
     expressServe: vi.fn(() => () => {}),
@@ -37,6 +41,21 @@ const getFunctionIds = (functions: Array<{ id?: (prefix?: string) => string }>) 
   });
 
 describe('Multi-framework serve', () => {
+  beforeEach(() => {
+    // The package suite intentionally runs without Vitest isolation. Reapply
+    // this file's hoisted adapter contracts after another file restores mocks.
+    mocks.honoServe.mockImplementation(() => () => Promise.resolve(new Response()));
+    mocks.expressServe.mockImplementation(() => () => {});
+    mocks.fastifyServe.mockImplementation(() => () => Promise.resolve());
+    mocks.inngestConnect.mockImplementation(async () => ({
+      connectionId: 'conn-test',
+      close: vi.fn(async () => {}),
+      closed: Promise.resolve(),
+      state: 'ACTIVE',
+      getDebugState: vi.fn(),
+    }));
+  });
+
   afterAll(() => {
     vi.restoreAllMocks();
   });

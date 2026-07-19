@@ -549,6 +549,18 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
   }
   // 7. Convert tools to CoreTool format for execution
   let tools: Record<string, CoreTool> = {};
+  const perExecutionToolHooks =
+    typeof execOptions?.hooks?.beforeToolCall === 'function' || typeof execOptions?.hooks?.afterToolCall === 'function'
+      ? execOptions.hooks
+      : undefined;
+  const toolHookPolicy = perExecutionToolHooks
+    ? {
+        kind: 'run-registry' as const,
+        id: crypto.randomUUID(),
+        beforeToolCall: typeof perExecutionToolHooks.beforeToolCall === 'function',
+        afterToolCall: typeof perExecutionToolHooks.afterToolCall === 'function',
+      }
+    : undefined;
   const toolSurfaceFenceOwnerId = crypto.randomUUID();
   try {
     tools = await typedAgent.getToolsForExecution({
@@ -705,6 +717,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
       toolChoice: execOptions?.toolChoice as any,
       activeTools: execOptions?.activeTools?.filter((name): name is string => typeof name === 'string'),
       toolSurfaceFence,
+      toolHookPolicy,
       modelSettings: execOptions?.modelSettings as any,
       // Function-form approval policies are closures that can't ride on the
       // serialized workflow input — the live closure is parked on the run
@@ -772,6 +785,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
     resourceId,
     tools,
     replacementToolSurface,
+    toolHookPolicy: perExecutionToolHooks ? { id: toolHookPolicy!.id, hooks: perExecutionToolHooks } : undefined,
     saveQueueManager,
     memory,
     model,

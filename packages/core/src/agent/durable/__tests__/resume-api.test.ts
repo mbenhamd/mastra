@@ -26,6 +26,7 @@ import { MessageList } from '../../message-list';
 import { DurableStepIds } from '../constants';
 import { createDurableAgent } from '../create-durable-agent';
 import { globalRunRegistry } from '../run-registry';
+import type { SerializableDurableOptions } from '../types';
 import { serializeModelConfig } from '../utils/serialize-state';
 
 // ============================================================================
@@ -91,6 +92,7 @@ async function seedSuspendedRun(
   agentId: string,
   memory: { threadId: string; resourceId: string },
   status: WorkflowRunState['status'] = 'suspended',
+  options: SerializableDurableOptions = {},
 ) {
   const workflows = (await store.getStore('workflows'))!;
   const snapshot = {
@@ -109,7 +111,7 @@ async function seedSuspendedRun(
         toolsMetadata: [],
         modelConfig: serializeModelConfig(createTextModel('Unused') as any),
         runtimeBindings: {},
-        options: {},
+        options,
         requestContextEntries: { tenantId: 'tenant-1' },
         state: memory,
         messageId: `message-${runId}`,
@@ -185,6 +187,40 @@ describe('Resume API', () => {
       expect(result.runId).toBe(runId);
       expect(typeof result.cleanup).toBe('function');
       result.cleanup();
+    });
+
+    it('rejects hook overrides on resume before touching the persisted run', async () => {
+      const beforeToolCall = vi.fn();
+      const baseAgent = new Agent({
+        id: 'resume-hook-override-agent',
+        name: 'Resume Hook Override Agent',
+        instructions: 'Test resume hook rejection',
+        model: createTextModel('Unused') as LanguageModelV2,
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+      await expect(
+        durableAgent.resume('missing-hook-run', { approved: true }, {
+          hooks: { beforeToolCall },
+        } as any),
+      ).rejects.toMatchObject({ id: 'DURABLE_AGENT_RESUME_TOOL_HOOKS_UNSUPPORTED' });
+      expect(beforeToolCall).not.toHaveBeenCalled();
+    });
+
+    it('rejects hook overrides routed through resumeStream', async () => {
+      const afterToolCall = vi.fn();
+      const baseAgent = new Agent({
+        id: 'resume-stream-hook-override-agent',
+        name: 'Resume Stream Hook Override Agent',
+        instructions: 'Test resumeStream hook rejection',
+        model: createTextModel('Unused') as LanguageModelV2,
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+      await expect(
+        durableAgent.resumeStream({ approved: true }, { runId: 'missing-hook-run', hooks: { afterToolCall } } as any),
+      ).rejects.toMatchObject({ id: 'DURABLE_AGENT_RESUME_TOOL_HOOKS_UNSUPPORTED' });
+      expect(afterToolCall).not.toHaveBeenCalled();
     });
 
     it('prepare() honors a caller-provided runId so resume(runId) can find the run', async () => {
@@ -282,6 +318,47 @@ describe('Resume API', () => {
         ),
       ).rejects.toMatchObject({ id: 'DURABLE_AGENT_RESUME_RUN_NOT_SUSPENDED' });
       expect(prepareSpy).not.toHaveBeenCalled();
+      expect(durableAgent.runRegistry.has(runId)).toBe(false);
+    });
+
+    it('fails closed before cold resume when per-execution tool hooks cannot be reconstructed', async () => {
+      const store = new InMemoryStore();
+      const baseAgent = new Agent({
+        id: 'cold-hook-policy-agent',
+        name: 'Cold Hook Policy Agent',
+        instructions: 'Test cold hook policy behavior',
+        model: createTextModel('Unused') as LanguageModelV2,
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+      void new Mastra({ agents: { coldHookPolicyAgent: durableAgent }, storage: store, logger: false });
+      const runId = 'cold-hook-policy-run';
+      await seedSuspendedRun(
+        store,
+        runId,
+        durableAgent.id,
+        { threadId: 'cold-hook-thread', resourceId: 'cold-hook-resource' },
+        'suspended',
+        {
+          toolHookPolicy: {
+            kind: 'run-registry',
+            id: 'process-local-policy',
+            beforeToolCall: false,
+            afterToolCall: true,
+          },
+        },
+      );
+      const getTools = vi.spyOn(baseAgent, 'getToolsForExecution');
+
+      await expect(
+        durableAgent.resume(
+          runId,
+          { approved: true },
+          {
+            memory: { thread: 'cold-hook-thread', resource: 'cold-hook-resource' },
+          },
+        ),
+      ).rejects.toMatchObject({ id: 'DURABLE_AGENT_TOOL_HOOK_POLICY_UNAVAILABLE' });
+      expect(getTools).not.toHaveBeenCalled();
       expect(durableAgent.runRegistry.has(runId)).toBe(false);
     });
 

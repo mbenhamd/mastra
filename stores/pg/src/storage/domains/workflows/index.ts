@@ -58,6 +58,11 @@ import {
   observeWorkflowTerminalContinuationPlanRecord,
   validateWorkflowTerminalContinuationPlanIntegrity,
   WORKFLOW_TERMINAL_PARENT_APPLICATION_CONSUMER_ID,
+  admitWorkflowResumeRecord,
+  consumeWorkflowResumeResultRecord,
+  finalizeWorkflowResumeRecord,
+  persistWorkflowStepUpdateRecord,
+  rollbackWorkflowResumeRecord,
 } from '@mastra/core/storage';
 import type {
   AdvanceWorkflowTerminalizationInput,
@@ -90,11 +95,21 @@ import type {
   BindWorkflowNestedRunOwnershipResult,
   AdmitWorkflowNestedRunInput,
   AdmitWorkflowNestedRunResult,
+  AdmitWorkflowResumeInput,
+  AdmitWorkflowResumeResult,
+  ConsumeWorkflowResumeResult,
+  ConsumeWorkflowResumeResultInput,
+  FinalizeWorkflowResumeInput,
+  FinalizeWorkflowResumeResult,
+  PersistWorkflowStepUpdateInput,
+  PersistWorkflowStepUpdateResult,
   PersistWorkflowTerminalRecoveryAncestryInput,
   PersistWorkflowTerminalRecoveryAncestryResult,
   GetWorkflowTerminalRecoveryAncestryResult,
   ReleaseWorkflowTerminalizationInput,
   ReleaseWorkflowTerminalizationResult,
+  RollbackWorkflowResumeInput,
+  RollbackWorkflowResumeResult,
   UpdateWorkflowStateOptions,
   StorageListWorkflowRunsInput,
   WorkflowRun,
@@ -102,6 +117,7 @@ import type {
   CreateIndexOptions,
   WorkflowTerminalContinuationPlanRecord,
   WorkflowTerminalizationCapabilities,
+  WorkflowResumeCapabilities,
   WorkflowTerminalRecoveryAncestryRecord,
   TABLE_NAMES,
   PruneOptions,
@@ -144,7 +160,7 @@ const TABLE_WORKFLOW_TERMINAL_RECOVERY_ANCESTRIES = 'mastra_workflow_terminal_re
 const TABLE_WORKFLOW_TERMINAL_DESTINATION_RECEIPTS = 'mastra_workflow_terminal_destination_receipts_v2';
 const TABLE_WORKFLOW_TERMINAL_CONTINUATION_PLANS = 'mastra_workflow_terminal_continuation_plans_v2';
 const TABLE_WORKFLOW_PARENT_REVISIONS = 'mastra_workflow_parent_revisions';
-const TERMINAL_WORKFLOW_RUN_STATUSES = ['success', 'failed', 'canceled', 'tripwire', 'bailed'] as const;
+const TERMINAL_WORKFLOW_RUN_STATUSES = ['success', 'failed', 'canceled', 'tripwire', 'bailed', 'skipped'] as const;
 type TerminalWorkflowRunStatus = (typeof TERMINAL_WORKFLOW_RUN_STATUSES)[number];
 
 function isTerminalWorkflowRunStatus(value: unknown): value is TerminalWorkflowRunStatus {
@@ -237,6 +253,157 @@ export class WorkflowsPG extends WorkflowsStorage {
       parentApplicationVersion: 1,
       recoveryVersion: 1,
     };
+  }
+
+  getWorkflowResumeCapabilities(): WorkflowResumeCapabilities {
+    return { atomicResumeVersion: 1, fencedStepUpdateVersion: 1 };
+  }
+
+  private materializeResumeSnapshot(snapshot: WorkflowRunState): WorkflowRunState {
+    return JSON.parse(sanitizeJsonForPg(JSON.stringify(snapshot))) as WorkflowRunState;
+  }
+
+  private async mutateWorkflowResume<T extends { status: string }>(
+    workflowName: string,
+    runId: string,
+    resourceId: string | undefined,
+    mutate: (snapshot: WorkflowRunState | undefined) => T & { snapshot?: WorkflowRunState },
+    operation: string,
+  ): Promise<T> {
+    try {
+      return await this.#db.client.tx(async t => {
+        const revision = await this.lockWorkflowParentRevision(t, workflowName, runId);
+        const row = await t.oneOrNone<{ snapshot: WorkflowRunState | string; resourceId?: string | null }>(
+          `SELECT snapshot, "resourceId" FROM ${this.workflowSnapshotTableName()}
+           WHERE workflow_name = $1 AND run_id = $2 FOR UPDATE`,
+          [workflowName, runId],
+        );
+        const snapshot = row?.snapshot
+          ? this.materializeResumeSnapshot(typeof row.snapshot === 'string' ? JSON.parse(row.snapshot) : row.snapshot)
+          : undefined;
+        const outcome = mutate(snapshot);
+        const { snapshot: updatedSnapshot, ...publicResult } = outcome;
+        if (updatedSnapshot && row) {
+          const retainedResourceId = row.resourceId ?? updatedSnapshot.resourceId ?? resourceId ?? null;
+          const now = new Date();
+          await t.none(
+            `UPDATE ${this.workflowSnapshotTableName()}
+             SET "resourceId" = $1, snapshot = $2, "updatedAt" = $3, "updatedAtZ" = $4
+             WHERE workflow_name = $5 AND run_id = $6`,
+            [retainedResourceId, sanitizeJsonForPg(JSON.stringify(updatedSnapshot)), now, now, workflowName, runId],
+          );
+          await this.bumpWorkflowParentRevision(t, workflowName, runId, revision);
+        }
+        return publicResult as T;
+      });
+    } catch (error) {
+      throw new MastraError(
+        {
+          id: createStorageErrorId('PG', operation.toUpperCase(), 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: { workflowName, runId },
+        },
+        error,
+      );
+    }
+  }
+
+  async admitWorkflowResume(input: AdmitWorkflowResumeInput): Promise<AdmitWorkflowResumeResult> {
+    return this.mutateWorkflowResume(
+      input.workflowName,
+      input.runId,
+      input.resourceId,
+      snapshot =>
+        admitWorkflowResumeRecord(snapshot, input, Date.now(), value => this.materializeResumeSnapshot(value)),
+      'admit_workflow_resume',
+    );
+  }
+
+  async rollbackWorkflowResume(input: RollbackWorkflowResumeInput): Promise<RollbackWorkflowResumeResult> {
+    return this.mutateWorkflowResume(
+      input.workflowName,
+      input.runId,
+      input.resourceId,
+      snapshot =>
+        rollbackWorkflowResumeRecord(snapshot, input, Date.now(), value => this.materializeResumeSnapshot(value)),
+      'rollback_workflow_resume',
+    );
+  }
+
+  async finalizeWorkflowResume(input: FinalizeWorkflowResumeInput): Promise<FinalizeWorkflowResumeResult> {
+    return this.mutateWorkflowResume(
+      input.workflowName,
+      input.runId,
+      input.resourceId,
+      snapshot =>
+        finalizeWorkflowResumeRecord(snapshot, input, Date.now(), value => this.materializeResumeSnapshot(value)),
+      'finalize_workflow_resume',
+    );
+  }
+
+  async consumeWorkflowResumeResult(input: ConsumeWorkflowResumeResultInput): Promise<ConsumeWorkflowResumeResult> {
+    return this.mutateWorkflowResume(
+      input.workflowName,
+      input.runId,
+      undefined,
+      snapshot =>
+        consumeWorkflowResumeResultRecord(snapshot, input, Date.now(), value => this.materializeResumeSnapshot(value)),
+      'consume_workflow_resume_result',
+    );
+  }
+
+  async persistWorkflowStepUpdate(input: PersistWorkflowStepUpdateInput): Promise<PersistWorkflowStepUpdateResult> {
+    try {
+      return await this.#db.client.tx(async t => {
+        const revision = await this.lockWorkflowParentRevision(t, input.workflowName, input.runId);
+        const row = await t.oneOrNone<{ snapshot: WorkflowRunState | string; resourceId?: string | null }>(
+          `SELECT snapshot, "resourceId" FROM ${this.workflowSnapshotTableName()}
+           WHERE workflow_name = $1 AND run_id = $2 FOR UPDATE`,
+          [input.workflowName, input.runId],
+        );
+        const snapshot = row?.snapshot
+          ? this.materializeResumeSnapshot(typeof row.snapshot === 'string' ? JSON.parse(row.snapshot) : row.snapshot)
+          : undefined;
+        const outcome = persistWorkflowStepUpdateRecord(snapshot, input, value =>
+          this.materializeResumeSnapshot(value),
+        );
+        const { snapshot: updatedSnapshot, ...result } = outcome;
+        if (updatedSnapshot) {
+          const now = new Date();
+          const retainedResourceId = row?.resourceId ?? updatedSnapshot.resourceId ?? input.resourceId ?? null;
+          await t.none(
+            `INSERT INTO ${this.workflowSnapshotTableName()}
+               (workflow_name, run_id, "resourceId", snapshot, "createdAt", "updatedAt", "createdAtZ", "updatedAtZ")
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT (workflow_name, run_id) DO UPDATE
+             SET "resourceId" = $3, snapshot = $4, "updatedAt" = $6, "updatedAtZ" = $8`,
+            [
+              input.workflowName,
+              input.runId,
+              retainedResourceId,
+              sanitizeJsonForPg(JSON.stringify(updatedSnapshot)),
+              now,
+              now,
+              now,
+              now,
+            ],
+          );
+          await this.bumpWorkflowParentRevision(t, input.workflowName, input.runId, revision);
+        }
+        return result;
+      });
+    } catch (error) {
+      throw new MastraError(
+        {
+          id: createStorageErrorId('PG', 'PERSIST_WORKFLOW_STEP_UPDATE', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: { workflowName: input.workflowName, runId: input.runId },
+        },
+        error,
+      );
+    }
   }
 
   private terminalizationTableName(): string {
@@ -340,7 +507,7 @@ export class WorkflowsPG extends WorkflowsStorage {
              revision.terminal_status,
              (
                SELECT CASE
-                 WHEN snapshot.snapshot->>'status' IN ('success', 'failed', 'canceled', 'tripwire', 'bailed')
+                 WHEN snapshot.snapshot->>'status' IN ('success', 'failed', 'canceled', 'tripwire', 'bailed', 'skipped')
                    THEN snapshot.snapshot->>'status'
                  ELSE NULL
                END
@@ -2669,7 +2836,8 @@ export class WorkflowsPG extends WorkflowsStorage {
       "updated_at" BIGINT NOT NULL,
       PRIMARY KEY ("workflow_name", "run_id"),
       CHECK ("generation" >= 0),
-      CHECK ("terminal_status" IS NULL OR "terminal_status" IN ('success', 'failed', 'canceled', 'tripwire', 'bailed')),
+      CONSTRAINT "mastra_workflow_parent_revisions_terminal_status_check"
+        CHECK ("terminal_status" IS NULL OR "terminal_status" IN ('success', 'failed', 'canceled', 'tripwire', 'bailed', 'skipped')),
       CHECK ("updated_at" >= 0)
     );`;
   }
@@ -2760,8 +2928,16 @@ export class WorkflowsPG extends WorkflowsStorage {
     await this.#db.client.tx(async t => {
       await t.none(
         `ALTER TABLE ${this.workflowParentRevisionTableName()}
-         ADD COLUMN IF NOT EXISTS terminal_status TEXT
-         CHECK (terminal_status IS NULL OR terminal_status IN ('success', 'failed', 'canceled', 'tripwire', 'bailed'))`,
+         ADD COLUMN IF NOT EXISTS terminal_status TEXT`,
+      );
+      await t.none(
+        `ALTER TABLE ${this.workflowParentRevisionTableName()}
+         DROP CONSTRAINT IF EXISTS "mastra_workflow_parent_revisions_terminal_status_check"`,
+      );
+      await t.none(
+        `ALTER TABLE ${this.workflowParentRevisionTableName()}
+         ADD CONSTRAINT "mastra_workflow_parent_revisions_terminal_status_check"
+         CHECK (terminal_status IS NULL OR terminal_status IN ('success', 'failed', 'canceled', 'tripwire', 'bailed', 'skipped'))`,
       );
       await t.none(
         `INSERT INTO ${this.workflowParentRevisionTableName()}
@@ -2770,7 +2946,7 @@ export class WorkflowsPG extends WorkflowsStorage {
            COALESCE(
              journal.terminal_status,
              CASE
-               WHEN snapshot.snapshot->>'status' IN ('success', 'failed', 'canceled', 'tripwire', 'bailed')
+               WHEN snapshot.snapshot->>'status' IN ('success', 'failed', 'canceled', 'tripwire', 'bailed', 'skipped')
                  THEN snapshot.snapshot->>'status'
                ELSE NULL
              END
@@ -2797,14 +2973,14 @@ export class WorkflowsPG extends WorkflowsStorage {
              ON snapshot.workflow_name = revision.workflow_name AND snapshot.run_id = revision.run_id
            WHERE
              (journal.terminal_status IS NOT NULL
-               AND snapshot.snapshot->>'status' IN ('success', 'failed', 'canceled', 'tripwire', 'bailed')
+               AND snapshot.snapshot->>'status' IN ('success', 'failed', 'canceled', 'tripwire', 'bailed', 'skipped')
                AND journal.terminal_status <> snapshot.snapshot->>'status')
              OR (revision.terminal_status IS NOT NULL
                AND journal.terminal_status IS NOT NULL
                AND revision.terminal_status <> journal.terminal_status)
              OR (revision.terminal_status IS NOT NULL
                AND journal.terminal_status IS NULL
-               AND snapshot.snapshot->>'status' IN ('success', 'failed', 'canceled', 'tripwire', 'bailed')
+               AND snapshot.snapshot->>'status' IN ('success', 'failed', 'canceled', 'tripwire', 'bailed', 'skipped')
                AND revision.terminal_status <> snapshot.snapshot->>'status')
          ) AS conflict`,
       );
@@ -2826,7 +3002,7 @@ export class WorkflowsPG extends WorkflowsStorage {
          WHERE revision.workflow_name = snapshot.workflow_name
            AND revision.run_id = snapshot.run_id
            AND revision.terminal_status IS NULL
-           AND snapshot.snapshot->>'status' IN ('success', 'failed', 'canceled', 'tripwire', 'bailed')`,
+           AND snapshot.snapshot->>'status' IN ('success', 'failed', 'canceled', 'tripwire', 'bailed', 'skipped')`,
       );
     });
     await this.#db.client.none(WorkflowsPG.getTerminalContinuationPlanTableDDL(this.#schema));

@@ -33,6 +33,16 @@ import type {
   GetWorkflowTerminalRecoveryAncestryResult,
   AdmitWorkflowNestedRunInput,
   AdmitWorkflowNestedRunResult,
+  AdmitWorkflowResumeInput,
+  AdmitWorkflowResumeResult,
+  ConsumeWorkflowResumeResult,
+  ConsumeWorkflowResumeResultInput,
+  PersistWorkflowStepUpdateInput,
+  PersistWorkflowStepUpdateResult,
+  FinalizeWorkflowResumeInput,
+  FinalizeWorkflowResumeResult,
+  RollbackWorkflowResumeInput,
+  RollbackWorkflowResumeResult,
   ReleaseWorkflowTerminalizationInput,
   ReleaseWorkflowTerminalizationResult,
   UpdateWorkflowStateOptions,
@@ -40,6 +50,7 @@ import type {
   WorkflowRuns,
   StorageListWorkflowRunsInput,
   WorkflowTerminalizationCapabilities,
+  WorkflowResumeCapabilities,
 } from '../../types';
 import { StorageDomain } from '../base';
 
@@ -61,6 +72,31 @@ export abstract class WorkflowsStorage extends StorageDomain {
   /** Exact protocol versions implemented by this adapter. */
   getWorkflowTerminalizationCapabilities(): WorkflowTerminalizationCapabilities {
     return {};
+  }
+
+  /** Exact atomic resume protocol versions implemented by this adapter. */
+  getWorkflowResumeCapabilities(): WorkflowResumeCapabilities {
+    return {};
+  }
+
+  async admitWorkflowResume(_input: AdmitWorkflowResumeInput): Promise<AdmitWorkflowResumeResult> {
+    return { status: 'unsupported' };
+  }
+
+  async rollbackWorkflowResume(_input: RollbackWorkflowResumeInput): Promise<RollbackWorkflowResumeResult> {
+    return { status: 'unsupported' };
+  }
+
+  async finalizeWorkflowResume(_input: FinalizeWorkflowResumeInput): Promise<FinalizeWorkflowResumeResult> {
+    return { status: 'unsupported' };
+  }
+
+  async consumeWorkflowResumeResult(_input: ConsumeWorkflowResumeResultInput): Promise<ConsumeWorkflowResumeResult> {
+    return { status: 'unsupported' };
+  }
+
+  async persistWorkflowStepUpdate(_input: PersistWorkflowStepUpdateInput): Promise<PersistWorkflowStepUpdateResult> {
+    return { status: 'unsupported' };
   }
 
   async claimWorkflowTerminalization(

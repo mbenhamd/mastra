@@ -18,6 +18,8 @@ import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
 
 import { Agent } from '../agent';
+import { InMemoryServerCache } from '../cache/inmemory';
+import { CachingPubSub } from '../events/caching-pubsub';
 import { EventEmitterPubSub } from '../events/event-emitter';
 import type { PubSubDeliveryMode } from '../events/pubsub';
 import type { Event } from '../events/types';
@@ -40,6 +42,7 @@ function makeStartEvent(workflowId: string, runId: string, internal = true): Eve
     data: {
       workflowId,
       runId,
+      executionGeneration: `cross-process-generation:${workflowId}:${runId}`,
       executionPath: [0],
       stepResults: {},
       prevResult: { status: 'success', output: {} },
@@ -470,6 +473,55 @@ describe('mastra.pubsub proxy localOnly tagging', () => {
     expect(pubsub.calls).toHaveLength(1);
     expect(pubsub.calls[0]).toMatchObject({ topic: 'workflows', localOnly: true });
     await mastra.shutdown();
+  });
+
+  it('runs internal agent workflows through explicit durable localOnly passthrough', async () => {
+    const cache = new InMemoryServerCache();
+    Object.defineProperty(cache, 'indexedLogScope', { value: 'durable' });
+    const append = vi.spyOn(cache, 'appendIndexedLogEntry');
+    const pubsub = new CachingPubSub(new EventEmitterPubSub(), cache, {
+      indexedReplay: { retentionMs: 60_000, maxEvents: 100 },
+      durableLocalOnly: 'passthrough',
+    });
+    const agent = new Agent({
+      id: 'durable-local-agent',
+      name: 'Durable local agent',
+      instructions: 'Reply briefly.',
+      model: new MockLanguageModelV2({
+        doGenerate: async () => ({
+          content: [{ type: 'text', text: 'durable local reply' }],
+          finishReason: 'stop',
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+          warnings: [],
+        }),
+      }),
+    });
+    const mastra = new Mastra({
+      logger: false,
+      storage: new MockStore(),
+      pubsub,
+      agents: { durableLocalAgent: agent },
+    });
+
+    try {
+      await mastra.startWorkers();
+      await expect(mastra.getAgent('durableLocalAgent').generate('hello')).resolves.toMatchObject({
+        text: 'durable local reply',
+      });
+
+      const retainedKeys = append.mock.calls.map(([key]) => key);
+      expect(retainedKeys.some(key => key.includes('workflow.lifecycle.v1.'))).toBe(true);
+      expect(
+        retainedKeys.some(
+          key =>
+            key.includes('pubsub:workflows:indexed-log') ||
+            key.includes('pubsub:workflows-finish:indexed-log') ||
+            key.includes('pubsub:workflow.events.v2.'),
+        ),
+      ).toBe(false);
+    } finally {
+      await mastra.shutdown();
+    }
   });
 
   it('does NOT tag publishes for workflows owned by no one as localOnly', async () => {

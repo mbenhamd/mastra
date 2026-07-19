@@ -822,7 +822,7 @@ describe('HarnessPG', () => {
     const harness = store.stores.harness;
     expect(harness).toBeDefined();
 
-    await harness!.writeMessageResultEvidence({
+    const terminalEvidence = {
       harnessName: 'default',
       sessionId: 'session-1',
       resourceId: 'resource-1',
@@ -833,10 +833,19 @@ describe('HarnessPG', () => {
       modelId: 'model-1',
       admissionId: 'admission-1',
       admissionHash: 'hash-1',
-      status: 'completed',
+      status: 'completed' as const,
       result: { ok: true },
       createdAt: 1,
       updatedAt: 2,
+    };
+    await expect(harness!.writeMessageResultEvidence(terminalEvidence)).resolves.toEqual({
+      created: true,
+      applied: true,
+    });
+    await expect(harness!.writeMessageResultEvidence(terminalEvidence)).resolves.toMatchObject({
+      created: false,
+      applied: false,
+      evidence: { status: 'completed', admissionId: 'admission-1' },
     });
 
     await expect(
@@ -861,6 +870,287 @@ describe('HarnessPG', () => {
         }),
       ).rejects.toBeInstanceOf(HarnessStorageThreadDeleteFenceConflictError);
     });
+  });
+
+  it('locks competing signal dispatch claims and migrates a legacy run row', async () => {
+    const harness = store.stores.harness!;
+    const pending = {
+      harnessName: 'default',
+      sessionId: 'session-cas',
+      resourceId: 'resource-cas',
+      threadId: 'thread-cas',
+      signalId: 'signal-cas',
+      admissionId: 'admission-cas',
+      admissionHash: 'hash-cas',
+      operationKind: 'signal' as const,
+      status: 'pending' as const,
+      dispatch: { state: 'reserved' as const },
+      createdAt: 1000,
+      updatedAt: 1000,
+    };
+    await harness.writeMessageResultEvidence(pending);
+    const claim = (attemptId: string) =>
+      harness.compareAndSwapSignalDispatch({
+        harnessName: 'default',
+        sessionId: pending.sessionId,
+        resourceId: pending.resourceId,
+        threadId: pending.threadId,
+        signalId: pending.signalId,
+        admissionId: pending.admissionId,
+        admissionHash: pending.admissionHash,
+        expected: { state: 'reserved' },
+        next: {
+          state: 'dispatching',
+          attemptId,
+          claimExpiresAt: 4000,
+          delivery: 'idle',
+          runId: 'run-cas',
+        },
+        updatedAt: 2000,
+      });
+    const competing = await Promise.all([claim('attempt-a'), claim('attempt-b')]);
+    expect(competing.filter(result => result.applied)).toHaveLength(1);
+    expect(competing.filter(result => !result.applied)).toHaveLength(1);
+
+    await harness.writeMessageResultEvidence({
+      ...pending,
+      signalId: 'harness-channel-signal-legacy',
+      admissionId: 'legacy-admission',
+      runId: 'legacy-run',
+      operationKind: undefined,
+      dispatch: undefined,
+    });
+    await expect(
+      harness.writeMessageResultEvidence({
+        ...pending,
+        signalId: 'harness-channel-signal-legacy',
+        admissionId: 'legacy-admission',
+        runId: 'legacy-run',
+        operationKind: undefined,
+        dispatch: undefined,
+        status: 'completed',
+        result: 'unfenced terminal',
+      }),
+    ).resolves.toMatchObject({ applied: false, evidence: { status: 'pending', runId: 'legacy-run' } });
+    await expect(
+      harness.compareAndSwapSignalDispatch({
+        harnessName: 'default',
+        sessionId: pending.sessionId,
+        resourceId: pending.resourceId,
+        threadId: pending.threadId,
+        signalId: 'harness-channel-signal-legacy',
+        admissionId: 'legacy-admission',
+        admissionHash: pending.admissionHash,
+        expected: {
+          state: 'accepted',
+          attemptId: 'legacy',
+          delivery: 'active',
+          runId: 'legacy-run',
+          acceptedAt: 1000,
+        },
+        next: {
+          state: 'dispatching',
+          attemptId: 'recovery-attempt',
+          claimExpiresAt: 5000,
+          delivery: 'active',
+          runId: 'legacy-run',
+        },
+        updatedAt: 3000,
+      }),
+    ).resolves.toMatchObject({
+      applied: true,
+      evidence: {
+        runId: 'legacy-run',
+        dispatch: { state: 'dispatching', attemptId: 'recovery-attempt' },
+      },
+    });
+  });
+
+  it('round-trips JSONB semantic dispatch CAS and fences terminal settlement by attempt', async () => {
+    const harness = store.stores.harness!;
+    const identity = {
+      harnessName: 'default',
+      sessionId: 'session-semantic-cas',
+      resourceId: 'resource-semantic-cas',
+      threadId: 'thread-semantic-cas',
+      signalId: 'signal-semantic-cas',
+      admissionId: 'admission-semantic-cas',
+      admissionHash: 'hash-semantic-cas',
+    };
+    const dispatchingA = {
+      state: 'dispatching' as const,
+      attemptId: 'attempt-a',
+      claimExpiresAt: 2000,
+      delivery: 'idle' as const,
+      runId: 'run-stable',
+    };
+    await harness.writeMessageResultEvidence({
+      ...identity,
+      status: 'pending',
+      runId: dispatchingA.runId,
+      operationKind: 'signal',
+      dispatch: dispatchingA,
+      createdAt: 1000,
+      updatedAt: 1000,
+    });
+    const dispatchingB = { ...dispatchingA, attemptId: 'attempt-b', claimExpiresAt: 3000 };
+    await expect(
+      harness.compareAndSwapSignalDispatch({
+        ...identity,
+        expected: {
+          runId: dispatchingA.runId,
+          delivery: dispatchingA.delivery,
+          claimExpiresAt: dispatchingA.claimExpiresAt,
+          attemptId: dispatchingA.attemptId,
+          state: 'dispatching',
+        },
+        next: dispatchingB,
+        updatedAt: 2000,
+      }),
+    ).resolves.toMatchObject({ applied: true });
+    const acceptedB = {
+      state: 'accepted' as const,
+      attemptId: dispatchingB.attemptId,
+      delivery: dispatchingB.delivery,
+      runId: dispatchingB.runId,
+      acceptedAt: 4000,
+    };
+    await expect(
+      harness.compareAndSwapSignalDispatch({ ...identity, expected: dispatchingB, next: acceptedB, updatedAt: 4000 }),
+    ).resolves.toMatchObject({ applied: true });
+    await expect(
+      harness.writeMessageResultEvidence({
+        ...identity,
+        status: 'failed',
+        error: { code: 'generic', message: 'must not overwrite accepted attempt' },
+        createdAt: 1000,
+        updatedAt: 4250,
+      }),
+    ).resolves.toMatchObject({ applied: false, evidence: { status: 'pending', dispatch: acceptedB } });
+    await expect(
+      harness.compareAndSwapSignalTerminal({
+        ...identity,
+        expected: acceptedB,
+        terminal: { status: 'completed', signalId: identity.signalId, runId: 'different-run', result: 'invalid' },
+        updatedAt: 4500,
+      }),
+    ).rejects.toThrow();
+    await expect(
+      harness.compareAndSwapSignalTerminal({
+        ...identity,
+        expected: dispatchingA,
+        terminal: { status: 'completed', signalId: identity.signalId, runId: 'stale-run', result: 'stale' },
+        updatedAt: 5000,
+      }),
+    ).resolves.toMatchObject({ applied: false, evidence: { status: 'pending', dispatch: acceptedB } });
+    await expect(
+      harness.compareAndSwapSignalTerminal({
+        ...identity,
+        expected: acceptedB,
+        terminal: { status: 'completed', signalId: identity.signalId, runId: 'run-stable', result: 'winner' },
+        updatedAt: 6000,
+      }),
+    ).resolves.toMatchObject({
+      applied: true,
+      evidence: { status: 'completed', runId: 'run-stable', result: 'winner', dispatch: acceptedB },
+    });
+    await expect(
+      harness.writeMessageResultEvidence({
+        ...identity,
+        status: 'pending',
+        dispatch: { state: 'reserved' },
+        createdAt: 1000,
+        updatedAt: 7000,
+      }),
+    ).resolves.toMatchObject({
+      applied: false,
+      evidence: { status: 'completed', runId: 'run-stable', result: 'winner', dispatch: acceptedB },
+    });
+  });
+
+  it('applies exactly one of two competing unfenced terminal evidence writes', async () => {
+    const harness = store.stores.harness!;
+    const pending = {
+      harnessName: 'default',
+      sessionId: 'session-terminal-cas',
+      resourceId: 'resource-terminal-cas',
+      threadId: 'thread-terminal-cas',
+      signalId: 'signal-terminal-cas',
+      runId: 'run-terminal-cas',
+      operationKind: 'message' as const,
+      status: 'pending' as const,
+      createdAt: 1000,
+      updatedAt: 1000,
+    };
+    await harness.writeMessageResultEvidence(pending);
+    const competing = await Promise.all([
+      harness.writeMessageResultEvidence({
+        ...pending,
+        status: 'completed',
+        result: { winner: 'completed' },
+        updatedAt: 2000,
+      }),
+      harness.writeMessageResultEvidence({
+        ...pending,
+        status: 'failed',
+        error: { code: 'failed', message: 'failed' },
+        updatedAt: 2001,
+      }),
+    ]);
+    expect(competing.filter(result => result.applied === true)).toHaveLength(1);
+    expect(competing.filter(result => result.applied === false)).toHaveLength(1);
+    const winner = await harness.loadMessageResultEvidence({
+      sessionId: pending.sessionId,
+      resourceId: pending.resourceId,
+      threadId: pending.threadId,
+      signalId: pending.signalId,
+    });
+    expect(['completed', 'failed']).toContain((winner as { status: string }).status);
+    expect(competing.every(result => result.evidence?.status === (winner as { status: string }).status)).toBe(true);
+  });
+
+  it('settles and reloads completed and failed admitted messages after an adapter restart', async () => {
+    const harness = store.stores.harness!;
+    const terminals = [
+      { status: 'completed' as const, result: { text: 'done' } },
+      { status: 'failed' as const, error: { code: 'model_failed', message: 'model failed' } },
+    ];
+
+    for (const [index, terminal] of terminals.entries()) {
+      const pending = {
+        harnessName: 'default',
+        sessionId: `session-message-restart-${index}`,
+        resourceId: 'resource-1',
+        threadId: `thread-message-restart-${index}`,
+        signalId: `harness-message-${index}`,
+        runId: `run-message-${index}`,
+        admissionId: `admission-message-${index}`,
+        admissionHash: `hash-message-${index}`,
+        operationKind: 'message' as const,
+        status: 'pending' as const,
+        createdAt: 1000,
+        updatedAt: 1000,
+      };
+      await harness.writeMessageResultEvidence(pending);
+      await expect(
+        harness.writeMessageResultEvidence({ ...pending, ...terminal, updatedAt: 2000 }),
+      ).resolves.toMatchObject({ applied: true });
+
+      const restartedStore = new PostgresStore({ ...TEST_CONFIG, id: `pg-harness-restart-${index}` });
+      try {
+        await restartedStore.init();
+        await expect(
+          restartedStore.stores.harness!.loadMessageResultEvidence({
+            sessionId: pending.sessionId,
+            resourceId: pending.resourceId,
+            threadId: pending.threadId,
+            signalId: pending.signalId,
+          }),
+        ).resolves.toMatchObject({ ...terminal, operationKind: 'message', runId: pending.runId });
+      } finally {
+        await restartedStore.close();
+      }
+    }
   });
 
   // §5.2a/§5.3/§5.5 cross-adapter parity (mirrors InMemoryHarness): closing a

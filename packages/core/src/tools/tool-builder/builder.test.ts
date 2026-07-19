@@ -11,6 +11,35 @@ import { createTool } from '../../tools';
 import { isProviderDefinedTool, isVercelTool } from '../toolchecks';
 import { CoreToolBuilder } from './builder';
 
+describe('CoreToolBuilder recovery fingerprint', () => {
+  it('defers expensive recovery identity work until durable metadata is read', () => {
+    class RuntimeOnlyPolicy extends RegExp {
+      override test(value: string): boolean {
+        return value.startsWith('internal:') && super.test(value);
+      }
+    }
+
+    const originalTool = createTool({
+      id: 'lazy-recovery-fingerprint',
+      description: 'Proves ordinary tool conversion does not eagerly fingerprint runtime-only configuration.',
+      providerOptions: { policy: new RuntimeOnlyPolicy('reports', 'u') } as any,
+      execute: async () => ({ ok: true }),
+    });
+    const builtTool = new CoreToolBuilder({
+      originalTool,
+      options: {
+        name: 'lazy-recovery-fingerprint',
+        logger: noopLogger,
+      },
+    }).build();
+
+    expect(builtTool.id).toBe('lazy-recovery-fingerprint');
+    expect(() => builtTool.recoveryFingerprint).toThrow(
+      'Cannot create a durable recovery fingerprint for RegExp subclass',
+    );
+  });
+});
+
 describe('CoreToolBuilder FGA', () => {
   it('executes tools without FGA when only auth/server config is present', async () => {
     const execute = vi.fn().mockResolvedValue({ result: 'ok' });

@@ -63,7 +63,7 @@ import type { WorkspaceVersion } from './workspaces';
 
 export interface WorkflowTerminalParentRevisionState {
   generation: number;
-  terminalStatus: 'success' | 'failed' | 'canceled' | 'tripwire' | 'bailed' | null;
+  terminalStatus: 'success' | 'failed' | 'canceled' | 'tripwire' | 'bailed' | 'skipped' | null;
 }
 
 class WorkflowTerminalDestinationReceiptMap extends Map<string, WorkflowTerminalDestinationReceiptRecord> {

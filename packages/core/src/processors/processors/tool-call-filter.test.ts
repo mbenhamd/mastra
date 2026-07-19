@@ -1125,6 +1125,60 @@ describe('ToolCallFilter', () => {
       );
     });
 
+    it('preserves compact model output only for an explicit tool allowlist', async () => {
+      const filter = new ToolCallFilter({ preserveModelOutputFor: ['search'] });
+      const messages: MastraDBMessage[] = [
+        ...toolMessages,
+        {
+          id: 'msg-private-tool',
+          role: 'assistant',
+          content: {
+            format: 2,
+            parts: [
+              {
+                type: 'tool-invocation',
+                toolInvocation: {
+                  state: 'result',
+                  toolCallId: 'call-private',
+                  toolName: 'private-file',
+                  args: { path: 'PRIVATE_PATH' },
+                  result: 'PRIVATE_RAW_RESULT',
+                },
+                providerMetadata: { mastra: { modelOutput: 'PRIVATE_COMPACT_RESULT' } },
+              },
+            ],
+          },
+          createdAt: new Date(),
+        },
+      ];
+
+      const result = await filter.processInput({
+        messages,
+        messageList: createMessageList(messages),
+        abort: mockAbort,
+      });
+
+      const serialized = JSON.stringify(Array.isArray(result) ? result : result.get.all.db());
+      expect(serialized).toContain('search result:\\nCompact search summary');
+      expect(serialized).not.toContain('PRIVATE_COMPACT_RESULT');
+      expect(serialized).not.toContain('PRIVATE_RAW_RESULT');
+      expect(serialized).not.toContain('PRIVATE_PATH');
+    });
+
+    it('lets an explicit empty model-output allowlist override the legacy preserve-all option', async () => {
+      const filter = new ToolCallFilter({ preserveModelOutput: true, preserveModelOutputFor: [] });
+
+      const result = await filter.processInput({
+        messages: toolMessages,
+        messageList: createMessageList(toolMessages),
+        abort: mockAbort,
+      });
+
+      expect(JSON.stringify(Array.isArray(result) ? result : result.get.all.db())).not.toContain(
+        'Compact search summary',
+      );
+    });
+
     it('preserves model output while filtering only matching specific tools', async () => {
       const filter = new ToolCallFilter({ exclude: ['search'], preserveModelOutput: true });
       const messages: MastraDBMessage[] = [
@@ -1369,8 +1423,8 @@ describe('ToolCallFilter', () => {
       expect(JSON.stringify(resultMessages)).not.toContain('SECRET_RAW_RESULT');
     });
 
-    it('exposes preserveModelOutput through the processor provider config', async () => {
-      const parsedConfig = toolCallFilterProvider.configSchema.parse({ preserveModelOutput: true });
+    it('exposes the model-output allowlist through the processor provider config', async () => {
+      const parsedConfig = toolCallFilterProvider.configSchema.parse({ preserveModelOutputFor: ['search'] });
       const processor = toolCallFilterProvider.createProcessor(parsedConfig);
       const messageList = createMessageList(toolMessages);
 

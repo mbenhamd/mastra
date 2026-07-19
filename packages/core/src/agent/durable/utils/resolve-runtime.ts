@@ -30,6 +30,7 @@ import type {
   DurableAgenticWorkflowInput,
   RegistryModelListEntry,
 } from '../types';
+import { assertDurableToolHookPolicyAvailable } from './tool-hook-policy';
 
 /**
  * Runtime dependencies that need to be resolved at step execution time.
@@ -150,6 +151,10 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
   // runId can never rebind an older workflow to a newer run's runtime
   // dependencies (or clobber its MessageList) — it throws on binding mismatch.
   const globalEntry = getBoundRunRegistryEntry(runId, input.runtimeBindingId);
+  assertDurableToolHookPolicyAvailable({
+    serialized: input.options?.toolHookPolicy,
+    registryEntry: globalEntry,
+  });
   const registryModel = globalEntry?.model as (MastraLanguageModel & { __metadataOnly?: boolean }) | undefined;
   const hasHydratedEntry =
     !!globalEntry && globalEntry.isPlaceholder !== true && !!registryModel && registryModel.__metadataOnly !== true;

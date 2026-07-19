@@ -7,13 +7,17 @@ import { z } from 'zod';
 import { init } from '../../index';
 import type { InngestWorkflow } from '../../workflow';
 
-export const INNGEST_PORT = 4100;
-export const HANDLER_PORT = 4101;
+export const INNGEST_PORT = 4200;
+export const HANDLER_PORT = 4201;
+export const ADAPTER_TEST_ENDPOINTS = Object.freeze({
+  clientBaseUrl: `http://localhost:${INNGEST_PORT}`,
+  handlerPort: HANDLER_PORT,
+});
 
 export function createTestInngest(id: string) {
   return new Inngest({
     id,
-    baseUrl: `http://localhost:${INNGEST_PORT}`,
+    baseUrl: ADAPTER_TEST_ENDPOINTS.clientBaseUrl,
   });
 }
 

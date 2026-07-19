@@ -646,37 +646,21 @@ describe('runEvals', () => {
         .then(mockStep)
         .commit();
 
-      // Create mock scores storage
-      const saveScoreSpy = vi.fn().mockResolvedValue({ score: {} });
-      const mockScoresStore = {
-        saveScore: saveScoreSpy,
-      };
-
-      // Mock workflows store with methods needed for scorer workflow runs
-      const mockWorkflowsStore = {
-        getWorkflowRunById: vi.fn().mockResolvedValue(null),
-        deleteWorkflowRunById: vi.fn().mockResolvedValue(undefined),
-        persistWorkflowSnapshot: vi.fn().mockResolvedValue(undefined),
-        listWorkflowRuns: vi.fn().mockResolvedValue({ runs: [] }),
-      };
-
-      const mockStorage = {
-        init: vi.fn().mockResolvedValue(undefined),
-        getStore: vi.fn().mockImplementation(async (domain: string) => {
-          if (domain === 'workflows') return mockWorkflowsStore;
-          if (domain === 'scores') return mockScoresStore;
-          return null;
-        }),
-        __setLogger: vi.fn(),
-      };
+      // Workflow lifecycle identity requires the complete workflow storage
+      // contract. A partial test double can hide integration drift between the
+      // eval runner and workflow execution, so use the real in-memory domains.
+      const storage = new InMemoryStore();
 
       const mastra = new Mastra({
         workflows: {
           testWorkflow: workflow,
         },
         logger: false,
-        storage: mockStorage as any,
+        storage,
       });
+
+      const scoresStore = (await mastra.getStorage()!.getStore('scores'))!;
+      const saveScoreSpy = vi.spyOn(scoresStore, 'saveScore');
 
       const scorer = createScorer({
         id: 'workflowScorer',

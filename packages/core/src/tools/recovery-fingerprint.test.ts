@@ -1,6 +1,26 @@
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
-import { createToolRecoveryFingerprint, normalizeToolRecoverySchemaIdentity } from './recovery-fingerprint';
+import {
+  createToolRecoveryFingerprint,
+  defineLazyToolRecoveryFingerprint,
+  normalizeToolRecoverySchemaIdentity,
+} from './recovery-fingerprint';
+
+describe('defineLazyToolRecoveryFingerprint', () => {
+  it.each([Object.freeze, Object.seal])('stays memoized when the tool is made non-configurable', lock => {
+    let computations = 0;
+    const tool = {} as { recoveryFingerprint: string };
+    defineLazyToolRecoveryFingerprint(tool, () => {
+      computations += 1;
+      return 'fingerprint';
+    });
+    lock(tool);
+
+    expect(tool.recoveryFingerprint).toBe('fingerprint');
+    expect(tool.recoveryFingerprint).toBe('fingerprint');
+    expect(computations).toBe(1);
+  });
+});
 
 describe('createToolRecoveryFingerprint', () => {
   it('distinguishes regular-expression source and flags', () => {

@@ -38,6 +38,7 @@ import { isZodObject, safeExtendZodObject } from '../../utils/zod-utils';
 import type { SuspendOptions } from '../../workflows';
 import {
   createToolRecoveryFingerprint as hashToolRecoveryFingerprint,
+  defineLazyToolRecoveryFingerprint,
   normalizeToolRecoverySchema,
   normalizeToolRecoverySchemaIdentity,
 } from '../recovery-fingerprint';
@@ -1053,7 +1054,7 @@ export class CoreToolBuilder extends MastraBase {
     }
 
     const outputSchema = this.getOutputSchema();
-    let processedOutputSchema;
+    let processedOutputSchema: unknown;
 
     if (outputSchema) {
       if (isStandardSchemaWithJSON(outputSchema)) {
@@ -1112,19 +1113,6 @@ export class CoreToolBuilder extends MastraBase {
       requireApproval,
       needsApprovalFn,
       hasSuspendSchema: !!this.getSuspendSchema(),
-      recoveryFingerprint: createToolRecoveryFingerprint(
-        this.originalTool,
-        {
-          input: processedInputSchema,
-          output: processedOutputSchema,
-          suspend: this.getSuspendSchema(),
-          resume: this.getResumeSchema(),
-        },
-        {
-          backgroundConfig: this.options.backgroundConfig,
-          requireApproval: this.options.requireApproval,
-        },
-      ),
       execute: this.originalTool.execute
         ? this.createExecute(
             this.originalTool,
@@ -1134,7 +1122,7 @@ export class CoreToolBuilder extends MastraBase {
         : undefined,
     };
 
-    return this.bindFGAResourceId({
+    const builtTool = {
       ...definition,
       id: 'id' in this.originalTool ? this.originalTool.id : undefined,
       parameters: processedInputSchema ?? z.object({}),
@@ -1152,6 +1140,21 @@ export class CoreToolBuilder extends MastraBase {
       // Preserve tool-level background config so the agentic loop can pick it up
       // from the converted CoreTool at dispatch time.
       backgroundConfig: this.options.backgroundConfig,
-    } as unknown as CoreTool);
+    } as unknown as CoreTool;
+    const recoveryOriginalTool = this.originalTool;
+    const recoverySchemas = {
+      input: processedInputSchema,
+      output: processedOutputSchema,
+      suspend: this.getSuspendSchema(),
+      resume: this.getResumeSchema(),
+    };
+    const recoveryOptions = {
+      backgroundConfig: this.options.backgroundConfig,
+      requireApproval: this.options.requireApproval,
+    };
+    defineLazyToolRecoveryFingerprint(builtTool, () =>
+      createToolRecoveryFingerprint(recoveryOriginalTool, recoverySchemas, recoveryOptions),
+    );
+    return this.bindFGAResourceId(builtTool);
   }
 }

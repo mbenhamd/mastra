@@ -102,6 +102,32 @@ The session is organized into sub-objects, each owning one domain of per-convers
 
 ## Methods
 
+### Messaging
+
+#### `signal(options)`
+
+Send a user-message signal to the active thread. If a run is active, the signal interleaves into that exact run. If the thread is idle, it wakes a new run. The returned handle contains `id`, `runId`, `willInterleave`, `accepted`, `signal`, and a `result` promise for the eventual `AgentResult`.
+
+Without `admissionId`, `signal()` preserves its optimistic boundary and returns the native routing decision on the first await tick. With `admissionId`, it first persists a reservation, claims dispatch ownership, waits for native or broker acceptance, and then durably records that acceptance. A live competing dispatcher waits for the claim; an expired dispatcher may recover it.
+
+If native acceptance remains ambiguous for 30 seconds, or the caller aborts while waiting for it, the call rejects and stops renewing its dispatch claim. The durable row remains recoverable instead of being marked failed. After that claim expires, retry the same `admissionId` and payload: the retry acquires a new dispatch attempt while retaining the original signal and run IDs. The native runtime does not reuse a still-pending acknowledgement from the expired attempt; stable signal-ID deduplication still prevents an already-accepted same-payload signal from being appended twice. A conflicting payload with the same `admissionId` continues to reject before dispatch.
+
+```typescript
+const session = await harness.session({ resourceId: 'project-xyz' })
+const handle = await session.signal({
+  content: 'Use the updated requirements',
+  admissionId: 'requirements-v2',
+})
+
+const result = await handle.result
+```
+
+An exact admitted retry returns the original signal and run identity. Idle recovery always reuses the deterministic idle run ID. Accepted active delivery is pinned to the original active run and fails explicitly if that run disappears; it is never rerouted to a new cold run.
+
+Durable admission evidence records whether the operation came from `message()` or `signal()`. This keeps signal dispatch fencing isolated from normal message settlement across process restarts. Older admitted signal rows are migrated only when they already contain dispatch state or use the stable `harness-channel-signal-` identity; a run ID by itself is not treated as evidence that the row is a signal.
+
+`admissionId` provides a stable at-least-once execution identity, not exactly-once side effects. After a crash or lost acknowledgement, recovery may repeat provider or tool work under the same run ID. External effects still need their own idempotency keys when exactly-once behavior matters.
+
 ### Permissions
 
 Session-scoped grants auto-approve tools without prompting. Grants are ephemeral — they reset when the session restarts and are never persisted.

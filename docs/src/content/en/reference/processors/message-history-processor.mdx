@@ -18,8 +18,9 @@ import { MessageHistory } from '@mastra/core/processors'
 const processor = new MessageHistory({
   storage: memoryStorage,
   lastMessages: 50,
-  toolCallFilter: {
-    preserveModelOutput: true,
+  persistence: {
+    mode: 'final-turn',
+    preserveModelOutputFor: ['publicSearch'],
     maxModelOutputBytes: 4096,
   },
 })
@@ -54,7 +55,7 @@ const processor = new MessageHistory({
             name: 'toolCallFilter',
             type: 'MessageHistoryToolCallFilterOptions',
             description:
-              'Optional policy that removes selected tool calls and results before MessageHistory persists them. If omitted, existing persistence behavior is unchanged',
+              'Optional policy that removes selected tool calls and results before MessageHistory persists them. If omitted, existing persistence behavior is unchanged. It cannot be combined with persistence',
             isOptional: true,
             properties: [
               {
@@ -75,10 +76,52 @@ const processor = new MessageHistory({
                     defaultValue: 'false',
                   },
                   {
+                    name: 'preserveModelOutputFor',
+                    type: 'string[]',
+                    description:
+                      'Preserves compact model-facing output only for the listed filtered tools. An explicit empty list preserves none and takes precedence over preserveModelOutput',
+                    isOptional: true,
+                  },
+                  {
                     name: 'maxModelOutputBytes',
                     type: 'number',
                     description:
                       'Maximum UTF-8 bytes retained from each preserved model output. Defaults to 16384 bytes',
+                    isOptional: true,
+                    defaultValue: '16384',
+                  },
+                ],
+              },
+            ],
+          },
+          {
+            name: 'persistence',
+            type: 'MessageHistoryFinalTurnPersistenceOptions',
+            description:
+              'Optional final-turn policy that keeps one stable user turn, approved compact tool outcomes, and only the final assistant answer. It cannot be combined with toolCallFilter',
+            isOptional: true,
+            properties: [
+              {
+                type: 'MessageHistoryFinalTurnPersistenceOptions',
+                parameters: [
+                  {
+                    name: 'mode',
+                    type: "'final-turn'",
+                    description: 'Enables final-turn persistence',
+                    isOptional: false,
+                  },
+                  {
+                    name: 'preserveModelOutputFor',
+                    type: 'string[]',
+                    description:
+                      'Allowlist of tool names whose compact model output may be persisted. Omitted or empty preserves none',
+                    isOptional: true,
+                  },
+                  {
+                    name: 'maxModelOutputBytes',
+                    type: 'number',
+                    description:
+                      'Maximum UTF-8 bytes retained from each approved compact model output. Defaults to 16384 bytes',
                     isOptional: true,
                     defaultValue: '16384',
                   },
@@ -183,6 +226,8 @@ Set `toolCallFilter` to remove tool calls and results at the persistence boundar
 
 `preserveModelOutput` keeps compact model-facing output from completed results. It doesn't preserve media, incomplete states, denied results, failed results, raw arguments, or raw results. When `maxModelOutputBytes` is omitted, MessageHistory retains at most 16 KiB per preserved model output.
 
+Set `preserveModelOutputFor` to retain compact output only for named tools. An explicit empty list preserves no output. If the option is omitted, the existing `preserveModelOutput` behavior is unchanged.
+
 When this persistence policy removes or compacts a tool payload, it also removes message-level provider metadata from that changed message. Messages without a matching tool payload remain unchanged by the tool-call policy.
 
 ```typescript
@@ -191,6 +236,25 @@ const messageHistory = new MessageHistory({
   toolCallFilter: {
     exclude: ['searchDatabase'],
     preserveModelOutput: true,
+    maxModelOutputBytes: 4096,
+  },
+})
+```
+
+## Persist only the final turn
+
+Set `persistence.mode` to `final-turn` to store one stable user message, approved compact outcomes, and the final assistant text. This mode removes raw tool calls and results, reasoning, step markers, provisional text, transient assistant rows, and provider metadata.
+
+`persistence` and `toolCallFilter` are mutually exclusive. Passing both throws a `TypeError` when `MessageHistory` is constructed.
+
+Compact output is fail closed. Omit `preserveModelOutputFor`, or pass an empty list, to retain no tool output.
+
+```typescript
+const messageHistory = new MessageHistory({
+  storage,
+  persistence: {
+    mode: 'final-turn',
+    preserveModelOutputFor: ['publicSearch'],
     maxModelOutputBytes: 4096,
   },
 })

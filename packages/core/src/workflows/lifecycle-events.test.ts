@@ -450,9 +450,28 @@ describe('canonical workflow lifecycle model', () => {
     await expect(run.resume({ step: 'approval', resumeData: { round: 1 } })).resolves.toMatchObject({
       status: 'suspended',
     });
+    const workflowsStore = await storage.getStore('workflows');
+    const firstResumeSnapshot = await workflowsStore?.loadWorkflowSnapshot({
+      workflowName: 'default-resume',
+      runId: 'default-resume-run',
+    });
+    expect(firstResumeSnapshot).toMatchObject({
+      status: 'suspended',
+      lifecycleResumeAttempt: 1,
+    });
+    expect(firstResumeSnapshot?.resumeCheckpoint).toBeUndefined();
     await expect(run.resume({ step: 'approval', resumeData: { round: 2 } })).resolves.toMatchObject({
       status: 'success',
     });
+    const terminalResumeSnapshot = await workflowsStore?.loadWorkflowSnapshot({
+      workflowName: 'default-resume',
+      runId: 'default-resume-run',
+    });
+    expect(terminalResumeSnapshot).toMatchObject({
+      status: 'success',
+      lifecycleResumeAttempt: 2,
+    });
+    expect(terminalResumeSnapshot?.resumeCheckpoint).toBeUndefined();
 
     const records = lifecycleRecords(publish);
     expect(new Set(records.map(item => item.record.executionGeneration)).size).toBe(1);
@@ -480,6 +499,54 @@ describe('canonical workflow lifecycle model', () => {
       workflowTransitions.length,
     );
   });
+
+  it.each(['sleep', 'sleepUntil'] as const)(
+    'persists an ordinary resume result after an intermediate %s wait',
+    async delayKind => {
+      const storage = new MockStore();
+      const approval = createStep({
+        id: `approval-before-${delayKind}`,
+        inputSchema: z.object({ value: z.number() }),
+        outputSchema: z.object({ value: z.number() }),
+        suspendSchema: z.object({ value: z.number() }),
+        resumeSchema: z.object({ approved: z.boolean() }),
+        execute: async ({ inputData, resumeData, suspend }) => {
+          if (!resumeData) {
+            await suspend({ value: inputData.value });
+          }
+          return { value: inputData.value };
+        },
+      });
+      const workflowBuilder = createWorkflow({
+        id: `default-resume-${delayKind}`,
+        inputSchema: z.object({ value: z.number() }),
+        outputSchema: z.object({ value: z.number() }),
+        steps: [approval],
+      }).then(approval);
+      const workflow = (
+        delayKind === 'sleep' ? workflowBuilder.sleep(1) : workflowBuilder.sleepUntil(new Date(Date.now() + 1))
+      ).commit();
+      new Mastra({ logger: false, storage, workflows: { defaultResumeDelay: workflow } });
+      const runId = `default-resume-${delayKind}-run`;
+      const run = await workflow.createRun({ runId });
+
+      await expect(run.start({ inputData: { value: 3 } })).resolves.toMatchObject({ status: 'suspended' });
+      await expect(run.resume({ step: approval.id, resumeData: { approved: true } })).resolves.toMatchObject({
+        status: 'success',
+      });
+
+      const workflowsStore = await storage.getStore('workflows');
+      await expect(
+        workflowsStore?.loadWorkflowSnapshot({
+          workflowName: workflow.id,
+          runId,
+        }),
+      ).resolves.toMatchObject({
+        status: 'success',
+        lifecycleResumeAttempt: 1,
+      });
+    },
+  );
 
   it('emits step.resumed for a valid falsy resume payload', async () => {
     const pubsub = new EventEmitterPubSub();

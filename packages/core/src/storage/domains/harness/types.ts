@@ -722,6 +722,30 @@ export interface HarnessStoredPublicError {
   message: string;
 }
 
+/**
+ * Durable execution ownership for one admitted `Session.signal()` receipt.
+ *
+ * The stable `runId` is an at-least-once execution identity. It prevents a
+ * recovery attempt from inventing a different cold-run identity, but it does
+ * not make provider or tool side effects exactly once.
+ */
+export type AgentSignalDispatchState =
+  | { state: 'reserved' }
+  | {
+      state: 'dispatching';
+      attemptId: string;
+      claimExpiresAt: number;
+      delivery: 'idle' | 'active';
+      runId: string;
+    }
+  | {
+      state: 'accepted';
+      attemptId: string;
+      delivery: 'idle' | 'active';
+      runId: string;
+      acceptedAt: number;
+    };
+
 export type AgentSignalResultStatus = (
   | { status: 'pending'; signalId: string; runId?: string }
   | { status: 'completed'; signalId: string; runId: string; result: unknown }
@@ -729,6 +753,10 @@ export type AgentSignalResultStatus = (
 ) & {
   modeId?: string;
   modelId?: string;
+  /** Durable operation discriminator for admitted message and signal rows. */
+  operationKind?: 'message' | 'signal';
+  /** Present on public/channel signal admissions that use durable dispatch fencing. */
+  dispatch?: AgentSignalDispatchState;
 };
 
 export interface AgentSignalAccepted {

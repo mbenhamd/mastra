@@ -126,6 +126,7 @@ export type {
   SerializableDurableState,
   SerializableDurableOptions,
   SerializableModelSettings,
+  SerializableToolHookPolicy,
   DurableAgenticWorkflowInput,
   // Step I/O types
   DurableLLMStepOutput,
@@ -191,6 +192,7 @@ export {
   calculateAccumulatedUsage,
   buildStepRecord,
   createBaseIterationStateUpdate,
+  mapDurableIterationToLLMInput,
   resolveDurableToolCallConcurrency,
 } from './workflows/shared';
 export type {

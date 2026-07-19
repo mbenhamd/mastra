@@ -6,8 +6,6 @@
  * so test isolation is achieved through unique agent IDs and run IDs
  * rather than separate Inngest apps.
  */
-import type { ChildProcess } from 'node:child_process';
-import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import { serve } from '@hono/node-server';
 import type { ServerType } from '@hono/node-server';
@@ -17,10 +15,21 @@ import { createHonoServer } from '@mastra/deployer/server';
 import { DefaultStorage } from '@mastra/libsql';
 import { Inngest } from 'inngest';
 
+import { createInngestDurableAgenticWorkflowIds } from '../durable-agent/create-inngest-agentic-workflow';
 import { serve as inngestServe } from '../index';
+import {
+  createInngestTestRuntimeConfig,
+  createLocalTestEndpoints,
+  InngestTestRuntimeManager,
+} from './inngest-test-runtime';
 
 export const INNGEST_PORT = 4100;
 export const HANDLER_PORT = 4101;
+
+const DURABLE_AGENT_TEST_ENDPOINTS = createLocalTestEndpoints({
+  inngestPort: INNGEST_PORT,
+  handlerPort: HANDLER_PORT,
+});
 
 // =============================================================================
 // Shared Test Infrastructure
@@ -30,7 +39,7 @@ export const HANDLER_PORT = 4101;
 let sharedInngest: Inngest | null = null;
 let sharedMastra: Mastra | null = null;
 let sharedServer: ServerType | null = null;
-let inngestDevServer: ChildProcess | null = null;
+let sharedRuntime: InngestTestRuntimeManager | null = null;
 
 type ApiRouteCreateHandler = Extract<ApiRoute, { createHandler: unknown }>['createHandler'];
 type ApiRouteHandler = Awaited<ReturnType<ApiRouteCreateHandler>>;
@@ -69,152 +78,172 @@ export function getSharedMastra(): Mastra {
 }
 
 /**
+ * Re-register the shared test app after adding a dynamically-created durable
+ * agent and wait until both of that agent's Inngest functions are visible.
+ */
+export async function registerSharedAgentFunctions(agentId: string): Promise<void> {
+  if (!sharedRuntime) {
+    throw new Error('Shared Inngest runtime not initialized. Call setupSharedTestInfrastructure() first.');
+  }
+
+  const workflowIds = createInngestDurableAgenticWorkflowIds(agentId);
+  await sharedRuntime.ensureReady([
+    `workflow.${workflowIds.AGENTIC_LOOP}`,
+    `workflow.${workflowIds.AGENTIC_EXECUTION}`,
+  ]);
+}
+
+/**
  * Wait for Inngest to sync with the app.
  */
 export async function waitForInngestSync(ms = 500): Promise<void> {
   await new Promise(resolve => setTimeout(resolve, ms));
 }
 
-/**
- * Start the Inngest dev server using npx inngest-cli.
- * Returns a promise that resolves when the server is ready.
- */
-async function startInngestDevServer(): Promise<ChildProcess> {
-  return new Promise((resolve, reject) => {
-    const args = [
-      'inngest-cli',
-      'dev',
-      '-p',
-      String(INNGEST_PORT),
-      '-u',
-      `http://localhost:${HANDLER_PORT}/inngest/api`,
-      '--poll-interval=1',
-      '--no-discovery',
-    ];
-
-    const proc = spawn('npx', args, {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      detached: false,
-    });
-
-    let started = false;
-    const timeout = setTimeout(() => {
-      if (!started) {
-        proc.kill();
-        reject(new Error('Inngest dev server failed to start within 30s'));
-      }
-    }, 30000);
-
-    const checkOutput = (output: string) => {
-      // Inngest dev server outputs JSON logs - look for the API server starting
-      // Example: {"time":"...","level":"INFO","msg":"starting server","caller":"api","addr":"0.0.0.0:4100"}
-      if (output.includes('"starting server"') && output.includes(`"addr":"0.0.0.0:${INNGEST_PORT}"`)) {
-        if (!started) {
-          started = true;
-          clearTimeout(timeout);
-          resolve(proc);
-        }
-      }
-    };
-
-    proc.stdout?.on('data', (data: Buffer) => {
-      checkOutput(data.toString());
-    });
-
-    proc.stderr?.on('data', (data: Buffer) => {
-      // JSON output often goes to stderr
-      checkOutput(data.toString());
-    });
-
-    proc.on('error', err => {
-      clearTimeout(timeout);
-      reject(err);
-    });
-
-    proc.on('exit', code => {
-      if (!started) {
-        clearTimeout(timeout);
-        reject(new Error(`Inngest dev server exited with code ${code}`));
-      }
+async function closeServer(server: ServerType): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    server.close(error => {
+      if ((error as NodeJS.ErrnoException | undefined)?.code === 'ERR_SERVER_NOT_RUNNING') resolve();
+      else if (error) reject(error);
+      else resolve();
     });
   });
 }
 
-/**
- * Wait for Inngest dev server to be reachable.
- */
-async function waitForInngestReady(maxAttempts = 30, intervalMs = 1000): Promise<void> {
-  for (let i = 0; i < maxAttempts; i++) {
+export async function cleanupSharedTestResources<TServer, TRuntime>(params: {
+  server: TServer | null;
+  runtime: TRuntime | null;
+  closeServer: (server: TServer) => Promise<void>;
+  stopRuntime: (runtime: TRuntime) => Promise<void>;
+}): Promise<{ server: TServer | null; runtime: TRuntime | null; errors: unknown[] }> {
+  let { server, runtime } = params;
+  const errors: unknown[] = [];
+
+  if (runtime) {
     try {
-      const response = await fetch(`http://localhost:${INNGEST_PORT}/health`);
-      if (response.ok) {
-        return;
-      }
-    } catch {
-      // Server not ready yet
+      await params.stopRuntime(runtime);
+      runtime = null;
+    } catch (error) {
+      errors.push(error);
     }
-    await new Promise(resolve => setTimeout(resolve, intervalMs));
   }
-  throw new Error(`Inngest dev server not ready after ${maxAttempts} attempts`);
+  if (server) {
+    try {
+      await params.closeServer(server);
+      server = null;
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+
+  return { server, runtime, errors };
+}
+
+async function cleanupSharedTestInfrastructureResources(): Promise<unknown[]> {
+  const server = sharedServer;
+  const runtime = sharedRuntime;
+  const cleanup = await cleanupSharedTestResources({
+    server,
+    runtime,
+    closeServer,
+    stopRuntime: activeRuntime => activeRuntime.stop(),
+  });
+
+  if (sharedServer === server) sharedServer = cleanup.server;
+  if (sharedRuntime === runtime) sharedRuntime = cleanup.runtime;
+  return cleanup.errors;
 }
 
 /**
  * Initialize shared test infrastructure.
  * Call this once in beforeAll for the test suite.
  *
- * This starts the Inngest dev server using npx (no Docker required).
+ * The handler starts before the policy-owned, digest-pinned Inngest runtime so
+ * registration readiness proves this exact test app is reachable.
  */
 export async function setupSharedTestInfrastructure(): Promise<void> {
-  // Start Inngest dev server first (needs to be running before we create the app server)
-  // Skip if INNGEST_DEV_EXTERNAL=true (for running against Docker or existing server)
-  if (process.env.INNGEST_DEV_EXTERNAL !== 'true') {
-    try {
-      inngestDevServer = await startInngestDevServer();
-      // Give it a moment to fully initialize
-      await waitForInngestReady();
-    } catch (error) {
-      console.error('Failed to start Inngest dev server:', error);
-      throw error;
-    }
+  if (sharedRuntime || sharedServer) {
+    throw new Error('Shared Inngest test infrastructure still requires cleanup; retry teardown before setup.');
   }
 
-  // Create shared Inngest client
-  const inngest = getSharedInngest();
+  const runtime = new InngestTestRuntimeManager(createInngestTestRuntimeConfig(DURABLE_AGENT_TEST_ENDPOINTS));
+  sharedRuntime = runtime;
 
-  // Create the shared workflow
-  const { createInngestDurableAgenticWorkflow } = await import('../durable-agent/create-inngest-agentic-workflow');
-  const workflow = createInngestDurableAgenticWorkflow({ inngest });
+  try {
+    // Create shared Inngest client
+    const inngest = getSharedInngest();
 
-  // Create shared Mastra instance with the workflow pre-registered
-  // This is required because Inngest reads workflows at serve() time
-  sharedMastra = new Mastra({
-    storage: new DefaultStorage({
-      id: 'shared-test-storage',
-      url: ':memory:',
-    }),
-    workflows: {
-      [workflow.id]: workflow,
-    },
-    server: {
-      apiRoutes: [
+    // Create the shared workflow
+    const { createInngestDurableAgenticWorkflow } = await import('../durable-agent/create-inngest-agentic-workflow');
+    const workflow = createInngestDurableAgenticWorkflow({ inngest });
+
+    // Create shared Mastra instance with the workflow pre-registered
+    // This is required because Inngest reads workflows at serve() time
+    sharedMastra = new Mastra({
+      storage: new DefaultStorage({
+        id: 'shared-test-storage',
+        url: ':memory:',
+      }),
+      workflows: {
+        [workflow.id]: workflow,
+      },
+      server: {
+        apiRoutes: [
+          {
+            path: '/inngest/api',
+            method: 'ALL',
+            createHandler: async ({ mastra }) => {
+              // Tests add a uniquely named durable agent for each case after
+              // the HTTP server has started. Recreate Inngest's Hono handler
+              // per request so registration PUTs see the current Mastra
+              // workflow registry rather than the setup-time snapshot.
+              const handler: ApiRouteHandler = async (...args) => {
+                const currentHandler = inngestServe({
+                  mastra,
+                  inngest,
+                  ...runtime.registerOptions,
+                }) as unknown as ApiRouteHandler;
+                return currentHandler(...args);
+              };
+              return handler;
+            },
+          },
+        ],
+      },
+    });
+
+    // Create and start shared server
+    const app = await createHonoServer(sharedMastra);
+    await new Promise<void>((resolve, reject) => {
+      const onError = (error: Error) => {
+        server.off('error', onError);
+        reject(error);
+      };
+      const server = serve(
         {
-          path: '/inngest/api',
-          method: 'ALL',
-          createHandler: async ({ mastra }) => inngestServe({ mastra, inngest }) as unknown as ApiRouteHandler,
+          fetch: app.fetch,
+          port: HANDLER_PORT,
         },
-      ],
-    },
-  });
+        () => {
+          server.off('error', onError);
+          resolve();
+        },
+      );
+      sharedServer = server;
+      server.once('error', onError);
+    });
 
-  // Create and start shared server
-  const app = await createHonoServer(sharedMastra);
-  sharedServer = serve({
-    fetch: app.fetch,
-    port: HANDLER_PORT,
-  });
+    await runtime.ensureReady([`workflow.${workflow.id}`]);
+  } catch (error) {
+    const cleanupErrors = await cleanupSharedTestInfrastructureResources();
+    sharedMastra = null;
+    sharedInngest = null;
 
-  // Wait for Inngest to sync with our app
-  await waitForInngestSync(2000);
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError([error, ...cleanupErrors], 'Failed to set up and clean up shared Inngest test runtime');
+    }
+    throw error;
+  }
 }
 
 /**
@@ -222,28 +251,14 @@ export async function setupSharedTestInfrastructure(): Promise<void> {
  * Call this once in afterAll for the test suite.
  */
 export async function teardownSharedTestInfrastructure(): Promise<void> {
-  // Stop the app server first
-  if (sharedServer) {
-    await new Promise<void>(resolve => {
-      sharedServer!.close(() => resolve());
-    });
-    sharedServer = null;
-  }
-
-  // Stop the Inngest dev server
-  if (inngestDevServer) {
-    inngestDevServer.kill('SIGTERM');
-    // Wait a bit for graceful shutdown
-    await new Promise(resolve => setTimeout(resolve, 500));
-    // Force kill if still running
-    if (!inngestDevServer.killed) {
-      inngestDevServer.kill('SIGKILL');
-    }
-    inngestDevServer = null;
-  }
-
+  const cleanupErrors = await cleanupSharedTestInfrastructureResources();
   sharedMastra = null;
   sharedInngest = null;
+
+  if (cleanupErrors.length === 1) throw cleanupErrors[0];
+  if (cleanupErrors.length > 1) {
+    throw new AggregateError(cleanupErrors, 'Failed to clean up shared Inngest test infrastructure');
+  }
 }
 
 // =============================================================================

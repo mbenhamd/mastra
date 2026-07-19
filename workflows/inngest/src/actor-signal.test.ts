@@ -459,5 +459,17 @@ describe('@mastra/inngest actor signal threading (hermetic)', () => {
     expect(invokeData[0].executionGeneration).toBe('nested-resume-execution');
     expect(invokeData[0].lifecycleResumeAttempt).toBe(5);
     expect(invokeData[0].lifecycleStepStates).toEqual({});
+    expect(invokeData[0].resume.steps).toEqual(['nested-step']);
+    expect(invokeData[0].resume.resumePath).toEqual([0]);
+    await expect(
+      workflowsStore!.loadWorkflowSnapshot({
+        workflowName: 'nested-resume-workflow',
+        runId: 'nested-run',
+      }),
+    ).resolves.toMatchObject({
+      status: 'running',
+      executionGeneration: 'nested-resume-execution',
+      lifecycleResumeAttempt: 5,
+    });
   });
 });

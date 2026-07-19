@@ -480,7 +480,7 @@ describe('Workflow (Evented Engine Specific)', () => {
       }
 
       // Verify perStep stream event format (evented-specific)
-      expect(watchData.length).toBe(7);
+      expect(watchData.length).toBe(6);
       expect(watchData.map(e => e.type)).toEqual([
         'workflow-start',
         'workflow-start',
@@ -488,8 +488,22 @@ describe('Workflow (Evented Engine Specific)', () => {
         'workflow-step-result',
         'workflow-paused', // perStep pauses after first step
         'workflow-finish',
-        'workflow-finish',
       ]);
+      expect(watchData.at(-1)).toMatchObject({
+        type: 'workflow-finish',
+        runId,
+        payload: {
+          workflowStatus: 'paused',
+          metadata: {},
+          output: {
+            usage: {
+              inputTokens: 0,
+              outputTokens: 0,
+              totalTokens: 0,
+            },
+          },
+        },
+      });
       // Verify perStep behavior
       expect(executionResult.status).toBe('paused');
       expect(executionResult.steps.step1?.status).toBe('success');
@@ -554,7 +568,7 @@ describe('Workflow (Evented Engine Specific)', () => {
       const executionResult = await output.result;
 
       // Verify sleep waiting flow stream event format (evented-specific)
-      expect(watchData.length).toBe(10);
+      expect(watchData.length).toBe(9);
       expect(watchData.map(e => e.type)).toEqual([
         'workflow-start',
         'workflow-start',
@@ -565,8 +579,22 @@ describe('Workflow (Evented Engine Specific)', () => {
         'workflow-step-start',
         'workflow-step-result',
         'workflow-finish',
-        'workflow-finish',
       ]);
+      expect(watchData.at(-1)).toMatchObject({
+        type: 'workflow-finish',
+        runId,
+        payload: {
+          workflowStatus: 'success',
+          metadata: {},
+          output: {
+            usage: {
+              inputTokens: 0,
+              outputTokens: 0,
+              totalTokens: 0,
+            },
+          },
+        },
+      });
       // Result verification covered by shared suite
       expect(executionResult.status).toBe('success');
 

@@ -9,14 +9,30 @@ import type {
   PruneResult,
   RetentionTablesDescriptor,
   TableRetentionPolicy,
+  AdmitWorkflowResumeInput,
+  AdmitWorkflowResumeResult,
+  ConsumeWorkflowResumeResult,
+  ConsumeWorkflowResumeResultInput,
+  FinalizeWorkflowResumeInput,
+  FinalizeWorkflowResumeResult,
+  PersistWorkflowStepUpdateInput,
+  PersistWorkflowStepUpdateResult,
+  RollbackWorkflowResumeInput,
+  RollbackWorkflowResumeResult,
+  WorkflowResumeCapabilities,
 } from '@mastra/core/storage';
 import {
+  admitWorkflowResumeRecord,
+  consumeWorkflowResumeResultRecord,
   createStorageErrorId,
+  finalizeWorkflowResumeRecord,
   mergeWorkflowStepResult,
   normalizePerPage,
+  persistWorkflowStepUpdateRecord,
   TABLE_WORKFLOW_SNAPSHOT,
   TABLE_SCHEMAS,
   WorkflowsStorage,
+  rollbackWorkflowResumeRecord,
 } from '@mastra/core/storage';
 import type { WorkflowRunState, StepResult } from '@mastra/core/workflows';
 import { LibSQLDB, resolveClient } from '../../db';
@@ -24,6 +40,8 @@ import type { LibSQLDomainConfig } from '../../db';
 import { createExecuteWriteOperationWithRetry, safeStringify } from '../../db/utils';
 import { withClientWriteLock } from '../../db/write-lock';
 import { runPrune, resolveTargets } from '../../retention';
+
+const MAX_RESUME_CAS_ATTEMPTS = 100;
 
 export class WorkflowsLibSQL extends WorkflowsStorage {
   /**
@@ -61,6 +79,142 @@ export class WorkflowsLibSQL extends WorkflowsStorage {
 
   supportsConcurrentUpdates(): boolean {
     return true;
+  }
+
+  getWorkflowResumeCapabilities(): WorkflowResumeCapabilities {
+    return { atomicResumeVersion: 1, fencedStepUpdateVersion: 1 };
+  }
+
+  private materializeResumeSnapshot(snapshot: WorkflowRunState): WorkflowRunState {
+    return JSON.parse(safeStringify(snapshot)) as WorkflowRunState;
+  }
+
+  private async mutateWorkflowResume<T extends { status: string }>(
+    workflowName: string,
+    runId: string,
+    resourceId: string | undefined,
+    mutate: (snapshot: WorkflowRunState | undefined) => T & { snapshot?: WorkflowRunState },
+    operation: string,
+  ): Promise<T> {
+    return this.executeWithRetry(
+      () =>
+        withClientWriteLock(this.#client, async () => {
+          // A bare LibSQL `:memory:` database is private to each connection.
+          // Interactive transactions move the client onto another connection,
+          // which therefore cannot see the initialized schema. Use an optimistic
+          // compare-and-swap instead: the conditional UPDATE is one atomic
+          // statement across local and remote clients, and a changed predecessor
+          // retries the complete read/transform/write operation.
+          for (let attempt = 0; attempt < MAX_RESUME_CAS_ATTEMPTS; attempt++) {
+            const row = await this.#client.execute({
+              sql: `SELECT json(snapshot) as snapshot, resourceId FROM ${TABLE_WORKFLOW_SNAPSHOT} WHERE workflow_name = ? AND run_id = ?`,
+              args: [workflowName, runId],
+            });
+            const retained = row.rows?.[0];
+            const serializedSnapshot = retained?.snapshot;
+            const snapshot = serializedSnapshot
+              ? this.materializeResumeSnapshot(
+                  typeof serializedSnapshot === 'string' ? JSON.parse(serializedSnapshot) : serializedSnapshot,
+                )
+              : undefined;
+            const outcome = mutate(snapshot);
+            const { snapshot: updatedSnapshot, ...publicResult } = outcome;
+            if (!updatedSnapshot) return publicResult as T;
+
+            const retainedResourceId =
+              (retained?.resourceId as string | null | undefined) ?? updatedSnapshot.resourceId ?? resourceId ?? null;
+            if (!retained || serializedSnapshot === undefined || serializedSnapshot === null) {
+              const now = new Date().toISOString();
+              const inserted = await this.#client.execute({
+                sql: `INSERT INTO ${TABLE_WORKFLOW_SNAPSHOT} (workflow_name, run_id, resourceId, snapshot, createdAt, updatedAt)
+                      VALUES (?, ?, ?, jsonb(?), ?, ?)
+                      ON CONFLICT(workflow_name, run_id) DO NOTHING`,
+                args: [workflowName, runId, retainedResourceId, safeStringify(updatedSnapshot), now, now],
+              });
+              if (inserted.rowsAffected === 1) return publicResult as T;
+
+              await new Promise(resolve => setTimeout(resolve, Math.min(attempt + 1, 10)));
+              continue;
+            }
+
+            const updated = await this.#client.execute({
+              sql: `UPDATE ${TABLE_WORKFLOW_SNAPSHOT}
+                    SET resourceId = ?, snapshot = jsonb(?), updatedAt = ?
+                    WHERE workflow_name = ? AND run_id = ? AND json(snapshot) = ?`,
+              args: [
+                retainedResourceId,
+                safeStringify(updatedSnapshot),
+                new Date().toISOString(),
+                workflowName,
+                runId,
+                String(serializedSnapshot),
+              ],
+            });
+            if (updated.rowsAffected === 1) return publicResult as T;
+
+            await new Promise(resolve => setTimeout(resolve, Math.min(attempt + 1, 10)));
+          }
+
+          throw new Error(
+            `Workflow resume mutation did not converge after ${MAX_RESUME_CAS_ATTEMPTS} compare-and-swap attempts`,
+          );
+        }),
+      operation,
+    );
+  }
+
+  async admitWorkflowResume(input: AdmitWorkflowResumeInput): Promise<AdmitWorkflowResumeResult> {
+    return this.mutateWorkflowResume(
+      input.workflowName,
+      input.runId,
+      input.resourceId,
+      snapshot =>
+        admitWorkflowResumeRecord(snapshot, input, Date.now(), value => this.materializeResumeSnapshot(value)),
+      'admitWorkflowResume',
+    );
+  }
+
+  async rollbackWorkflowResume(input: RollbackWorkflowResumeInput): Promise<RollbackWorkflowResumeResult> {
+    return this.mutateWorkflowResume(
+      input.workflowName,
+      input.runId,
+      input.resourceId,
+      snapshot =>
+        rollbackWorkflowResumeRecord(snapshot, input, Date.now(), value => this.materializeResumeSnapshot(value)),
+      'rollbackWorkflowResume',
+    );
+  }
+
+  async finalizeWorkflowResume(input: FinalizeWorkflowResumeInput): Promise<FinalizeWorkflowResumeResult> {
+    return this.mutateWorkflowResume(
+      input.workflowName,
+      input.runId,
+      input.resourceId,
+      snapshot =>
+        finalizeWorkflowResumeRecord(snapshot, input, Date.now(), value => this.materializeResumeSnapshot(value)),
+      'finalizeWorkflowResume',
+    );
+  }
+
+  async consumeWorkflowResumeResult(input: ConsumeWorkflowResumeResultInput): Promise<ConsumeWorkflowResumeResult> {
+    return this.mutateWorkflowResume(
+      input.workflowName,
+      input.runId,
+      undefined,
+      snapshot =>
+        consumeWorkflowResumeResultRecord(snapshot, input, Date.now(), value => this.materializeResumeSnapshot(value)),
+      'consumeWorkflowResumeResult',
+    );
+  }
+
+  async persistWorkflowStepUpdate(input: PersistWorkflowStepUpdateInput): Promise<PersistWorkflowStepUpdateResult> {
+    return this.mutateWorkflowResume(
+      input.workflowName,
+      input.runId,
+      input.resourceId,
+      snapshot => persistWorkflowStepUpdateRecord(snapshot, input, value => this.materializeResumeSnapshot(value)),
+      'persistWorkflowStepUpdate',
+    );
   }
 
   private parseWorkflowRun(row: Record<string, any>): WorkflowRun {

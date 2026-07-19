@@ -28,7 +28,7 @@ import type {
 } from './types';
 import { WORKFLOW_TERMINAL_FOREACH_RUN_KEY, WORKFLOW_TERMINAL_FOREACH_STATE_KEY } from './types';
 
-const FINAL_PARENT_STATUSES = new Set(['success', 'failed', 'canceled', 'tripwire', 'bailed']);
+const FINAL_PARENT_STATUSES = new Set(['success', 'failed', 'canceled', 'tripwire', 'bailed', 'skipped']);
 const ACTIVE_PARENT_STATUSES = new Set(['running', 'waiting', 'suspended']);
 const BRANCH_STATUSES: ReadonlySet<unknown> = new Set([
   'running',

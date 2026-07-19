@@ -261,6 +261,7 @@ export function serializeDurableOptions(options: {
   toolChoice?: any;
   activeTools?: string[];
   toolSurfaceFence?: string[];
+  toolHookPolicy?: SerializableDurableOptions['toolHookPolicy'];
   modelSettings?: SerializableModelSettings | Record<string, unknown>;
   requireToolApproval?: boolean;
   toolCallConcurrency?: number;
@@ -300,6 +301,7 @@ export function serializeDurableOptions(options: {
     toolChoice: serializedToolChoice,
     activeTools: options.activeTools,
     toolSurfaceFence: options.toolSurfaceFence,
+    toolHookPolicy: options.toolHookPolicy,
     modelSettings: serializeModelSettings(options.modelSettings),
     requireToolApproval: options.requireToolApproval,
     toolCallConcurrency: options.toolCallConcurrency,

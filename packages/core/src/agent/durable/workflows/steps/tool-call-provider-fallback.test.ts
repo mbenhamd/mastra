@@ -38,12 +38,12 @@ function mockPubsub() {
   return { publish: vi.fn(), subscribe: vi.fn(), unsubscribe: vi.fn(), flush: vi.fn() };
 }
 
-function makeInitData() {
+function makeInitData(options: Record<string, unknown> = { requireToolApproval: false }) {
   return {
     runId: RUN_ID,
     runtimeBindingId: RUNTIME_BINDING_ID,
     agentId: 'agent-1',
-    options: { requireToolApproval: false },
+    options,
     state: {
       threadId: 'thread-1',
       resourceId: 'user-1',
@@ -130,6 +130,85 @@ describe('durable tool-call provider-tool fallback', () => {
     expect(executeMock).toHaveBeenCalledTimes(1);
     expect(result.error).toBeUndefined();
     expect(result.result).toEqual({ ok: true });
+  });
+
+  it('never falls back to an unwrapped Mastra-wide tool for a policy-bound run', async () => {
+    const beforeToolCall = vi.fn(() => ({ proceed: false as const, output: { blocked: true } }));
+    const executeMock = vi.fn().mockResolvedValue({ unsafe: true });
+    const listTools = vi.fn(() => ({
+      danger: {
+        id: 'danger',
+        description: 'must remain unreachable',
+        execute: executeMock,
+      },
+    }));
+    globalRunRegistry.set(RUN_ID, {
+      runtimeBindingId: RUNTIME_BINDING_ID,
+      tools: {},
+      model: {} as any,
+      toolHookPolicy: { id: 'bound-policy', hooks: { beforeToolCall } },
+    } as any);
+
+    const step = createDurableToolCallStep();
+    const execution = (step as any).execute({
+      inputData: {
+        toolCallId: 'call-danger',
+        toolName: 'danger',
+        args: {},
+      },
+      mastra: { getLogger: () => undefined, listTools },
+      suspend: vi.fn(),
+      resumeData: undefined,
+      requestContext: new Map(),
+      getInitData: () =>
+        makeInitData({
+          requireToolApproval: false,
+          toolHookPolicy: {
+            kind: 'run-registry',
+            id: 'bound-policy',
+            beforeToolCall: true,
+            afterToolCall: false,
+          },
+        }),
+      [PUBSUB_SYMBOL]: mockPubsub(),
+    });
+
+    await expect(execution).rejects.toMatchObject({ id: 'DURABLE_AGENT_TOOL_HOOK_POLICY_UNAVAILABLE' });
+    expect(resolveRuntime.resolveTool).not.toHaveBeenCalled();
+    expect(listTools).not.toHaveBeenCalled();
+    expect(executeMock).not.toHaveBeenCalled();
+    expect(beforeToolCall).not.toHaveBeenCalled();
+  });
+
+  it('rejects a partial policy registry before materializing a replacement fence', async () => {
+    globalRunRegistry.set(RUN_ID, {
+      runtimeBindingId: RUNTIME_BINDING_ID,
+      model: {} as any,
+      toolHookPolicy: { id: 'partial-policy', hooks: { beforeToolCall: vi.fn() } },
+    } as any);
+
+    const step = createDurableToolCallStep();
+    const execution = (step as any).execute({
+      inputData: { toolCallId: 'call-partial', toolName: 'guarded', args: {} },
+      mastra: { getLogger: () => undefined },
+      suspend: vi.fn(),
+      resumeData: undefined,
+      requestContext: new Map(),
+      getInitData: () =>
+        makeInitData({
+          requireToolApproval: false,
+          toolSurfaceFence: ['guarded'],
+          toolHookPolicy: {
+            kind: 'run-registry',
+            id: 'partial-policy',
+            beforeToolCall: true,
+            afterToolCall: false,
+          },
+        }),
+      [PUBSUB_SYMBOL]: mockPubsub(),
+    });
+
+    await expect(execution).rejects.toMatchObject({ id: 'DURABLE_AGENT_TOOL_HOOK_POLICY_UNAVAILABLE' });
   });
 
   it('falls back to a Mastra-wide provider tool when run registry and resolveTool miss', async () => {
