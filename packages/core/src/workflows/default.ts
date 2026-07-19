@@ -27,7 +27,11 @@ import type { ExecuteSleepParams, ExecuteSleepUntilParams } from './handlers/sle
 import { executeSleep as executeSleepHandler, executeSleepUntil as executeSleepUntilHandler } from './handlers/sleep';
 import type { ExecuteStepParams } from './handlers/step';
 import { executeStep as executeStepHandler } from './handlers/step';
-import { publishWorkflowLifecycleEvent, requireWorkflowExecutionGeneration } from './lifecycle-events';
+import {
+  publishWorkflowLifecycleEvent,
+  requireWorkflowExecutionGeneration,
+  workflowLifecycleEventsAreSuppressed,
+} from './lifecycle-events';
 import type { ConditionFunction, ConditionFunctionParams, Step } from './step';
 import type {
   FormattedWorkflowResult,
@@ -822,21 +826,24 @@ export class DefaultExecutionEngine extends ExecutionEngine {
     );
     const lifecycleResumeAttempt = params.lifecycleResumeAttempt;
     const lifecycleStepStates = params.lifecycleStepStates;
+    const suppressLifecycleEvents = workflowLifecycleEventsAreSuppressed(params.pubsub);
     const { attempts = 0, delay = 0 } = retryConfig ?? {};
     const steps = graph.steps;
 
     //clear retryCounts
     this.retryCounts.clear();
 
-    await publishWorkflowLifecycleEvent({
-      pubsub: params.pubsub,
-      workflowId,
-      runId,
-      executionGeneration,
-      event: params.resume
-        ? { type: 'workflow.resumed', resumeAttempt: lifecycleResumeAttempt, resumeData: params.resume.resumePayload }
-        : { type: 'workflow.started', resumeAttempt: lifecycleResumeAttempt, input },
-    });
+    if (!suppressLifecycleEvents) {
+      await publishWorkflowLifecycleEvent({
+        pubsub: params.pubsub,
+        workflowId,
+        runId,
+        executionGeneration,
+        event: params.resume
+          ? { type: 'workflow.resumed', resumeAttempt: lifecycleResumeAttempt, resumeData: params.resume.resumePayload }
+          : { type: 'workflow.started', resumeAttempt: lifecycleResumeAttempt, input },
+      });
+    }
 
     if (steps.length === 0) {
       const empty_graph_error = new MastraError({
@@ -847,25 +854,27 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       });
 
       workflowSpan?.error({ error: empty_graph_error });
-      await publishWorkflowLifecycleEvent({
-        pubsub: params.pubsub,
-        workflowId,
-        runId,
-        executionGeneration,
-        event: { type: 'workflow.failed', resumeAttempt: lifecycleResumeAttempt, error: empty_graph_error },
-      });
-      await publishWorkflowLifecycleEvent({
-        pubsub: params.pubsub,
-        workflowId,
-        runId,
-        executionGeneration,
-        event: {
-          type: 'workflow.finished',
-          resumeAttempt: lifecycleResumeAttempt,
-          status: 'failed',
-          error: empty_graph_error,
-        },
-      });
+      if (!suppressLifecycleEvents) {
+        await publishWorkflowLifecycleEvent({
+          pubsub: params.pubsub,
+          workflowId,
+          runId,
+          executionGeneration,
+          event: { type: 'workflow.failed', resumeAttempt: lifecycleResumeAttempt, error: empty_graph_error },
+        });
+        await publishWorkflowLifecycleEvent({
+          pubsub: params.pubsub,
+          workflowId,
+          runId,
+          executionGeneration,
+          event: {
+            type: 'workflow.finished',
+            resumeAttempt: lifecycleResumeAttempt,
+            status: 'failed',
+            error: empty_graph_error,
+          },
+        });
+      }
       throw empty_graph_error;
     }
 
@@ -1070,50 +1079,52 @@ export class DefaultExecutionEngine extends ExecutionEngine {
           });
         }
 
-        if (result.status === 'suspended') {
-          await publishWorkflowLifecycleEvent({
-            pubsub: params.pubsub,
-            workflowId,
-            runId,
-            executionGeneration,
-            event: {
-              type: 'workflow.suspended',
-              resumeAttempt: lifecycleResumeAttempt,
-              suspendedStepIds: Object.keys(lastOutput.mutableContext.suspendedPaths),
-            },
-          });
-        } else if (result.status !== 'paused') {
-          if (result.status === 'failed' || result.status === 'tripwire') {
+        if (!suppressLifecycleEvents) {
+          if (result.status === 'suspended') {
             await publishWorkflowLifecycleEvent({
               pubsub: params.pubsub,
               workflowId,
               runId,
               executionGeneration,
-              event: { type: 'workflow.failed', resumeAttempt: lifecycleResumeAttempt, error: result.error },
+              event: {
+                type: 'workflow.suspended',
+                resumeAttempt: lifecycleResumeAttempt,
+                suspendedStepIds: Object.keys(lastOutput.mutableContext.suspendedPaths),
+              },
             });
-          } else if (result.status === 'canceled') {
+          } else if (result.status !== 'paused') {
+            if (result.status === 'failed' || result.status === 'tripwire') {
+              await publishWorkflowLifecycleEvent({
+                pubsub: params.pubsub,
+                workflowId,
+                runId,
+                executionGeneration,
+                event: { type: 'workflow.failed', resumeAttempt: lifecycleResumeAttempt, error: result.error },
+              });
+            } else if (result.status === 'canceled') {
+              await publishWorkflowLifecycleEvent({
+                pubsub: params.pubsub,
+                workflowId,
+                runId,
+                executionGeneration,
+                event: { type: 'workflow.canceled', resumeAttempt: lifecycleResumeAttempt },
+              });
+            }
+
             await publishWorkflowLifecycleEvent({
               pubsub: params.pubsub,
               workflowId,
               runId,
               executionGeneration,
-              event: { type: 'workflow.canceled', resumeAttempt: lifecycleResumeAttempt },
+              event: {
+                type: 'workflow.finished',
+                resumeAttempt: lifecycleResumeAttempt,
+                status: result.status,
+                result: result.result,
+                error: result.error,
+              },
             });
           }
-
-          await publishWorkflowLifecycleEvent({
-            pubsub: params.pubsub,
-            workflowId,
-            runId,
-            executionGeneration,
-            event: {
-              type: 'workflow.finished',
-              resumeAttempt: lifecycleResumeAttempt,
-              status: result.status,
-              result: result.result,
-              error: result.error,
-            },
-          });
         }
 
         // Drop the last-persisted-status tracker for early terminal exits
@@ -1225,7 +1236,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       stepExecutionPath,
     });
 
-    if (result.status === 'canceled') {
+    if (!suppressLifecycleEvents && result.status === 'canceled') {
       await publishWorkflowLifecycleEvent({
         pubsub: params.pubsub,
         workflowId,
@@ -1235,19 +1246,21 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       });
     }
 
-    await publishWorkflowLifecycleEvent({
-      pubsub: params.pubsub,
-      workflowId,
-      runId,
-      executionGeneration,
-      event: {
-        type: 'workflow.finished',
-        resumeAttempt: lifecycleResumeAttempt,
-        status: result.status,
-        result: result.result,
-        error: result.error,
-      },
-    });
+    if (!suppressLifecycleEvents) {
+      await publishWorkflowLifecycleEvent({
+        pubsub: params.pubsub,
+        workflowId,
+        runId,
+        executionGeneration,
+        event: {
+          type: 'workflow.finished',
+          resumeAttempt: lifecycleResumeAttempt,
+          status: result.status,
+          result: result.result,
+          error: result.error,
+        },
+      });
+    }
 
     // Drop the last-persisted-status tracker for terminal runs so the map
     // does not grow unbounded across many runs served by the same engine.
