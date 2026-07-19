@@ -901,6 +901,95 @@ export class DefaultExecutionEngine extends ExecutionEngine {
     let lastExecutionContext: ExecutionContext | undefined;
     let currentRequestContext = params.requestContext;
     for (let i = startIdx; i < steps.length; i++) {
+      if (params.abortController.signal.aborted) {
+        await this.persistStepUpdate({
+          workflowId,
+          runId,
+          resourceId,
+          stepResults,
+          serializedStepGraph: params.serializedStepGraph,
+          executionContext: lastExecutionContext || {
+            workflowId,
+            runId,
+            transientExecution: params.transientExecution,
+            executionGeneration,
+            lifecycleResumeAttempt,
+            lifecycleStepStates,
+            resumeOperationHash: params.resumeOperationHash,
+            executionPath: [i],
+            stepExecutionPath,
+            activeStepsPath: {},
+            suspendedPaths: {},
+            resumeLabels: {},
+            retryConfig: { attempts, delay },
+            format: params.format,
+            state: lastState ?? initialState,
+            tracingIds: params.tracingIds,
+          },
+          workflowStatus: 'canceled',
+          requestContext: currentRequestContext,
+        });
+
+        workflowSpan?.end({
+          attributes: {
+            status: 'canceled',
+          },
+        });
+
+        const formattedResult = await this.fmtReturnValue<any>(
+          params.pubsub,
+          stepResults,
+          { status: 'canceled' } as any,
+          undefined,
+          stepExecutionPath,
+        );
+
+        await this.invokeLifecycleCallbacks({
+          status: 'canceled',
+          result: undefined,
+          error: undefined,
+          steps: formattedResult.steps,
+          tripwire: undefined,
+          runId,
+          workflowId,
+          resourceId,
+          input,
+          requestContext: currentRequestContext,
+          state: lastState,
+          stepExecutionPath,
+        });
+
+        // Run.cancel() leaves terminal ownership to an active engine. Commit
+        // synchronously before lifecycle publication so cancellation cannot be
+        // replaced by another terminal result while transport awaits yield.
+        params.commitTerminalStatus?.('canceled');
+
+        if (!suppressLifecycleEvents) {
+          await publishWorkflowLifecycleEvent({
+            pubsub: params.pubsub,
+            workflowId,
+            runId,
+            executionGeneration,
+            event: { type: 'workflow.canceled', resumeAttempt: lifecycleResumeAttempt },
+          });
+          await publishWorkflowLifecycleEvent({
+            pubsub: params.pubsub,
+            workflowId,
+            runId,
+            executionGeneration,
+            event: { type: 'workflow.finished', resumeAttempt: lifecycleResumeAttempt, status: 'canceled' },
+          });
+        }
+
+        this.clearLastPersistedStatus(runId);
+
+        return {
+          ...formattedResult,
+          runId,
+          ...(params.outputOptions?.includeState ? { state: lastState } : {}),
+        } as any;
+      }
+
       const entry = steps[i]!;
 
       const executionContext: ExecutionContext = {
@@ -1164,6 +1253,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
 
         return {
           ...result,
+          runId,
           ...(lastOutput.result.status === 'suspended' && params.outputOptions?.includeResumeLabels
             ? { resumeLabels: lastOutput.mutableContext.resumeLabels }
             : {}),
@@ -1208,7 +1298,12 @@ export class DefaultExecutionEngine extends ExecutionEngine {
 
         delete result.result;
 
-        return { ...result, status: 'paused', ...(params.outputOptions?.includeState ? { state: lastState } : {}) };
+        return {
+          ...result,
+          runId,
+          status: 'paused',
+          ...(params.outputOptions?.includeState ? { state: lastState } : {}),
+        };
       }
     }
 
@@ -1314,9 +1409,9 @@ export class DefaultExecutionEngine extends ExecutionEngine {
     }
 
     if (params.outputOptions?.includeState) {
-      return { ...result, state: lastState };
+      return { ...result, runId, state: lastState };
     }
-    return result;
+    return { ...result, runId };
   }
 
   getStepOutput(stepResults: Record<string, any>, step?: StepFlowEntry): any {

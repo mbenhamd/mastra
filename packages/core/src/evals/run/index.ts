@@ -360,6 +360,12 @@ export async function runEvals(config: {
                 mastra,
                 target,
                 item,
+                turn: {
+                  index: ti,
+                  traceId: record.traceId,
+                  spanId: record.spanId,
+                  threadId: record.threadId,
+                },
               });
             }
           }
@@ -1078,6 +1084,7 @@ type PerTurnRecord = {
   output: any;
   traceId?: string;
   spanId?: string;
+  threadId?: string;
   entityType: EntityType;
 };
 
@@ -1160,6 +1167,7 @@ async function runAgentTurns(
       output: turnOutput,
       traceId: result.traceId,
       spanId: result.spanId,
+      threadId,
       entityType: EntityType.AGENT,
     });
   }
@@ -1613,6 +1621,7 @@ async function saveSingleScore({
   mastra,
   target,
   item,
+  turn,
 }: {
   storage: any;
   scoreResult: any;
@@ -1622,6 +1631,8 @@ async function saveSingleScore({
   mastra: any;
   target: Agent | Workflow;
   item: RunEvalsDataItem<any>;
+  /** Per-turn provenance: labels the stored score with its turn index and links it to that turn's span/thread. */
+  turn?: { index: number; traceId?: string; spanId?: string; threadId?: string };
 }): Promise<void> {
   try {
     // Get scorer information
@@ -1640,10 +1651,14 @@ async function saveSingleScore({
       }
     }
 
-    // Extract tracing context if available
+    // Extract tracing context if available. A per-turn score links to that turn's
+    // own span/thread; otherwise fall back to the item-level tracing context.
     let traceId: string | undefined;
     let spanId: string | undefined;
-    if (item.tracingContext?.currentSpan && item.tracingContext.currentSpan.isValid) {
+    if (turn?.traceId || turn?.spanId) {
+      traceId = turn.traceId;
+      spanId = turn.spanId;
+    } else if (item.tracingContext?.currentSpan && item.tracingContext.currentSpan.isValid) {
       spanId = item.tracingContext.currentSpan.id;
       traceId = item.tracingContext.currentSpan.traceId;
     }
@@ -1675,6 +1690,11 @@ async function saveSingleScore({
       requestContext: item.requestContext ? Object.fromEntries(item.requestContext.entries()) : undefined,
       // Include additionalContext with groundTruth
       additionalContext: Object.keys(additionalContext).length > 0 ? additionalContext : undefined,
+      // Per-turn scores carry their turn index in metadata for UI grouping/labeling.
+      // Merge onto any existing score metadata; the system-owned turnIndex is applied
+      // last so it always wins over a caller-supplied `turnIndex`.
+      ...(turn ? { metadata: { ...(scoreResult?.metadata ?? {}), turnIndex: turn.index } } : {}),
+      ...(turn?.threadId ? { threadId: turn.threadId } : {}),
       // Include tracing information
       traceId,
       spanId,

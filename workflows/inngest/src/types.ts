@@ -33,7 +33,7 @@ export type InngestWorkflowConfig<
   TState,
   TInput,
   TOutput,
-  TSteps extends Step<string, any, any, any, any, any, InngestEngineType>[],
+  TSteps extends Step<string, any, any, any, any, any, InngestEngineType, any>[],
   TRequestContext extends Record<string, any> | unknown = unknown,
   TRawInput = TInput,
 > = Omit<WorkflowConfig<TWorkflowId, TState, TInput, TOutput, TSteps, TRequestContext>, 'inputSchema'> & {

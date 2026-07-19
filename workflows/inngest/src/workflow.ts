@@ -147,14 +147,15 @@ function lifecycleStepStatesEqual(
 
 export class InngestWorkflow<
   TEngineType = InngestEngineType,
-  TSteps extends Step<string, any, any, any, any, any, TEngineType>[] = Step<
+  TSteps extends Step<string, any, any, any, any, any, TEngineType, any>[] = Step<
     string,
     unknown,
     unknown,
     unknown,
     unknown,
     unknown,
-    TEngineType
+    TEngineType,
+    unknown
   >[],
   TWorkflowId extends string = string,
   TState = unknown,
@@ -186,7 +187,7 @@ export class InngestWorkflow<
       TState,
       TInput,
       TOutput,
-      TSteps & Step<string, any, any, any, any, any, InngestEngineType>[],
+      TSteps & Step<string, any, any, any, any, any, InngestEngineType, any>[],
       TRequestContext,
       TRawInput
     >,

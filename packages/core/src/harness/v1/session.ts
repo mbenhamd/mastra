@@ -50,7 +50,6 @@ import {
 } from '../../agent/tool-surface-fence';
 import type { ToolSurfaceFence } from '../../agent/tool-surface-fence';
 import type { AgentThreadSubscription, ToolsInput } from '../../agent/types';
-import type { AgentControllerMessage as HarnessMessage } from '../../agent-controller/types';
 import { ModelRouterLanguageModel } from '../../llm/model/router';
 import { PrefillErrorHandler, ProviderHistoryCompat, StreamErrorRetryProcessor } from '../../processors';
 import { RequestContext } from '../../request-context';
@@ -209,6 +208,7 @@ import type {
   HarnessActionCatalogUnavailableReason,
   HarnessMcpServerDescriptor,
   HarnessMcpToolDescriptor,
+  HarnessMessage,
   HarnessMode,
   InboxResponseOptions,
   InboxResponseResult,

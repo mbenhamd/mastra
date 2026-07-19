@@ -39,9 +39,117 @@ import type {
   SessionRecord as StoredSessionRecord,
 } from '../../storage/domains/harness';
 import type { MastraModelOutput, FullOutput } from '../../stream/base/output';
+import type { GoalEvaluationPayload } from '../../stream/types';
 import type { Workspace } from '../../workspace';
 import type { RequestContextInput } from './request-context-input';
 import type { WorkspaceProvider, WorkspaceProviderContext } from './workspace-provider';
+
+// ---------------------------------------------------------------------------
+// Public message projection (§11.1).
+//
+// Harness owns this flattened, renderer-oriented projection. AgentController
+// now exposes canonical MastraDBMessage rows directly, so keeping these types
+// here prevents the durable Harness contract from leaking back into the
+// AgentController API.
+// ---------------------------------------------------------------------------
+
+export interface HarnessMessage {
+  id: string;
+  role: 'user' | 'assistant' | 'system';
+  content: HarnessMessageContent[];
+  createdAt: Date;
+  attributes?: Record<string, string | number | boolean | null | undefined>;
+  stopReason?: 'complete' | 'tool_use' | 'aborted' | 'error';
+  errorMessage?: string;
+}
+
+export type HarnessMessageContent =
+  | { type: 'text'; text: string }
+  | { type: 'thinking'; thinking: string }
+  | { type: 'tool_call'; id: string; name: string; args: unknown }
+  | {
+      type: 'tool_result';
+      id: string;
+      name: string;
+      result: unknown;
+      isError: boolean;
+      providerMetadata?: Record<string, unknown>;
+    }
+  | {
+      type: 'system_reminder';
+      message: string;
+      reminderType?: string;
+      path?: string;
+      precedesMessageId?: string;
+      gapText?: string;
+      gapMs?: number;
+      timestamp?: string;
+      goalMaxTurns?: number;
+      judgeModelId?: string;
+      goalEvaluation?: GoalEvaluationPayload;
+    }
+  | {
+      type: 'state_signal';
+      id?: string;
+      stateId: string;
+      mode: 'snapshot' | 'delta';
+      cacheKey?: string;
+      version?: number;
+      message: string;
+    }
+  | {
+      type: 'reactive_signal';
+      id?: string;
+      tagName: string;
+      message: string;
+      attributes?: Record<string, unknown>;
+      metadata?: Record<string, unknown>;
+    }
+  | {
+      type: 'notification_summary';
+      id?: string;
+      message: string;
+      pending: number;
+      bySource: Record<string, number>;
+      byPriority: Record<string, number>;
+      notificationIds: string[];
+    }
+  | {
+      type: 'notification';
+      id?: string;
+      notificationId?: string;
+      message: string;
+      source?: string;
+      kind?: string;
+      priority?: string;
+      status?: string;
+      attributes?: Record<string, unknown>;
+      metadata?: Record<string, unknown>;
+    }
+  | { type: 'image'; data: string; mimeType: string }
+  | { type: 'file'; data: string; mediaType: string; filename?: string }
+  | {
+      type: 'om_observation_start';
+      tokensToObserve: number;
+      operationType?: 'observation' | 'reflection';
+    }
+  | {
+      type: 'om_observation_end';
+      tokensObserved: number;
+      observationTokens: number;
+      durationMs: number;
+      operationType?: 'observation' | 'reflection';
+      observations?: string;
+      currentTask?: string;
+      suggestedResponse?: string;
+    }
+  | {
+      type: 'om_observation_failed';
+      error: string;
+      tokensAttempted?: number;
+      operationType?: 'observation' | 'reflection';
+    }
+  | { type: 'om_thread_title_updated'; threadId: string; oldTitle?: string; newTitle: string };
 
 // ---------------------------------------------------------------------------
 // HarnessMode (§4.2).

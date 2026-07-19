@@ -6,10 +6,9 @@
 
 import { describe, expect, it } from 'vitest';
 
-import type { AgentControllerMessage as HarnessMessage } from '../../agent-controller/types';
-
 import { ACTIVITY_TIMELINE_DEFAULT_LIMIT, buildActivityTimeline } from './activity-timeline';
 import type { ActivityTimelineSessionInput, BuildActivityTimelineInput } from './activity-timeline';
+import type { HarnessMessage } from './types';
 
 function msg(id: string, role: HarnessMessage['role'], at: number, content: HarnessMessage['content']): HarnessMessage {
   return { id, role, content, createdAt: new Date(at) };

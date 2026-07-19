@@ -1119,20 +1119,21 @@ function createStepFromProcessor<TProcessorId extends string>(
   };
 }
 
-export function init(inngest: Inngest) {
+export function init<TDefaultRequestContext = unknown>(inngest: Inngest) {
   function createInngestWorkflow<
     TWorkflowId extends string = string,
     TInputSchema extends PublicSchema<any> = PublicSchema<any>,
     TOutputSchema extends PublicSchema<any> = PublicSchema<any>,
     TStateSchema extends PublicSchema<any> | undefined = undefined,
-    TSteps extends Step<string, any, any, any, any, any, InngestEngineType>[] = Step<
+    TSteps extends Step<string, any, any, any, any, any, InngestEngineType, any>[] = Step<
       string,
       any,
       any,
       any,
       any,
       any,
-      InngestEngineType
+      InngestEngineType,
+      any
     >[],
     TRequestContextSchema extends PublicSchema<any> | undefined = undefined,
   >(
@@ -1152,7 +1153,7 @@ export function init(inngest: Inngest) {
     InferPublicSchema<TInputSchema>,
     InferPublicSchema<TOutputSchema>,
     InferPublicSchema<TInputSchema>,
-    InferSchemaOutput<TRequestContextSchema>,
+    TRequestContextSchema extends PublicSchema<any> ? InferSchemaOutput<TRequestContextSchema> : TDefaultRequestContext,
     InferPublicSchemaInput<TInputSchema>
   >;
   /**
@@ -1167,16 +1168,17 @@ export function init(inngest: Inngest) {
     TState = any,
     TInput = any,
     TOutput = any,
-    TSteps extends Step<string, any, any, any, any, any, InngestEngineType>[] = Step<
+    TSteps extends Step<string, any, any, any, any, any, InngestEngineType, any>[] = Step<
       string,
       any,
       any,
       any,
       any,
       any,
-      InngestEngineType
+      InngestEngineType,
+      any
     >[],
-    TRequestContext extends Record<string, any> | unknown = unknown,
+    TRequestContext extends Record<string, any> | unknown = TDefaultRequestContext,
     TRawInput = TInput,
   >(
     params: InngestWorkflowConfig<TWorkflowId, TState, TInput, TOutput, TSteps, TRequestContext, TRawInput>,
@@ -1197,7 +1199,7 @@ export function init(inngest: Inngest) {
       any,
       any,
       any,
-      Step<string, any, any, any, any, any, InngestEngineType>[],
+      Step<string, any, any, any, any, any, InngestEngineType, any>[],
       any
     >,
   ) {
@@ -1209,9 +1211,9 @@ export function init(inngest: Inngest) {
     createWorkflow: createInngestWorkflow,
     createStep,
     cloneStep<TStepId extends string>(
-      step: Step<TStepId, any, any, any, any, any, InngestEngineType>,
+      step: Step<TStepId, any, any, any, any, any, InngestEngineType, any>,
       opts: { id: TStepId },
-    ): Step<TStepId, any, any, any, any, any, InngestEngineType> {
+    ): Step<TStepId, any, any, any, any, any, InngestEngineType, any> {
       return {
         id: opts.id,
         description: step.description,
@@ -1232,14 +1234,15 @@ export function init(inngest: Inngest) {
       TState = unknown,
       TInput = unknown,
       TOutput = unknown,
-      TSteps extends Step<string, any, any, any, any, any, InngestEngineType>[] = Step<
+      TSteps extends Step<string, any, any, any, any, any, InngestEngineType, any>[] = Step<
         string,
         any,
         any,
         any,
         any,
         any,
-        InngestEngineType
+        InngestEngineType,
+        any
       >[],
       TPrev = TInput,
       TRequestContext extends Record<string, any> | unknown = unknown,

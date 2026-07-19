@@ -5,12 +5,10 @@
  *
  * No `this`-coupling, no harness state — pure function over an input row.
  */
+import { resolveFilePartMediaTypeAndData } from '../../agent/message-list/prompt/image-utils';
 import { mastraDBMessageToSignal, signalContentsToParts, signalContentsToText } from '../../agent/signals';
 import type { MastraDBMessage } from '../../agent/types';
-import type {
-  AgentControllerMessage as HarnessMessage,
-  AgentControllerMessageContent as HarnessMessageContent,
-} from '../../agent-controller/types';
+import type { HarnessMessage, HarnessMessageContent } from './types';
 
 /**
  * Memory-storage row shape that both runtimes feed in. We type the parts
@@ -445,21 +443,20 @@ export function convertStoredMessageToHarnessMessage(msg: StoredMessageRow): Har
         }
         break;
       }
-      case 'file':
-        if (typeof part.data !== 'string') {
-          console.warn('[Harness] Skipping file part with non-string data:', typeof part.data);
+      case 'file': {
+        const { mediaType, data } = resolveFilePartMediaTypeAndData(part);
+        if (typeof data !== 'string') {
+          console.warn('[Harness] Skipping file part with non-string data:', typeof data);
           break;
         }
         content.push({
           type: 'file',
-          data: part.data,
-          mediaType:
-            (part as { mediaType?: string }).mediaType ??
-            (part as { mimeType?: string }).mimeType ??
-            'application/octet-stream',
+          data,
+          mediaType: mediaType ?? 'application/octet-stream',
           ...((part as { filename?: string }).filename ? { filename: (part as { filename?: string }).filename } : {}),
         });
         break;
+      }
       case 'image': {
         const imgData =
           typeof part.data === 'string'

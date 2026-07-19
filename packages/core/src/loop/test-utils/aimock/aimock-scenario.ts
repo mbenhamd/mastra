@@ -304,7 +304,7 @@ export async function runLoopScenario(opts: RunLoopScenarioOptions): Promise<Loo
 
   fixtures(llm);
 
-  // For evented engine, set env var before building the agent
+  // For evented engine, set env var before building the agent.
   if (engine === 'evented') {
     process.env.MASTRA_EVENTED_EXECUTION = 'true';
   }
@@ -314,7 +314,12 @@ export async function runLoopScenario(opts: RunLoopScenarioOptions): Promise<Loo
   let agent: any;
   let mastra: any;
   if (sharedAgent) {
-    if (engine === 'durable' && !isDurableAgentLike(sharedAgent.agent)) {
+    // A standalone durable `Agent` satisfies `isDurableAgentLike` via a
+    // self-referential `.agent` getter, so discriminate against a real
+    // wrapper by checking `agent.agent !== agent`. See `Mastra.addAgent`.
+    const sharedIsRealDurableWrapper =
+      isDurableAgentLike(sharedAgent.agent) && (sharedAgent.agent as any).agent !== sharedAgent.agent;
+    if (engine === 'durable' && !sharedIsRealDurableWrapper) {
       // sharedAgent provides a regular Agent on the first call; wrap it for
       // the durable engine and re-register on the Mastra instance so
       // .getAgent() returns the DurableAgent wrapper.  On subsequent calls
@@ -474,7 +479,7 @@ export async function runLoopScenario(opts: RunLoopScenarioOptions): Promise<Loo
     }
   }
 
-  // Clean up evented env var
+  // Clean up the per-scenario evented-engine selection.
   if (engine === 'evented') {
     delete process.env.MASTRA_EVENTED_EXECUTION;
   }

@@ -145,24 +145,68 @@ export const GET_API_SCHEMA_ROUTE = createRoute({
 function getObservabilityStorageCapabilities(
   observabilityStorage: unknown,
 ): SystemPackagesResponse['observabilityStorageCapabilities'] {
-  const candidate = observabilityStorage as { getCapabilities?: () => unknown } | undefined;
-  if (typeof candidate?.getCapabilities !== 'function') {
-    return undefined;
-  }
+  const candidate = observabilityStorage as
+    | {
+        getCapabilities?: () => unknown;
+        getFeatures?: () => readonly string[] | undefined;
+        runtimeTracingStrategy?: unknown;
+        observabilityStrategy?: { preferred?: unknown; supported?: unknown };
+      }
+    | undefined;
+  if (!candidate) return undefined;
 
-  let owner = Object.prototype.hasOwnProperty.call(candidate, 'getCapabilities')
-    ? candidate
-    : Object.getPrototypeOf(candidate);
-  while (owner && owner !== Object.prototype && !Object.prototype.hasOwnProperty.call(owner, 'getCapabilities')) {
-    owner = Object.getPrototypeOf(owner);
-  }
-  if (!owner || owner === Object.prototype || owner === ObservabilityStorage.prototype) {
-    return undefined;
+  if (typeof candidate.getCapabilities === 'function') {
+    let owner = Object.prototype.hasOwnProperty.call(candidate, 'getCapabilities')
+      ? candidate
+      : Object.getPrototypeOf(candidate);
+    while (owner && owner !== Object.prototype && !Object.prototype.hasOwnProperty.call(owner, 'getCapabilities')) {
+      owner = Object.getPrototypeOf(owner);
+    }
+
+    // Ignore the conservative base implementation. It intentionally reports
+    // no optional APIs and would mask the stable feature list used by stores
+    // that have not adopted the richer capability contract yet.
+    if (owner && owner !== Object.prototype && owner !== ObservabilityStorage.prototype) {
+      try {
+        const result = observabilityStorageCapabilitiesSchema.safeParse(candidate.getCapabilities());
+        if (result.success) return result.data;
+      } catch {
+        // Fall through to the side-effect-free feature declaration below.
+      }
+    }
   }
 
   try {
-    const result = observabilityStorageCapabilitiesSchema.safeParse(candidate.getCapabilities());
-    return result.success ? result.data : undefined;
+    const features = candidate.getFeatures?.();
+    if (!features?.some(feature => feature === 'metrics' || feature === 'logs')) return undefined;
+
+    const runtimeStrategy = candidate.runtimeTracingStrategy;
+    const preferredStrategy = candidate.observabilityStrategy?.preferred ?? runtimeStrategy ?? 'insert-only';
+    const supportedStrategies = candidate.observabilityStrategy?.supported ?? [preferredStrategy];
+    const supportsLogs = features.includes('logs');
+    const supportsMetrics = features.includes('metrics');
+    const normalized = observabilityStorageCapabilitiesSchema.safeParse({
+      tracing: {
+        preferredStrategy,
+        supportedStrategies,
+        ...(runtimeStrategy ? { runtimeStrategy } : {}),
+      },
+      logs: {
+        persist: supportsLogs,
+        list: supportsLogs,
+      },
+      metrics: {
+        persist: supportsMetrics,
+        list: supportsMetrics,
+        aggregate: supportsMetrics,
+        breakdown: supportsMetrics,
+        timeSeries: supportsMetrics,
+        percentiles: supportsMetrics,
+        discovery: supportsMetrics,
+      },
+      persistence: 'unknown',
+    });
+    return normalized.success ? normalized.data : undefined;
   } catch {
     return undefined;
   }

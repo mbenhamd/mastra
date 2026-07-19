@@ -7,13 +7,17 @@ import {
 } from '@mastra/core/processors';
 import { RequestContext } from '@mastra/core/request-context';
 import { MockStore } from '@mastra/core/storage';
+import type { Workflow } from '@mastra/core/workflows';
 import { TRANSIENT_EXECUTION_SYMBOL } from '@mastra/core/workflows/_constants';
 import { Inngest } from 'inngest';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, expectTypeOf, it, vi } from 'vitest';
 import { z } from 'zod/v4';
 
 import { InngestExecutionEngine } from './execution-engine';
 import { init } from './index';
+
+type WorkflowRequestContext<TWorkflow> =
+  TWorkflow extends Workflow<any, any, any, any, any, any, any, infer TRequestContext, any> ? TRequestContext : never;
 
 function createTestWorkflow(storage = new MockStore()) {
   const inngest = new Inngest({ id: 'create-run-contract', isDev: true });
@@ -47,6 +51,27 @@ function createTestWorkflow(storage = new MockStore()) {
 }
 
 describe('Inngest createRun contract', () => {
+  it('preserves the init default request context when the schema overload omits requestContextSchema', () => {
+    type DefaultRequestContext = { tenantId: string; correlationId?: string };
+
+    const inngest = new Inngest({ id: 'default-request-context-contract', isDev: true });
+    const { createWorkflow } = init<DefaultRequestContext>(inngest);
+    const _workflow = createWorkflow({
+      id: 'default-request-context-workflow',
+      inputSchema: z.object({ value: z.string() }),
+      outputSchema: z.object({ value: z.string() }),
+    });
+    const _schemaWorkflow = createWorkflow({
+      id: 'schema-request-context-workflow',
+      inputSchema: z.object({ value: z.string() }),
+      outputSchema: z.object({ value: z.string() }),
+      requestContextSchema: z.object({ organizationId: z.string() }),
+    });
+
+    expectTypeOf<WorkflowRequestContext<typeof _workflow>>().toEqualTypeOf<DefaultRequestContext>();
+    expectTypeOf<WorkflowRequestContext<typeof _schemaWorkflow>>().toEqualTypeOf<{ organizationId: string }>();
+  });
+
   it('preserves processor phase restrictions when cloning a workflow', () => {
     const inngest = new Inngest({ id: 'clone-processor-phase-contract', isDev: true });
     const { createStep, createWorkflow, cloneWorkflow } = init(inngest);

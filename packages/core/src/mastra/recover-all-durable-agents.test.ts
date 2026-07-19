@@ -14,6 +14,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Agent } from '../agent';
 import { createDurableAgent } from '../agent/durable/create-durable-agent';
 import type { DurableAgent } from '../agent/durable/durable-agent';
+import { isDurableAgentLike, isRecoverableDurableAgentLike } from '../agent/types';
 import { InMemoryStore } from '../storage';
 import { Mastra } from './index';
 
@@ -85,6 +86,35 @@ describe('Mastra.recoverAllDurableAgents', () => {
 
     expect(spy).toHaveBeenCalledTimes(1);
     expect(result).toEqual({ agents: 1, recovered: 1, succeeded: 1, failed: 0 });
+  });
+
+  it('skips external durable wrappers that do not opt into Mastra-driven recovery', async () => {
+    const underlyingAgent = makeBaseAgent('external-underlying');
+    const recoverActiveRuns = vi.fn().mockRejectedValue(new Error('external engine owns recovery'));
+    const externalWrapper = {
+      id: 'external-wrapper',
+      name: 'External wrapper',
+      agent: underlyingAgent,
+      stream: vi.fn(),
+      recover: vi.fn(),
+      recoverActiveRuns,
+      __setLogger: vi.fn(),
+    };
+    expect(isDurableAgentLike(externalWrapper)).toBe(true);
+    expect(isRecoverableDurableAgentLike(externalWrapper)).toBe(false);
+
+    const mastra = new Mastra({
+      agents: { external: externalWrapper },
+      storage: store,
+    });
+
+    await expect(mastra.recoverAllDurableAgents()).resolves.toEqual({
+      agents: 0,
+      recovered: 0,
+      succeeded: 0,
+      failed: 0,
+    });
+    expect(recoverActiveRuns).not.toHaveBeenCalled();
   });
 
   it('aggregates counts across every durable agent', async () => {

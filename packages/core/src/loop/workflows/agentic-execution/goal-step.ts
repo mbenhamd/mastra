@@ -107,6 +107,8 @@ export function createGoalStep<Tools extends ToolSet = ToolSet, OUTPUT = undefin
     inputSchema: llmIterationOutputSchema,
     outputSchema: llmIterationOutputSchema,
     execute: async ({ inputData }) => {
+      if (inputData.stepResult?.reason === 'error') return inputData;
+
       // No goal configured on the agent → nothing to do.
       if (!goal) return inputData;
 
@@ -164,6 +166,7 @@ export function createGoalStep<Tools extends ToolSet = ToolSet, OUTPUT = undefin
             timedOut: false,
             maxRunsReached: true,
             suppressFeedback: false,
+            shouldContinue: false,
           },
         } as ChunkType<OUTPUT>);
         return inputData;
@@ -461,6 +464,7 @@ export function createGoalStep<Tools extends ToolSet = ToolSet, OUTPUT = undefin
         timedOut: result.timedOut,
         maxRunsReached,
         suppressFeedback,
+        shouldContinue,
       };
 
       let currentMessageId = inputData.messageId;
