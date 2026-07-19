@@ -669,8 +669,8 @@ export function createErrorHandlingTests(ctx: WorkflowTestContext, registry?: Wo
       },
     );
 
-    // These tests require storage access to inspect the authoritative snapshot.
-    // Skip if getStorage is not available.
+    // These tests require storage access to spy on persistWorkflowSnapshot
+    // Skip if getStorage is not available
     it.skipIf(skipTests.errorPersistWithoutStack ?? true)(
       'should persist error message without stack trace in snapshot',
       async () => {
@@ -689,6 +689,8 @@ export function createErrorHandlingTests(ctx: WorkflowTestContext, registry?: Wo
           return; // Skip if workflows store not available
         }
 
+        const persistSpy = vi.spyOn(workflowsStore, 'persistWorkflowSnapshot');
+
         const entry = registry!['error-persist-without-stack']!;
         const { workflow, errorMessage } = entry;
 
@@ -696,10 +698,14 @@ export function createErrorHandlingTests(ctx: WorkflowTestContext, registry?: Wo
         const result = await execute(workflow, {}, { runId });
 
         expect(result.status).toBe('failed');
-        const snapshot = await workflowsStore.loadWorkflowSnapshot({
-          workflowName: workflow.id,
-          runId,
-        });
+        expect(persistSpy).toHaveBeenCalled();
+
+        // Find the last persist call with failed status
+        const persistCalls = persistSpy.mock.calls;
+        const failedCall = persistCalls.find((call: any) => call[0]?.snapshot?.status === 'failed');
+
+        expect(failedCall).toBeDefined();
+        const snapshot = failedCall?.[0]?.snapshot;
 
         expect(snapshot).toBeDefined();
         expect(snapshot!.status).toBe('failed');
@@ -717,6 +723,8 @@ export function createErrorHandlingTests(ctx: WorkflowTestContext, registry?: Wo
         // Verify stack is not in JSON output (it may still be on the instance)
         const serialized = JSON.stringify(failedStepResult.error);
         expect(serialized).not.toContain('"stack"');
+
+        persistSpy.mockRestore();
       },
     );
 
@@ -738,6 +746,8 @@ export function createErrorHandlingTests(ctx: WorkflowTestContext, registry?: Wo
           return; // Skip if workflows store not available
         }
 
+        const persistSpy = vi.spyOn(workflowsStore, 'persistWorkflowSnapshot');
+
         const entry = registry!['error-persist-mastra-error']!;
         const { workflow, errorMessage } = entry;
 
@@ -745,10 +755,14 @@ export function createErrorHandlingTests(ctx: WorkflowTestContext, registry?: Wo
         const result = await execute(workflow, {}, { runId });
 
         expect(result.status).toBe('failed');
-        const snapshot = await workflowsStore.loadWorkflowSnapshot({
-          workflowName: workflow.id,
-          runId,
-        });
+        expect(persistSpy).toHaveBeenCalled();
+
+        // Find the last persist call with failed status
+        const persistCalls = persistSpy.mock.calls;
+        const failedCall = persistCalls.find((call: any) => call[0]?.snapshot?.status === 'failed');
+
+        expect(failedCall).toBeDefined();
+        const snapshot = failedCall?.[0]?.snapshot;
 
         expect(snapshot).toBeDefined();
         expect(snapshot!.status).toBe('failed');
@@ -766,6 +780,8 @@ export function createErrorHandlingTests(ctx: WorkflowTestContext, registry?: Wo
         // Verify stack is not in JSON output
         const serialized = JSON.stringify(failedStepResult.error);
         expect(serialized).not.toContain('"stack"');
+
+        persistSpy.mockRestore();
       },
     );
 
