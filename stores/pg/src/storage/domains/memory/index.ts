@@ -785,6 +785,22 @@ export class MemoryPG extends MemoryStorage {
           await t.none(`DELETE FROM ${vectorTableName} WHERE metadata->>'thread_id' = $1`, [threadId]);
         }
 
+        // Thread erasure must not orphan observational-memory rows: callers
+        // that reach the store directly (bypassing Memory.deleteThread's
+        // clearObservationalMemory) previously left extracted observations
+        // behind after messages and the thread row were gone.
+        const omTableName = getTableName({
+          indexName: OM_TABLE,
+          schemaName: getSchemaName(this.#schema),
+        });
+        const omTableExists = await t.oneOrNone<{ tablename: string }>(
+          `SELECT tablename FROM pg_tables WHERE schemaname = $1 AND tablename = $2`,
+          [schemaName, OM_TABLE],
+        );
+        if (omTableExists !== null) {
+          await t.none(`DELETE FROM ${omTableName} WHERE "threadId" = $1`, [threadId]);
+        }
+
         await t.none(`DELETE FROM ${threadTableName} WHERE id = $1`, [threadId]);
       });
     } catch (error) {
