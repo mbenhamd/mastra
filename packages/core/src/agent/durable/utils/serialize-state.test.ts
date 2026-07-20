@@ -238,12 +238,14 @@ describe('serializeScorersConfig', () => {
 describe('serializeDurableState', () => {
   it('serialises all provided fields', () => {
     const result = serializeDurableState({
+      memoryConfigured: true,
       threadId: 'thread-1',
       resourceId: 'resource-1',
       threadExists: true,
       savePerStep: false,
       observationalMemory: true,
     });
+    expect(result.memoryConfigured).toBe(true);
     expect(result.threadId).toBe('thread-1');
     expect(result.resourceId).toBe('resource-1');
     expect(result.threadExists).toBe(true);
@@ -253,6 +255,7 @@ describe('serializeDurableState', () => {
 
   it('returns undefined for omitted optional fields', () => {
     const result = serializeDurableState({});
+    expect(result.memoryConfigured).toBeUndefined();
     expect(result.threadId).toBeUndefined();
     expect(result.resourceId).toBeUndefined();
   });
@@ -274,10 +277,12 @@ describe('serializeDurableOptions', () => {
       maxSteps: 10,
       modelSettings: { temperature: 0.7 },
       requireToolApproval: true,
+      permissionPolicyRequired: true,
     });
     expect(result.maxSteps).toBe(10);
     expect(result.modelSettings?.temperature).toBe(0.7);
     expect(result.requireToolApproval).toBe(true);
+    expect(result.permissionPolicyRequired).toBe(true);
   });
 
   it('serialises string toolChoice directly', () => {
@@ -432,6 +437,26 @@ describe('serializeToolsMetadata', () => {
 
   it('returns empty array for empty tools record', () => {
     expect(serializeToolsMetadata({})).toEqual([]);
+  });
+
+  it('binds terminal-result policy even for a raw CoreTool without a recovery fingerprint', () => {
+    const baseTool = {
+      description: 'Direct delivery tool',
+      parameters: { type: 'object' },
+      execute: async () => ({ answer: 'done' }),
+    } as CoreTool;
+    const acceptsOk = serializeToolMetadata('direct', {
+      ...baseTool,
+      terminalResult: { isSuccess: (value: any) => value?.status === 'ok' },
+    });
+    const acceptsDone = serializeToolMetadata('direct', {
+      ...baseTool,
+      terminalResult: { isSuccess: (value: any) => value?.status === 'done' },
+    });
+
+    expect(acceptsOk.recoveryFingerprint).toBeUndefined();
+    expect(acceptsOk.terminalResultFingerprint).toMatch(/^[a-f0-9]{64}$/);
+    expect(acceptsOk.terminalResultFingerprint).not.toBe(acceptsDone.terminalResultFingerprint);
   });
 });
 

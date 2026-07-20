@@ -38,6 +38,33 @@ describe('CoreToolBuilder recovery fingerprint', () => {
       'Cannot create a durable recovery fingerprint for RegExp subclass',
     );
   });
+
+  it('binds durable recovery identity to the terminal-result policy', () => {
+    const execute = async () => ({ ok: true, answer: 'done' });
+    const build = (isSuccess: (output: { ok: boolean; answer: string }) => boolean) => {
+      const originalTool = createTool({
+        id: 'terminal-recovery-fingerprint',
+        description: 'Return a terminal result.',
+        outputSchema: z.object({ ok: z.boolean(), answer: z.string() }),
+        terminalResult: {
+          isSuccess,
+          outputSchema: z.object({ answer: z.string() }),
+          project: output => ({ answer: output.answer }),
+        },
+        execute,
+      });
+      return new CoreToolBuilder({
+        originalTool,
+        options: { name: 'terminal-recovery-fingerprint', logger: noopLogger },
+      }).build();
+    };
+
+    const acceptsOk = build(output => output.ok);
+    const acceptsNonEmpty = build(output => output.answer.length > 0);
+
+    expect(acceptsOk.terminalResult).toBeDefined();
+    expect(acceptsOk.recoveryFingerprint).not.toBe(acceptsNonEmpty.recoveryFingerprint);
+  });
 });
 
 describe('CoreToolBuilder FGA', () => {

@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 import { MessageList } from '../../agent/message-list';
+import type { MastraDBMessage } from '../../agent/message-list';
 import { RequestContext, MASTRA_THREAD_ID_KEY } from '../../request-context';
 import type { ProcessInputStepArgs } from '../index';
 import { SkillSearchProcessor } from './skill-search';
@@ -48,19 +49,89 @@ function createMockWorkspace(skillData: Array<{ name: string; description: strin
   } as any;
 }
 
+function createLoadSkillResultMessage(result: {
+  success: boolean;
+  skillName?: string;
+  contentDigest?: string;
+}): MastraDBMessage {
+  return {
+    id: `load-${result.skillName ?? 'failed'}`,
+    role: 'assistant',
+    createdAt: new Date(),
+    content: {
+      format: 2,
+      parts: [
+        {
+          type: 'tool-invocation',
+          toolInvocation: {
+            state: 'result',
+            toolCallId: `call-${result.skillName ?? 'failed'}`,
+            toolName: 'load_skill',
+            args: { skillName: result.skillName },
+            result,
+          },
+        },
+      ],
+    },
+  };
+}
+
+function createSearchSkillsResultMessage(result: unknown, role: 'assistant' | 'user' = 'assistant'): MastraDBMessage {
+  return {
+    id: 'search-skills-result',
+    role,
+    createdAt: new Date(),
+    content: {
+      format: 2,
+      parts: [
+        {
+          type: 'tool-invocation',
+          toolInvocation: {
+            state: 'result',
+            toolCallId: 'call-search-skills',
+            toolName: 'search_skills',
+            args: { query: 'api design' },
+            result,
+          },
+        },
+      ],
+    },
+  };
+}
+
+function spyOnSystemMessages(args: ProcessInputStepArgs) {
+  const spy = vi.spyOn(args.messageList, 'addSystem');
+  const includes = (expected: string) =>
+    spy.mock.calls.some(([value]) => {
+      if (typeof value === 'string') return value.includes(expected);
+      if (value && typeof value === 'object' && 'content' in value) {
+        const content = (value as Record<string, unknown>).content;
+        return typeof content === 'string' && content.includes(expected);
+      }
+      return false;
+    });
+
+  return { spy, includes };
+}
+
 // Helper to create ProcessInputStepArgs
-function createMockArgs(threadId?: string): ProcessInputStepArgs {
+function createMockArgs(
+  threadId?: string,
+  messages: MastraDBMessage[] = [],
+  state: Record<string, unknown> = {},
+): ProcessInputStepArgs {
   const requestContext = new RequestContext();
   if (threadId) {
     requestContext.set(MASTRA_THREAD_ID_KEY, threadId);
   }
   return {
     messageList: new MessageList({}),
+    messages,
     requestContext,
     stepNumber: 0,
     steps: [],
     systemMessages: [],
-    state: {},
+    state,
     retryCount: 0,
     model: {} as any,
     abort: (() => {
@@ -154,6 +225,7 @@ describe('SkillSearchProcessor', () => {
     beforeEach(() => {
       processor = new SkillSearchProcessor({
         workspace: createMockWorkspace(testSkills),
+        storage: 'context',
       });
     });
 
@@ -190,12 +262,124 @@ describe('SkillSearchProcessor', () => {
     });
   });
 
+  describe('autoLoad mode', () => {
+    function createAutoLoadProcessor(topK = 2) {
+      return new SkillSearchProcessor({
+        workspace: createMockWorkspace(testSkills),
+        storage: 'context',
+        search: { autoLoad: true, topK },
+      });
+    }
+
+    it('mechanically removes the separate load_skill turn', async () => {
+      const processor = createAutoLoadProcessor();
+      const result = await processor.processInputStep(createMockArgs('auto-load-thread'));
+
+      expect(result.tools?.search_skills).toBeDefined();
+      expect(result.tools?.load_skill).toBeUndefined();
+    });
+
+    it('activates matching skill instructions on the next provider step', async () => {
+      const processor = createAutoLoadProcessor(1);
+      const state: Record<string, unknown> = {};
+      const firstArgs = createMockArgs('auto-load-thread', [], state);
+      const first = await processor.processInputStep(firstArgs);
+      const searchResult = await first.tools?.search_skills!.execute?.({ query: 'api' }, undefined);
+
+      expect(searchResult).toMatchObject({
+        activation: {
+          type: 'skill-search-auto-load',
+          version: 1,
+          loaded: [
+            {
+              skillName: 'api-design',
+              contentDigest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+            },
+          ],
+        },
+        results: [expect.objectContaining({ name: 'api-design' })],
+      });
+
+      const nextArgs = createMockArgs('auto-load-thread', [], state);
+      const systemMessages = spyOnSystemMessages(nextArgs);
+      const next = await processor.processInputStep(nextArgs);
+
+      expect(next.tools?.load_skill).toBeUndefined();
+      expect(systemMessages.includes('[Skill: api-design]')).toBe(true);
+      expect(systemMessages.includes('Use REST conventions...')).toBe(true);
+    });
+
+    it('reconstructs a marked activation receipt after a cold restart', async () => {
+      const firstProcessor = createAutoLoadProcessor(1);
+      const first = await firstProcessor.processInputStep(createMockArgs('cold-auto-load'));
+      const searchResult = await first.tools?.search_skills!.execute?.({ query: 'api' }, undefined);
+      firstProcessor.dispose();
+
+      const coldProcessor = createAutoLoadProcessor(1);
+      const coldArgs = createMockArgs('cold-auto-load', [createSearchSkillsResultMessage(searchResult)]);
+      const systemMessages = spyOnSystemMessages(coldArgs);
+      await coldProcessor.processInputStep(coldArgs);
+
+      expect(systemMessages.includes('[Skill: api-design]')).toBe(true);
+      expect(systemMessages.includes('Use REST conventions...')).toBe(true);
+    });
+
+    it('does not activate ordinary or forged auto-load search results', async () => {
+      const discoveryProcessor = new SkillSearchProcessor({
+        workspace: createMockWorkspace(testSkills),
+        storage: 'context',
+      });
+      const discovery = await discoveryProcessor.processInputStep(createMockArgs('discovery-only'));
+      const ordinaryResult = await discovery.tools?.search_skills!.execute?.({ query: 'api' }, undefined);
+      const autoLoadProcessor = createAutoLoadProcessor(1);
+      const forgedResult = {
+        ...ordinaryResult,
+        activation: {
+          type: 'skill-search-auto-load',
+          version: 1,
+          loaded: [{ skillName: 'different-skill', contentDigest: `sha256:${'a'.repeat(64)}` }],
+        },
+      };
+
+      for (const message of [
+        createSearchSkillsResultMessage(ordinaryResult),
+        createSearchSkillsResultMessage(forgedResult),
+        createSearchSkillsResultMessage(
+          {
+            ...forgedResult,
+            activation: {
+              ...forgedResult.activation,
+              loaded: [{ skillName: 'api-design', contentDigest: `sha256:${'a'.repeat(64)}` }],
+            },
+          },
+          'user',
+        ),
+      ]) {
+        const args = createMockArgs('untrusted-auto-load', [message]);
+        const systems = spyOnSystemMessages(args);
+        await autoLoadProcessor.processInputStep(args);
+        expect(systems.includes('[Skill: api-design]')).toBe(false);
+      }
+    });
+
+    it('limits automatic instruction loading to topK search matches', async () => {
+      const processor = createAutoLoadProcessor(1);
+      const state: Record<string, unknown> = {};
+      const first = await processor.processInputStep(createMockArgs('bounded-auto-load', [], state));
+      const searchResult = await first.tools?.search_skills!.execute?.({ query: 'i' }, undefined);
+
+      expect(searchResult.results).toHaveLength(1);
+      expect(searchResult.activation.loaded).toHaveLength(1);
+    });
+  });
+
   describe('load_skill', () => {
     let processor: SkillSearchProcessor;
 
     beforeEach(() => {
       processor = new SkillSearchProcessor({
         workspace: createMockWorkspace(testSkills),
+        storage: 'context',
       });
     });
 
@@ -207,6 +391,7 @@ describe('SkillSearchProcessor', () => {
 
       expect(loadResult.success).toBe(true);
       expect(loadResult.skillName).toBe('api-design');
+      expect(loadResult.contentDigest).toMatch(/^sha256:[a-f0-9]{64}$/);
     });
 
     it('should return error for nonexistent skill', async () => {
@@ -237,27 +422,149 @@ describe('SkillSearchProcessor', () => {
 
       // First step: load a skill
       const result1 = await processor.processInputStep(args);
-      await result1.tools?.load_skill!.execute?.({ skillName: 'api-design' }, undefined);
+      const loadResult = await result1.tools?.load_skill!.execute?.({ skillName: 'api-design' }, undefined);
 
-      // Second step: skill instructions should be injected via addSystem
-      const args2 = createMockArgs('thread-1');
-      const addSystemSpy = vi.spyOn(args2.messageList, 'addSystem');
+      // The next step carries the persisted tool result. Skill instructions are
+      // derived from that conversation evidence rather than processor memory.
+      const args2 = createMockArgs('thread-1', [createLoadSkillResultMessage(loadResult)]);
+      const systemMessages = spyOnSystemMessages(args2);
       await processor.processInputStep(args2);
 
-      const calls = addSystemSpy.mock.calls;
-      const skillCall = calls.find(call => {
-        const arg = call[0];
-        if (typeof arg === 'string') {
-          return arg.includes('[Skill: api-design]');
-        }
-        if (arg && typeof arg === 'object' && 'content' in arg) {
-          const content = (arg as Record<string, unknown>).content;
-          return typeof content === 'string' && content.includes('[Skill: api-design]');
-        }
-        return false;
-      });
+      expect(systemMessages.includes('[Skill: api-design]')).toBe(true);
+      expect(systemMessages.includes('Use REST conventions...')).toBe(true);
+    });
+  });
 
-      expect(skillCall).toBeDefined();
+  describe('context-backed loaded state', () => {
+    it('reconstructs loaded instructions after cold processor recreation', async () => {
+      const firstProcessor = new SkillSearchProcessor({
+        workspace: createMockWorkspace(testSkills),
+        storage: 'context',
+      });
+      const firstArgs = createMockArgs('restart-thread');
+      const firstStep = await firstProcessor.processInputStep(firstArgs);
+      const loadResult = await firstStep.tools?.load_skill!.execute?.({ skillName: 'api-design' }, undefined);
+      const persistedMessages = [createLoadSkillResultMessage(loadResult)];
+      firstProcessor.dispose();
+
+      const recreatedProcessor = new SkillSearchProcessor({
+        workspace: createMockWorkspace(testSkills),
+        storage: 'context',
+      });
+      const recreatedArgs = createMockArgs('restart-thread', persistedMessages);
+      const systemMessages = spyOnSystemMessages(recreatedArgs);
+
+      await recreatedProcessor.processInputStep(recreatedArgs);
+
+      expect(systemMessages.includes('[Skill: api-design]')).toBe(true);
+      expect(systemMessages.includes('Use REST conventions...')).toBe(true);
+      expect(recreatedProcessor.getStateStats()).toEqual({ threadCount: 0, oldestAccessTime: null });
+    });
+
+    it('unloads a skill when edit or regenerate removes its load result', async () => {
+      const loadingProcessor = new SkillSearchProcessor({
+        workspace: createMockWorkspace(testSkills),
+        storage: 'context',
+      });
+      const loadStep = await loadingProcessor.processInputStep(createMockArgs('edited-thread'));
+      const loadResult = await loadStep.tools?.load_skill!.execute?.({ skillName: 'api-design' }, undefined);
+
+      const processor = new SkillSearchProcessor({
+        workspace: createMockWorkspace(testSkills),
+        storage: 'context',
+      });
+      const beforeEdit = createMockArgs('edited-thread', [createLoadSkillResultMessage(loadResult)]);
+      const beforeEditSystems = spyOnSystemMessages(beforeEdit);
+      await processor.processInputStep(beforeEdit);
+      expect(beforeEditSystems.includes('[Skill: api-design]')).toBe(true);
+
+      // A replacement request has fresh processor state and the edited history.
+      const afterEdit = createMockArgs('edited-thread', []);
+      const afterEditSystems = spyOnSystemMessages(afterEdit);
+      await processor.processInputStep(afterEdit);
+      expect(afterEditSystems.includes('[Skill: api-design]')).toBe(false);
+    });
+
+    it('fails closed on stale content and activates only a newly loaded digest', async () => {
+      const originalSkills = [{ name: 'api-design', description: 'API guidance', instructions: 'Use version one.' }];
+      const originalProcessor = new SkillSearchProcessor({
+        workspace: createMockWorkspace(originalSkills),
+        storage: 'context',
+      });
+      const originalStep = await originalProcessor.processInputStep(createMockArgs('version-thread'));
+      const originalLoad = await originalStep.tools?.load_skill!.execute?.({ skillName: 'api-design' }, undefined);
+      const originalMessage = createLoadSkillResultMessage(originalLoad);
+
+      const changedSkills = [{ name: 'api-design', description: 'API guidance', instructions: 'Use version two.' }];
+      const changedProcessor = new SkillSearchProcessor({
+        workspace: createMockWorkspace(changedSkills),
+        storage: 'context',
+      });
+      const changedArgs = createMockArgs('version-thread', [originalMessage]);
+      const changedSystems = spyOnSystemMessages(changedArgs);
+      const changedStep = await changedProcessor.processInputStep(changedArgs);
+
+      expect(changedSystems.includes('[Skill: api-design]')).toBe(false);
+      expect(changedSystems.includes('changed or became unavailable')).toBe(true);
+
+      const refreshedLoad = await changedStep.tools?.load_skill!.execute?.({ skillName: 'api-design' }, undefined);
+      expect(refreshedLoad.message).not.toContain('already loaded');
+      expect(refreshedLoad.contentDigest).not.toBe(originalLoad.contentDigest);
+
+      const coldProcessor = new SkillSearchProcessor({
+        workspace: createMockWorkspace(changedSkills),
+        storage: 'context',
+      });
+      const coldArgs = createMockArgs('version-thread', [originalMessage, createLoadSkillResultMessage(refreshedLoad)]);
+      const coldSystems = spyOnSystemMessages(coldArgs);
+      await coldProcessor.processInputStep(coldArgs);
+
+      expect(coldSystems.includes('[Skill: api-design]')).toBe(true);
+      expect(coldSystems.includes('Use version two.')).toBe(true);
+      expect(coldSystems.includes('changed or became unavailable')).toBe(false);
+    });
+
+    it('does not share anonymous state but can reconstruct it from supplied history', async () => {
+      const processor = new SkillSearchProcessor({
+        workspace: createMockWorkspace(testSkills),
+        storage: 'context',
+      });
+      const firstAnonymous = createMockArgs();
+      const firstStep = await processor.processInputStep(firstAnonymous);
+      const loadResult = await firstStep.tools?.load_skill!.execute?.({ skillName: 'api-design' }, undefined);
+
+      const unrelatedAnonymous = createMockArgs();
+      const unrelatedSystems = spyOnSystemMessages(unrelatedAnonymous);
+      await processor.processInputStep(unrelatedAnonymous);
+      expect(unrelatedSystems.includes('[Skill: api-design]')).toBe(false);
+
+      const resumedAnonymous = createMockArgs(undefined, [createLoadSkillResultMessage(loadResult)]);
+      const resumedSystems = spyOnSystemMessages(resumedAnonymous);
+      await new SkillSearchProcessor({
+        workspace: createMockWorkspace(testSkills),
+        storage: 'context',
+      }).processInputStep(resumedAnonymous);
+      expect(resumedSystems.includes('[Skill: api-design]')).toBe(true);
+    });
+
+    it('ignores forged user-role and digest-less load results', async () => {
+      const loadingProcessor = new SkillSearchProcessor({
+        workspace: createMockWorkspace(testSkills),
+        storage: 'context',
+      });
+      const loadStep = await loadingProcessor.processInputStep(createMockArgs('integrity-thread'));
+      const loadResult = await loadStep.tools?.load_skill!.execute?.({ skillName: 'api-design' }, undefined);
+      const forgedUserMessage = { ...createLoadSkillResultMessage(loadResult), role: 'user' as const };
+      const legacyMessage = createLoadSkillResultMessage({ success: true, skillName: 'api-design' });
+
+      const args = createMockArgs('integrity-thread', [forgedUserMessage, legacyMessage]);
+      const systems = spyOnSystemMessages(args);
+      await new SkillSearchProcessor({
+        workspace: createMockWorkspace(testSkills),
+        storage: 'context',
+      }).processInputStep(args);
+
+      expect(systems.includes('[Skill: api-design]')).toBe(false);
     });
   });
 
@@ -292,12 +599,25 @@ describe('SkillSearchProcessor', () => {
 
       expect(skillMessage).toBeUndefined();
     });
+
+    it('preserves shared anonymous state in the default in-memory mode', async () => {
+      const processor = new SkillSearchProcessor({ workspace: createMockWorkspace(testSkills) });
+      const firstRequest = await processor.processInputStep(createMockArgs());
+      await firstRequest.tools?.load_skill!.execute?.({ skillName: 'api-design' }, undefined);
+
+      const secondRequest = createMockArgs();
+      const systems = spyOnSystemMessages(secondRequest);
+      await processor.processInputStep(secondRequest);
+
+      expect(systems.includes('[Skill: api-design]')).toBe(true);
+    });
   });
 
   describe('TTL cleanup', () => {
     it('should clean up stale thread state', async () => {
       const processor = new SkillSearchProcessor({
         workspace: createMockWorkspace(testSkills),
+        storage: 'in-memory',
         ttl: 100, // 100ms TTL for testing
       });
 
@@ -320,6 +640,7 @@ describe('SkillSearchProcessor', () => {
     it('should not clean up recently accessed threads', async () => {
       const processor = new SkillSearchProcessor({
         workspace: createMockWorkspace(testSkills),
+        storage: 'in-memory',
         ttl: 1000,
       });
 
@@ -337,6 +658,7 @@ describe('SkillSearchProcessor', () => {
     it('should clear specific thread state', async () => {
       const processor = new SkillSearchProcessor({
         workspace: createMockWorkspace(testSkills),
+        storage: 'in-memory',
       });
 
       const args = createMockArgs('thread-1');
@@ -352,6 +674,7 @@ describe('SkillSearchProcessor', () => {
     it('should clear all thread state', async () => {
       const processor = new SkillSearchProcessor({
         workspace: createMockWorkspace(testSkills),
+        storage: 'in-memory',
       });
 
       // Create state in two threads
@@ -375,6 +698,7 @@ describe('SkillSearchProcessor', () => {
       const clearIntervalSpy = vi.spyOn(global, 'clearInterval');
       const processor = new SkillSearchProcessor({
         workspace: createMockWorkspace(testSkills),
+        storage: 'in-memory',
         ttl: 60000,
       });
 
@@ -395,6 +719,7 @@ describe('SkillSearchProcessor', () => {
     it('should be safe to call multiple times', () => {
       const processor = new SkillSearchProcessor({
         workspace: createMockWorkspace(testSkills),
+        storage: 'in-memory',
         ttl: 60000,
       });
 

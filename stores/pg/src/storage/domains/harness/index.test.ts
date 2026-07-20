@@ -12,6 +12,7 @@ import {
   HarnessStorageSessionNotFoundError,
   HarnessStorageThreadDeleteFenceConflictError,
   HarnessStorageVersionConflictError,
+  TABLE_HARNESS_PLAN_TASKS,
   TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS,
   TABLE_HARNESS_SESSION_EVENTS,
   TABLE_HARNESS_WORKSPACE_ACTIONS,
@@ -20,6 +21,7 @@ import type {
   ChannelBinding,
   HarnessPlanTask,
   HarnessProviderCallbackBinding,
+  SessionRecord,
   WorkspaceActionJournalEntry,
 } from '@mastra/core/storage';
 import { describe, expect, it, beforeAll, beforeEach, afterAll, vi } from 'vitest';
@@ -56,6 +58,7 @@ describe('HarnessPG', () => {
     expect(ddl).toContain(TABLE_HARNESS_WORKSPACE_ACTIONS);
     expect(ddl).toContain('idx_harness_sessions_active_key');
     expect(ddl).toContain('idx_harness_sessions_parent');
+    expect(ddl).toContain('idx_harness_sessions_pending_resume_expiry');
     expect(ddl).toContain('idx_harness_message_results_lookup');
     expect(ddl).toContain('idx_harness_message_results_admission');
     expect(ddl).toContain('idx_harness_tombstones_lookup');
@@ -72,6 +75,7 @@ describe('HarnessPG', () => {
       [
         [
           'idx_harness_sessions_active_key',
+          'idx_harness_sessions_pending_resume_expiry',
           'idx_harness_channel_inbox_idempotency',
           'idx_harness_channel_outbox_idempotency',
           'idx_harness_session_events_replay',
@@ -86,6 +90,7 @@ describe('HarnessPG', () => {
       'idx_harness_channel_outbox_idempotency',
       'idx_harness_session_events_replay',
       'idx_harness_sessions_active_key',
+      'idx_harness_sessions_pending_resume_expiry',
       'idx_harness_wakeups_idempotency',
       'idx_harness_workspace_actions_page',
       'idx_harness_workspace_actions_session',
@@ -683,6 +688,141 @@ describe('HarnessPG', () => {
     const topLevel = await harness!.loadSession({ sessionId: 'session-2' });
     expect(topLevel?.subagentTypeId).toBeUndefined();
     expect(topLevel?.subagentToolAllowlistScoped).toBeUndefined();
+  });
+
+  it('round-trips every restart-critical session field', async () => {
+    const harness = store.stores.harness!;
+    const record = createSampleSessionRecord({
+      subagentTypeId: 'critic',
+      subagentToolAllowlistScoped: true,
+      permissionRulesSeedHash: 'seed-hash-v1',
+      currentRun: {
+        runId: 'run-1',
+        harnessName: 'default',
+        sessionId: 'session-1',
+        resourceId: 'resource-1',
+        threadId: 'thread-1',
+        agentId: 'critic-agent',
+        operation: { kind: 'signal', signalId: 'signal-1' },
+        modeId: 'build',
+        modelId: 'claude-opus-4-7',
+        status: 'waiting',
+        startedAt: 1000,
+        updatedAt: 1100,
+      },
+      assistantDrafts: {
+        'run-1': {
+          runId: 'run-1',
+          sessionId: 'session-1',
+          resourceId: 'resource-1',
+          threadId: 'thread-1',
+          text: 'durable partial answer',
+          status: 'streaming',
+          startedAt: 1000,
+          updatedAt: 1100,
+        },
+      },
+      cancelRequest: {
+        requestedAt: 1200,
+        reason: 'operator-stop',
+        requestedBy: 'conformance-test',
+      },
+    });
+
+    await harness.saveSession(record, { ownerId: 'h', ifVersion: 0 });
+
+    await expect(harness.loadSession({ sessionId: record.id })).resolves.toMatchObject({
+      subagentTypeId: record.subagentTypeId,
+      subagentToolAllowlistScoped: true,
+      permissionRulesSeedHash: record.permissionRulesSeedHash,
+      currentRun: record.currentRun,
+      assistantDrafts: record.assistantDrafts,
+      cancelRequest: record.cancelRequest,
+    });
+  });
+
+  it('keyset-pages exact due pending generations and round-trips finalizing/tombstone state', async () => {
+    const harness = store.stores.harness!;
+    const pendingSession = (
+      id: string,
+      expiresAt: number,
+      pendingOverrides: Partial<NonNullable<SessionRecord['pendingResume']>> = {},
+      sessionOverrides: Partial<SessionRecord> = {},
+    ) =>
+      createSampleSessionRecord({
+        id,
+        resourceId: `resource-${id}`,
+        threadId: `thread-${id}`,
+        pendingResume: {
+          kind: 'tool-approval',
+          itemId: `item-${id}`,
+          runId: `run-${id}`,
+          toolCallId: `tool-call-${id}`,
+          source: 'parent',
+          requestedAt: 10,
+          expiresAt,
+          ...pendingOverrides,
+        },
+        ...sessionOverrides,
+      });
+
+    for (const record of [
+      pendingSession('due-a', 100),
+      pendingSession('due-b', 100),
+      pendingSession(
+        'finalizing',
+        200,
+        { expiryStartedAt: 201 },
+        {
+          expiredPendingInteractions: {
+            old: {
+              generationKey: 'old',
+              itemId: 'old-item',
+              kind: 'question',
+              runId: 'old-run',
+              toolCallId: 'old-tool',
+              requestedAt: 1,
+              expiresAt: 2,
+              expiredAt: 3,
+              error: { code: 'harness.pending_interaction_expired', message: 'expired' },
+            },
+          },
+        },
+      ),
+      pendingSession('recovering', 1_000, { resumedAt: 50, resumeRecoveryAt: 150 }),
+      pendingSession('future', 201),
+      pendingSession('resumed', 50, { resumedAt: 51 }),
+      pendingSession('closed', 50, {}, { closedAt: 60 }),
+      createSampleSessionRecord({
+        id: 'cleared',
+        resourceId: 'resource-cleared',
+        threadId: 'thread-cleared',
+      }),
+    ]) {
+      await harness.saveSession(record, { ownerId: 'owner', ifVersion: 0 });
+    }
+
+    const first = await harness.listDuePendingInteractions({ now: 200, limit: 2 });
+    expect(first.items.map(item => item.sessionId)).toEqual(['due-a', 'due-b']);
+    expect(first.nextCursor).toEqual({ dueAt: 100, sessionId: 'due-b' });
+    await expect(harness.listDuePendingInteractions({ now: 200, limit: 2, cursor: first.nextCursor })).resolves.toEqual(
+      {
+        items: [
+          expect.objectContaining({
+            sessionId: 'recovering',
+            dueAt: 150,
+            expiresAt: 1_000,
+            resumedAt: 50,
+            resumeRecoveryAt: 150,
+          }),
+          expect.objectContaining({ sessionId: 'finalizing', dueAt: 200, expiresAt: 200, expiryStartedAt: 201 }),
+        ],
+      },
+    );
+    await expect(harness.loadSession({ sessionId: 'finalizing' })).resolves.toMatchObject({
+      pendingResume: { expiresAt: 200, expiryStartedAt: 201 },
+      expiredPendingInteractions: { old: { generationKey: 'old', expiredAt: 3 } },
+    });
   });
 
   it('round-trips run summaries with idempotent first-write-wins + keyset listing (span-summary)', async () => {
@@ -2357,15 +2497,98 @@ describe('HarnessPG renewSessionLeaseSubtree (§5.8 / PF-821)', () => {
       const { sessionId, version } = await setupSession();
       const a = await harness.createPlanTask({
         fence: fence(sessionId, version),
-        task: sampleTask(sessionId, { taskId: 't-a', idempotencyKey: 'idem-1', content: 'first' }),
+        task: sampleTask(sessionId, {
+          taskId: 't-a',
+          idempotencyKey: 'idem-1',
+          idempotencyInputHash: 'request-hash-a',
+          content: 'first',
+        }),
       });
       const b = await harness.createPlanTask({
         fence: fence(sessionId, version),
-        task: sampleTask(sessionId, { taskId: 't-b', idempotencyKey: 'idem-1', content: 'second' }),
+        task: sampleTask(sessionId, {
+          taskId: 't-b',
+          idempotencyKey: 'idem-1',
+          idempotencyInputHash: 'request-hash-b',
+          content: 'second',
+        }),
       });
       expect(b.taskId).toBe('t-a');
       expect(b.content).toBe('first');
+      expect(b.idempotencyInputHash).toBe('request-hash-a');
       expect(b.version).toBe(a.version);
+    });
+
+    it('rejects keyed direct and batched creates without a non-empty immutable input hash', async () => {
+      const harness = store.stores.harness!;
+      const { sessionId, version } = await setupSession();
+      const missingHash = sampleTask(sessionId, { taskId: 'missing-hash', idempotencyKey: 'idem-missing' });
+      const emptyHash = sampleTask(sessionId, {
+        taskId: 'empty-hash',
+        idempotencyKey: 'idem-empty',
+        idempotencyInputHash: '',
+      });
+
+      await expect(harness.createPlanTask({ fence: fence(sessionId, version), task: missingHash })).rejects.toThrow(
+        /idempotencyInputHash must be a non-empty string/,
+      );
+      await expect(harness.createPlanTask({ fence: fence(sessionId, version), task: emptyHash })).rejects.toThrow(
+        /idempotencyInputHash must be a non-empty string/,
+      );
+      await expect(
+        harness.mutatePlanTasksForSession({
+          fence: fence(sessionId, version),
+          ops: [{ kind: 'create', task: missingHash }],
+        }),
+      ).rejects.toThrow(/idempotencyInputHash must be a non-empty string/);
+
+      await expect(harness.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 })).resolves.toEqual({
+        tasks: [],
+      });
+    });
+
+    it('preserves key-only replay for a pre-hash task after the row mutates', async () => {
+      const harness = store.stores.harness!;
+      const { sessionId, version } = await setupSession();
+      const legacy = await harness.createPlanTask({
+        fence: fence(sessionId, version),
+        task: sampleTask(sessionId, {
+          taskId: 'legacy-task',
+          idempotencyKey: 'legacy-key',
+          idempotencyInputHash: 'legacy-seed-hash',
+          content: 'legacy input',
+        }),
+      });
+      await store.db.none(
+        `UPDATE ${TABLE_HARNESS_PLAN_TASKS}
+         SET idempotency_input_hash = NULL
+         WHERE harness_name = $1 AND session_id = $2 AND task_id = $3`,
+        ['default', sessionId, legacy.taskId],
+      );
+      const mutated = await harness.updatePlanTask({
+        fence: fence(sessionId, version),
+        taskId: legacy.taskId,
+        ifVersion: legacy.version,
+        patch: { content: 'mutated after creation', priority: 9 },
+      });
+
+      const replay = await harness.createPlanTask({
+        fence: fence(sessionId, version),
+        task: sampleTask(sessionId, {
+          taskId: 'retry-task',
+          idempotencyKey: 'legacy-key',
+          idempotencyInputHash: 'new-client-hash',
+          content: 'different retry input',
+        }),
+      });
+
+      expect(replay).toMatchObject({
+        taskId: legacy.taskId,
+        content: 'mutated after creation',
+        priority: 9,
+        version: mutated.version,
+      });
+      expect(replay.idempotencyInputHash).toBeUndefined();
     });
 
     it('updatePlanTask advances the per-row version and applies the patch', async () => {
@@ -2418,6 +2641,44 @@ describe('HarnessPG renewSessionLeaseSubtree (§5.8 / PF-821)', () => {
       await expect(
         harness.createPlanTask({ fence: fence(sessionId, version, 'someone-else'), task: sampleTask(sessionId) }),
       ).rejects.toBeInstanceOf(HarnessStorageLeaseConflictError);
+    });
+
+    it('rejects every plan-task mutator after the owner lease expires', async () => {
+      const harness = store.stores.harness!;
+      const { sessionId, version } = await setupSession();
+      await harness.createPlanTask({
+        fence: fence(sessionId, version),
+        task: sampleTask(sessionId, { taskId: 'existing' }),
+      });
+      await harness.renewSessionLease({ sessionId, ownerId: OWNER, ttlMs: -1 });
+
+      const expiredFence = fence(sessionId, version);
+      const writes = [
+        () =>
+          harness.createPlanTask({
+            fence: expiredFence,
+            task: sampleTask(sessionId, { taskId: 'new' }),
+          }),
+        () =>
+          harness.updatePlanTask({
+            fence: expiredFence,
+            taskId: 'existing',
+            ifVersion: 1,
+            patch: { status: 'completed' },
+          }),
+        () => harness.deletePlanTaskSubtree({ fence: expiredFence, rootTaskId: 'existing' }),
+        () =>
+          harness.mutatePlanTasksForSession({
+            fence: expiredFence,
+            ops: [{ kind: 'update', taskId: 'existing', ifVersion: 1, patch: { status: 'completed' } }],
+          }),
+      ];
+
+      for (const write of writes) {
+        await expect(write()).rejects.toBeInstanceOf(HarnessStorageLeaseConflictError);
+      }
+      const listed = await harness.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
+      expect(listed.tasks).toEqual([expect.objectContaining({ taskId: 'existing', status: 'pending', version: 1 })]);
     });
 
     it('the session-owner fence rejects a stale session version', async () => {

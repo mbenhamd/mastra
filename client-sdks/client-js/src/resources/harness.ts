@@ -93,8 +93,14 @@ export type PermissionsBody =
   | { action: 'revokeTool'; toolName: string }
   | { action: 'setPolicy'; category?: string; toolName?: string; policy: 'allow' | 'ask' | 'deny' };
 export type PermissionsResponse = {
-  grants: unknown;
-  rules: unknown;
+  grants: {
+    categories: string[];
+    tools: string[];
+  };
+  rules: {
+    categories: Record<string, 'allow' | 'ask' | 'deny'>;
+    tools: Record<string, 'allow' | 'ask' | 'deny'>;
+  };
 };
 type HarnessRequestOptions = RequestOptions & { signal?: AbortSignal; retries?: number };
 
@@ -330,6 +336,7 @@ export class RemoteSession extends BaseResource {
   }
 
   readonly permissions = Object.freeze({
+    get: () => this.request<PermissionsResponse>(`${this.sessionPath()}/permissions`, { method: 'GET' }),
     grantCategory: (options: { category: string }) =>
       this.patchPermissions({ action: 'grantCategory', category: options.category }),
     grantTool: (options: { toolName: string }) =>

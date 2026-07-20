@@ -111,6 +111,12 @@ export interface AdmitWorkflowResumeInput extends WorkflowResumeFenceInput {
   operationReplayContext: WorkflowResumeOperationReplayContextV1;
   resourceId?: string;
   requestContext?: Record<string, unknown>;
+  /**
+   * Replace request context in both the admitted snapshot and its rollback
+   * checkpoint. Omit to preserve the generic workflow merge behavior.
+   * @internal Adapter security boundary only.
+   */
+  replaceRequestContext?: true;
 }
 
 export type AdmitWorkflowResumeResult =

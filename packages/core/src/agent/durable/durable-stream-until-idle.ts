@@ -13,13 +13,48 @@
  */
 import type { BackgroundTaskManager } from '../../background-tasks/manager';
 import { runIdleLoop } from '../../loop/shared/stream-until-idle-helpers';
+import type { AgentExecutionOptions } from '../agent.types';
+import type { ResolvedAgentMemory } from '../execution-memory';
 import type { MessageListInput } from '../message-list';
 
 import type { DurableAgent, DurableAgentStreamOptions, DurableAgentStreamResult } from './durable-agent';
 
+/**
+ * Private handoff from the idle wrapper to DurableAgent.stream(). The wrapper
+ * must resolve defaults to discover its memory scope; the inner durable
+ * preparation reuses that exact resolution instead of invoking a dynamic
+ * resolver a second time against potentially different runtime state.
+ */
+export const DURABLE_STREAM_UNTIL_IDLE_HANDOFF = Symbol('durableStreamUntilIdleHandoff');
+
+export interface DurableStreamUntilIdleHandoff<OUTPUT = undefined> {
+  defaultOptions: AgentExecutionOptions<OUTPUT>;
+  resolvedMemory: ResolvedAgentMemory;
+}
+
 export interface DurableStreamUntilIdleDeps {
   activeStreams: Map<string, () => void>;
   bgManager: BackgroundTaskManager | undefined;
+  prepareContinuation?: (resolvedOptions: Record<string, any>) => Promise<Record<string, any>>;
+}
+
+function agentForIdleLoop<OUTPUT>(
+  agent: DurableAgent<any, any, OUTPUT>,
+  resolvedDefaultOptions?: AgentExecutionOptions<OUTPUT>,
+) {
+  if (!resolvedDefaultOptions) return agent;
+  let initialResolutionPending = true;
+  return {
+    id: agent.id,
+    getDefaultOptions: async (options?: any) => {
+      if (initialResolutionPending) {
+        initialResolutionPending = false;
+        return resolvedDefaultOptions;
+      }
+      return agent.getDefaultOptions(options);
+    },
+    getMemory: (options?: any) => agent.getMemory(options),
+  };
 }
 
 /**
@@ -33,17 +68,37 @@ export async function runDurableStreamUntilIdle<OUTPUT = undefined>(
   messages: MessageListInput,
   streamOptions: (DurableAgentStreamOptions<OUTPUT> & { maxIdleMs?: number }) | undefined,
   deps: DurableStreamUntilIdleDeps,
+  resolvedDefaultOptions?: AgentExecutionOptions<OUTPUT>,
 ): Promise<DurableAgentStreamResult<OUTPUT>> {
   // Durable-specific: track cleanup/abort handles from each inner stream
   const innerCleanups: Array<() => void> = [];
   const innerAborts: Array<(reason?: unknown) => void> = [];
 
-  return runIdleLoop<typeof agent, DurableAgentStreamResult<OUTPUT>, DurableAgentStreamResult<OUTPUT>>(
-    agent,
+  return runIdleLoop<
+    ReturnType<typeof agentForIdleLoop<OUTPUT>>,
+    DurableAgentStreamResult<OUTPUT>,
+    DurableAgentStreamResult<OUTPUT>
+  >(
+    agentForIdleLoop(agent, resolvedDefaultOptions),
     streamOptions,
     deps,
-    opts => (agent as any).stream(messages, opts) as Promise<DurableAgentStreamResult<OUTPUT>>,
-    opts => (agent as any).stream([], opts) as Promise<{ fullStream: ReadableStream<any> }>,
+    (opts, memory, defaultOptions, mergedOptions) =>
+      (agent as any).stream(messages, {
+        ...mergedOptions,
+        _skipBgTaskWait: opts._skipBgTaskWait,
+        [DURABLE_STREAM_UNTIL_IDLE_HANDOFF]: {
+          defaultOptions: defaultOptions as AgentExecutionOptions<OUTPUT>,
+          resolvedMemory: { value: memory },
+        } satisfies DurableStreamUntilIdleHandoff<OUTPUT>,
+      }) as Promise<DurableAgentStreamResult<OUTPUT>>,
+    (opts, memory, defaultOptions) =>
+      (agent as any).stream([], {
+        ...opts,
+        [DURABLE_STREAM_UNTIL_IDLE_HANDOFF]: {
+          defaultOptions: defaultOptions as AgentExecutionOptions<OUTPUT>,
+          resolvedMemory: { value: memory },
+        } satisfies DurableStreamUntilIdleHandoff<OUTPUT>,
+      }) as Promise<{ fullStream: ReadableStream<any> }>,
     (first, ctx) => {
       // No ctx means no bgManager / no memory — fall through without wrapping.
       if (!ctx) return first;
@@ -110,16 +165,29 @@ export async function runResumeDurableStreamUntilIdle<OUTPUT = undefined>(
   resumeData: unknown,
   streamOptions: (DurableAgentStreamOptions<OUTPUT> & { maxIdleMs?: number }) | undefined,
   deps: DurableStreamUntilIdleDeps,
+  resolvedDefaultOptions?: AgentExecutionOptions<OUTPUT>,
 ): Promise<DurableAgentStreamResult<OUTPUT>> {
   const innerCleanups: Array<() => void> = [];
   const innerAborts: Array<(reason?: unknown) => void> = [];
 
-  return runIdleLoop<typeof agent, DurableAgentStreamResult<OUTPUT>, DurableAgentStreamResult<OUTPUT>>(
-    agent,
+  return runIdleLoop<
+    ReturnType<typeof agentForIdleLoop<OUTPUT>>,
+    DurableAgentStreamResult<OUTPUT>,
+    DurableAgentStreamResult<OUTPUT>
+  >(
+    agentForIdleLoop(agent, resolvedDefaultOptions),
     streamOptions,
     deps,
-    opts => (agent as any).resume(runId, resumeData, opts) as Promise<DurableAgentStreamResult<OUTPUT>>,
-    opts => (agent as any).stream([], opts) as Promise<{ fullStream: ReadableStream<any> }>,
+    (_opts, _memory, _defaultOptions, mergedOptions) =>
+      (agent as any).resume(runId, resumeData, mergedOptions) as Promise<DurableAgentStreamResult<OUTPUT>>,
+    (opts, memory, defaultOptions) =>
+      (agent as any).stream([], {
+        ...opts,
+        [DURABLE_STREAM_UNTIL_IDLE_HANDOFF]: {
+          defaultOptions: defaultOptions as AgentExecutionOptions<OUTPUT>,
+          resolvedMemory: { value: memory },
+        } satisfies DurableStreamUntilIdleHandoff<OUTPUT>,
+      }) as Promise<{ fullStream: ReadableStream<any> }>,
     (first, ctx) => {
       if (!ctx) return first;
 

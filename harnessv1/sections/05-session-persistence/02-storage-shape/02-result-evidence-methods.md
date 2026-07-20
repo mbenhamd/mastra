@@ -17,7 +17,7 @@
       resourceId: string;
       threadId: string;
       signalId: string;
-    }): Promise<AgentSignalResultStatus | OperationAdmissionTombstone | null>;
+    }): Promise<AgentSignalResultEvidence | OperationAdmissionTombstone | null>;
 
     loadQueueResultEvidence(opts: {
       sessionId: string;
@@ -81,3 +81,10 @@
     }): Promise<void>;
 
 ```
+
+Completed child-operation evidence may also carry bounded, framework-minted
+tool receipts containing only tool-call ID, tool name, and success/error status.
+When a run suspends, the same bounded receipt projection is stored on
+`PendingResume` and restored after rehydration. Raw tool arguments/results are
+not part of this evidence. Receipt truncation is persisted as an overflow marker
+and makes terminal outcome verification fail closed.

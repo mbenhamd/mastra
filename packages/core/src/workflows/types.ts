@@ -841,6 +841,8 @@ export interface ForeachConcurrencyContext {
   inputData: unknown;
   /** Returns the workflow run's init data (the workflow input). */
   getInitData: () => unknown;
+  /** Current run RequestContext at the foreach execution boundary. */
+  requestContext?: RequestContext;
 }
 
 /**

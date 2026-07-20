@@ -23,10 +23,16 @@ import {
   planTaskCheck,
   planTaskComplete,
   planTaskDecompose,
+  planTaskDelegate,
+  planTaskReconcileDelegation,
   planTaskReparent,
+  planTaskReset,
   planTaskUpdate,
+  PLAN_TASK_CONTENT_MAX_BYTES,
   PLAN_TASK_CHECK_DEFAULT_LIMIT,
   PLAN_TASK_CHECK_MAX_LIMIT,
+  PLAN_TASK_CHECK_MAX_OUTPUT_BYTES,
+  PLAN_TASK_MAX_NODES,
   PLAN_TASK_UPDATED_EVENT,
 } from './plan-task-session';
 import type { PlanTaskSessionPort, PlanTaskSummary, PlanTaskUpdatedPayload } from './plan-task-session';
@@ -57,6 +63,7 @@ function sessionRecord(): SessionRecord {
 }
 
 interface Harness {
+  db: InMemoryDB;
   storage: InMemoryHarness;
   port: PlanTaskSessionPort;
   events: PlanTaskUpdatedPayload[];
@@ -64,7 +71,8 @@ interface Harness {
 }
 
 async function setup(): Promise<Harness> {
-  const storage = new InMemoryHarness({ db: new InMemoryDB() });
+  const db = new InMemoryDB();
+  const storage = new InMemoryHarness({ db });
   await storage.createOrLoadActiveSession(sessionRecord(), { initialLease: { ownerId: OWNER, ttlMs: 60_000 } });
   const events: PlanTaskUpdatedPayload[] = [];
   const summaries: PlanTaskSummary[] = [];
@@ -83,7 +91,7 @@ async function setup(): Promise<Harness> {
       summaries.push(summary);
     },
   };
-  return { storage, port, events, summaries };
+  return { db, storage, port, events, summaries };
 }
 
 async function listAll(storage: InMemoryHarness) {
@@ -113,6 +121,47 @@ describe('planTaskAdd', () => {
     const a = await planTaskAdd(port, { content: 'a' });
     const b = await planTaskAdd(port, { content: 'b' });
     expect(b.order).toBe(a.order + 1);
+  });
+
+  it('enforces the UTF-8 task-label budget on add, decompose, and update', async () => {
+    const { port } = await setup();
+    // 257 two-byte code points stay below the character cap but exceed 512 UTF-8 bytes.
+    const oversized = 'é'.repeat(Math.floor(PLAN_TASK_CONTENT_MAX_BYTES / 2) + 1);
+    await expect(planTaskAdd(port, { content: oversized })).rejects.toThrow(/UTF-8 bytes/);
+
+    const root = await planTaskAdd(port, { content: 'root' });
+    await expect(planTaskDecompose(port, root.taskId, [{ content: oversized }])).rejects.toThrow(/UTF-8 bytes/);
+    await expect(planTaskUpdate(port, root.taskId, { content: oversized })).rejects.toThrow(/UTF-8 bytes/);
+    await expect(planTaskUpdate(port, root.taskId, { content: '' })).rejects.toThrow(/non-empty string/);
+  });
+
+  it('admits exactly the transaction-safe node budget and rejects the next add without a partial row', async () => {
+    const { storage, port } = await setup();
+    const root = await planTaskAdd(port, { content: 'root' });
+    await planTaskDecompose(
+      port,
+      root.taskId,
+      Array.from({ length: PLAN_TASK_MAX_NODES - 1 }, (_, index) => ({ content: `child-${index}` })),
+    );
+
+    await expect(planTaskAdd(port, { content: 'over budget' })).rejects.toThrow(/limit is 100 nodes/);
+    expect((await listAll(storage)).size).toBe(PLAN_TASK_MAX_NODES);
+  });
+
+  it('rejects an over-budget atomic decompose before writing any child', async () => {
+    const { storage, port } = await setup();
+    const root = await planTaskAdd(port, { content: 'root' });
+    await planTaskDecompose(
+      port,
+      root.taskId,
+      Array.from({ length: PLAN_TASK_MAX_NODES - 2 }, (_, index) => ({ content: `existing-${index}` })),
+    );
+    const before = await listAll(storage);
+
+    await expect(
+      planTaskDecompose(port, root.taskId, [{ content: 'too-many-a' }, { content: 'too-many-b' }]),
+    ).rejects.toThrow(/limit is 100 nodes/);
+    expect(await listAll(storage)).toEqual(before);
   });
 
   it('rejects an unknown parent', async () => {
@@ -177,15 +226,66 @@ describe('planTaskComplete + rollup', () => {
     expect(stored.get(parent.taskId)?.status).toBe('failed');
   });
 
-  it('explicit terminal parent status is NEVER overwritten by rollup', async () => {
-    const { storage, port } = await setup();
-    // Parent explicitly cancelled BEFORE it gains a child → stays cancelled.
+  it('a terminal parent cannot gain children that its status would mask', async () => {
+    const { port } = await setup();
     const parent = await planTaskAdd(port, { content: 'p', status: 'cancelled' });
-    const child = await planTaskAdd(port, { content: 'c', parentTaskId: parent.taskId, status: 'in_progress' });
-    const stored = await listAll(storage);
-    expect(stored.get(parent.taskId)?.status).toBe('cancelled');
-    expect(stored.get(parent.taskId)?.statusSource).toBe('explicit');
-    expect(stored.get(child.taskId)?.status).toBe('in_progress');
+    await expect(
+      planTaskAdd(port, { content: 'c', parentTaskId: parent.taskId, status: 'in_progress' }),
+    ).rejects.toThrow('cannot receive new children');
+  });
+});
+
+describe('planTaskReset', () => {
+  it('atomically clears every root, returns delegation links, and refreshes the empty summary', async () => {
+    const { storage, port, events, summaries } = await setup();
+    const firstRoot = await planTaskAdd(port, { content: 'first root' });
+    const [delegatedChild] = await planTaskDecompose(port, firstRoot.taskId, [{ content: 'delegated child' }]);
+    const secondRoot = await planTaskAdd(port, { content: 'second root' });
+    await planTaskDelegate(port, {
+      taskId: delegatedChild!.taskId,
+      subagentSessionId: 'child-session-1',
+      subagentTypeId: 'critic',
+    });
+
+    const result = await planTaskReset(port);
+
+    expect(result).toEqual({
+      deletedCount: 3,
+      delegatedSubagentSessionIds: ['child-session-1'],
+    });
+    expect((await listAll(storage)).size).toBe(0);
+    expect(summaries.at(-1)).toEqual({
+      total: 0,
+      byStatus: {},
+      inProgressTaskIds: [],
+      rootCount: 0,
+    });
+    expect(events.at(-1)).toMatchObject({
+      op: 'reset',
+      affectedTaskIds: [firstRoot.taskId, secondRoot.taskId],
+      deltas: [],
+    });
+  });
+
+  it('is idempotent when the plan is already empty', async () => {
+    const { port, events, summaries } = await setup();
+    await expect(planTaskReset(port)).resolves.toEqual({
+      deletedCount: 0,
+      delegatedSubagentSessionIds: [],
+    });
+    expect(events).toHaveLength(0);
+    expect(summaries.at(-1)?.total).toBe(0);
+  });
+
+  it('leaves the complete forest intact when the session fence is stale', async () => {
+    const { storage, port } = await setup();
+    await planTaskAdd(port, { content: 'root one' });
+    await planTaskAdd(port, { content: 'root two' });
+    const record = (await storage.loadSession({ sessionId: SESSION_ID }))!;
+    await storage.saveSession({ ...record, lastActivityAt: 1 }, { ownerId: OWNER, ifVersion: 1 });
+
+    await expect(planTaskReset(port)).rejects.toThrow();
+    expect((await listAll(storage)).size).toBe(2);
   });
 });
 
@@ -209,54 +309,105 @@ describe('blockedBy → blocked rollup', () => {
   // Finding 2: a LEAF (no children) with an unsatisfied blockedBy dep must
   // surface 'blocked' — rollup is not limited to nodes that already have
   // children. The leaf keeps statusSource 'explicit' and reverts when released.
-  it('a leaf with an unsatisfied blockedBy dep rolls to blocked, then reverts to its explicit status', async () => {
-    const { storage, port } = await setup();
+  it('a leaf with an unsatisfied blockedBy dep returns its canonical rolled-up post-image', async () => {
+    const { storage, port, events } = await setup();
     const dep = await planTaskAdd(port, { content: 'dep' });
     const leaf = await planTaskAdd(port, { content: 'leaf' });
     // leaf is a childless explicit 'pending' node; give it a pending dep.
-    await planTaskUpdate(port, leaf.taskId, { blockedBy: [dep.taskId] });
+    const returned = await planTaskUpdate(port, leaf.taskId, { blockedBy: [dep.taskId] });
     let stored = await listAll(storage);
     expect(stored.get(leaf.taskId)?.status).toBe('blocked');
     // A blockedBy overlay flips the node derived so it reverts when the dep clears.
     expect(stored.get(leaf.taskId)?.statusSource).toBe('derived');
+    expect(returned).toMatchObject({ status: 'blocked', statusSource: 'derived' });
+    expect(events.at(-1)?.deltas.find(delta => delta.taskId === leaf.taskId)).toMatchObject({
+      status: returned.status,
+      statusSource: returned.statusSource,
+    });
     // Completing the dep releases the block → leaf reverts to pending.
     await planTaskComplete(port, dep.taskId);
     stored = await listAll(storage);
     expect(stored.get(leaf.taskId)?.status).toBe('pending');
   });
+
+  it('rejects creating an in_progress task whose dependency is unsatisfied', async () => {
+    const { storage, port } = await setup();
+    const dependency = await planTaskAdd(port, { content: 'dependency' });
+    await expect(
+      planTaskAdd(port, {
+        content: 'cannot start yet',
+        status: 'in_progress',
+        blockedBy: [dependency.taskId],
+      }),
+    ).rejects.toThrow(/cannot start/);
+    expect((await listAll(storage)).size).toBe(1);
+  });
+
+  it('rejects moving a blocked task to in_progress until its dependency settles', async () => {
+    const { storage, port } = await setup();
+    const dependency = await planTaskAdd(port, { content: 'dependency' });
+    const dependent = await planTaskAdd(port, { content: 'dependent', blockedBy: [dependency.taskId] });
+
+    await expect(planTaskUpdate(port, dependent.taskId, { status: 'in_progress' })).rejects.toThrow(/cannot start/);
+    expect((await listAll(storage)).get(dependent.taskId)?.status).toBe('blocked');
+
+    await planTaskComplete(port, dependency.taskId);
+    await expect(planTaskUpdate(port, dependent.taskId, { status: 'in_progress' })).resolves.toMatchObject({
+      status: 'in_progress',
+    });
+  });
+
+  it.each(['failed', 'cancelled'] as const)(
+    'keeps a dependent blocked when its prerequisite becomes %s',
+    async prerequisiteStatus => {
+      const { storage, port } = await setup();
+      const prerequisite = await planTaskAdd(port, { content: 'compile with service' });
+      const repair = await planTaskAdd(port, {
+        content: 'repair source diagnostics',
+        blockedBy: [prerequisite.taskId],
+      });
+
+      await planTaskUpdate(port, prerequisite.taskId, { status: prerequisiteStatus });
+      expect((await listAll(storage)).get(repair.taskId)?.status).toBe('blocked');
+      await expect(planTaskUpdate(port, repair.taskId, { status: 'in_progress' })).rejects.toThrow(
+        /unsatisfied blockedBy dependencies/,
+      );
+    },
+  );
 });
 
 // ---------------------------------------------------------------------------
 // Finding 1: explicit NON-terminal parent re-derives from children
 // ---------------------------------------------------------------------------
 
-describe('explicit non-terminal parent stays under rollup', () => {
-  it('a parent re-marked explicit pending still rolls to failed when a child fails', async () => {
+describe('parent status remains hierarchy-owned after decomposition', () => {
+  it('rejects re-marking a non-leaf parent and still rolls child failure up', async () => {
     const { storage, port } = await setup();
     const parent = await planTaskAdd(port, { content: 'p' });
     const [c1] = await planTaskDecompose(port, parent.taskId, [{ content: 'c1' }, { content: 'c2' }]);
-    // Parent is now derived (gained children). Re-mark it EXPLICIT pending.
-    await planTaskUpdate(port, parent.taskId, { status: 'pending' });
+    await expect(planTaskUpdate(port, parent.taskId, { status: 'pending' })).rejects.toThrow(
+      'status is owned by hierarchy rollup',
+    );
     let stored = await listAll(storage);
     expect(stored.get(parent.taskId)?.status).toBe('pending');
-    expect(stored.get(parent.taskId)?.statusSource).toBe('explicit');
-    // A child now fails → the explicit-non-terminal parent must re-derive.
+    expect(stored.get(parent.taskId)?.statusSource).toBe('derived');
     await planTaskUpdate(port, c1!.taskId, { status: 'failed' });
     stored = await listAll(storage);
     expect(stored.get(parent.taskId)?.status).toBe('failed');
     expect(stored.get(parent.taskId)?.statusSource).toBe('derived');
   });
 
-  it('an explicit TERMINAL parent is still NEVER overwritten by a failing child', async () => {
+  it('rejects explicit terminal completion of a parent with unfinished children', async () => {
     const { storage, port } = await setup();
     const parent = await planTaskAdd(port, { content: 'p' });
     const [c1] = await planTaskDecompose(port, parent.taskId, [{ content: 'c1' }, { content: 'c2' }]);
-    // Explicitly mark the parent cancelled (terminal) AFTER it has children.
-    await planTaskUpdate(port, parent.taskId, { status: 'cancelled' });
+    await expect(planTaskUpdate(port, parent.taskId, { status: 'cancelled' })).rejects.toThrow(
+      'status is owned by hierarchy rollup',
+    );
     await planTaskUpdate(port, c1!.taskId, { status: 'failed' });
     const stored = await listAll(storage);
-    expect(stored.get(parent.taskId)?.status).toBe('cancelled');
-    expect(stored.get(parent.taskId)?.statusSource).toBe('explicit');
+    expect(stored.get(parent.taskId)?.status).toBe('failed');
+    expect(stored.get(parent.taskId)?.statusSource).toBe('derived');
   });
 });
 
@@ -292,6 +443,30 @@ describe('cycle prevention', () => {
     await expect(planTaskUpdate(port, a.taskId, { blockedBy: [b.taskId] })).rejects.toThrow(HarnessPlanTaskCycleError);
   });
 
+  it('task_add rejects a child blocked by its own parent', async () => {
+    const { port } = await setup();
+    const parent = await planTaskAdd(port, { content: 'parent' });
+    await expect(
+      planTaskAdd(port, { content: 'child', parentTaskId: parent.taskId, blockedBy: [parent.taskId] }),
+    ).rejects.toThrow(HarnessPlanTaskCycleError);
+  });
+
+  it('decompose rejects a child blocked by the parent it rolls up into', async () => {
+    const { storage, port } = await setup();
+    const parent = await planTaskAdd(port, { content: 'parent' });
+    await expect(
+      planTaskDecompose(port, parent.taskId, [{ content: 'child', blockedBy: [parent.taskId] }]),
+    ).rejects.toThrow(HarnessPlanTaskCycleError);
+    expect((await listAll(storage)).size).toBe(1);
+  });
+
+  it('reparent rejects creating a hierarchy/dependency deadlock', async () => {
+    const { port } = await setup();
+    const parent = await planTaskAdd(port, { content: 'parent' });
+    const child = await planTaskAdd(port, { content: 'child', blockedBy: [parent.taskId] });
+    await expect(planTaskReparent(port, child.taskId, parent.taskId)).rejects.toThrow(HarnessPlanTaskCycleError);
+  });
+
   // Finding 4: decompose children[].blockedBy must get the SAME validation as
   // task_add / task_update (unknown / cross-session / cycle rejection).
   it('decompose rejects a child blockedBy referencing an unknown task', async () => {
@@ -309,6 +484,157 @@ describe('cycle prevention', () => {
     const [c1] = await planTaskDecompose(port, parent.taskId, [{ content: 'c1', blockedBy: [dep.taskId] }]);
     const stored = await listAll(storage);
     expect(stored.get(c1!.taskId)?.blockedBy).toEqual([dep.taskId]);
+  });
+
+  it('decompose resolves call-local sibling dependency keys atomically', async () => {
+    const { storage, port } = await setup();
+    const parent = await planTaskAdd(port, { content: 'parallel pipeline' });
+    const [research, synthesis] = await planTaskDecompose(port, parent.taskId, [
+      { content: 'research', localKey: 'research' },
+      { content: 'synthesis', localKey: 'synthesis', blockedByLocalKeys: ['research'] },
+    ]);
+
+    expect(research?.decompositionLocalKey).toBe('research');
+    expect(synthesis?.decompositionLocalKey).toBe('synthesis');
+    expect((await listAll(storage)).get(synthesis!.taskId)?.blockedBy).toEqual([research!.taskId]);
+  });
+
+  it('decompose rejects duplicate or unknown call-local sibling keys before writing', async () => {
+    const { storage, port } = await setup();
+    const parent = await planTaskAdd(port, { content: 'pipeline' });
+
+    await expect(
+      planTaskDecompose(port, parent.taskId, [
+        { content: 'a', localKey: 'same' },
+        { content: 'b', localKey: 'same' },
+      ]),
+    ).rejects.toThrow(/duplicate localKey/);
+    await expect(
+      planTaskDecompose(port, parent.taskId, [{ content: 'a', localKey: 'a', blockedByLocalKeys: ['missing'] }]),
+    ).rejects.toThrow(/unknown sibling localKey/);
+    expect((await listAll(storage)).size).toBe(1);
+  });
+
+  it('decompose rejects a dependency cycle expressed through sibling local keys', async () => {
+    const { storage, port } = await setup();
+    const parent = await planTaskAdd(port, { content: 'pipeline' });
+    await expect(
+      planTaskDecompose(port, parent.taskId, [
+        { content: 'a', localKey: 'a', blockedByLocalKeys: ['b'] },
+        { content: 'b', localKey: 'b', blockedByLocalKeys: ['a'] },
+      ]),
+    ).rejects.toThrow(HarnessPlanTaskCycleError);
+    expect((await listAll(storage)).size).toBe(1);
+  });
+});
+
+describe('task_add idempotency', () => {
+  it('returns the original durable task without a phantom summary or duplicate event', async () => {
+    const { storage, port, events, summaries } = await setup();
+    const first = await planTaskAdd(port, { content: 'compile report', idempotencyKey: 'turn-1-task-1' });
+    const eventCount = events.length;
+    const summaryCount = summaries.length;
+
+    const retry = await planTaskAdd(port, {
+      content: 'compile report',
+      idempotencyKey: 'turn-1-task-1',
+    });
+
+    expect(retry).toEqual(first);
+    expect((await listAll(storage)).size).toBe(1);
+    expect(events).toHaveLength(eventCount);
+    expect(summaries).toHaveLength(summaryCount);
+    expect(summaries.at(-1)?.total).toBe(1);
+  });
+
+  it('replays the immutable create request after dependency rollup changes the stored status', async () => {
+    const { storage, port, events, summaries } = await setup();
+    const dependency = await planTaskAdd(port, { content: 'prepare source' });
+    const input = {
+      content: 'compile report',
+      blockedBy: [dependency.taskId],
+      idempotencyKey: 'turn-1-task-2',
+    };
+    const first = await planTaskAdd(port, input);
+    expect(first.status).toBe('blocked');
+    const eventCount = events.length;
+    const summaryCount = summaries.length;
+
+    const retry = await planTaskAdd(port, input);
+
+    expect(retry).toEqual(first);
+    expect((await listAll(storage)).size).toBe(2);
+    expect(events).toHaveLength(eventCount);
+    expect(summaries).toHaveLength(summaryCount);
+  });
+
+  it('replays the original create request after later updates and completion', async () => {
+    const { storage, port, events, summaries } = await setup();
+    const input = { content: 'compile report', priority: 1, idempotencyKey: 'turn-1-task-3' };
+    const first = await planTaskAdd(port, input);
+    await planTaskUpdate(port, first.taskId, { content: 'compile revised report', priority: 2 });
+    await planTaskComplete(port, first.taskId);
+    const eventCount = events.length;
+    const summaryCount = summaries.length;
+
+    const retry = await planTaskAdd(port, input);
+
+    expect(retry).toMatchObject({
+      taskId: first.taskId,
+      content: 'compile revised report',
+      priority: 2,
+      status: 'completed',
+    });
+    expect((await listAll(storage)).size).toBe(1);
+    expect(events).toHaveLength(eventCount);
+    expect(summaries).toHaveLength(summaryCount);
+  });
+
+  it('rejects reuse of an idempotency key with different task input', async () => {
+    const { storage, port } = await setup();
+    await planTaskAdd(port, { content: 'compile report', idempotencyKey: 'turn-1-task-1' });
+
+    await expect(
+      planTaskAdd(port, { content: 'rewrite conclusions', idempotencyKey: 'turn-1-task-1' }),
+    ).rejects.toThrow(/already used with different task input/);
+    expect((await listAll(storage)).size).toBe(1);
+  });
+
+  it('preserves key-only replay for pre-hash rows without lazily binding mutable state', async () => {
+    const { db, storage, port, events, summaries } = await setup();
+    const first = await planTaskAdd(port, { content: 'legacy task', idempotencyKey: 'legacy-key' });
+    for (const [key, task] of db.harnessPlanTasks) {
+      if (task.taskId === first.taskId) {
+        const { idempotencyInputHash: _removed, ...legacyTask } = task;
+        db.harnessPlanTasks.set(key, legacyTask);
+      }
+    }
+    await planTaskUpdate(port, first.taskId, { content: 'mutated after creation', priority: 9 });
+    const eventCount = events.length;
+    const summaryCount = summaries.length;
+
+    const replay = await planTaskAdd(port, {
+      content: 'different input cannot be authenticated for a legacy row',
+      idempotencyKey: 'legacy-key',
+    });
+
+    expect(replay).toMatchObject({
+      taskId: first.taskId,
+      content: 'mutated after creation',
+      priority: 9,
+    });
+    expect((await listAll(storage)).get(first.taskId)?.idempotencyInputHash).toBeUndefined();
+    expect(events).toHaveLength(eventCount);
+    expect(summaries).toHaveLength(summaryCount);
+  });
+
+  it('admits an idempotent retry even when the plan is already at the node cap', async () => {
+    const { port } = await setup();
+    const first = await planTaskAdd(port, { content: 'first', idempotencyKey: 'stable' });
+    for (let i = 1; i < PLAN_TASK_MAX_NODES; i++) {
+      await planTaskAdd(port, { content: `task-${i}` });
+    }
+    await expect(planTaskAdd(port, { content: 'first', idempotencyKey: 'stable' })).resolves.toEqual(first);
   });
 });
 
@@ -434,6 +760,67 @@ describe('planTaskCheck — bounded read', () => {
     const res = await planTaskCheck(h.port, { rootTaskId: root, limit: 2 });
     expect(res.tasks.length).toBe(2);
     expect(res.truncated).toBe(true);
+    expect(res.nextCursor).toBe(res.tasks[1]?.taskId);
+  });
+
+  it('continues from nextCursor without repeating tasks', async () => {
+    const first = await planTaskCheck(h.port, { rootTaskId: root, limit: 2 });
+    const second = await planTaskCheck(h.port, {
+      rootTaskId: root,
+      limit: 2,
+      cursor: first.nextCursor,
+    });
+    const combinedIds = [...first.tasks, ...second.tasks].map(task => task.taskId);
+    expect(combinedIds).toHaveLength(4);
+    expect(combinedIds[0]).toBe(root);
+    expect(new Set(combinedIds).size).toBe(4);
+    expect(second.truncated).toBe(false);
+    expect(second.nextCursor).toBeUndefined();
+  });
+
+  it('caps the serialized response and exposes a continuation for large delegation results', async () => {
+    const { port } = await setup();
+    const largeResult = {
+      status: 'success' as const,
+      text: 'x'.repeat(40 * 1024),
+      textTruncated: false,
+      finishReason: 'stop',
+      stepCount: 1,
+      toolCallCount: 0,
+      toolResultCount: 0,
+    };
+    for (let index = 0; index < 3; index += 1) {
+      const task = await planTaskAdd(port, { content: `large result ${index}` });
+      const subagentSessionId = `subagent-${index}`;
+      await planTaskDelegate(port, {
+        taskId: task.taskId,
+        subagentSessionId,
+      });
+      await planTaskReconcileDelegation(port, {
+        taskId: task.taskId,
+        subagentSessionId,
+        outcome: 'completed',
+        result: largeResult,
+      });
+    }
+
+    const first = await planTaskCheck(port, { limit: PLAN_TASK_CHECK_MAX_LIMIT });
+    expect(new TextEncoder().encode(JSON.stringify(first)).byteLength).toBeLessThanOrEqual(
+      PLAN_TASK_CHECK_MAX_OUTPUT_BYTES,
+    );
+    expect(first.tasks).toHaveLength(1);
+    expect(first.truncated).toBe(true);
+    expect(first.nextCursor).toBe(first.tasks[0]?.taskId);
+
+    const second = await planTaskCheck(port, {
+      limit: PLAN_TASK_CHECK_MAX_LIMIT,
+      cursor: first.nextCursor,
+    });
+    expect(new TextEncoder().encode(JSON.stringify(second)).byteLength).toBeLessThanOrEqual(
+      PLAN_TASK_CHECK_MAX_OUTPUT_BYTES,
+    );
+    expect(second.tasks).toHaveLength(1);
+    expect(second.tasks[0]?.taskId).not.toBe(first.tasks[0]?.taskId);
   });
 
   it('honors depth (depth 0 returns only the root)', async () => {
@@ -458,6 +845,13 @@ describe('planTaskCheck — bounded read', () => {
     await planTaskCheck(h.port, { limit: 10 });
     expect(h.events.length).toBe(beforeEvents);
     expect(h.summaries.length).toBe(beforeSummaries);
+  });
+
+  it('rejects an unknown root instead of presenting it as an empty plan', async () => {
+    await expect(planTaskCheck(h.port, { rootTaskId: 'missing-task', limit: 10 })).rejects.toMatchObject({
+      name: 'HarnessValidationError',
+      field: 'rootTaskId',
+    });
   });
 });
 
@@ -625,12 +1019,11 @@ describe('TM-5 plan-task summary', () => {
 // ---------------------------------------------------------------------------
 
 describe('countPlanTasksByStatus — exact aggregate', () => {
-  it('counts the WHOLE tree exactly even when it exceeds a single list page', async () => {
+  it('counts the whole bounded plan exactly', async () => {
     const { storage, port } = await setup();
-    // Build a tree larger than the 500-row seed page so a partial-page count would
-    // undercount. 1 root + 600 children (statuses spread) → 601 nodes, 1 root.
+    // Build the largest valid plan: one root plus 99 children.
     const root = await planTaskAdd(port, { content: 'root' });
-    const total = 600;
+    const total = 99;
     for (let i = 0; i < total; i++) {
       await planTaskAdd(port, {
         content: `c${i}`,
@@ -642,13 +1035,11 @@ describe('countPlanTasksByStatus — exact aggregate', () => {
     }
 
     const counts = await storage.countPlanTasksByStatus({ sessionId: SESSION_ID });
-    // 601 total: a bounded `listPlanTasks({limit:500})` would have reported <= 500.
-    expect(counts.total).toBe(601);
-    expect(counts.total).toBeGreaterThan(500);
+    expect(counts.total).toBe(PLAN_TASK_MAX_NODES);
     // root flips derived; its rolled-up status depends on children, but the count
     // total is what matters for the LIE this fixes.
     const sumByStatus = Object.values(counts.byStatus).reduce((a, b) => a + (b ?? 0), 0);
-    expect(sumByStatus).toBe(601);
+    expect(sumByStatus).toBe(PLAN_TASK_MAX_NODES);
     // Exactly one root (the parent); all children resolve their parent.
     expect(counts.rootCount).toBe(1);
   });
@@ -696,22 +1087,24 @@ describe('clampPlanTaskCheckLimit', () => {
   it('planTaskCheck never reads more than the cap even when handed a hostile limit', async () => {
     const { storage, port } = await setup();
     const root = await planTaskAdd(port, { content: 'root' });
-    // More children than the cap so an unclamped limit would return them all.
-    const n = PLAN_TASK_CHECK_MAX_LIMIT + 50;
+    // Fill the largest valid plan; a hostile caller still cannot raise the read
+    // limit above the plan's transaction-safe node budget.
+    const n = PLAN_TASK_MAX_NODES - 1;
     for (let i = 0; i < n; i++) {
       await planTaskAdd(port, { content: `c${i}`, parentTaskId: root.taskId });
     }
-    let lastLimit = -1;
+    const observedLimits: number[] = [];
     const origLoad = storage.loadPlanTaskSubtree.bind(storage);
     (storage as unknown as { loadPlanTaskSubtree: typeof storage.loadPlanTaskSubtree }).loadPlanTaskSubtree = (args => {
-      lastLimit = args.limit;
+      observedLimits.push(args.limit);
       return origLoad(args);
     }) as typeof storage.loadPlanTaskSubtree;
 
     const res = await planTaskCheck(port, { rootTaskId: root.taskId, limit: 10_000_000 });
-    expect(lastLimit).toBe(PLAN_TASK_CHECK_MAX_LIMIT);
+    expect(observedLimits).toContain(PLAN_TASK_CHECK_MAX_LIMIT);
+    expect(Math.max(...observedLimits)).toBe(PLAN_TASK_CHECK_MAX_LIMIT);
     expect(res.tasks.length).toBeLessThanOrEqual(PLAN_TASK_CHECK_MAX_LIMIT);
-    expect(res.truncated).toBe(true);
+    expect(res.truncated).toBe(false);
   });
 });
 

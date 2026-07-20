@@ -252,12 +252,21 @@ describe('Harness v1 plan-task E2E — PT3 delegation to a real subagent', () =>
   it('a real task_delegate tool-call spawns a real subagent, links it durably, and rolls the task up to completed', async () => {
     const createdIds: string[] = [];
 
-    // REAL subagent: a model that just produces text and finishes `stop`.
+    // REAL subagent: semantic completion must use the framework-owned terminal
+    // outcome tool; a bare provider stop is intentionally not task completion.
     const childModel = new MockLanguageModelV2({
       doStream: async () => ({
         rawCall: { rawPrompt: null, rawSettings: {} },
         warnings: [],
-        stream: textStream(['Subtask ', 'handled.']),
+        stream: toolCallStream(
+          'pt3-outcome',
+          'report_subagent_outcome',
+          JSON.stringify({
+            outcome: 'completed',
+            summary: 'Subtask handled.',
+            evidence: [{ kind: 'analysis', description: 'Completed the delegated deterministic test task.' }],
+          }),
+        ),
       }),
     });
     const childAgent = new Agent({
@@ -342,19 +351,42 @@ describe('Harness v1 plan-task E2E — PT3 delegation to a real subagent', () =>
         | undefined;
       expect(delegateEnd).toBeDefined();
       expect(delegateEnd!.isError).toBe(false);
+      expect(delegateEnd!.output?.delegation).toMatchObject({
+        attemptId: expect.stringMatching(/^delegation-/),
+        parentToolCallId: 'pt3-delegate',
+      });
 
-      // The plan task is durably linked to its delegated subagent session.
+      // The link can be short-lived when the child is fast, so assert it from
+      // the authoritative committed delegate delta rather than polling for an
+      // intermediate row that may already have settled by the first read.
       const linked = async () => {
         const page = await (session as any)._internalStorage.listPlanTasks({ sessionId: session.id, limit: 10 });
         return page.tasks.find((t: any) => t.taskId === taskId);
       };
-      await poll(async () => {
-        const t = await linked();
-        return typeof t?.delegatedSubagentSessionId === 'string' && t.delegatedSubagentSessionId.length > 0;
-      });
+      const delegateMutation = events.find(
+        event => event.type === 'papersflow.plan_task.updated' && (event as any).payload?.op === 'delegate',
+      ) as any;
+      expect(delegateMutation?.payload?.deltas).toEqual(
+        expect.arrayContaining([expect.objectContaining({ taskId, delegatedSubagentSessionId: expect.any(String) })]),
+      );
 
       // Once the subagent finishes, the delegated task rolls up to completed (across the turn).
-      await poll(async () => (await linked())?.status === 'completed');
+      try {
+        await poll(async () => (await linked())?.status === 'completed');
+      } catch (error) {
+        const current = await linked();
+        const childRecord = current?.delegatedSubagentSessionId
+          ? await (session as any)._internalStorage.loadSession({ sessionId: current.delegatedSubagentSessionId })
+          : null;
+        throw new Error(
+          `delegation did not settle: ${JSON.stringify({
+            task: current,
+            child: childRecord,
+            events: events.map(event => event.type),
+          })}`,
+          { cause: error },
+        );
+      }
       const final = await linked();
       expect(final.status).toBe('completed');
     } finally {

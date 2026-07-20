@@ -42,6 +42,16 @@ export interface TokenUsage {
 }
 
 /**
+ * Bounded framework-observed identity/status for a tool execution. Raw tool
+ * arguments and results are intentionally excluded from durable Harness state.
+ */
+export interface HarnessRunToolReceipt {
+  toolCallId: string;
+  toolName: string;
+  status: 'success' | 'error';
+}
+
+/**
  * A persisted attachment reference on a queued or pending message.
  *
  * `kind: 'ref'` points at a row in the harness attachment index (the bytes
@@ -161,6 +171,18 @@ export interface PendingResume {
   source: 'parent' | 'subagent';
   subagentToolCallId?: string;
   requestedAt: number;
+  /**
+   * Durable deadline for the user interaction. A live owner arms a local
+   * wake-up and storage exposes due rows to the cold-row expiry worker, but the
+   * exact expiry-vs-response winner is always committed under the session CAS.
+   */
+  expiresAt: number;
+  /**
+   * First-phase expiry marker. While present the row remains discoverable by
+   * the due scan until durable queue/signal cleanup succeeds and a second CAS
+   * clears `pendingResume`.
+   */
+  expiryStartedAt?: number;
   /** Present when this pending resume belongs to a queued turn. */
   queuedItemId?: string;
   /**
@@ -203,11 +225,38 @@ export interface PendingResume {
    */
   toolSurfaceFence?: string[];
   /**
+   * Cumulative provider usage already committed for this run when it parked.
+   * Resume outputs restore that cumulative counter, so Harness subtracts this
+   * durable baseline before adding the resumed segment to session usage.
+   */
+  accountedTokenUsage?: TokenUsage;
+  /**
+   * Framework-minted receipts observed before this run suspended. They let a
+   * resumed terminal report cite pre-suspension tool work after process
+   * rehydration without persisting tool inputs or outputs.
+   */
+  toolReceipts?: HarnessRunToolReceipt[];
+  /** Receipt collection exceeded its bounded count/byte budget; verify closed. */
+  toolReceiptsOverflow?: boolean;
+  /**
    * Idempotency marker. Set by the resume helper before calling
    * `agent.resumeStream(...)` and observed on replay so a crash between
    * "wrote resumedAt" and "cleared pendingResume" does not double-resume.
    */
   resumedAt?: number;
+  /**
+   * Durable deadline for resolving an admitted resume whose process owner
+   * disappeared before terminal evidence was committed. This is stamped in
+   * the same CAS as `resumedAt`; storage indexes it as the row's next due
+   * action so recovery does not depend on a browser reconnect.
+   */
+  resumeRecoveryAt?: number;
+  /**
+   * First-phase marker for stale admitted-resume cleanup. While present, the
+   * row remains due/discoverable until queue/signal failure evidence is durable
+   * and a second exact-generation CAS clears `pendingResume`.
+   */
+  resumeRecoveryStartedAt?: number;
   /**
    * Kind-specific UX surface — opaque to the harness, rendered by the UI.
    * Populated at suspend-capture time from the agent's `suspendPayload`.
@@ -431,12 +480,15 @@ export interface SessionRecord {
   assistantDrafts?: Record<string, HarnessAssistantDraft>;
   queueAdmissionReceipts?: Record<string, QueueAdmissionReceipt>;
   inboxResponseReceipts?: Record<string, InboxResponseReceipt>;
+  /** Latest bounded expiry evidence, keyed by exact pending-generation hash. */
+  expiredPendingInteractions?: Record<string, ExpiredPendingInteractionReceipt>;
 
-  // Observational memory config — JSON-safe resolved defaults + per-session model
-  // overrides used to rebuild the OM wrapper after hydration (§5.1a). Never stores
-  // active observations, buffered chunks/reflections, history generations, raw
-  // config blobs, provider clients, functions, or processor locks — those remain
-  // advisory MemoryStorage rows outside the session lease/CAS boundary.
+  // Legacy unsupported Harness OM intent. Current Harness builds never create
+  // this field: enabled Harness OM and per-session model switches reject, while
+  // OM is configured directly on the Agent Memory instance. A hydrated record
+  // carrying this field parks turn/queue dispatch until
+  // `session.om.clearOverride()` removes it. The optional shape remains readable
+  // only so old rows can recover without losing admitted work.
   observationalMemory?: {
     scope?: 'thread' | 'resource';
     observerModelId?: string;
@@ -579,7 +631,6 @@ export interface HarnessAssistantDraft {
   queuedItemId?: string;
   messageId?: string;
   text: string;
-  reasoningText?: string;
   status: HarnessAssistantDraftStatus;
   startedAt: number;
   updatedAt: number;
@@ -945,6 +996,8 @@ export interface InboxResponseReceipt {
   toolCallId: string;
   pendingRequestedAt: number;
   response: unknown;
+  /** Tool-approval persistence requested by this response. */
+  approvalScope?: 'once' | 'always';
   status: 'accepted' | 'applied' | 'failed' | 'dead';
   result?: unknown;
   error?: HarnessStoredPublicError;
@@ -954,6 +1007,24 @@ export interface InboxResponseReceipt {
   failedAt?: number;
   deadAt?: number;
   updatedAt: number;
+}
+
+/**
+ * Bounded durable tombstone for an interaction that reached its deadline
+ * before a response was admitted. It lets a reconnecting client distinguish a
+ * late response from an unknown/stale item after `pendingResume` is cleared.
+ */
+export interface ExpiredPendingInteractionReceipt {
+  /** SHA-256 of kind/item/run/tool/requestedAt; prevents item-id ABA aliases. */
+  generationKey: string;
+  itemId: string;
+  kind: PendingResume['kind'];
+  runId: string;
+  toolCallId: string;
+  requestedAt: number;
+  expiresAt: number;
+  expiredAt: number;
+  error: HarnessStoredPublicError;
 }
 
 export type HarnessRowErrorCode =
@@ -1535,6 +1606,56 @@ export interface ListActiveSessionsByThreadInput {
   threadId: string;
 }
 
+/** Stable keyset position for the cold-row pending-interaction expiry scan. */
+export interface PendingInteractionDueScanCursor {
+  dueAt: number;
+  sessionId: string;
+}
+
+/**
+ * Exact pending generation returned by the storage due scan. Callers must
+ * compare every identity field under the session CAS before beginning or
+ * completing expiry; this projection is discovery evidence, not authority to
+ * mutate a newer pending interaction.
+ */
+export interface PendingInteractionExpiryGeneration {
+  harnessName: string;
+  sessionId: string;
+  resourceId: string;
+  kind: PendingResume['kind'];
+  itemId: string;
+  runId: string;
+  toolCallId: string;
+  requestedAt: number;
+  /** Effective storage-discovery deadline for expiry or resume recovery. */
+  dueAt: number;
+  /** Original user-interaction deadline; never moves after suspension. */
+  expiresAt: number;
+  /** Present after phase one has durably claimed expiry cleanup. */
+  expiryStartedAt?: number;
+  /** Present after a user response has been admitted for provider dispatch. */
+  resumedAt?: number;
+  /** Due time for ambiguous admitted-resume recovery. */
+  resumeRecoveryAt?: number;
+  /** Present after phase one has claimed stale-resume recovery cleanup. */
+  resumeRecoveryStartedAt?: number;
+}
+
+export interface ListDuePendingInteractionsInput {
+  harnessName?: string;
+  /** Inclusive upper bound (epoch ms) for due interactions. */
+  now: number;
+  /** Positive page size; adapters cap it at the storage-wide maximum. */
+  limit: number;
+  /** Return rows strictly after this `(dueAt, sessionId)` position. */
+  cursor?: PendingInteractionDueScanCursor;
+}
+
+export interface ListDuePendingInteractionsResult {
+  items: PendingInteractionExpiryGeneration[];
+  nextCursor?: PendingInteractionDueScanCursor;
+}
+
 export interface WithThreadDeleteFenceInput {
   threadId: string;
   /** Unique acquisition token; only the current matching owner may release a fence. */
@@ -1712,6 +1833,15 @@ export interface HarnessPlanTask {
   taskId: string;
   /** Optional idempotency key so a retried create resolves to the same row. */
   idempotencyKey?: string;
+  /**
+   * Immutable hash of the normalized create request associated with
+   * `idempotencyKey`. Current creates that provide an idempotency key must also
+   * provide this as a non-empty string. The field remains optional on the
+   * durable row shape so pre-hash rows can still be read and replayed by key.
+   * It lets orchestration distinguish an exact replay from key reuse after
+   * mutable task fields have changed.
+   */
+  idempotencyInputHash?: string;
   harnessName: string;
   sessionId: string;
   resourceId: string;
@@ -1780,7 +1910,9 @@ export interface CreatePlanTaskInput {
    * The node to insert. `version`, `createdAt`, and `updatedAt` are adapter-set
    * on insert (callers may pass them; adapters normalize). `taskId` must be
    * caller-supplied (stable id). When `idempotencyKey` matches an existing
-   * task in the same session, the existing row is returned unchanged.
+   * task in the same session, the existing row is returned unchanged. A new
+   * create that provides `idempotencyKey` must also provide a non-empty
+   * `idempotencyInputHash`.
    */
   task: HarnessPlanTask;
 }
@@ -1811,7 +1943,9 @@ export interface UpdatePlanTaskInput {
     clearBlockedBy?: boolean;
     origin?: string;
     delegatedSubagentSessionId?: string;
+    clearDelegatedSubagentSessionId?: boolean;
     delegatedSubagentTypeId?: string;
+    clearDelegatedSubagentTypeId?: boolean;
     metadata?: JsonValue;
     clearMetadata?: boolean;
     startedAt?: number;

@@ -120,4 +120,143 @@ describe('SaveQueueManager', () => {
     expect(savedMessages.length).toBe(3);
     expect(list.drainUnsavedMessages().length).toBe(0);
   });
+
+  it('strict flush propagates failure and retries the same snapshot exactly once', async () => {
+    const persisted: MastraDBMessage[] = [];
+    let attempts = 0;
+    const memory = {
+      saveMessages: vi.fn(async ({ messages }: { messages: MastraDBMessage[] }) => {
+        attempts++;
+        if (attempts === 1) throw new Error('storage unavailable');
+        persisted.push(...messages);
+      }),
+    };
+    const manager = new SaveQueueManager({ memory: memory as any });
+    const list = new MessageList({ threadId: 'thread-strict-retry' });
+    list.add(makeTestMessage('strict-1', 'thread-strict-retry', 'assistant', 'Recoverable answer'), 'response');
+
+    await expect(manager.flushMessagesStrict(list, 'thread-strict-retry')).rejects.toThrow('storage unavailable');
+    expect(list.snapshotUnsavedMessages().messages.map(message => message.id)).toEqual(['strict-1']);
+
+    await manager.flushMessagesStrict(list, 'thread-strict-retry');
+
+    expect(memory.saveMessages).toHaveBeenCalledTimes(2);
+    expect(persisted.map(message => message.id)).toEqual(['strict-1']);
+    expect(list.drainUnsavedMessages()).toEqual([]);
+  });
+
+  it('captures a strict snapshot before an earlier best-effort save can drain it', async () => {
+    let releaseFirstSave!: () => void;
+    const firstSaveBlocked = new Promise<void>(resolve => {
+      releaseFirstSave = resolve;
+    });
+    let firstSaveStarted!: () => void;
+    const firstSaveDidStart = new Promise<void>(resolve => {
+      firstSaveStarted = resolve;
+    });
+    const persisted: MastraDBMessage[][] = [];
+    let attempts = 0;
+    const memory = {
+      saveMessages: vi.fn(async ({ messages }: { messages: MastraDBMessage[] }) => {
+        attempts++;
+        if (attempts === 1) {
+          firstSaveStarted();
+          await firstSaveBlocked;
+          persisted.push(structuredClone(messages));
+          return;
+        }
+        if (attempts === 2) {
+          throw new Error('best-effort storage failure');
+        }
+        persisted.push(structuredClone(messages));
+      }),
+    };
+    const manager = new SaveQueueManager({ memory: memory as any });
+    const list = new MessageList({ threadId: 'thread-strict-race' });
+
+    list.add(makeTestMessage('ordinary-1', 'thread-strict-race', 'assistant', 'Ordinary step'), 'response');
+    const firstSave = manager.flushMessages(list, 'thread-strict-race');
+    await firstSaveDidStart;
+
+    // This best-effort operation is already queued, but it has not captured a
+    // snapshot yet. It will see the terminal answer after the first save exits.
+    const racingBestEffortSave = manager.flushMessages(list, 'thread-strict-race');
+    list.add(makeTestMessage('terminal-1', 'thread-strict-race', 'assistant', 'Terminal answer'), 'response');
+    const strictSave = manager.flushMessagesStrict(list, 'thread-strict-race');
+
+    releaseFirstSave();
+    await firstSave;
+    await racingBestEffortSave;
+    await strictSave;
+
+    expect(memory.saveMessages).toHaveBeenCalledTimes(3);
+    // Assistant parts merge into the existing message, so the strict write is
+    // an idempotent upsert of the same ID with the terminal content included.
+    expect(persisted.map(messages => messages.map(message => message.id))).toEqual([['ordinary-1'], ['ordinary-1']]);
+    expect(JSON.stringify(persisted[0])).not.toContain('Terminal answer');
+    expect(JSON.stringify(persisted[1])).toContain('Terminal answer');
+    expect(list.drainUnsavedMessages()).toEqual([]);
+  });
+
+  it('retries the identical terminal snapshot after racing best-effort and strict writes both fail', async () => {
+    let releaseFirstSave!: () => void;
+    const firstSaveBlocked = new Promise<void>(resolve => {
+      releaseFirstSave = resolve;
+    });
+    let firstSaveStarted!: () => void;
+    const firstSaveDidStart = new Promise<void>(resolve => {
+      firstSaveStarted = resolve;
+    });
+    const attempts: MastraDBMessage[][] = [];
+    const persisted: MastraDBMessage[][] = [];
+    const memory = {
+      saveMessages: vi.fn(async ({ messages }: { messages: MastraDBMessage[] }) => {
+        const attempt = structuredClone(messages);
+        attempts.push(attempt);
+        if (attempts.length === 1) {
+          firstSaveStarted();
+          await firstSaveBlocked;
+          persisted.push(attempt);
+          return;
+        }
+        if (attempts.length <= 3) {
+          throw new Error(attempts.length === 2 ? 'best-effort storage failure' : 'strict storage failure');
+        }
+        persisted.push(attempt);
+      }),
+    };
+    const manager = new SaveQueueManager({ memory: memory as any });
+    const list = new MessageList({ threadId: 'thread-strict-double-failure' });
+
+    list.add(
+      makeTestMessage('shared-assistant', 'thread-strict-double-failure', 'assistant', 'Ordinary step'),
+      'response',
+    );
+    const firstSave = manager.flushMessages(list, 'thread-strict-double-failure');
+    await firstSaveDidStart;
+
+    const racingBestEffortSave = manager.flushMessages(list, 'thread-strict-double-failure');
+    list.add(
+      makeTestMessage('terminal-part', 'thread-strict-double-failure', 'assistant', 'Terminal answer'),
+      'response',
+    );
+    const failedStrictSave = manager.flushMessagesStrict(list, 'thread-strict-double-failure');
+
+    releaseFirstSave();
+    await firstSave;
+    await racingBestEffortSave;
+    await expect(failedStrictSave).rejects.toThrow('strict storage failure');
+
+    const retryableSnapshot = list.snapshotUnsavedMessages({ detached: true }).messages;
+    expect(retryableSnapshot.map(message => message.id)).toEqual(['shared-assistant']);
+    expect(JSON.stringify(retryableSnapshot)).toContain('Terminal answer');
+
+    await manager.flushMessagesStrict(list, 'thread-strict-double-failure');
+
+    expect(memory.saveMessages).toHaveBeenCalledTimes(4);
+    expect(attempts[2]).toEqual(attempts[3]);
+    expect(JSON.stringify(persisted[0])).not.toContain('Terminal answer');
+    expect(JSON.stringify(persisted[1])).toContain('Terminal answer');
+    expect(list.drainUnsavedMessages()).toEqual([]);
+  });
 });

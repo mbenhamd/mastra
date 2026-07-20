@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { Event, EventCallback, PublishEvent } from '../../events';
 import { PubSub } from '../../events';
 import type { IMastraLogger } from '../../logger';
+import { createTerminalToolResultPartId } from '../message-list';
 import { AGENT_STREAM_TOPIC, AgentStreamEventTypes } from './constants';
 import { createDurableAgentStream } from './stream-adapter';
 import type { DurableAgentStreamOptions } from './stream-adapter';
@@ -125,6 +126,462 @@ describe('createDurableAgentStream callback delivery', () => {
     expect(onError).not.toHaveBeenCalled();
     expect(onChunk).not.toHaveBeenCalled();
     cleanup();
+  });
+
+  it('recovers a terminal result from FINISH when replay starts after its data chunk', async () => {
+    const pubsub = new AwaitablePubSub();
+    const onChunk = vi.fn();
+    const onFinish = vi.fn();
+    const runId = 'finish-terminal-recovery';
+    const { ready, cleanup } = createStream(pubsub, runId, { onChunk, onFinish });
+    await ready;
+
+    const terminalToolResult = {
+      status: 'success' as const,
+      items: [
+        {
+          toolName: 'answer_tool',
+          toolCallId: 'answer-call',
+          status: 'success' as const,
+          value: { answer: 'already complete' },
+        },
+      ],
+    };
+    const terminalEnvelope = {
+      id: createTerminalToolResultPartId(runId, 0),
+      data: terminalToolResult,
+    };
+    await pubsub.publish(AGENT_STREAM_TOPIC(runId), {
+      type: AgentStreamEventTypes.FINISH,
+      id: 'finish-with-terminal',
+      runId,
+      data: {
+        ...finishData(),
+        terminalToolResult: terminalEnvelope,
+        terminalStepFinishChunk: {
+          type: 'step-finish',
+          payload: { reason: 'tool-calls', terminalToolResult },
+        },
+      },
+    });
+
+    expect(onChunk).toHaveBeenCalledTimes(2);
+    expect(onChunk).toHaveBeenNthCalledWith(1, {
+      type: 'data-terminal-tool-result',
+      ...terminalEnvelope,
+    });
+    expect(onChunk).toHaveBeenNthCalledWith(2, {
+      type: 'step-finish',
+      payload: { reason: 'tool-calls', terminalToolResult },
+    });
+    expect(onFinish).toHaveBeenCalledWith(expect.objectContaining({ terminalToolResult }));
+    cleanup();
+  });
+
+  it('deduplicates terminal chunks by their stable data id across publish retries and FINISH', async () => {
+    const pubsub = new AwaitablePubSub();
+    const onChunk = vi.fn();
+    const runId = 'terminal-chunk-retry';
+    const { ready, cleanup } = createStream(pubsub, runId, { onChunk });
+    await ready;
+
+    const terminalToolResult = {
+      status: 'success' as const,
+      items: [
+        {
+          toolName: 'answer_tool',
+          toolCallId: 'answer-call',
+          status: 'success' as const,
+          value: { answer: 'once' },
+        },
+      ],
+    };
+    const terminalChunk = {
+      type: 'data-terminal-tool-result',
+      id: createTerminalToolResultPartId(runId, 0),
+      data: terminalToolResult,
+    };
+    await pubsub.publish(AGENT_STREAM_TOPIC(runId), {
+      type: AgentStreamEventTypes.CHUNK,
+      id: 'terminal-envelope-1',
+      runId,
+      data: terminalChunk,
+    });
+    await pubsub.publish(AGENT_STREAM_TOPIC(runId), {
+      type: AgentStreamEventTypes.CHUNK,
+      id: 'terminal-envelope-2',
+      runId,
+      data: terminalChunk,
+    });
+    expect(onChunk).not.toHaveBeenCalled();
+    await pubsub.publish(AGENT_STREAM_TOPIC(runId), {
+      type: AgentStreamEventTypes.FINISH,
+      id: 'finish-after-terminal-retry',
+      runId,
+      data: {
+        ...finishData(),
+        terminalToolResult: { id: terminalChunk.id, data: terminalToolResult },
+        terminalStepFinishChunk: {
+          type: 'step-finish',
+          payload: { reason: 'tool-calls', terminalToolResult },
+        },
+      },
+    });
+
+    expect(onChunk).toHaveBeenCalledTimes(2);
+    expect(onChunk).toHaveBeenNthCalledWith(1, terminalChunk);
+    expect(onChunk).toHaveBeenNthCalledWith(2, {
+      type: 'step-finish',
+      payload: { reason: 'tool-calls', terminalToolResult },
+    });
+    cleanup();
+  });
+
+  it('fails closed when FINISH reuses a terminal id with different data', async () => {
+    const pubsub = new AwaitablePubSub();
+    const onChunk = vi.fn();
+    const onError = vi.fn();
+    const onFinish = vi.fn();
+    const runId = 'terminal-envelope-mismatch';
+    const terminalId = createTerminalToolResultPartId(runId, 0);
+    const { ready, cleanup } = createStream(pubsub, runId, { onChunk, onError, onFinish });
+    await ready;
+
+    await pubsub.publish(AGENT_STREAM_TOPIC(runId), {
+      type: AgentStreamEventTypes.CHUNK,
+      id: 'terminal-first',
+      runId,
+      data: {
+        type: 'data-terminal-tool-result',
+        id: terminalId,
+        data: { status: 'success', items: [{ toolName: 'a', toolCallId: '1', status: 'success', value: 'A' }] },
+      },
+    });
+    await pubsub.publish(AGENT_STREAM_TOPIC(runId), {
+      type: AgentStreamEventTypes.FINISH,
+      id: 'terminal-finish-mismatch',
+      runId,
+      data: {
+        ...finishData(),
+        terminalToolResult: {
+          id: terminalId,
+          data: { status: 'success', items: [{ toolName: 'a', toolCallId: '1', status: 'success', value: 'B' }] },
+        },
+        terminalStepFinishChunk: {
+          type: 'step-finish',
+          payload: {
+            reason: 'tool-calls',
+            terminalToolResult: {
+              status: 'success',
+              items: [{ toolName: 'a', toolCallId: '1', status: 'success', value: 'B' }],
+            },
+          },
+        },
+      },
+    });
+
+    expect(onChunk).not.toHaveBeenCalled();
+    expect(onFinish).not.toHaveBeenCalled();
+    expect(onError).toHaveBeenCalledWith(
+      expect.objectContaining({ error: expect.objectContaining({ name: 'TerminalToolResultIntegrityError' }) }),
+    );
+    cleanup();
+  });
+
+  it('does not expose a staged terminal answer when the durable run errors', async () => {
+    const pubsub = new AwaitablePubSub();
+    const onChunk = vi.fn();
+    const onError = vi.fn();
+    const runId = 'terminal-then-error';
+    const { ready, cleanup } = createStream(pubsub, runId, { onChunk, onError });
+    await ready;
+
+    await pubsub.publish(AGENT_STREAM_TOPIC(runId), {
+      type: AgentStreamEventTypes.CHUNK,
+      id: 'staged-terminal',
+      runId,
+      data: {
+        type: 'data-terminal-tool-result',
+        id: `${runId}:terminal-tool-result:1`,
+        data: { status: 'success', items: [{ toolName: 'a', toolCallId: '1', status: 'success', value: 'A' }] },
+      },
+    });
+    await pubsub.publish(AGENT_STREAM_TOPIC(runId), {
+      type: AgentStreamEventTypes.ERROR,
+      id: 'error-after-staged-terminal',
+      runId,
+      data: { error: { name: 'Error', message: 'finalization failed' } },
+    });
+
+    expect(onChunk).not.toHaveBeenCalled();
+    expect(onError).toHaveBeenCalledWith(
+      expect.objectContaining({ error: expect.objectContaining({ message: 'finalization failed' }) }),
+    );
+    cleanup();
+  });
+
+  it('fails closed when FINISH omits a staged terminal result', async () => {
+    const pubsub = new AwaitablePubSub();
+    const onChunk = vi.fn();
+    const onError = vi.fn();
+    const onFinish = vi.fn();
+    const runId = 'terminal-finish-omission';
+    const { ready, cleanup } = createStream(pubsub, runId, { onChunk, onError, onFinish });
+    await ready;
+
+    await pubsub.publish(AGENT_STREAM_TOPIC(runId), {
+      type: AgentStreamEventTypes.CHUNK,
+      id: 'staged-terminal',
+      runId,
+      data: {
+        type: 'data-terminal-tool-result',
+        id: `${runId}:terminal-tool-result:1`,
+        data: { status: 'success', items: [{ toolName: 'a', toolCallId: '1', status: 'success', value: 'A' }] },
+      },
+    });
+    await pubsub.publish(AGENT_STREAM_TOPIC(runId), {
+      type: AgentStreamEventTypes.FINISH,
+      id: 'finish-without-terminal',
+      runId,
+      data: finishData(),
+    });
+
+    expect(onChunk).not.toHaveBeenCalled();
+    expect(onFinish).not.toHaveBeenCalled();
+    expect(onError).toHaveBeenCalledWith(
+      expect.objectContaining({ error: expect.objectContaining({ name: 'TerminalToolResultIntegrityError' }) }),
+    );
+    cleanup();
+  });
+
+  it('keeps a terminal chunk hidden until reconnect replay reaches authoritative FINISH', async () => {
+    const pubsub = new AwaitablePubSub();
+    const onChunk = vi.fn();
+    const runId = 'terminal-missing-finish';
+    const { ready, cleanup } = createStream(pubsub, runId, { onChunk });
+    await ready;
+
+    await pubsub.publish(AGENT_STREAM_TOPIC(runId), {
+      type: AgentStreamEventTypes.CHUNK,
+      id: 'terminal-without-finish',
+      runId,
+      data: {
+        type: 'data-terminal-tool-result',
+        id: `${runId}:terminal-tool-result:1`,
+        data: { status: 'success', items: [{ toolName: 'a', toolCallId: '1', status: 'success', value: 'A' }] },
+      },
+    });
+
+    expect(onChunk).not.toHaveBeenCalled();
+    cleanup();
+  });
+
+  it('commits terminal and deferred step-finish chunks atomically in order', async () => {
+    const pubsub = new AwaitablePubSub();
+    const onChunk = vi.fn();
+    const runId = 'terminal-atomic-order';
+    const { ready, cleanup } = createStream(pubsub, runId, { onChunk });
+    await ready;
+    const terminalData = {
+      status: 'success' as const,
+      items: [{ toolName: 'a', toolCallId: '1', status: 'success' as const, value: 'A' }],
+    };
+    const terminalEnvelope = { id: createTerminalToolResultPartId(runId, 0), data: terminalData };
+
+    await pubsub.publish(AGENT_STREAM_TOPIC(runId), {
+      type: AgentStreamEventTypes.CHUNK,
+      id: 'terminal-order-chunk',
+      runId,
+      data: { type: 'data-terminal-tool-result', ...terminalEnvelope },
+    });
+    await pubsub.publish(AGENT_STREAM_TOPIC(runId), {
+      type: AgentStreamEventTypes.CHUNK,
+      id: 'terminal-order-step-finish',
+      runId,
+      data: { type: 'step-finish', payload: { reason: 'tool-calls', terminalToolResult: terminalData } },
+    });
+    expect(onChunk).not.toHaveBeenCalled();
+
+    await pubsub.publish(AGENT_STREAM_TOPIC(runId), {
+      type: AgentStreamEventTypes.FINISH,
+      id: 'terminal-order-finish',
+      runId,
+      data: {
+        ...finishData(),
+        terminalToolResult: terminalEnvelope,
+        terminalStepFinishChunk: {
+          type: 'step-finish',
+          payload: { reason: 'tool-calls', terminalToolResult: terminalData },
+        },
+      },
+    });
+
+    expect(onChunk.mock.calls.map(([chunk]) => chunk.type)).toEqual(['data-terminal-tool-result', 'step-finish']);
+    cleanup();
+  });
+
+  it('reconstructs terminal-before-step ordering from authoritative FINISH alone', async () => {
+    const pubsub = new AwaitablePubSub();
+    const onChunk = vi.fn();
+    const runId = 'terminal-finish-only-order';
+    const { ready, cleanup } = createStream(pubsub, runId, { onChunk });
+    await ready;
+    const terminalEnvelope = {
+      id: createTerminalToolResultPartId(runId, 0),
+      data: {
+        status: 'success' as const,
+        items: [{ toolName: 'a', toolCallId: '1', status: 'success' as const, value: 'A' }],
+      },
+    };
+
+    await pubsub.publish(AGENT_STREAM_TOPIC(runId), {
+      type: AgentStreamEventTypes.FINISH,
+      id: 'authoritative-finish',
+      runId,
+      data: {
+        ...finishData(),
+        terminalToolResult: terminalEnvelope,
+        terminalStepFinishChunk: {
+          type: 'step-finish',
+          payload: { reason: 'tool-calls', terminalToolResult: terminalEnvelope.data },
+        },
+      },
+    });
+
+    expect(onChunk.mock.calls.map(([chunk]) => chunk.type)).toEqual(['data-terminal-tool-result', 'step-finish']);
+    cleanup();
+  });
+
+  it.each([
+    [
+      'terminal result without step-finish',
+      {
+        terminalToolResult: {
+          id: 'unpaired-terminal:terminal-tool-result:1',
+          data: {
+            status: 'success' as const,
+            items: [{ toolName: 'a', toolCallId: '1', status: 'success' as const, value: 'A' }],
+          },
+        },
+      },
+    ],
+    [
+      'step-finish without terminal result',
+      { terminalStepFinishChunk: { type: 'step-finish', payload: { reason: 'tool-calls' } } },
+    ],
+  ])('fails closed for an authoritative FINISH with %s', async (_label, terminalFields) => {
+    const pubsub = new AwaitablePubSub();
+    const onChunk = vi.fn();
+    const onError = vi.fn();
+    const onFinish = vi.fn();
+    const runId = `unpaired-terminal-${_label}`;
+    const { ready, cleanup } = createStream(pubsub, runId, { onChunk, onError, onFinish });
+    await ready;
+
+    await pubsub.publish(AGENT_STREAM_TOPIC(runId), {
+      type: AgentStreamEventTypes.FINISH,
+      id: `finish-${runId}`,
+      runId,
+      data: { ...finishData(), ...terminalFields },
+    });
+
+    expect(onChunk).not.toHaveBeenCalled();
+    expect(onFinish).not.toHaveBeenCalled();
+    expect(onError).toHaveBeenCalledWith(
+      expect.objectContaining({ error: expect.objectContaining({ name: 'TerminalToolResultIntegrityError' }) }),
+    );
+    cleanup();
+  });
+
+  it('fails closed when a terminal chunk omits its stable data id', async () => {
+    const pubsub = new AwaitablePubSub();
+    const onChunk = vi.fn();
+    const onError = vi.fn();
+    const onFinish = vi.fn();
+    const runId = 'terminal-envelope-missing-id';
+    const { ready, cleanup } = createStream(pubsub, runId, { onChunk, onError, onFinish });
+    await ready;
+
+    await pubsub.publish(AGENT_STREAM_TOPIC(runId), {
+      type: AgentStreamEventTypes.CHUNK,
+      id: 'terminal-without-data-id',
+      runId,
+      data: {
+        type: 'data-terminal-tool-result',
+        data: { status: 'success', items: [{ toolName: 'a', toolCallId: '1', status: 'success', value: 'A' }] },
+      },
+    });
+
+    expect(onChunk).not.toHaveBeenCalled();
+    expect(onFinish).not.toHaveBeenCalled();
+    expect(onError).toHaveBeenCalledWith(
+      expect.objectContaining({ error: expect.objectContaining({ name: 'TerminalToolResultIntegrityError' }) }),
+    );
+    cleanup();
+  });
+
+  describe.each(['chunk', 'finish'] as const)('terminal %s data validation', source => {
+    it.each([
+      ['undefined', undefined],
+      ['null', null],
+      ['wrong status', { status: 'failed', items: [] }],
+      ['empty items', { status: 'success', items: [] }],
+      [
+        'missing item value',
+        { status: 'success', items: [{ toolName: 'answer', toolCallId: 'call-1', status: 'success' }] },
+      ],
+      [
+        'oversized data',
+        {
+          status: 'success',
+          items: [
+            {
+              toolName: 'answer',
+              toolCallId: 'call-1',
+              status: 'success',
+              value: { text: 'x'.repeat(65 * 1024) },
+            },
+          ],
+        },
+      ],
+    ])('fails closed for %s', async (_label, terminalData) => {
+      const pubsub = new AwaitablePubSub();
+      const onChunk = vi.fn();
+      const onError = vi.fn();
+      const onFinish = vi.fn();
+      const runId = `terminal-invalid-${source}-${_label}`;
+      const { ready, cleanup } = createStream(pubsub, runId, { onChunk, onError, onFinish });
+      await ready;
+      const envelope = { id: `${runId}:terminal-tool-result:1`, data: terminalData };
+
+      await pubsub.publish(
+        AGENT_STREAM_TOPIC(runId),
+        source === 'chunk'
+          ? {
+              type: AgentStreamEventTypes.CHUNK,
+              id: `event-${runId}`,
+              runId,
+              data: { type: 'data-terminal-tool-result', ...envelope },
+            }
+          : {
+              type: AgentStreamEventTypes.FINISH,
+              id: `event-${runId}`,
+              runId,
+              data: {
+                ...finishData(),
+                terminalToolResult: envelope,
+                terminalStepFinishChunk: { type: 'step-finish', payload: { reason: 'tool-calls' } },
+              },
+            },
+      );
+
+      expect(onChunk).not.toHaveBeenCalled();
+      expect(onFinish).not.toHaveBeenCalled();
+      expect(onError).toHaveBeenCalledWith(
+        expect.objectContaining({ error: expect.objectContaining({ name: 'TerminalToolResultIntegrityError' }) }),
+      );
+      cleanup();
+    });
   });
 
   it('contains callback failures without reopening delivery', async () => {

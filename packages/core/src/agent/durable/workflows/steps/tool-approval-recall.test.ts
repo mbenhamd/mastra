@@ -232,6 +232,10 @@ function seedFreshResumeMessageListState() {
 }
 
 async function runMappingStep(toolResults: unknown[], messageListState = seedMessageListState()) {
+  // The mapping step now resolves tools through the run-scoped binding so it
+  // can recover safely in another process. Mirror the workflow fixture by
+  // registering that binding and exposing the durable init data to the step.
+  setupRegistry(vi.fn());
   const step = createDurableLLMMappingStep();
   const output = await (step as any).execute({
     inputData: {
@@ -253,6 +257,7 @@ async function runMappingStep(toolResults: unknown[], messageListState = seedMes
     },
     mastra: { getLogger: () => undefined },
     requestContext: new Map(),
+    getInitData: () => makeInitData(),
   });
 
   const recalled = new MessageList({ threadId: THREAD_ID, resourceId: RESOURCE_ID });

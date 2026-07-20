@@ -104,6 +104,19 @@ describe('backgroundTaskCheckStep', () => {
     expect(result.backgroundTaskPending).toBe(true);
   });
 
+  it('clears a foreground terminal result while background work is pending', async () => {
+    const { params } = makeParams({ skipBgTaskWait: true, waitTimeoutMs: 60_000 });
+    const step = createBackgroundTaskCheckStep(params);
+
+    const result = await (step as any).execute({
+      inputData: { ...baseInput(), terminalToolResult: { status: 'success', items: [] } },
+      retryCount: 0,
+    });
+
+    expect(result.backgroundTaskPending).toBe(true);
+    expect(result.terminalToolResult).toBeUndefined();
+  });
+
   it('waits for next task when retryCount > 0 and a wait timeout is configured', async () => {
     const { params, waitForNextTask } = makeParams({ waitTimeoutMs: 60_000 });
     const step = createBackgroundTaskCheckStep(params);
@@ -113,5 +126,20 @@ describe('backgroundTaskCheckStep', () => {
     expect(waitForNextTask).toHaveBeenCalledTimes(1);
     expect(result.backgroundTaskPending).toBe(true);
     expect(result.stepResult.isContinued).toBe(true);
+  });
+
+  it('keeps the pending marker when the wait times out', async () => {
+    const { params, waitForNextTask } = makeParams({ waitTimeoutMs: 60_000 });
+    waitForNextTask.mockRejectedValueOnce(new Error('wait timeout'));
+    const step = createBackgroundTaskCheckStep(params);
+
+    const result = await (step as any).execute({
+      inputData: { ...baseInput(), terminalToolResult: { status: 'success', items: [] } },
+      retryCount: 1,
+    });
+
+    expect(result.backgroundTaskPending).toBe(true);
+    expect(result.stepResult.isContinued).toBe(false);
+    expect(result.terminalToolResult).toBeUndefined();
   });
 });

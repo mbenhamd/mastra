@@ -36,6 +36,13 @@ export function createIsTaskCompleteStep<Tools extends ToolSet = ToolSet, OUTPUT
     inputSchema: llmIterationOutputSchema,
     outputSchema: llmIterationOutputSchema,
     execute: async ({ inputData }) => {
+      // A terminal tool result is already the committed caller-facing answer.
+      // Do not spend a scorer call, mutate continuation, or append hidden
+      // completion feedback after terminal arbitration has succeeded.
+      if (inputData.terminalToolResult) {
+        return inputData;
+      }
+
       // Increment iteration count
       currentIteration++;
 

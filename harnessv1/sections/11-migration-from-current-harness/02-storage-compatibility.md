@@ -22,9 +22,11 @@ Import rules:
    through the same storage-linearized resolver used by normal session creation.
    It does not write thread metadata first and then infer runtime state later.
 3. Mode/model, permissions, channel bindings, subagent parentage, token usage,
-   workspace state, OM config, queue, pending items, wakeups, outbox, and
-   delivery receipts are imported only through explicit v1 fields owned by their
-   canonical sections. Old top-level metadata is never a second authority.
+   workspace state, queue, pending items, wakeups, outbox, and delivery receipts
+   are imported only through explicit v1 fields owned by their canonical
+   sections. Effective OM configuration moves to Agent Memory; import must not
+   create new `SessionRecord.observationalMemory` overrides. Old top-level
+   metadata is never a second authority.
 4. Attachments must be normalized into `PersistedAttachment` refs before any new
    durable queue, signal, message-history, current-run, channel-inbox, wakeup, or
    outbox-projection row references them. Raw URLs, data URIs, base64 blobs,
@@ -50,5 +52,5 @@ Import rules:
 Public thread metadata writes remain narrow: `session.setThreadSetting(...)`
 writes only `thread.metadata.app[key]`, never raw top-level metadata. Reserved
 top-level metadata stays framework-owned and is not consulted for session
-hydration, mode/model selection, permission policy, OM configuration, token
+hydration, mode/model selection, permission policy, Agent Memory OM configuration, token
 accounting, channel routing, subagent ownership, or thread titles.

@@ -13,6 +13,7 @@ import {
   TABLE_HARNESS_CHANNEL_OUTBOX,
   TABLE_HARNESS_MESSAGE_RESULTS,
   TABLE_HARNESS_OPERATION_TOMBSTONES,
+  TABLE_HARNESS_PLAN_TASKS,
   TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS,
   TABLE_HARNESS_SESSIONS,
   TABLE_HARNESS_THREAD_DELETE_FENCES,
@@ -57,12 +58,18 @@ import { HarnessLibSQL } from './index';
 
 let harnessDbCounter = 0;
 
-function createHarnessTestClient() {
+function createHarnessTestUrl(): string {
   harnessDbCounter += 1;
   const dbPath = join(tmpdir(), `mastra-harness-libsql-${process.pid}-${harnessDbCounter}-${randomUUID()}.db`);
-  return createClient({
-    url: pathToFileURL(dbPath).href,
-  });
+  return pathToFileURL(dbPath).href;
+}
+
+function createHarnessTestClient() {
+  return createClient({ url: createHarnessTestUrl() });
+}
+
+function createHarnessStorage(client: Client): HarnessLibSQL {
+  return new HarnessLibSQL({ client, transactionalInit: true });
 }
 
 describe('HarnessLibSQL attachments', () => {
@@ -70,7 +77,7 @@ describe('HarnessLibSQL attachments', () => {
 
   beforeEach(async () => {
     const client = createHarnessTestClient();
-    storage = new HarnessLibSQL({ client });
+    storage = createHarnessStorage(client);
     await storage.init();
   });
 
@@ -176,6 +183,56 @@ describe('HarnessLibSQL attachments', () => {
     const topLevel = await storage.loadSession({ sessionId: 'session-2' });
     expect(topLevel?.subagentTypeId).toBeUndefined();
     expect(topLevel?.subagentToolAllowlistScoped).toBeUndefined();
+  });
+
+  it('round-trips every restart-critical session field', async () => {
+    const record = sampleSession({
+      subagentTypeId: 'critic',
+      subagentToolAllowlistScoped: true,
+      permissionRulesSeedHash: 'seed-hash-v1',
+      currentRun: {
+        runId: 'run-1',
+        harnessName: 'default',
+        sessionId: 'session-1',
+        resourceId: 'resource-1',
+        threadId: 'thread-1',
+        agentId: 'critic-agent',
+        operation: { kind: 'signal', signalId: 'signal-1' },
+        modeId: 'build',
+        modelId: 'model-1',
+        status: 'waiting',
+        startedAt: 1000,
+        updatedAt: 1100,
+      },
+      assistantDrafts: {
+        'run-1': {
+          runId: 'run-1',
+          sessionId: 'session-1',
+          resourceId: 'resource-1',
+          threadId: 'thread-1',
+          text: 'durable partial answer',
+          status: 'streaming',
+          startedAt: 1000,
+          updatedAt: 1100,
+        },
+      },
+      cancelRequest: {
+        requestedAt: 1200,
+        reason: 'operator-stop',
+        requestedBy: 'conformance-test',
+      },
+    });
+
+    await storage.saveSession(record, { ownerId: 'h', ifVersion: 0 });
+
+    await expect(storage.loadSession({ sessionId: record.id })).resolves.toMatchObject({
+      subagentTypeId: record.subagentTypeId,
+      subagentToolAllowlistScoped: true,
+      permissionRulesSeedHash: record.permissionRulesSeedHash,
+      currentRun: record.currentRun,
+      assistantDrafts: record.assistantDrafts,
+      cancelRequest: record.cancelRequest,
+    });
   });
 
   it('round-trips run summaries with idempotent first-write-wins + keyset listing (span-summary)', async () => {
@@ -330,7 +387,7 @@ describe('HarnessLibSQL attachments', () => {
       args: ['session-1', 'a1', 'legacy.bin', 'application/octet-stream', data.byteLength, Date.now(), dataB64],
     });
 
-    const legacyStorage = new HarnessLibSQL({ client });
+    const legacyStorage = createHarnessStorage(client);
     await legacyStorage.init();
 
     const loaded = await legacyStorage.loadAttachment({ sessionId: 'session-1', attachmentId: 'a1' });
@@ -380,6 +437,50 @@ describe('HarnessLibSQL attachments', () => {
 });
 
 describe('HarnessLibSQL legacy Harness table migrations', () => {
+  it('keeps injected persistent clients on the standard path unless callers explicitly opt in', async () => {
+    const url = createHarnessTestUrl();
+    const seedClient = createClient({ url });
+    await createHarnessStorage(seedClient).init();
+    seedClient.close();
+
+    const standardClient = createClient({ url });
+    const standardExecute = vi.spyOn(standardClient, 'execute');
+    await new HarnessLibSQL({ client: standardClient }).init();
+    expect(
+      standardExecute.mock.calls.some(([statement]) =>
+        (typeof statement === 'string' ? statement : statement.sql).startsWith('BEGIN'),
+      ),
+    ).toBe(false);
+    standardClient.close();
+
+    const optedInClient = createClient({ url });
+    const optedInExecute = vi.spyOn(optedInClient, 'execute');
+    await createHarnessStorage(optedInClient).init();
+    expect(
+      optedInExecute.mock.calls.some(([statement]) =>
+        (typeof statement === 'string' ? statement : statement.sql).startsWith('BEGIN IMMEDIATE'),
+      ),
+    ).toBe(true);
+    optedInClient.close();
+  });
+
+  it('serializes concurrent persistent-file initializers and leaves the shared schema usable', async () => {
+    const url = createHarnessTestUrl();
+    const clients = Array.from({ length: 4 }, () => createClient({ url, timeout: 5_000 }));
+    const stores = clients.map(client => createHarnessStorage(client));
+
+    try {
+      await Promise.all(stores.map(store => store.init()));
+      await stores[0]!.saveSession(sampleSession(), { ownerId: 'owner', ifVersion: 0 });
+      await expect(stores[3]!.loadSession({ sessionId: 'session-1' })).resolves.toMatchObject({
+        id: 'session-1',
+        version: 1,
+      });
+    } finally {
+      for (const client of clients) client.close();
+    }
+  });
+
   it('rebuilds a pre-namespace sessions table with the namespace-aware primary key', async () => {
     const client = createClient({ url: ':memory:' });
     const legacySession = sampleSession({
@@ -391,7 +492,7 @@ describe('HarnessLibSQL legacy Harness table migrations', () => {
     await createLegacySessionsTable(client);
     await insertLegacySession(client, legacySession);
 
-    const legacyStorage = new HarnessLibSQL({ client });
+    const legacyStorage = createHarnessStorage(client);
     await legacyStorage.init();
 
     await expect(primaryKeyColumns(client, TABLE_HARNESS_SESSIONS)).resolves.toEqual(['harness_name', 'id']);
@@ -444,22 +545,35 @@ describe('HarnessLibSQL legacy Harness table migrations', () => {
     ).resolves.toBeDefined();
   });
 
-  it('reports duplicate active legacy sessions before creating the active-session index', async () => {
-    const client = createClient({ url: ':memory:' });
-    await createLegacySessionsTable(client);
-    await insertLegacySession(client, { id: 'session-1', resourceId: 'resource-1', threadId: 'thread-1' });
-    await insertLegacySession(client, { id: 'session-2', resourceId: 'resource-1', threadId: 'thread-1' });
+  it('rolls back a persistent-file migration when duplicate active legacy sessions block initialization', async () => {
+    const url = createHarnessTestUrl();
+    const setupClient = createClient({ url });
+    await createLegacySessionsTable(setupClient);
+    await insertLegacySession(setupClient, { id: 'session-1', resourceId: 'resource-1', threadId: 'thread-1' });
+    await insertLegacySession(setupClient, { id: 'session-2', resourceId: 'resource-1', threadId: 'thread-1' });
+    setupClient.close();
 
-    const legacyStorage = new HarnessLibSQL({ client });
+    const legacyStorage = new HarnessLibSQL({ url });
     await expect(legacyStorage.init()).rejects.toThrow(
       'Cannot create Harness active-session uniqueness index while duplicate active rows exist',
     );
-    await expect(primaryKeyColumns(client, TABLE_HARNESS_SESSIONS)).resolves.toEqual(['id']);
+    const verifier = createClient({ url });
+    await expect(primaryKeyColumns(verifier, TABLE_HARNESS_SESSIONS)).resolves.toEqual(['id']);
+    await expect(
+      verifier.execute({
+        sql: 'SELECT name FROM sqlite_master WHERE type = ? AND name = ?',
+        args: ['table', TABLE_HARNESS_ATTACHMENTS],
+      }),
+    ).resolves.toMatchObject({ rows: [] });
+    await expect(verifier.execute(`SELECT COUNT(*) AS count FROM ${TABLE_HARNESS_SESSIONS}`)).resolves.toMatchObject({
+      rows: [expect.objectContaining({ count: 2 })],
+    });
+    verifier.close();
   });
 
   it('creates the parent_session_id index for subtree-lease renewal + child listing (PF-825)', async () => {
     const client = createClient({ url: ':memory:' });
-    const storage = new HarnessLibSQL({ client });
+    const storage = createHarnessStorage(client);
     await storage.init();
     await expect(indexNames(client, TABLE_HARNESS_SESSIONS)).resolves.toContain('idx_harness_sessions_parent');
   });
@@ -478,6 +592,129 @@ describe('HarnessLibSQL legacy Harness table migrations', () => {
     expect(messageResultIndexes).toContain('idx_harness_message_results_lookup');
     expect(messageResultIndexes).toContain('idx_harness_message_results_admission');
   });
+
+  it('backfills and indexes a legacy exact pending-interaction deadline', async () => {
+    const client = createClient({ url: ':memory:' });
+    await createLegacySessionsTable(client);
+    await insertLegacySession(client, {
+      pendingResume: {
+        kind: 'question',
+        itemId: 'question-1',
+        runId: 'run-1',
+        toolCallId: 'tool-1',
+        source: 'parent',
+        requestedAt: 100,
+        expiresAt: 200,
+      },
+    });
+
+    const storage = new HarnessLibSQL({ client });
+    await storage.init();
+
+    await expect(storage.listDuePendingInteractions({ now: 200, limit: 10 })).resolves.toEqual({
+      items: [
+        {
+          harnessName: 'default',
+          sessionId: 'session-1',
+          resourceId: 'resource-1',
+          kind: 'question',
+          itemId: 'question-1',
+          runId: 'run-1',
+          toolCallId: 'tool-1',
+          requestedAt: 100,
+          dueAt: 200,
+          expiresAt: 200,
+        },
+      ],
+    });
+    await expect(indexNames(client, TABLE_HARNESS_SESSIONS)).resolves.toContain(
+      'idx_harness_sessions_pending_resume_expiry',
+    );
+  });
+});
+
+describe('HarnessLibSQL pending-interaction expiry discovery', () => {
+  it('keyset-pages exact generations and round-trips finalizing/tombstone state', async () => {
+    const client = createHarnessTestClient();
+    const storage = createHarnessStorage(client);
+    await storage.init();
+    const pendingSession = (
+      id: string,
+      expiresAt: number,
+      pendingOverrides: Partial<NonNullable<SessionRecord['pendingResume']>> = {},
+      sessionOverrides: Partial<SessionRecord> = {},
+    ) =>
+      sampleSession({
+        id,
+        resourceId: `resource-${id}`,
+        threadId: `thread-${id}`,
+        pendingResume: {
+          kind: 'tool-approval',
+          itemId: `item-${id}`,
+          runId: `run-${id}`,
+          toolCallId: `tool-call-${id}`,
+          source: 'parent',
+          requestedAt: 10,
+          expiresAt,
+          ...pendingOverrides,
+        },
+        ...sessionOverrides,
+      });
+
+    for (const record of [
+      pendingSession('due-a', 100),
+      pendingSession('due-b', 100),
+      pendingSession(
+        'finalizing',
+        200,
+        { expiryStartedAt: 201 },
+        {
+          expiredPendingInteractions: {
+            old: {
+              generationKey: 'old',
+              itemId: 'old-item',
+              kind: 'question',
+              runId: 'old-run',
+              toolCallId: 'old-tool',
+              requestedAt: 1,
+              expiresAt: 2,
+              expiredAt: 3,
+              error: { code: 'harness.pending_interaction_expired', message: 'expired' },
+            },
+          },
+        },
+      ),
+      pendingSession('recovering', 1_000, { resumedAt: 50, resumeRecoveryAt: 150 }),
+      pendingSession('future', 201),
+      pendingSession('resumed', 50, { resumedAt: 51 }),
+      pendingSession('closed', 50, {}, { closedAt: 60 }),
+      sampleSession({ id: 'cleared', resourceId: 'resource-cleared', threadId: 'thread-cleared' }),
+    ]) {
+      await storage.saveSession(record, { ownerId: 'owner', ifVersion: 0 });
+    }
+
+    const first = await storage.listDuePendingInteractions({ now: 200, limit: 2 });
+    expect(first.items.map(item => item.sessionId)).toEqual(['due-a', 'due-b']);
+    expect(first.nextCursor).toEqual({ dueAt: 100, sessionId: 'due-b' });
+    await expect(storage.listDuePendingInteractions({ now: 200, limit: 2, cursor: first.nextCursor })).resolves.toEqual(
+      {
+        items: [
+          expect.objectContaining({
+            sessionId: 'recovering',
+            dueAt: 150,
+            expiresAt: 1_000,
+            resumedAt: 50,
+            resumeRecoveryAt: 150,
+          }),
+          expect.objectContaining({ sessionId: 'finalizing', dueAt: 200, expiresAt: 200, expiryStartedAt: 201 }),
+        ],
+      },
+    );
+    await expect(storage.loadSession({ sessionId: 'finalizing' })).resolves.toMatchObject({
+      pendingResume: { expiresAt: 200, expiryStartedAt: 201 },
+      expiredPendingInteractions: { old: { generationKey: 'old', expiredAt: 3 } },
+    });
+  });
 });
 
 describe('HarnessLibSQL active session admission', () => {
@@ -486,7 +723,7 @@ describe('HarnessLibSQL active session admission', () => {
 
   beforeEach(async () => {
     client = createHarnessTestClient();
-    storage = new HarnessLibSQL({ client });
+    storage = createHarnessStorage(client);
     await storage.init();
   });
 
@@ -1059,7 +1296,7 @@ describe('HarnessLibSQL active session admission', () => {
       )`,
       args: [],
     });
-    const storage = new HarnessLibSQL({ client });
+    const storage = createHarnessStorage(client);
     await storage.init();
     await storage.saveSession(sampleSession(), { ownerId: 'h-1', ifVersion: 0 });
     await expect(
@@ -1383,7 +1620,7 @@ describe('HarnessLibSQL message result evidence', () => {
 
   beforeEach(async () => {
     client = createHarnessTestClient();
-    storage = new HarnessLibSQL({ client });
+    storage = createHarnessStorage(client);
     await storage.init();
   });
 
@@ -1601,7 +1838,7 @@ describe('HarnessLibSQL message result evidence', () => {
         storage.writeMessageResultEvidence({ ...pending, ...terminal, updatedAt: 2000 }),
       ).resolves.toMatchObject({ applied: true });
 
-      const restarted = new HarnessLibSQL({ client });
+      const restarted = createHarnessStorage(client);
       await restarted.init();
       await expect(
         restarted.loadMessageResultEvidence({
@@ -1857,7 +2094,7 @@ describe('HarnessLibSQL queue admission evidence', () => {
 
   beforeEach(async () => {
     client = createHarnessTestClient();
-    storage = new HarnessLibSQL({ client });
+    storage = createHarnessStorage(client);
     await storage.init();
   });
 
@@ -1958,7 +2195,7 @@ describe('HarnessLibSQL inbox response receipts', () => {
 
   beforeEach(async () => {
     const client = createHarnessTestClient();
-    storage = new HarnessLibSQL({ client });
+    storage = createHarnessStorage(client);
     await storage.init();
   });
 
@@ -2008,7 +2245,7 @@ describe('HarnessLibSQL provider callback binding ledger', () => {
 
   beforeEach(async () => {
     client = createHarnessTestClient();
-    storage = new HarnessLibSQL({ client });
+    storage = createHarnessStorage(client);
     await storage.init();
   });
 
@@ -2276,7 +2513,7 @@ describe('HarnessLibSQL channel inbox ledger', () => {
 
   beforeEach(async () => {
     const client = createHarnessTestClient();
-    storage = new HarnessLibSQL({ client });
+    storage = createHarnessStorage(client);
     await storage.init();
   });
 
@@ -2452,7 +2689,7 @@ describe('HarnessLibSQL channel inbox ledger', () => {
 
   it('rejects stale same-claim updates when another writer changes the row after the validation read', async () => {
     const client = createHarnessTestClient();
-    storage = new HarnessLibSQL({ client });
+    storage = createHarnessStorage(client);
     await storage.init();
     const now = 10_000;
     const dateNow = vi.spyOn(Date, 'now').mockReturnValue(now + 100);
@@ -2500,7 +2737,7 @@ describe('HarnessLibSQL channel inbox ledger', () => {
 
   it('allows same-claim updates after a concurrent lease renewal and preserves the renewed expiry', async () => {
     const client = createHarnessTestClient();
-    storage = new HarnessLibSQL({ client });
+    storage = createHarnessStorage(client);
     await storage.init();
     const now = 10_000;
     const dateNow = vi.spyOn(Date, 'now').mockReturnValue(now + 100);
@@ -2675,7 +2912,7 @@ describe('HarnessLibSQL wakeup ledger', () => {
 
   beforeEach(async () => {
     client = createHarnessTestClient();
-    storage = new HarnessLibSQL({ client });
+    storage = createHarnessStorage(client);
     await storage.init();
   });
 
@@ -3153,7 +3390,7 @@ describe('HarnessLibSQL channel action ledger', () => {
 
   beforeEach(async () => {
     client = createHarnessTestClient();
-    storage = new HarnessLibSQL({ client });
+    storage = createHarnessStorage(client);
     await storage.init();
   });
 
@@ -3440,7 +3677,7 @@ describe('HarnessLibSQL channel outbox ledger', () => {
 
   beforeEach(async () => {
     client = createHarnessTestClient();
-    storage = new HarnessLibSQL({ client });
+    storage = createHarnessStorage(client);
     await storage.init();
   });
 
@@ -3778,7 +4015,7 @@ describe('HarnessLibSQL channel diagnostics', () => {
 
   beforeEach(async () => {
     const client = createHarnessTestClient();
-    storage = new HarnessLibSQL({ client });
+    storage = createHarnessStorage(client);
     await storage.init();
   });
 
@@ -3881,7 +4118,7 @@ describe('HarnessLibSQL renewSessionLeaseSubtree (§5.8 / PF-821)', () => {
   let storage: HarnessLibSQL;
 
   beforeEach(async () => {
-    storage = new HarnessLibSQL({ client: createHarnessTestClient() });
+    storage = createHarnessStorage(createHarnessTestClient());
     await storage.init();
   });
 
@@ -4000,7 +4237,7 @@ describe('HarnessLibSQL channel binding ledger (§5.1h / §14.1 / PF-824)', () =
 
   beforeEach(async () => {
     const client = createHarnessTestClient();
-    storage = new HarnessLibSQL({ client });
+    storage = createHarnessStorage(client);
     await storage.init();
   });
 
@@ -4187,11 +4424,12 @@ describe('HarnessLibSQL channel binding ledger (§5.1h / §14.1 / PF-824)', () =
 
 describe('HarnessLibSQL plan tasks (§5.1k)', () => {
   let storage: HarnessLibSQL;
+  let client: Client;
   const OWNER = 'plan-owner';
 
   beforeEach(async () => {
-    const client = createHarnessTestClient();
-    storage = new HarnessLibSQL({ client });
+    client = createHarnessTestClient();
+    storage = createHarnessStorage(client);
     await storage.init();
   });
 
@@ -4239,15 +4477,96 @@ describe('HarnessLibSQL plan tasks (§5.1k)', () => {
     const { sessionId, version } = await setupSession();
     const a = await storage.createPlanTask({
       fence: fence(sessionId, version),
-      task: planTask(sessionId, { taskId: 't-a', idempotencyKey: 'idem-1', content: 'first' }),
+      task: planTask(sessionId, {
+        taskId: 't-a',
+        idempotencyKey: 'idem-1',
+        idempotencyInputHash: 'request-hash-a',
+        content: 'first',
+      }),
     });
     const b = await storage.createPlanTask({
       fence: fence(sessionId, version),
-      task: planTask(sessionId, { taskId: 't-b', idempotencyKey: 'idem-1', content: 'second' }),
+      task: planTask(sessionId, {
+        taskId: 't-b',
+        idempotencyKey: 'idem-1',
+        idempotencyInputHash: 'request-hash-b',
+        content: 'second',
+      }),
     });
     expect(b.taskId).toBe('t-a');
     expect(b.content).toBe('first');
+    expect(b.idempotencyInputHash).toBe('request-hash-a');
     expect(b.version).toBe(a.version);
+  });
+
+  it('rejects keyed direct and batched creates without a non-empty immutable input hash', async () => {
+    const { sessionId, version } = await setupSession();
+    const missingHash = planTask(sessionId, { taskId: 'missing-hash', idempotencyKey: 'idem-missing' });
+    const emptyHash = planTask(sessionId, {
+      taskId: 'empty-hash',
+      idempotencyKey: 'idem-empty',
+      idempotencyInputHash: '',
+    });
+
+    await expect(storage.createPlanTask({ fence: fence(sessionId, version), task: missingHash })).rejects.toThrow(
+      /idempotencyInputHash must be a non-empty string/,
+    );
+    await expect(storage.createPlanTask({ fence: fence(sessionId, version), task: emptyHash })).rejects.toThrow(
+      /idempotencyInputHash must be a non-empty string/,
+    );
+    await expect(
+      storage.mutatePlanTasksForSession({
+        fence: fence(sessionId, version),
+        ops: [{ kind: 'create', task: missingHash }],
+      }),
+    ).rejects.toThrow(/idempotencyInputHash must be a non-empty string/);
+
+    await expect(storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 })).resolves.toEqual({
+      tasks: [],
+    });
+  });
+
+  it('preserves key-only replay for a pre-hash task after the row mutates', async () => {
+    const { sessionId, version } = await setupSession();
+    const legacy = await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: planTask(sessionId, {
+        taskId: 'legacy-task',
+        idempotencyKey: 'legacy-key',
+        idempotencyInputHash: 'legacy-seed-hash',
+        content: 'legacy input',
+      }),
+    });
+    await client.execute({
+      sql: `UPDATE ${TABLE_HARNESS_PLAN_TASKS}
+            SET idempotency_input_hash = NULL
+            WHERE harness_name = ? AND session_id = ? AND task_id = ?`,
+      args: ['default', sessionId, legacy.taskId],
+    });
+    const mutated = await storage.updatePlanTask({
+      fence: fence(sessionId, version),
+      taskId: legacy.taskId,
+      ifVersion: legacy.version,
+      patch: { content: 'mutated after creation', priority: 9 },
+    });
+
+    const replay = await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: planTask(sessionId, {
+        taskId: 'retry-task',
+        idempotencyKey: 'legacy-key',
+        idempotencyInputHash: 'new-client-hash',
+        content: 'different retry input',
+      }),
+    });
+
+    expect(replay).toMatchObject({
+      taskId: legacy.taskId,
+      content: 'mutated after creation',
+      priority: 9,
+      version: mutated.version,
+    });
+    expect(replay.idempotencyInputHash).toBeUndefined();
   });
 
   it('updatePlanTask advances the per-row version and applies the patch (incl JSON blockedBy)', async () => {
@@ -4304,6 +4623,43 @@ describe('HarnessLibSQL plan tasks (§5.1k)', () => {
     await expect(
       storage.createPlanTask({ fence: fence(sessionId, version, 'someone-else'), task: planTask(sessionId) }),
     ).rejects.toBeInstanceOf(HarnessStorageLeaseConflictError);
+  });
+
+  it('rejects every plan-task mutator after the owner lease expires', async () => {
+    const { sessionId, version } = await setupSession();
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: planTask(sessionId, { taskId: 'existing' }),
+    });
+    await storage.renewSessionLease({ sessionId, ownerId: OWNER, ttlMs: -1 });
+
+    const expiredFence = fence(sessionId, version);
+    const writes = [
+      () =>
+        storage.createPlanTask({
+          fence: expiredFence,
+          task: planTask(sessionId, { taskId: 'new' }),
+        }),
+      () =>
+        storage.updatePlanTask({
+          fence: expiredFence,
+          taskId: 'existing',
+          ifVersion: 1,
+          patch: { status: 'completed' },
+        }),
+      () => storage.deletePlanTaskSubtree({ fence: expiredFence, rootTaskId: 'existing' }),
+      () =>
+        storage.mutatePlanTasksForSession({
+          fence: expiredFence,
+          ops: [{ kind: 'update', taskId: 'existing', ifVersion: 1, patch: { status: 'completed' } }],
+        }),
+    ];
+
+    for (const write of writes) {
+      await expect(write()).rejects.toBeInstanceOf(HarnessStorageLeaseConflictError);
+    }
+    const listed = await storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
+    expect(listed.tasks).toEqual([expect.objectContaining({ taskId: 'existing', status: 'pending', version: 1 })]);
   });
 
   it('the session-owner fence rejects a stale session version', async () => {

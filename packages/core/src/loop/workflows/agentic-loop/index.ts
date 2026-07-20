@@ -91,10 +91,23 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
   })
     .dowhile(agenticExecutionWorkflow, async ({ inputData }) => {
       const typedInputData = inputData as LLMIterationData<Tools, OUTPUT>;
-      let hasFinishedSteps = false;
+      const abortWon = rest.options?.abortSignal?.aborted === true;
+      if (abortWon) {
+        typedInputData.terminalToolResult = undefined;
+        if (typedInputData.stepResult) {
+          typedInputData.stepResult.reason = 'abort';
+          typedInputData.stepResult.isContinued = false;
+        }
+      }
+      let hasFinishedSteps = abortWon;
 
-      const pendingSignals = readScoped(scopeCtx, DRAIN_PENDING_SIGNALS_KEY, 'drainPendingSignals')?.(runId) ?? [];
+      const pendingSignals = abortWon
+        ? []
+        : (readScoped(scopeCtx, DRAIN_PENDING_SIGNALS_KEY, 'drainPendingSignals')?.(runId) ?? []);
       if (pendingSignals.length > 0) {
+        // Signals arriving after the execution workflow settled still win over
+        // a terminal candidate. The next provider turn must see them.
+        typedInputData.terminalToolResult = undefined;
         messageList.markResponseMessageBoundary(typedInputData.stepResult?.messageId ?? typedInputData.messageId);
 
         const nextMessageId = rest.rotateResponseMessageId();
@@ -161,8 +174,12 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
 
       accumulatedSteps.push(currentStep);
 
+      if (typedInputData.terminalToolResult) {
+        hasFinishedSteps = true;
+      }
+
       // Only call stopWhen if we're continuing (not on the final step)
-      if (rest.stopWhen && typedInputData.stepResult?.isContinued && accumulatedSteps.length > 0) {
+      if (rest.stopWhen && !hasFinishedSteps && typedInputData.stepResult?.isContinued && accumulatedSteps.length > 0) {
         // Cast steps to any for v5/v6 StopCondition compatibility
         // v5 and v6 StepResult types have minor differences (e.g., rawFinishReason, finishReason format)
         // but are compatible at runtime for stop condition evaluation
@@ -207,7 +224,11 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
         try {
           const iterationResult = await rest.onIterationComplete(iterationContext);
 
-          if (iterationResult) {
+          // A terminal tool result is already the caller-visible answer. The
+          // callback may observe that iteration, but its continuation feedback
+          // must not become a hidden synthetic assistant message that appears
+          // only in persisted history.
+          if (iterationResult && !typedInputData.terminalToolResult) {
             if (iterationResult.feedback && typedInputData.stepResult?.isContinued) {
               messageList.add(
                 {
@@ -266,6 +287,25 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
         writeScoped(scopeCtx, DELEGATION_BAILED_KEY, '_delegationBailed', false);
       }
 
+      // A callback can abort after the predicate's entry check. Re-check at
+      // the caller-visible commit point so terminal output never wins that
+      // race or reaches persistence through the final stream state.
+      if (rest.options?.abortSignal?.aborted) {
+        typedInputData.terminalToolResult = undefined;
+        hasFinishedSteps = true;
+        if (typedInputData.stepResult) {
+          typedInputData.stepResult.reason = 'abort';
+          typedInputData.stepResult.isContinued = false;
+        }
+      }
+
+      // Terminal tool results are a hard stop. User callbacks may observe the
+      // terminal iteration but cannot spend another provider call by forcing it
+      // to continue.
+      if (typedInputData.terminalToolResult) {
+        hasFinishedSteps = true;
+      }
+
       if (typedInputData.stepResult) {
         typedInputData.stepResult.isContinued = hasFinishedSteps ? false : typedInputData.stepResult.isContinued;
       }
@@ -276,7 +316,12 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
       const hasSteps = (typedInputData.output?.steps?.length ?? 0) > 0;
       const shouldEmitStepFinish = typedInputData.stepResult?.reason !== 'tripwire' || hasSteps;
 
-      if (shouldEmitStepFinish) {
+      // A terminal iteration is finalized by workflowLoopStream only after the
+      // workflow transition has committed. Evented condition evaluation can be
+      // replayed when publishing that transition fails; publishing either the
+      // terminal answer or its step-finish here would duplicate caller-visible
+      // output before the workflow has actually reached its terminal state.
+      if (shouldEmitStepFinish && !typedInputData.terminalToolResult) {
         await outputWriter({
           type: 'step-finish',
           runId,

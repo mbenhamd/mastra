@@ -115,6 +115,8 @@ function injectObservationContextMessages({
 export class ObservationalMemoryProcessor implements Processor<'observational-memory'> {
   readonly id = 'observational-memory' as const;
   readonly name = 'Observational Memory';
+  readonly terminalToolResultPolicy = 'pass-through' as const;
+  readonly terminalToolResultPersistence = 'owner' as const;
 
   /** The underlying ObservationalMemory engine. */
   readonly engine: ObservationalMemory;

@@ -1060,7 +1060,7 @@ describe('Session events — tool payload JSON-safety at emit (live === replay)'
     expect(live.output).toEqual(replay.output);
   });
 
-  it('applies NO cap when files.maxEventPayloadBytes is unset (opt-in; byte-identical to pre-feature)', async () => {
+  it('preserves an ordinary payload under the default 64 KiB cap', async () => {
     const { harness, agent, storage } = setup();
     const result = { items: Array.from({ length: 50 }, (_, i) => ({ id: i, label: `row-${i}` })) };
     agent.chunks = [
@@ -1080,9 +1080,34 @@ describe('Session events — tool payload JSON-safety at emit (live === replay)'
       sendMessage: () => session.message({ content: 'hi' }),
     });
 
-    // No cap configured => no sentinel substitution at any size; verbatim.
+    // No explicit cap configured => the finite default still preserves normal payloads.
     expect(live.output).toEqual(result);
     expect(live.output).toEqual(replay.output);
+  });
+
+  it('replaces a payload over the default 64 KiB cap identically for live and replay', async () => {
+    const { harness, agent, storage } = setup();
+    agent.chunks = [
+      { type: 'tool-call', payload: { toolCallId: 'tc1', toolName: 'compile', args: {} }, runId: 'fake-run' },
+      {
+        type: 'tool-result',
+        payload: { toolCallId: 'tc1', result: { compileLog: 'x'.repeat(70 * 1024) } },
+        runId: 'fake-run',
+      },
+    ];
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const liveEvents: HarnessEvent[] = [];
+    session.subscribe(event => liveEvents.push(event));
+
+    const { live, replay } = await captureLiveAndReplay({
+      storage,
+      session,
+      liveEvents,
+      sendMessage: () => session.message({ content: 'compile' }),
+    });
+
+    expect(live.output).toEqual({ __mastraHarness: 'oversized-tool-payload' });
+    expect(replay.output).toEqual(live.output);
   });
 
   it('replaces a circular output with a stable sentinel identically for live and replay', async () => {

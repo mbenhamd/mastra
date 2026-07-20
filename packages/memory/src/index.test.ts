@@ -2974,6 +2974,37 @@ describe('Memory', () => {
       expect(engine?.getObservationConfig().bufferOnIdle).toBe(true);
     });
 
+    it.fails('creates OM processors when observational memory is enabled by the per-turn memory config', async () => {
+      const memory = new Memory({
+        storage: new InMemoryStore(),
+        options: { lastMessages: 10 },
+      });
+      const requestContext = new RequestContext();
+      requestContext.set('MastraMemory', {
+        thread: { id: 'runtime-om-thread' },
+        resourceId: 'runtime-om-resource',
+        memoryConfig: {
+          observationalMemory: {
+            scope: 'thread',
+            observation: { messageTokens: 10_000 },
+          },
+        },
+      });
+
+      const [inputProcessors, outputProcessors] = await Promise.all([
+        memory.getInputProcessors([], requestContext),
+        memory.getOutputProcessors([], requestContext),
+      ]);
+
+      expect({
+        input: inputProcessors.map(processor => processor.id),
+        output: outputProcessors.map(processor => processor.id),
+      }).toEqual({
+        input: ['observational-memory'],
+        output: ['observational-memory'],
+      });
+    });
+
     it('should clear thread-scoped observational memory when deleting a thread', async () => {
       const storage = new InMemoryStore();
       const memory = new Memory({

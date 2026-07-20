@@ -958,7 +958,12 @@ export class MemoryPG extends MemoryStorage {
     details,
     rawError,
   }: {
-    operation: 'LIST_THREADS' | 'LIST_MESSAGES_BY_ID' | 'LIST_MESSAGES' | 'LIST_MESSAGES_BY_RESOURCE_ID';
+    operation:
+      | 'LIST_THREADS'
+      | 'LIST_MESSAGES_BY_ID'
+      | 'HAS_MESSAGES'
+      | 'LIST_MESSAGES'
+      | 'LIST_MESSAGES_BY_RESOURCE_ID';
     text: string;
     details: Record<string, string | number | boolean>;
     rawError: unknown;
@@ -1047,6 +1052,52 @@ export class MemoryPG extends MemoryStorage {
         operation: 'LIST_MESSAGES_BY_ID',
         text: 'Failed to list PostgreSQL messages by ID',
         details: { messageIdCount: messageIds.length },
+        rawError,
+      });
+    }
+  }
+
+  public override async hasMessages({
+    threadId,
+    resourceId,
+  }: Pick<StorageListMessagesInput, 'threadId' | 'resourceId'>): Promise<boolean> {
+    const threadIds = (Array.isArray(threadId) ? threadId : [threadId]).filter(
+      (id): id is string => typeof id === 'string',
+    );
+
+    if (threadIds.length === 0 || threadIds.some(id => !id.trim())) {
+      throw new MastraError(
+        {
+          id: createStorageErrorId('PG', 'HAS_MESSAGES', 'INVALID_THREAD_ID'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: {
+            hasThreadId: threadId !== undefined && threadId !== null,
+            threadIdCount: Array.isArray(threadId) ? threadId.length : 1,
+          },
+        },
+        new Error('threadId must be a non-empty string or array of non-empty strings'),
+      );
+    }
+
+    try {
+      const tableName = getTableName({ indexName: TABLE_MESSAGES, schemaName: getSchemaName(this.#schema) });
+      const conditions = [`thread_id IN (${inPlaceholders(threadIds.length)})`];
+      const queryParams: unknown[] = [...threadIds];
+      if (resourceId !== undefined) {
+        conditions.push(`"resourceId" = $${queryParams.length + 1}`);
+        queryParams.push(resourceId);
+      }
+      const result = await this.#db.client.one<{ exists: boolean }>(
+        `SELECT EXISTS (SELECT 1 FROM ${tableName} WHERE ${conditions.join(' AND ')}) AS "exists"`,
+        queryParams,
+      );
+      return result.exists;
+    } catch (rawError) {
+      throw this.createAndTrackSafeReadError({
+        operation: 'HAS_MESSAGES',
+        text: 'Failed to check for PostgreSQL messages',
+        details: { hasResourceId: resourceId !== undefined, threadIdCount: threadIds.length },
         rawError,
       });
     }

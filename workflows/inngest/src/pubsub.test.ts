@@ -239,6 +239,23 @@ describe('InngestPubSub', () => {
     expect(received).toMatchObject([{ id: 'local-event-id', createdAt, index: 7 }]);
   });
 
+  it('rethrows failed terminal-result delivery so the durable final step can retry', async () => {
+    const { pubsub, publish } = createFixture();
+    publish.mockRejectedValueOnce(new Error('realtime unavailable'));
+
+    await expect(
+      pubsub.publish('agent.stream.run-terminal', {
+        type: 'chunk',
+        runId: 'run-terminal',
+        data: {
+          type: 'data-terminal-tool-result',
+          id: 'run-terminal:terminal-tool-result:1',
+          data: { status: 'success', items: [] },
+        },
+      }),
+    ).rejects.toThrow('realtime unavailable');
+  });
+
   it('keeps watch() payload compatibility and gives watchLifecycle() the configured replay transport', async () => {
     const { inngest } = createFixture();
     const subscribeFromOffset = vi.fn(async () => {});

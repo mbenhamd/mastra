@@ -3,27 +3,43 @@ import {
   createDurableBackgroundTaskCheckStep,
   createDurableLLMExecutionStep,
   createDurableLLMMappingStep,
+  createDurableSignalDrainStep,
   createDurableToolCallStep,
   DurableAgentDefaults,
   DurableStepIds,
+  assertTerminalToolResultRetained,
+  createTerminalToolResultEnvelope,
+  emitChunkEvent,
   emitFinishEvent,
   modelConfigSchema,
   durableAgenticOutputSchema,
   baseIterationStateSchema,
   createBaseIterationStateUpdate,
+  globalRunRegistry,
+  createDurableRuntimeRequestContext,
   mapDurableIterationToLLMInput,
+  resolveRuntimeDependencies,
   resolveDurableToolCallConcurrency,
+  TOOL_PERMISSION_POLICY_KEY,
+  TOOL_PERMISSION_POLICY_REQUIRED_KEY,
+  TOOL_PERMISSION_POLICY_STABLE_KEY,
+  outputProcessorsOwnTerminalPersistence,
 } from '@mastra/core/agent/durable';
 import type {
+  DurableToolPermissionResolver,
   DurableAgenticExecutionOutput,
   DurableAgenticWorkflowInput,
   DurableLLMStepOutput,
   DurableToolCallOutput,
   DurableToolCallInput,
+  ToolPermissionPolicy,
 } from '@mastra/core/agent/durable';
+import { MessageList } from '@mastra/core/agent/message-list';
 import type { PubSub } from '@mastra/core/events';
 import { SpanType, EntityType, InternalSpans } from '@mastra/core/observability';
 import type { ExportedSpan } from '@mastra/core/observability';
+import { ProcessorRunner } from '@mastra/core/processors';
+import type { RequestContext } from '@mastra/core/request-context';
 import { PUBSUB_SYMBOL } from '@mastra/core/workflows/_constants';
 import type { Inngest } from 'inngest';
 import { z } from 'zod';
@@ -66,6 +82,11 @@ export interface InngestDurableAgenticWorkflowOptions {
    * this option is omitted.
    */
   workflowIds?: InngestDurableAgenticWorkflowIds;
+  /**
+   * Trusted worker-local policy resolver. The function is captured by the
+   * registered Inngest worker and is never serialized into workflow state.
+   */
+  resolveToolPermission?: DurableToolPermissionResolver;
 }
 
 /**
@@ -102,8 +123,15 @@ type IterationState = z.infer<typeof iterationStateSchema> & {
  * @param options - Configuration options
  * @returns An InngestWorkflow instance that implements the agentic loop
  */
-/** Prefix for Inngest engine workflow IDs to avoid collision with other engines */
-const INNGEST_ENGINE_PREFIX = 'inngest';
+/**
+ * Durable-agent wire/function protocol. Function IDs include this version so
+ * a pre-policy worker cannot claim an event whose authorization markers it
+ * does not understand.
+ */
+export const INNGEST_DURABLE_AGENT_PROTOCOL_VERSION = 'v2' as const;
+
+/** Prefix for Inngest engine workflow IDs to avoid collision with other engines and protocol versions. */
+const INNGEST_ENGINE_PREFIX = `inngest:${INNGEST_DURABLE_AGENT_PROTOCOL_VERSION}`;
 
 /** Inngest-prefixed workflow IDs */
 export const InngestDurableStepIds = {
@@ -124,9 +152,10 @@ export interface InngestDurableAgenticWorkflowIds {
  * nested function. Changing only the parent would leave nested functions from
  * different durable agents aliased to the same Inngest function ID.
  *
- * The hash input and width are a persisted routing contract. Do not change
- * them without an explicit migration for in-flight Inngest events and stored
- * workflow snapshots.
+ * The protocol prefix, hash input, and width are a persisted routing contract.
+ * A protocol change intentionally produces new Inngest function IDs. Keep the
+ * prior worker deployment running long enough to drain pre-upgrade runs; a v2
+ * wrapper doesn't resume a v1 snapshot under a different function identity.
  */
 export function createInngestDurableAgenticWorkflowIds(agentId: string): InngestDurableAgenticWorkflowIds {
   if (!agentId) {
@@ -134,7 +163,7 @@ export function createInngestDurableAgenticWorkflowIds(agentId: string): Inngest
   }
 
   const ownerHash = createHash('sha256')
-    .update(`mastra:inngest:durable-agent:v1\0${agentId}`)
+    .update(`mastra:inngest:durable-agent:${INNGEST_DURABLE_AGENT_PROTOCOL_VERSION}\0${agentId}`)
     .digest('hex')
     .slice(0, 32);
 
@@ -145,20 +174,29 @@ export function createInngestDurableAgenticWorkflowIds(agentId: string): Inngest
 }
 
 export function createInngestDurableAgenticWorkflow(options: InngestDurableAgenticWorkflowOptions) {
-  const { inngest, maxSteps = DurableAgentDefaults.MAX_STEPS, workflowIds = InngestDurableStepIds } = options;
+  const {
+    inngest,
+    maxSteps = DurableAgentDefaults.MAX_STEPS,
+    workflowIds = InngestDurableStepIds,
+    resolveToolPermission,
+  } = options;
   const { createWorkflow } = init(inngest);
 
   // Create the LLM execution step - tools and model are resolved from Mastra at runtime
   const llmExecutionStep = createDurableLLMExecutionStep();
 
   // Create the tool call step - each tool call runs as its own step with suspend support
-  const toolCallStep = createDurableToolCallStep();
+  const toolCallStep = createDurableToolCallStep({ resolveToolPermission });
 
   // Create the LLM mapping step - reuse from core
   const llmMappingStep = createDurableLLMMappingStep();
 
   // Create the background task check step
   const backgroundTaskCheckStep = createDurableBackgroundTaskCheckStep();
+
+  // Drain active-run signals after tools/background work settle. A signal
+  // wins over a terminal candidate and forces one provider continuation.
+  const signalDrainStep = createDurableSignalDrainStep();
 
   // Create the single iteration workflow (LLM -> Tool Calls -> Mapping)
   const singleIterationWorkflow = createWorkflow({
@@ -207,12 +245,26 @@ export function createInngestDurableAgenticWorkflow(options: InngestDurableAgent
     // tool sets run sequentially, otherwise the run's `toolCallConcurrency`
     // applies (default 10). Mirrors @mastra/core's behavior after #9704.
     .foreach(toolCallStep, {
-      concurrency: ({ inputData, getInitData }) => {
+      concurrency: ({ inputData, getInitData, requestContext }) => {
         const state = getInitData() as IterationState | undefined;
+        // The worker resolver may be async and may distinguish a fresh call
+        // from a resume, while foreach concurrency resolution is synchronous
+        // and has no resume phase. It therefore remains sequential. A live
+        // immutable RequestContext snapshot can still unlock all-allow batches
+        // through the same shared classifier as core durable execution.
+        if (resolveToolPermission) return 1;
+        const policyCandidate = requestContext?.get(TOOL_PERMISSION_POLICY_KEY);
+        const permissionPolicy =
+          typeof policyCandidate === 'function' ? (policyCandidate as ToolPermissionPolicy) : undefined;
         return resolveDurableToolCallConcurrency({
           options: state?.options,
           toolsMetadata: state?.toolsMetadata,
           toolCalls: inputData as DurableToolCallInput[],
+          permissionPolicy: permissionPolicy ? toolCall => permissionPolicy(toolCall.toolName) : undefined,
+          permissionPolicyStable: requestContext?.get(TOOL_PERMISSION_POLICY_STABLE_KEY) === true,
+          permissionPolicyRequired:
+            state?.options.permissionPolicyRequired === true ||
+            requestContext?.get(TOOL_PERMISSION_POLICY_REQUIRED_KEY) === true,
         });
       },
     })
@@ -310,6 +362,8 @@ export function createInngestDurableAgenticWorkflow(options: InngestDurableAgent
     .then(llmMappingStep)
     // Step 6: Check for pending background tasks
     .then(backgroundTaskCheckStep)
+    // Step 6.5: A queued signal supersedes direct terminal delivery.
+    .then(signalDrainStep)
     // Step 7: Map back to iteration state format using shared function
     .map(
       async ({ inputData, getInitData }) => {
@@ -389,8 +443,36 @@ export function createInngestDurableAgenticWorkflow(options: InngestDurableAgent
         { id: 'init-iteration-state' },
       )
       // Run the agentic loop with dowhile
-      .dowhile(singleIterationWorkflow, async ({ inputData }) => {
+      .dowhile(singleIterationWorkflow, async params => {
+        const { inputData } = params;
         const state = inputData as IterationState;
+        const pubsub = (params as any)[PUBSUB_SYMBOL] as PubSub | undefined;
+
+        if (globalRunRegistry.get(state.runId)?.abortSignal?.aborted) {
+          state.terminalToolResult = undefined;
+          state.deferredStepFinishChunk = undefined;
+          if (state.lastStepResult) {
+            state.lastStepResult.reason = 'abort';
+            state.lastStepResult.isContinued = false;
+          }
+          return false;
+        }
+
+        // Flush ordinary intermediate step-finish chunks here. Terminal data
+        // stays in state until the memoized final map: Inngest may re-evaluate
+        // a loop condition during replay, and caller-facing output must not be
+        // published from that replayable predicate.
+        if (pubsub && !state.terminalToolResult) {
+          if (state.deferredStepFinishChunk) {
+            await emitChunkEvent(pubsub, state.runId, state.deferredStepFinishChunk as any);
+          }
+          state.deferredStepFinishChunk = undefined;
+        }
+
+        if (state.terminalToolResult) {
+          if (state.lastStepResult) state.lastStepResult.isContinued = false;
+          return false;
+        }
 
         // Check if we should continue
         const shouldContinue = state.lastStepResult?.isContinued === true;
@@ -403,8 +485,20 @@ export function createInngestDurableAgenticWorkflow(options: InngestDurableAgent
       // Map final state to output format, close agent span, and emit finish event
       .map(
         async params => {
-          const { inputData, mastra } = params;
+          const { inputData, mastra, requestContext } = params;
           const state = inputData as IterationState;
+          const initData = params.getInitData?.() as DurableAgenticWorkflowInput | undefined;
+
+          // Abort may land after the loop predicate but before this final map.
+          // It still wins over the not-yet-published terminal candidate.
+          if (globalRunRegistry.get(state.runId)?.abortSignal?.aborted) {
+            state.terminalToolResult = undefined;
+            state.deferredStepFinishChunk = undefined;
+            if (state.lastStepResult) {
+              state.lastStepResult.reason = 'abort';
+              state.lastStepResult.isContinued = false;
+            }
+          }
 
           // Access pubsub via symbol to emit finish event
           const pubsub = (params as any)[PUBSUB_SYMBOL] as PubSub | undefined;
@@ -412,6 +506,137 @@ export function createInngestDurableAgenticWorkflow(options: InngestDurableAgent
           // Extract final text from last step
           const lastStep = state.accumulatedSteps[state.accumulatedSteps.length - 1];
           const finalText = lastStep?.text;
+
+          // Persist only after the Inngest loop has committed to terminal
+          // delivery. The mapping result can still lose to background work or
+          // a signal in engines that support those precedence lanes.
+          const terminalEnvelope = state.terminalToolResult
+            ? createTerminalToolResultEnvelope(state.runId, state.accumulatedSteps.length, state.terminalToolResult)
+            : undefined;
+          if (terminalEnvelope) {
+            state.terminalToolResult = terminalEnvelope.data;
+          }
+
+          // Inngest may finalize on a different worker than the one that ran
+          // the last model/tool step. Rebuild memory and output processors from
+          // the registered agent before final persistence instead of relying on
+          // the process-local run registry. This mirrors the core durable
+          // finalizer and makes the terminal marker recallable after restart.
+          const resolvedRuntime =
+            initData?.agentId && initData.runId
+              ? await resolveRuntimeDependencies({
+                  mastra: mastra as any,
+                  runId: initData.runId,
+                  agentId: initData.agentId,
+                  input: { ...initData, messageListState: state.messageListState },
+                  logger: mastra?.getLogger?.(),
+                })
+              : undefined;
+          const finalMessageList =
+            resolvedRuntime?.messageList ?? new MessageList().deserialize(state.messageListState);
+
+          if (terminalEnvelope) {
+            finalMessageList.add(
+              {
+                id: state.messageId,
+                role: 'assistant',
+                content: {
+                  format: 2,
+                  parts: [{ type: 'data-terminal-tool-result', ...terminalEnvelope }],
+                },
+                createdAt: new Date(),
+              } as any,
+              'response',
+            );
+          }
+          state.messageListState = finalMessageList.serialize();
+
+          const finalRequestContext = createDurableRuntimeRequestContext({
+            entries: initData?.requestContextEntries,
+            state: initData?.state ?? state.state,
+            liveContext: requestContext as RequestContext | undefined,
+          });
+          const logger = mastra?.getLogger?.();
+          const durableState = state.state;
+          const terminalPersistenceOwned = outputProcessorsOwnTerminalPersistence(resolvedRuntime?.outputProcessors);
+          const terminalMemoryPersistenceExpected = Boolean(
+            terminalEnvelope &&
+            durableState.memoryConfigured &&
+            durableState.threadId &&
+            durableState.resourceId &&
+            !durableState.memoryConfig?.readOnly,
+          );
+          if (terminalMemoryPersistenceExpected && !terminalPersistenceOwned && !resolvedRuntime?.memory) {
+            throw new Error(
+              `[InngestDurableAgent] Cannot deliver terminal result for run "${state.runId}" because configured memory could not be rehydrated.`,
+            );
+          }
+          if (terminalMemoryPersistenceExpected && durableState?.observationalMemory && !terminalPersistenceOwned) {
+            throw new Error(
+              `[InngestDurableAgent] Cannot deliver terminal result for run "${state.runId}" because observational-memory persistence could not be rehydrated.`,
+            );
+          }
+          if (terminalMemoryPersistenceExpected && !terminalPersistenceOwned && !resolvedRuntime?.saveQueueManager) {
+            throw new Error(
+              `[InngestDurableAgent] Cannot deliver terminal result for run "${state.runId}" because the memory save queue could not be rehydrated.`,
+            );
+          }
+
+          if (resolvedRuntime?.outputProcessors?.length) {
+            try {
+              const runner = new ProcessorRunner({
+                inputProcessors: resolvedRuntime.inputProcessors ?? [],
+                outputProcessors: resolvedRuntime.outputProcessors,
+                errorProcessors: resolvedRuntime.errorProcessors ?? [],
+                logger: logger as any,
+                agentName: initData?.agentName ?? initData?.agentId ?? state.agentName ?? state.agentId,
+                processorStates: resolvedRuntime.processorStates,
+              });
+              await runner.runOutputProcessors(finalMessageList, undefined, finalRequestContext, 0);
+            } catch (error) {
+              logger?.warn?.(`[InngestDurableAgent] Error running output processors: ${error}`);
+              if (terminalEnvelope) throw error;
+            }
+          }
+          if (terminalEnvelope) {
+            assertTerminalToolResultRetained(finalMessageList, state.messageId, terminalEnvelope);
+          }
+          state.messageListState = finalMessageList.serialize();
+
+          if (
+            resolvedRuntime?.saveQueueManager &&
+            resolvedRuntime.memory &&
+            durableState?.threadId &&
+            durableState?.resourceId &&
+            !durableState.observationalMemory &&
+            (!terminalEnvelope || !terminalPersistenceOwned) &&
+            !durableState.memoryConfig?.readOnly
+          ) {
+            try {
+              if (!durableState.threadExists) {
+                await resolvedRuntime.memory.createThread?.({
+                  threadId: durableState.threadId,
+                  resourceId: durableState.resourceId,
+                  memoryConfig: durableState.memoryConfig,
+                });
+                durableState.threadExists = true;
+              }
+              await (terminalEnvelope
+                ? resolvedRuntime.saveQueueManager.flushMessagesStrict(
+                    finalMessageList,
+                    durableState.threadId,
+                    durableState.memoryConfig,
+                  )
+                : resolvedRuntime.saveQueueManager.flushMessages(
+                    finalMessageList,
+                    durableState.threadId,
+                    durableState.memoryConfig,
+                  ));
+            } catch (error) {
+              logger?.warn?.(`[InngestDurableAgent] Error persisting messages: ${error}`);
+              if (terminalEnvelope) throw error;
+            }
+          }
 
           const finalOutput = {
             messageListState: state.messageListState,
@@ -427,6 +652,7 @@ export function createInngestDurableAgenticWorkflow(options: InngestDurableAgent
               steps: state.accumulatedSteps,
             },
             state: state.state,
+            ...(state.terminalToolResult ? { terminalToolResult: state.terminalToolResult } : {}),
           };
 
           // End MODEL_GENERATION span with final output (children before parent)
@@ -455,9 +681,23 @@ export function createInngestDurableAgenticWorkflow(options: InngestDurableAgent
 
           // Emit finish event via pubsub
           if (pubsub) {
+            const deferredTerminalStep = terminalEnvelope ? state.deferredStepFinishChunk : undefined;
+            const terminalStepFinishChunk =
+              deferredTerminalStep && typeof deferredTerminalStep === 'object'
+                ? {
+                    ...deferredTerminalStep,
+                    payload: {
+                      ...((deferredTerminalStep as { payload?: object }).payload ?? {}),
+                      messageId: state.messageId,
+                    },
+                  }
+                : deferredTerminalStep;
+            if (terminalEnvelope) state.deferredStepFinishChunk = undefined;
             await emitFinishEvent(pubsub, state.runId, {
               output: finalOutput.output,
               stepResult: finalOutput.stepResult,
+              ...(terminalEnvelope ? { terminalToolResult: terminalEnvelope } : {}),
+              ...(terminalStepFinishChunk ? { terminalStepFinishChunk: terminalStepFinishChunk as any } : {}),
             });
           }
 

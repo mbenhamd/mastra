@@ -218,18 +218,35 @@ type HarnessLike = {
     respondToToolApproval(opts: {
       itemId: string;
       responseId: string;
+      runId: string;
+      toolCallId: string;
+      pendingRequestedAt: number;
       approved: boolean;
       reason?: string;
+      approvalScope?: 'once' | 'always';
     }): Promise<InboxResponseResult>;
     respondToToolSuspension(opts: {
       itemId: string;
       responseId: string;
+      runId: string;
+      toolCallId: string;
+      pendingRequestedAt: number;
       resumeData: unknown;
     }): Promise<InboxResponseResult>;
-    respondToQuestion(opts: { itemId: string; responseId: string; answer: unknown }): Promise<InboxResponseResult>;
+    respondToQuestion(opts: {
+      itemId: string;
+      responseId: string;
+      runId: string;
+      toolCallId: string;
+      pendingRequestedAt: number;
+      answer: unknown;
+    }): Promise<InboxResponseResult>;
     respondToPlanApproval(opts: {
       itemId: string;
       responseId: string;
+      runId: string;
+      toolCallId: string;
+      pendingRequestedAt: number;
       approved: boolean;
       revision?: string;
       transitionToMode?: string;
@@ -237,6 +254,9 @@ type HarnessLike = {
     respondToSandboxAccess(opts: {
       itemId: string;
       responseId: string;
+      runId: string;
+      toolCallId: string;
+      pendingRequestedAt: number;
       approved: boolean;
       reason?: string;
     }): Promise<InboxResponseResult>;
@@ -1600,6 +1620,16 @@ function mapHarnessError(error: unknown): never {
       responseId: harnessErrorString(error, 'responseId'),
     });
   }
+  if (
+    name === 'HarnessPendingInteractionExpiredError' ||
+    harnessErrorString(error, 'code') === 'harness.pending_interaction_expired'
+  ) {
+    throwHarnessHttpError(410, 'harness.pending_interaction_expired', message, {
+      sessionId: harnessErrorString(error, 'sessionId'),
+      itemId: harnessErrorString(error, 'itemId'),
+      expiresAt: harnessErrorNumber(error, 'expiresAt'),
+    });
+  }
   if (name === 'HarnessSessionNotFoundError') {
     throwHarnessHttpError(404, 'harness.session_not_found', message, {
       sessionId: harnessErrorString(error, 'sessionId'),
@@ -2687,6 +2717,35 @@ export const PATCH_HARNESS_MODEL_ROUTE = createRoute({
   },
 });
 
+export const GET_HARNESS_PERMISSIONS_ROUTE = createRoute({
+  method: 'GET',
+  path: '/harness/:name/sessions/:sessionId/permissions',
+  responseType: 'json',
+  pathParamSchema: harnessSessionPathParams,
+  responseSchema: harnessPermissionsResponseSchema,
+  requiresAuth: true,
+  harnessAuth: { clientRoute: true },
+  onValidationError: harnessValidationErrorHook,
+  summary: 'Get Harness session permissions',
+  description: 'Returns the persisted per-session permission grants and current permission rules.',
+  tags: ['Harness'],
+  handler: async ({ mastra, requestContext, name, sessionId, requestPathParams }) => {
+    try {
+      const { pathName, pathSessionId } = harnessSessionPathIdentity(requestPathParams, name, sessionId);
+      const resourceId = getAuthResourceId(requestContext);
+      const harness = resolveHarness(mastra as unknown as { getHarness(name: string): HarnessLike }, pathName);
+      const stored = await harness.loadSession({ sessionId: pathSessionId, includeClosed: true });
+      if (!stored || stored.resourceId !== resourceId) {
+        throwSessionNotFound(pathSessionId);
+      }
+      const session = await harness.session({ sessionId: pathSessionId, resourceId });
+      return permissionsSnapshot(session);
+    } catch (error) {
+      return mapHarnessError(error);
+    }
+  },
+});
+
 export const PATCH_HARNESS_PERMISSIONS_ROUTE = createRoute({
   method: 'PATCH',
   path: '/harness/:name/sessions/:sessionId/permissions',
@@ -2765,8 +2824,12 @@ export const RESPOND_HARNESS_INBOX_ROUTE = createRoute({
       const body = objectRequestBody(requestBody, 'Inbox response') as {
         kind: 'tool-approval' | 'tool-suspension' | 'question' | 'plan-approval' | 'sandbox-access';
         responseId: string;
+        runId: string;
+        toolCallId: string;
+        pendingRequestedAt: number;
         approved?: boolean;
         reason?: string;
+        approvalScope?: 'once' | 'always';
         resumeData?: unknown;
         answer?: unknown;
         revision?: string;
@@ -2780,25 +2843,38 @@ export const RESPOND_HARNESS_INBOX_ROUTE = createRoute({
           return await session.respondToToolApproval({
             itemId: pathItemId,
             responseId: body.responseId,
+            runId: body.runId,
+            toolCallId: body.toolCallId,
+            pendingRequestedAt: body.pendingRequestedAt,
             approved: body.approved!,
             ...(body.reason !== undefined ? { reason: body.reason } : {}),
+            ...(body.approvalScope !== undefined ? { approvalScope: body.approvalScope } : {}),
           });
         case 'tool-suspension':
           return await session.respondToToolSuspension({
             itemId: pathItemId,
             responseId: body.responseId,
+            runId: body.runId,
+            toolCallId: body.toolCallId,
+            pendingRequestedAt: body.pendingRequestedAt,
             resumeData: body.resumeData,
           });
         case 'question':
           return await session.respondToQuestion({
             itemId: pathItemId,
             responseId: body.responseId,
+            runId: body.runId,
+            toolCallId: body.toolCallId,
+            pendingRequestedAt: body.pendingRequestedAt,
             answer: body.answer,
           });
         case 'plan-approval':
           return await session.respondToPlanApproval({
             itemId: pathItemId,
             responseId: body.responseId,
+            runId: body.runId,
+            toolCallId: body.toolCallId,
+            pendingRequestedAt: body.pendingRequestedAt,
             approved: body.approved!,
             ...(body.revision !== undefined ? { revision: body.revision } : {}),
             ...(body.transitionToMode !== undefined ? { transitionToMode: body.transitionToMode } : {}),
@@ -2807,6 +2883,9 @@ export const RESPOND_HARNESS_INBOX_ROUTE = createRoute({
           return await session.respondToSandboxAccess({
             itemId: pathItemId,
             responseId: body.responseId,
+            runId: body.runId,
+            toolCallId: body.toolCallId,
+            pendingRequestedAt: body.pendingRequestedAt,
             approved: body.approved!,
             ...(body.reason !== undefined ? { reason: body.reason } : {}),
           });

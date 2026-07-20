@@ -505,6 +505,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
 
       let approvalGrant: { approval: ToolApprovalGrant } | undefined;
       let resumeTargetToolCallId: string | undefined;
+      let resumedFromSuspension = false;
 
       try {
         // The factory closure value is authoritative when set: a function-valued policy
@@ -686,16 +687,28 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
         const authoritativeIdentityMatches =
           hasAuthoritativeResumeEnvelope && matchesExpectedResumeIdentity(authoritativeResumeEnvelope);
         // Some providers materialize optional workflow/agent-tool control fields
-        // as null on a fresh call. Null is also a valid resumed tool payload, so
-        // normalize it only when no durable or caller-supplied resume identity
-        // exists. Non-null values and calls naming a suspended run/call remain
-        // fail-closed below.
-        const isEvidenceFreeNullResumePlaceholder =
+        // as null on a fresh call. When the workflow engine is explicitly resuming
+        // that call, its resume data must win over the provider placeholder. This
+        // only applies when the provider supplied no non-empty resume coordinate;
+        // model-driven resumes keep their identity evidence and remain fail-closed
+        // in the checks below. The authoritative envelope is still validated before
+        // the workflow resume data can be consumed.
+        const isIdentityFreeProviderNullResume =
           isResumeToolCall &&
           resumeDataFromArgs === null &&
-          workflowResumeData === undefined &&
           suspendedToolCallId === undefined &&
-          suppliedSuspendedToolRunId === undefined &&
+          suppliedSuspendedToolRunId === undefined;
+        if (isIdentityFreeProviderNullResume && workflowResumeData !== undefined) {
+          resumeData = workflowResumeData;
+          isResumeToolCall = false;
+        }
+
+        // Null is also a valid resumed tool payload, so a fresh provider null is
+        // normalized to undefined only when no workflow, durable, or caller-supplied
+        // resume evidence exists.
+        const isEvidenceFreeNullResumePlaceholder =
+          isIdentityFreeProviderNullResume &&
+          workflowResumeData === undefined &&
           !hasAuthoritativeResumeEnvelope &&
           storedResumeMetadata === undefined;
         if (isEvidenceFreeNullResumePlaceholder) {
@@ -742,6 +755,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
         const isKnownSuspensionResume =
           effectiveResumeType === 'suspension' &&
           (authoritativeResumeType === 'suspension' || storedResumeMetadata?.identityMatches === true);
+        resumedFromSuspension = isKnownSuspensionResume;
         const isApprovalResumeData = hasApprovalResumeShape && isKnownApprovalResume;
         const isToolExecutionApprovalResume = isApprovalResumeData && effectiveApprovalSource === 'tool-execution';
         const persistedApprovalGrant =
@@ -847,6 +861,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           return {
             ...inputData,
             ...resumeTarget,
+            disposition: 'denied' as const,
             result: `Tool "${inputData.toolName}" was denied by the session permission policy.`,
           };
         }
@@ -1743,7 +1758,13 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           }
         }
 
-        return { result, ...inputData, ...resumeTarget, ...(approvalGrant ?? {}) };
+        return {
+          result,
+          ...inputData,
+          ...resumeTarget,
+          ...(resumedFromSuspension ? { resumedFromSuspension: true as const } : {}),
+          ...(approvalGrant ?? {}),
+        };
       } catch (error) {
         // Re-throw FGA authorization errors instead of swallowing them
         if (error instanceof Error && error.name === 'FGADeniedError') {
@@ -1753,6 +1774,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           error: serializeToolError(error),
           ...inputData,
           ...(resumeTargetToolCallId ? { resumeTargetToolCallId } : {}),
+          ...(resumedFromSuspension ? { resumedFromSuspension: true as const } : {}),
           ...(approvalGrant ?? {}),
         };
       }

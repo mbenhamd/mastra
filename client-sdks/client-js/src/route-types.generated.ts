@@ -27,12 +27,12 @@ type Shared_Auxiliary_813 =
       [key: string]: Shared_Auxiliary_813;
     };
 
-type Shared_Auxiliary_1264 = {
+type Shared_Auxiliary_1266 = {
   id?: string | undefined;
   name: string;
   type: 'file' | 'folder';
   content?: string | undefined;
-  children?: Shared_Auxiliary_1264[] | undefined;
+  children?: Shared_Auxiliary_1266[] | undefined;
 };
 
 type Shared_Type_0 = {
@@ -2071,13 +2071,22 @@ type Shared_Type_97 = {
 };
 
 type Shared_Type_98 = {
-  [key: string]: {
-    subagentSessionId: string;
-    agentType: string;
-    task: string;
-    parentToolCallId: string;
-    startedAt: number;
-  };
+  subagentSessionId: string;
+  agentType: string;
+  task: string;
+  parentToolCallId: string;
+  startedAt: number;
+  status?: ('running' | 'awaiting_input' | 'completed' | 'failed') | undefined;
+  currentToolName?: string | undefined;
+  toolCalls?: number | undefined;
+  usage?:
+    | {
+        promptTokens: number;
+        completionTokens: number;
+        totalTokens: number;
+      }
+    | undefined;
+  updatedAt?: number | undefined;
 };
 
 type Shared_Type_99 = {
@@ -2089,7 +2098,6 @@ type Shared_Type_99 = {
   queuedItemId?: string | undefined;
   messageId?: string | undefined;
   text: string;
-  reasoningText?: string | undefined;
   status: 'streaming' | 'interrupted' | 'completed' | 'failed';
   startedAt: number;
   updatedAt: number;
@@ -2107,6 +2115,7 @@ type Shared_Type_100 = {
   source: 'parent' | 'subagent';
   subagentToolCallId?: string | undefined;
   requestedAt: number;
+  expiresAt: number;
   queuedItemId?: string | undefined;
   modeId?: string | undefined;
   resumedAt?: number | undefined;
@@ -2138,7 +2147,9 @@ type Shared_Type_101 = {
       text: string;
     };
   };
-  activeSubagents: Shared_Type_98;
+  activeSubagents: {
+    [key: string]: Shared_Type_98;
+  };
   assistantDrafts: {
     [key: string]: Shared_Type_99;
   };
@@ -2832,7 +2843,7 @@ type Shared_Type_127 = {
   /** List of asset file paths */
   assets?: string[] | undefined;
   /** Full file tree structure for the skill */
-  files?: Shared_Auxiliary_1264[] | undefined;
+  files?: Shared_Auxiliary_1266[] | undefined;
   /** Additional metadata for the skill */
   metadata?:
     | {
@@ -12967,6 +12978,43 @@ export interface GetHarnessNameSessionsSessionIdState_RouteContract {
 }
 
 // ============================================================================
+// Route: GET /harness/:name/sessions/:sessionId/permissions
+// ============================================================================
+export type GetHarnessNameSessionsSessionIdPermissions_PathParams = GetHarnessNameSessionsSessionId_PathParams;
+
+export type GetHarnessNameSessionsSessionIdPermissions_Response = {
+  grants: {
+    categories: string[];
+    tools: string[];
+  };
+  rules: {
+    categories: {
+      [key: string]: 'allow' | 'ask' | 'deny';
+    };
+    tools: {
+      [key: string]: 'allow' | 'ask' | 'deny';
+    };
+  };
+};
+
+export type GetHarnessNameSessionsSessionIdPermissions_Request = Simplify<
+  (GetHarnessNameSessionsSessionIdPermissions_PathParams extends never
+    ? {}
+    : { params: GetHarnessNameSessionsSessionIdPermissions_PathParams }) &
+    (never extends never ? {} : {} extends never ? { query?: never } : { query: never }) &
+    (never extends never ? {} : {} extends never ? { body?: never } : { body: never })
+>;
+
+export interface GetHarnessNameSessionsSessionIdPermissions_RouteContract {
+  pathParams: GetHarnessNameSessionsSessionIdPermissions_PathParams;
+  queryParams: never;
+  body: never;
+  request: GetHarnessNameSessionsSessionIdPermissions_Request;
+  response: GetHarnessNameSessionsSessionIdPermissions_Response;
+  responseType: 'json';
+}
+
+// ============================================================================
 // Route: PATCH /harness/:name/sessions/:sessionId/state
 // ============================================================================
 export type PatchHarnessNameSessionsSessionIdState_PathParams = GetHarnessNameSessionsSessionId_PathParams;
@@ -13093,20 +13141,7 @@ export type PatchHarnessNameSessionsSessionIdPermissions_Body =
       policy: 'allow' | 'ask' | 'deny';
     };
 
-export type PatchHarnessNameSessionsSessionIdPermissions_Response = {
-  grants: {
-    categories: string[];
-    tools: string[];
-  };
-  rules: {
-    categories: {
-      [key: string]: 'allow' | 'ask' | 'deny';
-    };
-    tools: {
-      [key: string]: 'allow' | 'ask' | 'deny';
-    };
-  };
-};
+export type PatchHarnessNameSessionsSessionIdPermissions_Response = GetHarnessNameSessionsSessionIdPermissions_Response;
 
 export type PatchHarnessNameSessionsSessionIdPermissions_Request = Simplify<
   (PatchHarnessNameSessionsSessionIdPermissions_PathParams extends never
@@ -13146,23 +13181,36 @@ export type PostHarnessNameSessionsSessionIdInboxItemId_Body =
       kind: 'tool-approval';
       approved: boolean;
       reason?: string | undefined;
+      approvalScope?: ('once' | 'always') | undefined;
       responseId: string;
+      runId: string;
+      toolCallId: string;
+      pendingRequestedAt: number;
     }
   | {
       kind: 'tool-suspension';
       resumeData: Shared_Auxiliary_813;
       responseId: string;
+      runId: string;
+      toolCallId: string;
+      pendingRequestedAt: number;
     }
   | {
       kind: 'question';
       answer: Shared_Auxiliary_813;
       responseId: string;
+      runId: string;
+      toolCallId: string;
+      pendingRequestedAt: number;
     }
   | {
       kind: 'plan-approval';
       approved: boolean;
       revision?: string | undefined;
       responseId: string;
+      runId: string;
+      toolCallId: string;
+      pendingRequestedAt: number;
       transitionToMode?: string | undefined;
     }
   | {
@@ -13170,6 +13218,9 @@ export type PostHarnessNameSessionsSessionIdInboxItemId_Body =
       approved: boolean;
       reason?: string | undefined;
       responseId: string;
+      runId: string;
+      toolCallId: string;
+      pendingRequestedAt: number;
     };
 
 export type PostHarnessNameSessionsSessionIdInboxItemId_Response = {
@@ -17106,7 +17157,7 @@ export type PostStoredSkills_Body = {
   /** List of asset file paths */
   assets?: string[] | undefined;
   /** Full file tree structure for the skill */
-  files?: Shared_Auxiliary_1264[] | undefined;
+  files?: Shared_Auxiliary_1266[] | undefined;
   /** Additional metadata for the skill */
   metadata?:
     | {
@@ -17164,7 +17215,7 @@ export type PatchStoredSkillsStoredSkillId_Body = {
   /** List of asset file paths */
   assets?: (string[] | undefined) | undefined;
   /** Full file tree structure for the skill */
-  files?: (Shared_Auxiliary_1264[] | undefined) | undefined;
+  files?: (Shared_Auxiliary_1266[] | undefined) | undefined;
   /** Additional metadata for the skill */
   metadata?:
     | (
@@ -22288,6 +22339,7 @@ export interface RouteTypes {
   'GET /harness/:name/sessions/:sessionId/queue/:queuedItemId/result': GetHarnessNameSessionsSessionIdQueueQueuedItemIdResult_RouteContract;
   'GET /harness/:name/sessions/:sessionId/events': GetHarnessNameSessionsSessionIdEvents_RouteContract;
   'GET /harness/:name/sessions/:sessionId/state': GetHarnessNameSessionsSessionIdState_RouteContract;
+  'GET /harness/:name/sessions/:sessionId/permissions': GetHarnessNameSessionsSessionIdPermissions_RouteContract;
   'PATCH /harness/:name/sessions/:sessionId/state': PatchHarnessNameSessionsSessionIdState_RouteContract;
   'PATCH /harness/:name/sessions/:sessionId/mode': PatchHarnessNameSessionsSessionIdMode_RouteContract;
   'PATCH /harness/:name/sessions/:sessionId/model': PatchHarnessNameSessionsSessionIdModel_RouteContract;
@@ -22970,6 +23022,7 @@ export interface Client {
     PATCH: PatchHarnessNameSessionsSessionIdModel_RouteContract;
   };
   '/harness/:name/sessions/:sessionId/permissions': {
+    GET: GetHarnessNameSessionsSessionIdPermissions_RouteContract;
     PATCH: PatchHarnessNameSessionsSessionIdPermissions_RouteContract;
   };
   '/harness/:name/sessions/:sessionId/queue': {

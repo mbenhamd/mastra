@@ -18,10 +18,11 @@ import { createDurableAgent } from '../create-durable-agent';
 
 describe('Bug 3: background-task system prompt on durable', () => {
   let pubsub: EventEmitterPubSub;
-  const storage = new MockStore();
+  let storage: MockStore;
 
   beforeEach(() => {
     pubsub = new EventEmitterPubSub();
+    storage = new MockStore();
   });
 
   afterEach(async () => {
@@ -84,8 +85,9 @@ describe('Bug 3: background-task system prompt on durable', () => {
       agents: { 'bg-prompt-agent': durableAgent as any },
     });
 
-    const { cleanup } = await durableAgent.stream('hi', { onChunk: () => {} });
+    const { output, cleanup } = await durableAgent.stream('hi', { onChunk: () => {} });
     await calledPromise;
+    await output.consumeStream();
     cleanup();
 
     expect(promptSnapshots.length).toBeGreaterThan(0);
@@ -151,8 +153,9 @@ describe('Bug 3: background-task system prompt on durable', () => {
       agents: { 'no-bg-agent': durableAgent as any },
     });
 
-    const { cleanup } = await durableAgent.stream('hi', { onChunk: () => {} });
+    const { output, cleanup } = await durableAgent.stream('hi', { onChunk: () => {} });
     await calledPromise;
+    await output.consumeStream();
     cleanup();
 
     expect(promptSnapshots.length).toBeGreaterThan(0);

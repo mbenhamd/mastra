@@ -150,7 +150,8 @@ export type PendingInteraction = Omit<
   | 'resumedAt'
   | 'approvedTransitionModeId'
   | 'modeTransitionAppliedAt'
->;
+  | 'expiresAt'
+> & { expiresAt: number };
 
 /**
  * Documentation-only recovery policy for interrupted live sessions.

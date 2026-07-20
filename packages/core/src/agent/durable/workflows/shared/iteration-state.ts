@@ -101,6 +101,8 @@ export function createBaseIterationStateUpdate(input: IterationStateUpdateInput)
     accumulatedUsage: newUsage,
     lastStepResult: executionOutput.stepResult,
     backgroundTaskPending: executionOutput.backgroundTaskPending,
+    terminalToolResult: executionOutput.terminalToolResult,
+    deferredStepFinishChunk: executionOutput.deferredStepFinishChunk,
     delegationBailed: executionOutput.delegationBailed,
     // Preserve the two-phase stop flag set by the dowhile predicate's
     // onIterationComplete handler.  The predicate mutates state on the

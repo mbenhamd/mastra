@@ -49,7 +49,11 @@ function toolCallStream(toolCallId: string, toolName: string, inputJson: string)
  * records when it runs) then replies. `permissions` / `defaultPermissionPolicy`
  * configure the gate.
  */
-function buildHarness(opts: { permissions?: HarnessMode['permissions']; defaultPermissionPolicy?: PermissionPolicy }) {
+function buildHarness(opts: {
+  permissions?: HarnessMode['permissions'];
+  defaultPermissionPolicy?: PermissionPolicy;
+  additionalDeniedTools?: number;
+}) {
   const ran = { writeDoc: false };
   const writeDoc = createTool({
     id: 'writeDoc',
@@ -76,7 +80,17 @@ function buildHarness(opts: { permissions?: HarnessMode['permissions']; defaultP
     },
   });
 
-  const agent = new Agent({ id: 'default', name: 'default', instructions: 'use writeDoc', model, tools: { writeDoc } });
+  const tools: Record<string, ReturnType<typeof createTool>> = { writeDoc };
+  for (let index = 0; index < (opts.additionalDeniedTools ?? 0); index++) {
+    const name = `denied_${String(index).padStart(3, '0')}`;
+    tools[name] = createTool({
+      id: name,
+      description: 'denied test tool',
+      inputSchema: z.object({}),
+      execute: async () => ({ ok: true }),
+    });
+  }
+  const agent = new Agent({ id: 'default', name: 'default', instructions: 'use writeDoc', model, tools });
   const mode: HarnessMode = {
     id: 'default',
     agentId: 'default',
@@ -88,7 +102,7 @@ function buildHarness(opts: { permissions?: HarnessMode['permissions']; defaultP
     modes: [mode],
     defaultModeId: 'default',
     // writeDoc resolves to the 'edit' workspace category.
-    toolCategoryResolver: (name: string) => (name === 'writeDoc' ? 'edit' : null),
+    toolCategoryResolver: (name: string) => (name === 'writeDoc' || name.startsWith('denied_') ? 'edit' : null),
     ...(opts.defaultPermissionPolicy ? { defaultPermissionPolicy: opts.defaultPermissionPolicy } : {}),
   });
   return { harness, ran };
@@ -121,6 +135,39 @@ describe('Harness v1 §4.2e permission gate — enforced through the real loop',
 
       const denied = events.filter(e => e.type === 'tool_denied') as Array<{ toolName: string; stage: string }>;
       expect(denied.some(e => e.stage === 'pre-exposure' && e.toolName === 'writeDoc')).toBe(true);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('aggregates a large denied tool surface once per provider step', async () => {
+    const { harness } = buildHarness({
+      permissions: { categories: { edit: 'deny' }, tools: {} },
+      additionalDeniedTools: 124,
+    });
+    try {
+      const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const events: HarnessEvent[] = [];
+      session.subscribe(event => events.push(event));
+      await session.message({ content: 'write it' });
+
+      const preExposure = events.filter(
+        (event): event is Extract<HarnessEvent, { type: 'tool_denied' }> =>
+          event.type === 'tool_denied' && event.stage === 'pre-exposure',
+      );
+      // The denied write attempt drives one action step and one terminal
+      // continuation step. Each provider step gets one bounded aggregate; the
+      // count must never multiply by the 125 denied tools in the surface.
+      expect(preExposure).toHaveLength(2);
+      expect(preExposure).toEqual(
+        preExposure.map(() =>
+          expect.objectContaining({
+            deniedToolCount: 125,
+            deniedToolNames: expect.any(Array),
+          }),
+        ),
+      );
+      expect(preExposure.every(event => (event.deniedToolNames?.length ?? 0) <= 8)).toBe(true);
     } finally {
       await harness.shutdown();
     }
@@ -228,10 +275,9 @@ describe('Harness v1 §4.2e permission gate — enforced through the real loop',
     }
   });
 
-  it('harness BUILT-INS (plan-task tools) bypass the gate even under defaultPermissionPolicy deny', async () => {
-    // An explicit default 'deny' engages the gate and would block any non-builtin
-    // tool. The harness's own built-ins (task_add etc.) must still run — else the
-    // gate would break the harness's own orchestration.
+  it('an explicitly allowed plan-task tool runs under defaultPermissionPolicy deny', async () => {
+    // Plan mutations are actions, not protocol plumbing. A deny-by-default mode
+    // must opt into the exact plan tools it wants the model to use.
     let call = 0;
     const model = new MockLanguageModelV2({
       doStream: async () => {
@@ -250,7 +296,13 @@ describe('Harness v1 §4.2e permission gate — enforced through the real loop',
     const harness = new Harness({
       agents: { default: agent } as any,
       storage: new InMemoryStore(),
-      modes: [{ id: 'default', agentId: 'default' }],
+      modes: [
+        {
+          id: 'default',
+          agentId: 'default',
+          permissions: { categories: {}, tools: { task_add: 'allow' } },
+        },
+      ],
       defaultModeId: 'default',
       defaultPermissionPolicy: 'deny', // gate engaged; would deny any non-builtin tool
     });
@@ -259,7 +311,7 @@ describe('Harness v1 §4.2e permission gate — enforced through the real loop',
       const events: HarnessEvent[] = [];
       session.subscribe(e => events.push(e));
       await session.message({ content: 'plan it' });
-      // The built-in task_add ran (not denied) → a real plan task was created.
+      // The explicit policy admits task_add and a real plan task is created.
       const toolEnd = events.find(e => e.type === 'tool_end' && (e as any).toolName === 'task_add') as any;
       expect(toolEnd).toBeDefined();
       expect(toolEnd.isError).toBe(false);

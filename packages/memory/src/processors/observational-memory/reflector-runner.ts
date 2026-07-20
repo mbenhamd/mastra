@@ -332,6 +332,7 @@ export class ReflectorRunner {
   }> {
     const originalTokens = this.tokenCounter.countObservations(observations);
     const resolvedModel = model ? { model } : this.resolveModel(originalTokens);
+    const extractorResolutionFailures: Array<{ slug: string; error: string }> = [];
     const activeExtractors = await resolveExtractors(
       (skipContinuationHints
         ? this.reflectionConfig.extractors?.filter(
@@ -346,6 +347,7 @@ export class ReflectorRunner {
         memory: this.memory,
         requestContext,
       },
+      failure => extractorResolutionFailures.push(failure),
     );
     const structuredExtractors = activeExtractors.filter(extractor => extractor.mode === 'structured');
     const temporaryMemory =
@@ -384,7 +386,7 @@ export class ReflectorRunner {
 
       let chunkCount = 0;
       const result = await withRetry(
-        () =>
+        operationAbortSignal =>
           withOmTracingSpan({
             phase: 'reflector',
             model: resolvedModel.model,
@@ -410,10 +412,13 @@ export class ReflectorRunner {
                 const streamResult = await agent.stream(prompt, {
                   modelSettings: {
                     ...this.reflectionConfig.modelSettings,
+                    // OM owns the bounded transport retry budget around this call.
+                    // Disable the model layer retry to avoid multiplying attempts.
+                    maxRetries: 0,
                   },
                   providerOptions: this.reflectionConfig.providerOptions as any,
                   ...(temporaryMemory ? { memory: temporaryMemory.options } : {}),
-                  ...(abortSignal ? { abortSignal } : {}),
+                  abortSignal: operationAbortSignal,
                   ...(internalRequestContext ? { requestContext: internalRequestContext } : {}),
                   ...childObservabilityContext,
                   ...(attemptNumber === 1
@@ -448,7 +453,7 @@ export class ReflectorRunner {
                 });
 
                 return streamResult.getFullOutput();
-              }, abortSignal),
+              }, operationAbortSignal),
           }),
         { label: 'reflector', abortSignal },
       );
@@ -530,12 +535,16 @@ export class ReflectorRunner {
       extractors: activeExtractors,
       memory: temporaryMemory?.options,
       priorExtractedValues,
-      requestContext,
+      requestContext: internalRequestContext,
       observabilityContext,
       abortSignal,
     });
     const parsedExtractedValues = mergeExtractedValues(parsed.extractedValues, structuredExtraction.values);
-    const parsedExtractionFailures = mergeExtractionFailures(parsed.extractionFailures, structuredExtraction.failures);
+    const parsedExtractionFailures = mergeExtractionFailures(
+      extractorResolutionFailures,
+      parsed.extractionFailures,
+      structuredExtraction.failures,
+    );
     const hookedValues = await applyExtractorHooks({
       source: 'reflector',
       extractors: activeExtractors,

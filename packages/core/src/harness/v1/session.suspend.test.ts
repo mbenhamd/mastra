@@ -13,12 +13,20 @@ import { describe, expect, it } from 'vitest';
 
 import { Agent } from '../../agent';
 import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
+import type { PendingResume } from '../../storage/domains/harness/types';
 import { InMemoryDB } from '../../storage/domains/inmemory-db';
 import { InMemoryStore } from '../../storage/mock';
 import type { MastraModelOutput } from '../../stream/base/output';
 import { buildFakeOutput } from './__test-utils__/fake-output';
 
-import { HarnessInboxResponseConflictError, HarnessSessionDeletedError, HarnessValidationError } from './errors';
+import {
+  HarnessBusyError,
+  HarnessInboxResponseConflictError,
+  HarnessPendingInteractionExpiredError,
+  HarnessSessionCorruptError,
+  HarnessSessionDeletedError,
+  HarnessValidationError,
+} from './errors';
 import { Harness } from './harness';
 
 // ---------------------------------------------------------------------------
@@ -40,6 +48,9 @@ interface RunSpec {
   text?: string;
   runId?: string;
   holdUntil?: Promise<void>;
+  totalUsage?: { inputTokens: number; outputTokens: number; totalTokens: number };
+  chunks?: Array<Record<string, unknown>>;
+  terminalToolResult?: unknown;
 }
 
 interface ResumeCall {
@@ -69,11 +80,12 @@ class FakeAgent extends Agent<any, any, any> {
 
   private buildOutput(spec: RunSpec, runIdOverride?: string): MastraModelOutput {
     const runId = runIdOverride ?? spec.runId;
+    const totalUsage = spec.totalUsage ?? { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
     return buildFakeOutput({
       runId,
       fullOutput: {
         text: spec.text ?? '',
-        usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+        usage: totalUsage,
         finishReason: spec.finishReason,
         object: undefined,
         steps: [],
@@ -87,7 +99,7 @@ class FakeAgent extends Agent<any, any, any> {
         sources: [],
         files: [],
         response: { id: 'r', timestamp: new Date(), modelId: 'fake', messages: [], uiMessages: [] },
-        totalUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+        totalUsage,
         error: undefined,
         tripwire: undefined,
         traceId: undefined,
@@ -95,7 +107,9 @@ class FakeAgent extends Agent<any, any, any> {
         suspendPayload: spec.suspendPayload,
         messages: [],
         rememberedMessages: [],
+        terminalToolResult: spec.terminalToolResult,
       },
+      chunks: spec.chunks?.map(chunk => ({ ...chunk, runId })),
     });
   }
 
@@ -128,7 +142,7 @@ class FakeAgent extends Agent<any, any, any> {
   }
 }
 
-function setup(modes?: any) {
+function setup(modes?: any, sessionOptions: Record<string, unknown> = {}) {
   const agent = new FakeAgent();
   const storage = new InMemoryHarness({ db: new InMemoryDB() });
   const resolvedModes = modes ?? [{ id: 'default', agentId: 'default' }];
@@ -136,9 +150,18 @@ function setup(modes?: any) {
     agents: { default: agent } as any,
     modes: resolvedModes,
     defaultModeId: resolvedModes[0].id,
-    sessions: { storage },
+    sessions: { storage, ...sessionOptions },
   });
   return { harness, agent, storage };
+}
+
+function pendingResponseIdentity(pending: PendingResume) {
+  return {
+    itemId: pending.itemId!,
+    runId: pending.runId,
+    toolCallId: pending.toolCallId,
+    pendingRequestedAt: pending.requestedAt,
+  };
 }
 
 async function waitFor(predicate: () => boolean, label: string, timeoutMs = 500): Promise<void> {
@@ -180,6 +203,89 @@ describe('Session — suspend capture on message()', () => {
     expect(pending!.toolName).toBe('shell');
     expect(pending!.payload).toEqual({ input: { cmd: 'rm -rf /' } });
     expect(session.getDisplayState().pending?.kind).toBe('tool-approval');
+  });
+
+  it('persists bounded failed-tool receipts across suspension rehydration for terminal report verification', async () => {
+    const { harness, agent, storage } = setup();
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      suspendPayload: { toolCallId: 'approval-1', toolName: 'write_file', args: { path: 'paper.tex' } },
+      chunks: [
+        {
+          type: 'tool-error',
+          payload: {
+            toolCallId: 'compile-1',
+            toolName: 'compile_latex',
+            error: new Error('compiler service unavailable'),
+          },
+        },
+      ],
+    });
+    const source = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    await source.message({ content: 'diagnose, then ask before editing' });
+    expect(source.getRecord().pendingResume).toMatchObject({
+      toolReceipts: [
+        {
+          toolCallId: 'compile-1',
+          toolName: 'compile_latex',
+          status: 'error',
+        },
+      ],
+    });
+    const sessionId = source.id;
+    await harness.shutdown();
+
+    const recoveryAgent = new FakeAgent();
+    recoveryAgent.enqueueRun({
+      finishReason: 'tool-calls',
+      terminalToolResult: {
+        status: 'success',
+        items: [
+          {
+            toolName: 'report_subagent_outcome',
+            toolCallId: 'report-1',
+            status: 'success',
+            value: {
+              kind: 'subagent-outcome-report',
+              outcome: 'blocked',
+              summary: 'No source repair was attempted because the compiler service was unavailable.',
+              evidence: [
+                {
+                  kind: 'tool-result',
+                  description: 'Compiler service call failed',
+                  toolName: 'compile_latex',
+                  toolCallId: 'compile-1',
+                  status: 'error',
+                },
+              ],
+              issue: {
+                code: 'compiler.service_unavailable',
+                message: 'Compiler service unavailable',
+                retryable: true,
+              },
+            },
+          },
+        ],
+      },
+    });
+    const harness2 = new Harness({
+      agents: { default: recoveryAgent } as any,
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      sessions: { storage },
+    });
+    const restored = await harness2.session({ sessionId, resourceId: 'u' });
+    const result = (await restored.respondToToolApproval({ approved: false })) as Record<string, unknown>;
+    expect(result).toMatchObject({
+      harnessToolReceipts: [
+        {
+          toolCallId: 'compile-1',
+          toolName: 'compile_latex',
+          status: 'error',
+        },
+      ],
+    });
+    await harness2.shutdown();
   });
 
   it('signal(): a suspended owned turn is parked, not settled — no signal_completed, evidence stays pending (§4.2f/§10.2)', async () => {
@@ -243,7 +349,7 @@ describe('Session — suspend capture on message()', () => {
     expect(session.getRecord().pendingResume).toBeUndefined();
   });
 
-  it('signal(): failed resume of a suspended owned turn settles signal_failed (§4.2f)', async () => {
+  it('signal(): pre-output resume failure stays retryable and leaves signal evidence pending (§4.2f)', async () => {
     const { harness, agent } = setup();
     agent.enqueueRun({
       finishReason: 'suspended',
@@ -257,13 +363,72 @@ describe('Session — suspend capture on message()', () => {
     await waitFor(() => session.getRecord().pendingResume !== undefined, 'pendingResume captured for suspended signal');
 
     // No further run enqueued → resumeStream throws → terminal failure.
-    const events: { type: string }[] = [];
+    const events: { type: string; retryable?: boolean }[] = [];
     session.subscribe(e => events.push(e));
     await expect(session.respondToToolApproval({ approved: true })).rejects.toBeTruthy();
 
-    await waitFor(() => events.some(e => e.type === 'signal_failed'), 'signal_failed after failed resume');
+    await waitFor(() => events.some(e => e.type === 'resume_failed'), 'retryable resume_failed after failed resume');
+    expect(events).toContainEqual(expect.objectContaining({ type: 'resume_failed', retryable: true }));
+    expect(events.some(event => event.type === 'signal_failed')).toBe(false);
     const lookup = await session.lookupMessageResult(handle.id);
-    expect(lookup && 'status' in lookup ? lookup.status : null).toBe('failed');
+    expect(lookup && 'status' in lookup ? lookup.status : null).toBe('pending');
+    expect(session.getRecord().pendingResume?.resumedAt).toBeUndefined();
+  });
+
+  it('signal(): cold recovery settles an admitted resume abandoned across restart as failed', async () => {
+    const { harness, agent, storage } = setup();
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      runId: 'run-signal-crash',
+      suspendPayload: { toolCallId: 'tc-signal-crash', toolName: 'shell', args: { cmd: 'publish' } },
+    });
+    const source = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    const handle = await source.signal({ content: 'do it' });
+    await handle.result;
+    await waitFor(() => source.getRecord().pendingResume !== undefined, 'signal pending before crash fixture');
+    const sessionId = source.id;
+    await harness.shutdown();
+
+    const fixtureOwner = 'signal-resume-crash-fixture';
+    const lease = await storage.acquireSessionLease({ sessionId, ownerId: fixtureOwner, ttlMs: 30_000 });
+    const stored = await storage.loadSession({ sessionId });
+    if (!stored?.pendingResume) throw new Error('expected pending signal fixture');
+    const resumedAt = Date.now() - 60_000;
+    await storage.saveSession(
+      {
+        ...stored,
+        ownerId: fixtureOwner,
+        leaseExpiresAt: lease.expiresAt,
+        pendingResume: {
+          ...stored.pendingResume,
+          resumedAt,
+          resumeRecoveryAt: resumedAt + 30_000,
+        },
+      },
+      { ownerId: fixtureOwner, ifVersion: lease.version },
+    );
+    await storage.releaseSessionLease({ sessionId, ownerId: fixtureOwner });
+
+    const harness2 = new Harness({
+      agents: { default: new FakeAgent() } as any,
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      sessions: { storage },
+    });
+    let recovered = await storage.loadSession({ sessionId });
+    const deadline = Date.now() + 2_000;
+    while (recovered?.pendingResume !== undefined && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+      recovered = await storage.loadSession({ sessionId });
+    }
+    expect(recovered?.pendingResume).toBeUndefined();
+
+    const restored = await harness2.session({ sessionId, resourceId: 'u' });
+    await expect(restored.lookupMessageResult(handle.id)).resolves.toMatchObject({
+      status: 'failed',
+      error: { code: 'harness.resume_recovery_stale' },
+    });
+    await harness2.shutdown();
   });
 
   it('classifies as "tool-suspension" when the chunk carries a suspendPayload field', async () => {
@@ -539,6 +704,598 @@ describe('Session — suspend capture on message()', () => {
 // ---------------------------------------------------------------------------
 
 describe('Session — respondToToolApproval / Suspension / Question / PlanApproval', () => {
+  it('captures a durable 10-minute interaction deadline', async () => {
+    const { harness, agent } = setup();
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      suspendPayload: { toolCallId: 'tc-deadline', toolName: 'shell', args: { cmd: 'ls' } },
+    });
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    await session.message({ content: 'go' });
+
+    const pending = session.getRecord().pendingResume!;
+    expect(pending.expiresAt).toBe(pending.requestedAt + 10 * 60 * 1_000);
+    expect(session.getDisplayState().pending?.expiresAt).toBe(pending.expiresAt);
+  });
+
+  it('fails closed with a typed corruption error when durable pending state has no valid expiresAt', async () => {
+    const { harness, agent } = setup();
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      suspendPayload: { toolCallId: 'tc-corrupt-deadline', toolName: 'shell', args: { cmd: 'ls' } },
+    });
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    await session.message({ content: 'go' });
+    const pending = session.getRecord().pendingResume!;
+    const validRecord = (session as any)._record;
+    const corruptPending = { ...validRecord.pendingResume };
+    delete corruptPending.expiresAt;
+    (session as any)._record = { ...validRecord, pendingResume: corruptPending };
+
+    const response = session.respondToToolApproval({
+      ...pendingResponseIdentity(pending),
+      responseId: 'corrupt-deadline-response',
+      approved: true,
+    });
+    await expect(response).rejects.toMatchObject({
+      name: HarnessSessionCorruptError.name,
+      code: 'harness.session_corrupt',
+      reason: 'pending_state_corrupt',
+    });
+    expect(agent.resumeCalls).toHaveLength(0);
+    (session as any)._record = validRecord;
+    await harness.shutdown();
+  });
+
+  it('atomically persists allow-always with response admission and deduplicates retries', async () => {
+    const { harness, agent } = setup();
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      suspendPayload: { toolCallId: 'tc-always', toolName: 'shell', args: { cmd: 'ls' } },
+    });
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    await session.message({ content: 'go' });
+    const pending = session.getRecord().pendingResume!;
+    const events: string[] = [];
+    session.subscribe(event => {
+      if (event.type === 'permission_granted') events.push(event.toolName ?? event.category ?? '');
+    });
+    agent.enqueueRun({ finishReason: 'stop', text: 'done' });
+
+    const response = {
+      ...pendingResponseIdentity(pending),
+      responseId: 'allow-always-response',
+      approved: true,
+      approvalScope: 'always' as const,
+    };
+    const first = await session.respondToToolApproval(response);
+    const duplicate = await session.respondToToolApproval(response);
+
+    expect(first).toMatchObject({ status: 'applied', duplicate: false });
+    expect(duplicate).toMatchObject({ status: 'applied', duplicate: true });
+    expect(session.permissions.getGrants().tools).toEqual(['shell']);
+    expect(session.getRecord().inboxResponseReceipts?.['allow-always-response']).toMatchObject({
+      approvalScope: 'always',
+      status: 'applied',
+    });
+    expect(events).toEqual(['shell']);
+    expect(agent.resumeCalls).toHaveLength(1);
+  });
+
+  it('lets Stop cancel execution after admission while retaining the committed allow-always policy grant', async () => {
+    const { harness, agent } = setup();
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      suspendPayload: { toolCallId: 'tc-stop-race', toolName: 'shell', args: { cmd: 'rm draft.tmp' } },
+    });
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    await session.message({ content: 'remove the temporary draft' });
+    const pending = session.getRecord().pendingResume!;
+    const events: string[] = [];
+    session.subscribe(event => {
+      if (event.type === 'permission_granted') events.push(event.toolName ?? event.category ?? '');
+    });
+
+    const originalFlush = (session as any)._flushUpdate.bind(session);
+    let releaseAdmission!: () => void;
+    let admissionCommitted!: () => void;
+    let gateAdmission = true;
+    const admissionCommittedPromise = new Promise<void>(resolve => (admissionCommitted = resolve));
+    const admissionGate = new Promise<void>(resolve => (releaseAdmission = resolve));
+    (session as any)._flushUpdate = async (updater: any) => {
+      const wasResumed = session.getRecord().pendingResume?.resumedAt !== undefined;
+      const result = await originalFlush(updater);
+      if (gateAdmission && !wasResumed && session.getRecord().pendingResume?.resumedAt !== undefined) {
+        gateAdmission = false;
+        admissionCommitted();
+        await admissionGate;
+      }
+      return result;
+    };
+
+    const response = session.respondToToolApproval({
+      ...pendingResponseIdentity(pending),
+      responseId: 'stop-race-response',
+      approved: true,
+      approvalScope: 'always',
+    });
+    await admissionCommittedPromise;
+    await session.abortActiveWork({ reason: 'user_requested', settleTimeoutMs: 1_000 });
+    releaseAdmission();
+
+    await expect(response).rejects.toBeInstanceOf(HarnessBusyError);
+    expect(agent.resumeCalls).toHaveLength(0);
+    expect(session.permissions.getGrants().tools).toEqual(['shell']);
+    expect(events).toEqual(['shell']);
+    expect(session.getRecord().pendingResume).toBeUndefined();
+    expect(session.getRecord().inboxResponseReceipts?.['stop-race-response']).toMatchObject({
+      status: 'failed',
+      retryable: false,
+    });
+    await harness.shutdown();
+  });
+
+  it('rejects allow-always on a denial before mutating durable grants', async () => {
+    const { harness, agent } = setup();
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      suspendPayload: { toolCallId: 'tc-deny-always', toolName: 'shell', args: { cmd: 'rm' } },
+    });
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    await session.message({ content: 'go' });
+
+    await expect(session.respondToToolApproval({ approved: false, approvalScope: 'always' })).rejects.toBeInstanceOf(
+      HarnessValidationError,
+    );
+    expect(session.permissions.getGrants().tools).toEqual([]);
+    expect(session.getRecord().pendingResume).toBeDefined();
+    expect(agent.resumeCalls).toHaveLength(0);
+  });
+
+  it('expires an unanswered interaction, aborts only that run, and rejects a late response durably', async () => {
+    const { harness, agent } = setup(undefined, { pendingInteractionTtlMs: 20 });
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      suspendPayload: { toolCallId: 'tc-expire', toolName: 'shell', args: { cmd: 'ls' } },
+    });
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    await session.message({ content: 'go' });
+    const pending = session.getRecord().pendingResume!;
+
+    await waitFor(() => session.getRecord().pendingResume === undefined, 'pending interaction expiry', 1_000);
+    expect(Object.values(session.getRecord().expiredPendingInteractions ?? {})).toContainEqual(
+      expect.objectContaining({
+        itemId: pending.itemId,
+        kind: 'tool-approval',
+        expiresAt: pending.expiresAt,
+        error: expect.objectContaining({ code: 'harness.pending_interaction_expired' }),
+      }),
+    );
+    await expect(
+      session.respondToToolApproval({
+        ...pendingResponseIdentity(pending),
+        responseId: 'late-response',
+        approved: true,
+      }),
+    ).rejects.toBeInstanceOf(HarnessPendingInteractionExpiredError);
+    expect(agent.resumeCalls).toHaveLength(0);
+    expect(session.isClosed).toBe(false);
+
+    // Expiry terminalizes the abandoned run, not the project/thread/session.
+    agent.enqueueRun({ finishReason: 'stop', text: 'recovered' });
+    await expect(session.message({ content: 'new turn' })).resolves.toMatchObject({ text: 'recovered' });
+  });
+
+  it('keeps the original deadline across shutdown and hydration', async () => {
+    const { harness, agent, storage } = setup(undefined, { pendingInteractionTtlMs: 20 });
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      suspendPayload: { toolCallId: 'tc-restart-expire', toolName: 'shell', args: { cmd: 'ls' } },
+    });
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    await session.message({ content: 'go' });
+    const sessionId = session.id;
+    const pending = session.getRecord().pendingResume!;
+    await harness.shutdown();
+    await new Promise(resolve => setTimeout(resolve, Math.max(0, pending.expiresAt! - Date.now() + 5)));
+
+    const harness2 = new Harness({
+      agents: { default: agent } as any,
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      // A much longer new config must not move the already-persisted deadline.
+      sessions: { storage, pendingInteractionTtlMs: 60_000 },
+    });
+    const restored = await harness2.session({ sessionId, resourceId: 'u' });
+
+    expect(restored.getRecord().pendingResume).toBeUndefined();
+    expect(Object.values(restored.getRecord().expiredPendingInteractions ?? {})[0]?.expiresAt).toBe(pending.expiresAt);
+    await expect(
+      restored.respondToToolApproval({
+        ...pendingResponseIdentity(pending),
+        responseId: 'late-after-restart',
+        approved: true,
+      }),
+    ).rejects.toBeInstanceOf(HarnessPendingInteractionExpiredError);
+    expect(agent.resumeCalls).toHaveLength(0);
+  });
+
+  it('cold-sweeps an overdue interaction after restart without requiring session hydration', async () => {
+    const { harness, agent, storage } = setup(undefined, { pendingInteractionTtlMs: 40 });
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      suspendPayload: { toolCallId: 'tc-cold-expire', toolName: 'shell', args: { cmd: 'ls' } },
+    });
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    await session.message({ content: 'go' });
+    const sessionId = session.id;
+    const pending = session.getRecord().pendingResume!;
+    await harness.shutdown();
+
+    const harness2 = new Harness({
+      agents: { default: new FakeAgent() } as any,
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      sessions: { storage, pendingInteractionTtlMs: 60_000 },
+    });
+
+    let stored = await storage.loadSession({ sessionId });
+    const deadline = Date.now() + 2_000;
+    while (stored?.pendingResume !== undefined && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+      stored = await storage.loadSession({ sessionId });
+    }
+
+    expect(stored?.pendingResume).toBeUndefined();
+    expect(harness2._internalLiveSessionCount()).toBe(0);
+    expect(Object.values(stored?.expiredPendingInteractions ?? {})).toContainEqual(
+      expect.objectContaining({
+        itemId: pending.itemId,
+        runId: pending.runId,
+        toolCallId: pending.toolCallId,
+        requestedAt: pending.requestedAt,
+        expiresAt: pending.expiresAt,
+      }),
+    );
+
+    const restored = await harness2.session({ sessionId, resourceId: 'u' });
+    await expect(
+      restored.respondToToolApproval({
+        ...pendingResponseIdentity(pending),
+        responseId: 'late-after-cold-sweep',
+        approved: true,
+      }),
+    ).rejects.toBeInstanceOf(HarnessPendingInteractionExpiredError);
+    await harness2.shutdown();
+  });
+
+  it('cold-terminalizes an admitted resume abandoned by a process crash without redispatching it', async () => {
+    const { harness, agent, storage } = setup(undefined, { pendingInteractionTtlMs: 60_000 });
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      suspendPayload: { toolCallId: 'tc-admitted-crash', toolName: 'shell', args: { cmd: 'publish' } },
+    });
+    const source = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    await source.message({ content: 'go' });
+    const sessionId = source.id;
+    const pending = source.getRecord().pendingResume!;
+    const responseId = 'response-admitted-before-crash';
+    const response = { approved: true };
+    const responseHash = (source as any)._computeInboxResponseHash({
+      kind: pending.kind,
+      itemId: pending.itemId,
+      runId: pending.runId,
+      pendingRequestedAt: pending.requestedAt,
+      response,
+      approvalScope: 'once',
+    });
+    await harness.shutdown();
+
+    const fixtureOwner = 'admitted-resume-crash-fixture';
+    const lease = await storage.acquireSessionLease({ sessionId, ownerId: fixtureOwner, ttlMs: 30_000 });
+    const stored = await storage.loadSession({ sessionId });
+    if (!stored?.pendingResume?.itemId) throw new Error('expected pending interaction fixture');
+    const resumedAt = Date.now() - 60_000;
+    await storage.saveSession(
+      {
+        ...stored,
+        ownerId: fixtureOwner,
+        leaseExpiresAt: lease.expiresAt,
+        pendingResume: {
+          ...stored.pendingResume,
+          resumedAt,
+          resumeRecoveryAt: resumedAt + 30_000,
+        },
+        inboxResponseReceipts: {
+          ...(stored.inboxResponseReceipts ?? {}),
+          [responseId]: {
+            responseId,
+            responseHash,
+            resumeAttemptId: responseId,
+            itemId: stored.pendingResume.itemId,
+            kind: stored.pendingResume.kind,
+            runId: stored.pendingResume.runId,
+            toolCallId: stored.pendingResume.toolCallId,
+            pendingRequestedAt: stored.pendingResume.requestedAt,
+            response,
+            approvalScope: 'once',
+            status: 'accepted',
+            acceptedAt: resumedAt,
+            updatedAt: resumedAt,
+          },
+        },
+      },
+      { ownerId: fixtureOwner, ifVersion: lease.version },
+    );
+    await storage.releaseSessionLease({ sessionId, ownerId: fixtureOwner });
+
+    const recoveryAgent = new FakeAgent();
+    const harness2 = new Harness({
+      agents: { default: recoveryAgent } as any,
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      sessions: { storage, pendingInteractionTtlMs: 60_000 },
+    });
+
+    let recovered = await storage.loadSession({ sessionId });
+    const deadline = Date.now() + 2_000;
+    while (recovered?.pendingResume !== undefined && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+      recovered = await storage.loadSession({ sessionId });
+    }
+
+    expect(recovered?.pendingResume).toBeUndefined();
+    expect(recovered?.inboxResponseReceipts?.[responseId]).toMatchObject({
+      status: 'failed',
+      retryable: false,
+      error: { code: 'harness.resume_recovery_stale' },
+    });
+    expect(recovered?.expiredPendingInteractions).toBeUndefined();
+    expect(recoveryAgent.resumeCalls).toHaveLength(0);
+    expect(harness2._internalLiveSessionCount()).toBe(0);
+
+    const restored = await harness2.session({ sessionId, resourceId: 'u' });
+    await expect(
+      restored.respondToToolApproval({
+        ...pendingResponseIdentity(pending),
+        responseId,
+        approved: true,
+        approvalScope: 'once',
+      }),
+    ).rejects.toThrow('resume was admitted but no live owner');
+    expect(recoveryAgent.resumeCalls).toHaveLength(0);
+    await harness2.shutdown();
+  });
+
+  it('cold expiry bypasses a maxLive slot occupied by an unrelated pinned session', async () => {
+    const { harness, agent, storage } = setup(undefined, { pendingInteractionTtlMs: 60_000 });
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      suspendPayload: { toolCallId: 'tc-pinned', toolName: 'shell', args: { cmd: 'one' } },
+    });
+    const pinnedSource = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    await pinnedSource.message({ content: 'one' });
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      suspendPayload: { toolCallId: 'tc-due-cold', toolName: 'shell', args: { cmd: 'two' } },
+    });
+    const dueSource = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    await dueSource.message({ content: 'two' });
+    const dueSessionId = dueSource.id;
+    await harness.shutdown();
+
+    const fixtureOwner = 'pending-expiry-fixture';
+    const lease = await storage.acquireSessionLease({
+      sessionId: dueSessionId,
+      ownerId: fixtureOwner,
+      ttlMs: 30_000,
+    });
+    const dueStored = await storage.loadSession({ sessionId: dueSessionId });
+    if (!dueStored?.pendingResume) throw new Error('expected due pending interaction fixture');
+    const dueExpiresAt = Date.now() - 1;
+    await storage.saveSession(
+      {
+        ...dueStored,
+        ownerId: fixtureOwner,
+        leaseExpiresAt: lease.expiresAt,
+        pendingResume: {
+          ...dueStored.pendingResume,
+          requestedAt: Math.min(dueStored.pendingResume.requestedAt, dueExpiresAt),
+          expiresAt: dueExpiresAt,
+        },
+      },
+      { ownerId: fixtureOwner, ifVersion: lease.version },
+    );
+    await storage.releaseSessionLease({ sessionId: dueSessionId, ownerId: fixtureOwner });
+
+    const harness2 = new Harness({
+      agents: { default: new FakeAgent() } as any,
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      sessions: { storage, maxLive: 1, pendingInteractionTtlMs: 60_000 },
+    });
+    // Hold the constructor's immediate sweep until the unrelated session has
+    // occupied the only live slot, then run one deterministic pass ourselves.
+    (harness2 as any)._stopPendingInteractionExpirySweepLoop();
+    (harness2 as any)._pendingInteractionExpirySweepRunning = true;
+    const pinned = await harness2.session({ sessionId: pinnedSource.id, resourceId: 'u' });
+    expect(pinned.getRecord().pendingResume).toBeDefined();
+    expect(harness2._internalLiveSessionCount()).toBe(1);
+    (harness2 as any)._pendingInteractionExpirySweepRunning = false;
+
+    await harness2._tickPendingInteractionExpirySweep();
+
+    const expired = await storage.loadSession({ sessionId: dueSessionId });
+    expect(expired?.pendingResume).toBeUndefined();
+    expect(harness2._internalLiveSessionCount()).toBe(1);
+    expect(pinned.getRecord().pendingResume).toBeDefined();
+    await harness2.shutdown();
+  });
+
+  it('fences a stale due-scan generation after the pending interaction is replaced', async () => {
+    const { harness, agent, storage } = setup(undefined, { pendingInteractionTtlMs: 60_000 });
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      suspendPayload: { toolCallId: 'tc-stale-generation', toolName: 'shell', args: { cmd: 'old' } },
+    });
+    const source = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    await source.message({ content: 'old' });
+    const sessionId = source.id;
+    await harness.shutdown();
+
+    const fixtureOwner = 'pending-expiry-aba-fixture';
+    const lease = await storage.acquireSessionLease({ sessionId, ownerId: fixtureOwner, ttlMs: 30_000 });
+    const stored = await storage.loadSession({ sessionId });
+    if (!stored?.pendingResume) throw new Error('expected pending interaction fixture');
+    const staleExpiresAt = Date.now() - 1;
+    await storage.saveSession(
+      {
+        ...stored,
+        ownerId: fixtureOwner,
+        leaseExpiresAt: lease.expiresAt,
+        pendingResume: {
+          ...stored.pendingResume,
+          requestedAt: Math.min(stored.pendingResume.requestedAt, staleExpiresAt),
+          expiresAt: staleExpiresAt,
+        },
+      },
+      { ownerId: fixtureOwner, ifVersion: lease.version },
+    );
+    const staleGeneration = (await storage.listDuePendingInteractions({ now: Date.now(), limit: 1 })).items[0];
+    if (!staleGeneration) throw new Error('expected stale due-scan generation');
+
+    const dueStored = await storage.loadSession({ sessionId });
+    if (!dueStored?.pendingResume) throw new Error('expected due pending interaction fixture');
+    const replacementRequestedAt = dueStored.pendingResume.requestedAt + 1;
+    await storage.saveSession(
+      {
+        ...dueStored,
+        ownerId: fixtureOwner,
+        leaseExpiresAt: lease.expiresAt,
+        pendingResume: {
+          ...dueStored.pendingResume,
+          itemId: 'replacement-item',
+          runId: 'replacement-run',
+          toolCallId: 'replacement-tool-call',
+          requestedAt: replacementRequestedAt,
+          expiresAt: Date.now() + 60_000,
+          resumedAt: undefined,
+          expiryStartedAt: undefined,
+        },
+      },
+      { ownerId: fixtureOwner, ifVersion: dueStored.version },
+    );
+    await storage.releaseSessionLease({ sessionId, ownerId: fixtureOwner });
+
+    const harness2 = new Harness({
+      agents: { default: new FakeAgent() } as any,
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      sessions: { storage, pendingInteractionTtlMs: 60_000 },
+    });
+    (harness2 as any)._stopPendingInteractionExpirySweepLoop();
+    (harness2 as any)._pendingInteractionExpirySweepRunning = true;
+    await (harness2 as any)._runPendingInteractionExpiryGeneration(storage, staleGeneration);
+    (harness2 as any)._pendingInteractionExpirySweepRunning = false;
+
+    const after = await storage.loadSession({ sessionId });
+    expect(after?.pendingResume).toMatchObject({
+      itemId: 'replacement-item',
+      runId: 'replacement-run',
+      toolCallId: 'replacement-tool-call',
+      requestedAt: replacementRequestedAt,
+    });
+    expect(after?.expiredPendingInteractions).toBeUndefined();
+    await harness2.shutdown();
+  });
+
+  it('retries a cold due row after a competing lease is released', async () => {
+    const { harness, agent, storage } = setup(undefined, { pendingInteractionTtlMs: 60_000 });
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      suspendPayload: { toolCallId: 'tc-lease-retry', toolName: 'shell', args: { cmd: 'ls' } },
+    });
+    const source = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    await source.message({ content: 'go' });
+    const sessionId = source.id;
+    await harness.shutdown();
+
+    const competingOwner = 'pending-expiry-competing-owner';
+    const lease = await storage.acquireSessionLease({ sessionId, ownerId: competingOwner, ttlMs: 30_000 });
+    const stored = await storage.loadSession({ sessionId });
+    if (!stored?.pendingResume) throw new Error('expected pending interaction fixture');
+    const retryExpiresAt = Date.now() - 1;
+    await storage.saveSession(
+      {
+        ...stored,
+        ownerId: competingOwner,
+        leaseExpiresAt: lease.expiresAt,
+        pendingResume: {
+          ...stored.pendingResume,
+          requestedAt: Math.min(stored.pendingResume.requestedAt, retryExpiresAt),
+          expiresAt: retryExpiresAt,
+        },
+      },
+      { ownerId: competingOwner, ifVersion: lease.version },
+    );
+
+    const harness2 = new Harness({
+      agents: { default: new FakeAgent() } as any,
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      sessions: { storage, pendingInteractionTtlMs: 60_000 },
+    });
+    (harness2 as any)._stopPendingInteractionExpirySweepLoop();
+    (harness2 as any)._pendingInteractionExpirySweepRunning = true;
+    await Promise.resolve();
+    (harness2 as any)._pendingInteractionExpirySweepRunning = false;
+
+    await harness2._tickPendingInteractionExpirySweep();
+    expect((await storage.loadSession({ sessionId }))?.pendingResume).toBeDefined();
+
+    await storage.releaseSessionLease({ sessionId, ownerId: competingOwner });
+    await harness2._tickPendingInteractionExpirySweep();
+    expect((await storage.loadSession({ sessionId }))?.pendingResume).toBeUndefined();
+    await harness2.shutdown();
+  });
+
+  it('shutdown waits for an in-flight cold sweep to leave storage ownership cleanly', async () => {
+    const { harness, storage } = setup();
+    (harness as any)._stopPendingInteractionExpirySweepLoop();
+    (harness as any)._pendingInteractionExpirySweepRunning = true;
+    await Promise.resolve();
+    (harness as any)._pendingInteractionExpirySweepRunning = false;
+
+    let releaseQuery!: () => void;
+    const queryGate = new Promise<void>(resolve => {
+      releaseQuery = resolve;
+    });
+    let markQueryEntered!: () => void;
+    const queryEntered = new Promise<void>(resolve => {
+      markQueryEntered = resolve;
+    });
+    const originalListDue = storage.listDuePendingInteractions.bind(storage);
+    (storage as any).listDuePendingInteractions = async (options: Parameters<typeof originalListDue>[0]) => {
+      markQueryEntered();
+      await queryGate;
+      return originalListDue(options);
+    };
+
+    const sweep = harness._tickPendingInteractionExpirySweep();
+    await queryEntered;
+    let shutdownSettled = false;
+    const shutdown = harness.shutdown().then(() => {
+      shutdownSettled = true;
+    });
+    await Promise.resolve();
+    expect(shutdownSettled).toBe(false);
+
+    releaseQuery();
+    await Promise.all([sweep, shutdown]);
+    expect(shutdownSettled).toBe(true);
+    expect((harness as any)._pendingInteractionExpirySweepInFlight).toBeUndefined();
+  });
+
   it('respondToToolApproval calls agent.resumeStream and clears pendingResume', async () => {
     const { harness, agent } = setup();
     agent.enqueueRun({
@@ -572,11 +1329,13 @@ describe('Session — respondToToolApproval / Suspension / Question / PlanApprov
     });
     const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
     await session.message({ content: 'go' });
+    const pending = session.getRecord().pendingResume!;
 
     agent.enqueueRun({ finishReason: 'stop', runId: 'run-deny', text: 'denied' });
     const receipt = await session.respondToToolApproval({
       approved: false,
       reason: 'needs review',
+      ...pendingResponseIdentity(pending),
       responseId: 'deny-response-1',
     });
 
@@ -693,6 +1452,7 @@ describe('Session — respondToToolApproval / Suspension / Question / PlanApprov
           toolName: 'ask_user',
           source: 'parent',
           requestedAt,
+          expiresAt: requestedAt + 10 * 60 * 1_000,
           modeId: 'default',
           runtimeDependencies: { modeId: 'default', agentId: 'old-agent', modelId: 'default' },
           payload: { question: 'pick' },
@@ -713,8 +1473,9 @@ describe('Session — respondToToolApproval / Suspension / Question / PlanApprov
     });
 
     const session = await harness.session({ sessionId });
+    const responseIdentity = pendingResponseIdentity(session.getRecord().pendingResume!);
     await expect(
-      session.respondToQuestion({ itemId: 'question:tc-Q', responseId: 'answer-1', answer: 'red' }),
+      session.respondToQuestion({ ...responseIdentity, responseId: 'answer-1', answer: 'red' }),
     ).rejects.toMatchObject({ code: 'harness.runtime_drift' });
 
     expect(agent.resumeCalls).toHaveLength(0);
@@ -755,6 +1516,7 @@ describe('Session — respondToToolApproval / Suspension / Question / PlanApprov
           toolName: 'ask_user',
           source: 'parent',
           requestedAt,
+          expiresAt: requestedAt + 10 * 60 * 1_000,
           modeId: 'default',
           runtimeDependencies: {
             modeId: 'default',
@@ -781,8 +1543,9 @@ describe('Session — respondToToolApproval / Suspension / Question / PlanApprov
     });
 
     const session = await harness.session({ sessionId });
+    const responseIdentity = pendingResponseIdentity(session.getRecord().pendingResume!);
     await expect(
-      session.respondToQuestion({ itemId: 'question:tc-Q-generation', responseId: 'answer-generation', answer: 'red' }),
+      session.respondToQuestion({ ...responseIdentity, responseId: 'answer-generation', answer: 'red' }),
     ).rejects.toMatchObject({ code: 'harness.runtime_drift' });
 
     expect(agent.resumeCalls).toHaveLength(0);
@@ -810,6 +1573,7 @@ describe('Session — respondToToolApproval / Suspension / Question / PlanApprov
     });
     const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
     await session.message({ content: 'go' });
+    const responseIdentity = pendingResponseIdentity(session.getRecord().pendingResume!);
 
     let releaseFullOutput!: () => void;
     const fullOutput = new Promise<unknown>(resolve => {
@@ -819,7 +1583,7 @@ describe('Session — respondToToolApproval / Suspension / Question / PlanApprov
       agent.resumeCalls.push({ resumeData, options });
       return { getFullOutput: () => fullOutput };
     };
-    const response = session.respondToQuestion({ itemId: 'question:tc-Q', responseId: 'answer-1', answer: 'red' });
+    const response = session.respondToQuestion({ ...responseIdentity, responseId: 'answer-1', answer: 'red' });
     await waitFor(() => session.isRunning(), 'active resume turn start');
     const idle = session.waitForIdle();
 
@@ -848,11 +1612,12 @@ describe('Session — respondToToolApproval / Suspension / Question / PlanApprov
     });
     const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
     await session.message({ content: 'go' });
+    const responseIdentity = pendingResponseIdentity(session.getRecord().pendingResume!);
 
     agent.enqueueRun({ finishReason: 'stop', runId: 'run-Q' });
-    const first = await session.respondToQuestion({ itemId: 'question:tc-Q', responseId: 'answer-1', answer: 'red' });
+    const first = await session.respondToQuestion({ ...responseIdentity, responseId: 'answer-1', answer: 'red' });
     const duplicate = await session.respondToQuestion({
-      itemId: 'question:tc-Q',
+      ...responseIdentity,
       responseId: 'answer-1',
       answer: 'red',
     });
@@ -875,6 +1640,7 @@ describe('Session — respondToToolApproval / Suspension / Question / PlanApprov
     });
     const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
     await session.message({ content: 'go' });
+    const responseIdentity = pendingResponseIdentity(session.getRecord().pendingResume!);
 
     let release!: () => void;
     const holdUntil = new Promise<void>(resolve => {
@@ -882,8 +1648,8 @@ describe('Session — respondToToolApproval / Suspension / Question / PlanApprov
     });
     agent.enqueueRun({ finishReason: 'stop', runId: 'run-Q', holdUntil });
 
-    const first = session.respondToQuestion({ itemId: 'question:tc-Q', responseId: 'answer-1', answer: 'red' });
-    const second = session.respondToQuestion({ itemId: 'question:tc-Q', responseId: 'answer-1', answer: 'red' });
+    const first = session.respondToQuestion({ ...responseIdentity, responseId: 'answer-1', answer: 'red' });
+    const second = session.respondToQuestion({ ...responseIdentity, responseId: 'answer-1', answer: 'red' });
 
     await new Promise(resolve => setImmediate(resolve));
     expect(agent.resumeCalls).toHaveLength(1);
@@ -907,6 +1673,7 @@ describe('Session — respondToToolApproval / Suspension / Question / PlanApprov
     });
     const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
     await session.message({ content: 'go' });
+    const responseIdentity = pendingResponseIdentity(session.getRecord().pendingResume!);
 
     let release!: () => void;
     const holdUntil = new Promise<void>(resolve => {
@@ -914,9 +1681,9 @@ describe('Session — respondToToolApproval / Suspension / Question / PlanApprov
     });
     agent.enqueueRun({ finishReason: 'stop', runId: 'run-Q', holdUntil });
 
-    const first = session.respondToQuestion({ itemId: 'question:tc-Q', responseId: 'answer-1', answer: 'red' });
+    const first = session.respondToQuestion({ ...responseIdentity, responseId: 'answer-1', answer: 'red' });
     const second = session
-      .respondToQuestion({ itemId: 'question:tc-Q', responseId: 'answer-2', answer: 'red' })
+      .respondToQuestion({ ...responseIdentity, responseId: 'answer-2', answer: 'red' })
       .catch(err => err);
 
     await new Promise(resolve => setImmediate(resolve));
@@ -943,6 +1710,7 @@ describe('Session — respondToToolApproval / Suspension / Question / PlanApprov
     });
     const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
     await session.message({ content: 'go' });
+    const responseIdentity = pendingResponseIdentity(session.getRecord().pendingResume!);
 
     let release!: () => void;
     const holdUntil = new Promise<void>(resolve => {
@@ -950,11 +1718,11 @@ describe('Session — respondToToolApproval / Suspension / Question / PlanApprov
     });
     agent.enqueueRun({ finishReason: 'stop', runId: 'run-Q', holdUntil });
 
-    const first = session.respondToQuestion({ itemId: 'question:tc-Q', responseId: 'answer-1', answer: 'red' });
+    const first = session.respondToQuestion({ ...responseIdentity, responseId: 'answer-1', answer: 'red' });
     await new Promise(resolve => setImmediate(resolve));
 
     const duplicate = await session.respondToQuestion({
-      itemId: 'question:tc-Q',
+      ...responseIdentity,
       responseId: 'answer-1',
       answer: 'red',
     });
@@ -979,12 +1747,13 @@ describe('Session — respondToToolApproval / Suspension / Question / PlanApprov
     });
     const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
     await session.message({ content: 'go' });
+    const responseIdentity = pendingResponseIdentity(session.getRecord().pendingResume!);
 
     agent.enqueueRun({ finishReason: 'stop', runId: 'run-Q' });
-    await session.respondToQuestion({ itemId: 'question:tc-Q', responseId: 'answer-1', answer: 'red' });
+    await session.respondToQuestion({ ...responseIdentity, responseId: 'answer-1', answer: 'red' });
 
     await expect(
-      session.respondToQuestion({ itemId: 'question:tc-Q', responseId: 'answer-1', answer: 'blue' }),
+      session.respondToQuestion({ ...responseIdentity, responseId: 'answer-1', answer: 'blue' }),
     ).rejects.toBeInstanceOf(HarnessInboxResponseConflictError);
     expect(agent.resumeCalls).toHaveLength(1);
   });
@@ -1002,6 +1771,7 @@ describe('Session — respondToToolApproval / Suspension / Question / PlanApprov
     });
     const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
     await session.message({ content: 'go' });
+    const responseIdentity = pendingResponseIdentity(session.getRecord().pendingResume!);
 
     agent.enqueueRun({
       finishReason: 'suspended',
@@ -1012,9 +1782,9 @@ describe('Session — respondToToolApproval / Suspension / Question / PlanApprov
         args: { question: 'pick again' },
       },
     });
-    const first = await session.respondToQuestion({ itemId: 'question:tc-Q', responseId: 'answer-1', answer: 'red' });
+    const first = await session.respondToQuestion({ ...responseIdentity, responseId: 'answer-1', answer: 'red' });
     const duplicate = await session.respondToQuestion({
-      itemId: 'question:tc-Q',
+      ...responseIdentity,
       responseId: 'answer-1',
       answer: 'red',
     });
@@ -1025,7 +1795,7 @@ describe('Session — respondToToolApproval / Suspension / Question / PlanApprov
     expect(agent.resumeCalls).toHaveLength(1);
   });
 
-  it('respondToQuestion marks accepted receipts failed when resumeStream throws', async () => {
+  it('makes a failed receipt retryable and reuses the same deterministic response id', async () => {
     const { harness, agent } = setup();
     agent.enqueueRun({
       finishReason: 'suspended',
@@ -1038,13 +1808,14 @@ describe('Session — respondToToolApproval / Suspension / Question / PlanApprov
     });
     const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
     await session.message({ content: 'go' });
+    const responseIdentity = pendingResponseIdentity(session.getRecord().pendingResume!);
 
     // §13.3f.1: respondTo* is a public §4.2b boundary, so a raw resumeStream
     // failure is REDACTED on the in-process rejection too — generic
     // `harness.internal` message, with the raw "FakeAgent: …" text preserved
     // local-only on `.cause`.
     const firstThrown = await session
-      .respondToQuestion({ itemId: 'question:tc-Q', responseId: 'answer-1', answer: 'red' })
+      .respondToQuestion({ ...responseIdentity, responseId: 'answer-1', answer: 'red' })
       .then(
         () => undefined,
         (e: unknown) => e,
@@ -1061,17 +1832,16 @@ describe('Session — respondToToolApproval / Suspension / Question / PlanApprov
     expect(session.getRecord().inboxResponseReceipts?.['answer-1']).toMatchObject({
       itemId: 'question:tc-Q',
       status: 'failed',
-      retryable: false,
+      retryable: true,
       error: { code: 'harness.internal', message: 'An internal harness error occurred' },
     });
-    // The idempotent retry replays the stored failure receipt (it does NOT
-    // re-invoke the agent), so it re-throws the receipt's redacted public
-    // projection — the generic `harness.internal` message — not the original
-    // raw agent text. resumeStream is not called a second time.
+    expect(session.getRecord().pendingResume?.resumedAt).toBeUndefined();
+
+    agent.enqueueRun({ finishReason: 'stop', runId: 'run-Q', text: 'recovered' });
     await expect(
-      session.respondToQuestion({ itemId: 'question:tc-Q', responseId: 'answer-1', answer: 'red' }),
-    ).rejects.toThrow('An internal harness error occurred');
-    expect(agent.resumeCalls).toHaveLength(1);
+      session.respondToQuestion({ ...responseIdentity, responseId: 'answer-1', answer: 'red' }),
+    ).resolves.toMatchObject({ status: 'applied', duplicate: false });
+    expect(agent.resumeCalls).toHaveLength(2);
   });
 
   it('reverts the at-least-once marker to a retryable waiting state when an in-process resume throws (F2)', async () => {
@@ -1148,15 +1918,16 @@ describe('Session — respondToToolApproval / Suspension / Question / PlanApprov
   });
 
   it('a failed resume followed by close shuts down cleanly with no stuck in-flight turn (F4)', async () => {
-    // Small closeTimeoutMs so the parked-suspension close path force-closes
-    // promptly instead of waiting the default 30s product deadline.
+    // A parked suspension is durable state, not process-local work. Closing
+    // must not wait for its HITL deadline merely because no user can answer it
+    // while the session is closing.
     const agent = new FakeAgent();
     const storage = new InMemoryHarness({ db: new InMemoryDB() });
     const harness = new Harness({
       agents: { default: agent } as any,
       modes: [{ id: 'default', agentId: 'default' }],
       defaultModeId: 'default',
-      sessions: { storage, closeTimeoutMs: 1 },
+      sessions: { storage },
     });
     agent.enqueueRun({
       finishReason: 'suspended',
@@ -1174,10 +1945,11 @@ describe('Session — respondToToolApproval / Suspension / Question / PlanApprov
     expect(session.getRecord().pendingResume?.resumedAt).toBeUndefined();
     expect(session.isRunning()).toBe(false);
 
-    // Closing a session parked on a suspension force-closes after the deadline;
-    // it completes cleanly (no stuck in-flight turn, no orphaned resume marker
-    // — the revert never masked the resume error nor wedged shutdown).
+    // Closing completes promptly without waiting the default 30-second close
+    // deadline (the revert never masked the resume error nor wedged shutdown).
+    const closeStartedAt = Date.now();
     await expect(session.close()).resolves.toBeUndefined();
+    expect(Date.now() - closeStartedAt).toBeLessThan(1_000);
     expect(session.isClosed).toBe(true);
     expect(session.isRunning()).toBe(false);
   });
@@ -1207,7 +1979,11 @@ describe('Session — respondToToolApproval / Suspension / Question / PlanApprov
     });
     await (session as any)._flushUpdate((prev: any) => ({
       ...prev,
-      pendingResume: { ...prev.pendingResume, resumedAt: staleAt },
+      pendingResume: {
+        ...prev.pendingResume,
+        resumedAt: staleAt,
+        resumeRecoveryAt: staleAt + 30_000,
+      },
       inboxResponseReceipts: {
         stale: {
           responseId: 'stale',
@@ -1227,15 +2003,15 @@ describe('Session — respondToToolApproval / Suspension / Question / PlanApprov
     }));
 
     await expect(
-      session.respondToQuestion({ itemId: pending.itemId, responseId: 'stale', answer: 'red' }),
-    ).rejects.toThrow('queued turn resume was marked in flight');
+      session.respondToQuestion({ ...pendingResponseIdentity(pending), responseId: 'stale', answer: 'red' }),
+    ).rejects.toThrow('resume was admitted but no live owner');
 
     expect(session.getRecord().pendingResume).toBeUndefined();
     expect(session.getRecord().inboxResponseReceipts?.stale).toMatchObject({ status: 'failed' });
 
     agent.enqueueRun({ finishReason: 'stop', text: 'fresh answer' });
     await expect(
-      session.respondToQuestion({ itemId: pending.itemId, responseId: 'fresh', answer: 'red' }),
+      session.respondToQuestion({ ...pendingResponseIdentity(pending), responseId: 'fresh', answer: 'red' }),
     ).rejects.toThrow('no pending resume on this session');
 
     expect(agent.resumeCalls).toHaveLength(0);
@@ -1255,14 +2031,19 @@ describe('Session — respondToToolApproval / Suspension / Question / PlanApprov
     const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
     await session.message({ content: 'go' });
     const pending = session.getRecord().pendingResume!;
+    const staleAt = Date.now() - 60_000;
     await (session as any)._flushUpdate((prev: any) => ({
       ...prev,
-      pendingResume: { ...prev.pendingResume, resumedAt: Date.now() - 60_000 },
+      pendingResume: {
+        ...prev.pendingResume,
+        resumedAt: staleAt,
+        resumeRecoveryAt: staleAt + 30_000,
+      },
     }));
 
     await expect(
-      session.respondToQuestion({ itemId: pending.itemId, responseId: 'fresh', answer: 'red' }),
-    ).rejects.toThrow('queued turn resume was marked in flight');
+      session.respondToQuestion({ ...pendingResponseIdentity(pending), responseId: 'fresh', answer: 'red' }),
+    ).rejects.toThrow('resume was admitted but no live owner');
 
     expect(session.getRecord().pendingResume).toBeUndefined();
     expect(session.getRecord().inboxResponseReceipts?.fresh).toBeUndefined();
@@ -1340,6 +2121,62 @@ describe('Session — respondToToolApproval / Suspension / Question / PlanApprov
     await session.respondToToolApproval({ approved: true });
     expect(session.getRecord().pendingResume).toBeUndefined();
     expect(agent.resumeCalls).toHaveLength(2);
+  });
+
+  it('accounts cumulative usage once across re-suspend and process restart', async () => {
+    const { harness, agent, storage } = setup();
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      runId: 'run-usage',
+      totalUsage: { inputTokens: 100, outputTokens: 20, totalTokens: 120 },
+      suspendPayload: { toolCallId: 'tc-usage-1', toolName: 'shell', args: {} },
+    });
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    await session.message({ content: 'go' });
+
+    expect(session.getTokenUsage()).toEqual({ promptTokens: 100, completionTokens: 20, totalTokens: 120 });
+    expect(session.getRecord().pendingResume?.accountedTokenUsage).toEqual({
+      promptTokens: 100,
+      completionTokens: 20,
+      totalTokens: 120,
+    });
+
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      runId: 'run-usage',
+      totalUsage: { inputTokens: 150, outputTokens: 35, totalTokens: 185 },
+      suspendPayload: { toolCallId: 'tc-usage-2', toolName: 'shell', args: {} },
+    });
+    await session.respondToToolApproval({ approved: true });
+
+    expect(session.getTokenUsage()).toEqual({ promptTokens: 150, completionTokens: 35, totalTokens: 185 });
+    expect(session.getRecord().pendingResume?.accountedTokenUsage).toEqual({
+      promptTokens: 150,
+      completionTokens: 35,
+      totalTokens: 185,
+    });
+
+    const sessionId = session.id;
+    await harness.shutdown();
+    const restartedAgent = new FakeAgent();
+    const restartedHarness = new Harness({
+      agents: { default: restartedAgent } as any,
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      sessions: { storage },
+    });
+    const restarted = await restartedHarness.session({ sessionId, resourceId: 'u' });
+    restartedAgent.enqueueRun({
+      finishReason: 'stop',
+      runId: 'run-usage',
+      totalUsage: { inputTokens: 180, outputTokens: 50, totalTokens: 230 },
+    });
+
+    await restarted.respondToToolApproval({ approved: true });
+
+    expect(restarted.getTokenUsage()).toEqual({ promptTokens: 180, completionTokens: 50, totalTokens: 230 });
+    expect(restarted.getRecord().pendingResume).toBeUndefined();
+    await restartedHarness.shutdown();
   });
 });
 
@@ -1452,10 +2289,15 @@ describe('Session — respond* rejection paths (all responders)', () => {
 
       // Simulate a crash mid-resume by poking resumedAt directly into storage.
       const rec = (await storage.loadSession({ sessionId: session.id }))!;
+      const resumedAt = Date.now();
       await storage.saveSession(
         {
           ...rec,
-          pendingResume: { ...rec.pendingResume!, resumedAt: Date.now() },
+          pendingResume: {
+            ...rec.pendingResume!,
+            resumedAt,
+            resumeRecoveryAt: resumedAt + 30_000,
+          },
         },
         { ownerId: session._internalOwnerId, ifVersion: rec.version },
       );
@@ -1479,7 +2321,9 @@ describe('Session — respond* rejection paths (all responders)', () => {
     enqueueSuspend(agent);
     const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
     await session.message({ content: 'go' });
+    const closeStartedAt = Date.now();
     await session.close();
+    expect(Date.now() - closeStartedAt).toBeLessThan(1_000);
 
     await expect(call(session)).rejects.toThrow(/closed/);
   });

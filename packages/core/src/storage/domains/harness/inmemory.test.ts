@@ -3743,17 +3743,56 @@ describe('InMemoryHarness plan tasks (§5.1k)', () => {
     const { sessionId, version } = await setupSession(storage);
     const a = await storage.createPlanTask({
       fence: fence(sessionId, version),
-      task: sampleTask(sessionId, { taskId: 't-a', idempotencyKey: 'idem-1', content: 'first' }),
+      task: sampleTask(sessionId, {
+        taskId: 't-a',
+        idempotencyKey: 'idem-1',
+        idempotencyInputHash: 'request-hash-a',
+        content: 'first',
+      }),
     });
     const b = await storage.createPlanTask({
       fence: fence(sessionId, version),
-      task: sampleTask(sessionId, { taskId: 't-b', idempotencyKey: 'idem-1', content: 'second' }),
+      task: sampleTask(sessionId, {
+        taskId: 't-b',
+        idempotencyKey: 'idem-1',
+        idempotencyInputHash: 'request-hash-b',
+        content: 'second',
+      }),
     });
     expect(b.taskId).toBe('t-a');
     expect(b.content).toBe('first');
+    expect(b.idempotencyInputHash).toBe('request-hash-a');
     expect(b.version).toBe(a.version);
     const listed = await storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
     expect(listed.tasks).toHaveLength(1);
+  });
+
+  it('rejects keyed direct and batched creates without a non-empty immutable input hash', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const { sessionId, version } = await setupSession(storage);
+    const missingHash = sampleTask(sessionId, { taskId: 'missing-hash', idempotencyKey: 'idem-missing' });
+    const emptyHash = sampleTask(sessionId, {
+      taskId: 'empty-hash',
+      idempotencyKey: 'idem-empty',
+      idempotencyInputHash: '',
+    });
+
+    await expect(storage.createPlanTask({ fence: fence(sessionId, version), task: missingHash })).rejects.toThrow(
+      /idempotencyInputHash must be a non-empty string/,
+    );
+    await expect(storage.createPlanTask({ fence: fence(sessionId, version), task: emptyHash })).rejects.toThrow(
+      /idempotencyInputHash must be a non-empty string/,
+    );
+    await expect(
+      storage.mutatePlanTasksForSession({
+        fence: fence(sessionId, version),
+        ops: [{ kind: 'create', task: missingHash }],
+      }),
+    ).rejects.toThrow(/idempotencyInputHash must be a non-empty string/);
+
+    await expect(storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 })).resolves.toEqual({
+      tasks: [],
+    });
   });
 
   it('updatePlanTask advances the per-row version and applies the patch', async () => {
@@ -3807,6 +3846,44 @@ describe('InMemoryHarness plan tasks (§5.1k)', () => {
     await expect(
       storage.createPlanTask({ fence: fence(sessionId, version, 'someone-else'), task: sampleTask(sessionId) }),
     ).rejects.toBeInstanceOf(HarnessStorageLeaseConflictError);
+  });
+
+  it('rejects every plan-task mutator after the owner lease expires', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const { sessionId, version } = await setupSession(storage);
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'existing' }),
+    });
+    await storage.renewSessionLease({ sessionId, ownerId: OWNER, ttlMs: -1 });
+
+    const expiredFence = fence(sessionId, version);
+    const writes = [
+      () =>
+        storage.createPlanTask({
+          fence: expiredFence,
+          task: sampleTask(sessionId, { taskId: 'new' }),
+        }),
+      () =>
+        storage.updatePlanTask({
+          fence: expiredFence,
+          taskId: 'existing',
+          ifVersion: 1,
+          patch: { status: 'completed' },
+        }),
+      () => storage.deletePlanTaskSubtree({ fence: expiredFence, rootTaskId: 'existing' }),
+      () =>
+        storage.mutatePlanTasksForSession({
+          fence: expiredFence,
+          ops: [{ kind: 'update', taskId: 'existing', ifVersion: 1, patch: { status: 'completed' } }],
+        }),
+    ];
+
+    for (const write of writes) {
+      await expect(write()).rejects.toBeInstanceOf(HarnessStorageLeaseConflictError);
+    }
+    const listed = await storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
+    expect(listed.tasks).toEqual([expect.objectContaining({ taskId: 'existing', status: 'pending', version: 1 })]);
   });
 
   it('the session-owner fence rejects a stale session version', async () => {
@@ -4159,5 +4236,111 @@ describe('InMemoryHarness plan tasks (§5.1k)', () => {
     await storage.deleteSession({ harnessName: 'default', sessionId });
     const listed = await storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
     expect(listed.tasks).toHaveLength(0);
+  });
+});
+
+describe('InMemoryHarness pending-interaction expiry discovery', () => {
+  it('keyset-pages expiry and admitted-resume recovery while excluding malformed, future, cleared, and closed rows', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const pendingSession = (
+      id: string,
+      expiresAt: number,
+      pendingOverrides: Partial<NonNullable<SessionRecord['pendingResume']>> = {},
+      sessionOverrides: Partial<SessionRecord> = {},
+    ) =>
+      sampleSession({
+        id,
+        resourceId: `resource-${id}`,
+        threadId: `thread-${id}`,
+        pendingResume: {
+          kind: 'tool-approval',
+          itemId: `item-${id}`,
+          runId: `run-${id}`,
+          toolCallId: `tool-call-${id}`,
+          toolName: 'write-file',
+          source: 'parent',
+          requestedAt: 10,
+          expiresAt,
+          ...pendingOverrides,
+        },
+        ...sessionOverrides,
+      });
+
+    const records = [
+      pendingSession('due-a', 100),
+      pendingSession('due-b', 100),
+      pendingSession('finalizing', 200, { expiryStartedAt: 201 }),
+      pendingSession(
+        'future',
+        201,
+        {},
+        {
+          expiredPendingInteractions: {
+            'generation-old': {
+              generationKey: 'generation-old',
+              itemId: 'item-old',
+              kind: 'question',
+              runId: 'run-old',
+              toolCallId: 'tool-old',
+              requestedAt: 1,
+              expiresAt: 2,
+              expiredAt: 3,
+              error: { code: 'harness.pending_interaction_expired', message: 'expired' },
+            },
+          },
+        },
+      ),
+      pendingSession('recovering', 1_000, { resumedAt: 50, resumeRecoveryAt: 150 }),
+      pendingSession('resumed', 50, { resumedAt: 51 }),
+      pendingSession('closed', 50, {}, { closedAt: 60 }),
+      sampleSession({ id: 'cleared', resourceId: 'resource-cleared', threadId: 'thread-cleared' }),
+    ];
+    for (const record of records) {
+      await storage.saveSession(record, { ownerId: 'owner', ifVersion: 0 });
+    }
+
+    const first = await storage.listDuePendingInteractions({ now: 200, limit: 2 });
+    expect(first).toEqual({
+      items: [
+        expect.objectContaining({ sessionId: 'due-a', itemId: 'item-due-a', dueAt: 100, expiresAt: 100 }),
+        expect.objectContaining({ sessionId: 'due-b', itemId: 'item-due-b', dueAt: 100, expiresAt: 100 }),
+      ],
+      nextCursor: { dueAt: 100, sessionId: 'due-b' },
+    });
+    await expect(storage.listDuePendingInteractions({ now: 200, limit: 2, cursor: first.nextCursor })).resolves.toEqual(
+      {
+        items: [
+          expect.objectContaining({
+            sessionId: 'recovering',
+            dueAt: 150,
+            expiresAt: 1_000,
+            resumedAt: 50,
+            resumeRecoveryAt: 150,
+          }),
+          expect.objectContaining({
+            harnessName: 'default',
+            sessionId: 'finalizing',
+            resourceId: 'resource-finalizing',
+            kind: 'tool-approval',
+            itemId: 'item-finalizing',
+            runId: 'run-finalizing',
+            toolCallId: 'tool-call-finalizing',
+            requestedAt: 10,
+            dueAt: 200,
+            expiresAt: 200,
+            expiryStartedAt: 201,
+          }),
+        ],
+      },
+    );
+    await expect(storage.loadSession({ sessionId: 'future' })).resolves.toMatchObject({
+      pendingResume: { expiresAt: 201 },
+      expiredPendingInteractions: {
+        'generation-old': { generationKey: 'generation-old', expiredAt: 3 },
+      },
+    });
+    await expect(storage.listDuePendingInteractions({ now: 200, limit: 0 })).rejects.toThrow(
+      'limit must be a positive safe integer',
+    );
   });
 });

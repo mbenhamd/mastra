@@ -502,6 +502,7 @@ describe('Supervisor Pattern Integration Tests', () => {
 
       // Bail after first delegation — only 1 iteration fires (the tool-call one)
       expect(iterationsAfterBail).toBe(1);
+      expect(callCount).toBe(1);
     });
   });
 

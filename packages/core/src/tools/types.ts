@@ -56,6 +56,54 @@ export type RequireToolApprovalFn = (ctx: ToolApprovalContext) => boolean | Prom
  */
 export type RequireToolApproval = boolean | RequireToolApprovalFn;
 
+/** Context supplied when a completed tool result is considered for terminal delivery. */
+export interface ToolTerminalResultContext {
+  toolName: string;
+  toolCallId: string;
+  args: unknown;
+  /** Number of tool calls selected in the provider turn. */
+  batchSize: number;
+  /** Zero-based position of this tool call in provider order. */
+  batchIndex: number;
+  runId?: string;
+  /** Aborts when the parent run is canceled or the terminal-policy budget expires. */
+  abortSignal: AbortSignal;
+}
+
+/**
+ * Opts a tool into ending the current agent run with its validated result.
+ *
+ * The policy is evaluated only after every tool call selected in the provider
+ * turn has settled. A false predicate keeps the ordinary repair loop running.
+ * Provider-executed, background, denied, suspended, or failed calls are never
+ * terminal candidates.
+ */
+export interface ToolTerminalResultConfig<TOutput = unknown, TResult = unknown> {
+  /** Return true only when the tool output is a complete caller-facing answer. Required to fail closed. */
+  isSuccess: (output: TOutput, context: ToolTerminalResultContext) => boolean | Promise<boolean>;
+  /** Project internal output to a deliberately small caller-facing value. */
+  project: (output: TOutput, context: ToolTerminalResultContext) => TResult | Promise<TResult>;
+  /** Validate the projected caller-facing value before terminal delivery. */
+  outputSchema: PublicSchema<TResult>;
+  /** Maximum UTF-8 bytes for the canonical JSON projection. Defaults to 16 KiB; maximum 64 KiB. */
+  maxBytes?: number;
+  /** Shared budget for success, projection, and schema validation. Defaults to 1 second; maximum 10 seconds. */
+  evaluationTimeoutMs?: number;
+}
+
+export interface TerminalToolResultItem<TResult = unknown> {
+  toolName: string;
+  toolCallId: string;
+  status: 'success';
+  value: TResult;
+}
+
+/** Ordered terminal results for one fully settled provider tool-call batch. */
+export interface TerminalToolResult<TResult = unknown> {
+  status: 'success';
+  items: TerminalToolResultItem<TResult>[];
+}
+
 /**
  * Context passed to a per-tool `needsApprovalFn` alongside the parsed tool input.
  * This is the same context surfaced to a tool-level `requireApproval` function.
@@ -175,6 +223,12 @@ export type ToolPayloadTransform<TInput = unknown, TOutput = unknown, TError = u
 export type ToolPayloadTransformPolicy = {
   transformToolPayload?: ToolPayloadTransformFunction;
   targets?: ToolPayloadTransformTarget[];
+  /**
+   * Explicitly permits direct terminal-tool delivery when this policy is
+   * display-only. Transcript transforms and policies without this opt-in keep
+   * the ordinary model continuation path.
+   */
+  terminalToolResultPolicy?: 'pass-through';
 };
 
 /**
@@ -453,6 +507,8 @@ export type CoreTool = {
   ) => void | PromiseLike<void>;
   /** Background task configuration for this tool. */
   background?: ToolBackgroundConfig;
+  /** Mastra-native terminal-result policy. Never sent to the model provider. */
+  terminalResult?: ToolTerminalResultConfig<any, any>;
 } & (
   | {
       type?: 'function' | undefined;
@@ -593,6 +649,7 @@ export interface ToolAction<
   TContext extends ToolExecutionContext<TSuspend, TResume, any> = ToolExecutionContext<TSuspend, TResume>,
   TId extends string = string,
   TRequestContext extends Record<string, any> | unknown = unknown,
+  TTerminalResult = TSchemaOut,
 > {
   id: TId;
   description: string;
@@ -707,4 +764,9 @@ export interface ToolAction<
    * When enabled, the tool can be executed in the background while the agent conversation continues.
    */
   background?: ToolBackgroundConfig;
+  /**
+   * End the agent run directly from a successful, bounded tool result instead
+   * of spending another provider call narrating the same value.
+   */
+  terminalResult?: ToolTerminalResultConfig<TSchemaOut, TTerminalResult>;
 }

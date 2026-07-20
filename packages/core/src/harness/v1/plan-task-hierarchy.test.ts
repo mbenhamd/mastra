@@ -12,6 +12,7 @@ import { describe, expect, it } from 'vitest';
 import type { HarnessPlanTask, HarnessPlanTaskStatus } from '../../storage/domains/harness/types';
 import {
   assertNoBlockedByCycle,
+  assertNoPlanTaskCombinedCycle,
   assertNoParentCycle,
   assertSingleInProgress,
   deriveStatus,
@@ -101,14 +102,14 @@ describe('deriveStatus — ratified precedence', () => {
 });
 
 describe('hasUnsatisfiedDep', () => {
-  it('pending/in_progress/blocked dep blocks; completed/cancelled/failed dep releases', () => {
+  it('only completed releases; pending/in_progress/blocked/cancelled/failed block', () => {
     const t = task({ taskId: 'x', blockedBy: ['d'] });
     expect(hasUnsatisfiedDep(t, statusOfFrom({ d: 'pending' }))).toBe(true);
     expect(hasUnsatisfiedDep(t, statusOfFrom({ d: 'in_progress' }))).toBe(true);
     expect(hasUnsatisfiedDep(t, statusOfFrom({ d: 'blocked' }))).toBe(true);
     expect(hasUnsatisfiedDep(t, statusOfFrom({ d: 'completed' }))).toBe(false);
-    expect(hasUnsatisfiedDep(t, statusOfFrom({ d: 'cancelled' }))).toBe(false);
-    expect(hasUnsatisfiedDep(t, statusOfFrom({ d: 'failed' }))).toBe(false);
+    expect(hasUnsatisfiedDep(t, statusOfFrom({ d: 'cancelled' }))).toBe(true);
+    expect(hasUnsatisfiedDep(t, statusOfFrom({ d: 'failed' }))).toBe(true);
   });
   it('no deps → never blocked', () => {
     expect(hasUnsatisfiedDep(task({ taskId: 'x' }), statusOfFrom({}))).toBe(false);
@@ -281,6 +282,34 @@ describe('assertNoBlockedByCycle', () => {
   });
 });
 
+describe('assertNoPlanTaskCombinedCycle', () => {
+  it('rejects a child blocked by its own parent (implicit rollup cycle)', () => {
+    const tasks = [
+      task({ taskId: 'parent' }),
+      task({ taskId: 'child', parentTaskId: 'parent', blockedBy: ['parent'] }),
+    ];
+    expect(() => assertNoPlanTaskCombinedCycle(tasks, 'blockedBy')).toThrow(HarnessPlanTaskCycleError);
+  });
+
+  it('rejects a transitive cycle spanning hierarchy and blockedBy edges', () => {
+    const tasks = [
+      task({ taskId: 'root' }),
+      task({ taskId: 'middle', parentTaskId: 'root' }),
+      task({ taskId: 'leaf', parentTaskId: 'middle', blockedBy: ['root'] }),
+    ];
+    expect(() => assertNoPlanTaskCombinedCycle(tasks, 'blockedBy')).toThrow(HarnessPlanTaskCycleError);
+  });
+
+  it('allows a dependency on a completed task outside the parent chain', () => {
+    const tasks = [
+      task({ taskId: 'dependency', status: 'completed' }),
+      task({ taskId: 'parent' }),
+      task({ taskId: 'child', parentTaskId: 'parent', blockedBy: ['dependency'] }),
+    ];
+    expect(() => assertNoPlanTaskCombinedCycle(tasks, 'blockedBy')).not.toThrow();
+  });
+});
+
 // ---------------------------------------------------------------------------
 // rootOf + single in_progress
 // ---------------------------------------------------------------------------
@@ -344,6 +373,30 @@ describe('assertSingleInProgress', () => {
     const statusOf = (id: string) => (id === 'c2' ? 'in_progress' : (idx.byId.get(id)?.status ?? 'pending'));
     const sourceOf = (id: string) => idx.byId.get(id)?.statusSource ?? ('explicit' as const);
     expect(() => assertSingleInProgress(idx, 'c2', statusOf, sourceOf)).toThrow(HarnessPlanTaskInProgressConflictError);
+  });
+
+  it('ignores delegated background work when admitting one foreground focus', () => {
+    const tree = [
+      task({ taskId: 'root', status: 'in_progress', statusSource: 'derived' }),
+      task({
+        taskId: 'delegated',
+        parentTaskId: 'root',
+        status: 'in_progress',
+        statusSource: 'explicit',
+        delegatedSubagentSessionId: 'child-session',
+      }),
+      task({ taskId: 'foreground', parentTaskId: 'root' }),
+    ];
+    const idx = indexPlanTasks(tree);
+    expect(() =>
+      assertSingleInProgress(
+        idx,
+        'foreground',
+        id => (id === 'foreground' ? 'in_progress' : (idx.byId.get(id)?.status ?? 'pending')),
+        id => idx.byId.get(id)?.statusSource ?? 'explicit',
+        id => idx.byId.get(id)?.delegatedSubagentSessionId !== undefined,
+      ),
+    ).not.toThrow();
   });
 });
 
@@ -409,16 +462,16 @@ describe('blockedBy — diamond graphs', () => {
   });
 });
 
-describe('blockedBy — a failed/cancelled dependency RELEASES the block', () => {
+describe('blockedBy — only a successful dependency releases the block', () => {
   const dependent = task({ taskId: 'x', blockedBy: ['dep'] });
 
-  it('a failed dependency unblocks (childless → pending, not blocked)', () => {
-    expect(deriveStatus(dependent, [], statusOfFrom({ dep: 'failed' }))).toBe('pending');
-    expect(hasUnsatisfiedDep(dependent, statusOfFrom({ dep: 'failed' }))).toBe(false);
+  it('a failed dependency keeps downstream work blocked', () => {
+    expect(deriveStatus(dependent, [], statusOfFrom({ dep: 'failed' }))).toBe('blocked');
+    expect(hasUnsatisfiedDep(dependent, statusOfFrom({ dep: 'failed' }))).toBe(true);
   });
 
-  it('a cancelled dependency unblocks too', () => {
-    expect(deriveStatus(dependent, [], statusOfFrom({ dep: 'cancelled' }))).toBe('pending');
+  it('a cancelled dependency keeps downstream work blocked too', () => {
+    expect(deriveStatus(dependent, [], statusOfFrom({ dep: 'cancelled' }))).toBe('blocked');
   });
 
   it('a still-pending dependency keeps it blocked', () => {

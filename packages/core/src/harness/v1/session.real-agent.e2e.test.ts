@@ -49,6 +49,8 @@ import type { Event, EventCallback, SubscribeOptions } from '../../events/types'
 import { Mastra } from '../../mastra';
 import { MockMemory } from '../../memory/mock';
 import { InMemoryStore } from '../../storage';
+import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
+import { InMemoryDB } from '../../storage/domains/inmemory-db';
 import { createTool } from '../../tools';
 import { askUser } from '../../tools/builtin';
 
@@ -98,6 +100,36 @@ function toolCallStream(toolCallId: string, toolName: string, inputJson: string)
   return convertArrayToReadableStream([
     { type: 'stream-start', warnings: [] },
     { type: 'response-metadata', id: 'id-tool', modelId: 'mock-model-id', timestamp: new Date(0) },
+    { type: 'tool-call', toolCallId, toolName, input: inputJson, providerExecuted: false },
+    { type: 'finish', finishReason: 'tool-calls', usage: testUsage },
+  ]);
+}
+
+/**
+ * A raw provider stream that emits optional reasoning and visible text before
+ * a terminal tool call. This mirrors a specialist showing live progress while
+ * still ending through Harness's required structured outcome contract.
+ */
+function reasoningTextToolCallStream(
+  reasoningDeltas: string[],
+  textDeltas: string[],
+  toolCallId: string,
+  toolName: string,
+  inputJson: string,
+) {
+  return convertArrayToReadableStream([
+    { type: 'stream-start', warnings: [] },
+    { type: 'response-metadata', id: 'id-text-tool', modelId: 'mock-model-id', timestamp: new Date(0) },
+    ...(reasoningDeltas.length === 0
+      ? []
+      : [
+          { type: 'reasoning-start', id: 'reason-1' },
+          ...reasoningDeltas.map(delta => ({ type: 'reasoning-delta', id: 'reason-1', delta })),
+          { type: 'reasoning-end', id: 'reason-1' },
+        ]),
+    { type: 'text-start', id: 'text-1' },
+    ...textDeltas.map(delta => ({ type: 'text-delta', id: 'text-1', delta })),
+    { type: 'text-end', id: 'text-1' },
     { type: 'tool-call', toolCallId, toolName, input: inputJson, providerExecuted: false },
     { type: 'finish', finishReason: 'tool-calls', usage: testUsage },
   ]);
@@ -423,6 +455,96 @@ describe('Harness v1 real-agent E2E — S2 tool round-trip', () => {
       expect(Array.isArray(result.toolCalls)).toBe(true);
       expect(result.toolCalls.length).toBeGreaterThan(0);
       expect(result.toolResults.length).toBeGreaterThan(0);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('uses display transforms for both live and durable Harness tool events', async () => {
+    const privateTool = createTool({
+      id: 'privateTool',
+      description: 'returns a private payload',
+      inputSchema: z.object({ secret: z.string(), label: z.string() }),
+      execute: async () => ({ secretOutput: 'PF_PRIVATE_TOOL_OUTPUT', count: 3 }),
+    });
+    let callCount = 0;
+    const model = new MockLanguageModelV2({
+      doStream: async () => {
+        callCount++;
+        return callCount === 1
+          ? {
+              rawCall: { rawPrompt: null, rawSettings: {} },
+              warnings: [],
+              stream: toolCallStream(
+                'private-call-1',
+                'privateTool',
+                '{"secret":"PF_PRIVATE_TOOL_INPUT","label":"Safe label"}',
+              ),
+            }
+          : {
+              rawCall: { rawPrompt: null, rawSettings: {} },
+              warnings: [],
+              stream: textStream(['done']),
+            };
+      },
+    });
+    const agent = new Agent({
+      id: 'default',
+      name: 'default',
+      instructions: 'use privateTool',
+      model,
+      tools: { privateTool },
+      transform: {
+        targets: ['display'],
+        terminalToolResultPolicy: 'pass-through',
+        transformToolPayload: context => {
+          if (context.phase === 'input-available') return { label: 'Safe label' };
+          if (context.phase === 'output-available') return { success: true, summary: 'Safe result', count: 3 };
+          return undefined;
+        },
+      },
+    });
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const harness = new Harness({
+      agents: { default: agent } as any,
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      sessions: { storage },
+    });
+    try {
+      const session = await harness.session({ resourceId: 'u-redacted-tool', threadId: { fresh: true } });
+      const events: HarnessEvent[] = [];
+      session.subscribe(event => events.push(event));
+      await session.message({ content: 'run the private tool' });
+      await session._flushEventPersistence();
+
+      const liveToolEvents = events.filter(event => event.type === 'tool_start' || event.type === 'tool_end');
+      expect(liveToolEvents).toEqual([
+        expect.objectContaining({ type: 'tool_start', input: { label: 'Safe label' } }),
+        expect.objectContaining({
+          type: 'tool_end',
+          output: { success: true, summary: 'Safe result', count: 3 },
+        }),
+      ]);
+      const replayState = await storage.getSessionEventReplayState({
+        sessionId: session.id,
+        resourceId: session.resourceId,
+        threadId: session.threadId,
+      });
+      expect(replayState).not.toBeNull();
+      const rows = await storage.listSessionEvents({
+        sessionId: session.id,
+        resourceId: session.resourceId,
+        threadId: session.threadId,
+        epoch: replayState!.epoch,
+        afterSequence: 0,
+        limit: 100,
+      });
+      const durableToolEvents = rows
+        .map(row => row.event)
+        .filter(event => event.type === 'tool_start' || event.type === 'tool_end');
+      expect(durableToolEvents).toEqual(liveToolEvents);
+      expect(JSON.stringify({ liveToolEvents, durableToolEvents })).not.toContain('PF_PRIVATE_TOOL');
     } finally {
       await harness.shutdown();
     }
@@ -1095,9 +1217,21 @@ describe('Harness v1 real-agent E2E — S3 approval suspend/resume', () => {
         session.subscribe(event => events.push(event));
         const suspended = (await session.message({ content: 'request first approval' })) as any;
         expect(suspended.finishReason).toBe('suspended');
+        const pending = session.getRecord().pendingResume!;
 
         const rejection = await session
-          .respondToToolApproval({ approved: true, ...(responseId !== undefined ? { responseId } : {}) })
+          .respondToToolApproval({
+            approved: true,
+            ...(responseId !== undefined
+              ? {
+                  responseId,
+                  itemId: pending.itemId ?? pending.toolCallId,
+                  runId: pending.runId,
+                  toolCallId: pending.toolCallId,
+                  pendingRequestedAt: pending.requestedAt,
+                }
+              : {}),
+          })
           .then(
             () => undefined,
             error => error,
@@ -1689,12 +1823,16 @@ describe('Harness v1 real-agent E2E — S4 settlement evidence', () => {
 
       await (session as any)._flushUpdate((record: any) => ({
         ...record,
-        pendingResume: { ...record.pendingResume, resumedAt: Date.now() - 30_001 },
+        pendingResume: {
+          ...record.pendingResume,
+          resumedAt: Date.now() - 30_001,
+          resumeRecoveryAt: Date.now() - 1,
+        },
       }));
       await session._kickQueueDrain();
 
       expect(await firstOutcome).toEqual({
-        error: expect.objectContaining({ code: 'harness.queue_resume_recovery_stale' }),
+        error: expect.objectContaining({ code: 'harness.resume_recovery_stale' }),
       });
       await expect(secondOutcome).resolves.toMatchObject({ text: 'unexpected retry' });
       expect(session.getRecord().pendingResume).toBeUndefined();
@@ -2004,6 +2142,12 @@ describe('Harness v1 real-agent E2E — S7 real subagent streaming', () => {
         return { topic: (input as { topic: string }).topic, value: 42, fetchedAt: new Date(0) };
       },
     });
+    const continueAfterSummary = createTool({
+      id: 'continueAfterSummary',
+      description: 'Acknowledge that the visible specialist summary streamed before the terminal report.',
+      inputSchema: z.object({}),
+      execute: async () => ({ acknowledged: true }),
+    });
 
     // --- REAL child agent: model emits a real tool-call, then reasoning+text --
     const childDeltas = ['The ', 'answer ', 'is ', '42.'];
@@ -2019,12 +2163,41 @@ describe('Harness v1 real-agent E2E — S7 real subagent streaming', () => {
             stream: childToolCallStream('child-tc-1', 'lookupFact', '{"topic":"the answer"}'),
           };
         }
-        // The child's post-tool turn streams reasoning, then its summary text —
-        // exercising both subagent_reasoning_delta (GAP-B) and subagent_text_delta.
+        if (childCall === 2) {
+          // Visible progress is a non-terminal step. The required outcome tool
+          // must be called by itself on the following provider step.
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: reasoningTextToolCallStream(
+              childReasoning,
+              childDeltas,
+              'child-progress-tc',
+              'continueAfterSummary',
+              '{}',
+            ),
+          };
+        }
         return {
           rawCall: { rawPrompt: null, rawSettings: {} },
           warnings: [],
-          stream: reasoningTextStream(childReasoning, childDeltas),
+          stream: toolCallStream(
+            'child-outcome-tc',
+            'report_subagent_outcome',
+            JSON.stringify({
+              outcome: 'completed',
+              summary: childDeltas.join(''),
+              evidence: [
+                {
+                  kind: 'tool-result',
+                  toolName: 'lookupFact',
+                  toolCallId: 'child-tc-1',
+                  status: 'success',
+                  description: 'The fact lookup completed successfully.',
+                },
+              ],
+            }),
+          ),
         };
       },
     });
@@ -2033,10 +2206,10 @@ describe('Harness v1 real-agent E2E — S7 real subagent streaming', () => {
       name: 'child-agent',
       instructions: 'use lookupFact then summarize',
       model: childModel,
-      tools: { lookupFact: childTool },
+      tools: { lookupFact: childTool, continueAfterSummary },
     });
 
-    // --- REAL parent agent: model emits a spawn_subagent tool-call, then text -
+    // --- REAL parent agent: one model turn delegates; child answer is terminal -
     let parentCall = 0;
     const parentModel = new MockLanguageModelV2({
       doStream: async () => {
@@ -2048,28 +2221,31 @@ describe('Harness v1 real-agent E2E — S7 real subagent streaming', () => {
             stream: toolCallStream(
               'parent-spawn-tc',
               'spawn_subagent',
-              JSON.stringify({ agentType: 'explore', task: 'Find the answer to the question.' }),
+              JSON.stringify({
+                agentType: 'explore',
+                task: 'Find the answer to the question.',
+                delivery: 'final',
+              }),
             ),
           };
         }
-        return {
-          rawCall: { rawPrompt: null, rawSettings: {} },
-          warnings: [],
-          stream: textStream(['Delegated ', 'and done.']),
-        };
+        throw new Error('redundant parent model continuation must not run');
       },
     });
+    const storage = new InMemoryStore();
+    const parentMemory = new MockMemory({ storage });
     const parentAgent = new Agent({
       id: 'parent-agent',
       name: 'parent-agent',
       instructions: 'delegate to a subagent',
       model: parentModel,
+      memory: parentMemory,
     });
 
     // --- REAL harness wiring both real agents + a real subagent type --------
     const harness = new Harness({
       agents: { 'parent-agent': parentAgent, 'child-agent': childAgent } as any,
-      storage: new InMemoryStore(),
+      storage,
       modes: [
         { id: 'default', agentId: 'parent-agent' },
         { id: 'explore-mode', agentId: 'child-agent' },
@@ -2096,8 +2272,20 @@ describe('Harness v1 real-agent E2E — S7 real subagent streaming', () => {
 
       const result = (await session.message({ content: 'answer my question via a subagent' })) as any;
 
-      // The parent's real loop ran the spawn tool and continued to final text.
-      expect(result.text).toBe('Delegated and done.');
+      // The parent's real loop ran the spawn tool and delivered the specialist
+      // answer directly, without paying for a second parent model request.
+      expect(parentCall).toBe(1);
+      expect(result.text).toBe(childDeltas.join(''));
+      expect(result.terminalToolResult?.items).toEqual([
+        expect.objectContaining({
+          toolName: 'spawn_subagent',
+          toolCallId: 'parent-spawn-tc',
+          value: expect.objectContaining({
+            kind: 'subagent-direct-answer',
+            text: childDeltas.join(''),
+          }),
+        }),
+      ]);
       expect(Array.isArray(result.toolCalls)).toBe(true);
       expect(result.toolCalls.some((c: any) => (c.toolName ?? c.payload?.toolName) === 'spawn_subagent')).toBe(true);
 
@@ -2159,7 +2347,14 @@ describe('Harness v1 real-agent E2E — S7 real subagent streaming', () => {
         | { toolName: string; innerToolCallId: string; input: any; parentId: string; depth: number }
         | undefined;
       const subToolEnd = events.find(e => e.type === 'subagent_tool_end') as
-        | { toolName: string; innerToolCallId: string; output: any; isError: boolean; parentId: string }
+        | {
+            toolName: string;
+            innerToolCallId: string;
+            output: any;
+            isError: boolean;
+            durationMs?: number;
+            parentId: string;
+          }
         | undefined;
       expect(subToolStart).toBeDefined();
       expect(subToolStart!.toolName).toBe('lookupFact');
@@ -2178,6 +2373,8 @@ describe('Harness v1 real-agent E2E — S7 real subagent streaming', () => {
       // JSON-safe projection: the child tool's Date crossed as an ISO string.
       expect(subToolEnd!.output.fetchedAt).toBe(new Date(0).toISOString());
       expect(subToolEnd!.output.fetchedAt).not.toBeInstanceOf(Date);
+      expect(typeof subToolEnd!.durationMs).toBe('number');
+      expect(subToolEnd!.durationMs).toBeGreaterThanOrEqual(0);
 
       // --- subagent_end -------------------------------------------------------
       const subEnd = events.find(e => e.type === 'subagent_end') as
@@ -2189,8 +2386,8 @@ describe('Harness v1 real-agent E2E — S7 real subagent streaming', () => {
       expect(subEnd!.durationMs).toBeGreaterThanOrEqual(0);
       expect(subEnd!.parentId).toBe(session.id);
       expect(subEnd!.depth).toBe(1);
-      // The child's real FullOutput surfaced as the subagent's output; its text
-      // is the concatenation of the child's real streamed deltas.
+      // The bounded child summary preserves the final text without copying the
+      // child's raw FullOutput/provider/tool bodies into the parent ledger.
       expect((subEnd!.output as { text?: string }).text).toBe(childDeltas.join(''));
 
       // --- Ordering: start → (child events) → end ----------------------------
@@ -2211,9 +2408,135 @@ describe('Harness v1 real-agent E2E — S7 real subagent streaming', () => {
       expect(subTypes.filter(t => t === 'subagent_start')).toHaveLength(1);
       expect(subTypes.filter(t => t === 'subagent_end')).toHaveLength(1);
 
-      // The child agent's model was actually driven twice (tool round-trip +
-      // summary), proving the REAL child loop ran, not a fabricated output.
-      expect(childCall).toBe(2);
+      const directAnswerEvents = events.filter(e => e.type === 'text_delta') as Array<{ delta: string }>;
+      expect(directAnswerEvents.map(event => event.delta)).toEqual([childDeltas.join('')]);
+
+      const liveMessages = await session.listMessages();
+      const persistedAnswerOccurrences = liveMessages
+        .flatMap(message => message.content)
+        .filter(part => part.type === 'text' && part.text === childDeltas.join(''));
+      expect(persistedAnswerOccurrences).toHaveLength(1);
+
+      // The child ran three real provider steps: lookup, visible summary, then
+      // the report-only terminal action.
+      expect(childCall).toBe(3);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('direct-delivers a child domain terminal after one parent call, one child call, and one tool execution', async () => {
+    let sandboxExecutions = 0;
+    const terminalAnalysis = createTool({
+      id: 'runAnalysis',
+      description: 'compute and return the complete answer',
+      inputSchema: z.object({ expression: z.string() }),
+      terminalResult: {
+        isSuccess: output => output.success,
+        project: output => ({ text: output.answer }),
+        outputSchema: z.object({ text: z.string() }),
+      },
+      execute: async () => {
+        sandboxExecutions++;
+        return { success: true, answer: 'The computed total is **10**.' };
+      },
+    });
+    let childCalls = 0;
+    const childModel = new MockLanguageModelV2({
+      doStream: async () => {
+        childCalls++;
+        if (childCalls > 1) throw new Error('redundant child narration turn must not run');
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream: toolCallStream('analysis-call-1', 'runAnalysis', '{"expression":"4 + 6"}'),
+        };
+      },
+    });
+    const childAgent = new Agent({
+      id: 'analysis-agent',
+      name: 'analysis-agent',
+      instructions: 'run the analysis tool once',
+      model: childModel,
+      tools: { runAnalysis: terminalAnalysis },
+    });
+    let parentCalls = 0;
+    const parentModel = new MockLanguageModelV2({
+      doStream: async () => {
+        parentCalls++;
+        if (parentCalls > 1) throw new Error('redundant parent narration turn must not run');
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream: toolCallStream(
+            'analysis-spawn-1',
+            'spawn_subagent',
+            JSON.stringify({
+              agentType: 'analysis',
+              task: 'Compute 4 + 6 and return the complete result.',
+              delivery: 'final',
+            }),
+          ),
+        };
+      },
+    });
+    const parentAgent = new Agent({
+      id: 'parent-analysis-agent',
+      name: 'parent-analysis-agent',
+      instructions: 'delegate exact calculations',
+      model: parentModel,
+    });
+    const harness = new Harness({
+      agents: {
+        'parent-analysis-agent': parentAgent,
+        'analysis-agent': childAgent,
+      } as any,
+      storage: new InMemoryStore(),
+      modes: [
+        { id: 'default', agentId: 'parent-analysis-agent' },
+        { id: 'analysis-mode', agentId: 'analysis-agent' },
+      ],
+      defaultModeId: 'default',
+      subagents: {
+        maxDepth: 2,
+        types: {
+          analysis: {
+            agentId: 'analysis-agent',
+            modeId: 'analysis-mode',
+            description: 'Exact bounded analysis',
+            defaultModelId: 'openai/gpt-4o-mini',
+            workspace: 'inherit',
+          },
+        },
+      },
+    });
+    try {
+      const session = await harness.session({ resourceId: 'u-terminal-analysis', threadId: { fresh: true } });
+      const events: HarnessEvent[] = [];
+      session.subscribe(event => events.push(event));
+      const result = (await session.message({ content: 'What is 4 + 6?' })) as any;
+
+      expect({ parentCalls, childCalls, sandboxExecutions }).toEqual({
+        parentCalls: 1,
+        childCalls: 1,
+        sandboxExecutions: 1,
+      });
+      expect(result.text).toBe('The computed total is **10**.');
+      expect(result.terminalToolResult?.items).toEqual([
+        expect.objectContaining({
+          toolName: 'spawn_subagent',
+          value: expect.objectContaining({
+            kind: 'subagent-direct-answer',
+            text: 'The computed total is **10**.',
+          }),
+        }),
+      ]);
+      expect(events.filter(event => event.type === 'subagent_tool_start')).toHaveLength(1);
+      expect(events.filter(event => event.type === 'subagent_tool_end')).toHaveLength(1);
+      expect(events.filter(event => event.type === 'subagent_end')).toHaveLength(1);
+      expect(
+        events.filter(event => event.type === 'text_delta').map(event => (event as { delta: string }).delta),
+      ).toEqual(['The computed total is **10**.']);
     } finally {
       await harness.shutdown();
     }
@@ -2957,9 +3280,15 @@ describe('Harness v1 real-agent E2E — S14 subagent tool error', () => {
         throw new Error(THROWN);
       },
     });
+    const continueAfterSummary = createTool({
+      id: 'continueAfterSummary',
+      description: 'Acknowledge that the blocked specialist summary streamed before its terminal report.',
+      inputSchema: z.object({}),
+      execute: async () => ({ acknowledged: true }),
+    });
     // Child: call-1 the throwing tool, call-2 a recovery summary. A real agent
-    // loop feeds the tool error back to the model and continues, so the child
-    // does NOT itself abort — it streams a post-error summary.
+    // loop feeds the tool error back to the model and continues. The child
+    // reports a truthful blocked outcome; the parent remains free to continue.
     const childDeltas = ['Could ', 'not ', 'look it up.'];
     let childCall = 0;
     const childModel = new MockLanguageModelV2({
@@ -2972,10 +3301,44 @@ describe('Harness v1 real-agent E2E — S14 subagent tool error', () => {
             stream: toolCallStream('child-throw-tc', 'lookupFact', '{"topic":"the answer"}'),
           };
         }
+        if (childCall === 2) {
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: reasoningTextToolCallStream(
+              [],
+              childDeltas,
+              'child-blocked-progress-tc',
+              'continueAfterSummary',
+              '{}',
+            ),
+          };
+        }
         return {
           rawCall: { rawPrompt: null, rawSettings: {} },
           warnings: [],
-          stream: textStream(childDeltas),
+          stream: toolCallStream(
+            'child-blocked-outcome-tc',
+            'report_subagent_outcome',
+            JSON.stringify({
+              outcome: 'blocked',
+              summary: childDeltas.join(''),
+              evidence: [
+                {
+                  kind: 'tool-result',
+                  toolName: 'lookupFact',
+                  toolCallId: 'child-throw-tc',
+                  status: 'error',
+                  description: 'The lookup tool failed before returning a fact.',
+                },
+              ],
+              issue: {
+                code: 'lookup.unavailable',
+                message: 'The fact lookup dependency was unavailable.',
+                retryable: true,
+              },
+            }),
+          ),
         };
       },
     });
@@ -2984,7 +3347,7 @@ describe('Harness v1 real-agent E2E — S14 subagent tool error', () => {
       name: 'child-agent',
       instructions: 'use lookupFact',
       model: childModel,
-      tools: { lookupFact: childTool },
+      tools: { lookupFact: childTool, continueAfterSummary },
     });
 
     let parentCall = 0;
@@ -3067,17 +3430,20 @@ describe('Harness v1 real-agent E2E — S14 subagent tool error', () => {
       expect(JSON.stringify(subToolEnd!.output)).toContain(THROWN);
       expect(subToolEnd!.output).not.toBeInstanceOf(Error);
 
-      // The subagent terminalized cleanly: a single subagent_end. The child's
-      // real loop recovered after the tool error and returned its summary, so
-      // the subagent_end is NOT itself an error (the child run completed).
+      // The subagent terminalized exactly once with a truthful blocked result.
+      // Its dependency failure does not corrupt the parent run.
       const subEnds = events.filter(e => e.type === 'subagent_end') as Array<{ isError: boolean; output: any }>;
       expect(subEnds).toHaveLength(1);
-      expect(subEnds[0]!.isError).toBe(false);
-      // The child recovered and returned its post-error summary text.
+      expect(subEnds[0]!.isError).toBe(true);
+      expect(subEnds[0]!.output).toMatchObject({
+        outcome: 'blocked',
+        issue: { code: 'lookup.unavailable', retryable: true },
+      });
       expect((subEnds[0]!.output as { text?: string }).text).toBe(childDeltas.join(''));
 
-      // The child ran its model twice (tool round-trip + recovery summary).
-      expect(childCall).toBe(2);
+      // The child ran the failed lookup, streamed its blocked summary, then
+      // emitted a report-only terminal action.
+      expect(childCall).toBe(3);
     } finally {
       await harness.shutdown();
     }
@@ -3312,14 +3678,43 @@ describe('Harness v1 real-agent E2E — S15 nested subagent depth>1', () => {
 describe('Harness v1 real-agent E2E — S16 two subagents de-multiplex by subagentSessionId', () => {
   it('two real subagents spawned from one parent keep their events attributed to their own subagentSessionId', async () => {
     const makeChild = (id: string, text: string) => {
-      const model = new MockLanguageModelV2({
-        doStream: async () => ({
-          rawCall: { rawPrompt: null, rawSettings: {} },
-          warnings: [],
-          stream: textStream([text]),
-        }),
+      let childCall = 0;
+      const continueAfterSummary = createTool({
+        id: 'continueAfterSummary',
+        description: 'Acknowledge the visible specialist summary before the terminal report.',
+        inputSchema: z.object({}),
+        execute: async () => ({ acknowledged: true }),
       });
-      return new Agent({ id, name: id, instructions: 'reply', model });
+      const model = new MockLanguageModelV2({
+        doStream: async () => {
+          childCall += 1;
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream:
+              childCall === 1
+                ? reasoningTextToolCallStream([], [text], `${id}-progress-tc`, 'continueAfterSummary', '{}')
+                : toolCallStream(
+                    `${id}-outcome-tc`,
+                    'report_subagent_outcome',
+                    JSON.stringify({
+                      outcome: 'completed',
+                      summary: text,
+                      evidence: [
+                        {
+                          kind: 'tool-result',
+                          toolName: 'continueAfterSummary',
+                          toolCallId: `${id}-progress-tc`,
+                          status: 'success',
+                          description: `${id} completed its deterministic assignment.`,
+                        },
+                      ],
+                    }),
+                  ),
+          };
+        },
+      });
+      return new Agent({ id, name: id, instructions: 'reply', model, tools: { continueAfterSummary } });
     };
     const childA = makeChild('child-a', 'alpha');
     const childB = makeChild('child-b', 'beta');

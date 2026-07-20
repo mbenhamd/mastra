@@ -262,6 +262,7 @@ export async function runLoopScenario(opts: RunLoopScenarioOptions): Promise<Loo
     structuredOutput,
     activeTools,
     outputProcessors,
+    transform,
     inputProcessors,
     prepareStep,
     memory,
@@ -299,6 +300,7 @@ export async function runLoopScenario(opts: RunLoopScenarioOptions): Promise<Loo
     sharedAgent,
     pubsub,
     engine = 'normal',
+    runId,
     fsRouted,
   } = opts;
 
@@ -367,22 +369,22 @@ export async function runLoopScenario(opts: RunLoopScenarioOptions): Promise<Loo
     await agent.setObjective(objective, { threadId, resourceId });
   }
 
-  const memoryOption =
-    memory && threadId
-      ? {
-          memory: {
-            thread: threadId,
-            ...(resourceId ? { resource: resourceId } : {}),
-            ...(memoryOptions ? { options: memoryOptions } : {}),
-          },
-        }
-      : {};
+  const memoryOption = threadId
+    ? {
+        memory: {
+          thread: threadId,
+          ...(resourceId ? { resource: resourceId } : {}),
+          ...(memoryOptions ? { options: memoryOptions } : {}),
+        },
+      }
+    : {};
 
   // For durable engine, only pass options that DurableAgentStreamOptions supports.
   // inputProcessors are on the agent constructor, not call-time options.
   const isDurable = engine === 'durable';
 
   const streamOptions = {
+    ...(runId ? { runId } : {}),
     ...(stopWhen ? { stopWhen } : {}),
     ...(maxSteps ? { maxSteps } : {}),
     // Durable needs maxSteps as a fallback when stopWhen was the only bound
@@ -391,6 +393,7 @@ export async function runLoopScenario(opts: RunLoopScenarioOptions): Promise<Loo
     ...(structuredOutput ? { structuredOutput } : {}),
     ...(activeTools ? { activeTools } : {}),
     ...(outputProcessors ? { outputProcessors } : {}),
+    ...(transform ? { transform } : {}),
     ...(inputProcessors && !isDurable ? { inputProcessors } : {}),
     ...(prepareStep ? { prepareStep } : {}),
     ...(requestContext ? { requestContext } : {}),
@@ -542,52 +545,106 @@ export function describeForAllEngines(
  * Returns the final resumed output, the full ordered list of chunks observed
  * across the initial run and every resume, and the captured AIMock requests.
  */
-export async function runApprovalScenario({
-  llm,
-  fixtures,
-  prompt,
-  tools,
-  instructions,
-  stopWhen,
-  decision,
-  requireToolApproval = true,
-}: RunApprovalScenarioOptions): Promise<LoopScenarioResult & { chunks: ChunkType[]; approvals: string[] }> {
+export async function runApprovalScenario(
+  options: RunApprovalScenarioOptions,
+): Promise<LoopScenarioResult & { chunks: ChunkType[]; approvals: string[] }> {
+  const {
+    llm,
+    fixtures,
+    prompt,
+    tools,
+    instructions,
+    stopWhen,
+    decision,
+    requireToolApproval = true,
+    engine = 'normal',
+    memory,
+    threadId,
+    resourceId,
+  } = options;
   fixtures(llm);
 
-  const { agent } = await buildScenarioAgent({ llm, tools, instructions });
+  if (engine === 'evented') {
+    process.env.MASTRA_EVENTED_EXECUTION = 'true';
+  }
+
+  const { agent } = await buildScenarioAgent({
+    llm,
+    tools,
+    instructions,
+    engine,
+    memory,
+    workspace: options.workspace,
+    agents: options.agents,
+    workflows: options.workflows,
+    agentBackgroundTasks: options.agentBackgroundTasks,
+    goal: options.goal,
+    backgroundTasks: options.backgroundTasks,
+    model: options.model,
+    errorProcessors: options.errorProcessors,
+    defaultOptions: options.defaultOptions,
+    pubsub: options.pubsub,
+    inputProcessors: options.inputProcessors,
+    fsRouted: options.fsRouted,
+  });
 
   const chunks: ChunkType[] = [];
   const approvals: string[] = [];
 
-  let output = (await agent.stream(prompt, {
+  const memoryOption = threadId
+    ? { memory: { thread: threadId, ...(resourceId ? { resource: resourceId } : {}) } }
+    : {};
+  const streamOptions = {
     ...(requireToolApproval !== false ? { requireToolApproval } : {}),
     ...(stopWhen ? { stopWhen } : {}),
-  })) as unknown as MastraModelOutput<unknown>;
-  const runId = (output as unknown as { runId: string }).runId;
+    ...(options.maxSteps ? { maxSteps: options.maxSteps } : {}),
+    ...(!options.maxSteps && stopWhen && engine === 'durable' ? { maxSteps: 10 } : {}),
+    ...(options.outputProcessors ? { outputProcessors: options.outputProcessors } : {}),
+    ...(options.inputProcessors && engine !== 'durable' ? { inputProcessors: options.inputProcessors } : {}),
+    ...(options.requestContext ? { requestContext: options.requestContext } : {}),
+    ...(options.abortSignal ? { abortSignal: options.abortSignal } : {}),
+    ...(options.providerOptions ? { providerOptions: options.providerOptions } : {}),
+    ...(options.modelSettings ? { modelSettings: options.modelSettings } : {}),
+    ...memoryOption,
+  };
+
+  let rawOutput: any = await agent.stream(prompt, streamOptions);
+  const runId = rawOutput.runId ?? rawOutput.output?.runId;
+  let output = (rawOutput.output ?? rawOutput) as MastraModelOutput<unknown>;
 
   // Resume loop: drain the stream, collect any approval requests, resolve them,
   // and resume. Continue until a run completes without suspending.
   // The bound guards against an accidental infinite approval loop in a test.
-  for (let iterations = 0; iterations < 50; iterations++) {
-    const pendingApprovals: string[] = [];
-    for await (const chunk of output.fullStream as AsyncIterable<ChunkType>) {
-      chunks.push(chunk);
-      if (chunk.type === 'tool-call-approval') {
-        pendingApprovals.push((chunk.payload as { toolCallId: string }).toolCallId);
+  try {
+    for (let iterations = 0; iterations < 50; iterations++) {
+      const pendingApprovals: string[] = [];
+      const fullStream = (rawOutput.fullStream ?? output.fullStream) as AsyncIterable<ChunkType>;
+      for await (const chunk of fullStream) {
+        chunks.push(chunk);
+        if (chunk.type === 'tool-call-approval') {
+          pendingApprovals.push((chunk.payload as { toolCallId: string }).toolCallId);
+          if (engine === 'durable') break;
+        }
       }
+
+      if (pendingApprovals.length === 0) break;
+
+      // Resolve the first pending approval; subsequent ones (if any) surface on
+      // the next resume iteration.
+      const toolCallId = pendingApprovals[0]!;
+      const approve = decision({ toolCallId, approvalIndex: approvals.length });
+      approvals.push(`${approve ? 'approve' : 'decline'}:${toolCallId}`);
+
+      rawOutput = await (approve
+        ? agent.approveToolCall({ runId, toolCallId, ...memoryOption })
+        : agent.declineToolCall({ runId, toolCallId, ...memoryOption }));
+      output = (rawOutput.output ?? rawOutput) as MastraModelOutput<unknown>;
     }
-
-    if (pendingApprovals.length === 0) break;
-
-    // Resolve the first pending approval; subsequent ones (if any) surface on
-    // the next resume iteration.
-    const toolCallId = pendingApprovals[0]!;
-    const approve = decision({ toolCallId, approvalIndex: approvals.length });
-    approvals.push(`${approve ? 'approve' : 'decline'}:${toolCallId}`);
-
-    output = (await (approve
-      ? agent.approveToolCall({ runId, toolCallId })
-      : agent.declineToolCall({ runId, toolCallId }))) as unknown as MastraModelOutput<unknown>;
+  } finally {
+    if (engine === 'evented') {
+      delete process.env.MASTRA_EVENTED_EXECUTION;
+    }
+    rawOutput.cleanup?.();
   }
 
   return {

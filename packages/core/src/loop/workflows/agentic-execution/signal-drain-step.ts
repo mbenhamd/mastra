@@ -37,6 +37,9 @@ export function createSignalDrainStep<Tools extends ToolSet = ToolSet, OUTPUT = 
 
       return {
         ...typedInput,
+        // A late user/system signal takes precedence over a just-resolved tool
+        // terminal. The model must observe the signal before the run can end.
+        terminalToolResult: undefined,
         messageId: nextMessageId,
         stepResult: {
           ...typedInput.stepResult,

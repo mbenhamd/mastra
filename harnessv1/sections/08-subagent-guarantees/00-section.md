@@ -58,14 +58,27 @@
   untouched; built-in tool calling-session behavior is owned by §6.4. A
   spawned child session receives only the tool surface delegated by the
   parent/subagent configuration, then §4.2's pre-exposure and pre-action gates
-  run against the owning child session. Parent rules, grants, or `yolo` cap what
-  the parent may delegate only when the parent gate removes the spawning or
-  forwarded tool; they are not inherited action authority for the child.
+  run against the owning child session. By default, parent rules, grants, and
+  `yolo` are not inherited action authority for the child. An operator may set
+  `subagents.inheritRootSessionGrants: true` to copy the root session's current
+  grants into each newly created descendant. That copy is a creation-time
+  snapshot: already-running descendants are not mutated, rules remain local,
+  and a child `deny` or tool allowlist still overrides the copied grant.
 - **Workspace inheritance.** Subagents inherit the spawning parent session's
   resolved workspace by default — they typically cooperate on the same
   code/files as the parent. Subagent tool config can opt into a fresh workspace
   via `{ workspace: 'fresh' }` (only valid when the harness is configured with
   `kind: 'per-session'`). Fresh subagent workspaces are torn down on subagent
   session close. See §2.7.
+- **Terminal outcome evidence.** A durable child does not complete delegated
+  work merely because its provider stopped or emitted prose. It must finish
+  with the framework-owned `report_subagent_outcome` terminal tool and declare
+  `completed`, `blocked`, or `failed`. Every `tool-result` evidence item is
+  reconciled against a framework-observed `(toolCallId, toolName, status)`
+  receipt. A tool-using `completed` report must cite a successful receipt;
+  mismatches and receipt overflow fail closed. Receipts contain no tool inputs
+  or outputs. The bounded receipt set is parked with `PendingResume`, so a
+  suspend/process-rehydrate/resume sequence can verify work performed before
+  suspension.
 
 ---

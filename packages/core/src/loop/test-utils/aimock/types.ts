@@ -5,6 +5,7 @@ import type { MastraMemory } from '../../../memory';
 import type { RequestContext } from '../../../request-context';
 import type { MastraModelOutput } from '../../../stream/base/output';
 import type { ChunkType } from '../../../stream/types';
+import type { ToolPayloadTransformPolicy } from '../../../tools';
 import type { AnyWorkspace } from '../../../workspace/workspace';
 
 /**
@@ -86,6 +87,8 @@ export interface RunLoopScenarioOptions {
    * - `'durable'` wraps the agent with `createDurableAgent`.
    */
   engine?: EngineVariant;
+  /** Explicit run id for identity/replay boundary scenarios. */
+  runId?: string;
   /**
    * Imperatively script the per-turn model responses on the AIMock instance,
    * e.g. `llm.onMessage(...)`, `llm.onToolCall(...)`, `llm.onTurn(...)`.
@@ -296,6 +299,8 @@ export interface RunLoopScenarioOptions {
    * assert transform/redact behavior over the loop output.
    */
   outputProcessors?: any;
+  /** Tool payload transform policy forwarded to `agent.stream`. */
+  transform?: ToolPayloadTransformPolicy;
   /**
    * Input processors forwarded to `agent.stream({ inputProcessors })`. Run before
    * the user message reaches the model request — assert on `requests[0]`.

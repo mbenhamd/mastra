@@ -20,5 +20,7 @@ export function mapDurableIterationToLLMInput(state: DurableAgenticWorkflowInput
     stepIndex: state.iterationCount ?? state.stepIndex,
     agentSpanData: state.agentSpanData,
     modelSpanData: state.modelSpanData,
+    requestContextEntries: state.requestContextEntries,
+    requiredRequestContextCapabilities: state.requiredRequestContextCapabilities,
   };
 }

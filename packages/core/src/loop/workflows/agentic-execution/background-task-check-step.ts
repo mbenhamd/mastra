@@ -67,12 +67,17 @@ export function createBackgroundTaskCheckStep<Tools extends ToolSet = ToolSet, O
         return typedInput;
       }
 
+      // A previously dispatched background task is still part of this run's
+      // answer. Do not let an unrelated foreground success terminate while
+      // that task is pending or while its completion needs another model turn.
+      const inputWithoutTerminal = { ...typedInput, terminalToolResult: undefined };
+
       // When the outer caller (e.g. `agent.streamUntilIdle`) is driving
       // continuation from outside, skip the in-loop wait entirely. The outer
       // will re-enter via `stream([])` once tasks complete. We still mark the
       // pending flag so `isTaskCompleteStep` knows to skip scoring.
       if (readScoped(scopeCtx, SKIP_BG_TASK_WAIT_KEY, 'skipBgTaskWait')) {
-        return { ...typedInput, backgroundTaskPending: true };
+        return { ...inputWithoutTerminal, backgroundTaskPending: true };
       }
 
       const taskIds = runningTasks.map(task => task.id);
@@ -84,7 +89,7 @@ export function createBackgroundTaskCheckStep<Tools extends ToolSet = ToolSet, O
 
       // First invocation — signal pending but don't block
       if (retryCount === 0 || !waitTimeoutMs) {
-        return { ...typedInput, backgroundTaskPending: true };
+        return { ...inputWithoutTerminal, backgroundTaskPending: true };
       }
 
       // Emit initial progress chunk
@@ -127,19 +132,18 @@ export function createBackgroundTaskCheckStep<Tools extends ToolSet = ToolSet, O
         });
       } catch {
         // Timeout elapsed — no task completed within waitTimeoutMs.
-        // Return WITHOUT setting isContinued so the loop can end.
-        // The tasks keep running in the background — results will be
-        // picked up on the next user message or stream.
-        return typedInput;
+        // Preserve the pending marker but do not set isContinued, so the
+        // foreground loop can end without losing the background lifecycle.
+        return { ...inputWithoutTerminal, backgroundTaskPending: true };
       }
 
       // A task completed within the timeout — force the loop to continue
       // so the LLM processes the injected result
-      if (typedInput.stepResult) {
-        typedInput.stepResult.isContinued = true;
-      }
-
-      return { ...typedInput, backgroundTaskPending: true };
+      return {
+        ...inputWithoutTerminal,
+        backgroundTaskPending: true,
+        ...(typedInput.stepResult ? { stepResult: { ...typedInput.stepResult, isContinued: true } } : {}),
+      };
     },
   });
 }

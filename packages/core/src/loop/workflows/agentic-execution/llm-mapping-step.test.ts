@@ -3,6 +3,7 @@ import type { Mock } from 'vitest';
 import { z } from 'zod/v4';
 import type { MessageList } from '../../../agent/message-list';
 import { RequestContext } from '../../../request-context';
+import { DefaultStepResult } from '../../../stream/aisdk/v5/output-helpers';
 import { ToolStream } from '../../../tools/stream';
 import { PUBSUB_SYMBOL, STREAM_FORMAT_SYMBOL } from '../../../workflows/constants';
 import type { ExecuteFunctionParams } from '../../../workflows/step';
@@ -11,6 +12,7 @@ import { createLLMMappingStep } from './llm-mapping-step';
 
 vi.mock('../../../workflows/workflow', () => ({
   createStep: (config: unknown) => config,
+  Run: class {},
   Workflow: class {},
 }));
 
@@ -1842,5 +1844,163 @@ describe('createLLMMappingStep toModelOutput', () => {
     expect(span.ended).toBe(false);
     expect(span.errored).toBe(true);
     expect(span.errorOptions).toEqual({ error: failure, endSpan: true });
+  });
+});
+
+describe('createLLMMappingStep StepResult reconciliation', () => {
+  const stepResultTestUsage = {
+    inputTokens: 3,
+    outputTokens: 10,
+    totalTokens: 13,
+    reasoningTokens: undefined,
+    cachedInputTokens: undefined,
+  };
+
+  function createFixture() {
+    let resolvedToolPart: Parameters<MessageList['updateToolInvocation']>[0] | undefined;
+    const toolCallContent = {
+      type: 'tool-call' as const,
+      toolCallId: 'call-1',
+      toolName: 'localTool',
+      input: { value: 'input' },
+    };
+    const messageList = {
+      get: {
+        all: { aiV5: { model: () => [] } },
+        input: { aiV5: { model: () => [] } },
+        response: {
+          aiV5: {
+            model: () => [],
+            modelContent: () => [
+              toolCallContent,
+              ...(resolvedToolPart
+                ? [
+                    {
+                      type: 'tool-result' as const,
+                      toolCallId: 'call-1',
+                      toolName: 'localTool',
+                      input: { value: 'input' },
+                      output: {
+                        type: 'json' as const,
+                        value:
+                          resolvedToolPart.toolInvocation.state === 'output-denied'
+                            ? resolvedToolPart.toolInvocation.approval.reason
+                            : resolvedToolPart.toolInvocation.result,
+                      },
+                    },
+                  ]
+                : []),
+            ],
+          },
+        },
+      },
+      add: vi.fn(),
+      updateToolInvocation: vi.fn(part => {
+        resolvedToolPart = part;
+        return true;
+      }),
+    } as unknown as MessageList;
+
+    const provisionalStep = new DefaultStepResult({
+      content: [toolCallContent] as any,
+      finishReason: 'tool-calls',
+      providerMetadata: undefined,
+      request: {},
+      response: { messages: messageList.get.response.aiV5.model() },
+      usage: stepResultTestUsage,
+      warnings: [],
+    });
+    const initialResult = {
+      stepResult: { isContinued: true, reason: 'tool-calls' },
+      metadata: {},
+      output: {
+        steps: [provisionalStep],
+        text: '',
+        usage: stepResultTestUsage,
+      },
+    };
+    const llmExecutionStep = createStep({
+      id: 'step-result-llm-execution',
+      inputSchema: z.any(),
+      outputSchema: z.any(),
+      execute: async () => initialResult,
+    });
+    const controller = { enqueue: vi.fn() };
+    const bail = vi.fn(data => data);
+    const llmMappingStep = createLLMMappingStep(
+      {
+        models: {} as any,
+        controller,
+        messageList,
+        runId: 'step-result-run',
+        _internal: { generateId: () => 'step-result-message' },
+      } as any,
+      llmExecutionStep,
+    );
+
+    const execute = (inputData: ToolCallOutput[]) =>
+      llmMappingStep.execute({
+        runId: 'step-result-run',
+        workflowId: 'step-result-workflow',
+        mastra: {} as any,
+        requestContext: new RequestContext(),
+        state: {},
+        setState: vi.fn(),
+        retryCount: 0,
+        tracingContext: {} as any,
+        getInitData: vi.fn(),
+        getStepResult: vi.fn(() => initialResult),
+        suspend: vi.fn(),
+        bail,
+        abort: vi.fn(),
+        engine: 'default' as any,
+        abortSignal: new AbortController().signal,
+        writer: new ToolStream({
+          prefix: 'tool',
+          callId: 'call-1',
+          name: 'localTool',
+          runId: 'step-result-run',
+        }),
+        validateSchemas: false,
+        inputData,
+        [PUBSUB_SYMBOL]: {} as any,
+        [STREAM_FORMAT_SYMBOL]: undefined,
+      } as any);
+
+    return { execute };
+  }
+
+  it.each([
+    {
+      label: 'successful local result',
+      input: { result: { ok: true } },
+    },
+    {
+      label: 'local execution error',
+      input: { error: { name: 'Error', message: 'local tool failed', stack: '' } },
+    },
+    {
+      label: 'approval denial',
+      input: {
+        approval: { id: 'approval-1', approved: false, reason: 'User denied this call.' },
+      },
+    },
+  ])('refreshes the latest StepResult after a $label', async ({ input }) => {
+    const { execute } = createFixture();
+
+    const result = await execute([
+      {
+        toolCallId: 'call-1',
+        toolName: 'localTool',
+        args: { value: 'input' },
+        ...input,
+      },
+    ]);
+
+    expect(result.output.steps).toHaveLength(1);
+    expect(result.output.steps[0].toolCalls.map((call: { toolCallId: string }) => call.toolCallId)).toEqual(['call-1']);
+    expect(
+      result.output.steps[0].toolResults.map((toolResult: { toolCallId: string }) => toolResult.toolCallId),
+    ).toEqual(['call-1']);
   });
 });

@@ -205,6 +205,19 @@ describe('createLLMExecutionStep gateway provider tools', () => {
     const toolCalls = llmResult.output.toolCalls ?? [];
     const toolCallById = Object.fromEntries(toolCalls.map(toolCall => [toolCall.toolCallId, toolCall]));
 
+    // The public StepResult is built before this step is appended to the
+    // accumulated array. Its content extraction must therefore use the next
+    // one-based step number and must retain every parallel call/result.
+    expect(llmResult.output.steps).toHaveLength(1);
+    expect(llmResult.output.steps[0].toolCalls.map((call: { toolCallId: string }) => call.toolCallId)).toEqual([
+      'call-1',
+      'call-2',
+    ]);
+    expect(llmResult.output.steps[0].toolResults.map((result: { toolCallId: string }) => result.toolCallId)).toEqual([
+      'call-1',
+      'call-2',
+    ]);
+
     // providerExecuted is inferred from the tool definition (type: 'provider')
     // even though the raw model stream doesn't include it
     expect(toolCallById['call-1']).toEqual(
@@ -778,7 +791,9 @@ describe('createLLMExecutionStep gateway provider tools', () => {
     const enqueuedChunks = (controller.enqueue as Mock).mock.calls.map(([chunk]) => chunk);
     const deltaChunks = enqueuedChunks.filter(chunk => chunk.type === 'tool-call-delta');
 
-    expect(toolEnumerationCount).toBeLessThanOrEqual(5);
+    // StepResult materialization performs one fixed lookup after streaming;
+    // the count must remain independent of the number of input deltas.
+    expect(toolEnumerationCount).toBeLessThanOrEqual(6);
     expect(onInputDelta).toHaveBeenCalledTimes(toolInputDeltas.length);
     const deltaTransformCalls = transformToolPayload.mock.calls.filter(([context]) => context.phase === 'input-delta');
     expect(deltaTransformCalls).toHaveLength(toolInputDeltas.length);

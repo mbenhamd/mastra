@@ -44,7 +44,7 @@ cleanup()
 
 ### Using the `durable` config flag
 
-Set `durable: true` on `AgentConfig` and the agent is automatically wrapped with `createDurableAgent` when it is attached to a `Mastra` instance. Use an object to forward advanced options such as `cache`, `pubsub`, `maxSteps`, or `cleanupTimeoutMs`.
+Set `durable: true` on `AgentConfig` and the agent uses durable execution. Registered agents are wrapped with `createDurableAgent` when attached to a `Mastra` instance; standalone agents lazily create and reuse the same durable wrapper on their first durable API call. Use an object to forward advanced options such as `cache`, `pubsub`, `maxSteps`, `cleanupTimeoutMs`, or `durableRequestContextKeys`.
 
 ```typescript title="src/mastra/index.ts"
 import { Mastra } from '@mastra/core'
@@ -63,7 +63,7 @@ export const mastra = new Mastra({
 })
 ```
 
-`mastra.getAgent('myAgent')` returns the wrapped `DurableAgent`. Standalone agents (constructed but never registered on a `Mastra` instance) do not become durable; the wrapping is applied at registration.
+`mastra.getAgent('myAgent')` returns the wrapped `DurableAgent`. A standalone durable agent keeps its public `Agent` identity while routing durable calls through one lazily created `DurableAgent` wrapper.
 
 ## `createDurableAgent(options)`
 

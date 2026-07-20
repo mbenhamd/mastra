@@ -50,6 +50,7 @@ import type {
   ChannelBinding,
   PersistedRequestContextInput,
   PersistedAttachment,
+  PendingInteractionExpiryGeneration,
 } from '../../storage/domains/harness';
 import {
   CHANNEL_BINDING_EXTERNAL_ID_SENTINEL,
@@ -97,6 +98,7 @@ import {
 import type { HarnessSessionDeleteBlocker } from './errors';
 import { EventEmitter, projectHarnessPublicError } from './events';
 import type { HarnessEvent, HarnessEventListener, HarnessEventUnsubscribe } from './events';
+import { DEFAULT_PLAN_TASK_DELEGATION_TIMEOUT_MS } from './plan-task-session';
 import { Session } from './session';
 import type {
   AttachmentDeleteOptions,
@@ -127,6 +129,7 @@ import type {
   SessionListOptions,
   SessionDeleteOptions,
   SessionLoadByIdOptions,
+  SessionLoadByThreadOptions,
   SessionResolveOptions,
   ShutdownOptions,
   SubagentDefinition,
@@ -152,7 +155,14 @@ const DEFAULT_LOCK_WAIT_MS = 5_000;
 const DEFAULT_IDLE_TIMEOUT_MS = 2 * 60 * 60 * 1_000;
 const DEFAULT_MAX_QUEUE_DEPTH = 100;
 const DEFAULT_CLOSE_TIMEOUT_MS = 30_000;
+const DEFAULT_PENDING_INTERACTION_TTL_MS = 10 * 60 * 1_000;
+const PENDING_INTERACTION_EXPIRY_SWEEP_MIN_INTERVAL_MS = 1_000;
+const PENDING_INTERACTION_EXPIRY_SWEEP_MAX_INTERVAL_MS = 60_000;
+const PENDING_INTERACTION_EXPIRY_SWEEP_PAGE_SIZE = 100;
+const PENDING_INTERACTION_EXPIRY_SWEEP_MAX_PAGES = 10;
+const PENDING_INTERACTION_EXPIRY_SWEEP_CONCURRENCY = 8;
 const MAX_CLOSE_TIMEOUT_MS = 2_147_483_647;
+const DEFAULT_MAX_EVENT_PAYLOAD_BYTES = 64 * 1024;
 // Bounded best-effort budget for draining a victim's buffered session-record /
 // token-usage flush chain during pressure/idle eviction (§5.4). Caps the hot
 // path so a slow/stuck storage write can never block eviction indefinitely.
@@ -161,7 +171,49 @@ const DEFAULT_SUBAGENT_MAX_DEPTH = 1;
 const DEFAULT_GOAL_MAX_TURNS = 50;
 const DEFAULT_PERMISSION_POLICY: PermissionPolicy = 'ask';
 
-/** §9.2 — resolved, JSON-safe Observational Memory defaults for a harness. */
+function isPendingInteractionExpiryGeneration(value: unknown): value is PendingInteractionExpiryGeneration {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.harnessName === 'string' &&
+    typeof record.sessionId === 'string' &&
+    typeof record.resourceId === 'string' &&
+    typeof record.kind === 'string' &&
+    typeof record.itemId === 'string' &&
+    typeof record.runId === 'string' &&
+    typeof record.toolCallId === 'string' &&
+    typeof record.requestedAt === 'number' &&
+    Number.isFinite(record.requestedAt) &&
+    typeof record.dueAt === 'number' &&
+    Number.isFinite(record.dueAt) &&
+    typeof record.expiresAt === 'number' &&
+    Number.isFinite(record.expiresAt)
+  );
+}
+
+function isPendingInteractionDueScanCursor(value: unknown): value is { dueAt: number; sessionId: string } {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const cursor = value as Record<string, unknown>;
+  return typeof cursor.dueAt === 'number' && Number.isFinite(cursor.dueAt) && typeof cursor.sessionId === 'string';
+}
+
+function assertPendingInteractionDuePage(value: unknown): asserts value is {
+  items: PendingInteractionExpiryGeneration[];
+  nextCursor?: { dueAt: number; sessionId: string };
+} {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError('HarnessStorage.listDuePendingInteractions returned a non-object page');
+  }
+  const page = value as Record<string, unknown>;
+  if (!Array.isArray(page.items) || !page.items.every(isPendingInteractionExpiryGeneration)) {
+    throw new TypeError('HarnessStorage.listDuePendingInteractions returned malformed items');
+  }
+  if (page.nextCursor !== undefined && !isPendingInteractionDueScanCursor(page.nextCursor)) {
+    throw new TypeError('HarnessStorage.listDuePendingInteractions returned a malformed nextCursor');
+  }
+}
+
+/** §9.2 — validated disabled OM state; enabled Harness OM currently rejects. */
 interface ResolvedObservationalMemory {
   enabled: boolean;
   scope: 'thread' | 'resource';
@@ -193,14 +245,20 @@ function assertOmStepObject(value: unknown, field: string): void {
 }
 
 /**
- * Normalize + validate the §9.2 `ObservationalMemoryConfig` into resolved,
- * JSON-safe defaults. `true` enables OM with defaults; `false`/omitted disables
- * it. A per-channel `observation.model` / `reflection.model` overrides the shared
- * `model`. Throws `HarnessConfigError` on malformed input.
+ * Validate the §9.2 `ObservationalMemoryConfig`. `false`/omitted (or an object
+ * with `enabled: false`) resolves to disabled. Every enabled form rejects until
+ * @mastra/memory supports selecting the OM engine from effective per-turn
+ * config. Object fields are still validated first so malformed input reports
+ * its precise field instead of the broader unsupported-feature error.
  */
 function resolveObservationalMemoryConfig(config: ObservationalMemoryConfig | undefined): ResolvedObservationalMemory {
   if (config === undefined || config === false) return { enabled: false, scope: 'thread' };
-  if (config === true) return { enabled: true, scope: 'thread' };
+  if (config === true) {
+    throw new HarnessConfigError(
+      'observationalMemory',
+      'per-session Observational Memory is not supported until @mastra/memory can select an OM engine from the effective per-turn config; configure OM on the Agent Memory instance and omit HarnessConfig.observationalMemory',
+    );
+  }
   if (config === null || typeof config !== 'object' || Array.isArray(config)) {
     throw new HarnessConfigError('observationalMemory', 'must be a boolean or a config object');
   }
@@ -250,6 +308,12 @@ function resolveObservationalMemoryConfig(config: ObservationalMemoryConfig | un
       );
     }
   }
+  if (enabled) {
+    throw new HarnessConfigError(
+      'observationalMemory',
+      'per-session Observational Memory is not supported until @mastra/memory can select an OM engine from the effective per-turn config; configure OM on the Agent Memory instance and omit HarnessConfig.observationalMemory',
+    );
+  }
   return {
     enabled,
     scope,
@@ -261,7 +325,7 @@ function resolveObservationalMemoryConfig(config: ObservationalMemoryConfig | un
   };
 }
 
-/** Project resolved OM defaults into the persisted per-session snapshot fields. */
+/** Legacy projection retained for the currently unreachable enabled branch. */
 function observationalMemorySeedFromDefaults(
   resolved: ResolvedObservationalMemory,
 ): NonNullable<SessionRecord['observationalMemory']> {
@@ -878,16 +942,30 @@ export class Harness {
   // live session); stopped on shutdown. Reentrancy-guarded.
   private _channelInboxRecoveryTimer?: ReturnType<typeof setInterval>;
   private _channelInboxRecoveryRunning = false;
+  // Storage-driven pending-interaction expiry runs even when no session is
+  // live. It is bounded and reentrancy-guarded; per-session in-flight promises
+  // fence a concurrent public hydration from racing the transient cold worker.
+  private _pendingInteractionExpirySweepTimer?: ReturnType<typeof setTimeout>;
+  private _pendingInteractionExpirySweepLoopEnabled = false;
+  private _pendingInteractionExpirySweepDelayMs = PENDING_INTERACTION_EXPIRY_SWEEP_MIN_INTERVAL_MS;
+  private _pendingInteractionExpiryIdleSweepCount = 0;
+  private _pendingInteractionExpirySweepRunning = false;
+  private _pendingInteractionExpirySweepInFlight?: Promise<void>;
+  private readonly _pendingInteractionExpirySessionsInFlight = new Map<string, Promise<void>>();
   private readonly _maxQueueDepth: number;
   private readonly _queueBackpressure: HarnessQueueBackpressurePolicy;
   /** §10.5: when false, skip persisting transient streaming deltas (text_delta / reasoning_delta / subagent_text_delta / subagent_reasoning_delta). */
   private readonly _persistTransientStreamingEvents: boolean;
   private readonly _closeTimeoutMs: number;
+  private readonly _pendingInteractionTtlMs: number;
   private readonly _fileConfig: Readonly<HarnessFileConfig>;
   private readonly _subagentTypes: ReadonlyMap<string, SubagentDefinition>;
   private readonly _subagentMaxDepth: number;
+  private readonly _subagentInheritRootSessionGrants: boolean;
   /** §SA3 — per-parent concurrent `spawn_subagent` cap; `undefined` = no limit. */
   private readonly _subagentMaxConcurrent?: number;
+  /** Durable wall-clock budget for one task_delegate attempt. */
+  private readonly _subagentDelegationTimeoutMs: number;
   private readonly _goalDefaults: { defaultJudgeModel?: string; defaultMaxTurns: number };
   private readonly _defaultPermissionPolicy: PermissionPolicy;
   /** True when the operator explicitly set `defaultPermissionPolicy` (vs the
@@ -895,7 +973,7 @@ export class Harness {
    *  that declares no per-tool/category rules — so an unconfigured harness keeps
    *  today's no-gate behavior (§4.2e enforcement is opt-in). */
   private readonly _defaultPermissionPolicyConfigured: boolean;
-  /** §9.2 — resolved, JSON-safe Observational Memory defaults for this harness. */
+  /** §9.2 — validated disabled OM state; enabled Harness OM rejects. */
   private readonly _observationalMemory: ResolvedObservationalMemory;
   private readonly _toolCategoryResolver?: (toolName: string) => ToolCategory | null;
   private readonly _modelCatalog: ReadonlyMap<string, ModelInfo>;
@@ -919,6 +997,26 @@ export class Harness {
    * enters this map: each fresh call must mint its own new session.
    */
   private readonly _sessionResolutionsInFlight = new Map<string, Promise<Session>>();
+  /** Every public resolver admission, including `{ fresh: true }` calls that do
+   * not enter resolver-key singleflight. Shutdown closes admission first, then
+   * waits this set before taking its final live-session snapshot. */
+  private readonly _sessionAdmissionsInFlight = new Set<Promise<Session>>();
+  /** Durable ids that reserved a live-cache slot but have not yet completed
+   * publication/recovery. Included in cap accounting and treated as pinned. */
+  private readonly _pendingLiveMaterializations = new Set<string>();
+  /** Per-id teardown barrier so resolution cannot rehydrate while an old live
+   * handle is still flushing events/releasing its lease/workspace. */
+  private readonly _sessionEvictionsInFlight = new Map<string, Promise<void>>();
+  /** Short critical-section tail for maxLive reserve/evict decisions. */
+  private _liveMaterializationReservationTail: Promise<void> = Promise.resolve();
+  /**
+   * Canonical cold materialization fence, keyed by the durable session id.
+   * Resolver-input singleflight above cannot collapse a by-id call with a
+   * by-thread call, even when both storage lookups resolve to the same row.
+   * This second fence covers lease acquisition + adopt so every resolver shape
+   * receives one process-local Session object and one flush/event bridge.
+   */
+  private readonly _sessionMaterializationsInFlight = new Map<string, Promise<Session>>();
   /** In-process close de-dupe by any session id currently covered by a close tree. */
   private readonly _closePromises = new Map<string, Promise<void>>();
   private readonly _shutdownEvictedSessionIds = new Set<string>();
@@ -992,7 +1090,19 @@ export class Harness {
         `must be a positive integer no greater than ${MAX_CLOSE_TIMEOUT_MS}`,
       );
     }
+    this._pendingInteractionTtlMs = config.sessions?.pendingInteractionTtlMs ?? DEFAULT_PENDING_INTERACTION_TTL_MS;
+    if (
+      !Number.isInteger(this._pendingInteractionTtlMs) ||
+      this._pendingInteractionTtlMs < 1 ||
+      this._pendingInteractionTtlMs > MAX_CLOSE_TIMEOUT_MS
+    ) {
+      throw new HarnessConfigError(
+        'sessions.pendingInteractionTtlMs',
+        `must be a positive integer no greater than ${MAX_CLOSE_TIMEOUT_MS}`,
+      );
+    }
     const normalizedFileConfig: HarnessFileConfig = {
+      maxEventPayloadBytes: DEFAULT_MAX_EVENT_PAYLOAD_BYTES,
       ...(config.files ?? {}),
       ...(config.files?.allowedUrlMimeTypes
         ? { allowedUrlMimeTypes: Object.freeze([...config.files.allowedUrlMimeTypes]) }
@@ -1023,6 +1133,25 @@ export class Harness {
     // exclusion of tool overlays); agent-existence resolution happens at
     // _bindMastra so it matches how modes are validated.
     const subagentTypes = new Map<string, SubagentDefinition>();
+    if (
+      config.subagents?.inheritRootSessionGrants !== undefined &&
+      typeof config.subagents.inheritRootSessionGrants !== 'boolean'
+    ) {
+      throw new HarnessConfigError('subagents.inheritRootSessionGrants', 'must be a boolean');
+    }
+    this._subagentInheritRootSessionGrants = config.subagents?.inheritRootSessionGrants === true;
+    this._subagentDelegationTimeoutMs =
+      config.subagents?.delegationTimeoutMs ?? DEFAULT_PLAN_TASK_DELEGATION_TIMEOUT_MS;
+    if (
+      !Number.isSafeInteger(this._subagentDelegationTimeoutMs) ||
+      this._subagentDelegationTimeoutMs < 1 ||
+      this._subagentDelegationTimeoutMs > MAX_CLOSE_TIMEOUT_MS
+    ) {
+      throw new HarnessConfigError(
+        'subagents.delegationTimeoutMs',
+        `must be a positive safe integer no greater than ${MAX_CLOSE_TIMEOUT_MS}`,
+      );
+    }
     if (config.subagents) {
       for (const [agentType, def] of Object.entries(config.subagents.types ?? {})) {
         if (typeof def?.agentId !== 'string' || def.agentId.length === 0) {
@@ -1030,6 +1159,9 @@ export class Harness {
         }
         if (typeof def.description !== 'string' || def.description.length === 0) {
           throw new HarnessConfigError(`subagents.types["${agentType}"].description`, 'is required');
+        }
+        if (def.allowInline !== undefined && typeof def.allowInline !== 'boolean') {
+          throw new HarnessConfigError(`subagents.types["${agentType}"].allowInline`, 'must be a boolean');
         }
         if (def.toolAllowlist !== undefined) {
           const field = `subagents.types["${agentType}"].toolAllowlist`;
@@ -1550,6 +1682,7 @@ export class Harness {
       // adoption) so durable inbox rows from a prior process are recovered even
       // before any session goes live. No-op when no channels are configured.
       this._ensureChannelInboxRecoveryLoop();
+      this._ensurePendingInteractionExpirySweepLoop();
     } catch (err) {
       boundHarnesses.delete(this);
       this._mastra = undefined;
@@ -1735,9 +1868,16 @@ export class Harness {
     return this._subagentTypes.get(agentType);
   }
 
-  /** @internal — Session reads this to render the `agentType` enum in the spawn tool's input schema. */
-  _listSubagentTypeIds(): string[] {
-    return Array.from(this._subagentTypes.keys());
+  /**
+   * @internal — Session renders invocation-specific `agentType` enums from
+   * this registry. Durable delegation accepts every registered type; inline
+   * spawn excludes types that require an independent resume driver.
+   */
+  _listSubagentTypeIds(options: { invocation: 'inline' | 'delegated' }): string[] {
+    if (options.invocation === 'delegated') return Array.from(this._subagentTypes.keys());
+    return Array.from(this._subagentTypes.entries()).flatMap(([agentType, definition]) =>
+      definition.allowInline === false ? [] : [agentType],
+    );
   }
 
   /** @internal — Session merges static skills before workspace-discovered skills. */
@@ -1773,6 +1913,11 @@ export class Harness {
   /** @internal — per-parent concurrent spawn_subagent cap (SA3); `undefined` = no limit. */
   _getSubagentMaxConcurrent(): number | undefined {
     return this._subagentMaxConcurrent;
+  }
+
+  /** @internal — absolute task_delegate deadlines derive from this durable attempt budget. */
+  _getSubagentDelegationTimeoutMs(): number {
+    return this._subagentDelegationTimeoutMs;
   }
 
   /** @internal — Session reads the resolved mode for per-turn overlays. */
@@ -3440,8 +3585,9 @@ export class Harness {
     return this._defaultPermissionPolicyConfigured;
   }
 
-  /** @internal — resolved, JSON-safe OM defaults (§9.2). Session reads these as the
-   *  fallback behind per-session `SessionRecord.observationalMemory` overrides. */
+  /** @internal — validated disabled OM state (§9.2). A persisted per-session
+   *  override can only be legacy unsupported intent and blocks turns until
+   *  `session.om.clearOverride()` removes it. */
   _getObservationalMemoryDefaults(): ResolvedObservationalMemory {
     return this._observationalMemory;
   }
@@ -3466,12 +3612,22 @@ export class Harness {
     if (this._shutdown) {
       throw new Error('Harness is shut down');
     }
+    let admission!: Promise<Session>;
+    admission = this._resolveSession(opts).finally(() => {
+      this._sessionAdmissionsInFlight.delete(admission);
+    });
+    this._sessionAdmissionsInFlight.add(admission);
+    return admission;
+  }
+
+  private async _resolveSession(opts: SessionResolveOptions): Promise<Session> {
     const storage = this._requireStorage('session()');
 
     // 1) sessionId-only lookups.
     if ('sessionId' in opts && opts.sessionId && !('threadId' in opts && opts.threadId)) {
       const sessionId = opts.sessionId;
       const resourceId = opts.resourceId;
+      await this._waitForPendingInteractionExpirySweep(sessionId);
       // Fast-path: an already-live session returns immediately without entering
       // the singleflight (cheap, and the live record cannot double-adopt).
       const liveFast = this._liveSessions.get(sessionId);
@@ -3505,8 +3661,23 @@ export class Harness {
       }
       // Cold resolve — two concurrent by-thread callers for the same
       // (resourceId, threadId) share one resolution.
-      return this._singleflightResolve(canonicalJson(['thread', resourceId, threadId]), () =>
-        this._resolveByThread(storage, opts),
+      // Include every create-time identity input. Two deterministic-ID callers
+      // for the same thread are competing owner requests, not interchangeable
+      // retries; storage must linearize them so the loser receives a conflict.
+      return this._singleflightResolve(
+        canonicalJson([
+          'thread',
+          resourceId,
+          threadId,
+          opts.sessionId ?? null,
+          opts.parentSessionId ?? null,
+          opts.origin ?? null,
+          opts.modeId ?? null,
+          opts.modelId ?? null,
+          opts.subagentDepth ?? null,
+          opts.subagentTypeId ?? null,
+        ]),
+        () => this._resolveByThread(storage, opts),
       );
     }
 
@@ -3523,10 +3694,9 @@ export class Harness {
    * promise is stored BEFORE awaiting so concurrent SAME-key callers await the
    * same hydrate/adopt and receive the SAME `Session`. The entry is cleared in a
    * `finally` (success OR failure) so a failed resolution clears for retry. A
-   * by-sessionId and a by-thread call for the SAME row use different keys and
-   * may both resolve cold (an accepted rare case): adopt is idempotent on the id
-   * (second adopt of the same row simply re-publishes), and the common
-   * UI/headless callers resolve a given session consistently by one shape.
+   * A by-sessionId and a by-thread call for the same row use different resolver
+   * keys; `_materializeSession` provides the canonical durable-id fence after
+   * either storage lookup identifies the row.
    */
   private _singleflightResolve(key: string, resolve: () => Promise<Session>): Promise<Session> {
     const existing = this._sessionResolutionsInFlight.get(key);
@@ -3542,7 +3712,65 @@ export class Harness {
     return inflight;
   }
 
+  private _materializeSession(sessionId: string, materialize: () => Promise<Session>): Promise<Session> {
+    const evicting = this._sessionEvictionsInFlight.get(sessionId);
+    if (evicting) {
+      return evicting.then(() => this._materializeSession(sessionId, materialize));
+    }
+    // Once a cold materialization has started, its promise is the readiness
+    // barrier even after `_adoptSession` publishes the object into the live
+    // map. Hydration still has durable expiry/delegation reconciliation to do;
+    // returning the published object early would let a second resolver start
+    // work against stale recovered state.
+    const existing = this._sessionMaterializationsInFlight.get(sessionId);
+    if (existing) return existing;
+    const closing = this._closePromises.get(sessionId);
+    if (closing) {
+      return Promise.reject(harnessSessionClosingError({ id: sessionId }));
+    }
+    const live = this._liveSessions.get(sessionId);
+    if (live) {
+      if (live.isClosing) throw harnessSessionClosingError(live);
+      if (live.isClosed) throw new HarnessSessionClosedError(sessionId);
+      return Promise.resolve(live);
+    }
+    const inflight = (async () => {
+      // A synchronous publisher may have won after the caller's storage read
+      // but before this durable-id fence was installed.
+      const published = this._liveSessions.get(sessionId);
+      if (published) {
+        if (published.isClosing) throw harnessSessionClosingError(published);
+        if (published.isClosed) throw new HarnessSessionClosedError(sessionId);
+        return published;
+      }
+      return materialize();
+    })().finally(() => {
+      if (this._sessionMaterializationsInFlight.get(sessionId) === inflight) {
+        this._sessionMaterializationsInFlight.delete(sessionId);
+      }
+    });
+    this._sessionMaterializationsInFlight.set(sessionId, inflight);
+    return inflight;
+  }
+
   private async _resolveById(storage: HarnessStorage, sessionId: string, resourceId?: string): Promise<Session> {
+    await this._sessionEvictionsInFlight.get(sessionId);
+    // `_adoptSession` publishes before recovery reconciliation completes. A
+    // concurrent resolver must await that materialization barrier rather than
+    // treating the process-local cache entry as ready.
+    const materializing = this._sessionMaterializationsInFlight.get(sessionId);
+    if (materializing) {
+      const ready = await materializing;
+      if (resourceId !== undefined && ready.resourceId !== resourceId) {
+        throw new HarnessSessionNotFoundError(sessionId);
+      }
+      if (ready.isClosing) throw harnessSessionClosingError(ready);
+      if (ready.isClosed) throw new HarnessSessionClosedError(sessionId);
+      return ready;
+    }
+    if (this._closePromises.has(sessionId)) {
+      throw harnessSessionClosingError(this._liveSessions.get(sessionId) ?? { id: sessionId });
+    }
     // In-memory hit — return live instance, enforce resourceId scoping.
     const live = this._liveSessions.get(sessionId);
     if (live) {
@@ -3635,16 +3863,58 @@ export class Harness {
     // In-memory hit by (threadId, resourceId)?
     for (const live of this._liveSessions.values()) {
       if (live.threadId === threadId && live.resourceId === resourceId) {
-        if (live.isClosing) {
-          throw harnessSessionClosingError(live);
+        const evicting = this._sessionEvictionsInFlight.get(live.id);
+        if (evicting) {
+          await evicting;
+          return this._resolveByThread(storage, opts);
         }
-        return live;
+        if (opts.sessionId !== undefined && live.id !== opts.sessionId) {
+          throw new HarnessSessionConflictError(resourceId, threadId, opts.sessionId, live.id);
+        }
+        const ready = (await this._sessionMaterializationsInFlight.get(live.id)) ?? live;
+        if (this._closePromises.has(ready.id)) throw harnessSessionClosingError(ready);
+        if (ready.isClosing) throw harnessSessionClosingError(ready);
+        if (ready.isClosed) throw new HarnessSessionClosedError(ready.id);
+        return ready;
       }
     }
 
     // Storage lookup — returns the current owner including Closed/Closing (§5.2a).
-    const stored = await storage.loadSessionByThread({ harnessName: this._harnessName, threadId, resourceId });
+    let stored = await storage.loadSessionByThread({ harnessName: this._harnessName, threadId, resourceId });
     if (stored) {
+      if (opts.sessionId !== undefined && stored.id !== opts.sessionId) {
+        throw new HarnessSessionConflictError(resourceId, threadId, opts.sessionId, stored.id);
+      }
+      const evicting = this._sessionEvictionsInFlight.get(stored.id);
+      if (evicting) {
+        await evicting;
+        stored = await storage.loadSessionByThread({
+          harnessName: this._harnessName,
+          threadId,
+          resourceId,
+        });
+        if (!stored) throw new HarnessSessionNotFoundError(threadId);
+        if (opts.sessionId !== undefined && stored.id !== opts.sessionId) {
+          throw new HarnessSessionConflictError(resourceId, threadId, opts.sessionId, stored.id);
+        }
+      }
+      if (this._closePromises.has(stored.id)) throw harnessSessionClosingError(stored);
+      if (this._pendingInteractionExpirySessionsInFlight.has(stored.id)) {
+        await this._waitForPendingInteractionExpirySweep(stored.id);
+        stored = await storage.loadSessionByThread({ harnessName: this._harnessName, threadId, resourceId });
+        if (!stored) {
+          throw new HarnessSessionNotFoundError(threadId);
+        }
+        if (opts.sessionId !== undefined && stored.id !== opts.sessionId) {
+          throw new HarnessSessionConflictError(resourceId, threadId, opts.sessionId, stored.id);
+        }
+        const evictingAfterExpiry = this._sessionEvictionsInFlight.get(stored.id);
+        if (evictingAfterExpiry) {
+          await evictingAfterExpiry;
+          return this._resolveByThread(storage, opts);
+        }
+        if (this._closePromises.has(stored.id)) throw harnessSessionClosingError(stored);
+      }
       if (stored.closedAt !== undefined) {
         // §5.3/§5.5: reopen the closed owning record instead of ignoring it and
         // creating a fresh active record on the same thread.
@@ -3693,122 +3963,210 @@ export class Harness {
       subagentTypeId?: string;
     },
   ): Promise<Session> {
-    await this._enforceMaxLiveCap();
     const sessionId = init.sessionId ?? `sess-${randomUUID()}`;
-    const now = Date.now();
-
-    const modeId = init.modeId ?? this._defaultModeId;
-    if (modeId === undefined) {
-      throw new HarnessConfigError(
-        'session()',
-        'cannot create a session without a modeId — config has no modes and no override was supplied',
-      );
-    }
-    const mode = this._modesById.get(modeId);
-    if (!mode) {
-      throw new HarnessConfigError('session().modeId', `unknown mode "${modeId}"`);
-    }
-    const record: SessionRecord = {
-      id: sessionId,
-      harnessName: this._harnessName,
-      resourceId: init.resourceId,
-      threadId: init.threadId,
-      parentSessionId: init.parentSessionId,
-      origin: init.origin,
-      ownsThread: init.ownsThread,
-      subagentDepth: init.subagentDepth ?? 0,
-      ...(init.subagentTypeId !== undefined && { subagentTypeId: init.subagentTypeId }),
-      // M4: record whether this child was created with a hard toolAllowlist, so a
-      // later hydrate can fail CLOSED if the type definition is gone. Derived from
-      // the live def at create time (the type definitely resolves now).
-      ...(init.subagentTypeId !== undefined &&
-        this._getSubagentType(init.subagentTypeId)?.toolAllowlist !== undefined && {
-          subagentToolAllowlistScoped: true,
-        }),
-      modeId,
-      modelId: init.modelId ?? '',
-      subagentModelOverrides: {},
-      // The initial mode SEEDS the base permission policy when it declares one
-      // (§4.2e); otherwise the session starts with empty rules. Runtime grants +
-      // setPolicy overlay this base. Record the seed hash so a later rehydrate can
-      // tell whether the rules are still the untouched seed (see _hydrate).
-      permissionRules: this._modePermissionRules(modeId) ?? emptyPermissionRules(),
-      permissionRulesSeedHash: sha256CanonicalJsonChecked(this._modePermissionRules(modeId) ?? emptyPermissionRules()),
-      sessionGrants: emptySessionGrants(),
-      // §9.2 — seed the per-session OM config snapshot from the resolved harness
-      // defaults so it survives hydration and `session.om.*` reads/overrides it.
-      ...(this._observationalMemory.enabled
-        ? { observationalMemory: observationalMemorySeedFromDefaults(this._observationalMemory) }
-        : {}),
-      tokenUsage: zeroTokenUsage(),
-      pendingQueue: [],
-      state: {},
-      createdAt: now,
-      lastActivityAt: now,
-      version: 0,
-      ownerId: this.ownerId,
-      leaseExpiresAt: now + this._leaseTtlMs,
-    };
-
-    const liveParentError = this._getLiveParentAdmissionError(init.parentSessionId, init.resourceId);
-    if (liveParentError) {
-      const existing = await storage.loadSessionByThread({
-        harnessName: this._harnessName,
-        threadId: init.threadId,
-        resourceId: init.resourceId,
-      });
-      if (existing) {
-        if (existing.closedAt !== undefined) {
-          return this._reopen(storage, existing);
-        }
-        if (existing.closingAt !== undefined) {
-          throw harnessSessionClosingError(existing);
-        }
-        return this._hydrate(storage, existing);
-      }
-      throw liveParentError;
-    }
-
-    await this._markExternalSessionStorageOwner(init.threadId, { requireExisting: !init.ownsThread });
-
-    let admitted;
+    const releaseLiveReservation = await this._reserveLiveMaterialization(sessionId);
     try {
-      admitted = await storage.createOrLoadActiveSession(record, {
-        initialLease: { ownerId: this.ownerId, ttlMs: this._leaseTtlMs },
-      });
-    } catch (err) {
-      if (err instanceof HarnessStorageParentSessionUnavailableError) {
-        if (err.reason === 'closing')
-          throw harnessSessionClosingError({
-            id: err.parentSessionId,
-            closingAt: err.closingAt,
-            closeDeadlineAt: err.closeDeadlineAt,
+      const now = Date.now();
+
+      const modeId = init.modeId ?? this._defaultModeId;
+      if (modeId === undefined) {
+        throw new HarnessConfigError(
+          'session()',
+          'cannot create a session without a modeId — config has no modes and no override was supplied',
+        );
+      }
+      const mode = this._modesById.get(modeId);
+      if (!mode) {
+        throw new HarnessConfigError('session().modeId', `unknown mode "${modeId}"`);
+      }
+      const sessionGrants = await this._initialSubagentSessionGrants(storage, init.parentSessionId, init.resourceId);
+      const record: SessionRecord = {
+        id: sessionId,
+        harnessName: this._harnessName,
+        resourceId: init.resourceId,
+        threadId: init.threadId,
+        parentSessionId: init.parentSessionId,
+        origin: init.origin,
+        ownsThread: init.ownsThread,
+        subagentDepth: init.subagentDepth ?? 0,
+        ...(init.subagentTypeId !== undefined && { subagentTypeId: init.subagentTypeId }),
+        // M4: record whether this child was created with a hard toolAllowlist, so a
+        // later hydrate can fail CLOSED if the type definition is gone. Derived from
+        // the live def at create time (the type definitely resolves now).
+        ...(init.subagentTypeId !== undefined &&
+          this._getSubagentType(init.subagentTypeId)?.toolAllowlist !== undefined && {
+            subagentToolAllowlistScoped: true,
+          }),
+        modeId,
+        modelId: init.modelId ?? '',
+        subagentModelOverrides: {},
+        // The initial mode SEEDS the base permission policy when it declares one
+        // (§4.2e); otherwise the session starts with empty rules. Runtime grants +
+        // setPolicy overlay this base. Record the seed hash so a later rehydrate can
+        // tell whether the rules are still the untouched seed (see _hydrate).
+        permissionRules: this._modePermissionRules(modeId) ?? emptyPermissionRules(),
+        permissionRulesSeedHash: sha256CanonicalJsonChecked(
+          this._modePermissionRules(modeId) ?? emptyPermissionRules(),
+        ),
+        sessionGrants,
+        // §9.2 — the enabled branch is unreachable while Harness-level OM is
+        // unsupported. OM must be configured on the Agent Memory instance.
+        ...(this._observationalMemory.enabled
+          ? { observationalMemory: observationalMemorySeedFromDefaults(this._observationalMemory) }
+          : {}),
+        tokenUsage: zeroTokenUsage(),
+        pendingQueue: [],
+        state: {},
+        createdAt: now,
+        lastActivityAt: now,
+        version: 0,
+        ownerId: this.ownerId,
+        leaseExpiresAt: now + this._leaseTtlMs,
+      };
+
+      const liveParentError = this._getLiveParentAdmissionError(init.parentSessionId, init.resourceId);
+      if (liveParentError) {
+        const existing = await storage.loadSessionByThread({
+          harnessName: this._harnessName,
+          threadId: init.threadId,
+          resourceId: init.resourceId,
+        });
+        if (existing) {
+          if (init.sessionId !== undefined && existing.id !== init.sessionId) {
+            throw new HarnessSessionConflictError(init.resourceId, init.threadId, init.sessionId, existing.id);
+          }
+          if (existing.closedAt !== undefined) {
+            releaseLiveReservation();
+            return this._reopen(storage, existing);
+          }
+          if (existing.closingAt !== undefined) {
+            throw harnessSessionClosingError(existing);
+          }
+          releaseLiveReservation();
+          return this._hydrate(storage, existing);
+        }
+        throw liveParentError;
+      }
+
+      await this._markExternalSessionStorageOwner(init.threadId, { requireExisting: !init.ownsThread });
+
+      let admitted;
+      try {
+        admitted = await storage.createOrLoadActiveSession(record, {
+          initialLease: { ownerId: this.ownerId, ttlMs: this._leaseTtlMs },
+        });
+      } catch (err) {
+        if (err instanceof HarnessStorageParentSessionUnavailableError) {
+          if (err.reason === 'closing')
+            throw harnessSessionClosingError({
+              id: err.parentSessionId,
+              closingAt: err.closingAt,
+              closeDeadlineAt: err.closeDeadlineAt,
+            });
+          if (err.reason === 'closed') throw new HarnessSessionClosedError(err.parentSessionId);
+          throw new HarnessSessionNotFoundError(err.parentSessionId);
+        }
+        // A version conflict on first insert means another writer beat us to
+        // this id (only realistic for deterministic ids passed by the caller).
+        if (err instanceof HarnessStorageVersionConflictError) {
+          const existingById = await storage.loadSession({
+            harnessName: this._harnessName,
+            sessionId,
           });
-        if (err.reason === 'closed') throw new HarnessSessionClosedError(err.parentSessionId);
-        throw new HarnessSessionNotFoundError(err.parentSessionId);
+          if (existingById && existingById.resourceId !== init.resourceId) {
+            // Do not leak that another tenant owns the deterministic id.
+            throw new HarnessSessionNotFoundError(sessionId);
+          }
+          if (existingById && existingById.threadId !== init.threadId) {
+            throw new HarnessSessionConflictError(init.resourceId, init.threadId, sessionId, existingById.id);
+          }
+          throw new HarnessSessionLockedError(sessionId, 'unknown', 0);
+        }
+        throw new HarnessStorageError({ operation: 'session_create', sessionId, cause: err });
       }
-      // A version conflict on first insert means another writer beat us to
-      // this id (only realistic for deterministic ids passed by the caller).
-      if (err instanceof HarnessStorageVersionConflictError) {
-        throw new HarnessSessionLockedError(sessionId, 'unknown', 0);
+
+      if (!admitted.created) {
+        if (init.sessionId !== undefined && admitted.record.id !== init.sessionId) {
+          throw new HarnessSessionConflictError(init.resourceId, init.threadId, init.sessionId, admitted.record.id);
+        }
+        // A current owner already holds this (harness, resource, thread) key.
+        // §5.3/§5.5: reopen a Closed owner, fail a Closing one, hydrate an Active
+        // one — never create a second active owner behind a non-active record.
+        if (admitted.record.closedAt !== undefined) {
+          releaseLiveReservation();
+          return this._reopen(storage, admitted.record);
+        }
+        if (admitted.record.closingAt !== undefined) {
+          throw harnessSessionClosingError(admitted.record);
+        }
+        releaseLiveReservation();
+        return this._hydrate(storage, admitted.record);
       }
-      throw new HarnessStorageError({ operation: 'session_create', sessionId, cause: err });
+
+      if (this._shutdown) {
+        await this._releaseFailedMaterializationLease(storage, admitted.record);
+        throw new Error('Harness is shut down');
+      }
+      return this._publish(storage, admitted.record);
+    } finally {
+      releaseLiveReservation();
+    }
+  }
+
+  /**
+   * Resolve the creation-time grant snapshot for an opted-in descendant.
+   * Parent records are followed to the root so a child spawned later by an
+   * already-running descendant still sees grants the root acquired after that
+   * descendant was created. Existing descendants are deliberately untouched.
+   */
+  private async _initialSubagentSessionGrants(
+    storage: HarnessStorage,
+    parentSessionId: string | undefined,
+    resourceId: string,
+  ): Promise<SessionGrants> {
+    if (!this._subagentInheritRootSessionGrants || parentSessionId === undefined) {
+      return emptySessionGrants();
     }
 
-    if (!admitted.created) {
-      // A current owner already holds this (harness, resource, thread) key.
-      // §5.3/§5.5: reopen a Closed owner, fail a Closing one, hydrate an Active
-      // one — never create a second active owner behind a non-active record.
-      if (admitted.record.closedAt !== undefined) {
-        return this._reopen(storage, admitted.record);
+    let currentSessionId = parentSessionId;
+    const visited = new Set<string>();
+    for (let depth = 0; depth <= this._subagentMaxDepth; depth += 1) {
+      if (visited.has(currentSessionId)) {
+        throw new HarnessConfigError(
+          'subagents.inheritRootSessionGrants',
+          `cannot resolve cyclic parent chain at session "${currentSessionId}"`,
+        );
       }
-      if (admitted.record.closingAt !== undefined) {
-        throw harnessSessionClosingError(admitted.record);
+      visited.add(currentSessionId);
+
+      const live = this._liveSessions.get(currentSessionId);
+      const record =
+        live?.getRecord() ??
+        (await storage.loadSession({
+          harnessName: this._harnessName,
+          sessionId: currentSessionId,
+        }));
+      if (
+        record === undefined ||
+        record === null ||
+        record.harnessName !== this._harnessName ||
+        record.resourceId !== resourceId
+      ) {
+        throw new HarnessSessionNotFoundError(currentSessionId);
       }
-      return this._hydrate(storage, admitted.record);
+      if (record.parentSessionId === undefined) {
+        return {
+          categories: [...record.sessionGrants.categories],
+          tools: [...record.sessionGrants.tools],
+        };
+      }
+      currentSessionId = record.parentSessionId;
     }
 
-    return this._publish(storage, admitted.record);
+    throw new HarnessConfigError(
+      'subagents.inheritRootSessionGrants',
+      `parent chain exceeds configured maxDepth ${this._subagentMaxDepth}`,
+    );
   }
 
   /**
@@ -3856,37 +4214,53 @@ export class Harness {
   }
 
   private async _hydrate(storage: HarnessStorage, stored: SessionRecord): Promise<Session> {
-    await this._enforceMaxLiveCap();
-    const lease = await this._acquireLease(storage, stored.harnessName, stored.id);
-    const record: SessionRecord = this._reconcilePermissionSeedOnHydrate({
-      ...stored,
-      ownerId: this.ownerId,
-      leaseExpiresAt: lease.expiresAt,
-      version: lease.version,
-    });
-    const session = this._publish(storage, record, await this._eventReplaySeedFor(storage, record));
-    // §10.2: a session re-loaded from storage into the live cache emits a
-    // (session-scoped, non-terminal) `session_hydrated` observer notification.
-    session._emit({ type: 'session_hydrated' });
-    // TM-6 (§5.6): reconcile any durable subtask→subagent delegations whose
-    // completion hook was lost across the restart — load each delegated subagent
-    // session's terminal state and roll the plan task up, or re-arm the live
-    // hook. Fire-and-forget so hydration is not blocked on subagent reads.
-    void session._reconcileDelegationsOnHydrate();
-    return session;
+    return this._materializeSession(stored.id, () => this._hydrateOnce(storage, stored));
+  }
+
+  private async _hydrateOnce(storage: HarnessStorage, stored: SessionRecord): Promise<Session> {
+    const releaseLiveReservation = await this._reserveLiveMaterialization(stored.id);
+    try {
+      await this._acquireLease(storage, stored.harnessName, stored.id);
+      try {
+        // Lease acquisition is not a lifecycle snapshot: a same-owner close may
+        // have committed after the resolver's first lookup. Reload under the
+        // acquired ownership and never hydrate the stale pre-lease record.
+        const authoritative = await storage.loadSession({
+          harnessName: stored.harnessName,
+          sessionId: stored.id,
+        });
+        if (!authoritative) throw new HarnessSessionNotFoundError(stored.id);
+        if (authoritative.closedAt !== undefined) {
+          return await this._reopenAcquiredSession(storage, authoritative);
+        }
+        if (authoritative.closingAt !== undefined) {
+          throw harnessSessionClosingError(authoritative);
+        }
+        return await this._adoptRecoveredSession(storage, authoritative);
+      } catch (error) {
+        if (!this._liveSessions.has(stored.id)) {
+          await this._releaseFailedMaterializationLease(storage, stored);
+        }
+        throw error;
+      }
+    } finally {
+      releaseLiveReservation();
+    }
   }
 
   /**
-   * §4.2e seed reconciliation on rehydrate. If a session's `permissionRules` are
-   * still EXACTLY the value its mode last seeded (untouched by runtime
-   * `setPolicy`/grants) AND that mode's declared `permissions` changed since the
-   * session was persisted (e.g. a redeploy tightened a category), re-seed to the
-   * new config. A runtime-overlaid session (its rules differ from the recorded
-   * seed) is LEFT ALONE — rehydrate is not a mode entry and must not clobber a
-   * caller's runtime intent. Legacy records with no `permissionRulesSeedHash`
-   * are also left as-is (provenance unknown ⇒ conservative). The re-seed is
-   * in-memory only here; it persists on the session's next durable write and is
-   * deterministic/idempotent across repeated hydrations.
+   * §4.2e seed reconciliation on rehydrate. Untouched sessions adopt the mode's
+   * current base exactly. Runtime overlays and grants otherwise survive a
+   * redeploy, except that a newly configured category/tool `deny` is an operator
+   * safety floor and can never be weakened by a stale `allow`, `ask`, or grant.
+   * Explicit tool exceptions declared by the current mode remain valid beneath a
+   * denied category; stale tool exceptions are removed so they cannot outrank the
+   * new category floor in `_resolveToolPolicy`.
+   *
+   * Legacy records with no `permissionRulesSeedHash` remain unchanged because
+   * their base/overlay provenance is unknown. Reconciliation is deterministic and
+   * advances the recorded seed hash so later redeploys compare against the right
+   * operator base.
    */
   private _reconcilePermissionSeedOnHydrate(record: SessionRecord): SessionRecord {
     const seedHash = record.permissionRulesSeedHash;
@@ -3895,17 +4269,58 @@ export class Harness {
     // Current mode declares no permissions → entry leaves rules untouched, so
     // there is nothing to reconcile against.
     if (currentModeSeed === undefined) return record;
-    // A runtime GRANT is also an overlay (it lives in sessionGrants, not
-    // permissionRules), so a granted session is "touched" even though its rules
-    // still match the seed — re-seeding could change the base under a grant
-    // (e.g. ask→deny, which a grant cannot lift). Respect it: leave alone.
-    if (record.sessionGrants.categories.length > 0 || record.sessionGrants.tools.length > 0) return record;
-    // Touched via setPolicy (rules diverged from the recorded seed) → respect it.
-    if (sha256CanonicalJsonChecked(record.permissionRules) !== seedHash) return record;
     const newSeedHash = sha256CanonicalJsonChecked(currentModeSeed);
     // Mode config unchanged → no-op.
     if (newSeedHash === seedHash) return record;
-    return { ...record, permissionRules: currentModeSeed, permissionRulesSeedHash: newSeedHash };
+
+    const hasGrant = record.sessionGrants.categories.length > 0 || record.sessionGrants.tools.length > 0;
+    const rulesAreUntouched = sha256CanonicalJsonChecked(record.permissionRules) === seedHash;
+    if (rulesAreUntouched && !hasGrant) {
+      return { ...record, permissionRules: currentModeSeed, permissionRulesSeedHash: newSeedHash };
+    }
+
+    const categories = { ...record.permissionRules.categories };
+    const tools = { ...record.permissionRules.tools };
+    const stricter = (left: PermissionPolicy, right: PermissionPolicy): PermissionPolicy => {
+      const rank: Record<PermissionPolicy, number> = { allow: 0, ask: 1, deny: 2 };
+      return rank[left] >= rank[right] ? left : right;
+    };
+
+    for (const [category, policy] of Object.entries(currentModeSeed.categories) as Array<
+      [ToolCategory, PermissionPolicy]
+    >) {
+      if (policy !== 'deny') continue;
+      categories[category] = 'deny';
+
+      // A per-tool rule outranks its category. Remove stale exceptions and keep
+      // only exceptions explicitly reviewed in the current mode seed.
+      for (const [toolName, existingPolicy] of Object.entries(tools)) {
+        if (this.getToolCategory({ toolName }) !== category) continue;
+        const currentModeException = currentModeSeed.tools[toolName] as PermissionPolicy | undefined;
+        if (currentModeException === undefined) {
+          delete tools[toolName];
+        } else {
+          tools[toolName] = stricter(existingPolicy, currentModeException);
+        }
+      }
+    }
+
+    for (const [toolName, policy] of Object.entries(currentModeSeed.tools) as Array<[string, PermissionPolicy]>) {
+      if (policy === 'deny') {
+        tools[toolName] = 'deny';
+        continue;
+      }
+      const category = this.getToolCategory({ toolName });
+      if (category !== null && currentModeSeed.categories[category] === 'deny') {
+        tools[toolName] = stricter((tools[toolName] as PermissionPolicy | undefined) ?? policy, policy);
+      }
+    }
+
+    return {
+      ...record,
+      permissionRules: { categories, tools },
+      permissionRulesSeedHash: newSeedHash,
+    };
   }
 
   /**
@@ -3917,23 +4332,51 @@ export class Harness {
    * just set, so no separate atomic reopen storage op is required.
    */
   private async _reopen(storage: HarnessStorage, stored: SessionRecord): Promise<Session> {
-    await this._enforceMaxLiveCap();
-    const lease = await this._acquireLease(storage, stored.harnessName, stored.id);
+    return this._materializeSession(stored.id, () => this._reopenOnce(storage, stored));
+  }
+
+  private async _reopenOnce(storage: HarnessStorage, stored: SessionRecord): Promise<Session> {
+    const releaseLiveReservation = await this._reserveLiveMaterialization(stored.id);
+    try {
+      await this._acquireLease(storage, stored.harnessName, stored.id);
+      try {
+        const authoritative = await storage.loadSession({
+          harnessName: stored.harnessName,
+          sessionId: stored.id,
+        });
+        if (!authoritative) throw new HarnessSessionNotFoundError(stored.id);
+        if (authoritative.closingAt !== undefined && authoritative.closedAt === undefined) {
+          throw harnessSessionClosingError(authoritative);
+        }
+        if (authoritative.closedAt === undefined) {
+          return await this._adoptRecoveredSession(storage, authoritative);
+        }
+        return await this._reopenAcquiredSession(storage, authoritative);
+      } catch (error) {
+        if (!this._liveSessions.has(stored.id)) {
+          await this._releaseFailedMaterializationLease(storage, stored);
+        }
+        throw error;
+      }
+    } finally {
+      releaseLiveReservation();
+    }
+  }
+
+  private async _reopenAcquiredSession(storage: HarnessStorage, stored: SessionRecord): Promise<Session> {
     const reopened: SessionRecord = this._reconcilePermissionSeedOnHydrate({
       ...stored,
       closedAt: undefined,
       closingAt: undefined,
       closeDeadlineAt: undefined,
       ownerId: this.ownerId,
-      leaseExpiresAt: lease.expiresAt,
-      version: lease.version,
     });
     let saved: { version: number };
     try {
       saved = await storage.saveSession(reopened, {
         harnessName: stored.harnessName,
         ownerId: this.ownerId,
-        ifVersion: lease.version,
+        ifVersion: stored.version,
       });
     } catch (err) {
       // Lost a race with a concurrent close/delete/reopen on the same record.
@@ -3944,7 +4387,76 @@ export class Harness {
     }
     const record: SessionRecord = { ...reopened, version: saved.version };
     await this._markExternalSessionStorageOwner(record.threadId, { requireExisting: false });
-    return this._publish(storage, record, await this._eventReplaySeedFor(storage, record));
+    return this._adoptRecoveredSession(storage, record);
+  }
+
+  private async _adoptRecoveredSession(storage: HarnessStorage, record: SessionRecord): Promise<Session> {
+    if (this._shutdown) throw new Error('Harness is shut down');
+    // Every recovered-session path (active hydrate, close-race reload, and
+    // reopen) crosses this single adoption boundary. Reconcile the provenance-
+    // tracked mode seed here so an active durable session cannot retain a
+    // policy that a redeploy tightened merely because it was not closed.
+    record = this._reconcilePermissionSeedOnHydrate(record);
+    const existing = this._liveSessions.get(record.id);
+    const session = this._adoptSession(storage, record, {
+      emitCreated: true,
+      kickQueueDrain: false,
+      eventReplaySeed: await this._eventReplaySeedFor(storage, record),
+    });
+    const adoptedHere = existing === undefined;
+    try {
+      // Reconcile before publishing readiness. An overdue durable interaction
+      // is terminalized first, then lost delegation hooks are repaired. Queue
+      // replay cannot start until both recovery barriers have succeeded.
+      await session._reconcilePendingInteractionExpiryOnHydrate();
+      await session._reconcileDelegationsOnHydrate();
+      if (this._shutdown) throw new Error('Harness is shut down');
+      session._emit({ type: 'session_hydrated' });
+      void session._kickQueueDrain();
+      return session;
+    } catch (error) {
+      if (adoptedHere) await this._discardFailedMaterialization(storage, session);
+      throw error;
+    }
+  }
+
+  private async _discardFailedMaterialization(storage: HarnessStorage, session: Session): Promise<void> {
+    if (this._liveSessions.get(session.id) !== session) return;
+    session._markEvicted(session.getRecord());
+    const bridge = this._sessionEventBridges.get(session.id);
+    if (bridge) {
+      bridge();
+      this._sessionEventBridges.delete(session.id);
+    }
+    this._liveSessions.delete(session.id);
+    this._stopLeaseRenewalLoopIfIdle();
+    await this._releaseFailedMaterializationLease(storage, session.getRecord());
+    try {
+      if (this._workspaceKind === 'per-session') {
+        await this._workspaceRegistry.releasePerSession({ sessionId: session.id });
+      } else if (this._workspaceKind === 'per-resource') {
+        await this._workspaceRegistry.releasePerResource({ resourceId: session.resourceId });
+      }
+    } catch {
+      // Recovery failed before the Session became public; workspace release is
+      // best-effort and a later successful hydration can materialize it again.
+    }
+  }
+
+  private async _releaseFailedMaterializationLease(
+    storage: HarnessStorage,
+    record: Pick<SessionRecord, 'harnessName' | 'id'>,
+  ): Promise<void> {
+    try {
+      await storage.releaseSessionLease({
+        harnessName: record.harnessName,
+        sessionId: record.id,
+        ownerId: this.ownerId,
+      });
+    } catch {
+      // Best-effort: a concurrent lifecycle owner may already have released it;
+      // otherwise the bounded lease TTL remains the final fence.
+    }
   }
 
   private _publish(
@@ -3964,6 +4476,29 @@ export class Harness {
       eventReplaySeed?: { epoch: string; nextSequence: number };
     },
   ): Session {
+    // Defensive identity registry: lifecycle callers and resolver callers may
+    // race outside the normal materialization fence. Never overwrite a distinct
+    // coordinator or its event bridge for the same durable id.
+    const existing = this._liveSessions.get(record.id);
+    if (existing) {
+      if (
+        existing.resourceId !== record.resourceId ||
+        existing.threadId !== record.threadId ||
+        existing.getRecord().harnessName !== record.harnessName
+      ) {
+        throw new HarnessSessionCorruptError({
+          reason: 'duplicate_session_owner',
+          sessionId: record.id,
+          resourceId: record.resourceId,
+          threadId: record.threadId,
+          ownerSessionIds: [existing.id],
+        });
+      }
+      if (existing.isClosing) throw harnessSessionClosingError(existing);
+      if (existing.lifecycleState !== 'live') throw new HarnessSessionClosedError(existing.id);
+      return existing;
+    }
+
     // Workspace provider validation (§2.7). If the stored record carries a
     // workspace state blob, the configured provider must match. Mismatch is
     // a hard error — refuse to hand the record to the wrong implementation.
@@ -4143,6 +4678,261 @@ export class Harness {
       }
     } finally {
       this._channelInboxRecoveryRunning = false;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Durable pending-interaction expiry worker. Unlike the process-local Session
+  // timer, this sweep discovers rows that survived a process/browser restart.
+  // It starts on Mastra bind so expiry does not depend on a later `session()`
+  // call, uses a fixed cutoff for stable keyset paging, and caps work per tick.
+  // Empty sweeps back off to one minute; finding due work resets the next sweep
+  // to one second so a backlog drains promptly without polling idle storage once
+  // per second forever.
+  // ---------------------------------------------------------------------------
+
+  private _ensurePendingInteractionExpirySweepLoop(): void {
+    if (this._shutdown || this._pendingInteractionExpirySweepLoopEnabled) return;
+    // Ephemeral Harnesses are valid (for example readiness checks and isolated
+    // tests). The durable sweep has nothing to discover without a Harness
+    // storage domain, and starting it would turn that optional configuration
+    // into an unhandled background HarnessConfigError.
+    if (this._getEffectiveSessionStorage() === undefined) return;
+    this._pendingInteractionExpirySweepLoopEnabled = true;
+    this._schedulePendingInteractionExpirySweep(0);
+  }
+
+  private _schedulePendingInteractionExpirySweep(delayMs: number): void {
+    if (
+      this._shutdown ||
+      !this._pendingInteractionExpirySweepLoopEnabled ||
+      this._pendingInteractionExpirySweepTimer !== undefined
+    ) {
+      return;
+    }
+    this._pendingInteractionExpirySweepTimer = setTimeout(() => {
+      this._pendingInteractionExpirySweepTimer = undefined;
+      void this._tickPendingInteractionExpirySweep()
+        .catch(err => {
+          this._emitStorageError(
+            err instanceof HarnessStorageError
+              ? err
+              : new HarnessStorageError({ operation: 'session_load', cause: err }),
+          );
+        })
+        .finally(() => {
+          this._schedulePendingInteractionExpirySweep(this._pendingInteractionExpirySweepDelayMs);
+        });
+    }, delayMs);
+    this._pendingInteractionExpirySweepTimer.unref?.();
+  }
+
+  private _stopPendingInteractionExpirySweepLoop(): void {
+    this._pendingInteractionExpirySweepLoopEnabled = false;
+    this._pendingInteractionExpirySweepDelayMs = PENDING_INTERACTION_EXPIRY_SWEEP_MIN_INTERVAL_MS;
+    this._pendingInteractionExpiryIdleSweepCount = 0;
+    if (this._pendingInteractionExpirySweepTimer !== undefined) {
+      clearTimeout(this._pendingInteractionExpirySweepTimer);
+      this._pendingInteractionExpirySweepTimer = undefined;
+    }
+  }
+
+  private async _waitForPendingInteractionExpirySweep(sessionId: string): Promise<void> {
+    const inFlight = this._pendingInteractionExpirySessionsInFlight.get(sessionId);
+    if (inFlight) await inFlight;
+  }
+
+  /** @internal — deterministic one-pass hook used by recovery tests/operators. */
+  async _tickPendingInteractionExpirySweep(): Promise<void> {
+    if (this._shutdown || this._pendingInteractionExpirySweepRunning) return;
+    this._pendingInteractionExpirySweepRunning = true;
+    const cutoff = Date.now();
+    let foundDueInteraction = false;
+    let sweep!: Promise<void>;
+    sweep = (async () => {
+      try {
+        const storage = this._getEffectiveSessionStorage();
+        if (storage === undefined) {
+          // Storage can disappear during teardown or in an intentionally
+          // ephemeral Harness. A background worker must never surface that as
+          // an unhandled rejection; storage-requiring foreground APIs still
+          // fail closed through `_requireStorage`.
+          this._stopPendingInteractionExpirySweepLoop();
+          return;
+        }
+        let cursor: { dueAt: number; sessionId: string } | undefined;
+        for (let pageIndex = 0; pageIndex < PENDING_INTERACTION_EXPIRY_SWEEP_MAX_PAGES; pageIndex += 1) {
+          if (this._shutdown) break;
+          let page;
+          try {
+            page = await storage.listDuePendingInteractions({
+              harnessName: this._harnessName,
+              now: cutoff,
+              limit: PENDING_INTERACTION_EXPIRY_SWEEP_PAGE_SIZE,
+              ...(cursor ? { cursor } : {}),
+            });
+            // This worker has no foreground caller to receive adapter/deploy
+            // skew. Validate the untrusted storage boundary before iterating so
+            // a malformed page becomes an observable storage_error instead of
+            // an unhandled background rejection that can crash the process.
+            assertPendingInteractionDuePage(page);
+            foundDueInteraction ||= page.items.length > 0;
+          } catch (err) {
+            this._emitStorageError(
+              err instanceof HarnessStorageError
+                ? err
+                : new HarnessStorageError({ operation: 'session_load', cause: err }),
+            );
+            break;
+          }
+
+          // Cold expiry performs lease/load/CAS/event/release storage work per
+          // session. Run distinct rows concurrently so an overdue backlog is
+          // not multiplied by adapter latency, but keep a hard process-local
+          // bound to avoid a restart stampede against the storage backend.
+          for (
+            let start = 0;
+            start < page.items.length && !this._shutdown;
+            start += PENDING_INTERACTION_EXPIRY_SWEEP_CONCURRENCY
+          ) {
+            await Promise.all(
+              page.items
+                .slice(start, start + PENDING_INTERACTION_EXPIRY_SWEEP_CONCURRENCY)
+                .map(generation => this._runPendingInteractionExpiryGeneration(storage, generation)),
+            );
+          }
+          if (page.nextCursor === undefined) break;
+          cursor = page.nextCursor;
+        }
+      } finally {
+        this._pendingInteractionExpirySweepRunning = false;
+        if (foundDueInteraction) {
+          this._pendingInteractionExpiryIdleSweepCount = 0;
+          this._pendingInteractionExpirySweepDelayMs = PENDING_INTERACTION_EXPIRY_SWEEP_MIN_INTERVAL_MS;
+        } else {
+          this._pendingInteractionExpiryIdleSweepCount += 1;
+          if (this._pendingInteractionExpiryIdleSweepCount > 1) {
+            this._pendingInteractionExpirySweepDelayMs = Math.min(
+              PENDING_INTERACTION_EXPIRY_SWEEP_MAX_INTERVAL_MS,
+              this._pendingInteractionExpirySweepDelayMs * 2,
+            );
+          }
+        }
+      }
+    })();
+    this._pendingInteractionExpirySweepInFlight = sweep;
+    try {
+      await sweep;
+    } finally {
+      // Clear ownership outside the inner async body. The no-storage path can
+      // finish synchronously before `sweep` is assigned, so doing this inside
+      // that body would leave an already-settled Promise permanently retained.
+      if (this._pendingInteractionExpirySweepInFlight === sweep) {
+        this._pendingInteractionExpirySweepInFlight = undefined;
+      }
+    }
+  }
+
+  private async _runPendingInteractionExpiryGeneration(
+    storage: HarnessStorage,
+    generation: PendingInteractionExpiryGeneration,
+  ): Promise<void> {
+    const existing = this._pendingInteractionExpirySessionsInFlight.get(generation.sessionId);
+    if (existing) {
+      await existing;
+      return;
+    }
+    const inFlight = this._expirePendingInteractionGeneration(storage, generation).finally(() => {
+      if (this._pendingInteractionExpirySessionsInFlight.get(generation.sessionId) === inFlight) {
+        this._pendingInteractionExpirySessionsInFlight.delete(generation.sessionId);
+      }
+    });
+    this._pendingInteractionExpirySessionsInFlight.set(generation.sessionId, inFlight);
+    await inFlight;
+  }
+
+  private async _expirePendingInteractionGeneration(
+    storage: HarnessStorage,
+    generation: PendingInteractionExpiryGeneration,
+  ): Promise<void> {
+    let transientSession: Session | undefined;
+    let bridge: HarnessEventUnsubscribe | undefined;
+    let leaseAcquired = false;
+    try {
+      const live = this._liveSessions.get(generation.sessionId);
+      if (live !== undefined) {
+        await live._internalExpirePendingInteractionGeneration(generation);
+        return;
+      }
+
+      // Cold cleanup deliberately bypasses `sessions.maxLive`: it never enters
+      // the live map and cannot run an agent turn. This prevents an unrelated
+      // set of pinned sessions from starving an already-overdue row forever.
+      const lease = await storage.acquireSessionLease({
+        harnessName: generation.harnessName,
+        sessionId: generation.sessionId,
+        ownerId: this.ownerId,
+        ttlMs: this._leaseTtlMs,
+      });
+      leaseAcquired = true;
+      const stored = await storage.loadSession({
+        harnessName: generation.harnessName,
+        sessionId: generation.sessionId,
+      });
+      if (stored === null || stored.closedAt !== undefined || stored.closingAt !== undefined) return;
+
+      const record: SessionRecord = {
+        ...stored,
+        ownerId: this.ownerId,
+        leaseExpiresAt: lease.expiresAt,
+        version: lease.version,
+      };
+      transientSession = new Session({
+        harness: this,
+        storage,
+        ownerId: this.ownerId,
+        record,
+        leaseExpiresAt: lease.expiresAt,
+        eventReplaySeed: await this._eventReplaySeedFor(storage, record),
+        persistTransientStreamingEvents: this._persistTransientStreamingEvents,
+      });
+      bridge = transientSession._subscribeInternal(event => this._emitter.forward(event));
+      await transientSession._internalExpirePendingInteractionGeneration(generation, { drainQueue: false });
+      await transientSession._flushEventPersistence();
+    } catch (err) {
+      if (
+        err instanceof HarnessStorageLeaseConflictError ||
+        err instanceof HarnessStorageSessionNotFoundError ||
+        err instanceof HarnessSessionLockedError ||
+        err instanceof HarnessSessionNotFoundError
+      ) {
+        return;
+      }
+      this._emitStorageError(
+        err instanceof HarnessStorageError
+          ? err
+          : new HarnessStorageError({
+              operation: leaseAcquired ? 'session_save' : 'session_lease_acquire',
+              sessionId: generation.sessionId,
+              cause: err,
+            }),
+      );
+    } finally {
+      bridge?.();
+      if (transientSession !== undefined) {
+        transientSession._markEvicted(transientSession.getRecord() as SessionRecord);
+      }
+      if (leaseAcquired) {
+        try {
+          await storage.releaseSessionLease({
+            harnessName: generation.harnessName,
+            sessionId: generation.sessionId,
+            ownerId: this.ownerId,
+          });
+        } catch {
+          // Best-effort. A failed release remains bounded by the lease TTL.
+        }
+      }
     }
   }
 
@@ -4340,26 +5130,65 @@ export class Harness {
 
   /**
    * §5.4 pressure eviction: before adding a new live session that would exceed
-   * `sessions.maxLive`, evict the least-recently-active unpinned session
-   * (flushing its dirty state first). If every live session is pinned (parked on
-   * a pending interaction), reject with `HarnessLiveSessionLimitError` rather
-   * than dropping a pending prompt. No-op when `maxLive` is `Infinity`.
+   * `sessions.maxLive`, evict the least-recently-active idle/unpinned session
+   * (flushing its dirty state first). If every live session owns active work,
+   * reject with `HarnessLiveSessionLimitError` rather than aborting a provider
+   * turn, detached child, or pending interaction. No-op when `maxLive` is
+   * `Infinity`.
    */
   private async _enforceMaxLiveCap(): Promise<void> {
     if (!Number.isFinite(this._maxLive)) return;
-    while (this._liveSessions.size >= this._maxLive) {
+    while (this._liveMaterializationOccupancy() >= this._maxLive) {
       const victim = this._selectPressureEvictionVictim();
       if (!victim) {
-        throw new HarnessLiveSessionLimitError(this._maxLive, this._liveSessions.size);
+        throw new HarnessLiveSessionLimitError(this._maxLive, this._liveMaterializationOccupancy());
       }
       await this._evictLiveSession(victim, 'pressure');
     }
   }
 
-  /** Least-recently-active unpinned live session, or undefined if all are pinned (§5.4). */
+  private _liveMaterializationOccupancy(): number {
+    let pendingOnly = 0;
+    for (const sessionId of this._pendingLiveMaterializations) {
+      if (!this._liveSessions.has(sessionId)) pendingOnly += 1;
+    }
+    return this._liveSessions.size + pendingOnly;
+  }
+
+  private async _reserveLiveMaterialization(sessionId: string): Promise<() => void> {
+    if (!Number.isFinite(this._maxLive)) return () => {};
+    let releaseReservationTurn!: () => void;
+    const reservationTurn = new Promise<void>(resolve => {
+      releaseReservationTurn = resolve;
+    });
+    const predecessor = this._liveMaterializationReservationTail;
+    this._liveMaterializationReservationTail = predecessor.then(() => reservationTurn);
+    await predecessor;
+    let ownsReservation = false;
+    try {
+      // Same-id callers normally share `_materializeSession`; keep this guard
+      // idempotent for defensive lifecycle paths.
+      if (!this._pendingLiveMaterializations.has(sessionId)) {
+        await this._enforceMaxLiveCap();
+        this._pendingLiveMaterializations.add(sessionId);
+        ownsReservation = true;
+      }
+    } finally {
+      releaseReservationTurn();
+    }
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      if (ownsReservation) this._pendingLiveMaterializations.delete(sessionId);
+    };
+  }
+
+  /** Least-recently-active idle/unpinned live session, or undefined when all are protected (§5.4). */
   private _selectPressureEvictionVictim(): Session | undefined {
     let victim: Session | undefined;
     for (const candidate of this._liveSessions.values()) {
+      if (this._pendingLiveMaterializations.has(candidate.id)) continue;
       if (this._isPinnedSubtree(candidate)) continue;
       if (!victim || candidate.lastActivityAt < victim.lastActivityAt) victim = candidate;
     }
@@ -4367,12 +5196,13 @@ export class Harness {
   }
 
   /**
-   * A session is pinned while it parks on a pending interaction; a live
-   * descendant that is pinned also pins its parent/root owner subtree, because
-   * descendant writes share the parent/root lease (§5.4 / §5.8).
+   * A session is eviction-protected while it owns any live work (including a
+   * pending interaction or detached subagent). A protected descendant also
+   * protects its parent/root owner subtree because descendant writes share the
+   * parent/root lease (§5.4 / §5.8).
    */
   private _isPinnedSubtree(session: Session): boolean {
-    if (session.isPinned()) return true;
+    if (session.isBusy()) return true;
     for (const candidate of this._liveSessions.values()) {
       if (candidate.parentSessionId === session.id && this._isPinnedSubtree(candidate)) return true;
     }
@@ -4412,7 +5242,24 @@ export class Harness {
     return current;
   }
 
-  private async _evictLiveSession(session: Session, reason: 'lease_lost' | 'pressure' | 'idle'): Promise<void> {
+  private _evictLiveSession(session: Session, reason: 'lease_lost' | 'pressure' | 'idle'): Promise<void> {
+    const existing = this._sessionEvictionsInFlight.get(session.id);
+    if (existing) return existing;
+    let eviction!: Promise<void>;
+    // Defer the body one microtask so the fence is installed before any
+    // synchronous terminal event listener can re-enter `session()`.
+    eviction = Promise.resolve()
+      .then(() => this._evictLiveSessionOnce(session, reason))
+      .finally(() => {
+        if (this._sessionEvictionsInFlight.get(session.id) === eviction) {
+          this._sessionEvictionsInFlight.delete(session.id);
+        }
+      });
+    this._sessionEvictionsInFlight.set(session.id, eviction);
+    return eviction;
+  }
+
+  private async _evictLiveSessionOnce(session: Session, reason: 'lease_lost' | 'pressure' | 'idle'): Promise<void> {
     if (this._liveSessions.get(session.id) !== session) return;
     // §5.4 `_enforceMaxLiveCap` flushes the victim first. Previously only event
     // persistence was drained, leaving the session `_flushChain` (buffered
@@ -4456,19 +5303,42 @@ export class Harness {
       session._emit({ type: 'session_eviction_warning', reason });
     }
     session._markEvicted(record);
-    session._emit({ type: 'session_evicted', reason });
-    try {
-      await session._flushEventPersistence();
-    } catch {
-      // Best-effort: lease loss may also mean event persistence is unavailable.
+    this._liveSessions.delete(session.id);
+    this._stopLeaseRenewalLoopIfIdle();
+
+    if (reason === 'pressure' || reason === 'idle') {
+      const storage = this._requireStorage('session.evict()');
+      try {
+        await storage.releaseSessionLease({
+          harnessName: record.harnessName,
+          sessionId: session.id,
+          ownerId: this.ownerId,
+        });
+      } catch (error) {
+        this._emitStorageError(
+          new HarnessStorageError({
+            operation: 'session_lease_release',
+            sessionId: session.id,
+            cause: error,
+          }),
+        );
+      }
     }
+
+    // Terminal handoff is observable only after the cache entry is gone and a
+    // soft eviction released ownership. The bridge stays wired just long
+    // enough to forward this final event; resolvers join the eviction fence.
+    session._emit({ type: 'session_evicted', reason });
     const bridge = this._sessionEventBridges.get(session.id);
     if (bridge) {
       bridge();
       this._sessionEventBridges.delete(session.id);
     }
-    this._liveSessions.delete(session.id);
-    this._stopLeaseRenewalLoopIfIdle();
+    try {
+      await session._flushEventPersistence();
+    } catch {
+      // Best-effort: lease loss may also mean event persistence is unavailable.
+    }
 
     try {
       if (this._workspaceKind === 'per-session') {
@@ -4555,6 +5425,16 @@ export class Harness {
   async closeSession(opts: { sessionId: string; resourceId?: string }): Promise<void> {
     if (this._shutdown) return;
     const storage = this._requireStorage('closeSession()');
+    await this._sessionEvictionsInFlight.get(opts.sessionId);
+    const materializing = this._sessionMaterializationsInFlight.get(opts.sessionId);
+    if (materializing) {
+      const ready = await materializing;
+      if (opts.resourceId !== undefined && ready.resourceId !== opts.resourceId) {
+        throw new HarnessSessionNotFoundError(opts.sessionId);
+      }
+      await this._closeSession(ready);
+      return;
+    }
     const live = this._liveSessions.get(opts.sessionId);
     if (live) {
       if (opts.resourceId !== undefined && live.resourceId !== opts.resourceId) {
@@ -4569,6 +5449,12 @@ export class Harness {
       throw new HarnessSessionNotFoundError(opts.sessionId);
     }
     if (stored.closedAt !== undefined) return; // already closed → idempotent.
+    const materializingAfterLoad = this._sessionMaterializationsInFlight.get(opts.sessionId);
+    if (materializingAfterLoad) {
+      const ready = await materializingAfterLoad;
+      await this._closeSession(ready);
+      return;
+    }
     await this._closeSessionRecord(storage, stored, undefined, { resourceId: opts.resourceId });
   }
 
@@ -4580,6 +5466,8 @@ export class Harness {
   async deleteSession(opts: SessionDeleteOptions): Promise<void> {
     if (this._shutdown) return;
     const storage = this._requireStorage('deleteSession()');
+    await this._sessionEvictionsInFlight.get(opts.sessionId);
+    await this._sessionMaterializationsInFlight.get(opts.sessionId);
     const stored = await storage.loadSession({ harnessName: this._harnessName, sessionId: opts.sessionId });
     if (!stored) throw new HarnessSessionNotFoundError(opts.sessionId);
     if (stored.resourceId !== opts.resourceId) {
@@ -4641,6 +5529,24 @@ export class Harness {
 
     const storage = this._requireStorage('closeSession()');
     await this._closeSessionRecord(storage, session.getRecord());
+  }
+
+  /**
+   * @internal — best-effort auto-close for an inline subagent after its tool
+   * call settles. Returns `undefined` when another close operation already owns
+   * the child (most importantly an ancestor subtree close).
+   *
+   * The ownership check and `_closeSessionRecord()` call intentionally contain
+   * no await between them. `_closeSessionRecord()` installs its promise in
+   * `_closePromises` synchronously, so two same-process close initiators cannot
+   * both pass this fence. An inline tool must not await an ancestor's close
+   * promise: that close is itself draining the parent turn which cannot finish
+   * until the tool returns, producing a close-timeout cycle.
+   */
+  _internalCloseSessionIfUnclaimed(session: Session): Promise<void> | undefined {
+    if (this._shutdown || session.isClosed || this._closePromises.has(session.id)) return undefined;
+    const storage = this._requireStorage('closeSession()');
+    return this._closeSessionRecord(storage, session.getRecord());
   }
 
   private async _closeSessionRecord(
@@ -4766,6 +5672,19 @@ export class Harness {
     depth: number,
     scope: { resourceId?: string } = {},
   ): Promise<CloseTreeNode> {
+    const materializing = this._sessionMaterializationsInFlight.get(record.id);
+    if (materializing) {
+      const ready = await materializing;
+      if (scope.resourceId !== undefined && ready.resourceId !== scope.resourceId) {
+        throw new HarnessSessionNotFoundError(record.id);
+      }
+      return {
+        record: ready.getRecord(),
+        depth,
+        live: ready,
+        leaseAcquired: false,
+      };
+    }
     const live = this._liveSessions.get(record.id);
     if (live) {
       if (scope.resourceId !== undefined && live.resourceId !== scope.resourceId) {
@@ -4982,6 +5901,18 @@ export class Harness {
       // The session's own emitter is still wired and will publish to the
       // bridge before the unsubscribe lands.
       session._emit({ type: 'session_closed', reason: 'requested' });
+      // Publish the terminal event through the bridge, then remove the closed
+      // handle before awaiting persistence so concurrent resolution cannot
+      // return a terminal process-local Session.
+      const bridge = this._sessionEventBridges.get(record.id);
+      if (bridge) {
+        bridge();
+        this._sessionEventBridges.delete(record.id);
+      }
+      if (this._liveSessions.get(record.id) === session) {
+        this._liveSessions.delete(record.id);
+      }
+      this._stopLeaseRenewalLoopIfIdle();
       try {
         await session._flushEventPersistence();
       } catch (err) {
@@ -5019,7 +5950,9 @@ export class Harness {
       bridge();
       this._sessionEventBridges.delete(record.id);
     }
-    this._liveSessions.delete(record.id);
+    if (session !== undefined && this._liveSessions.get(record.id) === session) {
+      this._liveSessions.delete(record.id);
+    }
     this._stopLeaseRenewalLoopIfIdle();
 
     if (eventPersistenceError !== undefined) {
@@ -5225,6 +6158,24 @@ export class Harness {
     return stored;
   }
 
+  /**
+   * Inspect the current owner of an exact resource/thread key without creating
+   * or reopening a session. This indexed read is the safe product-orchestration
+   * path for delete/edit cleanup; callers must not emulate it with an unbounded
+   * resource-wide `listSessions()` scan.
+   */
+  async loadSessionByThread(opts: SessionLoadByThreadOptions): Promise<SessionRecord | null> {
+    const storage = this._requireStorage('loadSessionByThread()');
+    const stored = await storage.loadSessionByThread({
+      harnessName: this._harnessName,
+      resourceId: opts.resourceId,
+      threadId: opts.threadId,
+    });
+    if (!stored) return null;
+    if (stored.closedAt !== undefined && !opts.includeClosed) return null;
+    return stored;
+  }
+
   async lookupMessageResult(opts: {
     sessionId: string;
     resourceId: string;
@@ -5267,6 +6218,26 @@ export class Harness {
     this._shutdown = true;
     this._stopLeaseRenewalLoop();
     this._stopChannelInboxRecoveryLoop();
+    this._stopPendingInteractionExpirySweepLoop();
+
+    // A timer may already be inside a storage query or exact-generation CAS.
+    // Wait for that bounded sweep to observe `_shutdown`, finish its current
+    // atomic operation, and release any transient lease before tearing storage
+    // and workspace ownership down.
+    await this._pendingInteractionExpirySweepInFlight;
+
+    // `session({ fresh: true })` deliberately bypasses resolver-key
+    // singleflight, so waiting only the resolver/materialization maps is not
+    // enough. Admission was closed synchronously above; drain every resolver
+    // call that had already crossed that boundary before snapshotting live
+    // sessions. Materializers also observe `_shutdown` and roll back their
+    // lease/publication if they resume during this wait.
+    while (this._sessionAdmissionsInFlight.size > 0) {
+      await Promise.allSettled([...this._sessionAdmissionsInFlight]);
+    }
+    if (this._sessionEvictionsInFlight.size > 0) {
+      await Promise.allSettled([...this._sessionEvictionsInFlight.values()]);
+    }
 
     let storage: HarnessStorage;
     try {
@@ -5331,6 +6302,7 @@ export class Harness {
       // and channelWorkerReadiness() reports worker_not_started. Self-gates on
       // no-channels / already-running.
       this._ensureChannelInboxRecoveryLoop();
+      this._ensurePendingInteractionExpirySweepLoop();
       if (eventPersistenceError.error instanceof HarnessStorageError) {
         throw eventPersistenceError.error;
       }
@@ -5368,6 +6340,7 @@ export class Harness {
       // and channelWorkerReadiness() reports worker_not_started. Self-gates on
       // no-channels / already-running.
       this._ensureChannelInboxRecoveryLoop();
+      this._ensurePendingInteractionExpirySweepLoop();
       if (eventPersistenceError.error instanceof HarnessStorageError) {
         throw eventPersistenceError.error;
       }
@@ -6298,18 +7271,17 @@ export class Harness {
     return this._leaseTtlMs;
   }
 
+  /** @internal — durable user-interaction TTL consumed by Session. */
+  get _internalPendingInteractionTtlMs(): number {
+    return this._pendingInteractionTtlMs;
+  }
+
   /** @internal — goal-loop defaults, consumed by `Session.setGoal()` (§4.7). */
   get _internalGoalDefaults(): Readonly<{ defaultJudgeModel?: string; defaultMaxTurns: number }> {
     return this._goalDefaults;
   }
 
-  /**
-   * @internal — opt-in byte cap for an emitted tool-event payload, consumed by
-   * `Session` at emit. Returns `undefined` (NO cap) unless the host explicitly
-   * sets `files.maxEventPayloadBytes`. Defaulting to a cap would silently change
-   * emit/persist behavior for large payloads, so this stays strictly opt-in: an
-   * unconfigured harness is byte-identical to before this feature existed.
-   */
+  /** @internal — byte cap for an emitted tool/custom-event payload. */
   get _internalMaxEventPayloadBytes(): number | undefined {
     return this._fileConfig.maxEventPayloadBytes;
   }

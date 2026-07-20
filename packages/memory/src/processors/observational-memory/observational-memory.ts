@@ -1,4 +1,5 @@
 import type { MastraDBMessage, MessageList } from '@mastra/core/agent';
+import { tryFormatTerminalToolResultForModel } from '@mastra/core/agent/message-list';
 import { coreFeatures } from '@mastra/core/features';
 import type { MastraModelConfig } from '@mastra/core/llm';
 import { resolveModelConfig } from '@mastra/core/llm';
@@ -42,10 +43,13 @@ export function getLatestStepParts(parts: MastraDBMessage['content']['parts']): 
  * internal `data-*` parts (buffering markers, observation markers, etc.) return false.
  */
 function messageHasVisibleContent(msg: MastraDBMessage): boolean {
-  const content = msg.content as { parts?: Array<{ type?: string }>; content?: string };
+  const content = msg.content as { parts?: Array<{ type?: string; data?: unknown }>; content?: string };
   if (content?.parts && Array.isArray(content.parts)) {
     return content.parts.some(p => {
       const t = p?.type;
+      if (t === 'data-terminal-tool-result') {
+        return tryFormatTerminalToolResultForModel(p.data) !== undefined;
+      }
       return t && !t.startsWith('data-') && t !== 'step-start';
     });
   }
@@ -83,7 +87,14 @@ export function getLastActivityFromMessages(messages?: MastraDBMessage[]): numbe
 
     for (let j = message.content.parts.length - 1; j >= 0; j--) {
       const part = message.content.parts[j];
-      if (!part || part.type?.startsWith('data-')) {
+      if (!part) {
+        continue;
+      }
+      if (
+        part.type?.startsWith('data-') &&
+        (part.type !== 'data-terminal-tool-result' ||
+          tryFormatTerminalToolResultForModel((part as { data?: unknown }).data) === undefined)
+      ) {
         continue;
       }
 
@@ -340,13 +351,10 @@ export class ObservationalMemory {
    * If a lock is already held, waits for it to be released before acquiring.
    */
   private async withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
-    // Wait for any existing lock to be released
-    const existingLock = this.locks.get(key);
-    if (existingLock) {
-      await existingLock;
-    }
-
-    // Create a new lock
+    // Enqueue our lock before waiting for the predecessor. If multiple callers
+    // arrive while one owner is active, each caller must observe the previous
+    // queued tail rather than all waiting on the same active promise.
+    const predecessor = this.locks.get(key);
     let releaseLock: () => void;
     const lockPromise = new Promise<void>(resolve => {
       releaseLock = resolve;
@@ -354,6 +362,9 @@ export class ObservationalMemory {
     this.locks.set(key, lockPromise);
 
     try {
+      if (predecessor) {
+        await predecessor;
+      }
       return await fn();
     } finally {
       // Release the lock

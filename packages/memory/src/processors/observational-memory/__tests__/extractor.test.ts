@@ -222,6 +222,104 @@ describe('Extractor', () => {
     expect(buildExtractorOutputSections([resolved!])).toBe('');
   });
 
+  it('keeps successful extractors when one user resolver rejects and records a sanitized slug failure', async () => {
+    const rawSecret = 'resolver-secret-must-not-leak';
+    const good = new Extractor({
+      name: 'Good Profile',
+      instructions: async () => 'Extract the profile.',
+    });
+    const bad = new Extractor({
+      name: 'Bad Profile',
+      instructions: async () => {
+        throw new Error(rawSecret);
+      },
+    });
+    const failures: Array<{ slug: string; error: string }> = [];
+
+    const resolved = await resolveExtractors([bad, good], { source: 'observer' }, failure => failures.push(failure));
+
+    expect(resolved.map(extractor => extractor.slug)).toEqual(['good-profile']);
+    expect(failures).toEqual([
+      {
+        slug: 'bad-profile',
+        error: 'Extractor "Bad Profile" resolver failed.',
+      },
+    ]);
+    expect(JSON.stringify(failures)).not.toContain(rawSecret);
+  });
+
+  it('does not downgrade extractor abort control flow into a recoverable resolver failure', async () => {
+    const aborted = new Extractor({
+      name: 'Aborted',
+      instructions: async () => {
+        throw new DOMException('aborted', 'AbortError');
+      },
+    });
+    const failures: Array<{ slug: string; error: string }> = [];
+
+    await expect(
+      resolveExtractors([aborted], { source: 'observer' }, failure => failures.push(failure)),
+    ).rejects.toMatchObject({ name: 'AbortError' });
+    expect(failures).toEqual([]);
+  });
+
+  it('rejects an extractor abort without waiting for an unrelated resolver', async () => {
+    let releasePending!: (value: string) => void;
+    const pending = new Extractor({
+      name: 'Pending',
+      instructions: () => new Promise<string>(resolve => (releasePending = resolve)),
+    });
+    const aborted = new Extractor({
+      name: 'Aborted',
+      instructions: async () => {
+        throw new DOMException('aborted', 'AbortError');
+      },
+    });
+    const failures: Array<{ slug: string; error: string }> = [];
+
+    const outcome = await Promise.race([
+      resolveExtractors([pending, aborted], { source: 'observer' }, failure => failures.push(failure)).then(
+        () => ({ status: 'resolved' as const }),
+        error => ({ status: 'rejected' as const, error }),
+      ),
+      new Promise<{ status: 'timed-out' }>(resolve => setTimeout(() => resolve({ status: 'timed-out' }), 100)),
+    ]);
+    releasePending('Resolve after the abort has propagated.');
+
+    expect(outcome).toMatchObject({ status: 'rejected', error: { name: 'AbortError' } });
+    expect(failures).toEqual([]);
+  });
+
+  it('rejects an internal extractor failure without waiting for an unrelated resolver', async () => {
+    let releasePending!: (value: string) => void;
+    const pending = new Extractor({
+      name: 'Pending',
+      instructions: () => new Promise<string>(resolve => (releasePending = resolve)),
+    });
+    const internal = new Extractor(
+      {
+        name: 'Internal State',
+        instructions: async () => {
+          throw new Error('internal invariant failed');
+        },
+      },
+      true,
+    );
+    const failures: Array<{ slug: string; error: string }> = [];
+
+    const outcome = await Promise.race([
+      resolveExtractors([pending, internal], { source: 'observer' }, failure => failures.push(failure)).then(
+        () => ({ status: 'resolved' as const }),
+        error => ({ status: 'rejected' as const, error }),
+      ),
+      new Promise<{ status: 'timed-out' }>(resolve => setTimeout(() => resolve({ status: 'timed-out' }), 100)),
+    ]);
+    releasePending('Resolve after the invariant failure has propagated.');
+
+    expect(outcome).toMatchObject({ status: 'rejected', error: { message: 'internal invariant failed' } });
+    expect(failures).toEqual([]);
+  });
+
   it('passes the active memory instance to extractor hooks', async () => {
     const onExtracted = vi.fn((_context: { memory?: unknown }) => undefined);
     const memory = { marker: 'active-memory' } as any;

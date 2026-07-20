@@ -12,7 +12,7 @@ import { TestIntegration } from '../../integration/openapi-toolset.mock';
 import { Mastra } from '../../mastra';
 import { MockMemory } from '../../memory/mock';
 import { ToolSearchProcessor } from '../../processors/processors/tool-search';
-import { MASTRA_THREAD_ID_KEY, RequestContext } from '../../request-context';
+import { MASTRA_RESOURCE_ID_KEY, MASTRA_THREAD_ID_KEY, RequestContext } from '../../request-context';
 import { createTool } from '../../tools';
 import { Agent } from '../agent';
 
@@ -1551,6 +1551,59 @@ describe('evented agent tool hooks', () => {
 });
 
 describe('processor-provided agent tool hooks', () => {
+  it('rebuilds context-backed processor tools from persisted messages before a live processor step', async () => {
+    const weatherTool = createTool({
+      id: 'weather',
+      description: 'Get current weather for a location',
+      inputSchema: z.object({ location: z.string() }),
+      execute: async ({ location }) => ({ location, conditions: 'sunny' }),
+    });
+    const toolSearch = new ToolSearchProcessor({
+      tools: { weather: weatherTool },
+      storage: 'context',
+    });
+    const agent = new Agent({
+      id: 'persisted-tool-search-agent',
+      name: 'persisted-tool-search-agent',
+      instructions: 'Use discovered tools.',
+      model: new MockLanguageModelV2(),
+      inputProcessors: [toolSearch],
+    });
+    const requestContext = new RequestContext([
+      [MASTRA_THREAD_ID_KEY, 'persisted-tool-search-thread'],
+      [MASTRA_RESOURCE_ID_KEY, 'persisted-tool-search-resource'],
+    ]);
+
+    const tools = await agent.getToolsForExecution({
+      requestContext,
+      processorMessages: [
+        {
+          id: 'load-weather-result',
+          role: 'assistant',
+          createdAt: new Date(),
+          content: {
+            format: 2,
+            parts: [
+              {
+                type: 'tool-invocation',
+                toolInvocation: {
+                  state: 'result',
+                  toolCallId: 'load-weather',
+                  toolName: 'load_tool',
+                  args: { toolName: 'weather' },
+                  result: { success: true, toolName: 'weather', loaded: ['weather'] },
+                },
+              },
+            ],
+          },
+        },
+      ],
+    });
+
+    expect(tools.weather).toBeDefined();
+    expect(tools.weather?.description).toBe(weatherTool.description);
+  });
+
   it('runs hooks exactly once for a ToolSearch meta-tool and dynamically loaded tool', async () => {
     const weatherExecute = vi.fn(async ({ location }: { location: string }) => ({ location, conditions: 'sunny' }));
     const beforeToolCall = vi.fn();
@@ -2062,6 +2115,98 @@ describe('sub-agent prompt input normalization (GitHub #14154)', () => {
     expect(afterToolCall).toHaveBeenCalledWith(expect.objectContaining({ toolName: 'agent-subAgent' }));
   });
 
+  it('isolates parallel sub-agent request contexts from the parent and sibling invocations', async () => {
+    const model = new MockLanguageModelV2({
+      doGenerate: async () => ({
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        finishReason: 'stop',
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+        content: [{ type: 'text', text: 'delegated result' }],
+        warnings: [],
+      }),
+    });
+    let releaseFirstPair!: () => void;
+    const firstPairGate = new Promise<void>(resolve => {
+      releaseFirstPair = resolve;
+    });
+    let firstPairEnteredResolve!: () => void;
+    const firstPairEntered = new Promise<void>(resolve => {
+      firstPairEnteredResolve = resolve;
+    });
+    let modelResolverCalls = 0;
+    const childCoordinates: Array<{ thread: unknown; resource: unknown }> = [];
+    const subAgent = new Agent({
+      id: 'parallel-context-sub-agent',
+      name: 'Parallel Context Sub-agent',
+      instructions: 'Return a delegated result.',
+      model: async ({ requestContext }) => {
+        modelResolverCalls += 1;
+        if (modelResolverCalls <= 2) {
+          childCoordinates.push({
+            thread: requestContext.get(MASTRA_THREAD_ID_KEY),
+            resource: requestContext.get(MASTRA_RESOURCE_ID_KEY),
+          });
+          if (modelResolverCalls === 2) firstPairEnteredResolve();
+          await firstPairGate;
+        }
+        return model;
+      },
+    });
+    const parentAgent = new Agent({
+      id: 'parallel-context-parent-agent',
+      name: 'Parallel Context Parent Agent',
+      instructions: 'Delegate work.',
+      model,
+      agents: { subAgent },
+    });
+    const parentRequestContext = new RequestContext();
+    parentRequestContext.set(MASTRA_THREAD_ID_KEY, 'parent-thread');
+    parentRequestContext.set(MASTRA_RESOURCE_ID_KEY, 'parent-resource');
+    const tools = await parentAgent['convertTools']({
+      requestContext: parentRequestContext,
+      methodType: 'generate',
+      threadId: 'parent-thread',
+      resourceId: 'parent-resource',
+    });
+    const subAgentTool = tools['agent-subAgent']!;
+
+    // Building the parent's tool schema must remain pure metadata work. The
+    // child's request-scoped model belongs to each actual child invocation.
+    expect(modelResolverCalls).toBe(0);
+
+    // Schedule both invocations before either dynamic model resolver can park
+    // on the test gate. This tests sibling concurrency rather than serial test
+    // statement evaluation through nested tool wrappers.
+    const first = Promise.resolve().then(() => {
+      return subAgentTool.execute?.({ prompt: 'First delegated task.' }, {
+        toolCallId: 'parallel-sub-agent-1',
+        messages: [],
+      } as any);
+    });
+    const second = Promise.resolve().then(() => {
+      return subAgentTool.execute?.({ prompt: 'Second delegated task.' }, {
+        toolCallId: 'parallel-sub-agent-2',
+        messages: [],
+      } as any);
+    });
+    await firstPairEntered;
+
+    expect(parentRequestContext.get(MASTRA_THREAD_ID_KEY)).toBe('parent-thread');
+    expect(parentRequestContext.get(MASTRA_RESOURCE_ID_KEY)).toBe('parent-resource');
+    expect(childCoordinates).toEqual([
+      { thread: undefined, resource: undefined },
+      { thread: undefined, resource: undefined },
+    ]);
+
+    releaseFirstPair();
+    await expect(Promise.all([first, second])).resolves.toEqual([
+      expect.objectContaining({ text: 'delegated result' }),
+      expect.objectContaining({ text: 'delegated result' }),
+    ]);
+    expect(parentRequestContext.get(MASTRA_THREAD_ID_KEY)).toBe('parent-thread');
+    expect(parentRequestContext.get(MASTRA_RESOURCE_ID_KEY)).toBe('parent-resource');
+  });
+
   it('reuses sub-agent tool schemas across conversions', async () => {
     const mockModel = new MockLanguageModelV2({
       doGenerate: async () => ({
@@ -2118,6 +2263,92 @@ describe('sub-agent prompt input normalization (GitHub #14154)', () => {
     expect(secondSubAgentTool).not.toBe(firstSubAgentTool);
     expect(secondSchemas.inputSchema).toBe(firstSchemas.inputSchema);
     expect(secondSchemas.outputSchema).toBe(firstSchemas.outputSchema);
+  });
+});
+
+describe('generated workflow tool request-context isolation', () => {
+  it('isolates parallel workflow invocations from the parent and sibling contexts', async () => {
+    const model = new MockLanguageModelV2({
+      doGenerate: async () => ({
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        finishReason: 'stop',
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+        content: [{ type: 'text', text: 'done' }],
+        warnings: [],
+      }),
+    });
+    let invocationsEntered = 0;
+    let releaseInvocations!: () => void;
+    const invocationGate = new Promise<void>(resolve => {
+      releaseInvocations = resolve;
+    });
+    const observations: Array<{
+      label: string;
+      before: unknown;
+      after: unknown;
+      requestContext: RequestContext;
+    }> = [];
+    const workflow = {
+      id: 'parallel-context-workflow',
+      description: 'Records isolated workflow request contexts.',
+      inputSchema: z.object({ label: z.string() }),
+      outputSchema: z.object({ label: z.string() }),
+      createRun: async ({ runId }: { runId: string }) => ({
+        runId,
+        start: async ({
+          inputData,
+          requestContext,
+        }: {
+          inputData: { label: string };
+          requestContext: RequestContext;
+        }) => {
+          const before = requestContext.get('workflow-scope');
+          requestContext.set('workflow-scope', inputData.label);
+          const observation = {
+            label: inputData.label,
+            before,
+            after: undefined as unknown,
+            requestContext,
+          };
+          observations.push(observation);
+          invocationsEntered += 1;
+          if (invocationsEntered === 2) releaseInvocations();
+          await invocationGate;
+          observation.after = requestContext.get('workflow-scope');
+          return { status: 'success' as const, result: { label: inputData.label } };
+        },
+      }),
+    };
+    const parentRequestContext = new RequestContext();
+    parentRequestContext.set('workflow-scope', 'parent');
+    const agent = new Agent({
+      id: 'parallel-workflow-parent',
+      name: 'Parallel Workflow Parent',
+      instructions: 'Run workflows.',
+      model,
+      workflows: { parallelContext: workflow as any },
+    });
+    const tools = await agent['convertTools']({
+      requestContext: parentRequestContext,
+      methodType: 'generate',
+    });
+    const workflowTool = tools['workflow-parallelContext']!;
+
+    const [first, second] = await Promise.all([
+      workflowTool.execute?.({ inputData: { label: 'first' } }, { toolCallId: 'workflow-first' } as any),
+      workflowTool.execute?.({ inputData: { label: 'second' } }, { toolCallId: 'workflow-second' } as any),
+    ]);
+
+    expect(first).toMatchObject({ result: { label: 'first' } });
+    expect(second).toMatchObject({ result: { label: 'second' } });
+    expect(parentRequestContext.get('workflow-scope')).toBe('parent');
+    expect(observations.map(({ label, before, after }) => ({ label, before, after }))).toEqual([
+      { label: 'first', before: 'parent', after: 'first' },
+      { label: 'second', before: 'parent', after: 'second' },
+    ]);
+    expect(observations[0]!.requestContext).not.toBe(observations[1]!.requestContext);
+    expect(observations[0]!.requestContext).not.toBe(parentRequestContext);
+    expect(observations[1]!.requestContext).not.toBe(parentRequestContext);
   });
 });
 

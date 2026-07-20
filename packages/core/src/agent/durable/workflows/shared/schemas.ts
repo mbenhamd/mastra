@@ -45,6 +45,21 @@ export const accumulatedUsageSchema = z.object({
   totalTokens: z.number(),
 });
 
+/** JSON-safe result emitted when a tool intentionally ends an agent run. */
+export const terminalToolResultSchema = z.object({
+  status: z.literal('success'),
+  items: z
+    .array(
+      z.object({
+        toolName: z.string().min(1),
+        toolCallId: z.string().min(1),
+        status: z.literal('success'),
+        value: z.json(),
+      }),
+    )
+    .min(1),
+});
+
 /**
  * Schema for output from the durable agentic workflow
  */
@@ -58,6 +73,7 @@ export const durableAgenticOutputSchema = z.object({
     steps: z.array(z.any()),
   }),
   state: z.any(),
+  terminalToolResult: terminalToolResultSchema.optional(),
 });
 
 /**
@@ -113,6 +129,8 @@ export const baseIterationStateSchema = z.object({
   lastStepResult: z.any().optional(),
   // Background task tracking
   backgroundTaskPending: z.boolean().optional(),
+  terminalToolResult: terminalToolResultSchema.optional(),
+  deferredStepFinishChunk: z.any().optional(),
   // Set when a delegation hook calls ctx.bail() — signals the loop to stop
   delegationBailed: z.boolean().optional(),
   // Set when onIterationComplete returns { continue: false, feedback } — allows

@@ -228,7 +228,7 @@ describe('Session.getDisplayState — shape', () => {
     });
   });
 
-  it('preserves streamed reasoning text separately from assistant text', async () => {
+  it('does not persist streamed reasoning in assistant-answer drafts', async () => {
     const { harness, agent, storage } = setupHarness();
     agent.enqueueRun({
       runId: 'run-draft-reasoning',
@@ -248,13 +248,13 @@ describe('Session.getDisplayState — shape', () => {
     const stored = await storage.loadSession({ sessionId: session.id });
     expect(stored?.assistantDrafts?.['run-draft-reasoning']).toMatchObject({
       text: 'answer',
-      reasoningText: 'thinking through',
       messageId: 'message-1',
       status: 'completed',
     });
+    expect(stored?.assistantDrafts?.['run-draft-reasoning']).not.toHaveProperty('reasoningText');
   });
 
-  it('does not use reasoning stream ids as assistant draft message ids', async () => {
+  it('does not create an assistant-answer draft for reasoning-only output', async () => {
     const { harness, agent, storage } = setupHarness();
     agent.enqueueRun({
       runId: 'run-reasoning-id',
@@ -270,13 +270,7 @@ describe('Session.getDisplayState — shape', () => {
     await session._flushEventPersistence();
 
     const stored = await storage.loadSession({ sessionId: session.id });
-    expect(stored?.assistantDrafts?.['run-reasoning-id']).toMatchObject({
-      text: '',
-      reasoningText: 'thinking',
-      status: 'completed',
-      finishReason: 'complete',
-    });
-    expect(stored?.assistantDrafts?.['run-reasoning-id']).not.toHaveProperty('messageId');
+    expect(stored?.assistantDrafts?.['run-reasoning-id']).toBeUndefined();
   });
 
   it('terminalizes drafts when agent_end is emitted directly', async () => {
@@ -513,6 +507,110 @@ describe('Session.getDisplayState — shape', () => {
     expect(draft?.truncated).toBe(true);
   });
 
+  it('bounds assistant draft fields by UTF-8 bytes without splitting multibyte text', async () => {
+    const { harness, agent, storage } = setupHarness();
+    const longText = '🙂'.repeat(40_000);
+    agent.enqueueRun({
+      runId: 'run-draft-unicode',
+      finishReason: 'stop',
+      text: longText,
+      chunks: [{ type: 'text-delta', payload: { id: 'msg-unicode', text: longText }, runId: 'run-draft-unicode' }],
+    });
+
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    await session.message({ content: 'hi' });
+    await session._flushEventPersistence();
+
+    const stored = await storage.loadSession({ sessionId: session.id });
+    const draft = stored?.assistantDrafts?.['run-draft-unicode'];
+    expect(new TextEncoder().encode(draft?.text ?? '').byteLength).toBeLessThanOrEqual(128_000);
+    expect(draft?.text).toBe('🙂'.repeat(32_000));
+    expect(draft?.text).not.toContain('\uFFFD');
+    expect(draft?.truncated).toBe(true);
+  });
+
+  it('keeps the durable assistant-draft projection under its aggregate byte budget', async () => {
+    const { harness } = setupHarness();
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    const internals = session as unknown as {
+      _recordAssistantDraftDelta: (opts: {
+        runId: string;
+        kind: 'text' | 'reasoning';
+        delta: string;
+        messageId?: string;
+      }) => void;
+    };
+
+    for (let index = 0; index < 8; index += 1) {
+      const runId = `run-budget-${index}`;
+      internals._recordAssistantDraftDelta({ runId, kind: 'text', delta: 'x'.repeat(128_010) });
+    }
+
+    const drafts = session.getDisplayState().assistantDrafts;
+    expect(new TextEncoder().encode(JSON.stringify(drafts)).byteLength).toBeLessThanOrEqual(384 * 1024);
+    expect(drafts['run-budget-7']).toMatchObject({
+      text: 'x'.repeat(128_000),
+      truncated: true,
+    });
+    expect(Object.keys(drafts).length).toBeLessThan(8);
+  });
+
+  it('coalesces draft checkpoints to one in-flight write and one trailing snapshot on slow storage', async () => {
+    const { harness, storage } = setupHarness();
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    const originalSaveSession = storage.saveSession.bind(storage);
+    let releaseFirstDraftSave!: () => void;
+    const firstDraftSaveGate = new Promise<void>(resolve => {
+      releaseFirstDraftSave = resolve;
+    });
+    let markFirstDraftSaveStarted!: () => void;
+    const firstDraftSaveStarted = new Promise<void>(resolve => {
+      markFirstDraftSaveStarted = resolve;
+    });
+    let draftSaveCount = 0;
+    let concurrentDraftSaves = 0;
+    let maxConcurrentDraftSaves = 0;
+    storage.saveSession = async (record, opts) => {
+      if (record.assistantDrafts?.['run-slow-draft'] !== undefined) {
+        draftSaveCount += 1;
+        concurrentDraftSaves += 1;
+        maxConcurrentDraftSaves = Math.max(maxConcurrentDraftSaves, concurrentDraftSaves);
+        if (draftSaveCount === 1) {
+          markFirstDraftSaveStarted();
+          await firstDraftSaveGate;
+        }
+      }
+      try {
+        return await originalSaveSession(record, opts);
+      } finally {
+        if (record.assistantDrafts?.['run-slow-draft'] !== undefined) concurrentDraftSaves -= 1;
+      }
+    };
+    const internals = session as unknown as {
+      _recordAssistantDraftDelta: (opts: { runId: string; kind: 'text'; delta: string }) => void;
+      _flushAssistantDraftsNow: () => Promise<void>;
+    };
+
+    internals._recordAssistantDraftDelta({ runId: 'run-slow-draft', kind: 'text', delta: 'initial' });
+    const firstFlush = internals._flushAssistantDraftsNow();
+    await firstDraftSaveStarted;
+
+    // Keep producing deltas across several debounce windows while the adapter
+    // is blocked. These used to enqueue one whole-session CAS write per window.
+    for (let index = 0; index < 3; index += 1) {
+      internals._recordAssistantDraftDelta({ runId: 'run-slow-draft', kind: 'text', delta: `-${index}` });
+      await new Promise(resolve => setTimeout(resolve, 275));
+    }
+    const terminalBarrier = internals._flushAssistantDraftsNow();
+    releaseFirstDraftSave();
+    await Promise.all([firstFlush, terminalBarrier]);
+
+    const stored = await storage.loadSession({ sessionId: session.id });
+    expect(stored?.assistantDrafts?.['run-slow-draft']?.text).toBe('initial-0-1-2');
+    expect(draftSaveCount).toBe(2);
+    expect(maxConcurrentDraftSaves).toBe(1);
+  });
+
   it('notifies display subscribers when a draft terminalizes without another display event', async () => {
     const { harness, agent } = setupHarness();
     agent.enqueueRun({
@@ -556,6 +654,16 @@ describe('Session.getDisplayState — shape', () => {
     agent.enqueueRun({
       finishReason: 'suspended',
       runId: 'run-pending',
+      chunks: [
+        {
+          type: 'tool-error',
+          payload: {
+            toolCallId: 'compile-1',
+            toolName: 'compile_latex',
+            error: new Error('compiler unavailable'),
+          },
+        },
+      ],
       suspendPayload: {
         toolCallId: 'tc-1',
         toolName: 'ask_user',
@@ -575,6 +683,14 @@ describe('Session.getDisplayState — shape', () => {
       options: [{ label: 'a' }, { label: 'b' }],
     });
     expect((ds.pending as unknown as Record<string, unknown>).runtimeDependencies).toBeUndefined();
+    expect((ds.pending as unknown as Record<string, unknown>).toolReceipts).toBeUndefined();
+    expect(session.getRecord().pendingResume?.toolReceipts).toEqual([
+      {
+        toolCallId: 'compile-1',
+        toolName: 'compile_latex',
+        status: 'error',
+      },
+    ]);
     expect(session.getRecord().pendingResume?.runtimeDependencies).toBeDefined();
     // Legacy boolean fields are gone — make sure consumers know to use `pending`.
     expect((ds as unknown as Record<string, unknown>).hasPendingQuestion).toBeUndefined();

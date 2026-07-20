@@ -6,6 +6,7 @@ import { AIV4Adapter, AIV5Adapter, AIV6Adapter } from '../adapters';
 import type { AdapterContext } from '../adapters';
 import { TypeDetector } from '../detection/TypeDetector';
 import type { MastraDBMessage, MessageSource } from '../state/types';
+import { materializeTerminalToolResult, tryFormatTerminalToolResultForModel } from '../terminal-tool-result';
 import type { AIV5Type, AIV6Type } from '../types';
 import { ensureAnthropicCompatibleMessages, sanitizeOrphanedToolPairs } from '../utils/provider-compat';
 import { getResponseProviderItemKey } from '../utils/response-item-metadata';
@@ -141,14 +142,43 @@ export function sanitizeV5UIMessages(
     }
   }
 
-  const getSafeParts = (m: AIV5Type.UIMessage, assistantTurnStillOpen: boolean) =>
-    m.parts.filter(p => {
+  const getSafeParts = (m: AIV5Type.UIMessage, assistantTurnStillOpen: boolean) => {
+    const terminalReceipts = new Map<
+      string,
+      { status: 'success'; delivery: 'terminal-assistant-message'; toolName: string }
+    >();
+    if (m.role === 'assistant') {
+      for (const part of m.parts) {
+        if (part.type !== 'data-terminal-tool-result' || !('data' in part)) continue;
+        try {
+          const terminal = materializeTerminalToolResult(part.data);
+          for (const item of terminal.items) {
+            terminalReceipts.set(item.toolCallId, {
+              status: 'success',
+              delivery: 'terminal-assistant-message',
+              toolName: item.toolName,
+            });
+          }
+        } catch {
+          // Malformed replay data neither creates a receipt nor model-visible text.
+        }
+      }
+    }
+
+    return m.parts.flatMap(p => {
       // Filter out data-* parts (custom streaming data from writer.custom())
       // These are Mastra extensions not supported by LLM providers.
       // If not filtered, convertToModelMessages produces empty content arrays
       // which causes some models to fail with "must include at least one parts field"
       if (typeof p.type === 'string' && p.type.startsWith('data-')) {
-        return false;
+        // A terminal tool result is the final assistant answer, not transient UI
+        // telemetry. Preserve its bounded, validated model projection on later
+        // turns while retaining the structured data part in storage/UI formats.
+        if (m.role === 'assistant' && p.type === 'data-terminal-tool-result' && 'data' in p) {
+          const text = tryFormatTerminalToolResultForModel(p.data);
+          return text ? ([{ type: 'text', text }] as AIV5Type.UIMessage['parts']) : [];
+        }
+        return [];
       }
 
       // Filter out empty text parts to handle legacy data from before this filtering was implemented.
@@ -156,37 +186,45 @@ export function sanitizeV5UIMessages(
       // For user messages, always filter them out — Anthropic rejects empty user text content blocks.
       if (p.type === 'text' && (!('text' in p) || p.text === '' || p.text?.trim() === '')) {
         // Always filter empty text parts from user messages
-        if (m.role === 'user') return false;
+        if (m.role === 'user') return [];
 
         // For non-user messages, only filter if there are other non-empty parts
         const hasNonEmptyParts = m.parts.some(
           part => !(part.type === 'text' && (!('text' in part) || part.text === '' || part.text?.trim() === '')),
         );
-        if (hasNonEmptyParts) return false;
+        if (hasNonEmptyParts) return [];
       }
 
-      if (!AIV5.isToolUIPart(p)) return true;
+      if (!AIV5.isToolUIPart(p)) return [p];
+
+      const terminalReceipt = terminalReceipts.get(p.toolCallId);
+      if (terminalReceipt && p.state === 'output-available') {
+        // Keep the provider-required tool-call/result pair, but do not repeat the
+        // terminal value that is materialized once as the assistant answer below.
+        return [{ ...p, output: terminalReceipt }];
+      }
 
       // When sending messages TO the LLM: keep completed tool calls and provider-executed tools.
       // Filter out incomplete client-side tool calls (input-available without providerExecuted)
       // and input-streaming states.
       if (filterIncompleteToolCalls) {
         // Completed tools (client or provider) — keep them
-        if (p.state === 'output-available' || p.state === 'output-error') return true;
+        if (p.state === 'output-available' || p.state === 'output-error') return [p];
         // Provider-executed tools may be deferred by the provider (e.g. Anthropic non-deterministically
         // defers web_search when mixed with client tool calls). Keep these so the provider API sees
         // the server_tool_use block on the next request — but ONLY on the most recent surviving
         // assistant message. On any earlier assistant turn an unresolved provider-executed call is
         // an orphan (provider dropped the result chunk, or the run aborted mid-stream) and must be
         // dropped to keep the tool-call/tool-result invariant required by provider APIs. See #15668, #14148.
-        if (p.state === 'input-available' && p.providerExecuted && assistantTurnStillOpen) return true;
-        return false;
+        if (p.state === 'input-available' && p.providerExecuted && assistantTurnStillOpen) return [p];
+        return [];
       }
 
       // When processing response messages FROM the LLM: keep input-available states
       // (tool calls waiting for client-side execution) but filter out input-streaming
-      return p.state !== 'input-streaming';
+      return p.state !== 'input-streaming' ? [p] : [];
     });
+  };
 
   let lastSurvivingAssistantIdx = -1;
   if (lastUserIdx !== messages.length - 1) {

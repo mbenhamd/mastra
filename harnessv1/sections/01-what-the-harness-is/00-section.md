@@ -79,9 +79,10 @@ A useful mental model:
 > the room responsive while it is open and can fan out updates across processes,
 > but they are not the durable architecture.
 
-**Memory is advisory context, not a source of durability truth.** The Harness
-rebuilds working memory and observational memory from Harness-owned persisted
-messages and stored observations at runtime. Memory rows are eventually
+**Memory is advisory context, not a source of durability truth.** Agent Memory
+processors rebuild working and observational memory from the persisted message
+history and stored observations at runtime; Harness does not configure a second
+per-session OM engine. Memory rows are eventually
 consistent, guarded by process-local locking only, and are **not** subject to
 the session lease or version CAS (§5.8). They must not be the proof boundary for
 queue, channel, wakeup, approval, or goal decisions — those boundaries are owned

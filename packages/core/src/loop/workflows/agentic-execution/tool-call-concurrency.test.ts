@@ -136,6 +136,47 @@ describe('tool call concurrency resolution', () => {
     ).toBe(4);
   });
 
+  it('serializes an effective tool surface containing a permission-policy ask', () => {
+    expect(
+      resolveToolCallConcurrency({
+        tools: {
+          read: safeTool,
+          write: safeTool,
+        },
+        activeTools: ['read', 'write'],
+        permissionPolicy: toolName => (toolName === 'write' ? 'ask' : 'allow'),
+        configuredConcurrency: 4,
+      }),
+    ).toBe(1);
+  });
+
+  it('keeps an all-allow permission-policy surface concurrent', () => {
+    expect(
+      resolveToolCallConcurrency({
+        tools: {
+          firstRead: safeTool,
+          secondRead: safeTool,
+        },
+        activeTools: ['firstRead', 'secondRead'],
+        permissionPolicy: () => 'allow',
+        configuredConcurrency: 4,
+      }),
+    ).toBe(4);
+  });
+
+  it('fails conservatively to sequential execution when the permission policy throws', () => {
+    expect(
+      resolveToolCallConcurrency({
+        tools: { read: safeTool },
+        activeTools: ['read'],
+        permissionPolicy: () => {
+          throw new Error('policy unavailable');
+        },
+        configuredConcurrency: 4,
+      }),
+    ).toBe(1);
+  });
+
   it('honors configured concurrency of one for safe tools', () => {
     expect(
       resolveToolCallConcurrency({

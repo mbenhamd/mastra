@@ -354,6 +354,24 @@ describe('Harness Resource', () => {
     expect(global.fetch).toHaveBeenCalledTimes(2);
   });
 
+  it('reads the durable permission snapshot without mutating the session', async () => {
+    const permissions = {
+      grants: { categories: [], tools: ['delete_paper'] },
+      rules: { categories: {}, tools: { delete_paper: 'ask' as const } },
+    };
+    mockJson({ session: makeSnapshot() });
+    mockJson(permissions);
+
+    const session = await client.getHarness().session();
+    await expect(session.permissions.get()).resolves.toEqual(permissions);
+
+    expect(global.fetch).toHaveBeenNthCalledWith(
+      2,
+      'http://localhost:4111/api/harness/default/sessions/session-1/permissions',
+      expect.objectContaining({ method: 'GET' }),
+    );
+  });
+
   it('does not retry goal kickoff requests after a failed response', async () => {
     mockJson({ session: makeSnapshot() });
     mockJson({ code: 'harness.goal_failed', message: 'failed' }, { status: 500, statusText: 'Internal Server Error' });

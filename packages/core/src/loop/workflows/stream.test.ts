@@ -29,6 +29,7 @@ vi.mock('./agentic-loop', () => ({
             await capturedOutputWriter!(
               {
                 type: 'data-moderation',
+                id: 'moderation-1',
                 data: { flagged: true },
                 runId: 'run-1',
                 from: ChunkFrom.AGENT,
@@ -100,6 +101,9 @@ describe('workflowLoopStream', () => {
     const dataChunk = chunks.find(c => c.type === 'data-moderation');
     expect(dataChunk).toBeDefined();
     expect(messageList.get.response.db().map(message => message.id)).toEqual(['rotated-msg']);
+    expect(messageList.get.response.db()[0]?.content.parts).toEqual([
+      expect.objectContaining({ type: 'data-moderation', id: 'moderation-1', data: { flagged: true } }),
+    ]);
   });
 
   it('should forward resourceId from _internal to createRun()', async () => {

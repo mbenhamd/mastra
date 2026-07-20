@@ -276,4 +276,64 @@ describe('convertStoredMessageToHarnessMessage', () => {
       },
     ]);
   });
+
+  it('materializes the one approved terminal subagent answer as assistant text', () => {
+    const message: StoredMessageRow = {
+      id: 'assistant-terminal-subagent',
+      role: 'assistant',
+      createdAt: new Date('2026-05-01T00:00:05.000Z'),
+      content: {
+        parts: [
+          {
+            type: 'data-terminal-tool-result',
+            data: {
+              status: 'success',
+              items: [
+                {
+                  toolName: 'spawn_subagent',
+                  toolCallId: 'spawn-1',
+                  status: 'success',
+                  value: {
+                    kind: 'subagent-direct-answer',
+                    subagentSessionId: 'child-1',
+                    text: 'The specialist answer.',
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      },
+    };
+
+    expect(convertStoredMessageToHarnessMessage(message).content).toEqual([
+      { type: 'text', text: 'The specialist answer.' },
+    ]);
+  });
+
+  it.each([
+    ['wrong tool', { toolName: 'ordinary_tool' }],
+    ['empty text', { value: { kind: 'subagent-direct-answer', subagentSessionId: 'child-1', text: '' } }],
+    ['wrong kind', { value: { kind: 'other', subagentSessionId: 'child-1', text: 'hidden' } }],
+  ])('does not materialize a malformed terminal answer: %s', (_label, override) => {
+    const item = {
+      toolName: 'spawn_subagent',
+      toolCallId: 'spawn-1',
+      status: 'success',
+      value: {
+        kind: 'subagent-direct-answer',
+        subagentSessionId: 'child-1',
+        text: 'must stay hidden',
+      },
+      ...override,
+    };
+    const message: StoredMessageRow = {
+      id: 'assistant-invalid-terminal',
+      role: 'assistant',
+      createdAt: new Date('2026-05-01T00:00:06.000Z'),
+      content: { parts: [{ type: 'data-terminal-tool-result', data: { status: 'success', items: [item] } }] },
+    };
+
+    expect(convertStoredMessageToHarnessMessage(message).content).toEqual([]);
+  });
 });

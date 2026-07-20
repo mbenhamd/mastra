@@ -1,9 +1,11 @@
 import { convertArrayToReadableStream, MockLanguageModelV2 } from '@internal/ai-sdk-v5/test';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { z } from 'zod';
 import { Mastra } from '../../mastra';
 import { MockMemory } from '../../memory';
 import { RequestContext } from '../../request-context';
 import { MockStore } from '../../storage';
+import { createTool } from '../../tools';
 import { Agent } from '../agent';
 
 /**
@@ -12,17 +14,21 @@ import { Agent } from '../agent';
  */
 function makeScriptedModel(scripts: Array<() => ReadableStream<any>>) {
   let calls = 0;
+  const callOptions: any[] = [];
   const model = new MockLanguageModelV2({
     doGenerate: async () => {
       throw new Error('doGenerate not used in these tests');
     },
-    doStream: async () => ({
-      rawCall: { rawPrompt: null, rawSettings: {} },
-      warnings: [],
-      stream: scripts[calls++]!(),
-    }),
+    doStream: async options => {
+      callOptions.push(options);
+      return {
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        warnings: [],
+        stream: scripts[calls++]!(),
+      };
+    },
   });
-  return { model, getCallCount: () => calls };
+  return { model, getCallCount: () => calls, getCallOptions: () => callOptions };
 }
 
 function textResponse(text: string) {
@@ -36,6 +42,27 @@ function textResponse(text: string) {
       {
         type: 'finish',
         finishReason: 'stop',
+        usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+      },
+    ]);
+}
+
+function toolCallResponse(toolName: string, input: Record<string, unknown>) {
+  return () =>
+    convertArrayToReadableStream([
+      { type: 'stream-start', warnings: [] },
+      { type: 'response-metadata', id: 'id-tool', modelId: 'mock', timestamp: new Date(0) },
+      {
+        type: 'tool-call',
+        toolCallType: 'function',
+        toolCallId: 'call-1',
+        toolName,
+        input: JSON.stringify(input),
+        providerExecuted: false,
+      },
+      {
+        type: 'finish',
+        finishReason: 'tool-calls',
         usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
       },
     ]);
@@ -118,16 +145,94 @@ describe('Agent.streamUntilIdle', () => {
     expect(getCallCount()).toBe(1);
   });
 
+  it('uses one dynamic-defaults resolution for the complete first agentic turn', async () => {
+    const memory = new MockMemory();
+    let defaultOptionsCalls = 0;
+    const { model, getCallCount } = makeScriptedModel([
+      toolCallResponse('continueTool', { value: 'next' }),
+      textResponse('done'),
+    ]);
+    const continueTool = createTool({
+      id: 'continueTool',
+      description: 'Continue the test loop.',
+      inputSchema: z.object({ value: z.string() }),
+      execute: async () => ({ ok: true }),
+    });
+    const agent = new Agent({
+      id: 'single-default-resolution',
+      name: 'single-default-resolution',
+      instructions: 'Use the tool, then answer.',
+      model,
+      memory,
+      tools: { continueTool },
+      defaultOptions: () => ({
+        // A second resolution would lower the cap and terminate before the
+        // scripted final-text step, reproducing the live dynamic-policy bug.
+        maxSteps: ++defaultOptionsCalls === 1 ? 2 : 1,
+      }),
+    });
+    mastra.addAgent(agent, agent.id);
+
+    const result = await agent.streamUntilIdle('continue', {
+      memory: { thread: 'single-default-thread', resource: 'user-1' },
+    });
+    await drain(result.fullStream as ReadableStream<any>);
+
+    expect(defaultOptionsCalls).toBe(1);
+    expect(getCallCount()).toBe(2);
+    expect(await result.text).toBe('done');
+    expect(await result.finishReason).toBe('stop');
+  });
+
+  it('keeps an explicit caller step limit above dynamic idle-loop defaults', async () => {
+    const memory = new MockMemory();
+    let defaultOptionsCalls = 0;
+    const { model, getCallCount } = makeScriptedModel([
+      toolCallResponse('continueTool', { value: 'next' }),
+      textResponse('must-not-run'),
+    ]);
+    const continueTool = createTool({
+      id: 'continueTool',
+      description: 'Continue the test loop.',
+      inputSchema: z.object({ value: z.string() }),
+      execute: async () => ({ ok: true }),
+    });
+    const agent = new Agent({
+      id: 'caller-step-limit',
+      name: 'caller-step-limit',
+      instructions: 'Use the tool, then answer.',
+      model,
+      memory,
+      tools: { continueTool },
+      defaultOptions: () => {
+        defaultOptionsCalls += 1;
+        return { maxSteps: 2 };
+      },
+    });
+    mastra.addAgent(agent, agent.id);
+
+    const result = await agent.streamUntilIdle('continue', {
+      maxSteps: 1,
+      memory: { thread: 'caller-step-thread', resource: 'user-1' },
+    });
+    await drain(result.fullStream as ReadableStream<any>);
+
+    expect(defaultOptionsCalls).toBe(1);
+    expect(getCallCount()).toBe(1);
+    expect(await result.finishReason).toBe('tool-calls');
+  });
+
   it('re-invokes stream when a background task completes', async () => {
     const memory = new MockMemory();
     let memoryResolverCalls = 0;
     let defaultOptionsCalls = 0;
     const memoryScopes: string[] = [];
     const instructionScopes: string[] = [];
-    const { model, getCallCount } = makeScriptedModel([
+    const { model, getCallCount, getCallOptions } = makeScriptedModel([
       textResponse('first response'),
       textResponse('continuation response'),
     ]);
+    let callerOnFinishCalls = 0;
 
     const agent = new Agent({
       id: 'a2',
@@ -141,7 +246,10 @@ describe('Agent.streamUntilIdle', () => {
         defaultOptionsCalls += 1;
         const requestContext = new RequestContext();
         requestContext.set('scope', `turn-${defaultOptionsCalls}`);
-        return { requestContext };
+        return {
+          requestContext,
+          context: [{ role: 'user' as const, content: `default-context-${defaultOptionsCalls}` }],
+        };
       },
       memory: ({ requestContext }) => {
         memoryResolverCalls += 1;
@@ -174,6 +282,9 @@ describe('Agent.streamUntilIdle', () => {
 
     const outer = await agent.streamUntilIdle('hi', {
       memory: { thread: 'thread-2', resource: 'user-1' },
+      onFinish: () => {
+        callerOnFinishCalls += 1;
+      },
     });
 
     // Mark a task as running so the outer knows to wait for it.
@@ -191,6 +302,67 @@ describe('Agent.streamUntilIdle', () => {
     expect(defaultOptionsCalls).toBe(2);
     expect(memoryScopes).toEqual(['turn-1', 'turn-2']);
     expect(instructionScopes).toEqual(['turn-1', 'turn-2']);
+    expect(callerOnFinishCalls).toBe(1);
+    const continuationPrompt = JSON.stringify(getCallOptions()[1]?.prompt);
+    expect(continuationPrompt).toContain('default-context-2');
+    expect(continuationPrompt).toContain('task-1');
+  });
+
+  it('rejects a continuation policy change before resolving memory or invoking the model', async () => {
+    const memory = new MockMemory();
+    let defaultOptionsCalls = 0;
+    let memoryResolverCalls = 0;
+    const { model, getCallCount } = makeScriptedModel([textResponse('initial response'), textResponse('must not run')]);
+    const agent = new Agent({
+      id: 'continuation-preflight-agent',
+      name: 'continuation-preflight-agent',
+      instructions: 'test',
+      model,
+      requestContextSchema: z.object({ principal: z.string() }),
+      defaultOptions: () => {
+        defaultOptionsCalls += 1;
+        const requestContext = new RequestContext();
+        if (defaultOptionsCalls === 1) requestContext.set('principal', 'allowed-user');
+        return { requestContext };
+      },
+      memory: () => {
+        memoryResolverCalls += 1;
+        return memory;
+      },
+    });
+    mastra.addAgent(agent, agent.id);
+
+    const bgManager = mastra.backgroundTaskManager!;
+    const publishEvent = (type: string) =>
+      (bgManager as any).publishLifecycleEvent(type, {
+        id: 'revoked-task',
+        toolName: 'dummy',
+        toolCallId: 'revoked-task',
+        runId: 'revoked-run',
+        agentId: agent.id,
+        threadId: 'continuation-preflight-thread',
+        resourceId: 'user-1',
+        status: type.split('.')[1],
+        result: {},
+        retryCount: 0,
+        maxRetries: 0,
+        timeoutMs: 1000,
+        createdAt: new Date(),
+        args: {},
+      });
+
+    const outer = await agent.streamUntilIdle('hi', {
+      memory: { thread: 'continuation-preflight-thread', resource: 'user-1' },
+    });
+    await publishEvent('task.running');
+    await new Promise(resolve => setTimeout(resolve, 50));
+    await publishEvent('task.completed');
+
+    await expect(drain(outer.fullStream as ReadableStream<any>)).rejects.toThrow('Request context validation failed');
+
+    expect(defaultOptionsCalls).toBe(2);
+    expect(memoryResolverCalls).toBe(1);
+    expect(getCallCount()).toBe(1);
   });
 
   it('serializes continuations (only one inner stream at a time)', async () => {

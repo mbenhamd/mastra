@@ -562,6 +562,22 @@ export interface Processor<TId extends string = string, TTripwireMetadata = unkn
   readonly name?: string;
   readonly description?: string;
   /**
+   * Declares that this output processor is transparent to direct terminal
+   * tool-result delivery. Terminal tools fail closed when any configured
+   * output processor does not make this declaration.
+   *
+   * Use this only for persistence/indexing processors that neither block nor
+   * rewrite caller-facing tool results.
+   */
+  readonly terminalToolResultPolicy?: 'pass-through';
+  /**
+   * Declares that this processor is the single transcript-persistence commit
+   * point for terminal tool results. The owner must be the final processor in
+   * the output chain so no fallible processor can run after the answer has
+   * been durably committed.
+   */
+  readonly terminalToolResultPersistence?: 'owner';
+  /**
    * Declares that this processor owns skill discovery and instruction loading.
    * Agents use this to avoid adding eager skill context and overlapping skill tools.
    */
@@ -813,6 +829,10 @@ export type ProcessorWorkflowPhase = ProcessorStepOutput['phase'];
 export type ProcessorWorkflow = Workflow<any, any, string, any, ProcessorStepOutput, ProcessorStepOutput, any> & {
   /** @internal Processors in a combined workflow that compute state signals after input-step execution. */
   __stateSignalProcessors?: Processor[];
+  /** Preserved when every child processor is transparent to terminal tool-result delivery. */
+  terminalToolResultPolicy?: Processor['terminalToolResultPolicy'];
+  /** Preserved when the combined workflow has one final persistence owner. */
+  terminalToolResultPersistence?: Processor['terminalToolResultPersistence'];
 };
 
 /**

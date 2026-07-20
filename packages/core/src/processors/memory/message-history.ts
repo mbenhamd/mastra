@@ -1,11 +1,13 @@
 import type { Processor } from '..';
 import type { MastraDBMessage, MessageList } from '../../agent';
+import { materializeTerminalToolResult } from '../../loop/shared/terminal-tool-result';
 import { parseMemoryRequestContext } from '../../memory';
 import { removeWorkingMemoryTags } from '../../memory/working-memory-utils';
 import { SpanType, EntityType } from '../../observability';
 import type { ObservabilityContext, MemoryOperationAttributes } from '../../observability';
 import type { RequestContext } from '../../request-context';
 import type { MemoryStorage } from '../../storage';
+import type { TerminalToolResult } from '../../tools';
 import {
   filterToolCallMessages,
   getPreservedModelOutputParts,
@@ -14,6 +16,35 @@ import {
 import type { ToolCallFilteringOptions } from '../tool-call-filter-utils';
 
 const DEFAULT_PERSISTED_MODEL_OUTPUT_BYTES = 16 * 1024;
+const MAX_PERSISTED_TERMINAL_TOOL_RESULT_ID_BYTES = 1024;
+
+type PersistedTerminalToolResultPart = {
+  type: 'data-terminal-tool-result';
+  id: string;
+  data: TerminalToolResult;
+};
+
+function projectTerminalToolResultPart(part: unknown): PersistedTerminalToolResultPart | undefined {
+  if (!part || typeof part !== 'object' || Array.isArray(part)) return undefined;
+  const candidate = part as Record<string, unknown>;
+  if (
+    candidate.type !== 'data-terminal-tool-result' ||
+    typeof candidate.id !== 'string' ||
+    candidate.id.length === 0 ||
+    !candidate.data ||
+    typeof candidate.data !== 'object' ||
+    Array.isArray(candidate.data)
+  ) {
+    return undefined;
+  }
+  if (new TextEncoder().encode(candidate.id).byteLength > MAX_PERSISTED_TERMINAL_TOOL_RESULT_ID_BYTES) return undefined;
+  try {
+    const data = materializeTerminalToolResult(candidate.data);
+    return { type: 'data-terminal-tool-result', id: candidate.id, data };
+  } catch {
+    return undefined;
+  }
+}
 
 export type MessageHistoryToolCallFilterOptions = Pick<
   ToolCallFilteringOptions,
@@ -60,6 +91,8 @@ export interface MessageHistoryOptions {
 export class MessageHistory implements Processor {
   readonly id = 'message-history';
   readonly name = 'MessageHistory';
+  readonly terminalToolResultPolicy = 'pass-through' as const;
+  readonly terminalToolResultPersistence = 'owner' as const;
   private storage: MemoryStorage;
   private lastMessages?: number;
   private toolCallFilter?: MessageHistoryToolCallFilterOptions;
@@ -348,7 +381,11 @@ export class MessageHistory implements Processor {
       .filter((part): part is Extract<typeof part, { type: 'text' }> => part.type === 'text')
       .map(part => ({ type: 'text' as const, text: part.text }))
       .filter(part => part.text.length > 0);
-    const assistantParts = [...approvedOutcomes, ...finalAnswer];
+    const terminalResults = finalAssistant.content.parts
+      .slice(finalAnswerBoundary + 1)
+      .map(projectTerminalToolResultPart)
+      .filter((part): part is PersistedTerminalToolResultPart => part !== undefined);
+    const assistantParts = [...approvedOutcomes, ...terminalResults, ...finalAnswer];
 
     if (assistantParts.length > 0) {
       projected.push({

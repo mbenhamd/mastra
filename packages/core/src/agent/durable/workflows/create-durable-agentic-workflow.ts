@@ -5,6 +5,7 @@ import { runScorer } from '../../../evals/hooks';
 import type { PubSub } from '../../../events/pubsub';
 import { validateMaxSteps } from '../../../llm/model/max-steps';
 import type { IMastraLogger } from '../../../logger';
+import { outputProcessorsOwnTerminalPersistence } from '../../../loop/shared/terminal-tool-result';
 import { pruneAgentLoopSnapshot } from '../../../loop/workflows/prune-snapshot';
 import type { Mastra } from '../../../mastra';
 import { createObservabilityContext, InternalSpans } from '../../../observability';
@@ -14,9 +15,21 @@ import { PUBSUB_SYMBOL } from '../../../workflows/constants';
 import { createWorkflow } from '../../../workflows/create';
 import type { WorkflowOptions } from '../../../workflows/types';
 import { MessageList } from '../../message-list';
+import {
+  TOOL_PERMISSION_POLICY_KEY,
+  TOOL_PERMISSION_POLICY_REQUIRED_KEY,
+  TOOL_PERMISSION_POLICY_STABLE_KEY,
+} from '../../tool-permission-prefilter';
+import type { ToolPermissionPolicy } from '../../tool-permission-prefilter';
 import { DurableStepIds, DurableAgentDefaults } from '../constants';
 import { getBoundRunRegistryEntry, globalRunRegistry } from '../run-registry';
-import { emitChunkEvent, emitFinishEvent, emitIterationCompleteEvent } from '../stream-adapter';
+import {
+  assertTerminalToolResultRetained,
+  createTerminalToolResultEnvelope,
+  emitChunkEvent,
+  emitFinishEvent,
+  emitIterationCompleteEvent,
+} from '../stream-adapter';
 import type {
   DurableToolCallInput,
   DurableAgenticWorkflowInput,
@@ -25,6 +38,7 @@ import type {
   DurableToolCallOutput,
   SerializableScorersConfig,
 } from '../types';
+import { createDurableRuntimeRequestContext } from '../utils/resolve-runtime';
 import { mapDurableIterationToLLMInput } from './map-llm-input';
 import {
   modelConfigSchema,
@@ -83,6 +97,11 @@ const durableAgenticInputSchema = z.object({
   // JSON-safe snapshot of requestContext.entries() so durable steps can read
   // it (e.g. is-task-complete scorers pass it as customContext).
   requestContextEntries: z.record(z.string(), z.any()).optional(),
+  requiredRequestContextCapabilities: z
+    .object({
+      authToken: z.literal(true).optional(),
+    })
+    .optional(),
 });
 
 // Re-export shared output schema (identical across implementations)
@@ -215,12 +234,20 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
     // is shared across runs, so this must be a resolver — never a mutated
     // shared options object.
     .foreach(toolCallStep, {
-      concurrency: ({ inputData, getInitData }) => {
+      concurrency: ({ inputData, getInitData, requestContext }) => {
         const state = getInitData() as IterationState | undefined;
+        const policyCandidate = requestContext?.get(TOOL_PERMISSION_POLICY_KEY);
+        const permissionPolicy =
+          typeof policyCandidate === 'function' ? (policyCandidate as ToolPermissionPolicy) : undefined;
         return resolveDurableToolCallConcurrency({
           options: state?.options,
           toolsMetadata: state?.toolsMetadata,
           toolCalls: inputData as DurableToolCallInput[],
+          permissionPolicy: permissionPolicy ? toolCall => permissionPolicy(toolCall.toolName) : undefined,
+          permissionPolicyStable: requestContext?.get(TOOL_PERMISSION_POLICY_STABLE_KEY) === true,
+          permissionPolicyRequired:
+            state?.options.permissionPolicyRequired === true ||
+            requestContext?.get(TOOL_PERMISSION_POLICY_REQUIRED_KEY) === true,
         });
       },
     })
@@ -348,6 +375,8 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
         // reason so the FINISH event carries 'abort' and the client sees
         // the correct finishReason.
         if (registryEntry?.abortSignal?.aborted) {
+          state.terminalToolResult = undefined;
+          state.deferredStepFinishChunk = undefined;
           if (state.lastStepResult) {
             state.lastStepResult.reason = 'abort';
             state.lastStepResult.isContinued = false;
@@ -383,7 +412,7 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
         // engines (Inngest after worker restart) won't have the registry entry
         // and fall back to maxSteps only.
         let stopWhenMatched = false;
-        if (shouldContinue && underMaxSteps && !hasFinishedSteps) {
+        if (shouldContinue && underMaxSteps && !hasFinishedSteps && !state.terminalToolResult) {
           const stopWhen = registryEntry?.stopWhen;
           if (stopWhen && state.accumulatedSteps.length > 0) {
             const conditions = Array.isArray(stopWhen) ? stopWhen : [stopWhen];
@@ -436,6 +465,10 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
 
               state.messageListState = drainList.serialize();
 
+              // A queued signal wins over a just-settled terminal tool result.
+              // The model must process the new signal before this run can end.
+              state.terminalToolResult = undefined;
+
               // Force continuation — the LLM must see the injected signals
               if (state.lastStepResult) {
                 state.lastStepResult.isContinued = true;
@@ -448,6 +481,11 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
             // drainPendingSignals() is inside the try so signals remain
             // queued if the drain function itself throws.
           }
+        }
+
+        if (state.terminalToolResult) {
+          hasFinishedSteps = true;
+          hardStop = true;
         }
 
         let isFinal = !shouldContinue || !underMaxSteps || hasFinishedSteps;
@@ -564,6 +602,20 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
           }
         }
 
+        // stopWhen/onIterationComplete can abort after the first arbitration
+        // check. Re-check before any deferred terminal chunk can be committed.
+        if (registryEntry?.abortSignal?.aborted) {
+          state.terminalToolResult = undefined;
+          state.deferredStepFinishChunk = undefined;
+          hasFinishedSteps = true;
+          hardStop = true;
+          isFinal = true;
+          if (state.lastStepResult) {
+            state.lastStepResult.reason = 'abort';
+            state.lastStepResult.isContinued = false;
+          }
+        }
+
         // Rotate messageId for the next iteration. Each iteration's assistant
         // response is a distinct message, mirroring the non-durable agentic
         // loop which calls rotateResponseMessageId() between iterations. The
@@ -598,6 +650,20 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
         // continuation decision.
         if (pubsub) {
           const lastStep = state.accumulatedSteps[state.accumulatedSteps.length - 1];
+          // A terminal iteration keeps step-finish deferred until the durable
+          // finalization step. Loop conditions can be re-evaluated during
+          // replay, so publishing the terminal result from here could duplicate
+          // a caller-facing answer. Ordinary iterations still flush before the
+          // next model call.
+          if (!state.terminalToolResult && state.deferredStepFinishChunk) {
+            try {
+              await emitChunkEvent(pubsub, state.runId, state.deferredStepFinishChunk as any);
+            } catch (error) {
+              (mastra as Mastra | undefined)
+                ?.getLogger?.()
+                ?.warn?.(`[DurableAgent] Failed to emit deferred step-finish: ${error}`);
+            }
+          }
           await emitIterationCompleteEvent(pubsub, state.runId, {
             iteration: state.iterationCount,
             maxIterations: runMaxSteps,
@@ -612,6 +678,9 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
             agentId: initData.agentId,
             agentName: initData.agentName,
           });
+        }
+        if (!state.terminalToolResult) {
+          state.deferredStepFinishChunk = undefined;
         }
 
         return !isFinal;
@@ -641,6 +710,54 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
               details: { agentId: state.agentId, runId: state.runId },
             });
           }
+
+          if (registryEntry?.abortSignal?.aborted) {
+            state.terminalToolResult = undefined;
+            state.deferredStepFinishChunk = undefined;
+            if (state.lastStepResult) {
+              state.lastStepResult.reason = 'abort';
+              state.lastStepResult.isContinued = false;
+            }
+          }
+
+          // Only finalization may make a terminal envelope durable. Mapping is
+          // still followed by background-task and signal precedence checks;
+          // persisting there would leave a false terminal marker when either
+          // one wins. MessageMerger de-duplicates this canonical data part if
+          // the durable final map is replayed.
+          const terminalEnvelope = state.terminalToolResult
+            ? createTerminalToolResultEnvelope(state.runId, state.accumulatedSteps.length, state.terminalToolResult)
+            : undefined;
+          if (terminalEnvelope) {
+            state.terminalToolResult = terminalEnvelope.data;
+          }
+
+          // Reuse the registry MessageList when present. Observational Memory's
+          // live turn holds this exact object, so replacing it during finalization
+          // would make the persistence owner save a stale pre-terminal list.
+          const finalMessageList = registryEntry?.messageList ?? new MessageList();
+          finalMessageList.deserialize(state.messageListState);
+          if (terminalEnvelope) {
+            finalMessageList.add(
+              {
+                id: state.messageId,
+                role: 'assistant',
+                content: {
+                  format: 2,
+                  parts: [{ type: 'data-terminal-tool-result', ...terminalEnvelope }],
+                },
+                createdAt: new Date(),
+              } as any,
+              'response',
+            );
+          }
+
+          const finalRequestContext = createDurableRuntimeRequestContext({
+            entries: initData.requestContextEntries,
+            state: initData.state,
+            liveContext: requestContext,
+          });
+
           if (registryEntry?.outputProcessors?.length) {
             try {
               const { ProcessorRunner } = await import('../../../processors/runner');
@@ -652,84 +769,88 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
                 agentName: initData.agentName ?? initData.agentId,
                 processorStates: registryEntry.processorStates,
               });
-              const outputMessageList = new MessageList();
-              outputMessageList.deserialize(state.messageListState);
               // Forward the step's tracingContext so processor_run spans parent
               // to the AGENT_RUN ancestor via ProcessorRunner's findParent walk.
               await runner.runOutputProcessors(
-                outputMessageList,
+                finalMessageList,
                 createObservabilityContext(tracingContext),
-                requestContext ?? new RequestContext(),
+                finalRequestContext,
                 0,
               );
             } catch (error) {
               logger?.warn?.(`[DurableAgent] Error running output processors: ${error}`);
+              if (terminalEnvelope) throw error;
             }
+          }
+          if (terminalEnvelope) {
+            assertTerminalToolResultRetained(finalMessageList, state.messageId, terminalEnvelope);
+          }
+          state.messageListState = finalMessageList.serialize();
+          if (registryEntry) {
+            registryEntry.messageList = finalMessageList;
           }
 
           // Memory persistence (executeOnFinish equivalent)
           const durableState = initData.state;
+          const terminalPersistenceOwned = outputProcessorsOwnTerminalPersistence(registryEntry?.outputProcessors);
+          const terminalMemoryPersistenceExpected = Boolean(
+            terminalEnvelope &&
+            durableState.memoryConfigured &&
+            durableState.threadId &&
+            durableState.resourceId &&
+            !durableState.memoryConfig?.readOnly,
+          );
+          if (terminalMemoryPersistenceExpected && !terminalPersistenceOwned && !registryEntry?.memory) {
+            throw new Error(
+              `[DurableAgent] Cannot deliver terminal result for run "${state.runId}" because configured memory could not be resolved.`,
+            );
+          }
+          if (terminalMemoryPersistenceExpected && durableState?.observationalMemory && !terminalPersistenceOwned) {
+            throw new Error(
+              `[DurableAgent] Cannot deliver terminal result for run "${state.runId}" because observational-memory persistence could not be resolved.`,
+            );
+          }
+          if (terminalMemoryPersistenceExpected && !terminalPersistenceOwned && !registryEntry?.saveQueueManager) {
+            throw new Error(
+              `[DurableAgent] Cannot deliver terminal result for run "${state.runId}" because the memory save queue could not be resolved.`,
+            );
+          }
           if (
             registryEntry?.saveQueueManager &&
             registryEntry.memory &&
             durableState?.threadId &&
             durableState?.resourceId &&
             !durableState.observationalMemory &&
+            (!terminalEnvelope || !terminalPersistenceOwned) &&
             // Respect readOnly memory config ("read memory but don't save new
             // messages"). Mirrors the non-durable executeOnFinish `!readOnlyMemory`
             // guard and the MessageHistory output processor's readOnly check.
             !durableState.memoryConfig?.readOnly
           ) {
             try {
-              const memoryMessageList = new MessageList();
-              memoryMessageList.deserialize(state.messageListState);
-
               if (!durableState.threadExists) {
                 await registryEntry.memory.createThread?.({
                   threadId: durableState.threadId,
                   resourceId: durableState.resourceId,
                   memoryConfig: durableState.memoryConfig,
                 });
+                durableState.threadExists = true;
               }
 
-              await registryEntry.saveQueueManager.flushMessages(
-                memoryMessageList,
-                durableState.threadId,
-                durableState.memoryConfig,
-              );
+              await (terminalEnvelope
+                ? registryEntry.saveQueueManager.flushMessagesStrict(
+                    finalMessageList,
+                    durableState.threadId,
+                    durableState.memoryConfig,
+                  )
+                : registryEntry.saveQueueManager.flushMessages(
+                    finalMessageList,
+                    durableState.threadId,
+                    durableState.memoryConfig,
+                  ));
             } catch (error) {
               logger?.warn?.(`[DurableAgent] Error persisting messages: ${error}`);
-            }
-          }
-
-          // Thread title generation (executeOnFinish equivalent).
-          // The non-durable `#executeOnFinish` generates a thread title from the first user
-          // message when `memory.options.generateTitle` is set. That branch was never ported
-          // to the durable path, so `generateTitle` silently never fired for durable/evented
-          // agents (and Inngest). The `generateThreadTitle` closure — parked on the registry
-          // entry during preparation, where the agent instance is in scope — runs it here.
-          //
-          // Kept OUTSIDE the `!observationalMemory` guard above: OM handles its own message
-          // persistence, but title generation is orthogonal and should still run when OM is on.
-          // Non-serializable (a closure), so like the other registry closures it only fires for
-          // in-process durable runs; cross-process engines (Inngest after a restart) skip it.
-          if (
-            registryEntry?.generateThreadTitle &&
-            durableState?.threadId &&
-            durableState?.resourceId &&
-            !durableState.memoryConfig?.readOnly
-          ) {
-            try {
-              await registryEntry.generateThreadTitle({
-                threadId: durableState.threadId,
-                resourceId: durableState.resourceId,
-                memoryConfig: durableState.memoryConfig,
-                messageListState: state.messageListState,
-                requestContext,
-                tracingContext,
-              });
-            } catch (error) {
-              logger?.warn?.(`[DurableAgent] Error generating thread title: ${error}`);
+              if (terminalEnvelope) throw error;
             }
           }
 
@@ -747,13 +868,54 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
               steps: state.accumulatedSteps,
             },
             state: state.state,
+            ...(state.terminalToolResult ? { terminalToolResult: state.terminalToolResult } : {}),
           };
 
           if (pubsub) {
+            const deferredTerminalStep = terminalEnvelope ? state.deferredStepFinishChunk : undefined;
+            const terminalStepFinishChunk =
+              deferredTerminalStep && typeof deferredTerminalStep === 'object'
+                ? {
+                    ...deferredTerminalStep,
+                    payload: {
+                      ...((deferredTerminalStep as { payload?: object }).payload ?? {}),
+                      // The finalizer, not an arbitrary streamed producer,
+                      // authoritatively binds terminal persistence to the
+                      // response message that survived retries/resume.
+                      messageId: state.messageId,
+                    },
+                  }
+                : deferredTerminalStep;
+            if (terminalEnvelope) state.deferredStepFinishChunk = undefined;
             await emitFinishEvent(pubsub, state.runId, {
               output: finalOutput.output,
               stepResult: finalOutput.stepResult,
+              ...(terminalEnvelope ? { terminalToolResult: terminalEnvelope } : {}),
+              ...(terminalStepFinishChunk ? { terminalStepFinishChunk: terminalStepFinishChunk as any } : {}),
             });
+          }
+
+          // Title generation is an observer of an already committed response.
+          // Publish FINISH first so this optional extra model call cannot add to
+          // caller-visible terminal-result latency or retract a delivered answer.
+          if (
+            registryEntry?.generateThreadTitle &&
+            durableState?.threadId &&
+            durableState?.resourceId &&
+            !durableState.memoryConfig?.readOnly
+          ) {
+            try {
+              await registryEntry.generateThreadTitle({
+                threadId: durableState.threadId,
+                resourceId: durableState.resourceId,
+                memoryConfig: durableState.memoryConfig,
+                messageListState: state.messageListState,
+                requestContext: finalRequestContext,
+                tracingContext,
+              });
+            } catch (error) {
+              logger?.warn?.(`[DurableAgent] Error generating thread title: ${error}`);
+            }
           }
 
           // End MODEL_GENERATION then AGENT_RUN once at completion. After a resume the

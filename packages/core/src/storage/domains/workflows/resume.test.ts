@@ -291,6 +291,50 @@ describe('atomic workflow resume records', () => {
     expect(rolledBack.snapshot?.value.large).toHaveLength(256_000);
   });
 
+  it('cannot restore legacy credentials when an adapter replaces request context at admission', () => {
+    const snapshot = suspendedSnapshot();
+    snapshot.requestContext = {
+      tenant: 'tenant-1',
+      accessToken: 'legacy-access-secret',
+      credentials: { refreshToken: 'legacy-refresh-secret' },
+    };
+    const input: AdmitWorkflowResumeInput = {
+      ...admissionInput(),
+      requestContext: {
+        tenant: 'tenant-1',
+        __mastra_toolPermissionPolicyRequired: true,
+      },
+      replaceRequestContext: true,
+    };
+
+    const admitted = admitWorkflowResumeRecord(materialize(snapshot), input, 10, materialize);
+    expect(admitted.status).toBe('admitted');
+    expect(admitted.snapshot?.requestContext).toEqual(input.requestContext);
+    expect(admitted.snapshot?.resumeCheckpoint?.snapshot.requestContext).toEqual(input.requestContext);
+    expect(JSON.stringify(admitted.snapshot)).not.toContain('legacy-access-secret');
+    expect(JSON.stringify(admitted.snapshot)).not.toContain('legacy-refresh-secret');
+
+    const rolledBack = rollbackWorkflowResumeRecord(
+      materialize(admitted.snapshot!),
+      {
+        workflowName: input.workflowName,
+        runId: input.runId,
+        resourceId: input.resourceId,
+        resumeOperationHash: input.resumeOperationHash,
+        executionGeneration: input.executionGeneration,
+        lifecycleResumeAttempt: input.nextLifecycleResumeAttempt,
+        lifecycleStepStates: input.lifecycleStepStates,
+      },
+      11,
+      materialize,
+    );
+
+    expect(rolledBack.status).toBe('rolled_back');
+    expect(rolledBack.snapshot?.requestContext).toEqual(input.requestContext);
+    expect(JSON.stringify(rolledBack.snapshot)).not.toContain('legacy-access-secret');
+    expect(JSON.stringify(rolledBack.snapshot)).not.toContain('legacy-refresh-secret');
+  });
+
   it('is idempotent for the same operation and rejects a different concurrent payload', () => {
     const firstInput = admissionInput();
     const first = admitWorkflowResumeRecord(suspendedSnapshot(), firstInput, 10, materialize);

@@ -174,21 +174,22 @@ Raw wire body / response: `GET /state` / `PATCH /state` and
 SDK normalization: SDK caches the session ETag and rejects stale writes rather
 than replaying caller patches (§13.4)
 
-**Mode, model, permissions, and OM config**
+**Mode, model, permissions, and OM recovery**
 
 Local/session API: `switchMode`, `switchModel`, `setSubagentModel`,
-`getSubagentModel`, `permissions.*`, `om.*`
-mutators/reads (§4.2)
+`getSubagentModel`, `permissions.*`; `om.get*` reports disabled/legacy intent,
+`om.switch*Model` rejects, and `om.clearOverride` is local recovery (§4.2)
 
 Durable authority or read source: `SessionRecord.modeId`, `modelId`,
-`permissionRules`, `sessionGrants`, `observationalMemory`; OM snapshots read
-MemoryStorage through a verified projection (§5.1)
+`permissionRules`, and `sessionGrants`. Effective OM belongs to Agent Memory;
+`SessionRecord.observationalMemory` is unsupported legacy intent only (§5.1)
 
 Raw wire body / response: `PATCH /mode`, `PATCH /model`, `PATCH /permissions`,
-`GET/PATCH /om`; OM reads return `ObservationalMemorySnapshot | null` (§13.2)
+with no current Harness `GET/PATCH /om` route (§13.2)
 
 SDK normalization: SDK exposes only `RemoteSafeSession` methods and applies the
-capability / ETag / read-model rules from §13.2 and §13.4
+capability / ETag / read-model rules from §13.2 and §13.4; Agent Memory APIs own
+OM configuration and authorized reads
 
 **Goals**
 

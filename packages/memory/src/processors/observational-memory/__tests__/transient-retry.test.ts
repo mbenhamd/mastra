@@ -9,10 +9,11 @@
 import { Agent } from '@mastra/core/agent';
 import { InMemoryStore } from '@mastra/core/storage';
 import { createTool } from '@mastra/core/tools';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 
 import { Memory } from '../../../index';
+import { ReflectorRunner } from '../reflector-runner';
 import { RETRY_CONFIG } from '../retry';
 
 type StreamPart =
@@ -118,10 +119,9 @@ function createMockActorModel(responseText: string) {
 
 /**
  * Observer model that throws a `terminated`-style undici error a configurable
- * number of times before succeeding. With `failuresBeforeSuccess` greater than
- * the AI SDK's built-in pRetry budget (default 2 retries → 3 attempts), the
- * call only succeeds if OM's withRetry wrapper layers additional retries on
- * top.
+ * number of times before succeeding. Observer/Reflector calls disable the AI
+ * SDK retry layer, so the observed call count is also the total provider
+ * attempt count for the logical OM operation.
  *
  * With `failureMode: 'stream-error'` the model instead emits an
  * OpenRouter-style mid-stream error part ({ code: 502, message, metadata })
@@ -257,24 +257,50 @@ const observationsText = `<observations>
 - 🟢 User greeted and asked for help
 </observations>`;
 
+function createReflectorRunner() {
+  return new ReflectorRunner({
+    reflectionConfig: {
+      model: 'mock/model',
+      observationTokens: 1_000,
+    } as any,
+    observationConfig: {
+      model: 'mock/model',
+      messageTokens: 1_000,
+    } as any,
+    tokenCounter: {
+      countObservations: () => 1,
+    } as any,
+    storage: {} as any,
+    scope: 'thread',
+    buffering: {} as any,
+    emitDebugEvent: vi.fn(),
+    persistMarkerToStorage: vi.fn(),
+    persistMarkerToMessage: vi.fn(),
+    getCompressionStartLevel: async () => 0,
+    resolveModel: () => ({ model: 'mock/model' as any }),
+  });
+}
+
 describe('OM transient-error retry', { timeout: 30_000 }, () => {
   const originalConfig = { ...RETRY_CONFIG };
 
   beforeEach(() => {
     // Shrink the schedule so the test stays fast even when retries fire.
+    RETRY_CONFIG.maxRetries = 2;
     RETRY_CONFIG.initialDelayMs = 1;
     RETRY_CONFIG.maxDelayMs = 4;
     RETRY_CONFIG.jitter = 0;
+    RETRY_CONFIG.timeoutMs = 10_000;
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     Object.assign(RETRY_CONFIG, originalConfig);
   });
 
-  it('retries sync observation past the AI SDK retry budget on transient "terminated" errors', async () => {
-    // AI SDK's pRetry retries 2 times by default → 3 total attempts. Force more
-    // failures than that so the call only succeeds if OM's withRetry layers
-    // additional retries on top.
+  it('caps a persistent sync observation failure at one three-attempt retry budget', async () => {
+    // The model would succeed on its sixth call under the old nested retry
+    // behavior. The bounded owner must stop after exactly three provider calls.
     const failuresBeforeSuccess = 5;
     const store = new InMemoryStore();
     const observerModel = createFlakyObserverModel(observationsText, failuresBeforeSuccess);
@@ -314,12 +340,11 @@ describe('OM transient-error retry', { timeout: 30_000 }, () => {
       },
     });
 
-    // The actor turn completed normally — no tripwire, no empty text.
-    expect(result.tripwire).toBeFalsy();
-    expect(result.text).toBe(longResponseText);
-
-    // We were called more times than the AI SDK retry budget allows on its own.
-    expect(observerModel.__observerCallCount).toBeGreaterThan(failuresBeforeSuccess);
+    expect(result.tripwire).toMatchObject({
+      processorId: 'observational-memory',
+      reason: 'Encountered error during memory observation: terminated',
+    });
+    expect(observerModel.__observerCallCount).toBe(RETRY_CONFIG.maxRetries + 1);
   });
 
   it('retries observation on OpenRouter-style mid-stream SSE errors (numeric code 502)', async () => {
@@ -368,6 +393,42 @@ describe('OM transient-error retry', { timeout: 30_000 }, () => {
     // The actor turn completed normally despite mid-stream provider errors.
     expect(result.tripwire).toBeFalsy();
     expect(result.text).toBe(longResponseText);
-    expect(observerModel.__observerCallCount).toBeGreaterThan(failuresBeforeSuccess);
+    expect(observerModel.__observerCallCount).toBe(RETRY_CONFIG.maxRetries + 1);
+  });
+
+  it('gives the reflector one bounded retry owner and disables model-layer retries', async () => {
+    vi.useFakeTimers();
+    RETRY_CONFIG.initialDelayMs = 1_000;
+    RETRY_CONFIG.maxDelayMs = 2_000;
+    const reflector = createReflectorRunner();
+    const modelSettings: Array<{ maxRetries?: number }> = [];
+    let providerAttempts = 0;
+
+    vi.spyOn(reflector as any, 'createAgent').mockReturnValue({
+      id: 'observational-memory-reflector',
+      stream: async (_prompt: unknown, options: { modelSettings: { maxRetries?: number } }) => {
+        providerAttempts++;
+        modelSettings.push(options.modelSettings);
+        throw new TypeError('terminated');
+      },
+    });
+
+    const result = reflector.call('existing observations');
+    const rejection = result.catch(error => error);
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(providerAttempts).toBe(1);
+    await vi.advanceTimersByTimeAsync(999);
+    expect(providerAttempts).toBe(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(providerAttempts).toBe(2);
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(providerAttempts).toBe(2);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(await rejection).toMatchObject({ message: 'terminated' });
+
+    expect(providerAttempts).toBe(RETRY_CONFIG.maxRetries + 1);
+    expect(modelSettings).toHaveLength(RETRY_CONFIG.maxRetries + 1);
+    expect(modelSettings.every(settings => settings.maxRetries === 0)).toBe(true);
   });
 });

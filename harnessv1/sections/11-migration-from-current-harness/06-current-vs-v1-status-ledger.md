@@ -147,10 +147,12 @@ subsystem:
   background-task, pubsub, and storage-domain contracts. Any new Harness worker
   must own a source-specific durable row and claim/renew contract rather than a
   generic catch-all work table.
-- Observational Memory, workspace state, model/mode selection, permissions,
-  token usage, goals, and display snapshots use their canonical v1 fields or
-  existing Mastra domain owners. Raw thread metadata is import input only, not a
-  fallback source of truth after a `SessionRecord` exists.
+- Observational Memory uses the Agent Memory configuration and existing Mastra
+  MemoryStorage owner. Workspace state, model/mode selection, permissions,
+  token usage, goals, and display snapshots use their canonical v1 fields. Raw
+  thread metadata is import input only, not a fallback source of truth after a
+  `SessionRecord` exists; legacy Harness OM overrides are cleared rather than
+  rewritten.
 - `HarnessDisplayStateSnapshotV1` is a v1 persisted read model, not the current
   in-memory display state type under a familiar name. Migration must project
   current display state into the v1 JSON-safe snapshot shape and must not expose
@@ -202,10 +204,12 @@ to miss when reading only the historical core Harness files:
   leases. They must not block multi-client read, subscribe, append, or admitted
   `Session.signal(...)`; v1 exclusivity belongs only to the storage lease/claim
   scopes defined in §5.2 and §5.8.
-- `attachOMThreadStatePersistence(...)` and thread metadata based OM restore are
-  legacy bootstrap inputs only. V1 commits OM settings through
-  `SessionRecord.observationalMemory` and restores them during session
-  hydration.
+- `attachOMThreadStatePersistence(...)` and thread-metadata OM restore are
+  legacy inputs only. Current v1 does not commit or restore per-session OM
+  settings because @mastra/memory cannot select an engine from effective
+  per-turn config. Configure OM on Agent Memory. Hydration parks a session that
+  still carries legacy `SessionRecord.observationalMemory` intent until the
+  idempotent `session.om.clearOverride()` CAS removes it.
 
 #### 11.6a Names that overlap with or intentionally replace current Mastra code
 
@@ -749,7 +753,7 @@ semantics; owning sections remain authoritative.
 | **Session**    | Process-local queue and pending resolvers                                                                    | `SessionRecord.pendingQueue`, durable pending inbox                                                                                 | §5.1                      |
 | **Session**    | `display_state_changed` as public durability                                                                 | Persisted display snapshots; §10 union excludes legacy display event                                                                | §10.2, §5.1a.2            |
 | **Thread**     | `--thread`, `/thread`, `switchThread` as lifecycle                                                           | Product commands resolving to `harness.session(...)` first                                                                          | §11.6 migration-sensitive |
-| **Memory**     | OM/thread-metadata bootstrap without `SessionRecord`                                                         | `SessionRecord.observationalMemory`                                                                                                 | §11.6                     |
+| **Memory**     | OM/thread-metadata bootstrap without a native per-turn engine                                                | Agent Memory configuration; clear legacy `SessionRecord.observationalMemory`                                                        | §11.6                     |
 | **Memory**     | Message append mistaken for signal admission                                                                 | `Session.signal` is not a generic thread write                                                                                      | §4.2, §0                  |
 | **Storage**    | `threadLock` blocks read/subscribe/signal                                                                    | Leases for recovery-sensitive work only                                                                                             | §5.8, §11.6               |
 | **Storage**    | `SignalsPubSub` loss = data loss                                                                             | Storage admission/result + §10 replay                                                                                               | §11.6                     |

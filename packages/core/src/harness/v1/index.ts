@@ -64,6 +64,14 @@ export type {
 } from './events';
 
 export { HARNESS_EVENT_ID_PREFIX, formatHarnessEventId, parseHarnessEventId } from './events';
+export {
+  parseHarnessSubagentOutcomeReport,
+  parseHarnessSubagentTerminalResult,
+  parseHarnessTerminalToolResultText,
+  projectHarnessSubagentOutcomeReceipts,
+  verifyHarnessSubagentOutcomeReport,
+  verifyHarnessSubagentTerminalCompletion,
+} from './terminal-subagent-result';
 export { getHarnessWorkspaceActionPathInput, isHarnessWorkspaceFileMutationTool } from './workspace-actions';
 
 export {
@@ -79,6 +87,7 @@ export {
   HarnessLiveSessionLimitError,
   HarnessOutputGenerationError,
   type HarnessOutputGenerationReason,
+  HarnessPendingInteractionExpiredError,
   HarnessQueueItemExpiredError,
   HarnessQueueFullDroppedError,
   HarnessQueueFullError,
@@ -100,6 +109,7 @@ export {
   HarnessStorageError,
   type HarnessStorageOperation,
   type HarnessStorageSubject,
+  HarnessSubagentConcurrencyLimitError,
   HarnessSubagentDepthExceededError,
   HarnessThreadNotFoundError,
   HarnessValidationError,
@@ -230,6 +240,7 @@ export type {
   SessionDeleteOptions,
   SessionListOptions,
   SessionLoadByIdOptions,
+  SessionLoadByThreadOptions,
   SessionRecord,
   SessionResolveById,
   SessionResolveByIdScoped,

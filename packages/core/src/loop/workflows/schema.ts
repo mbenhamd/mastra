@@ -20,6 +20,7 @@ import type {
   GeneratedFile,
 } from '@internal/ai-sdk-v5';
 import { z } from 'zod/v4';
+import type { TerminalToolResult } from '../../tools';
 
 // Type definitions for the workflow data
 export interface LLMIterationStepResult {
@@ -92,6 +93,8 @@ export interface LLMIterationData<Tools extends ToolSet = ToolSet, OUTPUT = unde
    * iteration to process it. When set, isTaskCompleteStep is skipped.
    */
   backgroundTaskPending?: boolean;
+  /** Bounded result that ends the run without another provider iteration. */
+  terminalToolResult?: TerminalToolResult;
   /** Persisted name-only ceiling for reconstructing replacement tools after resume. */
   toolSurfaceFence?: string[];
 }
@@ -163,6 +166,19 @@ export const llmIterationOutputSchema = z.object({
   processorRetryFeedback: z.string().optional(),
   isTaskCompleteCheckFailed: z.boolean().optional(), //true if the isTaskComplete check failed and LLM has to run again
   backgroundTaskPending: z.boolean().optional(), // true if a background task result was injected and LLM needs to process it
+  terminalToolResult: z
+    .object({
+      status: z.literal('success'),
+      items: z.array(
+        z.object({
+          toolName: z.string(),
+          toolCallId: z.string(),
+          status: z.literal('success'),
+          value: z.any(),
+        }),
+      ),
+    })
+    .optional(),
   toolSurfaceFence: z.array(z.string()).optional(),
 });
 
@@ -178,6 +194,7 @@ export const toolCallInputSchema = z.object({
 export const toolCallOutputSchema = toolCallInputSchema.extend({
   result: z.any().optional(),
   error: z.any().optional(),
+  disposition: z.literal('denied').optional(),
   // A model-driven resume has its own provider tool-call ID. When it resolves an older
   // approval, retain that original call ID separately so both invocations can be completed.
   resumeTargetToolCallId: z.string().optional(),
@@ -190,4 +207,7 @@ export const toolCallOutputSchema = toolCallInputSchema.extend({
       reason: z.string().optional(),
     })
     .optional(),
+  // Preserve general suspension provenance through workflow serialization so
+  // a resumed result can never be mistaken for an uninterrupted terminal tool.
+  resumedFromSuspension: z.literal(true).optional(),
 });

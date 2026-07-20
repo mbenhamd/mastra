@@ -20,7 +20,20 @@ import { z } from 'zod';
 
 import { createTool } from '../../tools/tool';
 import { HarnessSubagentDepthExceededError, HarnessValidationError } from './errors';
+import { projectHarnessPublicError } from './events';
 import type { Session } from './session';
+import {
+  HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID,
+  harnessSubagentResultSummarySchema,
+  harnessSubagentDirectAnswerSchema,
+  MAX_HARNESS_SUBAGENT_DIRECT_ANSWER_BYTES,
+  parseHarnessSubagentOutcomeReport,
+  parseHarnessTerminalToolResultText,
+  projectHarnessSpawnSubagentResult,
+  summarizeHarnessSubagentEventResult,
+  summarizeHarnessSubagentResult,
+  verifyHarnessSubagentTerminalCompletion,
+} from './terminal-subagent-result';
 import type { SubagentDefinition } from './types';
 
 export const SPAWN_SUBAGENT_TOOL_ID = 'spawn_subagent';
@@ -32,19 +45,19 @@ export const SPAWN_SUBAGENT_TOOL_ID = 'spawn_subagent';
  */
 export function createSpawnSubagentTool(parent: Session) {
   const harness = (parent as any)._harness as {
-    _listSubagentTypeIds(): string[];
+    _listSubagentTypeIds(options: { invocation: 'inline' | 'delegated' }): string[];
     _getSubagentType(id: string): SubagentDefinition | undefined;
     _getSubagentMaxDepth(): number;
-    _getSubagentMaxConcurrent(): number | undefined;
     session(opts: unknown): Promise<Session>;
+    _internalCloseSessionIfUnclaimed(session: Session): Promise<void> | undefined;
   };
-  const typeIds = harness._listSubagentTypeIds();
+  const typeIds = harness._listSubagentTypeIds({ invocation: 'inline' });
   if (typeIds.length === 0) return undefined;
 
   const description =
     'Delegate a focused task to a specialized subagent. The subagent runs ' +
-    'independently with a constrained toolset, then returns its final output ' +
-    'as text. Available agent types:\n' +
+    'independently with a constrained toolset, then returns a verified structured outcome. ' +
+    'Available agent types:\n' +
     typeIds
       .map(id => {
         const def = harness._getSubagentType(id);
@@ -63,11 +76,17 @@ export function createSpawnSubagentTool(parent: Session) {
       .string()
       .optional()
       .describe('Optional model id override for this invocation. Falls back to the subagent type default.'),
+    delivery: z
+      .enum(['continue', 'final'])
+      .optional()
+      .describe(
+        'Use "final" only when this single subagent result should be returned directly to the caller with no parent aggregation, tool call, or narration. Omit or use "continue" for intermediate delegation.',
+      ),
   });
 
   const outputSchema = z.object({
     subagentSessionId: z.string(),
-    result: z.unknown(),
+    result: harnessSubagentResultSummarySchema.optional(),
     isError: z.boolean().optional(),
     errorName: z.string().optional(),
     field: z.string().optional(),
@@ -86,17 +105,36 @@ export function createSpawnSubagentTool(parent: Session) {
     description,
     inputSchema,
     outputSchema,
+    terminalResult: {
+      isSuccess: (output, context) =>
+        context.batchSize === 1 &&
+        (context.args as { delivery?: unknown } | undefined)?.delivery === 'final' &&
+        projectHarnessSpawnSubagentResult(output) !== undefined,
+      project: (output, context) => {
+        if (context.batchSize !== 1 || (context.args as { delivery?: unknown } | undefined)?.delivery !== 'final') {
+          throw new Error('spawn_subagent direct delivery was not explicitly selected');
+        }
+        const answer = projectHarnessSpawnSubagentResult(output);
+        if (!answer) throw new Error('spawn_subagent output is not a complete direct answer');
+        return answer;
+      },
+      outputSchema: harnessSubagentDirectAnswerSchema,
+      maxBytes: MAX_HARNESS_SUBAGENT_DIRECT_ANSWER_BYTES,
+    },
     execute: async (input, ctx) => {
       const { agentType, task, modelOverride } = input;
       const toolCallId = ctx.agent?.toolCallId ?? 'unknown';
 
       const def = harness._getSubagentType(agentType);
-      if (!def) {
+      if (!def || def.allowInline === false) {
         return {
           isError: true,
           errorName: 'HarnessValidationError',
           field: 'agentType',
-          reason: `unknown subagent type "${agentType}"`,
+          reason:
+            def?.allowInline === false
+              ? `subagent type "${agentType}" requires durable task_delegate execution`
+              : `unknown subagent type "${agentType}"`,
           subagentSessionId: '',
           result: undefined,
         };
@@ -130,23 +168,37 @@ export function createSpawnSubagentTool(parent: Session) {
         };
       }
 
-      // §SA3 backpressure — reject (do not create a child session) when this parent
-      // already has `maxConcurrent` spawn subagents in flight. The counter is
-      // reserved BEFORE the create await below and released in the finally, so
-      // concurrent (parallel tool-call) spawns see an accurate in-flight count.
-      const maxConcurrent = harness._getSubagentMaxConcurrent();
-      const parentInFlight = parent as unknown as { _subagentSpawnInFlight: number };
-      if (maxConcurrent !== undefined && parentInFlight._subagentSpawnInFlight >= maxConcurrent) {
+      let admissionEpoch: number;
+      try {
+        admissionEpoch = parent._internalCaptureSubagentAdmission();
+        parent._internalAssertSubagentAdmission(admissionEpoch, ctx.abortSignal);
+      } catch (error) {
+        const publicError = projectHarnessPublicError(error);
         return {
           isError: true,
-          errorName: 'HarnessSubagentConcurrencyLimitError',
-          reason: `subagent concurrency limit reached (maxConcurrent ${maxConcurrent}, in flight ${parentInFlight._subagentSpawnInFlight})`,
-          maxConcurrent,
+          errorName: error instanceof Error ? error.name : 'Error',
+          reason: publicError.code,
+          message: publicError.message,
           subagentSessionId: '',
           result: undefined,
         };
       }
-      parentInFlight._subagentSpawnInFlight += 1;
+
+      // §SA3 backpressure — inline spawn and durable task delegation share one
+      // parent-local reservation. Reserve BEFORE the create await so parallel
+      // tool calls cannot both claim the final slot.
+      const reservation = parent._internalTryReserveSubagentExecution();
+      if (!reservation.reserved) {
+        return {
+          isError: true,
+          errorName: 'HarnessSubagentConcurrencyLimitError',
+          reason: `subagent concurrency limit reached (maxConcurrent ${reservation.maxConcurrent}, in flight ${reservation.inFlight})`,
+          maxConcurrent: reservation.maxConcurrent,
+          subagentSessionId: '',
+          result: undefined,
+        };
+      }
+      let allocatedChild: Session | undefined;
       try {
         // Create a fresh thread + session for the subagent. The session is
         // `origin: 'subagent-tool'` and `parentSessionId` is wired so cascade
@@ -165,6 +217,11 @@ export function createSpawnSubagentTool(parent: Session) {
           // workspace / toolAllowlist) survive a direct-by-id hydrate.
           subagentTypeId: agentType,
         });
+        allocatedChild = child;
+        // An edit/retry reset or Stop may have won while child allocation was
+        // waiting on storage. The child has done no provider work yet, so fail
+        // the stale tool call closed and clean up the unstarted descendant.
+        parent._internalAssertSubagentAdmission(admissionEpoch, ctx.abortSignal);
 
         // Workspace inheritance (§2.7 / §8). `'inherit'` (default) makes the
         // child share the parent's workspace via a refcount on the same entry.
@@ -174,6 +231,7 @@ export function createSpawnSubagentTool(parent: Session) {
         child._subagentInheritWorkspace = subagentWorkspaceMode === 'inherit';
         if (def.tools) child._subagentToolsOverride = def.tools;
         if (def.toolAllowlist) child._subagentToolAllowlist = def.toolAllowlist;
+        child._subagentParentToolCallId = toolCallId;
 
         // Bridge the child's per-turn events into the parent's subscriber
         // stream as `subagent_*`. `_emitSubagentEvent` stamps `parentId` and
@@ -250,6 +308,7 @@ export function createSpawnSubagentTool(parent: Session) {
                 toolName,
                 output: event.output,
                 isError: event.isError ?? false,
+                ...(event.durationMs !== undefined ? { durationMs: event.durationMs } : {}),
                 depth: childDepth,
               });
               break;
@@ -278,10 +337,23 @@ export function createSpawnSubagentTool(parent: Session) {
         });
 
         const startTime = Date.now();
-        let result: unknown;
+        let rawResult: unknown;
         let isError = false;
+        let publicError: { code: string; message: string } | undefined;
         try {
-          result = await child.message({ content: task, abortSignal: ctx.abortSignal });
+          // Registering the active-map entry happens before this final fence.
+          // If invalidation begins after the check, reset/Stop discovery sees
+          // and cancels the child; if it began earlier, this check prevents the
+          // first provider call. There is no await between the check and
+          // `child.message()` invocation.
+          parent._internalAssertSubagentAdmission(admissionEpoch, ctx.abortSignal);
+          rawResult = await child.message({ content: task, abortSignal: ctx.abortSignal });
+          const finishReason = (rawResult as { finishReason?: string } | undefined)?.finishReason;
+          const declaredReport = parseHarnessSubagentOutcomeReport(rawResult);
+          const declaredTerminalText = parseHarnessTerminalToolResultText(
+            (rawResult as { terminalToolResult?: unknown } | undefined)?.terminalToolResult,
+          );
+          const report = verifyHarnessSubagentTerminalCompletion(rawResult);
           // §S3.3 — an inline spawn_subagent has NO independent driver to resume a
           // human-in-the-loop suspension, and the child is auto-closed below. A
           // default `message()` RESOLVES (not rejects) with finishReason
@@ -289,40 +361,92 @@ export function createSpawnSubagentTool(parent: Session) {
           // `subagent_end{isError:false}` and the child closed mid-suspension.
           // Treat it as an error result so the parent model gets an error-shaped
           // tool output instead of a misleading completion.
-          if ((result as { finishReason?: string } | undefined)?.finishReason === 'suspended') {
+          if (finishReason === 'suspended') {
             isError = true;
-            result = {
-              isError: true,
-              errorName: 'HarnessSubagentSuspendedError',
-              reason: 'inline_subagent_suspended_unresumable',
+            publicError = {
+              code: 'harness.subagent_suspended',
               message:
                 `Subagent "${agentType}" suspended for human input, but an inline spawn_subagent cannot be ` +
                 `resumed. Re-invoke it with self-contained context that does not require approval/input.`,
-              subagentSessionId: child.id,
+            };
+            // This inline child has no independent resume driver and will be
+            // auto-closed below. Persist cancellation now so pendingResume no
+            // longer keeps close() busy until its 30s drain deadline.
+            try {
+              await child.cancel({
+                reason: 'inline_subagent_suspended_unresumable',
+                requestedBy: parent.id,
+              });
+            } catch {
+              // Best-effort cleanup; close() remains the final lifecycle fence.
+            }
+          } else if (ctx.abortSignal?.aborted || child.getRecord().cancelRequest !== undefined) {
+            isError = true;
+            publicError = {
+              code: 'harness.subagent_cancelled',
+              message: `Subagent "${agentType}" was cancelled before it reported a terminal outcome`,
+            };
+          } else if (report === undefined) {
+            // Provider finish reasons describe the transport/model turn, not
+            // whether the assigned task was achieved. A bare stop is no more
+            // authoritative than length/content-filter/tool-loop exhaustion.
+            isError = true;
+            publicError = {
+              code:
+                declaredReport !== undefined || declaredTerminalText !== undefined
+                  ? 'harness.subagent_evidence_unverified'
+                  : finishReason === 'stop'
+                    ? 'harness.subagent_outcome_missing'
+                    : 'harness.subagent_incomplete',
+              message:
+                declaredReport !== undefined || declaredTerminalText !== undefined
+                  ? `Subagent "${agentType}" terminal completion did not match framework execution receipts`
+                  : finishReason === 'stop'
+                    ? `Subagent "${agentType}" ended without ${HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID}`
+                    : `Subagent "${agentType}" ended with finish reason "${finishReason ?? 'missing'}" and no ${HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID}`,
+            };
+          } else if (report.outcome !== 'completed') {
+            isError = true;
+            publicError = {
+              code: report.issue!.code,
+              message: report.issue!.message,
             };
           }
         } catch (err) {
           isError = true;
-          result = err instanceof Error ? err.message : String(err);
+          publicError = projectHarnessPublicError(err);
         } finally {
           unsub();
           activeMap.delete(toolCallId);
-          // Auto-close the subagent-tool child per §5.6. Best-effort: a
-          // failed close shouldn't mask the tool's own result.
-          try {
-            await child.close();
-          } catch {
-            // ignore
+          // Auto-close the subagent-tool child per §5.6, but never join a
+          // close already owned by an ancestor subtree. An ancestor close
+          // drains this parent turn; the parent turn cannot finish until this
+          // tool returns, so awaiting that same close promise would form a
+          // cycle and consume the full close deadline. The Harness performs
+          // the ownership check + independent-close claim atomically.
+          const independentClose = harness._internalCloseSessionIfUnclaimed(child);
+          if (independentClose) {
+            try {
+              await independentClose;
+            } catch {
+              // Best-effort cleanup: lifecycle close errors must not mask the
+              // bounded child result already produced for the parent model.
+            }
           }
         }
 
+        const result = summarizeHarnessSubagentResult(rawResult, { isError, error: publicError });
+        // A child can resolve normally with finishReason=error/aborted. Do not
+        // mislabel that as a successful tool result merely because it did not
+        // reject the in-process promise.
+        isError = result.status === 'error';
         const durationMs = Date.now() - startTime;
         parent._emitSubagentEvent({
           type: 'subagent_end',
           toolCallId,
           subagentSessionId: child.id,
           agentType,
-          output: result,
+          output: summarizeHarnessSubagentEventResult(result),
           isError,
           durationMs,
           depth: childDepth,
@@ -336,10 +460,30 @@ export function createSpawnSubagentTool(parent: Session) {
           // suspended subagent, instead of a value that looks like success.
           ...(isError ? { isError: true } : {}),
         };
+      } catch (error) {
+        if (allocatedChild) {
+          const independentClose = harness._internalCloseSessionIfUnclaimed(allocatedChild);
+          if (independentClose) {
+            try {
+              await independentClose;
+            } catch {
+              // Preserve the bounded public execution error below.
+            }
+          }
+        }
+        const publicError = projectHarnessPublicError(error);
+        return {
+          isError: true,
+          errorName: error instanceof Error ? error.name : 'Error',
+          reason: publicError.code,
+          message: publicError.message,
+          subagentSessionId: allocatedChild?.id ?? '',
+          result: undefined,
+        };
       } finally {
         // Release the SA3 reservation on every exit path (create failure, run
         // error, or normal completion).
-        parentInFlight._subagentSpawnInFlight -= 1;
+        parent._internalReleaseSubagentExecution();
       }
     },
   });

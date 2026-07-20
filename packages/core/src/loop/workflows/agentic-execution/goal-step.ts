@@ -108,6 +108,10 @@ export function createGoalStep<Tools extends ToolSet = ToolSet, OUTPUT = undefin
     outputSchema: llmIterationOutputSchema,
     execute: async ({ inputData }) => {
       if (inputData.stepResult?.reason === 'error') return inputData;
+      // A terminal tool result is already the committed caller-facing answer.
+      // Goal evaluation must not spend a judge call or append continuation
+      // signals/activity that can only appear after reload.
+      if (inputData.terminalToolResult) return inputData;
 
       // No goal configured on the agent → nothing to do.
       if (!goal) return inputData;

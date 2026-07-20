@@ -1,8 +1,9 @@
 import { ReadableStream } from 'node:stream/web';
 import { describe, expect, it, vi } from 'vitest';
-import { MessageList } from '../../agent/message-list';
+import { createTerminalToolResultPartId, MessageList } from '../../agent/message-list';
+import { TripWire } from '../../agent/trip-wire';
 import type { Processor, ProcessorStreamWriter } from '../../processors';
-import { ProcessorRunner } from '../../processors/runner';
+import { ProcessorRunner, ProcessorState } from '../../processors/runner';
 import { ChunkFrom } from '../types';
 import type { ChunkType } from '../types';
 import { MastraModelOutput } from './output';
@@ -1380,6 +1381,415 @@ describe('MastraModelOutput', () => {
       }
 
       expect(live.map(c => c.type)).toEqual(['text-delta', 'goal', 'text-delta', 'step-finish', 'finish']);
+    });
+  });
+
+  describe('terminal tool-result transaction', () => {
+    it('reports a terminal processor TripWire consistently across every completion surface', async () => {
+      const runId = 'terminal-tripwire';
+      const messageId = 'assistant-terminal-tripwire';
+      const terminalToolResult = {
+        status: 'success' as const,
+        items: [
+          {
+            toolName: 'spawn_subagent',
+            toolCallId: 'child-call-tripwire',
+            status: 'success' as const,
+            value: { text: 'candidate child answer' },
+          },
+        ],
+      };
+      const messageList = new MessageList({ threadId: 'terminal-tripwire-thread' });
+      messageList.add(
+        {
+          id: messageId,
+          role: 'assistant',
+          content: { format: 2, parts: [{ type: 'text', text: 'safe original answer' }] },
+          createdAt: new Date(),
+        },
+        'response',
+      );
+
+      const terminalDataChunk = {
+        type: 'data-terminal-tool-result' as const,
+        id: createTerminalToolResultPartId(runId, 0),
+        data: terminalToolResult,
+      } as ChunkType;
+      const terminalStepChunk = createStepFinishChunk(runId) as ChunkType & { payload: Record<string, any> };
+      terminalStepChunk.payload.messageId = messageId;
+      terminalStepChunk.payload.stepResult.reason = 'tool-calls';
+      terminalStepChunk.payload.terminalToolResult = terminalToolResult;
+      const terminalFinishChunk = createFinishChunk(runId) as ChunkType & { payload: Record<string, any> };
+      terminalFinishChunk.payload.stepResult.reason = 'tool-calls';
+      terminalFinishChunk.payload.terminalToolResult = terminalToolResult;
+
+      const tripwireOwner: Processor = {
+        id: 'terminal-content-policy',
+        terminalToolResultPolicy: 'pass-through',
+        terminalToolResultPersistence: 'owner',
+        processOutputResult: async () => {
+          throw new TripWire('Terminal answer blocked by policy', { retry: false }, 'terminal-content-policy');
+        },
+      };
+      const onStepFinish = vi.fn();
+      const onFinish = vi.fn();
+      const output = new MastraModelOutput({
+        model: { modelId: 'test-model', provider: 'test', version: 'v3' },
+        stream: createChunkStream([terminalDataChunk, terminalStepChunk, terminalFinishChunk]),
+        messageList,
+        messageId,
+        options: {
+          runId,
+          outputProcessors: [tripwireOwner],
+          onStepFinish,
+          onFinish,
+        },
+      });
+      const earlyText = output.text;
+      const earlyFinishReason = output.finishReason;
+
+      const chunks: ChunkType[] = [];
+      for await (const chunk of output.fullStream) chunks.push(chunk);
+      const [text, finishReason, fullOutput] = await Promise.all([
+        earlyText,
+        earlyFinishReason,
+        output.getFullOutput(),
+      ]);
+
+      expect(text).toBe('');
+      expect(finishReason).toBe('other');
+      expect(fullOutput.text).toBe('');
+      expect(fullOutput.finishReason).toBe('other');
+      expect(fullOutput.tripwire).toEqual({
+        reason: 'Terminal answer blocked by policy',
+        retry: false,
+        metadata: undefined,
+        processorId: 'terminal-content-policy',
+      });
+      expect(output.error).toBeUndefined();
+      expect(output.terminalToolResult).toBeUndefined();
+      expect(chunks.map(chunk => chunk.type)).toEqual(['finish']);
+      expect((chunks[0] as any).payload.stepResult.reason).toBe('other');
+      expect(onStepFinish).not.toHaveBeenCalled();
+      expect(onFinish).toHaveBeenCalledOnce();
+      expect(onFinish.mock.calls[0]?.[0]).toMatchObject({ finishReason: 'other', text: '' });
+      expect(
+        messageList.get.all
+          .db()
+          .flatMap(message => message.content.parts)
+          .filter(part => part.type === 'data-terminal-tool-result'),
+      ).toHaveLength(0);
+    });
+
+    it('buffers processor chunks and restores processor state when the persistence owner fails', async () => {
+      const runId = 'terminal-processor-rollback';
+      const messageId = 'assistant-terminal-processor-rollback';
+      const secret = 'PROCESSOR_DERIVED_SECRET_MUST_NOT_ESCAPE';
+      const terminalToolResult = {
+        status: 'success' as const,
+        items: [
+          {
+            toolName: 'spawn_subagent',
+            toolCallId: 'child-call-rollback',
+            status: 'success' as const,
+            value: { text: secret },
+          },
+        ],
+      };
+      const messageList = new MessageList({ threadId: 'terminal-processor-rollback-thread' });
+      messageList.add(
+        {
+          id: messageId,
+          role: 'assistant',
+          content: { format: 2, parts: [{ type: 'text', text: 'safe original answer' }] },
+          createdAt: new Date(),
+        },
+        'response',
+      );
+
+      const terminalDataChunk = {
+        type: 'data-terminal-tool-result' as const,
+        id: createTerminalToolResultPartId(runId, 0),
+        data: terminalToolResult,
+      } as ChunkType;
+      const terminalStepChunk = createStepFinishChunk(runId) as ChunkType & { payload: Record<string, any> };
+      terminalStepChunk.payload.messageId = messageId;
+      terminalStepChunk.payload.stepResult.reason = 'tool-calls';
+      terminalStepChunk.payload.terminalToolResult = terminalToolResult;
+      const terminalFinishChunk = createFinishChunk(runId) as ChunkType & { payload: Record<string, any> };
+      terminalFinishChunk.payload.stepResult.reason = 'tool-calls';
+      terminalFinishChunk.payload.terminalToolResult = terminalToolResult;
+
+      const opaqueHandle = () => 'runtime-only';
+      const existingState = new ProcessorState();
+      existingState.customState = { stable: 'before', nested: { count: 1 }, opaqueHandle };
+      const processorStates = new Map<string, ProcessorState>([['terminal-observer', existingState]]);
+      const terminalObserver: Processor = {
+        id: 'terminal-observer',
+        terminalToolResultPolicy: 'pass-through',
+        processOutputResult: async ({ messages, state, writer }) => {
+          state.stable = 'mutated';
+          (state.nested as { count: number }).count = 99;
+          state.transient = secret;
+          await writer!.custom({ type: 'data-index-status', data: { value: secret } });
+          return messages;
+        },
+      };
+      const failingPersistenceOwner: Processor = {
+        id: 'failing-message-history',
+        terminalToolResultPolicy: 'pass-through',
+        terminalToolResultPersistence: 'owner',
+        processOutputResult: async () => {
+          throw new Error('persistence unavailable');
+        },
+      };
+      const onStepFinish = vi.fn();
+      const onFinish = vi.fn();
+      const output = new MastraModelOutput({
+        model: { modelId: 'test-model', provider: 'test', version: 'v3' },
+        stream: createChunkStream([terminalDataChunk, terminalStepChunk, terminalFinishChunk]),
+        messageList,
+        messageId,
+        options: {
+          runId,
+          outputProcessors: [terminalObserver, failingPersistenceOwner],
+          processorStates,
+          onStepFinish,
+          onFinish,
+        },
+      });
+
+      const chunks: ChunkType[] = [];
+      for await (const chunk of output.fullStream) chunks.push(chunk);
+      const fullOutput = await output.getFullOutput();
+
+      expect(output.error?.message).toBe('persistence unavailable');
+      expect(chunks.map(chunk => chunk.type)).toEqual(['finish']);
+      expect((chunks[0] as any).payload.stepResult.reason).toBe('error');
+      expect(processorStates.size).toBe(1);
+      expect(processorStates.get('terminal-observer')).toBe(existingState);
+      expect(existingState.customState).toEqual({ stable: 'before', nested: { count: 1 }, opaqueHandle });
+      expect(onStepFinish).not.toHaveBeenCalled();
+      expect(onFinish).toHaveBeenCalledOnce();
+      expect(
+        JSON.stringify({
+          chunks,
+          fullOutput,
+          onFinish: onFinish.mock.calls,
+          messages: messageList.get.all.db(),
+          nextModelPrompt: messageList.get.all.aiV5.model(),
+        }),
+      ).not.toContain(secret);
+    });
+
+    it.each(['delete', 'mutate'] as const)(
+      'keeps final promises and response surfaces atomic when a processor %ss the terminal part',
+      async mode => {
+        const runId = `terminal-postvalidation-${mode}`;
+        const messageId = `assistant-terminal-postvalidation-${mode}`;
+        const secret = `UNCOMMITTED_${mode.toUpperCase()}_SENTINEL`;
+        const terminalToolResult = {
+          status: 'success' as const,
+          items: [
+            {
+              toolName: 'spawn_subagent',
+              toolCallId: `child-call-${mode}`,
+              status: 'success' as const,
+              value: { text: 'approved child answer' },
+            },
+          ],
+        };
+        const messageList = new MessageList({ threadId: `terminal-postvalidation-${mode}-thread` });
+        messageList.add(
+          {
+            id: messageId,
+            role: 'assistant',
+            content: { format: 2, parts: [{ type: 'text', text: 'safe original answer' }] },
+            createdAt: new Date(),
+          },
+          'response',
+        );
+
+        const terminalDataChunk = {
+          type: 'data-terminal-tool-result' as const,
+          id: createTerminalToolResultPartId(runId, 0),
+          data: terminalToolResult,
+        } as ChunkType;
+        const terminalStepChunk = createStepFinishChunk(runId) as ChunkType & { payload: Record<string, any> };
+        terminalStepChunk.payload.messageId = messageId;
+        terminalStepChunk.payload.stepResult.reason = 'tool-calls';
+        terminalStepChunk.payload.terminalToolResult = terminalToolResult;
+        const terminalFinishChunk = createFinishChunk(runId) as ChunkType & { payload: Record<string, any> };
+        terminalFinishChunk.payload.stepResult.reason = 'tool-calls';
+        terminalFinishChunk.payload.terminalToolResult = terminalToolResult;
+
+        const invalidatingOwner: Processor = {
+          id: `invalidating-owner-${mode}`,
+          terminalToolResultPolicy: 'pass-through',
+          terminalToolResultPersistence: 'owner',
+          processOutputResult: async ({ messages }) =>
+            messages.map(message => ({
+              ...message,
+              content: {
+                ...message.content,
+                parts: [
+                  ...message.content.parts.flatMap(part => {
+                    if (part.type !== 'data-terminal-tool-result') return [part];
+                    if (mode === 'delete') return [];
+                    return [
+                      {
+                        ...part,
+                        data: {
+                          ...terminalToolResult,
+                          items: terminalToolResult.items.map(item => ({
+                            ...item,
+                            value: { text: secret },
+                          })),
+                        },
+                      },
+                    ];
+                  }),
+                  { type: 'text' as const, text: secret },
+                ],
+              },
+            })),
+        };
+        const onStepFinish = vi.fn();
+        const onFinish = vi.fn();
+        const output = new MastraModelOutput({
+          model: { modelId: 'test-model', provider: 'test', version: 'v3' },
+          stream: createChunkStream([terminalDataChunk, terminalStepChunk, terminalFinishChunk]),
+          messageList,
+          messageId,
+          options: {
+            runId,
+            outputProcessors: [invalidatingOwner],
+            onStepFinish,
+            onFinish,
+          },
+        });
+        const earlyText = output.text;
+        const earlyFinishReason = output.finishReason;
+
+        const chunks: ChunkType[] = [];
+        for await (const chunk of output.fullStream) chunks.push(chunk);
+        const [text, finishReason, fullOutput] = await Promise.all([
+          earlyText,
+          earlyFinishReason,
+          output.getFullOutput(),
+        ]);
+
+        expect(text).toBe('');
+        expect(finishReason).toBe('error');
+        expect(fullOutput.text).toBe('');
+        expect(fullOutput.finishReason).toBe('error');
+        expect(output.terminalToolResult).toBeUndefined();
+        expect(chunks.map(chunk => chunk.type)).toEqual(['finish']);
+        expect((chunks[0] as any).payload.stepResult.reason).toBe('error');
+        expect(onStepFinish).not.toHaveBeenCalled();
+        expect(onFinish).toHaveBeenCalledOnce();
+        expect(onFinish.mock.calls[0]?.[0]).toMatchObject({ finishReason: 'error', text: '' });
+        expect(
+          JSON.stringify({
+            chunks,
+            fullOutput,
+            onFinish: onFinish.mock.calls,
+            messages: messageList.get.all.db(),
+            nextModelPrompt: messageList.get.all.aiV5.model(),
+          }),
+        ).not.toContain(secret);
+      },
+    );
+
+    it('rolls back and scrubs every output surface when final persistence fails', async () => {
+      const runId = 'terminal-persistence-failure';
+      const messageId = 'assistant-terminal-owner';
+      const secret = 'CHILD_ANSWER_MUST_NOT_COMMIT';
+      const terminalToolResult = {
+        status: 'success' as const,
+        items: [
+          {
+            toolName: 'spawn_subagent',
+            toolCallId: 'child-call-1',
+            status: 'success' as const,
+            value: { text: secret },
+          },
+        ],
+      };
+      const messageList = new MessageList({ threadId: 'terminal-failure-thread' });
+      messageList.add(
+        {
+          id: messageId,
+          role: 'assistant',
+          content: { format: 2, parts: [{ type: 'text', text: 'ordinary pre-terminal text' }] },
+          createdAt: new Date(),
+        },
+        'response',
+      );
+
+      const terminalDataChunk = {
+        type: 'data-terminal-tool-result' as const,
+        id: createTerminalToolResultPartId(runId, 0),
+        data: terminalToolResult,
+      } as ChunkType;
+      const terminalStepChunk = createStepFinishChunk(runId) as ChunkType & { payload: Record<string, any> };
+      terminalStepChunk.payload.messageId = messageId;
+      terminalStepChunk.payload.stepResult.reason = 'tool-calls';
+      terminalStepChunk.payload.terminalToolResult = terminalToolResult;
+      const terminalFinishChunk = createFinishChunk(runId) as ChunkType & { payload: Record<string, any> };
+      terminalFinishChunk.payload.stepResult.reason = 'tool-calls';
+      terminalFinishChunk.payload.terminalToolResult = terminalToolResult;
+
+      const onStepFinish = vi.fn();
+      const onFinish = vi.fn();
+      const failingPersistenceOwner: Processor = {
+        id: 'failing-message-history',
+        terminalToolResultPolicy: 'pass-through',
+        terminalToolResultPersistence: 'owner',
+        processOutputResult: async () => {
+          throw new Error('persistence down');
+        },
+      };
+      const output = new MastraModelOutput({
+        model: { modelId: 'test-model', provider: 'test', version: 'v3' },
+        stream: createChunkStream([terminalDataChunk, terminalStepChunk, terminalFinishChunk]),
+        messageList,
+        messageId,
+        options: {
+          runId,
+          outputProcessors: [failingPersistenceOwner],
+          onStepFinish,
+          onFinish,
+        },
+      });
+
+      const chunks: ChunkType[] = [];
+      for await (const chunk of output.fullStream) chunks.push(chunk);
+      const fullOutput = await output.getFullOutput();
+      const exposed = JSON.stringify({
+        chunks,
+        fullOutput,
+        onFinish: onFinish.mock.calls,
+        messages: messageList.get.all.db(),
+        nextModelPrompt: messageList.get.all.aiV5.model(),
+      });
+
+      expect(output.error?.message).toBe('persistence down');
+      expect(output.terminalToolResult).toBeUndefined();
+      expect(fullOutput.terminalToolResult).toBeUndefined();
+      expect(chunks.map(chunk => chunk.type)).toEqual(['finish']);
+      expect((chunks[0] as any).payload.stepResult.reason).toBe('error');
+      expect(onStepFinish).not.toHaveBeenCalled();
+      expect(onFinish).toHaveBeenCalledOnce();
+      expect(onFinish.mock.calls[0]?.[0]).toMatchObject({ finishReason: 'error' });
+      expect(onFinish.mock.calls[0]?.[0]).not.toHaveProperty('terminalToolResult');
+      expect(exposed).not.toContain(secret);
+      expect(
+        messageList.get.all
+          .db()
+          .flatMap(message => message.content.parts)
+          .filter(part => part.type === 'data-terminal-tool-result'),
+      ).toHaveLength(0);
     });
   });
 });

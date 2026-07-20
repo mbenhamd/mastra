@@ -7,6 +7,7 @@ import { MastraError, ErrorDomain, ErrorCategory } from '../../error';
 import type { IMastraLogger } from '../../logger';
 import { getTransformedToolPayload, hasTransformedToolPayload } from '../../tools/payload-transform';
 import type { IdGeneratorContext } from '../../types';
+import { deepEqual } from '../../utils';
 import { createSignal, isCreatedAgentSignal, mastraDBMessageToSignal } from '../signals';
 import type { CreatedAgentSignal } from '../signals';
 import { AIV4Adapter, AIV5Adapter, AIV6Adapter } from './adapters';
@@ -983,11 +984,66 @@ export class MessageList {
     },
   };
 
+  /**
+   * Capture the current unsaved input/response set without acknowledging it.
+   * `commit()` clears only captured messages whose transcript representation
+   * has not changed since the snapshot. A later merge may reuse the same
+   * assistant-message object, so reference identity alone cannot distinguish an
+   * older in-flight write from newer terminal content. This is used by
+   * fail-closed persistence: failed writes and post-snapshot mutations remain
+   * retryable.
+   */
+  public snapshotUnsavedMessages(options?: { detached?: boolean }): {
+    messages: MastraDBMessage[];
+    commit: () => void;
+  } {
+    const inputMessages = new Set(this.newUserMessages);
+    const responseMessages = new Set(this.newResponseMessages);
+    const trackedMessages = new Set([...inputMessages, ...responseMessages]);
+    const capturedMessages = new Map<MastraDBMessage, MastraDBMessage>();
+    const transformedMessages = this.messages
+      .filter(message => trackedMessages.has(message))
+      .map(message => {
+        const transformedMessage = this.transformMessageForTranscript(message);
+        // Keep an immutable baseline even when the caller requests live message
+        // objects. `commit()` must not acknowledge a newer merge into the same
+        // object merely because an older storage write completed successfully.
+        const capturedMessage = structuredClone(transformedMessage);
+        capturedMessages.set(message, capturedMessage);
+        return options?.detached ? capturedMessage : transformedMessage;
+      });
+    let committed = false;
+
+    return {
+      messages: transformedMessages,
+      commit: () => {
+        if (committed) return;
+        committed = true;
+        const currentMessages = new Set(this.messages);
+        const acknowledgeUnchanged = (
+          sourceMessages: Set<MastraDBMessage>,
+          capturedSourceMessages: Set<MastraDBMessage>,
+        ) => {
+          for (const message of capturedSourceMessages) {
+            const capturedMessage = capturedMessages.get(message);
+            if (
+              !currentMessages.has(message) ||
+              (capturedMessage !== undefined && deepEqual(this.transformMessageForTranscript(message), capturedMessage))
+            ) {
+              sourceMessages.delete(message);
+            }
+          }
+        };
+        acknowledgeUnchanged(this.newUserMessages, inputMessages);
+        acknowledgeUnchanged(this.newResponseMessages, responseMessages);
+      },
+    };
+  }
+
   public drainUnsavedMessages(): MastraDBMessage[] {
-    const messages = this.messages.filter(m => this.newUserMessages.has(m) || this.newResponseMessages.has(m));
-    this.newUserMessages.clear();
-    this.newResponseMessages.clear();
-    return messages.map(message => this.transformMessageForTranscript(message));
+    const snapshot = this.snapshotUnsavedMessages({ detached: true });
+    snapshot.commit();
+    return snapshot.messages;
   }
 
   private transformToolStateDataForTranscript(data: unknown, phase: 'approval' | 'suspend'): unknown {

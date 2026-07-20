@@ -1,10 +1,22 @@
-import { DurableAgentDefaults } from '@mastra/core/agent/durable';
+import { createHash } from 'node:crypto';
+import {
+  DurableAgentDefaults,
+  DurableStepIds,
+  globalRunRegistry,
+  TOOL_PERMISSION_POLICY_KEY,
+  TOOL_PERMISSION_POLICY_REQUIRED_KEY,
+  TOOL_PERMISSION_POLICY_STABLE_KEY,
+} from '@mastra/core/agent/durable';
+import { createTerminalToolResultPartId, MessageList } from '@mastra/core/agent/message-list';
+import { RequestContext } from '@mastra/core/request-context';
+import { PUBSUB_SYMBOL } from '@mastra/core/workflows/_constants';
 import { Inngest } from 'inngest';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   createInngestDurableAgenticWorkflow,
   createInngestDurableAgenticWorkflowIds,
+  INNGEST_DURABLE_AGENT_PROTOCOL_VERSION,
   InngestDurableStepIds,
 } from './create-inngest-agentic-workflow';
 
@@ -34,10 +46,40 @@ function findForeachEntry(steps: any[]): any {
   return undefined;
 }
 
+function findLoopEntry(steps: any[]): any {
+  for (const entry of steps ?? []) {
+    if (entry.type === 'loop' && entry.loopType === 'dowhile') return entry;
+    if (entry.step?.executionGraph) {
+      const nested = findLoopEntry(entry.step.executionGraph.steps);
+      if (nested) return nested;
+    }
+    if (entry.steps) {
+      const nested = findLoopEntry(entry.steps);
+      if (nested) return nested;
+    }
+  }
+  return undefined;
+}
+
+function findStepEntry(steps: any[], id: string): any {
+  for (const entry of steps ?? []) {
+    if (entry.type === 'step' && entry.step?.id === id) return entry;
+    if (entry.step?.executionGraph) {
+      const nested = findStepEntry(entry.step.executionGraph.steps, id);
+      if (nested) return nested;
+    }
+    if (entry.steps) {
+      const nested = findStepEntry(entry.steps, id);
+      if (nested) return nested;
+    }
+  }
+  return undefined;
+}
+
 describe('createInngestDurableAgenticWorkflow ownership IDs', () => {
   const inngest = new Inngest({ id: 'inngest-agentic-workflow-id-tests' });
 
-  it('retains the historical shared IDs for direct factory callers', () => {
+  it('uses protocol-v2 shared IDs for direct factory callers', () => {
     const workflow = createInngestDurableAgenticWorkflow({ inngest }) as any;
     const functionIds = workflow.getFunctions().map((fn: any) => fn.id());
 
@@ -57,9 +99,22 @@ describe('createInngestDurableAgenticWorkflow ownership IDs', () => {
 
     expect(first).toEqual(repeated);
     expect(first).not.toEqual(other);
-    expect(first.AGENTIC_LOOP).toMatch(/^inngest:durable-agentic-loop:[a-f0-9]{32}$/);
-    expect(first.AGENTIC_EXECUTION).toMatch(/^inngest:durable-agentic-execution:[a-f0-9]{32}$/);
+    expect(INNGEST_DURABLE_AGENT_PROTOCOL_VERSION).toBe('v2');
+    expect(first.AGENTIC_LOOP).toMatch(/^inngest:v2:durable-agentic-loop:[a-f0-9]{32}$/);
+    expect(first.AGENTIC_EXECUTION).toMatch(/^inngest:v2:durable-agentic-execution:[a-f0-9]{32}$/);
     expect(() => createInngestDurableAgenticWorkflowIds('')).toThrow(/non-empty agent ID/);
+  });
+
+  it('does not reuse the protocol-v1 function identity', () => {
+    const agentId = 'policy-owner';
+    const current = createInngestDurableAgenticWorkflowIds(agentId);
+    const legacyOwnerHash = createHash('sha256')
+      .update(`mastra:inngest:durable-agent:v1\0${agentId}`)
+      .digest('hex')
+      .slice(0, 32);
+
+    expect(current.AGENTIC_LOOP).not.toBe(`inngest:durable-agentic-loop:${legacyOwnerHash}`);
+    expect(current.AGENTIC_EXECUTION).not.toBe(`inngest:durable-agentic-execution:${legacyOwnerHash}`);
   });
 
   it('applies the owner namespace to both parent and nested function IDs', () => {
@@ -80,10 +135,10 @@ describe('createInngestDurableAgenticWorkflow tool-call concurrency', () => {
   const workflow = createInngestDurableAgenticWorkflow({ inngest });
   const foreachEntry = findForeachEntry((workflow as any).executionGraph.steps);
 
-  const resolveWith = (state: unknown): number => {
+  const resolveWith = (state: unknown, inputData: unknown[] = [], requestContext?: RequestContext): number => {
     const resolver = foreachEntry.opts.concurrency;
     expect(typeof resolver).toBe('function');
-    return resolver({ inputData: [], getInitData: () => state });
+    return resolver({ inputData, getInitData: () => state, requestContext });
   };
 
   it('uses a concurrency resolver on the tool-call foreach (not a static value)', () => {
@@ -116,6 +171,88 @@ describe('createInngestDurableAgenticWorkflow tool-call concurrency', () => {
     ).toBe(1);
   });
 
+  it('forces sequential execution when a per-tool permission policy may ask', () => {
+    expect(
+      resolveWith({
+        options: { permissionPolicyRequired: true, toolCallConcurrency: 10 },
+        toolsMetadata: [],
+      }),
+    ).toBe(1);
+  });
+
+  it('uses configured concurrency for a stable live all-allow policy', () => {
+    const requestContext = new RequestContext();
+    requestContext.set(TOOL_PERMISSION_POLICY_KEY, () => 'allow');
+    requestContext.set(TOOL_PERMISSION_POLICY_STABLE_KEY, true);
+
+    expect(
+      resolveWith(
+        { options: { permissionPolicyRequired: true, toolCallConcurrency: 4 }, toolsMetadata: [] },
+        [
+          { toolCallId: 'call-a', toolName: 'read_a', args: {} },
+          { toolCallId: 'call-b', toolName: 'read_b', args: {} },
+        ],
+        requestContext,
+      ),
+    ).toBe(4);
+  });
+
+  it('keeps mixed ask plus allow and throwing live policies sequential', () => {
+    const requestContext = new RequestContext();
+    requestContext.set(TOOL_PERMISSION_POLICY_STABLE_KEY, true);
+    requestContext.set(TOOL_PERMISSION_POLICY_KEY, (toolName: string) => (toolName === 'write' ? 'ask' : 'allow'));
+    const state = { options: { permissionPolicyRequired: true, toolCallConcurrency: 4 }, toolsMetadata: [] };
+    const calls = [
+      { toolCallId: 'call-read', toolName: 'read', args: {} },
+      { toolCallId: 'call-write', toolName: 'write', args: {} },
+    ];
+
+    expect(resolveWith(state, calls, requestContext)).toBe(1);
+
+    requestContext.set(TOOL_PERMISSION_POLICY_KEY, () => {
+      throw new Error('policy unavailable');
+    });
+    expect(resolveWith(state, calls, requestContext)).toBe(1);
+  });
+
+  it('forces two legacy tool calls sequentially when only RequestContext carries the policy marker', () => {
+    const requestContext = new RequestContext();
+    requestContext.set(TOOL_PERMISSION_POLICY_REQUIRED_KEY, true);
+    const resolver = foreachEntry.opts.concurrency;
+    const toolCalls = [
+      { toolCallId: 'call-a', toolName: 'write_file', args: { path: 'a.tex' } },
+      { toolCallId: 'call-b', toolName: 'write_file', args: { path: 'b.tex' } },
+    ];
+
+    expect(
+      resolver({
+        inputData: toolCalls,
+        getInitData: () => ({
+          options: { permissionPolicyRequired: false, toolCallConcurrency: 10 },
+          toolsMetadata: [],
+        }),
+        requestContext,
+      }),
+    ).toBe(1);
+  });
+
+  it('forces sequential execution from factory resolver configuration even if replay state loses its marker', () => {
+    const resolverWorkflow = createInngestDurableAgenticWorkflow({
+      inngest,
+      resolveToolPermission: () => 'allow',
+    });
+    const resolverForeach = findForeachEntry((resolverWorkflow as any).executionGraph.steps);
+    const resolver = resolverForeach.opts.concurrency;
+
+    expect(
+      resolver({
+        inputData: [],
+        getInitData: () => ({ options: { toolCallConcurrency: 10 }, toolsMetadata: [] }),
+      }),
+    ).toBe(1);
+    expect(resolver({ inputData: [], getInitData: () => undefined })).toBe(1);
+  });
+
   it('forces sequential execution when a tool requires approval', () => {
     expect(
       resolveWith({
@@ -137,5 +274,710 @@ describe('createInngestDurableAgenticWorkflow tool-call concurrency', () => {
         ],
       }),
     ).toBe(1);
+  });
+});
+
+describe('createInngestDurableAgenticWorkflow permission policy', () => {
+  const inngest = new Inngest({ id: 'inngest-agentic-workflow-permission-tests' });
+  const workflow = createInngestDurableAgenticWorkflow({ inngest }) as any;
+  const toolCallStep = findForeachEntry(workflow.executionGraph.steps).step;
+
+  it('fails closed before tool execution when a configured policy evaluator was lost', async () => {
+    const runId = 'inngest-missing-permission-policy';
+    const runtimeBindingId = 'inngest-missing-permission-policy-binding';
+    const execute = vi.fn().mockResolvedValue({ unsafe: true });
+    globalRunRegistry.set(runId, {
+      runtimeBindingId,
+      tools: { write_file: { id: 'write_file', execute } },
+      model: {} as any,
+    } as any);
+
+    try {
+      const result = await toolCallStep.execute({
+        inputData: { toolCallId: 'call-write', toolName: 'write_file', args: { path: 'paper.tex' } },
+        mastra: { getLogger: () => undefined },
+        suspend: vi.fn(),
+        resumeData: undefined,
+        requestContext: new Map(),
+        getInitData: () => ({
+          runId,
+          runtimeBindingId,
+          agentId: 'inngest-permission-agent',
+          options: { permissionPolicyRequired: true },
+          toolsMetadata: [],
+          messageListState: new MessageList().serialize(),
+          state: {},
+        }),
+        [PUBSUB_SYMBOL]: { publish: vi.fn() },
+      });
+
+      expect(result).toMatchObject({ disposition: 'denied' });
+      expect(execute).not.toHaveBeenCalled();
+    } finally {
+      globalRunRegistry.delete(runId);
+    }
+  });
+
+  it('uses the worker resolver on both sides of an ask approval resume', async () => {
+    const runId = 'inngest-worker-policy-ask';
+    const runtimeBindingId = 'inngest-worker-policy-ask-binding';
+    const execute = vi.fn().mockResolvedValue({ written: true });
+    const resolveToolPermission = vi.fn().mockResolvedValue('ask');
+    const resolverWorkflow = createInngestDurableAgenticWorkflow({ inngest, resolveToolPermission }) as any;
+    const resolverToolCallStep = findForeachEntry(resolverWorkflow.executionGraph.steps).step;
+    const requestContext = new RequestContext();
+    requestContext.set('sessionId', 'session-1');
+    globalRunRegistry.set(runId, {
+      runtimeBindingId,
+      tools: { write_file: { id: 'write_file', execute } },
+      model: {} as any,
+    } as any);
+
+    const initData = () => ({
+      runId,
+      runtimeBindingId,
+      agentId: 'inngest-permission-agent',
+      options: { permissionPolicyRequired: true },
+      toolsMetadata: [],
+      messageListState: new MessageList().serialize(),
+      state: {},
+    });
+    const inputData = { toolCallId: 'call-write', toolName: 'write_file', args: { path: 'paper.tex' } };
+    const pubsub = { publish: vi.fn() };
+    const suspend = vi.fn().mockReturnValue({ status: 'suspended' });
+
+    try {
+      const first = await resolverToolCallStep.execute({
+        inputData,
+        mastra: { getLogger: () => undefined },
+        suspend,
+        resumeData: undefined,
+        requestContext,
+        getInitData: initData,
+        [PUBSUB_SYMBOL]: pubsub,
+      });
+      expect(first).toEqual({ status: 'suspended' });
+      expect(execute).not.toHaveBeenCalled();
+
+      const suspendData = suspend.mock.calls[0]?.[0];
+      const resumed = await resolverToolCallStep.execute({
+        inputData,
+        mastra: { getLogger: () => undefined },
+        suspend: vi.fn(),
+        resumeData: { approved: true },
+        suspendData,
+        requestContext,
+        getInitData: initData,
+        [PUBSUB_SYMBOL]: pubsub,
+      });
+
+      expect(resumed.result).toEqual({ written: true });
+      expect(execute).toHaveBeenCalledOnce();
+      expect(resolveToolPermission).toHaveBeenCalledTimes(2);
+      expect(resolveToolPermission.mock.calls.map(([input]) => input.isResume)).toEqual([false, true]);
+      expect(resolveToolPermission).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          runId,
+          agentId: 'inngest-permission-agent',
+          toolCallId: 'call-write',
+          toolName: 'write_file',
+          args: { path: 'paper.tex' },
+          requestContext,
+          isResume: true,
+        }),
+      );
+    } finally {
+      globalRunRegistry.delete(runId);
+    }
+  });
+});
+
+describe('createInngestDurableAgenticWorkflow terminal tool result', () => {
+  const inngest = new Inngest({ id: 'inngest-agentic-workflow-terminal-result-tests' });
+  const workflow = createInngestDurableAgenticWorkflow({ inngest }) as any;
+  const loopEntry = findLoopEntry(workflow.executionGraph.steps);
+  const finalOutputEntry = findStepEntry(workflow.executionGraph.steps, 'map-final-output');
+
+  it('runs the signal-precedence step before committing terminal delivery', () => {
+    expect(
+      findStepEntry(workflow.executionGraph.steps, `${DurableStepIds.AGENTIC_EXECUTION}-signal-drain`),
+    ).toBeDefined();
+  });
+
+  it('emits the terminal result before step finish and stops without another iteration', async () => {
+    const published: any[] = [];
+    const pubsub = {
+      async publish(_topic: string, event: unknown) {
+        published.push(event);
+      },
+    };
+    const state = {
+      runId: 'run-terminal',
+      accumulatedSteps: [{}],
+      accumulatedUsage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      messageListState: new MessageList().serialize(),
+      messageId: 'message-1',
+      state: {},
+      lastStepResult: { isContinued: true },
+      terminalToolResult: {
+        status: 'success',
+        items: [
+          {
+            toolName: 'answer',
+            toolCallId: 'call-1',
+            status: 'success',
+            value: { answer: 'done' },
+          },
+        ],
+      },
+      deferredStepFinishChunk: { type: 'step-finish', payload: { reason: 'tool-calls' } },
+    };
+
+    const shouldContinue = await loopEntry.condition({
+      inputData: state,
+      [PUBSUB_SYMBOL]: pubsub,
+    });
+
+    expect(shouldContinue).toBe(false);
+    expect(state.lastStepResult.isContinued).toBe(false);
+    expect(state.deferredStepFinishChunk).toBeDefined();
+    expect(published).toEqual([]);
+
+    await finalOutputEntry.step.execute({
+      inputData: state,
+      mastra: undefined,
+      [PUBSUB_SYMBOL]: pubsub,
+    });
+
+    expect(state.deferredStepFinishChunk).toBeUndefined();
+    expect(published).toHaveLength(1);
+    expect(published[0].type).toBe('finish');
+    expect(published[0].data.terminalToolResult.id).toBe(createTerminalToolResultPartId('run-terminal', 1));
+    expect(published[0].data.terminalStepFinishChunk.type).toBe('step-finish');
+  });
+
+  it('rehydrates backing memory and persists the terminal marker during finalization', async () => {
+    const runId = 'run-terminal-memory-restart';
+    const threadId = 'thread-terminal-memory-restart';
+    const resourceId = 'resource-terminal-memory-restart';
+    const saveMessages = vi.fn().mockResolvedValue(undefined);
+    const processOutputResult = vi.fn(async ({ messageList }) => messageList);
+    const outputProcessor = {
+      id: 'restart-safe-output-processor',
+      terminalToolResultPolicy: 'pass-through',
+      processOutputResult,
+    };
+    const memory = {
+      saveMessages,
+      createThread: vi.fn().mockResolvedValue(undefined),
+    };
+    const logger = { debug: vi.fn(), error: vi.fn(), warn: vi.fn() };
+    const agent = {
+      getToolsForExecution: vi.fn().mockResolvedValue({}),
+      getModel: vi.fn().mockResolvedValue({ provider: 'test', modelId: 'test-model', specificationVersion: 'v2' }),
+      getModelList: vi.fn().mockResolvedValue(undefined),
+      getMemory: vi.fn().mockResolvedValue(memory),
+      getWorkspace: vi.fn().mockResolvedValue(undefined),
+      listInputProcessors: vi.fn().mockResolvedValue([]),
+      __listLLMRequestProcessors: vi.fn().mockResolvedValue([]),
+      listOutputProcessors: vi.fn().mockResolvedValue([outputProcessor]),
+      listErrorProcessors: vi.fn().mockResolvedValue([]),
+    };
+    const mastra = {
+      getAgentById: vi.fn().mockReturnValue(agent),
+      getLogger: () => logger,
+    };
+    const initialMessageList = new MessageList({ threadId, resourceId });
+    const state = {
+      runId,
+      agentId: 'terminal-memory-agent',
+      accumulatedSteps: [{}],
+      accumulatedUsage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      messageListState: initialMessageList.serialize(),
+      messageId: 'message-terminal-memory',
+      state: {
+        memoryConfigured: true,
+        threadId,
+        resourceId,
+        threadExists: false,
+        observationalMemory: false,
+        memoryConfig: {},
+      },
+      lastStepResult: { reason: 'tool-calls', warnings: [], isContinued: false },
+      terminalToolResult: {
+        status: 'success',
+        items: [
+          {
+            toolName: 'answer',
+            toolCallId: 'call-memory',
+            status: 'success',
+            value: { answer: 'persisted after restart' },
+          },
+        ],
+      },
+    };
+    const initData = {
+      __workflowKind: 'durable-agent',
+      runId,
+      agentId: state.agentId,
+      messageListState: state.messageListState,
+      toolsMetadata: [],
+      modelConfig: { provider: 'test', modelId: 'test-model', specificationVersion: 'v2' },
+      options: {},
+      state: state.state,
+      messageId: state.messageId,
+    };
+
+    await finalOutputEntry.step.execute({
+      inputData: state,
+      mastra,
+      getInitData: () => initData,
+    });
+
+    expect(agent.getMemory).toHaveBeenCalledOnce();
+    expect(memory.createThread).toHaveBeenCalledOnce();
+    expect(memory.createThread).toHaveBeenCalledWith(expect.objectContaining({ threadId, resourceId }));
+    expect(processOutputResult).toHaveBeenCalledOnce();
+    expect(processOutputResult.mock.calls[0]?.[0]?.messages).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          content: expect.objectContaining({
+            parts: expect.arrayContaining([
+              expect.objectContaining({
+                type: 'data-terminal-tool-result',
+                id: createTerminalToolResultPartId(runId, 1),
+              }),
+            ]),
+          }),
+        }),
+      ]),
+    );
+    expect(saveMessages).toHaveBeenCalledOnce();
+    const persisted = saveMessages.mock.calls[0]?.[0]?.messages as Array<{ content?: { parts?: unknown[] } }>;
+    expect(persisted).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          content: expect.objectContaining({
+            parts: expect.arrayContaining([
+              expect.objectContaining({
+                type: 'data-terminal-tool-result',
+                id: createTerminalToolResultPartId(runId, 1),
+              }),
+            ]),
+          }),
+        }),
+      ]),
+    );
+  });
+
+  it.each([
+    ['existing', true],
+    ['new', false],
+  ])('does not publish when configured memory cannot be rehydrated for an %s thread', async (_label, exists) => {
+    const published: unknown[] = [];
+    const state = {
+      runId: `run-terminal-missing-memory-${_label}`,
+      agentId: 'missing-memory-agent',
+      accumulatedSteps: [{}],
+      accumulatedUsage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      messageListState: new MessageList().serialize(),
+      messageId: `message-terminal-missing-memory-${_label}`,
+      state: {
+        memoryConfigured: true,
+        threadId: `thread-terminal-missing-memory-${_label}`,
+        resourceId: 'resource-terminal-missing-memory',
+        threadExists: exists,
+        observationalMemory: false,
+        memoryConfig: {},
+      },
+      lastStepResult: { reason: 'tool-calls', warnings: [], isContinued: false },
+      terminalToolResult: {
+        status: 'success',
+        items: [
+          {
+            toolName: 'answer',
+            toolCallId: 'call-missing-memory',
+            status: 'success',
+            value: { answer: 'must not publish' },
+          },
+        ],
+      },
+    };
+
+    await expect(
+      finalOutputEntry.step.execute({
+        inputData: state,
+        mastra: undefined,
+        [PUBSUB_SYMBOL]: {
+          async publish(_topic: string, event: unknown) {
+            published.push(event);
+          },
+        },
+      }),
+    ).rejects.toThrow('configured memory could not be rehydrated');
+
+    expect(published).toEqual([]);
+  });
+
+  it('does not publish when a rehydrated terminal output processor fails', async () => {
+    const published: unknown[] = [];
+    const processOutputResult = vi.fn().mockRejectedValue(new Error('processor persistence failed'));
+    const memory = { saveMessages: vi.fn(), createThread: vi.fn() };
+    const agent = {
+      getToolsForExecution: vi.fn().mockResolvedValue({}),
+      getModel: vi.fn().mockResolvedValue({ provider: 'test', modelId: 'test-model', specificationVersion: 'v2' }),
+      getModelList: vi.fn().mockResolvedValue(undefined),
+      getMemory: vi.fn().mockResolvedValue(memory),
+      getWorkspace: vi.fn().mockResolvedValue(undefined),
+      listInputProcessors: vi.fn().mockResolvedValue([]),
+      __listLLMRequestProcessors: vi.fn().mockResolvedValue([]),
+      listOutputProcessors: vi
+        .fn()
+        .mockResolvedValue([{ id: 'failing-output', terminalToolResultPolicy: 'pass-through', processOutputResult }]),
+      listErrorProcessors: vi.fn().mockResolvedValue([]),
+    };
+    const mastra = { getAgentById: vi.fn().mockReturnValue(agent), getLogger: () => ({ warn: vi.fn() }) };
+    const state = {
+      runId: 'run-terminal-inngest-processor-failure',
+      agentId: 'terminal-processor-agent',
+      accumulatedSteps: [{}],
+      accumulatedUsage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      messageListState: new MessageList().serialize(),
+      messageId: 'message-terminal-processor-failure',
+      state: {
+        memoryConfigured: true,
+        threadId: 'thread-terminal-processor-failure',
+        resourceId: 'resource-terminal-processor-failure',
+        threadExists: true,
+        observationalMemory: false,
+        memoryConfig: {},
+      },
+      lastStepResult: { reason: 'tool-calls', warnings: [], isContinued: false },
+      terminalToolResult: {
+        status: 'success',
+        items: [
+          {
+            toolName: 'answer',
+            toolCallId: 'call-processor-failure',
+            status: 'success',
+            value: { answer: 'must not publish' },
+          },
+        ],
+      },
+    };
+
+    await expect(
+      finalOutputEntry.step.execute({
+        inputData: state,
+        mastra,
+        getInitData: () => ({
+          __workflowKind: 'durable-agent',
+          runId: state.runId,
+          agentId: state.agentId,
+          messageListState: state.messageListState,
+          toolsMetadata: [],
+          modelConfig: { provider: 'test', modelId: 'test-model', specificationVersion: 'v2' },
+          options: {},
+          state: state.state,
+          messageId: state.messageId,
+        }),
+        [PUBSUB_SYMBOL]: {
+          async publish(_topic: string, event: unknown) {
+            published.push(event);
+          },
+        },
+      }),
+    ).rejects.toThrow('processor persistence failed');
+
+    expect(processOutputResult).toHaveBeenCalledOnce();
+    expect(memory.saveMessages).not.toHaveBeenCalled();
+    expect(published).toEqual([]);
+  });
+
+  it.each(['delete', 'mutate', 'duplicate'] as const)(
+    'does not publish when a rehydrated final processor %ss the terminal marker',
+    async mode => {
+      const published: unknown[] = [];
+      const processOutputResult = vi.fn(({ messages }: { messages: any[] }) =>
+        messages.map(message => ({
+          ...message,
+          content: {
+            ...message.content,
+            parts: message.content.parts.flatMap((part: any) => {
+              if (part.type !== 'data-terminal-tool-result') return [part];
+              if (mode === 'delete') return [];
+              if (mode === 'duplicate') return [part, structuredClone(part)];
+              return [
+                {
+                  ...part,
+                  data: {
+                    ...part.data,
+                    items: part.data.items.map((item: any) => ({ ...item, value: { answer: 'changed' } })),
+                  },
+                },
+              ];
+            }),
+          },
+        })),
+      );
+      const outputProcessor = {
+        id: `invalidating-terminal-owner-${mode}`,
+        terminalToolResultPolicy: 'pass-through',
+        terminalToolResultPersistence: 'owner',
+        processOutputResult,
+      };
+      const agent = {
+        getToolsForExecution: vi.fn().mockResolvedValue({}),
+        getModel: vi.fn().mockResolvedValue({ provider: 'test', modelId: 'test-model', specificationVersion: 'v2' }),
+        getModelList: vi.fn().mockResolvedValue(undefined),
+        getMemory: vi.fn().mockResolvedValue(undefined),
+        getWorkspace: vi.fn().mockResolvedValue(undefined),
+        listInputProcessors: vi.fn().mockResolvedValue([]),
+        __listLLMRequestProcessors: vi.fn().mockResolvedValue([]),
+        listOutputProcessors: vi.fn().mockResolvedValue([outputProcessor]),
+        listErrorProcessors: vi.fn().mockResolvedValue([]),
+      };
+      const mastra = {
+        getAgentById: vi.fn().mockReturnValue(agent),
+        getLogger: () => ({ debug: vi.fn(), error: vi.fn(), warn: vi.fn() }),
+      };
+      const state = {
+        runId: `run-terminal-inngest-${mode}`,
+        agentId: 'terminal-integrity-agent',
+        accumulatedSteps: [{}],
+        accumulatedUsage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+        messageListState: new MessageList().serialize(),
+        messageId: `message-terminal-inngest-${mode}`,
+        state: {
+          memoryConfigured: false,
+          threadId: `thread-terminal-inngest-${mode}`,
+          resourceId: 'resource-terminal-inngest-integrity',
+          threadExists: false,
+          observationalMemory: false,
+          memoryConfig: {},
+        },
+        lastStepResult: { reason: 'tool-calls', warnings: [], isContinued: false },
+        terminalToolResult: {
+          status: 'success',
+          items: [
+            {
+              toolName: 'answer',
+              toolCallId: `call-integrity-${mode}`,
+              status: 'success',
+              value: { answer: 'must remain exact' },
+            },
+          ],
+        },
+      };
+
+      await expect(
+        finalOutputEntry.step.execute({
+          inputData: state,
+          mastra,
+          getInitData: () => ({
+            __workflowKind: 'durable-agent',
+            runId: state.runId,
+            agentId: state.agentId,
+            messageListState: state.messageListState,
+            toolsMetadata: [],
+            modelConfig: { provider: 'test', modelId: 'test-model', specificationVersion: 'v2' },
+            options: {},
+            state: state.state,
+            messageId: state.messageId,
+          }),
+          [PUBSUB_SYMBOL]: {
+            async publish(_topic: string, event: unknown) {
+              published.push(event);
+            },
+          },
+        }),
+      ).rejects.toThrow(/retain exactly one|changed the terminal tool result/);
+
+      expect(processOutputResult).toHaveBeenCalledOnce();
+      expect(published).toEqual([]);
+    },
+  );
+
+  it('retries a failed new-thread memory write and publishes exactly once after persistence', async () => {
+    const published: any[] = [];
+    const persisted: any[] = [];
+    const memory = {
+      saveMessages: vi
+        .fn()
+        .mockRejectedValueOnce(new Error('memory flush failed'))
+        .mockImplementation(async ({ messages }: { messages: any[] }) => {
+          persisted.push(...messages);
+        }),
+      createThread: vi.fn().mockResolvedValue(undefined),
+    };
+    const agent = {
+      getToolsForExecution: vi.fn().mockResolvedValue({}),
+      getModel: vi.fn().mockResolvedValue({ provider: 'test', modelId: 'test-model', specificationVersion: 'v2' }),
+      getModelList: vi.fn().mockResolvedValue(undefined),
+      getMemory: vi.fn().mockResolvedValue(memory),
+      getWorkspace: vi.fn().mockResolvedValue(undefined),
+      listInputProcessors: vi.fn().mockResolvedValue([]),
+      __listLLMRequestProcessors: vi.fn().mockResolvedValue([]),
+      listOutputProcessors: vi.fn().mockResolvedValue([]),
+      listErrorProcessors: vi.fn().mockResolvedValue([]),
+    };
+    const mastra = { getAgentById: vi.fn().mockReturnValue(agent), getLogger: () => ({ warn: vi.fn() }) };
+    const state = {
+      runId: 'run-terminal-inngest-memory-failure',
+      agentId: 'terminal-memory-failure-agent',
+      accumulatedSteps: [{}],
+      accumulatedUsage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      messageListState: new MessageList().serialize(),
+      messageId: 'message-terminal-memory-failure',
+      state: {
+        memoryConfigured: true,
+        threadId: 'thread-terminal-memory-failure',
+        resourceId: 'resource-terminal-memory-failure',
+        threadExists: false,
+        observationalMemory: false,
+        memoryConfig: {},
+      },
+      lastStepResult: { reason: 'tool-calls', warnings: [], isContinued: false },
+      terminalToolResult: {
+        status: 'success',
+        items: [
+          {
+            toolName: 'answer',
+            toolCallId: 'call-memory-failure',
+            status: 'success',
+            value: { answer: 'must not publish' },
+          },
+        ],
+      },
+    };
+
+    const params = {
+      inputData: state,
+      mastra,
+      getInitData: () => ({
+        __workflowKind: 'durable-agent',
+        runId: state.runId,
+        agentId: state.agentId,
+        messageListState: state.messageListState,
+        toolsMetadata: [],
+        modelConfig: { provider: 'test', modelId: 'test-model', specificationVersion: 'v2' },
+        options: {},
+        state: state.state,
+        messageId: state.messageId,
+      }),
+      [PUBSUB_SYMBOL]: {
+        async publish(_topic: string, event: unknown) {
+          published.push(event);
+        },
+      },
+    };
+
+    await expect(finalOutputEntry.step.execute(params)).rejects.toThrow('memory flush failed');
+
+    expect(memory.createThread).toHaveBeenCalledOnce();
+    expect(memory.saveMessages).toHaveBeenCalledOnce();
+    expect(published).toEqual([]);
+
+    await finalOutputEntry.step.execute(params);
+
+    expect(memory.createThread).toHaveBeenCalledOnce();
+    expect(memory.saveMessages).toHaveBeenCalledTimes(2);
+    expect(persisted).toHaveLength(1);
+    expect(persisted[0]?.content?.parts?.filter((part: any) => part.type === 'data-terminal-tool-result')).toHaveLength(
+      1,
+    );
+    expect(published.filter(event => event.type === 'finish' && event.data?.terminalToolResult)).toHaveLength(1);
+  });
+
+  it.each([
+    ['empty items', { status: 'success', items: [] }],
+    [
+      'oversized value',
+      {
+        status: 'success',
+        items: [
+          {
+            toolName: 'answer',
+            toolCallId: 'call-oversized',
+            status: 'success',
+            value: { text: 'x'.repeat(64 * 1024) },
+          },
+        ],
+      },
+    ],
+  ])('rejects a replayed %s terminal payload before memory or publication', async (_label, terminal) => {
+    const published: unknown[] = [];
+    const state = {
+      runId: `run-invalid-terminal-${_label}`,
+      accumulatedSteps: [{}],
+      accumulatedUsage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      messageListState: new MessageList().serialize(),
+      messageId: 'invalid-terminal-message',
+      state: {},
+      lastStepResult: { reason: 'tool-calls', warnings: [], isContinued: false },
+      terminalToolResult: terminal,
+    };
+
+    await expect(
+      finalOutputEntry.step.execute({
+        inputData: state,
+        mastra: undefined,
+        [PUBSUB_SYMBOL]: {
+          async publish(_topic: string, event: unknown) {
+            published.push(event);
+          },
+        },
+      }),
+    ).rejects.toThrow(/Terminal tool result|byte limit/);
+    expect(published).toEqual([]);
+  });
+
+  it('lets an abort landing before the final map override a terminal candidate', async () => {
+    const runId = 'run-terminal-abort-window';
+    const abortController = new AbortController();
+    abortController.abort('cancel terminal delivery');
+    globalRunRegistry.set(runId, { abortSignal: abortController.signal } as any);
+    const published: any[] = [];
+    const state = {
+      runId,
+      accumulatedSteps: [{}],
+      accumulatedUsage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      messageListState: new MessageList().serialize(),
+      messageId: 'message-terminal-abort-window',
+      state: {},
+      lastStepResult: { reason: 'tool-calls', warnings: [], isContinued: false },
+      terminalToolResult: {
+        status: 'success',
+        items: [
+          {
+            toolName: 'answer',
+            toolCallId: 'call-abort-window',
+            status: 'success',
+            value: { answer: 'must not publish' },
+          },
+        ],
+      },
+      deferredStepFinishChunk: { type: 'step-finish', payload: { reason: 'tool-calls' } },
+    };
+
+    try {
+      await finalOutputEntry.step.execute({
+        inputData: state,
+        mastra: undefined,
+        [PUBSUB_SYMBOL]: {
+          async publish(_topic: string, event: unknown) {
+            published.push(event);
+          },
+        },
+      });
+    } finally {
+      globalRunRegistry.delete(runId);
+    }
+
+    expect(state.terminalToolResult).toBeUndefined();
+    expect(state.deferredStepFinishChunk).toBeUndefined();
+    expect(state.lastStepResult).toMatchObject({ reason: 'abort', isContinued: false });
+    expect(published.filter(event => event.data?.type === 'data-terminal-tool-result')).toHaveLength(0);
+    expect(published).toEqual([expect.objectContaining({ type: 'finish' })]);
   });
 });

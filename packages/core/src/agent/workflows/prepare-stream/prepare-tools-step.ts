@@ -6,6 +6,7 @@ import { createObservabilityContext } from '../../../observability';
 import type { RequestContext } from '../../../request-context';
 import { createStep } from '../../../workflows/workflow';
 import type { InnerAgentExecutionOptions } from '../../agent.types';
+import type { MastraDBMessage } from '../../message-list';
 import type { AgentMethodType } from '../../types';
 import type { PrepareStreamRunScope } from './run-scope';
 import { CONVERTED_TOOLS_KEY } from './run-scope-keys';
@@ -24,6 +25,7 @@ interface PrepareToolsStepOptions<OUTPUT = undefined> {
   memory?: MastraMemory;
   isResume?: boolean;
   backgroundTaskEnabled?: boolean;
+  processorResumeMessages?: MastraDBMessage[];
   runScope: PrepareStreamRunScope<OUTPUT>;
 }
 
@@ -39,6 +41,7 @@ export function createPrepareToolsStep<OUTPUT = undefined>({
   memory: _memory,
   isResume,
   backgroundTaskEnabled,
+  processorResumeMessages,
   runScope,
 }: PrepareToolsStepOptions<OUTPUT>) {
   return createStep({
@@ -65,6 +68,7 @@ export function createPrepareToolsStep<OUTPUT = undefined>({
         pubsub: options._pubsub,
         backgroundTaskEnabled,
         inputProcessors: options.inputProcessors,
+        ...(processorResumeMessages !== undefined ? { processorMessages: processorResumeMessages } : {}),
         hooks: options.hooks,
         isResume,
         toolSurfaceFenceOwnerId: options._toolSurfaceFenceOwnerId,

@@ -75,6 +75,25 @@ export abstract class MemoryStorage extends StorageDomain {
   abstract listMessages(args: StorageListMessagesInput): Promise<StorageListMessagesOutput>;
 
   /**
+   * Return whether at least one message exists for the requested thread scope.
+   *
+   * Storage adapters should override this with a native existence query when
+   * possible. The compatibility fallback intentionally keeps this method
+   * non-abstract so existing custom adapters continue to work.
+   */
+  async hasMessages({
+    threadId,
+    resourceId,
+  }: Pick<StorageListMessagesInput, 'threadId' | 'resourceId'>): Promise<boolean> {
+    const result = await this.listMessages({
+      threadId,
+      ...(resourceId === undefined ? {} : { resourceId }),
+      perPage: 1,
+    });
+    return result.messages.length > 0;
+  }
+
+  /**
    * List messages by resource ID only (across all threads).
    * Used by Observational Memory and LongMemEval for resource-scoped queries.
    *

@@ -22,6 +22,7 @@ import { Mastra } from '../../mastra';
 import { ToolSearchProcessor } from '../../processors';
 import type { ProcessInputStepArgs, Processor } from '../../processors';
 import { ProcessorStepInputSchema, ProcessorStepOutputSchema } from '../../processors/step-schema';
+import { MASTRA_RESOURCE_ID_KEY, MASTRA_THREAD_ID_KEY, RequestContext } from '../../request-context';
 import { InMemoryStore } from '../../storage';
 import { createTool } from '../../tools';
 import { createStep, createWorkflow } from '../../workflows';
@@ -411,10 +412,12 @@ describe('tool approval with ToolSearchProcessor', () => {
     toolId,
     agentId,
     inputProcessors,
+    coldRestart = false,
   }: {
     toolId: string;
     agentId: string;
     inputProcessors: (args: { toolId: string; dynamicApprovalTool: any }) => any[];
+    coldRestart?: boolean;
   }) => {
     const executeDynamicTool = vi.fn().mockResolvedValue({ ok: true });
 
@@ -496,33 +499,59 @@ describe('tool approval with ToolSearchProcessor', () => {
       },
     });
 
-    const userAgent = new Agent({
-      id: agentId,
-      name: 'Tool Search Approval Agent',
-      instructions: 'Load and use dynamic tools.',
-      model: mockModel,
-      inputProcessors: inputProcessors({ toolId, dynamicApprovalTool }),
-    });
+    const storage = new InMemoryStore();
+    const createRegisteredAgent = () => {
+      const userAgent = new Agent({
+        id: agentId,
+        name: 'Tool Search Approval Agent',
+        instructions: 'Load and use dynamic tools.',
+        model: mockModel,
+        inputProcessors: inputProcessors({ toolId, dynamicApprovalTool }),
+      });
+      const mastra = new Mastra({
+        agents: { userAgent },
+        logger: false,
+        storage,
+      });
+      return mastra.getAgent('userAgent');
+    };
 
-    const mastra = new Mastra({
-      agents: { userAgent },
-      logger: false,
-      storage: new InMemoryStore(),
+    let agent = createRegisteredAgent();
+    const memory = { thread: `${agentId}-thread`, resource: `${agentId}-resource` };
+    const createRequestContext = () =>
+      new RequestContext([
+        [MASTRA_THREAD_ID_KEY, memory.thread],
+        [MASTRA_RESOURCE_ID_KEY, memory.resource],
+      ]);
+    const stream = await agent.stream('Load and use the approval tool', {
+      maxSteps: 5,
+      memory,
+      requestContext: createRequestContext(),
     });
-
-    const agent = mastra.getAgent('userAgent');
-    const stream = await agent.stream('Load and use the approval tool', { maxSteps: 5 });
 
     let toolCallId = '';
+    const observedChunks: string[] = [];
     for await (const chunk of stream.fullStream) {
+      observedChunks.push(`${chunk.type}:${'payload' in chunk ? ((chunk.payload as any)?.toolName ?? '') : ''}`);
       if (chunk.type === 'tool-call-approval') {
         toolCallId = chunk.payload.toolCallId;
       }
     }
 
-    expect(toolCallId).toBe('dynamic-call');
+    expect(toolCallId, `observed chunks: ${observedChunks.join(', ')}`).toBe('dynamic-call');
 
-    const resumeResult = await agent.approveToolCall({ runId: stream.runId, toolCallId });
+    if (coldRestart) {
+      // Recreate both Agent and ToolSearchProcessor over the same durable
+      // workflow store. The new processor has no in-memory loaded-tool state.
+      agent = createRegisteredAgent();
+    }
+
+    const resumeResult = await agent.approveToolCall({
+      runId: stream.runId,
+      toolCallId,
+      memory,
+      requestContext: createRequestContext(),
+    });
 
     const toolErrors: unknown[] = [];
     for await (const chunk of resumeResult.fullStream) {
@@ -599,6 +628,22 @@ describe('tool approval with ToolSearchProcessor', () => {
 
         return [parentProcessorWorkflow];
       },
+    });
+  }, 30000);
+
+  it('rebuilds a context-loaded approval tool from persisted messages after a cold restart', async () => {
+    await expectDynamicallyLoadedToolAfterApprovalResume({
+      toolId: 'dynamic_context_cold_resume_tool',
+      agentId: 'context-cold-resume-tool-search-agent',
+      coldRestart: true,
+      inputProcessors: ({ toolId, dynamicApprovalTool }) => [
+        new ToolSearchProcessor({
+          tools: {
+            [toolId]: dynamicApprovalTool,
+          },
+          storage: 'context',
+        }),
+      ],
     });
   }, 30000);
 });

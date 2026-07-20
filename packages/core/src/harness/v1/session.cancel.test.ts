@@ -471,6 +471,7 @@ describe('Session.cancel()', () => {
         queuedItemId: 'suspended',
         source: 'parent',
         requestedAt: now,
+        expiresAt: now + 600_000,
       },
     }));
     (session as any)._currentQueuedItemId = 'suspended';
@@ -500,7 +501,9 @@ describe('Session.cancel()', () => {
         toolCallId: 'tool-call-resumed',
         source: 'parent',
         requestedAt: now,
+        expiresAt: now + 600_000,
         resumedAt: now + 1,
+        resumeRecoveryAt: now + 30_001,
       },
     }));
     const idle = session.waitForIdle({ timeoutMs: 100 });
@@ -551,7 +554,11 @@ describe('Session.cancel()', () => {
   it('propagates cancellation to live child sessions but not upward', async () => {
     const { harness } = setupHarness();
     const parent = await harness.session({ resourceId: 'u-parent', threadId: { fresh: true } });
-    const child = await harness.session({ resourceId: 'u-child', threadId: { fresh: true } });
+    const child = await harness.session({
+      resourceId: 'u-parent',
+      threadId: { fresh: true },
+      parentSessionId: parent.id,
+    });
     (parent as any)._activeSubagents.set('tool-call-1', {
       subagentSessionId: child.id,
       agentType: 'default',
@@ -568,7 +575,11 @@ describe('Session.cancel()', () => {
     });
 
     const otherParent = await harness.session({ resourceId: 'u-other-parent', threadId: { fresh: true } });
-    const otherChild = await harness.session({ resourceId: 'u-other-child', threadId: { fresh: true } });
+    const otherChild = await harness.session({
+      resourceId: 'u-other-parent',
+      threadId: { fresh: true },
+      parentSessionId: otherParent.id,
+    });
     (otherParent as any)._activeSubagents.set('tool-call-2', {
       subagentSessionId: otherChild.id,
       agentType: 'default',
@@ -665,6 +676,7 @@ describe('Session.cancelQueuedItem()', () => {
         queuedItemId: 'suspended',
         source: 'parent',
         requestedAt: now,
+        expiresAt: now + 600_000,
       },
     }));
 
@@ -831,6 +843,7 @@ describe('Session.cancel() resume gating', () => {
   it('refuses to resume a pending interaction after cancellation', async () => {
     const { harness, agent } = setupHarness({ agents: { default: new MockAgent({ id: 'default' }) } });
     const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    const now = Date.now();
     await (session as any)._flushUpdate((prev: any) => ({
       ...prev,
       pendingResume: {
@@ -840,7 +853,8 @@ describe('Session.cancel() resume gating', () => {
         itemId: 'item-1',
         toolName: 'dangerousTool',
         source: 'parent',
-        requestedAt: Date.now(),
+        requestedAt: now,
+        expiresAt: now + 600_000,
       },
     }));
 

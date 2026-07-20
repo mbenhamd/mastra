@@ -129,6 +129,11 @@ describe('toHarnessDisplayStateSnapshotV1', () => {
             task: 'scan',
             parentToolCallId: 'tool_2',
             startedAt: 20,
+            status: 'awaiting_input',
+            currentToolName: 'read_file',
+            toolCalls: 3,
+            usage: { promptTokens: 11, completionTokens: 5, totalTokens: 16 },
+            updatedAt: 25,
           },
         },
         toolInputBuffers: {
@@ -142,11 +147,11 @@ describe('toHarnessDisplayStateSnapshotV1', () => {
             threadId: 'thread-1',
             messageId: 'message-1',
             text: 'partial answer',
-            reasoningText: 'thinking',
+            reasoningText: 'private reasoning must not cross the display boundary',
             status: 'streaming',
             startedAt: 21,
             updatedAt: 22,
-          },
+          } as NonNullable<SessionDisplayState['assistantDrafts']>[string] & { reasoningText: string },
         },
         tokenUsage: { promptTokens: 2, completionTokens: 3, totalTokens: 5 },
         queueDepth: 1,
@@ -173,6 +178,11 @@ describe('toHarnessDisplayStateSnapshotV1', () => {
       task: 'scan',
       parentToolCallId: 'tool_2',
       startedAt: 20,
+      status: 'awaiting_input',
+      currentToolName: 'read_file',
+      toolCalls: 3,
+      usage: { promptTokens: 11, completionTokens: 5, totalTokens: 16 },
+      updatedAt: 25,
     });
     expect(snapshot.toolInputBuffers.tool_1).toEqual({ toolName: 'shell', text: 'npm test' });
     expect(snapshot.assistantDrafts.run_1).toEqual({
@@ -182,11 +192,11 @@ describe('toHarnessDisplayStateSnapshotV1', () => {
       threadId: 'thread-1',
       messageId: 'message-1',
       text: 'partial answer',
-      reasoningText: 'thinking',
       status: 'streaming',
       startedAt: 21,
       updatedAt: 22,
     });
+    expect(snapshot.assistantDrafts.run_1).not.toHaveProperty('reasoningText');
     expect(snapshot.tokenUsage).toEqual({ promptTokens: 2, completionTokens: 3, totalTokens: 5 });
     expect(snapshot.queueDepth).toBe(1);
     expect(snapshot.goal).toMatchObject({ id: 'goal-1', status: 'active' });

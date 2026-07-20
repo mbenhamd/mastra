@@ -3450,7 +3450,12 @@ describe('Workflow as Processor', () => {
 
   describe('processInputStep steps accumulation', () => {
     it('should pass accumulated steps to processInputStep across agentic loop iterations', async () => {
-      const stepLog: { stepNumber: number; stepsLength: number }[] = [];
+      const stepLog: Array<{
+        stepNumber: number;
+        stepsLength: number;
+        toolCallIds: string[][];
+        toolResultIds: string[][];
+      }> = [];
 
       const greetTool = createTool({
         id: 'greet',
@@ -3535,7 +3540,12 @@ describe('Workflow as Processor', () => {
       const trackingProcessor: Processor = {
         id: 'step-tracker',
         processInputStep: async ({ stepNumber, steps }) => {
-          stepLog.push({ stepNumber, stepsLength: steps.length });
+          stepLog.push({
+            stepNumber,
+            stepsLength: steps.length,
+            toolCallIds: steps.map(step => step.toolCalls.map(call => call.toolCallId)),
+            toolResultIds: steps.map(step => step.toolResults.map(result => result.toolCallId)),
+          });
           return {};
         },
       };
@@ -3553,8 +3563,18 @@ describe('Workflow as Processor', () => {
 
       expect(result.text).toBe('Done!');
       expect(stepLog.length).toBeGreaterThanOrEqual(2);
-      expect(stepLog[0]).toEqual({ stepNumber: 0, stepsLength: 0 });
-      expect(stepLog[1]).toEqual({ stepNumber: 1, stepsLength: 1 });
+      expect(stepLog[0]).toEqual({
+        stepNumber: 0,
+        stepsLength: 0,
+        toolCallIds: [],
+        toolResultIds: [],
+      });
+      expect(stepLog[1]).toEqual({
+        stepNumber: 1,
+        stepsLength: 1,
+        toolCallIds: [['call-1']],
+        toolResultIds: [['call-1']],
+      });
     });
   });
 });

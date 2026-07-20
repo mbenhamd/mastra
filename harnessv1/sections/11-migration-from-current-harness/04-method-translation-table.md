@@ -255,8 +255,9 @@ v1 `Harness` + `Session`: `session.setThreadSetting({ key, value })`.
 This is a semantic migration, not a direct metadata write alias. Current Harness
 writes arbitrary top-level thread metadata keys; v1 validates `key`/`value`,
 writes only `thread.metadata.app[key]`, and keeps canonical Harness-owned fields
-such as goals, mode/model selection, OM settings, sandbox/workspace state, and
-subagent model overrides on their owning session/storage fields.
+such as goals, mode/model selection, sandbox/workspace state, and subagent model
+overrides on their owning session/storage fields. Effective OM settings belong
+to Agent Memory, not thread metadata or a new per-session override.
 
 **`harness.grantSessionCategory(...)`**
 
@@ -280,26 +281,25 @@ v1 `Harness` + `Session` :
 
 **`harness.getObservationalMemoryRecord()`**
 
-v1 `Harness` + `Session` : `session.om.getRecord()`
-for caller intent only. This is not an implementation alias: legacy/current
-reads may return the raw `ObservationalMemoryRecord`, while v1 returns only the
-§4.8 `ObservationalMemorySnapshot` after session/resource/scope verification and
-redaction.
+No current Harness v1 equivalent. Configure OM on the Agent Memory instance and
+use the Memory domain's authorized read APIs where the product needs an OM
+snapshot. `session.om` exposes only disabled/legacy config reads and recovery;
+it never returns a raw `ObservationalMemoryRecord`.
 
 **`harness.switchObserverModel(...)`**
 
-v1 `Harness` + `Session` :
-`session.om.switchObserverModel({ model })` for caller intent only. This is not
-an implementation alias: legacy/current switches may use `{ modelId }`,
-process-local state, top-level thread metadata, or pre-commit events; v1 commits
-`SessionRecord.observationalMemory` under the session
-lease/version/authorization boundary and emits only after durable success.
+No supported runtime translation. Configure the Observer model on the Agent
+Memory instance at construction. `session.om.switchObserverModel({ model })`
+validates the model id and then rejects without persisting. If an older build
+already wrote a `SessionRecord.observationalMemory` override, call the
+idempotent `session.om.clearOverride()` recovery method; queued work remains
+parked until that clearing CAS commits.
 
 **`harness.switchReflectorModel(...)`**
 
-v1 `Harness` + `Session` :
-`session.om.switchReflectorModel({ model })` with the same caller-intent-only
-boundary as observer model switching.
+Same constraint as the Observer: configure the Reflector on Agent Memory.
+`session.om.switchReflectorModel({ model })` validates and rejects without a
+write; `session.om.clearOverride()` removes unsupported legacy intent.
 
 **`harness.registerHeartbeat(...)`**
 
@@ -382,8 +382,11 @@ Current MastraCode data that was written through old thread metadata or
 process-local helpers is import/bootstrap input only. New v1 writes move each
 family to its owner: goals to §4.7, model/mode and subagent choices to
 session-owned runtime settings, workspace/project/sandbox state to the workspace
-and session owners, session-local OM settings to
-`SessionRecord.observationalMemory`. Current MastraCode goal judge memory is not
+and session owners, and effective OM configuration to the Agent Memory instance.
+Legacy session-local OM metadata must not be imported into new
+`SessionRecord.observationalMemory` writes; that field is read only so
+`session.om.clearOverride()` can recover rows written by older Harness builds.
+Current MastraCode goal judge memory is not
 stored inside legacy `GoalState`; it lives in separate MemoryStorage threads
 named from the current thread and goal id. A v1 importer must either discover
 and link those legacy judge-memory threads into the §4.7 goal/judge-memory owner,

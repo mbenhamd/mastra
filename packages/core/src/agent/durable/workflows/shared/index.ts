@@ -14,6 +14,7 @@ export {
   modelConfigSchema,
   modelListEntrySchema,
   accumulatedUsageSchema,
+  terminalToolResultSchema,
   durableAgenticOutputSchema,
   baseDurableAgenticInputSchema,
   baseIterationStateSchema,
@@ -24,4 +25,6 @@ export { calculateAccumulatedUsage, buildStepRecord, createBaseIterationStateUpd
 export type { IterationStateUpdateInput, StepRecord } from './iteration-state';
 
 export { resolveDurableToolCallConcurrency } from './tool-call-concurrency';
+export { resolveDurableRequestContext } from './request-context';
+export type { DurableRequestContextResolution } from './request-context';
 export { mapDurableIterationToLLMInput } from '../map-llm-input';

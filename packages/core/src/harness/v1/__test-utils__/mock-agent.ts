@@ -56,6 +56,8 @@ export interface MockRunSpec {
   chunks?: unknown[];
   /** For structured-output / `output: schema` paths. */
   object?: unknown;
+  /** Framework terminal tool-result envelope returned by the mocked run. */
+  terminalToolResult?: unknown;
   /**
    * Hold the run mid-flight: `getFullOutput()` blocks until this promise
    * resolves. Use to observe in-flight state (e.g. `session.isRunning()`),
@@ -199,6 +201,8 @@ export class MockAgent extends Agent<any, any, any> {
       usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
       finishReason: merged.finishReason,
       object: merged.object,
+      terminalToolResult:
+        'terminalToolResult' in spec ? (spec.terminalToolResult ?? undefined) : this.defaultRun.terminalToolResult,
       steps: [],
       warnings: [],
       providerMetadata: undefined,

@@ -73,6 +73,12 @@ export interface CreateDurableAgentOptions<
    * Set to `0` to disable auto-cleanup. Defaults to `30_000` (30 seconds).
    */
   cleanupTimeoutMs?: number;
+
+  /**
+   * Explicit non-secret application RequestContext keys that may be persisted
+   * for cold recovery. Infrastructure keys and credentials are forbidden.
+   */
+  durableRequestContextKeys?: readonly string[];
 }
 
 /**
@@ -120,7 +126,7 @@ export function createDurableAgent<
   TTools extends Record<string, any> = Record<string, any>,
   TOutput = undefined,
 >(options: CreateDurableAgentOptions<TAgentId, TTools, TOutput>): DurableAgent<TAgentId, TTools, TOutput> {
-  const { agent, id, name, cache, pubsub, maxSteps, cleanupTimeoutMs } = options;
+  const { agent, id, name, cache, pubsub, maxSteps, cleanupTimeoutMs, durableRequestContextKeys } = options;
 
   return new DurableAgent({
     agent,
@@ -130,6 +136,7 @@ export function createDurableAgent<
     pubsub,
     maxSteps,
     cleanupTimeoutMs,
+    durableRequestContextKeys,
   } as DurableAgentConfig<TAgentId, TTools, TOutput>);
 }
 

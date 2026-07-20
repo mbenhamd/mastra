@@ -22,7 +22,12 @@ describeForAllEngines('AIMock loop scenario: input step processor (per-step)', e
   const getMock = useLoopScenarioAimock();
 
   it('processInputStep runs for each step and sees accumulated messages', async () => {
-    const stepsSeen: Array<{ stepNumber: number; messageCount: number }> = [];
+    const stepsSeen: Array<{
+      stepNumber: number;
+      messageCount: number;
+      toolCallIds: string[][];
+      toolResultIds: string[][];
+    }> = [];
 
     const lookupTool = createTool({
       id: 'lookup',
@@ -34,10 +39,23 @@ describeForAllEngines('AIMock loop scenario: input step processor (per-step)', e
 
     const inputStepProcessor = {
       id: 'step-tracker',
-      async processInputStep({ stepNumber, messages }: { stepNumber: number; messages: Array<{ role: string }> }) {
+      async processInputStep({
+        stepNumber,
+        messages,
+        steps,
+      }: {
+        stepNumber: number;
+        messages: Array<{ role: string }>;
+        steps: Array<{
+          toolCalls: Array<{ toolCallId: string }>;
+          toolResults: Array<{ toolCallId: string }>;
+        }>;
+      }) {
         stepsSeen.push({
           stepNumber,
           messageCount: messages.length,
+          toolCallIds: steps.map(step => step.toolCalls.map(call => call.toolCallId)),
+          toolResultIds: steps.map(step => step.toolResults.map(result => result.toolCallId)),
         });
         return messages;
       },
@@ -73,6 +91,13 @@ describeForAllEngines('AIMock loop scenario: input step processor (per-step)', e
     // Step 1: accumulated messages (user + assistant + tool result)
     expect(stepsSeen[1].stepNumber).toBe(1);
     expect(stepsSeen[1].messageCount).toBeGreaterThan(stepsSeen[0].messageCount);
+    // Durable agents maintain their iteration history through a separate
+    // durable state contract. The regular and evented agentic-loop engines
+    // share the StepResult construction/reconciliation fixed here.
+    if (engine !== 'durable') {
+      expect(stepsSeen[1].toolCallIds).toEqual([['call_lookup']]);
+      expect(stepsSeen[1].toolResultIds).toEqual([['call_lookup']]);
+    }
   });
 
   it('processInputStep can see tool results in accumulated messages', async () => {

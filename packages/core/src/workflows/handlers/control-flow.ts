@@ -905,6 +905,7 @@ export async function executeForeach(
   const concurrency = resolveForeachConcurrency(opts, {
     inputData: prevOutput,
     getInitData: () => stepResults?.input,
+    requestContext,
   });
   const startTime = resume?.steps[0] === step.id ? undefined : Date.now();
   const resumeTime = resume?.steps[0] === step.id ? Date.now() : undefined;

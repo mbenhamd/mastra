@@ -3397,6 +3397,21 @@ export const API_ROUTE_METADATA = {
       "kind": "single"
     }
   },
+  "GET /harness/:name/sessions/:sessionId/permissions": {
+    "method": "GET",
+    "path": "/harness/:name/sessions/:sessionId/permissions",
+    "pathParams": [
+      "name",
+      "sessionId"
+    ],
+    "queryParams": [],
+    "bodyParams": [],
+    "hasQuery": false,
+    "hasBody": false,
+    "responseShape": {
+      "kind": "single"
+    }
+  },
   "PATCH /harness/:name/sessions/:sessionId/mode": {
     "method": "PATCH",
     "path": "/harness/:name/sessions/:sessionId/mode",

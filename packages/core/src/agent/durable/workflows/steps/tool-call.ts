@@ -4,12 +4,14 @@ import { resolveBackgroundConfig } from '../../../../background-tasks/resolve-co
 import type { ToolBackgroundConfig } from '../../../../background-tasks/types';
 import { ErrorCategory, ErrorDomain, MastraError } from '../../../../error';
 import type { PubSub } from '../../../../events/pubsub';
+import { notifyToolDenied } from '../../../../loop/workflows/agentic-execution/tool-permission-notify';
 import type { Mastra } from '../../../../mastra';
 import type { MastraMemory } from '../../../../memory/memory';
 import type { MemoryConfig } from '../../../../memory/types';
 import type { ExportedSpan, SpanType } from '../../../../observability';
 import type { ProcessorState } from '../../../../processors';
 import { ProcessorRunner, outputProcessorsSupportStream } from '../../../../processors/runner';
+import type { RequestContext } from '../../../../request-context';
 import type { ChunkType } from '../../../../stream/types';
 import { ChunkFrom } from '../../../../stream/types';
 import { findProviderToolByName } from '../../../../tools/provider-tool-utils';
@@ -24,13 +26,17 @@ import {
   parseToolApprovalDecision,
   parseToolApprovalGrant,
 } from '../../../tool-call-identity';
+import { TOOL_PERMISSION_POLICY_KEY, TOOL_PERMISSION_POLICY_REQUIRED_KEY } from '../../../tool-permission-prefilter';
+import type { ToolPermissionDecision, ToolPermissionPolicy } from '../../../tool-permission-prefilter';
 import { createToolSurfaceFence, materializeToolSurfaceFence } from '../../../tool-surface-fence';
 import { DurableStepIds } from '../../constants';
 import { getBoundRunRegistryEntry, globalRunRegistry } from '../../run-registry';
 import { emitSuspendedEvent, emitChunkEvent } from '../../stream-adapter';
 import type {
   DurableToolCallInput,
+  DurableAgenticWorkflowInput,
   SerializableDurableOptions,
+  SerializableToolMetadata,
   AgentSuspendedEventData,
   RunRegistryEntry,
 } from '../../types';
@@ -72,6 +78,7 @@ const durableToolCallOutputSchema = durableToolCallInputSchema.extend({
       stack: z.string().optional(),
     })
     .optional(),
+  disposition: z.literal('denied').optional(),
   // Approval decision for a `requireApproval` tool. Without this field Zod would strip the
   // approval off the step output, so a declined call would lose its `output-denied` marker.
   approval: z
@@ -238,7 +245,42 @@ async function processChunkThroughOutputProcessors(
  * - In-execution suspension: tool calls suspend() callback, step suspends with suspension payload
  * - Message persistence: messages are flushed before any suspension
  */
-export function createDurableToolCallStep() {
+export interface DurableToolPermissionResolverInput {
+  runId: string;
+  agentId: string;
+  toolCallId: string;
+  toolName: string;
+  args: Record<string, unknown>;
+  requestContext: RequestContext | undefined;
+  isResume: boolean;
+}
+
+export type DurableToolPermissionResolver = (
+  input: DurableToolPermissionResolverInput,
+) => ToolPermissionDecision | Promise<ToolPermissionDecision>;
+
+export interface CreateDurableToolCallStepOptions {
+  /**
+   * Trusted worker-local policy resolver for engines that can replay on a
+   * different process. The callback is code/configuration, never workflow
+   * state. Throwing or returning an invalid decision fails closed as `deny`.
+   */
+  resolveToolPermission?: DurableToolPermissionResolver;
+}
+
+function normalizeToolPermissionDecision(candidate: unknown): ToolPermissionDecision {
+  return candidate === 'allow' || candidate === 'ask' || candidate === 'deny' ? candidate : 'deny';
+}
+
+function combineToolPermissionDecisions(decisions: ToolPermissionDecision[]): ToolPermissionDecision | undefined {
+  if (decisions.includes('deny')) return 'deny';
+  if (decisions.includes('ask')) return 'ask';
+  if (decisions.includes('allow')) return 'allow';
+  return undefined;
+}
+
+export function createDurableToolCallStep(options: CreateDurableToolCallStepOptions = {}) {
+  const { resolveToolPermission } = options;
   return createStep({
     id: DurableStepIds.TOOL_CALL,
     inputSchema: durableToolCallInputSchema,
@@ -306,6 +348,8 @@ export function createDurableToolCallStep() {
         agentId: string;
         runtimeResolution?: 'registry-required';
         options: SerializableDurableOptions;
+        toolsMetadata: SerializableToolMetadata[];
+        messageListState: DurableAgenticWorkflowInput['messageListState'];
         state: {
           threadId?: string;
           resourceId?: string;
@@ -472,6 +516,8 @@ export function createDurableToolCallStep() {
           agentId: initData.agentId,
           state: state as any,
           options: agentOptions,
+          toolsMetadata: initData.toolsMetadata,
+          messageListState: initData.messageListState,
           requestContextEntries: initData.requestContextEntries,
           logger,
         });
@@ -645,8 +691,10 @@ export function createDurableToolCallStep() {
         suspendRecord.iterationCount === iterationCount &&
         suspendRecord.identityDigest === identityDigest;
       const hasMatchingSuspendIdentity = hasMatchingFreshTurnIdentity || hasMatchingWorkflowIdentity;
-      const hasInvalidSuspendEnvelope =
-        resumeData !== undefined && (!hasKnownSuspendType || !hasMatchingSuspendIdentity);
+      const hasResumeAttempt =
+        isFreshTurnResume || workflowResumeData !== undefined || workflowSuspendRecord !== undefined;
+      const hasInvalidSuspendEnvelope = hasResumeAttempt && (!hasKnownSuspendType || !hasMatchingSuspendIdentity);
+      const isAuthenticatedResume = hasMatchingSuspendIdentity;
       const isApprovalResume = suspensionType === 'approval' && hasMatchingSuspendIdentity;
       const approvalDecision = parseToolApprovalDecision(resumeData);
       const hasValidApprovalDecision = isApprovalResume && approvalDecision !== undefined;
@@ -774,28 +822,115 @@ export function createDurableToolCallStep() {
         };
       }
 
+      // Re-evaluate the host's per-tool policy at the side-effect boundary on
+      // every attempt, including an approved resume. A durable snapshot stores
+      // only `permissionPolicyRequired`; it never stores an allow/ask decision.
+      // Resume must use the newly supplied RequestContext so a parked `ask` can
+      // become `deny`. The original registry context is a valid fallback only
+      // for a fresh in-process call, never for a resume where it may be stale.
+      const requestPermissionPolicy = requestContext?.get?.(TOOL_PERMISSION_POLICY_KEY);
+      const registryPermissionPolicy = !isAuthenticatedResume
+        ? registryEntry?.requestContext?.get(TOOL_PERMISSION_POLICY_KEY)
+        : undefined;
+      const permissionPolicy =
+        typeof requestPermissionPolicy === 'function'
+          ? (requestPermissionPolicy as ToolPermissionPolicy)
+          : typeof registryPermissionPolicy === 'function'
+            ? (registryPermissionPolicy as ToolPermissionPolicy)
+            : undefined;
+      const permissionContext =
+        typeof requestPermissionPolicy === 'function'
+          ? requestContext
+          : typeof registryPermissionPolicy === 'function'
+            ? registryEntry?.requestContext
+            : requestContext;
+      const toolPermissionDecisions: ToolPermissionDecision[] = [];
+      if (permissionPolicy) {
+        try {
+          toolPermissionDecisions.push(normalizeToolPermissionDecision(await permissionPolicy(toolName)));
+        } catch {
+          toolPermissionDecisions.push('deny');
+        }
+      }
+      if (resolveToolPermission) {
+        try {
+          toolPermissionDecisions.push(
+            normalizeToolPermissionDecision(
+              await resolveToolPermission({
+                runId,
+                agentId: initData.agentId,
+                toolCallId: metadataToolCallId,
+                toolName,
+                args,
+                requestContext,
+                isResume: isAuthenticatedResume,
+              }),
+            ),
+          );
+        } catch {
+          toolPermissionDecisions.push('deny');
+        }
+      }
+      if (
+        toolPermissionDecisions.length === 0 &&
+        (agentOptions.permissionPolicyRequired === true ||
+          requestContext?.get?.(TOOL_PERMISSION_POLICY_REQUIRED_KEY) === true)
+      ) {
+        // A configured policy that cannot be reconstructed is an authorization
+        // failure, not an implicit allow. This is the cold Inngest/restart seam.
+        toolPermissionDecisions.push('deny');
+      }
+      const toolPermissionDecision = combineToolPermissionDecisions(toolPermissionDecisions);
+
+      const yoloAutoApprove = permissionContext?.get?.('__mastra_yoloAutoApprove') === true;
+      const unsupportedAskOnSuspensionResume =
+        toolPermissionDecision === 'ask' &&
+        !yoloAutoApprove &&
+        isAuthenticatedResume &&
+        !hasValidApprovalDecision &&
+        persistedApprovalGrant === undefined;
+
+      if (toolPermissionDecision === 'deny' || unsupportedAskOnSuspensionResume) {
+        if (hasValidApprovalDecision) {
+          await removeToolMetadata('approval');
+        } else if (isAuthenticatedResume && !isApprovalResume) {
+          await removeToolMetadata('suspension');
+        }
+        notifyToolDenied(permissionContext, { toolName, stage: 'action', toolCallId });
+        return {
+          ...typedInput,
+          args,
+          ...resumeTarget,
+          disposition: 'denied' as const,
+          result: unsupportedAskOnSuspensionResume
+            ? `Tool "${toolName}" was not resumed because the session permission policy requires a new approval.`
+            : `Tool "${toolName}" was denied by the session permission policy.`,
+        };
+      }
+
       // 2. Check if a fresh tool call requires approval. A resume uses its persisted decision.
       // The live registry policy (function form) is preferred over the serialized boolean
       // shadow; internal transport keys are filtered from the policy's requestContext view.
-      const { required: requiresApproval, reasons: approvalReasons } =
-        resumeData === undefined
-          ? await toolApprovalRequirement(tool, effectiveRequireToolApproval, args, {
-              requestContext: registryEntry?.requestContext
-                ? Object.fromEntries(
-                    [...registryEntry.requestContext.entries()].filter(
-                      ([key]) => key !== '__mastra_requireToolApproval',
-                    ),
-                  )
-                : requestContext,
-              // Use the same rebuilt-workspace fallback as execution (above), so
-              // workspace-aware approval policies see their workspace cross-process.
-              workspace,
-              logger,
-              toolName,
-            })
-          : { required: false, reasons: [] };
+      const approvalRequirement = !isAuthenticatedResume
+        ? await toolApprovalRequirement(tool, effectiveRequireToolApproval, args, {
+            requestContext: registryEntry?.requestContext
+              ? Object.fromEntries(
+                  [...registryEntry.requestContext.entries()].filter(([key]) => key !== '__mastra_requireToolApproval'),
+                )
+              : requestContext,
+            // Use the same rebuilt-workspace fallback as execution (above), so
+            // workspace-aware approval policies see their workspace cross-process.
+            workspace,
+            logger,
+            toolName,
+          })
+        : { required: false, reasons: [] };
+      const policyAsk = toolPermissionDecision === 'ask' && !yoloAutoApprove;
+      const approvalReasons = [...approvalRequirement.reasons];
+      if (policyAsk) approvalReasons.push('policy');
+      const requiresApproval = approvalRequirement.required || policyAsk;
 
-      if (requiresApproval && resumeData === undefined) {
+      if (requiresApproval && !isAuthenticatedResume) {
         const resumeSchema = JSON.stringify({
           type: 'object',
           properties: {
@@ -889,9 +1024,11 @@ export function createDurableToolCallStep() {
           ? ({ approval: persistedApprovalGrant } as const)
           : undefined;
 
-      // Pass general suspension data through to the tool. An approved-shaped payload is still
-      // general suspension data when the persisted suspend marker says `suspension`.
-      const isResumingFromSuspension = resumeData !== undefined && !isApprovalResume;
+      // Suspension provenance comes from the authenticated persisted/workflow
+      // envelope, not from payload presence: `resume()` / `resume(undefined)`
+      // are valid resumes too. Payload-shaped detection would let an empty
+      // resumed terminal-capable tool bypass the terminal-result guard.
+      const isResumingFromSuspension = suspensionType === 'suspension' && hasMatchingSuspendIdentity;
 
       // Remove suspension metadata when resuming from an in-execution (non-approval-decision) suspension.
       // `isResumingFromSuspension` already excludes the approval-decision case above.
@@ -1159,7 +1296,7 @@ export function createDurableToolCallStep() {
                   try {
                     const bgRunId = chunk.payload.runId;
                     // Emit tool-call chunk so UIs can render the invocation inline
-                    if (bgRunId !== runId || (bgRunId === runId && resumeData)) {
+                    if (bgRunId !== runId || (bgRunId === runId && isAuthenticatedResume)) {
                       void emitChunkEvent(pubsub, bgRunId, {
                         type: 'tool-call',
                         runId: bgRunId,
@@ -1237,7 +1374,7 @@ export function createDurableToolCallStep() {
                   );
 
                   if (!updated) {
-                    if (params.runId !== runId || (params.runId === runId && resumeData)) {
+                    if (params.runId !== runId || (params.runId === runId && isAuthenticatedResume)) {
                       messageList.add(
                         [
                           {
@@ -1313,8 +1450,7 @@ export function createDurableToolCallStep() {
             // If the agent is resuming this tool call and a previously-suspended
             // bg task exists for this toolCallId+runId, resume the bg task with
             // the agent-resume payload instead of dispatching a fresh one.
-            const isSuspendedBgResume =
-              (isResumingFromSuspension || isToolExecutionApprovalResume) && resumeData !== undefined;
+            const isSuspendedBgResume = isResumingFromSuspension || isToolExecutionApprovalResume;
             if (isSuspendedBgResume) {
               const isSuspended = await bgTask.checkIfSuspended({
                 toolCallId,
@@ -1454,6 +1590,7 @@ export function createDurableToolCallStep() {
           ...resumeTarget,
           result,
           ...(delegationBailed ? { delegationBailed: true } : {}),
+          ...(isResumingFromSuspension ? { resumedFromSuspension: true as const } : {}),
           ...(approvalGrant ?? {}),
         };
       } catch (error) {
@@ -1502,6 +1639,7 @@ export function createDurableToolCallStep() {
           ...resumeTarget,
           error: toolError,
           ...(delegationBailed ? { delegationBailed: true } : {}),
+          ...(isResumingFromSuspension ? { resumedFromSuspension: true as const } : {}),
           ...(approvalGrant ?? {}),
         };
       }

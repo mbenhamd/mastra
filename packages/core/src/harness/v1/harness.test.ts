@@ -24,6 +24,7 @@ import type {
   ChannelInboxItem,
   ChannelOutboxEnqueueOptions,
   ChannelOutboxItem,
+  PendingInteractionExpiryGeneration,
 } from '../../storage/domains/harness';
 import {
   HarnessStorage,
@@ -417,6 +418,117 @@ function makeHarness(overrides?: Partial<ConstructorParameters<typeof Harness>[0
 describe('Harness v1 — construction', () => {
   it('accepts a valid config', () => {
     expect(() => makeHarness()).not.toThrow();
+  });
+
+  it('does not start the durable pending-interaction sweep without Harness storage', async () => {
+    const harness = new Harness({
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+    });
+
+    (harness as any)._ensurePendingInteractionExpirySweepLoop();
+    await expect(harness._tickPendingInteractionExpirySweep()).resolves.toBeUndefined();
+
+    expect((harness as any)._pendingInteractionExpirySweepTimer).toBeUndefined();
+    expect((harness as any)._pendingInteractionExpirySweepInFlight).toBeUndefined();
+    await harness.shutdown();
+  });
+
+  it('projects a malformed pending-interaction due page as storage_error without rejecting the background sweep', async () => {
+    const storage = makeStorage();
+    const listDue = vi.fn(async () => null);
+    (storage as unknown as { listDuePendingInteractions: typeof listDue }).listDuePendingInteractions = listDue;
+    const harness = makeHarness({ sessions: { storage } });
+    const events: Array<{ type: string; operation?: string }> = [];
+    harness.subscribe(event => events.push(event as { type: string; operation?: string }));
+
+    await expect(harness._tickPendingInteractionExpirySweep()).resolves.toBeUndefined();
+
+    expect(listDue).toHaveBeenCalledTimes(1);
+    expect(events).toContainEqual(expect.objectContaining({ type: 'storage_error', operation: 'session_load' }));
+    await harness.shutdown();
+  });
+
+  it('backs off idle pending-interaction sweeps and resets after finding due work', async () => {
+    const storage = makeStorage();
+    const generation: PendingInteractionExpiryGeneration = {
+      harnessName: 'default',
+      sessionId: 'due-session',
+      resourceId: 'resource-1',
+      kind: 'tool-approval',
+      itemId: 'item-1',
+      runId: 'run-1',
+      toolCallId: 'tool-call-1',
+      requestedAt: 1_000,
+      dueAt: 2_000,
+      expiresAt: 2_000,
+    };
+    const listDue = vi
+      .fn()
+      .mockResolvedValueOnce({ items: [] })
+      .mockResolvedValueOnce({ items: [] })
+      .mockResolvedValueOnce({ items: [generation] });
+    (storage as unknown as { listDuePendingInteractions: typeof listDue }).listDuePendingInteractions = listDue;
+    const harness = makeHarness({ sessions: { storage } });
+    (harness as any)._stopPendingInteractionExpirySweepLoop();
+    (harness as any)._runPendingInteractionExpiryGeneration = vi.fn(async () => undefined);
+
+    expect((harness as any)._pendingInteractionExpirySweepDelayMs).toBe(1_000);
+    await harness._tickPendingInteractionExpirySweep();
+    expect((harness as any)._pendingInteractionExpirySweepDelayMs).toBe(1_000);
+    await harness._tickPendingInteractionExpirySweep();
+    expect((harness as any)._pendingInteractionExpirySweepDelayMs).toBe(2_000);
+    await harness._tickPendingInteractionExpirySweep();
+    expect((harness as any)._pendingInteractionExpirySweepDelayMs).toBe(1_000);
+    expect((harness as any)._runPendingInteractionExpiryGeneration).toHaveBeenCalledWith(storage, generation);
+
+    await harness.shutdown();
+  });
+
+  it('bounds concurrent pending-interaction expiry work while draining a due page', async () => {
+    const storage = makeStorage();
+    const generations: PendingInteractionExpiryGeneration[] = Array.from({ length: 18 }, (_, index) => ({
+      harnessName: 'default',
+      sessionId: `due-session-${index}`,
+      resourceId: 'resource-1',
+      kind: 'tool-approval',
+      itemId: `item-${index}`,
+      runId: `run-${index}`,
+      toolCallId: `tool-call-${index}`,
+      requestedAt: 1_000,
+      dueAt: 2_000,
+      expiresAt: 2_000,
+    }));
+    const listDue = vi.fn(async () => ({ items: generations }));
+    (storage as unknown as { listDuePendingInteractions: typeof listDue }).listDuePendingInteractions = listDue;
+    const harness = makeHarness({ sessions: { storage } });
+    (harness as any)._stopPendingInteractionExpirySweepLoop();
+
+    const gate = deferred();
+    let active = 0;
+    let maxActive = 0;
+    const started: string[] = [];
+    const runGeneration = vi.fn(async (_storage: HarnessStorage, generation: PendingInteractionExpiryGeneration) => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      started.push(generation.sessionId);
+      await gate.promise;
+      active -= 1;
+    });
+    (harness as any)._runPendingInteractionExpiryGeneration = runGeneration;
+
+    const sweep = harness._tickPendingInteractionExpirySweep();
+    await waitFor(() => started.length === 8, 'first bounded expiry batch');
+    expect(started).toHaveLength(8);
+    expect(maxActive).toBe(8);
+
+    gate.resolve();
+    await sweep;
+
+    expect(runGeneration).toHaveBeenCalledTimes(generations.length);
+    expect(maxActive).toBe(8);
+    expect(active).toBe(0);
+    await harness.shutdown();
   });
 
   it('registers single-harness Mastra sugar under the default key', async () => {
@@ -2926,6 +3038,51 @@ describe('Harness v1 — lifecycle', () => {
     expect(reA.id).toBe(a.id);
   });
 
+  it('releases a pressure-evicted lease for immediate cross-owner hydration', async () => {
+    const storage = makeStorage();
+    const ownerA = makeHarness({ sessions: { storage, maxLive: 1 } });
+    const first = await ownerA.session({ threadId: 't-pressure-handoff-a', resourceId: 'r1' });
+    await ownerA.session({ threadId: 't-pressure-handoff-b', resourceId: 'r1' });
+    expect(ownerA._internalLiveSessionCount()).toBe(1);
+
+    const ownerB = makeHarness({ sessions: { storage, maxLive: 1 } });
+    const handedOff = await ownerB.session({ sessionId: first.id, resourceId: 'r1' });
+    expect(handedOff.id).toBe(first.id);
+    expect(handedOff._internalOwnerId).toBe(ownerB.ownerId);
+  });
+
+  it('rejects maxLive pressure instead of evicting a session with an active provider turn', async () => {
+    const storage = makeStorage();
+    const agent = new MockAgent({ id: 'default' });
+    let releaseRun!: () => void;
+    agent.enqueueRun({
+      holdUntil: new Promise<void>(resolve => (releaseRun = resolve)),
+      finishReason: 'stop',
+    });
+    const harness = makeHarness({
+      agents: { default: agent } as any,
+      sessions: { storage, maxLive: 1 },
+    });
+    const active = await harness.session({ threadId: 't-active-cap', resourceId: 'r1' });
+    const turn = active.message({ content: 'hold the only live slot' });
+    for (let attempt = 0; attempt < 50 && agent.streamCalls.length === 0; attempt += 1) {
+      await new Promise(resolve => setTimeout(resolve, 2));
+    }
+    expect(active.isRunning()).toBe(true);
+    expect(active.isBusy()).toBe(true);
+
+    await expect(harness.session({ threadId: 't-pressure-rejected', resourceId: 'r1' })).rejects.toBeInstanceOf(
+      HarnessLiveSessionLimitError,
+    );
+    expect(active.lifecycleState).toBe('live');
+    expect(active.isRunning()).toBe(true);
+    expect(harness._internalLiveSessionCount()).toBe(1);
+
+    releaseRun();
+    await turn;
+    await harness.shutdown();
+  });
+
   it('throws HarnessLiveSessionLimitError when every live session at maxLive is pinned (§5.4)', async () => {
     const storage = makeStorage();
     const harness = makeHarness({ sessions: { storage, maxLive: 1 } });
@@ -2952,6 +3109,7 @@ describe('Harness v1 — lifecycle', () => {
           toolCallId: 'tc-q',
           source: 'parent',
           requestedAt: now,
+          expiresAt: now + 10 * 60_000,
           payload: { question: 'pick' },
         },
         state: undefined,
@@ -2970,6 +3128,59 @@ describe('Harness v1 — lifecycle', () => {
     await expect(harness.session({ threadId: 'tnew', resourceId: 'r1' })).rejects.toBeInstanceOf(
       HarnessLiveSessionLimitError,
     );
+  });
+
+  it('reserves maxLive capacity across parallel cold materializations', async () => {
+    const storage = makeStorage();
+    const harness = makeHarness({ sessions: { storage, maxLive: 1 } });
+    const now = Date.now();
+    for (const [id, threadId] of [
+      ['sess-cap-a', 't-cap-a'],
+      ['sess-cap-b', 't-cap-b'],
+    ] as const) {
+      await storage.saveSession(
+        {
+          harnessName: 'default',
+          id,
+          resourceId: 'r1',
+          threadId,
+          origin: 'top-level',
+          ownsThread: false,
+          modeId: 'default',
+          modelId: 'default',
+          subagentModelOverrides: {},
+          permissionRules: { categories: {}, tools: {} },
+          sessionGrants: { categories: [], tools: [] },
+          tokenUsage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+          pendingQueue: [],
+          state: undefined,
+          createdAt: now,
+          lastActivityAt: now,
+          version: 0,
+        } as any,
+        { harnessName: 'default', ifVersion: 0 },
+      );
+    }
+
+    const firstAcquireEntered = deferred();
+    const releaseFirstAcquire = deferred();
+    const originalAcquire = storage.acquireSessionLease.bind(storage);
+    storage.acquireSessionLease = (async (...args: Parameters<typeof storage.acquireSessionLease>) => {
+      if (args[0].sessionId === 'sess-cap-a') {
+        firstAcquireEntered.resolve();
+        await releaseFirstAcquire.promise;
+      }
+      return originalAcquire(...args);
+    }) as typeof storage.acquireSessionLease;
+
+    const first = harness.session({ sessionId: 'sess-cap-a', resourceId: 'r1' });
+    await firstAcquireEntered.promise;
+    await expect(harness.session({ sessionId: 'sess-cap-b', resourceId: 'r1' })).rejects.toBeInstanceOf(
+      HarnessLiveSessionLimitError,
+    );
+    releaseFirstAcquire.resolve();
+    await expect(first).resolves.toMatchObject({ id: 'sess-cap-a' });
+    expect(harness._internalLiveSessionCount()).toBe(1);
   });
 
   it('idle-evicts an unpinned session after idleTimeoutMs (§5.4)', async () => {
@@ -3860,6 +4071,26 @@ describe('Harness v1 — lifecycle', () => {
     const all = await harness.listSessions({ resourceId: 'r1', includeClosed: true });
     expect(all.map(r => r.id).sort()).toEqual([s1.id, s2.id].sort());
   });
+
+  it('loadSessionByThread performs an exact non-creating owner lookup', async () => {
+    const harness = makeHarness();
+    const session = await harness.session({ threadId: 't-exact', resourceId: 'r1' });
+
+    await expect(harness.loadSessionByThread({ resourceId: 'r1', threadId: 't-exact' })).resolves.toMatchObject({
+      id: session.id,
+      resourceId: 'r1',
+      threadId: 't-exact',
+    });
+    await expect(harness.loadSessionByThread({ resourceId: 'r2', threadId: 't-exact' })).resolves.toBeNull();
+    await expect(harness.loadSessionByThread({ resourceId: 'r1', threadId: 'missing' })).resolves.toBeNull();
+    expect(harness._internalLiveSessionCount()).toBe(1);
+
+    await session.close();
+    await expect(harness.loadSessionByThread({ resourceId: 'r1', threadId: 't-exact' })).resolves.toBeNull();
+    await expect(
+      harness.loadSessionByThread({ resourceId: 'r1', threadId: 't-exact', includeClosed: true }),
+    ).resolves.toMatchObject({ id: session.id, closedAt: expect.any(Number) });
+  });
 });
 
 describe('Harness v1 — lease + write concurrency', () => {
@@ -3941,28 +4172,54 @@ describe('Harness v1 — deterministic-id branch (§5.3)', () => {
     expect(b).toBe(a);
   });
 
-  it('returns the active record when caller-supplied sessionId disagrees with the active one', async () => {
+  it('rejects a caller-supplied sessionId that disagrees with the live thread owner', async () => {
     const harness = makeHarness();
     const first = await harness.session({ threadId: 't1', resourceId: 'r1' });
-    const second = await harness.session({ threadId: 't1', resourceId: 'r1', sessionId: 'sess-different' });
-    expect(second.id).toBe(first.id);
-    expect(second.threadId).toBe('t1');
+    await expect(
+      harness.session({ threadId: 't1', resourceId: 'r1', sessionId: 'sess-different' }),
+    ).rejects.toMatchObject({
+      name: 'HarnessSessionConflictError',
+      requestedSessionId: 'sess-different',
+      activeSessionId: first.id,
+    });
   });
 
-  it('rehydrates the active thread record when caller-supplied sessionId is stale', async () => {
+  it('rejects a stale caller-supplied sessionId for a stored thread owner', async () => {
     const storage = makeStorage();
     const harness = makeHarness({ sessions: { storage } });
     const first = await harness.session({ threadId: 't1', resourceId: 'r1' });
     await harness.shutdown();
 
     const restarted = makeHarness({ sessions: { storage } });
-    const resolved = await restarted.session({ threadId: 't1', resourceId: 'r1', sessionId: 'sess-stale' });
-
-    expect(resolved.id).toBe(first.id);
-    expect(resolved.threadId).toBe('t1');
+    await expect(
+      restarted.session({ threadId: 't1', resourceId: 'r1', sessionId: 'sess-stale' }),
+    ).rejects.toMatchObject({
+      name: 'HarnessSessionConflictError',
+      requestedSessionId: 'sess-stale',
+      activeSessionId: first.id,
+    });
   });
 
-  it('returns an existing active child when the parent closes after thread lookup misses', async () => {
+  it('conflicts when a deterministic id already owns another thread for the same resource', async () => {
+    const harness = makeHarness();
+    await harness.session({ threadId: 't-owned', resourceId: 'r1', sessionId: 'sess-reused' });
+    await expect(
+      harness.session({ threadId: 't-other', resourceId: 'r1', sessionId: 'sess-reused' }),
+    ).rejects.toMatchObject({
+      name: 'HarnessSessionConflictError',
+      requestedSessionId: 'sess-reused',
+    });
+  });
+
+  it('hides a deterministic id owned by another resource', async () => {
+    const harness = makeHarness();
+    await harness.session({ threadId: 't-owned', resourceId: 'r1', sessionId: 'sess-cross-resource' });
+    await expect(
+      harness.session({ threadId: 't-other', resourceId: 'r2', sessionId: 'sess-cross-resource' }),
+    ).rejects.toBeInstanceOf(HarnessSessionNotFoundError);
+  });
+
+  it('rejects a different deterministic child id when the parent closes after thread lookup misses', async () => {
     const storage = makeStorage();
     const harness = makeHarness({ sessions: { storage } });
     const parent = await harness.session({ threadId: 'parent-thread', resourceId: 'r1', sessionId: 'parent' });
@@ -4016,7 +4273,7 @@ describe('Harness v1 — deterministic-id branch (§5.3)', () => {
     const closing = parent.close();
     await closingMarkerSeen;
 
-    const child = await harness.session({
+    const childResolution = harness.session({
       threadId: 'child-thread',
       resourceId: 'r1',
       parentSessionId: parent.id,
@@ -4024,11 +4281,43 @@ describe('Harness v1 — deterministic-id branch (§5.3)', () => {
       origin: 'subagent-tool',
     });
 
-    expect(child.id).toBe('existing-child');
+    await expect(childResolution).rejects.toMatchObject({
+      name: 'HarnessSessionConflictError',
+      requestedSessionId: 'retry-child',
+      activeSessionId: 'existing-child',
+    });
     expect(forcedThreadMiss).toBe(true);
     await expect(storage.loadSession({ sessionId: 'retry-child', harnessName: 'default' })).resolves.toBeNull();
     releaseClosingMarker();
     await closing;
+  });
+
+  it('linearizes concurrent deterministic ids for one thread and conflicts the loser', async () => {
+    const storage = makeStorage();
+    const harness = makeHarness({ sessions: { storage } });
+    const originalCreateOrLoad = storage.createOrLoadActiveSession.bind(storage);
+    const bothEntered = deferred();
+    const releaseBoth = deferred();
+    let entered = 0;
+    storage.createOrLoadActiveSession = (async (...args: Parameters<typeof storage.createOrLoadActiveSession>) => {
+      entered += 1;
+      if (entered === 2) bothEntered.resolve();
+      await releaseBoth.promise;
+      return originalCreateOrLoad(...args);
+    }) as typeof storage.createOrLoadActiveSession;
+
+    const first = harness.session({ threadId: 't-deterministic-race', resourceId: 'r1', sessionId: 'sess-a' });
+    const second = harness.session({ threadId: 't-deterministic-race', resourceId: 'r1', sessionId: 'sess-b' });
+    await bothEntered.promise;
+    releaseBoth.resolve();
+
+    const results = await Promise.allSettled([first, second]);
+    expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(1);
+    const rejected = results.find(result => result.status === 'rejected');
+    expect(rejected).toMatchObject({
+      status: 'rejected',
+      reason: expect.objectContaining({ name: 'HarnessSessionConflictError' }),
+    });
   });
 });
 
@@ -4774,6 +5063,265 @@ describe('Harness v1 — concurrent resolver race', () => {
     expect(a.id).toBe('sess-cold');
     expect(harness._internalLiveSessionCount()).toBe(1);
     expect(harness._internalSessionEventBridgeCount('sess-cold')).toBe(1);
+  });
+
+  it('collapses concurrent by-id and by-thread cold resolvers for the same durable row', async () => {
+    const storage = makeStorage();
+    const harness = makeHarness({ sessions: { storage } });
+    const t0 = Date.now();
+    await storage.saveSession(
+      {
+        id: 'sess-mixed-cold',
+        harnessName: 'default',
+        resourceId: 'r1',
+        threadId: 't-mixed-cold',
+        origin: 'top-level',
+        ownsThread: false,
+        modeId: 'default',
+        modelId: 'default',
+        subagentModelOverrides: {},
+        permissionRules: { categories: {}, tools: {} },
+        sessionGrants: { categories: [], tools: [] },
+        tokenUsage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+        pendingQueue: [],
+        state: undefined,
+        version: 0,
+        createdAt: t0,
+        lastActivityAt: t0,
+        ownerId: harness.ownerId,
+        leaseExpiresAt: t0 + 60_000,
+      },
+      { harnessName: 'default', ifVersion: 0 },
+    );
+
+    const originalLoadSession = storage.loadSession.bind(storage);
+    const originalLoadSessionByThread = storage.loadSessionByThread.bind(storage);
+    let releaseResolverLoads = () => {};
+    const resolverLoadsReady = new Promise<void>(resolve => {
+      releaseResolverLoads = resolve;
+    });
+    const resolverLoadKinds = new Set<string>();
+    const markResolverLoad = async (kind: string) => {
+      resolverLoadKinds.add(kind);
+      if (resolverLoadKinds.size === 2) releaseResolverLoads();
+      await resolverLoadsReady;
+    };
+    storage.loadSession = (async (...args: Parameters<typeof storage.loadSession>) => {
+      const record = await originalLoadSession(...args);
+      if (args[0].sessionId === 'sess-mixed-cold') await markResolverLoad('id');
+      return record;
+    }) as typeof storage.loadSession;
+    storage.loadSessionByThread = (async (...args: Parameters<typeof storage.loadSessionByThread>) => {
+      const record = await originalLoadSessionByThread(...args);
+      if (args[0].threadId === 't-mixed-cold') await markResolverLoad('thread');
+      return record;
+    }) as typeof storage.loadSessionByThread;
+
+    const originalAcquireSessionLease = storage.acquireSessionLease.bind(storage);
+    let leaseCalls = 0;
+    let releaseLease = () => {};
+    const leaseGate = new Promise<void>(resolve => {
+      releaseLease = resolve;
+    });
+    storage.acquireSessionLease = (async (...args: Parameters<typeof storage.acquireSessionLease>) => {
+      leaseCalls += 1;
+      if (leaseCalls === 1) setImmediate(releaseLease);
+      await leaseGate;
+      return originalAcquireSessionLease(...args);
+    }) as typeof storage.acquireSessionLease;
+
+    const [byId, byThread] = await Promise.all([
+      harness.session({ sessionId: 'sess-mixed-cold', resourceId: 'r1' }),
+      harness.session({ threadId: 't-mixed-cold', resourceId: 'r1' }),
+    ]);
+
+    expect(byId).toBe(byThread);
+    expect(leaseCalls).toBe(1);
+    expect(harness._internalLiveSessionCount()).toBe(1);
+    expect(harness._internalSessionEventBridgeCount('sess-mixed-cold')).toBe(1);
+  });
+
+  it('keeps every resolver behind the cold-hydration recovery barrier after adoption', async () => {
+    const storage = makeStorage();
+    const harness = makeHarness({ sessions: { storage } });
+    const t0 = Date.now();
+    await storage.saveSession(
+      {
+        id: 'sess-recovery-barrier',
+        harnessName: 'default',
+        resourceId: 'r1',
+        threadId: 't-recovery-barrier',
+        origin: 'top-level',
+        ownsThread: false,
+        modeId: 'default',
+        modelId: 'default',
+        subagentModelOverrides: {},
+        permissionRules: { categories: {}, tools: {} },
+        sessionGrants: { categories: [], tools: [] },
+        tokenUsage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+        pendingQueue: [],
+        state: undefined,
+        version: 0,
+        createdAt: t0,
+        lastActivityAt: t0,
+        ownerId: harness.ownerId,
+        leaseExpiresAt: t0 + 60_000,
+      },
+      { harnessName: 'default', ifVersion: 0 },
+    );
+
+    const recoveryEntered = deferred();
+    const releaseRecovery = deferred();
+    const internalHarness = harness as any;
+    const originalAdoptSession = internalHarness._adoptSession.bind(harness);
+    vi.spyOn(internalHarness, '_adoptSession').mockImplementation((...args: any[]) => {
+      const adopted = originalAdoptSession(...args);
+      adopted._reconcileDelegationsOnHydrate = async () => {
+        recoveryEntered.resolve();
+        await releaseRecovery.promise;
+      };
+      return adopted;
+    });
+
+    const cold = harness.session({ sessionId: 'sess-recovery-barrier', resourceId: 'r1' });
+    await recoveryEntered.promise;
+
+    let sameIdSettled = false;
+    let byThreadSettled = false;
+    const sameId = harness
+      .session({ sessionId: 'sess-recovery-barrier', resourceId: 'r1' })
+      .finally(() => (sameIdSettled = true));
+    const byThread = harness
+      .session({ threadId: 't-recovery-barrier', resourceId: 'r1' })
+      .finally(() => (byThreadSettled = true));
+    await new Promise(resolve => setImmediate(resolve));
+
+    expect(sameIdSettled).toBe(false);
+    expect(byThreadSettled).toBe(false);
+
+    releaseRecovery.resolve();
+    const [first, second, third] = await Promise.all([cold, sameId, byThread]);
+    expect(second).toBe(first);
+    expect(third).toBe(first);
+  });
+
+  it('unpublishes and releases a cold session when recovery reconciliation fails', async () => {
+    const storage = makeStorage();
+    const harness = makeHarness({ sessions: { storage } });
+    const t0 = Date.now();
+    await storage.saveSession(
+      {
+        id: 'sess-recovery-failure',
+        harnessName: 'default',
+        resourceId: 'r1',
+        threadId: 't-recovery-failure',
+        origin: 'top-level',
+        ownsThread: false,
+        modeId: 'default',
+        modelId: 'default',
+        subagentModelOverrides: {},
+        permissionRules: { categories: {}, tools: {} },
+        sessionGrants: { categories: [], tools: [] },
+        tokenUsage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+        pendingQueue: [],
+        state: undefined,
+        version: 0,
+        createdAt: t0,
+        lastActivityAt: t0,
+        ownerId: harness.ownerId,
+        leaseExpiresAt: t0 + 60_000,
+      },
+      { harnessName: 'default', ifVersion: 0 },
+    );
+
+    const internalHarness = harness as any;
+    const originalAdoptSession = internalHarness._adoptSession.bind(harness);
+    let adoptedAttempt = 0;
+    let failedSession: any;
+    vi.spyOn(internalHarness, '_adoptSession').mockImplementation((...args: any[]) => {
+      const adopted = originalAdoptSession(...args);
+      adoptedAttempt += 1;
+      if (adoptedAttempt === 1) {
+        failedSession = adopted;
+        adopted._reconcilePendingInteractionExpiryOnHydrate = async () => {
+          throw new Error('injected recovery failure');
+        };
+        adopted._kickQueueDrain = vi.fn();
+      }
+      return adopted;
+    });
+
+    await expect(harness.session({ sessionId: 'sess-recovery-failure', resourceId: 'r1' })).rejects.toThrow(
+      'injected recovery failure',
+    );
+    expect(failedSession._kickQueueDrain).not.toHaveBeenCalled();
+    expect(harness._internalLiveSessionCount()).toBe(0);
+    expect(harness._internalSessionEventBridgeCount('sess-recovery-failure')).toBe(0);
+    await expect(
+      storage.loadSession({ harnessName: 'default', sessionId: 'sess-recovery-failure' }),
+    ).resolves.toMatchObject({ ownerId: undefined, leaseExpiresAt: undefined });
+
+    const retried = await harness.session({
+      sessionId: 'sess-recovery-failure',
+      resourceId: 'r1',
+    });
+    expect(retried).not.toBe(failedSession);
+    expect(retried.lifecycleState).toBe('live');
+  });
+
+  it('drains an admitted cold resolver during shutdown and never publishes it afterwards', async () => {
+    const storage = makeStorage();
+    const harness = makeHarness({ sessions: { storage } });
+    const t0 = Date.now();
+    await storage.saveSession(
+      {
+        id: 'sess-shutdown-race',
+        harnessName: 'default',
+        resourceId: 'r1',
+        threadId: 't-shutdown-race',
+        origin: 'top-level',
+        ownsThread: false,
+        modeId: 'default',
+        modelId: 'default',
+        subagentModelOverrides: {},
+        permissionRules: { categories: {}, tools: {} },
+        sessionGrants: { categories: [], tools: [] },
+        tokenUsage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+        pendingQueue: [],
+        state: undefined,
+        version: 0,
+        createdAt: t0,
+        lastActivityAt: t0,
+        ownerId: harness.ownerId,
+        leaseExpiresAt: t0 + 60_000,
+      },
+      { harnessName: 'default', ifVersion: 0 },
+    );
+
+    const acquireEntered = deferred();
+    const releaseAcquire = deferred();
+    const originalAcquire = storage.acquireSessionLease.bind(storage);
+    storage.acquireSessionLease = (async (...args: Parameters<typeof storage.acquireSessionLease>) => {
+      acquireEntered.resolve();
+      await releaseAcquire.promise;
+      return originalAcquire(...args);
+    }) as typeof storage.acquireSessionLease;
+
+    const resolving = harness.session({ sessionId: 'sess-shutdown-race', resourceId: 'r1' });
+    await acquireEntered.promise;
+    let shutdownSettled = false;
+    const shuttingDown = harness.shutdown().finally(() => (shutdownSettled = true));
+    await new Promise(resolve => setImmediate(resolve));
+    expect(shutdownSettled).toBe(false);
+
+    releaseAcquire.resolve();
+    await expect(resolving).rejects.toThrow('Harness is shut down');
+    await shuttingDown;
+    expect(harness._internalLiveSessionCount()).toBe(0);
+    expect(harness._internalSessionEventBridgeCount('sess-shutdown-race')).toBe(0);
+    await expect(
+      storage.loadSession({ harnessName: 'default', sessionId: 'sess-shutdown-race' }),
+    ).resolves.toMatchObject({ ownerId: undefined, leaseExpiresAt: undefined });
   });
 
   it('does not falsely dedupe DISTINCT sessions resolved in parallel', async () => {

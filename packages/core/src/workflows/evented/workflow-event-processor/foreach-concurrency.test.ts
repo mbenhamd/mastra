@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import type { ForeachConcurrencyContext } from '../../types';
 import { processWorkflowForEach } from './loop';
 
 /**
@@ -13,7 +14,7 @@ import { processWorkflowForEach } from './loop';
  * silently serialize every iteration).
  */
 
-function makeForeachStep(concurrency: number | ((ctx: { inputData: unknown; getInitData: () => unknown }) => number)) {
+function makeForeachStep(concurrency: number | ((ctx: ForeachConcurrencyContext) => number)) {
   return {
     type: 'foreach' as const,
     step: { id: 'body' },
@@ -25,10 +26,12 @@ async function kickOffForeach({
   concurrency,
   items,
   initData,
+  requestContext,
 }: {
-  concurrency: number | ((ctx: { inputData: unknown; getInitData: () => unknown }) => number);
+  concurrency: number | ((ctx: ForeachConcurrencyContext) => number);
   items: unknown[];
   initData?: unknown;
+  requestContext?: Record<string, unknown>;
 }) {
   const published: any[] = [];
   const pubsub = {
@@ -47,7 +50,7 @@ async function kickOffForeach({
       activeStepsPath: {},
       resumeSteps: [],
       prevResult: { status: 'success', output: items, startedAt: 1, endedAt: 2, payload: {} },
-      requestContext: {},
+      requestContext: requestContext ?? {},
     } as any,
     { pubsub, mastra, step: makeForeachStep(concurrency) },
   );
@@ -84,6 +87,16 @@ describe('processWorkflowForEach concurrency resolution', () => {
   it('still supports static concurrency numbers', async () => {
     const runEvents = await kickOffForeach({ concurrency: 2, items: [1, 2, 3] });
     expect(runEvents).toHaveLength(2);
+  });
+
+  it('passes the current RequestContext to the resolver', async () => {
+    const runEvents = await kickOffForeach({
+      concurrency: context => (context.requestContext?.get('forceSequential') === true ? 1 : 3),
+      items: [1, 2, 3],
+      requestContext: { forceSequential: true },
+    });
+
+    expect(runEvents).toHaveLength(1);
   });
 
   it('falls back to sequential kick-off when the resolver returns an invalid value', async () => {

@@ -260,6 +260,46 @@ export const travelAgent = new Agent({
 
 If you need to access tools from the Mastra instance, see [`Mastra.getTool()`](/reference/core/getTool), [`Mastra.getToolById()`](/reference/core/getToolById), [`Mastra.listTools()`](/reference/core/listTools), and the [`Agent` reference](/reference/agents/agent).
 
+## Return a successful tool result directly
+
+Normally, a model calls a tool and Mastra sends the result back to the model in a second provider request so it can write a final response. When a tool already returns the complete caller-facing answer, use `terminalResult` to skip that redundant request.
+
+```typescript title="src/mastra/tools/compile-document.ts"
+import { createTool } from '@mastra/core/tools'
+import { z } from 'zod'
+
+export const compileDocument = createTool({
+  id: 'compile-document',
+  description: 'Compile a document and return its final artifact.',
+  inputSchema: z.object({ projectId: z.string() }),
+  outputSchema: z.object({
+    status: z.enum(['compiled', 'failed']),
+    artifactId: z.string().optional(),
+    diagnostics: z.array(z.string()),
+  }),
+  terminalResult: {
+    // Required: unsuccessful domain results keep the normal repair loop.
+    isSuccess: output => output.status === 'compiled',
+    outputSchema: z.object({
+      artifactId: z.string(),
+      diagnostics: z.array(z.string()),
+    }),
+    project: output => ({
+      artifactId: output.artifactId!,
+      diagnostics: output.diagnostics,
+    }),
+    maxBytes: 8 * 1024,
+  },
+  execute: async ({ projectId }) => compileProject(projectId),
+})
+```
+
+On success, `await result.text` can be empty because the provider's last response was the tool call. Read the validated value from `result.terminalToolResult` or `await result.getFullOutput()`. A terminal batch can contain projections from different tools, so its aggregate `item.value` type is `unknown`; parse or narrow that value with the projection schema before typed use. Streaming clients receive the same value as a `data-terminal-tool-result` part before `step-finish` and `finish`.
+
+Terminal delivery is intentionally fail closed. Every call in a parallel tool batch must be a successful opted-in local tool with an explicit `project` function and `outputSchema`. Failed or denied calls, approval-gated calls (including approved calls), resumed suspensions, provider-executed tools, background work, signals already queued at terminal arbitration on engines that support active-run signals, mixed ordinary tools, non-pass-through output processors, and display/transcript payload transforms keep the normal continuation path. A signal accepted after terminal arbitration is delivered as the thread's next turn instead of reopening the committed run.
+
+The projected canonical JSON defaults to a 16 KiB UTF-8 limit and cannot exceed 64 KiB. Keep large artifacts in durable storage and return identifiers plus a concise summary.
+
 ## Shape output for the model
 
 Use `toModelOutput` when your tool returns rich structured data for your application, but you want the model to receive a smaller or multimodal representation. This keeps model context focused while preserving the full tool result in your app.

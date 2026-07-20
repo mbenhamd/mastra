@@ -1,6 +1,10 @@
 import { DurableAgentDefaults } from '../../constants';
 import type { DurableToolCallInput, SerializableDurableOptions, SerializableToolMetadata } from '../../types';
 
+type DurablePermissionPolicyPreflight = (
+  toolCall: Pick<DurableToolCallInput, 'toolCallId' | 'toolName' | 'args'>,
+) => unknown;
+
 /**
  * Resolves the effective tool-call foreach concurrency for a durable agentic
  * workflow from the serialized workflow input (iteration state) and the
@@ -8,9 +12,11 @@ import type { DurableToolCallInput, SerializableDurableOptions, SerializableTool
  *
  * Mirrors @mastra/core's non-durable loop semantics
  * (loop/workflows/agentic-execution/tool-call-concurrency.ts):
- * - Global `requireToolApproval` forces sequential execution. The serialized
- *   boolean shadow is `true` for function-form policies, so those degrade
- *   safely to sequential as well.
+ * - Global `requireToolApproval` forces sequential execution.
+ * - A required per-tool permission policy remains sequential unless the live
+ *   evaluator is explicitly identified as an immutable per-turn snapshot and
+ *   returns `allow` for every emitted call. Missing, throwing, invalid,
+ *   promise-valued, `ask`, and `deny` policies all fail conservatively to one.
  * - Any tool in the step's *effective active tool set* with `requireApproval`
  *   or `hasSuspendSchema` forces sequential execution so approval/suspension
  *   flows never race with concurrent tool calls. The check is against the
@@ -27,17 +33,30 @@ import type { DurableToolCallInput, SerializableDurableOptions, SerializableTool
  * calls carry no stamp, the run-level `activeTools` option applies.
  *
  * Designed to be called from a foreach concurrency resolver at execution
- * time, reading only serialized state — safe across durable-engine replays
- * and shared workflow instances.
+ * time. Serialized run state supplies the durable requirement while an
+ * optional live policy snapshot can only narrow or unlock the batch's
+ * concurrency; no policy decision is persisted as authority.
  */
 export function resolveDurableToolCallConcurrency({
   options,
   toolsMetadata,
   toolCalls,
+  permissionPolicy,
+  permissionPolicyStable = false,
+  permissionPolicyRequired = false,
 }: {
-  options?: Pick<SerializableDurableOptions, 'requireToolApproval' | 'toolCallConcurrency' | 'activeTools'>;
+  options?: Pick<
+    SerializableDurableOptions,
+    'requireToolApproval' | 'permissionPolicyRequired' | 'toolCallConcurrency' | 'activeTools'
+  >;
   toolsMetadata?: SerializableToolMetadata[];
-  toolCalls?: Pick<DurableToolCallInput, 'activeTools'>[];
+  toolCalls?: Pick<DurableToolCallInput, 'toolCallId' | 'toolName' | 'args' | 'activeTools'>[];
+  /** Live policy preflight used only to select a concurrency limit. */
+  permissionPolicy?: DurablePermissionPolicyPreflight;
+  /** True only for a trusted immutable per-turn policy snapshot. */
+  permissionPolicyStable?: boolean;
+  /** Runtime marker may require a policy even when serialized options do not. */
+  permissionPolicyRequired?: boolean;
 }): number {
   if (options?.requireToolApproval) {
     return 1;
@@ -52,6 +71,32 @@ export function resolveDurableToolCallConcurrency({
 
   if (consideredTools.some(tool => tool.hasSuspendSchema || tool.requireApproval)) {
     return 1;
+  }
+
+  const requiresPermissionPolicy = options?.permissionPolicyRequired === true || permissionPolicyRequired;
+  if (requiresPermissionPolicy || permissionPolicy) {
+    if (!permissionPolicy || !permissionPolicyStable) return 1;
+
+    try {
+      for (const toolCall of toolCalls ?? []) {
+        const decision = permissionPolicy(toolCall);
+        // Async policy state cannot be resolved by the synchronous workflow
+        // concurrency hook. It remains sequential and is awaited later by the
+        // authoritative tool-call step.
+        if (
+          typeof decision === 'object' &&
+          decision !== null &&
+          'then' in decision &&
+          typeof (decision as { then?: unknown }).then === 'function'
+        ) {
+          void Promise.resolve(decision).catch(() => undefined);
+          return 1;
+        }
+        if (decision !== 'allow') return 1;
+      }
+    } catch {
+      return 1;
+    }
   }
 
   const configured = options?.toolCallConcurrency;

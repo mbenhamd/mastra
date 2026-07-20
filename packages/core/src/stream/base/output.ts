@@ -1,6 +1,10 @@
 import { EventEmitter } from 'node:events';
 import { ReadableStream, TransformStream } from 'node:stream/web';
-import { coreContentToString } from '../../agent/message-list';
+import {
+  coreContentToString,
+  createTerminalToolResultPartId,
+  materializeTerminalToolResult,
+} from '../../agent/message-list';
 import type { MessageList, MastraDBMessage } from '../../agent/message-list';
 import { TripWire } from '../../agent/trip-wire';
 import { MastraBase } from '../../base';
@@ -18,6 +22,7 @@ import {
   outputProcessorsSupportResult,
   outputProcessorsSupportStream,
 } from '../../processors/runner';
+import type { TerminalToolResult } from '../../tools';
 import type { WorkflowRunStatus } from '../../workflows';
 import { DelayedPromise, consumeStream } from '../aisdk/v5/compat';
 import type { ConsumeStreamOptions } from '../aisdk/v5/compat';
@@ -146,6 +151,8 @@ export type FullOutput<OUTPUT = undefined> = {
   messages: MastraDBMessage[];
   /** Only messages loaded from memory (conversation history) */
   rememberedMessages: MastraDBMessage[];
+  /** Bounded tool result that intentionally ended the run without another model call. */
+  terminalToolResult?: TerminalToolResult;
 };
 
 export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
@@ -229,6 +236,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
   };
   #tripwire: StepTripwireData | undefined = undefined;
   #wasSuspended = false;
+  #terminalToolResult: TerminalToolResult | undefined;
   #transportRef: MastraModelOutputOptions<OUTPUT>['transportRef'] | undefined;
   #transportClosed = false;
 
@@ -479,9 +487,24 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
       );
     }
 
+    type StagedTerminalChunk = ChunkType<OUTPUT> & {
+      type: 'data-terminal-tool-result';
+      id: string;
+      data: TerminalToolResult;
+    };
+    let stagedTerminalChunk: StagedTerminalChunk | undefined;
+    let stagedTerminalStepFinishChunk: Extract<ChunkType<OUTPUT>, { type: 'step-finish' }> | undefined;
+    let stagedTerminalStepResult: LLMStepResult<OUTPUT> | undefined;
+    const terminalSignature = (value: unknown): { data: TerminalToolResult; signature: string } => {
+      const data = materializeTerminalToolResult(value);
+      return { data, signature: JSON.stringify(data) };
+    };
+
     this.#baseStream = processedStream.pipeThrough(
       new TransformStream<ChunkType<OUTPUT>, ChunkType<OUTPUT>>({
         transform: async (chunk, controller) => {
+          let outboundChunk = chunk;
+          let suppressChunkEmission = false;
           switch (chunk.type) {
             case 'tool-call-suspended':
             case 'tool-call-approval':
@@ -494,6 +517,27 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                 await options?.onFinish?.(self.#createSuspendedOnFinishPayload(chunk));
               }
               break;
+            case 'data-terminal-tool-result': {
+              if (typeof chunk.id !== 'string' || chunk.id.length === 0) {
+                throw new TypeError('Terminal tool-result data part is missing its stable id');
+              }
+              const normalized = terminalSignature(chunk.data);
+              if (stagedTerminalChunk) {
+                const staged = terminalSignature(stagedTerminalChunk.data);
+                if (stagedTerminalChunk.id !== chunk.id || staged.signature !== normalized.signature) {
+                  throw new TypeError('Conflicting terminal tool-result data parts were received');
+                }
+                return;
+              }
+              stagedTerminalChunk = {
+                ...chunk,
+                data: normalized.data,
+              } as StagedTerminalChunk;
+              // A public custom data part is not authoritative. Keep it
+              // hidden until the framework-owned step and FINISH repeat the
+              // exact terminal result after final persistence succeeds.
+              return;
+            }
             case 'abort':
               self.#status = 'canceled';
               if (!self.#finishCallbackSent) {
@@ -676,6 +720,26 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
               self.#bufferedByStep.toolResults.push(chunk);
               break;
             case 'step-finish': {
+              const stepTerminalValue = (chunk.payload as { terminalToolResult?: unknown }).terminalToolResult;
+              const isTerminalStep = stagedTerminalChunk !== undefined || stepTerminalValue !== undefined;
+              if (isTerminalStep) {
+                if (!stagedTerminalChunk || stepTerminalValue === undefined) {
+                  throw new TypeError(
+                    'Terminal tool-result data and its authoritative step-finish must be emitted together',
+                  );
+                }
+                const staged = terminalSignature(stagedTerminalChunk.data);
+                const authoritative = terminalSignature(stepTerminalValue);
+                if (staged.signature !== authoritative.signature) {
+                  throw new TypeError('Terminal tool-result step-finish does not match its staged data part');
+                }
+                if (stagedTerminalStepFinishChunk) {
+                  throw new TypeError('Terminal tool-result has more than one authoritative step-finish');
+                }
+                stagedTerminalStepFinishChunk = chunk;
+                suppressChunkEmission = true;
+              }
+
               self.updateUsageCount(chunk.payload.output.usage);
               // chunk.payload.totalUsage = self.totalUsage;
               self.#warnings = chunk.payload.stepResult.warnings || [];
@@ -752,10 +816,14 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                 providerMetadata: providerMetadata ?? chunk.payload.providerMetadata,
               };
 
-              await options?.onStepFinish?.({
-                ...(self.#model.modelId && self.#model.provider && self.#model.version ? { model: self.#model } : {}),
-                ...stepResult,
-              });
+              if (isTerminalStep) {
+                stagedTerminalStepResult = stepResult;
+              } else {
+                await options?.onStepFinish?.({
+                  ...(self.#model.modelId && self.#model.provider && self.#model.version ? { model: self.#model } : {}),
+                  ...stepResult,
+                });
+              }
 
               self.#bufferedSteps.push(stepResult);
 
@@ -923,7 +991,123 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                 }),
               };
 
+              let terminalMessageListSnapshot: ReturnType<MessageList['serialize']> | undefined;
+              let terminalStepSnapshots:
+                | Array<{
+                    step: LLMStepResult<OUTPUT>;
+                    content: LLMStepResult<OUTPUT>['content'];
+                    response: LLMStepResult<OUTPUT>['response'];
+                    text: string;
+                  }>
+                | undefined;
+              let terminalMessageListReference: MessageList | undefined;
+              let terminalProcessorStateSnapshots: ReturnType<ProcessorRunner['snapshotProcessorStates']> | undefined;
+              let terminalResponseSnapshot: LLMStepResult<OUTPUT>['response'] | undefined;
+              let terminalChunkResponseSnapshot: LLMStepResult<OUTPUT>['response'] | undefined;
+              let terminalChunkHadResponse = false;
+              let terminalPromiseResolution: Pick<PromiseResults<OUTPUT>, 'text' | 'finishReason'> | undefined;
+              const terminalProcessorChunks: ChunkType<OUTPUT>[] = [];
+              let terminalDeliveryFailed = false;
+              let terminalFailureReason: 'error' | 'other' = 'error';
               try {
+                const finishTerminalValue = (chunk.payload as { terminalToolResult?: unknown }).terminalToolResult;
+                const hasTerminalProtocol =
+                  stagedTerminalChunk !== undefined ||
+                  stagedTerminalStepFinishChunk !== undefined ||
+                  finishTerminalValue !== undefined;
+                let terminalCommit:
+                  | {
+                      data: TerminalToolResult;
+                      dataChunk: NonNullable<typeof stagedTerminalChunk>;
+                      stepFinishChunk: NonNullable<typeof stagedTerminalStepFinishChunk>;
+                      stepResult: LLMStepResult<OUTPUT>;
+                    }
+                  | undefined;
+
+                if (hasTerminalProtocol) {
+                  terminalResponseSnapshot = structuredClone(response);
+                  terminalChunkHadResponse = Object.prototype.hasOwnProperty.call(chunk.payload, 'response');
+                  if (terminalChunkHadResponse) {
+                    terminalChunkResponseSnapshot = structuredClone(
+                      (chunk.payload as { response?: LLMStepResult<OUTPUT>['response'] }).response,
+                    );
+                  }
+                  if (
+                    !stagedTerminalChunk ||
+                    !stagedTerminalStepFinishChunk ||
+                    !stagedTerminalStepResult ||
+                    finishTerminalValue === undefined
+                  ) {
+                    throw new TypeError(
+                      'Terminal tool-result delivery requires matching data, step-finish, and FINISH authority',
+                    );
+                  }
+                  const staged = terminalSignature(stagedTerminalChunk.data);
+                  const step = terminalSignature(
+                    (stagedTerminalStepFinishChunk.payload as { terminalToolResult?: unknown }).terminalToolResult,
+                  );
+                  const finish = terminalSignature(finishTerminalValue);
+                  if (staged.signature !== step.signature || staged.signature !== finish.signature) {
+                    throw new TypeError('Terminal tool-result authority does not match the staged data part');
+                  }
+                  const stepCount = chunk.payload.output.steps?.length;
+                  if (typeof stepCount !== 'number' || !Number.isSafeInteger(stepCount)) {
+                    throw new TypeError('Terminal tool-result FINISH is missing its authoritative step count');
+                  }
+                  const expectedId = createTerminalToolResultPartId(self.runId, stepCount);
+                  if (stagedTerminalChunk.id !== expectedId) {
+                    throw new TypeError('Terminal tool-result data part id does not match its run and step');
+                  }
+                  terminalCommit = {
+                    data: finish.data,
+                    dataChunk: stagedTerminalChunk,
+                    stepFinishChunk: stagedTerminalStepFinishChunk,
+                    stepResult: stagedTerminalStepResult,
+                  };
+
+                  const terminalMessageId = stagedTerminalStepFinishChunk.payload.messageId;
+                  if (typeof terminalMessageId !== 'string' || terminalMessageId.length === 0) {
+                    throw new TypeError('Terminal tool-result step is missing its response message id');
+                  }
+                  terminalMessageListReference = self.messageList;
+                  terminalMessageListSnapshot = structuredClone(self.messageList.serialize());
+                  // MessageList getters may return message objects that are also referenced by
+                  // buffered step responses. Adding the staged terminal part can therefore mutate
+                  // those historical views in place. Keep a detached snapshot so a persistence
+                  // failure cannot expose an uncommitted terminal value through `steps` or
+                  // callback payloads after the canonical MessageList has been restored.
+                  terminalStepSnapshots = self.#bufferedSteps.map(step => ({
+                    step,
+                    content: structuredClone(step.content),
+                    response: structuredClone(step.response),
+                    text: step.text,
+                  }));
+                  const existingTerminalMessage = self.messageList.get.all
+                    .db()
+                    .find(message => message.id === terminalMessageId);
+                  const memoryInfo = terminalMessageListSnapshot.memoryInfo;
+                  self.messageList.add(
+                    {
+                      id: terminalMessageId,
+                      role: 'assistant',
+                      content: {
+                        format: 2,
+                        parts: [
+                          {
+                            type: 'data-terminal-tool-result',
+                            id: stagedTerminalChunk.id,
+                            data: terminalCommit.data,
+                          },
+                        ],
+                      },
+                      createdAt: existingTerminalMessage?.createdAt ?? new Date(),
+                      threadId: existingTerminalMessage?.threadId ?? memoryInfo?.threadId,
+                      resourceId: existingTerminalMessage?.resourceId ?? memoryInfo?.resourceId,
+                    },
+                    'response',
+                  );
+                }
+
                 if (self.processorRunner && !self.#options.isLLMExecutionStep) {
                   // Run output processors when NOT in LLM execution step context
                   // (i.e., when this is the final MastraModelOutput for the agent)
@@ -932,13 +1116,28 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                   const lastStep = self.#bufferedSteps[self.#bufferedSteps.length - 1];
                   const originalText = lastStep?.text || '';
 
+                  if (terminalCommit) {
+                    terminalProcessorStateSnapshots = self.processorRunner.snapshotProcessorStates();
+                  }
+
                   // Create a writer from the controller so processOutputResult can emit custom chunks.
                   // Must use both #emitChunk (for fullStream/EventEmitter consumers) and
                   // controller.enqueue (for raw stream consumers) to ensure visibility.
                   const outputResultWriter = {
                     custom: async (data: { type: string }) => {
-                      self.#emitChunk(data as ChunkType<OUTPUT>);
-                      controller.enqueue(data as ChunkType<OUTPUT>);
+                      if (data.type === 'data-terminal-tool-result') {
+                        throw new TypeError('data-terminal-tool-result is reserved for framework terminal delivery');
+                      }
+                      const customChunk = data as ChunkType<OUTPUT>;
+                      if (terminalCommit) {
+                        // A pass-through processor may derive custom output from the staged
+                        // terminal answer before the final persistence owner runs. Keep those
+                        // chunks private until the entire terminal transaction validates.
+                        terminalProcessorChunks.push(structuredClone(customChunk));
+                        return;
+                      }
+                      self.#emitChunk(customChunk);
+                      controller.enqueue(customChunk);
                     },
                   };
 
@@ -970,10 +1169,15 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                   }
 
                   // Use the processed text if available, otherwise keep original
-                  this.resolvePromises({
+                  const finalTextAndReason = {
                     text: outputText || originalText,
                     finishReason: self.#finishReason,
-                  });
+                  };
+                  if (terminalCommit) {
+                    terminalPromiseResolution = finalTextAndReason;
+                  } else {
+                    this.resolvePromises(finalTextAndReason);
+                  }
 
                   // Update response with processed messages after output processors have run
                   if (chunk.payload.metadata) {
@@ -982,8 +1186,9 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                       ...otherMetadata,
                       modelId:
                         (chunk.payload.metadata?.modelId as string) || (chunk.payload.metadata?.model as string) || '',
-                      messages: messageList.get.response.aiV5.model(),
-                      uiMessages: messageList.get.response.aiV5.ui() as LLMStepResult<OUTPUT>['response']['uiMessages'],
+                      messages: self.messageList.get.response.aiV5.model(),
+                      uiMessages:
+                        self.messageList.get.response.aiV5.ui() as LLMStepResult<OUTPUT>['response']['uiMessages'],
                     };
                   }
 
@@ -1000,26 +1205,130 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                   const hasToolStep = self.#bufferedSteps.some(
                     step => step.toolCalls.length > 0 || step.toolResults.length > 0,
                   );
-                  this.resolvePromises({
+                  const finalTextAndReason = {
                     text: hasToolStep && !self.#wasSuspended && lastStep ? lastStep.text : self.#bufferedText.join(''),
                     finishReason: self.#finishReason,
-                  });
+                  };
+                  if (terminalCommit) {
+                    terminalPromiseResolution = finalTextAndReason;
+                  } else {
+                    this.resolvePromises(finalTextAndReason);
+                  }
                 }
                 // If isLLMExecutionStep is true (without resolveFinalPromises), don't resolve
                 // text here - let the outer MastraModelOutput handle it
+
+                if (terminalCommit) {
+                  const persistedParts = self.messageList.get.response
+                    .db()
+                    .flatMap(message =>
+                      message.id === terminalCommit.stepFinishChunk.payload.messageId &&
+                      typeof message.content === 'object' &&
+                      Array.isArray(message.content.parts)
+                        ? message.content.parts.filter(
+                            part =>
+                              part.type === 'data-terminal-tool-result' &&
+                              'id' in part &&
+                              part.id === terminalCommit.dataChunk.id,
+                          )
+                        : [],
+                    );
+                  if (persistedParts.length !== 1) {
+                    throw new TypeError('Final output processors did not retain exactly one terminal tool result');
+                  }
+                  const persistedTerminal = terminalSignature((persistedParts[0] as { data?: unknown }).data);
+                  if (persistedTerminal.signature !== terminalSignature(terminalCommit.data).signature) {
+                    throw new TypeError('Final output processors changed the terminal tool result');
+                  }
+
+                  terminalCommit.stepResult.content = self.messageList.get.response.aiV5.modelContent(-1);
+                  terminalCommit.stepResult.response.dbMessages = self.messageList.get.response.db();
+                  terminalCommit.stepResult.response.uiMessages =
+                    self.messageList.get.response.aiV5.ui() as LLMStepResult<OUTPUT>['response']['uiMessages'];
+                  if (chunk.payload.metadata) {
+                    const { providerMetadata, request, ...otherMetadata } = chunk.payload.metadata;
+                    response = {
+                      ...otherMetadata,
+                      modelId:
+                        (chunk.payload.metadata?.modelId as string) || (chunk.payload.metadata?.model as string) || '',
+                      messages: self.messageList.get.response.aiV5.model(),
+                      uiMessages:
+                        self.messageList.get.response.aiV5.ui() as LLMStepResult<OUTPUT>['response']['uiMessages'],
+                    };
+                    (chunk.payload as { response?: LLMStepResult<OUTPUT>['response'] }).response = response;
+                  }
+                  self.#terminalToolResult = terminalCommit.data;
+                  if (terminalPromiseResolution) {
+                    this.resolvePromises(terminalPromiseResolution);
+                  }
+                  for (const processorChunk of terminalProcessorChunks) {
+                    self.#emitChunk(processorChunk);
+                    controller.enqueue(processorChunk);
+                  }
+                  for (const terminalChunk of [terminalCommit.dataChunk, terminalCommit.stepFinishChunk]) {
+                    self.#emitChunk(terminalChunk);
+                    controller.enqueue(terminalChunk);
+                  }
+                  try {
+                    await options?.onStepFinish?.({
+                      ...(self.#model.modelId && self.#model.provider && self.#model.version
+                        ? { model: self.#model }
+                        : {}),
+                      ...terminalCommit.stepResult,
+                    });
+                  } catch (callbackError) {
+                    self.logger?.error?.('Terminal onStepFinish callback failed after commit', {
+                      error: callbackError,
+                      runId: self.runId,
+                    });
+                  }
+                  stagedTerminalChunk = undefined;
+                  stagedTerminalStepFinishChunk = undefined;
+                  stagedTerminalStepResult = undefined;
+                }
               } catch (error) {
+                terminalDeliveryFailed = true;
+                if (terminalMessageListReference && terminalMessageListSnapshot) {
+                  self.messageList = terminalMessageListReference;
+                  self.messageList.deserialize(terminalMessageListSnapshot);
+                }
+                if (self.processorRunner && terminalProcessorStateSnapshots) {
+                  self.processorRunner.restoreProcessorStates(terminalProcessorStateSnapshots);
+                }
+                for (const snapshot of terminalStepSnapshots ?? []) {
+                  snapshot.step.content = snapshot.content;
+                  snapshot.step.response = snapshot.response;
+                  snapshot.step.text = snapshot.text;
+                }
+                if (terminalResponseSnapshot) {
+                  response = terminalResponseSnapshot;
+                }
+                if (terminalChunkHadResponse) {
+                  (chunk.payload as { response?: LLMStepResult<OUTPUT>['response'] }).response =
+                    terminalChunkResponseSnapshot;
+                } else {
+                  delete (chunk.payload as { response?: LLMStepResult<OUTPUT>['response'] }).response;
+                }
+                stagedTerminalChunk = undefined;
+                stagedTerminalStepFinishChunk = undefined;
+                stagedTerminalStepResult = undefined;
+                self.#terminalToolResult = undefined;
                 if (error instanceof TripWire) {
+                  terminalFailureReason = 'other';
                   self.#tripwire = {
                     reason: error.message,
                     retry: error.options?.retry,
                     metadata: error.options?.metadata,
                     processorId: error.processorId,
                   };
+                  self.#finishReason = 'other';
                   self.resolvePromises({
                     finishReason: 'other',
                     text: '',
                   });
                 } else {
+                  self.#status = 'failed';
+                  self.#finishReason = 'error';
                   self.#error = getErrorFromUnknown(error, {
                     fallbackMessage: 'Unknown error in stream',
                   });
@@ -1031,6 +1340,23 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                 if (self.#delayedPromises.object.status.type !== 'resolved') {
                   self.#delayedPromises.object.resolve(undefined as OUTPUT);
                 }
+              }
+
+              if (terminalDeliveryFailed) {
+                const { terminalToolResult: _terminalToolResult, ...safePayload } =
+                  chunk.payload as typeof chunk.payload & {
+                    terminalToolResult?: unknown;
+                  };
+                outboundChunk = {
+                  ...chunk,
+                  payload: {
+                    ...safePayload,
+                    stepResult: {
+                      ...safePayload.stepResult,
+                      reason: terminalFailureReason,
+                    },
+                  },
+                } as ChunkType<OUTPUT>;
               }
 
               const reasoningText =
@@ -1062,7 +1388,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                 toolResults: self.#toolResults,
                 steps: self.#bufferedSteps,
                 totalUsage: self.#getTotalUsage(),
-                content: messageList.get.response.aiV5.stepContent(),
+                content: self.messageList.get.response.aiV5.stepContent(),
                 suspendPayload: undefined,
                 resumeSchema: undefined,
               });
@@ -1073,8 +1399,8 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                   providerMetadata: baseFinishStep.providerMetadata ?? finalProviderMetadata,
                   text: self.#bufferedText.join(''),
                   warnings: baseFinishStep.warnings ?? [],
-                  finishReason: chunk.payload.stepResult.reason,
-                  content: messageList.get.response.aiV5.stepContent(),
+                  finishReason: self.#finishReason ?? chunk.payload.stepResult.reason,
+                  content: self.messageList.get.response.aiV5.stepContent(),
                   request: await self.request,
                   error: self.error,
                   reasoning: await self.reasoning,
@@ -1085,7 +1411,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                   response: {
                     ...(await self.response),
                     ...baseFinishStep.response,
-                    messages: messageList.get.response.aiV5.model(),
+                    messages: self.messageList.get.response.aiV5.model(),
                     dbMessages: self.messageList.get.response.db(),
                   },
                   usage: chunk.payload.output.usage,
@@ -1100,6 +1426,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                   dynamicToolResults: (await self.toolResults).filter(
                     toolResult => toolResult?.payload?.dynamic === true,
                   ),
+                  ...(self.#terminalToolResult ? { terminalToolResult: self.#terminalToolResult } : {}),
                   // Custom properties (not part of standard callback)
                   ...(self.#model.modelId && self.#model.provider && self.#model.version ? { model: self.#model } : {}),
                   object:
@@ -1120,7 +1447,18 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
 
                 if (!self.#finishCallbackSent) {
                   self.#finishCallbackSent = true;
-                  await options?.onFinish?.(onFinishPayload);
+                  if (self.#terminalToolResult) {
+                    try {
+                      await options?.onFinish?.(onFinishPayload);
+                    } catch (callbackError) {
+                      self.logger?.error?.('Terminal onFinish callback failed after commit', {
+                        error: callbackError,
+                        runId: self.runId,
+                      });
+                    }
+                  } else {
+                    await options?.onFinish?.(onFinishPayload);
+                  }
                 }
               }
 
@@ -1175,8 +1513,9 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
               self.#closeTransportIfNeeded();
               break;
           }
-          self.#emitChunk(chunk);
-          controller.enqueue(chunk);
+          if (suppressChunkEmission) return;
+          self.#emitChunk(outboundChunk);
+          controller.enqueue(outboundChunk);
         },
         flush: () => {
           if (self.#delayedPromises.object.status.type === 'pending') {
@@ -1546,6 +1885,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
       messages: this.messageList.get.all.db(),
       // Only messages loaded from memory (conversation history)
       rememberedMessages: this.messageList.get.remembered.db(),
+      ...(this.#terminalToolResult ? { terminalToolResult: this.#terminalToolResult } : {}),
     };
 
     return fullOutput;
@@ -1557,6 +1897,11 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
    */
   get tripwire(): StepTripwireData | undefined {
     return this.#tripwire;
+  }
+
+  /** The terminal tool result after its data part has been consumed, if present. */
+  get terminalToolResult(): TerminalToolResult | undefined {
+    return this.#terminalToolResult;
   }
 
   /**
@@ -1915,6 +2260,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
       usageCount: this.#usageCount,
       tripwire: this.#tripwire,
       wasSuspended: this.#wasSuspended,
+      terminalToolResult: this.#terminalToolResult,
       messageList: this.messageList.serialize(),
     };
   }
@@ -1940,6 +2286,9 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
     this.#usageCount = state.usageCount;
     this.#tripwire = state.tripwire;
     this.#wasSuspended = state.wasSuspended ?? state.status === 'suspended';
+    this.#terminalToolResult = state.terminalToolResult
+      ? materializeTerminalToolResult(state.terminalToolResult)
+      : undefined;
     this.messageList = this.messageList.deserialize(state.messageList);
   }
 }

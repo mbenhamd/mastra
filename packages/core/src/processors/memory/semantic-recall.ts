@@ -116,6 +116,7 @@ export interface SemanticRecallOptions {
 export class SemanticRecall implements Processor {
   readonly id = 'semantic-recall';
   readonly name = 'SemanticRecall';
+  readonly terminalToolResultPolicy = 'pass-through' as const;
 
   private storage: MemoryStorage;
   private vector: MastraVector;

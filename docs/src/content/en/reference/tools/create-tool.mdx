@@ -84,6 +84,13 @@ The first `execute` parameter is the validated value from `inputSchema`. Destruc
     isOptional: true,
   },
   {
+    name: 'terminalResult',
+    type: 'ToolTerminalResultConfig<TSchemaOut, TResult>',
+    description:
+      "Optional fail-closed policy that can end the agent run directly from a successful tool output. `isSuccess`, `project`, and `outputSchema` are required; the context includes `batchSize`/`batchIndex` so tools that require exclusive ownership can reject parallel batches. Approval-gated and resumed suspended calls never terminalize. `maxBytes` sets the projected value's UTF-8 JSON limit (16 KiB by default, 64 KiB maximum). The result is exposed as `FullOutput.terminalToolResult` and a `data-terminal-tool-result` stream part.",
+    isOptional: true,
+  },
+  {
     name: 'transform',
     type: 'ToolPayloadTransform',
     description:

@@ -29,7 +29,12 @@ import {
   renderObservationGroupsForReflection,
 } from '../observation-groups';
 import { getObservationsAsOf } from '../observation-utils';
-import { didProviderChange, ObservationalMemory } from '../observational-memory';
+import {
+  buildMessageRange,
+  didProviderChange,
+  getLastActivityFromMessages,
+  ObservationalMemory,
+} from '../observational-memory';
 import {
   buildObserverPrompt,
   buildMultiThreadObserverPrompt,
@@ -1511,6 +1516,58 @@ describe('Observer Agent Helpers', () => {
       expect(formatted).not.toMatch(/Assistant(?: \([^)]*\))?:/);
       expect(formatted).toMatch(/User( \([^)]*\))?:/);
       expect(formatted).toContain('Hello');
+    });
+
+    it('treats a valid terminal result as one bounded assistant answer while ignoring other data parts', () => {
+      const genericData = createTestMessage('ignored', 'assistant', 'generic-data');
+      genericData.createdAt = new Date('2024-12-04T10:29:00Z');
+      genericData.content = { format: 2, parts: [{ type: 'data-progress', data: { status: 'done' } } as any] };
+      const terminal = createTestMessage('ignored', 'assistant', 'terminal-answer');
+      terminal.createdAt = new Date('2024-12-04T10:30:00Z');
+      terminal.content = {
+        format: 2,
+        parts: [
+          {
+            type: 'data-terminal-tool-result',
+            createdAt: Date.parse('2024-12-04T10:30:01Z'),
+            data: {
+              status: 'success',
+              items: [
+                {
+                  toolName: 'spawn_subagent',
+                  toolCallId: 'call-specialist',
+                  status: 'success',
+                  value: {
+                    kind: 'subagent-direct-answer',
+                    text: 'Specialist-authored final answer.',
+                    subagentSessionId: 'child-1',
+                  },
+                },
+              ],
+            },
+          } as any,
+        ],
+      };
+
+      const formatted = formatMessagesForObserver([genericData, terminal]);
+      expect(formatted.match(/Specialist-authored final answer\./g)).toHaveLength(1);
+      expect(formatted).toContain('subagentSessionId');
+      expect(formatted).not.toContain('data-terminal-tool-result');
+      expect(buildMessageRange([genericData, terminal])).toBe('terminal-answer:terminal-answer');
+      expect(getLastActivityFromMessages([genericData, terminal])).toBe(Date.parse('2024-12-04T10:30:01Z'));
+
+      const counter = new TokenCounter();
+      expect(counter.countMessage(terminal)).toBeGreaterThan(counter.countMessage(genericData));
+    });
+
+    it('fails closed for malformed terminal result data', () => {
+      const malformed = createTestMessage('ignored', 'assistant', 'malformed-terminal');
+      malformed.content = {
+        format: 2,
+        parts: [{ type: 'data-terminal-tool-result', data: { status: 'success', items: [] } } as any],
+      };
+
+      expect(formatMessagesForObserver([malformed])).toBe('');
     });
 
     it('should render persisted temporal gap markers as time-passed lines', () => {
@@ -9570,6 +9627,78 @@ describe('Async Buffering Processor Logic', () => {
       expect(result1).toBe('first');
       expect(result2).toBe('second');
       expect(order).toEqual([1, 2]);
+    });
+
+    it('should preserve FIFO serialization when multiple callers queue behind one lock', async () => {
+      const om = new ObservationalMemory({
+        storage: createInMemoryStorage(),
+        scope: 'thread',
+        model: createStreamCapableMockModel({ defaultObjectGenerationMode: 'json' }),
+        observation: { messageTokens: 50000 },
+        reflection: { observationTokens: 20000 },
+      });
+
+      let releaseFirst!: () => void;
+      const firstGate = new Promise<void>(resolve => {
+        releaseFirst = resolve;
+      });
+      let releaseSecond!: () => void;
+      const secondGate = new Promise<void>(resolve => {
+        releaseSecond = resolve;
+      });
+      let firstEntered!: () => void;
+      const firstEnteredPromise = new Promise<void>(resolve => {
+        firstEntered = resolve;
+      });
+      let secondEntered!: () => void;
+      const secondEnteredPromise = new Promise<void>(resolve => {
+        secondEntered = resolve;
+      });
+
+      let active = 0;
+      let maxActive = 0;
+      const order: string[] = [];
+      const enter = (name: string) => {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        order.push(`${name}:enter`);
+      };
+      const exit = (name: string) => {
+        order.push(`${name}:exit`);
+        active -= 1;
+      };
+
+      const first = (om as any).withLock('test-key', async () => {
+        enter('first');
+        firstEntered();
+        await firstGate;
+        exit('first');
+      });
+      await firstEnteredPromise;
+
+      const second = (om as any).withLock('test-key', async () => {
+        enter('second');
+        secondEntered();
+        await secondGate;
+        exit('second');
+      });
+      const third = (om as any).withLock('test-key', async () => {
+        enter('third');
+        exit('third');
+      });
+
+      releaseFirst();
+      await secondEnteredPromise;
+      await Promise.resolve();
+      const maxActiveBeforeSecondRelease = maxActive;
+      const orderBeforeSecondRelease = [...order];
+      releaseSecond();
+      await Promise.all([first, second, third]);
+
+      expect(maxActiveBeforeSecondRelease).toBe(1);
+      expect(orderBeforeSecondRelease).toEqual(['first:enter', 'first:exit', 'second:enter']);
+      expect(maxActive).toBe(1);
+      expect(order).toEqual(['first:enter', 'first:exit', 'second:enter', 'second:exit', 'third:enter', 'third:exit']);
     });
 
     it('should allow concurrent operations on different keys', async () => {

@@ -59,6 +59,7 @@ export function createDurableSignalDrainStep() {
 
         return {
           ...execOutput,
+          terminalToolResult: undefined,
           messageListState: drainList.serialize(),
           messageId: nextMessageId,
           stepResult: {

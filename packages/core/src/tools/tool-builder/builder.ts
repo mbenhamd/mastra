@@ -113,6 +113,7 @@ function createToolRecoveryFingerprint(
     mcpMetadata: candidate.mcpMetadata,
     background: candidate.background,
     backgroundConfig: options.backgroundConfig,
+    terminalResult: candidate.terminalResult,
     onInputStart: candidate.onInputStart,
     onInputDelta: candidate.onInputDelta,
     onInputAvailable: candidate.onInputAvailable,
@@ -1140,6 +1141,7 @@ export class CoreToolBuilder extends MastraBase {
       // Preserve tool-level background config so the agentic loop can pick it up
       // from the converted CoreTool at dispatch time.
       backgroundConfig: this.options.backgroundConfig,
+      terminalResult: 'terminalResult' in this.originalTool ? this.originalTool.terminalResult : undefined,
     } as unknown as CoreTool;
     const recoveryOriginalTool = this.originalTool;
     const recoverySchemas = {

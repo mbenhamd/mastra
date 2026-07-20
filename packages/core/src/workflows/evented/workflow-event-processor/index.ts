@@ -3666,6 +3666,7 @@ export class WorkflowEventProcessor extends EventProcessor {
         const foreachConcurrency = resolveForeachConcurrency(step.opts, {
           inputData: foreachResult.payload,
           getInitData: () => (stepResults as any)?.input,
+          requestContext: new RequestContext(Object.entries(requestContext ?? {}) as any),
         });
         if (iterationsStarted < targetLen && suspendedCount < foreachConcurrency) {
           // More iterations need to be started - call processWorkflowForEach to continue

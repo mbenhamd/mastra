@@ -437,32 +437,29 @@ Switch model
 
 **`GET` `/harness/:name/sessions/:sessionId/om`**
 
-Read the session-scoped observational-memory snapshot. The server derives
-`resourceId` from auth, verifies the session/thread belongs to that resource,
-resolves the configured OM scope, and returns
-`ObservationalMemorySnapshot | null` (§4.8). The response is a redacted
-JSON-safe read model over MemoryStorage, not the raw OM row: it excludes raw
-config blobs, metadata, buffered chunks/reflections, history generations,
-provider clients, live model objects, functions, locks, and processor internals.
-Resource-scoped OM may summarize other threads for the same authenticated
-resource; cross-resource records are tenant-safe not-found. This route is
-read-only, advisory, and never settles operations, proves recovery, claims
-memory work, or mutates storage. `RemoteSession.om.getRecord()` uses this route;
-`RemoteSession.om.loadProgress()` may use the same read to refresh an
-implementation-local OM cache without changing settlement or display-state
-semantics.
+Reserved; not auto-mounted in the current Harness v1 implementation. Effective
+OM is configured and read through the Agent Memory/MemoryStorage domain, with
+the product responsible for its normal resource/thread authorization checks.
+Harness does not currently project an `ObservationalMemorySnapshot` route.
 
 **`PATCH` `/harness/:name/sessions/:sessionId/om`**
 
-Switch observer/reflector model IDs for the session OM wrapper. Body may include
-`{ observerModel?: string, reflectorModel?: string }`; live model objects,
-functions, provider clients, raw OM config, threshold/scope changes, and
-observation content are rejected. The route requires `If-Match` with the session
-`ETag`, runs under the active session lease, updates only
-`SessionRecord.observationalMemory` model IDs, advances the session version on
-commit, and returns the new resolved OM config read model. Validation, stale
-ETag, closing/closed session, lease, authorization, or storage failures reject
-before any OM event or display projection is emitted.
+Reserved; not auto-mounted. Per-session Observer/Reflector switching is
+unsupported and the local `session.om.switch*Model(...)` methods validate then
+reject without persisting. Configure models on the Agent Memory instance. A
+legacy `SessionRecord.observationalMemory` override can be removed only through
+the idempotent local recovery surface `session.om.clearOverride()` until a
+separately authorized remote recovery contract is implemented; its CAS commits
+before parked queue work is re-kicked.
+
+**`GET` `/harness/:name/sessions/:sessionId/permissions`**
+
+Return a copied snapshot of the session's persisted permission grants and
+current effective rules after verifying the addressed session belongs to the
+authenticated resource. The route may be used to rebuild a session-scoped
+approval UI after reconnect; it does not mutate base rules or widen the
+caller's route capabilities. Foreign session identifiers return tenant-safe
+`404 harness.session_not_found`.
 
 **`PATCH` `/harness/:name/sessions/:sessionId/permissions`**
 

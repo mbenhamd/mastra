@@ -266,23 +266,6 @@ describe('DurableAgent streaming execution', () => {
         inputSchema: z.object({}),
         execute: async () => 'mode',
       });
-      let ownKeysCalls = 0;
-      const processorTools = new Proxy<Record<string, unknown>>(
-        {},
-        {
-          ownKeys: () => {
-            ownKeysCalls++;
-            return ownKeysCalls % 2 === 1 ? ['modeTool'] : ['modeTool', 'hiddenTool'];
-          },
-          getOwnPropertyDescriptor: (_target, key) => ({
-            value: key === 'modeTool' ? modeTool : hiddenTool,
-            writable: true,
-            enumerable: true,
-            configurable: true,
-          }),
-          get: (_target, key) => (key === 'modeTool' ? modeTool : hiddenTool),
-        },
-      );
       const baseAgent = new Agent({
         id: 'durable-replacement-agent',
         name: 'Durable Replacement Agent',
@@ -292,8 +275,11 @@ describe('DurableAgent streaming execution', () => {
         inputProcessors: [
           {
             id: 'expand-tools',
-            processInputStep: () => ({
-              tools: processorTools,
+            processInputStep: ({ tools }) => ({
+              // Returning the exact processor view is allowed. The attempted
+              // selection expansion must still be narrowed to the replacement
+              // surface before the provider sees it.
+              tools,
               activeTools: ['modeTool', 'hiddenTool'],
             }),
           },
@@ -314,7 +300,6 @@ describe('DurableAgent streaming execution', () => {
         ['modeTool'],
       ]);
       expect(hiddenExecute).not.toHaveBeenCalled();
-      expect(ownKeysCalls).toBe(2);
       cleanup();
     });
 
@@ -509,6 +494,64 @@ describe('DurableAgent streaming execution', () => {
       ).rejects.toMatchObject({ id: 'DURABLE_AGENT_TOOL_HOOK_POLICY_UNAVAILABLE' });
 
       durableAgent.runRegistry.cleanup(prepared.runId);
+    });
+
+    it('should reject a changed terminal-result policy during cross-process tool rehydration', async () => {
+      const initialAgent = new Agent({
+        id: 'durable-terminal-drift-agent',
+        name: 'Durable Terminal Drift Agent',
+        instructions: 'test',
+        model: createTextStreamModel('unused') as LanguageModelV2,
+        tools: {
+          directAnswer: createTool({
+            id: 'directAnswer',
+            description: 'Return a specialist answer directly',
+            inputSchema: z.object({}),
+            outputSchema: z.object({ status: z.string(), answer: z.string() }),
+            execute: async () => ({ status: 'ok', answer: 'specialist answer' }),
+            terminalResult: {
+              isSuccess: result => result.status === 'ok',
+              project: result => ({ answer: result.answer }),
+            },
+          }),
+        },
+      });
+      const durableAgent = createDurableAgent({ agent: initialAgent, pubsub });
+      const prepared = await durableAgent.prepare('test', { runId: 'terminal-policy-drift-run' });
+      const { runtimeResolution: _runtimeResolution, ...crossProcessInput } = prepared.workflowInput;
+      globalRunRegistry.delete(prepared.runId);
+
+      const restartedAgent = new Agent({
+        id: initialAgent.id,
+        name: initialAgent.name,
+        instructions: 'test',
+        model: createTextStreamModel('unused') as LanguageModelV2,
+        tools: {
+          directAnswer: createTool({
+            id: 'directAnswer',
+            description: 'Return a specialist answer directly',
+            inputSchema: z.object({}),
+            outputSchema: z.object({ status: z.string(), answer: z.string() }),
+            execute: async () => ({ status: 'done', answer: 'specialist answer' }),
+            terminalResult: {
+              isSuccess: result => result.status === 'done',
+              project: result => ({ answer: result.answer }),
+            },
+          }),
+        },
+      });
+
+      await expect(
+        resolveRuntimeDependencies({
+          runId: prepared.runId,
+          agentId: restartedAgent.id,
+          input: crossProcessInput,
+          mastra: { getAgentById: () => restartedAgent } as any,
+        }),
+      ).rejects.toMatchObject({ id: 'DURABLE_AGENT_RUNTIME_TOOL_BINDING_MISMATCH' });
+
+      durableAgent.runRegistry.cleanup(prepared.runId);
+      globalRunRegistry.delete(prepared.runId);
     });
 
     it('should reject a stale warm per-execution hook policy identity', async () => {

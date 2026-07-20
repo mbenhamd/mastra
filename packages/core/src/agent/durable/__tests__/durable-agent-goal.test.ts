@@ -17,6 +17,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { EventEmitterPubSub } from '../../../events/event-emitter';
 import { Mastra } from '../../../mastra';
 import { MockMemory } from '../../../memory/mock';
+import { RequestContext } from '../../../request-context';
 import { InMemoryStore } from '../../../storage';
 import { Agent } from '../../agent';
 import { createDurableAgent } from '../create-durable-agent';
@@ -307,6 +308,59 @@ describe('DurableAgent goal step', () => {
     const record = await durableAgent.getObjective({ threadId: THREAD, resourceId: RESOURCE });
     expect(record?.status).toBe('done');
     expect(record?.runsUsed).toBe(1);
+  });
+
+  it('passes live request context to the goal scorer without persisting it by default', async () => {
+    const scorerRun = vi.fn().mockResolvedValue({ score: 1, reason: 'Goal achieved' });
+    const THREAD = 'goal-context-thread';
+    const RESOURCE = 'user-context';
+    const requestContext = new RequestContext();
+    requestContext.set('tenantId', 'tenant-live');
+
+    const baseAgent = new Agent({
+      id: 'goal-context-agent',
+      name: 'Goal Context Agent',
+      instructions: 'You are a helpful agent.',
+      model: createTextModel('I have completed the goal.') as LanguageModelV2,
+      memory: new MockMemory(),
+      goal: {
+        judge: 'mock-judge',
+        maxRuns: 5,
+        scorer: { id: 'goal-context-scorer', name: 'Goal Context Scorer', run: scorerRun } as any,
+      },
+    });
+    const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+    new Mastra({
+      agents: { 'goal-context-agent': durableAgent as any },
+      logger: false,
+      storage: new InMemoryStore(),
+      pubsub,
+    });
+
+    await durableAgent.setObjective('Verify scorer context', {
+      threadId: THREAD,
+      resourceId: RESOURCE,
+    });
+
+    const prepared = await durableAgent.prepare('Verify scorer context', {
+      requestContext,
+      memory: { thread: THREAD, resource: RESOURCE },
+    });
+    expect(prepared.workflowInput.requestContextEntries).toBeUndefined();
+    prepared.cleanup();
+
+    const result = await durableAgent.stream('Verify scorer context', {
+      requestContext,
+      maxSteps: 1,
+      memory: { thread: THREAD, resource: RESOURCE },
+    });
+    await drain(result.fullStream);
+    result.cleanup();
+
+    expect(scorerRun).toHaveBeenCalledTimes(1);
+    expect(scorerRun.mock.calls[0]?.[0]).toMatchObject({
+      requestContext: { tenantId: 'tenant-live' },
+    });
   });
 
   it('preserves a terminal primary-agent error without judging or emitting goal progress', async () => {
