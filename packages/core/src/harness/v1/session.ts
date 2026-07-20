@@ -383,6 +383,42 @@ const MAX_EMITTED_TOOL_TERMINALS = 4096;
  * without allowing tombstones to grow without bound. */
 const MAX_EXPIRED_PENDING_INTERACTIONS = 100;
 
+// §10.2 receipts stay bounded on BOTH axes (PF-2250, live-diagnosed): the map
+// itself is idempotency state, so only a recent window is needed, and a stored
+// result must never carry provider payloads large enough to push the session
+// record past a storage document limit (Azure Responses reasoning blobs made a
+// single applied receipt ~400KB and broke every later saveSession with an
+// HTTP 500).
+const MAX_INBOX_RESPONSE_RECEIPTS = 64;
+const MAX_INBOX_RECEIPT_RESULT_BYTES = 64_000;
+
+function boundInboxReceiptResult(full: unknown): unknown {
+  try {
+    const serialized = JSON.stringify(full);
+    if (serialized === undefined || serialized.length <= MAX_INBOX_RECEIPT_RESULT_BYTES) {
+      return full;
+    }
+  } catch {
+    // Unserializable results cannot be persisted faithfully either way.
+  }
+  const source = (full ?? {}) as { finishReason?: unknown; text?: unknown; usage?: unknown };
+  return {
+    truncated: true,
+    ...(source.finishReason === undefined ? {} : { finishReason: source.finishReason }),
+    ...(typeof source.text === 'string' ? { text: source.text.slice(0, 8_000) } : {}),
+    ...(source.usage === undefined ? {} : { usage: source.usage }),
+  };
+}
+
+function pruneInboxResponseReceipts(
+  receipts: Record<string, InboxResponseReceipt>,
+): Record<string, InboxResponseReceipt> {
+  const entries = Object.entries(receipts);
+  if (entries.length <= MAX_INBOX_RESPONSE_RECEIPTS) return receipts;
+  entries.sort((left, right) => (right[1].updatedAt ?? 0) - (left[1].updatedAt ?? 0));
+  return Object.fromEntries(entries.slice(0, MAX_INBOX_RESPONSE_RECEIPTS));
+}
+
 const ASK_USER_TOOL_NAME = ASK_USER_TOOL_ID;
 const SUBMIT_PLAN_TOOL_NAME = SUBMIT_PLAN_TOOL_ID;
 const MESSAGE_ADMISSION_DURABLE_WAIT_TIMEOUT_MS = 30_000;
@@ -12708,7 +12744,7 @@ export class Session {
           updatedAt: admissionAt,
         };
       }
-      next.inboxResponseReceipts = {
+      next.inboxResponseReceipts = pruneInboxResponseReceipts({
         ...(prev.inboxResponseReceipts ?? {}),
         [responseId]:
           retriedReceipt ??
@@ -12728,7 +12764,7 @@ export class Session {
             acceptedAt: admissionAt,
             updatedAt: admissionAt,
           } satisfies InboxResponseReceipt),
-      };
+      });
       return next;
     });
     // This event describes the durable policy transition committed by the CAS,
@@ -13137,16 +13173,16 @@ export class Session {
             const receipt =
               responseId !== undefined ? getOwnRecordValue(prev.inboxResponseReceipts, responseId) : undefined;
             if (receipt) {
-              next.inboxResponseReceipts = {
+              next.inboxResponseReceipts = pruneInboxResponseReceipts({
                 ...(prev.inboxResponseReceipts ?? {}),
                 [receipt.responseId]: {
                   ...receipt,
                   status: 'applied',
-                  result: full,
+                  result: boundInboxReceiptResult(full) as typeof full,
                   appliedAt: receipt.appliedAt ?? responseAppliedAt,
                   updatedAt: responseAppliedAt,
                 },
-              };
+              });
             }
             if (modeFlipTarget) {
               next.modeId = modeFlipTarget;
