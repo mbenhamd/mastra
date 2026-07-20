@@ -34,8 +34,8 @@ import type { ProcessInputStepArgs, Processor } from '../index';
 
 const SEARCH_SKILLS_TOOL_NAME = 'search_skills';
 const LOAD_SKILL_TOOL_NAME = 'load_skill';
-const SKILL_SEARCH_AUTO_LOAD_ACTIVATION_TYPE = 'skill-search-auto-load';
-const SKILL_SEARCH_AUTO_LOAD_ACTIVATION_VERSION = 1;
+const SKILL_SEARCH_AUTO_LOAD_ACTIVATION_TYPE = 'skill-search-auto-load' as const;
+const SKILL_SEARCH_AUTO_LOAD_ACTIVATION_VERSION = 1 as const;
 const CURRENT_RUN_LOADED_SKILLS_KEY = 'skillSearchLoadedSkills';
 const CURRENT_RUN_CONTEXT_INITIALIZED_KEY = 'skillSearchContextInitialized';
 const SHA256_DIGEST_PATTERN = /^sha256:[a-f0-9]{64}$/;

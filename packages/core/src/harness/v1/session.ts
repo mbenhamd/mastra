@@ -257,6 +257,7 @@ import type {
   ToolCategory,
   ActivityTimelineOptions,
   SessionActivityTimeline,
+  MessageAdmissionPhase,
 } from './types';
 
 type MessageAdmissionIdentity = {
