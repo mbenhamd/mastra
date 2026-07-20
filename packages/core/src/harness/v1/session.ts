@@ -410,6 +410,21 @@ function boundInboxReceiptResult(full: unknown): unknown {
   };
 }
 
+function queueReceiptRecency(receipt: QueueAdmissionReceipt): number {
+  return (
+    receipt.completedAt ?? receipt.failedAt ?? receipt.acceptedAt ?? receipt.admittingAt ?? receipt.enqueuedAt ?? 0
+  );
+}
+
+function pruneQueueAdmissionReceipts(
+  receipts: Record<string, QueueAdmissionReceipt>,
+): Record<string, QueueAdmissionReceipt> {
+  const entries = Object.entries(receipts);
+  if (entries.length <= MAX_INBOX_RESPONSE_RECEIPTS) return receipts;
+  entries.sort((left, right) => queueReceiptRecency(right[1]) - queueReceiptRecency(left[1]));
+  return Object.fromEntries(entries.slice(0, MAX_INBOX_RESPONSE_RECEIPTS));
+}
+
 function pruneInboxResponseReceipts(
   receipts: Record<string, InboxResponseReceipt>,
 ): Record<string, InboxResponseReceipt> {
@@ -13202,7 +13217,7 @@ export class Session {
                   [completingQueuedItemId]: {
                     ...receipt,
                     status: 'completed',
-                    result: full,
+                    result: boundInboxReceiptResult(full),
                     completedAt: receipt.completedAt ?? queueCompletedAt,
                     updatedAt: queueCompletedAt,
                   },
@@ -16150,6 +16165,15 @@ export class Session {
           tokenUsage: { ...tokenUsageForSave },
           lastActivityAt: Date.now(),
         };
+        // PF-2251 D2/D4 — receipts stay bounded on EVERY persisted record, at
+        // the single flush chokepoint, so no write path can regrow them past
+        // the storage document limit.
+        if (next.inboxResponseReceipts !== undefined) {
+          next.inboxResponseReceipts = pruneInboxResponseReceipts(next.inboxResponseReceipts);
+        }
+        if (next.queueAdmissionReceipts !== undefined) {
+          next.queueAdmissionReceipts = pruneQueueAdmissionReceipts(next.queueAdmissionReceipts);
+        }
         const saveOpts = {
           harnessName: this._record.harnessName,
           ownerId: this._ownerId,
