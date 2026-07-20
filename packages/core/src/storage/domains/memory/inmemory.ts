@@ -642,6 +642,10 @@ export class InMemoryMemory extends MemoryStorage {
 
   async deleteResource({ resourceId }: { resourceId: string }): Promise<void> {
     this.db.resources.delete(resourceId);
+    // Resource erasure must not orphan the resource-scoped observational
+    // memory record (thread-scoped records stay with their threads, which
+    // deleteResource deliberately preserves).
+    this.db.observationalMemory.delete(this.getObservationalMemoryKey(null, resourceId));
   }
 
   async cloneThread(args: StorageCloneThreadInput): Promise<StorageCloneThreadOutput> {

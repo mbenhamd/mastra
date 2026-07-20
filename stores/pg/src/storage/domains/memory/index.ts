@@ -1834,7 +1834,26 @@ export class MemoryPG extends MemoryStorage {
   async deleteResource({ resourceId }: { resourceId: string }): Promise<void> {
     try {
       const tableName = getTableName({ indexName: TABLE_RESOURCES, schemaName: getSchemaName(this.#schema) });
-      await this.#db.client.none(`DELETE FROM ${tableName} WHERE id = $1`, [resourceId]);
+      await this.#db.client.tx(async t => {
+        await t.none(`DELETE FROM ${tableName} WHERE id = $1`, [resourceId]);
+
+        // Resource erasure must not orphan the resource-scoped observational
+        // memory record. Thread-scoped rows stay with their threads (which
+        // deleteResource deliberately preserves) — only the threadId-less
+        // resource record goes.
+        const schemaName = this.#schema || 'public';
+        const omTableExists = await t.oneOrNone<{ tablename: string }>(
+          `SELECT tablename FROM pg_tables WHERE schemaname = $1 AND tablename = $2`,
+          [schemaName, OM_TABLE],
+        );
+        if (omTableExists !== null) {
+          const omTableName = getTableName({
+            indexName: OM_TABLE,
+            schemaName: getSchemaName(this.#schema),
+          });
+          await t.none(`DELETE FROM ${omTableName} WHERE "resourceId" = $1 AND "threadId" IS NULL`, [resourceId]);
+        }
+      });
     } catch (rawError) {
       const text = 'Failed to delete PostgreSQL memory resource';
       const failureCode = this.getSafeReadFailureCode(rawError);
