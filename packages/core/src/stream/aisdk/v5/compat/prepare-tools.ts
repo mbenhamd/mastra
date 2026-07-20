@@ -30,6 +30,8 @@ type PreparedToolChoice = LanguageModelV2ToolChoice | LanguageModelV3ToolChoice;
  * Zod v4's toJSONSchema serializes z.any() to just { description: "..." } with no 'type',
  * which providers like OpenAI reject. This converts such schemas to a permissive type union.
  */
+const convertedToolSchemaCache = new WeakMap<object, Record<string, unknown>>();
+
 function fixTypelessProperties(schema: Record<string, unknown>): Record<string, unknown> {
   if (typeof schema !== 'object' || schema === null) return schema;
 
@@ -163,10 +165,28 @@ export function prepareToolsAndToolChoice<TOOLS extends Record<string, Tool>>({
                 ) {
                   parameters = sdkTool.inputSchema;
                 } else if (isStandardSchemaWithJSON(sdkTool.inputSchema)) {
-                  parameters = standardSchemaToJSONSchema(sdkTool.inputSchema, {
-                    io: 'input',
-                    target: 'draft-07',
-                  });
+                  // PF-2250 latency: schema conversion walks the zod graph and
+                  // runs for every tool on every LLM call. Tool schemas are
+                  // static after registration, so memoize the conversion by
+                  // schema object identity and hand out a clone (downstream
+                  // normalization mutates the object per call).
+                  const cached = convertedToolSchemaCache.get(sdkTool.inputSchema as object);
+                  if (cached !== undefined) {
+                    parameters = structuredClone(cached);
+                  } else {
+                    parameters = standardSchemaToJSONSchema(sdkTool.inputSchema, {
+                      io: 'input',
+                      target: 'draft-07',
+                    });
+                    try {
+                      convertedToolSchemaCache.set(
+                        sdkTool.inputSchema as object,
+                        structuredClone(parameters) as Record<string, unknown>,
+                      );
+                    } catch {
+                      // Non-cloneable conversion output: skip caching.
+                    }
+                  }
                 } else {
                   // Fallback to AI SDK's asSchema for non-standard schemas
                   parameters = asSchema(sdkTool.inputSchema).jsonSchema;
