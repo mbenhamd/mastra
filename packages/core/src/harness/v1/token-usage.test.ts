@@ -1040,6 +1040,47 @@ describe('Session token usage — durability', () => {
     ).toBe(true);
   });
 
+  it('expires an oversized pending interaction instead of bricking the session (PF-2251 step 3)', async () => {
+    const { harness, agent, storage } = setupHarness();
+    const writes: SessionRecord[] = [];
+    const saveSession = storage.saveSession.bind(storage);
+    vi.spyOn(storage, 'saveSession').mockImplementation(async (record, opts) => {
+      writes.push(JSON.parse(JSON.stringify(record)) as SessionRecord);
+      return saveSession(record, opts);
+    });
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    try {
+      agent.enqueueRun({
+        runId: 'msg-oversized-suspend',
+        finishReason: 'suspended',
+        suspendPayload: {
+          toolCallId: 'tc-oversized',
+          toolName: 'shell',
+          // Larger than the whole-record budget: simulates provider reasoning
+          // blobs landing in the suspend snapshot.
+          args: { blob: 'x'.repeat(950_000) },
+        },
+      });
+      const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+      await session.message({ content: 'needs approval' });
+
+      const finalWrite = writes.at(-1)!;
+      expect(finalWrite.pendingResume).toBeUndefined();
+      const expired = Object.values(finalWrite.expiredPendingInteractions ?? {});
+      expect(expired).toHaveLength(1);
+      expect(expired[0]).toMatchObject({
+        toolCallId: 'tc-oversized',
+        error: { code: 'harness.pending.record_size_budget' },
+      });
+      // The surviving record must be persistable — well under the budget.
+      expect(JSON.stringify(finalWrite).length).toBeLessThan(200_000);
+      expect(consoleError.mock.calls.some(call => String(call[0]).includes('size budget'))).toBe(true);
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
   it('parks resumed suspension state in the same write as token usage', async () => {
     const { harness, agent, storage } = setupHarness();
     const writes: SessionRecord[] = [];

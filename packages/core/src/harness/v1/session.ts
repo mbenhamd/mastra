@@ -425,6 +425,25 @@ function pruneQueueAdmissionReceipts(
   return Object.fromEntries(entries.slice(0, MAX_INBOX_RESPONSE_RECEIPTS));
 }
 
+// Just under Convex's ~1MiB document limit, leaving headroom for envelope
+// fields the adapter adds around the record.
+const SESSION_RECORD_SIZE_BUDGET_BYTES = 900_000;
+
+function safeSerializedSize(value: unknown): number {
+  try {
+    return JSON.stringify(value)?.length ?? 0;
+  } catch {
+    return Number.MAX_SAFE_INTEGER;
+  }
+}
+
+function topRecordFieldSizes(record: SessionRecord): Array<[string, number]> {
+  return Object.entries(record as unknown as Record<string, unknown>)
+    .map(([key, value]) => [key, safeSerializedSize(value)] as [string, number])
+    .sort((left, right) => right[1] - left[1])
+    .slice(0, 5);
+}
+
 function pruneInboxResponseReceipts(
   receipts: Record<string, InboxResponseReceipt>,
 ): Record<string, InboxResponseReceipt> {
@@ -16173,6 +16192,55 @@ export class Session {
         }
         if (next.queueAdmissionReceipts !== undefined) {
           next.queueAdmissionReceipts = pruneQueueAdmissionReceipts(next.queueAdmissionReceipts);
+        }
+        // PF-2251 step 3 — session-survival guard. A record past the storage
+        // document budget bricks the session forever (every later save fails),
+        // so an oversized record is diagnosed loudly and, when a pending
+        // interaction's payload dominates (suspend snapshots can embed huge
+        // provider reasoning blobs), the pending is converted into an expired
+        // interaction: the user re-issues one confirmation instead of losing
+        // the whole session. Never silent — the log names the top fields.
+        {
+          const serializedSize = safeSerializedSize(next);
+          if (serializedSize > SESSION_RECORD_SIZE_BUDGET_BYTES) {
+            const fieldSizes = topRecordFieldSizes(next);
+            console.error(
+              '[harness/v1] session record exceeded the size budget; top fields:',
+              JSON.stringify({ sessionId: this.id, serializedSize, fieldSizes }),
+            );
+            const pending = next.pendingResume;
+            if (
+              pending !== undefined &&
+              pending.itemId !== undefined &&
+              pending.runId !== undefined &&
+              pending.toolCallId !== undefined &&
+              pending.requestedAt !== undefined &&
+              safeSerializedSize(pending) > serializedSize / 4
+            ) {
+              next.expiredPendingInteractions = appendExpiredPendingInteraction(next.expiredPendingInteractions, {
+                generationKey: pendingInteractionGenerationKey({
+                  kind: pending.kind,
+                  itemId: pending.itemId,
+                  runId: pending.runId,
+                  toolCallId: pending.toolCallId,
+                  requestedAt: pending.requestedAt,
+                }),
+                itemId: pending.itemId,
+                kind: pending.kind,
+                runId: pending.runId,
+                toolCallId: pending.toolCallId,
+                requestedAt: pending.requestedAt,
+                expiresAt: pending.expiresAt ?? pending.requestedAt,
+                expiredAt: Date.now(),
+                error: {
+                  code: 'harness.pending.record_size_budget',
+                  message:
+                    'Pending interaction was expired because its durable payload exceeded the session record size budget.',
+                },
+              });
+              delete next.pendingResume;
+            }
+          }
         }
         const saveOpts = {
           harnessName: this._record.harnessName,
