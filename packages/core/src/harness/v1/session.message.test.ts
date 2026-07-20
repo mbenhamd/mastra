@@ -872,24 +872,21 @@ describe('Session.message() — default path', () => {
     expect(storage.writes).not.toContain('failed');
   });
 
-  it('fails stream admission startup when post-dispatch pending evidence cannot be persisted', async () => {
-    class PostDispatchPendingEvidenceFailingStorage extends InMemoryHarness {
+  it('writes streamed admission pending evidence exactly once (pre-dispatch reservation)', async () => {
+    class PendingWriteCountingStorage extends InMemoryHarness {
       readonly writes: any[] = [];
-      pendingAttempts = 0;
+      pendingWrites = 0;
 
       override async writeMessageResultEvidence(record: any): Promise<{ created: boolean; applied: boolean }> {
         this.writes.push(record);
-        if (record.admissionId === 'stream-pending-failure' && record.status === 'pending') {
-          this.pendingAttempts++;
-          if (this.pendingAttempts === 2) {
-            throw new Error('post-dispatch pending evidence unavailable');
-          }
+        if (record.admissionId === 'stream-pending-once' && record.status === 'pending') {
+          this.pendingWrites++;
         }
         return super.writeMessageResultEvidence(record);
       }
     }
     const agent = new LiveStreamFakeAgent('default');
-    const storage = new PostDispatchPendingEvidenceFailingStorage({ db: new InMemoryDB() });
+    const storage = new PendingWriteCountingStorage({ db: new InMemoryDB() });
     const harness = new Harness({
       agents: { default: agent } as any,
       modes: [{ id: 'default', agentId: 'default' }],
@@ -899,72 +896,20 @@ describe('Session.message() — default path', () => {
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
 
     try {
-      // §13.3f.1: `message({ stream: true })` is a public §4.2b boundary. The
-      // post-dispatch pending-evidence write fails with a RAW storage error;
-      // the in-process rejection is REDACTED to the generic `harness.internal`
-      // shape with the raw original preserved local-only on `.cause`. (The
-      // durable `failed` evidence below still records the projected error.)
-      const streamThrown = await session
-        .message({ content: 'go', admissionId: 'stream-pending-failure', stream: true })
-        .then(
-          () => undefined,
-          (e: unknown) => e,
-        );
-      expect((streamThrown as Error).name).toBe('HarnessExecutionError');
-      expect((streamThrown as Error).message).toBe('An internal harness error occurred');
-      expect(((streamThrown as { cause?: Error }).cause as Error).message).toBe(
-        'post-dispatch pending evidence unavailable',
-      );
-
-      expect(agent.calls[0]!.options.abortSignal.aborted).toBe(true);
-      await nextTick();
-      const failedWrite = storage.writes.find(record => record.status === 'failed');
-      expect(failedWrite).toBeDefined();
-      expect(failedWrite).toMatchObject({
-        admissionId: 'stream-pending-failure',
-        status: 'failed',
-      });
-      await expect(
-        storage.loadMessageResultEvidence({
-          harnessName: (session as any)._record.harnessName,
-          sessionId: session.id,
-          resourceId: session.resourceId,
-          threadId: session.threadId,
-          signalId: failedWrite.signalId,
-        }),
-      ).resolves.toMatchObject({
-        admissionId: 'stream-pending-failure',
-        status: 'failed',
-      });
-
-      agent.releaseStream?.();
-      await nextTick();
-      await nextTick();
-
-      expect(failedWrite).toBeDefined();
-      await expect(
-        storage.loadMessageResultEvidence({
-          harnessName: (session as any)._record.harnessName,
-          sessionId: session.id,
-          resourceId: session.resourceId,
-          threadId: session.threadId,
-          signalId: failedWrite.signalId,
-        }),
-      ).resolves.toMatchObject({
-        admissionId: 'stream-pending-failure',
-        status: 'failed',
-      });
-      await expect(
-        session.message({ content: 'go', admissionId: 'stream-pending-failure', stream: true }),
-      ).rejects.toMatchObject({
-        name: 'HarnessValidationError',
-        message: expect.stringContaining('duplicate stream is no longer live'),
-      });
-      expect(agent.calls).toHaveLength(1);
+      const out = await session.message({ content: 'go', admissionId: 'stream-pending-once', stream: true });
+      expect(out).toBeDefined();
+      // PF-2250 §1 — the pre-dispatch reservation is the single durable
+      // admission barrier. A post-dispatch 'pending' refresh would be a
+      // byte-identical row (admission-derived signalId/runId) whose write used
+      // to be awaited on the first-token path; it must never come back.
+      expect(storage.pendingWrites).toBe(1);
     } finally {
       agent.releaseStream?.();
       await nextTick();
+      await nextTick();
     }
+    const completedWrite = storage.writes.find(record => record.status === 'completed');
+    expect(completedWrite).toMatchObject({ admissionId: 'stream-pending-once', status: 'completed' });
   });
 
   it('does not wait for failed evidence persistence before rejecting stream admission startup', async () => {
@@ -982,15 +927,7 @@ describe('Session.message() — default path', () => {
       releaseFailedWrite = resolve;
     });
     class StallingFailedEvidenceStorage extends InMemoryHarness {
-      pendingAttempts = 0;
-
       override async writeMessageResultEvidence(record: any): Promise<{ created: boolean; applied: boolean }> {
-        if (record.admissionId === 'stream-pending-stalled-failure' && record.status === 'pending') {
-          this.pendingAttempts++;
-          if (this.pendingAttempts === 2) {
-            throw new Error('post-dispatch pending evidence unavailable');
-          }
-        }
         if (record.admissionId === 'stream-pending-stalled-failure' && record.status === 'failed') {
           failedSignalId = record.signalId;
           resolveFailedWriteStarted();
@@ -1002,7 +939,17 @@ describe('Session.message() — default path', () => {
         return super.writeMessageResultEvidence(record);
       }
     }
-    const agent = new LiveStreamFakeAgent('default');
+    // PF-2250 §1 removed the post-dispatch pending refresh, so the reachable
+    // post-dispatch failure is the dispatched run's output settling with an
+    // error. The invariant under test is unchanged: the caller rejection must
+    // not wait for the background 'failed' evidence write.
+    class RejectingStreamFakeAgent extends FakeAgent {
+      override async stream(messages: any, options?: any): Promise<any> {
+        this.calls.push({ type: 'stream', messages, options });
+        throw new Error('post-dispatch output unavailable');
+      }
+    }
+    const agent = new RejectingStreamFakeAgent('default');
     const storage = new StallingFailedEvidenceStorage({ db: new InMemoryDB() });
     const harness = new Harness({
       agents: { default: agent } as any,
@@ -1034,11 +981,13 @@ describe('Session.message() — default path', () => {
         // evidence write finishes, which the redaction does not change.
         expect((outcome!.err as Error).name).toBe('HarnessExecutionError');
         expect((outcome!.err as Error).message).toBe('An internal harness error occurred');
-        expect(((outcome!.err as { cause?: Error }).cause as Error).message).toBe(
-          'post-dispatch pending evidence unavailable',
-        );
+        expect(((outcome!.err as { cause?: Error }).cause as Error).message).toBe('post-dispatch output unavailable');
       }
-      expect(agent.calls[0]!.options.abortSignal.aborted).toBe(true);
+      // The dispatched run's output settled with an error before any live
+      // stream existed, so there is nothing to abort — the turn must simply be
+      // finished from the caller's perspective while the failed-evidence write
+      // is still stalled below.
+      expect(session.isRunning()).toBe(false);
 
       await expect(
         session.message({ content: 'go', admissionId: 'stream-pending-stalled-failure', stream: true }),

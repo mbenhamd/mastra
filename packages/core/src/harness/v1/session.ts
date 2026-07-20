@@ -329,6 +329,15 @@ type MessageAdmissionStart = {
   modeId: string;
   modelId: string;
   promise: Promise<AgentSignalResultEvidence | OperationAdmissionTombstone>;
+  /**
+   * Set when the reservation write resolved this start as a duplicate of
+   * existing durable evidence (PF-2250 §1: the duplicate fast-path read no
+   * longer blocks admission, so a duplicate briefly registers a start entry
+   * before the reservation discovers the existing row). Readers polling the
+   * start map must treat such an entry as a duplicate admission, not a fresh
+   * dispatch.
+   */
+  duplicate?: boolean;
 };
 
 type MessageAdmissionHashes = {
@@ -7173,19 +7182,23 @@ export class Session {
         : undefined;
     const admissionHash = admissionHashes?.primary;
     const compatibleAdmissionHashes = admissionHashes?.legacyCompatible;
-    const duplicate =
+    // PF-2250 §1 — the duplicate fast-path read runs CONCURRENTLY with the
+    // admission interior: the reservation write below detects duplicates and
+    // tombstones transactionally (created:false ⇒ resolve-or-conflict), so the
+    // warm path never blocks on this read. Its result is awaited only where it
+    // changes behavior the reservation cannot express: an idempotent retry
+    // arriving in the §4.4c active-delivery window must return the duplicate
+    // instead of the active-delivery rejection.
+    const duplicateProbe =
       opts.admissionId !== undefined
-        ? await this._resolveMessageAdmissionDuplicate({
+        ? this._resolveMessageAdmissionDuplicate({
             admissionId: opts.admissionId,
             admissionHash: admissionHash!,
             compatibleAdmissionHashes,
           })
         : undefined;
+    if (duplicateProbe !== undefined) void duplicateProbe.catch(() => {});
     reportAdmissionPhase('admission_duplicate_resolved');
-    if (duplicate) {
-      this._assertOpenForTurn('message()');
-      return this._returnDuplicateMessageResult(duplicate, opts);
-    }
     const admissionIdentity =
       opts.admissionId !== undefined ? this._messageAdmissionIdentity(opts.admissionId) : undefined;
 
@@ -7392,6 +7405,19 @@ export class Session {
     // delivered to the interleaved run, matching how `abortSignal` behaves on active-delivery —
     // we deliberately do not reject post-reservation, because that would poison the retry.
     if (callerRequestContext !== undefined && sub.activeRunId() !== null) {
+      // The probe (in flight since admission entry) preserves the idempotent
+      // retry: a duplicate of an actively-delivering admission attaches to the
+      // running turn instead of surfacing the active-delivery rejection.
+      const duplicate = duplicateProbe !== undefined ? await duplicateProbe.catch(() => undefined) : undefined;
+      if (duplicate) {
+        if (opts.admissionId !== undefined) this._messageAdmissionStarts.delete(opts.admissionId);
+        admissionStart?.resolve(duplicate);
+        try {
+          return await this._returnDuplicateMessageResult(duplicate, opts);
+        } finally {
+          finishOwnedMessageTurn();
+        }
+      }
       const err = new HarnessConfigError(
         'message().requestContext',
         'cannot be supplied while a run is active on this thread — it would interleave into the running execution and could not reach its tools',
@@ -7419,6 +7445,8 @@ export class Session {
           activeTurnWaiter.promise,
         ]);
         if (!reservation.created) {
+          const registeredStart = this._messageAdmissionStarts.get(opts.admissionId!);
+          if (registeredStart !== undefined) registeredStart.duplicate = true;
           this._messageAdmissionStarts.delete(opts.admissionId!);
           const existing =
             reservation.evidence ??
@@ -7543,23 +7571,11 @@ export class Session {
     };
 
     reportAdmissionPhase('agent_dispatched');
-    const pendingEvidenceWrite =
-      admissionIdentity !== undefined
-        ? this._writeMessageResultEvidence(
-            {
-              status: 'pending',
-              signalId: signal.signal.id,
-              runId: signal.runId,
-              modeId: effectiveModeId,
-              modelId: effectiveModelId,
-              operationKind: 'message',
-              ...(opts.admissionId !== undefined ? { admissionId: opts.admissionId } : {}),
-              ...(admissionHash !== undefined ? { admissionHash } : {}),
-            },
-            { compatibleAdmissionHashes },
-          )
-        : Promise.resolve();
-    void pendingEvidenceWrite.catch(() => {});
+    // PF-2250 §1 — no post-dispatch 'pending' refresh: the pre-dispatch
+    // reservation already wrote this exact row (signalId/runId are
+    // admission-derived and handed to sendSignal unchanged), so the refresh was
+    // a byte-identical durable write awaited on the first-token path. The
+    // reservation is the durable admission barrier.
 
     const failDispatchedMessageTurn = async (err: unknown) => {
       turnAbortController.abort(err);
@@ -7591,7 +7607,6 @@ export class Session {
     };
 
     const awaitPendingMessageEvidence = async () => {
-      await Promise.race([pendingEvidenceWrite, activeTurnWaiter.promise]);
       resolveMessageAdmissionStart();
     };
 
@@ -7769,10 +7784,8 @@ export class Session {
     let completedEvidenceWriteFailed = false;
     let agentEndEmitted = false;
     try {
-      // The pre-dispatch reservation is the durable admission barrier here.
-      // Keep the post-dispatch pending refresh best-effort so completion
-      // evidence remains the authoritative default-path result.
-      await Promise.race([pendingEvidenceWrite.catch(() => {}), activeTurnWaiter.promise]);
+      // The pre-dispatch reservation is the durable admission barrier here;
+      // completion evidence remains the authoritative default-path result.
       resolveMessageAdmissionStart();
       if (signal.output) {
         await Promise.race([signal.output, activeTurnWaiter.promise]);
@@ -7971,7 +7984,7 @@ export class Session {
       accepted: true,
       signalId,
       ...(evidence.runId !== undefined ? { runId: evidence.runId } : {}),
-      duplicate: admissionStart.started === undefined,
+      duplicate: admissionStart.started === undefined || admissionStart.started.duplicate === true,
     };
   }
 
