@@ -51,6 +51,10 @@ function buildWorkingMemoryInstructions(details: Awaited<ReturnType<typeof getWo
   return [
     'Update working memory with durable facts from the observations you made.',
     'Return the full updated Markdown working memory. Preserve useful existing content and add or revise only what changed.',
+    // Emission must be unconditional: optional sections get skipped often
+    // enough by real observer models that durable facts are silently lost.
+    // Re-emitting an unchanged document is an idempotent write.
+    'You MUST always include this section in your output. If nothing durable changed, return the current working memory verbatim.',
     details.template ? `Working memory template:\n${details.template}` : undefined,
     details.current ? `Current working memory:\n${details.current}` : undefined,
   ]

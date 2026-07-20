@@ -390,6 +390,7 @@ export class ObserverRunner {
     >,
     observabilityContext?: ObservabilityContext,
     model?: ConcreteObservationModel,
+    resourceId?: string,
   ): Promise<{
     results: Map<
       string,
@@ -418,7 +419,11 @@ export class ObserverRunner {
       {
         source: 'observer',
         threadId: threadOrder[0],
-        resourceId: firstThreadMessages[0]?.resourceId,
+        // The observe-level resource identity wins: resource-scoped batches
+        // may carry messages without per-row resourceId (standalone observe),
+        // and dropping it silently excluded resource-scoped extractors such as
+        // working-memory from the observer prompt.
+        resourceId: resourceId ?? firstThreadMessages[0]?.resourceId,
         memory: this.memory,
         requestContext,
       },
