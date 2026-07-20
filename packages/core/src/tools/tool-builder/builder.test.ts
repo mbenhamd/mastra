@@ -941,3 +941,78 @@ describe('CoreToolBuilder requestContext merge', () => {
     expect(receivedCtx.requestContext!.get('harness')).toEqual({ harnessId: 'h-1' });
   });
 });
+
+describe('resume input normalization', () => {
+  const buildStrictReparseTool = (received: unknown[]) => {
+    const inputSchema = z.object({
+      name: z.string(),
+      projectId: z.string().optional(),
+    });
+    const originalTool = createTool({
+      id: 'strict-reparse',
+      description: 'Re-parses its input with the original zod schema, like product workspace suspension tools.',
+      inputSchema,
+      execute: async input => {
+        received.push(input);
+        // The tool-side re-parse that threw on resumed legs before the fix:
+        // OpenAI strict compat materializes .optional() fields as null, and the
+        // resumed leg used to skip the builder's null-stripping normalization.
+        const params = inputSchema.parse(input);
+        return { ok: true, params };
+      },
+    });
+    return new CoreToolBuilder({
+      originalTool,
+      options: { name: 'strict-reparse', logger: noopLogger },
+    }).build();
+  };
+
+  it('normalizes provider null-for-optional on the initial leg', async () => {
+    const received: unknown[] = [];
+    const builtTool = buildStrictReparseTool(received);
+    const result = await builtTool.execute!({ name: 'demo', projectId: null }, {
+      toolCallId: 'call-initial',
+      messages: [],
+    } as any);
+    expect(result).toMatchObject({ ok: true, params: { name: 'demo' } });
+  });
+
+  it('normalizes provider null-for-optional on the resumed leg too', async () => {
+    const received: unknown[] = [];
+    const builtTool = buildStrictReparseTool(received);
+    const result = await builtTool.execute!({ name: 'demo', projectId: null }, {
+      toolCallId: 'call-resumed',
+      messages: [],
+      resumeData: { approved: true },
+    } as any);
+    expect(result).toMatchObject({ ok: true, params: { name: 'demo' } });
+    expect(received[0]).not.toHaveProperty('projectId');
+  });
+
+  it('keeps raw args on resumed legs whose replayed args fail validation', async () => {
+    const received: unknown[] = [];
+    const inputSchema = z.object({ task: z.string() }).strict();
+    const originalTool = createTool({
+      id: 'delegated-resume',
+      description: 'Delegated resumes replay control fields the schema does not know.',
+      inputSchema,
+      execute: async input => {
+        received.push(input);
+        return { ok: true };
+      },
+    });
+    const builtTool = new CoreToolBuilder({
+      originalTool,
+      options: { name: 'delegated-resume', logger: noopLogger },
+    }).build();
+    const result = await builtTool.execute!({ task: 'continue', suspendedToolRunId: 'run-1' }, {
+      toolCallId: 'call-delegated',
+      messages: [],
+      resumeData: { answer: 'yes' },
+    } as any);
+    expect(result).toMatchObject({ ok: true });
+    // Validation fails on the unknown control field, so the raw replayed args
+    // must reach the tool unchanged (pre-fix behavior preserved).
+    expect(received[0]).toMatchObject({ task: 'continue', suspendedToolRunId: 'run-1' });
+  });
+});

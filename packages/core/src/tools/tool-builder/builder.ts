@@ -876,10 +876,10 @@ export class CoreToolBuilder extends MastraBase {
       try {
         logger.debug(start, { ...logData, ...rest, model: logModelObject, args });
 
-        // When a tool is being resumed (resumeData present in execOptions), skip input
-        // validation. The original args were already validated during the initial
-        // execution, and during resume the tool's execute function checks resumeData
-        // and returns early without using the input args.
+        // When a tool is being resumed (resumeData present in execOptions), validation
+        // must not FAIL the call: the original args were already validated during the
+        // initial execution, and delegated agent/workflow resumes replay args carrying
+        // control fields (e.g. suspendedToolRunId) the schema does not know.
         const isResuming = !!execOptions?.resumeData;
 
         // Validate input parameters if schema exists
@@ -897,6 +897,17 @@ export class CoreToolBuilder extends MastraBase {
           }
           // Use validated/transformed data
           args = data;
+        } else {
+          // Best-effort normalization on resume: replayed args keep the provider's
+          // raw shape (OpenAI strict compat materializes .optional() fields as null),
+          // so a tool whose execute re-parses its input with the original zod schema
+          // would throw on the resumed leg even though the initial leg passed. Reuse
+          // the same normalization pipeline; on validation error keep the raw args so
+          // delegated resumes with extra control fields behave exactly as before.
+          const { data, error } = validateToolInput(parameters, args, options.name);
+          if (error === undefined) {
+            args = data;
+          }
         }
 
         // there is a small delay in stream output so we add an immediate to ensure the stream is ready
