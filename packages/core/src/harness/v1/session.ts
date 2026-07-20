@@ -7142,6 +7142,18 @@ export class Session {
     }
     const persistedRequestContext = callerRequestContextToPersisted(callerRequestContext);
 
+    // Observability-only pre-stream phase marks (PF-2246). Callers use these
+    // to decompose admission latency; failures never affect turn semantics.
+    const messageAdmissionStartedAtMs = Date.now();
+    const reportAdmissionPhase = (phase: MessageAdmissionPhase) => {
+      if (opts.onPhase === undefined) return;
+      try {
+        opts.onPhase(phase, Date.now() - messageAdmissionStartedAtMs);
+      } catch {
+        // Swallow: the callback is observability-only.
+      }
+    };
+
     // Resolve the effective mode (per-call override wins, else session's).
     const effectiveModeId = opts.mode ?? this._record.modeId;
     const effectiveModelId = opts.model ?? this._record.modelId;
@@ -7168,6 +7180,7 @@ export class Session {
             compatibleAdmissionHashes,
           })
         : undefined;
+    reportAdmissionPhase('admission_duplicate_resolved');
     if (duplicate) {
       this._assertOpenForTurn('message()');
       return this._returnDuplicateMessageResult(duplicate, opts);
@@ -7177,6 +7190,7 @@ export class Session {
 
     // Per-turn additionalTools merge with the mode's surface, never replace.
     const toolSurface = this._buildToolSurface(mode, opts.additionalTools);
+    reportAdmissionPhase('tool_surface_built');
 
     const admissionStart =
       opts.admissionId !== undefined
@@ -7261,6 +7275,7 @@ export class Session {
       // persistence). Redact before rejecting the caller's promise.
       throw redactPublicBoundaryRejection(err);
     }
+    reportAdmissionPhase('request_context_ready');
     assertOwnedMessageTurnNotDeleted();
 
     const baseExecOptions: AgentExecutionOptionsBase<unknown> = {
@@ -7432,6 +7447,7 @@ export class Session {
       }
       assertOwnedMessageTurnNotDeleted();
     }
+    reportAdmissionPhase('evidence_reserved');
 
     let signal;
     try {
@@ -7525,6 +7541,7 @@ export class Session {
       admissionStart.reject(err);
     };
 
+    reportAdmissionPhase('agent_dispatched');
     const pendingEvidenceWrite =
       admissionIdentity !== undefined
         ? this._writeMessageResultEvidence(
@@ -7653,6 +7670,7 @@ export class Session {
         // with a raw storage error. Redact before rejecting the caller.
         throw redactPublicBoundaryRejection(err);
       }
+      reportAdmissionPhase('output_registered');
       let streamCompletedEvidenceWriteFailed = false;
       let streamAgentEndEmitted = false;
       const streamBookkeeping = Promise.race([completion, activeTurnWaiter.promise])

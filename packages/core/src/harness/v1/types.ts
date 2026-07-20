@@ -1860,6 +1860,21 @@ export interface MessageOverrides {
 /**
  * Common fields shared by every `message()` call.
  */
+/**
+ * Ordered internal phases of `session.message()` admission, reported through
+ * `MessageOptionsBase.onPhase`. Each fires once, immediately after its step
+ * settles, so callers can attribute pre-stream latency to duplicate fencing,
+ * context/instruction resolution, durable evidence writes, and agent dispatch
+ * without wrapping or re-implementing the harness pipeline.
+ */
+export type MessageAdmissionPhase =
+  | 'admission_duplicate_resolved'
+  | 'tool_surface_built'
+  | 'request_context_ready'
+  | 'evidence_reserved'
+  | 'agent_dispatched'
+  | 'output_registered';
+
 interface MessageOptionsBase extends MessageOverrides {
   /** Free-form user content. The only required field. */
   content: string;
@@ -1876,6 +1891,13 @@ interface MessageOptionsBase extends MessageOverrides {
    * harness's own abort plumbing.
    */
   abortSignal?: AbortSignal;
+
+  /**
+   * Observability-only phase callback for the pre-stream admission pipeline.
+   * Failures inside the callback are swallowed; it must never affect turn
+   * semantics.
+   */
+  onPhase?: (phase: MessageAdmissionPhase, elapsedMs: number) => void;
 }
 
 /** Default shape: returns a fully-resolved `AgentResult`. */

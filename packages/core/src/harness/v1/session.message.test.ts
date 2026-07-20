@@ -1560,3 +1560,66 @@ describe('Session.message() — closed sessions reject', () => {
     await expect(session.message({ content: 'hi' })).rejects.toThrow(/closed/);
   });
 });
+
+describe('session.message admission phase marks (PF-2246)', () => {
+  it('reports the ordered pre-stream phases exactly once on a streamed admission turn', async () => {
+    const agent = new LiveStreamFakeAgent('default');
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const harness = new Harness({
+      agents: { default: agent } as any,
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      sessions: { storage },
+    });
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const phases: Array<{ elapsedMs: number; phase: string }> = [];
+
+    const stream = await session.message({
+      content: 'hi',
+      admissionId: 'admission-phase-marks',
+      stream: true,
+      onPhase: (phase, elapsedMs) => phases.push({ elapsedMs, phase }),
+    });
+    expect(stream).toBeDefined();
+
+    expect(phases.map(entry => entry.phase)).toEqual([
+      'admission_duplicate_resolved',
+      'tool_surface_built',
+      'request_context_ready',
+      'evidence_reserved',
+      'agent_dispatched',
+      'output_registered',
+    ]);
+    for (const entry of phases) {
+      expect(entry.elapsedMs).toBeGreaterThanOrEqual(0);
+    }
+
+    agent.releaseStream?.();
+    await session.waitForIdle({ timeoutMs: 1_000 });
+  });
+
+  it('never lets a throwing onPhase callback affect the turn', async () => {
+    const agent = new LiveStreamFakeAgent('default');
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const harness = new Harness({
+      agents: { default: agent } as any,
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      sessions: { storage },
+    });
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    const stream = await session.message({
+      content: 'hi',
+      admissionId: 'admission-phase-throws',
+      stream: true,
+      onPhase: () => {
+        throw new Error('observability must never break the turn');
+      },
+    });
+    expect(stream).toBeDefined();
+
+    agent.releaseStream?.();
+    await session.waitForIdle({ timeoutMs: 1_000 });
+  });
+});
