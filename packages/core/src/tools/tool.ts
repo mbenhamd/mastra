@@ -375,19 +375,24 @@ export class Tool<
     if (opts.execute) {
       const originalExecute = opts.execute;
       this.execute = async (inputData: TSchemaIn, context?: any) => {
-        // When a tool is being resumed (resumeData present in context), skip input
-        // validation. The original args were already validated during the initial
-        // execution, and during resume the tool's execute function checks resumeData
-        // and returns early without using the input args.
+        // When a tool is being resumed (resumeData present in context), validation
+        // must not FAIL the call: the original args were already validated during
+        // the initial execution, and delegated resumes replay control fields the
+        // schema does not know. Normalization must still run — replayed args keep
+        // the provider's raw shape (OpenAI strict compat materializes .optional()
+        // fields as null), and tools that re-parse their input with the original
+        // zod schema would throw on the resumed leg even though the initial leg
+        // passed (see the identical branch in tool-builder/builder.ts).
         const isResuming = !!(context?.resumeData || context?.agent?.resumeData);
 
         let data: any = inputData;
-        if (!isResuming) {
-          // Validate input if schema exists
-          const validationResult = validateToolInput(this.inputSchema, inputData, this.id);
-          if (validationResult.error) {
+        // Validate input if schema exists
+        const validationResult = validateToolInput(this.inputSchema, inputData, this.id);
+        if (validationResult.error) {
+          if (!isResuming) {
             return validationResult.error;
           }
+        } else {
           data = validationResult.data;
         }
 
