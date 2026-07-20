@@ -412,6 +412,84 @@ describe('Extractor', () => {
     expect(buildThreadMetadataFromExtractedValues([resolved!], result.values)).toEqual({});
   });
 
+  it('resolves the configured zod working-memory schema and prunes factless keys before persisting', async () => {
+    const configuredSchema = z.object({
+      name: z.string().nullable(),
+      likes: z.array(z.string()),
+    });
+    const memory = {
+      getMergedThreadConfig: vi.fn(() => ({ workingMemory: { enabled: true, schema: configuredSchema } })),
+      getWorkingMemoryTemplate: vi.fn(async () => ({ format: 'json', content: '{"type":"object"}' })),
+      getWorkingMemory: vi.fn(async () => null),
+      updateWorkingMemory: vi.fn(async () => undefined),
+    } as any;
+    const extractor = new WorkingMemoryExtractor();
+    const [resolved] = await resolveExtractors([extractor], {
+      source: 'observer',
+      threadId: 'thread-1',
+      resourceId: 'resource-1',
+      memory,
+    });
+
+    // The structured-output schema must be the CONFIGURED schema (declared
+    // properties drive provider constrained decoding), nullable for the
+    // no-update sentinel — not a generic properties-less record.
+    expect(resolved?.mode).toBe('structured');
+    expect(resolved?.schema.parse(null)).toBeNull();
+    expect(resolved?.schema.parse({ name: 'Tyler', likes: [] })).toEqual({ name: 'Tyler', likes: [] });
+    expect(resolved?.schema.safeParse({ name: 42 }).success).toBe(false);
+
+    const result = await applyExtractorHooks({
+      source: 'observer',
+      extractors: [resolved!],
+      values: { 'working-memory': { name: 'Tyler', likes: [] } },
+      threadId: 'thread-1',
+      resourceId: 'resource-1',
+      memory,
+    });
+
+    // Required-but-nullable fields decode on every call; only keys carrying
+    // facts may reach storage.
+    expect(memory.updateWorkingMemory).toHaveBeenCalledWith({
+      threadId: 'thread-1',
+      resourceId: 'resource-1',
+      workingMemory: JSON.stringify({ name: 'Tyler' }),
+      memoryConfig: undefined,
+    });
+    expect(result.values).toEqual({ 'working-memory': { name: 'Tyler', likes: [] } });
+  });
+
+  it('never overwrites stored working memory with a factless document', async () => {
+    const configuredSchema = z.object({
+      name: z.string().nullable(),
+      likes: z.array(z.string()),
+    });
+    const memory = {
+      getMergedThreadConfig: vi.fn(() => ({ workingMemory: { enabled: true, schema: configuredSchema } })),
+      getWorkingMemoryTemplate: vi.fn(async () => ({ format: 'json', content: '{"type":"object"}' })),
+      getWorkingMemory: vi.fn(async () => '{"name":"Tyler"}'),
+      updateWorkingMemory: vi.fn(async () => undefined),
+    } as any;
+    const extractor = new WorkingMemoryExtractor();
+    const [resolved] = await resolveExtractors([extractor], {
+      source: 'observer',
+      threadId: 'thread-1',
+      resourceId: 'resource-1',
+      memory,
+    });
+
+    await applyExtractorHooks({
+      source: 'observer',
+      extractors: [resolved!],
+      values: { 'working-memory': { name: null, likes: [] } },
+      threadId: 'thread-1',
+      resourceId: 'resource-1',
+      memory,
+    });
+
+    expect(memory.updateWorkingMemory).not.toHaveBeenCalled();
+  });
+
   it('skips JSON working memory updates when the extractor returns null', async () => {
     const memory = {
       getMergedThreadConfig: vi.fn(() => ({ workingMemory: { enabled: true, schema: {} } })),

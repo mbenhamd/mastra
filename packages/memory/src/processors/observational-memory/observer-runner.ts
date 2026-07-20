@@ -454,6 +454,10 @@ export class ObserverRunner {
           priorThreadTitle: priorMetadataByThread?.get(threadId)?.threadTitle,
           priorExtractedValues: priorMetadataByThread?.get(threadId)?.extracted,
           model: resolvedModel.model,
+          // The delegated single-thread call resolves extractors from its own
+          // context, so the observe-level resource identity must ride along or
+          // resource-scoped extractors (working-memory) silently drop again.
+          resourceId: resourceId ?? messagesByThread.get(threadId)?.[0]?.resourceId,
         });
         results.set(threadId, {
           observations: threadResult.observations,

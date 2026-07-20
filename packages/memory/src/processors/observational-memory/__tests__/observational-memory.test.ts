@@ -6281,6 +6281,77 @@ describe('Resource Scope Observation Flow', () => {
     expect(threadTwoPrompt).not.toContain('thread-1-secret');
   });
 
+  it('threads the observe-level resourceId into delegated structured extraction', async () => {
+    const resolvedResourceIds: Array<string | undefined> = [];
+    const model = new MockLanguageModelV2({
+      doStream: async () => ({
+        stream: convertArrayToReadableStream([
+          { type: 'stream-start', warnings: [] },
+          { type: 'response-metadata', id: 'obs-1', modelId: 'mock-observer', timestamp: new Date() },
+          { type: 'text-start', id: 'text-1' },
+          { type: 'text-delta', id: 'text-1', delta: '<observations>\n- user said alpha\n</observations>' },
+          { type: 'text-end', id: 'text-1' },
+          { type: 'finish', finishReason: 'stop', usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 } },
+        ]),
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        warnings: [],
+      }),
+      doGenerate: async () => ({
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        finishReason: 'stop',
+        usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+        content: [{ type: 'text', text: JSON.stringify({ 'resource-notes': 'alpha' }) }],
+        warnings: [],
+      }),
+    });
+    const observer = new ObserverRunner({
+      observationConfig: {
+        model,
+        messageTokens: 1000,
+        bufferTokens: false,
+        previousObserverTokens: 1000,
+        observeAttachments: 'auto',
+        extractors: [
+          new Extractor({
+            name: 'Resource Notes',
+            // Mimics resource-scoped working memory: resolution reads
+            // resource state and fails without a resource identity.
+            instructions: context => {
+              resolvedResourceIds.push(context.resourceId);
+              if (!context.resourceId) throw new Error('resource-scoped extractor requires resourceId');
+              return 'Extract notes.';
+            },
+            schema: () => z.string(),
+          }),
+        ],
+      } as any,
+      observedMessageIds: new Set(),
+      resolveModel: () => ({ model: model as any }),
+      tokenCounter: { countMessages: () => 1 } as any,
+    });
+
+    // Structured extractors route multi-thread observation through per-thread
+    // single calls; message rows deliberately carry no resourceId so only the
+    // observe-level identity can reach the delegated resolution.
+    const results = await observer.callMultiThread(
+      undefined,
+      new Map([['thread-1', [createTestMessage('Alpha for the record.', 'user', 't1-msg-1')]]]),
+      ['thread-1'],
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      'resource-99',
+    );
+
+    expect(resolvedResourceIds.length).toBeGreaterThan(0);
+    expect(resolvedResourceIds).not.toContain(undefined);
+    expect(resolvedResourceIds).toContain('resource-99');
+    expect(results.results.get('thread-1')?.extractedValues).toEqual({ 'resource-notes': 'alpha' });
+    expect(results.results.get('thread-1')?.extractionFailures ?? []).toHaveLength(0);
+  });
+
   it('should NOT use thread tags in thread scope mode', async () => {
     const storage = createInMemoryStorage();
 
