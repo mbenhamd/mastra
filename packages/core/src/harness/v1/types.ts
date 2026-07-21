@@ -35,6 +35,7 @@ import type {
   PersistedRequestContextInput,
   HarnessStorage,
   JsonValue,
+  PendingResume,
   PermissionRules,
   SessionRecord as StoredSessionRecord,
 } from '../../storage/domains/harness';
@@ -1171,6 +1172,20 @@ export interface HarnessConfigCommon {
      * so restarts do not reset it. Defaults to 600_000 ms (10 minutes).
      */
     pendingInteractionTtlMs?: number;
+
+    /**
+     * Per-kind overrides for {@link pendingInteractionTtlMs}. A kind present
+     * here uses its own deadline; every other kind keeps the single default.
+     * Useful when one gate deserves more patience than the rest — a
+     * destructive-action `tool-approval` confirmation is worth waiting longer
+     * on than a `sandbox-access` prompt the user can simply re-trigger.
+     *
+     * Each value has the same bounds as `pendingInteractionTtlMs` and is
+     * validated at construction. Only the kind that captured the pending row
+     * is consulted, and the resolved deadline is frozen onto that row, so a
+     * config change never moves an already-parked interaction's deadline.
+     */
+    pendingInteractionTtlMsByKind?: Partial<Record<PendingResume['kind'], number>>;
 
     /**
      * Behavior when `harness.session(...)` needs the write lease but another

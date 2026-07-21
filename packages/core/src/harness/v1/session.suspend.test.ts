@@ -164,6 +164,9 @@ function pendingResponseIdentity(pending: PendingResume) {
   };
 }
 
+/** The terminal events `_expirePendingInteraction` is responsible for. */
+const EXPIRY_TERMINAL_EVENT_TYPES = new Set(['tool_end', 'resume_failed', 'agent_end', 'run_completed']);
+
 async function waitFor(predicate: () => boolean, label: string, timeoutMs = 500): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!predicate()) {
@@ -884,6 +887,152 @@ describe('Session — respondToToolApproval / Suspension / Question / PlanApprov
     // Expiry terminalizes the abandoned run, not the project/thread/session.
     agent.enqueueRun({ finishReason: 'stop', text: 'recovered' });
     await expect(session.message({ content: 'new turn' })).resolves.toMatchObject({ text: 'recovered' });
+  });
+
+  it('applies a per-kind TTL override and leaves every other kind on the default', async () => {
+    const { harness, agent } = setup(undefined, {
+      pendingInteractionTtlMs: 60_000,
+      pendingInteractionTtlMsByKind: { 'tool-approval': 900_000 },
+    });
+
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      suspendPayload: { toolCallId: 'tc-kind-approval', toolName: 'shell', args: { cmd: 'rm draft.tmp' } },
+    });
+    const approvalSession = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    await approvalSession.message({ content: 'remove the draft' });
+    const approval = approvalSession.getRecord().pendingResume!;
+    expect(approval.kind).toBe('tool-approval');
+    expect(approval.expiresAt).toBe(approval.requestedAt + 900_000);
+
+    // A nested suspendPayload classifies as 'tool-suspension', which carries no
+    // override and must therefore keep the single default deadline.
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      suspendPayload: {
+        toolCallId: 'tc-kind-suspension',
+        toolName: 'shell',
+        args: { cmd: 'ls' },
+        suspendPayload: { prompt: 'which directory?' },
+      },
+    });
+    const suspensionSession = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    await suspensionSession.message({ content: 'list something' });
+    const suspension = suspensionSession.getRecord().pendingResume!;
+    expect(suspension.kind).toBe('tool-suspension');
+    expect(suspension.expiresAt).toBe(suspension.requestedAt + 60_000);
+
+    await harness.shutdown();
+  });
+
+  it('rejects an unknown kind or an out-of-range per-kind pending-interaction TTL at construction', () => {
+    const build = (byKind: Record<string, number>) =>
+      new Harness({
+        agents: { default: new FakeAgent() } as any,
+        modes: [{ id: 'default', agentId: 'default' }],
+        defaultModeId: 'default',
+        sessions: {
+          storage: new InMemoryHarness({ db: new InMemoryDB() }),
+          pendingInteractionTtlMsByKind: byKind,
+        } as any,
+      });
+
+    expect(() => build({ 'tool-aproval': 1_000 })).toThrow(/pendingInteractionTtlMsByKind\.tool-aproval/);
+    expect(() => build({ 'sandbox-access': 0 })).toThrow(/pendingInteractionTtlMsByKind\.sandbox-access/);
+    expect(() => build({ question: 1.5 })).toThrow(/pendingInteractionTtlMsByKind\.question/);
+  });
+
+  // The post-expiry terminal sequence is the contract the Doxa projection
+  // depends on to close out a parked run. `_expirePendingInteraction` emits
+  //   _emitAbortedToolEnds({force:true}) → resume_failed → agent_end(error)
+  // and `run_completed` rides the terminal agent_end, but the first and third
+  // are conditional: a PARKED interaction has no live turn, so its active-tool
+  // map was already drained by `_endTurn` (no tool_end) and expiry owns the
+  // run terminal; a STILL-LIVE pre-registered owner keeps its own terminal but
+  // does have an active tool. The two tests below pin both orders so an
+  // upstream merge cannot reorder or drop any of them.
+  it('terminalizes an expired parked run as resume_failed → agent_end(error) → run_completed(failed)', async () => {
+    const { harness, agent } = setup(undefined, { pendingInteractionTtlMs: 20 });
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      suspendPayload: { toolCallId: 'tc-order-expire', toolName: 'shell', args: { cmd: 'rm -rf build' } },
+    });
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    const observed: any[] = [];
+
+    await session.message({ content: 'clean the build directory' });
+    const pending = session.getRecord().pendingResume!;
+    // Subscribe only once the turn has parked, so the park's own agent_end is
+    // not confused with the terminal expiry emits.
+    session.subscribe(event => {
+      if (EXPIRY_TERMINAL_EVENT_TYPES.has(event.type)) observed.push(event);
+    });
+
+    await waitFor(() => session.getRecord().pendingResume === undefined, 'pending interaction expiry', 1_000);
+    await waitFor(() => observed.some(event => event.type === 'run_completed'), 'run_completed', 1_000);
+
+    expect(observed.map(event => event.type)).toEqual(['resume_failed', 'agent_end', 'run_completed']);
+    const [resumeFailed, agentEnd, runCompleted] = observed;
+    expect(resumeFailed).toMatchObject({
+      retryable: false,
+      error: { code: 'harness.pending_interaction_expired' },
+    });
+    expect(agentEnd).toMatchObject({ finishReason: 'error' });
+    expect(runCompleted).toMatchObject({ status: 'failed', finishReason: 'error' });
+    // Every terminal event closes the SAME parked run.
+    expect(new Set(observed.map(event => event.runId))).toEqual(new Set([pending.runId]));
+
+    await harness.shutdown();
+  });
+
+  it('emits tool_end(aborted) before resume_failed and leaves the terminal to a still-live owner', async () => {
+    const { harness, agent } = setup(undefined, { pendingInteractionTtlMs: 200 });
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      suspendPayload: { toolCallId: 'tc-live-expire', toolName: 'shell', args: { cmd: 'rm -rf build' } },
+    });
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    await session.message({ content: 'clean the build directory' });
+    const pending = session.getRecord().pendingResume!;
+
+    // Model the still-running pre-registered ask/plan/sandbox owner: its tool
+    // is live and it still holds the turn's abort controller.
+    const controller = new AbortController();
+    (session as any)._currentRunId = pending.runId;
+    (session as any)._currentTurnAbortController = controller;
+    (session as any)._activeTools.set(pending.toolCallId, {
+      toolCallId: pending.toolCallId,
+      toolName: pending.toolName,
+      args: {},
+      startedAt: Date.now(),
+    });
+
+    const observed: any[] = [];
+    session.subscribe(event => {
+      if (EXPIRY_TERMINAL_EVENT_TYPES.has(event.type)) observed.push(event);
+    });
+
+    await waitFor(() => session.getRecord().pendingResume === undefined, 'pending interaction expiry', 2_000);
+
+    expect(observed.map(event => event.type)).toEqual(['tool_end', 'resume_failed']);
+    expect(observed[0]).toMatchObject({
+      runId: pending.runId,
+      toolCallId: pending.toolCallId,
+      isError: true,
+      output: { aborted: true },
+    });
+    expect(observed[1]).toMatchObject({
+      runId: pending.runId,
+      retryable: false,
+      error: { code: 'harness.pending_interaction_expired' },
+    });
+    // The live owner is aborted and keeps ownership of agent_end/run_completed.
+    expect(controller.signal.aborted).toBe(true);
+
+    // Unwind the modelled owner through the real teardown so the session reads
+    // idle for shutdown (expiry already drained the active-tool map).
+    (session as any)._endTurn(controller);
+    await harness.shutdown();
   });
 
   it('keeps the original deadline across shutdown and hydration', async () => {

@@ -51,6 +51,7 @@ import type {
   PersistedRequestContextInput,
   PersistedAttachment,
   PendingInteractionExpiryGeneration,
+  PendingResume,
 } from '../../storage/domains/harness';
 import {
   CHANNEL_BINDING_EXTERNAL_ID_SENTINEL,
@@ -156,6 +157,14 @@ const DEFAULT_IDLE_TIMEOUT_MS = 2 * 60 * 60 * 1_000;
 const DEFAULT_MAX_QUEUE_DEPTH = 100;
 const DEFAULT_CLOSE_TIMEOUT_MS = 30_000;
 const DEFAULT_PENDING_INTERACTION_TTL_MS = 10 * 60 * 1_000;
+/** Every pending-interaction kind that may carry its own TTL override. */
+const PENDING_INTERACTION_KINDS = [
+  'tool-approval',
+  'tool-suspension',
+  'question',
+  'plan-approval',
+  'sandbox-access',
+] as const satisfies ReadonlyArray<PendingResume['kind']>;
 const PENDING_INTERACTION_EXPIRY_SWEEP_MIN_INTERVAL_MS = 1_000;
 const PENDING_INTERACTION_EXPIRY_SWEEP_MAX_INTERVAL_MS = 60_000;
 const PENDING_INTERACTION_EXPIRY_SWEEP_PAGE_SIZE = 100;
@@ -958,6 +967,8 @@ export class Harness {
   private readonly _persistTransientStreamingEvents: boolean;
   private readonly _closeTimeoutMs: number;
   private readonly _pendingInteractionTtlMs: number;
+  /** Validated per-kind TTL overrides; kinds absent here use the default. */
+  private readonly _pendingInteractionTtlMsByKind: ReadonlyMap<PendingResume['kind'], number>;
   private readonly _fileConfig: Readonly<HarnessFileConfig>;
   private readonly _subagentTypes: ReadonlyMap<string, SubagentDefinition>;
   private readonly _subagentMaxDepth: number;
@@ -1101,6 +1112,24 @@ export class Harness {
         `must be a positive integer no greater than ${MAX_CLOSE_TIMEOUT_MS}`,
       );
     }
+    const ttlByKind = new Map<PendingResume['kind'], number>();
+    for (const [kind, ttlMs] of Object.entries(config.sessions?.pendingInteractionTtlMsByKind ?? {})) {
+      if (!(PENDING_INTERACTION_KINDS as readonly string[]).includes(kind)) {
+        throw new HarnessConfigError(
+          `sessions.pendingInteractionTtlMsByKind.${kind}`,
+          `must be one of ${PENDING_INTERACTION_KINDS.join(', ')}`,
+        );
+      }
+      if (ttlMs === undefined) continue;
+      if (!Number.isInteger(ttlMs) || ttlMs < 1 || ttlMs > MAX_CLOSE_TIMEOUT_MS) {
+        throw new HarnessConfigError(
+          `sessions.pendingInteractionTtlMsByKind.${kind}`,
+          `must be a positive integer no greater than ${MAX_CLOSE_TIMEOUT_MS}`,
+        );
+      }
+      ttlByKind.set(kind as PendingResume['kind'], ttlMs);
+    }
+    this._pendingInteractionTtlMsByKind = ttlByKind;
     const normalizedFileConfig: HarnessFileConfig = {
       maxEventPayloadBytes: DEFAULT_MAX_EVENT_PAYLOAD_BYTES,
       ...(config.files ?? {}),
@@ -7274,6 +7303,15 @@ export class Harness {
   /** @internal — durable user-interaction TTL consumed by Session. */
   get _internalPendingInteractionTtlMs(): number {
     return this._pendingInteractionTtlMs;
+  }
+
+  /**
+   * @internal — durable user-interaction TTL for one pending kind. Falls back
+   * to the single `sessions.pendingInteractionTtlMs` default when the kind
+   * carries no override.
+   */
+  _internalPendingInteractionTtlMsForKind(kind: PendingResume['kind']): number {
+    return this._pendingInteractionTtlMsByKind.get(kind) ?? this._pendingInteractionTtlMs;
   }
 
   /** @internal — goal-loop defaults, consumed by `Session.setGoal()` (§4.7). */

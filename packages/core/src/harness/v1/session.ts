@@ -3037,11 +3037,18 @@ export class Session {
     };
   }
 
-  private _newPendingInteractionTiming(): Pick<PendingResume, 'requestedAt' | 'expiresAt'> {
+  /**
+   * Freeze this interaction's deadline onto the pending row. The TTL is
+   * resolved per kind (`sessions.pendingInteractionTtlMsByKind`, falling back
+   * to `sessions.pendingInteractionTtlMs`) at capture time only, so a later
+   * config change never moves an already-parked interaction's deadline and a
+   * restart reads the same `expiresAt` back out of storage.
+   */
+  private _newPendingInteractionTiming(kind: PendingResume['kind']): Pick<PendingResume, 'requestedAt' | 'expiresAt'> {
     const requestedAt = Date.now();
     return {
       requestedAt,
-      expiresAt: requestedAt + this._harness._internalPendingInteractionTtlMs,
+      expiresAt: requestedAt + this._harness._internalPendingInteractionTtlMsForKind(kind),
     };
   }
 
@@ -10541,7 +10548,7 @@ export class Session {
       toolCallId: payload.toolCallId,
       toolName: payload.toolName,
       ...this._pendingResumeSourceFields(),
-      ...this._newPendingInteractionTiming(),
+      ...this._newPendingInteractionTiming(kind),
       ...(queuedItemId !== undefined ? { queuedItemId } : {}),
       ...(originSignalId !== undefined ? { originSignalId } : {}),
       modeId,
@@ -15574,7 +15581,7 @@ export class Session {
       toolCallId,
       toolName: ASK_USER_TOOL_NAME,
       ...this._pendingResumeSourceFields(),
-      ...this._newPendingInteractionTiming(),
+      ...this._newPendingInteractionTiming('question'),
       modeId: params.modeId ?? this._record.modeId,
       // §4.2e — carry the active turn's yolo so a later tool approval on the
       // resumed run is still auto-granted (pre-registered pendings win over the
@@ -15645,7 +15652,7 @@ export class Session {
       runId,
       toolCallId,
       ...this._pendingResumeSourceFields(),
-      ...this._newPendingInteractionTiming(),
+      ...this._newPendingInteractionTiming('sandbox-access'),
       modeId,
       // §4.2e — see _registerQuestion: carry yolo through pre-registered pendings.
       ...(this._currentTurnYolo ? { yolo: true } : {}),
@@ -15723,7 +15730,7 @@ export class Session {
       toolCallId,
       toolName: SUBMIT_PLAN_TOOL_NAME,
       ...this._pendingResumeSourceFields(),
-      ...this._newPendingInteractionTiming(),
+      ...this._newPendingInteractionTiming('plan-approval'),
       modeId: submittingModeId,
       // §4.2e — see _registerQuestion: carry yolo through pre-registered pendings.
       ...(this._currentTurnYolo ? { yolo: true } : {}),
