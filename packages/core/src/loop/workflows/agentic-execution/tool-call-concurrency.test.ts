@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   effectiveToolSetRequiresSequentialExecution,
+  resolveCalledBatchToolCallConcurrency,
   resolveConfiguredToolCallConcurrency,
   resolveToolCallConcurrency,
 } from './tool-call-concurrency';
@@ -194,5 +195,91 @@ describe('tool call concurrency resolution', () => {
     expect(resolveConfiguredToolCallConcurrency(0)).toBe(10);
     expect(resolveConfiguredToolCallConcurrency(-1)).toBe(10);
     expect(resolveConfiguredToolCallConcurrency(3)).toBe(3);
+  });
+
+  describe('called-batch concurrency (the tool-call step wiring)', () => {
+    const tools = {
+      search: safeTool,
+      spawn: safeTool,
+      approval: approvalTool,
+      suspending: suspendTool,
+      dynamic: dynamicApprovalTool,
+    };
+
+    it('keeps a safe called batch parallel even when ask/suspend tools are registered', () => {
+      // The old wiring scanned the whole active set, so any surface exposing an
+      // approval-family tool ran EVERY batch sequentially — including pure
+      // search fan-outs and multi-spawn subagent batches that never touched an
+      // approval tool.
+      expect(
+        resolveCalledBatchToolCallConcurrency({
+          toolCalls: [{ toolName: 'search' }, { toolName: 'spawn' }, { toolName: 'search' }],
+          tools,
+          configuredConcurrency: 10,
+        }),
+      ).toBe(10);
+    });
+
+    it('serializes when the batch actually calls an approval tool', () => {
+      expect(
+        resolveCalledBatchToolCallConcurrency({
+          toolCalls: [{ toolName: 'search' }, { toolName: 'approval' }],
+          tools,
+          configuredConcurrency: 10,
+        }),
+      ).toBe(1);
+    });
+
+    it('serializes when the batch calls a suspend-capable tool', () => {
+      expect(
+        resolveCalledBatchToolCallConcurrency({
+          toolCalls: [{ toolName: 'suspending' }, { toolName: 'search' }],
+          tools,
+          configuredConcurrency: 10,
+        }),
+      ).toBe(1);
+    });
+
+    it('serializes when the batch calls a dynamically-approving tool', () => {
+      expect(
+        resolveCalledBatchToolCallConcurrency({
+          toolCalls: [{ toolName: 'dynamic' }],
+          tools,
+          configuredConcurrency: 10,
+        }),
+      ).toBe(1);
+    });
+
+    it('serializes when a permission policy marks a called tool ask', () => {
+      expect(
+        resolveCalledBatchToolCallConcurrency({
+          toolCalls: [{ toolName: 'search' }, { toolName: 'spawn' }],
+          tools,
+          permissionPolicy: toolName => (toolName === 'spawn' ? 'ask' : 'allow'),
+          configuredConcurrency: 10,
+        }),
+      ).toBe(1);
+    });
+
+    it('stays sequential under a global function-valued approval policy', () => {
+      expect(
+        resolveCalledBatchToolCallConcurrency({
+          toolCalls: [{ toolName: 'search' }],
+          tools,
+          requireToolApproval: () => false,
+          configuredConcurrency: 10,
+        }),
+      ).toBe(1);
+    });
+
+    it('ignores hallucinated tool names and non-string entries', () => {
+      expect(
+        resolveCalledBatchToolCallConcurrency({
+          toolCalls: [{ toolName: 'search' }, { toolName: 'no_such_tool' }, { toolName: 42 }, {}],
+          tools,
+          configuredConcurrency: 10,
+        }),
+      ).toBe(10);
+    });
   });
 });

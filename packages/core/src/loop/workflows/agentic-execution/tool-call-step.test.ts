@@ -623,7 +623,11 @@ describe('createToolCallStep tool approval workflow', () => {
       { param: 'test' },
       expect.objectContaining({ resumeData: workflowResumeData }),
     );
-    expect(result).toEqual({ ...inputData, result: { resumeData: workflowResumeData } });
+    expect(result).toEqual({
+      ...inputData,
+      result: { resumeData: workflowResumeData },
+      resumedFromSuspension: true,
+    });
   });
 
   it('rejects a null resume payload that names an unverified suspended run', async () => {
@@ -1483,7 +1487,12 @@ describe('createToolCallStep tool approval workflow', () => {
       { param: 'test' },
       expect.objectContaining({ resumeData: { answer: 'continue' } }),
     );
-    expect(result).toEqual({ result: { resumed: true }, ...inputData, resumeTargetToolCallId: 'test-call-id' });
+    expect(result).toEqual({
+      result: { resumed: true },
+      ...inputData,
+      resumeTargetToolCallId: 'test-call-id',
+      resumedFromSuspension: true,
+    });
   });
 
   it('should consume approved stored approval resumes even if needsApprovalFn later returns false', async () => {
@@ -1776,6 +1785,7 @@ describe('createToolCallStep tool approval workflow', () => {
       result: { success: true },
       approval: { id: inputData.toolCallId, approved: true },
       ...inputData,
+      resumedFromSuspension: true,
     });
   });
 
@@ -1799,6 +1809,7 @@ describe('createToolCallStep tool approval workflow', () => {
     expect(result).toEqual({
       result: toolResult,
       ...inputData,
+      resumedFromSuspension: true,
     });
   });
 
@@ -2122,6 +2133,7 @@ describe('createToolCallStep tool approval workflow', () => {
       result: { text: 'resumed' },
       ...inputData,
       resumeTargetToolCallId: 'agent-call-id',
+      resumedFromSuspension: true,
     });
   });
 

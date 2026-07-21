@@ -94,3 +94,48 @@ export function updateToolCallForeachConcurrency(
 ) {
   options.concurrency = resolveToolCallConcurrency(args);
 }
+
+/**
+ * Per-batch concurrency: scans only the tools the model actually CALLED this
+ * step. Sequential execution exists to keep approval/suspension flows from
+ * racing sibling side effects — a property of the calls that will EXECUTE:
+ * every per-call hazard (permission-policy `ask`, suspend schemas, static or
+ * dynamic approval flags) is checked against the called subset, so a batch
+ * containing any such call still serializes. A registered ask/suspend tool the
+ * model did NOT call cannot park or approve anything this step, and scanning
+ * it anyway forced every turn on surfaces that expose ask-family tools down to
+ * one-at-a-time execution — observed live as "parallel" research fan-outs and
+ * multi-spawn subagent batches running serially. The global function-valued
+ * `requireToolApproval` still short-circuits to sequential inside the resolver
+ * (args are unknown before execution). Hallucinated names resolve to no tool
+ * entry and are ignored; a called name outside the step's active set still
+ * scans its registered entry, which only ever errs toward sequential.
+ */
+export function resolveCalledBatchToolCallConcurrency({
+  toolCalls,
+  requireToolApproval,
+  tools,
+  permissionPolicy,
+  configuredConcurrency,
+}: {
+  toolCalls: ReadonlyArray<{ toolName?: unknown }>;
+  requireToolApproval?: RequireToolApproval;
+  tools?: ToolSet;
+  permissionPolicy?: ToolPermissionPolicy;
+  configuredConcurrency: number;
+}): number {
+  const calledToolNames = [
+    ...new Set(
+      toolCalls
+        .map(toolCall => toolCall.toolName)
+        .filter((toolName): toolName is string => typeof toolName === 'string'),
+    ),
+  ];
+  return resolveToolCallConcurrency({
+    requireToolApproval,
+    tools,
+    activeTools: calledToolNames,
+    permissionPolicy,
+    configuredConcurrency,
+  });
+}
