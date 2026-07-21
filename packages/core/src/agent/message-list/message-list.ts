@@ -42,6 +42,7 @@ import type {
 } from './state';
 import type { AIV5Type, AIV5ResponseMessage, AIV6Type, MessageInput, MessageListInput } from './types';
 import { ensureGeminiCompatibleMessages } from './utils/provider-compat';
+import { dedupeResponseProviderItemParts } from './utils/response-item-metadata';
 import { stampPart } from './utils/stamp-part';
 
 function isSignalDataMessage<T extends { role: string; parts: Array<{ type: string }> }>(message: T): boolean {
@@ -745,11 +746,13 @@ export class MessageList {
 
         messages = ensureGeminiCompatibleMessages(messages, this.logger);
 
-        return messages
-          .map(aiV5ModelMessageToV2PromptMessage)
-          .filter(
-            message => message.role === 'system' || typeof message.content === 'string' || message.content.length > 0,
-          );
+        // PF-2279: a declined-suspension resume can leave the same Responses
+        // provider item (rs_/fc_ ids) in history twice; the provider rejects
+        // duplicate item ids and the thread wedges. Dedup at the final prompt
+        // boundary, then drop any assistant message the dedup emptied.
+        return dedupeResponseProviderItemParts(messages.map(aiV5ModelMessageToV2PromptMessage)).filter(
+          message => message.role === 'system' || typeof message.content === 'string' || message.content.length > 0,
+        );
       },
     },
     aiV6: {

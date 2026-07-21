@@ -383,6 +383,58 @@ const MAX_EMITTED_TOOL_TERMINALS = 4096;
  * without allowing tombstones to grow without bound. */
 const MAX_EXPIRED_PENDING_INTERACTIONS = 100;
 
+// Step ceiling for every harness-driven agent turn. Without an explicit
+// `maxSteps`, `agent.stream()`/`agent.generate()` fall back to the agent's
+// small default (5), and a tool-heavy turn terminates CLEANLY at the step
+// boundary with no synthesis text — live-diagnosed as a silent empty chat
+// turn: 5 tool-only steps, `finish-step`×5, `finish`, zero text deltas
+// (models that batch small parallel tool calls burn the budget fastest).
+// agent-controller.ts centralizes the same guarantee for CLI-harness runs
+// (CONTROLLER_MAX_STEPS); the harness governs runaway turns through its own
+// budgets and abort lanes, so this is an escape-proof ceiling, not pacing.
+const HARNESS_SESSION_MAX_STEPS = 1000;
+
+/**
+ * Empty-final-synthesis nudge. Live-diagnosed twice on the same day (a chat
+ * turn whose approved create tool succeeded, and a scripted journey whose
+ * create ran un-gated): some models execute action tools successfully and
+ * then finish the turn with zero visible text, so the user gets a mutation
+ * and silence. When the final iteration arrives with tool results somewhere
+ * in the segment and no text anywhere in it, force exactly ONE continuation
+ * step so the model states the outcome. One nudge per run segment — a model
+ * that stays silent twice is allowed to finish (never loop). Turns that end
+ * via a terminal tool result never reach this handler (the loop skips
+ * iteration-result handling for terminal delivery), and error/abort finishes
+ * are left alone.
+ */
+function createHarnessEmptySynthesisNudge(): (context: {
+  text: string;
+  toolResults: Array<{ id: string; name: string; result: unknown; error?: Error }>;
+  isFinal: boolean;
+  finishReason: string;
+}) => { continue: boolean; feedback: string } | undefined {
+  let nudged = false;
+  let segmentHasToolResults = false;
+  let segmentHasText = false;
+  return context => {
+    if (context.toolResults.length > 0) segmentHasToolResults = true;
+    if (context.text.trim() !== '') segmentHasText = true;
+    if (!context.isFinal || nudged || segmentHasText || !segmentHasToolResults) return undefined;
+    if (context.finishReason === 'error' || context.finishReason === 'abort') return undefined;
+    nudged = true;
+    return {
+      continue: true,
+      // Bare regeneration is not enough for models that habitually stop after
+      // tool use (live-verified): without explicit direction the extra step
+      // can end silent again. The feedback rides as a suppressed assistant
+      // note, so the model sees the instruction but transcripts stay clean.
+      feedback:
+        'You completed tool actions but sent the user no reply. In one or two short ' +
+        'sentences, state plainly what you did and the outcome. Do not call any more tools.',
+    };
+  };
+}
+
 // §10.2 receipts stay bounded on BOTH axes (PF-2250, live-diagnosed): the map
 // itself is idempotency state, so only a recent window is needed, and a stored
 // result must never carry provider payloads large enough to push the session
@@ -7373,6 +7425,7 @@ export class Session {
       memory: { thread: this.threadId, resource: this.resourceId },
       abortSignal: turnAbortSignal,
       requestContext,
+      maxSteps: HARNESS_SESSION_MAX_STEPS,
       ...toolSurface,
       ...(turnInstructions ? { instructions: turnInstructions } : {}),
       // §9 per-turn override: caller-supplied model generation settings
@@ -7567,7 +7620,14 @@ export class Session {
           ...(admissionIdentity ? { runId: admissionIdentity.runId } : {}),
           resourceId: this.resourceId,
           threadId: this.threadId,
-          ifIdle: { behavior: 'wake', streamOptions: baseExecOptions as never },
+          ifIdle: {
+            behavior: 'wake',
+            // The wake branch starts a REAL streamed turn; carry the silent-turn nudge.
+            streamOptions: {
+              ...baseExecOptions,
+              onIterationComplete: createHarnessEmptySynthesisNudge(),
+            } as never,
+          },
         },
       );
     } catch (err) {
@@ -9816,6 +9876,8 @@ export class Session {
           memory: { thread: this.threadId, resource: this.resourceId },
           abortSignal: turnAbortSignal,
           requestContext,
+          maxSteps: HARNESS_SESSION_MAX_STEPS,
+          onIterationComplete: createHarnessEmptySynthesisNudge(),
           ...toolSurface,
           ...(turnInstructions ? { instructions: turnInstructions } : {}),
         };
@@ -10197,7 +10259,16 @@ export class Session {
           {
             resourceId: this.resourceId,
             threadId: this.threadId,
-            ifIdle: { behavior: 'wake', streamOptions: {} as never },
+            // The interleave path ignores streamOptions (they cannot reach an
+            // active run), but the ifIdle wake fallback starts a REAL turn —
+            // without the ceiling it would die at the agent's 5-step default.
+            ifIdle: {
+              behavior: 'wake',
+              streamOptions: {
+                maxSteps: HARNESS_SESSION_MAX_STEPS,
+                onIterationComplete: createHarnessEmptySynthesisNudge(),
+              } as never,
+            },
           },
         );
       } catch (err) {
@@ -10320,6 +10391,8 @@ export class Session {
           memory: { thread: this.threadId, resource: this.resourceId },
           abortSignal: turnAbortSignal,
           requestContext,
+          maxSteps: HARNESS_SESSION_MAX_STEPS,
+          onIterationComplete: createHarnessEmptySynthesisNudge(),
           ...toolSurface,
           ...(turnInstructions ? { instructions: turnInstructions } : {}),
         };
@@ -12957,6 +13030,11 @@ export class Session {
         memory: { thread: this.threadId, resource: this.resourceId },
         abortSignal: turnAbortController.signal,
         requestContext: resumeRequestContext,
+        // Resume must re-carry the ceiling: a missing `maxSteps` here caps the
+        // RESUMED segment at the agent's 5-step default and ends it mid-task
+        // (the agent-controller documents the identical trap for its lane).
+        maxSteps: HARNESS_SESSION_MAX_STEPS,
+        onIterationComplete: createHarnessEmptySynthesisNudge(),
         ...resumeToolSurface,
         ...(turnInstructions ? { instructions: turnInstructions } : {}),
       });
@@ -15031,7 +15109,14 @@ export class Session {
           runId: identity.runId,
           resourceId: this.resourceId,
           threadId: this.threadId,
-          ifIdle: { behavior: 'wake', streamOptions: baseExecOptions as never },
+          ifIdle: {
+            behavior: 'wake',
+            // The wake branch starts a REAL streamed turn; carry the silent-turn nudge.
+            streamOptions: {
+              ...baseExecOptions,
+              onIterationComplete: createHarnessEmptySynthesisNudge(),
+            } as never,
+          },
         },
       );
       const signalIdentity =

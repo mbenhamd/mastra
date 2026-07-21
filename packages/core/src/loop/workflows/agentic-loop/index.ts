@@ -267,11 +267,49 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
               iterationResult.continue === true &&
               (hasFinishedSteps || !typedInputData.stepResult?.isContinued)
             ) {
+              // Forced continuation from a FINISHED state (the model returned
+              // stop, or a stop condition fired). Setting the flags alone is
+              // not enough: the finished iteration's response message is
+              // closed, so the resumed provider call needs the same boundary
+              // bookkeeping the pending-signals path performs above —
+              // otherwise the loop re-enters against a sealed message and the
+              // extra turn produces nothing caller-visible (live-diagnosed as
+              // the silent-turn nudge failing to surface any text).
               if (rest.maxSteps === undefined || accumulatedSteps.length < rest.maxSteps) {
+                if (iterationResult.feedback) {
+                  messageList.add(
+                    {
+                      id: rest.mastra?.generateId() || randomUUID(),
+                      createdAt: new Date(),
+                      type: 'text',
+                      role: 'assistant',
+                      content: {
+                        parts: [{ type: 'text', text: iterationResult.feedback }],
+                        metadata: {
+                          mode: 'stream',
+                          completionResult: { suppressFeedback: true },
+                        },
+                        format: 2,
+                      },
+                    } as MastraDBMessage,
+                    'response',
+                  );
+                }
+                messageList.markResponseMessageBoundary(
+                  typedInputData.stepResult?.messageId ?? typedInputData.messageId,
+                );
+                const forcedContinuationMessageId = rest.rotateResponseMessageId();
+                typedInputData.messageId = forcedContinuationMessageId;
                 hasFinishedSteps = false;
                 if (typedInputData.stepResult) {
+                  typedInputData.stepResult.messageId = forcedContinuationMessageId;
                   typedInputData.stepResult.isContinued = true;
                 }
+                typedInputData.messages = {
+                  all: messageList.get.all.aiV5.model(),
+                  user: messageList.get.input.aiV5.model(),
+                  nonUser: messageList.get.response.aiV5.model(),
+                };
               }
             }
           }
