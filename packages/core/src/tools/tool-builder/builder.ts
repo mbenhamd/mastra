@@ -824,6 +824,14 @@ export class CoreToolBuilder extends MastraBase {
               ),
             ])
           : (executionRequestContext ?? options.requestContext);
+      // The provider tool-call id is the only key that lets exporters join
+      // this span with the stream's tool frames and with any observed child
+      // spans the tool creates internally; without it every consumer sees the
+      // same execution as two or three unlinkable "calls".
+      const spanToolCallId =
+        typeof execOptions?.toolCallId === 'string' && execOptions.toolCallId.length > 0
+          ? { toolCallId: execOptions.toolCallId }
+          : {};
       const toolSpan = getOrCreateSpan({
         type: mcpMeta ? SpanType.MCP_TOOL_CALL : SpanType.TOOL_CALL,
         name: mcpMeta ? `mcp_tool: '${options.name}' on '${mcpMeta.serverName}'` : `tool: '${options.name}'`,
@@ -836,10 +844,12 @@ export class CoreToolBuilder extends MastraBase {
               mcpServer: mcpMeta.serverName,
               serverVersion: mcpMeta.serverVersion,
               toolDescription: options.description,
+              ...spanToolCallId,
             }
           : {
               toolDescription: options.description,
               toolType: logType || 'tool',
+              ...spanToolCallId,
             },
         tracingPolicy: options.tracingPolicy,
         tracingContext: tracingContext,
