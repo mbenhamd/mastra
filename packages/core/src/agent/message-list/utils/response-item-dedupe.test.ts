@@ -21,6 +21,24 @@ describe('dedupeResponseProviderItemParts (PF-2279)', () => {
     expect(result[1]?.content).toEqual([{ type: 'text', text: 'b' }]);
   });
 
+  it('keeps sibling parts sharing one item id WITHIN a message (multi-part reasoning summary)', () => {
+    // One OpenAI reasoning item can arrive split into several summary parts,
+    // each carrying the same rs_ id. Only a repeat in a LATER message is the
+    // PF-2279 wedge; in-message siblings are one item's legitimate content.
+    const messages = [
+      {
+        role: 'assistant',
+        content: [reasoning('rs_multi', 'part one'), reasoning('rs_multi', 'part two'), { type: 'text', text: 'a' }],
+      },
+      { role: 'assistant', content: [reasoning('rs_multi', 'replayed'), { type: 'text', text: 'b' }] },
+    ];
+
+    const result = dedupeResponseProviderItemParts(messages);
+
+    expect(result[0]?.content).toHaveLength(3);
+    expect(result[1]?.content).toEqual([{ type: 'text', text: 'b' }]);
+  });
+
   it('keeps distinct ids, id-less parts, and non-assistant messages untouched', () => {
     const user = { role: 'user', content: [{ type: 'text', text: 'q' }] };
     const messages = [

@@ -10492,7 +10492,18 @@ export class Session {
       {
         resourceId: this.resourceId,
         threadId: this.threadId,
-        ifIdle: { behavior: 'wake', streamOptions: {} as never },
+        ifIdle: {
+          behavior: 'wake',
+          // The active-delivery race can still land idle; a wake here starts a
+          // REAL streamed turn, so it must carry the step ceiling and the
+          // silent-turn nudge like every other wake site — empty options ran
+          // the turn at the provider's 5-step default with no memory identity.
+          streamOptions: {
+            memory: { thread: this.threadId, resource: this.resourceId },
+            maxSteps: HARNESS_SESSION_MAX_STEPS,
+            onIterationComplete: createHarnessEmptySynthesisNudge(),
+          } as never,
+        },
       },
     );
 
@@ -15080,6 +15091,10 @@ export class Session {
         memory: { thread: this.threadId, resource: this.resourceId },
         abortSignal: turnAbortController.signal,
         requestContext,
+        // Queued turns that wake an idle session run a REAL streamed turn and
+        // must carry the same step ceiling as direct turns — omitting it here
+        // capped channel/queued deliveries at the provider's 5-step default.
+        maxSteps: HARNESS_SESSION_MAX_STEPS,
         ...toolSurface,
         ...(turnInstructions ? { instructions: turnInstructions } : {}),
       };

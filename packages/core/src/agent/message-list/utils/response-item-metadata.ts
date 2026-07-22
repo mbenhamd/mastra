@@ -57,9 +57,15 @@ export function getResponseProviderItemKeys(providerMetadata: Record<string, unk
  * without a provider item id are never touched.
  */
 export function dedupeResponseProviderItemParts<T extends { role: string; content: unknown }>(messages: T[]): T[] {
-  const seen = new Set<string>();
+  const seenInEarlierMessages = new Set<string>();
   return messages.map(message => {
     if (message.role !== 'assistant' || !Array.isArray(message.content)) return message;
+    // Dedupe across MESSAGES only: the PF-2279 wedge is the same provider item
+    // (rs_/fc_) reappearing in a rebuilt copy of the message. Parts WITHIN one
+    // message legitimately share an item id (a reasoning item split into
+    // several summary parts), so an in-message match must survive — a global
+    // part-level set silently truncated multi-part reasoning to its first part.
+    const keysInThisMessage = new Set<string>();
     let dropped = false;
     const content = (message.content as Array<Record<string, unknown> | null | undefined>).filter(part => {
       const metadata =
@@ -67,13 +73,14 @@ export function dedupeResponseProviderItemParts<T extends { role: string; conten
         (part?.providerMetadata as Record<string, unknown> | undefined);
       const keys = getResponseProviderItemKeys(metadata);
       if (keys.length === 0) return true;
-      if (keys.some(key => seen.has(key))) {
+      if (keys.some(key => seenInEarlierMessages.has(key))) {
         dropped = true;
         return false;
       }
-      for (const key of keys) seen.add(key);
+      for (const key of keys) keysInThisMessage.add(key);
       return true;
     });
+    for (const key of keysInThisMessage) seenInEarlierMessages.add(key);
     return dropped ? ({ ...message, content } as T) : message;
   });
 }
