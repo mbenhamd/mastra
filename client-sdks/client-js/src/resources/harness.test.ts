@@ -372,6 +372,128 @@ describe('Harness Resource', () => {
     );
   });
 
+  it('forwards the pending generation fence through every inbox response helper', async () => {
+    mockJson({ session: makeSnapshot() });
+    for (const [itemId, kind] of [
+      ['approval-item', 'tool-approval'],
+      ['suspension-item', 'tool-suspension'],
+      ['question-item', 'question'],
+      ['plan-item', 'plan-approval'],
+      ['sandbox-item', 'sandbox-access'],
+    ] as const) {
+      mockJson({ itemId, kind, status: 'applied', responseId: `${itemId}-response`, duplicate: false });
+    }
+
+    const session = await client.getHarness().session();
+    const generation = {
+      runId: 'run-1',
+      toolCallId: 'tool-call-1',
+      pendingRequestedAt: 1_753_200_000_000,
+    };
+    await session.respondToToolApproval({
+      itemId: 'approval-item',
+      responseId: 'approval-item-response',
+      approved: true,
+      approvalScope: 'once',
+      ...generation,
+    });
+    await session.respondToToolSuspension({
+      itemId: 'suspension-item',
+      responseId: 'suspension-item-response',
+      resumeData: { answer: 42 },
+      ...generation,
+    });
+    await session.respondToQuestion({
+      itemId: 'question-item',
+      responseId: 'question-item-response',
+      answer: 'yes',
+      ...generation,
+    });
+    await session.respondToPlanApproval({
+      itemId: 'plan-item',
+      responseId: 'plan-item-response',
+      approved: false,
+      revision: 'Revise the evidence table.',
+      ...generation,
+    });
+    await session.respondToSandboxAccess({
+      itemId: 'sandbox-item',
+      responseId: 'sandbox-item-response',
+      approved: false,
+      reason: 'Keep this path read-only.',
+      ...generation,
+    });
+
+    expect(global.fetch).toHaveBeenNthCalledWith(
+      2,
+      'http://localhost:4111/api/harness/default/sessions/session-1/inbox/approval-item',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({
+          kind: 'tool-approval',
+          responseId: 'approval-item-response',
+          approved: true,
+          approvalScope: 'once',
+          ...generation,
+        }),
+      }),
+    );
+    expect(global.fetch).toHaveBeenNthCalledWith(
+      3,
+      'http://localhost:4111/api/harness/default/sessions/session-1/inbox/suspension-item',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({
+          kind: 'tool-suspension',
+          responseId: 'suspension-item-response',
+          resumeData: { answer: 42 },
+          ...generation,
+        }),
+      }),
+    );
+    expect(global.fetch).toHaveBeenNthCalledWith(
+      4,
+      'http://localhost:4111/api/harness/default/sessions/session-1/inbox/question-item',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({
+          kind: 'question',
+          responseId: 'question-item-response',
+          answer: 'yes',
+          ...generation,
+        }),
+      }),
+    );
+    expect(global.fetch).toHaveBeenNthCalledWith(
+      5,
+      'http://localhost:4111/api/harness/default/sessions/session-1/inbox/plan-item',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({
+          kind: 'plan-approval',
+          responseId: 'plan-item-response',
+          approved: false,
+          revision: 'Revise the evidence table.',
+          ...generation,
+        }),
+      }),
+    );
+    expect(global.fetch).toHaveBeenNthCalledWith(
+      6,
+      'http://localhost:4111/api/harness/default/sessions/session-1/inbox/sandbox-item',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({
+          kind: 'sandbox-access',
+          responseId: 'sandbox-item-response',
+          approved: false,
+          reason: 'Keep this path read-only.',
+          ...generation,
+        }),
+      }),
+    );
+  });
+
   it('does not retry goal kickoff requests after a failed response', async () => {
     mockJson({ session: makeSnapshot() });
     mockJson({ code: 'harness.goal_failed', message: 'failed' }, { status: 500, statusText: 'Internal Server Error' });

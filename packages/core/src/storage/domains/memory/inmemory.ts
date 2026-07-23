@@ -845,6 +845,10 @@ export class InMemoryMemory extends MemoryStorage {
     if (guard.threadId !== null && guard.threadId !== id) {
       throw new Error('Observational memory guard does not match the target thread.');
     }
+    const thread = this.db.threads.get(id);
+    if (!thread || thread.resourceId !== guard.resourceId) {
+      throw new Error('Observational memory guard does not match the target thread resource.');
+    }
     const current = this.db.observationalMemory.get(
       this.getObservationalMemoryKey(guard.threadId, guard.resourceId),
     )?.[0];
@@ -854,12 +858,23 @@ export class InMemoryMemory extends MemoryStorage {
     return this.updateThread({ id, title, metadata });
   }
 
-  async deleteResource({ resourceId }: { resourceId: string }): Promise<void> {
+  async deleteResource({
+    resourceId,
+    observationalMemoryRecordIds,
+  }: {
+    resourceId: string;
+    observationalMemoryRecordIds?: string[];
+  }): Promise<void> {
+    const resourceObservationalMemoryKey = this.getObservationalMemoryKey(null, resourceId);
+    const erasedRecordIds = (this.db.observationalMemory.get(resourceObservationalMemoryKey) ?? []).map(
+      record => record.id,
+    );
     this.db.resources.delete(resourceId);
     // Resource erasure must not orphan the resource-scoped observational
     // memory record (thread-scoped records stay with their threads, which
     // deleteResource deliberately preserves).
-    this.db.observationalMemory.delete(this.getObservationalMemoryKey(null, resourceId));
+    this.db.observationalMemory.delete(resourceObservationalMemoryKey);
+    observationalMemoryRecordIds?.push(...erasedRecordIds);
   }
 
   async cloneThread(args: StorageCloneThreadInput): Promise<StorageCloneThreadOutput> {

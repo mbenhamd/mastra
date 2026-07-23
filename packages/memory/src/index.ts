@@ -966,7 +966,12 @@ export class Memory extends MastraMemory {
               `The deleteResource method needs to be implemented in the storage adapter.`,
           );
         }
-        await deleteResource.call(memoryStore, { resourceId });
+        const observationalMemoryRecordIds: string[] = [];
+        try {
+          await deleteResource.call(memoryStore, { resourceId, observationalMemoryRecordIds });
+        } finally {
+          await this.deleteObservationVectorsByRecordIds(observationalMemoryRecordIds);
+        }
       });
     });
   }
@@ -1015,6 +1020,26 @@ export class Memory extends MastraMemory {
         ),
       ]),
     );
+  }
+
+  private async deleteObservationVectorsByRecordIds(recordIds: readonly string[]): Promise<void> {
+    if (!this.vector || recordIds.length === 0) return;
+
+    try {
+      const indexes = await this.getObservationVectorIndexes();
+      await Promise.all(
+        indexes.flatMap(indexName =>
+          recordIds.map(recordId =>
+            this.vector!.deleteVectors({
+              indexName,
+              filter: { record_id: recordId },
+            }),
+          ),
+        ),
+      );
+    } catch {
+      this.logger.debug('Failed to clean up observation vectors after committed resource deletion');
+    }
   }
 
   /**

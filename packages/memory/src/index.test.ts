@@ -3126,6 +3126,44 @@ describe('Memory', () => {
       await expect(memoryStore.getResourceById({ resourceId: 'resource-delete' })).resolves.toBeNull();
     });
 
+    it('deletes only the committed resource-scoped observation generation vectors', async () => {
+      const storage = new InMemoryStore();
+      const memoryStore = (await storage.getStore('memory'))!;
+      await memoryStore.updateResource({
+        resourceId: 'resource-delete-vectors',
+        workingMemory: 'private working memory',
+      });
+      const resourceRecord = await memoryStore.initializeObservationalMemory({
+        threadId: null,
+        resourceId: 'resource-delete-vectors',
+        scope: 'resource',
+      });
+      await memoryStore.initializeObservationalMemory({
+        threadId: 'thread-preserved-vectors',
+        resourceId: 'resource-delete-vectors',
+        scope: 'thread',
+      });
+      const vector = {
+        deleteVectors: vi.fn().mockResolvedValue(undefined),
+        listIndexes: vi.fn().mockResolvedValue(['memory_observations_384']),
+      } as any;
+      const memory = new Memory({ storage, vector });
+
+      await memory.deleteResource('resource-delete-vectors');
+
+      expect(vector.deleteVectors).toHaveBeenCalledWith({
+        indexName: 'memory_observations_384',
+        filter: { record_id: resourceRecord.id },
+      });
+      expect(vector.deleteVectors).not.toHaveBeenCalledWith({
+        indexName: 'memory_observations_384',
+        filter: { resource_id: 'resource-delete-vectors' },
+      });
+      await expect(
+        memoryStore.getObservationalMemory('thread-preserved-vectors', 'resource-delete-vectors'),
+      ).resolves.not.toBeNull();
+    });
+
     it('fails explicitly when the storage adapter predates resource deletion support', async () => {
       const storage = new InMemoryStore();
       const memory = new Memory({ storage });

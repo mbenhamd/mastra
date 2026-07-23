@@ -147,6 +147,32 @@ describe('durable tool-call per-tool permission policy', () => {
     expect(toolExecute).not.toHaveBeenCalled();
   });
 
+  it('returns invalid input to the model before a durable approval suspension', async () => {
+    const toolExecute = installTool();
+    const validationError = {
+      error: true,
+      message: `Tool input validation failed for ${TOOL_NAME}.`,
+      validationErrors: {
+        errors: [],
+        fields: { path: { errors: ['Invalid input'], fields: {} } },
+      },
+    };
+    const validateInput = vi.fn().mockReturnValue({ error: validationError });
+    (globalRunRegistry.get(RUN_ID)!.tools![TOOL_NAME] as any).validateInput = validateInput;
+    const requestContext = new RequestContext();
+    requestContext.set(TOOL_PERMISSION_POLICY_KEY, () => 'ask');
+    const suspend = vi.fn().mockReturnValue({ status: 'suspended' });
+
+    const result = await executeStep({ requestContext, permissionPolicyRequired: true, suspend });
+
+    expect(validateInput).toHaveBeenCalledWith(TOOL_ARGS);
+    expect(result).toMatchObject({
+      result: validationError,
+    });
+    expect(suspend).not.toHaveBeenCalled();
+    expect(toolExecute).not.toHaveBeenCalled();
+  });
+
   it('re-evaluates a prior ask as deny on approval resume', async () => {
     const toolExecute = installTool();
     const currentRequestContext = new RequestContext();

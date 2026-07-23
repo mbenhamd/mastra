@@ -14,7 +14,7 @@ describe('MemoryStorage.deleteResource observational memory erasure', () => {
         scope: 'thread' | 'resource';
       }) => Promise<unknown>;
       getObservationalMemory: (threadId: string | null, resourceId: string) => Promise<unknown>;
-      deleteResource: (input: { resourceId: string }) => Promise<void>;
+      deleteResource: (input: { resourceId: string; observationalMemoryRecordIds?: string[] }) => Promise<void>;
       saveResource: (input: { resource: unknown }) => Promise<unknown>;
     };
 
@@ -30,11 +30,13 @@ describe('MemoryStorage.deleteResource observational memory erasure', () => {
     await store.initializeObservationalMemory({ threadId: null, resourceId: 'resource-1', scope: 'resource' });
     await store.initializeObservationalMemory({ threadId: 'thread-1', resourceId: 'resource-1', scope: 'thread' });
 
-    await store.deleteResource({ resourceId: 'resource-1' });
+    const observationalMemoryRecordIds: string[] = [];
+    await store.deleteResource({ resourceId: 'resource-1', observationalMemoryRecordIds });
 
     // Resource erasure clears the resource-scoped observational record; the
     // thread-scoped record stays with its (preserved) thread.
     await expect(store.getObservationalMemory(null, 'resource-1')).resolves.toBeNull();
     await expect(store.getObservationalMemory('thread-1', 'resource-1')).resolves.not.toBeNull();
+    expect(observationalMemoryRecordIds).toHaveLength(1);
   });
 });

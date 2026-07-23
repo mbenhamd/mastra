@@ -43,6 +43,12 @@ export interface MockSuspendPayload {
   resumeSchema?: string;
 }
 
+export interface MockRunUsage {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+}
+
 /**
  * Shape returned by one stream/generate/resume call. Anything you don't set
  * inherits from the agent's `defaultOutput` (or sane defaults).
@@ -56,6 +62,10 @@ export interface MockRunSpec {
   chunks?: unknown[];
   /** For structured-output / `output: schema` paths. */
   object?: unknown;
+  /** Usage for this output segment. Defaults to one input and one output token. */
+  usage?: MockRunUsage;
+  /** Cumulative usage across resumed segments. Defaults to `usage`. */
+  totalUsage?: MockRunUsage;
   /** Framework terminal tool-result envelope returned by the mocked run. */
   terminalToolResult?: unknown;
   /**
@@ -194,11 +204,14 @@ export class MockAgent extends Agent<any, any, any> {
       chunks: spec.chunks ?? this.defaultRun.chunks ?? [],
       object: spec.object ?? this.defaultRun.object,
       suspendPayload: spec.suspendPayload,
+      usage: spec.usage ?? this.defaultRun.usage,
+      totalUsage: spec.totalUsage ?? this.defaultRun.totalUsage,
     };
 
+    const usage = merged.usage ?? { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
     const fullOutput = {
       text: merged.text,
-      usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      usage,
       finishReason: merged.finishReason,
       object: merged.object,
       terminalToolResult:
@@ -220,7 +233,7 @@ export class MockAgent extends Agent<any, any, any> {
         messages: [],
         uiMessages: [],
       },
-      totalUsage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      totalUsage: merged.totalUsage ?? usage,
       error: undefined,
       tripwire: undefined,
       traceId: undefined,

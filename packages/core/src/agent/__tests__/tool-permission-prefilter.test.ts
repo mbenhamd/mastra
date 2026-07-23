@@ -93,4 +93,26 @@ describe('tool permission conversion prefilter', () => {
     expect(readPreconvertedDeniedToolNames(requestContext, 'run-b')).toEqual(['denied']);
     expect(readPreconvertedDeniedToolNames(requestContext, 'missing')).toEqual([]);
   });
+
+  it('fails closed before conversion when the permission policy throws', async () => {
+    const guarded = createTool({
+      id: 'guarded-tool',
+      inputSchema: z.object({}),
+      execute: async () => ({ ok: true }),
+    });
+    const agent = new Agent({
+      id: 'permission-prefilter-failure-agent',
+      name: 'Permission Prefilter Failure Agent',
+      instructions: 'Test conversion-time policy failure.',
+      model: createModel(),
+      tools: { guarded },
+    });
+    const requestContext = new RequestContext();
+    requestContext.set(TOOL_PERMISSION_POLICY_KEY, () => {
+      throw new Error('policy backend unavailable');
+    });
+
+    await expect(agent.getToolsForExecution({ requestContext, runId: 'policy-failure-run' })).resolves.toEqual({});
+    expect(readPreconvertedDeniedToolNames(requestContext, 'policy-failure-run')).toEqual(['guarded']);
+  });
 });

@@ -63,7 +63,14 @@ export function shouldOmitToolBeforeConversion(
   toolName: string,
 ): boolean {
   const policy = requestContext.get(TOOL_PERMISSION_POLICY_KEY) as ToolPermissionPolicy | undefined;
-  if (typeof policy !== 'function' || policy(toolName) !== 'deny') return false;
+  if (typeof policy !== 'function') return false;
+  try {
+    if (policy(toolName) !== 'deny') return false;
+  } catch {
+    // The action-time gate treats an unavailable policy as deny. The optional
+    // conversion prefilter must fail closed the same way instead of aborting
+    // tool-surface construction before the authoritative gate can run.
+  }
   rememberDeniedToolName(requestContext, runId, toolName);
   return true;
 }

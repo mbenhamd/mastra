@@ -994,7 +994,11 @@ describe('Session token usage — durability', () => {
     const receiptId = Object.keys(session.getRecord().queueAdmissionReceipts ?? {})[0];
     expect(receiptId).toBeDefined();
     const beforeResumeTokens = session.getTokenUsage().totalTokens;
-    agent.enqueueRun({ runId: 'q-suspend-token-gap', finishReason: 'stop' });
+    agent.enqueueRun({
+      runId: 'q-suspend-token-gap',
+      finishReason: 'stop',
+      totalUsage: { inputTokens: 2, outputTokens: 2, totalTokens: 4 },
+    });
     await session.respondToToolApproval({ approved: true });
     await queued;
 
@@ -1057,9 +1061,10 @@ describe('Session token usage — durability', () => {
         suspendPayload: {
           toolCallId: 'tc-oversized',
           toolName: 'shell',
-          // Larger than the whole-record budget: simulates provider reasoning
-          // blobs landing in the suspend snapshot.
-          args: { blob: 'x'.repeat(950_000) },
+          // Larger than the whole-record byte budget while remaining below it
+          // in UTF-16 code units. Storage limits are UTF-8 byte limits, so
+          // non-ASCII provider payloads must not bypass the survival guard.
+          args: { blob: '🧠'.repeat(300_000) },
         },
       });
       const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
@@ -1102,6 +1107,7 @@ describe('Session token usage — durability', () => {
     agent.enqueueRun({
       runId: 'msg-resuspend-token-gap',
       finishReason: 'suspended',
+      totalUsage: { inputTokens: 2, outputTokens: 2, totalTokens: 4 },
       suspendPayload: { toolCallId: 'tc-resuspend-second', toolName: 'shell', args: { cmd: 'pwd' } },
     });
     await session.respondToToolApproval({ approved: true });

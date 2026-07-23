@@ -16,6 +16,7 @@ import type { ChunkType } from '../../../../stream/types';
 import { ChunkFrom } from '../../../../stream/types';
 import { findProviderToolByName } from '../../../../tools/provider-tool-utils';
 import type { CoreTool } from '../../../../tools/types';
+import { ensureSerializable } from '../../../../utils';
 import { PUBSUB_SYMBOL } from '../../../../workflows/constants';
 import type { SuspendOptions } from '../../../../workflows/step';
 import { createStep } from '../../../../workflows/workflow';
@@ -929,6 +930,26 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
       const approvalReasons = [...approvalRequirement.reasons];
       if (policyAsk) approvalReasons.push('policy');
       const requiresApproval = approvalRequirement.required || policyAsk;
+
+      // Durable execution owns a distinct approval path from the standard
+      // agent loop. Keep both paths on the same invariant: schema-invalid
+      // provider input is returned to the model for repair before a human is
+      // asked to approve it. execute() still performs authoritative validation
+      // immediately before side effects; transformed preflight data is not
+      // reused because schema transforms need not be idempotent.
+      if (requiresApproval && !isAuthenticatedResume && typeof tool.validateInput === 'function') {
+        const preflightValidation = tool.validateInput(args);
+        if (preflightValidation.error !== undefined) {
+          return {
+            ...typedInput,
+            args,
+            result:
+              preflightValidation.error instanceof Error
+                ? serializeError(preflightValidation.error)
+                : ensureSerializable(preflightValidation.error),
+          };
+        }
+      }
 
       if (requiresApproval && !isAuthenticatedResume) {
         const resumeSchema = JSON.stringify({

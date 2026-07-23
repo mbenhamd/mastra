@@ -245,6 +245,10 @@ export abstract class MemoryStorage extends StorageDomain {
     if (args.guard.threadId !== null && args.guard.threadId !== args.id) {
       throw new Error('Observational memory guard does not match the target thread.');
     }
+    const thread = await this.getThreadById({ threadId: args.id });
+    if (!thread || thread.resourceId !== args.guard.resourceId) {
+      throw new Error('Observational memory guard does not match the target thread resource.');
+    }
     const current = await this.getObservationalMemory(args.guard.threadId, args.guard.resourceId);
     if (current?.id !== args.guard.recordId) {
       throw new Error('Observational memory generation is no longer current.');
@@ -255,12 +259,17 @@ export abstract class MemoryStorage extends StorageDomain {
   /**
    * Delete a resource record, including working memory stored on that record.
    *
-   * This operation does not inspect or mutate associated thread, message, or
-   * observational-memory records, including thread metadata. Storage adapters
-   * can implement those lifecycle operations separately when their application
-   * requires them.
+   * This operation does not mutate associated threads, messages, or thread
+   * metadata. Adapters that erase a resource-scoped observational-memory
+   * generation append its record ids only after commit so the Memory facade can
+   * remove matching external vectors without deleting preserved thread-scoped
+   * vectors.
    */
-  async deleteResource(_args: { resourceId: string }): Promise<void> {
+  async deleteResource(_args: {
+    resourceId: string;
+    /** @internal Receives erased resource-scoped OM record ids only after commit. */
+    observationalMemoryRecordIds?: string[];
+  }): Promise<void> {
     throw new Error(
       `Resource deletion is not implemented by this storage adapter (${this.constructor.name}). ` +
         `The deleteResource method needs to be implemented in the storage adapter.`,

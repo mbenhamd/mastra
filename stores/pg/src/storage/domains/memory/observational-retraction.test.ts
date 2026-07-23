@@ -236,6 +236,49 @@ describe('MemoryPG observational-memory retraction', () => {
     }
   });
 
+  it('reports every committed resource-scoped generation when deleting a resource', async () => {
+    const deletionResourceId = `${resourceId}-delete-resource`;
+    const preservedThreadId = `${threadId}-delete-resource`;
+    await observerMemory.saveResource({
+      resource: {
+        id: deletionResourceId,
+        workingMemory: '{"privateCodename":"DELETE-ME"}',
+        metadata: {},
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+    const initialResourceRecord = await observerMemory.initializeObservationalMemory({
+      config: {},
+      resourceId: deletionResourceId,
+      scope: 'resource',
+      threadId: null,
+    });
+    const currentResourceRecord = await observerMemory.createReflectionGeneration({
+      currentRecord: initialResourceRecord,
+      reflection: 'Current resource observation.',
+      tokenCount: 4,
+    });
+    const preservedThreadRecord = await observerMemory.initializeObservationalMemory({
+      config: {},
+      resourceId: deletionResourceId,
+      scope: 'thread',
+      threadId: preservedThreadId,
+    });
+    const observationalMemoryRecordIds: string[] = [];
+
+    await retractorMemory.deleteResource({ resourceId: deletionResourceId, observationalMemoryRecordIds });
+
+    expect(new Set(observationalMemoryRecordIds)).toEqual(
+      new Set([initialResourceRecord.id, currentResourceRecord.id]),
+    );
+    await expect(retractorMemory.getResourceById({ resourceId: deletionResourceId })).resolves.toBeNull();
+    await expect(retractorMemory.getObservationalMemory(null, deletionResourceId)).resolves.toBeNull();
+    await expect(retractorMemory.getObservationalMemory(preservedThreadId, deletionResourceId)).resolves.toMatchObject({
+      id: preservedThreadRecord.id,
+    });
+  });
+
   it('retracts OM in the same transaction as authoritative message mutations', async () => {
     const mutationResourceId = `${resourceId}-message-mutation`;
     const mutationThreadId = `${threadId}-message-mutation`;

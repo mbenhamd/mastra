@@ -2024,9 +2024,16 @@ export class MemoryPG extends MemoryStorage {
     }
   }
 
-  async deleteResource({ resourceId }: { resourceId: string }): Promise<void> {
+  async deleteResource({
+    resourceId,
+    observationalMemoryRecordIds,
+  }: {
+    resourceId: string;
+    observationalMemoryRecordIds?: string[];
+  }): Promise<void> {
     try {
       const tableName = getTableName({ indexName: TABLE_RESOURCES, schemaName: getSchemaName(this.#schema) });
+      let committedRecordIds: string[] = [];
       await this.#db.client.tx(async t => {
         await this.lockObservationalMemoryResource(t, resourceId);
         await t.none(`DELETE FROM ${tableName} WHERE id = $1`, [resourceId]);
@@ -2045,9 +2052,14 @@ export class MemoryPG extends MemoryStorage {
             indexName: OM_TABLE,
             schemaName: getSchemaName(this.#schema),
           });
-          await t.none(`DELETE FROM ${omTableName} WHERE "resourceId" = $1 AND "threadId" IS NULL`, [resourceId]);
+          const erasedRows = await t.manyOrNone<{ id: string }>(
+            `DELETE FROM ${omTableName} WHERE "resourceId" = $1 AND "threadId" IS NULL RETURNING id`,
+            [resourceId],
+          );
+          committedRecordIds = erasedRows.map(row => row.id);
         }
       });
+      observationalMemoryRecordIds?.push(...committedRecordIds);
     } catch (rawError) {
       const text = 'Failed to delete PostgreSQL memory resource';
       const failureCode = this.getSafeReadFailureCode(rawError);

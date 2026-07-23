@@ -447,7 +447,7 @@ const MAX_INBOX_RECEIPT_RESULT_BYTES = 64_000;
 function boundInboxReceiptResult(full: unknown): unknown {
   try {
     const serialized = JSON.stringify(full);
-    if (serialized === undefined || serialized.length <= MAX_INBOX_RECEIPT_RESULT_BYTES) {
+    if (serialized === undefined || Buffer.byteLength(serialized, 'utf8') <= MAX_INBOX_RECEIPT_RESULT_BYTES) {
       return full;
     }
   } catch {
@@ -483,7 +483,8 @@ const SESSION_RECORD_SIZE_BUDGET_BYTES = 900_000;
 
 function safeSerializedSize(value: unknown): number {
   try {
-    return JSON.stringify(value)?.length ?? 0;
+    const serialized = JSON.stringify(value);
+    return serialized === undefined ? 0 : Buffer.byteLength(serialized, 'utf8');
   } catch {
     return Number.MAX_SAFE_INTEGER;
   }

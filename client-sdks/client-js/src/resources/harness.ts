@@ -62,14 +62,35 @@ export type QueueOperationResult =
   | { status: 'expired'; source: 'queue'; runId?: string; expiredAt?: number }
   | { status: 'not_found'; source: 'queue' };
 type OperationResult = MessageOperationResult | QueueOperationResult;
+export type InboxResponseGeneration = {
+  responseId: string;
+  runId: string;
+  toolCallId: string;
+  pendingRequestedAt: number;
+};
 export type InboxResponseBody =
-  | { kind: 'tool-approval'; approved: boolean; reason?: string; responseId: string }
-  | { kind: 'tool-suspension'; resumeData: unknown; responseId: string }
-  | { kind: 'question'; answer: unknown; responseId: string }
-  | { kind: 'plan-approval'; approved: boolean; revision?: string; responseId: string; transitionToMode?: string };
+  | (InboxResponseGeneration & {
+      kind: 'tool-approval';
+      approved: boolean;
+      reason?: string;
+      approvalScope?: 'once' | 'always';
+    })
+  | (InboxResponseGeneration & { kind: 'tool-suspension'; resumeData: unknown })
+  | (InboxResponseGeneration & { kind: 'question'; answer: unknown })
+  | (InboxResponseGeneration & {
+      kind: 'plan-approval';
+      approved: boolean;
+      revision?: string;
+      transitionToMode?: string;
+    })
+  | (InboxResponseGeneration & {
+      kind: 'sandbox-access';
+      approved: boolean;
+      reason?: string;
+    });
 export type InboxResponseResult = {
   itemId: string;
-  kind: 'tool-approval' | 'tool-suspension' | 'question' | 'plan-approval';
+  kind: 'tool-approval' | 'tool-suspension' | 'question' | 'plan-approval' | 'sandbox-access';
   status: 'accepted' | 'applied';
   responseId: string;
   duplicate: boolean;
@@ -356,30 +377,49 @@ export class RemoteSession extends BaseResource {
     return this.request(`${this.sessionPath()}/inbox/${encodeURIComponent(itemId)}`, { method: 'POST', body });
   }
 
-  respondToToolApproval(options: { itemId: string; responseId: string; approved: boolean; reason?: string }) {
+  respondToToolApproval(
+    options: InboxResponseGeneration & {
+      itemId: string;
+      approved: boolean;
+      reason?: string;
+      approvalScope?: 'once' | 'always';
+    },
+  ) {
     const { itemId, ...body } = options;
     return this.respondToInboxItem(itemId, { kind: 'tool-approval', ...body });
   }
 
-  respondToToolSuspension(options: { itemId: string; responseId: string; resumeData: unknown }) {
+  respondToToolSuspension(options: InboxResponseGeneration & { itemId: string; resumeData: unknown }) {
     const { itemId, ...body } = options;
     return this.respondToInboxItem(itemId, { kind: 'tool-suspension', ...body });
   }
 
-  respondToQuestion(options: { itemId: string; responseId: string; answer: unknown }) {
+  respondToQuestion(options: InboxResponseGeneration & { itemId: string; answer: unknown }) {
     const { itemId, ...body } = options;
     return this.respondToInboxItem(itemId, { kind: 'question', ...body });
   }
 
-  respondToPlanApproval(options: {
-    itemId: string;
-    responseId: string;
-    approved: boolean;
-    revision?: string;
-    transitionToMode?: string;
-  }) {
+  respondToPlanApproval(
+    options: InboxResponseGeneration & {
+      itemId: string;
+      approved: boolean;
+      revision?: string;
+      transitionToMode?: string;
+    },
+  ) {
     const { itemId, ...body } = options;
     return this.respondToInboxItem(itemId, { kind: 'plan-approval', ...body });
+  }
+
+  respondToSandboxAccess(
+    options: InboxResponseGeneration & {
+      itemId: string;
+      approved: boolean;
+      reason?: string;
+    },
+  ) {
+    const { itemId, ...body } = options;
+    return this.respondToInboxItem(itemId, { kind: 'sandbox-access', ...body });
   }
 
   async setGoal(options: GoalBody): Promise<GoalResponse> {

@@ -265,6 +265,16 @@ describe('MemoryStorage atomic observational-memory retraction', () => {
         },
       });
     }
+    await memory.saveThread({
+      thread: {
+        id: 'thread-cross-resource',
+        resourceId: 'resource-other',
+        title: 'Preserved cross-resource title',
+        metadata: {},
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
 
     const resourceRecord = await memory.initializeObservationalMemory({
       threadId: null,
@@ -300,12 +310,28 @@ describe('MemoryStorage atomic observational-memory retraction', () => {
         },
       }),
     ).rejects.toThrow('does not match the target thread');
+    await expect(
+      memory.updateThreadFromObservationalMemory({
+        id: 'thread-cross-resource',
+        title: 'Must not cross the resource boundary',
+        metadata: { leaked: true },
+        guard: {
+          recordId: resourceRecord.id,
+          threadId: null,
+          resourceId: 'resource-guard',
+        },
+      }),
+    ).rejects.toThrow('does not match the target thread resource');
 
     await expect(memory.getResourceById({ resourceId: 'resource-other' })).resolves.toMatchObject({
       workingMemory: 'preserved',
     });
     await expect(memory.getThreadById({ threadId: 'thread-other' })).resolves.toMatchObject({
       title: 'Preserved title',
+      metadata: {},
+    });
+    await expect(memory.getThreadById({ threadId: 'thread-cross-resource' })).resolves.toMatchObject({
+      title: 'Preserved cross-resource title',
       metadata: {},
     });
   });
