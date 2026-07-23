@@ -1048,6 +1048,80 @@ describe('Harness v1 real-agent E2E — replacement mode tool boundary', () => {
 // ===========================================================================
 
 describe('Harness v1 real-agent E2E — S3 approval suspend/resume', () => {
+  it('parks and resumes an admitted streaming turn whose tool owns the review boundary', async () => {
+    const appliedWrites: string[] = [];
+    const reviewedWrite = createTool({
+      id: 'reviewedWrite',
+      description: 'write only after editable user review',
+      inputSchema: z.object({ name: z.string() }),
+      outputSchema: z.object({ applied: z.boolean(), name: z.string() }),
+      suspendSchema: z.object({ name: z.string() }),
+      resumeSchema: z.object({ approved: z.boolean() }),
+      execute: async (input, ctx) => {
+        const resumeData = ctx.agent?.resumeData as { approved: boolean } | undefined;
+        if (resumeData === undefined) {
+          if (!ctx.agent?.suspend) throw new Error('expected a Harness agent execution context');
+          await ctx.agent.suspend({ name: input.name });
+          return { applied: false, name: input.name };
+        }
+        if (resumeData.approved) appliedWrites.push(input.name);
+        return { applied: resumeData.approved, name: input.name };
+      },
+    });
+    let callCount = 0;
+    const model = new MockLanguageModelV2({
+      doStream: async () => {
+        callCount++;
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream:
+            callCount === 1
+              ? toolCallStream('reviewed-write-call', 'reviewedWrite', '{"name":"Reviewed draft"}')
+              : textStream(['The reviewed write was applied.']),
+        };
+      },
+    });
+    const agent = new Agent({
+      id: 'default',
+      name: 'default',
+      instructions: 'Use reviewedWrite for the requested mutation.',
+      model,
+      tools: { reviewedWrite },
+    });
+    const harness = newHarness(agent);
+
+    try {
+      const session = await harness.session({ resourceId: 'u-reviewed-write', threadId: { fresh: true } });
+      const output = await session.message({
+        admissionId: 'reviewed-write-admission',
+        content: 'Save the reviewed draft.',
+        stream: true,
+      });
+      const suspended = await output.getFullOutput();
+
+      expect(suspended.finishReason).toBe('suspended');
+      await vi.waitFor(() => {
+        expect(session.getRecord().pendingResume).toMatchObject({
+          kind: 'tool-suspension',
+          runId: suspended.runId,
+          toolCallId: 'reviewed-write-call',
+          toolName: 'reviewedWrite',
+        });
+      });
+      expect(appliedWrites).toEqual([]);
+
+      const resumed = (await session.respondToToolSuspension({
+        resumeData: { approved: true },
+      })) as any;
+      expect(resumed.text).toBe('The reviewed write was applied.');
+      expect(appliedWrites).toEqual(['Reviewed draft']);
+      expect(session.getRecord().pendingResume).toBeUndefined();
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
   it('rejects and leaves no resumable state when a suspended terminal event cannot be published', async () => {
     const approvalTool = createTool({
       id: 'failedSuspendApproval',
