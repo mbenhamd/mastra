@@ -1488,6 +1488,7 @@ run_validator_self_tests() {
   local fixture_repo
   local mock_bin
   local command_log
+  local command_environment_log
   local docker_log
   local service_log
   local base_sha
@@ -1507,13 +1508,18 @@ run_validator_self_tests() {
   fixture_repo="$test_root/repo"
   mock_bin="$test_root/bin"
   command_log="$test_root/pnpm.log"
+  command_environment_log="$test_root/pnpm-environment.log"
   docker_log="$test_root/docker.log"
   service_log="$test_root/services.log"
   mkdir -p \
     "$fixture_repo/client-sdks/client-js/src/resources" \
     "$fixture_repo/.github/workflows" \
+    "$fixture_repo/harnessv1/sections/04-public-api/02-session" \
+    "$fixture_repo/mastracode/sdk/scripts" \
+    "$fixture_repo/mastracode/sdk/src/utils/__tests__" \
     "$fixture_repo/packages/cli/src/commands/api" \
     "$fixture_repo/packages/core/src/auth/ee/interfaces" \
+    "$fixture_repo/packages/core/src/agent/__tests__" \
     "$fixture_repo/packages/core/src/agent/durable/__tests__" \
     "$fixture_repo/packages/core/src/harness/v1" \
     "$fixture_repo/packages/server/src/server/handlers" \
@@ -1522,11 +1528,14 @@ run_validator_self_tests() {
     "$fixture_repo/pubsub/redis-streams/src" \
     "$fixture_repo/stores/convex/src/cache" \
     "$fixture_repo/stores/convex/src/server" \
+    "$fixture_repo/stores/_test-utils/src/domains/harness" \
     "$fixture_repo/stores/_test-utils/src/domains/workflows" \
     "$fixture_repo/stores/libsql/src/storage/domains/harness" \
     "$fixture_repo/stores/libsql/src/storage/domains/workflows" \
+    "$fixture_repo/stores/libsql/src/storage" \
     "$fixture_repo/stores/pg/src/storage/domains/workflows" \
     "$fixture_repo/workflows/inngest/src/__tests__/adapters" \
+    "$fixture_repo/workflows/inngest/src/durable-agent" \
     "$fixture_repo/workflows/inngest/src" \
     "$fixture_repo/workflows/temporal/src" \
     "$fixture_repo/node_modules" \
@@ -1542,6 +1551,8 @@ run_validator_self_tests() {
   # shellcheck disable=SC2016
   printf '%s\n' \
     'printf '\''%s\n'\'' "$*" >> "${MOCK_PNPM_LOG:?}"' \
+    'printf '\''LLM_TEST_MODE=%s\t%s\n'\'' "${LLM_TEST_MODE:-}" "$*" >> "${MOCK_PNPM_ENVIRONMENT_LOG:?}"' \
+    'printf '\''OPENAI_API_KEY=%s\t%s\n'\'' "${OPENAI_API_KEY:-}" "$*" >> "${MOCK_PNPM_ENVIRONMENT_LOG:?}"' \
     'if [[ " $* " == *" check:permissions "* && "${MOCK_FAIL_PERMISSIONS:-0}" == 1 ]]; then exit 17; fi' \
     'if [[ " $* " == *" generate:route-types "* && "${MOCK_STALE_ROUTE_TYPES:-0}" == 1 ]]; then' \
     '  printf '\''%s\n'\'' "// regenerated" >> client-sdks/client-js/src/route-types.generated.ts' \
@@ -1559,7 +1570,18 @@ run_validator_self_tests() {
     'fi' \
     'for argument in "$@"; do' \
     '  case "$argument" in' \
-    '    --outputFile.json=*) printf '\''%s\n'\'' '\''{"numPassedTests":1}'\'' > "${argument#*=}" ;;' \
+    '    --outputFile.json=*)' \
+    '      if [[ " $* " == *" --typecheck.only "* ]]; then' \
+    '        case "${MOCK_TYPE_TEST_REPORT:-pass}" in' \
+    '          zero) printf '\''%s\n'\'' '\''{"numPassedTests":0,"numFailedTests":0}'\'' > "${argument#*=}" ;;' \
+    '          partial) printf '\''%s\n'\'' '\''{"numPassedTests":1}'\'' > "${argument#*=}" ;;' \
+    '          nonnumeric) printf '\''%s\n'\'' '\''{"numPassedTests":"one","numFailedTests":0}'\'' > "${argument#*=}" ;;' \
+    '          *) printf '\''%s\n'\'' '\''{"numPassedTests":1,"numFailedTests":0}'\'' > "${argument#*=}" ;;' \
+    '        esac' \
+    '      else' \
+    '        printf '\''%s\n'\'' '\''{"numPassedTests":1,"numFailedTests":0}'\'' > "${argument#*=}"' \
+    '      fi' \
+    '      ;;' \
     '  esac' \
     'done' \
     >> "$mock_bin/pnpm"
@@ -1617,9 +1639,65 @@ run_validator_self_tests() {
     printf '%s\n' \
       '{"compilerOptions":{"module":"NodeNext","moduleResolution":"NodeNext","noEmit":true,"strict":true}}' \
       > client-sdks/client-js/tsconfig.json
+    printf '%s\n' 'export default {};' > client-sdks/client-js/vitest.config.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('client harness resource', () => {});" \
+      > client-sdks/client-js/src/resources/harness.test.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('client package exports', () => {});" \
+      > client-sdks/client-js/src/index.test.ts
+    printf '%s\n' '# Harness session contract' \
+      > harnessv1/sections/04-public-api/02-session/messages.md
+    printf '%s\n' '{}' > mastracode/sdk/package.json
+    printf '%s\n' 'export default {};' > mastracode/sdk/vitest.config.ts
+    printf '%s\n' \
+      'export function buildObservationIndexInput(candidate: unknown) {' \
+      '  return candidate;' \
+      '}' \
+      > mastracode/sdk/src/utils/observation-index-input.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('authorizes observation indexing', () => {});" \
+      > mastracode/sdk/src/utils/__tests__/observation-index-input.test.ts
+    printf '%s\n' \
+      "import { buildObservationIndexInput } from '../src/utils/observation-index-input';" \
+      'declare const memory: { indexObservation(input: unknown): Promise<void> };' \
+      'export async function indexObservationGroupsFromMessages(' \
+      '  memory: { indexObservation(input: unknown): Promise<void> },' \
+      '  candidate: unknown,' \
+      ') {' \
+      '  const input = buildObservationIndexInput(candidate);' \
+      '  if (!input) return;' \
+      '  await memory.indexObservation(input);' \
+      '}' \
+      'void indexObservationGroupsFromMessages(memory, {});' \
+      > mastracode/sdk/scripts/index-messages.ts
     printf '%s\n' '{}' > packages/cli/package.json
     printf '%s\n' '{}' > packages/core/package.json
     printf '%s\n' 'export default {};' > packages/core/vitest.config.ts
+    printf '%s\n' \
+      "import { openai } from '@ai-sdk/openai-v5';" \
+      "import { describe, expect, it } from 'vitest';" \
+      "describe('Supervisor Pattern Integration Tests', () => {" \
+      "  it('supervisor integration', () => expect(true).toBe(true));" \
+      '});' \
+      "describe('Supervisor Pattern - Working memory forwarding', () => {" \
+      '  it.skipIf(!process.env.OPENAI_API_KEY)(' \
+      "    'keeps the reviewed provider smoke guarded'," \
+      "    () => void openai('gpt-4o-mini')," \
+      '  );' \
+      '});' \
+      > packages/core/src/agent/__tests__/supervisor-integration.test.ts
+    printf '%s\n' \
+      "import { createGatewayMock } from '@internal/test-utils';" \
+      "import { afterAll, beforeAll, it } from 'vitest';" \
+      'const mock = createGatewayMock({});' \
+      'beforeAll(() => mock.start());' \
+      'afterAll(() => mock.saveAndStop());' \
+      'export function toolApprovalAndSuspensionTests() {' \
+      "  it('tool approval', () => {});" \
+      '}' \
+      > packages/core/src/agent/__tests__/tool-approval.e2e.test.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('permission gate', () => {});" \
+      > packages/core/src/harness/v1/session.permission-gate.e2e.test.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('plan task', () => {});" \
+      > packages/core/src/harness/v1/session.plan-task.e2e.test.ts
     printf '%s\n' "export const permission = 'base';" \
       > packages/core/src/auth/ee/interfaces/permissions.generated.ts
     printf '%s\n' '{}' > packages/server/package.json
@@ -1642,11 +1720,32 @@ run_validator_self_tests() {
     printf '%s\n' "import { it } from 'vitest';" "it('convex server cache', () => {});" \
       > stores/convex/src/server/cache.test.ts
     printf '%s\n' '{}' > stores/_test-utils/package.json
+    printf '%s\n' 'export const harnessConformance = true;' \
+      > stores/_test-utils/src/domains/harness/index.ts
+    printf '%s\n' \
+      "import { describe } from 'vitest';" \
+      "import { createHarnessTest } from './domains/harness';" \
+      'export function createTestSuite(storage: unknown) {' \
+      "  describe('Harness', () => {" \
+      '    createHarnessTest({ storage });' \
+      '  });' \
+      "  describe('Other domain', () => {});" \
+      '}' \
+      > stores/_test-utils/src/factory.ts
+    printf '%s\n' \
+      "import { MockStore } from '@mastra/core/storage';" \
+      "import { createTestSuite } from './factory';" \
+      'createTestSuite(new MockStore());' \
+      > stores/_test-utils/src/index.test.ts
     printf '%s\n' 'export const atomicResumeConformance = true;' \
       > stores/_test-utils/src/domains/workflows/atomic-resume.ts
     printf '%s\n' "export { atomicResumeConformance } from './domains/workflows/atomic-resume';" \
       > stores/_test-utils/src/index.ts
     printf '%s\n' '{}' > stores/libsql/package.json
+    printf '%s\n' 'export const libsqlStore = true;' \
+      > stores/libsql/src/storage/index.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('libsql composite wiring', () => {});" \
+      > stores/libsql/src/storage/index.test.ts
     printf '%s\n' 'export const harnessStorage = true;' \
       > stores/libsql/src/storage/domains/harness/index.ts
     printf '%s\n' "import { it } from 'vitest';" "it('libsql harness storage', () => {});" \
@@ -1672,6 +1771,10 @@ run_validator_self_tests() {
     printf '%s\n' 'export const resumeOperation = true;' > workflows/inngest/src/resume-operation.ts
     printf '%s\n' 'export const run = true;' > workflows/inngest/src/run.ts
     printf '%s\n' 'export const workflow = true;' > workflows/inngest/src/workflow.ts
+    printf '%s\n' 'export type InngestAgentResumeOptions = { requireToolPermissionPolicy?: true };' \
+      > workflows/inngest/src/durable-agent/create-inngest-agent.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('create inngest agent', () => {});" \
+      > workflows/inngest/src/__tests__/create-inngest-agent.test.ts
     printf '%s\n' 'export const durableAgentTestUtils = true;' \
       > workflows/inngest/src/__tests__/durable-agent.test.utils.ts
     printf '%s\n' "import { it } from 'vitest';" "it('durable test utility', () => {});" \
@@ -1716,8 +1819,14 @@ run_validator_self_tests() {
       > client-sdks/client-js/src/types.ts
     printf '%s\n' "import type { HarnessRoute } from '../route-types.generated.js';" \
       'export type ClientHarnessRoute = HarnessRoute;' \
+      'export type InboxResponseGeneration = { responseId: string };' \
       > client-sdks/client-js/src/resources/harness.ts
-    printf '%s\n' "export type { IndexOnlyRoute } from './route-types.generated.js';" \
+    printf '%s\n' 'export const clientTool = true;' \
+      > client-sdks/client-js/src/tools.ts
+    printf '%s\n' \
+      "export * from './tools';" \
+      "export type { IndexOnlyRoute, RouteTypes } from './route-types.generated.js';" \
+      "export type { ClientHarnessRoute } from './resources/harness';" \
       > client-sdks/client-js/src/index.ts
     printf '%s\n' "export const routeMetadata = 'base';" > packages/cli/src/commands/api/route-metadata.generated.ts
     printf '%s\n' 'export const favoriteFixture = true;' \
@@ -1752,6 +1861,7 @@ run_validator_self_tests() {
       env \
         PATH="$mock_bin:$PATH" \
         MOCK_PNPM_LOG="$command_log" \
+        MOCK_PNPM_ENVIRONMENT_LOG="$command_environment_log" \
         MOCK_DOCKER_LOG="$docker_log" \
         MOCK_SERVICE_LOG="$service_log" \
         BASE_SHA="$base_sha" \
@@ -3126,6 +3236,1221 @@ NODE
   head_sha="$(
     cd "$fixture_repo"
     git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      'export type InngestAgentResumeOptions = { requireToolPermissionPolicy?: true; head?: true };' \
+      > workflows/inngest/src/durable-agent/create-inngest-agent.ts
+    printf '%s\n' \
+      "import { expectTypeOf, it } from 'vitest';" \
+      "import type { InngestAgentResumeOptions } from './create-inngest-agent';" \
+      "it('keeps resume permission monotonic', () => expectTypeOf<InngestAgentResumeOptions>().toBeObject());" \
+      > workflows/inngest/src/durable-agent/create-inngest-agent.test-d.ts
+    git add .
+    git commit -q -m 'inngest resume type contract'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/inngest-resume-type-contract-success.log"
+  run_fixture "$head_sha" "$output"
+  assert_contains '--filter ./workflows/inngest --fail-if-no-match exec tsc --noEmit' "$command_log"
+  assert_contains '--filter ./workflows/inngest --fail-if-no-match build' "$command_log"
+  assert_contains '--filter ./workflows/inngest --fail-if-no-match lint' "$command_log"
+  assert_contains '--dir workflows/inngest exec vitest run --typecheck.only --reporter=dot --reporter=json --outputFile.json=' "$command_log"
+  assert_contains 'src/durable-agent/create-inngest-agent.test-d.ts' "$command_log"
+  assert_contains 'src/__tests__/create-inngest-agent.test.ts' "$command_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      'export type InngestAgentResumeOptions = { requireToolPermissionPolicy?: true; head?: true };' \
+      > workflows/inngest/src/durable-agent/create-inngest-agent.ts
+    printf '%s\n' 'export type EmptyTypeContract = true;' \
+      > workflows/inngest/src/durable-agent/create-inngest-agent.test-d.ts
+    git add .
+    git commit -q -m 'empty inngest resume type contract'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/inngest-empty-resume-type-contract-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output" MOCK_TYPE_TEST_REPORT=zero
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Empty Inngest resume type contract unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'The changed type-test file did not execute a passing Vitest type test.' "$output"
+  assert_contains 'workflows/inngest/src/durable-agent/create-inngest-agent.test-d.ts' "$output"
+
+  for invalid_report in partial nonnumeric; do
+    : > "$command_log"
+    output="$test_root/inngest-${invalid_report}-resume-type-contract-failure.log"
+    set +e
+    run_fixture "$head_sha" "$output" MOCK_TYPE_TEST_REPORT="$invalid_report"
+    status=$?
+    set -e
+    if (( status == 0 )); then
+      echo "Invalid ${invalid_report} Inngest type-test report unexpectedly passed." >&2
+      cat "$output" >&2
+      exit 1
+    fi
+    assert_contains 'The changed type-test file did not execute a passing Vitest type test.' "$output"
+    assert_contains 'workflows/inngest/src/durable-agent/create-inngest-agent.test-d.ts' "$output"
+  done
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "import type { HarnessRoute } from '../route-types.generated.js';" \
+      'export type ClientHarnessRoute = HarnessRoute & { permissions: "durable" };' \
+      > client-sdks/client-js/src/resources/harness.ts
+    git add .
+    git commit -q -m 'client harness contract'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/client-harness-production-success.log"
+  run_fixture "$head_sha" "$output"
+  assert_contains 'Forcing PF-2044 owned suites to run for source-only changes:' "$output"
+  assert_contains 'client-sdks/client-js/src/resources/harness.test.ts' "$output"
+  assert_contains '--filter ./client-sdks/client-js --fail-if-no-match exec tsc --noEmit' "$command_log"
+  assert_contains '--filter ./client-sdks/client-js --fail-if-no-match build:lib' "$command_log"
+  assert_contains '--filter ./client-sdks/client-js --fail-if-no-match lint' "$command_log"
+  assert_contains '--dir client-sdks/client-js exec vitest run' "$command_log"
+  assert_contains 'src/resources/harness.test.ts' "$command_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "export * from './tools';" \
+      "export type { IndexOnlyRoute, RouteTypes } from './route-types.generated.js';" \
+      "export type { ClientHarnessRoute, InboxResponseGeneration } from './resources/harness';" \
+      > client-sdks/client-js/src/index.ts
+    git add .
+    git commit -q -m 'client inbox response generation export'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/client-index-production-success.log"
+  run_fixture "$head_sha" "$output"
+  assert_contains 'Forcing PF-2044 owned suites to run for source-only changes:' "$output"
+  assert_contains 'client-sdks/client-js/src/index.test.ts' "$output"
+  assert_contains '--filter ./client-sdks/client-js --fail-if-no-match exec tsc --noEmit' "$command_log"
+  assert_contains '--filter ./client-sdks/client-js --fail-if-no-match build:lib' "$command_log"
+  assert_contains '--filter ./client-sdks/client-js --fail-if-no-match lint' "$command_log"
+  assert_contains '--dir client-sdks/client-js exec vitest run' "$command_log"
+  assert_contains 'src/index.test.ts' "$command_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "export * from './tools';" \
+      "export type { IndexOnlyRoute } from './route-types.generated.js';" \
+      "export type { ClientHarnessRoute, InboxResponseGeneration } from './resources/harness';" \
+      > client-sdks/client-js/src/index.ts
+    git add .
+    git commit -q -m 'remove one public client route export'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/client-index-route-export-removal-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Partial Client SDK route-export removal unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains \
+    'Client SDK public entrypoint changed outside the reviewed InboxResponseGeneration type re-export.' \
+    "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Invalid Client SDK route-export fixture executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "export * from './tools';" \
+      "export type { IndexOnlyRoute } from './route-types.generated.js';" \
+      "export type { ClientHarnessRoute, InboxResponseGeneration } from './resources/harness';" \
+      > client-sdks/client-js/src/index.ts
+    printf '%s\n' "it('unrelated server coverage', () => true);" \
+      >> packages/server/src/server/handlers/favorites.integration.test.ts
+    git add .
+    git commit -q -m 'hide client route export removal behind unrelated server test'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/client-index-route-export-removal-with-server-test-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Client SDK route-export removal paired with an unrelated Server test unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains \
+    'Client SDK public entrypoint changed outside the reviewed InboxResponseGeneration type re-export.' \
+    "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Invalid mixed Client SDK/Server route-export fixture executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "export * from './tools';" \
+      "export type { IndexOnlyRoute, RouteTypes } from './route-types.generated.js';" \
+      "export type * from './route-types.generated.js';" \
+      "export type { ClientHarnessRoute, InboxResponseGeneration } from './resources/harness';" \
+      > client-sdks/client-js/src/index.ts
+    git add .
+    git commit -q -m 'add wildcard public client route exports'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/client-index-wildcard-route-export-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Wildcard Client SDK route export unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains \
+    'Client SDK public entrypoint changed outside the reviewed InboxResponseGeneration type re-export.' \
+    "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Invalid wildcard Client SDK route-export fixture executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "export * from './tools';" \
+      "export type { IndexOnlyRoute, RouteTypes } from './route-types.generated.js';" \
+      "export type LeakedHarnessRoute = import('./route-types.generated.js').HarnessRoute;" \
+      "export type { ClientHarnessRoute, InboxResponseGeneration } from './resources/harness';" \
+      > client-sdks/client-js/src/index.ts
+    git add .
+    git commit -q -m 'indirectly expose a generated client route type'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/client-index-indirect-route-export-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Indirect Client SDK generated route export unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains \
+    'Client SDK public entrypoint changed outside the reviewed InboxResponseGeneration type re-export.' \
+    "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Invalid indirect Client SDK route-export fixture executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "export * from './tools';" \
+      "export type { IndexOnlyRoute, RouteTypes } from './route-types.generated.js';" \
+      "export type { HarnessRoute } from './resources/../route-types.generated.js';" \
+      "export type { ClientHarnessRoute, InboxResponseGeneration } from './resources/harness';" \
+      > client-sdks/client-js/src/index.ts
+    git add .
+    git commit -q -m 'expose generated client route through an equivalent path'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/client-index-equivalent-route-path-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Equivalent-path Client SDK generated route export unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains \
+    'Client SDK public entrypoint changed outside the reviewed InboxResponseGeneration type re-export.' \
+    "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Invalid equivalent-path Client SDK route-export fixture executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "export type { IndexOnlyRoute, RouteTypes } from './route-types.generated.js';" \
+      "export type { ClientHarnessRoute, InboxResponseGeneration } from './resources/harness';" \
+      > client-sdks/client-js/src/index.ts
+    git add .
+    git commit -q -m 'remove an unrelated client entrypoint export'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/client-index-unrelated-export-removal-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Unrelated Client SDK entrypoint export removal unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains \
+    'Client SDK public entrypoint changed outside the reviewed InboxResponseGeneration type re-export.' \
+    "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Invalid unrelated Client SDK entrypoint-export fixture executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'export const unreviewedClientSurface = true;' \
+      > client-sdks/client-js/src/resources/unreviewed.ts
+    git add .
+    git commit -q -m 'unreviewed client source'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/client-unknown-source-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Unknown Client SDK source unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'client-sdks/client-js/src/resources/unreviewed.ts' "$output"
+  assert_contains 'outside the PF-2044 owned source-and-test maps' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Unknown Client SDK source fixture executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' '# Harness session contract' '' 'Durable approval coordinates are immutable.' \
+      > harnessv1/sections/04-public-api/02-session/messages.md
+    git add .
+    git commit -q -m 'harness specification update'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/harness-spec-success.log"
+  run_fixture "$head_sha" "$output"
+  assert_contains 'exec prettier --check harnessv1/sections/04-public-api/02-session/messages.md' "$command_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    ln -s ../../../../outside.md \
+      harnessv1/sections/04-public-api/02-session/messages-link.md
+    git add .
+    git commit -q -m 'symlink Harness specification input'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/harness-spec-symlink-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Symlink Harness specification input unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'harnessv1/sections/04-public-api/02-session/messages-link.md' "$output"
+  assert_contains 'require dedicated validation' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Symlink Harness specification input executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'unreviewed binary specification input' \
+      > harnessv1/sections/04-public-api/02-session/messages.bin
+    git add .
+    git commit -q -m 'unreviewed harness specification input'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/harness-spec-unknown-input-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Unknown Harness specification input unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'harnessv1/sections/04-public-api/02-session/messages.bin' "$output"
+  assert_contains 'require dedicated validation' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Unknown Harness specification input executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      'export function buildObservationIndexInput(candidate: unknown) {' \
+      '  return { candidate, recordId: "record-1" };' \
+      '}' \
+      > mastracode/sdk/src/utils/observation-index-input.ts
+    printf '%s\n' \
+      "import { it } from 'vitest';" \
+      "import { buildObservationIndexInput } from '../observation-index-input';" \
+      "it('authorizes observation indexing', () => buildObservationIndexInput);" \
+      > mastracode/sdk/src/utils/__tests__/observation-index-input.test.ts
+    printf '%s\n' \
+      "import { buildObservationIndexInput } from '../src/utils/observation-index-input';" \
+      'declare const memory: { indexObservation(input: unknown): Promise<void> };' \
+      'export async function indexObservationGroupsFromMessages(' \
+      '  memory: { indexObservation(input: unknown): Promise<void> },' \
+      '  candidate: unknown,' \
+      ') {' \
+      '  const input = buildObservationIndexInput(candidate);' \
+      '  if (!input) return;' \
+      '  await memory.indexObservation(input);' \
+      '}' \
+      'void indexObservationGroupsFromMessages(memory, {});' \
+      > mastracode/sdk/scripts/index-messages.ts
+    git add .
+    git commit -q -m 'authorize mastracode observation indexing'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/mastracode-observation-index-success.log"
+  run_fixture "$head_sha" "$output"
+  assert_contains 'turbo build --filter ./mastracode/sdk' "$command_log"
+  assert_contains '--filter ./mastracode/sdk --fail-if-no-match check' "$command_log"
+  assert_contains '--filter ./mastracode/sdk --fail-if-no-match build:lib' "$command_log"
+  assert_contains '--filter ./mastracode/sdk --fail-if-no-match lint' "$command_log"
+  assert_contains '--dir mastracode/sdk exec tsc-files --noEmit scripts/index-messages.ts' "$command_log"
+  assert_contains '--dir mastracode/sdk exec vitest run' "$command_log"
+  assert_contains 'src/utils/__tests__/observation-index-input.test.ts' "$command_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "import { buildObservationIndexInput } from '../src/utils/observation-index-input';" \
+      'declare const memory: { indexObservation(input: unknown): Promise<void> };' \
+      'export async function* indexObservationGroupsFromMessages(' \
+      '  memory: { indexObservation(input: unknown): Promise<void> },' \
+      '  candidate: unknown,' \
+      ') {' \
+      '  const input = buildObservationIndexInput(candidate);' \
+      '  if (!input) return;' \
+      '  await memory.indexObservation(input);' \
+      '}' \
+      'void indexObservationGroupsFromMessages(memory, {});' \
+      > mastracode/sdk/scripts/index-messages.ts
+    git add .
+    git commit -q -m 'hide observation indexing in a generator entrypoint'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/mastracode-observation-index-generator-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Generator-backed observation-index entrypoint unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'must pass buildObservationIndexInput output to every indexObservation call' "$output"
+  assert_contains 'mastracode/sdk/scripts/index-messages.ts' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Generator-backed observation-index entrypoint executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "import { buildObservationIndexInput } from '../src/utils/observation-index-input';" \
+      'declare const fakeSink: { indexObservation(input: unknown): Promise<void> };' \
+      'export async function indexObservationGroupsFromMessages(' \
+      '  memory: { indexObservation(input: unknown): Promise<void> },' \
+      '  candidate: unknown,' \
+      ') {' \
+      '  void memory;' \
+      '  const input = buildObservationIndexInput(candidate);' \
+      '  if (!input) return;' \
+      '  await fakeSink.indexObservation(input);' \
+      '}' \
+      'void indexObservationGroupsFromMessages(fakeSink, {});' \
+      > mastracode/sdk/scripts/index-messages.ts
+    git add .
+    git commit -q -m 'send observation input to an unrelated sink'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/mastracode-observation-index-fake-sink-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Unrelated observation-index sink unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'must pass buildObservationIndexInput output to every indexObservation call' "$output"
+  assert_contains 'mastracode/sdk/scripts/index-messages.ts' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Unrelated observation-index sink executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "import { buildObservationIndexInput } from '../src/utils/observation-index-input';" \
+      'declare const memory: { indexObservation?(input: unknown): Promise<void> };' \
+      'export async function indexObservationGroupsFromMessages(' \
+      '  memory: { indexObservation?(input: unknown): Promise<void> },' \
+      '  candidate: unknown,' \
+      ') {' \
+      '  const input = buildObservationIndexInput(candidate);' \
+      '  if (!input) return;' \
+      '  await memory?.indexObservation?.(input);' \
+      '}' \
+      'void indexObservationGroupsFromMessages(memory, {});' \
+      > mastracode/sdk/scripts/index-messages.ts
+    git add .
+    git commit -q -m 'make observation indexing optional'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/mastracode-observation-index-optional-call-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Optional observation-index invocation unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'must pass buildObservationIndexInput output to every indexObservation call' "$output"
+  assert_contains 'mastracode/sdk/scripts/index-messages.ts' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Optional observation-index invocation executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "import { buildObservationIndexInput } from '../src/utils/observation-index-input';" \
+      'declare const memory: { indexObservation(input: unknown): Promise<void> };' \
+      'export async function indexMessages(candidate: unknown) {' \
+      '  buildObservationIndexInput(candidate);' \
+      '  await memory.indexObservation(candidate);' \
+      '}' \
+      > mastracode/sdk/scripts/index-messages.ts
+    git add .
+    git commit -q -m 'bypass observation index authorization helper'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/mastracode-observation-index-bypass-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Observation-index helper bypass unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'must pass buildObservationIndexInput output to every indexObservation call' "$output"
+  assert_contains 'mastracode/sdk/scripts/index-messages.ts' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Observation-index helper bypass executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "import { buildObservationIndexInput } from '../src/utils/observation-index-input';" \
+      'declare const memory: { indexObservation(input: unknown): Promise<void> };' \
+      'export async function indexMessages(candidate: unknown) {' \
+      '  const input = buildObservationIndexInput(candidate);' \
+      '  if (!input) return;' \
+      '  input.recordId = "forged-record";' \
+      '  await memory.indexObservation(input);' \
+      '}' \
+      > mastracode/sdk/scripts/index-messages.ts
+    git add .
+    git commit -q -m 'mutate observation index authorization input'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/mastracode-observation-index-mutation-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Mutated observation-index helper result unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'must pass buildObservationIndexInput output to every indexObservation call' "$output"
+  assert_contains 'mastracode/sdk/scripts/index-messages.ts' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Mutated observation-index helper result executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "import { buildObservationIndexInput } from '../src/utils/observation-index-input';" \
+      'declare const memory: { indexObservation(input: unknown): Promise<void> };' \
+      'export async function indexMessages(candidate: unknown) {' \
+      '  const input = buildObservationIndexInput(candidate);' \
+      '  if (!input) return;' \
+      '  await memory.indexObservation(input);' \
+      '  await memory.indexObservation.call(memory, candidate);' \
+      '}' \
+      > mastracode/sdk/scripts/index-messages.ts
+    git add .
+    git commit -q -m 'invoke observation index authorization indirectly'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/mastracode-observation-index-indirect-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Indirect observation-index invocation unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'must pass buildObservationIndexInput output to every indexObservation call' "$output"
+  assert_contains 'mastracode/sdk/scripts/index-messages.ts' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Indirect observation-index invocation executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "import { buildObservationIndexInput } from '../src/utils/observation-index-input';" \
+      'declare const memory: { indexObservation(input: unknown): Promise<void>; [key: string]: any };' \
+      'export async function indexMessages(candidate: unknown) {' \
+      '  const input = buildObservationIndexInput(candidate);' \
+      '  if (!input) return;' \
+      '  await memory.indexObservation(input);' \
+      "  const method = ('indexObserv' + 'ation') as 'indexObservation';" \
+      '  await memory[method](candidate);' \
+      '}' \
+      'void indexMessages({});' \
+      > mastracode/sdk/scripts/index-messages.ts
+    git add .
+    git commit -q -m 'invoke observation index through a computed method'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/mastracode-observation-index-computed-method-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Computed observation-index invocation unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'must pass buildObservationIndexInput output to every indexObservation call' "$output"
+  assert_contains 'mastracode/sdk/scripts/index-messages.ts' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Computed observation-index invocation executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "import { buildObservationIndexInput } from '../src/utils/observation-index-input';" \
+      'declare const memory: { indexObservation(input: unknown): Promise<void>; [key: string]: any };' \
+      'export async function indexObservationGroupsFromMessages(' \
+      '  memory: { indexObservation(input: unknown): Promise<void>; [key: string]: any },' \
+      '  candidate: unknown,' \
+      ') {' \
+      "  const key = ['index', 'Observation'].join('');" \
+      '  const hiddenSink = memory[key];' \
+      '  await hiddenSink(candidate);' \
+      '  const input = buildObservationIndexInput(candidate);' \
+      '  if (!input) return;' \
+      '  await memory.indexObservation(input);' \
+      '}' \
+      'void indexObservationGroupsFromMessages(memory, {});' \
+      > mastracode/sdk/scripts/index-messages.ts
+    git add .
+    git commit -q -m 'alias observation indexing through a computed memory member'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/mastracode-observation-index-computed-alias-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Computed observation-index alias unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'must pass buildObservationIndexInput output to every indexObservation call' "$output"
+  assert_contains 'mastracode/sdk/scripts/index-messages.ts' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Computed observation-index alias executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "import { buildObservationIndexInput } from '../src/utils/observation-index-input';" \
+      'declare const memory: { indexObservation(input: unknown): Promise<void>; valueOf(): any };' \
+      'export async function indexObservationGroupsFromMessages(' \
+      '  memory: { indexObservation(input: unknown): Promise<void>; valueOf(): any },' \
+      '  candidate: unknown,' \
+      ') {' \
+      '  const input = buildObservationIndexInput(candidate);' \
+      '  if (!input) return;' \
+      '  await memory.indexObservation(input);' \
+      "  await Reflect.get(memory.valueOf(), ['index', 'Observation'].join(''))(candidate);" \
+      '}' \
+      'void indexObservationGroupsFromMessages(memory, {});' \
+      > mastracode/sdk/scripts/index-messages.ts
+    git add .
+    git commit -q -m 'invoke observation indexing through reflection'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/mastracode-observation-index-reflective-call-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Reflective observation-index invocation unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'must pass buildObservationIndexInput output to every indexObservation call' "$output"
+  assert_contains 'mastracode/sdk/scripts/index-messages.ts' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Reflective observation-index invocation executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "import { buildObservationIndexInput } from '../src/utils/observation-index-input';" \
+      'declare const memory: { indexObservation(input: unknown): Promise<void> };' \
+      'export function indexMessages(candidate: unknown) {' \
+      '  const neverInvoked = async () => {' \
+      '    const input = buildObservationIndexInput(candidate);' \
+      '    if (!input) return;' \
+      '    await memory.indexObservation(input);' \
+      '  };' \
+      '  void neverInvoked;' \
+      '}' \
+      'void indexMessages({});' \
+      > mastracode/sdk/scripts/index-messages.ts
+    git add .
+    git commit -q -m 'hide observation indexing in dormant closure'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/mastracode-observation-index-dormant-closure-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Dormant observation-index closure unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'must pass buildObservationIndexInput output to every indexObservation call' "$output"
+  assert_contains 'mastracode/sdk/scripts/index-messages.ts' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Dormant observation-index closure executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "import { buildObservationIndexInput } from '../src/utils/observation-index-input';" \
+      'declare const memory: { indexObservation(input: unknown): Promise<void> };' \
+      'export async function indexMessages(candidate: unknown) {' \
+      '  if (false) {' \
+      '    const input = buildObservationIndexInput(candidate);' \
+      '    if (!input) return;' \
+      '    await memory.indexObservation(input);' \
+      '  }' \
+      '}' \
+      'void indexMessages({});' \
+      > mastracode/sdk/scripts/index-messages.ts
+    git add .
+    git commit -q -m 'hide observation indexing in a static false branch'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/mastracode-observation-index-static-false-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Statically unreachable observation-index call unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'must pass buildObservationIndexInput output to every indexObservation call' "$output"
+  assert_contains 'mastracode/sdk/scripts/index-messages.ts' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Statically unreachable observation-index call executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "import { buildObservationIndexInput } from '../src/utils/observation-index-input';" \
+      'declare const memory: { indexObservation(input: unknown): Promise<void> };' \
+      'export async function indexObservationGroupsFromMessages(' \
+      '  memory: { indexObservation(input: unknown): Promise<void> },' \
+      '  candidate: unknown,' \
+      ') {' \
+      '  if (0) {' \
+      '    const input = buildObservationIndexInput(candidate);' \
+      '    if (!input) return;' \
+      '    await memory.indexObservation(input);' \
+      '  }' \
+      '}' \
+      'void indexObservationGroupsFromMessages(memory, {});' \
+      > mastracode/sdk/scripts/index-messages.ts
+    git add .
+    git commit -q -m 'hide observation indexing in a numeric false branch'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/mastracode-observation-index-numeric-false-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Numeric-false observation-index branch unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'must pass buildObservationIndexInput output to every indexObservation call' "$output"
+  assert_contains 'mastracode/sdk/scripts/index-messages.ts' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Numeric-false observation-index branch executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "import { buildObservationIndexInput } from '../src/utils/observation-index-input';" \
+      'declare const memory: { indexObservation(input: unknown): Promise<void> };' \
+      'export async function indexObservationGroupsFromMessages(' \
+      '  memory: { indexObservation(input: unknown): Promise<void> },' \
+      '  candidate: unknown,' \
+      ') {' \
+      '  if (1 < 0) {' \
+      '    const input = buildObservationIndexInput(candidate);' \
+      '    if (!input) return;' \
+      '    await memory.indexObservation(input);' \
+      '  }' \
+      '}' \
+      'void indexObservationGroupsFromMessages(memory, {});' \
+      > mastracode/sdk/scripts/index-messages.ts
+    git add .
+    git commit -q -m 'hide observation indexing in a constant-expression branch'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/mastracode-observation-index-constant-expression-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Constant-expression observation-index branch unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'must pass buildObservationIndexInput output to every indexObservation call' "$output"
+  assert_contains 'mastracode/sdk/scripts/index-messages.ts' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Constant-expression observation-index branch executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "import { buildObservationIndexInput } from '../src/utils/observation-index-input';" \
+      'declare const memory: { indexObservation(input: unknown): Promise<void> };' \
+      'export async function indexObservationGroupsFromMessages(' \
+      '  memory: { indexObservation(input: unknown): Promise<void> },' \
+      '  candidate: unknown,' \
+      ') {' \
+      "  switch ('skip' as string) {" \
+      "    case 'run': {" \
+      '      const input = buildObservationIndexInput(candidate);' \
+      '      if (!input) return;' \
+      '      await memory.indexObservation(input);' \
+      '      break;' \
+      '    }' \
+      '  }' \
+      '}' \
+      'void indexObservationGroupsFromMessages(memory, {});' \
+      > mastracode/sdk/scripts/index-messages.ts
+    git add .
+    git commit -q -m 'hide observation indexing in an unmatched switch case'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/mastracode-observation-index-switch-case-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Unmatched switch-case observation-index branch unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'must pass buildObservationIndexInput output to every indexObservation call' "$output"
+  assert_contains 'mastracode/sdk/scripts/index-messages.ts' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Unmatched switch-case observation-index branch executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "import { buildObservationIndexInput } from '../src/utils/observation-index-input';" \
+      'declare const memory: { indexObservation(input: unknown): Promise<void> };' \
+      'export async function indexObservationGroupsFromMessages(' \
+      '  memory: { indexObservation(input: unknown): Promise<void> },' \
+      '  candidate: unknown,' \
+      ') {' \
+      "  switch ('run' as string) {" \
+      "    case 'run':" \
+      '      break;' \
+      '    default: {' \
+      '      const input = buildObservationIndexInput(candidate);' \
+      '      if (!input) return;' \
+      '      await memory.indexObservation(input);' \
+      '      break;' \
+      '    }' \
+      '  }' \
+      '}' \
+      'void indexObservationGroupsFromMessages(memory, {});' \
+      > mastracode/sdk/scripts/index-messages.ts
+    git add .
+    git commit -q -m 'hide observation indexing in a shadowed switch default'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/mastracode-observation-index-switch-default-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Shadowed switch-default observation-index branch unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'must pass buildObservationIndexInput output to every indexObservation call' "$output"
+  assert_contains 'mastracode/sdk/scripts/index-messages.ts' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Shadowed switch-default observation-index branch executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "import { buildObservationIndexInput } from '../src/utils/observation-index-input';" \
+      'declare const memory: { indexObservation(input: unknown): Promise<void> };' \
+      'export async function indexMessages(candidate: unknown) {' \
+      '  const input = buildObservationIndexInput(candidate);' \
+      '  if (!input) return;' \
+      '  await memory.indexObservation(input);' \
+      '}' \
+      'false && indexMessages({});' \
+      > mastracode/sdk/scripts/index-messages.ts
+    git add .
+    git commit -q -m 'hide observation indexing behind a short-circuited entrypoint'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/mastracode-observation-index-short-circuit-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Short-circuited observation-index entrypoint unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'must pass buildObservationIndexInput output to every indexObservation call' "$output"
+  assert_contains 'mastracode/sdk/scripts/index-messages.ts' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Short-circuited observation-index entrypoint executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "import { buildObservationIndexInput } from '../src/utils/observation-index-input';" \
+      'declare const memory: { indexObservation(input: unknown): Promise<void> };' \
+      'export async function indexObservationGroupsFromMessages(' \
+      '  memory: { indexObservation(input: unknown): Promise<void> },' \
+      '  candidate: unknown,' \
+      ') {' \
+      '  const input = buildObservationIndexInput(candidate);' \
+      '  if (!input) return;' \
+      '  await memory.indexObservation(input);' \
+      '}' \
+      'class DormantInvocation {' \
+      '  result = indexObservationGroupsFromMessages(memory, {});' \
+      '}' \
+      'void DormantInvocation;' \
+      > mastracode/sdk/scripts/index-messages.ts
+    git add .
+    git commit -q -m 'hide observation indexing in an unconstructed class'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/mastracode-observation-index-dormant-class-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Dormant class observation-index entrypoint unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'must pass buildObservationIndexInput output to every indexObservation call' "$output"
+  assert_contains 'mastracode/sdk/scripts/index-messages.ts' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Dormant class observation-index entrypoint executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "import { buildObservationIndexInput } from '../src/utils/observation-index-input';" \
+      'declare const memory: { indexObservation(input: unknown): Promise<void> };' \
+      'export async function indexMessages(candidate: unknown) {' \
+      '  return;' \
+      '  const input = buildObservationIndexInput(candidate);' \
+      '  if (!input) return;' \
+      '  await memory.indexObservation(input);' \
+      '}' \
+      'void indexMessages({});' \
+      > mastracode/sdk/scripts/index-messages.ts
+    git add .
+    git commit -q -m 'hide observation indexing after an unconditional return'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/mastracode-observation-index-post-return-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Post-return observation-index call unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'must pass buildObservationIndexInput output to every indexObservation call' "$output"
+  assert_contains 'mastracode/sdk/scripts/index-messages.ts' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Post-return observation-index call executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "import { buildObservationIndexInput } from '../src/utils/observation-index-input';" \
+      'declare const memory: { indexObservation(input: unknown): Promise<void> };' \
+      'void buildObservationIndexInput;' \
+      'export async function indexMessages(candidate: unknown) {' \
+      '  function buildObservationIndexInput(input: unknown) {' \
+      '    return input;' \
+      '  }' \
+      '  const input = buildObservationIndexInput(candidate);' \
+      '  await memory.indexObservation(input);' \
+      '}' \
+      > mastracode/sdk/scripts/index-messages.ts
+    git add .
+    git commit -q -m 'shadow observation index authorization helper'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/mastracode-observation-index-shadow-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Shadowed observation-index helper unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'must pass buildObservationIndexInput output to every indexObservation call' "$output"
+  assert_contains 'mastracode/sdk/scripts/index-messages.ts' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Shadowed observation-index helper executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      'export function buildObservationIndexInput(candidate: unknown) {' \
+      '  return { candidate, recordId: "helper-only-record-id-change" };' \
+      '}' \
+      > mastracode/sdk/src/utils/observation-index-input.ts
+    git add .
+    git commit -q -m 'change observation index helper only'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/mastracode-observation-helper-success.log"
+  run_fixture "$head_sha" "$output"
+  assert_contains 'Forcing owned MastraCode suites to run for source-only changes:' "$output"
+  assert_contains 'mastracode/sdk/src/utils/__tests__/observation-index-input.test.ts' "$output"
+  assert_contains 'turbo build --filter ./mastracode/sdk' "$command_log"
+  assert_contains '--dir mastracode/sdk exec tsc-files --noEmit scripts/index-messages.ts' "$command_log"
+  assert_contains '--dir mastracode/sdk exec vitest run' "$command_log"
+  assert_contains 'src/utils/__tests__/observation-index-input.test.ts' "$command_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
     printf '%s\n' 'export const googleCloudPubSub = "source-only-head";' \
       > pubsub/google-cloud-pubsub/src/index.ts
     git add .
@@ -3201,6 +4526,837 @@ NODE
   assert_contains '--filter ./stores/libsql --fail-if-no-match lint' "$command_log"
   assert_contains '--dir stores/libsql exec vitest run' "$command_log"
   assert_contains 'src/storage/domains/harness/index.test.ts' "$command_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'export const libsqlStore = "transactional-harness-wiring";' \
+      > stores/libsql/src/storage/index.ts
+    git add .
+    git commit -q -m 'libsql composite harness wiring'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/libsql-index-production-success.log"
+  run_fixture "$head_sha" "$output"
+  assert_contains 'Forcing PF-2044 owned suites to run for source-only changes:' "$output"
+  assert_contains 'stores/libsql/src/storage/index.test.ts' "$output"
+  assert_contains '--filter ./stores/libsql --fail-if-no-match exec tsc --noEmit' "$command_log"
+  assert_contains '--filter ./stores/libsql --fail-if-no-match build:lib' "$command_log"
+  assert_contains '--filter ./stores/libsql --fail-if-no-match lint' "$command_log"
+  assert_contains '--dir stores/libsql exec vitest run' "$command_log"
+  assert_contains 'src/storage/index.test.ts' "$command_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "import type { HarnessRoute } from '../route-types.generated.js';" \
+      'export type ClientHarnessRoute = HarnessRoute & { permissions: "durable" };' \
+      > client-sdks/client-js/src/resources/harness.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('client harness head', () => {});" \
+      > client-sdks/client-js/src/resources/harness.test.ts
+    printf '%s\n' '# Harness session contract' '' 'PF-2246 aggregate contract.' \
+      > harnessv1/sections/04-public-api/02-session/messages.md
+    printf '%s\n' \
+      'export function buildObservationIndexInput(candidate: unknown) {' \
+      '  return { candidate, recordId: "record-1" };' \
+      '}' \
+      > mastracode/sdk/src/utils/observation-index-input.ts
+    printf '%s\n' \
+      "import { it } from 'vitest';" \
+      "import { buildObservationIndexInput } from '../observation-index-input';" \
+      "it('authorizes observation indexing', () => buildObservationIndexInput);" \
+      > mastracode/sdk/src/utils/__tests__/observation-index-input.test.ts
+    printf '%s\n' \
+      "import { buildObservationIndexInput } from '../src/utils/observation-index-input';" \
+      'declare const memory: { indexObservation(input: unknown): Promise<void> };' \
+      'export async function indexObservationGroupsFromMessages(' \
+      '  memory: { indexObservation(input: unknown): Promise<void> },' \
+      '  candidate: unknown,' \
+      ') {' \
+      '  const input = buildObservationIndexInput(candidate);' \
+      '  if (!input) return;' \
+      '  await memory.indexObservation(input);' \
+      '}' \
+      'void indexObservationGroupsFromMessages(memory, {});' \
+      > mastracode/sdk/scripts/index-messages.ts
+    printf '%s\n' \
+      "import { openai } from '@ai-sdk/openai-v5';" \
+      "import { describe, expect, it } from 'vitest';" \
+      "describe('Supervisor Pattern Integration Tests', () => {" \
+      "  it('supervisor integration head', () => expect(true).toBe(true));" \
+      '});' \
+      "describe('Supervisor Pattern - Working memory forwarding', () => {" \
+      '  it.skipIf(!process.env.OPENAI_API_KEY)(' \
+      "    'keeps the reviewed provider smoke guarded'," \
+      "    () => void openai('gpt-4o-mini')," \
+      '  );' \
+      '});' \
+      > packages/core/src/agent/__tests__/supervisor-integration.test.ts
+    printf '%s\n' \
+      "import { createGatewayMock } from '@internal/test-utils';" \
+      "import { afterAll, beforeAll, it } from 'vitest';" \
+      'const mock = createGatewayMock({});' \
+      'beforeAll(() => mock.start());' \
+      'afterAll(() => mock.saveAndStop());' \
+      'export function toolApprovalAndSuspensionTests() {' \
+      "  it('tool approval head', () => {});" \
+      '}' \
+      > packages/core/src/agent/__tests__/tool-approval.e2e.test.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('permission gate head', () => {});" \
+      > packages/core/src/harness/v1/session.permission-gate.e2e.test.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('plan task head', () => {});" \
+      > packages/core/src/harness/v1/session.plan-task.e2e.test.ts
+    printf '%s\n' 'export const harnessConformance = "pf-2246-head";' \
+      > stores/_test-utils/src/domains/harness/index.ts
+    printf '%s\n' \
+      "import { describe } from 'vitest';" \
+      "import { createHarnessTest } from './domains/harness';" \
+      'export function createTestSuite(storage: unknown) {' \
+      "  describe('Harness', () => {" \
+      '    createHarnessTest({ storage });' \
+      '  });' \
+      "  describe('Other domain', () => {});" \
+      '}' \
+      > stores/_test-utils/src/factory.ts
+    printf '%s\n' 'export const libsqlStore = "transactional-harness-wiring";' \
+      > stores/libsql/src/storage/index.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('libsql composite head', () => {});" \
+      > stores/libsql/src/storage/index.test.ts
+    printf '%s\n' \
+      'export type InngestAgentResumeOptions = { requireToolPermissionPolicy?: true; head?: true };' \
+      > workflows/inngest/src/durable-agent/create-inngest-agent.ts
+    printf '%s\n' \
+      "import { expectTypeOf, it } from 'vitest';" \
+      "import type { InngestAgentResumeOptions } from './create-inngest-agent';" \
+      "it('keeps resume permission monotonic', () => expectTypeOf<InngestAgentResumeOptions>().toBeObject());" \
+      > workflows/inngest/src/durable-agent/create-inngest-agent.test-d.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('create inngest agent head', () => {});" \
+      > workflows/inngest/src/__tests__/create-inngest-agent.test.ts
+    git add .
+    git commit -q -m 'PF-2246 aggregate validation footprint'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  : > "$command_environment_log"
+  output="$test_root/pf2246-aggregate-success.log"
+  run_fixture "$head_sha" "$output" OPENAI_API_KEY=fixture-secret
+  assert_contains '--dir mastracode/sdk exec tsc-files --noEmit scripts/index-messages.ts' "$command_log"
+  assert_contains 'exec tsc-files --noEmit stores/_test-utils/src/domains/harness/index.ts stores/_test-utils/src/factory.ts stores/_test-utils/src/index.test.ts' "$command_log"
+  assert_contains '--dir stores/_test-utils exec vitest run' "$command_log"
+  assert_contains 'src/index.test.ts' "$command_log"
+  for expected_test in \
+    packages/core/src/agent/__tests__/supervisor-integration.test.ts \
+    packages/core/src/agent/__tests__/tool-approval.e2e.test.ts \
+    packages/core/src/harness/v1/session.permission-gate.e2e.test.ts \
+    packages/core/src/harness/v1/session.plan-task.e2e.test.ts; do
+    assert_contains "Running changed test file in full: $expected_test" "$output"
+    assert_contains "${expected_test#packages/core/}" "$command_log"
+  done
+  assert_contains \
+    $'LLM_TEST_MODE=replay\t--dir packages/core exec vitest run' \
+    "$command_environment_log"
+  assert_contains \
+    $'OPENAI_API_KEY=\t--dir packages/core exec vitest run' \
+    "$command_environment_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "import { openai } from '@ai-sdk/openai-v5';" \
+      "import { describe, expect, it } from 'vitest';" \
+      "describe('Supervisor Pattern Integration Tests', () => {" \
+      "  it('supervisor integration head', () => expect(true).toBe(true));" \
+      '});' \
+      "describe('Supervisor Pattern - Working memory forwarding', () => {" \
+      '  it(' \
+      "    'enable the provider smoke'," \
+      "    () => void openai('gpt-4o-mini')," \
+      '  );' \
+      '});' \
+      > packages/core/src/agent/__tests__/supervisor-integration.test.ts
+    git add .
+    git commit -q -m 'enable the supervisor provider smoke'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/core-supervisor-provider-gate-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Enabled supervisor provider smoke unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'may not modify the reviewed real-provider suite' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Enabled supervisor provider smoke executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "import { createGatewayMock } from '@internal/test-utils';" \
+      "import { afterAll, beforeAll, it } from 'vitest';" \
+      "const mock = createGatewayMock({ mode: 'live' });" \
+      'beforeAll(() => mock.start());' \
+      'afterAll(() => mock.saveAndStop());' \
+      'export function toolApprovalAndSuspensionTests() {' \
+      "  it('tool approval head', () => {});" \
+      '}' \
+      > packages/core/src/agent/__tests__/tool-approval.e2e.test.ts
+    git add .
+    git commit -q -m 'override the tool approval replay mode'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/core-tool-approval-live-mode-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Live tool-approval recorder mode unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'may not modify its reviewed recorder setup or lifecycle' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Live tool-approval recorder mode executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    rm packages/core/src/agent/__tests__/tool-approval.e2e.test.ts
+    ln -s supervisor-integration.test.ts \
+      packages/core/src/agent/__tests__/tool-approval.e2e.test.ts
+    git add .
+    git commit -q -m 'replace exact Core exception with a symlink'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/core-exact-test-symlink-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Symlinked exact Core exception unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'packages/core/src/agent/__tests__/tool-approval.e2e.test.ts' "$output"
+  assert_contains 'Failing closed instead of reporting incomplete validation as successful.' "$output"
+  if grep -Fq -- 'exec vitest run' "$command_log"; then
+    echo 'Symlinked exact Core exception executed a test suite.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    rm packages/core/src/harness/v1/session.permission-gate.e2e.test.ts
+    ln -s missing-target.ts \
+      packages/core/src/harness/v1/session.permission-gate.e2e.test.ts
+    git add .
+    git commit -q -m 'replace exact Core exception with a dangling symlink'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/core-exact-test-dangling-symlink-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Dangling exact Core exception unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'packages/core/src/harness/v1/session.permission-gate.e2e.test.ts' "$output"
+  assert_contains 'Failing closed instead of reporting incomplete validation as successful.' "$output"
+  if grep -Fq -- 'exec vitest run' "$command_log"; then
+    echo 'Dangling exact Core exception executed a test suite.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'export const harnessConformance = "detached-head";' \
+      > stores/_test-utils/src/domains/harness/index.ts
+    printf '%s\n' \
+      "import { describe } from 'vitest';" \
+      "// import { createHarnessTest } from './domains/harness';" \
+      'export function createTestSuite(_storage: unknown) {' \
+      "  describe('Harness', () => {" \
+      '    // createHarnessTest({ storage });' \
+      '  });' \
+      '}' \
+      > stores/_test-utils/src/factory.ts
+    printf '%s\n' "it('unrelated changed test', () => {});" \
+      >> stores/_test-utils/src/index.test.ts
+    git add .
+    git commit -q -m 'detach shared Harness registration'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/storage-harness-detached-registration-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Detached shared Harness registration unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'These files are outside the PF-2044 owned source-and-test maps:' "$output"
+  assert_contains 'stores/_test-utils/src/factory.ts' "$output"
+  assert_contains 'Failing closed instead of reporting Core-only validation as workspace coverage.' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Detached shared Harness registration executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'export const harnessConformance = "mocked-registration-head";' \
+      > stores/_test-utils/src/domains/harness/index.ts
+    printf '%s\n' \
+      "import { describe, vi } from 'vitest';" \
+      "import { createHarnessTest } from './domains/harness';" \
+      "vi.mock('./domains/' + 'harness', () => ({ createHarnessTest: () => undefined }));" \
+      'export function createTestSuite(storage: unknown) {' \
+      "  describe('Harness', () => {" \
+      '    createHarnessTest({ storage });' \
+      '  });' \
+      '}' \
+      > stores/_test-utils/src/factory.ts
+    git add .
+    git commit -q -m 'mock shared Harness registration'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/storage-harness-mocked-registration-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Mocked shared Harness registration unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'must import createHarnessTest and register it unconditionally' "$output"
+  assert_contains 'stores/_test-utils/src/factory.ts' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Mocked shared Harness registration executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'export const harnessConformance = "mocked-entrypoint-head";' \
+      > stores/_test-utils/src/domains/harness/index.ts
+    printf '%s\n' \
+      "import { MockStore } from '@mastra/core/storage';" \
+      "import { vi } from 'vitest';" \
+      "import { createTestSuite } from './factory';" \
+      "vi.mock('./' + 'factory', () => ({ createTestSuite: () => undefined }));" \
+      'createTestSuite(new MockStore());' \
+      > stores/_test-utils/src/index.test.ts
+    git add .
+    git commit -q -m 'mock shared Harness entrypoint'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/storage-harness-mocked-entrypoint-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Mocked shared Harness entrypoint unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains \
+    'must import createTestSuite and invoke it unconditionally at module scope with a new MockStore' \
+    "$output"
+  assert_contains 'stores/_test-utils/src/index.test.ts' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Mocked shared Harness entrypoint executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'export const harnessConformance = "mocked-store-head";' \
+      > stores/_test-utils/src/domains/harness/index.ts
+    printf '%s\n' \
+      "import { MockStore } from '@mastra/core/storage';" \
+      "import { vi } from 'vitest';" \
+      "import { createTestSuite } from './factory';" \
+      "vi.mock('@mastra/core/storage', () => ({ MockStore: class {} }));" \
+      'createTestSuite(new MockStore());' \
+      > stores/_test-utils/src/index.test.ts
+    git add .
+    git commit -q -m 'mock the in-memory store behind the shared Harness entrypoint'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/storage-harness-mocked-store-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Mocked in-memory store unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains \
+    'must import createTestSuite and invoke it unconditionally at module scope with a new MockStore' \
+    "$output"
+  assert_contains 'stores/_test-utils/src/index.test.ts' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Mocked in-memory store executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'export const harnessConformance = "shadowed-registration-head";' \
+      > stores/_test-utils/src/domains/harness/index.ts
+    printf '%s\n' \
+      "import { describe } from 'vitest';" \
+      "import { createHarnessTest } from './domains/harness';" \
+      'void describe;' \
+      'void createHarnessTest;' \
+      'export function createTestSuite(storage: unknown) {' \
+      '  function describe(_name: string, callback: () => void) {' \
+      '    callback();' \
+      '  }' \
+      '  function createHarnessTest(_options: { storage: unknown }) {}' \
+      "  describe('Harness', () => {" \
+      '    createHarnessTest({ storage });' \
+      '  });' \
+      '}' \
+      > stores/_test-utils/src/factory.ts
+    git add .
+    git commit -q -m 'shadow shared Harness registration imports'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/storage-harness-shadowed-registration-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Shadowed shared Harness registration unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'must import createHarnessTest and register it unconditionally' "$output"
+  assert_contains 'stores/_test-utils/src/factory.ts' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Shadowed shared Harness registration executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'export const harnessConformance = "generator-registration-head";' \
+      > stores/_test-utils/src/domains/harness/index.ts
+    printf '%s\n' \
+      "import { describe } from 'vitest';" \
+      "import { createHarnessTest } from './domains/harness';" \
+      'export function createTestSuite(storage: unknown) {' \
+      "  describe('Harness', function* () {" \
+      '    createHarnessTest({ storage });' \
+      '  });' \
+      '}' \
+      > stores/_test-utils/src/factory.ts
+    git add .
+    git commit -q -m 'hide shared Harness registration in a generator callback'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/storage-harness-generator-registration-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Generator-backed shared Harness registration unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'must import createHarnessTest and register it unconditionally' "$output"
+  assert_contains 'stores/_test-utils/src/factory.ts' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Generator-backed shared Harness registration executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'export const harnessConformance = "outer-generator-registration-head";' \
+      > stores/_test-utils/src/domains/harness/index.ts
+    printf '%s\n' \
+      "import { describe } from 'vitest';" \
+      "import { createHarnessTest } from './domains/harness';" \
+      'export function* createTestSuite(storage: unknown) {' \
+      "  describe('Harness', () => {" \
+      '    createHarnessTest({ storage });' \
+      '  });' \
+      '}' \
+      > stores/_test-utils/src/factory.ts
+    git add .
+    git commit -q -m 'hide shared Harness registration in a generator factory'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/storage-harness-outer-generator-registration-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Generator-backed shared Harness factory unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'must import createHarnessTest and register it unconditionally' "$output"
+  assert_contains 'stores/_test-utils/src/factory.ts' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Generator-backed shared Harness factory executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'export const harnessConformance = "async-registration-head";' \
+      > stores/_test-utils/src/domains/harness/index.ts
+    printf '%s\n' \
+      "import { describe } from 'vitest';" \
+      "import { createHarnessTest } from './domains/harness';" \
+      'export async function createTestSuite(storage: unknown) {' \
+      '  await Promise.resolve();' \
+      "  describe('Harness', () => {" \
+      '    createHarnessTest({ storage });' \
+      '  });' \
+      '}' \
+      > stores/_test-utils/src/factory.ts
+    git add .
+    git commit -q -m 'defer shared Harness registration in an async factory'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/storage-harness-async-registration-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Async shared Harness factory unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'must import createHarnessTest and register it unconditionally' "$output"
+  assert_contains 'stores/_test-utils/src/factory.ts' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Async shared Harness factory executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'export const harnessConformance = "guarded-registration-head";' \
+      > stores/_test-utils/src/domains/harness/index.ts
+    printf '%s\n' \
+      "import { describe } from 'vitest';" \
+      "import { createHarnessTest } from './domains/harness';" \
+      'export function createTestSuite(storage: unknown) {' \
+      "  describe('Harness', () => {" \
+      '    if (storage) return;' \
+      '    createHarnessTest({ storage });' \
+      '  });' \
+      '}' \
+      > stores/_test-utils/src/factory.ts
+    git add .
+    git commit -q -m 'guard shared Harness registration'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/storage-harness-guarded-registration-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Guarded shared Harness registration unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'must import createHarnessTest and register it unconditionally' "$output"
+  assert_contains 'stores/_test-utils/src/factory.ts' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Guarded shared Harness registration executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'export const harnessConformance = "outer-guarded-registration-head";' \
+      > stores/_test-utils/src/domains/harness/index.ts
+    printf '%s\n' \
+      "import { describe } from 'vitest';" \
+      "import { createHarnessTest } from './domains/harness';" \
+      'export function createTestSuite(storage: unknown) {' \
+      '  if (storage) return;' \
+      "  describe('Harness', () => {" \
+      '    createHarnessTest({ storage });' \
+      '  });' \
+      '}' \
+      > stores/_test-utils/src/factory.ts
+    git add .
+    git commit -q -m 'guard outer shared Harness registration'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/storage-harness-outer-guarded-registration-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Outer-guarded shared Harness registration unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'must import createHarnessTest and register it unconditionally' "$output"
+  assert_contains 'stores/_test-utils/src/factory.ts' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Outer-guarded shared Harness registration executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'export const harnessConformance = "reassigned-storage-registration-head";' \
+      > stores/_test-utils/src/domains/harness/index.ts
+    printf '%s\n' \
+      "import { describe } from 'vitest';" \
+      "import { createHarnessTest } from './domains/harness';" \
+      'export function createTestSuite(storage: unknown) {' \
+      '  storage = undefined;' \
+      "  describe('Harness', () => {" \
+      '    createHarnessTest({ storage });' \
+      '  });' \
+      '}' \
+      > stores/_test-utils/src/factory.ts
+    git add .
+    git commit -q -m 'replace shared Harness storage before registration'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/storage-harness-reassigned-storage-registration-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Reassigned shared Harness storage unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'must import createHarnessTest and register it unconditionally' "$output"
+  assert_contains 'stores/_test-utils/src/factory.ts' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Reassigned shared Harness storage executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'export const harnessConformance = "overridden-storage-registration-head";' \
+      > stores/_test-utils/src/domains/harness/index.ts
+    printf '%s\n' \
+      "import { describe } from 'vitest';" \
+      "import { createHarnessTest } from './domains/harness';" \
+      'export function createTestSuite(storage: unknown) {' \
+      "  describe('Harness', () => {" \
+      '    createHarnessTest({ storage, ...{ storage: undefined } });' \
+      '  });' \
+      '}' \
+      > stores/_test-utils/src/factory.ts
+    git add .
+    git commit -q -m 'override shared Harness storage registration'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/storage-harness-overridden-storage-registration-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Overridden shared Harness storage registration unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'must import createHarnessTest and register it unconditionally' "$output"
+  assert_contains 'stores/_test-utils/src/factory.ts' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Overridden shared Harness storage registration executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "import { MockStore } from '@mastra/core/storage';" \
+      "import { createTestSuite } from './factory';" \
+      'void MockStore;' \
+      'void createTestSuite;' \
+      > stores/_test-utils/src/index.test.ts
+    git add .
+    git commit -q -m 'detach shared Harness entrypoint'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/storage-harness-detached-entrypoint-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Detached shared Harness entrypoint unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'must import createTestSuite and invoke it unconditionally at module scope with a new MockStore' "$output"
+  assert_contains 'stores/_test-utils/src/index.test.ts' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Detached shared Harness entrypoint executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' "import { it } from 'vitest';" "it('unknown Core E2E', () => {});" \
+      > packages/core/src/harness/v1/session.unreviewed.e2e.test.ts
+    git add .
+    git commit -q -m 'unreviewed Core E2E'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/core-unknown-e2e-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Unknown Core E2E fixture unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'packages/core/src/harness/v1/session.unreviewed.e2e.test.ts' "$output"
+  assert_contains 'Failing closed instead of reporting incomplete validation as successful.' "$output"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'export const harnessConformance = "owned-plus-unreviewed-head";' \
+      > stores/_test-utils/src/domains/harness/index.ts
+    printf '%s\n' 'export const unknownHarnessFixture = true;' \
+      > stores/_test-utils/src/domains/harness/unreviewed.ts
+    git add .
+    git commit -q -m 'unreviewed shared Harness source'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/storage-harness-unknown-source-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Unknown shared Harness source fixture unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'Storage test utility changes must include a changed Vitest file' "$output"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'export const unknownStorageHelper = true;' \
+      > stores/_test-utils/src/unreviewed.ts
+    ln -s missing-target.ts stores/_test-utils/src/authored.test.ts
+    git add .
+    git commit -q -m 'pair storage helper with dangling test symlink'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/storage-test-utils-dangling-test-symlink-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Dangling Storage Test Utils test symlink unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'stores/_test-utils/src/authored.test.ts' "$output"
+  assert_contains 'Failing closed instead of reporting incomplete validation as successful.' "$output"
+  if grep -Fq -- '--dir stores/_test-utils exec vitest run' "$command_log"; then
+    echo 'Dangling Storage Test Utils test symlink executed the shared suite.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
 
   head_sha="$(
     cd "$fixture_repo"
@@ -4275,6 +6431,1423 @@ git diff --no-renames --name-only --diff-filter=D "${merge_base_sha}..${HEAD_SHA
 echo "Changed files:"
 cat "$changed_files"
 
+git_regular_file_at_head() {
+  git ls-tree "$HEAD_SHA" -- "$1" | grep -Eq '^100(644|755) blob '
+}
+
+core_supervisor_test_preserves_provider_gate() {
+  node - "$merge_base_sha" "$HEAD_SHA" <<'NODE'
+const { execFileSync } = require('node:child_process');
+const ts = require('typescript');
+
+const [baseSha, headSha] = process.argv.slice(2);
+const file = 'packages/core/src/agent/__tests__/supervisor-integration.test.ts';
+const read = sha => execFileSync('git', ['show', `${sha}:${file}`], { encoding: 'utf8' });
+const parse = source => ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+const baseSource = read(baseSha);
+const headSource = read(headSha);
+const base = parse(baseSource);
+const head = parse(headSource);
+
+function importTexts(sourceFile) {
+  return sourceFile.statements
+    .filter(ts.isImportDeclaration)
+    .map(statement => statement.getText(sourceFile));
+}
+
+if (JSON.stringify(importTexts(base)) !== JSON.stringify(importTexts(head))) {
+  throw new Error(`${file} may not change imports while it is admitted as a provider-safe exact suite.`);
+}
+
+function rootIdentifier(expression) {
+  let current = expression;
+  while (
+    ts.isPropertyAccessExpression(current) ||
+    ts.isElementAccessExpression(current)
+  ) {
+    current = current.expression;
+  }
+  return ts.isIdentifier(current) ? current.text : undefined;
+}
+
+function providerSuites(sourceFile) {
+  const suites = [];
+  function visit(node) {
+    if (
+      ts.isCallExpression(node) &&
+      rootIdentifier(node.expression) === 'describe' &&
+      node.arguments[0] &&
+      ts.isStringLiteralLike(node.arguments[0]) &&
+      node.arguments[0].text === 'Supervisor Pattern - Working memory forwarding'
+    ) {
+      suites.push(node);
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(sourceFile);
+  return suites;
+}
+
+const baseSuites = providerSuites(base);
+const headSuites = providerSuites(head);
+if (baseSuites.length !== 1 || headSuites.length !== 1) {
+  throw new Error(`${file} must retain exactly one reviewed working-memory provider suite.`);
+}
+const baseSuiteText = baseSuites[0].getText(base);
+const headSuite = headSuites[0];
+const headSuiteText = headSuite.getText(head);
+if (baseSuiteText !== headSuiteText) {
+  throw new Error(`${file} may not modify the reviewed real-provider suite.`);
+}
+if (!headSuiteText.includes('it.skipIf(!process.env.OPENAI_API_KEY)')) {
+  throw new Error(`${file} must keep its real-provider test behind the empty-key skip gate.`);
+}
+
+let openAiLocalName;
+for (const statement of head.statements) {
+  if (
+    ts.isImportDeclaration(statement) &&
+    ts.isStringLiteralLike(statement.moduleSpecifier) &&
+    statement.moduleSpecifier.text === '@ai-sdk/openai-v5' &&
+    statement.importClause?.namedBindings &&
+    ts.isNamedImports(statement.importClause.namedBindings)
+  ) {
+    for (const element of statement.importClause.namedBindings.elements) {
+      if ((element.propertyName ?? element.name).text === 'openai') {
+        openAiLocalName = element.name.text;
+      }
+    }
+  }
+}
+if (!openAiLocalName) {
+  throw new Error(`${file} no longer has the reviewed OpenAI provider binding.`);
+}
+
+function insideProviderSuite(node) {
+  return node.getStart(head) >= headSuite.getStart(head) && node.getEnd() <= headSuite.getEnd();
+}
+
+let invalidReference = false;
+function visit(node) {
+  if (
+    ts.isIdentifier(node) &&
+    (node.text === openAiLocalName || node.text === 'process') &&
+    !insideProviderSuite(node)
+  ) {
+    const inReviewedImport =
+      ts.isImportSpecifier(node.parent) ||
+      (ts.isImportClause(node.parent) && node.parent.name === node);
+    if (!inReviewedImport) invalidReference = true;
+  }
+  ts.forEachChild(node, visit);
+}
+visit(head);
+
+if (invalidReference) {
+  throw new Error(`${file} may not enable or reuse its real-provider binding outside the frozen skipped suite.`);
+}
+NODE
+}
+
+tool_approval_test_preserves_replay_harness() {
+  node - "$merge_base_sha" "$HEAD_SHA" <<'NODE'
+const { execFileSync } = require('node:child_process');
+const ts = require('typescript');
+
+const [baseSha, headSha] = process.argv.slice(2);
+const file = 'packages/core/src/agent/__tests__/tool-approval.e2e.test.ts';
+const read = sha => execFileSync('git', ['show', `${sha}:${file}`], { encoding: 'utf8' });
+const parse = source => ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+const baseSource = read(baseSha);
+const headSource = read(headSha);
+const base = parse(baseSource);
+const head = parse(headSource);
+
+function imports(sourceFile) {
+  return sourceFile.statements
+    .filter(ts.isImportDeclaration)
+    .map(statement => statement.getText(sourceFile));
+}
+if (JSON.stringify(imports(base)) !== JSON.stringify(imports(head))) {
+  throw new Error(`${file} may not change imports while using the recorder-backed exact-suite exception.`);
+}
+
+function entrypoint(sourceFile) {
+  const matches = sourceFile.statements.filter(
+    statement =>
+      ts.isFunctionDeclaration(statement) &&
+      statement.name?.text === 'toolApprovalAndSuspensionTests',
+  );
+  if (matches.length !== 1) {
+    throw new Error(`${file} must retain exactly one toolApprovalAndSuspensionTests entrypoint.`);
+  }
+  return matches[0];
+}
+
+const baseEntrypoint = entrypoint(base);
+const headEntrypoint = entrypoint(head);
+const basePrelude = baseSource.slice(0, baseEntrypoint.getStart(base));
+const headPrelude = headSource.slice(0, headEntrypoint.getStart(head));
+if (basePrelude !== headPrelude) {
+  throw new Error(`${file} may not modify its reviewed recorder setup or lifecycle.`);
+}
+for (const fragment of [
+  'const mock = createGatewayMock(',
+  'beforeAll(() => mock.start());',
+  'afterAll(() => mock.saveAndStop());',
+]) {
+  if (!headPrelude.includes(fragment)) {
+    throw new Error(`${file} is missing reviewed replay-harness fragment: ${fragment}`);
+  }
+}
+
+let gatewayCalls = 0;
+let unsafeGatewayOptions = false;
+let unsafeSuffixReference = false;
+function propertyName(name) {
+  if (ts.isIdentifier(name) || ts.isStringLiteralLike(name)) return name.text;
+}
+function visit(node) {
+  if (
+    ts.isCallExpression(node) &&
+    ts.isIdentifier(node.expression) &&
+    node.expression.text === 'createGatewayMock'
+  ) {
+    gatewayCalls++;
+    const options = node.arguments[0];
+    if (!options || !ts.isObjectLiteralExpression(options)) {
+      unsafeGatewayOptions = true;
+    } else {
+      for (const property of options.properties) {
+        if (ts.isSpreadAssignment(property)) {
+          unsafeGatewayOptions = true;
+          continue;
+        }
+        if (!ts.isPropertyAssignment(property)) continue;
+        const name = propertyName(property.name);
+        if (
+          name === 'mode' &&
+          !(ts.isStringLiteralLike(property.initializer) && property.initializer.text === 'replay')
+        ) {
+          unsafeGatewayOptions = true;
+        }
+        if (
+          name === 'forceRecord' &&
+          property.initializer.kind !== ts.SyntaxKind.FalseKeyword
+        ) {
+          unsafeGatewayOptions = true;
+        }
+      }
+    }
+  }
+  if (
+    node.getStart(head) >= headEntrypoint.getStart(head) &&
+    ((ts.isIdentifier(node) &&
+      ['createGatewayMock', 'mock', 'process', 'recorder'].includes(node.text)) ||
+      (ts.isStringLiteralLike(node) && ['LLM_TEST_MODE', 'recorder'].includes(node.text)))
+  ) {
+    unsafeSuffixReference = true;
+  }
+  ts.forEachChild(node, visit);
+}
+visit(head);
+
+if (gatewayCalls !== 1 || unsafeGatewayOptions || unsafeSuffixReference) {
+  throw new Error(`${file} must retain one immutable replay-only gateway harness with no in-test override.`);
+}
+NODE
+}
+
+storage_harness_factory_registers_suite() {
+  node - "$HEAD_SHA" <<'NODE'
+const { execFileSync } = require('node:child_process');
+const path = require('node:path');
+const ts = require('typescript');
+
+const [headSha] = process.argv.slice(2);
+const factoryPath = 'stores/_test-utils/src/factory.ts';
+const sourceText = execFileSync('git', ['show', `${headSha}:${factoryPath}`], {
+  encoding: 'utf8',
+  maxBuffer: 8 * 1024 * 1024,
+});
+
+function createCheckedSource(filePath, text) {
+  const options = {
+    noLib: true,
+    noResolve: true,
+    target: ts.ScriptTarget.Latest,
+  };
+  const resolvedPath = path.resolve(filePath);
+  const host = ts.createCompilerHost(options, true);
+  const originalFileExists = host.fileExists.bind(host);
+  const originalGetSourceFile = host.getSourceFile.bind(host);
+  const originalReadFile = host.readFile.bind(host);
+  host.fileExists = fileName =>
+    path.resolve(fileName) === resolvedPath || originalFileExists(fileName);
+  host.readFile = fileName =>
+    path.resolve(fileName) === resolvedPath ? text : originalReadFile(fileName);
+  host.getSourceFile = (fileName, languageVersion, onError, shouldCreateNewSourceFile) =>
+    path.resolve(fileName) === resolvedPath
+      ? ts.createSourceFile(fileName, text, languageVersion, true, ts.ScriptKind.TS)
+      : originalGetSourceFile(fileName, languageVersion, onError, shouldCreateNewSourceFile);
+  const program = ts.createProgram([filePath], options, host);
+  const source = program
+    .getSourceFiles()
+    .find(candidate => path.resolve(candidate.fileName) === resolvedPath);
+  if (!source) throw new Error(`Unable to parse ${filePath}.`);
+  return { checker: program.getTypeChecker(), source };
+}
+
+const { checker, source } = createCheckedSource(factoryPath, sourceText);
+
+function unwrap(expression) {
+  let current = expression;
+  while (
+    ts.isParenthesizedExpression(current) ||
+    ts.isAsExpression(current) ||
+    ts.isTypeAssertionExpression(current) ||
+    ts.isNonNullExpression(current)
+  ) {
+    current = current.expression;
+  }
+  return current;
+}
+
+function constantModuleName(expression) {
+  const candidate = unwrap(expression);
+  if (ts.isStringLiteralLike(candidate)) return candidate.text;
+  if (
+    ts.isBinaryExpression(candidate) &&
+    candidate.operatorToken.kind === ts.SyntaxKind.PlusToken
+  ) {
+    const left = constantModuleName(candidate.left);
+    const right = constantModuleName(candidate.right);
+    if (left !== undefined && right !== undefined) return left + right;
+  }
+  if (
+    ts.isCallExpression(candidate) &&
+    candidate.expression.kind === ts.SyntaxKind.ImportKeyword &&
+    candidate.arguments[0]
+  ) {
+    return constantModuleName(candidate.arguments[0]);
+  }
+}
+
+function callMemberName(expression) {
+  const candidate = unwrap(expression);
+  if (ts.isIdentifier(candidate)) return candidate.text;
+  if (ts.isPropertyAccessExpression(candidate)) return candidate.name.text;
+  if (
+    ts.isElementAccessExpression(candidate) &&
+    candidate.argumentExpression
+  ) {
+    return constantModuleName(candidate.argumentExpression);
+  }
+}
+
+function mocksModule(moduleName) {
+  let mocked = false;
+  const mockMembers = new Set(['mock', 'doMock', 'unstable_mockModule', 'module']);
+  function visit(node) {
+    if (mocked) return;
+    if (
+      ts.isCallExpression(node) &&
+      node.arguments[0] &&
+      constantModuleName(node.arguments[0]) === moduleName &&
+      mockMembers.has(callMemberName(node.expression))
+    ) {
+      mocked = true;
+      return;
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(source);
+  return mocked;
+}
+
+function importedBinding(moduleName, exportedName) {
+  for (const statement of source.statements) {
+    if (
+      !ts.isImportDeclaration(statement) ||
+      !ts.isStringLiteralLike(statement.moduleSpecifier) ||
+      statement.moduleSpecifier.text !== moduleName ||
+      !statement.importClause ||
+      statement.importClause.isTypeOnly ||
+      !statement.importClause.namedBindings ||
+      !ts.isNamedImports(statement.importClause.namedBindings)
+    ) {
+      continue;
+    }
+    for (const element of statement.importClause.namedBindings.elements) {
+      if (!element.isTypeOnly && (element.propertyName ?? element.name).text === exportedName) {
+        const symbol = checker.getSymbolAtLocation(element.name);
+        if (symbol) return { symbol };
+      }
+    }
+  }
+}
+
+function hasBinding(node, binding) {
+  return (
+    !!binding &&
+    ts.isIdentifier(node) &&
+    checker.getSymbolAtLocation(node) === binding.symbol
+  );
+}
+
+function propertyName(node) {
+  if (ts.isIdentifier(node) || ts.isStringLiteralLike(node)) return node.text;
+}
+
+function containsCallbackExit(statement) {
+  let found = false;
+  function visit(node) {
+    if (found) return;
+    if (node !== statement && ts.isFunctionLike(node)) return;
+    if (ts.isReturnStatement(node) || ts.isThrowStatement(node)) {
+      found = true;
+      return;
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(statement);
+  return found;
+}
+
+function writesSymbol(statement, symbol) {
+  let found = false;
+
+  function containsSymbol(node) {
+    let contains = false;
+    function visit(candidate) {
+      if (contains) return;
+      if (ts.isIdentifier(candidate) && checker.getSymbolAtLocation(candidate) === symbol) {
+        contains = true;
+        return;
+      }
+      ts.forEachChild(candidate, visit);
+    }
+    visit(node);
+    return contains;
+  }
+
+  function visit(node) {
+    if (found) return;
+    if (node !== statement && ts.isFunctionLike(node)) return;
+    if (
+      ts.isBinaryExpression(node) &&
+      node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
+      node.operatorToken.kind <= ts.SyntaxKind.LastAssignment &&
+      containsSymbol(node.left)
+    ) {
+      found = true;
+      return;
+    }
+    if (
+      (ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) &&
+      (node.operator === ts.SyntaxKind.PlusPlusToken ||
+        node.operator === ts.SyntaxKind.MinusMinusToken) &&
+      containsSymbol(node.operand)
+    ) {
+      found = true;
+      return;
+    }
+    if (
+      (ts.isForInStatement(node) || ts.isForOfStatement(node)) &&
+      containsSymbol(node.initializer)
+    ) {
+      found = true;
+      return;
+    }
+    if (
+      ts.isDeleteExpression(node) &&
+      containsSymbol(node.expression)
+    ) {
+      found = true;
+      return;
+    }
+    ts.forEachChild(node, visit);
+  }
+
+  visit(statement);
+  return found;
+}
+
+const describeBinding = importedBinding('vitest', 'describe');
+const harnessBinding = importedBinding('./domains/harness', 'createHarnessTest');
+const harnessModuleMocked = mocksModule('./domains/harness');
+let registered = false;
+
+for (const statement of source.statements) {
+  if (
+    registered ||
+      !ts.isFunctionDeclaration(statement) ||
+      statement.name?.text !== 'createTestSuite' ||
+      !statement.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.ExportKeyword) ||
+      statement.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.AsyncKeyword) ||
+      !!statement.asteriskToken ||
+      !statement.body
+  ) {
+    continue;
+  }
+  const storageParameter = statement.parameters[0]?.name;
+  if (!storageParameter || !ts.isIdentifier(storageParameter)) continue;
+  const storageSymbol = checker.getSymbolAtLocation(storageParameter);
+  if (!storageSymbol) continue;
+
+  for (const [bodyStatementIndex, bodyStatement] of statement.body.statements.entries()) {
+    if (
+      !ts.isExpressionStatement(bodyStatement) ||
+      !ts.isCallExpression(bodyStatement.expression) ||
+      !hasBinding(bodyStatement.expression.expression, describeBinding)
+    ) {
+      continue;
+    }
+    if (statement.body.statements.slice(0, bodyStatementIndex).some(containsCallbackExit)) {
+      continue;
+    }
+    if (statement.body.statements.slice(0, bodyStatementIndex).some(candidate => writesSymbol(candidate, storageSymbol))) {
+      continue;
+    }
+    const callback = bodyStatement.expression.arguments[1];
+    if (
+      !callback ||
+      (!ts.isArrowFunction(callback) && !ts.isFunctionExpression(callback)) ||
+      callback.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.AsyncKeyword) ||
+      (ts.isFunctionExpression(callback) && !!callback.asteriskToken) ||
+      !ts.isBlock(callback.body)
+    ) {
+      continue;
+    }
+
+    registered = registered || callback.body.statements.some((candidate, candidateIndex) => {
+      if (
+        !ts.isExpressionStatement(candidate) ||
+        !ts.isCallExpression(candidate.expression) ||
+        !hasBinding(candidate.expression.expression, harnessBinding)
+      ) {
+        return false;
+      }
+      if (callback.body.statements.slice(0, candidateIndex).some(containsCallbackExit)) {
+        return false;
+      }
+      if (callback.body.statements.slice(0, candidateIndex).some(statement => writesSymbol(statement, storageSymbol))) {
+        return false;
+      }
+      const options = candidate.expression.arguments[0];
+      if (!options || !ts.isObjectLiteralExpression(options)) return false;
+      if (options.properties.length !== 1) return false;
+      const property = options.properties[0];
+      if (ts.isShorthandPropertyAssignment(property)) {
+        return (
+          property.name.text === 'storage' &&
+          checker.getShorthandAssignmentValueSymbol(property) === storageSymbol
+        );
+      }
+      return (
+        ts.isPropertyAssignment(property) &&
+        propertyName(property.name) === 'storage' &&
+        hasBinding(property.initializer, { symbol: storageSymbol })
+      );
+    });
+  }
+}
+
+if (!describeBinding || !harnessBinding || harnessModuleMocked || !registered) {
+  console.error(
+    `${factoryPath} must import createHarnessTest and register it unconditionally in createTestSuite's describe block without mocking the module.`,
+  );
+  process.exit(1);
+}
+NODE
+}
+
+storage_harness_entrypoint_registers_suite() {
+  node - "$HEAD_SHA" <<'NODE'
+const { execFileSync } = require('node:child_process');
+const path = require('node:path');
+const ts = require('typescript');
+
+const [headSha] = process.argv.slice(2);
+const testPath = 'stores/_test-utils/src/index.test.ts';
+const sourceText = execFileSync('git', ['show', `${headSha}:${testPath}`], {
+  encoding: 'utf8',
+  maxBuffer: 8 * 1024 * 1024,
+});
+
+function createCheckedSource(filePath, text) {
+  const options = {
+    noLib: true,
+    noResolve: true,
+    target: ts.ScriptTarget.Latest,
+  };
+  const resolvedPath = path.resolve(filePath);
+  const host = ts.createCompilerHost(options, true);
+  const originalFileExists = host.fileExists.bind(host);
+  const originalGetSourceFile = host.getSourceFile.bind(host);
+  const originalReadFile = host.readFile.bind(host);
+  host.fileExists = fileName =>
+    path.resolve(fileName) === resolvedPath || originalFileExists(fileName);
+  host.readFile = fileName =>
+    path.resolve(fileName) === resolvedPath ? text : originalReadFile(fileName);
+  host.getSourceFile = (fileName, languageVersion, onError, shouldCreateNewSourceFile) =>
+    path.resolve(fileName) === resolvedPath
+      ? ts.createSourceFile(fileName, text, languageVersion, true, ts.ScriptKind.TS)
+      : originalGetSourceFile(fileName, languageVersion, onError, shouldCreateNewSourceFile);
+  const program = ts.createProgram([filePath], options, host);
+  const source = program
+    .getSourceFiles()
+    .find(candidate => path.resolve(candidate.fileName) === resolvedPath);
+  if (!source) throw new Error(`Unable to parse ${filePath}.`);
+  return { checker: program.getTypeChecker(), source };
+}
+
+const { checker, source } = createCheckedSource(testPath, sourceText);
+
+function unwrap(expression) {
+  let current = expression;
+  while (
+    ts.isParenthesizedExpression(current) ||
+    ts.isAsExpression(current) ||
+    ts.isTypeAssertionExpression(current) ||
+    ts.isNonNullExpression(current)
+  ) {
+    current = current.expression;
+  }
+  return current;
+}
+
+function constantModuleName(expression) {
+  const candidate = unwrap(expression);
+  if (ts.isStringLiteralLike(candidate)) return candidate.text;
+  if (
+    ts.isBinaryExpression(candidate) &&
+    candidate.operatorToken.kind === ts.SyntaxKind.PlusToken
+  ) {
+    const left = constantModuleName(candidate.left);
+    const right = constantModuleName(candidate.right);
+    if (left !== undefined && right !== undefined) return left + right;
+  }
+  if (
+    ts.isCallExpression(candidate) &&
+    candidate.expression.kind === ts.SyntaxKind.ImportKeyword &&
+    candidate.arguments[0]
+  ) {
+    return constantModuleName(candidate.arguments[0]);
+  }
+}
+
+function callMemberName(expression) {
+  const candidate = unwrap(expression);
+  if (ts.isIdentifier(candidate)) return candidate.text;
+  if (ts.isPropertyAccessExpression(candidate)) return candidate.name.text;
+  if (
+    ts.isElementAccessExpression(candidate) &&
+    candidate.argumentExpression
+  ) {
+    return constantModuleName(candidate.argumentExpression);
+  }
+}
+
+function mocksModule(moduleName) {
+  let mocked = false;
+  const mockMembers = new Set(['mock', 'doMock', 'unstable_mockModule', 'module']);
+  function visit(node) {
+    if (mocked) return;
+    if (
+      ts.isCallExpression(node) &&
+      node.arguments[0] &&
+      constantModuleName(node.arguments[0]) === moduleName &&
+      mockMembers.has(callMemberName(node.expression))
+    ) {
+      mocked = true;
+      return;
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(source);
+  return mocked;
+}
+
+function importedBinding(moduleName, exportedName) {
+  for (const statement of source.statements) {
+    if (
+      !ts.isImportDeclaration(statement) ||
+      !ts.isStringLiteralLike(statement.moduleSpecifier) ||
+      statement.moduleSpecifier.text !== moduleName ||
+      !statement.importClause ||
+      statement.importClause.isTypeOnly ||
+      !statement.importClause.namedBindings ||
+      !ts.isNamedImports(statement.importClause.namedBindings)
+    ) {
+      continue;
+    }
+    for (const element of statement.importClause.namedBindings.elements) {
+      if (!element.isTypeOnly && (element.propertyName ?? element.name).text === exportedName) {
+        const symbol = checker.getSymbolAtLocation(element.name);
+        if (symbol) return { symbol };
+      }
+    }
+  }
+}
+
+function hasBinding(node, binding) {
+  return (
+    !!binding &&
+    ts.isIdentifier(node) &&
+    checker.getSymbolAtLocation(node) === binding.symbol
+  );
+}
+
+const suiteBinding = importedBinding('./factory', 'createTestSuite');
+const mockStoreBinding = importedBinding('@mastra/core/storage', 'MockStore');
+const factoryModuleMocked = mocksModule('./factory');
+// Import bindings resolve to the same symbol whether or not the module is
+// replaced at run time, so a mocked storage module would run the shared suite
+// against a hand-written fake instead of the reviewed in-memory store.
+const mockStoreModuleMocked = mocksModule('@mastra/core/storage');
+const registered = source.statements.some(statement => {
+  if (
+    !ts.isExpressionStatement(statement) ||
+    !ts.isCallExpression(statement.expression) ||
+    !hasBinding(statement.expression.expression, suiteBinding)
+  ) {
+    return false;
+  }
+  const storage = statement.expression.arguments[0];
+  return (
+    !!storage &&
+    ts.isNewExpression(storage) &&
+    hasBinding(storage.expression, mockStoreBinding)
+  );
+});
+
+if (
+  !suiteBinding ||
+  !mockStoreBinding ||
+  factoryModuleMocked ||
+  mockStoreModuleMocked ||
+  !registered
+) {
+  console.error(
+    `${testPath} must import createTestSuite and invoke it unconditionally at module scope with a new MockStore without mocking either module.`,
+  );
+  process.exit(1);
+}
+NODE
+}
+
+mastracode_observation_migration_uses_helper() {
+  node - "$HEAD_SHA" <<'NODE'
+const { execFileSync } = require('node:child_process');
+const path = require('node:path');
+const ts = require('typescript');
+
+const [headSha] = process.argv.slice(2);
+const scriptPath = 'mastracode/sdk/scripts/index-messages.ts';
+const sourceText = execFileSync('git', ['show', `${headSha}:${scriptPath}`], {
+  encoding: 'utf8',
+  maxBuffer: 8 * 1024 * 1024,
+});
+
+function createCheckedSource(filePath, text) {
+  const options = {
+    noLib: true,
+    noResolve: true,
+    target: ts.ScriptTarget.Latest,
+  };
+  const resolvedPath = path.resolve(filePath);
+  const host = ts.createCompilerHost(options, true);
+  const originalFileExists = host.fileExists.bind(host);
+  const originalGetSourceFile = host.getSourceFile.bind(host);
+  const originalReadFile = host.readFile.bind(host);
+  host.fileExists = fileName =>
+    path.resolve(fileName) === resolvedPath || originalFileExists(fileName);
+  host.readFile = fileName =>
+    path.resolve(fileName) === resolvedPath ? text : originalReadFile(fileName);
+  host.getSourceFile = (fileName, languageVersion, onError, shouldCreateNewSourceFile) =>
+    path.resolve(fileName) === resolvedPath
+      ? ts.createSourceFile(fileName, text, languageVersion, true, ts.ScriptKind.TS)
+      : originalGetSourceFile(fileName, languageVersion, onError, shouldCreateNewSourceFile);
+  const program = ts.createProgram([filePath], options, host);
+  const source = program
+    .getSourceFiles()
+    .find(candidate => path.resolve(candidate.fileName) === resolvedPath);
+  if (!source) throw new Error(`Unable to parse ${filePath}.`);
+  return { checker: program.getTypeChecker(), source };
+}
+
+const { checker, source } = createCheckedSource(scriptPath, sourceText);
+
+function importedBinding(moduleName, exportedName) {
+  for (const statement of source.statements) {
+    if (
+      !ts.isImportDeclaration(statement) ||
+      !ts.isStringLiteralLike(statement.moduleSpecifier) ||
+      statement.moduleSpecifier.text !== moduleName ||
+      !statement.importClause ||
+      statement.importClause.isTypeOnly ||
+      !statement.importClause.namedBindings ||
+      !ts.isNamedImports(statement.importClause.namedBindings)
+    ) {
+      continue;
+    }
+    for (const element of statement.importClause.namedBindings.elements) {
+      if (!element.isTypeOnly && (element.propertyName ?? element.name).text === exportedName) {
+        const symbol = checker.getSymbolAtLocation(element.name);
+        if (symbol) return { symbol };
+      }
+    }
+  }
+}
+
+const helperBinding = importedBinding(
+  '../src/utils/observation-index-input',
+  'buildObservationIndexInput',
+);
+
+function unwrap(expression) {
+  let current = expression;
+  while (
+    ts.isParenthesizedExpression(current) ||
+    ts.isAsExpression(current) ||
+    ts.isTypeAssertionExpression(current) ||
+    ts.isNonNullExpression(current)
+  ) {
+    current = current.expression;
+  }
+  return current;
+}
+
+function isHelperCall(expression) {
+  const candidate = unwrap(expression);
+  const callee = ts.isCallExpression(candidate) ? unwrap(candidate.expression) : undefined;
+  return (
+    ts.isCallExpression(candidate) &&
+    !!callee &&
+    ts.isIdentifier(callee) &&
+    !!helperBinding &&
+    checker.getSymbolAtLocation(callee) === helperBinding.symbol
+  );
+}
+
+function constantString(expression) {
+  const candidate = unwrap(expression);
+  if (ts.isStringLiteralLike(candidate)) return candidate.text;
+  if (
+    ts.isBinaryExpression(candidate) &&
+    candidate.operatorToken.kind === ts.SyntaxKind.PlusToken
+  ) {
+    const left = constantString(candidate.left);
+    const right = constantString(candidate.right);
+    if (left !== undefined && right !== undefined) return left + right;
+  }
+}
+
+function isIndexObservationMember(node) {
+  if (ts.isPropertyAccessExpression(node)) return node.name.text === 'indexObservation';
+  return (
+    ts.isElementAccessExpression(node) &&
+    !!node.argumentExpression &&
+    constantString(node.argumentExpression) === 'indexObservation'
+  );
+}
+
+function enclosingExpression(node) {
+  let current = node;
+  while (
+    current.parent &&
+    (ts.isParenthesizedExpression(current.parent) ||
+      ts.isAsExpression(current.parent) ||
+      ts.isTypeAssertionExpression(current.parent) ||
+      ts.isNonNullExpression(current.parent)) &&
+    current.parent.expression === current
+  ) {
+    current = current.parent;
+  }
+  return current;
+}
+
+function containingStatement(node) {
+  let current = node;
+  while (current.parent && !ts.isBlock(current.parent) && !ts.isSourceFile(current.parent)) {
+    if (ts.isFunctionLike(current.parent)) return undefined;
+    current = current.parent;
+  }
+  return current.parent && ts.isStatement(current) ? current : undefined;
+}
+
+function nearestFunction(node) {
+  let current = node.parent;
+  while (current) {
+    if (ts.isFunctionLike(current)) return current;
+    current = current.parent;
+  }
+}
+
+function topLevelFunction(node) {
+  const owner = nearestFunction(node);
+  return (
+    owner &&
+    ts.isFunctionDeclaration(owner) &&
+    !!owner.name &&
+    ts.isSourceFile(owner.parent)
+      ? owner
+      : undefined
+  );
+}
+
+function staticConstant(expression) {
+  const candidate = unwrap(expression);
+  if (candidate.kind === ts.SyntaxKind.TrueKeyword) return { known: true, value: true };
+  if (candidate.kind === ts.SyntaxKind.FalseKeyword) return { known: true, value: false };
+  if (candidate.kind === ts.SyntaxKind.NullKeyword) return { known: true, value: null };
+  if (ts.isNumericLiteral(candidate)) return { known: true, value: Number(candidate.text) };
+  if (ts.isBigIntLiteral(candidate)) {
+    return { known: true, value: BigInt(candidate.text.slice(0, -1)) };
+  }
+  if (ts.isStringLiteralLike(candidate)) return { known: true, value: candidate.text };
+  if (ts.isIdentifier(candidate)) {
+    if (candidate.text === 'undefined') return { known: true, value: undefined };
+    if (candidate.text === 'NaN') return { known: true, value: Number.NaN };
+    if (candidate.text === 'Infinity') return { known: true, value: Infinity };
+  }
+  if (ts.isNoSubstitutionTemplateLiteral(candidate)) {
+    return { known: true, value: candidate.text };
+  }
+  if (ts.isTemplateExpression(candidate)) {
+    let value = candidate.head.text;
+    for (const span of candidate.templateSpans) {
+      const expressionValue = staticConstant(span.expression);
+      if (!expressionValue.known) return { known: false };
+      value += String(expressionValue.value) + span.literal.text;
+    }
+    return { known: true, value };
+  }
+  if (ts.isPrefixUnaryExpression(candidate)) {
+    const operand = staticConstant(candidate.operand);
+    if (!operand.known) return { known: false };
+    try {
+      switch (candidate.operator) {
+        case ts.SyntaxKind.ExclamationToken:
+          return { known: true, value: !operand.value };
+        case ts.SyntaxKind.PlusToken:
+          return { known: true, value: +operand.value };
+        case ts.SyntaxKind.MinusToken:
+          return { known: true, value: -operand.value };
+        case ts.SyntaxKind.TildeToken:
+          return { known: true, value: ~operand.value };
+        default:
+          return { known: false };
+      }
+    } catch {
+      return { known: false };
+    }
+  }
+  if (ts.isVoidExpression(candidate)) {
+    return { known: true, value: undefined };
+  }
+  if (ts.isBinaryExpression(candidate)) {
+    const left = staticConstant(candidate.left);
+    const operator = candidate.operatorToken.kind;
+    if (operator === ts.SyntaxKind.CommaToken) return staticConstant(candidate.right);
+    if (operator === ts.SyntaxKind.AmpersandAmpersandToken && left.known) {
+      return left.value ? staticConstant(candidate.right) : left;
+    }
+    if (operator === ts.SyntaxKind.BarBarToken && left.known) {
+      return left.value ? left : staticConstant(candidate.right);
+    }
+    if (operator === ts.SyntaxKind.QuestionQuestionToken && left.known) {
+      return left.value === null || left.value === undefined
+        ? staticConstant(candidate.right)
+        : left;
+    }
+    const right = staticConstant(candidate.right);
+    if (!left.known || !right.known) return { known: false };
+    try {
+      switch (operator) {
+        case ts.SyntaxKind.PlusToken:
+          return { known: true, value: left.value + right.value };
+        case ts.SyntaxKind.MinusToken:
+          return { known: true, value: left.value - right.value };
+        case ts.SyntaxKind.AsteriskToken:
+          return { known: true, value: left.value * right.value };
+        case ts.SyntaxKind.SlashToken:
+          return { known: true, value: left.value / right.value };
+        case ts.SyntaxKind.PercentToken:
+          return { known: true, value: left.value % right.value };
+        case ts.SyntaxKind.AsteriskAsteriskToken:
+          return { known: true, value: left.value ** right.value };
+        case ts.SyntaxKind.LessThanToken:
+          return { known: true, value: left.value < right.value };
+        case ts.SyntaxKind.LessThanEqualsToken:
+          return { known: true, value: left.value <= right.value };
+        case ts.SyntaxKind.GreaterThanToken:
+          return { known: true, value: left.value > right.value };
+        case ts.SyntaxKind.GreaterThanEqualsToken:
+          return { known: true, value: left.value >= right.value };
+        case ts.SyntaxKind.EqualsEqualsToken:
+          return { known: true, value: left.value == right.value };
+        case ts.SyntaxKind.ExclamationEqualsToken:
+          return { known: true, value: left.value != right.value };
+        case ts.SyntaxKind.EqualsEqualsEqualsToken:
+          return { known: true, value: left.value === right.value };
+        case ts.SyntaxKind.ExclamationEqualsEqualsToken:
+          return { known: true, value: left.value !== right.value };
+        case ts.SyntaxKind.AmpersandToken:
+          return { known: true, value: left.value & right.value };
+        case ts.SyntaxKind.BarToken:
+          return { known: true, value: left.value | right.value };
+        case ts.SyntaxKind.CaretToken:
+          return { known: true, value: left.value ^ right.value };
+        case ts.SyntaxKind.LessThanLessThanToken:
+          return { known: true, value: left.value << right.value };
+        case ts.SyntaxKind.GreaterThanGreaterThanToken:
+          return { known: true, value: left.value >> right.value };
+        case ts.SyntaxKind.GreaterThanGreaterThanGreaterThanToken:
+          return { known: true, value: left.value >>> right.value };
+        default:
+          return { known: false };
+      }
+    } catch {
+      return { known: false };
+    }
+  }
+  return { known: false };
+}
+
+function staticBoolean(expression) {
+  const constant = staticConstant(expression);
+  return constant.known ? Boolean(constant.value) : undefined;
+}
+
+function isModuleInitialization(node) {
+  let current = node.parent;
+  while (current && !ts.isSourceFile(current)) {
+    if (
+      ts.isClassDeclaration(current) ||
+      ts.isClassExpression(current)
+    ) {
+      return false;
+    }
+    current = current.parent;
+  }
+  return !!current;
+}
+
+function isStaticallyUnreachable(node, boundary) {
+  let child = node;
+  let parent = node.parent;
+  while (parent) {
+    if (
+      (ts.isBlock(parent) || ts.isSourceFile(parent)) &&
+      ts.isStatement(child)
+    ) {
+      const statementIndex = parent.statements.indexOf(child);
+      if (
+        statementIndex > 0 &&
+        parent.statements
+          .slice(0, statementIndex)
+          .some(statementAlwaysExits)
+      ) {
+        return true;
+      }
+    }
+
+    if (parent === boundary) break;
+
+    // Switch dispatch is not modeled. A constant discriminant leaves a clause
+    // body dead while every other authorization check still passes, and a
+    // default clause is skipped whenever an earlier case matches, so every
+    // clause body fails closed.
+    if (ts.isCaseClause(parent) || ts.isDefaultClause(parent)) return true;
+
+    if (ts.isBinaryExpression(parent) && child === parent.right) {
+      const leftValue = staticBoolean(parent.left);
+      if (
+        (parent.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken &&
+          leftValue === false) ||
+        (parent.operatorToken.kind === ts.SyntaxKind.BarBarToken && leftValue === true)
+      ) {
+        return true;
+      }
+    }
+
+    const condition =
+      ts.isIfStatement(parent) ||
+      ts.isConditionalExpression(parent) ||
+      ts.isWhileStatement(parent) ||
+      ts.isForStatement(parent)
+        ? parent.expression
+        : undefined;
+    const value = condition ? staticBoolean(condition) : undefined;
+
+    if (ts.isIfStatement(parent) && value !== undefined) {
+      if ((child === parent.thenStatement && !value) || (child === parent.elseStatement && value)) {
+        return true;
+      }
+    } else if (ts.isConditionalExpression(parent) && value !== undefined) {
+      if ((child === parent.whenTrue && !value) || (child === parent.whenFalse && value)) {
+        return true;
+      }
+    } else if (ts.isWhileStatement(parent) && child === parent.statement && value === false) {
+      return true;
+    } else if (
+      ts.isForStatement(parent) &&
+      child === parent.statement &&
+      parent.condition &&
+      staticBoolean(parent.condition) === false
+    ) {
+      return true;
+    }
+
+    child = parent;
+    parent = parent.parent;
+  }
+  return false;
+}
+
+const topLevelFunctions = new Map();
+for (const statement of source.statements) {
+  if (ts.isFunctionDeclaration(statement) && statement.name && !statement.asteriskToken) {
+    const symbol = checker.getSymbolAtLocation(statement.name);
+    if (symbol) topLevelFunctions.set(symbol, statement);
+  }
+}
+
+const topLevelCallGraph = new Map();
+const rootCalls = new Set();
+
+function directCalleeSymbol(call) {
+  const callee = unwrap(call.expression);
+  return ts.isIdentifier(callee) ? checker.getSymbolAtLocation(callee) : undefined;
+}
+
+function collectTopLevelCallGraph(node) {
+  if (ts.isCallExpression(node)) {
+    const targetSymbol = directCalleeSymbol(node);
+    if (targetSymbol && topLevelFunctions.has(targetSymbol)) {
+      const owner = topLevelFunction(node);
+      if (owner && nearestFunction(node) === owner && !isStaticallyUnreachable(node, owner)) {
+        const ownerSymbol = checker.getSymbolAtLocation(owner.name);
+        if (ownerSymbol) {
+          const callees = topLevelCallGraph.get(ownerSymbol) ?? new Set();
+          callees.add(targetSymbol);
+          topLevelCallGraph.set(ownerSymbol, callees);
+        }
+      } else if (
+        !nearestFunction(node) &&
+        isModuleInitialization(node) &&
+        !isStaticallyUnreachable(node, source)
+      ) {
+        rootCalls.add(targetSymbol);
+      }
+    }
+  }
+  ts.forEachChild(node, collectTopLevelCallGraph);
+}
+collectTopLevelCallGraph(source);
+
+const reachableTopLevelFunctions = new Set(rootCalls);
+const pendingTopLevelFunctions = [...rootCalls];
+while (pendingTopLevelFunctions.length > 0) {
+  const owner = pendingTopLevelFunctions.pop();
+  for (const callee of topLevelCallGraph.get(owner) ?? []) {
+    if (!reachableTopLevelFunctions.has(callee)) {
+      reachableTopLevelFunctions.add(callee);
+      pendingTopLevelFunctions.push(callee);
+    }
+  }
+}
+
+function statementAlwaysExits(statement) {
+  if (
+    ts.isReturnStatement(statement) ||
+    ts.isThrowStatement(statement) ||
+    ts.isContinueStatement(statement) ||
+    ts.isBreakStatement(statement)
+  ) {
+    return true;
+  }
+  if (ts.isBlock(statement)) {
+    const last = statement.statements.at(-1);
+    return !!last && statementAlwaysExits(last);
+  }
+  if (ts.isIfStatement(statement)) {
+    const value = staticBoolean(statement.expression);
+    if (value === true) return statementAlwaysExits(statement.thenStatement);
+    if (value === false) {
+      return !!statement.elseStatement && statementAlwaysExits(statement.elseStatement);
+    }
+    return (
+      !!statement.elseStatement &&
+      statementAlwaysExits(statement.thenStatement) &&
+      statementAlwaysExits(statement.elseStatement)
+    );
+  }
+  return false;
+}
+
+function missingInputGuardIdentifier(statement, symbol) {
+  if (!ts.isIfStatement(statement)) return undefined;
+  const condition = unwrap(statement.expression);
+  if (
+    !ts.isPrefixUnaryExpression(condition) ||
+    condition.operator !== ts.SyntaxKind.ExclamationToken
+  ) {
+    return undefined;
+  }
+  const identifier = unwrap(condition.operand);
+  if (
+    !ts.isIdentifier(identifier) ||
+    checker.getSymbolAtLocation(identifier) !== symbol ||
+    !statementAlwaysExits(statement.thenStatement)
+  ) {
+    return undefined;
+  }
+  return identifier;
+}
+
+function helperBackedIdentifier(call, identifier) {
+  const owner = topLevelFunction(call);
+  const ownerSymbol = owner?.name ? checker.getSymbolAtLocation(owner.name) : undefined;
+  const memoryParameter = owner?.parameters[0]?.name;
+  const memoryMember = unwrap(call.expression);
+  const memoryReceiver =
+    (ts.isPropertyAccessExpression(memoryMember) || ts.isElementAccessExpression(memoryMember))
+      ? unwrap(memoryMember.expression)
+      : undefined;
+  if (
+    !owner ||
+    owner.name?.text !== 'indexObservationGroupsFromMessages' ||
+    !memoryParameter ||
+    !ts.isIdentifier(memoryParameter) ||
+    !memoryReceiver ||
+    !ts.isIdentifier(memoryReceiver) ||
+    checker.getSymbolAtLocation(memoryReceiver) !== checker.getSymbolAtLocation(memoryParameter) ||
+    !ownerSymbol ||
+    nearestFunction(call) !== owner ||
+    !reachableTopLevelFunctions.has(ownerSymbol) ||
+    isStaticallyUnreachable(call, owner)
+  ) {
+    return false;
+  }
+
+  const statement = containingStatement(call);
+  const container = statement?.parent;
+  if (!statement || (!ts.isBlock(container) && !ts.isSourceFile(container))) return false;
+  const statementIndex = container.statements.indexOf(statement);
+  if (statementIndex < 0) return false;
+  const inputSymbol = checker.getSymbolAtLocation(identifier);
+  if (!inputSymbol) return false;
+
+  for (let declarationIndex = statementIndex - 1; declarationIndex >= 0; declarationIndex--) {
+    const candidate = container.statements[declarationIndex];
+    if (!ts.isVariableStatement(candidate) || !(candidate.declarationList.flags & ts.NodeFlags.Const)) {
+      continue;
+    }
+    for (const declaration of candidate.declarationList.declarations) {
+      if (
+        ts.isIdentifier(declaration.name) &&
+        checker.getSymbolAtLocation(declaration.name) === inputSymbol &&
+        declaration.initializer &&
+        isHelperCall(declaration.initializer)
+      ) {
+        let guardIdentifier;
+        for (let index = declarationIndex + 1; index < statementIndex; index++) {
+          guardIdentifier = missingInputGuardIdentifier(container.statements[index], inputSymbol);
+          if (guardIdentifier) break;
+        }
+        if (!guardIdentifier) return false;
+
+        const allowedReferences = new Set([declaration.name, guardIdentifier, identifier]);
+        let hasUnexpectedReference = false;
+        const visitReference = node => {
+          if (hasUnexpectedReference) return;
+          if (
+            ts.isIdentifier(node) &&
+            checker.getSymbolAtLocation(node) === inputSymbol &&
+            !allowedReferences.has(node)
+          ) {
+            hasUnexpectedReference = true;
+            return;
+          }
+          ts.forEachChild(node, visitReference);
+        };
+        for (let index = declarationIndex; index <= statementIndex; index++) {
+          visitReference(container.statements[index]);
+        }
+        return !hasUnexpectedReference;
+      }
+    }
+  }
+  return false;
+}
+
+let indexReferences = 0;
+let indexCalls = 0;
+let invalidIndexReferences = 0;
+let invalidMemoryReferences = 0;
+const allowedMemoryMembers = new Set([
+  'recall',
+  'listMessagesByResourceId',
+  'indexObservation',
+]);
+
+function isWithinTypeNode(node) {
+  let current = node.parent;
+  while (current && !ts.isStatement(current) && !ts.isSourceFile(current)) {
+    if (ts.isTypeNode(current)) return true;
+    current = current.parent;
+  }
+  return false;
+}
+
+function visit(node) {
+  const owner = topLevelFunction(node);
+  const memoryParameter =
+    owner?.name?.text === 'indexObservationGroupsFromMessages'
+      ? owner.parameters[0]?.name
+      : undefined;
+  const memorySymbol =
+    memoryParameter && ts.isIdentifier(memoryParameter)
+      ? checker.getSymbolAtLocation(memoryParameter)
+      : undefined;
+
+  if (
+    memorySymbol &&
+    ts.isElementAccessExpression(node) &&
+    (!node.argumentExpression || constantString(node.argumentExpression) === undefined)
+  ) {
+    const receiver = unwrap(node.expression);
+    if (
+      ts.isIdentifier(receiver) &&
+      checker.getSymbolAtLocation(receiver) === memorySymbol
+    ) {
+      invalidMemoryReferences++;
+    }
+  }
+
+  if (
+    memorySymbol &&
+    ts.isIdentifier(node) &&
+    checker.getSymbolAtLocation(node) === memorySymbol &&
+    node !== memoryParameter
+  ) {
+    const expression = enclosingExpression(node);
+    const parent = expression.parent;
+    const memberName =
+      ts.isPropertyAccessExpression(parent) && parent.expression === expression
+        ? parent.name.text
+        : ts.isElementAccessExpression(parent) &&
+            parent.expression === expression &&
+            parent.argumentExpression
+          ? constantString(parent.argumentExpression)
+          : undefined;
+    if (!memberName || !allowedMemoryMembers.has(memberName)) {
+      invalidMemoryReferences++;
+    }
+  }
+
+  if (ts.isCallExpression(node)) {
+    const callee = unwrap(node.expression);
+    if (
+      ts.isElementAccessExpression(callee) &&
+      (!callee.argumentExpression ||
+        constantString(callee.argumentExpression) === undefined)
+    ) {
+      // A computed call can synthesize "indexObservation" without ever
+      // containing the reviewed member name in the source. This one-time
+      // migration has no legitimate computed method calls, so fail closed.
+      invalidIndexReferences++;
+    }
+  }
+
+  if (isIndexObservationMember(node)) {
+    indexReferences++;
+    const expression = enclosingExpression(node);
+    const call = expression.parent;
+    if (!ts.isCallExpression(call) || call.expression !== expression) {
+      invalidIndexReferences++;
+    } else {
+      indexCalls++;
+      const input = call.arguments[0];
+      const authorized =
+        !expression.questionDotToken &&
+        !call.questionDotToken &&
+        !!input &&
+        ts.isIdentifier(unwrap(input)) &&
+        helperBackedIdentifier(call, unwrap(input));
+      if (!authorized) invalidIndexReferences++;
+    }
+  } else if (
+    ts.isIdentifier(node) &&
+    node.text === 'indexObservation' &&
+    !isWithinTypeNode(node) &&
+    !(
+      ts.isPropertyAccessExpression(node.parent) &&
+      node.parent.name === node &&
+      isIndexObservationMember(node.parent)
+    )
+  ) {
+    invalidIndexReferences++;
+  } else if (
+    ts.isStringLiteralLike(node) &&
+    node.text === 'indexObservation' &&
+    !isWithinTypeNode(node) &&
+    !(
+      ts.isElementAccessExpression(node.parent) &&
+      node.parent.argumentExpression === node &&
+      isIndexObservationMember(node.parent)
+    )
+  ) {
+    invalidIndexReferences++;
+  }
+  ts.forEachChild(node, visit);
+}
+visit(source);
+
+if (
+  !helperBinding ||
+  indexCalls < 1 ||
+  indexReferences !== indexCalls ||
+  invalidIndexReferences > 0 ||
+  invalidMemoryReferences > 0
+) {
+  console.error(
+    `${scriptPath} must pass buildObservationIndexInput output to every indexObservation call. ` +
+      `Switch dispatch is not modeled, so a case or default clause body counts as statically ` +
+      `unreachable; move the call out of the switch.`,
+  );
+  process.exit(1);
+}
+NODE
+}
+
+supervisor_provider_gate_verified=false
+if grep -Fxq 'packages/core/src/agent/__tests__/supervisor-integration.test.ts' "$changed_files"; then
+  if git_regular_file_at_head 'packages/core/src/agent/__tests__/supervisor-integration.test.ts' &&
+    ! core_supervisor_test_preserves_provider_gate; then
+    echo 'The exact supervisor suite changed its frozen real-provider safety boundary.' >&2
+    exit 1
+  fi
+  if git_regular_file_at_head 'packages/core/src/agent/__tests__/supervisor-integration.test.ts'; then
+    supervisor_provider_gate_verified=true
+  fi
+fi
+
+tool_approval_replay_harness_verified=false
+if grep -Fxq 'packages/core/src/agent/__tests__/tool-approval.e2e.test.ts' "$changed_files"; then
+  if git_regular_file_at_head 'packages/core/src/agent/__tests__/tool-approval.e2e.test.ts' &&
+    ! tool_approval_test_preserves_replay_harness; then
+    echo 'The exact tool-approval suite changed its frozen replay harness.' >&2
+    exit 1
+  fi
+  if git_regular_file_at_head 'packages/core/src/agent/__tests__/tool-approval.e2e.test.ts'; then
+    tool_approval_replay_harness_verified=true
+  fi
+fi
+
 is_server_generated_artifact() {
   case "$1" in
     client-sdks/client-js/src/route-types.generated.ts | \
@@ -4326,7 +7899,7 @@ while IFS= read -r workspace; do
     continue
   fi
   case "$workspace" in
-    auth/okta | browser/stagehand | packages/_internal-core | packages/cli | packages/codemod | packages/core | packages/deployer | packages/mcp | packages/memory | packages/server | client-sdks/ai-sdk | stores/_test-utils | stores/convex | stores/libsql | stores/pg | stores/redis | mastracode | mastracode/sdk | mastracode/tui | pubsub/google-cloud-pubsub | pubsub/redis-streams | workflows/inngest | workflows/temporal | docs) ;;
+    auth/okta | browser/stagehand | packages/_internal-core | packages/cli | packages/codemod | packages/core | packages/deployer | packages/mcp | packages/memory | packages/server | client-sdks/ai-sdk | client-sdks/client-js | stores/_test-utils | stores/convex | stores/libsql | stores/pg | stores/redis | mastracode | mastracode/sdk | mastracode/tui | pubsub/google-cloud-pubsub | pubsub/redis-streams | workflows/inngest | workflows/temporal | docs) ;;
     *) printf '%s\n' "$workspace" >> "$unsupported_workspaces" ;;
   esac
 done < "$changed_workspaces"
@@ -4349,6 +7922,13 @@ while IFS= read -r file; do
       scripts/tsconfig.json | \
       scripts/vitest.config.ts | \
       vitest.config.ts) ;;
+    harnessv1/sections/*.md)
+      # A Markdown suffix is not enough: symlinks can escape the reviewed tree
+      # or disappear on checkout, and deleted documents cannot be formatted.
+      # Only immutable regular blobs at the proposed head enter the docs lane.
+      git_regular_file_at_head "$file" ||
+        printf '%s\n' "$file" >> "$unsupported_inputs"
+      ;;
     *) printf '%s\n' "$file" >> "$unsupported_inputs" ;;
   esac
 done < "$unowned_files"
@@ -4524,10 +8104,6 @@ NODE
   fi
 fi
 
-git_regular_file_at_head() {
-  git ls-tree "$HEAD_SHA" -- "$1" | grep -Eq '^100(644|755) blob '
-}
-
 verify_pf2050_inngest_coordination() (
   local expected_paths actual_paths path
   expected_paths="$(mktemp)"
@@ -4657,7 +8233,7 @@ while IFS= read -r path; do
   printf '%s\n' "$path" >> "$unsupported_inputs"
 done < <(
   grep -E \
-    '^(mastracode/(sdk|tui)|pubsub/(google-cloud-pubsub|redis-streams)|stores/(convex|libsql)|workflows/inngest)/package\.json$' \
+    '^(client-sdks/client-js|mastracode/(sdk|tui)|pubsub/(google-cloud-pubsub|redis-streams)|stores/(convex|libsql)|workflows/inngest)/package\.json$' \
     "$changed_files" || true
 )
 
@@ -4719,6 +8295,7 @@ while IFS= read -r file; do
             mastracode/tui/src/tui/notify.test.ts | \
             mastracode/tui/src/tui/__tests__/goal-manager.test.ts | \
             mastracode/sdk/src/headless/run-mc.test.ts | \
+            mastracode/sdk/src/utils/__tests__/observation-index-input.test.ts | \
             mastracode/sdk/src/utils/__tests__/signals-pubsub.test.ts) ;;
           *) printf '%s\n' "$file" >> "$unsupported_mastracode_tests" ;;
         esac
@@ -4747,6 +8324,10 @@ while IFS= read -r file; do
       mastracode/sdk/src/headless/run-mc.ts)
         required_test="mastracode/sdk/src/headless/run-mc.test.ts"
         ;;
+      mastracode/sdk/scripts/index-messages.ts | \
+        mastracode/sdk/src/utils/observation-index-input.ts)
+        required_test="mastracode/sdk/src/utils/__tests__/observation-index-input.test.ts"
+        ;;
       mastracode/sdk/src/utils/signals-pubsub.ts)
         required_test="mastracode/sdk/src/utils/__tests__/signals-pubsub.test.ts"
         ;;
@@ -4772,6 +8353,17 @@ while IFS= read -r file; do
   fi
 done < "$changed_files"
 
+if grep -Eq \
+  '^(mastracode/sdk/scripts/index-messages\.ts|mastracode/sdk/src/utils/observation-index-input\.ts)$' \
+  "$changed_files"; then
+  if ! git_regular_file_at_head mastracode/sdk/scripts/index-messages.ts ||
+    ! git_regular_file_at_head mastracode/sdk/src/utils/observation-index-input.ts ||
+    ! mastracode_observation_migration_uses_helper; then
+    printf '%s\n' mastracode/sdk/scripts/index-messages.ts \
+      >> "$unsupported_mastracode_sources"
+  fi
+fi
+
 queue_owned_workspace_test() {
   local source_file="$1"
   local test_file="$2"
@@ -4781,6 +8373,43 @@ queue_owned_workspace_test() {
     printf '%s\n' "$test_file" >> "$forced_workspace_tests"
   fi
 }
+
+# The Client SDK is admitted only through exact source-and-test ownership.
+# Generated route types remain owned by the Server generator path above.
+# Direct Harness resource edits execute their request-contract regression;
+# public entrypoint edits execute the package-export regression. Both paths
+# also build, typecheck, and lint the complete Client SDK workspace.
+while IFS= read -r file; do
+  [[ "$file" == client-sdks/client-js/* ]] || continue
+
+  if [[ "$file" == 'client-sdks/client-js/src/route-types.generated.ts' ]]; then
+    continue
+  fi
+  if ! [[ "$file" =~ \.(cjs|cts|js|jsx|mjs|mts|ts|tsx)$ ]]; then
+    printf '%s\n' "$file" >> "$unsupported_owned_workspace_sources"
+    continue
+  fi
+  if grep -Eq '\.(test|spec)\.(cjs|cts|js|jsx|mjs|mts|ts|tsx)$|\.test-d\.ts$' <<< "$file"; then
+    case "$file" in
+      client-sdks/client-js/src/index.test.ts | client-sdks/client-js/src/resources/harness.test.ts) ;;
+      *) printf '%s\n' "$file" >> "$unsupported_owned_workspace_tests" ;;
+    esac
+    if ! git_regular_file_at_head "$file"; then
+      printf '%s\n' "$file" >> "$unsupported_owned_workspace_tests"
+    fi
+    continue
+  fi
+
+  case "$file" in
+    client-sdks/client-js/src/index.ts)
+      queue_owned_workspace_test "$file" client-sdks/client-js/src/index.test.ts
+      ;;
+    client-sdks/client-js/src/resources/harness.ts)
+      queue_owned_workspace_test "$file" client-sdks/client-js/src/resources/harness.test.ts
+      ;;
+    *) printf '%s\n' "$file" >> "$unsupported_owned_workspace_sources" ;;
+  esac
+done < "$changed_files"
 
 storage_atomic_resume_conformance_owned=false
 if grep -Eq '^stores/_test-utils/src/(domains/workflows/atomic-resume\.ts|index\.ts)$' "$changed_files" &&
@@ -4794,6 +8423,54 @@ if grep -Eq '^stores/_test-utils/src/(domains/workflows/atomic-resume\.ts|index\
   done < <(
     grep -E '^stores/_test-utils/src/(domains/workflows/atomic-resume\.ts|index\.ts)$' "$changed_files"
   )
+fi
+
+storage_harness_factory_registered=false
+if grep -Eq '^stores/_test-utils/src/(domains/harness/index\.ts|factory\.ts|index\.test\.ts)$' "$changed_files"; then
+  storage_harness_factory_valid=false
+  storage_harness_entrypoint_valid=false
+  if git_regular_file_at_head stores/_test-utils/src/factory.ts &&
+    storage_harness_factory_registers_suite; then
+    storage_harness_factory_valid=true
+  fi
+  if git_regular_file_at_head stores/_test-utils/src/index.test.ts &&
+    storage_harness_entrypoint_registers_suite; then
+    storage_harness_entrypoint_valid=true
+  fi
+
+  if [[ "$storage_harness_factory_valid" == true &&
+    "$storage_harness_entrypoint_valid" == true ]]; then
+    storage_harness_factory_registered=true
+    while IFS= read -r file; do
+      # The package's in-memory suite invokes createTestSuite, whose exact
+      # registration above installs the shared Harness conformance tests. This
+      # validates both definitions and factory wiring without a networked
+      # adapter.
+      queue_owned_workspace_test "$file" stores/_test-utils/src/index.test.ts
+    done < <(
+      grep -E '^stores/_test-utils/src/(domains/harness/index\.ts|factory\.ts)$' "$changed_files"
+    )
+  else
+    # Running src/index.test.ts is meaningful only when createTestSuite wires
+    # the shared Harness suite into the in-memory entrypoint. Reject a detached
+    # definition or entrypoint rather than accepting unrelated green tests.
+    if [[ "$storage_harness_factory_valid" == false ]]; then
+      printf '%s\n' stores/_test-utils/src/factory.ts \
+        >> "$unsupported_owned_workspace_sources"
+    fi
+    if [[ "$storage_harness_entrypoint_valid" == false ]]; then
+      printf '%s\n' stores/_test-utils/src/index.test.ts \
+        >> "$unsupported_owned_workspace_tests"
+    fi
+  fi
+fi
+
+storage_harness_conformance_owned=false
+if [[ "$storage_harness_factory_registered" == true ]] &&
+  ! grep -E '^stores/_test-utils/' "$changed_files" |
+    grep -Ev '^stores/_test-utils/src/(domains/harness/index\.ts|factory\.ts|index\.test\.ts)$' |
+    grep -q .; then
+  storage_harness_conformance_owned=true
 fi
 
 # These are executable ownership maps, not passive workspace allowlists. A
@@ -4831,6 +8508,7 @@ while IFS= read -r file; do
         pubsub/redis-streams/src/pubsub.test.ts | \
         stores/convex/src/cache/index.test.ts | \
         stores/convex/src/server/cache.test.ts | \
+        stores/libsql/src/storage/index.test.ts | \
         stores/libsql/src/storage/domains/harness/index.test.ts | \
         stores/libsql/src/storage/domains/thread-state/index.test.ts | \
         stores/libsql/src/storage/domains/workflows/atomic-resume.test.ts | \
@@ -4839,6 +8517,7 @@ while IFS= read -r file; do
         workflows/inngest/src/__tests__/inngest-test-runtime.test.ts | \
         workflows/inngest/src/actor-signal.test.ts | \
         workflows/inngest/src/create-run-contract.test.ts | \
+        workflows/inngest/src/durable-agent/create-inngest-agent.test-d.ts | \
         workflows/inngest/src/durable-agent/create-inngest-agentic-workflow.test.ts | \
         workflows/inngest/src/index.test.ts | \
         workflows/inngest/src/lifecycle-execution.test.ts | \
@@ -4877,6 +8556,9 @@ while IFS= read -r file; do
       ;;
     stores/libsql/src/storage/domains/harness/index.ts)
       queue_owned_workspace_test "$file" stores/libsql/src/storage/domains/harness/index.test.ts
+      ;;
+    stores/libsql/src/storage/index.ts)
+      queue_owned_workspace_test "$file" stores/libsql/src/storage/index.test.ts
       ;;
     stores/libsql/src/storage/domains/workflows/index.ts)
       queue_owned_workspace_test "$file" stores/libsql/src/storage/domains/workflows/atomic-resume.test.ts
@@ -5075,6 +8757,13 @@ const generatedExports = new Set(
     .map(symbol => symbol.getName()),
 );
 const indexPath = 'client-sdks/client-js/src/index.ts';
+const absoluteIndexPath = path.resolve(indexPath);
+const generatedRoutePath = rootNames[0];
+const resolvesToGeneratedRouteModule = specifier => {
+  if (specifier === './route-types.generated.js') return true;
+  const resolution = ts.resolveModuleName(specifier, absoluteIndexPath, parsed.options, ts.sys).resolvedModule;
+  return Boolean(resolution && path.resolve(resolution.resolvedFileName) === generatedRoutePath);
+};
 const indexSource = ts.createSourceFile(
   indexPath,
   fs.readFileSync(indexPath, 'utf8'),
@@ -5089,16 +8778,19 @@ if (indexSource.parseDiagnostics.length > 0) {
 const publicRouteExports = [];
 for (const statement of indexSource.statements) {
   if (
-    ts.isExportDeclaration(statement) &&
-    statement.moduleSpecifier &&
-    ts.isStringLiteralLike(statement.moduleSpecifier) &&
-    statement.moduleSpecifier.text === './route-types.generated.js' &&
-    statement.exportClause &&
-    ts.isNamedExports(statement.exportClause)
+    !ts.isExportDeclaration(statement) ||
+    !statement.moduleSpecifier ||
+    !ts.isStringLiteralLike(statement.moduleSpecifier) ||
+    !resolvesToGeneratedRouteModule(statement.moduleSpecifier.text)
   ) {
-    for (const element of statement.exportClause.elements) {
-      publicRouteExports.push(element.propertyName?.text ?? element.name.text);
-    }
+    continue;
+  }
+  if (!statement.exportClause || !ts.isNamedExports(statement.exportClause)) {
+    console.error('Client SDK index must use explicit named generated route-type exports.');
+    process.exit(1);
+  }
+  for (const element of statement.exportClause.elements) {
+    publicRouteExports.push(element.propertyName?.text ?? element.name.text);
   }
 }
 if (publicRouteExports.length === 0) {
@@ -5113,6 +8805,142 @@ if (missingPublicExports.length > 0) {
 console.log('Client SDK route consumers accept generated route types.');
 NODE
 }
+
+check_client_index_entrypoint_contract() {
+  local timeout_seconds
+  if ! timeout_seconds="$(remaining_validation_seconds 60)"; then
+    echo 'Validation budget exhausted before Client SDK public entrypoint comparison.' >&2
+    return 124
+  fi
+
+  timeout --kill-after=30s "${timeout_seconds}s" \
+    node - "$TYPESCRIPT_MODULE_PATH" "$merge_base_sha" "$HEAD_SHA" <<'NODE'
+const { execFileSync } = require('node:child_process');
+
+const ts = require(process.argv[2]);
+const [baseSha, headSha] = process.argv.slice(3);
+const indexPath = 'client-sdks/client-js/src/index.ts';
+const reviewedModule = './resources/harness';
+const reviewedExport = 'InboxResponseGeneration';
+const readAt = revision =>
+  execFileSync('git', ['show', `${revision}:${indexPath}`], { encoding: 'utf8' });
+const printer = ts.createPrinter({ newLine: ts.NewLineKind.LineFeed });
+
+function moduleExportName(name) {
+  return name && typeof name.text === 'string' ? name.text : undefined;
+}
+
+function entrypointContract(source, revision, removeReviewedExport) {
+  const parsed = ts.createSourceFile(indexPath, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  if (parsed.parseDiagnostics.length > 0) {
+    throw new Error(`Could not parse Client SDK index at ${revision}.`);
+  }
+
+  const contract = [];
+  let reviewedExportCount = 0;
+  for (const statement of parsed.statements) {
+    if (!ts.isExportDeclaration(statement)) {
+      contract.push({
+        kind: 'statement',
+        syntaxKind: ts.SyntaxKind[statement.kind],
+        text: printer.printNode(ts.EmitHint.Unspecified, statement, parsed),
+      });
+      continue;
+    }
+
+    const moduleSpecifier =
+      statement.moduleSpecifier && ts.isStringLiteralLike(statement.moduleSpecifier)
+        ? statement.moduleSpecifier.text
+        : statement.moduleSpecifier
+          ? printer.printNode(ts.EmitHint.Unspecified, statement.moduleSpecifier, parsed)
+          : null;
+    const attributes = statement.attributes
+      ? printer.printNode(ts.EmitHint.Unspecified, statement.attributes, parsed)
+      : null;
+
+    if (!statement.exportClause) {
+      contract.push({
+        kind: 'export-all',
+        typeOnly: statement.isTypeOnly,
+        moduleSpecifier,
+        attributes,
+      });
+      continue;
+    }
+
+    if (ts.isNamespaceExport(statement.exportClause)) {
+      contract.push({
+        kind: 'export-namespace',
+        typeOnly: statement.isTypeOnly,
+        moduleSpecifier,
+        attributes,
+        name: moduleExportName(statement.exportClause.name),
+      });
+      continue;
+    }
+
+    const elements = [];
+    for (const element of statement.exportClause.elements) {
+      const sourceName = moduleExportName(element.propertyName) ?? moduleExportName(element.name);
+      const exportedName = moduleExportName(element.name);
+      const typeOnly = statement.isTypeOnly || element.isTypeOnly;
+      const isReviewedExport =
+        moduleSpecifier === reviewedModule &&
+        typeOnly &&
+        sourceName === reviewedExport &&
+        exportedName === reviewedExport;
+      if (removeReviewedExport && isReviewedExport) {
+        reviewedExportCount += 1;
+        continue;
+      }
+      elements.push({
+        typeOnly,
+        sourceName,
+        exportedName,
+      });
+    }
+
+    contract.push({
+      kind: 'export-named',
+      typeOnly: statement.isTypeOnly,
+      moduleSpecifier,
+      attributes,
+      elements,
+    });
+  }
+  return { contract, reviewedExportCount };
+}
+
+const baseResult = entrypointContract(readAt(baseSha), baseSha, false);
+const headResult = entrypointContract(readAt(headSha), headSha, true);
+if (
+  headResult.reviewedExportCount !== 1 ||
+  JSON.stringify(baseResult.contract) !== JSON.stringify(headResult.contract)
+) {
+  console.error(
+    'Client SDK public entrypoint changed outside the reviewed InboxResponseGeneration type re-export.',
+  );
+  console.error(
+    "This lane permits exactly one added type-only named export from './resources/harness'.",
+  );
+  console.error(`Reviewed export occurrences at head: ${headResult.reviewedExportCount}`);
+  console.error(`Base contract: ${JSON.stringify(baseResult.contract)}`);
+  console.error(`Head contract without the reviewed export: ${JSON.stringify(headResult.contract)}`);
+  process.exit(1);
+}
+NODE
+}
+
+if grep -Fxq 'client-sdks/client-js/src/index.ts' "$changed_files"; then
+  # This narrow lane exists only for the reviewed Harness response type needed
+  # by PF-2246. Compare the complete semantic entrypoint shape with the PR merge
+  # base before running package work, remove exactly one type-only named
+  # InboxResponseGeneration re-export from the proposed head, and require every
+  # remaining statement and export to be unchanged. This prevents unrelated
+  # exports, aliases, route surfaces, side effects, or removals from hitching a
+  # ride on the admitted index source-and-test pair.
+  check_client_index_entrypoint_contract
+fi
 
 server_prerequisites_built=false
 ensure_server_prerequisites() {
@@ -5174,6 +9002,11 @@ if (( ${#prettier_files[@]} > 0 )); then
 fi
 
 run_with_validation_budget 900 pnpm build:core
+if grep -Fxq 'client-sdks/client-js/src/index.ts' "$changed_files"; then
+  # The consumer compiler resolves @mastra/core through its built package
+  # exports. Run only after build:core so this guard also works in clean CI.
+  check_client_route_consumers
+fi
 run_with_validation_budget 600 pnpm --filter ./packages/core --fail-if-no-match check
 if workspace_changed packages/core; then
   run_with_validation_budget 600 pnpm --filter ./packages/core --fail-if-no-match lint
@@ -5346,6 +9179,22 @@ if workspace_changed client-sdks/ai-sdk; then
   run_with_validation_budget 900 pnpm --filter ./client-sdks/ai-sdk --fail-if-no-match build:lib
 fi
 
+if workspace_changed client-sdks/client-js; then
+  run_with_validation_budget 600 pnpm --filter ./client-sdks/client-js --fail-if-no-match exec tsc --noEmit
+  run_with_validation_budget 900 pnpm --filter ./client-sdks/client-js --fail-if-no-match build:lib
+  run_with_validation_budget 600 pnpm --filter ./client-sdks/client-js --fail-if-no-match lint
+fi
+
+if [[ "$storage_harness_factory_registered" == true ]]; then
+  # Storage Test Utils has no package-wide TypeScript command. Compile the
+  # shared Harness definition, factory, and in-memory entrypoint together so
+  # the AST-proven wiring is also checked against the real types.
+  run_with_validation_budget 600 pnpm exec tsc-files --noEmit \
+    stores/_test-utils/src/domains/harness/index.ts \
+    stores/_test-utils/src/factory.ts \
+    stores/_test-utils/src/index.test.ts
+fi
+
 if workspace_changed stores/pg; then
   run_with_validation_budget 600 pnpm --filter ./stores/pg --fail-if-no-match exec tsc --noEmit
   run_with_validation_budget 900 pnpm --filter ./stores/pg --fail-if-no-match build:lib
@@ -5417,13 +9266,11 @@ ensure_mastracode_prerequisites() {
     return
   fi
 
-  # MastraCode's Vitest setup mocks these workspace packages, but Vite still
-  # resolves their exported dist entries before applying the mocks
-  # (settings.ts lazily imports @mastra/stagehand; the TUI imports
-  # @mastra/github-signals).
-  run_with_validation_budget 900 pnpm --filter ./signals/github --fail-if-no-match build:lib
-  run_with_validation_budget 900 pnpm --filter ./browser/stagehand --fail-if-no-match build
-  run_with_validation_budget 900 pnpm --filter ./browser/agent-browser --fail-if-no-match build
+  # MastraCode resolves workspace packages through their published dist
+  # exports during typechecking and before Vitest applies its mocks. Build the
+  # complete Code SDK dependency graph so a clean runner has declarations for
+  # storage, memory, MCP, embeddings, signals, and browser integrations.
+  run_with_validation_budget 900 pnpm turbo build --filter ./mastracode/sdk
   mastracode_prerequisites_built=true
 }
 
@@ -5445,6 +9292,15 @@ if workspace_changed mastracode/sdk; then
   run_with_validation_budget 600 pnpm --filter ./mastracode/sdk --fail-if-no-match check
   run_with_validation_budget 900 pnpm --filter ./mastracode/sdk --fail-if-no-match build:lib
   run_with_validation_budget 600 pnpm --filter ./mastracode/sdk --fail-if-no-match lint
+  if grep -Eq \
+    '^(mastracode/sdk/scripts/index-messages\.ts|mastracode/sdk/src/utils/observation-index-input\.ts)$' \
+    "$changed_files"; then
+    # The SDK tsconfig and ESLint config intentionally exclude scripts/**.
+    # Compile the executable migration entrypoint directly so its helper
+    # import and indexObservation call cannot drift behind a green helper test.
+    run_with_validation_budget 600 \
+      pnpm --dir mastracode/sdk exec tsc-files --noEmit scripts/index-messages.ts
+  fi
 fi
 
 if workspace_changed mastracode/tui; then
@@ -5459,6 +9315,8 @@ fi
 is_explicit_fork_safe_test() {
   case "$1" in
     packages/core/src/agent/durable/__tests__/durable-agent-background-tasks.e2e.test.ts | \
+      packages/core/src/harness/v1/session.permission-gate.e2e.test.ts | \
+      packages/core/src/harness/v1/session.plan-task.e2e.test.ts | \
     packages/core/src/harness/v1/session.real-agent.e2e.test.ts | \
       packages/server/src/server/handlers/favorites.integration.test.ts) return 0 ;;
     *) return 1 ;;
@@ -5690,7 +9548,11 @@ const bannedBuiltins = new Set([
 ]);
 const nodeBuiltins = new Set(builtinModules.map(specifier => specifier.replace(/^node:/, '').split('/')[0]));
 const exactTestEntries = new Set([
+  'packages/core/src/agent/__tests__/supervisor-integration.test.ts',
+  'packages/core/src/agent/__tests__/tool-approval.e2e.test.ts',
   'packages/core/src/agent/durable/__tests__/durable-agent-background-tasks.e2e.test.ts',
+  'packages/core/src/harness/v1/session.permission-gate.e2e.test.ts',
+  'packages/core/src/harness/v1/session.plan-task.e2e.test.ts',
   'packages/core/src/harness/v1/session.real-agent.e2e.test.ts',
   'packages/server/src/server/handlers/favorites.integration.test.ts',
 ]);
@@ -5907,12 +9769,16 @@ test_runtime_surface_has_unsupported_runtime() {
   return 1
 }
 
+# Collection is by path alone, because -f follows symlinks: a changed suite
+# replaced by a dangling symlink would drop out of validation entirely instead
+# of failing closed. git_regular_file_at_head below is the mode-aware existence
+# check, and deleted suites already failed closed through "$deleted_tests".
 mapfile -t detected_tests < <(
   while IFS= read -r file; do
     if [[ "$file" == browser/stagehand/src/__tests__/profile-lifecycle.test.ts ]] ||
-      { [[ -f "$file" ]] && grep -Eq \
+      grep -Eq \
         '\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs|mts|cts)$|\.test-d\.ts$' \
-        <<< "$file"; }; then
+        <<< "$file"; then
       printf '%s\n' "$file"
     fi
   done < "$changed_files"
@@ -5920,11 +9786,16 @@ mapfile -t detected_tests < <(
 
 # A changed or newly reachable local dependency of an exact-path exception
 # changes the runtime contract of that test even when the test file is untouched.
+# tool-approval.e2e.test.ts remains an exact changed-file exception, but is not
+# dependency-triggered until its committed replay baseline is repaired.
 for explicit_test in \
+  packages/core/src/agent/__tests__/supervisor-integration.test.ts \
   packages/core/src/agent/durable/__tests__/durable-agent-background-tasks.e2e.test.ts \
+  packages/core/src/harness/v1/session.permission-gate.e2e.test.ts \
+  packages/core/src/harness/v1/session.plan-task.e2e.test.ts \
   packages/core/src/harness/v1/session.real-agent.e2e.test.ts \
   packages/server/src/server/handlers/favorites.integration.test.ts; do
-  [[ -f "$explicit_test" ]] || continue
+  git_regular_file_at_head "$explicit_test" || continue
   if surface="$(list_test_runtime_surface "$explicit_test")"; then
     while IFS= read -r source_file; do
       if grep -Fxq "$source_file" "$changed_files"; then
@@ -5943,23 +9814,42 @@ fi
 
 if (( ${#detected_tests[@]} > 0 )); then
   for file in "${detected_tests[@]}"; do
-    if [[ "$file" == docs/* ]] && grep -Eq "['\"]@playwright/test['\"]" "$file"; then
+    if ! git_regular_file_at_head "$file"; then
+      printf '%s\n' "$file" >> "$unsupported_tests"
+    elif [[ "$file" == docs/* ]] && grep -Eq "['\"]@playwright/test['\"]" "$file"; then
       printf '%s\n' "$file" >> "$delegated_docs_tests"
+    elif [[ "$file" == packages/core/src/agent/__tests__/supervisor-integration.test.ts ]] &&
+      [[ "$supervisor_provider_gate_verified" == true ]] &&
+      test_runtime_surface_has_unsupported_runtime "$file"; then
+      printf '%s\n' "$file" >> "$unsupported_tests"
+    elif [[ "$file" == packages/core/src/agent/__tests__/supervisor-integration.test.ts ]] &&
+      [[ "$supervisor_provider_gate_verified" == true ]]; then
+      # The deterministic supervisor suite is admitted only after its imports,
+      # real-provider subtree, provider binding, and empty-key skip boundary
+      # match the trusted base exactly.
+      printf '%s\n' "$file" >> "$changed_tests"
+    elif [[ "$file" == packages/core/src/agent/__tests__/tool-approval.e2e.test.ts ]] &&
+      [[ "$tool_approval_replay_harness_verified" == true ]] &&
+      test_runtime_surface_has_unsupported_runtime "$file"; then
+      printf '%s\n' "$file" >> "$unsupported_tests"
+    elif [[ "$file" == packages/core/src/agent/__tests__/tool-approval.e2e.test.ts ]] &&
+      [[ "$tool_approval_replay_harness_verified" == true ]]; then
+      # Recorder-backed approval coverage is admitted only after imports and
+      # the gateway setup/lifecycle match the trusted replay harness exactly.
+      printf '%s\n' "$file" >> "$changed_tests"
     elif is_explicit_fork_safe_test "$file" &&
       test_runtime_surface_has_unsupported_runtime "$file"; then
       printf '%s\n' "$file" >> "$unsupported_tests"
     elif [[ "$file" == packages/server/* ]] &&
       test_runtime_surface_has_unsupported_runtime "$file"; then
       printf '%s\n' "$file" >> "$unsupported_tests"
-    elif [[ "$file" == packages/core/src/harness/v1/session.real-agent.e2e.test.ts ]]; then
-      # This is a deterministic, in-process Vitest suite. It uses Mastra's mock
-      # language model and InMemoryStore and requires no provider credentials or
-      # external service beyond the standard Core test environment.
-      printf '%s\n' "$file" >> "$changed_tests"
-    elif [[ "$file" == packages/core/src/agent/durable/__tests__/durable-agent-background-tasks.e2e.test.ts ]]; then
-      # This Core E2E suite provisions its own local recorder gateway and uses
-      # committed replay fixtures; the cross-turn case uses the reviewed
-      # deterministic AI SDK mock. It needs no provider credentials or service.
+    elif [[ "$file" == packages/core/src/agent/durable/__tests__/durable-agent-background-tasks.e2e.test.ts || \
+      "$file" == packages/core/src/harness/v1/session.permission-gate.e2e.test.ts || \
+      "$file" == packages/core/src/harness/v1/session.plan-task.e2e.test.ts || \
+      "$file" == packages/core/src/harness/v1/session.real-agent.e2e.test.ts ]]; then
+      # These exact Core suites are deterministic and fork-safe. They use
+      # in-process stores and mock language models or the frozen recorder
+      # harness with committed replay fixtures.
       printf '%s\n' "$file" >> "$changed_tests"
     elif [[ "$file" == packages/server/src/server/handlers/favorites.integration.test.ts ]]; then
       # This exact cross-layer Server suite is deterministic and fork-safe: it
@@ -5979,6 +9869,7 @@ if (( ${#detected_tests[@]} > 0 )); then
       "$file" != mastracode/tui/src/tui/notify.test.ts && \
       "$file" != mastracode/tui/src/tui/__tests__/goal-manager.test.ts && \
       "$file" != mastracode/sdk/src/headless/run-mc.test.ts && \
+      "$file" != mastracode/sdk/src/utils/__tests__/observation-index-input.test.ts && \
       "$file" != mastracode/sdk/src/utils/__tests__/signals-pubsub.test.ts ]]; then
       printf '%s\n' "$file" >> "$unsupported_tests"
     elif [[ "$file" =~ integration\.(test|spec)\. && \
@@ -5989,6 +9880,7 @@ if (( ${#detected_tests[@]} > 0 )); then
       printf '%s\n' "$file" >> "$unsupported_tests"
     elif [[ "$file" == stores/convex/src/cache/index.test.ts || \
       "$file" == stores/convex/src/server/cache.test.ts || \
+      "$file" == stores/libsql/src/storage/index.test.ts || \
       "$file" == stores/libsql/src/storage/domains/harness/index.test.ts || \
       "$file" == stores/libsql/src/storage/domains/thread-state/index.test.ts || \
       "$file" == stores/libsql/src/storage/domains/workflows/atomic-resume.test.ts ]]; then
@@ -6040,9 +9932,20 @@ if [[ -s "$unsupported_tests" ]]; then
   exit 1
 fi
 
+storage_test_utils_runnable_test=false
+while IFS= read -r file; do
+  if [[ "$file" =~ ^stores/_test-utils/.*\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs|mts|cts)$ ]] &&
+    grep -Fxq "$file" "$changed_files" &&
+    git_regular_file_at_head "$file"; then
+    storage_test_utils_runnable_test=true
+    break
+  fi
+done < "$changed_tests"
+
 if workspace_changed stores/_test-utils &&
   [[ "$storage_atomic_resume_conformance_owned" == false ]] &&
-  ! grep -Eq '^stores/_test-utils/.*\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs|mts|cts)$' "$changed_tests"; then
+  [[ "$storage_harness_conformance_owned" == false ]] &&
+  [[ "$storage_test_utils_runnable_test" == false ]]; then
   echo "Storage test utility changes must include a changed Vitest file in stores/_test-utils." >&2
   echo "Failing closed instead of accepting unexecuted shared conformance helpers." >&2
   exit 1
@@ -6262,11 +10165,40 @@ for (const name of [...selected].sort()) {
 NODE
 }
 
+type_test_report_has_passing_test() {
+  local report_path="$1"
+  node - "$report_path" <<'NODE'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const passed = result.numPassedTests;
+const failed = result.numFailedTests;
+if (
+  !Number.isSafeInteger(passed) ||
+  passed < 1 ||
+  !Number.isSafeInteger(failed) ||
+  failed !== 0
+) {
+  console.error('The changed type-test file did not execute a passing Vitest type test.');
+  process.exit(1);
+}
+NODE
+}
+
 test_status=0
 while IFS= read -r file; do
   status=0
   test_dir=""
   test_workspace=""
+  vitest_environment=()
+  if [[ "$file" == packages/core/src/agent/__tests__/tool-approval.e2e.test.ts ]]; then
+    # Never let this recorder-backed exception fall back from a missing replay
+    # fixture to auto-recording against a provider.
+    vitest_environment=(env LLM_TEST_MODE=replay)
+  elif [[ "$file" == packages/core/src/agent/__tests__/supervisor-integration.test.ts ]]; then
+    # The frozen provider subtree remains skipped even if the runner happens to
+    # carry an ambient OpenAI credential.
+    vitest_environment=(env OPENAI_API_KEY=)
+  fi
   search_dir="$(dirname "$file")"
 
   workspace_search_dir="$search_dir"
@@ -6341,11 +10273,20 @@ while IFS= read -r file; do
         test_status=124
         break
       fi
+      test_result="$(mktemp)"
       set +e
       timeout --kill-after=30s "${timeout_seconds}s" \
-        pnpm --dir "$test_dir" exec vitest run --typecheck.only --reporter=dot "$relative_file"
+        pnpm --dir "$test_dir" exec vitest run --typecheck.only \
+          --reporter=dot --reporter=json --outputFile.json="$test_result" "$relative_file"
       status=$?
       set -e
+      if (( status == 0 )); then
+        set +e
+        type_test_report_has_passing_test "$test_result"
+        status=$?
+        set -e
+      fi
+      rm -f "$test_result"
     else
       if ! timeout_seconds="$(remaining_validation_seconds 900)"; then
         echo "Validation budget exhausted before $file; failing predictably before the workflow timeout." >&2
@@ -6356,7 +10297,7 @@ while IFS= read -r file; do
       test_result="$(mktemp)"
       set +e
       timeout --kill-after=30s "${timeout_seconds}s" \
-        pnpm --dir "$test_dir" exec vitest run \
+        "${vitest_environment[@]}" pnpm --dir "$test_dir" exec vitest run \
           --reporter=dot --reporter=json --outputFile.json="$test_result" \
           "$relative_file"
       status=$?
@@ -6390,10 +10331,19 @@ NODE
       vitest_command=(pnpm --dir "$test_workspace" exec vitest)
       vitest_file="${file#"$test_workspace"/}"
     fi
+    test_result="$(mktemp)"
     timeout --kill-after=30s "${timeout_seconds}s" \
-      "${vitest_command[@]}" run --typecheck.only --reporter=dot "$vitest_file"
+      "${vitest_command[@]}" run --typecheck.only \
+        --reporter=dot --reporter=json --outputFile.json="$test_result" "$vitest_file"
     status=$?
     set -e
+    if (( status == 0 )); then
+      set +e
+      type_test_report_has_passing_test "$test_result"
+      status=$?
+      set -e
+    fi
+    rm -f "$test_result"
   else
     if ! timeout_seconds="$(remaining_validation_seconds 900)"; then
       echo "Validation budget exhausted before $file; failing predictably before the workflow timeout." >&2
@@ -6410,7 +10360,7 @@ NODE
       vitest_file="${file#"$test_workspace"/}"
     fi
     timeout --kill-after=30s "${timeout_seconds}s" \
-      "${vitest_command[@]}" run \
+      "${vitest_environment[@]}" "${vitest_command[@]}" run \
         --reporter=dot --reporter=json --outputFile.json="$test_result" \
         "$vitest_file"
     status=$?
