@@ -982,21 +982,46 @@ export class Memory extends MastraMemory {
     await this.retractObservationalMemoryForCoordinates(memoryStore, coordinates);
   }
 
+  private async reconcileRejectedNonAtomicThreadDeletion(
+    memoryStore: MemoryStorage,
+    coordinate: { resourceId: string; threadId: string },
+  ): Promise<void> {
+    try {
+      // Adapters without the atomic capability delete a thread's messages
+      // before the thread row, so a rejection can still have committed part of
+      // that cascade. Retract only once the transcript has actually changed.
+      const persistedThread = await memoryStore.getThreadById({ threadId: coordinate.threadId });
+      if (persistedThread && (await memoryStore.hasMessages({ threadId: coordinate.threadId }))) return;
+      await this.retractObservationalMemoryForCoordinates(memoryStore, [coordinate]);
+    } catch {
+      this.logger.debug('Failed to reconcile observational memory after a rejected non-atomic thread deletion');
+    }
+  }
+
   async deleteThread(threadId: string): Promise<void> {
     const memoryStore = await this.getMemoryStore();
     const thread = await memoryStore.getThreadById({ threadId });
     const atomicRetraction = memoryStore.supportsAtomicObservationalMemoryRetraction === true;
-    if (thread?.resourceId && memoryStore.supportsObservationalMemory && !atomicRetraction) {
-      await this.retractObservationalMemoryForCoordinates(memoryStore, [{ threadId, resourceId: thread.resourceId }]);
-    }
+    const fallbackCoordinate =
+      thread?.resourceId && memoryStore.supportsObservationalMemory && !atomicRetraction
+        ? { threadId, resourceId: thread.resourceId }
+        : undefined;
     const receipts: ObservationalMemoryRetractionReceipt[] = [];
     try {
       await memoryStore.deleteThread({
         threadId,
         ...(atomicRetraction ? { observationalMemoryRetractions: receipts } : {}),
       });
+    } catch (error) {
+      if (fallbackCoordinate) {
+        await this.reconcileRejectedNonAtomicThreadDeletion(memoryStore, fallbackCoordinate);
+      }
+      throw error;
     } finally {
       await this.deleteObservationVectorsForRetractions(receipts);
+    }
+    if (fallbackCoordinate) {
+      await this.retractObservationalMemoryForCoordinates(memoryStore, [fallbackCoordinate]);
     }
     if (this.vector) {
       void this.deleteThreadVectors(threadId);

@@ -2762,9 +2762,9 @@ describe('Memory', () => {
       return new MemoryWithMockVector();
     }
 
-    async function createMemoryWithDerivedObservationState(suffix: string) {
+    async function createMemoryWithDerivedObservationState(suffix: string, vector?: MastraVector) {
       const storage = new InMemoryStore();
-      const memory = new Memory({ storage });
+      const memory = new Memory({ storage, ...(vector ? { vector } : {}) });
       const memoryStore = (await storage.getStore('memory'))!;
       const threadId = `thread-${suffix}`;
       const resourceId = `resource-${suffix}`;
@@ -3086,6 +3086,60 @@ describe('Memory', () => {
       await expect(memoryStore.getObservationalMemory(null, resourceId)).resolves.toBeNull();
       await expect(memoryStore.getObservationalMemory(threadId, resourceId)).resolves.toBeNull();
       await expect(memoryStore.listMessagesById({ messageIds: [messageId] })).resolves.toEqual({ messages: [] });
+    });
+
+    it('does not clear derived state when a non-atomic authoritative thread deletion fails', async () => {
+      const mockVector = {
+        deleteVectors: vi.fn(),
+        listIndexes: vi.fn().mockResolvedValue(['memory_observations_384']),
+        query: vi.fn(),
+        upsert: vi.fn(),
+        createIndex: vi.fn(),
+        describeIndex: vi.fn(),
+        id: 'delete-thread-failure-vector',
+      } as unknown as MastraVector;
+      const { memory, memoryStore, messageId, resourceId, threadId } =
+        await createMemoryWithDerivedObservationState('delete-thread-failure', mockVector);
+      Object.defineProperty(memoryStore, 'supportsAtomicObservationalMemoryRetraction', {
+        configurable: true,
+        value: false,
+      });
+      vi.spyOn(memoryStore, 'deleteThread').mockRejectedValueOnce(new Error('delete thread failed'));
+
+      await expect(memory.deleteThread(threadId)).rejects.toThrow('delete thread failed');
+
+      await expect(memoryStore.getObservationalMemory(null, resourceId)).resolves.not.toBeNull();
+      await expect(memoryStore.getObservationalMemory(threadId, resourceId)).resolves.not.toBeNull();
+      await expect(memoryStore.getResourceById({ resourceId })).resolves.toMatchObject({
+        workingMemory: '{"privateFact":"ZEPHYR-9"}',
+      });
+      await expect(memoryStore.getThreadById({ threadId })).resolves.toMatchObject({ id: threadId });
+      await expect(memoryStore.listMessagesById({ messageIds: [messageId] })).resolves.toMatchObject({
+        messages: [{ id: messageId }],
+      });
+      expect(mockVector.deleteVectors).not.toHaveBeenCalled();
+    });
+
+    it('retracts derived state when a non-atomic thread deletion commits messages before rejecting', async () => {
+      const { memory, memoryStore, messageId, resourceId, threadId } =
+        await createMemoryWithDerivedObservationState('delete-thread-partial-commit');
+      Object.defineProperty(memoryStore, 'supportsAtomicObservationalMemoryRetraction', {
+        configurable: true,
+        value: false,
+      });
+      // Non-atomic adapters delete the thread's messages before the thread row,
+      // so a rejection can leave the transcript drained and the thread standing.
+      vi.spyOn(memoryStore, 'deleteThread').mockImplementationOnce(async () => {
+        await memoryStore.deleteMessages([messageId]);
+        throw new Error('post-commit thread deletion failure');
+      });
+
+      await expect(memory.deleteThread(threadId)).rejects.toThrow('post-commit thread deletion failure');
+
+      await expect(memoryStore.getObservationalMemory(null, resourceId)).resolves.toBeNull();
+      await expect(memoryStore.getObservationalMemory(threadId, resourceId)).resolves.toBeNull();
+      await expect(memoryStore.listMessagesById({ messageIds: [messageId] })).resolves.toEqual({ messages: [] });
+      await expect(memoryStore.getThreadById({ threadId })).resolves.toMatchObject({ id: threadId });
     });
 
     it('retracts derived observational state as part of deleting a thread', async () => {
