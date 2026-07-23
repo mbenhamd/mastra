@@ -1879,11 +1879,11 @@ The built-in plan-task tools and the TM-4 hierarchy layer are tests-first:
 
 - _Tools (§6.4 injection)._ `createPlanTaskTools(session)` registers
   `task_add` / `task_decompose` / `task_reparent` / `task_update` /
-  `task_complete` / `plan_task_check` / `task_write` (back-compat) under the
-  `harness:builtin` toolset the agent receives every turn; each tool routes its
-  write through the live session under its lease and acts on the calling session
-  only. A rejected mutation returns an `isError` tool payload (it does not abort
-  the turn). `plan_task_check({ rootTaskId?, depth?, status?, limit })` returns a
+  `task_complete` / `plan_task_check` under the `harness:builtin` toolset the
+  agent receives every turn; each tool routes its write through the live session
+  under its lease and acts on the calling session only. A rejected mutation
+  returns an `isError` tool payload (it does not abort the turn).
+  `plan_task_check({ rootTaskId?, depth?, status?, limit })` returns a
   BOUNDED next-N slice (never the whole tree by default) and emits no event.
 - _Custom event (§10.3)._ Every MUTATING tool emits the dotted custom event
   `papersflow.plan_task.updated` (carrying the op + affected task ids) through

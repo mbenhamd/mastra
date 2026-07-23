@@ -34,21 +34,18 @@ same rule: act on the calling session only, and tag user-facing events with
 
 **Plan-task tool surface (TM-3 / TM-4).** The built-in plan-task tools
 (`task_add`, `task_decompose`, `task_reparent`, `task_update`, `task_complete`,
-`plan_task_check`, and the back-compat `task_write`) are the ONLY model-facing
-mutation path for the durable `HarnessPlanTask` tree (§5.1k). They are
-registered on the `harness:builtin` toolset and, like `task_write` /
-`submit_plan` / `ask_user` above, act on the calling session only: each tool
-routes its write through the live `Session` under its lease so the storage
-mutators stay session-owner-fenced (§5.6, §5.8). `task_decompose` and
-`task_reparent` are transaction-shaped multi-row writes. The TM-4 hierarchy
-layer runs over the loaded tree on every mutation: a `'derived'`-status parent's
-status rolls up from its children (the ratified truth-table) and from its own
-`blockedBy` dependencies, an explicit terminal status is never overwritten,
-reparent + `blockedBy` edges are cycle-checked, and at most one task per root
-subtree may be `in_progress`. Each mutating tool emits the
-`papersflow.plan_task.updated` custom event (§10.3). The `task_write` alias maps
-to add (no `taskId`) / update (`taskId`) semantics so an agent trained on the
-legacy single-tool name keeps working against the tree.
+and `plan_task_check`) are the ONLY model-facing mutation path for the durable
+`HarnessPlanTask` tree (§5.1k). They are registered on the `harness:builtin`
+toolset and, like `task_write` / `submit_plan` / `ask_user` above, act on the
+calling session only: each tool routes its write through the live `Session`
+under its lease so the storage mutators stay session-owner-fenced (§5.6, §5.8).
+`task_decompose` and `task_reparent` are transaction-shaped multi-row writes.
+The TM-4 hierarchy layer runs over the loaded tree on every mutation: a
+`'derived'`-status parent's status rolls up from its children (the ratified
+truth-table) and from its own `blockedBy` dependencies, an explicit terminal
+status is never overwritten, reparent + `blockedBy` edges are cycle-checked,
+and at most one task per root subtree may be `in_progress`. Each mutating tool
+emits the `papersflow.plan_task.updated` custom event (§10.3).
 
 **Durable delegation tool (TM-6).** `task_delegate` is added to the same
 `harness:builtin` set, registered ONLY when subagent types are configured
