@@ -95,6 +95,13 @@ describe('AIMock loop scenario: first-call skill and tool discovery budget', () 
       },
       // Deliberately omit maxSteps/stopWhen: this exercises ModelLoop's
       // framework default stepCountAtLeast(5) cap.
+      //
+      // Turns are anchored with the README's tool-result matcher
+      // (`{ toolCallId, hasToolResult: true }`), keyed on the LAST tool call of
+      // the preceding turn. Do not use `onTurn(N)` here: aimock matches its
+      // `turnIndex` against the count of assistant-role messages in the request
+      // body, and every parallel-tool turn below contributes TWO assistant
+      // messages, so N would not line up with the turn ordinal.
       fixtures: llm => {
         llm.on(
           { endpoint: 'chat', hasToolResult: false },
@@ -113,63 +120,82 @@ describe('AIMock loop scenario: first-call skill and tool discovery budget', () 
             ],
           },
         );
-        llm.onTurn(2, /.*/, {
-          toolCalls: [
-            {
-              id: 'call_load_skill_2',
-              name: 'load_skill',
-              arguments: { skillName: 'bounded-latex-repair' },
-            },
-            {
-              id: 'call_search_skills_2',
-              name: 'search_skills',
-              arguments: { query: 'bounded latex repair' },
-            },
-          ],
-        });
-        llm.onTurn(3, /.*/, {
-          toolCalls: [
-            {
-              id: 'call_load_skill_3a',
-              name: 'load_skill',
-              arguments: { skillName: 'bounded-latex-repair' },
-            },
-            {
-              id: 'call_load_skill_3b',
-              name: 'load_skill',
-              arguments: { skillName: 'bounded-latex-repair' },
-            },
-          ],
-        });
-        llm.onTurn(4, /.*/, {
-          toolCalls: [
-            {
-              id: 'call_load_skill_4',
-              name: 'load_skill',
-              arguments: { skillName: 'bounded-latex-repair' },
-            },
-            {
-              id: 'call_search_tools_4',
-              name: 'search_tools',
-              arguments: { query: 'latex read file' },
-            },
-          ],
-        });
-        llm.onTurn(5, /.*/, {
-          toolCalls: [
-            {
-              id: 'call_read_main_5',
-              name: 'latex_read_file',
-              arguments: { path: 'main.tex' },
-            },
-            {
-              id: 'call_read_body_5',
-              name: 'latex_read_file',
-              arguments: { path: 'sections/body.tex' },
-            },
-          ],
-        });
-        llm.onTurn(6, /.*/, { content: 'The exact marker is BEFORE.' });
+        llm.on(
+          { endpoint: 'chat', toolCallId: 'call_load_skill_1b', hasToolResult: true },
+          {
+            toolCalls: [
+              {
+                id: 'call_load_skill_2',
+                name: 'load_skill',
+                arguments: { skillName: 'bounded-latex-repair' },
+              },
+              {
+                id: 'call_search_skills_2',
+                name: 'search_skills',
+                arguments: { query: 'bounded latex repair' },
+              },
+            ],
+          },
+        );
+        llm.on(
+          { endpoint: 'chat', toolCallId: 'call_search_skills_2', hasToolResult: true },
+          {
+            toolCalls: [
+              {
+                id: 'call_load_skill_3a',
+                name: 'load_skill',
+                arguments: { skillName: 'bounded-latex-repair' },
+              },
+              {
+                id: 'call_load_skill_3b',
+                name: 'load_skill',
+                arguments: { skillName: 'bounded-latex-repair' },
+              },
+            ],
+          },
+        );
+        llm.on(
+          { endpoint: 'chat', toolCallId: 'call_load_skill_3b', hasToolResult: true },
+          {
+            toolCalls: [
+              {
+                id: 'call_load_skill_4',
+                name: 'load_skill',
+                arguments: { skillName: 'bounded-latex-repair' },
+              },
+              {
+                id: 'call_search_tools_4',
+                name: 'search_tools',
+                arguments: { query: 'latex read file' },
+              },
+            ],
+          },
+        );
+        llm.on(
+          { endpoint: 'chat', toolCallId: 'call_search_tools_4', hasToolResult: true },
+          {
+            toolCalls: [
+              {
+                id: 'call_read_main_5',
+                name: 'latex_read_file',
+                arguments: { path: 'main.tex' },
+              },
+              {
+                id: 'call_read_body_5',
+                name: 'latex_read_file',
+                arguments: { path: 'sections/body.tex' },
+              },
+            ],
+          },
+        );
+        // Scripted but never reached: the default five-call cap stops the loop
+        // before the model can synthesize, which is the point of this scenario.
+        llm.on(
+          { endpoint: 'chat', toolCallId: 'call_read_body_5', hasToolResult: true },
+          {
+            content: 'The exact marker is BEFORE.',
+          },
+        );
       },
     });
 
@@ -197,7 +223,9 @@ describe('AIMock loop scenario: first-call skill and tool discovery budget', () 
         if (step.finishReason) finishReasons.push(step.finishReason);
       },
       // No expanded step budget: the optimized path must fit under the
-      // framework's default five-call cap.
+      // framework's default five-call cap. Turns are anchored on the previous
+      // turn's last tool call — see the note on the manual scenario above for
+      // why `onTurn(N)` cannot be used once a turn calls tools in parallel.
       fixtures: llm => {
         llm.on(
           { endpoint: 'chat', hasToolResult: false },
@@ -211,30 +239,41 @@ describe('AIMock loop scenario: first-call skill and tool discovery budget', () 
             ],
           },
         );
-        llm.onTurn(2, /.*/, {
-          toolCalls: [
-            {
-              id: 'call_search_tools_2',
-              name: 'search_tools',
-              arguments: { query: 'latex read file' },
-            },
-          ],
-        });
-        llm.onTurn(3, /.*/, {
-          toolCalls: [
-            {
-              id: 'call_read_main_3',
-              name: 'latex_read_file',
-              arguments: { path: 'main.tex' },
-            },
-            {
-              id: 'call_read_body_3',
-              name: 'latex_read_file',
-              arguments: { path: 'sections/body.tex' },
-            },
-          ],
-        });
-        llm.onTurn(4, /.*/, { content: 'The exact marker is BEFORE.' });
+        llm.on(
+          { endpoint: 'chat', toolCallId: 'call_search_skills_1', hasToolResult: true },
+          {
+            toolCalls: [
+              {
+                id: 'call_search_tools_2',
+                name: 'search_tools',
+                arguments: { query: 'latex read file' },
+              },
+            ],
+          },
+        );
+        llm.on(
+          { endpoint: 'chat', toolCallId: 'call_search_tools_2', hasToolResult: true },
+          {
+            toolCalls: [
+              {
+                id: 'call_read_main_3',
+                name: 'latex_read_file',
+                arguments: { path: 'main.tex' },
+              },
+              {
+                id: 'call_read_body_3',
+                name: 'latex_read_file',
+                arguments: { path: 'sections/body.tex' },
+              },
+            ],
+          },
+        );
+        llm.on(
+          { endpoint: 'chat', toolCallId: 'call_read_body_3', hasToolResult: true },
+          {
+            content: 'The exact marker is BEFORE.',
+          },
+        );
       },
     });
 
