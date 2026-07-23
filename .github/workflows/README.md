@@ -93,7 +93,7 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   type-checks Core,
   runs explicit affected-package checks for Okta Auth, Stagehand, Internal Core, CLI,
   Codemod, Deployer, MCP, Memory, Server, AI SDK, the exact Client SDK Harness
-  resource pair, shared Storage Test Utils, PostgreSQL, Redis, Convex, LibSQL,
+  resource and public-entrypoint pairs, shared Storage Test Utils, PostgreSQL, Redis, Convex, LibSQL,
   Google Cloud PubSub, Redis Streams,
   Inngest, and the MastraCode SDK/TUI, and
   executes each supported changed Vitest file in full. The stateful Core Agent
@@ -148,10 +148,19 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   interface. Server package manifest changes fail closed before package-owned
   commands run. This allows route and permission PRs to commit canonical output
   without granting general validation coverage to the Client SDK beyond its
-  exact Harness resource pair, or to the CLI or Core workspaces. Direct Client
-  Harness resource changes run the Client SDK typecheck, build, and lint plus
-  the native Harness resource regression; unknown Client SDK sources and tests
-  remain fail-closed. MCP runs its package typecheck, build, lint, and changed-test
+  exact Harness resource and public-entrypoint pairs, or to the CLI or Core
+  workspaces. Direct Client Harness resource changes run the Client SDK
+  typecheck, build, and lint plus the native Harness resource regression.
+  Direct public-entrypoint changes run the same package checks plus the package
+  export regression, always execute the generated route-consumer guard, and are
+  admitted only when the complete semantic entrypoint is unchanged after
+  removing exactly one added type-only `InboxResponseGeneration` named export
+  from `./resources/harness`. Removing an unrelated export, changing aliases or
+  generated route exports, adding side effects, or making any other entrypoint
+  change fails closed before package commands run. Broader public-contract
+  changes need their own reviewed validator lane. Unknown Client SDK sources and
+  tests remain fail-closed. MCP runs its
+  package typecheck, build, lint, and changed-test
   coverage. Nested
   fixture manifests are not treated as workspace boundaries. The validator discovers
   workspace ownership from the nearest non-fixture `package.json` and

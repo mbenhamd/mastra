@@ -1642,6 +1642,8 @@ run_validator_self_tests() {
     printf '%s\n' 'export default {};' > client-sdks/client-js/vitest.config.ts
     printf '%s\n' "import { it } from 'vitest';" "it('client harness resource', () => {});" \
       > client-sdks/client-js/src/resources/harness.test.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('client package exports', () => {});" \
+      > client-sdks/client-js/src/index.test.ts
     printf '%s\n' '# Harness session contract' \
       > harnessv1/sections/04-public-api/02-session/messages.md
     printf '%s\n' '{}' > mastracode/sdk/package.json
@@ -1817,8 +1819,14 @@ run_validator_self_tests() {
       > client-sdks/client-js/src/types.ts
     printf '%s\n' "import type { HarnessRoute } from '../route-types.generated.js';" \
       'export type ClientHarnessRoute = HarnessRoute;' \
+      'export type InboxResponseGeneration = { responseId: string };' \
       > client-sdks/client-js/src/resources/harness.ts
-    printf '%s\n' "export type { IndexOnlyRoute } from './route-types.generated.js';" \
+    printf '%s\n' 'export const clientTool = true;' \
+      > client-sdks/client-js/src/tools.ts
+    printf '%s\n' \
+      "export * from './tools';" \
+      "export type { IndexOnlyRoute, RouteTypes } from './route-types.generated.js';" \
+      "export type { ClientHarnessRoute } from './resources/harness';" \
       > client-sdks/client-js/src/index.ts
     printf '%s\n' "export const routeMetadata = 'base';" > packages/cli/src/commands/api/route-metadata.generated.ts
     printf '%s\n' 'export const favoriteFixture = true;' \
@@ -3313,6 +3321,225 @@ NODE
   assert_contains '--filter ./client-sdks/client-js --fail-if-no-match lint' "$command_log"
   assert_contains '--dir client-sdks/client-js exec vitest run' "$command_log"
   assert_contains 'src/resources/harness.test.ts' "$command_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "export * from './tools';" \
+      "export type { IndexOnlyRoute, RouteTypes } from './route-types.generated.js';" \
+      "export type { ClientHarnessRoute, InboxResponseGeneration } from './resources/harness';" \
+      > client-sdks/client-js/src/index.ts
+    git add .
+    git commit -q -m 'client inbox response generation export'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/client-index-production-success.log"
+  run_fixture "$head_sha" "$output"
+  assert_contains 'Forcing PF-2044 owned suites to run for source-only changes:' "$output"
+  assert_contains 'client-sdks/client-js/src/index.test.ts' "$output"
+  assert_contains '--filter ./client-sdks/client-js --fail-if-no-match exec tsc --noEmit' "$command_log"
+  assert_contains '--filter ./client-sdks/client-js --fail-if-no-match build:lib' "$command_log"
+  assert_contains '--filter ./client-sdks/client-js --fail-if-no-match lint' "$command_log"
+  assert_contains '--dir client-sdks/client-js exec vitest run' "$command_log"
+  assert_contains 'src/index.test.ts' "$command_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "export * from './tools';" \
+      "export type { IndexOnlyRoute } from './route-types.generated.js';" \
+      "export type { ClientHarnessRoute, InboxResponseGeneration } from './resources/harness';" \
+      > client-sdks/client-js/src/index.ts
+    git add .
+    git commit -q -m 'remove one public client route export'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/client-index-route-export-removal-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Partial Client SDK route-export removal unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains \
+    'Client SDK public entrypoint changed outside the reviewed InboxResponseGeneration type re-export.' \
+    "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Invalid Client SDK route-export fixture executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "export * from './tools';" \
+      "export type { IndexOnlyRoute } from './route-types.generated.js';" \
+      "export type { ClientHarnessRoute, InboxResponseGeneration } from './resources/harness';" \
+      > client-sdks/client-js/src/index.ts
+    printf '%s\n' "it('unrelated server coverage', () => true);" \
+      >> packages/server/src/server/handlers/favorites.integration.test.ts
+    git add .
+    git commit -q -m 'hide client route export removal behind unrelated server test'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/client-index-route-export-removal-with-server-test-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Client SDK route-export removal paired with an unrelated Server test unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains \
+    'Client SDK public entrypoint changed outside the reviewed InboxResponseGeneration type re-export.' \
+    "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Invalid mixed Client SDK/Server route-export fixture executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "export * from './tools';" \
+      "export type { IndexOnlyRoute, RouteTypes } from './route-types.generated.js';" \
+      "export type * from './route-types.generated.js';" \
+      "export type { ClientHarnessRoute, InboxResponseGeneration } from './resources/harness';" \
+      > client-sdks/client-js/src/index.ts
+    git add .
+    git commit -q -m 'add wildcard public client route exports'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/client-index-wildcard-route-export-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Wildcard Client SDK route export unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains \
+    'Client SDK public entrypoint changed outside the reviewed InboxResponseGeneration type re-export.' \
+    "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Invalid wildcard Client SDK route-export fixture executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "export * from './tools';" \
+      "export type { IndexOnlyRoute, RouteTypes } from './route-types.generated.js';" \
+      "export type LeakedHarnessRoute = import('./route-types.generated.js').HarnessRoute;" \
+      "export type { ClientHarnessRoute, InboxResponseGeneration } from './resources/harness';" \
+      > client-sdks/client-js/src/index.ts
+    git add .
+    git commit -q -m 'indirectly expose a generated client route type'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/client-index-indirect-route-export-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Indirect Client SDK generated route export unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains \
+    'Client SDK public entrypoint changed outside the reviewed InboxResponseGeneration type re-export.' \
+    "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Invalid indirect Client SDK route-export fixture executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "export * from './tools';" \
+      "export type { IndexOnlyRoute, RouteTypes } from './route-types.generated.js';" \
+      "export type { HarnessRoute } from './resources/../route-types.generated.js';" \
+      "export type { ClientHarnessRoute, InboxResponseGeneration } from './resources/harness';" \
+      > client-sdks/client-js/src/index.ts
+    git add .
+    git commit -q -m 'expose generated client route through an equivalent path'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/client-index-equivalent-route-path-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Equivalent-path Client SDK generated route export unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains \
+    'Client SDK public entrypoint changed outside the reviewed InboxResponseGeneration type re-export.' \
+    "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Invalid equivalent-path Client SDK route-export fixture executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "export type { IndexOnlyRoute, RouteTypes } from './route-types.generated.js';" \
+      "export type { ClientHarnessRoute, InboxResponseGeneration } from './resources/harness';" \
+      > client-sdks/client-js/src/index.ts
+    git add .
+    git commit -q -m 'remove an unrelated client entrypoint export'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/client-index-unrelated-export-removal-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Unrelated Client SDK entrypoint export removal unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains \
+    'Client SDK public entrypoint changed outside the reviewed InboxResponseGeneration type re-export.' \
+    "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Invalid unrelated Client SDK entrypoint-export fixture executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
 
   head_sha="$(
     cd "$fixture_repo"
@@ -7973,9 +8200,10 @@ queue_owned_workspace_test() {
 }
 
 # The Client SDK is admitted only through exact source-and-test ownership.
-# Generated route types remain owned by the Server generator path above; a
-# direct Harness resource edit must build/lint the package and execute its
-# native request-contract regression.
+# Generated route types remain owned by the Server generator path above.
+# Direct Harness resource edits execute their request-contract regression;
+# public entrypoint edits execute the package-export regression. Both paths
+# also build, typecheck, and lint the complete Client SDK workspace.
 while IFS= read -r file; do
   [[ "$file" == client-sdks/client-js/* ]] || continue
 
@@ -7988,7 +8216,7 @@ while IFS= read -r file; do
   fi
   if grep -Eq '\.(test|spec)\.(cjs|cts|js|jsx|mjs|mts|ts|tsx)$|\.test-d\.ts$' <<< "$file"; then
     case "$file" in
-      client-sdks/client-js/src/resources/harness.test.ts) ;;
+      client-sdks/client-js/src/index.test.ts | client-sdks/client-js/src/resources/harness.test.ts) ;;
       *) printf '%s\n' "$file" >> "$unsupported_owned_workspace_tests" ;;
     esac
     if ! git_regular_file_at_head "$file"; then
@@ -7998,6 +8226,9 @@ while IFS= read -r file; do
   fi
 
   case "$file" in
+    client-sdks/client-js/src/index.ts)
+      queue_owned_workspace_test "$file" client-sdks/client-js/src/index.test.ts
+      ;;
     client-sdks/client-js/src/resources/harness.ts)
       queue_owned_workspace_test "$file" client-sdks/client-js/src/resources/harness.test.ts
       ;;
@@ -8351,6 +8582,13 @@ const generatedExports = new Set(
     .map(symbol => symbol.getName()),
 );
 const indexPath = 'client-sdks/client-js/src/index.ts';
+const absoluteIndexPath = path.resolve(indexPath);
+const generatedRoutePath = rootNames[0];
+const resolvesToGeneratedRouteModule = specifier => {
+  if (specifier === './route-types.generated.js') return true;
+  const resolution = ts.resolveModuleName(specifier, absoluteIndexPath, parsed.options, ts.sys).resolvedModule;
+  return Boolean(resolution && path.resolve(resolution.resolvedFileName) === generatedRoutePath);
+};
 const indexSource = ts.createSourceFile(
   indexPath,
   fs.readFileSync(indexPath, 'utf8'),
@@ -8365,16 +8603,19 @@ if (indexSource.parseDiagnostics.length > 0) {
 const publicRouteExports = [];
 for (const statement of indexSource.statements) {
   if (
-    ts.isExportDeclaration(statement) &&
-    statement.moduleSpecifier &&
-    ts.isStringLiteralLike(statement.moduleSpecifier) &&
-    statement.moduleSpecifier.text === './route-types.generated.js' &&
-    statement.exportClause &&
-    ts.isNamedExports(statement.exportClause)
+    !ts.isExportDeclaration(statement) ||
+    !statement.moduleSpecifier ||
+    !ts.isStringLiteralLike(statement.moduleSpecifier) ||
+    !resolvesToGeneratedRouteModule(statement.moduleSpecifier.text)
   ) {
-    for (const element of statement.exportClause.elements) {
-      publicRouteExports.push(element.propertyName?.text ?? element.name.text);
-    }
+    continue;
+  }
+  if (!statement.exportClause || !ts.isNamedExports(statement.exportClause)) {
+    console.error('Client SDK index must use explicit named generated route-type exports.');
+    process.exit(1);
+  }
+  for (const element of statement.exportClause.elements) {
+    publicRouteExports.push(element.propertyName?.text ?? element.name.text);
   }
 }
 if (publicRouteExports.length === 0) {
@@ -8389,6 +8630,142 @@ if (missingPublicExports.length > 0) {
 console.log('Client SDK route consumers accept generated route types.');
 NODE
 }
+
+check_client_index_entrypoint_contract() {
+  local timeout_seconds
+  if ! timeout_seconds="$(remaining_validation_seconds 60)"; then
+    echo 'Validation budget exhausted before Client SDK public entrypoint comparison.' >&2
+    return 124
+  fi
+
+  timeout --kill-after=30s "${timeout_seconds}s" \
+    node - "$TYPESCRIPT_MODULE_PATH" "$merge_base_sha" "$HEAD_SHA" <<'NODE'
+const { execFileSync } = require('node:child_process');
+
+const ts = require(process.argv[2]);
+const [baseSha, headSha] = process.argv.slice(3);
+const indexPath = 'client-sdks/client-js/src/index.ts';
+const reviewedModule = './resources/harness';
+const reviewedExport = 'InboxResponseGeneration';
+const readAt = revision =>
+  execFileSync('git', ['show', `${revision}:${indexPath}`], { encoding: 'utf8' });
+const printer = ts.createPrinter({ newLine: ts.NewLineKind.LineFeed });
+
+function moduleExportName(name) {
+  return name && typeof name.text === 'string' ? name.text : undefined;
+}
+
+function entrypointContract(source, revision, removeReviewedExport) {
+  const parsed = ts.createSourceFile(indexPath, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  if (parsed.parseDiagnostics.length > 0) {
+    throw new Error(`Could not parse Client SDK index at ${revision}.`);
+  }
+
+  const contract = [];
+  let reviewedExportCount = 0;
+  for (const statement of parsed.statements) {
+    if (!ts.isExportDeclaration(statement)) {
+      contract.push({
+        kind: 'statement',
+        syntaxKind: ts.SyntaxKind[statement.kind],
+        text: printer.printNode(ts.EmitHint.Unspecified, statement, parsed),
+      });
+      continue;
+    }
+
+    const moduleSpecifier =
+      statement.moduleSpecifier && ts.isStringLiteralLike(statement.moduleSpecifier)
+        ? statement.moduleSpecifier.text
+        : statement.moduleSpecifier
+          ? printer.printNode(ts.EmitHint.Unspecified, statement.moduleSpecifier, parsed)
+          : null;
+    const attributes = statement.attributes
+      ? printer.printNode(ts.EmitHint.Unspecified, statement.attributes, parsed)
+      : null;
+
+    if (!statement.exportClause) {
+      contract.push({
+        kind: 'export-all',
+        typeOnly: statement.isTypeOnly,
+        moduleSpecifier,
+        attributes,
+      });
+      continue;
+    }
+
+    if (ts.isNamespaceExport(statement.exportClause)) {
+      contract.push({
+        kind: 'export-namespace',
+        typeOnly: statement.isTypeOnly,
+        moduleSpecifier,
+        attributes,
+        name: moduleExportName(statement.exportClause.name),
+      });
+      continue;
+    }
+
+    const elements = [];
+    for (const element of statement.exportClause.elements) {
+      const sourceName = moduleExportName(element.propertyName) ?? moduleExportName(element.name);
+      const exportedName = moduleExportName(element.name);
+      const typeOnly = statement.isTypeOnly || element.isTypeOnly;
+      const isReviewedExport =
+        moduleSpecifier === reviewedModule &&
+        typeOnly &&
+        sourceName === reviewedExport &&
+        exportedName === reviewedExport;
+      if (removeReviewedExport && isReviewedExport) {
+        reviewedExportCount += 1;
+        continue;
+      }
+      elements.push({
+        typeOnly,
+        sourceName,
+        exportedName,
+      });
+    }
+
+    contract.push({
+      kind: 'export-named',
+      typeOnly: statement.isTypeOnly,
+      moduleSpecifier,
+      attributes,
+      elements,
+    });
+  }
+  return { contract, reviewedExportCount };
+}
+
+const baseResult = entrypointContract(readAt(baseSha), baseSha, false);
+const headResult = entrypointContract(readAt(headSha), headSha, true);
+if (
+  headResult.reviewedExportCount !== 1 ||
+  JSON.stringify(baseResult.contract) !== JSON.stringify(headResult.contract)
+) {
+  console.error(
+    'Client SDK public entrypoint changed outside the reviewed InboxResponseGeneration type re-export.',
+  );
+  console.error(
+    "This lane permits exactly one added type-only named export from './resources/harness'.",
+  );
+  console.error(`Reviewed export occurrences at head: ${headResult.reviewedExportCount}`);
+  console.error(`Base contract: ${JSON.stringify(baseResult.contract)}`);
+  console.error(`Head contract without the reviewed export: ${JSON.stringify(headResult.contract)}`);
+  process.exit(1);
+}
+NODE
+}
+
+if grep -Fxq 'client-sdks/client-js/src/index.ts' "$changed_files"; then
+  # This narrow lane exists only for the reviewed Harness response type needed
+  # by PF-2246. Compare the complete semantic entrypoint shape with the PR merge
+  # base before running package work, remove exactly one type-only named
+  # InboxResponseGeneration re-export from the proposed head, and require every
+  # remaining statement and export to be unchanged. This prevents unrelated
+  # exports, aliases, route surfaces, side effects, or removals from hitching a
+  # ride on the admitted index source-and-test pair.
+  check_client_index_entrypoint_contract
+fi
 
 server_prerequisites_built=false
 ensure_server_prerequisites() {
@@ -8450,6 +8827,11 @@ if (( ${#prettier_files[@]} > 0 )); then
 fi
 
 run_with_validation_budget 900 pnpm build:core
+if grep -Fxq 'client-sdks/client-js/src/index.ts' "$changed_files"; then
+  # The consumer compiler resolves @mastra/core through its built package
+  # exports. Run only after build:core so this guard also works in clean CI.
+  check_client_route_consumers
+fi
 run_with_validation_budget 600 pnpm --filter ./packages/core --fail-if-no-match check
 if workspace_changed packages/core; then
   run_with_validation_budget 600 pnpm --filter ./packages/core --fail-if-no-match lint
