@@ -2941,7 +2941,7 @@ describe('Memory', () => {
       });
       await memoryStore.initializeObservationalMemory({ threadId, resourceId, scope: 'thread' });
       const mockVector = {
-        deleteVectors: vi.fn().mockResolvedValue(undefined),
+        deleteVectors: vi.fn().mockRejectedValue(new Error('vector cleanup unavailable')),
         listIndexes: vi.fn().mockResolvedValue(['memory_observations_384']),
         query: vi.fn(),
         upsert: vi.fn(),
@@ -2951,14 +2951,16 @@ describe('Memory', () => {
       } as any;
       const memory = new Memory({ storage, vector: mockVector });
 
-      await memory.updateMessages({
-        messages: [
-          {
-            id: messageId,
-            content: { format: 2, parts: [{ type: 'text', text: 'Corrected' }] },
-          },
-        ],
-      });
+      await expect(
+        memory.updateMessages({
+          messages: [
+            {
+              id: messageId,
+              content: { format: 2, parts: [{ type: 'text', text: 'Corrected' }] },
+            },
+          ],
+        }),
+      ).resolves.toMatchObject([{ id: messageId }]);
 
       expect(mockVector.deleteVectors).toHaveBeenCalledWith({
         indexName: 'memory_observations_384',
@@ -2979,9 +2981,13 @@ describe('Memory', () => {
       await expectDerivedObservationStateRetracted(memoryStore, resourceId, threadId);
     });
 
-    it('does not clear derived state when the authoritative message edit fails', async () => {
+    it('does not clear derived state when a non-atomic authoritative message edit fails', async () => {
       const { memory, memoryStore, messageId, resourceId, threadId } =
         await createMemoryWithDerivedObservationState('edit-failure');
+      Object.defineProperty(memoryStore, 'supportsAtomicObservationalMemoryRetraction', {
+        configurable: true,
+        value: false,
+      });
       vi.spyOn(memoryStore, 'updateMessages').mockRejectedValueOnce(new Error('edit failed'));
 
       await expect(
@@ -3010,9 +3016,13 @@ describe('Memory', () => {
       });
     });
 
-    it('does not clear derived state when the authoritative message deletion fails', async () => {
+    it('does not clear derived state when a non-atomic authoritative message deletion fails', async () => {
       const { memory, memoryStore, messageId, resourceId, threadId } =
         await createMemoryWithDerivedObservationState('delete-failure');
+      Object.defineProperty(memoryStore, 'supportsAtomicObservationalMemoryRetraction', {
+        configurable: true,
+        value: false,
+      });
       vi.spyOn(memoryStore, 'deleteMessages').mockRejectedValueOnce(new Error('delete failed'));
 
       await expect(memory.deleteMessages([messageId])).rejects.toThrow('delete failed');
@@ -3025,6 +3035,57 @@ describe('Memory', () => {
       await expect(memoryStore.listMessagesById({ messageIds: [messageId] })).resolves.toMatchObject({
         messages: [{ id: messageId }],
       });
+    });
+
+    it('retracts derived state when a non-atomic message edit commits before rejecting', async () => {
+      const { memory, memoryStore, messageId, resourceId, threadId } =
+        await createMemoryWithDerivedObservationState('edit-partial-commit');
+      Object.defineProperty(memoryStore, 'supportsAtomicObservationalMemoryRetraction', {
+        configurable: true,
+        value: false,
+      });
+      const updateMessages = memoryStore.updateMessages.bind(memoryStore);
+      vi.spyOn(memoryStore, 'updateMessages').mockImplementationOnce(async input => {
+        await updateMessages(input);
+        throw new Error('post-commit edit failure');
+      });
+      const committedCreatedAt = new Date('2026-01-02T00:00:00.000Z');
+
+      await expect(
+        memory.updateMessages({
+          messages: [
+            {
+              id: messageId,
+              createdAt: committedCreatedAt,
+            },
+          ],
+        }),
+      ).rejects.toThrow('post-commit edit failure');
+
+      await expect(memoryStore.getObservationalMemory(null, resourceId)).resolves.toBeNull();
+      await expect(memoryStore.getObservationalMemory(threadId, resourceId)).resolves.toBeNull();
+      const stored = await memoryStore.listMessagesById({ messageIds: [messageId] });
+      expect(stored.messages[0]?.createdAt).toEqual(committedCreatedAt);
+    });
+
+    it('retracts derived state when a non-atomic message deletion commits before rejecting', async () => {
+      const { memory, memoryStore, messageId, resourceId, threadId } =
+        await createMemoryWithDerivedObservationState('delete-partial-commit');
+      Object.defineProperty(memoryStore, 'supportsAtomicObservationalMemoryRetraction', {
+        configurable: true,
+        value: false,
+      });
+      const deleteMessages = memoryStore.deleteMessages.bind(memoryStore);
+      vi.spyOn(memoryStore, 'deleteMessages').mockImplementationOnce(async (...args) => {
+        await deleteMessages(...args);
+        throw new Error('post-commit deletion failure');
+      });
+
+      await expect(memory.deleteMessages([messageId])).rejects.toThrow('post-commit deletion failure');
+
+      await expect(memoryStore.getObservationalMemory(null, resourceId)).resolves.toBeNull();
+      await expect(memoryStore.getObservationalMemory(threadId, resourceId)).resolves.toBeNull();
+      await expect(memoryStore.listMessagesById({ messageIds: [messageId] })).resolves.toEqual({ messages: [] });
     });
 
     it('retracts derived observational state as part of deleting a thread', async () => {

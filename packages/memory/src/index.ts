@@ -39,7 +39,7 @@ import type {
   BufferedObservationChunk,
 } from '@mastra/core/storage';
 import type { ToolAction } from '@mastra/core/tools';
-import { generateEmptyFromSchema } from '@mastra/core/utils';
+import { deepEqual, generateEmptyFromSchema } from '@mastra/core/utils';
 import type { VectorFilter } from '@mastra/core/vector';
 import { isStandardSchemaWithJSON, toStandardSchema } from '@mastra/schema-compat/schema';
 import { Mutex } from 'async-mutex';
@@ -843,6 +843,56 @@ export class Memory extends MastraMemory {
     return this.getObservationalMemoryRetractionCoordinates(memoryStore, [...existingMessages, ...destinations]);
   }
 
+  private hasAuthoritativeMessageChanged(before: MastraDBMessage, after: MastraDBMessage): boolean {
+    return !deepEqual(
+      {
+        content: before.content,
+        createdAt: before.createdAt,
+        resourceId: before.resourceId,
+        role: before.role,
+        threadId: before.threadId,
+        type: before.type,
+      },
+      {
+        content: after.content,
+        createdAt: after.createdAt,
+        resourceId: after.resourceId,
+        role: after.role,
+        threadId: after.threadId,
+        type: after.type,
+      },
+    );
+  }
+
+  private async reconcileRejectedNonAtomicMessageMutation(
+    memoryStore: MemoryStorage,
+    existingMessages: readonly MastraDBMessage[],
+  ): Promise<void> {
+    try {
+      const persistedMessages = (
+        await memoryStore.listMessagesById({
+          messageIds: existingMessages.map(message => message.id),
+        })
+      ).messages;
+      const persistedById = new Map(persistedMessages.map(message => [message.id, message]));
+      const changedMessages: MastraDBMessage[] = [];
+
+      for (const existingMessage of existingMessages) {
+        const persistedMessage = persistedById.get(existingMessage.id);
+        if (!persistedMessage) {
+          changedMessages.push(existingMessage);
+        } else if (this.hasAuthoritativeMessageChanged(existingMessage, persistedMessage)) {
+          changedMessages.push(existingMessage, persistedMessage);
+        }
+      }
+
+      const coordinates = await this.getObservationalMemoryRetractionCoordinates(memoryStore, changedMessages);
+      await this.retractObservationalMemoryForCoordinates(memoryStore, coordinates);
+    } catch {
+      this.logger.debug('Failed to reconcile observational memory after a rejected non-atomic message mutation');
+    }
+  }
+
   private async retractObservationalMemoryForCoordinates(
     memoryStore: MemoryStorage,
     coordinates: readonly { resourceId: string; threadId: string }[],
@@ -890,7 +940,11 @@ export class Memory extends MastraMemory {
         }
       }
     }
-    await this.deleteObservationVectors(resourceVectorScopes, threadVectorScopes.values());
+    try {
+      await this.deleteObservationVectors(resourceVectorScopes, threadVectorScopes.values());
+    } catch {
+      this.logger.debug('Failed to clean up observation vectors after non-atomic retraction');
+    }
   }
 
   private async deleteObservationVectorsForRetractions(
@@ -2859,9 +2913,6 @@ Notes:
       messages,
     );
     const atomicRetraction = memoryStore.supportsAtomicObservationalMemoryRetraction === true;
-    if (!atomicRetraction) {
-      await this.retractObservationalMemoryForCoordinates(memoryStore, retractionCoordinates);
-    }
 
     // Update vector database if semantic recall is enabled and any messages have content updates
     if (this.vector && config.semanticRecall) {
@@ -3016,8 +3067,16 @@ Notes:
             }
           : {}),
       });
+    } catch (error) {
+      if (!atomicRetraction) {
+        await this.reconcileRejectedNonAtomicMessageMutation(memoryStore, existingMessages);
+      }
+      throw error;
     } finally {
       await this.deleteObservationVectorsForRetractions(receipts);
+    }
+    if (!atomicRetraction) {
+      await this.retractObservationalMemoryForCoordinates(memoryStore, retractionCoordinates);
     }
     return updatedMessages;
   }
@@ -3072,9 +3131,6 @@ Notes:
       ).messages;
 
       const atomicRetraction = memoryStore.supportsAtomicObservationalMemoryRetraction === true;
-      if (!atomicRetraction) {
-        await this.retractObservationalMemoryForMessages(memoryStore, existingMessages);
-      }
       const receipts: ObservationalMemoryRetractionReceipt[] = [];
       try {
         await memoryStore.deleteMessages(
@@ -3086,8 +3142,16 @@ Notes:
               }
             : undefined,
         );
+      } catch (error) {
+        if (!atomicRetraction) {
+          await this.reconcileRejectedNonAtomicMessageMutation(memoryStore, existingMessages);
+        }
+        throw error;
       } finally {
         await this.deleteObservationVectorsForRetractions(receipts);
+      }
+      if (!atomicRetraction) {
+        await this.retractObservationalMemoryForMessages(memoryStore, existingMessages);
       }
       if (this.vector) {
         void this.deleteMessageVectors(messageIds);
