@@ -303,6 +303,10 @@ jobs:
             echo "The trusted base commit does not contain the fork validator." >&2
             exit 1
           fi
+          # Exercise the exact trusted script selected above before it decides
+          # coverage for this PR. The fixture suite is isolated and resets the
+          # validator's per-invocation time budget.
+          /bin/bash "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash" --self-test
           case "$VALIDATION_LANE" in
             pf558-upstream-sync)
               /bin/bash "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash" \

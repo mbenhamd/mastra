@@ -88,10 +88,13 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   nested Memory integration package's broad native suite is deliberately not
   presented as clean-runner evidence because it is outside the frozen root
   workspace and warms FastEmbed during global setup.
-- `.github/workflows/papersflow-fork-pr.yml` always builds and type-checks Core,
+- `.github/workflows/papersflow-fork-pr.yml` first runs the selected trusted
+  validator's complete isolated policy fixture suite, then always builds and
+  type-checks Core,
   runs explicit affected-package checks for Okta Auth, Stagehand, Internal Core, CLI,
-  Codemod, Deployer, MCP, Memory, Server, AI SDK, shared Storage Test Utils,
-  PostgreSQL, Redis, Convex, LibSQL, Google Cloud PubSub, Redis Streams,
+  Codemod, Deployer, MCP, Memory, Server, AI SDK, the exact Client SDK Harness
+  resource pair, shared Storage Test Utils, PostgreSQL, Redis, Convex, LibSQL,
+  Google Cloud PubSub, Redis Streams,
   Inngest, and the MastraCode SDK/TUI, and
   executes each supported changed Vitest file in full. The stateful Core Agent
   signal suite is the sole exception: the validator maps changed lines to named
@@ -103,9 +106,26 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   fail-closed case after its Core prerequisite checks on every run. Duplicate
   or ambiguous leaf names fail closed. Two named PubSub failure-injection fixtures map to their
   owning regression cases; all other changes to shared setup or helpers in that
-  file fail closed because they cannot be covered safely by case selection. Storage Test Utils
-  changes must include a changed Vitest file in that workspace so shared
-  conformance helpers cannot pass without execution. Okta Auth runs its package
+  file fail closed because they cannot be covered safely by case selection. The
+  exact shared Harness conformance and factory sources force the Storage Test
+  Utils in-memory suite only after a TypeScript AST check proves the proposed
+  factory imports `createHarnessTest` and invokes that exact binding as an
+  unconditional statement in `createTestSuite`'s imported `describe` block. A
+  function- and callback-level control-flow check rejects returns or throws
+  that can bypass the registration, generator factories and callbacks that
+  Vitest does not execute are rejected, and the call must receive only the
+  exact `createTestSuite` storage binding without spreads or duplicate
+  overrides. A
+  second AST check runs for source or entrypoint-only changes and proves the
+  in-memory entrypoint imports `createTestSuite` and invokes that exact binding
+  unconditionally at module scope with an imported `MockStore`; the three files
+  are then compiled together with `tsc-files`. Detached definitions, detached
+  entrypoints, shadowed-import lookalikes, comment-only lookalikes, and a forced
+  test beside an unrelated source fail closed even when the PR also changes a
+  green Storage Test Utils suite. Other Storage Test Utils changes must enqueue
+  an actually changed regular-blob Vitest file in that workspace, so dangling
+  test symlinks and shared conformance helpers cannot pass without execution.
+  Okta Auth runs its package
   build and lint; Deployer runs
   explicit Memory, Agent Builder, Server, Hono, and Deployer builds before its
   package typecheck, lint, and changed-test coverage. CLI builds its Deployer
@@ -127,8 +147,11 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   from the PR head. The Server permission check owns the generated RBAC
   interface. Server package manifest changes fail closed before package-owned
   commands run. This allows route and permission PRs to commit canonical output
-  without granting general validation coverage to the Client SDK, CLI, or Core
-  workspaces. MCP runs its package typecheck, build, lint, and changed-test
+  without granting general validation coverage to the Client SDK beyond its
+  exact Harness resource pair, or to the CLI or Core workspaces. Direct Client
+  Harness resource changes run the Client SDK typecheck, build, and lint plus
+  the native Harness resource regression; unknown Client SDK sources and tests
+  remain fail-closed. MCP runs its package typecheck, build, lint, and changed-test
   coverage. Nested
   fixture manifests are not treated as workspace boundaries. The validator discovers
   workspace ownership from the nearest non-fixture `package.json` and
@@ -140,17 +163,29 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   unowned lockfile-only changes still fail closed. Supported package checks use
   path-bound filters that fail when no workspace matches. The exact PF-1880 CommonJS
   fixer and Vitest configuration files receive scripts TypeScript validation
-  plus changed-test execution. Other non-workspace changes must match the
-  explicit CI-rollout or changeset-metadata allowlist and fail closed otherwise.
+  plus changed-test execution. Root `harnessv1/sections/**/*.md` specification
+  changes are the sole non-workspace documentation exception, must be regular
+  blobs at the proposed head, and run through the same changed-file Prettier
+  gate. Symlinks, deletions, other Harness specification inputs, and other
+  non-workspace changes must match the explicit CI-rollout or changeset-metadata
+  allowlist and fail closed otherwise.
 - Docs Playwright changes are covered by the fork-enabled Docs E2E workflow.
-  The deterministic, in-process Core Harness real-agent E2E suite is explicitly
-  allowlisted and runs through Vitest because it uses a mock language model and
-  `InMemoryStore`. The durable-agent background-task E2E suite is likewise
-  allowlisted because it self-provisions its local recorder gateway, uses
-  committed replay fixtures, and uses the deterministic AI SDK mock for its
-  cross-turn case. The exact Server favorites integration suite is also
+  The exact Core Harness permission-gate, plan-task, and real-agent E2E suites
+  are explicitly allowlisted because they use in-process stores and mock
+  language models. The supervisor integration suite has a narrower exception:
+  its imports and existing real-provider subtree must match the trusted base,
+  the OpenAI binding and `process` credential gate cannot be reused elsewhere,
+  and the runner clears any ambient OpenAI key. The tool-approval E2E exception
+  similarly freezes its imports and recorder setup/lifecycle, rejects live,
+  recording, spread, or in-test overrides, and runs with forced replay mode.
+  The durable-agent background-task E2E
+  suite is likewise allowlisted because it self-provisions its local recorder
+  gateway, uses committed replay fixtures, and uses the deterministic AI SDK
+  mock for its cross-turn case. The exact Server favorites integration suite is also
   allowlisted because it exercises route handlers exclusively against
-  `InMemoryStore`. All exact-path exceptions are content-conditioned: edits
+  `InMemoryStore`. Every changed test must remain a regular Git blob, so an
+  exact-path exception cannot be replaced by a symlink to another green suite.
+  All exact-path exceptions are content-conditioned: edits
   that add Playwright, environment credentials, external provider or storage
   packages (including scoped OpenAI SDKs), or direct network/process
   primitives fail closed before the path exception is considered. Newly added
@@ -160,14 +195,20 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   dependency graph, including `.js` specifiers that resolve to TypeScript
   source; helper-only changes re-run the owning exact test. Every changed Server
   test is screened across that incremental runtime surface before generic Vitest
-  execution. Other integration-named Server tests remain fail-closed.
+  execution. The tool-approval E2E suite runs when that exact file changes but
+  is not dependency-triggered while the committed replay baseline on `main`
+  remains stale. Other integration-named Server tests remain fail-closed.
   Other Playwright files, `e2e-tests/**`, nested
   integration-test packages, integration-test filename variants, explicit
   provider E2E files, and PostgreSQL pooler/performance suites fail closed until
   a dedicated fork-safe workflow provides their required setup.
   The PF-2044 ownership map additionally admits only the exact Convex cache,
-  LibSQL thread-state, Google Cloud PubSub group, Redis Streams PubSub, and
-  Inngest regression files needed by the reviewed PF-2026/PF-2007 footprints.
+  LibSQL composite Harness wiring, LibSQL Harness/thread-state, Google Cloud
+  PubSub group, Redis Streams PubSub, and Inngest regression files needed by
+  the reviewed PF-2026/PF-2007/PF-2246 footprints. The Inngest durable-agent
+  resume type contract is admitted as a typecheck-only Vitest file alongside
+  the existing runtime suite. Its JSON report must contain at least one passing
+  type test, so an empty assertion file cannot satisfy the contract.
   A production-only change in those paths forces its paired native test to run;
   an unrecognized source or test fails closed. Convex's admitted tests are
   mocked/in-process, LibSQL uses a local database, and the admitted Inngest
@@ -230,12 +271,26 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   dedicated browser-capable validation lane. Maintainers can exercise the
   workspace classification and command selection locally with
   `.github/scripts/run-papersflow-fork-pr-validation.bash --self-test-stagehand`.
-- Actual `mastracode/**` changes build the GitHub Signals, Stagehand, and
-  Agent Browser test prerequisites, run the native SDK/TUI build, typecheck,
-  and lint commands, and execute the PF-1878 login-dialog, event-dispatch, and
+- Actual `mastracode/**` changes build the complete Code SDK workspace
+  dependency graph, run the native SDK/TUI build, typecheck, and lint commands,
+  and execute the PF-1878 login-dialog, event-dispatch, and
   notification files plus the PF-2026 goal-manager and PF-2007 SDK
-  signals-pubsub regression files in full. A production-only edit forces its
-  matching regular test to run; every
+  signals-pubsub regression files in full. The observation-index migration
+  script and its pure record-authorization input helper are owned by the
+  focused `observation-index-input` regression, so a migration cannot index
+  text without forwarding its authorizing observational-memory record id. A
+  TypeScript AST check additionally proves that every migration
+  `indexObservation` call is direct and receives one guarded, non-escaping
+  helper result in the same execution scope, belongs to the non-generator
+  `indexObservationGroupsFromMessages` function reachable from the script
+  entrypoint, targets that function's `memory` parameter, and is not hidden in
+  a statically false or short-circuited branch. Dormant nested closures,
+  generator call chains, unrelated sinks, mutations, aliases, computed element
+  calls, reflective dispatch through unreviewed `memory` members, optional
+  calls, `.call`/`.bind`, and other indirect method references fail closed.
+  The executable script is also compiled directly when either it or its helper changes because the
+  SDK's normal TypeScript and ESLint configurations exclude `scripts/**`. A
+  production-only edit forces its matching regular test to run; every
   other MastraCode production JS/TS source, unit test, and nested E2E test fails closed until the targeted
   validator owns its workspace build prerequisites and test configuration. The
   canonical MastraCode build and E2E workflow stays available by manual dispatch
@@ -244,9 +299,10 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   baseline errors.
 - The workflow has `contents: read`, does not receive repository secrets, and
   checks out with persisted credentials disabled. Install classification and
-  validation scripts are loaded from the PR's trusted base commit. The first
-  same-repository rollout may bootstrap only the new policy fixtures from its
-  exact CI branch; external PRs may not.
+  validation scripts are loaded from the PR's trusted base commit, then the
+  exact selected validator must pass its full isolated self-test before it can
+  classify the PR. The first same-repository rollout may bootstrap only the new
+  policy fixtures from its exact CI branch; external PRs may not.
 - Redis cache and PostgreSQL are disposable job services matching the
   repository test ports and credentials. Redis Streams on port 6381 and the
   Google Cloud PubSub emulator on port 8085 start only when their owned
@@ -283,8 +339,20 @@ test, reject exact and ordinary Server tests when their changed or newly
 reachable local dependencies gain unsafe runtime requirements, distinguish real
 imports from comments, and keep other integration-named tests fail-closed.
 They also prove production-only forced-test selection, direct test selection,
-native command routing, service-unavailable failure, and rejection of unknown
-sources inside a newly admitted PF-2044 workspace. They also accept the atomic
+native command routing, service-unavailable failure, the exact Client Harness,
+LibSQL composite, Inngest type-contract, MastraCode observation-index, and
+regular-blob Harness specification routes (including symlink rejection), exact
+deterministic Core integration/E2E paths,
+shared Harness conformance ownership and direct typechecking, rejection of
+observation-index helper bypass, shadowing, mutation, nested closure, or
+indirect, computed, or reflective invocation, statically unreachable or
+short-circuited indexing, detached, shadowed, async, outer-guarded,
+callback-guarded, generator-backed, reassigned, or storage-overridden factory
+registration, entrypoint-only detachment, dangling test symlinks, exact Core
+exception symlinks, frozen supervisor provider gating, strict tool-approval
+replay routing and recorder-override rejection, and forced-test substitution for an authored
+Storage Test Utils regression. An aggregate PF-2246 fixture proves those routes compose
+without a later fail-closed gate masking incomplete coverage. They also accept the atomic
 PF-2042 Inngest test/Compose/adapter-launcher trio, reject each unpaired member,
 reject a valid-but-misaligned port topology, reject the Inngest manifest and
 unknown live tests, and propagate Compose validation failure before executing
