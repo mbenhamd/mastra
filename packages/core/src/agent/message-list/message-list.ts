@@ -1394,7 +1394,81 @@ export class MessageList {
     return true;
   }
 
-  public markResponseMessageBoundary(messageId?: string): boolean {
+  /**
+   * A feedback note a loop injects so the model sees an instruction on its next
+   * turn (supervisor `onIterationComplete` feedback, network completion
+   * feedback). It is flagged `suppressFeedback` precisely because it must stay
+   * out of anything shown to the caller.
+   */
+  private static isSuppressedFeedbackMessage(message: MastraDBMessage): boolean {
+    return (
+      (message.content?.metadata?.completionResult as { suppressFeedback?: boolean } | undefined)?.suppressFeedback ===
+      true
+    );
+  }
+
+  /** Set by `markResponseMessageBoundary(id, { turnContinues: true })`. */
+  private static turnContinuesAfter(message: MastraDBMessage | undefined): boolean {
+    return (
+      (message?.content?.metadata?.mastra as { turnContinues?: boolean } | undefined)?.turnContinues === true &&
+      message?.role === 'assistant'
+    );
+  }
+
+  /**
+   * Text of the final assistant turn, as the caller should see it.
+   *
+   * One assistant turn is not always one response message. A forced
+   * continuation — an `onIterationComplete` hook returning `continue: true`
+   * after the model already stopped — seals the open response message and
+   * resumes the SAME turn into a fresh one, so reading only the last response
+   * message drops the first half of the reply (issue #14134). Messages sealed
+   * with `turnContinues` are therefore joined onto the one that follows them.
+   *
+   * Everything outside that turn stays out: an earlier goal or network
+   * iteration, narration emitted before a tool call (a `tool` message ends the
+   * turn), and the framework's own feedback notes, which are instructions
+   * written for the model rather than part of the answer.
+   */
+  public getFinalAssistantTurnText(): string {
+    const dbMessages = this.response.db().filter(message => !MessageList.isSuppressedFeedbackMessage(message));
+
+    // How many response messages the final turn spans.
+    let turnMessageCount = dbMessages.length > 0 ? 1 : 0;
+    while (
+      turnMessageCount < dbMessages.length &&
+      MessageList.turnContinuesAfter(dbMessages[dbMessages.length - 1 - turnMessageCount])
+    ) {
+      turnMessageCount++;
+    }
+
+    // Each of those contributes exactly one trailing assistant message to the
+    // AI v4 core projection, which is where a tool call splits narration off
+    // from the answer that follows it.
+    const coreMessages = aiV4UIMessagesToAIV4CoreMessages(
+      this.toAIV4UIMessages(dbMessages, { transformToolPayloads: false }),
+    );
+    let trailingAssistantCount = 0;
+    while (
+      trailingAssistantCount < coreMessages.length &&
+      coreMessages[coreMessages.length - 1 - trailingAssistantCount]?.role === 'assistant'
+    ) {
+      trailingAssistantCount++;
+    }
+
+    return coreMessages
+      .slice(coreMessages.length - Math.min(turnMessageCount, trailingAssistantCount))
+      .map(message => coreContentToString(message.content))
+      .join('');
+  }
+
+  /**
+   * @param options.turnContinues - The sealed message is only half of one
+   * caller-visible assistant turn: the same turn resumes into the next response
+   * message with no user input in between. Leave it unset when a signal or a
+   * new iteration separates the two, which is the usual case.
+   */
+  public markResponseMessageBoundary(messageId?: string, options?: { turnContinues?: boolean }): boolean {
     const message = messageId
       ? this.messages.find(message => message.id === messageId)
       : [...this.messages].reverse().find(message => message.role === 'assistant');
@@ -1408,6 +1482,7 @@ export class MessageList {
       mastra: {
         ...((message.content.metadata?.mastra as Record<string, unknown> | undefined) ?? {}),
         responseBoundary: true,
+        ...(options?.turnContinues ? { turnContinues: true } : {}),
       },
     };
 

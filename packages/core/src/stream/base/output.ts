@@ -1,10 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { ReadableStream, TransformStream } from 'node:stream/web';
-import {
-  coreContentToString,
-  createTerminalToolResultPartId,
-  materializeTerminalToolResult,
-} from '../../agent/message-list';
+import { createTerminalToolResultPartId, materializeTerminalToolResult } from '../../agent/message-list';
 import type { MessageList, MastraDBMessage } from '../../agent/message-list';
 import { TripWire } from '../../agent/trip-wire';
 import { MastraBase } from '../../base';
@@ -1157,10 +1153,10 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                     outputResult,
                   );
 
-                  // Get text from the latest response message (the last assistant message)
-                  const responseMessages = self.messageList.get.response.aiV4.core();
-                  const lastResponseMessage = responseMessages[responseMessages.length - 1];
-                  const outputText = lastResponseMessage ? coreContentToString(lastResponseMessage.content) : '';
+                  // Get text from the final assistant turn. That turn can span more
+                  // than one response message when the loop forced a continuation,
+                  // so this is not simply the last response message (issue #14134).
+                  const outputText = self.messageList.getFinalAssistantTurnText();
 
                   // Only update the last step's text if output processors actually modified it
                   // This preserves text from retry scenarios where step.text is already correct

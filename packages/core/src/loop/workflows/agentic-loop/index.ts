@@ -295,8 +295,13 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
                     'response',
                   );
                 }
+                // `turnContinues`: unlike the signal path above, nothing from the
+                // user separates the sealed message from the one the resumed call
+                // writes into. Both halves are the same caller-visible answer, so
+                // the run's final text must be read across the pair.
                 messageList.markResponseMessageBoundary(
                   typedInputData.stepResult?.messageId ?? typedInputData.messageId,
+                  { turnContinues: true },
                 );
                 const forcedContinuationMessageId = rest.rotateResponseMessageId();
                 typedInputData.messageId = forcedContinuationMessageId;
