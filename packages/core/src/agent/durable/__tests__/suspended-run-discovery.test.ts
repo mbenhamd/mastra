@@ -35,7 +35,11 @@ afterEach(async () => {
   await Promise.all(openPubsubs.splice(0).map(pubsub => pubsub.close()));
 });
 
-function toolCallModel(toolCallId = 'durable-call-1') {
+// `toolInput` must satisfy the tool's declared inputSchema: an approval-gated
+// tool with schema-invalid args is returned to the model for repair instead of
+// suspending for a human. Tests that widen `protectedTool`'s schema via
+// `toolOptions.inputSchema` must widen this input to match.
+function toolCallModel(toolCallId = 'durable-call-1', toolInput: Record<string, unknown> = { value: 'persisted' }) {
   return new MockLanguageModelV2({
     doStream: async () => ({
       rawCall: { rawPrompt: null, rawSettings: {} },
@@ -48,7 +52,7 @@ function toolCallModel(toolCallId = 'durable-call-1') {
           toolCallType: 'function',
           toolCallId,
           toolName: 'protectedTool',
-          input: JSON.stringify({ value: 'persisted' }),
+          input: JSON.stringify(toolInput),
           providerExecuted: false,
         },
         {
@@ -1975,7 +1979,7 @@ describe('DurableAgent suspended-run discovery', () => {
     const execute = vi.fn(async () => ({ ok: true }));
     const initial = createSetup({
       storage,
-      model: toolCallModel('canonical-schema-call'),
+      model: toolCallModel('canonical-schema-call', { value: 'persisted', count: 1 }),
       execute,
       toolOptions: {
         inputSchema: z.object({ value: z.string(), count: z.number() }),
