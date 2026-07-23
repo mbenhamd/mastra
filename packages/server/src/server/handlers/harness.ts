@@ -2738,6 +2738,12 @@ export const GET_HARNESS_PERMISSIONS_ROUTE = createRoute({
       if (!stored || stored.resourceId !== resourceId) {
         throwSessionNotFound(pathSessionId);
       }
+      // §5.3: direct-ID resolution reopens a Closed record, taking the lease and
+      // kicking queue recovery. This read must never resurrect a session, so the
+      // lifecycle is settled from the stored record first — as the events route
+      // does — and only a live session is resolved for its effective rules.
+      if (stored.closedAt !== undefined) throwSessionClosed(pathSessionId);
+      if (stored.closingAt !== undefined) throwSessionClosingFromRecord(stored);
       const session = await harness.session({ sessionId: pathSessionId, resourceId });
       return permissionsSnapshot(session);
     } catch (error) {

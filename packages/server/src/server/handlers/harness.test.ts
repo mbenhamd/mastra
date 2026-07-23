@@ -2650,6 +2650,49 @@ describe('Harness server routes', () => {
     expect((result as { rules: unknown }).rules).not.toBe(rules);
   });
 
+  it('does not reopen a closed session to read permissions', async () => {
+    const closed = makeRecord({ closedAt: 250 });
+    const session = {
+      permissions: {
+        getGrants: vi.fn(() => ({ categories: ['read'], tools: ['shell'] })),
+        getRules: vi.fn(() => ({ categories: {}, tools: {} })),
+      },
+    };
+    const harness = {
+      loadSession: vi.fn(async () => closed),
+      session: vi.fn(async () => session),
+    };
+    const mastra = { getHarness: vi.fn(() => harness) };
+
+    const body = await expectHarnessHttpError(
+      GET_HARNESS_PERMISSIONS_ROUTE.handler(makeParams({ mastra, name: 'code', sessionId: 'session-1' })),
+      404,
+      'harness.session_closed',
+    );
+
+    expect(body).toMatchObject({ details: { sessionId: 'session-1' } });
+    expect(harness.loadSession).toHaveBeenCalledWith({ sessionId: 'session-1', includeClosed: true });
+    expect(harness.session).not.toHaveBeenCalled();
+  });
+
+  it('does not resolve a closing session to read permissions', async () => {
+    const closing = makeRecord({ closingAt: 250, closeDeadlineAt: 300 });
+    const harness = {
+      loadSession: vi.fn(async () => closing),
+      session: vi.fn(),
+    };
+    const mastra = { getHarness: vi.fn(() => harness) };
+
+    const body = await expectHarnessHttpError(
+      GET_HARNESS_PERMISSIONS_ROUTE.handler(makeParams({ mastra, name: 'code', sessionId: 'session-1' })),
+      409,
+      'harness.session_closing',
+    );
+
+    expect(body).toMatchObject({ details: { sessionId: 'session-1', closingAt: 250, closeDeadlineAt: 300 } });
+    expect(harness.session).not.toHaveBeenCalled();
+  });
+
   it('does not disclose a foreign session permission snapshot', async () => {
     const harness = {
       loadSession: vi.fn(async () => makeRecord({ resourceId: 'resource-other' })),
