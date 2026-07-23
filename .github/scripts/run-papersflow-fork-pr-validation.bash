@@ -4189,6 +4189,96 @@ NODE
     printf '%s\n' \
       "import { buildObservationIndexInput } from '../src/utils/observation-index-input';" \
       'declare const memory: { indexObservation(input: unknown): Promise<void> };' \
+      'export async function indexObservationGroupsFromMessages(' \
+      '  memory: { indexObservation(input: unknown): Promise<void> },' \
+      '  candidate: unknown,' \
+      ') {' \
+      "  switch ('skip' as string) {" \
+      "    case 'run': {" \
+      '      const input = buildObservationIndexInput(candidate);' \
+      '      if (!input) return;' \
+      '      await memory.indexObservation(input);' \
+      '      break;' \
+      '    }' \
+      '  }' \
+      '}' \
+      'void indexObservationGroupsFromMessages(memory, {});' \
+      > mastracode/sdk/scripts/index-messages.ts
+    git add .
+    git commit -q -m 'hide observation indexing in an unmatched switch case'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/mastracode-observation-index-switch-case-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Unmatched switch-case observation-index branch unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'must pass buildObservationIndexInput output to every indexObservation call' "$output"
+  assert_contains 'mastracode/sdk/scripts/index-messages.ts' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Unmatched switch-case observation-index branch executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "import { buildObservationIndexInput } from '../src/utils/observation-index-input';" \
+      'declare const memory: { indexObservation(input: unknown): Promise<void> };' \
+      'export async function indexObservationGroupsFromMessages(' \
+      '  memory: { indexObservation(input: unknown): Promise<void> },' \
+      '  candidate: unknown,' \
+      ') {' \
+      "  switch ('run' as string) {" \
+      "    case 'run':" \
+      '      break;' \
+      '    default: {' \
+      '      const input = buildObservationIndexInput(candidate);' \
+      '      if (!input) return;' \
+      '      await memory.indexObservation(input);' \
+      '      break;' \
+      '    }' \
+      '  }' \
+      '}' \
+      'void indexObservationGroupsFromMessages(memory, {});' \
+      > mastracode/sdk/scripts/index-messages.ts
+    git add .
+    git commit -q -m 'hide observation indexing in a shadowed switch default'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/mastracode-observation-index-switch-default-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Shadowed switch-default observation-index branch unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'must pass buildObservationIndexInput output to every indexObservation call' "$output"
+  assert_contains 'mastracode/sdk/scripts/index-messages.ts' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Shadowed switch-default observation-index branch executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "import { buildObservationIndexInput } from '../src/utils/observation-index-input';" \
+      'declare const memory: { indexObservation(input: unknown): Promise<void> };' \
       'export async function indexMessages(candidate: unknown) {' \
       '  const input = buildObservationIndexInput(candidate);' \
       '  if (!input) return;' \
@@ -4676,6 +4766,35 @@ NODE
   head_sha="$(
     cd "$fixture_repo"
     git reset -q --hard "$base_sha"
+    rm packages/core/src/harness/v1/session.permission-gate.e2e.test.ts
+    ln -s missing-target.ts \
+      packages/core/src/harness/v1/session.permission-gate.e2e.test.ts
+    git add .
+    git commit -q -m 'replace exact Core exception with a dangling symlink'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/core-exact-test-dangling-symlink-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Dangling exact Core exception unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'packages/core/src/harness/v1/session.permission-gate.e2e.test.ts' "$output"
+  assert_contains 'Failing closed instead of reporting incomplete validation as successful.' "$output"
+  if grep -Fq -- 'exec vitest run' "$command_log"; then
+    echo 'Dangling exact Core exception executed a test suite.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
     printf '%s\n' 'export const harnessConformance = "detached-head";' \
       > stores/_test-utils/src/domains/harness/index.ts
     printf '%s\n' \
@@ -4784,6 +4903,43 @@ NODE
   assert_contains 'stores/_test-utils/src/index.test.ts' "$output"
   if [[ -s "$command_log" ]]; then
     echo 'Mocked shared Harness entrypoint executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'export const harnessConformance = "mocked-store-head";' \
+      > stores/_test-utils/src/domains/harness/index.ts
+    printf '%s\n' \
+      "import { MockStore } from '@mastra/core/storage';" \
+      "import { vi } from 'vitest';" \
+      "import { createTestSuite } from './factory';" \
+      "vi.mock('@mastra/core/storage', () => ({ MockStore: class {} }));" \
+      'createTestSuite(new MockStore());' \
+      > stores/_test-utils/src/index.test.ts
+    git add .
+    git commit -q -m 'mock the in-memory store behind the shared Harness entrypoint'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/storage-harness-mocked-store-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Mocked in-memory store unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains \
+    'must import createTestSuite and invoke it unconditionally at module scope with a new MockStore' \
+    "$output"
+  assert_contains 'stores/_test-utils/src/index.test.ts' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Mocked in-memory store executed package commands.' >&2
     cat "$command_log" >&2
     exit 1
   fi
@@ -5194,7 +5350,8 @@ NODE
     cat "$output" >&2
     exit 1
   fi
-  assert_contains 'Storage test utility changes must include a changed Vitest file' "$output"
+  assert_contains 'stores/_test-utils/src/authored.test.ts' "$output"
+  assert_contains 'Failing closed instead of reporting incomplete validation as successful.' "$output"
   if grep -Fq -- '--dir stores/_test-utils exec vitest run' "$command_log"; then
     echo 'Dangling Storage Test Utils test symlink executed the shared suite.' >&2
     cat "$command_log" >&2
@@ -6945,6 +7102,10 @@ function hasBinding(node, binding) {
 const suiteBinding = importedBinding('./factory', 'createTestSuite');
 const mockStoreBinding = importedBinding('@mastra/core/storage', 'MockStore');
 const factoryModuleMocked = mocksModule('./factory');
+// Import bindings resolve to the same symbol whether or not the module is
+// replaced at run time, so a mocked storage module would run the shared suite
+// against a hand-written fake instead of the reviewed in-memory store.
+const mockStoreModuleMocked = mocksModule('@mastra/core/storage');
 const registered = source.statements.some(statement => {
   if (
     !ts.isExpressionStatement(statement) ||
@@ -6961,9 +7122,15 @@ const registered = source.statements.some(statement => {
   );
 });
 
-if (!suiteBinding || !mockStoreBinding || factoryModuleMocked || !registered) {
+if (
+  !suiteBinding ||
+  !mockStoreBinding ||
+  factoryModuleMocked ||
+  mockStoreModuleMocked ||
+  !registered
+) {
   console.error(
-    `${testPath} must import createTestSuite and invoke it unconditionally at module scope with a new MockStore without mocking the module.`,
+    `${testPath} must import createTestSuite and invoke it unconditionally at module scope with a new MockStore without mocking either module.`,
   );
   process.exit(1);
 }
@@ -7288,6 +7455,12 @@ function isStaticallyUnreachable(node, boundary) {
     }
 
     if (parent === boundary) break;
+
+    // Switch dispatch is not modeled. A constant discriminant leaves a clause
+    // body dead while every other authorization check still passes, and a
+    // default clause is skipped whenever an earlier case matches, so every
+    // clause body fails closed.
+    if (ts.isCaseClause(parent) || ts.isDefaultClause(parent)) return true;
 
     if (ts.isBinaryExpression(parent) && child === parent.right) {
       const leftValue = staticBoolean(parent.left);
@@ -7642,7 +7815,9 @@ if (
   invalidMemoryReferences > 0
 ) {
   console.error(
-    `${scriptPath} must pass buildObservationIndexInput output to every indexObservation call.`,
+    `${scriptPath} must pass buildObservationIndexInput output to every indexObservation call. ` +
+      `Switch dispatch is not modeled, so a case or default clause body counts as statically ` +
+      `unreachable; move the call out of the switch.`,
   );
   process.exit(1);
 }
@@ -9594,12 +9769,16 @@ test_runtime_surface_has_unsupported_runtime() {
   return 1
 }
 
+# Collection is by path alone, because -f follows symlinks: a changed suite
+# replaced by a dangling symlink would drop out of validation entirely instead
+# of failing closed. git_regular_file_at_head below is the mode-aware existence
+# check, and deleted suites already failed closed through "$deleted_tests".
 mapfile -t detected_tests < <(
   while IFS= read -r file; do
     if [[ "$file" == browser/stagehand/src/__tests__/profile-lifecycle.test.ts ]] ||
-      { [[ -f "$file" ]] && grep -Eq \
+      grep -Eq \
         '\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs|mts|cts)$|\.test-d\.ts$' \
-        <<< "$file"; }; then
+        <<< "$file"; then
       printf '%s\n' "$file"
     fi
   done < "$changed_files"
@@ -9616,7 +9795,7 @@ for explicit_test in \
   packages/core/src/harness/v1/session.plan-task.e2e.test.ts \
   packages/core/src/harness/v1/session.real-agent.e2e.test.ts \
   packages/server/src/server/handlers/favorites.integration.test.ts; do
-  [[ -f "$explicit_test" ]] || continue
+  git_regular_file_at_head "$explicit_test" || continue
   if surface="$(list_test_runtime_surface "$explicit_test")"; then
     while IFS= read -r source_file; do
       if grep -Fxq "$source_file" "$changed_files"; then
