@@ -120,8 +120,13 @@ function createMockActorModel(responseText: string) {
 /**
  * Observer model that throws a `terminated`-style undici error a configurable
  * number of times before succeeding. Observer/Reflector calls disable the AI
- * SDK retry layer, so the observed call count is also the total provider
- * attempt count for the logical OM operation.
+ * SDK retry layer, so every counted call is exactly one provider attempt.
+ *
+ * `__observerCallCount` is turn-wide: it spans every observation pass the turn
+ * makes, which is more than one in synchronous mode. Assert a per-operation
+ * retry budget with `__firstSuccessCall` instead — it pins the attempt on which
+ * the first (failing) operation stopped retrying, independent of how many
+ * observation passes the turn goes on to run.
  *
  * With `failureMode: 'stream-error'` the model instead emits an
  * OpenRouter-style mid-stream error part ({ code: 502, message, metadata })
@@ -136,6 +141,11 @@ function createFlakyObserverModel(
 ) {
   let callCount = 0;
   let observerCallCount = 0;
+  let firstSuccessCall = 0;
+
+  function markSuccess() {
+    if (firstSuccessCall === 0) firstSuccessCall = callCount;
+  }
 
   function buildSuccessGenerate() {
     return {
@@ -155,8 +165,14 @@ function createFlakyObserverModel(
     supportsImageUrls: false,
     supportedUrls: {},
 
+    /** Turn-wide count of provider attempts across every observation pass. */
     get __observerCallCount() {
       return observerCallCount;
+    },
+
+    /** 1-based index of the first call that did not fail (0 if none ever did). */
+    get __firstSuccessCall() {
+      return firstSuccessCall;
     },
 
     async doGenerate() {
@@ -170,6 +186,7 @@ function createFlakyObserverModel(
         }
         throw new TypeError('terminated');
       }
+      markSuccess();
       return buildSuccessGenerate();
     },
 
@@ -210,6 +227,7 @@ function createFlakyObserverModel(
         throw new TypeError('terminated');
       }
 
+      markSuccess();
       const parts: StreamPart[] = [
         { type: 'stream-start', warnings: [] },
         { type: 'response-metadata', id: 'obs-1', modelId: 'mock-flaky-observer-model', timestamp: new Date() },
@@ -393,7 +411,25 @@ describe('OM transient-error retry', { timeout: 30_000 }, () => {
     // The actor turn completed normally despite mid-stream provider errors.
     expect(result.tripwire).toBeFalsy();
     expect(result.text).toBe(longResponseText);
-    expect(observerModel.__observerCallCount).toBe(RETRY_CONFIG.maxRetries + 1);
+
+    // Because the observation survives, this turn runs two logical observation
+    // passes, and `__observerCallCount` is turn-wide — it sums both. Spell the
+    // passes out rather than hard-coding the total, so that a change in either
+    // the retry budget or the number of passes names itself in the failure.
+    //   1. the step-boundary threshold observation, which burns its full budget
+    //      (2 transient failures, then success on its last permitted attempt);
+    //   2. the end-of-turn observation from ObservationTurn.end(), which
+    //      synchronous mode runs so single-step chat surfaces still observe.
+    // The second pass succeeds first try: the model is only flaky for its first
+    // `failuresBeforeSuccess` calls, which pass 1 has already consumed.
+    const stepObservationAttempts = RETRY_CONFIG.maxRetries + 1;
+    const endOfTurnObservationAttempts = 1;
+    expect(observerModel.__observerCallCount).toBe(stepObservationAttempts + endOfTurnObservationAttempts);
+
+    // The retry budget is per-operation, not turn-wide. Pinning the attempt the
+    // first operation succeeded on keeps the bound asserted here even if the
+    // number of observation passes in a turn changes again.
+    expect(observerModel.__firstSuccessCall).toBe(stepObservationAttempts);
   });
 
   it('gives the reflector one bounded retry owner and disables model-layer retries', async () => {
