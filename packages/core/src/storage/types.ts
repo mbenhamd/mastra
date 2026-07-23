@@ -1991,6 +1991,38 @@ export interface CreateReflectionGenerationInput {
 }
 
 /**
+ * Identifies the exact Observational Memory generation that authorizes a
+ * derived-state write. Storage adapters use this as a compare-and-set fence so
+ * a cleared or superseded generation cannot repopulate working memory or
+ * thread metadata after an edit/delete retraction.
+ */
+export interface ObservationalMemoryWriteGuard {
+  recordId: string;
+  threadId: string | null;
+  resourceId: string;
+}
+
+export interface RetractObservationalMemoryInput {
+  resourceId: string;
+  threadId: string;
+}
+
+export interface RetractObservationalMemoryResult {
+  clearedScopes: Array<'resource' | 'thread'>;
+  clearedResourceWorkingMemory: boolean;
+  clearedThreadMetadata: boolean;
+}
+
+/**
+ * Reports retraction work committed by an authoritative storage mutation.
+ * @internal Used to clean external observation vectors only after commit.
+ */
+export interface ObservationalMemoryRetractionReceipt {
+  input: RetractObservationalMemoryInput;
+  result: RetractObservationalMemoryResult;
+}
+
+/**
  * Input for updating the config of an existing observational memory record.
  * The provided config is deep-merged into the record's existing config.
  */

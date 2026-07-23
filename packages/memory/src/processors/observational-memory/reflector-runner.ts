@@ -6,7 +6,7 @@ import type { MastraMemory } from '@mastra/core/memory';
 import type { ObservabilityContext } from '@mastra/core/observability';
 import type { ProcessorContext, ProcessorStreamWriter } from '@mastra/core/processors';
 import type { RequestContext } from '@mastra/core/request-context';
-import type { MemoryStorage, ObservationalMemoryRecord } from '@mastra/core/storage';
+import type { MemoryStorage, ObservationalMemoryRecord, ObservationalMemoryWriteGuard } from '@mastra/core/storage';
 import type { ProviderMetadata } from '@mastra/core/stream';
 
 import type { Memory } from '../..';
@@ -46,6 +46,7 @@ import {
 } from './reflector-agent';
 import type { CompressionLevel } from './reflector-agent';
 import { withRetry } from './retry';
+import { updateThreadFromObservationalMemory } from './storage-compat';
 import { createTemporaryOmMemoryContext } from './temporary-memory';
 import { getMaxThreshold } from './thresholds';
 import type { TokenCounter } from './token-counter';
@@ -79,6 +80,7 @@ async function persistThreadExtractedValues(
   extractors: readonly Extractor<any>[],
   threadId: string | undefined,
   values: Record<string, unknown> | undefined,
+  guard: ObservationalMemoryWriteGuard,
 ): Promise<void> {
   if (!threadId || !values) {
     return;
@@ -97,10 +99,11 @@ async function persistThreadExtractedValues(
     threadTitle: metadataUpdate.threadTitle ?? previousOmMetadata?.threadTitle,
     extracted: { ...(previousOmMetadata?.extracted ?? {}), ...(metadataUpdate.extracted ?? {}) },
   });
-  await storage.updateThread({
+  await updateThreadFromObservationalMemory(storage, {
     id: threadId,
     title: thread.title ?? '',
     metadata: newMetadata,
+    guard,
   });
 }
 
@@ -322,6 +325,11 @@ export class ReflectorRunner {
     model?: ConcreteReflectionModel,
     mainAgent?: ProcessorContext['agent'],
     sendSignal?: ProcessorContext['sendSignal'],
+    observationalMemoryContext?: {
+      recordId: string;
+      threadId: string;
+      resourceId?: string;
+    },
   ): Promise<{
     observations: string;
     suggestedContinuation?: string;
@@ -341,8 +349,8 @@ export class ReflectorRunner {
         : this.reflectionConfig.extractors) ?? [],
       {
         source: 'reflector',
-        threadId: streamContext?.threadId,
-        resourceId: streamContext?.resourceId,
+        threadId: streamContext?.threadId ?? observationalMemoryContext?.threadId,
+        resourceId: streamContext?.resourceId ?? observationalMemoryContext?.resourceId,
         mainAgent,
         memory: this.memory,
         requestContext,
@@ -551,8 +559,9 @@ export class ReflectorRunner {
       values: parsedExtractedValues,
       failures: parsedExtractionFailures,
       previousValues: priorExtractedValues,
-      threadId: streamContext?.threadId ?? 'unknown',
-      resourceId: streamContext?.resourceId,
+      threadId: streamContext?.threadId ?? observationalMemoryContext?.threadId ?? 'unknown',
+      resourceId: streamContext?.resourceId ?? observationalMemoryContext?.resourceId,
+      observationalMemoryRecordId: streamContext?.recordId ?? observationalMemoryContext?.recordId,
       mainAgent,
       memory: this.memory,
       sendSignal,
@@ -579,6 +588,7 @@ export class ReflectorRunner {
     record: ObservationalMemoryRecord,
     observationTokens: number,
     lockKey: string,
+    threadId: string,
     writer?: ProcessorStreamWriter,
     requestContext?: RequestContext,
     observabilityContext?: ObservabilityContext,
@@ -604,6 +614,7 @@ export class ReflectorRunner {
     const asyncOp = this.doAsyncBufferedReflection(
       record,
       bufferKey,
+      threadId,
       writer,
       requestContext,
       observabilityContext,
@@ -659,6 +670,7 @@ export class ReflectorRunner {
   private async doAsyncBufferedReflection(
     record: ObservationalMemoryRecord,
     _bufferKey: string,
+    threadId: string,
     writer?: ProcessorStreamWriter,
     requestContext?: RequestContext,
     observabilityContext?: ObservabilityContext,
@@ -710,17 +722,13 @@ export class ReflectorRunner {
         operationType: 'reflection',
         tokensToBuffer: sliceTokenEstimate,
         recordId: record.id,
-        threadId: record.threadId ?? '',
-        threadIds: record.threadId ? [record.threadId] : [],
+        threadId,
+        threadIds: [threadId],
         config: this.getObservationMarkerConfig(currentRecord),
       });
       // Stream OM lifecycle markers as transient so the OutputWriter does not persist standalone data-only messages; OM persists the durable marker explicitly.
       void writer.custom({ ...startMarker, transient: true }).catch(() => {});
-      await this.persistMarkerToStorage(
-        startMarker,
-        currentRecord.threadId ?? '',
-        currentRecord.resourceId ?? undefined,
-      );
+      await this.persistMarkerToStorage(startMarker, threadId, currentRecord.resourceId ?? undefined);
     }
 
     const compressionStartLevel = await this.getCompressionStartLevel(requestContext);
@@ -738,6 +746,11 @@ export class ReflectorRunner {
       undefined,
       mainAgent,
       sendSignal,
+      {
+        recordId: currentRecord.id,
+        threadId,
+        resourceId: currentRecord.resourceId ?? undefined,
+      },
     );
 
     await persistThreadExtractedValues(
@@ -745,6 +758,11 @@ export class ReflectorRunner {
       this.reflectionConfig.extractors,
       currentRecord.threadId ?? undefined,
       reflectResult.extractedValues,
+      {
+        recordId: currentRecord.id,
+        threadId: currentRecord.threadId,
+        resourceId: currentRecord.resourceId,
+      },
     );
 
     const reflectionTokenCount = this.tokenCounter.countObservations(reflectResult.observations);
@@ -995,6 +1013,7 @@ export class ReflectorRunner {
       this.reflectionConfig.extractors,
       requestedThreadId ?? record.threadId,
     );
+    const reflectionThreadId = requestedThreadId ?? record.threadId ?? record.resourceId;
 
     // ════════════════════════════════════════════════════════════════════════
     // ASYNC BUFFERING: Trigger background reflection at bufferActivation ratio
@@ -1019,6 +1038,7 @@ export class ReflectorRunner {
           record,
           observationTokens,
           lockKey,
+          reflectionThreadId,
           writer,
           requestContext,
           observabilityContext,
@@ -1116,6 +1136,7 @@ export class ReflectorRunner {
           record,
           observationTokens,
           lockKey,
+          reflectionThreadId,
           writer,
           requestContext,
           observabilityContext,
@@ -1137,7 +1158,7 @@ export class ReflectorRunner {
 
     const cycleId = crypto.randomUUID();
     const startedAt = new Date().toISOString();
-    const threadId = requestedThreadId ?? 'unknown';
+    const threadId = reflectionThreadId;
 
     if (writer) {
       const startMarker = createObservationStartMarker({
@@ -1193,6 +1214,11 @@ export class ReflectorRunner {
         undefined,
         mainAgent,
         sendSignal,
+        {
+          recordId: record.id,
+          threadId,
+          resourceId: record.resourceId ?? undefined,
+        },
       );
       reflectionUsage = reflectResult.usage;
       reflectionProviderMetadata = reflectResult.providerMetadata;
@@ -1201,6 +1227,11 @@ export class ReflectorRunner {
         this.reflectionConfig.extractors,
         record.threadId ?? undefined,
         reflectResult.extractedValues,
+        {
+          recordId: record.id,
+          threadId: record.threadId,
+          resourceId: record.resourceId,
+        },
       );
       const reflectionTokenCount = this.tokenCounter.countObservations(reflectResult.observations);
 

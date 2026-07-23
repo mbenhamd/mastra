@@ -1,6 +1,31 @@
 import { describe, it, expect } from 'vitest';
 import { z } from 'zod';
-import { deepMergeWorkingMemory, updateWorkingMemoryTool } from './working-memory';
+import {
+  decodeWorkingMemoryPromptEntities,
+  decodeWorkingMemoryPromptValue,
+  deepMergeWorkingMemory,
+  updateWorkingMemoryTool,
+} from './working-memory';
+
+describe('working-memory prompt entity decoding', () => {
+  it('decodes exactly one prompt-escape layer', () => {
+    expect(decodeWorkingMemoryPromptEntities('2 &lt; 3 &amp; 5 &gt; 4; literal &amp;amp;lt;')).toBe(
+      '2 < 3 & 5 > 4; literal &amp;lt;',
+    );
+  });
+
+  it('decodes nested schema values without changing keys or non-string values', () => {
+    expect(
+      decodeWorkingMemoryPromptValue({
+        note: 'A &amp; B',
+        nested: ['x &lt; y', { literal: '&amp;gt;', count: 2 }],
+      }),
+    ).toEqual({
+      note: 'A & B',
+      nested: ['x < y', { literal: '&gt;', count: 2 }],
+    });
+  });
+});
 
 describe('deepMergeWorkingMemory', () => {
   describe('null/undefined/empty update handling', () => {

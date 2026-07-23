@@ -761,6 +761,10 @@ https://mastra.ai/en/docs/memory/overview`,
             storage: memoryStore,
             template,
             scope: typeof effectiveConfig.workingMemory === 'object' ? effectiveConfig.workingMemory.scope : undefined,
+            maxDataBytes:
+              typeof effectiveConfig.workingMemory === 'object'
+                ? effectiveConfig.workingMemory.maxDataBytes
+                : undefined,
             useVNext:
               typeof effectiveConfig.workingMemory === 'object' &&
               'version' in effectiveConfig.workingMemory &&

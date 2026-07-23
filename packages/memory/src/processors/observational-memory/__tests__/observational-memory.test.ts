@@ -159,6 +159,55 @@ function createInMemoryStorage(): InMemoryMemory {
   return new InMemoryMemory({ db });
 }
 
+describe('manual reflection generation fencing', () => {
+  it('forwards the current generation to reflector extractor hooks', async () => {
+    const storage = createInMemoryStorage();
+    const threadId = 'manual-reflection-thread';
+    const resourceId = 'manual-reflection-resource';
+    await storage.saveThread({
+      thread: {
+        id: threadId,
+        resourceId,
+        title: 'Manual reflection',
+        metadata: {},
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+    });
+    const record = await storage.initializeObservationalMemory({
+      threadId,
+      resourceId,
+      scope: 'thread',
+      config: {},
+    });
+    await storage.updateActiveObservations({
+      id: record.id,
+      observations: '- Retained observation',
+      tokenCount: 5,
+      lastObservedAt: new Date(),
+    });
+    const om = new ObservationalMemory({
+      storage,
+      scope: 'thread',
+      model: 'mock/model',
+      observation: { messageTokens: 1000, bufferTokens: false },
+      reflection: { observationTokens: 1000 },
+    });
+    const reflectorCall = vi.spyOn((om as any).reflector, 'call').mockResolvedValue({
+      observations: '- Reflected observation',
+      usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+    });
+
+    await om.reflect(threadId, resourceId);
+
+    expect(reflectorCall.mock.calls[0]?.[13]).toEqual({
+      recordId: record.id,
+      threadId,
+      resourceId,
+    });
+  });
+});
+
 describe('ObservationalMemoryProcessor read-only mode', () => {
   it('loads stored context without starting observation side effects', async () => {
     const { MessageList } = await import('@mastra/core/agent');
@@ -17052,55 +17101,52 @@ describe('Message ordering regressions', () => {
     };
   }
 
-  // ─── Test 1: observation should not produce side effects during processOutputResult ───
+  // ─── Test 1: synchronous observation runs after the completed response is persisted ───
 
-  it('1 — observation should not produce side effects during processOutputResult', async () => {
+  it('1 — synchronous observation runs after the completed response is persisted', async () => {
     const s = await setupOrderingScenario({ messageTokens: 1 });
 
-    s.addUserMessage('Tell me about React');
+    const userMessageId = s.addUserMessage('Tell me about React');
     await s.runStep(0);
-    s.addAssistantMessage('React is a UI library.');
+    const assistantMessageId = s.addAssistantMessage('React is a UI library.');
     await s.finalize();
 
     const record = await s.getOMRecord();
-    // observation must NOT have fired during finalize
-    expect(record?.activeObservations ?? '').toBe('');
-    expect(record?.lastObservedAt).toBeUndefined();
+    expect(record?.activeObservations).toContain('Observed user request');
+    expect(record?.lastObservedAt).toBeDefined();
 
     const omMetadata = await s.getOMMetadata();
-    expect(omMetadata?.currentTask).toBeUndefined();
-    expect(omMetadata?.suggestedResponse).toBeUndefined();
+    expect(omMetadata?.currentTask).toBe('Handle user request');
+    expect(omMetadata?.suggestedResponse).toBe('Sure!');
+
+    const storedMessageIds = (await s.getStoredMessages()).map(message => message.id);
+    expect(storedMessageIds).toContain(userMessageId);
+    expect(storedMessageIds).toContain(assistantMessageId);
   });
 
-  // ─── Test 2: deferred observation should happen at beginning of next turn ───
+  // ─── Test 2: the completed observation is loaded at the beginning of the next turn ───
 
-  it('2 — deferred observation should happen at the beginning of the next turn', async () => {
+  it('2 — completed end-of-turn observation is loaded at the beginning of the next turn', async () => {
     const s = await setupOrderingScenario({ messageTokens: 1 });
 
-    // Turn 1: single step
     s.addUserMessage('Hello');
     await s.runStep(0);
     s.addAssistantMessage('Hi there');
     await s.finalize();
 
-    // After turn 1: no observation yet
-    let record = await s.getOMRecord();
-    expect(record?.activeObservations ?? '').toBe('');
-    expect(record?.lastObservedAt).toBeUndefined();
+    const record = await s.getOMRecord();
+    expect(record?.activeObservations).toContain('Observed user request');
+    expect(record?.lastObservedAt).toBeDefined();
 
-    // Turn 2: multi-step (step 0 + step 1 triggers observation)
     s.resetForNewTurn();
     s.addUserMessage('Follow-up');
     await s.runStep(0);
-    s.addToolCallMessage('search');
-    await s.runStep(1);
-    s.addAssistantMessage('Here are results');
-    await s.finalize();
 
-    // After turn 2 step 1: observation should have fired
-    record = await s.getOMRecord();
-    expect(record?.activeObservations).toBeTruthy();
-    expect(record?.lastObservedAt).toBeDefined();
+    const observationalContext = s.currentMessageList
+      .getSystemMessages('observational-memory')
+      .map(message => message.content)
+      .join('\n');
+    expect(observationalContext).toContain('Observed user request');
   });
 
   // ─── Test 2b: next turn step 0 activates buffered chunks and loads correct context ───

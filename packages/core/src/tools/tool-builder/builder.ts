@@ -1135,6 +1135,11 @@ export class CoreToolBuilder extends MastraBase {
       requireApproval,
       needsApprovalFn,
       hasSuspendSchema: !!this.getSuspendSchema(),
+      // Approval gates run before execute(), so expose the exact runtime
+      // validator separately. The agent loop uses this to keep schema-invalid
+      // calls out of a user-facing approval queue; execute() still performs
+      // authoritative validation immediately before side effects.
+      validateInput: (params: unknown) => validateToolInput(this.getParameters(), params, this.options.name),
       execute: this.originalTool.execute
         ? this.createExecute(
             this.originalTool,

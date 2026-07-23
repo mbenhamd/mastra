@@ -12,6 +12,33 @@ const UPDATE_WORKING_MEMORY_TOOL_NAME = 'updateWorkingMemory';
 const SET_WORKING_MEMORY_TOOL_NAME = 'setWorkingMemory';
 
 /**
+ * Decode exactly one prompt-escaping layer added by WorkingMemoryStateProcessor.
+ * String.replace evaluates matches from the original input, so `&amp;lt;`
+ * becomes `&lt;`, never `<`, in a single call.
+ */
+export function decodeWorkingMemoryPromptEntities(value: string): string {
+  return value.replace(/&(amp|lt|gt);/g, entity => {
+    if (entity === '&amp;') return '&';
+    if (entity === '&lt;') return '<';
+    return '>';
+  });
+}
+
+export function decodeWorkingMemoryPromptValue(value: unknown): unknown {
+  if (typeof value === 'string') return decodeWorkingMemoryPromptEntities(value);
+  if (Array.isArray(value)) return value.map(decodeWorkingMemoryPromptValue);
+  if (typeof value === 'object' && value !== null) {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, entry]) => [
+        key,
+        decodeWorkingMemoryPromptValue(entry),
+      ]),
+    );
+  }
+  return value;
+}
+
+/**
  * Deep merges two objects, with special handling for null values (delete) and arrays (replace).
  * - Object properties are recursively merged
  * - null values in the update will delete the corresponding property
@@ -261,12 +288,17 @@ export const updateWorkingMemoryTool = (memoryConfig?: MemoryConfigInternal) => 
           newData = memoryInput;
         }
 
-        const mergedData = deepMergeWorkingMemory(existingData, newData as Record<string, unknown>);
+        const mergedData = deepMergeWorkingMemory(
+          existingData,
+          decodeWorkingMemoryPromptValue(newData) as Record<string, unknown>,
+        );
         workingMemory = JSON.stringify(mergedData);
       } else {
         // Template-based (Markdown): use existing replace semantics
         const memoryInput = workingMemoryInput.memory;
-        workingMemory = typeof memoryInput === 'string' ? memoryInput : JSON.stringify(memoryInput);
+        const decodedMemoryInput = decodeWorkingMemoryPromptValue(memoryInput);
+        workingMemory =
+          typeof decodedMemoryInput === 'string' ? decodedMemoryInput : JSON.stringify(decodedMemoryInput);
 
         // Validate that we're not replacing good data with an empty template
         // This prevents accidental data loss when the LLM returns just the template
@@ -375,27 +407,30 @@ export const __experimental_updateWorkingMemoryToolVNext = (config: MemoryConfig
         }
       }
 
-      const workingMemory = workingMemoryInput.newMemory || '';
+      const workingMemory = decodeWorkingMemoryPromptEntities(workingMemoryInput.newMemory || '');
+      let searchString = workingMemoryInput.searchString
+        ? decodeWorkingMemoryPromptEntities(workingMemoryInput.searchString)
+        : undefined;
       if (!workingMemoryInput.updateReason) workingMemoryInput.updateReason = `append-new-memory`;
 
       if (
-        workingMemoryInput.searchString &&
+        searchString &&
         config.workingMemory?.scope === `resource` &&
         workingMemoryInput.updateReason === `replace-irrelevant-memory`
       ) {
         // don't allow replacements due to something not being relevant to the current conversation
         // if there's no searchString, then we will append.
-        workingMemoryInput.searchString = undefined;
+        searchString = undefined;
       }
 
-      if (workingMemoryInput.updateReason === `append-new-memory` && workingMemoryInput.searchString) {
+      if (workingMemoryInput.updateReason === `append-new-memory` && searchString) {
         // do not find/replace when append-new-memory is selected
         // some models get confused and pass a search string even when they don't want to replace it.
         // TODO: maybe they're trying to add new info after the search string?
-        workingMemoryInput.searchString = undefined;
+        searchString = undefined;
       }
 
-      if (workingMemoryInput.updateReason !== `append-new-memory` && !workingMemoryInput.searchString) {
+      if (workingMemoryInput.updateReason !== `append-new-memory` && !searchString) {
         return {
           success: false,
           reason: `updateReason was ${workingMemoryInput.updateReason} but no searchString was provided. Unable to replace undefined with "${workingMemoryInput.newMemory}"`,
@@ -407,7 +442,7 @@ export const __experimental_updateWorkingMemoryToolVNext = (config: MemoryConfig
         threadId,
         resourceId,
         workingMemory: workingMemory,
-        searchString: workingMemoryInput.searchString,
+        searchString,
         memoryConfig: config,
       });
 

@@ -896,6 +896,32 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
         if (policyAsk) approvalReasons.push('policy');
         const toolRequiresApproval = approvalRequirement.required || policyAsk;
 
+        // execute() is intentionally deferred until after approval, but its
+        // schema validation must not be deferred with it. Otherwise an invalid
+        // provider call can be presented to a user, accepted, and only then
+        // collapse into a validation result on the resumed leg. Return that
+        // same result to the model now so it can repair the call before anyone
+        // is asked to approve it. Keep execute() validation as the final
+        // authority and do not reuse transformed data here: transforms are not
+        // guaranteed to be idempotent.
+        const validateInput = (
+          tool as {
+            validateInput?: (params: unknown) => { data?: unknown; error?: unknown };
+          }
+        ).validateInput;
+        if (toolRequiresApproval && resumeData === undefined && typeof validateInput === 'function') {
+          const preflightValidation = validateInput(args);
+          if (preflightValidation.error !== undefined) {
+            return {
+              result:
+                preflightValidation.error instanceof Error
+                  ? serializeToolError(preflightValidation.error)
+                  : ensureSerializable(preflightValidation.error),
+              ...inputData,
+            };
+          }
+        }
+
         // Schema for tool call approval - used for both streaming and metadata
         const approvalSchema = toStandardSchema(
           z.object({

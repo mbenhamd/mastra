@@ -454,7 +454,7 @@ describe('createToolCallStep tool approval workflow', () => {
   let controller: { enqueue: Mock };
   let suspend: Mock;
   let streamState: { serialize: Mock };
-  let tools: Record<string, { execute: Mock; requireApproval: boolean }>;
+  let tools: Record<string, { execute: Mock; requireApproval: boolean; validateInput?: Mock }>;
   let messageList: MessageList;
   let toolCallStep: ReturnType<typeof createToolCallStep>;
   let neverResolve: Promise<never>;
@@ -531,6 +531,47 @@ describe('createToolCallStep tool approval workflow', () => {
   afterEach(() => {
     vi.clearAllMocks();
     vi.restoreAllMocks();
+  });
+
+  it('returns invalid input to the model before asking for approval', async () => {
+    const validationError = {
+      error: true,
+      message: 'Tool input validation failed for test-tool.',
+      validationErrors: {
+        errors: [],
+        fields: { param: { errors: ['Invalid input'], fields: {} } },
+      },
+    };
+    tools['test-tool'].validateInput = vi.fn().mockReturnValue({ error: validationError });
+
+    const result = await toolCallStep.execute(makeExecuteParams());
+
+    expect(tools['test-tool'].validateInput).toHaveBeenCalledWith({ param: 'test' });
+    expect(suspend).not.toHaveBeenCalled();
+    expectNoToolExecution();
+    expect(result).toEqual({
+      result: validationError,
+      ...makeInputData(),
+    });
+  });
+
+  it('preserves Error details from approval preflight validation across serialization', async () => {
+    tools['test-tool'].validateInput = vi.fn().mockReturnValue({
+      error: new TypeError('Tool input must include a valid param.'),
+    });
+
+    const result = await toolCallStep.execute(makeExecuteParams());
+    const serializedResult = JSON.parse(JSON.stringify(result));
+
+    expect(suspend).not.toHaveBeenCalled();
+    expectNoToolExecution();
+    expect(serializedResult).toMatchObject({
+      result: {
+        name: 'TypeError',
+        message: 'Tool input must include a valid param.',
+      },
+      ...makeInputData(),
+    });
   });
 
   it('normalizes evidence-free null resume placeholders on a fresh tool call', async () => {

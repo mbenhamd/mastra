@@ -16,6 +16,7 @@ import {
 import { getLastObservedMessageCursor } from '../message-utils';
 
 import { buildMessageRange } from '../observational-memory';
+import { updateThreadFromObservationalMemory } from '../storage-compat';
 import { ObservationStrategy } from './base';
 import type { StrategyDeps } from './base';
 import type { ObservationRunOpts, ObserverOutput, ProcessedObservation } from './types';
@@ -124,6 +125,7 @@ export class SyncObservationStrategy extends ObservationStrategy {
       previousValues: this.priorExtractedValues,
       threadId: this.opts.threadId,
       resourceId: this.opts.resourceId,
+      observationalMemoryRecordId: this.opts.record.id,
       mainAgent: this.opts.agent,
       memory: this.deps.memory,
       sendSignal: this.opts.sendSignal,
@@ -212,10 +214,15 @@ export class SyncObservationStrategy extends ObservationStrategy {
         },
         lastObservedMessageCursor: getLastObservedMessageCursor(messages),
       });
-      await this.storage.updateThread({
+      await updateThreadFromObservationalMemory(this.storage, {
         id: threadId,
         title: shouldUpdateThreadTitle ? newTitle : (thread.title ?? ''),
         metadata: newMetadata,
+        guard: {
+          recordId: record.id,
+          threadId: record.threadId,
+          resourceId: record.resourceId,
+        },
       });
 
       if (shouldUpdateThreadTitle) {

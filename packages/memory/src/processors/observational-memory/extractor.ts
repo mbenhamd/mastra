@@ -11,6 +11,8 @@ export interface ExtractorRuntimeContext {
   source: ExtractorSource;
   threadId?: string;
   resourceId?: string;
+  /** Exact OM generation authorizing observer-managed derived writes. */
+  observationalMemoryRecordId?: string;
   mainAgent?: ProcessorContext['agent'];
   memory?: Memory;
   requestContext?: RequestContext;

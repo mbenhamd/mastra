@@ -117,7 +117,7 @@ export class WorkingMemoryExtractor extends Extractor<string | Record<string, un
         }
         return z.union([z.record(z.string(), z.unknown()), z.null()]);
       },
-      onExtracted: async ({ current, memory, threadId, resourceId, requestContext }) => {
+      onExtracted: async ({ current, memory, threadId, resourceId, requestContext, observationalMemoryRecordId }) => {
         const memoryConfig = parseMemoryRequestContext(requestContext)?.memoryConfig;
         const config = memory!.getMergedThreadConfig(memoryConfig ?? {});
         const isSchemaWorkingMemory = Boolean(config.workingMemory?.schema);
@@ -148,6 +148,7 @@ export class WorkingMemoryExtractor extends Extractor<string | Record<string, un
           resourceId,
           workingMemory,
           memoryConfig,
+          observationalMemoryRecordId,
         });
 
         return current;

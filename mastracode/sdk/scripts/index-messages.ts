@@ -337,10 +337,17 @@ async function indexObservationGroupsFromMessages(
       }
 
       try {
+        const recordId = group.provenance.recordId;
+        if (!recordId) {
+          errors++;
+          console.log(`\n    group ${group.id} skipped: no authorizing observational-memory record`);
+          continue;
+        }
         await (memory as any).indexObservation({
           text: group.content,
           groupId: group.id,
           range: group.range,
+          recordId,
           threadId: threadId ?? '',
           resourceId,
         });

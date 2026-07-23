@@ -281,4 +281,56 @@ describe('OM internal agent request contexts', () => {
       expect(context.get('tenantId')).toBe('tenant-1');
     }
   });
+
+  it('forwards the current observation generation to reflector extractor hooks without a writer', async () => {
+    const onExtracted = vi.fn(({ current }: { current: string }) => current);
+    const priority = new Extractor({
+      name: 'Priority',
+      instructions: 'Extract priority.',
+      schema: z.string(),
+      onExtracted,
+    });
+    const reflector = createReflectorRunner([priority]);
+
+    vi.spyOn(reflector as any, 'createAgent').mockReturnValue({
+      id: 'observational-memory-reflector',
+      stream: async () => ({
+        getFullOutput: async () => ({
+          text: '<observations>\n- compressed memory\n</observations>',
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+        }),
+      }),
+      generate: async () => ({ object: { priority: 'high' } }),
+    });
+
+    await reflector.call(
+      'existing observations',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      0,
+      createParentRequestContext(),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {
+        recordId: 'om-generation-1',
+        threadId: 'parent-thread',
+        resourceId: 'resource-1',
+      },
+    );
+
+    expect(onExtracted).toHaveBeenCalledWith(
+      expect.objectContaining({
+        current: 'high',
+        observationalMemoryRecordId: 'om-generation-1',
+        threadId: 'parent-thread',
+        resourceId: 'resource-1',
+      }),
+    );
+  });
 });

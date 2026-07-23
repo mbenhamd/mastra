@@ -329,6 +329,7 @@ describe('MCP Tool Tracing', () => {
         name: "mcp_tool: 'mcp-server_list-files' on 'filesystem-server'",
         input: { path: '/tmp' },
         attributes: {
+          toolCallId: 'test-call-id',
           mcpServer: 'filesystem-server',
           serverVersion: '1.2.0',
           toolDescription: 'List files in a directory',
@@ -381,6 +382,7 @@ describe('MCP Tool Tracing', () => {
         name: "tool: 'regular-tool'",
         input: { value: 'test' },
         attributes: {
+          toolCallId: 'test-call-id',
           toolDescription: 'A regular tool',
           toolType: 'tool',
         },
@@ -430,6 +432,7 @@ describe('MCP Tool Tracing', () => {
     const spanArgs = (mockAgentSpan.createChildSpan as ReturnType<typeof vi.fn>).mock.calls[0][0];
     expect(spanArgs.type).toBe(SpanType.MCP_TOOL_CALL);
     expect(spanArgs.attributes).toEqual({
+      toolCallId: 'test-call-id',
       mcpServer: 'my-mcp-server',
       serverVersion: undefined,
       toolDescription: 'Read a resource',
@@ -486,6 +489,35 @@ describe('MCP Tool Tracing', () => {
   });
 
   describe('requireApproval Handling', () => {
+    it('exposes the runtime input validator without executing the tool', () => {
+      const execute = vi.fn(async (input: { value: string }) => input);
+      const testTool = createTool({
+        id: 'approval-preflight-tool',
+        description: 'A tool whose input must be valid before approval.',
+        inputSchema: z.object({ value: z.string().trim().min(1) }),
+        execute,
+      });
+
+      const builtTool = new CoreToolBuilder({
+        originalTool: testTool,
+        options: {
+          name: 'approval-preflight-tool',
+          requireApproval: true,
+        },
+      }).build();
+
+      expect(builtTool.validateInput?.({ value: 42 })).toMatchObject({
+        error: {
+          error: true,
+          message: expect.stringContaining('approval-preflight-tool'),
+        },
+      });
+      expect(builtTool.validateInput?.({ value: ' valid ' })).toEqual({
+        data: { value: 'valid' },
+      });
+      expect(execute).not.toHaveBeenCalled();
+    });
+
     it('should correctly handle function in this.options.requireApproval', () => {
       const needsApprovalFn = (input: any) => input.value === 'secret';
       const testTool = {

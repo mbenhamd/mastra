@@ -226,6 +226,7 @@ import { registerOp, unregisterOp, isOpActiveInProcess } from './operation-regis
 import type { CompressionLevel } from './reflector-agent';
 import { ReflectorRunner } from './reflector-runner';
 import { isOmReproCaptureEnabled, writeObserverExchangeReproCapture } from './repro-capture';
+import { updateThreadFromObservationalMemory } from './storage-compat';
 import {
   calculateDynamicThreshold,
   calculateProjectedMessageRemoval,
@@ -302,6 +303,7 @@ export class ObservationalMemory {
     text: string;
     groupId: string;
     range: string;
+    recordId: string;
     threadId: string;
     resourceId: string;
     observedAt?: Date;
@@ -320,6 +322,7 @@ export class ObservationalMemory {
   private hasher = xxhash();
   private mastra?: Mastra;
   private memory?: Memory;
+  private readonly managedWorkingMemoryScope?: 'thread' | 'resource';
 
   /**
    * Track message IDs observed during this instance's lifetime.
@@ -402,6 +405,7 @@ export class ObservationalMemory {
     this.onIndexObservations = config.onIndexObservations;
     this.mastra = config.mastra;
     this.memory = config.memory;
+    this.managedWorkingMemoryScope = config.managedWorkingMemoryScope;
 
     // Resolve "default" to the model default for the agent being configured.
     const resolveModel = (model: ObservationalMemoryModel | undefined, defaultModel: string) =>
@@ -1079,6 +1083,7 @@ export class ObservationalMemory {
           observation: this.observationConfig,
           reflection: this.reflectionConfig,
           scope: this.scope,
+          ...(this.managedWorkingMemoryScope ? { _managedWorkingMemoryScope: this.managedWorkingMemoryScope } : {}),
         },
         observedTimezone,
       });
@@ -3355,7 +3360,7 @@ ${formattedMessages}
 
     // Update thread metadata with continuation hints from activated chunks
     const thread = await this.storage.getThreadById({ threadId });
-    if (thread) {
+    if (thread && postSwapRecord) {
       // Get hints from the most recent activated chunk
       const activatedChunks = freshChunks.filter(c => activationResult.activatedCycleIds.includes(c.cycleId));
       const lastActivated = activatedChunks[activatedChunks.length - 1];
@@ -3369,10 +3374,15 @@ ${formattedMessages}
         const oldTitle = thread.title?.trim();
         const newTitle = chunkThreadTitle?.trim();
         const shouldUpdateThreadTitle = !!newTitle && newTitle.length >= 3 && newTitle !== oldTitle;
-        await this.storage.updateThread({
+        await updateThreadFromObservationalMemory(this.storage, {
           id: threadId,
           title: shouldUpdateThreadTitle ? newTitle : (thread.title ?? ''),
           metadata: newMetadata,
+          guard: {
+            recordId: postSwapRecord.id,
+            threadId: postSwapRecord.threadId,
+            resourceId: postSwapRecord.resourceId,
+          },
         });
       }
     }
@@ -3524,10 +3534,17 @@ ${formattedMessages}
         priorExtractedValues,
         observabilityContext,
         undefined,
+        undefined,
+        undefined,
+        {
+          recordId: record.id,
+          threadId,
+          resourceId: record.resourceId ?? resourceId,
+        },
       );
       const reflectionTokenCount = this.tokenCounter.countObservations(reflectResult.observations);
 
-      await this.storage.createReflectionGeneration({
+      const reflectionRecord = await this.storage.createReflectionGeneration({
         currentRecord: record,
         reflection: reflectResult.observations,
         tokenCount: reflectionTokenCount,
@@ -3544,10 +3561,15 @@ ${formattedMessages}
           threadTitle: metadataUpdate.threadTitle ?? previousOmMetadata?.threadTitle,
           extracted: { ...(previousOmMetadata?.extracted ?? {}), ...(metadataUpdate.extracted ?? {}) },
         });
-        await this.storage.updateThread({
+        await updateThreadFromObservationalMemory(this.storage, {
           id: threadId,
           title: thread.title ?? '',
           metadata: newMetadata,
+          guard: {
+            recordId: reflectionRecord.id,
+            threadId: reflectionRecord.threadId,
+            resourceId: reflectionRecord.resourceId,
+          },
         });
       }
 

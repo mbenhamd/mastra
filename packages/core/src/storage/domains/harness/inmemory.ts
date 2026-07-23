@@ -911,15 +911,19 @@ export class InMemoryHarness extends HarnessStorage {
     const key = messageEvidenceKey(namespacedRecord.harnessName, namespacedRecord.sessionId, namespacedRecord.signalId);
     const existing = this.db.harnessMessageResultEvidence.get(key);
     if (existing === undefined && namespacedRecord.admissionId !== undefined) {
-      // Admission uniqueness is per admissionId, not per signalId: evidence
-      // written before a signal-identity or admission-hash scheme change lives
-      // under a legacy signalId this key never sees. Surface it as a storage
-      // admission conflict so the caller's duplicate resolver (which knows the
-      // legacy-compatible hashes) adjudicates replay vs conflict.
+      // Admission uniqueness is per scoped (resource, thread, admissionId),
+      // not per signalId: evidence written before a signal-identity or
+      // admission-hash scheme change lives under a legacy signalId this key
+      // never sees. Surface it as a storage admission conflict so the caller's
+      // duplicate resolver (which knows the legacy-compatible hashes)
+      // adjudicates replay vs conflict. The same caller-minted admission id may
+      // legitimately occur in another thread, so it must not collide here.
       for (const row of this.db.harnessMessageResultEvidence.values()) {
         if (
           row.harnessName === namespacedRecord.harnessName &&
           row.sessionId === namespacedRecord.sessionId &&
+          row.resourceId === namespacedRecord.resourceId &&
+          row.threadId === namespacedRecord.threadId &&
           row.admissionId === namespacedRecord.admissionId &&
           row.signalId !== namespacedRecord.signalId
         ) {
