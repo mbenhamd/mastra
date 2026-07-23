@@ -1510,13 +1510,20 @@ describe('Session events — serialization failure isolation (§S4.2)', () => {
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
     try {
       await session.setState({ a: 1 }); // good event #1 (state_changed)
-      // A circular payload pushed straight through the emitter bypasses emit-time
+      // A circular value pushed straight through the emitter bypasses emit-time
       // custom-event validation, so it reaches the persistence snapshot and fails.
+      // It must NOT sit under `payload`: whenever `files.maxEventPayloadBytes` is
+      // set, the §13.x emit cap (EventEmitter.applyCustomEventPayloadCap) projects
+      // that ONE field and would sanitize the cycle into an
+      // `unserializable-tool-payload` sentinel before persistence ever sees it.
+      // Every other field is exempt from that cap (no `payload` own-property =>
+      // the event passes through verbatim), so this fixture exercises §S4.2 with
+      // or without a cap configured.
       const circular: Record<string, unknown> = {};
       circular.self = circular;
       (session as unknown as { _emitter: { emit(e: unknown): unknown } })._emitter.emit({
         type: 'badns.bad',
-        payload: circular,
+        detail: circular,
       });
       await session.setState({ a: 2 }); // good event #2 — must still persist
 
