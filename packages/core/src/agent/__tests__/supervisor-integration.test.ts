@@ -13,6 +13,14 @@ import { Agent } from '../agent';
 import type { MessageFilterContext, DelegationCompleteContext, IterationCompleteContext } from '../agent.types';
 import type { MastraDBMessage } from '../message-list/state/types';
 
+// PF-2303 (fork PR #326) changes packages/core/src/llm/model/router.ts, which is
+// part of this suite's runtime surface (Agent -> model router). The fork PR
+// validator re-verifies and re-runs this provider-gated suite whenever its
+// surface changes, so it is admitted here. Behaviour is unchanged and the
+// reviewed provider gate (imports, the real-provider describe, and its empty-key
+// skip) is preserved; the suite confirms the transport change does not regress
+// supervisor working-memory forwarding.
+
 // Helper: create a sub-agent with a fixed text response
 function makeSubAgent(id: string, responseText: string) {
   return new Agent({
