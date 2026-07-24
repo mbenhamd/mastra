@@ -176,6 +176,10 @@ export class AzureOpenAIGateway extends MastraModelGateway {
   // historical single-gateway namespace.
   readonly id: string;
   readonly name: string;
+  // Azure carries transport/websocket config on `providerOptions.azure` and
+  // owns the Responses API websocket transport regardless of its configured id.
+  readonly transportProviderOptionsKey = 'azure' as const;
+  readonly ownsResponsesWebSocketTransport = true;
   private tokenCache = new InMemoryServerCache();
   private entraIdTokenRequests = new Map<string, Promise<CachedToken>>();
 

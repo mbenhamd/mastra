@@ -62,12 +62,12 @@ function createGatewayModelCache(): GatewayModelCache {
 
 function getOpenAITransport(
   providerOptions?: ProviderOptions,
-  providerId?: string,
+  transportProviderOptionsKey?: 'openai' | 'azure',
 ): {
   transport: OpenAITransport;
   websocket?: ResponsesWebSocketOptions;
 } {
-  const transportOptions = (providerId === 'azure-openai' ? providerOptions?.azure : providerOptions?.openai) as
+  const transportOptions = (transportProviderOptionsKey === 'azure' ? providerOptions?.azure : providerOptions?.openai) as
     | {
         transport?: OpenAITransport;
         websocket?: ResponsesWebSocketOptions;
@@ -436,14 +436,14 @@ export class ModelRouterLanguageModel implements MastraLanguageModelV2 {
 
     const { transport, websocket } = getOpenAITransport(
       sanitizedOptions.providerOptions as ProviderOptions | undefined,
-      resolved.providerId,
+      this.gateway.transportProviderOptionsKey,
     );
     const requestedTransport: OpenAITransport = transport === 'auto' ? 'websocket' : transport;
     const allowWebSocket =
       requestedTransport === 'websocket' &&
       !this.config.url &&
       ((this.gatewayId === 'models.dev' && OPENAI_WS_ALLOWLIST.has(this.provider)) ||
-        this.gatewayId === 'azure-openai');
+        this.gateway.ownsResponsesWebSocketTransport === true);
     const resolvedTransport: OpenAITransport = allowWebSocket ? 'websocket' : 'fetch';
 
     const model = await this.resolveLanguageModel({

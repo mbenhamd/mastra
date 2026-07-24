@@ -175,6 +175,8 @@ describe('ModelRouter - OpenAI WebSocket transport', () => {
     class TestAzureGateway extends MastraModelGateway {
       readonly id = 'azure-openai';
       readonly name = 'azure-openai';
+      readonly transportProviderOptionsKey = 'azure' as const;
+      readonly ownsResponsesWebSocketTransport = true;
 
       fetchProviders(): Promise<Record<string, ProviderConfig>> {
         return Promise.resolve({
@@ -239,6 +241,8 @@ describe('ModelRouter - OpenAI WebSocket transport', () => {
     class TestAzureGateway extends MastraModelGateway {
       readonly id = 'azure-openai';
       readonly name = 'azure-openai';
+      readonly transportProviderOptionsKey = 'azure' as const;
+      readonly ownsResponsesWebSocketTransport = true;
 
       constructor(
         private close: () => void,
@@ -315,6 +319,8 @@ describe('ModelRouter - OpenAI WebSocket transport', () => {
     class TestAzureGateway extends MastraModelGateway {
       readonly id = 'azure-openai';
       readonly name = 'azure-openai';
+      readonly transportProviderOptionsKey = 'azure' as const;
+      readonly ownsResponsesWebSocketTransport = true;
 
       fetchProviders(): Promise<Record<string, ProviderConfig>> {
         return Promise.resolve({
@@ -374,5 +380,76 @@ describe('ModelRouter - OpenAI WebSocket transport', () => {
     transport?.close();
     expect(close).toHaveBeenCalledTimes(1);
     await reader.cancel();
+  });
+
+  it('honours WebSocket transport for a custom-namespaced Azure gateway', async () => {
+    // Regression: the router previously gated the Azure transport/websocket
+    // path on the literal gateway id `azure-openai`. A gateway registered under
+    // a custom namespace (e.g. a benchmark Azure resource) still owns the
+    // Responses websocket transport and carries its config on
+    // `providerOptions.azure`; the capability now travels on the gateway
+    // instance so the id no longer decides it.
+    const calls: Array<Record<string, unknown>> = [];
+    class BenchmarkAzureGateway extends MastraModelGateway {
+      readonly id = 'benchmark-azure';
+      readonly name = 'benchmark-azure';
+      readonly transportProviderOptionsKey = 'azure' as const;
+      readonly ownsResponsesWebSocketTransport = true;
+
+      fetchProviders(): Promise<Record<string, ProviderConfig>> {
+        return Promise.resolve({
+          'benchmark-azure': {
+            name: 'Benchmark Azure',
+            models: ['gpt-5-4-deployment'],
+            apiKeyEnvVar: [],
+            gateway: 'benchmark-azure',
+          },
+        });
+      }
+
+      buildUrl(): undefined {
+        return undefined;
+      }
+
+      getApiKey(): Promise<string> {
+        return Promise.resolve('test-azure-key');
+      }
+
+      resolveLanguageModel(args: Record<string, unknown>): GatewayLanguageModel {
+        calls.push(args);
+        const model = createMockModel({ mockText: 'Hello from Benchmark Azure!' }) as GatewayLanguageModel;
+        Object.defineProperty(model, MASTRA_GATEWAY_STREAM_TRANSPORT, {
+          configurable: true,
+          value: {
+            type: 'openai-websocket',
+            close: vi.fn(),
+          },
+        });
+        return model;
+      }
+    }
+
+    const router = new ModelRouterLanguageModel('benchmark-azure/gpt-5-4-deployment', [new BenchmarkAzureGateway()]);
+
+    await router.doStream({
+      prompt: [{ role: 'user', content: [{ type: 'text', text: 'Hello' }] }],
+      providerOptions: {
+        azure: {
+          transport: 'websocket',
+          websocket: { closeOnFinish: false },
+        },
+      },
+    } as any);
+
+    expect(calls[0]).toMatchObject({
+      providerId: 'benchmark-azure',
+      modelId: 'gpt-5-4-deployment',
+      transport: 'websocket',
+      responsesWebSocket: { closeOnFinish: false },
+    });
+    expect(router._getStreamTransport()).toMatchObject({
+      type: 'openai-websocket',
+      closeOnFinish: false,
+    });
   });
 });
