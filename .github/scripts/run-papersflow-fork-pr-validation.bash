@@ -3727,6 +3727,50 @@ NODE
     exit 1
   fi
 
+  # PF-2306: the same reasoning applies to a plain runtime-bounded for loop --
+  # its body runs zero or more times, so a guarded call inside it is not
+  # guaranteed to run and must be rejected just like a for-of body.
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "import { buildObservationIndexInput } from '../src/utils/observation-index-input';" \
+      'declare const memory: { indexObservation(input: unknown): Promise<void> };' \
+      'export async function indexObservationGroupsFromMessages(' \
+      '  memory: { indexObservation(input: unknown): Promise<void> },' \
+      '  candidates: unknown[],' \
+      ') {' \
+      '  for (let i = 0; i < candidates.length; i++) {' \
+      '    const input = buildObservationIndexInput(candidates[i]);' \
+      '    if (!input) continue;' \
+      '    await memory.indexObservation(input);' \
+      '  }' \
+      '}' \
+      'void indexObservationGroupsFromMessages(memory, []);' \
+      > mastracode/sdk/scripts/index-messages.ts
+    git add .
+    git commit -q -m 'hide observation indexing inside a plain for loop body'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/mastracode-observation-index-for-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'for-loop-hidden observation indexing unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'must pass buildObservationIndexInput output to every indexObservation call' "$output"
+  assert_contains 'mastracode/sdk/scripts/index-messages.ts' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'for-loop-hidden observation indexing executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
   # PF-2306: a missing-input guard whose body always exits through a try/finally
   # (cleanup before returning) is a valid guard. Without TryStatement handling in
   # statementAlwaysExits the guard is not recognized and this legitimate
@@ -7621,14 +7665,14 @@ function isStaticallyUnreachable(node, boundary) {
     // clause body fails closed.
     if (ts.isCaseClause(parent) || ts.isDefaultClause(parent)) return true;
 
-    // for-of/for-in bodies execute zero or more times over a value the analysis
-    // cannot bound, so a guarded call inside one is not guaranteed to run under
-    // the guard reasoned about in the enclosing block. Treat the loop body as a
-    // disallowed position and fail closed, mirroring the switch-clause rule; the
-    // loop head (iterable/initializer) still evaluates unconditionally and is
-    // left reachable.
+    // Loop bodies (for-of, for-in, and plain for) execute zero or more times
+    // over a value the analysis cannot bound, so a guarded call inside one is
+    // not guaranteed to run under the guard reasoned about in the enclosing
+    // block. Treat the loop body as a disallowed position and fail closed,
+    // mirroring the switch-clause rule; the loop head (iterable/initializer/
+    // condition) still evaluates unconditionally and is left reachable.
     if (
-      (ts.isForOfStatement(parent) || ts.isForInStatement(parent)) &&
+      (ts.isForOfStatement(parent) || ts.isForInStatement(parent) || ts.isForStatement(parent)) &&
       child === parent.statement
     ) {
       return true;
