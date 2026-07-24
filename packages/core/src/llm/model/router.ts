@@ -67,7 +67,9 @@ function getOpenAITransport(
   transport: OpenAITransport;
   websocket?: ResponsesWebSocketOptions;
 } {
-  const transportOptions = (transportProviderOptionsKey === 'azure' ? providerOptions?.azure : providerOptions?.openai) as
+  const transportOptions = (
+    transportProviderOptionsKey === 'azure' ? providerOptions?.azure : providerOptions?.openai
+  ) as
     | {
         transport?: OpenAITransport;
         websocket?: ResponsesWebSocketOptions;

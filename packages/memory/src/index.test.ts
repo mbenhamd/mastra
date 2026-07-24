@@ -3144,7 +3144,7 @@ describe('Memory', () => {
       await expect(memoryStore.getThreadById({ threadId })).resolves.toMatchObject({ id: threadId });
     });
 
-    it('does not clear a resource\'s shared observational memory when a rejected non-atomic deletion targets an empty sibling thread', async () => {
+    it("does not clear a resource's shared observational memory when a rejected non-atomic deletion targets an empty sibling thread", async () => {
       const { memory, memoryStore, resourceId, threadId } =
         await createMemoryWithDerivedObservationState('delete-thread-empty-sibling');
       Object.defineProperty(memoryStore, 'supportsAtomicObservationalMemoryRetraction', {
