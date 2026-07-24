@@ -3144,6 +3144,44 @@ describe('Memory', () => {
       await expect(memoryStore.getThreadById({ threadId })).resolves.toMatchObject({ id: threadId });
     });
 
+    it('does not clear a resource\'s shared observational memory when a rejected non-atomic deletion targets an empty sibling thread', async () => {
+      const { memory, memoryStore, resourceId, threadId } =
+        await createMemoryWithDerivedObservationState('delete-thread-empty-sibling');
+      Object.defineProperty(memoryStore, 'supportsAtomicObservationalMemoryRetraction', {
+        configurable: true,
+        value: false,
+      });
+      // A second thread on the same resource that never held a message. It
+      // contributes nothing to synthesis, but shares the resource-scoped
+      // observational memory the first thread derived.
+      const emptySiblingThreadId = `${threadId}-empty-sibling`;
+      await memoryStore.saveThread({
+        thread: {
+          id: emptySiblingThreadId,
+          resourceId,
+          title: 'Empty sibling',
+          metadata: {},
+          createdAt: new Date('2026-01-02T00:00:00.000Z'),
+          updatedAt: new Date('2026-01-02T00:00:00.000Z'),
+        },
+      });
+      // The delete is rejected before committing any part of the cascade, and
+      // an empty thread's post-rejection state (thread present, no messages) is
+      // indistinguishable from a committed cascade unless the pre-attempt
+      // transcript state was captured.
+      vi.spyOn(memoryStore, 'deleteThread').mockRejectedValueOnce(new Error('delete empty sibling failed'));
+
+      await expect(memory.deleteThread(emptySiblingThreadId)).rejects.toThrow('delete empty sibling failed');
+
+      // Nothing committed, so the resource-scoped and first-thread observational
+      // memory the sibling shares must survive intact.
+      await expect(memoryStore.getObservationalMemory(null, resourceId)).resolves.not.toBeNull();
+      await expect(memoryStore.getObservationalMemory(threadId, resourceId)).resolves.not.toBeNull();
+      await expect(memoryStore.getResourceById({ resourceId })).resolves.toMatchObject({
+        workingMemory: '{"privateFact":"ZEPHYR-9"}',
+      });
+    });
+
     it('retracts derived observational state as part of deleting a thread', async () => {
       const { memory, memoryStore, resourceId, threadId } =
         await createMemoryWithDerivedObservationState('delete-thread');
