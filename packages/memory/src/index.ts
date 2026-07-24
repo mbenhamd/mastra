@@ -985,11 +985,18 @@ export class Memory extends MastraMemory {
   private async reconcileRejectedNonAtomicThreadDeletion(
     memoryStore: MemoryStorage,
     coordinate: { resourceId: string; threadId: string },
+    threadHadMessages: boolean,
   ): Promise<void> {
     try {
       // Adapters without the atomic capability delete a thread's messages
       // before the thread row, so a rejection can still have committed part of
-      // that cascade. Retract only once the transcript has actually changed.
+      // that cascade. Retract only once the transcript has actually changed. A
+      // thread that never held messages committed nothing to retract — whether
+      // its row survived the rejection or its deletion had already committed
+      // (leaving persistedThread null) — and retracting would wipe the
+      // resource-scoped observational memory its sibling threads depend on, so
+      // guard on the pre-attempt transcript state before probing the row.
+      if (!threadHadMessages) return;
       const persistedThread = await memoryStore.getThreadById({ threadId: coordinate.threadId });
       if (persistedThread && (await memoryStore.hasMessages({ threadId: coordinate.threadId }))) return;
       await this.retractObservationalMemoryForCoordinates(memoryStore, [coordinate]);
@@ -1006,6 +1013,11 @@ export class Memory extends MastraMemory {
       thread?.resourceId && memoryStore.supportsObservationalMemory && !atomicRetraction
         ? { threadId, resourceId: thread.resourceId }
         : undefined;
+    // Snapshot whether the transcript held messages before the delete attempt.
+    // A non-atomic adapter cascades message deletes before the thread row, so a
+    // rejection reconciler needs this to tell a committed cascade apart from a
+    // thread that simply never had messages.
+    const threadHadMessages = fallbackCoordinate ? await memoryStore.hasMessages({ threadId }) : false;
     const receipts: ObservationalMemoryRetractionReceipt[] = [];
     try {
       await memoryStore.deleteThread({
@@ -1014,7 +1026,7 @@ export class Memory extends MastraMemory {
       });
     } catch (error) {
       if (fallbackCoordinate) {
-        await this.reconcileRejectedNonAtomicThreadDeletion(memoryStore, fallbackCoordinate);
+        await this.reconcileRejectedNonAtomicThreadDeletion(memoryStore, fallbackCoordinate, threadHadMessages);
       }
       throw error;
     } finally {

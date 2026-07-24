@@ -150,6 +150,22 @@ export interface MastraModelGatewayInterface {
    * the gateway identity so subclasses are safe by default.
    */
   serializeForSpan?(): { id: string; name: string } & Record<string, unknown>;
+
+  /**
+   * Which `providerOptions` bag carries this gateway's OpenAI-shape transport
+   * and websocket configuration. `'azure'` gateways read `providerOptions.azure`;
+   * everything else defaults to `providerOptions.openai`. Declared here rather
+   * than inferred from the gateway id so a custom-namespaced gateway keeps its
+   * transport wiring.
+   */
+  readonly transportProviderOptionsKey?: 'openai' | 'azure';
+
+  /**
+   * Whether this gateway natively drives the Responses API WebSocket transport,
+   * independent of the models.dev per-provider allowlist. When `true` the router
+   * honours a requested websocket transport regardless of the gateway id.
+   */
+  readonly ownsResponsesWebSocketTransport?: boolean;
 }
 
 export abstract class MastraModelGateway implements MastraModelGatewayInterface {

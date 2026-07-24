@@ -3144,6 +3144,94 @@ describe('Memory', () => {
       await expect(memoryStore.getThreadById({ threadId })).resolves.toMatchObject({ id: threadId });
     });
 
+    it("does not clear a resource's shared observational memory when a rejected non-atomic deletion targets an empty sibling thread", async () => {
+      const { memory, memoryStore, resourceId, threadId } =
+        await createMemoryWithDerivedObservationState('delete-thread-empty-sibling');
+      Object.defineProperty(memoryStore, 'supportsAtomicObservationalMemoryRetraction', {
+        configurable: true,
+        value: false,
+      });
+      // A second thread on the same resource that never held a message. It
+      // contributes nothing to synthesis, but shares the resource-scoped
+      // observational memory the first thread derived.
+      const emptySiblingThreadId = `${threadId}-empty-sibling`;
+      await memoryStore.saveThread({
+        thread: {
+          id: emptySiblingThreadId,
+          resourceId,
+          title: 'Empty sibling',
+          metadata: {},
+          createdAt: new Date('2026-01-02T00:00:00.000Z'),
+          updatedAt: new Date('2026-01-02T00:00:00.000Z'),
+        },
+      });
+      // The delete is rejected before committing any part of the cascade, and
+      // an empty thread's post-rejection state (thread present, no messages) is
+      // indistinguishable from a committed cascade unless the pre-attempt
+      // transcript state was captured.
+      vi.spyOn(memoryStore, 'deleteThread').mockRejectedValueOnce(new Error('delete empty sibling failed'));
+
+      await expect(memory.deleteThread(emptySiblingThreadId)).rejects.toThrow('delete empty sibling failed');
+
+      // Nothing committed, so the resource-scoped and first-thread observational
+      // memory the sibling shares must survive intact.
+      await expect(memoryStore.getObservationalMemory(null, resourceId)).resolves.not.toBeNull();
+      await expect(memoryStore.getObservationalMemory(threadId, resourceId)).resolves.not.toBeNull();
+      await expect(memoryStore.getResourceById({ resourceId })).resolves.toMatchObject({
+        workingMemory: '{"privateFact":"ZEPHYR-9"}',
+      });
+    });
+
+    it("does not clear a resource's shared observational memory when a rejected non-atomic deletion commits an empty sibling thread's row", async () => {
+      const { memory, memoryStore, resourceId, threadId } = await createMemoryWithDerivedObservationState(
+        'delete-thread-empty-sibling-committed',
+      );
+      Object.defineProperty(memoryStore, 'supportsAtomicObservationalMemoryRetraction', {
+        configurable: true,
+        value: false,
+      });
+      const emptySiblingThreadId = `${threadId}-empty-sibling`;
+      await memoryStore.saveThread({
+        thread: {
+          id: emptySiblingThreadId,
+          resourceId,
+          title: 'Empty sibling',
+          metadata: {},
+          createdAt: new Date('2026-01-02T00:00:00.000Z'),
+          updatedAt: new Date('2026-01-02T00:00:00.000Z'),
+        },
+      });
+      // Simulate a genuine non-atomic adapter: it commits the empty thread's row
+      // deletion but cannot retract observational memory (that is deferred to the
+      // Memory class), then rejects. Post-rejection the row is gone
+      // (getThreadById === null) while the OM store is untouched. The reconciler
+      // must still skip retraction: an empty thread committed nothing to
+      // synthesis, so the resource-scoped memory its siblings share must not be
+      // wiped just because its row is gone.
+      let deleteCommitted = false;
+      const realGetThreadById = memoryStore.getThreadById.bind(memoryStore);
+      vi.spyOn(memoryStore, 'getThreadById').mockImplementation(async arg => {
+        if (arg.threadId === emptySiblingThreadId && deleteCommitted) return null;
+        return realGetThreadById(arg);
+      });
+      vi.spyOn(memoryStore, 'deleteThread').mockImplementationOnce(async () => {
+        deleteCommitted = true;
+        throw new Error('post-commit empty sibling deletion failure');
+      });
+
+      await expect(memory.deleteThread(emptySiblingThreadId)).rejects.toThrow(
+        'post-commit empty sibling deletion failure',
+      );
+
+      // The empty sibling's row is gone, but the shared observational memory must survive.
+      await expect(memoryStore.getThreadById({ threadId: emptySiblingThreadId })).resolves.toBeNull();
+      await expect(memoryStore.getObservationalMemory(null, resourceId)).resolves.not.toBeNull();
+      await expect(memoryStore.getObservationalMemory(threadId, resourceId)).resolves.not.toBeNull();
+      await expect(memoryStore.getResourceById({ resourceId })).resolves.toMatchObject({
+        workingMemory: '{"privateFact":"ZEPHYR-9"}',
+      });
+    });
+
     it('retracts derived observational state as part of deleting a thread', async () => {
       const { memory, memoryStore, resourceId, threadId } =
         await createMemoryWithDerivedObservationState('delete-thread');
