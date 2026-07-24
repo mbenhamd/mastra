@@ -6,7 +6,6 @@ import type { MastraLanguageModel } from '../../../../llm/model/shared.types';
 import { runStreamCompletionScorers } from '../../../../loop/network/validation';
 import type { StreamCompletionContext } from '../../../../loop/network/validation';
 import { createProcessorSendSignal } from '../../../../processors/send-signal';
-import { RequestContext } from '../../../../request-context';
 import type { ChunkType, GoalEvaluationActivity } from '../../../../stream/types';
 import { ChunkFrom } from '../../../../stream/types';
 import { PUBSUB_SYMBOL } from '../../../../workflows/constants';
@@ -25,6 +24,7 @@ import { MessageList } from '../../../message-list';
 import type { ToolsInput } from '../../../types';
 import { globalRunRegistry } from '../../run-registry';
 import { emitChunkEvent } from '../../stream-adapter';
+import { resolveDurableRequestContext } from '../shared';
 
 function isWorkingMemoryTool(name: string): boolean {
   return name === 'updateWorkingMemory' || name === 'setWorkingMemory' || name === 'update-working-memory';
@@ -129,6 +129,7 @@ export function createDurableGoalStep() {
         lastStepResult?: { isContinued?: boolean; reason?: string };
         options?: { maxSteps?: number };
         backgroundTaskPending?: boolean;
+        terminalToolResult?: unknown;
       };
       if (state.lastStepResult?.reason === 'error') return state;
 
@@ -139,6 +140,8 @@ export function createDurableGoalStep() {
         state?: { threadId?: string; resourceId?: string };
         requestContextEntries?: Record<string, unknown>;
       };
+
+      if (state.terminalToolResult) return state;
 
       const registryEntry = globalRunRegistry.get(state.runId);
       // This is shared agent configuration (judge, scorer, tools, defaults), not per-goal state.
@@ -169,13 +172,13 @@ export function createDurableGoalStep() {
       const threadId = initData.state?.threadId;
       const resourceId = initData.state?.resourceId;
 
-      // Reconstruct requestContext from serialized entries for resolvers.
-      const requestContext = new RequestContext();
-      if (initData.requestContextEntries) {
-        for (const [key, value] of Object.entries(initData.requestContextEntries)) {
-          requestContext.set(key, value);
-        }
-      }
+      // The live registry context preserves warm-run parity for dynamic goal
+      // resolvers and scorers. Cold recovery sees only the explicitly
+      // allowlisted entries serialized in workflow input.
+      const { requestContext, customContext } = resolveDurableRequestContext(
+        registryEntry?.requestContext,
+        initData.requestContextEntries,
+      );
 
       const store = (await resolveGoalStore(mastra as any)) as ResolvedGoalStore | undefined;
       const record = await readObjective(store, resourceId, threadId);
@@ -366,7 +369,7 @@ export function createDurableGoalStep() {
           runId: state.runId,
           threadId,
           resourceId: initData.state?.resourceId,
-          customContext: initData.requestContextEntries,
+          customContext,
         };
 
         // Emit a pending chunk so consumers can show a loading indicator.

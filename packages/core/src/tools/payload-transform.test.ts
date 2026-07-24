@@ -3,11 +3,37 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   getTransformedToolPayload,
   normalizeToolPayloadTransformPolicy,
+  toolPayloadTransformAllowsTerminalToolResult,
   transformToolPayloadForTargets,
   withToolPayloadTransformMetadata,
 } from './payload-transform';
 
 describe('tool payload transform', () => {
+  it('allows terminal delivery only for an explicitly opted-in display-only policy', () => {
+    expect(toolPayloadTransformAllowsTerminalToolResult(undefined)).toBe(true);
+    expect(toolPayloadTransformAllowsTerminalToolResult(undefined, true)).toBe(false);
+    expect(
+      toolPayloadTransformAllowsTerminalToolResult({
+        targets: ['display'],
+        terminalToolResultPolicy: 'pass-through',
+        transformToolPayload: () => ({ redacted: true }),
+      }),
+    ).toBe(true);
+    expect(
+      toolPayloadTransformAllowsTerminalToolResult({
+        targets: ['display', 'transcript'],
+        terminalToolResultPolicy: 'pass-through',
+        transformToolPayload: () => ({ redacted: true }),
+      }),
+    ).toBe(false);
+    expect(
+      toolPayloadTransformAllowsTerminalToolResult({
+        targets: ['display'],
+        transformToolPayload: () => ({ redacted: true }),
+      }),
+    ).toBe(false);
+  });
+
   it('keeps payloads untransformed when no policy is configured', async () => {
     const transform = await transformToolPayloadForTargets(
       {

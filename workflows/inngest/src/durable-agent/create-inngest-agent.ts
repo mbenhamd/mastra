@@ -44,8 +44,16 @@ import {
   runDurableStreamUntilIdle,
   runResumeDurableStreamUntilIdle,
   globalRunRegistry,
+  TOOL_PERMISSION_POLICY_KEY,
+  TOOL_PERMISSION_POLICY_REQUIRED_KEY,
+  snapshotDurableRequestContextEntries,
 } from '@mastra/core/agent/durable';
-import type { AgentStepFinishEventData, AgentSuspendedEventData, RunRegistryEntry } from '@mastra/core/agent/durable';
+import type {
+  AgentStepFinishEventData,
+  AgentSuspendedEventData,
+  DurableToolPermissionResolver,
+  RunRegistryEntry,
+} from '@mastra/core/agent/durable';
 import type { MessageListInput } from '@mastra/core/agent/message-list';
 import { InMemoryServerCache } from '@mastra/core/cache';
 import type { MastraServerCache } from '@mastra/core/cache';
@@ -59,6 +67,7 @@ import type { Workflow } from '@mastra/core/workflows';
 import type { Inngest } from 'inngest';
 
 import { InngestPubSub } from '../pubsub';
+import type { InngestRun } from '../run';
 import { INNGEST_WORKFLOW_LIFECYCLE_REPLAY, InngestWorkflow } from '../workflow';
 import {
   createInngestDurableAgenticWorkflow,
@@ -118,7 +127,22 @@ export interface CreateInngestAgentOptions {
    * reference automatically.
    */
   mastra?: Mastra;
+  /**
+   * Resolve the current tool permission on the worker that executes the
+   * durable action. Configure this when policy must survive Inngest replay or
+   * process loss. The resolver function itself is never serialized; it should
+   * use durable identifiers from `requestContext` to load current policy.
+   */
+  resolveToolPermission?: InngestToolPermissionResolver;
+  /**
+   * Application RequestContext keys that may be copied into durable workflow
+   * state. Values are bounded JSON snapshots; infrastructure/credential keys
+   * are rejected. Use references such as session or project IDs, not secrets.
+   */
+  durableRequestContextKeys?: readonly string[];
 }
+
+export type InngestToolPermissionResolver = DurableToolPermissionResolver;
 
 /**
  * Options for InngestAgent.stream().
@@ -270,6 +294,22 @@ export interface InngestAgentStreamResult<OUTPUT = undefined> {
 export interface InngestAgentResumeOptions<OUTPUT = undefined> {
   threadId?: string;
   resourceId?: string;
+  /**
+   * Fresh context for this resume. JSON-safe entries replace matching values
+   * in the allowlisted subset of persisted workflow context. Unallowlisted and
+   * credential-like snapshot keys are removed. A `TOOL_PERMISSION_POLICY_KEY`
+   * function is never serialized; it only sets a durable policy-required
+   * marker. Configure `resolveToolPermission` on the agent to produce allow/ask
+   * decisions on a cold worker. Without a resolver, a required policy fails
+   * closed.
+   */
+  requestContext?: AgentExecutionOptions<OUTPUT>['requestContext'];
+  /**
+   * Monotonically require current policy resolution for this resume. Omit when
+   * the run has no host permission policy. There is intentionally no `false`
+   * form that could downgrade a persisted requirement.
+   */
+  requireToolPermissionPolicy?: true;
   onChunk?: (chunk: ChunkType<OUTPUT>) => void | Promise<void>;
   onStepFinish?: (result: AgentStepFinishEventData) => void | Promise<void>;
   onFinish?: MastraOnFinishCallback<OUTPUT>;
@@ -505,6 +545,8 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
     pubsub: customPubsub,
     cache,
     mastra: mastraOption,
+    resolveToolPermission,
+    durableRequestContextKeys,
   } = options;
 
   // Use provided id/name or fall back to agent.id/agent.name
@@ -526,7 +568,11 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
   // function tree without allowing one wrapper's transport/cache factory to
   // become the accidental owner for all durable agents.
   const workflowIds = createInngestDurableAgenticWorkflowIds(agentId);
-  const workflow = createInngestDurableAgenticWorkflow({ inngest, workflowIds });
+  const workflow = createInngestDurableAgenticWorkflow({
+    inngest,
+    workflowIds,
+    resolveToolPermission,
+  });
 
   // Track whether user provided a custom cache (if not, we'll inherit from mastra)
   let _customCache = cache;
@@ -653,6 +699,57 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
   }
 
   /**
+   * Make the worker resolver requirement part of the durable run contract.
+   * Protocol-v2 workers that receive this marker deny when the configured
+   * callback is unavailable. Versioned function IDs keep pre-v2 workers from
+   * claiming these events because those workers don't understand the marker.
+   */
+  function requireWorkerPermissionResolver(workflowInput: any): void {
+    if (!resolveToolPermission) return;
+    workflowInput.options = {
+      ...(workflowInput.options ?? {}),
+      permissionPolicyRequired: true,
+    };
+  }
+
+  /**
+   * Remove the live permission closure before Inngest event/storage transport.
+   * The JSON-safe marker is monotonic: a caller can require policy evaluation
+   * on resume, but cannot clear a requirement persisted by the original run.
+   */
+  function prepareResumeRequestContext(
+    input: RequestContext | undefined,
+    requireToolPermissionPolicy: true | undefined,
+    persistedEntries: unknown,
+  ): RequestContext | undefined {
+    const livePolicy = input?.get(TOOL_PERMISSION_POLICY_KEY);
+    const policyRequired =
+      resolveToolPermission !== undefined ||
+      requireToolPermissionPolicy === true ||
+      typeof livePolicy === 'function' ||
+      (persistedEntries !== null &&
+        typeof persistedEntries === 'object' &&
+        !Array.isArray(persistedEntries) &&
+        (persistedEntries as Record<string, unknown>)[TOOL_PERMISSION_POLICY_REQUIRED_KEY] === true);
+    const persistedDurableEntries = snapshotDurableRequestContextEntries(
+      requestContextFromEntries(persistedEntries),
+      durableRequestContextKeys,
+    );
+    const freshDurableEntries = snapshotDurableRequestContextEntries(input, durableRequestContextKeys);
+    const durableEntries = {
+      ...(persistedDurableEntries ?? {}),
+      ...(freshDurableEntries ?? {}),
+    };
+    if (Object.keys(durableEntries).length === 0 && !policyRequired) return undefined;
+
+    const transported = requestContextFromEntries(durableEntries);
+    if (policyRequired) {
+      transported.set(TOOL_PERMISSION_POLICY_REQUIRED_KEY, true);
+    }
+    return transported;
+  }
+
+  /**
    * Trigger the workflow through InngestRun so lifecycle identity is admitted
    * before dispatch and the event receives its deterministic dispatch ID.
    */
@@ -738,6 +835,7 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
         runId: streamOptions?.runId,
         requestContext: streamOptions?.requestContext,
         methodType: (streamOptions as any)?.__methodType ?? 'stream',
+        durableRequestContextKeys,
       });
 
       const { runId, messageId, workflowInput, registryEntry, threadId, resourceId } = preparation;
@@ -745,6 +843,7 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
       // Override agentId and agentName in workflowInput with the durable agent's values
       workflowInput.agentId = agentId;
       workflowInput.agentName = agentName;
+      requireWorkerPermissionResolver(workflowInput);
 
       // 1a. Install abort controller for this run. The controller is owned by
       // this InngestAgent instance; `result.abort()` flips it, the durable
@@ -1055,10 +1154,22 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
 
           // Find the suspended step from the snapshot
           const steps = Object.keys(snapshot.suspendedPaths ?? {});
-          const run = await admittedWorkflow.createRun({ runId, resourceId: resumeOptions?.resourceId });
+          const run = (await admittedWorkflow.createRun({
+            runId,
+            resourceId: resumeOptions?.resourceId,
+          })) as InngestRun;
           await run.resumeAsync({
             resumeData,
             step: steps,
+            requestContext: prepareResumeRequestContext(
+              resumeOptions?.requestContext,
+              resumeOptions?.requireToolPermissionPolicy,
+              snapshot.requestContext,
+            ),
+            // Generic workflows merge snapshot context. Durable agents replace
+            // it with the independently allowlisted snapshot/fresh subset above
+            // so pre-hardening snapshots can't reintroduce stored credentials.
+            __requestContextMode: 'replace',
           });
         })
         .catch(async error => {
@@ -1100,11 +1211,13 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
         messages,
         options: prepareOptions,
         requestContext: prepareOptions?.requestContext,
+        durableRequestContextKeys,
       });
 
       // Override with durable agent's id/name
       preparation.workflowInput.agentId = agentId;
       preparation.workflowInput.agentName = agentName;
+      requireWorkerPermissionResolver(preparation.workflowInput);
 
       return {
         runId: preparation.runId,

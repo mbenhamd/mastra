@@ -111,6 +111,12 @@ export interface AdmitWorkflowResumeInput extends WorkflowResumeFenceInput {
   operationReplayContext: WorkflowResumeOperationReplayContextV1;
   resourceId?: string;
   requestContext?: Record<string, unknown>;
+  /**
+   * Replace request context in both the admitted snapshot and its rollback
+   * checkpoint. Omit to preserve the generic workflow merge behavior.
+   * @internal Adapter security boundary only.
+   */
+  replaceRequestContext?: true;
 }
 
 export type AdmitWorkflowResumeResult =
@@ -1982,6 +1988,38 @@ export interface CreateReflectionGenerationInput {
   currentRecord: ObservationalMemoryRecord;
   reflection: string;
   tokenCount: number;
+}
+
+/**
+ * Identifies the exact Observational Memory generation that authorizes a
+ * derived-state write. Storage adapters use this as a compare-and-set fence so
+ * a cleared or superseded generation cannot repopulate working memory or
+ * thread metadata after an edit/delete retraction.
+ */
+export interface ObservationalMemoryWriteGuard {
+  recordId: string;
+  threadId: string | null;
+  resourceId: string;
+}
+
+export interface RetractObservationalMemoryInput {
+  resourceId: string;
+  threadId: string;
+}
+
+export interface RetractObservationalMemoryResult {
+  clearedScopes: Array<'resource' | 'thread'>;
+  clearedResourceWorkingMemory: boolean;
+  clearedThreadMetadata: boolean;
+}
+
+/**
+ * Reports retraction work committed by an authoritative storage mutation.
+ * @internal Used to clean external observation vectors only after commit.
+ */
+export interface ObservationalMemoryRetractionReceipt {
+  input: RetractObservationalMemoryInput;
+  result: RetractObservationalMemoryResult;
 }
 
 /**

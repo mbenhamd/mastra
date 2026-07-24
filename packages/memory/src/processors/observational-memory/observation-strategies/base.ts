@@ -44,6 +44,7 @@ export interface StrategyDeps {
     text: string;
     groupId: string;
     range: string;
+    recordId: string;
     threadId: string;
     resourceId: string;
     observedAt?: Date;
@@ -319,6 +320,7 @@ export abstract class ObservationStrategy {
           text: group.content,
           groupId: group.id,
           range: group.range,
+          recordId: this.opts.record.id,
           threadId,
           resourceId,
           observedAt,

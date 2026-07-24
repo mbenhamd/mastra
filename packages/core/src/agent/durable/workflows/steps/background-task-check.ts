@@ -78,10 +78,15 @@ export function createDurableBackgroundTaskCheckStep() {
         return typedInput;
       }
 
+      // Pending background work disqualifies a foreground terminal result.
+      // Its eventual output must remain observable and may require another
+      // provider turn after durable resume/replay.
+      const inputWithoutTerminal = { ...typedInput, terminalToolResult: undefined };
+
       // When the outer caller drives continuation externally (e.g. streamUntilIdle),
       // skip the in-loop wait. We still mark pending so ownstream knows.
       if (initData.options?.skipBgTaskWait) {
-        return { ...typedInput, backgroundTaskPending: true };
+        return { ...inputWithoutTerminal, backgroundTaskPending: true };
       }
 
       const taskIds = runningTasks.map(task => task.id);
@@ -112,7 +117,7 @@ export function createDurableBackgroundTaskCheckStep() {
       // but only when the caller provided an explicit timeout (meaning
       // they'll drive continuation externally).
       if (retryCount === 0 && waitTimeoutMs) {
-        return { ...typedInput, backgroundTaskPending: true };
+        return { ...inputWithoutTerminal, backgroundTaskPending: true };
       }
 
       // Use configured timeout, or default to 1 s so the workflow stays
@@ -149,22 +154,22 @@ export function createDurableBackgroundTaskCheckStep() {
           progressIntervalMs: 3000,
         });
       } catch {
-        // Timeout elapsed — no task completed. Return unchanged so the loop can end.
-        // The tasks keep running in the background — results are picked up on
-        // the next user message or stream.
-        return typedInput;
+        // Timeout elapsed — no task completed. Keep the pending marker while
+        // leaving isContinued unchanged so this foreground loop can end
+        // without misreporting the still-running background work.
+        return { ...inputWithoutTerminal, backgroundTaskPending: true };
       }
 
       // A task completed — force the loop to continue so the LLM processes the result
       if (typedInput.stepResult) {
         return {
-          ...typedInput,
+          ...inputWithoutTerminal,
           backgroundTaskPending: true,
           stepResult: { ...typedInput.stepResult, isContinued: true },
         };
       }
 
-      return { ...typedInput, backgroundTaskPending: true };
+      return { ...inputWithoutTerminal, backgroundTaskPending: true };
     },
   });
 }

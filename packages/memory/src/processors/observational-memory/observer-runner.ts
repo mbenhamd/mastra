@@ -224,6 +224,7 @@ export class ObserverRunner {
   }> {
     const inputTokens = this.tokenCounter.countMessages(messagesToObserve);
     const resolvedModel = options?.model ? { model: options.model } : this.resolveModel(inputTokens);
+    const extractorResolutionFailures: Array<{ slug: string; error: string }> = [];
     const activeExtractors = await resolveExtractors(
       filterObserverExtractors(this.observationConfig.extractors, options?.skipContinuationHints),
       {
@@ -234,6 +235,7 @@ export class ObserverRunner {
         memory: this.memory,
         requestContext: options?.requestContext,
       },
+      failure => extractorResolutionFailures.push(failure),
     );
     const structuredExtractors = activeExtractors.filter(extractor => extractor.mode === 'structured');
     const temporaryMemory =
@@ -261,7 +263,7 @@ export class ObserverRunner {
 
     const doGenerate = async () => {
       return withRetry(
-        () =>
+        operationAbortSignal =>
           withOmTracingSpan({
             phase: 'observer',
             model: resolvedModel.model,
@@ -282,15 +284,17 @@ export class ObserverRunner {
             callback: childObservabilityContext =>
               this.withAbortCheck(async () => {
                 const streamResult = await agent.stream(observerMessages, {
-                  modelSettings: { ...this.observationConfig.modelSettings },
+                  // OM owns the bounded transport retry budget around this call.
+                  // Disable the model layer retry to avoid multiplying attempts.
+                  modelSettings: { ...this.observationConfig.modelSettings, maxRetries: 0 },
                   providerOptions: this.observationConfig.providerOptions as any,
                   ...(temporaryMemory ? { memory: temporaryMemory.options } : {}),
-                  ...(abortSignal ? { abortSignal } : {}),
+                  abortSignal: operationAbortSignal,
                   ...(internalRequestContext ? { requestContext: internalRequestContext } : {}),
                   ...childObservabilityContext,
                 });
                 return streamResult.getFullOutput();
-              }, abortSignal),
+              }, operationAbortSignal),
           }),
         { label: 'observer', abortSignal },
       );
@@ -317,12 +321,16 @@ export class ObserverRunner {
       extractors: activeExtractors,
       memory: temporaryMemory?.options,
       priorExtractedValues: options?.priorExtractedValues,
-      requestContext: options?.requestContext,
+      requestContext: internalRequestContext,
       observabilityContext: options?.observabilityContext,
       abortSignal,
     });
     const extractedValues = mergeExtractedValues(parsed.extractedValues, structuredExtraction.values);
-    const extractionFailures = mergeExtractionFailures(parsed.extractionFailures, structuredExtraction.failures);
+    const extractionFailures = mergeExtractionFailures(
+      extractorResolutionFailures,
+      parsed.extractionFailures,
+      structuredExtraction.failures,
+    );
     const builtIns = getBuiltInExtractedValues(extractedValues);
 
     const systemPrompt = buildObserverSystemPrompt(
@@ -382,6 +390,7 @@ export class ObserverRunner {
     >,
     observabilityContext?: ObservabilityContext,
     model?: ConcreteObservationModel,
+    resourceId?: string,
   ): Promise<{
     results: Map<
       string,
@@ -404,13 +413,22 @@ export class ObserverRunner {
     );
     const resolvedModel = model ? { model } : this.resolveModel(inputTokens);
     const firstThreadMessages = messagesByThread.get(threadOrder[0] ?? '') ?? [];
-    const activeExtractors = await resolveExtractors(this.observationConfig.extractors ?? [], {
-      source: 'observer',
-      threadId: threadOrder[0],
-      resourceId: firstThreadMessages[0]?.resourceId,
-      memory: this.memory,
-      requestContext,
-    });
+    const extractorResolutionFailures: Array<{ slug: string; error: string }> = [];
+    const activeExtractors = await resolveExtractors(
+      this.observationConfig.extractors ?? [],
+      {
+        source: 'observer',
+        threadId: threadOrder[0],
+        // The observe-level resource identity wins: resource-scoped batches
+        // may carry messages without per-row resourceId (standalone observe),
+        // and dropping it silently excluded resource-scoped extractors such as
+        // working-memory from the observer prompt.
+        resourceId: resourceId ?? firstThreadMessages[0]?.resourceId,
+        memory: this.memory,
+        requestContext,
+      },
+      failure => extractorResolutionFailures.push(failure),
+    );
     const structuredExtractors = activeExtractors.filter(extractor => extractor.mode === 'structured');
 
     if (structuredExtractors.length > 0) {
@@ -436,6 +454,10 @@ export class ObserverRunner {
           priorThreadTitle: priorMetadataByThread?.get(threadId)?.threadTitle,
           priorExtractedValues: priorMetadataByThread?.get(threadId)?.extracted,
           model: resolvedModel.model,
+          // The delegated single-thread call resolves extractors from its own
+          // context, so the observe-level resource identity must ride along or
+          // resource-scoped extractors (working-memory) silently drop again.
+          resourceId: resourceId ?? messagesByThread.get(threadId)?.[0]?.resourceId,
         });
         results.set(threadId, {
           observations: threadResult.observations,
@@ -487,7 +509,7 @@ export class ObserverRunner {
 
     const doGenerate = async () => {
       return withRetry(
-        () =>
+        operationAbortSignal =>
           withOmTracingSpan({
             phase: 'observer-multi-thread',
             model: resolvedModel.model,
@@ -507,15 +529,17 @@ export class ObserverRunner {
             callback: childObservabilityContext =>
               this.withAbortCheck(async () => {
                 const streamResult = await agent.stream(observerMessages, {
-                  modelSettings: { ...this.observationConfig.modelSettings },
+                  // OM owns the bounded transport retry budget around this call.
+                  // Disable the model layer retry to avoid multiplying attempts.
+                  modelSettings: { ...this.observationConfig.modelSettings, maxRetries: 0 },
                   providerOptions: this.observationConfig.providerOptions as any,
                   ...(temporaryMemory ? { memory: temporaryMemory.options } : {}),
-                  ...(abortSignal ? { abortSignal } : {}),
+                  abortSignal: operationAbortSignal,
                   ...(internalRequestContext ? { requestContext: internalRequestContext } : {}),
                   ...childObservabilityContext,
                 });
                 return streamResult.getFullOutput();
-              }, abortSignal),
+              }, operationAbortSignal),
           }),
         { label: 'observer-multi-thread', abortSignal },
       );
@@ -544,6 +568,7 @@ export class ObserverRunner {
       ),
     );
     const aggregatedExtractionFailures = mergeExtractionFailures(
+      extractorResolutionFailures,
       ...Array.from(parsed.threads, ([threadId, threadResult]) =>
         mergeExtractionFailures(threadResult.extractionFailures, structuredExtractionByThread.get(threadId)?.failures),
       ),
@@ -597,6 +622,7 @@ export class ObserverRunner {
       const structuredExtraction = structuredExtractionByThread.get(threadId);
       const extractedValues = mergeExtractedValues(threadResult.extractedValues, structuredExtraction?.values);
       const extractionFailures = mergeExtractionFailures(
+        extractorResolutionFailures,
         threadResult.extractionFailures,
         structuredExtraction?.failures,
       );
@@ -615,7 +641,10 @@ export class ObserverRunner {
     // Add empty results for threads that didn't get output
     for (const threadId of threadOrder) {
       if (!results.has(threadId)) {
-        results.set(threadId, { observations: '' });
+        results.set(threadId, {
+          observations: '',
+          extractionFailures: mergeExtractionFailures(extractorResolutionFailures),
+        });
       }
     }
 

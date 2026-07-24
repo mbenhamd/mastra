@@ -16,6 +16,7 @@ import { MockLanguageModelV2, convertArrayToReadableStream } from '@internal/ai-
 import { describe, it, expect, vi } from 'vitest';
 import { InMemoryServerCache } from '../../../cache/inmemory';
 import { Mastra } from '../../../mastra';
+import { RequestContext } from '../../../request-context';
 import { Agent } from '../../agent';
 import { isDurableAgentLike } from '../../types';
 import { isDurableAgent } from '../create-durable-agent';
@@ -105,6 +106,61 @@ describe('AgentConfig.durable', () => {
     expect(registered.cache).toBe(cache);
     expect(registered.maxSteps).toBe(3);
     expect(registered.cleanupTimeoutMs).toBe(5_000);
+  });
+
+  it('forwards durable RequestContext allowlists for registered and standalone agents', async () => {
+    const requestContext = new RequestContext();
+    requestContext.set('principalRef', { id: 'principal-1' });
+    requestContext.set('credentials', { accessToken: 'must-not-persist' });
+
+    const registeredRaw = new Agent({
+      id: 'registered-context',
+      name: 'Registered Context',
+      instructions: 'test',
+      model: makeMockModel(),
+      durable: { durableRequestContextKeys: ['principalRef'] },
+    });
+    const mastra = new Mastra({ agents: { registeredContext: registeredRaw as any } });
+    const registered = mastra.getAgent('registeredContext' as any) as unknown as DurableAgent;
+    const registeredPrepared = await registered.prepare('hello', { requestContext });
+    expect(registeredPrepared.workflowInput.requestContextEntries).toEqual({
+      principalRef: { id: 'principal-1' },
+    });
+    registeredPrepared.cleanup();
+
+    const registeredFork = registered.__fork() as unknown as DurableAgent;
+    const forkPrepared = await registeredFork.prepare('hello', { requestContext });
+    expect(forkPrepared.workflowInput.requestContextEntries).toEqual({
+      principalRef: { id: 'principal-1' },
+    });
+    forkPrepared.cleanup();
+
+    const standalone = new Agent({
+      id: 'standalone-context',
+      name: 'Standalone Context',
+      instructions: 'test',
+      model: makeMockModel(),
+      durable: { durableRequestContextKeys: ['principalRef'] },
+    });
+    let standaloneEntries: Record<string, unknown> | undefined;
+    const { DurableAgent } = await import('../durable-agent');
+    const spy = vi.spyOn(DurableAgent.prototype as any, 'stream').mockImplementation(async function (
+      this: DurableAgent,
+      messages: Parameters<DurableAgent['prepare']>[0],
+      options: Parameters<DurableAgent['prepare']>[1],
+    ) {
+      const prepared = await this.prepare(messages, options);
+      standaloneEntries = prepared.workflowInput.requestContextEntries;
+      prepared.cleanup();
+      return 'durable-result';
+    });
+
+    try {
+      await standalone.stream('hello', { requestContext });
+      expect(standaloneEntries).toEqual({ principalRef: { id: 'principal-1' } });
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it('does not wrap when `durable` is unset or falsy', () => {

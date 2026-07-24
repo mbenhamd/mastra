@@ -49,6 +49,25 @@ export function normalizeToolPayloadTransformPolicy(
   return undefined;
 }
 
+/**
+ * Direct terminal delivery may coexist with an explicitly opted-in,
+ * display-only transform. Such a transform can redact observability payloads
+ * but cannot alter the transcript or the terminalResult projection. A durable
+ * transform shadow without its live policy closure fails closed.
+ */
+export function toolPayloadTransformAllowsTerminalToolResult(
+  policy: ToolPayloadTransformPolicy | undefined,
+  serializedTransformConfigured = false,
+): boolean {
+  if (!policy) return !serializedTransformConfigured;
+  return (
+    policy.terminalToolResultPolicy === 'pass-through' &&
+    Array.isArray(policy.targets) &&
+    policy.targets.length > 0 &&
+    policy.targets.every(target => target === 'display')
+  );
+}
+
 const PHASE_TO_TOOL_TRANSFORMER: Record<ToolPayloadTransformPhase, keyof NonNullable<ToolPayloadTransform['display']>> =
   {
     'input-delta': 'inputDelta',

@@ -24,9 +24,35 @@ import { buildFakeOutput } from './__test-utils__/fake-output';
 import type { HarnessEvent } from './events';
 import { Harness } from './harness';
 import { createSpawnSubagentTool, SPAWN_SUBAGENT_TOOL_ID } from './spawn-subagent-tool';
+import {
+  HARNESS_SUBAGENT_OUTCOME_REPORT_KIND,
+  HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID,
+  MAX_HARNESS_SUBAGENT_EVENT_TEXT_BYTES,
+  MAX_HARNESS_SUBAGENT_RESULT_TEXT_BYTES,
+} from './terminal-subagent-result';
+
+function outcomeTerminalResult(summary = 'child-result') {
+  return {
+    status: 'success' as const,
+    items: [
+      {
+        toolName: HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID,
+        toolCallId: 'report-subagent-outcome-1',
+        status: 'success' as const,
+        value: {
+          kind: HARNESS_SUBAGENT_OUTCOME_REPORT_KIND,
+          outcome: 'completed' as const,
+          summary,
+          evidence: [{ kind: 'analysis' as const, description: 'Verified by the inline subagent fixture.' }],
+        },
+      },
+    ],
+  };
+}
 
 class FakeAgent extends Agent<any, any, any> {
   chunks: any[] = [];
+  streamCalls = 0;
   fullOutput: any = {
     text: 'child-result',
     usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
@@ -52,6 +78,7 @@ class FakeAgent extends Agent<any, any, any> {
     suspendPayload: undefined,
     messages: [],
     rememberedMessages: [],
+    terminalToolResult: outcomeTerminalResult(),
   };
 
   constructor(name: string) {
@@ -59,6 +86,7 @@ class FakeAgent extends Agent<any, any, any> {
   }
 
   async stream(_messages: any, options?: any): Promise<any> {
+    this.streamCalls += 1;
     const out = buildFakeOutput({
       runId: options?.runId ?? this.fullOutput.runId,
       fullOutput: this.fullOutput,
@@ -77,7 +105,13 @@ class FakeAgent extends Agent<any, any, any> {
   }
 }
 
-function setup(opts?: { maxDepth?: number; maxConcurrent?: number; chunks?: any[] }) {
+function setup(opts?: {
+  maxDepth?: number;
+  maxConcurrent?: number;
+  closeTimeoutMs?: number;
+  chunks?: any[];
+  allowInline?: boolean;
+}) {
   const parentAgent = new FakeAgent('parent-agent');
   const childAgent = new FakeAgent('child-agent');
   if (opts?.chunks) childAgent.chunks = opts.chunks;
@@ -89,7 +123,7 @@ function setup(opts?: { maxDepth?: number; maxConcurrent?: number; chunks?: any[
       { id: 'explore-mode', agentId: 'child-agent' },
     ],
     defaultModeId: 'default',
-    sessions: { storage },
+    sessions: { storage, ...(opts?.closeTimeoutMs !== undefined ? { closeTimeoutMs: opts.closeTimeoutMs } : {}) },
     subagents: {
       maxDepth: opts?.maxDepth ?? 2,
       ...(opts?.maxConcurrent !== undefined ? { maxConcurrent: opts.maxConcurrent } : {}),
@@ -100,6 +134,7 @@ function setup(opts?: { maxDepth?: number; maxConcurrent?: number; chunks?: any[
           description: 'Read-only codebase exploration',
           defaultModelId: 'openai/gpt-4o-mini',
           workspace: 'inherit',
+          ...(opts?.allowInline !== undefined ? { allowInline: opts.allowInline } : {}),
         },
       },
     },
@@ -120,6 +155,10 @@ function execCtx(toolCallId = 'tc-1') {
 }
 
 describe('spawn_subagent tool — registration', () => {
+  it('rejects a non-boolean allowInline boundary', () => {
+    expect(() => setup({ allowInline: 'sometimes' as never })).toThrow(/allowInline/);
+  });
+
   it('is undefined when no subagent types are configured', async () => {
     const storage = new InMemoryHarness({ db: new InMemoryDB() });
     const agent = new FakeAgent('parent-agent');
@@ -140,6 +179,16 @@ describe('spawn_subagent tool — registration', () => {
     const tool = createSpawnSubagentTool(session);
     expect(tool).toBeDefined();
     expect(tool!.id).toBe(SPAWN_SUBAGENT_TOOL_ID);
+    expect(tool!.terminalResult).toBeDefined();
+  });
+
+  it('omits durable-only types from the inline schema while retaining them for delegation', async () => {
+    const { harness } = setup({ allowInline: false });
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    expect(createSpawnSubagentTool(session)).toBeUndefined();
+    expect(harness._listSubagentTypeIds({ invocation: 'inline' })).toEqual([]);
+    expect(harness._listSubagentTypeIds({ invocation: 'delegated' })).toEqual(['explore']);
   });
 });
 
@@ -180,7 +229,11 @@ describe('spawn_subagent tool — execution', () => {
 
   it('creates a fresh child session and returns subagentSessionId + result', async () => {
     const { harness, childAgent } = setup();
-    childAgent.fullOutput = { ...childAgent.fullOutput, text: 'child says hi' };
+    childAgent.fullOutput = {
+      ...childAgent.fullOutput,
+      text: 'child says hi',
+      terminalToolResult: outcomeTerminalResult('child says hi'),
+    };
 
     const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
     const tool = createSpawnSubagentTool(parent)!;
@@ -190,6 +243,107 @@ describe('spawn_subagent tool — execution', () => {
     expect(typeof result.subagentSessionId).toBe('string');
     expect(result.subagentSessionId).not.toBe(parent.id);
     expect(result.subagentSessionId.length).toBeGreaterThan(0);
+    const terminalContext = {
+      toolName: SPAWN_SUBAGENT_TOOL_ID,
+      toolCallId: 'tc-1',
+      args: { delivery: 'final' },
+      batchSize: 1,
+      batchIndex: 0,
+      runId: 'run-1',
+      abortSignal: new AbortController().signal,
+    };
+    expect(await tool.terminalResult!.isSuccess(result, terminalContext)).toBe(true);
+    expect(await tool.terminalResult!.project!(result, terminalContext)).toEqual({
+      kind: 'subagent-direct-answer',
+      subagentSessionId: result.subagentSessionId,
+      text: 'child says hi',
+    });
+    expect(
+      await tool.terminalResult!.isSuccess(result, {
+        ...terminalContext,
+        args: {},
+      }),
+    ).toBe(false);
+  });
+
+  it('treats every resolved non-stop child finish reason as incomplete, never as direct success', async () => {
+    const { harness, childAgent } = setup();
+    childAgent.fullOutput = {
+      ...childAgent.fullOutput,
+      finishReason: 'length',
+      text: 'partial answer cut off by the provider',
+      terminalToolResult: undefined,
+    };
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      const events: HarnessEvent[] = [];
+      parent.subscribe(event => events.push(event));
+      const tool = createSpawnSubagentTool(parent)!;
+      const output = (await tool.execute!(
+        { agentType: 'explore', task: 'produce a complete answer', delivery: 'final' },
+        execCtx('tc-incomplete-child'),
+      )) as any;
+      const terminalContext = {
+        toolName: SPAWN_SUBAGENT_TOOL_ID,
+        toolCallId: 'tc-incomplete-child',
+        args: { delivery: 'final' },
+        batchSize: 1,
+        batchIndex: 0,
+        runId: 'run-1',
+        abortSignal: new AbortController().signal,
+      };
+
+      expect(output).toMatchObject({
+        isError: true,
+        result: {
+          status: 'error',
+          finishReason: 'length',
+          error: {
+            code: 'harness.subagent_incomplete',
+          },
+        },
+      });
+      expect(await tool.terminalResult!.isSuccess(output, terminalContext)).toBe(false);
+      expect(events.find(event => event.type === 'subagent_end')).toMatchObject({
+        type: 'subagent_end',
+        isError: true,
+        output: {
+          status: 'error',
+          finishReason: 'length',
+        },
+      });
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('rejects a bare provider stop without the framework-owned semantic outcome report', async () => {
+    const { harness, childAgent } = setup();
+    childAgent.fullOutput = {
+      ...childAgent.fullOutput,
+      finishReason: 'stop',
+      text: 'I edited the source and compilation succeeded.',
+      terminalToolResult: undefined,
+    };
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      const tool = createSpawnSubagentTool(parent)!;
+      const output = (await tool.execute!(
+        { agentType: 'explore', task: 'repair and compile the project', delivery: 'final' },
+        execCtx('tc-missing-outcome'),
+      )) as any;
+
+      expect(output).toMatchObject({
+        isError: true,
+        result: {
+          status: 'error',
+          finishReason: 'stop',
+          error: { code: 'harness.subagent_outcome_missing' },
+        },
+      });
+    } finally {
+      await harness.shutdown();
+    }
   });
 
   it('emits subagent_start + subagent_end on the parent session', async () => {
@@ -217,6 +371,120 @@ describe('spawn_subagent tool — execution', () => {
     expect(typeof (end as any).durationMs).toBe('number');
   });
 
+  it('returns and emits only a bounded child summary, never raw FullOutput internals', async () => {
+    const { harness, childAgent } = setup();
+    const secret = 'PF_RAW_CHILD_COMPILE_LOG_SECRET_7f0f6f';
+    const multiMegabyteCompileLog = `${'compiler output '.repeat(160_000)}${secret}`;
+    childAgent.fullOutput = {
+      ...childAgent.fullOutput,
+      text: 'The child completed the repair.',
+      terminalToolResult: outcomeTerminalResult('The child completed the repair.'),
+      steps: [{ providerMetadata: { privateCompileLog: multiMegabyteCompileLog } }],
+      toolCalls: [{ toolName: 'compileLatex', args: { source: multiMegabyteCompileLog } }],
+      toolResults: [{ toolName: 'compileLatex', result: { log: multiMegabyteCompileLog } }],
+      providerMetadata: { privateCompileLog: multiMegabyteCompileLog },
+      messages: [{ role: 'tool', content: multiMegabyteCompileLog }],
+      totalUsage: {
+        inputTokens: 12_345,
+        outputTokens: 678,
+        totalTokens: 13_023,
+        cachedInputTokens: 10_000,
+        raw: { privateCompileLog: multiMegabyteCompileLog },
+      },
+    };
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      const events: HarnessEvent[] = [];
+      parent.subscribe(event => events.push(event));
+      const tool = createSpawnSubagentTool(parent)!;
+
+      const output = (await tool.execute!(
+        { agentType: 'explore', task: 'diagnose and repair the LaTeX project' },
+        execCtx('tc-bounded-child'),
+      )) as any;
+      const end = events.find(event => event.type === 'subagent_end') as any;
+      const serializedToolOutput = JSON.stringify(output);
+      const serializedEndOutput = JSON.stringify(end?.output);
+
+      expect(output.result).toEqual({
+        status: 'success',
+        outcome: 'completed',
+        text: 'The child completed the repair.',
+        textTruncated: false,
+        finishReason: 'stop',
+        stepCount: 1,
+        toolCallCount: 1,
+        toolResultCount: 1,
+        usage: {
+          inputTokens: 12_345,
+          outputTokens: 678,
+          totalTokens: 13_023,
+          cachedInputTokens: 10_000,
+        },
+        evidence: [{ kind: 'analysis', description: 'Verified by the inline subagent fixture.' }],
+      });
+      expect(end?.output).toEqual(output.result);
+      expect(serializedToolOutput).not.toContain(secret);
+      expect(serializedEndOutput).not.toContain(secret);
+      expect(serializedToolOutput).not.toContain('privateCompileLog');
+      expect(serializedToolOutput).not.toContain('providerMetadata');
+      expect(Buffer.byteLength(serializedToolOutput, 'utf8')).toBeLessThan(64 * 1024);
+      expect(Buffer.byteLength(serializedEndOutput, 'utf8')).toBeLessThan(64 * 1024);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('UTF-8 truncates oversized child text and refuses partial direct delivery', async () => {
+    const { harness, childAgent } = setup();
+    childAgent.fullOutput = {
+      ...childAgent.fullOutput,
+      text: '\ud83e\uddea'.repeat(20_000),
+      terminalToolResult: outcomeTerminalResult('\ud83e\uddea'.repeat(20_000)),
+    };
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      const events: HarnessEvent[] = [];
+      parent.subscribe(event => events.push(event));
+      const tool = createSpawnSubagentTool(parent)!;
+      const output = (await tool.execute!(
+        { agentType: 'explore', task: 'return an intentionally huge report', delivery: 'final' },
+        execCtx('tc-truncated-child'),
+      )) as any;
+      const terminalContext = {
+        toolName: SPAWN_SUBAGENT_TOOL_ID,
+        toolCallId: 'tc-truncated-child',
+        args: { delivery: 'final' },
+        batchSize: 1,
+        batchIndex: 0,
+        runId: 'run-1',
+        abortSignal: new AbortController().signal,
+      };
+
+      expect(output.result.status).toBe('error');
+      expect(output.result.error.code).toBe('harness.subagent_outcome_missing');
+      expect(output.result.textTruncated).toBe(true);
+      expect(output.result.text).toContain('[truncated by Harness]');
+      expect(output.result.text).not.toContain('\ufffd');
+      expect(new TextEncoder().encode(output.result.text).byteLength).toBeLessThanOrEqual(
+        MAX_HARNESS_SUBAGENT_RESULT_TEXT_BYTES,
+      );
+      expect(Buffer.byteLength(JSON.stringify(output), 'utf8')).toBeLessThan(64 * 1024);
+      expect(await tool.terminalResult!.isSuccess(output, terminalContext)).toBe(false);
+      const end = events.find(event => event.type === 'subagent_end');
+      expect(end?.type).toBe('subagent_end');
+      if (end?.type === 'subagent_end') {
+        expect(end.output.textTruncated).toBe(true);
+        expect(new TextEncoder().encode(end.output.text).byteLength).toBeLessThanOrEqual(
+          MAX_HARNESS_SUBAGENT_EVENT_TEXT_BYTES,
+        );
+        expect(Buffer.byteLength(JSON.stringify(end), 'utf8')).toBeLessThan(8 * 1024);
+      }
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
   it('clears _activeSubagents after the child completes', async () => {
     const { harness } = setup();
     const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
@@ -239,6 +507,137 @@ describe('spawn_subagent tool — execution', () => {
     const childId = result.subagentSessionId as string;
     const childRecord = await storage.loadSession({ sessionId: childId });
     expect(childRecord?.closedAt).toBeDefined();
+  });
+
+  it('does not await an ancestor close that is draining the inline tool itself', async () => {
+    const closeTimeoutMs = 1_000;
+    const { harness, storage } = setup({ closeTimeoutMs });
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const originalSession = harness.session.bind(harness);
+    let child!: Awaited<ReturnType<typeof harness.session>>;
+    let childMessageStarted!: () => void;
+    const childMessageSeen = new Promise<void>(resolve => {
+      childMessageStarted = resolve;
+    });
+    let releaseChildMessage!: () => void;
+    const childMessageGate = new Promise<void>(resolve => {
+      releaseChildMessage = resolve;
+    });
+
+    // Hold the inline child's terminal return across the ancestor close walk.
+    // This models a provider/tool turn finishing just after the user closes the
+    // chat. The parent reservation keeps the root drain busy until execute()
+    // returns, which is the exact cycle this regression protects.
+    (harness as any).session = async (opts: any) => {
+      const session = await originalSession(opts);
+      if (opts?.parentSessionId === parent.id) {
+        child = session;
+        (session as any).message = async () => {
+          childMessageStarted();
+          await childMessageGate;
+          return {
+            text: 'child finished while the subtree was closing',
+            finishReason: 'stop',
+            terminalToolResult: outcomeTerminalResult('child finished while the subtree was closing'),
+            usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+          };
+        };
+      }
+      return session;
+    };
+
+    try {
+      const tool = createSpawnSubagentTool(parent)!;
+      const execution = tool.execute!({ agentType: 'explore', task: 'finish during close' }, execCtx('tc-close-cycle'));
+      await childMessageSeen;
+
+      expect(
+        await storage.listSessions({
+          harnessName: 'default',
+          resourceId: parent.resourceId,
+          includeClosed: false,
+          parentSessionId: parent.id,
+        }),
+      ).toEqual([expect.objectContaining({ id: child.id, parentSessionId: parent.id })]);
+
+      const closeStartedAt = Date.now();
+      const closing = parent.close();
+      let closeError: unknown;
+      void closing.catch(error => {
+        closeError = error;
+      });
+      while (!parent.isClosing || !child.isClosing) {
+        if (Date.now() - closeStartedAt > closeTimeoutMs / 2) {
+          throw new Error(
+            `ancestor close did not claim the inline child (parent=${parent.lifecycleState}, child=${child.lifecycleState}, error=${String(closeError)})`,
+          );
+        }
+        await new Promise(resolve => setTimeout(resolve, 1));
+      }
+      releaseChildMessage();
+
+      const output = (await execution) as any;
+      await closing;
+      const elapsedMs = Date.now() - closeStartedAt;
+
+      expect(output).toMatchObject({
+        subagentSessionId: child.id,
+        result: { status: 'success', finishReason: 'stop' },
+      });
+      // The old path awaited the ancestor's own close promise and therefore
+      // consumed essentially the full 1s deadline before the tool could return.
+      expect(elapsedMs).toBeLessThan(closeTimeoutMs / 2);
+      expect(parent._internalSubagentExecutionsInFlight).toBe(0);
+      expect((await storage.loadSession({ sessionId: child.id }))?.closedAt).toBeDefined();
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('does not start a stale inline child after conversation revision wins during allocation', async () => {
+    const { harness, childAgent, storage } = setup();
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const originalSession = harness.session.bind(harness);
+    let allocationStarted!: () => void;
+    const allocationSeen = new Promise<void>(resolve => {
+      allocationStarted = resolve;
+    });
+    let releaseAllocation!: () => void;
+    const allocationGate = new Promise<void>(resolve => {
+      releaseAllocation = resolve;
+    });
+
+    (harness as any).session = async (opts: any) => {
+      if (opts?.parentSessionId === parent.id) {
+        allocationStarted();
+        await allocationGate;
+      }
+      return originalSession(opts);
+    };
+
+    try {
+      const tool = createSpawnSubagentTool(parent)!;
+      const execution = tool.execute!({ agentType: 'explore', task: 'stale branch work' }, execCtx('tc-revision-race'));
+      await allocationSeen;
+
+      await parent.resetPlanTasks({ reason: 'message_edited' });
+      releaseAllocation();
+      const output = (await execution) as any;
+
+      expect(output).toMatchObject({
+        isError: true,
+        errorName: 'HarnessBusyError',
+        reason: 'harness.busy',
+      });
+      expect(output.subagentSessionId).not.toBe('');
+      expect(childAgent.streamCalls).toBe(0);
+      expect(parent.getDisplayState().activeSubagents).toEqual({});
+      expect(parent._internalSubagentExecutionsInFlight).toBe(0);
+      expect((await storage.loadSession({ sessionId: output.subagentSessionId }))?.closedAt).toBeDefined();
+    } finally {
+      releaseAllocation();
+      await harness.shutdown();
+    }
   });
 });
 
@@ -314,7 +713,7 @@ describe('spawn_subagent tool — concurrency backpressure (§SA3)', () => {
     try {
       const tool = createSpawnSubagentTool(parent)!;
       // One spawn already in flight (the create→run window the counter reserves).
-      (parent as any)._subagentSpawnInFlight = 1;
+      expect(parent._internalTryReserveSubagentExecution().reserved).toBe(true);
       const rejected = (await tool.execute!({ agentType: 'explore', task: 'x' } as any, execCtx('tc-2'))) as any;
       expect(rejected.isError).toBe(true);
       expect(rejected.errorName).toBe('HarnessSubagentConcurrencyLimitError');
@@ -322,11 +721,11 @@ describe('spawn_subagent tool — concurrency backpressure (§SA3)', () => {
       expect(rejected.subagentSessionId).toBe('');
 
       // Free the slot → a spawn proceeds (child runs to completion) and releases.
-      (parent as any)._subagentSpawnInFlight = 0;
+      parent._internalReleaseSubagentExecution();
       const ok = (await tool.execute!({ agentType: 'explore', task: 'y' } as any, execCtx('tc-3'))) as any;
       expect(ok.isError).toBeFalsy();
       expect(typeof ok.subagentSessionId).toBe('string');
-      expect((parent as any)._subagentSpawnInFlight).toBe(0); // reservation released in finally
+      expect(parent._internalSubagentExecutionsInFlight).toBe(0); // reservation released in finally
     } finally {
       await harness.shutdown();
     }
@@ -337,9 +736,11 @@ describe('spawn_subagent tool — concurrency backpressure (§SA3)', () => {
     const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
     try {
       const tool = createSpawnSubagentTool(parent)!;
-      (parent as any)._subagentSpawnInFlight = 99; // would exceed any limit
+      for (let i = 0; i < 99; i++) expect(parent._internalTryReserveSubagentExecution().reserved).toBe(true);
       const ok = (await tool.execute!({ agentType: 'explore', task: 'z' } as any, execCtx('tc-4'))) as any;
       expect(ok.isError).toBeFalsy();
+      expect(parent._internalSubagentExecutionsInFlight).toBe(99);
+      for (let i = 0; i < 99; i++) parent._internalReleaseSubagentExecution();
     } finally {
       await harness.shutdown();
     }
@@ -510,7 +911,7 @@ describe('subagent live progress projection (§SA2)', () => {
 });
 
 describe('spawn_subagent — inline suspension is an error, not a completion (§S3.3)', () => {
-  it('reports a HITL-suspended inline subagent as isError + HarnessSubagentSuspendedError', async () => {
+  it('reports a HITL-suspended inline subagent as a bounded public error summary', async () => {
     const { harness, childAgent } = setup();
     // Drive the child to a HITL suspension: a default message() RESOLVES with
     // finishReason 'suspended' (it does not reject).
@@ -527,7 +928,14 @@ describe('spawn_subagent — inline suspension is an error, not a completion (§
       const out = (await tool.execute!({ agentType: 'explore', task: 'explore X' } as any, execCtx('tc-susp'))) as any;
       // The inline subagent cannot be resumed → error result, NOT a success.
       expect(out.isError).toBe(true);
-      expect((out.result as { errorName?: string })?.errorName).toBe('HarnessSubagentSuspendedError');
+      expect(out.result).toMatchObject({
+        status: 'error',
+        finishReason: 'suspended',
+        error: {
+          code: 'harness.subagent_suspended',
+          messageTruncated: false,
+        },
+      });
       const end = events.find(e => e.type === 'subagent_end') as { isError?: boolean } | undefined;
       expect(end?.isError).toBe(true);
     } finally {

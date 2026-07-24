@@ -121,8 +121,66 @@ Returns: [`InngestAgent`](#inngestagent-interface)
     isOptional: true,
     description: 'Mastra instance for observability. Set automatically when the agent is registered with Mastra.',
   },
+  {
+    name: 'durableRequestContextKeys',
+    type: 'readonly string[]',
+    isOptional: true,
+    description:
+      'Application RequestContext keys that may be persisted as bounded JSON for cold-worker recovery. Infrastructure and credential keys are rejected; persist identifiers such as session or project IDs, not secrets.',
+  },
+  {
+    name: 'resolveToolPermission',
+    type: 'InngestToolPermissionResolver',
+    isOptional: true,
+    description:
+      'Trusted worker-local callback that resolves allow, ask, or deny at the tool action boundary. The function is never serialized. Throws and invalid decisions fail closed as deny.',
+  },
 ]}
 />
+
+### Durable tool permission policy
+
+Inngest can resume a run on a different process, so a permission-policy closure in `RequestContext` can't be stored in the workflow event. Configure `resolveToolPermission` on every worker and persist only the application references it needs:
+
+```typescript
+import { RequestContext } from '@mastra/core/request-context'
+
+const durableAgent = createInngestAgent({
+  agent,
+  inngest,
+  durableRequestContextKeys: ['sessionId'],
+  resolveToolPermission: async ({ toolName, requestContext }) => {
+    const sessionId = requestContext?.get('sessionId')
+    return loadCurrentToolPolicy({ sessionId, toolName }) // 'allow' | 'ask' | 'deny'
+  },
+})
+
+const requestContext = new RequestContext()
+requestContext.set('sessionId', 'session-123')
+
+await durableAgent.resume(
+  runId,
+  { approved: true },
+  {
+    requestContext,
+    requireToolPermissionPolicy: true,
+  },
+)
+```
+
+The durable state stores only a monotonic "policy required" marker. If a worker lacks the resolver, or the resolver throws or returns an invalid decision, tool execution is denied. The resolver is called again after an approval or in-tool suspension resume, including a resume with an `undefined` payload, so a policy change takes effect before the side effect.
+
+When a live `RequestContext` policy and `resolveToolPermission` are both available, Mastra evaluates both. The strictest result wins: `deny` takes precedence over `ask`, and `ask` takes precedence over `allow`. A throw or invalid result from either evaluator is a denial.
+
+Tool batches run sequentially whenever current permission resolution is required. Mastra checks both the serialized run option and the live durable marker, including snapshots written before the serialized option existed.
+
+On resume, the durable-agent adapter replaces the stored workflow context with a new bounded snapshot. It keeps only keys in `durableRequestContextKeys`, applies fresh values over stored values, and preserves the policy-required marker. Unallowlisted values and credential-like keys are removed, including values from snapshots created before this filter existed.
+
+### Protocol-v2 deployment
+
+Durable-agent Inngest function IDs include protocol version `v2`. This prevents an older worker, which doesn't understand the policy marker, from claiming a new event.
+
+The function identity change also separates in-flight runs. Keep the prior worker deployment available until protocol-v1 runs finish. A new protocol-v2 wrapper doesn't resume a protocol-v1 snapshot under a different function ID. Deploy protocol-v2 workers before routing new traffic to the updated wrapper.
 
 ## `InngestAgent` interface
 
@@ -202,7 +260,7 @@ await output.text
 cleanup()
 ```
 
-The third argument accepts `threadId` and `resourceId` in addition to the lifecycle callbacks:
+The third argument accepts `threadId`, `resourceId`, fresh bounded `requestContext`, and a monotonic policy requirement in addition to the lifecycle callbacks:
 
 <PropertiesTable
   content={[
@@ -217,6 +275,20 @@ The third argument accepts `threadId` and `resourceId` in addition to the lifecy
     type: 'string',
     isOptional: true,
     description: 'Resource ID to associate with the resumed run.',
+  },
+  {
+    name: 'requestContext',
+    type: 'RequestContext',
+    isOptional: true,
+    description:
+      'Fresh resume context. Only keys listed in durableRequestContextKeys cross the Inngest boundary. A live permission closure is never serialized.',
+  },
+  {
+    name: 'requireToolPermissionPolicy',
+    type: 'true',
+    isOptional: true,
+    description:
+      'Require current permission resolution for this resume. This can set but never clear the durable requirement; a missing resolver denies execution.',
   },
   {
     name: 'onChunk',

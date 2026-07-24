@@ -41,28 +41,25 @@ interface BackgroundTaskCompletionPolicyRegistration {
   validateMetadata?: (metadata: JsonValue) => boolean; // Optional row-level metadata validator.
 }
 
+// Retained validation shape only. Omission, `false`, or `{ enabled: false }`
+// keeps Harness OM disabled. Every enabled form rejects; configure OM on the
+// Agent Memory instance. Fields are still validated for precise diagnostics.
 type ObservationalMemoryConfig =
   | boolean
   | {
-      enabled?: boolean; // `false` disables OM; omitted means enabled when object form is present.
-      scope?: 'thread' | 'resource'; // Defaults to 'thread'. Creation-time lookup scope for OM records.
-      // `resource` is an explicit privacy/authorization choice:
-      // OM snapshots may summarize other threads for the same
-      // authenticated resource. Existing sessions do not change
-      // scope implicitly.
-      model?: string; // Default model ID for both observer and reflector.
+      enabled?: boolean; // Omission requests unsupported enablement and rejects.
+      scope?: 'thread' | 'resource'; // Validated but not activated by Harness.
+      model?: string; // Validated shared model intent; unsupported by Harness.
       observation?: {
-        model?: string; // Observer model ID.
-        messageTokens?: number; // Observation trigger threshold.
+        model?: string; // Validated Observer intent.
+        messageTokens?: number; // Validated observation threshold intent.
       };
       reflection?: {
-        model?: string; // Reflector model ID.
-        observationTokens?: number; // Reflection trigger threshold.
+        model?: string; // Validated Reflector intent.
+        observationTokens?: number; // Validated reflection threshold intent.
       };
-      // Opaque adapter-owned OM processor options. Implementations may reject
-      // unsupported keys before init/session persistence. These values never
-      // define Harness v1 API, storage, route, event, display, or recovery
-      // semantics, and non-JSON values are rejected.
+      // Opaque JSON values are checked for shape, then enabled configuration
+      // rejects before session creation or persistence.
       processorOptions?: Record<string, JsonValue>;
     };
 

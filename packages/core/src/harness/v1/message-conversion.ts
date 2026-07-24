@@ -8,6 +8,7 @@
 import { resolveFilePartMediaTypeAndData } from '../../agent/message-list/prompt/image-utils';
 import { mastraDBMessageToSignal, signalContentsToParts, signalContentsToText } from '../../agent/signals';
 import type { MastraDBMessage } from '../../agent/types';
+import { parseHarnessSubagentTerminalResult } from './terminal-subagent-result';
 import type { HarnessMessage, HarnessMessageContent } from './types';
 
 /**
@@ -376,6 +377,11 @@ export function convertStoredMessageToHarnessMessage(msg: StoredMessageRow): Har
           });
         }
         break;
+      case 'data-terminal-tool-result': {
+        const answer = parseHarnessSubagentTerminalResult(part.data);
+        if (answer) content.push({ type: 'text', text: answer.text });
+        break;
+      }
       case 'data-om-observation-start': {
         const data = (part as { data?: Record<string, unknown> }).data ?? {};
         content.push({

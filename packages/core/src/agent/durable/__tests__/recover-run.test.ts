@@ -24,7 +24,7 @@ import { DurableStepIds } from '../constants';
 import { createDurableAgent } from '../create-durable-agent';
 import type { DurableAgent } from '../durable-agent';
 import { globalRunRegistry } from '../run-registry';
-import type { SerializableDurableOptions } from '../types';
+import type { DurableAgenticWorkflowInput, SerializableDurableOptions } from '../types';
 import { serializeModelConfig } from '../utils/serialize-state';
 
 function makeSnapshot(
@@ -32,6 +32,7 @@ function makeSnapshot(
   status: WorkflowRunStatus,
   agentId: string,
   options: SerializableDurableOptions = {},
+  inputOverrides: Partial<DurableAgenticWorkflowInput> = {},
 ): WorkflowRunState {
   return {
     runId,
@@ -53,6 +54,7 @@ function makeSnapshot(
         requestContextEntries: { userId: 'u-1' },
         state: { threadId: 't', resourceId: 'r' },
         messageId: `message-${runId}`,
+        ...inputOverrides,
       } as any,
     },
     activePaths: [],
@@ -99,19 +101,20 @@ async function seed(
   status: WorkflowRunStatus,
   agentId: string,
   options: SerializableDurableOptions = {},
+  inputOverrides: Partial<DurableAgenticWorkflowInput> = {},
 ) {
   const workflows = (await store.getStore('workflows'))!;
   await workflows.persistWorkflowSnapshot({
     workflowName: DurableStepIds.AGENTIC_LOOP,
     runId,
     resourceId: 'r',
-    snapshot: makeSnapshot(runId, status, agentId, options),
+    snapshot: makeSnapshot(runId, status, agentId, options, inputOverrides),
   });
   await workflows.persistWorkflowSnapshot({
     workflowName: DurableStepIds.AGENTIC_EXECUTION,
     runId,
     resourceId: 'r',
-    snapshot: makeSnapshot(runId, status, agentId, options),
+    snapshot: makeSnapshot(runId, status, agentId, options, inputOverrides),
   });
 }
 
@@ -232,6 +235,86 @@ describe('DurableAgent.recover(runId)', () => {
     });
     expect(getWorkflow).not.toHaveBeenCalled();
     expect(agent.runRegistry.has('run-hook-policy')).toBe(false);
+  });
+
+  it('refuses boot recovery when the run requires fresh trusted auth-token reinjection', async () => {
+    await seed(
+      store,
+      'run-auth-bound',
+      'running',
+      'agent-A',
+      {},
+      {
+        requiredRequestContextCapabilities: { authToken: true },
+      },
+    );
+    const getWorkflow = vi.spyOn(agent, 'getWorkflow');
+
+    await expect(agent.recover('run-auth-bound')).rejects.toMatchObject({
+      id: 'DURABLE_AGENT_RECOVER_AUTH_TOKEN_REQUIRED',
+    });
+    expect(getWorkflow).not.toHaveBeenCalled();
+    expect(agent.runRegistry.has('run-auth-bound')).toBe(false);
+  });
+
+  it('resolves dynamic model and input-processor factories once while rebuilding a recovered run', async () => {
+    const agentId = 'dynamic-model-recover-agent';
+    const modelResolver = vi.fn(() => makeMockModel());
+    const inputProcessorResolver = vi.fn(() => []);
+    const dynamicAgent = new Agent({
+      id: agentId,
+      name: agentId,
+      instructions: 'x',
+      model: modelResolver,
+      inputProcessors: inputProcessorResolver,
+    });
+    const dynamicStore = new InMemoryStore();
+    const durableAgent = createDurableAgent({ agent: dynamicAgent });
+    void new Mastra({
+      agents: { [agentId]: durableAgent as any },
+      storage: dynamicStore,
+    });
+    expect(modelResolver).not.toHaveBeenCalled();
+    expect(inputProcessorResolver).not.toHaveBeenCalled();
+
+    await seed(dynamicStore, 'run-dynamic-model', 'running', agentId);
+    stubWorkflow(durableAgent as any, 'success');
+
+    const { cleanup } = await durableAgent.recover('run-dynamic-model');
+    expect(modelResolver).toHaveBeenCalledTimes(1);
+    expect(inputProcessorResolver).toHaveBeenCalledTimes(1);
+
+    await globalRunRegistry.get('run-dynamic-model')?.workflowExecution;
+    cleanup();
+  });
+
+  it('fails closed before restart when a processor surface cannot be reconstructed', async () => {
+    const agentId = 'processor-recover-agent';
+    const processorResolver = vi.fn(() => {
+      throw new Error('processor resolver unavailable');
+    });
+    const processorAgent = new Agent({
+      id: agentId,
+      name: agentId,
+      instructions: 'x',
+      model: makeMockModel(),
+      errorProcessors: processorResolver,
+    });
+    const processorStore = new InMemoryStore();
+    const durableAgent = createDurableAgent({ agent: processorAgent });
+    void new Mastra({
+      agents: { [agentId]: durableAgent as any },
+      storage: processorStore,
+    });
+    await seed(processorStore, 'run-processor-failure', 'running', agentId);
+    const getWorkflow = vi.spyOn(durableAgent, 'getWorkflow');
+
+    await expect(durableAgent.recover('run-processor-failure')).rejects.toMatchObject({
+      id: 'DURABLE_AGENT_RECOVER_PROCESSOR_RESOLUTION_FAILED',
+    });
+    expect(processorResolver).toHaveBeenCalledTimes(1);
+    expect(getWorkflow).not.toHaveBeenCalled();
+    expect(durableAgent.runRegistry.has('run-processor-failure')).toBe(false);
   });
 
   it('throws when the persisted snapshot is not a durable-agent workflow', async () => {

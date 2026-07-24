@@ -98,7 +98,12 @@ export {
 } from './durable-stream-until-idle';
 
 // Preparation utilities
-export { prepareForDurableExecution, type PreparationOptions, type PreparationResult } from './preparation';
+export {
+  prepareForDurableExecution,
+  snapshotDurableRequestContextEntries,
+  type PreparationOptions,
+  type PreparationResult,
+} from './preparation';
 
 // Run registry for non-serializable state
 export { RunRegistry, ExtendedRunRegistry, globalRunRegistry, type ExtendedRunRegistryEntry } from './run-registry';
@@ -106,6 +111,8 @@ export { RunRegistry, ExtendedRunRegistry, globalRunRegistry, type ExtendedRunRe
 // Stream adapter for pubsub-based streaming
 export {
   createDurableAgentStream,
+  createTerminalToolResultEnvelope,
+  assertTerminalToolResultRetained,
   emitChunkEvent,
   emitStepStartEvent,
   emitStepFinishEvent,
@@ -115,6 +122,7 @@ export {
   type DurableAgentStreamOptions as StreamAdapterOptions,
   type DurableAgentStreamResult as StreamAdapterResult,
 } from './stream-adapter';
+export { outputProcessorsOwnTerminalPersistence } from '../../loop/shared/terminal-tool-result';
 
 // Constants
 export { AGENT_STREAM_TOPIC, AgentStreamEventTypes, DurableAgentDefaults, DurableStepIds } from './constants';
@@ -160,6 +168,7 @@ export {
 // Utility functions for runtime resolution
 export {
   resolveRuntimeDependencies,
+  createDurableRuntimeRequestContext,
   rebuildRunToolsFromMastra,
   resolveModel,
   resolveInternalState,
@@ -179,7 +188,18 @@ export {
   createDurableLLMExecutionStep,
   createDurableToolCallStep,
   createDurableLLMMappingStep,
+  createDurableSignalDrainStep,
+  type CreateDurableToolCallStepOptions,
+  type DurableToolPermissionResolver,
+  type DurableToolPermissionResolverInput,
 } from './workflows/steps';
+export {
+  TOOL_PERMISSION_POLICY_KEY,
+  TOOL_PERMISSION_POLICY_REQUIRED_KEY,
+  TOOL_PERMISSION_POLICY_STABLE_KEY,
+  type ToolPermissionDecision,
+  type ToolPermissionPolicy,
+} from '../tool-permission-prefilter';
 
 // Shared workflow utilities
 export {

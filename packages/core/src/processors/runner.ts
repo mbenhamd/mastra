@@ -94,6 +94,69 @@ export function outputProcessorsSupportResult(outputProcessors: readonly Process
 }
 
 /**
+ * Clone request-local processor state without requiring every value to be
+ * structured-cloneable. Processor state commonly carries opaque runtime
+ * handles (for example a stream controller) alongside ordinary mutable data.
+ * Plain containers are copied recursively so their mutations can be rolled
+ * back, while opaque class instances and functions retain their identity.
+ */
+function cloneTransactionalState<T>(value: T, seen = new WeakMap<object, unknown>()): T {
+  if (value === null || (typeof value !== 'object' && typeof value !== 'function')) {
+    return value;
+  }
+  if (typeof value === 'function') {
+    return value;
+  }
+
+  const objectValue = value as object;
+  const existing = seen.get(objectValue);
+  if (existing !== undefined) {
+    return existing as T;
+  }
+
+  if (value instanceof Date) {
+    return new Date(value.getTime()) as T;
+  }
+  if (Array.isArray(value)) {
+    const clone: unknown[] = [];
+    seen.set(objectValue, clone);
+    for (const item of value) clone.push(cloneTransactionalState(item, seen));
+    return clone as T;
+  }
+  if (value instanceof Map) {
+    const clone = new Map();
+    seen.set(objectValue, clone);
+    for (const [key, item] of value) {
+      clone.set(key, cloneTransactionalState(item, seen));
+    }
+    return clone as T;
+  }
+  if (value instanceof Set) {
+    const clone = new Set();
+    seen.set(objectValue, clone);
+    for (const item of value) clone.add(cloneTransactionalState(item, seen));
+    return clone as T;
+  }
+
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    return value;
+  }
+
+  const clone = Object.create(prototype) as Record<PropertyKey, unknown>;
+  seen.set(objectValue, clone);
+  for (const key of Reflect.ownKeys(value)) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor) continue;
+    if ('value' in descriptor) {
+      descriptor.value = cloneTransactionalState(descriptor.value, seen);
+    }
+    Object.defineProperty(clone, key, descriptor);
+  }
+  return clone as T;
+}
+
+/**
  * Implementation of processor state management
  */
 /**
@@ -170,6 +233,32 @@ export class ProcessorState<OUTPUT = undefined> {
       totalChunks: this.outputChunkCount,
       accumulatedText: this.outputAccumulatedText,
     };
+  }
+
+  /** @internal Snapshot mutable request state for an atomic terminal commit. */
+  snapshot(): {
+    inputAccumulatedText: string;
+    outputAccumulatedText: string;
+    outputChunkCount: number;
+    customState: Record<string, unknown>;
+    streamParts: ChunkType<OUTPUT>[];
+  } {
+    return {
+      inputAccumulatedText: this.inputAccumulatedText,
+      outputAccumulatedText: this.outputAccumulatedText,
+      outputChunkCount: this.outputChunkCount,
+      customState: cloneTransactionalState(this.customState),
+      streamParts: cloneTransactionalState(this.streamParts),
+    };
+  }
+
+  /** @internal Restore mutable request state after a failed terminal commit. */
+  restore(snapshot: ReturnType<ProcessorState<OUTPUT>['snapshot']>): void {
+    this.inputAccumulatedText = snapshot.inputAccumulatedText;
+    this.outputAccumulatedText = snapshot.outputAccumulatedText;
+    this.outputChunkCount = snapshot.outputChunkCount;
+    this.customState = snapshot.customState;
+    this.streamParts = snapshot.streamParts;
   }
 }
 
@@ -406,6 +495,30 @@ export class ProcessorRunner {
     this.agentName = agentName;
     this.agent = agent;
     this.processorStates = processorStates ?? new Map();
+  }
+
+  /** @internal Capture all processor state before a transactional terminal finalization. */
+  snapshotProcessorStates(): Array<{
+    id: string;
+    state: ProcessorState;
+    snapshot: ReturnType<ProcessorState['snapshot']>;
+  }> {
+    return Array.from(this.processorStates, ([id, state]) => ({ id, state, snapshot: state.snapshot() }));
+  }
+
+  /** @internal Roll back mutations and remove states created during a failed terminal finalization. */
+  restoreProcessorStates(
+    snapshots: Array<{
+      id: string;
+      state: ProcessorState;
+      snapshot: ReturnType<ProcessorState['snapshot']>;
+    }>,
+  ): void {
+    this.processorStates.clear();
+    for (const { id, state, snapshot } of snapshots) {
+      state.restore(snapshot);
+      this.processorStates.set(id, state);
+    }
   }
 
   /**

@@ -1,3 +1,8 @@
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+
 import {
   createTestSuite,
   createConfigValidationTests,
@@ -44,6 +49,34 @@ describe('LibSQLStore domain wiring', () => {
     await expect(store.getStore('favorites')).resolves.toBe(store.stores.favorites);
     expect(store.stores.harness).toBeDefined();
     await expect(store.getStore('harness')).resolves.toBe(store.stores.harness);
+  });
+
+  it('uses atomic Harness initialization only for owned persistent-file URLs', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'mastra-libsql-harness-wiring-'));
+    const ownedUrl = pathToFileURL(join(directory, 'owned.db')).href;
+    const injectedUrl = pathToFileURL(join(directory, 'injected.db')).href;
+    const ownedStore = new LibSQLStore({ id: 'libsql-owned-harness-init', url: ownedUrl });
+    const ownedClient = (ownedStore as unknown as { client: ReturnType<typeof createClient> }).client;
+    const ownedExecute = vi.spyOn(ownedClient, 'execute');
+    const injectedClient = createClient({ url: injectedUrl });
+    const injectedExecute = vi.spyOn(injectedClient, 'execute');
+    const injectedStore = new LibSQLStore({ id: 'libsql-injected-harness-init', client: injectedClient });
+    const statementSql = (statement: Parameters<typeof ownedClient.execute>[0]) =>
+      typeof statement === 'string' ? statement : statement.sql;
+
+    try {
+      await ownedStore.stores.harness!.init();
+      expect(ownedExecute.mock.calls.some(([statement]) => statementSql(statement) === 'BEGIN IMMEDIATE')).toBe(true);
+
+      await injectedStore.stores.harness!.init();
+      expect(injectedExecute.mock.calls.some(([statement]) => statementSql(statement) === 'BEGIN IMMEDIATE')).toBe(
+        false,
+      );
+    } finally {
+      await ownedStore.close();
+      await injectedStore.close();
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 });
 
@@ -211,22 +244,32 @@ describe('LibSQLStore harness domain', () => {
       const harness = await store.getStore('harness');
       expect(harness).toBeDefined();
 
-      await harness!.saveSession({
-        id: 'session-1',
-        ownerId: 'owner-1',
-        resourceId: 'resource-1',
-        threadId: 'thread-1',
-        origin: 'top-level',
-        modeId: 'mode-1',
-        modelId: '__GATEWAY_OPENAI_MODEL__',
-        createdAt: new Date('2026-01-01T00:00:00.000Z'),
-        lastActivityAt: new Date('2026-01-01T00:00:00.000Z'),
-        metadata: { from: 'composite' },
-      });
+      await harness!.saveSession(
+        {
+          id: 'session-1',
+          ownerId: 'owner-1',
+          resourceId: 'resource-1',
+          threadId: 'thread-1',
+          origin: 'top-level',
+          ownsThread: false,
+          modeId: 'mode-1',
+          modelId: '__GATEWAY_OPENAI_MODEL__',
+          subagentModelOverrides: {},
+          permissionRules: { categories: {}, tools: {} },
+          sessionGrants: { categories: [], tools: [] },
+          tokenUsage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+          pendingQueue: [],
+          state: { from: 'composite' },
+          createdAt: new Date('2026-01-01T00:00:00.000Z').getTime(),
+          lastActivityAt: new Date('2026-01-01T00:00:00.000Z').getTime(),
+          version: 0,
+        },
+        { ownerId: 'owner-1', ifVersion: 0 },
+      );
 
-      await expect(harness!.loadSession('session-1')).resolves.toMatchObject({
+      await expect(harness!.loadSession({ harnessName: 'default', sessionId: 'session-1' })).resolves.toMatchObject({
         id: 'session-1',
-        metadata: { from: 'composite' },
+        state: { from: 'composite' },
       });
     } finally {
       client.close();

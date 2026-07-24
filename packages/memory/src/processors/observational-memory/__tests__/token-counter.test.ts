@@ -203,6 +203,77 @@ describe('TokenCounter', () => {
       expect(fetchMock).toHaveBeenCalledTimes(1);
     });
 
+    it('does not repeat a provider timeout across process, status, and final attachment recounts', async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-07-20T10:00:00.000Z'));
+
+      try {
+        vi.stubEnv('OPENAI_API_KEY', 'test-openai-key');
+        const fetchMock = vi
+          .fn()
+          .mockImplementationOnce(
+            (_input: RequestInfo | URL, init?: RequestInit) =>
+              new Promise<Response>((_resolve, reject) => {
+                const signal = init?.signal;
+                signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+              }),
+          )
+          .mockResolvedValueOnce({
+            ok: true,
+            json: async () => ({ input_tokens: 130 }),
+          });
+        globalThis.fetch = fetchMock as typeof fetch;
+
+        const message = createMessage({
+          format: 2,
+          parts: [
+            {
+              type: 'file',
+              data: 'https://example.com/specs/floorplan.pdf',
+              mimeType: 'application/pdf',
+              filename: 'floorplan.pdf',
+            },
+          ],
+        });
+
+        const processInputCounter = new TokenCounter({ model: 'openai/gpt-4o' });
+        const processInputStartedAt = Date.now();
+        const processInputCountPromise = processInputCounter.countMessagesAsync([message]);
+        await vi.advanceTimersByTimeAsync(20_000);
+        const processInputCount = await processInputCountPromise;
+        const processInputElapsed = Date.now() - processInputStartedAt;
+
+        const reloadedForStatus = structuredClone(message);
+        const statusStartedAt = Date.now();
+        const statusCount = await new TokenCounter({ model: 'openai/gpt-4o' }).countMessagesAsync([reloadedForStatus]);
+        const statusElapsed = Date.now() - statusStartedAt;
+
+        const reloadedForFinal = structuredClone(reloadedForStatus);
+        const finalStartedAt = Date.now();
+        const finalCount = await new TokenCounter({ model: 'openai/gpt-4o' }).countMessagesAsync([reloadedForFinal]);
+        const finalElapsed = Date.now() - finalStartedAt;
+
+        expect({ processInputCount, statusCount, finalCount }).toEqual({
+          processInputCount,
+          statusCount: processInputCount,
+          finalCount: processInputCount,
+        });
+        expect({ processInputElapsed, statusElapsed, finalElapsed }).toEqual({
+          processInputElapsed: 20_000,
+          statusElapsed: 0,
+          finalElapsed: 0,
+        });
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+
+        await vi.advanceTimersByTimeAsync(5 * 60_000);
+        await new TokenCounter({ model: 'openai/gpt-4o' }).countMessagesAsync([reloadedForFinal]);
+
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it('dedupes in-flight remote attachment counts for identical attachments', async () => {
       vi.stubEnv('OPENAI_API_KEY', 'test-openai-key');
       const fetchMock = vi.fn(

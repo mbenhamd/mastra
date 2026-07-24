@@ -1,4 +1,5 @@
 import type { MastraDBMessage } from '@mastra/core/agent';
+import { tryFormatTerminalToolResultForModel } from '@mastra/core/agent/message-list';
 import type { CoreMessage } from '@mastra/core/llm';
 
 import { stripEphemeralAnchorIds } from './anchor-ids';
@@ -995,6 +996,14 @@ function formatObserverMessage(
       }
 
       const partType = (part as { type?: string }).type;
+      if (partType === 'data-terminal-tool-result') {
+        const terminalText = tryFormatTerminalToolResultForModel((part as { data?: unknown }).data);
+        if (terminalText) {
+          pushLine(role, maybeTruncate(terminalText, maxLen), partCreatedAt);
+        }
+        return;
+      }
+
       if (partType === 'reasoning') {
         const reasoning = (part as { reasoning?: string }).reasoning;
         if (!reasoning) {

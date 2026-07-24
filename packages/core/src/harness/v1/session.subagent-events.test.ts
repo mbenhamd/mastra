@@ -245,7 +245,15 @@ describe('Session._emitSubagentEvent', () => {
       toolCallId: 'tool-call-1',
       subagentSessionId: 'child-1',
       agentType: 'explore',
-      output: { summary: 'done' },
+      output: {
+        status: 'success',
+        text: 'done',
+        textTruncated: false,
+        finishReason: 'stop',
+        stepCount: 1,
+        toolCallCount: 0,
+        toolResultCount: 0,
+      },
       isError: false,
       durationMs: 1234,
       depth: 1,
@@ -253,7 +261,15 @@ describe('Session._emitSubagentEvent', () => {
 
     expect(events[0]).toMatchObject({
       type: 'subagent_end',
-      output: { summary: 'done' },
+      output: {
+        status: 'success',
+        text: 'done',
+        textTruncated: false,
+        finishReason: 'stop',
+        stepCount: 1,
+        toolCallCount: 0,
+        toolResultCount: 0,
+      },
       isError: false,
       durationMs: 1234,
       parentId: session.id,

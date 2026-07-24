@@ -22,6 +22,10 @@ import type {
   SwapBufferedToActiveResult,
   SwapBufferedReflectionToActiveInput,
   CreateReflectionGenerationInput,
+  ObservationalMemoryWriteGuard,
+  ObservationalMemoryRetractionReceipt,
+  RetractObservationalMemoryInput,
+  RetractObservationalMemoryResult,
   UpdateObservationalMemoryConfigInput,
 } from '../../types';
 import { StorageDomain } from '../base';
@@ -42,6 +46,9 @@ export abstract class MemoryStorage extends StorageDomain {
    * Defaults to false for backwards compatibility with custom adapters.
    */
   readonly supportsObservationalMemory?: boolean = false;
+
+  /** Whether edit/delete retraction and guarded derived writes are atomic. */
+  readonly supportsAtomicObservationalMemoryRetraction?: boolean = false;
 
   constructor() {
     super({
@@ -70,9 +77,35 @@ export abstract class MemoryStorage extends StorageDomain {
     metadata: Record<string, unknown>;
   }): Promise<StorageThreadType>;
 
-  abstract deleteThread({ threadId }: { threadId: string }): Promise<void>;
+  abstract deleteThread({
+    threadId,
+    observationalMemoryRetractions,
+  }: {
+    threadId: string;
+    /** @internal Receives retractions only after the deletion commits. */
+    observationalMemoryRetractions?: ObservationalMemoryRetractionReceipt[];
+  }): Promise<void>;
 
   abstract listMessages(args: StorageListMessagesInput): Promise<StorageListMessagesOutput>;
+
+  /**
+   * Return whether at least one message exists for the requested thread scope.
+   *
+   * Storage adapters should override this with a native existence query when
+   * possible. The compatibility fallback intentionally keeps this method
+   * non-abstract so existing custom adapters continue to work.
+   */
+  async hasMessages({
+    threadId,
+    resourceId,
+  }: Pick<StorageListMessagesInput, 'threadId' | 'resourceId'>): Promise<boolean> {
+    const result = await this.listMessages({
+      threadId,
+      ...(resourceId === undefined ? {} : { resourceId }),
+      perPage: 1,
+    });
+    return result.messages.length > 0;
+  }
 
   /**
    * List messages by resource ID only (across all threads).
@@ -97,9 +130,25 @@ export abstract class MemoryStorage extends StorageDomain {
       id: string;
       content?: { metadata?: MastraMessageContentV2['metadata']; content?: MastraMessageContentV2['content'] };
     })[];
+    /**
+     * Retract observer-derived state in the same storage mutation as the
+     * authoritative transcript edit. Only adapters advertising atomic
+     * observational-memory retraction act on this internal flag.
+     */
+    retractObservationalMemory?: boolean;
+    /** @internal Receives retractions only after the edit commits. */
+    observationalMemoryRetractions?: ObservationalMemoryRetractionReceipt[];
   }): Promise<MastraDBMessage[]>;
 
-  async deleteMessages(_messageIds: string[]): Promise<void> {
+  async deleteMessages(
+    _messageIds: string[],
+    _options?: {
+      /** @internal See updateMessages.retractObservationalMemory. */
+      retractObservationalMemory?: boolean;
+      /** @internal Receives retractions only after the deletion commits. */
+      observationalMemoryRetractions?: ObservationalMemoryRetractionReceipt[];
+    },
+  ): Promise<void> {
     throw new Error(
       `Message deletion is not supported by this storage adapter (${this.constructor.name}). ` +
         `The deleteMessages method needs to be implemented in the storage adapter.`,
@@ -160,14 +209,67 @@ export abstract class MemoryStorage extends StorageDomain {
   }
 
   /**
+   * Update resource-scoped state only while the specified OM generation is
+   * still current. Adapters with atomic OM retraction must override this with
+   * a native compare-and-set implementation.
+   */
+  async updateResourceFromObservationalMemory(args: {
+    resourceId: string;
+    workingMemory: string;
+    guard: ObservationalMemoryWriteGuard;
+  }): Promise<StorageResourceType> {
+    if (args.guard.resourceId !== args.resourceId) {
+      throw new Error('Observational memory guard does not match the target resource.');
+    }
+    const current = await this.getObservationalMemory(args.guard.threadId, args.guard.resourceId);
+    if (current?.id !== args.guard.recordId) {
+      throw new Error('Observational memory generation is no longer current.');
+    }
+    return await this.updateResource({
+      resourceId: args.resourceId,
+      workingMemory: args.workingMemory,
+    });
+  }
+
+  /**
+   * Update thread-derived state only while the specified OM generation is
+   * still current. Adapters with atomic OM retraction must override this with
+   * a native compare-and-set implementation.
+   */
+  async updateThreadFromObservationalMemory(args: {
+    id: string;
+    title: string;
+    metadata: Record<string, unknown>;
+    guard: ObservationalMemoryWriteGuard;
+  }): Promise<StorageThreadType> {
+    if (args.guard.threadId !== null && args.guard.threadId !== args.id) {
+      throw new Error('Observational memory guard does not match the target thread.');
+    }
+    const thread = await this.getThreadById({ threadId: args.id });
+    if (!thread || thread.resourceId !== args.guard.resourceId) {
+      throw new Error('Observational memory guard does not match the target thread resource.');
+    }
+    const current = await this.getObservationalMemory(args.guard.threadId, args.guard.resourceId);
+    if (current?.id !== args.guard.recordId) {
+      throw new Error('Observational memory generation is no longer current.');
+    }
+    return await this.updateThread({ id: args.id, title: args.title, metadata: args.metadata });
+  }
+
+  /**
    * Delete a resource record, including working memory stored on that record.
    *
-   * This operation does not inspect or mutate associated thread, message, or
-   * observational-memory records, including thread metadata. Storage adapters
-   * can implement those lifecycle operations separately when their application
-   * requires them.
+   * This operation does not mutate associated threads, messages, or thread
+   * metadata. Adapters that erase a resource-scoped observational-memory
+   * generation append its record ids only after commit so the Memory facade can
+   * remove matching external vectors without deleting preserved thread-scoped
+   * vectors.
    */
-  async deleteResource(_args: { resourceId: string }): Promise<void> {
+  async deleteResource(_args: {
+    resourceId: string;
+    /** @internal Receives erased resource-scoped OM record ids only after commit. */
+    observationalMemoryRecordIds?: string[];
+  }): Promise<void> {
     throw new Error(
       `Resource deletion is not implemented by this storage adapter (${this.constructor.name}). ` +
         `The deleteResource method needs to be implemented in the storage adapter.`,
@@ -335,6 +437,16 @@ export abstract class MemoryStorage extends StorageDomain {
    */
   async clearObservationalMemory(_threadId: string | null, _resourceId: string): Promise<void> {
     throw new Error(`Observational memory is not implemented by this storage adapter (${this.constructor.name}).`);
+  }
+
+  /**
+   * Atomically retract native OM, observer-managed resource working memory,
+   * and thread OM metadata for an authoritative transcript edit/delete.
+   */
+  async retractObservationalMemory(_input: RetractObservationalMemoryInput): Promise<RetractObservationalMemoryResult> {
+    throw new Error(
+      `Atomic observational-memory retraction is not implemented by this storage adapter (${this.constructor.name}).`,
+    );
   }
 
   /**

@@ -48,6 +48,11 @@ export interface AzureTokenCredential {
 }
 
 export interface AzureOpenAIGatewayConfig {
+  /**
+   * Provider namespace this gateway claims (model ids are `<gatewayId>/<deployment>`).
+   * @default 'azure-openai'
+   */
+  gatewayId?: string;
   resourceName: string;
   apiKey?: string;
   apiVersion?: string;
@@ -166,13 +171,18 @@ function withAzureResponsesInputCompatibility(model: LanguageModelV2): LanguageM
 }
 
 export class AzureOpenAIGateway extends MastraModelGateway {
-  readonly id = 'azure-openai';
-  readonly name = 'azure-openai';
+  // Configurable so multiple Azure resources can register side by side
+  // (e.g. a benchmark deployment on its own resource); defaults preserve the
+  // historical single-gateway namespace.
+  readonly id: string;
+  readonly name: string;
   private tokenCache = new InMemoryServerCache();
   private entraIdTokenRequests = new Map<string, Promise<CachedToken>>();
 
   constructor(private config: AzureOpenAIGatewayConfig) {
     super();
+    this.id = config.gatewayId ?? 'azure-openai';
+    this.name = this.id;
     this.validateConfig();
   }
 
@@ -258,26 +268,26 @@ export class AzureOpenAIGateway extends MastraModelGateway {
   async fetchProviders(): Promise<Record<string, ProviderConfig>> {
     if (this.config.deployments && this.config.deployments.length > 0) {
       return {
-        'azure-openai': {
+        [this.id]: {
           apiKeyEnvVar: [],
           apiKeyHeader: 'api-key',
           name: 'Azure OpenAI',
           models: this.config.deployments,
           docUrl: 'https://learn.microsoft.com/en-us/azure/ai-services/openai/',
-          gateway: 'azure-openai',
+          gateway: this.id,
         },
       };
     }
 
     if (!this.config.management) {
       return {
-        'azure-openai': {
+        [this.id]: {
           apiKeyEnvVar: [],
           apiKeyHeader: 'api-key',
           name: 'Azure OpenAI',
           models: [],
           docUrl: 'https://learn.microsoft.com/en-us/azure/ai-services/openai/',
-          gateway: 'azure-openai',
+          gateway: this.id,
         },
       };
     }
@@ -298,13 +308,13 @@ export class AzureOpenAIGateway extends MastraModelGateway {
       });
 
       return {
-        'azure-openai': {
+        [this.id]: {
           apiKeyEnvVar: [],
           apiKeyHeader: 'api-key',
           name: 'Azure OpenAI',
           models: deployments.map(d => d.name),
           docUrl: 'https://learn.microsoft.com/en-us/azure/ai-services/openai/',
-          gateway: 'azure-openai',
+          gateway: this.id,
         },
       };
     } catch (error) {
@@ -315,13 +325,13 @@ export class AzureOpenAIGateway extends MastraModelGateway {
       );
 
       return {
-        'azure-openai': {
+        [this.id]: {
           apiKeyEnvVar: [],
           apiKeyHeader: 'api-key',
           name: 'Azure OpenAI',
           models: [],
           docUrl: 'https://learn.microsoft.com/en-us/azure/ai-services/openai/',
-          gateway: 'azure-openai',
+          gateway: this.id,
         },
       };
     }

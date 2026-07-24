@@ -8,6 +8,11 @@ import { enforceChannelToolFence, readChannelToolFence } from '../../../agent/ch
 import type { MessageList } from '../../../agent/message-list';
 import type { CreatedAgentSignal } from '../../../agent/signals';
 import {
+  readPreconvertedDeniedToolNames,
+  shouldOmitToolBeforeConversion,
+  TOOL_PERMISSION_POLICY_KEY,
+} from '../../../agent/tool-permission-prefilter';
+import {
   enforceActiveToolsFence,
   enforceToolChoiceFence,
   enforceToolSurfaceFence,
@@ -1260,8 +1265,10 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                 // callers that do not set the internal distinction retain the
                 // historical behavior of using the loop Mastra.
                 const toolContextMastra = _toolContextMastra === undefined ? mastra : (_toolContextMastra ?? undefined);
+                const toolRequestContext = requestContext ?? new RequestContext();
                 const convertedTools: Record<string, unknown> = {};
                 for (const [name, tool] of Object.entries(currentStep.tools)) {
+                  if (shouldOmitToolBeforeConversion(toolRequestContext, runId, name)) continue;
                   if (isMastraTool(tool)) {
                     convertedTools[name] = makeCoreTool(
                       tool as unknown as ToolToConvert,
@@ -1280,7 +1287,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                         memory: readScoped(scopeCtx, MEMORY_KEY, 'memory'),
                         agentId,
                         agentName: agentName || agentId,
-                        requestContext: requestContext || new RequestContext(),
+                        requestContext: toolRequestContext,
                         outputWriter,
                         workspace: currentStep.workspace,
                         requireApproval: (tool as any).requireApproval,
@@ -1348,11 +1355,11 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
           // unaffected. `ask`/`allow` tools stay exposed (`ask` still suspends at
           // the pre-action gate in tool-call-step). Mirrors the channel-tool-fence
           // pattern above.
-          const permissionPolicy = requestContext?.get('__mastra_toolPermissionPolicy') as
+          const permissionPolicy = requestContext?.get(TOOL_PERMISSION_POLICY_KEY) as
             | ((toolName: string) => 'allow' | 'ask' | 'deny')
             | undefined;
-          if (permissionPolicy && currentStep.tools) {
-            const toolSurface = currentStep.tools as Record<string, unknown>;
+          if (permissionPolicy) {
+            const toolSurface = (currentStep.tools ?? {}) as Record<string, unknown>;
             const toolChoice = currentStep.toolChoice as { type?: string; toolName?: string } | string | undefined;
             // §O4 — the forced-toolChoice denied tool (if any), resolved up front so
             // its `tool_denied` event carries `forcedToolChoice: true` on its FIRST
@@ -1365,35 +1372,44 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
               permissionPolicy(toolChoice.toolName) === 'deny'
                 ? toolChoice.toolName
                 : undefined;
-            // Surface each pre-exposure removal exactly once (a denied tool is
-            // otherwise dropped silently); dedup across the surface + activeTools +
-            // the forced-choice branch.
+            // Aggregate the denied inventory once per provider surface. A large
+            // app can expose hundreds of tools; emitting one durable event per
+            // denied name on every model step floods replay/activity retention.
             const deniedNames = new Set<string>();
-            const notifyDenied = (toolName: string): void => {
-              if (deniedNames.has(toolName)) return;
+            const markDenied = (toolName: string): void => {
               deniedNames.add(toolName);
-              notifyToolDenied(requestContext, {
-                toolName,
-                stage: 'pre-exposure',
-                ...(toolName === forcedDeniedName ? { forcedToolChoice: true } : {}),
-              });
             };
+            for (const toolName of readPreconvertedDeniedToolNames(requestContext, runId)) {
+              markDenied(toolName);
+            }
             for (const toolName of Object.keys(toolSurface)) {
               if (permissionPolicy(toolName) === 'deny') {
                 delete toolSurface[toolName];
-                notifyDenied(toolName);
+                markDenied(toolName);
               }
             }
             if (Array.isArray(currentStep.activeTools)) {
               currentStep.activeTools = (currentStep.activeTools as string[]).filter(name => {
                 if (permissionPolicy(name) !== 'deny') return true;
-                notifyDenied(name);
+                markDenied(name);
                 return false;
               }) as typeof currentStep.activeTools;
             }
             if (forcedDeniedName !== undefined) {
               // Covers a forced denied tool that was not in the surface/activeTools.
-              notifyDenied(forcedDeniedName);
+              markDenied(forcedDeniedName);
+            }
+            if (deniedNames.size > 0) {
+              const sortedDeniedNames = [...deniedNames].sort();
+              notifyToolDenied(requestContext, {
+                toolName: forcedDeniedName ?? sortedDeniedNames[0]!,
+                stage: 'pre-exposure',
+                deniedToolCount: sortedDeniedNames.length,
+                deniedToolNames: sortedDeniedNames.slice(0, 8),
+                ...(forcedDeniedName !== undefined ? { forcedToolChoice: true } : {}),
+              });
+            }
+            if (forcedDeniedName !== undefined) {
               throw new Error(
                 `Forced toolChoice names a permission-denied tool "${forcedDeniedName}" (pre-exposure gate, §4.2e)`,
               );
@@ -1421,6 +1437,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
               requireToolApproval,
               tools: currentStep.tools,
               activeTools: currentStep.activeTools as string[] | undefined,
+              permissionPolicy,
               configuredConcurrency: configuredToolCallConcurrency,
             });
           }
@@ -2234,14 +2251,14 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
       }
 
       const steps = inputData.output?.steps || [];
-
-      // Only include content from this iteration, not all accumulated content
-      // Get the number of existing response messages to know where this iteration starts
-      const existingResponseCount = inputData.messages?.nonUser?.length || 0;
-      const allResponseContent = messageList.get.response.aiV5.modelContent(steps.length);
-
-      // Extract only the content added in this iteration
-      const currentIterationContent = allResponseContent.slice(existingResponseCount);
+      // StepContentExtractor uses one-based step numbers. `steps.length` is the
+      // number of already-completed steps because the current result is pushed
+      // below, so the current iteration is `steps.length + 1`. Do not slice the
+      // returned content by `messages.nonUser.length`: that value counts model
+      // messages, while this array contains content parts. Mixing those units
+      // can erase the current step's tool calls (and parallel calls in
+      // particular) from the public StepResult.
+      const currentIterationContent = messageList.get.response.aiV5.modelContent(steps.length + 1);
 
       // Build tripwire data if this step is being rejected
       // This includes both retry scenarios and max retries exceeded

@@ -1,6 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { computeDelay, isTransientLLMError, RETRY_CONFIG, withRetry } from '../retry';
+import {
+  computeDelay,
+  isTransientLLMError,
+  ObservationalMemoryOperationTimeoutError,
+  RETRY_CONFIG,
+  withRetry,
+} from '../retry';
 
 describe('isTransientLLMError', () => {
   it('matches undici "terminated" error messages', () => {
@@ -104,14 +110,15 @@ describe('isTransientLLMError', () => {
 });
 
 describe('default retry schedule', () => {
-  // Tyler review (#16454): lock the schedule so the stated "few-minute" budget
-  // doesn't silently regress.
+  // Lock the single-owner retry budget so provider attempts and tail latency do
+  // not silently grow again.
 
   const defaults = {
-    maxRetries: 8,
+    maxRetries: 2,
     initialDelayMs: 1_000,
     backoffFactor: 2,
-    maxDelayMs: 120_000,
+    maxDelayMs: 2_000,
+    timeoutMs: 60_000,
   };
 
   it('has the expected default config', () => {
@@ -119,27 +126,27 @@ describe('default retry schedule', () => {
     expect(RETRY_CONFIG.initialDelayMs).toBe(defaults.initialDelayMs);
     expect(RETRY_CONFIG.backoffFactor).toBe(defaults.backoffFactor);
     expect(RETRY_CONFIG.maxDelayMs).toBe(defaults.maxDelayMs);
+    expect(RETRY_CONFIG.timeoutMs).toBe(defaults.timeoutMs);
   });
 
   it('produces the expected pre-jitter schedule and total budget', () => {
     const originalJitter = RETRY_CONFIG.jitter;
     RETRY_CONFIG.jitter = 0;
     try {
-      const expectedSchedule = [1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000, 120_000];
+      const expectedSchedule = [1_000, 2_000];
       const actualSchedule: number[] = [];
       for (let attempt = 0; attempt < RETRY_CONFIG.maxRetries; attempt++) {
         actualSchedule.push(computeDelay(attempt));
       }
       expect(actualSchedule).toEqual(expectedSchedule);
 
-      // Final retry delay must hit the configured cap.
+      // Final retry delay reaches the configured cap.
       expect(actualSchedule[actualSchedule.length - 1]).toBe(RETRY_CONFIG.maxDelayMs);
 
-      // ~247s total — i.e. the "few-minute" budget actually reaches minutes-scale.
+      // Three provider attempts have only three seconds of pre-jitter backoff.
       const totalBudgetMs = actualSchedule.reduce((a, b) => a + b, 0);
-      expect(totalBudgetMs).toBe(247_000);
-      expect(totalBudgetMs).toBeGreaterThanOrEqual(3 * 60_000);
-      expect(totalBudgetMs).toBeLessThanOrEqual(8 * 60_000);
+      expect(totalBudgetMs).toBe(3_000);
+      expect(totalBudgetMs).toBeLessThan(RETRY_CONFIG.timeoutMs);
     } finally {
       RETRY_CONFIG.jitter = originalJitter;
     }
@@ -156,9 +163,11 @@ describe('withRetry', () => {
     RETRY_CONFIG.backoffFactor = 2;
     RETRY_CONFIG.jitter = 0;
     RETRY_CONFIG.maxRetries = 3;
+    RETRY_CONFIG.timeoutMs = 10_000;
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     Object.assign(RETRY_CONFIG, originalConfig);
   });
 
@@ -169,13 +178,27 @@ describe('withRetry', () => {
   });
 
   it('retries on transient errors and eventually succeeds', async () => {
+    vi.useFakeTimers();
+    RETRY_CONFIG.initialDelayMs = 1_000;
+    RETRY_CONFIG.maxDelayMs = 2_000;
     const fn = vi
       .fn()
       .mockRejectedValueOnce(new TypeError('terminated'))
       .mockRejectedValueOnce(new TypeError('fetch failed'))
       .mockResolvedValue('ok');
 
-    await expect(withRetry(fn, { label: 'test' })).resolves.toBe('ok');
+    const result = withRetry(fn, { label: 'test' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fn).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(999);
+    expect(fn).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(fn).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(fn).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(1);
+
+    await expect(result).resolves.toBe('ok');
     expect(fn).toHaveBeenCalledTimes(3);
   });
 
@@ -213,19 +236,61 @@ describe('withRetry', () => {
   });
 
   it('stops retrying once abortSignal fires mid-backoff', async () => {
+    vi.useFakeTimers();
     const controller = new AbortController();
-    RETRY_CONFIG.initialDelayMs = 50;
-    RETRY_CONFIG.maxDelayMs = 200;
+    RETRY_CONFIG.initialDelayMs = 1_000;
+    RETRY_CONFIG.maxDelayMs = 2_000;
 
     const fn = vi.fn().mockRejectedValue(new TypeError('terminated'));
 
     const promise = withRetry(fn, { label: 'test', abortSignal: controller.signal });
-    // Let the first attempt fail, then abort during backoff.
-    await new Promise(r => setTimeout(r, 10));
+    const rejection = expect(promise).rejects.toThrow(/aborted/i);
+    await vi.advanceTimersByTimeAsync(0);
     controller.abort();
 
-    await expect(promise).rejects.toThrow(/aborted/);
+    await rejection;
     // Exactly one attempt happened before we aborted the backoff wait.
     expect(fn).toHaveBeenCalledTimes(1);
+  });
+
+  it('cancels an in-flight attempt at the total operation deadline', async () => {
+    vi.useFakeTimers();
+    RETRY_CONFIG.timeoutMs = 50;
+    let attemptSignal: AbortSignal | undefined;
+    const fn = vi.fn((signal: AbortSignal) => {
+      attemptSignal = signal;
+      // Deliberately ignore cancellation: the deadline race must still release
+      // the caller while propagating the aborted signal to the provider.
+      return new Promise<never>(() => {});
+    });
+
+    const promise = withRetry(fn, { label: 'observer' });
+    const rejection = expect(promise).rejects.toBeInstanceOf(ObservationalMemoryOperationTimeoutError);
+    await vi.advanceTimersByTimeAsync(49);
+    expect(fn).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+
+    await rejection;
+    expect(fn).toHaveBeenCalledTimes(1);
+    expect(attemptSignal?.aborted).toBe(true);
+    expect(attemptSignal?.reason).toBeInstanceOf(ObservationalMemoryOperationTimeoutError);
+  });
+
+  it('uses one total deadline across attempts and backoff', async () => {
+    vi.useFakeTimers();
+    RETRY_CONFIG.maxRetries = 5;
+    RETRY_CONFIG.initialDelayMs = 1_000;
+    RETRY_CONFIG.maxDelayMs = 2_000;
+    RETRY_CONFIG.timeoutMs = 1_500;
+    const fn = vi.fn().mockRejectedValue(new TypeError('terminated'));
+
+    const promise = withRetry(fn, { label: 'reflector' });
+    const rejection = expect(promise).rejects.toThrow('timed out after 1500ms');
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(fn).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(500);
+
+    await rejection;
+    expect(fn).toHaveBeenCalledTimes(2);
   });
 });

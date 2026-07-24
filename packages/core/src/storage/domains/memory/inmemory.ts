@@ -25,19 +25,93 @@ import type {
   SwapBufferedToActiveResult,
   SwapBufferedReflectionToActiveInput,
   CreateReflectionGenerationInput,
+  ObservationalMemoryWriteGuard,
+  ObservationalMemoryRetractionReceipt,
+  RetractObservationalMemoryInput,
+  RetractObservationalMemoryResult,
   UpdateObservationalMemoryConfigInput,
 } from '../../types';
 import { filterByDateRange, jsonValueEquals, safelyParseJSON } from '../../utils';
 import type { InMemoryDB } from '../inmemory-db';
 import { MemoryStorage } from './base';
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function getManagedWorkingMemoryScopes(records: readonly ObservationalMemoryRecord[]): Set<'thread' | 'resource'> {
+  const scopes = new Set<'thread' | 'resource'>();
+  for (const record of records) {
+    const scope = record.config?._managedWorkingMemoryScope;
+    if (scope === 'thread' || scope === 'resource') {
+      scopes.add(scope);
+    }
+  }
+  return scopes;
+}
+
+function removeObservationalMemoryMetadata(
+  metadata: Record<string, unknown> | undefined,
+  clearWorkingMemory: boolean,
+): {
+  metadata: Record<string, unknown>;
+  removed: boolean;
+  derivedTitle?: string;
+} {
+  const current = metadata ?? {};
+  const cleaned = { ...current };
+  let removed = false;
+  if (clearWorkingMemory && Object.prototype.hasOwnProperty.call(cleaned, 'workingMemory')) {
+    delete cleaned.workingMemory;
+    removed = true;
+  }
+
+  if (!isRecord(current.mastra) || !isRecord(current.mastra.om)) {
+    return { metadata: cleaned, removed };
+  }
+
+  const om = current.mastra.om;
+  const mastra = { ...current.mastra };
+  const derivedTitle = typeof om.threadTitle === 'string' ? om.threadTitle : undefined;
+  delete mastra.om;
+  return {
+    metadata: { ...cleaned, mastra },
+    removed: true,
+    ...(derivedTitle === undefined ? {} : { derivedTitle }),
+  };
+}
+
 export class InMemoryMemory extends MemoryStorage {
   readonly supportsObservationalMemory = true;
+  readonly supportsAtomicObservationalMemoryRetraction = true;
   private db: InMemoryDB;
 
   constructor({ db }: { db: InMemoryDB }) {
     super();
     this.db = db;
+  }
+
+  private withMemoryStateRollback<T>(enabled: boolean, operation: () => T): T {
+    if (!enabled) return operation();
+
+    const threads = new Map([...this.db.threads].map(([key, value]) => [key, { ...value }]));
+    const messages = new Map([...this.db.messages].map(([key, value]) => [key, { ...value }]));
+    const resources = new Map([...this.db.resources].map(([key, value]) => [key, { ...value }]));
+    const observationalMemory = new Map([...this.db.observationalMemory].map(([key, value]) => [key, [...value]]));
+    const restore = <K, V>(target: Map<K, V>, snapshot: Map<K, V>) => {
+      target.clear();
+      for (const [key, value] of snapshot) target.set(key, value);
+    };
+
+    try {
+      return operation();
+    } catch (error) {
+      restore(this.db.threads, threads);
+      restore(this.db.messages, messages);
+      restore(this.db.resources, resources);
+      restore(this.db.observationalMemory, observationalMemory);
+      throw error;
+    }
   }
 
   async dangerouslyClearAll(): Promise<void> {
@@ -88,14 +162,33 @@ export class InMemoryMemory extends MemoryStorage {
     return thread;
   }
 
-  async deleteThread({ threadId }: { threadId: string }): Promise<void> {
-    this.db.threads.delete(threadId);
+  async deleteThread({
+    threadId,
+    observationalMemoryRetractions,
+  }: {
+    threadId: string;
+    observationalMemoryRetractions?: ObservationalMemoryRetractionReceipt[];
+  }): Promise<void> {
+    const thread = this.db.threads.get(threadId);
+    let committedRetraction: ObservationalMemoryRetractionReceipt | undefined;
 
-    this.db.messages.forEach((msg, key) => {
-      if (msg.thread_id === threadId) {
-        this.db.messages.delete(key);
+    this.withMemoryStateRollback(true, () => {
+      this.db.threads.delete(threadId);
+
+      this.db.messages.forEach((msg, key) => {
+        if (msg.thread_id === threadId) {
+          this.db.messages.delete(key);
+        }
+      });
+
+      if (thread?.resourceId) {
+        const input = { resourceId: thread.resourceId, threadId };
+        const result = this.retractObservationalMemoryState(input);
+        committedRetraction = { input, result };
       }
     });
+
+    if (committedRetraction) observationalMemoryRetractions?.push(committedRetraction);
   }
 
   async listMessages({
@@ -440,110 +533,187 @@ export class InMemoryMemory extends MemoryStorage {
     return { messages: list.get.all.db() };
   }
 
-  async updateMessages(args: { messages: (Partial<MastraDBMessage> & { id: string })[] }): Promise<MastraDBMessage[]> {
-    const updatedMessages: MastraDBMessage[] = [];
-    for (const update of args.messages) {
-      const storageMsg = this.db.messages.get(update.id);
-      if (!storageMsg) continue;
+  async updateMessages(args: {
+    messages: (Partial<MastraDBMessage> & { id: string })[];
+    retractObservationalMemory?: boolean;
+    observationalMemoryRetractions?: ObservationalMemoryRetractionReceipt[];
+  }): Promise<MastraDBMessage[]> {
+    const committedRetractions: ObservationalMemoryRetractionReceipt[] = [];
+    const updatedMessages = this.withMemoryStateRollback(args.retractObservationalMemory === true, () => {
+      const retractionCoordinates: Array<{ resourceId: string; threadId: string }> = [];
+      if (args.retractObservationalMemory) {
+        const coordinates = new Map<string, { resourceId: string; threadId: string }>();
+        const addCoordinate = (resourceId: string | undefined, threadId: string | undefined) => {
+          if (!resourceId || !threadId) return;
+          coordinates.set(`${resourceId}\u0000${threadId}`, { resourceId, threadId });
+        };
+        for (const update of args.messages) {
+          const message = this.db.messages.get(update.id);
+          if (!message?.thread_id) continue;
+          const sourceResourceId = message.resourceId ?? this.db.threads.get(message.thread_id)?.resourceId;
+          addCoordinate(sourceResourceId, message.thread_id);
 
-      // Track old threadId for possible move
-      const oldThreadId = storageMsg.thread_id;
-      const newThreadId = update.threadId || oldThreadId;
-      let threadIdChanged = false;
-      if (update.threadId && update.threadId !== oldThreadId) {
-        threadIdChanged = true;
+          const destinationThreadId = update.threadId ?? message.thread_id;
+          const destinationResourceId =
+            update.resourceId ??
+            (destinationThreadId === message.thread_id
+              ? sourceResourceId
+              : this.db.threads.get(destinationThreadId)?.resourceId);
+          addCoordinate(destinationResourceId, destinationThreadId);
+        }
+        retractionCoordinates.push(
+          ...[...coordinates.values()].sort((a, b) =>
+            `${a.resourceId}\u0000${a.threadId}`.localeCompare(`${b.resourceId}\u0000${b.threadId}`),
+          ),
+        );
       }
 
-      // Update fields
-      if (update.role !== undefined) storageMsg.role = update.role;
-      if (update.type !== undefined) storageMsg.type = update.type;
-      if (update.createdAt !== undefined) storageMsg.createdAt = update.createdAt;
-      if (update.resourceId !== undefined) storageMsg.resourceId = update.resourceId;
-      // Deep merge content if present
-      if (update.content !== undefined) {
-        let oldContent = safelyParseJSON(storageMsg.content);
-        let newContent = update.content;
-        if (typeof newContent === 'object' && typeof oldContent === 'object') {
-          // Deep merge for metadata/content fields
-          newContent = { ...oldContent, ...newContent };
-          if (oldContent.metadata && newContent.metadata) {
-            newContent.metadata = { ...oldContent.metadata, ...newContent.metadata };
+      const mutationResults: MastraDBMessage[] = [];
+      for (const update of args.messages) {
+        const storageMsg = this.db.messages.get(update.id);
+        if (!storageMsg) continue;
+
+        // Track old threadId for possible move
+        const oldThreadId = storageMsg.thread_id;
+        const newThreadId = update.threadId || oldThreadId;
+        let threadIdChanged = false;
+        if (update.threadId && update.threadId !== oldThreadId) {
+          threadIdChanged = true;
+        }
+
+        // Update fields
+        if (update.role !== undefined) storageMsg.role = update.role;
+        if (update.type !== undefined) storageMsg.type = update.type;
+        if (update.createdAt !== undefined) storageMsg.createdAt = update.createdAt;
+        if (update.resourceId !== undefined) storageMsg.resourceId = update.resourceId;
+        // Deep merge content if present
+        if (update.content !== undefined) {
+          let oldContent = safelyParseJSON(storageMsg.content);
+          let newContent = update.content;
+          if (typeof newContent === 'object' && typeof oldContent === 'object') {
+            // Deep merge for metadata/content fields
+            newContent = { ...oldContent, ...newContent };
+            if (oldContent.metadata && newContent.metadata) {
+              newContent.metadata = { ...oldContent.metadata, ...newContent.metadata };
+            }
+          }
+          storageMsg.content = JSON.stringify(newContent);
+        }
+        // Handle threadId change
+        if (threadIdChanged) {
+          storageMsg.thread_id = newThreadId;
+          // Update updatedAt for both threads, ensuring strictly greater and not equal
+          const base = Date.now();
+          let oldThreadNewTime: number | undefined;
+          const oldThread = this.db.threads.get(oldThreadId);
+          if (oldThread) {
+            const prev = new Date(oldThread.updatedAt).getTime();
+            oldThreadNewTime = Math.max(base, prev + 1);
+            oldThread.updatedAt = new Date(oldThreadNewTime);
+          }
+          const newThread = this.db.threads.get(newThreadId);
+          if (newThread) {
+            const prev = new Date(newThread.updatedAt).getTime();
+            let newThreadNewTime = Math.max(base + 1, prev + 1);
+            if (oldThreadNewTime !== undefined && newThreadNewTime <= oldThreadNewTime) {
+              newThreadNewTime = oldThreadNewTime + 1;
+            }
+            newThread.updatedAt = new Date(newThreadNewTime);
+          }
+        } else {
+          // Only update the thread's updatedAt if not a move
+          const thread = this.db.threads.get(oldThreadId);
+          if (thread) {
+            const prev = new Date(thread.updatedAt).getTime();
+            let newTime = Date.now();
+            if (newTime <= prev) newTime = prev + 1;
+            thread.updatedAt = new Date(newTime);
           }
         }
-        storageMsg.content = JSON.stringify(newContent);
+        // Save the updated message
+        this.db.messages.set(update.id, storageMsg);
+        // Return as MastraDBMessage
+        mutationResults.push({
+          id: storageMsg.id,
+          threadId: storageMsg.thread_id,
+          content: safelyParseJSON(storageMsg.content),
+          role: storageMsg.role === 'user' || storageMsg.role === 'assistant' ? storageMsg.role : 'user',
+          type: storageMsg.type,
+          createdAt: storageMsg.createdAt,
+          resourceId: storageMsg.resourceId === null ? undefined : storageMsg.resourceId,
+        });
       }
-      // Handle threadId change
-      if (threadIdChanged) {
-        storageMsg.thread_id = newThreadId;
-        // Update updatedAt for both threads, ensuring strictly greater and not equal
-        const base = Date.now();
-        let oldThreadNewTime: number | undefined;
-        const oldThread = this.db.threads.get(oldThreadId);
-        if (oldThread) {
-          const prev = new Date(oldThread.updatedAt).getTime();
-          oldThreadNewTime = Math.max(base, prev + 1);
-          oldThread.updatedAt = new Date(oldThreadNewTime);
-        }
-        const newThread = this.db.threads.get(newThreadId);
-        if (newThread) {
-          const prev = new Date(newThread.updatedAt).getTime();
-          let newThreadNewTime = Math.max(base + 1, prev + 1);
-          if (oldThreadNewTime !== undefined && newThreadNewTime <= oldThreadNewTime) {
-            newThreadNewTime = oldThreadNewTime + 1;
-          }
-          newThread.updatedAt = new Date(newThreadNewTime);
-        }
-      } else {
-        // Only update the thread's updatedAt if not a move
-        const thread = this.db.threads.get(oldThreadId);
-        if (thread) {
-          const prev = new Date(thread.updatedAt).getTime();
-          let newTime = Date.now();
-          if (newTime <= prev) newTime = prev + 1;
-          thread.updatedAt = new Date(newTime);
-        }
+
+      for (const input of retractionCoordinates) {
+        const result = this.retractObservationalMemoryState(input);
+        committedRetractions.push({ input, result });
       }
-      // Save the updated message
-      this.db.messages.set(update.id, storageMsg);
-      // Return as MastraDBMessage
-      updatedMessages.push({
-        id: storageMsg.id,
-        threadId: storageMsg.thread_id,
-        content: safelyParseJSON(storageMsg.content),
-        role: storageMsg.role === 'user' || storageMsg.role === 'assistant' ? storageMsg.role : 'user',
-        type: storageMsg.type,
-        createdAt: storageMsg.createdAt,
-        resourceId: storageMsg.resourceId === null ? undefined : storageMsg.resourceId,
-      });
-    }
+      return mutationResults;
+    });
+    args.observationalMemoryRetractions?.push(...committedRetractions);
     return updatedMessages;
   }
 
-  async deleteMessages(messageIds: string[]): Promise<void> {
+  async deleteMessages(
+    messageIds: string[],
+    options?: {
+      retractObservationalMemory?: boolean;
+      observationalMemoryRetractions?: ObservationalMemoryRetractionReceipt[];
+    },
+  ): Promise<void> {
     if (!messageIds || messageIds.length === 0) {
       return;
     }
 
-    // Collect thread IDs to update
-    const threadIds = new Set<string>();
-
-    for (const messageId of messageIds) {
-      const message = this.db.messages.get(messageId);
-      if (message && message.thread_id) {
-        threadIds.add(message.thread_id);
+    const committedRetractions: ObservationalMemoryRetractionReceipt[] = [];
+    this.withMemoryStateRollback(options?.retractObservationalMemory === true, () => {
+      const retractionCoordinates: Array<{ resourceId: string; threadId: string }> = [];
+      if (options?.retractObservationalMemory) {
+        const coordinates = new Map<string, { resourceId: string; threadId: string }>();
+        for (const messageId of messageIds) {
+          const message = this.db.messages.get(messageId);
+          if (!message?.thread_id) continue;
+          const resourceId = message.resourceId ?? this.db.threads.get(message.thread_id)?.resourceId;
+          if (!resourceId) continue;
+          coordinates.set(`${resourceId}\u0000${message.thread_id}`, {
+            resourceId,
+            threadId: message.thread_id,
+          });
+        }
+        retractionCoordinates.push(
+          ...[...coordinates.values()].sort((a, b) =>
+            `${a.resourceId}\u0000${a.threadId}`.localeCompare(`${b.resourceId}\u0000${b.threadId}`),
+          ),
+        );
       }
-      // Delete the message
-      this.db.messages.delete(messageId);
-    }
 
-    // Update thread timestamps
-    const now = new Date();
-    for (const threadId of threadIds) {
-      const thread = this.db.threads.get(threadId);
-      if (thread) {
-        thread.updatedAt = now;
+      // Collect thread IDs to update
+      const threadIds = new Set<string>();
+
+      for (const messageId of messageIds) {
+        const message = this.db.messages.get(messageId);
+        if (message && message.thread_id) {
+          threadIds.add(message.thread_id);
+        }
+        // Delete the message
+        this.db.messages.delete(messageId);
       }
-    }
+
+      // Update thread timestamps
+      const now = new Date();
+      for (const threadId of threadIds) {
+        const thread = this.db.threads.get(threadId);
+        if (thread) {
+          thread.updatedAt = now;
+        }
+      }
+
+      for (const input of retractionCoordinates) {
+        const result = this.retractObservationalMemoryState(input);
+        committedRetractions.push({ input, result });
+      }
+    });
+    options?.observationalMemoryRetractions?.push(...committedRetractions);
   }
 
   async listThreads(args: StorageListThreadsInput): Promise<StorageListThreadsOutput> {
@@ -640,8 +810,71 @@ export class InMemoryMemory extends MemoryStorage {
     return resource;
   }
 
-  async deleteResource({ resourceId }: { resourceId: string }): Promise<void> {
+  async updateResourceFromObservationalMemory({
+    resourceId,
+    workingMemory,
+    guard,
+  }: {
+    resourceId: string;
+    workingMemory: string;
+    guard: ObservationalMemoryWriteGuard;
+  }): Promise<StorageResourceType> {
+    if (guard.resourceId !== resourceId) {
+      throw new Error('Observational memory guard does not match the target resource.');
+    }
+    const current = this.db.observationalMemory.get(
+      this.getObservationalMemoryKey(guard.threadId, guard.resourceId),
+    )?.[0];
+    if (current?.id !== guard.recordId) {
+      throw new Error('Observational memory generation is no longer current.');
+    }
+    return this.updateResource({ resourceId, workingMemory });
+  }
+
+  async updateThreadFromObservationalMemory({
+    id,
+    title,
+    metadata,
+    guard,
+  }: {
+    id: string;
+    title: string;
+    metadata: Record<string, unknown>;
+    guard: ObservationalMemoryWriteGuard;
+  }): Promise<StorageThreadType> {
+    if (guard.threadId !== null && guard.threadId !== id) {
+      throw new Error('Observational memory guard does not match the target thread.');
+    }
+    const thread = this.db.threads.get(id);
+    if (!thread || thread.resourceId !== guard.resourceId) {
+      throw new Error('Observational memory guard does not match the target thread resource.');
+    }
+    const current = this.db.observationalMemory.get(
+      this.getObservationalMemoryKey(guard.threadId, guard.resourceId),
+    )?.[0];
+    if (current?.id !== guard.recordId) {
+      throw new Error('Observational memory generation is no longer current.');
+    }
+    return this.updateThread({ id, title, metadata });
+  }
+
+  async deleteResource({
+    resourceId,
+    observationalMemoryRecordIds,
+  }: {
+    resourceId: string;
+    observationalMemoryRecordIds?: string[];
+  }): Promise<void> {
+    const resourceObservationalMemoryKey = this.getObservationalMemoryKey(null, resourceId);
+    const erasedRecordIds = (this.db.observationalMemory.get(resourceObservationalMemoryKey) ?? []).map(
+      record => record.id,
+    );
     this.db.resources.delete(resourceId);
+    // Resource erasure must not orphan the resource-scoped observational
+    // memory record (thread-scoped records stay with their threads, which
+    // deleteResource deliberately preserves).
+    this.db.observationalMemory.delete(resourceObservationalMemoryKey);
+    observationalMemoryRecordIds?.push(...erasedRecordIds);
   }
 
   async cloneThread(args: StorageCloneThreadInput): Promise<StorageCloneThreadOutput> {
@@ -1093,6 +1326,9 @@ export class InMemoryMemory extends MemoryStorage {
   async createReflectionGeneration(input: CreateReflectionGenerationInput): Promise<ObservationalMemoryRecord> {
     const { currentRecord, reflection, tokenCount } = input;
     const key = this.getObservationalMemoryKey(currentRecord.threadId, currentRecord.resourceId);
+    if (this.db.observationalMemory.get(key)?.[0]?.id !== currentRecord.id) {
+      throw new Error('Observational memory generation is no longer current.');
+    }
     const now = new Date();
 
     const newRecord: ObservationalMemoryRecord = {
@@ -1233,6 +1469,59 @@ export class InMemoryMemory extends MemoryStorage {
   async clearObservationalMemory(threadId: string | null, resourceId: string): Promise<void> {
     const key = this.getObservationalMemoryKey(threadId, resourceId);
     this.db.observationalMemory.delete(key);
+  }
+
+  private retractObservationalMemoryState(input: RetractObservationalMemoryInput): RetractObservationalMemoryResult {
+    const resourceKey = this.getObservationalMemoryKey(null, input.resourceId);
+    const threadKey = this.getObservationalMemoryKey(input.threadId, input.resourceId);
+    const resourceRecords = this.db.observationalMemory.get(resourceKey) ?? [];
+    const threadRecords = this.db.observationalMemory.get(threadKey) ?? [];
+    const clearedScopes: Array<'resource' | 'thread'> = [];
+    if (resourceRecords.length > 0) clearedScopes.push('resource');
+    if (threadRecords.length > 0) clearedScopes.push('thread');
+    this.db.observationalMemory.delete(resourceKey);
+    this.db.observationalMemory.delete(threadKey);
+
+    const managedWorkingMemoryScopes = getManagedWorkingMemoryScopes([...resourceRecords, ...threadRecords]);
+    const resource = this.db.resources.get(input.resourceId);
+    const clearedResourceWorkingMemory =
+      managedWorkingMemoryScopes.has('resource') && resource?.workingMemory !== undefined;
+    if (resource && clearedResourceWorkingMemory) {
+      this.db.resources.set(input.resourceId, {
+        ...resource,
+        workingMemory: undefined,
+        updatedAt: new Date(),
+      });
+    }
+
+    let clearedThreadMetadata = false;
+    const threads =
+      resourceRecords.length > 0
+        ? [...this.db.threads.values()].filter(thread => thread.resourceId === input.resourceId)
+        : threadRecords.length > 0
+          ? [this.db.threads.get(input.threadId)].filter((thread): thread is StorageThreadType => thread !== undefined)
+          : [];
+    for (const thread of threads) {
+      const cleaned = removeObservationalMemoryMetadata(thread.metadata, managedWorkingMemoryScopes.has('thread'));
+      if (!cleaned.removed) continue;
+      clearedThreadMetadata = true;
+      this.db.threads.set(thread.id, {
+        ...thread,
+        title: cleaned.derivedTitle === thread.title ? '' : thread.title,
+        metadata: cleaned.metadata,
+        updatedAt: new Date(),
+      });
+    }
+
+    return {
+      clearedScopes,
+      clearedResourceWorkingMemory,
+      clearedThreadMetadata,
+    };
+  }
+
+  async retractObservationalMemory(input: RetractObservationalMemoryInput): Promise<RetractObservationalMemoryResult> {
+    return this.retractObservationalMemoryState(input);
   }
 
   async setPendingMessageTokens(id: string, tokenCount: number): Promise<void> {

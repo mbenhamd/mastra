@@ -132,9 +132,61 @@ export function createHarnessTest({ storage }: HarnessTestOptions) {
       it('persists JSON-encoded fields losslessly', async () => {
         if (!harness) return;
         const record = createSampleSessionRecord({
+          subagentTypeId: 'critic',
+          subagentToolAllowlistScoped: true,
           permissionRules: {
             categories: { write: 'ask' },
             tools: { dangerous_tool: 'deny' },
+          },
+          permissionRulesSeedHash: 'seed-hash-v1',
+          pendingResume: {
+            kind: 'tool-approval',
+            itemId: 'approval-1',
+            runId: 'run-1',
+            toolCallId: 'approval-call-1',
+            toolName: 'write_file',
+            source: 'subagent',
+            requestedAt: 1050,
+            expiresAt: 1650,
+            toolReceipts: [
+              {
+                toolCallId: 'compile-1',
+                toolName: 'compile_latex',
+                status: 'error',
+              },
+            ],
+            toolReceiptsOverflow: true,
+          },
+          currentRun: {
+            runId: 'run-1',
+            harnessName: 'default',
+            sessionId: 'session-1',
+            resourceId: 'resource-1',
+            threadId: 'thread-1',
+            agentId: 'critic-agent',
+            operation: { kind: 'signal', signalId: 'signal-1' },
+            modeId: 'build',
+            modelId: 'claude-opus-4-7',
+            status: 'waiting',
+            startedAt: 1000,
+            updatedAt: 1100,
+          },
+          assistantDrafts: {
+            'run-1': {
+              runId: 'run-1',
+              sessionId: 'session-1',
+              resourceId: 'resource-1',
+              threadId: 'thread-1',
+              text: 'durable partial answer',
+              status: 'streaming',
+              startedAt: 1000,
+              updatedAt: 1100,
+            },
+          },
+          cancelRequest: {
+            requestedAt: 1200,
+            reason: 'operator-stop',
+            requestedBy: 'conformance-test',
           },
           tokenUsage: { promptTokens: 100, completionTokens: 50, totalTokens: 150 },
           state: { foo: { bar: [1, 2, 3] }, n: 42 },
@@ -152,6 +204,13 @@ export function createHarnessTest({ storage }: HarnessTestOptions) {
         await harness.saveSession(record, { ownerId: 'h-1', ifVersion: 0 });
         const loaded = await harness.loadSession({ sessionId: 'session-1' });
         expect(loaded?.permissionRules).toEqual(record.permissionRules);
+        expect(loaded?.permissionRulesSeedHash).toBe(record.permissionRulesSeedHash);
+        expect(loaded?.subagentTypeId).toBe(record.subagentTypeId);
+        expect(loaded?.subagentToolAllowlistScoped).toBe(true);
+        expect(loaded?.pendingResume).toEqual(record.pendingResume);
+        expect(loaded?.currentRun).toEqual(record.currentRun);
+        expect(loaded?.assistantDrafts).toEqual(record.assistantDrafts);
+        expect(loaded?.cancelRequest).toEqual(record.cancelRequest);
         expect(loaded?.tokenUsage).toEqual(record.tokenUsage);
         expect(loaded?.state).toEqual(record.state);
         expect(loaded?.goal).toEqual(record.goal);
@@ -203,7 +262,7 @@ export function createHarnessTest({ storage }: HarnessTestOptions) {
               enqueuedAt: 1000,
               content: 'queued',
               attachments: [],
-              requestContext: { userId: 'user-1' },
+              requestContext: { metadata: { userId: 'user-1' } },
             },
           ],
           queueAdmissionReceipts: {
@@ -245,14 +304,18 @@ export function createHarnessTest({ storage }: HarnessTestOptions) {
         expect(loaded?.id).toBe('session-1');
       });
 
-      it('skips closed records and returns null when only closed exist', async () => {
+      it('returns the closed owner as the reopen candidate', async () => {
         if (!harness) return;
-        await harness.saveSession(createSampleSessionRecord({ closedAt: Date.now() }), {
+        const closedAt = Date.now();
+        await harness.saveSession(createSampleSessionRecord({ closedAt }), {
           ownerId: 'h-1',
           ifVersion: 0,
         });
 
-        expect(await harness.loadSessionByThread({ threadId: 'thread-1', resourceId: 'resource-1' })).toBeNull();
+        expect(await harness.loadSessionByThread({ threadId: 'thread-1', resourceId: 'resource-1' })).toMatchObject({
+          id: 'session-1',
+          closedAt,
+        });
       });
 
       it('does not leak across resourceId', async () => {

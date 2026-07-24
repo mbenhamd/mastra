@@ -30,6 +30,11 @@ export interface HarnessDisplayActiveSubagentSnapshotV1 {
   task: string;
   parentToolCallId: string;
   startedAt: number;
+  status?: ActiveSubagentState['status'];
+  currentToolName?: string;
+  toolCalls?: number;
+  usage?: TokenUsage;
+  updatedAt?: number;
 }
 
 export interface HarnessDisplayPendingSnapshotV1 extends Omit<SessionDisplayPending, 'payload'> {
@@ -144,13 +149,19 @@ function encodeActiveTool(tool: ActiveToolState): HarnessDisplayActiveToolSnapsh
 }
 
 function encodeActiveSubagent(subagent: ActiveSubagentState): HarnessDisplayActiveSubagentSnapshotV1 {
-  return {
+  const encoded: HarnessDisplayActiveSubagentSnapshotV1 = {
     subagentSessionId: subagent.subagentSessionId,
     agentType: subagent.agentType,
     task: subagent.task,
     parentToolCallId: subagent.parentToolCallId,
     startedAt: subagent.startedAt,
   };
+  if (subagent.status !== undefined) encoded.status = subagent.status;
+  if (subagent.currentToolName !== undefined) encoded.currentToolName = subagent.currentToolName;
+  if (subagent.toolCalls !== undefined) encoded.toolCalls = subagent.toolCalls;
+  if (subagent.usage !== undefined) encoded.usage = { ...subagent.usage };
+  if (subagent.updatedAt !== undefined) encoded.updatedAt = subagent.updatedAt;
+  return encoded;
 }
 
 function encodePending(pending: SessionDisplayPending | null): HarnessDisplayPendingSnapshotV1 | null {
@@ -159,6 +170,27 @@ function encodePending(pending: SessionDisplayPending | null): HarnessDisplayPen
   const encoded: HarnessDisplayPendingSnapshotV1 = pendingWithoutPayload;
   if (pending.payload !== undefined) encoded.payload = toHarnessDisplayJsonValue(pending.payload);
   return encoded;
+}
+
+function encodeAssistantDraft(
+  draft: NonNullable<SessionDisplayState['assistantDrafts']>[string],
+): NonNullable<SessionDisplayState['assistantDrafts']>[string] {
+  return {
+    runId: draft.runId,
+    sessionId: draft.sessionId,
+    resourceId: draft.resourceId,
+    threadId: draft.threadId,
+    ...(draft.signalId === undefined ? {} : { signalId: draft.signalId }),
+    ...(draft.queuedItemId === undefined ? {} : { queuedItemId: draft.queuedItemId }),
+    ...(draft.messageId === undefined ? {} : { messageId: draft.messageId }),
+    text: draft.text,
+    status: draft.status,
+    startedAt: draft.startedAt,
+    updatedAt: draft.updatedAt,
+    ...(draft.terminalAt === undefined ? {} : { terminalAt: draft.terminalAt }),
+    ...(draft.finishReason === undefined ? {} : { finishReason: draft.finishReason }),
+    ...(draft.truncated === undefined ? {} : { truncated: draft.truncated }),
+  };
 }
 
 export function toHarnessDisplayStateSnapshotV1(state: SessionDisplayState): HarnessDisplayStateSnapshotV1 {
@@ -186,14 +218,7 @@ export function toHarnessDisplayStateSnapshotV1(state: SessionDisplayState): Har
       Object.entries(state.activeSubagents).map(([id, subagent]) => [id, encodeActiveSubagent(subagent)]),
     ),
     assistantDrafts: Object.fromEntries(
-      Object.entries(state.assistantDrafts ?? {}).map(([runId, draft]) => [
-        runId,
-        {
-          ...draft,
-          text: draft.text,
-          ...(draft.reasoningText !== undefined ? { reasoningText: draft.reasoningText } : {}),
-        },
-      ]),
+      Object.entries(state.assistantDrafts ?? {}).map(([runId, draft]) => [runId, encodeAssistantDraft(draft)]),
     ),
     tokenUsage: { ...state.tokenUsage },
     pending: encodePending(state.pending),

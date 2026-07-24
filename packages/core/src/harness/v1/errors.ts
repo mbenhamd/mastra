@@ -562,6 +562,24 @@ export class HarnessQueueItemExpiredError extends HarnessError {
   }
 }
 
+/**
+ * A durable user interaction reached its deadline before any response won the
+ * session CAS. The session remains usable for future turns; only the suspended
+ * run is terminalized.
+ */
+export class HarnessPendingInteractionExpiredError extends HarnessError {
+  readonly name = 'HarnessPendingInteractionExpiredError';
+  readonly code = 'harness.pending_interaction_expired';
+
+  constructor(
+    public readonly sessionId: string,
+    public readonly itemId: string,
+    public readonly expiresAt: number,
+  ) {
+    super(`Pending interaction "${itemId}" for session "${sessionId}" expired at ${new Date(expiresAt).toISOString()}`);
+  }
+}
+
 export class HarnessAdmissionConflictError extends Error {
   readonly name = 'HarnessAdmissionConflictError';
   constructor(
@@ -676,6 +694,22 @@ export class HarnessSubagentDepthExceededError extends Error {
     public readonly attemptedDepth: number,
   ) {
     super(`Cannot spawn a subagent: attempted depth ${attemptedDepth} exceeds maxDepth ${maxDepth}`);
+  }
+}
+
+/**
+ * A parent session attempted to start more inline or durable subagent work than
+ * `HarnessConfig.subagents.maxConcurrent` permits. Both `spawn_subagent` and
+ * `task_delegate` consume the same parent-local reservation, so choosing the
+ * detached API cannot bypass backpressure.
+ */
+export class HarnessSubagentConcurrencyLimitError extends Error {
+  readonly name = 'HarnessSubagentConcurrencyLimitError';
+  constructor(
+    public readonly maxConcurrent: number,
+    public readonly inFlight: number,
+  ) {
+    super(`Subagent concurrency limit reached (maxConcurrent ${maxConcurrent}, in flight ${inFlight})`);
   }
 }
 

@@ -46,7 +46,7 @@ remain the authoritative field inventory):
     <text style="font: 500 13px system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; fill: #475569;" x="130" y="362" text-anchor="middle">rules + grants</text>
 
     <rect style="fill: #f8fafc; stroke: #94a3b8; stroke-width: 2; rx: 14;" x="240" y="310" width="180" height="76" />
-    <text style="font: 600 16px system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; fill: #0f172a;" x="330" y="340" text-anchor="middle">OM config</text>
+    <text style="font: 600 16px system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; fill: #0f172a;" x="330" y="340" text-anchor="middle">legacy OM recovery</text>
     <text style="font: 500 13px system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; fill: #475569;" x="330" y="362" text-anchor="middle">scope + model defaults</text>
 
     <rect style="fill: #f8fafc; stroke: #94a3b8; stroke-width: 2; rx: 14;" x="440" y="310" width="180" height="76" />
@@ -151,11 +151,13 @@ agent settings are serializable application state inside `SessionRecord.state`
 unless a canonical v1 field already exists. `state` may hold product
 preferences and UI projections; it must not hold live handles, leases, pending
 tool ownership, queue authority, browser/process objects, or recovery-critical
-facts owned by another field. Goals, OM config, selected mode/model, subagent
-model overrides, permissions, queue state, pending inbox, token usage, and
-display state must use their canonical `SessionRecord` fields instead of thread
-metadata or `metadata.app`. Any duplicated value in `state` is a derived cache
-that can be rebuilt from the canonical owner.
+facts owned by another field. Goals, selected mode/model, subagent model
+overrides, permissions, queue state, pending inbox, token usage, and display
+state must use their canonical `SessionRecord` fields instead of thread metadata
+or `metadata.app`. Effective OM belongs to Agent Memory; the only
+`SessionRecord.observationalMemory` value is unsupported legacy recovery input.
+Any duplicated value in `state` is a derived cache that can be rebuilt from the
+canonical owner.
 
 MastraCode ownership map:
 
@@ -172,7 +174,7 @@ MastraCode ownership map:
 | `modeModelId_*`                                                                    | canonical session model/mode fields, or `SessionRecord.state.modeModelOverrides` when MastraCode needs per-mode product overrides |
 | subagent model choices                                                             | `SessionRecord.subagentModelOverrides`                                                                                            |
 | goals                                                                              | `SessionRecord.goal`                                                                                                              |
-| OM settings                                                                        | `SessionRecord.observationalMemory`                                                                                               |
+| Effective OM settings                                                              | Agent Memory configuration; `SessionRecord.observationalMemory` is legacy recovery input only                                     |
 
 ```ts
 interface SessionRecord {
@@ -257,12 +259,11 @@ interface SessionRecord {
   // model an implementation may use internally.
   displayState?: HarnessDisplayStateSnapshotV1;
 
-  // Observational memory config. These are the JSON-safe resolved defaults and
-  // session-level model overrides used to rebuild the OM wrapper after
-  // hydration. The SessionRecord does not store active observations, buffered
-  // chunks/reflections, OM history generations, raw config blobs, provider
-  // clients, functions, or processor locks; those remain advisory MemoryStorage
-  // rows outside the session lease/CAS boundary.
+  // Unsupported legacy Harness OM intent. Current writes never create this
+  // field: enablement/model switches reject and effective OM belongs to the
+  // Agent Memory configuration. Hydration keeps the optional field readable so
+  // old sessions can park without losing admitted work; clear it idempotently
+  // with `session.om.clearOverride()` to resume turn/queue dispatch.
   observationalMemory?: {
     scope?: 'thread' | 'resource';
     observerModelId?: string;

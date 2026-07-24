@@ -13,6 +13,7 @@ import { z } from 'zod';
 import { EventEmitterPubSub } from '../../../events/event-emitter';
 import { Mastra } from '../../../mastra';
 import { MockMemory } from '../../../memory/mock';
+import { RequestContext } from '../../../request-context';
 import { MockStore } from '../../../storage/mock';
 import { createTool } from '../../../tools';
 import { Agent } from '../../agent';
@@ -46,6 +47,27 @@ function textResponse(text: string) {
       {
         type: 'finish',
         finishReason: 'stop',
+        usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+      },
+    ]);
+}
+
+function toolCallResponse(toolName: string, input: Record<string, unknown>) {
+  return () =>
+    convertArrayToReadableStream([
+      { type: 'stream-start', warnings: [] },
+      { type: 'response-metadata', id: 'id-tool', modelId: 'mock', timestamp: new Date(0) },
+      {
+        type: 'tool-call',
+        toolCallType: 'function',
+        toolCallId: 'call-defaults',
+        toolName,
+        input: JSON.stringify(input),
+        providerExecuted: false,
+      },
+      {
+        type: 'finish',
+        finishReason: 'tool-calls',
         usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
       },
     ]);
@@ -588,6 +610,52 @@ describe('DurableAgent.streamUntilIdle', () => {
     result.cleanup();
   });
 
+  it('uses one dynamic-defaults resolution for the complete first durable agentic turn', async () => {
+    const memory = new MockMemory();
+    let defaultOptionsCalls = 0;
+    let memoryResolverCalls = 0;
+    const { model, getCallCount } = makeScriptedModel([
+      toolCallResponse('continueTool', { value: 'next' }),
+      textResponse('done'),
+    ]);
+    const continueTool = createTool({
+      id: 'continueTool',
+      description: 'Continue the test loop.',
+      inputSchema: z.object({ value: z.string() }),
+      execute: async () => ({ ok: true }),
+    });
+    const baseAgent = new Agent({
+      id: 'durable-single-default-resolution',
+      name: 'durable-single-default-resolution',
+      instructions: 'Use the tool, then answer.',
+      model,
+      memory: () => {
+        memoryResolverCalls += 1;
+        return memory;
+      },
+      tools: { continueTool },
+      defaultOptions: () => ({
+        // Resolving twice would change the effective loop policy and stop
+        // after the tool call instead of reaching the final answer.
+        maxSteps: ++defaultOptionsCalls === 1 ? 2 : 1,
+      }),
+    });
+    const durableAgent = createDurableAgent({ agent: baseAgent });
+    mastra.addAgent(durableAgent as any, durableAgent.id);
+
+    const result = await durableAgent.streamUntilIdle('continue', {
+      memory: { thread: 'durable-single-default-thread', resource: 'user-1' },
+    });
+    await drain(result.fullStream as ReadableStream<any>);
+
+    expect(defaultOptionsCalls).toBe(1);
+    expect(memoryResolverCalls).toBe(1);
+    expect(getCallCount()).toBe(2);
+    expect(await result.output.text).toBe('done');
+    expect(await result.output.finishReason).toBe('stop');
+    result.cleanup();
+  });
+
   it('re-invokes stream when a background task completes', async () => {
     const memory = new MockMemory();
     const { model, getCallCount } = makeScriptedModel([
@@ -637,6 +705,65 @@ describe('DurableAgent.streamUntilIdle', () => {
 
     expect(getCallCount()).toBe(2);
 
+    outer.cleanup();
+  });
+
+  it('rejects a durable continuation policy change before resolving memory or invoking the model', async () => {
+    const memory = new MockMemory();
+    let defaultOptionsCalls = 0;
+    let memoryResolverCalls = 0;
+    const { model, getCallCount } = makeScriptedModel([textResponse('initial response'), textResponse('must not run')]);
+    const baseAgent = new Agent({
+      id: 'durable-continuation-preflight-agent',
+      name: 'durable-continuation-preflight-agent',
+      instructions: 'test',
+      model,
+      requestContextSchema: z.object({ principal: z.string() }),
+      defaultOptions: () => {
+        defaultOptionsCalls += 1;
+        const requestContext = new RequestContext();
+        if (defaultOptionsCalls === 1) requestContext.set('principal', 'allowed-user');
+        return { requestContext };
+      },
+      memory: () => {
+        memoryResolverCalls += 1;
+        return memory;
+      },
+    });
+    const durableAgent = createDurableAgent({ agent: baseAgent });
+    mastra.addAgent(durableAgent as any, durableAgent.id);
+
+    const bgManager = mastra.backgroundTaskManager!;
+    const publishEvent = (type: string) =>
+      (bgManager as any).publishLifecycleEvent(type, {
+        id: 'durable-revoked-task',
+        toolName: 'dummy',
+        toolCallId: 'durable-revoked-task',
+        runId: 'durable-revoked-run',
+        agentId: durableAgent.id,
+        threadId: 'durable-continuation-preflight-thread',
+        resourceId: 'user-1',
+        status: type.split('.')[1],
+        result: {},
+        retryCount: 0,
+        maxRetries: 0,
+        timeoutMs: 1000,
+        createdAt: new Date(),
+        args: {},
+      });
+
+    const outer = await durableAgent.streamUntilIdle('hi', {
+      memory: { thread: 'durable-continuation-preflight-thread', resource: 'user-1' },
+    });
+    await publishEvent('task.running');
+    await new Promise(resolve => setTimeout(resolve, 50));
+    await publishEvent('task.completed');
+
+    await expect(drain(outer.fullStream as ReadableStream<any>)).rejects.toThrow('Request context validation failed');
+
+    expect(defaultOptionsCalls).toBe(2);
+    expect(memoryResolverCalls).toBe(1);
+    expect(getCallCount()).toBe(1);
     outer.cleanup();
   });
 

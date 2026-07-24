@@ -239,6 +239,7 @@ export async function applyExtractorHooks(opts: {
   previousValues?: Record<string, unknown>;
   threadId: string;
   resourceId?: string;
+  observationalMemoryRecordId?: string;
   mainAgent?: ProcessorContext['agent'];
   memory?: Memory;
   sendSignal?: ProcessorContext['sendSignal'];
@@ -268,6 +269,7 @@ export async function applyExtractorHooks(opts: {
         extractor,
         threadId: opts.threadId,
         resourceId: opts.resourceId,
+        observationalMemoryRecordId: opts.observationalMemoryRecordId,
         previous: opts.previousValues?.[extractor.slug],
         current,
         mainAgent: opts.mainAgent,

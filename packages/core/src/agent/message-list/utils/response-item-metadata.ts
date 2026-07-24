@@ -46,3 +46,41 @@ export function getResponseProviderItemKeys(providerMetadata: Record<string, unk
     formatResponseProviderItemKey(provider, itemId),
   );
 }
+
+/**
+ * Drops assistant-content parts whose Responses provider item id already
+ * appeared earlier in the prompt (PF-2279). A declined-suspension resume can
+ * persist the same provider items twice — once from the suspended segment and
+ * once from the resumed segment — and the Azure/OpenAI Responses API rejects
+ * any request whose input repeats an item id ("Duplicate item found with id
+ * rs_…"), permanently wedging the thread. First occurrence wins; parts
+ * without a provider item id are never touched.
+ */
+export function dedupeResponseProviderItemParts<T extends { role: string; content: unknown }>(messages: T[]): T[] {
+  const seenInEarlierMessages = new Set<string>();
+  return messages.map(message => {
+    if (message.role !== 'assistant' || !Array.isArray(message.content)) return message;
+    // Dedupe across MESSAGES only: the PF-2279 wedge is the same provider item
+    // (rs_/fc_) reappearing in a rebuilt copy of the message. Parts WITHIN one
+    // message legitimately share an item id (a reasoning item split into
+    // several summary parts), so an in-message match must survive — a global
+    // part-level set silently truncated multi-part reasoning to its first part.
+    const keysInThisMessage = new Set<string>();
+    let dropped = false;
+    const content = (message.content as Array<Record<string, unknown> | null | undefined>).filter(part => {
+      const metadata =
+        (part?.providerOptions as Record<string, unknown> | undefined) ??
+        (part?.providerMetadata as Record<string, unknown> | undefined);
+      const keys = getResponseProviderItemKeys(metadata);
+      if (keys.length === 0) return true;
+      if (keys.some(key => seenInEarlierMessages.has(key))) {
+        dropped = true;
+        return false;
+      }
+      for (const key of keys) keysInThisMessage.add(key);
+      return true;
+    });
+    for (const key of keysInThisMessage) seenInEarlierMessages.add(key);
+    return dropped ? ({ ...message, content } as T) : message;
+  });
+}

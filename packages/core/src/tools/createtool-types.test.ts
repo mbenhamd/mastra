@@ -195,6 +195,27 @@ describe('createTool type improvements', () => {
     expect(tool.requireApproval).toBeDefined();
     expect(typeof tool.requireApproval).toBe('function');
   });
+
+  it('infers the terminal projection from its schema and types the raw tool output', () => {
+    const _tool = createTool({
+      id: 'typed-terminal-result',
+      description: 'Return a bounded caller-facing answer.',
+      inputSchema: z.object({ query: z.string() }),
+      outputSchema: z.object({ ok: z.boolean(), internal: z.string() }),
+      terminalResult: {
+        isSuccess: output => {
+          expectTypeOf(output).toEqualTypeOf<{ ok: boolean; internal: string }>();
+          return output.ok;
+        },
+        outputSchema: z.object({ answer: z.string() }),
+        project: output => ({ answer: output.internal }),
+      },
+      execute: async ({ query }) => ({ ok: true, internal: query }),
+    });
+
+    type Projection = Awaited<ReturnType<NonNullable<NonNullable<typeof _tool.terminalResult>['project']>>>;
+    expectTypeOf<Projection>().toEqualTypeOf<{ answer: string }>();
+  });
 });
 
 /**

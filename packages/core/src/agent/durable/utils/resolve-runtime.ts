@@ -11,12 +11,15 @@ import type {
   InputProcessorOrWorkflow,
   OutputProcessorOrWorkflow,
 } from '../../../processors';
-import { RequestContext } from '../../../request-context';
+import { MASTRA_RESOURCE_ID_KEY, MASTRA_THREAD_ID_KEY, RequestContext } from '../../../request-context';
 import { resolveToolApprovalRequirement, resolveToolRequiresApproval } from '../../../tools/approval';
 import type { ResolvedToolApproval } from '../../../tools/approval';
 import type { CoreTool, RequireToolApproval } from '../../../tools/types';
 import type { Workspace } from '../../../workspace';
 import { MessageList } from '../../message-list';
+import type { MastraDBMessage } from '../../message-list';
+import { stableStringify } from '../../message-list/cache/stable-stringify';
+import type { SerializedMessageListState } from '../../message-list/state';
 import { SaveQueueManager } from '../../save-queue';
 import { createToolSurfaceFence } from '../../tool-surface-fence';
 import { getBoundRunRegistryEntry, globalRunRegistry } from '../run-registry';
@@ -30,7 +33,30 @@ import type {
   DurableAgenticWorkflowInput,
   RegistryModelListEntry,
 } from '../types';
+import { serializeToolsMetadata } from './serialize-state';
 import { assertDurableToolHookPolicyAvailable } from './tool-hook-policy';
+
+const DURABLE_RUNTIME_TOOL_BINDING_MISMATCH = 'DURABLE_AGENT_RUNTIME_TOOL_BINDING_MISMATCH';
+
+function assertRuntimeToolBinding(
+  tools: Record<string, CoreTool>,
+  expected: SerializableToolMetadata[],
+  context: { agentId: string; runId: string },
+): void {
+  if (stableStringify(serializeToolsMetadata(tools)) === stableStringify(expected)) return;
+
+  throw new MastraError({
+    id: DURABLE_RUNTIME_TOOL_BINDING_MISMATCH,
+    domain: ErrorDomain.AGENT,
+    category: ErrorCategory.SYSTEM,
+    text: `DurableAgent "${context.agentId}" cannot continue run "${context.runId}" because its resolved tools changed.`,
+    details: context,
+  });
+}
+
+function isRuntimeToolBindingMismatch(error: unknown): boolean {
+  return error instanceof MastraError && error.id === DURABLE_RUNTIME_TOOL_BINDING_MISMATCH;
+}
 
 /**
  * Runtime dependencies that need to be resolved at step execution time.
@@ -96,10 +122,32 @@ export interface ResolveRuntimeOptions {
  * snapshot serialized onto the workflow input (see preparation.ts). Returns
  * an empty context when no snapshot is present.
  */
-function restoreRequestContext(entries?: Record<string, unknown>): RequestContext {
-  return entries
-    ? new RequestContext(Object.entries(entries) as Iterable<readonly [string, unknown]>)
-    : new RequestContext();
+export function createDurableRuntimeRequestContext(options: {
+  entries?: Record<string, unknown>;
+  state: Pick<SerializableDurableState, 'memoryConfigured' | 'threadId' | 'resourceId' | 'memoryConfig'>;
+  liveContext?: RequestContext;
+}): RequestContext {
+  const context = new RequestContext();
+  for (const [key, value] of Object.entries(options.entries ?? {})) {
+    if (key === 'MastraMemory' || key === MASTRA_THREAD_ID_KEY || key === MASTRA_RESOURCE_ID_KEY) continue;
+    context.set(key, value);
+  }
+  for (const [key, value] of options.liveContext?.entries() ?? []) {
+    if (key === 'MastraMemory' || key === MASTRA_THREAD_ID_KEY || key === MASTRA_RESOURCE_ID_KEY) continue;
+    context.set(key, value);
+  }
+
+  const { threadId, resourceId, memoryConfig, memoryConfigured } = options.state;
+  if (threadId) context.set(MASTRA_THREAD_ID_KEY, threadId);
+  if (resourceId) context.set(MASTRA_RESOURCE_ID_KEY, resourceId);
+  if (memoryConfigured && threadId && resourceId) {
+    context.set('MastraMemory', {
+      thread: { id: threadId },
+      resourceId,
+      memoryConfig,
+    });
+  }
+  return context;
 }
 
 /**
@@ -215,7 +263,10 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
       // the workflow input (mirrors durable-agent.ts resume handling), so
       // request-scoped tools / workspace / memory / processors resolve with
       // the same configuration as the original call site.
-      const resolveRequestContext = restoreRequestContext(input.requestContextEntries);
+      const resolveRequestContext = createDurableRuntimeRequestContext({
+        entries: input.requestContextEntries,
+        state: input.state,
+      });
 
       tools = await agent.getToolsForExecution({
         ...(input.options?.toolSurfaceFence ? { toolsets: {}, toolsetsMode: 'replace' as const } : {}),
@@ -225,7 +276,9 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
         requestContext: resolveRequestContext,
         memoryConfig: input.state.memoryConfig,
         autoResumeSuspendedTools: input.options?.autoResumeSuspendedTools,
+        processorMessages: messageList.get.all.db(),
       });
+      assertRuntimeToolBinding(tools, input.toolsMetadata, { agentId, runId });
       model =
         (await (agent as any).getModel?.({ requestContext: resolveRequestContext })) ??
         resolveModel(input.modelConfig, mastra);
@@ -266,6 +319,7 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
       rehydratedFromMastra = true;
     } catch (error) {
       if (error instanceof DurableProcessorRebuildError) throw error;
+      if (isRuntimeToolBindingMismatch(error)) throw error;
       logger?.debug?.(`[DurableAgent:${agentId}] Failed to get agent from Mastra: ${error}`);
       model = resolveModel(input.modelConfig, mastra);
     }
@@ -375,18 +429,44 @@ export async function rebuildRunToolsFromMastra(options: {
   agentId: string;
   state: SerializableDurableState;
   options?: SerializableDurableOptions;
+  /** Exact serialized tool binding captured when the durable run was prepared. */
+  toolsMetadata: SerializableToolMetadata[];
   /** JSON-safe request-context snapshot from the workflow input (see preparation.ts). */
   requestContextEntries?: Record<string, unknown>;
+  /** Persisted message state used to rebuild context-backed processor tools. */
+  messageListState?: SerializedMessageListState;
+  /** Already-materialized messages, when the caller still owns the live list. */
+  processorMessages?: MastraDBMessage[];
   logger?: { debug?: (...args: any[]) => void };
 }): Promise<RebuiltRunTools | undefined> {
-  const { mastra, runId, agentId, state, options: execOptions, requestContextEntries, logger } = options;
+  const {
+    mastra,
+    runId,
+    agentId,
+    state,
+    options: execOptions,
+    toolsMetadata,
+    requestContextEntries,
+    messageListState,
+    logger,
+  } = options;
   if (!mastra) return undefined;
 
   try {
     const agent = mastra.getAgentById(agentId);
     // Restore the caller's request context so request-scoped tools, workspace
     // and memory resolve with the same configuration as the original call.
-    const resolveRequestContext = restoreRequestContext(requestContextEntries);
+    const resolveRequestContext = createDurableRuntimeRequestContext({
+      entries: requestContextEntries,
+      state,
+    });
+    const processorMessages =
+      options.processorMessages ??
+      (messageListState
+        ? new MessageList({ threadId: state.threadId, resourceId: state.resourceId })
+            .deserialize(messageListState)
+            .get.all.db()
+        : undefined);
 
     const tools = await agent.getToolsForExecution({
       runId,
@@ -395,7 +475,9 @@ export async function rebuildRunToolsFromMastra(options: {
       requestContext: resolveRequestContext,
       memoryConfig: state.memoryConfig,
       autoResumeSuspendedTools: execOptions?.autoResumeSuspendedTools,
+      ...(processorMessages !== undefined ? { processorMessages } : {}),
     });
+    assertRuntimeToolBinding(tools, toolsMetadata, { agentId, runId });
 
     const memory = await (agent as any).getMemory?.({ requestContext: resolveRequestContext });
     const workspace = await (agent as any).getWorkspace?.({ requestContext: resolveRequestContext });
@@ -419,6 +501,7 @@ export async function rebuildRunToolsFromMastra(options: {
 
     return { tools, workspace, memory, saveQueueManager };
   } catch (error) {
+    if (isRuntimeToolBindingMismatch(error)) throw error;
     logger?.debug?.(`[DurableAgent:${agentId}] Failed to rebuild tools from Mastra for run ${runId}: ${error}`);
     return undefined;
   }

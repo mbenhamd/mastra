@@ -257,9 +257,10 @@ interface HarnessDisplayTaskSnapshotV1 {
 // effect, or creates operation-result evidence.
 
 // **Memory context is advisory, not under session write-concurrency.**
-// Working memory and observational memory are assembled from Harness-owned
-// persisted messages and stored observations at runtime (§1). Their storage
-// rows are not guarded by the `SessionRecord` lease or version CAS (§5.8).
+// Working memory and observational memory are assembled by Agent Memory from
+// persisted messages and stored observations at runtime (§1). Harness does not
+// build a second per-session OM engine. Memory rows are not guarded by the
+// `SessionRecord` lease or version CAS (§5.8).
 // Harness must not treat memory state as the proof boundary for queue,
 // channel, wakeup, approval, or goal decisions — those decisions are owned
 // by the durable Harness storage records listed above.

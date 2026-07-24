@@ -890,6 +890,12 @@ export interface ObservationalMemoryConfig {
   memory?: Memory;
 
   /**
+   * Working-memory state written by this observer, if any.
+   * @internal Used to retract only state that Observational Memory owns.
+   */
+  managedWorkingMemoryScope?: 'thread' | 'resource';
+
+  /**
    * Enable retrieval-mode observation group metadata.
    * When true, observation groups are treated as durable pointers to raw
    * message history and a `recall` tool is registered so the actor can
@@ -910,6 +916,7 @@ export interface ObservationalMemoryConfig {
     text: string;
     groupId: string;
     range: string;
+    recordId: string;
     threadId: string;
     resourceId: string;
     observedAt?: Date;

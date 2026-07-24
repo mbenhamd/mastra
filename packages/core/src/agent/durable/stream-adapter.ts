@@ -2,6 +2,7 @@ import { ReadableStream } from 'node:stream/web';
 import type { PubSub } from '../../events/pubsub';
 import type { Event } from '../../events/types';
 import type { IMastraLogger } from '../../logger';
+import { createTerminalToolResultPartId, materializeTerminalToolResult } from '../../loop/shared/terminal-tool-result';
 import type { OutputProcessorOrWorkflow } from '../../processors';
 import { safeClose, safeEnqueue } from '../../stream/base';
 import { MastraModelOutput } from '../../stream/base/output';
@@ -11,7 +12,9 @@ import type {
   MastraOnStepFinishCallback,
   LanguageModelUsage,
 } from '../../stream/types';
+import type { TerminalToolResult } from '../../tools/types';
 import { MessageList } from '../message-list';
+import { stableStringify } from '../message-list/cache/stable-stringify';
 import type { StructuredOutputOptions } from '../types';
 import { AGENT_STREAM_TOPIC, AgentStreamEventTypes } from './constants';
 import type {
@@ -118,6 +121,61 @@ export interface DurableAgentStreamResult<OUTPUT = undefined> {
   ready: Promise<void>;
 }
 
+export function createTerminalToolResultEnvelope(
+  runId: string,
+  stepCount: number,
+  data: unknown,
+): { id: string; data: ReturnType<typeof materializeTerminalToolResult> } {
+  return {
+    id: createTerminalToolResultPartId(runId, stepCount),
+    // Durable state and pubsub payloads may have crossed a persistence or
+    // worker boundary. Canonicalize here before any finalizer can persist,
+    // process, or publish a replayed terminal result.
+    data: materializeTerminalToolResult(data),
+  };
+}
+
+/**
+ * Re-assert the exact terminal marker after every final output processor has
+ * run. Pass-through declarations are an eligibility gate, not proof that a
+ * processor retained the authoritative message unchanged.
+ */
+export function assertTerminalToolResultRetained(
+  messageList: MessageList,
+  messageId: string,
+  envelope: ReturnType<typeof createTerminalToolResultEnvelope>,
+): void {
+  const terminalParts = messageList.get.response
+    .db()
+    .flatMap(message =>
+      message.id === messageId && typeof message.content === 'object' && Array.isArray(message.content.parts)
+        ? message.content.parts.filter(part => part.type === 'data-terminal-tool-result')
+        : [],
+    ) as Array<{ type: 'data-terminal-tool-result'; id: string; data: unknown }>;
+  if (terminalParts.length !== 1 || terminalParts[0]?.id !== envelope.id) {
+    throw new TerminalToolResultIntegrityError(
+      'Final output processors did not retain exactly one authoritative terminal tool result',
+    );
+  }
+
+  let retainedData: ReturnType<typeof materializeTerminalToolResult>;
+  try {
+    retainedData = materializeTerminalToolResult(terminalParts[0].data);
+  } catch {
+    throw new TerminalToolResultIntegrityError('Final output processors produced an invalid terminal tool result');
+  }
+  if (stableStringify(retainedData) !== stableStringify(envelope.data)) {
+    throw new TerminalToolResultIntegrityError('Final output processors changed the terminal tool result');
+  }
+}
+
+class TerminalToolResultIntegrityError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'TerminalToolResultIntegrityError';
+  }
+}
+
 /**
  * Create a MastraModelOutput that streams from pubsub events.
  *
@@ -199,6 +257,95 @@ export function createDurableAgentStream<OUTPUT = undefined>(
   // Track the last error message seen in an 'error' chunk, so we can
   // surface it in onError when the FINISH event arrives with reason 'error'.
   let lastErrorMessage: string | undefined;
+  let terminalToolResult: TerminalToolResult | undefined;
+  let pendingTerminalEnvelope:
+    | { id: string; data: TerminalToolResult; signature: string; chunk: AgentChunkEventData }
+    | undefined;
+  const pendingPostTerminalChunks: AgentChunkEventData[] = [];
+
+  const normalizeTerminalEnvelope = (envelope: {
+    id?: unknown;
+    data?: unknown;
+  }): { id: string; data: TerminalToolResult; signature: string } => {
+    if (typeof envelope.id !== 'string' || envelope.id.length === 0) {
+      throw new TerminalToolResultIntegrityError('Terminal tool-result envelope is missing its stable id');
+    }
+    let data: TerminalToolResult;
+    try {
+      data = materializeTerminalToolResult(envelope.data);
+    } catch {
+      throw new TerminalToolResultIntegrityError('Terminal tool-result envelope contains invalid data');
+    }
+    return { id: envelope.id, data, signature: stableStringify(data) };
+  };
+
+  const stageTerminalEnvelope = (chunk: AgentChunkEventData): void => {
+    const normalized = normalizeTerminalEnvelope(chunk as { id?: unknown; data?: unknown });
+    if (pendingTerminalEnvelope) {
+      if (pendingTerminalEnvelope.id !== normalized.id || pendingTerminalEnvelope.signature !== normalized.signature) {
+        throw new TerminalToolResultIntegrityError('A durable run staged conflicting terminal tool results');
+      }
+      return;
+    }
+
+    pendingTerminalEnvelope = {
+      ...normalized,
+      chunk: { ...(chunk as any), data: normalized.data } as AgentChunkEventData,
+    };
+  };
+
+  const commitTerminalEnvelope = (
+    envelope: {
+      id?: unknown;
+      data?: unknown;
+    },
+    expectedId: string,
+  ): { data: TerminalToolResult; chunk: AgentChunkEventData } => {
+    const normalized = normalizeTerminalEnvelope(envelope);
+    if (normalized.id !== expectedId) {
+      throw new TerminalToolResultIntegrityError(
+        `Terminal tool-result envelope id does not match run "${runId}" and its authoritative step count`,
+      );
+    }
+    if (
+      pendingTerminalEnvelope &&
+      (pendingTerminalEnvelope.id !== normalized.id || pendingTerminalEnvelope.signature !== normalized.signature)
+    ) {
+      throw new TerminalToolResultIntegrityError(
+        `Terminal tool-result envelope "${normalized.id}" does not match the staged terminal result`,
+      );
+    }
+
+    terminalToolResult = normalized.data;
+    return {
+      data: normalized.data,
+      chunk:
+        pendingTerminalEnvelope?.chunk ??
+        ({ type: 'data-terminal-tool-result', id: normalized.id, data: normalized.data } as AgentChunkEventData),
+    };
+  };
+
+  const normalizeTerminalStepFinishChunk = (value: unknown): AgentChunkEventData | undefined => {
+    if (value === undefined) return undefined;
+    if (
+      !value ||
+      typeof value !== 'object' ||
+      Array.isArray(value) ||
+      (value as { type?: unknown }).type !== 'step-finish'
+    ) {
+      throw new TerminalToolResultIntegrityError('FINISH contains an invalid terminal step-finish chunk');
+    }
+    let serialized: string;
+    try {
+      serialized = stableStringify(value);
+    } catch {
+      throw new TerminalToolResultIntegrityError('FINISH terminal step-finish chunk is not serializable');
+    }
+    if (new TextEncoder().encode(serialized).byteLength > 256 * 1024) {
+      throw new TerminalToolResultIntegrityError('FINISH terminal step-finish chunk exceeds its byte limit');
+    }
+    return value as AgentChunkEventData;
+  };
 
   /**
    * Pubsub transports may redeliver an event after reconnect or nack. User
@@ -235,6 +382,20 @@ export function createDurableAgentStream<OUTPUT = undefined>(
       switch (streamEvent.type) {
         case AgentStreamEventTypes.CHUNK: {
           const chunk = streamEvent.data as AgentChunkEventData;
+          if ((chunk as any).type === 'data-terminal-tool-result') {
+            // A CHUNK is replayable transport data, not the authoritative run
+            // commit. Stage it so ERROR/crash/reconnect cannot expose an answer
+            // before FINISH confirms the identical envelope.
+            stageTerminalEnvelope(chunk);
+            break;
+          }
+          if (pendingTerminalEnvelope) {
+            // The finalizer emits terminal -> step-finish -> FINISH. Keep that
+            // ordering atomic to consumers; all staged chunks are discarded if
+            // the run errors or never commits.
+            pendingPostTerminalChunks.push(chunk);
+            break;
+          }
           // Track error chunks for onError callback
           if ((chunk as any).type === 'error') {
             const errPayload = (chunk as any).payload;
@@ -263,12 +424,83 @@ export function createDurableAgentStream<OUTPUT = undefined>(
 
         case AgentStreamEventTypes.FINISH: {
           const data = streamEvent.data as AgentFinishEventData;
+          if (Boolean(data.terminalStepFinishChunk) !== Boolean(data.terminalToolResult)) {
+            throw new TerminalToolResultIntegrityError(
+              data.terminalToolResult
+                ? 'FINISH contains a terminal tool result without its authoritative step-finish chunk'
+                : 'FINISH contains a terminal step-finish chunk without a terminal tool result',
+            );
+          }
+          if (pendingTerminalEnvelope && !data.terminalToolResult) {
+            throw new TerminalToolResultIntegrityError(
+              'FINISH omitted the terminal tool result staged by the durable stream',
+            );
+          }
+          if (data.terminalToolResult) {
+            const authoritativeStepFinish = normalizeTerminalStepFinishChunk(data.terminalStepFinishChunk);
+            if (!authoritativeStepFinish) {
+              throw new TerminalToolResultIntegrityError(
+                'FINISH contains a terminal tool result without its authoritative step-finish chunk',
+              );
+            }
+            const stepCount = data.output?.steps?.length;
+            if (typeof stepCount !== 'number' || !Number.isSafeInteger(stepCount)) {
+              throw new TerminalToolResultIntegrityError('FINISH is missing its authoritative terminal step count');
+            }
+            const committed = commitTerminalEnvelope(
+              data.terminalToolResult,
+              createTerminalToolResultPartId(runId, stepCount),
+            );
+            const stepTerminalValue = (authoritativeStepFinish as { payload?: { terminalToolResult?: unknown } })
+              .payload?.terminalToolResult;
+            if (stepTerminalValue === undefined) {
+              throw new TerminalToolResultIntegrityError(
+                'FINISH terminal step-finish chunk is missing its terminal tool result',
+              );
+            }
+            let stepTerminalSignature: string;
+            try {
+              stepTerminalSignature = stableStringify(materializeTerminalToolResult(stepTerminalValue));
+            } catch {
+              throw new TerminalToolResultIntegrityError(
+                'FINISH terminal step-finish chunk contains invalid terminal data',
+              );
+            }
+            if (stepTerminalSignature !== stableStringify(committed.data)) {
+              throw new TerminalToolResultIntegrityError(
+                'FINISH terminal step-finish chunk does not match its terminal envelope',
+              );
+            }
+            if (pendingPostTerminalChunks.length > 0) {
+              if (
+                pendingPostTerminalChunks.length !== 1 ||
+                stableStringify(pendingPostTerminalChunks[0]) !== stableStringify(authoritativeStepFinish)
+              ) {
+                throw new TerminalToolResultIntegrityError(
+                  'FINISH terminal step-finish chunk conflicts with staged post-terminal chunks',
+                );
+              }
+            }
+            const committedChunks = [committed.chunk, authoritativeStepFinish] as ChunkType<OUTPUT>[];
+            for (const committedChunk of committedChunks) {
+              if (safeEnqueue(controller, committedChunk)) {
+                try {
+                  await onChunk?.(committedChunk);
+                } catch (callbackError) {
+                  logError(`[DurableAgentStream] onChunk callback error:`, callbackError);
+                }
+              }
+            }
+            pendingTerminalEnvelope = undefined;
+            pendingPostTerminalChunks.length = 0;
+          }
           // Enqueue finish chunk and close stream even if callback throws
           const finishChunk = {
             type: 'finish' as const,
             payload: {
               output: data.output,
               stepResult: data.stepResult,
+              ...(data.terminalToolResult ? { terminalToolResult: data.terminalToolResult.data } : {}),
             },
           } as ChunkType<OUTPUT>;
           safeEnqueue(controller, finishChunk);
@@ -304,6 +536,7 @@ export function createDurableAgentStream<OUTPUT = undefined>(
                 response: {},
                 reasoningText: undefined,
                 providerMetadata: undefined,
+                ...(terminalToolResult ? { terminalToolResult } : {}),
               });
             } catch (callbackError) {
               logError(`[DurableAgentStream] onFinish callback error:`, callbackError);
@@ -411,6 +644,17 @@ export function createDurableAgentStream<OUTPUT = undefined>(
           break;
       }
     } catch (error) {
+      if (error instanceof TerminalToolResultIntegrityError) {
+        streamSettled = true;
+        safeEnqueue(controller, { type: 'error', payload: { error } } as ChunkType<OUTPUT>);
+        safeClose(controller);
+        try {
+          await onError?.({ error });
+        } catch (callbackError) {
+          logError(`[DurableAgentStream] onError callback error:`, callbackError);
+        }
+        return;
+      }
       // Intentional catch-and-continue: callback errors (onChunk, onStepFinish,
       // onSuspended) must not kill the stream. onFinish/onError have their own
       // inner try/catch and close/error the stream before invoking callbacks,
@@ -464,6 +708,8 @@ export function createDurableAgentStream<OUTPUT = undefined>(
     cancelled = true;
     streamSettled = true;
     acceptedEventIds.clear();
+    pendingTerminalEnvelope = undefined;
+    pendingPostTerminalChunks.length = 0;
     if (isSubscribed) {
       isSubscribed = false;
       const topic = AGENT_STREAM_TOPIC(runId);

@@ -143,6 +143,7 @@ type PhantomSerializedKeys = Exclude<
   | 'structuredOutput' // serialized form of structuredOutput
   | 'toolSurfaceFence' // PF-1790: derived name ceiling from toolsets + toolsetsMode: 'replace'
   | 'toolHookPolicy' // opaque shadow of per-execution hooks
+  | 'permissionPolicyRequired' // marker derived from the live per-tool policy evaluator
 >;
 
 describe('DurableAgent ↔ Agent parity gate', () => {

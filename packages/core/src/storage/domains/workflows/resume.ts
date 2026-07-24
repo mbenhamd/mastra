@@ -602,18 +602,25 @@ export function admitWorkflowResumeRecord(
     return { status: 'fence_conflict' };
   }
   if (existing.resumeCheckpoint) return { status: 'checkpoint_conflict' };
+  const checkpointSource =
+    input.replaceRequestContext === true
+      ? materialize({ ...existing, requestContext: input.requestContext ?? {} })
+      : existing;
   const checkpoint = createCheckpoint(
     input.runId,
     admittedFence,
     input.resumeOperationHash,
     operationReplayContext,
-    existing,
+    checkpointSource,
     materialize,
   );
   const snapshot = materialize({
     ...existing,
     resourceId: existing.resourceId ?? input.resourceId,
-    requestContext: input.requestContext ?? existing.requestContext,
+    requestContext:
+      input.replaceRequestContext === true
+        ? (input.requestContext ?? {})
+        : (input.requestContext ?? existing.requestContext),
     status: 'running',
     result: undefined,
     error: undefined,

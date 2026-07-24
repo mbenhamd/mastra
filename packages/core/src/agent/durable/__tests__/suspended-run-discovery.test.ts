@@ -5,7 +5,9 @@ import { z } from 'zod/v4';
 import type { IFGAProvider } from '../../../auth/ee/interfaces/fga';
 import { EventEmitterPubSub } from '../../../events/event-emitter';
 import { Mastra } from '../../../mastra';
+import { MockMemory } from '../../../memory/mock';
 import {
+  MASTRA_AUTH_TOKEN_KEY,
   MASTRA_RESOURCE_ID_KEY,
   MASTRA_THREAD_ID_KEY,
   MASTRA_VERSIONS_KEY,
@@ -33,7 +35,11 @@ afterEach(async () => {
   await Promise.all(openPubsubs.splice(0).map(pubsub => pubsub.close()));
 });
 
-function toolCallModel(toolCallId = 'durable-call-1') {
+// `toolInput` must satisfy the tool's declared inputSchema: an approval-gated
+// tool with schema-invalid args is returned to the model for repair instead of
+// suspending for a human. Tests that widen `protectedTool`'s schema via
+// `toolOptions.inputSchema` must widen this input to match.
+function toolCallModel(toolCallId = 'durable-call-1', toolInput: Record<string, unknown> = { value: 'persisted' }) {
   return new MockLanguageModelV2({
     doStream: async () => ({
       rawCall: { rawPrompt: null, rawSettings: {} },
@@ -46,7 +52,7 @@ function toolCallModel(toolCallId = 'durable-call-1') {
           toolCallType: 'function',
           toolCallId,
           toolName: 'protectedTool',
-          input: JSON.stringify({ value: 'persisted' }),
+          input: JSON.stringify(toolInput),
           providerExecuted: false,
         },
         {
@@ -113,6 +119,18 @@ function twoApprovalCallsModel() {
   });
 }
 
+function toolThenTextModel(toolCallId: string) {
+  let call = 0;
+  const toolModel = toolCallModel(toolCallId);
+  const completionModel = textModel();
+  return new MockLanguageModelV2({
+    doStream: async () => {
+      call += 1;
+      return call === 1 ? toolModel.doStream({} as any) : completionModel.doStream({} as any);
+    },
+  });
+}
+
 function createSetup({
   storage,
   model,
@@ -125,9 +143,11 @@ function createSetup({
   requestContextSchema,
   inputProcessors,
   toolOptions,
+  defaultOptions,
+  memory,
 }: {
   storage: InMemoryStore;
-  model: MockLanguageModelV2;
+  model: any;
   agentId?: string;
   durableAgentId?: string;
   durableAgentName?: string;
@@ -137,6 +157,8 @@ function createSetup({
   requestContextSchema?: any;
   inputProcessors?: any[];
   toolOptions?: Record<string, any>;
+  defaultOptions?: any;
+  memory?: any;
 }) {
   const tool = createTool({
     id: 'protectedTool',
@@ -154,6 +176,8 @@ function createSetup({
     tools: includeTool ? { protectedTool: tool } : {},
     requestContextSchema,
     inputProcessors,
+    defaultOptions,
+    memory,
   });
   const pubsub = new EventEmitterPubSub();
   openPubsubs.push(pubsub);
@@ -598,6 +622,184 @@ describe('DurableAgent suspended-run discovery', () => {
       { memory: { thread: 'thread-1', resource: 'resource-1' } },
     );
     expect(getTools).toHaveBeenCalledOnce();
+    resumed.cleanup();
+    started.cleanup();
+  });
+
+  it('requires a fresh auth token to cold-resume a run without persisting the original token', async () => {
+    const storage = new InMemoryStore();
+    const initial = createSetup({ storage, model: toolCallModel('auth-bound-resume-call') });
+    const initialRequestContext = new RequestContext();
+    initialRequestContext.set(MASTRA_AUTH_TOKEN_KEY, 'Bearer original-token-must-not-persist');
+    const started = await initial.agent.stream('run it', {
+      runId: 'auth-bound-resume-run',
+      requireToolApproval: true,
+      requestContext: initialRequestContext,
+      memory: { thread: 'thread-1', resource: 'resource-1' },
+    });
+    await vi.waitFor(async () => {
+      expect((await initial.agent.listSuspendedRuns({ resourceId: 'resource-1' })).total).toBe(1);
+    });
+    const workflowsStore = (await storage.getStore('workflows'))!;
+    const persisted = await workflowsStore.getWorkflowRunById({
+      workflowName: 'durable-agentic-loop',
+      runId: started.runId,
+    });
+    const snapshot = typeof persisted?.snapshot === 'string' ? JSON.parse(persisted.snapshot) : persisted?.snapshot;
+    expect((snapshot?.context?.input as any)?.requestContextEntries).toBeUndefined();
+    expect((snapshot?.context?.input as any)?.requiredRequestContextCapabilities).toEqual({ authToken: true });
+    started.cleanup();
+    globalRunRegistry.delete(started.runId);
+
+    const restarted = createSetup({ storage, model: toolCallModel('auth-bound-resume-call') });
+    await expect(
+      restarted.agent.resume(
+        started.runId,
+        { approved: false },
+        {
+          toolCallId: 'auth-bound-resume-call',
+          memory: { thread: 'thread-1', resource: 'resource-1' },
+        },
+      ),
+    ).rejects.toMatchObject({ id: 'DURABLE_AGENT_RESUME_AUTH_TOKEN_REQUIRED' });
+
+    const freshRequestContext = new RequestContext();
+    freshRequestContext.set(MASTRA_AUTH_TOKEN_KEY, 'Bearer freshly-authenticated-token');
+    const resumed = await restarted.agent.resume(
+      started.runId,
+      { approved: false },
+      {
+        toolCallId: 'auth-bound-resume-call',
+        requestContext: freshRequestContext,
+        memory: { thread: 'thread-1', resource: 'resource-1' },
+      },
+    );
+    resumed.cleanup();
+  });
+
+  it('preserves re-resolved model-list headers after cold rehydration', async () => {
+    const storage = new InMemoryStore();
+    const sharedModel = toolCallModel('model-header-resume-call');
+    const initial = createSetup({
+      storage,
+      model: [
+        {
+          id: 'tenant-model',
+          model: sharedModel,
+          maxRetries: 0,
+          headers: { 'x-tenant-route': 'tenant-a' },
+        },
+      ],
+    });
+    const started = await initial.agent.stream('run it', {
+      runId: 'model-header-resume-run',
+      requireToolApproval: true,
+      memory: { thread: 'thread-1', resource: 'resource-1' },
+    });
+    await vi.waitFor(async () => {
+      expect((await initial.agent.listSuspendedRuns({ resourceId: 'resource-1' })).total).toBe(1);
+    });
+    started.cleanup();
+
+    const resumeDoStream = vi.spyOn(sharedModel, 'doStream').mockImplementation(async () => ({
+      rawCall: { rawPrompt: null, rawSettings: {} },
+      warnings: [],
+      stream: convertArrayToReadableStream([
+        { type: 'stream-start', warnings: [] },
+        { type: 'response-metadata', id: 'resumed-turn', modelId: 'mock-model', timestamp: new Date(0) },
+        { type: 'text-start', id: 'text-1' },
+        { type: 'text-delta', id: 'text-1', delta: 'done' },
+        { type: 'text-end', id: 'text-1' },
+        {
+          type: 'finish',
+          finishReason: 'stop',
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+        },
+      ]),
+    }));
+    const restarted = createSetup({
+      storage,
+      model: [
+        {
+          id: 'tenant-model',
+          model: sharedModel,
+          maxRetries: 0,
+          headers: { 'x-tenant-route': 'tenant-a' },
+        },
+      ],
+    });
+
+    const resumed = await restarted.agent.resume(
+      started.runId,
+      { approved: true },
+      {
+        toolCallId: 'model-header-resume-call',
+        memory: { thread: 'thread-1', resource: 'resource-1' },
+      },
+    );
+    await resumed.output.consumeStream();
+
+    expect(resumeDoStream).toHaveBeenCalled();
+    expect(resumeDoStream.mock.calls[0]?.[0].headers).toMatchObject({ 'x-tenant-route': 'tenant-a' });
+    resumed.cleanup();
+  });
+
+  it('carries dynamic-default request context through an until-idle resume without re-resolving it', async () => {
+    const storage = new InMemoryStore();
+    let defaultOptionsCalls = 0;
+    let memoryResolverCalls = 0;
+    const resolvedMemory = new MockMemory();
+    const defaultOptions = () => {
+      defaultOptionsCalls += 1;
+      const requestContext = new RequestContext();
+      requestContext.set('principal', 'default-user');
+      return { requestContext };
+    };
+    const memory = () => {
+      memoryResolverCalls += 1;
+      return resolvedMemory;
+    };
+    const setup = createSetup({
+      storage,
+      model: toolThenTextModel('default-context-resume-call'),
+      requestContextSchema: z.object({ principal: z.string() }),
+      defaultOptions,
+      memory,
+    });
+    const initialRequestContext = new RequestContext();
+    initialRequestContext.set('principal', 'initial-user');
+    const started = await setup.agent.stream('run it', {
+      runId: 'default-context-resume-run',
+      requestContext: initialRequestContext,
+      requireToolApproval: true,
+      memory: { thread: 'thread-1', resource: 'resource-1' },
+    });
+    await vi.waitFor(async () => {
+      expect(
+        (
+          await setup.agent.listSuspendedRuns({
+            resourceId: 'resource-1',
+            requestContext: initialRequestContext,
+          })
+        ).total,
+      ).toBe(1);
+    });
+    defaultOptionsCalls = 0;
+    memoryResolverCalls = 0;
+
+    const resumed = await setup.agent.resume(
+      started.runId,
+      { approved: false },
+      {
+        untilIdle: true,
+        toolCallId: 'default-context-resume-call',
+        memory: { thread: 'thread-1', resource: 'resource-1' },
+      },
+    );
+    await resumed.output.consumeStream();
+
+    expect(defaultOptionsCalls).toBe(1);
+    expect(memoryResolverCalls).toBe(1);
     resumed.cleanup();
     started.cleanup();
   });
@@ -1676,10 +1878,12 @@ describe('DurableAgent suspended-run discovery', () => {
       }),
     ).resolves.toMatchObject({ accepted: true });
     await vi.waitFor(() => expect(execute).toHaveBeenCalled());
-    await vi.waitFor(() => expect(deleteRun).toHaveBeenCalledTimes(3));
-    expect(deleteRun.mock.calls.map(([call]) => call.workflowName)).toEqual(
-      expect.arrayContaining(['durable-agentic-loop', 'durable-agentic-execution']),
-    );
+    await vi.waitFor(() => {
+      const workflowNames = deleteRun.mock.calls.map(([call]) => call.workflowName);
+      expect(workflowNames.filter(name => name === 'durable-agentic-loop')).toHaveLength(2);
+      expect(workflowNames.filter(name => name === 'durable-agentic-execution').length).toBeGreaterThanOrEqual(1);
+      expect(new Set(workflowNames)).toEqual(new Set(['durable-agentic-loop', 'durable-agentic-execution']));
+    });
     await vi.waitFor(async () => {
       expect((await restarted.agent.listSuspendedRuns({ resourceId: 'resource-1' })).total).toBe(0);
     });
@@ -1775,7 +1979,7 @@ describe('DurableAgent suspended-run discovery', () => {
     const execute = vi.fn(async () => ({ ok: true }));
     const initial = createSetup({
       storage,
-      model: toolCallModel('canonical-schema-call'),
+      model: toolCallModel('canonical-schema-call', { value: 'persisted', count: 1 }),
       execute,
       toolOptions: {
         inputSchema: z.object({ value: z.string(), count: z.number() }),

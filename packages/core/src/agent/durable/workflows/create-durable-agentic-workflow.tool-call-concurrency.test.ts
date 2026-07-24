@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest';
+import { RequestContext } from '../../../request-context';
+import { TOOL_PERMISSION_POLICY_KEY, TOOL_PERMISSION_POLICY_STABLE_KEY } from '../../tool-permission-prefilter';
 import { DurableAgentDefaults } from '../constants';
 import { createDurableAgenticWorkflow } from './create-durable-agentic-workflow';
 
@@ -29,10 +31,10 @@ describe('createDurableAgenticWorkflow tool-call concurrency', () => {
   const workflow = createDurableAgenticWorkflow();
   const foreachEntry = findForeachEntry((workflow as any).executionGraph.steps);
 
-  const resolveWith = (state: unknown): number => {
+  const resolveWith = (state: unknown, inputData: unknown[] = [], requestContext?: RequestContext): number => {
     const resolver = foreachEntry.opts.concurrency;
     expect(typeof resolver).toBe('function');
-    return resolver({ inputData: [], getInitData: () => state });
+    return resolver({ inputData, getInitData: () => state, requestContext });
   };
 
   it('uses a concurrency resolver on the tool-call foreach (not a static value)', () => {
@@ -60,6 +62,40 @@ describe('createDurableAgenticWorkflow tool-call concurrency', () => {
         options: { requireToolApproval: true, toolCallConcurrency: 10 },
         toolsMetadata: [],
       }),
+    ).toBe(1);
+  });
+
+  it('uses configured concurrency only for a stable live policy that allows every emitted call', () => {
+    const requestContext = new RequestContext();
+    requestContext.set(TOOL_PERMISSION_POLICY_KEY, () => 'allow');
+    requestContext.set(TOOL_PERMISSION_POLICY_STABLE_KEY, true);
+
+    expect(
+      resolveWith(
+        { options: { permissionPolicyRequired: true, toolCallConcurrency: 5 }, toolsMetadata: [] },
+        [
+          { toolCallId: 'call-a', toolName: 'read_a', args: {} },
+          { toolCallId: 'call-b', toolName: 'read_b', args: {} },
+        ],
+        requestContext,
+      ),
+    ).toBe(5);
+  });
+
+  it('keeps a stable live policy batch sequential when any emitted call asks', () => {
+    const requestContext = new RequestContext();
+    requestContext.set(TOOL_PERMISSION_POLICY_KEY, (toolName: string) => (toolName === 'write' ? 'ask' : 'allow'));
+    requestContext.set(TOOL_PERMISSION_POLICY_STABLE_KEY, true);
+
+    expect(
+      resolveWith(
+        { options: { permissionPolicyRequired: true, toolCallConcurrency: 5 }, toolsMetadata: [] },
+        [
+          { toolCallId: 'call-read', toolName: 'read', args: {} },
+          { toolCallId: 'call-write', toolName: 'write', args: {} },
+        ],
+        requestContext,
+      ),
     ).toBe(1);
   });
 

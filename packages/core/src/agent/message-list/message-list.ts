@@ -7,6 +7,7 @@ import { MastraError, ErrorDomain, ErrorCategory } from '../../error';
 import type { IMastraLogger } from '../../logger';
 import { getTransformedToolPayload, hasTransformedToolPayload } from '../../tools/payload-transform';
 import type { IdGeneratorContext } from '../../types';
+import { deepEqual } from '../../utils';
 import { createSignal, isCreatedAgentSignal, mastraDBMessageToSignal } from '../signals';
 import type { CreatedAgentSignal } from '../signals';
 import { AIV4Adapter, AIV5Adapter, AIV6Adapter } from './adapters';
@@ -41,6 +42,7 @@ import type {
 } from './state';
 import type { AIV5Type, AIV5ResponseMessage, AIV6Type, MessageInput, MessageListInput } from './types';
 import { ensureGeminiCompatibleMessages } from './utils/provider-compat';
+import { dedupeResponseProviderItemParts } from './utils/response-item-metadata';
 import { stampPart } from './utils/stamp-part';
 
 function isSignalDataMessage<T extends { role: string; parts: Array<{ type: string }> }>(message: T): boolean {
@@ -744,11 +746,13 @@ export class MessageList {
 
         messages = ensureGeminiCompatibleMessages(messages, this.logger);
 
-        return messages
-          .map(aiV5ModelMessageToV2PromptMessage)
-          .filter(
-            message => message.role === 'system' || typeof message.content === 'string' || message.content.length > 0,
-          );
+        // PF-2279: a declined-suspension resume can leave the same Responses
+        // provider item (rs_/fc_ ids) in history twice; the provider rejects
+        // duplicate item ids and the thread wedges. Dedup at the final prompt
+        // boundary, then drop any assistant message the dedup emptied.
+        return dedupeResponseProviderItemParts(messages.map(aiV5ModelMessageToV2PromptMessage)).filter(
+          message => message.role === 'system' || typeof message.content === 'string' || message.content.length > 0,
+        );
       },
     },
     aiV6: {
@@ -983,11 +987,66 @@ export class MessageList {
     },
   };
 
+  /**
+   * Capture the current unsaved input/response set without acknowledging it.
+   * `commit()` clears only captured messages whose transcript representation
+   * has not changed since the snapshot. A later merge may reuse the same
+   * assistant-message object, so reference identity alone cannot distinguish an
+   * older in-flight write from newer terminal content. This is used by
+   * fail-closed persistence: failed writes and post-snapshot mutations remain
+   * retryable.
+   */
+  public snapshotUnsavedMessages(options?: { detached?: boolean }): {
+    messages: MastraDBMessage[];
+    commit: () => void;
+  } {
+    const inputMessages = new Set(this.newUserMessages);
+    const responseMessages = new Set(this.newResponseMessages);
+    const trackedMessages = new Set([...inputMessages, ...responseMessages]);
+    const capturedMessages = new Map<MastraDBMessage, MastraDBMessage>();
+    const transformedMessages = this.messages
+      .filter(message => trackedMessages.has(message))
+      .map(message => {
+        const transformedMessage = this.transformMessageForTranscript(message);
+        // Keep an immutable baseline even when the caller requests live message
+        // objects. `commit()` must not acknowledge a newer merge into the same
+        // object merely because an older storage write completed successfully.
+        const capturedMessage = structuredClone(transformedMessage);
+        capturedMessages.set(message, capturedMessage);
+        return options?.detached ? capturedMessage : transformedMessage;
+      });
+    let committed = false;
+
+    return {
+      messages: transformedMessages,
+      commit: () => {
+        if (committed) return;
+        committed = true;
+        const currentMessages = new Set(this.messages);
+        const acknowledgeUnchanged = (
+          sourceMessages: Set<MastraDBMessage>,
+          capturedSourceMessages: Set<MastraDBMessage>,
+        ) => {
+          for (const message of capturedSourceMessages) {
+            const capturedMessage = capturedMessages.get(message);
+            if (
+              !currentMessages.has(message) ||
+              (capturedMessage !== undefined && deepEqual(this.transformMessageForTranscript(message), capturedMessage))
+            ) {
+              sourceMessages.delete(message);
+            }
+          }
+        };
+        acknowledgeUnchanged(this.newUserMessages, inputMessages);
+        acknowledgeUnchanged(this.newResponseMessages, responseMessages);
+      },
+    };
+  }
+
   public drainUnsavedMessages(): MastraDBMessage[] {
-    const messages = this.messages.filter(m => this.newUserMessages.has(m) || this.newResponseMessages.has(m));
-    this.newUserMessages.clear();
-    this.newResponseMessages.clear();
-    return messages.map(message => this.transformMessageForTranscript(message));
+    const snapshot = this.snapshotUnsavedMessages({ detached: true });
+    snapshot.commit();
+    return snapshot.messages;
   }
 
   private transformToolStateDataForTranscript(data: unknown, phase: 'approval' | 'suspend'): unknown {
@@ -1335,7 +1394,81 @@ export class MessageList {
     return true;
   }
 
-  public markResponseMessageBoundary(messageId?: string): boolean {
+  /**
+   * A feedback note a loop injects so the model sees an instruction on its next
+   * turn (supervisor `onIterationComplete` feedback, network completion
+   * feedback). It is flagged `suppressFeedback` precisely because it must stay
+   * out of anything shown to the caller.
+   */
+  private static isSuppressedFeedbackMessage(message: MastraDBMessage): boolean {
+    return (
+      (message.content?.metadata?.completionResult as { suppressFeedback?: boolean } | undefined)?.suppressFeedback ===
+      true
+    );
+  }
+
+  /** Set by `markResponseMessageBoundary(id, { turnContinues: true })`. */
+  private static turnContinuesAfter(message: MastraDBMessage | undefined): boolean {
+    return (
+      (message?.content?.metadata?.mastra as { turnContinues?: boolean } | undefined)?.turnContinues === true &&
+      message?.role === 'assistant'
+    );
+  }
+
+  /**
+   * Text of the final assistant turn, as the caller should see it.
+   *
+   * One assistant turn is not always one response message. A forced
+   * continuation — an `onIterationComplete` hook returning `continue: true`
+   * after the model already stopped — seals the open response message and
+   * resumes the SAME turn into a fresh one, so reading only the last response
+   * message drops the first half of the reply (issue #14134). Messages sealed
+   * with `turnContinues` are therefore joined onto the one that follows them.
+   *
+   * Everything outside that turn stays out: an earlier goal or network
+   * iteration, narration emitted before a tool call (a `tool` message ends the
+   * turn), and the framework's own feedback notes, which are instructions
+   * written for the model rather than part of the answer.
+   */
+  public getFinalAssistantTurnText(): string {
+    const dbMessages = this.response.db().filter(message => !MessageList.isSuppressedFeedbackMessage(message));
+
+    // How many response messages the final turn spans.
+    let turnMessageCount = dbMessages.length > 0 ? 1 : 0;
+    while (
+      turnMessageCount < dbMessages.length &&
+      MessageList.turnContinuesAfter(dbMessages[dbMessages.length - 1 - turnMessageCount])
+    ) {
+      turnMessageCount++;
+    }
+
+    // Each of those contributes exactly one trailing assistant message to the
+    // AI v4 core projection, which is where a tool call splits narration off
+    // from the answer that follows it.
+    const coreMessages = aiV4UIMessagesToAIV4CoreMessages(
+      this.toAIV4UIMessages(dbMessages, { transformToolPayloads: false }),
+    );
+    let trailingAssistantCount = 0;
+    while (
+      trailingAssistantCount < coreMessages.length &&
+      coreMessages[coreMessages.length - 1 - trailingAssistantCount]?.role === 'assistant'
+    ) {
+      trailingAssistantCount++;
+    }
+
+    return coreMessages
+      .slice(coreMessages.length - Math.min(turnMessageCount, trailingAssistantCount))
+      .map(message => coreContentToString(message.content))
+      .join('');
+  }
+
+  /**
+   * @param options.turnContinues - The sealed message is only half of one
+   * caller-visible assistant turn: the same turn resumes into the next response
+   * message with no user input in between. Leave it unset when a signal or a
+   * new iteration separates the two, which is the usual case.
+   */
+  public markResponseMessageBoundary(messageId?: string, options?: { turnContinues?: boolean }): boolean {
     const message = messageId
       ? this.messages.find(message => message.id === messageId)
       : [...this.messages].reverse().find(message => message.role === 'assistant');
@@ -1349,6 +1482,7 @@ export class MessageList {
       mastra: {
         ...((message.content.metadata?.mastra as Record<string, unknown> | undefined) ?? {}),
         responseBoundary: true,
+        ...(options?.turnContinues ? { turnContinues: true } : {}),
       },
     };
 

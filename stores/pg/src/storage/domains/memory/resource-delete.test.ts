@@ -5,7 +5,11 @@ import { MemoryPG } from './index';
 
 function createDeleteDbClient() {
   const none = vi.fn(async (): Promise<null> => null);
-  return { client: { none } as unknown as DbClient, none };
+  const oneOrNone = vi.fn(async (): Promise<{ tablename: string } | null> => null);
+  const manyOrNone = vi.fn(async (): Promise<Array<{ id: string }>> => []);
+  const txClient = { none, oneOrNone, manyOrNone };
+  const tx = vi.fn(async (operation: (client: typeof txClient) => Promise<unknown>) => operation(txClient));
+  return { client: { tx } as unknown as DbClient, manyOrNone, none, oneOrNone, tx };
 }
 
 function createLogger() {
@@ -26,9 +30,28 @@ describe('MemoryPG.deleteResource', () => {
     await memory.deleteResource({ resourceId: 'resource-1' });
     await memory.deleteResource({ resourceId: 'resource-1' });
 
-    expect(none).toHaveBeenCalledTimes(2);
-    expect(none).toHaveBeenNthCalledWith(1, 'DELETE FROM "public"."mastra_resources" WHERE id = $1', ['resource-1']);
-    expect(none).toHaveBeenNthCalledWith(2, 'DELETE FROM "public"."mastra_resources" WHERE id = $1', ['resource-1']);
+    expect(
+      none.mock.calls.filter(([query]) => query === 'DELETE FROM "public"."mastra_resources" WHERE id = $1'),
+    ).toEqual([
+      ['DELETE FROM "public"."mastra_resources" WHERE id = $1', ['resource-1']],
+      ['DELETE FROM "public"."mastra_resources" WHERE id = $1', ['resource-1']],
+    ]);
+  });
+
+  it('reports erased resource-scoped observational-memory record ids only after commit', async () => {
+    const { client, manyOrNone, oneOrNone } = createDeleteDbClient();
+    oneOrNone.mockResolvedValue({ tablename: 'mastra_observational_memory' });
+    manyOrNone.mockResolvedValue([{ id: 'om-generation-1' }, { id: 'om-generation-2' }]);
+    const memory = new MemoryPG({ client });
+    const observationalMemoryRecordIds: string[] = [];
+
+    await memory.deleteResource({ resourceId: 'resource-1', observationalMemoryRecordIds });
+
+    expect(manyOrNone).toHaveBeenCalledWith(
+      'DELETE FROM "public"."mastra_observational_memory" WHERE "resourceId" = $1 AND "threadId" IS NULL RETURNING id',
+      ['resource-1'],
+    );
+    expect(observationalMemoryRecordIds).toEqual(['om-generation-1', 'om-generation-2']);
   });
 
   it('rejects storage failures without retaining driver details', async () => {

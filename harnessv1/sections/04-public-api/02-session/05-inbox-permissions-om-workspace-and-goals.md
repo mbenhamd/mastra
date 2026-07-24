@@ -258,8 +258,12 @@ observational memory, workspace, goal, and token-usage semantics):
   // `permissionRules`; "always allow" UI affordances must perform an explicit
   // `grantTool(...)` or `grantCategory(...)` transition in addition to answering
   // the pending item. Subagent tool calls resolve against the owning child
-  // session record at both enforcement gates; parent grants, rules, and
-  // `yolo` are not inherited unless copied by an explicit session mutation.
+  // session record at both enforcement gates. Parent rules and `yolo` are not
+  // inherited. Grants are also isolated by default; with
+  // `subagents.inheritRootSessionGrants: true`, each newly created descendant
+  // receives a copy of the root session's then-current grants. The copy does
+  // not update running descendants and cannot override a child `deny` or
+  // allowlist cap.
   // Parent and subagent-tool allowlists are delegation caps on what can be
   // exposed to the child; they do not grant action authority. The child
   // pre-exposure gate filters the capped child surface, and the child
@@ -276,33 +280,23 @@ observational memory, workspace, goal, and token-usage semantics):
     getRules(): Readonly<PermissionRules>;
   };
 
-  // Observational Memory. OM is advisory memory context (§1), not a session
-  // recovery proof boundary. Reads below are resolved against the verified
-  // session resource/thread and the configured OM scope; mutators are
-  // session-config writes and resolve only after the SessionRecord transition
-  // commits under the session lease. They do not mutate raw memory rows.
+  // Observational Memory recovery surface. Harness-level OM enablement and
+  // per-session model switching are currently unsupported: configure OM on the
+  // Agent Memory instance and omit HarnessConfig.observationalMemory. The read
+  // accessors return disabled defaults or values from an unsupported legacy
+  // SessionRecord override. A legacy override parks turn and queue dispatch so
+  // admitted work is not failed under configuration the runtime cannot honor.
   om: {
     getObserverModelId(): string | null;
     getReflectorModelId(): string | null;
     getObservationThreshold(): number;
     getReflectionThreshold(): number;
+    // Both switch methods validate `model`, then reject without persisting.
     switchObserverModel(opts: { model: string }): Promise<void>;
     switchReflectorModel(opts: { model: string }): Promise<void>;
-    // Returns the redacted JSON-safe read model from §4.8, not the mutable
-    // MemoryStorage row. The snapshot may include bounded, redacted active
-    // observation text and bounded progress counters, but it must not expose
-    // raw config blobs, metadata, buffered chunks/reflections, history
-    // generations, live model objects, functions, locks, or processor
-    // internals. Resource-scoped OM can summarize other threads for the same
-    // authenticated resource; it never crosses the session's `resourceId`
-    // boundary. Returns `null` when OM is disabled or no scoped record exists.
-    getRecord(): Promise<ObservationalMemorySnapshot | null>;
-    // OM refresh helper. It may reread OM/message progress into an
-    // implementation-local cache, but it is advisory only: it does not mutate
-    // SessionRecord.displayState, prove memory health, settle signal/queue
-    // operations, recover work, advance a durable lease, or block session
-    // admission.
-    loadProgress(): Promise<void>;
+    // Idempotently removes an override written by an older Harness build. The
+    // clearing CAS commits before the parked queue is re-kicked.
+    clearOverride(): Promise<void>;
   };
 
   // Workspace — canonical session access path. Public in-process callers use

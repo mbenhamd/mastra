@@ -38,6 +38,33 @@ describe('CoreToolBuilder recovery fingerprint', () => {
       'Cannot create a durable recovery fingerprint for RegExp subclass',
     );
   });
+
+  it('binds durable recovery identity to the terminal-result policy', () => {
+    const execute = async () => ({ ok: true, answer: 'done' });
+    const build = (isSuccess: (output: { ok: boolean; answer: string }) => boolean) => {
+      const originalTool = createTool({
+        id: 'terminal-recovery-fingerprint',
+        description: 'Return a terminal result.',
+        outputSchema: z.object({ ok: z.boolean(), answer: z.string() }),
+        terminalResult: {
+          isSuccess,
+          outputSchema: z.object({ answer: z.string() }),
+          project: output => ({ answer: output.answer }),
+        },
+        execute,
+      });
+      return new CoreToolBuilder({
+        originalTool,
+        options: { name: 'terminal-recovery-fingerprint', logger: noopLogger },
+      }).build();
+    };
+
+    const acceptsOk = build(output => output.ok);
+    const acceptsNonEmpty = build(output => output.answer.length > 0);
+
+    expect(acceptsOk.terminalResult).toBeDefined();
+    expect(acceptsOk.recoveryFingerprint).not.toBe(acceptsNonEmpty.recoveryFingerprint);
+  });
 });
 
 describe('CoreToolBuilder FGA', () => {
@@ -302,6 +329,7 @@ describe('MCP Tool Tracing', () => {
         name: "mcp_tool: 'mcp-server_list-files' on 'filesystem-server'",
         input: { path: '/tmp' },
         attributes: {
+          toolCallId: 'test-call-id',
           mcpServer: 'filesystem-server',
           serverVersion: '1.2.0',
           toolDescription: 'List files in a directory',
@@ -354,6 +382,7 @@ describe('MCP Tool Tracing', () => {
         name: "tool: 'regular-tool'",
         input: { value: 'test' },
         attributes: {
+          toolCallId: 'test-call-id',
           toolDescription: 'A regular tool',
           toolType: 'tool',
         },
@@ -403,6 +432,7 @@ describe('MCP Tool Tracing', () => {
     const spanArgs = (mockAgentSpan.createChildSpan as ReturnType<typeof vi.fn>).mock.calls[0][0];
     expect(spanArgs.type).toBe(SpanType.MCP_TOOL_CALL);
     expect(spanArgs.attributes).toEqual({
+      toolCallId: 'test-call-id',
       mcpServer: 'my-mcp-server',
       serverVersion: undefined,
       toolDescription: 'Read a resource',
@@ -459,6 +489,35 @@ describe('MCP Tool Tracing', () => {
   });
 
   describe('requireApproval Handling', () => {
+    it('exposes the runtime input validator without executing the tool', () => {
+      const execute = vi.fn(async (input: { value: string }) => input);
+      const testTool = createTool({
+        id: 'approval-preflight-tool',
+        description: 'A tool whose input must be valid before approval.',
+        inputSchema: z.object({ value: z.string().trim().min(1) }),
+        execute,
+      });
+
+      const builtTool = new CoreToolBuilder({
+        originalTool: testTool,
+        options: {
+          name: 'approval-preflight-tool',
+          requireApproval: true,
+        },
+      }).build();
+
+      expect(builtTool.validateInput?.({ value: 42 })).toMatchObject({
+        error: {
+          error: true,
+          message: expect.stringContaining('approval-preflight-tool'),
+        },
+      });
+      expect(builtTool.validateInput?.({ value: ' valid ' })).toEqual({
+        data: { value: 'valid' },
+      });
+      expect(execute).not.toHaveBeenCalled();
+    });
+
     it('should correctly handle function in this.options.requireApproval', () => {
       const needsApprovalFn = (input: any) => input.value === 'secret';
       const testTool = {
@@ -912,5 +971,80 @@ describe('CoreToolBuilder requestContext merge', () => {
 
     // With no exec RC, closure RC is used directly
     expect(receivedCtx.requestContext!.get('harness')).toEqual({ harnessId: 'h-1' });
+  });
+});
+
+describe('resume input normalization', () => {
+  const buildStrictReparseTool = (received: unknown[]) => {
+    const inputSchema = z.object({
+      name: z.string(),
+      projectId: z.string().optional(),
+    });
+    const originalTool = createTool({
+      id: 'strict-reparse',
+      description: 'Re-parses its input with the original zod schema, like product workspace suspension tools.',
+      inputSchema,
+      execute: async input => {
+        received.push(input);
+        // The tool-side re-parse that threw on resumed legs before the fix:
+        // OpenAI strict compat materializes .optional() fields as null, and the
+        // resumed leg used to skip the builder's null-stripping normalization.
+        const params = inputSchema.parse(input);
+        return { ok: true, params };
+      },
+    });
+    return new CoreToolBuilder({
+      originalTool,
+      options: { name: 'strict-reparse', logger: noopLogger },
+    }).build();
+  };
+
+  it('normalizes provider null-for-optional on the initial leg', async () => {
+    const received: unknown[] = [];
+    const builtTool = buildStrictReparseTool(received);
+    const result = await builtTool.execute!({ name: 'demo', projectId: null }, {
+      toolCallId: 'call-initial',
+      messages: [],
+    } as any);
+    expect(result).toMatchObject({ ok: true, params: { name: 'demo' } });
+  });
+
+  it('normalizes provider null-for-optional on the resumed leg too', async () => {
+    const received: unknown[] = [];
+    const builtTool = buildStrictReparseTool(received);
+    const result = await builtTool.execute!({ name: 'demo', projectId: null }, {
+      toolCallId: 'call-resumed',
+      messages: [],
+      resumeData: { approved: true },
+    } as any);
+    expect(result).toMatchObject({ ok: true, params: { name: 'demo' } });
+    expect(received[0]).not.toHaveProperty('projectId');
+  });
+
+  it('keeps raw args on resumed legs whose replayed args fail validation', async () => {
+    const received: unknown[] = [];
+    const inputSchema = z.object({ task: z.string() }).strict();
+    const originalTool = createTool({
+      id: 'delegated-resume',
+      description: 'Delegated resumes replay control fields the schema does not know.',
+      inputSchema,
+      execute: async input => {
+        received.push(input);
+        return { ok: true };
+      },
+    });
+    const builtTool = new CoreToolBuilder({
+      originalTool,
+      options: { name: 'delegated-resume', logger: noopLogger },
+    }).build();
+    const result = await builtTool.execute!({ task: 'continue', suspendedToolRunId: 'run-1' }, {
+      toolCallId: 'call-delegated',
+      messages: [],
+      resumeData: { answer: 'yes' },
+    } as any);
+    expect(result).toMatchObject({ ok: true });
+    // Validation fails on the unknown control field, so the raw replayed args
+    // must reach the tool unchanged (pre-fix behavior preserved).
+    expect(received[0]).toMatchObject({ task: 'continue', suspendedToolRunId: 'run-1' });
   });
 });

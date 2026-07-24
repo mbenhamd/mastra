@@ -194,6 +194,7 @@ export async function processWorkflowForEach(
   },
 ) {
   const lifecycleExecution = { executionGeneration, lifecycleResumeAttempt, lifecycleStepStates };
+  const reqContext = new RequestContext(Object.entries(requestContext ?? {}) as any);
 
   // Get current state from stepResults or passed state
   const currentState = resolveCurrentState({ stepResults, state });
@@ -429,6 +430,7 @@ export async function processWorkflowForEach(
       const concurrency = resolveForeachConcurrency(step.opts, {
         inputData: (prevResult as any)?.output,
         getInitData: () => (stepResults as any)?.input,
+        requestContext: reqContext,
       });
       const indicesToResume = suspendedIndices.slice(0, concurrency);
 
@@ -579,6 +581,7 @@ export async function processWorkflowForEach(
     const resolvedConcurrency = resolveForeachConcurrency(step.opts, {
       inputData: (prevResult as any)?.output,
       getInitData: () => (stepResults as any)?.input,
+      requestContext: reqContext,
     });
     const concurrency = Math.min(resolvedConcurrency, targetLen);
     const dummyResult = Array.from({ length: concurrency }, () => null);

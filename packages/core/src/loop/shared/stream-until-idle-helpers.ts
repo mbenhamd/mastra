@@ -10,10 +10,10 @@
  * - A `buildResult` callback to construct the caller-specific return value
  * - Optional `postPipeInner` hooks for durable-specific cleanup/abort tracking
  */
+import { mergeAgentExecutionOptions } from '../../agent/merge-execution-options';
 import type { BackgroundTaskManager } from '../../background-tasks/manager';
 import type { MastraMemory } from '../../memory/memory';
 import { MASTRA_RESOURCE_ID_KEY, MASTRA_THREAD_ID_KEY, RequestContext } from '../../request-context';
-import { deepMerge } from '../../utils';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -212,6 +212,13 @@ export function releaseStreamSlot(
 export interface IdleLoopDeps {
   activeStreams: Map<string, () => void>;
   bgManager: BackgroundTaskManager | undefined;
+  /**
+   * Re-authorize a freshly resolved continuation before dynamic memory is
+   * touched. Dynamic defaults may change request context or actor identity
+   * between turns, so the initial-turn preflight cannot authorize later
+   * continuations.
+   */
+  prepareContinuation?: (resolvedOptions: Record<string, any>) => Promise<Record<string, any>>;
 }
 
 /**
@@ -268,12 +275,16 @@ export async function runIdleLoop<
   streamOptions: (Record<string, any> & { maxIdleMs?: number }) | undefined,
   deps: IdleLoopDeps,
   firstTurn: (
-    opts: Record<string, any>,
+    callerOptions: Record<string, any>,
     memory: MastraMemory | undefined,
     defaultOptions: Record<string, any>,
-    mergedOptions: Record<string, any>,
+    resolvedOptions: Record<string, any>,
   ) => Promise<TFirstResult>,
-  streamForContinuation: (opts: Record<string, any>) => Promise<{ fullStream: ReadableStream<any> }>,
+  streamForContinuation: (
+    resolvedOptions: Record<string, any>,
+    memory: MastraMemory | undefined,
+    defaultOptions: Record<string, any>,
+  ) => Promise<{ fullStream: ReadableStream<any> }>,
   buildResult: (first: TFirstResult, ctx: IdleLoopContext) => TReturn,
   hooks?: PostPipeHooks,
 ): Promise<TReturn> {
@@ -282,9 +293,9 @@ export async function runIdleLoop<
   const defaultOptions = await agent.getDefaultOptions({
     requestContext: streamOptions?.requestContext,
   });
-  const mergedOptions = deepMerge(
-    defaultOptions as Record<string, unknown>,
-    (restStreamOptions ?? {}) as Record<string, unknown>,
+  const mergedOptions = mergeAgentExecutionOptions(
+    defaultOptions as Record<string, any>,
+    restStreamOptions as Record<string, any>,
   ) as Record<string, any>;
 
   const scope = await resolveScope(agent, mergedOptions);
@@ -304,9 +315,16 @@ export async function runIdleLoop<
   // Continuation calls reuse the memory thread but drop one-shot hooks.
   // `_skipBgTaskWait` prevents the inner loop from redundantly waiting for
   // running bg tasks — this outer method already handles that.
+  const {
+    onFinish: _onFinish,
+    runId: _runId,
+    toolCallId: _toolCallId,
+    _threadRunReservationOwner: _threadRunReservationOwner,
+    _threadRunInflightIdleOwner: _threadRunInflightIdleOwner,
+    ...continuationCallerOptions
+  } = Object.fromEntries(Object.entries(restStreamOptions ?? {}));
   const baseContinuationOpts = {
-    ...(restStreamOptions ?? {}),
-    onFinish: undefined,
+    ...continuationCallerOptions,
     _skipBgTaskWait: true,
   } as Record<string, any>;
 
@@ -406,8 +424,35 @@ export async function runIdleLoop<
         const ctype = (chunk as { type?: string }).type;
         if (tid && ctype) processedTerminalKeys.add(`${tid}:${ctype}`);
       }
-      const continuationOpts = buildContinuationOpts(baseContinuationOpts, restStreamOptions?.context as any[], batch);
-      const inner = await streamForContinuation(continuationOpts);
+      const continuationDefaultOptions = await agent.getDefaultOptions({
+        requestContext: baseContinuationOpts.requestContext,
+      });
+      const mergedContinuationOptions = mergeAgentExecutionOptions(
+        continuationDefaultOptions as Record<string, any>,
+        baseContinuationOpts,
+      );
+      // Every continuation is a distinct execution. Strip one-shot wrapper,
+      // resume, hook, and reservation state after merging so defaults cannot
+      // silently reintroduce any of it.
+      for (const key of [
+        'runId',
+        'toolCallId',
+        'onFinish',
+        'untilIdle',
+        'maxIdleMs',
+        '_threadRunReservationOwner',
+        '_threadRunInflightIdleOwner',
+      ]) {
+        delete mergedContinuationOptions[key];
+      }
+      let continuationOpts = buildContinuationOpts(
+        mergedContinuationOptions,
+        mergedContinuationOptions.context as any[] | undefined,
+        batch,
+      );
+      continuationOpts = deps.prepareContinuation ? await deps.prepareContinuation(continuationOpts) : continuationOpts;
+      const continuationScope = await resolveScope(agent, continuationOpts);
+      const inner = await streamForContinuation(continuationOpts, continuationScope.memory, continuationDefaultOptions);
       hooks?.onInnerResult?.(inner);
       await pipeInner(inner.fullStream);
     } catch (err) {
@@ -432,8 +477,6 @@ export async function runIdleLoop<
   // --- Setup ---
   acquireStreamSlot(deps.activeStreams, scopeKey, forceClose);
 
-  streamOptions?.abortSignal?.addEventListener('abort', forceClose);
-
   const combinedStream = new ReadableStream<any>({
     start(controller) {
       outerController = controller;
@@ -442,6 +485,12 @@ export async function runIdleLoop<
       forceClose();
     },
   });
+  const effectiveAbortSignal = mergedOptions.abortSignal as AbortSignal | undefined;
+  if (effectiveAbortSignal?.aborted) {
+    forceClose();
+  } else {
+    effectiveAbortSignal?.addEventListener('abort', forceClose, { once: true });
+  }
 
   // --- Subscribe to background task events ---
   const bgStream = deps.bgManager.stream({

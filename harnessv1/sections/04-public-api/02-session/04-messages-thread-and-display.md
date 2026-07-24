@@ -19,7 +19,8 @@
   // touched. The harness never reads `metadata.app` for mode/model,
   // permissions, token usage, OM config, channel state, subagent ownership,
   // thread title/list labels, or any other runtime decision. Use typed Session
-  // or thread APIs for those fields.
+  // or thread APIs for Harness-owned fields and Agent Memory configuration for
+  // OM.
   setThreadSetting(opts: { key: string; value: JsonValue }): Promise<void>;
 
   // Display state. This public shape is the wire/persistence-safe

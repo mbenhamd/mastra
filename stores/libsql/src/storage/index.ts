@@ -234,7 +234,13 @@ export class LibSQLStore extends MastraCompositeStore {
     const blobs = new BlobsLibSQL(domainConfig);
     const backgroundTasks = new BackgroundTasksLibSQL(domainConfig);
     const schedules = new SchedulesLibSQL(domainConfig);
-    const harness = new HarnessLibSQL(domainConfig);
+    const harness = new HarnessLibSQL({
+      ...domainConfig,
+      // Only URL-owned persistent local stores initialize domains sequentially,
+      // so Harness can safely hold one atomic schema transaction. Injected and
+      // remote clients retain the established non-transactional domain path.
+      transactionalInit: 'url' in config && config.url.startsWith('file:') && !config.url.includes(':memory:'),
+    });
     const toolProviderConnections = new ToolProviderConnectionsLibSQL(domainConfig);
     const notifications = new NotificationsLibSQL(domainConfig);
     const threadState = new ThreadStateLibSQL(domainConfig);

@@ -13,6 +13,7 @@ export type {
   HarnessSessionSnapshot,
   HarnessSessionSummary,
   InboxResponseBody,
+  InboxResponseGeneration,
   InboxResponseResult,
   MessageAdmissionBody,
   MessageAdmissionResponse,

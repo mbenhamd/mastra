@@ -30,6 +30,7 @@ import type {
 import { HarnessError, HarnessEventSerializationError, HarnessStorageError, HarnessValidationError } from './errors';
 import type { EventSerializationReason, HarnessStorageOperation, HarnessStorageSubject } from './errors';
 import type { HarnessRunOperationRefKind, SessionLifecycleState, TokenUsage } from './session';
+import type { HarnessSubagentResultSummary } from './terminal-subagent-result';
 import type { PermissionPolicy, ToolCategory } from './types';
 
 // ---------------------------------------------------------------------------
@@ -280,6 +281,8 @@ export interface ToolDeniedEvent extends HarnessEventBase {
   stage: 'pre-exposure' | 'action';
   toolCallId?: string;
   forcedToolChoice?: boolean;
+  deniedToolCount?: number;
+  deniedToolNames?: string[];
 }
 
 /**
@@ -449,6 +452,7 @@ export type ToolApprovalRequiredEvent = HarnessEventBase & {
   runId: string;
   itemId: string;
   requestedAt: number;
+  expiresAt: number;
   toolCallId: string;
   toolName: string;
   toolCategory?: string;
@@ -462,6 +466,7 @@ export type ToolSuspensionRequiredEvent = HarnessEventBase & {
   runId: string;
   itemId: string;
   requestedAt: number;
+  expiresAt: number;
   toolCallId: string;
   toolName: string;
   suspendData: unknown;
@@ -472,6 +477,7 @@ export type QuestionPendingEvent = HarnessEventBase & {
   runId: string;
   itemId: string;
   requestedAt: number;
+  expiresAt: number;
   toolCallId: string;
   question: string;
   options?: { label: string; description?: string }[];
@@ -483,6 +489,7 @@ export type PlanApprovalRequiredEvent = HarnessEventBase & {
   runId: string;
   itemId: string;
   requestedAt: number;
+  expiresAt: number;
   toolCallId: string;
   title: string;
   plan: string;
@@ -779,6 +786,8 @@ export interface SubagentToolEndEvent extends HarnessEventBase {
   toolName: string;
   output: unknown;
   isError: boolean;
+  /** Child tool duration as measured by the child session's canonical tool span. */
+  durationMs?: number;
   parentId?: string;
   depth: number;
 }
@@ -788,7 +797,8 @@ export interface SubagentEndEvent extends HarnessEventBase {
   toolCallId: string;
   subagentSessionId: string;
   agentType: string;
-  output: unknown;
+  /** Bounded terminal summary; never the child's raw FullOutput. */
+  output: HarnessSubagentResultSummary;
   isError: boolean;
   durationMs: number;
   parentId?: string;
@@ -1188,8 +1198,8 @@ export class EventEmitter {
        * an oversized custom payload is replaced AT EMIT by the
        * {@link TOOL_PAYLOAD_TOO_LARGE} sentinel so live === durable replay by
        * construction. Returns `undefined` (NO cap, payload untouched) when the
-       * host has not set `files.maxEventPayloadBytes`, keeping an unconfigured
-       * harness byte-identical to before this feature existed.
+       * an embedding host deliberately supplies no cap. Harness itself supplies
+       * a finite default.
        */
       maxCustomEventPayloadBytes?: () => number | undefined;
     } = {},
@@ -1230,8 +1240,7 @@ export class EventEmitter {
    * `payload` field is replaced by the {@link TOOL_PAYLOAD_TOO_LARGE} sentinel
    * (the same projection helper, same sentinel) so the durable replay row matches
    * the live value by construction. Non-custom events, payload-less events, and
-   * an unconfigured cap pass through UNCHANGED (no projection, no round-trip), so
-   * an unconfigured harness is byte-identical to before this feature existed.
+   * an absent cap pass through UNCHANGED (no projection, no round-trip).
    */
   private applyCustomEventPayloadCap(event: EmitInput): EmitInput {
     const maxBytes = this.maxCustomEventPayloadBytes?.();

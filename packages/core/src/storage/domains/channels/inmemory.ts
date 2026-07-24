@@ -10,7 +10,15 @@ export class InMemoryChannelsStorage extends ChannelsStorage {
   #configs = new Map<string, ChannelConfig>();
 
   async saveInstallation(installation: ChannelInstallation): Promise<void> {
-    this.#installations.set(installation.id, { ...installation });
+    // Upsert semantics must match the SQL adapters, whose
+    // `ON CONFLICT (id) DO UPDATE SET ...` clauses deliberately omit
+    // `createdAt` (stores/pg, stores/libsql). Keep the original creation
+    // timestamp so a save-over-existing behaves as an update, not a replace.
+    const existing = this.#installations.get(installation.id);
+    this.#installations.set(installation.id, {
+      ...installation,
+      ...(existing ? { createdAt: existing.createdAt } : {}),
+    });
   }
 
   async getInstallation(id: string): Promise<ChannelInstallation | null> {

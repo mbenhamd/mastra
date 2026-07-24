@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
 import type { MastraDBMessage } from '@mastra/core/agent';
+import { tryFormatTerminalToolResultForModel } from '@mastra/core/agent/message-list';
 import imageSize from 'image-size';
 import { estimateTokenCount } from 'tokenx';
 
@@ -11,6 +12,7 @@ type TokenEstimateCacheEntry = {
   source: string;
   key: string;
   tokens: number;
+  retryAfter?: number;
 };
 
 export type TokenCounterModelContext = {
@@ -91,6 +93,7 @@ const GOOGLE_MEDIA_RESOLUTION_VALUES = new Set<GoogleMediaResolution>([
 ]);
 
 const ATTACHMENT_COUNT_TIMEOUT_MS = 20_000;
+const ATTACHMENT_COUNT_FAILURE_BACKOFF_MS = 5 * 60_000;
 const REMOTE_IMAGE_PROBE_TIMEOUT_MS = 2_500;
 const PROVIDER_API_KEY_ENV_VARS: Record<string, string[]> = {
   openai: ['OPENAI_API_KEY'],
@@ -1626,6 +1629,26 @@ export class TokenCounter {
         return cachedRemote.tokens;
       }
 
+      const fallbackCacheSource = `${this.cacheSource}:attachment-local-fallback`;
+      const cachedFallbackBackoff = getPartCacheEntry(part, remoteKey);
+      if (
+        isValidCacheEntry(cachedFallbackBackoff, remoteKey, fallbackCacheSource) &&
+        typeof cachedFallbackBackoff.retryAfter === 'number' &&
+        cachedFallbackBackoff.retryAfter > Date.now()
+      ) {
+        return cachedFallbackBackoff.tokens;
+      }
+
+      const persistRemoteFailureBackoff = (tokens: number) => {
+        setPartCacheEntry(part, remoteKey, {
+          v: TOKEN_ESTIMATE_CACHE_VERSION,
+          source: fallbackCacheSource,
+          key: remoteKey,
+          tokens,
+          retryAfter: Date.now() + ATTACHMENT_COUNT_FAILURE_BACKOFF_MS,
+        });
+      };
+
       const existingRequest = this.inFlightAttachmentCounts.get(remoteKey);
       if (existingRequest) {
         const remoteTokens = await existingRequest;
@@ -1672,6 +1695,7 @@ export class TokenCounter {
       const fallbackKey = buildEstimateKey('attachment-provider', fallbackPayload);
       const cachedFallback = getPartCacheEntry(part, fallbackKey);
       if (isValidCacheEntry(cachedFallback, fallbackKey, this.cacheSource)) {
+        persistRemoteFailureBackoff(cachedFallback.tokens);
         return cachedFallback.tokens;
       }
 
@@ -1686,6 +1710,7 @@ export class TokenCounter {
         key: fallbackKey,
         tokens: localTokens,
       });
+      persistRemoteFailureBackoff(localTokens);
       return localTokens;
     }
 
@@ -1776,6 +1801,16 @@ export class TokenCounter {
     }
 
     if (typeof part.type === 'string' && part.type.startsWith('data-')) {
+      if (part.type === 'data-terminal-tool-result') {
+        const terminalText = tryFormatTerminalToolResultForModel((part as { data?: unknown }).data);
+        if (terminalText) {
+          return {
+            tokens: this.readOrPersistPartEstimate(part, 'terminal-tool-result-model-text', terminalText),
+            overheadDelta,
+            toolResultDelta,
+          };
+        }
+      }
       return { tokens: 0, overheadDelta, toolResultDelta };
     }
 

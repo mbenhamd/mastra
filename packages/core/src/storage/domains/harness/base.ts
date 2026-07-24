@@ -2,7 +2,6 @@ import { StorageDomain } from '../base';
 import type {
   AcquireSessionLeaseInput,
   AgentSignalResultEvidence,
-  AgentSignalResultStatus,
   AgentSignalDispatchState,
   AppendWorkspaceActionJournalEntryResult,
   AttachmentReference,
@@ -53,6 +52,8 @@ import type {
   HarnessWakeupItem,
   ListActiveSessionsByThreadInput,
   ListChannelDiagnosticsInput,
+  ListDuePendingInteractionsInput,
+  ListDuePendingInteractionsResult,
   ListSessionsByThreadInput,
   ListSessionsInput,
   ListWorkspaceActionJournalInput,
@@ -78,6 +79,39 @@ import type {
   WithThreadDeleteFenceInput,
   WorkspaceActionJournalEntry,
 } from './types';
+
+/** Hard storage-side page ceiling for pending-interaction expiry discovery. */
+export const HARNESS_PENDING_INTERACTION_DUE_SCAN_MAX_LIMIT = 100;
+
+/**
+ * Validate and cap a due-scan request before an adapter allocates or queries.
+ * Kept in the storage domain so every adapter enforces identical bounds.
+ */
+export function normalizePendingInteractionDueScanInput(input: ListDuePendingInteractionsInput): {
+  now: number;
+  limit: number;
+  cursor?: { dueAt: number; sessionId: string };
+} {
+  if (!Number.isSafeInteger(input.now) || input.now < 0) {
+    throw new RangeError('Pending-interaction due scan now must be a non-negative safe integer');
+  }
+  if (!Number.isSafeInteger(input.limit) || input.limit <= 0) {
+    throw new RangeError('Pending-interaction due scan limit must be a positive safe integer');
+  }
+  if (input.cursor !== undefined) {
+    if (!Number.isSafeInteger(input.cursor.dueAt) || input.cursor.dueAt < 0) {
+      throw new RangeError('Pending-interaction due scan cursor dueAt must be a non-negative safe integer');
+    }
+    if (input.cursor.sessionId.length === 0) {
+      throw new RangeError('Pending-interaction due scan cursor sessionId must not be empty');
+    }
+  }
+  return {
+    now: input.now,
+    limit: Math.min(input.limit, HARNESS_PENDING_INTERACTION_DUE_SCAN_MAX_LIMIT),
+    ...(input.cursor ? { cursor: input.cursor } : {}),
+  };
+}
 
 export interface WriteMessageResultEvidenceResult {
   created: boolean;
@@ -683,6 +717,14 @@ export abstract class HarnessStorage extends StorageDomain {
   }
 
   /**
+   * Discover due pending interactions without hydrating every session. Results
+   * are ordered by `(expiresAt, sessionId)` and keyset-paginated. The returned
+   * generation is advisory: the expiry worker must compare it under the
+   * session CAS so a response/new pending generation can win safely.
+   */
+  abstract listDuePendingInteractions(opts: ListDuePendingInteractionsInput): Promise<ListDuePendingInteractionsResult>;
+
+  /**
    * Run a small critical section while new active-session admission for this
    * thread is fenced. Durable adapters persist the fence so another process
    * cannot create a session after the active-session guard and before the
@@ -906,13 +948,19 @@ export abstract class HarnessStorage extends StorageDomain {
   // Admission/result evidence
   // -------------------------------------------------------------------------
 
+  /**
+   * Load the complete durable row, including created/updated timestamps used by
+   * deadline-fenced recovery. Returning only `AgentSignalResultStatus` is not
+   * sufficient: a conforming adapter must not make an old completion appear to
+   * have settled before a delegation deadline.
+   */
   abstract loadMessageResultEvidence(opts: {
     harnessName?: string;
     sessionId: string;
     resourceId: string;
     threadId: string;
     signalId: string;
-  }): Promise<AgentSignalResultStatus | OperationAdmissionTombstone | null>;
+  }): Promise<AgentSignalResultEvidence | OperationAdmissionTombstone | null>;
 
   abstract writeMessageResultEvidence(record: AgentSignalResultEvidence): Promise<WriteMessageResultEvidenceResult>;
 

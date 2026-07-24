@@ -11,6 +11,8 @@ export interface ExtractorRuntimeContext {
   source: ExtractorSource;
   threadId?: string;
   resourceId?: string;
+  /** Exact OM generation authorizing observer-managed derived writes. */
+  observationalMemoryRecordId?: string;
   mainAgent?: ProcessorContext['agent'];
   memory?: Memory;
   requestContext?: RequestContext;
@@ -181,8 +183,39 @@ export class Extractor<T = unknown> {
 export async function resolveExtractors(
   extractors: readonly Extractor<any>[],
   context: ExtractorRuntimeContext,
+  onFailure?: (failure: { slug: string; error: string }) => void,
 ): Promise<Extractor<any>[]> {
-  return Promise.all(extractors.map(extractor => extractor.resolve(context)));
+  const settled = await Promise.all(
+    extractors.map(async extractor => {
+      try {
+        return { status: 'fulfilled' as const, value: await extractor.resolve(context) };
+      } catch (reason) {
+        const aborted =
+          (reason instanceof DOMException && reason.name === 'AbortError') ||
+          (reason instanceof Error && reason.name === 'AbortError');
+        // Built-in extractors enforce OM invariants and aborts are control flow.
+        // Throwing inside the mapped promise makes Promise.all reject without
+        // waiting for unrelated dynamic resolvers to settle.
+        if (extractor.internal || aborted) throw reason;
+        return {
+          status: 'rejected' as const,
+          failure: {
+            slug: extractor.slug,
+            error: `Extractor "${extractor.name}" resolver failed.`,
+          },
+        };
+      }
+    }),
+  );
+  const resolved: Extractor<any>[] = [];
+  for (const result of settled) {
+    if (result.status === 'fulfilled') {
+      resolved.push(result.value);
+      continue;
+    }
+    onFailure?.(result.failure);
+  }
+  return resolved;
 }
 
 export function validateExtractorList(extractors: readonly Extractor<any>[]): Extractor<any>[] {

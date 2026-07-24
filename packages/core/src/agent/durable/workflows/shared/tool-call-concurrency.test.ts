@@ -11,8 +11,16 @@ function tool(overrides: Partial<SerializableToolMetadata> & { name: string }): 
   };
 }
 
-function call(_toolName: string, activeTools?: string[] | null): Pick<DurableToolCallInput, 'activeTools'> {
-  return activeTools !== undefined ? { activeTools } : {};
+function call(
+  toolName: string,
+  activeTools?: string[] | null,
+): Pick<DurableToolCallInput, 'toolCallId' | 'toolName' | 'args' | 'activeTools'> {
+  return {
+    toolCallId: `call-${toolName}`,
+    toolName,
+    args: {},
+    ...(activeTools !== undefined ? { activeTools } : {}),
+  };
 }
 
 describe('resolveDurableToolCallConcurrency', () => {
@@ -43,6 +51,84 @@ describe('resolveDurableToolCallConcurrency', () => {
       resolveDurableToolCallConcurrency({
         options: { requireToolApproval: true, toolCallConcurrency: 10 },
         toolsMetadata: [tool({ name: 'plain' })],
+      }),
+    ).toBe(1);
+  });
+
+  it('forces sequential execution when a required per-tool permission policy is missing after replay', () => {
+    expect(
+      resolveDurableToolCallConcurrency({
+        options: { permissionPolicyRequired: true, toolCallConcurrency: 10 },
+        toolsMetadata: [tool({ name: 'plain' })],
+        toolCalls: [call('plain')],
+      }),
+    ).toBe(1);
+  });
+
+  it('does not let a runtime false hint downgrade the serialized policy requirement', () => {
+    expect(
+      resolveDurableToolCallConcurrency({
+        options: { permissionPolicyRequired: true, toolCallConcurrency: 10 },
+        toolCalls: [call('plain')],
+        permissionPolicyRequired: false,
+      }),
+    ).toBe(1);
+  });
+
+  it('uses configured concurrency for an immutable all-allow policy over every emitted call', () => {
+    expect(
+      resolveDurableToolCallConcurrency({
+        options: { permissionPolicyRequired: true, toolCallConcurrency: 6 },
+        toolsMetadata: [tool({ name: 'read_a' }), tool({ name: 'read_b' })],
+        toolCalls: [call('read_a'), call('read_b')],
+        permissionPolicy: () => 'allow',
+        permissionPolicyStable: true,
+      }),
+    ).toBe(6);
+  });
+
+  it('keeps a mixed ask plus allow emitted batch sequential', () => {
+    expect(
+      resolveDurableToolCallConcurrency({
+        options: { permissionPolicyRequired: true, toolCallConcurrency: 6 },
+        toolCalls: [call('read'), call('write')],
+        permissionPolicy: toolCall => (toolCall.toolName === 'write' ? 'ask' : 'allow'),
+        permissionPolicyStable: true,
+      }),
+    ).toBe(1);
+  });
+
+  it('keeps a throwing policy sequential', () => {
+    expect(
+      resolveDurableToolCallConcurrency({
+        options: { permissionPolicyRequired: true, toolCallConcurrency: 6 },
+        toolCalls: [call('read')],
+        permissionPolicy: () => {
+          throw new Error('policy store unavailable');
+        },
+        permissionPolicyStable: true,
+      }),
+    ).toBe(1);
+  });
+
+  it('keeps a promise-valued policy sequential even when it eventually allows', async () => {
+    expect(
+      resolveDurableToolCallConcurrency({
+        options: { permissionPolicyRequired: true, toolCallConcurrency: 6 },
+        toolCalls: [call('read')],
+        permissionPolicy: () => Promise.resolve('allow'),
+        permissionPolicyStable: true,
+      }),
+    ).toBe(1);
+    await Promise.resolve();
+  });
+
+  it('does not trust an all-allow evaluator without the immutable-snapshot assertion', () => {
+    expect(
+      resolveDurableToolCallConcurrency({
+        options: { permissionPolicyRequired: true, toolCallConcurrency: 6 },
+        toolCalls: [call('read_a'), call('read_b')],
+        permissionPolicy: () => 'allow',
       }),
     ).toBe(1);
   });

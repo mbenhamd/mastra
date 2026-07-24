@@ -7,7 +7,13 @@
  */
 
 import { Agent } from '@mastra/core/agent';
-import { AGENT_STREAM_TOPIC, AgentStreamEventTypes, globalRunRegistry } from '@mastra/core/agent/durable';
+import {
+  AGENT_STREAM_TOPIC,
+  AgentStreamEventTypes,
+  globalRunRegistry,
+  TOOL_PERMISSION_POLICY_KEY,
+  TOOL_PERMISSION_POLICY_REQUIRED_KEY,
+} from '@mastra/core/agent/durable';
 import { InMemoryServerCache } from '@mastra/core/cache';
 import { CachingPubSub, EventEmitterPubSub } from '@mastra/core/events';
 import { Mastra } from '@mastra/core/mastra';
@@ -709,8 +715,14 @@ describe('InngestAgent parity surface', () => {
   // dev server, terminal stream events (finish/error/abort) try to publish
   // over inngest realtime and produce unhandled fetch rejections. Swap the
   // inner with an in-process broker so the surface tests stay self-contained.
-  function makeIsolatedAgent(id: string) {
-    const durableAgent = createInngestAgent({ agent: makeAgent(id), inngest });
+  function makeIsolatedAgent(
+    id: string,
+    options: {
+      durableRequestContextKeys?: readonly string[];
+      resolveToolPermission?: (input: any) => 'allow' | 'ask' | 'deny' | Promise<'allow' | 'ask' | 'deny'>;
+    } = {},
+  ) {
+    const durableAgent = createInngestAgent({ agent: makeAgent(id), inngest, ...options });
     const mastra = new Mastra({
       logger: false,
       storage: new DefaultStorage({ id: `${id}-storage`, url: ':memory:' }),
@@ -945,7 +957,9 @@ describe('InngestAgent parity surface', () => {
   });
 
   it('forwards requestContext entries into the workflow trigger event', async () => {
-    const { durableAgent, mastra } = makeIsolatedAgent('parity-request-context-trigger');
+    const { durableAgent, mastra } = makeIsolatedAgent('parity-request-context-trigger', {
+      durableRequestContextKeys: ['userId', 'organizationId'],
+    });
     const sendSpy = stubInngestSend();
     const requestContext = new RequestContext();
     requestContext.set('userId', 'user-1');
@@ -980,7 +994,7 @@ describe('InngestAgent parity surface', () => {
     }
   });
 
-  it('forwards persisted requestContext entries into the workflow resume event', async () => {
+  it('strips unallowlisted legacy snapshot context from the workflow resume event', async () => {
     const { durableAgent, mastra } = makeIsolatedAgent('parity-request-context-resume');
     const workflowIds = workflowIdsFor('parity-request-context-resume');
     const sendSpy = stubInngestSend();
@@ -1031,10 +1045,7 @@ describe('InngestAgent parity surface', () => {
           executionGeneration: 'request-context-resume-generation',
           lifecycleResumeAttempt: 1,
           lifecycleStepStates: {},
-          requestContext: {
-            userId: 'user-1',
-            organizationId: 'org-1',
-          },
+          requestContext: {},
           resume: expect.objectContaining({
             steps: ['agentic-loop'],
             resumePayload: { answer: 'approved' },
@@ -1054,6 +1065,160 @@ describe('InngestAgent parity surface', () => {
       sendSpy.mockRestore();
       await mastra.shutdown();
     }
+  });
+
+  it('merges fresh bounded resume context, persists a sticky policy marker, and never serializes the closure', async () => {
+    const { durableAgent, mastra } = makeIsolatedAgent('parity-request-context-resume-policy', {
+      durableRequestContextKeys: ['organizationId'],
+    });
+    const workflowIds = workflowIdsFor('parity-request-context-resume-policy');
+    const sendSpy = stubInngestSend();
+    const runId = 'request-context-resume-policy-run';
+    const workflowsStore = await mastra.getStorage()!.getStore('workflows');
+    const [workflow] = durableAgent.getDurableWorkflows() as any[];
+    await workflowsStore.persistWorkflowSnapshot({
+      workflowName: workflowIds.AGENTIC_LOOP,
+      runId,
+      snapshot: {
+        runId,
+        executionGeneration: 'request-context-resume-policy-generation',
+        lifecycleResumeAttempt: 0,
+        lifecycleStepStates: {},
+        status: 'suspended',
+        value: { retainedState: true },
+        context: {},
+        suspendedPaths: { 'agentic-loop': [0] },
+        activePaths: [],
+        activeStepsPath: {},
+        waitingPaths: {},
+        resumeLabels: {},
+        serializedStepGraph: workflow.serializedStepGraph,
+        requestContext: { userId: 'persisted-user' },
+        timestamp: Date.now(),
+      },
+    });
+    const requestContext = new RequestContext();
+    requestContext.set('organizationId', 'fresh-org');
+    requestContext.set(TOOL_PERMISSION_POLICY_KEY, () => 'deny');
+
+    const result = await durableAgent.resume(
+      runId,
+      { answer: 'approved' },
+      { requestContext, requireToolPermissionPolicy: true },
+    );
+    try {
+      const deadline = Date.now() + 1_000;
+      let entry = globalRunRegistry.get(runId);
+      while (!entry?.workflowExecution && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 0));
+        entry = globalRunRegistry.get(runId);
+      }
+      await expect(entry?.workflowExecution).resolves.toBeUndefined();
+
+      const transported = sendSpy.mock.calls[0]?.[0]?.data?.requestContext;
+      expect(transported).toEqual({
+        organizationId: 'fresh-org',
+        [TOOL_PERMISSION_POLICY_REQUIRED_KEY]: true,
+      });
+      expect(transported).not.toHaveProperty(TOOL_PERMISSION_POLICY_KEY);
+      expect(() => structuredClone(transported)).not.toThrow();
+
+      await expect(
+        workflowsStore.loadWorkflowSnapshot({ workflowName: workflowIds.AGENTIC_LOOP, runId }),
+      ).resolves.toMatchObject({
+        requestContext: {
+          organizationId: 'fresh-org',
+          [TOOL_PERMISSION_POLICY_REQUIRED_KEY]: true,
+        },
+      });
+    } finally {
+      result.cleanup();
+      sendSpy.mockRestore();
+      await mastra.shutdown();
+    }
+  });
+
+  it('rehydrates only allowlisted snapshot references and strips legacy credentials on resume', async () => {
+    const { durableAgent, mastra } = makeIsolatedAgent('parity-request-context-resume-filtered', {
+      durableRequestContextKeys: ['sessionId'],
+    });
+    const workflowIds = workflowIdsFor('parity-request-context-resume-filtered');
+    const sendSpy = stubInngestSend();
+    const runId = 'request-context-resume-filtered-run';
+    const workflowsStore = await mastra.getStorage()!.getStore('workflows');
+    const [workflow] = durableAgent.getDurableWorkflows() as any[];
+    await workflowsStore.persistWorkflowSnapshot({
+      workflowName: workflowIds.AGENTIC_LOOP,
+      runId,
+      snapshot: {
+        runId,
+        executionGeneration: 'request-context-resume-filtered-generation',
+        lifecycleResumeAttempt: 0,
+        lifecycleStepStates: {},
+        status: 'suspended',
+        value: {},
+        context: {},
+        suspendedPaths: { 'agentic-loop': [0] },
+        activePaths: [],
+        activeStepsPath: {},
+        waitingPaths: {},
+        resumeLabels: {},
+        serializedStepGraph: workflow.serializedStepGraph,
+        requestContext: {
+          sessionId: 'session-safe-reference',
+          accessToken: 'legacy-secret',
+          credentials: { refreshToken: 'legacy-refresh-secret' },
+          [TOOL_PERMISSION_POLICY_REQUIRED_KEY]: true,
+        },
+        timestamp: Date.now(),
+      },
+    });
+
+    const result = await durableAgent.resume(runId, undefined);
+    try {
+      const deadline = Date.now() + 1_000;
+      let entry = globalRunRegistry.get(runId);
+      while (!entry?.workflowExecution && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 0));
+        entry = globalRunRegistry.get(runId);
+      }
+      await expect(entry?.workflowExecution).resolves.toBeUndefined();
+
+      expect(sendSpy.mock.calls[0]?.[0]?.data?.requestContext).toEqual({
+        sessionId: 'session-safe-reference',
+        [TOOL_PERMISSION_POLICY_REQUIRED_KEY]: true,
+      });
+      expect(JSON.stringify(sendSpy.mock.calls[0]?.[0])).not.toContain('legacy-secret');
+      expect(JSON.stringify(sendSpy.mock.calls[0]?.[0])).not.toContain('legacy-refresh-secret');
+      const persistedSnapshot = await workflowsStore.loadWorkflowSnapshot({
+        workflowName: workflowIds.AGENTIC_LOOP,
+        runId,
+      });
+      expect(persistedSnapshot).toMatchObject({
+        requestContext: {
+          sessionId: 'session-safe-reference',
+          [TOOL_PERMISSION_POLICY_REQUIRED_KEY]: true,
+        },
+      });
+      expect(JSON.stringify(persistedSnapshot)).not.toContain('legacy-secret');
+      expect(JSON.stringify(persistedSnapshot)).not.toContain('legacy-refresh-secret');
+    } finally {
+      result.cleanup();
+      sendSpy.mockRestore();
+      await mastra.shutdown();
+    }
+  });
+
+  it('makes a configured worker permission resolver a serialized fail-closed run requirement', async () => {
+    const durableAgent = createInngestAgent({
+      agent: makeAgent('parity-worker-policy-marker'),
+      inngest,
+      resolveToolPermission: () => 'allow',
+    });
+
+    const prepared = await durableAgent.prepare([{ role: 'user', content: 'hi' }]);
+
+    expect(prepared.workflowInput.options.permissionPolicyRequired).toBe(true);
   });
 
   it('exposes generate() and resumeGenerate() with durable signatures', () => {

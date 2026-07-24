@@ -1454,6 +1454,138 @@ describe('MessageHistory', () => {
       expect(JSON.stringify(savedMessages)).not.toContain('HISTORICAL_OUTCOME_MUST_NOT_LEAK');
     });
 
+    it('persists a bounded terminal-only assistant answer for reload', async () => {
+      const storage = createPersistenceStorage();
+      const processor = new MessageHistory({ storage, persistence: { mode: 'final-turn' } });
+      const messages: MastraDBMessage[] = [
+        {
+          id: 'terminal-user',
+          role: 'user',
+          createdAt: new Date('2024-01-01T00:00:00Z'),
+          threadId: 'thread-1',
+          resourceId: 'resource-1',
+          content: { format: 2, parts: [{ type: 'text', text: 'Delegate this answer.' }] },
+        },
+        {
+          id: 'terminal-assistant',
+          role: 'assistant',
+          createdAt: new Date('2024-01-01T00:00:01Z'),
+          threadId: 'thread-1',
+          resourceId: 'resource-1',
+          content: {
+            format: 2,
+            parts: [
+              {
+                type: 'tool-invocation',
+                toolInvocation: {
+                  state: 'result',
+                  toolCallId: 'spawn-call',
+                  toolName: 'spawn_subagent',
+                  args: { task: 'PRIVATE_CHILD_TASK' },
+                  result: { raw: 'PRIVATE_CHILD_RESULT' },
+                },
+              },
+              {
+                type: 'data-terminal-tool-result',
+                id: 'run-1:terminal-tool-result:1',
+                data: {
+                  status: 'success',
+                  items: [
+                    {
+                      toolName: 'spawn_subagent',
+                      toolCallId: 'spawn-call',
+                      status: 'success',
+                      value: { kind: 'subagent-direct-answer', text: 'Specialist-authored final answer.' },
+                    },
+                  ],
+                },
+                providerMetadata: { mastra: { secret: 'TERMINAL_PART_METADATA_SECRET' } },
+              } as any,
+            ],
+          },
+        },
+      ];
+
+      await processor.persistMessages({ messages, threadId: 'thread-1', resourceId: 'resource-1' });
+
+      const savedMessages = (storage.saveMessages as any).mock.calls[0][0].messages as MastraDBMessage[];
+      expect(savedMessages.map(message => message.id)).toEqual(['terminal-user', 'terminal-assistant']);
+      expect(savedMessages[1]!.content.parts).toEqual([
+        {
+          type: 'data-terminal-tool-result',
+          id: 'run-1:terminal-tool-result:1',
+          data: {
+            status: 'success',
+            items: [
+              {
+                toolName: 'spawn_subagent',
+                toolCallId: 'spawn-call',
+                status: 'success',
+                value: { kind: 'subagent-direct-answer', text: 'Specialist-authored final answer.' },
+              },
+            ],
+          },
+        },
+      ]);
+      expect(JSON.stringify(savedMessages)).not.toContain('PRIVATE_CHILD_TASK');
+      expect(JSON.stringify(savedMessages)).not.toContain('PRIVATE_CHILD_RESULT');
+      expect(JSON.stringify(savedMessages)).not.toContain('TERMINAL_PART_METADATA_SECRET');
+    });
+
+    it('retains terminal data at the exact 64 KiB data boundary even though the persisted part wrapper is larger', async () => {
+      const storage = createPersistenceStorage();
+      const processor = new MessageHistory({ storage, persistence: { mode: 'final-turn' } });
+      const terminalData = {
+        status: 'success' as const,
+        items: [
+          {
+            toolName: 'spawn_subagent',
+            toolCallId: 'spawn-boundary',
+            status: 'success' as const,
+            value: { text: '' },
+          },
+        ],
+      };
+      const encodedSize = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).byteLength;
+      terminalData.items[0]!.value.text = 'x'.repeat(64 * 1024 - encodedSize(terminalData));
+      expect(encodedSize(terminalData)).toBe(64 * 1024);
+      const messages: MastraDBMessage[] = [
+        {
+          id: 'terminal-boundary-user',
+          role: 'user',
+          createdAt: new Date('2024-01-01T00:00:00Z'),
+          content: { format: 2, parts: [{ type: 'text', text: 'Return the large bounded answer.' }] },
+        },
+        {
+          id: 'terminal-boundary-assistant',
+          role: 'assistant',
+          createdAt: new Date('2024-01-01T00:00:01Z'),
+          content: {
+            format: 2,
+            parts: [
+              {
+                type: 'data-terminal-tool-result',
+                id: 'run-boundary:terminal-tool-result:1',
+                data: terminalData,
+              } as any,
+            ],
+          },
+        },
+      ];
+
+      await processor.persistMessages({ messages, threadId: 'thread-1' });
+
+      const savedMessages = (storage.saveMessages as any).mock.calls[0][0].messages as MastraDBMessage[];
+      expect(savedMessages[1]!.content.parts).toEqual([
+        {
+          type: 'data-terminal-tool-result',
+          id: 'run-boundary:terminal-tool-result:1',
+          data: terminalData,
+        },
+      ]);
+      expect(encodedSize(savedMessages[1]!.content.parts[0])).toBeGreaterThan(64 * 1024);
+    });
+
     it('does not persist an approved compact outcome from before the last user turn', async () => {
       const storage = createPersistenceStorage();
       const processor = new MessageHistory({

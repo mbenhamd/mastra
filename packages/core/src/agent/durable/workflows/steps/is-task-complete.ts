@@ -10,6 +10,7 @@ import { MessageList } from '../../../message-list';
 import { DurableAgentDefaults, DurableStepIds } from '../../constants';
 import { globalRunRegistry } from '../../run-registry';
 import { emitChunkEvent } from '../../stream-adapter';
+import { resolveDurableRequestContext } from '../shared';
 
 /**
  * Create the durable isTaskComplete step.
@@ -56,6 +57,7 @@ export function createDurableIsTaskCompleteStep(defaultMaxSteps: number = Durabl
         lastStepResult?: { isContinued?: boolean };
         options?: { maxSteps?: number };
         backgroundTaskPending?: boolean;
+        terminalToolResult?: unknown;
       };
       const pubsub = (params as any)[PUBSUB_SYMBOL] as PubSub | undefined;
       const initData = getInitData() as {
@@ -64,6 +66,8 @@ export function createDurableIsTaskCompleteStep(defaultMaxSteps: number = Durabl
         state?: { threadId?: string; resourceId?: string };
         requestContextEntries?: Record<string, unknown>;
       };
+
+      if (state.terminalToolResult) return state;
 
       const registryEntry = globalRunRegistry.get(state.runId);
       const isTaskComplete = registryEntry?.isTaskComplete;
@@ -122,6 +126,10 @@ export function createDurableIsTaskCompleteStep(defaultMaxSteps: number = Durabl
         toolName?: string;
         result?: unknown;
       }>;
+      const { customContext } = resolveDurableRequestContext(
+        registryEntry?.requestContext,
+        initData.requestContextEntries,
+      );
 
       const ctx: StreamCompletionContext = {
         iteration: state.iterationCount,
@@ -142,7 +150,7 @@ export function createDurableIsTaskCompleteStep(defaultMaxSteps: number = Durabl
         runId: state.runId,
         threadId: initData.state?.threadId,
         resourceId: initData.state?.resourceId,
-        customContext: initData.requestContextEntries,
+        customContext,
       };
 
       let result: IsTaskCompleteRunResult | undefined;

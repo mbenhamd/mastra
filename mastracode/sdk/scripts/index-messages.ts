@@ -22,6 +22,8 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { spawnSync } from 'child_process';
 
+import { buildObservationIndexInput } from '../src/utils/observation-index-input';
+
 function buildLegacyGroupId(threadId: string | null, dateHeader: string, content: string): string {
   return crypto
     .createHash('sha1')
@@ -337,13 +339,13 @@ async function indexObservationGroupsFromMessages(
       }
 
       try {
-        await (memory as any).indexObservation({
-          text: group.content,
-          groupId: group.id,
-          range: group.range,
-          threadId: threadId ?? '',
-          resourceId,
-        });
+        const input = buildObservationIndexInput({ group, threadId, resourceId });
+        if (!input) {
+          errors++;
+          console.log(`\n    group ${group.id} skipped: no authorizing observational-memory record`);
+          continue;
+        }
+        await (memory as any).indexObservation(input);
         indexed++;
       } catch (err: any) {
         errors++;

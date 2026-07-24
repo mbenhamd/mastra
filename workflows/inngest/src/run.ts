@@ -789,6 +789,8 @@ export class InngestRun<
       | string[];
     label?: string;
     requestContext?: RequestContext<TRequestContext>;
+    /** @internal Replace persisted context instead of merging. Adapter trust boundary only. */
+    __requestContextMode?: 'replace';
     actor?: ActorSignal;
     perStep?: boolean;
   }): Promise<WorkflowResult<TState, TInput, TOutput, TSteps>> {
@@ -822,6 +824,8 @@ export class InngestRun<
       | string[];
     label?: string;
     requestContext?: RequestContext<TRequestContext>;
+    /** @internal Replace persisted context instead of merging. Adapter trust boundary only. */
+    __requestContextMode?: 'replace';
     actor?: ActorSignal;
     perStep?: boolean;
   }): Promise<{ eventId: string; receipt: WorkflowResumeReceiptExpectation }> {
@@ -887,8 +891,11 @@ export class InngestRun<
     const suspendedStep = this.workflowSteps[steps?.[0] ?? ''];
 
     const resumeDataToUse = await this._validateResumeData(params.resumeData, suspendedStep);
-    // Merge persisted requestContext from snapshot with any new values from params
-    const persistedRequestContext = snapshot.requestContext ?? resumeSource?.requestContext ?? {};
+    // Generic workflows merge persisted context by default. Trusted adapters
+    // can opt into replacement after they have independently filtered and
+    // rebuilt the context at their security boundary.
+    const persistedRequestContext =
+      params.__requestContextMode === 'replace' ? {} : (snapshot.requestContext ?? resumeSource?.requestContext ?? {});
     const newRequestContext = params.requestContext ? Object.fromEntries(params.requestContext.entries()) : {};
     const mergedRequestContext = { ...persistedRequestContext, ...newRequestContext };
     const disableScorers = this.getDurableDisableScorers(snapshot as InngestWorkflowRunState);
@@ -961,6 +968,7 @@ export class InngestRun<
       lifecycleStepStates: resumeSource.lifecycleStepStates ?? {},
       nextLifecycleResumeAttempt: lifecycleExecution.lifecycleResumeAttempt,
       requestContext: mergedRequestContext,
+      ...(params.__requestContextMode === 'replace' ? { replaceRequestContext: true as const } : {}),
     });
     if (admission.status !== 'admitted' && admission.status !== 'already_admitted') {
       throw new NonRetriableError(`Cannot resume run ${this.runId}: atomic admission failed with ${admission.status}`);
@@ -1022,6 +1030,8 @@ export class InngestRun<
       | string[];
     label?: string;
     requestContext?: RequestContext<TRequestContext>;
+    /** @internal Replace persisted context instead of merging. Adapter trust boundary only. */
+    __requestContextMode?: 'replace';
     actor?: ActorSignal;
     perStep?: boolean;
   }): Promise<WorkflowResult<TState, TInput, TOutput, TSteps>> {
@@ -1058,6 +1068,8 @@ export class InngestRun<
       | string[];
     label?: string;
     requestContext?: RequestContext<TRequestContext>;
+    /** @internal Replace persisted context instead of merging. Adapter trust boundary only. */
+    __requestContextMode?: 'replace';
     actor?: ActorSignal;
     perStep?: boolean;
   }): Promise<{ runId: string }> {

@@ -35,6 +35,7 @@ import type {
   PersistedRequestContextInput,
   HarnessStorage,
   JsonValue,
+  PendingResume,
   PermissionRules,
   SessionRecord as StoredSessionRecord,
 } from '../../storage/domains/harness';
@@ -685,8 +686,9 @@ export interface HarnessFileConfig {
    * (`tool_start.input`, `tool_end.output`, approval/suspension data). A payload
    * exceeding this is replaced AT EMIT by the stable oversized-payload sentinel
    * so the durable event ledger and the live wire stay bounded while live and
-   * replay remain identical. Defaults high enough that normal model-generated
-   * tool results are untouched. Must be a non-negative integer.
+   * replay remain identical. Defaults to 64 KiB so normal model-generated tool
+   * results are untouched while an unconfigured Harness remains bounded. Must
+   * be a non-negative integer.
    */
   maxEventPayloadBytes?: number;
 }
@@ -1163,6 +1165,29 @@ export interface HarnessConfigCommon {
     closeTimeoutMs?: number;
 
     /**
+     * Maximum time a tool approval, tool suspension, question, plan approval,
+     * or sandbox-access request may wait for a user response. Expiry
+     * terminalizes only the suspended run and keeps the session/thread
+     * recoverable for future turns. The deadline is stored on the pending row,
+     * so restarts do not reset it. Defaults to 600_000 ms (10 minutes).
+     */
+    pendingInteractionTtlMs?: number;
+
+    /**
+     * Per-kind overrides for {@link pendingInteractionTtlMs}. A kind present
+     * here uses its own deadline; every other kind keeps the single default.
+     * Useful when one gate deserves more patience than the rest — a
+     * destructive-action `tool-approval` confirmation is worth waiting longer
+     * on than a `sandbox-access` prompt the user can simply re-trigger.
+     *
+     * Each value has the same bounds as `pendingInteractionTtlMs` and is
+     * validated at construction. Only the kind that captured the pending row
+     * is consulted, and the resolved deadline is frozen onto that row, so a
+     * config change never moves an already-parked interaction's deadline.
+     */
+    pendingInteractionTtlMsByKind?: Partial<Record<PendingResume['kind'], number>>;
+
+    /**
      * Behavior when `harness.session(...)` needs the write lease but another
      * owner holds an unexpired lease (§5.8):
      * - `'fail'` (default): reject immediately with `HarnessSessionLockedError`.
@@ -1223,15 +1248,33 @@ export interface HarnessConfigCommon {
    * error containing `HarnessSubagentDepthExceededError`. Default: `1`
    * (the top-level session can spawn one level of subagents).
    *
-   * `maxConcurrent` caps how many `spawn_subagent` subagents a single parent
-   * session may run AT ONCE (backpressure). A spawn while that many are already
-   * in flight returns a tool error (`HarnessSubagentConcurrencyLimitError`)
-   * instead of unbounded child-session creation. Omitted ⇒ no per-parent limit
-   * (still bounded harness-wide by `sessions.maxLive`).
+   * `maxConcurrent` caps how many inline (`spawn_subagent`) plus durable
+   * (`task_delegate`) subagents a single parent session may have in flight at
+   * once. Both paths consume the same reservation; selecting durable delegation
+   * cannot bypass backpressure. A call at the cap returns a tool error
+   * (`HarnessSubagentConcurrencyLimitError`) before creating a child session.
+   * Omitted ⇒ no per-parent limit (still bounded harness-wide by
+   * `sessions.maxLive`).
+   *
+   * `delegationTimeoutMs` is the wall-clock budget for one durable
+   * `task_delegate` attempt, including provider work and any HITL wait. The
+   * resulting absolute deadline is committed with the ownership edge and is
+   * never reset by process restart. Default: 30 minutes.
    */
   subagents?: {
+    /**
+     * Copy the root session's durable tool/category grants into each newly
+     * created descendant session. The copy is a creation-time snapshot: it
+     * does not share mutable permission state and never updates descendants
+     * that are already running. Per-tool/category `deny` rules and subagent
+     * tool allowlists remain stronger than an inherited grant.
+     *
+     * Defaults to `false`, preserving isolated subagent permission state.
+     */
+    inheritRootSessionGrants?: boolean;
     maxDepth?: number;
     maxConcurrent?: number;
+    delegationTimeoutMs?: number;
     types: Record<string, SubagentDefinition>;
   };
 
@@ -1352,10 +1395,13 @@ export interface HarnessConfigCommon {
 
   /**
    * §9.2 Observational Memory. JSON-safe resolved defaults for OM in this
-   * harness; per-session model overrides live on `SessionRecord.observationalMemory`
-   * and are surfaced via `session.om.*`. `true` enables OM with defaults, `false`
-   * (or omitted) disables it. Raw observation rows remain advisory MemoryStorage
-   * data outside the session lease/CAS boundary (§5.2).
+   * harness. Runtime enablement and per-session model switching are currently
+   * blocked on native @mastra/memory engine selection, so enabled configuration
+   * and switch calls reject instead of silently dropping message history. The
+   * `session.om.clearOverride()` recovery surface removes unsupported intent
+   * persisted by older builds. Until native selection lands, configure OM on the
+   * Agent Memory instance and omit this option. Raw observation rows remain
+   * advisory MemoryStorage data outside the session lease/CAS boundary (§5.2).
    */
   observationalMemory?: ObservationalMemoryConfig;
 
@@ -1365,15 +1411,17 @@ export interface HarnessConfigCommon {
 }
 
 /**
- * §9.2 — JSON-safe Observational Memory configuration. A harness-local subset of
- * the memory-package OM options: it carries only serializable resolved defaults +
- * scope, never live model objects, storage handles, functions, or processor
- * internals. `processorOptions` is an opaque adapter-owned bag (JSON only).
+ * §9.2 — retained JSON-safe validation surface for Harness Observational Memory.
+ * `false`, omission, or `{ enabled: false }` keeps Harness OM disabled. Every
+ * enabled form currently rejects because @mastra/memory cannot select an OM
+ * engine from the effective per-turn config. Configure OM directly on the
+ * Agent's Memory instance instead. The remaining fields are validated so callers
+ * receive precise malformed-input errors; they do not enable Harness OM.
  */
 export type ObservationalMemoryConfig =
   | boolean
   | {
-      /** `false` disables OM; omitted means enabled when the object form is present. */
+      /** `false` disables OM; omitted requests unsupported enablement and rejects. */
       enabled?: boolean;
       /**
        * Creation-time lookup scope for OM records. Defaults to `'thread'`.
@@ -1463,6 +1511,18 @@ export interface SubagentDefinition {
    * for the subagent's mode when unset.
    */
   defaultModelId?: string;
+
+  /**
+   * Whether this type may be selected by the synchronous `spawn_subagent`
+   * tool. Defaults to `true`. Set this to `false` for a type whose tool surface
+   * can park for human input: inline children have no independent resume
+   * driver, while `task_delegate` children are durable and resumable.
+   *
+   * This is an execution-boundary control, not prompt guidance. Disabled types
+   * are omitted from the inline tool schema and rejected again at execution.
+   * They remain available to durable `task_delegate` calls.
+   */
+  allowInline?: boolean;
 
   /**
    * Extra tools layered onto this subagent type's surface, on top of its mode's
@@ -1699,6 +1759,12 @@ export interface SessionLoadByIdOptions {
   includeClosed?: boolean;
 }
 
+export interface SessionLoadByThreadOptions {
+  resourceId: string;
+  threadId: string;
+  includeClosed?: boolean;
+}
+
 export interface SessionDeleteOptions {
   sessionId: string;
   resourceId: string;
@@ -1809,6 +1875,21 @@ export interface MessageOverrides {
 /**
  * Common fields shared by every `message()` call.
  */
+/**
+ * Ordered internal phases of `session.message()` admission, reported through
+ * `MessageOptionsBase.onPhase`. Each fires once, immediately after its step
+ * settles, so callers can attribute pre-stream latency to duplicate fencing,
+ * context/instruction resolution, durable evidence writes, and agent dispatch
+ * without wrapping or re-implementing the harness pipeline.
+ */
+export type MessageAdmissionPhase =
+  | 'admission_duplicate_resolved'
+  | 'tool_surface_built'
+  | 'request_context_ready'
+  | 'evidence_reserved'
+  | 'agent_dispatched'
+  | 'output_registered';
+
 interface MessageOptionsBase extends MessageOverrides {
   /** Free-form user content. The only required field. */
   content: string;
@@ -1825,6 +1906,13 @@ interface MessageOptionsBase extends MessageOverrides {
    * harness's own abort plumbing.
    */
   abortSignal?: AbortSignal;
+
+  /**
+   * Observability-only phase callback for the pre-stream admission pipeline.
+   * Failures inside the callback are swallowed; it must never affect turn
+   * semantics.
+   */
+  onPhase?: (phase: MessageAdmissionPhase, elapsedMs: number) => void;
 }
 
 /** Default shape: returns a fully-resolved `AgentResult`. */
@@ -1883,15 +1971,42 @@ export interface QueueAdmissionResult {
   duplicate: boolean;
 }
 
-export interface InboxResponseOptions {
-  itemId?: string;
-  responseId?: string;
+type InboxResponsePolicyOptions = {
+  /**
+   * Tool approvals only. `once` resumes only the current invocation; `always`
+   * atomically grants the exact tool for the lifetime of this session while
+   * admitting the response. Defaults to `once`.
+   */
+  approvalScope?: 'once' | 'always';
   // NOTE (§4.4c): inbox responses are also a fresh entry point that may carry a
   // caller `requestContext.app`. Wiring it correctly requires including the
   // normalized DTO in the response-admission hash (so duplicate `responseId`s
   // with different `app` do not alias) without plumbing it into the resumed run
   // — deferred to a dedicated follow-up so it is not left accept-but-ignore here.
-}
+};
+
+/**
+ * Response receipts are fenced to the exact pending generation. This prevents
+ * a delayed browser/reconnect response from approving a later interaction
+ * that happens to reuse the same item id.
+ */
+export type InboxResponseOptions = InboxResponsePolicyOptions &
+  (
+    | {
+        responseId?: undefined;
+        itemId?: string;
+        runId?: never;
+        toolCallId?: never;
+        pendingRequestedAt?: never;
+      }
+    | {
+        responseId: string;
+        itemId: string;
+        runId: string;
+        toolCallId: string;
+        pendingRequestedAt: number;
+      }
+  );
 
 export interface InboxResponseResult {
   itemId: string;

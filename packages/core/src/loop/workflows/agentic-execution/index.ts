@@ -1,4 +1,6 @@
 import type { ToolSet } from '@internal/ai-sdk-v5';
+import { TOOL_PERMISSION_POLICY_KEY } from '../../../agent/tool-permission-prefilter';
+import type { ToolPermissionPolicy } from '../../../agent/tool-permission-prefilter';
 import { InternalSpans } from '../../../observability';
 import { createWorkflow as createDirectWorkflow, createEventedWorkflow } from '../../../workflows/create';
 import type { OuterLLMRun } from '../../types';
@@ -11,7 +13,11 @@ import { createIsTaskCompleteStep } from './is-task-complete-step';
 import { createLLMExecutionStep } from './llm-execution-step';
 import { createLLMMappingStep } from './llm-mapping-step';
 import { createSignalDrainStep } from './signal-drain-step';
-import { resolveConfiguredToolCallConcurrency, resolveToolCallConcurrency } from './tool-call-concurrency';
+import {
+  resolveCalledBatchToolCallConcurrency,
+  resolveConfiguredToolCallConcurrency,
+  resolveToolCallConcurrency,
+} from './tool-call-concurrency';
 import type { ToolCallForeachOptions } from './tool-call-concurrency';
 import { createToolCallStep } from './tool-call-step';
 
@@ -23,6 +29,7 @@ export function createAgenticExecutionWorkflow<Tools extends ToolSet = ToolSet, 
   ...rest
 }: OuterLLMRun<Tools, OUTPUT>) {
   const configuredToolCallConcurrency = resolveConfiguredToolCallConcurrency(rest.toolCallConcurrency);
+  const permissionPolicy = rest.requestContext?.get(TOOL_PERMISSION_POLICY_KEY) as ToolPermissionPolicy | undefined;
   const toolCallForeachOptions: ToolCallForeachOptions = {
     // This initial value is a conservative fallback for resume paths that can enter
     // a suspended foreach before llm-execution recomputes the effective step tools.
@@ -30,6 +37,7 @@ export function createAgenticExecutionWorkflow<Tools extends ToolSet = ToolSet, 
       requireToolApproval: rest.requireToolApproval,
       tools: rest.tools,
       activeTools: rest.activeTools as string[] | undefined,
+      permissionPolicy,
       configuredConcurrency: configuredToolCallConcurrency,
     }),
   };
@@ -115,16 +123,14 @@ export function createAgenticExecutionWorkflow<Tools extends ToolSet = ToolSet, 
       async ({ inputData }) => {
         const typedInputData = inputData as LLMIterationData<Tools, OUTPUT>;
         const toolCalls = typedInputData.output.toolCalls || [];
-        // Recompute concurrency from the step's effective active tool set (set by
-        // llm-execution-step), NOT from the tools the model actually called. A
-        // registered approval/suspending tool that the model did not call this
-        // step must still force sequential execution, so narrowing to called
-        // tool names here would incorrectly allow concurrent execution.
-        const stepActiveTools = _internal?.stepActiveTools as string[] | undefined;
-        toolCallForeachOptions.concurrency = resolveToolCallConcurrency({
+        // Recompute concurrency from the tools the model actually CALLED this
+        // step, not from the whole registered/active set — see
+        // resolveCalledBatchToolCallConcurrency for the safety argument.
+        toolCallForeachOptions.concurrency = resolveCalledBatchToolCallConcurrency({
+          toolCalls,
           requireToolApproval: rest.requireToolApproval,
           tools: ((_internal?.stepTools as Tools | undefined) ?? rest.tools) as Tools | undefined,
-          activeTools: stepActiveTools,
+          permissionPolicy,
           configuredConcurrency: configuredToolCallConcurrency,
         });
         return toolCalls;

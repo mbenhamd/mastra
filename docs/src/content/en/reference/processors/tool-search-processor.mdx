@@ -80,7 +80,7 @@ const toolSearch = new ToolSearchProcessor({
             name: 'storage',
             type: "'in-memory' | 'context'",
             description:
-              "Where loaded-tool state lives. 'in-memory' (default) tracks loaded tools in an in-memory map per thread with TTL cleanup (see ttl); state is lost on restart and anonymous requests share a 'default' entry. 'context' derives loaded state from the conversation messages — a tool is loaded while a search_tools/load_tool result naming it remains in the messages; it is restart-safe, requires no memory, and de-loads automatically once that result is no longer present in the messages. The 'context' store is opt-in.",
+              "Where loaded-tool state lives. 'in-memory' (default) tracks loaded tools in an in-memory map per thread with TTL cleanup (see ttl); state is lost on restart and anonymous requests share a 'default' entry. 'context' derives loaded state from canonical assistant tool results: load_tool must report loaded names, while search_tools must include the explicit receipt emitted by autoLoad. It is restart-safe, requires no memory, and de-loads automatically once that result is no longer present in the messages. The 'context' store is opt-in.",
             isOptional: true,
             default: "'in-memory'",
           },
@@ -105,6 +105,8 @@ const toolSearch = new ToolSearchProcessor({
   },
 ]}
 />
+
+Tool IDs must be unique. Tool keys and IDs may differ, but a key may not equal another tool's ID because that makes search/load resolution ambiguous. `search_tools` and `load_tool` are reserved as both keys and IDs. The processor also rejects an always-available input tool that would shadow one of its meta-tools or a loaded dynamic tool.
 
 ## Returns
 
@@ -134,9 +136,9 @@ const toolSearch = new ToolSearchProcessor({
 
 ## Methods
 
-### State inspection (legacy `'in-memory'` store)
+### State inspection and lifecycle
 
-These methods operate on the default `'in-memory'` store only. They're no-ops for the `'context'` store, whose state lives in the conversation messages rather than an in-process map.
+These lifecycle methods operate on the default `'in-memory'` store. They're no-ops for the `'context'` store: its durable state lives in conversation messages, and its same-run bridge lives in request-local processor state that is released with the request.
 
 #### `clearState(threadId)`
 
@@ -152,6 +154,14 @@ Clears loaded-tool state for every thread.
 
 ```typescript
 processor.clearAllState()
+```
+
+#### `dispose()`
+
+Releases the in-memory cleanup timer and all processor-owned in-memory state. Call this when a processor instance is evicted or replaced. It is safe to call more than once.
+
+```typescript
+processor.dispose()
 ```
 
 #### `getStateStats()`
@@ -198,7 +208,7 @@ const toolSearch = new ToolSearchProcessor({
 The `phase` value describes where the filter is being applied:
 
 - `search`: Filters results returned by `search_tools`.
-- `load`: Blocks `load_tool` from loading disallowed tools.
+- `load`: Blocks explicit `load_tool` calls and automatic activation when `search.autoLoad` is enabled.
 - `active`: Hides already-loaded tools from the current request if they're no longer allowed.
 
 If the hook throws or rejects, `ToolSearchProcessor` treats the tool as disallowed for that request. The hook may run for every matching search candidate, so keep async policy checks cheap or cached. The `search_tools` meta-tool is always available; `load_tool` is available unless `search.autoLoad` is enabled. Tools passed directly through the agent or `processInputStep` remain available unless you filter them outside `ToolSearchProcessor`.
@@ -283,11 +293,21 @@ Use `clearState`, `clearAllState`, `getStateStats`, and `cleanupNow` to inspect 
 
 ### `'context'`
 
-Loaded state is derived from the conversation messages: a tool is loaded while a `search_tools` or `load_tool` result naming it remains in the messages. This mode:
+Loaded state is derived from canonical assistant tool results in the conversation messages:
+
+- A `load_tool` result activates only the names in its `loaded` array.
+- A `search_tools` result activates tools only when `search.autoLoad` emitted its explicit activation receipt. A discovery-only search result never activates tools.
+- Tool-shaped results on user messages are ignored.
+
+This mode:
 
 - Requires no memory configuration.
 - Is restart-safe — the durable record is the persisted message history.
 - De-loads a tool automatically once that result is no longer present in the messages.
+
+Restart safety depends on supplying that persisted history to the next processor run. A configured Mastra MessageHistory processor can do this when it recalls history before ToolSearch runs. Without memory, the caller must provide the prior messages; sending only the newest message leaves no context record to reconstruct.
+
+Within one agent run, request-local processor state bridges a successful load to the next model step before the assistant result appears in persisted messages. This bridge also works without a thread ID. It isn't shared across runs, so discarding or aborting one run doesn't activate tools in another run for the same thread.
 
 ```typescript
 import { ToolSearchProcessor } from '@mastra/core/processors'
@@ -300,7 +320,7 @@ const toolSearch = new ToolSearchProcessor({
 
 Loading tools is cache-friendly in both modes: loads are append-only, so the cached prompt prefix stays stable for providers that support prompt caching.
 
-Unloading a tool changes the tool definitions sent to the model, which shifts the cached prefix and causes the next turn to pay a cache write instead of a cache hit. In `'in-memory'` mode this happens when a thread's state is evicted by `ttl`. In `'context'` mode it happens when a tool's discovery result is no longer present in the messages (for example, when older messages are trimmed) — the tool de-loads and the model must search for it again before reuse. This is expected: removing an unused tool trades one cache write for a smaller prefix on later turns.
+Unloading a tool changes the tool definitions sent to the model, which shifts the cached prefix and causes the next turn to pay a cache write instead of a cache hit. In `'in-memory'` mode this happens when a thread's state is evicted by `ttl`. In `'context'` mode it happens when a tool's activation result is no longer present in the messages (for example, when older messages are trimmed) — the tool de-loads and the model must search for it again before reuse. This is expected: removing an unused tool trades one cache write for a smaller prefix on later turns.
 
 ## Combining with other processors
 

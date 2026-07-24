@@ -185,3 +185,67 @@ describeForAllEngines('AIMock loop scenario: onIterationComplete hook', engine =
     expect(iterations[1].isFinal).toBe(true);
   });
 });
+
+describeForAllEngines(
+  'AIMock loop scenario: forced continuation from a FINAL iteration (silent-turn nudge)',
+  engine => {
+    const getMock = useLoopScenarioAimock();
+
+    it('re-enters generation when the hook returns continue:true on the final iteration', async () => {
+      // Live-diagnosed shape: the model runs a tool, then STOPS with empty
+      // text — the user gets a mutation and silence. The harness nudge
+      // returns {continue:true} exactly once from the final iteration; the
+      // loop must run one more model call whose text becomes the answer.
+      const iterations: IterationCompleteContext[] = [];
+      let nudged = false;
+
+      const createThing = createTool({
+        id: 'create_thing',
+        description: 'Create a thing',
+        inputSchema: z.object({ name: z.string() }),
+        outputSchema: z.object({ ok: z.boolean() }),
+        execute: async () => ({ ok: true }),
+      });
+
+      const { chunks } = await runLoopScenario({
+        engine,
+        llm: getMock(),
+        prompt: 'Create a thing named probe',
+        tools: { create_thing: createThing },
+        stopWhen: ({ steps }: { steps: number }) => steps >= 5,
+        collectChunks: true,
+        onIterationComplete: async (context: IterationCompleteContext) => {
+          iterations.push(context);
+          const segmentHasToolResults = iterations.some(entry => entry.toolResults.length > 0);
+          const segmentHasText = iterations.some(entry => entry.text.trim() !== '');
+          if (context.isFinal && !nudged && segmentHasToolResults && !segmentHasText) {
+            nudged = true;
+            return { continue: true };
+          }
+          return undefined;
+        },
+        fixtures: llm => {
+          llm.on(
+            { endpoint: 'chat', sequenceIndex: 0 },
+            {
+              toolCalls: [{ id: 'call_create_1', name: 'create_thing', arguments: { name: 'probe' } }],
+            },
+          );
+          // Second iteration: the model goes silent after the tool result.
+          // Matched by sequence index — a toolCallId matcher would also
+          // capture the post-nudge third call (the tool result stays in
+          // history) and keep answering with silence.
+          llm.on({ endpoint: 'chat', sequenceIndex: 1 }, { content: '' });
+          // Third iteration exists ONLY if the forced continuation re-enters.
+          llm.on({ endpoint: 'chat', sequenceIndex: 2 }, { content: 'Created the thing "probe".' });
+        },
+      });
+
+      expect(nudged).toBe(true);
+      expect(iterations).toHaveLength(3);
+      const textDeltas = chunks?.filter(c => c.type === 'text-delta') || [];
+      const text = textDeltas.map((c: any) => c.payload?.text || '').join('');
+      expect(text).toContain('Created the thing "probe".');
+    });
+  },
+);

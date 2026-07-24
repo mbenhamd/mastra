@@ -5,7 +5,7 @@ export type {
   MessageHistoryToolCallFilterOptions,
 } from './message-history';
 
-export { WorkingMemory } from './working-memory';
+export { prepareWorkingMemoryPromptData, WorkingMemory } from './working-memory';
 export type { WorkingMemoryTemplate, WorkingMemoryConfig } from './working-memory';
 
 export { SemanticRecall } from './semantic-recall';

@@ -118,6 +118,17 @@ const harnessDisplayActiveSubagentSnapshotV1Schema = z.object({
   task: z.string(),
   parentToolCallId: z.string(),
   startedAt: z.number(),
+  status: z.enum(['running', 'awaiting_input', 'completed', 'failed']).optional(),
+  currentToolName: z.string().optional(),
+  toolCalls: z.number().optional(),
+  usage: z
+    .object({
+      promptTokens: z.number(),
+      completionTokens: z.number(),
+      totalTokens: z.number(),
+    })
+    .optional(),
+  updatedAt: z.number().optional(),
 });
 
 const harnessAssistantDraftSchema = z.object({
@@ -129,7 +140,6 @@ const harnessAssistantDraftSchema = z.object({
   queuedItemId: z.string().optional(),
   messageId: z.string().optional(),
   text: z.string(),
-  reasoningText: z.string().optional(),
   status: z.enum(['streaming', 'interrupted', 'completed', 'failed']),
   startedAt: z.number(),
   updatedAt: z.number(),
@@ -147,6 +157,7 @@ const harnessDisplayPendingSnapshotV1Schema = z.object({
   source: z.enum(['parent', 'subagent']),
   subagentToolCallId: z.string().optional(),
   requestedAt: z.number(),
+  expiresAt: z.number(),
   queuedItemId: z.string().optional(),
   modeId: z.string().optional(),
   resumedAt: z.number().optional(),
@@ -619,27 +630,39 @@ export const harnessPermissionsResponseSchema = z.object({
   }),
 });
 
+const harnessInboxResponseGenerationShape = {
+  responseId: z.string().min(1),
+  runId: z.string().min(1),
+  toolCallId: z.string().min(1),
+  pendingRequestedAt: z.number().int().nonnegative(),
+} as const;
+
 export const harnessInboxResponseBodySchema = z.discriminatedUnion('kind', [
   z
     .object({
       kind: z.literal('tool-approval'),
       approved: z.boolean(),
       reason: z.string().optional(),
-      responseId: z.string().min(1),
+      approvalScope: z.enum(['once', 'always']).optional(),
+      ...harnessInboxResponseGenerationShape,
     })
-    .strict(),
+    .strict()
+    .refine(value => value.approvalScope !== 'always' || value.approved, {
+      message: 'approvalScope "always" requires approved: true',
+      path: ['approvalScope'],
+    }),
   z
     .object({
       kind: z.literal('tool-suspension'),
       resumeData: jsonValueSchema,
-      responseId: z.string().min(1),
+      ...harnessInboxResponseGenerationShape,
     })
     .strict(),
   z
     .object({
       kind: z.literal('question'),
       answer: jsonValueSchema,
-      responseId: z.string().min(1),
+      ...harnessInboxResponseGenerationShape,
     })
     .strict(),
   z
@@ -647,7 +670,7 @@ export const harnessInboxResponseBodySchema = z.discriminatedUnion('kind', [
       kind: z.literal('plan-approval'),
       approved: z.boolean(),
       revision: z.string().optional(),
-      responseId: z.string().min(1),
+      ...harnessInboxResponseGenerationShape,
       transitionToMode: z.string().min(1).optional(),
     })
     .strict(),
@@ -656,7 +679,7 @@ export const harnessInboxResponseBodySchema = z.discriminatedUnion('kind', [
       kind: z.literal('sandbox-access'),
       approved: z.boolean(),
       reason: z.string().optional(),
-      responseId: z.string().min(1),
+      ...harnessInboxResponseGenerationShape,
     })
     .strict(),
 ]);

@@ -1,7 +1,9 @@
 import type { MastraDBMessage } from '@mastra/core/agent';
 import { MASTRA_RESOURCE_ID_KEY, MASTRA_THREAD_ID_KEY, RequestContext } from '@mastra/core/request-context';
 import { describe, expect, it, vi } from 'vitest';
+import { z } from 'zod';
 
+import { Extractor } from '../extractor';
 import { withOmInternalThreadId } from '../internal-request-context';
 import { ObserverRunner } from '../observer-runner';
 import { ReflectorRunner } from '../reflector-runner';
@@ -20,7 +22,7 @@ function createMessage(id: string, threadId = 'parent-thread'): MastraDBMessage 
   } as MastraDBMessage;
 }
 
-function createObserverRunner() {
+function createObserverRunner(extractors?: Extractor<any>[]) {
   return new ObserverRunner({
     observationConfig: {
       model: 'mock/model',
@@ -28,6 +30,7 @@ function createObserverRunner() {
       bufferTokens: false,
       previousObserverTokens: 1000,
       observeAttachments: false,
+      extractors,
     } as any,
     observedMessageIds: new Set(),
     resolveModel: () => ({ model: 'mock/model' as any }),
@@ -37,11 +40,12 @@ function createObserverRunner() {
   });
 }
 
-function createReflectorRunner() {
+function createReflectorRunner(extractors?: Extractor<any>[]) {
   return new ReflectorRunner({
     reflectionConfig: {
       model: 'mock/model',
       observationTokens: 1000,
+      extractors,
     } as any,
     observationConfig: {
       model: 'mock/model',
@@ -126,6 +130,43 @@ describe('OM internal agent request contexts', () => {
     expect(parentRequestContext.get(MASTRA_THREAD_ID_KEY)).toBe('parent-thread');
   });
 
+  it('uses the same derived observer thread for streaming and structured extractor follow-up', async () => {
+    const priority = new Extractor({ name: 'Priority', instructions: 'Extract priority.', schema: z.string() });
+    const observer = createObserverRunner([priority]);
+    const parentRequestContext = createParentRequestContext();
+    const captured: RequestContext[] = [];
+
+    vi.spyOn(observer as any, 'createAgent').mockReturnValue({
+      id: 'observational-memory-observer',
+      stream: async (_prompt: unknown, options: { requestContext?: RequestContext }) => {
+        captured.push(options.requestContext!);
+        return {
+          getFullOutput: async () => ({
+            text: '<observations>\n- learned something\n</observations>',
+            usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+          }),
+        };
+      },
+      generate: async (_prompt: unknown, options: { requestContext?: RequestContext }) => {
+        captured.push(options.requestContext!);
+        return { object: { priority: 'high' } };
+      },
+    });
+
+    const result = await observer.call(undefined, [createMessage('msg-structured-observer')], undefined, {
+      requestContext: parentRequestContext,
+    });
+
+    expect(result.extractedValues).toEqual({ priority: 'high' });
+    expect(captured).toHaveLength(2);
+    for (const context of captured) {
+      expect(context).not.toBe(parentRequestContext);
+      expect(context.get(MASTRA_THREAD_ID_KEY)).toBe('parent-thread-observational-memory-observer');
+      expect(context.get(MASTRA_RESOURCE_ID_KEY)).toBe('resource-1');
+      expect(context.get('tenantId')).toBe('tenant-1');
+    }
+  });
+
   it('passes a derived thread id to the multi-thread observer stream call', async () => {
     const observer = createObserverRunner();
     const parentRequestContext = createParentRequestContext();
@@ -195,5 +236,101 @@ describe('OM internal agent request contexts', () => {
     expect(capturedRequestContext?.get(MASTRA_RESOURCE_ID_KEY)).toBe('resource-1');
     expect(capturedRequestContext?.get('tenantId')).toBe('tenant-1');
     expect(parentRequestContext.get(MASTRA_THREAD_ID_KEY)).toBe('parent-thread');
+  });
+
+  it('uses the same derived reflector thread for streaming and structured extractor follow-up', async () => {
+    const priority = new Extractor({ name: 'Priority', instructions: 'Extract priority.', schema: z.string() });
+    const reflector = createReflectorRunner([priority]);
+    const parentRequestContext = createParentRequestContext();
+    const captured: RequestContext[] = [];
+
+    vi.spyOn(reflector as any, 'createAgent').mockReturnValue({
+      id: 'observational-memory-reflector',
+      stream: async (_prompt: unknown, options: { requestContext?: RequestContext }) => {
+        captured.push(options.requestContext!);
+        return {
+          getFullOutput: async () => ({
+            text: '<observations>\n- compressed memory\n</observations>',
+            usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+          }),
+        };
+      },
+      generate: async (_prompt: unknown, options: { requestContext?: RequestContext }) => {
+        captured.push(options.requestContext!);
+        return { object: { priority: 'high' } };
+      },
+    });
+
+    const result = await reflector.call(
+      'existing observations',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      0,
+      parentRequestContext,
+    );
+
+    expect(result.extractedValues).toEqual({ priority: 'high' });
+    expect(captured).toHaveLength(2);
+    for (const context of captured) {
+      expect(context).not.toBe(parentRequestContext);
+      expect(context.get(MASTRA_THREAD_ID_KEY)).toBe('parent-thread-observational-memory-reflector');
+      expect(context.get(MASTRA_RESOURCE_ID_KEY)).toBe('resource-1');
+      expect(context.get('tenantId')).toBe('tenant-1');
+    }
+  });
+
+  it('forwards the current observation generation to reflector extractor hooks without a writer', async () => {
+    const onExtracted = vi.fn(({ current }: { current: string }) => current);
+    const priority = new Extractor({
+      name: 'Priority',
+      instructions: 'Extract priority.',
+      schema: z.string(),
+      onExtracted,
+    });
+    const reflector = createReflectorRunner([priority]);
+
+    vi.spyOn(reflector as any, 'createAgent').mockReturnValue({
+      id: 'observational-memory-reflector',
+      stream: async () => ({
+        getFullOutput: async () => ({
+          text: '<observations>\n- compressed memory\n</observations>',
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+        }),
+      }),
+      generate: async () => ({ object: { priority: 'high' } }),
+    });
+
+    await reflector.call(
+      'existing observations',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      0,
+      createParentRequestContext(),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {
+        recordId: 'om-generation-1',
+        threadId: 'parent-thread',
+        resourceId: 'resource-1',
+      },
+    );
+
+    expect(onExtracted).toHaveBeenCalledWith(
+      expect.objectContaining({
+        current: 'high',
+        observationalMemoryRecordId: 'om-generation-1',
+        threadId: 'parent-thread',
+        resourceId: 'resource-1',
+      }),
+    );
   });
 });

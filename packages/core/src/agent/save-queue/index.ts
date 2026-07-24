@@ -3,6 +3,8 @@ import type { MemoryConfigInternal } from '../../memory';
 import type { MastraMemory } from '../../memory/memory';
 import type { MessageList } from '../message-list';
 
+type UnsavedMessageSnapshot = ReturnType<MessageList['snapshotUnsavedMessages']>;
+
 export class SaveQueueManager {
   private logger?: IMastraLogger;
   private debounceMs: number;
@@ -57,10 +59,19 @@ export class SaveQueueManager {
    * @param messageList - The MessageList instance containing unsaved messages.
    * @param memoryConfig - Optional memory configuration to use for saving.
    */
-  private enqueueSave(threadId: string, messageList: MessageList, memoryConfig?: MemoryConfigInternal) {
+  private enqueueSave(
+    threadId: string,
+    messageList: MessageList,
+    memoryConfig?: MemoryConfigInternal,
+    options?: { strictSnapshot?: UnsavedMessageSnapshot },
+  ) {
     const prev = this.saveQueues.get(threadId) || Promise.resolve();
-    const next = prev
-      .then(() => this.persistUnsavedMessages(messageList, memoryConfig))
+    const operation = prev.then(() =>
+      options?.strictSnapshot
+        ? this.persistUnsavedMessagesStrict(options.strictSnapshot, memoryConfig)
+        : this.persistUnsavedMessages(messageList, memoryConfig),
+    );
+    const next = operation
       .catch(err => {
         this.logger?.error?.('Error in enqueueSave', { err, threadId });
       })
@@ -70,7 +81,7 @@ export class SaveQueueManager {
         }
       });
     this.saveQueues.set(threadId, next);
-    return next;
+    return options?.strictSnapshot ? operation : next;
   }
 
   /**
@@ -88,18 +99,34 @@ export class SaveQueueManager {
 
   /**
    * Persists any unsaved messages from the MessageList to memory storage.
-   * Drains the list of unsaved messages and writes them using the memory backend.
+   * Acknowledges only after the memory backend confirms the write, so a storage
+   * failure cannot consume state needed by a later strict terminal retry.
    * @param messageList - The MessageList instance for the current thread.
    * @param memoryConfig - The memory configuration for saving.
    */
   private async persistUnsavedMessages(messageList: MessageList, memoryConfig?: MemoryConfigInternal) {
-    const newMessages = messageList.drainUnsavedMessages();
-    if (newMessages.length > 0 && this.memory) {
+    const snapshot = messageList.snapshotUnsavedMessages({ detached: true });
+    if (snapshot.messages.length > 0 && this.memory) {
       await this.memory.saveMessages({
-        messages: newMessages,
+        messages: snapshot.messages,
         memoryConfig,
       });
     }
+    snapshot.commit();
+  }
+
+  /**
+   * Persist without acknowledging the MessageList until storage confirms the
+   * write. Unlike the historical best-effort queue path, errors propagate and
+   * the same snapshot remains unsaved for an idempotent retry.
+   */
+  private async persistUnsavedMessagesStrict(snapshot: UnsavedMessageSnapshot, memoryConfig?: MemoryConfigInternal) {
+    if (snapshot.messages.length === 0) return;
+    if (!this.memory) {
+      throw new Error('Cannot strictly persist messages without a memory backend');
+    }
+    await this.memory.saveMessages({ messages: snapshot.messages, memoryConfig });
+    snapshot.commit();
   }
 
   /**
@@ -135,5 +162,19 @@ export class SaveQueueManager {
     if (!threadId) return;
     this.clearDebounce(threadId);
     return this.enqueueSave(threadId, messageList, memoryConfig);
+  }
+
+  /**
+   * Flush a recoverability-critical transition. Storage failures reject and
+   * leave the snapshot unsaved so the caller can retry before publishing.
+   */
+  async flushMessagesStrict(messageList: MessageList, threadId?: string, memoryConfig?: MemoryConfigInternal) {
+    if (!threadId) throw new Error('Strict message persistence requires a thread id');
+    this.clearDebounce(threadId);
+    // Capture before waiting on earlier queue entries. A previously enqueued
+    // best-effort save takes its own snapshot only when it starts and may
+    // otherwise drain this recoverability-critical transition first.
+    const strictSnapshot = messageList.snapshotUnsavedMessages({ detached: true });
+    return this.enqueueSave(threadId, messageList, memoryConfig, { strictSnapshot });
   }
 }

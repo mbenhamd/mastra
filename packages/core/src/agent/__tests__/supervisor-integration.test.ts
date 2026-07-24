@@ -502,6 +502,7 @@ describe('Supervisor Pattern Integration Tests', () => {
 
       // Bail after first delegation — only 1 iteration fires (the tool-call one)
       expect(iterationsAfterBail).toBe(1);
+      expect(callCount).toBe(1);
     });
   });
 
@@ -2130,6 +2131,80 @@ describe('Supervisor Pattern - onIterationComplete Hook Integration', () => {
     expect(iterations).toEqual([1, 2]);
     expect(callCount).toBe(2);
     expect(text).toBe('First response Second response');
+  });
+
+  it('should keep forced-continuation feedback out of the final text while the model still sees it', async () => {
+    // The production shape of the test above: the harness silent-turn nudge
+    // (`createHarnessEmptySynthesisNudge`) always returns continue:true WITH
+    // feedback. That feedback is an instruction written for the model's next
+    // turn, so it has to reach the provider and must never surface as the
+    // agent's answer. Both halves are asserted here: a fix that stops injecting
+    // the feedback, and a fix that lets it leak into `result.text`, each fail.
+    const NUDGE = 'INTERNAL_NUDGE_YOU_SENT_NO_REPLY';
+    const receivedPrompts: unknown[] = [];
+    let callCount = 0;
+
+    const agent = new Agent({
+      id: 'continue-feedback-stream-agent',
+      name: 'Continue Feedback Stream Agent',
+      instructions: 'You may take multiple turns.',
+      model: new MockLanguageModelV2({
+        doStream: async ({ prompt }) => {
+          callCount++;
+          receivedPrompts.push(prompt);
+          const currentCall = callCount;
+          const responseText = currentCall === 1 ? 'First response ' : 'Second response';
+
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: convertArrayToReadableStream([
+              { type: 'stream-start', warnings: [] },
+              {
+                type: 'response-metadata',
+                id: `id-${currentCall}`,
+                modelId: 'mock-model-id',
+                timestamp: new Date(0),
+              },
+              { type: 'text-start', id: `text-${currentCall}` },
+              { type: 'text-delta', id: `text-${currentCall}`, delta: responseText },
+              { type: 'text-end', id: `text-${currentCall}` },
+              {
+                type: 'finish',
+                finishReason: 'stop',
+                usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+              },
+            ]),
+          };
+        },
+      }),
+      memory: new MockMemory(),
+    });
+
+    const mastra = new Mastra({
+      agents: { 'continue-feedback-stream-agent': agent },
+      storage: new InMemoryStore(),
+    });
+
+    const result = await mastra.getAgent('continue-feedback-stream-agent').stream('Take multiple turns', {
+      maxSteps: 5,
+      onIterationComplete: ctx => (ctx.iteration === 1 ? { continue: true, feedback: NUDGE } : undefined),
+    });
+
+    const reader = result.fullStream.getReader();
+    while (true) {
+      const { done } = await reader.read();
+      if (done) break;
+    }
+
+    const text = await result.text;
+
+    expect(callCount).toBe(2);
+    // The model was actually told what to fix on the forced continuation.
+    expect(JSON.stringify(receivedPrompts[1])).toContain(NUDGE);
+    // The caller gets the whole assistant turn, and none of the instruction.
+    expect(text).toBe('First response Second response');
+    expect(text).not.toContain(NUDGE);
   });
 
   it('should accept onIterationComplete configuration without errors', async () => {

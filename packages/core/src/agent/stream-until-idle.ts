@@ -49,9 +49,16 @@ function agentForIdleLoop(
     STREAM_UNTIL_IDLE_DEFAULT_OPTIONS
   ] as Record<string, any> | undefined;
   if (!preflightedDefaultOptions) return agent;
+  let initialResolutionPending = true;
   return {
     id: agent.id,
-    getDefaultOptions: async () => preflightedDefaultOptions,
+    getDefaultOptions: async (options?: any) => {
+      if (initialResolutionPending) {
+        initialResolutionPending = false;
+        return preflightedDefaultOptions;
+      }
+      return agent.getDefaultOptions(options);
+    },
     getMemory: (opts?: any) => agent.getMemory(opts),
   };
 }
@@ -73,6 +80,8 @@ export interface StreamUntilIdleDeps {
    * `runStreamUntilIdle` falls through to a plain `agent.stream` call.
    */
   bgManager: BackgroundTaskManager | undefined;
+  /** Re-authorize each dynamically resolved continuation before memory. */
+  prepareContinuation?: (resolvedOptions: Record<string, any>) => Promise<Record<string, any>>;
   /** Keep live memory in runScope and pass only its random token downstream. */
   prepareResolvedMemoryHandoff: (
     runId: string,
@@ -127,7 +136,19 @@ export async function runStreamUntilIdle<OUTPUT>(
         handoff.release();
       }
     },
-    opts => (agent.stream as any)([], opts) as Promise<{ fullStream: ReadableStream<any> }>,
+    async (opts, memory, defaultOptions) => {
+      const runId = deps.resolveRunId({ ...opts, runId: undefined });
+      const handoff = await deps.prepareResolvedMemoryHandoff(runId, { value: memory });
+      try {
+        return await (agent.stream as any)(
+          [],
+          withDefaultOptions({ ...opts, runId }, defaultOptions),
+          handoff.executionMemoryId,
+        );
+      } finally {
+        handoff.release();
+      }
+    },
     (first, ctx) => {
       // No ctx means no bgManager / no memory — fall through without wrapping.
       if (!ctx) return first;
@@ -174,8 +195,8 @@ export async function runResumeStreamUntilIdle<OUTPUT>(
     agentForIdleLoop(agent, streamOptions),
     streamOptions,
     deps,
-    async (opts, memory, defaultOptions, mergedOptions) => {
-      const runId = mergedOptions.runId as string | undefined;
+    async (opts, memory, defaultOptions, _mergedOptions) => {
+      const runId = opts.runId as string | undefined;
       const resolvedOptions = withDefaultOptions(runId ? { ...opts, runId } : opts, defaultOptions);
       if (!runId) {
         // Preserve resumeStream's missing-run error path; it exits before
@@ -190,7 +211,19 @@ export async function runResumeStreamUntilIdle<OUTPUT>(
         handoff.release();
       }
     },
-    opts => (agent.stream as any)([], opts) as Promise<{ fullStream: ReadableStream<any> }>,
+    async (opts, memory, defaultOptions) => {
+      const runId = deps.resolveRunId({ ...opts, runId: undefined });
+      const handoff = await deps.prepareResolvedMemoryHandoff(runId, { value: memory });
+      try {
+        return await (agent.stream as any)(
+          [],
+          withDefaultOptions({ ...opts, runId }, defaultOptions),
+          handoff.executionMemoryId,
+        );
+      } finally {
+        handoff.release();
+      }
+    },
     (first, ctx) => {
       if (!ctx) return first;
       return new Proxy(first, {

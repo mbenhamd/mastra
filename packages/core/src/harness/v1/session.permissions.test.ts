@@ -8,6 +8,7 @@
 
 import { describe, expect, it } from 'vitest';
 
+import { TOOL_PERMISSION_POLICY_KEY, TOOL_PERMISSION_POLICY_STABLE_KEY } from '../../agent/tool-permission-prefilter';
 import { setupHarness } from './__test-utils__';
 import { HarnessValidationError, HarnessConfigError } from './errors';
 import type { HarnessEvent } from './events';
@@ -29,6 +30,17 @@ function collectEvents(session: Awaited<ReturnType<typeof openSession>>['session
 }
 
 describe('Session permissions (§4.2e)', () => {
+  it('marks the per-turn policy closure as an immutable snapshot', async () => {
+    const { harness, agent } = setupHarness({ defaultPermissionPolicy: 'allow' });
+    const session = await harness.session({ resourceId: 'user-1', threadId: { fresh: true } });
+
+    await session.message({ content: 'hello' });
+
+    const requestContext = agent.streamCalls[0]?.options.requestContext;
+    expect(requestContext?.get(TOOL_PERMISSION_POLICY_KEY)).toBeTypeOf('function');
+    expect(requestContext?.get(TOOL_PERMISSION_POLICY_STABLE_KEY)).toBe(true);
+  });
+
   describe('grantCategory / revokeCategory', () => {
     it('persists category grants and emits permission_granted exactly once', async () => {
       const { session } = await openSession();
@@ -86,6 +98,20 @@ describe('Session permissions (§4.2e)', () => {
       expect(granted.map(e => (e as any).toolName)).toEqual(['fs.write', 'shell']);
     });
 
+    it('serializes concurrent duplicate grants into one row transition and one event', async () => {
+      const { session } = await openSession();
+      const events = collectEvents(session);
+
+      await Promise.all([
+        session.permissions.grantTool({ toolName: 'shell' }),
+        session.permissions.grantTool({ toolName: 'shell' }),
+        session.permissions.grantTool({ toolName: 'shell' }),
+      ]);
+
+      expect(session.permissions.getGrants().tools).toEqual(['shell']);
+      expect(events.filter(event => event.type === 'permission_granted')).toHaveLength(1);
+    });
+
     it('revokeTool is idempotent', async () => {
       const { session } = await openSession();
       await session.permissions.grantTool({ toolName: 'shell' });
@@ -103,6 +129,89 @@ describe('Session permissions (§4.2e)', () => {
       const { session } = await openSession();
       await expect(session.permissions.grantTool({ toolName: '' })).rejects.toBeInstanceOf(HarnessValidationError);
       await expect(session.permissions.revokeTool({ toolName: '' })).rejects.toBeInstanceOf(HarnessValidationError);
+    });
+  });
+
+  describe('subagent root-grant snapshots', () => {
+    it('keeps descendant permissions isolated by default', async () => {
+      const { harness } = setupHarness({
+        subagents: { maxDepth: 2, types: {} },
+      });
+      const root = await harness.session({ resourceId: 'user-1', threadId: { fresh: true } });
+      await root.permissions.grantTool({ toolName: 'write_file' });
+
+      const child = await harness.session({
+        resourceId: root.resourceId,
+        threadId: { fresh: true },
+        parentSessionId: root.id,
+        origin: 'subagent-tool',
+        subagentDepth: 1,
+      });
+
+      expect(child.permissions.getGrants()).toEqual({ categories: [], tools: [] });
+    });
+
+    it('copies the current root grants only into descendants created after each grant', async () => {
+      const { harness } = setupHarness({
+        modes: [
+          {
+            id: 'default',
+            agentId: 'default',
+            permissions: { categories: {}, tools: { delete_paper: 'deny' } },
+          },
+        ],
+        subagents: { inheritRootSessionGrants: true, maxDepth: 3, types: {} },
+      });
+      const root = await harness.session({ resourceId: 'user-1', threadId: { fresh: true } });
+      await root.permissions.grantCategory({ category: 'read' });
+      await root.permissions.grantTool({ toolName: 'write_file' });
+
+      const existingChild = await harness.session({
+        resourceId: root.resourceId,
+        threadId: { fresh: true },
+        parentSessionId: root.id,
+        origin: 'subagent-tool',
+        subagentDepth: 1,
+      });
+      await root.permissions.grantTool({ toolName: 'delete_paper' });
+
+      const laterSibling = await harness.session({
+        resourceId: root.resourceId,
+        threadId: { fresh: true },
+        parentSessionId: root.id,
+        origin: 'subagent-tool',
+        subagentDepth: 1,
+      });
+      const laterGrandchild = await harness.session({
+        resourceId: root.resourceId,
+        threadId: { fresh: true },
+        parentSessionId: existingChild.id,
+        origin: 'subagent-tool',
+        subagentDepth: 2,
+      });
+
+      expect(existingChild.permissions.getGrants()).toEqual({
+        categories: ['read'],
+        tools: ['write_file'],
+      });
+      for (const descendant of [laterSibling, laterGrandchild]) {
+        expect(descendant.permissions.getGrants()).toEqual({
+          categories: ['read'],
+          tools: ['write_file', 'delete_paper'],
+        });
+        expect(descendant.permissions.getRules().tools.delete_paper).toBe('deny');
+      }
+    });
+
+    it('rejects a non-boolean root-grant inheritance setting', () => {
+      expect(() =>
+        setupHarness({
+          subagents: {
+            inheritRootSessionGrants: 'yes' as never,
+            types: {},
+          },
+        }),
+      ).toThrow(/subagents\.inheritRootSessionGrants/u);
     });
   });
 

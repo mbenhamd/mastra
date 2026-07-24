@@ -224,9 +224,18 @@ export class InngestPubSub extends PubSub {
       // would make live Inngest delivery disagree with replayed cache history.
       await this.inngest.realtime.publish(buildTopicRef(channel, inngestTopic), payload);
     } catch (err: any) {
-      // For agent stream terminal events, rethrow — losing a finish/error event
-      // causes the client stream to hang indefinitely
-      if (topicType === 'lifecycle' || (topicType === 'agent' && (event.type === 'finish' || event.type === 'error'))) {
+      const isCriticalTerminalChunk =
+        topicType === 'agent' &&
+        event.type === 'chunk' &&
+        (event.data as { type?: unknown } | undefined)?.type === 'data-terminal-tool-result';
+      // For agent stream terminal events, rethrow. FINISH repeats the terminal
+      // envelope as a replay fallback, while retry-safe chunk ids de-duplicate
+      // a terminal chunk if this publish committed before the worker crashed.
+      if (
+        topicType === 'lifecycle' ||
+        isCriticalTerminalChunk ||
+        (topicType === 'agent' && (event.type === 'finish' || event.type === 'error'))
+      ) {
         throw err;
       }
       // Non-terminal events: log but don't throw

@@ -302,6 +302,63 @@ describe('MastraMemory Embedding Cache (Issue #11455)', () => {
   });
 
   describe('processor creation', () => {
+    it('passes the configured working-memory byte limit to the generated processor', async () => {
+      const maxDataBytes = 16;
+      const memory = new MockMemory({
+        storage: mockStorage as any,
+        enableWorkingMemory: true,
+        enableMessageHistory: false,
+        options: {
+          workingMemory: {
+            enabled: true,
+            maxDataBytes,
+          },
+        },
+      });
+      vi.mocked(mockMemoryStore.getResourceById).mockResolvedValue({
+        id: 'resource-1',
+        workingMemory: '&'.repeat(100),
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      const processor = (await memory.getInputProcessors()).find(p => p.id === 'working-memory');
+      expect(processor).toBeDefined();
+
+      const requestContext = new RequestContext();
+      requestContext.set('MastraMemory', {
+        thread: { id: 'thread-1' },
+        resourceId: 'resource-1',
+      });
+      const messages: MastraDBMessage[] = [
+        {
+          id: 'message-1',
+          role: 'user',
+          content: {
+            format: 2,
+            parts: [{ type: 'text', text: 'Hello' }],
+          },
+          createdAt: new Date(),
+        },
+      ];
+      const messageList = new MessageList();
+      messageList.add(messages, 'input');
+
+      const result = await processor!.processInput({
+        messages,
+        messageList,
+        abort: vi.fn() as any,
+        requestContext,
+      });
+      const resultMessages = result instanceof MessageList ? result.get.all.aiV5.prompt() : result;
+      const instruction = String(resultMessages[0].content);
+      const injectedData = instruction.match(/<working_memory_data>\n([\s\S]*?)\n<\/working_memory_data>/)?.[1];
+
+      expect(instruction).toContain('truncated before this prompt');
+      expect(injectedData).toBeDefined();
+      expect(new TextEncoder().encode(injectedData).byteLength).toBeLessThanOrEqual(maxDataBytes);
+    });
+
     it('should create new processor instances on each call (not cached)', async () => {
       const memory = new MockMemory({
         storage: mockStorage as any,

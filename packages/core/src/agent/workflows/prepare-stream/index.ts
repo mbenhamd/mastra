@@ -13,6 +13,7 @@ import type { RequireToolApproval, ToolPayloadTransformPolicy } from '../../../t
 import { createEventedWorkflow, createWorkflow as createDirectWorkflow } from '../../../workflows/create';
 import type { Workspace } from '../../../workspace/workspace';
 import type { InnerAgentExecutionOptions } from '../../agent.types';
+import type { MastraDBMessage } from '../../message-list';
 import type { SaveQueueManager } from '../../save-queue';
 import type { CreatedAgentSignal } from '../../signals';
 import type { AgentMethodType } from '../../types';
@@ -48,6 +49,8 @@ interface CreatePrepareStreamWorkflowOptions<OUTPUT = undefined> {
   agentId: string;
   agentName?: string;
   toolCallId?: string;
+  /** Persisted conversation behind the exact suspended tool call being resumed. */
+  processorResumeMessages?: MastraDBMessage[];
   workspace?: Workspace;
   backgroundTaskManager?: BackgroundTaskManager;
   agentBackgroundConfig?: AgentBackgroundConfig;
@@ -84,6 +87,7 @@ export function createPrepareStreamWorkflow<OUTPUT = undefined>({
   agentId,
   agentName,
   toolCallId,
+  processorResumeMessages,
   workspace,
   backgroundTaskManager,
   agentBackgroundConfig,
@@ -121,6 +125,7 @@ export function createPrepareStreamWorkflow<OUTPUT = undefined>({
     memory,
     isResume: !!resumeContext,
     backgroundTaskEnabled: backgroundTaskManager?.config?.enabled,
+    ...(processorResumeMessages !== undefined ? { processorResumeMessages } : {}),
     runScope,
   });
 

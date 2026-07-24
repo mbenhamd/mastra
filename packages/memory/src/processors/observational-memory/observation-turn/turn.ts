@@ -200,6 +200,33 @@ export class ObservationTurn {
     // rather than waiting for the next turn's step.prepare() to trigger buffering.
     const asyncObservationEnabled = this.om.buffering.isAsyncObservationEnabled();
     const bufferOnIdle = this.om.getObservationConfig().bufferOnIdle;
+    if (!asyncObservationEnabled) {
+      // Synchronous mode has no other trigger on single-step turns: threshold
+      // observation only runs at step > 0, so a chat surface (one LLM step per
+      // turn) would drift past the threshold forever. The turn boundary is the
+      // synchronous equivalent of bufferOnIdle — observe() self-gates on the
+      // threshold and advances the cursor, and the await keeps the record
+      // consistent before the next turn starts (the cost lands only on the
+      // rare threshold-crossing turn).
+      try {
+        const observeResult = await this.om.observe({
+          threadId: this.threadId,
+          resourceId: this.resourceId,
+          messages: this.messageList.get.all.db(),
+          agent: this.agent,
+          requestContext: this.requestContext,
+          writer: this.writer,
+          observabilityContext: this.observabilityContext,
+        });
+        if (observeResult.observed) {
+          omDebug(
+            `[OM:turn.end] synchronous end-of-turn observation ran (gen=${observeResult.record.generationCount})`,
+          );
+        }
+      } catch (err) {
+        omDebug(`[OM:turn.end] end-of-turn observation failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
     if (asyncObservationEnabled && bufferOnIdle) {
       const allMessages = this.messageList.get.all.db();
       const record = this._record!;

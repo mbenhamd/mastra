@@ -50,8 +50,9 @@ export class HarnessPlanTaskCycleError extends HarnessValidationError {
 }
 
 /**
- * Thrown when setting a task `in_progress` while another task in the SAME root
- * subtree is already `in_progress`. The single-in_progress-per-root invariant is
+ * Thrown when setting a foreground task `in_progress` while another foreground
+ * task in the SAME root subtree is already `in_progress`. The
+ * single-foreground-in-progress-per-root invariant is
  * enforced by auto-transitioning is NOT chosen here: the spec-faithful behavior
  * is REJECT (the model must complete/pause the current focus first), so the
  * model's plan stays an explicit, auditable record of what it chose to work on.
@@ -176,29 +177,71 @@ export function assertNoBlockedByCycle(
   }
 }
 
+/**
+ * Reject a cycle in the COMPLETE execution-dependency graph.
+ *
+ * `blockedBy` is not the only dependency carried by a plan tree: a derived
+ * parent also waits for every direct child before it can complete. Therefore
+ * the graph contains both `task -> blockedBy target` and the implicit rollup
+ * edges `parent -> child`. Validating those edge families independently misses
+ * deadlocks such as a child blocked by its own parent, or reparenting a task
+ * beneath a node that transitively waits for it.
+ *
+ * Callers pass the mutation edge family so the validation error points at the
+ * field the model can repair. Unknown dependency ids are validated by the
+ * operation layer and are ignored defensively here.
+ */
+export function assertNoPlanTaskCombinedCycle(
+  tasks: readonly HarnessPlanTask[],
+  mutationEdgeKind: 'parent' | 'blockedBy',
+): void {
+  const index = indexPlanTasks([...tasks]);
+  const state = new Map<string, 'visiting' | 'visited'>();
+
+  const visit = (taskId: string): void => {
+    state.set(taskId, 'visiting');
+    const task = index.byId.get(taskId);
+    const targets = [...(task?.blockedBy ?? []), ...(index.childrenByParent.get(taskId) ?? [])];
+    for (const targetId of targets) {
+      if (!index.byId.has(targetId)) continue;
+      const targetState = state.get(targetId);
+      if (targetState === 'visiting') {
+        throw new HarnessPlanTaskCycleError(mutationEdgeKind, taskId, targetId);
+      }
+      if (targetState !== 'visited') visit(targetId);
+    }
+    state.set(taskId, 'visited');
+  };
+
+  for (const taskId of index.byId.keys()) {
+    if (state.get(taskId) === undefined) visit(taskId);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Single in_progress per root
 // ---------------------------------------------------------------------------
 
 /**
- * Assert no OTHER task in the same root subtree as `taskId` is currently
- * EXPLICITLY `in_progress`. Used before setting `taskId` itself `in_progress`.
+ * Assert no OTHER FOREGROUND task in the same root subtree as `taskId` is
+ * currently EXPLICITLY `in_progress`. Used before setting `taskId` itself
+ * `in_progress`.
  * `statusOf` lets callers reflect a staged (not-yet-committed) status map.
  *
- * The invariant is "one EXPLICIT active work item per root" (§5.1k): only an
- * explicit `in_progress` is a real competing focus. A DERIVED `in_progress`
- * ancestor merely reflects the child that is the focus, so it must NOT count as
- * a conflict — otherwise re-confirming the already-active child (an idempotent
- * `task_update(child, { status: 'in_progress' })`) would see the child's own
- * rolled-up ancestor as a rival and falsely reject. `sourceOf` reports the
- * (possibly staged) statusSource; absent, every node is treated as explicit so
- * the stricter check still holds for callers that do not track source.
+ * The invariant is "one EXPLICIT foreground work item per root" (§5.1k): a
+ * DERIVED `in_progress` ancestor merely reflects its child and a delegated task
+ * is bounded background work owned by the subagent concurrency pool. Neither is
+ * a competing parent-agent focus. `sourceOf` reports the (possibly staged)
+ * statusSource; `isBackground` identifies delegated work. Both are optional so
+ * pure callers retain the stricter historical check unless they have those
+ * fields available.
  */
 export function assertSingleInProgress(
   index: PlanTaskIndex,
   taskId: string,
   statusOf: (id: string) => HarnessPlanTaskStatus,
   sourceOf?: (id: string) => 'explicit' | 'derived',
+  isBackground?: (id: string) => boolean,
 ): void {
   const root = rootOf(index, taskId);
   for (const task of index.byId.values()) {
@@ -208,6 +251,7 @@ export function assertSingleInProgress(
     // in_progress just mirrors its in_progress child.
     const source = sourceOf?.(task.taskId) ?? task.statusSource ?? 'explicit';
     if (source !== 'explicit') continue;
+    if (isBackground?.(task.taskId) === true) continue;
     if (rootOf(index, task.taskId) === root) {
       throw new HarnessPlanTaskInProgressConflictError(taskId, task.taskId, root);
     }
@@ -305,17 +349,20 @@ function precedence(status: HarnessPlanTaskStatus): number {
   }
 }
 
-/** True when any `blockedBy` dependency is not yet satisfied (i.e. not in a
- * terminal-ok state). A `failed`/`cancelled` dep does NOT keep a task blocked —
- * the work it waited on is over; the model decides what to do next. Only a dep
- * still `pending` / `in_progress` / `blocked` keeps a task blocked. */
+/**
+ * True when any `blockedBy` dependency has not SUCCEEDED. `blockedBy` is a
+ * success dependency by default: only `completed` releases it. A failed or
+ * cancelled prerequisite must not silently make downstream work runnable (for
+ * example, a source-repair task must stay blocked when the compiler SERVICE,
+ * rather than the source, failed). Work that intentionally runs after any
+ * terminal outcome belongs in an explicit workflow branch, not an ambiguous
+ * dependency edge.
+ */
 export function hasUnsatisfiedDep(task: HarnessPlanTask, statusOf: (id: string) => HarnessPlanTaskStatus): boolean {
   if (!task.blockedBy || task.blockedBy.length === 0) return false;
   for (const depId of task.blockedBy) {
     const s = statusOf(depId);
-    // 'completed' satisfies; 'cancelled'/'failed' release the block (the awaited
-    // work is terminal). Anything else (pending/in_progress/blocked) blocks.
-    if (s !== 'completed' && s !== 'cancelled' && s !== 'failed') return true;
+    if (s !== 'completed') return true;
   }
   return false;
 }

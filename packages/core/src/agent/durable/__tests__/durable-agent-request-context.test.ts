@@ -11,7 +11,12 @@ import { MockLanguageModelV2, convertArrayToReadableStream } from '@internal/ai-
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { z } from 'zod';
 import { EventEmitterPubSub } from '../../../events/event-emitter';
-import { RequestContext, MASTRA_RESOURCE_ID_KEY, MASTRA_THREAD_ID_KEY } from '../../../request-context';
+import {
+  MASTRA_AUTH_TOKEN_KEY,
+  MASTRA_RESOURCE_ID_KEY,
+  MASTRA_THREAD_ID_KEY,
+  RequestContext,
+} from '../../../request-context';
 import { createTool } from '../../../tools';
 import { Agent } from '../../agent';
 import { createDurableAgent } from '../create-durable-agent';
@@ -68,6 +73,56 @@ describe('DurableAgent RequestContext reserved keys', () => {
   });
 
   describe('basic RequestContext handling', () => {
+    it('rejects an until-idle stream before resolving dynamic memory', async () => {
+      let memoryResolverCalls = 0;
+      const baseAgent = new Agent({
+        id: 'until-idle-preflight-agent',
+        name: 'Until Idle Preflight Agent',
+        instructions: 'Test authorization ordering.',
+        model: createTextModel('must not run') as LanguageModelV2,
+        requestContextSchema: z.object({ principal: z.string() }),
+        memory: () => {
+          memoryResolverCalls += 1;
+          return undefined;
+        },
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+      await expect(
+        durableAgent.stream('Hello', {
+          untilIdle: true,
+          requestContext: new RequestContext(),
+        }),
+      ).rejects.toThrow();
+
+      expect(memoryResolverCalls).toBe(0);
+    });
+
+    it('uses dynamic-default request context for durable preparation preflight and persistence', async () => {
+      const defaultRequestContext = new RequestContext();
+      defaultRequestContext.set('principal', 'default-user');
+      const baseAgent = new Agent({
+        id: 'default-context-prepare-agent',
+        name: 'Default Context Prepare Agent',
+        instructions: 'Test default context preparation.',
+        model: createTextModel('prepared') as LanguageModelV2,
+        requestContextSchema: z.object({ principal: z.string() }),
+        defaultOptions: () => ({ requestContext: defaultRequestContext }),
+      });
+      const durableAgent = createDurableAgent({
+        agent: baseAgent,
+        pubsub,
+        durableRequestContextKeys: ['principal'],
+      });
+
+      const prepared = await durableAgent.prepare('Hello');
+
+      expect(prepared.workflowInput.requestContextEntries).toMatchObject({
+        principal: 'default-user',
+      });
+      prepared.cleanup();
+    });
+
     it('should accept requestContext option in prepare', async () => {
       const mockModel = createTextModel('Hello!');
 
@@ -288,11 +343,21 @@ describe('DurableAgent RequestContext reserved keys', () => {
         instructions: 'Test serialization',
         model: mockModel as LanguageModelV2,
       });
-      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+      const durableAgent = createDurableAgent({
+        agent: baseAgent,
+        pubsub,
+        durableRequestContextKeys: ['userId'],
+      });
 
       const requestContext = new RequestContext();
       requestContext.set('userId', 'user-123');
-      // Non-JSON values are dropped from the snapshot.
+      requestContext.set('MastraMemory', {
+        thread: { id: 'parent-thread' },
+        resourceId: 'parent-resource',
+        memoryConfig: { readOnly: false },
+      });
+      // Non-allowlisted values remain live-only, regardless of whether they
+      // are serializable.
       requestContext.set('liveHandle', () => 'not-serializable');
 
       const result = await durableAgent.prepare('Hello', {
@@ -312,6 +377,161 @@ describe('DurableAgent RequestContext reserved keys', () => {
         .requestContextEntries;
       expect(entries).toEqual({ userId: 'user-123' });
       result.cleanup();
+    });
+
+    it('never persists auth tokens or arbitrary application secrets by default', async () => {
+      const baseAgent = new Agent({
+        id: 'secure-context-agent',
+        name: 'Secure Context Agent',
+        instructions: 'Test secure durable context defaults',
+        model: createTextModel('Hello!') as LanguageModelV2,
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+      const requestContext = new RequestContext();
+      requestContext.set(MASTRA_AUTH_TOKEN_KEY, 'Bearer raw-secret-token');
+      requestContext.set('credentials', {
+        accessToken: 'nested-secret-token',
+        refreshToken: 'nested-refresh-token',
+      });
+      requestContext.set('userId', 'user-123');
+
+      const result = await durableAgent.prepare('Hello', { requestContext });
+
+      expect(result.workflowInput.requestContextEntries).toBeUndefined();
+      expect(result.workflowInput.requiredRequestContextCapabilities).toEqual({ authToken: true });
+      expect(globalRunRegistry.get(result.runId)?.requestContext?.get(MASTRA_AUTH_TOKEN_KEY)).toBe(
+        'Bearer raw-secret-token',
+      );
+      result.cleanup();
+    });
+
+    it('persists only explicitly allowlisted non-secret application references', async () => {
+      const baseAgent = new Agent({
+        id: 'allowlisted-context-agent',
+        name: 'Allowlisted Context Agent',
+        instructions: 'Test explicit durable context persistence',
+        model: createTextModel('Hello!') as LanguageModelV2,
+      });
+      const durableAgent = createDurableAgent({
+        agent: baseAgent,
+        pubsub,
+        durableRequestContextKeys: ['userId', 'connectionRef'],
+      });
+      const requestContext = new RequestContext();
+      requestContext.set('userId', 'user-123');
+      requestContext.set('connectionRef', { provider: 'drive', id: 'connection-456' });
+      requestContext.set('credentials', { accessToken: 'must-not-persist' });
+
+      const result = await durableAgent.prepare('Hello', { requestContext });
+
+      expect(result.workflowInput.requestContextEntries).toEqual({
+        userId: 'user-123',
+        connectionRef: { provider: 'drive', id: 'connection-456' },
+      });
+      result.cleanup();
+    });
+
+    it('rejects infrastructure keys even when explicitly allowlisted', async () => {
+      const baseAgent = new Agent({
+        id: 'forbidden-context-agent',
+        name: 'Forbidden Context Agent',
+        instructions: 'Test forbidden durable context persistence',
+        model: createTextModel('Hello!') as LanguageModelV2,
+      });
+      const durableAgent = createDurableAgent({
+        agent: baseAgent,
+        pubsub,
+        durableRequestContextKeys: [MASTRA_AUTH_TOKEN_KEY],
+      });
+      const requestContext = new RequestContext();
+      requestContext.set(MASTRA_AUTH_TOKEN_KEY, 'Bearer raw-secret-token');
+
+      await expect(durableAgent.prepare('Hello', { requestContext })).rejects.toMatchObject({
+        id: 'DURABLE_AGENT_REQUEST_CONTEXT_INFRASTRUCTURE_KEY_FORBIDDEN',
+      });
+    });
+
+    it.each([
+      'credentials',
+      'accessToken',
+      'refresh_token',
+      'oauthToken',
+      'token',
+      'apiKey',
+      'accessKey',
+      'clientSecret',
+      'private-key',
+      'signingKey',
+      'headers',
+      'password',
+    ])('rejects credential-like key %s even when explicitly allowlisted', async credentialKey => {
+      const baseAgent = new Agent({
+        id: `forbidden-credential-context-${credentialKey}`,
+        name: 'Forbidden Credential Context Agent',
+        instructions: 'Test forbidden durable credential persistence',
+        model: createTextModel('Hello!') as LanguageModelV2,
+      });
+      const durableAgent = createDurableAgent({
+        agent: baseAgent,
+        pubsub,
+        durableRequestContextKeys: [credentialKey],
+      });
+      const requestContext = new RequestContext();
+      requestContext.set(credentialKey, 'must-not-persist');
+
+      await expect(durableAgent.prepare('Hello', { requestContext })).rejects.toMatchObject({
+        id: 'DURABLE_AGENT_REQUEST_CONTEXT_CREDENTIAL_KEY_FORBIDDEN',
+      });
+    });
+
+    it('does not mistake non-credential token metadata for a credential', async () => {
+      const baseAgent = new Agent({
+        id: 'safe-token-metadata-context-agent',
+        name: 'Safe Token Metadata Context Agent',
+        instructions: 'Test non-credential durable context persistence',
+        model: createTextModel('Hello!') as LanguageModelV2,
+      });
+      const durableAgent = createDurableAgent({
+        agent: baseAgent,
+        pubsub,
+        durableRequestContextKeys: ['tokenBudget', 'connectionId'],
+      });
+      const requestContext = new RequestContext();
+      requestContext.set('tokenBudget', 4_096);
+      requestContext.set('connectionId', 'connection-123');
+
+      const result = await durableAgent.prepare('Hello', { requestContext });
+      expect(result.workflowInput.requestContextEntries).toEqual({
+        tokenBudget: 4_096,
+        connectionId: 'connection-123',
+      });
+      result.cleanup();
+    });
+
+    it('fails closed when an allowlisted value is not serializable or exceeds its bound', async () => {
+      const baseAgent = new Agent({
+        id: 'invalid-context-agent',
+        name: 'Invalid Context Agent',
+        instructions: 'Test bounded durable context persistence',
+        model: createTextModel('Hello!') as LanguageModelV2,
+      });
+      const durableAgent = createDurableAgent({
+        agent: baseAgent,
+        pubsub,
+        durableRequestContextKeys: ['applicationRef'],
+      });
+      const nonSerializableContext = new RequestContext();
+      nonSerializableContext.set('applicationRef', () => 'live-only');
+
+      await expect(durableAgent.prepare('Hello', { requestContext: nonSerializableContext })).rejects.toMatchObject({
+        id: 'DURABLE_AGENT_REQUEST_CONTEXT_VALUE_NOT_SERIALIZABLE',
+      });
+
+      const oversizedContext = new RequestContext();
+      oversizedContext.set('applicationRef', 'x'.repeat(8_193));
+      await expect(durableAgent.prepare('Hello', { requestContext: oversizedContext })).rejects.toMatchObject({
+        id: 'DURABLE_AGENT_REQUEST_CONTEXT_VALUE_TOO_LARGE',
+      });
     });
   });
 });

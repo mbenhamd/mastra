@@ -53,6 +53,7 @@ async function runGoalStep(
     undefinedJudgeResolver?: boolean;
     dbMessages?: any[];
     useMemory?: boolean;
+    terminalToolResult?: unknown;
     /**
      * Runs while the judge call is awaiting, i.e. after the goal step's
      * pre-judge read and before its write — the window a concurrent writer
@@ -119,6 +120,7 @@ async function runGoalStep(
     messageId: 'response-1',
     output: { text: 'I did X', toolCalls: [], toolResults: [] },
     stepResult,
+    ...(opts?.terminalToolResult ? { terminalToolResult: opts.terminalToolResult } : {}),
   };
 
   // A custom scorer whose run throws, to exercise the judge-failure path. The
@@ -199,6 +201,23 @@ async function runGoalStep(
     executionResult,
   };
 }
+
+describe('goal step terminal-result guard', () => {
+  it('skips judge calls, activity, and continuation signals after terminal arbitration', async () => {
+    const result = await runGoalStep('continue', makeRecord({ id: 'goal-terminal' }), {
+      terminalToolResult: {
+        status: 'success',
+        items: [{ toolName: 'answer', toolCallId: 'call-1', status: 'success', value: { answer: 'done' } }],
+      },
+    });
+
+    expect(result.goalChunks).toEqual([]);
+    expect(result.messages).toEqual([]);
+    expect(result.dataParts).toEqual([]);
+    expect(result.record.runsUsed).toBe(0);
+    expect(result.stepResult.isContinued).toBe(false);
+  });
+});
 
 describe('goal step waiting semantics', () => {
   it('uses the original MastraCode judge prompt shape and memory thread id', async () => {

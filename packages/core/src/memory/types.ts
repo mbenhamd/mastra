@@ -177,6 +177,12 @@ export type MessageResponse<T extends 'raw' | 'core_message'> = {
 type BaseWorkingMemory = {
   enabled: boolean;
   /**
+   * Maximum UTF-8 bytes of escaped stored data that may be injected through
+   * the system-message delivery path. Storage is not modified when the prompt
+   * view is truncated.
+   */
+  maxDataBytes?: number;
+  /**
    * Scope for working memory storage.
    * - 'resource': Memory persists across all threads for the same resource/user (default)
    * - 'thread': Memory is isolated per conversation thread

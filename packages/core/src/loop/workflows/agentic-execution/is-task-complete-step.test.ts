@@ -26,9 +26,17 @@ function executeStep(step: any, inputData: any) {
   return step.execute({ inputData });
 }
 
-function makeInput(opts: { toolCalls?: Array<{ toolName: string }>; isContinued?: boolean; bgPending?: boolean } = {}) {
+function makeInput(
+  opts: {
+    toolCalls?: Array<{ toolName: string }>;
+    isContinued?: boolean;
+    bgPending?: boolean;
+    terminalToolResult?: unknown;
+  } = {},
+) {
   return {
     backgroundTaskPending: opts.bgPending ?? false,
+    terminalToolResult: opts.terminalToolResult,
     stepResult: { isContinued: opts.isContinued ?? false },
     output: {
       text: 'done',
@@ -42,6 +50,7 @@ describe('isTaskCompleteStep — working memory skip', () => {
   let runScorersSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
+    vi.restoreAllMocks();
     runScorersSpy = vi
       .spyOn(validation, 'runStreamCompletionScorers')
       .mockResolvedValue({ complete: true, scorers: [] } as any);
@@ -78,5 +87,23 @@ describe('isTaskCompleteStep — working memory skip', () => {
     await executeStep(step, makeInput({ toolCalls: [] }));
 
     expect(runScorersSpy).toHaveBeenCalled();
+  });
+
+  it('skips scorers and feedback after a terminal tool result', async () => {
+    const params = baseParams();
+    const step = createIsTaskCompleteStep(params as any);
+    const input = makeInput({
+      terminalToolResult: {
+        status: 'success',
+        items: [{ toolName: 'answer', toolCallId: 'call-1', status: 'success', value: { answer: 'done' } }],
+      },
+    });
+
+    const result = await executeStep(step, input);
+
+    expect(result).toBe(input);
+    expect(runScorersSpy).not.toHaveBeenCalled();
+    expect(params.controller.enqueue).not.toHaveBeenCalled();
+    expect(params.messageList.get.response.db()).toEqual([]);
   });
 });

@@ -13,6 +13,23 @@ function cloneJsonValue<T>(value: T): T {
 }
 
 /**
+ * New idempotent creates must persist the immutable input hash alongside the
+ * key. Existing rows created before the hash column was introduced may still
+ * omit it; callers validate only the incoming create so those rows remain
+ * readable and retain their key-only replay behavior.
+ */
+export function assertPlanTaskCreateIdempotencyInput(
+  task: Pick<HarnessPlanTask, 'idempotencyKey' | 'idempotencyInputHash'>,
+): void {
+  if (
+    task.idempotencyKey !== undefined &&
+    (typeof task.idempotencyInputHash !== 'string' || task.idempotencyInputHash.length === 0)
+  ) {
+    throw new TypeError('Plan task idempotencyInputHash must be a non-empty string when idempotencyKey is provided');
+  }
+}
+
+/**
  * Apply an `UpdatePlanTaskInput['patch']` to a plan task, producing the next
  * row with `version` set to `nextVersion` and `updatedAt` refreshed. `clear*`
  * flags delete the optional field; a provided value sets it.
@@ -39,9 +56,11 @@ export function applyPlanTaskPatch(
   if (patch.delegatedSubagentSessionId !== undefined) {
     next.delegatedSubagentSessionId = patch.delegatedSubagentSessionId;
   }
+  if (patch.clearDelegatedSubagentSessionId === true) delete next.delegatedSubagentSessionId;
   if (patch.delegatedSubagentTypeId !== undefined) {
     next.delegatedSubagentTypeId = patch.delegatedSubagentTypeId;
   }
+  if (patch.clearDelegatedSubagentTypeId === true) delete next.delegatedSubagentTypeId;
   if (patch.metadata !== undefined) next.metadata = cloneJsonValue(patch.metadata);
   if (patch.clearMetadata === true) delete next.metadata;
   if (patch.startedAt !== undefined) next.startedAt = patch.startedAt;

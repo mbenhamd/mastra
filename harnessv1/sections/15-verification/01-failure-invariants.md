@@ -111,19 +111,21 @@ same Harness namespace.
 
 **Observational memory public boundary**
 
-Authoritative record: `ObservationalMemorySnapshot` projected from scoped
-MemoryStorage OM rows plus `SessionRecord.observationalMemory` config
+Authoritative record: Agent Memory configuration plus scoped MemoryStorage OM
+rows. `SessionRecord.observationalMemory` is unsupported legacy intent, not an
+effective configuration source.
 
-Promise: OM is advisory context, not operation proof. Public local and remote OM
-reads return only the JSON-safe snapshot projection after the session/resource
-check; raw OM rows, raw config blobs, metadata, buffered chunks/reflections,
-history generations, provider clients, live model objects, functions, locks, and
-processor internals never cross the Harness API. OM model switches are ordinary
-session-config writes under the session lease/version and do not mutate raw
-memory rows. Deleting a root/product session through the session-first delete
-cascade removes the backing conversation history and clears only thread-scoped OM
-for that verified `(harnessName, resourceId, threadId)`, unless an explicit
-operator preserve/import-retention path is used. Resource-scoped OM survives
+Promise: OM is advisory context, not operation proof. Harness-level enablement
+and per-session model switches reject rather than persisting inert intent;
+configure OM on Agent Memory. Hydration of a legacy override parks turn and
+queue dispatch before scheduling, expiry, or admission-receipt mutation.
+`session.om.clearOverride()` is idempotent, commits the clearing CAS, and only
+then re-kicks parked work without waiting for the full queued turn. Harness does
+not currently expose an OM snapshot route. Deleting a root/product session
+through the session-first delete cascade removes the backing conversation
+history and clears only thread-scoped OM for that verified
+`(harnessName, resourceId, threadId)`, unless an explicit operator
+preserve/import-retention path is used. Resource-scoped OM survives
 single-conversation deletion.
 
 **Thread clone graph**
@@ -421,9 +423,9 @@ Promise: Public `setThreadSetting` writes only one app-owned `metadata.app[key]`
 entry after resource, lease, key, reserved namespace, and canonical-JSON
 validation. It preserves all top-level metadata and unrelated app keys, rejects
 attempts to write Harness/Mastra/Memory/channel/legacy names, advances the
-session version on commit, and never affects session hydration, mode/model, OM
-config, token usage, channel routing, subagent ownership, or thread title/list
-labels. Remote writes require `If-Match` and reject stale validators before
+session version on commit, and never affects session hydration, mode/model,
+Agent Memory OM config, token usage, channel routing, subagent ownership, or
+thread title/list labels. Remote writes require `If-Match` and reject stale validators before
 touching thread metadata.
 
 **Principal authorization**

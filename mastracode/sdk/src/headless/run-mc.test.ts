@@ -545,9 +545,12 @@ describe('runMC', () => {
         message: {
           id: 'assistant-1',
           role: 'assistant',
-          content: [],
+          content: {
+            format: 2,
+            parts: [],
+            metadata: { stopReason: 'tool_use' },
+          },
           createdAt: new Date(),
-          stopReason: 'tool_use',
         },
       });
       const result = await harness.run.result;

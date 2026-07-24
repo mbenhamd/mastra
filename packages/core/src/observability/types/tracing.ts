@@ -359,6 +359,8 @@ export interface ModelChunkAttributes extends AIBaseAttributes {
 export interface ToolCallAttributes extends AIBaseAttributes {
   toolType?: string;
   toolDescription?: string;
+  /** Provider tool call ID (e.g. 'call_...') — joins the span to the stream's tool frames */
+  toolCallId?: string;
   success?: boolean;
 }
 
@@ -411,6 +413,8 @@ export interface MCPToolCallAttributes extends AIBaseAttributes {
   serverVersion?: string;
   /** Tool description */
   toolDescription?: string;
+  /** Provider tool call ID (e.g. 'call_...') — joins the span to the stream's tool frames */
+  toolCallId?: string;
   /** Whether tool execution was successful */
   success?: boolean;
 }

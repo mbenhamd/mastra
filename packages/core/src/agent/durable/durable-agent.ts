@@ -9,6 +9,7 @@ import type { MastraLanguageModel } from '../../llm/model/shared.types';
 import type { Mastra } from '../../mastra';
 import { createObservabilityContext, getOrCreateSpan, SpanType, EntityType } from '../../observability';
 import {
+  MASTRA_AUTH_TOKEN_KEY,
   MASTRA_RESOURCE_ID_KEY,
   MASTRA_THREAD_ID_KEY,
   MASTRA_VERSIONS_KEY,
@@ -23,7 +24,9 @@ import type { WorkflowFinishCallbackResult, WorkflowRunState, WorkflowRunStatus 
 import { Agent } from '../agent';
 import type { AgentListSuspendedRunsOptions, AgentListSuspendedRunsResult, AgentRunToolCall } from '../agent';
 import type { AgentExecutionOptions, AgentExecutionOptionsBase } from '../agent.types';
+import type { ResolvedAgentMemory } from '../execution-memory';
 import { snapshotAgentExecutionOptions, snapshotAgentExecutionValue } from '../execution-snapshot';
+import { mergeAgentExecutionOptions } from '../merge-execution-options';
 import { MessageList } from '../message-list';
 import type { MessageListInput } from '../message-list';
 import { stableStringify } from '../message-list/cache/stable-stringify';
@@ -33,7 +36,12 @@ import type { AgentMemoryOption, ToolsInput } from '../types';
 import { isSupportedLanguageModel } from '../utils';
 
 import { AGENT_STREAM_TOPIC, DurableStepIds } from './constants';
-import { runDurableStreamUntilIdle, runResumeDurableStreamUntilIdle } from './durable-stream-until-idle';
+import {
+  DURABLE_STREAM_UNTIL_IDLE_HANDOFF,
+  runDurableStreamUntilIdle,
+  runResumeDurableStreamUntilIdle,
+} from './durable-stream-until-idle';
+import type { DurableStreamUntilIdleHandoff } from './durable-stream-until-idle';
 import { prepareForDurableExecution } from './preparation';
 import type { PreparationResult } from './preparation';
 import {
@@ -320,6 +328,14 @@ export interface DurableAgentConfig<
    * Set to 0 to disable auto-cleanup (manual cleanup() required).
    */
   cleanupTimeoutMs?: number;
+
+  /**
+   * Explicit non-secret application RequestContext keys that may be persisted
+   * in durable workflow input. Infrastructure keys and raw credentials are
+   * always forbidden. Persist stable IDs/references and re-resolve credentials
+   * from a trusted provider after restart.
+   */
+  durableRequestContextKeys?: readonly string[];
 }
 
 /**
@@ -532,15 +548,28 @@ export class DurableAgent<
   /** Timeout for auto-cleanup after stream finishes (0 = disabled) */
   readonly #cleanupTimeoutMs: number;
 
+  /** Explicit application context allowlist for durable serialization. */
+  readonly #durableRequestContextKeys: readonly string[];
+
   /**
    * Create a new DurableAgent that wraps an existing Agent
    */
   constructor(config: DurableAgentConfig<TAgentId, TTools, TOutput>) {
-    const { agent, id: idOverride, name: nameOverride, pubsub, cache, maxSteps, cleanupTimeoutMs } = config;
+    const {
+      agent,
+      id: idOverride,
+      name: nameOverride,
+      pubsub,
+      cache,
+      maxSteps,
+      cleanupTimeoutMs,
+      durableRequestContextKeys,
+    } = config;
 
     // Use provided id/name or fall back to agent.id/agent.name
     const agentId = idOverride ?? agent.id;
     const agentName = nameOverride ?? agent.name ?? agent.id;
+    validateMaxSteps(maxSteps);
 
     // Call Agent constructor with minimal config - we delegate to the wrapped agent
     super({
@@ -548,11 +577,11 @@ export class DurableAgent<
       name: agentName,
       // Delegate to wrapped agent's instructions
       instructions: ({ requestContext }) => agent.getInstructions({ requestContext }),
-      // We need to provide model to satisfy the base class, but we'll delegate to wrapped agent
-      model: (() => {
-        validateMaxSteps(maxSteps);
-        return (agent as any).__model ?? agent.getModel();
-      })(),
+      // Keep the base Agent model lazy. Eagerly calling getModel() here resolves
+      // tenant-scoped model factories with an empty RequestContext before any
+      // execution/admission boundary and can also create an unhandled rejected
+      // promise during construction.
+      model: ({ requestContext }) => agent.getModel({ requestContext }),
     });
 
     this.#wrappedAgent = agent;
@@ -562,6 +591,7 @@ export class DurableAgent<
     this.#innerPubsub = pubsub ?? new EventEmitterPubSub();
     this.#cacheConfig = cache;
     this.#cleanupTimeoutMs = cleanupTimeoutMs ?? 30_000;
+    this.#durableRequestContextKeys = Object.freeze([...(durableRequestContextKeys ?? [])]);
   }
 
   // ===========================================================================
@@ -947,6 +977,7 @@ export class DurableAgent<
       cache: this.#cacheConfig,
       maxSteps: this.#maxSteps,
       cleanupTimeoutMs: this.#cleanupTimeoutMs,
+      durableRequestContextKeys: this.#durableRequestContextKeys,
     });
 
     // Preserve runtime state set after construction (mastra registration and the
@@ -1029,7 +1060,6 @@ export class DurableAgent<
   /** Handle terminal lifecycle for synchronous and evented workflow engines. */
   protected async onDurableWorkflowFinish(result: WorkflowFinishCallbackResult): Promise<void> {
     if (['running', 'suspended', 'waiting', 'pending', 'paused'].includes(result.status)) return;
-
     try {
       await this.deleteTerminalRunSnapshots(result.runId);
     } catch (error) {
@@ -1515,8 +1545,9 @@ export class DurableAgent<
   async #assertPublicAgentResumePreflight(options: {
     requestContext?: RequestContext;
     memory?: AgentMemoryOption;
-    runId: string;
+    runId?: string;
     snapshotMemoryInfo?: { threadId?: string; resourceId?: string };
+    actor?: AgentExecutionOptions<any>['actor'];
   }): Promise<void> {
     await this.#wrappedAgent.__assertAgentResumePreflight({
       ...options,
@@ -1571,6 +1602,8 @@ export class DurableAgent<
       modelConfig: input.modelConfig,
       modelList: input.modelList,
       options: input.options,
+      requestContextEntries: input.requestContextEntries,
+      requiredRequestContextCapabilities: input.requiredRequestContextCapabilities,
     });
     return stableStringify(recoveryContract(outerInput)) === stableStringify(recoveryContract(nestedInput));
   }
@@ -1774,8 +1807,12 @@ export class DurableAgent<
 
   async #rehydrateSuspendedRunRegistry(
     runId: string,
-    options: Pick<DurableAgentResumeOptions<TOutput>, 'requestContext' | 'memory' | 'versions'> = {},
-  ): Promise<void> {
+    options: Pick<DurableAgentResumeOptions<TOutput>, 'requestContext' | 'memory' | 'versions' | 'actor'> = {},
+  ): Promise<{
+    requestContext: RequestContext;
+    defaultOptions: AgentExecutionOptions<TOutput>;
+    resolvedMemory: ResolvedAgentMemory;
+  }> {
     const workflowsStore = await this.#mastra?.getStorage()?.getStore('workflows');
     if (!workflowsStore) {
       throw new MastraError({
@@ -1903,6 +1940,18 @@ export class DurableAgent<
     if (mergedVersions) {
       requestContext.set(MASTRA_VERSIONS_KEY, mergedVersions);
     }
+    if (
+      workflowInput.requiredRequestContextCapabilities?.authToken === true &&
+      !callerRequestContext.has(MASTRA_AUTH_TOKEN_KEY)
+    ) {
+      throw new MastraError({
+        id: 'DURABLE_AGENT_RESUME_AUTH_TOKEN_REQUIRED',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `DurableAgent "${this.name}" requires a fresh trusted auth token to recover run "${runId}".`,
+        details: { agentName: this.name, runId },
+      });
+    }
     // Persisted context is runtime input, never proof of the current caller.
     // Ownership must come from the live request context (or explicit memory
     // coordinates when FGA is not configured).
@@ -1960,6 +2009,7 @@ export class DurableAgent<
       memory: options.memory,
       runId,
       snapshotMemoryInfo: { threadId, resourceId },
+      actor: options.actor,
     });
 
     if (stableStringify(mergedVersions ?? {}) !== stableStringify(workflowInput.versions ?? {})) {
@@ -1988,26 +2038,50 @@ export class DurableAgent<
     }
 
     const memoryConfig = workflowInput.state?.memoryConfig;
-    const [tools, model, modelList, memory, workspace, inputProcessors, outputProcessors, errorProcessors] =
-      await Promise.all([
-        this.#wrappedAgent.getToolsForExecution({
-          threadId,
-          resourceId,
-          runId,
-          requestContext,
-          memoryConfig,
-          autoResumeSuspendedTools: workflowInput.options?.autoResumeSuspendedTools,
-          agentId: this.id,
-          agentName: this.name,
-        }),
-        this.#wrappedAgent.getModel({ requestContext }),
-        this.#wrappedAgent.getModelList(requestContext),
-        this.#wrappedAgent.getMemory({ requestContext }),
-        this.#wrappedAgent.getWorkspace({ requestContext }),
-        this.#wrappedAgent.listInputProcessors(requestContext),
-        this.#wrappedAgent.listOutputProcessors(requestContext),
-        this.#wrappedAgent.listErrorProcessors(requestContext),
-      ]);
+    const defaultOptionsPromise = this.#wrappedAgent.getDefaultOptions({ requestContext });
+    const memoryPromise = this.#wrappedAgent.getMemory({ requestContext });
+    const resolvedMemoryPromise = memoryPromise.then(value => ({ value }));
+    const resolvedModelsPromise = this.#wrappedAgent.__resolveExecutionModels({ requestContext });
+    const [
+      resolvedDefaultOptions,
+      tools,
+      resolvedModels,
+      memory,
+      workspace,
+      inputProcessors,
+      outputProcessors,
+      errorProcessors,
+    ] = await Promise.all([
+      defaultOptionsPromise,
+      Promise.all([defaultOptionsPromise, resolvedMemoryPromise, resolvedModelsPromise]).then(
+        ([resolvedDefaultOptions, resolvedMemory, resolvedModels]) =>
+          this.#wrappedAgent.getToolsForExecution({
+            threadId,
+            resourceId,
+            runId,
+            requestContext,
+            memoryConfig,
+            autoResumeSuspendedTools: workflowInput.options?.autoResumeSuspendedTools,
+            agentId: this.id,
+            agentName: this.name,
+            resolvedDefaultOptions: resolvedDefaultOptions as AgentExecutionOptions<any>,
+            resolvedMemory,
+            resolvedModel: resolvedModels.model,
+            processorMessages: messageList.get.all.db(),
+          }),
+      ),
+      resolvedModelsPromise,
+      memoryPromise,
+      this.#wrappedAgent.getWorkspace({ requestContext }),
+      resolvedMemoryPromise.then(resolvedMemory =>
+        this.#wrappedAgent.listInputProcessors(requestContext, resolvedMemory),
+      ),
+      resolvedMemoryPromise.then(resolvedMemory =>
+        this.#wrappedAgent.listOutputProcessors(requestContext, resolvedMemory),
+      ),
+      this.#wrappedAgent.listErrorProcessors(requestContext),
+    ]);
+    const { model, modelList } = resolvedModels;
     if (
       workflowInput.hasProcessors ||
       inputProcessors.length > 0 ||
@@ -2107,6 +2181,7 @@ export class DurableAgent<
         model: entry.model,
         maxRetries: entry.maxRetries ?? 0,
         enabled: entry.enabled ?? true,
+        headers: entry.headers,
       })),
       memory,
       saveQueueManager,
@@ -2127,6 +2202,11 @@ export class DurableAgent<
     this.#assertNoRegistryCollision(runId);
     this.#runRegistry.registerWithMessageList(runId, registryEntry, messageList, { threadId, resourceId });
     registerGlobalRunRegistryEntry(runId, registryEntry);
+    return {
+      requestContext,
+      defaultOptions: resolvedDefaultOptions as AgentExecutionOptions<TOutput>,
+      resolvedMemory: { value: memory },
+    };
   }
 
   // ===========================================================================
@@ -2324,6 +2404,20 @@ export class DurableAgent<
     options = options
       ? snapshotAgentExecutionOptions(options, ['runId', 'requestContext', 'memory', 'versions'])
       : undefined;
+    const idleLoopHandoff = (
+      options as
+        | (DurableAgentStreamOptions<TOutput> & {
+            [DURABLE_STREAM_UNTIL_IDLE_HANDOFF]?: DurableStreamUntilIdleHandoff<TOutput>;
+          })
+        | undefined
+    )?.[DURABLE_STREAM_UNTIL_IDLE_HANDOFF];
+    if (options && idleLoopHandoff) {
+      const { [DURABLE_STREAM_UNTIL_IDLE_HANDOFF]: _idleLoopHandoff, ...publicOptions } =
+        options as DurableAgentStreamOptions<TOutput> & {
+          [DURABLE_STREAM_UNTIL_IDLE_HANDOFF]?: DurableStreamUntilIdleHandoff<TOutput>;
+        };
+      options = publicOptions;
+    }
 
     // Delegate to the idle-loop wrapper when `untilIdle` is set.
     // Strip `untilIdle` before passing to the wrapper so its internal
@@ -2331,6 +2425,29 @@ export class DurableAgent<
     if (options?.untilIdle) {
       const { untilIdle, ...rest } = options;
       const maxIdleMs = typeof untilIdle === 'object' ? untilIdle.maxIdleMs : undefined;
+      let preflightedDefaultOptions: AgentExecutionOptions<TOutput> | undefined;
+      if (rest.requestContext) {
+        await this.#assertPublicAgentResumePreflight({
+          requestContext: rest.requestContext,
+          memory: rest.memory,
+          runId: rest.runId,
+          actor: rest.actor,
+        });
+      } else if (this.requestContextSchema || this.#mastra?.getServer()?.fga) {
+        preflightedDefaultOptions = (await this.getDefaultOptions({
+          requestContext: rest.requestContext,
+        })) as AgentExecutionOptions<TOutput>;
+        const resolvedOptions = mergeAgentExecutionOptions(
+          preflightedDefaultOptions as Record<string, any>,
+          rest as Record<string, any>,
+        ) as AgentExecutionOptions<TOutput>;
+        await this.#assertPublicAgentResumePreflight({
+          requestContext: resolvedOptions.requestContext,
+          memory: resolvedOptions.memory,
+          runId: rest.runId,
+          actor: resolvedOptions.actor,
+        });
+      }
       return runDurableStreamUntilIdle<TOutput>(
         this as unknown as DurableAgent<any, any, TOutput>,
         messages,
@@ -2338,7 +2455,19 @@ export class DurableAgent<
         {
           activeStreams: this.#activeStreamUntilIdle,
           bgManager: this.#mastra?.backgroundTaskManager,
+          prepareContinuation:
+            this.requestContextSchema || this.#mastra?.getServer()?.fga
+              ? async resolvedOptions => {
+                  await this.#assertPublicAgentResumePreflight({
+                    requestContext: resolvedOptions.requestContext,
+                    memory: resolvedOptions.memory,
+                    actor: resolvedOptions.actor,
+                  });
+                  return resolvedOptions;
+                }
+              : undefined,
         },
+        preflightedDefaultOptions,
       );
     }
 
@@ -2355,6 +2484,7 @@ export class DurableAgent<
           memory: options?.memory,
           runId: allocatedRunId,
           snapshotMemoryInfo,
+          actor: options?.actor,
         });
         const requestFingerprint = this.#preparedRequestFingerprint(messages, options);
         const matchedPreparation = this.#getPreparedExecution(allocatedRunId, requestFingerprint);
@@ -2370,6 +2500,7 @@ export class DurableAgent<
           memory: options?.memory,
           runId: allocatedRunId,
           snapshotMemoryInfo,
+          actor: options?.actor,
         });
         if (this.#getPreparedExecution(allocatedRunId, requestFingerprint) !== preparation) {
           this.#throwRunIdConflict(allocatedRunId);
@@ -2381,6 +2512,7 @@ export class DurableAgent<
             requestContext: options.requestContext,
             memory: options.memory,
             runId: allocatedRunId,
+            actor: options.actor,
           });
           releaseRunIdReservation = await this.#reserveRunId(allocatedRunId);
         }
@@ -2388,6 +2520,9 @@ export class DurableAgent<
           agent: this.#wrappedAgent as Agent<string, any, TOutput>,
           messages,
           options: options as AgentExecutionOptions<TOutput>,
+          resolvedDefaultOptions: idleLoopHandoff?.defaultOptions,
+          resolvedMemory: idleLoopHandoff?.resolvedMemory,
+          durableRequestContextKeys: this.#durableRequestContextKeys,
           runId: allocatedRunId,
           requestContext: options?.requestContext,
           logger: this.logger,
@@ -2629,6 +2764,29 @@ export class DurableAgent<
     if (options?.untilIdle) {
       const { untilIdle, ...rest } = options;
       const maxIdleMs = typeof untilIdle === 'object' ? untilIdle.maxIdleMs : undefined;
+      let preflightedDefaultOptions: AgentExecutionOptions<TOutput> | undefined;
+      if (rest.requestContext) {
+        await this.#assertPublicAgentResumePreflight({
+          requestContext: rest.requestContext,
+          memory: rest.memory,
+          runId,
+          actor: rest.actor,
+        });
+      } else if (this.requestContextSchema || this.#mastra?.getServer()?.fga) {
+        preflightedDefaultOptions = (await this.getDefaultOptions({
+          requestContext: rest.requestContext,
+        })) as AgentExecutionOptions<TOutput>;
+        const resolvedOptions = mergeAgentExecutionOptions(
+          preflightedDefaultOptions as Record<string, any>,
+          rest as Record<string, any>,
+        ) as AgentExecutionOptions<TOutput>;
+        await this.#assertPublicAgentResumePreflight({
+          requestContext: resolvedOptions.requestContext,
+          memory: resolvedOptions.memory,
+          runId,
+          actor: resolvedOptions.actor,
+        });
+      }
       return runResumeDurableStreamUntilIdle<TOutput>(
         this as unknown as DurableAgent<any, any, TOutput>,
         runId,
@@ -2637,7 +2795,19 @@ export class DurableAgent<
         {
           activeStreams: this.#activeStreamUntilIdle,
           bgManager: this.#mastra?.backgroundTaskManager,
+          prepareContinuation:
+            this.requestContextSchema || this.#mastra?.getServer()?.fga
+              ? async resolvedOptions => {
+                  await this.#assertPublicAgentResumePreflight({
+                    requestContext: resolvedOptions.requestContext,
+                    memory: resolvedOptions.memory,
+                    actor: resolvedOptions.actor,
+                  });
+                  return resolvedOptions;
+                }
+              : undefined,
         },
+        preflightedDefaultOptions,
       );
     }
 
@@ -2687,6 +2857,7 @@ export class DurableAgent<
       requestContext: explicitRequestContext,
       memory: callerMemory,
       runId,
+      actor: options?.actor,
     });
     if (
       (warmMemoryInfo?.resourceId &&
@@ -2714,6 +2885,7 @@ export class DurableAgent<
           : undefined),
       runId,
       snapshotMemoryInfo: warmMemoryInfo,
+      actor: options?.actor,
     });
     if (entry && !this.#activeRegistryPairIsValid(runId, entry)) entry = undefined;
     if (entry) this.#assertWarmResumeVersionSelectors(runId, entry, options ?? {});
@@ -3076,6 +3248,15 @@ export class DurableAgent<
         details: { agentName: this.name, runId, ownerAgentId: workflowInput.agentId },
       });
     }
+    if (workflowInput.requiredRequestContextCapabilities?.authToken === true) {
+      throw new MastraError({
+        id: 'DURABLE_AGENT_RECOVER_AUTH_TOKEN_REQUIRED',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `DurableAgent "${this.name}" recover(${runId}) requires trusted auth-token reinjection and cannot reuse persisted credentials.`,
+        details: { agentName: this.name, runId },
+      });
+    }
     assertDurableToolHookPolicyAvailable({ serialized: workflowInput.options.toolHookPolicy });
 
     // 2. Rebuild the RequestContext from the persisted JSON-safe snapshot.
@@ -3116,7 +3297,30 @@ export class DurableAgent<
         details: { agentName: this.name, runId },
       });
     }
-    const [tools, resolvedModel, memory, workspace, modelList] = await Promise.all([
+    const defaultOptionsPromise = wrapped.getDefaultOptions({ requestContext });
+    const memoryPromise = wrapped.getMemory({ requestContext });
+    const resolvedMemoryPromise = memoryPromise.then(value => ({ value }));
+    const resolvedModelsPromise = wrapped.__resolveExecutionModels({ requestContext });
+    const processorsPromise = resolvedMemoryPromise
+      .then(resolvedMemory => wrapped.__resolveExecutionProcessors(requestContext, resolvedMemory))
+      .catch(cause => {
+        throw new MastraError(
+          {
+            id: 'DURABLE_AGENT_RECOVER_PROCESSOR_RESOLUTION_FAILED',
+            domain: ErrorDomain.AGENT,
+            category: ErrorCategory.USER,
+            text: `DurableAgent "${this.name}" recover(${runId}) could not reconstruct its processor surface.`,
+            details: { agentName: this.name, runId },
+          },
+          cause,
+        );
+      });
+    const toolsPromise = Promise.all([
+      defaultOptionsPromise,
+      resolvedMemoryPromise,
+      resolvedModelsPromise,
+      processorsPromise,
+    ]).then(([resolvedDefaultOptions, resolvedMemory, resolvedModels, processors]) =>
       wrapped.getToolsForExecution({
         runId,
         threadId,
@@ -3126,12 +3330,21 @@ export class DurableAgent<
         autoResumeSuspendedTools: workflowInput.options?.autoResumeSuspendedTools,
         agentId: this.id,
         agentName: this.name,
+        resolvedDefaultOptions: resolvedDefaultOptions as AgentExecutionOptions<any>,
+        resolvedMemory,
+        resolvedModel: resolvedModels.model,
+        resolvedInputProcessors: processors.configuredInputProcessors,
+        processorMessages: messageList.get.all.db(),
       }),
-      wrapped.getModel({ requestContext }),
-      wrapped.getMemory({ requestContext }),
+    );
+    const [tools, resolvedModels, memory, workspace, processors] = await Promise.all([
+      toolsPromise,
+      resolvedModelsPromise,
+      memoryPromise,
       wrapped.getWorkspace({ requestContext }),
-      wrapped.getModelList(requestContext),
+      processorsPromise,
     ]);
+    const { model: resolvedModel, modelList } = resolvedModels;
     if (!isSupportedLanguageModel(resolvedModel)) {
       throw new MastraError({
         id: 'DURABLE_AGENT_RECOVER_UNSUPPORTED_MODEL',
@@ -3204,18 +3417,7 @@ export class DurableAgent<
     // the global registry, and the terminal `.map(...)` reads `outputProcessors`
     // + `errorProcessors` — without these, the recovered segment would run
     // with no processors even if the agent has some configured.
-    let inputProcessors: any[] = [];
-    let llmRequestInputProcessors: any[] = [];
-    let outputProcessors: any[] = [];
-    let errorProcessors: any[] = [];
-    try {
-      inputProcessors = (await (wrapped as any).listInputProcessors?.(requestContext)) ?? [];
-      llmRequestInputProcessors = (await (wrapped as any).__listLLMRequestProcessors?.(requestContext)) ?? [];
-      outputProcessors = (await (wrapped as any).listOutputProcessors?.(requestContext)) ?? [];
-      errorProcessors = (await (wrapped as any).listErrorProcessors?.(requestContext)) ?? [];
-    } catch (err) {
-      this.#mastra?.getLogger?.()?.warn?.(`[DurableAgent] recover(${runId}) processor resolution failed: ${err}`);
-    }
+    const { inputProcessors, llmRequestInputProcessors, outputProcessors, errorProcessors } = processors;
     // Fresh empty processorStates for the recovered segment — the pre-crash
     // segment's in-memory processor state is gone, but the terminal state
     // (memory writes, message list) lives on the persisted snapshot.
@@ -3531,6 +3733,7 @@ export class DurableAgent<
           requestContext: options.requestContext,
           memory: options.memory,
           runId: allocatedRunId,
+          actor: options.actor,
         });
         releaseRunIdReservation = await this.#reserveRunId(allocatedRunId);
       }
@@ -3538,6 +3741,7 @@ export class DurableAgent<
         agent: this.#wrappedAgent as Agent<string, any, TOutput>,
         messages,
         options: options as AgentExecutionOptions<TOutput>,
+        durableRequestContextKeys: this.#durableRequestContextKeys,
         runId: allocatedRunId,
         requestContext: options?.requestContext,
         logger: this.logger,
@@ -4133,15 +4337,11 @@ export class DurableAgent<
     messages: MessageListInput,
     streamOptions?: DurableAgentStreamOptions<OUTPUT> & { maxIdleMs?: number },
   ): Promise<DurableAgentStreamResult<OUTPUT>> {
-    return runDurableStreamUntilIdle<OUTPUT>(
-      this as unknown as DurableAgent<any, any, OUTPUT>,
-      messages,
-      streamOptions,
-      {
-        activeStreams: this.#activeStreamUntilIdle,
-        bgManager: this.#mastra?.backgroundTaskManager,
-      },
-    );
+    const { maxIdleMs, ...options } = streamOptions ?? {};
+    return (this.stream as any)(messages, {
+      ...options,
+      untilIdle: maxIdleMs === undefined ? true : { maxIdleMs },
+    }) as Promise<DurableAgentStreamResult<OUTPUT>>;
   }
 
   /**
@@ -4168,6 +4368,7 @@ export class DurableAgent<
           requestContext: options.requestContext,
           memory: options.memory,
           runId: options.runId,
+          actor: options.actor,
         });
         releaseRunIdReservation = await this.#reserveRunId(options.runId);
       }
@@ -4177,6 +4378,7 @@ export class DurableAgent<
         durableAgentName: this.name,
         messages,
         options,
+        durableRequestContextKeys: this.#durableRequestContextKeys,
         runId: options?.runId,
         requestContext: options?.requestContext,
         logger: this.logger,

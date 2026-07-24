@@ -616,8 +616,8 @@ function dynamicMemoryTest(version: 'v1' | 'v2') {
             requestContext: new RequestContext(),
             methodType,
           });
-          // Background eligibility discovery is outside the sub-agent execution
-          // boundary and currently resolves its full tool surface once.
+          // Background eligibility discovery is metadata-only. It must not resolve
+          // the child's tenant-scoped memory before the delegated execution starts.
           const resolverCallsBeforeExecution = resolverCalls;
 
           const result = (await tools['agent-subAgent']!.execute?.({ prompt: 'Do the delegated work.' }, {
@@ -626,13 +626,256 @@ function dynamicMemoryTest(version: 'v1' | 'v2') {
           } as any)) as { text: string; subAgentThreadId: string; subAgentResourceId: string };
 
           expect(result.text).toBe('Dummy response');
-          expect(resolverCallsBeforeExecution).toBe(1);
+          expect(resolverCallsBeforeExecution).toBe(0);
           expect(resolverCalls - resolverCallsBeforeExecution).toBe(1);
           await expect(memory.getThreadById({ threadId: result.subAgentThreadId })).resolves.toMatchObject({
             resourceId: result.subAgentResourceId,
           });
         },
       );
+
+      it('should inherit each parent memory without installing it on a shared sub-agent', async () => {
+        const firstMemory = new MockMemory({ storage: new InMemoryStore() });
+        const secondMemory = new MockMemory({ storage: new InMemoryStore() });
+        const sharedSubAgent = new Agent({
+          id: 'shared-memory-sub-agent',
+          name: 'Shared Memory Sub-agent',
+          instructions: 'Return a delegated result.',
+          model: dummyModel,
+        });
+        const firstParent = new Agent({
+          id: 'first-memory-parent',
+          name: 'First Memory Parent',
+          instructions: 'Delegate work.',
+          model: dummyModel,
+          memory: firstMemory,
+          agents: { sharedSubAgent },
+        });
+        const secondParent = new Agent({
+          id: 'second-memory-parent',
+          name: 'Second Memory Parent',
+          instructions: 'Delegate work.',
+          model: dummyModel,
+          memory: secondMemory,
+          agents: { sharedSubAgent },
+        });
+
+        expect(sharedSubAgent.hasOwnMemory()).toBe(false);
+
+        const [firstTools, secondTools] = await Promise.all([
+          firstParent['convertTools']({
+            requestContext: new RequestContext(),
+            methodType: 'generate',
+            threadId: 'first-parent-thread',
+            resourceId: 'first-parent-resource',
+          }),
+          secondParent['convertTools']({
+            requestContext: new RequestContext(),
+            methodType: 'generate',
+            threadId: 'second-parent-thread',
+            resourceId: 'second-parent-resource',
+          }),
+        ]);
+
+        const [firstResult, secondResult] = (await Promise.all([
+          firstTools['agent-sharedSubAgent']!.execute?.({ prompt: 'First delegated task.' }, {
+            toolCallId: 'first-shared-memory-call',
+            messages: [],
+          } as any),
+          secondTools['agent-sharedSubAgent']!.execute?.({ prompt: 'Second delegated task.' }, {
+            toolCallId: 'second-shared-memory-call',
+            messages: [],
+          } as any),
+        ])) as Array<{ subAgentThreadId: string; subAgentResourceId: string; text: string }>;
+
+        expect(firstResult.text).toBe('Dummy response');
+        expect(secondResult.text).toBe('Dummy response');
+        expect(sharedSubAgent.hasOwnMemory()).toBe(false);
+        await expect(sharedSubAgent.getMemory()).resolves.toBeUndefined();
+        await expect(firstMemory.getThreadById({ threadId: firstResult.subAgentThreadId })).resolves.toMatchObject({
+          resourceId: firstResult.subAgentResourceId,
+        });
+        await expect(secondMemory.getThreadById({ threadId: secondResult.subAgentThreadId })).resolves.toMatchObject({
+          resourceId: secondResult.subAgentResourceId,
+        });
+        await expect(firstMemory.getThreadById({ threadId: secondResult.subAgentThreadId })).resolves.toBeNull();
+        await expect(secondMemory.getThreadById({ threadId: firstResult.subAgentThreadId })).resolves.toBeNull();
+      });
+
+      it('should run inherited memory processors and persist the delegated transcript', async () => {
+        const inheritedMemory = new MockMemory({
+          storage: new InMemoryStore(),
+          enableWorkingMemory: true,
+        });
+        const childThreadId = 'inherited-processor-child-thread';
+        const childResourceId = 'inherited-processor-child-resource';
+
+        await inheritedMemory.createThread({ threadId: childThreadId, resourceId: childResourceId });
+        await inheritedMemory.saveMessages({
+          messages: [
+            {
+              id: 'inherited-history-message',
+              role: 'user',
+              type: 'text',
+              content: {
+                format: 2,
+                parts: [{ type: 'text', text: 'INHERITED_HISTORY_MARKER' }],
+              },
+              threadId: childThreadId,
+              resourceId: childResourceId,
+              createdAt: new Date(0),
+            },
+          ],
+        });
+        await inheritedMemory.updateWorkingMemory({
+          threadId: childThreadId,
+          resourceId: childResourceId,
+          workingMemory: '# Delegated context\n- INHERITED_WORKING_MEMORY_MARKER',
+        });
+
+        let capturedPrompt: unknown;
+        const sharedSubAgent = new Agent({
+          id: 'inherited-processor-sub-agent',
+          name: 'Inherited Processor Sub-agent',
+          instructions: 'Return a delegated result.',
+          model: new MockLanguageModelV2({
+            doGenerate: async ({ prompt }) => {
+              capturedPrompt = prompt;
+              return {
+                rawCall: { rawPrompt: null, rawSettings: {} },
+                finishReason: 'stop',
+                usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+                content: [{ type: 'text', text: 'INHERITED_OUTPUT_MARKER' }],
+                warnings: [],
+              };
+            },
+          }),
+          defaultOptions: {
+            memory: {
+              thread: childThreadId,
+              resource: childResourceId,
+            },
+          },
+        });
+        const parentAgent = new Agent({
+          id: 'inherited-processor-parent',
+          name: 'Inherited Processor Parent',
+          instructions: 'Delegate work.',
+          model: dummyModel,
+          memory: inheritedMemory,
+          agents: { sharedSubAgent },
+        });
+
+        expect(sharedSubAgent.hasOwnMemory()).toBe(false);
+        const tools = await parentAgent['convertTools']({
+          requestContext: new RequestContext(),
+          methodType: 'generate',
+          threadId: 'inherited-processor-parent-thread',
+          resourceId: 'inherited-processor-parent-resource',
+        });
+        const result = (await tools['agent-sharedSubAgent']!.execute?.({ prompt: 'INHERITED_INPUT_MARKER' }, {
+          toolCallId: 'inherited-processor-call',
+          messages: [],
+        } as any)) as { text: string; subAgentThreadId: string; subAgentResourceId: string };
+
+        const serializedPrompt = JSON.stringify(capturedPrompt);
+        expect(serializedPrompt).toContain('INHERITED_HISTORY_MARKER');
+        expect(serializedPrompt).toContain('INHERITED_WORKING_MEMORY_MARKER');
+        expect(result.text).toBe('INHERITED_OUTPUT_MARKER');
+        expect(sharedSubAgent.hasOwnMemory()).toBe(false);
+        await expect(sharedSubAgent.getMemory()).resolves.toBeUndefined();
+
+        const childHistory = await inheritedMemory.recall({ threadId: childThreadId, perPage: false });
+        const serializedChildHistory = JSON.stringify(childHistory.messages);
+        expect(serializedChildHistory).toContain('INHERITED_INPUT_MARKER');
+        expect(serializedChildHistory).toContain('INHERITED_OUTPUT_MARKER');
+
+        const displayedHistory = await inheritedMemory.recall({
+          threadId: result.subAgentThreadId,
+          perPage: false,
+        });
+        const serializedDisplayedHistory = JSON.stringify(displayedHistory.messages);
+        expect(serializedDisplayedHistory).toContain('INHERITED_INPUT_MARKER');
+        expect(serializedDisplayedHistory).toContain('INHERITED_OUTPUT_MARKER');
+      });
+
+      it('should project a streamed child-default transcript without moving child messages', async () => {
+        const childMemory = new MockMemory({ storage: new InMemoryStore() });
+        const childThreadId = 'stream-child-default-thread';
+        const childResourceId = 'stream-child-default-resource';
+        const childModel = new MockLanguageModelV2({
+          doGenerate: async () => ({
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            finishReason: 'stop',
+            usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+            content: [{ type: 'text', text: 'STREAM_CHILD_OUTPUT_MARKER' }],
+            warnings: [],
+          }),
+          doStream: async () => ({
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            finishReason: 'stop',
+            usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+            stream: convertArrayToReadableStream([
+              { type: 'text-delta', id: 'stream-child-text', delta: 'STREAM_CHILD_OUTPUT_MARKER' },
+              {
+                type: 'finish',
+                id: 'stream-child-finish',
+                finishReason: 'stop',
+                usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+              },
+            ]),
+            warnings: [],
+          }),
+        });
+        const childAgent = new Agent({
+          id: 'stream-child-default-agent',
+          name: 'Stream Child Default Agent',
+          instructions: 'Return the streamed delegated result.',
+          model: childModel,
+          memory: childMemory,
+          defaultOptions: {
+            memory: {
+              thread: childThreadId,
+              resource: childResourceId,
+            },
+          },
+        });
+        const parentAgent = new Agent({
+          id: 'stream-child-default-parent',
+          name: 'Stream Child Default Parent',
+          instructions: 'Delegate work.',
+          model: dummyModel,
+          agents: { childAgent },
+        });
+        const tools = await parentAgent['convertTools']({
+          requestContext: new RequestContext(),
+          methodType: 'stream',
+          threadId: 'stream-child-parent-thread',
+          resourceId: 'stream-child-parent-resource',
+        });
+
+        const result = (await tools['agent-childAgent']!.execute?.({ prompt: 'STREAM_CHILD_INPUT_MARKER' }, {
+          toolCallId: 'stream-child-default-call',
+          messages: [],
+        } as any)) as { text: string; subAgentThreadId: string; subAgentResourceId: string };
+
+        expect(result.text).toBe('STREAM_CHILD_OUTPUT_MARKER');
+        expect(result.subAgentThreadId).not.toBe(childThreadId);
+
+        const childHistory = await childMemory.recall({ threadId: childThreadId, perPage: false });
+        const displayedHistory = await childMemory.recall({ threadId: result.subAgentThreadId, perPage: false });
+        expect(JSON.stringify(childHistory.messages)).toContain('STREAM_CHILD_INPUT_MARKER');
+        expect(JSON.stringify(childHistory.messages)).toContain('STREAM_CHILD_OUTPUT_MARKER');
+        expect(JSON.stringify(displayedHistory.messages)).toContain('STREAM_CHILD_INPUT_MARKER');
+        expect(JSON.stringify(displayedHistory.messages)).toContain('STREAM_CHILD_OUTPUT_MARKER');
+        expect(childHistory.messages.every(message => message.threadId === childThreadId)).toBe(true);
+        expect(childHistory.messages.every(message => message.resourceId === childResourceId)).toBe(true);
+        expect(displayedHistory.messages.every(message => message.threadId === result.subAgentThreadId)).toBe(true);
+        expect(displayedHistory.messages.every(message => message.resourceId === result.subAgentResourceId)).toBe(true);
+
+        const childMessageIds = new Set(childHistory.messages.map(message => message.id));
+        expect(displayedHistory.messages.every(message => !childMessageIds.has(message.id))).toBe(true);
+      });
 
       it('should stop before model or tool execution when dynamic memory resolution fails', async () => {
         let modelCalls = 0;

@@ -1,21 +1,28 @@
 import { z } from 'zod';
 import type { PubSub } from '../../../../events/pubsub';
+import {
+  outputProcessorsAllowTerminalToolResult,
+  resolveTerminalToolResult,
+} from '../../../../loop/shared/terminal-tool-result';
 import type { Mastra } from '../../../../mastra';
 import { EntityType, SpanType } from '../../../../observability';
 import type { ExportedSpan } from '../../../../observability';
 import { ChunkFrom } from '../../../../stream/types';
+import { toolPayloadTransformAllowsTerminalToolResult } from '../../../../tools/payload-transform';
 import { PUBSUB_SYMBOL } from '../../../../workflows/constants';
 import { createStep } from '../../../../workflows/workflow';
 import { MessageList } from '../../../message-list';
 import { DurableStepIds } from '../../constants';
-import { globalRunRegistry } from '../../run-registry';
+import { getBoundRunRegistryEntry } from '../../run-registry';
 import { emitChunkEvent } from '../../stream-adapter';
 import type {
+  DurableAgenticWorkflowInput,
   DurableLLMStepOutput,
   DurableToolCallOutput,
   DurableAgenticExecutionOutput,
   SerializableDurableState,
 } from '../../types';
+import { resolveRuntimeDependencies } from '../../utils/resolve-runtime';
 
 /**
  * Input schema for the durable LLM mapping step.
@@ -46,6 +53,8 @@ const durableLLMMappingOutputSchema = z.object({
   }),
   state: z.any(),
   delegationBailed: z.boolean().optional(),
+  terminalToolResult: z.any().optional(),
+  deferredStepFinishChunk: z.any().optional(),
   processorRetryCount: z.number().optional(),
   processorRetryFeedback: z.string().optional(),
 });
@@ -108,7 +117,7 @@ export function createDurableLLMMappingStep() {
     inputSchema: durableLLMMappingInputSchema,
     outputSchema: durableLLMMappingOutputSchema,
     execute: async params => {
-      const { inputData, mastra, requestContext } = params;
+      const { inputData, mastra, requestContext, getInitData } = params;
       const {
         llmOutput,
         toolResults,
@@ -153,7 +162,24 @@ export function createDurableLLMMappingStep() {
 
       // 2. Add tool results to message list
       // Look up tools from the in-process registry for toModelOutput support
-      const registryEntry = globalRunRegistry.get(_runId);
+      const durableInitData = getInitData() as DurableAgenticWorkflowInput;
+      let registryEntry = getBoundRunRegistryEntry(_runId, durableInitData.runtimeBindingId);
+      const registryModel = registryEntry?.model as { __metadataOnly?: boolean } | undefined;
+      const needsRuntimeHydration =
+        !registryEntry ||
+        registryEntry.isPlaceholder === true ||
+        !registryModel ||
+        registryModel.__metadataOnly === true;
+      if (needsRuntimeHydration && mastra) {
+        await resolveRuntimeDependencies({
+          mastra: mastra as Mastra,
+          runId: _runId,
+          agentId: _agentId,
+          input: durableInitData,
+          logger: (mastra as Mastra).getLogger?.(),
+        });
+        registryEntry = getBoundRunRegistryEntry(_runId, durableInitData.runtimeBindingId);
+      }
       const registryTools = registryEntry?.tools;
 
       // Rebuild the MODEL_STEP span early so MAPPING child spans can nest under it
@@ -329,6 +355,70 @@ export function createDurableLLMMappingStep() {
         requestContext.set('__mastra_delegationBailed', false);
       }
 
+      // Terminal delivery bypasses the model, so fail closed whenever a
+      // processor or payload transform could otherwise redact/block the tool
+      // result. Those policies retain the ordinary model continuation path.
+      const terminalDeliveryIsSafe =
+        outputProcessorsAllowTerminalToolResult(registryEntry?.outputProcessors) &&
+        toolPayloadTransformAllowsTerminalToolResult(
+          registryEntry?.toolPayloadTransform,
+          durableInitData.options?.transform !== undefined,
+        ) &&
+        llmOutput.stepResult.reason !== 'tripwire' &&
+        // Terminal delivery replaces the ordinary assistant answer. A mixed
+        // text+tool step has already streamed that text, so bypassing the next
+        // model iteration would make live and persisted output disagree.
+        !(typeof llmOutput.text === 'string' && llmOutput.text.length > 0);
+      const terminalToolResult = terminalDeliveryIsSafe
+        ? await resolveTerminalToolResult({
+            calls: toolResults,
+            tools: registryTools as any,
+            runId: _runId,
+            abortSignal: registryEntry?.abortSignal,
+            onPolicyFailure: error =>
+              (mastra as Mastra | undefined)
+                ?.getLogger?.()
+                ?.warn?.(`[DurableAgent][TerminalToolResult] ${error.message}`, { runId: _runId }),
+          })
+        : undefined;
+
+      // The durable LLM step defers step-finish for tool-calling iterations.
+      // Keep it in workflow state until signal/terminal resolution so every
+      // engine emits tool-result -> terminal-result -> step-finish in order.
+      const deferredChunk = llmOutput.deferredStepFinishChunk as any;
+      let deferredStepFinishChunk: unknown;
+      if (deferredChunk) {
+        const stepContent: unknown[] = [];
+        if (llmOutput.text) {
+          stepContent.push({ type: 'text', text: llmOutput.text });
+        }
+        for (const tc of llmOutput.toolCalls ?? []) {
+          stepContent.push({
+            type: 'tool-call',
+            toolCallId: tc.toolCallId,
+            toolName: tc.toolName,
+            args: tc.args,
+          });
+        }
+        for (const tr of toolResults ?? []) {
+          stepContent.push({
+            type: 'tool-result',
+            toolCallId: tr.toolCallId,
+            toolName: tr.toolName,
+            result: tr.error ? tr.error.message : tr.result,
+            ...(tr.error ? { isError: true } : {}),
+          });
+        }
+        deferredStepFinishChunk = {
+          ...deferredChunk,
+          payload: {
+            ...deferredChunk.payload,
+            _durableStepContent: stepContent,
+            ...(terminalToolResult ? { terminalToolResult } : {}),
+          },
+        };
+      }
+
       // 4. Build the output
       const output: DurableAgenticExecutionOutput = {
         messageListState: messageList.serialize(),
@@ -355,6 +445,8 @@ export function createDurableLLMMappingStep() {
         processorRetryCount: llmOutput.processorRetryCount,
         processorRetryFeedback: llmOutput.processorRetryFeedback,
         delegationBailed,
+        ...(terminalToolResult ? { terminalToolResult } : {}),
+        ...(deferredStepFinishChunk ? { deferredStepFinishChunk } : {}),
       };
 
       // Close the MODEL_STEP span for tool-calling iterations: the LLM step defers it so
@@ -379,57 +471,6 @@ export function createDurableLLMMappingStep() {
           (mastra as Mastra | undefined)
             ?.getLogger?.()
             ?.warn?.(`[DurableAgent] Failed to close model_step span: ${error}`);
-        }
-      }
-
-      // Emit the deferred step-finish chunk for intermediate steps.
-      // llm-execution defers step-finish emission for tool-calling steps so that
-      // it arrives AFTER tool-result chunks (emitted by tool-call.ts). This
-      // matches the regular agent's chunk ordering which MastraModelOutput
-      // relies on for correct step content reconstruction in onStepFinish.
-      const deferredChunk = llmOutput.deferredStepFinishChunk as any;
-      if (deferredChunk && pubsub) {
-        try {
-          // Build step content directly from this iteration's data.
-          // We cannot rely on messageList.get.response.aiV5.modelContent(-1)
-          // because each durable step deserializes a fresh MessageList, so
-          // the MastraModelOutput's reference is stale. Instead, construct
-          // the content array from the LLM output (text + tool calls) and
-          // the tool results collected in this step.
-          const stepContent: unknown[] = [];
-          if (llmOutput.text) {
-            stepContent.push({ type: 'text', text: llmOutput.text });
-          }
-          for (const tc of llmOutput.toolCalls ?? []) {
-            stepContent.push({
-              type: 'tool-call',
-              toolCallId: tc.toolCallId,
-              toolName: tc.toolName,
-              args: tc.args,
-            });
-          }
-          for (const tr of toolResults ?? []) {
-            stepContent.push({
-              type: 'tool-result',
-              toolCallId: tr.toolCallId,
-              toolName: tr.toolName,
-              result: tr.error ? tr.error.message : tr.result,
-              ...(tr.error ? { isError: true } : {}),
-            });
-          }
-
-          const enrichedChunk = {
-            ...deferredChunk,
-            payload: {
-              ...deferredChunk.payload,
-              _durableStepContent: stepContent,
-            },
-          };
-          await emitChunkEvent(pubsub, _runId, enrichedChunk);
-        } catch (error) {
-          (mastra as Mastra | undefined)
-            ?.getLogger?.()
-            ?.warn?.(`[DurableAgent] Failed to emit deferred step-finish: ${error}`);
         }
       }
 

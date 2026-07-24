@@ -12,6 +12,7 @@ import { createFavoritesTests } from './domains/favorites';
 import { createSchedulesTests } from './domains/schedules';
 import { createChannelsTests } from './domains/channels';
 import { createToolProviderConnectionsTests } from './domains/tool-provider-connections';
+import { createHarnessTest } from './domains/harness';
 import { createSkillsTests } from './domains/skills';
 export * from './domains/memory/data';
 export * from './domains/harness/data';
@@ -137,5 +138,6 @@ export function createTestSuite(storage: MastraStorage, capabilities: TestCapabi
     createSchedulesTests({ storage });
     createChannelsTests({ storage });
     createToolProviderConnectionsTests({ storage });
+    createHarnessTest({ storage });
   });
 }

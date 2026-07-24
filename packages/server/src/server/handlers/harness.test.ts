@@ -7,6 +7,7 @@ import {
   HarnessAttachmentInUseError,
   HarnessAttachmentUnavailableError,
   HarnessInboxResponseConflictError,
+  HarnessPendingInteractionExpiredError,
   HarnessRuntimeDriftError,
 } from '@mastra/core/harness/v1';
 import { RequestContext, MASTRA_RESOURCE_ID_KEY } from '@mastra/core/request-context';
@@ -28,6 +29,7 @@ import {
   GET_HARNESS_CHANNEL_DIAGNOSTICS_ROUTE,
   GET_HARNESS_GOAL_ROUTE,
   GET_HARNESS_MESSAGE_RESULT_ROUTE,
+  GET_HARNESS_PERMISSIONS_ROUTE,
   GET_HARNESS_QUEUE_RESULT_ROUTE,
   GET_HARNESS_SESSION_ROUTE,
   GET_HARNESS_SESSION_EVENTS_ROUTE,
@@ -157,6 +159,12 @@ async function withUrlServer(
   }
 }
 
+const inboxGeneration = {
+  runId: 'run-1',
+  toolCallId: 'tool-call-1',
+  pendingRequestedAt: 1_778_870_000_000,
+} as const;
+
 describe('Harness server routes', () => {
   it('registers Harness routes as authenticated Harness client routes', () => {
     expect(HARNESS_ROUTES).toContain(LIST_HARNESS_SESSIONS_ROUTE);
@@ -171,6 +179,7 @@ describe('Harness server routes', () => {
     expect(HARNESS_ROUTES).toContain(GET_HARNESS_QUEUE_RESULT_ROUTE);
     expect(HARNESS_ROUTES).toContain(GET_HARNESS_SESSION_EVENTS_ROUTE);
     expect(HARNESS_ROUTES).toContain(GET_HARNESS_STATE_ROUTE);
+    expect(HARNESS_ROUTES).toContain(GET_HARNESS_PERMISSIONS_ROUTE);
     expect(HARNESS_ROUTES).toContain(PATCH_HARNESS_STATE_ROUTE);
     expect(HARNESS_ROUTES).toContain(PATCH_HARNESS_MODE_ROUTE);
     expect(HARNESS_ROUTES).toContain(PATCH_HARNESS_MODEL_ROUTE);
@@ -211,6 +220,8 @@ describe('Harness server routes', () => {
       clientRoute: true,
       allowSseSubscriptionToken: true,
     });
+    expect(GET_HARNESS_PERMISSIONS_ROUTE.requiresAuth).toBe(true);
+    expect(GET_HARNESS_PERMISSIONS_ROUTE.harnessAuth).toEqual({ clientRoute: true });
     expect(PATCH_HARNESS_STATE_ROUTE.requiresAuth).toBe(true);
     expect(PATCH_HARNESS_STATE_ROUTE.harnessAuth).toEqual({ clientRoute: true });
     expect(RESPOND_HARNESS_INBOX_ROUTE.requiresAuth).toBe(true);
@@ -630,11 +641,11 @@ describe('Harness server routes', () => {
           threadId: 'thread-1',
           messageId: 'message-1',
           text: 'recovered partial answer',
-          reasoningText: 'thinking',
+          reasoningText: 'private reasoning must not cross the server boundary',
           status: 'streaming',
           startedAt: 300,
           updatedAt: 350,
-        },
+        } as NonNullable<SessionRecord['assistantDrafts']>[string] & { reasoningText: string },
       },
     });
     const session = {
@@ -673,7 +684,6 @@ describe('Harness server routes', () => {
         assistantDrafts: {
           'run-1': {
             text: 'recovered partial answer',
-            reasoningText: 'thinking',
             status: 'streaming',
           },
         },
@@ -686,6 +696,7 @@ describe('Harness server routes', () => {
     expect(body.displayState.pending).not.toHaveProperty('runtimeDependencies');
     expect(body.displayState.pending).not.toHaveProperty('requestContext');
     expect(body.displayState.pending).not.toHaveProperty('toolSurfaceFence');
+    expect(body.displayState.assistantDrafts['run-1']).not.toHaveProperty('reasoningText');
   });
 
   it('returns read-only channel diagnostics for the authenticated resource', async () => {
@@ -2602,6 +2613,108 @@ describe('Harness server routes', () => {
     expect(harness.session).toHaveBeenCalledWith({ sessionId: 'session-1', resourceId: 'resource-1' });
   });
 
+  it('returns a tenant-scoped copied permission snapshot', async () => {
+    const grants = { categories: ['read'], tools: ['shell'] };
+    const rules = { categories: { edit: 'ask' as const }, tools: { shell: 'ask' as const } };
+    const session = {
+      permissions: {
+        getGrants: vi.fn(() => grants),
+        getRules: vi.fn(() => rules),
+      },
+    };
+    const stored = makeRecord({ resourceId: 'resource-1' });
+    const harness = {
+      loadSession: vi.fn(async () => stored),
+      session: vi.fn(async () => session),
+    };
+    const mastra = { getHarness: vi.fn(() => harness) };
+
+    const result = await GET_HARNESS_PERMISSIONS_ROUTE.handler(
+      makeParams({
+        mastra,
+        name: 'query-code',
+        sessionId: 'query-session',
+        requestPathParams: { name: 'code', sessionId: 'session-1' },
+      }),
+    );
+
+    expect(mastra.getHarness).toHaveBeenCalledWith('code');
+    expect(harness.loadSession).toHaveBeenCalledWith({ sessionId: 'session-1', includeClosed: true });
+    expect(harness.session).toHaveBeenCalledWith({ sessionId: 'session-1', resourceId: 'resource-1' });
+    expect(result).toEqual({
+      grants: { categories: ['read'], tools: ['shell'] },
+      rules: { categories: { edit: 'ask' }, tools: { shell: 'ask' } },
+    });
+    expect(result).not.toBe(grants);
+    expect((result as { grants: unknown }).grants).not.toBe(grants);
+    expect((result as { rules: unknown }).rules).not.toBe(rules);
+  });
+
+  it('does not reopen a closed session to read permissions', async () => {
+    const closed = makeRecord({ closedAt: 250 });
+    const session = {
+      permissions: {
+        getGrants: vi.fn(() => ({ categories: ['read'], tools: ['shell'] })),
+        getRules: vi.fn(() => ({ categories: {}, tools: {} })),
+      },
+    };
+    const harness = {
+      loadSession: vi.fn(async () => closed),
+      session: vi.fn(async () => session),
+    };
+    const mastra = { getHarness: vi.fn(() => harness) };
+
+    const body = await expectHarnessHttpError(
+      GET_HARNESS_PERMISSIONS_ROUTE.handler(makeParams({ mastra, name: 'code', sessionId: 'session-1' })),
+      404,
+      'harness.session_closed',
+    );
+
+    expect(body).toMatchObject({ details: { sessionId: 'session-1' } });
+    expect(harness.loadSession).toHaveBeenCalledWith({ sessionId: 'session-1', includeClosed: true });
+    expect(harness.session).not.toHaveBeenCalled();
+  });
+
+  it('does not resolve a closing session to read permissions', async () => {
+    const closing = makeRecord({ closingAt: 250, closeDeadlineAt: 300 });
+    const harness = {
+      loadSession: vi.fn(async () => closing),
+      session: vi.fn(),
+    };
+    const mastra = { getHarness: vi.fn(() => harness) };
+
+    const body = await expectHarnessHttpError(
+      GET_HARNESS_PERMISSIONS_ROUTE.handler(makeParams({ mastra, name: 'code', sessionId: 'session-1' })),
+      409,
+      'harness.session_closing',
+    );
+
+    expect(body).toMatchObject({ details: { sessionId: 'session-1', closingAt: 250, closeDeadlineAt: 300 } });
+    expect(harness.session).not.toHaveBeenCalled();
+  });
+
+  it('does not disclose a foreign session permission snapshot', async () => {
+    const harness = {
+      loadSession: vi.fn(async () => makeRecord({ resourceId: 'resource-other' })),
+      session: vi.fn(),
+    };
+    const mastra = { getHarness: vi.fn(() => harness) };
+
+    await expectHarnessHttpError(
+      GET_HARNESS_PERMISSIONS_ROUTE.handler(
+        makeParams({
+          mastra,
+          name: 'code',
+          sessionId: 'session-1',
+          requestContext: makeRequestContext('resource-1'),
+        }),
+      ),
+      404,
+      'harness.session_not_found',
+    );
+    expect(harness.session).not.toHaveBeenCalled();
+  });
+
   it('applies permission mutations and returns a copied snapshot', async () => {
     const grants = { categories: ['read'], tools: [] };
     const rules = { categories: {}, tools: { shell: 'ask' as const } };
@@ -2723,6 +2836,7 @@ describe('Harness server routes', () => {
           requestBody: {
             kind: 'question',
             answer: 'yes',
+            ...inboxGeneration,
             responseId: 'response-1',
           },
         }),
@@ -2732,8 +2846,47 @@ describe('Harness server routes', () => {
     expect(harness.session).toHaveBeenCalledWith({ sessionId: 'session-1', resourceId: 'resource-1' });
     expect(session.respondToQuestion).toHaveBeenCalledWith({
       itemId: 'item-1',
+      ...inboxGeneration,
       responseId: 'response-1',
       answer: 'yes',
+    });
+  });
+
+  it('forwards allow-always as one atomic tool-approval response', async () => {
+    const response = {
+      itemId: 'item-1',
+      kind: 'tool-approval' as const,
+      status: 'accepted' as const,
+      responseId: 'response-1',
+      duplicate: false,
+    };
+    const session = { respondToToolApproval: vi.fn(async () => response) };
+    const harness = { session: vi.fn(async () => session) };
+    const mastra = { getHarness: vi.fn(() => harness) };
+
+    await expect(
+      RESPOND_HARNESS_INBOX_ROUTE.handler(
+        makeParams({
+          mastra,
+          name: 'code',
+          sessionId: 'session-1',
+          itemId: 'item-1',
+          requestBody: {
+            kind: 'tool-approval',
+            approved: true,
+            approvalScope: 'always',
+            ...inboxGeneration,
+            responseId: 'response-1',
+          },
+        }),
+      ),
+    ).resolves.toEqual(response);
+    expect(session.respondToToolApproval).toHaveBeenCalledWith({
+      itemId: 'item-1',
+      ...inboxGeneration,
+      responseId: 'response-1',
+      approved: true,
+      approvalScope: 'always',
     });
   });
 
@@ -2763,6 +2916,7 @@ describe('Harness server routes', () => {
             kind: 'sandbox-access',
             approved: false,
             reason: 'Needs a narrower write path',
+            ...inboxGeneration,
             responseId: 'response-1',
           },
         }),
@@ -2772,6 +2926,7 @@ describe('Harness server routes', () => {
     expect(harness.session).toHaveBeenCalledWith({ sessionId: 'session-1', resourceId: 'resource-1' });
     expect(session.respondToSandboxAccess).toHaveBeenCalledWith({
       itemId: 'item-1',
+      ...inboxGeneration,
       responseId: 'response-1',
       approved: false,
       reason: 'Needs a narrower write path',
@@ -2832,6 +2987,7 @@ describe('Harness server routes', () => {
           requestBody: {
             kind: 'question',
             answer: 'yes',
+            ...inboxGeneration,
             responseId: 'response-1',
           },
         }),
@@ -2863,6 +3019,7 @@ describe('Harness server routes', () => {
           requestBody: {
             kind: 'question',
             answer: 'yes',
+            ...inboxGeneration,
             responseId: 'response-1',
           },
         }),
@@ -2875,6 +3032,36 @@ describe('Harness server routes', () => {
         driftedRefs: [{ kind: 'workspace_provider', ref: 'unconfigured' }],
       },
     });
+  });
+
+  it('maps a durable pending-interaction expiry to HTTP 410', async () => {
+    const session = {
+      respondToToolApproval: vi.fn(async () => {
+        throw new HarnessPendingInteractionExpiredError('session-1', 'item-1', 1234);
+      }),
+    };
+    const harness = { session: vi.fn(async () => session) };
+    const mastra = { getHarness: vi.fn(() => harness) };
+
+    const body = await expectHarnessHttpError(
+      RESPOND_HARNESS_INBOX_ROUTE.handler(
+        makeParams({
+          mastra,
+          name: 'code',
+          sessionId: 'session-1',
+          itemId: 'item-1',
+          requestBody: {
+            kind: 'tool-approval',
+            approved: true,
+            ...inboxGeneration,
+            responseId: 'late-response',
+          },
+        }),
+      ),
+      410,
+      'harness.pending_interaction_expired',
+    );
+    expect(body).toMatchObject({ details: { sessionId: 'session-1', itemId: 'item-1', expiresAt: 1234 } });
   });
 
   it('sets, reads, pauses, resumes, and clears session goals', async () => {

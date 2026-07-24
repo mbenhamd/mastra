@@ -92,23 +92,31 @@ describe('Mode-seeded base permission policy (§4.2e)', () => {
     }
   });
 
-  it('HITL and local plan-task built-ins bypass the gate while escalation built-ins honor it', async () => {
+  it('only protocol-critical HITL/terminal built-ins bypass the gate', async () => {
     const { harness } = setupHarness({ modes: [{ id: 'm', agentId: 'default' }], defaultModeId: 'm' });
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
     try {
       const rules = { categories: {}, tools: {} };
       const grants = { categories: [], tools: [] };
-      // ask_user / submit_plan are harness HITL infrastructure — never gated, else a
-      // deny default would break the question / plan-approval suspension flows.
-      for (const id of ['ask_user', 'submit_plan', 'task_add']) {
+      // These are harness protocol boundaries: gating them would break question /
+      // approval suspension or prevent a child from returning its terminal result.
+      for (const id of ['ask_user', 'submit_plan', 'report_subagent_outcome']) {
         expect((session as any)._resolveToolPolicy(id, rules, grants, 'deny')).toBe('allow');
       }
-      // A non-builtin user tool is still denied under the deny default.
+      // Plan mutations and capability expansion are real actions and obey policy.
+      expect((session as any)._resolveToolPolicy('task_add', rules, grants, 'deny')).toBe('deny');
+      expect((session as any)._resolveToolPolicy('task_check', rules, grants, 'deny')).toBe('deny');
       expect((session as any)._resolveToolPolicy('someUserTool', rules, grants, 'deny')).toBe('deny');
-      // Escalation built-ins cross agent/session capability boundaries and honor
-      // the engaged policy unless the session/mode explicitly allows them.
       expect((session as any)._resolveToolPolicy('spawn_subagent', rules, grants, 'deny')).toBe('deny');
       expect((session as any)._resolveToolPolicy('task_delegate', rules, grants, 'deny')).toBe('deny');
+      expect(
+        (session as any)._resolveToolPolicy(
+          'task_add',
+          { categories: {}, tools: { task_add: 'allow' } },
+          grants,
+          'deny',
+        ),
+      ).toBe('allow');
       expect(
         (session as any)._resolveToolPolicy(
           'spawn_subagent',
@@ -143,10 +151,12 @@ describe('Mode-seeded base permission policy (§4.2e)', () => {
       expect(resolve('readDoc', allow)).toBe('allow');
       // Non-listed user tool → HARD deny (the allowlist is the capability cap).
       expect(resolve('writeDoc', allow)).toBe('deny');
-      // HITL/local builtins are always kept regardless of the allowlist.
+      // Protocol boundaries stay available regardless of the child allowlist.
       expect(resolve('ask_user', allow)).toBe('allow');
-      expect(resolve('task_add', allow)).toBe('allow');
-      // Escalation builtins are NOT auto-kept under an allowlist → denied unless listed.
+      expect(resolve('report_subagent_outcome', allow)).toBe('allow');
+      // Plan/escalation builtins are capability scoped like application tools.
+      expect(resolve('task_add', allow)).toBe('deny');
+      expect(resolve('task_add', new Set(['task_add']))).toBe('allow');
       expect(resolve('spawn_subagent', allow)).toBe('deny');
       expect(resolve('task_delegate', allow)).toBe('deny');
       expect(resolve('spawn_subagent', new Set(['spawn_subagent']))).toBe('allow');
@@ -358,8 +368,8 @@ describe('Mode permission seeding — inheritance + grants edge cases (§4.2e)',
 
 // ---------------------------------------------------------------------------
 // Seed reconciliation on rehydrate (§4.2e) — a redeploy that changes a mode's
-// declared permissions re-seeds an UNTOUCHED session on hydrate, but leaves a
-// runtime-overlaid session alone.
+// declared permissions re-seeds an UNTOUCHED session on hydrate. Runtime
+// overlays survive except that a newly configured operator deny is a hard floor.
 // ---------------------------------------------------------------------------
 
 describe('Mode permission seed reconciliation on rehydrate (§4.2e)', () => {
@@ -367,6 +377,7 @@ describe('Mode permission seed reconciliation on rehydrate (§4.2e)', () => {
     const { harness: h1, storage } = setupHarness({
       modes: [{ id: 'm', agentId: 'default', permissions: { categories: { edit: 'ask' }, tools: {} } }],
       defaultModeId: 'm',
+      toolCategoryResolver: toolName => (toolName === 'editDoc' ? 'edit' : null),
     });
     const session = await h1.session({ resourceId: 'u1', threadId: { fresh: true } });
     const sessionId = session.id;
@@ -388,7 +399,7 @@ describe('Mode permission seed reconciliation on rehydrate (§4.2e)', () => {
     }
   });
 
-  it('LEAVES a runtime-overlaid session alone on rehydrate even if the mode config changed', async () => {
+  it('preserves unrelated runtime overlays while enforcing a redeployed category deny', async () => {
     const { harness: h1, storage } = setupHarness({
       modes: [{ id: 'm', agentId: 'default', permissions: { categories: { edit: 'ask' }, tools: {} } }],
       defaultModeId: 'm',
@@ -397,33 +408,38 @@ describe('Mode permission seed reconciliation on rehydrate (§4.2e)', () => {
     const sessionId = session.id;
     // Runtime overlay → rules now differ from the recorded seed.
     await session.permissions.setPolicy({ category: 'read', policy: 'deny' });
+    await session.permissions.setPolicy({ toolName: 'editDoc', policy: 'allow' });
     await h1.shutdown();
 
     const { harness: h2 } = setupHarness({
       modes: [{ id: 'm', agentId: 'default', permissions: { categories: { edit: 'deny' }, tools: {} } }],
       defaultModeId: 'm',
       sessions: { storage },
+      toolCategoryResolver: toolName => (toolName === 'editDoc' ? 'edit' : null),
     });
     try {
       const rehydrated = await h2.session({ sessionId, resourceId: 'u1' });
       const rules = rehydrated.permissions.getRules();
-      // Touched → respect the runtime intent; do NOT clobber with the new config.
-      expect(rules.categories.edit).toBe('ask'); // original seed, NOT the redeployed 'deny'
+      // Unrelated runtime intent survives, but the operator deny is non-waivable.
+      expect(rules.categories.edit).toBe('deny');
       expect(rules.categories.read).toBe('deny'); // the runtime overlay survives
+      // A stale explicit tool allow would outrank its category, so it must be
+      // removed unless the current operator seed explicitly declares an exception.
+      expect(rules.tools.editDoc).toBeUndefined();
     } finally {
       await h2.shutdown();
     }
   });
 
-  it('LEAVES a GRANT-only session alone on rehydrate (grants are an overlay too)', async () => {
+  it('retains a grant record but never lets it lift a redeployed deny', async () => {
     const { harness: h1, storage } = setupHarness({
       modes: [{ id: 'm', agentId: 'default', permissions: { categories: { edit: 'ask' }, tools: {} } }],
       defaultModeId: 'm',
+      toolCategoryResolver: toolName => (toolName === 'editDoc' ? 'edit' : null),
     });
     const session = await h1.session({ resourceId: 'u1', threadId: { fresh: true } });
     const sessionId = session.id;
-    // Grant edit at runtime: this leaves permissionRules == seed but adds an overlay
-    // in sessionGrants, so the session must NOT be re-seeded on rehydrate.
+    // Grant edit at runtime: this leaves permissionRules == seed and adds an overlay.
     await session.permissions.grantCategory({ category: 'edit' });
     await h1.shutdown();
 
@@ -431,12 +447,20 @@ describe('Mode permission seed reconciliation on rehydrate (§4.2e)', () => {
       modes: [{ id: 'm', agentId: 'default', permissions: { categories: { edit: 'deny' }, tools: {} } }],
       defaultModeId: 'm',
       sessions: { storage },
+      toolCategoryResolver: toolName => (toolName === 'editDoc' ? 'edit' : null),
     });
     try {
       const rehydrated = await h2.session({ sessionId, resourceId: 'u1' });
-      // Not clobbered by the redeployed 'deny'; the grant survives.
-      expect(rehydrated.permissions.getRules().categories.edit).toBe('ask');
+      expect(rehydrated.permissions.getRules().categories.edit).toBe('deny');
       expect(rehydrated.permissions.getGrants().categories).toContain('edit');
+      expect(
+        (rehydrated as any)._resolveToolPolicy(
+          'editDoc',
+          rehydrated.permissions.getRules(),
+          rehydrated.permissions.getGrants(),
+          'allow',
+        ),
+      ).toBe('deny');
     } finally {
       await h2.shutdown();
     }

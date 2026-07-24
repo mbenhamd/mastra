@@ -249,6 +249,15 @@ describe('DurableAgent isTaskComplete', () => {
     requestContext.set('userId', 'user-123');
     requestContext.set('tenantId', 'tenant-abc');
 
+    const prepared = await durableAgent.prepare('go', {
+      requestContext,
+      isTaskComplete: {
+        scorers: [scorer as any],
+      } as any,
+    });
+    expect(prepared.workflowInput.requestContextEntries).toBeUndefined();
+    prepared.cleanup();
+
     const { output, cleanup } = await durableAgent.stream('go', {
       requestContext,
       isTaskComplete: {

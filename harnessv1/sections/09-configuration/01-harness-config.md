@@ -41,7 +41,7 @@ remains authoritative for required vs optional fields, defaults, and types):
     <rect style="fill: #f8fafc; stroke: #94a3b8; stroke-width: 2; rx: 14;" x="520" y="234" width="230" height="100" />
     <text style="font: 600 15px system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; fill: #0f172a;" x="635" y="262" text-anchor="middle">per-feature config</text>
     <text style="font: 500 12px system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; fill: #475569;" x="635" y="284" text-anchor="middle">workspace · goals</text>
-    <text style="font: 500 12px system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; fill: #475569;" x="635" y="302" text-anchor="middle">observationalMemory</text>
+    <text style="font: 500 12px system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; fill: #475569;" x="635" y="302" text-anchor="middle">OM recovery (disabled)</text>
     <text style="font: 500 12px system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; fill: #475569;" x="635" y="320" text-anchor="middle">files (upload caps)</text>
 
     <rect style="fill: #f8fafc; stroke: #94a3b8; stroke-width: 2; rx: 14;" x="760" y="234" width="240" height="100" />
@@ -306,12 +306,11 @@ interface HarnessConfig<TState = Record<string, unknown>> {
   //   rather than receiving a replacement workspace).
   workspace?: HarnessWorkspaceConfig | Workspace | WorkspaceFactoryFn;
 
-  // Observational Memory. Harness v1's core contract covers only optional OM
-  // enablement, thread/resource scope, resolved model IDs, numeric thresholds,
-  // and the JSON-safe snapshot/model-switch boundary in §4.2 and §4.8. Raw
-  // observation rows remain in MemoryStorage (§5.2). Advanced processor tuning
-  // is adapter-owned advisory behavior; it is not a recovery, routing, queue,
-  // approval, wakeup, channel, or display-state guarantee.
+  // Observational Memory is not currently enabled through HarnessConfig.
+  // `true` or any enabled object validates and then rejects; `false`, omission,
+  // or `{ enabled: false }` keeps this surface disabled. Configure OM directly
+  // on each Agent Memory instance instead. `session.om.clearOverride()` exists
+  // only to recover old SessionRecords carrying unsupported persisted intent.
   observationalMemory?: ObservationalMemoryConfig;
 
   // Tooling

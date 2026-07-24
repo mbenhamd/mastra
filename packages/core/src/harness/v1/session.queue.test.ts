@@ -392,6 +392,7 @@ describe('Session.queue() — admission', () => {
         toolName: 'shell',
         source: 'parent',
         requestedAt: now,
+        expiresAt: now + 10 * 60 * 1_000,
         queuedItemId,
         payload: { input: { cmd: 'echo hold' } },
       },
@@ -1174,6 +1175,7 @@ describe('Session.queue() — suspension', () => {
           toolName: 'shell',
           source: 'parent',
           requestedAt: now,
+          expiresAt: now + 600_000,
           queuedItemId,
           payload: { input: { cmd: 'echo ok' } },
         },
@@ -1311,9 +1313,11 @@ describe('Session.queue() — suspension', () => {
           toolName: 'shell',
           source: 'parent',
           requestedAt: now,
+          expiresAt: now + 600_000,
           queuedItemId,
           modeId: 'default',
           resumedAt: now,
+          resumeRecoveryAt: now + 30_000,
           payload: { toolName: 'shell', args: { cmd: 'ls' } },
         },
         queueAdmissionReceipts: {
@@ -1395,9 +1399,11 @@ describe('Session.queue() — suspension', () => {
         toolName: 'shell',
         source: 'parent',
         requestedAt: now,
+        expiresAt: now + 600_000,
         queuedItemId,
         modeId: 'default',
         resumedAt: now,
+        resumeRecoveryAt: now + 30_000,
         payload: { input: { cmd: 'ls' } },
       },
       queueAdmissionReceipts: {
@@ -1458,9 +1464,11 @@ describe('Session.queue() — suspension', () => {
         toolName: 'shell',
         source: 'parent',
         requestedAt: now,
+        expiresAt: now + 600_000,
         queuedItemId,
         modeId: 'default',
         resumedAt: now,
+        resumeRecoveryAt: now + 30_000,
         payload: { input: { cmd: 'ls' } },
       },
       queueAdmissionReceipts: {
@@ -1482,9 +1490,16 @@ describe('Session.queue() — suspension', () => {
       },
     }));
 
-    await expect(session.respondToToolApproval({ approved: true, responseId: 'fresh-response' })).rejects.toThrow(
-      'pending resume already responded; no matching inbox response receipt exists',
-    );
+    await expect(
+      session.respondToToolApproval({
+        approved: true,
+        responseId: 'fresh-response',
+        itemId: 'tc-completed-fresh',
+        runId: 'completed-fresh-run',
+        toolCallId: 'tc-completed-fresh',
+        pendingRequestedAt: now,
+      }),
+    ).rejects.toThrow('pending resume already responded; no matching inbox response receipt exists');
 
     expect(agent.resumeCalls).toHaveLength(0);
     expect(session.getRecord().inboxResponseReceipts?.['fresh-response']).toBeUndefined();
@@ -1502,6 +1517,7 @@ describe('Session.queue() — suspension', () => {
       runId: 'shared-run',
       pendingRequestedAt: now,
       response,
+      approvalScope: 'once',
     });
     await (session as any)._flushUpdate((prev: any) => ({
       ...prev,
@@ -1517,6 +1533,7 @@ describe('Session.queue() — suspension', () => {
           toolCallId: 'tc-target',
           pendingRequestedAt: now,
           response,
+          approvalScope: 'once',
           status: 'accepted',
           acceptedAt: now,
           updatedAt: now,
@@ -1541,7 +1558,14 @@ describe('Session.queue() — suspension', () => {
       },
     }));
 
-    const duplicate = await session.respondToToolApproval({ approved: true, responseId: 'target' });
+    const duplicate = await session.respondToToolApproval({
+      approved: true,
+      responseId: 'target',
+      itemId: 'tc-target',
+      runId: 'shared-run',
+      toolCallId: 'tc-target',
+      pendingRequestedAt: now,
+    });
 
     expect(duplicate).toMatchObject({ status: 'accepted', duplicate: true, responseId: 'target' });
     expect(session.getRecord().inboxResponseReceipts?.target).toMatchObject({ status: 'accepted' });
@@ -1587,6 +1611,7 @@ describe('Session.queue() — suspension', () => {
           toolName: 'shell',
           source: 'parent',
           requestedAt: now,
+          expiresAt: now + 600_000,
           payload: { input: { cmd: 'echo ok' } },
         },
         queueAdmissionReceipts: {
@@ -1678,7 +1703,9 @@ describe('Session.queue() — suspension', () => {
           toolName: 'shell',
           source: 'parent',
           requestedAt: staleAt,
+          expiresAt: now + 600_000,
           resumedAt: staleAt,
+          resumeRecoveryAt: staleAt + 30_000,
           queuedItemId,
           payload: { input: { cmd: 'echo ok' } },
         },
@@ -1723,7 +1750,7 @@ describe('Session.queue() — suspension', () => {
     expect(replaySession.getRecord().pendingQueue).toEqual([]);
     expect(replaySession.getRecord().queueAdmissionReceipts?.[queuedItemId]).toMatchObject({
       status: 'failed',
-      error: { code: 'harness.queue_resume_recovery_stale' },
+      error: { code: 'harness.resume_recovery_stale' },
     });
   });
 
@@ -1763,7 +1790,9 @@ describe('Session.queue() — suspension', () => {
         toolName: 'shell',
         source: 'parent',
         requestedAt: staleAt,
+        expiresAt: now + 600_000,
         resumedAt: staleAt,
+        resumeRecoveryAt: staleAt + 30_000,
         queuedItemId: staleId,
         payload: { input: { cmd: 'echo stale' } },
       },
@@ -1794,7 +1823,7 @@ describe('Session.queue() — suspension', () => {
     }));
 
     await expect(session.respondToToolApproval({ approved: true })).rejects.toMatchObject({
-      code: 'harness.queue_resume_recovery_stale',
+      code: 'harness.resume_recovery_stale',
     });
     await session.waitForIdle({ timeoutMs: 1_000 });
 

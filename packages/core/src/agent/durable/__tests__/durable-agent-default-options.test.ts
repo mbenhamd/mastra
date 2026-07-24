@@ -14,6 +14,7 @@ import { MockLanguageModelV2, convertArrayToReadableStream } from '@internal/ai-
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { z } from 'zod';
 import { EventEmitterPubSub } from '../../../events/event-emitter';
+import { MockMemory } from '../../../memory/mock';
 import { MASTRA_VERSIONS_KEY, RequestContext } from '../../../request-context';
 import { createTool } from '../../../tools';
 import { Agent } from '../../agent';
@@ -131,6 +132,98 @@ describe('DurableAgent defaultOptions (#17790)', () => {
   });
 
   describe('prepare() merges defaultOptions into workflow input', () => {
+    it('passes the prepared message snapshot when assembling processor-backed tools', async () => {
+      const base = new Agent({
+        id: 'processor-message-snapshot-agent',
+        name: 'Processor Message Snapshot Agent',
+        instructions: 'You are a test agent',
+        model: model as any,
+      });
+      const getTools = vi.spyOn(base, 'getToolsForExecution');
+      const durableAgent = createDurableAgent({ agent: base });
+
+      const prepared = await durableAgent.prepare('Persist this input');
+
+      expect(getTools).toHaveBeenCalledWith(
+        expect.objectContaining({
+          processorMessages: [
+            expect.objectContaining({
+              role: 'user',
+              content: expect.objectContaining({
+                parts: [expect.objectContaining({ type: 'text', text: 'Persist this input' })],
+              }),
+            }),
+          ],
+        }),
+      );
+      prepared.cleanup();
+    });
+
+    it('does not resolve a tenant-scoped model while constructing the durable wrapper', async () => {
+      let modelResolverCalls = 0;
+      const tenantModel = { ...model, modelId: 'tenant-a-model' };
+      const base = new Agent({
+        id: 'tenant-model-agent',
+        name: 'Tenant Model Agent',
+        instructions: 'You are a test agent',
+        model: ({ requestContext }) => {
+          modelResolverCalls += 1;
+          if (requestContext.get('tenant') !== 'tenant-a') {
+            throw new Error('tenant context is required');
+          }
+          return tenantModel as any;
+        },
+      });
+
+      const durableAgent = createDurableAgent({ agent: base });
+      expect(modelResolverCalls).toBe(0);
+
+      const requestContext = new RequestContext();
+      requestContext.set('tenant', 'tenant-a');
+      const prepared = await durableAgent.prepare('Hello', { requestContext });
+
+      expect(modelResolverCalls).toBe(1);
+      expect(prepared.workflowInput.modelConfig.modelId).toBe('tenant-a-model');
+      prepared.cleanup();
+    });
+
+    it('does not resolve disabled model factories during durable preparation', async () => {
+      let disabledResolverCalls = 0;
+      const enabledModel = new MockLanguageModelV2({
+        doStream: async () => ({
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream: convertArrayToReadableStream([
+            { type: 'stream-start', warnings: [] },
+            { type: 'finish', finishReason: 'stop', usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } },
+          ]),
+        }),
+      });
+      const base = new Agent({
+        id: 'disabled-model-agent',
+        name: 'Disabled Model Agent',
+        instructions: 'You are a test agent',
+        model: [
+          {
+            id: 'disabled',
+            enabled: false,
+            model: (() => {
+              disabledResolverCalls += 1;
+              throw new Error('disabled model must not resolve');
+            }) as any,
+          },
+          { id: 'enabled', enabled: true, model: enabledModel as LanguageModelV2 },
+        ],
+      });
+      const durableAgent = createDurableAgent({ agent: base });
+
+      const prepared = await durableAgent.prepare('Hello');
+
+      expect(disabledResolverCalls).toBe(0);
+      expect(prepared.workflowInput.modelList?.map(entry => entry.id)).toEqual(['enabled']);
+      prepared.cleanup();
+    });
+
     it('serializes the wrapped agent maxSteps into workflowInput', async () => {
       const base = new Agent({
         id: 'base',
@@ -215,6 +308,41 @@ describe('DurableAgent defaultOptions (#17790)', () => {
       expect(workflowInput.options.maxSteps).toBeUndefined();
     });
 
+    it('does not retain default tools in a caller replacement surface', async () => {
+      const adminTool = createTool({
+        id: 'adminTool',
+        description: 'Default-only privileged tool.',
+        inputSchema: z.object({}),
+        execute: async () => ({ ok: true }),
+      });
+      const safeTool = createTool({
+        id: 'safeTool',
+        description: 'Caller replacement tool.',
+        inputSchema: z.object({}),
+        execute: async () => ({ ok: true }),
+      });
+      const base = new Agent({
+        id: 'replacement-defaults-agent',
+        name: 'Replacement Defaults Agent',
+        instructions: 'Test replacement surfaces.',
+        model: model as any,
+        defaultOptions: {
+          toolsetsMode: 'replace',
+          toolsets: { defaults: { adminTool } },
+        },
+      });
+      const durableAgent = createDurableAgent({ agent: base });
+
+      const prepared = await durableAgent.prepare('Hello', {
+        toolsetsMode: 'replace',
+        toolsets: { caller: { safeTool } },
+      });
+
+      expect(Object.keys(durableAgent.runRegistry.getTools(prepared.runId) ?? {})).toEqual(['safeTool']);
+      expect(prepared.workflowInput.options.toolSurfaceFence).toEqual(['safeTool']);
+      prepared.cleanup();
+    });
+
     it('resolves function-valued defaultOptions with the request context', async () => {
       const base = new Agent({
         id: 'base',
@@ -230,6 +358,171 @@ describe('DurableAgent defaultOptions (#17790)', () => {
         requestContext: new RequestContext(),
       } as any);
       expect(workflowInput.options.maxSteps).toBe(99);
+    });
+
+    it('resolves a dynamic model once while preparing many assigned tools', async () => {
+      let modelResolverCalls = 0;
+      const assignedTools = Object.fromEntries(
+        Array.from({ length: 10 }, (_, index) => [
+          `tool${index}`,
+          createTool({
+            id: `tool${index}`,
+            description: `Tool ${index}`,
+            inputSchema: z.object({}),
+            execute: async () => ({ ok: true }),
+          }),
+        ]),
+      );
+      const base = new Agent({
+        id: 'single-model-resolution-agent',
+        name: 'Single Model Resolution Agent',
+        instructions: 'Test model resolution.',
+        model: () => {
+          modelResolverCalls += 1;
+          return model as any;
+        },
+        tools: assignedTools,
+      });
+      const durableAgent = createDurableAgent({ agent: base });
+      modelResolverCalls = 0;
+
+      const prepared = await durableAgent.prepare('Hello');
+
+      expect(modelResolverCalls).toBe(1);
+      expect(Object.keys(durableAgent.runRegistry.getTools(prepared.runId) ?? {})).toHaveLength(10);
+      prepared.cleanup();
+    });
+
+    it('resolves a dynamic input-processor factory once for the whole durable preparation boundary', async () => {
+      const inputProcessorResolver = vi.fn(() => []);
+      const base = new Agent({
+        id: 'single-processor-resolution-agent',
+        name: 'Single Processor Resolution Agent',
+        instructions: 'Test processor resolution.',
+        model: model as any,
+        inputProcessors: inputProcessorResolver,
+      });
+      const durableAgent = createDurableAgent({ agent: base });
+
+      const prepared = await durableAgent.prepare('Hello');
+
+      expect(inputProcessorResolver).toHaveBeenCalledTimes(1);
+      prepared.cleanup();
+    });
+
+    it('resolves a dynamic model once for standalone tool assembly', async () => {
+      let modelResolverCalls = 0;
+      const assignedTools = Object.fromEntries(
+        Array.from({ length: 10 }, (_, index) => [
+          `standaloneTool${index}`,
+          createTool({
+            id: `standaloneTool${index}`,
+            description: `Standalone tool ${index}`,
+            inputSchema: z.object({}),
+            execute: async () => ({ ok: true }),
+          }),
+        ]),
+      );
+      const base = new Agent({
+        id: 'standalone-single-model-resolution-agent',
+        name: 'Standalone Single Model Resolution Agent',
+        instructions: 'Test standalone model resolution.',
+        model: () => {
+          modelResolverCalls += 1;
+          return model as any;
+        },
+        tools: assignedTools,
+      });
+      modelResolverCalls = 0;
+
+      const tools = await base.getToolsForExecution({});
+
+      expect(modelResolverCalls).toBe(1);
+      expect(Object.keys(tools)).toHaveLength(10);
+    });
+
+    it('fails closed before provider execution when an input processor throws', async () => {
+      let providerCalls = 0;
+      const providerModel = new MockLanguageModelV2({
+        doStream: async () => {
+          providerCalls += 1;
+          throw new Error('provider must not run');
+        },
+      });
+      const memory = new MockMemory();
+      const base = new Agent({
+        id: 'processor-admission-agent',
+        name: 'Processor Admission Agent',
+        instructions: 'Test processor admission.',
+        model: providerModel,
+        memory,
+        inputProcessors: [
+          {
+            id: 'failing-security-processor',
+            processInput: () => {
+              throw new Error('security policy backend unavailable');
+            },
+          },
+        ],
+      });
+      const durableAgent = createDurableAgent({ agent: base });
+
+      await expect(
+        durableAgent.stream('Hello', {
+          memory: { thread: 'processor-failure-thread', resource: 'resource-1' },
+        }),
+      ).rejects.toMatchObject({ id: 'AGENT_INPUT_PROCESSOR_ERROR' });
+
+      expect(providerCalls).toBe(0);
+      await expect(memory.getThreadById({ threadId: 'processor-failure-thread' })).resolves.toBeNull();
+    });
+
+    it('fails closed before provider execution when the assigned tool surface cannot resolve', async () => {
+      let providerCalls = 0;
+      const providerModel = new MockLanguageModelV2({
+        doStream: async () => {
+          providerCalls += 1;
+          throw new Error('provider must not run');
+        },
+      });
+      const base = new Agent({
+        id: 'tool-admission-agent',
+        name: 'Tool Admission Agent',
+        instructions: 'Test tool admission.',
+        model: providerModel,
+        tools: () => {
+          throw new Error('connector and tool policy service unavailable');
+        },
+      });
+      const durableAgent = createDurableAgent({ agent: base });
+
+      await expect(durableAgent.stream('Hello')).rejects.toMatchObject({ id: 'AGENT_TOOL_RESOLUTION_ERROR' });
+      expect(providerCalls).toBe(0);
+    });
+
+    it('rolls back a newly created memory thread when dynamic model resolution fails', async () => {
+      const memory = new MockMemory();
+      let rejectModelResolution = false;
+      const base = new Agent({
+        id: 'model-resolution-rollback-agent',
+        name: 'Model Resolution Rollback Agent',
+        instructions: 'Test preparation rollback.',
+        model: () => {
+          if (rejectModelResolution) throw new Error('dynamic model registry unavailable');
+          return model as any;
+        },
+        memory,
+      });
+      const durableAgent = createDurableAgent({ agent: base });
+      rejectModelResolution = true;
+
+      await expect(
+        durableAgent.stream('Hello', {
+          memory: { thread: 'model-failure-thread', resource: 'resource-1' },
+        }),
+      ).rejects.toThrow('dynamic model registry unavailable');
+
+      await expect(memory.getThreadById({ threadId: 'model-failure-thread' })).resolves.toBeNull();
     });
   });
 

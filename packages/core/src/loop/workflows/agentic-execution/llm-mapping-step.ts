@@ -4,9 +4,11 @@ import { sanitizeToolName } from '../../../agent/message-list/utils/tool-name';
 import { createObservabilityContext, EntityType, SpanType } from '../../../observability';
 import type { ProcessorState } from '../../../processors';
 import { ProcessorRunner, outputProcessorsSupportStream } from '../../../processors/runner';
+import { DefaultStepResult } from '../../../stream/aisdk/v5/output-helpers';
 import type { ChunkType, ProviderMetadata } from '../../../stream/types';
 import { ChunkFrom } from '../../../stream/types';
 import {
+  toolPayloadTransformAllowsTerminalToolResult,
   transformToolPayloadForTargets,
   withToolPayloadTransformMetadata,
   withToolPayloadTransformProviderMetadata,
@@ -16,6 +18,7 @@ import { createStep } from '../../../workflows/workflow';
 import { readScoped, writeScoped } from '../../run-scope-access';
 import type { RunScopeContext } from '../../run-scope-access';
 import { DELEGATION_BAILED_KEY, STEP_TOOLS_KEY, TOOL_PAYLOAD_TRANSFORM_KEY } from '../../run-scope-keys';
+import { outputProcessorsAllowTerminalToolResult, resolveTerminalToolResult } from '../../shared/terminal-tool-result';
 import type { OuterLLMRun } from '../../types';
 import { deserializeToolError } from '../errors';
 import { llmIterationOutputSchema, toolCallOutputSchema } from '../schema';
@@ -58,10 +61,12 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
   const streamWriter = rest.outputWriter
     ? { custom: async (data: { type: string }) => rest.outputWriter(data as ChunkType<OUTPUT>) }
     : undefined;
-
   // Helper function to process a chunk through output processors and enqueue it.
   // Returns the processed chunk, or null if the chunk was blocked by a processor.
-  async function processAndEnqueueChunk(chunk: ChunkType<OUTPUT>): Promise<ChunkType<OUTPUT> | null> {
+  async function processAndEnqueueChunk(
+    chunk: ChunkType<OUTPUT>,
+    terminalResolutionState: { toolResultBlocked: boolean },
+  ): Promise<ChunkType<OUTPUT> | null> {
     if (processorRunner && rest.processorStates) {
       const {
         part: processed,
@@ -93,6 +98,7 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
 
       if (blocked) {
         // Emit a tripwire chunk so downstream knows about the abort
+        terminalResolutionState.toolResultBlocked = true;
         enqueueTripwire(reason, tripwireOptions, processorId);
         return null;
       }
@@ -114,6 +120,7 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
       );
       for (const r of reprocessed) {
         if (r.blocked) {
+          terminalResolutionState.toolResultBlocked = true;
           enqueueTripwire(r.reason, r.tripwireOptions, r.processorId);
           return processed ? (processed as ChunkType<OUTPUT>) : null;
         }
@@ -135,7 +142,39 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
     inputSchema: z.array(toolCallOutputSchema),
     outputSchema: llmIterationOutputSchema,
     execute: async ({ inputData, getStepResult, bail }) => {
+      // Per-execution state: one Agent/workflow instance can serve concurrent
+      // runs, so terminal eligibility must never live in a shared closure.
+      const terminalResolutionState = { toolResultBlocked: false };
       const initialResult = getStepResult(llmExecutionStep);
+
+      /**
+       * llm-execution-step creates the latest StepResult before local tools run.
+       * Once this mapping step persists their result, error, or denial on the
+       * MessageList, rebuild that result so the next processInputStep call sees
+       * the completed tool interaction through the documented StepResult
+       * `toolCalls`/`toolResults` accessors.
+       */
+      const refreshLatestStepResult = () => {
+        const steps = initialResult?.output?.steps;
+        if (!Array.isArray(steps) || steps.length === 0) return;
+
+        const latestStep = steps.at(-1);
+        if (!latestStep) return;
+
+        steps[steps.length - 1] = new DefaultStepResult({
+          content: rest.messageList.get.response.aiV5.modelContent(steps.length),
+          finishReason: latestStep.finishReason,
+          providerMetadata: latestStep.providerMetadata,
+          request: latestStep.request,
+          response: {
+            ...latestStep.response,
+            messages: rest.messageList.get.response.aiV5.model(),
+          },
+          tripwire: latestStep.tripwire,
+          usage: latestStep.usage,
+          warnings: latestStep.warnings,
+        });
+      };
 
       /**
        * Compute toModelOutput for a successful tool call and return providerMetadata
@@ -378,7 +417,7 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
             providerExecuted: toolCall.providerExecuted,
           },
         };
-        const processed = await processAndEnqueueChunk(chunk);
+        const processed = await processAndEnqueueChunk(chunk, terminalResolutionState);
         if (processed) await rest.options?.onChunk?.(processed);
       };
       const persistResolvedToolCall = (
@@ -448,7 +487,7 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
               { ...toolCall, error: reifiedError },
               'error',
             );
-            const processed = await processAndEnqueueChunk(chunk);
+            const processed = await processAndEnqueueChunk(chunk, terminalResolutionState);
             if (processed) await rest.options?.onChunk?.(processed);
 
             persistResolvedToolCall(toolCall, {
@@ -535,7 +574,7 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
                 toolCall,
                 'output-available',
               );
-              const processed = await processAndEnqueueChunk(chunk);
+              const processed = await processAndEnqueueChunk(chunk, terminalResolutionState);
               if (processed) await rest.options?.onChunk?.(processed);
 
               if (!toolCall.providerExecuted) {
@@ -570,6 +609,7 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
           // so the model will see them and can retry with correct tool names
           initialResult.stepResult.isContinued = true;
           initialResult.stepResult.reason = 'tool-calls';
+          refreshLatestStepResult();
           return {
             ...initialResult,
             messages: {
@@ -588,6 +628,7 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
         }
 
         // Update messages field to include any error messages we added to messageList
+        refreshLatestStepResult();
         return bail({
           ...initialResult,
           messages: {
@@ -638,7 +679,7 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
             'output-available',
           );
 
-          const processed = await processAndEnqueueChunk(chunk);
+          const processed = await processAndEnqueueChunk(chunk, terminalResolutionState);
           if (processed) await rest.options?.onChunk?.(processed);
 
           // Exclude provider-executed tools — these are handled by llm-execution-step
@@ -676,8 +717,33 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
           rest.requestContext.set('__mastra_delegationBailed', false);
         }
 
+        const stepTools = readScoped(scopeCtx, STEP_TOOLS_KEY, 'stepTools') as ToolSet | undefined;
+        const toolPayloadTransform = readScoped(scopeCtx, TOOL_PAYLOAD_TRANSFORM_KEY, 'toolPayloadTransform');
+        const terminalDeliveryIsSafe =
+          outputProcessorsAllowTerminalToolResult(rest.outputProcessors) &&
+          toolPayloadTransformAllowsTerminalToolResult(toolPayloadTransform) &&
+          // A terminal envelope replaces the ordinary assistant answer. If the
+          // provider already streamed user-visible text in this run, stopping
+          // here would make live delivery (preamble + terminal value) disagree
+          // with persisted/materialized output (terminal value only).
+          !(typeof initialResult.output?.text === 'string' && initialResult.output.text.length > 0);
+        const terminalToolResult =
+          rest.options?.abortSignal?.aborted || terminalResolutionState.toolResultBlocked || !terminalDeliveryIsSafe
+            ? undefined
+            : await resolveTerminalToolResult({
+                calls: inputData,
+                tools: stepTools,
+                fallbackTools: rest.tools,
+                runId: rest.runId,
+                abortSignal: rest.options?.abortSignal,
+                onPolicyFailure: error =>
+                  rest.logger?.warn?.(`[TerminalToolResult] ${error.message}`, { runId: rest.runId }),
+              });
+
+        refreshLatestStepResult();
         return {
           ...initialResult,
+          ...(terminalToolResult ? { terminalToolResult } : {}),
           messages: {
             all: rest.messageList.get.all.aiV5.model(),
             user: rest.messageList.get.input.aiV5.model(),

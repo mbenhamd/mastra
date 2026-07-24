@@ -45,16 +45,17 @@ import {
   TABLE_HARNESS_WORKSPACE_ACTIONS,
   TABLE_SCHEMAS,
   applyPlanTaskPatch,
+  assertPlanTaskCreateIdempotencyInput,
   decodePlanTaskCursor,
   encodePlanTaskCursor,
   getSqlType,
+  normalizePendingInteractionDueScanInput,
   walkPlanTaskSubtree,
 } from '@mastra/core/storage';
 import type {
   AcquireSessionLeaseInput,
   AgentSignalDispatchState,
   AgentSignalResultEvidence,
-  AgentSignalResultStatus,
   AppendWorkspaceActionJournalEntryResult,
   AttachmentReference,
   AttachmentRecord,
@@ -101,6 +102,8 @@ import type {
   HarnessSessionEventReplayState,
   ListActiveSessionsByThreadInput,
   ListChannelDiagnosticsInput,
+  ListDuePendingInteractionsInput,
+  ListDuePendingInteractionsResult,
   ListSessionsByThreadInput,
   ListSessionsInput,
   ListWorkspaceActionJournalInput,
@@ -108,6 +111,8 @@ import type {
   JsonValue,
   OperationAdmissionEvidence,
   OperationAdmissionTombstone,
+  PendingInteractionExpiryGeneration,
+  PendingResume,
   ProviderCallbackSelectorKind,
   QueueAdmissionReceipt,
   ReleaseSessionLeaseInput,
@@ -138,6 +143,35 @@ import { LibSQLDB, resolveClient } from '../../db';
 import type { LibSQLDomainConfig } from '../../db';
 
 type HarnessWakeupClaimStatus = Extract<HarnessWakeupItem['status'], 'due' | 'claimed' | 'failed'>;
+type HarnessLibSQLConfig = LibSQLDomainConfig & { transactionalInit?: boolean };
+
+// Multiple HarnessLibSQL instances can share one local file (for example when
+// separate Mastra instances start in one Node process). Beginning a synchronous
+// SQLite write transaction on a second client can block the event loop while
+// the first client is waiting to continue and commit. Serialize only the local
+// migration critical section by SQLite's canonical main-database path. Separate
+// processes remain coordinated by SQLite's own file lock and busy timeout.
+const localHarnessInitLocks = new Map<string, Promise<void>>();
+
+async function withLocalHarnessInitLock<T>(databasePath: string, fn: () => Promise<T>): Promise<T> {
+  const previous = localHarnessInitLocks.get(databasePath) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>(resolve => {
+    release = resolve;
+  });
+  const queued = previous.catch(() => undefined).then(() => current);
+  localHarnessInitLocks.set(databasePath, queued);
+
+  await previous.catch(() => undefined);
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (localHarnessInitLocks.get(databasePath) === queued) {
+      localHarnessInitLocks.delete(databasePath);
+    }
+  }
+}
 
 /**
  * LibSQL `HarnessStorage` adapter.
@@ -156,6 +190,10 @@ export class HarnessLibSQL extends HarnessStorage {
   #db: LibSQLDB;
   #client: Client;
   #harnessName: string;
+  #transactionalInit: boolean;
+  #maxRetries: number | undefined;
+  #initialBackoffMs: number | undefined;
+  #schemaTransactionActive = false;
   #compactionLocks = new Map<string, Promise<void>>();
   #sessionEventsReady: Promise<void> | undefined;
   #workspaceActionsReady: Promise<void> | undefined;
@@ -169,11 +207,16 @@ export class HarnessLibSQL extends HarnessStorage {
   #wakeupIndexesReady: Promise<void> | undefined;
   #localThreadDeleteFences = new Map<string, { ownerId: string; leaseId: string; ttlMs: number }>();
 
-  constructor(config: LibSQLDomainConfig) {
+  constructor(config: HarnessLibSQLConfig) {
     super();
     const client = resolveClient(config);
     this.#client = client;
     this.#harnessName = (config as LibSQLDomainConfig & { harnessName?: string }).harnessName ?? 'default';
+    this.#transactionalInit =
+      config.transactionalInit ??
+      ('url' in config && config.url.startsWith('file:') && !config.url.includes(':memory:'));
+    this.#maxRetries = config.maxRetries;
+    this.#initialBackoffMs = config.initialBackoffMs;
     this.#db = new LibSQLDB({
       client,
       maxRetries: config.maxRetries,
@@ -182,6 +225,80 @@ export class HarnessLibSQL extends HarnessStorage {
   }
 
   async init(): Promise<void> {
+    // Each local SQLite DDL statement otherwise commits independently. Harness
+    // currently owns enough tables and indexes that a fresh file pays dozens of
+    // filesystem sync barriers during startup. Run the existing migration path
+    // unchanged inside one transaction so schema creation/backfills are
+    // atomic and require one commit. Remote clients retain their existing
+    // behavior; their transaction and concurrency characteristics are provider
+    // controlled rather than local filesystem bound.
+    const localFilePath = this.#transactionalInit ? await this.#localPersistentFilePath() : undefined;
+    if (localFilePath !== undefined) {
+      await withLocalHarnessInitLock(localFilePath, () =>
+        this.#db.executeWriteOperationWithRetry(
+          () => this.#initLocalTransaction(),
+          'initialize Harness storage schema',
+        ),
+      );
+      return;
+    }
+
+    await this.#initOnCurrentClient();
+  }
+
+  async #localPersistentFilePath(): Promise<string | undefined> {
+    if (this.#client.protocol !== 'file') return undefined;
+
+    // Persistent files benefit from collapsing filesystem sync barriers;
+    // in-memory databases do not. PRAGMA database_list is the public SQLite way
+    // to distinguish the two even when callers inject an already-created Client
+    // instead of passing its URL to this adapter.
+    const databases = await this.#client.execute('PRAGMA database_list');
+    const main = databases.rows.find(row => String(row.name) === 'main');
+    return typeof main?.file === 'string' && main.file.length > 0 ? main.file : undefined;
+  }
+
+  async #initLocalTransaction(): Promise<void> {
+    // Use explicit SQL boundaries on the existing connection. The libSQL
+    // transaction() API detaches that connection from the Client, which would
+    // discard LibSQLStore's connection-local pragmas and retain WAL sidecars
+    // until the detached transaction object is collected.
+    await this.#client.execute('BEGIN IMMEDIATE');
+    const transactionalStorage = new HarnessLibSQL({
+      client: this.#client,
+      maxRetries: this.#maxRetries,
+      initialBackoffMs: this.#initialBackoffMs,
+    });
+    transactionalStorage.#harnessName = this.#harnessName;
+    transactionalStorage.#schemaTransactionActive = true;
+
+    try {
+      await transactionalStorage.#initOnCurrentClient();
+      await this.#client.execute('COMMIT');
+    } catch (error) {
+      // Preserve the initialization error. ROLLBACK can itself fail when
+      // SQLite already closed the transaction after a failed statement.
+      await this.#client.execute('ROLLBACK').catch(() => undefined);
+      throw error;
+    }
+
+    this.#adoptInitializationState(transactionalStorage);
+  }
+
+  #adoptInitializationState(initialized: HarnessLibSQL): void {
+    this.#sessionEventsReady = initialized.#sessionEventsReady;
+    this.#workspaceActionsReady = initialized.#workspaceActionsReady;
+    this.#planTasksReady = initialized.#planTasksReady;
+    this.#runSummariesReady = initialized.#runSummariesReady;
+    this.#providerCallbackBindingIndexesReady = initialized.#providerCallbackBindingIndexesReady;
+    this.#channelInboxIndexesReady = initialized.#channelInboxIndexesReady;
+    this.#channelBindingIndexesReady = initialized.#channelBindingIndexesReady;
+    this.#channelActionIndexesReady = initialized.#channelActionIndexesReady;
+    this.#channelOutboxIndexesReady = initialized.#channelOutboxIndexesReady;
+    this.#wakeupIndexesReady = initialized.#wakeupIndexesReady;
+  }
+
+  async #initOnCurrentClient(): Promise<void> {
     const sessionsConfig = TABLE_CONFIGS[TABLE_HARNESS_SESSIONS];
     await this.#db.createTable({
       tableName: TABLE_HARNESS_SESSIONS,
@@ -240,8 +357,14 @@ export class HarnessLibSQL extends HarnessStorage {
         'subagent_depth',
         'subagent_type_id',
         'subagent_tool_allowlist_scoped',
+        'permission_rules_seed_hash',
+        'current_run',
+        'assistant_drafts',
+        'cancel_request',
+        'pending_resume_expires_at',
         'queue_admission_receipts',
         'inbox_response_receipts',
+        'expired_pending_interactions',
         'closing_at',
         'close_deadline_at',
       ],
@@ -268,6 +391,7 @@ export class HarnessLibSQL extends HarnessStorage {
       ifNotExists: ['harness_name'],
     });
     await this.#backfillHarnessNamespace();
+    await this.#backfillPendingResumeExpiry();
     await this.#assertNoDuplicateActiveSessions();
     await this.#backfillAttachmentMetadata();
     await this.#ensureHarnessPrimaryKeys();
@@ -305,6 +429,12 @@ export class HarnessLibSQL extends HarnessStorage {
       // without this index each recursion level / listing seq-scans the sessions table.
       sql: `CREATE INDEX IF NOT EXISTS idx_harness_sessions_parent
             ON "${TABLE_HARNESS_SESSIONS}" ("harness_name", "parent_session_id")`,
+      args: [],
+    });
+    await this.#client.execute({
+      sql: `CREATE INDEX IF NOT EXISTS idx_harness_sessions_pending_resume_expiry
+            ON "${TABLE_HARNESS_SESSIONS}" ("harness_name", "pending_resume_expires_at", "id")
+            WHERE "pending_resume_expires_at" IS NOT NULL`,
       args: [],
     });
   }
@@ -470,6 +600,38 @@ export class HarnessLibSQL extends HarnessStorage {
     });
 
     return result.rows.map(row => rowToSummary(row as Record<string, unknown>));
+  }
+
+  async listDuePendingInteractions(input: ListDuePendingInteractionsInput): Promise<ListDuePendingInteractionsResult> {
+    const { now, limit, cursor } = normalizePendingInteractionDueScanInput(input);
+    const conditions = [
+      'harness_name = ?',
+      'closed_at IS NULL',
+      'pending_resume_expires_at IS NOT NULL',
+      'pending_resume_expires_at <= ?',
+    ];
+    const args: (string | number)[] = [this.#resolveHarnessName(input.harnessName), now];
+    if (cursor !== undefined) {
+      conditions.push('(pending_resume_expires_at > ? OR (pending_resume_expires_at = ? AND id > ?))');
+      args.push(cursor.dueAt, cursor.dueAt, cursor.sessionId);
+    }
+    args.push(limit + 1);
+
+    const result = await this.#client.execute({
+      sql: `SELECT harness_name, id, resource_id, pending_resume, pending_resume_expires_at
+            FROM ${TABLE_HARNESS_SESSIONS}
+            WHERE ${conditions.join(' AND ')}
+            ORDER BY pending_resume_expires_at ASC, id ASC
+            LIMIT ?`,
+      args,
+    });
+    const generations = result.rows.map(row => rowToPendingInteractionExpiryGeneration(row as Record<string, unknown>));
+    const items = generations.slice(0, limit);
+    const last = items.at(-1);
+    return {
+      items,
+      ...(generations.length > limit && last ? { nextCursor: { dueAt: last.dueAt, sessionId: last.sessionId } } : {}),
+    };
   }
 
   async withThreadDeleteFence<T>(
@@ -1464,7 +1626,7 @@ export class HarnessLibSQL extends HarnessStorage {
     resourceId: string;
     threadId: string;
     signalId: string;
-  }): Promise<AgentSignalResultStatus | OperationAdmissionTombstone | null> {
+  }): Promise<AgentSignalResultEvidence | OperationAdmissionTombstone | null> {
     const namespace = this.#resolveHarnessName(harnessName);
     await this.#ensureMessageResultsTable();
     const retainedResult = await this.#client.execute({
@@ -2008,8 +2170,8 @@ export class HarnessLibSQL extends HarnessStorage {
     const leaseExpiresAt = row.lease_expires_at == null ? undefined : Number(row.lease_expires_at);
     const now = Date.now();
     const leaseHeld = ownerId !== undefined && leaseExpiresAt !== undefined && leaseExpiresAt > now;
-    if (leaseHeld && ownerId !== fence.ownerId) {
-      throw new HarnessStorageLeaseConflictError(fence.sessionId, ownerId, leaseExpiresAt ?? 0);
+    if (!leaseHeld || ownerId !== fence.ownerId) {
+      throw new HarnessStorageLeaseConflictError(fence.sessionId, ownerId ?? '<unowned>', leaseExpiresAt ?? 0);
     }
     const version = Number(row.version);
     if (version !== fence.ifSessionVersion) {
@@ -2038,6 +2200,7 @@ export class HarnessLibSQL extends HarnessStorage {
     sessionId: string,
     task: HarnessPlanTask,
   ): Promise<HarnessPlanTask> {
+    assertPlanTaskCreateIdempotencyInput(task);
     if (task.idempotencyKey !== undefined) {
       const existing = await tx.execute({
         sql: `SELECT * FROM ${TABLE_HARNESS_PLAN_TASKS}
@@ -4939,7 +5102,7 @@ export class HarnessLibSQL extends HarnessStorage {
         await this.#db.alterTable({
           tableName: TABLE_HARNESS_PLAN_TASKS,
           schema: TABLE_SCHEMAS[TABLE_HARNESS_PLAN_TASKS],
-          ifNotExists: ['delegated_subagent_type_id', 'started_at'],
+          ifNotExists: ['delegated_subagent_type_id', 'started_at', 'idempotency_input_hash'],
         });
       } catch (error) {
         const cause = (error as { cause?: unknown })?.cause ?? error;
@@ -5301,6 +5464,69 @@ export class HarnessLibSQL extends HarnessStorage {
     }
   }
 
+  async #backfillPendingResumeExpiry(): Promise<void> {
+    // Keep the derived discovery column empty for terminal/incomplete rows. It
+    // stores the next durable action: unanswered interaction expiry, or the
+    // stale-recovery deadline for an admitted resume.
+    await this.#client.execute({
+      sql: `UPDATE ${TABLE_HARNESS_SESSIONS}
+            SET pending_resume_expires_at = NULL
+            WHERE pending_resume_expires_at IS NOT NULL
+              AND (
+                closed_at IS NOT NULL
+                OR pending_resume IS NULL
+                OR COALESCE(json_type(pending_resume, '$.itemId'), '') <> 'text'
+                OR length(json_extract(pending_resume, '$.itemId')) = 0
+                OR (
+                  json_extract(pending_resume, '$.resumedAt') IS NULL
+                  AND (
+                    COALESCE(json_type(pending_resume, '$.expiresAt'), '') <> 'integer'
+                    OR CAST(json_extract(pending_resume, '$.expiresAt') AS INTEGER) NOT BETWEEN 0 AND 9007199254740991
+                  )
+                )
+                OR (
+                  json_extract(pending_resume, '$.resumedAt') IS NOT NULL
+                  AND (
+                    COALESCE(json_type(pending_resume, '$.resumedAt'), '') <> 'integer'
+                    OR CAST(json_extract(pending_resume, '$.resumedAt') AS INTEGER) NOT BETWEEN 0 AND 9007199254740991
+                    OR COALESCE(json_type(pending_resume, '$.resumeRecoveryAt'), '') <> 'integer'
+                    OR CAST(json_extract(pending_resume, '$.resumeRecoveryAt') AS INTEGER)
+                      NOT BETWEEN CAST(json_extract(pending_resume, '$.resumedAt') AS INTEGER) AND 9007199254740991
+                  )
+                )
+              )`,
+      args: [],
+    });
+    await this.#client.execute({
+      sql: `UPDATE ${TABLE_HARNESS_SESSIONS}
+            SET pending_resume_expires_at = CASE
+              WHEN json_extract(pending_resume, '$.resumedAt') IS NULL
+                THEN CAST(json_extract(pending_resume, '$.expiresAt') AS INTEGER)
+              ELSE CAST(json_extract(pending_resume, '$.resumeRecoveryAt') AS INTEGER)
+            END
+            WHERE pending_resume_expires_at IS NULL
+              AND closed_at IS NULL
+              AND pending_resume IS NOT NULL
+              AND json_type(pending_resume, '$.itemId') = 'text'
+              AND length(json_extract(pending_resume, '$.itemId')) > 0
+              AND (
+                (
+                  json_extract(pending_resume, '$.resumedAt') IS NULL
+                  AND json_type(pending_resume, '$.expiresAt') = 'integer'
+                  AND CAST(json_extract(pending_resume, '$.expiresAt') AS INTEGER) BETWEEN 0 AND 9007199254740991
+                )
+                OR (
+                  json_type(pending_resume, '$.resumedAt') = 'integer'
+                  AND CAST(json_extract(pending_resume, '$.resumedAt') AS INTEGER) BETWEEN 0 AND 9007199254740991
+                  AND json_type(pending_resume, '$.resumeRecoveryAt') = 'integer'
+                  AND CAST(json_extract(pending_resume, '$.resumeRecoveryAt') AS INTEGER)
+                    BETWEEN CAST(json_extract(pending_resume, '$.resumedAt') AS INTEGER) AND 9007199254740991
+                )
+              )`,
+      args: [],
+    });
+  }
+
   async #ensureHarnessPrimaryKeys(): Promise<void> {
     await this.#rebuildTableIfPrimaryKeyMismatch(TABLE_HARNESS_SESSIONS, ['harness_name', 'id']);
     await this.#rebuildTableIfPrimaryKeyMismatch(TABLE_HARNESS_ATTACHMENTS, [
@@ -5328,23 +5554,27 @@ export class HarnessLibSQL extends HarnessStorage {
     const columns = Object.keys(schema);
     const quotedColumns = columns.map(quoteIdentifier).join(', ');
 
-    await this.#client.batch(
-      [
-        { sql: `DROP TABLE IF EXISTS ${quoteIdentifier(tempTableName)}`, args: [] },
-        { sql: buildCreateTableSql(tempTableName, schema, primaryKey), args: [] },
-        {
-          sql: `INSERT INTO ${quoteIdentifier(tempTableName)} (${quotedColumns})
-                SELECT ${quotedColumns} FROM ${quoteIdentifier(tableName)}`,
-          args: [],
-        },
-        { sql: `DROP TABLE ${quoteIdentifier(tableName)}`, args: [] },
-        {
-          sql: `ALTER TABLE ${quoteIdentifier(tempTableName)} RENAME TO ${quoteIdentifier(tableName)}`,
-          args: [],
-        },
-      ],
-      'write',
-    );
+    const statements = [
+      { sql: `DROP TABLE IF EXISTS ${quoteIdentifier(tempTableName)}`, args: [] },
+      { sql: buildCreateTableSql(tempTableName, schema, primaryKey), args: [] },
+      {
+        sql: `INSERT INTO ${quoteIdentifier(tempTableName)} (${quotedColumns})
+              SELECT ${quotedColumns} FROM ${quoteIdentifier(tableName)}`,
+        args: [],
+      },
+      { sql: `DROP TABLE ${quoteIdentifier(tableName)}`, args: [] },
+      {
+        sql: `ALTER TABLE ${quoteIdentifier(tempTableName)} RENAME TO ${quoteIdentifier(tableName)}`,
+        args: [],
+      },
+    ];
+    if (this.#schemaTransactionActive) {
+      for (const statement of statements) {
+        await this.#client.execute(statement);
+      }
+      return;
+    }
+    await this.#client.batch(statements, 'write');
   }
 
   async #primaryKeyColumns(tableName: string): Promise<string[]> {
@@ -5439,12 +5669,17 @@ const SESSION_COLUMN_NAMES = [
   'model_id',
   'subagent_model_overrides',
   'permission_rules',
+  'permission_rules_seed_hash',
   'session_grants',
   'token_usage',
   'pending_queue',
   'pending_resume',
+  'current_run',
+  'assistant_drafts',
+  'pending_resume_expires_at',
   'queue_admission_receipts',
   'inbox_response_receipts',
+  'expired_pending_interactions',
   'observational_memory',
   'goal',
   'workspace',
@@ -5457,7 +5692,87 @@ const SESSION_COLUMN_NAMES = [
   'version',
   'owner_id',
   'lease_expires_at',
+  'cancel_request',
 ] as const;
+
+function pendingResumeExpiryIndexValue(record: SessionRecord): number | null {
+  const pending = record.pendingResume;
+  if (record.closedAt !== undefined || !isDueScannablePendingResume(pending)) {
+    return null;
+  }
+  return pendingResumeDueAt(pending);
+}
+
+function rowToPendingInteractionExpiryGeneration(row: Record<string, unknown>): PendingInteractionExpiryGeneration {
+  const pending = parseJson(row.pending_resume) as PendingResume | undefined;
+  const indexedExpiresAt = Number(row.pending_resume_expires_at);
+  if (!isDueScannablePendingResume(pending) || pendingResumeDueAt(pending) !== indexedExpiresAt) {
+    throw new Error(
+      `Corrupt pending-interaction expiry index for harness "${String(row.harness_name)}" session "${String(row.id)}"`,
+    );
+  }
+  return {
+    harnessName: String(row.harness_name),
+    sessionId: String(row.id),
+    resourceId: String(row.resource_id),
+    kind: pending.kind,
+    itemId: pending.itemId,
+    runId: pending.runId,
+    toolCallId: pending.toolCallId,
+    requestedAt: pending.requestedAt,
+    dueAt: indexedExpiresAt,
+    expiresAt: pending.expiresAt,
+    ...(pending.expiryStartedAt !== undefined ? { expiryStartedAt: pending.expiryStartedAt } : {}),
+    ...(pending.resumedAt !== undefined ? { resumedAt: pending.resumedAt } : {}),
+    ...(pending.resumeRecoveryAt !== undefined ? { resumeRecoveryAt: pending.resumeRecoveryAt } : {}),
+    ...(pending.resumeRecoveryStartedAt !== undefined
+      ? { resumeRecoveryStartedAt: pending.resumeRecoveryStartedAt }
+      : {}),
+  };
+}
+
+function isDueScannablePendingResume(
+  pending: PendingResume | undefined,
+): pending is PendingResume & { itemId: string } {
+  return (
+    pending !== undefined &&
+    isPendingResumeKind(pending.kind) &&
+    typeof pending.itemId === 'string' &&
+    pending.itemId.length > 0 &&
+    typeof pending.runId === 'string' &&
+    pending.runId.length > 0 &&
+    typeof pending.toolCallId === 'string' &&
+    pending.toolCallId.length > 0 &&
+    Number.isSafeInteger(pending.requestedAt) &&
+    pending.requestedAt >= 0 &&
+    Number.isSafeInteger(pending.expiresAt) &&
+    pending.expiresAt >= 0 &&
+    (pending.expiryStartedAt === undefined ||
+      (Number.isSafeInteger(pending.expiryStartedAt) && pending.expiryStartedAt >= 0)) &&
+    (pending.resumedAt === undefined
+      ? pending.resumeRecoveryAt === undefined && pending.resumeRecoveryStartedAt === undefined
+      : Number.isSafeInteger(pending.resumedAt) &&
+        pending.resumedAt >= 0 &&
+        Number.isSafeInteger(pending.resumeRecoveryAt) &&
+        pending.resumeRecoveryAt! >= pending.resumedAt &&
+        (pending.resumeRecoveryStartedAt === undefined ||
+          (Number.isSafeInteger(pending.resumeRecoveryStartedAt) && pending.resumeRecoveryStartedAt >= 0)))
+  );
+}
+
+function pendingResumeDueAt(pending: PendingResume & { itemId: string }): number {
+  return pending.resumedAt === undefined ? pending.expiresAt : pending.resumeRecoveryAt!;
+}
+
+function isPendingResumeKind(value: unknown): value is PendingResume['kind'] {
+  return (
+    value === 'tool-approval' ||
+    value === 'tool-suspension' ||
+    value === 'question' ||
+    value === 'plan-approval' ||
+    value === 'sandbox-access'
+  );
+}
 
 function sessionColumnValues(record: SessionRecord, version: number): { names: string[]; values: any[] } {
   const values = [
@@ -5475,12 +5790,17 @@ function sessionColumnValues(record: SessionRecord, version: number): { names: s
     record.modelId,
     JSON.stringify(record.subagentModelOverrides ?? {}),
     JSON.stringify(record.permissionRules),
+    record.permissionRulesSeedHash ?? null,
     JSON.stringify(record.sessionGrants),
     JSON.stringify(record.tokenUsage),
     JSON.stringify(record.pendingQueue),
     record.pendingResume ? JSON.stringify(record.pendingResume) : null,
+    record.currentRun ? JSON.stringify(record.currentRun) : null,
+    record.assistantDrafts ? JSON.stringify(record.assistantDrafts) : null,
+    pendingResumeExpiryIndexValue(record),
     record.queueAdmissionReceipts ? JSON.stringify(record.queueAdmissionReceipts) : null,
     record.inboxResponseReceipts ? JSON.stringify(record.inboxResponseReceipts) : null,
+    record.expiredPendingInteractions ? JSON.stringify(record.expiredPendingInteractions) : null,
     record.observationalMemory ? JSON.stringify(record.observationalMemory) : null,
     record.goal ? JSON.stringify(record.goal) : null,
     record.workspace ? JSON.stringify(record.workspace) : null,
@@ -5493,6 +5813,7 @@ function sessionColumnValues(record: SessionRecord, version: number): { names: s
     version,
     record.ownerId ?? null,
     record.leaseExpiresAt ?? null,
+    record.cancelRequest ? JSON.stringify(record.cancelRequest) : null,
   ];
   return { names: [...SESSION_COLUMN_NAMES], values };
 }
@@ -6265,12 +6586,17 @@ function rowToSession(row: Record<string, unknown>): SessionRecord {
     modelId: String(row.model_id),
     subagentModelOverrides: parseJson(row.subagent_model_overrides) ?? {},
     permissionRules: parseJson(row.permission_rules) ?? { categories: {}, tools: {} },
+    permissionRulesSeedHash:
+      row.permission_rules_seed_hash != null ? String(row.permission_rules_seed_hash) : undefined,
     sessionGrants: parseJson(row.session_grants) ?? { categories: [], tools: [] },
     tokenUsage: parseJson(row.token_usage) ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
     pendingQueue: parseJson(row.pending_queue) ?? [],
     pendingResume: parseJson(row.pending_resume) ?? undefined,
+    currentRun: parseJson(row.current_run) ?? undefined,
+    assistantDrafts: parseJson(row.assistant_drafts) ?? undefined,
     queueAdmissionReceipts: parseJson(row.queue_admission_receipts) ?? undefined,
     inboxResponseReceipts: parseJson(row.inbox_response_receipts) ?? undefined,
+    expiredPendingInteractions: parseJson(row.expired_pending_interactions) ?? undefined,
     observationalMemory: parseJson(row.observational_memory) ?? undefined,
     goal: parseJson(row.goal) ?? undefined,
     workspace: parseJson(row.workspace) ?? undefined,
@@ -6283,6 +6609,7 @@ function rowToSession(row: Record<string, unknown>): SessionRecord {
     version: Number(row.version),
     ownerId: row.owner_id != null ? String(row.owner_id) : undefined,
     leaseExpiresAt: row.lease_expires_at != null ? Number(row.lease_expires_at) : undefined,
+    cancelRequest: parseJson(row.cancel_request) ?? undefined,
   };
 }
 
@@ -6371,6 +6698,7 @@ function rowToPlanTask(row: Record<string, unknown>): HarnessPlanTask {
     version: Number(row.version),
   };
   if (row.idempotency_key != null) task.idempotencyKey = String(row.idempotency_key);
+  if (row.idempotency_input_hash != null) task.idempotencyInputHash = String(row.idempotency_input_hash);
   if (row.parent_task_id != null) task.parentTaskId = String(row.parent_task_id);
   if (row.active_form != null) task.activeForm = String(row.active_form);
   if (row.priority != null) task.priority = Number(row.priority);
@@ -6394,6 +6722,7 @@ function planTaskColumnValues(task: HarnessPlanTask): { names: string[]; values:
     'session_id',
     'task_id',
     'idempotency_key',
+    'idempotency_input_hash',
     'resource_id',
     'thread_id',
     'parent_task_id',
@@ -6419,6 +6748,7 @@ function planTaskColumnValues(task: HarnessPlanTask): { names: string[]; values:
     task.sessionId,
     task.taskId,
     task.idempotencyKey ?? null,
+    task.idempotencyInputHash ?? null,
     task.resourceId,
     task.threadId,
     task.parentTaskId ?? null,

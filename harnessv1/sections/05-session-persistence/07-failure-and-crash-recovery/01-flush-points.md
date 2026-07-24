@@ -29,8 +29,8 @@
   goal/permission/pending-item notifications are emitted only after the durable
   transition succeeds.
 - **Debounced (non-critical).** Token usage, `lastActivityAt`, display-state
-  snapshots, non-terminal `currentRun.updatedAt` refreshes, periodic OM
-  bookkeeping. Coalesced on the `sessions.flushDebounceMs` window. Failures are
+  snapshots, and non-terminal `currentRun.updatedAt` refreshes. Coalesced on the
+  `sessions.flushDebounceMs` window. Agent Memory owns OM bookkeeping. Failures are
   logged and retried with exponential backoff. After `sessions.maxFlushFailures`
   consecutive failures (default `5`), the session emits an `error` event and
   starts rejecting durable operations with `HarnessStorageError` until storage
@@ -40,5 +40,5 @@
 writes. It is serialized under the owning session lease, advances the session
 version when committed, preserves unrelated top-level and app metadata, and
 does not emit `state_changed` or mutate display/runtime projections. Recovery
-never treats `metadata.app` as proof of mode/model, OM config, channel routing,
+never treats `metadata.app` as proof of mode/model, Agent Memory OM config, channel routing,
 permission, token usage, or subagent state.

@@ -8,7 +8,7 @@ import type {
   OutputProcessorOrWorkflow,
 } from '../../../processors';
 import type { RequestContext } from '../../../request-context';
-import type { ToolHooks } from '../../../tools';
+import type { ToolHooks, ToolTerminalResultConfig } from '../../../tools';
 import type { Agent } from '../../agent';
 import type { AgentExecuteOnFinishOptions } from '../../types';
 
@@ -59,6 +59,7 @@ export type CoreTool = {
   outputSchema?: any;
   execute?: (inputData: any, context: any) => any;
   toModelOutput?: (output: any) => any;
+  terminalResult?: ToolTerminalResultConfig<any, any>;
   type?: 'function' | 'provider-defined' | undefined;
   args?: Record<string, any> | undefined;
 };

@@ -50,14 +50,17 @@ export {
   isInngestAgent,
   type InngestAgent,
   type CreateInngestAgentOptions,
+  type InngestAgentResumeOptions,
   type InngestAgentStreamOptions,
   type InngestAgentStreamResult,
+  type InngestToolPermissionResolver,
 } from './create-inngest-agent';
 
 // Workflow factory (internal, used by createInngestAgent)
 export {
   createInngestDurableAgenticWorkflow,
   createInngestDurableAgenticWorkflowIds,
+  INNGEST_DURABLE_AGENT_PROTOCOL_VERSION,
   type InngestDurableAgenticWorkflowOptions,
   type InngestDurableAgenticWorkflowIds,
 } from './create-inngest-agentic-workflow';

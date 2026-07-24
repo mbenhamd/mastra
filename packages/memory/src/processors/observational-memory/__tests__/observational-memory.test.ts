@@ -29,7 +29,12 @@ import {
   renderObservationGroupsForReflection,
 } from '../observation-groups';
 import { getObservationsAsOf } from '../observation-utils';
-import { didProviderChange, ObservationalMemory } from '../observational-memory';
+import {
+  buildMessageRange,
+  didProviderChange,
+  getLastActivityFromMessages,
+  ObservationalMemory,
+} from '../observational-memory';
 import {
   buildObserverPrompt,
   buildMultiThreadObserverPrompt,
@@ -153,6 +158,55 @@ function createInMemoryStorage(): InMemoryMemory {
   const db = new InMemoryDB();
   return new InMemoryMemory({ db });
 }
+
+describe('manual reflection generation fencing', () => {
+  it('forwards the current generation to reflector extractor hooks', async () => {
+    const storage = createInMemoryStorage();
+    const threadId = 'manual-reflection-thread';
+    const resourceId = 'manual-reflection-resource';
+    await storage.saveThread({
+      thread: {
+        id: threadId,
+        resourceId,
+        title: 'Manual reflection',
+        metadata: {},
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+    });
+    const record = await storage.initializeObservationalMemory({
+      threadId,
+      resourceId,
+      scope: 'thread',
+      config: {},
+    });
+    await storage.updateActiveObservations({
+      id: record.id,
+      observations: '- Retained observation',
+      tokenCount: 5,
+      lastObservedAt: new Date(),
+    });
+    const om = new ObservationalMemory({
+      storage,
+      scope: 'thread',
+      model: 'mock/model',
+      observation: { messageTokens: 1000, bufferTokens: false },
+      reflection: { observationTokens: 1000 },
+    });
+    const reflectorCall = vi.spyOn((om as any).reflector, 'call').mockResolvedValue({
+      observations: '- Reflected observation',
+      usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+    });
+
+    await om.reflect(threadId, resourceId);
+
+    expect(reflectorCall.mock.calls[0]?.[13]).toEqual({
+      recordId: record.id,
+      threadId,
+      resourceId,
+    });
+  });
+});
 
 describe('ObservationalMemoryProcessor read-only mode', () => {
   it('loads stored context without starting observation side effects', async () => {
@@ -1511,6 +1565,58 @@ describe('Observer Agent Helpers', () => {
       expect(formatted).not.toMatch(/Assistant(?: \([^)]*\))?:/);
       expect(formatted).toMatch(/User( \([^)]*\))?:/);
       expect(formatted).toContain('Hello');
+    });
+
+    it('treats a valid terminal result as one bounded assistant answer while ignoring other data parts', () => {
+      const genericData = createTestMessage('ignored', 'assistant', 'generic-data');
+      genericData.createdAt = new Date('2024-12-04T10:29:00Z');
+      genericData.content = { format: 2, parts: [{ type: 'data-progress', data: { status: 'done' } } as any] };
+      const terminal = createTestMessage('ignored', 'assistant', 'terminal-answer');
+      terminal.createdAt = new Date('2024-12-04T10:30:00Z');
+      terminal.content = {
+        format: 2,
+        parts: [
+          {
+            type: 'data-terminal-tool-result',
+            createdAt: Date.parse('2024-12-04T10:30:01Z'),
+            data: {
+              status: 'success',
+              items: [
+                {
+                  toolName: 'spawn_subagent',
+                  toolCallId: 'call-specialist',
+                  status: 'success',
+                  value: {
+                    kind: 'subagent-direct-answer',
+                    text: 'Specialist-authored final answer.',
+                    subagentSessionId: 'child-1',
+                  },
+                },
+              ],
+            },
+          } as any,
+        ],
+      };
+
+      const formatted = formatMessagesForObserver([genericData, terminal]);
+      expect(formatted.match(/Specialist-authored final answer\./g)).toHaveLength(1);
+      expect(formatted).toContain('subagentSessionId');
+      expect(formatted).not.toContain('data-terminal-tool-result');
+      expect(buildMessageRange([genericData, terminal])).toBe('terminal-answer:terminal-answer');
+      expect(getLastActivityFromMessages([genericData, terminal])).toBe(Date.parse('2024-12-04T10:30:01Z'));
+
+      const counter = new TokenCounter();
+      expect(counter.countMessage(terminal)).toBeGreaterThan(counter.countMessage(genericData));
+    });
+
+    it('fails closed for malformed terminal result data', () => {
+      const malformed = createTestMessage('ignored', 'assistant', 'malformed-terminal');
+      malformed.content = {
+        format: 2,
+        parts: [{ type: 'data-terminal-tool-result', data: { status: 'success', items: [] } } as any],
+      };
+
+      expect(formatMessagesForObserver([malformed])).toBe('');
     });
 
     it('should render persisted temporal gap markers as time-passed lines', () => {
@@ -6224,6 +6330,77 @@ describe('Resource Scope Observation Flow', () => {
     expect(threadTwoPrompt).not.toContain('thread-1-secret');
   });
 
+  it('threads the observe-level resourceId into delegated structured extraction', async () => {
+    const resolvedResourceIds: Array<string | undefined> = [];
+    const model = new MockLanguageModelV2({
+      doStream: async () => ({
+        stream: convertArrayToReadableStream([
+          { type: 'stream-start', warnings: [] },
+          { type: 'response-metadata', id: 'obs-1', modelId: 'mock-observer', timestamp: new Date() },
+          { type: 'text-start', id: 'text-1' },
+          { type: 'text-delta', id: 'text-1', delta: '<observations>\n- user said alpha\n</observations>' },
+          { type: 'text-end', id: 'text-1' },
+          { type: 'finish', finishReason: 'stop', usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 } },
+        ]),
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        warnings: [],
+      }),
+      doGenerate: async () => ({
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        finishReason: 'stop',
+        usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+        content: [{ type: 'text', text: JSON.stringify({ 'resource-notes': 'alpha' }) }],
+        warnings: [],
+      }),
+    });
+    const observer = new ObserverRunner({
+      observationConfig: {
+        model,
+        messageTokens: 1000,
+        bufferTokens: false,
+        previousObserverTokens: 1000,
+        observeAttachments: 'auto',
+        extractors: [
+          new Extractor({
+            name: 'Resource Notes',
+            // Mimics resource-scoped working memory: resolution reads
+            // resource state and fails without a resource identity.
+            instructions: context => {
+              resolvedResourceIds.push(context.resourceId);
+              if (!context.resourceId) throw new Error('resource-scoped extractor requires resourceId');
+              return 'Extract notes.';
+            },
+            schema: () => z.string(),
+          }),
+        ],
+      } as any,
+      observedMessageIds: new Set(),
+      resolveModel: () => ({ model: model as any }),
+      tokenCounter: { countMessages: () => 1 } as any,
+    });
+
+    // Structured extractors route multi-thread observation through per-thread
+    // single calls; message rows deliberately carry no resourceId so only the
+    // observe-level identity can reach the delegated resolution.
+    const results = await observer.callMultiThread(
+      undefined,
+      new Map([['thread-1', [createTestMessage('Alpha for the record.', 'user', 't1-msg-1')]]]),
+      ['thread-1'],
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      'resource-99',
+    );
+
+    expect(resolvedResourceIds.length).toBeGreaterThan(0);
+    expect(resolvedResourceIds).not.toContain(undefined);
+    expect(resolvedResourceIds).toContain('resource-99');
+    expect(results.results.get('thread-1')?.extractedValues).toEqual({ 'resource-notes': 'alpha' });
+    expect(results.results.get('thread-1')?.extractionFailures ?? []).toHaveLength(0);
+  });
+
   it('should NOT use thread tags in thread scope mode', async () => {
     const storage = createInMemoryStorage();
 
@@ -9570,6 +9747,78 @@ describe('Async Buffering Processor Logic', () => {
       expect(result1).toBe('first');
       expect(result2).toBe('second');
       expect(order).toEqual([1, 2]);
+    });
+
+    it('should preserve FIFO serialization when multiple callers queue behind one lock', async () => {
+      const om = new ObservationalMemory({
+        storage: createInMemoryStorage(),
+        scope: 'thread',
+        model: createStreamCapableMockModel({ defaultObjectGenerationMode: 'json' }),
+        observation: { messageTokens: 50000 },
+        reflection: { observationTokens: 20000 },
+      });
+
+      let releaseFirst!: () => void;
+      const firstGate = new Promise<void>(resolve => {
+        releaseFirst = resolve;
+      });
+      let releaseSecond!: () => void;
+      const secondGate = new Promise<void>(resolve => {
+        releaseSecond = resolve;
+      });
+      let firstEntered!: () => void;
+      const firstEnteredPromise = new Promise<void>(resolve => {
+        firstEntered = resolve;
+      });
+      let secondEntered!: () => void;
+      const secondEnteredPromise = new Promise<void>(resolve => {
+        secondEntered = resolve;
+      });
+
+      let active = 0;
+      let maxActive = 0;
+      const order: string[] = [];
+      const enter = (name: string) => {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        order.push(`${name}:enter`);
+      };
+      const exit = (name: string) => {
+        order.push(`${name}:exit`);
+        active -= 1;
+      };
+
+      const first = (om as any).withLock('test-key', async () => {
+        enter('first');
+        firstEntered();
+        await firstGate;
+        exit('first');
+      });
+      await firstEnteredPromise;
+
+      const second = (om as any).withLock('test-key', async () => {
+        enter('second');
+        secondEntered();
+        await secondGate;
+        exit('second');
+      });
+      const third = (om as any).withLock('test-key', async () => {
+        enter('third');
+        exit('third');
+      });
+
+      releaseFirst();
+      await secondEnteredPromise;
+      await Promise.resolve();
+      const maxActiveBeforeSecondRelease = maxActive;
+      const orderBeforeSecondRelease = [...order];
+      releaseSecond();
+      await Promise.all([first, second, third]);
+
+      expect(maxActiveBeforeSecondRelease).toBe(1);
+      expect(orderBeforeSecondRelease).toEqual(['first:enter', 'first:exit', 'second:enter']);
+      expect(maxActive).toBe(1);
+      expect(order).toEqual(['first:enter', 'first:exit', 'second:enter', 'second:exit', 'third:enter', 'third:exit']);
     });
 
     it('should allow concurrent operations on different keys', async () => {
@@ -16852,55 +17101,52 @@ describe('Message ordering regressions', () => {
     };
   }
 
-  // ─── Test 1: observation should not produce side effects during processOutputResult ───
+  // ─── Test 1: synchronous observation runs after the completed response is persisted ───
 
-  it('1 — observation should not produce side effects during processOutputResult', async () => {
+  it('1 — synchronous observation runs after the completed response is persisted', async () => {
     const s = await setupOrderingScenario({ messageTokens: 1 });
 
-    s.addUserMessage('Tell me about React');
+    const userMessageId = s.addUserMessage('Tell me about React');
     await s.runStep(0);
-    s.addAssistantMessage('React is a UI library.');
+    const assistantMessageId = s.addAssistantMessage('React is a UI library.');
     await s.finalize();
 
     const record = await s.getOMRecord();
-    // observation must NOT have fired during finalize
-    expect(record?.activeObservations ?? '').toBe('');
-    expect(record?.lastObservedAt).toBeUndefined();
+    expect(record?.activeObservations).toContain('Observed user request');
+    expect(record?.lastObservedAt).toBeDefined();
 
     const omMetadata = await s.getOMMetadata();
-    expect(omMetadata?.currentTask).toBeUndefined();
-    expect(omMetadata?.suggestedResponse).toBeUndefined();
+    expect(omMetadata?.currentTask).toBe('Handle user request');
+    expect(omMetadata?.suggestedResponse).toBe('Sure!');
+
+    const storedMessageIds = (await s.getStoredMessages()).map(message => message.id);
+    expect(storedMessageIds).toContain(userMessageId);
+    expect(storedMessageIds).toContain(assistantMessageId);
   });
 
-  // ─── Test 2: deferred observation should happen at beginning of next turn ───
+  // ─── Test 2: the completed observation is loaded at the beginning of the next turn ───
 
-  it('2 — deferred observation should happen at the beginning of the next turn', async () => {
+  it('2 — completed end-of-turn observation is loaded at the beginning of the next turn', async () => {
     const s = await setupOrderingScenario({ messageTokens: 1 });
 
-    // Turn 1: single step
     s.addUserMessage('Hello');
     await s.runStep(0);
     s.addAssistantMessage('Hi there');
     await s.finalize();
 
-    // After turn 1: no observation yet
-    let record = await s.getOMRecord();
-    expect(record?.activeObservations ?? '').toBe('');
-    expect(record?.lastObservedAt).toBeUndefined();
+    const record = await s.getOMRecord();
+    expect(record?.activeObservations).toContain('Observed user request');
+    expect(record?.lastObservedAt).toBeDefined();
 
-    // Turn 2: multi-step (step 0 + step 1 triggers observation)
     s.resetForNewTurn();
     s.addUserMessage('Follow-up');
     await s.runStep(0);
-    s.addToolCallMessage('search');
-    await s.runStep(1);
-    s.addAssistantMessage('Here are results');
-    await s.finalize();
 
-    // After turn 2 step 1: observation should have fired
-    record = await s.getOMRecord();
-    expect(record?.activeObservations).toBeTruthy();
-    expect(record?.lastObservedAt).toBeDefined();
+    const observationalContext = s.currentMessageList
+      .getSystemMessages('observational-memory')
+      .map(message => message.content)
+      .join('\n');
+    expect(observationalContext).toContain('Observed user request');
   });
 
   // ─── Test 2b: next turn step 0 activates buffered chunks and loads correct context ───

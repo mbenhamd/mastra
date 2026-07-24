@@ -127,8 +127,10 @@ prove the pre-action gate re-evaluates the owning session's current permission
 rows before local execute, approval resume, direct resume, and durable shared
 execution, including model-emitted hidden tool calls, permission changes between
 exposure and action, recovered pending approvals, and child/subagent tool calls
-that must use the child session's rows rather than inherited parent grants,
-rules, or `yolo`. Legacy forked-thread metadata is migration/display input only.
+that must use the child session's rows rather than live parent state. Default
+children inherit no grants, rules, or `yolo`; opt-in root-grant snapshots apply
+only at descendant creation and remain subordinate to child `deny` rules and
+allowlists. Legacy forked-thread metadata is migration/display input only.
 
 **Dynamic tool discovery filtering**
 
@@ -435,8 +437,8 @@ metadata namespace protection rejects raw writes: goals commit to §4.7
 `GoalState`; mode/model and model-pack choices commit to session model/config
 state; `projectPath` and sandbox paths commit to workspace/session state;
 escape-as-cancel preference commits to the appropriate TUI/session setting; OM
-settings commit to `SessionRecord.observationalMemory`; and unknown app-owned
-metadata remains under `metadata.app` only.
+settings configure Agent Memory instead of creating per-session Harness
+overrides; and unknown app-owned metadata remains under `metadata.app` only.
 
 **MastraCode `/skill` activation route**
 
@@ -491,13 +493,17 @@ drain, pending-item resume, workspace materialisation, provider-visible
 delivery, and side-effect execution require the current storage lease/claim
 owner.
 
-**MastraCode OM settings restore through session state**
+**MastraCode OM configuration and legacy recovery**
 
-OM tests prove legacy `attachOMThreadStatePersistence(...)` metadata is imported
-only through the §11.2 bootstrap path, then v1 observer/reflector model and
-threshold changes commit to `SessionRecord.observationalMemory`, survive
-eviction/restart, emit only after durable commit, and are not overwritten by
-later legacy thread metadata writes.
+OM tests prove enabled `HarnessConfig.observationalMemory` forms and
+`session.om.switch*Model(...)` calls fail loudly without persisting, while OM
+configured directly on Agent Memory leaves ordinary Harness message history
+unchanged. A hydrated legacy `SessionRecord.observationalMemory` override with a
+pending queued item must park before queue scheduling or receipt mutation; the
+item and queued receipt remain byte-for-byte equivalent until the idempotent
+`session.om.clearOverride()` CAS commits. That recovery call re-kicks the drain
+without waiting for the entire queued model turn, and the admitted item then
+settles exactly once.
 
 **MastraCode goal judge memory ownership**
 
@@ -564,7 +570,7 @@ top-level names and prefixes, known legacy keys (`currentModeId`,
 and non-object legacy `metadata.app`. Tests also prove successful writes
 preserve unrelated metadata, advance `SessionRecord.version`, return a new
 `ETag` remotely, reject stale `If-Match` with `harness.state_conflict`, emit no
-`state_changed`, and do not alter runtime mode/model, OM config, channel
+`state_changed`, and do not alter runtime mode/model, Agent Memory OM config, channel
 routing, subagent filtering, token usage, or thread title/list label
 projections.
 
@@ -1689,19 +1695,13 @@ accepted as the public v1 lifecycle. Only the Harness operator thread-delete
 route may invoke raw physical cleanup, and only after the session-first cascade
 has completed.
 
-**Observational memory snapshot and cleanup**
+**Observational memory ownership and cleanup**
 
-Storage/server/SDK tests prove raw OM rows created through the Harness adapter
-carry the bound `harnessName` or an equivalent key prefix; adapters that cannot
-provide that namespace do not expose Harness OM snapshots in shared
-multi-harness configurations. `session.om.getRecord()` and
-`GET /sessions/:sessionId/om` return only the JSON-safe
-`ObservationalMemorySnapshot` for the tenant-verified session/resource and
-configured OM scope; raw OM rows, raw config blobs, metadata, buffered
-chunks/reflections, history records, provider clients, live model objects,
-functions, locks, and processor internals are absent. Tests prove OM model
-switches commit through the session lease/ETag path and reject stale, closing,
-closed, or unauthorized calls before events. Lifecycle tests prove root
+Storage/server/SDK tests prove Harness does not auto-mount OM snapshot or config
+routes and does not create `SessionRecord.observationalMemory` through current
+writes. Enabled config and model switches reject before events or persistence;
+effective OM remains in the Agent Memory/MemoryStorage domain. Recovery tests
+cover old rows as described above. Lifecycle tests prove root
 `deleteSession` cleans up session-owned durable state, attachments, backing
 history, and thread-scoped OM for the deleted
 `(harnessName, resourceId, threadId)` unless an explicit operator preserve path
@@ -1879,11 +1879,11 @@ The built-in plan-task tools and the TM-4 hierarchy layer are tests-first:
 
 - _Tools (§6.4 injection)._ `createPlanTaskTools(session)` registers
   `task_add` / `task_decompose` / `task_reparent` / `task_update` /
-  `task_complete` / `plan_task_check` / `task_write` (back-compat) under the
-  `harness:builtin` toolset the agent receives every turn; each tool routes its
-  write through the live session under its lease and acts on the calling session
-  only. A rejected mutation returns an `isError` tool payload (it does not abort
-  the turn). `plan_task_check({ rootTaskId?, depth?, status?, limit })` returns a
+  `task_complete` / `plan_task_check` under the `harness:builtin` toolset the
+  agent receives every turn; each tool routes its write through the live session
+  under its lease and acts on the calling session only. A rejected mutation
+  returns an `isError` tool payload (it does not abort the turn).
+  `plan_task_check({ rootTaskId?, depth?, status?, limit })` returns a
   BOUNDED next-N slice (never the whole tree by default) and emits no event.
 - _Custom event (§10.3)._ Every MUTATING tool emits the dotted custom event
   `papersflow.plan_task.updated` (carrying the op + affected task ids) through

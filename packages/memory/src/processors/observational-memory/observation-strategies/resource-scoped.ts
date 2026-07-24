@@ -18,6 +18,7 @@ import {
 } from '../markers';
 import { getLastObservedMessageCursor, sortThreadsByOldestMessage } from '../message-utils';
 import { buildMessageRange } from '../observational-memory';
+import { updateThreadFromObservationalMemory } from '../storage-compat';
 import { getMaxThreshold } from '../thresholds';
 
 import { ObservationStrategy } from './base';
@@ -263,6 +264,8 @@ export class ResourceScopedObservationStrategy extends ObservationStrategy {
           this.opts.requestContext,
           this.priorMetadataByThread,
           this.opts.observabilityContext,
+          undefined,
+          this.resourceId,
         );
       }),
     );
@@ -311,6 +314,7 @@ export class ResourceScopedObservationStrategy extends ObservationStrategy {
         previousValues,
         threadId,
         resourceId: this.resourceId,
+        observationalMemoryRecordId: record.id,
         mainAgent: this.opts.agent,
         memory: this.deps.memory,
         sendSignal: this.opts.sendSignal,
@@ -418,10 +422,15 @@ export class ResourceScopedObservationStrategy extends ObservationStrategy {
             },
             lastObservedMessageCursor: update.lastObservedMessageCursor,
           });
-          await this.storage.updateThread({
+          await updateThreadFromObservationalMemory(this.storage, {
             id: update.threadId,
             title: shouldUpdateThreadTitle ? newTitle : (thread.title ?? ''),
             metadata: newMetadata,
+            guard: {
+              recordId: record.id,
+              threadId: record.threadId,
+              resourceId: record.resourceId,
+            },
           });
 
           if (shouldUpdateThreadTitle) {

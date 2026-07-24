@@ -1,5 +1,6 @@
 import { EventEmitterPubSub } from '@mastra/core/events';
 import { Mastra } from '@mastra/core/mastra';
+import { RequestContext } from '@mastra/core/request-context';
 import { MockStore, WORKFLOW_RESUME_RESULT_RECEIPT_MAX_BYTES } from '@mastra/core/storage';
 import { Inngest } from 'inngest';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -253,6 +254,62 @@ describe('InngestRun.resumeAsync()', () => {
     expect(sentEvent.data).not.toHaveProperty('stepResults');
     expect(sentEvent.data.resume).not.toHaveProperty('stepResults');
     expect(sentEvent.data).not.toHaveProperty('snapshotBeforeResume');
+  });
+
+  it('merges persisted request context by default for generic workflow resumes', async () => {
+    const { run, workflowsStore } = await createSuspendedRun();
+    const snapshot = await workflowsStore.loadWorkflowSnapshot({
+      workflowName: 'resume-async-wf',
+      runId: run.runId,
+    });
+    await workflowsStore.persistWorkflowSnapshot({
+      workflowName: 'resume-async-wf',
+      runId: run.runId,
+      resourceId: snapshot!.resourceId,
+      snapshot: {
+        ...snapshot!,
+        requestContext: { persisted: 'kept', overridden: 'old' },
+      },
+    });
+    const requestContext = new RequestContext();
+    requestContext.set('fresh', 'value');
+    requestContext.set('overridden', 'new');
+
+    await run.resumeAsync({ step: 'step1', resumeData: { resumed: 'world' }, requestContext });
+
+    expect(sendMock.mock.calls[0]?.[0]?.data?.requestContext).toEqual({
+      persisted: 'kept',
+      fresh: 'value',
+      overridden: 'new',
+    });
+  });
+
+  it('supports an internal replacement mode for adapters that sanitize resume context', async () => {
+    const { run, workflowsStore } = await createSuspendedRun();
+    const snapshot = await workflowsStore.loadWorkflowSnapshot({
+      workflowName: 'resume-async-wf',
+      runId: run.runId,
+    });
+    await workflowsStore.persistWorkflowSnapshot({
+      workflowName: 'resume-async-wf',
+      runId: run.runId,
+      resourceId: snapshot!.resourceId,
+      snapshot: {
+        ...snapshot!,
+        requestContext: { legacyCredential: 'must-be-removed', persisted: 'also-replaced' },
+      },
+    });
+    const requestContext = new RequestContext();
+    requestContext.set('fresh', 'sanitized');
+
+    await run.resumeAsync({
+      step: 'step1',
+      resumeData: { resumed: 'world' },
+      requestContext,
+      __requestContextMode: 'replace',
+    });
+
+    expect(sendMock.mock.calls[0]?.[0]?.data?.requestContext).toEqual({ fresh: 'sanitized' });
   });
 
   it('keeps the event small while the storage checkpoint round-trips large state', async () => {

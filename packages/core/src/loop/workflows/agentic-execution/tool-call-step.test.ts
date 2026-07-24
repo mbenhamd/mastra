@@ -454,7 +454,7 @@ describe('createToolCallStep tool approval workflow', () => {
   let controller: { enqueue: Mock };
   let suspend: Mock;
   let streamState: { serialize: Mock };
-  let tools: Record<string, { execute: Mock; requireApproval: boolean }>;
+  let tools: Record<string, { execute: Mock; requireApproval: boolean; validateInput?: Mock }>;
   let messageList: MessageList;
   let toolCallStep: ReturnType<typeof createToolCallStep>;
   let neverResolve: Promise<never>;
@@ -533,6 +533,47 @@ describe('createToolCallStep tool approval workflow', () => {
     vi.restoreAllMocks();
   });
 
+  it('returns invalid input to the model before asking for approval', async () => {
+    const validationError = {
+      error: true,
+      message: 'Tool input validation failed for test-tool.',
+      validationErrors: {
+        errors: [],
+        fields: { param: { errors: ['Invalid input'], fields: {} } },
+      },
+    };
+    tools['test-tool'].validateInput = vi.fn().mockReturnValue({ error: validationError });
+
+    const result = await toolCallStep.execute(makeExecuteParams());
+
+    expect(tools['test-tool'].validateInput).toHaveBeenCalledWith({ param: 'test' });
+    expect(suspend).not.toHaveBeenCalled();
+    expectNoToolExecution();
+    expect(result).toEqual({
+      result: validationError,
+      ...makeInputData(),
+    });
+  });
+
+  it('preserves Error details from approval preflight validation across serialization', async () => {
+    tools['test-tool'].validateInput = vi.fn().mockReturnValue({
+      error: new TypeError('Tool input must include a valid param.'),
+    });
+
+    const result = await toolCallStep.execute(makeExecuteParams());
+    const serializedResult = JSON.parse(JSON.stringify(result));
+
+    expect(suspend).not.toHaveBeenCalled();
+    expectNoToolExecution();
+    expect(serializedResult).toMatchObject({
+      result: {
+        name: 'TypeError',
+        message: 'Tool input must include a valid param.',
+      },
+      ...makeInputData(),
+    });
+  });
+
   it('normalizes evidence-free null resume placeholders on a fresh tool call', async () => {
     const resultValue = { success: true };
     tools['test-tool'].requireApproval = false;
@@ -563,6 +604,73 @@ describe('createToolCallStep tool approval workflow', () => {
     expect(result).toEqual({ ...inputData, result: resultValue });
   });
 
+  it('uses explicit workflow approval data when provider resume controls are null placeholders', async () => {
+    const resultValue = { success: true };
+    tools['test-tool'].execute.mockResolvedValue(resultValue);
+    const inputData = {
+      ...makeInputData(),
+      args: {
+        param: 'test',
+        resumeData: null,
+        suspendedToolCallId: null,
+        suspendedToolRunId: null,
+      },
+    };
+
+    const result = await toolCallStep.execute(
+      makeExecuteParams({
+        inputData,
+        resumeData: { approved: true },
+        suspendData: makeSuspendData(),
+      }),
+    );
+
+    expect(tools['test-tool'].execute).toHaveBeenCalledWith(
+      { param: 'test' },
+      expect.objectContaining({ resumeData: undefined }),
+    );
+    expect(result).toEqual({
+      ...inputData,
+      result: resultValue,
+      approval: { id: inputData.toolCallId, approved: true },
+    });
+  });
+
+  it('uses explicit workflow suspension data when provider resume controls are null placeholders', async () => {
+    const workflowResumeData = { answer: 'continue' };
+    tools['test-tool'].requireApproval = false;
+    tools['test-tool'].execute.mockImplementation(async (_args, context) => ({
+      resumeData: context.resumeData,
+    }));
+    const inputData = {
+      ...makeInputData(),
+      args: {
+        param: 'test',
+        resumeData: null,
+        suspendedToolCallId: null,
+        suspendedToolRunId: null,
+      },
+    };
+
+    const result = await toolCallStep.execute(
+      makeExecuteParams({
+        inputData,
+        resumeData: workflowResumeData,
+        suspendData: makeSuspendData('suspension'),
+      }),
+    );
+
+    expect(tools['test-tool'].execute).toHaveBeenCalledWith(
+      { param: 'test' },
+      expect.objectContaining({ resumeData: workflowResumeData }),
+    );
+    expect(result).toEqual({
+      ...inputData,
+      result: { resumeData: workflowResumeData },
+      resumedFromSuspension: true,
+    });
+  });
+
   it('rejects a null resume payload that names an unverified suspended run', async () => {
     tools['test-tool'].requireApproval = false;
     const inputData = {
@@ -570,7 +678,36 @@ describe('createToolCallStep tool approval workflow', () => {
       args: { param: 'test', resumeData: null, suspendedToolRunId: 'unverified-run' },
     };
 
-    const result = await toolCallStep.execute(makeExecuteParams({ inputData }));
+    const result = await toolCallStep.execute(
+      makeExecuteParams({
+        inputData,
+        resumeData: { approved: true },
+        suspendData: makeSuspendData(),
+      }),
+    );
+
+    expect(result.error).toBeInstanceOf(Error);
+    expect(result.error.message).toBe('Tool resume evidence did not match the suspended tool call');
+    expectNoToolExecution();
+  });
+
+  it('does not let workflow resume data bypass model-driven call identity checks', async () => {
+    const inputData = {
+      ...makeInputData(),
+      args: {
+        param: 'test',
+        resumeData: { approved: true },
+        suspendedToolCallId: 'unverified-call',
+      },
+    };
+
+    const result = await toolCallStep.execute(
+      makeExecuteParams({
+        inputData,
+        resumeData: { approved: true },
+        suspendData: makeSuspendData(),
+      }),
+    );
 
     expect(result.error).toBeInstanceOf(Error);
     expect(result.error.message).toBe('Tool resume evidence did not match the suspended tool call');
@@ -870,6 +1007,7 @@ describe('createToolCallStep tool approval workflow', () => {
 
     expect(result).toEqual({
       ...makeInputData(),
+      disposition: 'denied',
       result: 'Tool "test-tool" was denied by the session permission policy.',
     });
     expectNoToolExecution();
@@ -1390,7 +1528,12 @@ describe('createToolCallStep tool approval workflow', () => {
       { param: 'test' },
       expect.objectContaining({ resumeData: { answer: 'continue' } }),
     );
-    expect(result).toEqual({ result: { resumed: true }, ...inputData, resumeTargetToolCallId: 'test-call-id' });
+    expect(result).toEqual({
+      result: { resumed: true },
+      ...inputData,
+      resumeTargetToolCallId: 'test-call-id',
+      resumedFromSuspension: true,
+    });
   });
 
   it('should consume approved stored approval resumes even if needsApprovalFn later returns false', async () => {
@@ -1683,6 +1826,7 @@ describe('createToolCallStep tool approval workflow', () => {
       result: { success: true },
       approval: { id: inputData.toolCallId, approved: true },
       ...inputData,
+      resumedFromSuspension: true,
     });
   });
 
@@ -1706,6 +1850,7 @@ describe('createToolCallStep tool approval workflow', () => {
     expect(result).toEqual({
       result: toolResult,
       ...inputData,
+      resumedFromSuspension: true,
     });
   });
 
@@ -2029,6 +2174,7 @@ describe('createToolCallStep tool approval workflow', () => {
       result: { text: 'resumed' },
       ...inputData,
       resumeTargetToolCallId: 'agent-call-id',
+      resumedFromSuspension: true,
     });
   });
 

@@ -1,5 +1,10 @@
 import type { ProcessInputStepArgs } from '../index';
 
+const CURRENT_RUN_LOADED_TOOLS_KEY = 'toolSearchLoadedTools';
+const CURRENT_RUN_CONTEXT_INITIALIZED_KEY = 'toolSearchContextInitialized';
+export const TOOL_SEARCH_AUTO_LOAD_ACTIVATION_TYPE = 'tool-search-auto-load';
+export const TOOL_SEARCH_AUTO_LOAD_ACTIVATION_VERSION = 1;
+
 /**
  * Context handed to a {@link LoadedToolStore} on every operation.
  */
@@ -11,6 +16,11 @@ export interface LoadedToolStoreContext {
    * May be undefined on resume paths that resolve loaded state without a live step.
    */
   args?: ProcessInputStepArgs;
+  /**
+   * Persisted conversation messages supplied by a resume/recovery boundary
+   * before a live `processInputStep` exists.
+   */
+  messages?: ProcessInputStepArgs['messages'];
 }
 
 /**
@@ -29,47 +39,103 @@ export interface LoadedToolStore {
   getLoadedNames(ctx: LoadedToolStoreContext): Promise<Set<string>> | Set<string>;
   /** Record one or more tool names as loaded. */
   addLoaded(names: string[], ctx: LoadedToolStoreContext): Promise<void> | void;
+  /** Clear processor-owned state for one thread, if the backend has any. */
+  clearState(threadId: string): void;
+  /** Clear all processor-owned state for this store. */
+  clearAllState(): void;
+  /** Release timers and processor-owned state. Safe to call more than once. */
+  dispose(): void;
 }
 
 /**
- * Reads the structured `result` of a `search_tools` / `load_tool` tool-invocation
- * part and returns the tool names it activated.
- *
- * - `search_tools` (autoLoad) results carry `results: [{ name }]`.
- * - `load_tool` results carry `loaded: string[]`.
+ * Reads a canonical `load_tool` result. Discovery results are deliberately not
+ * accepted here: only the `loaded` array emitted after a load-phase policy check
+ * is activation evidence.
  */
-function extractActivatedNames(result: unknown): string[] {
+function extractLoadToolNames(result: unknown): string[] {
   if (!result || typeof result !== 'object') return [];
-  const names: string[] = [];
 
-  const maybeResults = (result as { results?: unknown }).results;
-  if (Array.isArray(maybeResults)) {
-    for (const entry of maybeResults) {
-      const name = (entry as { name?: unknown })?.name;
-      if (typeof name === 'string') names.push(name);
-    }
+  const candidate = result as { success?: unknown; loaded?: unknown };
+  if (typeof candidate.success !== 'boolean') return [];
+
+  const maybeLoaded = candidate.loaded;
+  if (!Array.isArray(maybeLoaded)) return [];
+
+  return maybeLoaded.filter((name): name is string => typeof name === 'string' && name.length > 0);
+}
+
+/**
+ * Reads the explicit activation receipt emitted by `search_tools` in auto-load
+ * mode. The marked names must exactly match the canonical search result names;
+ * ordinary discovery-only results therefore cannot be replayed as loaded tools.
+ */
+function extractAutoLoadNames(result: unknown): string[] {
+  if (!result || typeof result !== 'object') return [];
+
+  const candidate = result as { results?: unknown; activation?: unknown };
+  if (!Array.isArray(candidate.results) || !candidate.activation || typeof candidate.activation !== 'object') {
+    return [];
   }
 
-  const maybeLoaded = (result as { loaded?: unknown }).loaded;
-  if (Array.isArray(maybeLoaded)) {
-    for (const name of maybeLoaded) {
-      if (typeof name === 'string') names.push(name);
+  const resultNames: string[] = [];
+  for (const entry of candidate.results) {
+    const searchResult = entry as { name?: unknown; description?: unknown; score?: unknown };
+    if (
+      typeof searchResult.name !== 'string' ||
+      searchResult.name.length === 0 ||
+      typeof searchResult.description !== 'string' ||
+      typeof searchResult.score !== 'number' ||
+      !Number.isFinite(searchResult.score)
+    ) {
+      return [];
     }
+    resultNames.push(searchResult.name);
   }
 
-  return names;
+  const activation = candidate.activation as { type?: unknown; version?: unknown; loaded?: unknown };
+  if (
+    activation.type !== TOOL_SEARCH_AUTO_LOAD_ACTIVATION_TYPE ||
+    activation.version !== TOOL_SEARCH_AUTO_LOAD_ACTIVATION_VERSION ||
+    !Array.isArray(activation.loaded)
+  ) {
+    return [];
+  }
+
+  const loadedNames: string[] = [];
+  for (const name of activation.loaded) {
+    if (typeof name !== 'string' || name.length === 0) return [];
+    loadedNames.push(name);
+  }
+
+  const resultSet = new Set(resultNames);
+  const loadedSet = new Set(loadedNames);
+  if (
+    loadedNames.length === 0 ||
+    resultSet.size !== resultNames.length ||
+    loadedSet.size !== loadedNames.length ||
+    resultSet.size !== loadedSet.size ||
+    [...resultSet].some(name => !loadedSet.has(name))
+  ) {
+    return [];
+  }
+
+  return loadedNames;
 }
 
 /**
  * Scans conversation messages for completed `search_tools` / `load_tool` invocations
  * and unions the tool names they activated.
  */
-export function deriveLoadedNamesFromMessages(args: ProcessInputStepArgs): Set<string> {
+export function deriveLoadedNamesFromMessages(args: Pick<ProcessInputStepArgs, 'messages'>): Set<string> {
   const loaded = new Set<string>();
 
   if (!Array.isArray(args.messages)) return loaded;
 
   for (const message of args.messages) {
+    // Tool results persisted by Mastra belong to assistant messages. Ignore
+    // user-authored tool-shaped content instead of treating it as authorization.
+    if (message.role !== 'assistant') continue;
+
     const parts = message.content?.parts;
     if (!parts) continue;
 
@@ -80,7 +146,11 @@ export function deriveLoadedNamesFromMessages(args: ProcessInputStepArgs): Set<s
       if (invocation.toolName !== 'search_tools' && invocation.toolName !== 'load_tool') continue;
       if (invocation.state !== 'result') continue;
 
-      for (const name of extractActivatedNames(invocation.result)) {
+      const names =
+        invocation.toolName === 'load_tool'
+          ? extractLoadToolNames(invocation.result)
+          : extractAutoLoadNames(invocation.result);
+      for (const name of names) {
         loaded.add(name);
       }
     }
@@ -90,64 +160,54 @@ export function deriveLoadedNamesFromMessages(args: ProcessInputStepArgs): Set<s
 }
 
 /**
- * 'context' mode store. The conversation messages are the source of truth — a tool
- * is loaded iff a `search_tools`/`load_tool` result naming it is still present in
- * `args.messages`.
- *
- * A small same-process supplemental set (keyed by real thread ID) bridges the gap
- * between a tool being activated during `execute` and that result becoming visible
- * in the messages on the next step. It is only ever additive to the message-derived
- * set and is never the durable record, so:
- *
- * - Restart-safe: after a restart the messages alone still yield the loaded set.
- * - De-loads automatically when the result block leaves the messages (native parity):
- *   the supplemental set is intersected with what the messages can still confirm
- *   once messages are available.
- * - No `'default'` thread-ID leak: the supplemental set is keyed by real thread IDs
- *   only and is never populated for anonymous requests.
- * - Requires no memory configuration.
+ * 'context' mode store. Canonical assistant tool results in conversation messages
+ * are the durable source of truth. A serializable snapshot in `args.state` bridges
+ * execution to later steps in the same ProcessorRunner request, including requests
+ * without a thread ID. The snapshot is never shared between requests, so an aborted
+ * or concurrent run cannot contaminate another run for the same thread.
  */
 export class ContextLoadedToolStore implements LoadedToolStore {
-  /** Same-process supplemental set, keyed by real thread ID. Additive only. */
-  private supplemental = new Map<string, Set<string>>();
+  private getCurrentRunLoadedNames(state: Record<string, unknown>): Set<string> {
+    const value = state[CURRENT_RUN_LOADED_TOOLS_KEY];
+    if (!Array.isArray(value)) return new Set();
+
+    return new Set(value.filter((name): name is string => typeof name === 'string' && name.length > 0));
+  }
+
+  private getOrInitializeCurrentRun(ctx: LoadedToolStoreContext): Set<string> {
+    const args = ctx.args!;
+    const loaded = this.getCurrentRunLoadedNames(args.state);
+
+    if (args.state[CURRENT_RUN_CONTEXT_INITIALIZED_KEY] !== true) {
+      for (const name of deriveLoadedNamesFromMessages(args)) loaded.add(name);
+      args.state[CURRENT_RUN_LOADED_TOOLS_KEY] = [...loaded];
+      args.state[CURRENT_RUN_CONTEXT_INITIALIZED_KEY] = true;
+    }
+
+    return loaded;
+  }
 
   getLoadedNames(ctx: LoadedToolStoreContext): Set<string> {
-    const fromMessages = ctx.args ? deriveLoadedNamesFromMessages(ctx.args) : new Set<string>();
-
-    if (!ctx.threadId) return fromMessages;
-
-    const supplemental = this.supplemental.get(ctx.threadId);
-    if (!supplemental || supplemental.size === 0) {
-      // Drop the empty entry so high thread churn does not leak keys.
-      if (supplemental) this.supplemental.delete(ctx.threadId);
-      return fromMessages;
-    }
-
-    // Once a name appears in the messages it becomes message-owned, so prune it from
-    // the supplemental set. This hands de-loading back to the messages (native
-    // parity): an evicted block disappears from the messages and is no longer
-    // shadowed by the supplemental set. Names not yet visible (just activated) stay
-    // in the supplemental set until the messages catch up.
-    if (ctx.args) {
-      for (const name of [...supplemental]) {
-        if (fromMessages.has(name)) supplemental.delete(name);
-      }
-      // Once every name is message-owned the entry is dead weight; drop it.
-      if (supplemental.size === 0) this.supplemental.delete(ctx.threadId);
-    }
-
-    return new Set([...fromMessages, ...supplemental]);
+    if (ctx.args) return this.getOrInitializeCurrentRun(ctx);
+    return ctx.messages ? deriveLoadedNamesFromMessages({ messages: ctx.messages }) : new Set();
   }
 
   addLoaded(names: string[], ctx: LoadedToolStoreContext): void {
-    if (names.length === 0 || !ctx.threadId) return;
-    let set = this.supplemental.get(ctx.threadId);
-    if (!set) {
-      set = new Set();
-      this.supplemental.set(ctx.threadId, set);
+    if (names.length === 0 || !ctx.args) return;
+
+    const loaded = this.getOrInitializeCurrentRun(ctx);
+    for (const name of names) {
+      if (name.length > 0) loaded.add(name);
     }
-    for (const name of names) set.add(name);
+    ctx.args.state[CURRENT_RUN_LOADED_TOOLS_KEY] = [...loaded];
   }
+
+  // Context state belongs to messages and the live request, not this store.
+  clearState(_threadId: string): void {}
+
+  clearAllState(): void {}
+
+  dispose(): void {}
 }
 
 /**
@@ -222,6 +282,14 @@ export class LegacyMapLoadedToolStore implements LoadedToolStore {
 
   clearAllState(): void {
     this.threadLoadedTools.clear();
+  }
+
+  dispose(): void {
+    if (this.intervalId) {
+      clearInterval(this.intervalId);
+      this.intervalId = undefined;
+    }
+    this.clearAllState();
   }
 
   cleanupStaleState(): number {

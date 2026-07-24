@@ -16,6 +16,7 @@ import type {
   ToolAction,
   ToolExecutionContext,
   ToolPayloadTransform,
+  ToolTerminalResultConfig,
 } from './types';
 import { validateToolInput, validateToolOutput, validateToolSuspendData, validateRequestContext } from './validation';
 
@@ -91,7 +92,17 @@ export class Tool<
   >,
   TId extends string = string,
   TRequestContext extends Record<string, any> | unknown = unknown,
-> implements ToolAction<TSchemaIn, TSchemaOut, TSuspendSchema, TResumeSchema, TContext, TId, TRequestContext> {
+  TTerminalResult = TSchemaOut,
+> implements ToolAction<
+  TSchemaIn,
+  TSchemaOut,
+  TSuspendSchema,
+  TResumeSchema,
+  TContext,
+  TId,
+  TRequestContext,
+  TTerminalResult
+> {
   /** Unique identifier for the tool */
   id: TId;
 
@@ -267,6 +278,9 @@ export class Tool<
    */
   background?: ToolBackgroundConfig;
 
+  /** Optional policy for returning a successful tool result as the agent's terminal result. */
+  terminalResult?: ToolTerminalResultConfig<TSchemaOut, TTerminalResult>;
+
   /**
    * Creates a new Tool instance with input validation wrapper.
    *
@@ -281,7 +295,18 @@ export class Tool<
    * });
    * ```
    */
-  constructor(opts: ToolAction<TSchemaIn, TSchemaOut, TSuspendSchema, TResumeSchema, TContext, TId, TRequestContext>) {
+  constructor(
+    opts: ToolAction<
+      TSchemaIn,
+      TSchemaOut,
+      TSuspendSchema,
+      TResumeSchema,
+      TContext,
+      TId,
+      TRequestContext,
+      TTerminalResult
+    >,
+  ) {
     (this as any)[MASTRA_TOOL_MARKER] = true;
     this.id = opts.id;
     const recoverySchemas = {
@@ -304,6 +329,7 @@ export class Tool<
       mcp: opts.mcp,
       mcpMetadata: opts.mcpMetadata,
       background: opts.background,
+      terminalResult: opts.terminalResult,
       onInputStart: opts.onInputStart,
       onInputDelta: opts.onInputDelta,
       onInputAvailable: opts.onInputAvailable,
@@ -337,6 +363,7 @@ export class Tool<
     this.mcp = opts.mcp;
     this.mcpMetadata = opts.mcpMetadata;
     this.background = opts.background;
+    this.terminalResult = opts.terminalResult;
     this.onInputStart = opts.onInputStart;
     this.onInputDelta = opts.onInputDelta;
     this.onInputAvailable = opts.onInputAvailable;
@@ -348,19 +375,24 @@ export class Tool<
     if (opts.execute) {
       const originalExecute = opts.execute;
       this.execute = async (inputData: TSchemaIn, context?: any) => {
-        // When a tool is being resumed (resumeData present in context), skip input
-        // validation. The original args were already validated during the initial
-        // execution, and during resume the tool's execute function checks resumeData
-        // and returns early without using the input args.
+        // When a tool is being resumed (resumeData present in context), validation
+        // must not FAIL the call: the original args were already validated during
+        // the initial execution, and delegated resumes replay control fields the
+        // schema does not know. Normalization must still run — replayed args keep
+        // the provider's raw shape (OpenAI strict compat materializes .optional()
+        // fields as null), and tools that re-parse their input with the original
+        // zod schema would throw on the resumed leg even though the initial leg
+        // passed (see the identical branch in tool-builder/builder.ts).
         const isResuming = !!(context?.resumeData || context?.agent?.resumeData);
 
         let data: any = inputData;
-        if (!isResuming) {
-          // Validate input if schema exists
-          const validationResult = validateToolInput(this.inputSchema, inputData, this.id);
-          if (validationResult.error) {
+        // Validate input if schema exists
+        const validationResult = validateToolInput(this.inputSchema, inputData, this.id);
+        if (validationResult.error) {
+          if (!isResuming) {
             return validationResult.error;
           }
+        } else {
           data = validationResult.data;
         }
 
@@ -604,13 +636,25 @@ type ToolWithRawInput<
   TId extends string,
   TRequestContext,
   TRawInput,
-> = Tool<TSchemaIn, TSchemaOut, TSuspendSchema, TResumeSchema, TContext, TId, TRequestContext> & {
+  TTerminalResult,
+> = Tool<TSchemaIn, TSchemaOut, TSuspendSchema, TResumeSchema, TContext, TId, TRequestContext, TTerminalResult> & {
   /** Raw schema input is validated and transformed before the configured callback runs. */
   execute?: (
     inputData: TRawInput,
     context?: TContext,
   ) => ReturnType<
-    NonNullable<Tool<TSchemaIn, TSchemaOut, TSuspendSchema, TResumeSchema, TContext, TId, TRequestContext>['execute']>
+    NonNullable<
+      Tool<
+        TSchemaIn,
+        TSchemaOut,
+        TSuspendSchema,
+        TResumeSchema,
+        TContext,
+        TId,
+        TRequestContext,
+        TTerminalResult
+      >['execute']
+    >
   >;
 };
 
@@ -622,6 +666,7 @@ type CreateToolOpts<
   TResumeSchema extends SchemaLike,
   TRequestContext,
   TContext extends ToolExecutionContext<InferSchema<TSuspendSchema>, InferSchema<TResumeSchema>, TRequestContext>,
+  TTerminalResult,
 > = Omit<
   ToolAction<
     InferSchema<TInputSchema>,
@@ -630,7 +675,8 @@ type CreateToolOpts<
     InferSchema<TResumeSchema>,
     TContext,
     TId,
-    TRequestContext
+    TRequestContext,
+    TTerminalResult
   >,
   'inputSchema' | 'outputSchema' | 'suspendSchema' | 'resumeSchema'
 > & {
@@ -648,8 +694,18 @@ export function createTool<
   TRequestContext extends Record<string, any> | unknown = unknown,
   TContext extends ToolExecutionContext<InferSchema<TSuspendSchema>, InferSchema<TResumeSchema>, TRequestContext> =
     ToolExecutionContext<InferSchema<TSuspendSchema>, InferSchema<TResumeSchema>, TRequestContext>,
+  TTerminalResult = InferSchema<TOutputSchema>,
 >(
-  opts: CreateToolOpts<TId, TInputSchema, TOutputSchema, TSuspendSchema, TResumeSchema, TRequestContext, TContext>,
+  opts: CreateToolOpts<
+    TId,
+    TInputSchema,
+    TOutputSchema,
+    TSuspendSchema,
+    TResumeSchema,
+    TRequestContext,
+    TContext,
+    TTerminalResult
+  >,
 ): ToolWithRawInput<
   InferSchema<TInputSchema>,
   InferSchema<TOutputSchema>,
@@ -658,7 +714,8 @@ export function createTool<
   TContext,
   TId,
   TRequestContext,
-  InferSchemaInput<TInputSchema>
+  InferSchemaInput<TInputSchema>,
+  TTerminalResult
 > {
   return new Tool(opts) as ToolWithRawInput<
     InferSchema<TInputSchema>,
@@ -668,6 +725,7 @@ export function createTool<
     TContext,
     TId,
     TRequestContext,
-    InferSchemaInput<TInputSchema>
+    InferSchemaInput<TInputSchema>,
+    TTerminalResult
   >;
 }

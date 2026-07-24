@@ -152,6 +152,20 @@ describe('createDurableBackgroundTaskCheckStep', () => {
     expect(result.backgroundTaskPending).toBe(true);
   });
 
+  it('clears a foreground terminal result while durable background work is pending', async () => {
+    const { getInitData } = setupRegistry({ skipBgTaskWait: true, waitTimeoutMs: 60_000 });
+    const step = createDurableBackgroundTaskCheckStep();
+
+    const result = await (step as any).execute({
+      inputData: { ...baseInput(), terminalToolResult: { status: 'success', items: [] } },
+      retryCount: 0,
+      getInitData: getInitData(),
+    });
+
+    expect(result.backgroundTaskPending).toBe(true);
+    expect(result.terminalToolResult).toBeUndefined();
+  });
+
   it('waits with 1s default when no waitTimeoutMs is configured (retryCount=0)', async () => {
     const { waitForNextTask, getInitData } = setupRegistry({});
     const step = createDurableBackgroundTaskCheckStep();
@@ -184,5 +198,21 @@ describe('createDurableBackgroundTaskCheckStep', () => {
     expect(waitForNextTask).toHaveBeenCalledWith(['t1'], expect.objectContaining({ timeoutMs: 60_000 }));
     expect(result.backgroundTaskPending).toBe(true);
     expect(result.stepResult.isContinued).toBe(true);
+  });
+
+  it('keeps the pending marker when the durable wait times out', async () => {
+    const { waitForNextTask, getInitData } = setupRegistry({ waitTimeoutMs: 60_000 });
+    waitForNextTask.mockRejectedValueOnce(new Error('wait timeout'));
+    const step = createDurableBackgroundTaskCheckStep();
+
+    const result = await (step as any).execute({
+      inputData: { ...baseInput(), terminalToolResult: { status: 'success', items: [] } },
+      retryCount: 1,
+      getInitData: getInitData(),
+    });
+
+    expect(result.backgroundTaskPending).toBe(true);
+    expect(result.stepResult.isContinued).toBe(false);
+    expect(result.terminalToolResult).toBeUndefined();
   });
 });

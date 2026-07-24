@@ -68,6 +68,9 @@ export class ToolStream extends WritableStream<unknown> {
   }
 
   async custom<T extends { type: string }>(data: T extends { type: `data-${string}` } ? DataChunkType : T) {
+    if (data.type === 'data-terminal-tool-result') {
+      throw new TypeError('data-terminal-tool-result is reserved for framework terminal delivery');
+    }
     if (this.writeFn) {
       await this.writeFn(data);
     }

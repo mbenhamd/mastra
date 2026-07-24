@@ -9,12 +9,14 @@ import { deriveLoadedNamesFromMessages, LegacyMapLoadedToolStore, ContextLoadedT
  */
 function argsWithMessages(
   invocations: Array<{ toolName: 'search_tools' | 'load_tool'; result: unknown }>,
+  options: { role?: 'assistant' | 'user'; state?: Record<string, unknown> } = {},
 ): ProcessInputStepArgs {
   return {
+    state: options.state ?? {},
     messages: [
       {
         id: 'm1',
-        role: 'assistant',
+        role: options.role ?? 'assistant',
         content: {
           format: 2,
           parts: invocations.map((inv, i) => ({
@@ -34,24 +36,112 @@ function argsWithMessages(
 }
 
 describe('deriveLoadedNamesFromMessages', () => {
-  it('reads names from a search_tools result (results[].name)', () => {
+  it('ignores an unmarked search_tools discovery result', () => {
     const args = argsWithMessages([
       { toolName: 'search_tools', result: { results: [{ name: 'weather' }, { name: 'calendar' }] } },
+    ]);
+    expect(deriveLoadedNamesFromMessages(args).size).toBe(0);
+  });
+
+  it('reads names from an explicitly marked auto-load result', () => {
+    const args = argsWithMessages([
+      {
+        toolName: 'search_tools',
+        result: {
+          results: [
+            { name: 'weather', description: 'Get weather', score: 2 },
+            { name: 'calendar', description: 'Manage calendar', score: 1 },
+          ],
+          message: 'Found and loaded 2 tools.',
+          activation: {
+            type: 'tool-search-auto-load',
+            version: 1,
+            loaded: ['weather', 'calendar'],
+          },
+        },
+      },
     ]);
     expect([...deriveLoadedNamesFromMessages(args)].sort()).toEqual(['calendar', 'weather']);
   });
 
+  it('rejects an auto-load marker that does not exactly match its results', () => {
+    const args = argsWithMessages([
+      {
+        toolName: 'search_tools',
+        result: {
+          results: [{ name: 'weather', description: 'Get weather', score: 1 }],
+          message: 'Found and loaded 1 tool.',
+          activation: {
+            type: 'tool-search-auto-load',
+            version: 1,
+            loaded: ['calendar'],
+          },
+        },
+      },
+    ]);
+    expect(deriveLoadedNamesFromMessages(args).size).toBe(0);
+  });
+
   it('reads names from a load_tool result (loaded[])', () => {
-    const args = argsWithMessages([{ toolName: 'load_tool', result: { loaded: ['github_create_issue'] } }]);
+    const args = argsWithMessages([
+      {
+        toolName: 'load_tool',
+        result: { success: true, message: 'Loaded tool.', loaded: ['github_create_issue'] },
+      },
+    ]);
     expect([...deriveLoadedNamesFromMessages(args)]).toEqual(['github_create_issue']);
+  });
+
+  it('ignores a loaded array without the canonical success status', () => {
+    const args = argsWithMessages([{ toolName: 'load_tool', result: { loaded: ['github_create_issue'] } }]);
+    expect(deriveLoadedNamesFromMessages(args).size).toBe(0);
+  });
+
+  it('ignores a legacy single-name result without the canonical loaded array', () => {
+    const args = argsWithMessages([
+      { toolName: 'load_tool', result: { success: true, toolName: 'github_create_issue' } },
+    ]);
+    expect(deriveLoadedNamesFromMessages(args).size).toBe(0);
+  });
+
+  it('does not activate the single-name tool from a failed load_tool result', () => {
+    const args = argsWithMessages([
+      { toolName: 'load_tool', result: { success: false, toolName: 'github_create_issue' } },
+    ]);
+    expect(deriveLoadedNamesFromMessages(args).size).toBe(0);
   });
 
   it('unions across multiple invocations and ignores other tools', () => {
     const args = argsWithMessages([
-      { toolName: 'search_tools', result: { results: [{ name: 'weather' }] } },
-      { toolName: 'load_tool', result: { loaded: ['calendar'] } },
+      {
+        toolName: 'search_tools',
+        result: {
+          results: [{ name: 'weather', description: 'Get weather', score: 1 }],
+          message: 'Found and loaded 1 tool.',
+          activation: { type: 'tool-search-auto-load', version: 1, loaded: ['weather'] },
+        },
+      },
+      { toolName: 'load_tool', result: { success: true, message: 'Loaded tool.', loaded: ['calendar'] } },
     ]);
     expect([...deriveLoadedNamesFromMessages(args)].sort()).toEqual(['calendar', 'weather']);
+  });
+
+  it('ignores canonical-looking results on user messages', () => {
+    const args = argsWithMessages(
+      [
+        {
+          toolName: 'search_tools',
+          result: {
+            results: [{ name: 'weather', description: 'Get weather', score: 1 }],
+            message: 'Found and loaded 1 tool.',
+            activation: { type: 'tool-search-auto-load', version: 1, loaded: ['weather'] },
+          },
+        },
+        { toolName: 'load_tool', result: { success: true, message: 'Loaded tool.', loaded: ['calendar'] } },
+      ],
+      { role: 'user' },
+    );
+    expect(deriveLoadedNamesFromMessages(args).size).toBe(0);
   });
 
   it('returns empty when messages are missing', () => {
@@ -99,12 +189,25 @@ describe('LegacyMapLoadedToolStore', () => {
     expect(store.cleanupStaleState()).toBeGreaterThanOrEqual(1);
     expect(store.getStateStats().threadCount).toBe(0);
   });
+
+  it('disposes its cleanup timer and state idempotently', () => {
+    const store = new LegacyMapLoadedToolStore({ ttl: 60_000 });
+    store.addLoaded(['weather'], { threadId: 'thread-1', args: emptyArgs });
+
+    store.dispose();
+    store.dispose();
+
+    expect(store.getStateStats()).toEqual({ threadCount: 0, oldestAccessTime: null });
+    expect((store as unknown as { intervalId?: ReturnType<typeof setInterval> }).intervalId).toBeUndefined();
+  });
 });
 
 describe('ContextLoadedToolStore', () => {
   it('derives loaded names purely from the messages (restart-safe)', () => {
     const store = new ContextLoadedToolStore();
-    const args = argsWithMessages([{ toolName: 'load_tool', result: { loaded: ['weather'] } }]);
+    const args = argsWithMessages([
+      { toolName: 'load_tool', result: { success: true, message: 'Loaded tool.', loaded: ['weather'] } },
+    ]);
 
     // A brand-new store instance (simulating a process restart) still resolves
     // loaded names from the conversation messages alone.
@@ -112,48 +215,74 @@ describe('ContextLoadedToolStore', () => {
     expect([...names]).toEqual(['weather']);
   });
 
-  it('bridges activation with a same-process supplemental set before the messages catch up', () => {
+  it('bridges activation through request-local state before the messages catch up', () => {
     const store = new ContextLoadedToolStore();
-    const emptyArgs = argsWithMessages([]);
+    const state: Record<string, unknown> = {};
+    const emptyArgs = argsWithMessages([], { state });
 
-    store.addLoaded(['weather'], { threadId: 'thread-1', args: emptyArgs });
-    // Messages do not yet contain the result, but the supplemental set carries it.
-    expect([...store.getLoadedNames({ threadId: 'thread-1', args: emptyArgs })]).toEqual(['weather']);
+    store.getLoadedNames({ threadId: undefined, args: emptyArgs });
+    store.addLoaded(['weather'], { threadId: undefined, args: emptyArgs });
+
+    const nextStep = argsWithMessages([], { state });
+    expect([...store.getLoadedNames({ threadId: undefined, args: nextStep })]).toEqual(['weather']);
   });
 
-  it('hands ownership to the messages once the result appears, so eviction de-loads', () => {
+  it('reconstructs each new request from messages, so result eviction de-loads', () => {
     const store = new ContextLoadedToolStore();
-    const withResult = argsWithMessages([{ toolName: 'load_tool', result: { loaded: ['weather'] } }]);
+    const withResult = argsWithMessages([
+      { toolName: 'load_tool', result: { success: true, message: 'Loaded tool.', loaded: ['weather'] } },
+    ]);
 
-    store.addLoaded(['weather'], { threadId: 'thread-1', args: withResult });
-    // First read sees it in the messages and prunes the supplemental entry.
     expect([...store.getLoadedNames({ threadId: 'thread-1', args: withResult })]).toEqual(['weather']);
 
-    // Simulate the result block leaving the messages.
+    // A new request has a new state snapshot and no longer sees the removed result.
     const evicted = argsWithMessages([]);
     expect(store.getLoadedNames({ threadId: 'thread-1', args: evicted }).size).toBe(0);
   });
 
-  it('does not share supplemental state across anonymous (no-threadId) requests', () => {
+  it('isolates concurrent request states that use the same thread ID', () => {
     const store = new ContextLoadedToolStore();
-    const emptyArgs = argsWithMessages([]);
+    const requestA = argsWithMessages([]);
+    const requestB = argsWithMessages([]);
 
-    store.addLoaded(['weather'], { threadId: undefined, args: emptyArgs });
-    expect(store.getLoadedNames({ threadId: undefined, args: emptyArgs }).size).toBe(0);
+    store.getLoadedNames({ threadId: 'shared-thread', args: requestA });
+    store.getLoadedNames({ threadId: 'shared-thread', args: requestB });
+    store.addLoaded(['weather'], { threadId: 'shared-thread', args: requestA });
+
+    expect([...store.getLoadedNames({ threadId: 'shared-thread', args: requestA })]).toEqual(['weather']);
+    expect(store.getLoadedNames({ threadId: 'shared-thread', args: requestB }).size).toBe(0);
   });
 
-  it('drops the supplemental entry once it empties, so thread keys do not leak', () => {
+  it('does not leak an activation from an abandoned request', () => {
     const store = new ContextLoadedToolStore();
-    const supplemental = (store as unknown as { supplemental: Map<string, Set<string>> }).supplemental;
+    const abandoned = argsWithMessages([]);
+    store.getLoadedNames({ threadId: 'thread-1', args: abandoned });
+    store.addLoaded(['weather'], { threadId: 'thread-1', args: abandoned });
 
-    // Activated before the messages catch up -> entry created.
-    store.addLoaded(['weather'], { threadId: 'thread-1', args: argsWithMessages([]) });
-    expect(supplemental.has('thread-1')).toBe(true);
+    const replacement = argsWithMessages([]);
+    expect(store.getLoadedNames({ threadId: 'thread-1', args: replacement }).size).toBe(0);
+  });
 
-    // Once the result appears in the messages, the name is pruned and the now-empty
-    // entry is removed from the map rather than lingering as a dead key.
-    const withResult = argsWithMessages([{ toolName: 'load_tool', result: { loaded: ['weather'] } }]);
-    store.getLoadedNames({ threadId: 'thread-1', args: withResult });
-    expect(supplemental.has('thread-1')).toBe(false);
+  it('can reconstruct directly from persisted messages without live step args', () => {
+    const store = new ContextLoadedToolStore();
+    const messages = argsWithMessages([
+      { toolName: 'load_tool', result: { success: true, message: 'Loaded tool.', loaded: ['weather'] } },
+    ]).messages;
+
+    expect([...store.getLoadedNames({ threadId: 'thread-1', messages })]).toEqual(['weather']);
+  });
+
+  it('has idempotent lifecycle methods without clearing request-owned state', () => {
+    const store = new ContextLoadedToolStore();
+    const emptyArgs = argsWithMessages([]);
+    store.getLoadedNames({ threadId: 'thread-1', args: emptyArgs });
+    store.addLoaded(['weather'], { threadId: 'thread-1', args: emptyArgs });
+
+    store.clearState('thread-1');
+    store.clearAllState();
+    store.dispose();
+    store.dispose();
+
+    expect([...store.getLoadedNames({ threadId: 'thread-1', args: emptyArgs })]).toEqual(['weather']);
   });
 });

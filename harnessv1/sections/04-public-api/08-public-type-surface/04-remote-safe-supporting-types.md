@@ -108,9 +108,17 @@ interface RemoteSafeObservationalMemory {
   getReflectorModelId(): Awaitable<string | null>;
   getObservationThreshold(): Awaitable<number>;
   getReflectionThreshold(): Awaitable<number>;
+  // Unsupported until @mastra/memory supports effective per-turn OM engines;
+  // these validate and reject without persisting.
   switchObserverModel(opts: { model: string }): Promise<void>;
   switchReflectorModel(opts: { model: string }): Promise<void>;
-  getRecord(): Promise<ObservationalMemorySnapshot | null>;
-  loadProgress(): Promise<void>;
+  // Recovery for unsupported overrides persisted by older Harness builds.
+  clearOverride(): Promise<void>;
 }
 ```
+
+Harness v1 does not currently expose an OM snapshot read or a remote OM
+configuration route. Configure observational memory directly on the Agent's
+Memory instance. The snapshot type above remains the proposed JSON-safe shape
+for a future verified read API; it is not returned by the current `session.om`
+surface.

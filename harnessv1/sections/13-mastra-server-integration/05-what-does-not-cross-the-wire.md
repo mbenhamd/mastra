@@ -116,19 +116,20 @@ not `Session`, to keep the local/remote distinction enforced at the type system.
 
 **Asymmetric local/remote wrappers.** A handful of memory-served reads are sync
 on the in-process `Session` and async on `RemoteSession` — for example
-`getState`, `getDisplayState`, mode/model/O.M. config reads,
+`getState`, `getDisplayState`, and mode/model reads,
 concurrency/inspection reads, and `getGoal`. `getState` returns the same
 detached read-only state snapshot shape (`ReadonlyState<TState>`) on both
 surfaces, and `getDisplayState` returns the same JSON-safe
 `HarnessDisplayStateSnapshotV1` shape on both surfaces; only the sync/async
-wrapper differs. `session.om.getRecord()` is async on both surfaces because it
-reads the memory store, and remote callers receive the same JSON-safe
-`ObservationalMemorySnapshot` projection defined in §4.8, never the raw
-MemoryStorage OM row. Rich in-process display internals such as `Map`, `Set`, or
+wrapper differs. Rich in-process display internals such as `Map`, `Set`, or
 `Date` values do not cross this public boundary. `RemoteSafeSession` types these
 as `Awaitable<T> = T | Promise<T>` so both implementations satisfy the same
 portable interface. Persisted mutators are not part of this asymmetry:
-permission grants/revokes/policies, goal set/pause/resume/clear, OM model
-switches, and all other durable session mutations are `Promise`-returning on
-every session variant. In-process callers that prefer cheaper sync reads should
-narrow their parameter type to `Session` explicitly; portable code awaits.
+permission grants/revokes/policies, goal set/pause/resume/clear, and all other
+durable session mutations are `Promise`-returning on every session variant.
+Harness does not currently expose OM snapshot/config routes: configure and read
+OM through the Agent Memory domain. Local `session.om.switch*Model` calls reject
+without writing; `session.om.clearOverride()` is an idempotent local recovery
+operation for legacy poisoned rows. In-process callers that prefer cheaper sync
+reads should narrow their parameter type to `Session` explicitly; portable code
+awaits.

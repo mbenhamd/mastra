@@ -12,6 +12,7 @@ import { safeClose, safeEnqueue } from '../../stream/base';
 import type { ChunkType } from '../../stream/types';
 import { ChunkFrom } from '../../stream/types';
 import { hydrateRunScopeFromInternal } from '../hydrate-run-scope';
+import { createTerminalToolResultPartId, materializeTerminalToolResult } from '../shared/terminal-tool-result';
 import type { LoopRun } from '../types';
 import { AGENTIC_EXECUTION_WORKFLOW_ID } from './agentic-execution';
 import { createAgenticLoopWorkflow } from './agentic-loop';
@@ -59,18 +60,40 @@ export function workflowLoopStream<Tools extends ToolSet = ToolSet, OUTPUT = und
       // Create a ProcessorStreamWriter so output processors can emit custom chunks back to the stream
       const dataChunkStreamWriter = {
         custom: async (data: { type: string }) => {
+          if (data.type === 'data-terminal-tool-result') {
+            throw new TypeError('data-terminal-tool-result is reserved for framework terminal delivery');
+          }
           safeEnqueue(controller, data as ChunkType<OUTPUT>);
         },
       };
 
-      const outputWriter = async (chunk: ChunkType<OUTPUT>, options?: { messageId?: string }) => {
+      const terminalWriterAuthority = Symbol('terminal-tool-result-writer');
+      const outputWriter = async (
+        chunk: ChunkType<OUTPUT>,
+        options?: { messageId?: string; terminalAuthority?: symbol },
+      ) => {
+        const isTerminalDataPart = chunk.type === 'data-terminal-tool-result';
+        const hasTerminalAuthority = options?.terminalAuthority === terminalWriterAuthority;
+        if (isTerminalDataPart && !hasTerminalAuthority) {
+          throw new TypeError('data-terminal-tool-result is reserved for framework terminal delivery');
+        }
+        if (hasTerminalAuthority && chunk.type === 'step-finish') {
+          safeEnqueue(controller, chunk);
+          return;
+        }
+
         // Handle data-* chunks (custom data chunks from writer.custom())
         // These need to be persisted to storage, not just streamed
         // Transient chunks are streamed to the client but not saved to the DB
         if (chunk.type.startsWith('data-')) {
           // Run data-* chunks through output processors before persisting
           let processedChunk = chunk;
-          if (dataChunkProcessorRunner) {
+          if (isTerminalDataPart) {
+            processedChunk = {
+              ...chunk,
+              data: materializeTerminalToolResult(chunk.data),
+            } as ChunkType<OUTPUT>;
+          } else if (dataChunkProcessorRunner) {
             const {
               part: processed,
               blocked,
@@ -109,6 +132,18 @@ export function workflowLoopStream<Tools extends ToolSet = ToolSet, OUTPUT = und
             }
           }
 
+          if (!isTerminalDataPart && processedChunk.type === 'data-terminal-tool-result') {
+            throw new TypeError('Output processors cannot create reserved terminal tool-result parts');
+          }
+
+          if (isTerminalDataPart) {
+            // Terminal data is a transaction candidate, not an ordinary custom
+            // part. The outer MastraModelOutput stages it until matching
+            // step/FINISH authority and final persistence have succeeded.
+            safeEnqueue(controller, processedChunk);
+            return;
+          }
+
           // If a processor rewrote the chunk to a non-data type, skip persistence
           const responseMessageId = options?.messageId ?? messageId;
           if (
@@ -119,6 +154,7 @@ export function workflowLoopStream<Tools extends ToolSet = ToolSet, OUTPUT = und
           ) {
             const dataPart = {
               type: processedChunk.type as `data-${string}`,
+              ...('id' in processedChunk && typeof processedChunk.id === 'string' ? { id: processedChunk.id } : {}),
               data: 'data' in processedChunk ? processedChunk.data : undefined,
             };
             const message: MastraDBMessage = {
@@ -377,6 +413,33 @@ export function workflowLoopStream<Tools extends ToolSet = ToolSet, OUTPUT = und
 
           safeClose(controller);
           return;
+        }
+
+        if (executionResult.result.terminalToolResult) {
+          const terminalToolResult = materializeTerminalToolResult(executionResult.result.terminalToolResult);
+          const terminalStepCount = executionResult.result.output.steps.length;
+          await outputWriter(
+            {
+              type: 'data-terminal-tool-result',
+              id: createTerminalToolResultPartId(runId, terminalStepCount),
+              data: terminalToolResult,
+            },
+            {
+              terminalAuthority: terminalWriterAuthority,
+            },
+          );
+          await outputWriter(
+            {
+              type: 'step-finish',
+              runId,
+              from: ChunkFrom.AGENT,
+              payload: {
+                ...executionResult.result,
+                terminalToolResult,
+              },
+            } as ChunkType<OUTPUT>,
+            { terminalAuthority: terminalWriterAuthority },
+          );
         }
 
         await deleteRunSnapshots();

@@ -533,7 +533,7 @@ export interface GoalConfig {
  *
  * - `true`  → wrap with `createDurableAgent` using defaults on Mastra registration.
  * - object  → forwarded to `createDurableAgent` (cache, pubsub, maxSteps,
- *   cleanupTimeoutMs, id, name).
+ *   cleanupTimeoutMs, durableRequestContextKeys, id, name).
  *
  * See `packages/core/src/agent/durable/create-durable-agent.ts`.
  */
@@ -548,6 +548,8 @@ export type AgentDurableOption =
       maxSteps?: number;
       /** Auto-cleanup timer for durable stream state (ms). */
       cleanupTimeoutMs?: number;
+      /** Non-secret application RequestContext keys permitted in durable storage. */
+      durableRequestContextKeys?: readonly string[];
       /** Optional id override (defaults to agent.id). */
       id?: string;
       /** Optional name override (defaults to agent.name). */
@@ -690,10 +692,11 @@ interface AgentConfigBase<
    * - `true` → wraps with `createDurableAgent` using defaults when the agent is
    *   registered on a `Mastra` instance.
    * - object → forwarded to `createDurableAgent` (cache, pubsub, maxSteps,
-   *   cleanupTimeoutMs, id, name).
+   *   cleanupTimeoutMs, durableRequestContextKeys, id, name).
    *
-   * Ignored when the agent is used standalone (not attached to a `Mastra`
-   * instance). See {@link AgentDurableOption}.
+   * Registered agents are wrapped during registration. Standalone agents lazily
+   * create and reuse a durable wrapper on their first durable API call. See
+   * {@link AgentDurableOption}.
    *
    * @example
    * ```typescript

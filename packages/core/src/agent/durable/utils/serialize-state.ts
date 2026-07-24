@@ -99,6 +99,7 @@ export function serializeToolMetadata(name: string, tool: CoreTool): Serializabl
     ),
     hasSuspendSchema: approvalTool.hasSuspendSchema,
     recoveryFingerprint: approvalTool.recoveryFingerprint,
+    terminalResultFingerprint: tool.terminalResult ? createToolRecoveryFingerprint(tool.terminalResult) : undefined,
   };
 }
 
@@ -192,6 +193,7 @@ export function serializeScorersConfig(
  * Extract serializable state from _internal-like objects
  */
 export function serializeDurableState(params: {
+  memoryConfigured?: boolean;
   memoryConfig?: MemoryConfig;
   threadId?: string;
   resourceId?: string;
@@ -200,6 +202,7 @@ export function serializeDurableState(params: {
   observationalMemory?: boolean;
 }): SerializableDurableState {
   return {
+    memoryConfigured: params.memoryConfigured,
     memoryConfig: params.memoryConfig,
     threadId: params.threadId,
     resourceId: params.resourceId,
@@ -264,6 +267,7 @@ export function serializeDurableOptions(options: {
   toolHookPolicy?: SerializableDurableOptions['toolHookPolicy'];
   modelSettings?: SerializableModelSettings | Record<string, unknown>;
   requireToolApproval?: boolean;
+  permissionPolicyRequired?: boolean;
   toolCallConcurrency?: number;
   autoResumeSuspendedTools?: boolean;
   maxProcessorRetries?: number;
@@ -304,6 +308,7 @@ export function serializeDurableOptions(options: {
     toolHookPolicy: options.toolHookPolicy,
     modelSettings: serializeModelSettings(options.modelSettings),
     requireToolApproval: options.requireToolApproval,
+    permissionPolicyRequired: options.permissionPolicyRequired,
     toolCallConcurrency: options.toolCallConcurrency,
     autoResumeSuspendedTools: options.autoResumeSuspendedTools,
     maxProcessorRetries: options.maxProcessorRetries,
@@ -345,6 +350,7 @@ export function createWorkflowInput(params: {
   agentSpanData?: unknown;
   modelSpanData?: unknown;
   requestContextEntries?: Record<string, unknown>;
+  requiredRequestContextCapabilities?: DurableAgenticWorkflowInput['requiredRequestContextCapabilities'];
 }): DurableAgenticWorkflowInput {
   return {
     __workflowKind: 'durable-agent',
@@ -366,6 +372,7 @@ export function createWorkflowInput(params: {
     agentSpanData: params.agentSpanData,
     modelSpanData: params.modelSpanData,
     requestContextEntries: params.requestContextEntries,
+    requiredRequestContextCapabilities: params.requiredRequestContextCapabilities,
   };
 }
 

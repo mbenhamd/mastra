@@ -21,6 +21,7 @@ import type { ScorerResult } from '../loop';
 import type { ClientObservabilityCarrier, ObservabilityContext } from '../observability';
 import type { OutputProcessorOrWorkflow } from '../processors';
 import type { RequestContext } from '../request-context';
+import type { TerminalToolResult } from '../tools/types';
 import type { WorkflowRunStatus, WorkflowStepStatus } from '../workflows/types';
 import type { OutputSchema } from './base/schema';
 
@@ -1031,7 +1032,7 @@ export type TypedChunkType<OUTPUT = undefined> =
   | AgentChunkType<OUTPUT>
   | WorkflowStreamEvent
   | NetworkChunkType<OUTPUT>
-  | (DataChunkType & { from: never; runId: never; metadata?: BaseChunkType['metadata']; payload: never });
+  | (DataChunkType & { from?: never; runId?: never; metadata?: BaseChunkType['metadata']; payload?: never });
 
 // Default ChunkType for backward compatibility using dynamic (any) tool types
 export type ChunkType<OUTPUT = undefined> = TypedChunkType<OUTPUT>;
@@ -1110,6 +1111,8 @@ export type MastraOnFinishCallbackArgs<OUTPUT = undefined> = LLMStepResult<OUTPU
   totalUsage: LanguageModelUsage;
   model?: partialModel;
   runId?: string;
+  /** Bounded tool result that intentionally ended the run without another model call. */
+  terminalToolResult?: TerminalToolResult;
 };
 
 export type MastraOnFinishCallback<OUTPUT = undefined> = (

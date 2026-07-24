@@ -7,7 +7,12 @@ import { BM25Index } from '../../workspace/search/bm25';
 import type { TokenizeOptions } from '../../workspace/search/bm25';
 import type { ProcessInputStepArgs, Processor } from '../index';
 import type { LoadedToolStore, LoadedToolStoreContext } from './tool-search-stores';
-import { LegacyMapLoadedToolStore, ContextLoadedToolStore } from './tool-search-stores';
+import {
+  LegacyMapLoadedToolStore,
+  ContextLoadedToolStore,
+  TOOL_SEARCH_AUTO_LOAD_ACTIVATION_TYPE,
+  TOOL_SEARCH_AUTO_LOAD_ACTIVATION_VERSION,
+} from './tool-search-stores';
 
 export type ToolSearchFilterPhase = 'search' | 'load' | 'active';
 
@@ -68,11 +73,11 @@ export interface ToolSearchProcessorOptions {
    * - `'in-memory'` (default): the original behavior — loaded state lives in an
    *   in-memory `Map<threadId, Set>` with TTL cleanup (see `ttl`). Lost on restart;
    *   anonymous requests share a `'default'` entry.
-   * - `'context'`: derived from the conversation messages. A tool is loaded iff a
-   *   prior `search_tools`/`load_tool` result naming it is still present in the
-   *   conversation. Restart-safe, requires no memory, and de-loads automatically
-   *   when the result block is no longer present in the messages — parity with
-   *   native provider tool-search.
+   * - `'context'`: derived from canonical assistant tool results in the
+   *   conversation. `load_tool` results must contain `loaded`; `search_tools`
+   *   results activate tools only when auto-load emitted an explicit activation
+   *   receipt. Restart-safe, requires no memory, and de-loads automatically when
+   *   the result block is no longer present in the messages.
    *
    * @default 'in-memory'
    */
@@ -118,6 +123,8 @@ const TOOL_SEARCH_TOKENIZE_OPTIONS: TokenizeOptions = {
   splitPattern: /[\s\-_.,;:!?()[\]{}'"]+/,
 };
 
+const TOOL_SEARCH_META_TOOL_NAMES = new Set(['search_tools', 'load_tool']);
+
 /**
  * Processor that enables dynamic tool discovery and loading.
  *
@@ -154,11 +161,20 @@ export class ToolSearchProcessor implements Processor<'tool-search'> {
   readonly description = 'Enables dynamic tool discovery and loading via search';
 
   private allTools: Record<string, Tool<any, any>>;
+  private toolsById = new Map<string, Tool<any, any>>();
   private searchConfig: Required<NonNullable<ToolSearchProcessorOptions['search']>>;
   private filter?: ToolSearchProcessorOptions['filter'];
 
   /** Pluggable backend for loaded-tool state. */
   private store: LoadedToolStore;
+
+  /**
+   * Context-backed activation receipts are caller-visible conversation data.
+   * They are durable evidence, but not an authorization credential: Agent APIs
+   * accept assistant-shaped history from callers. Re-run the load policy when
+   * materializing those names so forged or stale receipts cannot bypass it.
+   */
+  private reauthorizeLoadedNames: boolean;
 
   /** BM25 index for tool search */
   private bm25Index: BM25Index;
@@ -167,6 +183,7 @@ export class ToolSearchProcessor implements Processor<'tool-search'> {
 
   constructor(options: ToolSearchProcessorOptions) {
     this.allTools = options.tools;
+    this.validateToolCatalog();
     this.filter = options.filter;
     this.searchConfig = {
       topK: options.search?.topK ?? 5,
@@ -175,6 +192,7 @@ export class ToolSearchProcessor implements Processor<'tool-search'> {
     };
 
     const storage = options.storage ?? 'in-memory';
+    this.reauthorizeLoadedNames = storage === 'context';
 
     this.store =
       storage === 'context' ? new ContextLoadedToolStore() : new LegacyMapLoadedToolStore({ ttl: options.ttl });
@@ -199,13 +217,41 @@ export class ToolSearchProcessor implements Processor<'tool-search'> {
   }
 
   private findToolById(toolId: string): Tool<any, any> | undefined {
-    return Object.values(this.allTools).find(tool => tool.id === toolId);
+    return this.toolsById.get(toolId);
   }
 
   private findToolForDynamicName(toolName: string): Tool<any, any> | undefined {
     const toolByKey = this.allTools[toolName];
     const toolById = this.findToolById(toolName);
-    return this.filter ? (toolById ?? toolByKey) : (toolByKey ?? toolById);
+    return toolById ?? toolByKey;
+  }
+
+  private validateToolCatalog(): void {
+    const keyOwners = new Map(Object.entries(this.allTools));
+
+    for (const [key, tool] of Object.entries(this.allTools)) {
+      if (TOOL_SEARCH_META_TOOL_NAMES.has(key) || TOOL_SEARCH_META_TOOL_NAMES.has(tool.id)) {
+        throw new Error(
+          `ToolSearchProcessor tool key and id must not use reserved meta-tool names: key="${key}", id="${tool.id}".`,
+        );
+      }
+
+      const duplicateId = this.toolsById.get(tool.id);
+      if (duplicateId) {
+        throw new Error(`ToolSearchProcessor requires unique tool ids; duplicate id "${tool.id}" was provided.`);
+      }
+      this.toolsById.set(tool.id, tool);
+    }
+
+    for (const [key, tool] of Object.entries(this.allTools)) {
+      const idOwner = this.toolsById.get(key);
+      if (idOwner && idOwner !== tool) {
+        const conflictingKey = [...keyOwners.entries()].find(([, candidate]) => candidate === idOwner)?.[0];
+        throw new Error(
+          `ToolSearchProcessor tool key "${key}" conflicts with the id of tool key "${conflictingKey ?? '<unknown>'}". Tool keys and ids must resolve unambiguously.`,
+        );
+      }
+    }
   }
 
   private async isToolAllowed(
@@ -263,6 +309,9 @@ export class ToolSearchProcessor implements Processor<'tool-search'> {
     for (const toolName of loadedNames) {
       const tool = this.findToolForDynamicName(toolName);
       if (tool) {
+        if (this.reauthorizeLoadedNames && !(await this.isToolAllowed(tool, requestContext, 'load'))) {
+          continue;
+        }
         const isAllowed = await this.isToolAllowed(tool, requestContext, 'active');
         if (isAllowed) {
           loadedTools[toolName] = tool;
@@ -279,13 +328,14 @@ export class ToolSearchProcessor implements Processor<'tool-search'> {
    *
    * Resolution:
    * - If `stepArgs` are supplied, resolve through the store with the live messages.
-   * - Otherwise (resume path) resolve from the store using the thread ID derived
-   *   from the request context. The context store falls back to its same-process
-   *   supplemental set.
+   * - Otherwise (resume path), the context store reconstructs from supplied
+   *   persisted messages. The in-memory store resolves by thread ID.
    */
   public async getLoadedToolsForRequestContext(args?: {
     requestContext?: RequestContext;
     stepArgs?: ProcessInputStepArgs;
+    /** Persisted messages supplied by a resume boundary before a live step exists. */
+    messages?: ProcessInputStepArgs['messages'];
   }): Promise<Record<string, Tool<any, any>>> {
     if (args?.stepArgs) {
       const loadedNames = await this.store.getLoadedNames(this.makeStoreContext(args.stepArgs));
@@ -295,29 +345,38 @@ export class ToolSearchProcessor implements Processor<'tool-search'> {
     }
 
     const threadId = (args?.requestContext?.get(MASTRA_THREAD_ID_KEY) as string | undefined) || undefined;
-    const loadedNames = await this.store.getLoadedNames({ threadId, args: undefined });
+    const loadedNames = await this.store.getLoadedNames({
+      threadId,
+      args: undefined,
+      messages: args?.messages,
+    });
     return this.getLoadedTools(loadedNames, args?.requestContext);
   }
 
   /**
    * Clear loaded tools for a specific thread (useful for testing).
    *
-   * Only affects the default `storage: 'in-memory'` store; a no-op for the
-   * `'context'` store, where loaded state lives in the conversation messages.
+   * This is a no-op for the `'context'` store. Its durable state is owned by
+   * conversation messages and its same-run bridge is owned by request state.
    *
    * @param threadId - The thread ID to clear, or 'default' if not provided
    */
   public clearState(threadId: string = 'default'): void {
-    if (this.store instanceof LegacyMapLoadedToolStore) this.store.clearState(threadId);
+    this.store.clearState(threadId);
   }
 
   /**
    * Clear all thread state for this processor instance (useful for testing).
    *
-   * Only affects the default `storage: 'in-memory'` store.
+   * This is a no-op for the `'context'` store.
    */
   public clearAllState(): void {
-    if (this.store instanceof LegacyMapLoadedToolStore) this.store.clearAllState();
+    this.store.clearAllState();
+  }
+
+  /** Release cleanup timers and process-local loaded-tool state. */
+  public dispose(): void {
+    this.store.dispose();
   }
 
   /**
@@ -422,6 +481,13 @@ export class ToolSearchProcessor implements Processor<'tool-search'> {
 
   async processInputStep(args: ProcessInputStepArgs) {
     const { tools, messageList } = args;
+    for (const metaToolName of TOOL_SEARCH_META_TOOL_NAMES) {
+      if (Object.prototype.hasOwnProperty.call(tools ?? {}, metaToolName)) {
+        throw new Error(
+          `ToolSearchProcessor cannot inject its "${metaToolName}" meta-tool because the input tool set already defines that name.`,
+        );
+      }
+    }
     const storeContext = this.makeStoreContext(args);
     // Snapshot of names already loaded as of this step. Newly activated tools are
     // recorded via the store and become available on the model's next turn.
@@ -464,10 +530,17 @@ export class ToolSearchProcessor implements Processor<'tool-search'> {
           }),
         ),
         message: z.string(),
+        activation: z
+          .object({
+            type: z.literal(TOOL_SEARCH_AUTO_LOAD_ACTIVATION_TYPE),
+            version: z.literal(TOOL_SEARCH_AUTO_LOAD_ACTIVATION_VERSION),
+            loaded: z.array(z.string()),
+          })
+          .optional(),
       }),
       execute: async ({ query }) => {
         // Use BM25 search for relevance-ranked results
-        const results = await this.searchTools(query, args.requestContext);
+        let results = await this.searchTools(query, args.requestContext);
 
         if (results.length === 0) {
           return {
@@ -477,6 +550,27 @@ export class ToolSearchProcessor implements Processor<'tool-search'> {
         }
 
         if (autoLoad) {
+          // Auto-load collapses discovery and loading into one operation, but it
+          // must not collapse their policy checks. A tool may be discoverable
+          // while loading it is forbidden for this request. Only expose and
+          // persist matches that pass the same load-phase gate as `load_tool`.
+          const loadAllowedResults: SearchResult[] = [];
+          for (const result of results) {
+            const tool = this.findToolById(result.name);
+            if (!tool) continue;
+            if (await this.isToolAllowed(tool, args.requestContext, 'load')) {
+              loadAllowedResults.push(result);
+            }
+          }
+          results = loadAllowedResults;
+
+          if (results.length === 0) {
+            return {
+              results: [],
+              message: `No tools available to load matching "${query}". Try different keywords.`,
+            };
+          }
+
           // Activate the matches immediately. They become usable on the next turn —
           // no explicit load_tool call needed. The store records the activation;
           // for the context store this result in the conversation messages is the durable record.
@@ -489,8 +583,21 @@ export class ToolSearchProcessor implements Processor<'tool-search'> {
           await this.store.addLoaded(newlyLoaded, storeContext);
           for (const name of newlyLoaded) loadedToolNames.add(name);
 
+          const activation: {
+            type: typeof TOOL_SEARCH_AUTO_LOAD_ACTIVATION_TYPE;
+            version: typeof TOOL_SEARCH_AUTO_LOAD_ACTIVATION_VERSION;
+            loaded: string[];
+          } = {
+            type: TOOL_SEARCH_AUTO_LOAD_ACTIVATION_TYPE,
+            version: TOOL_SEARCH_AUTO_LOAD_ACTIVATION_VERSION,
+            // Mark every result, including a repeat match that was already
+            // active. A cold replay can then recover from this result alone.
+            loaded: results.map(result => result.name),
+          };
+
           return {
             results,
+            activation,
             message:
               `Found and loaded ${results.length} tool(s): ${results.map(r => r.name).join(', ')}. ` +
               `They are available on your next turn — call them directly.` +
@@ -582,8 +689,9 @@ export class ToolSearchProcessor implements Processor<'tool-search'> {
           loaded.push(name);
         }
 
-        // Record newly loaded tools in the store. For the context store this
-        // result in the conversation messages is the durable record.
+        // Record newly loaded tools in the store. For the context store the
+        // canonical assistant result is the durable record; request state only
+        // bridges execution to later steps in this run.
         await this.store.addLoaded(loaded, storeContext);
         for (const name of loaded) loadedToolNames.add(name);
 
@@ -607,12 +715,14 @@ export class ToolSearchProcessor implements Processor<'tool-search'> {
               success: true,
               message: `Tool "${alreadyLoaded[0]}" is already loaded and available.`,
               toolName: alreadyLoaded[0],
+              loaded: [alreadyLoaded[0]!],
             };
           }
           return {
             success: true,
             message: `Tool "${loaded[0]}" loaded successfully. It will be available on your next turn.`,
             toolName: loaded[0],
+            loaded: [loaded[0]!],
           };
         }
 
@@ -635,6 +745,13 @@ export class ToolSearchProcessor implements Processor<'tool-search'> {
 
     // Get loaded tools as of this step's snapshot.
     const loadedTools = await this.getLoadedTools(loadedToolNames, args.requestContext);
+    for (const loadedToolName of Object.keys(loadedTools)) {
+      if (Object.prototype.hasOwnProperty.call(tools ?? {}, loadedToolName)) {
+        throw new Error(
+          `ToolSearchProcessor loaded tool "${loadedToolName}" conflicts with an always-available input tool.`,
+        );
+      }
+    }
 
     // Return merged tools, ordered to keep the cacheable prefix stable:
     // meta-tool(s) first (always present, fixed position), then existing tools,

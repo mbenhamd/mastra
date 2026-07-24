@@ -994,7 +994,11 @@ describe('Session token usage — durability', () => {
     const receiptId = Object.keys(session.getRecord().queueAdmissionReceipts ?? {})[0];
     expect(receiptId).toBeDefined();
     const beforeResumeTokens = session.getTokenUsage().totalTokens;
-    agent.enqueueRun({ runId: 'q-suspend-token-gap', finishReason: 'stop' });
+    agent.enqueueRun({
+      runId: 'q-suspend-token-gap',
+      finishReason: 'stop',
+      totalUsage: { inputTokens: 2, outputTokens: 2, totalTokens: 4 },
+    });
     await session.respondToToolApproval({ approved: true });
     await queued;
 
@@ -1040,6 +1044,48 @@ describe('Session token usage — durability', () => {
     ).toBe(true);
   });
 
+  it('expires an oversized pending interaction instead of bricking the session (PF-2251 step 3)', async () => {
+    const { harness, agent, storage } = setupHarness();
+    const writes: SessionRecord[] = [];
+    const saveSession = storage.saveSession.bind(storage);
+    vi.spyOn(storage, 'saveSession').mockImplementation(async (record, opts) => {
+      writes.push(JSON.parse(JSON.stringify(record)) as SessionRecord);
+      return saveSession(record, opts);
+    });
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    try {
+      agent.enqueueRun({
+        runId: 'msg-oversized-suspend',
+        finishReason: 'suspended',
+        suspendPayload: {
+          toolCallId: 'tc-oversized',
+          toolName: 'shell',
+          // Larger than the whole-record byte budget while remaining below it
+          // in UTF-16 code units. Storage limits are UTF-8 byte limits, so
+          // non-ASCII provider payloads must not bypass the survival guard.
+          args: { blob: '🧠'.repeat(300_000) },
+        },
+      });
+      const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+      await session.message({ content: 'needs approval' });
+
+      const finalWrite = writes.at(-1)!;
+      expect(finalWrite.pendingResume).toBeUndefined();
+      const expired = Object.values(finalWrite.expiredPendingInteractions ?? {});
+      expect(expired).toHaveLength(1);
+      expect(expired[0]).toMatchObject({
+        toolCallId: 'tc-oversized',
+        error: { code: 'harness.pending.record_size_budget' },
+      });
+      // The surviving record must be persistable — well under the budget.
+      expect(JSON.stringify(finalWrite).length).toBeLessThan(200_000);
+      expect(consoleError.mock.calls.some(call => String(call[0]).includes('size budget'))).toBe(true);
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
   it('parks resumed suspension state in the same write as token usage', async () => {
     const { harness, agent, storage } = setupHarness();
     const writes: SessionRecord[] = [];
@@ -1061,6 +1107,7 @@ describe('Session token usage — durability', () => {
     agent.enqueueRun({
       runId: 'msg-resuspend-token-gap',
       finishReason: 'suspended',
+      totalUsage: { inputTokens: 2, outputTokens: 2, totalTokens: 4 },
       suspendPayload: { toolCallId: 'tc-resuspend-second', toolName: 'shell', args: { cmd: 'pwd' } },
     });
     await session.respondToToolApproval({ approved: true });

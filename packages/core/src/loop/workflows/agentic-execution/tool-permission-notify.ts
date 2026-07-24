@@ -22,6 +22,10 @@ export interface ToolDeniedInfo {
   toolCallId?: string;
   /** True when the denial came from a forced `toolChoice` naming a denied tool (the run then throws). */
   forcedToolChoice?: boolean;
+  /** Total tools removed from one pre-exposure surface. */
+  deniedToolCount?: number;
+  /** Bounded deterministic sample for diagnostics; never carries arguments. */
+  deniedToolNames?: string[];
 }
 
 export type ToolDeniedCallback = (info: ToolDeniedInfo) => void;

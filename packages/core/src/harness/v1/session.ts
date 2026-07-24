@@ -40,6 +40,7 @@ import {
   AgentThreadSignalAdmissionError,
   isAgentThreadOutputDrainTeardownError,
 } from '../../agent/thread-stream-runtime';
+import { TOOL_PERMISSION_POLICY_KEY, TOOL_PERMISSION_POLICY_STABLE_KEY } from '../../agent/tool-permission-prefilter';
 import {
   captureSuspendedToolSurfaceFenceLease,
   clearSuspendedToolSurfaceFence,
@@ -67,11 +68,13 @@ import type {
   AgentSignalResultStatus,
   HarnessAssistantDraft,
   HarnessPlanTask,
+  HarnessPlanTaskStatus,
   HarnessRunSummary,
   HarnessStorage,
   HarnessStorageAttachmentUnavailableError,
   HarnessRuntimeDependencyRefs,
   InboxResponseReceipt,
+  PendingInteractionExpiryGeneration,
   QueueAdmissionReceipt,
   PendingResume,
   PermissionRules,
@@ -87,6 +90,7 @@ import type {
 import type { MastraModelOutput, FullOutput } from '../../stream/base/output';
 
 import { ASK_USER_TOOL_ID, SUBMIT_PLAN_TOOL_ID } from '../../tools/builtin';
+import { getTransformedToolPayload, hasTransformedToolPayload } from '../../tools/payload-transform';
 import type { Workspace } from '../../workspace';
 
 // §5.1 stable-hash canonicalization (centralized in ./canonical-json). Admission hashing here
@@ -116,11 +120,13 @@ import {
   HarnessInboxResponseConflictError,
   HarnessOutputGenerationError,
   HarnessOverrideConflictError,
+  HarnessPendingInteractionExpiredError,
   HarnessQueueFullDroppedError,
   HarnessQueueFullError,
   HarnessQueueItemExpiredError,
   HarnessSessionCancelledError,
   HarnessSessionClosedError,
+  HarnessSessionCorruptError,
   harnessSessionClosingError,
   HarnessSessionDeletedError,
   HarnessSessionLockedError,
@@ -129,6 +135,7 @@ import {
   HarnessStorageError,
   HarnessSkillArgsValidationError,
   HarnessSkillNotFoundError,
+  HarnessSubagentConcurrencyLimitError,
   HarnessSubagentDepthExceededError,
   HarnessValidationError,
   HarnessWorkspaceLostError,
@@ -171,9 +178,11 @@ import type {
   PlanTaskSessionPort,
   PlanTaskSummary,
   PlanTaskView,
+  ResetPlanTasksResult,
   UpdateTaskInput,
 } from './plan-task-session';
 import {
+  capturePlanTaskDelegationScope,
   planTaskAdd,
   planTaskCheck,
   planTaskComplete,
@@ -181,22 +190,32 @@ import {
   planTaskDelegate,
   planTaskReconcileDelegation,
   planTaskReparent,
+  planTaskReset,
   planTaskUpdate,
+  PLAN_TASK_MAX_NODES,
   PLAN_TASK_UPDATED_EVENT,
+  readDelegationAttemptMetadata,
 } from './plan-task-session';
-import {
-  createPlanTaskTools,
-  TASK_ADD_TOOL_ID,
-  TASK_CHECK_TOOL_ID,
-  TASK_COMPLETE_TOOL_ID,
-  TASK_DECOMPOSE_TOOL_ID,
-  TASK_DELEGATE_TOOL_ID,
-  TASK_REPARENT_TOOL_ID,
-  TASK_UPDATE_TOOL_ID,
-  TASK_WRITE_TOOL_ID,
-} from './plan-task-tool';
+import { createPlanTaskTools } from './plan-task-tool';
 import { callerRequestContextToPersisted, validateCallerRequestContext } from './request-context-input';
 import { createSpawnSubagentTool, SPAWN_SUBAGENT_TOOL_ID } from './spawn-subagent-tool';
+import { createSubagentOutcomeReportTool } from './subagent-outcome-tool';
+import type {
+  HarnessSubagentDirectAnswer,
+  HarnessSubagentResultSummary,
+  HarnessSubagentToolReceipt,
+} from './terminal-subagent-result';
+import {
+  HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID,
+  materializeHarnessTerminalText,
+  parseHarnessSubagentOutcomeReport,
+  parseHarnessSubagentTerminalResult,
+  parseHarnessTerminalToolResultText,
+  summarizeHarnessSubagentEventResult,
+  summarizeHarnessSubagentResult,
+  verifyHarnessSubagentTerminalCompletion,
+  withHarnessSubagentToolReceipts,
+} from './terminal-subagent-result';
 import type {
   AgentResult,
   AgentStream,
@@ -238,6 +257,7 @@ import type {
   ToolCategory,
   ActivityTimelineOptions,
   SessionActivityTimeline,
+  MessageAdmissionPhase,
 } from './types';
 
 type MessageAdmissionIdentity = {
@@ -273,6 +293,20 @@ type Deferred<T> = {
   reject: (reason: unknown) => void;
 };
 
+function harnessDisplayToolPayload(
+  metadata: unknown,
+  phase: 'input-delta' | 'input-available' | 'output-available' | 'error',
+  fallback: unknown,
+): unknown {
+  const transformed = getTransformedToolPayload(metadata, 'display', phase);
+  if (hasTransformedToolPayload(transformed)) return transformed.transformed;
+  // A display policy may intentionally suppress a payload. Never fall back to
+  // the raw value in that case, because Harness events are durable/replayable
+  // display records rather than the model's private transcript.
+  if (transformed?.suppress === true) return { suppressed: true };
+  return fallback;
+}
+
 /**
  * §S4.1 — a pending event-ledger append awaiting transient-failure retry. Everything
  * except `storedAt` is captured at enqueue time; `storedAt` is stamped at write time so
@@ -295,6 +329,15 @@ type MessageAdmissionStart = {
   modeId: string;
   modelId: string;
   promise: Promise<AgentSignalResultEvidence | OperationAdmissionTombstone>;
+  /**
+   * Set when the reservation write resolved this start as a duplicate of
+   * existing durable evidence (PF-2250 §1: the duplicate fast-path read no
+   * longer blocks admission, so a duplicate briefly registers a start entry
+   * before the reservation discovers the existing row). Readers polling the
+   * start map must treat such an entry as a duplicate admission, not a fresh
+   * dispatch.
+   */
+  duplicate?: boolean;
 };
 
 type MessageAdmissionHashes = {
@@ -308,8 +351,8 @@ type QueueResumeRecoveryResult =
   | { status: 'stale' };
 
 type ResumeResponseMode = 'agent-result' | 'inbox-receipt';
-type InboxReceiptResponseOptions = InboxResponseOptions & { responseId: string };
-type LegacyInboxResponseOptions = Omit<InboxResponseOptions, 'responseId'> & { responseId?: undefined };
+type InboxReceiptResponseOptions = Extract<InboxResponseOptions, { responseId: string }>;
+type LegacyInboxResponseOptions = Extract<InboxResponseOptions, { responseId?: undefined }>;
 type ActionCatalogSkillDescriptor = Pick<
   HarnessSkill,
   'name' | 'description' | 'filePath' | 'category' | 'action' | 'metadata'
@@ -335,6 +378,133 @@ type ActionCatalogMcpTimedOutWork = {
 const MAX_ABORTED_TOOL_TOMBSTONES = 4096;
 /** Defensive cap on exact-once tool-terminal observations across resumed segments. */
 const MAX_EMITTED_TOOL_TERMINALS = 4096;
+/** One session can expose only one pending interaction at a time; keep a small
+ * durable tail so late reconnect responses receive an exact expiry result
+ * without allowing tombstones to grow without bound. */
+const MAX_EXPIRED_PENDING_INTERACTIONS = 100;
+
+// Step ceiling for every harness-driven agent turn. Without an explicit
+// `maxSteps`, `agent.stream()`/`agent.generate()` fall back to the agent's
+// small default (5), and a tool-heavy turn terminates CLEANLY at the step
+// boundary with no synthesis text — live-diagnosed as a silent empty chat
+// turn: 5 tool-only steps, `finish-step`×5, `finish`, zero text deltas
+// (models that batch small parallel tool calls burn the budget fastest).
+// agent-controller.ts centralizes the same guarantee for CLI-harness runs
+// (CONTROLLER_MAX_STEPS); the harness governs runaway turns through its own
+// budgets and abort lanes, so this is an escape-proof ceiling, not pacing.
+const HARNESS_SESSION_MAX_STEPS = 1000;
+
+/**
+ * Empty-final-synthesis nudge. Live-diagnosed twice on the same day (a chat
+ * turn whose approved create tool succeeded, and a scripted journey whose
+ * create ran un-gated): some models execute action tools successfully and
+ * then finish the turn with zero visible text, so the user gets a mutation
+ * and silence. When the final iteration arrives with tool results somewhere
+ * in the segment and no text anywhere in it, force exactly ONE continuation
+ * step so the model states the outcome. One nudge per run segment — a model
+ * that stays silent twice is allowed to finish (never loop). Turns that end
+ * via a terminal tool result never reach this handler (the loop skips
+ * iteration-result handling for terminal delivery), and error/abort finishes
+ * are left alone.
+ */
+function createHarnessEmptySynthesisNudge(): (context: {
+  text: string;
+  toolResults: Array<{ id: string; name: string; result: unknown; error?: Error }>;
+  isFinal: boolean;
+  finishReason: string;
+}) => { continue: boolean; feedback: string } | undefined {
+  let nudged = false;
+  let segmentHasToolResults = false;
+  let segmentHasText = false;
+  return context => {
+    if (context.toolResults.length > 0) segmentHasToolResults = true;
+    if (context.text.trim() !== '') segmentHasText = true;
+    if (!context.isFinal || nudged || segmentHasText || !segmentHasToolResults) return undefined;
+    if (context.finishReason === 'error' || context.finishReason === 'abort') return undefined;
+    nudged = true;
+    return {
+      continue: true,
+      // Bare regeneration is not enough for models that habitually stop after
+      // tool use (live-verified): without explicit direction the extra step
+      // can end silent again. The feedback rides as a suppressed assistant
+      // note, so the model sees the instruction but transcripts stay clean.
+      feedback:
+        'You completed tool actions but sent the user no reply. In one or two short ' +
+        'sentences, state plainly what you did and the outcome. Do not call any more tools.',
+    };
+  };
+}
+
+// §10.2 receipts stay bounded on BOTH axes (PF-2250, live-diagnosed): the map
+// itself is idempotency state, so only a recent window is needed, and a stored
+// result must never carry provider payloads large enough to push the session
+// record past a storage document limit (Azure Responses reasoning blobs made a
+// single applied receipt ~400KB and broke every later saveSession with an
+// HTTP 500).
+const MAX_INBOX_RESPONSE_RECEIPTS = 64;
+const MAX_INBOX_RECEIPT_RESULT_BYTES = 64_000;
+
+function boundInboxReceiptResult(full: unknown): unknown {
+  try {
+    const serialized = JSON.stringify(full);
+    if (serialized === undefined || Buffer.byteLength(serialized, 'utf8') <= MAX_INBOX_RECEIPT_RESULT_BYTES) {
+      return full;
+    }
+  } catch {
+    // Unserializable results cannot be persisted faithfully either way.
+  }
+  const source = (full ?? {}) as { finishReason?: unknown; text?: unknown; usage?: unknown };
+  return {
+    truncated: true,
+    ...(source.finishReason === undefined ? {} : { finishReason: source.finishReason }),
+    ...(typeof source.text === 'string' ? { text: source.text.slice(0, 8_000) } : {}),
+    ...(source.usage === undefined ? {} : { usage: source.usage }),
+  };
+}
+
+function queueReceiptRecency(receipt: QueueAdmissionReceipt): number {
+  return (
+    receipt.completedAt ?? receipt.failedAt ?? receipt.acceptedAt ?? receipt.admittingAt ?? receipt.enqueuedAt ?? 0
+  );
+}
+
+function pruneQueueAdmissionReceipts(
+  receipts: Record<string, QueueAdmissionReceipt>,
+): Record<string, QueueAdmissionReceipt> {
+  const entries = Object.entries(receipts);
+  if (entries.length <= MAX_INBOX_RESPONSE_RECEIPTS) return receipts;
+  entries.sort((left, right) => queueReceiptRecency(right[1]) - queueReceiptRecency(left[1]));
+  return Object.fromEntries(entries.slice(0, MAX_INBOX_RESPONSE_RECEIPTS));
+}
+
+// Just under Convex's ~1MiB document limit, leaving headroom for envelope
+// fields the adapter adds around the record.
+const SESSION_RECORD_SIZE_BUDGET_BYTES = 900_000;
+
+function safeSerializedSize(value: unknown): number {
+  try {
+    const serialized = JSON.stringify(value);
+    return serialized === undefined ? 0 : Buffer.byteLength(serialized, 'utf8');
+  } catch {
+    return Number.MAX_SAFE_INTEGER;
+  }
+}
+
+function topRecordFieldSizes(record: SessionRecord): Array<[string, number]> {
+  return Object.entries(record as unknown as Record<string, unknown>)
+    .map(([key, value]) => [key, safeSerializedSize(value)] as [string, number])
+    .sort((left, right) => right[1] - left[1])
+    .slice(0, 5);
+}
+
+function pruneInboxResponseReceipts(
+  receipts: Record<string, InboxResponseReceipt>,
+): Record<string, InboxResponseReceipt> {
+  const entries = Object.entries(receipts);
+  if (entries.length <= MAX_INBOX_RESPONSE_RECEIPTS) return receipts;
+  entries.sort((left, right) => (right[1].updatedAt ?? 0) - (left[1].updatedAt ?? 0));
+  return Object.fromEntries(entries.slice(0, MAX_INBOX_RESPONSE_RECEIPTS));
+}
 
 const ASK_USER_TOOL_NAME = ASK_USER_TOOL_ID;
 const SUBMIT_PLAN_TOOL_NAME = SUBMIT_PLAN_TOOL_ID;
@@ -356,11 +526,15 @@ const QUEUE_POST_RUN_FINALIZATION_RETRY_MS = 1_000;
  * reconnect recover via the §10.5 snapshot path.
  */
 const MAX_PENDING_FAILED_EVENT_APPENDS = 256;
-/** TM-6 reconcile-on-rehydrate bounded retry (transient/CAS/locked failures). */
-const DELEGATION_RECONCILE_MAX_RETRIES = 5;
+/** TM-6 reconcile-on-rehydrate retry (transient/CAS/locked failures). */
 const DELEGATION_RECONCILE_RETRY_BASE_MS = 500;
-/** TM-6 `includeSubtree` transfer cap; a clipped subtree is flagged truncated. */
-const DELEGATED_SUBTREE_MAX_NODES = 100;
+const DELEGATION_RECONCILE_RETRY_MAX_MS = 30_000;
+/**
+ * TM-6 `includeSubtree` transfers the complete valid plan. The plan writer
+ * already enforces this bound, so a normal delegated child never receives a
+ * partial execution unit that the parent would later settle as complete.
+ */
+const DELEGATED_SUBTREE_MAX_NODES = PLAN_TASK_MAX_NODES;
 const ACTION_CATALOG_DEFAULT_LIMIT = 100;
 const ACTION_CATALOG_MAX_LIMIT = 500;
 const ACTION_CATALOG_MCP_LIST_TIMEOUT_MS = 2_000;
@@ -690,6 +864,40 @@ function startActionCatalogMcpListWithTimeout<T>(
   };
 }
 
+const DELEGATION_DEADLINE_REACHED = Symbol('delegation-deadline-reached');
+
+/** Race one durable delegation result against its persisted absolute deadline. */
+async function waitForDelegationResult<T>(
+  promise: Promise<T>,
+  deadlineAt: number,
+): Promise<T | typeof DELEGATION_DEADLINE_REACHED> {
+  const remainingMs = Math.max(0, deadlineAt - Date.now());
+  if (remainingMs === 0) return DELEGATION_DEADLINE_REACHED;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<typeof DELEGATION_DEADLINE_REACHED>(resolve => {
+    timer = setTimeout(() => resolve(DELEGATION_DEADLINE_REACHED), remainingMs);
+    if (typeof timer.unref === 'function') timer.unref();
+  });
+  try {
+    return await Promise.race([promise, deadline]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+function summarizeDelegationDeadline(deadlineAt: number): HarnessSubagentResultSummary {
+  const summary = summarizeHarnessSubagentEventResult(
+    summarizeHarnessSubagentResult(undefined, {
+      isError: true,
+      error: {
+        code: 'harness.delegation_timeout',
+        message: `The delegated subagent did not complete before its durable deadline (${deadlineAt})`,
+      },
+    }),
+  );
+  return { ...summary, outcome: 'failed' };
+}
+
 export type SessionLifecycleState = 'live' | 'closing' | 'closed' | 'deleted' | 'evicted';
 
 interface QueueBackpressureDrop {
@@ -743,40 +951,19 @@ const TOOL_CATEGORIES: readonly ToolCategory[] = ['read', 'edit', 'execute', 'mc
 const PERMISSION_POLICIES: readonly PermissionPolicy[] = ['allow', 'ask', 'deny'];
 
 /**
- * Harness-OWNED built-in tools (plan-task tools, spawn_subagent, task_delegate,
- * and the HITL suspension tools ask_user / submit_plan). Most are harness
- * infrastructure, NOT user/agent tools, so the §4.2e permission gate never applies
- * to them — an engaged default 'deny'/'ask' must not block or suspend the harness's
- * own orchestration (denying ask_user/submit_plan would break the question /
- * plan-approval flows the gate itself relies on). Escalation built-ins are
- * different: they cross session/agent capability boundaries and therefore honor
- * the engaged tool policy after anti-escalation allowlist checks. Kept in sync
- * with `_buildToolSurface`.
+ * Harness-owned control tools that must remain callable for the protocol itself
+ * to make progress. `ask_user` / `submit_plan` are the suspension boundary and
+ * `report_subagent_outcome` is the child session's mandatory terminal envelope.
+ *
+ * Plan mutation/check/delegation tools and `spawn_subagent` are intentionally
+ * absent: they mutate durable state or expand execution capability, so they obey
+ * the same permission policy and subagent capability allowlist as application
+ * tools. Kept in sync with `_buildToolSurface`.
  */
-const HARNESS_BUILTIN_TOOL_IDS: ReadonlySet<string> = new Set<string>([
-  TASK_ADD_TOOL_ID,
-  TASK_DECOMPOSE_TOOL_ID,
-  TASK_REPARENT_TOOL_ID,
-  TASK_UPDATE_TOOL_ID,
-  TASK_COMPLETE_TOOL_ID,
-  TASK_CHECK_TOOL_ID,
-  TASK_DELEGATE_TOOL_ID,
-  TASK_WRITE_TOOL_ID,
-  SPAWN_SUBAGENT_TOOL_ID,
+const UNGATED_HARNESS_BUILTIN_TOOL_IDS: ReadonlySet<string> = new Set<string>([
+  HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID,
   ASK_USER_TOOL_ID,
   SUBMIT_PLAN_TOOL_ID,
-]);
-
-/**
- * The subset of harness built-ins that a per-subagent `toolAllowlist` does NOT
- * auto-keep (M4): `spawn_subagent` / `task_delegate` are capability-escalation
- * vectors — a scoped subagent could otherwise run a broader child. Under an
- * allowlist these must be listed explicitly to be available. Everything else in
- * HARNESS_BUILTIN_TOOL_IDS (HITL + local plan-task orchestration) is always kept.
- */
-const ESCALATION_BUILTIN_TOOL_IDS: ReadonlySet<string> = new Set<string>([
-  SPAWN_SUBAGENT_TOOL_ID,
-  TASK_DELEGATE_TOOL_ID,
 ]);
 
 function assertToolCategory(method: string, value: unknown): asserts value is ToolCategory {
@@ -892,7 +1079,7 @@ export interface ActiveSubagentState {
    * the `subagent_*` event family). Best-effort + in-memory: updated as the
    * child's bridged events arrive; absent fields mean "not yet observed".
    */
-  status?: 'running' | 'completed' | 'failed';
+  status?: 'running' | 'awaiting_input' | 'completed' | 'failed';
   /** The child's currently-executing tool, if one is in flight; cleared when it ends. */
   currentToolName?: string;
   /** Count of child tool calls observed so far. */
@@ -1010,8 +1197,23 @@ interface OpenRunSpan {
 
 /** Bound on the finalized-runId dedup set (oldest entries dropped wholesale; re-finalizing an ancient runId is impossible in practice). */
 const MAX_FINALIZED_RUN_IDS = 4096;
-const MAX_ASSISTANT_DRAFT_CHARS = 128_000;
+const MAX_DELIVERED_TERMINAL_SUBAGENT_ANSWERS = 4096;
+/** Bounded safe receipt evidence retained per run for subagent settlement. */
+const MAX_HARNESS_RUN_TOOL_RECEIPTS = 256;
+const MAX_HARNESS_RUN_TOOL_RECEIPT_BYTES = 64 * 1024;
+const MAX_HARNESS_RUN_TOOL_RECEIPT_SETS = 64;
+/**
+ * Drafts share the parent SessionRecord with queues, receipts, policy and run
+ * state. Bound both each streamed field and the whole draft projection in
+ * UTF-8 bytes so multibyte output cannot silently exceed a storage adapter's
+ * document limit (Convex, for example, caps a document at 1 MiB).
+ */
+const MAX_ASSISTANT_DRAFT_FIELD_BYTES = 128_000;
+const MAX_PERSISTED_ASSISTANT_DRAFT_BYTES = 384 * 1024;
+const MAX_PERSISTED_ASSISTANT_DRAFTS = 8;
 const ASSISTANT_DRAFT_FLUSH_DELAY_MS = 250;
+const ASSISTANT_DRAFT_TEXT_ENCODER = new TextEncoder();
+const ASSISTANT_DRAFT_TEXT_DECODER = new TextDecoder();
 
 export interface SessionDisplayState {
   // Identity
@@ -1063,20 +1265,26 @@ export interface SessionDisplayState {
 
 export type SessionDisplayPending = Omit<
   NonNullable<SessionRecord['pendingResume']>,
-  'runtimeDependencies' | 'requestContext' | 'toolSurfaceFence'
->;
+  'runtimeDependencies' | 'requestContext' | 'toolSurfaceFence' | 'toolReceipts' | 'toolReceiptsOverflow' | 'expiresAt'
+> & { expiresAt: number };
 
 function pendingResumeForDisplay(pending: SessionRecord['pendingResume']): SessionDisplayPending | null {
   if (!pending) return null;
-  // Strip storage-internal recovery fields (runtimeDependencies) and the caller
-  // app bag (requestContext) — neither belongs on the public display projection.
+  // Strip storage-internal recovery fields and the caller app bag. Receipt
+  // identities authenticate a terminal report after restart; they are not the
+  // UI's activity feed (tool events already provide that public projection).
   const {
     runtimeDependencies: _runtimeDependencies,
     requestContext: _requestContext,
     toolSurfaceFence: _toolSurfaceFence,
+    toolReceipts: _toolReceipts,
+    toolReceiptsOverflow: _toolReceiptsOverflow,
     ...displayPending
   } = pending;
-  return displayPending;
+  return {
+    ...displayPending,
+    expiresAt: pending.expiresAt,
+  };
 }
 
 /**
@@ -1156,6 +1364,8 @@ export class Session {
   private _queueWakeTimer?: ReturnType<typeof setTimeout>;
   private _queueWakeAt?: number;
   private _queuedResumeRecoveryTimer?: ReturnType<typeof setTimeout>;
+  private _pendingInteractionExpiryTimer?: ReturnType<typeof setTimeout>;
+  private _pendingInteractionExpiryAt?: number;
   /**
    * Tracks the AbortController for the currently-running turn (message or
    * queued). Set when a turn begins, cleared on terminal completion or
@@ -1241,16 +1451,53 @@ export class Session {
    */
   private readonly _abortedToolTombstones = new Set<string>();
   private readonly _toolInputBuffers = new Map<string, { toolName: string; text: string }>();
+  private readonly _runToolReceipts = new Map<
+    string,
+    {
+      receipts: HarnessSubagentToolReceipt[];
+      exact: Set<string>;
+      bytes: number;
+      overflow: boolean;
+    }
+  >();
   private readonly _activeSubagents = new Map<string, ActiveSubagentState>();
+  /** Exact child ids claimed by either a new delegation or its recovery driver. */
+  private readonly _delegationDriverClaims = new Set<string>();
+  /** Framework-staged direct answers, held until the matching authoritative step-finish supplies the message id. */
+  private readonly _pendingTerminalSubagentAnswers = new Map<
+    string,
+    { partId: string; answer: HarnessSubagentDirectAnswer }
+  >();
+  /** `${runId}:${partId}` deduplication for duplicate/replayed terminal frames. */
+  private readonly _deliveredTerminalSubagentAnswers = new Set<string>();
   private readonly _assistantDrafts = new Map<string, HarnessAssistantDraft>();
   private _assistantDraftFlushTimer: ReturnType<typeof setTimeout> | undefined;
   private _assistantDraftFlushDirty = false;
-  /** §SA3 — count of `spawn_subagent` children currently in flight from this parent
-   *  (incremented at the spawn gate, decremented when the child settles). Used for
-   *  the `subagents.maxConcurrent` backpressure check; counts the create window too. */
-  _subagentSpawnInFlight = 0;
+  private _assistantDraftFlushUrgent = false;
+  /** At most one draft checkpoint may be queued/running on the session CAS chain. */
+  private _assistantDraftFlushInFlight: Promise<void> | undefined;
+  /**
+   * §SA3 — shared parent-local reservation count for inline `spawn_subagent`
+   * and durable `task_delegate` work. It includes the create/link window so two
+   * parallel tool calls cannot both observe a free final slot.
+   */
+  private _subagentExecutionsInFlight = 0;
+  /**
+   * Same-owner admission fence for destructive Stop/revision operations. A
+   * turn or resume captures the epoch before asynchronous preflight; Stop bumps
+   * it synchronously, so work that was admitted against the old branch cannot
+   * create/link a child or begin a resume afterward.
+   */
+  private _activeWorkAdmissionEpoch = 0;
+  private _activeWorkInvalidationsInFlight = 0;
   /** TM-6 reconcile-on-rehydrate pending retry timers (cleared on close). */
   private readonly _delegationReconcileRetryTimers = new Set<ReturnType<typeof setTimeout>>();
+  /** Concurrent hydrate/retry callers join one recovery scan. */
+  private _delegationReconcileInFlight: Promise<void> | undefined;
+  /** A recovery request arrived while the current scan was still running. */
+  private _delegationReconcileRerunRequested = false;
+  /** A hydrate scan found durable delegated work but no shared execution slot. */
+  private _delegationReconcileCapacityBlocked = false;
   /**
    * §5.1k / TM-5 bounded plan-task summary for `getDisplayState()`. Kept in
    * memory and refreshed for FREE on every plan-task mutation (the mutator
@@ -1260,6 +1507,8 @@ export class Session {
    */
   private _planTaskSummary: PlanTaskSummary | undefined;
   private _planTaskSummarySeeded = false;
+  /** Single-flight for the one authoritative summary seed used by display and turn instructions. */
+  private _planTaskSummarySeedPromise: Promise<PlanTaskSummary | undefined> | undefined;
   /**
    * Cumulative usage for the session's thread. Live counter, single source of
    * truth in-process. Seeded from `internals.record.tokenUsage` in the
@@ -1469,7 +1718,7 @@ export class Session {
         nextSequence: internals.eventReplaySeed?.nextSequence,
         // §10.3 / §13.x — bound an oversized CUSTOM-event payload at emit with the
         // SAME projection + sentinel the tool-event sites use, read at emit time so
-        // the cap tracks `files.maxEventPayloadBytes`. Undefined → no cap (opt-in).
+        // The cap tracks `files.maxEventPayloadBytes` (Harness defaults it to 64 KiB).
         maxCustomEventPayloadBytes: () => this._harness._internalMaxEventPayloadBytes,
       },
     );
@@ -2156,6 +2405,12 @@ export class Session {
       case 'agent_start':
         entry.status = 'running';
         break;
+      case 'tool_approval_required':
+      case 'tool_suspension_required':
+      case 'question_pending':
+      case 'plan_approval_required':
+        entry.status = 'awaiting_input';
+        break;
       case 'tool_start':
         entry.currentToolName = event.toolName;
         entry.toolCalls = (entry.toolCalls ?? 0) + 1;
@@ -2178,6 +2433,88 @@ export class Session {
         return; // text/reasoning deltas don't change the projection
     }
     entry.updatedAt = Date.now();
+    this._notifyDisplayRefresh();
+  }
+
+  /**
+   * @internal — mirror a delegated child's pending interaction onto the
+   * PARENT event stream. The owning inbox remains the child session; the
+   * bridged event only supplies parent activity/replay consumers with the
+   * correlation needed to render the wait and route the response correctly.
+   */
+  private _emitDelegatedSubagentPendingEvent(
+    event: Extract<
+      HarnessEvent,
+      {
+        type: 'tool_approval_required' | 'tool_suspension_required' | 'question_pending' | 'plan_approval_required';
+      }
+    >,
+    correlation: { parentToolCallId: string; subagentSessionId: string },
+  ): void {
+    const { id: _id, timestamp: _timestamp, sessionId: _sessionId, source: _source, ...payload } = event;
+    // SuspensionSource is a discriminated union: parent events do not declare
+    // the child-only correlation keys, so strip them from a widened copy rather
+    // than destructuring properties that are absent on one union member.
+    const bridgedPayload = { ...payload } as Record<string, unknown>;
+    delete bridgedPayload.subagentToolCallId;
+    delete bridgedPayload.subagentSessionId;
+    this._emitter.emit({
+      ...bridgedPayload,
+      source: 'subagent',
+      subagentToolCallId: correlation.parentToolCallId,
+      subagentSessionId: correlation.subagentSessionId,
+    } as EmitInput);
+  }
+
+  /**
+   * @internal — capture the conversation-work epoch for an inline subagent
+   * spawn. The built-in tool lives in a separate module, so it uses this narrow
+   * facade instead of reaching into the private revision fence directly.
+   */
+  _internalCaptureSubagentAdmission(): number {
+    return this._captureActiveWorkAdmission('spawn_subagent');
+  }
+
+  /** @internal — recheck an inline spawn against edit/retry/Stop invalidation. */
+  _internalAssertSubagentAdmission(epoch: number, signal?: AbortSignal): void {
+    this._assertActiveWorkAdmission(epoch, 'spawn_subagent', signal);
+  }
+
+  /**
+   * @internal — atomically reserve one parent-local subagent execution slot.
+   * JavaScript runs this read/increment without an await boundary, so parallel
+   * inline and durable tool calls cannot both claim the last slot.
+   */
+  _internalTryReserveSubagentExecution():
+    | { reserved: true; inFlight: number; maxConcurrent?: number }
+    | { reserved: false; inFlight: number; maxConcurrent: number } {
+    const maxConcurrent = this._harness._getSubagentMaxConcurrent();
+    if (maxConcurrent !== undefined && this._subagentExecutionsInFlight >= maxConcurrent) {
+      return { reserved: false, inFlight: this._subagentExecutionsInFlight, maxConcurrent };
+    }
+    this._subagentExecutionsInFlight += 1;
+    return {
+      reserved: true,
+      inFlight: this._subagentExecutionsInFlight,
+      ...(maxConcurrent !== undefined ? { maxConcurrent } : {}),
+    };
+  }
+
+  /** @internal — release a slot previously returned by the reservation method. */
+  _internalReleaseSubagentExecution(): void {
+    // Every caller releases in a `finally`. Clamp defensively so a late cleanup
+    // can never turn an accidental duplicate release into an unlimited bypass.
+    this._subagentExecutionsInFlight = Math.max(0, this._subagentExecutionsInFlight - 1);
+    if (this._delegationReconcileCapacityBlocked && this._state === 'live') {
+      this._delegationReconcileCapacityBlocked = false;
+      this._scheduleDelegationReconcileRetry(0);
+    }
+    this._notifyMaybeIdle();
+  }
+
+  /** @internal — current shared count, exposed only for deterministic tests. */
+  get _internalSubagentExecutionsInFlight(): number {
+    return this._subagentExecutionsInFlight;
   }
 
   /** @internal — number of registered listeners (for tests). */
@@ -2224,6 +2561,7 @@ export class Session {
    * (`_tokenUsage`) intentionally persist across turns within a session.
    */
   private _resetTurnTracking(): void {
+    if (this._currentRunId !== undefined) this._pendingTerminalSubagentAnswers.delete(this._currentRunId);
     this._currentRunId = undefined;
     this._currentAssistantDraftRunIds.clear();
     this._currentRunStartedAt = undefined;
@@ -2262,6 +2600,7 @@ export class Session {
       // a streaming consumer always gets a terminal for every `tool_start`. On a
       // normal turn the drain already removed every tool, so this is a no-op.
       this._emitAbortedToolEnds();
+      if (this._currentRunId !== undefined) this._pendingTerminalSubagentAnswers.delete(this._currentRunId);
       this._currentRunId = undefined;
       this._currentRunStartedAt = undefined;
       this._currentRunModeId = undefined;
@@ -2290,16 +2629,34 @@ export class Session {
 
   private _appendBoundedDraftText(previous: string | undefined, delta: string): { text: string; truncated: boolean } {
     const next = `${previous ?? ''}${delta}`;
-    if (next.length <= MAX_ASSISTANT_DRAFT_CHARS) {
+    const encoded = ASSISTANT_DRAFT_TEXT_ENCODER.encode(next);
+    if (encoded.byteLength <= MAX_ASSISTANT_DRAFT_FIELD_BYTES) {
       return { text: next, truncated: false };
     }
-    return { text: next.slice(next.length - MAX_ASSISTANT_DRAFT_CHARS), truncated: true };
+    let start = encoded.byteLength - MAX_ASSISTANT_DRAFT_FIELD_BYTES;
+    // Keep the newest tail without starting inside a UTF-8 continuation byte.
+    while (start < encoded.byteLength && (encoded[start]! & 0xc0) === 0x80) start += 1;
+    return {
+      text: ASSISTANT_DRAFT_TEXT_DECODER.decode(encoded.subarray(start)),
+      truncated: true,
+    };
   }
 
   private _pruneAssistantDrafts(): void {
-    if (this._assistantDrafts.size <= 8) return;
-    const ordered = Array.from(this._assistantDrafts.values()).sort((a, b) => b.updatedAt - a.updatedAt);
-    const keep = new Set(ordered.slice(0, 8).map(draft => draft.runId));
+    const ordered = Array.from(this._assistantDrafts.values())
+      .map((draft, insertionIndex) => ({ draft, insertionIndex }))
+      .sort((a, b) => b.draft.updatedAt - a.draft.updatedAt || b.insertionIndex - a.insertionIndex)
+      .slice(0, MAX_PERSISTED_ASSISTANT_DRAFTS);
+    const kept: Record<string, HarnessAssistantDraft> = {};
+    for (const { draft } of ordered) {
+      const candidate = { ...kept, [draft.runId]: draft };
+      const candidateBytes = ASSISTANT_DRAFT_TEXT_ENCODER.encode(JSON.stringify(candidate)).byteLength;
+      // A pathologically large identity/metadata field must not make the
+      // entire SessionRecord unwriteable. Normal drafts always fit at least
+      // one entry because their two streamed fields are independently bound.
+      if (candidateBytes <= MAX_PERSISTED_ASSISTANT_DRAFT_BYTES) kept[draft.runId] = draft;
+    }
+    const keep = new Set(Object.keys(kept));
     for (const runId of this._assistantDrafts.keys()) {
       if (!keep.has(runId)) this._assistantDrafts.delete(runId);
     }
@@ -2308,6 +2665,11 @@ export class Session {
   private _scheduleAssistantDraftFlush(delayMs = ASSISTANT_DRAFT_FLUSH_DELAY_MS): void {
     if (this._state === 'closed' || this._state === 'deleted' || this._state === 'evicted') return;
     this._assistantDraftFlushDirty = true;
+    if (delayMs <= 0) this._assistantDraftFlushUrgent = true;
+    // A slow adapter must never accumulate one full-session CAS write for
+    // every debounce interval. The active checkpoint's completion schedules
+    // exactly one trailing snapshot when newer deltas made the state dirty.
+    if (this._assistantDraftFlushInFlight !== undefined) return;
     if (this._assistantDraftFlushTimer !== undefined) {
       if (delayMs > 0) return;
       clearTimeout(this._assistantDraftFlushTimer);
@@ -2315,27 +2677,58 @@ export class Session {
     }
     this._assistantDraftFlushTimer = setTimeout(() => {
       this._assistantDraftFlushTimer = undefined;
-      void this._flushAssistantDraftsNow().catch(() => {});
+      this._assistantDraftFlushUrgent = false;
+      void this._startAssistantDraftFlush().catch(() => {});
     }, delayMs);
     this._assistantDraftFlushTimer.unref?.();
   }
 
-  private async _flushAssistantDraftsNow(): Promise<void> {
-    if (this._assistantDraftFlushTimer !== undefined) {
-      clearTimeout(this._assistantDraftFlushTimer);
-      this._assistantDraftFlushTimer = undefined;
-    }
-    if (!this._assistantDraftFlushDirty) return;
+  private _startAssistantDraftFlush(): Promise<void> {
+    if (this._assistantDraftFlushInFlight !== undefined) return this._assistantDraftFlushInFlight;
+    if (!this._assistantDraftFlushDirty) return Promise.resolve();
     this._assistantDraftFlushDirty = false;
+    this._assistantDraftFlushUrgent = false;
     const assistantDrafts = this._persistedAssistantDrafts(this._assistantDraftSnapshot());
-    try {
-      await this._flushUpdate(prev => ({ ...prev, assistantDrafts }));
-    } catch (err) {
-      if (this._state !== 'closed' && this._state !== 'deleted' && this._state !== 'evicted') {
-        this._assistantDraftFlushDirty = true;
-        this._scheduleAssistantDraftFlush(ASSISTANT_DRAFT_FLUSH_DELAY_MS);
+
+    let run!: Promise<void>;
+    run = (async () => {
+      try {
+        await this._flushUpdate(prev => ({ ...prev, assistantDrafts }));
+      } catch (err) {
+        if (this._state !== 'closed' && this._state !== 'deleted' && this._state !== 'evicted') {
+          this._assistantDraftFlushDirty = true;
+        }
+        throw err;
+      } finally {
+        if (this._assistantDraftFlushInFlight === run) this._assistantDraftFlushInFlight = undefined;
+        if (
+          this._assistantDraftFlushDirty &&
+          this._state !== 'closed' &&
+          this._state !== 'deleted' &&
+          this._state !== 'evicted'
+        ) {
+          this._scheduleAssistantDraftFlush(this._assistantDraftFlushUrgent ? 0 : ASSISTANT_DRAFT_FLUSH_DELAY_MS);
+        }
       }
-      throw err;
+    })();
+    this._assistantDraftFlushInFlight = run;
+    return run;
+  }
+
+  /** Terminal/shutdown barrier: persist the latest dirty generation. */
+  private async _flushAssistantDraftsNow(): Promise<void> {
+    while (true) {
+      if (this._assistantDraftFlushTimer !== undefined) {
+        clearTimeout(this._assistantDraftFlushTimer);
+        this._assistantDraftFlushTimer = undefined;
+      }
+      const inFlight = this._assistantDraftFlushInFlight;
+      if (inFlight !== undefined) {
+        await inFlight;
+        continue;
+      }
+      if (!this._assistantDraftFlushDirty) return;
+      await this._startAssistantDraftFlush();
     }
   }
 
@@ -2345,21 +2738,15 @@ export class Session {
     delta: string;
     messageId?: string;
   }): void {
-    if (opts.delta.length === 0) return;
+    // Reasoning remains a live stream event for consumers that explicitly
+    // support it, but it is never copied into the durable assistant-answer
+    // recovery projection. A reasoning-only run must not become visible as an
+    // assistant answer after restart.
+    if (opts.kind !== 'text' || opts.delta.length === 0) return;
     const now = Date.now();
     this._currentAssistantDraftRunIds.add(opts.runId);
     const previous = this._assistantDrafts.get(opts.runId);
-    const text =
-      opts.kind === 'text'
-        ? this._appendBoundedDraftText(previous?.text, opts.delta)
-        : { text: previous?.text ?? '', truncated: previous?.truncated === true };
-    const reasoningText =
-      opts.kind === 'reasoning'
-        ? this._appendBoundedDraftText(previous?.reasoningText, opts.delta)
-        : {
-            text: previous?.reasoningText ?? '',
-            truncated: previous?.truncated === true,
-          };
+    const text = this._appendBoundedDraftText(previous?.text, opts.delta);
     const previousIsTerminal =
       previous?.status === 'completed' || previous?.status === 'interrupted' || previous?.status === 'failed';
     const draft: HarnessAssistantDraft = {
@@ -2371,13 +2758,12 @@ export class Session {
       ...(this._currentQueuedItemId !== undefined ? { queuedItemId: this._currentQueuedItemId } : {}),
       ...((opts.messageId ?? previous?.messageId) ? { messageId: opts.messageId ?? previous?.messageId } : {}),
       text: text.text,
-      ...(reasoningText.text.length > 0 ? { reasoningText: reasoningText.text } : {}),
       status: previousIsTerminal ? previous.status : 'streaming',
       startedAt: previous?.startedAt ?? this._currentRunStartedAt ?? now,
       updatedAt: now,
       ...(previousIsTerminal && previous.terminalAt !== undefined ? { terminalAt: previous.terminalAt } : {}),
       ...(previousIsTerminal && previous.finishReason !== undefined ? { finishReason: previous.finishReason } : {}),
-      truncated: previous?.truncated === true || text.truncated || reasoningText.truncated || undefined,
+      truncated: previous?.truncated === true || text.truncated || undefined,
     };
     this._assistantDrafts.set(opts.runId, draft);
     this._pruneAssistantDrafts();
@@ -2491,7 +2877,7 @@ export class Session {
       toolName,
       output: projectToolEventPayloadForJson(
         result !== undefined
-          ? result.result
+          ? harnessDisplayToolPayload(resultChunk?.metadata, 'output-available', result.result)
           : {
               unavailable: true,
               reason: 'resumed tool result was unavailable after run registration failed',
@@ -2651,6 +3037,615 @@ export class Session {
     });
   }
 
+  private _pendingInteractionExpiresAt(pending: PendingResume): number {
+    if (
+      !Number.isSafeInteger(pending.expiresAt) ||
+      pending.expiresAt < 0 ||
+      !Number.isSafeInteger(pending.requestedAt) ||
+      pending.requestedAt < 0 ||
+      pending.expiresAt < pending.requestedAt
+    ) {
+      throw new HarnessSessionCorruptError({
+        reason: 'pending_state_corrupt',
+        sessionId: this.id,
+        resourceId: this.resourceId,
+        threadId: this.threadId,
+      });
+    }
+    return pending.expiresAt;
+  }
+
+  private _pendingInteractionDueAt(pending: PendingResume): number {
+    if (pending.resumedAt === undefined) return this._pendingInteractionExpiresAt(pending);
+    if (!Number.isSafeInteger(pending.resumeRecoveryAt) || pending.resumeRecoveryAt! < pending.resumedAt) {
+      throw new HarnessSessionCorruptError({
+        reason: 'pending_state_corrupt',
+        sessionId: this.id,
+        resourceId: this.resourceId,
+        threadId: this.threadId,
+      });
+    }
+    return pending.resumeRecoveryAt!;
+  }
+
+  private _pendingInteractionGeneration(pending: PendingResume): PendingInteractionExpiryGeneration {
+    const dueAt = this._pendingInteractionDueAt(pending);
+    return {
+      harnessName: this._record.harnessName,
+      sessionId: this.id,
+      resourceId: this.resourceId,
+      kind: pending.kind,
+      itemId: pending.itemId ?? pending.toolCallId,
+      runId: pending.runId,
+      toolCallId: pending.toolCallId,
+      requestedAt: pending.requestedAt,
+      dueAt,
+      expiresAt: pending.expiresAt,
+      ...(pending.expiryStartedAt !== undefined ? { expiryStartedAt: pending.expiryStartedAt } : {}),
+      ...(pending.resumedAt !== undefined ? { resumedAt: pending.resumedAt } : {}),
+      ...(pending.resumeRecoveryAt !== undefined ? { resumeRecoveryAt: pending.resumeRecoveryAt } : {}),
+      ...(pending.resumeRecoveryStartedAt !== undefined
+        ? { resumeRecoveryStartedAt: pending.resumeRecoveryStartedAt }
+        : {}),
+    };
+  }
+
+  /**
+   * Freeze this interaction's deadline onto the pending row. The TTL is
+   * resolved per kind (`sessions.pendingInteractionTtlMsByKind`, falling back
+   * to `sessions.pendingInteractionTtlMs`) at capture time only, so a later
+   * config change never moves an already-parked interaction's deadline and a
+   * restart reads the same `expiresAt` back out of storage.
+   */
+  private _newPendingInteractionTiming(kind: PendingResume['kind']): Pick<PendingResume, 'requestedAt' | 'expiresAt'> {
+    const requestedAt = Date.now();
+    return {
+      requestedAt,
+      expiresAt: requestedAt + this._harness._internalPendingInteractionTtlMsForKind(kind),
+    };
+  }
+
+  private _clearPendingInteractionExpiryTimer(): void {
+    if (this._pendingInteractionExpiryTimer !== undefined) {
+      clearTimeout(this._pendingInteractionExpiryTimer);
+      this._pendingInteractionExpiryTimer = undefined;
+    }
+    this._pendingInteractionExpiryAt = undefined;
+  }
+
+  /**
+   * The timer is only a liveness wake-up. The callback re-checks the exact
+   * pending identity inside `_flushUpdate`, which is the authority for an
+   * expiry-vs-response race and remains correct after a restart.
+   */
+  private _syncPendingInteractionExpiryTimer(): void {
+    const pending = this._record.pendingResume;
+    if (this._state !== 'live' || pending === undefined) {
+      this._clearPendingInteractionExpiryTimer();
+      return;
+    }
+    const dueAt = this._pendingInteractionDueAt(pending);
+    if (this._pendingInteractionExpiryTimer !== undefined && this._pendingInteractionExpiryAt === dueAt) return;
+    this._clearPendingInteractionExpiryTimer();
+    this._pendingInteractionExpiryAt = dueAt;
+    const identity = this._pendingInteractionGeneration(pending);
+    this._pendingInteractionExpiryTimer = setTimeout(
+      () => {
+        this._pendingInteractionExpiryTimer = undefined;
+        this._pendingInteractionExpiryAt = undefined;
+        void this._reconcilePendingInteractionDeadlineGeneration(identity).catch(err => {
+          console.error('[harness/v1] pending interaction expiry persistence failed:', err);
+          if (this._state !== 'live') return;
+          this._emitter.emit({
+            type: 'storage_error',
+            operation: 'session_save',
+            retryable: true,
+            error: { code: 'harness.storage', message: 'pending interaction expiry persistence failed' },
+            resourceId: this.resourceId,
+            threadId: this.threadId,
+            harnessName: this._record.harnessName,
+          } as EmitInput);
+          // A transient save failure must retry without requiring another user
+          // action. Back off before re-arming: the persisted deadline is now in
+          // the past, so an immediate `_sync` would otherwise create a hot
+          // zero-delay retry loop while storage remains unavailable.
+          this._pendingInteractionExpiryAt = dueAt;
+          this._pendingInteractionExpiryTimer = setTimeout(() => {
+            this._pendingInteractionExpiryTimer = undefined;
+            this._pendingInteractionExpiryAt = undefined;
+            this._syncPendingInteractionExpiryTimer();
+          }, 1_000);
+          this._pendingInteractionExpiryTimer.unref?.();
+        });
+      },
+      pending.expiryStartedAt !== undefined || pending.resumeRecoveryStartedAt !== undefined
+        ? 1_000
+        : Math.max(0, dueAt - Date.now()),
+    );
+    this._pendingInteractionExpiryTimer.unref?.();
+  }
+
+  /** @internal — called after the Harness has installed its event bridge. */
+  async _reconcilePendingInteractionExpiryOnHydrate(): Promise<void> {
+    const pending = this._record.pendingResume;
+    if (pending === undefined) {
+      this._clearPendingInteractionExpiryTimer();
+      return;
+    }
+    if (pending.resumedAt !== undefined) {
+      const recovery = await this._maybeRecoverStaleQueuedResume({ kickDrainOnStale: false });
+      if (recovery.status !== 'none') return;
+    }
+    const dueAt = this._pendingInteractionDueAt(pending);
+    if (Date.now() < dueAt) {
+      this._syncPendingInteractionExpiryTimer();
+      return;
+    }
+    await this._reconcilePendingInteractionDeadlineGeneration(this._pendingInteractionGeneration(pending));
+  }
+
+  /**
+   * @internal — cold-row expiry entrypoint used by the Harness storage sweep.
+   * The storage projection is discovery evidence only: every generation field
+   * is rechecked by `_expirePendingInteraction` inside the session CAS. Cold
+   * sweep sessions suppress queue draining; any surviving backlog starts on a
+   * later normal hydration after the expired pending row has been cleared.
+   */
+  async _internalExpirePendingInteractionGeneration(
+    expected: PendingInteractionExpiryGeneration,
+    opts: { drainQueue?: boolean } = {},
+  ): Promise<boolean> {
+    if (
+      expected.harnessName !== this._record.harnessName ||
+      expected.sessionId !== this.id ||
+      expected.resourceId !== this.resourceId
+    ) {
+      return false;
+    }
+    return this._reconcilePendingInteractionDeadlineGeneration(expected, opts);
+  }
+
+  private async _reconcilePendingInteractionDeadlineGeneration(
+    expected: PendingInteractionExpiryGeneration,
+    opts: { drainQueue?: boolean } = {},
+  ): Promise<boolean> {
+    if (expected.resumedAt !== undefined) {
+      return this._recoverStaleResumeAdmission(expected, opts);
+    }
+    return this._expirePendingInteraction(
+      {
+        kind: expected.kind,
+        itemId: expected.itemId,
+        runId: expected.runId,
+        toolCallId: expected.toolCallId,
+        requestedAt: expected.requestedAt,
+        expiresAt: expected.expiresAt,
+      },
+      opts,
+    );
+  }
+
+  private async _expirePendingInteraction(
+    expected: {
+      kind: PendingResume['kind'];
+      itemId: string;
+      runId: string;
+      toolCallId: string;
+      requestedAt: number;
+      expiresAt: number;
+    },
+    opts: { drainQueue?: boolean } = {},
+  ): Promise<boolean> {
+    if (this._state !== 'live') return false;
+    const expiredAt = Date.now();
+    if (expiredAt < expected.expiresAt) {
+      this._syncPendingInteractionExpiryTimer();
+      return false;
+    }
+    const expiryError = new HarnessPendingInteractionExpiredError(this.id, expected.itemId, expected.expiresAt);
+    const projectedError = projectHarnessPublicError(expiryError);
+    const generationKey = pendingInteractionGenerationKey(expected);
+    let expiryStarted = false;
+    let expiredPending: PendingResume | undefined;
+    let failedQueueReceipt: QueueAdmissionReceipt | undefined;
+
+    await this._flushUpdate(prev => {
+      expiryStarted = false;
+      expiredPending = undefined;
+      failedQueueReceipt = undefined;
+      const current = prev.pendingResume;
+      if (
+        current === undefined ||
+        (current.resumedAt !== undefined && current.expiryStartedAt === undefined) ||
+        current.kind !== expected.kind ||
+        current.runId !== expected.runId ||
+        current.toolCallId !== expected.toolCallId ||
+        (current.itemId ?? current.toolCallId) !== expected.itemId ||
+        current.requestedAt !== expected.requestedAt ||
+        this._pendingInteractionExpiresAt(current) !== expected.expiresAt
+      ) {
+        return prev;
+      }
+
+      expiryStarted = true;
+      const expiryStartedAt = current.expiryStartedAt ?? expiredAt;
+      expiredPending = { ...current, expiryStartedAt };
+      const next: SessionRecord = { ...prev, pendingResume: expiredPending };
+      next.expiredPendingInteractions = appendExpiredPendingInteraction(prev.expiredPendingInteractions, {
+        generationKey,
+        itemId: expected.itemId,
+        kind: expected.kind,
+        runId: expected.runId,
+        toolCallId: expected.toolCallId,
+        requestedAt: expected.requestedAt,
+        expiresAt: expected.expiresAt,
+        expiredAt: expiryStartedAt,
+        error: projectedError,
+      });
+
+      for (const [responseId, receipt] of Object.entries(prev.inboxResponseReceipts ?? {})) {
+        if (
+          receipt.itemId !== expected.itemId ||
+          receipt.kind !== expected.kind ||
+          receipt.runId !== expected.runId ||
+          receipt.toolCallId !== expected.toolCallId ||
+          receipt.pendingRequestedAt !== expected.requestedAt ||
+          receipt.status !== 'failed' ||
+          receipt.retryable !== true
+        ) {
+          continue;
+        }
+        next.inboxResponseReceipts = {
+          ...(next.inboxResponseReceipts ?? prev.inboxResponseReceipts ?? {}),
+          [responseId]: {
+            ...receipt,
+            status: 'failed',
+            error: projectedError,
+            retryable: false,
+            failedAt: receipt.failedAt ?? expiryStartedAt,
+            updatedAt: expiryStartedAt,
+          },
+        };
+      }
+
+      if (current.queuedItemId !== undefined) {
+        next.pendingQueue = (prev.pendingQueue ?? []).filter(item => item.id !== current.queuedItemId);
+        const receipt = prev.queueAdmissionReceipts?.[current.queuedItemId];
+        failedQueueReceipt = receipt;
+        if (receipt && receipt.status !== 'completed' && receipt.status !== 'failed' && receipt.status !== 'dead') {
+          failedQueueReceipt = {
+            ...receipt,
+            status: 'failed',
+            error: projectedError,
+            failedAt: receipt.failedAt ?? expiredAt,
+            updatedAt: expiredAt,
+          };
+          next.queueAdmissionReceipts = {
+            ...(prev.queueAdmissionReceipts ?? {}),
+            [current.queuedItemId]: failedQueueReceipt,
+          };
+        }
+      }
+      return next;
+    });
+
+    if (!expiryStarted || expiredPending === undefined) return false;
+    this._pendingReplacementToolSurfaces.delete(expiredPending.runId);
+    const activeController = this._currentTurnAbortController;
+    if (activeController !== undefined) activeController.abort(expiryError);
+
+    const queuedItemId = expiredPending.queuedItemId;
+    if (queuedItemId !== undefined) {
+      const settledReceipt = this._record.queueAdmissionReceipts?.[queuedItemId] ?? failedQueueReceipt;
+      if (settledReceipt?.signalId !== undefined) {
+        await this._writeQueueSignalResultEvidence({
+          status: 'failed',
+          signalId: settledReceipt.signalId,
+          runId: settledReceipt.runId,
+          error: projectedError,
+        });
+      }
+      const resolver = this._queueResolvers.get(queuedItemId);
+      if (resolver) {
+        this._queueResolvers.delete(queuedItemId);
+        resolver.reject(expiryError);
+      }
+      if (this._currentQueuedItemId === queuedItemId) {
+        this._currentQueuedItemId = undefined;
+        this._currentQueuedItemSource = undefined;
+      }
+    }
+
+    if (expiredPending.originSignalId !== undefined) {
+      await this._settleSignalResult(expiredPending.originSignalId, {
+        status: 'failed',
+        runId: expiredPending.runId,
+        error: projectedError,
+      });
+    }
+
+    // Phase two clears the still-discoverable pending row only after every
+    // durable queue/signal settlement has succeeded. A crash or storage error
+    // before this CAS leaves `expiryStartedAt` indexed for hydrate/sweep retry.
+    let finalized = false;
+    await this._flushUpdate(prev => {
+      finalized = false;
+      const current = prev.pendingResume;
+      if (
+        current === undefined ||
+        current.kind !== expected.kind ||
+        current.runId !== expected.runId ||
+        current.toolCallId !== expected.toolCallId ||
+        (current.itemId ?? current.toolCallId) !== expected.itemId ||
+        current.requestedAt !== expected.requestedAt ||
+        current.expiresAt !== expected.expiresAt ||
+        current.expiryStartedAt !== expiredPending!.expiryStartedAt
+      ) {
+        return prev;
+      }
+      finalized = true;
+      const next: SessionRecord = { ...prev };
+      delete next.pendingResume;
+      return next;
+    });
+    if (!finalized) return false;
+
+    if (queuedItemId !== undefined) {
+      const settledReceipt = this._record.queueAdmissionReceipts?.[queuedItemId] ?? failedQueueReceipt;
+      this._emit({
+        type: 'queue_failed',
+        queuedItemId,
+        ...(settledReceipt?.runId ? { runId: settledReceipt.runId } : {}),
+        ...(settledReceipt?.signalId ? { signalId: settledReceipt.signalId } : {}),
+        ...(settledReceipt?.admissionId ? { admissionId: settledReceipt.admissionId } : {}),
+        error: projectedError,
+      });
+    }
+    this._emitAbortedToolEnds({ force: true });
+    this._emitTurnEvent({
+      type: 'resume_failed',
+      runId: expiredPending.runId,
+      retryable: false,
+      error: projectedError,
+    });
+    // An already-running pre-registered ask/plan tool owns its terminal event;
+    // the abort above makes that path finish. A parked suspension has no live
+    // owner, so expiry closes its run here.
+    if (activeController === undefined) {
+      this._emitAgentEnd({ runId: expiredPending.runId, finishReason: 'error' });
+    }
+    this._notifyMaybeIdle();
+    if (this._state === 'live' && opts.drainQueue !== false) void this._maybeDrainQueue();
+    return true;
+  }
+
+  /**
+   * Resolve a response admission whose owner disappeared after persisting
+   * `resumedAt` but before committing terminal provider evidence. Re-dispatch
+   * is intentionally forbidden: the provider/tool may already have performed
+   * side effects. Instead, a two-phase exact-generation transition fails all
+   * related receipts/signals and terminalizes the abandoned run.
+   */
+  private async _recoverStaleResumeAdmission(
+    expected: PendingInteractionExpiryGeneration,
+    opts: { drainQueue?: boolean } = {},
+  ): Promise<boolean> {
+    if (
+      expected.resumedAt === undefined ||
+      expected.resumeRecoveryAt === undefined ||
+      expected.dueAt !== expected.resumeRecoveryAt
+    ) {
+      return false;
+    }
+    const currentPending = this._record.pendingResume;
+    let expectedQueuedItemId: string | undefined;
+    if (
+      currentPending?.resumedAt === expected.resumedAt &&
+      currentPending.runId === expected.runId &&
+      currentPending.toolCallId === expected.toolCallId
+    ) {
+      const queuedItemId = this._queuedItemIdForPendingResume(currentPending);
+      expectedQueuedItemId = queuedItemId;
+      if (queuedItemId !== undefined && this._record.queueAdmissionReceipts?.[queuedItemId]?.status === 'completed') {
+        const recovery = await this._maybeRecoverStaleQueuedResume({ kickDrainOnStale: opts.drainQueue !== false });
+        return recovery.status === 'completed';
+      }
+    }
+    if (Date.now() < expected.resumeRecoveryAt) {
+      this._syncPendingInteractionExpiryTimer();
+      return false;
+    }
+    // A legitimately slow resume still owns this live session. Only a cold
+    // owner (or a hydrated session with no active turn) may classify the
+    // persisted admission as abandoned.
+    if (this._currentTurnAbortController !== undefined) {
+      this._pendingInteractionExpiryAt = expected.resumeRecoveryAt;
+      this._pendingInteractionExpiryTimer = setTimeout(() => {
+        this._pendingInteractionExpiryTimer = undefined;
+        this._pendingInteractionExpiryAt = undefined;
+        this._syncPendingInteractionExpiryTimer();
+      }, 1_000);
+      this._pendingInteractionExpiryTimer.unref?.();
+      return false;
+    }
+
+    const recoveryError = new ResumeRecoveryStaleError();
+    const projectedError = projectHarnessPublicError(recoveryError);
+    const recoveryAt = Date.now();
+    let recoveryStarted = false;
+    let recoveringPending: PendingResume | undefined;
+    let recoveringQueuedItemId: string | undefined;
+    let failedQueueReceipt: QueueAdmissionReceipt | undefined;
+
+    await this._flushUpdate(prev => {
+      recoveryStarted = false;
+      recoveringPending = undefined;
+      recoveringQueuedItemId = undefined;
+      failedQueueReceipt = undefined;
+      const current = prev.pendingResume;
+      if (
+        current === undefined ||
+        current.kind !== expected.kind ||
+        current.runId !== expected.runId ||
+        current.toolCallId !== expected.toolCallId ||
+        (current.itemId ?? current.toolCallId) !== expected.itemId ||
+        current.requestedAt !== expected.requestedAt ||
+        current.expiresAt !== expected.expiresAt ||
+        current.expiryStartedAt !== expected.expiryStartedAt ||
+        current.resumedAt !== expected.resumedAt ||
+        current.resumeRecoveryAt !== expected.resumeRecoveryAt ||
+        current.resumeRecoveryStartedAt !== expected.resumeRecoveryStartedAt
+      ) {
+        return prev;
+      }
+
+      recoveryStarted = true;
+      const resumeRecoveryStartedAt = current.resumeRecoveryStartedAt ?? recoveryAt;
+      recoveringPending = { ...current, resumeRecoveryStartedAt };
+      const next: SessionRecord = { ...prev, pendingResume: recoveringPending };
+
+      for (const [responseId, receipt] of Object.entries(prev.inboxResponseReceipts ?? {})) {
+        if (
+          receipt.itemId !== expected.itemId ||
+          receipt.kind !== expected.kind ||
+          receipt.runId !== expected.runId ||
+          receipt.toolCallId !== expected.toolCallId ||
+          receipt.pendingRequestedAt !== expected.requestedAt ||
+          receipt.status !== 'accepted'
+        ) {
+          continue;
+        }
+        next.inboxResponseReceipts = {
+          ...(next.inboxResponseReceipts ?? prev.inboxResponseReceipts ?? {}),
+          [responseId]: {
+            ...receipt,
+            status: 'failed',
+            error: projectedError,
+            retryable: false,
+            failedAt: receipt.failedAt ?? resumeRecoveryStartedAt,
+            updatedAt: resumeRecoveryStartedAt,
+          },
+        };
+      }
+
+      recoveringQueuedItemId =
+        current.queuedItemId ??
+        (prev.pendingQueue ?? []).find(item => {
+          const receipt = prev.queueAdmissionReceipts?.[item.id];
+          return (receipt?.status === 'accepted' || receipt?.status === 'completed') && receipt.runId === current.runId;
+        })?.id;
+      if (recoveringQueuedItemId !== undefined) {
+        next.pendingQueue = (prev.pendingQueue ?? []).filter(item => item.id !== recoveringQueuedItemId);
+        const receipt = prev.queueAdmissionReceipts?.[recoveringQueuedItemId];
+        if (receipt && receipt.status !== 'completed' && receipt.status !== 'failed' && receipt.status !== 'dead') {
+          failedQueueReceipt = {
+            ...receipt,
+            status: 'failed',
+            error: projectedError,
+            failedAt: receipt.failedAt ?? resumeRecoveryStartedAt,
+            updatedAt: resumeRecoveryStartedAt,
+          };
+          next.queueAdmissionReceipts = {
+            ...(prev.queueAdmissionReceipts ?? {}),
+            [recoveringQueuedItemId]: failedQueueReceipt,
+          };
+        }
+      }
+      return next;
+    });
+
+    if (!recoveryStarted || recoveringPending === undefined) {
+      if (
+        expectedQueuedItemId !== undefined &&
+        this._currentQueuedItemId === expectedQueuedItemId &&
+        this._record.pendingResume?.queuedItemId !== expectedQueuedItemId &&
+        !this._record.pendingQueue.some(item => item.id === expectedQueuedItemId)
+      ) {
+        this._currentQueuedItemId = undefined;
+        this._currentQueuedItemSource = undefined;
+        this._notifyMaybeIdle();
+      }
+      return false;
+    }
+
+    if (recoveringQueuedItemId !== undefined) {
+      const settledReceipt = this._record.queueAdmissionReceipts?.[recoveringQueuedItemId] ?? failedQueueReceipt;
+      if (settledReceipt?.signalId !== undefined) {
+        await this._writeQueueSignalResultEvidence({
+          status: 'failed',
+          signalId: settledReceipt.signalId,
+          runId: settledReceipt.runId,
+          error: projectedError,
+        });
+      }
+    }
+    if (recoveringPending.originSignalId !== undefined) {
+      await this._settleSignalResult(recoveringPending.originSignalId, {
+        status: 'failed',
+        runId: recoveringPending.runId,
+        error: projectedError,
+      });
+    }
+
+    let finalized = false;
+    await this._flushUpdate(prev => {
+      finalized = false;
+      const current = prev.pendingResume;
+      if (
+        current === undefined ||
+        current.kind !== expected.kind ||
+        current.runId !== expected.runId ||
+        current.toolCallId !== expected.toolCallId ||
+        (current.itemId ?? current.toolCallId) !== expected.itemId ||
+        current.requestedAt !== expected.requestedAt ||
+        current.expiresAt !== expected.expiresAt ||
+        current.resumedAt !== expected.resumedAt ||
+        current.resumeRecoveryAt !== expected.resumeRecoveryAt ||
+        current.resumeRecoveryStartedAt !== recoveringPending!.resumeRecoveryStartedAt
+      ) {
+        return prev;
+      }
+      finalized = true;
+      const next: SessionRecord = { ...prev };
+      delete next.pendingResume;
+      return next;
+    });
+    if (!finalized) return false;
+
+    this._pendingReplacementToolSurfaces.delete(recoveringPending.runId);
+    if (recoveringQueuedItemId !== undefined) {
+      const settledReceipt = this._record.queueAdmissionReceipts?.[recoveringQueuedItemId] ?? failedQueueReceipt;
+      this._emit({
+        type: 'queue_failed',
+        queuedItemId: recoveringQueuedItemId,
+        ...(settledReceipt?.runId ? { runId: settledReceipt.runId } : {}),
+        ...(settledReceipt?.signalId ? { signalId: settledReceipt.signalId } : {}),
+        ...(settledReceipt?.admissionId ? { admissionId: settledReceipt.admissionId } : {}),
+        error: projectedError,
+      });
+      const resolver = this._queueResolvers.get(recoveringQueuedItemId);
+      if (resolver) {
+        this._queueResolvers.delete(recoveringQueuedItemId);
+        resolver.reject(recoveryError);
+      }
+      if (this._currentQueuedItemId === recoveringQueuedItemId) {
+        this._currentQueuedItemId = undefined;
+        this._currentQueuedItemSource = undefined;
+      }
+    }
+    this._emitAbortedToolEnds({ force: true });
+    this._emitTurnEvent({
+      type: 'resume_failed',
+      runId: recoveringPending.runId,
+      retryable: false,
+      error: projectedError,
+    });
+    this._emitAgentEnd({ runId: recoveringPending.runId, finishReason: 'error' });
+    this._notifyMaybeIdle();
+    if (this._state === 'live' && opts.drainQueue !== false) void this._maybeDrainQueue();
+    return true;
+  }
+
   /**
    * §10.2 suspension event: project a captured `PendingResume` into the matching
    * pending shape (tool_approval_required / tool_suspension_required /
@@ -2672,6 +3667,7 @@ export class Session {
       runId: pending.runId,
       itemId: pending.itemId ?? '',
       requestedAt: pending.requestedAt,
+      expiresAt: this._pendingInteractionExpiresAt(pending),
       toolCallId: pending.toolCallId,
       ...sourceFields,
     };
@@ -2774,7 +3770,10 @@ export class Session {
     }
   }
 
-  private _tokenUsageDeltaFromFullOutput(full: FullOutput<unknown>): TokenUsage | undefined {
+  private _tokenUsageDeltaFromFullOutput(
+    full: FullOutput<unknown>,
+    accountedCumulative?: TokenUsage,
+  ): TokenUsage | undefined {
     const usage = (full as { totalUsage?: unknown; usage?: unknown }).totalUsage ?? (full as { usage?: unknown }).usage;
     if (usage && typeof usage === 'object') {
       const u = usage as {
@@ -2804,7 +3803,33 @@ export class Session {
         // off; derive it so the aggregate stays consistent with its parts.
         delta.totalTokens += derivedTotalTokens;
       }
-      return incremented ? delta : undefined;
+      if (!incremented) return undefined;
+      if (accountedCumulative === undefined) return delta;
+
+      // A resumed Mastra stream restores its prior usage counter, so FullOutput
+      // is cumulative across suspend boundaries. Subtract the durable baseline
+      // component-wise. If a provider resets a counter, treat the new value as
+      // this segment's usage rather than producing a negative delta.
+      const promptTokens =
+        delta.promptTokens >= accountedCumulative.promptTokens
+          ? delta.promptTokens - accountedCumulative.promptTokens
+          : delta.promptTokens;
+      const completionTokens =
+        delta.completionTokens >= accountedCumulative.completionTokens
+          ? delta.completionTokens - accountedCumulative.completionTokens
+          : delta.completionTokens;
+      const rawTotalTokens =
+        delta.totalTokens >= accountedCumulative.totalTokens
+          ? delta.totalTokens - accountedCumulative.totalTokens
+          : delta.totalTokens;
+      const resumedDelta = {
+        promptTokens,
+        completionTokens,
+        totalTokens: Math.max(rawTotalTokens, promptTokens + completionTokens),
+      };
+      return resumedDelta.promptTokens === 0 && resumedDelta.completionTokens === 0 && resumedDelta.totalTokens === 0
+        ? undefined
+        : resumedDelta;
     }
     return undefined;
   }
@@ -2894,9 +3919,12 @@ export class Session {
     return typeof value === 'number' && Number.isInteger(value) && value >= 0;
   }
 
-  private _recordTurnCompletion(full: FullOutput<unknown>, opts: { persist?: boolean } = {}): TokenUsage | undefined {
+  private _recordTurnCompletion(
+    full: FullOutput<unknown>,
+    opts: { persist?: boolean; accountedCumulative?: TokenUsage } = {},
+  ): TokenUsage | undefined {
     this._captureTurnRunId(full);
-    const delta = this._tokenUsageDeltaFromFullOutput(full);
+    const delta = this._tokenUsageDeltaFromFullOutput(full, opts.accountedCumulative);
     this._applyTokenUsageDelta(delta);
     if (delta !== undefined && opts.persist !== false) this._schedulePersistTokenUsage();
     return delta;
@@ -3162,8 +4190,9 @@ export class Session {
 
   /**
    * True when the session has any pending work — an in-flight turn, an
-   * active queue drain, a queued item awaiting its turn, or a pending
-   * `respondTo*` suspension. False only when the session is fully idle.
+   * active queue drain, a queued item awaiting its turn, a pending
+   * `respondTo*` suspension, or an inline/detached subagent execution. False
+   * only when the complete owned work graph is idle.
    *
    * Broader than `isRunning()`: a session can be `!isRunning()` but still
    * `isBusy()` (queue items not yet drained, awaiting `respondToQuestion`,
@@ -3178,6 +4207,7 @@ export class Session {
     if (this._currentQueuedItemId !== undefined) return true;
     if ((this._record.pendingQueue?.length ?? 0) > 0) return true;
     if (this._record.pendingResume !== undefined && this._record.cancelRequest === undefined) return true;
+    if (this._subagentExecutionsInFlight > 0) return true;
     return false;
   }
 
@@ -3202,6 +4232,14 @@ export class Session {
 
   private _isShutdownDrainBusy(): boolean {
     if (this._currentTurnAbortController !== undefined) return true;
+    // Inline spawn and detached delegation reserve a parent-local execution
+    // slot before child creation and release it only after the complete child
+    // lifecycle settles. Closing the parent while that slot is held would
+    // otherwise terminalize the subtree underneath a still-running tool/driver.
+    // Keep this before the parked-HITL shortcut: a parent can be durably parked
+    // while it still owns independent child work that must drain or hit the
+    // shared close deadline.
+    if (this._subagentExecutionsInFlight > 0) return true;
     if (this._record.pendingResume !== undefined) return false;
     if (this._draining) return true;
     if (this._currentQueuedItemId !== undefined) return true;
@@ -3374,7 +4412,12 @@ export class Session {
   /** @internal — close uses this after the durable closing marker commits. */
   _waitForCloseDrain(closeDeadlineAt: number): Promise<void> {
     void this._maybeDrainQueue();
-    if (!this.isBusy()) return Promise.resolve();
+    // A durably parked HITL interaction has no cooperative process-local work
+    // left to drain. It also cannot be answered while the session is closing,
+    // so waiting for `pendingResume` here can only burn the entire close
+    // deadline. Keep the durable record for lifecycle/recovery handling, but
+    // use the shutdown-drain predicate for the live-work wait.
+    if (!this._isShutdownDrainBusy()) return Promise.resolve();
     const timeoutMs = Math.max(0, closeDeadlineAt - Date.now());
 
     return new Promise<void>(resolve => {
@@ -3389,7 +4432,7 @@ export class Session {
       };
       const waiter: IdleWaiter = {
         check: () => {
-          if (!this.isBusy()) {
+          if (!this._isShutdownDrainBusy()) {
             resolveAfter();
             return true;
           }
@@ -3481,6 +4524,104 @@ export class Session {
     this._abortActiveTurn('agent_aborted');
   }
 
+  private _captureActiveWorkAdmission(operation: string): number {
+    if (this._activeWorkInvalidationsInFlight > 0) {
+      void operation;
+      throw new HarnessBusyError(this.id, 'in_flight');
+    }
+    return this._activeWorkAdmissionEpoch;
+  }
+
+  private _activeWorkAdmissionIsCurrent(epoch: number): boolean {
+    return this._activeWorkInvalidationsInFlight === 0 && this._activeWorkAdmissionEpoch === epoch;
+  }
+
+  private _assertActiveWorkAdmission(epoch: number, operation: string, signal?: AbortSignal): void {
+    if (signal?.aborted) {
+      throw signal.reason instanceof Error ? signal.reason : new HarnessAbortedError(this.id, 'agent_aborted');
+    }
+    if (!this._activeWorkAdmissionIsCurrent(epoch)) {
+      void operation;
+      throw new HarnessBusyError(this.id, 'in_flight');
+    }
+  }
+
+  /** Begin a synchronous admission barrier; the returned closure is idempotent. */
+  private _beginActiveWorkInvalidation(): () => void {
+    this._activeWorkAdmissionEpoch += 1;
+    this._activeWorkInvalidationsInFlight += 1;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this._activeWorkInvalidationsInFlight = Math.max(0, this._activeWorkInvalidationsInFlight - 1);
+    };
+  }
+
+  /**
+   * Abort the current parent turn AND durably cancel every active/detached
+   * subagent owned by its plan. Unlike `cancel()`, this keeps the parent session
+   * reusable for a later user message. Product "Stop" controls should prefer
+   * this operation so a detached `task_delegate` cannot continue consuming
+   * provider tokens after the visible root response stops.
+   */
+  async abortActiveWork(opts?: {
+    reason?: string;
+    discardPendingInteraction?: boolean;
+    settleTimeoutMs?: number;
+  }): Promise<{ cancelledSubagentSessionIds: string[] }> {
+    this._assertLive('abortActiveWork()');
+    if (opts?.settleTimeoutMs !== undefined && (!Number.isFinite(opts.settleTimeoutMs) || opts.settleTimeoutMs < 0)) {
+      throw new HarnessValidationError(
+        'abortActiveWork().settleTimeoutMs',
+        'settleTimeoutMs must be a finite non-negative number',
+      );
+    }
+    const releaseInvalidation = this._beginActiveWorkInvalidation();
+    try {
+      const settleDeadlineAt = opts?.settleTimeoutMs === undefined ? undefined : Date.now() + opts.settleTimeoutMs;
+      const activeIds = Array.from(this._activeSubagents.values(), state => state.subagentSessionId);
+      // Abort the visible/root provider immediately; storage discovery must not
+      // add latency to the user's Stop action.
+      this._abortActiveTurn('agent_aborted');
+
+      let delegatedIds: string[] = [];
+      let discoveryError: unknown;
+      try {
+        delegatedIds = await this._listDelegatedSubagentSessionIds();
+      } catch (error) {
+        discoveryError = error;
+      }
+      const cancellation = await this._cancelOwnedSubagentSessions(
+        [...activeIds, ...delegatedIds],
+        opts?.reason ?? 'parent_work_aborted',
+      );
+      if (opts?.discardPendingInteraction !== false) {
+        await this._discardPendingInteractionForAbort(opts?.reason ?? 'parent_work_aborted');
+      }
+      // Catch a resume controller that was admitted immediately before the
+      // invalidation epoch changed but became visible after the first abort.
+      this._abortActiveTurn('agent_aborted');
+      if (discoveryError !== undefined) throw discoveryError;
+      if (cancellation.unavailable.length > 0) {
+        throw new HarnessValidationError(
+          'abortActiveWork()',
+          `could not cancel owned subagent sessions: ${cancellation.unavailable.join(', ')}`,
+        );
+      }
+      if (settleDeadlineAt !== undefined) {
+        // Destructive conversation revisions need more than an abort request:
+        // wait until the provider turn unwinds and every background/session write
+        // reaches a durable boundary before callers prune MessageHistory.
+        await this.waitForIdle({ timeoutMs: Math.max(0, settleDeadlineAt - Date.now()) });
+        await this._internalAwaitFlushChain({ deadlineAt: settleDeadlineAt });
+      }
+      return { cancelledSubagentSessionIds: cancellation.cancelled };
+    } finally {
+      releaseInvalidation();
+    }
+  }
+
   /**
    * §6.2: abort the in-flight turn's controller with a typed `HarnessAbortedError`
    * so tools observe `abortSignal.reason instanceof HarnessAbortedError`. All
@@ -3538,7 +4679,13 @@ export class Session {
     // harness-owned — only the internal subagent cascade may select it (passing
     // the real parent id), so a caller cannot mislabel the abort by supplying a
     // matching `requestedBy`.
-    return this._cancelInternal(opts, undefined);
+    const cascade = await this._cancelInternal(opts, undefined);
+    if (cascade.unavailable.length > 0) {
+      throw new HarnessValidationError(
+        'cancel()',
+        `session cancellation committed but descendant propagation is incomplete: ${cascade.unavailable.join(', ')}`,
+      );
+    }
   }
 
   /**
@@ -3572,12 +4719,97 @@ export class Session {
     }
   }
 
+  /** Read every durable delegation link in this session's plan forest. */
+  private async _listDelegatedSubagentSessionIds(): Promise<string[]> {
+    const ids = new Set<string>();
+    let cursor: string | undefined;
+    for (;;) {
+      const page = await this._storage.listPlanTasks({
+        harnessName: this._record.harnessName,
+        sessionId: this.id,
+        limit: 500,
+        cursor,
+      });
+      for (const task of page.tasks) {
+        if (task.delegatedSubagentSessionId !== undefined) ids.add(task.delegatedSubagentSessionId);
+      }
+      if (!page.cursor || page.tasks.length === 0) break;
+      cursor = page.cursor;
+    }
+    return Array.from(ids);
+  }
+
+  /**
+   * Cancel child sessions whose ownership was established by the parent's live
+   * projection or durable plan link. A cold child is hydrated by exact id after
+   * re-checking `parentSessionId`; closed/deleted children are terminal. An
+   * already-cancelled child is still hydrated so a crash-interrupted descendant
+   * cascade can resume. Descendant cancellation flows through the child's
+   * normal durable `cancel()` path.
+   */
+  private async _cancelOwnedSubagentSessions(
+    subagentSessionIds: Iterable<string>,
+    reason: string,
+  ): Promise<{ cancelled: string[]; unavailable: string[] }> {
+    const cancelled: string[] = [];
+    const unavailable: string[] = [];
+    for (const childId of new Set(subagentSessionIds)) {
+      if (childId === this.id) {
+        unavailable.push(childId);
+        continue;
+      }
+      let child = this._harness._internalGetLiveSession(childId);
+      if (child === undefined) {
+        let stored: SessionRecord | null;
+        try {
+          stored = await this._storage.loadSession({
+            harnessName: this._record.harnessName,
+            sessionId: childId,
+          });
+        } catch {
+          unavailable.push(childId);
+          continue;
+        }
+        if (stored === null || stored.closedAt !== undefined || stored.closingAt !== undefined) {
+          continue;
+        }
+        if (stored.parentSessionId !== this.id || stored.resourceId !== this.resourceId) {
+          unavailable.push(childId);
+          continue;
+        }
+        try {
+          child = await this._harness.session({ sessionId: childId, resourceId: this.resourceId });
+        } catch {
+          unavailable.push(childId);
+          continue;
+        }
+      }
+      if (child.parentSessionId !== this.id || child.resourceId !== this.resourceId) {
+        unavailable.push(childId);
+        continue;
+      }
+      try {
+        const alreadyCancelled = child.getRecord().cancelRequest !== undefined;
+        const nested = await child._cancelInternal({ reason, requestedBy: this.id }, this.id);
+        if (!alreadyCancelled) cancelled.push(childId);
+        unavailable.push(...nested.unavailable);
+      } catch {
+        unavailable.push(childId);
+      }
+    }
+    return { cancelled: Array.from(new Set(cancelled)), unavailable: Array.from(new Set(unavailable)) };
+  }
+
   private async _cancelInternal(
     opts?: { reason?: string; requestedBy?: string },
     parentOrigin?: string,
-  ): Promise<void> {
+  ): Promise<{ unavailable: string[] }> {
     this._assertNotDeleted();
-    if (this._currentCancelRequest() !== undefined) return;
+    const existingCancel = this._currentCancelRequest();
+    if (existingCancel !== undefined) {
+      await this._settlePendingInteractionCancellation(existingCancel.reason ?? opts?.reason);
+      return this._cascadeCancellationToOwnedSubagents(existingCancel.reason ?? opts?.reason ?? 'parent_cancelled');
+    }
 
     const reason = opts?.reason;
     const requestedBy = opts?.requestedBy;
@@ -3638,9 +4870,10 @@ export class Session {
     });
 
     const committedCancel = this._currentCancelRequest();
-    if (committedCancel === undefined) return;
-    if (!attemptedWrite) return;
-    if (committedCancel.requestedAt !== requestedAt) return;
+    if (committedCancel === undefined) return { unavailable: [] };
+    if (!attemptedWrite || committedCancel.requestedAt !== requestedAt) {
+      return this._cascadeCancellationToOwnedSubagents(committedCancel.reason ?? reason ?? 'parent_cancelled');
+    }
     const durableReason = committedCancel.reason;
     this._clearQueueWakeTimer();
 
@@ -3685,24 +4918,234 @@ export class Session {
       await this._settleCompletedQueuedItemAfterCancellation(completed.item, completed.result, completed.modeId);
     }
 
+    await this._settlePendingInteractionCancellation(durableReason);
     this._notifyMaybeIdle();
 
-    if (this._activeSubagents.size === 0) return;
-    const childIds = Array.from(this._activeSubagents.values()).map(s => s.subagentSessionId);
-    await Promise.all(
-      childIds.map(async childId => {
-        const child = this._harness._internalGetLiveSession(childId);
-        if (!child) return;
-        try {
-          // Internal cascade: pass this session id as the harness-owned parent
-          // origin so the child's live turn aborts with `parent_aborted`.
-          await child._cancelInternal({ reason: reason ?? 'parent_cancelled', requestedBy: this.id }, this.id);
-        } catch {
-          // Cancellation has already committed for the parent. Child
-          // propagation is best-effort and must not roll it back.
+    return this._cascadeCancellationToOwnedSubagents(reason ?? 'parent_cancelled');
+  }
+
+  /**
+   * A suspended signal remains in `pendingResume` as immutable audit/recovery
+   * evidence after session cancellation, but its durable signal result must be
+   * failed immediately. Otherwise `signal()` callers (including detached task
+   * delegation drivers) wait until the interaction TTL and retain concurrency
+   * reservations for up to ten minutes.
+   */
+  private async _settlePendingInteractionCancellation(reason?: string): Promise<void> {
+    const pending = this._record.pendingResume;
+    if (pending === undefined) return;
+    const cancellationError = new HarnessSessionCancelledError(this.id, reason);
+    const projectedError = projectHarnessPublicError(cancellationError);
+    const queuedItemId = this._queuedItemIdForPendingResume(pending);
+    if (queuedItemId !== undefined) {
+      const receipt = this._record.queueAdmissionReceipts?.[queuedItemId];
+      if (receipt?.signalId !== undefined) {
+        await this._writeQueueSignalResultEvidence({
+          status: 'failed',
+          signalId: receipt.signalId,
+          runId: receipt.runId,
+          error: projectedError,
+        });
+      }
+    }
+    if (pending.originSignalId !== undefined) {
+      await this._settleSignalResult(pending.originSignalId, {
+        status: 'failed',
+        runId: pending.runId,
+        error: projectedError,
+      });
+    }
+  }
+
+  /**
+   * Abort/branch-revision counterpart to cancellation settlement. The pending
+   * interaction is terminalized and removed without setting a parent
+   * `cancelRequest`, so the conversation session remains reusable. Durable
+   * signal evidence is failed before the exact-generation clear; a crash in
+   * between leaves the pending row visible and safely retryable.
+   */
+  private async _discardPendingInteractionForAbort(reason: string): Promise<boolean> {
+    const pending = this._record.pendingResume;
+    if (pending === undefined) return false;
+    const abortError = new HarnessSessionCancelledError(this.id, reason);
+    const projectedError = projectHarnessPublicError(abortError);
+    const failedAt = Date.now();
+    const queuedItemId = this._queuedItemIdForPendingResume(pending);
+    const queueReceipt = queuedItemId === undefined ? undefined : this._record.queueAdmissionReceipts?.[queuedItemId];
+
+    // First win a durable waiting/resuming -> terminalizing transition. Resume
+    // admission rejects any generation carrying expiryStartedAt, so evidence is
+    // never failed for a response that can still proceed. If the process dies
+    // after this claim, the ordinary pending-deadline recovery finishes it.
+    let discardClaimed = false;
+    await this._flushUpdate(prev => {
+      discardClaimed = false;
+      const current = prev.pendingResume;
+      if (
+        current === undefined ||
+        current.kind !== pending.kind ||
+        current.runId !== pending.runId ||
+        current.toolCallId !== pending.toolCallId ||
+        (current.itemId ?? current.toolCallId) !== (pending.itemId ?? pending.toolCallId) ||
+        current.requestedAt !== pending.requestedAt ||
+        current.expiresAt !== pending.expiresAt ||
+        current.resumedAt !== pending.resumedAt ||
+        current.expiryStartedAt !== undefined
+      ) {
+        return prev;
+      }
+      discardClaimed = true;
+      return {
+        ...prev,
+        pendingResume: { ...current, expiryStartedAt: failedAt },
+      };
+    });
+    if (!discardClaimed) return false;
+
+    if (queueReceipt?.signalId !== undefined) {
+      await this._writeQueueSignalResultEvidence({
+        status: 'failed',
+        signalId: queueReceipt.signalId,
+        runId: queueReceipt.runId,
+        error: projectedError,
+      });
+    }
+    if (pending.originSignalId !== undefined) {
+      await this._settleSignalResult(pending.originSignalId, {
+        status: 'failed',
+        runId: pending.runId,
+        error: projectedError,
+      });
+    }
+
+    let discarded = false;
+    await this._flushUpdate(prev => {
+      discarded = false;
+      const current = prev.pendingResume;
+      if (
+        current === undefined ||
+        current.kind !== pending.kind ||
+        current.runId !== pending.runId ||
+        current.toolCallId !== pending.toolCallId ||
+        (current.itemId ?? current.toolCallId) !== (pending.itemId ?? pending.toolCallId) ||
+        current.requestedAt !== pending.requestedAt ||
+        current.expiresAt !== pending.expiresAt ||
+        current.resumedAt !== pending.resumedAt ||
+        current.expiryStartedAt !== failedAt
+      ) {
+        return prev;
+      }
+      discarded = true;
+      const next: SessionRecord = { ...prev };
+      delete next.pendingResume;
+      // A response may have durably won admission (`resumedAt` + accepted
+      // inbox receipt) immediately before Stop invalidated the branch. Because
+      // no provider resume is allowed to start afterward, terminalize every
+      // accepted receipt for this exact pending generation instead of leaving a
+      // permanent "accepted" receipt that a reconnect could mistake for work
+      // still in flight.
+      const inboxResponseReceipts = { ...(prev.inboxResponseReceipts ?? {}) };
+      let inboxReceiptsChanged = false;
+      for (const [responseId, receipt] of Object.entries(inboxResponseReceipts)) {
+        if (
+          receipt.status === 'accepted' &&
+          receipt.kind === pending.kind &&
+          receipt.runId === pending.runId &&
+          receipt.toolCallId === pending.toolCallId &&
+          receipt.pendingRequestedAt === pending.requestedAt
+        ) {
+          inboxResponseReceipts[responseId] = {
+            ...receipt,
+            status: 'failed',
+            error: projectedError,
+            failedAt: receipt.failedAt ?? failedAt,
+            updatedAt: failedAt,
+            retryable: false,
+          };
+          inboxReceiptsChanged = true;
         }
-      }),
-    );
+      }
+      if (inboxReceiptsChanged) next.inboxResponseReceipts = inboxResponseReceipts;
+      if (queuedItemId !== undefined) {
+        next.pendingQueue = (prev.pendingQueue ?? []).filter(item => item.id !== queuedItemId);
+        const receipt = prev.queueAdmissionReceipts?.[queuedItemId];
+        if (receipt && receipt.status !== 'completed' && receipt.status !== 'failed' && receipt.status !== 'dead') {
+          next.queueAdmissionReceipts = {
+            ...(prev.queueAdmissionReceipts ?? {}),
+            [queuedItemId]: {
+              ...receipt,
+              status: 'failed',
+              error: projectedError,
+              failedAt: receipt.failedAt ?? failedAt,
+              updatedAt: failedAt,
+            },
+          };
+        }
+      }
+      return next;
+    });
+    if (!discarded) return false;
+
+    this._clearPendingInteractionExpiryTimer();
+    this._pendingReplacementToolSurfaces.delete(pending.runId);
+    if (queuedItemId !== undefined) {
+      const resolver = this._queueResolvers.get(queuedItemId);
+      if (resolver) {
+        this._queueResolvers.delete(queuedItemId);
+        resolver.reject(abortError);
+      }
+      if (this._currentQueuedItemId === queuedItemId) {
+        this._currentQueuedItemId = undefined;
+        this._currentQueuedItemSource = undefined;
+      }
+      this._emit({
+        type: 'queue_failed',
+        queuedItemId,
+        ...(queueReceipt?.runId ? { runId: queueReceipt.runId } : {}),
+        ...(queueReceipt?.signalId ? { signalId: queueReceipt.signalId } : {}),
+        ...(queueReceipt?.admissionId ? { admissionId: queueReceipt.admissionId } : {}),
+        error: projectedError,
+      });
+    }
+    this._emitAbortedToolEnds({ force: true });
+    this._emitTurnEvent({
+      type: 'resume_failed',
+      runId: pending.runId,
+      retryable: false,
+      error: projectedError,
+    });
+    if (this._currentTurnAbortController === undefined) {
+      this._emitAgentEnd({ runId: pending.runId, finishReason: 'error' });
+    }
+    this._notifyMaybeIdle();
+    return true;
+  }
+
+  /**
+   * Continue a durable cancellation through every owned delegation edge. This
+   * remains callable after `cancelRequest` committed so a restart between the
+   * parent CAS and descendant propagation can safely resume the cascade.
+   */
+  private async _cascadeCancellationToOwnedSubagents(reason: string): Promise<{ unavailable: string[] }> {
+    const activeChildIds = Array.from(this._activeSubagents.values(), state => state.subagentSessionId);
+    let delegatedChildIds: string[] = [];
+    let discoveryFailed = false;
+    try {
+      // A restarted parent may have no process-local `_activeSubagents` entry
+      // even though its plan still durably owns detached descendants. Discover
+      // those links before cascading so cancellation reaches the whole cold
+      // delegation tree rather than only whichever generation happened to be
+      // hydrated first.
+      delegatedChildIds = await this._listDelegatedSubagentSessionIds();
+    } catch {
+      // Mark this session as incomplete: its caller must preserve the ownership
+      // edge and retry because we cannot prove that every descendant was found.
+      discoveryFailed = true;
+    }
+    const cancellation = await this._cancelOwnedSubagentSessions([...activeChildIds, ...delegatedChildIds], reason);
+    return {
+      unavailable: Array.from(new Set([...(discoveryFailed ? [this.id] : []), ...cancellation.unavailable])),
+    };
   }
 
   /**
@@ -4044,6 +5487,15 @@ export class Session {
    * child's reattach from `delegatedSubagentTypeId`.
    */
   _subagentToolAllowlist?: readonly string[];
+
+  /**
+   * @internal — parent-side invocation correlation for a spawned/delegated
+   * child. Set before the child's turn starts (and restored by delegated
+   * reattachment) so a pending interaction is durably attributed to the parent
+   * tool/delegation that owns it. It is intentionally process-local: once a
+   * pending interaction is captured, the correlation lives on `PendingResume`.
+   */
+  _subagentParentToolCallId?: string;
 
   /** @internal — writes the latest opaque workspace state into the session record. */
   private async _persistWorkspaceState(state: unknown): Promise<void> {
@@ -5316,6 +6768,7 @@ export class Session {
       if (
         pending?.runId !== runId ||
         pending.resumedAt !== undefined ||
+        pending.expiryStartedAt !== undefined ||
         (pending.kind !== 'question' && pending.kind !== 'plan-approval' && pending.kind !== 'sandbox-access')
       ) {
         return prev;
@@ -5382,14 +6835,17 @@ export class Session {
     this._runCompletionPromises.delete(runId);
     const cached = this._completedRuns.get(runId);
     if (cached && !cached.ok) {
+      this._runToolReceipts.delete(runId);
       if (waiter) waiter.reject(cached.err);
       return;
     }
     try {
-      const full = (await out.getFullOutput()) as FullOutput<unknown>;
+      const rawFull = (await out.getFullOutput()) as FullOutput<unknown>;
+      const full = this._materializeHarnessRunOutput(runId, rawFull);
       this._rememberCompletedRun(runId, { ok: true, full });
       if (waiter) waiter.resolve(full);
     } catch (err) {
+      this._runToolReceipts.delete(runId);
       this._rememberCompletedRun(runId, { ok: false, err });
       if (waiter) waiter.reject(err);
     }
@@ -5408,6 +6864,95 @@ export class Session {
       this._messageTokenAccountedRunIds.delete(oldest);
       this._messageTokenAccountingRunIds.delete(oldest);
       this._messageTokenAccountingReservations.delete(oldest);
+      this._runToolReceipts.delete(oldest);
+    }
+  }
+
+  /**
+   * Capture only tool receipt identity/status from the authoritative stream.
+   * Failed local tools are absent from Mastra FullOutput.toolResults, so this
+   * bounded side channel is required for truthful blocked/failed reports and
+   * durable recovery verification.
+   */
+  private _recordRunToolReceipt(runId: string, receipt: HarnessSubagentToolReceipt): void {
+    if (
+      receipt.toolCallId.length === 0 ||
+      receipt.toolCallId.length > 1_024 ||
+      receipt.toolName.length === 0 ||
+      receipt.toolName.length > 256 ||
+      receipt.toolName === HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID
+    ) {
+      return;
+    }
+    const state = this._getOrCreateRunToolReceiptState(runId);
+    const key = `${receipt.toolCallId}\0${receipt.toolName}\0${receipt.status}`;
+    if (state.exact.has(key)) return;
+    const bytes = new TextEncoder().encode(JSON.stringify(receipt)).byteLength;
+    if (
+      state.receipts.length >= MAX_HARNESS_RUN_TOOL_RECEIPTS ||
+      state.bytes + bytes > MAX_HARNESS_RUN_TOOL_RECEIPT_BYTES
+    ) {
+      state.overflow = true;
+      return;
+    }
+    state.exact.add(key);
+    state.receipts.push({ ...receipt });
+    state.bytes += bytes;
+  }
+
+  private _getOrCreateRunToolReceiptState(runId: string): {
+    receipts: HarnessSubagentToolReceipt[];
+    exact: Set<string>;
+    bytes: number;
+    overflow: boolean;
+  } {
+    const existing = this._runToolReceipts.get(runId);
+    if (existing !== undefined) return existing;
+    while (this._runToolReceipts.size >= MAX_HARNESS_RUN_TOOL_RECEIPT_SETS) {
+      const oldest = this._runToolReceipts.keys().next().value;
+      if (oldest === undefined) break;
+      this._runToolReceipts.delete(oldest);
+    }
+    const state = { receipts: [], exact: new Set<string>(), bytes: 0, overflow: false };
+    this._runToolReceipts.set(runId, state);
+    return state;
+  }
+
+  private _materializeHarnessRunOutput(runId: string, rawFull: FullOutput<unknown>): FullOutput<unknown> {
+    const receiptState = this._runToolReceipts.get(runId);
+    const full = materializeHarnessTerminalText(
+      withHarnessSubagentToolReceipts(rawFull, receiptState?.receipts ?? [], receiptState?.overflow ?? false),
+    );
+    if (full.finishReason !== 'suspended') this._runToolReceipts.delete(runId);
+    return full;
+  }
+
+  private _pendingRunToolReceiptProjection(
+    runId: string,
+  ): Pick<PendingResume, 'toolReceipts' | 'toolReceiptsOverflow'> {
+    const state = this._runToolReceipts.get(runId);
+    if (state === undefined) return {};
+    return {
+      ...(state.receipts.length > 0 ? { toolReceipts: state.receipts.map(receipt => ({ ...receipt })) } : {}),
+      ...(state.overflow ? { toolReceiptsOverflow: true } : {}),
+    };
+  }
+
+  private _restorePendingRunToolReceipts(pending: PendingResume): void {
+    const persisted = Array.isArray(pending.toolReceipts) ? pending.toolReceipts : [];
+    for (const receipt of persisted.slice(0, MAX_HARNESS_RUN_TOOL_RECEIPTS)) {
+      if (
+        receipt !== null &&
+        typeof receipt === 'object' &&
+        typeof receipt.toolCallId === 'string' &&
+        typeof receipt.toolName === 'string' &&
+        (receipt.status === 'success' || receipt.status === 'error')
+      ) {
+        this._recordRunToolReceipt(pending.runId, receipt);
+      }
+    }
+    if (pending.toolReceiptsOverflow === true || persisted.length > MAX_HARNESS_RUN_TOOL_RECEIPTS) {
+      this._getOrCreateRunToolReceiptState(pending.runId).overflow = true;
     }
   }
 
@@ -5416,7 +6961,14 @@ export class Session {
    * Extracted from `_drainStreamToEvents` so the long-lived subscription
    * drain is the single consumer of chunks.
    */
-  private _emitForChunk(chunk: { type: string; payload?: unknown; data?: unknown; runId?: string }): void {
+  private _emitForChunk(chunk: {
+    type: string;
+    id?: string;
+    payload?: unknown;
+    data?: unknown;
+    runId?: string;
+    metadata?: unknown;
+  }): void {
     // §10.2 TurnEvent/ToolEvent — runId identifies the streaming run. Mid-run
     // chunks carry it; fall back to the session's current run id.
     const runId = chunk.runId ?? this._currentRunId;
@@ -5468,6 +7020,58 @@ export class Session {
         }
         return;
       }
+      case 'data-terminal-tool-result': {
+        if (runId === undefined || typeof chunk.id !== 'string') return;
+        const answer = parseHarnessSubagentTerminalResult(chunk.data);
+        if (!answer) return;
+        const deliveryKey = `${runId}:${chunk.id}`;
+        if (this._deliveredTerminalSubagentAnswers.has(deliveryKey)) return;
+        const pending = this._pendingTerminalSubagentAnswers.get(runId);
+        if (pending && pending.partId !== chunk.id) {
+          // More than one candidate for a run is ambiguous. The framework
+          // protocol will fail the run; Harness must not guess which to render.
+          this._pendingTerminalSubagentAnswers.delete(runId);
+          return;
+        }
+        this._pendingTerminalSubagentAnswers.set(runId, { partId: chunk.id, answer });
+        return;
+      }
+      case 'step-finish': {
+        if (runId === undefined) return;
+        const pending = this._pendingTerminalSubagentAnswers.get(runId);
+        if (!pending) return;
+        this._pendingTerminalSubagentAnswers.delete(runId);
+        const payload = chunk.payload as { messageId?: unknown; terminalToolResult?: unknown } | undefined;
+        const authoritative = parseHarnessSubagentTerminalResult(payload?.terminalToolResult);
+        if (
+          !authoritative ||
+          authoritative.kind !== pending.answer.kind ||
+          authoritative.subagentSessionId !== pending.answer.subagentSessionId ||
+          authoritative.text !== pending.answer.text
+        ) {
+          return;
+        }
+        const deliveryKey = `${runId}:${pending.partId}`;
+        if (this._deliveredTerminalSubagentAnswers.has(deliveryKey)) return;
+        this._deliveredTerminalSubagentAnswers.add(deliveryKey);
+        while (this._deliveredTerminalSubagentAnswers.size > MAX_DELIVERED_TERMINAL_SUBAGENT_ANSWERS) {
+          const oldest = this._deliveredTerminalSubagentAnswers.values().next().value;
+          if (oldest === undefined) break;
+          this._deliveredTerminalSubagentAnswers.delete(oldest);
+        }
+        this._recordAssistantDraftDelta({
+          runId,
+          kind: 'text',
+          delta: authoritative.text,
+          ...(typeof payload?.messageId === 'string' ? { messageId: payload.messageId } : {}),
+        });
+        this._emitTurnEvent({ type: 'text_delta', runId, delta: authoritative.text });
+        return;
+      }
+      case 'finish': {
+        if (runId !== undefined) this._pendingTerminalSubagentAnswers.delete(runId);
+        return;
+      }
       case 'tool-call-input-streaming-start': {
         // §10.2 has no tool-input-streaming events; keep the buffer for the
         // display snapshot of in-flight args, but emit nothing.
@@ -5479,9 +7083,10 @@ export class Session {
         const payload = chunk.payload as { toolCallId: string; argsTextDelta: string; toolName?: string };
         const prev = this._toolInputBuffers.get(payload.toolCallId);
         const toolName = prev?.toolName ?? payload.toolName ?? '';
+        const displayedDelta = harnessDisplayToolPayload(chunk.metadata, 'input-delta', payload.argsTextDelta);
         this._toolInputBuffers.set(payload.toolCallId, {
           toolName,
-          text: (prev?.text ?? '') + payload.argsTextDelta,
+          text: (prev?.text ?? '') + (typeof displayedDelta === 'string' ? displayedDelta : ''),
         });
         return;
       }
@@ -5509,7 +7114,7 @@ export class Session {
             toolCallId: payload.toolCallId,
             toolName: payload.toolName,
             input: projectToolEventPayloadForJson(
-              payload.args,
+              harnessDisplayToolPayload(chunk.metadata, 'input-available', payload.args),
               'tool_start.input',
               this._harness._internalMaxEventPayloadBytes,
             ),
@@ -5533,6 +7138,11 @@ export class Session {
           return;
         }
         if (runId !== undefined) {
+          this._recordRunToolReceipt(runId, {
+            toolCallId: payload.toolCallId,
+            toolName,
+            status: payload.isError === true ? 'error' : 'success',
+          });
           // Project `output` at emit so live === replay (§10.2). Shared/aliased
           // refs are split into copies, Date->ISO, Map/Set->{}, class->plain.
           this._emitTurnEvent({
@@ -5541,7 +7151,7 @@ export class Session {
             toolCallId: payload.toolCallId,
             toolName,
             output: projectToolEventPayloadForJson(
-              payload.result,
+              harnessDisplayToolPayload(chunk.metadata, 'output-available', payload.result),
               'tool_end.output',
               this._harness._internalMaxEventPayloadBytes,
             ),
@@ -5563,6 +7173,11 @@ export class Session {
           return;
         }
         if (runId !== undefined) {
+          this._recordRunToolReceipt(runId, {
+            toolCallId: payload.toolCallId,
+            toolName,
+            status: 'error',
+          });
           // §13.3f.1: a tool's OWN error is faithfully preserved (the shared
           // `harnessEventJsonReplacer` keeps name/code/message — NOT flattened
           // into `harness.internal`), and projected at emit so the raw thrown
@@ -5574,7 +7189,7 @@ export class Session {
             toolCallId: payload.toolCallId,
             toolName,
             output: projectToolEventPayloadForJson(
-              payload.error,
+              harnessDisplayToolPayload(chunk.metadata, 'error', payload.error),
               'tool_end.output',
               this._harness._internalMaxEventPayloadBytes,
             ),
@@ -5667,6 +7282,18 @@ export class Session {
     }
     const persistedRequestContext = callerRequestContextToPersisted(callerRequestContext);
 
+    // Observability-only pre-stream phase marks (PF-2246). Callers use these
+    // to decompose admission latency; failures never affect turn semantics.
+    const messageAdmissionStartedAtMs = Date.now();
+    const reportAdmissionPhase = (phase: MessageAdmissionPhase) => {
+      if (opts.onPhase === undefined) return;
+      try {
+        opts.onPhase(phase, Date.now() - messageAdmissionStartedAtMs);
+      } catch {
+        // Swallow: the callback is observability-only.
+      }
+    };
+
     // Resolve the effective mode (per-call override wins, else session's).
     const effectiveModeId = opts.mode ?? this._record.modeId;
     const effectiveModelId = opts.model ?? this._record.modelId;
@@ -5685,23 +7312,29 @@ export class Session {
         : undefined;
     const admissionHash = admissionHashes?.primary;
     const compatibleAdmissionHashes = admissionHashes?.legacyCompatible;
-    const duplicate =
+    // PF-2250 §1 — the duplicate fast-path read runs CONCURRENTLY with the
+    // admission interior: the reservation write below detects duplicates and
+    // tombstones transactionally (created:false ⇒ resolve-or-conflict), so the
+    // warm path never blocks on this read. Its result is awaited only where it
+    // changes behavior the reservation cannot express: an idempotent retry
+    // arriving in the §4.4c active-delivery window must return the duplicate
+    // instead of the active-delivery rejection.
+    const duplicateProbe =
       opts.admissionId !== undefined
-        ? await this._resolveMessageAdmissionDuplicate({
+        ? this._resolveMessageAdmissionDuplicate({
             admissionId: opts.admissionId,
             admissionHash: admissionHash!,
             compatibleAdmissionHashes,
           })
         : undefined;
-    if (duplicate) {
-      this._assertOpenForTurn('message()');
-      return this._returnDuplicateMessageResult(duplicate, opts);
-    }
+    if (duplicateProbe !== undefined) void duplicateProbe.catch(() => {});
+    reportAdmissionPhase('admission_duplicate_resolved');
     const admissionIdentity =
       opts.admissionId !== undefined ? this._messageAdmissionIdentity(opts.admissionId) : undefined;
 
     // Per-turn additionalTools merge with the mode's surface, never replace.
     const toolSurface = this._buildToolSurface(mode, opts.additionalTools);
+    reportAdmissionPhase('tool_surface_built');
 
     const admissionStart =
       opts.admissionId !== undefined
@@ -5765,14 +7398,18 @@ export class Session {
       throw err;
     }
     let requestContext;
+    let turnInstructions: string | undefined;
     try {
-      requestContext = await Promise.race([
-        this._buildRequestContext({
-          modeId: effectiveModeId,
-          modelId: effectiveModelId,
-          abortSignal: turnAbortSignal,
-          ...(persistedRequestContext ? { persistedRequestContext } : {}),
-        }),
+      [requestContext, turnInstructions] = await Promise.race([
+        Promise.all([
+          this._buildRequestContext({
+            modeId: effectiveModeId,
+            modelId: effectiveModelId,
+            abortSignal: turnAbortSignal,
+            ...(persistedRequestContext ? { persistedRequestContext } : {}),
+          }),
+          this._turnInstructions(mode.instructions),
+        ]),
         activeTurnWaiter.promise,
       ]);
     } catch (err) {
@@ -5782,14 +7419,16 @@ export class Session {
       // persistence). Redact before rejecting the caller's promise.
       throw redactPublicBoundaryRejection(err);
     }
+    reportAdmissionPhase('request_context_ready');
     assertOwnedMessageTurnNotDeleted();
 
     const baseExecOptions: AgentExecutionOptionsBase<unknown> = {
       memory: { thread: this.threadId, resource: this.resourceId },
       abortSignal: turnAbortSignal,
       requestContext,
+      maxSteps: HARNESS_SESSION_MAX_STEPS,
       ...toolSurface,
-      ...(mode.instructions ? { instructions: mode.instructions } : {}),
+      ...(turnInstructions ? { instructions: turnInstructions } : {}),
       // §9 per-turn override: caller-supplied model generation settings
       // (temperature, maxOutputTokens, …) layered onto the structured generate
       // turn. Omitted → model/provider defaults, so existing turns are unchanged.
@@ -5897,6 +7536,19 @@ export class Session {
     // delivered to the interleaved run, matching how `abortSignal` behaves on active-delivery —
     // we deliberately do not reject post-reservation, because that would poison the retry.
     if (callerRequestContext !== undefined && sub.activeRunId() !== null) {
+      // The probe (in flight since admission entry) preserves the idempotent
+      // retry: a duplicate of an actively-delivering admission attaches to the
+      // running turn instead of surfacing the active-delivery rejection.
+      const duplicate = duplicateProbe !== undefined ? await duplicateProbe.catch(() => undefined) : undefined;
+      if (duplicate) {
+        if (opts.admissionId !== undefined) this._messageAdmissionStarts.delete(opts.admissionId);
+        admissionStart?.resolve(duplicate);
+        try {
+          return await this._returnDuplicateMessageResult(duplicate, opts);
+        } finally {
+          finishOwnedMessageTurn();
+        }
+      }
       const err = new HarnessConfigError(
         'message().requestContext',
         'cannot be supplied while a run is active on this thread — it would interleave into the running execution and could not reach its tools',
@@ -5924,6 +7576,8 @@ export class Session {
           activeTurnWaiter.promise,
         ]);
         if (!reservation.created) {
+          const registeredStart = this._messageAdmissionStarts.get(opts.admissionId!);
+          if (registeredStart !== undefined) registeredStart.duplicate = true;
           this._messageAdmissionStarts.delete(opts.admissionId!);
           const existing =
             reservation.evidence ??
@@ -5953,6 +7607,7 @@ export class Session {
       }
       assertOwnedMessageTurnNotDeleted();
     }
+    reportAdmissionPhase('evidence_reserved');
 
     let signal;
     try {
@@ -5966,7 +7621,14 @@ export class Session {
           ...(admissionIdentity ? { runId: admissionIdentity.runId } : {}),
           resourceId: this.resourceId,
           threadId: this.threadId,
-          ifIdle: { behavior: 'wake', streamOptions: baseExecOptions as never },
+          ifIdle: {
+            behavior: 'wake',
+            // The wake branch starts a REAL streamed turn; carry the silent-turn nudge.
+            streamOptions: {
+              ...baseExecOptions,
+              onIterationComplete: createHarnessEmptySynthesisNudge(),
+            } as never,
+          },
         },
       );
     } catch (err) {
@@ -6046,23 +7708,12 @@ export class Session {
       admissionStart.reject(err);
     };
 
-    const pendingEvidenceWrite =
-      admissionIdentity !== undefined
-        ? this._writeMessageResultEvidence(
-            {
-              status: 'pending',
-              signalId: signal.signal.id,
-              runId: signal.runId,
-              modeId: effectiveModeId,
-              modelId: effectiveModelId,
-              operationKind: 'message',
-              ...(opts.admissionId !== undefined ? { admissionId: opts.admissionId } : {}),
-              ...(admissionHash !== undefined ? { admissionHash } : {}),
-            },
-            { compatibleAdmissionHashes },
-          )
-        : Promise.resolve();
-    void pendingEvidenceWrite.catch(() => {});
+    reportAdmissionPhase('agent_dispatched');
+    // PF-2250 §1 — no post-dispatch 'pending' refresh: the pre-dispatch
+    // reservation already wrote this exact row (signalId/runId are
+    // admission-derived and handed to sendSignal unchanged), so the refresh was
+    // a byte-identical durable write awaited on the first-token path. The
+    // reservation is the durable admission barrier.
 
     const failDispatchedMessageTurn = async (err: unknown) => {
       turnAbortController.abort(err);
@@ -6094,7 +7745,6 @@ export class Session {
     };
 
     const awaitPendingMessageEvidence = async () => {
-      await Promise.race([pendingEvidenceWrite, activeTurnWaiter.promise]);
       resolveMessageAdmissionStart();
     };
 
@@ -6174,6 +7824,7 @@ export class Session {
         // with a raw storage error. Redact before rejecting the caller.
         throw redactPublicBoundaryRejection(err);
       }
+      reportAdmissionPhase('output_registered');
       let streamCompletedEvidenceWriteFailed = false;
       let streamAgentEndEmitted = false;
       const streamBookkeeping = Promise.race([completion, activeTurnWaiter.promise])
@@ -6271,10 +7922,8 @@ export class Session {
     let completedEvidenceWriteFailed = false;
     let agentEndEmitted = false;
     try {
-      // The pre-dispatch reservation is the durable admission barrier here.
-      // Keep the post-dispatch pending refresh best-effort so completion
-      // evidence remains the authoritative default-path result.
-      await Promise.race([pendingEvidenceWrite.catch(() => {}), activeTurnWaiter.promise]);
+      // The pre-dispatch reservation is the durable admission barrier here;
+      // completion evidence remains the authoritative default-path result.
       resolveMessageAdmissionStart();
       if (signal.output) {
         await Promise.race([signal.output, activeTurnWaiter.promise]);
@@ -6473,7 +8122,7 @@ export class Session {
       accepted: true,
       signalId,
       ...(evidence.runId !== undefined ? { runId: evidence.runId } : {}),
-      duplicate: admissionStart.started === undefined,
+      duplicate: admissionStart.started === undefined || admissionStart.started.duplicate === true,
     };
   }
 
@@ -8212,21 +9861,26 @@ export class Session {
       try {
         const toolSurface = this._buildToolSurface(mode, opts.additionalTools);
         this._setCurrentTurnReplacementToolSurface(toolSurface);
-        const requestContext = await Promise.race([
-          this._buildRequestContext({
-            modeId: effectiveModeId,
-            modelId: effectiveModelId,
-            abortSignal: turnAbortSignal,
-            ...(persistedRequestContext ? { persistedRequestContext } : {}),
-          }),
+        const [requestContext, turnInstructions] = await Promise.race([
+          Promise.all([
+            this._buildRequestContext({
+              modeId: effectiveModeId,
+              modelId: effectiveModelId,
+              abortSignal: turnAbortSignal,
+              ...(persistedRequestContext ? { persistedRequestContext } : {}),
+            }),
+            this._turnInstructions(mode.instructions),
+          ]),
           activeTurnWaiter.promise,
         ]);
         const baseExecOptions: AgentExecutionOptionsBase<unknown> = {
           memory: { thread: this.threadId, resource: this.resourceId },
           abortSignal: turnAbortSignal,
           requestContext,
+          maxSteps: HARNESS_SESSION_MAX_STEPS,
+          onIterationComplete: createHarnessEmptySynthesisNudge(),
           ...toolSurface,
-          ...(mode.instructions ? { instructions: mode.instructions } : {}),
+          ...(turnInstructions ? { instructions: turnInstructions } : {}),
         };
         assertOwnedSignalTurnNotDeleted();
         this._assertOpenForTurn('signal()');
@@ -8606,7 +10260,16 @@ export class Session {
           {
             resourceId: this.resourceId,
             threadId: this.threadId,
-            ifIdle: { behavior: 'wake', streamOptions: {} as never },
+            // The interleave path ignores streamOptions (they cannot reach an
+            // active run), but the ifIdle wake fallback starts a REAL turn —
+            // without the ceiling it would die at the agent's 5-step default.
+            ifIdle: {
+              behavior: 'wake',
+              streamOptions: {
+                maxSteps: HARNESS_SESSION_MAX_STEPS,
+                onIterationComplete: createHarnessEmptySynthesisNudge(),
+              } as never,
+            },
           },
         );
       } catch (err) {
@@ -8714,20 +10377,25 @@ export class Session {
       try {
         const toolSurface = this._buildToolSurface(mode, undefined);
         this._setCurrentTurnReplacementToolSurface(toolSurface);
-        const requestContext = await Promise.race([
-          this._buildRequestContext({
-            modeId: effectiveModeId,
-            modelId: this._record.modelId,
-            abortSignal: turnAbortSignal,
-          }),
+        const [requestContext, turnInstructions] = await Promise.race([
+          Promise.all([
+            this._buildRequestContext({
+              modeId: effectiveModeId,
+              modelId: this._record.modelId,
+              abortSignal: turnAbortSignal,
+            }),
+            this._turnInstructions(mode.instructions),
+          ]),
           activeTurnWaiter.promise,
         ]);
         const baseExecOptions: AgentExecutionOptionsBase<unknown> = {
           memory: { thread: this.threadId, resource: this.resourceId },
           abortSignal: turnAbortSignal,
           requestContext,
+          maxSteps: HARNESS_SESSION_MAX_STEPS,
+          onIterationComplete: createHarnessEmptySynthesisNudge(),
           ...toolSurface,
-          ...(mode.instructions ? { instructions: mode.instructions } : {}),
+          ...(turnInstructions ? { instructions: turnInstructions } : {}),
         };
         assertOwnedReminderTurnNotDeleted();
         this._assertOpenForTurn('injectSystemReminder()');
@@ -8825,7 +10493,18 @@ export class Session {
       {
         resourceId: this.resourceId,
         threadId: this.threadId,
-        ifIdle: { behavior: 'wake', streamOptions: {} as never },
+        ifIdle: {
+          behavior: 'wake',
+          // The active-delivery race can still land idle; a wake here starts a
+          // REAL streamed turn, so it must carry the step ceiling and the
+          // silent-turn nudge like every other wake site — empty options ran
+          // the turn at the provider's 5-step default with no memory identity.
+          streamOptions: {
+            memory: { thread: this.threadId, resource: this.resourceId },
+            maxSteps: HARNESS_SESSION_MAX_STEPS,
+            onIterationComplete: createHarnessEmptySynthesisNudge(),
+          } as never,
+        },
       },
     );
 
@@ -8885,7 +10564,33 @@ export class Session {
     const existing = this._record.pendingResume;
     if (existing && existing.runId === full.runId && existing.toolCallId === payload.toolCallId) {
       if (pending.toolSurfaceFence !== undefined) this._retainCurrentReplacementToolSurface(full.runId);
-      await this._flushUpdate(prev => prev, { tokenUsageDelta: opts.tokenUsageDelta });
+      await this._flushUpdate(
+        prev => {
+          const current = prev.pendingResume;
+          if (
+            current === undefined ||
+            current.runId !== full.runId ||
+            current.toolCallId !== payload.toolCallId ||
+            (pending.accountedTokenUsage === undefined &&
+              pending.toolReceipts === undefined &&
+              pending.toolReceiptsOverflow !== true)
+          ) {
+            return prev;
+          }
+          return {
+            ...prev,
+            pendingResume: {
+              ...current,
+              ...(pending.accountedTokenUsage !== undefined
+                ? { accountedTokenUsage: pending.accountedTokenUsage }
+                : {}),
+              ...(pending.toolReceipts !== undefined ? { toolReceipts: pending.toolReceipts } : {}),
+              ...(pending.toolReceiptsOverflow === true ? { toolReceiptsOverflow: true } : {}),
+            },
+          };
+        },
+        { tokenUsageDelta: opts.tokenUsageDelta },
+      );
       if (this._currentAgentRequestContext && suspendedFenceLease) {
         clearSuspendedToolSurfaceFence(this._currentAgentRequestContext, full.runId, suspendedFenceLease);
       }
@@ -8919,14 +10624,16 @@ export class Session {
   ): PendingResume | undefined {
     if (!full.runId) return undefined;
     const kind = this._classifyResumeKind(payload);
+    const accountedTokenUsage = this._tokenUsageDeltaFromFullOutput(full);
+    const toolReceiptProjection = this._pendingRunToolReceiptProjection(full.runId);
     const pending: PendingResume = {
       kind,
       itemId: `${kind}:${payload.toolCallId}`,
       runId: full.runId,
       toolCallId: payload.toolCallId,
       toolName: payload.toolName,
-      source: 'parent',
-      requestedAt: Date.now(),
+      ...this._pendingResumeSourceFields(),
+      ...this._newPendingInteractionTiming(kind),
       ...(queuedItemId !== undefined ? { queuedItemId } : {}),
       ...(originSignalId !== undefined ? { originSignalId } : {}),
       modeId,
@@ -8941,6 +10648,8 @@ export class Session {
       ...(this._currentToolSurfaceFenceSnapshot(full.runId)
         ? { toolSurfaceFence: this._currentToolSurfaceFenceSnapshot(full.runId) }
         : {}),
+      ...(accountedTokenUsage ? { accountedTokenUsage } : {}),
+      ...toolReceiptProjection,
       payload: this._buildResumePayload(kind, payload),
     };
 
@@ -8951,6 +10660,15 @@ export class Session {
       if (mode.transitionsTo) pending.transitionModeId = mode.transitionsTo;
     }
     return pending;
+  }
+
+  /** Correlate child-side pending interactions with their parent invocation. */
+  private _pendingResumeSourceFields(): Pick<PendingResume, 'source' | 'subagentToolCallId'> {
+    if (this.subagentDepth <= 0) return { source: 'parent' };
+    return {
+      source: 'subagent',
+      ...(this._subagentParentToolCallId !== undefined ? { subagentToolCallId: this._subagentParentToolCallId } : {}),
+    };
   }
 
   private _classifyResumeKind(payload: { toolName: string; suspendPayload?: unknown }): PendingResume['kind'] {
@@ -10414,15 +12132,20 @@ export class Session {
   private async _permGrantCategory(opts: { category: ToolCategory }): Promise<void> {
     this._assertLive('permissions.grantCategory()');
     assertToolCategory('permissions.grantCategory', opts.category);
-    if (this._record.sessionGrants.categories.includes(opts.category)) return;
-    await this._flushUpdate(prev => ({
-      ...prev,
-      sessionGrants: {
-        ...prev.sessionGrants,
-        categories: [...prev.sessionGrants.categories, opts.category],
-      },
-    }));
-    this._emitter.emit({ type: 'permission_granted', category: opts.category });
+    let changed = false;
+    await this._flushUpdate(prev => {
+      changed = false;
+      if (prev.sessionGrants.categories.includes(opts.category)) return prev;
+      changed = true;
+      return {
+        ...prev,
+        sessionGrants: {
+          ...prev.sessionGrants,
+          categories: [...prev.sessionGrants.categories, opts.category],
+        },
+      };
+    });
+    if (changed) this._emitter.emit({ type: 'permission_granted', category: opts.category });
   }
 
   /**
@@ -10432,15 +12155,20 @@ export class Session {
   private async _permGrantTool(opts: { toolName: string }): Promise<void> {
     this._assertLive('permissions.grantTool()');
     assertToolName('permissions.grantTool', opts.toolName);
-    if (this._record.sessionGrants.tools.includes(opts.toolName)) return;
-    await this._flushUpdate(prev => ({
-      ...prev,
-      sessionGrants: {
-        ...prev.sessionGrants,
-        tools: [...prev.sessionGrants.tools, opts.toolName],
-      },
-    }));
-    this._emitter.emit({ type: 'permission_granted', toolName: opts.toolName });
+    let changed = false;
+    await this._flushUpdate(prev => {
+      changed = false;
+      if (prev.sessionGrants.tools.includes(opts.toolName)) return prev;
+      changed = true;
+      return {
+        ...prev,
+        sessionGrants: {
+          ...prev.sessionGrants,
+          tools: [...prev.sessionGrants.tools, opts.toolName],
+        },
+      };
+    });
+    if (changed) this._emitter.emit({ type: 'permission_granted', toolName: opts.toolName });
   }
 
   /**
@@ -10450,16 +12178,20 @@ export class Session {
   private async _permRevokeCategory(opts: { category: ToolCategory }): Promise<void> {
     this._assertLive('permissions.revokeCategory()');
     assertToolCategory('permissions.revokeCategory', opts.category);
-    const idx = this._record.sessionGrants.categories.indexOf(opts.category);
-    if (idx === -1) return;
-    await this._flushUpdate(prev => ({
-      ...prev,
-      sessionGrants: {
-        ...prev.sessionGrants,
-        categories: prev.sessionGrants.categories.filter(c => c !== opts.category),
-      },
-    }));
-    this._emitter.emit({ type: 'permission_revoked', category: opts.category });
+    let changed = false;
+    await this._flushUpdate(prev => {
+      changed = false;
+      if (!prev.sessionGrants.categories.includes(opts.category)) return prev;
+      changed = true;
+      return {
+        ...prev,
+        sessionGrants: {
+          ...prev.sessionGrants,
+          categories: prev.sessionGrants.categories.filter(c => c !== opts.category),
+        },
+      };
+    });
+    if (changed) this._emitter.emit({ type: 'permission_revoked', category: opts.category });
   }
 
   /**
@@ -10469,16 +12201,20 @@ export class Session {
   private async _permRevokeTool(opts: { toolName: string }): Promise<void> {
     this._assertLive('permissions.revokeTool()');
     assertToolName('permissions.revokeTool', opts.toolName);
-    const idx = this._record.sessionGrants.tools.indexOf(opts.toolName);
-    if (idx === -1) return;
-    await this._flushUpdate(prev => ({
-      ...prev,
-      sessionGrants: {
-        ...prev.sessionGrants,
-        tools: prev.sessionGrants.tools.filter(t => t !== opts.toolName),
-      },
-    }));
-    this._emitter.emit({ type: 'permission_revoked', toolName: opts.toolName });
+    let changed = false;
+    await this._flushUpdate(prev => {
+      changed = false;
+      if (!prev.sessionGrants.tools.includes(opts.toolName)) return prev;
+      changed = true;
+      return {
+        ...prev,
+        sessionGrants: {
+          ...prev.sessionGrants,
+          tools: prev.sessionGrants.tools.filter(t => t !== opts.toolName),
+        },
+      };
+    });
+    if (changed) this._emitter.emit({ type: 'permission_revoked', toolName: opts.toolName });
   }
 
   /** Read-only snapshot of the session's current grants. */
@@ -10513,64 +12249,66 @@ export class Session {
     assertPolicy('permissions.setPolicy', opts.policy);
     if (opts.category !== undefined) {
       assertToolCategory('permissions.setPolicy', opts.category);
-      const oldPolicy = this._record.permissionRules.categories[opts.category];
-      if (oldPolicy === opts.policy) return;
-      await this._flushUpdate(prev => ({
-        ...prev,
-        permissionRules: {
-          ...prev.permissionRules,
-          categories: { ...prev.permissionRules.categories, [opts.category!]: opts.policy },
-        },
-      }));
-      this._emitter.emit({
-        type: 'permission_policy_changed',
-        category: opts.category,
-        oldPolicy,
-        newPolicy: opts.policy,
+      let oldPolicy: PermissionPolicy | undefined;
+      let changed = false;
+      await this._flushUpdate(prev => {
+        changed = false;
+        oldPolicy = prev.permissionRules.categories[opts.category!];
+        if (oldPolicy === opts.policy) return prev;
+        changed = true;
+        return {
+          ...prev,
+          permissionRules: {
+            ...prev.permissionRules,
+            categories: { ...prev.permissionRules.categories, [opts.category!]: opts.policy },
+          },
+        };
       });
+      if (changed) {
+        this._emitter.emit({
+          type: 'permission_policy_changed',
+          category: opts.category,
+          oldPolicy,
+          newPolicy: opts.policy,
+        });
+      }
       return;
     }
     assertToolName('permissions.setPolicy', opts.toolName!);
-    const oldPolicy = this._record.permissionRules.tools[opts.toolName!];
-    if (oldPolicy === opts.policy) return;
-    await this._flushUpdate(prev => ({
-      ...prev,
-      permissionRules: {
-        ...prev.permissionRules,
-        tools: { ...prev.permissionRules.tools, [opts.toolName!]: opts.policy },
-      },
-    }));
-    this._emitter.emit({
-      type: 'permission_policy_changed',
-      toolName: opts.toolName,
-      oldPolicy,
-      newPolicy: opts.policy,
+    let oldPolicy: PermissionPolicy | undefined;
+    let changed = false;
+    await this._flushUpdate(prev => {
+      changed = false;
+      oldPolicy = prev.permissionRules.tools[opts.toolName!];
+      if (oldPolicy === opts.policy) return prev;
+      changed = true;
+      return {
+        ...prev,
+        permissionRules: {
+          ...prev.permissionRules,
+          tools: { ...prev.permissionRules.tools, [opts.toolName!]: opts.policy },
+        },
+      };
     });
+    if (changed) {
+      this._emitter.emit({
+        type: 'permission_policy_changed',
+        toolName: opts.toolName,
+        oldPolicy,
+        newPolicy: opts.policy,
+      });
+    }
   }
 
   // -------------------------------------------------------------------------
   // Observational Memory — §4.2e / §9.2.
   //
-  // OM is advisory memory context, not a recovery proof boundary. The config
-  // accessors below read the resolved per-session OM config (the persisted
-  // `SessionRecord.observationalMemory` snapshot, falling back to the harness
-  // defaults); the model switches are session-config writes that commit under
-  // the session lease via `_flushUpdate` and never touch raw MemoryStorage rows.
-  // The redacted snapshot read (`getRecord`/`loadProgress`, §4.8) is a separate
-  // follow-up slice.
-  //
-  // CONTRACT (read this): `switchObserverModel`/`switchReflectorModel` record
-  // durable per-session INTENT — they do NOT change runtime OM behavior today.
-  // Effective OM (its observer/reflector models, scope, and thresholds) is fixed
-  // at the Agent's Memory CONSTRUCTION via `Memory.threadConfig.observationalMemory`;
-  // the harness deliberately does NOT thread a per-turn OM option, because core
-  // Memory builds its OM engine only from constructor config AND suppresses the
-  // MessageHistory processor whenever it sees OM "enabled" (so a runtime OM option
-  // for a Memory not constructed with OM would drop history without attaching OM —
-  // see the DEFERRED note on `_omWriteConfig`). To actually USE OM, construct the
-  // Agent's Memory with OM; the `om.get*` accessors then report that resolved
-  // config, and the switches stay recorded intent until upstream adds runtime OM
-  // override. An explicit switch logs a one-time advisory (see `_warnOmIntentInert`).
+  // OM is advisory memory context, not a recovery proof boundary. Native
+  // per-turn engine selection is not available yet, so enabled Harness OM
+  // configuration is rejected at Harness construction and model switches reject
+  // before persisting anything. `clearOverride()` remains as a recovery surface
+  // for sessions written by an older build that recorded now-unsupported intent.
+  // Configure OM directly on the Agent Memory instance in the meantime.
   // -------------------------------------------------------------------------
 
   readonly om = Object.freeze({
@@ -10580,6 +12318,7 @@ export class Session {
     getReflectionThreshold: (): number => this._omReflectionThreshold(),
     switchObserverModel: (opts: { model: string }): Promise<void> => this._omSwitchObserverModel(opts),
     switchReflectorModel: (opts: { model: string }): Promise<void> => this._omSwitchReflectorModel(opts),
+    clearOverride: (): Promise<void> => this._omClearOverride(),
   });
 
   private _omDefaults() {
@@ -10613,9 +12352,10 @@ export class Session {
     if (typeof opts?.model !== 'string' || opts.model.length === 0) {
       throw new HarnessValidationError('om.switchObserverModel.model', 'must be a non-empty string');
     }
-    this._warnOmIntentInert();
-    if (this._record.observationalMemory?.observerModelId === opts.model) return;
-    await this._omWriteConfig(prev => ({ ...prev, observerModelId: opts.model }));
+    throw new HarnessConfigError(
+      'observationalMemory',
+      'per-session model switches are not supported until @mastra/memory can select an OM engine from the effective per-turn config',
+    );
   }
 
   private async _omSwitchReflectorModel(opts: { model: string }): Promise<void> {
@@ -10623,63 +12363,30 @@ export class Session {
     if (typeof opts?.model !== 'string' || opts.model.length === 0) {
       throw new HarnessValidationError('om.switchReflectorModel.model', 'must be a non-empty string');
     }
-    this._warnOmIntentInert();
-    if (this._record.observationalMemory?.reflectorModelId === opts.model) return;
-    await this._omWriteConfig(prev => ({ ...prev, reflectorModelId: opts.model }));
-  }
-
-  /** @internal — guards {@link _warnOmIntentInert} to once per live session. */
-  private _omIntentInertWarned = false;
-
-  /**
-   * §9.2 OM honesty — warn ONCE per session that an explicit `session.om.*` model
-   * switch records durable per-session INTENT but does NOT change runtime OM
-   * behavior. OM observer/reflector models, scope, and thresholds are fixed at
-   * the Agent's Memory CONSTRUCTION (Memory `threadConfig.observationalMemory`);
-   * the per-turn path forwards only temporal markers, so a session-level switch
-   * is inert at runtime today — and core Memory SUPPRESSES MessageHistory when it
-   * sees OM "enabled", so a runtime OM option for non-OM-constructed Memory would
-   * drop history WITHOUT attaching OM. The config is still recorded (read-back via
-   * `om.get*`) for forward-compat + declared-intent inspection. Advisory only.
-   */
-  private _warnOmIntentInert(): void {
-    if (this._omIntentInertWarned) return;
-    this._omIntentInertWarned = true;
-    console.warn(
-      '[harness/v1] session.om model switch records durable per-session intent but does NOT change runtime ' +
-        'Observational Memory behavior: OM models/scope/thresholds are fixed at the Agent Memory construction ' +
-        '(threadConfig.observationalMemory). Effective OM requires constructing the Memory with OM; per-session ' +
-        'runtime override is pending upstream support. The intent is still recorded for read-back.',
+    throw new HarnessConfigError(
+      'observationalMemory',
+      'per-session model switches are not supported until @mastra/memory can select an OM engine from the effective per-turn config',
     );
   }
 
-  /** The full per-session OM snapshot seeded from the resolved harness defaults. */
-  private _omDefaultSeed(): NonNullable<SessionRecord['observationalMemory']> {
-    const d = this._omDefaults();
-    return {
-      scope: d.scope,
-      ...(d.observerModelId !== undefined ? { observerModelId: d.observerModelId } : {}),
-      ...(d.reflectorModelId !== undefined ? { reflectorModelId: d.reflectorModelId } : {}),
-      ...(d.observationThreshold !== undefined ? { observationThreshold: d.observationThreshold } : {}),
-      ...(d.reflectionThreshold !== undefined ? { reflectionThreshold: d.reflectionThreshold } : {}),
-    };
+  /** Remove unsupported intent persisted by an older Harness build. */
+  private async _omClearOverride(): Promise<void> {
+    this._assertLive('om.clearOverride()');
+    await this._flushUpdate(prev => {
+      if (prev.observationalMemory === undefined) return prev;
+      const next = { ...prev };
+      delete next.observationalMemory;
+      return next;
+    });
+    // Recovered queue work parks while a legacy override is present. Wake it
+    // only after the clearing CAS commits; a failed write leaves the durable
+    // poison authoritative. This mirrors the other fire-and-forget queue kicks
+    // and is idempotent when another drain already owns the session.
+    void this._maybeDrainQueue();
   }
 
-  /**
-   * Commit an OM config patch under the session lease. When the session has no
-   * persisted OM snapshot yet (a legacy/unseeded record), the base is the FULL
-   * resolved default seed — not a bare `{ scope }` — so a single-field switch
-   * freezes the effective scope/thresholds/peer model rather than dropping them.
-   */
-  private async _omWriteConfig(
-    patch: (
-      prev: NonNullable<SessionRecord['observationalMemory']>,
-    ) => NonNullable<SessionRecord['observationalMemory']>,
-  ): Promise<void> {
-    await this._flushUpdate(prev => {
-      const base = prev.observationalMemory ?? this._omDefaultSeed();
-      return { ...prev, observationalMemory: patch(base) };
-    });
+  private _hasUnsupportedObservationalMemoryIntent(): boolean {
+    return this._harness._getObservationalMemoryDefaults().enabled || this._record.observationalMemory !== undefined;
   }
 
   // §9.2 PER-TURN OM ENABLEMENT — DEFERRED (BLOCKED ON @mastra/memory).
@@ -10693,10 +12400,11 @@ export class Session {
   // whenever it sees OM "enabled" in the effective config (memory.ts), so passing
   // a runtime OM option for an Agent whose Memory was NOT constructed with OM would
   // SUPPRESS normal history WITHOUT attaching OM. So the harness does NOT thread a
-  // per-turn OM option today; `session.om.*` records durable per-session config
-  // intent (above), and effective enablement requires the Agent's Memory to be
-  // constructed with OM. Faithful runtime enablement needs upstream support for
-  // runtime OM engine construction/override.
+  // per-turn OM option today. Harness construction rejects enabled configuration;
+  // `_buildRequestContext` additionally rejects records carrying unsupported intent
+  // persisted by older builds until `session.om.clearOverride()` removes it. Users
+  // can configure OM directly on the Agent Memory and omit this option while native
+  // per-turn engine selection is implemented in @mastra/memory.
 
   private async _resume(
     expectedKind: PendingResume['kind'],
@@ -10704,6 +12412,7 @@ export class Session {
     responseOptions: InboxResponseOptions = {},
   ): Promise<AgentResult | InboxResponseResult> {
     this._assertLive(`respond[${expectedKind}]`);
+    const activeWorkAdmissionEpoch = this._captureActiveWorkAdmission(`respond[${expectedKind}]`);
     const responseId = getOwnRecordValue(responseOptions as Record<string, unknown>, 'responseId');
     if (responseId !== undefined && typeof responseId !== 'string') {
       throw new HarnessValidationError(`respond[${expectedKind}].responseId`, 'responseId must be a string');
@@ -10716,15 +12425,65 @@ export class Session {
     if (requestedItemId !== undefined && typeof requestedItemId !== 'string') {
       throw new HarnessValidationError(`respond[${expectedKind}].itemId`, 'itemId must be a string');
     }
+    const requestedRunId = getOwnRecordValue(responseOptions as Record<string, unknown>, 'runId');
+    const requestedToolCallId = getOwnRecordValue(responseOptions as Record<string, unknown>, 'toolCallId');
+    const requestedPendingRequestedAt = getOwnRecordValue(
+      responseOptions as Record<string, unknown>,
+      'pendingRequestedAt',
+    );
+    if (responseId !== undefined) {
+      if (typeof requestedItemId !== 'string' || requestedItemId.length === 0) {
+        throw new HarnessValidationError(`respond[${expectedKind}].itemId`, 'receipt responses require itemId');
+      }
+      if (typeof requestedRunId !== 'string' || requestedRunId.length === 0) {
+        throw new HarnessValidationError(`respond[${expectedKind}].runId`, 'receipt responses require runId');
+      }
+      if (typeof requestedToolCallId !== 'string' || requestedToolCallId.length === 0) {
+        throw new HarnessValidationError(`respond[${expectedKind}].toolCallId`, 'receipt responses require toolCallId');
+      }
+      if (
+        typeof requestedPendingRequestedAt !== 'number' ||
+        !Number.isSafeInteger(requestedPendingRequestedAt) ||
+        requestedPendingRequestedAt < 0
+      ) {
+        throw new HarnessValidationError(
+          `respond[${expectedKind}].pendingRequestedAt`,
+          'receipt responses require a non-negative integer pendingRequestedAt',
+        );
+      }
+    }
+    const requestedApprovalScope = getOwnRecordValue(responseOptions as Record<string, unknown>, 'approvalScope');
+    if (
+      requestedApprovalScope !== undefined &&
+      requestedApprovalScope !== 'once' &&
+      requestedApprovalScope !== 'always'
+    ) {
+      throw new HarnessValidationError(
+        `respond[${expectedKind}].approvalScope`,
+        'approvalScope must be "once" or "always"',
+      );
+    }
+    if (expectedKind !== 'tool-approval' && requestedApprovalScope !== undefined) {
+      throw new HarnessValidationError(
+        `respond[${expectedKind}].approvalScope`,
+        'approvalScope is only valid for tool approvals',
+      );
+    }
+    const approvalScope =
+      expectedKind === 'tool-approval' ? ((requestedApprovalScope ?? 'once') as 'once' | 'always') : undefined;
+    if (approvalScope === 'always' && (resumeData as { approved?: unknown })?.approved !== true) {
+      throw new HarnessValidationError('respond[tool-approval].approvalScope', '"always" requires approved: true');
+    }
 
     const storedReceipt =
       responseId !== undefined ? getOwnRecordValue(this._record.inboxResponseReceipts, responseId) : undefined;
     if (storedReceipt !== undefined) {
       const duplicate = this._resolveStoredInboxResponse(expectedKind, resumeData, responseOptions);
-      if (storedReceipt.status === 'applied') {
+      const retryClaim = storedReceipt.status === 'failed' && storedReceipt.retryable === true;
+      if (!retryClaim && storedReceipt.status === 'applied') {
         return duplicate!;
       }
-      if (this._record.pendingResume === undefined) {
+      if (!retryClaim && this._record.pendingResume === undefined) {
         const recoveredReceipt = await this._applyInboxReceiptFromCompletedQueue(storedReceipt);
         if (recoveredReceipt) return this._inboxReceiptResult(recoveredReceipt, true);
         return duplicate!;
@@ -10732,7 +12491,11 @@ export class Session {
       // The original caller owns the in-flight resume. A later delivery of the
       // same accepted inbox response observes that durable admission and must
       // not enter the busy resume path or dispatch the agent a second time.
-      if (this._record.pendingResume.resumedAt !== undefined && this._currentTurnAbortController !== undefined) {
+      if (
+        !retryClaim &&
+        this._record.pendingResume?.resumedAt !== undefined &&
+        this._currentTurnAbortController !== undefined
+      ) {
         return duplicate!;
       }
     }
@@ -10744,12 +12507,42 @@ export class Session {
 
     const pending = this._record.pendingResume;
     if (!pending) {
+      if (
+        typeof requestedItemId === 'string' &&
+        typeof requestedRunId === 'string' &&
+        typeof requestedToolCallId === 'string' &&
+        typeof requestedPendingRequestedAt === 'number'
+      ) {
+        const generationKey = pendingInteractionGenerationKey({
+          kind: expectedKind,
+          itemId: requestedItemId,
+          runId: requestedRunId,
+          toolCallId: requestedToolCallId,
+          requestedAt: requestedPendingRequestedAt,
+        });
+        const expired = getOwnRecordValue(this._record.expiredPendingInteractions, generationKey);
+        if (expired?.kind === expectedKind) {
+          throw new HarnessPendingInteractionExpiredError(this.id, expired.itemId, expired.expiresAt);
+        }
+      }
       throw new HarnessValidationError(`respond[${expectedKind}]`, 'no pending resume on this session');
     }
     if (pending.kind !== expectedKind) {
       throw new HarnessValidationError(
         `respond[${expectedKind}]`,
         `pending resume is "${pending.kind}", not "${expectedKind}"`,
+      );
+    }
+    if (
+      responseId !== undefined &&
+      (requestedRunId !== pending.runId ||
+        requestedToolCallId !== pending.toolCallId ||
+        requestedPendingRequestedAt !== pending.requestedAt)
+    ) {
+      throw new HarnessInboxItemNotFoundError(
+        this.id,
+        requestedItemId as string,
+        expectedKind === 'sandbox-access' ? undefined : expectedKind,
       );
     }
     // ask_user / submit_plan / sandbox access persist and emit their pending
@@ -10774,6 +12567,36 @@ export class Session {
         expectedKind === 'sandbox-access' ? undefined : expectedKind,
       );
     }
+    if (approvalScope === 'always' && (!pending.toolName || pending.toolName.length === 0)) {
+      throw new HarnessValidationError(
+        'respond[tool-approval].approvalScope',
+        'the pending tool approval has no grantable tool name',
+      );
+    }
+    const pendingExpiresAt = this._pendingInteractionExpiresAt(pending);
+    if (pending.expiryStartedAt !== undefined || (pending.resumedAt === undefined && Date.now() >= pendingExpiresAt)) {
+      const didExpire = await this._expirePendingInteraction({
+        kind: pending.kind,
+        itemId,
+        runId: pending.runId,
+        toolCallId: pending.toolCallId,
+        requestedAt: pending.requestedAt,
+        expiresAt: pendingExpiresAt,
+      });
+      const generationKey = pendingInteractionGenerationKey({
+        kind: pending.kind,
+        itemId,
+        runId: pending.runId,
+        toolCallId: pending.toolCallId,
+        requestedAt: pending.requestedAt,
+      });
+      if (
+        didExpire ||
+        getOwnRecordValue(this._record.expiredPendingInteractions, generationKey)?.kind === expectedKind
+      ) {
+        throw new HarnessPendingInteractionExpiredError(this.id, itemId, pendingExpiresAt);
+      }
+    }
     const responseHash =
       responseId !== undefined
         ? this._computeInboxResponseHash({
@@ -10782,6 +12605,7 @@ export class Session {
             runId: pending.runId,
             pendingRequestedAt: pending.requestedAt,
             response: resumeData,
+            ...(approvalScope !== undefined ? { approvalScope } : {}),
           })
         : undefined;
     const persistedResponse =
@@ -10795,15 +12619,18 @@ export class Session {
         responseId: responseId!,
         responseHash: responseHash!,
       });
-      this._throwStoredInboxResponseFailure(existingReceipt);
-      if (
-        responseMode === 'inbox-receipt' &&
-        (pending.resumedAt === undefined || existingReceipt.status === 'applied')
-      ) {
-        return this._inboxReceiptResult(existingReceipt, true);
-      }
-      if (existingReceipt.status === 'applied' && existingReceipt.result !== undefined) {
-        return existingReceipt.result as AgentResult;
+      const retryClaim = existingReceipt.status === 'failed' && existingReceipt.retryable === true;
+      if (!retryClaim) {
+        this._throwStoredInboxResponseFailure(existingReceipt);
+        if (
+          responseMode === 'inbox-receipt' &&
+          (pending.resumedAt === undefined || existingReceipt.status === 'applied')
+        ) {
+          return this._inboxReceiptResult(existingReceipt, true);
+        }
+        if (existingReceipt.status === 'applied' && existingReceipt.result !== undefined) {
+          return existingReceipt.result as AgentResult;
+        }
       }
     }
 
@@ -10823,18 +12650,15 @@ export class Session {
           return this._inboxReceiptResult(receipt, true);
         }
         if (recovery.status === 'stale') {
-          const stale = new QueueResumeRecoveryStaleError();
-          await this._markInboxResponseFailed(existingReceipt.responseId, stale);
-          throw stale;
+          throw new ResumeRecoveryStaleError();
         }
         if (
           this._currentTurnAbortController === undefined &&
           this._queuedItemIdForPendingResume(pending) === undefined &&
-          Date.now() >= pending.resumedAt + QUEUE_ACCEPTED_RECOVERY_STALE_MS
+          Date.now() >= this._pendingInteractionDueAt(pending)
         ) {
-          const stale = new QueueResumeRecoveryStaleError();
-          await this._markInboxResponseFailedAndClearPending(existingReceipt.responseId, pending, stale);
-          throw stale;
+          const stale = new ResumeRecoveryStaleError();
+          if (await this._recoverStaleResumeAdmission(this._pendingInteractionGeneration(pending))) throw stale;
         }
         return this._inboxReceiptResult(existingReceipt, true);
       }
@@ -10849,20 +12673,15 @@ export class Session {
         return recovery.result;
       }
       if (recovery.status === 'stale') {
-        const stale = new QueueResumeRecoveryStaleError();
-        if (responseId !== undefined) {
-          await this._markInboxResponseFailed(responseId, stale);
-        }
-        throw stale;
+        throw new ResumeRecoveryStaleError();
       }
       if (
         this._currentTurnAbortController === undefined &&
         this._queuedItemIdForPendingResume(pending) === undefined &&
-        Date.now() >= pending.resumedAt + QUEUE_ACCEPTED_RECOVERY_STALE_MS
+        Date.now() >= this._pendingInteractionDueAt(pending)
       ) {
-        const stale = new QueueResumeRecoveryStaleError();
-        await this._markInboxResponseFailedAndClearPending(responseId, pending, stale);
-        throw stale;
+        const stale = new ResumeRecoveryStaleError();
+        if (await this._recoverStaleResumeAdmission(this._pendingInteractionGeneration(pending))) throw stale;
       }
       throw new HarnessValidationError(
         `respond[${expectedKind}]`,
@@ -10903,7 +12722,8 @@ export class Session {
     const previousModeId = this._record.modeId;
     const resumeModeId = this._modeIdForPendingResume(pending);
     const resumeRuntimeDependencies = this._runtimeDependenciesForPendingResume(pending);
-    let resumeToolSurface = this._buildToolSurface(this._harness._getMode(resumeModeId));
+    const resumeMode = this._harness._getMode(resumeModeId);
+    let resumeToolSurface = this._buildToolSurface(resumeMode);
     if (pending.toolSurfaceFence !== undefined) {
       const retainedFence = this._pendingReplacementToolSurfaces.get(pending.runId);
       if (retainedFence === undefined) {
@@ -10938,6 +12758,7 @@ export class Session {
               kind: expectedKind,
               pending,
               response: persistedResponse,
+              ...(approvalScope !== undefined ? { approvalScope } : {}),
             },
             err,
           );
@@ -10955,11 +12776,21 @@ export class Session {
     // Mark resumed under the lease BEFORE calling the agent (idempotency
     // marker per §5.4 / §5.7). On crash here, the next caller observes
     // resumedAt set and rejects rather than double-resuming.
-    const resumedAt = Date.now();
+    let resumedAt: number | undefined;
     let duplicateReceiptAfterAdmission: InboxResponseReceipt | undefined;
     let pendingAlreadyResumedAfterAdmission = false;
     let cancelledBeforeResume: { reason?: string } | undefined;
+    let invalidatedBeforeResume = false;
+    let expiredBeforeAdmission: PendingResume | undefined;
+    let grantedToolAfterAdmission: string | undefined;
     await this._flushUpdate(prev => {
+      expiredBeforeAdmission = undefined;
+      grantedToolAfterAdmission = undefined;
+      resumedAt = undefined;
+      if (!this._activeWorkAdmissionIsCurrent(activeWorkAdmissionEpoch)) {
+        invalidatedBeforeResume = true;
+        return prev;
+      }
       if (prev.cancelRequest !== undefined && prev.pendingResume?.resumedAt === undefined) {
         cancelledBeforeResume = prev.cancelRequest.reason !== undefined ? { reason: prev.cancelRequest.reason } : {};
         return prev;
@@ -10967,7 +12798,9 @@ export class Session {
 
       const currentReceipt =
         responseId !== undefined ? getOwnRecordValue(prev.inboxResponseReceipts, responseId) : undefined;
-      if (currentReceipt !== undefined) {
+      const retryableReceipt =
+        currentReceipt?.status === 'failed' && currentReceipt.retryable === true ? currentReceipt : undefined;
+      if (currentReceipt !== undefined && retryableReceipt === undefined) {
         this._assertMatchingInboxReceipt(currentReceipt, {
           kind: expectedKind,
           itemId,
@@ -10985,40 +12818,109 @@ export class Session {
         currentPending.kind !== expectedKind ||
         currentPending.runId !== pending.runId ||
         currentPending.toolCallId !== pending.toolCallId ||
-        (currentPending.itemId ?? currentPending.toolCallId) !== itemId
+        (currentPending.itemId ?? currentPending.toolCallId) !== itemId ||
+        currentPending.requestedAt !== pending.requestedAt ||
+        currentPending.expiresAt !== pending.expiresAt ||
+        currentPending.expiryStartedAt !== undefined
       ) {
         pendingAlreadyResumedAfterAdmission = true;
         return prev;
       }
 
+      const admissionAt = Date.now();
+      if (admissionAt >= this._pendingInteractionExpiresAt(currentPending)) {
+        expiredBeforeAdmission = currentPending;
+        return prev;
+      }
+      resumedAt = admissionAt;
+
+      const shouldGrantTool =
+        approvalScope === 'always' &&
+        currentPending.toolName !== undefined &&
+        !prev.sessionGrants.tools.includes(currentPending.toolName);
       const next: SessionRecord = {
         ...prev,
-        pendingResume: { ...currentPending, resumedAt },
+        pendingResume: {
+          ...currentPending,
+          resumedAt: admissionAt,
+          resumeRecoveryAt: admissionAt + QUEUE_ACCEPTED_RECOVERY_STALE_MS,
+        },
+        ...(shouldGrantTool
+          ? {
+              sessionGrants: {
+                ...prev.sessionGrants,
+                tools: [...prev.sessionGrants.tools, currentPending.toolName!],
+              },
+            }
+          : {}),
       };
+      if (shouldGrantTool) {
+        grantedToolAfterAdmission = currentPending.toolName;
+      }
       if (responseId === undefined) return next;
 
-      next.inboxResponseReceipts = {
-        ...(prev.inboxResponseReceipts ?? {}),
-        [responseId]: {
-          responseId,
-          responseHash: responseHash!,
-          resumeAttemptId: responseId,
-          itemId,
-          ...(pendingQueuedItemId !== undefined ? { queuedItemId: pendingQueuedItemId } : {}),
-          kind: expectedKind,
-          runId: pending.runId,
-          toolCallId: pending.toolCallId,
-          pendingRequestedAt: pending.requestedAt,
-          response: persistedResponse,
+      let retriedReceipt: InboxResponseReceipt | undefined;
+      if (retryableReceipt !== undefined) {
+        const { error: _error, failedAt: _failedAt, retryable: _retryable, ...receiptBase } = retryableReceipt;
+        retriedReceipt = {
+          ...receiptBase,
+          resumeAttemptId: `${responseId}:${retryableReceipt.failedAt ?? retryableReceipt.updatedAt}`,
           status: 'accepted',
-          acceptedAt: resumedAt,
-          updatedAt: resumedAt,
-        } satisfies InboxResponseReceipt,
-      };
+          acceptedAt: admissionAt,
+          updatedAt: admissionAt,
+        };
+      }
+      next.inboxResponseReceipts = pruneInboxResponseReceipts({
+        ...(prev.inboxResponseReceipts ?? {}),
+        [responseId]:
+          retriedReceipt ??
+          ({
+            responseId,
+            responseHash: responseHash!,
+            resumeAttemptId: responseId,
+            itemId,
+            ...(pendingQueuedItemId !== undefined ? { queuedItemId: pendingQueuedItemId } : {}),
+            kind: expectedKind,
+            runId: pending.runId,
+            toolCallId: pending.toolCallId,
+            pendingRequestedAt: pending.requestedAt,
+            response: persistedResponse,
+            ...(approvalScope !== undefined ? { approvalScope } : {}),
+            status: 'accepted',
+            acceptedAt: admissionAt,
+            updatedAt: admissionAt,
+          } satisfies InboxResponseReceipt),
+      });
       return next;
     });
+    // This event describes the durable policy transition committed by the CAS,
+    // not whether the provider resume subsequently starts. Emit before the
+    // branch-epoch checks so a Stop that wins immediately after admission does
+    // not hide a grant that remains authoritative in storage.
+    if (grantedToolAfterAdmission !== undefined) {
+      this._emitter.emit({ type: 'permission_granted', toolName: grantedToolAfterAdmission });
+    }
     if (cancelledBeforeResume !== undefined) {
       throw new HarnessSessionCancelledError(this.id, cancelledBeforeResume.reason);
+    }
+    if (invalidatedBeforeResume || !this._activeWorkAdmissionIsCurrent(activeWorkAdmissionEpoch)) {
+      throw new HarnessBusyError(this.id, 'in_flight');
+    }
+    if (expiredBeforeAdmission !== undefined) {
+      const expired = expiredBeforeAdmission;
+      await this._expirePendingInteraction({
+        kind: expired.kind,
+        itemId: expired.itemId ?? expired.toolCallId,
+        runId: expired.runId,
+        toolCallId: expired.toolCallId,
+        requestedAt: expired.requestedAt,
+        expiresAt: this._pendingInteractionExpiresAt(expired),
+      });
+      throw new HarnessPendingInteractionExpiredError(
+        this.id,
+        expired.itemId ?? expired.toolCallId,
+        this._pendingInteractionExpiresAt(expired),
+      );
     }
     if (duplicateReceiptAfterAdmission !== undefined) {
       this._throwStoredInboxResponseFailure(duplicateReceiptAfterAdmission);
@@ -11036,7 +12938,7 @@ export class Session {
         return recovery.result;
       }
       if (recovery.status === 'stale') {
-        const stale = new QueueResumeRecoveryStaleError();
+        const stale = new ResumeRecoveryStaleError();
         if (responseId !== undefined) {
           await this._markInboxResponseFailed(responseId, stale);
         }
@@ -11047,6 +12949,19 @@ export class Session {
         'pending resume already responded; awaiting agent confirmation',
       );
     }
+    if (resumedAt === undefined) {
+      throw new HarnessValidationError(
+        `respond[${expectedKind}]`,
+        'pending resume admission did not commit an authoritative response attempt',
+      );
+    }
+
+    // The storage CAS may have completed just before a Stop bumped the local
+    // branch epoch. Never create a new provider controller for a stale
+    // admission; Stop's
+    // durable discard owns execution terminalization from here. It does not
+    // roll back the independently committed policy grant.
+    this._assertActiveWorkAdmission(activeWorkAdmissionEpoch, `respond[${expectedKind}]`);
 
     // §10.2 defines no sandbox_access_resolved event — sandbox/path-access
     // prompts surface as question_pending and resolve via the inbox response
@@ -11100,27 +13015,40 @@ export class Session {
       // snapshot via toJSON), so without this a resumed turn would run UNGATED — the
       // §4.2e pre-action gate must re-evaluate before resume/execute, not just on the
       // initial turn.
-      const resumeRequestContext = await this._buildRequestContext({
-        modeId: resumeModeId,
-        modelId: resumeRuntimeDependencies.modelId ?? this._record.modelId,
-        abortSignal: turnAbortController.signal,
-        // §5.1 — rebuild the SAME caller app bag the suspended turn carried (the
-        // queued-drain path already threads `item.requestContext`; resume used to
-        // drop it). `_buildRequestContext` re-stashes it so a re-suspend on this
-        // resumed turn re-persists it. Absent on legacy pendings ⇒ no app bag.
-        ...(pending.requestContext ? { persistedRequestContext: pending.requestContext } : {}),
-        yolo: pending.yolo === true,
-      });
+      const [resumeRequestContext, turnInstructions] = await Promise.race([
+        Promise.all([
+          this._buildRequestContext({
+            modeId: resumeModeId,
+            modelId: resumeRuntimeDependencies.modelId ?? this._record.modelId,
+            abortSignal: turnAbortController.signal,
+            // §5.1 — rebuild the SAME caller app bag the suspended turn carried (the
+            // queued-drain path already threads `item.requestContext`; resume used to
+            // drop it). `_buildRequestContext` re-stashes it so a re-suspend on this
+            // resumed turn re-persists it. Absent on legacy pendings ⇒ no app bag.
+            ...(pending.requestContext ? { persistedRequestContext: pending.requestContext } : {}),
+            yolo: pending.yolo === true,
+          }),
+          this._turnInstructions(resumeMode.instructions),
+        ]),
+        activeTurnWaiter.promise,
+      ]);
       if (pending.toolSurfaceFence) {
         stageToolSurfaceFenceRestore(resumeRequestContext, pending.runId, pending.toolSurfaceFence);
       }
+      this._restorePendingRunToolReceipts(pending);
       const resumeStream = agent.resumeStream(resumeData, {
         runId: pending.runId,
         toolCallId: pending.toolCallId,
         memory: { thread: this.threadId, resource: this.resourceId },
         abortSignal: turnAbortController.signal,
         requestContext: resumeRequestContext,
+        // Resume must re-carry the ceiling: a missing `maxSteps` here caps the
+        // RESUMED segment at the agent's 5-step default and ends it mid-task
+        // (the agent-controller documents the identical trap for its lane).
+        maxSteps: HARNESS_SESSION_MAX_STEPS,
+        onIterationComplete: createHarnessEmptySynthesisNudge(),
         ...resumeToolSurface,
+        ...(turnInstructions ? { instructions: turnInstructions } : {}),
       });
       void resumeStream.catch(() => {});
       const out = await Promise.race([resumeStream, activeTurnWaiter.promise]);
@@ -11154,6 +13082,7 @@ export class Session {
           }
         }
       }
+      full = this._materializeHarnessRunOutput(pending.runId, full);
       const resumedQueuedItemId = this._queuedItemIdForPendingResume(pending);
       if (full.finishReason !== 'suspended' && resumedQueuedItemId !== undefined) {
         await Promise.race([
@@ -11163,12 +13092,23 @@ export class Session {
       }
     } catch (err) {
       let thrown = err;
-      if (responseId !== undefined) {
-        try {
-          await Promise.race([this._markInboxResponseFailed(responseId, err), activeTurnWaiter.promise]);
-        } catch (responseErr) {
-          thrown = responseErr;
-        }
+      let retryableAdmissionRestored = false;
+      try {
+        retryableAdmissionRestored = await Promise.race([
+          this._revertFailedResumeAdmission(pending, resumedAt, responseId, err),
+          activeTurnWaiter.promise,
+        ]);
+      } catch (responseErr) {
+        thrown = responseErr;
+        this._emitter.emit({
+          type: 'storage_error',
+          operation: 'session_save',
+          retryable: true,
+          error: { code: 'harness.storage', message: 'failed to restore retryable inbox response admission' },
+          resourceId: this.resourceId,
+          threadId: this.threadId,
+          harnessName: this._record.harnessName,
+        } as EmitInput);
       }
       finishResumedTurn();
       // §5.4 / §5.7 — `pendingResume.resumedAt` is the at-least-once
@@ -11199,11 +13139,6 @@ export class Session {
       // not block shutdown), and (b) a closed/deleted record is being torn down,
       // so a residual `resumedAt` on it is never observed again. The original
       // resume error must surface regardless, so the revert never masks it (F4).
-      try {
-        await this._revertFailedResumeMarker(pending, resumedAt);
-      } catch {
-        // best-effort; closing/closed/deleted session — see comment above.
-      }
       // §S3.1 — surface the failed resume as a NON-terminal `resume_failed` event so
       // an event-only consumer learns the attempt failed instead of seeing the run
       // stuck "running". It is deliberately NOT a terminal `agent_end`: the marker
@@ -11213,7 +13148,7 @@ export class Session {
       this._emitTurnEvent({
         type: 'resume_failed',
         runId: pending.runId,
-        retryable: true,
+        retryable: retryableAdmissionRestored,
         error: projectHarnessPublicError(thrown),
       });
       // §13.3f.1 — respondTo* (this resume) is a public §4.2b boundary; the
@@ -11305,7 +13240,9 @@ export class Session {
             )
           : undefined;
       const suspendedTokenUsageDelta =
-        full.finishReason === 'suspended' ? this._tokenUsageDeltaFromFullOutput(full) : undefined;
+        full.finishReason === 'suspended'
+          ? this._tokenUsageDeltaFromFullOutput(full, pending.accountedTokenUsage)
+          : undefined;
       if (full.finishReason === 'suspended') this._captureTurnRunId(full);
       let alreadyAccounted = false;
       if (completingQueuedItemId !== undefined) {
@@ -11330,7 +13267,7 @@ export class Session {
           let tokenUsageDelta: TokenUsage | undefined;
           try {
             this._captureTurnRunId(full);
-            tokenUsageDelta = this._tokenUsageDeltaFromFullOutput(full);
+            tokenUsageDelta = this._tokenUsageDeltaFromFullOutput(full, pending.accountedTokenUsage);
             alreadyAccounted = true;
             await Promise.race([
               this._markQueuedPostRunFinalized(completingQueuedItemId, { tokenUsageDelta }),
@@ -11341,9 +13278,17 @@ export class Session {
             throw new QueuePostRunFinalizationPendingError(Date.now() + QUEUE_POST_RUN_FINALIZATION_RETRY_MS, err);
           }
         }
-        if (!alreadyAccounted) this._recordTurnCompletion(full, { persist: false });
+        if (!alreadyAccounted) {
+          this._recordTurnCompletion(full, {
+            persist: false,
+            accountedCumulative: pending.accountedTokenUsage,
+          });
+        }
       } else if (full.finishReason !== 'suspended') {
-        this._recordTurnCompletion(full, { persist: false });
+        this._recordTurnCompletion(full, {
+          persist: false,
+          accountedCumulative: pending.accountedTokenUsage,
+        });
       }
       const queueCompletedAt = Date.now();
       const responseAppliedAt = queueCompletedAt;
@@ -11359,16 +13304,16 @@ export class Session {
             const receipt =
               responseId !== undefined ? getOwnRecordValue(prev.inboxResponseReceipts, responseId) : undefined;
             if (receipt) {
-              next.inboxResponseReceipts = {
+              next.inboxResponseReceipts = pruneInboxResponseReceipts({
                 ...(prev.inboxResponseReceipts ?? {}),
                 [receipt.responseId]: {
                   ...receipt,
                   status: 'applied',
-                  result: full,
+                  result: boundInboxReceiptResult(full) as typeof full,
                   appliedAt: receipt.appliedAt ?? responseAppliedAt,
                   updatedAt: responseAppliedAt,
                 },
-              };
+              });
             }
             if (modeFlipTarget) {
               next.modeId = modeFlipTarget;
@@ -11388,7 +13333,7 @@ export class Session {
                   [completingQueuedItemId]: {
                     ...receipt,
                     status: 'completed',
-                    result: full,
+                    result: boundInboxReceiptResult(full),
                     completedAt: receipt.completedAt ?? queueCompletedAt,
                     updatedAt: queueCompletedAt,
                   },
@@ -11512,7 +13457,7 @@ export class Session {
     const { pending, resumedAt, responseId, queuedItemId, modeFlipTarget, previousModeId, full, error } = input;
     const failedAt = Date.now();
     const projectedError = projectHarnessPublicError(error);
-    const usageDelta = this._tokenUsageDeltaFromFullOutput(full);
+    const usageDelta = this._tokenUsageDeltaFromFullOutput(full, pending.accountedTokenUsage);
     let terminalized = false;
     let usageDeltaToPersist: TokenUsage | undefined;
     let failedQueueReceipt: QueueAdmissionReceipt | undefined;
@@ -11668,12 +13613,26 @@ export class Session {
         expectedKind === 'sandbox-access' ? undefined : expectedKind,
       );
     }
+    const requestedRunId = getOwnRecordValue(responseOptions as Record<string, unknown>, 'runId');
+    const requestedToolCallId = getOwnRecordValue(responseOptions as Record<string, unknown>, 'toolCallId');
+    const requestedPendingRequestedAt = getOwnRecordValue(
+      responseOptions as Record<string, unknown>,
+      'pendingRequestedAt',
+    );
+    if (
+      receipt.runId !== requestedRunId ||
+      receipt.toolCallId !== requestedToolCallId ||
+      receipt.pendingRequestedAt !== requestedPendingRequestedAt
+    ) {
+      throw new HarnessInboxResponseConflictError(this.id, receipt.itemId, responseId);
+    }
     const attemptedHash = this._computeInboxResponseHash({
       kind: expectedKind,
       itemId: receipt.itemId,
       runId: receipt.runId,
       pendingRequestedAt: receipt.pendingRequestedAt,
       response: resumeData,
+      ...(expectedKind === 'tool-approval' ? { approvalScope: responseOptions.approvalScope ?? 'once' } : {}),
     });
     if (attemptedHash !== receipt.responseHash) {
       throw new HarnessInboxResponseConflictError(this.id, receipt.itemId, responseId);
@@ -11703,6 +13662,7 @@ export class Session {
 
   private _throwStoredInboxResponseFailure(receipt: InboxResponseReceipt): void {
     if (receipt.status !== 'failed' && receipt.status !== 'dead') return;
+    if (receipt.status === 'failed' && receipt.retryable === true) return;
     throw publicErrorProjectionToError(
       receipt.error ?? { code: 'harness.inbox_response_failed', message: 'inbox response failed' },
     );
@@ -11750,6 +13710,7 @@ export class Session {
       kind: PendingResume['kind'];
       pending: PendingResume;
       response: unknown;
+      approvalScope?: 'once' | 'always';
     },
     err: unknown,
   ): Promise<void> {
@@ -11780,6 +13741,7 @@ export class Session {
             toolCallId: input.pending.toolCallId,
             pendingRequestedAt: input.pending.requestedAt,
             response: input.response,
+            ...(input.approvalScope !== undefined ? { approvalScope: input.approvalScope } : {}),
             status: 'failed',
             error: projectHarnessPublicError(err),
             retryable: false,
@@ -11816,59 +13778,13 @@ export class Session {
     });
   }
 
-  private async _markInboxResponseFailedAndClearPending(
-    responseId: string | undefined,
-    pending: PendingResume,
-    err: unknown,
-  ): Promise<void> {
-    const failedAt = Date.now();
-    await this._flushUpdate(prev => {
-      const receipt = responseId !== undefined ? getOwnRecordValue(prev.inboxResponseReceipts, responseId) : undefined;
-      const current = prev.pendingResume;
-      const currentItemId = current ? (current.itemId ?? current.toolCallId) : undefined;
-      const pendingItemId = pending.itemId ?? pending.toolCallId;
-      const canClearPending =
-        current !== undefined &&
-        current.runId === pending.runId &&
-        current.toolCallId === pending.toolCallId &&
-        currentItemId === pendingItemId &&
-        current.resumedAt === pending.resumedAt &&
-        current.queuedItemId === undefined;
-
-      if (
-        (!receipt || receipt.status === 'applied' || receipt.status === 'failed' || receipt.status === 'dead') &&
-        !canClearPending
-      ) {
-        return prev;
-      }
-
-      const next: SessionRecord = { ...prev };
-      if (receipt && receipt.status !== 'applied' && receipt.status !== 'failed' && receipt.status !== 'dead') {
-        next.inboxResponseReceipts = {
-          ...(prev.inboxResponseReceipts ?? {}),
-          [receipt.responseId]: {
-            ...receipt,
-            status: 'failed',
-            error: projectHarnessPublicError(err),
-            retryable: false,
-            failedAt: receipt.failedAt ?? failedAt,
-            updatedAt: failedAt,
-          },
-        };
-      }
-      if (canClearPending) {
-        delete next.pendingResume;
-      }
-      return next;
-    });
-  }
-
   private _computeInboxResponseHash(input: {
     kind: PendingResume['kind'];
     itemId: string;
     runId: string;
     pendingRequestedAt: number;
     response: unknown;
+    approvalScope?: 'once' | 'always';
   }): string {
     return sha256CanonicalJson(input);
   }
@@ -11926,8 +13842,14 @@ export class Session {
    * the caller swallows that (the record is being torn down and a parked
    * pendingResume is already non-busy for shutdown — see `_isShutdownDrainBusy`).
    */
-  private async _revertFailedResumeMarker(pending: PendingResume, resumedAt: number): Promise<void> {
+  private async _revertFailedResumeAdmission(
+    pending: PendingResume,
+    resumedAt: number,
+    responseId: string | undefined,
+    error: unknown,
+  ): Promise<boolean> {
     let reverted = false;
+    const failedAt = Date.now();
     await this._flushUpdate(prev => {
       const current = prev.pendingResume;
       if (
@@ -11939,14 +13861,42 @@ export class Session {
       ) {
         return prev;
       }
+      const receipt = responseId ? getOwnRecordValue(prev.inboxResponseReceipts, responseId) : undefined;
+      if (
+        responseId !== undefined &&
+        (receipt === undefined ||
+          receipt.status !== 'accepted' ||
+          receipt.runId !== pending.runId ||
+          receipt.toolCallId !== pending.toolCallId ||
+          receipt.pendingRequestedAt !== pending.requestedAt)
+      ) {
+        return prev;
+      }
       reverted = true;
       const restored: PendingResume = { ...current };
       delete restored.resumedAt;
-      return { ...prev, pendingResume: restored };
+      delete restored.resumeRecoveryAt;
+      delete restored.resumeRecoveryStartedAt;
+      const next: SessionRecord = { ...prev, pendingResume: restored };
+      if (receipt !== undefined) {
+        next.inboxResponseReceipts = {
+          ...(prev.inboxResponseReceipts ?? {}),
+          [receipt.responseId]: {
+            ...receipt,
+            status: 'failed',
+            error: projectHarnessPublicError(error),
+            retryable: true,
+            failedAt,
+            updatedAt: failedAt,
+          },
+        };
+      }
+      return next;
     });
     if (reverted && this._state === 'live') {
       void this._maybeDrainQueue();
     }
+    return reverted;
   }
 
   private async _maybeRecoverStaleQueuedResume({
@@ -11971,7 +13921,7 @@ export class Session {
         try {
           const full = currentReceipt.result as FullOutput<unknown>;
           this._captureTurnRunId(full);
-          tokenUsageDelta = this._tokenUsageDeltaFromFullOutput(full);
+          tokenUsageDelta = this._tokenUsageDeltaFromFullOutput(full, pending.accountedTokenUsage);
           alreadyAccounted = true;
           await this._markQueuedPostRunFinalized(queuedItemId, { tokenUsageDelta });
         } catch (err) {
@@ -12037,63 +13987,10 @@ export class Session {
       this._queuedResumeRecoveryTimer = undefined;
     }
 
-    const err = new QueueResumeRecoveryStaleError();
-    const now = Date.now();
-    await this._flushUpdate(prev => {
-      const current = prev.pendingResume;
-      if (
-        !current ||
-        current.runId !== pending.runId ||
-        current.toolCallId !== pending.toolCallId ||
-        current.resumedAt !== pending.resumedAt
-      ) {
-        return prev;
-      }
-      const receipt = prev.queueAdmissionReceipts?.[queuedItemId];
-      const next: SessionRecord = {
-        ...prev,
-        pendingQueue: (prev.pendingQueue ?? []).filter(item => item.id !== queuedItemId),
-      };
-      delete next.pendingResume;
-      if (receipt) {
-        if (receipt.status === 'completed') {
-          return next;
-        }
-        next.queueAdmissionReceipts = {
-          ...(prev.queueAdmissionReceipts ?? {}),
-          [queuedItemId]: {
-            ...receipt,
-            status: 'failed',
-            error: projectHarnessPublicError(err),
-            failedAt: receipt.failedAt ?? now,
-            updatedAt: now,
-          },
-        };
-      }
-      return next;
+    const recovered = await this._recoverStaleResumeAdmission(this._pendingInteractionGeneration(pending), {
+      drainQueue: kickDrainOnStale,
     });
-
-    const current = this._record.pendingResume;
-    if (
-      current?.runId === pending.runId &&
-      current.toolCallId === pending.toolCallId &&
-      current.resumedAt === pending.resumedAt
-    ) {
-      return { status: 'none' };
-    }
-
-    this._currentQueuedItemId = undefined;
-    this._currentQueuedItemSource = undefined;
-    const resolver = this._queueResolvers.get(queuedItemId);
-    if (resolver) {
-      this._queueResolvers.delete(queuedItemId);
-      resolver.reject(err);
-    }
-    this._notifyMaybeIdle();
-    if (kickDrainOnStale && this._state === 'live') {
-      void this._maybeDrainQueue();
-    }
-    return { status: 'stale' };
+    return recovered ? { status: 'stale' } : { status: 'none' };
   }
 
   // -------------------------------------------------------------------------
@@ -13177,14 +15074,17 @@ export class Session {
     let fallbackRunId = identity.runId;
 
     try {
-      const requestContext = await Promise.race([
-        this._buildRequestContext({
-          modeId: effectiveModeId,
-          modelId: this._modelIdForQueuedItem(item.id),
-          abortSignal: turnAbortController.signal,
-          persistedRequestContext: item.requestContext,
-          yolo: item.yolo === true,
-        }),
+      const [requestContext, turnInstructions] = await Promise.race([
+        Promise.all([
+          this._buildRequestContext({
+            modeId: effectiveModeId,
+            modelId: this._modelIdForQueuedItem(item.id),
+            abortSignal: turnAbortController.signal,
+            persistedRequestContext: item.requestContext,
+            yolo: item.yolo === true,
+          }),
+          this._turnInstructions(mode.instructions),
+        ]),
         activeTurnWaiter.promise,
       ]);
       assertQueuedTurnNotDeleted();
@@ -13192,8 +15092,12 @@ export class Session {
         memory: { thread: this.threadId, resource: this.resourceId },
         abortSignal: turnAbortController.signal,
         requestContext,
+        // Queued turns that wake an idle session run a REAL streamed turn and
+        // must carry the same step ceiling as direct turns — omitting it here
+        // capped channel/queued deliveries at the provider's 5-step default.
+        maxSteps: HARNESS_SESSION_MAX_STEPS,
         ...toolSurface,
-        ...(mode.instructions ? { instructions: mode.instructions } : {}),
+        ...(turnInstructions ? { instructions: turnInstructions } : {}),
       };
 
       await Promise.race([this._ensureThreadSubscription(agent), activeTurnWaiter.promise]);
@@ -13221,7 +15125,14 @@ export class Session {
           runId: identity.runId,
           resourceId: this.resourceId,
           threadId: this.threadId,
-          ifIdle: { behavior: 'wake', streamOptions: baseExecOptions as never },
+          ifIdle: {
+            behavior: 'wake',
+            // The wake branch starts a REAL streamed turn; carry the silent-turn nudge.
+            streamOptions: {
+              ...baseExecOptions,
+              onIterationComplete: createHarnessEmptySynthesisNudge(),
+            } as never,
+          },
         },
       );
       const signalIdentity =
@@ -13770,8 +15681,8 @@ export class Session {
       runId,
       toolCallId,
       toolName: ASK_USER_TOOL_NAME,
-      source: (this._record.subagentDepth ?? 0) > 0 ? 'subagent' : 'parent',
-      requestedAt: Date.now(),
+      ...this._pendingResumeSourceFields(),
+      ...this._newPendingInteractionTiming('question'),
       modeId: params.modeId ?? this._record.modeId,
       // §4.2e — carry the active turn's yolo so a later tool approval on the
       // resumed run is still auto-granted (pre-registered pendings win over the
@@ -13841,8 +15752,8 @@ export class Session {
       itemId: params.requestId,
       runId,
       toolCallId,
-      source: (this._record.subagentDepth ?? 0) > 0 ? 'subagent' : 'parent',
-      requestedAt: Date.now(),
+      ...this._pendingResumeSourceFields(),
+      ...this._newPendingInteractionTiming('sandbox-access'),
       modeId,
       // §4.2e — see _registerQuestion: carry yolo through pre-registered pendings.
       ...(this._currentTurnYolo ? { yolo: true } : {}),
@@ -13919,8 +15830,8 @@ export class Session {
       runId,
       toolCallId,
       toolName: SUBMIT_PLAN_TOOL_NAME,
-      source: (this._record.subagentDepth ?? 0) > 0 ? 'subagent' : 'parent',
-      requestedAt: Date.now(),
+      ...this._pendingResumeSourceFields(),
+      ...this._newPendingInteractionTiming('plan-approval'),
       modeId: submittingModeId,
       // §4.2e — see _registerQuestion: carry yolo through pre-registered pendings.
       ...(this._currentTurnYolo ? { yolo: true } : {}),
@@ -14246,6 +16157,7 @@ export class Session {
   private _clearDelegationReconcileTimers(): void {
     for (const timer of this._delegationReconcileRetryTimers) clearTimeout(timer);
     this._delegationReconcileRetryTimers.clear();
+    this._delegationReconcileRerunRequested = false;
   }
 
   private _unrefQueueTimerIfBackgroundOnly(timer: ReturnType<typeof setTimeout>): void {
@@ -14295,6 +16207,11 @@ export class Session {
   }
 
   private _canDrainQueue(): boolean {
+    // Legacy builds could persist per-session OM intent that the native Memory
+    // engine never honored. Recovered work must park before scheduling, expiry,
+    // receipt admission, or failure settlement mutates durable queue state.
+    // `session.om.clearOverride()` commits recovery and then re-kicks the drain.
+    if (this._hasUnsupportedObservationalMemoryIntent()) return false;
     if (this._record.cancelRequest !== undefined) return this._hasCompletedQueuedItemsAfterCancellation();
     if (this._state === 'live') return true;
     if (!this.isClosing) return false;
@@ -14375,6 +16292,64 @@ export class Session {
           tokenUsage: { ...tokenUsageForSave },
           lastActivityAt: Date.now(),
         };
+        // PF-2251 D2/D4 — receipts stay bounded on EVERY persisted record, at
+        // the single flush chokepoint, so no write path can regrow them past
+        // the storage document limit.
+        if (next.inboxResponseReceipts !== undefined) {
+          next.inboxResponseReceipts = pruneInboxResponseReceipts(next.inboxResponseReceipts);
+        }
+        if (next.queueAdmissionReceipts !== undefined) {
+          next.queueAdmissionReceipts = pruneQueueAdmissionReceipts(next.queueAdmissionReceipts);
+        }
+        // PF-2251 step 3 — session-survival guard. A record past the storage
+        // document budget bricks the session forever (every later save fails),
+        // so an oversized record is diagnosed loudly and, when a pending
+        // interaction's payload dominates (suspend snapshots can embed huge
+        // provider reasoning blobs), the pending is converted into an expired
+        // interaction: the user re-issues one confirmation instead of losing
+        // the whole session. Never silent — the log names the top fields.
+        {
+          const serializedSize = safeSerializedSize(next);
+          if (serializedSize > SESSION_RECORD_SIZE_BUDGET_BYTES) {
+            const fieldSizes = topRecordFieldSizes(next);
+            console.error(
+              '[harness/v1] session record exceeded the size budget; top fields:',
+              JSON.stringify({ sessionId: this.id, serializedSize, fieldSizes }),
+            );
+            const pending = next.pendingResume;
+            if (
+              pending !== undefined &&
+              pending.itemId !== undefined &&
+              pending.runId !== undefined &&
+              pending.toolCallId !== undefined &&
+              pending.requestedAt !== undefined &&
+              safeSerializedSize(pending) > serializedSize / 4
+            ) {
+              next.expiredPendingInteractions = appendExpiredPendingInteraction(next.expiredPendingInteractions, {
+                generationKey: pendingInteractionGenerationKey({
+                  kind: pending.kind,
+                  itemId: pending.itemId,
+                  runId: pending.runId,
+                  toolCallId: pending.toolCallId,
+                  requestedAt: pending.requestedAt,
+                }),
+                itemId: pending.itemId,
+                kind: pending.kind,
+                runId: pending.runId,
+                toolCallId: pending.toolCallId,
+                requestedAt: pending.requestedAt,
+                expiresAt: pending.expiresAt ?? pending.requestedAt,
+                expiredAt: Date.now(),
+                error: {
+                  code: 'harness.pending.record_size_budget',
+                  message:
+                    'Pending interaction was expired because its durable payload exceeded the session record size budget.',
+                },
+              });
+              delete next.pendingResume;
+            }
+          }
+        }
         const saveOpts = {
           harnessName: this._record.harnessName,
           ownerId: this._ownerId,
@@ -14403,6 +16378,7 @@ export class Session {
             version: saved.version,
             leaseExpiresAt: committedLeaseExpiresAt,
           };
+          this._syncPendingInteractionExpiryTimer();
           // §10.2 state_changed — emit only when durable `session.state` actually
           // changed, after the record is committed so subscribers reading state
           // see the post-write value.
@@ -14494,6 +16470,25 @@ export class Session {
   }
 
   /**
+   * Admit a model-authored plan mutation against the current conversation-work
+   * epoch, then recheck that epoch when its serialized RMW body reaches the head
+   * of the write chain. A reset/stop that starts in between therefore rejects
+   * stale work instead of letting it recreate a discarded branch.
+   */
+  private _admitPlanTaskMutation<T>(
+    operation: string,
+    callerSignal: AbortSignal | undefined,
+    run: () => Promise<T>,
+  ): Promise<T> {
+    const admissionEpoch = this._captureActiveWorkAdmission(operation);
+    this._assertActiveWorkAdmission(admissionEpoch, operation, callerSignal);
+    return this._serializePlanTaskWrite(() => {
+      this._assertActiveWorkAdmission(admissionEpoch, operation, callerSignal);
+      return run();
+    });
+  }
+
+  /**
    * Build the toolset surface for a single turn:
    *   - mode.tools (replace) wins over agent's own tools
    *   - mode.additionalTools merges with agent's tools
@@ -14537,6 +16532,9 @@ export class Session {
       // for the durable HarnessPlanTask tree; each write routes through this
       // session under its lease.
       Object.assign(builtins, createPlanTaskTools(this));
+      if (this._record.origin === 'subagent-tool') {
+        builtins[HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID] = createSubagentOutcomeReportTool();
+      }
       if (Object.keys(builtins).length > 0) {
         toolsets['harness:builtin'] = builtins;
       }
@@ -14619,6 +16617,12 @@ export class Session {
      */
     yolo?: boolean;
   }): Promise<RequestContext> {
+    if (this._hasUnsupportedObservationalMemoryIntent()) {
+      throw new HarnessConfigError(
+        'observationalMemory',
+        'Harness per-session Observational Memory is not supported until @mastra/memory can select an OM engine from the per-turn memory config. Configure OM on the Agent Memory instance and omit HarnessConfig.observationalMemory.',
+      );
+    }
     const session = this;
     const stateSnapshot = (this._record.state ?? {}) as unknown;
     const persistedRequestContext = turn.persistedRequestContext
@@ -14684,6 +16688,7 @@ export class Session {
       subagentDepth: this._record.subagentDepth ?? 0,
       source: (this._record.subagentDepth ?? 0) > 0 ? 'subagent' : 'parent',
       parentSessionId: this._record.parentSessionId,
+      ...(this._subagentParentToolCallId !== undefined ? { subagentToolCallId: this._subagentParentToolCallId } : {}),
       getSubagentModel: params => {
         const agentType = params?.agentType;
         if (!agentType) return null;
@@ -14736,10 +16741,15 @@ export class Session {
       // at the pre-exposure gate; this composes after it and ahead of the policy).
       const allowlistSnapshot = this._subagentToolAllowlist ? new Set(this._subagentToolAllowlist) : undefined;
       entries.push([
-        '__mastra_toolPermissionPolicy',
+        TOOL_PERMISSION_POLICY_KEY,
         (toolName: string) =>
           session._resolveToolPolicy(toolName, ruleSnapshot, grantSnapshot, defaultPolicy, allowlistSnapshot),
       ]);
+      // The resolver above closes over immutable per-turn copies. Durable
+      // foreach dispatch may therefore classify the emitted batch before
+      // choosing concurrency without a mid-turn rule/grant change turning an
+      // `allow` preflight into an `ask` at the side-effect boundary.
+      entries.push([TOOL_PERMISSION_POLICY_STABLE_KEY, true]);
       // §O4 — deny observability: the loop calls this when the policy above blocks
       // a tool (pre-exposure removal or action-time refusal), so a `tool_denied`
       // event surfaces WHY instead of the denial being silent. Sync + best-effort.
@@ -14750,6 +16760,8 @@ export class Session {
           stage: 'pre-exposure' | 'action';
           toolCallId?: string;
           forcedToolChoice?: boolean;
+          deniedToolCount?: number;
+          deniedToolNames?: string[];
         }) => {
           session._emitTurnEvent({
             type: 'tool_denied',
@@ -14757,6 +16769,8 @@ export class Session {
             stage: info.stage,
             ...(info.toolCallId !== undefined ? { toolCallId: info.toolCallId } : {}),
             ...(info.forcedToolChoice ? { forcedToolChoice: true } : {}),
+            ...(info.deniedToolCount !== undefined ? { deniedToolCount: info.deniedToolCount } : {}),
+            ...(info.deniedToolNames !== undefined ? { deniedToolNames: info.deniedToolNames } : {}),
             ...(session._currentRunId !== undefined ? { runId: session._currentRunId } : {}),
           });
         },
@@ -14805,9 +16819,9 @@ export class Session {
    * per-turn POLICY SNAPSHOT: a per-tool rule wins, else the tool's category rule,
    * else the harness default. A matching tool/category GRANT turns an `ask` into
    * `allow` (a grant suppresses only the policy-level ask; it never overrides a
-   * `deny`). Harness-owned non-escalation built-ins always resolve to `allow` —
-   * they are infrastructure, never gated by the session policy. Escalation
-   * built-ins fall through to the normal policy after the subagent allowlist cap.
+   * `deny`). Only protocol-critical HITL/terminal built-ins resolve to `allow`.
+   * Plan mutation/check/delegation and child-spawn built-ins fall through to the
+   * normal policy after the subagent allowlist cap.
    */
   private _resolveToolPolicy(
     toolName: string,
@@ -14816,10 +16830,8 @@ export class Session {
     defaultPolicy: PermissionPolicy,
     allowlist?: ReadonlySet<string>,
   ): PermissionPolicy {
-    // Always-kept builtins (HITL + local plan-task orchestration) bypass the gate
-    // entirely — but the escalation builtins (spawn_subagent / task_delegate) do
-    // NOT, so an allowlist below can still gate them (anti-escalation, M4).
-    if (HARNESS_BUILTIN_TOOL_IDS.has(toolName) && !ESCALATION_BUILTIN_TOOL_IDS.has(toolName)) return 'allow';
+    // These three tools are protocol boundaries rather than user capabilities.
+    if (UNGATED_HARNESS_BUILTIN_TOOL_IDS.has(toolName)) return 'allow';
     // M4 — subagent capability scope: a tool outside the allowlist is a hard deny
     // (removed pre-exposure; refused at action time), regardless of permission rules.
     if (allowlist !== undefined && !allowlist.has(toolName)) return 'deny';
@@ -14959,6 +16971,7 @@ export class Session {
    */
   _markClosed(updatedRecord: SessionRecord): void {
     this._clearQueueWakeTimer();
+    this._clearPendingInteractionExpiryTimer();
     this._clearDelegationReconcileTimers();
     this._leaseExtensionDeadline = undefined;
     this._record = updatedRecord;
@@ -14966,6 +16979,7 @@ export class Session {
     // Span-summary: drop any in-flight run spans (e.g. an abandoned suspended run
     // that will never reach a terminal here) so they cannot accumulate.
     this._openRuns.clear();
+    this._runToolReceipts.clear();
     this._finalizedRunIds.clear();
     this._pendingReplacementToolSurfaces.clear();
     this._tearDownThreadSubscription(new HarnessValidationError('session.close()', 'Session closed'));
@@ -14976,8 +16990,10 @@ export class Session {
   _markDeleted(): void {
     const err = new HarnessSessionDeletedError(this.id, this._record.resourceId, this._record.threadId);
     this._leaseExtensionDeadline = undefined;
+    this._clearPendingInteractionExpiryTimer();
     this._state = 'deleted';
     this._openRuns.clear();
+    this._runToolReceipts.clear();
     this._finalizedRunIds.clear();
     this._pendingReplacementToolSurfaces.clear();
     this._rejectIdleWaiters(err);
@@ -15024,8 +17040,13 @@ export class Session {
   _markEvicted(updatedRecord: SessionRecord): void {
     const err = new HarnessValidationError('session.evict()', 'Session evicted');
     this._leaseExtensionDeadline = undefined;
+    this._clearPendingInteractionExpiryTimer();
     this._record = updatedRecord;
     this._state = 'evicted';
+    this._openRuns.clear();
+    this._runToolReceipts.clear();
+    this._finalizedRunIds.clear();
+    this._pendingReplacementToolSurfaces.clear();
     this._tearDownThreadSubscription(err);
     this._rejectIdleWaiters(new HarnessSessionClosedError(this.id));
     this._rejectActiveTurnWaiters(err);
@@ -15101,7 +17122,7 @@ export class Session {
   //
   // The model mutates its plan tree exclusively through the built-in plan-task
   // tools (`task_add` / `task_decompose` / `task_reparent` / `task_update` /
-  // `task_complete` / `plan_task_check` / `task_write`), which call these
+  // `task_complete` / `plan_task_check`), which call these
   // methods. The session is the single serialized writer: every mutator fences
   // on this owner + the current SessionRecord.version (§5.8), runs the TM-4
   // hierarchy semantics, commits transaction-shaped via
@@ -15148,11 +17169,23 @@ export class Session {
    * `planTasks` field becomes observable without waiting for an unrelated event.
    */
   private _maybeSeedPlanTaskSummary(): void {
-    if (this._planTaskSummarySeeded) return;
+    void this._ensurePlanTaskSummary().catch(() => {});
+  }
+
+  /**
+   * Load the bounded authoritative summary once per in-memory Session. Plan
+   * mutations replace `_planTaskSummary` from their committed post-image, so
+   * subsequent turns add no storage round-trip. A concurrent mutation wins over
+   * a stale seed response; concurrent display/turn callers share this promise.
+   */
+  private _ensurePlanTaskSummary(): Promise<PlanTaskSummary | undefined> {
+    if (this._planTaskSummary !== undefined) return Promise.resolve(this._planTaskSummary);
+    if (this._planTaskSummarySeedPromise !== undefined) return this._planTaskSummarySeedPromise;
+
     this._planTaskSummarySeeded = true;
-    void Promise.all([
+    const seed = Promise.all([
       this._storage.countPlanTasksByStatus({ harnessName: this._record.harnessName, sessionId: this.id }),
-      // Bounded: in_progress is at most one explicit per root (§5.1k); cap defensively.
+      // Bounded: in_progress is at most the plan-node cap; never load task bodies.
       this._storage.loadPlanTaskSubtree({
         harnessName: this._record.harnessName,
         sessionId: this.id,
@@ -15161,62 +17194,179 @@ export class Session {
       }),
     ])
       .then(([counts, inProgress]) => {
-        // A concurrent mutation may have set the authoritative summary first; only
-        // fill the seed if nothing has populated it yet.
-        if (this._planTaskSummary !== undefined) return;
+        // A concurrent mutation may have populated the authoritative post-image
+        // first. Never overwrite it with an older aggregate/read pair.
+        if (this._planTaskSummary !== undefined) return this._planTaskSummary;
         this._planTaskSummary = {
           total: counts.total,
           byStatus: counts.byStatus,
           rootCount: counts.rootCount,
           inProgressTaskIds: inProgress.tasks.map(t => t.taskId),
         };
-        // Make the freshly-seeded summary observable: a display-only refresh so a
-        // subscriber sees `planTasks` without waiting for an unrelated §10.2 event.
-        // No persisted event is emitted — the seed reflects already-durable state.
+        // Make the freshly-seeded summary observable without a persisted event.
         this._notifyDisplayRefresh();
+        return this._planTaskSummary;
       })
-      .catch(() => {
-        // Allow a later snapshot to retry the seed.
+      .catch(error => {
+        // Display seeding remains best-effort because its caller observes this
+        // promise with a catch. Turn instruction assembly, however, awaits the
+        // same promise and fails closed: running without authoritative durable
+        // plan state can make the model repeat or skip work after a restart.
         this._planTaskSummarySeeded = false;
+        throw error;
+      })
+      .finally(() => {
+        if (this._planTaskSummarySeedPromise === seed) this._planTaskSummarySeedPromise = undefined;
       });
+    this._planTaskSummarySeedPromise = seed;
+    return seed;
   }
 
   /**
-   * Emit the `papersflow.plan_task.updated` custom event (§10.3). Goes through
-   * the same validation/stamping path as `ctx.emitCustomEvent`, so it is gated
-   * on an active turn — plan tasks are only mutated by tools running mid-turn.
+   * Framework-owned, content-free plan orientation appended to every owned turn.
+   * The summary contains only fixed status labels, counts, and generated task ids;
+   * user task bodies/results remain behind the bounded `plan_task_check` tool.
+   * This keeps the durable tracker authoritative even after memory compression or
+   * a process restart, while adding storage I/O only for the first turn on a
+   * freshly hydrated Session.
+   */
+  private async _turnInstructions(modeInstructions?: string): Promise<string | undefined> {
+    const summary = await this._ensurePlanTaskSummary();
+    const parts: string[] = [];
+    if (modeInstructions) parts.push(modeInstructions);
+    if (summary !== undefined && summary.total > 0) {
+      const statuses = Object.entries(summary.byStatus)
+        .filter((entry): entry is [HarnessPlanTaskStatus, number] => typeof entry[1] === 'number' && entry[1] > 0)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([status, count]) => `${status}=${count}`)
+        .join(', ');
+      const activeIds = summary.inProgressTaskIds.length > 0 ? summary.inProgressTaskIds.join(',') : 'none';
+      parts.push(
+        [
+          '<harness_durable_plan_state>',
+          `total=${summary.total}; roots=${summary.rootCount}; statuses=${statuses || 'none'}; in_progress_ids=${activeIds}`,
+          'The durable plan tracker is authoritative across turns and restarts. Before planning, declaring completion, or answering from delegated work, call plan_task_check to inspect the relevant bounded slice. Completed delegated tasks can contain delegation.result; synthesize that result instead of assuming completion from status alone.',
+          '</harness_durable_plan_state>',
+        ].join('\n'),
+      );
+    }
+    if (this._record.origin === 'subagent-tool') {
+      parts.push(
+        [
+          '<harness_subagent_outcome_contract>',
+          `Before ending this assignment, call ${HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID} exactly once and by itself as the final action.`,
+          'A normal text response or provider stop does not prove that the assigned task completed.',
+          'Use completed only when the work is actually complete with concrete evidence; use blocked for unavailable external services, missing required input, or unmet dependencies; use failed for an unrecoverable work failure.',
+          'Never claim a source repair when only a compiler/service failure was observed.',
+          '</harness_subagent_outcome_contract>',
+        ].join('\n'),
+      );
+    }
+    return parts.length > 0 ? parts.join('\n\n') : undefined;
+  }
+
+  /**
+   * Emit the framework-owned `papersflow.plan_task.updated` custom event
+   * (§10.3). Unlike tool-authored `ctx.emitCustomEvent`, delegation settlement
+   * legitimately occurs between parent turns or during restart reconciliation;
+   * it must still be persisted so reconnecting projections cannot remain stuck
+   * on an in-progress task forever.
    */
   private _emitPlanTaskEvent(payload: JsonValue): void {
-    this._emitCustomEvent({ type: PLAN_TASK_UPDATED_EVENT, payload });
+    assertCustomEventType(PLAN_TASK_UPDATED_EVENT);
+    assertJsonSerializable(PLAN_TASK_UPDATED_EVENT, this.id, payload);
+    this._emit({
+      type: PLAN_TASK_UPDATED_EVENT,
+      resourceId: this.resourceId,
+      threadId: this.threadId,
+      payload,
+      ...(this._currentRunId !== undefined ? { runId: this._currentRunId } : {}),
+    });
+  }
+
+  /**
+   * Clear the complete durable plan for a discarded conversation branch and
+   * cancel every child session that was executing work from that plan. The
+   * parent session remains live/reusable so the replacement edit/regeneration
+   * can start from the retained MessageHistory prefix.
+   */
+  async resetPlanTasks(opts?: {
+    reason?: string;
+  }): Promise<ResetPlanTasksResult & { cancelledSubagentSessionIds: string[] }> {
+    this._assertLive('resetPlanTasks()');
+    const releaseInvalidation = this._beginActiveWorkInvalidation();
+    try {
+      return await this._serializePlanTaskWrite(async () => {
+        const activeIds = Array.from(this._activeSubagents.values(), state => state.subagentSessionId);
+        const delegatedIds = await this._listDelegatedSubagentSessionIds();
+        const cancellation = await this._cancelOwnedSubagentSessions(
+          [...activeIds, ...delegatedIds],
+          opts?.reason ?? 'conversation_revision',
+        );
+        if (cancellation.unavailable.length > 0) {
+          // Keep the durable links intact so the operation remains retryable. If
+          // we deleted first, a child locked by another instance could continue
+          // working while the only durable ownership edge had already vanished.
+          throw new HarnessValidationError(
+            'resetPlanTasks()',
+            `could not cancel owned subagent sessions; plan was preserved for retry: ${cancellation.unavailable.join(', ')}`,
+          );
+        }
+        const result = await planTaskReset(this._planTaskPort());
+        // The reset helper updates the cached summary without a persisted event
+        // when called between turns; wake display subscribers explicitly.
+        this._notifyDisplayRefresh();
+        return { ...result, cancelledSubagentSessionIds: cancellation.cancelled };
+      });
+    } finally {
+      releaseInvalidation();
+    }
   }
 
   /** @internal — `task_add`. Add one plan task. Serialized per session. */
-  _planTaskAdd(input: AddTaskInput): Promise<PlanTaskView> {
-    return this._serializePlanTaskWrite(() => planTaskAdd(this._planTaskPort(), input));
+  _planTaskAdd(input: AddTaskInput, callerSignal?: AbortSignal): Promise<PlanTaskView> {
+    return this._admitPlanTaskMutation('task_add', callerSignal, () => planTaskAdd(this._planTaskPort(), input));
   }
 
   /** @internal — `task_decompose`. Add N children under a parent atomically. */
-  _planTaskDecompose(parentTaskId: string, children: DecomposeChildInput[]): Promise<PlanTaskView[]> {
-    return this._serializePlanTaskWrite(() => planTaskDecompose(this._planTaskPort(), parentTaskId, children));
+  _planTaskDecompose(
+    parentTaskId: string,
+    children: DecomposeChildInput[],
+    callerSignal?: AbortSignal,
+  ): Promise<PlanTaskView[]> {
+    return this._admitPlanTaskMutation('task_decompose', callerSignal, () =>
+      planTaskDecompose(this._planTaskPort(), parentTaskId, children),
+    );
   }
 
   /** @internal — `task_reparent`. Move a subtree (cycle-checked). */
-  _planTaskReparent(taskId: string, newParentTaskId: string | null, order?: number): Promise<void> {
-    return this._serializePlanTaskWrite(() => planTaskReparent(this._planTaskPort(), taskId, newParentTaskId, order));
+  _planTaskReparent(
+    taskId: string,
+    newParentTaskId: string | null,
+    order?: number,
+    callerSignal?: AbortSignal,
+  ): Promise<void> {
+    return this._admitPlanTaskMutation('task_reparent', callerSignal, () =>
+      planTaskReparent(this._planTaskPort(), taskId, newParentTaskId, order),
+    );
   }
 
   /** @internal — `task_update`. Patch status/content/priority/blockedBy. */
-  _planTaskUpdate(taskId: string, patch: UpdateTaskInput): Promise<PlanTaskView> {
-    return this._serializePlanTaskWrite(() => planTaskUpdate(this._planTaskPort(), taskId, patch));
+  _planTaskUpdate(taskId: string, patch: UpdateTaskInput, callerSignal?: AbortSignal): Promise<PlanTaskView> {
+    return this._admitPlanTaskMutation('task_update', callerSignal, () =>
+      planTaskUpdate(this._planTaskPort(), taskId, patch),
+    );
   }
 
   /** @internal — `task_complete`. Mark completed; triggers rollup. */
-  _planTaskComplete(taskId: string): Promise<PlanTaskView> {
-    return this._serializePlanTaskWrite(() => planTaskComplete(this._planTaskPort(), taskId));
+  _planTaskComplete(taskId: string, callerSignal?: AbortSignal): Promise<PlanTaskView> {
+    return this._admitPlanTaskMutation('task_complete', callerSignal, () =>
+      planTaskComplete(this._planTaskPort(), taskId),
+    );
   }
 
   /** @internal — `plan_task_check`. The bounded anti-forgetting read. */
-  _planTaskCheck(input: CheckInput): Promise<{ tasks: PlanTaskView[]; truncated: boolean }> {
+  _planTaskCheck(input: CheckInput): Promise<{ tasks: PlanTaskView[]; truncated: boolean; nextCursor?: string }> {
     return planTaskCheck(this._planTaskPort(), input);
   }
 
@@ -15236,17 +17386,26 @@ export class Session {
    * @internal — `task_delegate`. Spawn/create a subagent SESSION for `taskId`,
    * durably link it (`delegatedSubagentSessionId`), drive the task `in_progress`,
    * and arm the live completion hook. Returns the view + the created subagent
-   * session id. Throws `HarnessValidationError` / `HarnessSubagentDepthExceededError`
-   * BEFORE any plan-task or session mutation so a rejected delegation is a no-op.
+   * session id. Throws `HarnessValidationError`,
+   * `HarnessSubagentDepthExceededError`, or
+   * `HarnessSubagentConcurrencyLimitError` BEFORE any plan-task or session
+   * mutation so a rejected delegation is a no-op.
    */
-  async _planTaskDelegate(input: {
-    taskId: string;
-    agentType: string;
-    task?: string;
-    includeSubtree?: boolean;
-    modelOverride?: string;
-  }): Promise<PlanTaskView & { subagentSessionId: string }> {
+  async _planTaskDelegate(
+    input: {
+      taskId: string;
+      agentType: string;
+      task?: string;
+      includeSubtree?: boolean;
+      modelOverride?: string;
+    },
+    callerSignal?: AbortSignal,
+    parentToolCallId?: string,
+    parentRunId?: string,
+  ): Promise<PlanTaskView & { subagentSessionId: string }> {
     this._assertLive('task_delegate');
+    const admissionEpoch = this._captureActiveWorkAdmission('task_delegate');
+    this._assertActiveWorkAdmission(admissionEpoch, 'task_delegate', callerSignal);
     const def = this._harness._getSubagentType(input.agentType);
     if (!def) {
       throw new HarnessValidationError('agentType', `unknown subagent type "${input.agentType}"`);
@@ -15263,18 +17422,14 @@ export class Session {
       throw new HarnessSubagentDepthExceededError(maxDepth, childDepth);
     }
 
-    // Resolve the delegated task body. Default to the plan task's own content so a
-    // delegation with no explicit `task` still hands the subagent a description.
-    const planForBody = await this._storage.loadPlanTaskSubtree({
-      harnessName: this._record.harnessName,
-      sessionId: this.id,
-      rootTaskId: input.taskId,
-      depth: 0,
-      limit: 1,
-    });
-    const planRow = planForBody.tasks[0];
-    if (!planRow) throw new HarnessValidationError('taskId', `unknown task "${input.taskId}"`);
-    let taskBody = input.task ?? planRow.content;
+    // Reject unknown, already-running, or dependency-blocked tasks before
+    // reserving capacity or creating a durable child. The fenced link commit
+    // repeats the same eligibility checks after child creation.
+    const scopeSnapshot = await this._serializePlanTaskWrite(() =>
+      capturePlanTaskDelegationScope(this._planTaskPort(), input.taskId, input.includeSubtree === true),
+    );
+    this._assertActiveWorkAdmission(admissionEpoch, 'task_delegate', callerSignal);
+    let taskBody = input.task ?? scopeSnapshot.view.content;
     if (input.includeSubtree) {
       // Surface the delegated subtree SUBSET so the subagent sees the unit it
       // owns. This is a LOSSLESS transfer: every node keeps its stable taskId,
@@ -15282,72 +17437,144 @@ export class Session {
       // depth (computed from the parent chain, not a flat one-level indent). A
       // clipped subtree appends an explicit truncation marker so the subagent
       // knows the unit it received is incomplete.
-      const subtree = await this._storage.loadPlanTaskSubtree({
-        harnessName: this._record.harnessName,
-        sessionId: this.id,
-        rootTaskId: input.taskId,
-        limit: DELEGATED_SUBTREE_MAX_NODES,
-      });
-      taskBody = `${taskBody}\n\n${this._renderDelegatedSubtree(input.taskId, subtree.tasks, subtree.truncated)}`;
+      taskBody = `${taskBody}\n\n${this._renderDelegatedSubtree(input.taskId, scopeSnapshot.tasks, false)}`;
+    }
+    this._assertActiveWorkAdmission(admissionEpoch, 'task_delegate', callerSignal);
+
+    // Durable delegation and inline spawn share the same parent-local
+    // backpressure reservation. Claim it before child creation/linking so the
+    // detached API cannot bypass `subagents.maxConcurrent`.
+    const reservation = this._internalTryReserveSubagentExecution();
+    if (!reservation.reserved) {
+      throw new HarnessSubagentConcurrencyLimitError(reservation.maxConcurrent, reservation.inFlight);
+    }
+
+    // Allocate the child identity and commit the durable plan ownership edge
+    // BEFORE creating the child row. A crash in this order leaves a link to a
+    // missing child, which recovery deterministically fails closed. The former
+    // create-then-link order could leave an unreferenced active descendant whose
+    // old-owner lease later poisoned root subtree renewal.
+    const childSessionId = `sess-${randomUUID()}`;
+    // Claim before the link write awaits storage. A reconciliation wakeup that
+    // observes the committed link before child allocation must not classify the
+    // intentionally-not-yet-created child as missing.
+    this._delegationDriverClaims.add(childSessionId);
+    const delegationStartedAt = Date.now();
+    const delegationDeadlineAt = delegationStartedAt + this._harness._getSubagentDelegationTimeoutMs();
+    let view: PlanTaskView;
+    try {
+      view = await this._serializePlanTaskWrite(() =>
+        planTaskDelegate(this._planTaskPort(), {
+          taskId: input.taskId,
+          subagentSessionId: childSessionId,
+          subagentTypeId: input.agentType,
+          includeSubtree: input.includeSubtree === true,
+          taskBody,
+          startedAt: delegationStartedAt,
+          deadlineAt: delegationDeadlineAt,
+          expectedScopeFingerprint: scopeSnapshot.fingerprint,
+          ...(parentToolCallId !== undefined ? { parentToolCallId } : {}),
+          ...(parentRunId !== undefined ? { parentRunId } : {}),
+        }),
+      );
+      this._assertActiveWorkAdmission(admissionEpoch, 'task_delegate', callerSignal);
+    } catch (error) {
+      // No child exists yet. If the link committed before active-work
+      // invalidation won, clear it to a durable failed terminal state.
+      await this._reconcileDelegatedTask(input.taskId, childSessionId, 'failed');
+      this._delegationDriverClaims.delete(childSessionId);
+      this._internalReleaseSubagentExecution();
+      throw error;
     }
 
     // Create the durable subagent SESSION (reuse the subagent-tool creation path:
     // origin 'subagent-tool' + parentSessionId so cascade/depth/lease-sharing all
     // apply per §5.6). It is NOT auto-closed at delegate time — its lifecycle is
     // tracked by the plan task across turns.
-    //
-    // ORPHAN WINDOW (bounded, accepted): a crash between this `session(...)` and
-    // the `planTaskDelegate` link write below leaves a subagent-tool child with
-    // `parentSessionId` set but NO plan task referencing it. This is identical to
-    // the `spawn_subagent` tool's create-then-use window and is reclaimed by the
-    // SAME §5.4/§5.6 lifecycle: the child ran no turn (no durable evidence, no
-    // work), holds only an unrenewable child lease, and is cascade-evicted as a
-    // descendant whose ancestry is not fully live (`lease_lost`, see
-    // `_renewLiveSessionLeaseSubtree` orphan handling) or closed when the parent
-    // terminalizes. The link write below is the durable point of no return; the
-    // child is best-effort closed on a rejected link so the only residual orphan
-    // is a crash precisely inside this window, which the lifecycle reclaims.
-    const child = await this._harness.session({
-      resourceId: this.resourceId,
-      threadId: { fresh: true },
-      parentSessionId: this.id,
-      origin: 'subagent-tool',
-      // §9 — an unset `def.modeId` inherits the PARENT's current mode (as
-      // documented), not the harness default mode.
-      modeId: def.modeId ?? this._record.modeId,
-      modelId: input.modelOverride ?? def.defaultModelId,
-      subagentDepth: childDepth,
-      // M4 — persist the type so the durable delegated child's per-subagent
-      // overrides (tools / workspace / toolAllowlist) survive a direct-by-id
-      // hydrate, not only this parent's delegation-reattach.
-      subagentTypeId: input.agentType,
-    });
+    let child: Session;
+    try {
+      child = await this._harness.session({
+        sessionId: childSessionId,
+        resourceId: this.resourceId,
+        threadId: { fresh: true },
+        parentSessionId: this.id,
+        origin: 'subagent-tool',
+        // §9 — an unset `def.modeId` inherits the PARENT's current mode (as
+        // documented), not the harness default mode.
+        modeId: def.modeId ?? this._record.modeId,
+        modelId: input.modelOverride ?? def.defaultModelId,
+        subagentDepth: childDepth,
+        // M4 — persist the type so the durable delegated child's per-subagent
+        // overrides (tools / workspace / toolAllowlist) survive a direct-by-id
+        // hydrate, not only this parent's delegation-reattach.
+        subagentTypeId: input.agentType,
+      });
+    } catch (error) {
+      await this._reconcileDelegatedTask(input.taskId, childSessionId, 'failed');
+      this._delegationDriverClaims.delete(childSessionId);
+      this._internalReleaseSubagentExecution();
+      throw error;
+    }
     const subagentWorkspaceMode = def.workspace ?? 'inherit';
     child._subagentInheritWorkspace = subagentWorkspaceMode === 'inherit';
     if (def.tools) child._subagentToolsOverride = def.tools;
     if (def.toolAllowlist) child._subagentToolAllowlist = def.toolAllowlist;
+    const delegationParentToolCallId = view.delegation?.parentToolCallId ?? `delegate:${input.taskId}`;
+    child._subagentParentToolCallId = delegationParentToolCallId;
 
-    // Write the durable link + drive the task in_progress under the owner fence.
-    // If this rejects (e.g. single-in_progress conflict) the child session was
-    // created but never linked; close it best-effort so we leave no orphan.
-    let view: PlanTaskView;
+    // Stop/revision may have won while child creation was awaiting storage.
+    // The unlinked child has done no provider work, so close it and fail the
+    // stale tool call before it can create an ownership edge.
     try {
-      view = await this._serializePlanTaskWrite(() =>
-        planTaskDelegate(this._planTaskPort(), {
-          taskId: input.taskId,
-          subagentSessionId: child.id,
-          // Persist the subagent type so a reattach-on-rehydrate can re-resolve the
-          // SubagentDefinition and restore the tools / workspace overrides (§9).
-          subagentTypeId: input.agentType,
-        }),
-      );
-    } catch (err) {
+      this._assertActiveWorkAdmission(admissionEpoch, 'task_delegate', callerSignal);
+    } catch (error) {
+      // The plan ownership edge was committed before child allocation. Close
+      // the child before clearing that edge: if close fails, retaining the link
+      // keeps the active descendant discoverable and retryable by recovery.
+      let childClosed = false;
       try {
         await child.close();
+        childClosed = true;
       } catch {
-        // best-effort cleanup
+        this._scheduleDelegationReconcileRetry(0);
       }
-      throw err;
+      if (childClosed) await this._reconcileDelegatedTask(input.taskId, child.id, 'failed');
+      this._delegationDriverClaims.delete(childSessionId);
+      this._internalReleaseSubagentExecution();
+      throw error;
+    }
+
+    // A Stop can begin while the fenced link transaction is in flight. It may
+    // have completed discovery before this new link became visible, so the
+    // delegate itself must settle the now-stale attempt and never start it.
+    try {
+      this._assertActiveWorkAdmission(admissionEpoch, 'task_delegate', callerSignal);
+      const linkStillCurrent = await this._delegationLinkIsCurrent(input.taskId, child.id);
+      this._assertActiveWorkAdmission(admissionEpoch, 'task_delegate', callerSignal);
+      if (!linkStillCurrent) {
+        throw new HarnessValidationError(
+          'taskId',
+          `delegation ownership for task "${input.taskId}" changed during child allocation`,
+        );
+      }
+    } catch (error) {
+      try {
+        await child._cancelInternal({ reason: 'parent_work_aborted', requestedBy: this.id }, this.id);
+      } catch {
+        // The exact task link below still fails closed even if child cleanup
+        // races another owner; reconciliation remains retryable from storage.
+      }
+      let childClosed = false;
+      try {
+        await child.close();
+        childClosed = true;
+      } catch {
+        this._scheduleDelegationReconcileRetry(0);
+      }
+      if (childClosed) await this._reconcileDelegatedTask(input.taskId, child.id, 'failed');
+      this._delegationDriverClaims.delete(childSessionId);
+      this._internalReleaseSubagentExecution();
+      throw error;
     }
 
     // Track for display (mirrors the spawn tool) keyed by the subagent id so a
@@ -15356,21 +17583,27 @@ export class Session {
       subagentSessionId: child.id,
       agentType: input.agentType,
       task: taskBody,
-      parentToolCallId: `delegate:${input.taskId}`,
-      startedAt: Date.now(),
+      parentToolCallId: delegationParentToolCallId,
+      startedAt: delegationStartedAt,
+      status: 'running',
     });
 
-    // Arm the LIVE completion hook: drive the child's turn DETACHED (the parent
-    // turn must not block), and roll the plan task up when the child settles. The
-    // delegated `child.message` carries a DETERMINISTIC `admissionId` derived from
-    // the delegation link, so the run is durably idempotent: its terminal outcome
-    // (completed-with-result / failed-with-error) is persisted as message-result
-    // evidence on the child session, and a re-message with the same id observes
-    // the original run instead of enqueuing a second one. That durable evidence —
-    // plus the `delegatedSubagentSessionId` link — is what makes delegation
-    // recoverable: if this process dies before the hook fires,
-    // reconcile-on-rehydrate reads the child's terminal evidence and rolls up.
-    void this._driveDelegatedSubagent(input.taskId, child, taskBody);
+    // Arm the live completion hook. Delegation uses an admitted SIGNAL instead
+    // of `message()`: signal evidence remains `pending` while the child is
+    // suspended, carries the pending interaction's `originSignalId`, and settles
+    // only after a later resume terminalizes. That gives detached HITL a durable
+    // join handle across reconnects/restarts rather than falsely completing and
+    // closing the child at the first `finishReason: suspended` segment.
+    void this._driveDelegatedSubagent(
+      input.taskId,
+      child,
+      taskBody,
+      input.agentType,
+      child._record.modelId,
+      delegationStartedAt,
+      delegationDeadlineAt,
+      delegationParentToolCallId,
+    );
 
     return { ...view, subagentSessionId: child.id };
   }
@@ -15431,57 +17664,222 @@ export class Session {
   }
 
   /**
-   * @internal — deterministic `admissionId` for a delegated subagent turn. Stable
-   * across restarts (keyed on the parent session + delegated task id) so the
-   * delegated `child.message` is durably idempotent: re-issuing it on rehydrate
-   * RE-ATTACHES to the original run (observes its terminal evidence) instead of
-   * enqueuing a fresh, duplicate run. Namespaced so it never collides with a
-   * caller-supplied admissionId.
+   * @internal — deterministic `admissionId` for a delegated subagent signal.
+   * Stable across restarts so re-issuing it re-attaches to the original durable
+   * signal result (including a suspended run) instead of dispatching duplicate
+   * specialist work.
    */
   private _delegationAdmissionId(taskId: string): string {
     return `harness-delegate:${this.id}:${taskId}`;
   }
 
   /**
-   * @internal — detached driver for a delegated subagent turn. On settle it
-   * reconciles the plan task and closes the child (§5.6 auto-close). Never
-   * rejects — a delegated subagent failure becomes a `failed` plan-task rollup,
-   * not an unhandled rejection on the parent. The `admissionId` makes the
-   * `child.message` durably idempotent (see `_delegationAdmissionId`).
+   * @internal — detached driver for a delegated subagent signal. The admitted
+   * signal's result promise remains pending across HITL suspension and resolves
+   * only after a terminal resume. On terminal settlement this reconciles the
+   * plan task, closes the child, and releases the shared parent reservation.
    */
-  private async _driveDelegatedSubagent(taskId: string, child: Session, taskBody: string): Promise<void> {
-    let outcome: DelegatedSubagentOutcome;
+  private async _driveDelegatedSubagent(
+    taskId: string,
+    child: Session,
+    taskBody: string,
+    agentType: string,
+    modelId: string,
+    startedAt: number,
+    deadlineAt: number,
+    parentToolCallId: string,
+  ): Promise<void> {
+    let outcome: DelegatedSubagentOutcome = 'failed';
+    let rawResult: unknown;
+    let publicError: { code: string; message: string } | undefined;
     // §SA2 — fold the detached child's live progress into the parent's display
     // projection (the delegate path has no event bridge of its own, unlike the
     // spawn tool). Unsubscribed in the finally below.
     const progressKey = `delegate:${child.id}`;
-    const unsubProgress = child.subscribe(event => this._internalUpdateSubagentProgress(progressKey, event));
+    const childDepth = child.subagentDepth;
+    const innerToolNames = new Map<string, string>();
+    child._subagentParentToolCallId = parentToolCallId;
+    const unsubProgress = child.subscribe(event => {
+      this._internalUpdateSubagentProgress(progressKey, event);
+      switch (event.type) {
+        case 'text_delta':
+          if (event.delta.length > 0) {
+            this._emitSubagentEvent({
+              type: 'subagent_text_delta',
+              toolCallId: parentToolCallId,
+              subagentSessionId: child.id,
+              agentType,
+              delta: event.delta,
+              depth: childDepth,
+            });
+          }
+          break;
+        case 'reasoning_delta':
+          if (event.delta.length > 0) {
+            this._emitSubagentEvent({
+              type: 'subagent_reasoning_delta',
+              toolCallId: parentToolCallId,
+              subagentSessionId: child.id,
+              agentType,
+              delta: event.delta,
+              depth: childDepth,
+            });
+          }
+          break;
+        case 'tool_start':
+          innerToolNames.set(event.toolCallId, event.toolName);
+          this._emitSubagentEvent({
+            type: 'subagent_tool_start',
+            toolCallId: parentToolCallId,
+            subagentSessionId: child.id,
+            agentType,
+            innerToolCallId: event.toolCallId,
+            toolName: event.toolName,
+            input: event.input,
+            depth: childDepth,
+          });
+          break;
+        case 'tool_end': {
+          const toolName = innerToolNames.get(event.toolCallId) ?? event.toolName;
+          innerToolNames.delete(event.toolCallId);
+          this._emitSubagentEvent({
+            type: 'subagent_tool_end',
+            toolCallId: parentToolCallId,
+            subagentSessionId: child.id,
+            agentType,
+            innerToolCallId: event.toolCallId,
+            toolName,
+            output: event.output,
+            isError: event.isError ?? false,
+            ...(event.durationMs !== undefined ? { durationMs: event.durationMs } : {}),
+            depth: childDepth,
+          });
+          break;
+        }
+        case 'tool_approval_required':
+        case 'tool_suspension_required':
+        case 'question_pending':
+        case 'plan_approval_required':
+          this._emitDelegatedSubagentPendingEvent(event, {
+            parentToolCallId,
+            subagentSessionId: child.id,
+          });
+          break;
+      }
+    });
+    this._emitSubagentEvent({
+      type: 'subagent_start',
+      toolCallId: parentToolCallId,
+      subagentSessionId: child.id,
+      agentType,
+      task: taskBody,
+      modelId,
+      depth: childDepth,
+    });
     try {
-      const result = await child.message({ content: taskBody, admissionId: this._delegationAdmissionId(taskId) });
-      // A resolved turn can still be a FAILURE: the mock/real agent surfaces an
-      // abort/cancel as `finishReason: 'aborted' | 'error'` rather than a
-      // rejection, and a cancelled child session records `cancelRequest`. Treat
-      // any of those as a failed delegation so a cancelled subagent does not
-      // masquerade as a completed plan task.
-      const finishReason = (result as { finishReason?: string } | undefined)?.finishReason;
-      const failed =
-        finishReason === 'aborted' || finishReason === 'error' || child._record.cancelRequest !== undefined;
-      outcome = failed ? 'failed' : 'completed';
-    } catch {
-      // Subagent error / abort / cancel that rejected → the delegated task FAILED.
-      // (Includes the rehydrate re-attach observing a `failed` durable evidence
-      // row, or a crash-orphaned `pending` reservation that fail-closes.)
+      // The deadline covers admission/dispatch as well as the eventual result.
+      // Racing only the returned result leaves a storage/provider stall inside
+      // signal() itself able to retain the parent reservation forever.
+      const terminal = await waitForDelegationResult(
+        child
+          .signal({ content: taskBody, admissionId: this._delegationAdmissionId(taskId) })
+          .then(dispatched => dispatched.result),
+        deadlineAt,
+      );
+      if (terminal === DELEGATION_DEADLINE_REACHED) {
+        // Commit cancellation before settlement so the child cannot continue
+        // mutating tools after its parent task has released ownership.
+        try {
+          await child._cancelInternal({ reason: 'delegation_timeout', requestedBy: this.id }, this.id);
+        } catch {
+          // Child closure below remains the ownership prerequisite. A failed
+          // cancel/close retains the durable link for restart reconciliation.
+        }
+        outcome = 'failed';
+        publicError = {
+          code: 'harness.delegation_timeout',
+          message: `The delegated subagent did not complete before its durable deadline (${deadlineAt})`,
+        };
+      } else {
+        rawResult = terminal;
+        const finishReason = (rawResult as { finishReason?: string } | undefined)?.finishReason;
+        const declaredReport = parseHarnessSubagentOutcomeReport(rawResult);
+        const declaredTerminalText = parseHarnessTerminalToolResultText(
+          (rawResult as { terminalToolResult?: unknown } | undefined)?.terminalToolResult,
+        );
+        const report = verifyHarnessSubagentTerminalCompletion(rawResult);
+        // Provider finishReason is transport termination, not semantic task success.
+        // A delegated task settles only from the exact framework-owned report
+        // terminal envelope. Cancellation still overrides any concurrently
+        // produced report; a terminal tool normally ends the provider step as
+        // `tool-calls`, so requiring `stop` would reject every real first-call
+        // terminal delivery.
+        outcome = child._record.cancelRequest === undefined && report !== undefined ? report.outcome : 'failed';
+        if (outcome !== 'completed') {
+          publicError = {
+            code:
+              child._record.cancelRequest !== undefined
+                ? 'harness.subagent_cancelled'
+                : (report?.issue?.code ??
+                  ((declaredReport !== undefined || declaredTerminalText !== undefined) && report === undefined
+                    ? 'harness.subagent_evidence_unverified'
+                    : report === undefined
+                      ? 'harness.subagent_outcome_missing'
+                      : 'harness.subagent_incomplete')),
+            message:
+              child._record.cancelRequest !== undefined
+                ? 'The delegated subagent was cancelled before it completed'
+                : (report?.issue?.message ??
+                  (report === undefined
+                    ? declaredReport !== undefined || declaredTerminalText !== undefined
+                      ? 'The delegated subagent terminal completion did not match framework execution receipts'
+                      : `The delegated subagent ended without ${HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID}`
+                    : `The delegated subagent reported ${report.outcome} after provider finish reason "${finishReason ?? 'missing'}"`)),
+          };
+        }
+      }
+    } catch (error) {
+      // Rejected signal/result, cancellation, expiry, or crash-orphan recovery.
       outcome = 'failed';
+      publicError = projectHarnessPublicError(error);
     } finally {
       unsubProgress();
       this._activeSubagents.delete(`delegate:${child.id}`);
     }
-    await this._reconcileDelegatedTask(taskId, child.id, outcome);
-    // §5.6 auto-close the delegated subagent once its work has settled.
+    const summary = summarizeHarnessSubagentResult(rawResult, {
+      isError: outcome !== 'completed',
+      ...(publicError !== undefined ? { error: publicError } : {}),
+    });
     try {
-      await child.close();
-    } catch {
-      // best-effort
+      // Close the terminal child BEFORE clearing its durable plan link. If the
+      // process dies after close, recovery can still settle from signal evidence;
+      // if close fails, retaining the link keeps ownership discoverable and
+      // retryable instead of creating an unlinked active descendant.
+      try {
+        await child.close();
+      } catch {
+        this._scheduleDelegationReconcileRetry(0);
+        return;
+      }
+      const reconciled = await this._reconcileDelegatedTask(taskId, child.id, outcome, summary);
+      if (!reconciled) return;
+      // A successful subagent_end is a durable settlement notification, not a
+      // provider-stop notification. Emit only after child closure and the
+      // fenced plan write both committed so reconnecting UI cannot show a
+      // completed child while the authoritative task remains in_progress.
+      this._emitSubagentEvent({
+        type: 'subagent_end',
+        toolCallId: parentToolCallId,
+        subagentSessionId: child.id,
+        agentType,
+        output: summarizeHarnessSubagentEventResult(summary),
+        isError: outcome !== 'completed',
+        durationMs: Math.max(0, Date.now() - startedAt),
+        depth: childDepth,
+      });
+    } finally {
+      this._delegationDriverClaims.delete(child.id);
+      this._internalReleaseSubagentExecution();
     }
   }
 
@@ -15495,57 +17893,97 @@ export class Session {
     taskId: string,
     subagentSessionId: string,
     outcome: DelegatedSubagentOutcome,
-  ): Promise<void> {
-    if (this._state === 'closed') return;
+    result?: HarnessSubagentResultSummary,
+  ): Promise<boolean> {
+    if (this._state === 'closed') return false;
     try {
-      await this._serializePlanTaskWrite(() =>
-        planTaskReconcileDelegation(this._planTaskPort(), { taskId, subagentSessionId, outcome }),
+      const durableResult =
+        result ??
+        (outcome !== 'completed'
+          ? {
+              ...summarizeHarnessSubagentEventResult(
+                summarizeHarnessSubagentResult(undefined, {
+                  isError: true,
+                  error: {
+                    code: outcome === 'blocked' ? 'harness.delegation_blocked' : 'harness.delegation_failed',
+                    message: `The delegated task ${outcome} without usable terminal result evidence`,
+                  },
+                }),
+              ),
+              outcome,
+            }
+          : undefined);
+      const reconcileResult = await this._serializePlanTaskWrite(() =>
+        planTaskReconcileDelegation(this._planTaskPort(), {
+          taskId,
+          subagentSessionId,
+          outcome,
+          ...(durableResult !== undefined ? { result: durableResult } : {}),
+        }),
       );
+      if (reconcileResult.reconciled) this._notifyDisplayRefresh();
+      return reconcileResult.reconciled;
     } catch {
-      // A fence/version race is benign here — a later reconcile (or hydrate scan)
-      // re-reads the durable link and retries. The durable child outcome is the
-      // authority, not this one attempt.
+      // Keep a live recovery path even when no future parent message or hydrate
+      // occurs. The durable child signal evidence is the authority; a bounded
+      // scan retry re-reads the exact link and settles it idempotently.
+      this._scheduleDelegationReconcileRetry(0);
+      return false;
     }
   }
 
   /**
-   * @internal — read the DURABLE terminal outcome of a delegated subagent turn
-   * from the child session's message-result evidence (the same evidence the
-   * deterministic delegation `admissionId` persists; see
-   * `_delegationAdmissionId`). The signal id is reconstructed from the child's
-   * own record fields exactly as `_messageAdmissionIdentity` derives it, so this
-   * works even after the child session has CLOSED (evidence outlives the live
-   * session). Returns the mapped plan-task outcome, or `undefined` when no
-   * terminal evidence exists yet (still `pending`, absent, or a tombstone).
-   *
-   * FAITHFUL ACROSS CRASH: the message-result-evidence primitive records
-   * `completed` whenever a turn RESOLVES and `failed` only when it REJECTS, so a
-   * run that resolves with `finishReason: 'error' | 'aborted'` (rather than
-   * rejecting) settles as `completed` evidence. But the durable evidence carries
-   * the run's full `result` (the `AgentResult`/`FullOutput`, persisted at the
-   * `status: 'completed'` write), and that result carries `finishReason`. So we
-   * read it back here and map a non-success finishReason to a `failed` delegation
-   * — exactly what the live driver does in-process via `result.finishReason`.
-   * This closes the former resolve-with-error crash window WITHOUT a new
-   * primitive: rejecting runs are durable `failed`, resolve-with-error/aborted
-   * runs are now durable-`completed`-but-finishReason-failed, and cancellation is
-   * captured by the `cancelRequest` override in the reconcile scan.
+   * Make child closure the prerequisite for clearing its plan ownership edge.
+   * Returns false on a transient/foreign-lease failure so the caller can retain
+   * the link and retry; a closed child is already safe.
+   */
+  private async _closeDelegatedChildForSettlement(childRecord: SessionRecord): Promise<boolean> {
+    if (childRecord.closedAt !== undefined) return true;
+    try {
+      const child = await this._harness.session({ sessionId: childRecord.id, resourceId: this.resourceId });
+      await child.close();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Cancel timed-out work before closing it and releasing its plan ownership edge. */
+  private async _cancelAndCloseDelegatedChildForDeadline(childRecord: SessionRecord): Promise<boolean> {
+    if (childRecord.closedAt !== undefined) return true;
+    try {
+      const child = await this._harness.session({ sessionId: childRecord.id, resourceId: this.resourceId });
+      await child._cancelInternal({ reason: 'delegation_timeout', requestedBy: this.id }, this.id);
+      await child.close();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * @internal — read the durable terminal outcome of the delegated admitted
+   * signal. Signal evidence deliberately remains `pending` across a suspension
+   * and settles only after resume/expiry, so `undefined` means "still owned or
+   * waiting for HITL", never a successful delegation. Evidence outlives a closed
+   * child and therefore remains the recovery authority after a crash.
    */
   private async _loadDelegationOutcomeFromEvidence(
     childRecord: SessionRecord,
     taskId: string,
-  ): Promise<DelegatedSubagentOutcome | undefined> {
+    deadlineAt: number,
+  ): Promise<{ outcome: DelegatedSubagentOutcome; result: HarnessSubagentResultSummary } | undefined> {
     const admissionId = this._delegationAdmissionId(taskId);
     const digest = sha256CanonicalJson({
-      kind: 'message-admission',
+      kind: 'channel-signal-admission',
       harnessName: childRecord.harnessName,
       sessionId: childRecord.id,
       resourceId: childRecord.resourceId,
       threadId: childRecord.threadId,
       admissionId,
     });
-    const signalId = `harness-message-${digest.slice(0, 32)}`;
-    let evidence: AgentSignalResultStatus | OperationAdmissionTombstone | null;
+    const signalId = `harness-channel-signal-${digest.slice(0, 32)}`;
+    let evidence: AgentSignalResultEvidence | OperationAdmissionTombstone | null;
     try {
       evidence = await this._storage.loadMessageResultEvidence({
         harnessName: childRecord.harnessName,
@@ -15558,15 +17996,54 @@ export class Session {
       return undefined;
     }
     if (!evidence || !('status' in evidence)) return undefined;
-    if (evidence.status === 'completed') {
-      // A turn that RESOLVED but with a non-success finishReason is a FAILED
-      // delegation (the live driver maps it the same way). The finishReason rides
-      // on the durable `result` payload, so this stays faithful across a crash.
-      const finishReason = (evidence as { result?: { finishReason?: unknown } }).result?.finishReason;
-      if (finishReason === 'error' || finishReason === 'aborted') return 'failed';
-      return 'completed';
+    if (evidence.status === 'completed' || evidence.status === 'failed') {
+      const settledAt = evidence.updatedAt;
+      if (!Number.isSafeInteger(settledAt) || settledAt > deadlineAt) {
+        return { outcome: 'failed', result: summarizeDelegationDeadline(deadlineAt) };
+      }
     }
-    if (evidence.status === 'failed') return 'failed';
+    if (evidence.status === 'completed') {
+      const rawResult = (evidence as { result?: unknown }).result;
+      const finishReason = (rawResult as { finishReason?: unknown } | undefined)?.finishReason;
+      const declaredReport = parseHarnessSubagentOutcomeReport(rawResult);
+      const declaredTerminalText = parseHarnessTerminalToolResultText(
+        (rawResult as { terminalToolResult?: unknown } | undefined)?.terminalToolResult,
+      );
+      const report = verifyHarnessSubagentTerminalCompletion(rawResult);
+      const outcome: DelegatedSubagentOutcome = report !== undefined ? report.outcome : 'failed';
+      const result = summarizeHarnessSubagentResult(rawResult, {
+        isError: outcome !== 'completed',
+        ...(outcome !== 'completed'
+          ? {
+              error: {
+                code:
+                  report?.issue?.code ??
+                  ((declaredReport !== undefined || declaredTerminalText !== undefined) && report === undefined
+                    ? 'harness.subagent_evidence_unverified'
+                    : report === undefined
+                      ? 'harness.subagent_outcome_missing'
+                      : 'harness.subagent_incomplete'),
+                message:
+                  report?.issue?.message ??
+                  (report === undefined
+                    ? declaredReport !== undefined || declaredTerminalText !== undefined
+                      ? 'The delegated subagent terminal completion did not match framework execution receipts'
+                      : `The delegated subagent ended without ${HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID}`
+                    : `The delegated subagent reported ${report.outcome} after provider finish reason "${String(finishReason ?? 'missing')}"`),
+              },
+            }
+          : {}),
+      });
+      return { outcome, result };
+    }
+    if (evidence.status === 'failed') {
+      return {
+        outcome: 'failed',
+        result: summarizeHarnessSubagentEventResult(
+          summarizeHarnessSubagentResult(undefined, { isError: true, error: evidence.error }),
+        ),
+      };
+    }
     return undefined; // 'pending' — no terminal outcome yet.
   }
 
@@ -15574,26 +18051,60 @@ export class Session {
    * @internal — recovery / reconcile-on-rehydrate (§5.6 TM-6). Scan this
    * session's plan tasks for a `delegatedSubagentSessionId` whose task is still
    * non-terminal and reconcile each against the delegated subagent session's
-   * DURABLE state. The authority is the child's durable message-result evidence
+   * DURABLE state. The authority is the child's durable signal-result evidence
    * (persisted by the deterministic delegation `admissionId`), not a guess from
    * the session close marker:
    *   - durable terminal evidence (completed/failed) → roll the plan task up from
    *     it (a FAILED delegated run recovers as `failed`, not `completed`);
    *   - subagent session GONE/deleted → fail closed (`failed`);
-   *   - subagent CLOSED with no terminal evidence → map from the close marker
-   *     (cancelled = failed; clean close = completed) as a conservative fallback;
-   *   - subagent still LIVE with no terminal evidence → RE-ATTACH by re-issuing
-   *     the delegated `child.message` with the SAME deterministic admissionId,
-   *     which OBSERVES the original run (admission dedup) rather than enqueuing a
-   *     second one. A crash-orphaned `pending` reservation whose run died with
-   *     the old process fail-closes after the durable-wait timeout.
+   *   - subagent CLOSED with no terminal evidence → fail closed;
+   *   - subagent still LIVE with pending evidence → re-attach by re-issuing the
+   *     admitted signal. Dedup observes the original run or waits for its
+   *     suspended resume; it never dispatches a second specialist turn.
    *
    * Resilient: a transient/CAS failure on a single task does not strand it — the
-   * scan re-arms a bounded retry so a stuck `in_progress` delegation is not left
+   * scan re-arms a capped-backoff retry so a stuck `in_progress` delegation is not left
    * with no path forward while the parent stays live.
    */
   async _reconcileDelegationsOnHydrate(attempt = 0): Promise<void> {
+    const current = this._delegationReconcileInFlight;
+    if (current !== undefined) {
+      // Do not lose a timer/capacity-release wakeup merely because a slower scan
+      // is still reading another delegated task. The owner of `current` loops
+      // once more before releasing the singleflight.
+      this._delegationReconcileRerunRequested = true;
+      return current;
+    }
+    const run = (async () => {
+      do {
+        this._delegationReconcileRerunRequested = false;
+        await this._reconcileDelegationsOnHydratePass(attempt);
+      } while (this._state === 'live' && this._delegationReconcileRerunRequested);
+    })();
+    this._delegationReconcileInFlight = run;
+    try {
+      await run;
+    } finally {
+      if (this._delegationReconcileInFlight === run) this._delegationReconcileInFlight = undefined;
+      // A request can land after the loop's final condition but before this
+      // singleflight is cleared. Preserve that narrow wakeup with a fresh timer.
+      if (this._state === 'live' && this._delegationReconcileRerunRequested) {
+        this._delegationReconcileRerunRequested = false;
+        this._scheduleDelegationReconcileRetry(0);
+      }
+    }
+  }
+
+  private async _reconcileDelegationsOnHydratePass(attempt: number): Promise<void> {
     if (this._state !== 'live') return;
+    let admissionEpoch: number;
+    try {
+      admissionEpoch = this._captureActiveWorkAdmission('delegation reconciliation');
+    } catch {
+      // Stop/reset owns the branch. Its cancellation/reset pass will settle or
+      // preserve every durable edge; recovery must not attach new work behind it.
+      return;
+    }
     let cursor: string | undefined;
     const delegated: HarnessPlanTask[] = [];
     try {
@@ -15613,7 +18124,7 @@ export class Session {
         cursor = page.cursor;
       }
     } catch {
-      // Best-effort: the listing itself failed transiently — re-arm a bounded
+      // Best-effort: the listing itself failed transiently — re-arm a
       // retry so a delegated task is not stranded by a flaky read.
       this._scheduleDelegationReconcileRetry(attempt);
       return;
@@ -15622,6 +18133,10 @@ export class Session {
     let needsRetry = false;
     for (const task of delegated) {
       const childId = task.delegatedSubagentSessionId!;
+      if (!this._activeWorkAdmissionIsCurrent(admissionEpoch)) return;
+      // A live driver in this process already owns the exact delegation. This
+      // also keeps an explicit/manual recovery kick from double-reserving it.
+      if (this._delegationDriverClaims.has(childId) || this._activeSubagents.has(`delegate:${childId}`)) continue;
       let childRecord: SessionRecord | null;
       try {
         childRecord = await this._storage.loadSession({ harnessName: this._record.harnessName, sessionId: childId });
@@ -15636,39 +18151,119 @@ export class Session {
         await this._reconcileDelegatedTask(task.taskId, childId, 'failed');
         continue;
       }
+      const delegationAttempt = readDelegationAttemptMetadata(task, childId);
       // A CANCELLED subagent is a FAILED delegation regardless of how the run
       // finishReason landed — mirrors the live driver's `cancelRequest` override
       // (a run can race to `complete` after a cancel, but the delegation was
       // cancelled, so the plan task fails). Checked before the evidence so a
-      // `completed` evidence row from that race cannot mask the cancel.
+      // `completed` evidence row from that race cannot mask the cancel. Preserve
+      // the framework-owned timeout reason across the crash window between the
+      // durable cancellation CAS and task reconciliation; otherwise recovery
+      // degrades a precise timeout into the generic delegation-failed result.
       if (childRecord.cancelRequest !== undefined) {
+        if (!(await this._closeDelegatedChildForSettlement(childRecord))) {
+          needsRetry = true;
+          continue;
+        }
+        await this._reconcileDelegatedTask(
+          task.taskId,
+          childId,
+          'failed',
+          childRecord.cancelRequest.reason === 'delegation_timeout' && delegationAttempt !== undefined
+            ? summarizeDelegationDeadline(delegationAttempt.deadlineAt)
+            : undefined,
+        );
+        continue;
+      }
+      if (delegationAttempt === undefined) {
+        if (!(await this._closeDelegatedChildForSettlement(childRecord))) {
+          needsRetry = true;
+          continue;
+        }
         await this._reconcileDelegatedTask(task.taskId, childId, 'failed');
         continue;
       }
       // DURABLE terminal evidence is the authority — a delegated run that ERRORED
-      // before closing recovers as `failed`, not `completed`.
-      const durable = await this._loadDelegationOutcomeFromEvidence(childRecord, task.taskId);
+      // before closing recovers as `failed`, not `completed`. Its durable
+      // settlement timestamp must also fall within the immutable attempt
+      // deadline; a late provider result cannot retroactively win recovery.
+      const durable = await this._loadDelegationOutcomeFromEvidence(
+        childRecord,
+        task.taskId,
+        delegationAttempt.deadlineAt,
+      );
       if (durable !== undefined) {
-        await this._reconcileDelegatedTask(task.taskId, childId, durable);
+        if (!(await this._closeDelegatedChildForSettlement(childRecord))) {
+          needsRetry = true;
+          continue;
+        }
+        await this._reconcileDelegatedTask(task.taskId, childId, durable.outcome, durable.result);
         continue;
       }
-      // Subagent session CLOSED with no terminal evidence → fall back to the close
-      // marker (a clean close is the conservative "the subagent finished" read;
-      // the cancel case is already handled above).
+      // A close marker cannot prove useful work completed. Without terminal
+      // signal evidence, fail closed rather than fabricating success.
       if (childRecord.closedAt !== undefined) {
-        await this._reconcileDelegatedTask(task.taskId, childId, 'completed');
+        await this._reconcileDelegatedTask(task.taskId, childId, 'failed');
         continue;
       }
-      // Subagent still active → RE-ATTACH by re-issuing the delegated message with
-      // the deterministic admissionId. The dedup path observes the original run
-      // (no second run); a crash-orphaned `pending` fail-closes via the driver.
+      // The absolute timestamp was committed with the ownership edge. Recovery
+      // must never grant a fresh duration after restart. Terminal evidence above
+      // still wins when it already proves the child settled.
+      if (Date.now() >= delegationAttempt.deadlineAt) {
+        if (!(await this._cancelAndCloseDelegatedChildForDeadline(childRecord))) {
+          needsRetry = true;
+          continue;
+        }
+        await this._reconcileDelegatedTask(
+          task.taskId,
+          childId,
+          'failed',
+          summarizeDelegationDeadline(delegationAttempt.deadlineAt),
+        );
+        continue;
+      }
+      if (!this._activeWorkAdmissionIsCurrent(admissionEpoch)) return;
+      // Reserve from the same pool as a newly delegated/inline child before
+      // hydrating and attaching. A capacity miss is retried and is also kicked
+      // immediately when any current child releases a slot.
+      const reservation = this._internalTryReserveSubagentExecution();
+      if (!reservation.reserved) {
+        this._delegationReconcileCapacityBlocked = true;
+        needsRetry = true;
+        continue;
+      }
+      this._delegationDriverClaims.add(childId);
+
+      // Subagent still active → re-attach by re-issuing the admitted signal with
+      // the deterministic admission id. The durable dispatch fence observes the
+      // original execution or waits through HITL; it does not enqueue a second.
       let child: Session | undefined;
       try {
         child = await this._harness.session({ sessionId: childId, resourceId: this.resourceId });
       } catch {
+        this._delegationDriverClaims.delete(childId);
+        this._internalReleaseSubagentExecution();
         // Could not re-acquire the child (locked elsewhere / transient) — retry
         // the scan later so the task is not stranded.
         needsRetry = true;
+        continue;
+      }
+      // Hydrating the child crossed an async ownership boundary. Stop/reset may
+      // have invalidated this recovery pass or removed/replaced the exact link;
+      // re-read both authorities before starting the admitted signal driver.
+      let linkStillCurrent = false;
+      try {
+        linkStillCurrent = await this._delegationLinkIsCurrent(task.taskId, childId);
+      } catch {
+        this._delegationDriverClaims.delete(childId);
+        this._internalReleaseSubagentExecution();
+        needsRetry = true;
+        continue;
+      }
+      if (!this._activeWorkAdmissionIsCurrent(admissionEpoch) || !linkStillCurrent) {
+        this._delegationDriverClaims.delete(childId);
+        this._internalReleaseSubagentExecution();
+        if (!this._activeWorkAdmissionIsCurrent(admissionEpoch)) return;
         continue;
       }
       // §9 — restore the SubagentDefinition overrides on the reattached child. The
@@ -15684,30 +18279,60 @@ export class Session {
           if (def.toolAllowlist) child._subagentToolAllowlist = def.toolAllowlist;
         }
       }
+      const agentType = task.delegatedSubagentTypeId ?? childRecord.subagentTypeId ?? 'delegated';
+      child._subagentParentToolCallId = delegationAttempt.parentToolCallId;
       this._activeSubagents.set(`delegate:${child.id}`, {
         subagentSessionId: child.id,
-        agentType: 'delegated',
-        task: task.content,
-        parentToolCallId: `delegate:${task.taskId}`,
-        startedAt: Date.now(),
+        agentType,
+        task: delegationAttempt.taskBody,
+        parentToolCallId: delegationAttempt.parentToolCallId,
+        startedAt: delegationAttempt.startedAt,
+        status: childRecord.pendingResume !== undefined ? 'awaiting_input' : 'running',
       });
-      void this._driveDelegatedSubagent(task.taskId, child, task.content);
+      void this._driveDelegatedSubagent(
+        task.taskId,
+        child,
+        delegationAttempt.taskBody,
+        agentType,
+        childRecord.modelId,
+        delegationAttempt.startedAt,
+        delegationAttempt.deadlineAt,
+        delegationAttempt.parentToolCallId,
+      );
     }
     if (needsRetry) this._scheduleDelegationReconcileRetry(attempt);
   }
 
+  /** Exact revision-fenced ownership check immediately before reattachment. */
+  private async _delegationLinkIsCurrent(taskId: string, childId: string): Promise<boolean> {
+    const snapshot = await this._storage.loadPlanTaskSubtree({
+      harnessName: this._record.harnessName,
+      sessionId: this.id,
+      rootTaskId: taskId,
+      limit: 1,
+    });
+    const current = snapshot.tasks.find(task => task.taskId === taskId);
+    return current?.delegatedSubagentSessionId === childId && !TERMINAL_PLAN_TASK_STATUSES.has(current.status);
+  }
+
   /**
-   * @internal — bounded retry for reconcile-on-rehydrate. A transient/CAS/locked
-   * failure on a delegated task re-arms the scan with exponential backoff (capped
-   * attempts) so a stuck `in_progress` delegation is not permanently stranded
-   * while the parent session stays live. A terminal/permanent outcome (gone →
-   * failed, durable terminal evidence) already fails-closed in the scan and is
-   * not retried.
+   * @internal — persistent retry for reconcile-on-rehydrate. A transient/CAS/
+   * locked failure re-arms the scan with capped exponential backoff for as long
+   * as the parent remains live. This intentionally has no small attempt ceiling:
+   * another process may legitimately hold a child lease longer than one retry
+   * window. At most one timer is armed, preventing retry fan-out. A fresh
+   * capacity release (`attempt === 0`) replaces a slower pending timer.
    */
   private _scheduleDelegationReconcileRetry(attempt: number): void {
-    if (attempt >= DELEGATION_RECONCILE_MAX_RETRIES) return;
+    if (this._state !== 'live') return;
+    if (this._delegationReconcileRetryTimers.size > 0) {
+      if (attempt !== 0) return;
+      for (const existing of this._delegationReconcileRetryTimers) clearTimeout(existing);
+      this._delegationReconcileRetryTimers.clear();
+    }
     const next = attempt + 1;
-    const backoffMs = DELEGATION_RECONCILE_RETRY_BASE_MS * 2 ** attempt;
+    const exponent = Math.min(Math.max(0, attempt), 16);
+    const backoffMs = Math.min(DELEGATION_RECONCILE_RETRY_BASE_MS * 2 ** exponent, DELEGATION_RECONCILE_RETRY_MAX_MS);
     const timer = setTimeout(() => {
       this._delegationReconcileRetryTimers.delete(timer);
       if (this._state !== 'live') return;
@@ -15742,6 +18367,27 @@ function compactJsonObject<T extends Record<string, unknown>>(value: T): Record<
 function getOwnRecordValue<T>(record: Record<string, T> | undefined, key: string): T | undefined {
   if (!record || !Object.prototype.hasOwnProperty.call(record, key)) return undefined;
   return record[key];
+}
+
+function appendExpiredPendingInteraction(
+  current: SessionRecord['expiredPendingInteractions'],
+  receipt: NonNullable<SessionRecord['expiredPendingInteractions']>[string],
+): NonNullable<SessionRecord['expiredPendingInteractions']> {
+  const next = { ...(current ?? {}), [receipt.generationKey]: receipt };
+  const retained = Object.values(next)
+    .sort((a, b) => b.expiredAt - a.expiredAt || b.generationKey.localeCompare(a.generationKey))
+    .slice(0, MAX_EXPIRED_PENDING_INTERACTIONS);
+  return Object.fromEntries(retained.map(entry => [entry.generationKey, entry]));
+}
+
+function pendingInteractionGenerationKey(input: {
+  kind: PendingResume['kind'];
+  itemId: string;
+  runId: string;
+  toolCallId: string;
+  requestedAt: number;
+}): string {
+  return sha256CanonicalJson([input.kind, input.itemId, input.runId, input.toolCallId, input.requestedAt]);
 }
 
 function publicErrorProjectionToError(error: { code: string; message: string }): Error {
@@ -15783,12 +18429,12 @@ class QueueRecoveryStaleError extends HarnessError {
   }
 }
 
-class QueueResumeRecoveryStaleError extends HarnessError {
-  readonly code = 'harness.queue_resume_recovery_stale';
+class ResumeRecoveryStaleError extends HarnessError {
+  readonly code = 'harness.resume_recovery_stale';
 
   constructor() {
-    super('queued turn resume was marked in flight but no terminal queue result is available');
-    this.name = 'harness.queue_resume_recovery_stale';
+    super('resume was admitted but no live owner or durable terminal result is available');
+    this.name = 'harness.resume_recovery_stale';
   }
 }
 

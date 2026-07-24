@@ -25,7 +25,6 @@ import {
   TASK_DECOMPOSE_TOOL_ID,
   TASK_REPARENT_TOOL_ID,
   TASK_UPDATE_TOOL_ID,
-  TASK_WRITE_TOOL_ID,
 } from './plan-task-tool';
 
 const PLAN_TASK_TOOL_IDS = [
@@ -35,7 +34,6 @@ const PLAN_TASK_TOOL_IDS = [
   TASK_UPDATE_TOOL_ID,
   TASK_COMPLETE_TOOL_ID,
   TASK_CHECK_TOOL_ID,
-  TASK_WRITE_TOOL_ID,
 ];
 
 describe('plan-task tool registration', () => {
@@ -47,6 +45,32 @@ describe('plan-task tool registration', () => {
     for (const id of PLAN_TASK_TOOL_IDS) {
       expect(tools[id]!.id).toBe(id);
     }
+  });
+
+  it('redacts unexpected plan-task failures before returning them to the model', async () => {
+    const secret = 'postgresql://admin:token@db.internal/secret_table';
+    const tools = createPlanTaskTools({
+      _planTaskAdd: async () => {
+        throw new Error(`driver failed at ${secret}`);
+      },
+    } as any);
+
+    const result = (await tools[TASK_ADD_TOOL_ID]!.execute!(
+      { content: 'inspect source' } as any,
+      {
+        abortSignal: new AbortController().signal,
+        agent: { toolCallId: 'tc-redaction', runId: 'mock-run' },
+        requestContext: { get: () => undefined },
+      } as any,
+    )) as any;
+
+    expect(result).toEqual({
+      isError: true,
+      errorName: 'HarnessError',
+      code: 'harness.internal',
+      message: 'An internal harness error occurred',
+    });
+    expect(JSON.stringify(result)).not.toContain(secret);
   });
 
   it('injects the plan-task tools into the harness:builtin toolset the agent receives', async () => {
@@ -64,6 +88,40 @@ describe('plan-task tool registration', () => {
 });
 
 describe('plan-task tool execution mid-turn', () => {
+  it('injects a bounded durable-plan frontier into the next turn and preserves mode instructions', async () => {
+    const { harness, agent } = setupHarness({
+      modes: [{ id: 'default', agentId: 'default', instructions: 'Keep answers concise.' }],
+    });
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    let release!: () => void;
+    const holdUntil = new Promise<void>(resolve => (release = resolve));
+    agent.enqueueRun({ holdUntil, finishReason: 'stop', text: 'planning' });
+    const firstTurn = session.message({ content: 'make a plan' });
+    await vitestPoll(() => agent.streamCalls.length === 1);
+    const tools = createPlanTaskTools(session);
+    const ctx = {
+      abortSignal: new AbortController().signal,
+      agent: { toolCallId: 'tc-frontier', runId: 'mock-run' },
+      requestContext: { get: () => undefined },
+    } as any;
+    const task = (await tools[TASK_ADD_TOOL_ID]!.execute!({ content: 'inspect source' } as any, ctx)) as any;
+    await tools[TASK_UPDATE_TOOL_ID]!.execute!({ taskId: task.taskId, status: 'in_progress' } as any, ctx);
+    release();
+    await firstTurn;
+
+    await session.message({ content: 'continue' });
+    const instructions = agent.streamCalls.at(-1)!.options.instructions as string;
+    expect(instructions).toContain('Keep answers concise.');
+    expect(instructions).toContain('<harness_durable_plan_state>');
+    expect(instructions).toContain('total=1; roots=1; statuses=in_progress=1');
+    expect(instructions).toContain(`in_progress_ids=${task.taskId}`);
+    expect(instructions).toContain('call plan_task_check');
+    expect(instructions).toContain('delegation.result');
+    // User task content is intentionally not duplicated into the system prompt.
+    expect(instructions).not.toContain('inspect source');
+  });
+
   it('task_add mutates the tree and emits papersflow.plan_task.updated through the live session', async () => {
     const { harness, agent } = setupHarness();
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
@@ -83,17 +141,21 @@ describe('plan-task tool execution mid-turn', () => {
     await vitestPoll(() => agent.streamCalls.length > 0);
 
     const tools = createPlanTaskTools(session);
-    const result = (await tools[TASK_ADD_TOOL_ID]!.execute!(
-      { content: 'plan thing' } as any,
-      {
-        abortSignal: new AbortController().signal,
-        agent: { toolCallId: 'tc-1', runId: 'mock-run' },
-        requestContext: { get: () => undefined },
-      } as any,
-    )) as any;
+    const context = {
+      abortSignal: new AbortController().signal,
+      agent: { agentId: 'default', messages: [], toolCallId: 'tc-1', runId: 'mock-run' },
+      requestContext: { get: () => undefined },
+    } as any;
+    const result = (await tools[TASK_ADD_TOOL_ID]!.execute!({ content: 'plan thing' } as any, context)) as any;
 
     expect(result.isError).toBeFalsy();
     expect(result.content).toBe('plan thing');
+    await expect(tools[TASK_ADD_TOOL_ID]!.execute!({ content: 'plan thing' } as any, context)).resolves.toMatchObject({
+      taskId: result.taskId,
+    });
+    await expect(
+      tools[TASK_ADD_TOOL_ID]!.execute!({ content: 'different replay payload' } as any, context),
+    ).resolves.toMatchObject({ isError: true, field: 'idempotencyKey' });
 
     release();
     await turn;
@@ -105,6 +167,7 @@ describe('plan-task tool execution mid-turn', () => {
 
     // Tree persisted.
     const stored = await session._internalStorage.listPlanTasks({ sessionId: session.id, limit: 10 });
+    expect(stored.tasks).toHaveLength(1);
     expect(stored.tasks.map(t => t.content)).toContain('plan thing');
   });
 
@@ -128,109 +191,23 @@ describe('plan-task tool execution mid-turn', () => {
       requestContext: { get: () => undefined },
     } as any;
     const root = (await tools[TASK_ADD_TOOL_ID]!.execute!({ content: 'root' } as any, ctx)) as any;
-    await tools[TASK_DECOMPOSE_TOOL_ID]!.execute!(
+    const decomposed = (await tools[TASK_DECOMPOSE_TOOL_ID]!.execute!(
       { parentTaskId: root.taskId, children: [{ content: 'c1' }, { content: 'c2' }] } as any,
       ctx,
-    );
-    await tools[TASK_UPDATE_TOOL_ID]!.execute!({ taskId: root.taskId, status: 'in_progress' } as any, ctx);
+    )) as any;
+    // A parent with children is rollup-owned. Start a leaf and assert the
+    // summary contains both the explicit leaf and its derived parent.
+    const startedChildId = decomposed.children[0].taskId;
+    await tools[TASK_UPDATE_TOOL_ID]!.execute!({ taskId: startedChildId, status: 'in_progress' } as any, ctx);
 
     const summary = session.getDisplayState().planTasks!;
     expect(summary.total).toBe(3);
     expect(summary.rootCount).toBe(1);
-    expect(summary.inProgressTaskIds).toEqual([root.taskId]);
-    expect(summary.byStatus.in_progress).toBe(1);
-    expect(summary.byStatus.pending).toBe(2);
+    expect(summary.inProgressTaskIds).toEqual([root.taskId, startedChildId]);
+    expect(summary.byStatus.in_progress).toBe(2);
+    expect(summary.byStatus.pending).toBe(1);
     // Bounded — no full tree embedded on the snapshot.
     expect(Object.keys(summary).sort()).toEqual(['byStatus', 'inProgressTaskIds', 'rootCount', 'total']);
-
-    release();
-    await turn;
-  });
-
-  it('task_write back-compat: no taskId adds, taskId updates', async () => {
-    const { harness, agent } = setupHarness();
-    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
-
-    let release!: () => void;
-    const holdUntil = new Promise<void>(r => (release = r));
-    agent.enqueueRun({ holdUntil, finishReason: 'stop', text: 'done' });
-    const turn = session.message({ content: 'go' });
-    await vitestPoll(() => agent.streamCalls.length > 0);
-
-    const tools = createPlanTaskTools(session);
-    const ctx = {
-      abortSignal: new AbortController().signal,
-      agent: { toolCallId: 'tc-w', runId: 'mock-run' },
-      requestContext: { get: () => undefined },
-    } as any;
-    const added = (await tools[TASK_WRITE_TOOL_ID]!.execute!({ content: 'via write' } as any, ctx)) as any;
-    expect(added.taskId).toBeTruthy();
-    expect(added.content).toBe('via write');
-    const updated = (await tools[TASK_WRITE_TOOL_ID]!.execute!(
-      { taskId: added.taskId, status: 'completed' } as any,
-      ctx,
-    )) as any;
-    expect(updated.status).toBe('completed');
-
-    release();
-    await turn;
-  });
-
-  it('task_write back-compat: legacy {tasks:[...]} full-list shape adds + updates by content', async () => {
-    const { harness, agent } = setupHarness();
-    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
-
-    let release!: () => void;
-    const holdUntil = new Promise<void>(r => (release = r));
-    agent.enqueueRun({ holdUntil, finishReason: 'stop', text: 'done' });
-    const turn = session.message({ content: 'go' });
-    await vitestPoll(() => agent.streamCalls.length > 0);
-
-    const tools = createPlanTaskTools(session);
-    const ctx = {
-      abortSignal: new AbortController().signal,
-      agent: { toolCallId: 'tc-legacy', runId: 'mock-run' },
-      requestContext: { get: () => undefined },
-    } as any;
-
-    // Legacy mastracode contract: pass the FULL list. First call CREATES the tasks.
-    const first = (await tools[TASK_WRITE_TOOL_ID]!.execute!(
-      {
-        tasks: [
-          { content: 'design', status: 'in_progress', activeForm: 'Designing' },
-          { content: 'build', status: 'pending' },
-          { content: 'ship', status: 'pending' },
-        ],
-      } as any,
-      ctx,
-    )) as any;
-    expect(first.isError).toBeFalsy();
-    expect(first.tasks).toHaveLength(3);
-    expect(first.tasks.map((t: any) => t.content)).toEqual(['design', 'build', 'ship']);
-
-    // Second FULL-list call RECONCILES by content: 'design' completed, 'build'
-    // in_progress, 'ship' unchanged. No errors, no duplicate rows.
-    const second = (await tools[TASK_WRITE_TOOL_ID]!.execute!(
-      {
-        tasks: [
-          { content: 'design', status: 'completed' },
-          { content: 'build', status: 'in_progress', activeForm: 'Building' },
-          { content: 'ship', status: 'pending' },
-        ],
-      } as any,
-      ctx,
-    )) as any;
-    expect(second.isError).toBeFalsy();
-    const byContent = new Map(second.tasks.map((t: any) => [t.content, t]));
-    expect((byContent.get('design') as any).status).toBe('completed');
-    expect((byContent.get('build') as any).status).toBe('in_progress');
-
-    // Durable: exactly 3 rows (no duplicates), matched-by-content updates applied.
-    const stored = await session._internalStorage.listPlanTasks({ sessionId: session.id, limit: 50 });
-    expect(stored.tasks).toHaveLength(3);
-    const storedByContent = new Map(stored.tasks.map(t => [t.content, t]));
-    expect(storedByContent.get('design')!.status).toBe('completed');
-    expect(storedByContent.get('build')!.status).toBe('in_progress');
 
     release();
     await turn;
@@ -360,6 +337,40 @@ describe('plan-task concurrent-write serialization (§5.8 / TM-5)', () => {
 
     release();
     await turn;
+  });
+
+  it('rejects a stale task mutation admitted while a conversation reset owns the write barrier', async () => {
+    const { harness, agent } = setupHarness();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    let releaseTurn!: () => void;
+    agent.enqueueRun({ holdUntil: new Promise<void>(resolve => (releaseTurn = resolve)), finishReason: 'stop' });
+    const turn = session.message({ content: 'go' });
+    await vitestPoll(() => agent.streamCalls.length > 0);
+
+    const tools = createPlanTaskTools(session);
+    const ctx = {
+      abortSignal: new AbortController().signal,
+      agent: { toolCallId: 'tc-reset-race', runId: 'mock-run' },
+      requestContext: { get: () => undefined },
+    } as any;
+    await tools[TASK_ADD_TOOL_ID]!.execute!({ content: 'discarded root' } as any, ctx);
+
+    let releaseWriteChain!: () => void;
+    (session as any)._flushChain = new Promise<void>(resolve => (releaseWriteChain = resolve));
+    const reset = session.resetPlanTasks({ reason: 'message_edited' });
+    await Promise.resolve();
+
+    const stale = (await tools[TASK_ADD_TOOL_ID]!.execute!({ content: 'must not resurrect' } as any, ctx)) as any;
+    expect(stale).toMatchObject({ isError: true, errorName: 'HarnessBusyError' });
+
+    releaseWriteChain();
+    await reset;
+    const stored = await session._internalStorage.listPlanTasks({ sessionId: session.id, limit: 50 });
+    expect(stored.tasks).toHaveLength(0);
+
+    releaseTurn();
+    await turn;
+    await harness.shutdown();
   });
 });
 

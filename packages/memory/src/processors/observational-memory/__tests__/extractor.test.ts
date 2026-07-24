@@ -222,6 +222,104 @@ describe('Extractor', () => {
     expect(buildExtractorOutputSections([resolved!])).toBe('');
   });
 
+  it('keeps successful extractors when one user resolver rejects and records a sanitized slug failure', async () => {
+    const rawSecret = 'resolver-secret-must-not-leak';
+    const good = new Extractor({
+      name: 'Good Profile',
+      instructions: async () => 'Extract the profile.',
+    });
+    const bad = new Extractor({
+      name: 'Bad Profile',
+      instructions: async () => {
+        throw new Error(rawSecret);
+      },
+    });
+    const failures: Array<{ slug: string; error: string }> = [];
+
+    const resolved = await resolveExtractors([bad, good], { source: 'observer' }, failure => failures.push(failure));
+
+    expect(resolved.map(extractor => extractor.slug)).toEqual(['good-profile']);
+    expect(failures).toEqual([
+      {
+        slug: 'bad-profile',
+        error: 'Extractor "Bad Profile" resolver failed.',
+      },
+    ]);
+    expect(JSON.stringify(failures)).not.toContain(rawSecret);
+  });
+
+  it('does not downgrade extractor abort control flow into a recoverable resolver failure', async () => {
+    const aborted = new Extractor({
+      name: 'Aborted',
+      instructions: async () => {
+        throw new DOMException('aborted', 'AbortError');
+      },
+    });
+    const failures: Array<{ slug: string; error: string }> = [];
+
+    await expect(
+      resolveExtractors([aborted], { source: 'observer' }, failure => failures.push(failure)),
+    ).rejects.toMatchObject({ name: 'AbortError' });
+    expect(failures).toEqual([]);
+  });
+
+  it('rejects an extractor abort without waiting for an unrelated resolver', async () => {
+    let releasePending!: (value: string) => void;
+    const pending = new Extractor({
+      name: 'Pending',
+      instructions: () => new Promise<string>(resolve => (releasePending = resolve)),
+    });
+    const aborted = new Extractor({
+      name: 'Aborted',
+      instructions: async () => {
+        throw new DOMException('aborted', 'AbortError');
+      },
+    });
+    const failures: Array<{ slug: string; error: string }> = [];
+
+    const outcome = await Promise.race([
+      resolveExtractors([pending, aborted], { source: 'observer' }, failure => failures.push(failure)).then(
+        () => ({ status: 'resolved' as const }),
+        error => ({ status: 'rejected' as const, error }),
+      ),
+      new Promise<{ status: 'timed-out' }>(resolve => setTimeout(() => resolve({ status: 'timed-out' }), 100)),
+    ]);
+    releasePending('Resolve after the abort has propagated.');
+
+    expect(outcome).toMatchObject({ status: 'rejected', error: { name: 'AbortError' } });
+    expect(failures).toEqual([]);
+  });
+
+  it('rejects an internal extractor failure without waiting for an unrelated resolver', async () => {
+    let releasePending!: (value: string) => void;
+    const pending = new Extractor({
+      name: 'Pending',
+      instructions: () => new Promise<string>(resolve => (releasePending = resolve)),
+    });
+    const internal = new Extractor(
+      {
+        name: 'Internal State',
+        instructions: async () => {
+          throw new Error('internal invariant failed');
+        },
+      },
+      true,
+    );
+    const failures: Array<{ slug: string; error: string }> = [];
+
+    const outcome = await Promise.race([
+      resolveExtractors([pending, internal], { source: 'observer' }, failure => failures.push(failure)).then(
+        () => ({ status: 'resolved' as const }),
+        error => ({ status: 'rejected' as const, error }),
+      ),
+      new Promise<{ status: 'timed-out' }>(resolve => setTimeout(() => resolve({ status: 'timed-out' }), 100)),
+    ]);
+    releasePending('Resolve after the invariant failure has propagated.');
+
+    expect(outcome).toMatchObject({ status: 'rejected', error: { message: 'internal invariant failed' } });
+    expect(failures).toEqual([]);
+  });
+
   it('passes the active memory instance to extractor hooks', async () => {
     const onExtracted = vi.fn((_context: { memory?: unknown }) => undefined);
     const memory = { marker: 'active-memory' } as any;
@@ -312,6 +410,84 @@ describe('Extractor', () => {
     });
     expect(result.values).toEqual({ 'working-memory': { location: 'Toronto' } });
     expect(buildThreadMetadataFromExtractedValues([resolved!], result.values)).toEqual({});
+  });
+
+  it('resolves the configured zod working-memory schema and prunes factless keys before persisting', async () => {
+    const configuredSchema = z.object({
+      name: z.string().nullable(),
+      likes: z.array(z.string()),
+    });
+    const memory = {
+      getMergedThreadConfig: vi.fn(() => ({ workingMemory: { enabled: true, schema: configuredSchema } })),
+      getWorkingMemoryTemplate: vi.fn(async () => ({ format: 'json', content: '{"type":"object"}' })),
+      getWorkingMemory: vi.fn(async () => null),
+      updateWorkingMemory: vi.fn(async () => undefined),
+    } as any;
+    const extractor = new WorkingMemoryExtractor();
+    const [resolved] = await resolveExtractors([extractor], {
+      source: 'observer',
+      threadId: 'thread-1',
+      resourceId: 'resource-1',
+      memory,
+    });
+
+    // The structured-output schema must be the CONFIGURED schema (declared
+    // properties drive provider constrained decoding), nullable for the
+    // no-update sentinel — not a generic properties-less record.
+    expect(resolved?.mode).toBe('structured');
+    expect(resolved?.schema.parse(null)).toBeNull();
+    expect(resolved?.schema.parse({ name: 'Tyler', likes: [] })).toEqual({ name: 'Tyler', likes: [] });
+    expect(resolved?.schema.safeParse({ name: 42 }).success).toBe(false);
+
+    const result = await applyExtractorHooks({
+      source: 'observer',
+      extractors: [resolved!],
+      values: { 'working-memory': { name: 'Tyler', likes: [] } },
+      threadId: 'thread-1',
+      resourceId: 'resource-1',
+      memory,
+    });
+
+    // Required-but-nullable fields decode on every call; only keys carrying
+    // facts may reach storage.
+    expect(memory.updateWorkingMemory).toHaveBeenCalledWith({
+      threadId: 'thread-1',
+      resourceId: 'resource-1',
+      workingMemory: JSON.stringify({ name: 'Tyler' }),
+      memoryConfig: undefined,
+    });
+    expect(result.values).toEqual({ 'working-memory': { name: 'Tyler', likes: [] } });
+  });
+
+  it('never overwrites stored working memory with a factless document', async () => {
+    const configuredSchema = z.object({
+      name: z.string().nullable(),
+      likes: z.array(z.string()),
+    });
+    const memory = {
+      getMergedThreadConfig: vi.fn(() => ({ workingMemory: { enabled: true, schema: configuredSchema } })),
+      getWorkingMemoryTemplate: vi.fn(async () => ({ format: 'json', content: '{"type":"object"}' })),
+      getWorkingMemory: vi.fn(async () => '{"name":"Tyler"}'),
+      updateWorkingMemory: vi.fn(async () => undefined),
+    } as any;
+    const extractor = new WorkingMemoryExtractor();
+    const [resolved] = await resolveExtractors([extractor], {
+      source: 'observer',
+      threadId: 'thread-1',
+      resourceId: 'resource-1',
+      memory,
+    });
+
+    await applyExtractorHooks({
+      source: 'observer',
+      extractors: [resolved!],
+      values: { 'working-memory': { name: null, likes: [] } },
+      threadId: 'thread-1',
+      resourceId: 'resource-1',
+      memory,
+    });
+
+    expect(memory.updateWorkingMemory).not.toHaveBeenCalled();
   });
 
   it('skips JSON working memory updates when the extractor returns null', async () => {

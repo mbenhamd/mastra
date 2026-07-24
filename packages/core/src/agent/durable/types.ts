@@ -30,10 +30,12 @@ import type { ChunkType } from '../../stream/types';
 import type {
   CoreTool,
   RequireToolApproval,
+  TerminalToolResult,
   ToolHooks,
   ToolPayloadTransformPolicy,
   ToolPayloadTransformTarget,
 } from '../../tools/types';
+import type { WorkflowTerminalCanonicalJsonValue } from '../../workflows/terminal-recovery/types';
 import type { Workspace } from '../../workspace';
 import type { AgentExecutionOptions } from '../agent.types';
 import type { MessageList } from '../message-list';
@@ -60,6 +62,8 @@ export interface SerializableToolMetadata {
   hasSuspendSchema?: boolean;
   /** Opaque binding to the resolved implementation and recovery-relevant schemas. */
   recoveryFingerprint?: string;
+  /** Opaque binding to the terminal-result policy, including its predicates and projection. */
+  terminalResultFingerprint?: string;
 }
 
 /**
@@ -125,6 +129,8 @@ export type SerializableScorersConfig = Record<string, SerializableScorerEntry>;
  * Serializable subset of _internal (StreamInternal) that flows through workflow state
  */
 export interface SerializableDurableState {
+  /** Whether this run resolved a memory backend during preparation */
+  memoryConfigured?: boolean;
   /** Memory configuration options */
   memoryConfig?: MemoryConfig;
   /** Thread identifier for memory persistence */
@@ -203,6 +209,13 @@ export interface SerializableDurableOptions {
   modelSettings?: SerializableModelSettings;
   /** Whether to require tool approval globally */
   requireToolApproval?: boolean;
+  /**
+   * A host installed a live per-tool permission evaluator for this execution.
+   * The evaluator is deliberately not serialized. Durable action/resume steps
+   * must find a freshly reconstructed evaluator when this marker is true and
+   * fail closed when they cannot.
+   */
+  permissionPolicyRequired?: boolean;
   /** Concurrency limit for parallel tool calls */
   toolCallConcurrency?: number;
   /** Whether to auto-resume suspended tools */
@@ -314,6 +327,11 @@ export interface DurableAgenticWorkflowInput {
    * Only plain JSON-safe entries should appear here.
    */
   requestContextEntries?: Record<string, unknown>;
+  /** Ephemeral trusted capabilities that were present but were never serialized. */
+  requiredRequestContextCapabilities?: {
+    /** A fresh raw server auth token must be supplied by the trusted caller after process loss. */
+    authToken?: true;
+  };
 }
 
 /**
@@ -415,6 +433,10 @@ export interface DurableToolCallOutput extends DurableToolCallInput {
     approved: boolean;
     reason?: string;
   };
+  /** Result was produced after resuming an in-tool suspension. */
+  resumedFromSuspension?: true;
+  /** Framework execution disposition. Denied calls can never become terminal results. */
+  disposition?: 'denied';
   /** A delegation completion hook called bail() while this tool executed. */
   delegationBailed?: boolean;
 }
@@ -447,6 +469,10 @@ export interface DurableAgenticExecutionOutput {
   backgroundTaskPending?: boolean;
   /** Whether a delegation hook called ctx.bail() during this iteration */
   delegationBailed?: boolean;
+  /** Bounded successful tool result that may end the durable run without another model call. */
+  terminalToolResult?: TerminalToolResult<WorkflowTerminalCanonicalJsonValue>;
+  /** Deferred intermediate step-finish chunk, emitted after terminal/signal resolution. */
+  deferredStepFinishChunk?: unknown;
 }
 
 /**
@@ -467,6 +493,8 @@ export interface DurableAgenticLoopOutput {
   };
   /** Final state */
   state: SerializableDurableState;
+  /** Bounded successful tool result that ended the durable run, if any. */
+  terminalToolResult?: TerminalToolResult<WorkflowTerminalCanonicalJsonValue>;
 }
 
 /**
@@ -513,6 +541,10 @@ export interface AgentStepFinishEventData {
 export interface AgentFinishEventData {
   output: DurableAgenticLoopOutput['output'];
   stepResult: DurableLLMStepOutput['stepResult'];
+  /** Authoritative terminal envelope repeated on FINISH so offset replay cannot lose it. */
+  terminalToolResult?: { id: string; data: TerminalToolResult<WorkflowTerminalCanonicalJsonValue> };
+  /** Final step-finish chunk committed atomically with a terminal result. */
+  terminalStepFinishChunk?: AgentChunkEventData;
 }
 
 /**

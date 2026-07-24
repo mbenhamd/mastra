@@ -701,10 +701,15 @@ describe('DurableAgent memory edge cases', () => {
       for await (const _chunk of result.fullStream as AsyncIterable<any>) {
       }
 
-      const thread = await mockMemory.getThreadById({ threadId: 'thread-title' });
-      expect(thread?.title).toBe('Generated Thread Title');
-      expect(onTitleGenerated).toHaveBeenCalledOnce();
-      expect(onTitleGenerated).toHaveBeenCalledWith('Generated Thread Title');
+      // FINISH closes the caller-visible stream before optional title generation.
+      // Observe the post-finish side effect eventually instead of making title
+      // model latency part of the response contract.
+      await vi.waitFor(async () => {
+        const thread = await mockMemory.getThreadById({ threadId: 'thread-title' });
+        expect(thread?.title).toBe('Generated Thread Title');
+        expect(onTitleGenerated).toHaveBeenCalledOnce();
+        expect(onTitleGenerated).toHaveBeenCalledWith('Generated Thread Title');
+      });
       result.cleanup();
     });
 

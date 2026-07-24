@@ -105,10 +105,12 @@ admitted:
   goals to `GoalState`, mode/model and model-pack choices to session runtime
   settings, subagent model choices to session subagent model overrides,
   project/sandbox paths to workspace/session state, and app-owned display
-  metadata only to `thread.metadata.app`. OM migration is per-key: session-local
-  observer/reflector/threshold choices move to
-  `SessionRecord.observationalMemory`, while global MastraCode settings remain
-  bootstrap defaults and raw OM rows remain owned by MemoryStorage.
+  metadata only to `thread.metadata.app`. OM migration does not create
+  per-session Harness overrides: Observer/Reflector/scope/threshold choices move
+  to the Agent Memory configuration and raw OM rows remain owned by
+  MemoryStorage. Existing `SessionRecord.observationalMemory` values are
+  unsupported legacy recovery input and are cleared with
+  `session.om.clearOverride()` after hydration parks admitted work.
 - Plan/build/fast are MastraCode mode names and model-pack choices, not model
   identity by themselves. Session settings must store the selected mode id and
   resolved model id, and may store the product-local pack id/name as app-owned

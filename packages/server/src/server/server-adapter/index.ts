@@ -778,6 +778,10 @@ export abstract class MastraServer<TApp, TRequest, TResponse> extends MastraServ
   abstract registerHttpLoggingMiddleware(): void;
 
   async init() {
+    // Route registration makes the process externally reachable. Complete
+    // Harness/channel readiness first so a failed runtime cannot expose a
+    // partially initialized API surface.
+    await this.mastra.init();
     this.registerContextMiddleware();
     this.registerAuthMiddleware();
     this.registerHttpLoggingMiddleware();

@@ -77,3 +77,12 @@ export { CacheKeyGenerator } from './cache';
 
 // Merge exports
 export { MessageMerger } from './merge';
+
+export {
+  createTerminalToolResultPartId,
+  MAX_TERMINAL_TOOL_RESULT_ENVELOPE_BYTES,
+  MAX_TERMINAL_TOOL_RESULT_MODEL_TEXT_BYTES,
+  formatTerminalToolResultForModel,
+  materializeTerminalToolResult,
+  tryFormatTerminalToolResultForModel,
+} from './terminal-tool-result';

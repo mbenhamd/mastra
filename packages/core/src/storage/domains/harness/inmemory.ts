@@ -26,6 +26,7 @@ import {
   HarnessStorageVersionConflictError,
   HarnessStorageWakeupClaimConflictError,
   HarnessStorageWakeupTransitionError,
+  normalizePendingInteractionDueScanInput,
 } from './base';
 import type {
   CompareAndSwapSignalDispatchInput,
@@ -36,6 +37,7 @@ import type {
 } from './base';
 import {
   applyPlanTaskPatch,
+  assertPlanTaskCreateIdempotencyInput,
   comparePlanTaskOrder,
   decodePlanTaskCursor,
   encodePlanTaskCursor,
@@ -46,7 +48,6 @@ import type {
   AcquireSessionLeaseInput,
   AgentSignalResultEvidence,
   AgentSignalDispatchState,
-  AgentSignalResultStatus,
   AppendWorkspaceActionJournalEntryResult,
   AttachmentReference,
   AttachmentRecord,
@@ -95,6 +96,8 @@ import type {
   HarnessWakeupItem,
   ListActiveSessionsByThreadInput,
   ListChannelDiagnosticsInput,
+  ListDuePendingInteractionsInput,
+  ListDuePendingInteractionsResult,
   ListSessionsByThreadInput,
   ListSessionsInput,
   ListWorkspaceActionJournalInput,
@@ -102,6 +105,7 @@ import type {
   JsonValue,
   OperationAdmissionEvidence,
   OperationAdmissionTombstone,
+  PendingResume,
   ProviderCallbackSelectorKind,
   QueueAdmissionReceipt,
   ReleaseSessionLeaseInput,
@@ -117,6 +121,7 @@ import type {
   SubtreeSessionLeaseResult,
   SessionRecord,
   SessionSummary,
+  PendingInteractionExpiryGeneration,
   ThreadDeleteFenceLease,
   WithThreadDeleteFenceInput,
   WorkspaceActionJournalEntry,
@@ -233,6 +238,51 @@ export class InMemoryHarness extends HarnessStorage {
     }
     matched.sort((a, b) => b.lastActivityAt - a.lastActivityAt);
     return matched.map(toSummary);
+  }
+
+  async listDuePendingInteractions(input: ListDuePendingInteractionsInput): Promise<ListDuePendingInteractionsResult> {
+    const { now, limit, cursor } = normalizePendingInteractionDueScanInput(input);
+    const namespace = resolveHarnessName(input.harnessName, this.harnessName);
+    const due: PendingInteractionExpiryGeneration[] = [];
+
+    for (const record of this.db.harnessSessions.values()) {
+      if (record.harnessName !== namespace || record.closedAt !== undefined) continue;
+      const pending = record.pendingResume;
+      if (!isDueScannablePendingResume(pending)) {
+        continue;
+      }
+      const dueAt = pendingResumeDueAt(pending);
+      if (dueAt > now) continue;
+      if (cursor !== undefined && (dueAt < cursor.dueAt || (dueAt === cursor.dueAt && record.id <= cursor.sessionId))) {
+        continue;
+      }
+      due.push({
+        harnessName: record.harnessName,
+        sessionId: record.id,
+        resourceId: record.resourceId,
+        kind: pending.kind,
+        itemId: pending.itemId,
+        runId: pending.runId,
+        toolCallId: pending.toolCallId,
+        requestedAt: pending.requestedAt,
+        dueAt,
+        expiresAt: pending.expiresAt,
+        ...(pending.expiryStartedAt !== undefined ? { expiryStartedAt: pending.expiryStartedAt } : {}),
+        ...(pending.resumedAt !== undefined ? { resumedAt: pending.resumedAt } : {}),
+        ...(pending.resumeRecoveryAt !== undefined ? { resumeRecoveryAt: pending.resumeRecoveryAt } : {}),
+        ...(pending.resumeRecoveryStartedAt !== undefined
+          ? { resumeRecoveryStartedAt: pending.resumeRecoveryStartedAt }
+          : {}),
+      });
+    }
+
+    due.sort((a, b) => a.dueAt - b.dueAt || compareStrings(a.sessionId, b.sessionId));
+    const page = due.slice(0, limit);
+    const last = page.at(-1);
+    return {
+      items: page.map(cloneJson),
+      ...(due.length > limit && last ? { nextCursor: { dueAt: last.dueAt, sessionId: last.sessionId } } : {}),
+    };
   }
 
   async withThreadDeleteFence<T>(
@@ -835,7 +885,7 @@ export class InMemoryHarness extends HarnessStorage {
     resourceId: string;
     threadId: string;
     signalId: string;
-  }): Promise<AgentSignalResultStatus | OperationAdmissionTombstone | null> {
+  }): Promise<AgentSignalResultEvidence | OperationAdmissionTombstone | null> {
     const namespace = resolveHarnessName(harnessName, this.harnessName);
     const retained = this.db.harnessMessageResultEvidence.get(messageEvidenceKey(namespace, sessionId, signalId));
     if (retained && retained.resourceId === resourceId && retained.threadId === threadId) {
@@ -860,6 +910,31 @@ export class InMemoryHarness extends HarnessStorage {
     };
     const key = messageEvidenceKey(namespacedRecord.harnessName, namespacedRecord.sessionId, namespacedRecord.signalId);
     const existing = this.db.harnessMessageResultEvidence.get(key);
+    if (existing === undefined && namespacedRecord.admissionId !== undefined) {
+      // Admission uniqueness is per scoped (resource, thread, admissionId),
+      // not per signalId: evidence written before a signal-identity or
+      // admission-hash scheme change lives under a legacy signalId this key
+      // never sees. Surface it as a storage admission conflict so the caller's
+      // duplicate resolver (which knows the legacy-compatible hashes)
+      // adjudicates replay vs conflict. The same caller-minted admission id may
+      // legitimately occur in another thread, so it must not collide here.
+      for (const row of this.db.harnessMessageResultEvidence.values()) {
+        if (
+          row.harnessName === namespacedRecord.harnessName &&
+          row.sessionId === namespacedRecord.sessionId &&
+          row.resourceId === namespacedRecord.resourceId &&
+          row.threadId === namespacedRecord.threadId &&
+          row.admissionId === namespacedRecord.admissionId &&
+          row.signalId !== namespacedRecord.signalId
+        ) {
+          throw new HarnessStorageAdmissionConflictError(
+            namespacedRecord.sessionId,
+            'signal',
+            namespacedRecord.admissionId,
+          );
+        }
+      }
+    }
     if (existing && !sameMessageEvidenceIdentity(existing, namespacedRecord)) {
       throw new HarnessStorageAdmissionConflictError(
         namespacedRecord.sessionId,
@@ -2902,8 +2977,11 @@ export class InMemoryHarness extends HarnessStorage {
     const namespace = resolveHarnessName(fence.harnessName, this.harnessName);
     const session = this.db.harnessSessions.get(sessionKey(namespace, fence.sessionId));
     if (!session) throw new HarnessStorageSessionNotFoundError(fence.sessionId);
-    // Lease check first — mirrors saveSession (the lease is the ownership token).
-    assertLeaseHolder(session, fence.ownerId);
+    // Unlike saveSession's reacquisition-friendly fence, a plan-task mutation is
+    // only authoritative while this exact owner still holds a live lease. An
+    // expired or released lease is not permission for the stale session object
+    // to keep mutating its durable plan tree.
+    assertUnexpiredLeaseHolder(session, fence.ownerId);
     if (session.version !== fence.ifSessionVersion) {
       throw new HarnessStorageVersionConflictError(fence.sessionId, fence.ifSessionVersion, session.version);
     }
@@ -2912,6 +2990,7 @@ export class InMemoryHarness extends HarnessStorage {
 
   async createPlanTask({ fence, task }: CreatePlanTaskInput): Promise<HarnessPlanTask> {
     const namespace = this.assertPlanTaskFence(fence);
+    assertPlanTaskCreateIdempotencyInput(task);
     // Idempotent retry: an existing task with the same idempotencyKey in this
     // session returns unchanged (§5.1k).
     if (task.idempotencyKey !== undefined) {
@@ -2995,6 +3074,7 @@ export class InMemoryHarness extends HarnessStorage {
     now: number,
   ): void {
     if (op.kind === 'create') {
+      assertPlanTaskCreateIdempotencyInput(op.task);
       if (op.task.idempotencyKey !== undefined) {
         for (const existing of working.values()) {
           if (existing.idempotencyKey === op.task.idempotencyKey) return; // idempotent no-op
@@ -3334,6 +3414,7 @@ function normalizePlanTask(task: HarnessPlanTask): HarnessPlanTask {
     version: task.version,
   };
   if (task.idempotencyKey !== undefined) next.idempotencyKey = task.idempotencyKey;
+  if (task.idempotencyInputHash !== undefined) next.idempotencyInputHash = task.idempotencyInputHash;
   if (task.parentTaskId !== undefined) next.parentTaskId = task.parentTaskId;
   if (task.activeForm !== undefined) next.activeForm = task.activeForm;
   if (task.priority !== undefined) next.priority = task.priority;
@@ -3383,6 +3464,53 @@ function cloneSessionRecord(record: SessionRecord): SessionRecord {
 
 function cloneJson<T>(value: T): T {
   return structuredClone(value);
+}
+
+function compareStrings(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+function isDueScannablePendingResume(
+  pending: PendingResume | undefined,
+): pending is PendingResume & { itemId: string } {
+  return (
+    pending !== undefined &&
+    isPendingResumeKind(pending.kind) &&
+    typeof pending.itemId === 'string' &&
+    pending.itemId.length > 0 &&
+    typeof pending.runId === 'string' &&
+    pending.runId.length > 0 &&
+    typeof pending.toolCallId === 'string' &&
+    pending.toolCallId.length > 0 &&
+    Number.isSafeInteger(pending.requestedAt) &&
+    pending.requestedAt >= 0 &&
+    Number.isSafeInteger(pending.expiresAt) &&
+    pending.expiresAt >= 0 &&
+    (pending.expiryStartedAt === undefined ||
+      (Number.isSafeInteger(pending.expiryStartedAt) && pending.expiryStartedAt >= 0)) &&
+    (pending.resumedAt === undefined
+      ? pending.resumeRecoveryAt === undefined && pending.resumeRecoveryStartedAt === undefined
+      : Number.isSafeInteger(pending.resumedAt) &&
+        pending.resumedAt >= 0 &&
+        Number.isSafeInteger(pending.resumeRecoveryAt) &&
+        pending.resumeRecoveryAt! >= pending.resumedAt &&
+        (pending.resumeRecoveryStartedAt === undefined ||
+          (Number.isSafeInteger(pending.resumeRecoveryStartedAt) && pending.resumeRecoveryStartedAt >= 0)))
+  );
+}
+
+function pendingResumeDueAt(pending: PendingResume & { itemId: string }): number {
+  return pending.resumedAt === undefined ? pending.expiresAt : pending.resumeRecoveryAt!;
+}
+
+function isPendingResumeKind(value: unknown): value is PendingResume['kind'] {
+  return (
+    value === 'tool-approval' ||
+    value === 'tool-suspension' ||
+    value === 'question' ||
+    value === 'plan-approval' ||
+    value === 'sandbox-access'
+  );
 }
 
 function sameTombstoneIdentity(a: OperationAdmissionTombstone, b: OperationAdmissionTombstone): boolean {
@@ -4346,6 +4474,13 @@ function assertLeaseHolder(existing: SessionRecord, ownerId: string): void {
   if (existing.leaseExpiresAt !== undefined && existing.leaseExpiresAt <= now) return;
   if (existing.ownerId === ownerId) return;
   throw new HarnessStorageLeaseConflictError(existing.id, existing.ownerId, existing.leaseExpiresAt ?? 0);
+}
+
+/** Plan-task writes require the caller to hold the current, unexpired lease. */
+function assertUnexpiredLeaseHolder(existing: SessionRecord, ownerId: string): void {
+  const leaseExpiresAt = existing.leaseExpiresAt ?? 0;
+  if (existing.ownerId === ownerId && leaseExpiresAt > Date.now()) return;
+  throw new HarnessStorageLeaseConflictError(existing.id, existing.ownerId ?? '<unowned>', leaseExpiresAt);
 }
 
 function assertDeleteGuard(record: SessionRecord, opts: DeleteSessionOptions): void {

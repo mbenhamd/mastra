@@ -1,4 +1,5 @@
 import type { MastraDBMessage, MessageList } from '@mastra/core/agent';
+import { tryFormatTerminalToolResultForModel } from '@mastra/core/agent/message-list';
 import { coreFeatures } from '@mastra/core/features';
 import type { MastraModelConfig } from '@mastra/core/llm';
 import { resolveModelConfig } from '@mastra/core/llm';
@@ -42,10 +43,13 @@ export function getLatestStepParts(parts: MastraDBMessage['content']['parts']): 
  * internal `data-*` parts (buffering markers, observation markers, etc.) return false.
  */
 function messageHasVisibleContent(msg: MastraDBMessage): boolean {
-  const content = msg.content as { parts?: Array<{ type?: string }>; content?: string };
+  const content = msg.content as { parts?: Array<{ type?: string; data?: unknown }>; content?: string };
   if (content?.parts && Array.isArray(content.parts)) {
     return content.parts.some(p => {
       const t = p?.type;
+      if (t === 'data-terminal-tool-result') {
+        return tryFormatTerminalToolResultForModel(p.data) !== undefined;
+      }
       return t && !t.startsWith('data-') && t !== 'step-start';
     });
   }
@@ -83,7 +87,14 @@ export function getLastActivityFromMessages(messages?: MastraDBMessage[]): numbe
 
     for (let j = message.content.parts.length - 1; j >= 0; j--) {
       const part = message.content.parts[j];
-      if (!part || part.type?.startsWith('data-')) {
+      if (!part) {
+        continue;
+      }
+      if (
+        part.type?.startsWith('data-') &&
+        (part.type !== 'data-terminal-tool-result' ||
+          tryFormatTerminalToolResultForModel((part as { data?: unknown }).data) === undefined)
+      ) {
         continue;
       }
 
@@ -215,6 +226,7 @@ import { registerOp, unregisterOp, isOpActiveInProcess } from './operation-regis
 import type { CompressionLevel } from './reflector-agent';
 import { ReflectorRunner } from './reflector-runner';
 import { isOmReproCaptureEnabled, writeObserverExchangeReproCapture } from './repro-capture';
+import { updateThreadFromObservationalMemory } from './storage-compat';
 import {
   calculateDynamicThreshold,
   calculateProjectedMessageRemoval,
@@ -291,6 +303,7 @@ export class ObservationalMemory {
     text: string;
     groupId: string;
     range: string;
+    recordId: string;
     threadId: string;
     resourceId: string;
     observedAt?: Date;
@@ -309,6 +322,7 @@ export class ObservationalMemory {
   private hasher = xxhash();
   private mastra?: Mastra;
   private memory?: Memory;
+  private readonly managedWorkingMemoryScope?: 'thread' | 'resource';
 
   /**
    * Track message IDs observed during this instance's lifetime.
@@ -340,13 +354,10 @@ export class ObservationalMemory {
    * If a lock is already held, waits for it to be released before acquiring.
    */
   private async withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
-    // Wait for any existing lock to be released
-    const existingLock = this.locks.get(key);
-    if (existingLock) {
-      await existingLock;
-    }
-
-    // Create a new lock
+    // Enqueue our lock before waiting for the predecessor. If multiple callers
+    // arrive while one owner is active, each caller must observe the previous
+    // queued tail rather than all waiting on the same active promise.
+    const predecessor = this.locks.get(key);
     let releaseLock: () => void;
     const lockPromise = new Promise<void>(resolve => {
       releaseLock = resolve;
@@ -354,6 +365,9 @@ export class ObservationalMemory {
     this.locks.set(key, lockPromise);
 
     try {
+      if (predecessor) {
+        await predecessor;
+      }
       return await fn();
     } finally {
       // Release the lock
@@ -391,6 +405,7 @@ export class ObservationalMemory {
     this.onIndexObservations = config.onIndexObservations;
     this.mastra = config.mastra;
     this.memory = config.memory;
+    this.managedWorkingMemoryScope = config.managedWorkingMemoryScope;
 
     // Resolve "default" to the model default for the agent being configured.
     const resolveModel = (model: ObservationalMemoryModel | undefined, defaultModel: string) =>
@@ -1068,6 +1083,7 @@ export class ObservationalMemory {
           observation: this.observationConfig,
           reflection: this.reflectionConfig,
           scope: this.scope,
+          ...(this.managedWorkingMemoryScope ? { _managedWorkingMemoryScope: this.managedWorkingMemoryScope } : {}),
         },
         observedTimezone,
       });
@@ -3344,7 +3360,7 @@ ${formattedMessages}
 
     // Update thread metadata with continuation hints from activated chunks
     const thread = await this.storage.getThreadById({ threadId });
-    if (thread) {
+    if (thread && postSwapRecord) {
       // Get hints from the most recent activated chunk
       const activatedChunks = freshChunks.filter(c => activationResult.activatedCycleIds.includes(c.cycleId));
       const lastActivated = activatedChunks[activatedChunks.length - 1];
@@ -3358,10 +3374,15 @@ ${formattedMessages}
         const oldTitle = thread.title?.trim();
         const newTitle = chunkThreadTitle?.trim();
         const shouldUpdateThreadTitle = !!newTitle && newTitle.length >= 3 && newTitle !== oldTitle;
-        await this.storage.updateThread({
+        await updateThreadFromObservationalMemory(this.storage, {
           id: threadId,
           title: shouldUpdateThreadTitle ? newTitle : (thread.title ?? ''),
           metadata: newMetadata,
+          guard: {
+            recordId: postSwapRecord.id,
+            threadId: postSwapRecord.threadId,
+            resourceId: postSwapRecord.resourceId,
+          },
         });
       }
     }
@@ -3513,10 +3534,17 @@ ${formattedMessages}
         priorExtractedValues,
         observabilityContext,
         undefined,
+        undefined,
+        undefined,
+        {
+          recordId: record.id,
+          threadId,
+          resourceId: record.resourceId ?? resourceId,
+        },
       );
       const reflectionTokenCount = this.tokenCounter.countObservations(reflectResult.observations);
 
-      await this.storage.createReflectionGeneration({
+      const reflectionRecord = await this.storage.createReflectionGeneration({
         currentRecord: record,
         reflection: reflectResult.observations,
         tokenCount: reflectionTokenCount,
@@ -3533,10 +3561,15 @@ ${formattedMessages}
           threadTitle: metadataUpdate.threadTitle ?? previousOmMetadata?.threadTitle,
           extracted: { ...(previousOmMetadata?.extracted ?? {}), ...(metadataUpdate.extracted ?? {}) },
         });
-        await this.storage.updateThread({
+        await updateThreadFromObservationalMemory(this.storage, {
           id: threadId,
           title: thread.title ?? '',
           metadata: newMetadata,
+          guard: {
+            recordId: reflectionRecord.id,
+            threadId: reflectionRecord.threadId,
+            resourceId: reflectionRecord.resourceId,
+          },
         });
       }
 

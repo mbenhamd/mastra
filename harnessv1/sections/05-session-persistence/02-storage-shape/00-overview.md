@@ -95,40 +95,27 @@ one registered Harness per physical namespace; Mastra Server boot fails if that
 adapter is shared by more than one Harness. This is a namespace requirement, not
 permission to create a second Harness-only message log.
 
-Observational-memory records stay in the configured memory domain. Harness reads
-them only through a session/resource-verified projection (`ObservationalMemorySnapshot`
-in §4.8) and never treats the raw OM row as a SessionRecord, operation result,
-receipt, or recovery boundary.
+Observational-memory records and effective configuration stay in the Agent
+Memory domain. Harness never treats a raw OM row as a SessionRecord, operation
+result, receipt, or recovery boundary, and it does not currently expose the
+proposed `ObservationalMemorySnapshot` projection. Enabled Harness OM config and
+per-session model switches reject; Agent Memory is the supported configuration
+surface.
 
-Raw OM rows used by Harness v1 must be scoped and addressable by a
-Harness-bound namespace plus `(resourceId, threadId)`, where `threadId: string`
-means thread-scoped OM and `threadId: null` means resource-scoped OM. This is an
-adapter namespace requirement, not a requirement to add `harnessName` to the
-canonical Memory/OM row model. A storage adapter may use a physical schema,
-table, key prefix, bound memory view, or explicit column if Memory itself adopts
-that ownership field; the important invariant is that reads, history reads, and
-cleanup isolate rows to the bound Harness namespace. The adapter supplies the
-namespace from the bound Harness storage view; it is not a caller-provided
-per-operation parameter.
+When lifecycle integration addresses raw OM rows, they must be scoped and
+addressable by the authenticated Memory resource/thread namespace. A storage
+adapter may use a physical schema, table, key prefix, bound memory view, or
+explicit column if Memory itself adopts that ownership field. This does not
+authorize a Harness-specific duplicate OM store or per-session config writer.
 
-If the adapter exposes thread delete through the Harness view, it must also
-remove or tombstone all OM rows and history scoped exactly to the deleted
-`(harnessName, resourceId, threadId)`. `clearObservationalMemory(threadId,
-resourceId)` or equivalent Harness cleanup must not delete rows from another
-Harness, another resource, or resource-scoped OM (`threadId: null`). A cleanup
-whose `threadId` is `null` targets only resource-scoped OM for that exact
-`(harnessName, resourceId)` and must not delete thread-scoped rows sharing the
-same resource. Resource-scoped OM is not removed by deleting one thread; any
-resource-level OM retention or deletion policy is product/operator-owned
-outside the v1 thread-delete lifecycle.
+If the adapter exposes thread delete through the Harness view, its authorized
+Memory cleanup must not delete another resource's rows or resource-scoped OM.
+Resource-level OM retention or deletion remains product/operator-owned outside
+the v1 thread-delete lifecycle.
 
-An adapter that cannot provide a Harness-scoped OM namespace may keep legacy OM
-outside Harness v1, but Harness must not expose those rows as
-`ObservationalMemorySnapshot` and must not claim thread-delete OM cleanup. If
-observational memory is enabled on more than one registered Harness sharing one
-physical namespace, an adapter that cannot isolate OM by `harnessName` fails
-Mastra Server boot for that configuration, mirroring the shared
-thread/message-log rule above.
+An adapter that cannot authorize and isolate Memory rows keeps OM outside
+Harness lifecycle integration. Harness must not expose those rows as an
+`ObservationalMemorySnapshot` or claim cleanup it cannot prove.
 
 Orientation diagram (storage surfaces only; method signatures below remain
 authoritative):

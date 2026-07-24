@@ -44,15 +44,16 @@ import {
   TABLE_HARNESS_WORKSPACE_ACTIONS,
   TABLE_SCHEMAS,
   applyPlanTaskPatch,
+  assertPlanTaskCreateIdempotencyInput,
   decodePlanTaskCursor,
   encodePlanTaskCursor,
+  normalizePendingInteractionDueScanInput,
   walkPlanTaskSubtree,
 } from '@mastra/core/storage';
 import type {
   AcquireSessionLeaseInput,
   AgentSignalDispatchState,
   AgentSignalResultEvidence,
-  AgentSignalResultStatus,
   AppendWorkspaceActionJournalEntryResult,
   AttachmentReference,
   AttachmentRecord,
@@ -100,6 +101,8 @@ import type {
   ListActiveChannelBindingsResult,
   ListActiveSessionsByThreadInput,
   ListChannelDiagnosticsInput,
+  ListDuePendingInteractionsInput,
+  ListDuePendingInteractionsResult,
   ListSessionsByThreadInput,
   ListSessionsInput,
   ListWorkspaceActionJournalInput,
@@ -107,6 +110,8 @@ import type {
   JsonValue,
   OperationAdmissionEvidence,
   OperationAdmissionTombstone,
+  PendingInteractionExpiryGeneration,
+  PendingResume,
   ProviderCallbackSelectorKind,
   QueueAdmissionReceipt,
   ReleaseSessionLeaseInput,
@@ -311,6 +316,12 @@ function harnessIndexDefs(schemaPrefix: string): CreateIndexOptions[] {
       name: harnessIndexName(schemaPrefix, 'idx_harness_sessions_parent'),
       table: TABLE_HARNESS_SESSIONS,
       columns: ['harness_name', 'parent_session_id'],
+    },
+    {
+      name: harnessIndexName(schemaPrefix, 'idx_harness_sessions_pending_resume_expiry'),
+      table: TABLE_HARNESS_SESSIONS,
+      columns: ['harness_name', 'pending_resume_expires_at', 'id'],
+      where: '"pending_resume_expires_at" IS NOT NULL',
     },
     {
       name: harnessIndexName(schemaPrefix, 'idx_harness_session_events_replay'),
@@ -669,8 +680,14 @@ export class HarnessPG extends HarnessStorage {
         'subagent_depth',
         'subagent_type_id',
         'subagent_tool_allowlist_scoped',
+        'permission_rules_seed_hash',
+        'current_run',
+        'assistant_drafts',
+        'cancel_request',
+        'pending_resume_expires_at',
         'queue_admission_receipts',
         'inbox_response_receipts',
+        'expired_pending_interactions',
         'closing_at',
         'close_deadline_at',
       ],
@@ -697,6 +714,7 @@ export class HarnessPG extends HarnessStorage {
       ifNotExists: ['harness_name'],
     });
     await this.#backfillHarnessNamespace();
+    await this.#backfillPendingResumeExpiry();
     if (!this.#skipDefaultIndexes) {
       await this.#assertNoDuplicateActiveSessions();
     }
@@ -892,6 +910,38 @@ export class HarnessPG extends HarnessStorage {
     });
 
     return result.rows.map(row => rowToSummary(row as Record<string, unknown>));
+  }
+
+  async listDuePendingInteractions(input: ListDuePendingInteractionsInput): Promise<ListDuePendingInteractionsResult> {
+    const { now, limit, cursor } = normalizePendingInteractionDueScanInput(input);
+    const conditions = [
+      'harness_name = ?',
+      'closed_at IS NULL',
+      'pending_resume_expires_at IS NOT NULL',
+      'pending_resume_expires_at <= ?',
+    ];
+    const args: (string | number)[] = [this.#resolveHarnessName(input.harnessName), now];
+    if (cursor !== undefined) {
+      conditions.push('(pending_resume_expires_at > ? OR (pending_resume_expires_at = ? AND id > ?))');
+      args.push(cursor.dueAt, cursor.dueAt, cursor.sessionId);
+    }
+    args.push(limit + 1);
+
+    const result = await this.#client.execute({
+      sql: `SELECT harness_name, id, resource_id, pending_resume, pending_resume_expires_at
+            FROM ${TABLE_HARNESS_SESSIONS}
+            WHERE ${conditions.join(' AND ')}
+            ORDER BY pending_resume_expires_at ASC, id ASC
+            LIMIT ?`,
+      args,
+    });
+    const generations = result.rows.map(row => rowToPendingInteractionExpiryGeneration(row as Record<string, unknown>));
+    const items = generations.slice(0, limit);
+    const last = items.at(-1);
+    return {
+      items,
+      ...(generations.length > limit && last ? { nextCursor: { dueAt: last.dueAt, sessionId: last.sessionId } } : {}),
+    };
   }
 
   async withThreadDeleteFence<T>(
@@ -1923,7 +1973,7 @@ export class HarnessPG extends HarnessStorage {
     resourceId: string;
     threadId: string;
     signalId: string;
-  }): Promise<AgentSignalResultStatus | OperationAdmissionTombstone | null> {
+  }): Promise<AgentSignalResultEvidence | OperationAdmissionTombstone | null> {
     const namespace = this.#resolveHarnessName(harnessName);
     await this.#ensureMessageResultsTable();
     const retainedResult = await this.#client.execute({
@@ -2481,10 +2531,11 @@ export class HarnessPG extends HarnessStorage {
     const ownerId = (row.owner_id ?? undefined) as string | undefined;
     const leaseExpiresAt = row.lease_expires_at == null ? undefined : Number(row.lease_expires_at);
     const now = Date.now();
-    // Lease check first — mirrors saveSession. An expired lease is no holder.
+    // Plan-task writes require this exact owner to hold a live lease. An
+    // expired/released lease is no authority for a stale session object.
     const leaseHeld = ownerId !== undefined && leaseExpiresAt !== undefined && leaseExpiresAt > now;
-    if (leaseHeld && ownerId !== fence.ownerId) {
-      throw new HarnessStorageLeaseConflictError(fence.sessionId, ownerId, leaseExpiresAt ?? 0);
+    if (!leaseHeld || ownerId !== fence.ownerId) {
+      throw new HarnessStorageLeaseConflictError(fence.sessionId, ownerId ?? '<unowned>', leaseExpiresAt ?? 0);
     }
     const version = Number(row.version);
     if (version !== fence.ifSessionVersion) {
@@ -2513,6 +2564,7 @@ export class HarnessPG extends HarnessStorage {
     sessionId: string,
     task: HarnessPlanTask,
   ): Promise<HarnessPlanTask> {
+    assertPlanTaskCreateIdempotencyInput(task);
     if (task.idempotencyKey !== undefined) {
       const existing = await tx.execute({
         sql: `SELECT * FROM ${TABLE_HARNESS_PLAN_TASKS}
@@ -5337,7 +5389,7 @@ export class HarnessPG extends HarnessStorage {
       await this.#db.alterTable({
         tableName: TABLE_HARNESS_PLAN_TASKS,
         schema: TABLE_SCHEMAS[TABLE_HARNESS_PLAN_TASKS],
-        ifNotExists: ['delegated_subagent_type_id', 'started_at'],
+        ifNotExists: ['delegated_subagent_type_id', 'started_at', 'idempotency_input_hash'],
       });
       await this.#createDefaultIndexes(['idx_harness_plan_tasks_order']);
       await this.#createDefaultIndexes(['idx_harness_plan_tasks_idempotency']);
@@ -5598,6 +5650,74 @@ export class HarnessPG extends HarnessStorage {
     }
   }
 
+  async #backfillPendingResumeExpiry(): Promise<void> {
+    // The scalar is discovery-only and stores the row's next durable action:
+    // unanswered interaction expiry or admitted-resume stale recovery.
+    await this.#client.execute({
+      sql: `UPDATE ${TABLE_HARNESS_SESSIONS}
+            SET pending_resume_expires_at = NULL
+            WHERE pending_resume_expires_at IS NOT NULL
+              AND (
+                closed_at IS NOT NULL
+                OR pending_resume IS NULL
+                OR COALESCE(jsonb_typeof(pending_resume->'itemId'), '') <> 'string'
+                OR COALESCE(pending_resume->>'itemId', '') = ''
+                OR (
+                  pending_resume->>'resumedAt' IS NULL
+                  AND (
+                    COALESCE(jsonb_typeof(pending_resume->'expiresAt'), '') <> 'number'
+                    OR COALESCE(pending_resume->>'expiresAt', '') !~ '^[0-9]+$'
+                    OR CAST(pending_resume->>'expiresAt' AS NUMERIC) > 9007199254740991
+                  )
+                )
+                OR (
+                  pending_resume->>'resumedAt' IS NOT NULL
+                  AND (
+                    COALESCE(jsonb_typeof(pending_resume->'resumedAt'), '') <> 'number'
+                    OR COALESCE(pending_resume->>'resumedAt', '') !~ '^[0-9]+$'
+                    OR CAST(pending_resume->>'resumedAt' AS NUMERIC) > 9007199254740991
+                    OR COALESCE(jsonb_typeof(pending_resume->'resumeRecoveryAt'), '') <> 'number'
+                    OR COALESCE(pending_resume->>'resumeRecoveryAt', '') !~ '^[0-9]+$'
+                    OR CAST(pending_resume->>'resumeRecoveryAt' AS NUMERIC)
+                      NOT BETWEEN CAST(pending_resume->>'resumedAt' AS NUMERIC) AND 9007199254740991
+                  )
+                )
+              )`,
+      args: [],
+    });
+    await this.#client.execute({
+      sql: `UPDATE ${TABLE_HARNESS_SESSIONS}
+            SET pending_resume_expires_at = CASE
+              WHEN pending_resume->>'resumedAt' IS NULL
+                THEN CAST(pending_resume->>'expiresAt' AS BIGINT)
+              ELSE CAST(pending_resume->>'resumeRecoveryAt' AS BIGINT)
+            END
+            WHERE pending_resume_expires_at IS NULL
+              AND closed_at IS NULL
+              AND pending_resume IS NOT NULL
+              AND jsonb_typeof(pending_resume->'itemId') = 'string'
+              AND pending_resume->>'itemId' <> ''
+              AND (
+                (
+                  pending_resume->>'resumedAt' IS NULL
+                  AND jsonb_typeof(pending_resume->'expiresAt') = 'number'
+                  AND pending_resume->>'expiresAt' ~ '^[0-9]+$'
+                  AND CAST(pending_resume->>'expiresAt' AS NUMERIC) <= 9007199254740991
+                )
+                OR (
+                  jsonb_typeof(pending_resume->'resumedAt') = 'number'
+                  AND pending_resume->>'resumedAt' ~ '^[0-9]+$'
+                  AND CAST(pending_resume->>'resumedAt' AS NUMERIC) <= 9007199254740991
+                  AND jsonb_typeof(pending_resume->'resumeRecoveryAt') = 'number'
+                  AND pending_resume->>'resumeRecoveryAt' ~ '^[0-9]+$'
+                  AND CAST(pending_resume->>'resumeRecoveryAt' AS NUMERIC)
+                    BETWEEN CAST(pending_resume->>'resumedAt' AS NUMERIC) AND 9007199254740991
+                )
+              )`,
+      args: [],
+    });
+  }
+
   async #assertNoDuplicateActiveSessions(): Promise<void> {
     const result = await this.#client.execute({
       sql: `SELECT harness_name, resource_id, thread_id, COUNT(*) AS duplicate_count
@@ -5662,12 +5782,17 @@ const SESSION_COLUMN_NAMES = [
   'model_id',
   'subagent_model_overrides',
   'permission_rules',
+  'permission_rules_seed_hash',
   'session_grants',
   'token_usage',
   'pending_queue',
   'pending_resume',
+  'current_run',
+  'assistant_drafts',
+  'pending_resume_expires_at',
   'queue_admission_receipts',
   'inbox_response_receipts',
+  'expired_pending_interactions',
   'observational_memory',
   'goal',
   'workspace',
@@ -5680,7 +5805,87 @@ const SESSION_COLUMN_NAMES = [
   'version',
   'owner_id',
   'lease_expires_at',
+  'cancel_request',
 ] as const;
+
+function pendingResumeExpiryIndexValue(record: SessionRecord): number | null {
+  const pending = record.pendingResume;
+  if (record.closedAt !== undefined || !isDueScannablePendingResume(pending)) {
+    return null;
+  }
+  return pendingResumeDueAt(pending);
+}
+
+function rowToPendingInteractionExpiryGeneration(row: Record<string, unknown>): PendingInteractionExpiryGeneration {
+  const pending = parseJson(row.pending_resume) as PendingResume | undefined;
+  const indexedExpiresAt = Number(row.pending_resume_expires_at);
+  if (!isDueScannablePendingResume(pending) || pendingResumeDueAt(pending) !== indexedExpiresAt) {
+    throw new Error(
+      `Corrupt pending-interaction expiry index for harness "${String(row.harness_name)}" session "${String(row.id)}"`,
+    );
+  }
+  return {
+    harnessName: String(row.harness_name),
+    sessionId: String(row.id),
+    resourceId: String(row.resource_id),
+    kind: pending.kind,
+    itemId: pending.itemId,
+    runId: pending.runId,
+    toolCallId: pending.toolCallId,
+    requestedAt: pending.requestedAt,
+    dueAt: indexedExpiresAt,
+    expiresAt: pending.expiresAt,
+    ...(pending.expiryStartedAt !== undefined ? { expiryStartedAt: pending.expiryStartedAt } : {}),
+    ...(pending.resumedAt !== undefined ? { resumedAt: pending.resumedAt } : {}),
+    ...(pending.resumeRecoveryAt !== undefined ? { resumeRecoveryAt: pending.resumeRecoveryAt } : {}),
+    ...(pending.resumeRecoveryStartedAt !== undefined
+      ? { resumeRecoveryStartedAt: pending.resumeRecoveryStartedAt }
+      : {}),
+  };
+}
+
+function isDueScannablePendingResume(
+  pending: PendingResume | undefined,
+): pending is PendingResume & { itemId: string } {
+  return (
+    pending !== undefined &&
+    isPendingResumeKind(pending.kind) &&
+    typeof pending.itemId === 'string' &&
+    pending.itemId.length > 0 &&
+    typeof pending.runId === 'string' &&
+    pending.runId.length > 0 &&
+    typeof pending.toolCallId === 'string' &&
+    pending.toolCallId.length > 0 &&
+    Number.isSafeInteger(pending.requestedAt) &&
+    pending.requestedAt >= 0 &&
+    Number.isSafeInteger(pending.expiresAt) &&
+    pending.expiresAt >= 0 &&
+    (pending.expiryStartedAt === undefined ||
+      (Number.isSafeInteger(pending.expiryStartedAt) && pending.expiryStartedAt >= 0)) &&
+    (pending.resumedAt === undefined
+      ? pending.resumeRecoveryAt === undefined && pending.resumeRecoveryStartedAt === undefined
+      : Number.isSafeInteger(pending.resumedAt) &&
+        pending.resumedAt >= 0 &&
+        Number.isSafeInteger(pending.resumeRecoveryAt) &&
+        pending.resumeRecoveryAt! >= pending.resumedAt &&
+        (pending.resumeRecoveryStartedAt === undefined ||
+          (Number.isSafeInteger(pending.resumeRecoveryStartedAt) && pending.resumeRecoveryStartedAt >= 0)))
+  );
+}
+
+function pendingResumeDueAt(pending: PendingResume & { itemId: string }): number {
+  return pending.resumedAt === undefined ? pending.expiresAt : pending.resumeRecoveryAt!;
+}
+
+function isPendingResumeKind(value: unknown): value is PendingResume['kind'] {
+  return (
+    value === 'tool-approval' ||
+    value === 'tool-suspension' ||
+    value === 'question' ||
+    value === 'plan-approval' ||
+    value === 'sandbox-access'
+  );
+}
 
 function sessionColumnValues(record: SessionRecord, version: number): { names: string[]; values: any[] } {
   const values = [
@@ -5698,12 +5903,17 @@ function sessionColumnValues(record: SessionRecord, version: number): { names: s
     record.modelId,
     JSON.stringify(record.subagentModelOverrides ?? {}),
     JSON.stringify(record.permissionRules),
+    record.permissionRulesSeedHash ?? null,
     JSON.stringify(record.sessionGrants),
     JSON.stringify(record.tokenUsage),
     JSON.stringify(record.pendingQueue),
     record.pendingResume ? JSON.stringify(record.pendingResume) : null,
+    record.currentRun ? JSON.stringify(record.currentRun) : null,
+    record.assistantDrafts ? JSON.stringify(record.assistantDrafts) : null,
+    pendingResumeExpiryIndexValue(record),
     record.queueAdmissionReceipts ? JSON.stringify(record.queueAdmissionReceipts) : null,
     record.inboxResponseReceipts ? JSON.stringify(record.inboxResponseReceipts) : null,
+    record.expiredPendingInteractions ? JSON.stringify(record.expiredPendingInteractions) : null,
     record.observationalMemory ? JSON.stringify(record.observationalMemory) : null,
     record.goal ? JSON.stringify(record.goal) : null,
     record.workspace ? JSON.stringify(record.workspace) : null,
@@ -5716,6 +5926,7 @@ function sessionColumnValues(record: SessionRecord, version: number): { names: s
     version,
     record.ownerId ?? null,
     record.leaseExpiresAt ?? null,
+    record.cancelRequest ? JSON.stringify(record.cancelRequest) : null,
   ];
   return { names: [...SESSION_COLUMN_NAMES], values };
 }
@@ -6563,12 +6774,17 @@ function rowToSession(row: Record<string, unknown>): SessionRecord {
     modelId: String(row.model_id),
     subagentModelOverrides: parseJson(row.subagent_model_overrides) ?? {},
     permissionRules: parseJson(row.permission_rules) ?? { categories: {}, tools: {} },
+    permissionRulesSeedHash:
+      row.permission_rules_seed_hash != null ? String(row.permission_rules_seed_hash) : undefined,
     sessionGrants: parseJson(row.session_grants) ?? { categories: [], tools: [] },
     tokenUsage: parseJson(row.token_usage) ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
     pendingQueue: parseJson(row.pending_queue) ?? [],
     pendingResume: parseJson(row.pending_resume) ?? undefined,
+    currentRun: parseJson(row.current_run) ?? undefined,
+    assistantDrafts: parseJson(row.assistant_drafts) ?? undefined,
     queueAdmissionReceipts: parseJson(row.queue_admission_receipts) ?? undefined,
     inboxResponseReceipts: parseJson(row.inbox_response_receipts) ?? undefined,
+    expiredPendingInteractions: parseJson(row.expired_pending_interactions) ?? undefined,
     observationalMemory: parseJson(row.observational_memory) ?? undefined,
     goal: parseJson(row.goal) ?? undefined,
     workspace: parseJson(row.workspace) ?? undefined,
@@ -6581,6 +6797,7 @@ function rowToSession(row: Record<string, unknown>): SessionRecord {
     version: Number(row.version),
     ownerId: row.owner_id != null ? String(row.owner_id) : undefined,
     leaseExpiresAt: row.lease_expires_at != null ? Number(row.lease_expires_at) : undefined,
+    cancelRequest: parseJson(row.cancel_request) ?? undefined,
   };
 }
 
@@ -6807,6 +7024,7 @@ function rowToPlanTask(row: Record<string, unknown>): HarnessPlanTask {
     version: Number(row.version),
   };
   if (row.idempotency_key != null) task.idempotencyKey = String(row.idempotency_key);
+  if (row.idempotency_input_hash != null) task.idempotencyInputHash = String(row.idempotency_input_hash);
   if (row.parent_task_id != null) task.parentTaskId = String(row.parent_task_id);
   if (row.active_form != null) task.activeForm = String(row.active_form);
   if (row.priority != null) task.priority = Number(row.priority);
@@ -6830,6 +7048,7 @@ function planTaskColumnValues(task: HarnessPlanTask): { names: string[]; values:
     'session_id',
     'task_id',
     'idempotency_key',
+    'idempotency_input_hash',
     'resource_id',
     'thread_id',
     'parent_task_id',
@@ -6855,6 +7074,7 @@ function planTaskColumnValues(task: HarnessPlanTask): { names: string[]; values:
     task.sessionId,
     task.taskId,
     task.idempotencyKey ?? null,
+    task.idempotencyInputHash ?? null,
     task.resourceId,
     task.threadId,
     task.parentTaskId ?? null,
