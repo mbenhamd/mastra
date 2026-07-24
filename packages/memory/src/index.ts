@@ -990,15 +990,15 @@ export class Memory extends MastraMemory {
     try {
       // Adapters without the atomic capability delete a thread's messages
       // before the thread row, so a rejection can still have committed part of
-      // that cascade. Retract only once the transcript has actually changed:
-      // a surviving thread that never held messages committed nothing, and
-      // retracting would wipe the resource-scoped observational memory its
-      // sibling threads still depend on.
+      // that cascade. Retract only once the transcript has actually changed. A
+      // thread that never held messages committed nothing to retract — whether
+      // its row survived the rejection or its deletion had already committed
+      // (leaving persistedThread null) — and retracting would wipe the
+      // resource-scoped observational memory its sibling threads depend on, so
+      // guard on the pre-attempt transcript state before probing the row.
+      if (!threadHadMessages) return;
       const persistedThread = await memoryStore.getThreadById({ threadId: coordinate.threadId });
-      if (persistedThread) {
-        if (!threadHadMessages) return;
-        if (await memoryStore.hasMessages({ threadId: coordinate.threadId })) return;
-      }
+      if (persistedThread && (await memoryStore.hasMessages({ threadId: coordinate.threadId }))) return;
       await this.retractObservationalMemoryForCoordinates(memoryStore, [coordinate]);
     } catch {
       this.logger.debug('Failed to reconcile observational memory after a rejected non-atomic thread deletion');
