@@ -3680,6 +3680,98 @@ NODE
   assert_contains '--dir mastracode/sdk exec vitest run' "$command_log"
   assert_contains 'src/utils/__tests__/observation-index-input.test.ts' "$command_log"
 
+  # PF-2306: a guarded indexObservation call inside a for-of body is not
+  # guaranteed to execute under the guard the analysis reasons about (the loop
+  # runs zero or more times over an unbounded value), so the loop body counts as
+  # a disallowed, statically unreachable position. Without the for-of rule this
+  # migration passes; with it the call must be rejected and moved to
+  # straight-line code.
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "import { buildObservationIndexInput } from '../src/utils/observation-index-input';" \
+      'declare const memory: { indexObservation(input: unknown): Promise<void> };' \
+      'export async function indexObservationGroupsFromMessages(' \
+      '  memory: { indexObservation(input: unknown): Promise<void> },' \
+      '  candidates: unknown[],' \
+      ') {' \
+      '  for (const candidate of candidates) {' \
+      '    const input = buildObservationIndexInput(candidate);' \
+      '    if (!input) continue;' \
+      '    await memory.indexObservation(input);' \
+      '  }' \
+      '}' \
+      'void indexObservationGroupsFromMessages(memory, []);' \
+      > mastracode/sdk/scripts/index-messages.ts
+    git add .
+    git commit -q -m 'hide observation indexing inside a for-of loop body'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/mastracode-observation-index-for-of-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'for-of-hidden observation indexing unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'must pass buildObservationIndexInput output to every indexObservation call' "$output"
+  assert_contains 'mastracode/sdk/scripts/index-messages.ts' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'for-of-hidden observation indexing executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  # PF-2306: a missing-input guard whose body always exits through a try/finally
+  # (cleanup before returning) is a valid guard. Without TryStatement handling in
+  # statementAlwaysExits the guard is not recognized and this legitimate
+  # migration is wrongly rejected; with it the guarded call is authorized and the
+  # migration passes.
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' \
+      "import { buildObservationIndexInput } from '../src/utils/observation-index-input';" \
+      'declare const memory: { indexObservation(input: unknown): Promise<void> };' \
+      'declare function teardown(): void;' \
+      'export async function indexObservationGroupsFromMessages(' \
+      '  memory: { indexObservation(input: unknown): Promise<void> },' \
+      '  candidate: unknown,' \
+      ') {' \
+      '  const input = buildObservationIndexInput(candidate);' \
+      '  if (!input) {' \
+      '    try {' \
+      '      return;' \
+      '    } finally {' \
+      '      teardown();' \
+      '    }' \
+      '  }' \
+      '  await memory.indexObservation(input);' \
+      '}' \
+      'void indexObservationGroupsFromMessages(memory, {});' \
+      > mastracode/sdk/scripts/index-messages.ts
+    git add .
+    git commit -q -m 'guard observation indexing with a try/finally that always exits'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/mastracode-observation-index-try-finally-success.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status != 0 )); then
+    echo 'try/finally-guarded observation indexing unexpectedly failed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains '--dir mastracode/sdk exec vitest run' "$command_log"
+
   head_sha="$(
     cd "$fixture_repo"
     git reset -q --hard "$base_sha"
@@ -4940,6 +5032,47 @@ NODE
   assert_contains 'stores/_test-utils/src/index.test.ts' "$output"
   if [[ -s "$command_log" ]]; then
     echo 'Mocked in-memory store executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  # PF-2306: a template-expression specifier whose substitutions are all constant
+  # resolves to the same module identity as a literal. Mocking the in-memory
+  # store through `@mastra/core/stora${`ge`}` must be caught the same way a
+  # literal or concatenated specifier is, or the guard is evaded by obfuscation.
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'export const harnessConformance = "mocked-store-template-head";' \
+      > stores/_test-utils/src/domains/harness/index.ts
+    printf '%s\n' \
+      "import { MockStore } from '@mastra/core/storage';" \
+      "import { vi } from 'vitest';" \
+      "import { createTestSuite } from './factory';" \
+      'vi.mock(`@mastra/core/stora${`ge`}`, () => ({ MockStore: class {} }));' \
+      'createTestSuite(new MockStore());' \
+      > stores/_test-utils/src/index.test.ts
+    git add .
+    git commit -q -m 'mock the in-memory store through a template-expression specifier'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/storage-harness-mocked-store-template-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Template-specifier store mock unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains \
+    'must import createTestSuite and invoke it unconditionally at module scope with a new MockStore' \
+    "$output"
+  assert_contains 'stores/_test-utils/src/index.test.ts' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Template-specifier store mock executed package commands.' >&2
     cat "$command_log" >&2
     exit 1
   fi
@@ -6716,6 +6849,19 @@ function unwrap(expression) {
 function constantModuleName(expression) {
   const candidate = unwrap(expression);
   if (ts.isStringLiteralLike(candidate)) return candidate.text;
+  if (ts.isTemplateExpression(candidate)) {
+    // Fold a template whose every substitution is itself a constant string, so
+    // `@mastra/core/stor${'age'}` resolves to the same module identity a plain
+    // literal would. Matches the concatenation folding below and keeps the
+    // guard from being evaded by template obfuscation.
+    let text = candidate.head.text;
+    for (const span of candidate.templateSpans) {
+      const value = constantModuleName(span.expression);
+      if (value === undefined) return undefined;
+      text += value + span.literal.text;
+    }
+    return text;
+  }
   if (
     ts.isBinaryExpression(candidate) &&
     candidate.operatorToken.kind === ts.SyntaxKind.PlusToken
@@ -7020,6 +7166,19 @@ function unwrap(expression) {
 function constantModuleName(expression) {
   const candidate = unwrap(expression);
   if (ts.isStringLiteralLike(candidate)) return candidate.text;
+  if (ts.isTemplateExpression(candidate)) {
+    // Fold a template whose every substitution is itself a constant string, so
+    // `@mastra/core/stor${'age'}` resolves to the same module identity a plain
+    // literal would. Matches the concatenation folding below and keeps the
+    // guard from being evaded by template obfuscation.
+    let text = candidate.head.text;
+    for (const span of candidate.templateSpans) {
+      const value = constantModuleName(span.expression);
+      if (value === undefined) return undefined;
+      text += value + span.literal.text;
+    }
+    return text;
+  }
   if (
     ts.isBinaryExpression(candidate) &&
     candidate.operatorToken.kind === ts.SyntaxKind.PlusToken
@@ -7462,6 +7621,19 @@ function isStaticallyUnreachable(node, boundary) {
     // clause body fails closed.
     if (ts.isCaseClause(parent) || ts.isDefaultClause(parent)) return true;
 
+    // for-of/for-in bodies execute zero or more times over a value the analysis
+    // cannot bound, so a guarded call inside one is not guaranteed to run under
+    // the guard reasoned about in the enclosing block. Treat the loop body as a
+    // disallowed position and fail closed, mirroring the switch-clause rule; the
+    // loop head (iterable/initializer) still evaluates unconditionally and is
+    // left reachable.
+    if (
+      (ts.isForOfStatement(parent) || ts.isForInStatement(parent)) &&
+      child === parent.statement
+    ) {
+      return true;
+    }
+
     if (ts.isBinaryExpression(parent) && child === parent.right) {
       const leftValue = staticBoolean(parent.left);
       if (
@@ -7584,6 +7756,18 @@ function statementAlwaysExits(statement) {
       statementAlwaysExits(statement.thenStatement) &&
       statementAlwaysExits(statement.elseStatement)
     );
+  }
+  if (ts.isTryStatement(statement)) {
+    // A finally that always exits dominates every other completion path.
+    if (statement.finallyBlock && statementAlwaysExits(statement.finallyBlock)) {
+      return true;
+    }
+    // Otherwise both the normal-completion path (the try block) and, when
+    // present, the exception path (the catch block) must always exit. Required
+    // conservatively so a catch that falls through is never mistaken for a
+    // guard that always exits.
+    if (!statementAlwaysExits(statement.tryBlock)) return false;
+    return !statement.catchClause || statementAlwaysExits(statement.catchClause.block);
   }
   return false;
 }
