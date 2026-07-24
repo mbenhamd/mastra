@@ -3098,8 +3098,10 @@ describe('Memory', () => {
         describeIndex: vi.fn(),
         id: 'delete-thread-failure-vector',
       } as unknown as MastraVector;
-      const { memory, memoryStore, messageId, resourceId, threadId } =
-        await createMemoryWithDerivedObservationState('delete-thread-failure', mockVector);
+      const { memory, memoryStore, messageId, resourceId, threadId } = await createMemoryWithDerivedObservationState(
+        'delete-thread-failure',
+        mockVector,
+      );
       Object.defineProperty(memoryStore, 'supportsAtomicObservationalMemoryRetraction', {
         configurable: true,
         value: false,
