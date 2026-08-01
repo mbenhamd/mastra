@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import http from 'node:http';
+import net from 'node:net';
 import { PassThrough } from 'node:stream';
 import type {
   AdapterTestContext,
@@ -1424,6 +1425,158 @@ describe('Fastify Server Adapter', () => {
       expect(JSON.parse(response.body)).toEqual({
         bytes: payload.byteLength,
         sha256: createHash('sha256').update(payload).digest('hex'),
+      });
+    });
+
+    it('tears down an unread chunked multipart connection after the response instead of discarding forever', async () => {
+      app = Fastify();
+
+      const adapter = new MastraServer({
+        app,
+        mastra: context.mastra,
+      });
+
+      // The real harness-inbound shape: skipBodyParse + declared
+      // maxBodySize, and a handler that CANNOT consume request.raw
+      // (ServerRoute handlers only receive transport-neutral params).
+      const testRoute: ServerRoute<any, any, any> = {
+        method: 'POST',
+        path: '/test/webhook-skip-unconsumed',
+        responseType: 'json',
+        skipBodyParse: true,
+        maxBodySize: 1024,
+        handler: async () => ({ ok: true }),
+      };
+
+      adapter.registerContextMiddleware();
+      await adapter.registerRoute(app, testRoute, { prefix: '' });
+      const address = await app.listen({ port: 0 });
+      const boundary = 'skip-unconsumed-boundary';
+
+      // Endless chunked body (no Content-Length): without the deliberate
+      // teardown, Fastify (requestTimeout: 0) leaves the connection open
+      // and dump-discards the remainder forever.
+      const result = await new Promise<{ gotResponse: boolean; serverClosed: boolean; writesAfterResponse: number }>(
+        resolve => {
+          const sock = net.connect(serverPort(address), '127.0.0.1');
+          let response = '';
+          let gotResponse = false;
+          let writesAfterResponse = 0;
+          let settled = false;
+          let timer: NodeJS.Timeout | undefined;
+          let guard: NodeJS.Timeout | undefined;
+          const settle = (serverClosed: boolean) => {
+            if (settled) return;
+            settled = true;
+            if (timer) clearInterval(timer);
+            if (guard) clearTimeout(guard);
+            resolve({ gotResponse, serverClosed, writesAfterResponse });
+            sock.destroy();
+          };
+          sock.on('data', chunk => {
+            response += chunk;
+            if (!gotResponse && response.includes('\r\n\r\n')) gotResponse = true;
+          });
+          // FIN or reset from the server after the response IS the
+          // deliberate teardown under test.
+          sock.on('end', () => settle(true));
+          sock.on('error', () => settle(gotResponse));
+          sock.on('close', () => settle(gotResponse));
+          sock.on('connect', () => {
+            sock.write(
+              'POST /test/webhook-skip-unconsumed HTTP/1.1\r\n' +
+                'host: 127.0.0.1\r\n' +
+                `content-type: multipart/form-data; boundary=${boundary}\r\n` +
+                'transfer-encoding: chunked\r\nconnection: keep-alive\r\n\r\n',
+            );
+            const piece = 'a'.repeat(1024);
+            const frame = `${piece.length.toString(16)}\r\n${piece}\r\n`;
+            timer = setInterval(() => {
+              if (sock.destroyed) return;
+              sock.write(frame);
+              if (gotResponse) writesAfterResponse += 1;
+            }, 5);
+            guard = setTimeout(() => settle(false), 3000);
+          });
+        },
+      );
+
+      expect(result.gotResponse).toBe(true);
+      // The server's teardown, not the 3s guard, must end the connection.
+      expect(result.serverClosed).toBe(true);
+      // Byte churn stops promptly after the response.
+      expect(result.writesAfterResponse).toBeLessThan(100);
+
+      // The teardown wedges nothing: a fresh request is served end to end.
+      const followUp = buildMultipartString(boundary, [{ name: 'name', value: 'ok' }]);
+      const accepted = await sendRawMultipart(
+        serverPort(address),
+        '/test/webhook-skip-unconsumed',
+        boundary,
+        Buffer.from(followUp),
+      );
+      expect(accepted.status).toBe(200);
+    }, 10_000);
+
+    it('leaves a handler that consumes after an await untouched until natural end', async () => {
+      app = Fastify();
+
+      const adapter = new MastraServer({
+        app,
+        mastra: context.mastra,
+      });
+
+      let currentRaw: FastifyRequest['raw'] | undefined;
+      app.addHook('onRequest', async request => {
+        currentRaw = request.raw;
+      });
+
+      const testRoute: ServerRoute<any, any, any> = {
+        method: 'POST',
+        path: '/test/webhook-skip-late-consume',
+        responseType: 'json',
+        skipBodyParse: true,
+        maxBodySize: 64 * 1024,
+        handler: async () => {
+          // Consume only AFTER an await: the teardown keys on reply 'finish'
+          // (which cannot precede the handler's return), never on handler
+          // entry, so a late consumer still gets the intact stream.
+          await sleep(25);
+          const chunks: Buffer[] = [];
+          for await (const chunk of currentRaw!) {
+            chunks.push(chunk as Buffer);
+          }
+          const received = Buffer.concat(chunks);
+          // `readableEnded` distinguishes a natural end from a teardown abort
+          // (`destroyed` is useless here: for-await destroys its source on
+          // completion as part of iterator cleanup).
+          return {
+            bytes: received.byteLength,
+            sha256: createHash('sha256').update(received).digest('hex'),
+            endedNaturally: currentRaw!.readableEnded,
+          };
+        },
+      };
+
+      adapter.registerContextMiddleware();
+      await adapter.registerRoute(app, testRoute, { prefix: '' });
+      const address = await app.listen({ port: 0 });
+
+      const boundary = 'skip-late-consume-boundary';
+      const payload = Buffer.from(
+        buildMultipartString(boundary, [{ name: 'file', value: 'z'.repeat(16 * 1024), filename: 'z.bin' }]),
+      );
+      const response = await sendRawMultipart(
+        serverPort(address),
+        '/test/webhook-skip-late-consume',
+        boundary,
+        payload,
+      );
+      expect(response.status).toBe(200);
+      expect(JSON.parse(response.body)).toEqual({
+        bytes: payload.byteLength,
+        sha256: createHash('sha256').update(payload).digest('hex'),
+        endedNaturally: true,
       });
     });
 

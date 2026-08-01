@@ -599,6 +599,15 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
    * handler that already sent its own response (e.g. the harness channel
    * webhook's self-enforced rawBody cap) wins the race: the guard never
    * double-fires over a sent reply.
+   *
+   * Finally, a response that finishes while the request body never ended
+   * (nothing consumed the stream — the harness webhook handler cannot: it
+   * only receives handler params) gets a deliberate connection teardown on
+   * reply 'finish' instead of Node's unbounded dump-discard of the chunked
+   * remainder. Buffering the body pre-handler would have cost up to
+   * `maxBodySize` of user-space memory per request and broken the
+   * skipBodyParse raw-stream contract; destroy-on-finish-if-unread closes the
+   * connection-occupancy vector without either.
    */
   private installSkipBodyParseMultipartAggregateGuard(
     route: ServerRoute,
@@ -626,6 +635,7 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
     }
 
     let aggregateBytes = 0;
+    let aggregateTripped = false;
     const onAggregateData = (chunk: Buffer | string) => {
       // A handler may setEncoding() before consuming; count BYTES either way
       // (same dance as Fastify's own body-limit accounting).
@@ -636,6 +646,7 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
       // own enforcement won the race and owns its stream's lifecycle).
       request.raw.removeListener('data', onAggregateData);
       if (reply.sent) return;
+      aggregateTripped = true;
       void reply.header('connection', 'close');
       // Destroy the half-read request stream, but only after the 413 has left
       // the process: a finished response is DETACHED from the connection's
@@ -652,6 +663,25 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
       void reply.send(createBodyTooLargeError());
     };
     request.raw.prependListener('data', onAggregateData);
+
+    // Unread-after-response = deliberate teardown, not an error. Once the
+    // reply has fully flushed and the request body still has NOT ended,
+    // destroy the connection instead of letting Node dump-discard an
+    // unbounded chunked remainder on an open keep-alive socket (Fastify ships
+    // `requestTimeout: 0`, so nothing else bounds it — probed: a client can
+    // stream megabytes into the discard path after a 200). Bytes accepted are
+    // then ≈ what the kernel/stream buffers held during handler latency, and
+    // the socket resets, mirroring the 413 lane's connection-close
+    // discipline. A handler that consumed to the end (`readableEnded`) is
+    // left untouched, an aggregate breach defers to the 413 lane's own
+    // close-teardown (which carries the 413 error to in-flight consumers),
+    // and `destroy()` is called without an error on purpose.
+    reply.raw.once('finish', () => {
+      if (aggregateTripped) return;
+      if (!request.raw.readableEnded && !request.raw.destroyed) {
+        request.raw.destroy();
+      }
+    });
   }
 
   async sendResponse(
