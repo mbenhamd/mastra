@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import http from 'node:http';
 import type {
   AdapterTestContext,
@@ -1187,6 +1188,242 @@ describe('Fastify Server Adapter', () => {
       });
       expect(accepted.status).toBe(200);
       await expect(accepted.json()).resolves.toMatchObject({ ok: true, name: 'after-abort' });
+    });
+
+    // --- skipBodyParse multipart aggregate enforcement (PF-2594 review finding) ---
+    //
+    // skipBodyParse routes return from getParams() before the multipart
+    // aggregate lane, so without the dedicated guard a multipart request to a
+    // skipBodyParse route with a declared maxBodySize reaches its handler with
+    // no adapter-level aggregate cap at all.
+
+    it('enforces a declared maxBodySize on a skipBodyParse multipart route with the hardened 413 shape', async () => {
+      app = Fastify();
+
+      const adapter = new MastraServer({
+        app,
+        mastra: context.mastra,
+      });
+
+      let handlerRuns = 0;
+      const testRoute: ServerRoute<any, any, any> = {
+        method: 'POST',
+        path: '/test/webhook-skip-capped',
+        responseType: 'json',
+        skipBodyParse: true,
+        maxBodySize: 1024,
+        handler: async () => {
+          handlerRuns += 1;
+          return { ok: true };
+        },
+      };
+
+      adapter.registerContextMiddleware();
+      await adapter.registerRoute(app, testRoute, { prefix: '' });
+
+      const address = await app.listen({ port: 0 });
+      const boundary = 'skip-cap-boundary';
+
+      // Over the cap with an honest Content-Length: rejected before the
+      // handler runs, with the exact hardened-lane 413 shape.
+      const oversize = buildMultipartString(boundary, [{ name: 'file', value: 'x'.repeat(4096), filename: 'x.bin' }]);
+      const rejected = await sendRawMultipart(
+        serverPort(address),
+        '/test/webhook-skip-capped',
+        boundary,
+        Buffer.from(oversize),
+      );
+      expect(rejected.status).toBe(413);
+      expect(JSON.parse(rejected.body)).toMatchObject({
+        statusCode: 413,
+        code: 'FST_ERR_CTP_BODY_TOO_LARGE',
+        message: 'Request body is too large',
+      });
+      expect(handlerRuns).toBe(0);
+
+      // Under the cap the same route still reaches its handler.
+      const undersize = buildMultipartString(boundary, [{ name: 'name', value: 'ok' }]);
+      const accepted2 = await sendRawMultipart(
+        serverPort(address),
+        '/test/webhook-skip-capped',
+        boundary,
+        Buffer.from(undersize),
+      );
+      expect(accepted2.status).toBe(200);
+      expect(JSON.parse(accepted2.body)).toMatchObject({ ok: true });
+      expect(handlerRuns).toBe(1);
+    });
+
+    it('aborts an over-cap chunked multipart stream on a skipBodyParse route mid-consumption with 413 (no hang)', async () => {
+      app = Fastify();
+
+      const adapter = new MastraServer({
+        app,
+        mastra: context.mastra,
+      });
+
+      // skipBodyParse handlers do not receive the raw stream through handler
+      // params; capture it per request the way an embedding server could.
+      let currentRaw: FastifyRequest['raw'] | undefined;
+      app.addHook('onRequest', async request => {
+        currentRaw = request.raw;
+      });
+
+      let handlerSettled = false;
+      const testRoute: ServerRoute<any, any, any> = {
+        method: 'POST',
+        path: '/test/webhook-skip-chunked',
+        responseType: 'json',
+        skipBodyParse: true,
+        maxBodySize: 1024,
+        handler: async () => {
+          const raw = currentRaw!;
+          let consumedBytes = 0;
+          try {
+            for await (const chunk of raw) {
+              consumedBytes += (chunk as Buffer).length;
+            }
+          } catch {
+            // Expected on abort: the guard's 413 + connection teardown
+            // destroys the half-read request stream.
+          } finally {
+            handlerSettled = true;
+          }
+          return { ok: true, consumedBytes };
+        },
+      };
+
+      adapter.registerContextMiddleware();
+      await adapter.registerRoute(app, testRoute, { prefix: '' });
+
+      const address = await app.listen({ port: 0 });
+      const boundary = 'skip-chunked-boundary';
+
+      // No Content-Length: the pre-buffer short-circuit cannot engage; the
+      // 413 must come from the passive mid-stream accounting while the
+      // handler is consuming. Writes are BOUNDED (8 KiB against a 1 KiB cap)
+      // so a missing guard fails fast with a 200 instead of hanging.
+      const result = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+        const req = http.request({
+          host: '127.0.0.1',
+          port: serverPort(address),
+          method: 'POST',
+          path: '/test/webhook-skip-chunked',
+          headers: { 'content-type': `multipart/form-data; boundary=${boundary}` },
+        });
+
+        let timer: NodeJS.Timeout | undefined;
+        const stopWriting = () => {
+          if (timer) {
+            clearInterval(timer);
+            timer = undefined;
+          }
+        };
+
+        // Connection reset after the mid-stream 413 is the expected teardown.
+        let responded = false;
+        req.on('error', error => {
+          stopWriting();
+          if (!responded) reject(error);
+        });
+
+        req.on('response', res => {
+          responded = true;
+          stopWriting();
+          let body = '';
+          res.on('data', chunk => (body += chunk));
+          res.on('end', () => {
+            req.destroy();
+            resolve({ status: res.statusCode ?? 0, body });
+          });
+          res.on('error', reject);
+        });
+
+        req.write(
+          `--${boundary}\r\ncontent-disposition: form-data; name="file"; filename="big.bin"\r\ncontent-type: application/octet-stream\r\n\r\n`,
+        );
+        const filler = Buffer.alloc(512, 0x61);
+        let written = 0;
+        timer = setInterval(() => {
+          req.write(filler);
+          written += 1;
+          if (written >= 16) {
+            stopWriting();
+            req.end(`\r\n--${boundary}--\r\n`);
+          }
+        }, 2);
+      });
+
+      expect(result.status).toBe(413);
+      expect(JSON.parse(result.body)).toMatchObject({
+        statusCode: 413,
+        code: 'FST_ERR_CTP_BODY_TOO_LARGE',
+        message: 'Request body is too large',
+      });
+
+      // Clean teardown: the in-flight handler consumption terminates instead
+      // of hanging on a wedged stream…
+      await waitFor(() => handlerSettled, 2000);
+
+      // …and a fresh connection still gets served end to end.
+      const afterBoundary = 'skip-chunked-after';
+      const small = buildMultipartString(afterBoundary, [{ name: 'name', value: 'after-abort' }]);
+      const followUp = await sendRawMultipart(
+        serverPort(address),
+        '/test/webhook-skip-chunked',
+        afterBoundary,
+        Buffer.from(small),
+      );
+      expect(followUp.status).toBe(200);
+      expect(JSON.parse(followUp.body)).toMatchObject({ ok: true });
+    });
+
+    it('hands a consuming skipBodyParse handler the intact raw multipart stream byte-exact under the cap', async () => {
+      app = Fastify();
+
+      const adapter = new MastraServer({
+        app,
+        mastra: context.mastra,
+      });
+
+      let currentRaw: FastifyRequest['raw'] | undefined;
+      app.addHook('onRequest', async request => {
+        currentRaw = request.raw;
+      });
+
+      const testRoute: ServerRoute<any, any, any> = {
+        method: 'POST',
+        path: '/test/webhook-skip-exact',
+        responseType: 'json',
+        skipBodyParse: true,
+        maxBodySize: 64 * 1024,
+        handler: async () => {
+          const chunks: Buffer[] = [];
+          for await (const chunk of currentRaw!) {
+            chunks.push(chunk as Buffer);
+          }
+          const received = Buffer.concat(chunks);
+          return { bytes: received.byteLength, sha256: createHash('sha256').update(received).digest('hex') };
+        },
+      };
+
+      adapter.registerContextMiddleware();
+      await adapter.registerRoute(app, testRoute, { prefix: '' });
+
+      const address = await app.listen({ port: 0 });
+      const boundary = 'skip-exact-boundary';
+
+      // 16 KiB payload under the 64 KiB cap: the passive accounting must not
+      // consume, reorder, or drop a single byte of what the handler reads.
+      const payload = Buffer.from(
+        buildMultipartString(boundary, [{ name: 'file', value: 'y'.repeat(16 * 1024), filename: 'y.bin' }]),
+      );
+      const response = await sendRawMultipart(serverPort(address), '/test/webhook-skip-exact', boundary, payload);
+      expect(response.status).toBe(200);
+      expect(JSON.parse(response.body)).toEqual({
+        bytes: payload.byteLength,
+        sha256: createHash('sha256').update(payload).digest('hex'),
+      });
     });
   });
 
