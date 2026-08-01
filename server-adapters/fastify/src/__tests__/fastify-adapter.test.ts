@@ -1580,6 +1580,369 @@ describe('Fastify Server Adapter', () => {
       });
     });
 
+    // --- Effective-cap precedence + generalized teardown (PF-2594 codex round 2) ---
+
+    /**
+     * Stream an endless chunked multipart body from a raw socket and KEEP
+     * writing after the response arrives; report whether the server tore the
+     * connection down within `boundMs` and how much churn followed.
+     */
+    const streamChunkedMultipartUntilClosed = (
+      port: number,
+      path: string,
+      boundary: string,
+      extraHeaders: string,
+      boundMs: number,
+    ): Promise<{ statusLine: string; serverClosed: boolean; writesAfterResponse: number }> =>
+      new Promise(resolve => {
+        const sock = net.connect(port, '127.0.0.1');
+        let response = '';
+        let gotResponse = false;
+        let writesAfterResponse = 0;
+        let settled = false;
+        let timer: NodeJS.Timeout | undefined;
+        let guard: NodeJS.Timeout | undefined;
+        const settle = (serverClosed: boolean) => {
+          if (settled) return;
+          settled = true;
+          if (timer) clearInterval(timer);
+          if (guard) clearTimeout(guard);
+          resolve({ statusLine: response.split('\r\n')[0] ?? '', serverClosed, writesAfterResponse });
+          sock.destroy();
+        };
+        sock.on('data', chunk => {
+          response += chunk;
+          if (!gotResponse && response.includes('\r\n\r\n')) gotResponse = true;
+        });
+        sock.on('end', () => settle(true));
+        sock.on('error', () => settle(gotResponse));
+        sock.on('close', () => settle(gotResponse));
+        sock.on('connect', () => {
+          sock.write(
+            `POST ${path} HTTP/1.1\r\n` +
+              'host: 127.0.0.1\r\n' +
+              `content-type: multipart/form-data; boundary=${boundary}\r\n` +
+              extraHeaders +
+              'transfer-encoding: chunked\r\nconnection: keep-alive\r\n\r\n',
+          );
+          const piece = 'a'.repeat(1024);
+          const frame = `${piece.length.toString(16)}\r\n${piece}\r\n`;
+          timer = setInterval(() => {
+            if (sock.destroyed) return;
+            sock.write(frame);
+            if (gotResponse) writesAfterResponse += 1;
+          }, 5);
+          guard = setTimeout(() => settle(false), boundMs);
+        });
+      });
+
+    it('enforces the adapter-level cap on skipBodyParse multipart routes without a route maxBodySize', async () => {
+      app = Fastify();
+
+      const adapter = new MastraServer({
+        app,
+        mastra: context.mastra,
+        bodyLimitOptions: { maxSize: 1024 },
+      });
+
+      const testRoute: ServerRoute<any, any, any> = {
+        method: 'POST',
+        path: '/test/webhook-skip-adapter-cap',
+        responseType: 'json',
+        skipBodyParse: true,
+        handler: async () => ({ ok: true }),
+      };
+
+      adapter.registerContextMiddleware();
+      await adapter.registerRoute(app, testRoute, { prefix: '' });
+      const address = await app.listen({ port: 0 });
+      const boundary = 'skip-adapter-cap-boundary';
+
+      const oversize = buildMultipartString(boundary, [{ name: 'file', value: 'x'.repeat(4096), filename: 'x.bin' }]);
+      const rejected = await sendRawMultipart(
+        serverPort(address),
+        '/test/webhook-skip-adapter-cap',
+        boundary,
+        Buffer.from(oversize),
+      );
+      expect(rejected.status).toBe(413);
+      expect(JSON.parse(rejected.body).code).toBe('FST_ERR_CTP_BODY_TOO_LARGE');
+
+      const undersize = buildMultipartString(boundary, [{ name: 'name', value: 'ok' }]);
+      const accepted = await sendRawMultipart(
+        serverPort(address),
+        '/test/webhook-skip-adapter-cap',
+        boundary,
+        Buffer.from(undersize),
+      );
+      expect(accepted.status).toBe(200);
+    });
+
+    it('caps skipBodyParse multipart at the server bodyLimit when neither route nor adapter declares one', async () => {
+      app = Fastify({ bodyLimit: 2048 });
+
+      const adapter = new MastraServer({
+        app,
+        mastra: context.mastra,
+      });
+
+      const testRoute: ServerRoute<any, any, any> = {
+        method: 'POST',
+        path: '/test/webhook-skip-server-cap',
+        responseType: 'json',
+        skipBodyParse: true,
+        handler: async () => ({ ok: true }),
+      };
+
+      adapter.registerContextMiddleware();
+      await adapter.registerRoute(app, testRoute, { prefix: '' });
+      const address = await app.listen({ port: 0 });
+      const boundary = 'skip-server-cap-boundary';
+
+      const oversize = buildMultipartString(boundary, [{ name: 'file', value: 'x'.repeat(4096), filename: 'x.bin' }]);
+      const rejected = await sendRawMultipart(
+        serverPort(address),
+        '/test/webhook-skip-server-cap',
+        boundary,
+        Buffer.from(oversize),
+      );
+      expect(rejected.status).toBe(413);
+      expect(JSON.parse(rejected.body).code).toBe('FST_ERR_CTP_BODY_TOO_LARGE');
+
+      const undersize = buildMultipartString(boundary, [{ name: 'name', value: 'ok' }]);
+      const accepted = await sendRawMultipart(
+        serverPort(address),
+        '/test/webhook-skip-server-cap',
+        boundary,
+        Buffer.from(undersize),
+      );
+      expect(accepted.status).toBe(200);
+    });
+
+    it('lets a route-level maxBodySize win over the adapter-level cap on skipBodyParse multipart', async () => {
+      app = Fastify();
+
+      const adapter = new MastraServer({
+        app,
+        mastra: context.mastra,
+        bodyLimitOptions: { maxSize: 256 },
+      });
+
+      const testRoute: ServerRoute<any, any, any> = {
+        method: 'POST',
+        path: '/test/webhook-skip-route-wins',
+        responseType: 'json',
+        skipBodyParse: true,
+        maxBodySize: 8192,
+        handler: async () => ({ ok: true }),
+      };
+
+      adapter.registerContextMiddleware();
+      await adapter.registerRoute(app, testRoute, { prefix: '' });
+      const address = await app.listen({ port: 0 });
+      const boundary = 'skip-route-wins-boundary';
+
+      // Over the adapter cap but under the route cap: the route wins → 200.
+      const midSized = buildMultipartString(boundary, [{ name: 'file', value: 'x'.repeat(1024), filename: 'x.bin' }]);
+      const accepted = await sendRawMultipart(
+        serverPort(address),
+        '/test/webhook-skip-route-wins',
+        boundary,
+        Buffer.from(midSized),
+      );
+      expect(accepted.status).toBe(200);
+
+      // Over the route cap as well → 413. The pre-auth check is header-only
+      // (honest Content-Length), so stream just the first bytes and read the
+      // 413 — uploading the full payload would race the connection close that
+      // follows an early 413 (kernel-buffered unread bytes turn the close
+      // into a reset).
+      const rejected = await new Promise<{ status: number; code: string }>((resolve, reject) => {
+        // A dedicated socket: Node's keep-alive agent would otherwise race
+        // this request onto the pooled socket of the preceding 200 while the
+        // client-side destroy is tearing it down.
+        const req = http.request({
+          host: '127.0.0.1',
+          port: serverPort(address),
+          method: 'POST',
+          path: '/test/webhook-skip-route-wins',
+          agent: false,
+          headers: {
+            'content-type': `multipart/form-data; boundary=${boundary}`,
+            'content-length': 12288,
+          },
+        });
+        let responded = false;
+        req.on('error', error => {
+          if (!responded) reject(error);
+        });
+        req.on('response', res => {
+          responded = true;
+          let body = '';
+          res.on('data', chunk => (body += chunk));
+          res.on('end', () => {
+            req.destroy();
+            resolve({ status: res.statusCode ?? 0, code: JSON.parse(body).code });
+          });
+        });
+        req.write(Buffer.alloc(1024, 0x61));
+      });
+      expect(rejected.status).toBe(413);
+      expect(rejected.code).toBe('FST_ERR_CTP_BODY_TOO_LARGE');
+    });
+
+    it('closes the connection after a parsed-lane multipart 413 while the client keeps writing', async () => {
+      app = Fastify();
+
+      const adapter = new MastraServer({
+        app,
+        mastra: context.mastra,
+        bodyLimitOptions: { maxSize: 1024 },
+      });
+
+      const testRoute: ServerRoute<any, any, any> = {
+        method: 'POST',
+        path: '/test/parsed-keep-writing',
+        responseType: 'json',
+        handler: async (params: any) => ({ ok: true, name: params.name }),
+      };
+
+      adapter.registerContextMiddleware();
+      await adapter.registerRoute(app, testRoute, { prefix: '' });
+      const address = await app.listen({ port: 0 });
+
+      // Chunked (no Content-Length) over-cap body from a client that KEEPS
+      // writing after the 413 arrives: without the teardown the server
+      // dump-discards the remainder on an open connection indefinitely.
+      const result = await streamChunkedMultipartUntilClosed(
+        serverPort(address),
+        '/test/parsed-keep-writing',
+        'parsed-keep-writing-boundary',
+        '',
+        3000,
+      );
+
+      expect(result.statusLine).toContain(' 413 ');
+      expect(result.serverClosed).toBe(true);
+      expect(result.writesAfterResponse).toBeLessThan(100);
+
+      // Clean teardown: a fresh connection still parses multipart fine.
+      const followUp = new FormData();
+      followUp.append('name', 'still-alive');
+      const accepted = await fetch(`${address}/test/parsed-keep-writing`, {
+        method: 'POST',
+        body: followUp as any,
+      });
+      expect(accepted.status).toBe(200);
+      await expect(accepted.json()).resolves.toMatchObject({ ok: true, name: 'still-alive' });
+    }, 10_000);
+
+    it('tears down an unauthenticated oversized chunked multipart request after the 401', async () => {
+      app = Fastify();
+
+      const originalGetServer = context.mastra.getServer.bind(context.mastra);
+      context.mastra.getServer = () =>
+        ({
+          ...originalGetServer(),
+          auth: {
+            authenticateToken: async (token: string) => (token === 'valid-token' ? { id: 'user-1' } : null),
+            authorize: async () => true,
+          },
+        }) as ReturnType<typeof originalGetServer>;
+
+      const adapter = new MastraServer({
+        app,
+        mastra: context.mastra,
+        bodyLimitOptions: { maxSize: 1024 },
+      });
+
+      const testRoute: ServerRoute<any, any, any> = {
+        method: 'POST',
+        path: '/api/test/multipart-protected',
+        responseType: 'json',
+        handler: async () => ({ ok: true }),
+      };
+
+      adapter.registerContextMiddleware();
+      await adapter.registerRoute(app, testRoute, { prefix: '' });
+      const address = await app.listen({ port: 0 });
+
+      // No authorization header: auth 401s BEFORE getParams ever runs, so
+      // neither body-limit lane engages — only the shared multipart unread
+      // teardown can close the connection while the client keeps writing.
+      const result = await streamChunkedMultipartUntilClosed(
+        serverPort(address),
+        '/api/test/multipart-protected',
+        'multipart-auth-boundary',
+        '',
+        3000,
+      );
+
+      expect(result.statusLine).toContain(' 401 ');
+      expect(result.serverClosed).toBe(true);
+      expect(result.writesAfterResponse).toBeLessThan(100);
+
+      // The server keeps serving authorized multipart afterwards.
+      const followUp = new FormData();
+      followUp.append('name', 'authed');
+      const accepted = await fetch(`${address}/api/test/multipart-protected`, {
+        method: 'POST',
+        headers: { authorization: 'Bearer valid-token' },
+        body: followUp as any,
+      });
+      expect(accepted.status).toBe(200);
+    }, 10_000);
+
+    it('rejects an honest over-cap Content-Length multipart before auth with 413', async () => {
+      app = Fastify();
+
+      const originalGetServer = context.mastra.getServer.bind(context.mastra);
+      let authenticateCalls = 0;
+      context.mastra.getServer = () =>
+        ({
+          ...originalGetServer(),
+          auth: {
+            authenticateToken: async (token: string) => {
+              authenticateCalls += 1;
+              return token === 'valid-token' ? { id: 'user-1' } : null;
+            },
+            authorize: async () => true,
+          },
+        }) as ReturnType<typeof originalGetServer>;
+
+      const adapter = new MastraServer({
+        app,
+        mastra: context.mastra,
+        bodyLimitOptions: { maxSize: 1024 },
+      });
+
+      const testRoute: ServerRoute<any, any, any> = {
+        method: 'POST',
+        path: '/api/test/multipart-preauth-cap',
+        responseType: 'json',
+        handler: async () => ({ ok: true }),
+      };
+
+      adapter.registerContextMiddleware();
+      await adapter.registerRoute(app, testRoute, { prefix: '' });
+      const address = await app.listen({ port: 0 });
+      const boundary = 'preauth-cap-boundary';
+
+      // Unauthenticated AND over-cap with an honest Content-Length: the
+      // header-only parser check must reject 413 BEFORE auth runs (mirroring
+      // Fastify's buffering parsers), not 401.
+      const oversize = buildMultipartString(boundary, [{ name: 'file', value: 'x'.repeat(4096), filename: 'x.bin' }]);
+      const rejected = await sendRawMultipart(
+        serverPort(address),
+        '/api/test/multipart-preauth-cap',
+        boundary,
+        Buffer.from(oversize),
+      );
+      expect(rejected.status).toBe(413);
+      expect(JSON.parse(rejected.body).code).toBe('FST_ERR_CTP_BODY_TOO_LARGE');
+      expect(authenticateCalls).toBe(0);
+    });
+
     // --- Premature request closure during multipart parsing (PF-2594 CodeRabbit round) ---
     //
     // A request stream can close WITHOUT an 'error' event (client abort), or

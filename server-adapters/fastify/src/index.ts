@@ -366,16 +366,9 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
           // The multipart content-type parser deliberately ignores the payload
           // (registerContextMiddleware), so neither Fastify's server-wide
           // `bodyLimit` nor the per-route `bodyLimit` registered in
-          // registerRoute() ever counts multipart bytes. Enforce the SAME cap
-          // here as an AGGREGATE limit over the raw request stream, resolved
-          // exactly like the non-multipart lane: route cap, else adapter-wide
-          // cap, else the Fastify server's own bodyLimit.
-          const maxTotalBytes =
-            route.maxBodySize ??
-            this.bodyLimitOptions?.maxSize ??
-            request.server.initialConfig?.bodyLimit ??
-            FASTIFY_DEFAULT_BODY_LIMIT_BYTES;
-          body = await this.parseMultipartFormData(request, maxTotalBytes);
+          // registerRoute() ever counts multipart bytes. Enforce the shared
+          // effective cap here as an AGGREGATE limit over the raw stream.
+          body = await this.parseMultipartFormData(request, this.resolveMultipartAggregateCap(route, request));
         } catch (error) {
           this.mastra.getLogger()?.error('Failed to parse multipart form data', {
             error: error instanceof Error ? { message: error.message, stack: error.stack } : error,
@@ -397,6 +390,71 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
     }
 
     return { urlParams, queryParams, body, bodyParseError, rawBody };
+  }
+
+  /**
+   * Effective multipart aggregate body cap for a route: the route-declared
+   * cap, else the adapter-wide default, else the Fastify server's own
+   * `bodyLimit`. The ONE source of truth for the parsed lane
+   * (parseMultipartFormData via getParams) and the skipBodyParse guard; the
+   * multipart content-type parser's pre-auth header check reads the same
+   * precedence through `routeOptions.bodyLimit`, which registerRoute
+   * materializes from the first two tiers.
+   */
+  private resolveMultipartAggregateCap(route: ServerRoute, request: FastifyRequest): number {
+    return (
+      route.maxBodySize ??
+      this.bodyLimitOptions?.maxSize ??
+      request.server.initialConfig?.bodyLimit ??
+      FASTIFY_DEFAULT_BODY_LIMIT_BYTES
+    );
+  }
+
+  /**
+   * Deliberate unread-after-response teardown for multipart requests.
+   *
+   * The multipart content-type parser never consumes the payload, so ANY
+   * response can finish while the request stream has not ended: a 401 from
+   * auth (which runs before body handling), a 413 from either body-limit
+   * lane, or a handler response on a route that never reads the stream.
+   * Fastify ships `requestTimeout: 0`, so Node would then dump-discard a
+   * chunked remainder on an open keep-alive socket indefinitely (probed:
+   * megabytes per second of churn). Once the reply has fully flushed and the
+   * request message is still INCOMPLETE (`!raw.complete` — more body bytes
+   * can keep arriving forever), destroy the connection: bytes accepted are
+   * then roughly what the kernel/stream buffers held during handler latency,
+   * and the socket resets. A body that fully ARRIVED but was never consumed
+   * is deliberately spared: its remainder is already in-process and Node's
+   * own dump is bounded, while destroying would RST the socket and race the
+   * client out of the just-flushed response (an incomplete message subsumes
+   * `!readableEnded`, so no completed-and-consumed request is ever touched).
+   * `destroy()` carries no error on purpose — unread-after-response is
+   * deliberate teardown, not a failure. A lane that owns its own teardown
+   * (the skip-lane aggregate breach, whose close hook carries the 413 error
+   * to in-flight consumers) calls `defer()` so this shared hook never
+   * double-destroys.
+   */
+  private installMultipartUnreadTeardown(
+    request: FastifyRequest,
+    reply: FastifyReply,
+  ): { defer: () => void } | undefined {
+    const method = String(request.method || '').toUpperCase();
+    if (method !== 'POST' && method !== 'PUT' && method !== 'PATCH' && method !== 'DELETE') return undefined;
+    const contentType = request.headers['content-type'] || '';
+    if (!contentType.includes('multipart/form-data')) return undefined;
+
+    let deferred = false;
+    reply.raw.once('finish', () => {
+      if (deferred) return;
+      if (!request.raw.complete && !request.raw.destroyed) {
+        request.raw.destroy();
+      }
+    });
+    return {
+      defer: () => {
+        deferred = true;
+      },
+    };
   }
 
   /**
@@ -578,43 +636,41 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
    * skipBodyParse routes return from getParams() before parseMultipartFormData,
    * and the multipart content-type parser deliberately never hands the payload
    * to Fastify's byte counting, so a multipart request to a skipBodyParse
-   * route with a declared `maxBodySize` was entirely uncapped at the adapter
-   * level. Applies to EXACTLY the `skipBodyParse && route.maxBodySize &&
-   * multipart` combination; other content types on skipBodyParse routes stay
-   * covered by Fastify's per-route `bodyLimit` (their parsers buffer through
-   * Fastify's byte counting).
+   * route would otherwise be entirely uncapped at the adapter level. The cap
+   * is the SAME effective cap as the parsed lane
+   * (resolveMultipartAggregateCap: route, else adapter, else server
+   * bodyLimit); other content types on skipBodyParse routes stay covered by
+   * Fastify's per-route `bodyLimit` (their parsers buffer through Fastify's
+   * byte counting).
    *
    * An honest Content-Length above the cap throws the hardened lane's 413
-   * before a payload byte is read. Otherwise a PASSIVE counter is attached via
+   * before a payload byte is read (with `connection: close` — the client may
+   * keep sending). Otherwise a PASSIVE counter is attached via
    * `prependListener('data')` — unlike `.on('data')` this does not switch the
    * stream into flowing mode, so the unread stream reaches the handler exactly
    * as before (identical pause/pipe/read semantics, byte-exact) and the
    * counter only observes chunks the handler's own consumption causes to be
    * emitted. The moment the aggregate exceeds the cap the reply is rejected
    * with the SAME `FST_ERR_CTP_BODY_TOO_LARGE` 413 shape as the hardened lane
-   * plus `connection: close` (mirroring Fastify's own content-type-parser
-   * abort: the client may keep sending, so the connection must close). Node
-   * then tears down the connection whose request body was never fully read,
-   * which also terminates the handler's in-flight consumption — no hang. A
+   * plus `connection: close`; the half-read stream is then destroyed with the
+   * 413 error once the reply's socket closes, so an in-flight handler
+   * consumer (pipe/for-await) is aborted instead of waiting forever (a
+   * finished response is DETACHED from Node's connection abort path). A
    * handler that already sent its own response (e.g. the harness channel
    * webhook's self-enforced rawBody cap) wins the race: the guard never
    * double-fires over a sent reply.
    *
-   * Finally, a response that finishes while the request body never ended
-   * (nothing consumed the stream — the harness webhook handler cannot: it
-   * only receives handler params) gets a deliberate connection teardown on
-   * reply 'finish' instead of Node's unbounded dump-discard of the chunked
-   * remainder. Buffering the body pre-handler would have cost up to
-   * `maxBodySize` of user-space memory per request and broken the
-   * skipBodyParse raw-stream contract; destroy-on-finish-if-unread closes the
-   * connection-occupancy vector without either.
+   * The unread-after-response occupancy teardown itself lives in the shared
+   * installMultipartUnreadTeardown hook (this guard's breach path calls
+   * `defer()` on it because the breach owns its error-carrying teardown).
    */
   private installSkipBodyParseMultipartAggregateGuard(
     route: ServerRoute,
     request: FastifyRequest,
     reply: FastifyReply,
+    multipartTeardown?: { defer: () => void },
   ): void {
-    if (!route.skipBodyParse || !route.maxBodySize) return;
+    if (!route.skipBodyParse) return;
 
     // Same body-bearing set as getParams()/the per-route bodyLimit lane.
     const method = String(request.method || '').toUpperCase();
@@ -623,7 +679,7 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
     const contentType = request.headers['content-type'] || '';
     if (!contentType.includes('multipart/form-data')) return;
 
-    const maxTotalBytes = route.maxBodySize;
+    const maxTotalBytes = this.resolveMultipartAggregateCap(route, request);
 
     // Same pre-buffer short-circuit as the hardened multipart lane: an honest
     // Content-Length above the cap is rejected before a single payload byte is
@@ -631,11 +687,11 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
     // accounting below (NaN comparisons are false).
     const declaredLength = Number(request.headers['content-length']);
     if (declaredLength > maxTotalBytes) {
+      void reply.header('connection', 'close');
       throw createBodyTooLargeError();
     }
 
     let aggregateBytes = 0;
-    let aggregateTripped = false;
     const onAggregateData = (chunk: Buffer | string) => {
       // A handler may setEncoding() before consuming; count BYTES either way
       // (same dance as Fastify's own body-limit accounting).
@@ -646,7 +702,10 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
       // own enforcement won the race and owns its stream's lifecycle).
       request.raw.removeListener('data', onAggregateData);
       if (reply.sent) return;
-      aggregateTripped = true;
+      // The breach owns its teardown: the close hook below destroys the
+      // half-read stream WITH the 413 error so in-flight consumers abort
+      // meaningfully; tell the shared unread hook to stand down.
+      multipartTeardown?.defer();
       void reply.header('connection', 'close');
       // Destroy the half-read request stream, but only after the 413 has left
       // the process: a finished response is DETACHED from the connection's
@@ -663,25 +722,6 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
       void reply.send(createBodyTooLargeError());
     };
     request.raw.prependListener('data', onAggregateData);
-
-    // Unread-after-response = deliberate teardown, not an error. Once the
-    // reply has fully flushed and the request body still has NOT ended,
-    // destroy the connection instead of letting Node dump-discard an
-    // unbounded chunked remainder on an open keep-alive socket (Fastify ships
-    // `requestTimeout: 0`, so nothing else bounds it — probed: a client can
-    // stream megabytes into the discard path after a 200). Bytes accepted are
-    // then ≈ what the kernel/stream buffers held during handler latency, and
-    // the socket resets, mirroring the 413 lane's connection-close
-    // discipline. A handler that consumed to the end (`readableEnded`) is
-    // left untouched, an aggregate breach defers to the 413 lane's own
-    // close-teardown (which carries the 413 error to in-flight consumers),
-    // and `destroy()` is called without an error on purpose.
-    reply.raw.once('finish', () => {
-      if (aggregateTripped) return;
-      if (!request.raw.readableEnded && !request.raw.destroyed) {
-        request.raw.destroy();
-      }
-    });
   }
 
   async sendResponse(
@@ -903,6 +943,13 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
       let authWebRequest: globalThis.Request | undefined;
       const getAuthWebRequest = () => (authWebRequest ??= toWebRequest(request));
 
+      // Any multipart request can produce a response while its (never-parsed)
+      // stream is still unread — a 401 from the auth check below, a 413 from
+      // a body-limit lane, or a handler that never consumes. Install the
+      // shared unread-after-response teardown FIRST so even pre-auth
+      // rejections close the connection-occupancy vector.
+      const multipartTeardown = this.installMultipartUnreadTeardown(request, reply);
+
       // Check route-level authentication/authorization
       const authError = await this.checkRouteAuth(route, {
         path: String(request.url.split('?')[0] || '/'),
@@ -931,16 +978,26 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
       }
 
       // `skipBodyParse` routes return from getParams() before the multipart
-      // aggregate lane, so a multipart request to a skipBodyParse route with a
-      // declared `maxBodySize` would otherwise reach its handler with NO
-      // adapter-level aggregate cap (Fastify's own bodyLimit never engages for
-      // the ignore-the-payload multipart parser either). Guard exactly that
-      // combination. May throw the hardened lane's 413 (honest Content-Length
-      // above the cap), which propagates through Fastify's default error
-      // handler exactly like a getParams() body-limit breach.
-      this.installSkipBodyParseMultipartAggregateGuard(route, request, reply);
+      // aggregate lane, so a multipart request to a skipBodyParse route would
+      // otherwise reach its handler with NO adapter-level aggregate cap
+      // (Fastify's own bodyLimit never engages for the ignore-the-payload
+      // multipart parser either). May throw the hardened lane's 413 (honest
+      // Content-Length above the cap), which propagates through Fastify's
+      // default error handler exactly like a getParams() body-limit breach.
+      this.installSkipBodyParseMultipartAggregateGuard(route, request, reply, multipartTeardown);
 
-      const params = await this.getParams(route, request);
+      let params: ParsedRequestParams;
+      try {
+        params = await this.getParams(route, request);
+      } catch (error) {
+        // A mid-stream body-limit breach's 413 must close the connection (the
+        // client may keep sending); the shared multipart teardown then resets
+        // the socket once the 413 finishes with the stream unread.
+        if (error instanceof Error && isBodyTooLargeError(error)) {
+          void reply.header('connection', 'close');
+        }
+        throw error;
+      }
 
       // Return 400 Bad Request if body parsing failed (e.g., malformed multipart data)
       if (params.bodyParseError) {
@@ -1187,6 +1244,11 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
         let webRequest: globalThis.Request | undefined;
         const getWebRequest = () => (webRequest ??= toWebRequest(request));
 
+        // Same unread-multipart teardown as registerRoute: custom API route
+        // handlers receive a core-built Request without the multipart body,
+        // so the raw stream can reach any response (401s included) unread.
+        this.installMultipartUnreadTeardown(request, reply);
+
         // Per-route auth check (same pattern as registerRoute)
         const authError = await this.checkRouteAuth(serverRoute, {
           path: String(request.url.split('?')[0] || '/'),
@@ -1351,8 +1413,22 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
     // Register content type parser for multipart/form-data
     // This allows Fastify to accept multipart requests without parsing them
     // We'll parse them manually in getParams using busboy
-    this.app.addContentTypeParser('multipart/form-data', (_request, _payload, done) => {
-      // Don't parse the body, we'll handle it manually with busboy
+    this.app.addContentTypeParser('multipart/form-data', (request: FastifyRequest, _payload, done) => {
+      // Don't parse the body here — getParams() handles multipart with
+      // busboy. But DO run the same header-only pre-buffer check Fastify's
+      // buffering parsers apply to non-multipart bodies: an honest
+      // Content-Length above the route's effective body limit is rejected 413
+      // BEFORE auth and before any stream work (content-type parsers run
+      // ahead of the route handler, so this also covers unauthenticated
+      // requests to protected routes). `routeOptions.bodyLimit` carries the
+      // route → adapter → server precedence registerRoute materializes, and
+      // Fastify's own parser error path adds `connection: close`.
+      const routeBodyLimit = request.routeOptions?.bodyLimit;
+      const declaredLength = Number(request.headers['content-length']);
+      if (typeof routeBodyLimit === 'number' && declaredLength > routeBodyLimit) {
+        done(createBodyTooLargeError(), undefined);
+        return;
+      }
       done(null, undefined);
     });
 
