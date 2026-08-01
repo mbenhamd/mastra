@@ -1,6 +1,6 @@
 import type { AdapterTestContext } from '@internal/server-adapter-test-utils';
 import { createDefaultTestContext } from '@internal/server-adapter-test-utils';
-import type { ServerRoute } from '@mastra/server/server-adapter';
+import type { ServerContext, ServerRoute } from '@mastra/server/server-adapter';
 import Fastify from 'fastify';
 import type { FastifyInstance } from 'fastify';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
@@ -73,8 +73,8 @@ describe('WHATWG Request lane isolation (PF-2594)', () => {
       method: 'GET',
       path: '/api/test/web-request-isolation',
       responseType: 'json',
-      handler: async (params: any) => {
-        const handlerRequest = params.request as globalThis.Request;
+      handler: async (params: ServerContext) => {
+        const handlerRequest = params.request!;
         seenByHandler = {
           authMutated: handlerRequest.headers.get('x-auth-mutated'),
           authorizeMutated: handlerRequest.headers.get('x-authorize-mutated'),
@@ -245,7 +245,7 @@ describe('WHATWG Request construction counting (PF-2594)', () => {
       method: 'GET',
       path: '/api/test/count-auth-read',
       responseType: 'json',
-      handler: async (params: any) => ({ host: (params.request as globalThis.Request).headers.get('host') }),
+      handler: async (params: ServerContext) => ({ host: params.request!.headers.get('host') }),
     };
     const nonReadingRoute: ServerRoute<any, any, any> = {
       method: 'GET',

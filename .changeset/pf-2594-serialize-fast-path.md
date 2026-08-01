@@ -2,4 +2,4 @@
 '@mastra/server': patch
 ---
 
-Stream chunk serialization now takes a plain `JSON.stringify` fast path and only falls back to the replacer-based safe serializer for chunks it cannot handle (BigInt, circular references). Output is byte-identical; SSE and datastream responses serialize each chunk 2-4x faster. `getServerRoutes()` also returns a cached frozen snapshot instead of copying the route table on every request.
+Faster streamed responses. Stream chunks now serialize through a plain `JSON.stringify` fast path — 2.3-3.9x faster per chunk in our benchmarks — and fall back to the safe serializer only for chunks plain serialization cannot handle (BigInt values, circular references). Output stays byte-identical. The server also reuses one frozen snapshot of its route table instead of copying the table on every request.
