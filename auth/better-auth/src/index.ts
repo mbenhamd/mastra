@@ -665,6 +665,11 @@ export class MastraAuthBetterAuth
    * @throws Error if credentials are invalid
    */
   async signIn(email: string, password: string, request: Request): Promise<CredentialsResult<EEUser>> {
+    // Public credential entry point: hosts route /auth/credentials/sign-in
+    // here directly (not through handleAuthRequest), so it must await the
+    // same deferred-migration latch — otherwise the first credential op on a
+    // fresh provider-owned database hits unmigrated tables.
+    await this.#ensureDbReady();
     const headers = request?.headers ?? new Headers();
 
     // Use asResponse: true to get the full response with Set-Cookie headers
@@ -717,6 +722,9 @@ export class MastraAuthBetterAuth
     name: string | undefined,
     request: Request,
   ): Promise<CredentialsResult<EEUser>> {
+    // Same deferred-migration gate as signIn(): first-use sign-up on a fresh
+    // provider-owned database must run the schema migrations first.
+    await this.#ensureDbReady();
     const displayName = name ?? email.split('@')[0] ?? 'User';
     const headers = request?.headers ?? new Headers();
 

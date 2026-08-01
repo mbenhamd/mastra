@@ -760,6 +760,30 @@ describe('webSearchTool agent resolution', () => {
     await expect(agent.getToolsForExecution({ requestContext: new RequestContext() })).rejects.toThrow(MastraError);
   });
 
+  it('resolves the sentinel inside per-run toolsets, matching the assigned-tools lane', async () => {
+    const agent = new Agent({
+      id: 'toolset-web-search-agent',
+      name: 'toolset-web-search-agent',
+      instructions: 'Search the web.',
+      model: 'openai/gpt-5-mini',
+    });
+
+    // The `toolsets` lane accepts the same ToolsInput as assigned tools, so a
+    // webSearchTool placeholder passed per-run must resolve to the
+    // provider-executed tool — never reach makeCoreTool as the raw sentinel.
+    const tools = await agent.getToolsForExecution({
+      requestContext: new RequestContext(),
+      toolsets: { search: { searchTheWeb: webSearchTool } },
+    });
+
+    expect(tools.searchTheWeb).toMatchObject({
+      type: 'provider-defined',
+      id: 'openai.web_search',
+      name: 'web_search',
+    });
+    expect(tools.searchTheWeb.execute).toBeUndefined();
+  });
+
   it('does not replace custom tools with web search-like names', async () => {
     const customTool = createTool({
       id: 'web_search',

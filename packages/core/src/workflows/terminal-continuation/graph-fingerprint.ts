@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { isDate, isProxy } from 'node:util/types';
+import { SERIALIZED_AGENT_PASSTHROUGH_OPTION_KEYS } from '../types';
 import type { SerializedStep, SerializedStepFlowEntry } from '../types';
 import { getDenseDataArray, getPlainDataDescriptors } from './data-shape';
 import type { WorkflowTerminalSha256 } from './types';
@@ -275,16 +276,37 @@ function hashCanonicalData(domain: string, value: unknown, field: string, state:
   return hashFramedParts(domain, [canonicalizeBoundedData(value, field, state, 0)]);
 }
 
-function normalizeSerializedStepOptions(value: unknown, field: string): string {
+function normalizeSerializedStepOptions(value: unknown, field: string, state: GraphState): string {
   if (value === undefined) return '';
   const descriptors = getDataDescriptors(value, field);
-  validateKeys(descriptors, ['retries', 'metadata'], [], field);
+  validateKeys(descriptors, ['retries', 'metadata', ...SERIALIZED_AGENT_PASSTHROUGH_OPTION_KEYS], [], field);
   const retries = descriptors.retries?.value;
-  if (retries === undefined) return '';
-  if (!Number.isSafeInteger(retries) || retries < 0) {
-    throw new TypeError(`${field}.retries must be a non-negative safe integer`);
+  let normalized = '';
+  if (retries !== undefined) {
+    if (!Number.isSafeInteger(retries) || retries < 0) {
+      throw new TypeError(`${field}.retries must be a non-negative safe integer`);
+    }
+    normalized = String(retries);
   }
-  return String(retries);
+  // Serialized agent execution passthrough options (maxSteps, toolChoice,
+  // activeTools, modelSettings, …) change run behavior, so they participate in
+  // the fingerprint. Entries without them emit the legacy retries-only token,
+  // keeping retained pre-upgrade fingerprints stable — stored graphs could not
+  // carry these keys before they entered the serialized subset.
+  const passthrough: Record<string, unknown> = {};
+  for (const key of SERIALIZED_AGENT_PASSTHROUGH_OPTION_KEYS) {
+    const descriptor = descriptors[key];
+    if (descriptor !== undefined && descriptor.value !== undefined) passthrough[key] = descriptor.value;
+  }
+  if (Object.keys(passthrough).length > 0) {
+    normalized += `#${hashCanonicalData(
+      'mastra.workflow-terminal-parent-graph.step-options.v1',
+      passthrough,
+      `${field}`,
+      state,
+    )}`;
+  }
+  return normalized;
 }
 
 /**
@@ -349,7 +371,7 @@ function normalizeSingleStepEntry(
     if (scopeStepIds.has(id)) throw new TypeError(`serialized workflow graph contains duplicate step id ${id}`);
     scopeStepIds.add(id);
     const ref = validateWorkflowTerminalStructuralString(descriptors[refKey]!.value, `${field}.${refKey}`);
-    const options = normalizeSerializedStepOptions(descriptors.options?.value, `${field}.options`);
+    const options = normalizeSerializedStepOptions(descriptors.options?.value, `${field}.options`, state);
     if (type === 'agent') {
       const outputSchemaValue = descriptors.outputSchema?.value;
       const outputSchema =

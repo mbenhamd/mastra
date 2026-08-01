@@ -10,7 +10,7 @@
  * time — silent loss would ship broken workflows unnoticed.
  */
 import { convertArrayToReadableStream, MockLanguageModelV2 } from '@internal/ai-sdk-v5/test';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
 import { Agent } from '../../agent';
 import { Mastra } from '../../mastra';
@@ -948,6 +948,124 @@ describe('rehydrate agent/tool step options', () => {
     // Serializing `{ fn }` would pass validation but rehydrate as
     // `concurrency: 1` — silent behavior drift, so it must throw here.
     expect(() => toStorableGraph(wf.stepGraph)).toThrow(/dynamic concurrency/);
+  });
+
+  it('round-trips JSON-safe agent execution options and applies them on the rehydrated run', async () => {
+    const agent = fixedResponseAgent('opts-agent', 'ok');
+    const mastra = new Mastra({
+      logger: false,
+      agents: { 'opts-agent': agent } as any,
+      storage: new InMemoryStore({ id: 'agent-passthrough-options' }),
+    });
+
+    const passthrough = {
+      maxSteps: 3,
+      toolChoice: 'auto' as const,
+      activeTools: [] as string[],
+      modelSettings: { temperature: 0.25 },
+      providerOptions: { testProvider: { flavor: 'unit' } },
+      temperature: 0.5,
+      toolCallConcurrency: 2,
+    };
+    const wf = createWorkflow({
+      id: 'agent-passthrough-options-wf',
+      inputSchema: z.object({ prompt: z.string() }),
+      outputSchema: z.object({ text: z.string() }),
+    })
+      .agent(agent, { retries: 1, ...passthrough } as any)
+      .commit();
+
+    const stored = JSON.parse(JSON.stringify(toStorableGraph(wf.stepGraph)));
+    // Serialization keeps every passthrough option, JSON-safe.
+    expect(stored[0]).toMatchObject({ type: 'agent', options: { retries: 1, ...passthrough } });
+
+    const { workflow } = await rehydrateWorkflow(
+      {
+        id: 'agent-passthrough-options-wf',
+        inputSchema: { type: 'object', properties: { prompt: { type: 'string' } }, required: ['prompt'] },
+        outputSchema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] },
+        graph: stored,
+      },
+      mastra,
+    );
+
+    // Rehydration puts the options back on the declarative entry the
+    // entry executor reads (runAgentEntry spreads them into the agent run).
+    const [entry] = workflow.stepGraph as Array<{ type: string; options?: Record<string, any> }>;
+    expect(entry.type).toBe('agent');
+    expect(entry.options).toMatchObject(passthrough);
+
+    // Re-serialization is idempotent — nothing gets dropped on the second trip.
+    expect(toStorableGraph(workflow.stepGraph)[0]).toMatchObject({ options: { retries: 1, ...passthrough } });
+
+    // End-to-end: running the rehydrated workflow forwards the options to the
+    // live agent invocation instead of silently running with defaults.
+    const streamSpy = vi.spyOn(agent, 'stream');
+    mastra.addWorkflow(workflow, 'agent-passthrough-options-wf');
+    const run = await mastra.getWorkflow('agent-passthrough-options-wf').createRun();
+    const result = await run.start({ inputData: { prompt: 'hi' } });
+    expect(result.status).toBe('success');
+    expect(streamSpy).toHaveBeenCalledWith(
+      'hi',
+      expect.objectContaining({
+        maxSteps: 3,
+        toolChoice: 'auto',
+        activeTools: [],
+        modelSettings: { temperature: 0.25 },
+        providerOptions: { testProvider: { flavor: 'unit' } },
+        temperature: 0.5,
+        toolCallConcurrency: 2,
+      }),
+    );
+  });
+
+  it('hard-crashes when an agent step carries an option outside the serialized subset', () => {
+    const agent = fixedResponseAgent('a6', 'ok');
+    const buildWith = (options: Record<string, unknown>) =>
+      createWorkflow({
+        id: 'bad-passthrough-wf',
+        inputSchema: z.object({ prompt: z.string() }),
+        outputSchema: z.object({ text: z.string() }),
+      })
+        .agent(agent, options as any)
+        .commit();
+
+    // Known non-round-trippable option → targeted hint.
+    expect(() => toStorableGraph(buildWith({ stopWhen: () => false }).stepGraph)).toThrow(
+      /"stopWhen" does not round-trip/,
+    );
+    expect(() => toStorableGraph(buildWith({ memory: { thread: 't-1', resource: 'r-1' } }).stepGraph)).toThrow(
+      /"memory" does not round-trip/,
+    );
+    // Unknown/future option → generic fail-closed rejection, never silent loss.
+    expect(() => toStorableGraph(buildWith({ someFutureOption: 1 }).stepGraph)).toThrow(
+      /"someFutureOption" does not round-trip/,
+    );
+  });
+
+  it('hard-crashes when an allowlisted agent option carries non-JSON-safe data', () => {
+    const agent = fixedResponseAgent('a7', 'ok');
+    const wf = createWorkflow({
+      id: 'bad-modelsettings-wf',
+      inputSchema: z.object({ prompt: z.string() }),
+      outputSchema: z.object({ text: z.string() }),
+    })
+      .agent(agent, { modelSettings: { stopSequences: new Set(['x']) } } as any)
+      .commit();
+
+    expect(() => toStorableGraph(wf.stepGraph)).toThrow(/modelSettings\.stopSequences.*class instance/);
+  });
+
+  it('hard-crashes when a tool step carries agent-only passthrough options', () => {
+    const wf = createWorkflow({
+      id: 'bad-tool-passthrough-wf',
+      inputSchema: z.object({ value: z.string() }),
+      outputSchema: z.object({ echoed: z.string() }),
+    })
+      .tool(echoTool, { maxSteps: 3 } as any)
+      .commit();
+
+    expect(() => toStorableGraph(wf.stepGraph)).toThrow(/"maxSteps" does not round-trip/);
   });
 });
 

@@ -9,6 +9,7 @@ import { cloneWorkflow, createWorkflow } from '../create';
 import { derivePredicateLabel } from '../predicate';
 import type { Step } from '../step';
 import { createStepFromAgent, createStepFromTool } from '../step-factories';
+import { SERIALIZED_AGENT_PASSTHROUGH_OPTION_KEYS } from '../types';
 import type {
   SerializedSingleStepEntry,
   SerializedStepFlowEntry,
@@ -212,8 +213,11 @@ function applyGraphEntry(
 /**
  * Reconstruct the options bag `.agent()` accepts from a serialized entry.
  * Restores `structuredOutput.schema` from `outputSchema` (JSON Schema → Zod)
- * and merges in `retries` / `metadata`. Returns `undefined` when nothing to
- * restore so `.agent(agentId)` stays a clean call.
+ * and merges in `retries` / `metadata` plus the JSON-safe execution
+ * passthrough options (`maxSteps`, `toolChoice`, `activeTools`,
+ * `modelSettings`, …) that `runAgentEntry` forwards verbatim to the agent
+ * run. Returns `undefined` when nothing to restore so `.agent(agentId)`
+ * stays a clean call.
  */
 function rebuildAgentOptions(
   entry: {
@@ -228,6 +232,10 @@ function rebuildAgentOptions(
   }
   if (entry.options?.retries !== undefined) opts.retries = entry.options.retries;
   if (entry.options?.metadata !== undefined) opts.metadata = entry.options.metadata;
+  for (const key of SERIALIZED_AGENT_PASSTHROUGH_OPTION_KEYS) {
+    const value = entry.options?.[key];
+    if (value !== undefined) opts[key] = value;
+  }
   return Object.keys(opts).length > 0 ? opts : undefined;
 }
 

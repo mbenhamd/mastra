@@ -751,7 +751,7 @@ export class SlackProvider implements ChannelProvider {
     // messages into controller sessions via AgentControllerChannels; plain
     // agents route into the agent via AgentChannels.
     if (controller && this.#mastra) {
-      const controllerChannels = this.#createAgentControllerChannels(controller, adapter);
+      const controllerChannels = await this.#createAgentControllerChannels(controller, adapter);
       await controllerChannels.initialize(this.#mastra);
     } else if (agent && this.#mastra) {
       const agentChannels = this.#createAgentChannels(agent, adapter);
@@ -956,19 +956,29 @@ export class SlackProvider implements ChannelProvider {
    * {@link AgentControllerChannels} that preserves any config the controller
    * already had (including other adapters) and layers this Slack adapter on,
    * then swap it onto the controller via `setChannels`. Mirrors the agent path
-   * — a superset merge, not a mutation of the live instance.
+   * — a superset merge, not a mutation of the live instance. Like the agent
+   * path, the replaced instance is `close()`d (and awaited) BEFORE the swap so
+   * persistent gateway connections and thread subscriptions from the old
+   * instance are torn down instead of leaking — `AgentController.setChannels`
+   * only swaps the reference and never closes the previous instance, so this
+   * is the single close for it (`AgentChannels.close()` is idempotent either
+   * way).
    *
    * The swap discards the old instance's in-memory `autoApproveResourceIds`
    * tracking. That's fine: the set is refreshed on every inbound message, and
    * Slack renders approval buttons anyway so it stays empty here.
    */
-  #createAgentControllerChannels(controller: AgentController<any>, adapter: SlackAdapter): AgentControllerChannels {
+  async #createAgentControllerChannels(
+    controller: AgentController<any>,
+    adapter: SlackAdapter,
+  ): Promise<AgentControllerChannels> {
     const adapterConfig = this.#resolveSlackAdapterConfig();
     const slackEntry = (Object.keys(adapterConfig).length > 0 ? { adapter, ...adapterConfig } : adapter) as
       | ChannelAdapterConfig
       | SlackAdapter;
     const existing = controller.getChannels() as AgentControllerChannels | null;
     const existingConfig = existing?.channelConfig;
+    await existing?.close();
     const controllerChannels = new AgentControllerChannels({
       ...existingConfig,
       ...this.#forwardedChannelOptions(),
@@ -1003,7 +1013,7 @@ export class SlackProvider implements ChannelProvider {
       }
       let channels = controller.getChannels();
       if (!channels || channels.adapters.slack !== currentAdapter) {
-        channels = this.#createAgentControllerChannels(controller, currentAdapter);
+        channels = await this.#createAgentControllerChannels(controller, currentAdapter);
         await channels.initialize(this.#mastra);
       }
       return channels;
