@@ -122,6 +122,15 @@ function isBodyTooLargeError(error: Error): boolean {
   return (error as { code?: string }).code === 'FST_ERR_CTP_BODY_TOO_LARGE';
 }
 
+/**
+ * A multipart request stream that closes before the body completed (client
+ * abort). Distinct from a body-limit breach: surfaces as a bodyParseError
+ * (400 attempt to a client that is usually already gone) rather than a 413.
+ */
+function createPrematureCloseError(): Error {
+  return new Error('Multipart request stream closed before the body completed');
+}
+
 // Extend Fastify types to include Mastra context
 declare module 'fastify' {
   interface FastifyRequest {
@@ -418,6 +427,15 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
         return;
       }
 
+      // A request stream that was already torn down (client aborted while an
+      // earlier await was in flight) will never emit 'data'/'end'/'error'/
+      // 'close' again — busboy would never finish and this promise would pend
+      // forever. Fail it before registering any listeners.
+      if (request.raw.destroyed || request.raw.readableAborted) {
+        reject(createPrematureCloseError());
+        return;
+      }
+
       const result: Record<string, unknown> = {};
       const partCountLimit = Math.floor(maxTotalBytes / MIN_MULTIPART_PART_WIRE_BYTES) + 2;
 
@@ -448,6 +466,7 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
         if (settled) return;
         settled = true;
         request.raw.removeListener('data', onAggregateData);
+        request.raw.removeListener('close', onRawClose);
         request.raw.unpipe(busboy);
         busboy.destroy();
         reject(error);
@@ -457,6 +476,7 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
         if (settled) return;
         settled = true;
         request.raw.removeListener('data', onAggregateData);
+        request.raw.removeListener('close', onRawClose);
         resolve(result);
       };
 
@@ -532,6 +552,19 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
       request.raw.once('error', (error: Error) => {
         settleReject(error);
       });
+
+      // Premature close WITHOUT an 'error' event (e.g. the socket torn down
+      // after the response side detached, or a destroy() without an error):
+      // busboy never emits 'finish', so this promise would pend forever. On
+      // normal completion 'end' fires first (readableEnded is true by the
+      // time 'close' arrives), so this backstop never rejects a completed
+      // body; after any settle it is a guarded no-op.
+      const onRawClose = () => {
+        if (!settled && !request.raw.readableEnded) {
+          settleReject(createPrematureCloseError());
+        }
+      };
+      request.raw.once('close', onRawClose);
 
       request.raw.on('data', onAggregateData);
       // Pipe the raw request to busboy

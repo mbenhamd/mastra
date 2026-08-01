@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import http from 'node:http';
+import { PassThrough } from 'node:stream';
 import type {
   AdapterTestContext,
   AdapterSetupOptions,
@@ -1424,6 +1425,168 @@ describe('Fastify Server Adapter', () => {
         bytes: payload.byteLength,
         sha256: createHash('sha256').update(payload).digest('hex'),
       });
+    });
+
+    // --- Premature request closure during multipart parsing (PF-2594 CodeRabbit round) ---
+    //
+    // A request stream can close WITHOUT an 'error' event (client abort), or
+    // arrive already destroyed (abort during an earlier await). Busboy then
+    // never emits 'finish' and the parser promise would pend forever.
+
+    it('settles multipart parsing when the request stream closes prematurely without an error', async () => {
+      app = Fastify();
+      const adapter = new MastraServer({ app, mastra: context.mastra });
+
+      const boundary = 'premature-close-boundary';
+      const route: ServerRoute<any, any, any> = {
+        method: 'POST',
+        path: '/test/premature-close',
+        responseType: 'json',
+        handler: async () => ({ ok: true }),
+      };
+      const makeFakeRequest = (raw: PassThrough) =>
+        ({
+          params: {},
+          query: {},
+          body: undefined,
+          headers: { 'content-type': `multipart/form-data; boundary=${boundary}` },
+          server: { initialConfig: { bodyLimit: 1024 * 1024 } },
+          raw,
+        }) as any;
+      const bounded = <T>(parse: Promise<T>) =>
+        Promise.race([
+          parse,
+          sleep(2000).then(() => {
+            throw new Error('parser promise still pending after premature close');
+          }),
+        ]);
+
+      // Close WITHOUT 'error' mid-parse: destroy() with no error argument
+      // emits only 'close'; busboy never finishes on its own.
+      const midParseRaw = new PassThrough();
+      const midParse = adapter.getParams(route, makeFakeRequest(midParseRaw));
+      midParseRaw.write(`--${boundary}\r\ncontent-disposition: form-data; name="a"\r\n\r\npartial`);
+      await sleep(10);
+      midParseRaw.destroy();
+      const midParseParams = await bounded(midParse);
+      expect(midParseParams.bodyParseError?.message).toMatch(/closed before the body completed/);
+
+      // Stream already destroyed BEFORE the parse starts: no future events at
+      // all, so the parse must fail immediately instead of waiting for them.
+      const deadRaw = new PassThrough();
+      deadRaw.destroy();
+      await sleep(1);
+      const deadParams = await bounded(adapter.getParams(route, makeFakeRequest(deadRaw)));
+      expect(deadParams.bodyParseError?.message).toMatch(/closed before the body completed/);
+    });
+
+    it('recovers when a client aborts a multipart upload mid-stream (socket teardown)', async () => {
+      app = Fastify();
+      const adapter = new MastraServer({ app, mastra: context.mastra });
+
+      const testRoute: ServerRoute<any, any, any> = {
+        method: 'POST',
+        path: '/test/abort-upload',
+        responseType: 'json',
+        handler: async (params: any) => ({ ok: true, name: params.name }),
+      };
+
+      adapter.registerContextMiddleware();
+      await adapter.registerRoute(app, testRoute, { prefix: '' });
+
+      // Capture the in-flight getParams promise so settlement is observable.
+      const getParamsResults: Array<Promise<unknown>> = [];
+      const realGetParams = adapter.getParams.bind(adapter);
+      vi.spyOn(adapter, 'getParams').mockImplementation((route, request) => {
+        const parse = realGetParams(route, request);
+        getParamsResults.push(parse);
+        return parse;
+      });
+
+      const address = await app.listen({ port: 0 });
+      const boundary = 'abort-mid-upload';
+
+      await new Promise<void>(resolve => {
+        const req = http.request({
+          host: '127.0.0.1',
+          port: serverPort(address),
+          method: 'POST',
+          path: '/test/abort-upload',
+          headers: {
+            'content-type': `multipart/form-data; boundary=${boundary}`,
+            // Declared length far beyond what is sent: the parse is
+            // mid-stream when the socket dies.
+            'content-length': 512 * 1024,
+          },
+        });
+        req.on('error', () => resolve());
+        req.on('close', () => resolve());
+        req.write(
+          `--${boundary}\r\ncontent-disposition: form-data; name="file"; filename="a.bin"\r\ncontent-type: application/octet-stream\r\n\r\n`,
+        );
+        req.write(Buffer.alloc(4096, 0x61));
+        setTimeout(() => req.destroy(), 20);
+      });
+
+      // The in-flight parse must settle in bounded time (via 'error' or the
+      // premature-close backstop) — never a pending-forever leak.
+      await waitFor(() => getParamsResults.length === 1, 1000);
+      const settlement = await Promise.race([
+        getParamsResults[0]!.then(
+          () => 'settled',
+          () => 'settled',
+        ),
+        sleep(2000).then(() => 'pending'),
+      ]);
+      expect(settlement).toBe('settled');
+
+      // The abort must not wedge the server: a fresh multipart request works.
+      const followUp = new FormData();
+      followUp.append('name', 'after-client-abort');
+      const accepted = await fetch(`${address}/test/abort-upload`, {
+        method: 'POST',
+        body: followUp as any,
+      });
+      expect(accepted.status).toBe(200);
+      await expect(accepted.json()).resolves.toMatchObject({ ok: true, name: 'after-client-abort' });
+    });
+
+    it('does not spuriously reject multipart parsing on normal completion (close after end)', async () => {
+      app = Fastify();
+      const adapter = new MastraServer({ app, mastra: context.mastra });
+
+      const testRoute: ServerRoute<any, any, any> = {
+        method: 'POST',
+        path: '/test/normal-complete',
+        responseType: 'json',
+        handler: async (params: any) => ({ ok: true, name: params.name }),
+      };
+
+      adapter.registerContextMiddleware();
+      await adapter.registerRoute(app, testRoute, { prefix: '' });
+
+      const getParamsResults: Array<Promise<{ body?: unknown; bodyParseError?: { message: string } }>> = [];
+      const realGetParams = adapter.getParams.bind(adapter);
+      vi.spyOn(adapter, 'getParams').mockImplementation((route, request) => {
+        const parse = realGetParams(route, request);
+        getParamsResults.push(parse);
+        return parse;
+      });
+
+      const address = await app.listen({ port: 0 });
+
+      const form = new FormData();
+      form.append('name', 'all-good');
+      form.append('file', new Blob(['hello world']), 'h.txt');
+      const response = await fetch(`${address}/test/normal-complete`, { method: 'POST', body: form as any });
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toMatchObject({ ok: true, name: 'all-good' });
+
+      // The raw socket's 'close' after a completed body must not have turned
+      // into a premature-close rejection.
+      const params = await getParamsResults[0]!;
+      expect(params.bodyParseError).toBeUndefined();
+      expect(params.body).toMatchObject({ name: 'all-good' });
     });
   });
 
