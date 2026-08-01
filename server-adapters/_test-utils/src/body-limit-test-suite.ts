@@ -167,7 +167,7 @@ export function createBodyLimitTestSuite<TApp>(config: BodyLimitTestSuiteConfig<
 
       multipartIt('rejects a multipart body whose aggregate exceeds the limit with 413', async () => {
         // Each part stays under every per-part cap; only the aggregate breaches.
-        const partValue = 'y'.repeat(Math.ceil(maxSize * 0.4));
+        const partValue = 'y'.repeat(Math.floor(maxSize / 2));
         const payload = buildMultipartPayload(boundary, [
           { name: 'a', value: partValue },
           { name: 'b', value: partValue },
