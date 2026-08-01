@@ -2,11 +2,10 @@
  * Login dialog component - handles OAuth login flow UI
  */
 
-import { spawn } from 'node:child_process';
-import { win32 } from 'node:path';
 import { Box, Container, getKeybindings, hyperlink, Spacer, Text } from '@earendil-works/pi-tui';
 import type { Focusable, TUI } from '@earendil-works/pi-tui';
 import { getOAuthProviders } from '@mastra/code-sdk/auth/index';
+import { openUrlInBrowser } from '../open-url.js';
 import { theme } from '../theme.js';
 import { MaskedInput } from './masked-input.js';
 
@@ -29,30 +28,6 @@ function parseBrowserUrl(url: string): URL | undefined {
 
 function sanitizeTerminalText(value: string): string {
   return value.replace(/[\u0000-\u001F\u007F-\u009F]/g, '\uFFFD');
-}
-
-function openUrlInBrowser(parsed: URL): void {
-  const url = parsed.href;
-  const configuredWindowsRoot = process.env.SystemRoot || process.env.WINDIR;
-  const windowsRoot =
-    configuredWindowsRoot && win32.isAbsolute(configuredWindowsRoot) ? configuredWindowsRoot : String.raw`C:\Windows`;
-  const windowsLauncher = win32.join(windowsRoot, 'System32', 'rundll32.exe');
-
-  const [cmd, args]: [string, string[]] =
-    process.platform === 'darwin'
-      ? ['open', [url]]
-      : process.platform === 'win32'
-        ? [windowsLauncher, ['url.dll,FileProtocolHandler', url]]
-        : ['xdg-open', [url]];
-
-  try {
-    const child = spawn(cmd, args, { stdio: 'ignore', detached: true });
-    // Opening the browser is best-effort — the URL is shown in the dialog.
-    child.on('error', () => {});
-    child.unref();
-  } catch {
-    // Ignore synchronous argument/spawn failures too.
-  }
 }
 
 export class LoginDialogComponent extends Box implements Focusable {
@@ -149,7 +124,7 @@ export class LoginDialogComponent extends Box implements Focusable {
     // shell so it can't be used for command injection (CodeQL
     // js/shell-command-constructed-from-input).
     if (parsedUrl) {
-      openUrlInBrowser(parsedUrl);
+      openUrlInBrowser(parsedUrl.href);
     }
 
     this.tui.requestRender();
