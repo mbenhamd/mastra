@@ -366,6 +366,8 @@ export interface PreparationOptions<OUTPUT = undefined> {
    * callers use this to keep dynamic defaults single-resolution.
    */
   resolvedDefaultOptions?: AgentExecutionOptions<OUTPUT>;
+  /** Whether execution options already include the agent defaults. */
+  optionsAreResolved?: boolean;
   /** Memory already resolved by an enclosing execution boundary. */
   resolvedMemory?: ResolvedAgentMemory;
   /** Explicit non-secret application keys that may cross the durable boundary. */
@@ -467,6 +469,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
     agent,
     messages,
     options: rawExecOptions,
+    optionsAreResolved = false,
     requestContext: providedRequestContext,
     logger,
     mastra,
@@ -489,11 +492,25 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
   // mirroring the non-durable Agent.stream()/generate() paths. Without this the
   // agent's configured defaults (maxSteps, providerOptions, etc.) are silently
   // dropped and durable runs fall back to DurableAgentDefaults.MAX_STEPS.
-  const defaultOptions = options.resolvedDefaultOptions ?? (await typedAgent.getDefaultOptions({ requestContext }));
-  const execOptions = mergeAgentExecutionOptions(
-    (defaultOptions ?? {}) as Record<string, any>,
-    (rawExecOptions ?? {}) as Record<string, any>,
-  ) as AgentExecutionOptions<OUTPUT>;
+  // Dynamic defaults resolve exactly once per run: the pre-resolved lane must
+  // reuse the caller-provided snapshot and never re-invoke getDefaultOptions.
+  const defaultOptions = (
+    optionsAreResolved
+      ? options.resolvedDefaultOptions
+      : (options.resolvedDefaultOptions ?? (await typedAgent.getDefaultOptions({ requestContext })))
+  ) as AgentExecutionOptions<OUTPUT> | undefined;
+  const execOptions: AgentExecutionOptions<OUTPUT> = optionsAreResolved
+    ? (rawExecOptions ?? ({} as AgentExecutionOptions<OUTPUT>))
+    : (mergeAgentExecutionOptions(
+        (defaultOptions ?? {}) as Record<string, any>,
+        (rawExecOptions ?? {}) as Record<string, any>,
+      ) as AgentExecutionOptions<OUTPUT>);
+  // Actor is a per-call trust signal: an explicit value replaces the default
+  // actor as a whole rather than field-merging with it (a default's
+  // sourceWorkflow must never tag a caller-supplied actor).
+  if (!optionsAreResolved && rawExecOptions?.actor !== undefined) {
+    execOptions.actor = rawExecOptions.actor;
+  }
   // An explicit context wins. Otherwise the context supplied by dynamic
   // defaults is the execution context and must drive preflight, dependency
   // resolution, and cold-recovery persistence rather than the empty bootstrap
@@ -1059,9 +1076,14 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
             if (!shouldGenerate || thread?.title) return;
 
             const titleMessageList = new MessageList().deserialize(messageListState);
-            const uiMessages = titleMessageList.get.all.ui();
-            const coreMessages = titleMessageList.get.all.core();
-            if (coreMessages.length < (minMessages ?? 1)) return;
+            // Only messages of the thread being titled — resource-scoped memory can
+            // load messages from other threads into the deserialized list.
+            const uiMessages = agent.filterUiMessagesByThread(
+              titleMessageList,
+              threadId,
+              titleMessageList.get.all.ui(),
+            );
+            if (uiMessages.length < (minMessages ?? 1)) return;
 
             const userMessage = agent.getMostRecentUserMessage(uiMessages);
             if (!userMessage) return;

@@ -141,6 +141,9 @@ export function createRouteAdapterTestSuite(config: AdapterTestSuiteConfig) {
       // tests cover the behavior.
       '/agents/:agentId/approve-network-tool-call',
       '/agents/:agentId/decline-network-tool-call',
+      // Recover requires both a durable agent and a persisted workflow run.
+      // Its stateful behavior is covered by packages/server/src/server/handlers/agents.test.ts.
+      '/agents/:agentId/recover',
       // Tool-provider connection routes that require a persisted connection
       // row matching the supplied connectionId. The test suite uses a generic
       // 'test-connection-id' that isn't seeded, so the fail-closed ownership

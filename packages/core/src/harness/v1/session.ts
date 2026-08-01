@@ -3057,7 +3057,26 @@ export class Session {
 
   private _pendingInteractionDueAt(pending: PendingResume): number {
     if (pending.resumedAt === undefined) return this._pendingInteractionExpiresAt(pending);
-    if (!Number.isSafeInteger(pending.resumeRecoveryAt) || pending.resumeRecoveryAt! < pending.resumedAt) {
+    if (pending.resumeRecoveryAt === undefined) {
+      // At-least-once resume marker without a recovery stamp: rows written by
+      // builds that predate `resumeRecoveryAt` (the admission CAS now stamps
+      // both fields atomically, so current code can no longer produce this
+      // shape). The marker stays RECOVERABLE — its effective deadline is the
+      // admission time plus the accepted-recovery stale window, exactly what
+      // the stamping writer would have persisted. Classifying it corrupt would
+      // permanently wedge the session on hydrate, the precise outcome the
+      // crash-mid-resume recovery contract forbids (queue not parked).
+      if (!Number.isSafeInteger(pending.resumedAt) || pending.resumedAt < 0) {
+        throw new HarnessSessionCorruptError({
+          reason: 'pending_state_corrupt',
+          sessionId: this.id,
+          resourceId: this.resourceId,
+          threadId: this.threadId,
+        });
+      }
+      return pending.resumedAt + QUEUE_ACCEPTED_RECOVERY_STALE_MS;
+    }
+    if (!Number.isSafeInteger(pending.resumeRecoveryAt) || pending.resumeRecoveryAt < pending.resumedAt) {
       throw new HarnessSessionCorruptError({
         reason: 'pending_state_corrupt',
         sessionId: this.id,
@@ -3065,7 +3084,7 @@ export class Session {
         threadId: this.threadId,
       });
     }
-    return pending.resumeRecoveryAt!;
+    return pending.resumeRecoveryAt;
   }
 
   private _pendingInteractionGeneration(pending: PendingResume): PendingInteractionExpiryGeneration {
@@ -3175,6 +3194,14 @@ export class Session {
     if (pending.resumedAt !== undefined) {
       const recovery = await this._maybeRecoverStaleQueuedResume({ kickDrainOnStale: false });
       if (recovery.status !== 'none') return;
+      if (pending.resumeRecoveryAt === undefined) {
+        // Legacy at-least-once marker (no recovery stamp): resolution belongs
+        // to the interactive lanes — the next respond surfaces the
+        // deterministic `harness.resume_recovery_stale` outcome and durably
+        // clears the marker. Hydration only adopts; it neither terminalizes
+        // the marker nor races the caller's next respond with an expiry timer.
+        return;
+      }
     }
     const dueAt = this._pendingInteractionDueAt(pending);
     if (Date.now() < dueAt) {
@@ -3430,11 +3457,13 @@ export class Session {
     expected: PendingInteractionExpiryGeneration,
     opts: { drainQueue?: boolean } = {},
   ): Promise<boolean> {
-    if (
-      expected.resumedAt === undefined ||
-      expected.resumeRecoveryAt === undefined ||
-      expected.dueAt !== expected.resumeRecoveryAt
-    ) {
+    if (expected.resumedAt === undefined) return false;
+    // Legacy at-least-once markers carry no recovery stamp; their effective
+    // deadline is the synthesized one `_pendingInteractionDueAt` folded into
+    // `dueAt` (admission + stale window). Stamped rows keep the exact-identity
+    // requirement between the generation's dueAt and the persisted stamp.
+    const expectedRecoveryDueAt = expected.resumeRecoveryAt ?? expected.resumedAt + QUEUE_ACCEPTED_RECOVERY_STALE_MS;
+    if (expected.dueAt !== expectedRecoveryDueAt) {
       return false;
     }
     const currentPending = this._record.pendingResume;
@@ -3451,7 +3480,7 @@ export class Session {
         return recovery.status === 'completed';
       }
     }
-    if (Date.now() < expected.resumeRecoveryAt) {
+    if (Date.now() < expectedRecoveryDueAt) {
       this._syncPendingInteractionExpiryTimer();
       return false;
     }
@@ -3459,7 +3488,7 @@ export class Session {
     // owner (or a hydrated session with no active turn) may classify the
     // persisted admission as abandoned.
     if (this._currentTurnAbortController !== undefined) {
-      this._pendingInteractionExpiryAt = expected.resumeRecoveryAt;
+      this._pendingInteractionExpiryAt = expectedRecoveryDueAt;
       this._pendingInteractionExpiryTimer = setTimeout(() => {
         this._pendingInteractionExpiryTimer = undefined;
         this._pendingInteractionExpiryAt = undefined;

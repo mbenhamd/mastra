@@ -23,6 +23,7 @@ import type {
   V6UIMessage,
   V6UIMessageStream,
 } from './public-types';
+import type { MastraStreamTransformOptions } from './smooth-stream';
 
 export interface V6NativeApprovalResponse {
   resumeData: Record<string, unknown>;
@@ -142,9 +143,10 @@ function streamV6ApprovalResumes(args: {
   sendSources: boolean;
   onError?: (error: unknown) => string;
   messageMetadata?: UIMessageStreamOptionsV6<V6UIMessage>['messageMetadata'];
+  experimentalTransform?: MastraStreamTransformOptions<any>;
 }): ReadableStream<any> {
   const { agent, approvals, baseOptions, structuredOutput, messages, lastMessageId } = args;
-  const { sendStart, sendFinish, sendReasoning, sendSources, onError, messageMetadata } = args;
+  const { sendStart, sendFinish, sendReasoning, sendSources, onError, messageMetadata, experimentalTransform } = args;
 
   return createUIMessageStreamV6<any>({
     originalMessages: messages,
@@ -173,6 +175,7 @@ function streamV6ApprovalResumes(args: {
             sendFinish,
             sendReasoning,
             sendSources,
+            experimentalTransform,
             onError,
             messageMetadata,
           })) {
@@ -240,6 +243,11 @@ export type ChatStreamHandlerParams<
   trigger?: 'submit-message' | 'regenerate-message';
 };
 
+export type ChatStreamDefaultOptions<OUTPUT = undefined> = AgentExecutionOptions<OUTPUT> & {
+  /** Experimental transforms applied before converting Mastra chunks to AI SDK UI chunks. */
+  experimentalTransform?: MastraStreamTransformOptions<OUTPUT>;
+};
+
 /**
  * Extracted from the second parameter of `Mastra.getAgentById` so the type
  * stays in sync with core automatically.
@@ -251,7 +259,9 @@ export type ChatStreamHandlerOptions<UI_MESSAGE extends SupportedUIMessage = Sup
   agentId: string;
   agentVersion?: AgentVersionOptions;
   params: ChatStreamHandlerParams<UI_MESSAGE, OUTPUT>;
-  defaultOptions?: AgentExecutionOptions<OUTPUT>;
+  defaultOptions?: ChatStreamDefaultOptions<OUTPUT>;
+  /** Experimental transforms applied before converting Mastra chunks to AI SDK UI chunks. */
+  experimentalTransform?: MastraStreamTransformOptions<OUTPUT>;
   version?: 'v5' | 'v6';
   sendStart?: boolean;
   sendFinish?: boolean;
@@ -536,6 +546,7 @@ export async function handleChatStream<OUTPUT = undefined>({
   agentVersion,
   params,
   defaultOptions,
+  experimentalTransform,
   version = 'v5',
   sendStart = true,
   sendFinish = true,
@@ -597,8 +608,13 @@ export async function handleChatStream<OUTPUT = undefined>({
   }
 
   const { structuredOutput: restStructuredOutput, ...restOptions } = rest;
-  const { structuredOutput: defaultStructuredOutput, ...defaultOptionsRest } = defaultOptions ?? {};
+  const {
+    structuredOutput: defaultStructuredOutput,
+    experimentalTransform: defaultExperimentalTransform,
+    ...defaultOptionsRest
+  } = defaultOptions ?? {};
   const structuredOutput = restStructuredOutput ?? defaultStructuredOutput;
+  const effectiveExperimentalTransform = experimentalTransform ?? defaultExperimentalTransform;
 
   const mergedProviderOptions = {
     ...defaultOptions?.providerOptions,
@@ -640,6 +656,7 @@ export async function handleChatStream<OUTPUT = undefined>({
         sendReasoning,
         sendSources,
         onError,
+        experimentalTransform: effectiveExperimentalTransform,
         messageMetadata: messageMetadata as UIMessageStreamOptionsV6<V6UIMessage>['messageMetadata'],
       });
     }
@@ -665,6 +682,7 @@ export async function handleChatStream<OUTPUT = undefined>({
           sendFinish,
           sendReasoning,
           sendSources,
+          experimentalTransform: effectiveExperimentalTransform,
           onError,
           messageMetadata: messageMetadata as UIMessageStreamOptionsV6<V6UIMessage>['messageMetadata'],
         })) {
@@ -684,6 +702,7 @@ export async function handleChatStream<OUTPUT = undefined>({
         sendFinish,
         sendReasoning,
         sendSources,
+        experimentalTransform: effectiveExperimentalTransform,
         onError,
         messageMetadata: messageMetadata as UIMessageStreamOptionsV5<V5UIMessage>['messageMetadata'],
       })) {
@@ -785,7 +804,9 @@ export async function handleHarnessChatStream<OUTPUT = undefined>({
 }
 
 export type chatRouteOptions<OUTPUT = undefined> = {
-  defaultOptions?: AgentExecutionOptions<OUTPUT>;
+  defaultOptions?: ChatStreamDefaultOptions<OUTPUT>;
+  /** Experimental transforms applied before converting Mastra chunks to AI SDK UI chunks. */
+  experimentalTransform?: MastraStreamTransformOptions<OUTPUT>;
   version?: 'v5' | 'v6';
   agentVersion?: AgentVersionOptions;
 } & (
@@ -853,6 +874,7 @@ export function chatRoute<OUTPUT = undefined>({
   path = '/chat/:agentId',
   agent,
   defaultOptions,
+  experimentalTransform,
   version = 'v5',
   agentVersion,
   sendStart = true,
@@ -1051,6 +1073,7 @@ export function chatRoute<OUTPUT = undefined>({
           abortSignal: c.req.raw.signal,
         } as any,
         defaultOptions,
+        experimentalTransform,
         sendStart,
         sendFinish,
         sendReasoning,

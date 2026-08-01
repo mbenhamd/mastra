@@ -45,6 +45,10 @@ const RESERVED_CONTEXT_KEYS = new Set([
   'user',
   'userPermissions',
   'userRoles',
+  // Tenant scope must be established server-side, never self-asserted by a
+  // client. The trusted-actor FGA gate keys off `organizationId`, so a
+  // body-supplied value must not be merged into the request context.
+  'organizationId',
 ]);
 
 export function isReservedRequestContextKey(key: string): boolean {

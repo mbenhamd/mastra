@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { getSerializedEntryId } from '../step-entry';
 import type { SerializedStepFlowEntry, WorkflowRunState } from '../types';
 import {
   createWorkflowTerminalParentContinuationContract,
@@ -325,8 +326,14 @@ function activeTopologyMatchesSource(
 function nextTarget(graph: readonly SerializedStepFlowEntry[], index: number): WorkflowTerminalRunTarget {
   const entry = graph[index];
   if (!entry) throw new TypeError('Workflow terminal planner successor is missing');
-  if (entry.type === 'step') {
-    return { kind: 'step', stepId: entry.step.id, executionPath: [index] };
+  if (
+    entry.type === 'step' ||
+    entry.type === 'agent' ||
+    entry.type === 'tool' ||
+    entry.type === 'mapping' ||
+    entry.type === 'workflow'
+  ) {
+    return { kind: 'step', stepId: getSerializedEntryId(entry), executionPath: [index] };
   }
   if (entry.type === 'sleep' || entry.type === 'sleepUntil') {
     return { kind: 'entry', entryType: entry.type, entryId: entry.id, executionPath: [index] };
@@ -532,7 +539,9 @@ function planAction(
     const rootIndex = view.effect.parentExecutionPath[0]!;
     const entry = view.parentSnapshot.serializedStepGraph[rootIndex];
     if (!entry || (entry.type !== 'parallel' && entry.type !== 'conditional')) throw new TypeError('Branch is missing');
-    const branchCoordinates = new Map(entry.steps.map((branch, index) => [branch.step.id, [rootIndex, index]]));
+    const branchCoordinates = new Map(
+      entry.steps.map((branch, index) => [getSerializedEntryId(branch), [rootIndex, index]]),
+    );
     if (
       Object.entries(view.parentSnapshot.activeStepsPath).some(
         ([stepId, path]) => !branchCoordinates.has(stepId) || !samePath(path, branchCoordinates.get(stepId)!),
@@ -542,13 +551,17 @@ function planAction(
     }
     if (
       entry.steps.some(
-        branch => branch.step.id !== source.stepId && contextEntry(view.parentSnapshot, branch.step.id) === undefined,
+        branch =>
+          getSerializedEntryId(branch) !== source.stepId &&
+          contextEntry(view.parentSnapshot, getSerializedEntryId(branch)) === undefined,
       )
     ) {
       return 'plan-conflict';
     }
     const statuses = entry.steps.map(branch =>
-      branch.step.id === source.stepId ? 'success' : contextEntry(view.parentSnapshot, branch.step.id)?.status,
+      getSerializedEntryId(branch) === source.stepId
+        ? 'success'
+        : contextEntry(view.parentSnapshot, getSerializedEntryId(branch))?.status,
     );
     if (statuses.some(status => status !== undefined && !BRANCH_STATUSES.has(status))) {
       return 'plan-conflict';
@@ -556,9 +569,9 @@ function planAction(
     if (
       entry.steps.some(
         (branch, index) =>
-          branch.step.id !== source.stepId &&
+          getSerializedEntryId(branch) !== source.stepId &&
           statuses[index] === 'running' &&
-          !Object.prototype.hasOwnProperty.call(view.parentSnapshot.activeStepsPath, branch.step.id),
+          !Object.prototype.hasOwnProperty.call(view.parentSnapshot.activeStepsPath, getSerializedEntryId(branch)),
       )
     ) {
       return 'plan-conflict';
@@ -573,9 +586,9 @@ function planAction(
     if (
       entry.steps.some(
         (branch, index) =>
-          branch.step.id !== source.stepId &&
+          getSerializedEntryId(branch) !== source.stepId &&
           (statuses[index] === 'success' || statuses[index] === 'skipped') &&
-          Object.prototype.hasOwnProperty.call(view.parentSnapshot.activeStepsPath, branch.step.id),
+          Object.prototype.hasOwnProperty.call(view.parentSnapshot.activeStepsPath, getSerializedEntryId(branch)),
       )
     ) {
       return 'plan-conflict';

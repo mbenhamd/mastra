@@ -61,12 +61,8 @@ const codingHarness = new Harness(codingConfig);
 const supportHarness = new Harness(supportConfig);
 
 const mastra = new Mastra({
-  agents: {
-    /* ... */
-  },
-  workflows: {
-    /* ... */
-  },
+  agents: {/* ... */},
+  workflows: {/* ... */},
   harness: {
     coding: codingHarness,
     support: supportHarness,
@@ -106,9 +102,7 @@ deployment may register X harnesses and Y channel providers:
 
 ```ts
 const mastra = new Mastra({
-  agents: {
-    /* ... */
-  },
+  agents: {/* ... */},
   channels: {
     slack: slackProvider,
     discord: discordProvider,

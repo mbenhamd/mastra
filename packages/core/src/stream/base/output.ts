@@ -60,6 +60,25 @@ export function createDestructurableOutput<OUTPUT = undefined>(
   }) as MastraModelOutput<OUTPUT>;
 }
 
+function persistProcessorDataChunk(
+  messageList: MessageList,
+  messageId: string,
+  chunk: { type: string; data?: unknown; transient?: boolean },
+): void {
+  if (!chunk.type.startsWith('data-') || chunk.transient) return;
+
+  const message: MastraDBMessage = {
+    id: messageId,
+    role: 'assistant',
+    content: {
+      format: 2,
+      parts: [{ type: chunk.type as `data-${string}`, data: chunk.data }],
+    },
+    createdAt: new Date(),
+  };
+  messageList.add(message, 'response');
+}
+
 type PromiseResults<OUTPUT = undefined> = Pick<
   LLMStepResult<OUTPUT>,
   | 'text'
@@ -406,7 +425,13 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
 
               // Create a ProcessorStreamWriter from the controller so processOutputStream can emit custom chunks
               streamWriter ??= {
-                custom: async (data: { type: string }) => controller.enqueue(data as ChunkType<OUTPUT>),
+                custom: async (
+                  data: { type: string; data?: unknown; transient?: boolean },
+                  writerOptions?: { messageId?: string },
+                ) => {
+                  persistProcessorDataChunk(self.messageList, writerOptions?.messageId ?? self.messageId, data);
+                  controller.enqueue(data as ChunkType<OUTPUT>);
+                },
               };
 
               const {
@@ -910,7 +935,12 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
               controller.terminate();
               return;
             case 'finish':
-              self.#status = 'success';
+              // 'suspended' is not terminal: a resume leg rehydrates the persisted 'suspended'
+              // status and must be able to finish as 'success'. Only 'failed' and 'canceled'
+              // block the success transition.
+              if (self.#status !== 'failed' && self.#status !== 'canceled') {
+                self.#status = 'success';
+              }
               if (chunk.payload.stepResult.reason) {
                 self.#finishReason = chunk.payload.stepResult.reason;
               }
@@ -1120,10 +1150,14 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                   // Must use both #emitChunk (for fullStream/EventEmitter consumers) and
                   // controller.enqueue (for raw stream consumers) to ensure visibility.
                   const outputResultWriter = {
-                    custom: async (data: { type: string }) => {
+                    custom: async (
+                      data: { type: string; data?: unknown; transient?: boolean },
+                      writerOptions?: { messageId?: string },
+                    ) => {
                       if (data.type === 'data-terminal-tool-result') {
                         throw new TypeError('data-terminal-tool-result is reserved for framework terminal delivery');
                       }
+                      persistProcessorDataChunk(self.messageList, writerOptions?.messageId ?? self.messageId, data);
                       const customChunk = data as ChunkType<OUTPUT>;
                       if (terminalCommit) {
                         // A pass-through processor may derive custom output from the staged
@@ -1144,18 +1178,22 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                     steps: [...self.#bufferedSteps] as LLMStepResult[],
                   };
 
-                  self.messageList = await self.processorRunner.runOutputProcessors(
-                    self.messageList,
-                    resolveObservabilityContext(options),
-                    self.#options.requestContext,
-                    0,
-                    outputResultWriter,
-                    outputResult,
-                  );
+                  if (self.#status !== 'failed' && self.#status !== 'canceled') {
+                    self.messageList = await self.processorRunner.runOutputProcessors(
+                      self.messageList,
+                      resolveObservabilityContext(options),
+                      self.#options.requestContext,
+                      0,
+                      outputResultWriter,
+                      outputResult,
+                    );
+                  }
 
                   // Get text from the final assistant turn. That turn can span more
                   // than one response message when the loop forced a continuation,
                   // so this is not simply the last response message (issue #14134).
+                  // Suppressed completion-check feedback is filtered inside
+                  // getFinalAssistantTurnText, covering the #19951 leak.
                   const outputText = self.messageList.getFinalAssistantTurnText();
 
                   // Only update the last step's text if output processors actually modified it
@@ -1659,7 +1697,17 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
    * Stream of all chunks. Provides complete control over stream processing.
    */
   get fullStream() {
-    return this.#createEventedStream();
+    const configuredTransforms = this.#options.experimentalTransform;
+    if (!configuredTransforms) {
+      return this.#createEventedStream();
+    }
+
+    const transforms = typeof configuredTransforms === 'function' ? [configuredTransforms] : configuredTransforms;
+    let stream = this.#createEventedStream();
+    for (const transform of transforms) {
+      stream = stream.pipeThrough(transform());
+    }
+    return stream;
   }
 
   /**
@@ -2187,6 +2235,12 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
 
   #createEventedStream() {
     const self = this;
+    // Holds this subscriber's own detach function once start() registers its
+    // listeners. cancel() must only remove this subscriber's handlers — the
+    // emitter is shared across every concurrent consumer of this output, so
+    // removeAllListeners() here would silently kill every other subscriber
+    // (see #19743).
+    let detach: (() => void) | undefined;
 
     return new ReadableStream<ChunkType<OUTPUT>>({
       start(controller) {
@@ -2214,6 +2268,11 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
 
         self.#emitter.on('chunk', chunkHandler);
         self.#emitter.on('finish', finishHandler);
+
+        detach = () => {
+          self.#emitter.off('chunk', chunkHandler);
+          self.#emitter.off('finish', finishHandler);
+        };
       },
 
       pull(_controller) {
@@ -2224,8 +2283,8 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
       },
 
       cancel() {
-        // Stream was cancelled, clean up
-        self.#emitter.removeAllListeners();
+        // Only detach this subscriber's own listeners — never the whole emitter.
+        detach?.();
       },
     });
   }

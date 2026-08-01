@@ -15,6 +15,7 @@ export * from './scores';
 export * from './observability';
 export * from './operations';
 export * from './workflows';
+export * from './workflow-definitions';
 export * from './memory';
 export * from './harness';
 export * from './inmemory-db';

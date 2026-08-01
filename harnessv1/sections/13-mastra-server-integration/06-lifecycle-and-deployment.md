@@ -1,7 +1,7 @@
 ### 13.6 Lifecycle and deployment
 
 Mastra Server takes responsibility for `init` and `shutdown`. Consumers don't
-call `harness.init()` directly when running under the server ÿÿÿ `mastra.init()`
+call `harness.init()` directly when running under the server â€” `mastra.init()`
 does it.
 
 Server readiness waits for the Harness/channel registry and the required

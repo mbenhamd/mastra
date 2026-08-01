@@ -54,7 +54,7 @@ import type { VersionOverrides } from '../mastra/types';
 import { mergeVersionOverrides } from '../mastra/types';
 import type { MastraMemory } from '../memory/memory';
 import type { MemoryConfig, MemoryConfigInternal } from '../memory/types';
-import { resolveNotificationDeliveryDecision } from '../notifications/delivery-policy';
+import { resolveDeliveryFailureUpdate, resolveNotificationDeliveryDecision } from '../notifications/delivery-policy';
 import {
   createNotificationSignal,
   createNotificationSummarySignal,
@@ -103,6 +103,7 @@ import { ChunkFrom } from '../stream';
 import type { ChunkType, MastraAgentNetworkStream, MastraOnFinishCallback } from '../stream';
 import type { FullOutput, MastraModelOutput } from '../stream/base/output';
 import { createTool } from '../tools';
+import { createWebSearchProviderTool, isWebSearchTool, normalizeWebSearchProvider } from '../tools/builtin/web-search';
 import { normalizeToolPayloadTransformPolicy } from '../tools/payload-transform';
 import type { ToolToConvert } from '../tools/tool-builder/builder';
 import { unwrapToolsFromHooks, wrapToolsWithHooks } from '../tools/tool-hooks';
@@ -1217,17 +1218,26 @@ export class Agent<
       maxRuns?: number;
       prompt?: string;
       id?: string;
+      activeDurationMs?: number;
     },
   ): Promise<GoalObjectiveRecord | undefined> {
     const store = await resolveGoalStore(this.#mastra as MastraUnion | undefined);
     if (!store || !options.resourceId || !options.threadId) return undefined;
 
     const now = Date.now();
+    const suppliedActiveDurationMs = options.activeDurationMs;
+    const activeDurationMs =
+      suppliedActiveDurationMs !== undefined &&
+      Number.isFinite(suppliedActiveDurationMs) &&
+      suppliedActiveDurationMs >= 0
+        ? suppliedActiveDurationMs
+        : 0;
     const record: GoalObjectiveRecord = {
       id: options.id ?? randomUUID(),
       objective,
       status: 'active',
       runsUsed: 0,
+      activeDurationMs,
       startedAt: now,
       updatedAt: now,
       ...(options.maxRuns !== undefined && options.maxRuns > 0 ? { maxRuns: options.maxRuns } : {}),
@@ -1743,7 +1753,7 @@ export class Agent<
       const user = requestContext?.get('user');
       const actor = options?.actor;
       const trustedActor = isTrustedActorSignal(actor);
-      const { FGADeniedError } = await import(/* @vite-ignore */ '../auth/ee/fga-check');
+      const { FGADeniedError } = await import('../auth/ee/fga-check');
       if (!user && !trustedActor) {
         throw new FGADeniedError(
           { id: 'unknown' },
@@ -1770,7 +1780,7 @@ export class Agent<
         return;
       }
 
-      await this.#requireAgentExecutionFGA({
+      await this.requireAgentExecutionFGA({
         requestContext,
         memory: options?.memory,
         runId: options?.runId,
@@ -1794,6 +1804,7 @@ export class Agent<
     agentId?: string;
     agentName?: string;
     actor?: ActorSignal;
+    authorize?: boolean;
   }): Promise<void> {
     await this.#assertAgentExecutionPreflight(options.requestContext, {
       memory: options.memory,
@@ -1802,6 +1813,7 @@ export class Agent<
       agentId: options.agentId,
       agentName: options.agentName,
       actor: options.actor,
+      authorize: options.authorize,
     });
   }
 
@@ -1915,7 +1927,7 @@ export class Agent<
 
     // Single item that's already a workflow - mark it as processor type and return
     if (processors.length === 1 && isProcessorWorkflow(processors[0]!)) {
-      const workflow = processors[0]!;
+      const workflow = processors[0];
       // Mark the workflow as a processor workflow if not already set
       // Note: This mutates the workflow, but processor workflows are expected to be
       // dedicated to this purpose and not reused as regular workflows
@@ -1976,7 +1988,7 @@ export class Agent<
 
     // If after filtering we have a single workflow, mark it as processor type and return
     if (validProcessors.length === 1 && isProcessorWorkflow(validProcessors[0]!)) {
-      const workflow = validProcessors[0]!;
+      const workflow = validProcessors[0];
       // Mark the workflow as a processor workflow if not already set
       if (!workflow.type) {
         workflow.type = 'processor';
@@ -2860,7 +2872,7 @@ export class Agent<
     const tools: Array<{ mcpMetadata?: McpMetadata } | undefined> = [];
 
     if (toolsetsMode !== 'replace') {
-      const assignedTools = await this.listTools({ requestContext });
+      const assignedTools = await this.listTools({ requestContext, resolveWebSearch: false });
       tools.push(...(Object.values(assignedTools || {}) as { mcpMetadata?: McpMetadata }[]));
     }
 
@@ -3177,19 +3189,11 @@ export class Agent<
    * console.log(Object.keys(tools)); // ['calculator', 'weather', ...]
    * ```
    */
-  public listTools({ requestContext = new RequestContext() }: { requestContext?: RequestContext } = {}):
-    | TTools
-    | Promise<TTools> {
-    if (typeof this.#tools !== 'function') {
-      return ensureToolProperties(this.#tools) as TTools;
-    }
-
-    const result = this.#tools({
-      requestContext: requestContext as RequestContext<TRequestContext>,
-      mastra: this.#mastra,
-    });
-
-    return resolveMaybePromise(result, tools => {
+  public async listTools({
+    requestContext = new RequestContext(),
+    resolveWebSearch = true,
+  }: { requestContext?: RequestContext; resolveWebSearch?: boolean } = {}): Promise<TTools> {
+    const resolveToolList = async (tools: ToolsInput | undefined): Promise<TTools> => {
       if (!tools) {
         const mastraError = new MastraError({
           id: 'AGENT_GET_TOOLS_FUNCTION_EMPTY_RETURN',
@@ -3204,8 +3208,30 @@ export class Agent<
         throw mastraError;
       }
 
-      return ensureToolProperties(tools) as TTools;
+      const ensuredTools = ensureToolProperties(tools) as ToolsInput;
+      if (!resolveWebSearch || !Object.values(ensuredTools).some(isWebSearchTool)) {
+        return ensuredTools as TTools;
+      }
+
+      const model = await this.getModel({ requestContext });
+      return Object.fromEntries(
+        Object.entries(ensuredTools).map(([key, tool]) => [
+          key,
+          isWebSearchTool(tool) ? createWebSearchProviderTool(normalizeWebSearchProvider(model)) : tool,
+        ]),
+      ) as TTools;
+    };
+
+    if (typeof this.#tools !== 'function') {
+      return resolveToolList(this.#tools as ToolsInput | undefined);
+    }
+
+    const result = this.#tools({
+      requestContext: requestContext as RequestContext<TRequestContext>,
+      mastra: this.#mastra,
     });
+
+    return resolveMaybePromise(result, tools => resolveToolList(tools as ToolsInput | undefined));
   }
 
   /**
@@ -3849,7 +3875,13 @@ export class Agent<
     const lines: string[] = [];
     for (const msg of messages) {
       const role = msg.role.charAt(0).toUpperCase() + msg.role.slice(1);
-      if (typeof msg.content === 'string' && msg.content) {
+      // AIV4 UI messages can carry the same text in both `content` and a text part.
+      // Skip `content` only when a text part carries the exact same text, so each
+      // message's text is emitted once without ever dropping distinct content.
+      const hasContent = typeof msg.content === 'string' && msg.content !== '';
+      const contentDuplicatedByPart =
+        hasContent && msg.parts?.some(part => part.type === 'text' && part.text === msg.content);
+      if (hasContent && !contentDuplicatedByPart) {
         lines.push(`${role}: ${msg.content}`);
       }
       if (msg.parts && Array.isArray(msg.parts) && msg.parts.length > 0) {
@@ -3964,6 +3996,21 @@ export class Agent<
   getMostRecentUserMessage(messages: Array<UIMessage | UIMessageWithMetadata>) {
     const userMessages = messages.filter(message => message.role === 'user');
     return userMessages.at(-1);
+  }
+
+  /**
+   * Restrict UI messages to those that belong to the given thread. Memory can
+   * load messages from other threads of the same resource into the message list
+   * (resource-scoped recall); those must not influence the generated title.
+   */
+  filterUiMessagesByThread<T extends { id: string }>(messageList: MessageList, threadId: string, uiMessages: T[]): T[] {
+    const threadMessageIds = new Set(
+      messageList.get.all
+        .db()
+        .filter(m => !m.threadId || m.threadId === threadId)
+        .map(m => m.id),
+    );
+    return uiMessages.filter(m => threadMessageIds.has(m.id));
   }
 
   async genTitle(
@@ -4950,7 +4997,7 @@ export class Agent<
     let toolsForRequest: Record<string, CoreTool> = {};
 
     // Mastra tools passed into the Agent
-    const assignedTools = await this.listTools({ requestContext });
+    const assignedTools = await this.listTools({ requestContext, resolveWebSearch: false });
 
     const assignedToolEntries = Object.entries(assignedTools || {});
 
@@ -4960,6 +5007,11 @@ export class Agent<
           return;
         }
         if (shouldOmitToolBeforeConversion(requestContext, runId, k)) return;
+
+        const model = resolvedModel ?? (await this.getModel({ requestContext }));
+        const toolToConvert = isWebSearchTool(tool)
+          ? createWebSearchProviderTool(normalizeWebSearchProvider(model))
+          : tool;
 
         const options: ToolOptions = {
           name: k,
@@ -4973,13 +5025,13 @@ export class Agent<
           agentId,
           requestContext,
           ...observabilityContext,
-          model: resolvedModel ?? (await this.getModel({ requestContext })),
+          model,
           outputWriter,
           tracingPolicy: this.#options?.tracingPolicy,
           requireApproval: (tool as any).requireApproval,
           backgroundConfig: (tool as any).background,
         };
-        return [k, makeCoreTool(tool, options, undefined, autoResumeSuspendedTools, backgroundTaskEnabled)];
+        return [k, makeCoreTool(toolToConvert, options, undefined, autoResumeSuspendedTools, backgroundTaskEnabled)];
       }),
     );
 
@@ -5121,8 +5173,16 @@ export class Agent<
       this.logger.debug('Adding client tools', { agent: this.name, tools: Object.keys(clientTools || {}), runId });
       for (const [toolName, tool] of clientToolsForInput) {
         if (shouldOmitToolBeforeConversion(requestContext, runId, toolName)) continue;
-        const { execute, ...toolRest } = tool;
-        const toolToConvert = isProviderTool(tool) ? tool : toolRest;
+        const model = resolvedModel ?? (await this.getModel({ requestContext }));
+        let toolToConvert: ToolToConvert;
+        if (isWebSearchTool(tool)) {
+          toolToConvert = createWebSearchProviderTool(normalizeWebSearchProvider(model));
+        } else if (isProviderTool(tool)) {
+          toolToConvert = tool;
+        } else {
+          const { execute, ...toolRest } = tool;
+          toolToConvert = toolRest;
+        }
         const options: ToolOptions = {
           name: toolName,
           runId,
@@ -5135,7 +5195,7 @@ export class Agent<
           agentId,
           requestContext,
           ...observabilityContext,
-          model: resolvedModel ?? (await this.getModel({ requestContext })),
+          model,
           tracingPolicy: this.#options?.tracingPolicy,
           requireApproval: (tool as any).requireApproval,
           backgroundConfig: (tool as any).background,
@@ -5598,8 +5658,26 @@ export class Agent<
                 }
               }
 
-              // Pass history as context (not messages) so it reaches the LLM but is not persisted to the sub-agent thread.
-              const messagesForSubAgent: MessageListInput = [{ role: 'user' as const, content: effectivePrompt }];
+              // Supervisor memory (thread/resource identity) is injected into the sub-agent
+              // run only when the parent has thread context and the sub-agent has no memory
+              // config of its own. The prompt message format and the memory option passed to
+              // generate/stream below must stay in lockstep on this condition.
+              const injectSupervisorMemory = Boolean(resourceId && threadId && !resolvedHasOwnMemoryConfig);
+              const subAgentMemoryOption = injectSupervisorMemory
+                ? {
+                    memory: {
+                      resource: subAgentResourceId,
+                      thread: subAgentThreadId,
+                      options: {
+                        lastMessages: false as const,
+                        // Title generation is a top-level thread concern. Ephemeral subagent
+                        // delegation threads are never surfaced, so suppress it here to avoid
+                        // an extra title-generation LLM call per delegation (issue #18738).
+                        generateTitle: false,
+                      },
+                    },
+                  }
+                : {};
 
               const subAgentPromptCreatedAt = new Date();
               const projectDelegatedResponseMessages = (
@@ -5658,6 +5736,37 @@ export class Agent<
                   },
                 ];
               };
+
+              // Build the delegation prompt as a full DB message up front so its ID is
+              // stable across every write path. MessageList preserves IDs on DB-format
+              // input, so when the sub-agent run itself persists input messages (e.g.
+              // observational memory finalizing a turn), the explicit save after the run
+              // upserts the same row instead of inserting a duplicate prompt.
+              const subAgentUserMessage: MastraDBMessage = {
+                id: this.#mastra?.generateId() || randomUUID(),
+                role: 'user',
+                createdAt: new Date(),
+                threadId: subAgentThreadId,
+                resourceId: subAgentResourceId,
+                content: {
+                  format: 2,
+                  parts: [
+                    {
+                      type: 'text',
+                      text: effectivePrompt,
+                    },
+                  ],
+                },
+              };
+
+              // The sub-agent run receives only the delegation prompt as input; supervisor
+              // history is forwarded separately via the `context` option so it reaches the
+              // LLM without being persisted to the sub-agent thread. Only pass the pre-built
+              // DB message when supervisor memory is injected into the run — otherwise the
+              // stamped threadId would conflict with the sub-agent's own memory thread.
+              const messagesForSubAgent: MessageListInput = injectSupervisorMemory
+                ? [subAgentUserMessage]
+                : [{ role: 'user' as const, content: effectivePrompt }];
 
               // Forward the parent's abortSignal so aborting the supervisor stream/generate cancels
               // in-flight sub-agents. The signal reaches this delegation tool via the tool-execution
@@ -5720,18 +5829,7 @@ export class Agent<
                       ...(effectiveInstructions && { instructions: effectiveInstructions }),
                       ...(effectiveMaxSteps && { maxSteps: effectiveMaxSteps }),
                       context: filteredContextMessages as unknown as ModelMessage[],
-                      ...(resourceId && threadId && !resolvedHasOwnMemoryConfig
-                        ? {
-                            memory: {
-                              resource: subAgentResourceId,
-                              thread: subAgentThreadId,
-                              // Title generation is a top-level thread concern. Ephemeral subagent
-                              // delegation threads are never surfaced, so suppress it here to avoid
-                              // an extra title-generation LLM call per delegation (issue #18738).
-                              options: { lastMessages: false, generateTitle: false },
-                            },
-                          }
-                        : {}),
+                      ...subAgentMemoryOption,
                       ...subAgentAbortOptions,
                       disableBackgroundTasks: true,
                     })
@@ -5744,18 +5842,7 @@ export class Agent<
                       ...(effectiveInstructions && { instructions: effectiveInstructions }),
                       ...(effectiveMaxSteps && { maxSteps: effectiveMaxSteps }),
                       context: filteredContextMessages as unknown as ModelMessage[],
-                      ...(resourceId && threadId && !resolvedHasOwnMemoryConfig
-                        ? {
-                            memory: {
-                              resource: subAgentResourceId,
-                              thread: subAgentThreadId,
-                              // Title generation is a top-level thread concern. Ephemeral subagent
-                              // delegation threads are never surfaced, so suppress it here to avoid
-                              // an extra title-generation LLM call per delegation (issue #18738).
-                              options: { lastMessages: false, generateTitle: false },
-                            },
-                          }
-                        : {}),
+                      ...subAgentMemoryOption,
                       ...subAgentAbortOptions,
                       disableBackgroundTasks: true,
                     });
@@ -5777,26 +5864,7 @@ export class Agent<
                   args: toolResult.payload.args,
                   isError: toolResult.payload.isError,
                 }));
-                // Create user message with the original prompt
-                const userMessage: MastraDBMessage = {
-                  id: this.#mastra?.generateId() || randomUUID(),
-                  role: 'user',
-                  type: 'text',
-                  createdAt: subAgentPromptCreatedAt,
-                  threadId: subAgentThreadId,
-                  resourceId: subAgentResourceId,
-                  content: {
-                    format: 2,
-                    parts: [
-                      {
-                        type: 'text',
-                        text: effectivePrompt,
-                      },
-                    ],
-                  },
-                };
-
-                fullSubAgentMessages = [userMessage, ...agentResponseMessages];
+                fullSubAgentMessages = [subAgentUserMessage, ...agentResponseMessages];
 
                 // Save response messages to sub-agent's memory so the UI can display them
                 const memory = subAgentMemoryHandoff
@@ -5869,21 +5937,7 @@ export class Agent<
                       ...(effectiveInstructions && { instructions: effectiveInstructions }),
                       ...(effectiveMaxSteps && { maxSteps: effectiveMaxSteps }),
                       context: filteredContextMessages as unknown as ModelMessage[],
-                      ...(resourceId && threadId && !resolvedHasOwnMemoryConfig
-                        ? {
-                            memory: {
-                              resource: subAgentResourceId,
-                              thread: subAgentThreadId,
-                              options: {
-                                lastMessages: false,
-                                // Title generation is a top-level thread concern. Ephemeral subagent
-                                // delegation threads are never surfaced, so suppress it here to avoid
-                                // an extra title-generation LLM call per delegation (issue #18738).
-                                generateTitle: false,
-                              },
-                            },
-                          }
-                        : {}),
+                      ...subAgentMemoryOption,
                       ...subAgentAbortOptions,
                       disableBackgroundTasks: true,
                     })
@@ -5896,21 +5950,7 @@ export class Agent<
                       ...(effectiveInstructions && { instructions: effectiveInstructions }),
                       ...(effectiveMaxSteps && { maxSteps: effectiveMaxSteps }),
                       context: filteredContextMessages as unknown as ModelMessage[],
-                      ...(resourceId && threadId && !resolvedHasOwnMemoryConfig
-                        ? {
-                            memory: {
-                              resource: subAgentResourceId,
-                              thread: subAgentThreadId,
-                              options: {
-                                lastMessages: false,
-                                // Title generation is a top-level thread concern. Ephemeral subagent
-                                // delegation threads are never surfaced, so suppress it here to avoid
-                                // an extra title-generation LLM call per delegation (issue #18738).
-                                generateTitle: false,
-                              },
-                            },
-                          }
-                        : {}),
+                      ...subAgentMemoryOption,
                       ...subAgentAbortOptions,
                       disableBackgroundTasks: true,
                     });
@@ -5972,26 +6012,7 @@ export class Agent<
                 const agentResponseMessages = projectDelegatedResponseMessages(
                   streamResult.messageList.get.response.db(),
                 );
-                // Create user message with the original prompt
-                const userMessage: MastraDBMessage = {
-                  id: this.#mastra?.generateId() || randomUUID(),
-                  role: 'user',
-                  type: 'text',
-                  createdAt: subAgentPromptCreatedAt,
-                  threadId: subAgentThreadId,
-                  resourceId: subAgentResourceId,
-                  content: {
-                    format: 2,
-                    parts: [
-                      {
-                        type: 'text',
-                        text: effectivePrompt,
-                      },
-                    ],
-                  },
-                };
-
-                fullSubAgentMessages = [userMessage, ...agentResponseMessages];
+                fullSubAgentMessages = [subAgentUserMessage, ...agentResponseMessages];
 
                 // Save response messages to sub-agent's memory so the UI can display them
                 const streamMemory = subAgentMemoryHandoff
@@ -6719,6 +6740,7 @@ export class Agent<
     isResume,
     toolSurfaceFenceOwnerId,
     registerToolSurfaceFence = true,
+    model,
     ...rest
   }: {
     toolsets?: ToolsetsInput;
@@ -6746,8 +6768,13 @@ export class Agent<
     isResume?: boolean;
     toolSurfaceFenceOwnerId?: string;
     registerToolSurfaceFence?: boolean;
+    model?: MastraLanguageModel | MastraLegacyLanguageModel;
   } & Partial<ObservabilityContext>): Promise<Record<string, CoreTool>> {
     const observabilityContext = resolveObservabilityContext(rest);
+    // Callers pass the resolved execution model either as the fork's
+    // `resolvedModel` or upstream's `model` (prepare-tools-step); coalesce so
+    // provider-native placeholders respect per-call and Studio overrides.
+    resolvedModel ??= model;
     let mastraProxy = undefined;
     const logger = this.logger;
     // Execution callers pass their already-resolved instance; standalone tool
@@ -6981,19 +7008,26 @@ export class Agent<
       agentName,
     });
 
-    const channelTools = await this.listChannelTools({
-      runId,
-      resourceId,
-      threadId,
-      requestContext,
-      memory,
-      ...observabilityContext,
-      mastraProxy,
-      autoResumeSuspendedTools,
-      backgroundTaskEnabled,
-      agentId,
-      agentName,
-    });
+    // Upstream #20152 stopped auto-injecting AgentChannels direct-provider
+    // tools into the model surface (they are explicit opt-in via
+    // `channels.getTools()` now). They are resolved here only on a Harness
+    // channel-bound turn, where their normalized names must stay reserved so
+    // no other tool source can spoof the fenced platform surface (§14.7).
+    const channelTools = isHarnessChannelBoundTurn(requestContext)
+      ? await this.listChannelTools({
+          runId,
+          resourceId,
+          threadId,
+          requestContext,
+          memory,
+          ...observabilityContext,
+          mastraProxy,
+          autoResumeSuspendedTools,
+          backgroundTaskEnabled,
+          agentId,
+          agentName,
+        })
+      : {};
 
     const browserTools = await this.listBrowserTools({
       runId,
@@ -7045,7 +7079,6 @@ export class Agent<
       ...workflowTools,
       ...workspaceTools,
       ...skillTools,
-      ...(channelBoundTurn ? {} : channelTools),
       ...browserTools,
       ...inputProcessorLoadedTools,
     };
@@ -7575,6 +7608,28 @@ export class Agent<
           typeof serializedMessageList !== 'object' ||
           !Object.prototype.hasOwnProperty.call(serializedMessageList, 'memoryInfo')
         ) {
+          // Durable agentic-loop snapshots don't embed `__streamState` in
+          // suspend payloads; their thread/resource info lives on the
+          // serialized workflow input's message-list state instead.
+          const durableMessageListState = (existingSnapshot?.context as Record<string, any> | undefined)?.input
+            ?.messageListState;
+          if (
+            durableMessageListState &&
+            typeof durableMessageListState === 'object' &&
+            Object.prototype.hasOwnProperty.call(durableMessageListState, 'memoryInfo')
+          ) {
+            foundMemoryInfo = true;
+            const durableMemoryInfo = durableMessageListState.memoryInfo;
+            if (durableMemoryInfo === null) continue;
+            if (typeof durableMemoryInfo !== 'object') return null;
+            if (typeof durableMemoryInfo.threadId === 'string' && durableMemoryInfo.threadId.length > 0) {
+              threadIds.add(durableMemoryInfo.threadId);
+            }
+            if (typeof durableMemoryInfo.resourceId === 'string' && durableMemoryInfo.resourceId.length > 0) {
+              resourceIds.add(durableMemoryInfo.resourceId);
+            }
+            continue;
+          }
           return null;
         }
         foundMemoryInfo = true;
@@ -7648,6 +7703,9 @@ export class Agent<
   }
 
   #getAgenticLoopSnapshotAgentId(existingSnapshot: any): string | undefined {
+    // Durable agentic-loop snapshots persist the owning agent id on the
+    // serialized workflow input instead of in suspend payloads.
+    const durableAgentId = (existingSnapshot?.context as Record<string, any> | undefined)?.input?.agentId;
     const agentIds = new Set<string>();
     for (const key in existingSnapshot?.context) {
       const step = existingSnapshot?.context[key];
@@ -7658,10 +7716,13 @@ export class Agent<
       if (typeof payload?.__agentId === 'string') {
         agentIds.add(payload.__agentId);
       } else if (isToolSuspension) {
-        return undefined;
+        if (typeof durableAgentId !== 'string') return undefined;
+        agentIds.add(durableAgentId);
       }
     }
-    return agentIds.size === 1 ? [...agentIds][0] : undefined;
+    if (agentIds.size === 1) return [...agentIds][0];
+    if (agentIds.size === 0 && typeof durableAgentId === 'string') return durableAgentId;
+    return undefined;
   }
 
   #findResumeLabelForStep(existingSnapshot: any, stepId: string, persistedToolCallId?: unknown): string | undefined {
@@ -7978,7 +8039,13 @@ export class Agent<
     return resourceIdFromContext || memory?.resource || snapshotMemoryInfo?.resourceId;
   }
 
-  async #requireAgentExecutionFGA({
+  /**
+   * Enforce agent-level FGA (`agents:execute`) before running the agent.
+   * `protected` so durable/evented subclasses can enforce the same gate before
+   * their workflow-based execution (they override the public entry points and
+   * would otherwise bypass it).
+   */
+  protected async requireAgentExecutionFGA({
     requestContext,
     memory,
     runId,
@@ -8002,7 +8069,7 @@ export class Agent<
 
     const user = requestContext?.get('user');
     const executionResourceId = this.#getAgentExecutionResourceId({ requestContext, memory, snapshotMemoryInfo });
-    const { getAgentFGAResourceId, requireFGA } = await import(/* @vite-ignore */ '../auth/ee/fga-check');
+    const { getAgentFGAResourceId, requireFGA } = await import('../auth/ee/fga-check');
     await requireFGA({
       fgaProvider,
       user,
@@ -8319,7 +8386,7 @@ export class Agent<
         : options.tracingOptions;
 
     const spanInput = isResume
-      ? this.#getResumeSpanInput(resumeContext!.resumeData, suspendedToolInfo)
+      ? this.#getResumeSpanInput(resumeContext.resumeData, suspendedToolInfo)
       : options.messages;
 
     const agentSpan = getOrCreateSpan({
@@ -8669,38 +8736,41 @@ export class Agent<
         );
 
         const uiMessages = messageList.get.all.ui();
-        const messages = messageList.get.all.core();
         const requiredMessages = minMessages ?? 1;
 
-        if (shouldGenerate && !thread.title && messages.length >= requiredMessages) {
-          const userMessage = this.getMostRecentUserMessage(uiMessages);
+        if (shouldGenerate && !thread.title) {
+          const threadUiMessages = this.filterUiMessagesByThread(messageList, thread.id, uiMessages);
 
-          if (userMessage) {
-            void this.genTitle(
-              userMessage,
-              requestContext,
-              observabilityContext,
-              titleModel,
-              titleInstructions,
-              uiMessages,
-            )
-              .then(async title => {
-                if (title) {
-                  await memory.createThread({
-                    threadId: thread.id,
-                    resourceId,
-                    memoryConfig,
-                    title,
-                    metadata: thread.metadata,
-                  });
-                  if (typeof onTitleGenerated === 'function') {
-                    await onTitleGenerated(title);
+          if (threadUiMessages.length >= requiredMessages) {
+            const userMessage = this.getMostRecentUserMessage(threadUiMessages);
+
+            if (userMessage) {
+              void this.genTitle(
+                userMessage,
+                requestContext,
+                observabilityContext,
+                titleModel,
+                titleInstructions,
+                threadUiMessages,
+              )
+                .then(async title => {
+                  if (title) {
+                    await memory.createThread({
+                      threadId: thread.id,
+                      resourceId,
+                      memoryConfig,
+                      title,
+                      metadata: thread.metadata,
+                    });
+                    if (typeof onTitleGenerated === 'function') {
+                      await onTitleGenerated(title);
+                    }
                   }
-                }
-              })
-              .catch(error => {
-                this.logger.error('Error persisting generated title:', error);
-              });
+                })
+                .catch(error => {
+                  this.logger.error('Error persisting generated title:', error);
+                });
+            }
           }
         }
       } catch (e) {
@@ -8844,7 +8914,7 @@ export class Agent<
     const runId = hasFga
       ? this.#mastra?.generateId() || randomUUID()
       : mergedOptions?.runId || this.#mastra?.generateId() || randomUUID();
-    await this.#requireAgentExecutionFGA({
+    await this.requireAgentExecutionFGA({
       requestContext: requestContextToUse,
       memory: mergedOptions?.memory,
       runId,
@@ -8856,9 +8926,10 @@ export class Agent<
       runId,
       routingAgent: this,
       routingAgentOptions: {
+        model: mergedOptions?.model,
         modelSettings: mergedOptions?.modelSettings,
         memory: mergedOptions?.memory,
-      } as unknown as AgentExecutionOptions<OUTPUT>,
+      },
       generateId: context => this.#mastra?.generateId(context) || randomUUID(),
       maxIterations: mergedOptions?.maxSteps || 1,
       messages,
@@ -8939,7 +9010,7 @@ export class Agent<
         },
       });
     }
-    await this.#requireAgentExecutionFGA({
+    await this.requireAgentExecutionFGA({
       requestContext: requestContextToUse,
       memory: mergedOptions?.memory,
       runId,
@@ -8976,6 +9047,7 @@ export class Agent<
       runId,
       routingAgent: this,
       routingAgentOptions: {
+        model: mergedOptions?.model,
         modelSettings: mergedOptions?.modelSettings,
         memory: mergedOptions?.memory,
       },
@@ -9123,7 +9195,7 @@ export class Agent<
     const actor = mergedOptions.actor;
     delete loopOptions.actor;
 
-    await this.#requireAgentExecutionFGA({
+    await this.requireAgentExecutionFGA({
       requestContext: mergedOptions.requestContext,
       memory: mergedOptions.memory,
       runId: mergedOptions.runId,
@@ -9438,6 +9510,10 @@ export class Agent<
 
     // Always bypass driver defaults (notably DynamoDB's ten-row default), then
     // paginate after snapshot-owned thread/resource filtering so total is exact.
+    // Suspended durable runs are discovered through the DurableAgent
+    // listSuspendedRuns override (which queries the durable workflow names with
+    // snapshot-pair consistency checks), so the standard lane performs exactly
+    // one resource-scoped discovery query.
     const { runs } = await workflowsStore.listWorkflowRuns({
       workflowName: 'agentic-loop',
       status: 'suspended',
@@ -9673,7 +9749,10 @@ export class Agent<
             const failed = await notifications.updateNotification({
               id: updated.id,
               threadId: updated.threadId,
-              deliveryAttempts: (updated.deliveryAttempts ?? 0) + 1,
+              // `summaryAt` was cleared to emit this summary. Restore it so the
+              // record stays due and the dispatcher can retry it.
+              summaryAt: now,
+              ...resolveDeliveryFailureUpdate(updated),
               lastDeliveryAttemptAt: new Date(),
               lastDeliveryError: error instanceof Error ? error.message : 'Notification summary signal was rejected',
             });
@@ -9727,7 +9806,7 @@ export class Agent<
         const failed = await notifications.updateNotification({
           id: record.id,
           threadId: record.threadId,
-          deliveryAttempts: (record.deliveryAttempts ?? 0) + 1,
+          ...resolveDeliveryFailureUpdate(record),
           lastDeliveryAttemptAt: new Date(),
           lastDeliveryError: error instanceof Error ? error.message : 'Notification signal was rejected',
           deliveryReason: decision.reason,
@@ -11386,7 +11465,9 @@ export class Agent<
    * ```
    */
   async approveToolCall<OUTPUT = undefined>(
-    options: AgentExecutionOptions<OUTPUT> & { runId: string; toolCallId?: string },
+    options: AgentExecutionOptions<OUTPUT> & { runId: string; toolCallId?: string } & {
+      model?: DynamicArgument<MastraModelConfig>;
+    },
   ): Promise<MastraModelOutput<OUTPUT>> {
     // Route standalone `new Agent({ durable: true })` calls through the
     // durable execution path.
@@ -11697,7 +11778,9 @@ export class Agent<
    * ```
    */
   async declineToolCall<OUTPUT = undefined>(
-    options: AgentExecutionOptions<OUTPUT> & { runId: string; toolCallId?: string },
+    options: AgentExecutionOptions<OUTPUT> & { runId: string; toolCallId?: string } & {
+      model?: DynamicArgument<MastraModelConfig>;
+    },
   ): Promise<MastraModelOutput<OUTPUT>> {
     // Route standalone `new Agent({ durable: true })` calls through the
     // durable execution path.
@@ -11727,7 +11810,9 @@ export class Agent<
    * ```
    */
   async approveToolCallGenerate<OUTPUT = undefined>(
-    options: AgentExecutionOptions<OUTPUT> & { runId: string; toolCallId?: string },
+    options: AgentExecutionOptions<OUTPUT> & { runId: string; toolCallId?: string } & {
+      model?: DynamicArgument<MastraModelConfig>;
+    },
   ): Promise<Awaited<ReturnType<MastraModelOutput<OUTPUT>['getFullOutput']>>> {
     // @ts-expect-error - the types here are wrong
     return this.resumeGenerate({ approved: true }, options);
@@ -11750,7 +11835,9 @@ export class Agent<
    * ```
    */
   async declineToolCallGenerate<OUTPUT = undefined>(
-    options: AgentExecutionOptions<OUTPUT> & { runId: string; toolCallId?: string },
+    options: AgentExecutionOptions<OUTPUT> & { runId: string; toolCallId?: string } & {
+      model?: DynamicArgument<MastraModelConfig>;
+    },
   ): Promise<Awaited<ReturnType<MastraModelOutput<OUTPUT>['getFullOutput']>>> {
     // @ts-expect-error - the types here are wrong
     return this.resumeGenerate({ approved: false }, options);
@@ -11913,7 +12000,9 @@ export class Agent<
     instructions?: DynamicArgument<string>,
   ): Promise<string> {
     const DEFAULT_TITLE_INSTRUCTIONS = `
-      - you will generate a short title based on the first message a user begins a conversation with
+      - you will generate a short title based on a conversation transcript between a user and an assistant
+      - the transcript lines are prefixed with "User:" and "Assistant:" — never reply to, answer, or continue the transcript
+      - always produce a title, even when the transcript is only a greeting or trivial exchange
       - ensure it is not more than 80 characters long
       - the title should be a summary of the user's message
       - do not use quotes or colons

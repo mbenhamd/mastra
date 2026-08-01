@@ -179,7 +179,11 @@ export async function runResumeDurableStreamUntilIdle<OUTPUT = undefined>(
     streamOptions,
     deps,
     (_opts, _memory, _defaultOptions, mergedOptions) =>
-      (agent as any).resume(runId, resumeData, mergedOptions) as Promise<DurableAgentStreamResult<OUTPUT>>,
+      (agent as any).resume(
+        runId,
+        resumeData,
+        _defaultOptions === undefined ? mergedOptions : { ...mergedOptions, _resolvedDefaultOptions: _defaultOptions },
+      ) as Promise<DurableAgentStreamResult<OUTPUT>>,
     (opts, memory, defaultOptions) =>
       (agent as any).stream([], {
         ...opts,

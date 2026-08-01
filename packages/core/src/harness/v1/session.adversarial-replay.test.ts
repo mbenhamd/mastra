@@ -274,11 +274,18 @@ describe('§S4.2 — unserializable event becomes a sentinel AT THE EXACT live s
 
       // Force ONE unserializable event straight through the emitter (bypasses emit-time
       // custom-event JSON validation), so it fails at the persistence snapshot.
+      // The cycle rides OUTSIDE `payload`: the default-on event-payload cap
+      // (PF-2246, `applyCustomEventPayloadCap`) deliberately projects a custom
+      // event's `payload` at emit — an in-`payload` cycle now becomes the
+      // TOOL_PAYLOAD_UNSERIALIZABLE sentinel before persistence ever sees it.
+      // Any other unserializable field still reaches the persistence snapshot,
+      // which is exactly the §S4.2 ledger-sentinel lane this test pins.
       const circular: Record<string, unknown> = {};
       circular.self = circular;
       const badEvent = (session as unknown as { _emitter: { emit(e: unknown): HarnessEvent } })._emitter.emit({
         type: 'badns.bad',
-        payload: circular,
+        payload: { ok: true },
+        poison: circular,
       });
       const badSeq = parseHarnessEventId(badEvent.id).sequence;
 

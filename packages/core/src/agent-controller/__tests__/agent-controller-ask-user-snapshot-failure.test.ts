@@ -105,7 +105,11 @@ describe('AgentController: ask_user with suspended-snapshot persistence failure'
     const { session, storage } = await buildController('snapfail');
 
     // Fail suspended-snapshot persistence the way an oversized snapshot does in
-    // real storage adapters that JSON.stringify the snapshot.
+    // real storage adapters that JSON.stringify the snapshot. Capability-enabled
+    // adapters (fenced step updates) write the suspended snapshot through
+    // `persistWorkflowStepUpdate`; the compatibility lane uses
+    // `persistWorkflowSnapshot` — fail the suspended write on BOTH so the pinned
+    // contract holds regardless of the adapter's resume capabilities.
     const workflowsStore = await storage.getStore('workflows');
     const realPersist = workflowsStore!.persistWorkflowSnapshot.bind(workflowsStore);
     vi.spyOn(workflowsStore!, 'persistWorkflowSnapshot').mockImplementation(async args => {
@@ -113,6 +117,13 @@ describe('AgentController: ask_user with suspended-snapshot persistence failure'
         throw new RangeError('Invalid string length');
       }
       return realPersist(args);
+    });
+    const realPersistStepUpdate = workflowsStore!.persistWorkflowStepUpdate.bind(workflowsStore);
+    vi.spyOn(workflowsStore!, 'persistWorkflowStepUpdate').mockImplementation(async args => {
+      if ((args.snapshot as any)?.status === 'suspended') {
+        throw new RangeError('Invalid string length');
+      }
+      return realPersistStepUpdate(args);
     });
 
     const events: any[] = [];

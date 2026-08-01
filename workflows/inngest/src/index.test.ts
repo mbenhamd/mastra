@@ -14712,10 +14712,28 @@ createWorkflowTestSuite({
    * 3. Wait for sync to complete
    */
   registerWorkflows: async (registry: WorkflowRegistry) => {
-    // Collect all workflows from registry
+    // Collect all workflows + any Mastra-level agents/tools the entries declare
+    // (used by `.agent('id')` / `.tool('id')` by-id forms).
     const workflows: Record<string, InngestWorkflow<any, any, any, any, any, any, any>> = {};
+    const agents: Record<string, any> = {};
+    const tools: Record<string, any> = {};
     for (const [id, entry] of Object.entries(registry)) {
       workflows[id] = entry.workflow as InngestWorkflow<any, any, any, any, any, any, any>;
+      // Fail loudly if two registry entries declare the same agent/tool id with
+      // different instances — Object.assign would silently last-write-win and
+      // route by-id lookups to the wrong instance.
+      for (const [agentId, agent] of Object.entries(entry.mastraAgents ?? {})) {
+        if (agentId in agents && agents[agentId] !== agent) {
+          throw new Error(`registerWorkflows: agent id collision across registry entries: "${agentId}"`);
+        }
+        agents[agentId] = agent;
+      }
+      for (const [toolId, tool] of Object.entries(entry.mastraTools ?? {})) {
+        if (toolId in tools && tools[toolId] !== tool) {
+          throw new Error(`registerWorkflows: tool id collision across registry entries: "${toolId}"`);
+        }
+        tools[toolId] = tool;
+      }
     }
 
     // Create storage
@@ -14731,6 +14749,8 @@ createWorkflowTestSuite({
     sharedMastra = new Mastra({
       storage: sharedStorage,
       workflows,
+      agents: Object.keys(agents).length ? agents : undefined,
+      tools: Object.keys(tools).length ? tools : undefined,
       server: {
         apiRoutes: [
           {
@@ -14770,6 +14790,8 @@ createWorkflowTestSuite({
     });
     console.log(`[registerWorkflows] Handler server started on port ${ACTIVE_TEST_ENDPOINTS.ports.handlerPort}`);
 
+    // Use workflow.id (Inngest function id), not registry keys — nested suites
+    // register e.g. `nested-basic-main` under the `nested-basic` registry key.
     const expectedFnIds = [...new Set(Object.values(workflows).map(workflow => `workflow.${workflow.id}`))];
     console.log(
       `[registerWorkflows] Waiting for ${expectedFnIds.length} unique functions from ` +

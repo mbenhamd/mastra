@@ -1318,7 +1318,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                   messageList,
                   messageId: currentStep.messageId,
                   stepTools: tools,
-                  _internal: _internal!,
+                  _internal: _internal,
                 });
               }
               logger?.error('Error in processInputStep processors:', error);
@@ -1443,7 +1443,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
           }
 
           const runState = new AgenticRunState({
-            _internal: _internal!,
+            _internal: _internal,
             model: currentStep.model,
           });
 
@@ -1453,9 +1453,11 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
             downloadConcurrency,
           });
           const llmPromptForModel =
-            currentStep.model?.specificationVersion === 'v3' || currentStep.model?.specificationVersion === 'v4'
-              ? messageList.get.all.aiV6.llmPrompt
-              : messageList.get.all.aiV5.llmPrompt;
+            currentStep.model?.specificationVersion === 'v4'
+              ? messageList.get.all.aiV7.llmPrompt
+              : currentStep.model?.specificationVersion === 'v3'
+                ? messageList.get.all.aiV6.llmPrompt
+                : messageList.get.all.aiV5.llmPrompt;
           let inputMessages = await llmPromptForModel(messageListPromptArgs);
 
           inputMessages = applyAutoResumeSystemMessage({
@@ -1518,7 +1520,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                 messageList,
                 messageId: currentStep.messageId,
                 stepTools: currentStep.tools,
-                _internal: _internal!,
+                _internal: _internal,
               });
             }
             logger?.error('Error in processLLMRequest processors:', error);
@@ -1791,7 +1793,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                     messageList,
                     messageId: currentStep.messageId,
                     stepTools: currentStep.tools,
-                    _internal: _internal!,
+                    _internal: _internal,
                   });
                 }
                 logger?.error('Error in processLLMResponse processors:', responseProcessorError);

@@ -407,12 +407,17 @@ describe('@mastra/inngest actor signal threading (hermetic)', () => {
     const mastra = new Mastra({ logger: false, storage: new MockStore() });
     const engine = new InngestExecutionEngine(mastra, fakeStep, 0, {});
     const pubsub: any = { publish: vi.fn().mockResolvedValue(undefined) };
-    const workflowsStore = await mastra.getStorage()!.getStore('workflows');
-    await workflowsStore!.persistWorkflowSnapshot({
+
+    // Model a genuinely suspended child: the parent's stepResults carry the
+    // child runId, and the child's snapshot records its suspended step — this
+    // is the state the engine reads to rebuild the nested resume path.
+    const nestedRunId = 'nested-run-1';
+    const store = await mastra.getStorage()!.getStore('workflows');
+    await store!.persistWorkflowSnapshot({
       workflowName: 'nested-resume-workflow',
-      runId: 'nested-run',
+      runId: nestedRunId,
       snapshot: {
-        runId: 'nested-run',
+        runId: nestedRunId,
         serializedStepGraph: [],
         status: 'suspended',
         value: {},
@@ -426,17 +431,17 @@ describe('@mastra/inngest actor signal threading (hermetic)', () => {
         executionGeneration: 'nested-resume-execution',
         lifecycleResumeAttempt: 4,
         lifecycleStepStates: {},
-      },
+      } as any,
     });
 
     const result = await engine.executeWorkflowStep({
       step: nestedWorkflow as any,
       stepResults: {
-        'nested-step': {
+        'nested-resume-workflow': {
           status: 'suspended',
-          suspendPayload: { __workflow_meta: { runId: 'nested-run' } },
+          suspendPayload: { __workflow_meta: { runId: nestedRunId } },
         },
-      },
+      } as any,
       executionContext: {
         workflowId: 'parent',
         runId: 'parent-run',
@@ -444,7 +449,7 @@ describe('@mastra/inngest actor signal threading (hermetic)', () => {
         suspendedPaths: {},
         state: {},
       } as any,
-      resume: { steps: ['nested-step'], resumePayload: { value: 'ok' } },
+      resume: { steps: ['nested-resume-workflow', 'nested-step'], resumePayload: { value: 'ok' } },
       prevOutput: {},
       inputData: { value: 'ok' },
       pubsub,
@@ -462,9 +467,9 @@ describe('@mastra/inngest actor signal threading (hermetic)', () => {
     expect(invokeData[0].resume.steps).toEqual(['nested-step']);
     expect(invokeData[0].resume.resumePath).toEqual([0]);
     await expect(
-      workflowsStore!.loadWorkflowSnapshot({
+      store!.loadWorkflowSnapshot({
         workflowName: 'nested-resume-workflow',
-        runId: 'nested-run',
+        runId: nestedRunId,
       }),
     ).resolves.toMatchObject({
       status: 'running',

@@ -53,14 +53,7 @@ type DurableWorkProofKind =
   | 'current-run-projection';
 
 type BackgroundTaskRowStatus =
-  | 'pending'
-  | 'running'
-  | 'suspended'
-  | 'completed'
-  | 'failed'
-  | 'cancelled'
-  | 'timed_out'
-  | 'dead';
+  'pending' | 'running' | 'suspended' | 'completed' | 'failed' | 'cancelled' | 'timed_out' | 'dead';
 
 type BackgroundTaskOwnerRef =
   | { kind: 'queue-admission-receipt'; id: string }

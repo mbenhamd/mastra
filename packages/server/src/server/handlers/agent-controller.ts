@@ -70,16 +70,17 @@ export function createAgentControllerSessionId(resourceId: string, scope?: strin
 async function getSession(
   controller: AgentController<any>,
   resourceId: string,
-  options?: { tags?: Record<string, string>; scope?: string },
+  options?: { tags?: Record<string, string>; scope?: string; threadId?: string },
   requestContext?: RequestContext,
 ): Promise<Session<any>> {
   await controller.init();
-  const { tags, scope } = options ?? {};
+  const { tags, scope, threadId } = options ?? {};
   // Encode the tuple rather than joining it with a delimiter: resource and
   // scope are user-controlled strings, so delimiter-shaped values must remain
-  // distinct session identities.
-  const id = createAgentControllerSessionId(resourceId, scope);
-  return controller.createSession({ resourceId, id, ownerId: controller.id, tags, scope, requestContext });
+  // distinct session identities. An exact thread binding doubles as the
+  // stable session id when supplied.
+  const id = threadId ?? createAgentControllerSessionId(resourceId, scope);
+  return controller.createSession({ resourceId, id, ownerId: controller.id, tags, scope, threadId, requestContext });
 }
 
 // ---------------------------------------------------------------------------
@@ -99,6 +100,7 @@ const sessionScopeQuerySchema = z.object({ sessionScope: z.string().optional() }
 const createSessionBodySchema = z.object({
   resourceId: z.string(),
   tags: z.record(z.string(), z.string()).optional(),
+  threadId: z.string().optional(),
   sessionScope: z.string().optional(),
 });
 // Server-side attachment limits mirroring the web composer caps (10MB per
@@ -363,10 +365,10 @@ export const CREATE_AGENT_CONTROLLER_SESSION_ROUTE = createRoute({
   tags: ['AgentController'],
   requiresAuth: true,
   requiresPermission: 'agent-controller:execute',
-  handler: async ({ mastra, controllerId, resourceId, sessionScope, tags, requestContext }) => {
+  handler: async ({ mastra, controllerId, resourceId, sessionScope, tags, threadId, requestContext }) => {
     try {
       const controller = getAgentControllerOrThrow(mastra, controllerId);
-      const session = await getSession(controller, resourceId, { tags, scope: sessionScope }, requestContext);
+      const session = await getSession(controller, resourceId, { tags, scope: sessionScope, threadId }, requestContext);
       return {
         controllerId,
         resourceId,

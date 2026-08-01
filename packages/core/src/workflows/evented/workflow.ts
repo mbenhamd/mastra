@@ -81,6 +81,7 @@ import { PUBSUB_SYMBOL, STREAM_FORMAT_SYMBOL, TRANSIENT_EXECUTION_SYMBOL } from 
 import { createWorkflowExecutionGeneration } from '../lifecycle-events';
 import { validateCron } from '../scheduler/cron';
 import type { WorkflowScheduleConfig } from '../scheduler/types';
+import { getEntryId } from '../step-entry';
 import { forwardAgentStreamChunk } from '../stream-utils';
 import type { StreamChunkWriter } from '../stream-utils';
 import { Workflow, Run } from '../workflow';
@@ -1263,7 +1264,7 @@ function createStepFromProcessor<TProcessorId extends string>(
               }
 
               if (validatedResult.systemMessages) {
-                passThrough.messageList!.replaceAllSystemMessages(validatedResult.systemMessages as CoreMessage[]);
+                passThrough.messageList.replaceAllSystemMessages(validatedResult.systemMessages as CoreMessage[]);
               }
 
               // Preserve messages in return - passThrough doesn't include messages,
@@ -1272,7 +1273,7 @@ function createStepFromProcessor<TProcessorId extends string>(
                 ...passThrough,
                 messages,
                 ...validatedResult,
-                systemMessages: passThrough.messageList!.getSystemMessages(),
+                systemMessages: passThrough.messageList.getSystemMessages(),
                 ...(currentMessageId ? { messageId: validatedResult.messageId ?? currentMessageId } : {}),
               };
             }
@@ -2348,11 +2349,14 @@ export class EventedRun<
       return entry;
     })();
     const snapshotResumeStepId =
-      snapshotResumeEntry?.type === 'step' ||
-      snapshotResumeEntry?.type === 'loop' ||
-      snapshotResumeEntry?.type === 'foreach'
-        ? snapshotResumeEntry.step.id
-        : undefined;
+      snapshotResumeEntry?.type === 'loop' || snapshotResumeEntry?.type === 'foreach'
+        ? getEntryId(snapshotResumeEntry.step)
+        : snapshotResumeEntry?.type === 'step' ||
+            snapshotResumeEntry?.type === 'agent' ||
+            snapshotResumeEntry?.type === 'tool' ||
+            snapshotResumeEntry?.type === 'mapping'
+          ? getEntryId(snapshotResumeEntry)
+          : undefined;
     const snapshotForEachResult =
       snapshotResumeLabel?.stepId !== undefined ? (snapshot?.context?.[snapshotResumeLabel.stepId] as any) : undefined;
     const isValidLocalForEachTarget =
