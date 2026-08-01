@@ -123,6 +123,7 @@ jobs:
           if [[ "$VALIDATION_LANE" == 'pf558-upstream-sync' || \
             "$VALIDATION_LANE" == 'pf2009-upstream-sync' || \
             "$VALIDATION_LANE" == 'pf2247-upstream-sync' || \
+            "$VALIDATION_LANE" == 'pf2576-upstream-sync' || \
             "$VALIDATION_LANE" == 'pf2045-upstream-sync' ]]; then
             # Nested workspace manifests are part of the reconciled source
             # tree, not part of the exact pre-install allowlist. Suppress all
@@ -199,6 +200,20 @@ jobs:
             exit 1
           fi
           /bin/bash "$pf2247_policy_script" --self-test-pf2247-upstream-sync
+
+          pf2576_policy_script="${RUNNER_TEMP}/pf2576-policy-self-test.bash"
+          if grep -Fq -- '--self-test-pf2576-upstream-sync' "$policy_script"; then
+            cp "$policy_script" "$pf2576_policy_script"
+          elif [[ "$HEAD_REPOSITORY" == "$GITHUB_REPOSITORY" && \
+            "$HEAD_REF" == 'ci/pf-2576-upstream-sync-validation' && \
+            "$BASE_REF" == 'main' ]]; then
+            echo 'Bootstrapping the PF-2576 exact-merge fixtures from this same-repository policy PR.'
+            /usr/bin/git show "${HEAD_SHA}:${script_path}" > "$pf2576_policy_script"
+          else
+            echo 'The trusted base does not contain the PF-2576 admission fixtures.' >&2
+            exit 1
+          fi
+          /bin/bash "$pf2576_policy_script" --self-test-pf2576-upstream-sync
 
       - name: Start Redis test service
         run: |
@@ -323,6 +338,10 @@ jobs:
             pf2247-upstream-sync)
               /bin/bash "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash" \
                 --validate-pf2247-upstream-sync
+              ;;
+            pf2576-upstream-sync)
+              /bin/bash "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash" \
+                --validate-pf2576-upstream-sync
               ;;
             *)
               /bin/bash "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash"
