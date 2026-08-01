@@ -9,13 +9,19 @@ export interface FastifyAuthMiddlewareOptions {
 }
 
 function toWebRequest(request: FastifyRequest): globalThis.Request {
+  // request.protocol/request.host are trustProxy-aware Fastify getters (unlike
+  // raw headers.host), and request.host falls back to the HTTP/2 :authority
+  // pseudo-header. Keep final fallbacks so fully host-less requests (e.g.
+  // HTTP/1.0 without a Host header) never derive an invalid URL.
   const protocol = request.protocol || 'http';
-  const host = request.headers.host || 'localhost';
+  const host = request.host || 'localhost';
   const url = `${protocol}://${host}${request.url}`;
 
   const headers = new Headers();
   for (const [key, value] of Object.entries(request.headers)) {
-    if (!value) continue;
+    // HTTP/2 pseudo-headers (:method, :path, :authority, ...) are not legal
+    // Web API header names — Headers.set() throws on them.
+    if (!value || key.startsWith(':')) continue;
     if (Array.isArray(value)) {
       value.forEach(v => headers.append(key, v));
     } else {
