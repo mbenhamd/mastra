@@ -64,6 +64,14 @@ export function createAuthMiddleware({
       token = query.apiKey || null;
     }
 
+    // At most one WHATWG Request per request, constructed lazily:
+    // `coreAuthMiddleware` reads `rawRequest` exactly once, and only AFTER its
+    // dev-playground/unprotected/public skip checks, so requests those checks
+    // wave through construct nothing. authenticateToken and authorize() share
+    // the single instance (it carries method + headers only — no body).
+    let webRequest: globalThis.Request | undefined;
+    const getWebRequest = () => (webRequest ??= toWebRequest(request));
+
     const result = await coreAuthMiddleware({
       path,
       method,
@@ -72,9 +80,11 @@ export function createAuthMiddleware({
       authConfig,
       customRouteAuthConfig,
       requestContext: request.requestContext,
-      rawRequest: toWebRequest(request),
+      get rawRequest() {
+        return getWebRequest();
+      },
       token,
-      buildAuthorizeContext: () => toWebRequest(request),
+      buildAuthorizeContext: getWebRequest,
     });
 
     if (result.action === 'error') {

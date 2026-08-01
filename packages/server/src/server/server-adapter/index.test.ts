@@ -292,7 +292,7 @@ describe('built-in route selection', () => {
     ).toThrow('routes selector contains duplicate built-in route: GET /agents');
   });
 
-  it('returns a defensive copy of selected server routes', () => {
+  it('returns a frozen snapshot of selected server routes that cannot corrupt the registry', () => {
     const selectedRoutes = [SERVER_ROUTES[0], SERVER_ROUTES[2]].filter(Boolean) as ServerRoute[];
     const adapter = new TestMastraServer({
       app: {},
@@ -303,10 +303,21 @@ describe('built-in route selection', () => {
       routes: selectedRoutes,
     });
 
-    const exposedRoutes = adapter.getServerRoutes() as ServerRoute[];
-    exposedRoutes.length = 0;
+    const exposedRoutes = adapter.getServerRoutes();
 
+    // The snapshot is frozen: mutation attempts throw instead of silently
+    // mutating a throwaway copy, and the registry stays intact either way.
+    expect(Object.isFrozen(exposedRoutes)).toBe(true);
+    expect(() => {
+      (exposedRoutes as ServerRoute[]).length = 0;
+    }).toThrow(TypeError);
+    expect(() => {
+      (exposedRoutes as ServerRoute[]).push(selectedRoutes[0]!);
+    }).toThrow(TypeError);
     expect(adapter.getServerRoutes()).toEqual(selectedRoutes);
+
+    // Computed once and reused — this runs on the per-request path.
+    expect(adapter.getServerRoutes()).toBe(exposedRoutes);
   });
 
   it('registers predicate-selected built-in server routes in canonical order', async () => {

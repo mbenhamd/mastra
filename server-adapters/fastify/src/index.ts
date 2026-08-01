@@ -601,6 +601,25 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
 
     // Define the route handler
     const handler: RouteHandlerMethod = async (request: FastifyRequest, reply: FastifyReply) => {
+      // Build the WHATWG Request at most once per LANE per request, and only
+      // when it is actually read. Constructing undici Headers + Request costs
+      // several microseconds, and most requests never touch it: with no auth
+      // configured `checkRouteAuth` returns before reading `context.request`,
+      // and most handlers never read `ctx.request` — those paths construct
+      // zero Requests.
+      //
+      // The auth lane gets its OWN memoized instance, separate from the
+      // handler-visible one: auth callbacks (authenticateToken / legacy
+      // authorize) are handed the constructed Request with its LIVE Headers
+      // and may mutate it, and the handler's ctx.request must never observe
+      // those mutations (pre-memoization, every read got a fresh copy). Within
+      // the auth lane a single instance is shared across authenticateToken and
+      // authorize — constructed lazily, once.
+      let webRequest: globalThis.Request | undefined;
+      const getWebRequest = () => (webRequest ??= toWebRequest(request));
+      let authWebRequest: globalThis.Request | undefined;
+      const getAuthWebRequest = () => (authWebRequest ??= toWebRequest(request));
+
       // Check route-level authentication/authorization
       const authError = await this.checkRouteAuth(route, {
         path: String(request.url.split('?')[0] || '/'),
@@ -608,8 +627,10 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
         getHeader: name => request.headers[name.toLowerCase()] as string | undefined,
         getQuery: name => (request.query as Record<string, string>)[name],
         requestContext: request.requestContext,
-        request: toWebRequest(request),
-        buildAuthorizeContext: () => toWebRequest(request),
+        get request() {
+          return getAuthWebRequest();
+        },
+        buildAuthorizeContext: getAuthWebRequest,
       });
 
       if (authError) {
@@ -722,7 +743,9 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
         rawBody: params.rawBody,
         requestBody: params.body,
         requestPathParams: params.urlParams,
-        request: toWebRequest(request),
+        get request() {
+          return getWebRequest();
+        },
       };
 
       // Check route permission requirement (EE feature)
@@ -866,6 +889,11 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
       };
 
       const fastifyHandler: RouteHandlerMethod = async (request: FastifyRequest, reply: FastifyReply) => {
+        // Same lazy memoized construction as registerRoute: at most one WHATWG
+        // Request per request, built only when auth actually reads it.
+        let webRequest: globalThis.Request | undefined;
+        const getWebRequest = () => (webRequest ??= toWebRequest(request));
+
         // Per-route auth check (same pattern as registerRoute)
         const authError = await this.checkRouteAuth(serverRoute, {
           path: String(request.url.split('?')[0] || '/'),
@@ -873,8 +901,10 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
           getHeader: name => request.headers[name.toLowerCase()] as string | undefined,
           getQuery: name => (request.query as Record<string, string>)[name],
           requestContext: request.requestContext,
-          request: toWebRequest(request),
-          buildAuthorizeContext: () => toWebRequest(request),
+          get request() {
+            return getWebRequest();
+          },
+          buildAuthorizeContext: getWebRequest,
         });
 
         if (authError) {

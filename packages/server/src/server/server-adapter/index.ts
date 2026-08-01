@@ -373,6 +373,8 @@ export abstract class MastraServer<TApp, TRequest, TResponse> extends MastraServ
   protected customApiRoutes?: ApiRoute[];
   protected mcpOptions?: MCPOptions;
   protected serverRoutes: readonly ServerRoute[];
+  /** Cached frozen snapshot returned by {@link getServerRoutes}. */
+  private frozenServerRoutes?: readonly ServerRoute[];
   private customRouteHandler:
     | ((
         request: Request,
@@ -462,7 +464,14 @@ export abstract class MastraServer<TApp, TRequest, TResponse> extends MastraServ
   }
 
   getServerRoutes(): readonly ServerRoute[] {
-    return [...this.serverRoutes];
+    // Adapters call this on every request (`handlerParams.serverRoutes`), so
+    // return one cached frozen snapshot instead of allocating a fresh copy of
+    // the whole route table per call. `serverRoutes` is assigned once in the
+    // constructor and never mutated afterwards, and freezing preserves the
+    // guarantee the per-call copy existed for: callers cannot corrupt the
+    // route registry through the returned array.
+    this.frozenServerRoutes ??= Object.freeze([...this.serverRoutes]);
+    return this.frozenServerRoutes;
   }
 
   /**
@@ -661,14 +670,6 @@ export abstract class MastraServer<TApp, TRequest, TResponse> extends MastraServ
       token = context.getQuery('apiKey') || null;
     }
 
-    const fallbackHeaders = new Headers();
-    for (const headerName of ['authorization', 'cookie']) {
-      const headerValue = context.getHeader(headerName);
-      if (headerValue) {
-        fallbackHeaders.set(headerName, headerValue);
-      }
-    }
-
     // Delegate to coreAuthMiddleware for all auth logic
     const result = await coreAuthMiddleware({
       path: context.path,
@@ -678,9 +679,23 @@ export abstract class MastraServer<TApp, TRequest, TResponse> extends MastraServ
       authConfig: authConfig as any,
       customRouteAuthConfig: this.customRouteAuthConfig,
       requestContext: context.requestContext,
-      rawRequest:
-        context.request ??
-        new Request(`http://localhost${context.path}`, { method: context.method, headers: fallbackHeaders }),
+      // Lazy: coreAuthMiddleware reads this exactly once, and only AFTER its
+      // dev-playground/unprotected/public skip checks, so adapters whose
+      // `context.request` is a lazy memoized getter construct no Request at
+      // all for requests those checks wave through.
+      get rawRequest() {
+        if (context.request) {
+          return context.request;
+        }
+        const fallbackHeaders = new Headers();
+        for (const headerName of ['authorization', 'cookie']) {
+          const headerValue = context.getHeader(headerName);
+          if (headerValue) {
+            fallbackHeaders.set(headerName, headerValue);
+          }
+        }
+        return new Request(`http://localhost${context.path}`, { method: context.method, headers: fallbackHeaders });
+      },
       token,
       buildAuthorizeContext: context.buildAuthorizeContext ?? (() => null),
       requiresAuth: route.requiresAuth,
