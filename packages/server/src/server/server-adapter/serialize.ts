@@ -29,6 +29,9 @@ export function serializeStreamChunk(chunk: unknown): SerializedStreamChunk {
       const fast = JSON.stringify(chunk);
       json = fast === undefined ? 'null' : fast;
     } catch {
+      // Re-walks the chunk, so getters/toJSON run a second time on this path.
+      // Chunk payloads must not rely on evaluate-once semantics; nothing the
+      // framework constructs does.
       json = safeStringify(chunk);
     }
     return { ok: true, json };
