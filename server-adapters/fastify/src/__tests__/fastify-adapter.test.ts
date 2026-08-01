@@ -1,3 +1,4 @@
+import http from 'node:http';
 import type {
   AdapterTestContext,
   AdapterSetupOptions,
@@ -906,6 +907,287 @@ describe('Fastify Server Adapter', () => {
 
       expect(response.status).toBeGreaterThanOrEqual(400);
     });
+
+    // --- Multipart aggregate body-limit hardening (PF-2594) ---
+
+    const buildMultipartString = (
+      boundary: string,
+      parts: Array<{ name: string; value: string; filename?: string }>,
+    ): string => {
+      const rendered = parts
+        .map(part => {
+          const disposition =
+            part.filename === undefined
+              ? `content-disposition: form-data; name="${part.name}"\r\n`
+              : `content-disposition: form-data; name="${part.name}"; filename="${part.filename}"\r\ncontent-type: application/octet-stream\r\n`;
+          return `--${boundary}\r\n${disposition}\r\n${part.value}\r\n`;
+        })
+        .join('');
+      return `${rendered}--${boundary}--\r\n`;
+    };
+
+    /**
+     * Send a raw multipart POST over a plain node:http socket so oversized
+     * payloads exercise the server's early-413 path deterministically (fetch's
+     * upload handling can obscure an early response mid-write).
+     */
+    const sendRawMultipart = (
+      port: number,
+      path: string,
+      boundary: string,
+      payload: Buffer,
+    ): Promise<{ status: number; body: string }> => {
+      return new Promise((resolve, reject) => {
+        let responded = false;
+        const req = http.request(
+          {
+            host: '127.0.0.1',
+            port,
+            method: 'POST',
+            path,
+            headers: {
+              'content-type': `multipart/form-data; boundary=${boundary}`,
+              'content-length': payload.byteLength,
+            },
+          },
+          res => {
+            responded = true;
+            let body = '';
+            res.on('data', chunk => (body += chunk));
+            res.on('end', () => {
+              req.destroy();
+              resolve({ status: res.statusCode ?? 0, body });
+            });
+            res.on('error', reject);
+          },
+        );
+        // After an early 413 the server closes a connection whose request body
+        // was never fully read; post-response socket errors are expected.
+        req.on('error', error => {
+          if (!responded) reject(error);
+        });
+        req.end(payload);
+      });
+    };
+
+    const serverPort = (address: string): number => Number(new URL(address).port);
+
+    it('rejects an aggregate-oversize multipart body with the hardened lane 413 shape and stays healthy', async () => {
+      app = Fastify();
+
+      const adapter = new MastraServer({
+        app,
+        mastra: context.mastra,
+        bodyLimitOptions: { maxSize: 1024 },
+      });
+
+      const testRoute: ServerRoute<any, any, any> = {
+        method: 'POST',
+        path: '/test/upload-aggregate',
+        responseType: 'json',
+        handler: async (params: any) => ({ ok: true, name: params.name }),
+      };
+
+      adapter.registerContextMiddleware();
+      await adapter.registerRoute(app, testRoute, { prefix: '' });
+
+      const address = await app.listen({ port: 0 });
+
+      // Each part is small; only the aggregate breaches the 1024-byte cap.
+      const boundary = 'aggregate-boundary';
+      const oversize = buildMultipartString(
+        boundary,
+        Array.from({ length: 64 }, (_, index) => ({ name: `field${index}`, value: 'v'.repeat(64) })),
+      );
+      const rejected = await sendRawMultipart(
+        serverPort(address),
+        '/test/upload-aggregate',
+        boundary,
+        Buffer.from(oversize),
+      );
+
+      expect(rejected.status).toBe(413);
+      // Exact hardened-lane shape: Fastify's own FST_ERR_CTP_BODY_TOO_LARGE
+      // serialization, identical to the non-multipart pre-buffer 413.
+      expect(JSON.parse(rejected.body)).toMatchObject({
+        statusCode: 413,
+        code: 'FST_ERR_CTP_BODY_TOO_LARGE',
+        message: 'Request body is too large',
+      });
+
+      // Busboy teardown must be clean: the same server keeps serving multipart.
+      const followUp = new FormData();
+      followUp.append('name', 'still-alive');
+      const accepted = await fetch(`${address}/test/upload-aggregate`, {
+        method: 'POST',
+        body: followUp as any,
+      });
+      expect(accepted.status).toBe(200);
+      await expect(accepted.json()).resolves.toMatchObject({ ok: true, name: 'still-alive' });
+    });
+
+    it('enforces a route-declared maxBodySize on multipart even without adapter bodyLimitOptions', async () => {
+      app = Fastify();
+
+      const adapter = new MastraServer({
+        app,
+        mastra: context.mastra,
+      });
+
+      const testRoute: ServerRoute<any, any, any> = {
+        method: 'POST',
+        path: '/test/upload-route-cap',
+        responseType: 'json',
+        maxBodySize: 256,
+        handler: async (params: any) => ({ ok: true, name: params.name }),
+      };
+
+      adapter.registerContextMiddleware();
+      await adapter.registerRoute(app, testRoute, { prefix: '' });
+
+      const address = await app.listen({ port: 0 });
+      const boundary = 'route-cap-boundary';
+
+      // Over the 256-byte route cap (but far under the 1 MiB server default).
+      const oversize = buildMultipartString(boundary, [{ name: 'file', value: 'x'.repeat(512), filename: 'x.bin' }]);
+      const rejected = await sendRawMultipart(
+        serverPort(address),
+        '/test/upload-route-cap',
+        boundary,
+        Buffer.from(oversize),
+      );
+      expect(rejected.status).toBe(413);
+      expect(JSON.parse(rejected.body).code).toBe('FST_ERR_CTP_BODY_TOO_LARGE');
+
+      // Under the route cap parses normally.
+      const undersize = buildMultipartString(boundary, [{ name: 'name', value: 'ok' }]);
+      const accepted = await sendRawMultipart(
+        serverPort(address),
+        '/test/upload-route-cap',
+        boundary,
+        Buffer.from(undersize),
+      );
+      expect(accepted.status).toBe(200);
+      expect(JSON.parse(accepted.body)).toMatchObject({ ok: true, name: 'ok' });
+    });
+
+    it('caps multipart at the Fastify server bodyLimit when neither route nor adapter declares one', async () => {
+      app = Fastify(); // factory default bodyLimit: 1 MiB
+
+      const adapter = new MastraServer({
+        app,
+        mastra: context.mastra,
+      });
+
+      const testRoute: ServerRoute<any, any, any> = {
+        method: 'POST',
+        path: '/test/upload-default-cap',
+        responseType: 'json',
+        handler: async () => ({ ok: true }),
+      };
+
+      adapter.registerContextMiddleware();
+      await adapter.registerRoute(app, testRoute, { prefix: '' });
+
+      const address = await app.listen({ port: 0 });
+      const boundary = 'default-cap-boundary';
+
+      const oversize = buildMultipartString(boundary, [
+        { name: 'file', value: 'x'.repeat(1024 * 1024 + 1024), filename: 'big.bin' },
+      ]);
+      const rejected = await sendRawMultipart(
+        serverPort(address),
+        '/test/upload-default-cap',
+        boundary,
+        Buffer.from(oversize),
+      );
+      expect(rejected.status).toBe(413);
+      expect(JSON.parse(rejected.body).code).toBe('FST_ERR_CTP_BODY_TOO_LARGE');
+    });
+
+    it('aborts a chunked multipart stream mid-flight with 413 and closes the connection (no hang)', async () => {
+      app = Fastify();
+
+      const adapter = new MastraServer({
+        app,
+        mastra: context.mastra,
+        bodyLimitOptions: { maxSize: 1024 },
+      });
+
+      const testRoute: ServerRoute<any, any, any> = {
+        method: 'POST',
+        path: '/test/upload-chunked',
+        responseType: 'json',
+        handler: async (params: any) => ({ ok: true, name: params.name }),
+      };
+
+      adapter.registerContextMiddleware();
+      await adapter.registerRoute(app, testRoute, { prefix: '' });
+
+      const address = await app.listen({ port: 0 });
+      const boundary = 'chunked-abort-boundary';
+
+      // No Content-Length: the pre-buffer short-circuit cannot engage, so the
+      // 413 must come from the mid-stream aggregate accounting.
+      const result = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+        const req = http.request({
+          host: '127.0.0.1',
+          port: serverPort(address),
+          method: 'POST',
+          path: '/test/upload-chunked',
+          headers: { 'content-type': `multipart/form-data; boundary=${boundary}` },
+        });
+
+        let timer: NodeJS.Timeout | undefined;
+        const stopWriting = () => {
+          if (timer) {
+            clearInterval(timer);
+            timer = undefined;
+          }
+        };
+
+        // Connection reset after the early 413 is the expected teardown.
+        let responded = false;
+        req.on('error', error => {
+          stopWriting();
+          if (!responded) reject(error);
+        });
+
+        req.on('response', res => {
+          responded = true;
+          stopWriting();
+          let body = '';
+          res.on('data', chunk => (body += chunk));
+          res.on('end', () => {
+            req.destroy();
+            resolve({ status: res.statusCode ?? 0, body });
+          });
+          res.on('error', reject);
+        });
+
+        req.write(
+          `--${boundary}\r\ncontent-disposition: form-data; name="file"; filename="endless.bin"\r\ncontent-type: application/octet-stream\r\n\r\n`,
+        );
+        const filler = Buffer.alloc(256, 0x61);
+        timer = setInterval(() => {
+          req.write(filler);
+        }, 5);
+      });
+
+      expect(result.status).toBe(413);
+      expect(JSON.parse(result.body).code).toBe('FST_ERR_CTP_BODY_TOO_LARGE');
+
+      // The abort must not wedge the server: a well-formed multipart request on
+      // a fresh connection still succeeds.
+      const followUp = new FormData();
+      followUp.append('name', 'after-abort');
+      const accepted = await fetch(`${address}/test/upload-chunked`, {
+        method: 'POST',
+        body: followUp as any,
+      });
+      expect(accepted.status).toBe(200);
+      await expect(accepted.json()).resolves.toMatchObject({ ok: true, name: 'after-abort' });
+    });
   });
 
   describe('Custom route prefix validation', () => {
@@ -1073,6 +1355,10 @@ describe('Fastify Server Adapter', () => {
 
     registerRoute: (adapter, app, route) => adapter.registerRoute(app, route, { prefix: '' }),
 
+    // The adapter enforces bodyLimitOptions.maxSize as an aggregate cap across
+    // an entire multipart payload (parseMultipartFormData raw-stream accounting).
+    supportsMultipartAggregateLimit: true,
+
     executeRequest: async (app, method, url, options = {}) => {
       const parsedUrl = new URL(url);
       const injectOptions: any = {
@@ -1083,7 +1369,12 @@ describe('Fastify Server Adapter', () => {
 
       if (options.body) {
         injectOptions.payload = options.body;
-        injectOptions.headers['content-type'] = 'application/json';
+        // Default to JSON only when the case did not choose its own content
+        // type (the multipart cases carry an explicit multipart Content-Type).
+        const hasContentType = Object.keys(injectOptions.headers).some(name => name.toLowerCase() === 'content-type');
+        if (!hasContentType) {
+          injectOptions.headers['content-type'] = 'application/json';
+        }
       }
 
       const response = await app.inject(injectOptions);

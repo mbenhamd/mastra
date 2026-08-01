@@ -14,6 +14,7 @@ import {
   redactStreamChunk,
   serializeStreamChunk,
 } from '@mastra/server/server-adapter';
+import { errorCodes } from 'fastify';
 import type { FastifyInstance, FastifyReply, FastifyRequest, preHandlerHookHandler, RouteHandlerMethod } from 'fastify';
 export { createAuthMiddleware } from './auth-middleware';
 export type { FastifyAuthMiddlewareOptions } from './auth-middleware';
@@ -81,6 +82,44 @@ function isRequestAborted(rawRequest: FastifyRequest['raw']): boolean {
   // the response stream is still active, so only treat it as disconnect when
   // the request itself reports an abort or never completed.
   return rawRequest.aborted || rawRequest.readableAborted || !rawRequest.complete;
+}
+
+/**
+ * Fastify's own factory default for `bodyLimit` (1 MiB). The multipart lane
+ * cannot rely on Fastify's enforcement — the multipart content-type parser
+ * deliberately never hands the payload to Fastify's byte counting — so the
+ * aggregate cap mirrors what the JSON lane would have allowed on the same
+ * server: route cap, else adapter-wide cap, else the server's `bodyLimit`.
+ * `request.server.initialConfig.bodyLimit` normally supplies that last value;
+ * this constant is the fallback for exotic instances that do not expose it.
+ */
+const FASTIFY_DEFAULT_BODY_LIMIT_BYTES = 1024 * 1024;
+
+/**
+ * Smallest wire cost of one multipart part: the delimiter line for a one-char
+ * boundary (`--b\r\n`), a minimal `content-disposition` header, the blank
+ * header/body separator, and the part's trailing CRLF. Used to derive busboy
+ * part/field/file COUNT caps from the byte cap: a request with more than
+ * `maxTotalBytes / MIN_MULTIPART_PART_WIRE_BYTES` parts necessarily also
+ * breaches the aggregate byte cap, so the derived count limits can never
+ * reject a request the aggregate accounting would have allowed — they are
+ * fail-closed backstops against parser-state abuse, not the primary gate.
+ */
+const MIN_MULTIPART_PART_WIRE_BYTES = 30;
+
+/**
+ * The exact error the hardened non-multipart body-limit lane produces: Fastify
+ * rejects an over-limit body with `FST_ERR_CTP_BODY_TOO_LARGE` (413) from its
+ * content-type parser. Reusing the same error class means the multipart lane's
+ * breaches flow through Fastify's default error handler and serialize to the
+ * identical status/shape (`statusCode`/`code`/`error`/`message`).
+ */
+function createBodyTooLargeError(): Error {
+  return new errorCodes.FST_ERR_CTP_BODY_TOO_LARGE();
+}
+
+function isBodyTooLargeError(error: Error): boolean {
+  return (error as { code?: string }).code === 'FST_ERR_CTP_BODY_TOO_LARGE';
 }
 
 // Extend Fastify types to include Mastra context
@@ -315,14 +354,28 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
 
       if (contentType.includes('multipart/form-data')) {
         try {
-          const maxFileSize = route.maxBodySize ?? this.bodyLimitOptions?.maxSize;
-          body = await this.parseMultipartFormData(request, maxFileSize);
+          // The multipart content-type parser deliberately ignores the payload
+          // (registerContextMiddleware), so neither Fastify's server-wide
+          // `bodyLimit` nor the per-route `bodyLimit` registered in
+          // registerRoute() ever counts multipart bytes. Enforce the SAME cap
+          // here as an AGGREGATE limit over the raw request stream, resolved
+          // exactly like the non-multipart lane: route cap, else adapter-wide
+          // cap, else the Fastify server's own bodyLimit.
+          const maxTotalBytes =
+            route.maxBodySize ??
+            this.bodyLimitOptions?.maxSize ??
+            request.server.initialConfig?.bodyLimit ??
+            FASTIFY_DEFAULT_BODY_LIMIT_BYTES;
+          body = await this.parseMultipartFormData(request, maxTotalBytes);
         } catch (error) {
           this.mastra.getLogger()?.error('Failed to parse multipart form data', {
             error: error instanceof Error ? { message: error.message, stack: error.stack } : error,
           });
-          // Re-throw size limit errors, let others fall through to validation
-          if (error instanceof Error && error.message.toLowerCase().includes('size')) {
+          // Re-throw body-limit breaches so they escape the route handler and
+          // surface through Fastify's default error handler with the exact 413
+          // status/shape of the hardened non-multipart lane
+          // (FST_ERR_CTP_BODY_TOO_LARGE); let others fall through to validation
+          if (error instanceof Error && (isBodyTooLargeError(error) || error.message.toLowerCase().includes('size'))) {
             throw error;
           }
           bodyParseError = {
@@ -341,45 +394,118 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
    * Parse multipart/form-data using @fastify/busboy.
    * Converts file uploads to Buffers and parses JSON field values.
    *
+   * Enforces `maxTotalBytes` as an AGGREGATE cap over the ENTIRE multipart
+   * payload — every part body, boundary, and part header — by accounting the
+   * raw request stream, because Fastify's own body-limit lane never engages for
+   * multipart (the registered content-type parser ignores the payload). Busboy
+   * per-file/per-field size caps and derived part/field/file count caps are
+   * fail-closed backstops behind the aggregate accounting. A breach rejects
+   * with the same `FST_ERR_CTP_BODY_TOO_LARGE` (413) the hardened
+   * non-multipart lane produces.
+   *
    * @param request - The Fastify request object
-   * @param maxFileSize - Optional maximum file size in bytes
+   * @param maxTotalBytes - Maximum aggregate payload size in bytes
    */
-  private parseMultipartFormData(request: FastifyRequest, maxFileSize?: number): Promise<Record<string, unknown>> {
+  private parseMultipartFormData(request: FastifyRequest, maxTotalBytes: number): Promise<Record<string, unknown>> {
     return new Promise((resolve, reject) => {
+      // Same pre-buffer short-circuit Fastify applies in its own body-limit
+      // lane: an honest Content-Length above the cap is rejected before a
+      // single payload byte is read. Chunked or absent Content-Length falls
+      // through to the streaming accounting below (NaN comparisons are false).
+      const declaredLength = Number(request.headers['content-length']);
+      if (declaredLength > maxTotalBytes) {
+        reject(createBodyTooLargeError());
+        return;
+      }
+
       const result: Record<string, unknown> = {};
+      const partCountLimit = Math.floor(maxTotalBytes / MIN_MULTIPART_PART_WIRE_BYTES) + 2;
 
       const busboy = new Busboy({
         headers: {
           'content-type': request.headers['content-type'] as string,
         },
-        limits: maxFileSize ? { fileSize: maxFileSize } : undefined,
+        limits: {
+          // A single file or field can never legitimately exceed the aggregate
+          // cap, and @fastify/busboy's defaults (fieldSize 1 MiB; files,
+          // fields, parts unlimited) must not outlive the route's cap.
+          fileSize: maxTotalBytes,
+          fieldSize: maxTotalBytes,
+          files: partCountLimit,
+          fields: partCountLimit,
+          parts: partCountLimit,
+        },
       });
+
+      let settled = false;
+
+      // Abort teardown, mirroring Fastify's hardened lane: stop observing and
+      // consuming the request stream (no drain — once the 413 is flushed, Node
+      // closes a connection whose request body was not fully read) and destroy
+      // busboy so no further parts are parsed or buffered. unpipe BEFORE
+      // destroy so the pipe never writes into a destroyed stream.
+      const settleReject = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        request.raw.removeListener('data', onAggregateData);
+        request.raw.unpipe(busboy);
+        busboy.destroy();
+        reject(error);
+      };
+
+      const settleResolve = () => {
+        if (settled) return;
+        settled = true;
+        request.raw.removeListener('data', onAggregateData);
+        resolve(result);
+      };
+
+      const abortTooLarge = () => settleReject(createBodyTooLargeError());
+
+      // AGGREGATE accounting. Registered BEFORE .pipe() so it observes every
+      // chunk ahead of busboy and the breach aborts at the earliest byte.
+      let aggregateBytes = 0;
+      const onAggregateData = (chunk: Buffer) => {
+        aggregateBytes += chunk.length;
+        if (aggregateBytes > maxTotalBytes) {
+          abortTooLarge();
+        }
+      };
 
       busboy.on(
         'file',
         (fieldname: string, file: NodeJS.ReadableStream, _filename: string, _encoding: string, _mimetype: string) => {
           const chunks: Buffer[] = [];
-          let limitExceeded = false;
 
           file.on('data', (chunk: Buffer) => {
             chunks.push(chunk);
           });
 
-          file.on('limit', () => {
-            limitExceeded = true;
-            file.resume();
-            reject(new Error(`File size limit exceeded${maxFileSize ? ` (max: ${maxFileSize} bytes)` : ''}`));
-          });
+          // Per-file cap breach (backstop behind the aggregate accounting).
+          file.on('limit', abortTooLarge);
+
+          // Busboy re-emits parse errors on the in-flight file stream; without
+          // a listener that becomes an unhandled 'error' crash. The busboy
+          // 'error' handler below owns the rejection.
+          file.on('error', () => {});
 
           file.on('end', () => {
-            if (!limitExceeded) {
+            if (!settled) {
               result[fieldname] = Buffer.concat(chunks);
             }
           });
         },
       );
 
-      busboy.on('field', (fieldname: string, value: string) => {
+      busboy.on('field', (fieldname: string, value: string, _fieldnameTruncated: boolean, valueTruncated: boolean) => {
+        // Fail closed on a truncated field: silently keeping the truncated
+        // prefix would hand the handler a different body than the client
+        // sent. With fieldSize == maxTotalBytes truncation implies the
+        // aggregate cap is breached as well.
+        if (valueTruncated) {
+          abortTooLarge();
+          return;
+        }
         // Try to parse JSON strings (like 'options')
         try {
           result[fieldname] = JSON.parse(value);
@@ -388,14 +514,26 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
         }
       });
 
-      busboy.on('finish', () => {
-        resolve(result);
-      });
+      // Fail closed when a derived count cap trips instead of silently
+      // truncating the part stream (busboy's default is to ignore the rest).
+      busboy.on('partsLimit', abortTooLarge);
+      busboy.on('filesLimit', abortTooLarge);
+      busboy.on('fieldsLimit', abortTooLarge);
+
+      busboy.on('finish', settleResolve);
 
       busboy.on('error', (error: Error) => {
-        reject(error);
+        settleReject(error);
       });
 
+      // A request stream that errors mid-parse (client abort) must tear the
+      // parse down instead of leaving an unhandled 'error' and a forever-
+      // pending promise.
+      request.raw.once('error', (error: Error) => {
+        settleReject(error);
+      });
+
+      request.raw.on('data', onAggregateData);
       // Pipe the raw request to busboy
       request.raw.pipe(busboy);
     });
