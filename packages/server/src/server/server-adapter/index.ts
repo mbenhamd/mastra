@@ -373,6 +373,8 @@ export abstract class MastraServer<TApp, TRequest, TResponse> extends MastraServ
   protected customApiRoutes?: ApiRoute[];
   protected mcpOptions?: MCPOptions;
   protected serverRoutes: readonly ServerRoute[];
+  /** Cached frozen snapshot returned by {@link getServerRoutes}. */
+  private frozenServerRoutes?: readonly ServerRoute[];
   private customRouteHandler:
     | ((
         request: Request,
@@ -462,7 +464,14 @@ export abstract class MastraServer<TApp, TRequest, TResponse> extends MastraServ
   }
 
   getServerRoutes(): readonly ServerRoute[] {
-    return [...this.serverRoutes];
+    // Adapters call this on every request (`handlerParams.serverRoutes`), so
+    // return one cached frozen snapshot instead of allocating a fresh copy of
+    // the whole route table per call. `serverRoutes` is assigned once in the
+    // constructor and never mutated afterwards, and freezing preserves the
+    // guarantee the per-call copy existed for: callers cannot corrupt the
+    // route registry through the returned array.
+    this.frozenServerRoutes ??= Object.freeze([...this.serverRoutes]);
+    return this.frozenServerRoutes;
   }
 
   /**
