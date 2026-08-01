@@ -110,3 +110,52 @@ describe('runAgentEntry legacy watch-event bridge', () => {
     ]);
   });
 });
+
+describe('runAgentEntry structured output capture (PF-2591)', () => {
+  function makeStructuredAgent(object: unknown) {
+    return {
+      name: 'structured-agent',
+      getModel: async () => ({ specificationVersion: 'v1' }),
+      streamLegacy: async (_prompt: string, opts: { onFinish?: (result: any) => void }) => ({
+        fullStream: (async function* () {
+          yield { type: 'text-delta', textDelta: 'ignored text' };
+          opts.onFinish?.({ text: 'ignored text', object });
+        })(),
+      }),
+    };
+  }
+
+  type AgentEntry = Parameters<typeof runAgentEntry>[0];
+
+  it.each([[false], [0], [''], [null]])(
+    'returns the falsy structured value %j instead of degrading to text',
+    async value => {
+      const publish = vi.fn(async () => {});
+      const result = await runAgentEntry(
+        {
+          type: 'agent',
+          id: 'step-structured',
+          agentId: 'structured-agent',
+          agent: makeStructuredAgent(value),
+          options: { structuredOutput: { schema: { type: 'boolean' } } },
+        } as unknown as AgentEntry,
+        makeCtx(publish),
+      );
+      expect(result).toBe(value);
+    },
+  );
+
+  it('still returns { text } when no structured schema is declared', async () => {
+    const publish = vi.fn(async () => {});
+    const result = await runAgentEntry(
+      {
+        type: 'agent',
+        id: 'step-plain',
+        agentId: 'structured-agent',
+        agent: makeStructuredAgent(false),
+      } as unknown as AgentEntry,
+      makeCtx(publish),
+    );
+    expect(result).toEqual({ text: 'ignored text' });
+  });
+});

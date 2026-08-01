@@ -62,8 +62,12 @@ export async function runAgentEntry(
   // can't surface as an unhandled rejection before the await.
   streamPromise.promise.catch(() => {});
 
-  // Track structured output result
-  let structuredResult: any = null;
+  // Track structured output result. Presence is a separate sentinel: a
+  // declared structured schema may legitimately produce `false`, `0`, `''`,
+  // or `null`, and those must reach downstream steps as the structured value
+  // rather than degrading to `{ text }` (PF-2591).
+  let structuredResult: unknown;
+  let hasStructuredResult = false;
 
   const toolData = {
     name: agent.name,
@@ -74,8 +78,9 @@ export async function runAgentEntry(
 
   const handleFinish = (result: any) => {
     const resultWithObject = result as typeof result & { object?: unknown };
-    if (agentOptions?.structuredOutput?.schema && resultWithObject.object) {
+    if (agentOptions?.structuredOutput?.schema && resultWithObject.object !== undefined) {
       structuredResult = resultWithObject.object;
+      hasStructuredResult = true;
     }
     streamPromise.resolve(result.text);
     void agentOptions?.onFinish?.(result);
@@ -138,7 +143,7 @@ export async function runAgentEntry(
   }
 
   // Return structured output if available, otherwise default text
-  if (structuredResult !== null) {
+  if (hasStructuredResult) {
     return structuredResult;
   }
   return {
