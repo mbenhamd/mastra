@@ -173,6 +173,56 @@ describe('WHATWG Request construction counting (PF-2594)', () => {
     });
   });
 
+  it('constructs ZERO Requests for unprotected and auth-opt-out routes on an auth-configured server', async () => {
+    app = Fastify();
+
+    const originalGetServer = context.mastra.getServer.bind(context.mastra);
+    context.mastra.getServer = () =>
+      ({
+        ...originalGetServer(),
+        auth: {
+          authenticateToken: async (token: string) => (token === 'valid-token' ? { id: 'user-1' } : null),
+          authorize: async () => true,
+        },
+      }) as ReturnType<typeof originalGetServer>;
+
+    const adapter = new MastraServer({ app, mastra: context.mastra });
+
+    // Outside the default protected set (['/api/*']): coreAuthMiddleware's
+    // unprotected-path skip check waves the request through BEFORE its single
+    // deferred rawRequest read, so nothing is constructed.
+    const unprotectedRoute: ServerRoute<any, any, any> = {
+      method: 'GET',
+      path: '/unprotected/ping',
+      responseType: 'json',
+      handler: async () => ({ ok: true }),
+    };
+    // Explicit per-route opt-out: checkRouteAuth returns before
+    // coreAuthMiddleware is even invoked.
+    const optOutRoute: ServerRoute<any, any, any> = {
+      method: 'GET',
+      path: '/api/test/auth-opt-out',
+      responseType: 'json',
+      requiresAuth: false,
+      handler: async () => ({ ok: true }),
+    };
+
+    adapter.registerContextMiddleware();
+    await adapter.registerRoute(app, unprotectedRoute, { prefix: '' });
+    await adapter.registerRoute(app, optOutRoute, { prefix: '' });
+    await app.ready();
+
+    await withCountingRequest(async constructions => {
+      const unprotected = await app!.inject({ method: 'GET', url: '/unprotected/ping' });
+      expect(unprotected.statusCode).toBe(200);
+      expect(constructions()).toBe(0);
+
+      const optOut = await app!.inject({ method: 'GET', url: '/api/test/auth-opt-out' });
+      expect(optOut.statusCode).toBe(200);
+      expect(constructions()).toBe(0);
+    });
+  });
+
   it('constructs exactly one Request for the whole auth lane, plus one when the handler reads ctx.request', async () => {
     app = Fastify();
 

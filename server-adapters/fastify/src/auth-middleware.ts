@@ -64,11 +64,11 @@ export function createAuthMiddleware({
       token = query.apiKey || null;
     }
 
-    // One WHATWG Request per request: `coreAuthMiddleware` reads `rawRequest`
-    // unconditionally, so it is constructed eagerly (as before), but
-    // authorize() now reuses the same instance instead of building a second
-    // one. The instances carry method + headers only (no body), so sharing is
-    // safe.
+    // At most one WHATWG Request per request, constructed lazily:
+    // `coreAuthMiddleware` reads `rawRequest` exactly once, and only AFTER its
+    // dev-playground/unprotected/public skip checks, so requests those checks
+    // wave through construct nothing. authenticateToken and authorize() share
+    // the single instance (it carries method + headers only — no body).
     let webRequest: globalThis.Request | undefined;
     const getWebRequest = () => (webRequest ??= toWebRequest(request));
 
@@ -80,7 +80,9 @@ export function createAuthMiddleware({
       authConfig,
       customRouteAuthConfig,
       requestContext: request.requestContext,
-      rawRequest: getWebRequest(),
+      get rawRequest() {
+        return getWebRequest();
+      },
       token,
       buildAuthorizeContext: getWebRequest,
     });

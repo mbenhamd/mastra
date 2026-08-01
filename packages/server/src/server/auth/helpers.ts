@@ -434,6 +434,11 @@ export function supportsSessionRefresh(
  * Skip checks (dev playground, unprotected path, public path) are evaluated once.
  */
 export const coreAuthMiddleware = async (ctx: AuthMiddlewareContext): Promise<AuthResult> => {
+  // `rawRequest` is deliberately NOT destructured here: adapters may pass it
+  // as a lazy getter (constructing a WHATWG Request costs several
+  // microseconds), and reading it before the skip checks below would defeat
+  // that laziness for dev-playground/unprotected/public requests that never
+  // need it. It is read exactly once, after the skip checks.
   const {
     path,
     method,
@@ -442,7 +447,6 @@ export const coreAuthMiddleware = async (ctx: AuthMiddlewareContext): Promise<Au
     authConfig,
     customRouteAuthConfig,
     requestContext,
-    rawRequest,
     token,
     forceAuth,
     requiresAuth,
@@ -478,6 +482,8 @@ export const coreAuthMiddleware = async (ctx: AuthMiddlewareContext): Promise<Au
 
   let user: unknown;
   let refreshHeaders: Record<string, string> | undefined;
+  // First (and only) read of ctx.rawRequest — see the note at the destructure.
+  const rawRequest = ctx.rawRequest;
   const authRequest = adaptToMastraAuthRequest(rawRequest);
 
   try {
