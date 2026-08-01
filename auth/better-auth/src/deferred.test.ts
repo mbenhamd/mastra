@@ -91,6 +91,61 @@ describe('deferred instance mode', () => {
     warn.mockRestore();
   });
 
+  it('credential entry points await the deferred-migration latch idempotently', async () => {
+    const provider = new MastraAuthBetterAuth({ secret: SECRET });
+    await provider.init({ database: memoryDb(), publicUrl: 'http://localhost:3000' });
+
+    // Sign-in is the FIRST operation on this provider — it must run the lazy
+    // migration itself instead of relying on some earlier migrated call. (The
+    // in-memory adapter accepts queries either way, so the latch call count is
+    // the observable contract here; the real-database behavior is pinned in
+    // deferred-credentials.test.ts.)
+    await provider
+      .signIn('nobody@acme.test', 'password-1234', new Request('http://localhost:3000/auth/credentials/sign-in'))
+      .catch(() => {
+        // invalid credentials — irrelevant here
+      });
+    expect(runMigrations).toHaveBeenCalledTimes(1);
+
+    // The once-per-process latch holds across the other credential entry point.
+    await provider.signUp(
+      'new-user@acme.test',
+      'password-1234',
+      'New User',
+      new Request('http://localhost:3000/auth/credentials/sign-up'),
+    );
+    expect(runMigrations).toHaveBeenCalledTimes(1);
+  });
+
+  it('sign-up fails closed while migrations fail, then retries and recovers', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    runMigrations.mockRejectedValueOnce(new Error('database locked'));
+    const provider = new MastraAuthBetterAuth({ secret: SECRET });
+    await provider.init({ database: memoryDb(), publicUrl: 'http://localhost:3000' });
+
+    // First sign-up: migration fails → the credential op must fail closed
+    // instead of proceeding against an unmigrated database.
+    await expect(
+      provider.signUp(
+        'blocked-user@acme.test',
+        'password-1234',
+        'Blocked User',
+        new Request('http://localhost:3000/auth/credentials/sign-up'),
+      ),
+    ).rejects.toThrow(/database locked/);
+
+    // Retry succeeds once migrations recover.
+    const result = await provider.signUp(
+      'recovered-user@acme.test',
+      'password-1234',
+      'Recovered User',
+      new Request('http://localhost:3000/auth/credentials/sign-up'),
+    );
+    expect(result.user.email).toBe('recovered-user@acme.test');
+    expect(runMigrations).toHaveBeenCalledTimes(2);
+    warn.mockRestore();
+  });
+
   it('bring-your-own instances never trigger provider-owned migrations', async () => {
     const auth = betterAuth({
       baseURL: 'http://localhost:3000',

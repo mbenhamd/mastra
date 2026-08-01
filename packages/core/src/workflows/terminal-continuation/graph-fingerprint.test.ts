@@ -411,6 +411,43 @@ describe('workflow terminal graph fingerprint', () => {
     ).toThrow(/duplicate step id/);
   });
 
+  it('accepts and distinguishes serialized agent passthrough execution options', () => {
+    const withOptions = (options: Record<string, unknown> | undefined): SerializedStepFlowEntry[] => [
+      { type: 'agent', id: 'summarize', agentId: 'writer', ...(options ? { options } : {}) } as SerializedStepFlowEntry,
+    ];
+
+    // Stored graphs may now carry the serialized execution passthrough set —
+    // strict key validation must accept it instead of rejecting the graph.
+    const base = createWorkflowTerminalGraphFingerprint(
+      withOptions({ retries: 2, maxSteps: 3, toolChoice: 'auto', modelSettings: { temperature: 0.25 } }),
+    );
+    // Deterministic across JSON storage.
+    expect(
+      createWorkflowTerminalGraphFingerprint(
+        JSON.parse(
+          JSON.stringify(
+            withOptions({ retries: 2, maxSteps: 3, toolChoice: 'auto', modelSettings: { temperature: 0.25 } }),
+          ),
+        ) as SerializedStepFlowEntry[],
+      ),
+    ).toBe(base);
+    // Execution-semantic option drift must change the fingerprint.
+    expect(
+      createWorkflowTerminalGraphFingerprint(
+        withOptions({ retries: 2, maxSteps: 5, toolChoice: 'auto', modelSettings: { temperature: 0.25 } }),
+      ),
+    ).not.toBe(base);
+    expect(createWorkflowTerminalGraphFingerprint(withOptions({ retries: 2 }))).not.toBe(base);
+    // Legacy stability: retries-only options keep the pre-upgrade token, so an
+    // entry without passthrough options fingerprints exactly like before —
+    // metadata stays excluded from the hash.
+    expect(createWorkflowTerminalGraphFingerprint(withOptions({ retries: 2, metadata: { note: 'x' } }))).toBe(
+      createWorkflowTerminalGraphFingerprint(withOptions({ retries: 2 })),
+    );
+    // Unknown option keys are still rejected.
+    expect(() => createWorkflowTerminalGraphFingerprint(withOptions({ scorers: {} }))).toThrow(/unknown field/);
+  });
+
   it('includes declarative predicates and foreach concurrency resolvers in the fingerprint', () => {
     const base: SerializedStepFlowEntry[] = [
       {

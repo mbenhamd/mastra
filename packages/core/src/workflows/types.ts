@@ -940,15 +940,49 @@ export type SerializedStep<TEngineType = DefaultEngineType> = Pick<
  * ids/strings only (no closures or live references).
  */
 /**
+ * Agent-step execution options that round-trip through storage as plain JSON:
+ * `runAgentEntry` forwards them verbatim to the agent run and they carry no
+ * per-run identity or trust semantics. Shared by `toStorableGraph` (which
+ * validates and copies them), `rehydrateWorkflow` (which restores them onto
+ * the rebuilt entry), and the terminal-continuation graph fingerprint (which
+ * must accept and hash them so option drift is detected on cold resume).
+ */
+export const SERIALIZED_AGENT_PASSTHROUGH_OPTION_KEYS = [
+  'maxSteps',
+  'toolChoice',
+  'activeTools',
+  'modelSettings',
+  'providerOptions',
+  'instructions',
+  'system',
+  'temperature',
+  'savePerStep',
+  'maxProcessorRetries',
+  'returnScorerData',
+  'requireToolApproval',
+  'autoResumeSuspendedTools',
+  'toolCallConcurrency',
+  'includeRawChunks',
+  'toolsetsMode',
+  'disableBackgroundTasks',
+  'versions',
+] as const;
+
+export type SerializedAgentPassthroughOptionKey = (typeof SERIALIZED_AGENT_PASSTHROUGH_OPTION_KEYS)[number];
+
+/**
  * JSON-safe subset of {@link AgentStepOptions} / tool step options carried on
- * a serialized declarative entry. Closure-valued fields (`onFinish`) and
- * `scorers` in any form don't round-trip and are rejected at `toStorableGraph`
- * time.
+ * a serialized declarative entry. `retries` / `metadata` apply to both agent
+ * and tool entries; the passthrough execution options
+ * ({@link SERIALIZED_AGENT_PASSTHROUGH_OPTION_KEYS}) are agent-only and are
+ * validated as JSON-round-trippable at `toStorableGraph` time. Closure-valued
+ * fields (`onFinish`), `scorers` in any form, and every option outside this
+ * set don't round-trip and are rejected at `toStorableGraph` time.
  */
 export type SerializedStepOptions = {
   retries?: number;
   metadata?: StepMetadata;
-};
+} & Partial<Record<SerializedAgentPassthroughOptionKey, unknown>>;
 
 export type SerializedSingleStepEntry =
   | { type: 'step'; step: SerializedStep }

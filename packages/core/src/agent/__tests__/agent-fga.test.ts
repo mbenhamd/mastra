@@ -2016,6 +2016,111 @@ describe('DurableAgent FGA checks', () => {
     }
   });
 
+  it('cold resume authorizes with the defaults-resolved request context but still fails closed on owner verification', async () => {
+    const requireActor = vi.fn().mockResolvedValue(undefined);
+    const fgaProvider = { ...createMockFGAProvider(true), requireActor };
+    const pubsub = new EventEmitterPubSub();
+    const defaultsContext = new RequestContext();
+    defaultsContext.set('organizationId', 'org-1');
+    defaultsContext.set('user', { id: 'defaults-user', organizationMembershipId: 'membership-1' });
+    const defaultOptions = vi.fn(() => ({ requestContext: defaultsContext }));
+    const base = new Agent({
+      id: 'test-agent',
+      name: 'test-agent',
+      instructions: 'test',
+      model: createMockModel(),
+      defaultOptions,
+    });
+    const durableAgent = createDurableAgent({ agent: base, pubsub });
+    const mastra = new Mastra({ agents: {}, logger: false, pubsub, server: { fga: fgaProvider } });
+    (durableAgent as any).__registerMastra(mastra);
+
+    try {
+      // With no explicit and no registry context, the defaults-resolved
+      // request context (which carries the authenticated user) is the
+      // authorization context, so the principal fail-closed check passes —
+      // and the resume then fails closed on the caller's unverified owner
+      // ids: a defaults-supplied context never vouches for thread ownership.
+      await expect(durableAgent.resume('cold-defaults-ctx-run', { approved: true })).rejects.toMatchObject({
+        id: 'AGENT_RESUME_OWNER_UNVERIFIED',
+      });
+      expect(defaultOptions).toHaveBeenCalled();
+      // Fail-closed without ever consulting the provider or storage.
+      expect(requireActor).not.toHaveBeenCalled();
+      expect(fgaProvider.require).not.toHaveBeenCalled();
+    } finally {
+      await mastra.stopWorkers?.();
+      await pubsub.close();
+    }
+  });
+
+  it('resume({ untilIdle: true }) authorizes the effective actor exactly once across the whole until-idle resume', async () => {
+    const requireActor = vi.fn().mockResolvedValue(undefined);
+    const requireUser = vi.fn().mockResolvedValue(undefined);
+    const fgaProvider = { ...createMockFGAProvider(true), require: requireUser, requireActor };
+    const pubsub = new EventEmitterPubSub();
+    const defaultOptions = vi.fn(() => ({}));
+    const base = new Agent({
+      id: 'test-agent',
+      name: 'test-agent',
+      instructions: 'test',
+      model: createMockModel(),
+      defaultOptions,
+    });
+    const durableAgent = createDurableAgent({ agent: base, pubsub });
+    const mastra = new Mastra({ agents: {}, logger: false, pubsub, server: { fga: fgaProvider } });
+    (durableAgent as any).__registerMastra(mastra);
+
+    const user = { id: 'until-idle-user', organizationMembershipId: 'membership-1' };
+    const requestContext = new RequestContext();
+    requestContext.set('organizationId', 'org-1');
+    requestContext.set('user', user);
+    const initialActor = { actorKind: 'system' as const, agentId: 'initial-system-agent' };
+    const { runId } = await durableAgent.prepare('test', { requestContext, actor: initialActor });
+    const resumeWorkflow = vi.fn().mockResolvedValue({ status: 'suspended' });
+    vi.spyOn(durableAgent, 'getWorkflow').mockReturnValue({
+      createRun: vi.fn().mockResolvedValue({ resume: resumeWorkflow }),
+    } as any);
+    let result: { cleanup: () => void } | undefined;
+
+    try {
+      // prepare() authorized the initial actor (fork contract: preparation
+      // enforces agents:execute fail-closed).
+      expect(requireActor).toHaveBeenCalledTimes(1);
+      const authorizeCallsAfterPrepare = requireActor.mock.calls.length;
+      const defaultOptionsCallsAfterPrepare = defaultOptions.mock.calls.length;
+
+      const explicitActor = { actorKind: 'system' as const, agentId: 'until-idle-actor' };
+      result = await durableAgent.resume(runId, { approved: true }, {
+        requestContext,
+        actor: explicitActor,
+        untilIdle: true,
+      } as any);
+      await vi.waitFor(() => expect(resumeWorkflow).toHaveBeenCalledTimes(1));
+
+      // The whole until-idle resume — the outer preflight plus the idle
+      // wrapper's inner resume() — consults the provider exactly ONCE. The
+      // outer authorization is carried to the inner call on the wrapper-owned
+      // resolved-defaults lane, so the inner preflight keeps every fail-closed
+      // gate but never re-authorizes.
+      expect(requireActor).toHaveBeenCalledTimes(authorizeCallsAfterPrepare + 1);
+      expect(requireActor).toHaveBeenLastCalledWith(
+        explicitActor,
+        expect.objectContaining({ resource: { type: 'agent', id: 'test-agent' } }),
+      );
+      // Dynamic defaults were resolved exactly once for the whole call.
+      expect(defaultOptions).toHaveBeenCalledTimes(defaultOptionsCallsAfterPrepare + 1);
+      // The workflow segment received this call's actor.
+      expect(resumeWorkflow.mock.calls[0]?.[0].actor).toEqual(explicitActor);
+    } finally {
+      result?.cleanup();
+      durableAgent.runRegistry.cleanup(runId);
+      globalRunRegistry.delete(runId);
+      await mastra.stopWorkers?.();
+      await pubsub.close();
+    }
+  });
+
   it.each([
     { name: 'generate()', method: 'generate' as const },
     { name: 'stream()', method: 'stream' as const },

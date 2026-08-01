@@ -18,6 +18,7 @@
  * would ship broken workflows unnoticed.
  */
 import { standardSchemaToJSONSchema, toStandardSchema } from '../../schema';
+import { SERIALIZED_AGENT_PASSTHROUGH_OPTION_KEYS } from '../types';
 import type {
   SerializedSingleStepEntry,
   SerializedStepFlowEntry,
@@ -198,9 +199,93 @@ function stepDescriptor(step: any) {
 }
 
 /**
- * Pull the JSON-safe fields (`retries`, `metadata`) out of the options bag
- * carried on a live agent/tool `SingleStepEntry`. Closure-valued fields must
- * hard-crash here rather than silently vanish through storage.
+ * Options that can never be stored, keyed to a targeted hint. Everything here
+ * is either closure-carrying by nature, a live runtime object, per-run
+ * identity, or a per-call trust signal — none of which round-trip through
+ * JSON, so a rehydrated step would silently run without them.
+ */
+const NON_STORABLE_STEP_OPTION_HINTS: Record<string, string> = {
+  stopWhen: 'stop conditions are functions',
+  inputProcessors: 'live processor instances do not round-trip',
+  outputProcessors: 'live processor instances do not round-trip',
+  errorProcessors: 'live processor instances do not round-trip',
+  toolsets: 'live tool instances do not round-trip',
+  clientTools: 'live tool instances do not round-trip',
+  hooks: 'tool hooks are callback closures',
+  prepareStep: 'callback closures do not round-trip',
+  onIterationComplete: 'callback closures do not round-trip',
+  delegation: 'delegation hooks are callback closures',
+  isTaskComplete: 'scorer instances do not round-trip',
+  experimentalTransform: 'stream transform factories do not round-trip',
+  transform: 'tool-payload transform policies carry functions',
+  memory: 'memory binds per-run identity and may carry live configuration',
+  memoryOptions: 'memory binds per-run identity and may carry live configuration',
+  runId: 'run ids are per-run identity',
+  actor: 'actor is a per-call trust signal and must never be persisted',
+  tracingOptions: 'tracing options are per-invocation observability state',
+  untilIdle: 'background-continuation lifecycle is a live-invocation concern',
+};
+
+/**
+ * Fail-closed structural check for a storable option value: only JSON-safe
+ * plain data (finite numbers, strings, booleans, null, plain objects/arrays)
+ * survives a storage round-trip byte-for-byte. Anything else — functions,
+ * class instances, symbols, bigints, non-finite numbers, `undefined` array
+ * holes — would be silently mangled or dropped by `JSON.stringify`.
+ */
+function assertStorableOptionValue(value: unknown, entryId: string, kind: 'agent' | 'tool', path: string): void {
+  const fail = (reason: string): never => {
+    throw new Error(
+      `${kind === 'agent' ? 'Agent' : 'Tool'} step "${entryId}" cannot be stored: option "${path}" ${reason} and does not round-trip through storage. Remove it or move that logic outside the persisted workflow.`,
+    );
+  };
+  if (value === null) return;
+  switch (typeof value) {
+    case 'string':
+    case 'boolean':
+      return;
+    case 'number':
+      if (!Number.isFinite(value)) fail('is a non-finite number');
+      return;
+    case 'undefined':
+      // Only reachable for object properties (array holes are rejected below);
+      // JSON.stringify drops the key, which is equivalent to absence.
+      return;
+    case 'function':
+      fail('is a function');
+      return;
+    case 'symbol':
+    case 'bigint':
+      fail(`is a ${typeof value}`);
+      return;
+    default:
+      break;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => {
+      if (item === undefined) fail(`has an undefined element at "${path}[${index}]"`);
+      assertStorableOptionValue(item, entryId, kind, `${path}[${index}]`);
+    });
+    return;
+  }
+  const proto = Object.getPrototypeOf(value);
+  if (proto !== Object.prototype && proto !== null) {
+    fail('is a class instance (not plain data)');
+  }
+  for (const [key, entryValue] of Object.entries(value as Record<string, unknown>)) {
+    assertStorableOptionValue(entryValue, entryId, kind, `${path}.${key}`);
+  }
+}
+
+/**
+ * Pull the storable fields out of the options bag carried on a live
+ * agent/tool `SingleStepEntry`: `retries` / `metadata` for both kinds, plus
+ * the JSON-safe agent execution passthrough set
+ * ({@link SERIALIZED_AGENT_PASSTHROUGH_OPTION_KEYS}) that `runAgentEntry`
+ * forwards verbatim to the agent run. Every other option — closures, live
+ * instances, per-run identity, trust signals, and any key this walk doesn't
+ * recognize — must hard-crash here rather than silently vanish through
+ * storage.
  */
 function pickSerializableStepOptions(
   options: any,
@@ -219,6 +304,7 @@ function pickSerializableStepOptions(
     { key: 'onStepFinish', hint: 'callback closure' },
     { key: 'onAbort', hint: 'callback closure' },
     { key: 'toolChoice', hint: 'may be a function' },
+    { key: 'requireToolApproval', hint: 'may be a function' },
   ];
   for (const { key, hint } of forbidden) {
     if (typeof options[key] === 'function') {
@@ -228,18 +314,41 @@ function pickSerializableStepOptions(
     }
   }
   // Scorer configs don't survive storage in ANY form — `SerializedStepOptions`
-  // carries only `retries`/`metadata`, so a rehydrated step would silently run
-  // unscored. Fail loudly for static configs exactly like for closures.
+  // has no scorers field, so a rehydrated step would silently run unscored.
+  // Fail loudly for static configs exactly like for closures.
   if (options.scorers !== undefined) {
     throw new Error(
       `${kind === 'agent' ? 'Agent' : 'Tool'} step "${entryId}" cannot be stored: option "scorers" does not round-trip through storage (scorer configs are not serialized). Remove it or attach scoring outside the persisted workflow.`,
     );
   }
 
+  const passthroughKeys = new Set<string>(SERIALIZED_AGENT_PASSTHROUGH_OPTION_KEYS);
   const out: SerializedStepOptions = {};
   if (typeof options.retries === 'number') out.retries = options.retries;
   if (options.metadata && typeof options.metadata === 'object') {
+    assertStorableOptionValue(options.metadata, entryId, kind, 'metadata');
     out.metadata = options.metadata as Record<string, any>;
+  }
+  for (const key of Object.keys(options)) {
+    const value = options[key];
+    if (value === undefined) continue;
+    // Handled above (retries/metadata) or elsewhere (structuredOutput is
+    // captured as the entry's `outputSchema`; the callback/scorers rejections
+    // already fired for function values).
+    if (key === 'retries' || key === 'metadata' || key === 'structuredOutput') continue;
+    if (kind === 'agent' && passthroughKeys.has(key)) {
+      assertStorableOptionValue(value, entryId, kind, key);
+      (out as Record<string, unknown>)[key] = value;
+      continue;
+    }
+    const hint = NON_STORABLE_STEP_OPTION_HINTS[key];
+    throw new Error(
+      `${kind === 'agent' ? 'Agent' : 'Tool'} step "${entryId}" cannot be stored: option "${key}" does not round-trip through storage${
+        hint
+          ? ` (${hint})`
+          : ' (it is not in the serialized subset, so a rehydrated step would silently run without it)'
+      }. Remove it or move that logic outside the persisted workflow.`,
+    );
   }
   return Object.keys(out).length > 0 ? out : undefined;
 }

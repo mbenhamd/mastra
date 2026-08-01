@@ -83,6 +83,17 @@ import { createDurableAgenticWorkflow } from './workflows';
 const CLOSE_ON_SUSPEND = Symbol('mastra.durable.closeOnSuspend');
 const pendingDurableRunIds = new Set<string>();
 const RESOLVED_EXECUTION_OPTIONS = Symbol('mastra.durable.resolvedExecutionOptions');
+/**
+ * Marker stamped by `resume({ untilIdle })` onto the resolved-defaults object
+ * it hands the idle wrapper (the `_resolvedDefaultOptions` lane) after it has
+ * fully FGA-authorized the public call. The wrapper's inner `resume()` for the
+ * SAME runId consumes it to skip only the duplicate provider authorization —
+ * every other fail-closed gate (principal check, request-context validation,
+ * owner verification) still runs. The key is a module-local Symbol, so a
+ * public caller who forges a plain `_resolvedDefaultOptions` object can never
+ * attach it, and a marker minted for one run never authorizes another.
+ */
+const RESUME_PREFLIGHT_AUTHORIZED = Symbol('mastra.durable.resumePreflightAuthorized');
 
 /**
  * Options for DurableAgent.stream()
@@ -2856,6 +2867,21 @@ export class DurableAgent<
           runId,
           actor: resolvedOptions.actor,
         });
+        // The wrapper's inner resume() re-runs the public entry for the SAME
+        // runId; carry proof of the authorization above on the wrapper-owned
+        // `_resolvedDefaultOptions` object (enumerable so it survives the
+        // spreads in the idle loop, module-local Symbol so it cannot be forged
+        // from outside) so the provider is not consulted twice per call.
+        // Shallow-clone first: static `defaultOptions` configs are returned by
+        // reference, and the marker must never be stamped onto shared agent
+        // config.
+        preflightedDefaultOptions = { ...preflightedDefaultOptions };
+        Object.defineProperty(preflightedDefaultOptions, RESUME_PREFLIGHT_AUTHORIZED, {
+          value: { runId },
+          enumerable: true,
+          configurable: true,
+          writable: true,
+        });
       }
       return runResumeDurableStreamUntilIdle<TOutput>(
         this as unknown as DurableAgent<any, any, TOutput>,
@@ -2881,16 +2907,24 @@ export class DurableAgent<
       );
     }
 
+    // Until-idle handoff: when the outer resume({ untilIdle }) branch already
+    // fully authorized this public call, its marker rides the resolved-defaults
+    // object the wrapper controls. Validate it against THIS runId and strip it
+    // before the defaults are merged, so it can only ever skip the duplicate
+    // provider authorization for the run it was minted for.
+    const carriedResumeDefaults = options?._resolvedDefaultOptions as Record<PropertyKey, unknown> | undefined;
+    const carriedResumePreflight = carriedResumeDefaults?.[RESUME_PREFLIGHT_AUTHORIZED] as { runId?: string } | undefined;
+    if (carriedResumeDefaults && carriedResumePreflight !== undefined) {
+      delete carriedResumeDefaults[RESUME_PREFLIGHT_AUTHORIZED];
+    }
+    const resumeAlreadyAuthorized = carriedResumePreflight?.runId === runId;
+
     let entry = this.#runRegistry.get(runId);
     let priorExecution = entry?.workflowExecution;
     const warmMemoryInfo = entry ? this.#runRegistry.getMemoryInfo(runId) : undefined;
     const hasFga = Boolean(this.#mastra?.getServer()?.fga);
     const explicitRequestContext = options?.requestContext;
-    // Warm resumes may authorize against the registered request context (the
-    // run was admitted through this instance's own preflights). The reserved
-    // owner ids below still come exclusively from the caller's own context —
-    // the registered context never vouches for a caller's thread ownership.
-    const effectiveRequestContext = explicitRequestContext ?? (entry?.requestContext as RequestContext | undefined);
+    const registryRequestContext = entry?.requestContext as RequestContext | undefined;
     const contextResourceId = explicitRequestContext?.get(MASTRA_RESOURCE_ID_KEY);
     const contextThreadId = explicitRequestContext?.get(MASTRA_THREAD_ID_KEY);
     const requestedThread = options?.memory?.thread;
@@ -2902,8 +2936,23 @@ export class DurableAgent<
     // is both authorized and forwarded to the workflow segment.
     const resolvedOptions = (await this.#resolveExecutionOptions({
       ...(options as DurableAgentStreamOptions<TOutput>),
-      requestContext: effectiveRequestContext as DurableAgentStreamOptions<TOutput>['requestContext'],
+      requestContext: (explicitRequestContext ??
+        registryRequestContext) as DurableAgentStreamOptions<TOutput>['requestContext'],
     })) as DurableAgentResumeOptions<TOutput>;
+
+    // Warm resumes may authorize against the registered request context (the
+    // run was admitted through this instance's own preflights). Cold resumes
+    // with no explicit caller context fall back to the context the resolved
+    // dynamic defaults just supplied — the same context the execution options
+    // carry — instead of authorizing against an empty context. The reserved
+    // owner ids above still come exclusively from the caller's own explicit
+    // context: neither the registered nor the defaults-resolved context ever
+    // vouches for a caller's thread ownership, so the fail-closed
+    // AGENT_RESUME_OWNER_UNVERIFIED gate below is unaffected.
+    const effectiveRequestContext =
+      explicitRequestContext ??
+      registryRequestContext ??
+      (resolvedOptions.requestContext as RequestContext | undefined);
 
     // Fail closed on the caller's principal before revealing anything about
     // the run: with FGA configured, a caller with neither an authenticated
@@ -2960,7 +3009,10 @@ export class DurableAgent<
     // Single FGA authorization for this resume call, with the effective
     // per-call actor and the warm owner tuple as authorization context. It
     // runs before the warm owner-tuple comparison so a denied caller never
-    // learns whether their claim matched.
+    // learns whether their claim matched. When the until-idle wrapper's outer
+    // branch already authorized this exact public call (validated marker
+    // above), the provider is not consulted again — the preflight still runs
+    // for request-context validation and the principal fail-closed check.
     await this.#assertPublicAgentResumePreflight({
       requestContext: effectiveRequestContext,
       memory:
@@ -2971,6 +3023,7 @@ export class DurableAgent<
       runId,
       snapshotMemoryInfo: warmMemoryInfo,
       actor: resolvedOptions.actor,
+      ...(resumeAlreadyAuthorized ? { authorize: false } : {}),
     });
     if (
       (warmMemoryInfo?.resourceId &&

@@ -18,6 +18,7 @@ import { CachingPubSub } from '../../../events/caching-pubsub';
 import { EventEmitterPubSub } from '../../../events/event-emitter';
 import type { Event } from '../../../events/types';
 import { Mastra } from '../../../mastra';
+import { RequestContext } from '../../../request-context';
 import { InMemoryStore } from '../../../storage';
 import { createTool } from '../../../tools';
 import type { WorkflowRunState } from '../../../workflows/types';
@@ -285,6 +286,58 @@ describe('Resume API', () => {
       expect(result.runId).toBe(runId);
       expect(result.threadId).toBe('cold-thread');
       expect(result.resourceId).toBe('cold-resource');
+      result.cleanup();
+    });
+
+    it('cold resume authorizes and prepares with the defaults-resolved request context when the caller supplies none', async () => {
+      const mockModel = createTextModel('Resumed!');
+      const store = new InMemoryStore();
+      const defaultsContext = new RequestContext();
+      defaultsContext.set('defaultsFlag', 'from-defaults');
+      const defaultOptions = vi.fn(() => ({ requestContext: defaultsContext }));
+
+      const baseAgent = new Agent({
+        id: 'cold-defaults-ctx-agent',
+        name: 'Cold Defaults Ctx Agent',
+        instructions: 'Test cold resume with defaults-supplied request context',
+        model: mockModel as LanguageModelV2,
+        defaultOptions,
+      });
+
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+      void new Mastra({ agents: { coldDefaultsCtxAgent: durableAgent }, storage: store, logger: false });
+      const runId = 'cold-defaults-ctx-run';
+      await seedSuspendedRun(store, runId, durableAgent.id, {
+        threadId: 'cd-thread',
+        resourceId: 'cd-resource',
+      });
+      const preflightSpy = vi.spyOn(baseAgent, '__assertAgentResumePreflight');
+
+      const result = await durableAgent.resume(
+        runId,
+        { approved: true },
+        {
+          memory: { thread: 'cd-thread', resource: 'cd-resource' },
+        },
+      );
+
+      // No registry entry existed (process-restart cold resume) and the
+      // caller passed no requestContext — the resume-lane preflights
+      // (principal fail-closed check, then full authorization) must run with
+      // the context the resolved dynamic defaults supplied, not an empty one.
+      expect(preflightSpy.mock.calls.length).toBeGreaterThanOrEqual(2);
+      const principalCall = preflightSpy.mock.calls[0]![0] as { requestContext?: RequestContext };
+      const authorizeCall = preflightSpy.mock.calls[1]![0] as { requestContext?: RequestContext };
+      expect(principalCall.requestContext?.get('defaultsFlag')).toBe('from-defaults');
+      expect(authorizeCall.requestContext?.get('defaultsFlag')).toBe('from-defaults');
+      // Rehydration itself still preflights with the persisted+caller merged
+      // context — the persisted entries, not the defaults, describe the run.
+      const rehydrationCall = preflightSpy.mock.calls[2]?.[0] as { requestContext?: RequestContext } | undefined;
+      expect(rehydrationCall?.requestContext?.get('tenantId')).toBe('tenant-1');
+
+      expect(result.runId).toBe(runId);
+      expect(result.threadId).toBe('cd-thread');
+      expect(result.resourceId).toBe('cd-resource');
       result.cleanup();
     });
 

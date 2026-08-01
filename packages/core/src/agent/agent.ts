@@ -5099,7 +5099,11 @@ export class Agent<
           if (!preservePermissionDeniedTools && shouldOmitToolBeforeConversion(requestContext, runId, toolName)) {
             continue;
           }
-          const toolObj = tool;
+          const model = resolvedModel ?? (await this.getModel({ requestContext }));
+          // Same `webSearchTool` sentinel resolution as the assigned-tools and
+          // client-tools lanes: the placeholder must become the provider-executed
+          // search tool before conversion, never reach makeCoreTool raw.
+          const toolObj = isWebSearchTool(tool) ? createWebSearchProviderTool(normalizeWebSearchProvider(model)) : tool;
           const options: ToolOptions = {
             name: toolName,
             runId,
@@ -5112,7 +5116,7 @@ export class Agent<
             agentId,
             requestContext,
             ...observabilityContext,
-            model: resolvedModel ?? (await this.getModel({ requestContext })),
+            model,
             outputWriter,
             tracingPolicy: this.#options?.tracingPolicy,
             requireApproval: (toolObj as any).requireApproval,
