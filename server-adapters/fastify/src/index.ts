@@ -35,16 +35,33 @@ function loadHasPermission(): Promise<HasPermissionFn | undefined> {
 }
 
 /**
+ * Derive the request origin (scheme + authority) for URL construction.
+ *
+ * `request.protocol` and `request.host` are Fastify getters that honor
+ * `trustProxy` (x-forwarded-proto / x-forwarded-host), so scheme and
+ * authority come from the same trust domain, and `request.host` falls back
+ * to the HTTP/2 `:authority` pseudo-header. Both can still be empty for
+ * fully host-less requests (e.g. HTTP/1.0 without a Host header, where
+ * `request.host` is `''`), so keep final fallbacks: derived URLs must never
+ * contain `undefined` or an empty authority.
+ */
+function requestOrigin(request: FastifyRequest): string {
+  const protocol = request.protocol || 'http';
+  const host = request.host || 'localhost';
+  return `${protocol}://${host}`;
+}
+
+/**
  * Convert Fastify request to Web API Request for cookie-based auth providers.
  */
 function toWebRequest(request: FastifyRequest): globalThis.Request {
-  const protocol = request.protocol || 'http';
-  const host = request.headers.host || 'localhost';
-  const url = `${protocol}://${host}${request.url}`;
+  const url = `${requestOrigin(request)}${request.url}`;
 
   const headers = new Headers();
   for (const [key, value] of Object.entries(request.headers)) {
-    if (value) {
+    // HTTP/2 pseudo-headers (:method, :path, :authority, ...) are not legal
+    // Web API header names — Headers.set() throws on them.
+    if (value && !key.startsWith(':')) {
       if (Array.isArray(value)) {
         value.forEach(v => headers.append(key, v));
       } else {
@@ -510,7 +527,7 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
         const options = { ...this.mcpOptions, ...routeMcpOptions };
 
         await server.startHTTP({
-          url: new URL(request.url, `http://${request.headers.host}`),
+          url: new URL(request.url, requestOrigin(request)),
           httpPath: `${resolvedPrefix}${httpPath}`,
           req: rawReq,
           res: reply.raw,
@@ -551,7 +568,7 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
         }
 
         await server.startSSE({
-          url: new URL(request.url, `http://${request.headers.host}`),
+          url: new URL(request.url, requestOrigin(request)),
           ssePath: `${resolvedPrefix}${ssePath}`,
           messagePath: `${resolvedPrefix}${messagePath}`,
           req: rawReq,
@@ -810,8 +827,11 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
             ...(bodyLimit !== undefined ? { bodyLimit } : {}),
           });
         } catch (err) {
-          // Skip duplicate route errors - can happen if route is registered multiple times
-          if (err instanceof Error && err.message.includes('already declared')) {
+          // Skip duplicate route errors - can happen if route is registered multiple times.
+          // Match Fastify's stable error code instead of the English message; the code
+          // exists across the entire supported peer range (verified in 5.8.4, 5.8.5,
+          // 5.9.0, 5.10.0 and 5.11.0 — lib/errors.js FST_ERR_DUPLICATED_ROUTE).
+          if (err instanceof Error && (err as { code?: string }).code === 'FST_ERR_DUPLICATED_ROUTE') {
             continue;
           }
           throw err;
@@ -911,7 +931,7 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
         }
 
         const response = await this.handleCustomRouteRequest(
-          `http://${request.headers.host}${request.url}`,
+          `${requestOrigin(request)}${request.url}`,
           request.method,
           request.headers as Record<string, string | string[] | undefined>,
           request.body,
