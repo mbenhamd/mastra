@@ -32,6 +32,10 @@ import { setupHarness } from './__test-utils__/setup';
 import { HarnessConfigError, HarnessWorkspaceProvisioningError } from './errors';
 import { Harness } from './harness';
 import { createSpawnSubagentTool } from './spawn-subagent-tool';
+import {
+  HARNESS_SUBAGENT_OUTCOME_REPORT_KIND,
+  HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID,
+} from './terminal-subagent-result';
 import type { HarnessRequestContext } from './types';
 import type { WorkspaceProvider, WorkspaceProviderContext } from './workspace-provider';
 import { nonDurableProvider } from './workspace-provider';
@@ -309,6 +313,30 @@ describe('Workspace lifecycle on harness.shutdown()', () => {
 // ---------------------------------------------------------------------------
 
 describe('Subagent workspace inheritance — runtime', () => {
+  // The fail-closed subagent outcome contract (PF-2246): a child turn that
+  // ends without a verified `report_subagent_outcome` is an error result.
+  // These tests pin WORKSPACE runtime behavior, so the mock child reports a
+  // compliant completed outcome (same staging as session.spawn-subagent /
+  // session.plan-task-delegation fixtures).
+  function outcomeTerminalResult(summary = 'workspace fixture done') {
+    return {
+      status: 'success' as const,
+      items: [
+        {
+          toolName: HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID,
+          toolCallId: 'report-subagent-outcome-1',
+          status: 'success' as const,
+          value: {
+            kind: HARNESS_SUBAGENT_OUTCOME_REPORT_KIND,
+            outcome: 'completed' as const,
+            summary,
+            evidence: [{ kind: 'analysis' as const, description: 'Verified by the workspace runtime fixture.' }],
+          },
+        },
+      ],
+    };
+  }
+
   function subagentSetup(opts: { workspace: 'inherit' | 'fresh' }) {
     const created: StubWorkspace[] = [];
     const provider: WorkspaceProvider = {
@@ -327,6 +355,10 @@ describe('Subagent workspace inheritance — runtime', () => {
     };
     const harness = new Harness(
       multiAgentConfig({
+        agents: {
+          a: makeAgent('a'),
+          b: new MockAgent({ id: 'b', defaultOutput: { terminalToolResult: outcomeTerminalResult() } }),
+        } as any,
         workspace: { kind: 'per-session', provider },
         subagents: {
           maxDepth: 3,

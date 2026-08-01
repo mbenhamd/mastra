@@ -38,6 +38,13 @@ export {
   type GoalEvaluationCommit,
 } from './objective';
 
+export {
+  beginGoalActivity,
+  stopGoalActivity,
+  getGoalActivityDurationMs,
+  getGoalActivitySegmentStartMs,
+} from './activity';
+
 export { createGoalScorer } from './scorer';
 
 export { GoalStateProcessor } from './state-processor';

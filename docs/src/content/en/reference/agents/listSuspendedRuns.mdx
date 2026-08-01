@@ -15,7 +15,7 @@ The filter contract mirrors the workflow run listing APIs (`listWorkflowRuns`), 
 
 ## Usage example
 
-Discover the pending run for a conversation and continue it. Check `requiresApproval` to pick the right continuation — `approveToolCall()` / `declineToolCall()` for approval suspensions, `resumeStream()` with resume data for `suspend()`-based suspensions:
+Discover the pending run for a conversation and continue it. Check `requiresApproval` to pick the right continuation: `approveToolCall()` / `declineToolCall()` for approval suspensions, `resumeStream()` with resume data for `suspend()`-based suspensions:
 
 ```typescript
 const threadId = 'thread-123'

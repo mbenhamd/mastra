@@ -1,5 +1,6 @@
 import { isProxy } from 'node:util/types';
 import { isInfrastructureRequestContextKey } from '../../request-context';
+import { getSerializedEntryId } from '../step-entry';
 import type { WorkflowTerminalRecoveryEnvelopeV1 } from '../terminal-recovery/types';
 import type { WorkflowRunState, WorkflowTerminalEffectRecord, WorkflowTerminalSnapshotRecord } from '../types';
 import {
@@ -625,13 +626,14 @@ function applyAggregateSuspension(
     }
     const suspendedPaths: Record<string, number[]> = {};
     container.steps.forEach((entry, branchIndex) => {
+      const branchId = getSerializedEntryId(entry);
       const result =
-        entry.step.id === contract.source.stepId
-          ? normalizedDataRecord(snapshot.context[entry.step.id], `parent branch ${entry.step.id}`)
-          : dataRecord(snapshot.context[entry.step.id], `parent branch ${entry.step.id}`, budget);
+        branchId === contract.source.stepId
+          ? normalizedDataRecord(snapshot.context[branchId], `parent branch ${branchId}`)
+          : dataRecord(snapshot.context[branchId], `parent branch ${branchId}`, budget);
       if (result.status === 'suspended') {
-        defineDataProperty(suspendedPaths, entry.step.id, [rootIndex, branchIndex]);
-        collectResumeLabels(result, resumeLabels, `parent branch ${entry.step.id}`);
+        defineDataProperty(suspendedPaths, branchId, [rootIndex, branchIndex]);
+        collectResumeLabels(result, resumeLabels, `parent branch ${branchId}`);
       }
     });
     if (Object.keys(suspendedPaths).length === 0) throw new TypeError('parent branch suspension has no suspended path');

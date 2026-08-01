@@ -1,4 +1,6 @@
 export { AgentChannels } from './agent-channels';
+export { AgentControllerChannels } from './agent-controller-channels';
+export type { AgentControllerChannelsConfig } from './agent-controller-channels';
 export { ChatChannelProcessor } from './processor';
 export { renderBuiltInToolEvent } from './stream-helpers';
 export { getChatModule } from './chat-lazy';
@@ -21,6 +23,7 @@ export type {
   ChannelContext,
   ChannelHandler,
   ChannelHandlerConfig,
+  ChannelHandlerContext,
   ChannelHandlers,
   ChannelInstallationInfo,
   ChannelPlatformInfo,
@@ -29,6 +32,8 @@ export type {
   PostableMessage,
   ResolveResourceId,
   ResolveResourceIdContext,
+  ResolveThreadId,
+  ResolveThreadIdContext,
   StaticToolDisplay,
   StreamingConfig,
   StreamingOnlyToolDisplay,

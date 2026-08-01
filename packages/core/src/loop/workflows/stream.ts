@@ -1,5 +1,6 @@
 import { ReadableStream } from 'node:stream/web';
 import type { ToolSet } from '@internal/ai-sdk-v5';
+import { beginGoalActivity, stopGoalActivity } from '../../agent/goal';
 import type { MastraDBMessage } from '../../agent/message-list';
 import { readToolSurfaceFence } from '../../agent/tool-surface-fence';
 import { getErrorFromUnknown } from '../../error';
@@ -57,16 +58,6 @@ export function workflowLoopStream<Tools extends ToolSet = ToolSet, OUTPUT = und
           })
         : undefined;
 
-      // Create a ProcessorStreamWriter so output processors can emit custom chunks back to the stream
-      const dataChunkStreamWriter = {
-        custom: async (data: { type: string }) => {
-          if (data.type === 'data-terminal-tool-result') {
-            throw new TypeError('data-terminal-tool-result is reserved for framework terminal delivery');
-          }
-          safeEnqueue(controller, data as ChunkType<OUTPUT>);
-        },
-      };
-
       const terminalWriterAuthority = Symbol('terminal-tool-result-writer');
       const outputWriter = async (
         chunk: ChunkType<OUTPUT>,
@@ -81,6 +72,37 @@ export function workflowLoopStream<Tools extends ToolSet = ToolSet, OUTPUT = und
           safeEnqueue(controller, chunk);
           return;
         }
+
+        const responseMessageId = options?.messageId ?? messageId;
+        // ProcessorStreamWriter so output processors can emit custom chunks back to the stream
+        const dataChunkStreamWriter = {
+          custom: async (
+            data: { type: string; data?: unknown; transient?: boolean },
+            writerOptions?: { messageId?: string },
+          ) => {
+            if (data.type === 'data-terminal-tool-result') {
+              throw new TypeError('data-terminal-tool-result is reserved for framework terminal delivery');
+            }
+            const emittedMessageId = writerOptions?.messageId ?? responseMessageId;
+            if (data.type.startsWith('data-') && emittedMessageId && !data.transient) {
+              messageList.add(
+                {
+                  id: emittedMessageId,
+                  role: 'assistant',
+                  content: {
+                    format: 2,
+                    parts: [{ type: data.type as `data-${string}`, data: data.data }],
+                  },
+                  createdAt: new Date(),
+                  threadId: _internal?.threadId,
+                  resourceId: _internal?.resourceId,
+                },
+                'response',
+              );
+            }
+            safeEnqueue(controller, data as ChunkType<OUTPUT>);
+          },
+        };
 
         // Handle data-* chunks (custom data chunks from writer.custom())
         // These need to be persisted to storage, not just streamed
@@ -145,7 +167,6 @@ export function workflowLoopStream<Tools extends ToolSet = ToolSet, OUTPUT = und
           }
 
           // If a processor rewrote the chunk to a non-data type, skip persistence
-          const responseMessageId = options?.messageId ?? messageId;
           if (
             typeof processedChunk.type === 'string' &&
             processedChunk.type.startsWith('data-') &&
@@ -222,7 +243,7 @@ export function workflowLoopStream<Tools extends ToolSet = ToolSet, OUTPUT = und
 
       const agenticLoopWorkflow = createAgenticLoopWorkflow<Tools, OUTPUT>({
         resumeContext,
-        messageId: messageId!,
+        messageId: messageId,
         models,
         _internal,
         modelSettings,
@@ -322,7 +343,7 @@ export function workflowLoopStream<Tools extends ToolSet = ToolSet, OUTPUT = und
       try {
         const toolSurfaceFence = readToolSurfaceFence(requestContext, runId);
         const initialData = {
-          messageId: messageId!,
+          messageId: messageId,
           messages: {
             all: messageList.get.all.aiV5.model(),
             user: messageList.get.input.aiV5.model(),
@@ -372,6 +393,18 @@ export function workflowLoopStream<Tools extends ToolSet = ToolSet, OUTPUT = und
           requestContext.delete('__mastra_requireToolApproval');
         }
 
+        if (rest.goal) {
+          await beginGoalActivity({
+            mastra: rest.mastra,
+            agentId,
+            resourceId: _internal?.resourceId,
+            threadId: _internal?.threadId,
+            runId,
+            requestContext,
+            now: _internal?.now,
+          });
+        }
+
         const executionResult = resumeContext
           ? await run.resume({
               resumeData: resumeContext.resumeData,
@@ -419,11 +452,12 @@ export function workflowLoopStream<Tools extends ToolSet = ToolSet, OUTPUT = und
           const terminalToolResult = materializeTerminalToolResult(executionResult.result.terminalToolResult);
           const terminalStepCount = executionResult.result.output.steps.length;
           await outputWriter(
+            // Boundary cast: see stream-adapter's data-terminal-tool-result note.
             {
               type: 'data-terminal-tool-result',
               id: createTerminalToolResultPartId(runId, terminalStepCount),
               data: terminalToolResult,
-            },
+            } as unknown as Parameters<typeof outputWriter>[0],
             {
               terminalAuthority: terminalWriterAuthority,
             },
@@ -463,6 +497,7 @@ export function workflowLoopStream<Tools extends ToolSet = ToolSet, OUTPUT = und
 
         safeClose(controller);
       } finally {
+        await stopGoalActivity({ agentId, runId, now: _internal?.now });
         if (!keepRegisteredForResume) {
           rest.mastra?.__unregisterInternalWorkflow(agenticLoopWorkflow.id, runId, agenticLoopWorkflowRegistration);
         }

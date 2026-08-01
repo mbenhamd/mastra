@@ -137,7 +137,8 @@ interface HarnessErrorResponseBase {
 
 type HarnessErrorResponse = HarnessErrorResponseBase &
   // ── Admission failures (4xx) ────────────────────────────────────────────
-  (| {
+  (
+    | {
         code: 'harness.busy'; // → HarnessBusyError (fail-fast message/skill
         //   and tool-context pending-interaction conflicts)
         details: {

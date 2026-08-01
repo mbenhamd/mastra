@@ -1,7 +1,6 @@
-import type { Mastra } from '@mastra/core';
 import { extractTrajectoryFromTrace, listScoresResponseSchema } from '@mastra/core/evals';
 import { scoreTraces } from '@mastra/core/evals/scoreTraces';
-import type { ScoresStorage, StoragePagination } from '@mastra/core/storage';
+import type { StoragePagination } from '@mastra/core/storage';
 import {
   tracesFilterSchema,
   tracesOrderBySchema,
@@ -29,6 +28,7 @@ import {
   assertObservabilityDeltaSupported,
   createObservabilityListQuerySchema,
   getObservabilityStore,
+  getScoresStore,
   getStorage,
   OBSERVABILITY_LIST_ENDPOINTS,
 } from './observability-shared';
@@ -103,15 +103,6 @@ function transformLegacyParams(params: Record<string, unknown>): Record<string, 
 // ============================================================================
 // Route Definitions (new pattern - handlers defined inline with createRoute)
 // ============================================================================
-
-async function getScoresStore(mastra: Mastra): Promise<ScoresStorage> {
-  const storage = getStorage(mastra);
-  const scores = await storage.getStore('scores');
-  if (!scores) {
-    throw new HTTPException(500, { message: 'Scores storage domain is not available' });
-  }
-  return scores;
-}
 
 const listTracesQueryParamSchema = wrapSchemaForQueryParams(
   tracesFilterSchema

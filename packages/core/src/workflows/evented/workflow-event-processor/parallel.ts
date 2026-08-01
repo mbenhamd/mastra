@@ -1,5 +1,5 @@
 import { isProxy } from 'node:util/types';
-import type { StepFlowEntry } from '../..';
+import type { SingleStepEntry, StepFlowEntry } from '../..';
 import { RequestContext } from '../../../di';
 import type { PubSub } from '../../../events';
 import type { WorkflowsStorage } from '../../../storage/domains/workflows/base';
@@ -8,6 +8,7 @@ import {
   mergeWorkflowStepLifecycleStates,
   requireWorkflowExecutionGeneration,
 } from '../../lifecycle-events';
+import { getSingleStepEntryId } from '../../utils';
 import { resolveCurrentState } from '../helpers';
 import type { StepExecutor } from '../step-executor';
 import type { ProcessorArgs } from '.';
@@ -157,7 +158,7 @@ function validateParallelRestartPaths({
 
   const branchIndices = new Map(
     step.steps.flatMap((nestedStep, index) =>
-      nestedStep.type === 'step' ? ([[nestedStep.step.id, index]] as const) : [],
+      nestedStep ? ([[getSingleStepEntryId(nestedStep), index]] as const) : [],
     ),
   );
 
@@ -238,15 +239,16 @@ export async function processWorkflowParallel(
   }
   for (let i = 0; i < step.steps.length; i++) {
     const nestedStep = step.steps[i];
-    if (nestedStep?.type === 'step') {
+    if (nestedStep) {
+      const nestedStepId = getSingleStepEntryId(nestedStep);
       //if restart, only run the step if it's in the active steps path
       if (restart) {
-        const descriptor = Object.getOwnPropertyDescriptor(restart.activeStepsPath, nestedStep.step.id);
+        const descriptor = Object.getOwnPropertyDescriptor(restart.activeStepsPath, nestedStepId);
         if (descriptor) {
-          pathsToRun.add(nestedStep.step.id);
+          pathsToRun.add(nestedStepId);
         }
       } else {
-        pathsToRun.add(nestedStep.step.id);
+        pathsToRun.add(nestedStepId);
       }
       if (perStep) {
         break;
@@ -255,7 +257,7 @@ export async function processWorkflowParallel(
   }
 
   const branches = step.steps.flatMap((nestedStep, idx) => {
-    if (!pathsToRun.has(nestedStep.step.id)) return [];
+    if (!pathsToRun.has(getSingleStepEntryId(nestedStep))) return [];
     return [
       {
         nestedStep,
@@ -272,7 +274,10 @@ export async function processWorkflowParallel(
     lifecycleStepStates,
     lifecycleIncomingStepStates,
     lifecycleAttemptBaselineCaptured,
-    branches: branches.map(({ nestedStep, executionPath }) => ({ stepId: nestedStep.step.id, executionPath })),
+    branches: branches.map(({ nestedStep, executionPath }) => ({
+      stepId: getSingleStepEntryId(nestedStep),
+      executionPath,
+    })),
   });
 
   await Promise.all(
@@ -363,7 +368,7 @@ export async function processWorkflowConditional(
     truthyIdxs[idxs[i]!] = true;
   }
 
-  let onlyStepToRun: Extract<StepFlowEntry, { type: 'step' }> | undefined;
+  let onlyStepToRun: SingleStepEntry | undefined;
 
   if (perStep) {
     const stepsToRun = step.steps.filter((_, idx) => truthyIdxs[idx]);
@@ -371,7 +376,8 @@ export async function processWorkflowConditional(
   }
 
   if (onlyStepToRun) {
-    const stepIndex = step.steps.findIndex(step => step.step.id === onlyStepToRun.step.id);
+    const onlyStepToRunId = getSingleStepEntryId(onlyStepToRun);
+    const stepIndex = step.steps.findIndex(child => getSingleStepEntryId(child) === onlyStepToRunId);
     const branchExecutionPath = executionPath.concat([stepIndex]);
     const lifecycleReservation = await reserveBranchLifecycleAttempts({
       workflowsStore,
@@ -382,9 +388,9 @@ export async function processWorkflowConditional(
       lifecycleStepStates,
       lifecycleIncomingStepStates,
       lifecycleAttemptBaselineCaptured,
-      branches: [{ stepId: onlyStepToRun.step.id, executionPath: branchExecutionPath }],
+      branches: [{ stepId: onlyStepToRunId, executionPath: branchExecutionPath }],
     });
-    activeStepsPath[onlyStepToRun.step.id] = executionPath.concat([stepIndex]);
+    activeStepsPath[onlyStepToRunId] = executionPath.concat([stepIndex]);
     await pubsub.publish('workflows', {
       type: 'workflow.step.run',
       runId,
@@ -409,8 +415,8 @@ export async function processWorkflowConditional(
     });
   } else {
     const selectedBranches = step.steps.flatMap((branch, idx) =>
-      truthyIdxs[idx] && branch?.type === 'step'
-        ? [{ stepId: branch.step.id, executionPath: executionPath.concat([idx]) }]
+      truthyIdxs[idx] && branch
+        ? [{ stepId: getSingleStepEntryId(branch), executionPath: executionPath.concat([idx]) }]
         : [],
     );
     const lifecycleReservation = await reserveBranchLifecycleAttempts({
@@ -430,10 +436,10 @@ export async function processWorkflowConditional(
       lifecycleStepStates: lifecycleReservation.lifecycleStepStates,
     };
     await Promise.all(
-      step.steps.map(async (step, idx) => {
+      step.steps.map(async (child, idx) => {
         if (truthyIdxs[idx]) {
-          if (step?.type === 'step') {
-            activeStepsPath[step.step.id] = executionPath.concat([idx]);
+          if (child) {
+            activeStepsPath[getSingleStepEntryId(child)] = executionPath.concat([idx]);
           }
           return pubsub.publish('workflows', {
             type: 'workflow.step.run',

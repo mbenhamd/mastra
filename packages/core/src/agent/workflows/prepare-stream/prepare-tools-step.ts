@@ -72,6 +72,9 @@ export function createPrepareToolsStep<OUTPUT = undefined>({
         hooks: options.hooks,
         isResume,
         toolSurfaceFenceOwnerId: options._toolSurfaceFenceOwnerId,
+        // Use the resolved execution model so provider-native placeholders
+        // respect per-call and Studio model overrides.
+        model: capabilities.llm.getModel(),
       });
 
       // Update the agent span with available tool names for observability

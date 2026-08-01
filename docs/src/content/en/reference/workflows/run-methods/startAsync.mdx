@@ -7,7 +7,7 @@ packages:
 
 # Run.startAsync()
 
-The `.startAsync()` method starts a workflow run without waiting for completion. It returns immediately with the `runId`, allowing the workflow to execute in the background. Built-in workflow runs also return an optional `execution` promise so infrastructure code can observe background completion or rejection without changing the fire-and-forget behavior. Evented or integration-backed engines may omit that promise; use persisted run status as the portable completion contract.
+The `.startAsync()` method starts a workflow run without waiting for completion. It returns immediately with the `runId`, allowing the workflow to execute in the background. This is useful for long-running workflows or scheduled tasks. It also avoids blocking on workflow completion. Built-in workflow runs also return an optional `execution` promise so infrastructure code can observe background completion or rejection without changing the fire-and-forget behavior. Evented or integration-backed engines may omit that promise; use persisted run status as the portable completion contract.
 
 ## Usage example
 

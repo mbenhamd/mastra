@@ -1,4 +1,5 @@
 import { isProxy } from 'node:util/types';
+import { getSerializedEntryId } from '../step-entry';
 import type {
   SerializedStepFlowEntry,
   WorkflowRunState,
@@ -294,7 +295,7 @@ function contextProjection(
     if (resolved.kind === 'branch') {
       const entry = graph[effect.parentExecutionPath[0]!];
       if (entry?.type === 'parallel' || entry?.type === 'conditional') {
-        for (const branch of entry.steps) ids.add(branch.step.id);
+        for (const branch of entry.steps) ids.add(getSerializedEntryId(branch));
       }
       return { ids, sourceKind: 'branch' };
     }

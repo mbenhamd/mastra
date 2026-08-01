@@ -1,4 +1,5 @@
 export * from './workflow';
+export { getEntryId, getEntryWorkflow } from './step-entry';
 export * from './execution-engine';
 export * from './default';
 export * from './step';
@@ -9,3 +10,5 @@ export * from './state-reader';
 export * from './terminal-recovery';
 export * from './create';
 export * from './lifecycle-events';
+export * from './stored';
+export * from './predicate';

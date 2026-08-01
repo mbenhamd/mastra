@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import type { SuspendOptions } from '../workflows';
-import { createStep, createWorkflow } from '../workflows/evented';
+import { createStep, createWorkflow } from '../workflows';
 import type { BackgroundTaskManager } from './manager';
 import { BACKGROUND_TASK_SHUTDOWN_ABORT_MESSAGE } from './shutdown';
 import type { BackgroundTaskStatus } from './types';
@@ -25,7 +25,14 @@ const bodyOutputSchema = z.object({
 const WORKFLOW_STATUS_TO_PERSIST = ['suspended', 'pending', 'paused', 'waiting'];
 
 /**
- * Builds the per-task evented workflow that owns executor + retries.
+ * Builds the per-task workflow that owns executor + retries.
+ *
+ * Uses the standard (default) execution engine so the workflow runs entirely
+ * in-process on whatever host calls `run.start()`. This is critical for
+ * distributed deployments where the background-task worker must
+ * execute tools locally — routing through the evented pipeline would send
+ * step execution to the orchestration worker / API, which don't have the
+ * internal workflow or task contexts registered.
  *
  * A single `run-attempt` step is the `dountil` body. It invokes the executor,
  * persists the outcome, advances retry bookkeeping, and returns whether the
@@ -61,9 +68,14 @@ export function buildBackgroundTaskWorkflow(manager: BackgroundTaskManager) {
       //      wins when present.
       //   2. Static executor registered by tool name. Used by remote workers
       //      that received the dispatch via PubSub and don't have access to
-      //      the producer's per-task closure.
+      //      the producer's per-task closure. Agent-owned executors are
+      //      namespaced as `agentId:toolName` to avoid cross-agent collisions;
+      //      we try the namespaced key first, then fall back to the plain key.
       const ctx = manager.taskContexts.get(taskId);
-      const executor = ctx?.executor ?? manager.getStaticExecutor(task.toolName);
+      const executor =
+        ctx?.executor ??
+        (task.agentId ? manager.getStaticExecutor(`${task.agentId}:${task.toolName}`) : undefined) ??
+        manager.getStaticExecutor(task.toolName);
       if (!executor) {
         const errorInfo = {
           message:
@@ -89,7 +101,7 @@ export function buildBackgroundTaskWorkflow(manager: BackgroundTaskManager) {
       const onProgress = async (chunk: any) => {
         if (shouldThrottleProgress) {
           const now = Date.now();
-          if (lastProgressEmitMs !== undefined && now - lastProgressEmitMs < progressThrottleMs!) return;
+          if (lastProgressEmitMs !== undefined && now - lastProgressEmitMs < progressThrottleMs) return;
           lastProgressEmitMs = now;
         }
         await manager.publishLifecycleEvent('task.output', { ...task, chunk });
@@ -154,9 +166,9 @@ export function buildBackgroundTaskWorkflow(manager: BackgroundTaskManager) {
         result,
         error,
       }: {
-        outcome: 'success' | 'retry' | 'cancelled' | 'timed_out';
+        outcome: 'success' | 'retry' | 'failed' | 'cancelled' | 'timed_out';
         result?: unknown;
-        error?: { message: string; stack?: string };
+        error?: { name?: string; message: string; stack?: string };
       }) => {
         const currentTask = await storage.getTask(taskId);
         if (!currentTask) return { taskId, done: true };
@@ -194,7 +206,9 @@ export function buildBackgroundTaskWorkflow(manager: BackgroundTaskManager) {
           return { taskId, done: true, result };
         }
 
-        if (currentTask.retryCount < currentTask.maxRetries) {
+        // outcome === 'retry' | 'failed' — authorization denials ('failed')
+        // are non-retryable and fall through to the terminal-failure persist.
+        if (outcome === 'retry' && currentTask.retryCount < currentTask.maxRetries) {
           await storage.updateTask(taskId, {
             retryCount: currentTask.retryCount + 1,
             error: undefined,
@@ -216,9 +230,9 @@ export function buildBackgroundTaskWorkflow(manager: BackgroundTaskManager) {
         return { taskId, done: true };
       };
 
-      let outcome: 'success' | 'retry' | 'cancelled' | 'timed_out';
+      let outcome: 'success' | 'retry' | 'failed' | 'cancelled' | 'timed_out';
       let attemptResult: unknown;
-      let attemptError: { message: string; stack?: string } | undefined;
+      let attemptError: { name?: string; message: string; stack?: string } | undefined;
       try {
         attemptResult = await executor.execute(task.args, {
           abortSignal: abortController.signal,
@@ -255,6 +269,11 @@ export function buildBackgroundTaskWorkflow(manager: BackgroundTaskManager) {
           error?.message?.startsWith('Task timed out after ')
         ) {
           outcome = 'timed_out';
+        } else if (error?.name === 'FGADeniedError') {
+          // Authorization denials are non-retryable — retrying cannot succeed
+          // and would just burn attempts before surfacing the denial.
+          outcome = 'failed';
+          attemptError = { name: error.name, message: error?.message ?? 'Authorization denied', stack: error?.stack };
         } else {
           outcome = 'retry';
           attemptError = { message: error?.message ?? 'Unknown error', stack: error?.stack };

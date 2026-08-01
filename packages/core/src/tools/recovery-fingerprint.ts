@@ -1,4 +1,5 @@
-import { createHash } from 'node:crypto';
+import { sha256 } from '@noble/hashes/sha2.js';
+import { bytesToHex } from '@noble/hashes/utils.js';
 import { stableStringify } from '../agent/message-list/cache/stable-stringify';
 import { standardSchemaToJSONSchema, toStandardSchema } from '../schema';
 
@@ -94,9 +95,12 @@ export function normalizeToolRecoverySchemaIdentity(schema: unknown): unknown {
 
 /** Hash every execution-affecting tool capability using deterministic object ordering. */
 export function createToolRecoveryFingerprint(value: unknown): string {
-  return createHash('sha256')
-    .update(stableStringify(normalizeRecoveryValue(value, new Map(), '$tool')))
-    .digest('hex');
+  // Platform-neutral sha256 (identical digests to node:crypto): this module is
+  // reachable from browser bundles via the tools entry, where node builtins
+  // are unavailable at bundle time.
+  return bytesToHex(
+    sha256(new TextEncoder().encode(stableStringify(normalizeRecoveryValue(value, new Map(), '$tool')))),
+  );
 }
 
 /** Install cold-recovery metadata without charging every ordinary tool construction for it. */

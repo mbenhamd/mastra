@@ -181,12 +181,7 @@ interface ChannelIngressPolicy {
 type ChannelDeliverySemantics = 'native-idempotency' | 'client-message-id' | 'lookup-reconcile' | 'at-least-once';
 
 type ChannelOutboxOperationKind =
-  | 'message-create'
-  | 'message-edit'
-  | 'reaction-add'
-  | 'reaction-remove'
-  | 'file-upload'
-  | 'custom';
+  'message-create' | 'message-edit' | 'reaction-add' | 'reaction-remove' | 'file-upload' | 'custom';
 
 interface ChannelOutboxDeliveryPlan {
   operationKind: ChannelOutboxOperationKind;

@@ -6,6 +6,7 @@ import {
   MAX_TERMINAL_PATH_LENGTH,
   MAX_TERMINAL_REVISION_LENGTH,
   createWorkflowTerminalGraphFingerprint,
+  readWorkflowTerminalSingleEntryStepId,
   resolveWorkflowTerminalGraphCoordinate,
   validateWorkflowTerminalStructuralString,
 } from './graph-fingerprint';
@@ -1020,11 +1021,15 @@ export function validateWorkflowTerminalParentContinuationBinding(
     if (!branch || (branch.type !== 'parallel' && branch.type !== 'conditional')) {
       throw new TypeError('Workflow terminal branch container is missing');
     }
-    const siblingStatuses = branch.steps.map(entry => {
-      if (entry.step.id === contract.source.stepId) return contract.childTerminalStatus;
+    const siblingStatuses = branch.steps.map((entry, branchIndex) => {
+      const siblingStepId = readWorkflowTerminalSingleEntryStepId(
+        entry,
+        `Workflow terminal parent continuation branch[${branchIndex}]`,
+      );
+      if (siblingStepId === contract.source.stepId) return contract.childTerminalStatus;
       const sibling = getRecord(
-        value(parentContext, entry.step.id),
-        `Workflow terminal parent continuation sibling ${entry.step.id}`,
+        value(parentContext, siblingStepId),
+        `Workflow terminal parent continuation sibling ${siblingStepId}`,
       );
       return value(sibling, 'status');
     });

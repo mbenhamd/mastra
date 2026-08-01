@@ -33,18 +33,6 @@ const expectOnlyGuardedHoverBorder = (className: string) => {
   expect(className).not.toContain('hover:border-border2');
 };
 
-const inputGroupVariants = ['default', 'filled', 'outline'] as const;
-
-const expectOnlyGuardedHoverBorder = (className: string) => {
-  const hoverBorderTokens = className
-    .split(/\s+/)
-    .filter(token => token.includes('hover') && token.includes('border-border2'));
-
-  expect(hoverBorderTokens).toEqual(['[&:hover:not(:focus-within)]:border-border2']);
-  expect(className).toContain('focus-within:border-neutral5/50');
-  expect(className).not.toContain('hover:border-border2');
-};
-
 describe('InputGroup', () => {
   it('puts an explicit height on the root box so the group matches a same-size sibling control', () => {
     render(

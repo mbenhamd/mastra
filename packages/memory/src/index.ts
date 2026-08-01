@@ -30,6 +30,8 @@ import type {
   StorageListThreadsInput,
   StorageListThreadsOutput,
   StorageListMessagesInput,
+  StorageListMessagesByResourceIdInput,
+  StorageListMessagesOutput,
   MemoryStorage,
   StorageCloneThreadInput,
   StorageCloneThreadOutput,
@@ -93,6 +95,7 @@ type MemoryObservationalMemoryOptions = Omit<ObservationalMemoryOptions, 'model'
   activateAfterIdle?: ObservationalMemoryConfig['activateAfterIdle'];
   activateOnProviderChange?: ObservationalMemoryConfig['activateOnProviderChange'];
   temporalMarkers?: boolean;
+  hooks?: ObservationalMemoryConfig['hooks'];
 };
 
 type MemoryOptions = Omit<MemoryConfigInternal, 'observationalMemory'> & {
@@ -403,26 +406,7 @@ export class Memory extends MastraMemory {
     return store;
   }
 
-  async listMessagesByResourceId(args: {
-    resourceId: string;
-    perPage?: number | false;
-    page?: number;
-    orderBy?: { field?: 'createdAt'; direction?: 'ASC' | 'DESC' };
-    filter?: {
-      dateRange?: {
-        start?: Date;
-        end?: Date;
-        startExclusive?: boolean;
-        endExclusive?: boolean;
-      };
-    };
-    include?: Array<{
-      id: string;
-      threadId?: string;
-      withPreviousMessages?: number;
-      withNextMessages?: number;
-    }>;
-  }): Promise<{ messages: MastraDBMessage[]; total: number; page: number; perPage: number | false; hasMore: boolean }> {
+  async listMessagesByResourceId(args: StorageListMessagesByResourceIdInput): Promise<StorageListMessagesOutput> {
     const memoryStore = await this.getMemoryStore();
     return memoryStore.listMessagesByResourceId(args);
   }
@@ -2174,6 +2158,7 @@ ${workingMemory}`;
       model: omConfig.model,
       mastra: this._mastraInstance,
       onIndexObservations,
+      hooks: omConfig.hooks,
       observation: omConfig.observation
         ? {
             model: omConfig.observation.model,
@@ -3760,6 +3745,11 @@ Notes:
     );
     if (hasObservationalMemory) return null;
 
+    // Note: attachment is intentionally permissive — `MastraMemory` may not be
+    // populated in the request context at discovery time (or at all, for direct
+    // `getInputProcessors()` calls). Ephemeral invocations without a thread
+    // (e.g. workflow agent steps) are handled at runtime: the processor no-ops
+    // when `getThreadContext` resolves no thread.
     const runtimeMemory = context?.get('MastraMemory') as { memoryConfig?: RuntimeMemoryConfig } | undefined;
     const runtimeObservationalMemory = normalizeObservationalMemoryConfig(
       runtimeMemory?.memoryConfig?.observationalMemory,
@@ -3792,6 +3782,11 @@ Notes:
     configuredProcessors: InputProcessorOrWorkflow[] = [],
     context?: RequestContext,
   ): Promise<InputProcessor | null> {
+    // Note: attachment is intentionally permissive — `MastraMemory` may not be
+    // populated in the request context at discovery time (or at all, for direct
+    // `getInputProcessors()` calls). Ephemeral invocations without a thread
+    // (e.g. workflow agent steps) are handled at runtime: the processor runner
+    // skips `computeStateSignal` when no thread/resource resolves.
     const runtimeMemory = context?.get('MastraMemory') as { memoryConfig?: MemoryConfigInternal } | undefined;
     const mergedConfig = this.getMergedThreadConfig(runtimeMemory?.memoryConfig);
     this.assertWorkingMemoryStateSignalsCompatibility(mergedConfig);

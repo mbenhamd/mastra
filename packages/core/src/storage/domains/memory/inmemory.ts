@@ -31,7 +31,13 @@ import type {
   RetractObservationalMemoryResult,
   UpdateObservationalMemoryConfigInput,
 } from '../../types';
-import { filterByDateRange, jsonValueEquals, safelyParseJSON } from '../../utils';
+import {
+  filterByDateRange,
+  jsonValueEquals,
+  safelyParseJSON,
+  storageMessageMatchesMetadataFilter,
+  validateStorageMetadataFilter,
+} from '../../utils';
 import type { InMemoryDB } from '../inmemory-db';
 import { MemoryStorage } from './base';
 
@@ -200,6 +206,7 @@ export class InMemoryMemory extends MemoryStorage {
     page = 0,
     orderBy,
   }: StorageListMessagesInput): Promise<StorageListMessagesOutput> {
+    const metadataFilter = validateStorageMetadataFilter(filter?.metadata);
     // Normalize threadId to array
     const threadIds = Array.isArray(threadId) ? threadId : [threadId];
 
@@ -243,6 +250,9 @@ export class InMemoryMemory extends MemoryStorage {
 
     // Apply date filtering
     threadMessages = filterByDateRange(threadMessages, (msg: any) => new Date(msg.createdAt), filter?.dateRange);
+    threadMessages = threadMessages.filter(message =>
+      storageMessageMatchesMetadataFilter(message.content, metadataFilter),
+    );
 
     // Sort thread messages before pagination
     threadMessages.sort((a: any, b: any) => {
@@ -379,6 +389,8 @@ export class InMemoryMemory extends MemoryStorage {
     if (perPage === 0) {
       // perPage=0 fast path skips pagination entirely
       hasMore = false;
+    } else if (metadataFilter) {
+      hasMore = offset + paginatedThreadMessages.length < totalThreadMessages;
     } else if (include && include.length > 0) {
       // When using include, check if we've returned all messages from the thread
       // because include might bring in messages beyond the pagination window
@@ -405,6 +417,7 @@ export class InMemoryMemory extends MemoryStorage {
     page = 0,
     orderBy,
   }: StorageListMessagesByResourceIdInput): Promise<StorageListMessagesOutput> {
+    const metadataFilter = validateStorageMetadataFilter(filter?.metadata);
     const { field, direction } = this.parseOrderBy(orderBy, 'ASC');
 
     // Normalize perPage for query (false → MAX_SAFE_INTEGER, 0 → 0, undefined → 40)
@@ -427,6 +440,7 @@ export class InMemoryMemory extends MemoryStorage {
 
     // Apply date filtering
     messages = filterByDateRange(messages, (msg: any) => new Date(msg.createdAt), filter?.dateRange);
+    messages = messages.filter(message => storageMessageMatchesMetadataFilter(message.content, metadataFilter));
 
     // Sort messages
     messages.sort((a: any, b: any) => {

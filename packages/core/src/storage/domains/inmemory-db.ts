@@ -59,6 +59,7 @@ import type { PromptBlockVersion } from './prompt-blocks';
 import type { Schedule, ScheduleTrigger } from './schedules/base';
 import type { ScorerDefinitionVersion } from './scorer-definitions';
 import type { SkillVersion } from './skills';
+import type { WorkflowDefinition } from './workflow-definitions';
 import type { WorkspaceVersion } from './workspaces';
 
 export interface WorkflowTerminalParentRevisionState {
@@ -187,6 +188,7 @@ export class InMemoryDB {
   readonly workflowTerminalContinuationPlans = new Map<string, WorkflowTerminalContinuationPlanRecord>();
   /** Opaque monotonic revisions plus an immutable terminal-status latch for parent recovery. */
   readonly workflowTerminalParentRevisions = new Map<string, WorkflowTerminalParentRevisionState>();
+  readonly workflowDefinitions = new Map<string, WorkflowDefinition>();
   readonly scores = new Map<string, ScoreRowData>();
   readonly traces = new Map<string, TraceEntry>();
   readonly metricRecords: MetricRecord[] = [];
@@ -285,6 +287,7 @@ export class InMemoryDB {
     this.workflowTerminalDestinationReceipts.clear();
     this.workflowTerminalContinuationPlans.clear();
     this.workflowTerminalParentRevisions.clear();
+    this.workflowDefinitions.clear();
     this.scores.clear();
     this.traces.clear();
     this.metricRecords.length = 0;

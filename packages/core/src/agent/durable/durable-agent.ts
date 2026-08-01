@@ -18,14 +18,16 @@ import {
 } from '../../request-context';
 import type { VersionOverrides } from '../../request-context';
 import type { FullOutput, MastraModelOutput } from '../../stream/base/output';
-import type { ChunkType, MastraOnFinishCallback } from '../../stream/types';
+import type { ChunkType, MastraOnFinishCallback, MastraStreamTransformOptions } from '../../stream/types';
 import { ChunkFrom } from '../../stream/types';
+import { deepMerge } from '../../utils';
 import type { WorkflowFinishCallbackResult, WorkflowRunState, WorkflowRunStatus } from '../../workflows/types';
 import { Agent } from '../agent';
 import type { AgentListSuspendedRunsOptions, AgentListSuspendedRunsResult, AgentRunToolCall } from '../agent';
 import type { AgentExecutionOptions, AgentExecutionOptionsBase } from '../agent.types';
 import type { ResolvedAgentMemory } from '../execution-memory';
 import { snapshotAgentExecutionOptions, snapshotAgentExecutionValue } from '../execution-snapshot';
+import { beginGoalActivity, stopGoalActivity } from '../goal';
 import { mergeAgentExecutionOptions } from '../merge-execution-options';
 import { MessageList } from '../message-list';
 import type { MessageListInput } from '../message-list';
@@ -80,6 +82,7 @@ import { createDurableAgenticWorkflow } from './workflows';
  */
 const CLOSE_ON_SUSPEND = Symbol('mastra.durable.closeOnSuspend');
 const pendingDurableRunIds = new Set<string>();
+const RESOLVED_EXECUTION_OPTIONS = Symbol('mastra.durable.resolvedExecutionOptions');
 
 /**
  * Options for DurableAgent.stream()
@@ -133,6 +136,8 @@ export interface DurableAgentStreamOptions<OUTPUT = undefined> {
   toolCallConcurrency?: number;
   /** Whether to include raw chunks in the stream output */
   includeRawChunks?: boolean;
+  /** Experimental transforms applied whenever `fullStream` is consumed. */
+  experimentalTransform?: MastraStreamTransformOptions<OUTPUT>;
   /** Maximum processor retries */
   maxProcessorRetries?: number;
   /** Structured output configuration */
@@ -208,6 +213,12 @@ export interface DurableAgentStreamOptions<OUTPUT = undefined> {
   untilIdle?: boolean | { maxIdleMs?: number };
   /** When true, the in-loop background task check step skips waiting (streamUntilIdle sets this) */
   _skipBgTaskWait?: boolean;
+  /**
+   * @internal Pre-resolved dynamic defaults carried by the until-idle wrapper
+   * into inner resume segments so `getDefaultOptions` resolves exactly once
+   * per public call.
+   */
+  _resolvedDefaultOptions?: AgentExecutionOptions<OUTPUT>;
   /**
    * External abort signal. The durable agent always installs its own internal
    * `AbortController` for the run; when this signal is provided, its `abort`
@@ -473,6 +484,8 @@ export interface DurableAgentRecoverActiveRunsResult {
 export interface DurableAgentRecoverOptions<OUTPUT = undefined> {
   /** Callback when chunk is received */
   onChunk?: (chunk: ChunkType<OUTPUT>) => void | Promise<void>;
+  /** Experimental transforms applied whenever `fullStream` is consumed. */
+  experimentalTransform?: MastraStreamTransformOptions<OUTPUT>;
   /** Callback when a step finishes */
   onStepFinish?: (result: AgentStepFinishEventData) => void | Promise<void>;
   /** Callback when the recovered run finishes */
@@ -729,6 +742,39 @@ export class DurableAgent<
   // --- Default options ---
   override getDefaultOptions(options?: any) {
     return this.#wrappedAgent.getDefaultOptions(options);
+  }
+
+  async #resolveExecutionOptions(
+    options?: DurableAgentStreamOptions<TOutput>,
+  ): Promise<DurableAgentStreamOptions<TOutput>> {
+    if ((options as any)?.[RESOLVED_EXECUTION_OPTIONS]) {
+      return options!;
+    }
+
+    // The until-idle wrapper resolves dynamic defaults once per public call
+    // and carries them into inner segments; never re-resolve behind it.
+    const carriedDefaultOptions = options?._resolvedDefaultOptions;
+    const defaultOptions =
+      carriedDefaultOptions ?? (await this.getDefaultOptions({ requestContext: options?.requestContext }));
+    if (options?._resolvedDefaultOptions !== undefined) {
+      const { _resolvedDefaultOptions: _carried, ...publicOptions } = options;
+      options = publicOptions as DurableAgentStreamOptions<TOutput>;
+    }
+    const resolvedOptions = deepMerge(
+      (defaultOptions ?? {}) as Record<string, unknown>,
+      (options ?? {}) as Record<string, unknown>,
+    ) as DurableAgentStreamOptions<TOutput>;
+    // Actor is a per-call trust signal, so an explicit value replaces the
+    // default actor as a whole rather than inheriting any of its fields.
+    if (options?.actor !== undefined) {
+      resolvedOptions.actor = options.actor;
+    }
+    if ((options as any)?.[CLOSE_ON_SUSPEND] === true) {
+      Object.defineProperty(resolvedOptions, CLOSE_ON_SUSPEND, { value: true, enumerable: true });
+    }
+    // Preserve the marker when the until-idle wrapper spreads these options.
+    Object.defineProperty(resolvedOptions, RESOLVED_EXECUTION_OPTIONS, { value: true, enumerable: true });
+    return resolvedOptions;
   }
 
   override getDefaultGenerateOptionsLegacy(options?: any) {
@@ -1050,6 +1096,7 @@ export class DurableAgent<
       await run.start({
         inputData: workflowInput,
         requestContext,
+        actor: workflowInput.options?.actor,
         ...createObservabilityContext({ currentSpan: entry?.agentSpan }),
       });
     } finally {
@@ -1548,6 +1595,7 @@ export class DurableAgent<
     runId?: string;
     snapshotMemoryInfo?: { threadId?: string; resourceId?: string };
     actor?: AgentExecutionOptions<any>['actor'];
+    authorize?: boolean;
   }): Promise<void> {
     await this.#wrappedAgent.__assertAgentResumePreflight({
       ...options,
@@ -2426,14 +2474,12 @@ export class DurableAgent<
       const { untilIdle, ...rest } = options;
       const maxIdleMs = typeof untilIdle === 'object' ? untilIdle.maxIdleMs : undefined;
       let preflightedDefaultOptions: AgentExecutionOptions<TOutput> | undefined;
-      if (rest.requestContext) {
-        await this.#assertPublicAgentResumePreflight({
-          requestContext: rest.requestContext,
-          memory: rest.memory,
-          runId: rest.runId,
-          actor: rest.actor,
-        });
-      } else if (this.requestContextSchema || this.#mastra?.getServer()?.fga) {
+      if (this.requestContextSchema || this.#mastra?.getServer()?.fga) {
+        // Resolve dynamic defaults exactly once per public call and preflight
+        // with the merged options, so the effective default actor (and any
+        // defaults-provided context) is what gets authorized. The resolved
+        // defaults are handed to the idle wrapper so they are never
+        // re-resolved for the inner stream segments.
         preflightedDefaultOptions = (await this.getDefaultOptions({
           requestContext: rest.requestContext,
         })) as AgentExecutionOptions<TOutput>;
@@ -2441,6 +2487,9 @@ export class DurableAgent<
           preflightedDefaultOptions as Record<string, any>,
           rest as Record<string, any>,
         ) as AgentExecutionOptions<TOutput>;
+        // Actor is a per-call trust signal: an explicit value replaces the
+        // default actor as a whole rather than field-merging with it.
+        if (rest.actor !== undefined) resolvedOptions.actor = rest.actor;
         await this.#assertPublicAgentResumePreflight({
           requestContext: resolvedOptions.requestContext,
           memory: resolvedOptions.memory,
@@ -2603,6 +2652,7 @@ export class DurableAgent<
       threadId,
       resourceId,
       onChunk: options?.onChunk,
+      experimentalTransform: options?.experimentalTransform,
       onStepFinish: options?.onStepFinish,
       onFinish: options?.onFinish,
       onStreamFinished: scheduleAutoCleanup,
@@ -2690,7 +2740,21 @@ export class DurableAgent<
           from: ChunkFrom.AGENT,
           payload: { id: workflowInput.agentId, messageId },
         });
-        return this.executeWorkflow(runId, workflowInput);
+        if (this.__getGoalConfig()) {
+          await beginGoalActivity({
+            mastra: this.#mastra,
+            agentId: workflowInput.agentId,
+            resourceId,
+            threadId,
+            runId,
+            requestContext: globalRunRegistry.get(runId)?.requestContext,
+          });
+        }
+        try {
+          return await this.executeWorkflow(runId, workflowInput);
+        } finally {
+          await stopGoalActivity({ agentId: workflowInput.agentId, runId });
+        }
       })
       .catch(error => {
         void this.emitError(runId, error);
@@ -2755,7 +2819,14 @@ export class DurableAgent<
     }
     resumeData = snapshotAgentExecutionValue(resumeData);
     options = options
-      ? snapshotAgentExecutionOptions(options, ['runId', 'toolCallId', 'requestContext', 'memory', 'versions'])
+      ? snapshotAgentExecutionOptions(options, [
+          'runId',
+          'toolCallId',
+          'requestContext',
+          'memory',
+          'versions',
+          '_resolvedDefaultOptions',
+        ])
       : undefined;
 
     // Delegate to the idle-loop wrapper when `untilIdle` is set. Strip
@@ -2765,14 +2836,10 @@ export class DurableAgent<
       const { untilIdle, ...rest } = options;
       const maxIdleMs = typeof untilIdle === 'object' ? untilIdle.maxIdleMs : undefined;
       let preflightedDefaultOptions: AgentExecutionOptions<TOutput> | undefined;
-      if (rest.requestContext) {
-        await this.#assertPublicAgentResumePreflight({
-          requestContext: rest.requestContext,
-          memory: rest.memory,
-          runId,
-          actor: rest.actor,
-        });
-      } else if (this.requestContextSchema || this.#mastra?.getServer()?.fga) {
+      if (this.requestContextSchema || this.#mastra?.getServer()?.fga) {
+        // Resolve dynamic defaults exactly once per public call and preflight
+        // with the merged options — mirrors stream({ untilIdle }); the inner
+        // resume segment reuses the resolution via `_resolvedDefaultOptions`.
         preflightedDefaultOptions = (await this.getDefaultOptions({
           requestContext: rest.requestContext,
         })) as AgentExecutionOptions<TOutput>;
@@ -2780,6 +2847,9 @@ export class DurableAgent<
           preflightedDefaultOptions as Record<string, any>,
           rest as Record<string, any>,
         ) as AgentExecutionOptions<TOutput>;
+        // Actor is a per-call trust signal: an explicit value replaces the
+        // default actor as a whole rather than field-merging with it.
+        if (rest.actor !== undefined) resolvedOptions.actor = rest.actor;
         await this.#assertPublicAgentResumePreflight({
           requestContext: resolvedOptions.requestContext,
           memory: resolvedOptions.memory,
@@ -2816,12 +2886,46 @@ export class DurableAgent<
     const warmMemoryInfo = entry ? this.#runRegistry.getMemoryInfo(runId) : undefined;
     const hasFga = Boolean(this.#mastra?.getServer()?.fga);
     const explicitRequestContext = options?.requestContext;
+    // Warm resumes may authorize against the registered request context (the
+    // run was admitted through this instance's own preflights). The reserved
+    // owner ids below still come exclusively from the caller's own context —
+    // the registered context never vouches for a caller's thread ownership.
+    const effectiveRequestContext = explicitRequestContext ?? (entry?.requestContext as RequestContext | undefined);
     const contextResourceId = explicitRequestContext?.get(MASTRA_RESOURCE_ID_KEY);
     const contextThreadId = explicitRequestContext?.get(MASTRA_THREAD_ID_KEY);
     const requestedThread = options?.memory?.thread;
     const requestedThreadId = typeof requestedThread === 'string' ? requestedThread : requestedThread?.id;
+
+    // Resolve execution options (dynamic defaults) exactly once and before
+    // authorization, so the effective per-call actor — the explicit option or
+    // a freshly resolved default, never a persisted one — is the identity that
+    // is both authorized and forwarded to the workflow segment.
+    const resolvedOptions = (await this.#resolveExecutionOptions({
+      ...(options as DurableAgentStreamOptions<TOutput>),
+      requestContext: effectiveRequestContext as DurableAgentStreamOptions<TOutput>['requestContext'],
+    })) as DurableAgentResumeOptions<TOutput>;
+
+    // Fail closed on the caller's principal before revealing anything about
+    // the run: with FGA configured, a caller with neither an authenticated
+    // user nor a trusted actor is denied outright, without consulting the
+    // provider or storage.
+    await this.#assertPublicAgentResumePreflight({
+      requestContext: effectiveRequestContext,
+      memory: options?.memory,
+      runId,
+      actor: resolvedOptions.actor,
+      authorize: false,
+    });
+
+    // A registry-warm run that never bound a thread or resource has no owner
+    // tuple to verify — FGA authorization below remains its gate. Every other
+    // resume (cold, thread-bound, or making an explicit memory claim) must
+    // present caller-verified reserved ids.
+    const isWarmThreadlessResume =
+      entry !== undefined && !warmMemoryInfo?.threadId && !warmMemoryInfo?.resourceId && options?.memory === undefined;
     if (
       hasFga &&
+      !isWarmThreadlessResume &&
       (typeof contextResourceId !== 'string' ||
         contextResourceId.trim().length === 0 ||
         typeof contextThreadId !== 'string' ||
@@ -2853,11 +2957,20 @@ export class DurableAgent<
       typeof contextResourceId === 'string' && typeof contextThreadId === 'string'
         ? { resource: contextResourceId, thread: contextThreadId }
         : options?.memory;
+    // Single FGA authorization for this resume call, with the effective
+    // per-call actor and the warm owner tuple as authorization context. It
+    // runs before the warm owner-tuple comparison so a denied caller never
+    // learns whether their claim matched.
     await this.#assertPublicAgentResumePreflight({
-      requestContext: explicitRequestContext,
-      memory: callerMemory,
+      requestContext: effectiveRequestContext,
+      memory:
+        callerMemory ??
+        (warmMemoryInfo?.threadId && warmMemoryInfo.resourceId
+          ? { thread: warmMemoryInfo.threadId, resource: warmMemoryInfo.resourceId }
+          : undefined),
       runId,
-      actor: options?.actor,
+      snapshotMemoryInfo: warmMemoryInfo,
+      actor: resolvedOptions.actor,
     });
     if (
       (warmMemoryInfo?.resourceId &&
@@ -2876,17 +2989,6 @@ export class DurableAgent<
         details: { agentName: this.name, runId },
       });
     }
-    await this.#assertPublicAgentResumePreflight({
-      requestContext: explicitRequestContext,
-      memory:
-        callerMemory ??
-        (warmMemoryInfo?.threadId && warmMemoryInfo.resourceId
-          ? { thread: warmMemoryInfo.threadId, resource: warmMemoryInfo.resourceId }
-          : undefined),
-      runId,
-      snapshotMemoryInfo: warmMemoryInfo,
-      actor: options?.actor,
-    });
     if (entry && !this.#activeRegistryPairIsValid(runId, entry)) entry = undefined;
     if (entry) this.#assertWarmResumeVersionSelectors(runId, entry, options ?? {});
 
@@ -2919,18 +3021,36 @@ export class DurableAgent<
     const memoryInfo = this.#runRegistry.getMemoryInfo(runId);
     const typedResumeRequestContext = (options?.requestContext ?? entry.requestContext) as RequestContext | undefined;
 
+    // Bind the resumed segment to the registered thread/resource. Execution
+    // options (defaults, callbacks, actor) were already resolved exactly once
+    // before authorization; only patch in what rehydration just made
+    // available: the registered memory tuple and — for cold resumes without an
+    // explicit caller context — the rehydrated registry context, so runtime
+    // registration matches the pre-restructure behavior.
+    const registeredMemory = memoryInfo?.threadId
+      ? ({
+          ...resolvedOptions.memory,
+          thread: memoryInfo.threadId,
+          resource: memoryInfo.resourceId ?? resolvedOptions.memory?.resource,
+        } as DurableAgentStreamOptions<TOutput>['memory'])
+      : resolvedOptions.memory;
+    resolvedOptions.memory = registeredMemory;
+    if (!resolvedOptions.requestContext && entry.requestContext) {
+      resolvedOptions.requestContext = entry.requestContext as DurableAgentStreamOptions<TOutput>['requestContext'];
+    }
+
     // Install a fresh abort controller for the resumed segment. The original
     // controller is gone (the stream that owned it has already settled), so
     // we overwrite the registry slot. If the caller passed an external
     // signal, forward it onto the new internal controller.
     const abortController = new AbortController();
-    if (options?.abortSignal) {
-      if (options.abortSignal.aborted) {
-        abortController.abort((options.abortSignal as AbortSignal & { reason?: unknown }).reason);
+    if (resolvedOptions.abortSignal) {
+      if (resolvedOptions.abortSignal.aborted) {
+        abortController.abort((resolvedOptions.abortSignal as AbortSignal & { reason?: unknown }).reason);
       } else {
-        options.abortSignal.addEventListener(
+        resolvedOptions.abortSignal.addEventListener(
           'abort',
-          () => abortController.abort((options.abortSignal as AbortSignal & { reason?: unknown }).reason),
+          () => abortController.abort((resolvedOptions.abortSignal as AbortSignal & { reason?: unknown }).reason),
           { once: true },
         );
       }
@@ -2981,16 +3101,17 @@ export class DurableAgent<
       threadId: memoryInfo?.threadId,
       resourceId: memoryInfo?.resourceId,
       offset: resumeOffset,
-      onChunk: options?.onChunk,
-      onStepFinish: options?.onStepFinish,
-      onFinish: options?.onFinish,
+      onChunk: resolvedOptions.onChunk,
+      experimentalTransform: resolvedOptions.experimentalTransform,
+      onStepFinish: resolvedOptions.onStepFinish,
+      onFinish: resolvedOptions.onFinish,
       onStreamFinished: scheduleAutoCleanup,
       onError: async error => {
-        await options?.onError?.(error);
+        await resolvedOptions.onError?.(error);
         scheduleAutoCleanup();
       },
-      onSuspended: options?.onSuspended,
-      closeOnSuspend: (options as any)?.[CLOSE_ON_SUSPEND] === true,
+      onSuspended: resolvedOptions.onSuspended,
+      closeOnSuspend: (resolvedOptions as any)[CLOSE_ON_SUSPEND] === true,
       structuredOutput: entry.structuredOutput as any,
       outputProcessors: entry.outputProcessors,
       messageList: globalEntry?.messageList ?? this.#runRegistry.getMessageList(runId),
@@ -3079,12 +3200,29 @@ export class DurableAgent<
             resourceId: memoryInfo?.resourceId,
             pubsub: this.pubsub,
           });
-          await run.resume({
-            resumeData,
-            label: resumeLabel,
-            requestContext,
-            ...createObservabilityContext({ currentSpan: activeEntry.resumeAgentSpan ?? activeEntry.agentSpan }),
-          });
+          if (this.__getGoalConfig()) {
+            await beginGoalActivity({
+              mastra: this.#mastra,
+              agentId: this.id,
+              resourceId: memoryInfo?.resourceId,
+              threadId: memoryInfo?.threadId,
+              runId,
+              requestContext,
+            });
+          }
+          try {
+            await run.resume({
+              resumeData,
+              label: resumeLabel,
+              requestContext,
+              // Use the actor resolved for this resume call. A resumed segment
+              // must never recover the initial actor from serialized options.
+              actor: resolvedOptions.actor,
+              ...createObservabilityContext({ currentSpan: activeEntry.resumeAgentSpan ?? activeEntry.agentSpan }),
+            });
+          } finally {
+            await stopGoalActivity({ agentId: this.id, runId });
+          }
         } finally {
           unpinGlobalRunRegistryEntry(runId);
         }
@@ -3100,11 +3238,8 @@ export class DurableAgent<
     // Register the resumed run with the thread-stream runtime so
     // subscribeToThread subscribers are notified of the new stream.
     const resumeStreamOptions: AgentExecutionOptions<TOutput> = {
-      ...options,
+      ...resolvedOptions,
       runId,
-      memory: memoryInfo?.threadId
-        ? { thread: memoryInfo.threadId, resource: memoryInfo.resourceId }
-        : (options as any)?.memory,
     } as AgentExecutionOptions<TOutput>;
     // Registration is synchronous; the returned promise is the resumed
     // segment's terminal-delivery watcher and must not delay returning its
@@ -3554,6 +3689,7 @@ export class DurableAgent<
       resourceId,
       offset: recoverOffset,
       onChunk: options?.onChunk,
+      experimentalTransform: options?.experimentalTransform,
       onStepFinish: options?.onStepFinish,
       onFinish: options?.onFinish,
       onStreamFinished: scheduleAutoCleanup,
@@ -3687,6 +3823,20 @@ export class DurableAgent<
     return this.resumeStream({ approved: false }, options);
   }
 
+  override async approveToolCallGenerate<OUTPUT = undefined>(
+    options: AgentExecutionOptions<OUTPUT> & { runId: string; toolCallId?: string },
+  ): Promise<Awaited<ReturnType<MastraModelOutput<OUTPUT>['getFullOutput']>>> {
+    const { runId, ...resumeOptions } = options;
+    return this.resumeGenerate(runId, { approved: true }, resumeOptions as any) as any;
+  }
+
+  override async declineToolCallGenerate<OUTPUT = undefined>(
+    options: AgentExecutionOptions<OUTPUT> & { runId: string; toolCallId?: string },
+  ): Promise<Awaited<ReturnType<MastraModelOutput<OUTPUT>['getFullOutput']>>> {
+    const { runId, ...resumeOptions } = options;
+    return this.resumeGenerate(runId, { approved: false }, resumeOptions as any) as any;
+  }
+
   /**
    * Generate a complete response from the agent using durable execution.
    *
@@ -3817,6 +3967,7 @@ export class DurableAgent<
       threadId,
       resourceId,
       onChunk: options?.onChunk,
+      experimentalTransform: options?.experimentalTransform,
       onStepFinish: options?.onStepFinish,
       onFinish: options?.onFinish,
       onStreamFinished: scheduleAutoCleanup,
@@ -3854,7 +4005,21 @@ export class DurableAgent<
           from: ChunkFrom.AGENT,
           payload: { id: workflowInput.agentId, messageId },
         });
-        return this.executeWorkflow(runId, workflowInput);
+        if (this.__getGoalConfig()) {
+          await beginGoalActivity({
+            mastra: this.#mastra,
+            agentId: workflowInput.agentId,
+            resourceId,
+            threadId,
+            runId,
+            requestContext: globalRunRegistry.get(runId)?.requestContext,
+          });
+        }
+        try {
+          return await this.executeWorkflow(runId, workflowInput);
+        } finally {
+          await stopGoalActivity({ agentId: workflowInput.agentId, runId });
+        }
       })
       .catch(error => {
         void this.emitError(runId, error);
@@ -4163,12 +4328,24 @@ export class DurableAgent<
    * run entirely. If the workflow is suspended and you intend to resume later,
    * do not call cleanup — let the auto-cleanup timer handle it after
    * FINISH/ERROR. Auto-cleanup does not fire on SUSPENDED events.
+   *
+   * Pass `idleTimeoutMs` to bound how long the stream waits on a silent topic:
+   * a durable run whose driving process crashed stops emitting chunks but never
+   * publishes a terminal event, so without this `observe()` hangs forever on a
+   * producerless topic. When the idle timeout fires, the optional `isAlive`
+   * probe is consulted first — returning true (e.g. a live run-liveness
+   * heartbeat, or a suspended HITL gate) re-arms the timer and keeps waiting,
+   * while false/absent terminates the stream with an error chunk. Both options
+   * are opt-in; omit them for the current unbounded behavior.
    */
   async observe(
     runId: string,
     options?: {
       offset?: number;
+      idleTimeoutMs?: number;
+      isAlive?: () => boolean | Promise<boolean>;
       onChunk?: (chunk: ChunkType<TOutput>) => void | Promise<void>;
+      experimentalTransform?: MastraStreamTransformOptions<TOutput>;
       onStepFinish?: (result: AgentStepFinishEventData) => void | Promise<void>;
       onFinish?: MastraOnFinishCallback<TOutput>;
       onError?: ({ error }: { error: Error | string }) => void | Promise<void>;
@@ -4208,7 +4385,10 @@ export class DurableAgent<
       threadId: memoryInfo?.threadId,
       resourceId: memoryInfo?.resourceId,
       offset: options?.offset,
+      idleTimeoutMs: options?.idleTimeoutMs,
+      isAlive: options?.isAlive,
       onChunk: options?.onChunk,
+      experimentalTransform: options?.experimentalTransform,
       onStepFinish: options?.onStepFinish,
       onFinish: options?.onFinish,
       onStreamFinished: scheduleAutoCleanup,
@@ -4353,7 +4533,14 @@ export class DurableAgent<
   ): Promise<DurableAgentPreparationResult> {
     messages = snapshotAgentExecutionValue(messages);
     options = options
-      ? snapshotAgentExecutionOptions(options, ['runId', 'toolCallId', 'requestContext', 'memory', 'versions'])
+      ? snapshotAgentExecutionOptions(options, [
+          'runId',
+          'toolCallId',
+          'requestContext',
+          'memory',
+          'versions',
+          '_resolvedDefaultOptions',
+        ])
       : undefined;
     let releaseRunIdReservation: (() => void) | undefined;
     let preparation: PreparationResult<TOutput>;

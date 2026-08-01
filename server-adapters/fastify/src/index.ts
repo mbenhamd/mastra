@@ -787,7 +787,8 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
     // the JSON content-type parser reads via `request.routeOptions.config` to capture
     // the raw bytes for this route instead of JSON-parsing them (see
     // registerContextMiddleware).
-    const isBodyBearingMethod = ['POST', 'PUT', 'PATCH'].includes(route.method.toUpperCase());
+    // DELETE is included because DELETE requests may carry bodies too (#20015).
+    const isBodyBearingMethod = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(route.method.toUpperCase());
     const maxSize = isBodyBearingMethod ? (route.maxBodySize ?? this.bodyLimitOptions?.maxSize) : undefined;
 
     const config: { skipBodyParse?: boolean } | undefined = route.skipBodyParse ? { skipBodyParse: true } : undefined;

@@ -453,20 +453,24 @@ export class MastraServer extends MastraServerBase<HonoApp, HonoRequest, Context
     // independently of `this.bodyLimitOptions` means a route that declares its own
     // cap (e.g. the channel webhook's 1 MiB) gets a real pre-buffer 413 even when
     // the adapter was constructed without global bodyLimitOptions (embedders/tests).
-    const isBodyBearingMethod = ['POST', 'PUT', 'PATCH'].includes(route.method.toUpperCase());
+    // DELETE is included because DELETE requests may carry bodies too (#20015).
+    const isBodyBearingMethod = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(route.method.toUpperCase());
     const maxSize = route.maxBodySize ?? this.bodyLimitOptions?.maxSize;
 
     // Build middleware array
     const middlewares: MiddlewareHandler[] = [];
 
     if (isBodyBearingMethod && maxSize) {
+      const onError = this.bodyLimitOptions?.onError;
       middlewares.push(
         bodyLimit({
           maxSize,
-          // hono's bodyLimit defaults to throwing HTTPException(413) when no
-          // onError is supplied; pass the adapter-wide handler through when set so
-          // routes that relied on a custom onError keep it.
-          onError: this.bodyLimitOptions?.onError as any,
+          // Hono's bodyLimit middleware uses this callback's return value as the response
+          // directly, so it must resolve to a Response, unlike onError's framework-agnostic
+          // (error: unknown) => unknown contract used by the other adapters. When the
+          // adapter has no global bodyLimitOptions (route-specific caps still apply),
+          // omit onError so hono's default HTTPException(413) is used.
+          ...(onError ? { onError: (c: Context) => c.json(onError({ error: 'Request body too large' }), 413) } : {}),
         }),
       );
     }
