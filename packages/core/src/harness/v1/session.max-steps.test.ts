@@ -201,4 +201,23 @@ describe('Session empty-final-synthesis nudge', () => {
     ).resolves.toEqual({ continue: false, feedback: 'Stop here.' });
     await expect(stopped.prepareStep()).resolves.toBeUndefined();
   });
+
+  it('remembers completed tools when a configured iteration hook rejects', async () => {
+    const configuredIteration = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('configured hook failed'))
+      .mockResolvedValue(undefined);
+    const { nudge, prepareStep } = await capturedSynthesisOptions({
+      onIterationComplete: configuredIteration,
+    });
+
+    await expect(
+      nudge({ text: 'Working.', toolResults: [toolResult], isFinal: false, finishReason: 'tool-calls' }),
+    ).rejects.toThrow('configured hook failed');
+    await expect(nudge({ text: '', toolResults: [], isFinal: true, finishReason: 'stop' })).resolves.toMatchObject({
+      continue: true,
+    });
+    await expect(prepareStep()).resolves.toEqual({ activeTools: [], toolChoice: 'none' });
+    expect(configuredIteration).toHaveBeenCalledTimes(2);
+  });
 });

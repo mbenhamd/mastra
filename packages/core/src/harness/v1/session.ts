@@ -434,8 +434,8 @@ function createHarnessEmptySynthesisOptions(): {
             // otherwise caught by the loop and can also reopen generation.
             if (responseOnly) return { continue: false };
 
-            const configuredResult = await configured?.(context);
             if (context.toolResults.length > 0) segmentHasToolResults = true;
+            const configuredResult = await configured?.(context);
 
             if (!context.isFinal || nudged || context.text.trim() !== '' || !segmentHasToolResults) {
               return configuredResult;

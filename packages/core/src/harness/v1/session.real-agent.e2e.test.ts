@@ -4564,4 +4564,60 @@ describe('Harness v1 real-agent E2E — S22 empty final synthesis', () => {
       await harness.shutdown();
     }
   });
+
+  it('still synthesizes when a configured hook rejects after the tool result', async () => {
+    let providerCalls = 0;
+    let toolExecutions = 0;
+    let configuredIterations = 0;
+    const applyChange = createTool({
+      id: 'applyChange',
+      description: 'Apply one test change.',
+      inputSchema: z.object({}),
+      execute: async () => {
+        toolExecutions += 1;
+        return { applied: true };
+      },
+    });
+    const model = new MockLanguageModelV2({
+      doStream: async () => {
+        providerCalls += 1;
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream:
+            providerCalls === 1
+              ? toolCallStream('apply-1', 'applyChange', '{}')
+              : providerCalls === 2
+                ? textStream([])
+                : textStream(['Applied despite the optional hook failure.']),
+        };
+      },
+    });
+    const agent = new Agent({
+      id: 'default',
+      name: 'default',
+      instructions: 'apply the change and report the result',
+      model,
+      tools: { applyChange },
+      defaultOptions: {
+        onIterationComplete: async () => {
+          configuredIterations += 1;
+          if (configuredIterations === 1) throw new Error('configured hook failed');
+          return undefined;
+        },
+      },
+    });
+    const harness = newHarness(agent);
+    try {
+      const session = await harness.session({ resourceId: 'u-empty-synthesis-hook-error', threadId: { fresh: true } });
+      const result = (await session.message({ content: 'apply it' })) as any;
+
+      expect(result.text).toBe('Applied despite the optional hook failure.');
+      expect(providerCalls).toBe(3);
+      expect(toolExecutions).toBe(1);
+      expect(configuredIterations).toBe(2);
+    } finally {
+      await harness.shutdown();
+    }
+  });
 });
