@@ -103,10 +103,14 @@ describe('Session empty-final-synthesis nudge', () => {
     });
   });
 
-  it('leaves error and abort finishes alone and is a fresh closure per turn', async () => {
+  it('leaves failed and safety-blocked finishes alone and is a fresh closure per turn', async () => {
     const nudge = await capturedNudge();
     expect(nudge({ text: '', toolResults: [toolResult], isFinal: true, finishReason: 'error' })).toBeUndefined();
     expect(nudge({ text: '', toolResults: [toolResult], isFinal: true, finishReason: 'abort' })).toBeUndefined();
+    expect(nudge({ text: '', toolResults: [toolResult], isFinal: true, finishReason: 'tripwire' })).toBeUndefined();
+    expect(
+      nudge({ text: '', toolResults: [toolResult], isFinal: true, finishReason: 'content-filter' }),
+    ).toBeUndefined();
 
     const { harness, agent } = setupHarness();
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });

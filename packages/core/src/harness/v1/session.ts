@@ -418,7 +418,14 @@ function createHarnessEmptySynthesisNudge(): (context: {
   return context => {
     if (context.toolResults.length > 0) segmentHasToolResults = true;
     if (!context.isFinal || nudged || context.text.trim() !== '' || !segmentHasToolResults) return undefined;
-    if (context.finishReason === 'error' || context.finishReason === 'abort') return undefined;
+    if (
+      context.finishReason === 'error' ||
+      context.finishReason === 'abort' ||
+      context.finishReason === 'tripwire' ||
+      context.finishReason === 'content-filter'
+    ) {
+      return undefined;
+    }
     nudged = true;
     return {
       continue: true,

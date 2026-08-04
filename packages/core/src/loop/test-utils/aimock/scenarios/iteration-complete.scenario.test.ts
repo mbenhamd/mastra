@@ -1,5 +1,6 @@
 import { it, expect } from 'vitest';
 import { z } from 'zod/v4';
+import type { Processor } from '../../../../processors';
 import { createTool } from '../../../../tools';
 import { runLoopScenario, useLoopScenarioAimock, describeForAllEngines } from '../aimock-scenario';
 import type { IterationCompleteContext } from '../../../../agent';
@@ -315,6 +316,78 @@ describeForAllEngines(
         .map((chunk: any) => chunk.payload?.text ?? '')
         .join('');
       expect(text).toContain('Updated the probe.');
+    });
+
+    it('does not reopen a tripwire stop after earlier tool work', async () => {
+      const iterations: IterationCompleteContext[] = [];
+      let toolExecutions = 0;
+      let segmentHasToolResults = false;
+
+      const inspectThing = createTool({
+        id: 'inspect_thing',
+        description: 'Inspect a thing',
+        inputSchema: z.object({ name: z.string() }),
+        outputSchema: z.object({ ok: z.boolean() }),
+        execute: async () => {
+          toolExecutions += 1;
+          return { ok: true };
+        },
+      });
+      const blockFinalResponse = {
+        id: 'block-final-response',
+        processOutputStep: async ({ text, abort }: Parameters<NonNullable<Processor['processOutputStep']>>[0]) => {
+          if (text === '') abort('Blocked after tool inspection.');
+        },
+      } satisfies Processor;
+
+      const { output, requests } = await runLoopScenario({
+        engine,
+        llm: getMock(),
+        prompt: 'Inspect the probe and report the outcome.',
+        tools: { inspect_thing: inspectThing },
+        outputProcessors: [blockFinalResponse],
+        maxSteps: 20,
+        onIterationComplete: async (context: IterationCompleteContext) => {
+          iterations.push(context);
+          if (context.toolResults.length > 0) segmentHasToolResults = true;
+          const safetyBlocked = context.finishReason === 'tripwire' || context.finishReason === 'content-filter';
+          if (context.isFinal && segmentHasToolResults && context.text.trim() === '' && !safetyBlocked) {
+            return {
+              continue: true,
+              feedback: 'Reply with the outcome only. Do not call tools.',
+            };
+          }
+          return undefined;
+        },
+        fixtures: llm => {
+          llm.on(
+            { endpoint: 'chat', sequenceIndex: 0 },
+            {
+              content: 'I will inspect the probe now.',
+              toolCalls: [{ id: 'call_inspect_1', name: 'inspect_thing', arguments: { name: 'probe' } }],
+            },
+          );
+          llm.on({ endpoint: 'chat', sequenceIndex: 1 }, { content: '' });
+          llm.on({ endpoint: 'chat', sequenceIndex: 2 }, { content: 'UNEXPECTED_REOPENED_GENERATION' });
+        },
+      });
+
+      expect(toolExecutions).toBe(1);
+      expect(requests).toHaveLength(2);
+      if (engine === 'durable') {
+        // Durable terminalizes the tripwire before a second iteration callback;
+        // there is therefore no callback opportunity to reopen the run.
+        expect(iterations).toHaveLength(1);
+      } else {
+        expect(iterations).toHaveLength(2);
+        expect(iterations[1]).toMatchObject({
+          text: '',
+          isFinal: true,
+          finishReason: 'tripwire',
+        });
+      }
+      expect(await output.finishReason).toBe(engine === 'durable' ? 'other' : 'tripwire');
+      expect(await output.text).not.toContain('UNEXPECTED_REOPENED_GENERATION');
     });
   },
 );
