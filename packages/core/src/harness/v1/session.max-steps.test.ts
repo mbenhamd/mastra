@@ -62,11 +62,10 @@ describe('Session empty-final-synthesis nudge', () => {
         }) => Promise<{ continue?: boolean; feedback?: string } | undefined>)
       | undefined;
     const prepareStep = merged.prepareStep as
-      | ((args?: unknown) => Promise<Record<string, unknown> | undefined>)
-      | undefined;
+      ((args?: unknown) => Promise<Record<string, unknown> | undefined>) | undefined;
     expect(typeof nudge).toBe('function');
     expect(typeof prepareStep).toBe('function');
-    return { nudge: nudge!, prepareStep: prepareStep! };
+    return { nudge: nudge!, prepareStep: prepareStep!, harness };
   }
 
   const toolResult = { id: 'tc1', name: 'create_task', result: { ok: true } };
@@ -191,7 +190,7 @@ describe('Session empty-final-synthesis nudge', () => {
     await expect(nudge({ text: '', toolResults: [], isFinal: false, finishReason: 'tool-calls' })).resolves.toEqual({
       continue: false,
     });
-    expect(configuredIteration).toHaveBeenCalledTimes(2);
+    expect(configuredIteration).toHaveBeenCalledTimes(3);
     expect(configuredPrepare).toHaveBeenCalledTimes(2);
 
     const configuredStop = vi.fn(async () => ({ continue: false, feedback: 'Stop here.' }));
@@ -219,5 +218,33 @@ describe('Session empty-final-synthesis nudge', () => {
     });
     await expect(prepareStep()).resolves.toEqual({ activeTools: [], toolChoice: 'none' });
     expect(configuredIteration).toHaveBeenCalledTimes(2);
+  });
+
+  it('forces recovery and logs when the configured hook rejects through the recovery turn', async () => {
+    const hookError = new Error('configured hook failed');
+    const configuredIteration = vi.fn(async () => {
+      throw hookError;
+    });
+    const { nudge, prepareStep, harness } = await capturedSynthesisOptions({
+      onIterationComplete: configuredIteration,
+    });
+    const loggerError = vi.spyOn(harness.mastra.getLogger(), 'error');
+
+    await expect(
+      nudge({ text: 'Working.', toolResults: [toolResult], isFinal: false, finishReason: 'tool-calls' }),
+    ).rejects.toThrow('configured hook failed');
+    await expect(nudge({ text: '', toolResults: [], isFinal: true, finishReason: 'stop' })).resolves.toMatchObject({
+      continue: true,
+      feedback: expect.stringContaining('no reply'),
+    });
+    await expect(prepareStep()).resolves.toEqual({ activeTools: [], toolChoice: 'none' });
+    await expect(nudge({ text: 'Recovered.', toolResults: [], isFinal: true, finishReason: 'stop' })).resolves.toEqual({
+      continue: false,
+    });
+    expect(configuredIteration).toHaveBeenCalledTimes(3);
+    expect(loggerError).toHaveBeenCalledTimes(2);
+    expect(loggerError).toHaveBeenNthCalledWith(1, 'Error in onIterationComplete hook:', hookError);
+    expect(loggerError).toHaveBeenNthCalledWith(2, 'Error in onIterationComplete hook:', hookError);
+    loggerError.mockRestore();
   });
 });

@@ -350,9 +350,7 @@ type MessageAdmissionHashes = {
 };
 
 type QueueResumeRecoveryResult =
-  | { status: 'none' }
-  | { status: 'completed'; result: AgentResult }
-  | { status: 'stale' };
+  { status: 'none' } | { status: 'completed'; result: AgentResult } | { status: 'stale' };
 
 type ResumeResponseMode = 'agent-result' | 'inbox-receipt';
 type InboxReceiptResponseOptions = Extract<InboxResponseOptions, { responseId: string }>;
@@ -399,6 +397,7 @@ const MAX_EXPIRED_PENDING_INTERACTIONS = 100;
 const HARNESS_SESSION_MAX_STEPS = 1000;
 type HarnessIterationCompleteHandler = NonNullable<AgentExecutionOptionsBase<unknown>['onIterationComplete']>;
 type HarnessPrepareStep = NonNullable<AgentExecutionOptionsBase<unknown>['prepareStep']>;
+type HarnessIterationCompleteErrorReporter = (error: unknown) => void;
 
 /**
  * Empty-final-synthesis nudge. Live-diagnosed twice on the same day (a chat
@@ -415,7 +414,7 @@ type HarnessPrepareStep = NonNullable<AgentExecutionOptionsBase<unknown>['prepar
  * ignores continuation results for terminal tool delivery, and error, abort,
  * safety, and output-length finishes are left alone.
  */
-function createHarnessEmptySynthesisOptions(): {
+function createHarnessEmptySynthesisOptions(reportConfiguredHookError: HarnessIterationCompleteErrorReporter): {
   [AGENT_EXECUTION_OPTION_COMPOSERS]: () => AgentExecutionOptionComposers;
 } {
   return {
@@ -428,27 +427,42 @@ function createHarnessEmptySynthesisOptions(): {
           const configured = existing as HarnessIterationCompleteHandler | undefined;
           return async (context: Parameters<HarnessIterationCompleteHandler>[0]) => {
             // The recovery phase gets one provider response, even if that
-            // response tries to call a tool that prepareStep hid. This hard
-            // stop runs before configured callbacks: feedback paired with
-            // `continue: false` is a two-phase stop, and a callback error is
-            // otherwise caught by the loop and can also reopen generation.
-            if (responseOnly) return { continue: false };
+            // response tries to call a tool that prepareStep hid. Configured
+            // observers still see this iteration, but cannot reopen it.
+            if (responseOnly) {
+              try {
+                await configured?.(context);
+              } catch (error) {
+                reportConfiguredHookError(error);
+              }
+              return { continue: false };
+            }
 
             if (context.toolResults.length > 0) segmentHasToolResults = true;
-            const configuredResult = await configured?.(context);
+            const needsRecovery =
+              context.isFinal &&
+              !nudged &&
+              context.text.trim() === '' &&
+              segmentHasToolResults &&
+              context.finishReason !== 'error' &&
+              context.finishReason !== 'abort' &&
+              context.finishReason !== 'tripwire' &&
+              context.finishReason !== 'content-filter' &&
+              context.finishReason !== 'length';
+            let configuredResult: Awaited<ReturnType<HarnessIterationCompleteHandler>>;
+            try {
+              configuredResult = await configured?.(context);
+            } catch (error) {
+              // Keep the framework's established callback-error behavior for
+              // ordinary iterations. On the exact silent terminal that needs
+              // recovery, however, rethrowing would make the loop swallow the
+              // error and strand a completed mutation with no user response.
+              if (!needsRecovery) throw error;
+              reportConfiguredHookError(error);
+              configuredResult = undefined;
+            }
 
-            if (!context.isFinal || nudged || context.text.trim() !== '' || !segmentHasToolResults) {
-              return configuredResult;
-            }
-            if (
-              context.finishReason === 'error' ||
-              context.finishReason === 'abort' ||
-              context.finishReason === 'tripwire' ||
-              context.finishReason === 'content-filter' ||
-              context.finishReason === 'length'
-            ) {
-              return configuredResult;
-            }
+            if (!needsRecovery) return configuredResult;
 
             // An application-level explicit stop/continue decision owns this
             // iteration. The Harness only fills the otherwise-silent default.
@@ -1772,6 +1786,16 @@ export class Session {
         maxCustomEventPayloadBytes: () => this._harness._internalMaxEventPayloadBytes,
       },
     );
+  }
+
+  private _createEmptySynthesisOptions() {
+    return createHarnessEmptySynthesisOptions(error => {
+      try {
+        this._harness.mastra.getLogger().error('Error in onIterationComplete hook:', error);
+      } catch {
+        // Diagnostics must never suppress the caller-visible recovery.
+      }
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -4254,8 +4278,7 @@ export class Session {
    * `_internalAwaitFlushChain()` so shutdown and tests can act on it. */
   private _pendingTokenUsageFlushError: unknown;
   private _pendingDurableTurnFlushError:
-    | { error: unknown; pendingResume?: { runId: string; toolCallId: string } }
-    | undefined;
+    { error: unknown; pendingResume?: { runId: string; toolCallId: string } } | undefined;
 
   /**
    * True while a turn (message or queued) is in flight against the agent.
@@ -7705,7 +7728,7 @@ export class Session {
             // The wake branch starts a REAL streamed turn; carry the silent-turn nudge.
             streamOptions: {
               ...baseExecOptions,
-              ...createHarnessEmptySynthesisOptions(),
+              ...this._createEmptySynthesisOptions(),
             } as never,
           },
         },
@@ -9957,7 +9980,7 @@ export class Session {
           abortSignal: turnAbortSignal,
           requestContext,
           maxSteps: HARNESS_SESSION_MAX_STEPS,
-          ...createHarnessEmptySynthesisOptions(),
+          ...this._createEmptySynthesisOptions(),
           ...toolSurface,
           ...(turnInstructions ? { instructions: turnInstructions } : {}),
         };
@@ -10346,7 +10369,7 @@ export class Session {
               behavior: 'wake',
               streamOptions: {
                 maxSteps: HARNESS_SESSION_MAX_STEPS,
-                ...createHarnessEmptySynthesisOptions(),
+                ...this._createEmptySynthesisOptions(),
               } as never,
             },
           },
@@ -10472,7 +10495,7 @@ export class Session {
           abortSignal: turnAbortSignal,
           requestContext,
           maxSteps: HARNESS_SESSION_MAX_STEPS,
-          ...createHarnessEmptySynthesisOptions(),
+          ...this._createEmptySynthesisOptions(),
           ...toolSurface,
           ...(turnInstructions ? { instructions: turnInstructions } : {}),
         };
@@ -10581,7 +10604,7 @@ export class Session {
           streamOptions: {
             memory: { thread: this.threadId, resource: this.resourceId },
             maxSteps: HARNESS_SESSION_MAX_STEPS,
-            ...createHarnessEmptySynthesisOptions(),
+            ...this._createEmptySynthesisOptions(),
           } as never,
         },
       },
@@ -13125,7 +13148,7 @@ export class Session {
         // RESUMED segment at the agent's 5-step default and ends it mid-task
         // (the agent-controller documents the identical trap for its lane).
         maxSteps: HARNESS_SESSION_MAX_STEPS,
-        ...createHarnessEmptySynthesisOptions(),
+        ...this._createEmptySynthesisOptions(),
         ...resumeToolSurface,
         ...(turnInstructions ? { instructions: turnInstructions } : {}),
       });
@@ -15209,7 +15232,7 @@ export class Session {
             // The wake branch starts a REAL streamed turn; carry the silent-turn nudge.
             streamOptions: {
               ...baseExecOptions,
-              ...createHarnessEmptySynthesisOptions(),
+              ...this._createEmptySynthesisOptions(),
             } as never,
           },
         },

@@ -38,8 +38,7 @@ export function mergeAgentExecutionOptions(
   }
 
   const createComposers = (callerOptions as Record<PropertyKey, any>)[AGENT_EXECUTION_OPTION_COMPOSERS] as
-    | AgentExecutionOptionComposerFactory
-    | undefined;
+    AgentExecutionOptionComposerFactory | undefined;
   const composers = createComposers?.();
   for (const key of ['onIterationComplete', 'prepareStep'] as const) {
     const compose = composers?.[key];
