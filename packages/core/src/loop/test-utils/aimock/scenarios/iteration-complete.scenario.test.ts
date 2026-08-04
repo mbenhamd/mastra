@@ -253,6 +253,7 @@ describeForAllEngines(
       let nudged = false;
       let toolExecutions = 0;
       let segmentHasToolResults = false;
+      let responseOnly = false;
 
       const updateThing = createTool({
         id: 'update_thing',
@@ -272,11 +273,14 @@ describeForAllEngines(
         tools: { update_thing: updateThing },
         maxSteps: 20,
         collectChunks: true,
+        prepareStep: () => (responseOnly ? { activeTools: [], toolChoice: 'none' } : undefined),
         onIterationComplete: async (context: IterationCompleteContext) => {
           iterations.push(context);
           if (context.toolResults.length > 0) segmentHasToolResults = true;
+          if (responseOnly) return { continue: false };
           if (context.isFinal && !nudged && segmentHasToolResults && context.text.trim() === '') {
             nudged = true;
+            responseOnly = true;
             return {
               continue: true,
               feedback: 'Reply with the outcome only. Do not call tools.',
@@ -293,7 +297,16 @@ describeForAllEngines(
             },
           );
           llm.on({ endpoint: 'chat', sequenceIndex: 1 }, { content: '' });
-          llm.on({ endpoint: 'chat', sequenceIndex: 2 }, { content: 'Updated the probe.' });
+          // Deliberately violate the feedback. The response-only prepareStep
+          // must keep the completed action unavailable, so this call is never
+          // executed and the model gets one more chance to return plain text.
+          llm.on(
+            { endpoint: 'chat', sequenceIndex: 2 },
+            {
+              toolCalls: [{ id: 'call_update_2', name: 'update_thing', arguments: { name: 'probe' } }],
+            },
+          );
+          llm.on({ endpoint: 'chat', sequenceIndex: 3 }, { content: 'UNEXPECTED_EXTRA_RECOVERY_STEP' });
         },
       });
 
@@ -302,6 +315,7 @@ describeForAllEngines(
       expect(JSON.stringify(requests[2]?.body?.messages ?? [])).toContain(
         'Reply with the outcome only. Do not call tools.',
       );
+      expect(requests[2]?.body?.tools ?? []).toHaveLength(0);
       expect(nudged).toBe(true);
       expect(iterations[0]).toMatchObject({
         text: 'I will update the probe now.',
@@ -315,7 +329,7 @@ describeForAllEngines(
         .filter(chunk => chunk.type === 'text-delta')
         .map((chunk: any) => chunk.payload?.text ?? '')
         .join('');
-      expect(text).toContain('Updated the probe.');
+      expect(text).not.toContain('UNEXPECTED_EXTRA_RECOVERY_STEP');
     });
 
     it('does not reopen a tripwire stop after earlier tool work', async () => {

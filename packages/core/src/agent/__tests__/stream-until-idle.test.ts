@@ -7,6 +7,7 @@ import { RequestContext } from '../../request-context';
 import { MockStore } from '../../storage';
 import { createTool } from '../../tools';
 import { Agent } from '../agent';
+import { AGENT_EXECUTION_OPTION_COMPOSERS } from '../merge-execution-options';
 
 /**
  * Helper: build a mock model whose streaming response is controlled by the
@@ -226,6 +227,9 @@ describe('Agent.streamUntilIdle', () => {
     const memory = new MockMemory();
     let memoryResolverCalls = 0;
     let defaultOptionsCalls = 0;
+    let configuredPrepareCalls = 0;
+    let composedPrepareCalls = 0;
+    const composerInstanceCalls: number[] = [];
     const memoryScopes: string[] = [];
     const instructionScopes: string[] = [];
     const { model, getCallCount, getCallOptions } = makeScriptedModel([
@@ -249,6 +253,10 @@ describe('Agent.streamUntilIdle', () => {
         return {
           requestContext,
           context: [{ role: 'user' as const, content: `default-context-${defaultOptionsCalls}` }],
+          prepareStep: async () => {
+            configuredPrepareCalls += 1;
+            return undefined;
+          },
         };
       },
       memory: ({ requestContext }) => {
@@ -285,7 +293,18 @@ describe('Agent.streamUntilIdle', () => {
       onFinish: () => {
         callerOnFinishCalls += 1;
       },
-    });
+      [AGENT_EXECUTION_OPTION_COMPOSERS]: () => {
+        const instance = composerInstanceCalls.push(0) - 1;
+        return {
+          prepareStep: (existing: ((args: unknown) => unknown) | undefined) => async (args: unknown) => {
+            const result = await existing?.(args);
+            composerInstanceCalls[instance]! += 1;
+            composedPrepareCalls += 1;
+            return result;
+          },
+        };
+      },
+    } as any);
 
     // Mark a task as running so the outer knows to wait for it.
     await publishEvent('task.running', 'task-1');
@@ -300,6 +319,9 @@ describe('Agent.streamUntilIdle', () => {
     // Each turn is its own execution boundary; neither turn resolves memory twice.
     expect(memoryResolverCalls).toBe(2);
     expect(defaultOptionsCalls).toBe(2);
+    expect(configuredPrepareCalls).toBe(2);
+    expect(composedPrepareCalls).toBe(2);
+    expect(composerInstanceCalls.filter(calls => calls > 0)).toEqual([1, 1]);
     expect(memoryScopes).toEqual(['turn-1', 'turn-2']);
     expect(instructionScopes).toEqual(['turn-1', 'turn-2']);
     expect(callerOnFinishCalls).toBe(1);

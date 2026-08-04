@@ -11,7 +11,9 @@
  * pins CONTROLLER_MAX_STEPS; these tests pin the session lane.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+
+import { mergeAgentExecutionOptions } from '../../agent/merge-execution-options';
 
 import { setupHarness } from './__test-utils__';
 
@@ -45,52 +47,81 @@ describe('Session step ceiling', () => {
 });
 
 describe('Session empty-final-synthesis nudge', () => {
-  async function capturedNudge() {
+  async function capturedSynthesisOptions(defaultOptions: Record<string, unknown> = {}) {
     const { harness, agent } = setupHarness();
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
     await session.message({ content: 'do something' });
     const call = agent.streamCalls.at(-1);
-    const nudge = call?.options?.onIterationComplete as
+    const merged = mergeAgentExecutionOptions(defaultOptions, call?.options ?? {});
+    const nudge = merged.onIterationComplete as
       | ((context: {
           text: string;
           toolResults: Array<{ id: string; name: string; result: unknown }>;
           isFinal: boolean;
           finishReason: string;
-        }) => { continue: boolean } | undefined)
+        }) => Promise<{ continue?: boolean; feedback?: string } | undefined>)
+      | undefined;
+    const prepareStep = merged.prepareStep as
+      | ((args?: unknown) => Promise<Record<string, unknown> | undefined>)
       | undefined;
     expect(typeof nudge).toBe('function');
-    return nudge!;
+    expect(typeof prepareStep).toBe('function');
+    return { nudge: nudge!, prepareStep: prepareStep! };
   }
 
   const toolResult = { id: 'tc1', name: 'create_task', result: { ok: true } };
 
-  it('forces one continuation when tools completed and the final iteration has no text', async () => {
-    const nudge = await capturedNudge();
+  it('forces one response-only continuation when tools completed and the final iteration has no text', async () => {
+    const { nudge, prepareStep } = await capturedSynthesisOptions();
+    await expect(prepareStep()).resolves.toBeUndefined();
     expect(
-      nudge({ text: 'I will create it now.', toolResults: [toolResult], isFinal: false, finishReason: 'tool-calls' }),
+      await nudge({
+        text: 'I will create it now.',
+        toolResults: [toolResult],
+        isFinal: false,
+        finishReason: 'tool-calls',
+      }),
     ).toBeUndefined();
-    expect(nudge({ text: '', toolResults: [], isFinal: true, finishReason: 'stop' })).toMatchObject({
+    expect(await nudge({ text: '', toolResults: [], isFinal: true, finishReason: 'stop' })).toMatchObject({
       continue: true,
       feedback: expect.stringContaining('no reply'),
     });
-    // Never loops: a second silent final is allowed to finish.
-    expect(nudge({ text: '', toolResults: [], isFinal: true, finishReason: 'stop' })).toBeUndefined();
+    await expect(prepareStep()).resolves.toEqual({ activeTools: [], toolChoice: 'none' });
+    // Never loops: the single response-only iteration is forced to stop.
+    expect(await nudge({ text: '', toolResults: [], isFinal: true, finishReason: 'stop' })).toMatchObject({
+      continue: false,
+    });
   });
 
   it('stays silent when the final iteration produced text or the turn ran no tools', async () => {
-    const spoke = await capturedNudge();
-    expect(spoke({ text: '', toolResults: [toolResult], isFinal: false, finishReason: 'tool-calls' })).toBeUndefined();
-    expect(spoke({ text: 'Done.', toolResults: [], isFinal: true, finishReason: 'stop' })).toBeUndefined();
+    const { nudge: spoke } = await capturedSynthesisOptions();
+    expect(
+      await spoke({ text: '', toolResults: [toolResult], isFinal: false, finishReason: 'tool-calls' }),
+    ).toBeUndefined();
+    expect(await spoke({ text: 'Done.', toolResults: [], isFinal: true, finishReason: 'stop' })).toBeUndefined();
 
-    const toolless = await capturedNudge();
-    expect(toolless({ text: '', toolResults: [], isFinal: true, finishReason: 'stop' })).toBeUndefined();
+    const { nudge: toolless } = await capturedSynthesisOptions();
+    expect(await toolless({ text: '', toolResults: [], isFinal: true, finishReason: 'stop' })).toBeUndefined();
+  });
+
+  it('asks for a result-grounded report when a tool was denied instead of implying it ran', async () => {
+    const { nudge } = await capturedSynthesisOptions();
+    const result = await nudge({
+      text: '',
+      toolResults: [{ ...toolResult, result: { approved: false, denied: true } }],
+      isFinal: true,
+      finishReason: 'stop',
+    });
+    expect(result?.feedback).toContain('succeeded, failed, or was denied');
+    expect(result?.feedback).toContain('Do not claim an action ran');
+    expect(result?.feedback).not.toContain('completed tool actions');
   });
 
   it('keeps the one-shot synthesis available after more than ten ordinary tool generations', async () => {
-    const nudge = await capturedNudge();
+    const { nudge } = await capturedSynthesisOptions();
     for (let index = 0; index < 12; index += 1) {
       expect(
-        nudge({
+        await nudge({
           text: `Working on tool step ${index + 1}.`,
           toolResults: [{ ...toolResult, id: `tc-${index}` }],
           isFinal: false,
@@ -98,29 +129,76 @@ describe('Session empty-final-synthesis nudge', () => {
         }),
       ).toBeUndefined();
     }
-    expect(nudge({ text: '', toolResults: [], isFinal: true, finishReason: 'stop' })).toMatchObject({
+    expect(await nudge({ text: '', toolResults: [], isFinal: true, finishReason: 'stop' })).toMatchObject({
       continue: true,
     });
   });
 
-  it('leaves failed and safety-blocked finishes alone and is a fresh closure per turn', async () => {
-    const nudge = await capturedNudge();
-    expect(nudge({ text: '', toolResults: [toolResult], isFinal: true, finishReason: 'error' })).toBeUndefined();
-    expect(nudge({ text: '', toolResults: [toolResult], isFinal: true, finishReason: 'abort' })).toBeUndefined();
-    expect(nudge({ text: '', toolResults: [toolResult], isFinal: true, finishReason: 'tripwire' })).toBeUndefined();
+  it('leaves failed, truncated, and safety-blocked finishes alone and is a fresh closure per turn', async () => {
+    const { nudge, prepareStep } = await capturedSynthesisOptions();
+    expect(await nudge({ text: '', toolResults: [toolResult], isFinal: true, finishReason: 'error' })).toBeUndefined();
+    expect(await nudge({ text: '', toolResults: [toolResult], isFinal: true, finishReason: 'abort' })).toBeUndefined();
     expect(
-      nudge({ text: '', toolResults: [toolResult], isFinal: true, finishReason: 'content-filter' }),
+      await nudge({ text: '', toolResults: [toolResult], isFinal: true, finishReason: 'tripwire' }),
     ).toBeUndefined();
+    expect(
+      await nudge({ text: '', toolResults: [toolResult], isFinal: true, finishReason: 'content-filter' }),
+    ).toBeUndefined();
+    expect(await nudge({ text: '', toolResults: [toolResult], isFinal: true, finishReason: 'length' })).toBeUndefined();
+    await expect(prepareStep()).resolves.toBeUndefined();
 
     const { harness, agent } = setupHarness();
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
     await session.message({ content: 'one' });
     await session.message({ content: 'two' });
     const runCalls = agent.streamCalls.filter(call => call.type === 'stream');
-    const first = runCalls.at(0)?.options?.onIterationComplete;
-    const second = runCalls.at(1)?.options?.onIterationComplete;
+    const firstOptions = mergeAgentExecutionOptions({}, runCalls.at(0)?.options ?? {});
+    const secondOptions = mergeAgentExecutionOptions({}, runCalls.at(1)?.options ?? {});
+    const first = firstOptions.onIterationComplete;
+    const second = secondOptions.onIterationComplete;
+    const firstPrepare = firstOptions.prepareStep;
+    const secondPrepare = secondOptions.prepareStep;
     expect(typeof first).toBe('function');
     expect(typeof second).toBe('function');
+    expect(typeof firstPrepare).toBe('function');
+    expect(typeof secondPrepare).toBe('function');
     expect(first).not.toBe(second);
+    expect(firstPrepare).not.toBe(secondPrepare);
+  });
+
+  it('preserves configured hooks while forcing the recovery step tool-free', async () => {
+    const configuredIteration = vi.fn(async () => ({ feedback: 'Configured feedback.' }));
+    const configuredPrepare = vi.fn(async () => ({ activeTools: ['safe_tool'], workspace: 'configured-workspace' }));
+    const { nudge, prepareStep } = await capturedSynthesisOptions({
+      onIterationComplete: configuredIteration,
+      prepareStep: configuredPrepare,
+    });
+
+    await expect(prepareStep()).resolves.toEqual({
+      activeTools: ['safe_tool'],
+      workspace: 'configured-workspace',
+    });
+    await nudge({ text: 'Working.', toolResults: [toolResult], isFinal: false, finishReason: 'tool-calls' });
+    expect(await nudge({ text: '', toolResults: [], isFinal: true, finishReason: 'stop' })).toMatchObject({
+      continue: true,
+      feedback: expect.stringContaining('Configured feedback.'),
+    });
+    await expect(prepareStep()).resolves.toEqual({
+      activeTools: [],
+      toolChoice: 'none',
+      workspace: 'configured-workspace',
+    });
+    await expect(nudge({ text: '', toolResults: [], isFinal: false, finishReason: 'tool-calls' })).resolves.toEqual({
+      continue: false,
+    });
+    expect(configuredIteration).toHaveBeenCalledTimes(2);
+    expect(configuredPrepare).toHaveBeenCalledTimes(2);
+
+    const configuredStop = vi.fn(async () => ({ continue: false, feedback: 'Stop here.' }));
+    const stopped = await capturedSynthesisOptions({ onIterationComplete: configuredStop });
+    await expect(
+      stopped.nudge({ text: '', toolResults: [toolResult], isFinal: true, finishReason: 'stop' }),
+    ).resolves.toEqual({ continue: false, feedback: 'Stop here.' });
+    await expect(stopped.prepareStep()).resolves.toBeUndefined();
   });
 });

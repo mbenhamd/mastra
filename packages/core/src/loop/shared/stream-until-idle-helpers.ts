@@ -10,7 +10,7 @@
  * - A `buildResult` callback to construct the caller-specific return value
  * - Optional `postPipeInner` hooks for durable-specific cleanup/abort tracking
  */
-import { mergeAgentExecutionOptions } from '../../agent/merge-execution-options';
+import { AGENT_EXECUTION_OPTION_COMPOSERS, mergeAgentExecutionOptions } from '../../agent/merge-execution-options';
 import type { BackgroundTaskManager } from '../../background-tasks/manager';
 import type { MastraMemory } from '../../memory/memory';
 import { MASTRA_RESOURCE_ID_KEY, MASTRA_THREAD_ID_KEY, RequestContext } from '../../request-context';
@@ -323,8 +323,12 @@ export async function runIdleLoop<
     _threadRunInflightIdleOwner: _threadRunInflightIdleOwner,
     ...continuationCallerOptions
   } = Object.fromEntries(Object.entries(restStreamOptions ?? {}));
+  const executionOptionComposerFactory = (restStreamOptions as Record<PropertyKey, unknown> | undefined)?.[
+    AGENT_EXECUTION_OPTION_COMPOSERS
+  ];
   const baseContinuationOpts = {
     ...continuationCallerOptions,
+    ...(executionOptionComposerFactory ? { [AGENT_EXECUTION_OPTION_COMPOSERS]: executionOptionComposerFactory } : {}),
     _skipBgTaskWait: true,
   } as Record<string, any>;
 

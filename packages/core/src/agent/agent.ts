@@ -9161,7 +9161,7 @@ export class Agent<
     const defaultOptions = await this.getDefaultOptions({
       requestContext: requestContextToUse,
     });
-    const mergedOptions = deepMerge(
+    const mergedOptions = mergeAgentExecutionOptions(
       defaultOptions as Record<string, unknown>,
       (options ?? {}) as Record<string, unknown>,
     ) as AgentExecutionOptions<any> & { model?: DynamicArgument<MastraModelConfig> };
@@ -10114,7 +10114,7 @@ export class Agent<
         (await this.getDefaultOptions({
           requestContext: requestContextToUse,
         }));
-      const mergedOptions = deepMerge(
+      const mergedOptions = mergeAgentExecutionOptions(
         defaultOptions as Record<string, unknown>,
         streamOptionsWithRunId as Record<string, unknown>,
       ) as AgentExecutionOptions<OUTPUT> & { model?: DynamicArgument<MastraModelConfig> };
@@ -10881,7 +10881,7 @@ export class Agent<
     let stagedToolSurfaceFenceRestore = false;
 
     try {
-      let mergedStreamOptions = deepMerge(
+      let mergedStreamOptions = mergeAgentExecutionOptions(
         defaultOptions as Record<string, unknown>,
         (streamOptionsWithSnapshotTarget ?? {}) as Record<string, unknown>,
       ) as typeof defaultOptions & { model?: DynamicArgument<MastraModelConfig> };
@@ -11265,7 +11265,7 @@ export class Agent<
       requestContext: requestContextToUse,
     })) as AgentExecutionOptions<TOutput>;
 
-    const mergedOptions = deepMerge(
+    const mergedOptions = mergeAgentExecutionOptions(
       defaultOptions as Record<string, unknown>,
       (options ?? {}) as Record<string, unknown>,
     ) as typeof defaultOptions & { model?: DynamicArgument<MastraModelConfig> };

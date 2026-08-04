@@ -4436,3 +4436,132 @@ describe('Harness v1 real-agent E2E — S21 reasoning_delta streams (GAP-B)', ()
     }
   });
 });
+
+// ===========================================================================
+// S22 — EMPTY FINAL SYNTHESIS: successful tool work never leaves the user
+// silent, and the one recovery request cannot repeat an action even when the
+// provider ignores toolChoice. This runs through the real Session + Agent loop,
+// including composition with Agent.defaultOptions hooks.
+// ===========================================================================
+
+describe('Harness v1 real-agent E2E — S22 empty final synthesis', () => {
+  it('adds one tool-free response step while preserving configured agent hooks', async () => {
+    let providerCalls = 0;
+    let toolExecutions = 0;
+    let configuredIterations = 0;
+    let configuredPrepareSteps = 0;
+    const providerOptions: any[] = [];
+    const applyChange = createTool({
+      id: 'applyChange',
+      description: 'Apply one test change.',
+      inputSchema: z.object({}),
+      execute: async () => {
+        toolExecutions += 1;
+        return { applied: true };
+      },
+    });
+    const model = new MockLanguageModelV2({
+      doStream: async options => {
+        providerOptions.push(options);
+        providerCalls += 1;
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream:
+            providerCalls === 1
+              ? toolCallStream('apply-1', 'applyChange', '{}')
+              : providerCalls === 2
+                ? textStream([])
+                : textStream(['Applied the change.']),
+        };
+      },
+    });
+    const agent = new Agent({
+      id: 'default',
+      name: 'default',
+      instructions: 'apply the change and report the result',
+      model,
+      tools: { applyChange },
+      defaultOptions: {
+        onIterationComplete: async () => {
+          configuredIterations += 1;
+          return undefined;
+        },
+        prepareStep: async () => {
+          configuredPrepareSteps += 1;
+          return { activeTools: ['applyChange'] };
+        },
+      },
+    });
+    const harness = newHarness(agent);
+    try {
+      const session = await harness.session({ resourceId: 'u-empty-synthesis', threadId: { fresh: true } });
+      const result = (await session.message({ content: 'apply it' })) as any;
+
+      expect(result.text).toBe('Applied the change.');
+      expect(providerCalls).toBe(3);
+      expect(toolExecutions).toBe(1);
+      expect(configuredIterations).toBe(2);
+      expect(configuredPrepareSteps).toBe(3);
+      expect(providerOptions[0]?.tools).toHaveLength(1);
+      expect(providerOptions[2]?.tools ?? []).toHaveLength(0);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('hard-stops after one tool-free recovery request when the provider tries to repeat the action', async () => {
+    let providerCalls = 0;
+    let toolExecutions = 0;
+    const applyChange = createTool({
+      id: 'applyChange',
+      description: 'Apply one test change.',
+      inputSchema: z.object({}),
+      execute: async () => {
+        toolExecutions += 1;
+        return { applied: true };
+      },
+    });
+    const model = new MockLanguageModelV2({
+      doStream: async () => {
+        providerCalls += 1;
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream:
+            providerCalls === 1
+              ? toolCallStream('apply-1', 'applyChange', '{}')
+              : providerCalls === 2
+                ? textStream([])
+                : providerCalls === 3
+                  ? toolCallStream('apply-2', 'applyChange', '{}')
+                  : textStream(['UNEXPECTED_EXTRA_RECOVERY_STEP']),
+        };
+      },
+    });
+    const agent = new Agent({
+      id: 'default',
+      name: 'default',
+      instructions: 'apply the change and report the result',
+      model,
+      tools: { applyChange },
+      defaultOptions: {
+        // Feedback on the recovery response would normally request a two-phase
+        // stop. The Harness composer must discard it at the hard-stop point.
+        onIterationComplete: async () => ({ feedback: 'Configured feedback.' }),
+        prepareStep: async () => ({ activeTools: ['applyChange'] }),
+      },
+    });
+    const harness = newHarness(agent);
+    try {
+      const session = await harness.session({ resourceId: 'u-empty-synthesis-cap', threadId: { fresh: true } });
+      const result = (await session.message({ content: 'apply it once' })) as any;
+
+      expect(providerCalls).toBe(3);
+      expect(toolExecutions).toBe(1);
+      expect(result.text).not.toContain('UNEXPECTED_EXTRA_RECOVERY_STEP');
+    } finally {
+      await harness.shutdown();
+    }
+  });
+});
