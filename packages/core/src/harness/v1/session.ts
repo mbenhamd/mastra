@@ -399,13 +399,13 @@ const HARNESS_SESSION_MAX_STEPS = 1000;
  * turn whose approved create tool succeeded, and a scripted journey whose
  * create ran un-gated): some models execute action tools successfully and
  * then finish the turn with zero visible text, so the user gets a mutation
- * and silence. When the final iteration arrives with tool results somewhere
- * in the segment and no text anywhere in it, force exactly ONE continuation
- * step so the model states the outcome. One nudge per run segment — a model
- * that stays silent twice is allowed to finish (never loop). Turns that end
- * via a terminal tool result never reach this handler (the loop skips
- * iteration-result handling for terminal delivery), and error/abort finishes
- * are left alone.
+ * and silence. When the final iteration has no text after completed tools,
+ * force exactly ONE continuation step so the model states the outcome. Text
+ * from an earlier tool-call iteration is not a terminal answer and must not
+ * suppress synthesis. One nudge per run segment — a model that stays silent
+ * twice is allowed to finish (never loop). Turns that end via a terminal tool
+ * result never reach this handler (the loop skips iteration-result handling
+ * for terminal delivery), and error/abort finishes are left alone.
  */
 function createHarnessEmptySynthesisNudge(): (context: {
   text: string;
@@ -415,11 +415,9 @@ function createHarnessEmptySynthesisNudge(): (context: {
 }) => { continue: boolean; feedback: string } | undefined {
   let nudged = false;
   let segmentHasToolResults = false;
-  let segmentHasText = false;
   return context => {
     if (context.toolResults.length > 0) segmentHasToolResults = true;
-    if (context.text.trim() !== '') segmentHasText = true;
-    if (!context.isFinal || nudged || segmentHasText || !segmentHasToolResults) return undefined;
+    if (!context.isFinal || nudged || context.text.trim() !== '' || !segmentHasToolResults) return undefined;
     if (context.finishReason === 'error' || context.finishReason === 'abort') return undefined;
     nudged = true;
     return {

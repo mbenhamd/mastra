@@ -64,9 +64,11 @@ describe('Session empty-final-synthesis nudge', () => {
 
   const toolResult = { id: 'tc1', name: 'create_task', result: { ok: true } };
 
-  it('forces one continuation when the segment ran tools and ends with no text', async () => {
+  it('forces one continuation when tools completed and the final iteration has no text', async () => {
     const nudge = await capturedNudge();
-    expect(nudge({ text: '', toolResults: [toolResult], isFinal: false, finishReason: 'tool-calls' })).toBeUndefined();
+    expect(
+      nudge({ text: 'I will create it now.', toolResults: [toolResult], isFinal: false, finishReason: 'tool-calls' }),
+    ).toBeUndefined();
     expect(nudge({ text: '', toolResults: [], isFinal: true, finishReason: 'stop' })).toMatchObject({
       continue: true,
       feedback: expect.stringContaining('no reply'),
@@ -75,15 +77,30 @@ describe('Session empty-final-synthesis nudge', () => {
     expect(nudge({ text: '', toolResults: [], isFinal: true, finishReason: 'stop' })).toBeUndefined();
   });
 
-  it('stays silent when the turn already produced text or ran no tools', async () => {
+  it('stays silent when the final iteration produced text or the turn ran no tools', async () => {
     const spoke = await capturedNudge();
-    expect(
-      spoke({ text: 'Done.', toolResults: [toolResult], isFinal: false, finishReason: 'tool-calls' }),
-    ).toBeUndefined();
-    expect(spoke({ text: '', toolResults: [], isFinal: true, finishReason: 'stop' })).toBeUndefined();
+    expect(spoke({ text: '', toolResults: [toolResult], isFinal: false, finishReason: 'tool-calls' })).toBeUndefined();
+    expect(spoke({ text: 'Done.', toolResults: [], isFinal: true, finishReason: 'stop' })).toBeUndefined();
 
     const toolless = await capturedNudge();
     expect(toolless({ text: '', toolResults: [], isFinal: true, finishReason: 'stop' })).toBeUndefined();
+  });
+
+  it('keeps the one-shot synthesis available after more than ten ordinary tool generations', async () => {
+    const nudge = await capturedNudge();
+    for (let index = 0; index < 12; index += 1) {
+      expect(
+        nudge({
+          text: `Working on tool step ${index + 1}.`,
+          toolResults: [{ ...toolResult, id: `tc-${index}` }],
+          isFinal: false,
+          finishReason: 'tool-calls',
+        }),
+      ).toBeUndefined();
+    }
+    expect(nudge({ text: '', toolResults: [], isFinal: true, finishReason: 'stop' })).toMatchObject({
+      continue: true,
+    });
   });
 
   it('leaves error and abort finishes alone and is a fresh closure per turn', async () => {

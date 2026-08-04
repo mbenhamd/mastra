@@ -217,8 +217,7 @@ describeForAllEngines(
         onIterationComplete: async (context: IterationCompleteContext) => {
           iterations.push(context);
           const segmentHasToolResults = iterations.some(entry => entry.toolResults.length > 0);
-          const segmentHasText = iterations.some(entry => entry.text.trim() !== '');
-          if (context.isFinal && !nudged && segmentHasToolResults && !segmentHasText) {
+          if (context.isFinal && !nudged && segmentHasToolResults && context.text.trim() === '') {
             nudged = true;
             return { continue: true };
           }
@@ -246,6 +245,73 @@ describeForAllEngines(
       const textDeltas = chunks?.filter(c => c.type === 'text-delta') || [];
       const text = textDeltas.map((c: any) => c.payload?.text || '').join('');
       expect(text).toContain('Created the thing "probe".');
+    });
+
+    it('continues once after earlier tool-step text and does not replay the completed tool', async () => {
+      const iterations: IterationCompleteContext[] = [];
+      let nudged = false;
+      let toolExecutions = 0;
+      let segmentHasToolResults = false;
+
+      const updateThing = createTool({
+        id: 'update_thing',
+        description: 'Update a thing',
+        inputSchema: z.object({ name: z.string() }),
+        outputSchema: z.object({ ok: z.boolean() }),
+        execute: async () => {
+          toolExecutions += 1;
+          return { ok: true };
+        },
+      });
+
+      const { chunks, requests } = await runLoopScenario({
+        engine,
+        llm: getMock(),
+        prompt: 'Update the probe and report the outcome.',
+        tools: { update_thing: updateThing },
+        maxSteps: 20,
+        collectChunks: true,
+        onIterationComplete: async (context: IterationCompleteContext) => {
+          iterations.push(context);
+          if (context.toolResults.length > 0) segmentHasToolResults = true;
+          if (context.isFinal && !nudged && segmentHasToolResults && context.text.trim() === '') {
+            nudged = true;
+            return {
+              continue: true,
+              feedback: 'Reply with the outcome only. Do not call tools.',
+            };
+          }
+          return undefined;
+        },
+        fixtures: llm => {
+          llm.on(
+            { endpoint: 'chat', sequenceIndex: 0 },
+            {
+              content: 'I will update the probe now.',
+              toolCalls: [{ id: 'call_update_1', name: 'update_thing', arguments: { name: 'probe' } }],
+            },
+          );
+          llm.on({ endpoint: 'chat', sequenceIndex: 1 }, { content: '' });
+          llm.on({ endpoint: 'chat', sequenceIndex: 2 }, { content: 'Updated the probe.' });
+        },
+      });
+
+      expect(toolExecutions).toBe(1);
+      expect(requests).toHaveLength(3);
+      expect(nudged).toBe(true);
+      expect(iterations[0]).toMatchObject({
+        text: 'I will update the probe now.',
+        isFinal: false,
+      });
+      expect(iterations[1]).toMatchObject({
+        text: '',
+        isFinal: true,
+      });
+      const text = (chunks ?? [])
+        .filter(chunk => chunk.type === 'text-delta')
+        .map((chunk: any) => chunk.payload?.text ?? '')
+        .join('');
+      expect(text).toContain('Updated the probe.');
     });
   },
 );
