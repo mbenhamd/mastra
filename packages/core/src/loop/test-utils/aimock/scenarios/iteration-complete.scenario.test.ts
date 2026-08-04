@@ -298,6 +298,9 @@ describeForAllEngines(
 
       expect(toolExecutions).toBe(1);
       expect(requests).toHaveLength(3);
+      expect(JSON.stringify(requests[2]?.body?.messages ?? [])).toContain(
+        'Reply with the outcome only. Do not call tools.',
+      );
       expect(nudged).toBe(true);
       expect(iterations[0]).toMatchObject({
         text: 'I will update the probe now.',

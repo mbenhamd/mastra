@@ -2,4 +2,4 @@
 '@mastra/core': patch
 ---
 
-Fixed Harness synthesis after completed tools end on an empty terminal iteration.
+Fixed Harness returning no response after completing tool actions.
