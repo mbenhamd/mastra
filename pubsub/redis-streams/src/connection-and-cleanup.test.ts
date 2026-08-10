@@ -149,6 +149,30 @@ describe('RedisStreamsPubSub connection resilience and topic cleanup', () => {
       await expect(ps.clearTopic(`never-${randomUUID()}`)).resolves.toBeUndefined();
     }, 15_000);
 
+    it('exposes deletion failures to retryable durable cleanup while clearTopic remains best-effort', async () => {
+      const port = await getFreePort();
+      const ps = createPubSub({
+        url: `redis://127.0.0.1:${port}`,
+        redisOptions: {
+          socket: {
+            connectTimeout: 100,
+            reconnectStrategy: false,
+          },
+        },
+      });
+
+      await expect(ps.clearTopicOrThrow('strict-cleanup')).rejects.toBeDefined();
+      await expect(ps.clearTopic('best-effort-cleanup')).resolves.toBeUndefined();
+    }, 15_000);
+
+    it('rejects strict cleanup after close while best-effort cleanup remains non-throwing', async () => {
+      const ps = createPubSub();
+      await ps.close();
+
+      await expect(ps.clearTopicOrThrow('closed-strict-cleanup')).rejects.toThrow(/after close/);
+      await expect(ps.clearTopic('closed-best-effort-cleanup')).resolves.toBeUndefined();
+    });
+
     it('lets a still-attached subscriber recover after the stream is deleted', async () => {
       const ps = createPubSub();
       const topic = `clear-live-${randomUUID()}`;

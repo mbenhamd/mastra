@@ -6,7 +6,13 @@ type ApprovalEvent = Parameters<typeof autoApprovePolicy.onToolApproval>[0];
 type SuspensionEvent = Parameters<typeof autoApprovePolicy.onSuspension>[0];
 
 function approval(overrides: Partial<ApprovalEvent> = {}): ApprovalEvent {
-  return { type: 'tool_approval_required', toolCallId: 'call-1', toolName: 'shell', ...overrides } as ApprovalEvent;
+  return {
+    type: 'tool_approval_required',
+    runId: 'run-1',
+    toolCallId: 'call-1',
+    toolName: 'shell',
+    ...overrides,
+  } as ApprovalEvent;
 }
 
 function suspension(overrides: Partial<SuspensionEvent> = {}): SuspensionEvent {

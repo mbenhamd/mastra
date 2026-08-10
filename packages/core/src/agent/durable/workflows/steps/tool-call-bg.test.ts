@@ -20,6 +20,8 @@ vi.mock('../../../../background-tasks/resolve-config', () => ({
 vi.mock('../../utils/resolve-runtime', () => ({
   resolveTool: vi.fn(),
   toolApprovalRequirement: vi.fn().mockResolvedValue({ required: false, reasons: [] }),
+  toolRequiresApproval: vi.fn().mockResolvedValue(false),
+  rebuildRunToolsFromMastra: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock('../../stream-adapter', () => ({
@@ -127,7 +129,26 @@ describe('durable tool-call background task dispatch', () => {
   it('fails closed when a built-in durable run loses its runtime registry entry', async () => {
     const pubsub = mockPubsub();
 
-    await expect(executeStep(pubsub, makeInitData({ runtimeResolution: 'registry-required' }))).rejects.toMatchObject({
+    const initData = makeInitData({ runtimeResolution: 'registry-required' });
+    await expect(executeStep(pubsub, initData)).rejects.toMatchObject({
+      id: 'DURABLE_AGENT_RUNTIME_REGISTRY_MISSING',
+    });
+    expect(globalRunRegistry.has(RUN_ID)).toBe(false);
+
+    // A retry must fail identically rather than inheriting a placeholder seeded
+    // by abort-listener bootstrap and degrading to ToolNotFoundError.
+    await expect(executeStep(pubsub, initData)).rejects.toMatchObject({
+      id: 'DURABLE_AGENT_RUNTIME_REGISTRY_MISSING',
+    });
+    expect(globalRunRegistry.has(RUN_ID)).toBe(false);
+
+    globalRunRegistry.set(RUN_ID, {
+      isPlaceholder: true,
+      runtimeBindingId: RUNTIME_BINDING_ID,
+      tools: {},
+      model: undefined as any,
+    } as any);
+    await expect(executeStep(pubsub, initData)).rejects.toMatchObject({
       id: 'DURABLE_AGENT_RUNTIME_REGISTRY_MISSING',
     });
     expect(_resolveTool).not.toHaveBeenCalled();

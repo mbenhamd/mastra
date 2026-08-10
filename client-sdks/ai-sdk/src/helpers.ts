@@ -45,6 +45,14 @@ export type OutputChunkType<OUTPUT = undefined> =
   | DataChunkType
   | undefined;
 
+type AISDKToolOutputDenied = {
+  type: 'tool-output-denied';
+  toolCallId: string;
+  toolName: string;
+  providerExecuted?: boolean;
+  dynamic?: boolean;
+};
+
 export type ToolAgentChunkType = { type: 'tool-agent'; toolCallId: string; payload: any };
 export type ToolWorkflowChunkType = { type: 'tool-workflow'; toolCallId: string; payload: any };
 export type ToolNetworkChunkType = { type: 'tool-network'; toolCallId: string; payload: any };
@@ -528,7 +536,15 @@ export function convertMastraChunkToAISDKv6<OUTPUT = undefined>({
 }: {
   chunk: ChunkType<OUTPUT>;
   mode?: 'generate' | 'stream';
-}): OutputChunkType<OUTPUT> | OutputChunkType<OUTPUT>[] {
+}): OutputChunkType<OUTPUT> | AISDKToolOutputDenied | OutputChunkType<OUTPUT>[] {
+  if (chunk.type === 'tool-output-denied') {
+    return {
+      type: 'tool-output-denied',
+      toolCallId: chunk.payload.toolCallId,
+      toolName: chunk.payload.toolName,
+    };
+  }
+
   if (chunk.type === 'tool-call-approval') {
     const dataChunk = convertMastraChunkToAISDKBase<OUTPUT>({
       chunk,
@@ -574,6 +590,7 @@ export function convertFullStreamChunkToUIMessageStream<UI_MESSAGE extends UIMes
   // tool-output is a custom mastra chunk type used in ToolStream
   part:
     | TextStreamPart<ToolSet>
+    | AISDKToolOutputDenied
     | DataChunkType
     | ToolApprovalRequest
     | { type: 'tool-output'; toolCallId: string; output: any };
@@ -741,6 +758,13 @@ export function convertFullStreamChunkToUIMessageStream<UI_MESSAGE extends UIMes
       };
     }
 
+    case 'tool-output-denied': {
+      return {
+        type: 'tool-output-denied',
+        toolCallId: part.toolCallId,
+      };
+    }
+
     case 'tool-output': {
       if (part.output.from === 'AGENT') {
         return {
@@ -817,6 +841,8 @@ export function convertFullStreamChunkToUIMessageStream<UI_MESSAGE extends UIMes
       if (sendFinish) {
         return {
           type: 'finish' as const,
+          // Matches the AI SDK UI converter, which keeps the finish reason on the terminal chunk.
+          ...(part.finishReason != null ? { finishReason: part.finishReason } : {}),
           ...(messageMetadataValue != null ? { messageMetadata: messageMetadataValue } : {}),
         } as InferUIMessageChunk<UI_MESSAGE>;
       }

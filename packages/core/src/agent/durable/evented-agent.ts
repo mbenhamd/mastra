@@ -16,7 +16,7 @@ import type { ToolsInput } from '../types';
 
 import { DurableAgent } from './durable-agent';
 import type { DurableAgentConfig } from './durable-agent';
-import { pinGlobalRunRegistryEntry, unpinGlobalRunRegistryEntry } from './run-registry';
+import { getGlobalRunRegistryEntry, pinGlobalRunRegistryEntry, unpinGlobalRunRegistryEntry } from './run-registry';
 import type { DurableAgenticWorkflowInput } from './types';
 
 /**
@@ -103,7 +103,7 @@ export class EventedAgent<
       if (execution) {
         await execution
           .catch(async error => {
-            unpinGlobalRunRegistryEntry(runId);
+            unpinGlobalRunRegistryEntry(runId, workflowInput.runtimeBindingId);
             await this.emitError(runId, error instanceof Error ? error : new Error(String(error)));
           })
           .catch(error => {
@@ -111,16 +111,23 @@ export class EventedAgent<
           });
       }
     } catch (error) {
-      unpinGlobalRunRegistryEntry(runId);
+      unpinGlobalRunRegistryEntry(runId, workflowInput.runtimeBindingId);
       await this.emitError(runId, error instanceof Error ? error : new Error(String(error)));
     }
   }
 
   protected override async onDurableWorkflowFinish(result: WorkflowFinishCallbackResult): Promise<void> {
+    // Capture the exact pin identity before terminal cleanup can remove the
+    // registry entry. Older/custom workflow callbacks may omit getInitData().
+    let runtimeBindingId = getGlobalRunRegistryEntry(result.runId)?.runtimeBindingId;
+    if (typeof result.getInitData === 'function') {
+      runtimeBindingId =
+        (result.getInitData() as DurableAgenticWorkflowInput | undefined)?.runtimeBindingId ?? runtimeBindingId;
+    }
     try {
       await super.onDurableWorkflowFinish(result);
     } finally {
-      unpinGlobalRunRegistryEntry(result.runId);
+      unpinGlobalRunRegistryEntry(result.runId, runtimeBindingId);
     }
   }
 }

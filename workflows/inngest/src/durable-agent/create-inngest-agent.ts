@@ -41,8 +41,11 @@ import {
   prepareForDurableExecution,
   createDurableAgentStream,
   emitErrorEvent,
+  publishAbortRequest,
   runDurableStreamUntilIdle,
   runResumeDurableStreamUntilIdle,
+  deleteBoundRunRegistryEntry as deleteCoreBoundRunRegistryEntry,
+  getBoundRunRegistryEntry,
   globalRunRegistry,
   TOOL_PERMISSION_POLICY_KEY,
   TOOL_PERMISSION_POLICY_REQUIRED_KEY,
@@ -83,6 +86,49 @@ import {
  *
  * Modelled on `CLOSE_ON_SUSPEND` in core `DurableAgent`.
  */
+function registerGlobalRunRegistryEntry(runId: string, entry: RunRegistryEntry): void {
+  let occupied = false;
+  try {
+    occupied = getBoundRunRegistryEntry(runId, undefined) !== undefined;
+  } catch {
+    occupied = true;
+  }
+  if (occupied) {
+    throw new Error(`Durable run ${runId} is already active. Refusing to replace its runtime dependencies.`);
+  }
+  globalRunRegistry.set(runId, entry);
+}
+
+function deleteBoundRunRegistryEntry(
+  runId: string,
+  runtimeBindingId: string,
+  expectedAbortController: AbortController,
+): boolean {
+  let entry: RunRegistryEntry | undefined;
+  try {
+    entry = getBoundRunRegistryEntry(runId, runtimeBindingId);
+  } catch {
+    return false;
+  }
+  if (!entry || entry.abortController !== expectedAbortController) return false;
+  return deleteCoreBoundRunRegistryEntry(runId, runtimeBindingId);
+}
+
+const pendingInngestResumeKeys = new Set<string>();
+
+function reserveInngestResume(key: string): () => void {
+  if (pendingInngestResumeKeys.has(key)) {
+    throw new Error(`Inngest durable-agent resume is already pending for ${key}`);
+  }
+  pendingInngestResumeKeys.add(key);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    pendingInngestResumeKeys.delete(key);
+  };
+}
+
 const CLOSE_ON_SUSPEND = Symbol('mastra.durable.inngest.closeOnSuspend');
 
 /**
@@ -284,8 +330,13 @@ export interface InngestAgentStreamResult<OUTPUT = undefined> {
    * durable LLM step short-circuits (when the step worker shares the same
    * process) and emits an ABORT event over pubsub so the consumer stream
    * closes. Safe to call after the run has already finished.
+   *
+   * Also publishes an abort request over pubsub, which is what stops work
+   * already running on a step worker — a different process from this one.
+   * Await the returned promise to confirm the request was dispatched; it
+   * rejects when binding or transport state cannot provide that guarantee.
    */
-  abort: (reason?: unknown) => void;
+  abort: (reason?: unknown) => Promise<void>;
 }
 
 /**
@@ -774,6 +825,82 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
     await emitErrorEvent(getPubsub(), runId, error);
   }
 
+  async function resolveRuntimeBindingId(runId: string): Promise<string | undefined> {
+    const localBinding = globalRunRegistry.get(runId)?.runtimeBindingId;
+
+    try {
+      const workflowsStore = await mastra?.getStorage()?.getStore('workflows');
+      const snapshot = await workflowsStore?.loadWorkflowSnapshot({
+        workflowName: workflowIds.AGENTIC_LOOP,
+        runId,
+      });
+      const persistedBinding = snapshot?.context?.input?.runtimeBindingId;
+      if (typeof persistedBinding === 'string' && persistedBinding.length > 0) return persistedBinding;
+    } catch (error) {
+      mastra?.getLogger?.()?.warn?.('Failed to resolve durable run binding for abort request', {
+        agentId,
+        runId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    return localBinding;
+  }
+
+  async function resolveSuspendedRuntimeBindingId(runId: string): Promise<string> {
+    const workflowsStore = await mastra?.getStorage()?.getStore('workflows');
+    if (!workflowsStore) {
+      throw new TypeError('Cannot resume Inngest durable-agent run: workflow storage is unavailable');
+    }
+    const snapshot = await workflowsStore.loadWorkflowSnapshot({
+      workflowName: workflowIds.AGENTIC_LOOP,
+      runId,
+    });
+    if (!snapshot || snapshot.status !== 'suspended') {
+      throw new TypeError(`Cannot resume Inngest durable-agent run ${runId}: suspended snapshot not found`);
+    }
+    const runtimeBindingId = snapshot.context?.input?.runtimeBindingId;
+    if (typeof runtimeBindingId !== 'string' || runtimeBindingId.length === 0) {
+      throw new TypeError(`Cannot resume Inngest durable-agent run ${runId}: runtime binding is unavailable`);
+    }
+    return runtimeBindingId;
+  }
+
+  /**
+   * Stop a run in whichever worker is executing it.
+   *
+   * An Inngest agent's steps run on Inngest's infrastructure, essentially never
+   * in the process that called `stream()`. The local `AbortController` is
+   * therefore invisible to the step worker, and on its own `abort()` cannot
+   * stop anything. Publishing an abort request lets the worker flip its own
+   * controller and unwind the run gracefully, emitting the terminal stream
+   * event consumers wait on — which a hard workflow cancel would skip.
+   *
+   * Public abort handles surface dispatch failures so callers can retry. The
+   * external AbortSignal bridge explicitly contains those rejections after the
+   * warning is recorded because event listeners cannot return an awaitable
+   * delivery result.
+   */
+  async function requestRemoteAbort(runId: string, runtimeBindingId: string | undefined): Promise<void> {
+    if (!runtimeBindingId) {
+      const error = new Error(`Cannot publish Inngest durable agent abort for ${runId} without a runtime binding`);
+      mastra?.getLogger?.()?.warn?.(error.message, {
+        agentId,
+        runId,
+      });
+      throw error;
+    }
+    try {
+      await publishAbortRequest(getPubsub(), runId, runtimeBindingId);
+    } catch (error) {
+      mastra?.getLogger?.()?.warn?.('Failed to publish Inngest durable agent abort request', {
+        agentId,
+        runId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
+  }
+
   // Return the InngestAgent object (Agent methods are added by the Proxy below)
   const inngestAgent: Pick<
     InngestAgent<TOutput>,
@@ -839,11 +966,16 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
       });
 
       const { runId, messageId, workflowInput, registryEntry, threadId, resourceId } = preparation;
+      const runtimeBindingId = registryEntry.runtimeBindingId;
+      if (!runtimeBindingId) {
+        throw new TypeError(`Cannot start Inngest durable-agent run ${runId}: runtime binding is missing`);
+      }
 
       // Override agentId and agentName in workflowInput with the durable agent's values
       workflowInput.agentId = agentId;
       workflowInput.agentName = agentName;
       requireWorkerPermissionResolver(workflowInput);
+      const streamPubsub = getPubsub();
 
       // 1a. Install abort controller for this run. The controller is owned by
       // this InngestAgent instance; `result.abort()` flips it, the durable
@@ -853,175 +985,201 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
       // caller supplied an external signal, forward it onto the internal
       // controller so either source can cancel the run.
       const abortController = new AbortController();
-      if (streamOptions?.abortSignal) {
-        const external = streamOptions.abortSignal;
-        if (external.aborted) {
-          abortController.abort((external as AbortSignal & { reason?: unknown }).reason);
-        } else {
-          external.addEventListener(
-            'abort',
-            () => abortController.abort((external as AbortSignal & { reason?: unknown }).reason),
-            { once: true },
-          );
-        }
-      }
       registryEntry.abortController = abortController;
       registryEntry.abortSignal = abortController.signal;
 
       // 1b. Register non-serializable state on the global run registry so
-      // workflow steps running in the same process can recover it.
-      globalRunRegistry.set(runId, registryEntry);
+      // workflow steps running in the same process can recover it. Admission
+      // happens before external listener attachment so a duplicate run cannot
+      // leak a listener or publish a tombstone for an execution that never won.
+      registerGlobalRunRegistryEntry(runId, registryEntry);
+      let detachExternalAbort = () => {};
+      if (streamOptions?.abortSignal) {
+        const external = streamOptions.abortSignal;
+        const forwardExternalAbort = () => {
+          abortController.abort((external as AbortSignal & { reason?: unknown }).reason);
+          void requestRemoteAbort(runId, runtimeBindingId).catch(() => {});
+        };
+        if (external.aborted) {
+          forwardExternalAbort();
+        } else {
+          external.addEventListener('abort', forwardExternalAbort, { once: true });
+          detachExternalAbort = () => external.removeEventListener('abort', forwardExternalAbort);
+        }
+      }
 
-      // 2. Create AGENT_RUN span BEFORE the workflow starts
-      // This ensures the agent_run is the root of the trace, not the workflow
-      const observability = mastra?.observability?.getSelectedInstance({
-        requestContext: streamOptions?.requestContext,
-      });
-      const agentSpan = observability?.startSpan({
-        type: SpanType.AGENT_RUN,
-        name: `agent run: '${agentId}'`,
-        entityType: EntityType.AGENT,
-        entityId: agentId,
-        entityName: agentName,
-        input: workflowInput.messageListState,
-        metadata: {
+      let initialStreamCleanup: (() => void) | undefined;
+      try {
+        // 2. Create AGENT_RUN span BEFORE the workflow starts
+        // This ensures the agent_run is the root of the trace, not the workflow
+        const observability = mastra?.observability?.getSelectedInstance({
+          requestContext: streamOptions?.requestContext,
+        });
+        const agentSpan = observability?.startSpan({
+          type: SpanType.AGENT_RUN,
+          name: `agent run: '${agentId}'`,
+          entityType: EntityType.AGENT,
+          entityId: agentId,
+          entityName: agentName,
+          input: workflowInput.messageListState,
+          metadata: {
+            runId,
+            threadId,
+            resourceId,
+          },
+        });
+        // Export span data so it can be passed to the workflow
+        const agentSpanData = agentSpan?.exportSpan();
+
+        // 3. Create MODEL_GENERATION span BEFORE the workflow starts
+        // This ensures ONE model_generation span contains all steps (like regular agents)
+        const modelSpan = agentSpan?.createChildSpan({
+          type: SpanType.MODEL_GENERATION,
+          name: `llm: '${workflowInput.modelConfig.modelId}'`,
+          input: { messages: workflowInput.messageListState },
+          attributes: {
+            model: workflowInput.modelConfig.modelId,
+            provider: workflowInput.modelConfig.provider,
+            streaming: true,
+            parameters: {
+              temperature: workflowInput.options?.modelSettings?.temperature,
+            },
+          },
+        });
+        const modelSpanData = modelSpan?.exportSpan();
+
+        // Add span data to workflow input
+        workflowInput.agentSpanData = agentSpanData;
+        workflowInput.modelSpanData = modelSpanData;
+        workflowInput.stepIndex = 0;
+
+        // Track cleanup state and global registry entry lifecycle.
+        let cleanedUp = false;
+        const finalizeGlobalRegistry = () => {
+          if (cleanedUp) return;
+          cleanedUp = true;
+          detachExternalAbort();
+          deleteBoundRunRegistryEntry(runId, runtimeBindingId, abortController);
+        };
+
+        // 2. Create the durable agent stream (subscribes to pubsub)
+        const {
+          output,
+          cleanup: streamCleanup,
+          ready,
+        } = createDurableAgentStream<TOutput>({
+          pubsub: streamPubsub,
+          runId,
+          messageId,
+          model: {
+            modelId: workflowInput.modelConfig.modelId,
+            provider: workflowInput.modelConfig.provider,
+            version: 'v3',
+          },
+          threadId,
+          resourceId,
+          onChunk: streamOptions?.onChunk,
+          onStepFinish: streamOptions?.onStepFinish,
+          onFinish: async result => {
+            try {
+              await streamOptions?.onFinish?.(result);
+            } finally {
+              finalizeGlobalRegistry();
+            }
+          },
+          onError: async errorArg => {
+            try {
+              await streamOptions?.onError?.(errorArg);
+            } finally {
+              finalizeGlobalRegistry();
+            }
+          },
+          onSuspended: streamOptions?.onSuspended,
+          onAbort: async data => {
+            try {
+              await (streamOptions?.onAbort as ((event: any) => void | Promise<void>) | undefined)?.(data);
+            } finally {
+              finalizeGlobalRegistry();
+            }
+          },
+          onIterationComplete: streamOptions?.onIterationComplete
+            ? async data => {
+                await (streamOptions.onIterationComplete as (ctx: any) => void | Promise<void>)?.(data);
+              }
+            : undefined,
+          closeOnSuspend: (streamOptions as any)?.[CLOSE_ON_SUSPEND] === true,
+        });
+
+        initialStreamCleanup = streamCleanup;
+
+        // 3. Wait for subscription to be established, then trigger workflow
+        // Pass tracing options so workflow spans are children of the agent span
+        const tracingOptions = agentSpanData
+          ? { traceId: agentSpanData.traceId, parentSpanId: agentSpanData.id }
+          : undefined;
+
+        // Wait for subscription to be ready before triggering workflow
+        // This prevents race conditions where events are published before subscription.
+        // Track the trigger promise on the registry so generate() can await suspend
+        // snapshot persistence before returning.
+        const workflowExecution = ready.then(
+          async () => {
+            try {
+              await triggerWorkflow(runId, workflowInput, tracingOptions, resourceId);
+            } catch (error) {
+              // Dispatch acknowledgement can be ambiguous, so preserve the
+              // binding and any abort tombstone for a possibly queued worker.
+              await emitError(runId, error instanceof Error ? error : new Error(String(error))).catch(() => {});
+            }
+          },
+          async error => {
+            // Subscription setup failed before dispatch was attempted. This is
+            // definite non-admission, so release the registry/listener state.
+            finalizeGlobalRegistry();
+            await emitError(runId, error instanceof Error ? error : new Error(String(error))).catch(() => {});
+          },
+        );
+        const trackedEntry = getBoundRunRegistryEntry(runId, runtimeBindingId);
+        if (trackedEntry) {
+          trackedEntry.workflowExecution = workflowExecution;
+        }
+
+        // 4. Return stream result - attach extra properties to output for compatibility
+        // This allows both destructuring { output, runId, cleanup } AND direct access to fullStream
+        const cleanup = () => {
+          streamCleanup();
+          finalizeGlobalRegistry();
+        };
+        const abort = async (reason?: unknown) => {
+          if (!abortController.signal.aborted) {
+            abortController.abort(reason);
+          }
+          // The step worker is a different process — see `requestRemoteAbort`.
+          await requestRemoteAbort(runId, runtimeBindingId);
+        };
+        const result = {
+          output,
           runId,
           threadId,
           resourceId,
-        },
-      });
-      // Export span data so it can be passed to the workflow
-      const agentSpanData = agentSpan?.exportSpan();
-
-      // 3. Create MODEL_GENERATION span BEFORE the workflow starts
-      // This ensures ONE model_generation span contains all steps (like regular agents)
-      const modelSpan = agentSpan?.createChildSpan({
-        type: SpanType.MODEL_GENERATION,
-        name: `llm: '${workflowInput.modelConfig.modelId}'`,
-        input: { messages: workflowInput.messageListState },
-        attributes: {
-          model: workflowInput.modelConfig.modelId,
-          provider: workflowInput.modelConfig.provider,
-          streaming: true,
-          parameters: {
-            temperature: workflowInput.options?.modelSettings?.temperature,
+          cleanup,
+          abort,
+          // Also expose fullStream directly for server compatibility
+          get fullStream() {
+            return output.fullStream;
           },
-        },
-      });
-      const modelSpanData = modelSpan?.exportSpan();
+          // Internal: stream-only cleanup for generate()/resumeGenerate() to
+          // release the subscription on suspend without dropping the registry.
+          [STREAM_CLEANUP]: streamCleanup,
+        };
 
-      // Add span data to workflow input
-      workflowInput.agentSpanData = agentSpanData;
-      workflowInput.modelSpanData = modelSpanData;
-      workflowInput.stepIndex = 0;
-
-      // Track cleanup state and global registry entry lifecycle.
-      let cleanedUp = false;
-      const finalizeGlobalRegistry = () => {
-        if (cleanedUp) return;
-        cleanedUp = true;
-        globalRunRegistry.delete(runId);
-      };
-
-      // 2. Create the durable agent stream (subscribes to pubsub)
-      const {
-        output,
-        cleanup: streamCleanup,
-        ready,
-      } = createDurableAgentStream<TOutput>({
-        pubsub: getPubsub(),
-        runId,
-        messageId,
-        model: {
-          modelId: workflowInput.modelConfig.modelId,
-          provider: workflowInput.modelConfig.provider,
-          version: 'v3',
-        },
-        threadId,
-        resourceId,
-        onChunk: streamOptions?.onChunk,
-        onStepFinish: streamOptions?.onStepFinish,
-        onFinish: async result => {
-          try {
-            await streamOptions?.onFinish?.(result);
-          } finally {
-            finalizeGlobalRegistry();
-          }
-        },
-        onError: async errorArg => {
-          try {
-            await streamOptions?.onError?.(errorArg);
-          } finally {
-            finalizeGlobalRegistry();
-          }
-        },
-        onSuspended: streamOptions?.onSuspended,
-        onAbort: async data => {
-          try {
-            await (streamOptions?.onAbort as ((event: any) => void | Promise<void>) | undefined)?.(data);
-          } finally {
-            finalizeGlobalRegistry();
-          }
-        },
-        onIterationComplete: streamOptions?.onIterationComplete
-          ? async data => {
-              await (streamOptions.onIterationComplete as (ctx: any) => void | Promise<void>)?.(data);
-            }
-          : undefined,
-        closeOnSuspend: (streamOptions as any)?.[CLOSE_ON_SUSPEND] === true,
-      });
-
-      // 3. Wait for subscription to be established, then trigger workflow
-      // Pass tracing options so workflow spans are children of the agent span
-      const tracingOptions = agentSpanData
-        ? { traceId: agentSpanData.traceId, parentSpanId: agentSpanData.id }
-        : undefined;
-
-      // Wait for subscription to be ready before triggering workflow
-      // This prevents race conditions where events are published before subscription.
-      // Track the trigger promise on the registry so generate() can await suspend
-      // snapshot persistence before returning.
-      const workflowExecution = ready
-        .then(() => triggerWorkflow(runId, workflowInput, tracingOptions, resourceId))
-        .catch(async error => {
-          // The trigger failure is already contained by this workflow promise.
-          // Contain a secondary realtime outage as well so best-effort terminal
-          // notification cannot become an unhandled rejection.
-          await emitError(runId, error).catch(() => {});
-        });
-      const trackedEntry = globalRunRegistry.get(runId);
-      if (trackedEntry) {
-        trackedEntry.workflowExecution = workflowExecution;
+        return result as InngestAgentStreamResult<TOutput>;
+      } catch (error) {
+        initialStreamCleanup?.();
+        detachExternalAbort();
+        deleteBoundRunRegistryEntry(runId, runtimeBindingId, abortController);
+        throw error;
       }
-
-      // 4. Return stream result - attach extra properties to output for compatibility
-      // This allows both destructuring { output, runId, cleanup } AND direct access to fullStream
-      const cleanup = () => {
-        streamCleanup();
-        finalizeGlobalRegistry();
-      };
-      const abort = (reason?: unknown) => {
-        if (!abortController.signal.aborted) {
-          abortController.abort(reason);
-        }
-      };
-      const result = {
-        output,
-        runId,
-        threadId,
-        resourceId,
-        cleanup,
-        abort,
-        // Also expose fullStream directly for server compatibility
-        get fullStream() {
-          return output.fullStream;
-        },
-        // Internal: stream-only cleanup for generate()/resumeGenerate() to
-        // release the subscription on suspend without dropping the registry.
-        [STREAM_CLEANUP]: streamCleanup,
-      };
-
-      return result as InngestAgentStreamResult<TOutput>;
     },
 
     async resume(runId, resumeData, resumeOptions): Promise<InngestAgentStreamResult<TOutput>> {
@@ -1044,165 +1202,240 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
         ) as Promise<InngestAgentStreamResult<TOutput>>;
       }
 
-      // Install a fresh abort controller scoped to the resumed segment and
-      // attach it to the run-registry entry so the durable LLM step (when
-      // co-located) can react. The previous run's controller is no longer
-      // relevant.
-      const abortController = new AbortController();
-      if (resumeOptions?.abortSignal) {
-        const external = resumeOptions.abortSignal;
-        if (external.aborted) {
-          abortController.abort((external as AbortSignal & { reason?: unknown }).reason);
-        } else {
-          external.addEventListener(
-            'abort',
-            () => abortController.abort((external as AbortSignal & { reason?: unknown }).reason),
-            { once: true },
-          );
+      const releaseResumeReservation = reserveInngestResume(`${workflowIds.AGENTIC_LOOP}:${runId}`);
+      let resumeRegistryEntry: RunRegistryEntry | undefined;
+      let resumeAbortController: AbortController | undefined;
+      let resumeCreatedRegistryEntry = false;
+      let previousRuntimeBindingId: string | undefined;
+      let previousAbortController: AbortController | undefined;
+      let previousAbortSignal: AbortSignal | undefined;
+      let previousWorkflowExecution: RunRegistryEntry['workflowExecution'];
+      let detachResumeExternalAbort = () => {};
+      let resumeSetupRolledBack = false;
+      let resumeSubscriptionReady = false;
+      let resumeCancelledBeforeReady = false;
+      const rollbackResumeSetup = () => {
+        if (resumeSetupRolledBack) return;
+        resumeSetupRolledBack = true;
+        detachResumeExternalAbort();
+        if (
+          resumeRegistryEntry &&
+          resumeAbortController &&
+          globalRunRegistry.get(runId) === resumeRegistryEntry &&
+          resumeRegistryEntry.abortController === resumeAbortController
+        ) {
+          if (resumeCreatedRegistryEntry) {
+            globalRunRegistry.delete(runId);
+          } else {
+            if (previousRuntimeBindingId === undefined) {
+              delete (resumeRegistryEntry as Partial<RunRegistryEntry>).runtimeBindingId;
+            } else {
+              resumeRegistryEntry.runtimeBindingId = previousRuntimeBindingId;
+            }
+            resumeRegistryEntry.abortController = previousAbortController;
+            resumeRegistryEntry.abortSignal = previousAbortSignal;
+            resumeRegistryEntry.workflowExecution = previousWorkflowExecution;
+          }
         }
-      }
-      // Ensure a registry entry exists for this resumed segment. On Inngest,
-      // a resume frequently runs in a fresh process where no prior stream()
-      // entry is in memory — without this, the abort controller would be
-      // silently dropped and the durable LLM step (when co-located) would
-      // have nothing to react to.
-      let existingEntry = globalRunRegistry.get(runId);
-      if (!existingEntry) {
-        existingEntry = {
-          // Minimal placeholder fields. The durable LLM step recreates tools
-          // and model from the workflow input; this slot exists primarily to
-          // carry the abort controller across the resumed segment. The
-          // explicit flag tells resolveRuntimeDependencies to rebuild runtime
-          // state from the Mastra instance instead of trusting this entry.
-          // Placeholders are exempt from runtime-binding checks (see
-          // getBoundRunRegistryEntry), so no runtimeBindingId is stamped here.
-          isPlaceholder: true,
-          tools: {},
-          model: undefined as any,
-        } as RunRegistryEntry;
-        globalRunRegistry.set(runId, existingEntry);
-      }
-      existingEntry.abortController = abortController;
-      existingEntry.abortSignal = abortController.signal;
-
-      // Track cleanup state for the resumed segment so terminal events
-      // (finish/error/abort/cleanup) always tear down the registry entry.
-      let resumeCleanedUp = false;
-      const finalizeResumeRegistry = () => {
-        if (resumeCleanedUp) return;
-        resumeCleanedUp = true;
-        globalRunRegistry.delete(runId);
       };
+      try {
+        const runtimeBindingId = await resolveSuspendedRuntimeBindingId(runId);
+        const resumePubsub = getPubsub();
 
-      // Re-subscribe to the stream
-      const {
-        output,
-        cleanup: streamCleanup,
-        ready,
-      } = createDurableAgentStream<TOutput>({
-        pubsub: getPubsub(),
-        runId,
-        messageId: crypto.randomUUID(),
-        model: {
-          modelId: undefined,
-          provider: undefined,
-          version: 'v3',
-        },
-        threadId: resumeOptions?.threadId,
-        resourceId: resumeOptions?.resourceId,
-        onChunk: resumeOptions?.onChunk,
-        onStepFinish: resumeOptions?.onStepFinish,
-        onFinish: async result => {
-          try {
-            await resumeOptions?.onFinish?.(result);
-          } finally {
-            finalizeResumeRegistry();
+        // Install a fresh abort controller scoped to the resumed segment and
+        // attach it to the run-registry entry so the durable LLM step (when
+        // co-located) can react. The previous run's controller is no longer
+        // relevant.
+        const abortController = new AbortController();
+        resumeAbortController = abortController;
+        if (resumeOptions?.abortSignal) {
+          const external = resumeOptions.abortSignal;
+          const forwardExternalAbort = () => {
+            abortController.abort((external as AbortSignal & { reason?: unknown }).reason);
+            void requestRemoteAbort(runId, runtimeBindingId).catch(() => {});
+          };
+          if (external.aborted) {
+            forwardExternalAbort();
+          } else {
+            external.addEventListener('abort', forwardExternalAbort, { once: true });
+            detachResumeExternalAbort = () => external.removeEventListener('abort', forwardExternalAbort);
           }
-        },
-        onError: async errorArg => {
-          try {
-            await resumeOptions?.onError?.(errorArg);
-          } finally {
-            finalizeResumeRegistry();
-          }
-        },
-        onSuspended: resumeOptions?.onSuspended,
-        onAbort: async data => {
-          try {
-            await (resumeOptions?.onAbort as ((event: any) => void | Promise<void>) | undefined)?.(data);
-          } finally {
-            finalizeResumeRegistry();
-          }
-        },
-        closeOnSuspend: (resumeOptions as any)?.[CLOSE_ON_SUSPEND] === true,
-      });
+        }
+        // Ensure a registry entry exists for this resumed segment. On Inngest,
+        // a resume frequently runs in a fresh process where no prior stream()
+        // entry is in memory — without this, the abort controller would be
+        // silently dropped and the durable LLM step (when co-located) would
+        // have nothing to react to.
+        let existingEntry = getBoundRunRegistryEntry(runId, runtimeBindingId);
+        if (!existingEntry) {
+          resumeCreatedRegistryEntry = true;
+          existingEntry = {
+            // Minimal placeholder fields. The durable LLM step recreates tools
+            // and model from the workflow input; this slot exists primarily to
+            // carry the abort controller across the resumed segment. The
+            // explicit flag tells resolveRuntimeDependencies to rebuild runtime
+            // state from the Mastra instance instead of trusting this entry.
+            isPlaceholder: true,
+            runtimeBindingId,
+            tools: {},
+            model: undefined as any,
+          } as RunRegistryEntry;
+          registerGlobalRunRegistryEntry(runId, existingEntry);
+        } else {
+          previousRuntimeBindingId = existingEntry.runtimeBindingId;
+          previousAbortController = existingEntry.abortController;
+          previousAbortSignal = existingEntry.abortSignal;
+          previousWorkflowExecution = existingEntry.workflowExecution;
+          if (existingEntry.runtimeBindingId === undefined) existingEntry.runtimeBindingId = runtimeBindingId;
+        }
+        resumeRegistryEntry = existingEntry;
+        existingEntry.abortController = abortController;
+        existingEntry.abortSignal = abortController.signal;
 
-      const workflowExecution = ready
-        .then(async () => {
-          const admittedWorkflow = getAdmittedWorkflow();
-          const workflowsStore = await mastra!.getStorage()!.getStore('workflows');
-          if (!workflowsStore) {
-            throw new TypeError('Cannot resume Inngest durable-agent run: workflow storage is unavailable');
-          }
-          const snapshot = await workflowsStore.loadWorkflowSnapshot({
-            workflowName: workflowIds.AGENTIC_LOOP,
-            runId,
-          });
-          if (!snapshot) {
-            throw new TypeError(`Cannot resume Inngest durable-agent run ${runId}: snapshot not found`);
-          }
+        // Track cleanup state for the resumed segment so terminal events
+        // (finish/error/abort/cleanup) always tear down the registry entry.
+        let resumeCleanedUp = false;
+        const finalizeResumeRegistry = () => {
+          if (resumeCleanedUp) return;
+          resumeCleanedUp = true;
+          detachResumeExternalAbort();
+          deleteBoundRunRegistryEntry(runId, runtimeBindingId, abortController);
+        };
 
-          // Find the suspended step from the snapshot
-          const steps = Object.keys(snapshot.suspendedPaths ?? {});
-          const run = (await admittedWorkflow.createRun({
-            runId,
-            resourceId: resumeOptions?.resourceId,
-          })) as InngestRun;
-          await run.resumeAsync({
-            resumeData,
-            step: steps,
-            requestContext: prepareResumeRequestContext(
-              resumeOptions?.requestContext,
-              resumeOptions?.requireToolPermissionPolicy,
-              snapshot.requestContext,
-            ),
-            // Generic workflows merge snapshot context. Durable agents replace
-            // it with the independently allowlisted snapshot/fresh subset above
-            // so pre-hardening snapshots can't reintroduce stored credentials.
-            __requestContextMode: 'replace',
-          });
-        })
-        .catch(async error => {
-          await emitError(runId, error).catch(() => {});
+        // Re-subscribe to the stream
+        const {
+          output,
+          cleanup: streamCleanup,
+          ready,
+        } = createDurableAgentStream<TOutput>({
+          pubsub: resumePubsub,
+          runId,
+          messageId: crypto.randomUUID(),
+          model: {
+            modelId: undefined,
+            provider: undefined,
+            version: 'v3',
+          },
+          threadId: resumeOptions?.threadId,
+          resourceId: resumeOptions?.resourceId,
+          onChunk: resumeOptions?.onChunk,
+          onStepFinish: resumeOptions?.onStepFinish,
+          onFinish: async result => {
+            try {
+              await resumeOptions?.onFinish?.(result);
+            } finally {
+              finalizeResumeRegistry();
+            }
+          },
+          onError: async errorArg => {
+            try {
+              await resumeOptions?.onError?.(errorArg);
+            } finally {
+              finalizeResumeRegistry();
+            }
+          },
+          onSuspended: resumeOptions?.onSuspended,
+          onAbort: async data => {
+            try {
+              await (resumeOptions?.onAbort as ((event: any) => void | Promise<void>) | undefined)?.(data);
+            } finally {
+              finalizeResumeRegistry();
+            }
+          },
+          closeOnSuspend: (resumeOptions as any)?.[CLOSE_ON_SUSPEND] === true,
         });
 
-      existingEntry.workflowExecution = workflowExecution;
+        const workflowExecution = ready.then(
+          async () => {
+            if (resumeCancelledBeforeReady) return;
+            resumeSubscriptionReady = true;
+            try {
+              const admittedWorkflow = getAdmittedWorkflow();
+              const workflowsStore = await mastra!.getStorage()!.getStore('workflows');
+              if (!workflowsStore) {
+                throw new TypeError('Cannot resume Inngest durable-agent run: workflow storage is unavailable');
+              }
+              const snapshot = await workflowsStore.loadWorkflowSnapshot({
+                workflowName: workflowIds.AGENTIC_LOOP,
+                runId,
+              });
+              if (!snapshot) {
+                throw new TypeError(`Cannot resume Inngest durable-agent run ${runId}: snapshot not found`);
+              }
 
-      const abort = (reason?: unknown) => {
-        if (!abortController.signal.aborted) {
-          abortController.abort(reason);
-        }
-      };
+              // Find the suspended step from the snapshot
+              const steps = Object.keys(snapshot.suspendedPaths ?? {});
+              const run = (await admittedWorkflow.createRun({
+                runId,
+                resourceId: resumeOptions?.resourceId,
+              })) as InngestRun;
+              await run.resumeAsync({
+                resumeData,
+                step: steps,
+                requestContext: prepareResumeRequestContext(
+                  resumeOptions?.requestContext,
+                  resumeOptions?.requireToolPermissionPolicy,
+                  snapshot.requestContext,
+                ),
+                // Generic workflows merge snapshot context. Durable agents replace
+                // it with the independently allowlisted snapshot/fresh subset above
+                // so pre-hardening snapshots can't reintroduce stored credentials.
+                __requestContextMode: 'replace',
+              });
+            } catch (error) {
+              // A lost resume acknowledgement does not prove non-admission. Keep
+              // the abort tombstone so a possibly queued worker still cancels.
+              await emitError(runId, error instanceof Error ? error : new Error(String(error))).catch(() => {});
+            }
+          },
+          async error => {
+            rollbackResumeSetup();
+            releaseResumeReservation();
+            await emitError(runId, error instanceof Error ? error : new Error(String(error))).catch(() => {});
+          },
+        );
+        void workflowExecution.finally(releaseResumeReservation).catch(() => {});
 
-      const cleanup = () => {
-        streamCleanup();
-        finalizeResumeRegistry();
-      };
+        existingEntry.workflowExecution = workflowExecution;
 
-      return {
-        output,
-        get fullStream() {
-          return output.fullStream as ReadableStream<any>;
-        },
-        runId,
-        threadId: resumeOptions?.threadId,
-        resourceId: resumeOptions?.resourceId,
-        cleanup,
-        abort,
-        // Internal: stream-only cleanup for resumeGenerate() to release the
-        // subscription on suspend without dropping the resumed registry entry.
-        [STREAM_CLEANUP]: streamCleanup,
-      } as InngestAgentStreamResult<TOutput>;
+        const abort = async (reason?: unknown) => {
+          if (!abortController.signal.aborted) {
+            abortController.abort(reason);
+          }
+          // The step worker is a different process — see `requestRemoteAbort`.
+          await requestRemoteAbort(runId, runtimeBindingId);
+        };
+
+        const cleanup = () => {
+          streamCleanup();
+          if (!resumeSubscriptionReady) {
+            resumeCancelledBeforeReady = true;
+            rollbackResumeSetup();
+            releaseResumeReservation();
+            return;
+          }
+          finalizeResumeRegistry();
+        };
+
+        return {
+          output,
+          get fullStream() {
+            return output.fullStream as ReadableStream<any>;
+          },
+          runId,
+          threadId: resumeOptions?.threadId,
+          resourceId: resumeOptions?.resourceId,
+          cleanup,
+          abort,
+          // Internal: stream-only cleanup for resumeGenerate() to release the
+          // subscription on suspend without dropping the resumed registry entry.
+          [STREAM_CLEANUP]: streamCleanup,
+        } as InngestAgentStreamResult<TOutput>;
+      } catch (error) {
+        rollbackResumeSetup();
+        releaseResumeReservation();
+        throw error;
+      }
     },
 
     async prepare(messages, prepareOptions) {
@@ -1229,6 +1462,8 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
     },
 
     async observe(runId, observeOptions) {
+      const runtimeBindingId = await resolveRuntimeBindingId(runId);
+
       // Create the stream subscription with offset support
       const {
         output,
@@ -1253,13 +1488,12 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
 
       await ready;
 
-      // `observe()` is a read-only re-subscription — it does not own the run
-      // so it cannot abort the underlying workflow. We still expose `abort()`
-      // on the result for type parity with stream()/resume(); calling it
-      // closes the local subscription via cleanup but is a no-op against the
-      // running workflow.
-      const abort = (_reason?: unknown) => {
+      // `observe()` does not own the run, but it can still stop it: closing the
+      // local subscription and publishing an abort request, which reaches the
+      // worker actually executing it.
+      const abort = async (_reason?: unknown) => {
         streamCleanup();
+        await requestRemoteAbort(runId, runtimeBindingId);
       };
 
       return {

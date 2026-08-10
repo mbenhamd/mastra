@@ -22,7 +22,12 @@ import { stableStringify } from '../../message-list/cache/stable-stringify';
 import type { SerializedMessageListState } from '../../message-list/state';
 import { SaveQueueManager } from '../../save-queue';
 import { createToolSurfaceFence } from '../../tool-surface-fence';
-import { getBoundRunRegistryEntry, globalRunRegistry } from '../run-registry';
+import {
+  getBoundRunRegistryEntry,
+  getGlobalRunRegistryEntry,
+  globalRunRegistry,
+  registerGlobalRunRegistryEntry,
+} from '../run-registry';
 import type {
   RunRegistryEntry,
   SerializableDurableState,
@@ -113,14 +118,25 @@ export interface ResolveRuntimeOptions {
   agentId: string;
   /** Workflow input containing serialized state */
   input: DurableAgenticWorkflowInput;
+  /**
+   * The step's run-level RequestContext, used when the step input carries no
+   * `requestContextEntries` snapshot. See `restoreRequestContext`.
+   */
+  requestContext?: RequestContext;
   /** Logger for debugging */
   logger?: { debug?: (...args: any[]) => void; error?: (...args: any[]) => void };
 }
 
 /**
  * Restore a RequestContext from the JSON-safe `requestContextEntries`
- * snapshot serialized onto the workflow input (see preparation.ts). Returns
- * an empty context when no snapshot is present.
+ * snapshot serialized onto the workflow input (see preparation.ts).
+ *
+ * `entries` is absent on a step input even when the run itself has a context:
+ * the snapshot is propagated at the run level, not copied onto every step.
+ * `runLevel` is that run-level context, which the execution engine has already
+ * rebuilt in the step's scope — falling back to it is what keeps request-scoped
+ * resolution (tenant/user, workspace, dynamic model/memory) working for tools
+ * rebuilt on a cross-process worker, including a delegated subagent's.
  */
 export function createDurableRuntimeRequestContext(options: {
   entries?: Record<string, unknown>;
@@ -266,6 +282,7 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
       const resolveRequestContext = createDurableRuntimeRequestContext({
         entries: input.requestContextEntries,
         state: input.state,
+        liveContext: options.requestContext,
       });
 
       tools = await agent.getToolsForExecution({
@@ -363,7 +380,7 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
     if (globalEntry) {
       Object.assign(globalEntry, rebuilt);
     } else {
-      globalRunRegistry.set(runId, rebuilt as RunRegistryEntry);
+      registerGlobalRunRegistryEntry(runId, rebuilt as RunRegistryEntry);
     }
   }
 
@@ -433,6 +450,8 @@ export async function rebuildRunToolsFromMastra(options: {
   toolsMetadata: SerializableToolMetadata[];
   /** JSON-safe request-context snapshot from the workflow input (see preparation.ts). */
   requestContextEntries?: Record<string, unknown>;
+  /** Live step request context; persisted entries are merged before identity is reinstalled. */
+  requestContext?: RequestContext;
   /** Persisted message state used to rebuild context-backed processor tools. */
   messageListState?: SerializedMessageListState;
   /** Already-materialized messages, when the caller still owns the live list. */
@@ -447,6 +466,7 @@ export async function rebuildRunToolsFromMastra(options: {
     options: execOptions,
     toolsMetadata,
     requestContextEntries,
+    requestContext,
     messageListState,
     logger,
   } = options;
@@ -459,6 +479,7 @@ export async function rebuildRunToolsFromMastra(options: {
     const resolveRequestContext = createDurableRuntimeRequestContext({
       entries: requestContextEntries,
       state,
+      liveContext: requestContext,
     });
     const processorMessages =
       options.processorMessages ??
@@ -484,7 +505,7 @@ export async function rebuildRunToolsFromMastra(options: {
     const saveQueueManager = makeSaveQueueManager(memory, mastra);
 
     // Write back so sibling steps in this process reuse the rebuilt tools.
-    const existing = globalRunRegistry.get(runId);
+    const existing = getGlobalRunRegistryEntry(runId);
     const patch: Partial<RunRegistryEntry> = { tools, workspace, memory, saveQueueManager };
     if (existing) {
       // Only fill fields the entry is missing — never clobber a populated entry.

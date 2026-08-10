@@ -13,7 +13,7 @@ The `Harness` feature is in alpha stage and subject to breaking changes in minor
 
 :::
 
-A `Session` owns all the state tied to a single conversation. The [`Harness`](/reference/harness/harness-class) is the shared host — agents, storage, config, the thread lock, and the event bus — while the `Session` holds everything that's per-conversation: identity, the active thread binding and reads, mode and model selection, run and abort state, the live agent stream, tool suspensions, follow-ups, approvals, permission grants, token usage, and the display-state snapshot.
+A `Session` owns all the state tied to a single conversation. The [`Harness`](/reference/harness/harness-class) is the shared host for agents, storage, config, the thread lock, and the event bus. The `Session` holds everything that's per-conversation: identity, the active thread binding and reads, mode and model selection, run and abort state, the live agent stream, tool suspensions, follow-ups, approvals, permission grants, token usage, and the display-state snapshot.
 
 Access the session through `harness.session`.
 
@@ -108,9 +108,9 @@ The session is organized into sub-objects, each owning one domain of per-convers
 
 Send a user-message signal to the active thread. If a run is active, the signal interleaves into that exact run. If the thread is idle, it wakes a new run. The returned handle contains `id`, `runId`, `willInterleave`, `accepted`, `signal`, and a `result` promise for the eventual `AgentResult`.
 
-Without `admissionId`, `signal()` preserves its optimistic boundary and returns the native routing decision on the first await tick. With `admissionId`, it first persists a reservation, claims dispatch ownership, waits for native or broker acceptance, and then durably records that acceptance. A live competing dispatcher waits for the claim; an expired dispatcher may recover it.
+Without `admissionId`, `signal()` preserves its optimistic boundary and returns the native routing decision on the first await tick. With `admissionId`, it first persists a reservation and claims dispatch ownership. It then waits for native or broker acceptance and durably records that acceptance. A live competing dispatcher waits for the claim. An expired dispatcher may recover it.
 
-If native acceptance remains ambiguous for 30 seconds, or the caller aborts while waiting for it, the call rejects and stops renewing its dispatch claim. The durable row remains recoverable instead of being marked failed. After that claim expires, retry the same `admissionId` and payload: the retry acquires a new dispatch attempt while retaining the original signal and run IDs. The native runtime does not reuse a still-pending acknowledgement from the expired attempt; stable signal-ID deduplication still prevents an already-accepted same-payload signal from being appended twice. A conflicting payload with the same `admissionId` continues to reject before dispatch.
+If native acceptance remains ambiguous for 30 seconds, or the caller aborts while waiting for it, the call rejects and stops renewing its dispatch claim. The durable row remains recoverable instead of being marked failed. After that claim expires, retry the same `admissionId` and payload: the retry acquires a new dispatch attempt while retaining the original signal and run IDs. The native runtime doesn't reuse a still-pending acknowledgement from the expired attempt. Stable signal-ID deduplication still prevents an already-accepted same-payload signal from being appended twice. A conflicting payload with the same `admissionId` continues to reject before dispatch.
 
 ```typescript
 const session = await harness.session({ resourceId: 'project-xyz' })
@@ -122,15 +122,15 @@ const handle = await session.signal({
 const result = await handle.result
 ```
 
-An exact admitted retry returns the original signal and run identity. Idle recovery always reuses the deterministic idle run ID. Accepted active delivery is pinned to the original active run and fails explicitly if that run disappears; it is never rerouted to a new cold run.
+An exact admitted retry returns the original signal and run identity. Idle recovery always reuses the deterministic idle run ID. Accepted active delivery is pinned to the original active run and fails explicitly if that run disappears. It's never rerouted to a new cold run.
 
-Durable admission evidence records whether the operation came from `message()` or `signal()`. This keeps signal dispatch fencing isolated from normal message settlement across process restarts. Older admitted signal rows are migrated only when they already contain dispatch state or use the stable `harness-channel-signal-` identity; a run ID by itself is not treated as evidence that the row is a signal.
+Durable admission evidence records whether the operation came from `message()` or `signal()`. This keeps signal dispatch fencing isolated from normal message settlement across process restarts. Older admitted signal rows are migrated only when they already contain dispatch state or use the stable `harness-channel-signal-` identity; a run ID by itself isn't treated as evidence that the row is a signal.
 
 `admissionId` provides a stable at-least-once execution identity, not exactly-once side effects. After a crash or lost acknowledgement, recovery may repeat provider or tool work under the same run ID. External effects still need their own idempotency keys when exactly-once behavior matters.
 
 ### Permissions
 
-Session-scoped grants auto-approve tools without prompting. Grants are ephemeral — they reset when the session restarts and are never persisted.
+Session-scoped grants auto-approve tools without prompting. Grants are ephemeral, so they reset when the session restarts and are never persisted.
 
 #### `grantCategory(category)`
 
@@ -181,7 +181,7 @@ const runId = harness.session.getCurrentRunId()
 
 #### `abortRun()`
 
-Abort the in-flight run: aborts the live stream, requests abort on the run, and clears parked tool suspensions.
+Abort the in-flight run. This aborts the live stream and requests abort on the run. It also clears parked tool suspensions.
 
 ```typescript
 harness.session.abortRun()
@@ -316,7 +316,7 @@ const mode = harness.session.mode.resolve()
 
 ### `session.mode.switch({ modeId })`
 
-Switch to a different mode. Aborts any in-progress generation, saves the current model to the outgoing mode, loads the incoming mode's model, and emits `mode_changed` and `model_changed` events.
+Switch to a different mode. This aborts any in-progress generation and saves the current model to the outgoing mode. It then loads the incoming mode's model and emits `mode_changed` and `model_changed` events.
 
 ```typescript
 await harness.session.mode.switch({ modeId: 'build' })
@@ -408,7 +408,7 @@ const observerModel = harness.session.om.observer.resolvedModel()
 
 ## Permissions
 
-`session.permissions` owns the persisted tool-approval _policy_ — the per-category and per-tool rules consulted during approval resolution. These are distinct from the in-memory session _grants_ documented under [Methods → Permissions](#permissions); grants reset each session, whereas these rules are persisted in session state.
+`session.permissions` owns the persisted tool-approval _policy_, which contains the per-category and per-tool rules consulted during approval resolution. These are distinct from the in-memory session _grants_ documented under [Methods → Permissions](#permissions). Grants reset each session, whereas these rules are persisted in session state.
 
 ### `session.permissions.getRules()`
 
@@ -593,7 +593,7 @@ After every event the harness emits `display_state_changed`, so high-frequency e
 
 ## State
 
-`session.state` owns the schema-validated Harness state for the conversation. It holds the current snapshot, validates updates against the `stateSchema` passed to the Harness, serializes concurrent writes, and emits a `state_changed` event on every change.
+`session.state` owns the schema-validated Harness state for the conversation. It holds the current snapshot and validates updates against the `stateSchema` passed to the Harness. It also serializes concurrent writes and emits a `state_changed` event on every change.
 
 ### `session.state.get()`
 

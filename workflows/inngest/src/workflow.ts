@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { emitErrorEvent } from '@mastra/core/agent/durable';
+import { AGENT_CONTROL_TOPIC, emitErrorEvent } from '@mastra/core/agent/durable';
 import { InMemoryServerCache } from '@mastra/core/cache';
 import { RequestContext } from '@mastra/core/di';
 import { getErrorFromUnknown } from '@mastra/core/error';
@@ -33,6 +33,11 @@ import type { PROCESSOR_EXECUTION_SYMBOL } from '@mastra/core/workflows/_constan
 import { NonRetriableError } from 'inngest';
 import type { Inngest } from 'inngest';
 import { InngestExecutionEngine } from './execution-engine';
+import {
+  compactNestedWorkflowResult,
+  NESTED_WORKFLOW_OUTPUT_MODE,
+  resolveNestedWorkflowOutputMode,
+} from './nested-workflow-output';
 import { InngestPubSub } from './pubsub';
 import { inngestWorkflowResumeOperationHash } from './resume-operation';
 import { InngestRun } from './run';
@@ -49,6 +54,18 @@ export const INNGEST_WORKFLOW_LIFECYCLE_REPLAY = {
   retentionMs: 24 * 60 * 60 * 1000,
   maxEvents: 10_000,
 } as const;
+
+/** Publish terminal failure before clearing retained abort intent. Both operations reject so Inngest retries the checkpoint. */
+export async function finalizeDurableAgentFailureTransport(
+  pubsub: PubSub,
+  input: { runId: string; runtimeBindingId?: string },
+  error: Error,
+): Promise<void> {
+  await emitErrorEvent(pubsub, input.runId, error);
+  if (typeof input.runtimeBindingId === 'string' && input.runtimeBindingId.length > 0) {
+    await pubsub.clearTopicOrThrow(AGENT_CONTROL_TOPIC(input.runId, input.runtimeBindingId));
+  }
+}
 
 export function createInngestWorkflowTerminalPayload(result: {
   status: WorkflowRunStatus;
@@ -495,6 +512,11 @@ export class InngestWorkflow<
     return this.cronFunction;
   }
 
+  /**
+   * Gets the durable Inngest function that executes this workflow.
+   *
+   * @returns The memoized Inngest function for this workflow.
+   */
   getFunction(): ReturnType<Inngest['createFunction']> {
     if (this.function) {
       return this.function;
@@ -518,6 +540,12 @@ export class InngestWorkflow<
         // Spread flow control configuration
         ...this.flowControlConfig,
       },
+      /**
+       * Executes a workflow invocation from its Inngest trigger event.
+       *
+       * @param context - The Inngest event, durable step tools, and current attempt.
+       * @returns The workflow result and run identifier returned to Inngest.
+       */
       async ({ event, step, attempt }) => {
         let {
           inputData,
@@ -538,12 +566,25 @@ export class InngestWorkflow<
           executionGeneration: suppliedExecutionGeneration,
           lifecycleResumeAttempt: suppliedLifecycleResumeAttempt,
           lifecycleStepStates: suppliedLifecycleStepStates,
+          nestedWorkflowOutputMode: requestedNestedWorkflowOutputMode,
         } = event.data;
+        const nestedWorkflowOutputMode = resolveNestedWorkflowOutputMode(requestedNestedWorkflowOutputMode);
+        const shouldCompactNestedWorkflowOutput = nestedWorkflowOutputMode === NESTED_WORKFLOW_OUTPUT_MODE.COMPACT;
 
         if (!runId) {
+          // Reached when a trigger event arrives without a run id — an event sent
+          // directly rather than through `createRun()`, which always supplies one.
+          // The id generated here never reaches the trigger event that `cancelOn`
+          // matches against, so `cancel.workflow.${this.id}` cannot target this
+          // run. Warn rather than reject: an unnamed run is still a valid way to
+          // start a workflow, it just can't be cancelled by id afterwards.
           runId = await step.run(`workflow.${this.id}.runIdGen`, async () => {
             return randomUUID();
           });
+          this.logger.warn?.(
+            `Workflow "${this.id}" was triggered without a runId, so run "${runId}" cannot be cancelled by id. ` +
+              `Send \`data.runId\` on the trigger event (or start the run with createRun()) to make it cancellable.`,
+          );
         }
 
         const hasSuppliedLifecycleState =
@@ -870,13 +911,17 @@ export class InngestWorkflow<
             ]),
           );
         }
+        const authoritativeResumeSource = resume
+          ? (authoritativeSnapshot?.resumeCheckpoint?.snapshot ?? authoritativeSnapshot)
+          : undefined;
         const executionResume = resume
           ? {
               ...resume,
-              stepResults: authoritativeSnapshot?.context ?? {},
+              stepResults: authoritativeResumeSource?.context ?? {},
+              stepExecutionPath: authoritativeResumeSource?.stepExecutionPath,
             }
           : undefined;
-        const executionInitialState = resume ? (authoritativeSnapshot?.value ?? initialState) : initialState;
+        const executionInitialState = resume ? (authoritativeResumeSource?.value ?? initialState) : initialState;
 
         let result: WorkflowResult<TState, TInput, TOutput, TSteps>;
         try {
@@ -933,21 +978,24 @@ export class InngestWorkflow<
           } as WorkflowResult<TState, TInput, TOutput, TSteps>;
         }
 
+        const returnedResult = shouldCompactNestedWorkflowOutput ? compactNestedWorkflowResult(result) : result;
+
         // Final step to invoke lifecycle callbacks and end workflow span.
         // This step is memoized by step.run.
         let finalizeError: unknown;
         let finalizeErrored = false;
         try {
-          await step.run(`workflow.${this.id}.finalize`, async () => {
+          /**
+           * Finalizes workflow lifecycle reporting in a memoized Inngest step.
+           *
+           * @returns The workflow result, or only its status for compact nested invocations.
+           */
+          const finalizeWorkflow = async () => {
             // For durable agent workflows, emit error event on failure so the
             // client's stream can receive the error and close properly.
             if (result.status === 'failed' && inputData?.__workflowKind === 'durable-agent' && inputData?.runId) {
               const error = result.error instanceof Error ? result.error : new Error(String(result.error));
-              try {
-                await emitErrorEvent(pubsub, inputData.runId, error);
-              } catch (e) {
-                this.logger.debug?.('Failed to emit error event:', e);
-              }
+              await finalizeDurableAgentFailureTransport(pubsub, inputData, error);
             }
 
             if (result.status !== 'paused') {
@@ -1131,12 +1179,13 @@ export class InngestWorkflow<
             // Throw after span ended for failed workflows
             if (result.status === 'failed') {
               throw new NonRetriableError(`Workflow failed`, {
-                cause: result,
+                cause: shouldCompactNestedWorkflowOutput ? { ...returnedResult, runId } : result,
               });
             }
 
-            return result;
-          });
+            return shouldCompactNestedWorkflowOutput ? { status: result.status } : result;
+          };
+          await step.run(`workflow.${this.id}.finalize`, finalizeWorkflow);
         } catch (error) {
           finalizeErrored = true;
           finalizeError = error;
@@ -1156,7 +1205,7 @@ export class InngestWorkflow<
           throw finalizeError;
         }
 
-        return { result, runId };
+        return { result: returnedResult, runId };
       },
     );
     return this.function;

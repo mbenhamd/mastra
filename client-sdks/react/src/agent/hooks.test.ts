@@ -393,6 +393,7 @@ describe('useChat forwards clientTools', () => {
     expect(sendToolApprovalMock).toHaveBeenCalledWith({
       resourceId: 'resource-1',
       threadId: 'thread-1',
+      runId: 'run-approval',
       toolCallId: 'tool-call-approval-1',
       approved: true,
       requestContext: undefined,

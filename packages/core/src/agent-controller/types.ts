@@ -14,6 +14,7 @@ import type { MastraCompositeStore } from '../storage/base';
 import type { GoalEvaluationPayload } from '../stream/types';
 import type { DynamicArgument } from '../types';
 import type { Workspace, WorkspaceStatus } from '../workspace';
+import type { Session } from './session';
 import type { TaskItemSnapshot } from './tools';
 
 // =============================================================================
@@ -232,6 +233,9 @@ export type BuiltinToolId =
   | 'task_complete'
   | 'task_check'
   | 'subagent';
+
+/** Process-local listener notified after AgentController materializes a live session. */
+export type AgentControllerSessionCreatedListener<TState = {}> = (session: Session<TState>) => void | Promise<void>;
 
 export interface AgentControllerConfig<TState = {}> {
   /** Unique identifier for this controller instance */
@@ -648,6 +652,7 @@ export interface AgentControllerDisplayState {
   // ── Tool approval ────────────────────────────────────────────────────
   /** A tool awaiting user approval (null when no approval pending) */
   pendingApproval: {
+    runId: string;
     toolCallId: string;
     toolName: string;
     args: unknown;
@@ -771,7 +776,7 @@ export type AgentControllerEvent =
   | { type: 'message_update'; message: MastraDBMessage }
   | { type: 'message_end'; message: MastraDBMessage }
   | { type: 'tool_start'; toolCallId: string; toolName: string; args: unknown }
-  | { type: 'tool_approval_required'; toolCallId: string; toolName: string; args: unknown }
+  | { type: 'tool_approval_required'; runId: string; toolCallId: string; toolName: string; args: unknown }
   | {
       type: 'tool_suspended';
       toolCallId: string;

@@ -2029,6 +2029,15 @@ describe('MastraInngestWorkflow', () => {
   });
 
   describe('abort', () => {
+    const abortDbPath = path.join(process.cwd(), 'mastra-inngest-abort.db');
+    let abortStorage: DefaultStorage | undefined;
+
+    afterEach(async () => {
+      await abortStorage?.close();
+      abortStorage = undefined;
+      fs.rmSync(abortDbPath, { force: true });
+    });
+
     it('should be able to abort workflow execution in between steps', async ctx => {
       const inngest = new Inngest({
         id: 'mastra',
@@ -2056,7 +2065,7 @@ describe('MastraInngestWorkflow', () => {
 
       const workflow = createWorkflow({
         id: 'test-workflow',
-        inputSchema: z.object({}),
+        inputSchema: z.object({ value: z.string() }),
         outputSchema: z.object({
           result: z.string(),
         }),
@@ -2065,11 +2074,15 @@ describe('MastraInngestWorkflow', () => {
 
       workflow.then(step1).sleep(2000).then(step2).commit();
 
+      // Cancellation uses transactional lifecycle writes. Keep the schema visible
+      // when libSQL rotates connections after a transaction.
+      const storage = (abortStorage = new DefaultStorage({
+        id: 'abort-test-storage',
+        url: `file:${abortDbPath}`,
+      }));
+      await storage.init();
       const mastra = new Mastra({
-        storage: new DefaultStorage({
-          id: 'test-storage',
-          url: ':memory:',
-        }),
+        storage,
         workflows: {
           'test-workflow': workflow,
         },
@@ -2106,6 +2119,7 @@ describe('MastraInngestWorkflow', () => {
       expect(result.status).toBe('canceled');
       expect(result.steps['step1']).toEqual({
         status: 'success',
+        payload: { value: 'test' },
         output: { result: 'step1: test' },
         startedAt: expect.any(Number),
         endedAt: expect.any(Number),
@@ -2157,7 +2171,7 @@ describe('MastraInngestWorkflow', () => {
 
       const workflow = createWorkflow({
         id: 'test-workflow',
-        inputSchema: z.object({}),
+        inputSchema: z.object({ value: z.string() }),
         outputSchema: z.object({
           result: z.string(),
         }),
@@ -2166,11 +2180,13 @@ describe('MastraInngestWorkflow', () => {
 
       workflow.then(step1).then(step2).commit();
 
+      const storage = (abortStorage = new DefaultStorage({
+        id: 'abort-test-storage',
+        url: `file:${abortDbPath}`,
+      }));
+      await storage.init();
       const mastra = new Mastra({
-        storage: new DefaultStorage({
-          id: 'test-storage',
-          url: ':memory:',
-        }),
+        storage,
         workflows: {
           'test-workflow': workflow,
         },
@@ -2208,6 +2224,7 @@ describe('MastraInngestWorkflow', () => {
       expect(result.status).toBe('canceled');
       expect(result.steps['step1']).toEqual({
         status: 'success',
+        payload: { value: 'test' },
         output: { result: 'step1: test' },
         startedAt: expect.any(Number),
         endedAt: expect.any(Number),
@@ -6878,7 +6895,6 @@ describe('MastraInngestWorkflow', () => {
             value: 0,
           },
           step1: {
-            payload: { value: 0 },
             startedAt: expect.any(Number),
             status: 'success',
             output: {
@@ -6923,7 +6939,7 @@ describe('MastraInngestWorkflow', () => {
         steps: {
           input: { value: 0 },
           step1: {
-            payload: { value: 0 },
+            payload: {},
             startedAt: expect.any(Number),
             status: 'success',
             output: {
@@ -7508,7 +7524,6 @@ describe('MastraInngestWorkflow', () => {
             toneScore: { score: 0.8 },
             completenessScore: { score: 0.7 },
           },
-          payload: { modelOutput: 'test output' },
           startedAt: expect.any(Number),
           endedAt: expect.any(Number),
         },
@@ -7675,6 +7690,7 @@ describe('MastraInngestWorkflow', () => {
         input: { input: 'test input' },
         getUserInput: {
           status: 'success',
+          payload: { input: 'test input' },
           output: { userInput: 'test input' },
           startedAt: expect.any(Number),
           endedAt: expect.any(Number),
@@ -7700,6 +7716,7 @@ describe('MastraInngestWorkflow', () => {
         },
         improveResponse: {
           status: 'suspended',
+          suspendPayload: undefined,
           startedAt: expect.any(Number),
           suspendedAt: expect.any(Number),
         },
@@ -8646,7 +8663,7 @@ describe('MastraInngestWorkflow', () => {
       expect(result.steps).toMatchObject({
         input: {},
         step1: { status: 'success', output: { status: 'success' } },
-        step2: { status: 'success', output: {} },
+        step2: { status: 'skipped' },
         step5: { status: 'success', output: { result: 'step5' } },
         step4: { status: 'success', output: { result: 'step5step5' } },
       });

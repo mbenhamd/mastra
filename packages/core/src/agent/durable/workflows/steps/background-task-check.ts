@@ -4,6 +4,7 @@ import type { PubSub } from '../../../../events/pubsub';
 import { ChunkFrom } from '../../../../stream/types';
 import { PUBSUB_SYMBOL } from '../../../../workflows/constants';
 import { createStep } from '../../../../workflows/workflow';
+import { ensureRemoteAbortListener } from '../../abort-transport';
 import { DurableStepIds } from '../../constants';
 import { getBoundRunRegistryEntry } from '../../run-registry';
 import { emitChunkEvent } from '../../stream-adapter';
@@ -49,9 +50,11 @@ export function createDurableBackgroundTaskCheckStep() {
         state?: { threadId?: string; resourceId?: string };
       }>();
       const { runId, runtimeBindingId, agentId } = initData;
-
-      const registryEntry = getBoundRunRegistryEntry(runId, runtimeBindingId);
-      if (!registryEntry && initData.runtimeResolution === 'registry-required') {
+      const registryEntryBeforeAbortListener = getBoundRunRegistryEntry(runId, runtimeBindingId);
+      if (
+        (!registryEntryBeforeAbortListener || registryEntryBeforeAbortListener.isPlaceholder === true) &&
+        initData.runtimeResolution === 'registry-required'
+      ) {
         throw new MastraError({
           id: 'DURABLE_AGENT_RUNTIME_REGISTRY_MISSING',
           domain: ErrorDomain.AGENT,
@@ -60,6 +63,19 @@ export function createDurableBackgroundTaskCheckStep() {
           details: { agentId, runId },
         });
       }
+
+      if (pubsub) {
+        try {
+          await ensureRemoteAbortListener(pubsub, runId, runtimeBindingId);
+        } catch (error) {
+          params.mastra?.getLogger?.()?.warn?.('Failed to subscribe to cross-process abort requests', {
+            runId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+
+      const registryEntry = getBoundRunRegistryEntry(runId, runtimeBindingId);
       const bgManager = registryEntry?.backgroundTaskManager;
 
       if (!bgManager) {

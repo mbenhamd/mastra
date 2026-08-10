@@ -263,25 +263,35 @@ describe('AgentController: ask_user native suspension', () => {
     expect(approval.isArmed()).toBe(false);
   });
 
-  it('ignores a tool-approval response whose toolCallId does not match the armed gate', async () => {
+  it('ignores a tool-approval response whose toolCallId or runId does not match the armed gate', async () => {
     // A stale/delayed approval request must not resolve a different pending gate.
-    // When a toolCallId is supplied it has to match the armed call; a mismatch is
-    // a no-op so the gate stays parked for the correct responder.
+    // Supplied tool-call and run ids are one identity: either mismatch keeps the
+    // gate parked for the exact responder.
     const approval = new SessionApproval();
-    const parked = approval.arm({ toolName: 'edit_file', toolCallId: 'call-current' });
+    const parked = approval.arm({ toolName: 'edit_file', toolCallId: 'call-current', runId: 'run-current' });
     expect(approval.isArmed()).toBe(true);
     expect(approval.getToolCallId()).toBe('call-current');
+    expect(approval.getRunId()).toBe('run-current');
 
-    // Wrong id: ignored, gate remains armed.
-    approval.respond({ decision: 'approve', toolCallId: 'call-stale' });
+    approval.respond({ decision: 'approve', toolCallId: 'call-stale', runId: 'run-current' });
     expect(approval.isArmed()).toBe(true);
 
-    // Correct id resolves it. Omitting toolCallId is also accepted (backwards compatible).
-    approval.respond({ decision: 'approve', toolCallId: 'call-current' });
+    approval.respond({ decision: 'approve', toolCallId: 'call-current', runId: 'run-stale' });
+    expect(approval.isArmed()).toBe(true);
+
+    // Runtime callers cannot bypass either identity by omitting it.
+    approval.respond({ decision: 'approve', toolCallId: 'call-current' } as any);
+    expect(approval.isArmed()).toBe(true);
+    approval.respond({ decision: 'approve', runId: 'run-current' } as any);
+    expect(approval.isArmed()).toBe(true);
+
+    // Only the exact identity resolves it.
+    approval.respond({ decision: 'approve', toolCallId: 'call-current', runId: 'run-current' });
     const decision = await parked;
     expect(decision.decision).toBe('approve');
     expect(approval.isArmed()).toBe(false);
     expect(approval.getToolCallId()).toBeNull();
+    expect(approval.getRunId()).toBeNull();
   });
 
   it('surfaces three ask_user questions one at a time across resumes (#13642 serialized flow)', async () => {

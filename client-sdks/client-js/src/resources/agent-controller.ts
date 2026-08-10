@@ -1,4 +1,9 @@
-import type { MastraDBMessage, MastraMessagePart } from '@mastra/core/agent-controller';
+import type {
+  ActiveSubagentState,
+  ActiveToolState,
+  MastraDBMessage,
+  MastraMessagePart,
+} from '@mastra/core/agent-controller';
 export type { MastraDBMessage, MastraMessageContentV2, MastraMessagePart } from '@mastra/core/agent-controller';
 import type { RequestContext } from '@mastra/core/request-context';
 
@@ -65,7 +70,7 @@ export type KnownAgentControllerEvent =
   | { type: 'shell_output'; toolCallId: string; output: string; stream: 'stdout' | 'stderr' }
   | { type: 'tool_end'; toolCallId: string; result?: unknown; isError?: boolean }
   // Interactive prompts.
-  | { type: 'tool_approval_required'; toolCallId: string; toolName: string; args: unknown }
+  | { type: 'tool_approval_required'; runId: string; toolCallId: string; toolName: string; args: unknown }
   | { type: 'tool_suspended'; toolCallId: string; toolName: string; args: unknown; suspendPayload: unknown }
   // Session state changes.
   | { type: 'mode_changed'; modeId: string; previousModeId: string }
@@ -100,15 +105,25 @@ export type KnownAgentControllerEvent =
     }
   // Usage tracking.
   | { type: 'usage_update'; usage: unknown }
-  // Canonical display-state snapshot, emitted after every other event. Carries
-  // the status-line figures (OM progress + cumulative token usage). Maps/Dates
-  // in the full display state don't survive JSON, so only plain fields are typed.
+  // Canonical display-state snapshot, emitted after every other event. The
+  // server converts the display state's Maps to plain records for the wire;
+  // servers predating that conversion send `{}` for those fields.
   | {
       type: 'display_state_changed';
       displayState: {
         isRunning?: boolean;
         omProgress?: AgentControllerOMProgress;
         tokenUsage?: Record<string, unknown>;
+        /** Active tool executions keyed by toolCallId. */
+        activeTools?: Record<string, ActiveToolState>;
+        toolInputBuffers?: Record<string, { text: string; toolName: string }>;
+        pendingSuspensions?: Record<
+          string,
+          { toolCallId: string; toolName: string; args: unknown; suspendPayload: unknown; resumeSchema?: string }
+        >;
+        activeSubagents?: Record<string, ActiveSubagentState>;
+        /** `firstModified` is an ISO string on the wire. */
+        modifiedFiles?: Record<string, { operations: string[]; firstModified: string }>;
         [key: string]: unknown;
       };
     }
@@ -155,10 +170,70 @@ export interface OtherAgentControllerEvent {
 }
 
 /**
- * An agent controller event. Narrow on `type` to access known payloads; unknown
- * event types fall through to {@link OtherAgentControllerEvent}.
+ * An agent controller event. Comparing `event.type` to a literal does NOT
+ * narrow this union — {@link OtherAgentControllerEvent} types `type` as
+ * `string`, which matches every literal. Narrow with
+ * {@link isKnownAgentControllerEvent} first, then switch on `type`.
  */
 export type AgentControllerEvent = KnownAgentControllerEvent | OtherAgentControllerEvent;
+
+// Runtime mirror of the union — Record keyed by its `type` makes tsc reject a
+// missing or extra entry.
+const KNOWN_AGENT_CONTROLLER_EVENT_TYPES = new Set<string>(
+  Object.keys({
+    agent_start: true,
+    agent_end: true,
+    message_start: true,
+    message_update: true,
+    message_end: true,
+    tool_input_start: true,
+    tool_input_delta: true,
+    tool_input_end: true,
+    tool_start: true,
+    tool_update: true,
+    shell_output: true,
+    tool_end: true,
+    tool_approval_required: true,
+    tool_suspended: true,
+    mode_changed: true,
+    model_changed: true,
+    thread_changed: true,
+    thread_created: true,
+    thread_deleted: true,
+    subagent_start: true,
+    subagent_end: true,
+    task_updated: true,
+    notification: true,
+    notification_summary: true,
+    usage_update: true,
+    display_state_changed: true,
+    goal_evaluation: true,
+    follow_up_queued: true,
+    om_observation_start: true,
+    om_observation_end: true,
+    om_observation_failed: true,
+    om_reflection_start: true,
+    om_reflection_end: true,
+    om_reflection_failed: true,
+    om_buffering_start: true,
+    om_buffering_end: true,
+    om_buffering_failed: true,
+    om_model_changed: true,
+    om_activation: true,
+    om_status: true,
+    om_thread_title_updated: true,
+    workspace_ready: true,
+    workspace_error: true,
+    workspace_status_changed: true,
+    info: true,
+    error: true,
+  } satisfies Record<KnownAgentControllerEvent['type'], true>),
+);
+
+/** Narrows to the explicitly typed events; see {@link AgentControllerEvent}. */
+export function isKnownAgentControllerEvent(event: AgentControllerEvent): event is KnownAgentControllerEvent {
+  return KNOWN_AGENT_CONTROLLER_EVENT_TYPES.has(event.type);
+}
 
 type SerializedMastraDBMessage = Omit<MastraDBMessage, 'createdAt'> & { createdAt: Date | string };
 
@@ -189,8 +264,8 @@ export interface CreateAgentControllerSessionResponse {
 export interface AgentControllerSessionSettings {
   /** Auto-approve all tool calls (no per-tool prompt). */
   yolo: boolean;
-  /** Extended-thinking budget. */
-  thinkingLevel: 'off' | 'low' | 'medium' | 'high' | 'xhigh';
+  /** Extended-thinking budget (session override). Absent when the session inherits a configured default. */
+  thinkingLevel?: 'off' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
   /** How completion/notification alerts are delivered. */
   notifications: 'off' | 'bell' | 'system' | 'both';
   /** Use AST-aware smart editing when available. */
@@ -659,12 +734,17 @@ export class AgentControllerSession extends BaseResource {
     await this.request(this.url(`${this.base()}/abort`), { method: 'POST' });
   }
 
-  /** Approve or decline a pending tool call (`tool_approval_required`). */
-  async approveTool(toolCallId: string, approved: boolean, options?: AgentControllerRequestOptions): Promise<void> {
+  /** Approve or decline the exact pending tool call (`tool_approval_required`). */
+  async approveTool(
+    runId: string,
+    toolCallId: string,
+    approved: boolean,
+    options?: AgentControllerRequestOptions,
+  ): Promise<void> {
     const requestContext = parseClientRequestContext(options?.requestContext);
     await this.request(this.url(`${this.base()}/tool-approval`), {
       method: 'POST',
-      body: { toolCallId, approved, ...(requestContext ? { requestContext } : {}) },
+      body: { runId, toolCallId, approved, ...(requestContext ? { requestContext } : {}) },
     });
   }
 

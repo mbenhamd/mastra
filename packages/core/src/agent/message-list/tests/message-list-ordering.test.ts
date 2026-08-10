@@ -445,10 +445,14 @@ describe('Message ordering with identical timestamps (Issue #10683)', () => {
       const responseTime = new Date('2024-01-01T10:00:00.000Z');
       const signalTime = new Date('2024-01-01T09:00:00.000Z');
       const list = new MessageList();
+      const providerOptions = {
+        mastra: { channels: { discord: { messageId: 'message-1', author: { userId: 'user-1' } } } },
+      };
       const signal = createSignal({
         id: 'signal-1',
         type: 'user-message',
         contents: 'Signal message',
+        providerOptions,
         createdAt: signalTime,
       });
 
@@ -467,7 +471,9 @@ describe('Message ordering with identical timestamps (Issue #10683)', () => {
       const storedSignal = list.get.all.db().at(-1)!;
       expect(signalForTranscript.createdAt.getTime()).toBeGreaterThan(responseTime.getTime());
       expect(signalForTranscript.acceptedAt).toEqual(signalTime);
+      expect(signalForTranscript.providerOptions).toEqual(providerOptions);
       expect(storedSignal.createdAt).toEqual(signalForTranscript.createdAt);
+      expect(storedSignal.content.providerMetadata).toEqual(providerOptions);
       expect(storedSignal.content.metadata?.signal).toMatchObject({
         createdAt: signalForTranscript.createdAt.toISOString(),
         acceptedAt: signalTime.toISOString(),

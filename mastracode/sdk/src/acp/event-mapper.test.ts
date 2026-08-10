@@ -365,6 +365,7 @@ describe('ACP Event Mapper', () => {
 
       const event: Extract<AgentControllerEvent, { type: 'tool_approval_required' }> = {
         type: 'tool_approval_required',
+        runId: 'run-123',
         toolCallId: 'tool-123',
         toolName: 'delete_file',
         args: { path: '/important.js' },
@@ -390,6 +391,8 @@ describe('ACP Event Mapper', () => {
 
       expect(mockSession.respondToToolApproval).toHaveBeenCalledWith({
         decision: 'approve',
+        runId: 'run-123',
+        toolCallId: 'tool-123',
       });
     });
 
@@ -402,6 +405,7 @@ describe('ACP Event Mapper', () => {
 
       const event: Extract<AgentControllerEvent, { type: 'tool_approval_required' }> = {
         type: 'tool_approval_required',
+        runId: 'run-123',
         toolCallId: 'tool-123',
         toolName: 'delete_file',
         args: {},
@@ -415,6 +419,8 @@ describe('ACP Event Mapper', () => {
 
       expect(mockSession.respondToToolApproval).toHaveBeenCalledWith({
         decision: 'decline',
+        runId: 'run-123',
+        toolCallId: 'tool-123',
       });
     });
 
@@ -427,6 +433,7 @@ describe('ACP Event Mapper', () => {
 
         const event: Extract<AgentControllerEvent, { type: 'tool_approval_required' }> = {
           type: 'tool_approval_required',
+          runId: 'run-123',
           toolCallId: 'tool-123',
           toolName: 'delete_file',
           args: {},
@@ -438,6 +445,8 @@ describe('ACP Event Mapper', () => {
         expect(requestPermissionSpy).not.toHaveBeenCalled();
         expect(mockSession.respondToToolApproval).toHaveBeenCalledWith({
           decision: 'approve',
+          runId: 'run-123',
+          toolCallId: 'tool-123',
         });
       } finally {
         setAutoApprove(false);

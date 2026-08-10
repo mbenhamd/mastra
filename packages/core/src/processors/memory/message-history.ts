@@ -1,5 +1,6 @@
 import type { Processor } from '..';
 import type { MastraDBMessage, MessageList } from '../../agent';
+import { isTransientSignalMessage } from '../../agent/signals';
 import { materializeTerminalToolResult } from '../../loop/shared/terminal-tool-result';
 import { parseMemoryRequestContext } from '../../memory';
 import { removeWorkingMemoryTags } from '../../memory/working-memory-utils';
@@ -238,9 +239,10 @@ export class MessageHistory implements Processor {
   /**
    * Filters messages before persisting to storage:
    * 1. Removes system messages - these are runtime instructions and should never be stored
-   * 2. Removes streaming tool calls (state === 'partial-call') - these are intermediate states
-   * 3. Removes updateWorkingMemory tool invocations (hide args from message history)
-   * 4. Strips <working_memory> tags from text content
+   * 2. Removes transient signals (`transient: true`) - delivery-only, must never be retained
+   * 3. Removes streaming tool calls (state === 'partial-call') - these are intermediate states
+   * 4. Removes updateWorkingMemory tool invocations (hide args from message history)
+   * 5. Strips <working_memory> tags from text content
    *
    * Note: We preserve 'call' state tool invocations because:
    * - For server-side tools, 'call' should have been converted to 'result' by the time OUTPUT is processed
@@ -255,7 +257,7 @@ export class MessageHistory implements Processor {
       normalizedToolCallFilterExclude === 'all' || normalizedToolCallFilterExclude?.includes(toolName) === true;
 
     const filteredMessages = messages
-      .filter(m => m.role !== 'system')
+      .filter(m => m.role !== 'system' && !isTransientSignalMessage(m))
       .map(m => {
         const newMessage = { ...m };
         let removedToolInvocationCoveredByPolicy = false;
@@ -476,15 +478,11 @@ export class MessageHistory implements Processor {
       return;
     }
 
-    // Ensure thread exists (create if needed) before saving messages
+    // Ensure thread exists (create if needed) before saving messages.
+    // Nothing to write when it already exists: re-writing the row we just read
+    // would clobber a title generated concurrently with this save.
     const thread = await this.storage.getThreadById({ threadId });
-    if (thread) {
-      await this.storage.updateThread({
-        id: threadId,
-        title: thread.title || '',
-        metadata: thread.metadata || {},
-      });
-    } else {
+    if (!thread) {
       // Auto-create thread if it doesn't exist
       await this.storage.saveThread({
         thread: {

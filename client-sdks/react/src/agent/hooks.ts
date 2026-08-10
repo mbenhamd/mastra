@@ -954,6 +954,7 @@ export const useChat = ({
         await agent.sendToolApproval({
           resourceId: resourceId || agentId,
           threadId,
+          runId: currentRunId,
           toolCallId,
           approved: true,
           ...(continuation.model !== undefined ? { streamOptions: { model: continuation.model } } : {}),
@@ -1005,6 +1006,7 @@ export const useChat = ({
         await agent.sendToolApproval({
           resourceId: resourceId || agentId,
           threadId,
+          runId: currentRunId,
           toolCallId,
           approved: false,
           ...(continuation.model !== undefined ? { streamOptions: { model: continuation.model } } : {}),

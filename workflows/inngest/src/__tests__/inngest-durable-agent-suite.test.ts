@@ -97,5 +97,9 @@ createDurableAgentTestSuite({
     // not auto-attached, so `for await (textStream)` can hang waiting for run-scoped
     // events that never get routed to this run's subscribers.
     workspace: true,
+    // The shared processor stream cases instantiate the core DurableAgent with
+    // an Inngest transport outside an Inngest function. Cross-process output
+    // processing is covered by durable-finish-side-effects.test.ts instead.
+    processorPipeline: true,
   },
 });

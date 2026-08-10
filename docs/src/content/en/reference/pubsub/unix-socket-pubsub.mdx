@@ -114,4 +114,4 @@ Ownership follows these rules:
 
 Parent workflow traversal is depth-bounded and cycle-safe. A malformed parent chain can't block event routing.
 
-For push-only delivery, a Mastra instance acknowledges an event owned by another instance without running user workflow code. This routing skip isn't a workflow error: it doesn't emit `workflow.fail`, request redelivery, or throw a `MastraError`. The debug record includes only structural fields (`workflowId`, event type, and `ownership: "foreign"`), not the workflow payload.
+For push-only delivery, a Mastra instance acknowledges an event owned by another instance without running user workflow code. This routing skip isn't a workflow error. It doesn't emit `workflow.fail` or request redelivery, and it doesn't throw a `MastraError`. The debug record includes only structural fields (`workflowId`, event type, and `ownership: "foreign"`), not the workflow payload.

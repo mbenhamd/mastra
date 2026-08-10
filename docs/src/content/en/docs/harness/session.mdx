@@ -1,19 +1,19 @@
 ---
 title: "Session | Harness"
-description: "Understand the Session — the live state object on a Harness — and the identity, thread, mode, grants, run, and display state it tracks."
+description: "Understand the Session, the live state object on a Harness, and the identity, thread, mode, grants, run, and display state it tracks."
 packages:
   - "@mastra/core"
 ---
 
 # Session
 
-A [`Session`](/reference/harness/session) holds the live state of a Harness: who the session is for, which thread is active, the selected mode and model, permission grants, queued follow-ups, token usage, application state, and the display snapshot. You reach it through `harness.session`.
+A [`Session`](/reference/harness/session) holds the live state of a Harness. It records who the session is for and which thread is active, along with the selected mode and model. It also holds permission grants, queued follow-ups, token usage, application state, and the display snapshot. You reach it through `harness.session`.
 
 ## What the Session tracks
 
-The Session is the live state of a single user's interaction with the Harness. It answers "what's true right now": who the session belongs to, which thread is currently bound, which mode and model are selected, what the user has approved, what's queued or running, the application state, and the snapshot to render. A session has one active thread at a time but can list, switch between, and clone many threads over its lifetime. Anything that describes the current state lives here; the Harness owns the shared infrastructure every session runs on.
+The Session is the live state of a single user's interaction with the Harness. It identifies the session owner, current thread, selected mode, and model. It also records what the user has approved, what's queued or running, the application state, and the snapshot to render. A session has one active thread at a time but can list, switch between, and clone many threads over its lifetime. Anything that describes the current state lives here. The Harness owns the shared infrastructure every session runs on.
 
-Because each session has its own identity and state, one Harness can serve many users at once — each backed by its own Session — without one session's mode, grants, or active thread leaking into another.
+One Harness can serve many users at once because each session has its own identity and state. A separate Session backs each user, which prevents one session's mode, grants, or active thread from leaking into another.
 
 The rest of this page walks through the Session's state. Each part is a focused sub-object on `harness.session`:
 
@@ -22,7 +22,7 @@ The rest of this page walks through the Session's state. Each part is a focused 
 - **What's happening right now**: [Run state](#run-state) reflects the in-flight generation, and [Follow-ups](#follow-ups) holds messages queued to send when it finishes.
 - **What you store and render**: [State](#state) holds your application's structured data, and [Display state](#display-state) is the single snapshot your UI renders from.
 
-The Harness performs actions that change this state — switching threads, modes, or models — because those operations coordinate shared infrastructure and emit events. The Session is where you read the result. The sections below note this split where it matters.
+The Harness performs actions that change this state, such as switching threads, modes, or models, because those operations coordinate shared infrastructure and emit events. The Session is where you read the result. The sections below note this split where it matters.
 
 ## Identity
 
@@ -68,7 +68,7 @@ See [Modes](/docs/harness/modes) for how modes carry their own model.
 
 ## Permission grants
 
-The Harness owns permission _policy_ — which categories or tools require approval. The Session owns the _grants_ a user makes during the conversation. A grant lets a tool run for the rest of the session without prompting again:
+The Harness owns permission _policy_, which determines the categories or tools that require approval. The Session owns the _grants_ a user makes during the conversation. A grant lets a tool run for the rest of the session without prompting again:
 
 ```typescript
 // Grant a category or tool for the rest of the session
@@ -106,7 +106,7 @@ Queue a follow-up with `harness.followUp({ content })`. To redirect the agent mi
 
 ## State
 
-`session.state` holds the conversation's application state — structured values that agents and the UI share, such as model preferences, feature flags, or progress. The Harness defines the shape with a `stateSchema`; the Session owns the live snapshot, validates updates against the schema, and emits `state_changed` on every write:
+`session.state` holds the conversation's application state, including structured values that agents and the UI share, such as model preferences, feature flags, or progress. The Harness defines the shape with a `stateSchema`. The Session owns the live snapshot and validates updates against the schema. It emits `state_changed` on every write:
 
 ```typescript
 const state = harness.session.state.get()
@@ -117,9 +117,9 @@ See [Threads and state](/docs/harness/threads-and-state) for defining a schema.
 
 ## Display state
 
-A conversation emits many fine-grained events: tokens streaming in, tools starting and finishing, approvals pending, tasks updating, token usage climbing. Subscribing to each event type and reassembling the current picture yourself is tedious and error-prone. `session.displayState` does that work for you.
+Fine-grained conversation events report streaming tokens and tool progress. They also report pending approvals and task updates, along with increasing token usage. Subscribing to each event type and reassembling the current picture yourself is tedious and error-prone. `session.displayState` does that work for you.
 
-It's a reducer-maintained snapshot. The Session keeps one `HarnessDisplayState` object and folds every harness event into it as it happens, so the snapshot always reflects the latest state. It captures everything a UI needs to render: whether the agent is running and what it's streaming, which tools and subagents are active, anything waiting on the user such as approvals, the current task list, and running totals like token usage and queued follow-ups.
+It's a reducer-maintained snapshot. The Session keeps one `HarnessDisplayState` object and folds every harness event into it as it happens, so the snapshot always reflects the latest state. It captures everything a UI needs to render. This includes whether the agent is running, what it's streaming, and which tools or subagents are active. It also includes anything waiting on the user, such as approvals, the current task list, and running totals like token usage and queued follow-ups.
 
 Because it's a single object, you can drive an entire UI from one place: read the current snapshot with `get()`, and re-render whenever the Harness emits `display_state_changed` (fired after every other event):
 

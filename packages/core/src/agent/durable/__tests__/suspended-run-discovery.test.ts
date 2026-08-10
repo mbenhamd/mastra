@@ -22,6 +22,7 @@ import {
   getGlobalRunRegistryEntry,
   globalRunRegistry,
   pinGlobalRunRegistryEntry,
+  registerGlobalRunRegistryEntry,
   unpinGlobalRunRegistryEntry,
 } from '../run-registry';
 import { resolveRuntimeDependencies } from '../utils/resolve-runtime';
@@ -827,10 +828,24 @@ describe('DurableAgent suspended-run discovery', () => {
     expect(pinGlobalRunRegistryEntry(prepared.runId)).toBe(entry);
     globalRunRegistry.delete(prepared.runId);
     expect(getGlobalRunRegistryEntry(prepared.runId)).toBe(entry);
-    unpinGlobalRunRegistryEntry(prepared.runId);
+    const resolved = await resolveRuntimeDependencies({
+      runId: prepared.runId,
+      agentId: setup.agent.id,
+      input: prepared.workflowInput,
+    });
+    expect(resolved.model).toBe(entry.model);
+    expect(globalRunRegistry.get(prepared.runId)).toBeUndefined();
+    expect(() =>
+      registerGlobalRunRegistryEntry(prepared.runId, {
+        runtimeBindingId: 'colliding-binding',
+        tools: {},
+        model: textModel(),
+      } as any),
+    ).toThrow(/already active/);
+    unpinGlobalRunRegistryEntry(prepared.runId, prepared.workflowInput.runtimeBindingId);
     expect(getGlobalRunRegistryEntry(prepared.runId)).toBe(entry);
     expect(globalRunRegistry.get(prepared.runId)).toBeUndefined();
-    unpinGlobalRunRegistryEntry(prepared.runId);
+    unpinGlobalRunRegistryEntry(prepared.runId, prepared.workflowInput.runtimeBindingId);
     expect(globalRunRegistry.get(prepared.runId)).toBe(entry);
     prepared.cleanup();
   });
@@ -847,7 +862,7 @@ describe('DurableAgent suspended-run discovery', () => {
       id: 'DURABLE_AGENT_RUN_ID_CONFLICT',
     });
 
-    unpinGlobalRunRegistryEntry(prepared.runId);
+    unpinGlobalRunRegistryEntry(prepared.runId, prepared.workflowInput.runtimeBindingId);
     prepared.cleanup();
   });
 

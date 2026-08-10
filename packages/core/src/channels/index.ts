@@ -1,6 +1,15 @@
 export { AgentChannels } from './agent-channels';
 export { AgentControllerChannels } from './agent-controller-channels';
-export type { AgentControllerChannelsConfig } from './agent-controller-channels';
+export type {
+  AgentControllerChannelsConfig,
+  ChannelSessionResolve,
+  ChannelSessionResolveContext,
+  ChannelSessionStart,
+  ChannelSessionStartContext,
+  ChannelStaleToolApproval,
+  ChannelStaleToolApprovalContext,
+} from './agent-controller-channels';
+export { ChannelSessionRejectedError } from './errors';
 export { ChatChannelProcessor } from './processor';
 export { renderBuiltInToolEvent } from './stream-helpers';
 export { getChatModule } from './chat-lazy';

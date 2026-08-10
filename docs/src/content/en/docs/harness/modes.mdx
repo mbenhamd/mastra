@@ -7,9 +7,9 @@ packages:
 
 # Modes
 
-Modes define the different behaviors a Harness can run. Each mode layers its own instructions and tool overrides on top of a shared backing agent, so the same agent can act as a planner in one mode and an executor in another. The Harness keeps exactly one mode active at a time, carries the thread and state across switches, and handles the transition between them.
+Modes define the different behaviors a Harness can run. Each mode layers its own instructions and tool overrides on top of a shared backing agent, so the same agent can act as a planner in one mode and an executor in another. The Harness keeps exactly one mode active at a time and carries the thread and state across switches. It also handles transitions between modes.
 
-Every Harness needs at least one mode — the `modes` array is required, and the Harness throws at construction if it's empty. A single-purpose Harness still defines one mode; multiple modes are how you give a session more than one behavior to switch between.
+Every Harness needs at least one mode. The `modes` array is required, and the Harness throws at construction if it's empty. A single-purpose Harness still defines one mode. Multiple modes give a session more than one behavior to switch between.
 
 A mode supplies three things that change how the agent behaves:
 
@@ -108,9 +108,9 @@ const toolFreeMode = {
 }
 ```
 
-Replacement is enforced on every agent-loop step and across suspend and resume while the same live Harness instance retains the canonical tool snapshot. After each input-processor pass Mastra materializes a fresh trusted tool map, so processors can remove an allowed tool for a step but can't add a tool outside the replacement surface, replace an allowed implementation, or mutate the configuration used by later model or execution calls.
+Replacement is enforced on every agent-loop step and across suspend and resume while the same live Harness instance retains the canonical tool snapshot. After each input-processor pass Mastra materializes a fresh trusted tool map, so processors can remove an allowed tool for a step. They can't add a tool outside the replacement surface or replace an allowed implementation. They also can't mutate the configuration used by later model or execution calls.
 
-Harness persists the allowed tool names, but executable tool objects are process-local. After `harness.shutdown()`, process loss, or session rehydration in another Harness instance, a pending replacement run fails closed before it's marked resumed—even when the new Harness has same-named static mode tools—because Mastra can't prove implementation identity from names alone.
+Harness persists the allowed tool names, but executable tool objects are process-local. After `harness.shutdown()`, process loss, or session rehydration in another Harness instance, a pending replacement run fails closed before it's marked resumed, even when the new Harness has static mode tools with matching names, because Mastra can't prove implementation identity from names alone.
 
 ### Mode transitions
 
@@ -129,7 +129,7 @@ On plan approval, the Harness automatically switches to `build` mode. On rejecti
 
 ## Switching modes
 
-The active mode lives on the Session, so call `harness.session.mode.switch()` to change it. The switch aborts any in-progress generation, saves the current model to the outgoing mode, and emits a `mode_changed` event. It then resolves the incoming mode's model and, when one resolves, applies it and emits a `model_changed` event:
+The active mode lives on the Session, so call `harness.session.mode.switch()` to change it. The switch aborts any in-progress generation and saves the current model to the outgoing mode. It then emits a `mode_changed` event and resolves the incoming mode's model. When a model resolves, the switch applies it and emits a `model_changed` event:
 
 ```typescript
 await harness.session.mode.switch({ modeId: 'build' })

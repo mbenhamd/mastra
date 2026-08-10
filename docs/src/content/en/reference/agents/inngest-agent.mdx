@@ -174,7 +174,7 @@ When a live `RequestContext` policy and `resolveToolPermission` are both availab
 
 Tool batches run sequentially whenever current permission resolution is required. Mastra checks both the serialized run option and the live durable marker, including snapshots written before the serialized option existed.
 
-On resume, the durable-agent adapter replaces the stored workflow context with a new bounded snapshot. It keeps only keys in `durableRequestContextKeys`, applies fresh values over stored values, and preserves the policy-required marker. Unallowlisted values and credential-like keys are removed, including values from snapshots created before this filter existed.
+On resume, the durable-agent adapter replaces the stored workflow context with a new bounded snapshot. It keeps only keys in `durableRequestContextKeys` and applies fresh values over stored values. It also preserves the policy-required marker. Unallowlisted values and credential-like keys are removed, including values from snapshots created before this filter existed.
 
 ### Protocol-v2 deployment
 

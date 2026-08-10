@@ -944,6 +944,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
           },
           workflowStatus: 'canceled',
           requestContext: currentRequestContext,
+          phase: 'workflow-canceled',
         });
 
         workflowSpan?.end({
@@ -1131,6 +1132,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
             error: result.error,
             requestContext: currentRequestContext,
             tracingContext: persistTracingContext,
+            phase: 'workflow-terminal',
           });
         }
 
@@ -1295,6 +1297,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
             executionContext: lastExecutionContext,
             workflowStatus: 'paused',
             requestContext: currentRequestContext,
+            phase: 'workflow-paused',
           });
         }
 
@@ -1343,6 +1346,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
         result: result.result,
         error: result.error,
         requestContext: currentRequestContext,
+        phase: 'workflow-terminal',
       });
     }
 

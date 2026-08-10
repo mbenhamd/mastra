@@ -7,11 +7,11 @@ packages:
 
 # Tool approvals and permissions
 
-The Harness provides a permission system that controls which tools require user approval before execution. You can configure policies at the category level or per-tool, and grant session-wide exceptions for trusted tools. This gives agents with access to destructive or sensitive tools — file writes, command execution, API calls — a human-in-the-loop checkpoint before those tools run.
+The Harness provides a permission system that controls which tools require user approval before execution. Set category-level or per-tool policies. You can also grant session-wide exceptions for trusted tools. Agents with access to destructive or sensitive tools then receive a human-in-the-loop checkpoint before those tools run.
 
 ## Permission policies
 
-Three policies control tool behavior:
+Available tool policies:
 
 - `allow`: The tool runs without prompting
 - `ask`: The tool pauses and emits a `tool_approval_required` event; the user must approve or decline
@@ -67,7 +67,7 @@ harness.session.respondToToolApproval({ decision: 'always_allow_category' })
 
 ## Session grants
 
-The Harness owns permission _policy_ (which categories require approval); the [`Session`](/docs/harness/session) owns the _grants_ a user makes during a conversation. Grant a category or tool for the rest of the session so it runs without further prompting:
+The Harness owns permission _policy_, which determines the categories that require approval. The [`Session`](/docs/harness/session) owns the _grants_ a user makes during a conversation. Grant a category or tool for the rest of the session so it runs without further prompting:
 
 ```typescript
 // Grant all edit tools for this session

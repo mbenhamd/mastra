@@ -340,6 +340,7 @@ export function runMC<TState extends Record<string, unknown>>(options: RunMCOpti
         }
         session.respondToToolApproval({
           decision: decision === 'approve' ? 'approve' : 'decline',
+          runId: event.runId,
           toolCallId: event.toolCallId,
         });
         queue.push(event);

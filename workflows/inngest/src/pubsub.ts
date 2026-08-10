@@ -73,7 +73,7 @@ function decodeEvent(value: unknown, requireReplayIdentity: boolean): Event {
 }
 
 type TopicRoute = {
-  topicType: 'workflow' | 'lifecycle' | 'agent';
+  topicType: 'workflow' | 'lifecycle' | 'agent' | 'control';
   channel: string;
   inngestTopic: string;
   runId: string;
@@ -91,6 +91,7 @@ function lifecycleChannel(topic: string): string {
  * - "workflow.lifecycle.v1.{workflowId}.{runId}.{executionGeneration}" - replayable lifecycle events
  * - "workflow.events.v2.{runId}" - legacy workflow watch events
  * - "agent.stream.{runId}" - agent stream events
+ * - "agent.control.{runId}.{runtimeBindingId}" - binding-scoped durable-agent control events
  *
  * @returns { runId, topicType } or null if not a recognized format
  */
@@ -143,6 +144,31 @@ function parseTopic(topic: string, workflowId: string): TopicRoute | null {
     };
   }
 
+  // Durable control events are scoped to one immutable runtime binding so a
+  // retained abort cannot affect a later execution that reuses the run ID.
+  const controlPrefix = 'agent.control.';
+  if (topic.startsWith(controlPrefix)) {
+    const encodedParts = topic.slice(controlPrefix.length).split('.');
+    if (encodedParts.length === 2 && encodedParts.every(Boolean)) {
+      try {
+        const [encodedRunId, encodedRuntimeBindingId] = encodedParts as [string, string];
+        const runId = decodeURIComponent(encodedRunId);
+        const runtimeBindingId = decodeURIComponent(encodedRuntimeBindingId);
+        if (runId.length > 0 && runtimeBindingId.length > 0) {
+          return {
+            runId,
+            topicType: 'control',
+            channel: `agent:${encodedRunId}.${encodedRuntimeBindingId}`,
+            inngestTopic: 'agent-control',
+            requireReplayIdentity: false,
+          };
+        }
+      } catch {
+        // Malformed URI encoding is not a canonical control topic.
+      }
+    }
+  }
+
   return null;
 }
 
@@ -191,7 +217,9 @@ export class InngestPubSub extends PubSub {
    *   -> channel: "workflow:{workflowId}:{runId}", topic: "watch"
    * - "agent.stream.{runId}" - agent stream events
    *   -> channel: "agent:{runId}", topic: "agent-stream"
-   *   (Note: agent stream uses runId-only channel so nested workflows can publish to same channel)
+   * - "agent.control.{runId}.{runtimeBindingId}" - durable-agent control events
+   *   -> channel: "agent:{runId}.{runtimeBindingId}", topic: "agent-control"
+   *   (Binding-scoped channels isolate retained aborts across run-ID reuse.)
    */
   async publish(topic: string, event: PublishEvent, options?: { localOnly?: boolean }): Promise<void> {
     const parsed = parseTopic(topic, this.workflowId);
@@ -233,6 +261,7 @@ export class InngestPubSub extends PubSub {
       // a terminal chunk if this publish committed before the worker crashed.
       if (
         topicType === 'lifecycle' ||
+        topicType === 'control' ||
         isCriticalTerminalChunk ||
         (topicType === 'agent' && (event.type === 'finish' || event.type === 'error'))
       ) {
@@ -253,7 +282,9 @@ export class InngestPubSub extends PubSub {
    *   -> channel: "workflow:{workflowId}:{runId}", topic: "watch"
    * - "agent.stream.{runId}" - agent stream events
    *   -> channel: "agent:{runId}", topic: "agent-stream"
-   *   (Note: agent stream uses runId-only channel so nested workflows can publish to same channel)
+   * - "agent.control.{runId}.{runtimeBindingId}" - durable-agent control events
+   *   -> channel: "agent:{runId}.{runtimeBindingId}", topic: "agent-control"
+   *   (Binding-scoped channels isolate retained aborts across run-ID reuse.)
    */
   async subscribe(topic: string, cb: EventCallback, _options?: SubscribeOptions): Promise<void> {
     const parsed = parseTopic(topic, this.workflowId);

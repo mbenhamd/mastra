@@ -6,6 +6,7 @@ import type { InMemoryTaskStore } from '@mastra/server/a2a/store';
 import type { MCPHttpTransportResult, MCPSseTransportResult } from '@mastra/server/handlers/mcp';
 import type { ParsedRequestParams, ServerRoute } from '@mastra/server/server-adapter';
 import {
+  MASTRA_FRAMEWORK_PUBLIC_KEY,
   MastraServer as MastraServerBase,
   checkRouteFGA,
   isZodError,
@@ -48,7 +49,17 @@ export type HonoVariables = {
   taskStore: InMemoryTaskStore;
   customRouteAuthConfig?: Map<string, boolean>;
   cachedBody?: unknown;
+  /**
+   * True when the current request targets a route the framework has declared
+   * public (`requiresAuth: false`). Framework authentication may inspect this
+   * flag; general host middleware must still execute.
+   */
+  [MASTRA_FRAMEWORK_PUBLIC_KEY]?: boolean;
 };
+
+// Re-export the framework-public context key so users configuring Hono apps
+// can reference it directly without importing from @mastra/server.
+export { MASTRA_FRAMEWORK_PUBLIC_KEY } from '@mastra/server/server-adapter';
 
 export type HonoBindings = {};
 
@@ -201,7 +212,7 @@ export class MastraServer extends MastraServerBase<HonoApp, HonoRequest, Context
         const reader = readableStream.getReader();
 
         stream.onAbort(() => {
-          void reader.cancel('request aborted');
+          void reader.cancel('request aborted').catch(() => {});
         });
 
         try {
@@ -818,7 +829,20 @@ export class MastraServer extends MastraServerBase<HonoApp, HonoRequest, Context
   }
 
   registerContextMiddleware(): void {
+    // Precompute the framework-public matcher once at registration time.
+    // Called per request below so framework authentication can skip only its
+    // own check on routes declared public via `requiresAuth: false`.
+    const isFrameworkPublic = this.getFrameworkPublicMatcher();
+
     this.app.use('*', this.createContextMiddleware());
+    this.app.use('*', async (c, next) => {
+      c.set(MASTRA_FRAMEWORK_PUBLIC_KEY, isFrameworkPublic(c.req.path, c.req.method));
+      return next();
+    });
+    this.app.use('*', async (c, next) => {
+      await next();
+      this.warnIfUnregisteredChannelWebhook(c.req.path, c.req.method, c.res.status);
+    });
   }
 
   registerAuthMiddleware(): void {

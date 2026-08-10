@@ -142,7 +142,7 @@ export async function dispatchEvent(
         threadId: state.session.thread.getId(),
         resourceId: state.session.identity.getResourceId(),
       });
-      handleToolApprovalRequired(ectx, event.toolCallId, event.toolName, event.args);
+      handleToolApprovalRequired(ectx, event.runId, event.toolCallId, event.toolName, event.args);
       break;
 
     case 'tool_update':

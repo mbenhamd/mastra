@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { EventEmitterPubSub } from '../../../../events/event-emitter';
+import { PUBSUB_SYMBOL } from '../../../../workflows/constants';
 import { globalRunRegistry } from '../../run-registry';
 import { createDurableBackgroundTaskCheckStep } from './background-task-check';
 
@@ -73,18 +75,50 @@ afterEach(() => {
 describe('createDurableBackgroundTaskCheckStep', () => {
   it('fails closed when a built-in durable run loses its runtime registry entry', async () => {
     const step = createDurableBackgroundTaskCheckStep();
-
-    await expect(
+    const runId = 'missing-runtime';
+    const execute = () =>
       (step as any).execute({
         inputData: baseInput(),
         retryCount: 0,
         getInitData: () => ({
-          runId: 'missing-runtime',
+          runId,
+          runtimeBindingId: 'missing-runtime-binding',
           agentId: 'a1',
           runtimeResolution: 'registry-required',
         }),
-      }),
-    ).rejects.toMatchObject({ id: 'DURABLE_AGENT_RUNTIME_REGISTRY_MISSING' });
+        // The remote-listener bootstrap must not seed a placeholder that
+        // bypasses the built-in runtime's fail-closed registry check.
+        [PUBSUB_SYMBOL]: {},
+      });
+
+    await expect(execute()).rejects.toMatchObject({ id: 'DURABLE_AGENT_RUNTIME_REGISTRY_MISSING' });
+
+    globalRunRegistry.set(runId, {
+      isPlaceholder: true,
+      runtimeBindingId: 'missing-runtime-binding',
+    } as any);
+    await expect(execute()).rejects.toMatchObject({ id: 'DURABLE_AGENT_RUNTIME_REGISTRY_MISSING' });
+    globalRunRegistry.delete(runId);
+  });
+
+  it('installs the replayed abort listener before checking background tasks', async () => {
+    const { getInitData, runId } = setupRegistry({ runningTasks: [] });
+    const pubsub = new EventEmitterPubSub();
+
+    try {
+      const step = createDurableBackgroundTaskCheckStep();
+      await (step as any).execute({
+        inputData: baseInput(),
+        retryCount: 0,
+        getInitData: getInitData(),
+        [PUBSUB_SYMBOL]: pubsub,
+      });
+
+      expect(globalRunRegistry.get(runId)?.remoteAbortListenerInstalled).toBe(true);
+    } finally {
+      globalRunRegistry.delete(runId);
+      await pubsub.close();
+    }
   });
 
   it('passes through unchanged when no manager is configured', async () => {

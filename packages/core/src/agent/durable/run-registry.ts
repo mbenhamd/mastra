@@ -48,10 +48,10 @@ export function pinGlobalRunRegistryEntry(runId: string): RunRegistryEntry | und
   return entry;
 }
 
-/** Release an active segment and restore its TTL entry when it remains resumable. */
-export function unpinGlobalRunRegistryEntry(runId: string): void {
+/** Release an exact active segment and restore its TTL entry when it remains resumable. */
+export function unpinGlobalRunRegistryEntry(runId: string, runtimeBindingId: string | undefined): void {
   const pinned = pinnedRunRegistry.get(runId);
-  if (!pinned) return;
+  if (!pinned || pinned.entry.runtimeBindingId !== runtimeBindingId) return;
   pinned.count -= 1;
   if (pinned.count > 0) return;
   pinnedRunRegistry.delete(runId);
@@ -99,11 +99,11 @@ export function getBoundRunRegistryEntry(runId: string, runtimeBindingId?: strin
   const entry = getGlobalRunRegistryEntry(runId);
   if (
     entry &&
-    // Placeholder entries are cross-process carriers (e.g. the abort
-    // controller seeded by @mastra/inngest resume()). They hold no usable
-    // runtime dependencies — consumers rebuild from the Mastra instance — so
-    // a binding check would only break legitimate cross-process resumes.
-    entry.isPlaceholder !== true &&
+    // A legacy placeholder may be created before its persisted binding is
+    // loaded. Once a placeholder is stamped, it is fenced exactly like a full
+    // runtime entry so a reused run ID cannot adopt another execution's
+    // controller or cleanup.
+    (entry.isPlaceholder !== true || entry.runtimeBindingId !== undefined) &&
     (entry.runtimeBindingId !== runtimeBindingId ||
       // Inputs persisted before runtime bindings existed may reconstruct after
       // a process restart, but must never attach to a newly registered run that
@@ -119,7 +119,7 @@ export function getBoundRunRegistryEntry(runId: string, runtimeBindingId?: strin
 
 /** Register without replacing another active run that happens to reuse the same ID. */
 export function registerGlobalRunRegistryEntry(runId: string, entry: RunRegistryEntry): void {
-  if (globalRunRegistry.has(runId)) {
+  if (getGlobalRunRegistryEntry(runId)) {
     throw new Error(`Durable run ${runId} is already active. Refusing to replace its runtime dependencies.`);
   }
   globalRunRegistry.set(runId, entry);
@@ -127,9 +127,23 @@ export function registerGlobalRunRegistryEntry(runId: string, entry: RunRegistry
 
 /** Delete only the entry owned by the caller; stale cleanup must not delete a newer binding. */
 export function deleteBoundRunRegistryEntry(runId: string, runtimeBindingId: string): boolean {
-  const entry = globalRunRegistry.get(runId);
-  if (entry?.runtimeBindingId !== runtimeBindingId) return false;
-  globalRunRegistry.delete(runId);
+  const pinned = pinnedRunRegistry.get(runId);
+  const cached = globalRunRegistry.get(runId);
+  const pinnedMatches = pinned?.entry.runtimeBindingId === runtimeBindingId;
+  const cachedMatches = cached?.runtimeBindingId === runtimeBindingId;
+  if (!pinnedMatches && !cachedMatches) return false;
+
+  // Terminal cleanup can race the active segment's `finally`. Remove the
+  // matching pin first so a later unpin cannot restore terminal runtime state
+  // into the TTL registry and block legitimate run-ID reuse.
+  if (pinnedMatches) pinnedRunRegistry.delete(runId);
+
+  if (cachedMatches) {
+    const disposalSuppressedByAnotherPin = pinnedRunRegistry.has(runId);
+    globalRunRegistry.delete(runId);
+    if (disposalSuppressedByAnotherPin) cached.cleanup?.();
+  }
+  if (pinnedMatches && pinned.entry !== cached) pinned.entry.cleanup?.();
   return true;
 }
 

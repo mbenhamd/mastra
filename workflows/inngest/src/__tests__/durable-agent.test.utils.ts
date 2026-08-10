@@ -154,6 +154,22 @@ async function cleanupSharedTestInfrastructureResources(): Promise<unknown[]> {
   return cleanup.errors;
 }
 
+/** Stop a policy-owned dev runtime used by a connect-worker test. */
+export async function stopInngestDevServer(runtime: InngestTestRuntimeManager | null): Promise<void> {
+  await runtime?.stop();
+}
+
+/**
+ * Start the policy-owned, digest-pinned Inngest runtime without HTTP function
+ * registration. The test's connect worker registers functions over the gateway.
+ */
+export async function startConnectInngestDevServer(): Promise<InngestTestRuntimeManager | null> {
+  if (process.env.INNGEST_DEV_EXTERNAL === 'true') return null;
+  const runtime = new InngestTestRuntimeManager(createInngestTestRuntimeConfig(DURABLE_AGENT_TEST_ENDPOINTS));
+  await runtime.start();
+  return runtime;
+}
+
 /**
  * Initialize shared test infrastructure.
  * Call this once in beforeAll for the test suite.

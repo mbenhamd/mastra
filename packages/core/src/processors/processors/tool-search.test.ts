@@ -495,7 +495,7 @@ describe('ToolSearchProcessor', () => {
       expect(loadResult.message).toContain('Did you mean');
     });
 
-    it('should preserve key-only suggestions when filter is omitted', async () => {
+    it('should suggest the effective callable name when filter is omitted', async () => {
       const processor = new ToolSearchProcessor({
         tools: {
           weather: createMockTool('weather_tool_id', 'Get weather'),
@@ -509,8 +509,7 @@ describe('ToolSearchProcessor', () => {
       const loadResult = await loadTool!.execute?.({ toolName: 'weath' }, undefined);
 
       expect(loadResult.success).toBe(false);
-      expect(loadResult.message).toContain('Did you mean: weather');
-      expect(loadResult.message).not.toContain('weather_tool_id');
+      expect(loadResult.message).toContain('Did you mean: weather_tool_id');
     });
 
     it('should reject ambiguous key/id collisions', () => {
@@ -906,8 +905,8 @@ describe('ToolSearchProcessor', () => {
       const loadResult = await result.tools?.load_tool!.execute?.({ toolName: 'weath' }, undefined);
 
       expect(loadResult.success).toBe(false);
-      expect(loadResult.message).not.toContain('weather_private_alias');
-      expect(loadResult.message).toContain('weather_public_alias');
+      expect(loadResult.message).not.toContain('private_weather');
+      expect(loadResult.message).toContain('public_weather');
     });
 
     it('should fill search results from lower-ranked allowed matches', async () => {
@@ -949,7 +948,7 @@ describe('ToolSearchProcessor', () => {
       args1.requestContext?.set('plan', 'pro');
       const result1 = await processor.processInputStep(args1);
       await result1.tools?.search_tools!.execute?.({ query: 'weather' }, undefined);
-      await result1.tools?.load_tool!.execute?.({ toolName: 'weather' }, undefined);
+      await result1.tools?.load_tool!.execute?.({ toolName: 'weather_tool_id' }, undefined);
 
       const args2 = createMockArgs('thread-filter-args');
       args2.requestContext?.set('plan', 'pro');
