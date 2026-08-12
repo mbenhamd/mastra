@@ -4,6 +4,7 @@ import type { OutputProcessor, Processor } from '../../../../processors';
 import { createTool } from '../../../../tools';
 import { runLoopScenario, useLoopScenarioAimock, describeForAllEngines } from '../aimock-scenario';
 import type { IterationCompleteContext } from '../../../../agent';
+import { AGENT_RESPONSE_RECOVERY_CONTINUATION } from '../../../../agent/merge-execution-options';
 
 /**
  * Regression class: onIterationComplete hook — supervisor iteration tracking.
@@ -520,7 +521,11 @@ describeForAllEngines(
         onIterationComplete: (context: IterationCompleteContext) => {
           if (!responseOnly && context.isFinal && context.text.trim() === '' && context.toolResults.length > 0) {
             responseOnly = true;
-            return { continue: true, feedback: 'Report the completed result without tools.' };
+            return {
+              continue: true,
+              feedback: 'Report the completed result without tools.',
+              [AGENT_RESPONSE_RECOVERY_CONTINUATION]: true,
+            };
           }
           if (responseOnly) return { continue: false };
           return undefined;
@@ -544,6 +549,42 @@ describeForAllEngines(
         .join('');
       expect(text).toContain('The capped action succeeded.');
       expect(text).not.toContain('UNEXPECTED_THIRD_CALL');
+    });
+
+    it('does not spend recoveryMaxSteps on an ordinary continued tool iteration', async () => {
+      let toolExecutions = 0;
+      const ordinaryTool = createTool({
+        id: 'ordinary_tool',
+        description: 'Run ordinary work',
+        inputSchema: z.object({}),
+        outputSchema: z.object({ ok: z.boolean() }),
+        execute: async () => {
+          toolExecutions += 1;
+          return { ok: true };
+        },
+      });
+
+      const { requests } = await runLoopScenario({
+        engine,
+        llm: getMock(),
+        prompt: 'Run ordinary work.',
+        tools: { ordinary_tool: ordinaryTool },
+        maxSteps: 1,
+        recoveryMaxSteps: 1,
+        fixtures: llm => {
+          llm.on(
+            { endpoint: 'chat', sequenceIndex: 0 },
+            { toolCalls: [{ id: 'ordinary-call-1', name: 'ordinary_tool', arguments: {} }] },
+          );
+          llm.on(
+            { endpoint: 'chat', sequenceIndex: 1 },
+            { toolCalls: [{ id: 'ordinary-call-2', name: 'ordinary_tool', arguments: {} }] },
+          );
+        },
+      });
+
+      expect(requests).toHaveLength(1);
+      expect(toolExecutions).toBe(1);
     });
 
     it('does not reopen a tripwire stop after earlier tool work', async () => {

@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { StepResult, ToolSet } from '@internal/ai-sdk-v5';
+import { AGENT_RESPONSE_RECOVERY_CONTINUATION } from '../../../agent/merge-execution-options';
 import type { MastraDBMessage } from '../../../memory';
 import { InternalSpans } from '../../../observability';
 import { safeEnqueue } from '../../../stream/base';
@@ -46,6 +47,7 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
   let previousCallerVisibleContentLength = 0;
   // When continue:false + feedback, allow one more LLM turn then stop
   let pendingFeedbackStop = false;
+  let responseRecoveryReserved = false;
   // When this loop is a resume (e.g. after tool approval), the suspended run
   // already flushed its in-progress assistant message to storage. The first
   // continuation must start a fresh response message instead of merging into
@@ -275,13 +277,19 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
 
         try {
           const iterationResult = await rest.onIterationComplete(iterationContext);
+          const reservesResponseRecovery =
+            iterationResult?.[AGENT_RESPONSE_RECOVERY_CONTINUATION] === true &&
+            rest.maxSteps !== undefined &&
+            rest.recoveryMaxSteps !== undefined &&
+            accumulatedSteps.length >= rest.maxSteps &&
+            accumulatedSteps.length < rest.maxSteps + rest.recoveryMaxSteps;
 
           // A terminal tool result is already the caller-visible answer. The
           // callback may observe that iteration, but its continuation feedback
           // must not become a hidden synthetic assistant message that appears
           // only in persisted history.
           if (iterationResult && !typedInputData.terminalToolResult) {
-            if (iterationResult.feedback && typedInputData.stepResult?.isContinued) {
+            if (iterationResult.feedback && typedInputData.stepResult?.isContinued && !reservesResponseRecovery) {
               messageList.add(
                 {
                   id: rest.mastra?.generateId() || randomUUID(),
@@ -327,7 +335,7 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
               // otherwise the loop re-enters against a sealed message and the
               // extra turn produces nothing caller-visible (live-diagnosed as
               // the silent-turn nudge failing to surface any text).
-              if (rest.maxSteps === undefined || accumulatedSteps.length <= rest.maxSteps) {
+              if (rest.maxSteps === undefined || accumulatedSteps.length < rest.maxSteps || reservesResponseRecovery) {
                 if (iterationResult.feedback) {
                   messageList.add(
                     {
@@ -367,6 +375,7 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
                   user: messageList.get.input.aiV5.model(),
                   nonUser: messageList.get.response.aiV5.model(),
                 };
+                responseRecoveryReserved = reservesResponseRecovery;
               }
             }
           }
@@ -381,11 +390,8 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
       // natural/scorer/background/configured continuation; only a hook-forced
       // continuation from an otherwise terminal iteration may cross it.
       const forcedResponseOnlyContinuation =
-        typedInputData.stepResult?.isContinued === true &&
-        rest.maxSteps !== undefined &&
-        rest.recoveryMaxSteps !== undefined &&
-        accumulatedSteps.length >= rest.maxSteps &&
-        accumulatedSteps.length < rest.maxSteps + rest.recoveryMaxSteps;
+        responseRecoveryReserved && typedInputData.stepResult?.isContinued === true;
+      responseRecoveryReserved = false;
       if (forcedResponseOnlyContinuation) {
         // The AI-SDK-compatible maxSteps stop condition already marked this
         // iteration complete before the hook ran. Clear only that boundary so

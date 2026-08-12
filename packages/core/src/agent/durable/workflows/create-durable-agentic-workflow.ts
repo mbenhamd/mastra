@@ -14,6 +14,7 @@ import { RequestContext } from '../../../request-context';
 import { PUBSUB_SYMBOL } from '../../../workflows/constants';
 import { createWorkflow } from '../../../workflows/create';
 import type { WorkflowOptions } from '../../../workflows/types';
+import { AGENT_RESPONSE_RECOVERY_CONTINUATION } from '../../merge-execution-options';
 import { MessageList } from '../../message-list';
 import {
   TOOL_PERMISSION_POLICY_KEY,
@@ -541,6 +542,7 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
               // (pendingFeedbackStop, delegationBailed) are unconditional —
               // onIterationComplete cannot override them.
               const canUseRecoveryTurn =
+                iterationResult[AGENT_RESPONSE_RECOVERY_CONTINUATION] === true &&
                 recoveryMaxSteps > 0 &&
                 state.iterationCount >= runMaxSteps &&
                 state.iterationCount < runMaxSteps + recoveryMaxSteps;

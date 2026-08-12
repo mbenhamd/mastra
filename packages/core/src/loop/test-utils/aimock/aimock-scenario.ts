@@ -388,7 +388,7 @@ export async function runLoopScenario(opts: RunLoopScenarioOptions): Promise<Loo
     ...(runId ? { runId } : {}),
     ...(stopWhen ? { stopWhen } : {}),
     ...(maxSteps ? { maxSteps } : {}),
-    ...(recoveryMaxSteps ? { recoveryMaxSteps } : {}),
+    ...(recoveryMaxSteps !== undefined ? { recoveryMaxSteps } : {}),
     // Durable needs maxSteps as a fallback when stopWhen was the only bound
     ...(!maxSteps && stopWhen && isDurable ? { maxSteps: 10 } : {}),
     ...(isTaskComplete ? { isTaskComplete } : {}),

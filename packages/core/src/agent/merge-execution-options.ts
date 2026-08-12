@@ -9,6 +9,9 @@ import { deepMerge } from '../utils';
  */
 export const AGENT_EXECUTION_OPTION_COMPOSERS = Symbol('agentExecutionOptionComposers');
 
+/** Internal marker returned only by a framework-owned response-recovery hook. */
+export const AGENT_RESPONSE_RECOVERY_CONTINUATION = Symbol('agentResponseRecoveryContinuation');
+
 export type AgentExecutionOptionComposers = Partial<
   Record<'onIterationComplete' | 'prepareStep', (existing: unknown) => unknown>
 > & {

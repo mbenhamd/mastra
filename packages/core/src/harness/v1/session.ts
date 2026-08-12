@@ -35,6 +35,7 @@ import { Agent } from '../../agent';
 import type { AgentExecutionOptionsBase } from '../../agent/agent.types';
 import {
   AGENT_EXECUTION_OPTION_COMPOSERS,
+  AGENT_RESPONSE_RECOVERY_CONTINUATION,
   type AgentExecutionOptionComposers,
 } from '../../agent/merge-execution-options';
 import { createSignal } from '../../agent/signals';
@@ -490,6 +491,7 @@ function createHarnessEmptySynthesisOptions(reportConfiguredHookError: HarnessEx
             return {
               ...(configuredResult ?? {}),
               continue: true,
+              [AGENT_RESPONSE_RECOVERY_CONTINUATION]: true,
               // Bare regeneration is not enough for models that habitually stop
               // after tool use (live-verified). Feedback is a suppressed assistant
               // note, so the model sees it but transcripts stay clean.
