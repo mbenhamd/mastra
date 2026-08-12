@@ -294,6 +294,70 @@ describeForAllEngines('AIMock loop scenario: onIterationComplete hook', engine =
     expect(iterations[0]?.text).toBe('');
   });
 
+  it('attributes inserted prefix text to the processed step that introduced it', async () => {
+    const firstStepText = 'First step narration.';
+    const insertedPrefix = 'Inserted prefix before prior narration.';
+    const iterations: IterationCompleteContext[] = [];
+    const inspectTool = createTool({
+      id: 'insert_prefix_attribution_probe',
+      description: 'Return a value before the final silent step.',
+      inputSchema: z.object({ value: z.string() }),
+      outputSchema: z.object({ value: z.string() }),
+      execute: async ({ value }) => ({ value }),
+    });
+    const insertPrefixBeforePriorNarration: OutputProcessor = {
+      id: 'insert-prefix-before-prior-narration',
+      processOutputStep({ messages, stepNumber }) {
+        if (stepNumber === 0) return messages;
+        return messages.map(message => {
+          const containsPriorNarration = message.content.parts.some(
+            part => part.type === 'text' && part.text === firstStepText,
+          );
+          return containsPriorNarration
+            ? {
+                ...message,
+                content: {
+                  ...message.content,
+                  parts: [{ type: 'text' as const, text: insertedPrefix }, ...message.content.parts],
+                },
+              }
+            : message;
+        });
+      },
+    };
+
+    await runLoopScenario({
+      engine,
+      llm: getMock(),
+      prompt: 'Inspect the value, then finish silently.',
+      tools: { insert_prefix_attribution_probe: inspectTool },
+      outputProcessors: [insertPrefixBeforePriorNarration],
+      onIterationComplete: (context: IterationCompleteContext) => {
+        iterations.push(context);
+      },
+      fixtures: llm => {
+        llm.on(
+          { endpoint: 'chat', sequenceIndex: 0 },
+          {
+            content: firstStepText,
+            toolCalls: [
+              {
+                id: 'call_insert_prefix_attribution_probe',
+                name: 'insert_prefix_attribution_probe',
+                arguments: { value: 'ready' },
+              },
+            ],
+          },
+        );
+        llm.on({ endpoint: 'chat', sequenceIndex: 1 }, { content: '' });
+      },
+    });
+
+    expect(iterations.map(iteration => iteration.text)).toEqual([firstStepText, '']);
+    expect(iterations[1]?.text).not.toContain(insertedPrefix);
+    expect(iterations[1]?.text).not.toContain(firstStepText);
+  });
+
   it('keeps the current step visible when a processor removes earlier narration', async () => {
     const earlierText = 'Private setup narration.';
     const finalText = 'Caller-visible final answer.';

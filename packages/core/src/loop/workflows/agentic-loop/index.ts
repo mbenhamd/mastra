@@ -177,24 +177,24 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
 
       const toolResultParts = currentContent.filter(part => part.type === 'tool-result');
 
-      // The MessageList slice excludes framework feedback by provenance and
-      // preserves approval-resume behavior. If a successful output processor
-      // removed or rewrote earlier narration, that cumulative slice may shift
-      // left and become empty; in that processor-only case, use the completed
-      // step's already-processed content as the current-step authority.
+      // Without output processors, the MessageList slice excludes framework
+      // feedback by provenance and preserves approval-resume behavior. With
+      // output processors, cumulative caller-visible content is not a stable
+      // cursor: a processor may insert, remove, or reorder earlier parts. The
+      // completed step's processed content is therefore the sole authority for
+      // the current iteration, including an intentionally empty/redacted step.
       const latestCompletedStep = typedInputData.output.steps.at(-1);
       const processedStepText = latestCompletedStep?.content
         .filter(part => part.type === 'text')
         .map(part => part.text)
         .join('');
-      const projectedStepText = currentCallerVisibleContent
-        .filter(part => part.type === 'text')
-        .map(part => part.text)
-        .join('');
-      const currentIterationText =
-        typedInputData.stepResult?.reason === 'tripwire'
-          ? ''
-          : projectedStepText || (rest.outputProcessors?.length ? (processedStepText ?? '') : '');
+      const projectedStepText = rest.outputProcessors?.length
+        ? (processedStepText ?? '')
+        : currentCallerVisibleContent
+            .filter(part => part.type === 'text')
+            .map(part => part.text)
+            .join('');
+      const currentIterationText = typedInputData.stepResult?.reason === 'tripwire' ? '' : projectedStepText;
 
       const currentStep: StepResult<Tools> = {
         content: currentContent,
