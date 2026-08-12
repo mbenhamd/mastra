@@ -1520,14 +1520,13 @@ export class MessageList {
   /**
    * A feedback note a loop injects so the model sees an instruction on its next
    * turn (supervisor `onIterationComplete` feedback, network completion
-   * feedback). It is flagged `suppressFeedback` precisely because it must stay
-   * out of anything shown to the caller.
+   * feedback). A failing completion report remains model-visible so the next
+   * iteration can improve, but it is never part of the caller's answer.
    */
   private static isSuppressedFeedbackMessage(message: MastraDBMessage): boolean {
-    return (
-      (message.content?.metadata?.completionResult as { suppressFeedback?: boolean } | undefined)?.suppressFeedback ===
-      true
-    );
+    const completionResult = message.content?.metadata?.completionResult as
+      { passed?: boolean; suppressFeedback?: boolean } | undefined;
+    return completionResult?.suppressFeedback === true || completionResult?.passed === false;
   }
 
   /**

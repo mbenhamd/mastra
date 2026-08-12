@@ -2387,8 +2387,8 @@ describe('Supervisor Pattern - onIterationComplete Hook Integration', () => {
     expect(text).not.toContain(NUDGE);
   });
 
-  it('should accept onIterationComplete configuration without errors', async () => {
-    const hookMock = vi.fn(() => ({ continue: true }));
+  it('should observe a terminal iteration without forcing continuation', async () => {
+    const hookMock = vi.fn();
 
     const agent = new Agent({
       id: 'test-agent',
@@ -2441,8 +2441,8 @@ describe('Supervisor Pattern - onIterationComplete Hook Integration', () => {
     expect(result).toBeDefined();
     expect(result.text).toBe('Response');
 
-    // Hook should be called after the iteration
-    expect(hookMock).toHaveBeenCalled();
+    // The hook observes the terminal iteration but does not request more work.
+    expect(hookMock).toHaveBeenCalledTimes(1);
   });
 });
 

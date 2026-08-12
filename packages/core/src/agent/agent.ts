@@ -9216,7 +9216,7 @@ export class Agent<
     const defaultOptions = await this.getDefaultOptions({
       requestContext: requestContextToUse,
     });
-    const mergedOptions = mergeAgentExecutionOptions(
+    const mergedOptions = deepMerge(
       defaultOptions as Record<string, unknown>,
       (options ?? {}) as Record<string, unknown>,
     ) as AgentExecutionOptions<any> & { model?: DynamicArgument<MastraModelConfig> };

@@ -45,7 +45,9 @@ describe('mergeAgentExecutionOptions', () => {
 
     await expect(merged.prepareStep()).resolves.toEqual({ activeTools: [], workspace: 'configured-workspace' });
     expect(calls).toEqual(['configured', 'internal']);
-    expect(Reflect.ownKeys(merged)).not.toContain(AGENT_EXECUTION_OPTION_COMPOSERS);
+    // The run-local factory remains internal symbol metadata so an enclosing
+    // stream/resume boundary can create a fresh composition.
+    expect(Reflect.ownKeys(merged)).toContain(AGENT_EXECUTION_OPTION_COMPOSERS);
   });
 
   it('does not let internal hook composition change the caller step budget', () => {
@@ -61,5 +63,33 @@ describe('mergeAgentExecutionOptions', () => {
       recoveryMaxSteps: 1,
     });
     expect(mergeAgentExecutionOptions({}, composer).maxSteps).toBeUndefined();
+  });
+
+  it('creates a fresh internal hook composition when already-merged caller options are merged again', async () => {
+    const calls: string[] = [];
+    const configured = async () => {
+      calls.push('configured');
+      return { continue: true };
+    };
+    let composerInstance = 0;
+    const callerOptions = {
+      onIterationComplete: configured,
+      [AGENT_EXECUTION_OPTION_COMPOSERS]: () => {
+        const instance = ++composerInstance;
+        return {
+          onIterationComplete: (existing: typeof configured | undefined) => async () => {
+            calls.push(`internal-${instance}`);
+            return existing?.();
+          },
+        };
+      },
+    };
+
+    const firstMerge = mergeAgentExecutionOptions({}, callerOptions);
+    const secondMerge = mergeAgentExecutionOptions({}, firstMerge);
+
+    await secondMerge.onIterationComplete();
+    expect(calls).toEqual(['internal-2', 'configured']);
+    expect(composerInstance).toBe(2);
   });
 });

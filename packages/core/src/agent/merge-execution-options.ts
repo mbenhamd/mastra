@@ -17,6 +17,9 @@ export type AgentExecutionOptionComposers = Partial<
 };
 export type AgentExecutionOptionComposerFactory = () => AgentExecutionOptionComposers;
 
+const AGENT_CONFIGURED_EXECUTION_HOOKS = Symbol('agentConfiguredExecutionHooks');
+type AgentConfiguredExecutionHooks = Pick<Record<string, any>, 'onIterationComplete' | 'prepareStep'>;
+
 /**
  * Merge agent defaults beneath per-execution options while preserving the
  * replacement tool-surface ceiling. Plain deep merge is unsafe here because
@@ -31,6 +34,24 @@ export function mergeAgentExecutionOptions(
     defaultOptions as Record<string, unknown>,
     callerOptions as Record<string, unknown>,
   ) as Record<string, any>;
+  const callerSymbols = callerOptions as Record<PropertyKey, any>;
+  const configuredHooks = (callerSymbols[AGENT_CONFIGURED_EXECUTION_HOOKS] as
+    AgentConfiguredExecutionHooks | undefined) ?? {
+    onIterationComplete: merged.onIterationComplete,
+    prepareStep: merged.prepareStep,
+  };
+
+  const createComposers = callerSymbols[AGENT_EXECUTION_OPTION_COMPOSERS] as
+    AgentExecutionOptionComposerFactory | undefined;
+  // `deepMerge` intentionally copies only enumerable string keys. Preserve the
+  // internal symbol metadata so an enclosing execution boundary can create a
+  // fresh, run-local composer from the original configured hooks instead of
+  // silently reusing or nesting already-wrapped callbacks.
+  if (createComposers) {
+    const mergedSymbols = merged as Record<PropertyKey, any>;
+    mergedSymbols[AGENT_EXECUTION_OPTION_COMPOSERS] = createComposers;
+    mergedSymbols[AGENT_CONFIGURED_EXECUTION_HOOKS] = configuredHooks;
+  }
 
   if (merged.toolsetsMode === 'replace') {
     if (callerOptions.toolsetsMode === 'replace') {
@@ -40,15 +61,13 @@ export function mergeAgentExecutionOptions(
     }
   }
 
-  const createComposers = (callerOptions as Record<PropertyKey, any>)[AGENT_EXECUTION_OPTION_COMPOSERS] as
-    AgentExecutionOptionComposerFactory | undefined;
   const composers = createComposers?.();
   if (composers?.recoveryMaxSteps !== undefined) {
     merged.recoveryMaxSteps = composers.recoveryMaxSteps;
   }
   for (const key of ['onIterationComplete', 'prepareStep'] as const) {
     const compose = composers?.[key];
-    if (compose) merged[key] = compose(merged[key]);
+    if (compose) merged[key] = compose(configuredHooks[key]);
   }
 
   return merged;
