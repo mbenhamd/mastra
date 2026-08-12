@@ -139,6 +139,7 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
   validateRecoveryMaxSteps(options?.recoveryMaxSteps, logger);
 
   const maxSteps = options?.maxSteps ?? DurableAgentDefaults.MAX_STEPS;
+  const defaultRecoveryMaxSteps = options?.recoveryMaxSteps ?? 0;
 
   // Create the LLM execution step - tools and model are resolved from Mastra at runtime
   const llmExecutionStep = createDurableLLMExecutionStep();
@@ -408,7 +409,7 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
         // Declared as `let` because signal drain may force isContinued later.
         let shouldContinue = state.lastStepResult?.isContinued === true;
         const runMaxSteps = state.options?.maxSteps ?? maxSteps;
-        const recoveryMaxSteps = state.options?.recoveryMaxSteps ?? 0;
+        const recoveryMaxSteps = state.options?.recoveryMaxSteps ?? defaultRecoveryMaxSteps;
         const underMaxSteps = state.iterationCount < runMaxSteps;
 
         // Evaluate user-supplied stopWhen predicate(s) parked on the registry
