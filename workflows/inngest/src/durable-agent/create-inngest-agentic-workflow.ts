@@ -7,23 +7,23 @@ import {
   createDurableToolCallStep,
   DurableAgentDefaults,
   DurableStepIds,
-  assertTerminalToolResultRetained,
+  AGENT_CONTROL_TOPIC,
+  ensureRemoteAbortListener,
   createTerminalToolResultEnvelope,
   emitChunkEvent,
   emitFinishEvent,
+  executeDurableAgentScorers,
+  runDurableFinishSideEffects,
   modelConfigSchema,
   durableAgenticOutputSchema,
   baseIterationStateSchema,
   createBaseIterationStateUpdate,
-  globalRunRegistry,
-  createDurableRuntimeRequestContext,
+  getBoundRunRegistryEntry,
   mapDurableIterationToLLMInput,
-  resolveRuntimeDependencies,
   resolveDurableToolCallConcurrency,
   TOOL_PERMISSION_POLICY_KEY,
   TOOL_PERMISSION_POLICY_REQUIRED_KEY,
   TOOL_PERMISSION_POLICY_STABLE_KEY,
-  outputProcessorsOwnTerminalPersistence,
 } from '@mastra/core/agent/durable';
 import type {
   DurableToolPermissionResolver,
@@ -34,12 +34,9 @@ import type {
   DurableToolCallInput,
   ToolPermissionPolicy,
 } from '@mastra/core/agent/durable';
-import { MessageList } from '@mastra/core/agent/message-list';
 import type { PubSub } from '@mastra/core/events';
 import { SpanType, EntityType, InternalSpans } from '@mastra/core/observability';
 import type { ExportedSpan } from '@mastra/core/observability';
-import { ProcessorRunner } from '@mastra/core/processors';
-import type { RequestContext } from '@mastra/core/request-context';
 import { PUBSUB_SYMBOL } from '@mastra/core/workflows/_constants';
 import type { Inngest } from 'inngest';
 import { z } from 'zod';
@@ -449,9 +446,10 @@ export function createInngestDurableAgenticWorkflow(options: InngestDurableAgent
       .dowhile(singleIterationWorkflow, async params => {
         const { inputData } = params;
         const state = inputData as IterationState;
+        const initData = params.getInitData() as DurableAgenticWorkflowInput;
         const pubsub = (params as any)[PUBSUB_SYMBOL] as PubSub | undefined;
 
-        if (globalRunRegistry.get(state.runId)?.abortSignal?.aborted) {
+        if (getBoundRunRegistryEntry(state.runId, initData.runtimeBindingId)?.abortSignal?.aborted) {
           state.terminalToolResult = undefined;
           state.deferredStepFinishChunk = undefined;
           if (state.lastStepResult) {
@@ -488,13 +486,34 @@ export function createInngestDurableAgenticWorkflow(options: InngestDurableAgent
       // Map final state to output format, close agent span, and emit finish event
       .map(
         async params => {
-          const { inputData, mastra, requestContext } = params;
+          const { inputData, mastra, requestContext, tracingContext } = params;
           const state = inputData as IterationState;
-          const initData = params.getInitData?.() as DurableAgenticWorkflowInput | undefined;
+          const initData = params.getInitData() as DurableAgenticWorkflowInput;
+          getBoundRunRegistryEntry(state.runId, initData.runtimeBindingId);
+          const pubsub = (params as any)[PUBSUB_SYMBOL] as PubSub | undefined;
+
+          // This final map is an independently scheduled Inngest operation and
+          // can run on a worker that never executed the preceding LLM/tool
+          // steps. Install the replay listener before deciding terminal
+          // authority so a queued abort still wins.
+          if (pubsub) {
+            try {
+              await ensureRemoteAbortListener(pubsub, state.runId, initData.runtimeBindingId);
+            } catch (error) {
+              mastra?.getLogger?.()?.warn?.('Failed to subscribe to cross-process abort requests', {
+                runId: state.runId,
+                error: error instanceof Error ? error.message : String(error),
+              });
+              // Terminal publication must not continue without replaying any
+              // retained abort request. Throw so Inngest retries this memoized
+              // operation before FINISH and binding-scoped cleanup commit.
+              throw error;
+            }
+          }
 
           // Abort may land after the loop predicate but before this final map.
           // It still wins over the not-yet-published terminal candidate.
-          if (globalRunRegistry.get(state.runId)?.abortSignal?.aborted) {
+          if (getBoundRunRegistryEntry(state.runId, initData.runtimeBindingId)?.abortSignal?.aborted) {
             state.terminalToolResult = undefined;
             state.deferredStepFinishChunk = undefined;
             if (state.lastStepResult) {
@@ -503,16 +522,11 @@ export function createInngestDurableAgenticWorkflow(options: InngestDurableAgent
             }
           }
 
-          // Access pubsub via symbol to emit finish event
-          const pubsub = (params as any)[PUBSUB_SYMBOL] as PubSub | undefined;
-
           // Extract final text from last step
           const lastStep = state.accumulatedSteps[state.accumulatedSteps.length - 1];
-          const finalText = lastStep?.text;
+          let finalText = lastStep?.text;
 
-          // Persist only after the Inngest loop has committed to terminal
-          // delivery. The mapping result can still lose to background work or
-          // a signal in engines that support those precedence lanes.
+          // Establish terminal authority before any processor, persistence, or title side effect.
           const terminalEnvelope = state.terminalToolResult
             ? createTerminalToolResultEnvelope(state.runId, state.accumulatedSteps.length, state.terminalToolResult)
             : undefined;
@@ -520,129 +534,34 @@ export function createInngestDurableAgenticWorkflow(options: InngestDurableAgent
             state.terminalToolResult = terminalEnvelope.data;
           }
 
-          // Inngest may finalize on a different worker than the one that ran
-          // the last model/tool step. Rebuild memory and output processors from
-          // the registered agent before final persistence instead of relying on
-          // the process-local run registry. This mirrors the core durable
-          // finalizer and makes the terminal marker recallable after restart.
-          const resolvedRuntime =
-            initData?.agentId && initData.runId
-              ? await resolveRuntimeDependencies({
-                  mastra: mastra as any,
-                  runId: initData.runId,
-                  agentId: initData.agentId,
-                  input: { ...initData, messageListState: state.messageListState },
-                  logger: mastra?.getLogger?.(),
-                })
-              : undefined;
-          const finalMessageList =
-            resolvedRuntime?.messageList ?? new MessageList().deserialize(state.messageListState);
-
-          if (terminalEnvelope) {
-            finalMessageList.add(
-              {
-                id: state.messageId,
-                role: 'assistant',
-                content: {
-                  format: 2,
-                  parts: [{ type: 'data-terminal-tool-result', ...terminalEnvelope }],
-                },
-                createdAt: new Date(),
-              } as any,
-              'response',
-            );
-          }
-          state.messageListState = finalMessageList.serialize();
-
-          const finalRequestContext = createDurableRuntimeRequestContext({
-            entries: initData?.requestContextEntries,
-            state: initData?.state ?? state.state,
-            liveContext: requestContext as RequestContext | undefined,
+          // This map callback already runs inside the execution engine's
+          // durable step. Nesting another Inngest step.run here is rejected by
+          // connect workers and can strand the caller before the finish event.
+          const finishResult = await runDurableFinishSideEffects({
+            runId: state.runId,
+            initData,
+            messageListState: state.messageListState,
+            mastra,
+            requestContext,
+            tracingContext,
+            logger: mastra?.getLogger?.(),
+            outputResult: {
+              text: finalText ?? '',
+              usage: state.accumulatedUsage,
+              finishReason: state.lastStepResult?.reason ?? 'unknown',
+              steps: state.accumulatedSteps,
+            },
+            terminalEnvelope,
+            messageId: state.messageId,
           });
-          const logger = mastra?.getLogger?.();
-          const durableState = state.state;
-          const terminalPersistenceOwned = outputProcessorsOwnTerminalPersistence(resolvedRuntime?.outputProcessors);
-          const terminalMemoryPersistenceExpected = Boolean(
-            terminalEnvelope &&
-            durableState.memoryConfigured &&
-            durableState.threadId &&
-            durableState.resourceId &&
-            !durableState.memoryConfig?.readOnly,
-          );
-          if (terminalMemoryPersistenceExpected && !terminalPersistenceOwned && !resolvedRuntime?.memory) {
-            throw new Error(
-              `[InngestDurableAgent] Cannot deliver terminal result for run "${state.runId}" because configured memory could not be rehydrated.`,
-            );
-          }
-          if (terminalMemoryPersistenceExpected && durableState?.observationalMemory && !terminalPersistenceOwned) {
-            throw new Error(
-              `[InngestDurableAgent] Cannot deliver terminal result for run "${state.runId}" because observational-memory persistence could not be rehydrated.`,
-            );
-          }
-          if (terminalMemoryPersistenceExpected && !terminalPersistenceOwned && !resolvedRuntime?.saveQueueManager) {
-            throw new Error(
-              `[InngestDurableAgent] Cannot deliver terminal result for run "${state.runId}" because the memory save queue could not be rehydrated.`,
-            );
-          }
-
-          if (resolvedRuntime?.outputProcessors?.length) {
-            try {
-              const runner = new ProcessorRunner({
-                inputProcessors: resolvedRuntime.inputProcessors ?? [],
-                outputProcessors: resolvedRuntime.outputProcessors,
-                errorProcessors: resolvedRuntime.errorProcessors ?? [],
-                logger: logger as any,
-                agentName: initData?.agentName ?? initData?.agentId ?? state.agentName ?? state.agentId,
-                processorStates: resolvedRuntime.processorStates,
-              });
-              await runner.runOutputProcessors(finalMessageList, undefined, finalRequestContext, 0);
-            } catch (error) {
-              logger?.warn?.(`[InngestDurableAgent] Error running output processors: ${error}`);
-              if (terminalEnvelope) throw error;
-            }
-          }
-          if (terminalEnvelope) {
-            assertTerminalToolResultRetained(finalMessageList, state.messageId, terminalEnvelope);
-          }
-          state.messageListState = finalMessageList.serialize();
-
-          if (
-            resolvedRuntime?.saveQueueManager &&
-            resolvedRuntime.memory &&
-            durableState?.threadId &&
-            durableState?.resourceId &&
-            !durableState.observationalMemory &&
-            (!terminalEnvelope || !terminalPersistenceOwned) &&
-            !durableState.memoryConfig?.readOnly
-          ) {
-            try {
-              if (!durableState.threadExists) {
-                await resolvedRuntime.memory.createThread?.({
-                  threadId: durableState.threadId,
-                  resourceId: durableState.resourceId,
-                  memoryConfig: durableState.memoryConfig,
-                });
-                durableState.threadExists = true;
-              }
-              await (terminalEnvelope
-                ? resolvedRuntime.saveQueueManager.flushMessagesStrict(
-                    finalMessageList,
-                    durableState.threadId,
-                    durableState.memoryConfig,
-                  )
-                : resolvedRuntime.saveQueueManager.flushMessages(
-                    finalMessageList,
-                    durableState.threadId,
-                    durableState.memoryConfig,
-                  ));
-            } catch (error) {
-              logger?.warn?.(`[InngestDurableAgent] Error persisting messages: ${error}`);
-              if (terminalEnvelope) throw error;
-            }
+          state.messageListState = finishResult.messageListState;
+          if (lastStep && finishResult.outputText && finishResult.outputText !== (finalText ?? '')) {
+            lastStep.text = finishResult.outputText;
+            finalText = finishResult.outputText;
           }
 
           const finalOutput = {
-            messageListState: state.messageListState,
+            messageListState: finishResult.messageListState,
             messageId: state.messageId,
             stepResult: state.lastStepResult || {
               reason: 'stop',
@@ -707,6 +626,44 @@ export function createInngestDurableAgenticWorkflow(options: InngestDurableAgent
           return finalOutput;
         },
         { id: 'map-final-output' },
+      )
+      // `map-final-output` must be durably acknowledged before removing the
+      // replayed abort. If a worker dies after publishing FINISH but before
+      // that map commits, its retry still needs the tombstone to preserve the
+      // aborted outcome. This separate memoized operation is idempotent.
+      .map(
+        async params => {
+          const initData = params.getInitData() as DurableAgenticWorkflowInput;
+          if (!initData.runtimeBindingId) return params.inputData;
+          try {
+            getBoundRunRegistryEntry(initData.runId, initData.runtimeBindingId);
+          } catch {
+            // A newer execution owns this reused run ID. The old cleanup is an
+            // idempotent no-op and must not fail terminalized work.
+            return params.inputData;
+          }
+          const pubsub = (params as any)[PUBSUB_SYMBOL] as PubSub | undefined;
+          if (pubsub) {
+            await pubsub.clearTopicOrThrow(AGENT_CONTROL_TOPIC(initData.runId, initData.runtimeBindingId));
+          }
+          return params.inputData;
+        },
+        { id: 'clear-agent-control-topic' },
+      )
+      // Execute scorers (fire-and-forget, doesn't affect main result)
+      .map(
+        async ({ inputData, getInitData, mastra, requestContext, tracingContext }) => {
+          executeDurableAgentScorers({
+            initData: getInitData() as DurableAgenticWorkflowInput,
+            finalOutput: inputData,
+            mastra,
+            requestContext,
+            tracingContext,
+          });
+
+          return inputData;
+        },
+        { id: 'execute-scorers' },
       )
       .commit()
   );

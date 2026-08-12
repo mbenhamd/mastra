@@ -24,7 +24,7 @@ import { createTool } from '../../../tools';
 import type { WorkflowRunState } from '../../../workflows/types';
 import { Agent } from '../../agent';
 import { MessageList } from '../../message-list';
-import { DurableStepIds } from '../constants';
+import { AGENT_CONTROL_TOPIC, DurableStepIds } from '../constants';
 import { createDurableAgent } from '../create-durable-agent';
 import { globalRunRegistry } from '../run-registry';
 import type { SerializableDurableOptions } from '../types';
@@ -1092,11 +1092,20 @@ describe('Observe API', () => {
     durableAgent.runRegistry.cleanupBound(runId, first.workflowInput.runtimeBindingId);
     globalRunRegistry.delete(runId);
     const second = await durableAgent.prepare('second', { runId });
+    const newerController = new AbortController();
+    const newerEntry = globalRunRegistry.get(runId)!;
+    newerEntry.abortController = newerController;
+    newerEntry.abortSignal = newerController.signal;
     const topic = `agent.stream.${runId}`;
     await cachingPubsub.publish(topic, { type: 'second-binding-event', runId, data: { binding: 'second' } });
 
+    await staleObserver.abort('stale-observer-abort');
     staleObserver.cleanup();
 
+    expect(newerController.signal.aborted).toBe(false);
+    expect(await cachingPubsub.getHistory(AGENT_CONTROL_TOPIC(runId, first.workflowInput.runtimeBindingId!))).toEqual([
+      expect.objectContaining({ type: 'abort-request', runId }),
+    ]);
     expect(durableAgent.runRegistry.get(runId)?.runtimeBindingId).toBe(second.workflowInput.runtimeBindingId);
     expect(globalRunRegistry.get(runId)?.runtimeBindingId).toBe(second.workflowInput.runtimeBindingId);
     expect(await cachingPubsub.getHistory(topic)).toEqual([
@@ -1105,6 +1114,7 @@ describe('Observe API', () => {
 
     durableAgent.runRegistry.cleanupBound(runId, second.workflowInput.runtimeBindingId);
     globalRunRegistry.delete(runId);
+    await cachingPubsub.clearTopic(AGENT_CONTROL_TOPIC(runId, first.workflowInput.runtimeBindingId!));
     await cachingPubsub.clearTopic(topic);
   });
 });

@@ -42,6 +42,8 @@ export interface ExtractorConfig<T = unknown> {
   metadataKeyPath?: string | false;
   /** Optional lifecycle hook invoked after a value is parsed and before it is persisted. */
   onExtracted?: (context: ExtractorOnExtractedContext<T>) => Promise<T | void | undefined> | T | void | undefined;
+  /** Retry with JSON prompt injection when native structured output returns an empty object. */
+  retryStructuredExtractionOnEmptyObject?: boolean;
 }
 
 const BUILT_IN_SLUGS = new Set(['current-task', 'suggested-response', 'thread-title']);
@@ -122,6 +124,7 @@ export class Extractor<T = unknown> {
   readonly includePreviousExtraction: boolean;
   readonly metadataKeyPath: string | false;
   readonly onExtracted?: ExtractorConfig<T>['onExtracted'];
+  readonly retryStructuredExtractionOnEmptyObject: boolean;
   /** @internal */
   readonly internal: boolean;
   private readonly instructionsConfig: ExtractorConfigValue<string>;
@@ -153,6 +156,7 @@ export class Extractor<T = unknown> {
     this.includePreviousExtraction = config.includePreviousExtraction ?? true;
     this.metadataKeyPath = config.metadataKeyPath ?? `extracted.${slug}`;
     this.onExtracted = config.onExtracted;
+    this.retryStructuredExtractionOnEmptyObject = config.retryStructuredExtractionOnEmptyObject ?? false;
     this.internal = internal;
   }
 
@@ -174,6 +178,7 @@ export class Extractor<T = unknown> {
         includePreviousExtraction: this.includePreviousExtraction,
         metadataKeyPath: this.metadataKeyPath,
         onExtracted: this.onExtracted,
+        retryStructuredExtractionOnEmptyObject: this.retryStructuredExtractionOnEmptyObject,
       },
       this.internal,
     );

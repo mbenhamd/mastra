@@ -7,9 +7,19 @@
  * cleanup callback invocation, size/runIds accounting, and the
  * override lifecycle in ExtendedRunRegistry.
  */
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { ExtendedRunRegistry, RunRegistry } from './run-registry';
+import {
+  clearGlobalRunRegistry,
+  deleteBoundRunRegistryEntry,
+  ExtendedRunRegistry,
+  getGlobalRunRegistryEntry,
+  globalRunRegistry,
+  pinGlobalRunRegistryEntry,
+  registerGlobalRunRegistryEntry,
+  RunRegistry,
+  unpinGlobalRunRegistryEntry,
+} from './run-registry';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -22,6 +32,53 @@ function makeEntry(overrides: Partial<Record<string, any>> = {}): any {
     ...overrides,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Global registry pin lifecycle
+// ---------------------------------------------------------------------------
+
+describe('global run registry pin lifecycle', () => {
+  beforeEach(() => clearGlobalRunRegistry());
+  afterEach(() => clearGlobalRunRegistry());
+
+  it('does not resurrect a terminal entry when bound cleanup wins the race with unpin', () => {
+    const runId = 'terminal-cleanup-before-unpin';
+    const cleanup = vi.fn();
+    const entry = makeEntry({ runtimeBindingId: 'old-binding', cleanup });
+    registerGlobalRunRegistryEntry(runId, entry);
+    expect(pinGlobalRunRegistryEntry(runId)).toBe(entry);
+
+    expect(deleteBoundRunRegistryEntry(runId, 'old-binding')).toBe(true);
+    expect(getGlobalRunRegistryEntry(runId)).toBeUndefined();
+    expect(globalRunRegistry.has(runId)).toBe(false);
+    expect(cleanup).toHaveBeenCalledOnce();
+
+    unpinGlobalRunRegistryEntry(runId, 'old-binding');
+    expect(getGlobalRunRegistryEntry(runId)).toBeUndefined();
+    expect(() => registerGlobalRunRegistryEntry(runId, makeEntry({ runtimeBindingId: 'new-binding' }))).not.toThrow();
+  });
+
+  it('does not let a stale release remove a reused binding pin', () => {
+    const runId = 'stale-release-after-reuse';
+    const oldEntry = makeEntry({ runtimeBindingId: 'old-binding' });
+    registerGlobalRunRegistryEntry(runId, oldEntry);
+    expect(pinGlobalRunRegistryEntry(runId)).toBe(oldEntry);
+    expect(deleteBoundRunRegistryEntry(runId, 'old-binding')).toBe(true);
+
+    const replacementCleanup = vi.fn();
+    const replacement = makeEntry({ runtimeBindingId: 'new-binding', cleanup: replacementCleanup });
+    registerGlobalRunRegistryEntry(runId, replacement);
+    expect(pinGlobalRunRegistryEntry(runId)).toBe(replacement);
+
+    unpinGlobalRunRegistryEntry(runId, 'old-binding');
+    globalRunRegistry.delete(runId);
+    expect(getGlobalRunRegistryEntry(runId)).toBe(replacement);
+    expect(replacementCleanup).not.toHaveBeenCalled();
+
+    unpinGlobalRunRegistryEntry(runId, 'new-binding');
+    expect(globalRunRegistry.get(runId)).toBe(replacement);
+  });
+});
 
 // ---------------------------------------------------------------------------
 // RunRegistry

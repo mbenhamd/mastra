@@ -6,6 +6,7 @@ import { InMemoryStore } from '@mastra/core/storage';
 import { Workspace } from '@mastra/core/workspace';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
+import { MASTRA_RESOURCE_ID_KEY, MASTRA_USER_PERMISSIONS_KEY } from '../constants';
 import { HTTPException } from '../http-exception';
 import {
   LIST_AGENT_CONTROLLERS_ROUTE,
@@ -25,11 +26,19 @@ import {
   FOLLOW_UP_AGENT_CONTROLLER_SESSION_ROUTE,
   AGENT_CONTROLLER_TOOL_APPROVAL_ROUTE,
   AGENT_CONTROLLER_TOOL_SUSPENSION_ROUTE,
+  SET_AGENT_CONTROLLER_RESOURCE_ID_ROUTE,
   createAgentControllerSessionId,
 } from './agent-controller';
 
 function makeAgent(id = 'test-agent') {
   return new Agent({ id, name: id, instructions: 'test', model: {} as any });
+}
+
+function authenticatedRequestContext(resourceId: string, permissions: string[] = []): RequestContext {
+  const requestContext = new RequestContext();
+  requestContext.set(MASTRA_RESOURCE_ID_KEY, resourceId);
+  requestContext.set(MASTRA_USER_PERMISSIONS_KEY, permissions);
+  return requestContext;
 }
 
 function makeMastra() {
@@ -111,6 +120,72 @@ describe('agent-controller routes', () => {
       await expect(
         CREATE_AGENT_CONTROLLER_SESSION_ROUTE.handler({ mastra, controllerId: 'nope', resourceId: 'user-1' } as any),
       ).rejects.toBeInstanceOf(HTTPException);
+    });
+  });
+
+  describe('resource ownership', () => {
+    it('rejects authenticated resource mismatches across create, read, and execute routes', async () => {
+      const requestContext = authenticatedRequestContext('attacker');
+      const attempts = [
+        () =>
+          CREATE_AGENT_CONTROLLER_SESSION_ROUTE.handler({
+            mastra,
+            controllerId: 'code',
+            resourceId: 'victim',
+            requestContext,
+          } as any),
+        () =>
+          GET_AGENT_CONTROLLER_SESSION_STATE_ROUTE.handler({
+            mastra,
+            controllerId: 'code',
+            resourceId: 'victim',
+            requestContext,
+          } as any),
+        () =>
+          SEND_AGENT_CONTROLLER_MESSAGE_ROUTE.handler({
+            mastra,
+            controllerId: 'code',
+            resourceId: 'victim',
+            message: 'do not deliver',
+            requestContext,
+          } as any),
+      ];
+
+      for (const attempt of attempts) {
+        await expect(attempt()).rejects.toThrow(/does not match the authenticated resource/);
+      }
+    });
+
+    it('allows an explicit global administrator to address another resource', async () => {
+      const requestContext = authenticatedRequestContext('admin', ['*:*']);
+      const result = (await CREATE_AGENT_CONTROLLER_SESSION_ROUTE.handler({
+        mastra,
+        controllerId: 'code',
+        resourceId: 'managed-user',
+        requestContext,
+      } as any)) as { resourceId: string };
+
+      expect(result.resourceId).toBe('managed-user');
+    });
+
+    it('does not let an owner retarget its session to another resource', async () => {
+      const requestContext = authenticatedRequestContext('user-1');
+      await CREATE_AGENT_CONTROLLER_SESSION_ROUTE.handler({
+        mastra,
+        controllerId: 'code',
+        resourceId: 'user-1',
+        requestContext,
+      } as any);
+
+      await expect(
+        SET_AGENT_CONTROLLER_RESOURCE_ID_ROUTE.handler({
+          mastra,
+          controllerId: 'code',
+          resourceId: 'user-1',
+          newResourceId: 'victim',
+          requestContext,
+        } as any),
+      ).rejects.toThrow(/does not match the authenticated resource/);
     });
   });
 
@@ -252,6 +327,68 @@ describe('agent-controller routes', () => {
     });
   });
 
+  // The messages/steer/follow-up routes ack immediately and let the session
+  // finish the turn in the background. Session methods can still reject (e.g.
+  // `sendMessage` rejects when signal submission fails before a stream starts),
+  // and an unobserved rejection crashes the process on Node's default
+  // `--unhandled-rejections=throw` (see mastra-ai/mastra#19734). The routes must
+  // observe the failure: log it and tell the session's subscribers.
+  describe('background session failures', () => {
+    async function getRouteSession(resourceId: string) {
+      const controller = mastra.getAgentController('code')!;
+      await controller.init();
+      return controller.createSession({ resourceId, id: resourceId, ownerId: controller.id });
+    }
+
+    const cases = [
+      { name: 'sendMessage', method: 'sendMessage', route: SEND_AGENT_CONTROLLER_MESSAGE_ROUTE },
+      { name: 'steer', method: 'steer', route: STEER_AGENT_CONTROLLER_SESSION_ROUTE },
+      { name: 'followUp', method: 'followUp', route: FOLLOW_UP_AGENT_CONTROLLER_SESSION_ROUTE },
+    ] as const;
+
+    for (const { name, method, route } of cases) {
+      it(`still acks, logs, and emits an error event when session.${name} rejects`, async () => {
+        const session = await getRouteSession(`user-bg-${name}`);
+        const failure = new Error('signal failed before stream started');
+        vi.spyOn(session, method as any).mockRejectedValue(failure);
+        const errorLog = vi.spyOn(mastra.getLogger(), 'error').mockImplementation(() => {});
+
+        const events: any[] = [];
+        const unsubscribe = session.subscribe(event => {
+          if (event.type === 'error') events.push(event);
+        });
+
+        const unhandled: unknown[] = [];
+        const onUnhandled = (reason: unknown) => unhandled.push(reason);
+        process.on('unhandledRejection', onUnhandled);
+
+        try {
+          const res = await route.handler({
+            mastra,
+            controllerId: 'code',
+            resourceId: `user-bg-${name}`,
+            message: 'hello',
+          } as any);
+          expect(res).toEqual({ ok: true });
+
+          // Let the rejection settle and any unhandled-rejection fire.
+          await new Promise(resolve => setTimeout(resolve, 0));
+          await new Promise(resolve => setTimeout(resolve, 0));
+
+          expect(unhandled).toEqual([]);
+          expect(errorLog).toHaveBeenCalledWith(
+            expect.stringContaining(name),
+            expect.objectContaining({ operation: name, error: failure }),
+          );
+          expect(events).toEqual([expect.objectContaining({ type: 'error', error: failure })]);
+        } finally {
+          process.off('unhandledRejection', onUnhandled);
+          unsubscribe();
+        }
+      });
+    }
+  });
+
   describe('requestContext forwarding', () => {
     // Identity injected by `server.middleware` arrives on the handler as
     // `requestContext`; the session-write routes must thread it through to the
@@ -354,6 +491,19 @@ describe('agent-controller routes', () => {
       expect(spy).toHaveBeenCalledWith({ content: 'and another thing', requestContext });
     });
 
+    it('requires the parked run id for a tool-approval response', () => {
+      expect(
+        AGENT_CONTROLLER_TOOL_APPROVAL_ROUTE.bodySchema!.safeParse({ toolCallId: 'call-1', approved: true }).success,
+      ).toBe(false);
+      expect(
+        AGENT_CONTROLLER_TOOL_APPROVAL_ROUTE.bodySchema!.safeParse({
+          runId: 'run-1',
+          toolCallId: 'call-1',
+          approved: true,
+        }).success,
+      ).toBe(true);
+    });
+
     it('forwards requestContext to session.respondToToolApproval', async () => {
       const session = await getRouteSession('user-rc');
       const spy = vi.spyOn(session, 'respondToToolApproval').mockReturnValue(undefined);
@@ -363,12 +513,18 @@ describe('agent-controller routes', () => {
         mastra,
         controllerId: 'code',
         resourceId: 'user-rc',
+        runId: 'run-1',
         toolCallId: 'call-1',
         approved: true,
         requestContext,
       } as any);
 
-      expect(spy).toHaveBeenCalledWith({ toolCallId: 'call-1', decision: 'approve', requestContext });
+      expect(spy).toHaveBeenCalledWith({
+        runId: 'run-1',
+        toolCallId: 'call-1',
+        decision: 'approve',
+        requestContext,
+      });
     });
 
     it('forwards requestContext to session.respondToToolSuspension', async () => {
@@ -457,6 +613,35 @@ describe('agent-controller routes', () => {
       expect(received.error).toEqual({ name: 'Error', message: 'model quota exhausted' });
       expect(JSON.parse(JSON.stringify(received)).error.message).toBe('model quota exhausted');
       expect(received.errorType).toBe('provider');
+    });
+
+    it('converts display-state Maps to plain objects so tool state survives JSON serialization', async () => {
+      const stream = (await STREAM_AGENT_CONTROLLER_SESSION_ROUTE.handler({
+        mastra,
+        controllerId: 'code',
+        resourceId: 'user-ds',
+        abortSignal: new AbortController().signal,
+      } as any)) as ReadableStream<unknown>;
+
+      const reader = stream.getReader();
+
+      const controller = mastra.getAgentController('code')!;
+      await controller.init();
+      const session = await controller.createSession({ resourceId: 'user-ds', id: 'user-ds', ownerId: 'code' });
+      session.emit({ type: 'tool_start', toolCallId: 'call-1', toolName: 'read', args: { path: 'a.ts' } });
+
+      let received: unknown;
+      for (let i = 0; i < 10 && received === undefined; i++) {
+        const { value } = await reader.read();
+        if (value && typeof value === 'object' && 'type' in value && value.type === 'display_state_changed') {
+          received = value;
+        }
+      }
+      await reader.cancel();
+
+      expect(received).toBeDefined();
+      const wire = JSON.parse(JSON.stringify(received));
+      expect(wire.displayState.activeTools['call-1']).toMatchObject({ name: 'read', status: 'running' });
     });
   });
 

@@ -106,7 +106,14 @@ export {
 } from './preparation';
 
 // Run registry for non-serializable state
-export { RunRegistry, ExtendedRunRegistry, globalRunRegistry, type ExtendedRunRegistryEntry } from './run-registry';
+export {
+  RunRegistry,
+  ExtendedRunRegistry,
+  deleteBoundRunRegistryEntry,
+  getBoundRunRegistryEntry,
+  globalRunRegistry,
+  type ExtendedRunRegistryEntry,
+} from './run-registry';
 
 // Stream adapter for pubsub-based streaming
 export {
@@ -125,7 +132,15 @@ export {
 export { outputProcessorsOwnTerminalPersistence } from '../../loop/shared/terminal-tool-result';
 
 // Constants
-export { AGENT_STREAM_TOPIC, AgentStreamEventTypes, DurableAgentDefaults, DurableStepIds } from './constants';
+export {
+  AGENT_STREAM_TOPIC,
+  AGENT_CONTROL_TOPIC,
+  AgentStreamEventTypes,
+  AgentControlEventTypes,
+  DurableAgentDefaults,
+  DurableStepIds,
+} from './constants';
+export { publishAbortRequest, subscribeToAbortRequests, ensureRemoteAbortListener } from './abort-transport';
 
 // Types
 export type {
@@ -180,7 +195,13 @@ export {
 } from './utils/resolve-runtime';
 
 // Workflow creation
-export { createDurableAgenticWorkflow, type DurableAgenticWorkflowOptions } from './workflows';
+export {
+  createDurableAgenticWorkflow,
+  runDurableFinishSideEffects,
+  type DurableAgenticWorkflowOptions,
+  type DurableFinishSideEffectsOptions,
+  type DurableFinishSideEffectsResult,
+} from './workflows';
 
 // Workflow steps (for advanced customization)
 export {
@@ -203,6 +224,7 @@ export {
 
 // Shared workflow utilities
 export {
+  executeDurableAgentScorers,
   executeDurableToolCalls,
   modelConfigSchema,
   modelListEntrySchema,
@@ -217,6 +239,7 @@ export {
   resolveDurableToolCallConcurrency,
 } from './workflows/shared';
 export type {
+  ExecuteDurableAgentScorersParams,
   ToolExecutionContext,
   ToolExecutionError,
   BaseIterationState,

@@ -108,6 +108,14 @@ export interface DelegationStartContext {
   toolCallId: string;
   /** Messages accumulated so far */
   messages: MastraDBMessage[];
+  /**
+   * The request context the delegated run will receive. Entries are shallowly
+   * copied from the parent run's context, excluding `MastraMemory` and the
+   * reserved thread/resource keys. Mutate it with `requestContext.set()` to add
+   * entries without modifying the parent's context map. Values must be
+   * JSON-serializable to work with durable agents.
+   */
+  requestContext: RequestContext;
 }
 
 /**
@@ -189,6 +197,17 @@ export interface DelegationCompleteContext {
 export interface DelegationCompleteResult {
   /** Optional feedback to add to the conversation */
   feedback?: string;
+  /**
+   * Replaces the text the parent model sees as this delegation's tool result,
+   * within the current run.
+   *
+   * `feedback` is persisted to the parent's memory and therefore only reaches the
+   * model on the next turn. Use `resultText` when the sub-agent's own result would
+   * mislead the parent right now — for example when the sub-agent stopped on a
+   * tool-calls step and returned empty text, which reads to the model as a
+   * successful but empty delegation.
+   */
+  resultText?: string;
 }
 
 /**

@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import {
   DurableAgentDefaults,
   DurableStepIds,
+  AGENT_CONTROL_TOPIC,
   globalRunRegistry,
   TOOL_PERMISSION_POLICY_KEY,
   TOOL_PERMISSION_POLICY_REQUIRED_KEY,
@@ -31,15 +32,21 @@ import {
  * unlike a shared mutable options object.
  */
 
+function nestedWorkflowSteps(entry: any): any[] | undefined {
+  // Loop/foreach entries wrap their body in a SingleStepEntry, while plain
+  // step entries hold nested workflows directly.
+  const inner = entry.step?.executionGraph ? entry.step : entry.step?.step;
+  return inner?.executionGraph?.steps;
+}
+
 function findForeachEntry(steps: any[]): any {
   for (const entry of steps ?? []) {
-    if (entry.type === 'foreach') return entry;
-    // Loop/foreach entries wrap their body in a `SingleStepEntry`, so a nested
-    // workflow lives one level deeper (`entry.step.step`); plain `type: 'step'`
-    // entries still hold the workflow directly on `entry.step`.
-    const inner = entry.step?.executionGraph ? entry.step : entry.step?.step;
-    if (inner?.executionGraph) {
-      const nested = findForeachEntry(inner.executionGraph.steps);
+    if (entry.type === 'foreach') {
+      return entry.step?.step ? { ...entry, step: entry.step.step } : entry;
+    }
+    const nestedSteps = nestedWorkflowSteps(entry);
+    if (nestedSteps) {
+      const nested = findForeachEntry(nestedSteps);
       if (nested) return nested;
     }
     if (entry.steps) {
@@ -53,8 +60,9 @@ function findForeachEntry(steps: any[]): any {
 function findLoopEntry(steps: any[]): any {
   for (const entry of steps ?? []) {
     if (entry.type === 'loop' && entry.loopType === 'dowhile') return entry;
-    if (entry.step?.executionGraph) {
-      const nested = findLoopEntry(entry.step.executionGraph.steps);
+    const nestedSteps = nestedWorkflowSteps(entry);
+    if (nestedSteps) {
+      const nested = findLoopEntry(nestedSteps);
       if (nested) return nested;
     }
     if (entry.steps) {
@@ -67,9 +75,24 @@ function findLoopEntry(steps: any[]): any {
 
 function findStepEntry(steps: any[], id: string): any {
   for (const entry of steps ?? []) {
+    if (entry.type === 'mapping' && entry.id === id) {
+      return {
+        ...entry,
+        step: {
+          id: entry.id,
+          execute: (params: any) =>
+            entry.mapConfig({
+              ...params,
+              getInitData: params.getInitData ?? (() => params.inputData),
+            }),
+        },
+      };
+    }
     if (entry.type === 'step' && entry.step?.id === id) return entry;
-    if (entry.step?.executionGraph) {
-      const nested = findStepEntry(entry.step.executionGraph.steps, id);
+    if (entry.type === 'step' && entry.step?.step?.id === id) return { ...entry, step: entry.step.step };
+    const nestedSteps = nestedWorkflowSteps(entry);
+    if (nestedSteps) {
+      const nested = findStepEntry(nestedSteps, id);
       if (nested) return nested;
     }
     if (entry.steps) {
@@ -401,11 +424,140 @@ describe('createInngestDurableAgenticWorkflow terminal tool result', () => {
   const workflow = createInngestDurableAgenticWorkflow({ inngest }) as any;
   const loopEntry = findLoopEntry(workflow.executionGraph.steps);
   const finalOutputEntry = findStepEntry(workflow.executionGraph.steps, 'map-final-output');
+  const controlCleanupEntry = findStepEntry(workflow.executionGraph.steps, 'clear-agent-control-topic');
+
+  async function executeFinalWithBoundRuntime(params: any) {
+    const runId = params.inputData.runId as string;
+    const previousEntry = globalRunRegistry.get(runId);
+    const suppliedInitData = params.getInitData?.() ?? params.inputData;
+    const runtimeBindingId = suppliedInitData.runtimeBindingId ?? `${runId}-binding`;
+    globalRunRegistry.set(runId, {
+      ...previousEntry,
+      runtimeBindingId,
+      isPlaceholder: true,
+    } as any);
+    const suppliedPubsub = params[PUBSUB_SYMBOL];
+    const pubsub = suppliedPubsub
+      ? {
+          subscribeWithReplay: vi.fn().mockResolvedValue(undefined),
+          unsubscribe: vi.fn().mockResolvedValue(undefined),
+          ...suppliedPubsub,
+        }
+      : undefined;
+
+    try {
+      return await finalOutputEntry.step.execute({
+        ...params,
+        getInitData: () => ({ ...suppliedInitData, runId, runtimeBindingId }),
+        ...(pubsub ? { [PUBSUB_SYMBOL]: pubsub } : {}),
+      });
+    } finally {
+      if (previousEntry) globalRunRegistry.set(runId, previousEntry);
+      else globalRunRegistry.delete(runId);
+    }
+  }
 
   it('runs the signal-precedence step before committing terminal delivery', () => {
     expect(
       findStepEntry(workflow.executionGraph.steps, `${DurableStepIds.AGENTIC_EXECUTION}-signal-drain`),
     ).toBeDefined();
+  });
+
+  it('rejects a stale loop predicate before reading a newer reused-run binding', async () => {
+    const runId = 'run-terminal-loop-rebound';
+    globalRunRegistry.set(runId, {
+      runtimeBindingId: 'new-binding',
+      tools: {},
+      model: {} as any,
+      abortSignal: AbortSignal.abort('new-run-abort'),
+    } as any);
+
+    try {
+      await expect(
+        loopEntry.condition({
+          inputData: { runId },
+          getInitData: () => ({ runId, runtimeBindingId: 'stale-binding' }),
+        }),
+      ).rejects.toThrow(/no longer matches its registered runtime dependencies/);
+    } finally {
+      globalRunRegistry.delete(runId);
+    }
+  });
+
+  it('revalidates the binding after final-map listener setup', async () => {
+    const runId = 'run-terminal-map-rebound';
+    const oldBinding = 'old-binding';
+    let releaseSubscription!: () => void;
+    let markSubscriptionStarted!: () => void;
+    const subscriptionStarted = new Promise<void>(resolve => {
+      markSubscriptionStarted = resolve;
+    });
+    const subscriptionReleased = new Promise<void>(resolve => {
+      releaseSubscription = resolve;
+    });
+    const pubsub = {
+      subscribeWithReplay: vi.fn(async () => {
+        markSubscriptionStarted();
+        await subscriptionReleased;
+      }),
+      unsubscribe: vi.fn().mockResolvedValue(undefined),
+    };
+    globalRunRegistry.set(runId, {
+      runtimeBindingId: oldBinding,
+      tools: {},
+      model: {} as any,
+    } as any);
+    const execution = finalOutputEntry.step.execute({
+      inputData: { runId },
+      getInitData: () => ({ runId, runtimeBindingId: oldBinding }),
+      mastra: undefined,
+      [PUBSUB_SYMBOL]: pubsub,
+    });
+    await subscriptionStarted;
+    globalRunRegistry.set(runId, {
+      runtimeBindingId: 'new-binding',
+      tools: {},
+      model: {} as any,
+    } as any);
+    releaseSubscription();
+
+    try {
+      await expect(execution).rejects.toThrow(/no longer matches its registered runtime dependencies/);
+    } finally {
+      globalRunRegistry.delete(runId);
+    }
+  });
+
+  it('retries the final map when retained abort replay subscription fails', async () => {
+    const runId = 'run-terminal-replay-subscription-failure';
+    const runtimeBindingId = 'run-terminal-replay-subscription-failure-binding';
+    const replayError = new Error('transient replay subscription failure');
+    const pubsub = {
+      publish: vi.fn().mockResolvedValue(undefined),
+      subscribeWithReplay: vi.fn().mockRejectedValue(replayError),
+      unsubscribe: vi.fn().mockResolvedValue(undefined),
+      clearTopicOrThrow: vi.fn().mockResolvedValue(undefined),
+    };
+    globalRunRegistry.set(runId, {
+      runtimeBindingId,
+      tools: {},
+      model: {} as any,
+    } as any);
+
+    try {
+      await expect(
+        finalOutputEntry.step.execute({
+          inputData: { runId },
+          getInitData: () => ({ runId, runtimeBindingId }),
+          mastra: undefined,
+          [PUBSUB_SYMBOL]: pubsub,
+        }),
+      ).rejects.toBe(replayError);
+      expect(pubsub.publish).not.toHaveBeenCalled();
+      expect(pubsub.clearTopicOrThrow).not.toHaveBeenCalled();
+    } finally {
+      globalRunRegistry.delete(runId);
+    }
   });
 
   it('emits the terminal result before step finish and stops without another iteration', async () => {
@@ -414,9 +566,18 @@ describe('createInngestDurableAgenticWorkflow terminal tool result', () => {
       async publish(_topic: string, event: unknown) {
         published.push(event);
       },
+      subscribeWithReplay: vi.fn().mockResolvedValue(undefined),
+      unsubscribe: vi.fn().mockResolvedValue(undefined),
+      clearTopicOrThrow: vi.fn().mockResolvedValue(undefined),
     };
+    globalRunRegistry.set('run-terminal', {
+      runtimeBindingId: 'run-terminal-binding',
+      tools: {},
+      model: {} as any,
+    } as any);
     const state = {
       runId: 'run-terminal',
+      runtimeBindingId: 'run-terminal-binding',
       accumulatedSteps: [{}],
       accumulatedUsage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
       messageListState: new MessageList().serialize(),
@@ -437,8 +598,10 @@ describe('createInngestDurableAgenticWorkflow terminal tool result', () => {
       deferredStepFinishChunk: { type: 'step-finish', payload: { reason: 'tool-calls' } },
     };
 
+    const getInitData = () => state;
     const shouldContinue = await loopEntry.condition({
       inputData: state,
+      getInitData,
       [PUBSUB_SYMBOL]: pubsub,
     });
 
@@ -449,6 +612,7 @@ describe('createInngestDurableAgenticWorkflow terminal tool result', () => {
 
     await finalOutputEntry.step.execute({
       inputData: state,
+      getInitData,
       mastra: undefined,
       [PUBSUB_SYMBOL]: pubsub,
     });
@@ -458,6 +622,75 @@ describe('createInngestDurableAgenticWorkflow terminal tool result', () => {
     expect(published[0].type).toBe('finish');
     expect(published[0].data.terminalToolResult.id).toBe(createTerminalToolResultPartId('run-terminal', 1));
     expect(published[0].data.terminalStepFinishChunk.type).toBe('step-finish');
+    expect(pubsub.subscribeWithReplay).toHaveBeenCalledWith(
+      AGENT_CONTROL_TOPIC('run-terminal', 'run-terminal-binding'),
+      expect.any(Function),
+    );
+    // The final map is not durably acknowledged yet, so it must leave the
+    // replayed abort intact. The following memoized operation owns cleanup.
+    expect(pubsub.clearTopicOrThrow).not.toHaveBeenCalled();
+
+    await controlCleanupEntry.step.execute({
+      inputData: { done: true },
+      getInitData: () => ({ runId: 'run-terminal', runtimeBindingId: 'run-terminal-binding' }),
+      [PUBSUB_SYMBOL]: pubsub,
+    });
+
+    expect(pubsub.clearTopicOrThrow).toHaveBeenCalledWith(AGENT_CONTROL_TOPIC('run-terminal', 'run-terminal-binding'));
+    globalRunRegistry.delete('run-terminal');
+  });
+
+  it('treats stale cleanup as a no-op when a newer run reused the ID', async () => {
+    const runId = 'run-terminal-cleanup-rebound';
+    const pubsub = { clearTopicOrThrow: vi.fn().mockResolvedValue(undefined) };
+    globalRunRegistry.set(runId, {
+      runtimeBindingId: 'new-binding',
+      tools: {},
+      model: {} as any,
+    } as any);
+
+    try {
+      const input = { done: true };
+      await expect(
+        controlCleanupEntry.step.execute({
+          inputData: input,
+          getInitData: () => ({ runId, runtimeBindingId: 'stale-binding' }),
+          [PUBSUB_SYMBOL]: pubsub,
+        }),
+      ).resolves.toBe(input);
+      expect(pubsub.clearTopicOrThrow).not.toHaveBeenCalled();
+    } finally {
+      globalRunRegistry.delete(runId);
+    }
+  });
+
+  it('rejects failed control cleanup so the durable operation can retry', async () => {
+    const runId = 'run-terminal-cleanup-retry';
+    const runtimeBindingId = 'cleanup-retry-binding';
+    const clearTopicOrThrow = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('transient cleanup failure'))
+      .mockResolvedValueOnce(undefined);
+    const pubsub = { clearTopicOrThrow };
+    globalRunRegistry.set(runId, {
+      runtimeBindingId,
+      tools: {},
+      model: {} as any,
+    } as any);
+    const execute = () =>
+      controlCleanupEntry.step.execute({
+        inputData: { done: true },
+        getInitData: () => ({ runId, runtimeBindingId }),
+        [PUBSUB_SYMBOL]: pubsub,
+      });
+
+    try {
+      await expect(execute()).rejects.toThrow('transient cleanup failure');
+      await expect(execute()).resolves.toEqual({ done: true });
+      expect(clearTopicOrThrow).toHaveBeenCalledTimes(2);
+    } finally {
+      globalRunRegistry.delete(runId);
+    }
   });
 
   it('rehydrates backing memory and persists the terminal marker during finalization', async () => {
@@ -609,7 +842,7 @@ describe('createInngestDurableAgenticWorkflow terminal tool result', () => {
     };
 
     await expect(
-      finalOutputEntry.step.execute({
+      executeFinalWithBoundRuntime({
         inputData: state,
         mastra: undefined,
         [PUBSUB_SYMBOL]: {
@@ -618,7 +851,7 @@ describe('createInngestDurableAgenticWorkflow terminal tool result', () => {
           },
         },
       }),
-    ).rejects.toThrow('configured memory could not be rehydrated');
+    ).rejects.toThrow('configured memory could not be resolved');
 
     expect(published).toEqual([]);
   });
@@ -671,7 +904,7 @@ describe('createInngestDurableAgenticWorkflow terminal tool result', () => {
     };
 
     await expect(
-      finalOutputEntry.step.execute({
+      executeFinalWithBoundRuntime({
         inputData: state,
         mastra,
         getInitData: () => ({
@@ -775,7 +1008,7 @@ describe('createInngestDurableAgenticWorkflow terminal tool result', () => {
       };
 
       await expect(
-        finalOutputEntry.step.execute({
+        executeFinalWithBoundRuntime({
           inputData: state,
           mastra,
           getInitData: () => ({
@@ -825,7 +1058,10 @@ describe('createInngestDurableAgenticWorkflow terminal tool result', () => {
       listOutputProcessors: vi.fn().mockResolvedValue([]),
       listErrorProcessors: vi.fn().mockResolvedValue([]),
     };
-    const mastra = { getAgentById: vi.fn().mockReturnValue(agent), getLogger: () => ({ warn: vi.fn() }) };
+    const mastra = {
+      getAgentById: vi.fn().mockReturnValue(agent),
+      getLogger: () => ({ warn: vi.fn(), error: vi.fn() }),
+    };
     const state = {
       runId: 'run-terminal-inngest-memory-failure',
       agentId: 'terminal-memory-failure-agent',
@@ -876,15 +1112,17 @@ describe('createInngestDurableAgenticWorkflow terminal tool result', () => {
       },
     };
 
-    await expect(finalOutputEntry.step.execute(params)).rejects.toThrow('memory flush failed');
+    await expect(executeFinalWithBoundRuntime(params)).rejects.toThrow('memory flush failed');
 
     expect(memory.createThread).toHaveBeenCalledOnce();
     expect(memory.saveMessages).toHaveBeenCalledOnce();
     expect(published).toEqual([]);
 
-    await finalOutputEntry.step.execute(params);
+    await executeFinalWithBoundRuntime(params);
 
-    expect(memory.createThread).toHaveBeenCalledOnce();
+    // The failed durable attempt may repeat the idempotent thread upsert; the
+    // message write and finish publication remain the transactional boundary.
+    expect(memory.createThread).toHaveBeenCalledTimes(2);
     expect(memory.saveMessages).toHaveBeenCalledTimes(2);
     expect(persisted).toHaveLength(1);
     expect(persisted[0]?.content?.parts?.filter((part: any) => part.type === 'data-terminal-tool-result')).toHaveLength(
@@ -923,7 +1161,7 @@ describe('createInngestDurableAgenticWorkflow terminal tool result', () => {
     };
 
     await expect(
-      finalOutputEntry.step.execute({
+      executeFinalWithBoundRuntime({
         inputData: state,
         mastra: undefined,
         [PUBSUB_SYMBOL]: {
@@ -940,7 +1178,7 @@ describe('createInngestDurableAgenticWorkflow terminal tool result', () => {
     const runId = 'run-terminal-abort-window';
     const abortController = new AbortController();
     abortController.abort('cancel terminal delivery');
-    globalRunRegistry.set(runId, { abortSignal: abortController.signal } as any);
+    globalRunRegistry.set(runId, { isPlaceholder: true, abortSignal: abortController.signal } as any);
     const published: any[] = [];
     const state = {
       runId,
@@ -965,7 +1203,7 @@ describe('createInngestDurableAgenticWorkflow terminal tool result', () => {
     };
 
     try {
-      await finalOutputEntry.step.execute({
+      await executeFinalWithBoundRuntime({
         inputData: state,
         mastra: undefined,
         [PUBSUB_SYMBOL]: {

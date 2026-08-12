@@ -28,8 +28,12 @@ function getDeletedMdxFiles() {
 
 // Convert file path to URL path
 function filePathToUrlPath(filePath) {
-  // Remove docs/src/content/en/ prefix and .mdx suffix
-  let urlPath = filePath.replace(/^docs\/src\/content\/en\//, '').replace(/\.mdx$/, '');
+  // Remove the content prefix and .mdx suffix. English is the default
+  // locale, while translated routes retain their locale segment.
+  let urlPath = filePath.replace(/^docs\/src\/content\//, '').replace(/\.mdx$/, '');
+  if (urlPath.startsWith('en/')) {
+    urlPath = urlPath.slice('en/'.length);
+  }
 
   // Handle index files (they should redirect to parent directory)
   if (urlPath.endsWith('/index')) {

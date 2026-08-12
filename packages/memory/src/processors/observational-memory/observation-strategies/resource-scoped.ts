@@ -424,7 +424,7 @@ export class ResourceScopedObservationStrategy extends ObservationStrategy {
           });
           await updateThreadFromObservationalMemory(this.storage, {
             id: update.threadId,
-            title: shouldUpdateThreadTitle ? newTitle : (thread.title ?? ''),
+            ...(shouldUpdateThreadTitle ? { title: newTitle } : {}),
             metadata: newMetadata,
             guard: {
               recordId: record.id,

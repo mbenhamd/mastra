@@ -7,7 +7,7 @@
 
 import { describe, it, expect, vi } from 'vitest';
 import { Agent } from '@mastra/core/agent';
-import { createDurableAgent } from '@mastra/core/agent/durable';
+import { createDurableAgent, globalRunRegistry } from '@mastra/core/agent/durable';
 import type { DurableAgentTestContext } from '../types';
 import { createTextStreamModel } from '../mock-models';
 
@@ -65,9 +65,14 @@ export function createProcessorPipelineTests(context: DurableAgentTestContext) {
 
         const result = await durableAgent.prepare('Hello');
 
-        // Output processors array is always present (may be empty if resolution filters them)
-        expect(result.registryEntry.outputProcessors).toBeDefined();
-        expect(Array.isArray(result.registryEntry.outputProcessors)).toBe(true);
+        try {
+          // Output processors array is always present (may be empty if resolution filters them)
+          const registryEntry = globalRunRegistry.get(result.runId);
+          expect(registryEntry?.outputProcessors).toBeDefined();
+          expect(Array.isArray(registryEntry?.outputProcessors)).toBe(true);
+        } finally {
+          result.cleanup();
+        }
       });
 
       it('should stream successfully with output processors configured', async () => {
@@ -119,8 +124,13 @@ export function createProcessorPipelineTests(context: DurableAgentTestContext) {
 
         const result = await durableAgent.prepare('Hello');
 
-        expect(result.registryEntry.errorProcessors).toBeDefined();
-        expect(result.registryEntry.errorProcessors!.length).toBe(1);
+        try {
+          const registryEntry = globalRunRegistry.get(result.runId);
+          expect(registryEntry?.errorProcessors).toBeDefined();
+          expect(registryEntry?.errorProcessors?.length).toBe(1);
+        } finally {
+          result.cleanup();
+        }
       });
 
       it('should set hasErrorProcessors flag in workflow input', async () => {
@@ -175,9 +185,14 @@ export function createProcessorPipelineTests(context: DurableAgentTestContext) {
 
         const result = await durableAgent.prepare('Hello');
 
-        expect(result.registryEntry.inputProcessors).toBeDefined();
-        expect(result.registryEntry.outputProcessors).toBeDefined();
-        expect(result.registryEntry.processorStates).toBeDefined();
+        try {
+          const registryEntry = globalRunRegistry.get(result.runId);
+          expect(registryEntry?.inputProcessors).toBeDefined();
+          expect(registryEntry?.outputProcessors).toBeDefined();
+          expect(registryEntry?.processorStates).toBeDefined();
+        } finally {
+          result.cleanup();
+        }
       });
 
       it('should stream with combined processors', async () => {

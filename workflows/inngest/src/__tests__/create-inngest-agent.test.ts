@@ -8,16 +8,19 @@
 
 import { Agent } from '@mastra/core/agent';
 import {
+  AGENT_CONTROL_TOPIC,
   AGENT_STREAM_TOPIC,
   AgentStreamEventTypes,
+  createDurableAgent,
   globalRunRegistry,
   TOOL_PERMISSION_POLICY_KEY,
   TOOL_PERMISSION_POLICY_REQUIRED_KEY,
 } from '@mastra/core/agent/durable';
 import { InMemoryServerCache } from '@mastra/core/cache';
-import { CachingPubSub, EventEmitterPubSub } from '@mastra/core/events';
+import { CachingPubSub, EventEmitterPubSub, PubSub } from '@mastra/core/events';
 import { Mastra } from '@mastra/core/mastra';
 import { RequestContext } from '@mastra/core/request-context';
+import { MastraLanguageModelV2Mock as MockLanguageModelV2 } from '@mastra/core/test-utils/llm-mock';
 import { DefaultStorage } from '@mastra/libsql';
 import { Inngest } from 'inngest';
 import { describe, it, expect, vi } from 'vitest';
@@ -773,10 +776,104 @@ describe('InngestAgent parity surface', () => {
       expect(entry?.abortSignal).toBeInstanceOf(AbortSignal);
       expect(entry?.abortSignal?.aborted).toBe(false);
 
-      result.abort('user-cancelled');
+      await result.abort('user-cancelled');
 
       expect(entry?.abortSignal?.aborted).toBe(true);
       await entry?.workflowExecution;
+    } finally {
+      result.cleanup();
+      sendSpy.mockRestore();
+      await mastra.shutdown();
+    }
+  });
+
+  it('rejects an awaitable abort when remote dispatch cannot be confirmed', async () => {
+    const { durableAgent, mastra } = makeIsolatedAgent('parity-abort-dispatch-failure');
+    const sendSpy = stubInngestSend();
+    const result = await durableAgent.stream([{ role: 'user', content: 'hi' }]);
+    const entry = globalRunRegistry.get(result.runId);
+    const runtimeBindingId = entry?.runtimeBindingId;
+    expect(runtimeBindingId).toEqual(expect.any(String));
+    const dispatchError = new Error('abort transport unavailable');
+    const originalPublish = durableAgent.pubsub.publish.bind(durableAgent.pubsub);
+    const publishSpy = vi.spyOn(durableAgent.pubsub, 'publish').mockImplementation(async (topic, event) => {
+      if (topic === AGENT_CONTROL_TOPIC(result.runId, runtimeBindingId!)) throw dispatchError;
+      return originalPublish(topic, event);
+    });
+
+    try {
+      await expect(result.abort('user-cancelled')).rejects.toBe(dispatchError);
+      expect(entry?.abortSignal?.aborted).toBe(true);
+      await entry?.workflowExecution;
+    } finally {
+      publishSpy.mockRestore();
+      result.cleanup();
+      sendSpy.mockRestore();
+      await mastra.shutdown();
+    }
+  });
+
+  it('does not let stale stream cleanup delete a newer controller for the same durable binding', async () => {
+    const { durableAgent, mastra } = makeIsolatedAgent('parity-stale-stream-cleanup');
+    const sendSpy = stubInngestSend();
+    const result = await durableAgent.stream([{ role: 'user', content: 'hi' }]);
+    const previousEntry = globalRunRegistry.get(result.runId)!;
+    const newerController = new AbortController();
+    const newerEntry = {
+      ...previousEntry,
+      abortController: newerController,
+      abortSignal: newerController.signal,
+    };
+    globalRunRegistry.set(result.runId, newerEntry);
+
+    try {
+      result.cleanup();
+      expect(globalRunRegistry.get(result.runId)).toBe(newerEntry);
+      expect(newerController.signal.aborted).toBe(false);
+    } finally {
+      globalRunRegistry.delete(result.runId);
+      sendSpy.mockRestore();
+      await mastra.shutdown();
+    }
+  });
+
+  it('retains an already-aborted external signal for a worker that subscribes later', async () => {
+    const { durableAgent, mastra } = makeIsolatedAgent('parity-abort-before-worker');
+    const sendSpy = stubInngestSend();
+    const external = new AbortController();
+    external.abort(new Error('cancel-before-worker'));
+
+    const result = await durableAgent.stream([{ role: 'user', content: 'hi' }], {
+      abortSignal: external.signal,
+    });
+    const runtimeBindingId = globalRunRegistry.get(result.runId)?.runtimeBindingId;
+    expect(runtimeBindingId).toEqual(expect.any(String));
+    try {
+      await vi.waitFor(async () => {
+        const history = await durableAgent.pubsub.getHistory(AGENT_CONTROL_TOPIC(result.runId, runtimeBindingId!));
+        expect(history).toEqual([expect.objectContaining({ type: 'abort-request', runId: result.runId })]);
+      });
+    } finally {
+      result.cleanup();
+      sendSpy.mockRestore();
+      await mastra.shutdown();
+    }
+  });
+
+  it('preserves a retained abort when workflow dispatch acknowledgement is ambiguous', async () => {
+    const { durableAgent, mastra } = makeIsolatedAgent('parity-abort-ambiguous-trigger');
+    const sendSpy = vi.spyOn(inngest as any, 'send').mockRejectedValue(new Error('dispatch acknowledgement lost'));
+
+    const result = await durableAgent.stream([{ role: 'user', content: 'hi' }]);
+    const runtimeBindingId = globalRunRegistry.get(result.runId)?.runtimeBindingId;
+    expect(runtimeBindingId).toEqual(expect.any(String));
+    try {
+      await result.abort('cancel-possibly-queued-run');
+
+      await vi.waitFor(async () => {
+        const history = await durableAgent.pubsub.getHistory(AGENT_CONTROL_TOPIC(result.runId, runtimeBindingId!));
+        expect(history).toEqual([expect.objectContaining({ type: 'abort-request', runId: result.runId })]);
+      });
     } finally {
       result.cleanup();
       sendSpy.mockRestore();
@@ -926,6 +1023,162 @@ describe('InngestAgent parity surface', () => {
     },
   );
 
+  it('rejects an overlapping caller-reused run ID without replacing the active binding', async () => {
+    const { durableAgent, mastra } = makeIsolatedAgent('parity-overlapping-run-id');
+    const sendSpy = stubInngestSend();
+    const runId = 'overlapping-run-id';
+    const first = await durableAgent.stream([{ role: 'user', content: 'first' }], { runId });
+    const firstEntry = globalRunRegistry.get(runId);
+    await firstEntry?.workflowExecution;
+
+    try {
+      await expect(durableAgent.stream([{ role: 'user', content: 'second' }], { runId })).rejects.toThrow(
+        /already active/,
+      );
+      expect(globalRunRegistry.get(runId)).toBe(firstEntry);
+      expect(sendSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      first.cleanup();
+      sendSpy.mockRestore();
+      await mastra.shutdown();
+    }
+  });
+
+  it('rejects an Inngest run when only a pinned Core runtime occupies the caller-reused ID', async () => {
+    const runId = 'pinned-core-runtime-collision';
+    let markProcessorStarted!: () => void;
+    let releaseProcessor!: () => void;
+    const processorStarted = new Promise<void>(resolve => {
+      markProcessorStarted = resolve;
+    });
+    const processorReleased = new Promise<void>(resolve => {
+      releaseProcessor = resolve;
+    });
+    const corePubsub = new EventEmitterPubSub();
+    const coreAgent = new Agent({
+      id: 'pinned-core-runtime-owner',
+      name: 'Pinned Core Runtime Owner',
+      instructions: 'Test',
+      model: new MockLanguageModelV2({
+        doStream: (async () => ({
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream: new ReadableStream({
+            start(controller) {
+              controller.enqueue({ type: 'stream-start', warnings: [] });
+              controller.enqueue({
+                type: 'finish',
+                finishReason: 'stop',
+                usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+              });
+              controller.close();
+            },
+          }),
+        })) as any,
+      }) as any,
+      inputProcessors: [
+        {
+          id: 'hold-pinned-runtime',
+          processInputStep: async () => {
+            markProcessorStarted();
+            await processorReleased;
+            return {};
+          },
+        },
+      ],
+    });
+    const coreDurableAgent = createDurableAgent({ agent: coreAgent, pubsub: corePubsub });
+    const coreResult = await coreDurableAgent.stream([{ role: 'user', content: 'first' }], { runId });
+    const coreConsume = coreResult.output.consumeStream();
+    const coreEntry = globalRunRegistry.get(runId)!;
+    await processorStarted;
+
+    // Keep the active execution only in Core's pinned registry. Inngest must
+    // consult the bound lookup rather than the expiring public map before it
+    // claims this caller-supplied identifier.
+    globalRunRegistry.delete(runId);
+    const { durableAgent, mastra } = makeIsolatedAgent('parity-pinned-core-collision');
+    const sendSpy = stubInngestSend();
+
+    try {
+      await expect(durableAgent.stream([{ role: 'user', content: 'second' }], { runId })).rejects.toThrow(
+        /already active/,
+      );
+      expect(globalRunRegistry.get(runId)).toBeUndefined();
+      expect(sendSpy).not.toHaveBeenCalled();
+    } finally {
+      releaseProcessor();
+      await coreEntry.workflowExecution;
+      await coreConsume;
+      coreResult.cleanup();
+      sendSpy.mockRestore();
+      await mastra.shutdown();
+      await corePubsub.close();
+      globalRunRegistry.delete(runId);
+    }
+  });
+
+  it('does not leak initial registry or abort-listener state when pubsub setup fails', async () => {
+    const runId = 'initial-setup-rollback-run';
+    const innerPubsub = new EventEmitterPubSub();
+    const invalidPubsub = new CachingPubSub(innerPubsub, new InMemoryServerCache());
+    const durableAgent = createInngestAgent({
+      agent: makeAgent('parity-initial-setup-rollback'),
+      inngest,
+      pubsub: invalidPubsub,
+    });
+    const external = new AbortController();
+
+    try {
+      await expect(
+        durableAgent.stream([{ role: 'user', content: 'hi' }], { runId, abortSignal: external.signal }),
+      ).rejects.toThrow(/indexedReplay/);
+      expect(globalRunRegistry.has(runId)).toBe(false);
+      external.abort('after-failed-setup');
+      expect(globalRunRegistry.has(runId)).toBe(false);
+    } finally {
+      globalRunRegistry.delete(runId);
+      await innerPubsub.close();
+    }
+  });
+
+  it('releases initial registry and external-listener state when stream subscription rejects', async () => {
+    class RejectingSubscribePubSub extends PubSub {
+      async publish(): Promise<void> {}
+      async subscribe(): Promise<void> {
+        throw new Error('subscription setup failed');
+      }
+      async unsubscribe(): Promise<void> {}
+      async flush(): Promise<void> {}
+    }
+
+    const runId = 'initial-subscription-rollback-run';
+    const customPubsub = new CachingPubSub(new RejectingSubscribePubSub(), new InMemoryServerCache(), {
+      indexedReplay: { retentionMs: 60_000, maxEvents: 100 },
+    });
+    const durableAgent = createInngestAgent({
+      agent: makeAgent('parity-initial-subscription-rollback'),
+      inngest,
+      pubsub: customPubsub,
+    });
+    const external = new AbortController();
+    const result = await durableAgent.stream([{ role: 'user', content: 'hi' }], {
+      runId,
+      abortSignal: external.signal,
+    });
+    const entry = globalRunRegistry.get(runId);
+
+    try {
+      await entry?.workflowExecution;
+      expect(globalRunRegistry.has(runId)).toBe(false);
+      external.abort('after-rejected-subscription');
+      expect(entry?.abortSignal?.aborted).toBe(false);
+    } finally {
+      result.cleanup();
+      globalRunRegistry.delete(runId);
+    }
+  });
+
   it('does not dispatch a second sequential start for the same admitted run', async () => {
     const { durableAgent, mastra } = makeIsolatedAgent('parity-single-start-admission');
     const sendSpy = stubInngestSend();
@@ -997,6 +1250,209 @@ describe('InngestAgent parity surface', () => {
     }
   });
 
+  it('rejects overlapping resume admission without replacing the active segment controller', async () => {
+    const { durableAgent, mastra } = makeIsolatedAgent('parity-overlapping-resume');
+    const workflowIds = workflowIdsFor('parity-overlapping-resume');
+    const runId = 'overlapping-resume-run';
+    const runtimeBindingId = 'overlapping-resume-binding';
+    const workflowsStore = await mastra.getStorage()!.getStore('workflows');
+    const [workflow] = durableAgent.getDurableWorkflows() as any[];
+    await workflowsStore.persistWorkflowSnapshot({
+      workflowName: workflowIds.AGENTIC_LOOP,
+      runId,
+      snapshot: {
+        runId,
+        executionGeneration: 'overlapping-resume-generation',
+        lifecycleResumeAttempt: 0,
+        lifecycleStepStates: {},
+        status: 'suspended',
+        value: {},
+        context: { input: { __workflowKind: 'durable-agent', runId, runtimeBindingId } },
+        suspendedPaths: { 'agentic-loop': [0] },
+        activePaths: [],
+        activeStepsPath: {},
+        waitingPaths: {},
+        resumeLabels: {},
+        serializedStepGraph: workflow.serializedStepGraph,
+        timestamp: Date.now(),
+      },
+    });
+    let resolveSend!: () => void;
+    const sendPending = new Promise<void>(resolve => {
+      resolveSend = resolve;
+    });
+    const sendSpy = vi.spyOn(inngest as any, 'send').mockImplementation(() => sendPending);
+    const first = await durableAgent.resume(runId, { answer: 'first' });
+    const firstEntry = globalRunRegistry.get(runId);
+    const firstController = firstEntry?.abortController;
+
+    try {
+      await expect(durableAgent.resume(runId, { answer: 'second' })).rejects.toThrow(/resume is already pending/);
+      expect(globalRunRegistry.get(runId)).toBe(firstEntry);
+      expect(globalRunRegistry.get(runId)?.abortController).toBe(firstController);
+    } finally {
+      resolveSend();
+      await firstEntry?.workflowExecution;
+      first.cleanup();
+      sendSpy.mockRestore();
+      await mastra.shutdown();
+    }
+  });
+
+  it('rolls back resume setup state when pubsub initialization fails', async () => {
+    const id = 'parity-resume-setup-rollback';
+    const innerPubsub = new EventEmitterPubSub();
+    const invalidPubsub = new CachingPubSub(innerPubsub, new InMemoryServerCache());
+    const durableAgent = createInngestAgent({ agent: makeAgent(id), inngest, pubsub: invalidPubsub });
+    const mastra = new Mastra({
+      logger: false,
+      storage: new DefaultStorage({ id: `${id}-storage`, url: ':memory:' }),
+      agents: { [id]: durableAgent },
+    });
+    const workflowIds = workflowIdsFor(id);
+    const runId = 'resume-setup-rollback-run';
+    const runtimeBindingId = 'resume-setup-rollback-binding';
+    const workflowsStore = await mastra.getStorage()!.getStore('workflows');
+    const [workflow] = durableAgent.getDurableWorkflows() as any[];
+    await workflowsStore.persistWorkflowSnapshot({
+      workflowName: workflowIds.AGENTIC_LOOP,
+      runId,
+      snapshot: {
+        runId,
+        executionGeneration: 'resume-setup-rollback-generation',
+        lifecycleResumeAttempt: 0,
+        lifecycleStepStates: {},
+        status: 'suspended',
+        value: {},
+        context: { input: { __workflowKind: 'durable-agent', runId, runtimeBindingId } },
+        suspendedPaths: { 'agentic-loop': [0] },
+        activePaths: [],
+        activeStepsPath: {},
+        waitingPaths: {},
+        resumeLabels: {},
+        serializedStepGraph: workflow.serializedStepGraph,
+        timestamp: Date.now(),
+      },
+    });
+    const previousController = new AbortController();
+    const previousEntry = {
+      runtimeBindingId,
+      tools: {},
+      model: {} as any,
+      abortController: previousController,
+      abortSignal: previousController.signal,
+    };
+    globalRunRegistry.set(runId, previousEntry);
+    const external = new AbortController();
+
+    try {
+      await expect(durableAgent.resume(runId, undefined, { abortSignal: external.signal })).rejects.toThrow(
+        /indexedReplay/,
+      );
+      expect(globalRunRegistry.get(runId)).toBe(previousEntry);
+      expect(globalRunRegistry.get(runId)?.abortController).toBe(previousController);
+      external.abort('after-failed-setup');
+      expect(previousController.signal.aborted).toBe(false);
+    } finally {
+      globalRunRegistry.delete(runId);
+      await innerPubsub.close();
+      await mastra.shutdown();
+    }
+  });
+
+  it('restores reused registry state when resume subscription rejects before dispatch', async () => {
+    let releaseErrorPublish!: () => void;
+    const errorPublishPending = new Promise<void>(resolve => {
+      releaseErrorPublish = resolve;
+    });
+    let rejectSubscription!: (error: Error) => void;
+    const subscriptionPending = new Promise<void>((_resolve, reject) => {
+      rejectSubscription = reject;
+    });
+    class RejectingSubscribePubSub extends PubSub {
+      async publish(): Promise<void> {
+        await errorPublishPending;
+      }
+      async subscribe(): Promise<void> {
+        await subscriptionPending;
+      }
+      async unsubscribe(): Promise<void> {}
+      async flush(): Promise<void> {}
+    }
+
+    const id = 'parity-resume-subscription-rollback';
+    const customPubsub = new CachingPubSub(new RejectingSubscribePubSub(), new InMemoryServerCache(), {
+      indexedReplay: { retentionMs: 60_000, maxEvents: 100 },
+    });
+    const durableAgent = createInngestAgent({ agent: makeAgent(id), inngest, pubsub: customPubsub });
+    const mastra = new Mastra({
+      logger: false,
+      storage: new DefaultStorage({ id: `${id}-storage`, url: ':memory:' }),
+      agents: { [id]: durableAgent },
+    });
+    const workflowIds = workflowIdsFor(id);
+    const runId = 'resume-subscription-rollback-run';
+    const runtimeBindingId = 'resume-subscription-rollback-binding';
+    const workflowsStore = await mastra.getStorage()!.getStore('workflows');
+    const [workflow] = durableAgent.getDurableWorkflows() as any[];
+    await workflowsStore.persistWorkflowSnapshot({
+      workflowName: workflowIds.AGENTIC_LOOP,
+      runId,
+      snapshot: {
+        runId,
+        executionGeneration: 'resume-subscription-rollback-generation',
+        lifecycleResumeAttempt: 0,
+        lifecycleStepStates: {},
+        status: 'suspended',
+        value: {},
+        context: { input: { __workflowKind: 'durable-agent', runId, runtimeBindingId } },
+        suspendedPaths: { 'agentic-loop': [0] },
+        activePaths: [],
+        activeStepsPath: {},
+        waitingPaths: {},
+        resumeLabels: {},
+        serializedStepGraph: workflow.serializedStepGraph,
+        timestamp: Date.now(),
+      },
+    });
+    const previousController = new AbortController();
+    const previousWorkflowExecution = Promise.resolve();
+    const previousEntry = {
+      runtimeBindingId,
+      tools: {},
+      model: {} as any,
+      abortController: previousController,
+      abortSignal: previousController.signal,
+      workflowExecution: previousWorkflowExecution,
+    };
+    globalRunRegistry.set(runId, previousEntry);
+    const external = new AbortController();
+    const result = await durableAgent.resume(runId, undefined, { abortSignal: external.signal });
+
+    try {
+      result.cleanup();
+      rejectSubscription(new Error('resume subscription setup failed'));
+      await vi.waitFor(() => expect(previousEntry.workflowExecution).toBe(previousWorkflowExecution));
+      expect(globalRunRegistry.get(runId)).toBe(previousEntry);
+      expect(previousEntry.abortController).toBe(previousController);
+      expect(previousEntry.abortSignal).toBe(previousController.signal);
+      expect(previousEntry.workflowExecution).toBe(previousWorkflowExecution);
+      external.abort('after-rejected-resume-subscription');
+      expect(previousController.signal.aborted).toBe(false);
+
+      // Error publication is still pending, but the reservation was released
+      // before awaiting it, so a retry can acquire admission immediately.
+      const retry = await durableAgent.resume(runId, undefined);
+      retry.cleanup();
+      releaseErrorPublish();
+    } finally {
+      releaseErrorPublish();
+      result.cleanup();
+      globalRunRegistry.delete(runId);
+      await mastra.shutdown();
+    }
+  });
+
   it('strips unallowlisted legacy snapshot context from the workflow resume event', async () => {
     const { durableAgent, mastra } = makeIsolatedAgent('parity-request-context-resume');
     const workflowIds = workflowIdsFor('parity-request-context-resume');
@@ -1014,7 +1470,13 @@ describe('InngestAgent parity surface', () => {
         lifecycleStepStates: {},
         status: 'suspended',
         value: { retainedState: true },
-        context: {},
+        context: {
+          input: {
+            __workflowKind: 'durable-agent',
+            runId,
+            runtimeBindingId: 'request-context-resume-binding',
+          },
+        },
         suspendedPaths: { 'agentic-loop': [0] },
         activePaths: [],
         activeStepsPath: {},
@@ -1089,7 +1551,13 @@ describe('InngestAgent parity surface', () => {
         lifecycleStepStates: {},
         status: 'suspended',
         value: { retainedState: true },
-        context: {},
+        context: {
+          input: {
+            __workflowKind: 'durable-agent',
+            runId,
+            runtimeBindingId: 'request-context-resume-policy-binding',
+          },
+        },
         suspendedPaths: { 'agentic-loop': [0] },
         activePaths: [],
         activeStepsPath: {},
@@ -1160,7 +1628,13 @@ describe('InngestAgent parity surface', () => {
         lifecycleStepStates: {},
         status: 'suspended',
         value: {},
-        context: {},
+        context: {
+          input: {
+            __workflowKind: 'durable-agent',
+            runId,
+            runtimeBindingId: 'request-context-resume-filtered-binding',
+          },
+        },
         suspendedPaths: { 'agentic-loop': [0] },
         activePaths: [],
         activeStepsPath: {},

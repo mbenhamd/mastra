@@ -1,7 +1,9 @@
 import { Agent } from '@mastra/core/agent';
 import { globalRunRegistry, resolveRuntimeDependencies } from '@mastra/core/agent/durable';
 import { EventEmitterPubSub } from '@mastra/core/events';
+import { Mastra } from '@mastra/core/mastra';
 import { RequestContext } from '@mastra/core/request-context';
+import { DefaultStorage } from '@mastra/libsql';
 import { Inngest } from 'inngest';
 import { describe, expect, it, vi } from 'vitest';
 import { createInngestAgent } from './index';
@@ -25,9 +27,14 @@ describe('InngestAgent resume runtime rehydration', () => {
       instructions: 'Test',
       model: createMockModel() as any,
     });
-    const durableAgent = createInngestAgent({ agent, inngest });
+    const durableAgent = createInngestAgent({ agent, inngest, durableRequestContextKeys: ['tenantId'] });
+    const mastra = new Mastra({
+      logger: false,
+      storage: new DefaultStorage({ id: 'resume-runtime-rehydration-storage', url: ':memory:' }),
+      agents: { [agent.id]: durableAgent },
+    });
     (durableAgent.pubsub as any).inner = new EventEmitterPubSub();
-    const sendSpy = vi.spyOn(inngest as any, 'send').mockResolvedValue(undefined);
+    const sendSpy = vi.spyOn(inngest as any, 'send').mockResolvedValue({ ids: ['test-event'] });
     const requestContext = new RequestContext();
     requestContext.set('tenantId', 'tenant-1');
     const initialResult = await durableAgent.stream([{ role: 'user', content: 'hi' }], { requestContext });
@@ -37,39 +44,45 @@ describe('InngestAgent resume runtime rehydration', () => {
       await vi.waitFor(() => expect(globalRunRegistry.get(runId)?.workflowExecution).toBeDefined());
       await expect(globalRunRegistry.get(runId)!.workflowExecution).resolves.toBeUndefined();
 
-      const workflowInput = sendSpy.mock.calls[0]?.[0]?.data?.inputData;
+      const dispatch = sendSpy.mock.calls[0]?.[0] as any;
+      const workflowInput = dispatch?.data?.inputData;
       expect(workflowInput?.requestContextEntries).toEqual({ tenantId: 'tenant-1' });
+
+      const workflowId = durableAgent.getDurableWorkflows()[0]!.id;
+      const workflowsStore = await mastra.getStorage()!.getStore('workflows');
+      if (!workflowsStore) throw new Error('workflow storage is unavailable');
+      const runningSnapshot = await workflowsStore.loadWorkflowSnapshot({ workflowName: workflowId, runId });
+      expect(runningSnapshot).toBeDefined();
+      await workflowsStore.persistWorkflowSnapshot({
+        workflowName: workflowId,
+        runId,
+        snapshot: {
+          ...runningSnapshot!,
+          status: 'suspended',
+          context: { input: workflowInput },
+          suspendedPaths: { 'agentic-loop': [0] },
+          requestContext: workflowInput.requestContextEntries,
+        },
+      });
 
       initialResult.cleanup();
       expect(globalRunRegistry.has(runId)).toBe(false);
 
       const restoredModel = createMockModel();
-      const restoredTools = { approvalTool: { id: 'approval-tool' } as any };
+      const restoredTools = {};
       const assertRestoredContext = (context: RequestContext) => {
         expect(context.get('tenantId')).toBe('tenant-1');
       };
-      const registeredAgent = {
-        async getToolsForExecution({ requestContext: context }: { requestContext: RequestContext }) {
-          assertRestoredContext(context);
-          return restoredTools;
-        },
-        async getModel({ requestContext: context }: { requestContext: RequestContext }) {
-          assertRestoredContext(context);
-          return restoredModel;
-        },
-      };
-      const snapshot = {
-        value: {},
-        context: { input: workflowInput },
-        suspendedPaths: { 'agentic-loop': ['agentic-loop'] },
-      };
-      const mastra = {
-        getAgentById: () => registeredAgent,
-        getStorage: () => ({
-          getStore: async () => ({ loadWorkflowSnapshot: async () => snapshot }),
-        }),
-      };
-      (durableAgent as any).__setMastra(mastra);
+      vi.spyOn(agent, 'getToolsForExecution').mockImplementation(async ({ requestContext: context }) => {
+        expect(context).toBeDefined();
+        assertRestoredContext(context!);
+        return restoredTools;
+      });
+      vi.spyOn(agent, 'getModel').mockImplementation(async options => {
+        expect(options?.requestContext).toBeDefined();
+        assertRestoredContext(options!.requestContext!);
+        return restoredModel as any;
+      });
 
       const resumedResult = await durableAgent.resume(runId, { approved: true });
       try {
@@ -80,7 +93,7 @@ describe('InngestAgent resume runtime rehydration', () => {
 
         // The durable LLM step performs this resolution on the Inngest worker.
         const resolved = await resolveRuntimeDependencies({
-          mastra: mastra as any,
+          mastra,
           runId,
           agentId: workflowInput.agentId,
           input: workflowInput,
@@ -98,6 +111,7 @@ describe('InngestAgent resume runtime rehydration', () => {
       initialResult.cleanup();
       globalRunRegistry.delete(runId);
       sendSpy.mockRestore();
+      await mastra.shutdown();
     }
   });
 });

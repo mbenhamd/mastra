@@ -34,6 +34,7 @@ import {
   createObservationFailedMarker,
   createObservationStartMarker,
 } from './markers';
+import { getObservableMessages } from './message-utils';
 import type { ModelByInputTokens } from './model-by-input-tokens';
 import { didProviderChange } from './model-context';
 import { registerOp, unregisterOp, isOpActiveInProcess } from './operation-registry';
@@ -101,7 +102,6 @@ async function persistThreadExtractedValues(
   });
   await updateThreadFromObservationalMemory(storage, {
     id: threadId,
-    title: thread.title ?? '',
     metadata: newMetadata,
     guard,
   });
@@ -120,7 +120,7 @@ function getCurrentModel(model?: ObservationModelContext): string | undefined {
 }
 
 function getLastModelFromMessageList(messageList?: MessageList): string | undefined {
-  const messages = messageList?.get.all.db();
+  const messages = messageList ? getObservableMessages(messageList) : undefined;
   if (!messages) return undefined;
 
   for (let i = messages.length - 1; i >= 0; i--) {

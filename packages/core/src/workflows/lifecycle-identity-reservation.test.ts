@@ -10,10 +10,19 @@ import type { ExecutionGraph } from './execution-engine';
 import type { SerializedStepFlowEntry, WorkflowRunState } from './types';
 import { createStep } from './workflow';
 
+const getOrCreateSpanMock = vi.fn();
+vi.mock('../observability', async importOriginal => {
+  const actual = await importOriginal<typeof import('../observability')>();
+  return {
+    ...actual,
+    getOrCreateSpan: (...args: any[]) => getOrCreateSpanMock(...args) ?? (actual.getOrCreateSpan as any)(...args),
+  };
+});
+
 const workflowId = 'lifecycle-identity-reservation';
 const runId = 'shared-pending-run';
 
-function makeWorkflow(executionEngine?: ExecutionEngine) {
+function makeWorkflow(executionEngine?: ExecutionEngine, onStart?: () => Promise<void> | void) {
   const step = createStep({
     id: 'only-step',
     inputSchema: z.object({}),
@@ -26,6 +35,7 @@ function makeWorkflow(executionEngine?: ExecutionEngine) {
     outputSchema: z.object({}),
     steps: [step],
     executionEngine,
+    options: { onStart },
   })
     .then(step)
     .commit();
@@ -142,8 +152,10 @@ describe('workflow lifecycle identity admission', () => {
       return snapshot;
     };
 
-    const workflowA = makeWorkflow();
-    const workflowB = makeWorkflow();
+    const losingOnStart = vi.fn();
+    const winningOnStart = vi.fn();
+    const workflowA = makeWorkflow(undefined, losingOnStart);
+    const workflowB = makeWorkflow(undefined, winningOnStart);
     const mastraA = new Mastra({ logger: false, storage, workflows: { [workflowId]: workflowA } });
     const mastraB = new Mastra({ logger: false, storage, workflows: { [workflowId]: workflowB } });
     const [runA, runB] = await Promise.all([
@@ -158,8 +170,21 @@ describe('workflow lifecycle identity admission', () => {
     expect(creatorAGeneration).not.toBe(creatorBGeneration);
     expect(admitted?.executionGeneration).toBe(creatorBGeneration);
 
+    const losingSpanError = vi.fn();
+    getOrCreateSpanMock.mockReturnValueOnce({
+      id: 'losing-span',
+      externalTraceId: 'losing-trace',
+      error: losingSpanError,
+    });
     await expect(runA.start({ inputData: {} })).rejects.toThrow('lifecycle execution admission is stale');
+    expect(losingOnStart).not.toHaveBeenCalled();
+    expect(losingSpanError).toHaveBeenCalledTimes(1);
+    expect(losingSpanError.mock.calls[0]![0]!.error.message).toBe(
+      `Workflow run ${workflowId}/absent-race-run lifecycle execution admission is stale`,
+    );
+
     await expect(runB.start({ inputData: {} })).resolves.toMatchObject({ status: 'success' });
+    expect(winningOnStart).toHaveBeenCalledTimes(1);
     await expect(originalLoad({ workflowName: workflowId, runId: 'absent-race-run' })).resolves.toMatchObject({
       executionGeneration: creatorBGeneration,
       status: 'success',

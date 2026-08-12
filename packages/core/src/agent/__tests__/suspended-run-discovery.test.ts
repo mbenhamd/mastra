@@ -217,6 +217,40 @@ function createFGAProvider(): IFGAProvider {
   };
 }
 
+function createToolSuspensionSetup({
+  storage,
+  toolCallOnFirstCall,
+  onResume,
+}: {
+  storage: InMemoryStore;
+  toolCallOnFirstCall: boolean;
+  onResume: (resumeData: { name: string }) => void;
+}) {
+  const askUserTool = createTool({
+    id: 'Ask user tool',
+    description: 'Asks the user for the name',
+    inputSchema: z.object({ name: z.string() }),
+    suspendSchema: z.object({ question: z.string() }),
+    resumeSchema: z.object({ name: z.string() }),
+    execute: async (_input, context) => {
+      if (!context?.agent?.resumeData) {
+        return await context?.agent?.suspend({ question: 'Which user?' });
+      }
+      onResume(context.agent.resumeData);
+      return { name: context.agent.resumeData.name, email: 'dero@mail.com' };
+    },
+  });
+  const agent = new Agent({
+    id: 'suspending-agent',
+    name: 'Suspending Agent',
+    instructions: 'You find users.',
+    model: createMockModel({ toolName: 'askUserTool', toolCallOnFirstCall }),
+    tools: { askUserTool },
+  });
+  const mastra = new Mastra({ agents: { agent }, logger: false, storage });
+  return { agent, mastra };
+}
+
 async function suspendRun(agent: Agent, threadId: string, resourceId: string) {
   const stream = await agent.stream('Find the user with name - Dero Israel', {
     requireToolApproval: true,
@@ -271,6 +305,7 @@ async function persistConflictingSuspendedStepOwnership(
 
 afterEach(() => {
   mockFindUser.mockClear();
+  vi.restoreAllMocks();
 });
 
 // The loop workflows pick their engine from MASTRA_EVENTED_EXECUTION at
@@ -894,11 +929,13 @@ describe.each([
 
       const scoped = await supervisor.listSuspendedRuns({ threadId: 'thread-1', resourceId: 'resource-1' });
       expect(scoped.runs.map(run => run.runId)).toEqual([stream.runId]);
+      // The outer resumable run retains its own toolCallId, but discloses the
+      // actual inner approval target and arguments to the user.
       expect(scoped.runs[0]!.toolCalls).toEqual([
         {
           toolCallId: 'sup-call-1',
-          toolName: 'agent-billing-agent',
-          args: { message: 'Find Dero Israel' },
+          toolName: 'findUserTool',
+          args: { name: 'Dero Israel' },
           requiresApproval: true,
         },
       ]);
@@ -939,16 +976,16 @@ describe.each([
         // consume until suspension
       }
 
-      // Each agent in the chain sees only its own suspended run.
+      // Each agent in the chain sees only its own suspended run. Every layer
+      // discloses the leaf approval target while retaining its layer's resumable
+      // toolCallId internally.
       const supervisorRuns = await supervisor.listSuspendedRuns();
       expect(supervisorRuns.runs.map(run => run.runId)).toEqual([stream.runId]);
-      // The supervisor's resumable run shows the delegation call to mid, not the
-      // real approval tool (which lives on the leaf's run).
       expect(supervisorRuns.runs[0]!.toolCalls).toEqual([
         {
           toolCallId: 'sup-call-1',
-          toolName: 'agent-mid-agent',
-          args: { message: 'Find Dero Israel' },
+          toolName: 'findUserTool',
+          args: { name: 'Dero Israel' },
           requiresApproval: true,
         },
       ]);
@@ -956,11 +993,13 @@ describe.each([
       const midRuns = await mid.listSuspendedRuns();
       expect(midRuns.runs).toHaveLength(1);
       expect(midRuns.runs[0]!.runId).not.toBe(stream.runId);
-      expect(midRuns.runs[0]!.toolCalls[0]!.toolName).toBe('agent-leaf-agent');
+      expect(midRuns.runs[0]!.toolCalls[0]).toMatchObject({
+        toolName: 'findUserTool',
+        args: { name: 'Dero Israel' },
+      });
 
       const leafRuns = await leaf.listSuspendedRuns();
       expect(leafRuns.runs).toHaveLength(1);
-      // Only the innermost (leaf) run surfaces the actual approval tool + args.
       expect(leafRuns.runs[0]!.toolCalls).toEqual([
         {
           toolCallId: expect.any(String),
@@ -1421,6 +1460,93 @@ describe.each([
     });
   });
 
+  describe('agent.sendStreamResume() storage fallback', () => {
+    it('resumes a tool-suspended run after a simulated restart', async () => {
+      const storage = new InMemoryStore();
+      const resumedTool = vi.fn();
+      const { agent } = createToolSuspensionSetup({ storage, toolCallOnFirstCall: true, onResume: resumedTool });
+      const stream = await agent.stream('Find the user', {
+        memory: { thread: 'thread-1', resource: 'resource-1' },
+      });
+      let toolCallId = '';
+      for await (const chunk of stream.fullStream) {
+        if (chunk.type === 'tool-call-suspended') {
+          toolCallId = chunk.payload.toolCallId;
+        }
+      }
+      expect(toolCallId).toBeTruthy();
+
+      const { agent: restartedAgent, mastra } = createToolSuspensionSetup({
+        storage,
+        toolCallOnFirstCall: false,
+        onResume: resumedTool,
+      });
+      expect(restartedAgent.getActiveThreadRunId({ threadId: 'thread-1', resourceId: 'resource-1' })).toBeUndefined();
+      expect((await restartedAgent.listSuspendedRuns({ threadId: 'thread-1', resourceId: 'resource-1' })).runs).toEqual(
+        [expect.objectContaining({ runId: stream.runId })],
+      );
+
+      const result = await restartedAgent.sendStreamResume({
+        threadId: 'thread-1',
+        resourceId: 'resource-1',
+        runId: stream.runId,
+        toolCallId,
+        resumeData: { name: 'Dero Israel' },
+      });
+      expect(result).toEqual({ accepted: true, runId: stream.runId, toolCallId });
+
+      const workflowsStore = (await mastra.getStorage()!.getStore('workflows'))!;
+      await vi.waitFor(
+        async () => {
+          expect(resumedTool).toHaveBeenCalledWith({ name: 'Dero Israel' });
+          expect((await workflowsStore.listWorkflowRuns({})).runs).toHaveLength(0);
+        },
+        { timeout: 10000 },
+      );
+    }, 30000);
+
+    it('passes authenticated request context through cold FGA discovery and resume', async () => {
+      const storage = new InMemoryStore();
+      const suspended = await suspendRun(createSuspendedSetup({ storage }).agent, 'thread-1', 'resource-1');
+      const fgaProvider = createFGAProvider();
+      const restarted = createSuspendedSetup({ storage, toolCallOnFirstCall: false, fgaProvider });
+      const requestContext = new RequestContext([
+        ['user', { id: 'user-1' }],
+        [MASTRA_RESOURCE_ID_KEY, 'resource-1'],
+        [MASTRA_THREAD_ID_KEY, 'thread-1'],
+      ]);
+
+      await expect(
+        restarted.agent.sendStreamResume({
+          threadId: 'thread-1',
+          resourceId: 'resource-1',
+          runId: suspended.runId,
+          toolCallId: suspended.toolCallId,
+          resumeData: { approved: false },
+          streamOptions: { requestContext },
+        }),
+      ).resolves.toEqual({ accepted: true, runId: suspended.runId, toolCallId: suspended.toolCallId });
+      expect(fgaProvider.require).toHaveBeenCalled();
+    });
+
+    it('rejects a toolCallId that does not belong to the stored run', async () => {
+      const storage = new InMemoryStore();
+      const { agent } = createSuspendedSetup({ storage });
+      const { runId } = await suspendRun(agent, 'thread-1', 'resource-1');
+      const { agent: restartedAgent } = createSuspendedSetup({ storage, toolCallOnFirstCall: false });
+
+      await expect(
+        restartedAgent.sendStreamResume({
+          threadId: 'thread-1',
+          resourceId: 'resource-1',
+          runId,
+          toolCallId: 'wrong-tool-call',
+          resumeData: { approved: true },
+        }),
+      ).rejects.toMatchObject({ id: 'AGENT_SEND_STREAM_RESUME_NO_SUSPENDED_THREAD_RUN' });
+    }, 30000);
+  });
+
   describe('agent.sendToolApproval() storage fallback', () => {
     it('passes authenticated request context through cold FGA discovery and resume', async () => {
       const storage = new InMemoryStore();
@@ -1525,34 +1651,8 @@ describe.each([
 
     it('matches a suspend()-parked run by toolCallId after a simulated restart', async () => {
       const resumedTool = vi.fn();
-      const makeAskUserAgent = (toolCallOnFirstCall: boolean) => {
-        const askUserTool = createTool({
-          id: 'Ask user tool',
-          description: 'Asks the user for the name',
-          inputSchema: z.object({ name: z.string() }),
-          suspendSchema: z.object({ question: z.string() }),
-          resumeSchema: z.object({ name: z.string() }),
-          execute: async (_input, context) => {
-            if (!context?.agent?.resumeData) {
-              return await context?.agent?.suspend({ question: 'Which user?' });
-            }
-            resumedTool(context.agent.resumeData);
-            return { name: context.agent.resumeData.name, email: 'dero@mail.com' };
-          },
-        });
-        const agent = new Agent({
-          id: 'suspending-agent',
-          name: 'Suspending Agent',
-          instructions: 'You find users.',
-          model: createMockModel({ toolName: 'askUserTool', toolCallOnFirstCall }),
-          tools: { askUserTool },
-        });
-        const mastra = new Mastra({ agents: { agent }, logger: false, storage });
-        return { agent, mastra };
-      };
-
       const storage = new InMemoryStore();
-      const { agent } = makeAskUserAgent(true);
+      const { agent } = createToolSuspensionSetup({ storage, toolCallOnFirstCall: true, onResume: resumedTool });
       const stream = await agent.stream('Find the user', {
         memory: { thread: 'thread-1', resource: 'resource-1' },
       });
@@ -1566,7 +1666,11 @@ describe.each([
 
       // Fresh process: the run must be resolved from storage, and the id taken
       // from the tool-call-suspended chunk has to match the discovered run.
-      const { agent: restartedAgent, mastra } = makeAskUserAgent(false);
+      const { agent: restartedAgent, mastra } = createToolSuspensionSetup({
+        storage,
+        toolCallOnFirstCall: false,
+        onResume: resumedTool,
+      });
       expect(restartedAgent.getActiveThreadRunId({ threadId: 'thread-1', resourceId: 'resource-1' })).toBeUndefined();
 
       const result = await restartedAgent.sendToolApproval({
@@ -1648,6 +1752,185 @@ describe.each([
       });
       expect(result).toEqual({ accepted: true, runId: second.runId, toolCallId: second.toolCallId });
     }, 30000);
+
+    it('uses exact local approval metadata while storage still describes the previous sequential call', async () => {
+      const { agent } = createSuspendedSetup({ toolCallOnFirstCall: false });
+      const activeRunId = 'active-sequential-run';
+      vi.spyOn(agent, 'getActiveThreadRunId').mockReturnValue(activeRunId);
+      vi.spyOn(agent, 'listSuspendedRuns').mockResolvedValue({
+        runs: [
+          {
+            runId: activeRunId,
+            workflowName: 'agentic-loop',
+            status: 'suspended',
+            threadId: 'thread-1',
+            resourceId: 'resource-1',
+            suspendedAt: new Date(0),
+            toolCalls: [{ toolCallId: 'previous-call', requiresApproval: true }],
+          },
+        ],
+        total: 1,
+      });
+      const resumableSpy = vi.spyOn(agentThreadStreamRuntime, 'getResumableThreadRun').mockReturnValue({
+        runId: activeRunId,
+        toolCallId: 'next-call',
+      });
+      const resumeSpy = vi.spyOn(agent, 'sendStreamResume').mockResolvedValue({
+        accepted: true,
+        runId: activeRunId,
+        toolCallId: 'next-call',
+      });
+
+      await expect(
+        agent.sendToolApproval({
+          threadId: 'thread-1',
+          resourceId: 'resource-1',
+          runId: activeRunId,
+          toolCallId: 'next-call',
+          approved: true,
+        }),
+      ).resolves.toEqual({ accepted: true, runId: activeRunId, toolCallId: 'next-call' });
+      expect(resumableSpy).toHaveBeenCalledWith(
+        {
+          threadId: 'thread-1',
+          resourceId: 'resource-1',
+          runId: activeRunId,
+          toolCallId: 'next-call',
+          suspensionKind: 'approval',
+        },
+        expect.anything(),
+      );
+      expect(resumeSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          threadId: 'thread-1',
+          resourceId: 'resource-1',
+          runId: activeRunId,
+          toolCallId: 'next-call',
+          resumeData: { approved: true },
+        }),
+      );
+    });
+
+    it('waits for an exact remote approval occurrence when storage still describes the previous call', async () => {
+      const { agent } = createSuspendedSetup({ toolCallOnFirstCall: false });
+      const activeRunId = 'remote-sequential-run';
+      const staleRun = {
+        runId: activeRunId,
+        workflowName: 'agentic-loop',
+        status: 'suspended' as const,
+        threadId: 'thread-1',
+        resourceId: 'resource-1',
+        suspendedAt: new Date(0),
+        toolCalls: [{ toolCallId: 'previous-call', requiresApproval: true }],
+      };
+      const currentRun = {
+        ...staleRun,
+        toolCalls: [{ toolCallId: 'next-call', requiresApproval: true }],
+      };
+      vi.spyOn(agent, 'getActiveThreadRunId').mockReturnValue(activeRunId);
+      vi.spyOn(agentThreadStreamRuntime, 'getResumableThreadRun').mockReturnValue(undefined);
+      vi.spyOn(agent, 'listSuspendedRuns')
+        .mockResolvedValueOnce({ runs: [staleRun], total: 1 })
+        .mockResolvedValue({ runs: [currentRun], total: 1 });
+      const waitUntilFinished = vi.fn().mockResolvedValue(undefined);
+      const resumeSpy = vi.spyOn(agent, 'resumeStream').mockResolvedValue({
+        runId: activeRunId,
+        _waitUntilFinished: waitUntilFinished,
+      } as any);
+
+      await expect(
+        agent.sendToolApproval({
+          threadId: 'thread-1',
+          resourceId: 'resource-1',
+          runId: activeRunId,
+          toolCallId: 'next-call',
+          approved: true,
+        }),
+      ).resolves.toEqual({ accepted: true, runId: activeRunId, toolCallId: 'next-call' });
+      expect(resumeSpy).toHaveBeenCalledWith(
+        { approved: true },
+        expect.objectContaining({
+          runId: activeRunId,
+          toolCallId: 'next-call',
+          memory: { thread: 'thread-1', resource: 'resource-1' },
+        }),
+      );
+      await vi.waitFor(() => expect(waitUntilFinished).toHaveBeenCalledOnce());
+    });
+
+    it('does not reinterpret a generic suspension as an approval occurrence', async () => {
+      const { agent } = createSuspendedSetup({ toolCallOnFirstCall: false });
+      const activeRunId = 'generic-suspension-run';
+      vi.spyOn(agent, 'getActiveThreadRunId').mockReturnValue(activeRunId);
+      // Persisted kind wins if local metadata disagrees; never reinterpret an
+      // exact generic suspension as approval-shaped resume data.
+      vi.spyOn(agentThreadStreamRuntime, 'getResumableThreadRun').mockReturnValue({
+        runId: activeRunId,
+        toolCallId: 'generic-call',
+      });
+      vi.spyOn(agent, 'listSuspendedRuns').mockResolvedValue({
+        runs: [
+          {
+            runId: activeRunId,
+            workflowName: 'agentic-loop',
+            status: 'suspended',
+            threadId: 'thread-1',
+            resourceId: 'resource-1',
+            suspendedAt: new Date(0),
+            toolCalls: [{ toolCallId: 'generic-call', requiresApproval: false }],
+          },
+        ],
+        total: 1,
+      });
+      const resumeSpy = vi.spyOn(agent, 'sendStreamResume');
+
+      await expect(
+        agent.sendToolApproval({
+          threadId: 'thread-1',
+          resourceId: 'resource-1',
+          runId: activeRunId,
+          toolCallId: 'generic-call',
+          approved: true,
+        }),
+      ).rejects.toMatchObject({ id: 'AGENT_SEND_TOOL_APPROVAL_NO_ACTIVE_THREAD_RUN' });
+      expect(resumeSpy).not.toHaveBeenCalled();
+    });
+
+    it('rejects a matching toolCallId when the supplied runId names another occurrence', async () => {
+      const { agent } = createSuspendedSetup({ toolCallOnFirstCall: false });
+      const activeRunId = 'active-exact-run';
+      vi.spyOn(agent, 'getActiveThreadRunId').mockReturnValue(activeRunId);
+      vi.spyOn(agentThreadStreamRuntime, 'getResumableThreadRun').mockReturnValue({
+        runId: activeRunId,
+        toolCallId: 'shared-call',
+      });
+      vi.spyOn(agent, 'listSuspendedRuns').mockResolvedValue({
+        runs: [
+          {
+            runId: activeRunId,
+            workflowName: 'agentic-loop',
+            status: 'suspended',
+            threadId: 'thread-1',
+            resourceId: 'resource-1',
+            suspendedAt: new Date(0),
+            toolCalls: [{ toolCallId: 'shared-call', requiresApproval: true }],
+          },
+        ],
+        total: 1,
+      });
+      const resumeSpy = vi.spyOn(agent, 'sendStreamResume');
+
+      await expect(
+        agent.sendToolApproval({
+          threadId: 'thread-1',
+          resourceId: 'resource-1',
+          runId: 'different-run',
+          toolCallId: 'shared-call',
+          approved: true,
+        }),
+      ).rejects.toMatchObject({ id: 'AGENT_SEND_TOOL_APPROVAL_NO_ACTIVE_THREAD_RUN' });
+      expect(resumeSpy).not.toHaveBeenCalled();
+    });
 
     it('rejects an exact cold call while another run owns the same thread', async () => {
       const storage = new InMemoryStore();

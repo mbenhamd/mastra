@@ -117,23 +117,32 @@ const agentMessageInputSchema = z.union([userMessageSignalContentsSchema, agentM
 // `user`/`user-message` signals carry rich user content (string or text/file parts);
 // every other supported signal category is a context signal that must use string
 // contents. Restrict `type` to the runtime's `AgentSignalType` set (see core
-// `agent/signals.ts` `normalizeSignalType`) so unknown types are rejected at the edge
-// instead of throwing inside the runtime.
-const userMessageAgentSignalSchema = baseSignalSchema.extend({
-  type: z.enum(['user', 'user-message']),
+// `agent/signals.ts` `normalizeSignalType`) so unknown types are rejected at the edge.
+const agentSignalMetadataSchema = {
   tagName: z.string().optional(),
-  contents: userMessageSignalContentsSchema,
   providerOptions: z.record(z.string(), z.record(z.string(), jsonValueSchema)).optional(),
-});
+};
 
-const contextAgentSignalSchema = baseSignalSchema.extend({
-  type: z.enum(['state', 'reactive', 'notification', 'system-reminder']),
-  tagName: z.string().optional(),
-  contents: z.string(),
-  providerOptions: z.record(z.string(), z.record(z.string(), jsonValueSchema)).optional(),
-});
-
-const agentSignalSchema = z.union([userMessageAgentSignalSchema, contextAgentSignalSchema]);
+const agentSignalSchema = z.discriminatedUnion('type', [
+  baseSignalSchema.extend({
+    ...agentSignalMetadataSchema,
+    type: z.literal('state'),
+    contents: z.string(),
+    transient: z.never().optional(),
+  }),
+  baseSignalSchema.extend({
+    ...agentSignalMetadataSchema,
+    type: z.enum(['user', 'user-message']),
+    contents: userMessageSignalContentsSchema,
+    transient: z.boolean().optional(),
+  }),
+  baseSignalSchema.extend({
+    ...agentSignalMetadataSchema,
+    type: z.enum(['reactive', 'notification', 'system-reminder']),
+    contents: z.string(),
+    transient: z.boolean().optional(),
+  }),
+]);
 
 // Path parameter schemas
 export const agentIdPathParams = z.object({
@@ -531,7 +540,10 @@ export const approveToolCallBodySchema = toolCallActionBodySchema;
 /**
  * Body schema for declining tool call
  */
-export const declineToolCallBodySchema = toolCallActionBodySchema;
+export const declineToolCallBodySchema = toolCallActionBodySchema.extend({
+  /** Optional explanation surfaced to the model in place of the default decline message. */
+  reason: z.string().optional(),
+});
 
 /**
  * Body schema for approving network tool call
@@ -541,7 +553,10 @@ export const approveNetworkToolCallBodySchema = networkToolCallActionBodySchema;
 /**
  * Body schema for declining network tool call
  */
-export const declineNetworkToolCallBodySchema = networkToolCallActionBodySchema;
+export const declineNetworkToolCallBodySchema = networkToolCallActionBodySchema.extend({
+  /** Optional explanation surfaced in place of the default decline message. */
+  reason: z.string().optional(),
+});
 
 /**
  * Response schema for tool approval/decline
@@ -776,6 +791,7 @@ export const sendToolApprovalBodySchema = z.object({
   resourceId: z.string(),
   threadId: z.string(),
   requestContext: z.record(z.string(), z.unknown()).optional(),
+  runId: z.string(),
   toolCallId: z.string(),
   approved: z.boolean(),
   resumeData: z.unknown().optional(),

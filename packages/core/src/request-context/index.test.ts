@@ -307,6 +307,46 @@ describe('RequestContext', () => {
       expect(json).toHaveProperty('smallDag');
     });
 
+    it('should bound nested RequestContext probes by sharing one budget across them (#20446)', () => {
+      // A shared-reference graph that reaches a nested RequestContext through
+      // 2^8 paths. With a per-call budget each of the 256 visits re-ran the
+      // inner probe with a fresh full budget (~9-10s). Sharing one budget across
+      // nested probes bounds the total work and filters the over-budget key.
+      const inner = new RequestContext();
+      let big: unknown = { leaf: true };
+      for (let i = 0; i < 25; i++) big = { a: big, b: big }; // over budget on its own
+      inner.set('big', big);
+
+      let outer: unknown = inner;
+      for (let i = 0; i < 8; i++) outer = { a: outer, b: outer }; // 2^8 shared paths to inner
+
+      const ctx = new RequestContext();
+      ctx.set('outer', outer);
+      ctx.set('serializable', 'value');
+
+      const start = Date.now();
+      const json = ctx.toJSON();
+      const elapsed = Date.now() - start;
+
+      // Loose threshold: assert "bounded", not "fast" (was ~9-10s unbounded).
+      expect(elapsed).toBeLessThan(2000);
+      expect(json).toEqual({ serializable: 'value' });
+      expect(json).not.toHaveProperty('outer');
+    });
+
+    it('should keep nested RequestContext values whose total probe stays within budget', () => {
+      const inner = new RequestContext();
+      inner.set('userId', 'user-123');
+      inner.set('data', { nested: { value: 1 } });
+
+      const ctx = new RequestContext();
+      ctx.set('inner', { ctx: inner });
+
+      const json = ctx.toJSON();
+
+      expect(json).toHaveProperty('inner');
+    });
+
     it('should skip oversized typed arrays without materializing their elements, and keep small ones', () => {
       const ctx = new RequestContext();
       ctx.set('bigTyped', new Float64Array(8 * 1024 * 1024));
@@ -517,6 +557,19 @@ describe('RequestContext', () => {
       });
       expect(toJSON).not.toHaveBeenCalled();
       expect(JSON.stringify(ctx.serializeForSpan())).not.toContain('SECRET_');
+    });
+
+    it('should collapse values that reject classification (e.g. a revoked Proxy) instead of throwing', () => {
+      const revocable = Proxy.revocable({}, {});
+      revocable.revoke();
+      const ctx = new RequestContext();
+      ctx.set('revoked', revocable.proxy as unknown);
+      ctx.set('userId', 'user-123');
+
+      expect(() => ctx.serializeForSpan()).not.toThrow();
+      const result = ctx.serializeForSpan();
+      expect(result['revoked']).toBe('[object]');
+      expect(result['userId']).toBe('user-123');
     });
 
     it('returns an empty object for an empty context', () => {

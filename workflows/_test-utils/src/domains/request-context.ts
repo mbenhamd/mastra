@@ -102,8 +102,10 @@ export function createRequestContextTests({ createAgent }: DurableAgentTestConte
           },
         });
 
-        expect(result.threadId).toBe('body-thread');
-        expect(result.resourceId).toBe('body-resource');
+        // Verified infrastructure identity in RequestContext owns the run;
+        // body-level memory options cannot replace it.
+        expect(result.threadId).toBe('middleware-thread');
+        expect(result.resourceId).toBe('middleware-user');
       });
     });
 

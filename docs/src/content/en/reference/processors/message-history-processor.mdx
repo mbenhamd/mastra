@@ -226,7 +226,7 @@ Set `toolCallFilter` to remove tool calls and results at the persistence boundar
 
 `preserveModelOutput` keeps compact model-facing output from completed results. It doesn't preserve media, incomplete states, denied results, failed results, raw arguments, or raw results. When `maxModelOutputBytes` is omitted, MessageHistory retains at most 16 KiB per preserved model output.
 
-Set `preserveModelOutputFor` to retain compact output only for named tools. An explicit empty list preserves no output. If the option is omitted, the existing `preserveModelOutput` behavior is unchanged.
+Set `preserveModelOutputFor` to retain compact output only for specified tools. An explicit empty list preserves no output. If the option is omitted, the existing `preserveModelOutput` behavior is unchanged.
 
 When this persistence policy removes or compacts a tool payload, it also removes message-level provider metadata from that changed message. Messages without a matching tool payload remain unchanged by the tool-call policy.
 

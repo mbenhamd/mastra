@@ -18,8 +18,9 @@ import { PUBSUB_SYMBOL } from '../../../../workflows/constants';
 import type { MastraDBMessage } from '../../../message-list';
 import { MessageList } from '../../../message-list';
 import { createToolCallIdentityDigest } from '../../../tool-call-identity';
+import { ensureRemoteAbortListener } from '../../abort-transport';
 import { globalRunRegistry } from '../../run-registry';
-import { toolApprovalRequirement } from '../../utils/resolve-runtime';
+import { resolveRuntimeDependencies, toolApprovalRequirement } from '../../utils/resolve-runtime';
 import { createDurableLLMMappingStep } from './llm-mapping';
 import { createDurableToolCallStep } from './tool-call';
 
@@ -27,9 +28,14 @@ vi.mock('../../../../workflows', () => ({
   createStep: (config: unknown) => config,
 }));
 
+vi.mock('../../abort-transport', () => ({
+  ensureRemoteAbortListener: vi.fn().mockResolvedValue(undefined),
+}));
+
 vi.mock('../../utils/resolve-runtime', () => ({
   resolveTool: vi.fn(),
   rebuildRunToolsFromMastra: vi.fn().mockResolvedValue({ tools: {} }),
+  resolveRuntimeDependencies: vi.fn(),
   toolApprovalRequirement: vi.fn().mockResolvedValue({ required: true, reasons: ['tool-config'] }),
 }));
 
@@ -143,6 +149,7 @@ function runToolCallStep(
   resumeData: unknown,
   suspendData: unknown = makeSuspendEnvelope(),
   suspend: ReturnType<typeof vi.fn> = vi.fn(),
+  pubsub = mockPubsub(),
 ) {
   const step = createDurableToolCallStep();
   return (step as any).execute({
@@ -153,7 +160,7 @@ function runToolCallStep(
     suspendData,
     requestContext: new Map(),
     getInitData: () => makeInitData(),
-    [PUBSUB_SYMBOL]: mockPubsub(),
+    [PUBSUB_SYMBOL]: pubsub,
   });
 }
 
@@ -263,12 +270,11 @@ async function runMappingStep(toolResults: unknown[], messageListState = seedMes
   const recalled = new MessageList({ threadId: THREAD_ID, resourceId: RESOURCE_ID });
   recalled.deserialize(output.messageListState);
 
-  const stored = recalled.get.all
+  const storedPart = recalled.get.all
     .db()
     .flatMap((m: MastraDBMessage) => m.content.parts ?? [])
-    .find((p: any) => p.type === 'tool-invocation' && p.toolInvocation?.toolCallId === TOOL_CALL_ID)?.toolInvocation as
-    | Record<string, any>
-    | undefined;
+    .find((p: any) => p.type === 'tool-invocation' && p.toolInvocation?.toolCallId === TOOL_CALL_ID) as any;
+  const stored = storedPart?.toolInvocation as Record<string, any> | undefined;
 
   const v6 = recalled.get.all.aiV6
     .ui()
@@ -283,6 +289,55 @@ afterEach(() => {
     globalRunRegistry.delete(RUN_ID);
   }
   vi.clearAllMocks();
+});
+
+describe('cross-process durable step handoff', () => {
+  it('installs the replayed abort listener before a tool-call step uses the run registry', async () => {
+    const pubsub = mockPubsub();
+    setupRegistry(vi.fn());
+
+    await runToolCallStep({ approved: false }, makeSuspendEnvelope(), vi.fn(), pubsub);
+
+    expect(ensureRemoteAbortListener).toHaveBeenCalledWith(pubsub, RUN_ID, RUNTIME_BINDING_ID);
+  });
+
+  it('passes the live resume request context when the mapping step rehydrates runtime tools', async () => {
+    const pubsub = mockPubsub();
+    const requestContext = new Map<string, unknown>([['tenant', 'fresh-tenant']]);
+    globalRunRegistry.set(RUN_ID, { isPlaceholder: true } as any);
+    vi.mocked(resolveRuntimeDependencies).mockImplementationOnce(async () => {
+      setupRegistry(vi.fn());
+      return {} as any;
+    });
+
+    const step = createDurableLLMMappingStep();
+    await (step as any).execute({
+      inputData: {
+        llmOutput: {
+          messageListState: seedMessageListState(),
+          stepResult: {
+            isContinued: false,
+            reason: 'stop',
+            totalUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+          },
+          text: '',
+          toolCalls: [],
+        },
+        toolResults: [],
+        runId: RUN_ID,
+        agentId: AGENT_ID,
+        messageId: 'msg-rehydrate',
+        state: { threadId: THREAD_ID, resourceId: RESOURCE_ID, threadExists: true },
+      },
+      mastra: { getLogger: () => undefined },
+      requestContext,
+      getInitData: () => makeInitData(),
+      [PUBSUB_SYMBOL]: pubsub,
+    });
+
+    expect(ensureRemoteAbortListener).toHaveBeenCalledWith(pubsub, RUN_ID, RUNTIME_BINDING_ID);
+    expect(resolveRuntimeDependencies).toHaveBeenCalledWith(expect.objectContaining({ runId: RUN_ID, requestContext }));
+  });
 });
 
 describe('issue #17218 (durable engine): tool-call step records the approval decision', () => {

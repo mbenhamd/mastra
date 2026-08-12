@@ -275,23 +275,25 @@ describe('MastraTUI hook wiring', () => {
     expect(runAgentEnd.mock.invocationCallOrder[0]).toBeLessThan(clearRunId.mock.invocationCallOrder[0]);
   });
 
-  it('fires PermissionRequest on tool_approval_required with tool context', async () => {
+  // PermissionRequest dispatch moved to the receipt-time tap (#20861) — see
+  // permission-hooks-receipt.test.ts for the positive assertions. These
+  // negatives pin that the queued handler no longer double-dispatches.
+  it('does not fire PermissionRequest from the queued handler on tool_approval_required', async () => {
     const runPermissionRequest = vi.fn().mockResolvedValue(createHookResult());
     const tui = createBareTui({ runPermissionRequest });
 
     await tui.handleEvent({
       type: 'tool_approval_required',
+      runId: 'run-1',
       toolCallId: 'call-1',
       toolName: 'execute_command',
       args: { command: 'rm -rf /' },
     });
 
-    expect(runPermissionRequest).toHaveBeenCalledWith('tool_approval', 'call-1', 'execute_command', {
-      command: 'rm -rf /',
-    });
+    expect(runPermissionRequest).not.toHaveBeenCalled();
   });
 
-  it('fires PermissionRequest on sandbox access suspension with suspend payload', async () => {
+  it('does not fire PermissionRequest from the queued handler on sandbox access suspension', async () => {
     const runPermissionRequest = vi.fn().mockResolvedValue(createHookResult());
     const tui = createBareTui({ runPermissionRequest });
     const suspendPayload = { kind: 'sandbox_access_request', path: '/tmp/project', reason: 'read files' };
@@ -304,10 +306,10 @@ describe('MastraTUI hook wiring', () => {
       suspendPayload,
     });
 
-    expect(runPermissionRequest).toHaveBeenCalledWith('sandbox_access', 'call-2', 'request_access', suspendPayload);
+    expect(runPermissionRequest).not.toHaveBeenCalled();
   });
 
-  it('fires PermissionRequest on plan approval suspension with suspend payload', async () => {
+  it('does not fire PermissionRequest from the queued handler on plan approval suspension', async () => {
     const runPermissionRequest = vi.fn().mockResolvedValue(createHookResult());
     const tui = createBareTui({ runPermissionRequest });
     const suspendPayload = { path: '.mastracode/plans/change.md' };
@@ -320,7 +322,7 @@ describe('MastraTUI hook wiring', () => {
       suspendPayload,
     });
 
-    expect(runPermissionRequest).toHaveBeenCalledWith('plan_approval', 'call-3', 'submit_plan', suspendPayload);
+    expect(runPermissionRequest).not.toHaveBeenCalled();
   });
 
   it('does not fire PermissionRequest on ask_user suspension', async () => {
@@ -392,7 +394,13 @@ describe('MastraTUI hook wiring', () => {
   it('does not fire lifecycle hooks when no hookManager is configured', async () => {
     const tui = createBareTui();
 
-    await tui.handleEvent({ type: 'tool_approval_required', toolCallId: 'c', toolName: 't', args: {} });
+    await tui.handleEvent({
+      type: 'tool_approval_required',
+      runId: 'run-c',
+      toolCallId: 'c',
+      toolName: 't',
+      args: {},
+    });
     await tui.handleEvent({ type: 'subagent_start', toolCallId: 'c', agentType: 'a', task: 't' });
     await tui.handleEvent({
       type: 'subagent_end',

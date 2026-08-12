@@ -198,6 +198,9 @@ export const toolCallOutputSchema = toolCallInputSchema.extend({
   // A model-driven resume has its own provider tool-call ID. When it resolves an older
   // approval, retain that original call ID separately so both invocations can be completed.
   resumeTargetToolCallId: z.string().optional(),
+  // Set when execution was interrupted by request abort (not a tool error); no result/error
+  // so downstream leaves the call incomplete. Must be declared or Zod strips it. See tool-call-step.ts.
+  aborted: z.boolean().optional(),
   // HITL approval decision, present when the tool required approval and was resumed.
   // Without this field Zod would strip `approval` from the step output before persistence.
   approval: z

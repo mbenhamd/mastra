@@ -7,7 +7,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { Agent } from '@mastra/core/agent';
-import { createDurableAgent } from '@mastra/core/agent/durable';
+import { createDurableAgent, globalRunRegistry } from '@mastra/core/agent/durable';
 import type { DurableAgentTestContext } from '../types';
 import { createTextStreamModel } from '../mock-models';
 
@@ -39,8 +39,13 @@ export function createSkillsWithCustomProcessorsTests(context: DurableAgentTestC
 
       const result = await durableAgent.prepare('Hello');
 
-      expect(result.registryEntry).toBeDefined();
-      expect(result.registryEntry.workspace).toBe(mockWorkspace);
+      try {
+        const registryEntry = globalRunRegistry.get(result.runId);
+        expect(registryEntry).toBeDefined();
+        expect(registryEntry?.workspace).toBe(mockWorkspace);
+      } finally {
+        result.cleanup();
+      }
     });
 
     it('should preserve workspace alongside input processors', async () => {
@@ -73,8 +78,13 @@ export function createSkillsWithCustomProcessorsTests(context: DurableAgentTestC
 
       const result = await durableAgent.prepare('Hello');
 
-      expect(result.registryEntry).toBeDefined();
-      expect(result.registryEntry.workspace).toBe(mockWorkspace);
+      try {
+        const registryEntry = globalRunRegistry.get(result.runId);
+        expect(registryEntry).toBeDefined();
+        expect(registryEntry?.workspace).toBe(mockWorkspace);
+      } finally {
+        result.cleanup();
+      }
     });
   });
 }

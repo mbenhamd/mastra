@@ -232,6 +232,15 @@ export class CachingPubSub extends PubSub {
    *
    * Uses atomic increment for index assignment to prevent race conditions
    * when multiple events are published concurrently.
+   *
+   * `localOnly` events bypass the cache entirely — no list entry, no index, no
+   * counter allocation — and are handed straight to the inner PubSub. They are
+   * never relayed to other instances, so a shared replay cache can have no
+   * reader for them; caching them only grows the store without bound (some
+   * payloads, e.g. `workflow.events.v2.*` watch events carrying cumulative step
+   * results, are multiple megabytes each). Consumers of `localOnly` topics
+   * subscribe live and never replay, and every downstream `index` check is
+   * guarded for absence, so dropping the index is safe.
    */
   async publish(topic: string, event: PublishEvent, options?: { localOnly?: boolean }): Promise<void> {
     // `localOnly` events are scoped to the publishing instance. Do not cache
@@ -374,6 +383,8 @@ export class CachingPubSub extends PubSub {
 
     const wrappedCb: EventCallback = async (event, ack, nack) => {
       // Drop events strictly before the requested offset on the live path.
+      // Dropped deliveries are still acknowledged: the consumer will never see
+      // them, so leaving them unacknowledged would strand them on the backend.
       if (typeof event.index === 'number' && event.index < offset) {
         await ack?.();
         return;
@@ -863,16 +874,20 @@ export class CachingPubSub extends PubSub {
    * pubsub in `CachingPubSub` silently turns `clearTopic` into a cache-only
    * no-op and the inner stream leaks forever.
    */
-  override async clearTopic(topic: string): Promise<void> {
+  override async clearTopicOrThrow(topic: string): Promise<void> {
     const cacheKey = this.getCacheKey(topic);
     const counterKey = this.getCounterKey(topic);
+    await Promise.all([
+      this.cache.delete(cacheKey),
+      this.cache.delete(counterKey),
+      this.indexedLog?.deleteIndexedLog(this.getIndexedLogKey(topic)),
+      this.inner.clearTopicOrThrow(topic),
+    ]);
+  }
+
+  override async clearTopic(topic: string): Promise<void> {
     try {
-      await Promise.all([
-        this.cache.delete(cacheKey),
-        this.cache.delete(counterKey),
-        this.indexedLog?.deleteIndexedLog(this.getIndexedLogKey(topic)),
-        this.inner.clearTopic(topic),
-      ]);
+      await this.clearTopicOrThrow(topic);
     } catch (error) {
       // Honor the base-class contract: clearTopic is best-effort and callers
       // invoke it fire-and-forget, so a cache failure must not become an

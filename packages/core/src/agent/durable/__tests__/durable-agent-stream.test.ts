@@ -444,6 +444,106 @@ describe('DurableAgent streaming execution', () => {
       globalRunRegistry.delete(prepared.runId);
     });
 
+    it('should reject a run rebound while an awaited input processor is pending before provider execution', async () => {
+      let markProcessorStarted!: () => void;
+      let releaseProcessor!: () => void;
+      const processorStarted = new Promise<void>(resolve => {
+        markProcessorStarted = resolve;
+      });
+      const processorReleased = new Promise<void>(resolve => {
+        releaseProcessor = resolve;
+      });
+      const doStream = vi.fn(async (_options: unknown) => ({
+        stream: convertArrayToReadableStream([
+          { type: 'stream-start', warnings: [] },
+          { type: 'finish', finishReason: 'stop', usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } },
+        ]),
+        rawCall: { rawPrompt: null, rawSettings: {} },
+      }));
+      const baseAgent = new Agent({
+        id: 'durable-post-processor-binding-agent',
+        name: 'Durable Post Processor Binding Agent',
+        instructions: 'test',
+        model: new MockLanguageModelV2({ doStream: doStream as any }) as LanguageModelV2,
+        inputProcessors: [
+          {
+            id: 'await-before-provider',
+            processInputStep: async () => {
+              markProcessorStarted();
+              await processorReleased;
+              return {};
+            },
+          },
+        ],
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+      const result = await durableAgent.stream('test', { runId: 'post-processor-rebound-run' });
+      const originalEntry = globalRunRegistry.get(result.runId)!;
+
+      await processorStarted;
+      // Explicit cleanup releases the active pin. A later caller can then
+      // reuse the identifier while this stale processor callback is still
+      // suspended, which the post-await fence must reject.
+      result.cleanup();
+      globalRunRegistry.set(result.runId, {
+        ...originalEntry,
+        runtimeBindingId: 'newer-runtime-binding',
+      });
+      releaseProcessor();
+      await originalEntry.workflowExecution;
+
+      expect(doStream).not.toHaveBeenCalled();
+      durableAgent.runRegistry.cleanup(result.runId);
+      globalRunRegistry.delete(result.runId);
+    });
+
+    it('should pass the post-processor registry signal and call-time headers to the provider', async () => {
+      let freshAbortSignal: AbortSignal | undefined;
+      const doStream = vi.fn(async (_options: unknown) => ({
+        stream: convertArrayToReadableStream([
+          { type: 'stream-start', warnings: [] },
+          { type: 'text-start', id: 'text-1' },
+          { type: 'text-delta', id: 'text-1', delta: 'Done' },
+          { type: 'text-end', id: 'text-1' },
+          { type: 'finish', finishReason: 'stop', usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } },
+        ]),
+        rawCall: { rawPrompt: null, rawSettings: {} },
+      }));
+      const baseAgent = new Agent({
+        id: 'durable-fresh-provider-binding-agent',
+        name: 'Durable Fresh Provider Binding Agent',
+        instructions: 'test',
+        model: new MockLanguageModelV2({ doStream: doStream as any }) as LanguageModelV2,
+        inputProcessors: [
+          {
+            id: 'refresh-provider-binding',
+            processInputStep: async () => {
+              const entry = [...globalRunRegistry.values()].find(candidate => candidate.agentId === baseAgent.id);
+              if (!entry) throw new Error('active run entry not found');
+              const controller = new AbortController();
+              freshAbortSignal = controller.signal;
+              entry.abortController = controller;
+              entry.abortSignal = controller.signal;
+              entry.callTimeHeaders = { 'x-post-processor': 'fresh' };
+              return {};
+            },
+          },
+        ],
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+      const result = await durableAgent.stream('test');
+      await result.output.consumeStream();
+
+      expect(doStream).toHaveBeenCalledOnce();
+      const providerOptions = doStream.mock.calls[0]?.[0] as {
+        abortSignal?: AbortSignal;
+        headers?: Record<string, string>;
+      };
+      expect(providerOptions.abortSignal).toBe(freshAbortSignal);
+      expect(providerOptions.headers).toMatchObject({ 'x-post-processor': 'fresh' });
+      result.cleanup();
+    });
+
     it('should bind per-execution tool hooks to the exact warm registry policy', async () => {
       const baseAgent = new Agent({
         id: 'durable-hook-binding-agent',

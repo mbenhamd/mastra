@@ -854,6 +854,7 @@ export class Agent extends BaseResource {
             const approval = await agent.sendToolApproval({
               resourceId: resourceId || agent.agentId,
               threadId,
+              runId,
               toolCallId: pendingToolCalls[0]!.toolCallId,
               approved: true,
               requestContext: processedRequestContext,
@@ -2113,6 +2114,21 @@ export class Agent extends BaseResource {
 
       // Use tee() to split the stream into two branches
       const [streamForController, streamForProcessing] = response.body.tee();
+      const decoder = new TextDecoder();
+      let pendingText = '';
+
+      const enqueueReadableText = (text: string, isFinal = false) => {
+        pendingText += text;
+        const lines = pendingText.split('\n\n');
+        pendingText = isFinal ? '' : (lines.pop() ?? '');
+
+        const readableLines = lines
+          .filter(line => line.trim() !== '[DONE]' && line.trim() !== 'data: [DONE]')
+          .join('\n\n');
+        if (readableLines) {
+          controller.enqueue(new TextEncoder().encode(`${readableLines}\n\n`));
+        }
+      };
 
       // Pipe one branch directly to the controller
       const pipePromise = streamForController
@@ -2121,19 +2137,14 @@ export class Agent extends BaseResource {
             async write(chunk) {
               // Filter out terminal markers so the client stream doesn't end before recursion
               try {
-                const text = new TextDecoder().decode(chunk);
-                const lines = text.split('\n\n');
-                const readableLines = lines
-                  .filter(line => line.trim() !== '[DONE]' && line.trim() !== 'data: [DONE]')
-                  .join('\n\n');
-                if (readableLines) {
-                  const encoded = new TextEncoder().encode(readableLines);
-                  controller.enqueue(encoded);
-                }
+                enqueueReadableText(decoder.decode(chunk, { stream: true }));
               } catch (error) {
                 console.error('Error enqueueing to controller:', error);
                 controller.enqueue(chunk);
               }
+            },
+            close() {
+              enqueueReadableText(decoder.decode(), true);
             },
           }),
         )
@@ -2518,6 +2529,8 @@ export class Agent extends BaseResource {
   async declineNetworkToolCall(params: {
     runId: string;
     model?: string;
+    /** Optional explanation surfaced in place of the default decline message. */
+    reason?: string;
     requestContext?: RequestContext | Record<string, any>;
   }): Promise<
     Response & {
@@ -2885,6 +2898,7 @@ export class Agent extends BaseResource {
   async sendToolApproval(params: {
     resourceId: string;
     threadId: string;
+    runId: string;
     toolCallId: string;
     approved: boolean;
     resumeData?: unknown;
@@ -2906,6 +2920,8 @@ export class Agent extends BaseResource {
     runId: string;
     toolCallId: string;
     model?: string;
+    /** Optional explanation surfaced to the model in place of the default decline message. */
+    reason?: string;
     requestContext?: RequestContext | Record<string, any>;
   }): Promise<
     Response & {
@@ -3235,6 +3251,8 @@ export class Agent extends BaseResource {
     runId: string;
     toolCallId: string;
     model?: string;
+    /** Optional explanation surfaced to the model in place of the default decline message. */
+    reason?: string;
     requestContext?: RequestContext | Record<string, any>;
   }): Promise<any> {
     const { requestContext, ...rest } = params;

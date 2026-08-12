@@ -7,15 +7,15 @@ packages:
 
 # Threads and state
 
-Threads and state are how a Harness conversation survives beyond a single exchange. A **thread** is the persistent record of a conversation — its messages and metadata, saved to storage so a user can close the app and resume the same conversation later, or switch between several conversations. **State** is structured data attached to the conversation — values like model preferences, feature flags, or progress — that agents and your UI read and write as the conversation runs.
+Threads and state are how a Harness conversation survives beyond a single exchange. A **thread** is the persistent record of a conversation, with its messages and metadata saved to storage so a user can close the app and resume the same conversation later, or switch between several conversations. **State** is structured data attached to the conversation. It contains values like model preferences, feature flags, or progress that agents and your UI read and write as the conversation runs.
 
-The two work together: the thread is the message history, and state is the shared scratchpad alongside it. Both persist across mode switches, model changes, and restarts, so nothing is lost when a user switches from plan mode to build mode or reopens the app the next day.
+The thread provides the message history, while state provides the shared scratchpad alongside it. Both persist across mode switches and model changes. They also persist across restarts, so nothing is lost when a user switches from plan mode to build mode or reopens the app the next day.
 
-Thread _lifecycle_ transitions — create, switch, clone, delete — live on the Harness because they coordinate the shared thread lock and emit events. The active thread binding and thread/message _reads_ live on the [`Session`](/docs/harness/session) as `harness.session.thread`.
+Thread _lifecycle_ transitions, including create, switch, clone, and delete, live on the Harness because they coordinate the shared thread lock and emit events. The active thread binding and thread/message _reads_ live on the [`Session`](/docs/harness/session) as `harness.session.thread`.
 
 ## Threads
 
-A thread holds one conversation's full message history. The Harness binds the Session to one active thread at a time; messages you send and the agent's replies are appended to that thread and saved to storage. Threads let users resume a past conversation, keep several conversations side by side, or branch one into alternatives.
+A thread holds one conversation's full message history. The Harness binds the Session to one active thread at a time. Messages you send and the agent's replies are appended to that thread and saved to storage. Threads let users resume a past conversation or keep several conversations side by side. Users can also branch a conversation into alternatives.
 
 ### Creating and selecting threads
 
@@ -34,7 +34,7 @@ const thread = await harness.createThread({ title: 'New conversation' })
 
 ### Switching threads
 
-Switch to an existing thread. The harness aborts any in-progress generation, acquires a lock on the new thread, and emits a `thread_changed` event:
+Switch to an existing thread. The harness aborts any in-progress generation and acquires a lock on the new thread. It then emits a `thread_changed` event:
 
 ```typescript
 await harness.switchThread({ threadId: 'thread-abc123' })
@@ -79,7 +79,7 @@ const harness = new Harness({
 
 ## State
 
-Where a thread stores the conversation's messages, state stores structured values that describe the conversation but aren't messages — model preferences, feature flags, UI settings, or progress markers. Agents can read and update state during a run, and your UI can react to changes, so state is how the agent and the interface stay in sync on shared facts. You define its shape with a schema, and every update is validated against that schema before it's applied.
+Where a thread stores the conversation's messages, state stores structured values that describe the conversation but aren't messages, such as model preferences, feature flags, UI settings, or progress markers. Agents can read and update state during a run, and your UI can react to changes, so state is how the agent and the interface stay in sync on shared facts. You define its shape with a schema, and every update is validated against that schema before it's applied.
 
 ### Defining a state schema
 

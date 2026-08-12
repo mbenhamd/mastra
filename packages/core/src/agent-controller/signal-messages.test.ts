@@ -834,7 +834,9 @@ describe('AgentController signal messages', () => {
       ),
     );
 
-    expect(sendToolApproval).toHaveBeenCalledWith(expect.objectContaining({ approved: true, toolCallId: 'tool-1' }));
+    expect(sendToolApproval).toHaveBeenCalledWith(
+      expect.objectContaining({ approved: true, runId: 'run-1', toolCallId: 'tool-1' }),
+    );
   });
 
   it('starts idle text signals through ifIdle stream options', async () => {

@@ -138,7 +138,11 @@ describe('tool approval with LibSQLStore via AgentController', () => {
         if (event.type === 'tool_approval_required') {
           // Must be async — the approval gate is armed after emit returns
           queueMicrotask(() => {
-            session.respondToToolApproval({ decision: 'approve' });
+            session.respondToToolApproval({
+              decision: 'approve',
+              runId: event.runId,
+              toolCallId: event.toolCallId,
+            });
             resolve();
           });
         }

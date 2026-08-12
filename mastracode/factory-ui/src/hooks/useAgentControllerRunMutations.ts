@@ -76,8 +76,8 @@ export function useApproveAgentControllerToolMutation(args: AgentControllerRunMu
   const { session } = createAgentControllerClient(args);
   const invalidateSession = useSessionInvalidation(args);
   return useMutation({
-    mutationFn: ({ toolCallId, approved }: { toolCallId: string; approved: boolean }) =>
-      requireAgentControllerSession(session).approveTool(toolCallId, approved),
+    mutationFn: ({ runId, toolCallId, approved }: { runId: string; toolCallId: string; approved: boolean }) =>
+      requireAgentControllerSession(session).approveTool(runId, toolCallId, approved),
     onSuccess: invalidateSession,
   });
 }

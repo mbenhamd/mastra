@@ -7,7 +7,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { Agent } from '@mastra/core/agent';
-import { createDurableAgent, baseIterationStateSchema } from '@mastra/core/agent/durable';
+import { createDurableAgent, baseIterationStateSchema, globalRunRegistry } from '@mastra/core/agent/durable';
 import { Mastra } from '@mastra/core/mastra';
 import { MockStore } from '@mastra/core/storage';
 import type { DurableAgentTestContext } from '../types';
@@ -78,10 +78,14 @@ export function createBackgroundTaskTests(context: DurableAgentTestContext) {
 
       const result = await durableAgent.prepare('Hello');
 
-      expect(result.registryEntry.backgroundTaskManager).toBeDefined();
-      expect(result.registryEntry.backgroundTasksConfig).toBeDefined();
-
-      await mastra.backgroundTaskManager?.shutdown();
+      try {
+        const registryEntry = globalRunRegistry.get(result.runId);
+        expect(registryEntry?.backgroundTaskManager).toBeDefined();
+        expect(registryEntry?.backgroundTasksConfig).toBeDefined();
+      } finally {
+        result.cleanup();
+        await mastra.backgroundTaskManager?.shutdown();
+      }
     });
 
     it('should include backgroundTaskPending in iteration state schema', async () => {

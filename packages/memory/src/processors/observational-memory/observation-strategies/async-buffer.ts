@@ -182,7 +182,7 @@ export class AsyncBufferObservationStrategy extends ObservationStrategy {
         });
         await updateThreadFromObservationalMemory(this.storage, {
           id: threadId,
-          title: shouldUpdateThreadTitle ? newTitle : (thread.title ?? ''),
+          ...(shouldUpdateThreadTitle ? { title: newTitle } : {}),
           metadata: newMetadata,
           guard: {
             recordId: record.id,

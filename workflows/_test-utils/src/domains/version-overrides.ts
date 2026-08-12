@@ -7,7 +7,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { Agent } from '@mastra/core/agent';
-import { createDurableAgent } from '@mastra/core/agent/durable';
+import { createDurableAgent, globalRunRegistry } from '@mastra/core/agent/durable';
 import { RequestContext, MASTRA_VERSIONS_KEY } from '@mastra/core/request-context';
 import type { DurableAgentTestContext } from '../types';
 import { createTextStreamModel } from '../mock-models';
@@ -38,8 +38,12 @@ export function createVersionOverridesTests(context: DurableAgentTestContext) {
         requestContext,
       });
 
-      expect(result.runId).toBeDefined();
-      expect(result.registryEntry.requestContext).toBeDefined();
+      try {
+        expect(result.runId).toBeDefined();
+        expect(globalRunRegistry.get(result.runId)?.requestContext).toBeDefined();
+      } finally {
+        result.cleanup();
+      }
     });
 
     it('should accept versions in stream options', async () => {

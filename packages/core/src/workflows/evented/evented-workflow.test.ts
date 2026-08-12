@@ -328,6 +328,146 @@ describe('Workflow (Evented Engine Specific)', () => {
     await workflowsStore?.dangerouslyClearAll();
   });
 
+  it('should run onStart before execution and abort the run when it throws', async () => {
+    const stepAction = vi.fn().mockResolvedValue({ value: 'done' });
+    const step1 = createStep({
+      id: 'step1',
+      execute: stepAction,
+      inputSchema: z.object({}),
+      outputSchema: z.object({ value: z.string() }),
+    });
+
+    const onStart = vi.fn();
+    const okWorkflow = createWorkflow({
+      id: 'on-start-ok-workflow',
+      inputSchema: z.object({}),
+      outputSchema: z.object({ value: z.string() }),
+      steps: [step1],
+      options: { validateInputs: false, onStart },
+    });
+    okWorkflow.then(step1).commit();
+
+    const gatedAction = vi.fn().mockResolvedValue({ value: 'done' });
+    const gatedStep = createStep({
+      id: 'gated-step',
+      execute: gatedAction,
+      inputSchema: z.object({}),
+      outputSchema: z.object({ value: z.string() }),
+    });
+    const gatedWorkflow = createWorkflow({
+      id: 'on-start-gated-workflow',
+      inputSchema: z.object({}),
+      outputSchema: z.object({ value: z.string() }),
+      steps: [gatedStep],
+      options: {
+        validateInputs: false,
+        onStart: async () => {
+          throw new Error('quota exceeded');
+        },
+      },
+    });
+    gatedWorkflow.then(gatedStep).commit();
+
+    const mastra = new Mastra({
+      workflows: {
+        'on-start-ok-workflow': okWorkflow,
+        'on-start-gated-workflow': gatedWorkflow,
+      },
+      storage: testStorage,
+      pubsub: new EventEmitterPubSub(),
+    });
+    await mastra.startWorkers();
+
+    try {
+      const okRun = await okWorkflow.createRun();
+      const okResult = await okRun.start({ inputData: {} });
+      expect(okResult.status).toBe('success');
+      expect(onStart).toHaveBeenCalledTimes(1);
+      expect(onStart.mock.calls[0]![0]!.runId).toBe(okRun.runId);
+
+      const gatedRun = await gatedWorkflow.createRun();
+      await expect(gatedRun.start({ inputData: {} })).rejects.toThrow('quota exceeded');
+      expect(gatedAction).not.toHaveBeenCalled();
+      expect(gatedRun.workflowRunStatus).toBe('pending');
+
+      const gatedAsyncRun = await gatedWorkflow.createRun();
+      await expect(gatedAsyncRun.startAsync({ inputData: {} })).rejects.toThrow('quota exceeded');
+      expect(gatedAsyncRun.workflowRunStatus).toBe('pending');
+
+      // The hook runs ahead of the initial run-record write in start(), but createRun()
+      // has already persisted a pending record by then, so the gated run is parked at
+      // 'pending' rather than absent. Pinning that so the guarantee cannot drift.
+      const workflowsStore = await testStorage.getStore('workflows');
+      const gatedRecord = await workflowsStore?.getWorkflowRunById({
+        runId: gatedRun.runId,
+        workflowName: 'on-start-gated-workflow',
+      });
+      expect((gatedRecord?.snapshot as any)?.status).toBe('pending');
+
+      // Control: the allowed run advanced past pending, so the assertion above reflects the
+      // gate holding rather than this engine never updating the record.
+      const okRecord = await workflowsStore?.getWorkflowRunById({
+        runId: okRun.runId,
+        workflowName: 'on-start-ok-workflow',
+      });
+      expect((okRecord?.snapshot as any)?.status).toBe('success');
+    } finally {
+      await mastra.stopWorkers();
+    }
+  });
+
+  it('fences a concurrent start while an evented onStart hook awaits', async () => {
+    let signalOnStartEntered!: () => void;
+    let releaseOnStart!: () => void;
+    const onStartEntered = new Promise<void>(resolve => {
+      signalOnStartEntered = resolve;
+    });
+    const onStartBlocked = new Promise<void>(resolve => {
+      releaseOnStart = resolve;
+    });
+    const workflow = createWorkflow({
+      id: 'evented-on-start-concurrency-workflow',
+      inputSchema: z.object({}),
+      outputSchema: z.object({ value: z.string() }),
+      options: {
+        validateInputs: false,
+        onStart: async () => {
+          signalOnStartEntered();
+          await onStartBlocked;
+        },
+      },
+    });
+    const step = createStep({
+      id: 'evented-on-start-concurrency-step',
+      execute: async () => ({ value: 'done' }),
+      inputSchema: z.object({}),
+      outputSchema: z.object({ value: z.string() }),
+    });
+    workflow.then(step).commit();
+    const mastra = new Mastra({
+      workflows: { [workflow.id]: workflow },
+      storage: testStorage,
+      pubsub: new EventEmitterPubSub(),
+    });
+    await mastra.startWorkers();
+
+    try {
+      const run = await workflow.createRun();
+      const lifecycleIdentity = await run.getLifecycleExecutionIdentity();
+      const firstStart = run.start({ inputData: {} });
+      const competingStart = run.startAsync({ inputData: {} });
+      await onStartEntered;
+
+      await expect(competingStart).rejects.toThrow('lifecycle execution admission is stale');
+      await expect(run.getLifecycleExecutionIdentity()).resolves.toMatchObject(lifecycleIdentity);
+
+      releaseOnStart();
+      await expect(firstStart).resolves.toMatchObject({ status: 'success' });
+    } finally {
+      await mastra.stopWorkers();
+    }
+  });
+
   it('should create a processor step for state signal only processors', () => {
     const processor: Processor = {
       id: 'state-only-processor',

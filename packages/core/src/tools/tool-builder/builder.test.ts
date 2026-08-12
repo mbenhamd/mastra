@@ -65,6 +65,32 @@ describe('CoreToolBuilder recovery fingerprint', () => {
     expect(acceptsOk.terminalResult).toBeDefined();
     expect(acceptsOk.recoveryFingerprint).not.toBe(acceptsNonEmpty.recoveryFingerprint);
   });
+
+  it('uses an explicit original fingerprint as the durable implementation version', () => {
+    const build = (version: string, execute: () => Promise<{ source: string }>) => {
+      const originalTool = createTool({
+        id: 'explicit-recovery-version',
+        description: 'Uses a deployment-stable durable version.',
+        execute,
+      });
+      originalTool.recoveryFingerprint = version;
+      return new CoreToolBuilder({
+        originalTool,
+        options: {
+          name: 'explicit-recovery-version',
+          logger: noopLogger,
+          requestContext: new RequestContext(),
+        },
+      }).build();
+    };
+
+    const first = build('explicit-recovery-version:v1', async () => ({ source: 'first transform' }));
+    const equivalentReplica = build('explicit-recovery-version:v1', async () => ({ source: 'second transform' }));
+    const changedVersion = build('explicit-recovery-version:v2', async () => ({ source: 'first transform' }));
+
+    expect(first.recoveryFingerprint).toBe(equivalentReplica.recoveryFingerprint);
+    expect(first.recoveryFingerprint).not.toBe(changedVersion.recoveryFingerprint);
+  });
 });
 
 describe('CoreToolBuilder FGA', () => {
@@ -1143,8 +1169,9 @@ describe('resume input normalization', () => {
     const merged = receivedCtx.requestContext!;
     // Exec-only entries from the foreign copy are preserved
     expect(merged.get('exec-only-key')).toBe(42);
-    // Closure value wins for shared keys (merge semantics unchanged)
-    expect(merged.get('shared-key')).toBe('from-closure');
+    // Execution-time application values win just as they do for a same-copy
+    // RequestContext; only closure-owned infrastructure keys are protected.
+    expect(merged.get('shared-key')).toBe('from-exec');
     expect(merged.get('closure-only-key')).toBe('closure-only');
   });
 
