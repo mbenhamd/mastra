@@ -693,6 +693,7 @@ export async function executeEntry(
         executionContext,
         workflowStatus: 'waiting',
         requestContext,
+        phase: 'sleep-waiting',
       });
     }
 
@@ -725,6 +726,7 @@ export async function executeEntry(
         executionContext,
         workflowStatus: 'running',
         requestContext,
+        phase: 'sleep-resumed',
       });
     }
 
@@ -806,6 +808,7 @@ export async function executeEntry(
         executionContext,
         workflowStatus: 'waiting',
         requestContext,
+        phase: 'sleep-until-waiting',
       });
     }
 
@@ -838,6 +841,7 @@ export async function executeEntry(
         executionContext,
         workflowStatus: 'running',
         requestContext,
+        phase: 'sleep-until-resumed',
       });
     }
 
@@ -903,6 +907,7 @@ export async function executeEntry(
       executionContext,
       workflowStatus: execResults.status === 'success' ? 'running' : execResults.status,
       requestContext,
+      phase: 'entry-result',
     });
   }
 

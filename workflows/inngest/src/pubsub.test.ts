@@ -1,3 +1,4 @@
+import { AGENT_CONTROL_TOPIC } from '@mastra/core/agent/durable';
 import type { Event } from '@mastra/core/events';
 import { getWorkflowLifecycleTopic } from '@mastra/core/workflows';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -237,6 +238,52 @@ describe('InngestPubSub', () => {
 
     expect(publish).not.toHaveBeenCalled();
     expect(received).toMatchObject([{ id: 'local-event-id', createdAt, index: 7 }]);
+  });
+
+  it('routes durable-agent control events over the run channel and preserves the envelope', async () => {
+    const { pubsub, publish } = createFixture();
+    const received: Event[] = [];
+    const runId = 'run.1';
+    const runtimeBindingId = 'binding.1';
+    const topic = AGENT_CONTROL_TOPIC(runId, runtimeBindingId);
+
+    await pubsub.subscribe(topic, event => {
+      received.push(event);
+    });
+    await pubsub.publish(topic, {
+      type: 'abort-request',
+      runId,
+      data: { runtimeBindingId },
+      id: 'abort-event-id',
+      createdAt: new Date('2026-07-15T10:00:00.000Z'),
+    });
+
+    expect(realtimeMocks.subscribe).toHaveBeenCalledWith(
+      expect.objectContaining({ channel: 'agent:run%2E1.binding%2E1', topics: ['agent-control'] }),
+      expect.any(Function),
+    );
+    expect(publish).toHaveBeenCalledWith(
+      expect.objectContaining({ channel: 'agent:run%2E1.binding%2E1', topic: 'agent-control' }),
+      expect.objectContaining({ id: 'abort-event-id', runId, type: 'abort-request' }),
+    );
+
+    await realtimeMocks.handlers[0]!({ data: JSON.parse(JSON.stringify(publish.mock.calls[0]![1])) });
+    expect(received).toEqual([expect.objectContaining({ id: 'abort-event-id', type: 'abort-request' })]);
+  });
+
+  it('rethrows failed durable-agent control delivery so retained replay can recover it', async () => {
+    const { pubsub, publish } = createFixture();
+    publish.mockRejectedValueOnce(new Error('realtime unavailable'));
+    const runId = 'run-1';
+    const runtimeBindingId = 'binding-1';
+
+    await expect(
+      pubsub.publish(AGENT_CONTROL_TOPIC(runId, runtimeBindingId), {
+        type: 'abort-request',
+        runId,
+        data: { runtimeBindingId },
+      }),
+    ).rejects.toThrow('realtime unavailable');
   });
 
   it('rethrows failed terminal-result delivery so the durable final step can retry', async () => {

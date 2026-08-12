@@ -350,7 +350,9 @@ type MessageAdmissionHashes = {
 };
 
 type QueueResumeRecoveryResult =
-  { status: 'none' } | { status: 'completed'; result: AgentResult } | { status: 'stale' };
+  | { status: 'none' }
+  | { status: 'completed'; result: AgentResult }
+  | { status: 'stale' };
 
 type ResumeResponseMode = 'agent-result' | 'inbox-receipt';
 type InboxReceiptResponseOptions = Extract<InboxResponseOptions, { responseId: string }>;
@@ -397,7 +399,7 @@ const MAX_EXPIRED_PENDING_INTERACTIONS = 100;
 const HARNESS_SESSION_MAX_STEPS = 1000;
 type HarnessIterationCompleteHandler = NonNullable<AgentExecutionOptionsBase<unknown>['onIterationComplete']>;
 type HarnessPrepareStep = NonNullable<AgentExecutionOptionsBase<unknown>['prepareStep']>;
-type HarnessIterationCompleteErrorReporter = (error: unknown) => void;
+type HarnessExecutionHookErrorReporter = (hook: 'onIterationComplete' | 'prepareStep', error: unknown) => void;
 
 /**
  * Empty-final-synthesis nudge. Live-diagnosed twice on the same day (a chat
@@ -414,7 +416,7 @@ type HarnessIterationCompleteErrorReporter = (error: unknown) => void;
  * ignores continuation results for terminal tool delivery, and error, abort,
  * safety, and output-length finishes are left alone.
  */
-function createHarnessEmptySynthesisOptions(reportConfiguredHookError: HarnessIterationCompleteErrorReporter): {
+function createHarnessEmptySynthesisOptions(reportConfiguredHookError: HarnessExecutionHookErrorReporter): {
   [AGENT_EXECUTION_OPTION_COMPOSERS]: () => AgentExecutionOptionComposers;
 } {
   return {
@@ -422,7 +424,9 @@ function createHarnessEmptySynthesisOptions(reportConfiguredHookError: HarnessIt
       let nudged = false;
       let segmentHasToolResults = false;
       let responseOnly = false;
+      let ordinaryBudgetExhausted = false;
       return {
+        recoveryMaxSteps: 1,
         onIterationComplete: existing => {
           const configured = existing as HarnessIterationCompleteHandler | undefined;
           return async (context: Parameters<HarnessIterationCompleteHandler>[0]) => {
@@ -433,12 +437,13 @@ function createHarnessEmptySynthesisOptions(reportConfiguredHookError: HarnessIt
               try {
                 await configured?.(context);
               } catch (error) {
-                reportConfiguredHookError(error);
+                reportConfiguredHookError('onIterationComplete', error);
               }
               return { continue: false };
             }
 
             if (context.toolResults.length > 0) segmentHasToolResults = true;
+            ordinaryBudgetExhausted ||= context.iteration >= HARNESS_SESSION_MAX_STEPS;
             const needsRecovery =
               context.isFinal &&
               !nudged &&
@@ -458,15 +463,25 @@ function createHarnessEmptySynthesisOptions(reportConfiguredHookError: HarnessIt
               // recovery, however, rethrowing would make the loop swallow the
               // error and strand a completed mutation with no user response.
               if (!needsRecovery) throw error;
-              reportConfiguredHookError(error);
+              reportConfiguredHookError('onIterationComplete', error);
               configuredResult = undefined;
             }
 
-            if (!needsRecovery) return configuredResult;
+            if (!needsRecovery) {
+              // The ordinary Harness budget is a hard ceiling even when the
+              // model, a scorer, a background-task wakeup, or an application
+              // hook asks to continue. Only the exact response-only recovery
+              // below may spend a provider call after this point.
+              if (ordinaryBudgetExhausted) return { ...(configuredResult ?? {}), continue: false };
+              return configuredResult;
+            }
 
             // An application-level explicit stop/continue decision owns this
-            // iteration. The Harness only fills the otherwise-silent default.
-            if (configuredResult?.continue !== undefined) return configuredResult;
+            // iteration before the ordinary budget is exhausted. At the exact
+            // ceiling, `continue: true` is ordinary work and cannot consume the
+            // reserved response-only call; the Harness still recovers silence.
+            if (configuredResult?.continue !== undefined && !ordinaryBudgetExhausted) return configuredResult;
+            if (configuredResult?.continue === false) return configuredResult;
 
             nudged = true;
             responseOnly = true;
@@ -489,7 +504,28 @@ function createHarnessEmptySynthesisOptions(reportConfiguredHookError: HarnessIt
         prepareStep: existing => {
           const configured = existing as HarnessPrepareStep | undefined;
           return async (args: Parameters<HarnessPrepareStep>[0]) => {
-            const configuredResult = await configured?.(args);
+            // `prepareStep` runs before the provider call. Once the 0-based
+            // step index reaches the public ceiling, ordinary execution must
+            // fail closed unless the preceding terminal iteration explicitly
+            // armed the one response-only recovery call.
+            const stepNumber = (args as { stepNumber?: number } | undefined)?.stepNumber;
+            if (
+              !responseOnly &&
+              (ordinaryBudgetExhausted || (typeof stepNumber === 'number' && stepNumber >= HARNESS_SESSION_MAX_STEPS))
+            ) {
+              throw new HarnessOrdinaryStepBudgetExhaustedError();
+            }
+            let configuredResult: Awaited<ReturnType<HarnessPrepareStep>>;
+            try {
+              configuredResult = await configured?.(args);
+            } catch (error) {
+              // Keep configured prepareStep failures fatal during ordinary
+              // execution, but never let an optional observer strand completed
+              // tool work or bypass the response-only recovery fence.
+              if (!responseOnly) throw error;
+              reportConfiguredHookError('prepareStep', error);
+              configuredResult = undefined;
+            }
             if (!responseOnly) return configuredResult;
             return { ...(configuredResult ?? {}), activeTools: [], toolChoice: 'none' };
           };
@@ -497,6 +533,13 @@ function createHarnessEmptySynthesisOptions(reportConfiguredHookError: HarnessIt
       };
     },
   };
+}
+
+class HarnessOrdinaryStepBudgetExhaustedError extends Error {
+  constructor() {
+    super(`Harness ordinary step budget exhausted at ${HARNESS_SESSION_MAX_STEPS} steps`);
+    this.name = 'HarnessOrdinaryStepBudgetExhaustedError';
+  }
 }
 
 // §10.2 receipts stay bounded on BOTH axes (PF-2250, live-diagnosed): the map
@@ -1789,9 +1832,9 @@ export class Session {
   }
 
   private _createEmptySynthesisOptions() {
-    return createHarnessEmptySynthesisOptions(error => {
+    return createHarnessEmptySynthesisOptions((hook, error) => {
       try {
-        this._harness.mastra.getLogger().error('Error in onIterationComplete hook:', error);
+        this._harness.mastra.getLogger().error(`Error in ${hook} hook:`, error);
       } catch {
         // Diagnostics must never suppress the caller-visible recovery.
       }
@@ -4278,7 +4321,8 @@ export class Session {
    * `_internalAwaitFlushChain()` so shutdown and tests can act on it. */
   private _pendingTokenUsageFlushError: unknown;
   private _pendingDurableTurnFlushError:
-    { error: unknown; pendingResume?: { runId: string; toolCallId: string } } | undefined;
+    | { error: unknown; pendingResume?: { runId: string; toolCallId: string } }
+    | undefined;
 
   /**
    * True while a turn (message or queued) is in flight against the agent.

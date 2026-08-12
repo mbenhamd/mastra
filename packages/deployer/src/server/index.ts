@@ -56,7 +56,13 @@ type Variables = HonoVariables & {
 type ApiRouteMiddleware = Extract<Exclude<ApiRoute['middleware'], undefined>, Function>;
 
 const DEFAULT_CORS_ALLOW_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'];
-const DEFAULT_CORS_ALLOW_HEADERS = ['Content-Type', 'Authorization', 'x-mastra-client-type', 'x-mastra-dev-playground'];
+const DEFAULT_CORS_ALLOW_HEADERS = [
+  'Content-Type',
+  'Authorization',
+  'A2A-Version',
+  'x-mastra-client-type',
+  'x-mastra-dev-playground',
+];
 const DEFAULT_CORS_EXPOSE_HEADERS = ['Content-Length', 'X-Requested-With'];
 
 function getCorsConfig(serverCors: CorsOptions | false | undefined, credentialsDefault: boolean) {
@@ -201,6 +207,8 @@ export async function createHonoServer(
 
   if (serverMiddleware && serverMiddleware.length > 0) {
     for (const m of serverMiddleware) {
+      // General host middleware (audit, tenancy, abuse controls, rate limits)
+      // applies to public and authenticated framework routes alike.
       app.use(m.path, m.handler);
     }
   }
@@ -317,6 +325,8 @@ export async function createHonoServer(
     });
 
     for (const middleware of middlewares) {
+      // Public-route classification bypasses framework authentication only;
+      // configured host middleware must still execute.
       app.use(middleware.path, middleware.handler as unknown as HonoMiddlewareHandler);
     }
   }

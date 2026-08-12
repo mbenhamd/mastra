@@ -118,6 +118,19 @@ export abstract class PubSub {
   }
 
   /**
+   * Delete retained topic state and reject if deletion fails.
+   *
+   * Durable workflow operations use this strict variant when a rejected
+   * operation must be retried before its terminal checkpoint can commit.
+   * Implementations that expose failures from `clearTopic` need no override;
+   * best-effort wrappers should override this method with their unsuppressed
+   * deletion path.
+   */
+  clearTopicOrThrow(topic: string): Promise<void> {
+    return this.clearTopic(topic);
+  }
+
+  /**
    * Delivery modes this PubSub implementation supports.
    *
    * Defaults to `['pull']` for backward compatibility — third-party

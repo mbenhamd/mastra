@@ -319,7 +319,7 @@ export interface StepFinishPayload<Tools extends ToolSet = ToolSet, OUTPUT = und
   [key: string]: unknown;
 }
 
-interface ToolErrorPayload {
+export interface ToolErrorPayload {
   id?: string;
   providerMetadata?: ProviderMetadata;
   toolCallId: string;
@@ -327,6 +327,18 @@ interface ToolErrorPayload {
   args?: Record<string, unknown>;
   error: unknown;
   providerExecuted?: boolean;
+}
+
+/** Terminal stream payload when a requireApproval tool call is declined. */
+export interface ToolOutputDeniedPayload {
+  toolCallId: string;
+  toolName: string;
+  args?: Record<string, unknown>;
+  approval: {
+    id: string;
+    approved: false;
+    reason?: string;
+  };
 }
 
 interface AbortPayload {
@@ -784,6 +796,9 @@ interface ToolCallApprovalPayload {
   toolCallId: string;
   toolName: string;
   args: Record<string, any>;
+  /** Outer tool occurrence when approval was requested by a nested/delegated tool call. */
+  parentToolName?: string;
+  parentArgs?: unknown;
   resumeSchema: string;
   /** Reasons a conditional approval predicate surfaced for why the tool needs approval. */
   approvalReasons?: readonly string[];
@@ -868,6 +883,7 @@ export type AgentChunkType<OUTPUT = undefined> =
   | (BaseChunkType & { type: 'step-start'; payload: StepStartPayload })
   | (BaseChunkType & { type: 'step-finish'; payload: StepFinishPayload<ToolSet, OUTPUT> })
   | (BaseChunkType & { type: 'tool-error'; payload: ToolErrorPayload })
+  | (BaseChunkType & { type: 'tool-output-denied'; payload: ToolOutputDeniedPayload })
   | (BaseChunkType & { type: 'abort'; payload: AbortPayload })
   | (BaseChunkType & {
       type: 'object';
@@ -1055,6 +1071,7 @@ export type SourceChunk = BaseChunkType & { type: 'source'; payload: SourcePaylo
 export type FileChunk = BaseChunkType & { type: 'file'; payload: FilePayload };
 export type ToolCallChunk = BaseChunkType & { type: 'tool-call'; payload: ToolCallPayload };
 export type ToolResultChunk = BaseChunkType & { type: 'tool-result'; payload: ToolResultPayload };
+export type ToolOutputDeniedChunk = BaseChunkType & { type: 'tool-output-denied'; payload: ToolOutputDeniedPayload };
 export type ReasoningChunk = BaseChunkType & { type: 'reasoning'; payload: ReasoningDeltaPayload };
 
 export type PendingToolCall = {

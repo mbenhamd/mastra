@@ -178,7 +178,7 @@ export const weatherAgent = new Agent({
 
 ## Agents as tools
 
-Add subagents through the `agents` configuration to create a [supervisor](/docs/agents/supervisor-agents). Mastra converts each subagent to an `agent-<key>` tool. Include a `description` on each subagent so the supervisor knows when to delegate.
+Add subagents through the `agents` configuration to create a [supervisor](/docs/capabilities/subagents). Mastra converts each subagent to an `agent-<key>` tool. Include a `description` on each subagent so the supervisor knows when to delegate.
 
 ```typescript title="src/mastra/agents/supervisor.ts"
 import { Agent } from '@mastra/core/agent'
@@ -294,11 +294,11 @@ export const compileDocument = createTool({
 })
 ```
 
-On success, `await result.text` can be empty because the provider's last response was the tool call. Read the validated value from `result.terminalToolResult` or `await result.getFullOutput()`. A terminal batch can contain projections from different tools, so its aggregate `item.value` type is `unknown`; parse or narrow that value with the projection schema before typed use. Streaming clients receive the same value as a `data-terminal-tool-result` part before `step-finish` and `finish`.
+On success, `await result.text` can be empty because the provider's last response was the tool call. Read the validated value from `result.terminalToolResult` or `await result.getFullOutput()`. A terminal batch can contain projections from different tools, so its aggregate `item.value` type is `unknown`. Parse or narrow that value with the projection schema before typed use. Streaming clients receive the same value as a `data-terminal-tool-result` part before `step-finish` and `finish`.
 
 Terminal delivery is intentionally fail closed. Every call in a parallel tool batch must be a successful opted-in local tool with an explicit `project` function and `outputSchema`. Failed or denied calls, approval-gated calls (including approved calls), resumed suspensions, provider-executed tools, background work, signals already queued at terminal arbitration on engines that support active-run signals, mixed ordinary tools, non-pass-through output processors, and display/transcript payload transforms keep the normal continuation path. A signal accepted after terminal arbitration is delivered as the thread's next turn instead of reopening the committed run.
 
-The projected canonical JSON defaults to a 16 KiB UTF-8 limit and cannot exceed 64 KiB. Keep large artifacts in durable storage and return identifiers plus a concise summary.
+The projected canonical JSON defaults to a 16 KiB UTF-8 limit and can't exceed 64 KiB. Keep large artifacts in durable storage and return identifiers plus a concise summary.
 
 ## Shape output for the model
 
@@ -482,7 +482,7 @@ await agent.generate('Run the approved operation', {
 })
 ```
 
-Mastra snapshots the replacement names, executable functions, and nested tool configuration for the execution. After each input-processor pass it materializes a fresh trusted tool map from that snapshot. Input processors can narrow the set for a step, but they can't expand it, replace an allowed implementation, or mutate the configuration used by later model or execution calls. An empty `toolsets` object creates a tool-free execution. Durable reconstruction fails closed if the original replacement implementations are no longer available after a process restart.
+Mastra snapshots the replacement names, executable functions, and nested tool configuration for the execution. After each input-processor pass it materializes a fresh trusted tool map from that snapshot. Input processors can narrow the set for a step, but they can't expand it or replace an allowed implementation. They also can't mutate the configuration used by later model or execution calls. An empty `toolsets` object creates a tool-free execution. Durable reconstruction fails closed if the original replacement implementations are no longer available after a process restart.
 
 Replacement fences are cleared when runs terminate or resume. To keep caller-retained `RequestContext` instances bounded when suspended runs are abandoned, Mastra allows at most 64 simultaneously retained replacement fences per context. Use a distinct context or finish or resume existing runs before starting more.
 
@@ -551,6 +551,7 @@ Mastra includes agent-agnostic built-in tools in `@mastra/core/tools` that add i
 | `task_complete` | Mark one tracked task completed |
 | `task_check` | Check task list completion status |
 | `webSearchTool` | Run provider-native web search with the active model |
+| `webFetchTool` | Fetch a web page by URL and return its text content |
 
 ### Use provider web search
 
@@ -574,6 +575,34 @@ export const researchAgent = new Agent({
 `webSearchTool` supports OpenAI, Anthropic, Google Gemini, and xAI models. If Mastra can't infer one of those providers from the active model, the agent run fails with a `MastraError`.
 
 The `search` key is only the agent-local tool name. Use any key. The `webSearchTool` value tells Mastra to use provider web search.
+
+### Fetch a web page
+
+Import `webFetchTool` from `@mastra/core/tools` when the agent needs to read a specific URL. The tool requests the page over HTTP or HTTPS and returns its text content plus response metadata.
+
+```typescript {2,10} title="src/mastra/agents/reader-agent.ts"
+import { Agent } from '@mastra/core/agent'
+import { webFetchTool } from '@mastra/core/tools'
+
+export const readerAgent = new Agent({
+  id: 'reader-agent',
+  name: 'Reader Agent',
+  instructions: 'Fetch the page the user links to before answering.',
+  model: 'openai/gpt-5.6-sol',
+  tools: {
+    fetch: webFetchTool,
+  },
+})
+```
+
+The tool takes a single `url` input and returns `content`, `truncated`, `status`, `statusText`, `contentType`, `url`, and `ok`. It applies these limits:
+
+- Only `http:` and `https:` URLs are allowed.
+- Requests to `localhost` and to private or reserved IP addresses are blocked, including addresses returned by DNS resolution.
+- Responses are truncated at 100,000 characters, with `truncated: true` in the result.
+- Requests follow at most 5 redirects and time out after 15 seconds.
+
+Failures don't throw. The tool returns `isError: true` with the reason in `content`, so the agent can retry or explain the problem.
 
 ### Ask the user a question
 
@@ -650,7 +679,7 @@ const agent = new Agent({
 
 Only one task can be `in_progress` at a time. The list is stored in the thread-scoped `threadState` storage domain and projected onto the agent's [state-signal](/docs/long-running-agents/signals) lane, so it survives observational-memory truncation. See the [Task tools reference](/reference/tools/task-tools) for full schemas.
 
-The [AgentController](/docs/agent-controller/overview) automatically includes all built-in tools in every mode, you don't need to add them manually. See [Tool approvals](/docs/agent-controller/tool-approvals#built-in-tools) for AgentController-specific behavior.
+The [AgentController](/docs/harness/agent-controller) automatically includes all built-in tools in every mode, you don't need to add them manually. See [Tool approvals](/docs/harness/agent-controller#approve-tools-and-resume-suspensions) for AgentController-specific behavior.
 
 ## Related
 

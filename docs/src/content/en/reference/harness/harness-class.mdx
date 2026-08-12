@@ -13,9 +13,9 @@ The `Harness` feature is in alpha stage and subject to breaking changes in minor
 
 :::
 
-The `Harness` class orchestrates multiple agent modes, shared state, memory, and storage. It provides a control layer that a TUI or other UI can drive to manage threads, switch models and modes, send messages, handle tool approvals, and track events.
+The `Harness` class orchestrates multiple agent modes, shared state, memory, and storage. It provides a control layer that a TUI or other UI can drive to manage threads and switch models or modes. The control layer can also send messages and handle tool approvals. It also tracks events.
 
-Per-conversation state — identity, the active thread, mode and model selection, run state, grants, and the display snapshot — lives on the [`Session`](/reference/harness/session), accessed through `harness.session`.
+Per-conversation state lives on the [`Session`](/reference/harness/session), accessed through `harness.session`. This state includes identity, the active thread, mode and model selection, run state, grants, and the display snapshot.
 
 For a conceptual introduction, see the [Harness overview](/docs/harness/overview).
 
@@ -82,7 +82,7 @@ const mastra = new Mastra({
 const defaultHarness = mastra.getHarness()
 ```
 
-Use `harnesses` when an app needs multiple named harnesses. The `harness`
+Use `harnesses` when an app needs multiple Harness instances under distinct keys. The `harness`
 shortcut and `harnesses.default` are mutually exclusive.
 
 ```typescript
@@ -505,7 +505,7 @@ Use the returned `source` field to route execution through the owning surface, s
 
 #### `init()`
 
-Initialize the harness. Loads storage, initializes the workspace, propagates memory and workspace to mode agents, and starts heartbeat handlers. Call this before using the harness.
+Initialize the harness. This loads storage and initializes the workspace. It also propagates memory and workspace to mode agents and starts heartbeat handlers. Call this before using the harness.
 
 ```typescript
 await harness.init()
@@ -617,11 +617,11 @@ const models = await harness.listAvailableModels()
 
 ### Threads
 
-The harness owns thread lifecycle transitions — creating, switching, cloning, renaming, and deleting threads — because they coordinate the shared thread lock and emit events. The active thread binding and thread/message reads live on [`session.thread`](/reference/harness/session#thread).
+The harness owns thread lifecycle transitions, including creating, switching, cloning, renaming, and deleting threads, because they coordinate the shared thread lock and emit events. The active thread binding and thread/message reads live on [`session.thread`](/reference/harness/session#thread).
 
 #### `createThread({ title? })`
 
-Create a new thread. Initializes thread metadata, saves it to storage, acquires a thread lock, and emits a `thread_created` event.
+Create a new thread. This initializes thread metadata and saves it to storage. It then acquires a thread lock and emits a `thread_created` event.
 
 ```typescript
 const thread = await harness.createThread({ title: 'New conversation' })
@@ -629,13 +629,13 @@ const thread = await harness.createThread({ title: 'New conversation' })
 
 #### `switchThread({ threadId })`
 
-Switch to a different thread. Aborts any in-progress operations, acquires a lock on the new thread, releases the lock on the previous thread, loads the thread's metadata, and emits a `thread_changed` event.
+Switch to a different thread. This aborts any in-progress operations and acquires a lock on the new thread. It then releases the lock on the previous thread and loads the thread's metadata. Finally, it emits a `thread_changed` event.
 
 ```typescript
 await harness.switchThread({ threadId: 'thread-abc123' })
 ```
 
-To list threads from storage, use [`session.thread.list()`](/reference/harness/session#thread). By default it returns only threads for the current resource and hides transient [forked subagent](#forked-subagents) threads; pass `includeForkedSubagents: true` to opt back into seeing them — e.g. for a debug panel.
+To list threads from storage, use [`session.thread.list()`](/reference/harness/session#thread). By default it returns only threads for the current resource and hides transient [forked subagent](#forked-subagents) threads. Pass `includeForkedSubagents: true` to see them, for example in a debug panel.
 
 #### `renameThread({ title })`
 
@@ -647,7 +647,7 @@ await harness.renameThread({ title: 'Updated title' })
 
 #### `cloneThread({ sourceThreadId?, title?, resourceId? })`
 
-Clone an existing thread and switch to the clone. Copies all messages, acquires a lock on the new thread, releases the lock on the previous thread, and emits a `thread_created` event. If `sourceThreadId` is omitted, the current thread is cloned. When [Observational Memory](/docs/memory/observational-memory) is enabled, OM records are cloned with remapped message IDs.
+Clone an existing thread and switch to the clone. This copies all messages and acquires a lock on the new thread. It then releases the lock on the previous thread and emits a `thread_created` event. If `sourceThreadId` is omitted, the current thread is cloned. When [Observational Memory](/docs/memory/observational-memory) is enabled, OM records are cloned with remapped message IDs.
 
 ```typescript
 // Clone the current thread
@@ -691,7 +691,7 @@ const session = await harness.getSession()
 
 #### `session(options)`
 
-Resolve a durable Harness v1 `Session` from an existing session, a thread, or a resource. The resolver returns an active live session when one is already loaded, hydrates an active stored session when possible, or creates a fresh session when the selected resolver shape requires one.
+Resolve a durable Harness v1 `Session` from an existing session, a thread, or a resource. The resolver returns an active live session when one is already loaded or hydrates an active stored session when possible. It creates a fresh session when the selected resolver shape requires one.
 
 This method is available on the Harness v1 export, `@mastra/core/harness/v1`.
 
@@ -756,7 +756,7 @@ const result = await session.queue({
 })
 ```
 
-When a later `session.queue()` call uses the same `admissionId` and the same queue payload, the session returns the retained result, joins the live in-process queued turn, or waits briefly for durable terminal evidence from the original queued turn. If the payload differs, the call fails with an admission conflict.
+When a later `session.queue()` call uses the same `admissionId` and the same queue payload, the session returns the retained result or joins the live in-process queued turn. It may instead wait briefly for durable terminal evidence from the original queued turn. If the payload differs, the call fails with an admission conflict.
 
 #### `listMessages(options?)`
 
@@ -779,7 +779,7 @@ const messages = await harness.listMessagesForThread({ threadId: 'thread-abc123'
 
 #### `getFirstUserMessageForThread({ threadId })`
 
-Retrieve the first user message for a given thread.
+Retrieve the first user message for a thread.
 
 ```typescript
 const firstMsg = await harness.getFirstUserMessageForThread({ threadId: 'thread-abc123' })
@@ -787,7 +787,7 @@ const firstMsg = await harness.getFirstUserMessageForThread({ threadId: 'thread-
 
 ### Memory
 
-The `memory` property bundles thread management operations into a single namespace. `memory.createThread`, `memory.switchThread`, and `memory.renameThread` delegate to the corresponding Harness lifecycle methods documented above; `memory.listThreads` delegates to [`session.thread.list()`](/reference/harness/session#thread).
+The `memory` property bundles thread management operations into a single namespace. `memory.createThread`, `memory.switchThread`, and `memory.renameThread` delegate to the corresponding Harness lifecycle methods documented above. `memory.listThreads` delegates to [`session.thread.list()`](/reference/harness/session#thread).
 
 #### `memory.deleteThread({ threadId })`
 
@@ -825,7 +825,7 @@ harness.followUp({ content: 'Now apply those changes' })
 
 ### Tool approvals
 
-Responding to a pending tool approval is owned by the session — see [`session.respondToToolApproval()`](/reference/harness/session#tool-approvals). The harness owns the permission _policy_ that decides when approval is required, documented under [Permissions](#permissions) below.
+The session owns responses to pending tool approvals. See [`session.respondToToolApproval()`](/reference/harness/session#tool-approvals). The harness owns the permission _policy_ that decides when approval is required, documented under [Permissions](#permissions) below.
 
 ### Tool suspensions and plans
 
@@ -833,7 +833,7 @@ Responding to a pending tool approval is owned by the session — see [`session.
 
 Respond to a pending tool suspension. Interactive built-in tools such as `ask_user` and `request_access` pause through the native tool-suspension primitive, which emits a `tool_suspended` event carrying `toolCallId`, `toolName`, and `suspendPayload`. Pass `resumeData` to resume the suspended tool with the user's response.
 
-Provide `toolCallId` to select which suspension to resume. It's required when more than one tool is suspended at the same time (for example, parallel `ask_user` calls). When omitted, it resolves to the sole pending suspension.
+Provide `toolCallId` to select which suspension to resume. It's required when more than one tool is suspended (for example, parallel `ask_user` calls). When omitted, it resolves to the sole pending suspension.
 
 ```typescript
 harness.subscribe(event => {
@@ -925,7 +925,7 @@ if (harness.isWorkspaceReady()) {
 
 #### `destroyWorkspace()`
 
-Destroy the workspace and release resources. Only applies to static workspaces — dynamic workspaces aren't destroyed.
+Destroy the workspace and release resources. This method only applies to static workspaces because dynamic workspaces aren't destroyed.
 
 ```typescript
 await harness.destroyWorkspace()
@@ -959,14 +959,14 @@ The observer/reflector model selection and observation/reflection thresholds liv
 
 ### Forked subagents
 
-By default, a subagent runs with a fresh context — it doesn't see the parent conversation. **Forked subagents** opt into a different model: the subagent runs on a clone of the parent thread and reuses the parent agent's full configuration. This is useful when the subagent needs the full context of the conversation so far (e.g., recalling earlier user-supplied facts), and when prompt-cache hit rates matter.
+By default, a subagent runs with a fresh context and doesn't see the parent conversation. **Forked subagents** opt into a different execution model: the subagent runs on a clone of the parent thread and reuses the parent agent's full configuration. This is useful when the subagent needs the full context of the conversation so far, for example to recall earlier user-supplied facts. It's also useful when prompt-cache hit rates matter.
 
 #### Enabling forked mode
 
 Set `forked: true` either on the `HarnessSubagent` definition (per-type default) or on each `subagent` tool call (per-invocation override):
 
 ```typescript
-// Per-type default — every call to this subagent forks unless overridden.
+// Per-type default: every call to this subagent forks unless overridden.
 const subagents: HarnessSubagent[] = [
   {
     id: 'collaborator',
@@ -978,20 +978,20 @@ const subagents: HarnessSubagent[] = [
 ]
 ```
 
-The model can also pass `forked: true` (or `forked: false`) per-invocation in the `subagent` tool input; the per-invocation value wins.
+The model can also pass `forked: true` (or `forked: false`) per-invocation in the `subagent` tool input. The per-invocation value wins.
 
 #### Semantics and constraints
 
 - **Memory required.** Forked mode calls `memory.cloneThread` to create the fork, so the harness must have `memory` configured and an active parent thread. Calls without those return a structured error rather than throwing.
-- **Parent agent reused.** The fork runs through the parent agent's `stream(...)` call. The parent's instructions, tools, model, and processors apply; reusing that parent agent surface is what preserves the prompt-cache prefix. The subagent definition's `instructions`, `tools`, `allowedHarnessTools`, `allowedWorkspaceTools`, `defaultModelId`, `maxSteps`, `stopWhen`, `inputProcessors`, and `outputProcessors` are ignored in forked mode. The subagent tool uses fork-specific loop controls so the model can recover if it accidentally calls an inherited-but-disabled tool.
-- **Toolsets inherited, recursive forks blocked at runtime.** Forks inherit the parent's toolsets verbatim (`ask_user`, `submit_plan`, user-configured harness tools, _including the `subagent` tool itself_) so the LLM request prefix — system prompt + tool list + tool schemas + tool descriptions — stays byte-identical to the parent's. This is what preserves the prompt cache. The `subagent` entry is kept on the model side but its `execute` is replaced inside the fork with a stub that returns an error tool result with a clear "tool unavailable inside a forked subagent" message: nested forks are blocked at the runtime layer without perturbing the cached prefix.
+- **Parent agent reused.** The fork runs through the parent agent's `stream(...)` call. The parent's instructions, tools, model, and processors apply. Reusing that parent agent surface preserves the prompt-cache prefix. The subagent definition's `instructions`, `tools`, `allowedHarnessTools`, `allowedWorkspaceTools`, `defaultModelId`, `maxSteps`, `stopWhen`, `inputProcessors`, and `outputProcessors` are ignored in forked mode. The subagent tool uses fork-specific loop controls so the model can recover if it accidentally calls an inherited-but-disabled tool.
+- **Toolsets inherited, recursive forks blocked at runtime.** Forks inherit the parent's toolsets verbatim (`ask_user`, `submit_plan`, user-configured harness tools, _including the `subagent` tool itself_) so the large language model (LLM) request prefix stays byte-identical to the parent's. This prefix consists of the system prompt, tool list, tool schemas, and tool descriptions. This is what preserves the prompt cache. The `subagent` entry is kept on the model side but its `execute` is replaced inside the fork with a stub that returns an error tool result with a clear "tool unavailable inside a forked subagent" message: nested forks are blocked at the runtime layer without perturbing the cached prefix.
 - **Fork threads are tagged.** Each fork thread is created with `metadata.forkedSubagent === true` and `metadata.parentThreadId === <parent>`. By default, [`session.thread.list()`](/reference/harness/session#thread) hides these so they don't show up in user-facing thread pickers / startup flows. Pass `includeForkedSubagents: true` to see them in admin / debug tooling.
-- **Save-queue flushed before clone.** The agent stream batches message saves through a debounced `SaveQueueManager`, so the parent's latest user / assistant turn may not be on disk yet when the subagent tool call fires. The fork tool flushes pending saves first via the `flushMessages` callback on `AgentToolExecutionContext` before cloning, so the fork actually carries the latest turn. Flush failures are non-fatal — the clone still runs.
+- **Save-queue flushed before clone.** The agent stream batches message saves through a debounced `SaveQueueManager`, so the parent's latest user / assistant turn may not be on disk yet when the subagent tool call fires. The fork tool flushes pending saves first via the `flushMessages` callback on `AgentToolExecutionContext` before cloning, so the fork actually carries the latest turn. Flush failures are non-fatal, so the clone still runs.
 - **Parent thread untouched.** All subagent activity (messages, OM writes) lands on the fork. The parent thread is never appended to during a forked subagent run.
 
 #### When to prefer non-forked mode
 
-Forked mode trades isolation for context inheritance. If the subagent should run with a strictly smaller toolset, a different system prompt, or a cheaper model, use the default (non-forked) mode and pass any required context explicitly in the `task` description.
+Forked mode trades isolation for context inheritance. If the subagent needs a strictly smaller toolset or a different system prompt, use the default (non-forked) mode and pass any required context explicitly in the `task` description. Also use the default mode when the subagent should use a cheaper model.
 
 ### Events
 
@@ -999,7 +999,7 @@ Forked mode trades isolation for context inheritance. If the subagent should run
 
 Register an event listener. Returns an unsubscribe function.
 
-Use this method for all consumers — UI, Server-Sent Events (SSE), terminal UI (TUI), bridge rendering, audit logs, debugging, analytics, and deterministic replay. For display rendering, watch for the `display_state_changed` event and read the latest snapshot from [`session.displayState.get()`](/reference/harness/session#display-state). After every event the harness emits `display_state_changed`, so high-frequency events such as `message_update`, `tool_update`, and `tool_input_delta` are coalesced into the next snapshot.
+Use this method for all consumers, including UI, Server-Sent Events (SSE), terminal UI (TUI), bridge rendering, audit logs, debugging, analytics, and deterministic replay. For display rendering, watch for the `display_state_changed` event and read the latest snapshot from [`session.displayState.get()`](/reference/harness/session#display-state). After every event the harness emits `display_state_changed`, so high-frequency events such as `message_update`, `tool_update`, and `tool_input_delta` are coalesced into the next snapshot.
 
 ```typescript
 // Render from the coalesced display-state snapshot:
@@ -1095,7 +1095,7 @@ The harness emits events through registered listeners. The following table lists
 | `shell_output` | A tool emitted shell output (stdout or stderr). |
 | `display_state_changed` | The canonical `HarnessDisplayState` snapshot changed. Read it from [`session.displayState.get()`](/reference/harness/session#display-state). |
 
-The harness also emits low-level streaming content chunks — `text`, `thinking`, `tool_call`, `tool_result`, `image`, and `file`. These are the raw pieces that get assembled into messages; most UIs render from `message_update` (or read the [`session.displayState`](/reference/harness/session#display-state) snapshot) rather than subscribing to them directly.
+The harness also emits low-level streaming content chunks: `text`, `thinking`, `tool_call`, `tool_result`, `image`, and `file`. These are the raw pieces that get assembled into messages. Most UIs render from `message_update` (or read the [`session.displayState`](/reference/harness/session#display-state) snapshot) rather than subscribing to them directly.
 
 ## Built-in tools
 
@@ -1109,7 +1109,7 @@ The harness provides built-in tools to agents in every mode:
 | `task_update` | Update one tracked task by ID and return the structured task list snapshot. |
 | `task_complete` | Mark one tracked task completed by ID and return the structured task list snapshot. |
 | `task_check` | Check the completion status of the current task list and return `tasks`, `summary`, `incompleteTasks`, and `isError` fields. |
-| `subagent` | Spawn a focused subagent with constrained tools (only available when `subagents` is configured). Pass `forked: true` to inherit the parent conversation — see [Forked subagents](#forked-subagents). |
+| `subagent` | Spawn a focused subagent with constrained tools (only available when `subagents` is configured). Pass `forked: true` to inherit the parent conversation. See [Forked subagents](#forked-subagents). |
 
 ### `ask_user` selections
 

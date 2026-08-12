@@ -47,4 +47,19 @@ describe('mergeAgentExecutionOptions', () => {
     expect(calls).toEqual(['configured', 'internal']);
     expect(Reflect.ownKeys(merged)).not.toContain(AGENT_EXECUTION_OPTION_COMPOSERS);
   });
+
+  it('does not let internal hook composition change the caller step budget', () => {
+    const composer = {
+      [AGENT_EXECUTION_OPTION_COMPOSERS]: () => ({
+        recoveryMaxSteps: 1,
+        onIterationComplete: (existing: unknown) => existing,
+      }),
+    };
+
+    expect(mergeAgentExecutionOptions({ maxSteps: 1000 }, composer)).toMatchObject({
+      maxSteps: 1000,
+      recoveryMaxSteps: 1,
+    });
+    expect(mergeAgentExecutionOptions({}, composer).maxSteps).toBeUndefined();
+  });
 });

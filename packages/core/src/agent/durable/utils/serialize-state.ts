@@ -261,6 +261,7 @@ export function serializeModelSettings(
  */
 export function serializeDurableOptions(options: {
   maxSteps?: number;
+  recoveryMaxSteps?: number;
   toolChoice?: any;
   activeTools?: string[];
   toolSurfaceFence?: string[];
@@ -302,6 +303,7 @@ export function serializeDurableOptions(options: {
 
   return {
     maxSteps: options.maxSteps,
+    recoveryMaxSteps: options.recoveryMaxSteps,
     toolChoice: serializedToolChoice,
     activeTools: options.activeTools,
     toolSurfaceFence: options.toolSurfaceFence,

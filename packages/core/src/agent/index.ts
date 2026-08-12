@@ -30,6 +30,7 @@ export {
 } from '../schedules';
 export * from './agent';
 export { getGoalActivityDurationMs, getGoalActivitySegmentStartMs } from './goal';
+export { DEFAULT_TOOL_DECLINE_REASON, resolveDeclineReason } from './tool-approval';
 export * from './utils';
 export * from './fs-routing';
 

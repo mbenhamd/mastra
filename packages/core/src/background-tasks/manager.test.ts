@@ -191,7 +191,7 @@ describe('BackgroundTaskManager', () => {
       manager.registerTaskContext(taskId, ctx(vi.fn().mockResolvedValue('ok')));
       const claim = vi.spyOn(backgroundTasksStore!, 'updateTaskIfStatus').mockResolvedValueOnce(false);
 
-      const nacked = await dispatchWithPrivateHandler(manager, {
+      const consumed = await dispatchWithPrivateHandler(manager, {
         id: 'event-claim-race',
         type: 'task.dispatch',
         data: { taskId },
@@ -199,7 +199,7 @@ describe('BackgroundTaskManager', () => {
         createdAt: new Date(),
       });
 
-      expect(nacked).toBe(false);
+      expect(consumed).toBe(true);
       expect(manager.taskContexts.has(taskId)).toBe(true);
       expect(claim).toHaveBeenCalledWith(taskId, 'pending', expect.objectContaining({ status: 'running' }));
       claim.mockRestore();
@@ -227,7 +227,7 @@ describe('BackgroundTaskManager', () => {
         return false;
       });
 
-      const nacked = await dispatchWithPrivateHandler(manager, {
+      const consumed = await dispatchWithPrivateHandler(manager, {
         id: 'event-claim-cancel-race',
         type: 'task.dispatch',
         data: { taskId },
@@ -235,7 +235,7 @@ describe('BackgroundTaskManager', () => {
         createdAt: new Date(),
       });
 
-      expect(nacked).toBe(false);
+      expect(consumed).toBe(true);
       expect(manager.taskContexts.has(taskId)).toBe(true);
       expect(claim).toHaveBeenCalledWith(taskId, 'pending', expect.objectContaining({ status: 'running' }));
       claim.mockRestore();
@@ -269,7 +269,7 @@ describe('BackgroundTaskManager', () => {
         return false;
       });
 
-      const nacked = await dispatchWithPrivateHandler(manager, {
+      const consumed = await dispatchWithPrivateHandler(manager, {
         id: 'event-claim-running-cancel-race',
         type: 'task.dispatch',
         data: { taskId },
@@ -278,7 +278,7 @@ describe('BackgroundTaskManager', () => {
       });
       claim.mockRestore();
 
-      expect(nacked).toBe(false);
+      expect(consumed).toBe(true);
       expect(manager.taskContexts.has(taskId)).toBe(true);
 
       await backgroundTasksStore!.updateTask(taskId, { status: 'cancelled', completedAt: new Date() });
@@ -1740,7 +1740,7 @@ describe('BackgroundTaskManager', () => {
       ).rejects.toThrow('shutting down');
     });
 
-    it('aborts active task controllers during shutdown', async () => {
+    it('aborts active task controllers and cancels tasks with no retry budget during shutdown', async () => {
       let taskSignal: AbortSignal | undefined;
       let sawAbort!: () => void;
       const abortSeen = new Promise<void>(resolve => {
@@ -1774,7 +1774,7 @@ describe('BackgroundTaskManager', () => {
 
       expect(taskSignal?.aborted).toBe(true);
       expect(manager.activeAbortControllers.size).toBe(0);
-      expect((await manager.getTask(task.id))?.status).toBe('running');
+      expect((await manager.getTask(task.id))?.status).toBe('cancelled');
     });
 
     it('does not complete a task when the executor resolves after shutdown abort', async () => {
@@ -1810,7 +1810,7 @@ describe('BackgroundTaskManager', () => {
       await tick(100);
 
       expect(taskSignal?.aborted).toBe(true);
-      expect((await manager.getTask(task.id))?.status).toBe('running');
+      expect((await manager.getTask(task.id))?.status).toBe('cancelled');
     });
 
     it('does not suspend a task when the executor reacts to shutdown abort by suspending', async () => {
@@ -1848,7 +1848,7 @@ describe('BackgroundTaskManager', () => {
 
       const current = await manager.getTask(task.id);
       expect(taskSignal?.aborted).toBe(true);
-      expect(current?.status).toBe('running');
+      expect(current?.status).toBe('cancelled');
       expect(current?.suspendPayload).toBeUndefined();
     });
   });

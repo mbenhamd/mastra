@@ -121,13 +121,24 @@ function createNestedResumeFixture(suspendedPaths: Record<string, number[]>) {
     Object.keys(suspendedPaths).map(stepId => [stepId, { status: 'suspended', payload: { value: 'before-suspend' } }]),
   );
   const loadWorkflowSnapshot = vi.fn().mockResolvedValue({
+    runId: nestedRunId,
+    resourceId: 'nested-resource',
+    status: 'suspended',
     value: { count: 1 },
     context: nestedStepResults,
     suspendedPaths,
+    executionGeneration: 'nested-execution-generation',
+    lifecycleResumeAttempt: 0,
+    lifecycleStepStates: {},
   });
+  const admitWorkflowResume = vi.fn().mockResolvedValue({ status: 'admitted' });
   const mastra = {
     getStorage: () => ({
-      getStore: async () => ({ loadWorkflowSnapshot }),
+      getStore: async () => ({
+        loadWorkflowSnapshot,
+        admitWorkflowResume,
+        getWorkflowResumeCapabilities: () => ({ atomicResumeVersion: 1, fencedStepUpdateVersion: 1 }),
+      }),
     }),
   } as unknown as Mastra;
   const invoke = vi.fn().mockResolvedValue({
@@ -201,7 +212,6 @@ describe('InngestExecutionEngine.executeWorkflowStep', () => {
     expect(invoke.mock.calls[0]?.[1].data.resume).toEqual({
       runId: nestedRunId,
       steps: [suspendedStep.id],
-      stepResults: nestedStepResults,
       resumePayload,
       resumePath: [1, 0],
     });
@@ -211,13 +221,14 @@ describe('InngestExecutionEngine.executeWorkflowStep', () => {
     {
       name: 'no suspended child',
       suspendedPaths: {},
-      message: 'No suspended steps found in nested workflow: nested-resume-workflow',
+      message:
+        'Cannot infer nested resume step for nested-resume-workflow/nested-run: expected exactly one suspended step',
     },
     {
       name: 'multiple suspended children',
       suspendedPaths: { 'first-child': [1, 0], 'second-child': [1, 1] },
       message:
-        'Multiple suspended steps found: [first-child], [second-child]. Please specify which step to resume using the "step" parameter.',
+        'Cannot infer nested resume step for nested-resume-workflow/nested-run: expected exactly one suspended step',
     },
   ])('does not guess a resume target with $name', async ({ suspendedPaths, message }) => {
     const { execute, invoke } = createNestedResumeFixture(suspendedPaths);

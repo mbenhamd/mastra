@@ -575,11 +575,15 @@ export class RedisStreamsPubSub extends PubSub implements LeaseProvider {
    * unhandledRejection. Failures are swallowed and logged; the `streamIdleTtlMs`
    * backstop (when configured) reclaims anything a failed delete leaves behind.
    */
+  async clearTopicOrThrow(topic: string): Promise<void> {
+    if (this.#closed) throw new Error('redis-streams: cannot clear a topic after close');
+    await this.#ensureWriterConnected();
+    await this.#writeClient.del(this.#streamKey(topic));
+  }
+
   async clearTopic(topic: string): Promise<void> {
-    if (this.#closed) return;
     try {
-      await this.#ensureWriterConnected();
-      await this.#writeClient.del(this.#streamKey(topic));
+      await this.clearTopicOrThrow(topic);
     } catch (err) {
       // warn, not debug: a failed delete means the memory leak clearTopic
       // exists to prevent is silently recurring for this topic.

@@ -22,6 +22,7 @@ import type { VersionOverrides } from '../../request-context';
 import { toStandardSchema } from '../../schema';
 import { normalizeToolPayloadTransformPolicy } from '../../tools/payload-transform';
 import type { CoreTool, ToolHooks, ToolPayloadTransformPolicy } from '../../tools/types';
+import { boundedStringify } from '../../utils';
 import type { Workspace } from '../../workspace';
 import type { Agent } from '../agent';
 import type { AgentExecutionOptions, DelegationConfig } from '../agent.types';
@@ -178,7 +179,7 @@ export function snapshotDurableRequestContextEntries(
     if (!requestContext.has(key)) continue;
     const value = requestContext.get(key);
     try {
-      const json = JSON.stringify(value);
+      const json = boundedStringify(value);
       if (json === undefined) {
         throw new MastraError({
           id: 'DURABLE_AGENT_REQUEST_CONTEXT_VALUE_NOT_SERIALIZABLE',
@@ -732,6 +733,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
           errorProcessors,
           logger: logger as any,
           agentName: publicAgentName,
+          agent: agent as unknown as Agent<any, any, any, any>,
           processorStates,
         });
         await runner.runInputProcessors(
@@ -938,6 +940,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
       scorers,
       options: {
         maxSteps: execOptions?.maxSteps,
+        recoveryMaxSteps: execOptions?.recoveryMaxSteps,
         toolChoice: execOptions?.toolChoice as any,
         activeTools: execOptions?.activeTools?.filter((name): name is string => typeof name === 'string'),
         toolSurfaceFence,

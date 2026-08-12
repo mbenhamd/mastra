@@ -76,8 +76,13 @@ export class EventEmitterPubSub extends PubSub implements LeaseProvider {
    * Debug-hostile silent failures are the default for emitter listeners.
    * Surface buffer-side errors on a single channel so they're at least visible.
    */
-  private logBufferError(topic: string, err: unknown, ctx: { phase: 'cb' | 'ack-dropped' }): void {
-    const message = `[EventEmitterPubSub] batched ${ctx.phase} failed for ${topic}`;
+  /**
+   * Subscribers may return a promise now that they can acknowledge deliveries.
+   * This transport is push-only and has nothing to redeliver, so a rejection is
+   * logged rather than becoming an unhandled rejection.
+   */
+  private logSubscriberError(topic: string, err: unknown): void {
+    const message = `[EventEmitterPubSub] subscriber failed for ${topic}`;
     if (this.logger) {
       this.logger.error(message, err);
     } else {
@@ -85,8 +90,8 @@ export class EventEmitterPubSub extends PubSub implements LeaseProvider {
     }
   }
 
-  private logSubscriberError(topic: string, err: unknown): void {
-    const message = `[EventEmitterPubSub] subscriber failed for ${topic}`;
+  private logBufferError(topic: string, err: unknown, ctx: { phase: 'cb' | 'ack-dropped' }): void {
+    const message = `[EventEmitterPubSub] batched ${ctx.phase} failed for ${topic}`;
     if (this.logger) {
       this.logger.error(message, err);
     } else {

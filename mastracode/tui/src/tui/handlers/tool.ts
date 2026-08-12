@@ -341,6 +341,7 @@ export function formatToolResult(result: unknown): string {
 
 export function handleToolApprovalRequired(
   ctx: EventHandlerContext,
+  runId: string,
   toolCallId: string,
   toolName: string,
   args: unknown,
@@ -350,12 +351,10 @@ export function handleToolApprovalRequired(
   const category = getToolCategory(toolName);
   const categoryLabel = category ? TOOL_CATEGORIES[category]?.label : undefined;
 
-  // Send notification to alert the user
-  ctx.notify('tool_approval', `Approve ${toolName}?`);
-
   const firePermissionResult = (decision: 'approved' | 'declined' | 'dismissed' | 'auto_approved') => {
     state.hookManager?.runPermissionResult('tool_approval', toolCallId, toolName, decision, args).catch(() => {});
   };
+  const approvalTarget = { runId, toolCallId };
 
   const dialog = new ToolApprovalDialogComponent({
     toolCallId,
@@ -367,17 +366,17 @@ export function handleToolApprovalRequired(
       state.pendingApprovalDismiss = null;
       if (action.type === 'approve') {
         firePermissionResult('approved');
-        state.session.respondToToolApproval({ decision: 'approve' });
+        state.session.respondToToolApproval({ decision: 'approve', ...approvalTarget });
       } else if (action.type === 'always_allow_category') {
         firePermissionResult('approved');
-        state.session.respondToToolApproval({ decision: 'always_allow_category' });
+        state.session.respondToToolApproval({ decision: 'always_allow_category', ...approvalTarget });
       } else if (action.type === 'yolo') {
         firePermissionResult('auto_approved');
         void state.session.state.set({ yolo: true } as any);
-        state.session.respondToToolApproval({ decision: 'approve' });
+        state.session.respondToToolApproval({ decision: 'approve', ...approvalTarget });
       } else {
         firePermissionResult('declined');
-        state.session.respondToToolApproval({ decision: 'decline' });
+        state.session.respondToToolApproval({ decision: 'decline', ...approvalTarget });
       }
     },
   });
@@ -387,7 +386,7 @@ export function handleToolApprovalRequired(
     state.ui.hideOverlay();
     state.pendingApprovalDismiss = null;
     firePermissionResult('dismissed');
-    state.session.respondToToolApproval({ decision: 'decline', declineContext });
+    state.session.respondToToolApproval({ decision: 'decline', declineContext, ...approvalTarget });
   };
 
   // Show the dialog as an overlay

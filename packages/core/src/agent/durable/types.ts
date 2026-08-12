@@ -195,8 +195,10 @@ export interface SerializableToolHookPolicy {
  * Options for durable agent execution (serializable subset)
  */
 export interface SerializableDurableOptions {
-  /** Maximum number of agentic loop iterations */
+  /** Maximum number of ordinary agentic loop iterations */
   maxSteps?: number;
+  /** Framework-owned calls available only after the ordinary iteration ceiling. */
+  recoveryMaxSteps?: number;
   /** Tool selection strategy */
   toolChoice?: 'auto' | 'none' | 'required' | { type: 'tool'; toolName: string };
   /** Tool names enabled for this execution */
@@ -417,6 +419,8 @@ export interface DurableToolCallOutput extends DurableToolCallInput {
   resumeTargetToolCallId?: string;
   /** Result from tool execution */
   result?: unknown;
+  /** Whether toModelOutput was evaluated before the result crossed the durable boundary */
+  modelOutputComputed?: boolean;
   /** Error if tool execution failed */
   error?: {
     name: string;
@@ -833,6 +837,13 @@ export interface RunRegistryEntry {
    * should call `result.abort()` instead, which routes through here.
    */
   abortController?: AbortController;
+  /**
+   * Whether this process has already subscribed to cross-process abort
+   * requests for the run. Set by `ensureRemoteAbortListener`, which every
+   * durable step calls on entry — the flag is what keeps a run's many steps
+   * from installing duplicate subscriptions.
+   */
+  remoteAbortListenerInstalled?: boolean;
   /**
    * Promise tracking the in-flight workflow execution (or resume) for this
    * run. Resolves once the workflow has fully settled (finished, errored,

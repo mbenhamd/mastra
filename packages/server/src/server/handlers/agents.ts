@@ -2620,6 +2620,9 @@ export const SEND_TOOL_APPROVAL_ROUTE = createRoute({
         requestContext: serverRequestContext,
       });
 
+      if (!params.runId) {
+        throw new HTTPException(400, { message: 'Run id is required' });
+      }
       if (!params.toolCallId) {
         throw new HTTPException(400, { message: 'Tool call id is required' });
       }

@@ -288,6 +288,7 @@ async function validateOutput(
     output,
     reverseVirtualReferenceMap,
     usedExternals,
+    userExternals,
     outputDir,
     projectRoot,
     workspaceMap,
@@ -297,6 +298,7 @@ async function validateOutput(
     output: (OutputChunk | OutputAsset)[];
     reverseVirtualReferenceMap: Map<string, string>;
     usedExternals: Record<string, Record<string, string>>;
+    userExternals: string[];
     outputDir: string;
     projectRoot: string;
     workspaceMap: Map<string, WorkspacePackageInfo>;
@@ -607,6 +609,7 @@ export async function analyzeBundle(
       output,
       reverseVirtualReferenceMap: fileNameToDependencyMap,
       usedExternals,
+      userExternals,
       outputDir,
       projectRoot: workspaceRoot || projectRoot,
       workspaceMap,

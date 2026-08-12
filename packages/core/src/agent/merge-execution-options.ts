@@ -11,7 +11,10 @@ export const AGENT_EXECUTION_OPTION_COMPOSERS = Symbol('agentExecutionOptionComp
 
 export type AgentExecutionOptionComposers = Partial<
   Record<'onIterationComplete' | 'prepareStep', (existing: unknown) => unknown>
->;
+> & {
+  /** Internal recovery calls that may run only after the ordinary maxSteps boundary. */
+  recoveryMaxSteps?: number;
+};
 export type AgentExecutionOptionComposerFactory = () => AgentExecutionOptionComposers;
 
 /**
@@ -38,8 +41,12 @@ export function mergeAgentExecutionOptions(
   }
 
   const createComposers = (callerOptions as Record<PropertyKey, any>)[AGENT_EXECUTION_OPTION_COMPOSERS] as
-    AgentExecutionOptionComposerFactory | undefined;
+    | AgentExecutionOptionComposerFactory
+    | undefined;
   const composers = createComposers?.();
+  if (composers?.recoveryMaxSteps !== undefined) {
+    merged.recoveryMaxSteps = composers.recoveryMaxSteps;
+  }
   for (const key of ['onIterationComplete', 'prepareStep'] as const) {
     const compose = composers?.[key];
     if (compose) merged[key] = compose(merged[key]);

@@ -13,23 +13,12 @@ import { Txt } from '@mastra/playground-ui/components/Txt';
 import { cn } from '@mastra/playground-ui/utils/cn';
 import { MessageFactory } from '@mastra/react/ui';
 import type { FilePart, MessageRoleRenderers, ReasoningPart, TextPart, ToolInvocationPart } from '@mastra/react/ui';
-import {
-  Bell,
-  ChevronDown,
-  CircleDot,
-  CircleX,
-  ExternalLink,
-  GitMerge,
-  Info,
-  Layers,
-  Slack,
-  Wrench,
-  X,
-} from 'lucide-react';
+import { Bell, ChevronDown, CircleDot, ExternalLink, Info, Layers, Slack, Wrench, X } from 'lucide-react';
 import type { ReactNode } from 'react';
 import { useState } from 'react';
 
 import { highlightCode, languageForPath } from '../../../ui/highlight';
+import { PullRequestStatusIcon } from '../../factory/components/PullRequestStatusIcon';
 import { useChatSessionContext } from '../context/useChatSessionContext';
 import { useChatTranscript } from '../context/useChatTranscript';
 import {
@@ -38,6 +27,7 @@ import {
 } from '../../../../hooks/useAgentControllerRunMutations';
 import { stripSerializedAnsi } from '../services/ansi';
 import { AGENT_CONTROLLER_ID } from '../services/constants';
+import { isTerminalInvocationState } from '../services/transcript';
 import { isTranscriptToolVisible, ToolFactory } from './ToolFactory';
 import { Markdown } from '../../../ui/Markdown';
 
@@ -271,7 +261,7 @@ function ApprovalCard({
 }: {
   prompt: ApprovalPrompt;
   isSubmitting: boolean;
-  onApprove: (toolCallId: string, approved: boolean, promptId: string) => void;
+  onApprove: (runId: string, toolCallId: string, approved: boolean, promptId: string) => void;
 }) {
   return (
     <div className={promptCardApproval} role="group" aria-label={`Tool approval for ${prompt.toolName}`}>
@@ -286,7 +276,7 @@ function ApprovalCard({
           aria-label={`Approve ${prompt.toolName}`}
           autoFocus
           disabled={isSubmitting}
-          onClick={() => onApprove(prompt.toolCallId, true, prompt.id)}
+          onClick={() => onApprove(prompt.runId, prompt.toolCallId, true, prompt.id)}
         >
           Approve
         </Button>
@@ -294,7 +284,7 @@ function ApprovalCard({
           size="sm"
           aria-label={`Decline ${prompt.toolName}`}
           disabled={isSubmitting}
-          onClick={() => onApprove(prompt.toolCallId, false, prompt.id)}
+          onClick={() => onApprove(prompt.runId, prompt.toolCallId, false, prompt.id)}
         >
           Decline
         </Button>
@@ -518,13 +508,13 @@ function notificationUrl(entry: NotificationEntry): string | undefined {
   return undefined;
 }
 
-function notificationPresentation(entry: NotificationEntry) {
+function notificationPresentation(entry: NotificationEntry): { state: string; icon: ReactNode; className?: string } {
   const action = entry.metadata?.action;
   if (entry.notifKind === 'pull-request-merged') {
-    return { state: 'merged', icon: <GitMerge size={13} />, className: 'text-accent3' };
+    return { state: 'merged', icon: <PullRequestStatusIcon status="merged" size={13} decorative /> };
   }
   if (entry.notifKind === 'pull-request-closed') {
-    return { state: 'closed', icon: <CircleX size={13} />, className: 'text-error' };
+    return { state: 'closed', icon: <PullRequestStatusIcon status="closed" size={13} decorative /> };
   }
   if (action === 'opened' || action === 'reopened') {
     return { state: 'open', icon: <CircleDot size={13} />, className: 'text-accent1' };
@@ -699,8 +689,8 @@ export function Transcript() {
   const approveMutation = useApproveAgentControllerToolMutation(hookArgs);
   const respondMutation = useRespondAgentControllerSuspensionMutation(hookArgs);
 
-  const onApprove = async (toolCallId: string, approved: boolean, promptId: string) => {
-    await approveMutation.mutateAsync({ toolCallId, approved });
+  const onApprove = async (runId: string, toolCallId: string, approved: boolean, promptId: string) => {
+    await approveMutation.mutateAsync({ runId, toolCallId, approved });
     resolvePrompt(promptId);
   };
   const onRespond = async (toolCallId: string, resumeData: string | string[] | PlanResume, promptId: string) => {
@@ -726,7 +716,7 @@ export function TranscriptEntries({
 }: {
   entries: TimelineEntry[];
   isSubmitting?: boolean;
-  onApprove: (toolCallId: string, approved: boolean, promptId: string) => void;
+  onApprove: (runId: string, toolCallId: string, approved: boolean, promptId: string) => void;
   onRespond: (toolCallId: string, resumeData: string | string[] | PlanResume, promptId: string) => void;
 }) {
   const suspensions = new Map(
@@ -996,17 +986,30 @@ function FileAttachment({ part }: { part: FilePart }) {
   return <pre className={resultBlock}>{stringify(part)}</pre>;
 }
 
+/** Terminal status carried by the persisted part, if it reached one. */
+function terminalInvocationStatus(invocation: ToolInvocationPart['toolInvocation']): 'done' | 'error' | undefined {
+  if (!isTerminalInvocationState(invocation.state)) return undefined;
+  if (invocation.state !== 'result') return 'error';
+  return 'isError' in invocation && invocation.isError === true ? 'error' : 'done';
+}
+
 function toolFromInvocationPart(part: ToolInvocationPart, runtime?: ToolCall): ToolCall {
   const invocation = part.toolInvocation;
-  const failed = invocation.state === 'output-error' || invocation.state === 'output-denied';
   const persistedResult = 'result' in invocation ? invocation.result : undefined;
+  // Persisted terminal state beats the live overlay: `tool_end` can be lost in
+  // an SSE gap (no server replay), and a terminal part never regresses — the
+  // overlay's 'running' would otherwise spin forever.
+  const terminalStatus = terminalInvocationStatus(invocation);
+  const result = terminalStatus
+    ? (persistedResult ?? invocation.errorText ?? runtime?.result)
+    : (runtime?.result ?? persistedResult ?? invocation.errorText);
   return {
     toolCallId: invocation.toolCallId,
     toolName: invocation.toolName,
     argsText: runtime?.argsText ?? '',
     args: runtime?.args ?? ('args' in invocation ? invocation.args : undefined),
-    status: runtime?.status ?? (failed ? 'error' : invocation.state === 'result' ? 'done' : 'running'),
-    result: runtime?.result ?? persistedResult ?? invocation.errorText,
+    status: terminalStatus ?? runtime?.status ?? 'running',
+    result,
     output: runtime?.output ?? '',
   };
 }

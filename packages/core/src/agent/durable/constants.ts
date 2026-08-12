@@ -16,6 +16,35 @@ export const RUN_REGISTRY_SYMBOL = Symbol('run_registry');
 export const AGENT_STREAM_TOPIC = (runId: string): string => `agent.stream.${runId}`;
 
 /**
+ * Generate the pubsub topic name for agent control messages.
+ *
+ * Separate from {@link AGENT_STREAM_TOPIC} because control messages travel the
+ * opposite direction: stream events flow worker -> consumer, control messages
+ * flow caller -> worker. Keeping them apart means stream consumers never see
+ * control traffic and vice versa.
+ *
+ * @param runId - The unique run identifier
+ * @param runtimeBindingId - The immutable execution binding for this use of the run ID
+ * @returns The topic name for publishing/subscribing agent control events
+ */
+const encodeControlTopicPart = (value: string): string => encodeURIComponent(value).replace(/\./g, '%2E');
+
+export const AGENT_CONTROL_TOPIC = (runId: string, runtimeBindingId: string): string =>
+  `agent.control.${encodeControlTopicPart(runId)}.${encodeControlTopicPart(runtimeBindingId)}`;
+
+/**
+ * Event type constants for agent control events
+ */
+export const AgentControlEventTypes = {
+  /**
+   * Request that a run abort itself. Published by `abort()` in whichever
+   * process the caller lives in; handled by whichever process is actually
+   * executing the run's steps.
+   */
+  ABORT_REQUEST: 'abort-request',
+} as const;
+
+/**
  * Event type constants for agent stream events
  */
 export const AgentStreamEventTypes = {

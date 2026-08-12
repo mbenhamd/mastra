@@ -9,6 +9,7 @@ const sidebars = {
   referenceSidebar: [
     { type: 'doc', id: 'index', label: 'Overview' },
     { type: 'doc', id: 'configuration', label: 'Configuration' },
+    { type: 'doc', id: 'build-with-ai', label: 'Build with AI' },
     { type: 'doc', id: 'project-structure', label: 'Project Structure' },
     {
       type: 'category',
@@ -154,7 +155,6 @@ const sidebars = {
       label: 'Client SDK',
       collapsed: true,
       items: [
-        { type: 'doc', id: 'client-js/agent-builder', label: 'Agent Builder API' },
         { type: 'doc', id: 'client-js/agents', label: 'Agents API' },
         { type: 'doc', id: 'client-js/conversations', label: 'Conversations API' },
         { type: 'doc', id: 'client-js/error-handling', label: 'Error Handling' },
@@ -198,6 +198,18 @@ const sidebars = {
       items: [
         { type: 'doc', id: 'core/mastra-class', label: 'Mastra Class' },
         { type: 'doc', id: 'core/mastra-model-gateway', label: 'MastraModelGateway' },
+        {
+          type: 'doc',
+          id: 'core/addDynamicWorkflow',
+          label: '.addDynamicWorkflow()',
+          customProps: { tags: ['beta'] },
+        },
+        {
+          type: 'doc',
+          id: 'core/addDynamicWorkflows',
+          label: '.addDynamicWorkflows()',
+          customProps: { tags: ['beta'] },
+        },
         { type: 'doc', id: 'core/addGateway', label: '.addGateway()' },
         { type: 'doc', id: 'core/getAgent', label: '.getAgent()' },
         { type: 'doc', id: 'core/getAgentById', label: '.getAgentById()' },
@@ -252,25 +264,10 @@ const sidebars = {
         { type: 'doc', id: 'editor/blob-store-provider', label: 'BlobStoreProvider' },
         { type: 'doc', id: 'editor/mastra-editor', label: 'MastraEditor Class' },
         { type: 'doc', id: 'editor/processor-provider', label: 'ProcessorProvider' },
+        { type: 'doc', id: 'editor/prompt-blocks', label: 'Prompt blocks' },
+        { type: 'doc', id: 'editor/tools', label: 'Tool configuration' },
         { type: 'doc', id: 'editor/tool-provider', label: 'ToolProvider' },
-        {
-          type: 'category',
-          label: 'Agent Builder',
-          collapsed: true,
-          items: [
-            {
-              type: 'doc',
-              id: 'editor/agent-builder/agent-builder-options',
-              label: 'AgentBuilderOptions',
-            },
-            {
-              type: 'doc',
-              id: 'editor/agent-builder/builder-agent-defaults',
-              label: 'BuilderAgentDefaults',
-            },
-            { type: 'doc', id: 'editor/agent-builder/builder-models', label: 'Models default' },
-          ],
-        },
+        { type: 'doc', id: 'editor/versioning', label: 'Versioning' },
         {
           type: 'category',
           label: 'Browser',
@@ -375,6 +372,7 @@ const sidebars = {
         { type: 'doc', id: 'file-based-agents/memory', label: 'Memory' },
         { type: 'doc', id: 'file-based-agents/observability', label: 'Observability' },
         { type: 'doc', id: 'file-based-agents/processors', label: 'Processors' },
+        { type: 'doc', id: 'file-based-agents/schedules', label: 'Schedules' },
         { type: 'doc', id: 'file-based-agents/scorers', label: 'Scorers' },
         { type: 'doc', id: 'file-based-agents/server', label: 'Server' },
         { type: 'doc', id: 'file-based-agents/skills', label: 'Skills' },
@@ -493,6 +491,11 @@ const sidebars = {
                   type: 'doc',
                   id: 'observability/tracing/exporters/cloud-exporter',
                   label: 'CloudExporter (deprecated)',
+                },
+                {
+                  type: 'doc',
+                  id: 'observability/tracing/exporters/confident-ai',
+                  label: 'Confident AI',
                 },
                 {
                   type: 'doc',
@@ -680,6 +683,7 @@ const sidebars = {
         { type: 'doc', id: 'storage/libsql', label: 'libSQL Storage' },
         { type: 'doc', id: 'storage/mongodb', label: 'MongoDB Storage' },
         { type: 'doc', id: 'storage/mssql', label: 'MSSQL Storage' },
+        { type: 'doc', id: 'storage/oracledb', label: 'OracleDB Storage' },
         { type: 'doc', id: 'storage/postgresql', label: 'PostgreSQL Storage' },
         { type: 'doc', id: 'storage/redis', label: 'Redis Storage' },
         { type: 'doc', id: 'storage/retention', label: 'Retention (prune)' },
@@ -732,6 +736,7 @@ const sidebars = {
       items: [
         { type: 'doc', id: 'tools/ask-user-tool', label: 'askUserTool' },
         { type: 'doc', id: 'tools/brightdata', label: 'Bright Data Tools' },
+        { type: 'doc', id: 'tools/bedrock-kb-tool', label: 'createBedrockKBTool()' },
         {
           type: 'doc',
           id: 'tools/create-code-mode',
@@ -751,6 +756,12 @@ const sidebars = {
         { type: 'doc', id: 'tools/mcp-client', label: 'MCPClient' },
         { type: 'doc', id: 'tools/mcp-server', label: 'MCPServer' },
         { type: 'doc', id: 'tools/perplexity', label: 'Perplexity Tools' },
+        {
+          type: 'doc',
+          id: 'tools/quickjs-transport',
+          label: 'QuickJsCodeModeTransport',
+          customProps: { tags: ['beta'] },
+        },
         { type: 'doc', id: 'tools/submit-plan-tool', label: 'submitPlanTool' },
         { type: 'doc', id: 'tools/task-tools', label: 'Task tools' },
         { type: 'doc', id: 'tools/tavily', label: 'Tavily Tools' },
@@ -773,6 +784,7 @@ const sidebars = {
         { type: 'doc', id: 'vectors/libsql', label: 'libSQL Vector Store' },
         { type: 'doc', id: 'vectors/mongodb', label: 'MongoDB Vector Store' },
         { type: 'doc', id: 'vectors/opensearch', label: 'OpenSearch Vector Store' },
+        { type: 'doc', id: 'vectors/oracledb', label: 'OracleDB Vector Store' },
         { type: 'doc', id: 'vectors/pg', label: 'PG Vector Store' },
         { type: 'doc', id: 'vectors/pinecone', label: 'Pinecone Vector Store' },
         { type: 'doc', id: 'vectors/qdrant', label: 'Qdrant Vector Store' },
@@ -831,6 +843,12 @@ const sidebars = {
       label: 'Workflows',
       collapsed: true,
       items: [
+        {
+          type: 'doc',
+          id: 'workflows/dynamic-workflow-definition',
+          label: 'Dynamic Workflow Definition',
+          customProps: { tags: ['beta'] },
+        },
         { type: 'doc', id: 'workflows/run', label: 'Run Class' },
         { type: 'doc', id: 'workflows/step', label: 'Step Class' },
         { type: 'doc', id: 'workflows/workflow', label: 'Workflow Class' },
@@ -839,6 +857,7 @@ const sidebars = {
           type: 'category',
           label: 'Methods',
           items: [
+            { type: 'doc', id: 'workflows/workflow-methods/agent', label: '.agent()' },
             { type: 'doc', id: 'workflows/workflow-methods/branch', label: '.branch()' },
             { type: 'doc', id: 'workflows/workflow-methods/commit', label: '.commit()' },
             { type: 'doc', id: 'workflows/workflow-methods/create-run', label: '.createRun()' },
@@ -850,6 +869,7 @@ const sidebars = {
             { type: 'doc', id: 'workflows/workflow-methods/sleep', label: '.sleep()' },
             { type: 'doc', id: 'workflows/workflow-methods/sleepUntil', label: '.sleepUntil()' },
             { type: 'doc', id: 'workflows/workflow-methods/then', label: '.then()' },
+            { type: 'doc', id: 'workflows/workflow-methods/tool', label: '.tool()' },
           ],
         },
         {

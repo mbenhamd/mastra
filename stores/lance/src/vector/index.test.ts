@@ -344,6 +344,7 @@ describe('Lance vector store tests', () => {
 
       afterAll(async () => {
         await cleanupTable(testTableName);
+        await vectorDB.deleteTable(testTableName);
       });
 
       it('should upsert vectors in an existing table', async () => {
@@ -507,6 +508,7 @@ describe('Lance vector store tests', () => {
 
       afterAll(async () => {
         await cleanupTable(testTableName);
+        await vectorDB.deleteTable(testTableName);
       });
 
       it('should query vectors from an existing table', async () => {
@@ -618,6 +620,7 @@ describe('Lance vector store tests', () => {
 
       afterAll(async () => {
         await cleanupTable(testTableName);
+        await vectorDB.deleteTable(testTableName);
       });
 
       it('should update vector and metadata by id', async () => {
@@ -848,6 +851,7 @@ describe('Lance vector store tests', () => {
 
       afterAll(async () => {
         await cleanupTable(testTableName);
+        await vectorDB.deleteTable(testTableName);
       });
 
       it('should delete vector and metadata by id', async () => {
@@ -930,6 +934,7 @@ describe('Lance vector store tests', () => {
 
     afterAll(async () => {
       await cleanupTable(testTableName);
+      await vectorDB.deleteTable(testTableName);
     });
 
     it('should query vectors with metadata', async () => {
@@ -1130,6 +1135,7 @@ describe('Lance vector store tests', () => {
 
     afterAll(async () => {
       await cleanupTable(testTableName);
+      await vectorDB.deleteTable(testTableName);
     });
 
     describe('Simple queries', () => {
@@ -1212,6 +1218,7 @@ describe('Lance vector store tests', () => {
 
       afterAll(async () => {
         await cleanupTable(testTableName);
+        await vectorDB.deleteTable(testTableName);
       });
 
       it('should filter with negated equality (equivalent to $not)', async () => {
@@ -1300,6 +1307,7 @@ describe('Lance vector store tests', () => {
 
       afterAll(async () => {
         await cleanupTable(testTableName);
+        await vectorDB.deleteTable(testTableName);
       });
 
       it('should query with logical $or operator for metadata filtering', async () => {
@@ -1366,6 +1374,7 @@ describe('Lance vector store tests', () => {
 
       afterAll(async () => {
         await cleanupTable(testTableName);
+        await vectorDB.deleteTable(testTableName);
       });
 
       it('should query with $and operator using comparison operators', async () => {
@@ -1437,6 +1446,7 @@ describe('Lance vector store tests', () => {
 
       afterAll(async () => {
         await cleanupTable(testTableName);
+        await vectorDB.deleteTable(testTableName);
       });
 
       it('should query with array $in operator', async () => {
@@ -1519,6 +1529,7 @@ describe('Lance vector store tests', () => {
 
       afterAll(async () => {
         await cleanupTable(testTableName);
+        await vectorDB.deleteTable(testTableName);
       });
 
       it('should query with nested comparison and pattern matching', async () => {
@@ -1604,6 +1615,7 @@ describe('Lance vector store tests', () => {
 
       afterAll(async () => {
         await cleanupTable(testTableName);
+        await vectorDB.deleteTable(testTableName);
       });
 
       it('should query with regex pattern matching', async () => {
@@ -1710,6 +1722,7 @@ describe('Lance vector store tests', () => {
 
       afterAll(async () => {
         await cleanupTable(testTableName);
+        await vectorDB.deleteTable(testTableName);
       });
 
       it('should find documents with null fields using direct null comparison', async () => {
@@ -2312,23 +2325,37 @@ describe('Lance vector store tests', () => {
     it('resolves the metric from the table index when metric is omitted', async () => {
       const tableName = 'score_semantics_index_metric_' + Date.now();
       // 256+ rows are required for index creation; place the exact/far vectors deterministically.
+      //
+      // The far position is seeded ten times (ids 2-11) rather than once. The index built below is
+      // an HNSW approximation: it does not promise to return every row even when topK covers the
+      // whole table, and a lone orthogonal outlier is precisely what graph traversal drops. Seeding
+      // a small cluster of near-identical far rows, each with a slight offset so they are distinct
+      // graph nodes, keeps the euclidean-vs-cosine discriminator below without making the assertion
+      // depend on any one row surviving recall.
+      const FAR_ROW_COUNT = 10;
       const rows = Array.from({ length: 300 }, (_, i) => ({
         id: String(i + 1),
-        vector: i === 0 ? [1, 0, 0] : i === 1 ? [0, 1, 0] : [0.2, 0.2, 0.2 + i / 1000],
+        vector:
+          i === 0
+            ? [1, 0, 0, 0, 0, 0, 0, 0]
+            : i <= FAR_ROW_COUNT
+              ? [0, 1, i / 1000, 0, 0, 0, 0, 0]
+              : [0.2, 0.2, 0.2 + i / 1000, 0, 0, 0, 0, 0],
       }));
+      const farIds = new Set(Array.from({ length: FAR_ROW_COUNT }, (_, i) => String(i + 2)));
       await vectorDB.createTable(tableName, rows);
-      await vectorDB.createIndex({ tableName, indexName: 'vector', dimension: 3, metric: 'euclidean' });
+      await vectorDB.createIndex({ tableName, indexName: 'vector', dimension: 8, metric: 'euclidean' });
 
       // No metric passed: resolveQueryMetric should read 'euclidean' from the index stats.
       const results = await vectorDB.query({
         indexName: 'vector',
         tableName,
-        queryVector: [1, 0, 0],
+        queryVector: [1, 0, 0, 0, 0, 0, 0, 0],
         topK: 300,
       });
 
       const exact = results.find(r => r.id === '1')!;
-      const far = results.find(r => r.id === '2')!;
+      const far = results.find(r => farIds.has(r.id))!;
       expect(exact).toBeDefined();
       expect(far).toBeDefined();
       expect(exact.score).toBeGreaterThan(far.score);
@@ -2344,23 +2371,34 @@ describe('Lance vector store tests', () => {
 
     it('uses the Lance index metric when an explicit query metric conflicts', async () => {
       const tableName = 'score_semantics_index_metric_conflict_' + Date.now();
+      // Far rows are seeded as a cluster for the same reason as the test above: HNSW recall is
+      // approximate, so a single orthogonal outlier is not guaranteed to come back.
+      const FAR_ROW_COUNT = 10;
       const rows = Array.from({ length: 300 }, (_, i) => ({
         id: String(i + 1),
-        vector: i === 0 ? [1, 0, 0] : i === 1 ? [0, 1, 0] : [0.2, 0.2, 0.2 + i / 1000],
+        vector:
+          i === 0
+            ? [1, 0, 0, 0, 0, 0, 0, 0]
+            : i <= FAR_ROW_COUNT
+              ? [0, 1, i / 1000, 0, 0, 0, 0, 0]
+              : [0.2, 0.2, 0.2 + i / 1000, 0, 0, 0, 0, 0],
       }));
+      const farIds = new Set(Array.from({ length: FAR_ROW_COUNT }, (_, i) => String(i + 2)));
       await vectorDB.createTable(tableName, rows);
-      await vectorDB.createIndex({ tableName, indexName: 'vector', dimension: 3, metric: 'euclidean' });
+      await vectorDB.createIndex({ tableName, indexName: 'vector', dimension: 8, metric: 'euclidean' });
 
       const results = await vectorDB.query({
         indexName: 'vector',
         tableName,
-        queryVector: [1, 0, 0],
+        queryVector: [1, 0, 0, 0, 0, 0, 0, 0],
         topK: 300,
         metric: 'cosine',
       });
 
       const exact = results.find(r => r.id === '1')!;
-      const far = results.find(r => r.id === '2')!;
+      const far = results.find(r => farIds.has(r.id))!;
+      expect(exact).toBeDefined();
+      expect(far).toBeDefined();
       expect(exact.score).toBeGreaterThan(far.score);
       expect(exact.score).toBeGreaterThan(0.9);
       expect(far.score).toBeGreaterThan(0.3);

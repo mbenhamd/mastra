@@ -2,7 +2,7 @@ import { RequestContext } from '@mastra/core/request-context';
 import { describe, expect, beforeEach, it, vi } from 'vitest';
 
 import { MastraClient } from '../client';
-import { agentControllerMessageText } from './agent-controller';
+import { agentControllerMessageText, isKnownAgentControllerEvent } from './agent-controller';
 import type { AgentControllerEvent, KnownAgentControllerEvent } from './agent-controller';
 
 global.fetch = vi.fn();
@@ -114,8 +114,13 @@ describe('AgentController Resource', () => {
     expect(JSON.parse(lastCall()[1].body as string)).toEqual({ message: 'later', requestContext });
 
     mockJson({ ok: true });
-    await session.approveTool('call-7', true, { requestContext });
-    expect(JSON.parse(lastCall()[1].body as string)).toEqual({ toolCallId: 'call-7', approved: true, requestContext });
+    await session.approveTool('run-7', 'call-7', true, { requestContext });
+    expect(JSON.parse(lastCall()[1].body as string)).toEqual({
+      runId: 'run-7',
+      toolCallId: 'call-7',
+      approved: true,
+      requestContext,
+    });
 
     mockJson({ ok: true });
     await session.respondToToolSuspension('call-9', 'answer', { requestContext });
@@ -144,10 +149,10 @@ describe('AgentController Resource', () => {
 
   it('approves a pending tool call', async () => {
     mockJson({ ok: true });
-    await client.getAgentController('code').session('user-1').approveTool('call-7', true);
+    await client.getAgentController('code').session('user-1').approveTool('run-7', 'call-7', true);
     const [url, init] = lastCall();
     expect(url).toBe('http://localhost:4111/api/agent-controller/code/sessions/user-1/tool-approval');
-    expect(JSON.parse(init.body as string)).toEqual({ toolCallId: 'call-7', approved: true });
+    expect(JSON.parse(init.body as string)).toEqual({ runId: 'run-7', toolCallId: 'call-7', approved: true });
   });
 
   it('responds to a suspended tool (ask_user)', async () => {
@@ -324,7 +329,9 @@ describe('AgentController Resource', () => {
       .getAgentController('code')
       .session('user-1')
       .subscribe({
-        onEvent: e => received.push(e as KnownAgentControllerEvent),
+        onEvent: e => {
+          if (isKnownAgentControllerEvent(e)) received.push(e);
+        },
       });
 
     // Allow the async pump to drain the (already-closed) stream.

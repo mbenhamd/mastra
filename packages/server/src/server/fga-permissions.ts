@@ -44,8 +44,8 @@ const FALLBACK_PERMISSIONS = {
   MEMORY_WRITE: 'memory:write',
   TOOLS_EXECUTE: 'tools:execute',
   TOOLS_READ: 'tools:read',
-  STORED_WORKFLOWS_READ: 'stored-workflows:read',
-  STORED_WORKFLOWS_WRITE: 'stored-workflows:write',
+  DYNAMIC_WORKFLOWS_READ: 'dynamic-workflows:read',
+  DYNAMIC_WORKFLOWS_WRITE: 'dynamic-workflows:write',
   WORKFLOWS_EXECUTE: 'workflows:execute',
   WORKFLOWS_READ: 'workflows:read',
 } as const;

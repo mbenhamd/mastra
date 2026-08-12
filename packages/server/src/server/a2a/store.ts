@@ -4,14 +4,22 @@ function createAbortError() {
   return new DOMException('The operation was aborted.', 'AbortError');
 }
 
+export class TaskStoreVersionConflictError extends Error {
+  constructor(expectedVersion: number, currentVersion: number) {
+    super(`Task version conflict: expected ${expectedVersion}, received ${currentVersion}`);
+    this.name = 'TaskStoreVersionConflictError';
+  }
+}
+
 export class InMemoryTaskStore {
   private store: Map<string, Task> = new Map();
   private versions: Map<string, number> = new Map();
   private listeners: Map<string, Set<(update: { task: Task; version: number }) => void>> = new Map();
+  private abortControllers: Map<string, Set<AbortController>> = new Map();
   public activeCancellations = new Set<string>();
 
   private getKey(agentId: string, taskId: string) {
-    return `${agentId}-${taskId}`;
+    return JSON.stringify([agentId, taskId]);
   }
 
   async load({ agentId, taskId }: { agentId: string; taskId: string }): Promise<Task | null> {
@@ -38,15 +46,36 @@ export class InMemoryTaskStore {
     };
   }
 
-  async save({ agentId, data }: { agentId: string; data: Task }): Promise<void> {
+  async save({
+    agentId,
+    data,
+    expectedVersion,
+    skipIfCanceled = false,
+  }: {
+    agentId: string;
+    data: Task;
+    expectedVersion?: number;
+    skipIfCanceled?: boolean;
+  }): Promise<Task> {
     // Store copies to prevent internal mutation if caller reuses objects
     const key = this.getKey(agentId, data.id);
     if (!data.id) {
       throw new Error('Task ID is required');
     }
 
+    const existingTask = this.store.get(key);
+
+    if (skipIfCanceled && existingTask?.status.state === 'canceled' && data.status.state !== 'canceled') {
+      return { ...existingTask };
+    }
+
+    const currentVersion = this.versions.get(key) ?? 0;
+    if (expectedVersion !== undefined && currentVersion !== expectedVersion) {
+      throw new TaskStoreVersionConflictError(expectedVersion, currentVersion);
+    }
+
     const storedTask = { ...data };
-    const nextVersion = (this.versions.get(key) ?? 0) + 1;
+    const nextVersion = currentVersion + 1;
 
     this.store.set(key, storedTask);
     this.versions.set(key, nextVersion);
@@ -57,10 +86,53 @@ export class InMemoryTaskStore {
         listener({ task: { ...storedTask }, version: nextVersion });
       }
     }
+
+    return { ...storedTask };
   }
 
   getVersion({ agentId, taskId }: { agentId: string; taskId: string }): number {
     return this.versions.get(this.getKey(agentId, taskId)) ?? 0;
+  }
+
+  list({ agentId }: { agentId: string }): Task[] {
+    return [...this.store.entries()]
+      .filter(([key]) => {
+        const [storedAgentId] = JSON.parse(key) as [string, string];
+        return storedAgentId === agentId;
+      })
+      .map(([, task]) => ({ ...task }));
+  }
+
+  registerAbortController({
+    agentId,
+    taskId,
+    controller,
+  }: {
+    agentId: string;
+    taskId: string;
+    controller: AbortController;
+  }): () => void {
+    const key = this.getKey(agentId, taskId);
+    const controllers = this.abortControllers.get(key) ?? new Set<AbortController>();
+    controllers.add(controller);
+    this.abortControllers.set(key, controllers);
+
+    return () => {
+      controllers.delete(controller);
+      if (controllers.size === 0) {
+        this.abortControllers.delete(key);
+      }
+    };
+  }
+
+  abortTask({ agentId, taskId, reason }: { agentId: string; taskId: string; reason?: unknown }): void {
+    const controllers = this.abortControllers.get(this.getKey(agentId, taskId));
+
+    for (const controller of controllers ?? []) {
+      if (!controller.signal.aborted) {
+        controller.abort(reason);
+      }
+    }
   }
 
   async waitForNextUpdate({

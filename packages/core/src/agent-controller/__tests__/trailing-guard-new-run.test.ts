@@ -12,8 +12,9 @@
  *
  * Fix: clear lastFinishedRunId when creating a new run (`!currentRun` branch).
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { Agent } from '../../agent';
+import { RequestContext } from '../../request-context';
 import { InMemoryStore } from '../../storage/mock';
 import { AgentController } from '../agent-controller';
 import type { Session } from '../session';
@@ -92,5 +93,136 @@ describe('Trailing guard does not swallow new-run null-runId chunks', () => {
     // The null-runId chunks from run B must have been processed, not skipped.
     expect(processedChunkTypes).toContain('data-user-message');
     expect(processedChunkTypes).toContain('data-om-status');
+  });
+
+  it('uses the context bound to the accepted run for subscribed approvals', async () => {
+    const controller = createController();
+    await controller.init();
+    const session = await controller.createSession({ id: 'test-session', ownerId: 'test-owner' });
+    const requestContext = new RequestContext();
+    requestContext.set('user', { id: 'user-1', organizationId: 'org-1' });
+    session.runEngine.bindRequestContext({ runId: 'run-a', requestContext });
+    vi.spyOn(session, 'resolveToolApproval').mockReturnValue('allow');
+    const approveToolCall = vi.spyOn(session, 'approveToolCall').mockResolvedValue();
+
+    await processSubscribedChunks(
+      session,
+      [
+        { type: 'start', runId: 'run-a' },
+        {
+          type: 'tool-call-approval',
+          runId: 'run-a',
+          payload: { toolCallId: 'tool-call-1', toolName: 'factory_transition_work_item', args: {} },
+        },
+        { type: 'finish', runId: 'run-a', payload: { stepResult: { reason: 'stop' } } },
+      ],
+      'run-a',
+    );
+
+    expect(approveToolCall).toHaveBeenCalledOnce();
+    expect(approveToolCall.mock.calls[0]?.[0].requestContext?.get('user')).toEqual({
+      id: 'user-1',
+      organizationId: 'org-1',
+    });
+  });
+
+  it('does not reuse a previous principal for a context-less run', async () => {
+    const controller = createController();
+    await controller.init();
+    const session = await controller.createSession({ id: 'test-session', ownerId: 'test-owner' });
+    const principalA = new RequestContext();
+    principalA.set('user', { id: 'user-a', organizationId: 'org-1' });
+    session.runEngine.bindRequestContext({ runId: 'run-a', requestContext: principalA });
+    vi.spyOn(session, 'resolveToolApproval').mockReturnValue('allow');
+    const approveToolCall = vi.spyOn(session, 'approveToolCall').mockResolvedValue();
+
+    const approvalChunks = (runId: string) => [
+      { type: 'start', runId },
+      {
+        type: 'tool-call-approval',
+        runId,
+        payload: { toolCallId: `tool-call-${runId}`, toolName: 'factory_transition_work_item', args: {} },
+      },
+      { type: 'finish', runId, payload: { stepResult: { reason: 'stop' } } },
+    ];
+
+    await processSubscribedChunks(session, approvalChunks('run-a'), 'run-a');
+    await processSubscribedChunks(session, approvalChunks('run-b'), 'run-b');
+
+    expect(approveToolCall).toHaveBeenCalledTimes(2);
+    expect(approveToolCall.mock.calls[0]?.[0].requestContext?.get('user')).toEqual({
+      id: 'user-a',
+      organizationId: 'org-1',
+    });
+    expect(approveToolCall.mock.calls[1]?.[0].requestContext?.get('user')).toBeUndefined();
+  });
+
+  it('keeps delayed chunks on their run context while preserving a newer generation', async () => {
+    const controller = createController();
+    await controller.init();
+    const session = await controller.createSession({ id: 'test-session', ownerId: 'test-owner' });
+    const principalA = new RequestContext();
+    principalA.set('user', { id: 'user-a', organizationId: 'org-1' });
+    const principalB = new RequestContext();
+    principalB.set('user', { id: 'user-b', organizationId: 'org-2' });
+    session.runEngine.bindRequestContext({ runId: 'run-a', requestContext: principalA });
+    vi.spyOn(session, 'resolveToolApproval').mockReturnValue('allow');
+    const approveToolCall = vi.spyOn(session, 'approveToolCall').mockResolvedValue();
+
+    let releaseRunA!: () => void;
+    const runAHold = new Promise<void>(resolve => {
+      releaseRunA = resolve;
+    });
+    let runAStarted!: () => void;
+    const runAStart = new Promise<void>(resolve => {
+      runAStarted = resolve;
+    });
+    const subscription = {
+      stream: (async function* () {
+        yield { type: 'start', runId: 'run-a' };
+        runAStarted();
+        await runAHold;
+        yield {
+          type: 'tool-call-approval',
+          runId: 'run-a',
+          payload: { toolCallId: 'tool-call-a', toolName: 'factory_transition_work_item', args: {} },
+        };
+        yield { type: 'finish', runId: 'run-a', payload: { stepResult: { reason: 'stop' } } };
+      })(),
+      activeRunId: () => 'run-a',
+      abort: () => false,
+      unsubscribe: () => {},
+    };
+    session.stream.attach({ subscription: subscription as any, key: 'run-a-subscription' });
+    const processingRunA = session.processSubscribedThreadStream(subscription as any);
+
+    await runAStart;
+    session.runEngine.bindRequestContext({ runId: 'run-b', requestContext: principalB });
+    releaseRunA();
+    await processingRunA;
+
+    await processSubscribedChunks(
+      session,
+      [
+        { type: 'start', runId: 'run-b' },
+        {
+          type: 'tool-call-approval',
+          runId: 'run-b',
+          payload: { toolCallId: 'tool-call-b', toolName: 'factory_transition_work_item', args: {} },
+        },
+        { type: 'finish', runId: 'run-b', payload: { stepResult: { reason: 'stop' } } },
+      ],
+      'run-b',
+    );
+
+    expect(approveToolCall).toHaveBeenCalledTimes(2);
+    expect(approveToolCall.mock.calls[0]?.[0].requestContext?.get('user')).toEqual({
+      id: 'user-a',
+      organizationId: 'org-1',
+    });
+    expect(approveToolCall.mock.calls[1]?.[0].requestContext?.get('user')).toEqual({
+      id: 'user-b',
+      organizationId: 'org-2',
+    });
   });
 });

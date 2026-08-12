@@ -17,6 +17,7 @@ import {
   mergeVersionOverrides,
 } from '../../request-context';
 import type { VersionOverrides } from '../../request-context';
+import type { DeclaredAgentSchedule } from '../../schedules/define';
 import type { FullOutput, MastraModelOutput } from '../../stream/base/output';
 import type { ChunkType, MastraOnFinishCallback, MastraStreamTransformOptions } from '../../stream/types';
 import { ChunkFrom } from '../../stream/types';
@@ -37,7 +38,8 @@ import { agentThreadStreamRuntime } from '../thread-stream-runtime';
 import type { AgentMemoryOption, ToolsInput } from '../types';
 import { isSupportedLanguageModel } from '../utils';
 
-import { AGENT_STREAM_TOPIC, DurableStepIds } from './constants';
+import { publishAbortRequest } from './abort-transport';
+import { AGENT_CONTROL_TOPIC, AGENT_STREAM_TOPIC, DurableStepIds } from './constants';
 import {
   DURABLE_STREAM_UNTIL_IDLE_HANDOFF,
   runDurableStreamUntilIdle,
@@ -279,8 +281,16 @@ export interface DurableAgentStreamResult<OUTPUT = undefined> {
    *
    * Safe to call after the run has already finished — it's a no-op in that
    * case.
+   *
+   * Also publishes an abort request over pubsub so the abort reaches the
+   * process executing the run, which in a load-balanced deployment is usually
+   * not this one. That process flips its own controller and unwinds normally;
+   * the workflow run is never hard-cancelled, so the terminal `finish` event
+   * still reaches stream consumers. Await the returned promise to confirm the
+   * request was dispatched; it rejects when binding or transport state cannot
+   * provide that guarantee.
    */
-  abort: (reason?: unknown) => void;
+  abort: (reason?: unknown) => Promise<void>;
 }
 
 /** Public, capability-safe result from DurableAgent.prepare(). */
@@ -678,6 +688,25 @@ export class DurableAgent<
    */
   get agent(): Agent<TAgentId, TTools, TOutput> {
     return this.#wrappedAgent;
+  }
+
+  /**
+   * File-based schedules live on the wrapped agent: `assembleAgentFromFsEntry`
+   * attaches them to the inner `Agent` before it is wrapped for durable
+   * execution, and `#declaredSchedules` is private to each instance. Without
+   * this delegate the wrapper would report none of its own and Mastra would
+   * never sync a durable agent's `schedules/` directory.
+   */
+  public override getDeclaredSchedules(): DeclaredAgentSchedule[] {
+    return this.#wrappedAgent.getDeclaredSchedules();
+  }
+
+  /**
+   * Mirrors {@link getDeclaredSchedules} so attaching schedules to an
+   * already-wrapped agent lands on the instance the getter reads from.
+   */
+  public override __setDeclaredSchedules(schedules: DeclaredAgentSchedule[]): void {
+    this.#wrappedAgent.__setDeclaredSchedules(schedules);
   }
 
   /**
@@ -1111,7 +1140,7 @@ export class DurableAgent<
         ...createObservabilityContext({ currentSpan: entry?.agentSpan }),
       });
     } finally {
-      unpinGlobalRunRegistryEntry(runId);
+      unpinGlobalRunRegistryEntry(runId, workflowInput.runtimeBindingId);
     }
   }
 
@@ -1164,6 +1193,28 @@ export class DurableAgent<
     // End the root spans on error so the trace exports (mirrors the non-durable map-results-step).
     endRunSpansWithError(runId, error);
     await emitErrorEvent(this.pubsub, runId, error);
+  }
+
+  /** Abort the exact durable execution captured by a result handle. */
+  protected async requestRemoteAbort(runId: string, runtimeBindingId: string | undefined): Promise<void> {
+    if (!runtimeBindingId) {
+      const error = new Error(`Cannot publish durable agent abort for ${runId} without a runtime binding`);
+      this.#mastra?.getLogger?.()?.warn?.(error.message, {
+        agentId: this.id,
+        runId,
+      });
+      throw error;
+    }
+    try {
+      await publishAbortRequest(this.pubsub, runId, runtimeBindingId);
+    } catch (error) {
+      this.#mastra?.getLogger?.()?.warn?.('Failed to publish durable agent abort request', {
+        agentId: this.id,
+        runId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
   }
 
   /** Best-effort deletion of the outer and nested snapshots for a terminal run. */
@@ -2788,10 +2839,13 @@ export class DurableAgent<
       }
     };
 
-    const abort = (reason?: unknown) => {
+    const abort = async (reason?: unknown) => {
       if (!abortController.signal.aborted) {
         abortController.abort(reason);
       }
+      // Also stop the exact execution captured by this handle. Resolving the
+      // binding at abort time could target a later execution that reused runId.
+      await this.requestRemoteAbort(runId, runtimeBindingId);
     };
 
     return {
@@ -2913,7 +2967,9 @@ export class DurableAgent<
     // before the defaults are merged, so it can only ever skip the duplicate
     // provider authorization for the run it was minted for.
     const carriedResumeDefaults = options?._resolvedDefaultOptions as Record<PropertyKey, unknown> | undefined;
-    const carriedResumePreflight = carriedResumeDefaults?.[RESUME_PREFLIGHT_AUTHORIZED] as { runId?: string } | undefined;
+    const carriedResumePreflight = carriedResumeDefaults?.[RESUME_PREFLIGHT_AUTHORIZED] as
+      | { runId?: string }
+      | undefined;
     if (carriedResumeDefaults && carriedResumePreflight !== undefined) {
       delete carriedResumeDefaults[RESUME_PREFLIGHT_AUTHORIZED];
     }
@@ -3277,7 +3333,7 @@ export class DurableAgent<
             await stopGoalActivity({ agentId: this.id, runId });
           }
         } finally {
-          unpinGlobalRunRegistryEntry(runId);
+          unpinGlobalRunRegistryEntry(runId, activeEntry.runtimeBindingId);
         }
       })
       .catch(error => {
@@ -3316,10 +3372,11 @@ export class DurableAgent<
       }
     };
 
-    const abort = (reason?: unknown) => {
+    const abort = async (reason?: unknown) => {
       if (!abortController.signal.aborted) {
         abortController.abort(reason);
       }
+      await this.requestRemoteAbort(runId, runtimeBindingId);
     };
 
     return {
@@ -3804,10 +3861,11 @@ export class DurableAgent<
       }
     };
 
-    const abort = (reason?: unknown) => {
+    const abort = async (reason?: unknown) => {
       if (!abortController.signal.aborted) {
         abortController.abort(reason);
       }
+      await this.requestRemoteAbort(runId, runtimeBindingId);
     };
 
     return {
@@ -3871,9 +3929,10 @@ export class DurableAgent<
    * `resume()` path.
    */
   override async declineToolCall(
-    options: { runId: string; toolCallId?: string } & Record<string, any>,
+    options: { runId: string; toolCallId?: string; reason?: string } & Record<string, any>,
   ): Promise<MastraModelOutput<any>> {
-    return this.resumeStream({ approved: false }, options);
+    const { reason, ...resumeOptions } = options;
+    return this.resumeStream({ approved: false, ...(reason !== undefined ? { reason } : {}) }, resumeOptions);
   }
 
   override async approveToolCallGenerate<OUTPUT = undefined>(
@@ -3884,10 +3943,14 @@ export class DurableAgent<
   }
 
   override async declineToolCallGenerate<OUTPUT = undefined>(
-    options: AgentExecutionOptions<OUTPUT> & { runId: string; toolCallId?: string },
+    options: AgentExecutionOptions<OUTPUT> & { runId: string; toolCallId?: string; reason?: string },
   ): Promise<Awaited<ReturnType<MastraModelOutput<OUTPUT>['getFullOutput']>>> {
-    const { runId, ...resumeOptions } = options;
-    return this.resumeGenerate(runId, { approved: false }, resumeOptions as any) as any;
+    const { runId, reason, ...resumeOptions } = options;
+    return this.resumeGenerate(
+      runId,
+      { approved: false, ...(reason !== undefined ? { reason } : {}) },
+      resumeOptions as any,
+    ) as any;
   }
 
   /**
@@ -4406,7 +4469,8 @@ export class DurableAgent<
     },
   ): Promise<Omit<DurableAgentStreamResult<TOutput>, 'runId'> & { runId: string }> {
     const memoryInfo = this.#runRegistry.getMemoryInfo(runId);
-    const runtimeBindingId = this.#runRegistry.get(runId)?.runtimeBindingId;
+    const runtimeBindingId =
+      this.#runRegistry.get(runId)?.runtimeBindingId ?? getGlobalRunRegistryEntry(runId)?.runtimeBindingId;
 
     // Track cleanup state to avoid double cleanup
     let cleanedUp = false;
@@ -4470,15 +4534,17 @@ export class DurableAgent<
       }
     };
 
-    // observe() doesn't own the run's lifecycle, but for API symmetry the
-    // returned `abort` flips the in-process controller currently installed
-    // on the registry. If the run already ended (or is running in a
-    // different process), this is a best-effort no-op.
-    const abort = (reason?: unknown) => {
-      const controller = (globalRunRegistry.get(runId) ?? this.#runRegistry.get(runId))?.abortController;
-      if (controller && !controller.signal.aborted) {
-        controller.abort(reason);
+    // observe() doesn't own the run's lifecycle, but the returned `abort` can
+    // still stop the exact execution observed when this handle was created.
+    // Never resolve the current binding/controller at click time: the run ID
+    // may have been reused by then.
+    const observedEntry = getBoundRunRegistryEntry(runId, runtimeBindingId);
+    const observedAbortController = observedEntry?.abortController ?? this.#runRegistry.get(runId)?.abortController;
+    const abort = async (reason?: unknown) => {
+      if (observedAbortController && !observedAbortController.signal.aborted) {
+        observedAbortController.abort(reason);
       }
+      await this.requestRemoteAbort(runId, runtimeBindingId);
     };
 
     return {
@@ -4495,26 +4561,37 @@ export class DurableAgent<
   }
 
   /**
-   * Clear retained pubsub state for a run's topic (cached history and, for
+   * Clear retained pubsub state for a run's topics (cached history and, for
    * persistent transports, the underlying stream). Fire-and-forget: the
    * `clearTopic` contract is best-effort and non-throwing.
+   *
+   * Clears the agent stream, remote-control, and `workflow.events.v2.<runId>`
+   * topics. The durable agentic loop runs on the default workflow engine, so the evented
+   * engine's terminal topic cleanup never runs for these runs — without this,
+   * CachingPubSub permanently orphans a no-TTL counter key per completed run.
    *
    * Unlike the evented workflow engine's per-run topic cleanup, this needs no
    * restart guard: cleanup timers arm only on terminal outcomes
    * (FINISH/ERROR/ABORT — never SUSPENDED), `resume()` rejects runs whose
    * snapshot isn't `suspended`, `untilIdle` continuations mint a fresh runId
    * per segment, and cross-process `recover()` can't race a dead process's
-   * timer. No supported flow re-engages a runId after its timer is armed.
+   * timer. Caller-supplied IDs are also rejected while either durable workflow
+   * has a persisted row; shared persistence is required for supported
+   * cross-process execution. Ephemeral no-storage runs are process-local and
+   * the binding checks below fence their same-process reuse. No supported flow
+   * re-engages a runId after its timer is armed.
    */
-  #clearPubsubTopic(runId: string): void {
+  #clearPubsubTopic(runId: string, runtimeBindingId: string): void {
     void this.pubsub.clearTopic(AGENT_STREAM_TOPIC(runId));
+    void this.pubsub.clearTopic(AGENT_CONTROL_TOPIC(runId, runtimeBindingId));
+    void this.pubsub.clearTopic(`workflow.events.v2.${runId}`);
   }
 
   /** Clear replay state only while this binding still owns the reused run ID. */
   #cleanupBoundRun(runId: string, runtimeBindingId: string): void {
     const cleanedLocal = this.#runRegistry.cleanupBound(runId, runtimeBindingId);
     const cleanedGlobal = deleteBoundRunRegistryEntry(runId, runtimeBindingId);
-    if (cleanedLocal || cleanedGlobal) this.#clearPubsubTopic(runId);
+    if (cleanedLocal || cleanedGlobal) this.#clearPubsubTopic(runId, runtimeBindingId);
   }
 
   /**

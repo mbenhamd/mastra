@@ -629,7 +629,15 @@ export async function createMastraCodeAgentController(config?: MastraCodeConfig)
   // Hooks
   const hookManager = config?.disableHooks
     ? undefined
-    : new HookManager(project.rootPath, 'session-init', configDir, homeDir);
+    : new HookManager(
+        project.rootPath,
+        'session-init',
+        configDir,
+        homeDir,
+        project.isWorktree
+          ? { path: project.rootPath, branch: project.gitBranch, mainRepoPath: project.mainRepoPath }
+          : undefined,
+      );
 
   const pluginManager = config?.disablePlugins
     ? undefined
@@ -711,7 +719,9 @@ export async function createMastraCodeAgentController(config?: MastraCodeConfig)
     // default when the `workspace` key is absent.
     workspace: undefined,
     instructions: getDynamicInstructions,
-    model: getDynamicModel,
+    // `settingsPath` matches the source `createMastraCode()` reads from so the
+    // per-mode thinking defaults resolve against the same config file.
+    model: ctx => getDynamicModel(ctx, config?.settingsPath),
     tools: createDynamicTools(mcpManager, config?.extraTools, config?.disabledTools, storage, pluginTools),
     hooks: createToolHooks(hookManager, config?.postToolObserver),
     scorers: {
@@ -955,7 +965,10 @@ export async function createMastraCodeAgentController(config?: MastraCodeConfig)
   if (globalSettings.preferences.yolo !== null) {
     globalInitialState.yolo = globalSettings.preferences.yolo;
   }
-  globalInitialState.thinkingLevel = globalSettings.preferences.thinkingLevel;
+  // Note: `thinkingLevel` is intentionally NOT seeded into session state. The
+  // state slot is a session-level override; the effective level is resolved at
+  // request time (per-mode defaults → global preference) in getDynamicModel so
+  // settings changes apply to the next request of every session.
   if (config?.omScope) {
     globalInitialState.omScope = config.omScope;
   }

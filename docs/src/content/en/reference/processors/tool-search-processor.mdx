@@ -49,6 +49,14 @@ const toolSearch = new ToolSearchProcessor({
             isOptional: false,
           },
           {
+            name: 'includeResolvedTools',
+            type: 'boolean',
+            description:
+              "Also make the tools the agent resolved for this request (MCP tools requiring the caller's credentials, or anything returned by a dynamic tools function) searchable, and withhold them from the prompt until the agent loads them. The meta-tools are never withheld. Request-resolved tools are indexed per request, so each request searches and loads its own tool instances.",
+            isOptional: true,
+            default: 'false',
+          },
+          {
             name: 'search',
             type: '{ topK?: number; minScore?: number; autoLoad?: boolean }',
             description: 'Configuration for the search behavior.',
@@ -138,7 +146,7 @@ Tool IDs must be unique. Tool keys and IDs may differ, but a key may not equal a
 
 ### State inspection and lifecycle
 
-These lifecycle methods operate on the default `'in-memory'` store. They're no-ops for the `'context'` store: its durable state lives in conversation messages, and its same-run bridge lives in request-local processor state that is released with the request.
+These lifecycle methods operate on the default `'in-memory'` store. They're no-ops for the `'context'` store: its durable state lives in conversation messages, and its same-run bridge lives in request-local processor state that's released with the request.
 
 #### `clearState(threadId)`
 
@@ -158,7 +166,7 @@ processor.clearAllState()
 
 #### `dispose()`
 
-Releases the in-memory cleanup timer and all processor-owned in-memory state. Call this when a processor instance is evicted or replaced. It is safe to call more than once.
+Releases the in-memory cleanup timer and all processor-owned in-memory state. Call this when a processor instance is evicted or replaced. It's safe to call more than once.
 
 ```typescript
 processor.dispose()
@@ -211,7 +219,37 @@ The `phase` value describes where the filter is being applied:
 - `load`: Blocks explicit `load_tool` calls and automatic activation when `search.autoLoad` is enabled.
 - `active`: Hides already-loaded tools from the current request if they're no longer allowed.
 
-If the hook throws or rejects, `ToolSearchProcessor` treats the tool as disallowed for that request. The hook may run for every matching search candidate, so keep async policy checks cheap or cached. The `search_tools` meta-tool is always available. `load_tool` is available unless `search.autoLoad` is enabled. Tools passed directly through the agent or `processInputStep` remain available unless you filter them outside `ToolSearchProcessor`.
+If the hook throws or rejects, `ToolSearchProcessor` treats the tool as disallowed for that request. The hook may run for every matching search candidate, so keep async policy checks cheap or cached. The `search_tools` meta-tool is always available. `load_tool` is available unless `search.autoLoad` is enabled. Tools passed directly through the agent or `processInputStep` remain available unless you filter them outside `ToolSearchProcessor`, or enable `includeResolvedTools`.
+
+## Searching request-resolved tools
+
+The `tools` option is fixed at construction, so you can't list tools that only exist per request (MCP tools that need the caller's credentials, or anything returned by a dynamic `tools` function). By default those tools bypass search and occupy prompt space on every turn.
+
+Set `includeResolvedTools: true` to index them for the request and withhold them from the prompt until the agent loads them:
+
+```typescript title="src/mastra/agents/mcp-agent.ts"
+import { Agent } from '@mastra/core/agent'
+import { ToolSearchProcessor } from '@mastra/core/processors'
+
+const toolSearch = new ToolSearchProcessor({
+  tools: staticTools,
+  includeResolvedTools: true,
+})
+
+const agent = new Agent({
+  id: 'mcp-agent',
+  name: 'mcp-agent',
+  instructions: 'Search for a tool when you need a capability you do not have.',
+  model: '__GATEWAY_OPENAI_MODEL__',
+  // Resolved per request, then searchable alongside staticTools
+  tools: async ({ requestContext }) => mcpClient.getTools(requestContext.get('userToken')),
+  inputProcessors: [toolSearch],
+})
+```
+
+Each request is indexed on its own, so a tool loaded by one caller never resolves to another caller's instance of the same tool name.
+
+This option applies to every tool resolved for the request, including memory, workspace, skill, and browser tools. Only the `search_tools` and `load_tool` meta-tools stay in the prompt, so any tool the agent relies on implicitly must be found through search before it can be called.
 
 ## Extended usage example
 
@@ -302,12 +340,12 @@ Loaded state is derived from canonical assistant tool results in the conversatio
 This mode:
 
 - Requires no memory configuration.
-- Is restart-safe: the durable record is the persisted message history.
+- It's restart-safe: the durable record is the persisted message history.
 - De-loads a tool automatically once that result is no longer present in the messages.
 
-Restart safety depends on supplying that persisted history to the next processor run. A configured Mastra MessageHistory processor can do this when it recalls history before ToolSearch runs. Without memory, the caller must provide the prior messages; sending only the newest message leaves no context record to reconstruct.
+Restart safety requires supplying that persisted history to the next processor run. A configured Mastra MessageHistory processor can recall the history before invoking ToolSearch. Without memory, the caller must provide the prior messages. Sending only the newest message leaves no context record to reconstruct.
 
-Within one agent run, request-local processor state bridges a successful load to the next model step before the assistant result appears in persisted messages. This bridge also works without a thread ID. It isn't shared across runs, so discarding or aborting one run doesn't activate tools in another run for the same thread.
+Within one agent run, request-local processor state bridges a successful load to the next model step before the assistant result is written to persisted messages. This bridge also works without a thread ID. It isn't shared across runs, so discarding or aborting one run doesn't activate tools in another run for the same thread.
 
 ```typescript
 import { ToolSearchProcessor } from '@mastra/core/processors'

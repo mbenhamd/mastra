@@ -4,6 +4,7 @@ import { RequestContext } from '../request-context';
 import { toStandardSchema } from '../schema';
 import type { PublicSchema, StandardSchemaWithJSON, InferPublicSchema, InferPublicSchemaInput } from '../schema';
 import type { SuspendOptions } from '../workflows';
+import { consumeBuilderValidatedInput } from './builder-validation-context';
 import {
   createToolRecoveryFingerprint,
   defineLazyToolRecoveryFingerprint,
@@ -381,16 +382,24 @@ export class Tool<
         // zod schema would throw on the resumed leg even though the initial leg
         // passed (see the identical branch in tool-builder/builder.ts).
         const isResuming = !!(context?.resumeData || context?.agent?.resumeData);
+        const wasBuilderValidated = consumeBuilderValidatedInput(context);
+        const skipInputValidation = isResuming || wasBuilderValidated;
 
         let data: any = inputData;
-        // Validate input if schema exists
-        const validationResult = validateToolInput(this.inputSchema, inputData, this.id);
-        if (validationResult.error) {
-          if (!isResuming) {
+        if (!skipInputValidation) {
+          const validationResult = validateToolInput(this.inputSchema, inputData, this.id);
+          if (validationResult.error) {
             return validationResult.error;
           }
-        } else {
           data = validationResult.data;
+        } else if (isResuming && !wasBuilderValidated) {
+          // Best-effort normalization on resume: replayed args may contain provider
+          // compatibility values such as null for optional fields. Preserve delegated
+          // control fields when normalization cannot safely apply.
+          const validationResult = validateToolInput(this.inputSchema, inputData, this.id);
+          if (validationResult.error === undefined) {
+            data = validationResult.data;
+          }
         }
 
         // Validate request context if schema exists

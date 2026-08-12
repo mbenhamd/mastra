@@ -8,6 +8,7 @@ import type {
   SendAgentNotificationSignalOptions,
   SendAgentNotificationSignalResult,
   SendAgentSignalAccepted,
+  SendAgentSignalResult,
   ToolsetsInput,
 } from '../agent/types';
 import { getErrorFromUnknown } from '../error';
@@ -54,10 +55,15 @@ export interface ThreadSettingsStore {
   set(key: string, value: unknown): Promise<void>;
 }
 
+/** Process-local listener awaited before a terminal agent event is emitted. */
+export type SessionBeforeAgentEndListener = (
+  event: Extract<AgentControllerEvent, { type: 'agent_end' }>,
+) => void | Promise<void>;
+
 /** Options for {@link Session.sendNotificationSignal}. */
-export type SessionSendNotificationSignalOptions = {
-  ifActive?: SendAgentNotificationSignalOptions['ifActive'];
-  ifIdle?: SendAgentNotificationSignalOptions['ifIdle'];
+export type SessionSendNotificationSignalOptions<OUTPUT = unknown> = {
+  ifActive?: SendAgentNotificationSignalOptions<OUTPUT>['ifActive'];
+  ifIdle?: SendAgentNotificationSignalOptions<OUTPUT>['ifIdle'];
   tracingContext?: TracingContext;
   tracingOptions?: TracingOptions;
   requestContext?: RequestContext;
@@ -74,6 +80,22 @@ function addOptionalUsageField(usage: TokenUsage, key: OptionalUsageField, value
 
 /** Persisted thread-setting key for the currently-selected mode. */
 const MODE_ID_KEY = 'currentModeId';
+
+/**
+ * Reason attached to tool prompts retracted because the user aborted the run.
+ * Shared by the parked-suspension retraction and the gated-approval decline so
+ * both render the same "the user interrupted this" explanation.
+ */
+export const ABORTED_BY_USER_REASON = 'Aborted by the user';
+
+/**
+ * Session-state keys that are transparently persisted to thread metadata on
+ * every state update and restored by `Session.loadMetadata()`. These are user
+ * preferences that must survive a host restart (sessions themselves are
+ * in-memory only). Keys listed here must also be reserved in
+ * {@link isReservedThreadMetadataKey}.
+ */
+const PERSISTED_STATE_KEYS = ['thinkingLevel', 'notifications'] as const;
 /** Persisted thread-setting key prefix for a mode's last-used model. */
 const modeModelKey = (modeId: string) => `modeModelId_${modeId}`;
 
@@ -94,6 +116,8 @@ function isReservedThreadMetadataKey(key: string): boolean {
     key === 'observationThreshold' ||
     key === 'reflectionThreshold' ||
     key === 'tokenUsage' ||
+    key === 'thinkingLevel' ||
+    key === 'notifications' ||
     key.startsWith('modeModelId_')
   );
 }
@@ -465,8 +489,14 @@ export class SessionThread {
 
   /** Persist a setting (metadata value) for the active thread. */
   async setSetting({ key, value }: { key: string; value: unknown }): Promise<void> {
-    if (!this.#store || this.#threadId === null) return;
-    await this.#store.setMetadata({ threadId: this.#threadId, key, value });
+    if (this.#threadId === null) return;
+    await this.setSettingOn({ threadId: this.#threadId, key, value });
+  }
+
+  /** Persist a setting to a specific thread, regardless of the current binding. */
+  async setSettingOn({ threadId, key, value }: { threadId: string; key: string; value: unknown }): Promise<void> {
+    if (!this.#store) return;
+    await this.#store.setMetadata({ threadId, key, value });
   }
 
   /** Delete a setting (metadata value) for the active thread. */
@@ -541,21 +571,9 @@ export class SessionThread {
       metadata[`modeModelId_${session.mode.get()}`] = modelId;
     }
 
-    // Stamp the session's scoping tags onto the thread so listings can be
-    // filtered back to this session's scope (e.g. a `projectPath` per git
-    // worktree). Fall back to a `projectPath` read from state for unscoped
-    // sessions that still carry one in their initial state.
-    const tags = session.getTags();
-    if (Object.keys(tags).length > 0) {
-      for (const [key, value] of Object.entries(tags)) {
-        if (!isReservedThreadMetadataKey(key)) metadata[key] = value;
-      }
-    } else {
-      const projectPath = (session.state.get() as any).projectPath;
-      if (projectPath) {
-        metadata.projectPath = projectPath;
-      }
-    }
+    // Stamp the session's scope so thread selection can filter listings back to
+    // it (e.g. a `projectPath` per git worktree).
+    Object.assign(metadata, session.getThreadScope());
 
     // Acquire lock on new thread before releasing old one.
     // If acquire fails, attempt to re-acquire the old lock before rethrowing.
@@ -887,6 +905,20 @@ export class SessionThread {
         await session.state.set(updates as Record<string, unknown>);
       }
 
+      // Restore restart-surviving preferences (thinking level, notifications).
+      // Applied one key at a time so an invalid persisted value fails schema
+      // validation without discarding the mode/model/OM restoration above or
+      // the other, still-valid preference.
+      for (const key of PERSISTED_STATE_KEYS) {
+        const value = meta?.[key];
+        if (value === undefined) continue;
+        try {
+          await session.state.set({ [key]: value } as Record<string, unknown>);
+        } catch {
+          // Persisted preference no longer valid for the current state schema.
+        }
+      }
+
       if (!hasObservationThreshold) {
         const observationThreshold = session.om.observer.threshold();
         if (observationThreshold !== undefined) {
@@ -1070,9 +1102,14 @@ export class SessionSuspensions {
     return dropped;
   }
 
-  /** Drop all parked suspensions (e.g. on abort or thread switch). */
-  clear(): void {
+  /**
+   * Drop all parked suspensions (e.g. on abort or thread switch), returning the
+   * dropped entries so callers can retract the corresponding prompts.
+   */
+  clear(): Array<{ toolCallId: string; toolName: string }> {
+    const dropped = [...this.#pending].map(([toolCallId, { toolName }]) => ({ toolCallId, toolName }));
     this.#pending.clear();
+    return dropped;
   }
 
   /** Whether any tool calls are parked awaiting a resume. */
@@ -1163,6 +1200,10 @@ export interface ApprovalDecision {
  */
 export interface ApprovalResponse {
   decision: 'approve' | 'decline' | 'always_allow_category';
+  /** Exact tool call parked on this approval gate. */
+  toolCallId: string;
+  /** Exact run that parked this approval gate. */
+  runId: string;
   requestContext?: RequestContext;
   declineContext?: { reason?: string; message?: string };
 }
@@ -1184,15 +1225,26 @@ export class SessionApproval {
   #toolName: string | null = null;
   /** Id of the tool call currently awaiting approval, or null when none. */
   #toolCallId: string | null = null;
+  /** Id of the run that parked the approval, or null when unavailable. */
+  #runId: string | null = null;
 
   /**
-   * Park a new approval for `toolName`/`toolCallId` and return a promise that
-   * resolves once {@link respond} is called with the user's decision. The caller
-   * awaits this while the run is suspended on the gate.
+   * Park a new approval for `toolName`/`toolCallId`/`runId` and return a promise
+   * that resolves once {@link respond} is called with the user's decision. The
+   * caller awaits this while the run is suspended on the gate.
    */
-  arm({ toolName, toolCallId }: { toolName: string; toolCallId?: string }): Promise<ApprovalDecision> {
+  arm({
+    toolName,
+    toolCallId,
+    runId,
+  }: {
+    toolName: string;
+    toolCallId?: string;
+    runId?: string;
+  }): Promise<ApprovalDecision> {
     this.#toolName = toolName;
     this.#toolCallId = toolCallId ?? null;
+    this.#runId = runId ?? null;
     return new Promise<ApprovalDecision>(resolve => {
       this.#resolve = resolve;
     });
@@ -1203,6 +1255,11 @@ export class SessionApproval {
     return this.#toolCallId;
   }
 
+  /** Id of the run that parked the approval, or null when unavailable. */
+  getRunId(): string | null {
+    return this.#runId;
+  }
+
   /** Whether an approval is currently parked awaiting a decision. */
   isArmed(): boolean {
     return this.#resolve !== null;
@@ -1210,21 +1267,24 @@ export class SessionApproval {
 
   /**
    * Apply a user's {@link ApprovalResponse} to the parked gate. A no-op when
-   * nothing is armed. When `toolCallId` is supplied it must match the gated
-   * call; a mismatch is ignored so a stale/delayed response cannot resolve a
-   * different pending gate. `always_allow_category` runs `onAlwaysAllow` with the
-   * gated tool name (so the caller can grant the tool's category — a lookup that
-   * needs AgentController config) and then approves; `approve`/`decline` resolve as-is.
+   * nothing is armed. Both `toolCallId` and `runId` must exactly match the
+   * gated identity; omission or mismatch cannot resolve a different pending
+   * gate. `always_allow_category` runs `onAlwaysAllow` with the gated tool name
+   * (so the caller can grant the tool's category — a lookup that needs
+   * AgentController config) and then approves; `approve`/`decline` resolve as-is.
    */
   respond({
     decision,
     toolCallId,
+    runId,
     requestContext,
     declineContext,
     onAlwaysAllow,
-  }: ApprovalResponse & { toolCallId?: string; onAlwaysAllow?: (toolName: string) => void }): void {
+  }: ApprovalResponse & {
+    onAlwaysAllow?: (toolName: string) => void;
+  }): void {
     if (!this.isArmed()) return;
-    if (toolCallId !== undefined && this.#toolCallId !== null && toolCallId !== this.#toolCallId) return;
+    if (toolCallId !== this.#toolCallId || runId !== this.#runId) return;
 
     if (decision === 'always_allow_category' && this.#toolName) {
       onAlwaysAllow?.(this.#toolName);
@@ -1239,6 +1299,7 @@ export class SessionApproval {
     this.#resolve = null;
     this.#toolName = null;
     this.#toolCallId = null;
+    this.#runId = null;
   }
 
   /**
@@ -1252,12 +1313,14 @@ export class SessionApproval {
     this.#resolve = null;
     this.#toolName = null;
     this.#toolCallId = null;
+    this.#runId = null;
   }
 
-  /** Clear the gated tool name/call id once a parked approval has been consumed. */
+  /** Clear the gated tool/run identity once a parked approval has been consumed. */
   clearToolName(): void {
     this.#toolName = null;
     this.#toolCallId = null;
+    this.#runId = null;
   }
 }
 
@@ -1284,6 +1347,7 @@ export class SessionRun {
   /** Whether an abort has been requested for the current run. */
   #abortRequested = false;
   readonly #teardownWaiters = new Set<() => void>();
+  readonly #abortRequestWaiters = new Set<() => void>();
 
   #notifyTeardown(): void {
     const waiters = [...this.#teardownWaiters];
@@ -1303,6 +1367,32 @@ export class SessionRun {
       };
       if (signal.aborted) return resolve();
       this.#teardownWaiters.add(done);
+      signal.addEventListener('abort', abort, { once: true });
+    });
+  }
+
+  #notifyAbortRequested(): void {
+    const waiters = [...this.#abortRequestWaiters];
+    this.#abortRequestWaiters.clear();
+    for (const waiter of waiters) waiter();
+  }
+
+  /**
+   * Resolves once an abort is requested for the current run (immediately if
+   * one already was), or when `signal` cancels the wait.
+   */
+  waitForAbortRequest(signal: AbortSignal): Promise<void> {
+    return new Promise(resolve => {
+      const done = () => {
+        signal.removeEventListener('abort', abort);
+        resolve();
+      };
+      const abort = () => {
+        this.#abortRequestWaiters.delete(done);
+        resolve();
+      };
+      if (this.#abortRequested || signal.aborted) return resolve();
+      this.#abortRequestWaiters.add(done);
       signal.addEventListener('abort', abort, { once: true });
     });
   }
@@ -1391,15 +1481,26 @@ export class SessionRun {
    * Request an abort: mark the run as aborting and fire the AbortController (if
    * armed), then drop the controller. Leaves the requested flag set so the
    * run-end path can resolve its reason as 'aborted'; {@link reset} clears it.
+   *
+   * `deferSignal` marks the run as aborting without firing the controller. Used
+   * when the abort interrupts a parked tool-approval gate: the gated call still
+   * has to be declined through the (still live) agent run so the denial is
+   * persisted, and firing the signal first would tear that run down underneath
+   * the decline. The engine fires the signal itself once the decline lands.
    */
-  requestAbort(): void {
+  requestAbort({ deferSignal }: { deferSignal?: boolean } = {}): void {
     this.#abortRequested = true;
+    if (deferSignal) {
+      this.#notifyAbortRequested();
+      return;
+    }
     if (this.#abortController) {
       try {
         this.#abortController.abort();
       } catch {}
       this.#abortController = null;
     }
+    this.#notifyAbortRequested();
   }
 }
 
@@ -1897,19 +1998,27 @@ interface SessionStateOptions<TState> {
  * and validated updates emit the same `state_changed` event the AgentController used to
  * emit when it owned state directly.
  */
+type PersistSettingFn = (args: { key: string; value: unknown }) => Promise<void>;
+
 class SessionState<TState = unknown> {
   #state: TState;
   #updateQueue: Promise<void> = Promise.resolve();
   readonly #schema: StandardSchemaWithJSON | undefined;
   readonly #bus: SessionBus;
+  readonly #capturePersistSetting: (() => PersistSettingFn | undefined) | undefined;
 
-  constructor({ initialState, stateSchema }: SessionStateOptions<TState>, bus: SessionBus) {
+  constructor(
+    { initialState, stateSchema }: SessionStateOptions<TState>,
+    bus: SessionBus,
+    capturePersistSetting?: () => PersistSettingFn | undefined,
+  ) {
     this.#schema = stateSchema ? toStandardSchema(stateSchema) : undefined;
     this.#state = {
       ...this.getSchemaDefaults(),
       ...(initialState as Record<string, unknown> | undefined),
     } as TState;
     this.#bus = bus;
+    this.#capturePersistSetting = capturePersistSetting;
   }
 
   get(): Readonly<TState> {
@@ -1940,7 +2049,7 @@ class SessionState<TState = unknown> {
     return defaults as Partial<TState>;
   }
 
-  private async apply(updates: Partial<TState>): Promise<void> {
+  private async apply(updates: Partial<TState>, persistSetting?: PersistSettingFn): Promise<void> {
     const changedKeys = Object.keys(updates as Record<string, unknown>);
     const newState = { ...(this.#state as Record<string, unknown>), ...(updates as Record<string, unknown>) };
 
@@ -1956,11 +2065,29 @@ class SessionState<TState = unknown> {
     }
 
     this.#bus.emit({ type: 'state_changed', state: this.get() as Record<string, unknown>, changedKeys });
+
+    // Mirror restart-surviving preferences into thread metadata so they can be
+    // restored by `Session.loadMetadata()` after the host process restarts.
+    // Persistence failures never fail the in-memory state update.
+    if (persistSetting) {
+      const state = this.#state as Record<string, unknown>;
+      for (const key of PERSISTED_STATE_KEYS) {
+        if (!changedKeys.includes(key)) continue;
+        try {
+          await persistSetting({ key, value: state[key] });
+        } catch {
+          // Storage unavailable or write failed — keep the in-memory update.
+        }
+      }
+    }
   }
 
   set(updates: Partial<TState>): Promise<void> {
     const updateSnapshot = { ...(updates as Record<string, unknown>) } as Partial<TState>;
-    const run = this.#updateQueue.then(() => this.apply(updateSnapshot));
+    // Captured now, not at apply time: an update queued behind a thread switch
+    // must persist to the thread that was active when the update was requested.
+    const persistSetting = this.#capturePersistSetting?.();
+    const run = this.#updateQueue.then(() => this.apply(updateSnapshot, persistSetting));
     this.#updateQueue = run.then(
       () => undefined,
       () => undefined,
@@ -1969,10 +2096,11 @@ class SessionState<TState = unknown> {
   }
 
   update<TResult>(updater: SessionStateUpdater<TState, TResult>): Promise<TResult> {
+    const persistSetting = this.#capturePersistSetting?.();
     const run = this.#updateQueue.then(async () => {
       const update = await updater(this.get());
       if (update.updates && Object.keys(update.updates as Record<string, unknown>).length > 0) {
-        await this.apply(update.updates);
+        await this.apply(update.updates, persistSetting);
       }
       for (const event of update.events ?? []) {
         this.#bus.emit(event);
@@ -2275,6 +2403,7 @@ export class SessionDisplayState {
 
       case 'tool_approval_required':
         ds.pendingApproval = {
+          runId: event.runId,
           toolCallId: event.toolCallId,
           toolName: event.toolName,
           args: event.args,
@@ -2521,9 +2650,23 @@ export class SessionDisplayState {
  * has its own bus, so events never cross between sessions. Subsystems hold a
  * reference to their session's bus and call {@link emit} directly.
  */
+/**
+ * Event types emitted once per streamed chunk. Their display-state snapshots are
+ * coalesced, since a snapshot always carries the full state and intermediate
+ * ones are immediately superseded.
+ */
+const COALESCIBLE_DISPLAY_STATE_EVENTS = new Set<AgentControllerEvent['type']>(['message_update', 'tool_input_delta']);
+
+/** Upper bound on coalesced display-state snapshots: one per this many ms, plus a leading one. */
+const DISPLAY_STATE_COALESCE_MS = 16;
+
 export class SessionBus {
   readonly #listeners: AgentControllerEventListener[] = [];
   #displayState: SessionDisplayState | undefined;
+  /** Timer for the trailing snapshot of the current coalescing window. */
+  #displayStateTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Whether a snapshot was withheld during the current window and still owes a dispatch. */
+  #displayStatePending = false;
   /**
    * The last workspace lifecycle event group emitted on this bus, replayed to
    * subscribers that attach after the workspace finished initializing. Without
@@ -2560,6 +2703,11 @@ export class SessionBus {
     };
   }
 
+  /** Whether anything is currently listening. Lets emitters skip snapshot work nobody reads. */
+  hasListeners(): boolean {
+    return this.#listeners.length > 0;
+  }
+
   emit(event: AgentControllerEvent): void {
     if (
       event.type === 'workspace_status_changed' ||
@@ -2573,8 +2721,59 @@ export class SessionBus {
       }
     }
     this.#displayState?.apply(event);
+
+    // A pending snapshot describes state that predates this event, so it must
+    // reach listeners before the event itself does. Flushing here also means a
+    // coalesced snapshot can never arrive after the event that superseded it.
+    if (!COALESCIBLE_DISPLAY_STATE_EVENTS.has(event.type)) {
+      this.#flushDisplayState();
+    }
+
     this.#dispatch(event);
-    if (event.type !== 'display_state_changed' && this.#displayState) {
+
+    if (event.type === 'display_state_changed' || !this.#displayState) return;
+
+    if (COALESCIBLE_DISPLAY_STATE_EVENTS.has(event.type)) {
+      this.#scheduleDisplayState();
+      return;
+    }
+    this.#dispatch({ type: 'display_state_changed', displayState: this.#displayState.get() });
+  }
+
+  /**
+   * Queue a display-state snapshot for a high-frequency event. Streaming a
+   * single message emits thousands of deltas, and dispatching a full snapshot
+   * per delta re-serializes the whole message (plus every completed tool's args
+   * and result) on each one. Snapshots are state-of-the-world rather than
+   * incremental, so dropping intermediate ones loses nothing: the trailing
+   * flush carries the latest state.
+   *
+   * The first delta of a burst dispatches immediately so UIs stay responsive;
+   * the rest collapse into one trailing snapshot per interval.
+   */
+  #scheduleDisplayState(): void {
+    if (this.#displayStateTimer) {
+      this.#displayStatePending = true;
+      return;
+    }
+    this.#dispatch({ type: 'display_state_changed', displayState: this.#displayState!.get() });
+    this.#displayStateTimer = setTimeout(() => {
+      this.#displayStateTimer = undefined;
+      this.#flushDisplayState();
+    }, DISPLAY_STATE_COALESCE_MS);
+    // Never hold the process open for a snapshot that only mirrors state.
+    (this.#displayStateTimer as { unref?: () => void }).unref?.();
+  }
+
+  /** Dispatch any snapshot withheld by coalescing and clear the pending timer. */
+  #flushDisplayState(): void {
+    if (this.#displayStateTimer) {
+      clearTimeout(this.#displayStateTimer);
+      this.#displayStateTimer = undefined;
+    }
+    if (!this.#displayStatePending) return;
+    this.#displayStatePending = false;
+    if (this.#displayState) {
       this.#dispatch({ type: 'display_state_changed', displayState: this.#displayState.get() });
     }
   }
@@ -2596,6 +2795,8 @@ export class SessionBus {
 export class Session<TState = unknown> {
   /** This session's event bus. Constructed first so every subsystem can route its events here. */
   readonly #bus = new SessionBus();
+  /** Process-local hooks that must finish before the session exposes a terminal agent event. */
+  readonly #beforeAgentEndListeners = new Set<SessionBeforeAgentEndListener>();
   /** Tool categories the user has granted "allow" for the lifetime of this session. */
   readonly #grantedCategories = new Set<string>();
   /** Individual tool names the user has granted "allow" for the lifetime of this session. */
@@ -2646,7 +2847,7 @@ export class Session<TState = unknown> {
    * filtered back to the session's scope. Empty when the session is unscoped.
    */
   readonly #tags: Record<string, string>;
-  readonly #workspace: Workspace;
+  readonly #workspace: Workspace | undefined;
   browser?: MastraBrowser;
 
   constructor({
@@ -2663,7 +2864,7 @@ export class Session<TState = unknown> {
     id: string;
     ownerId: string;
     tags?: Record<string, string>;
-    workspace: Workspace;
+    workspace?: Workspace;
     browser?: MastraBrowser;
   }) {
     this.#tags = tags && Object.keys(tags).length > 0 ? { ...tags } : {};
@@ -2676,10 +2877,17 @@ export class Session<TState = unknown> {
       clearFollowUps: () => this.followUps.clear(),
     });
     this.#bus.setDisplayState(this.displayState);
-    this.state = new SessionState(state ?? { initialState: {} as TState }, this.#bus);
+    this.state = new SessionState(state ?? { initialState: {} as TState }, this.#bus, () => {
+      // Pin persistence to the thread active when the state update was
+      // requested — a queued preference update must not land in the metadata
+      // of a thread the session switched to in the meantime.
+      const threadId = this.thread.getId();
+      if (threadId === null) return undefined;
+      return args => this.thread.setSettingOn({ threadId, ...args });
+    });
 
-    if (!workspace || !(workspace instanceof Workspace)) {
-      throw new Error(`A session requires a valid workspace instance.`);
+    if (workspace !== undefined && !(workspace instanceof Workspace)) {
+      throw new Error(`A session workspace must be a valid Workspace instance.`);
     }
 
     this.#workspace = workspace;
@@ -2695,13 +2903,29 @@ export class Session<TState = unknown> {
   }
 
   /**
-   * The workspace resolved for this session.
+   * The scope this session's threads carry: what `thread.create()` stamps and
+   * what thread selection filters on. Both must read it here — computing it on
+   * each side is what let selection drift off the controller-global state while
+   * creation stamped the session's own.
+   */
+  getThreadScope(): Record<string, string> {
+    const tags = Object.fromEntries(Object.entries(this.#tags).filter(([key]) => !isReservedThreadMetadataKey(key)));
+    if (Object.keys(tags).length > 0) return tags;
+    const { projectPath } = this.state.get() as { projectPath?: string };
+    return projectPath ? { projectPath } : {};
+  }
+
+  /**
+   * The workspace resolved for this session, or `undefined` when the session
+   * runs without one. A workspace is optional: sessions that only need threads,
+   * state, and agent runs (chat-style usage) do not have to configure
+   * filesystem or sandbox access.
    *
    * Dynamic workspace factories are evaluated independently when each session
    * is created. Use this accessor for operations that must stay bound to the
    * session's workspace rather than resolving through controller-global state.
    */
-  getWorkspace(): Workspace {
+  getWorkspace(): Workspace | undefined {
     return this.#workspace;
   }
 
@@ -2718,6 +2942,27 @@ export class Session<TState = unknown> {
     return this.#bus.subscribe(listener);
   }
 
+  /** Subscribe to work that must complete before the terminal agent event is exposed. */
+  onBeforeAgentEnd(listener: SessionBeforeAgentEndListener): () => void {
+    this.#beforeAgentEndListeners.add(listener);
+    return () => this.#beforeAgentEndListeners.delete(listener);
+  }
+
+  /** Await terminal hooks, then emit the terminal event to subscribers. */
+  async finishAgentRun(
+    reason: NonNullable<Extract<AgentControllerEvent, { type: 'agent_end' }>['reason']>,
+  ): Promise<void> {
+    const event = { type: 'agent_end', reason } as const;
+    for (const listener of this.#beforeAgentEndListeners) {
+      try {
+        await listener(event);
+      } catch (error) {
+        console.error('Error in before-agent-end listener:', error);
+      }
+    }
+    this.emit(event);
+  }
+
   /**
    * Emit an event on this session. Delegates to this session's bus, which folds
    * the event into the canonical display state, dispatches to this session's
@@ -2725,6 +2970,14 @@ export class Session<TState = unknown> {
    */
   emit(event: AgentControllerEvent): void {
     this.#bus.emit(event);
+  }
+
+  /**
+   * Whether this session has any event subscribers. Emitters use this to skip
+   * building per-event snapshots that nothing would read.
+   */
+  hasListeners(): boolean {
+    return this.#bus.hasListeners();
   }
 
   /**
@@ -2806,6 +3059,20 @@ export class Session<TState = unknown> {
     return this.runEngine.processSubscribedThreadStream(subscription);
   }
 
+  /** Bind a caller context to the exact run this signal reserved or joined. */
+  private bindRequestContextToSignal<OUTPUT>(
+    result: Pick<SendAgentSignalResult<OUTPUT>, 'runId' | 'accepted'>,
+    requestContext?: RequestContext,
+  ): void {
+    const generation = this.runEngine.bindRequestContext({ runId: result.runId, requestContext });
+    const clear = () => this.runEngine.clearRequestContext({ runId: result.runId, generation });
+    void result.accepted.then(accepted => {
+      if (accepted.action === 'blocked' || !('runId' in accepted) || accepted.runId !== result.runId) {
+        clear();
+      }
+    }, clear);
+  }
+
   /**
    * The id of the run currently active on this session: the live subscription's
    * active run id when it is streaming, falling back to the last run id the run
@@ -2830,8 +3097,43 @@ export class Session<TState = unknown> {
    * the gated tool is rejected and the run can finalize rather than hang.
    */
   abortRun(): void {
-    this.suspensions.clear();
+    // Aborting twice while a gate is parked would tear the stream down before
+    // the deferred decline lands (the second call sees the gate already
+    // cancelled), which is the exact failure the deferral exists to avoid. Two
+    // `tool_approval_required` subscribers each calling abort() is enough.
+    if (this.run.isAbortRequested()) return;
+
+    // Retract the prompts for every parked suspension. Dropping them silently
+    // left the UI rendering `ask_user` / `request_access` prompts whose answers
+    // could never land, since the run they belong to is gone.
+    for (const { toolCallId, toolName } of this.suspensions.clear()) {
+      this.emit({ type: 'tool_suspension_cancelled', toolCallId, toolName, reason: ABORTED_BY_USER_REASON });
+    }
+
+    // A parked approval gate is special: the agent-side run is still alive and
+    // waiting for the decision, so the gated call must be declined through it
+    // (that is what persists the `output-denied` tool result). Tearing the
+    // stream down first would make that decline fail with "could not find an
+    // active or suspended run". Defer both the stream abort and the abort
+    // signal to the engine, which fires them once the decline has landed.
+    const wasGated = this.approval.isArmed();
     this.approval.cancel();
+    if (wasGated) {
+      this.run.requestAbort({ deferSignal: true });
+      return;
+    }
+
+    this.stream.abort();
+    this.run.requestAbort();
+  }
+
+  /**
+   * Fire the deferred abort teardown for a run that was aborted while parked on
+   * a tool-approval gate: abort the live subscription and the run's controller.
+   * Called by the run engine once the gated call's decline has been driven
+   * through the agent, so the denial is persisted before the run is torn down.
+   */
+  completeDeferredAbort(): void {
     this.stream.abort();
     this.run.requestAbort();
   }
@@ -2886,26 +3188,29 @@ export class Session<TState = unknown> {
   }
 
   /**
-   * Respond to the parked tool-approval gate with the user's decision. A no-op
-   * when nothing is awaiting approval. "always_allow_category" grants the gated
-   * tool's category for the rest of the session (resolved via the injected
-   * {@link setCategoryResolver}) and then approves; "approve"/"decline" release
-   * the run as-is.
+   * Respond to the exact parked tool-approval gate with the user's decision. A
+   * no-op when nothing is awaiting approval or either identity does not match.
+   * "always_allow_category" grants the gated tool's category for the rest of
+   * the session (resolved via the injected {@link setCategoryResolver}) and then
+   * approves; "approve"/"decline" release the run as-is.
    */
   respondToToolApproval({
     decision,
     toolCallId,
+    runId,
     requestContext,
     declineContext,
   }: {
     decision: 'approve' | 'decline' | 'always_allow_category';
-    toolCallId?: string;
+    toolCallId: string;
+    runId: string;
     requestContext?: RequestContext;
     declineContext?: { reason?: string; message?: string };
   }): void {
     this.approval.respond({
       decision,
       toolCallId,
+      runId,
       requestContext,
       declineContext,
       onAlwaysAllow: toolName => {
@@ -3084,14 +3389,23 @@ export class Session<TState = unknown> {
       const agent = this.machinery.getAgent();
       await this.thread.ensureSubscription(threadId);
 
-      if (submittedRunId && submittedActiveRunId && submittedIsRunning) {
-        this.approval.respond({
-          decision: 'decline',
-          declineContext: {
-            reason: 'interrupted_by_user_message',
-            message: 'The pending tool approval was declined because the user sent a new message.',
-          },
-        });
+      // A deferred abort (parked approval gate) leaves the AbortController
+      // armed until the decline lands, so `submittedIsRunning` stays true for a
+      // run that is already on its way out. Routing a signal to it would hand
+      // the message to a run that `completeDeferredAbort()` then terminates.
+      if (!submittedAbortRequested && submittedRunId && submittedActiveRunId && submittedIsRunning) {
+        const pendingToolCallId = this.approval.getToolCallId();
+        if (pendingToolCallId) {
+          this.approval.respond({
+            decision: 'decline',
+            runId: submittedRunId,
+            toolCallId: pendingToolCallId,
+            declineContext: {
+              reason: 'interrupted_by_user_message',
+              message: 'The pending tool approval was declined because the user sent a new message.',
+            },
+          });
+        }
         const result = agent.sendSignal(signal, {
           resourceId: this.identity.getResourceId(),
           threadId,
@@ -3133,6 +3447,7 @@ export class Session<TState = unknown> {
         ifActive,
         ifIdle: { ...ifIdle, streamOptions: streamOptions as any },
       });
+      this.bindRequestContextToSignal(result, requestContextInput);
       if (requireDelivery) {
         // Delivery-guaranteed path: surface the real acceptance decision and
         // propagate routing/stream-setup failures to the caller.
@@ -3161,10 +3476,10 @@ export class Session<TState = unknown> {
   /**
    * Send a notification signal to this session's current agent/thread.
    */
-  async sendNotificationSignal(
+  async sendNotificationSignal<OUTPUT = unknown>(
     input: SendNotificationSignalInput,
-    options: SessionSendNotificationSignalOptions = {},
-  ): Promise<SendAgentNotificationSignalResult> {
+    options: SessionSendNotificationSignalOptions<OUTPUT> = {},
+  ): Promise<SendAgentNotificationSignalResult<OUTPUT>> {
     const { ifActive, ifIdle, requestContext: requestContextInput, tracingContext, tracingOptions } = options;
     if (!this.thread.getId()) {
       const thread = await this.thread.create();
@@ -3176,7 +3491,7 @@ export class Session<TState = unknown> {
     await this.thread.ensureSubscription(threadId);
 
     if (this.run.getRunId() && this.stream.activeRunId()) {
-      return agent.sendNotificationSignal(input, {
+      return agent.sendNotificationSignal<OUTPUT>(input, {
         resourceId: this.identity.getResourceId(),
         threadId,
         ifActive,
@@ -3190,12 +3505,16 @@ export class Session<TState = unknown> {
       tracingOptions,
     });
 
-    return agent.sendNotificationSignal(input, {
+    const result = await agent.sendNotificationSignal<OUTPUT>(input, {
       resourceId: this.identity.getResourceId(),
       threadId,
       ifActive,
       ifIdle: { ...ifIdle, streamOptions: streamOptions as any },
     });
+    if (result.runId && result.accepted) {
+      this.bindRequestContextToSignal({ runId: result.runId, accepted: result.accepted }, requestContextInput);
+    }
+    return result;
   }
 
   /**
@@ -3389,7 +3708,7 @@ export class Session<TState = unknown> {
     } catch (error) {
       const err = getErrorFromUnknown(error);
       this.emit({ type: 'error', error: err });
-      this.emit({ type: 'agent_end', reason: 'error' });
+      await this.finishAgentRun('error');
     }
   }
 
@@ -3446,18 +3765,24 @@ export class Session<TState = unknown> {
       throw new Error('Cannot approve a tool call without a current thread');
     }
     const resourceId = this.identity.getResourceId();
-    await agent.sendToolApproval({
-      threadId,
-      resourceId,
-      runId,
-      toolCallId,
-      approved: true,
-      requireToolApproval: !isYolo,
-      memory: { thread: threadId, resource: resourceId },
-      abortSignal: this.run.ensureAbortController().signal,
-      requestContext,
-      toolsets: await this.machinery.buildToolsets(requestContext),
-    });
+    const requestContextGeneration = this.runEngine.bindRequestContext({ runId, requestContext: requestContextInput });
+    try {
+      await agent.sendToolApproval({
+        threadId,
+        resourceId,
+        runId,
+        toolCallId,
+        approved: true,
+        requireToolApproval: !isYolo,
+        memory: { thread: threadId, resource: resourceId },
+        abortSignal: this.run.ensureAbortController().signal,
+        requestContext,
+        toolsets: await this.machinery.buildToolsets(requestContext),
+      });
+    } catch (error) {
+      this.runEngine.clearRequestContext({ runId, generation: requestContextGeneration });
+      throw error;
+    }
   }
 
   /**
@@ -3486,19 +3811,25 @@ export class Session<TState = unknown> {
       throw new Error('Cannot decline a tool call without a current thread');
     }
     const resourceId = this.identity.getResourceId();
-    await agent.sendToolApproval({
-      threadId,
-      resourceId,
-      runId,
-      toolCallId,
-      approved: false,
-      declineContext,
-      requireToolApproval: !isYolo,
-      memory: { thread: threadId, resource: resourceId },
-      abortSignal: this.run.ensureAbortController().signal,
-      requestContext,
-      toolsets: await this.machinery.buildToolsets(requestContext),
-    });
+    const requestContextGeneration = this.runEngine.bindRequestContext({ runId, requestContext: requestContextInput });
+    try {
+      await agent.sendToolApproval({
+        threadId,
+        resourceId,
+        runId,
+        toolCallId,
+        approved: false,
+        declineContext,
+        requireToolApproval: !isYolo,
+        memory: { thread: threadId, resource: resourceId },
+        abortSignal: this.run.ensureAbortController().signal,
+        requestContext,
+        toolsets: await this.machinery.buildToolsets(requestContext),
+      });
+    } catch (error) {
+      this.runEngine.clearRequestContext({ runId, generation: requestContextGeneration });
+      throw error;
+    }
   }
 
   private createSubscribedResumeBoundaryWaiter(toolCallId?: string): { promise: Promise<void>; cancel: () => void } {
@@ -3561,12 +3892,17 @@ export class Session<TState = unknown> {
       throw new Error('Cannot resume a suspended tool without a current thread');
     }
 
-    await this.thread.ensureSubscription(threadId);
-    const resumedSubscriptionBoundary = this.createSubscribedResumeBoundaryWaiter(
-      suspension.toolName === 'submit_plan' ? toolCallId : undefined,
-    );
+    const requestContextGeneration = this.runEngine.bindRequestContext({
+      runId: suspension.runId,
+      requestContext: requestContextInput,
+    });
+    let resumedSubscriptionBoundary: ReturnType<Session['createSubscribedResumeBoundaryWaiter']> | undefined;
 
     try {
+      await this.thread.ensureSubscription(threadId);
+      resumedSubscriptionBoundary = this.createSubscribedResumeBoundaryWaiter(
+        suspension.toolName === 'submit_plan' ? toolCallId : undefined,
+      );
       const resourceId = this.identity.getResourceId();
       const sharedOptions = this.machinery.buildSharedRunOptions();
       // Interactive builtins suspend to collect user input, not for approval.
@@ -3592,8 +3928,11 @@ export class Session<TState = unknown> {
         },
       });
       await resumedSubscriptionBoundary.promise;
+    } catch (error) {
+      this.runEngine.clearRequestContext({ runId: suspension.runId, generation: requestContextGeneration });
+      throw error;
     } finally {
-      resumedSubscriptionBoundary.cancel();
+      resumedSubscriptionBoundary?.cancel();
     }
   }
 

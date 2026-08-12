@@ -9,7 +9,7 @@ type GuardedResourceUpdate = {
 
 type GuardedThreadUpdate = {
   id: string;
-  title: string;
+  title?: string;
   metadata: Record<string, unknown>;
   guard: ObservationalMemoryWriteGuard;
 };

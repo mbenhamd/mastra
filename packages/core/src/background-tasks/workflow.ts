@@ -108,10 +108,7 @@ export function buildBackgroundTaskWorkflow(manager: BackgroundTaskManager) {
       };
 
       const abortController = new AbortController();
-      manager.activeAbortControllers.set(taskId, abortController);
-      if (manager.isShuttingDown()) {
-        abortController.abort(new Error(BACKGROUND_TASK_SHUTDOWN_ABORT_MESSAGE));
-        manager.activeAbortControllers.delete(taskId);
+      if (!manager.registerActiveAbortController(taskId, abortController)) {
         manager.deregisterTaskContext(taskId);
         return { taskId, done: true };
       }

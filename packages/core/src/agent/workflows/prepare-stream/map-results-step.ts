@@ -240,6 +240,7 @@ export function createMapResultsStep<OUTPUT = undefined>({
       threadId: result.threadId,
       stopWhen: result.stopWhen,
       maxSteps: result.maxSteps,
+      recoveryMaxSteps: options.recoveryMaxSteps,
       providerOptions: result.providerOptions,
       includeRawChunks: options.includeRawChunks,
       experimentalTransform: options.experimentalTransform,

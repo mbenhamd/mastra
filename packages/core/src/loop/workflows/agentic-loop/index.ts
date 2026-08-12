@@ -43,6 +43,7 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
   const accumulatedSteps: StepResult<Tools>[] = [];
   // Track previous content to determine what's new in each step
   let previousContentLength = 0;
+  let previousCallerVisibleContentLength = 0;
   // When continue:false + feedback, allow one more LLM turn then stop
   let pendingFeedbackStop = false;
   // When this loop is a resume (e.g. after tool approval), the suspended run
@@ -168,7 +169,30 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
       const currentContent = allContent.slice(previousContentLength);
       previousContentLength = allContent.length;
 
+      const callerVisibleContent = messageList.getCallerVisibleResponseContent();
+      const currentCallerVisibleContent = callerVisibleContent.slice(previousCallerVisibleContentLength);
+      previousCallerVisibleContentLength = callerVisibleContent.length;
+
       const toolResultParts = currentContent.filter(part => part.type === 'tool-result');
+
+      // The MessageList slice excludes framework feedback by provenance and
+      // preserves approval-resume behavior. If a successful output processor
+      // removed or rewrote earlier narration, that cumulative slice may shift
+      // left and become empty; in that processor-only case, use the completed
+      // step's already-processed content as the current-step authority.
+      const latestCompletedStep = typedInputData.output.steps.at(-1);
+      const processedStepText = latestCompletedStep?.content
+        .filter(part => part.type === 'text')
+        .map(part => part.text)
+        .join('');
+      const projectedStepText = currentCallerVisibleContent
+        .filter(part => part.type === 'text')
+        .map(part => part.text)
+        .join('');
+      const currentIterationText =
+        typedInputData.stepResult?.reason === 'tripwire'
+          ? ''
+          : projectedStepText || (rest.outputProcessors?.length ? (processedStepText ?? '') : '');
 
       const currentStep: StepResult<Tools> = {
         content: currentContent,
@@ -182,7 +206,7 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
           modelId: typedInputData.metadata?.modelId || typedInputData.metadata?.model || '',
           messages: [],
         } as StepResult<Tools>['response'],
-        text: typedInputData.output.text || '',
+        text: currentIterationText,
         reasoning: typedInputData.output.reasoning || [],
         reasoningText: typedInputData.output.reasoningText || '',
         files: typedInputData.output.files || [],
@@ -228,7 +252,7 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
         const iterationContext = {
           iteration: accumulatedSteps.length,
           maxIterations: rest.maxSteps,
-          text: typedInputData.output.text || '',
+          text: currentStep.text,
           toolCalls: (typedInputData.output.toolCalls || []).map((tc: any) => ({
             id: tc.toolCallId || tc.id || '',
             name: tc.toolName || tc.name || '',
@@ -303,7 +327,7 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
               // otherwise the loop re-enters against a sealed message and the
               // extra turn produces nothing caller-visible (live-diagnosed as
               // the silent-turn nudge failing to surface any text).
-              if (rest.maxSteps === undefined || accumulatedSteps.length < rest.maxSteps) {
+              if (rest.maxSteps === undefined || accumulatedSteps.length <= rest.maxSteps) {
                 if (iterationResult.feedback) {
                   messageList.add(
                     {
@@ -350,6 +374,23 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
           // Log error but don't fail the iteration
           rest.logger?.error('Error in onIterationComplete hook:', error);
         }
+      }
+
+      // The hook above may reserve one framework-owned response-only call at
+      // the exact ordinary maxSteps boundary. `maxSteps` still fences every
+      // natural/scorer/background/configured continuation; only a hook-forced
+      // continuation from an otherwise terminal iteration may cross it.
+      const forcedResponseOnlyContinuation =
+        typedInputData.stepResult?.isContinued === true &&
+        rest.maxSteps !== undefined &&
+        rest.recoveryMaxSteps !== undefined &&
+        accumulatedSteps.length >= rest.maxSteps &&
+        accumulatedSteps.length < rest.maxSteps + rest.recoveryMaxSteps;
+      if (forcedResponseOnlyContinuation) {
+        // The AI-SDK-compatible maxSteps stop condition already marked this
+        // iteration complete before the hook ran. Clear only that boundary so
+        // the callback-reserved response call can enter the workflow once.
+        hasFinishedSteps = false;
       }
 
       // Check if a delegation hook called ctx.bail() — stop the loop after this iteration
@@ -407,7 +448,7 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
         return false;
       }
 
-      return typedInputData.stepResult?.isContinued ?? false;
+      return forcedResponseOnlyContinuation || (typedInputData.stepResult?.isContinued ?? false);
     })
     .commit();
 }

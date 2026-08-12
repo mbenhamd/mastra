@@ -4,8 +4,9 @@ import type { Mastra } from '../../../../mastra';
 import { PUBSUB_SYMBOL } from '../../../../workflows/constants';
 import { createStep } from '../../../../workflows/workflow';
 import { MessageList } from '../../../message-list';
+import { ensureRemoteAbortListener } from '../../abort-transport';
 import { DurableStepIds } from '../../constants';
-import { globalRunRegistry } from '../../run-registry';
+import { getBoundRunRegistryEntry } from '../../run-registry';
 import { emitChunkEvent } from '../../stream-adapter';
 
 const SIGNAL_DRAIN_STEP_ID = `${DurableStepIds.AGENTIC_EXECUTION}-signal-drain`;
@@ -29,9 +30,21 @@ export function createDurableSignalDrainStep() {
     execute: async params => {
       const { inputData, getInitData } = params;
       const execOutput = inputData as Record<string, any>;
-      const initData = getInitData<{ runId: string }>();
+      const initData = getInitData<{ runId: string; runtimeBindingId?: string }>();
       const runId = initData.runId;
-      const registryEntry = globalRunRegistry.get(runId);
+      getBoundRunRegistryEntry(runId, initData.runtimeBindingId);
+      const pubsub = (params as any)[PUBSUB_SYMBOL] as PubSub | undefined;
+      if (pubsub) {
+        try {
+          await ensureRemoteAbortListener(pubsub, runId, initData.runtimeBindingId);
+        } catch (error) {
+          params.mastra?.getLogger?.()?.warn?.('Failed to subscribe to cross-process abort requests', {
+            runId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      const registryEntry = getBoundRunRegistryEntry(runId, initData.runtimeBindingId);
       const drainFn = registryEntry?.drainPendingSignals;
 
       if (!drainFn) return execOutput;
@@ -49,7 +62,6 @@ export function createDurableSignalDrainStep() {
           globalThis.crypto?.randomUUID?.() ??
           `msg_${Date.now()}`;
 
-        const pubsub = (params as any)[PUBSUB_SYMBOL] as PubSub | undefined;
         for (const pendingSignal of pendingSignals) {
           const signalForTranscript = drainList.addSignal(pendingSignal);
           if (pubsub) {

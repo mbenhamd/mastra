@@ -347,6 +347,22 @@ export class InngestTestRuntimeManager {
     };
   }
 
+  /** Start the policy-owned runtime without HTTP function registration.
+   * Used by connect-worker tests whose functions register over the gateway.
+   */
+  async start(): Promise<void> {
+    try {
+      await this.ensureRuntimeStarted();
+    } catch (error) {
+      try {
+        await this.stop();
+      } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], 'Inngest runtime startup and cleanup both failed.');
+      }
+      throw error;
+    }
+  }
+
   async ensureReady(expectedFunctionIds: readonly string[] = []): Promise<void> {
     try {
       await this.ensureRuntimeStarted();

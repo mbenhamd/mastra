@@ -332,7 +332,7 @@ export class MastraServer extends MastraServerBase<Application, Request, Respons
           this.mastra.getLogger()?.error('Error writing datastream response', {
             error: err instanceof Error ? { message: err.message, stack: err.stack } : err,
           });
-          void reader.cancel('response write error');
+          void reader.cancel('response write error').catch(() => {});
         };
         response.once('error', onResError);
 
@@ -715,6 +715,14 @@ export class MastraServer extends MastraServerBase<Application, Request, Respons
 
   registerContextMiddleware(): void {
     this.app.use(this.createContextMiddleware());
+    this.app.use((req, res, next) => {
+      const path = String(req.path || '/');
+      const method = String(req.method || 'GET');
+      res.on('finish', () => {
+        this.warnIfUnregisteredChannelWebhook(path, method, res.statusCode);
+      });
+      next();
+    });
   }
 
   registerAuthMiddleware(): void {

@@ -26,9 +26,11 @@ describe('Session step ceiling', () => {
 
     const call = agent.streamCalls.at(-1);
     expect(call).toBeDefined();
-    // The exact value is an internal constant; the invariant is that it exists
-    // and dwarfs the 5-step agent default a missing option would fall back to.
-    expect(call?.options?.maxSteps).toBeGreaterThanOrEqual(1000);
+    // The public and effective ordinary-work budget remain exactly 1000.
+    // Response-only recovery is fenced by the composed hooks, not by raising
+    // the loop's generic maxSteps ceiling.
+    expect(call?.options?.maxSteps).toBe(1000);
+    expect(mergeAgentExecutionOptions({}, call?.options ?? {}).maxSteps).toBe(1000);
   });
 
   it('every recorded run of a multi-turn session carries the ceiling', async () => {
@@ -41,7 +43,8 @@ describe('Session step ceiling', () => {
     const runCalls = agent.streamCalls.filter(call => call.type === 'stream');
     expect(runCalls.length).toBeGreaterThanOrEqual(2);
     for (const call of runCalls) {
-      expect(call.options?.maxSteps).toBeGreaterThanOrEqual(1000);
+      expect(call.options?.maxSteps).toBe(1000);
+      expect(mergeAgentExecutionOptions({}, call.options ?? {}).maxSteps).toBe(1000);
     }
   });
 });
@@ -62,7 +65,8 @@ describe('Session empty-final-synthesis nudge', () => {
         }) => Promise<{ continue?: boolean; feedback?: string } | undefined>)
       | undefined;
     const prepareStep = merged.prepareStep as
-      ((args?: unknown) => Promise<Record<string, unknown> | undefined>) | undefined;
+      | ((args?: unknown) => Promise<Record<string, unknown> | undefined>)
+      | undefined;
     expect(typeof nudge).toBe('function');
     expect(typeof prepareStep).toBe('function');
     return { nudge: nudge!, prepareStep: prepareStep!, harness };
@@ -116,21 +120,42 @@ describe('Session empty-final-synthesis nudge', () => {
     expect(result?.feedback).not.toContain('completed tool actions');
   });
 
-  it('keeps the one-shot synthesis available after more than ten ordinary tool generations', async () => {
-    const { nudge } = await capturedSynthesisOptions();
-    for (let index = 0; index < 12; index += 1) {
-      expect(
-        await nudge({
-          text: `Working on tool step ${index + 1}.`,
-          toolResults: [{ ...toolResult, id: `tc-${index}` }],
-          isFinal: false,
-          finishReason: 'tool-calls',
-        }),
-      ).toBeUndefined();
-    }
-    expect(await nudge({ text: '', toolResults: [], isFinal: true, finishReason: 'stop' })).toMatchObject({
+  it('reserves the only post-ceiling provider call for response-only recovery', async () => {
+    const configuredIteration = vi.fn(async () => ({ continue: true, feedback: 'Keep doing ordinary work.' }));
+    const { nudge, prepareStep } = await capturedSynthesisOptions({ onIterationComplete: configuredIteration });
+    const ceilingContext = {
+      iteration: 1000,
+      maxIterations: 1000,
+      text: '',
+      toolResults: [toolResult],
+      isFinal: true,
+      finishReason: 'stop',
+    };
+
+    // A configured ordinary continuation cannot consume step 1001. The exact
+    // silent terminal arms recovery instead, and that call is tool-free.
+    await expect(nudge(ceilingContext)).resolves.toMatchObject({
       continue: true,
+      feedback: expect.stringContaining('no reply'),
     });
+    await expect(prepareStep({ stepNumber: 1000 })).resolves.toEqual({ activeTools: [], toolChoice: 'none' });
+    await expect(
+      nudge({ ...ceilingContext, iteration: 1001, text: 'Recovered.', toolResults: [], isFinal: true }),
+    ).resolves.toEqual({ continue: false });
+
+    // Without the exact silent-tool terminal, the ceiling remains terminal.
+    const capped = await capturedSynthesisOptions({ onIterationComplete: configuredIteration });
+    await expect(
+      capped.nudge({
+        iteration: 1000,
+        maxIterations: 1000,
+        text: 'Still working.',
+        toolResults: [toolResult],
+        isFinal: false,
+        finishReason: 'tool-calls',
+      }),
+    ).resolves.toMatchObject({ continue: false });
+    await expect(capped.prepareStep({ stepNumber: 1000 })).rejects.toThrow('ordinary step budget exhausted');
   });
 
   it('leaves failed, truncated, and safety-blocked finishes alone and is a fresh closure per turn', async () => {
@@ -245,6 +270,24 @@ describe('Session empty-final-synthesis nudge', () => {
     expect(loggerError).toHaveBeenCalledTimes(2);
     expect(loggerError).toHaveBeenNthCalledWith(1, 'Error in onIterationComplete hook:', hookError);
     expect(loggerError).toHaveBeenNthCalledWith(2, 'Error in onIterationComplete hook:', hookError);
+    loggerError.mockRestore();
+  });
+
+  it('keeps recovery tool-free when configured prepareStep rejects on the recovery call', async () => {
+    const prepareError = new Error('configured prepare failed');
+    const configuredPrepare = vi
+      .fn()
+      .mockResolvedValueOnce({ activeTools: ['create_task'] })
+      .mockRejectedValueOnce(prepareError);
+    const { nudge, prepareStep, harness } = await capturedSynthesisOptions({ prepareStep: configuredPrepare });
+    const loggerError = vi.spyOn(harness.mastra.getLogger(), 'error');
+
+    await expect(prepareStep()).resolves.toEqual({ activeTools: ['create_task'] });
+    await expect(
+      nudge({ text: '', toolResults: [toolResult], isFinal: true, finishReason: 'stop' }),
+    ).resolves.toMatchObject({ continue: true });
+    await expect(prepareStep()).resolves.toEqual({ activeTools: [], toolChoice: 'none' });
+    expect(loggerError).toHaveBeenCalledWith('Error in prepareStep hook:', prepareError);
     loggerError.mockRestore();
   });
 });

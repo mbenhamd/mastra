@@ -146,6 +146,12 @@ describe('internal workflow registry', () => {
       m.__unregisterInternalWorkflow('loop', 'suspended-run');
       expect(m.__hasInternalWorkflow('loop', 'suspended-run')).toBe(false);
     });
+  });
+
+  describe('TTL compatibility', () => {
+    it('retains the documented legacy TTL reference', () => {
+      expect(Mastra.INTERNAL_WORKFLOW_TTL_MS).toBe(30 * 60 * 1000);
+    });
 
     it('does not infer abandonment from registration age', () => {
       vi.useFakeTimers();
@@ -155,7 +161,7 @@ describe('internal workflow registry', () => {
         const fresh = makeWorkflow('fresh-loop');
         m.__registerInternalWorkflow(longRunning, 'long-running-run');
 
-        vi.advanceTimersByTime(30 * 60 * 1000 + 1);
+        vi.advanceTimersByTime(Mastra.INTERNAL_WORKFLOW_TTL_MS + 1);
         m.__registerInternalWorkflow(fresh, 'fresh-run');
 
         expect(m.__getInternalWorkflow('long-running-loop', 'long-running-run')).toBe(longRunning);

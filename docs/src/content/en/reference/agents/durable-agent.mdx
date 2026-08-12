@@ -642,7 +642,7 @@ Returns: [`Promise<DurableAgentStreamResult>`](#durableagentstreamresult)
 ]}
 />
 
-`resume()` and `observe()` accept the same lifecycle callbacks (`onChunk`, `onStepFinish`, `onFinish`, `onError`, `onSuspended`). Durable `resume()` also accepts `toolCallId`, `memory`, `requestContext`, and `versions`; cold recovery verifies these values against the persisted run before execution. `observe()` also accepts an `offset` to control where replay starts.
+`resume()` and `observe()` accept the same lifecycle callbacks (`onChunk`, `onStepFinish`, `onFinish`, `onError`, `onSuspended`). Durable `resume()` also accepts `toolCallId`, `memory`, `requestContext`, and `versions`. Cold recovery verifies these values against the persisted run before execution. `observe()` also accepts an `offset` to control where replay starts.
 
 ## DurableAgentStreamResult
 

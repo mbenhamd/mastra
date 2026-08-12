@@ -83,7 +83,9 @@ Both backends below deliver across processes and hosts and persist events for re
 
 ### Workflow retry ownership
 
-The pub/sub backend owns workflow-event delivery identity and, when supported, the `deliveryAttempt` count. Mastra may execute the source workflow event while that count is within its bounded budget. After the budget is exhausted, later deliveries retry terminal failure propagation only; they don't run the source event again. This keeps the budget stable when another worker claims the event or the receiving process restarts. Backends that don't provide a tracked positive attempt value can't provide this cross-process guarantee.
+The pub/sub backend owns workflow-event delivery identity and, when supported, the `deliveryAttempt` count. Mastra may execute the source workflow event while that count is within its bounded budget. After the budget is exhausted, later deliveries only retry terminal failure propagation instead of running the source event again.
+
+This constraint keeps the budget stable when another worker claims the event or the receiving process restarts, but backends without a tracked positive attempt value can't provide this cross-process guarantee.
 
 If terminal failure publication is temporarily unavailable, or a configured workflow store can't yet observe the durable run snapshot, Mastra calls `nack` and leaves the source event with the backend. A missing snapshot in a configured store isn't treated as proof that the event is stale. When workflow storage isn't configured, Mastra publishes the terminal failure without this stale-state guard. A `workflow.fail` event never publishes another `workflow.fail`; failure processing retries the existing terminal event instead.
 
@@ -93,7 +95,7 @@ This is an at-least-once transport contract. Broker-owned attempts prevent a fre
 
 The workflows storage contract includes an optional, fenced terminalization-journal capability for runtimes that coordinate a terminal workflow outcome across workers. `InMemoryStore` implements it for single-process development and `PostgresStore` implements it with an isolated `mastra_workflow_terminalizations` table. Other adapters report `unsupported` until they implement equivalent atomic operations.
 
-The PostgreSQL journal is separate from the replaceable workflow snapshot. A snapshot rewrite or normal run deletion therefore can't erase an active claim or completed deduplication evidence. Successful acquisition and renewal return an opaque token and a monotonically increasing generation. A worker must present both values to renew, advance, or release the claim; reads and unsuccessful operations redact all active fencing credentials so another worker can't impersonate the owner. An expired takeover receives a new token and generation and permanently fences the stale worker from later journal updates. PostgreSQL evaluates lease expiry with database time, and leases are limited to 24 hours.
+The PostgreSQL journal is separate from the replaceable workflow snapshot. A snapshot rewrite or normal run deletion therefore can't erase an active claim or completed deduplication evidence. Successful acquisition and renewal return an opaque token and a monotonically increasing generation. A worker must present both values to renew, advance, or release the claim. Reads and unsuccessful operations redact all active fencing credentials so another worker can't impersonate the owner. An expired takeover receives a new token and generation and permanently fences the stale worker from later journal updates. PostgreSQL evaluates lease expiry with database time, and leases are limited to 24 hours.
 
 The journal reserves this phase graph for root and nested terminalization:
 
@@ -108,11 +110,11 @@ terminalization_pending
 
 The bracketed parent path is skipped for a root workflow. The journal reserves one first-terminal-wins slot per workflow run, so a competing success, failure, or cancellation returns `terminal_conflict` instead of starting another terminalization.
 
-`persistWorkflowTerminalState` is the only operation that can enter `run_state_persisted`. It replaces the canonical workflow snapshot and advances the journal in one in-memory critical section or PostgreSQL transaction, so the phase can't certify a snapshot that was never written. The canonical snapshot remains replaceable; a later producer-outbox capability must retain immutable recovery evidence before source acknowledgment. Generic phase advancement can't enter snapshot, outbox, or effect-evidence phases; each evidence-producing capability owns its atomic transition.
+`persistWorkflowTerminalState` is the only operation that can enter `run_state_persisted`. It replaces the canonical workflow snapshot and advances the journal in one in-memory critical section or PostgreSQL transaction, so the phase can't certify a snapshot that was never written. The canonical snapshot remains replaceable. A later producer-outbox capability must retain immutable recovery evidence before source acknowledgment. Generic phase advancement can't enter snapshot, outbox, or effect-evidence phases. Each evidence-producing capability owns its atomic transition.
 
-This storage capability is an adapter primitive; configuring a supporting store doesn't by itself change workflow-event execution. A runtime consuming it must fail visibly when durable mode is requested with an unsupported adapter, keep the original event or a durable outbox payload available for recovery, use a stable idempotency key for every external effect, and acknowledge the source event only after `complete`. The journal alone doesn't store an effect payload and doesn't claim exactly-once delivery.
+This storage capability is an adapter primitive, so configuring a supporting store doesn't by itself change workflow-event execution. A runtime consuming it must fail visibly when durable mode is requested with an unsupported adapter and keep the original event or a durable outbox payload available for recovery. It must also use a stable idempotency key for every external effect and acknowledge the source event only after `complete`. The journal alone doesn't store an effect payload and doesn't claim exactly-once delivery.
 
-Completed records deliberately survive normal workflow-run deletion. Delete them only after a retention horizon longer than every broker redelivery and reclaim window; deleting deduplication evidence earlier allows a sufficiently late delivery to acquire the run again.
+Completed records deliberately survive normal workflow-run deletion. Delete them only after a retention horizon longer than every broker redelivery and reclaim window. Deleting deduplication evidence earlier allows a sufficiently late delivery to acquire the run again.
 
 The following example uses [Redis Streams](https://redis.io/docs/latest/develop/data-types/streams/):
 

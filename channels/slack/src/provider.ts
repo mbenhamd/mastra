@@ -113,6 +113,70 @@ export function stripTrailingSlash(url: string): string {
 }
 
 /**
+ * Resolve the per-adapter config applied to the Slack entry in
+ * `AgentChannels.adapters`. Top-level fields on `SlackProviderConfig` win;
+ * the deprecated `adapterConfig` is merged in as a fallback for backwards
+ * compatibility. Undefined values are filtered so they don't clobber the
+ * fallback or preserved options.
+ */
+export function resolveSlackAdapterConfig(channelConfig: SlackProviderConfig): SlackAdapterChannelConfig {
+  // eslint-disable-next-line @typescript-eslint/no-deprecated -- intentional read of deprecated alias for back-compat
+  const {
+    adapterConfig,
+    cors,
+    gateway,
+    formatError,
+    streaming: topLevelStreaming,
+    textFormat,
+    typingStatus,
+    toolDisplay: topLevelToolDisplay,
+    cards: topLevelCards,
+    formatToolCall: topLevelFormatToolCall,
+  } = channelConfig;
+  const topLevel = {
+    cors,
+    gateway,
+    formatError,
+    streaming: topLevelStreaming,
+    textFormat,
+    typingStatus,
+    toolDisplay: topLevelToolDisplay,
+    cards: topLevelCards,
+    formatToolCall: topLevelFormatToolCall,
+  };
+  const filteredTopLevel = Object.fromEntries(Object.entries(topLevel).filter(([, value]) => value !== undefined));
+  const filteredAdapterConfig = Object.fromEntries(
+    Object.entries(adapterConfig ?? {}).filter(([, value]) => value !== undefined),
+  );
+  // SlackProvider opinionated defaults — these render well in Slack's AI Assistant UI
+  // but aren't appropriate for every platform, so they live here rather than in core.
+  //   - `streaming: true`         — Slack supports native message streaming.
+  //   - `toolDisplay: 'grouped'`  — tools collapse into a single "Thinking Steps" widget (streaming only).
+  // Users can opt out of any of these by passing the field at the top level (or via `adapterConfig`).
+  // Keep in sync with the `@default` JSDoc on `SlackAdapterChannelConfig` in ./types.ts.
+  const merged = { ...filteredAdapterConfig, ...filteredTopLevel } as Partial<SlackAdapterChannelConfig> & {
+    cards?: boolean;
+    formatToolCall?: LegacyFormatToolCall;
+  };
+  const streaming = merged.streaming ?? true;
+  // Map deprecated fields before applying Slack's default, while preserving an
+  // explicit modern toolDisplay as the authoritative value.
+  const { cards: deprecatedCards, formatToolCall: deprecatedFormatToolCall, ...rest } = merged;
+  const mappedToolDisplay = mapLegacyToolDisplay({
+    toolDisplay: rest.toolDisplay,
+    cards: deprecatedCards,
+    formatToolCall: deprecatedFormatToolCall,
+  });
+  // `'grouped'` requires streaming; fall back to `'cards'` when streaming is off.
+  const toolDisplay = mappedToolDisplay ?? (streaming ? 'grouped' : 'cards');
+  return {
+    ...rest,
+    streaming,
+    toolDisplay,
+  } as SlackAdapterChannelConfig;
+}
+
+/**
  * Create a hash of the agent config for change detection.
  * Uses the resolved app name (config.name ?? agentName) to detect renames.
  */
@@ -180,6 +244,9 @@ export class SlackProvider implements ChannelProvider {
 
   /** SlackAdapter instances keyed by installation ID */
   readonly #adapters = new Map<string, SlackAdapter>();
+
+  /** Serialize close/create/initialize/install transitions for each channel owner. */
+  readonly #channelTransitions = new WeakMap<object, Promise<AgentChannels>>();
 
   #mastra?: Mastra;
   #baseUrl?: string;
@@ -751,11 +818,19 @@ export class SlackProvider implements ChannelProvider {
     // messages into controller sessions via AgentControllerChannels; plain
     // agents route into the agent via AgentChannels.
     if (controller && this.#mastra) {
-      const controllerChannels = await this.#createAgentControllerChannels(controller, adapter);
-      await controllerChannels.initialize(this.#mastra);
+      await this.#resolveOwnerChannels(
+        controller,
+        () => controller.getChannels(),
+        adapter,
+        () => this.#createAgentControllerChannels(controller, adapter),
+      );
     } else if (agent && this.#mastra) {
-      const agentChannels = this.#createAgentChannels(agent, adapter);
-      await agentChannels.initialize(this.#mastra);
+      await this.#resolveOwnerChannels(
+        agent,
+        () => agent.getChannels(),
+        adapter,
+        () => this.#createAgentChannels(agent, adapter),
+      );
     }
   }
 
@@ -855,69 +930,41 @@ export class SlackProvider implements ChannelProvider {
     return Object.fromEntries(Object.entries(candidate).filter(([, value]) => value !== undefined));
   }
 
-  /**
-   * Resolve the per-adapter config applied to the Slack entry in
-   * `AgentChannels.adapters`. Top-level fields on `SlackProviderConfig` win;
-   * the deprecated `adapterConfig` is merged in as a fallback for backwards
-   * compatibility. Undefined values are filtered so they don't clobber the
-   * fallback or preserved options.
-   */
+  /** See {@link resolveSlackAdapterConfig}. */
   #resolveSlackAdapterConfig(): SlackAdapterChannelConfig {
-    /* eslint-disable @typescript-eslint/no-deprecated -- intentional read of deprecated aliases for back-compat */
-    const {
-      adapterConfig,
-      cors,
-      gateway,
-      formatError,
-      streaming: topLevelStreaming,
-      typingStatus,
-      toolDisplay: topLevelToolDisplay,
-      cards: topLevelCards,
-      formatToolCall: topLevelFormatToolCall,
-    } = this.#channelConfig;
-    const topLevel = {
-      cors,
-      gateway,
-      formatError,
-      streaming: topLevelStreaming,
-      typingStatus,
-      toolDisplay: topLevelToolDisplay,
-      cards: topLevelCards,
-      formatToolCall: topLevelFormatToolCall,
-    };
-    const filteredTopLevel = Object.fromEntries(Object.entries(topLevel).filter(([, value]) => value !== undefined));
-    const filteredAdapterConfig = Object.fromEntries(
-      Object.entries(adapterConfig ?? {}).filter(([, value]) => value !== undefined),
-    );
-    // SlackProvider opinionated defaults — these render well in Slack's AI Assistant UI
-    // but aren't appropriate for every platform, so they live here rather than in core.
-    //   - `streaming: true`         — Slack supports native message streaming.
-    //   - `toolDisplay: 'grouped'`  — tools collapse into a single "Thinking Steps" widget (streaming only).
-    // Users can opt out of any of these by passing the field at the top level (or via `adapterConfig`).
-    // Keep in sync with the `@default` JSDoc on `SlackAdapterChannelConfig` in ./types.ts.
-    const merged = { ...filteredAdapterConfig, ...filteredTopLevel } as Partial<SlackAdapterChannelConfig> & {
-      cards?: boolean;
-      formatToolCall?: LegacyFormatToolCall;
-    };
-    const streaming = merged.streaming ?? true;
-    // §back-compat — map the deprecated `cards` / `formatToolCall` fields onto the
-    // current `toolDisplay` path BEFORE applying the Slack default, so a consumer that
-    // still passes only a legacy field gets its faithful behavior (not the `'grouped'`
-    // default). The shim mirrors the core `resolveToolDisplay` semantics.
-    const { cards: deprecatedCards, formatToolCall: deprecatedFormatToolCall, ...rest } = merged;
-    const mappedToolDisplay = mapLegacyToolDisplay({
-      toolDisplay: rest.toolDisplay,
-      cards: deprecatedCards,
-      formatToolCall: deprecatedFormatToolCall,
+    return resolveSlackAdapterConfig(this.#channelConfig);
+  }
+
+  /**
+   * Return the current matching channels or serialize one complete replacement
+   * transition for this owner. The lock covers close, construction,
+   * initialization, and installation so concurrent webhook requests cannot
+   * leak an initialized loser.
+   */
+  async #resolveOwnerChannels<TChannels extends AgentChannels>(
+    owner: object,
+    getCurrent: () => TChannels | null | undefined,
+    adapter: SlackAdapter,
+    replace: () => Promise<TChannels>,
+  ): Promise<TChannels> {
+    const current = getCurrent();
+    if (current?.adapters.slack === adapter) return current;
+
+    const previous = this.#channelTransitions.get(owner);
+    const transition = (previous ? previous.catch(() => undefined) : Promise.resolve(undefined)).then(async () => {
+      const latest = getCurrent();
+      if (latest?.adapters.slack === adapter) return latest;
+      return replace();
     });
-    // `'grouped'` requires streaming; fall back to `'cards'` when streaming is off.
-    const toolDisplay = mappedToolDisplay ?? (streaming ? 'grouped' : 'cards');
-    return {
-      ...rest,
-      streaming,
-      toolDisplay,
-    } as SlackAdapterChannelConfig;
-    /* eslint-enable @typescript-eslint/no-deprecated */
+    this.#channelTransitions.set(owner, transition);
+
+    try {
+      return await transition;
+    } finally {
+      if (this.#channelTransitions.get(owner) === transition) {
+        this.#channelTransitions.delete(owner);
+      }
+    }
   }
 
   /**
@@ -930,7 +977,7 @@ export class SlackProvider implements ChannelProvider {
    * existing instance first so any persistent thread subscriptions from the
    * previous instance are torn down before we replace it.
    */
-  #createAgentChannels(agent: any, adapter: SlackAdapter): AgentChannels {
+  async #createAgentChannels(agent: any, adapter: SlackAdapter): Promise<AgentChannels> {
     const adapterConfig = this.#resolveSlackAdapterConfig();
     // The spread merges fields from a SlackAdapterChannelConfig union; TS can't
     // confirm which branch the runtime object satisfies, but the merge always
@@ -940,13 +987,19 @@ export class SlackProvider implements ChannelProvider {
       | SlackAdapter;
     const existing = agent.getChannels() as AgentChannels | undefined;
     const existingConfig = existing?.channelConfig;
-    existing?.close();
+    await existing?.close();
     const agentChannels = new AgentChannels({
       ...existingConfig,
       ...this.#forwardedChannelOptions(),
       adapters: { ...existingConfig?.adapters, slack: slackEntry },
       userName: agent.name,
     });
+    try {
+      await agentChannels.initialize(this.#mastra!);
+    } catch (error) {
+      await agentChannels.close();
+      throw error;
+    }
     agent.setChannels(agentChannels);
     return agentChannels;
   }
@@ -985,6 +1038,12 @@ export class SlackProvider implements ChannelProvider {
       adapters: { ...existingConfig?.adapters, slack: slackEntry },
       userName: controller.id,
     });
+    try {
+      await controllerChannels.initialize(this.#mastra!);
+    } catch (error) {
+      await controllerChannels.close();
+      throw error;
+    }
     controller.setChannels(controllerChannels);
     return controllerChannels;
   }
@@ -1011,12 +1070,12 @@ export class SlackProvider implements ChannelProvider {
         console.error(`[Slack] Agent controller "${installation.agentId}" not found`);
         return null;
       }
-      let channels = controller.getChannels();
-      if (!channels || channels.adapters.slack !== currentAdapter) {
-        channels = await this.#createAgentControllerChannels(controller, currentAdapter);
-        await channels.initialize(this.#mastra);
-      }
-      return channels;
+      return this.#resolveOwnerChannels(
+        controller,
+        () => controller.getChannels(),
+        currentAdapter,
+        () => this.#createAgentControllerChannels(controller, currentAdapter),
+      );
     }
 
     const agent = this.#resolveAgent(installation.agentId);
@@ -1024,12 +1083,12 @@ export class SlackProvider implements ChannelProvider {
       console.error(`[Slack] Agent "${installation.agentId}" not found`);
       return null;
     }
-    let channels = agent.getChannels();
-    if (!channels || channels.adapters.slack !== currentAdapter) {
-      channels = this.#createAgentChannels(agent, currentAdapter);
-      await channels.initialize(this.#mastra);
-    }
-    return channels;
+    return this.#resolveOwnerChannels(
+      agent,
+      () => agent.getChannels(),
+      currentAdapter,
+      () => this.#createAgentChannels(agent, currentAdapter),
+    );
   }
 
   /**

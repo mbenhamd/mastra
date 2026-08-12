@@ -149,6 +149,8 @@ export interface RunLoopScenarioOptions {
    * `stopWhen` can terminate earlier if its predicate is satisfied.
    */
   maxSteps?: number;
+  /** Internal test-only recovery calls available after maxSteps. */
+  recoveryMaxSteps?: number;
   /**
    * Provider-specific options forwarded to `agent.stream({ providerOptions })`.
    * These land in the model request and can include provider-specific metadata
