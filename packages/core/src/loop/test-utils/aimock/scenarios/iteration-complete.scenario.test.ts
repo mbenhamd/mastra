@@ -551,6 +551,49 @@ describeForAllEngines(
       expect(text).not.toContain('UNEXPECTED_THIRD_CALL');
     });
 
+    it('does not continue when the recovery hook aborts the run', async () => {
+      const abortController = new AbortController();
+      let responseOnly = false;
+      const recoveryTool = createTool({
+        id: 'abort_recovery_tool',
+        description: 'Run work before recovery',
+        inputSchema: z.object({}),
+        outputSchema: z.object({ ok: z.boolean() }),
+        execute: async () => ({ ok: true }),
+      });
+
+      const { requests } = await runLoopScenario({
+        engine,
+        llm: getMock(),
+        prompt: 'Run work, then recover.',
+        tools: { abort_recovery_tool: recoveryTool },
+        maxSteps: 1,
+        recoveryMaxSteps: 1,
+        abortSignal: abortController.signal,
+        prepareStep: () => (responseOnly ? { activeTools: [], toolChoice: 'none' } : undefined),
+        onIterationComplete: context => {
+          if (context.isFinal && context.toolResults.length > 0) {
+            responseOnly = true;
+            abortController.abort();
+            return {
+              continue: true,
+              [AGENT_RESPONSE_RECOVERY_CONTINUATION]: true,
+            };
+          }
+          return undefined;
+        },
+        fixtures: llm => {
+          llm.on(
+            { endpoint: 'chat', sequenceIndex: 0 },
+            { toolCalls: [{ id: 'abort-recovery-call', name: 'abort_recovery_tool', arguments: {} }] },
+          );
+          llm.on({ endpoint: 'chat', sequenceIndex: 1 }, { content: 'UNEXPECTED_ABORTED_RECOVERY' });
+        },
+      });
+
+      expect(requests).toHaveLength(1);
+    });
+
     it('does not spend recoveryMaxSteps on an ordinary continued tool iteration', async () => {
       let toolExecutions = 0;
       const ordinaryTool = createTool({

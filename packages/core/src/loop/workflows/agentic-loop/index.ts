@@ -278,7 +278,8 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
         try {
           const iterationResult = await rest.onIterationComplete(iterationContext);
           const reservesResponseRecovery =
-            iterationResult?.[AGENT_RESPONSE_RECOVERY_CONTINUATION] === true &&
+            iterationResult?.continue === true &&
+            iterationResult[AGENT_RESPONSE_RECOVERY_CONTINUATION] === true &&
             rest.maxSteps !== undefined &&
             rest.recoveryMaxSteps !== undefined &&
             accumulatedSteps.length >= rest.maxSteps &&
@@ -389,8 +390,7 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
       // the exact ordinary maxSteps boundary. `maxSteps` still fences every
       // natural/scorer/background/configured continuation; only a hook-forced
       // continuation from an otherwise terminal iteration may cross it.
-      const forcedResponseOnlyContinuation =
-        responseRecoveryReserved && typedInputData.stepResult?.isContinued === true;
+      let forcedResponseOnlyContinuation = responseRecoveryReserved && typedInputData.stepResult?.isContinued === true;
       responseRecoveryReserved = false;
       if (forcedResponseOnlyContinuation) {
         // The AI-SDK-compatible maxSteps stop condition already marked this
@@ -410,6 +410,7 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
       // race or reaches persistence through the final stream state.
       if (rest.options?.abortSignal?.aborted) {
         typedInputData.terminalToolResult = undefined;
+        forcedResponseOnlyContinuation = false;
         hasFinishedSteps = true;
         if (typedInputData.stepResult) {
           typedInputData.stepResult.reason = 'abort';
@@ -421,6 +422,7 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
       // terminal iteration but cannot spend another provider call by forcing it
       // to continue.
       if (typedInputData.terminalToolResult) {
+        forcedResponseOnlyContinuation = false;
         hasFinishedSteps = true;
       }
 

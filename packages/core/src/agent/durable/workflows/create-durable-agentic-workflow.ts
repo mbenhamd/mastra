@@ -3,7 +3,7 @@ import { ErrorCategory, ErrorDomain, MastraError } from '../../../error';
 import type { MastraScorer, MastraScorerEntry } from '../../../evals/base';
 import { runScorer } from '../../../evals/hooks';
 import type { PubSub } from '../../../events/pubsub';
-import { validateMaxSteps } from '../../../llm/model/max-steps';
+import { validateMaxSteps, validateRecoveryMaxSteps } from '../../../llm/model/max-steps';
 import type { IMastraLogger } from '../../../logger';
 import { outputProcessorsOwnTerminalPersistence } from '../../../loop/shared/terminal-tool-result';
 import { pruneAgentLoopSnapshot } from '../../../loop/workflows/prune-snapshot';
@@ -65,6 +65,8 @@ import {
 export interface DurableAgenticWorkflowOptions {
   /** Maximum number of agentic loop iterations */
   maxSteps?: number;
+  /** Internal response-recovery calls available beyond maxSteps. */
+  recoveryMaxSteps?: number;
   /** Server-side lifecycle callback for the outer durable-agent workflow. */
   onFinish?: WorkflowOptions['onFinish'];
 }
@@ -134,6 +136,7 @@ type IterationState = z.infer<typeof iterationStateSchema>;
  */
 export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOptions, logger?: IMastraLogger) {
   validateMaxSteps(options?.maxSteps, logger);
+  validateRecoveryMaxSteps(options?.recoveryMaxSteps, logger);
 
   const maxSteps = options?.maxSteps ?? DurableAgentDefaults.MAX_STEPS;
 
@@ -345,6 +348,7 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
         async ({ inputData }) => {
           const input = inputData as DurableAgenticWorkflowInput;
           validateMaxSteps(input.options?.maxSteps, logger);
+          validateRecoveryMaxSteps(input.options?.recoveryMaxSteps, logger);
           const iterationState: IterationState = {
             ...input,
             iterationCount: 0,
@@ -542,6 +546,7 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
               // (pendingFeedbackStop, delegationBailed) are unconditional —
               // onIterationComplete cannot override them.
               const canUseRecoveryTurn =
+                iterationResult.continue === true &&
                 iterationResult[AGENT_RESPONSE_RECOVERY_CONTINUATION] === true &&
                 recoveryMaxSteps > 0 &&
                 state.iterationCount >= runMaxSteps &&

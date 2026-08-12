@@ -217,7 +217,7 @@ export type LoopOptions<TOOLS extends ToolSet = ToolSet, OUTPUT = undefined> = {
   experimental_generateMessageId?: () => string;
   stopWhen?: StopCondition | Array<StopCondition>;
   maxSteps?: number;
-  /** Internal provider calls reserved for hook-forced recovery after maxSteps. */
+  /** Internal provider calls reserved for hook-forced recovery after maxSteps; ignored when maxSteps is unset. */
   recoveryMaxSteps?: number;
   _internal?: StreamInternal;
   structuredOutput?: StructuredOutputOptions<OUTPUT>;
