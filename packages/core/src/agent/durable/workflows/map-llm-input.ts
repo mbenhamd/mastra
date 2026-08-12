@@ -15,6 +15,7 @@ export function mapDurableIterationToLLMInput(state: DurableAgenticWorkflowInput
     modelConfig: state.modelConfig,
     modelList: state.modelList,
     options: state.options,
+    responseRecoveryPhase: state.responseRecoveryPhase,
     state: state.state,
     messageId: state.messageId,
     stepIndex: state.iterationCount ?? state.stepIndex,

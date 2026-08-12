@@ -85,6 +85,7 @@ const durableLLMInputSchema = z.object({
   // Model list for fallback support (when agent configured with array of models)
   modelList: z.array(modelListEntrySchema).optional(),
   options: z.any(),
+  responseRecoveryPhase: z.enum(['reserved', 'consumed']).optional(),
   state: z.any(),
   messageId: z.string(),
   // Agent span data for model span parenting
@@ -120,6 +121,7 @@ const durableLLMOutputSchema = z.object({
   processorRetryCount: z.number().optional(),
   processorRetryFeedback: z.string().optional(),
   state: z.any(),
+  responseRecoveryPhase: z.enum(['reserved', 'consumed']).optional(),
   // Step index used in this execution (for tracking)
   stepIndex: z.number().optional(),
   // Exported span data forwarded to downstream steps for trace nesting/closing
@@ -163,6 +165,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
       const typedInput = inputData as DurableAgenticWorkflowInput;
       const { agentId, messageId, options: execOptions } = typedInput;
       const runId = typedInput.runId;
+      const responseRecoveryReserved = typedInput.responseRecoveryPhase === 'reserved';
       const logger = mastra?.getLogger?.();
 
       // 1. Resolve runtime dependencies (tools from Mastra)
@@ -283,7 +286,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
       // 3. Build the model list - either from explicit list or single model
       // For single model case (no modelList), we use the resolved model directly
       // which supports mock models and directly-provided models
-      const modelList = hasModelList
+      const resolvedExecutionModels = hasModelList
         ? typedInput.modelList!.filter(m => m.enabled)
         : [
             {
@@ -293,6 +296,8 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
               enabled: true,
             },
           ];
+      // A reserved recovery owns one request, not a new retry/fallback budget.
+      const modelList = responseRecoveryReserved ? resolvedExecutionModels.slice(0, 1) : resolvedExecutionModels;
 
       if (modelList.length === 0) {
         throw new Error('No enabled models available for execution');
@@ -307,7 +312,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
 
       for (let modelIndex = 0; modelIndex < modelList.length; modelIndex++) {
         const modelEntry = modelList[modelIndex]!;
-        const maxRetries = modelEntry.maxRetries || 0;
+        const maxRetries = responseRecoveryReserved ? 0 : modelEntry.maxRetries || 0;
 
         for (let attempt = 0; attempt <= maxRetries; attempt++) {
           try {
@@ -352,7 +357,8 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                 Object.keys(currentTools),
               );
               currentToolChoice = enforceToolChoiceFence(currentToolChoice as any, toolSurfaceFence) as
-                ToolChoice<ToolSet> | undefined;
+                | ToolChoice<ToolSet>
+                | undefined;
             }
             let currentModelSettings: Record<string, unknown> = { ...(execOptions.modelSettings ?? {}) };
             let currentProviderOptions: SharedProviderOptions | undefined = mergeProviderOptions(
@@ -369,7 +375,8 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
             // after a resume the registry override points steps at the resumed generation.
             const inputModelSpanData = (getBoundRunRegistryEntry(runId, typedInput.runtimeBindingId)
               ?.resumeModelSpanData ?? (inputData as any).modelSpanData) as
-              ExportedSpan<SpanType.MODEL_GENERATION> | undefined;
+              | ExportedSpan<SpanType.MODEL_GENERATION>
+              | undefined;
             const modelSpan = inputModelSpanData
               ? (observability?.rebuildSpan(inputModelSpanData) as AIModelGenerationSpan | undefined)
               : undefined;
@@ -477,7 +484,8 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                 try {
                   currentActiveTools = enforceActiveToolsFence(merged.activeTools, reconstructibleToolSurface);
                   currentToolChoice = enforceToolChoiceFence(merged.toolChoice as any, reconstructibleToolSurface) as
-                    ToolChoice<ToolSet> | undefined;
+                    | ToolChoice<ToolSet>
+                    | undefined;
                 } catch (error) {
                   selectionControlError = error;
                   hasSelectionControlError = true;
@@ -795,6 +803,11 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
               }
             }
 
+            // Recovery must perform the one freshly fenced request. A cache
+            // response was produced under an earlier tool surface and cannot
+            // consume or stand in for this reserved call.
+            if (responseRecoveryReserved) cachedResponse = undefined;
+
             // processLLMRequest runs after processInputStep and may share the
             // same processor instance. Re-check the already-plain surface at
             // the last processor boundary so a retained reference cannot
@@ -823,6 +836,16 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                 reconstructibleToolSurface,
                 reconstructibleVisibleToolNames,
               ) as ToolChoice<ToolSet> | undefined;
+            }
+
+            // The durable checkpoint, not a process-local prepareStep closure, owns
+            // the response-only recovery fence. Apply it after every configured
+            // processor surface has composed its selection so cold workers cannot
+            // regain tools. The provider call consumes the reservation regardless
+            // of whether the provider complies.
+            if (responseRecoveryReserved) {
+              currentActiveTools = [];
+              currentToolChoice = 'none';
             }
 
             // Enable defer mode - step-finish won't auto-close the step span
@@ -1504,7 +1527,10 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
 
               // Try processAPIError before deciding retry/break
               const registryEntryInner = getBoundRunRegistryEntry(runId, typedInput.runtimeBindingId);
-              const canRetryErrorInner = maxProcessorRetries !== undefined && processorRetryCount < maxProcessorRetries;
+              const canRetryErrorInner =
+                !responseRecoveryReserved &&
+                maxProcessorRetries !== undefined &&
+                processorRetryCount < maxProcessorRetries;
               if (registryEntryInner?.errorProcessors?.length && canRetryErrorInner) {
                 try {
                   const runner = new ProcessorRunner({
@@ -1693,7 +1719,13 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
             }
 
             // 13. Determine if we should continue (has tool calls)
-            const isContinued = toolCalls.length > 0 && finishReason !== 'stop';
+            // A response-only provider violation is terminal evidence, never an
+            // executable call. Keep it model-visible in the reconstructed message
+            // but clear the durable execution projection before foreach.
+            if (responseRecoveryReserved && toolCalls.length > 0) {
+              toolCalls.length = 0;
+            }
+            const isContinued = !responseRecoveryReserved && toolCalls.length > 0 && finishReason !== 'stop';
             const hasToolCalls = toolCalls.length > 0;
 
             // 13.5. Run processOutputStep for output processors (runs AFTER LLM response, BEFORE tool execution)
@@ -1851,6 +1883,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                 request,
               },
               state: typedInput.state,
+              ...(responseRecoveryReserved ? { responseRecoveryPhase: 'consumed' as const } : {}),
               // Pass span data so tool calls can be children of model_step
               modelSpanData: hasToolCalls ? modelSpan?.exportSpan?.() : undefined,
               stepSpanData,
@@ -1923,6 +1956,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                 },
                 metadata: { modelId: modelEntry.config.modelId },
                 state: typedInput.state,
+                ...(responseRecoveryReserved ? { responseRecoveryPhase: 'consumed' as const } : {}),
               } satisfies DurableLLMStepOutput;
             }
 
@@ -1938,7 +1972,10 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
             // rejections that throw before the stream opens). Stream-level
             // errors are already handled in the inner catch above.
             const registryEntry = getBoundRunRegistryEntry(runId, typedInput.runtimeBindingId);
-            const canRetryError = maxProcessorRetries !== undefined && processorRetryCount < maxProcessorRetries;
+            const canRetryError =
+              !responseRecoveryReserved &&
+              maxProcessorRetries !== undefined &&
+              processorRetryCount < maxProcessorRetries;
             if (registryEntry?.errorProcessors?.length && canRetryError) {
               try {
                 const runner = new ProcessorRunner({

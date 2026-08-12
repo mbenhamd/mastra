@@ -59,6 +59,7 @@ const durableLLMMappingOutputSchema = z.object({
   deferredStepFinishChunk: z.any().optional(),
   processorRetryCount: z.number().optional(),
   processorRetryFeedback: z.string().optional(),
+  responseRecoveryPhase: z.enum(['reserved', 'consumed']).optional(),
 });
 
 /**
@@ -429,6 +430,7 @@ export function createDurableLLMMappingStep() {
           ...state,
           threadExists: state.threadExists,
         },
+        responseRecoveryPhase: llmOutput.responseRecoveryPhase,
         processorRetryCount: llmOutput.processorRetryCount,
         processorRetryFeedback: llmOutput.processorRetryFeedback,
         delegationBailed,

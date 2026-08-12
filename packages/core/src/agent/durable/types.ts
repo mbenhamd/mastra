@@ -278,6 +278,8 @@ export interface SerializableDurableOptions {
  * Main input schema for the durable agentic workflow
  * This is fully serializable and flows through workflow state
  */
+export type DurableResponseRecoveryPhase = 'reserved' | 'consumed';
+
 export interface DurableAgenticWorkflowInput {
   /** Discriminator field to identify durable agent workflows */
   __workflowKind: 'durable-agent';
@@ -312,6 +314,8 @@ export interface DurableAgenticWorkflowInput {
   scorers?: SerializableScorersConfig;
   /** Serializable execution options */
   options: SerializableDurableOptions;
+  /** Framework-owned response-only call state; never contains user callbacks or tool implementations. */
+  responseRecoveryPhase?: DurableResponseRecoveryPhase;
   /** Serializable internal state */
   state: SerializableDurableState;
   /** Message ID for the current generation */
@@ -372,6 +376,8 @@ export interface DurableLLMStepOutput {
   processorRetryFeedback?: string;
   /** Updated serializable state */
   state: SerializableDurableState;
+  /** Consumed response-only call state propagated across the durable step boundary. */
+  responseRecoveryPhase?: DurableResponseRecoveryPhase;
   /** Exported model_generation span data (only set when there are tool calls) */
   modelSpanData?: unknown;
   /** Exported model_step span data (only set when there are tool calls) */
@@ -466,6 +472,8 @@ export interface DurableAgenticExecutionOutput {
   };
   /** Updated state */
   state: SerializableDurableState;
+  /** Framework-owned response-only call state propagated into the next iteration checkpoint. */
+  responseRecoveryPhase?: DurableResponseRecoveryPhase;
   /** Processor retry tracking */
   processorRetryCount?: number;
   processorRetryFeedback?: string;
@@ -505,7 +513,14 @@ export interface DurableAgenticLoopOutput {
  * Event types emitted via pubsub for agent streaming
  */
 export type AgentStreamEventType =
-  'chunk' | 'step-start' | 'step-finish' | 'finish' | 'error' | 'suspended' | 'abort' | 'iteration-complete';
+  | 'chunk'
+  | 'step-start'
+  | 'step-finish'
+  | 'finish'
+  | 'error'
+  | 'suspended'
+  | 'abort'
+  | 'iteration-complete';
 
 /**
  * Event emitted via pubsub for agent streaming

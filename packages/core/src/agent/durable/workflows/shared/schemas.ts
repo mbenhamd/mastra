@@ -39,6 +39,8 @@ export const modelListEntrySchema = z.object({
 /**
  * Schema for accumulated usage across iterations
  */
+export const durableResponseRecoveryPhaseSchema = z.enum(['reserved', 'consumed']);
+
 export const accumulatedUsageSchema = z.object({
   inputTokens: z.number(),
   outputTokens: z.number(),
@@ -95,6 +97,7 @@ export const baseDurableAgenticInputSchema = z.object({
   toolsMetadata: z.array(z.any()),
   modelConfig: modelConfigSchema,
   options: z.any(),
+  responseRecoveryPhase: durableResponseRecoveryPhaseSchema.optional(),
   state: z.any(),
   messageId: z.string(),
 });
@@ -119,6 +122,7 @@ export const baseIterationStateSchema = z.object({
   toolsMetadata: z.array(z.any()),
   modelConfig: z.any(),
   options: z.any(),
+  responseRecoveryPhase: durableResponseRecoveryPhaseSchema.optional(),
   state: z.any(),
   messageId: z.string(),
   // Iteration tracking
