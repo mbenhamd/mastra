@@ -65,8 +65,7 @@ describe('Session empty-final-synthesis nudge', () => {
         }) => Promise<{ continue?: boolean; feedback?: string } | undefined>)
       | undefined;
     const prepareStep = merged.prepareStep as
-      | ((args?: unknown) => Promise<Record<string, unknown> | undefined>)
-      | undefined;
+      ((args?: unknown) => Promise<Record<string, unknown> | undefined>) | undefined;
     expect(typeof nudge).toBe('function');
     expect(typeof prepareStep).toBe('function');
     return { nudge: nudge!, prepareStep: prepareStep!, harness };

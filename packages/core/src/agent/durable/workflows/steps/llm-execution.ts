@@ -352,8 +352,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                 Object.keys(currentTools),
               );
               currentToolChoice = enforceToolChoiceFence(currentToolChoice as any, toolSurfaceFence) as
-                | ToolChoice<ToolSet>
-                | undefined;
+                ToolChoice<ToolSet> | undefined;
             }
             let currentModelSettings: Record<string, unknown> = { ...(execOptions.modelSettings ?? {}) };
             let currentProviderOptions: SharedProviderOptions | undefined = mergeProviderOptions(
@@ -370,8 +369,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
             // after a resume the registry override points steps at the resumed generation.
             const inputModelSpanData = (getBoundRunRegistryEntry(runId, typedInput.runtimeBindingId)
               ?.resumeModelSpanData ?? (inputData as any).modelSpanData) as
-              | ExportedSpan<SpanType.MODEL_GENERATION>
-              | undefined;
+              ExportedSpan<SpanType.MODEL_GENERATION> | undefined;
             const modelSpan = inputModelSpanData
               ? (observability?.rebuildSpan(inputModelSpanData) as AIModelGenerationSpan | undefined)
               : undefined;
@@ -479,8 +477,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                 try {
                   currentActiveTools = enforceActiveToolsFence(merged.activeTools, reconstructibleToolSurface);
                   currentToolChoice = enforceToolChoiceFence(merged.toolChoice as any, reconstructibleToolSurface) as
-                    | ToolChoice<ToolSet>
-                    | undefined;
+                    ToolChoice<ToolSet> | undefined;
                 } catch (error) {
                   selectionControlError = error;
                   hasSelectionControlError = true;

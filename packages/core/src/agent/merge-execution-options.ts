@@ -41,8 +41,7 @@ export function mergeAgentExecutionOptions(
   }
 
   const createComposers = (callerOptions as Record<PropertyKey, any>)[AGENT_EXECUTION_OPTION_COMPOSERS] as
-    | AgentExecutionOptionComposerFactory
-    | undefined;
+    AgentExecutionOptionComposerFactory | undefined;
   const composers = createComposers?.();
   if (composers?.recoveryMaxSteps !== undefined) {
     merged.recoveryMaxSteps = composers.recoveryMaxSteps;
