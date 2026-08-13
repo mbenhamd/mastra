@@ -2972,6 +2972,11 @@ export class Session {
     const runId = this._currentRunId;
     if (runId === undefined) return;
     for (const tool of this._activeTools.values()) {
+      this._recordRunToolReceipt(runId, {
+        toolCallId: tool.toolCallId,
+        toolName: tool.toolName,
+        status: 'error',
+      });
       this._emitTurnEvent({
         type: 'tool_end',
         runId,
@@ -7016,6 +7021,11 @@ export class Session {
     }
     try {
       const rawFull = (await out.getFullOutput()) as FullOutput<unknown>;
+      // Close dangling tools while their receipt state can still be attached to
+      // this run's output. Suspended tools remain parked for their real terminal.
+      if (rawFull.finishReason !== 'suspended' && this._currentRunId === runId) {
+        this._emitAbortedToolEnds();
+      }
       const full = this._materializeHarnessRunOutput(runId, rawFull);
       this._rememberCompletedRun(runId, { ok: true, full });
       if (waiter) waiter.resolve(full);
@@ -13256,6 +13266,15 @@ export class Session {
             throw error;
           }
         }
+      }
+      // Mirror ordinary-run finalization: a resumed segment can start a new
+      // tool before it is aborted or otherwise terminates without a result.
+      // Close that tool while the run's receipt state can still be projected.
+      if (full.finishReason !== 'suspended' && this._currentRunId === pending.runId) {
+        // The consumed pending record remains installed until the resume's
+        // durable settlement below, so explicitly close only this terminal
+        // resumed segment rather than treating it as still parked.
+        this._emitAbortedToolEnds({ force: true });
       }
       full = this._materializeHarnessRunOutput(pending.runId, full);
       const resumedQueuedItemId = this._queuedItemIdForPendingResume(pending);
