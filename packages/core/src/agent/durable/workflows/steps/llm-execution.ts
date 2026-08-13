@@ -166,13 +166,12 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
       const typedInput = inputData as DurableAgenticWorkflowInput;
       const { agentId, messageId, options: execOptions } = typedInput;
       const runId = typedInput.runId;
+      const stepIndex = typedInput.stepIndex ?? 0;
       const responseRecoveryReserved =
         typedInput.responseRecovery?.phase === 'reserved' &&
-        typedInput.responseRecovery.reservedAtIteration === typedInput.stepIndex;
+        typedInput.responseRecovery.reservedAtIteration === stepIndex;
       if (typedInput.responseRecovery && !responseRecoveryReserved) {
-        throw new Error(
-          `Durable response recovery reservation for run "${runId}" does not match step ${typedInput.stepIndex ?? 'unknown'}`,
-        );
+        throw new Error(`Durable response recovery reservation for run "${runId}" does not match step ${stepIndex}`);
       }
       let responseRecoveryAdmitted = false;
       const logger = mastra?.getLogger?.();
@@ -393,7 +392,6 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
 
             // Set the step index for continuation (step: 0, 1, 2, ...)
             // This ensures step numbering continues across agentic loop iterations
-            const stepIndex = (inputData as any).stepIndex ?? 0;
             modelSpanTracker?.setStepIndex(stepIndex);
 
             // Build structured output for AI SDK if configured. Held in a `let`
@@ -1177,7 +1175,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
               ? (modelResult as ReadableStream<any>).pipeThrough(
                   new TransformStream<any, any>({
                     transform(chunk, streamController) {
-                      if (chunk?.type?.startsWith?.('tool-')) {
+                      if (chunk?.type?.startsWith?.('tool-') && chunk.type !== 'tool-result') {
                         providerToolChunkSuppressed = true;
                         return;
                       }
@@ -1238,7 +1236,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                 // An explicit no-tools step is an execution boundary, not a
                 // provider hint. Drop hostile tool-family chunks before client
                 // publication, lifecycle callbacks, or message persistence.
-                if (toolExecutionDisabled && rawChunk.type?.startsWith?.('tool-')) {
+                if (toolExecutionDisabled && rawChunk.type?.startsWith?.('tool-') && rawChunk.type !== 'tool-result') {
                   providerToolChunkSuppressed = true;
                   continue;
                 }
@@ -1770,6 +1768,12 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
 
             // 13. Determine if we should continue (has tool calls). A
             // non-compliant recovery provider cannot create executable work.
+            if (toolExecutionDisabled && (providerToolChunkSuppressed || toolCalls.length > 0)) {
+              logger?.warn?.('Provider emitted tool calls while the execution tool surface was disabled', {
+                runId,
+                messageId: currentMessageId,
+              });
+            }
             if (toolExecutionDisabled) toolCalls.length = 0;
             const isContinued =
               !responseRecoveryReserved &&

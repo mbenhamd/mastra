@@ -195,7 +195,7 @@ type ProcessOutputStreamOptions<OUTPUT = undefined> = {
   pendingProviderToolCallsByToolCallId?: Map<string, PendingProviderToolCall>;
   /** Live step tracker, consulted at tool-result time to parent PROVIDER_TOOL_CALL spans. */
   modelSpanTracker?: IModelSpanTracker;
-  /** Drop provider tool-family chunks before callbacks, history, or client publication. */
+  /** Drop provider tool-call family chunks before callbacks, history, or client publication. */
   suppressToolChunks?: boolean;
 };
 
@@ -744,9 +744,11 @@ async function processOutputStream<OUTPUT = undefined>({
     }
 
     // An explicit no-tools step is an execution boundary, not merely a request
-    // hint. Drop a non-compliant provider's entire tool family before payload
+    // hint. Drop a non-compliant provider's tool-call family before payload
     // transforms, lifecycle callbacks, history assembly, or client delivery.
-    if (suppressToolChunks && chunk.type.startsWith('tool-')) {
+    // Provider-executed results for calls admitted by an earlier iteration may
+    // still arrive here; preserve those so their pending calls can settle.
+    if (suppressToolChunks && chunk.type.startsWith('tool-') && chunk.type !== 'tool-result') {
       toolChunkSuppressed = true;
       continue;
     }
@@ -1848,7 +1850,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
           ? (modelResult as ReadableStream<ChunkType<OUTPUT>>).pipeThrough(
               new TransformStream<ChunkType<OUTPUT>, ChunkType<OUTPUT>>({
                 transform(chunk, streamController) {
-                  if (chunk.type.startsWith('tool-')) {
+                  if (chunk.type.startsWith('tool-') && chunk.type !== 'tool-result') {
                     providerToolChunkSuppressed = true;
                     return;
                   }
@@ -2373,6 +2375,12 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
       const immediateToolCalls = outputStream._getImmediateToolCalls() ?? [];
       const providerViolatedToolFence =
         toolExecutionDisabled && (providerToolChunkSuppressed || immediateToolCalls.length > 0);
+      if (providerViolatedToolFence) {
+        logger?.warn('Provider emitted tool calls while the execution tool surface was disabled', {
+          runId,
+          messageId: inputData.messageId,
+        });
+      }
       const toolCalls = (
         toolExecutionDisabled
           ? []

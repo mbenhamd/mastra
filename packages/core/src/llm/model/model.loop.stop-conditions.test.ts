@@ -121,6 +121,7 @@ describe('MastraLLMVNext stop conditions', () => {
         recoveryMaxSteps: 0,
       } as never),
     ).not.toThrow();
+    expect(loopMock).toHaveBeenCalledWith(expect.objectContaining({ recoveryMaxSteps: 0 }));
   });
 
   it('uses a monotonic cap for restored step counts already above maxSteps', async () => {

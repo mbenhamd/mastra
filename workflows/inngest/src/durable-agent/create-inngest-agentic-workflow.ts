@@ -123,7 +123,8 @@ type IterationState = z.infer<typeof iterationStateSchema> & {
 /**
  * Durable-agent wire/function protocol. Function IDs include this version so
  * a pre-policy worker cannot claim an event whose authorization markers it
- * does not understand.
+ * does not understand. Deploy v3 only after in-flight v2 runs have drained,
+ * or keep v2 workers available until those runs and suspended snapshots finish.
  */
 export const INNGEST_DURABLE_AGENT_PROTOCOL_VERSION = 'v3' as const;
 

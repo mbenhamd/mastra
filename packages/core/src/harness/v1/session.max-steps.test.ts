@@ -27,6 +27,7 @@ function trackedHarness() {
 }
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(activeHarnesses.splice(0).map(harness => harness.shutdown()));
 });
 

@@ -562,7 +562,9 @@ describeForAllEngines(
       expect(
         outputProcessorToolParts.some(part => part.toolCallId === 'call_update_1' && part.type !== 'tool-call'),
       ).toBe(true);
-      expect(outputProcessorToolParts.some(part => part.toolCallId === 'call_update_2')).toBe(false);
+      expect(
+        outputProcessorToolParts.some(part => part.toolCallId === 'call_update_2' && part.type !== 'tool-result'),
+      ).toBe(false);
       expect(nudged).toBe(true);
       expect(iterations[0]).toMatchObject({
         text: 'I will update the probe now.',
@@ -574,7 +576,10 @@ describeForAllEngines(
       });
       expect(
         (chunks ?? []).some(
-          chunk => chunk.type.startsWith('tool-') && (chunk as any).payload?.toolCallId === 'call_update_2',
+          chunk =>
+            chunk.type.startsWith('tool-') &&
+            chunk.type !== 'tool-result' &&
+            (chunk as any).payload?.toolCallId === 'call_update_2',
         ),
       ).toBe(false);
       const text = (chunks ?? [])
