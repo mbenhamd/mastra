@@ -792,7 +792,7 @@ export class InMemoryMemory extends MemoryStorage {
         throw new WorkingMemoryValidationError('updatedBefore must be a valid Date.');
       }
       const updatedBefore = filter.updatedBefore.getTime();
-      threads = threads.filter(thread => thread.updatedAt.getTime() < updatedBefore);
+      threads = threads.filter(thread => new Date(thread.updatedAt).getTime() < updatedBefore);
     }
 
     // Validate metadata keys before filtering

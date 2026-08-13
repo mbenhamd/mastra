@@ -587,7 +587,7 @@ describe('InMemoryMemory revisioned Working Memory', () => {
           title: id,
           metadata: {},
           createdAt: new Date(updatedAt),
-          updatedAt: new Date(updatedAt),
+          updatedAt: id === 'older' ? (updatedAt as unknown as Date) : new Date(updatedAt),
         },
       });
     }
