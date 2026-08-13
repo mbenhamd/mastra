@@ -549,9 +549,10 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
               // Determine whether we can run another turn. Hard stops
               // (pendingFeedbackStop, delegationBailed) are unconditional —
               // onIterationComplete cannot override them.
+              const responseRecoveryRequested =
+                iterationResult.continue === true && iterationResult[AGENT_RESPONSE_RECOVERY_CONTINUATION] === true;
               const canUseRecoveryTurn =
-                iterationResult.continue === true &&
-                iterationResult[AGENT_RESPONSE_RECOVERY_CONTINUATION] === true &&
+                responseRecoveryRequested &&
                 recoveryMaxSteps > 0 &&
                 state.iterationCount >= runMaxSteps &&
                 state.iterationCount < runMaxSteps + recoveryMaxSteps;
@@ -560,7 +561,7 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
                 (underMaxSteps || canUseRecoveryTurn) &&
                 (shouldContinue || iterationResult.continue === true);
 
-              if (canUseRecoveryTurn && canRunAnotherTurn) {
+              if (responseRecoveryRequested && canRunAnotherTurn) {
                 state.responseRecovery = {
                   phase: 'reserved',
                   reservedAtIteration: state.iterationCount,
