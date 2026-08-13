@@ -352,7 +352,9 @@ type MessageAdmissionHashes = {
 };
 
 type QueueResumeRecoveryResult =
-  { status: 'none' } | { status: 'completed'; result: AgentResult } | { status: 'stale' };
+  | { status: 'none' }
+  | { status: 'completed'; result: AgentResult }
+  | { status: 'stale' };
 
 type ResumeResponseMode = 'agent-result' | 'inbox-receipt';
 type InboxReceiptResponseOptions = Extract<InboxResponseOptions, { responseId: string }>;
@@ -4356,7 +4358,8 @@ export class Session {
    * `_internalAwaitFlushChain()` so shutdown and tests can act on it. */
   private _pendingTokenUsageFlushError: unknown;
   private _pendingDurableTurnFlushError:
-    { error: unknown; pendingResume?: { runId: string; toolCallId: string } } | undefined;
+    | { error: unknown; pendingResume?: { runId: string; toolCallId: string } }
+    | undefined;
 
   /**
    * True while a turn (message or queued) is in flight against the agent.
@@ -13266,6 +13269,15 @@ export class Session {
             throw error;
           }
         }
+      }
+      // Mirror ordinary-run finalization: a resumed segment can start a new
+      // tool before it is aborted or otherwise terminates without a result.
+      // Close that tool while the run's receipt state can still be projected.
+      if (full.finishReason !== 'suspended' && this._currentRunId === pending.runId) {
+        // The consumed pending record remains installed until the resume's
+        // durable settlement below, so explicitly close only this terminal
+        // resumed segment rather than treating it as still parked.
+        this._emitAbortedToolEnds({ force: true });
       }
       full = this._materializeHarnessRunOutput(pending.runId, full);
       const resumedQueuedItemId = this._queuedItemIdForPendingResume(pending);

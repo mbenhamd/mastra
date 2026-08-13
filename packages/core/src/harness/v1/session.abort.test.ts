@@ -271,7 +271,8 @@ describe('Session.abort()', () => {
     });
 
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
-    await session.message({ content: 'go' });
+    const suspended = (await session.message({ content: 'go' })) as Record<string, unknown>;
+    const resumedRunId = suspended.runId as string;
 
     // Now the next run (the resume) is held — abort it.
     const hold = deferred();
@@ -279,22 +280,54 @@ describe('Session.abort()', () => {
     agent.enqueueRun({
       finishReason: 'stop',
       text: 'resumed',
-      runId: 'run-R',
+      runId: resumedRunId,
+      chunks: [
+        {
+          type: 'tool-call',
+          payload: { toolCallId: 'tc-resumed-abort', toolName: 'lookup', args: {} },
+          runId: resumedRunId,
+        },
+      ],
       holdUntil: hold.promise,
       onAbort: reason => {
         abortReason = reason;
       },
     });
 
+    const events: unknown[] = [];
+    session.subscribe(event => {
+      events.push(event);
+    });
     const inflight = session.respondToToolApproval({ approved: true });
 
-    await waitFor(() => session.isRunning());
+    await waitFor(
+      () =>
+        session.isRunning() &&
+        events.some(
+          event =>
+            (event as { type?: string; toolCallId?: string }).type === 'tool_start' &&
+            (event as { toolCallId?: string }).toolCallId === 'tc-resumed-abort',
+        ),
+    );
     expect(session.isRunning()).toBe(true);
 
     session.abort({ reason: 'resume-cancel' });
-    await inflight;
+    const result = (await inflight) as Record<string, unknown>;
 
     expect(abortReason).toMatchObject({ reason: 'agent_aborted', sessionId: session.id });
+    expect(result.harnessToolReceipts).toEqual([
+      { toolCallId: 'tc-resumed-abort', toolName: 'lookup', status: 'error' },
+    ]);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: 'tool_end',
+        runId: result.runId,
+        toolCallId: 'tc-resumed-abort',
+        toolName: 'lookup',
+        isError: true,
+      }),
+    );
+
     expect(session.isRunning()).toBe(false);
 
     // The resume call's abortSignal got the typed abort.
