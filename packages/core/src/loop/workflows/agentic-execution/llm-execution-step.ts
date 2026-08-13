@@ -2589,7 +2589,12 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
       // If shouldRetry is true, we continue the loop instead of triggering tripwire
       const stepReason = shouldRetry ? 'retry' : tripwireTriggered ? 'tripwire' : hasErrored ? 'error' : finishReason;
 
-      const nextFallbackModelIndex = shouldRetry ? activeFallbackModelIndex : 0;
+      // Preserve the model that actually served the step. A later response-only
+      // recovery must spend its single call on that known-working model rather
+      // than restarting at a primary that already failed. Ordinary successful
+      // iterations may also start there; their normal fallback chain remains
+      // available if it subsequently fails.
+      const nextFallbackModelIndex = activeFallbackModelIndex;
 
       // isContinued should be true if:
       // - shouldRetry is true (processor requested retry)
