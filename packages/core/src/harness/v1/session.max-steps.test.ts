@@ -100,18 +100,24 @@ describe('Session empty-final-synthesis nudge', () => {
         finishReason: 'tool-calls',
       }),
     ).toBeUndefined();
-    expect(await nudge({ text: '', toolResults: [], isFinal: true, finishReason: 'stop' })).toMatchObject({
-      continue: true,
-      feedback: expect.stringContaining('no reply'),
-    });
+    expect(await nudge({ iteration: 0, text: '', toolResults: [], isFinal: true, finishReason: 'stop' })).toMatchObject(
+      {
+        continue: true,
+        feedback: expect.stringContaining('no reply'),
+      },
+    );
     const recoveryStep = await prepareStep();
     expect(recoveryStep).toMatchObject({ activeTools: [], toolChoice: 'none' });
     expect(recoveryStep?.[AGENT_RESPONSE_RECOVERY_STEP]).toBe(true);
     await expect(prepareStep()).rejects.toThrow('already admitted its one provider attempt');
-    // Never loops: the single response-only iteration is forced to stop.
-    expect(await nudge({ text: '', toolResults: [], isFinal: true, finishReason: 'stop' })).toMatchObject({
-      continue: false,
-    });
+    // A durable predicate replay of the same iteration returns the same
+    // reservation, while the actual later recovery iteration remains final.
+    expect(await nudge({ iteration: 0, text: '', toolResults: [], isFinal: true, finishReason: 'stop' })).toMatchObject(
+      { continue: true },
+    );
+    expect(await nudge({ iteration: 1, text: '', toolResults: [], isFinal: true, finishReason: 'stop' })).toMatchObject(
+      { continue: false },
+    );
   });
 
   it('stays silent when the final iteration produced text or the turn ran no tools', async () => {
@@ -223,17 +229,27 @@ describe('Session empty-final-synthesis nudge', () => {
       activeTools: ['safe_tool'],
       workspace: 'configured-workspace',
     });
-    await nudge({ text: 'Working.', toolResults: [toolResult], isFinal: false, finishReason: 'tool-calls' });
-    expect(await nudge({ text: '', toolResults: [], isFinal: true, finishReason: 'stop' })).toMatchObject({
-      continue: true,
-      feedback: expect.stringContaining('Configured feedback.'),
+    await nudge({
+      iteration: 1,
+      text: 'Working.',
+      toolResults: [toolResult],
+      isFinal: false,
+      finishReason: 'tool-calls',
     });
+    expect(await nudge({ iteration: 2, text: '', toolResults: [], isFinal: true, finishReason: 'stop' })).toMatchObject(
+      {
+        continue: true,
+        feedback: expect.stringContaining('Configured feedback.'),
+      },
+    );
     await expect(prepareStep()).resolves.toMatchObject({
       activeTools: [],
       toolChoice: 'none',
       workspace: 'configured-workspace',
     });
-    await expect(nudge({ text: '', toolResults: [], isFinal: false, finishReason: 'tool-calls' })).resolves.toEqual({
+    await expect(
+      nudge({ iteration: 3, text: '', toolResults: [], isFinal: false, finishReason: 'tool-calls' }),
+    ).resolves.toEqual({
       continue: false,
     });
     expect(configuredIteration).toHaveBeenCalledTimes(3);
@@ -277,14 +293,18 @@ describe('Session empty-final-synthesis nudge', () => {
     const loggerError = vi.spyOn(harness.mastra.getLogger(), 'error');
 
     await expect(
-      nudge({ text: 'Working.', toolResults: [toolResult], isFinal: false, finishReason: 'tool-calls' }),
+      nudge({ iteration: 1, text: 'Working.', toolResults: [toolResult], isFinal: false, finishReason: 'tool-calls' }),
     ).rejects.toThrow('configured hook failed');
-    await expect(nudge({ text: '', toolResults: [], isFinal: true, finishReason: 'stop' })).resolves.toMatchObject({
+    await expect(
+      nudge({ iteration: 2, text: '', toolResults: [], isFinal: true, finishReason: 'stop' }),
+    ).resolves.toMatchObject({
       continue: true,
       feedback: expect.stringContaining('no reply'),
     });
     await expect(prepareStep()).resolves.toMatchObject({ activeTools: [], toolChoice: 'none' });
-    await expect(nudge({ text: 'Recovered.', toolResults: [], isFinal: true, finishReason: 'stop' })).resolves.toEqual({
+    await expect(
+      nudge({ iteration: 3, text: 'Recovered.', toolResults: [], isFinal: true, finishReason: 'stop' }),
+    ).resolves.toEqual({
       continue: false,
     });
     expect(configuredIteration).toHaveBeenCalledTimes(3);

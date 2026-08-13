@@ -101,6 +101,7 @@ export function createBaseIterationStateUpdate(input: IterationStateUpdateInput)
     accumulatedSteps: [...currentState.accumulatedSteps, stepRecord],
     accumulatedUsage: newUsage,
     lastStepResult: executionOutput.stepResult,
+    lastModelEntryId: executionOutput.modelEntryId ?? currentState.lastModelEntryId,
     backgroundTaskPending: executionOutput.backgroundTaskPending,
     terminalToolResult: executionOutput.terminalToolResult,
     deferredStepFinishChunk: executionOutput.deferredStepFinishChunk,

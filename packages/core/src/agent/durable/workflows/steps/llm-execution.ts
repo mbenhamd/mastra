@@ -122,6 +122,7 @@ const durableLLMOutputSchema = z.object({
   processorRetryCount: z.number().optional(),
   processorRetryFeedback: z.string().optional(),
   state: z.any(),
+  modelEntryId: z.string().optional(),
   responseRecoveryConsumed: z.boolean().optional(),
   // Step index used in this execution (for tracking)
   stepIndex: z.number().optional(),
@@ -304,8 +305,15 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
               enabled: true,
             },
           ];
-      // A reserved recovery owns one request, not another fallback budget.
-      const modelList = responseRecoveryReserved ? resolvedExecutionModels.slice(0, 1) : resolvedExecutionModels;
+      // A reserved recovery owns one request, not another fallback budget. Reuse
+      // the enabled model entry that actually completed the preceding iteration
+      // rather than restarting at a primary that may already have failed.
+      const recoveryModelEntry = typedInput.responseRecovery?.modelEntryId
+        ? resolvedExecutionModels.find(entry => entry.id === typedInput.responseRecovery?.modelEntryId)
+        : undefined;
+      const modelList = responseRecoveryReserved
+        ? [recoveryModelEntry ?? resolvedExecutionModels[0]].filter(entry => entry !== undefined)
+        : resolvedExecutionModels;
 
       if (modelList.length === 0) {
         throw new Error('No enabled models available for execution');
@@ -1970,6 +1978,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                 request,
               },
               state: typedInput.state,
+              modelEntryId: modelEntry.id,
               ...(responseRecoveryAdmitted ? { responseRecoveryConsumed: true } : {}),
               // Pass span data so tool calls can be children of model_step
               modelSpanData: hasToolCalls ? modelSpan?.exportSpan?.() : undefined,

@@ -93,7 +93,11 @@ const durableAgenticInputSchema = z.object({
   modelList: z.array(modelListEntrySchema).optional(),
   options: z.any(),
   responseRecovery: z
-    .object({ phase: z.literal('reserved'), reservedAtIteration: z.number().int().nonnegative() })
+    .object({
+      phase: z.literal('reserved'),
+      reservedAtIteration: z.number().int().nonnegative(),
+      modelEntryId: z.string().optional(),
+    })
     .optional(),
   state: z.any(),
   messageId: z.string(),
@@ -566,6 +570,7 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
                 state.responseRecovery = {
                   phase: 'reserved',
                   reservedAtIteration: state.iterationCount,
+                  ...(state.lastModelEntryId ? { modelEntryId: state.lastModelEntryId } : {}),
                 };
               }
 

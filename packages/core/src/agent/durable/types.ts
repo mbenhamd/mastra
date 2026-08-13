@@ -283,6 +283,8 @@ export interface DurableResponseRecoveryState {
   phase: 'reserved';
   /** Iteration that reserved recovery; binds the guard to the exact next call. */
   reservedAtIteration: number;
+  /** Enabled model-list entry that successfully served the preceding iteration. */
+  modelEntryId?: string;
 }
 
 export interface DurableAgenticWorkflowInput {
@@ -381,6 +383,8 @@ export interface DurableLLMStepOutput {
   processorRetryFeedback?: string;
   /** Updated serializable state */
   state: SerializableDurableState;
+  /** Enabled model-list entry selected for this iteration. */
+  modelEntryId?: string;
   /** The live response-only capability was consumed, even if a later hard stop prevented provider I/O. */
   responseRecoveryConsumed?: boolean;
   /** Exported model_generation span data (only set when there are tool calls) */
@@ -477,6 +481,8 @@ export interface DurableAgenticExecutionOutput {
   };
   /** Updated state */
   state: SerializableDurableState;
+  /** Enabled model-list entry that served this iteration. */
+  modelEntryId?: string;
   /** The live response-only capability was consumed by this iteration. */
   responseRecoveryConsumed?: boolean;
   /** Processor retry tracking */

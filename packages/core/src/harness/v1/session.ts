@@ -424,6 +424,7 @@ function createHarnessEmptySynthesisOptions(reportConfiguredHookError: HarnessEx
       let nudged = false;
       let segmentHasToolResults = false;
       let responseOnly = false;
+      let responseOnlyReservedAtIteration: number | undefined;
       let responseOnlyPrepared = false;
       let ordinaryBudgetExhausted = false;
       return {
@@ -435,6 +436,15 @@ function createHarnessEmptySynthesisOptions(reportConfiguredHookError: HarnessEx
             // response tries to call a tool that prepareStep hid. Configured
             // observers still see this iteration, but cannot reopen it.
             if (responseOnly) {
+              // Durable loop predicates may be replayed before the transition
+              // commits. Return the same reservation for the same terminal
+              // iteration; only an actual later iteration closes recovery.
+              if (context.iteration === responseOnlyReservedAtIteration) {
+                return {
+                  continue: true,
+                  [AGENT_RESPONSE_RECOVERY_CONTINUATION]: true,
+                };
+              }
               try {
                 await configured?.(context);
               } catch (error) {
@@ -486,6 +496,7 @@ function createHarnessEmptySynthesisOptions(reportConfiguredHookError: HarnessEx
 
             nudged = true;
             responseOnly = true;
+            responseOnlyReservedAtIteration = context.iteration;
             const recoveryFeedback =
               'You received tool results but sent the user no reply. In one or two short sentences, ' +
               'report the result accurately, including whether the action succeeded, failed, or was denied. ' +

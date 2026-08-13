@@ -40,6 +40,7 @@ export const modelListEntrySchema = z.object({
 export const durableResponseRecoveryStateSchema = z.object({
   phase: z.literal('reserved'),
   reservedAtIteration: z.number().int().nonnegative(),
+  modelEntryId: z.string().optional(),
 });
 
 /**
@@ -135,6 +136,8 @@ export const baseIterationStateSchema = z.object({
   accumulatedUsage: accumulatedUsageSchema,
   // Last step result for continuation check
   lastStepResult: z.any().optional(),
+  // Enabled model-list entry that served the preceding iteration.
+  lastModelEntryId: z.string().optional(),
   // Background task tracking
   backgroundTaskPending: z.boolean().optional(),
   terminalToolResult: terminalToolResultSchema.optional(),

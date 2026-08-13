@@ -94,6 +94,42 @@ describe('createDurableAgenticWorkflow response recovery arbitration', () => {
     }
   });
 
+  it('replays the same marked response-only reservation idempotently', async () => {
+    const runId = 'replayed-recovery-run';
+    const runtimeBindingId = 'replayed-recovery-binding';
+    const workflow = createDurableAgenticWorkflow() as any;
+    const loopEntry = findLoopEntry(workflow.executionGraph.steps);
+    const onIterationComplete = vi.fn(async () => ({
+      continue: true,
+      [AGENT_RESPONSE_RECOVERY_CONTINUATION]: true,
+    }));
+    globalRunRegistry.set(runId, { runtimeBindingId, onIterationComplete } as any);
+    const state: any = {
+      __workflowKind: 'durable-agent',
+      runId,
+      runtimeBindingId,
+      agentId: 'recovery-agent',
+      options: { maxSteps: 1, recoveryMaxSteps: 1 },
+      iterationCount: 1,
+      accumulatedSteps: [{ text: '', toolCalls: [], toolResults: [], finishReason: 'stop' }],
+      messageListState: new MessageList().serialize(),
+      messageId: 'message-1',
+      state: {},
+      lastStepResult: { reason: 'stop', warnings: [], isContinued: false },
+      responseRecovery: { phase: 'reserved', reservedAtIteration: 1 },
+    };
+
+    try {
+      await expect(
+        loopEntry.condition({ inputData: state, getInitData: () => state, mastra: undefined }),
+      ).resolves.toBe(true);
+      expect(state.responseRecovery).toEqual({ phase: 'reserved', reservedAtIteration: 1 });
+      expect(state.lastStepResult.isContinued).toBe(true);
+    } finally {
+      globalRunRegistry.delete(runId);
+    }
+  });
+
   it('reserves a marked response-only continuation before the ordinary maxSteps ceiling', async () => {
     const runId = 'ordinary-budget-recovery-run';
     const runtimeBindingId = 'ordinary-budget-recovery-binding';
