@@ -58,7 +58,7 @@ import { emitChunkEvent, emitStepStartEvent } from '../../stream-adapter';
 import type { DurableAgenticWorkflowInput, DurableLLMStepOutput, DurableToolCallInput } from '../../types';
 import { applyToolPayloadTransformToChunk } from '../../utils/apply-tool-payload-transform';
 import { resolveRuntimeDependencies, resolveModelFromListEntry } from '../../utils/resolve-runtime';
-import { modelListEntrySchema } from '../shared/schemas';
+import { durableResponseRecoveryStateSchema, modelListEntrySchema } from '../shared/schemas';
 
 /**
  * Input schema for the durable LLM execution step
@@ -86,9 +86,7 @@ const durableLLMInputSchema = z.object({
   // Model list for fallback support (when agent configured with array of models)
   modelList: z.array(modelListEntrySchema).optional(),
   options: z.any(),
-  responseRecovery: z
-    .object({ phase: z.literal('reserved'), reservedAtIteration: z.number().int().nonnegative() })
-    .optional(),
+  responseRecovery: durableResponseRecoveryStateSchema.optional(),
   state: z.any(),
   messageId: z.string(),
   // Agent span data for model span parenting
@@ -1870,7 +1868,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                       message =>
                         message.id === currentMessageId || !responseMessageIdsBeforeCurrentStep.has(message.id),
                     )
-                    .flatMap(message => message.content.parts)
+                    .flatMap(message => message.content?.parts ?? [])
                     .filter(part => part.type === 'text')
                     .map(part => part.text)
                     .join('');

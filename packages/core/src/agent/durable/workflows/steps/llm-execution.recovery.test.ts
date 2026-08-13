@@ -95,6 +95,7 @@ describe('durable response recovery admission', () => {
   });
 
   it('does not treat a serialized reservation as cold-worker provider authorization', async () => {
+    const loggerError = vi.fn();
     const doStream = vi.fn(async () => {
       throw new Error('provider must not be called');
     });
@@ -129,13 +130,20 @@ describe('durable response recovery admission', () => {
         messageId: 'message-1',
         stepIndex: 1,
       },
-      mastra: undefined,
+      mastra: { getLogger: () => ({ error: loggerError, debug: vi.fn() }) },
       tracingContext: undefined,
       requestContext: new RequestContext(),
       abortSignal: undefined,
     });
 
     expect(doStream).not.toHaveBeenCalled();
+    expect(
+      loggerError.mock.calls.some(
+        ([, details]) =>
+          (details as { error?: Error } | undefined)?.error?.message ===
+          'Durable response recovery for run "cold-recovery-run" lost its live one-shot admission',
+      ),
+    ).toBe(true);
     expect(result).toMatchObject({
       text: '',
       toolCalls: [],

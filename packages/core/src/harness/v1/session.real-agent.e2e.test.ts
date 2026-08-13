@@ -4676,8 +4676,18 @@ describe('Harness v1 real-agent E2E — S22 empty final synthesis', () => {
     const harness = newHarness(agent);
     try {
       const session = await harness.session({ resourceId: 'u-empty-synthesis-retry', threadId: { fresh: true } });
-      await expect(session.message({ content: 'apply it once' })).rejects.toThrow('An internal harness error occurred');
+      let rejection: unknown;
+      try {
+        await session.message({ content: 'apply it once' });
+      } catch (error) {
+        rejection = error;
+      }
 
+      expect(rejection).toMatchObject({
+        name: 'HarnessExecutionError',
+        message: 'An internal harness error occurred',
+      });
+      expect((rejection as { cause?: Error }).cause?.message).toBe('recovery provider failed');
       expect(primaryCalls).toBe(3);
       expect(backupCalls).toBe(0);
       expect(toolExecutions).toBe(1);

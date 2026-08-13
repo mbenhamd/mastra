@@ -1061,6 +1061,7 @@ function executeStreamWithFallbackModels<T>(
   models: ModelManagerModelConfig[],
   logger?: IMastraLogger,
   startIndex = 0,
+  stopFallbackOnError?: () => boolean,
 ): ExecuteStreamModelManager<T> {
   return async callback => {
     let index = startIndex;
@@ -1090,6 +1091,7 @@ function executeStreamWithFallbackModels<T>(
         lastError = err;
 
         logger?.error(`Error executing model ${modelConfig.model.modelId}`, err);
+        if (stopFallbackOnError?.()) throw err;
       }
     }
     if (typeof finalResult === 'undefined') {
@@ -1226,6 +1228,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
         models,
         logger,
         activeFallbackModelIndex,
+        () => responseRecoveryStep,
       )(async (modelConfig, isLastModel) => {
         if (responseRecoveryStep) {
           throw new Error('Response-only recovery has already admitted its one provider attempt');

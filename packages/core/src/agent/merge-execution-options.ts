@@ -24,7 +24,7 @@ export type AgentExecutionOptionComposers = Partial<
 export type AgentExecutionOptionComposerFactory = () => AgentExecutionOptionComposers;
 
 const AGENT_CONFIGURED_EXECUTION_HOOKS = Symbol('agentConfiguredExecutionHooks');
-type AgentConfiguredExecutionHooks = Pick<Record<string, any>, 'onIterationComplete' | 'prepareStep'>;
+type AgentConfiguredExecutionHooks = Partial<Record<'onIterationComplete' | 'prepareStep', unknown>>;
 
 /**
  * Merge agent defaults beneath per-execution options while preserving the
