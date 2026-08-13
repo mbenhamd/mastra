@@ -11,15 +11,28 @@
  * pins CONTROLLER_MAX_STEPS; these tests pin the session lane.
  */
 
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { mergeAgentExecutionOptions } from '../../agent/merge-execution-options';
+import { AGENT_RESPONSE_RECOVERY_STEP, mergeAgentExecutionOptions } from '../../agent/merge-execution-options';
 
 import { setupHarness } from './__test-utils__';
+import type { Harness } from './harness';
+
+const activeHarnesses: Harness[] = [];
+
+function trackedHarness() {
+  const setup = setupHarness();
+  activeHarnesses.push(setup.harness);
+  return setup;
+}
+
+afterEach(async () => {
+  await Promise.all(activeHarnesses.splice(0).map(harness => harness.shutdown()));
+});
 
 describe('Session step ceiling', () => {
   it('message() carries an escape-proof maxSteps into the agent run options', async () => {
-    const { harness, agent } = setupHarness();
+    const { harness, agent } = trackedHarness();
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
 
     await session.message({ content: 'hi' });
@@ -34,7 +47,7 @@ describe('Session step ceiling', () => {
   });
 
   it('every recorded run of a multi-turn session carries the ceiling', async () => {
-    const { harness, agent } = setupHarness();
+    const { harness, agent } = trackedHarness();
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
 
     await session.message({ content: 'first' });
@@ -51,13 +64,15 @@ describe('Session step ceiling', () => {
 
 describe('Session empty-final-synthesis nudge', () => {
   async function capturedSynthesisOptions(defaultOptions: Record<string, unknown> = {}) {
-    const { harness, agent } = setupHarness();
+    const { harness, agent } = trackedHarness();
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
     await session.message({ content: 'do something' });
     const call = agent.streamCalls.at(-1);
     const merged = mergeAgentExecutionOptions(defaultOptions, call?.options ?? {});
     const nudge = merged.onIterationComplete as
       | ((context: {
+          iteration?: number;
+          maxIterations?: number;
           text: string;
           toolResults: Array<{ id: string; name: string; result: unknown }>;
           isFinal: boolean;
@@ -65,7 +80,8 @@ describe('Session empty-final-synthesis nudge', () => {
         }) => Promise<{ continue?: boolean; feedback?: string } | undefined>)
       | undefined;
     const prepareStep = merged.prepareStep as
-      ((args?: unknown) => Promise<Record<string, unknown> | undefined>) | undefined;
+      | ((args?: unknown) => Promise<Record<PropertyKey, unknown> | undefined>)
+      | undefined;
     expect(typeof nudge).toBe('function');
     expect(typeof prepareStep).toBe('function');
     return { nudge: nudge!, prepareStep: prepareStep!, harness };
@@ -88,7 +104,10 @@ describe('Session empty-final-synthesis nudge', () => {
       continue: true,
       feedback: expect.stringContaining('no reply'),
     });
-    await expect(prepareStep()).resolves.toEqual({ activeTools: [], toolChoice: 'none' });
+    const recoveryStep = await prepareStep();
+    expect(recoveryStep).toMatchObject({ activeTools: [], toolChoice: 'none' });
+    expect(recoveryStep?.[AGENT_RESPONSE_RECOVERY_STEP]).toBe(true);
+    await expect(prepareStep()).rejects.toThrow('already admitted its one provider attempt');
     // Never loops: the single response-only iteration is forced to stop.
     expect(await nudge({ text: '', toolResults: [], isFinal: true, finishReason: 'stop' })).toMatchObject({
       continue: false,
@@ -137,7 +156,10 @@ describe('Session empty-final-synthesis nudge', () => {
       continue: true,
       feedback: expect.stringContaining('no reply'),
     });
-    await expect(prepareStep({ stepNumber: 1000 })).resolves.toEqual({ activeTools: [], toolChoice: 'none' });
+    await expect(prepareStep({ stepNumber: 1000 })).resolves.toMatchObject({
+      activeTools: [],
+      toolChoice: 'none',
+    });
     await expect(
       nudge({ ...ceilingContext, iteration: 1001, text: 'Recovered.', toolResults: [], isFinal: true }),
     ).resolves.toEqual({ continue: false });
@@ -170,7 +192,7 @@ describe('Session empty-final-synthesis nudge', () => {
     expect(await nudge({ text: '', toolResults: [toolResult], isFinal: true, finishReason: 'length' })).toBeUndefined();
     await expect(prepareStep()).resolves.toBeUndefined();
 
-    const { harness, agent } = setupHarness();
+    const { harness, agent } = trackedHarness();
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
     await session.message({ content: 'one' });
     await session.message({ content: 'two' });
@@ -206,7 +228,7 @@ describe('Session empty-final-synthesis nudge', () => {
       continue: true,
       feedback: expect.stringContaining('Configured feedback.'),
     });
-    await expect(prepareStep()).resolves.toEqual({
+    await expect(prepareStep()).resolves.toMatchObject({
       activeTools: [],
       toolChoice: 'none',
       workspace: 'configured-workspace',
@@ -240,7 +262,7 @@ describe('Session empty-final-synthesis nudge', () => {
     await expect(nudge({ text: '', toolResults: [], isFinal: true, finishReason: 'stop' })).resolves.toMatchObject({
       continue: true,
     });
-    await expect(prepareStep()).resolves.toEqual({ activeTools: [], toolChoice: 'none' });
+    await expect(prepareStep()).resolves.toMatchObject({ activeTools: [], toolChoice: 'none' });
     expect(configuredIteration).toHaveBeenCalledTimes(2);
   });
 
@@ -261,7 +283,7 @@ describe('Session empty-final-synthesis nudge', () => {
       continue: true,
       feedback: expect.stringContaining('no reply'),
     });
-    await expect(prepareStep()).resolves.toEqual({ activeTools: [], toolChoice: 'none' });
+    await expect(prepareStep()).resolves.toMatchObject({ activeTools: [], toolChoice: 'none' });
     await expect(nudge({ text: 'Recovered.', toolResults: [], isFinal: true, finishReason: 'stop' })).resolves.toEqual({
       continue: false,
     });
@@ -285,7 +307,7 @@ describe('Session empty-final-synthesis nudge', () => {
     await expect(
       nudge({ text: '', toolResults: [toolResult], isFinal: true, finishReason: 'stop' }),
     ).resolves.toMatchObject({ continue: true });
-    await expect(prepareStep()).resolves.toEqual({ activeTools: [], toolChoice: 'none' });
+    await expect(prepareStep()).resolves.toMatchObject({ activeTools: [], toolChoice: 'none' });
     expect(loggerError).toHaveBeenCalledWith('Error in prepareStep hook:', prepareError);
     loggerError.mockRestore();
   });

@@ -1,10 +1,11 @@
-import { ReadableStream } from 'node:stream/web';
+import { ReadableStream, TransformStream } from 'node:stream/web';
 import { isAbortError } from '@ai-sdk/provider-utils-v5';
 import type { LanguageModelV2Usage } from '@ai-sdk/provider-v5';
 import { APICallError, generateId } from '@internal/ai-sdk-v5';
 import type { CallSettings, StepResult, ToolChoice, ToolSet } from '@internal/ai-sdk-v5';
 import type { StructuredOutputOptions } from '../../../agent';
 import { enforceChannelToolFence, readChannelToolFence } from '../../../agent/channel-tool-fence';
+import { AGENT_RESPONSE_RECOVERY_STEP } from '../../../agent/merge-execution-options';
 import type { MessageList } from '../../../agent/message-list';
 import type { CreatedAgentSignal } from '../../../agent/signals';
 import {
@@ -153,6 +154,7 @@ type ProcessOutputStreamResult = {
   collectedChunks: CollectedChunk[];
   interjectedSignals: CreatedAgentSignal[];
   toolResultTripwire: TripWire | null;
+  toolChunkSuppressed: boolean;
 };
 
 type ProcessOutputStreamOptions<OUTPUT = undefined> = {
@@ -193,6 +195,8 @@ type ProcessOutputStreamOptions<OUTPUT = undefined> = {
   pendingProviderToolCallsByToolCallId?: Map<string, PendingProviderToolCall>;
   /** Live step tracker, consulted at tool-result time to parent PROVIDER_TOOL_CALL spans. */
   modelSpanTracker?: IModelSpanTracker;
+  /** Drop provider tool-family chunks before callbacks, history, or client publication. */
+  suppressToolChunks?: boolean;
 };
 
 /**
@@ -528,10 +532,12 @@ async function processOutputStream<OUTPUT = undefined>({
   tracingContext,
   pendingProviderToolCallsByToolCallId,
   modelSpanTracker,
+  suppressToolChunks,
 }: ProcessOutputStreamOptions<OUTPUT>): Promise<ProcessOutputStreamResult> {
   let transportSet = false;
   const collectedChunks: CollectedChunk[] = [];
   let toolResultTripwire: TripWire | null = null;
+  let toolChunkSuppressed = false;
   let toolResultProcessorRunner: ProcessorRunner | null = null;
   const getToolResultProcessorRunner = (): ProcessorRunner => {
     if (toolResultProcessorRunner) return toolResultProcessorRunner;
@@ -737,10 +743,18 @@ async function processOutputStream<OUTPUT = undefined>({
       continue;
     }
 
+    // An explicit no-tools step is an execution boundary, not merely a request
+    // hint. Drop a non-compliant provider's entire tool family before payload
+    // transforms, lifecycle callbacks, history assembly, or client delivery.
+    if (suppressToolChunks && chunk.type.startsWith('tool-')) {
+      toolChunkSuppressed = true;
+      continue;
+    }
+
     if (['tool-call', 'tool-call-input-streaming-start'].includes(chunk.type)) {
       const interjectedSignals = drainPendingSignals?.(runId) ?? [];
       if (interjectedSignals.length > 0) {
-        return { collectedChunks, interjectedSignals, toolResultTripwire };
+        return { collectedChunks, interjectedSignals, toolResultTripwire, toolChunkSuppressed };
       }
     }
 
@@ -1035,12 +1049,12 @@ async function processOutputStream<OUTPUT = undefined>({
     if (['text-end', 'reasoning-end', 'tool-result', 'finish'].includes(chunk.type)) {
       const interjectedSignals = drainPendingSignals?.(runId) ?? [];
       if (interjectedSignals.length > 0) {
-        return { collectedChunks, interjectedSignals, toolResultTripwire };
+        return { collectedChunks, interjectedSignals, toolResultTripwire, toolChunkSuppressed };
       }
     }
   }
 
-  return { collectedChunks, interjectedSignals: [], toolResultTripwire };
+  return { collectedChunks, interjectedSignals: [], toolResultTripwire, toolChunkSuppressed };
 }
 
 function executeStreamWithFallbackModels<T>(
@@ -1175,6 +1189,9 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
       let activeFallbackModelIndex = inputData.fallbackModelIndex || 0;
       let executedStepModel: string | undefined;
       let hadInterjectedSignals = false;
+      let responseRecoveryStep = false;
+      let toolExecutionDisabled = false;
+      let providerToolChunkSuppressed = false;
       // Tool-call ids already surfaced to the stream when a follow-up signal
       // interjected. Only tool calls that were NOT yet emitted are discarded;
       // already-visible calls must still be executed so they never orphan.
@@ -1210,7 +1227,12 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
         logger,
         activeFallbackModelIndex,
       )(async (modelConfig, isLastModel) => {
+        if (responseRecoveryStep) {
+          throw new Error('Response-only recovery has already admitted its one provider attempt');
+        }
         hadInterjectedSignals = false;
+        toolExecutionDisabled = false;
+        providerToolChunkSuppressed = false;
         activeFallbackModelIndex = models.findIndex(candidate => candidate.id === modelConfig.id);
         const model = modelConfig.model;
         const modelHeaders = modelConfig.headers;
@@ -1339,6 +1361,10 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
               writer: inputStepWriter,
               abortSignal: options?.abortSignal,
             });
+            const admittedResponseRecovery =
+              (processInputStepResult as Record<PropertyKey, unknown>)[AGENT_RESPONSE_RECOVERY_STEP] === true;
+            if (admittedResponseRecovery) responseRecoveryStep = true;
+
             const mergedStepInput = composeStepInput(
               {
                 messageId: currentStep.messageId,
@@ -1480,6 +1506,11 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
             logger?.error('Error in processInputStep processors:', error);
             throw error;
           }
+        }
+
+        if (responseRecoveryStep) {
+          currentStep.activeTools = [];
+          currentStep.toolChoice = 'none';
         }
 
         const toolSurfaceFence = readToolSurfaceFence(requestContext, runId);
@@ -1683,6 +1714,19 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
           throw error;
         }
 
+        if (responseRecoveryStep) {
+          // Recovery owns one freshly fenced provider attempt. A cached response
+          // was produced under another tool surface and cannot consume it.
+          cachedResponse = undefined;
+          currentStep.activeTools = [];
+          currentStep.toolChoice = 'none';
+        }
+
+        toolExecutionDisabled =
+          currentStep.toolChoice === 'none' &&
+          Array.isArray(currentStep.activeTools) &&
+          currentStep.activeTools.length === 0;
+
         if (cachedResponse) {
           // Short-circuit: replay cached chunks instead of calling the model.
           // Output processors are skipped on cache hit because the cached
@@ -1748,7 +1792,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                 modelSettings: {
                   ...currentStep.modelSettings,
                   ...modelConfig.modelSettings,
-                  maxRetries: modelConfig.maxRetries,
+                  maxRetries: responseRecoveryStep ? 0 : modelConfig.maxRetries,
                 },
                 includeRawChunks,
                 structuredOutput: currentStep.structuredOutput,
@@ -1798,13 +1842,27 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
           );
         }
 
+        const guardedModelResult = toolExecutionDisabled
+          ? (modelResult as ReadableStream<ChunkType<OUTPUT>>).pipeThrough(
+              new TransformStream<ChunkType<OUTPUT>, ChunkType<OUTPUT>>({
+                transform(chunk, streamController) {
+                  if (chunk.type.startsWith('tool-')) {
+                    providerToolChunkSuppressed = true;
+                    return;
+                  }
+                  streamController.enqueue(chunk);
+                },
+              }),
+            )
+          : modelResult;
+
         const outputStream = new MastraModelOutput<OUTPUT>({
           model: {
             modelId: currentStep.model.modelId,
             provider: currentStep.model.provider,
             version: currentStep.model.specificationVersion,
           },
-          stream: modelResult as ReadableStream<ChunkType<OUTPUT>>,
+          stream: guardedModelResult as ReadableStream<ChunkType<OUTPUT>>,
           messageList,
           messageId: currentStep.messageId,
           options: {
@@ -1834,6 +1892,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
             collectedChunks,
             interjectedSignals,
             toolResultTripwire: streamToolResultTripwire,
+            toolChunkSuppressed,
           } = await processOutputStream({
             outputStream,
             includeRawChunks,
@@ -1865,8 +1924,10 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
             tracingContext: modelSpanTracker?.getTracingContext() ?? tracingContext,
             pendingProviderToolCallsByToolCallId,
             modelSpanTracker,
+            suppressToolChunks: toolExecutionDisabled,
           });
           toolResultTripwireFromStream = streamToolResultTripwire;
+          providerToolChunkSuppressed ||= toolChunkSuppressed;
 
           if (toolResultTripwireFromStream) {
             return buildTripWireBailResponse({
@@ -2039,7 +2100,9 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
 
             const currentRetryCount = inputData.processorRetryCount || 0;
             const canRetryError =
-              maxErrorProcessorRetries !== undefined && currentRetryCount < maxErrorProcessorRetries;
+              !responseRecoveryStep &&
+              maxErrorProcessorRetries !== undefined &&
+              currentRetryCount < maxErrorProcessorRetries;
             const apiErrorWriter: ProcessorStreamWriter | undefined = outputWriter
               ? {
                   custom: async (data: { type: string }, options?: { messageId?: string }) =>
@@ -2175,7 +2238,10 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
 
       if (!apiErrorRetryResult && runState.state.hasErrored && runState.state.apiError) {
         const currentRetryCount = inputData.processorRetryCount || 0;
-        const canRetryError = maxErrorProcessorRetries !== undefined && currentRetryCount < maxErrorProcessorRetries;
+        const canRetryError =
+          !responseRecoveryStep &&
+          maxErrorProcessorRetries !== undefined &&
+          currentRetryCount < maxErrorProcessorRetries;
         const processorRunner = new ProcessorRunner({
           inputProcessors: inputProcessors || [],
           outputProcessors: outputProcessors || [],
@@ -2303,10 +2369,14 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
       // surfaced to the stream. Dropping an already-emitted call would strand a
       // visible tool invocation with no execution and no result.
       const immediateToolCalls = outputStream._getImmediateToolCalls() ?? [];
+      const providerViolatedToolFence =
+        toolExecutionDisabled && (providerToolChunkSuppressed || immediateToolCalls.length > 0);
       const toolCalls = (
-        hadInterjectedSignals
-          ? immediateToolCalls.filter(chunk => emittedToolCallIds?.has(chunk.payload.toolCallId))
-          : immediateToolCalls
+        toolExecutionDisabled
+          ? []
+          : hadInterjectedSignals
+            ? immediateToolCalls.filter(chunk => emittedToolCallIds?.has(chunk.payload.toolCallId))
+            : immediateToolCalls
       ).map(chunk => {
         const tool = stepTools?.[chunk.payload.toolName] || findProviderToolByName(stepTools, chunk.payload.toolName);
         return {
@@ -2406,7 +2476,8 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
 
       // Check if this is a retry request from processOutputStep
       const retryRequested = processOutputStepTripwire?.options?.retry === true;
-      const canRetry = maxProcessorRetries !== undefined && currentProcessorRetryCount < maxProcessorRetries;
+      const canRetry =
+        !responseRecoveryStep && maxProcessorRetries !== undefined && currentProcessorRetryCount < maxProcessorRetries;
       const shouldRetry = retryRequested && canRetry;
 
       // Log if retry was requested but not allowed
@@ -2510,7 +2581,10 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
         finishReason !== 'length' &&
         finishReason !== 'content-filter';
       const shouldContinue =
-        shouldRetry || (!tripwireTriggered && (hasPendingToolCalls || !TERMINAL_FINISH_REASONS.includes(finishReason)));
+        !responseRecoveryStep &&
+        !providerViolatedToolFence &&
+        (shouldRetry ||
+          (!tripwireTriggered && (hasPendingToolCalls || !TERMINAL_FINISH_REASONS.includes(finishReason))));
 
       // On terminal exit, materialize spans for provider tool calls whose result never arrived.
       // On retry (shouldRetry), pending calls from the rejected attempt must also be flushed —

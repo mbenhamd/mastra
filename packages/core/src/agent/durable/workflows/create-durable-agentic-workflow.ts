@@ -92,7 +92,9 @@ const durableAgenticInputSchema = z.object({
   // Model list for fallback support (when agent configured with array of models)
   modelList: z.array(modelListEntrySchema).optional(),
   options: z.any(),
-  responseRecoveryPhase: z.enum(['reserved', 'consumed']).optional(),
+  responseRecovery: z
+    .object({ phase: z.literal('reserved'), reservedAtIteration: z.number().int().nonnegative() })
+    .optional(),
   state: z.any(),
   messageId: z.string(),
   // Exported AGENT_RUN / MODEL_GENERATION span data, threaded so the run shares one trace
@@ -403,14 +405,6 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
           hardStop = true;
           state.pendingFeedbackStop = false;
         }
-        // A consumed framework recovery call is terminal even when its provider
-        // violated toolChoice:none or a reconstructed application hook asks to
-        // continue. The serialized phase survives registry loss and replay.
-        if (state.responseRecoveryPhase === 'consumed') {
-          hasFinishedSteps = true;
-          hardStop = true;
-          if (state.lastStepResult) state.lastStepResult.isContinued = false;
-        }
 
         // Continuation check. isTaskComplete (when configured) runs as a
         // proper step inside singleIterationWorkflow and may have already
@@ -567,7 +561,10 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
                 (shouldContinue || iterationResult.continue === true);
 
               if (canUseRecoveryTurn && canRunAnotherTurn) {
-                state.responseRecoveryPhase = 'reserved';
+                state.responseRecovery = {
+                  phase: 'reserved',
+                  reservedAtIteration: state.iterationCount,
+                };
               }
 
               if (iterationResult.feedback && canRunAnotherTurn) {
@@ -635,7 +632,7 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
         if (registryEntry?.abortSignal?.aborted) {
           state.terminalToolResult = undefined;
           state.deferredStepFinishChunk = undefined;
-          state.responseRecoveryPhase = undefined;
+          state.responseRecovery = undefined;
           hasFinishedSteps = true;
           hardStop = true;
           isFinal = true;

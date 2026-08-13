@@ -172,7 +172,9 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
       previousContentLength = allContent.length;
 
       const callerVisibleContent = messageList.getCallerVisibleResponseContent();
-      const currentCallerVisibleContent = callerVisibleContent.slice(previousCallerVisibleContentLength);
+      const currentCallerVisibleContent = rest.outputProcessors?.length
+        ? []
+        : callerVisibleContent.slice(previousCallerVisibleContentLength);
       previousCallerVisibleContentLength = callerVisibleContent.length;
 
       const toolResultParts = currentContent.filter(part => part.type === 'tool-result');

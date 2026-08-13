@@ -125,7 +125,7 @@ type IterationState = z.infer<typeof iterationStateSchema> & {
  * a pre-policy worker cannot claim an event whose authorization markers it
  * does not understand.
  */
-export const INNGEST_DURABLE_AGENT_PROTOCOL_VERSION = 'v2' as const;
+export const INNGEST_DURABLE_AGENT_PROTOCOL_VERSION = 'v3' as const;
 
 /** Prefix for Inngest engine workflow IDs to avoid collision with other engines and protocol versions. */
 const INNGEST_ENGINE_PREFIX = `inngest:${INNGEST_DURABLE_AGENT_PROTOCOL_VERSION}`;
@@ -139,6 +139,22 @@ export const InngestDurableStepIds = {
 export interface InngestDurableAgenticWorkflowIds {
   AGENTIC_EXECUTION: string;
   AGENTIC_LOOP: string;
+}
+
+const INNGEST_RESPONSE_RECOVERY_UNSUPPORTED_MESSAGE =
+  'Inngest durable agents do not support response-only recovery; recoveryMaxSteps must be 0';
+
+/**
+ * Fail before dispatch or provider I/O when a caller requests the live,
+ * response-only recovery capability. Inngest may resume on another worker and
+ * cannot preserve the process-local one-shot admission that authorizes it.
+ */
+export function assertInngestResponseRecoveryDisabled(options: unknown): void {
+  const recoveryMaxSteps =
+    options && typeof options === 'object' ? (options as { recoveryMaxSteps?: unknown }).recoveryMaxSteps : undefined;
+  if (recoveryMaxSteps !== undefined && recoveryMaxSteps !== 0) {
+    throw new TypeError(INNGEST_RESPONSE_RECOVERY_UNSUPPORTED_MESSAGE);
+  }
 }
 
 /**
@@ -416,6 +432,7 @@ export function createInngestDurableAgenticWorkflow(options: InngestDurableAgent
       .map(
         async ({ inputData }) => {
           const input = inputData as DurableAgenticWorkflowInput;
+          assertInngestResponseRecoveryDisabled(input.options);
 
           // Use the agent span data passed from InngestAgent.stream()
           // This span was created before the workflow started, making it the trace root

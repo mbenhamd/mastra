@@ -278,7 +278,12 @@ export interface SerializableDurableOptions {
  * Main input schema for the durable agentic workflow
  * This is fully serializable and flows through workflow state
  */
-export type DurableResponseRecoveryPhase = 'reserved' | 'consumed';
+export interface DurableResponseRecoveryState {
+  /** One response-only execution capability is reserved for the next durable iteration. */
+  phase: 'reserved';
+  /** Iteration that reserved recovery; binds the guard to the exact next call. */
+  reservedAtIteration: number;
+}
 
 export interface DurableAgenticWorkflowInput {
   /** Discriminator field to identify durable agent workflows */
@@ -314,8 +319,8 @@ export interface DurableAgenticWorkflowInput {
   scorers?: SerializableScorersConfig;
   /** Serializable execution options */
   options: SerializableDurableOptions;
-  /** Framework-owned response-only call state; never contains user callbacks or tool implementations. */
-  responseRecoveryPhase?: DurableResponseRecoveryPhase;
+  /** Serialized guard; a matching live prepareStep admission is still required. */
+  responseRecovery?: DurableResponseRecoveryState;
   /** Serializable internal state */
   state: SerializableDurableState;
   /** Message ID for the current generation */
@@ -376,8 +381,8 @@ export interface DurableLLMStepOutput {
   processorRetryFeedback?: string;
   /** Updated serializable state */
   state: SerializableDurableState;
-  /** Consumed response-only call state propagated across the durable step boundary. */
-  responseRecoveryPhase?: DurableResponseRecoveryPhase;
+  /** The live response-only capability was consumed, even if a later hard stop prevented provider I/O. */
+  responseRecoveryConsumed?: boolean;
   /** Exported model_generation span data (only set when there are tool calls) */
   modelSpanData?: unknown;
   /** Exported model_step span data (only set when there are tool calls) */
@@ -472,8 +477,8 @@ export interface DurableAgenticExecutionOutput {
   };
   /** Updated state */
   state: SerializableDurableState;
-  /** Framework-owned response-only call state propagated into the next iteration checkpoint. */
-  responseRecoveryPhase?: DurableResponseRecoveryPhase;
+  /** The live response-only capability was consumed by this iteration. */
+  responseRecoveryConsumed?: boolean;
   /** Processor retry tracking */
   processorRetryCount?: number;
   processorRetryFeedback?: string;

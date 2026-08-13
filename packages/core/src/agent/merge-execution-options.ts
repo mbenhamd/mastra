@@ -9,8 +9,11 @@ import { deepMerge } from '../utils';
  */
 export const AGENT_EXECUTION_OPTION_COMPOSERS = Symbol('agentExecutionOptionComposers');
 
-/** Internal marker returned only by a framework-owned response-recovery hook. */
+/** Internal marker returned only by a framework-owned response-recovery continuation hook. */
 export const AGENT_RESPONSE_RECOVERY_CONTINUATION = Symbol('agentResponseRecoveryContinuation');
+
+/** Internal marker returned by the matching response-only prepareStep hook. */
+export const AGENT_RESPONSE_RECOVERY_STEP = Symbol('agentResponseRecoveryStep');
 
 export type AgentExecutionOptionComposers = Partial<
   Record<'onIterationComplete' | 'prepareStep', (existing: unknown) => unknown>
@@ -39,13 +42,15 @@ export function mergeAgentExecutionOptions(
   ) as Record<string, any>;
   const callerSymbols = callerOptions as Record<PropertyKey, any>;
   const configuredHooks = (callerSymbols[AGENT_CONFIGURED_EXECUTION_HOOKS] as
-    AgentConfiguredExecutionHooks | undefined) ?? {
+    | AgentConfiguredExecutionHooks
+    | undefined) ?? {
     onIterationComplete: merged.onIterationComplete,
     prepareStep: merged.prepareStep,
   };
 
   const createComposers = callerSymbols[AGENT_EXECUTION_OPTION_COMPOSERS] as
-    AgentExecutionOptionComposerFactory | undefined;
+    | AgentExecutionOptionComposerFactory
+    | undefined;
   // `deepMerge` intentionally copies only enumerable string keys. Preserve the
   // internal symbol metadata so an enclosing execution boundary can create a
   // fresh, run-local composer from the original configured hooks instead of

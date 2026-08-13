@@ -762,6 +762,27 @@ describe('InngestAgent parity surface', () => {
     expect(opts.tracingOptions).toEqual({ metadata: { feature: 'parity' } });
   });
 
+  it('rejects response-only recovery before Inngest dispatch', async () => {
+    const runId = 'inngest-response-recovery-rejected';
+    const { durableAgent, mastra } = makeIsolatedAgent('parity-response-recovery');
+    const sendSpy = stubInngestSend();
+
+    try {
+      await expect(
+        durableAgent.prepare([{ role: 'user', content: 'hi' }], { recoveryMaxSteps: 1 } as any),
+      ).rejects.toThrow('Inngest durable agents do not support response-only recovery; recoveryMaxSteps must be 0');
+      await expect(
+        durableAgent.stream([{ role: 'user', content: 'hi' }], { runId, recoveryMaxSteps: 1 } as any),
+      ).rejects.toThrow('Inngest durable agents do not support response-only recovery; recoveryMaxSteps must be 0');
+
+      expect(sendSpy).not.toHaveBeenCalled();
+      expect(globalRunRegistry.has(runId)).toBe(false);
+    } finally {
+      sendSpy.mockRestore();
+      await mastra.shutdown();
+    }
+  });
+
   it('exposes result.abort and flips the registry abortSignal', async () => {
     // Slice 2: stream() must own an AbortController, expose it via
     // result.abort, and surface its signal on the run-registry entry so the

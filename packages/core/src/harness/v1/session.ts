@@ -36,6 +36,7 @@ import type { AgentExecutionOptionsBase } from '../../agent/agent.types';
 import {
   AGENT_EXECUTION_OPTION_COMPOSERS,
   AGENT_RESPONSE_RECOVERY_CONTINUATION,
+  AGENT_RESPONSE_RECOVERY_STEP,
   type AgentExecutionOptionComposers,
 } from '../../agent/merge-execution-options';
 import { createSignal } from '../../agent/signals';
@@ -351,7 +352,9 @@ type MessageAdmissionHashes = {
 };
 
 type QueueResumeRecoveryResult =
-  { status: 'none' } | { status: 'completed'; result: AgentResult } | { status: 'stale' };
+  | { status: 'none' }
+  | { status: 'completed'; result: AgentResult }
+  | { status: 'stale' };
 
 type ResumeResponseMode = 'agent-result' | 'inbox-receipt';
 type InboxReceiptResponseOptions = Extract<InboxResponseOptions, { responseId: string }>;
@@ -423,6 +426,7 @@ function createHarnessEmptySynthesisOptions(reportConfiguredHookError: HarnessEx
       let nudged = false;
       let segmentHasToolResults = false;
       let responseOnly = false;
+      let responseOnlyPrepared = false;
       let ordinaryBudgetExhausted = false;
       return {
         recoveryMaxSteps: 1,
@@ -515,6 +519,11 @@ function createHarnessEmptySynthesisOptions(reportConfiguredHookError: HarnessEx
             ) {
               throw new HarnessOrdinaryStepBudgetExhaustedError();
             }
+            if (responseOnly && responseOnlyPrepared) {
+              throw new HarnessResponseRecoveryAlreadyPreparedError();
+            }
+            if (responseOnly) responseOnlyPrepared = true;
+
             let configuredResult: Awaited<ReturnType<HarnessPrepareStep>>;
             try {
               configuredResult = await configured?.(args);
@@ -527,12 +536,24 @@ function createHarnessEmptySynthesisOptions(reportConfiguredHookError: HarnessEx
               configuredResult = undefined;
             }
             if (!responseOnly) return configuredResult;
-            return { ...(configuredResult ?? {}), activeTools: [], toolChoice: 'none' };
+            return {
+              ...(configuredResult ?? {}),
+              activeTools: [],
+              toolChoice: 'none',
+              [AGENT_RESPONSE_RECOVERY_STEP]: true,
+            };
           };
         },
       };
     },
   };
+}
+
+class HarnessResponseRecoveryAlreadyPreparedError extends Error {
+  constructor() {
+    super('Harness response recovery has already admitted its one provider attempt');
+    this.name = 'HarnessResponseRecoveryAlreadyPreparedError';
+  }
 }
 
 class HarnessOrdinaryStepBudgetExhaustedError extends Error {
@@ -4321,7 +4342,8 @@ export class Session {
    * `_internalAwaitFlushChain()` so shutdown and tests can act on it. */
   private _pendingTokenUsageFlushError: unknown;
   private _pendingDurableTurnFlushError:
-    { error: unknown; pendingResume?: { runId: string; toolCallId: string } } | undefined;
+    | { error: unknown; pendingResume?: { runId: string; toolCallId: string } }
+    | undefined;
 
   /**
    * True while a turn (message or queued) is in flight against the agent.

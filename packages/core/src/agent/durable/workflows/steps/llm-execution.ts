@@ -39,6 +39,7 @@ import { createMastraProxy, makeCoreTool } from '../../../../utils';
 import { PUBSUB_SYMBOL } from '../../../../workflows/constants';
 import { createStep } from '../../../../workflows/workflow';
 import { enforceChannelToolFence, readChannelToolFence } from '../../../channel-tool-fence';
+import { AGENT_RESPONSE_RECOVERY_STEP } from '../../../merge-execution-options';
 import { MessageList } from '../../../message-list';
 import {
   createProcessorToolSurfaceView,
@@ -85,7 +86,9 @@ const durableLLMInputSchema = z.object({
   // Model list for fallback support (when agent configured with array of models)
   modelList: z.array(modelListEntrySchema).optional(),
   options: z.any(),
-  responseRecoveryPhase: z.enum(['reserved', 'consumed']).optional(),
+  responseRecovery: z
+    .object({ phase: z.literal('reserved'), reservedAtIteration: z.number().int().nonnegative() })
+    .optional(),
   state: z.any(),
   messageId: z.string(),
   // Agent span data for model span parenting
@@ -121,7 +124,7 @@ const durableLLMOutputSchema = z.object({
   processorRetryCount: z.number().optional(),
   processorRetryFeedback: z.string().optional(),
   state: z.any(),
-  responseRecoveryPhase: z.enum(['reserved', 'consumed']).optional(),
+  responseRecoveryConsumed: z.boolean().optional(),
   // Step index used in this execution (for tracking)
   stepIndex: z.number().optional(),
   // Exported span data forwarded to downstream steps for trace nesting/closing
@@ -165,7 +168,15 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
       const typedInput = inputData as DurableAgenticWorkflowInput;
       const { agentId, messageId, options: execOptions } = typedInput;
       const runId = typedInput.runId;
-      const responseRecoveryReserved = typedInput.responseRecoveryPhase === 'reserved';
+      const responseRecoveryReserved =
+        typedInput.responseRecovery?.phase === 'reserved' &&
+        typedInput.responseRecovery.reservedAtIteration === typedInput.stepIndex;
+      if (typedInput.responseRecovery && !responseRecoveryReserved) {
+        throw new Error(
+          `Durable response recovery reservation for run "${runId}" does not match step ${typedInput.stepIndex ?? 'unknown'}`,
+        );
+      }
+      let responseRecoveryAdmitted = false;
       const logger = mastra?.getLogger?.();
 
       // 1. Resolve runtime dependencies (tools from Mastra)
@@ -296,7 +307,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
               enabled: true,
             },
           ];
-      // A reserved recovery owns one request, not a new retry/fallback budget.
+      // A reserved recovery owns one request, not another fallback budget.
       const modelList = responseRecoveryReserved ? resolvedExecutionModels.slice(0, 1) : resolvedExecutionModels;
 
       if (modelList.length === 0) {
@@ -460,6 +471,9 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                   abortSignal: executionAbortSignal,
                   writer: inputStepWriter,
                 });
+                responseRecoveryAdmitted =
+                  (processInputStepResult as Record<PropertyKey, unknown>)[AGENT_RESPONSE_RECOVERY_STEP] === true;
+
                 const merged = composeStepInput(
                   {
                     messageId: currentMessageId,
@@ -647,6 +661,18 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
               }
             }
 
+            if (responseRecoveryReserved !== responseRecoveryAdmitted) {
+              throw new Error(
+                responseRecoveryReserved
+                  ? `Durable response recovery for run "${runId}" lost its live one-shot admission`
+                  : `Run "${runId}" produced a response-recovery admission without a durable reservation`,
+              );
+            }
+            if (responseRecoveryReserved) {
+              currentActiveTools = [];
+              currentToolChoice = 'none';
+            }
+
             // ── Signal echo & pre-run drain ───────────────────────────────
             // Mirror the non-durable llm-execution-step:
             //  1. Echo initialSignalEchoes (signals that were part of the input
@@ -796,6 +822,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                       modelId: currentModel.modelId,
                     },
                     state: typedInput.state,
+                    ...(responseRecoveryAdmitted ? { responseRecoveryConsumed: true } : {}),
                   } satisfies DurableLLMStepOutput;
                 }
                 logger?.error?.('Error in processLLMRequest processors:', error);
@@ -803,9 +830,8 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
               }
             }
 
-            // Recovery must perform the one freshly fenced request. A cache
-            // response was produced under an earlier tool surface and cannot
-            // consume or stand in for this reserved call.
+            // Recovery must perform one freshly fenced request. A cache entry
+            // was produced under another tool surface and cannot consume it.
             if (responseRecoveryReserved) cachedResponse = undefined;
 
             // processLLMRequest runs after processInputStep and may share the
@@ -838,15 +864,16 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
               ) as ToolChoice<ToolSet> | undefined;
             }
 
-            // The durable checkpoint, not a process-local prepareStep closure, owns
-            // the response-only recovery fence. Apply it after every configured
-            // processor surface has composed its selection so cold workers cannot
-            // regain tools. The provider call consumes the reservation regardless
-            // of whether the provider complies.
+            // Apply the response-only fence again after every configured
+            // processor boundary. The serialized reservation is only a guard;
+            // the process-local prepareStep admission above is the authority.
             if (responseRecoveryReserved) {
               currentActiveTools = [];
               currentToolChoice = 'none';
             }
+            const toolExecutionDisabled =
+              currentToolChoice === 'none' && Array.isArray(currentActiveTools) && currentActiveTools.length === 0;
+            let providerToolChunkSuppressed = false;
 
             // Enable defer mode - step-finish won't auto-close the step span
             // This allows us to export the step span and close it later after tool execution
@@ -1148,6 +1175,23 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
               });
             }
 
+            // Filter the effective no-tools boundary before MastraModelOutput,
+            // so streaming output processors cannot observe or act on a
+            // provider's non-compliant tool chunks.
+            const guardedModelResult = toolExecutionDisabled
+              ? (modelResult as ReadableStream<any>).pipeThrough(
+                  new TransformStream<any, any>({
+                    transform(chunk, streamController) {
+                      if (chunk?.type?.startsWith?.('tool-')) {
+                        providerToolChunkSuppressed = true;
+                        return;
+                      }
+                      streamController.enqueue(chunk);
+                    },
+                  }),
+                )
+              : modelResult;
+
             // 10. Create output stream to process chunks
             // Note: We cast through any to handle the web/node ReadableStream type mismatch
             const outputStream = new MastraModelOutput({
@@ -1156,7 +1200,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                 provider: currentModel.provider,
                 version: currentModel.specificationVersion,
               },
-              stream: modelResult as any,
+              stream: guardedModelResult as any,
               messageList,
               messageId: currentMessageId,
               options: {
@@ -1195,6 +1239,14 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                 // chunks, stop consuming the stream immediately so we don't
                 // send additional data to the client after cancellation.
                 if (executionAbortSignal?.aborted) break;
+
+                // An explicit no-tools step is an execution boundary, not a
+                // provider hint. Drop hostile tool-family chunks before client
+                // publication, lifecycle callbacks, or message persistence.
+                if (toolExecutionDisabled && rawChunk.type?.startsWith?.('tool-')) {
+                  providerToolChunkSuppressed = true;
+                  continue;
+                }
 
                 // Emit step-start before the first stream chunk so the
                 // ordering matches the regular agent: start → step-start → response-metadata → …
@@ -1520,6 +1572,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                   },
                   metadata: { modelId: currentModel.modelId },
                   state: typedInput.state,
+                  ...(responseRecoveryAdmitted ? { responseRecoveryConsumed: true } : {}),
                 } satisfies DurableLLMStepOutput;
               }
 
@@ -1595,6 +1648,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                   },
                   metadata: { modelId: currentModel.modelId },
                   state: typedInput.state,
+                  ...(responseRecoveryAdmitted ? { responseRecoveryConsumed: true } : {}),
                 } satisfies DurableLLMStepOutput;
               }
 
@@ -1659,6 +1713,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                       modelId: currentModel.modelId,
                     },
                     state: typedInput.state,
+                    ...(responseRecoveryAdmitted ? { responseRecoveryConsumed: true } : {}),
                   } satisfies DurableLLMStepOutput;
                 }
                 logger?.error?.('Error in processLLMResponse processors:', error);
@@ -1718,14 +1773,14 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
               }
             }
 
-            // 13. Determine if we should continue (has tool calls)
-            // A response-only provider violation is terminal evidence, never an
-            // executable call. Keep it model-visible in the reconstructed message
-            // but clear the durable execution projection before foreach.
-            if (responseRecoveryReserved && toolCalls.length > 0) {
-              toolCalls.length = 0;
-            }
-            const isContinued = !responseRecoveryReserved && toolCalls.length > 0 && finishReason !== 'stop';
+            // 13. Determine if we should continue (has tool calls). A
+            // non-compliant recovery provider cannot create executable work.
+            if (toolExecutionDisabled) toolCalls.length = 0;
+            const isContinued =
+              !responseRecoveryReserved &&
+              !providerToolChunkSuppressed &&
+              toolCalls.length > 0 &&
+              finishReason !== 'stop';
             const hasToolCalls = toolCalls.length > 0;
 
             // 13.5. Run processOutputStep for output processors (runs AFTER LLM response, BEFORE tool execution)
@@ -1794,6 +1849,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                     },
                     metadata: { modelId: currentModel.modelId },
                     state: typedInput.state,
+                    ...(responseRecoveryAdmitted ? { responseRecoveryConsumed: true } : {}),
                   };
                 }
                 throw error;
@@ -1883,7 +1939,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                 request,
               },
               state: typedInput.state,
-              ...(responseRecoveryReserved ? { responseRecoveryPhase: 'consumed' as const } : {}),
+              ...(responseRecoveryAdmitted ? { responseRecoveryConsumed: true } : {}),
               // Pass span data so tool calls can be children of model_step
               modelSpanData: hasToolCalls ? modelSpan?.exportSpan?.() : undefined,
               stepSpanData,
@@ -1956,7 +2012,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                 },
                 metadata: { modelId: modelEntry.config.modelId },
                 state: typedInput.state,
-                ...(responseRecoveryReserved ? { responseRecoveryPhase: 'consumed' as const } : {}),
+                ...(responseRecoveryAdmitted ? { responseRecoveryConsumed: true } : {}),
               } satisfies DurableLLMStepOutput;
             }
 
@@ -2070,6 +2126,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
         },
         metadata: { modelId },
         state: typedInput.state,
+        ...(responseRecoveryAdmitted ? { responseRecoveryConsumed: true } : {}),
       };
     },
   });

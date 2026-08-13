@@ -4,7 +4,10 @@ import type { OutputProcessor, Processor } from '../../../../processors';
 import { createTool } from '../../../../tools';
 import { runLoopScenario, useLoopScenarioAimock, describeForAllEngines } from '../aimock-scenario';
 import type { IterationCompleteContext } from '../../../../agent';
-import { AGENT_RESPONSE_RECOVERY_CONTINUATION } from '../../../../agent/merge-execution-options';
+import {
+  AGENT_RESPONSE_RECOVERY_CONTINUATION,
+  AGENT_RESPONSE_RECOVERY_STEP,
+} from '../../../../agent/merge-execution-options';
 
 /**
  * Regression class: onIterationComplete hook — supervisor iteration tracking.
@@ -481,6 +484,7 @@ describeForAllEngines(
       let toolExecutions = 0;
       let segmentHasToolResults = false;
       let responseOnly = false;
+      const outputProcessorToolParts: Array<{ type: string; toolCallId?: string }> = [];
 
       const updateThing = createTool({
         id: 'update_thing',
@@ -493,13 +497,24 @@ describeForAllEngines(
         },
       });
 
-      const { chunks, requests } = await runLoopScenario({
+      const { chunks, requests, output } = await runLoopScenario({
         engine,
         llm: getMock(),
         prompt: 'Update the probe and report the outcome.',
         tools: { update_thing: updateThing },
         maxSteps: 20,
         collectChunks: true,
+        outputProcessors: [
+          {
+            id: 'observe-recovery-tool-chunks',
+            async processOutputStream({ part }: { part: any }) {
+              if (part?.type?.startsWith?.('tool-')) {
+                outputProcessorToolParts.push({ type: part.type, toolCallId: part.payload?.toolCallId });
+              }
+              return part;
+            },
+          },
+        ],
         prepareStep: () => (responseOnly ? { activeTools: [], toolChoice: 'none' } : undefined),
         onIterationComplete: async (context: IterationCompleteContext) => {
           iterations.push(context);
@@ -543,6 +558,11 @@ describeForAllEngines(
         'Reply with the outcome only. Do not call tools.',
       );
       expect(requests[2]?.body?.tools ?? []).toHaveLength(0);
+      expect(outputProcessorToolParts).toContainEqual({ type: 'tool-call', toolCallId: 'call_update_1' });
+      expect(
+        outputProcessorToolParts.some(part => part.toolCallId === 'call_update_1' && part.type !== 'tool-call'),
+      ).toBe(true);
+      expect(outputProcessorToolParts.some(part => part.toolCallId === 'call_update_2')).toBe(false);
       expect(nudged).toBe(true);
       expect(iterations[0]).toMatchObject({
         text: 'I will update the probe now.',
@@ -552,11 +572,17 @@ describeForAllEngines(
         text: '',
         isFinal: true,
       });
+      expect(
+        (chunks ?? []).some(
+          chunk => chunk.type.startsWith('tool-') && (chunk as any).payload?.toolCallId === 'call_update_2',
+        ),
+      ).toBe(false);
       const text = (chunks ?? [])
         .filter(chunk => chunk.type === 'text-delta')
         .map((chunk: any) => chunk.payload?.text ?? '')
         .join('');
       expect(text).not.toContain('UNEXPECTED_EXTRA_RECOVERY_STEP');
+      expect(JSON.stringify((await output.getFullOutput()).steps)).not.toContain('call_update_2');
     });
 
     it('uses a hook-forced continuation as the only call beyond maxSteps', async () => {
@@ -581,7 +607,8 @@ describeForAllEngines(
         maxSteps: 1,
         recoveryMaxSteps: 1,
         collectChunks: true,
-        prepareStep: () => (responseOnly ? { activeTools: [], toolChoice: 'none' } : undefined),
+        prepareStep: () =>
+          responseOnly ? { activeTools: [], toolChoice: 'none', [AGENT_RESPONSE_RECOVERY_STEP]: true } : undefined,
         onIterationComplete: (context: IterationCompleteContext) => {
           if (!responseOnly && context.isFinal && context.text.trim() === '' && context.toolResults.length > 0) {
             responseOnly = true;
@@ -635,7 +662,7 @@ describeForAllEngines(
         recoveryMaxSteps: 1,
         abortSignal: abortController.signal,
         prepareStep: () => (responseOnly ? { activeTools: [], toolChoice: 'none' } : undefined),
-        onIterationComplete: context => {
+        onIterationComplete: (context: IterationCompleteContext) => {
           if (context.isFinal && context.toolResults.length > 0) {
             responseOnly = true;
             abortController.abort();

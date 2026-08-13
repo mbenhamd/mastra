@@ -73,6 +73,7 @@ import { InngestPubSub } from '../pubsub';
 import type { InngestRun } from '../run';
 import { INNGEST_WORKFLOW_LIFECYCLE_REPLAY, InngestWorkflow } from '../workflow';
 import {
+  assertInngestResponseRecoveryDisabled,
   createInngestDurableAgenticWorkflow,
   createInngestDurableAgenticWorkflowIds,
 } from './create-inngest-agentic-workflow';
@@ -751,8 +752,8 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
 
   /**
    * Make the worker resolver requirement part of the durable run contract.
-   * Protocol-v2 workers that receive this marker deny when the configured
-   * callback is unavailable. Versioned function IDs keep pre-v2 workers from
+   * Protocol-v3 workers that receive this marker deny when the configured
+   * callback is unavailable. Versioned function IDs keep pre-v3 workers from
    * claiming these events because those workers don't understand the marker.
    */
   function requireWorkerPermissionResolver(workflowInput: any): void {
@@ -954,6 +955,10 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
         }) as Promise<InngestAgentStreamResult<TOutput>>;
       }
 
+      // Inngest can move the next operation to another worker, so reject the
+      // live-only recovery capability before preparation or dispatch.
+      assertInngestResponseRecoveryDisabled(streamOptions);
+
       // 1. Prepare for durable execution
       const preparation = await prepareForDurableExecution<TOutput>({
         agent: agent as Agent<string, any, TOutput>,
@@ -966,6 +971,7 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
       });
 
       const { runId, messageId, workflowInput, registryEntry, threadId, resourceId } = preparation;
+      assertInngestResponseRecoveryDisabled(workflowInput.options);
       const runtimeBindingId = registryEntry.runtimeBindingId;
       if (!runtimeBindingId) {
         throw new TypeError(`Cannot start Inngest durable-agent run ${runId}: runtime binding is missing`);
@@ -1439,6 +1445,7 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
     },
 
     async prepare(messages, prepareOptions) {
+      assertInngestResponseRecoveryDisabled(prepareOptions);
       const preparation = await prepareForDurableExecution<TOutput>({
         agent: agent as Agent<string, any, TOutput>,
         messages,
@@ -1446,6 +1453,8 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
         requestContext: prepareOptions?.requestContext,
         durableRequestContextKeys,
       });
+
+      assertInngestResponseRecoveryDisabled(preparation.workflowInput.options);
 
       // Override with durable agent's id/name
       preparation.workflowInput.agentId = agentId;

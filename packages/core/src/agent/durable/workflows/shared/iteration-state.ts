@@ -94,7 +94,7 @@ export function createBaseIterationStateUpdate(input: IterationStateUpdateInput)
     toolsMetadata: currentState.toolsMetadata,
     modelConfig: currentState.modelConfig,
     options: currentState.options,
-    responseRecoveryPhase: executionOutput.responseRecoveryPhase ?? currentState.responseRecoveryPhase,
+    responseRecovery: executionOutput.responseRecoveryConsumed ? undefined : currentState.responseRecovery,
     state: executionOutput.state,
     messageId: executionOutput.messageId,
     iterationCount: currentState.iterationCount + 1,

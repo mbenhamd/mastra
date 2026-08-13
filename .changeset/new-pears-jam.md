@@ -2,4 +2,4 @@
 '@mastra/core': patch
 ---
 
-Fixed Harness conversations ending silently after tool results so the agent now sends a final response that completes the interaction.
+Harness conversations that end silently after tool results now make one bounded, response-only recovery attempt with tools disabled.
