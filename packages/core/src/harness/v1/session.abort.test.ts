@@ -102,6 +102,14 @@ describe('Session.abort()', () => {
     agent.enqueueRun({
       finishReason: 'stop',
       text: 'done',
+      runId: 'run-aborted-tool',
+      chunks: [
+        {
+          type: 'tool-call',
+          payload: { toolCallId: 'tool-aborted', toolName: 'lookup', args: {} },
+          runId: 'run-aborted-tool',
+        },
+      ],
       holdUntil: hold.promise,
       onAbort: reason => {
         abortReason = reason;
@@ -110,17 +118,21 @@ describe('Session.abort()', () => {
 
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
     const events: unknown[] = [];
-    session.subscribe(event => events.push(event));
+    session.subscribe(event => {
+      events.push(event);
+    });
     const inflight = session.message({ content: 'go' });
 
-    await waitFor(() => session.isRunning());
+    await waitFor(
+      () => session.isRunning() && events.some(event => (event as { type?: string }).type === 'tool_start'),
+    );
     expect(session.isRunning()).toBe(true);
 
     session.abort({ reason: 'user-cancelled' });
 
     // The hold loses to abort — mock agent surfaces finishReason='aborted'
     // and Session unwinds cleanly.
-    await inflight;
+    const result = (await inflight) as Record<string, unknown>;
     // §6.2: the abort reason is a typed HarnessAbortedError; public abort() is
     // ordinary agent-layer cancellation, so a caller string does not become the
     // structured reason.
@@ -134,6 +146,16 @@ describe('Session.abort()', () => {
         finishReason: 'aborted',
       }),
     ]);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: 'tool_end',
+        runId: result.runId,
+        toolCallId: 'tool-aborted',
+        toolName: 'lookup',
+        isError: true,
+      }),
+    );
+    expect(result.harnessToolReceipts).toEqual([{ toolCallId: 'tool-aborted', toolName: 'lookup', status: 'error' }]);
 
     // Per-turn signal handed to the agent carries the same typed HarnessAbortedError.
     const turnSignal = agent.streamCalls[0]!.options.abortSignal as AbortSignal;
@@ -150,7 +172,9 @@ describe('Session.abort()', () => {
 
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
     const events: unknown[] = [];
-    session.subscribe(event => events.push(event));
+    session.subscribe(event => {
+      events.push(event);
+    });
     const inflight = session.message({ content: 'go' });
 
     await waitFor(() => session.isRunning());

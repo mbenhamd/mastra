@@ -530,8 +530,7 @@ describe('Session events — fullStream drain', () => {
     await session.message({ content: 'hi' });
 
     const textDelta = events.find(e => e.type === 'text_delta') as
-      | Extract<HarnessEvent, { type: 'text_delta' }>
-      | undefined;
+      Extract<HarnessEvent, { type: 'text_delta' }> | undefined;
     expect(textDelta?.delta).toBe('no-run-id');
     expect(typeof textDelta?.runId).toBe('string');
     expect((textDelta?.runId ?? '').length).toBeGreaterThan(0);
@@ -1293,7 +1292,7 @@ describe('Session synthetic tool_end on unsettled tools (§10.2)', () => {
     try {
       const events: HarnessEvent[] = [];
       session.subscribe(e => events.push(e));
-      await session.message({ content: 'hi' });
+      const result = (await session.message({ content: 'hi' })) as any;
 
       const starts = events.filter(e => e.type === 'tool_start') as any[];
       const ends = events.filter(e => e.type === 'tool_end') as any[];
@@ -1307,7 +1306,8 @@ describe('Session synthetic tool_end on unsettled tools (§10.2)', () => {
       expect(typeof end.runId).toBe('string');
       expect(end.runId.length).toBeGreaterThan(0);
       expect((end.output as any).aborted).toBe(true);
-      // Exactly one terminal (no duplicate from a later real result).
+      expect(result.harnessToolReceipts).toEqual([{ toolCallId: 'tc-dangle', toolName: 'lookup', status: 'error' }]);
+      // Exactly one terminal and one matching receipt.
       expect(ends.filter(e => e.toolCallId === 'tc-dangle')).toHaveLength(1);
     } finally {
       await harness.shutdown();
