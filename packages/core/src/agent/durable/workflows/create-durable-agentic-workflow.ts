@@ -422,7 +422,7 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
         // engines (Inngest after worker restart) won't have the registry entry
         // and fall back to maxSteps only.
         let stopWhenMatched = false;
-        if (shouldContinue && underMaxSteps && !hasFinishedSteps && !state.terminalToolResult) {
+        if (shouldContinue && !hasFinishedSteps && !state.terminalToolResult) {
           const stopWhen = registryEntry?.stopWhen;
           if (stopWhen && state.accumulatedSteps.length > 0) {
             const conditions = Array.isArray(stopWhen) ? stopWhen : [stopWhen];
@@ -553,6 +553,7 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
                 iterationResult.continue === true && iterationResult[AGENT_RESPONSE_RECOVERY_CONTINUATION] === true;
               const canUseRecoveryTurn =
                 responseRecoveryRequested &&
+                !stopWhenMatched &&
                 recoveryMaxSteps > 0 &&
                 state.iterationCount >= runMaxSteps &&
                 state.iterationCount < runMaxSteps + recoveryMaxSteps;
@@ -641,6 +642,10 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
             state.lastStepResult.reason = 'abort';
             state.lastStepResult.isContinued = false;
           }
+        }
+
+        if (isFinal && state.lastStepResult) {
+          state.lastStepResult.isContinued = false;
         }
 
         // Rotate messageId for the next iteration. Each iteration's assistant

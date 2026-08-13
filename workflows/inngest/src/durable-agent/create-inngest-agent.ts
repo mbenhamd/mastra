@@ -1027,7 +1027,7 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
         // 2. Create AGENT_RUN span BEFORE the workflow starts
         // This ensures the agent_run is the root of the trace, not the workflow
         const observability = mastra?.observability?.getSelectedInstance({
-          requestContext: streamOptions?.requestContext,
+          requestContext,
         });
         const agentSpan = observability?.startSpan({
           type: SpanType.AGENT_RUN,

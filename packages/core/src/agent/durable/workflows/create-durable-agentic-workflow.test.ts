@@ -52,6 +52,48 @@ describe('mapDurableIterationToLLMInput', () => {
 });
 
 describe('createDurableAgenticWorkflow response recovery arbitration', () => {
+  it('keeps a matching caller stop condition terminal at the ordinary maxSteps boundary', async () => {
+    const runId = 'stop-when-recovery-run';
+    const runtimeBindingId = 'stop-when-recovery-binding';
+    const workflow = createDurableAgenticWorkflow() as any;
+    const loopEntry = findLoopEntry(workflow.executionGraph.steps);
+    const stopWhen = vi.fn(async () => true);
+    const onIterationComplete = vi.fn(async () => ({
+      continue: true,
+      [AGENT_RESPONSE_RECOVERY_CONTINUATION]: true,
+    }));
+    globalRunRegistry.set(runId, { runtimeBindingId, stopWhen, onIterationComplete } as any);
+    const state: any = {
+      __workflowKind: 'durable-agent',
+      runId,
+      runtimeBindingId,
+      agentId: 'recovery-agent',
+      options: { maxSteps: 1, recoveryMaxSteps: 1 },
+      iterationCount: 1,
+      accumulatedSteps: [{ text: '', toolCalls: [], toolResults: [], finishReason: 'stop' }],
+      messageListState: new MessageList().serialize(),
+      messageId: 'message-1',
+      state: {},
+      lastStepResult: { reason: 'stop', warnings: [], isContinued: true },
+    };
+
+    try {
+      await expect(
+        loopEntry.condition({
+          inputData: state,
+          getInitData: () => state,
+          mastra: undefined,
+        }),
+      ).resolves.toBe(false);
+
+      expect(stopWhen).toHaveBeenCalledTimes(1);
+      expect(state.responseRecovery).toBeUndefined();
+      expect(state.lastStepResult.isContinued).toBe(false);
+    } finally {
+      globalRunRegistry.delete(runId);
+    }
+  });
+
   it('reserves a marked response-only continuation before the ordinary maxSteps ceiling', async () => {
     const runId = 'ordinary-budget-recovery-run';
     const runtimeBindingId = 'ordinary-budget-recovery-binding';
