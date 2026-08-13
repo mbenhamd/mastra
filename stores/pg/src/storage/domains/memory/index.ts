@@ -3496,16 +3496,20 @@ export class MemoryPG extends MemoryStorage {
     await t.none(`DELETE FROM ${omTableName} WHERE "lookupKey" IN ($1, $2)`, [resourceLookupKey, threadLookupKey]);
 
     const lookupKeys = new Set(records.map(record => record.lookupKey));
-    const managedWorkingMemoryScopes = new Set(
-      records
-        .map(record => getManagedWorkingMemoryScope(record.config))
-        .filter((scope): scope is 'thread' | 'resource' => scope !== undefined),
+    const resourceRecordManagedWorkingMemoryScope = getManagedWorkingMemoryScope(
+      records.find(record => record.lookupKey === resourceLookupKey)?.config,
+    );
+    const threadRecordManagedWorkingMemoryScope = getManagedWorkingMemoryScope(
+      records.find(record => record.lookupKey === threadLookupKey)?.config,
     );
     let clearedResourceWorkingMemory = false;
     let clearedThreadMetadata = false;
     if (lookupKeys.size > 0) {
       const now = new Date().toISOString();
-      if (managedWorkingMemoryScopes.has('resource')) {
+      if (
+        resourceRecordManagedWorkingMemoryScope === 'resource' ||
+        threadRecordManagedWorkingMemoryScope === 'resource'
+      ) {
         const resource = await t.oneOrNone<{ workingMemory: string | null; metadata: unknown }>(
           `SELECT "workingMemory", metadata FROM ${resourceTableName} WHERE id = $1 FOR UPDATE`,
           [input.resourceId],
@@ -3543,14 +3547,23 @@ export class MemoryPG extends MemoryStorage {
       }
 
       const resourceScopeCleared = lookupKeys.has(resourceLookupKey);
-      const clearThreadWorkingMemory = managedWorkingMemoryScopes.has('thread');
       const threadSelector = resourceScopeCleared ? `"resourceId" = $1` : `id = $1 AND "resourceId" = $2`;
       const threadSelectorValues = resourceScopeCleared ? [input.resourceId] : [input.threadId, input.resourceId];
-      const metadataSelector = clearThreadWorkingMemory
-        ? `(jsonb_typeof(metadata->'mastra'->'om') = 'object'
-           OR COALESCE(metadata, '{}'::jsonb) ? 'workingMemory'
-           OR COALESCE(metadata->'mastra', '{}'::jsonb) ? 'workingMemory')`
-        : `jsonb_typeof(metadata->'mastra'->'om') = 'object'`;
+      const workingMemorySelector = `(COALESCE(metadata, '{}'::jsonb) ? 'workingMemory'
+         OR COALESCE(metadata->'mastra', '{}'::jsonb) ? 'workingMemory')`;
+      let managedWorkingMemorySelector: string | undefined;
+      if (resourceRecordManagedWorkingMemoryScope === 'thread') {
+        managedWorkingMemorySelector = workingMemorySelector;
+      } else if (threadRecordManagedWorkingMemoryScope === 'thread') {
+        if (resourceScopeCleared) {
+          threadSelectorValues.push(input.threadId);
+          managedWorkingMemorySelector = `(id = $${threadSelectorValues.length} AND ${workingMemorySelector})`;
+        } else {
+          managedWorkingMemorySelector = workingMemorySelector;
+        }
+      }
+      const metadataSelector = `(jsonb_typeof(metadata->'mastra'->'om') = 'object'
+         ${managedWorkingMemorySelector ? `OR ${managedWorkingMemorySelector}` : ''})`;
       const threads = await t.manyOrNone<{ id: string; title: string; metadata: unknown }>(
         `SELECT id, title, metadata FROM ${threadTableName}
          WHERE ${threadSelector} AND ${metadataSelector}
@@ -3565,6 +3578,9 @@ export class MemoryPG extends MemoryStorage {
         delete mastra.om;
         let nextMetadata: Record<string, unknown> = { ...metadata, mastra };
 
+        const clearThreadWorkingMemory =
+          resourceRecordManagedWorkingMemoryScope === 'thread' ||
+          (thread.id === input.threadId && threadRecordManagedWorkingMemoryScope === 'thread');
         if (clearThreadWorkingMemory) {
           if (hasWorkingMemorySnapshotControls(metadata)) {
             const current = readWorkingMemorySnapshot(

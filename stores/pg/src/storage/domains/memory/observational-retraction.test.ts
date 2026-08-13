@@ -522,6 +522,86 @@ describe('MemoryPG observational-memory retraction', () => {
     }
   });
 
+  it('preserves sibling thread memory when resource and thread OM records own different scopes', async () => {
+    const mixedResourceId = `${resourceId}-mixed-scopes`;
+    const editedThreadId = `${threadId}-mixed-edited`;
+    const siblingThreadId = `${threadId}-mixed-sibling`;
+    await observerMemory.saveResource({
+      resource: {
+        id: mixedResourceId,
+        workingMemory: 'observer-managed-resource',
+        metadata: {},
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+    for (const [mixedThreadId, label] of [
+      [editedThreadId, 'edited'],
+      [siblingThreadId, 'sibling'],
+    ] as const) {
+      await observerMemory.saveThread({
+        thread: {
+          id: mixedThreadId,
+          resourceId: mixedResourceId,
+          title: `Derived ${label}`,
+          metadata: {
+            workingMemory: `observer-managed-${label}`,
+            mastra: {
+              preserved: true,
+              om: { threadTitle: `Derived ${label}`, lastObservedMessageId: `message-${label}` },
+            },
+          },
+          createdAt,
+          updatedAt: createdAt,
+        },
+      });
+    }
+    await observerMemory.initializeObservationalMemory({
+      config: { _managedWorkingMemoryScope: 'resource' },
+      resourceId: mixedResourceId,
+      scope: 'resource',
+      threadId: null,
+    });
+    await observerMemory.initializeObservationalMemory({
+      config: { _managedWorkingMemoryScope: 'thread' },
+      resourceId: mixedResourceId,
+      scope: 'thread',
+      threadId: editedThreadId,
+    });
+
+    await expect(
+      retractorMemory.retractObservationalMemory({
+        resourceId: mixedResourceId,
+        threadId: editedThreadId,
+      }),
+    ).resolves.toEqual({
+      clearedScopes: ['resource', 'thread'],
+      clearedResourceWorkingMemory: true,
+      clearedThreadMetadata: true,
+    });
+
+    await expect(retractorMemory.getResourceById({ resourceId: mixedResourceId })).resolves.toMatchObject({
+      workingMemory: null,
+    });
+    const editedThread = await retractorMemory.getThreadById({ threadId: editedThreadId });
+    expect(editedThread).toMatchObject({
+      title: '',
+      metadata: { mastra: { preserved: true } },
+    });
+    expect(editedThread?.metadata).not.toHaveProperty('workingMemory');
+    expect(editedThread?.metadata?.mastra).not.toHaveProperty('om');
+
+    const siblingThread = await retractorMemory.getThreadById({ threadId: siblingThreadId });
+    expect(siblingThread).toMatchObject({
+      title: '',
+      metadata: {
+        workingMemory: 'observer-managed-sibling',
+        mastra: { preserved: true },
+      },
+    });
+    expect(siblingThread?.metadata?.mastra).not.toHaveProperty('om');
+  });
+
   it('resolves nullable message resources and retracts both sides of a move', async () => {
     const sourceResourceId = `${resourceId}-move-source`;
     const destinationResourceId = `${resourceId}-move-destination`;
