@@ -899,6 +899,27 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
             // Guards against a re-delivered tool-result minting a second span for the same call.
             const materializedProviderToolCallIds = new Set<string>();
 
+            const hasPendingProviderToolCall = (toolCallId: string, toolName?: string): boolean => {
+              const messages = messageList.get.all.db();
+              for (let i = messages.length - 1; i >= 0; i--) {
+                const msg = messages[i];
+                if (!msg || msg.role !== 'assistant' || !msg.content?.parts) continue;
+                for (const part of msg.content.parts) {
+                  if (part?.type !== 'tool-invocation') continue;
+                  const invocation = part.toolInvocation;
+                  if (
+                    part.providerExecuted === true &&
+                    invocation?.state === 'call' &&
+                    (invocation.toolCallId === toolCallId ||
+                      (toolName !== undefined && invocation.toolName === toolName))
+                  ) {
+                    return true;
+                  }
+                }
+              }
+              return false;
+            };
+
             const resolveToolDef = (toolName: string): CoreTool | undefined => {
               const directTool = (currentTools as unknown as Record<string, CoreTool> | undefined)?.[toolName];
               if (directTool) return directTool;
@@ -1175,9 +1196,15 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
               ? (modelResult as ReadableStream<any>).pipeThrough(
                   new TransformStream<any, any>({
                     transform(chunk, streamController) {
-                      if (chunk?.type?.startsWith?.('tool-') && chunk.type !== 'tool-result') {
-                        providerToolChunkSuppressed = true;
-                        return;
+                      if (chunk?.type?.startsWith?.('tool-')) {
+                        const settlesPendingProviderCall =
+                          chunk.type === 'tool-result' &&
+                          (pendingProviderToolCallsByToolCallId.has(chunk.payload.toolCallId) ||
+                            hasPendingProviderToolCall(chunk.payload.toolCallId, chunk.payload.toolName));
+                        if (!settlesPendingProviderCall) {
+                          providerToolChunkSuppressed = true;
+                          return;
+                        }
                       }
                       streamController.enqueue(chunk);
                     },
@@ -1236,9 +1263,15 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                 // An explicit no-tools step is an execution boundary, not a
                 // provider hint. Drop hostile tool-family chunks before client
                 // publication, lifecycle callbacks, or message persistence.
-                if (toolExecutionDisabled && rawChunk.type?.startsWith?.('tool-') && rawChunk.type !== 'tool-result') {
-                  providerToolChunkSuppressed = true;
-                  continue;
+                if (toolExecutionDisabled && rawChunk.type?.startsWith?.('tool-')) {
+                  const settlesPendingProviderCall =
+                    rawChunk.type === 'tool-result' &&
+                    (pendingProviderToolCallsByToolCallId.has(rawChunk.payload.toolCallId) ||
+                      hasPendingProviderToolCall(rawChunk.payload.toolCallId, rawChunk.payload.toolName));
+                  if (!settlesPendingProviderCall) {
+                    providerToolChunkSuppressed = true;
+                    continue;
+                  }
                 }
 
                 // Emit step-start before the first stream chunk so the

@@ -206,6 +206,26 @@ type ProcessOutputStreamOptions<OUTPUT = undefined> = {
  * Used to read the post-processToolResult value back from the message list so we can
  * sync any processor mutations into the downstream tool-result stream chunk.
  */
+function hasPendingProviderToolCall(messageList: MessageList, toolCallId: string, toolName?: string): boolean {
+  const messages = messageList.get.all.db();
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (!msg || msg.role !== 'assistant' || !msg.content?.parts) continue;
+    for (const part of msg.content.parts) {
+      if (part?.type !== 'tool-invocation') continue;
+      const invocation = part.toolInvocation;
+      if (
+        part.providerExecuted === true &&
+        invocation?.state === 'call' &&
+        (invocation.toolCallId === toolCallId || (toolName !== undefined && invocation.toolName === toolName))
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 function readToolResultFromMessageList(messageList: MessageList, toolCallId: string): unknown {
   const messages = messageList.get.all.db();
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -748,9 +768,15 @@ async function processOutputStream<OUTPUT = undefined>({
     // transforms, lifecycle callbacks, history assembly, or client delivery.
     // Provider-executed results for calls admitted by an earlier iteration may
     // still arrive here; preserve those so their pending calls can settle.
-    if (suppressToolChunks && chunk.type.startsWith('tool-') && chunk.type !== 'tool-result') {
-      toolChunkSuppressed = true;
-      continue;
+    if (suppressToolChunks && chunk.type.startsWith('tool-')) {
+      const settlesPendingProviderCall =
+        chunk.type === 'tool-result' &&
+        (pendingProviderToolCallsByToolCallId?.has(chunk.payload.toolCallId) === true ||
+          hasPendingProviderToolCall(messageList, chunk.payload.toolCallId, chunk.payload.toolName));
+      if (!settlesPendingProviderCall) {
+        toolChunkSuppressed = true;
+        continue;
+      }
     }
 
     if (['tool-call', 'tool-call-input-streaming-start'].includes(chunk.type)) {
@@ -1850,9 +1876,15 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
           ? (modelResult as ReadableStream<ChunkType<OUTPUT>>).pipeThrough(
               new TransformStream<ChunkType<OUTPUT>, ChunkType<OUTPUT>>({
                 transform(chunk, streamController) {
-                  if (chunk.type.startsWith('tool-') && chunk.type !== 'tool-result') {
-                    providerToolChunkSuppressed = true;
-                    return;
+                  if (chunk.type.startsWith('tool-')) {
+                    const settlesPendingProviderCall =
+                      chunk.type === 'tool-result' &&
+                      (pendingProviderToolCallsByToolCallId.has(chunk.payload.toolCallId) ||
+                        hasPendingProviderToolCall(messageList, chunk.payload.toolCallId, chunk.payload.toolName));
+                    if (!settlesPendingProviderCall) {
+                      providerToolChunkSuppressed = true;
+                      return;
+                    }
                   }
                   streamController.enqueue(chunk);
                 },

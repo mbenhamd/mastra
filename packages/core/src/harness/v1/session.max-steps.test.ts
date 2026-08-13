@@ -288,9 +288,13 @@ describe('Session empty-final-synthesis nudge', () => {
       continue: false,
     });
     expect(configuredIteration).toHaveBeenCalledTimes(3);
-    expect(loggerError).toHaveBeenCalledTimes(2);
-    expect(loggerError).toHaveBeenNthCalledWith(1, 'Error in onIterationComplete hook:', hookError);
-    expect(loggerError).toHaveBeenNthCalledWith(2, 'Error in onIterationComplete hook:', hookError);
+    const hookErrorCalls = loggerError.mock.calls.filter(
+      ([message]) => message === 'Error in onIterationComplete hook:',
+    );
+    expect(hookErrorCalls).toEqual([
+      ['Error in onIterationComplete hook:', hookError],
+      ['Error in onIterationComplete hook:', hookError],
+    ]);
     loggerError.mockRestore();
   });
 
