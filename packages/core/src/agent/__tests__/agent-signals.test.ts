@@ -1261,13 +1261,8 @@ describe('Agent signals', () => {
       });
       const terminal = await withTimeout(iterator.next(), 'Timed out waiting for filtered abort terminal');
       expect(terminal.value).toEqual({ type: 'abort', runId });
-      expect([authoritative.value, terminal.value]).not.toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({ type: 'text-delta' }),
-          expect.objectContaining({ type: 'tool-call', payload: expect.objectContaining({ toolCallId: 'late-tool' }) }),
-          expect.objectContaining({ type: 'finish' }),
-        ]),
-      );
+      expect([authoritative.value.type, terminal.value.type]).toEqual(['tool-error', 'abort']);
+      expect(authoritative.value.payload?.toolCallId).not.toBe('late-tool');
     } finally {
       subscription.unsubscribe();
       await iterator.return?.();
