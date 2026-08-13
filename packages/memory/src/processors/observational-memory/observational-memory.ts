@@ -1093,7 +1093,12 @@ export class ObservationalMemory {
    * Returns the existing record if one exists, otherwise initializes a new one.
    */
   async getOrCreateRecord(threadId: string, resourceId?: string): Promise<ObservationalMemoryRecord> {
-    const ids = this.getStorageIds(threadId, resourceId);
+    let resolvedResourceId = resourceId;
+    if (this.scope === 'thread' && resolvedResourceId === undefined) {
+      const thread = await this.storage.getThreadById({ threadId });
+      resolvedResourceId = thread?.resourceId;
+    }
+    const ids = this.getStorageIds(threadId, resolvedResourceId);
     // Storage adapters identify thread-scoped records by threadId alone and
     // resource-scoped records by resourceId alone. The single-flight key must
     // mirror that identity so optional resourceId differences cannot split a

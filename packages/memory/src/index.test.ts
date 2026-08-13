@@ -212,8 +212,9 @@ describe('Memory', () => {
 
     it('bounds escaped legacy working-memory data before rendering it', async () => {
       const maxDataBytes = 64;
+      const storage = new InMemoryStore();
       const memory = new Memory({
-        storage: new InMemoryStore(),
+        storage,
         options: {
           workingMemory: { enabled: true, agentManaged: false, maxDataBytes },
         },
@@ -221,10 +222,17 @@ describe('Memory', () => {
       const threadId = 'agent-managed-bounded-thread';
       const resourceId = 'agent-managed-bounded-resource';
       await memory.createThread({ threadId, resourceId });
-      await memory.updateWorkingMemory({
-        threadId,
-        resourceId,
-        workingMemory: '&'.repeat(100),
+      const memoryStore = await storage.getStore('memory');
+      if (!memoryStore) throw new Error('Expected memory storage.');
+      const now = new Date();
+      await memoryStore.saveResource({
+        resource: {
+          id: resourceId,
+          workingMemory: '&'.repeat(100),
+          metadata: {},
+          createdAt: now,
+          updatedAt: now,
+        },
       });
 
       const systemMessage = await memory.getSystemMessage({ threadId, resourceId });
@@ -252,6 +260,130 @@ describe('Memory', () => {
 
       expect(systemMessage).toContain('calling the updateWorkingMemory tool');
       expect(systemMessage).not.toContain('WORKING_MEMORY_SYSTEM_INSTRUCTION (READ-ONLY)');
+    });
+  });
+
+  describe('owner Working Memory controls', () => {
+    it('lets an authorized service protect corrections from later observer writes', async () => {
+      const memory = new Memory({
+        storage: new InMemoryStore(),
+        options: { workingMemory: { enabled: true, scope: 'resource' } },
+      });
+      const threadId = 'owner-correction-thread';
+      const resourceId = 'owner-correction-resource';
+      await memory.createThread({ threadId, resourceId });
+      await memory.updateWorkingMemory({
+        threadId,
+        resourceId,
+        workingMemory: '{"name":"Grace","focus":"compilers"}',
+      });
+      const beforeCorrection = await memory.getWorkingMemorySnapshot({ threadId, resourceId });
+
+      const corrected = await memory.updateWorkingMemoryByOwner({
+        threadId,
+        resourceId,
+        workingMemory: '{"name":"Ada","focus":"compilers"}',
+        expectedRevision: beforeCorrection.revision,
+        protectPaths: ['/name'],
+      });
+      await memory.updateWorkingMemory({
+        threadId,
+        resourceId,
+        workingMemory: '{"name":"Grace","focus":"proofs"}',
+      });
+
+      const afterObserver = await memory.getWorkingMemorySnapshot({ threadId, resourceId });
+      expect(JSON.parse(afterObserver.value!)).toEqual({ name: 'Ada', focus: 'proofs' });
+      expect(afterObserver.protectedPaths).toEqual(['/name']);
+      await expect(
+        memory.updateWorkingMemoryByOwner({
+          threadId,
+          resourceId,
+          workingMemory: '{}',
+          expectedRevision: corrected.revision,
+        }),
+      ).rejects.toMatchObject({ name: 'WorkingMemoryRevisionConflictError' });
+    });
+
+    it('preserves protected owner values across metadata-driven resource updates', async () => {
+      const memory = new Memory({
+        storage: new InMemoryStore(),
+        options: { workingMemory: { enabled: true, scope: 'resource' } },
+      });
+      const threadId = 'metadata-owner-correction-thread';
+      const resourceId = 'metadata-owner-correction-resource';
+      await memory.createThread({ threadId, resourceId });
+      const initial = await memory.getWorkingMemorySnapshot({ threadId, resourceId });
+      await memory.updateWorkingMemoryByOwner({
+        threadId,
+        resourceId,
+        workingMemory: '{"name":"Ada","focus":"proofs"}',
+        expectedRevision: initial.revision,
+        protectPaths: ['/name'],
+      });
+
+      const now = new Date();
+      await memory.saveThread({
+        thread: {
+          id: threadId,
+          resourceId,
+          metadata: { workingMemory: '{"name":"Grace","focus":"compilers"}' },
+          createdAt: now,
+          updatedAt: now,
+        },
+      });
+      await memory.updateThread({
+        id: threadId,
+        metadata: { workingMemory: '{"name":"Emmy","focus":"physics"}' },
+      });
+
+      const snapshot = await memory.getWorkingMemorySnapshot({ threadId, resourceId });
+      expect(JSON.parse(snapshot.value!)).toEqual({ name: 'Ada', focus: 'physics' });
+      expect(snapshot.protectedPaths).toEqual(['/name']);
+      expect(snapshot.provenance['/name']).toMatchObject({ source: 'owner' });
+    });
+
+    it('fails closed when the storage adapter does not advertise the native capability', async () => {
+      const storage = new InMemoryStore();
+      const memory = new Memory({
+        storage,
+        options: { workingMemory: { enabled: true, scope: 'resource' } },
+      });
+      const memoryStore = (await storage.getStore('memory'))!;
+      Object.defineProperty(memoryStore, 'supportsRevisionedWorkingMemory', {
+        configurable: true,
+        value: false,
+      });
+
+      await expect(memory.getWorkingMemorySnapshot({ resourceId: 'unsupported-resource' })).rejects.toThrow(
+        'not supported by this storage adapter',
+      );
+    });
+
+    it('enforces the configured UTF-8 storage bound for owner and observer writes', async () => {
+      const memory = new Memory({
+        storage: new InMemoryStore(),
+        options: { workingMemory: { enabled: true, scope: 'resource', maxDataBytes: 5 } },
+      });
+      const threadId = 'bounded-working-memory-thread';
+      const resourceId = 'bounded-working-memory-resource';
+      await memory.createThread({ threadId, resourceId });
+
+      await expect(memory.updateWorkingMemory({ threadId, resourceId, workingMemory: 'ééé' })).rejects.toThrow(
+        'UTF-8 byte limit',
+      );
+      await expect(
+        memory.updateWorkingMemoryByOwner({
+          threadId,
+          resourceId,
+          workingMemory: 'ééé',
+          expectedRevision: 0,
+        }),
+      ).rejects.toThrow('UTF-8 byte limit');
+      await expect(memory.getWorkingMemorySnapshot({ threadId, resourceId })).resolves.toMatchObject({
+        revision: 0,
+        value: null,
+      });
     });
   });
 
@@ -1083,6 +1215,108 @@ describe('Memory', () => {
         resourceId,
       });
       expect(clonedWm).toBe('User name is Alice. Lives in New York.');
+    });
+
+    it('preserves owner-protected paths when cloning thread-scoped working memory', async () => {
+      const wmMemory = new Memory({
+        storage: new InMemoryStore(),
+        options: { workingMemory: { enabled: true, scope: 'thread' } },
+      });
+      const sourceThread = await wmMemory.createThread({
+        threadId: 'source-thread-protected-wm',
+        resourceId,
+      });
+      const initial = await wmMemory.getWorkingMemorySnapshot({
+        threadId: sourceThread.id,
+        resourceId,
+      });
+      await wmMemory.updateWorkingMemoryByOwner({
+        threadId: sourceThread.id,
+        resourceId,
+        workingMemory: '{"name":"Ada","focus":"proofs"}',
+        expectedRevision: initial.revision,
+        protectPaths: ['/name'],
+      });
+
+      const { thread: clonedThread } = await wmMemory.cloneThread({
+        sourceThreadId: sourceThread.id,
+      });
+      await wmMemory.updateWorkingMemory({
+        threadId: clonedThread.id,
+        resourceId,
+        workingMemory: '{"name":"Grace","focus":"compilers"}',
+      });
+
+      const cloned = await wmMemory.getWorkingMemorySnapshot({
+        threadId: clonedThread.id,
+        resourceId,
+      });
+      expect(JSON.parse(cloned.value!)).toEqual({ name: 'Ada', focus: 'compilers' });
+      expect(cloned.protectedPaths).toEqual(['/name']);
+      expect(cloned.provenance['/name']).toMatchObject({ source: 'owner' });
+      expect(cloned.provenance['/focus']).toMatchObject({ source: 'observer' });
+    });
+
+    it('preserves an owner-protected empty root value when cloning thread-scoped working memory', async () => {
+      const wmMemory = new Memory({
+        storage: new InMemoryStore(),
+        options: { workingMemory: { enabled: true, scope: 'thread' } },
+      });
+      const sourceThread = await wmMemory.createThread({
+        threadId: 'source-thread-empty-protected-wm',
+        resourceId,
+      });
+      await wmMemory.updateWorkingMemoryByOwner({
+        threadId: sourceThread.id,
+        resourceId,
+        workingMemory: '',
+        expectedRevision: 0,
+        protectPaths: [''],
+      });
+
+      const { thread: clonedThread } = await wmMemory.cloneThread({
+        sourceThreadId: sourceThread.id,
+      });
+      await wmMemory.updateWorkingMemory({
+        threadId: clonedThread.id,
+        resourceId,
+        workingMemory: 'observer replacement',
+      });
+
+      await expect(wmMemory.getWorkingMemorySnapshot({ threadId: clonedThread.id, resourceId })).resolves.toMatchObject(
+        { value: '', protectedPaths: [''] },
+      );
+    });
+
+    it('preserves an owner-protected null root when cloning thread-scoped working memory', async () => {
+      const wmMemory = new Memory({
+        storage: new InMemoryStore(),
+        options: { workingMemory: { enabled: true, scope: 'thread' } },
+      });
+      const sourceThread = await wmMemory.createThread({
+        threadId: 'source-thread-null-protected-wm',
+        resourceId,
+      });
+      await wmMemory.updateWorkingMemoryByOwner({
+        threadId: sourceThread.id,
+        resourceId,
+        workingMemory: null,
+        expectedRevision: 0,
+        protectPaths: [''],
+      });
+
+      const { thread: clonedThread } = await wmMemory.cloneThread({
+        sourceThreadId: sourceThread.id,
+      });
+      await wmMemory.updateWorkingMemory({
+        threadId: clonedThread.id,
+        resourceId,
+        workingMemory: 'observer replacement',
+      });
+
+      await expect(wmMemory.getWorkingMemorySnapshot({ threadId: clonedThread.id, resourceId })).resolves.toMatchObject(
+        { value: null, protectedPaths: [''] },
+      );
     });
   });
 
@@ -3683,7 +3917,7 @@ describe('Memory', () => {
         options: { workingMemory: { enabled: true, scope: 'resource' } },
       });
       const memoryStore = (await storage.getStore('memory'))!;
-      const originalUpdateResource = memoryStore.updateResource.bind(memoryStore);
+      const originalApplyWorkingMemoryUpdate = memoryStore.applyWorkingMemoryUpdate.bind(memoryStore);
       const originalDeleteResource = memoryStore.deleteResource.bind(memoryStore);
       const operationOrder: string[] = [];
       let markUpdateStarted!: () => void;
@@ -3695,10 +3929,10 @@ describe('Memory', () => {
         releaseUpdate = resolve;
       });
 
-      vi.spyOn(memoryStore, 'updateResource').mockImplementation(async args => {
+      vi.spyOn(memoryStore, 'applyWorkingMemoryUpdate').mockImplementation(async args => {
         markUpdateStarted();
         await updateBlocked;
-        const result = await originalUpdateResource(args);
+        const result = await originalApplyWorkingMemoryUpdate(args);
         operationOrder.push('update');
         return result;
       });
@@ -3735,7 +3969,7 @@ describe('Memory', () => {
       });
       const memoryStore = (await storage.getStore('memory'))!;
       const originalSaveThread = memoryStore.saveThread.bind(memoryStore);
-      const originalUpdateResource = memoryStore.updateResource.bind(memoryStore);
+      const originalApplyWorkingMemoryUpdate = memoryStore.applyWorkingMemoryUpdate.bind(memoryStore);
       const originalDeleteResource = memoryStore.deleteResource.bind(memoryStore);
       const operationOrder: string[] = [];
       let markSaveStarted!: () => void;
@@ -3754,9 +3988,9 @@ describe('Memory', () => {
         operationOrder.push('save-thread');
         return result;
       });
-      vi.spyOn(memoryStore, 'updateResource').mockImplementation(async args => {
-        const result = await originalUpdateResource(args);
-        operationOrder.push('update-resource');
+      vi.spyOn(memoryStore, 'applyWorkingMemoryUpdate').mockImplementation(async args => {
+        const result = await originalApplyWorkingMemoryUpdate(args);
+        operationOrder.push('update-working-memory');
         return result;
       });
       const deleteSpy = vi.spyOn(memoryStore, 'deleteResource').mockImplementation(async args => {
@@ -3782,7 +4016,7 @@ describe('Memory', () => {
       releaseSave();
       await Promise.all([savePromise, deletePromise]);
 
-      expect(operationOrder).toEqual(['save-thread', 'update-resource', 'delete']);
+      expect(operationOrder).toEqual(['save-thread', 'update-working-memory', 'delete']);
       await expect(memoryStore.getResourceById({ resourceId: 'resource-save-delete-race' })).resolves.toBeNull();
       const workingMemoryMutexes = Reflect.get(memory, 'updateWorkingMemoryMutexes') as Map<string, unknown>;
       expect(workingMemoryMutexes.size).toBe(0);
@@ -3798,7 +4032,7 @@ describe('Memory', () => {
       const threadId = 'thread-queued-save-delete-race';
       const resourceId = 'resource-queued-save-delete-race';
       const originalSaveThread = memoryStore.saveThread.bind(memoryStore);
-      const originalUpdateResource = memoryStore.updateResource.bind(memoryStore);
+      const originalApplyWorkingMemoryUpdate = memoryStore.applyWorkingMemoryUpdate.bind(memoryStore);
       const originalDeleteResource = memoryStore.deleteResource.bind(memoryStore);
       const operationOrder: string[] = [];
       let markBlockingSaveStarted!: () => void;
@@ -3819,9 +4053,9 @@ describe('Memory', () => {
         operationOrder.push(args.thread.metadata?.workingMemory ? 'metadata-save' : 'blocking-save');
         return result;
       });
-      vi.spyOn(memoryStore, 'updateResource').mockImplementation(async args => {
-        const result = await originalUpdateResource(args);
-        operationOrder.push('update-resource');
+      vi.spyOn(memoryStore, 'applyWorkingMemoryUpdate').mockImplementation(async args => {
+        const result = await originalApplyWorkingMemoryUpdate(args);
+        operationOrder.push('update-working-memory');
         return result;
       });
       const deleteSpy = vi.spyOn(memoryStore, 'deleteResource').mockImplementation(async args => {
@@ -3860,7 +4094,7 @@ describe('Memory', () => {
       releaseBlockingSave();
       await Promise.all([blockingSavePromise, metadataSavePromise, deletePromise]);
 
-      expect(operationOrder).toEqual(['blocking-save', 'metadata-save', 'update-resource', 'delete']);
+      expect(operationOrder).toEqual(['blocking-save', 'metadata-save', 'update-working-memory', 'delete']);
       await expect(memoryStore.getResourceById({ resourceId })).resolves.toBeNull();
       const workingMemoryMutexes = Reflect.get(memory, 'updateWorkingMemoryMutexes') as Map<string, unknown>;
       expect(workingMemoryMutexes.size).toBe(0);
@@ -3886,7 +4120,7 @@ describe('Memory', () => {
       });
 
       const originalUpdateThread = memoryStore.updateThread.bind(memoryStore);
-      const originalUpdateResource = memoryStore.updateResource.bind(memoryStore);
+      const originalApplyWorkingMemoryUpdate = memoryStore.applyWorkingMemoryUpdate.bind(memoryStore);
       const originalDeleteResource = memoryStore.deleteResource.bind(memoryStore);
       const operationOrder: string[] = [];
       let markUpdateStarted!: () => void;
@@ -3905,9 +4139,9 @@ describe('Memory', () => {
         operationOrder.push('update-thread');
         return result;
       });
-      vi.spyOn(memoryStore, 'updateResource').mockImplementation(async args => {
-        const result = await originalUpdateResource(args);
-        operationOrder.push('update-resource');
+      vi.spyOn(memoryStore, 'applyWorkingMemoryUpdate').mockImplementation(async args => {
+        const result = await originalApplyWorkingMemoryUpdate(args);
+        operationOrder.push('update-working-memory');
         return result;
       });
       const deleteSpy = vi.spyOn(memoryStore, 'deleteResource').mockImplementation(async args => {
@@ -3929,7 +4163,7 @@ describe('Memory', () => {
       releaseUpdate();
       await Promise.all([updatePromise, deletePromise]);
 
-      expect(operationOrder).toEqual(['update-thread', 'update-resource', 'delete']);
+      expect(operationOrder).toEqual(['update-thread', 'update-working-memory', 'delete']);
       await expect(memoryStore.getResourceById({ resourceId })).resolves.toBeNull();
       const workingMemoryMutexes = Reflect.get(memory, 'updateWorkingMemoryMutexes') as Map<string, unknown>;
       expect(workingMemoryMutexes.size).toBe(0);
@@ -3956,7 +4190,7 @@ describe('Memory', () => {
 
       const originalSaveThread = memoryStore.saveThread.bind(memoryStore);
       const originalUpdateThread = memoryStore.updateThread.bind(memoryStore);
-      const originalUpdateResource = memoryStore.updateResource.bind(memoryStore);
+      const originalApplyWorkingMemoryUpdate = memoryStore.applyWorkingMemoryUpdate.bind(memoryStore);
       const originalDeleteResource = memoryStore.deleteResource.bind(memoryStore);
       const operationOrder: string[] = [];
       let markBlockingSaveStarted!: () => void;
@@ -3980,9 +4214,9 @@ describe('Memory', () => {
         operationOrder.push('update-thread');
         return result;
       });
-      vi.spyOn(memoryStore, 'updateResource').mockImplementation(async args => {
-        const result = await originalUpdateResource(args);
-        operationOrder.push('update-resource');
+      vi.spyOn(memoryStore, 'applyWorkingMemoryUpdate').mockImplementation(async args => {
+        const result = await originalApplyWorkingMemoryUpdate(args);
+        operationOrder.push('update-working-memory');
         return result;
       });
       const deleteSpy = vi.spyOn(memoryStore, 'deleteResource').mockImplementation(async args => {
@@ -4016,7 +4250,7 @@ describe('Memory', () => {
       releaseBlockingSave();
       await Promise.all([blockingSavePromise, updatePromise, deletePromise]);
 
-      expect(operationOrder).toEqual(['blocking-save', 'update-thread', 'update-resource', 'delete']);
+      expect(operationOrder).toEqual(['blocking-save', 'update-thread', 'update-working-memory', 'delete']);
       await expect(memoryStore.getResourceById({ resourceId })).resolves.toBeNull();
       const workingMemoryMutexes = Reflect.get(memory, 'updateWorkingMemoryMutexes') as Map<string, unknown>;
       expect(workingMemoryMutexes.size).toBe(0);
@@ -4044,7 +4278,7 @@ describe('Memory', () => {
 
       const originalSaveThread = memoryStore.saveThread.bind(memoryStore);
       const originalUpdateThread = memoryStore.updateThread.bind(memoryStore);
-      const originalUpdateResource = memoryStore.updateResource.bind(memoryStore);
+      const originalApplyWorkingMemoryUpdate = memoryStore.applyWorkingMemoryUpdate.bind(memoryStore);
       const operationOrder: string[] = [];
       let markUpdateStarted!: () => void;
       let releaseUpdate!: () => void;
@@ -4062,9 +4296,9 @@ describe('Memory', () => {
         operationOrder.push('update-thread');
         return result;
       });
-      vi.spyOn(memoryStore, 'updateResource').mockImplementation(async args => {
-        const result = await originalUpdateResource(args);
-        operationOrder.push('update-resource');
+      vi.spyOn(memoryStore, 'applyWorkingMemoryUpdate').mockImplementation(async args => {
+        const result = await originalApplyWorkingMemoryUpdate(args);
+        operationOrder.push('update-working-memory');
         return result;
       });
       const saveSpy = vi.spyOn(memoryStore, 'saveThread').mockImplementation(async args => {
@@ -4095,7 +4329,7 @@ describe('Memory', () => {
       releaseUpdate();
       await Promise.all([updatePromise, reassignPromise]);
 
-      expect(operationOrder).toEqual(['update-thread', 'update-resource', 'save-thread']);
+      expect(operationOrder).toEqual(['update-thread', 'update-working-memory', 'save-thread']);
       await expect(memoryStore.getResourceById({ resourceId: originalResourceId })).resolves.toEqual(
         expect.objectContaining({ workingMemory: 'private working memory' }),
       );

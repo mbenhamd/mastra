@@ -735,6 +735,14 @@ export type StorageListThreadsInput = {
      */
     resourceId?: string;
     /**
+     * Return only threads whose last activity is strictly older than this
+     * instant. Storage adapters must apply this predicate before pagination so
+     * callers can run bounded, cursor-free retention sweeps safely. Callers
+     * must first require `supportsThreadUpdatedBeforeFilter`; other adapters
+     * may not implement this optional filter.
+     */
+    updatedBefore?: Date;
+    /**
      * Filter threads by metadata key-value pairs.
      * All specified key-value pairs must match (AND logic).
      */
@@ -806,6 +814,59 @@ export type StorageResourceType = {
   metadata?: Record<string, unknown>;
   createdAt: Date;
   updatedAt: Date;
+};
+
+/** The writer that produced a revisioned working-memory value. */
+export type WorkingMemoryUpdateSource = 'observer' | 'owner';
+
+/** Audit-safe provenance for one JSON-pointer path in working memory. */
+export type WorkingMemoryPathProvenance = {
+  source: WorkingMemoryUpdateSource;
+  revision: number;
+  updatedAt: string;
+};
+
+/**
+ * A revisioned working-memory view. Paths use RFC 6901 JSON Pointer syntax;
+ * the empty string identifies the complete value.
+ */
+export type WorkingMemorySnapshot = {
+  value: string | null;
+  revision: number;
+  protectedPaths: string[];
+  provenance: Record<string, WorkingMemoryPathProvenance>;
+};
+
+/** Coordinates for a resource- or thread-scoped working-memory record. */
+export type WorkingMemorySnapshotInput =
+  | {
+      scope: 'resource';
+      resourceId: string;
+      /** Required only when fencing an observer write to a thread-scoped OM generation. */
+      threadId?: string;
+    }
+  | {
+      scope: 'thread';
+      resourceId: string;
+      threadId: string;
+    };
+
+/**
+ * Compare-and-set update for working memory.
+ *
+ * Owner writes may protect or unprotect JSON-pointer paths. Observer writes
+ * never change those controls and must preserve every protected value.
+ */
+export type ApplyWorkingMemoryUpdateInput = WorkingMemorySnapshotInput & {
+  value: string | null;
+  expectedRevision: number;
+  source: WorkingMemoryUpdateSource;
+  /** Reject a non-null value whose UTF-8 encoding exceeds this many bytes. */
+  maxDataBytes?: number;
+  protectPaths?: string[];
+  unprotectPaths?: string[];
+  /** Optional OM generation fence for observer-managed writes. */
+  observationalMemoryGuard?: ObservationalMemoryWriteGuard;
 };
 
 export type StorageMessageType = {

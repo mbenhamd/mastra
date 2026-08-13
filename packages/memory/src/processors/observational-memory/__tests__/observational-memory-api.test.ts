@@ -335,6 +335,7 @@ name: Tyler
       const result = await extractOm.observe({ threadId });
 
       expect(result.observed).toBe(true);
+      expect(result.record.resourceId).toBe('observe-resource');
       expect(onExtracted).toHaveBeenCalledWith(
         expect.objectContaining({
           source: 'observer',

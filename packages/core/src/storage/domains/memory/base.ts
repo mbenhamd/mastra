@@ -27,6 +27,9 @@ import type {
   RetractObservationalMemoryInput,
   RetractObservationalMemoryResult,
   UpdateObservationalMemoryConfigInput,
+  ApplyWorkingMemoryUpdateInput,
+  WorkingMemorySnapshot,
+  WorkingMemorySnapshotInput,
 } from '../../types';
 import { StorageDomain } from '../base';
 
@@ -49,6 +52,12 @@ export abstract class MemoryStorage extends StorageDomain {
 
   /** Whether edit/delete retraction and guarded derived writes are atomic. */
   readonly supportsAtomicObservationalMemoryRetraction?: boolean = false;
+
+  /** Whether owner-protected, revisioned Working Memory updates are atomic. */
+  readonly supportsRevisionedWorkingMemory?: boolean = false;
+
+  /** Whether listThreads applies the updatedBefore filter before pagination. */
+  readonly supportsThreadUpdatedBeforeFilter?: boolean = false;
 
   constructor() {
     super({
@@ -263,6 +272,24 @@ export abstract class MemoryStorage extends StorageDomain {
       throw new Error('Observational memory generation is no longer current.');
     }
     return await this.updateThread({ id: args.id, title: args.title, metadata: args.metadata });
+  }
+
+  /**
+   * Read working memory together with its compare-and-set revision and
+   * owner-protection controls. Adapters must override this together with
+   * applyWorkingMemoryUpdate; a non-atomic compatibility fallback would let
+   * observer writes race owner corrections.
+   */
+  async getWorkingMemorySnapshot(_args: WorkingMemorySnapshotInput): Promise<WorkingMemorySnapshot> {
+    throw new Error(`Revisioned working memory is not implemented by this storage adapter (${this.constructor.name}).`);
+  }
+
+  /**
+   * Atomically apply a revisioned working-memory update. Owner-protected paths
+   * must be preserved by observer writes in the same storage transaction.
+   */
+  async applyWorkingMemoryUpdate(_args: ApplyWorkingMemoryUpdateInput): Promise<WorkingMemorySnapshot> {
+    throw new Error(`Revisioned working memory is not implemented by this storage adapter (${this.constructor.name}).`);
   }
 
   /**

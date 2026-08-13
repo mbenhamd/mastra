@@ -30,6 +30,9 @@ import type {
   RetractObservationalMemoryInput,
   RetractObservationalMemoryResult,
   UpdateObservationalMemoryConfigInput,
+  ApplyWorkingMemoryUpdateInput,
+  WorkingMemorySnapshot,
+  WorkingMemorySnapshotInput,
 } from '../../types';
 import {
   filterByDateRange,
@@ -40,6 +43,14 @@ import {
 } from '../../utils';
 import type { InMemoryDB } from '../inmemory-db';
 import { MemoryStorage } from './base';
+import {
+  applyWorkingMemorySnapshotUpdate,
+  hasWorkingMemorySnapshotControls,
+  readWorkingMemorySnapshot,
+  retractObserverWorkingMemorySnapshot,
+  writeWorkingMemorySnapshotMetadata,
+  WorkingMemoryValidationError,
+} from './working-memory-snapshot';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -90,6 +101,8 @@ function removeObservationalMemoryMetadata(
 export class InMemoryMemory extends MemoryStorage {
   readonly supportsObservationalMemory = true;
   readonly supportsAtomicObservationalMemoryRetraction = true;
+  readonly supportsRevisionedWorkingMemory = true;
+  readonly supportsThreadUpdatedBeforeFilter = true;
   private db: InMemoryDB;
 
   constructor({ db }: { db: InMemoryDB }) {
@@ -742,6 +755,14 @@ export class InMemoryMemory extends MemoryStorage {
       threads = threads.filter((t: any) => t.resourceId === filter.resourceId);
     }
 
+    if (filter?.updatedBefore) {
+      if (!(filter.updatedBefore instanceof Date) || Number.isNaN(filter.updatedBefore.getTime())) {
+        throw new WorkingMemoryValidationError('updatedBefore must be a valid Date.');
+      }
+      const updatedBefore = filter.updatedBefore.getTime();
+      threads = threads.filter(thread => thread.updatedAt.getTime() < updatedBefore);
+    }
+
     // Validate metadata keys before filtering
     this.validateMetadataKeys(filter?.metadata);
 
@@ -864,6 +885,72 @@ export class InMemoryMemory extends MemoryStorage {
       throw new Error('Observational memory generation is no longer current.');
     }
     return this.updateThread({ id, title, metadata });
+  }
+
+  async getWorkingMemorySnapshot(input: WorkingMemorySnapshotInput): Promise<WorkingMemorySnapshot> {
+    if (input.scope === 'resource') {
+      const resource = this.db.resources.get(input.resourceId);
+      return readWorkingMemorySnapshot(resource?.workingMemory, resource?.metadata);
+    }
+
+    const thread = this.db.threads.get(input.threadId);
+    if (!thread || thread.resourceId !== input.resourceId) {
+      throw new WorkingMemoryValidationError('Working-memory thread was not found in the requested resource.');
+    }
+    const value = typeof thread.metadata?.workingMemory === 'string' ? thread.metadata.workingMemory : null;
+    return readWorkingMemorySnapshot(value, thread.metadata);
+  }
+
+  async applyWorkingMemoryUpdate(input: ApplyWorkingMemoryUpdateInput): Promise<WorkingMemorySnapshot> {
+    return this.withMemoryStateRollback(true, () => {
+      if (input.observationalMemoryGuard) {
+        if (input.source !== 'observer') {
+          throw new WorkingMemoryValidationError('Only observer updates may carry an observational-memory guard.');
+        }
+        const guard = input.observationalMemoryGuard;
+        if (guard.resourceId !== input.resourceId || (guard.threadId !== null && guard.threadId !== input.threadId)) {
+          throw new WorkingMemoryValidationError(
+            'Observational memory guard does not match the working-memory target.',
+          );
+        }
+        const currentGeneration = this.db.observationalMemory.get(
+          this.getObservationalMemoryKey(guard.threadId, guard.resourceId),
+        )?.[0];
+        if (currentGeneration?.id !== guard.recordId) {
+          throw new WorkingMemoryValidationError('Observational memory generation is no longer current.');
+        }
+      }
+
+      const now = new Date();
+      if (input.scope === 'resource') {
+        const resource = this.db.resources.get(input.resourceId);
+        const current = readWorkingMemorySnapshot(resource?.workingMemory, resource?.metadata);
+        const next = applyWorkingMemorySnapshotUpdate(current, input, now.toISOString());
+        if (next === current) return current;
+        this.db.resources.set(input.resourceId, {
+          id: input.resourceId,
+          ...(next.value === null ? {} : { workingMemory: next.value }),
+          metadata: writeWorkingMemorySnapshotMetadata(resource?.metadata, next),
+          createdAt: resource?.createdAt ?? now,
+          updatedAt: now,
+        });
+        return next;
+      }
+
+      const thread = this.db.threads.get(input.threadId);
+      if (!thread || thread.resourceId !== input.resourceId) {
+        throw new WorkingMemoryValidationError('Working-memory thread was not found in the requested resource.');
+      }
+      const currentValue = typeof thread.metadata?.workingMemory === 'string' ? thread.metadata.workingMemory : null;
+      const current = readWorkingMemorySnapshot(currentValue, thread.metadata);
+      const next = applyWorkingMemorySnapshotUpdate(current, input, now.toISOString());
+      if (next === current) return current;
+      const metadata = writeWorkingMemorySnapshotMetadata(thread.metadata, next);
+      if (next.value === null) delete metadata.workingMemory;
+      else metadata.workingMemory = next.value;
+      this.db.threads.set(input.threadId, { ...thread, metadata, updatedAt: now });
+      return next;
+    });
   }
 
   async deleteResource({
@@ -1492,14 +1579,32 @@ export class InMemoryMemory extends MemoryStorage {
 
     const managedWorkingMemoryScopes = getManagedWorkingMemoryScopes([...resourceRecords, ...threadRecords]);
     const resource = this.db.resources.get(input.resourceId);
-    const clearedResourceWorkingMemory =
-      managedWorkingMemoryScopes.has('resource') && resource?.workingMemory !== undefined;
-    if (resource && clearedResourceWorkingMemory) {
-      this.db.resources.set(input.resourceId, {
-        ...resource,
-        workingMemory: undefined,
-        updatedAt: new Date(),
-      });
+    let clearedResourceWorkingMemory = false;
+    if (
+      resource &&
+      managedWorkingMemoryScopes.has('resource') &&
+      (resource.workingMemory !== undefined || hasWorkingMemorySnapshotControls(resource.metadata))
+    ) {
+      if (hasWorkingMemorySnapshotControls(resource.metadata)) {
+        const current = readWorkingMemorySnapshot(resource.workingMemory, resource.metadata);
+        const next = retractObserverWorkingMemorySnapshot(current);
+        clearedResourceWorkingMemory = next.value !== current.value;
+        if (next !== current) {
+          this.db.resources.set(input.resourceId, {
+            ...resource,
+            workingMemory: next.value ?? undefined,
+            metadata: writeWorkingMemorySnapshotMetadata(resource.metadata, next),
+            updatedAt: new Date(),
+          });
+        }
+      } else {
+        clearedResourceWorkingMemory = true;
+        this.db.resources.set(input.resourceId, {
+          ...resource,
+          workingMemory: undefined,
+          updatedAt: new Date(),
+        });
+      }
     }
 
     let clearedThreadMetadata = false;
@@ -1510,13 +1615,26 @@ export class InMemoryMemory extends MemoryStorage {
           ? [this.db.threads.get(input.threadId)].filter((thread): thread is StorageThreadType => thread !== undefined)
           : [];
     for (const thread of threads) {
-      const cleaned = removeObservationalMemoryMetadata(thread.metadata, managedWorkingMemoryScopes.has('thread'));
-      if (!cleaned.removed) continue;
+      const clearWorkingMemory = managedWorkingMemoryScopes.has('thread');
+      const hasControls = clearWorkingMemory && hasWorkingMemorySnapshotControls(thread.metadata);
+      const cleaned = removeObservationalMemoryMetadata(thread.metadata, clearWorkingMemory && !hasControls);
+      let metadata = cleaned.metadata;
+      let workingMemoryStateChanged = false;
+      if (hasControls) {
+        const currentValue = typeof thread.metadata?.workingMemory === 'string' ? thread.metadata.workingMemory : null;
+        const current = readWorkingMemorySnapshot(currentValue, thread.metadata);
+        const next = retractObserverWorkingMemorySnapshot(current);
+        workingMemoryStateChanged = next !== current;
+        metadata = writeWorkingMemorySnapshotMetadata(metadata, next);
+        if (next.value === null) delete metadata.workingMemory;
+        else metadata.workingMemory = next.value;
+      }
+      if (!cleaned.removed && !workingMemoryStateChanged) continue;
       clearedThreadMetadata = true;
       this.db.threads.set(thread.id, {
         ...thread,
         title: cleaned.derivedTitle === thread.title ? '' : thread.title,
-        metadata: cleaned.metadata,
+        metadata,
         updatedAt: new Date(),
       });
     }

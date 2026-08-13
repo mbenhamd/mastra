@@ -406,18 +406,24 @@ export class MockMemory extends MastraMemory {
       return;
     }
 
-    const scope = workingMemoryConfig.scope || 'resource';
-    const id = scope === 'resource' ? resourceId : threadId;
-
-    if (!id) {
-      throw new Error(`Cannot update working memory: ${scope} ID is required`);
-    }
-
+    const coordinates = await this.resolveWorkingMemorySnapshotInput({ threadId, resourceId, memoryConfig });
     const memoryStorage = await this.getMemoryStore();
-    await memoryStorage.updateResource({
-      resourceId: id,
-      workingMemory,
-    });
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const current = await memoryStorage.getWorkingMemorySnapshot(coordinates);
+      try {
+        await memoryStorage.applyWorkingMemoryUpdate({
+          ...coordinates,
+          value: workingMemory,
+          expectedRevision: current.revision,
+          source: 'observer',
+          ...(workingMemoryConfig.maxDataBytes !== undefined ? { maxDataBytes: workingMemoryConfig.maxDataBytes } : {}),
+        });
+        return;
+      } catch (error) {
+        const conflict = error instanceof Error && error.name === 'WorkingMemoryRevisionConflictError';
+        if (!conflict || attempt === 2) throw error;
+      }
+    }
   }
 
   async __experimental_updateWorkingMemoryVNext({
