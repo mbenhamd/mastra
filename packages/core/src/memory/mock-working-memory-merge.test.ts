@@ -1,5 +1,6 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { z } from 'zod/v4';
+import { InMemoryStore } from '../storage';
 import { MockMemory } from './mock';
 
 describe('MockMemory working memory merge semantics', () => {
@@ -55,6 +56,81 @@ describe('MockMemory working memory merge semantics', () => {
     });
 
     await expect(memory.getWorkingMemory({ threadId, resourceId })).resolves.toBe('thread-scoped value');
+  });
+
+  it('rejects thread-scoped working memory access from a different supplied resource', async () => {
+    const memory = new MockMemory({
+      enableWorkingMemory: true,
+      options: { workingMemory: { enabled: true, scope: 'thread' } },
+    });
+    await memory.createThread({ threadId, resourceId });
+    await memory.updateWorkingMemory({
+      threadId,
+      resourceId,
+      workingMemory: 'thread-scoped value',
+    });
+
+    await expect(memory.getWorkingMemory({ threadId, resourceId: 'resource-2' })).rejects.toThrow(
+      'Working-memory thread does not belong to the requested resource.',
+    );
+  });
+
+  it('does not resurrect an owner-forgotten value after an observer revision conflict', async () => {
+    const storage = new InMemoryStore({ id: 'mock-owner-forget-conflict' });
+    const memory = new MockMemory({ storage, enableWorkingMemory: true });
+    await memory.createThread({ threadId, resourceId });
+    await memory.updateWorkingMemory({ threadId, resourceId, workingMemory: 'initial value' });
+
+    const memoryStore = await storage.getStore('memory');
+    if (!memoryStore) throw new Error('Expected in-memory storage domain.');
+    const applyUpdate = memoryStore.applyWorkingMemoryUpdate.bind(memoryStore);
+    vi.spyOn(memoryStore, 'applyWorkingMemoryUpdate').mockImplementationOnce(async input => {
+      const current = await memoryStore.getWorkingMemorySnapshot(input);
+      await applyUpdate({
+        scope: input.scope,
+        resourceId: input.resourceId,
+        ...(input.threadId ? { threadId: input.threadId } : {}),
+        value: null,
+        expectedRevision: current.revision,
+        source: 'owner',
+      });
+      return applyUpdate(input);
+    });
+
+    await expect(
+      memory.updateWorkingMemory({ threadId, resourceId, workingMemory: 'stale observer proposal' }),
+    ).rejects.toMatchObject({ name: 'WorkingMemoryRevisionConflictError' });
+    await expect(memory.getWorkingMemorySnapshot({ threadId, resourceId })).resolves.toMatchObject({ value: null });
+  });
+
+  it('does not overwrite a newer observer value after an observer revision conflict', async () => {
+    const storage = new InMemoryStore({ id: 'mock-observer-conflict' });
+    const memory = new MockMemory({ storage, enableWorkingMemory: true });
+    await memory.createThread({ threadId, resourceId });
+    await memory.updateWorkingMemory({ threadId, resourceId, workingMemory: 'initial value' });
+
+    const memoryStore = await storage.getStore('memory');
+    if (!memoryStore) throw new Error('Expected in-memory storage domain.');
+    const applyUpdate = memoryStore.applyWorkingMemoryUpdate.bind(memoryStore);
+    vi.spyOn(memoryStore, 'applyWorkingMemoryUpdate').mockImplementationOnce(async input => {
+      const current = await memoryStore.getWorkingMemorySnapshot(input);
+      await applyUpdate({
+        scope: input.scope,
+        resourceId: input.resourceId,
+        ...(input.threadId ? { threadId: input.threadId } : {}),
+        value: 'newer observer value',
+        expectedRevision: current.revision,
+        source: 'observer',
+      });
+      return applyUpdate(input);
+    });
+
+    await expect(
+      memory.updateWorkingMemory({ threadId, resourceId, workingMemory: 'stale observer proposal' }),
+    ).rejects.toMatchObject({ name: 'WorkingMemoryRevisionConflictError' });
+    await expect(memory.getWorkingMemorySnapshot({ threadId, resourceId })).resolves.toMatchObject({
+      value: 'newer observer value',
+    });
   });
 
   it('replaces working memory entirely for template-based (no schema)', async () => {

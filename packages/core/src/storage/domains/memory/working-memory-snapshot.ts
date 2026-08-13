@@ -52,6 +52,12 @@ function pointerSegments(pointer: string): string[] {
   return pointer.slice(1).split('/').map(decodePointerSegment);
 }
 
+function parseArrayIndex(segment: string): number | undefined {
+  if (!/^(?:0|[1-9]\d*)$/u.test(segment)) return undefined;
+  const index = Number(segment);
+  return Number.isSafeInteger(index) ? index : undefined;
+}
+
 export function normalizeWorkingMemoryPaths(paths: readonly string[] | undefined): string[] {
   if (!paths) return [];
   if (paths.length > MAX_PROTECTED_PATHS) {
@@ -90,9 +96,8 @@ function getPointer(root: JsonValue, segments: readonly string[]): { exists: boo
   let current: JsonValue = root;
   for (const segment of segments) {
     if (Array.isArray(current)) {
-      if (!/^\d+$/u.test(segment)) return { exists: false };
-      const index = Number(segment);
-      if (!Number.isSafeInteger(index) || index >= current.length) return { exists: false };
+      const index = parseArrayIndex(segment);
+      if (index === undefined || index >= current.length) return { exists: false };
       current = current[index]!;
       continue;
     }
@@ -129,27 +134,21 @@ function setPointer(
   let template = templateRoot as JsonValue[] | Record<string, JsonValue>;
   for (let index = 0; index < segments.length - 1; index += 1) {
     const segment = segments[index]!;
-    if (Array.isArray(template) && !/^\d+$/u.test(segment)) {
+    const arrayIndex = Array.isArray(template) ? parseArrayIndex(segment) : undefined;
+    if (Array.isArray(template) && arrayIndex === undefined) {
       throw new WorkingMemoryValidationError('Working-memory array paths must use numeric indexes.');
     }
-    const templateNext = Array.isArray(template) ? template[Number(segment)] : template[segment];
+    const templateNext = Array.isArray(template) ? template[arrayIndex!] : template[segment];
     if (templateNext === undefined) {
       throw new WorkingMemoryValidationError('Protected working-memory paths must exist in the stored value.');
     }
-    const existing = Array.isArray(current)
-      ? /^\d+$/u.test(segment)
-        ? current[Number(segment)]
-        : undefined
-      : current[segment];
+    const existing = Array.isArray(current) ? current[arrayIndex!] : current[segment];
     const next: JsonValue[] | Record<string, JsonValue> =
       existing !== undefined && sameContainerType(existing, templateNext)
         ? (existing as JsonValue[] | Record<string, JsonValue>)
         : emptyContainerLike(templateNext);
     if (Array.isArray(current)) {
-      if (!/^\d+$/u.test(segment)) {
-        throw new WorkingMemoryValidationError('Working-memory array paths must use numeric indexes.');
-      }
-      current[Number(segment)] = next;
+      current[arrayIndex!] = next;
     } else {
       current[segment] = next;
     }
@@ -159,10 +158,11 @@ function setPointer(
 
   const leaf = segments.at(-1)!;
   if (Array.isArray(current)) {
-    if (!/^\d+$/u.test(leaf)) {
+    const arrayIndex = parseArrayIndex(leaf);
+    if (arrayIndex === undefined) {
       throw new WorkingMemoryValidationError('Working-memory array paths must use numeric indexes.');
     }
-    current[Number(leaf)] = cloneJson(value);
+    current[arrayIndex] = cloneJson(value);
   } else {
     current[leaf] = cloneJson(value);
   }
@@ -352,8 +352,7 @@ export function retractObserverWorkingMemorySnapshot(current: WorkingMemorySnaps
       // data that an owner explicitly asked the observer to preserve.
       value = current.value;
     } else {
-      const firstSegments = pointerSegments(current.protectedPaths[0]!);
-      let preserved: JsonValue = /^\d+$/u.test(firstSegments[0] ?? '') ? [] : {};
+      let preserved: JsonValue = Array.isArray(parsed) ? [] : {};
       for (const pointer of current.protectedPaths) {
         const segments = pointerSegments(pointer);
         const existing = getPointer(parsed, segments);

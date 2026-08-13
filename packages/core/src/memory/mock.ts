@@ -240,6 +240,9 @@ export class MockMemory extends MastraMemory {
     }
 
     const thread = await memoryStorage.getThreadById({ threadId });
+    if (thread && resourceId !== undefined && thread.resourceId !== resourceId) {
+      throw new Error('Working-memory thread does not belong to the requested resource.');
+    }
     return typeof thread?.metadata?.workingMemory === 'string' ? thread.metadata.workingMemory : null;
   }
 
@@ -411,22 +414,14 @@ export class MockMemory extends MastraMemory {
 
     const coordinates = await this.resolveWorkingMemorySnapshotInput({ threadId, resourceId, memoryConfig });
     const memoryStorage = await this.getMemoryStore();
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      const current = await memoryStorage.getWorkingMemorySnapshot(coordinates);
-      try {
-        await memoryStorage.applyWorkingMemoryUpdate({
-          ...coordinates,
-          value: workingMemory,
-          expectedRevision: current.revision,
-          source: 'observer',
-          ...(workingMemoryConfig.maxDataBytes !== undefined ? { maxDataBytes: workingMemoryConfig.maxDataBytes } : {}),
-        });
-        return;
-      } catch (error) {
-        const conflict = error instanceof Error && error.name === 'WorkingMemoryRevisionConflictError';
-        if (!conflict || attempt === 2) throw error;
-      }
-    }
+    const current = await memoryStorage.getWorkingMemorySnapshot(coordinates);
+    await memoryStorage.applyWorkingMemoryUpdate({
+      ...coordinates,
+      value: workingMemory,
+      expectedRevision: current.revision,
+      source: 'observer',
+      ...(workingMemoryConfig.maxDataBytes !== undefined ? { maxDataBytes: workingMemoryConfig.maxDataBytes } : {}),
+    });
   }
 
   async __experimental_updateWorkingMemoryVNext({

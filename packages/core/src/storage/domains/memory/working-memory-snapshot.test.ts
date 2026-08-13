@@ -113,6 +113,57 @@ describe('revisioned Working Memory controls', () => {
     });
   });
 
+  it('treats leading-zero pointer tokens as object keys, not array indexes', () => {
+    const objectOwner = applyWorkingMemorySnapshotUpdate(
+      { value: null, revision: 0, protectedPaths: [], provenance: {} },
+      {
+        value: JSON.stringify({ answers: { '01': 'owner value', stale: true } }),
+        expectedRevision: 0,
+        source: 'owner',
+        protectPaths: ['/answers/01'],
+      },
+    );
+    const unprotected = applyWorkingMemorySnapshotUpdate(objectOwner, {
+      value: JSON.stringify({ answers: {} }),
+      expectedRevision: objectOwner.revision,
+      source: 'owner',
+      unprotectPaths: ['/answers/01'],
+    });
+
+    expect(unprotected).toMatchObject({ value: '{"answers":{}}', protectedPaths: [] });
+    expect(() =>
+      applyWorkingMemorySnapshotUpdate(
+        { value: null, revision: 0, protectedPaths: [], provenance: {} },
+        {
+          value: JSON.stringify(['zero', 'one']),
+          expectedRevision: 0,
+          source: 'owner',
+          protectPaths: ['/01'],
+        },
+      ),
+    ).toThrow('must exist');
+  });
+
+  it('reconstructs protected leading-zero object keys as objects during retraction', () => {
+    const owner = applyWorkingMemorySnapshotUpdate(
+      { value: null, revision: 0, protectedPaths: [], provenance: {} },
+      {
+        value: JSON.stringify({ '01': 'owner value', stale: true }),
+        expectedRevision: 0,
+        source: 'owner',
+        protectPaths: ['/01'],
+      },
+    );
+    const observer = applyWorkingMemorySnapshotUpdate(owner, {
+      value: JSON.stringify({ transient: true }),
+      expectedRevision: owner.revision,
+      source: 'observer',
+    });
+
+    expect(JSON.parse(observer.value!)).toEqual({ '01': 'owner value', transient: true });
+    expect(JSON.parse(retractObserverWorkingMemorySnapshot(observer).value!)).toEqual({ '01': 'owner value' });
+  });
+
   it('rejects stale revisions and observer control changes', () => {
     const current = { value: '{}', revision: 4, protectedPaths: [], provenance: {} } as const;
     expect(() =>
