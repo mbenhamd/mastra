@@ -1,5 +1,18 @@
 # @mastra/inngest
 
+## 2.0.0-alpha.1
+
+### Major Changes
+
+- Inngest durable agents now reject response-only recovery configuration before dispatch because it requires live worker state. ([`7afa240`](https://github.com/mastra-ai/mastra/commit/7afa240495196e70d2caa57eda375109f4a04b7d))
+
+  **Operational migration:** The durable-agent workflow identity is now v3. Drain active v2 runs and complete suspended v2 runs on a v2 worker before deploying v3, or keep v2 workers available until those runs finish.
+
+### Patch Changes
+
+- Updated dependencies [[`820e2c4`](https://github.com/mastra-ai/mastra/commit/820e2c457b3b83c5206d46b0a49a2e9b89b24567)]:
+  - @mastra/core@1.58.0-alpha.11
+
 ## 1.8.6-alpha.0
 
 ### Patch Changes

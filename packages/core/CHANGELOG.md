@@ -1,5 +1,11 @@
 # @mastra/core
 
+## 1.58.0-alpha.11
+
+### Patch Changes
+
+- Harness conversations that end silently after tool results now make one bounded, response-only recovery attempt with tools disabled. ([`820e2c4`](https://github.com/mastra-ai/mastra/commit/820e2c457b3b83c5206d46b0a49a2e9b89b24567))
+
 ## 1.58.0-alpha.10
 
 ### Patch Changes

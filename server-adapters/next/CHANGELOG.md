@@ -1,5 +1,14 @@
 # @mastra/next
 
+## 0.2.14-alpha.11
+
+### Patch Changes
+
+- Updated dependencies [[`820e2c4`](https://github.com/mastra-ai/mastra/commit/820e2c457b3b83c5206d46b0a49a2e9b89b24567)]:
+  - @mastra/core@1.58.0-alpha.11
+  - @mastra/server@1.58.0-alpha.11
+  - @mastra/hono@1.6.0-alpha.11
+
 ## 0.2.14-alpha.10
 
 ### Patch Changes

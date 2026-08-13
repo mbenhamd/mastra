@@ -176,7 +176,8 @@
     "@mastra/vercel": "1.3.0",
     "@mastra/oracledb": "0.1.0",
     "@mastra/telegram": "0.0.0",
-    "@mastra/quickjs": "0.0.0"
+    "@mastra/quickjs": "0.0.0",
+    "@mastra/whatsapp": "0.1.0"
   },
   "changesets": [
     "@mastra_agentcore-20406-dependencies",
@@ -214,6 +215,7 @@
     "better-donuts-feel",
     "blue-lions-stand",
     "bold-meals-report",
+    "bold-rockets-thank",
     "brave-hoops-argue",
     "breadcrumb-crumb-truncation",
     "brown-cases-repeat",
@@ -313,6 +315,7 @@
     "mcp-tool-error-reconnect",
     "message-trace-id-19891",
     "mighty-thinking-defaults",
+    "new-pears-jam",
     "notify-input-request-20398",
     "olive-buttons-shave",
     "olive-donkeys-retry",
@@ -407,7 +410,6 @@
     "tidy-jars-repeat",
     "tidy-melons-repeat",
     "tidy-moons-shine",
-    "tidy-planes-stick",
     "tidy-rivers-render",
     "tidy-tigers-wave",
     "tidy-tools-resolve",
