@@ -1543,8 +1543,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
         // the pre-action gate in tool-call-step). Mirrors the channel-tool-fence
         // pattern above.
         const permissionPolicy = requestContext?.get(TOOL_PERMISSION_POLICY_KEY) as
-          | ((toolName: string) => 'allow' | 'ask' | 'deny')
-          | undefined;
+          ((toolName: string) => 'allow' | 'ask' | 'deny') | undefined;
         if (permissionPolicy) {
           const toolSurface = (currentStep.tools ?? {}) as Record<string, unknown>;
           const toolChoice = currentStep.toolChoice as { type?: string; toolName?: string } | string | undefined;
