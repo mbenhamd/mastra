@@ -217,6 +217,7 @@ describe('MemoryPG revisioned Working Memory', () => {
       thread: {
         id: transitionThreadId,
         resourceId: transitionResourceId,
+        title: 'Scope transition',
         metadata: {},
         createdAt,
         updatedAt: createdAt,
@@ -240,6 +241,7 @@ describe('MemoryPG revisioned Working Memory', () => {
     const thread = {
       id: transitionThreadId,
       resourceId: transitionResourceId,
+      title: 'Scope transition',
       metadata: { preserved: true },
       createdAt,
       updatedAt: new Date(),
