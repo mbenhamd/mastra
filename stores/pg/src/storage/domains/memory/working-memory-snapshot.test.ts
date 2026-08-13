@@ -103,6 +103,167 @@ describe('MemoryPG revisioned Working Memory', () => {
     ).resolves.toMatchObject({ revision: 1 });
   });
 
+  it('guards generic thread, resource, whole-row, and legacy observer writes', async () => {
+    const guardedResourceId = `${resourceId}-generic-guards`;
+    const guardedThreadId = `${threadId}-generic-guards`;
+    const createdAt = new Date('2026-01-01T00:00:00.000Z');
+    await firstMemory.saveThread({
+      thread: {
+        id: guardedThreadId,
+        resourceId: guardedResourceId,
+        title: 'Thread',
+        metadata: {},
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+    const threadOwner = await firstMemory.applyWorkingMemoryUpdate({
+      scope: 'thread',
+      resourceId: guardedResourceId,
+      threadId: guardedThreadId,
+      value: '{"preference":"concise"}',
+      expectedRevision: 0,
+      source: 'owner',
+      protectPaths: ['/preference'],
+    });
+    const resourceOwner = await firstMemory.applyWorkingMemoryUpdate({
+      scope: 'resource',
+      resourceId: guardedResourceId,
+      value: '{"name":"Ada"}',
+      expectedRevision: 0,
+      source: 'owner',
+      protectPaths: ['/name'],
+    });
+
+    await secondMemory.updateThread({ id: guardedThreadId, metadata: { display: 'updated' } });
+    await secondMemory.updateResource({ resourceId: guardedResourceId, metadata: { display: 'updated' } });
+    await secondMemory.saveThread({
+      thread: {
+        id: guardedThreadId,
+        resourceId: guardedResourceId,
+        title: 'Saved',
+        metadata: {},
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+    await secondMemory.saveResource({
+      resource: { id: guardedResourceId, metadata: {}, createdAt, updatedAt: createdAt },
+    });
+    await expect(
+      firstMemory.getWorkingMemorySnapshot({
+        scope: 'thread',
+        resourceId: guardedResourceId,
+        threadId: guardedThreadId,
+      }),
+    ).resolves.toEqual(threadOwner);
+    await expect(
+      firstMemory.getWorkingMemorySnapshot({ scope: 'resource', resourceId: guardedResourceId }),
+    ).resolves.toEqual(resourceOwner);
+
+    await expect(
+      secondMemory.updateThread({
+        id: guardedThreadId,
+        metadata: { workingMemory: '{"preference":"verbose"}' },
+      }),
+    ).rejects.toMatchObject({ name: 'WorkingMemoryValidationError' });
+    await expect(
+      secondMemory.updateResource({ resourceId: guardedResourceId, workingMemory: '{"name":"Grace"}' }),
+    ).rejects.toMatchObject({ name: 'WorkingMemoryValidationError' });
+    await expect(
+      secondMemory.saveThread({
+        thread: {
+          id: guardedThreadId,
+          resourceId: guardedResourceId,
+          title: 'Rejected',
+          metadata: { mastra: { workingMemory: { revision: 999 } } },
+          createdAt,
+          updatedAt: createdAt,
+        },
+      }),
+    ).rejects.toMatchObject({ name: 'WorkingMemoryValidationError' });
+    await expect(
+      secondMemory.saveResource({
+        resource: {
+          id: guardedResourceId,
+          workingMemory: '{"name":"Grace"}',
+          metadata: {},
+          createdAt,
+          updatedAt: createdAt,
+        },
+      }),
+    ).rejects.toMatchObject({ name: 'WorkingMemoryValidationError' });
+
+    const record = await firstMemory.initializeObservationalMemory({
+      config: { _managedWorkingMemoryScope: 'resource' },
+      resourceId: guardedResourceId,
+      scope: 'resource',
+      threadId: null,
+    });
+    await expect(
+      secondMemory.updateResourceFromObservationalMemory({
+        resourceId: guardedResourceId,
+        workingMemory: '{"name":"Grace"}',
+        guard: { recordId: record.id, resourceId: guardedResourceId, threadId: null },
+      }),
+    ).rejects.toMatchObject({ name: 'WorkingMemoryValidationError' });
+  });
+
+  it('serializes whole-row saves with owner compare-and-set updates for both scopes', async () => {
+    for (const scope of ['resource', 'thread'] as const) {
+      const concurrentResourceId = `${resourceId}-${scope}-save-cas`;
+      const concurrentThreadId = `${threadId}-${scope}-save-cas`;
+      const createdAt = new Date('2026-01-01T00:00:00.000Z');
+      await firstMemory.saveThread({
+        thread: {
+          id: concurrentThreadId,
+          resourceId: concurrentResourceId,
+          title: 'Thread',
+          metadata: {},
+          createdAt,
+          updatedAt: createdAt,
+        },
+      });
+      const coordinates =
+        scope === 'resource'
+          ? ({ scope, resourceId: concurrentResourceId } as const)
+          : ({ scope, resourceId: concurrentResourceId, threadId: concurrentThreadId } as const);
+      const initial = await firstMemory.applyWorkingMemoryUpdate({
+        ...coordinates,
+        value: '{"version":1}',
+        expectedRevision: 0,
+        source: 'owner',
+      });
+
+      const save =
+        scope === 'resource'
+          ? secondMemory.saveResource({
+              resource: { id: concurrentResourceId, metadata: {}, createdAt, updatedAt: createdAt },
+            })
+          : secondMemory.saveThread({
+              thread: {
+                id: concurrentThreadId,
+                resourceId: concurrentResourceId,
+                title: 'Saved concurrently',
+                metadata: {},
+                createdAt,
+                updatedAt: createdAt,
+              },
+            });
+      const [, owner] = await Promise.all([
+        save,
+        firstMemory.applyWorkingMemoryUpdate({
+          ...coordinates,
+          value: '{"version":2}',
+          expectedRevision: initial.revision,
+          source: 'owner',
+        }),
+      ]);
+
+      await expect(firstMemory.getWorkingMemorySnapshot(coordinates)).resolves.toEqual(owner);
+    }
+  });
+
   it('preserves governed thread metadata across stale generic and OM updates', async () => {
     const protectedResourceId = `${resourceId}-stale-metadata`;
     const protectedThreadId = `${threadId}-stale-metadata`;

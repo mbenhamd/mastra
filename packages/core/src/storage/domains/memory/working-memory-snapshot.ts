@@ -335,6 +335,91 @@ export function hasWorkingMemorySnapshotControls(metadata: Record<string, unknow
   return mastra !== undefined && Object.prototype.hasOwnProperty.call(mastra, CONTROL_METADATA_KEY);
 }
 
+function storedControlEquals(left: unknown, right: unknown): boolean {
+  if (left === right) return true;
+  if (left === null || right === null || typeof left !== 'object' || typeof right !== 'object') return false;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return (
+      Array.isArray(left) &&
+      Array.isArray(right) &&
+      left.length === right.length &&
+      left.every((value, index) => storedControlEquals(value, right[index]))
+    );
+  }
+  const leftRecord = left as Record<string, unknown>;
+  const rightRecord = right as Record<string, unknown>;
+  const leftKeys = Object.keys(leftRecord);
+  const rightKeys = Object.keys(rightRecord);
+  return (
+    leftKeys.length === rightKeys.length &&
+    leftKeys.every(
+      key =>
+        Object.prototype.hasOwnProperty.call(rightRecord, key) &&
+        storedControlEquals(leftRecord[key], rightRecord[key]),
+    )
+  );
+}
+
+/**
+ * Reject generic storage writes that try to change a native revisioned Working
+ * Memory value or its control record. Generic writers may omit those fields or
+ * repeat the exact stored values (for example from a stale whole-row payload),
+ * but mutations must go through applyWorkingMemoryUpdate so revision checks and
+ * owner protections remain atomic.
+ */
+export function assertWorkingMemorySnapshotUnchanged({
+  currentValue,
+  currentMetadata,
+  proposedValue,
+  proposedValueProvided,
+  proposedMetadata,
+}: {
+  currentValue: string | null | undefined;
+  currentMetadata: Record<string, unknown> | undefined;
+  proposedValue: unknown;
+  proposedValueProvided: boolean;
+  proposedMetadata: Record<string, unknown> | undefined;
+}): void {
+  if (!hasWorkingMemorySnapshotControls(currentMetadata)) return;
+
+  const current = readWorkingMemorySnapshot(currentValue, currentMetadata);
+  if (proposedValueProvided && proposedValue !== current.value) {
+    throw new WorkingMemoryValidationError('Revisioned working memory must be changed with applyWorkingMemoryUpdate.');
+  }
+
+  if (!proposedMetadata || !Object.prototype.hasOwnProperty.call(proposedMetadata, 'mastra')) return;
+  if (!isRecord(proposedMetadata.mastra)) {
+    throw new WorkingMemoryValidationError(
+      'Revisioned working memory controls must be changed with applyWorkingMemoryUpdate.',
+    );
+  }
+  if (!Object.prototype.hasOwnProperty.call(proposedMetadata.mastra, CONTROL_METADATA_KEY)) return;
+
+  const currentMastra = currentMetadata!.mastra as Record<string, unknown>;
+  if (!storedControlEquals(proposedMetadata.mastra[CONTROL_METADATA_KEY], currentMastra[CONTROL_METADATA_KEY])) {
+    throw new WorkingMemoryValidationError(
+      'Revisioned working memory controls must be changed with applyWorkingMemoryUpdate.',
+    );
+  }
+}
+
+/** Restore the stored native control record after an allowed generic metadata write. */
+export function preserveWorkingMemorySnapshotControls(
+  currentMetadata: Record<string, unknown> | undefined,
+  nextMetadata: Record<string, unknown>,
+): Record<string, unknown> {
+  if (!hasWorkingMemorySnapshotControls(currentMetadata)) return nextMetadata;
+  const currentMastra = currentMetadata!.mastra as Record<string, unknown>;
+  const nextMastra = isRecord(nextMetadata.mastra) ? nextMetadata.mastra : {};
+  return {
+    ...nextMetadata,
+    mastra: {
+      ...nextMastra,
+      [CONTROL_METADATA_KEY]: structuredClone(currentMastra[CONTROL_METADATA_KEY]),
+    },
+  };
+}
+
 /**
  * Remove observer-derived values while retaining every path the owner has
  * protected. Callers must persist the returned snapshot atomically with the OM

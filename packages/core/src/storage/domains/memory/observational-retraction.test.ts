@@ -3,6 +3,69 @@ import { describe, expect, it } from 'vitest';
 import { InMemoryStore } from '../../mock';
 
 describe('MemoryStorage atomic observational-memory retraction', () => {
+  it('does not clear sibling thread memory when a resource record owns only resource memory', async () => {
+    const storage = new InMemoryStore({ id: 'memory-observational-retraction-mixed-scope' });
+    const memory = await storage.getStore('memory');
+    if (!memory) throw new Error('Expected in-memory storage domain.');
+    const resourceId = 'mixed-scope-resource';
+    const editedThreadId = 'mixed-scope-edited';
+    const siblingThreadId = 'mixed-scope-sibling';
+    const createdAt = new Date('2026-01-01T00:00:00.000Z');
+    for (const id of [editedThreadId, siblingThreadId]) {
+      await memory.saveThread({
+        thread: { id, resourceId, title: id, metadata: {}, createdAt, updatedAt: createdAt },
+      });
+    }
+    await memory.initializeObservationalMemory({
+      config: { _managedWorkingMemoryScope: 'resource' },
+      resourceId,
+      scope: 'resource',
+      threadId: null,
+    });
+    const editedRecord = await memory.initializeObservationalMemory({
+      config: { _managedWorkingMemoryScope: 'thread' },
+      resourceId,
+      scope: 'thread',
+      threadId: editedThreadId,
+    });
+    const siblingRecord = await memory.initializeObservationalMemory({
+      config: { _managedWorkingMemoryScope: 'thread' },
+      resourceId,
+      scope: 'thread',
+      threadId: siblingThreadId,
+    });
+    await memory.applyWorkingMemoryUpdate({
+      scope: 'thread',
+      resourceId,
+      threadId: editedThreadId,
+      value: '{"task":"edited"}',
+      expectedRevision: 0,
+      source: 'observer',
+      observationalMemoryGuard: { recordId: editedRecord.id, resourceId, threadId: editedThreadId },
+    });
+    const siblingSnapshot = await memory.applyWorkingMemoryUpdate({
+      scope: 'thread',
+      resourceId,
+      threadId: siblingThreadId,
+      value: '{"task":"sibling"}',
+      expectedRevision: 0,
+      source: 'observer',
+      observationalMemoryGuard: { recordId: siblingRecord.id, resourceId, threadId: siblingThreadId },
+    });
+
+    await memory.retractObservationalMemory({ resourceId, threadId: editedThreadId });
+
+    await expect(
+      memory.getWorkingMemorySnapshot({ scope: 'thread', resourceId, threadId: editedThreadId }),
+    ).resolves.toMatchObject({ value: null, revision: 2 });
+    await expect(
+      memory.getWorkingMemorySnapshot({ scope: 'thread', resourceId, threadId: siblingThreadId }),
+    ).resolves.toEqual(siblingSnapshot);
+    await expect(memory.getObservationalMemory(siblingThreadId, resourceId)).resolves.toMatchObject({
+      id: siblingRecord.id,
+    });
+  });
+
   it('clears every derived surface and fences an in-flight generation', async () => {
     const storage = new InMemoryStore({ id: 'memory-observational-retraction' });
     const memory = await storage.getStore('memory');

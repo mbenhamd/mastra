@@ -45,7 +45,9 @@ import type { InMemoryDB } from '../inmemory-db';
 import { MemoryStorage } from './base';
 import {
   applyWorkingMemorySnapshotUpdate,
+  assertWorkingMemorySnapshotUnchanged,
   hasWorkingMemorySnapshotControls,
+  preserveWorkingMemorySnapshotControls,
   readWorkingMemorySnapshot,
   retractObserverWorkingMemorySnapshot,
   writeWorkingMemorySnapshotMetadata,
@@ -54,6 +56,75 @@ import {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function freezeNested(value: unknown): unknown {
+  if (typeof value !== 'object' || value === null || Object.isFrozen(value)) return value;
+  for (const nested of Object.values(value)) freezeNested(nested);
+  return Object.freeze(value);
+}
+
+function cloneMetadataBoundary(
+  metadata: Record<string, unknown> | undefined,
+  freezeWorkingMemoryControl = false,
+): Record<string, unknown> | undefined {
+  if (metadata === undefined) return undefined;
+  const clone = { ...metadata };
+  if (!isRecord(metadata.mastra)) return clone;
+  const mastra = { ...metadata.mastra };
+  if (Object.prototype.hasOwnProperty.call(metadata.mastra, 'workingMemory')) {
+    const control = structuredClone(metadata.mastra.workingMemory);
+    mastra.workingMemory = freezeWorkingMemoryControl ? freezeNested(control) : control;
+  }
+  clone.mastra = mastra;
+  return clone;
+}
+
+function cloneThreadBoundary(thread: StorageThreadType, freezeWorkingMemoryControl = true): StorageThreadType {
+  return {
+    ...thread,
+    metadata: cloneMetadataBoundary(thread.metadata, freezeWorkingMemoryControl),
+    createdAt: new Date(thread.createdAt),
+    updatedAt: new Date(thread.updatedAt),
+  };
+}
+
+function cloneResourceBoundary(resource: StorageResourceType, freezeWorkingMemoryControl = true): StorageResourceType {
+  return {
+    ...resource,
+    metadata: cloneMetadataBoundary(resource.metadata, freezeWorkingMemoryControl),
+    createdAt: new Date(resource.createdAt),
+    updatedAt: new Date(resource.updatedAt),
+  };
+}
+
+function preserveGovernedThreadMetadata(
+  current: Record<string, unknown> | undefined,
+  proposed: Record<string, unknown> | undefined,
+  next: Record<string, unknown>,
+): Record<string, unknown> {
+  const currentValue = typeof current?.workingMemory === 'string' ? current.workingMemory : null;
+  assertWorkingMemorySnapshotUnchanged({
+    currentValue,
+    currentMetadata: current,
+    proposedValue: proposed?.workingMemory,
+    proposedValueProvided: proposed !== undefined && Object.prototype.hasOwnProperty.call(proposed, 'workingMemory'),
+    proposedMetadata: proposed,
+  });
+  if (!hasWorkingMemorySnapshotControls(current)) return next;
+
+  const preserved = preserveWorkingMemorySnapshotControls(current, next);
+  if (Object.prototype.hasOwnProperty.call(current, 'workingMemory')) preserved.workingMemory = current.workingMemory;
+  else delete preserved.workingMemory;
+  return preserved;
+}
+
+function replaceThreadMetadataPreservingWorkingMemory(
+  current: Record<string, unknown> | undefined,
+  proposed: Record<string, unknown> | undefined,
+): Record<string, unknown> {
+  const next = proposed ?? {};
+  return preserveGovernedThreadMetadata(current, proposed, next);
 }
 
 function mergeThreadMetadataPreservingWorkingMemory(
@@ -67,12 +138,7 @@ function mergeThreadMetadataPreservingWorkingMemory(
   if (Object.keys(existingMastra).length > 0 || Object.keys(updateMastra).length > 0) {
     merged.mastra = { ...existingMastra, ...updateMastra };
   }
-  if (hasWorkingMemorySnapshotControls(existing)) {
-    (merged.mastra as Record<string, unknown>).workingMemory = existingMastra.workingMemory;
-    if (typeof existing.workingMemory === 'string') merged.workingMemory = existing.workingMemory;
-    else delete merged.workingMemory;
-  }
-  return merged;
+  return preserveGovernedThreadMetadata(current, update, merged);
 }
 
 function mergeObservationalThreadMetadata(
@@ -143,9 +209,9 @@ export class InMemoryMemory extends MemoryStorage {
   private withMemoryStateRollback<T>(enabled: boolean, operation: () => T): T {
     if (!enabled) return operation();
 
-    const threads = new Map([...this.db.threads].map(([key, value]) => [key, { ...value }]));
+    const threads = new Map([...this.db.threads].map(([key, value]) => [key, cloneThreadBoundary(value, true)]));
     const messages = new Map([...this.db.messages].map(([key, value]) => [key, { ...value }]));
-    const resources = new Map([...this.db.resources].map(([key, value]) => [key, { ...value }]));
+    const resources = new Map([...this.db.resources].map(([key, value]) => [key, cloneResourceBoundary(value, true)]));
     const observationalMemory = new Map([...this.db.observationalMemory].map(([key, value]) => [key, [...value]]));
     const restore = <K, V>(target: Map<K, V>, snapshot: Map<K, V>) => {
       target.clear();
@@ -179,13 +245,15 @@ export class InMemoryMemory extends MemoryStorage {
   }): Promise<StorageThreadType | null> {
     const thread = this.db.threads.get(threadId);
     if (!thread || (resourceId !== undefined && thread.resourceId !== resourceId)) return null;
-    return { ...thread, metadata: thread.metadata ? { ...thread.metadata } : thread.metadata };
+    return cloneThreadBoundary(thread);
   }
 
   async saveThread({ thread }: { thread: StorageThreadType }): Promise<StorageThreadType> {
-    const key = thread.id;
-    this.db.threads.set(key, thread);
-    return thread;
+    const current = this.db.threads.get(thread.id);
+    const metadata = replaceThreadMetadataPreservingWorkingMemory(current?.metadata, thread.metadata);
+    const stored = cloneThreadBoundary({ ...thread, metadata }, true);
+    this.db.threads.set(thread.id, stored);
+    return cloneThreadBoundary(stored);
   }
 
   async updateThread({
@@ -203,14 +271,19 @@ export class InMemoryMemory extends MemoryStorage {
       throw new Error(`Thread with id ${id} not found`);
     }
 
-    if (thread) {
-      if (title !== undefined) thread.title = title;
-      if (metadata !== undefined) {
-        thread.metadata = mergeThreadMetadataPreservingWorkingMemory(thread.metadata, metadata);
-      }
-      thread.updatedAt = new Date();
-    }
-    return thread;
+    const updated = cloneThreadBoundary(
+      {
+        ...thread,
+        ...(title === undefined ? {} : { title }),
+        ...(metadata === undefined
+          ? {}
+          : { metadata: mergeThreadMetadataPreservingWorkingMemory(thread.metadata, metadata) }),
+        updatedAt: new Date(),
+      },
+      true,
+    );
+    this.db.threads.set(id, updated);
+    return cloneThreadBoundary(updated);
   }
 
   async deleteThread({
@@ -789,7 +862,7 @@ export class InMemoryMemory extends MemoryStorage {
 
     if (filter?.updatedBefore) {
       if (!(filter.updatedBefore instanceof Date) || Number.isNaN(filter.updatedBefore.getTime())) {
-        throw new WorkingMemoryValidationError('updatedBefore must be a valid Date.');
+        throw new TypeError('updatedBefore must be a valid Date.');
       }
       const updatedBefore = filter.updatedBefore.getTime();
       threads = threads.filter(thread => new Date(thread.updatedAt).getTime() < updatedBefore);
@@ -807,10 +880,7 @@ export class InMemoryMemory extends MemoryStorage {
     }
 
     const sortedThreads = this.sortThreads(threads, field, direction);
-    const clonedThreads = sortedThreads.map(thread => ({
-      ...thread,
-      metadata: thread.metadata ? { ...thread.metadata } : thread.metadata,
-    })) as StorageThreadType[];
+    const clonedThreads = sortedThreads.map(thread => cloneThreadBoundary(thread));
 
     const { offset, perPage: perPageForResponse } = calculatePagination(page, perPageInput, perPage);
 
@@ -825,14 +895,30 @@ export class InMemoryMemory extends MemoryStorage {
 
   async getResourceById({ resourceId }: { resourceId: string }): Promise<StorageResourceType | null> {
     const resource = this.db.resources.get(resourceId);
-    return resource
-      ? { ...resource, metadata: resource.metadata ? { ...resource.metadata } : resource.metadata }
-      : null;
+    return resource ? cloneResourceBoundary(resource) : null;
   }
 
   async saveResource({ resource }: { resource: StorageResourceType }): Promise<StorageResourceType> {
-    this.db.resources.set(resource.id, resource);
-    return resource;
+    const current = this.db.resources.get(resource.id);
+    assertWorkingMemorySnapshotUnchanged({
+      currentValue: current?.workingMemory,
+      currentMetadata: current?.metadata,
+      proposedValue: resource.workingMemory,
+      proposedValueProvided: Object.prototype.hasOwnProperty.call(resource, 'workingMemory'),
+      proposedMetadata: resource.metadata,
+    });
+    const stored = cloneResourceBoundary(
+      current && hasWorkingMemorySnapshotControls(current.metadata)
+        ? {
+            ...resource,
+            workingMemory: current.workingMemory,
+            metadata: preserveWorkingMemorySnapshotControls(current.metadata, resource.metadata ?? {}),
+          }
+        : resource,
+      true,
+    );
+    this.db.resources.set(resource.id, stored);
+    return cloneResourceBoundary(stored);
   }
 
   async updateResource({
@@ -844,7 +930,17 @@ export class InMemoryMemory extends MemoryStorage {
     workingMemory?: string;
     metadata?: Record<string, unknown>;
   }): Promise<StorageResourceType> {
-    let resource = this.db.resources.get(resourceId);
+    const current = this.db.resources.get(resourceId);
+
+    assertWorkingMemorySnapshotUnchanged({
+      currentValue: current?.workingMemory,
+      currentMetadata: current?.metadata,
+      proposedValue: workingMemory,
+      proposedValueProvided: workingMemory !== undefined,
+      proposedMetadata: metadata,
+    });
+
+    let resource = current;
 
     if (!resource) {
       // Create new resource if it doesn't exist
@@ -856,19 +952,24 @@ export class InMemoryMemory extends MemoryStorage {
         updatedAt: new Date(),
       };
     } else {
+      const mergedMetadata = {
+        ...resource.metadata,
+        ...metadata,
+      };
       resource = {
         ...resource,
-        workingMemory: workingMemory !== undefined ? workingMemory : resource.workingMemory,
-        metadata: {
-          ...resource.metadata,
-          ...metadata,
-        },
+        workingMemory:
+          hasWorkingMemorySnapshotControls(resource.metadata) || workingMemory === undefined
+            ? resource.workingMemory
+            : workingMemory,
+        metadata: preserveWorkingMemorySnapshotControls(resource.metadata, mergedMetadata),
         updatedAt: new Date(),
       };
     }
 
-    this.db.resources.set(resourceId, resource);
-    return resource;
+    const stored = cloneResourceBoundary(resource, true);
+    this.db.resources.set(resourceId, stored);
+    return cloneResourceBoundary(stored);
   }
 
   async updateResourceFromObservationalMemory({
@@ -889,6 +990,14 @@ export class InMemoryMemory extends MemoryStorage {
     if (current?.id !== guard.recordId) {
       throw new Error('Observational memory generation is no longer current.');
     }
+    const resource = this.db.resources.get(resourceId);
+    assertWorkingMemorySnapshotUnchanged({
+      currentValue: resource?.workingMemory,
+      currentMetadata: resource?.metadata,
+      proposedValue: workingMemory,
+      proposedValueProvided: true,
+      proposedMetadata: undefined,
+    });
     return this.updateResource({ resourceId, workingMemory });
   }
 
@@ -963,13 +1072,19 @@ export class InMemoryMemory extends MemoryStorage {
         const current = readWorkingMemorySnapshot(resource?.workingMemory, resource?.metadata);
         const next = applyWorkingMemorySnapshotUpdate(current, input, now.toISOString());
         if (next === current) return current;
-        this.db.resources.set(input.resourceId, {
-          id: input.resourceId,
-          ...(next.value === null ? {} : { workingMemory: next.value }),
-          metadata: writeWorkingMemorySnapshotMetadata(resource?.metadata, next),
-          createdAt: resource?.createdAt ?? now,
-          updatedAt: now,
-        });
+        this.db.resources.set(
+          input.resourceId,
+          cloneResourceBoundary(
+            {
+              id: input.resourceId,
+              ...(next.value === null ? {} : { workingMemory: next.value }),
+              metadata: writeWorkingMemorySnapshotMetadata(resource?.metadata, next),
+              createdAt: resource?.createdAt ?? now,
+              updatedAt: now,
+            },
+            true,
+          ),
+        );
         return next;
       }
 
@@ -984,7 +1099,7 @@ export class InMemoryMemory extends MemoryStorage {
       const metadata = writeWorkingMemorySnapshotMetadata(thread.metadata, next);
       if (next.value === null) delete metadata.workingMemory;
       else metadata.workingMemory = next.value;
-      this.db.threads.set(input.threadId, { ...thread, metadata, updatedAt: now });
+      this.db.threads.set(input.threadId, cloneThreadBoundary({ ...thread, metadata, updatedAt: now }, true));
       return next;
     });
   }
@@ -1613,12 +1728,13 @@ export class InMemoryMemory extends MemoryStorage {
     this.db.observationalMemory.delete(resourceKey);
     this.db.observationalMemory.delete(threadKey);
 
-    const managedWorkingMemoryScopes = getManagedWorkingMemoryScopes([...resourceRecords, ...threadRecords]);
+    const resourceManagedWorkingMemoryScopes = getManagedWorkingMemoryScopes(resourceRecords);
+    const threadManagedWorkingMemoryScopes = getManagedWorkingMemoryScopes(threadRecords);
     const resource = this.db.resources.get(input.resourceId);
     let clearedResourceWorkingMemory = false;
     if (
       resource &&
-      managedWorkingMemoryScopes.has('resource') &&
+      (resourceManagedWorkingMemoryScopes.has('resource') || threadManagedWorkingMemoryScopes.has('resource')) &&
       (resource.workingMemory !== undefined || hasWorkingMemorySnapshotControls(resource.metadata))
     ) {
       if (hasWorkingMemorySnapshotControls(resource.metadata)) {
@@ -1651,7 +1767,9 @@ export class InMemoryMemory extends MemoryStorage {
           ? [this.db.threads.get(input.threadId)].filter((thread): thread is StorageThreadType => thread !== undefined)
           : [];
     for (const thread of threads) {
-      const clearWorkingMemory = managedWorkingMemoryScopes.has('thread');
+      const clearWorkingMemory =
+        resourceManagedWorkingMemoryScopes.has('thread') ||
+        (thread.id === input.threadId && threadManagedWorkingMemoryScopes.has('thread'));
       const hasControls = clearWorkingMemory && hasWorkingMemorySnapshotControls(thread.metadata);
       const cleaned = removeObservationalMemoryMetadata(thread.metadata, clearWorkingMemory && !hasControls);
       let metadata = cleaned.metadata;

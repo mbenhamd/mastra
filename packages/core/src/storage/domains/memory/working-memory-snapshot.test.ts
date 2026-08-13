@@ -472,6 +472,149 @@ describe('revisioned Working Memory controls', () => {
 });
 
 describe('InMemoryMemory revisioned Working Memory', () => {
+  it('rejects generic mutations while preserving governed fields omitted from whole-row saves', async () => {
+    const storage = new InMemoryStore({ id: 'working-memory-generic-write-guards' });
+    const memory = await storage.getStore('memory');
+    if (!memory) throw new Error('Expected in-memory storage domain.');
+    const createdAt = new Date('2026-01-01T00:00:00.000Z');
+    const resourceId = 'guarded-resource';
+    const threadId = 'guarded-thread';
+    await memory.saveThread({
+      thread: { id: threadId, resourceId, title: 'Thread', metadata: {}, createdAt, updatedAt: createdAt },
+    });
+    const threadOwner = await memory.applyWorkingMemoryUpdate({
+      scope: 'thread',
+      resourceId,
+      threadId,
+      value: '{"preference":"concise"}',
+      expectedRevision: 0,
+      source: 'owner',
+      protectPaths: ['/preference'],
+    });
+    const resourceOwner = await memory.applyWorkingMemoryUpdate({
+      scope: 'resource',
+      resourceId,
+      value: '{"name":"Ada"}',
+      expectedRevision: 0,
+      source: 'owner',
+      protectPaths: ['/name'],
+    });
+
+    await memory.updateThread({ id: threadId, metadata: { display: 'updated' } });
+    await memory.updateResource({ resourceId, metadata: { display: 'updated' } });
+    await memory.saveThread({
+      thread: { id: threadId, resourceId, title: 'Saved', metadata: {}, createdAt, updatedAt: createdAt },
+    });
+    await memory.saveResource({ resource: { id: resourceId, metadata: {}, createdAt, updatedAt: createdAt } });
+
+    await expect(memory.getWorkingMemorySnapshot({ scope: 'thread', resourceId, threadId })).resolves.toEqual(
+      threadOwner,
+    );
+    await expect(memory.getWorkingMemorySnapshot({ scope: 'resource', resourceId })).resolves.toEqual(resourceOwner);
+
+    await expect(
+      memory.updateThread({ id: threadId, metadata: { workingMemory: '{"preference":"verbose"}' } }),
+    ).rejects.toThrow('applyWorkingMemoryUpdate');
+    await expect(memory.updateResource({ resourceId, workingMemory: '{"name":"Grace"}' })).rejects.toThrow(
+      'applyWorkingMemoryUpdate',
+    );
+    await expect(
+      memory.saveThread({
+        thread: {
+          id: threadId,
+          resourceId,
+          title: 'Rejected',
+          metadata: { mastra: { workingMemory: { revision: 999 } } },
+          createdAt,
+          updatedAt: createdAt,
+        },
+      }),
+    ).rejects.toThrow('applyWorkingMemoryUpdate');
+    await expect(
+      memory.saveResource({
+        resource: {
+          id: resourceId,
+          workingMemory: '{"name":"Grace"}',
+          metadata: {},
+          createdAt,
+          updatedAt: createdAt,
+        },
+      }),
+    ).rejects.toThrow('applyWorkingMemoryUpdate');
+
+    const record = await memory.initializeObservationalMemory({
+      config: { _managedWorkingMemoryScope: 'resource' },
+      resourceId,
+      scope: 'resource',
+      threadId: null,
+    });
+    await expect(
+      memory.updateResourceFromObservationalMemory({
+        resourceId,
+        workingMemory: '{"name":"Grace"}',
+        guard: { recordId: record.id, resourceId, threadId: null },
+      }),
+    ).rejects.toThrow('applyWorkingMemoryUpdate');
+  });
+
+  it('deep-clones and freezes governed metadata at in-memory adapter boundaries', async () => {
+    const storage = new InMemoryStore({ id: 'working-memory-control-boundaries' });
+    const memory = await storage.getStore('memory');
+    if (!memory) throw new Error('Expected in-memory storage domain.');
+    const createdAt = new Date('2026-01-01T00:00:00.000Z');
+    const resourceId = 'boundary-resource';
+    const threadId = 'boundary-thread';
+    await memory.saveThread({
+      thread: { id: threadId, resourceId, title: 'Thread', metadata: {}, createdAt, updatedAt: createdAt },
+    });
+    await memory.applyWorkingMemoryUpdate({
+      scope: 'thread',
+      resourceId,
+      threadId,
+      value: '{"preference":"concise"}',
+      expectedRevision: 0,
+      source: 'owner',
+      protectPaths: ['/preference'],
+    });
+    await memory.applyWorkingMemoryUpdate({
+      scope: 'resource',
+      resourceId,
+      value: '{"name":"Ada"}',
+      expectedRevision: 0,
+      source: 'owner',
+      protectPaths: ['/name'],
+    });
+
+    const thread = await memory.getThreadById({ threadId });
+    const resource = await memory.getResourceById({ resourceId });
+    const threadControl = (thread?.metadata?.mastra as Record<string, unknown>).workingMemory as Record<
+      string,
+      unknown
+    >;
+    const resourceControl = (resource?.metadata?.mastra as Record<string, unknown>).workingMemory as Record<
+      string,
+      unknown
+    >;
+    expect(Object.isFrozen(threadControl)).toBe(true);
+    expect(Object.isFrozen(threadControl.provenance)).toBe(true);
+    expect(Object.isFrozen(resourceControl)).toBe(true);
+    expect(() => {
+      threadControl.revision = 99;
+    }).toThrow(TypeError);
+    expect(() => {
+      resourceControl.revision = 99;
+    }).toThrow(TypeError);
+
+    await expect(memory.getWorkingMemorySnapshot({ scope: 'thread', resourceId, threadId })).resolves.toMatchObject({
+      revision: 1,
+      protectedPaths: ['/preference'],
+    });
+    await expect(memory.getWorkingMemorySnapshot({ scope: 'resource', resourceId })).resolves.toMatchObject({
+      revision: 1,
+      protectedPaths: ['/name'],
+    });
+  });
+
   it('enforces revisions, ownership coordinates, and protected observer writes', async () => {
     const storage = new InMemoryStore({ id: 'revisioned-working-memory' });
     const memory = await storage.getStore('memory');
