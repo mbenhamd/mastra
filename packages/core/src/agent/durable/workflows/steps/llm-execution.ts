@@ -899,7 +899,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
             // Guards against a re-delivered tool-result minting a second span for the same call.
             const materializedProviderToolCallIds = new Set<string>();
 
-            const hasPendingProviderToolCall = (toolCallId: string, toolName?: string): boolean => {
+            const hasPendingProviderToolCall = (toolCallId: string): boolean => {
               const messages = messageList.get.all.db();
               for (let i = messages.length - 1; i >= 0; i--) {
                 const msg = messages[i];
@@ -910,8 +910,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                   if (
                     part.providerExecuted === true &&
                     invocation?.state === 'call' &&
-                    (invocation.toolCallId === toolCallId ||
-                      (toolName !== undefined && invocation.toolName === toolName))
+                    invocation.toolCallId === toolCallId
                   ) {
                     return true;
                   }
@@ -1200,7 +1199,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                         const settlesPendingProviderCall =
                           chunk.type === 'tool-result' &&
                           (pendingProviderToolCallsByToolCallId.has(chunk.payload.toolCallId) ||
-                            hasPendingProviderToolCall(chunk.payload.toolCallId, chunk.payload.toolName));
+                            hasPendingProviderToolCall(chunk.payload.toolCallId));
                         if (!settlesPendingProviderCall) {
                           providerToolChunkSuppressed = true;
                           return;
@@ -1267,7 +1266,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                   const settlesPendingProviderCall =
                     rawChunk.type === 'tool-result' &&
                     (pendingProviderToolCallsByToolCallId.has(rawChunk.payload.toolCallId) ||
-                      hasPendingProviderToolCall(rawChunk.payload.toolCallId, rawChunk.payload.toolName));
+                      hasPendingProviderToolCall(rawChunk.payload.toolCallId));
                   if (!settlesPendingProviderCall) {
                     providerToolChunkSuppressed = true;
                     continue;

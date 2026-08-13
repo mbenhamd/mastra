@@ -206,7 +206,7 @@ type ProcessOutputStreamOptions<OUTPUT = undefined> = {
  * Used to read the post-processToolResult value back from the message list so we can
  * sync any processor mutations into the downstream tool-result stream chunk.
  */
-function hasPendingProviderToolCall(messageList: MessageList, toolCallId: string, toolName?: string): boolean {
+function hasPendingProviderToolCall(messageList: MessageList, toolCallId: string): boolean {
   const messages = messageList.get.all.db();
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
@@ -214,11 +214,7 @@ function hasPendingProviderToolCall(messageList: MessageList, toolCallId: string
     for (const part of msg.content.parts) {
       if (part?.type !== 'tool-invocation') continue;
       const invocation = part.toolInvocation;
-      if (
-        part.providerExecuted === true &&
-        invocation?.state === 'call' &&
-        (invocation.toolCallId === toolCallId || (toolName !== undefined && invocation.toolName === toolName))
-      ) {
+      if (part.providerExecuted === true && invocation?.state === 'call' && invocation.toolCallId === toolCallId) {
         return true;
       }
     }
@@ -772,7 +768,7 @@ async function processOutputStream<OUTPUT = undefined>({
       const settlesPendingProviderCall =
         chunk.type === 'tool-result' &&
         (pendingProviderToolCallsByToolCallId?.has(chunk.payload.toolCallId) === true ||
-          hasPendingProviderToolCall(messageList, chunk.payload.toolCallId, chunk.payload.toolName));
+          hasPendingProviderToolCall(messageList, chunk.payload.toolCallId));
       if (!settlesPendingProviderCall) {
         toolChunkSuppressed = true;
         continue;
@@ -1880,7 +1876,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                     const settlesPendingProviderCall =
                       chunk.type === 'tool-result' &&
                       (pendingProviderToolCallsByToolCallId.has(chunk.payload.toolCallId) ||
-                        hasPendingProviderToolCall(messageList, chunk.payload.toolCallId, chunk.payload.toolName));
+                        hasPendingProviderToolCall(messageList, chunk.payload.toolCallId));
                     if (!settlesPendingProviderCall) {
                       providerToolChunkSuppressed = true;
                       return;

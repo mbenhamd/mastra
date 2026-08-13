@@ -958,8 +958,11 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
       // Inngest can move the next operation to another worker. Resolve the
       // effective defaults before preparation so a configured recovery budget
       // is rejected before memory, processors, spans, or dispatch side effects.
-      const requestContext = streamOptions?.requestContext ?? new RequestContext();
-      const defaultOptions = await agent.getDefaultOptions({ requestContext });
+      const callerRequestContext = streamOptions?.requestContext;
+      const defaultOptions = await agent.getDefaultOptions({
+        requestContext: callerRequestContext ?? new RequestContext(),
+      });
+      const requestContext = callerRequestContext ?? defaultOptions.requestContext;
       assertInngestResponseRecoveryDisabled(streamOptions);
       assertInngestResponseRecoveryDisabled(defaultOptions);
 
@@ -969,7 +972,7 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
         messages,
         options: streamOptions as AgentExecutionOptions<TOutput>,
         resolvedDefaultOptions: defaultOptions as AgentExecutionOptions<TOutput>,
-        requestContext,
+        ...(requestContext ? { requestContext } : {}),
         runId: streamOptions?.runId,
         methodType: (streamOptions as any)?.__methodType ?? 'stream',
         durableRequestContextKeys,
@@ -1450,8 +1453,11 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
     },
 
     async prepare(messages, prepareOptions) {
-      const requestContext = prepareOptions?.requestContext ?? new RequestContext();
-      const defaultOptions = await agent.getDefaultOptions({ requestContext });
+      const callerRequestContext = prepareOptions?.requestContext;
+      const defaultOptions = await agent.getDefaultOptions({
+        requestContext: callerRequestContext ?? new RequestContext(),
+      });
+      const requestContext = callerRequestContext ?? defaultOptions.requestContext;
       assertInngestResponseRecoveryDisabled(prepareOptions);
       assertInngestResponseRecoveryDisabled(defaultOptions);
       const preparation = await prepareForDurableExecution<TOutput>({
@@ -1459,7 +1465,7 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
         messages,
         options: prepareOptions,
         resolvedDefaultOptions: defaultOptions as AgentExecutionOptions<TOutput>,
-        requestContext,
+        ...(requestContext ? { requestContext } : {}),
         durableRequestContextKeys,
       });
 

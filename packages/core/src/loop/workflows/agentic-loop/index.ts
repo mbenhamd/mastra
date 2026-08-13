@@ -241,6 +241,7 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
       }
 
       // Only call stopWhen if we're continuing (not on the final step)
+      let customStopWhenMatched = false;
       if (rest.stopWhen && !hasFinishedSteps && typedInputData.stepResult?.isContinued && accumulatedSteps.length > 0) {
         // Cast steps to any for v5/v6 StopCondition compatibility
         // v5 and v6 StepResult types have minor differences (e.g., rawFinishReason, finishReason format)
@@ -252,8 +253,13 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
           }),
         );
 
-        const hasStopped = conditions.some(condition => condition);
-        hasFinishedSteps = hasFinishedSteps || hasStopped;
+        const matchedStopConditionIndexes = conditions.flatMap((condition, index) => (condition ? [index] : []));
+        const maxStepsConditionMatched = rest.maxSteps !== undefined && accumulatedSteps.length >= rest.maxSteps;
+        // The loop prepends its internal maxSteps condition before caller
+        // conditions. Recovery may cross only that ordinary ceiling; any later
+        // matching condition is a caller-owned hard stop.
+        customStopWhenMatched = matchedStopConditionIndexes.some(index => !maxStepsConditionMatched || index > 0);
+        hasFinishedSteps = hasFinishedSteps || matchedStopConditionIndexes.length > 0;
       }
 
       // Call onIterationComplete hook if provided (call for every iteration, not just continued ones)
@@ -286,6 +292,7 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
         try {
           const iterationResult = await rest.onIterationComplete(iterationContext);
           const reservesResponseRecovery =
+            !customStopWhenMatched &&
             iterationResult?.continue === true &&
             iterationResult[AGENT_RESPONSE_RECOVERY_CONTINUATION] === true &&
             rest.maxSteps !== undefined &&
