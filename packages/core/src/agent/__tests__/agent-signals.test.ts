@@ -4572,7 +4572,6 @@ describe('Agent signals', () => {
     const followerRuntime = new AgentThreadStreamRuntime();
     const key = 'remote-abort-resource\u0000remote-abort-thread';
     const runId = 'remote-abort-run';
-    pubsub.owners.set(key, runId);
     const ownerSubscription = await ownerRuntime.subscribeToThread(
       { id: 'remote-abort-agent' } as Agent<any, any, any, any>,
       { resourceId: 'remote-abort-resource', threadId: 'remote-abort-thread' },

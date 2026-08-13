@@ -286,7 +286,8 @@ type SerializableAgentSignal = AgentSignal & Pick<CreatedAgentSignal, 'id' | 'cr
 
 type AgentThreadStreamRuntimeEvent =
   | { type: 'run-registered'; runId: string; streamId: string; streamSeq: number; leaseOwner: string }
-  | { type: 'stream-part'; runId: string; streamId: string; part: unknown; sourceId: string }
+  | { type: 'run-aborting'; runId: string; streamId: string; leaseOwner: string }
+  | { type: 'stream-part'; runId: string; streamId: string; part: unknown; sourceId: string; leaseOwner?: string }
   | { type: 'run-completed'; runId: string; streamId?: string }
   | { type: 'run-suspended'; runId: string; streamId?: string }
   | { type: 'run-abort-requested'; runId: string; streamId: string }
@@ -852,6 +853,7 @@ export class AgentThreadStreamRuntime {
         streamId,
         part,
         sourceId: runtime.#getSourceId(),
+        leaseOwner: runtime.#leaseOwnerForRun(runtime.#getState(pubsub), output.runId),
       });
     };
 
@@ -1232,6 +1234,14 @@ export class AgentThreadStreamRuntime {
       for (const notifyAbort of this.#eagerAbortListenersByStreamId.get(registeredRecord.streamId) ?? []) {
         notifyAbort();
       }
+      if (key) {
+        this.#publish(pubsub, key, {
+          type: 'run-aborting',
+          runId,
+          streamId: registeredRecord.streamId,
+          leaseOwner: this.#leaseOwnerForRun(state, runId),
+        });
+      }
       const broadcastAbort = registeredRecord.abortBroadcast?.() ?? Promise.resolve();
       const publishAbortAfterBroadcast = () => {
         if (!key) return;
@@ -1377,6 +1387,7 @@ export class AgentThreadStreamRuntime {
 
   /** @internal */
   resetForTests() {
+    this.#eagerAbortListenersByStreamId.clear();
     for (const pubsub of [defaultAgentThreadPubSub]) {
       this.#resetState(pubsub);
       void (pubsub as { close?: () => Promise<void> }).close?.();
@@ -1438,6 +1449,7 @@ export class AgentThreadStreamRuntime {
     }
     state.registrationPublishesByStreamId.clear();
     state.broadcastsByStreamId.clear();
+    this.#eagerAbortListenersByStreamId.clear();
   }
 
   #cleanupPreparedRun(state: AgentThreadRuntimeState, runId: string, preserveAbort = false) {
@@ -1848,14 +1860,22 @@ export class AgentThreadStreamRuntime {
     state.threadRunsById.set(runId, record);
     state.threadRunsByStreamId.set(streamId, record);
     state.threadKeysByRunId.set(runId, key);
+    state.activeThreadRunIds.set(key, runId);
     state.activeThreadStreamIds.set(key, streamId);
-    const registered = this.#publishAndWait(pubsub, key, {
-      type: 'run-registered',
-      runId,
-      streamId,
-      streamSeq,
-      leaseOwner: this.#leaseOwnerForRun(state, runId),
-    });
+    const leaseOwner = this.#leaseOwnerForRun(state, runId);
+    const registered = this.#getLeaseProvider(pubsub)
+      .acquireLease(key, leaseOwner, AGENT_THREAD_LEASE_TTL_MS)
+      .then(lease => {
+        if (!lease.acquired) throw new Error(`Agent thread run id "${runId}" lost its persisted-signal lease`);
+        this.#startLeaseRenewal(this.#getPubSub(pubsub), key, runId);
+        return this.#publishAndWait(pubsub, key, {
+          type: 'run-registered',
+          runId,
+          streamId,
+          streamSeq,
+          leaseOwner,
+        });
+      });
     const broadcast = registered.then(startBroadcast, startBroadcast).catch(() => {});
     // PR #202 review (P2): the synthetic output's `finish()` fires at stream
     // CONSTRUCTION, long before an async pubsub has published the stream-parts.
@@ -3322,6 +3342,10 @@ export class AgentThreadStreamRuntime {
       abortDrainTimer = undefined;
     };
 
+    const markAbortPending = (streamId: string) => {
+      if (activeReaderStreamId === streamId && currentReader) abortTerminalPending = true;
+    };
+
     const armAbortDrain = (runId: string, streamId: string) => {
       if (activeReaderStreamId !== streamId || !currentReader) return;
       abortTerminalPending = true;
@@ -3347,7 +3371,7 @@ export class AgentThreadStreamRuntime {
 
     const registerEagerAbortListener = (runId: string, streamId: string) => {
       if (eagerAbortListenersByStreamId.has(streamId)) return;
-      const listener = () => armAbortDrain(runId, streamId);
+      const listener = () => markAbortPending(streamId);
       eagerAbortListenersByStreamId.set(streamId, listener);
       const listeners = this.#eagerAbortListenersByStreamId.get(streamId) ?? new Set<() => void>();
       listeners.add(listener);
@@ -3425,6 +3449,14 @@ export class AgentThreadStreamRuntime {
         wake();
         return;
       }
+      if (data.type === 'run-aborting') {
+        const activeStreamId =
+          state.activeThreadRunIds.get(key) === data.runId ? state.activeThreadStreamIds.get(key) : undefined;
+        if (activeStreamId !== data.streamId) return;
+        if (!(await this.#hasLiveThreadLease(resolvedPubSub, key, data.runId, data.leaseOwner))) return;
+        markAbortPending(data.streamId);
+        return;
+      }
       if (data.type === 'stream-part') {
         if (
           data.sourceId === this.#id &&
@@ -3444,7 +3476,12 @@ export class AgentThreadStreamRuntime {
         ) {
           return;
         }
-        if (activeStreamId === undefined) return;
+        if (activeStreamId === undefined) {
+          if (data.leaseOwner === undefined) return;
+          if (!(await markActiveIfLive(data.runId, data.streamId, false, data.leaseOwner))) return;
+          replayedStreamIds.add(data.streamId);
+          enqueueRun(createRemoteRun(data.runId, data.streamId, state.streamSeqByRunId.get(data.runId) ?? 1));
+        }
         let remoteRun = remoteRuns.get(data.streamId);
         if (!remoteRun) return;
         remoteRun.parts.push(data.part);
