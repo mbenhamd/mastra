@@ -104,22 +104,47 @@ function getPointer(root: JsonValue, segments: readonly string[]): { exists: boo
   return { exists: true, value: current };
 }
 
-function setPointer(root: JsonValue, segments: readonly string[], value: JsonValue): JsonValue {
+function sameContainerType(left: JsonValue, right: JsonValue): boolean {
+  return (Array.isArray(left) && Array.isArray(right)) || (isRecord(left) && isRecord(right));
+}
+
+function emptyContainerLike(value: JsonValue): JsonValue[] | Record<string, JsonValue> {
+  if (Array.isArray(value)) return [];
+  if (isRecord(value)) return {};
+  throw new WorkingMemoryValidationError('Protected working-memory paths must traverse JSON containers.');
+}
+
+function setPointer(
+  root: JsonValue,
+  segments: readonly string[],
+  value: JsonValue,
+  templateRoot: JsonValue,
+): JsonValue {
   if (segments.length === 0) return cloneJson(value);
-  if (!isRecord(root) && !Array.isArray(root)) {
-    root = /^\d+$/u.test(segments[0]!) ? [] : {};
+  if (!sameContainerType(root, templateRoot)) {
+    root = emptyContainerLike(templateRoot);
   }
 
   let current = root as JsonValue[] | Record<string, JsonValue>;
+  let template = templateRoot as JsonValue[] | Record<string, JsonValue>;
   for (let index = 0; index < segments.length - 1; index += 1) {
     const segment = segments[index]!;
-    const nextSegment = segments[index + 1]!;
+    if (Array.isArray(template) && !/^\d+$/u.test(segment)) {
+      throw new WorkingMemoryValidationError('Working-memory array paths must use numeric indexes.');
+    }
+    const templateNext = Array.isArray(template) ? template[Number(segment)] : template[segment];
+    if (templateNext === undefined) {
+      throw new WorkingMemoryValidationError('Protected working-memory paths must exist in the stored value.');
+    }
     const existing = Array.isArray(current)
       ? /^\d+$/u.test(segment)
         ? current[Number(segment)]
         : undefined
       : current[segment];
-    const next = isRecord(existing) || Array.isArray(existing) ? existing : /^\d+$/u.test(nextSegment) ? [] : {};
+    const next: JsonValue[] | Record<string, JsonValue> =
+      existing !== undefined && sameContainerType(existing, templateNext)
+        ? (existing as JsonValue[] | Record<string, JsonValue>)
+        : emptyContainerLike(templateNext);
     if (Array.isArray(current)) {
       if (!/^\d+$/u.test(segment)) {
         throw new WorkingMemoryValidationError('Working-memory array paths must use numeric indexes.');
@@ -129,6 +154,7 @@ function setPointer(root: JsonValue, segments: readonly string[], value: JsonVal
       current[segment] = next;
     }
     current = next;
+    template = templateNext as JsonValue[] | Record<string, JsonValue>;
   }
 
   const leaf = segments.at(-1)!;
@@ -164,7 +190,7 @@ function preserveProtectedPaths(
     if (!prior.exists) {
       throw new WorkingMemoryValidationError('Protected working-memory paths must exist in the stored value.');
     }
-    merged = setPointer(merged, segments, prior.value!);
+    merged = setPointer(merged, segments, prior.value!, current);
   }
   return JSON.stringify(merged);
 }
@@ -174,6 +200,9 @@ function valuesEqual(left: JsonValue | undefined, right: JsonValue | undefined):
 }
 
 function changedJsonPointers(before: string | null, after: string | null): string[] {
+  // The storage contract distinguishes no value (`null`) from the literal JSON
+  // text `"null"`, even though both parse to the same JavaScript value.
+  if (before === null || after === null) return before === after ? [] : [''];
   const beforeJson = parseJsonValue(before);
   const afterJson = parseJsonValue(after);
   if (beforeJson === undefined || afterJson === undefined) return before === after ? [] : [''];
@@ -200,6 +229,13 @@ function changedJsonPointers(before: string | null, after: string | null): strin
     // coarse provenance unit instead of emitting a control pointer that the
     // fail-closed reader would later reject.
     if ([...keys].some(key => FORBIDDEN_POINTER_SEGMENTS.has(key))) {
+      changed.push(path);
+      return;
+    }
+    // Stored JSON keys are not control input and may be longer than a bounded
+    // JSON pointer permits. Collapse their changes to the nearest valid
+    // ancestor so a value we just wrote always remains readable.
+    if ([...keys].some(key => `${path}/${encodePointerSegment(key)}`.length > MAX_POINTER_LENGTH)) {
       changed.push(path);
       return;
     }
@@ -321,7 +357,7 @@ export function retractObserverWorkingMemorySnapshot(current: WorkingMemorySnaps
       for (const pointer of current.protectedPaths) {
         const segments = pointerSegments(pointer);
         const existing = getPointer(parsed, segments);
-        if (existing.exists) preserved = setPointer(preserved, segments, existing.value!);
+        if (existing.exists) preserved = setPointer(preserved, segments, existing.value!, parsed);
       }
       value = JSON.stringify(preserved);
     }
@@ -362,8 +398,10 @@ export function writeWorkingMemorySnapshotMetadata(
       ...mastra,
       [CONTROL_METADATA_KEY]: {
         revision: snapshot.revision,
-        protectedPaths: snapshot.protectedPaths,
-        provenance: snapshot.provenance,
+        protectedPaths: [...snapshot.protectedPaths],
+        provenance: Object.fromEntries(
+          Object.entries(snapshot.provenance).map(([path, entry]) => [path, { ...entry }]),
+        ),
       },
     },
   };
@@ -435,13 +473,16 @@ export function applyWorkingMemorySnapshotUpdate(
 
   const revision = current.revision + 1;
   const provenance = { ...current.provenance };
+  const parsedValue = parseJsonValue(value);
   for (const path of changedPaths) {
     for (const existingPath of Object.keys(provenance)) {
       if (existingPath === path || path === '' || existingPath.startsWith(`${path}/`)) {
         delete provenance[existingPath];
       }
     }
-    provenance[path] = { source: input.source, revision, updatedAt };
+    if (path === '' || parsedValue === undefined || getPointer(parsedValue, pointerSegments(path)).exists) {
+      provenance[path] = { source: input.source, revision, updatedAt };
+    }
   }
   if (input.source === 'observer') {
     // Arrays are tracked as one changed pointer so that insertions/removals do

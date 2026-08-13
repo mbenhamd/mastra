@@ -91,6 +91,28 @@ describe('revisioned Working Memory controls', () => {
     expect(observer.provenance['/0']).toMatchObject({ source: 'owner' });
   });
 
+  it('preserves numeric object keys as objects during observer writes and retraction', () => {
+    const owner = applyWorkingMemorySnapshotUpdate(
+      { value: null, revision: 0, protectedPaths: [], provenance: {} },
+      {
+        value: JSON.stringify({ answers: { '0': 'owner value', stale: true } }),
+        expectedRevision: 0,
+        source: 'owner',
+        protectPaths: ['/answers/0'],
+      },
+    );
+    const observer = applyWorkingMemorySnapshotUpdate(owner, {
+      value: JSON.stringify({ focus: 'new value' }),
+      expectedRevision: owner.revision,
+      source: 'observer',
+    });
+
+    expect(JSON.parse(observer.value!)).toEqual({ answers: { '0': 'owner value' }, focus: 'new value' });
+    expect(JSON.parse(retractObserverWorkingMemorySnapshot(observer).value!)).toEqual({
+      answers: { '0': 'owner value' },
+    });
+  });
+
   it('rejects stale revisions and observer control changes', () => {
     const current = { value: '{}', revision: 4, protectedPaths: [], provenance: {} } as const;
     expect(() =>
@@ -226,6 +248,58 @@ describe('revisioned Working Memory controls', () => {
     expect(updated.provenance['']).toMatchObject({ source: 'observer' });
     expect(updated.provenance['/name']).toMatchObject({ source: 'owner' });
     expect(() => readWorkingMemorySnapshot(updated.value, metadata)).not.toThrow();
+  });
+
+  it('keeps snapshots readable when JSON data keys exceed the control-pointer limit', () => {
+    const initial = applyWorkingMemorySnapshotUpdate(
+      { value: null, revision: 0, protectedPaths: [], provenance: {} },
+      {
+        value: '{}',
+        expectedRevision: 0,
+        source: 'observer',
+      },
+    );
+    const longDataKey = 'x'.repeat(1024);
+    const updated = applyWorkingMemorySnapshotUpdate(initial, {
+      value: JSON.stringify({ [longDataKey]: true }),
+      expectedRevision: initial.revision,
+      source: 'observer',
+    });
+
+    expect(updated.provenance).toMatchObject({ '': { source: 'observer' } });
+    expect(() =>
+      readWorkingMemorySnapshot(updated.value, writeWorkingMemorySnapshotMetadata({}, updated)),
+    ).not.toThrow();
+  });
+
+  it('distinguishes a cleared snapshot from the literal JSON null value', () => {
+    const storedNull = applyWorkingMemorySnapshotUpdate(
+      { value: null, revision: 0, protectedPaths: [], provenance: {} },
+      { value: 'null', expectedRevision: 0, source: 'owner' },
+    );
+    const cleared = applyWorkingMemorySnapshotUpdate(storedNull, {
+      value: null,
+      expectedRevision: storedNull.revision,
+      source: 'owner',
+    });
+
+    expect(storedNull).toMatchObject({ value: 'null', revision: 1 });
+    expect(cleared).toMatchObject({ value: null, revision: 2 });
+  });
+
+  it('does not retain provenance tombstones for removed JSON paths', () => {
+    const added = applyWorkingMemorySnapshotUpdate(
+      { value: '{}', revision: 0, protectedPaths: [], provenance: {} },
+      { value: '{"temporary":true}', expectedRevision: 0, source: 'observer' },
+    );
+    const removed = applyWorkingMemorySnapshotUpdate(added, {
+      value: '{}',
+      expectedRevision: added.revision,
+      source: 'observer',
+    });
+
+    expect(added.provenance['/temporary']).toMatchObject({ source: 'observer' });
+    expect(removed.provenance).not.toHaveProperty('/temporary');
   });
 
   it('round-trips controls without replacing unrelated metadata', () => {
@@ -397,6 +471,59 @@ describe('InMemoryMemory revisioned Working Memory', () => {
         threadId: 'thread-1',
       }),
     ).rejects.toThrow('requested resource');
+  });
+
+  it('does not expose persisted controls through mutable update results', async () => {
+    const storage = new InMemoryStore({ id: 'working-memory-control-aliasing' });
+    const memory = await storage.getStore('memory');
+    if (!memory) throw new Error('Expected in-memory storage domain.');
+
+    const result = await memory.applyWorkingMemoryUpdate({
+      scope: 'resource',
+      resourceId: 'resource-control-aliasing',
+      value: '{"name":"Ada"}',
+      expectedRevision: 0,
+      source: 'owner',
+      protectPaths: ['/name'],
+    });
+    result.protectedPaths.length = 0;
+    delete result.provenance['/name'];
+
+    await expect(
+      memory.getWorkingMemorySnapshot({ scope: 'resource', resourceId: 'resource-control-aliasing' }),
+    ).resolves.toMatchObject({
+      protectedPaths: ['/name'],
+      provenance: { '/name': { source: 'owner' } },
+    });
+  });
+
+  it('rolls back OM deletion when working-memory retraction validation fails', async () => {
+    const storage = new InMemoryStore({ id: 'working-memory-retraction-rollback' });
+    const memory = await storage.getStore('memory');
+    if (!memory) throw new Error('Expected in-memory storage domain.');
+    const resourceId = 'resource-retraction-rollback';
+    const threadId = 'thread-retraction-rollback';
+    const record = await memory.initializeObservationalMemory({
+      config: { _managedWorkingMemoryScope: 'resource' },
+      resourceId,
+      scope: 'resource',
+      threadId: null,
+    });
+    const createdAt = new Date('2026-01-01T00:00:00.000Z');
+    await memory.saveResource({
+      resource: {
+        id: resourceId,
+        workingMemory: '{"name":"Ada"}',
+        metadata: { mastra: { workingMemory: { revision: 'invalid' } } },
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+
+    await expect(memory.retractObservationalMemory({ resourceId, threadId })).rejects.toThrow(
+      'Stored working-memory controls are invalid',
+    );
+    await expect(memory.getObservationalMemory(null, resourceId)).resolves.toMatchObject({ id: record.id });
   });
 
   it('persists metadata-only observer cleanup after the resource value was cleared', async () => {

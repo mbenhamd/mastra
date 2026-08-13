@@ -343,6 +343,44 @@ describe('Memory', () => {
       expect(snapshot.provenance['/name']).toMatchObject({ source: 'owner' });
     });
 
+    it('preserves protected owner values across metadata-driven thread updates', async () => {
+      const memory = new Memory({
+        storage: new InMemoryStore(),
+        options: { workingMemory: { enabled: true, scope: 'thread' } },
+      });
+      const threadId = 'thread-metadata-owner-correction-thread';
+      const resourceId = 'thread-metadata-owner-correction-resource';
+      await memory.createThread({ threadId, resourceId });
+      const initial = await memory.getWorkingMemorySnapshot({ threadId, resourceId });
+      await memory.updateWorkingMemoryByOwner({
+        threadId,
+        resourceId,
+        workingMemory: '{"name":"Ada","focus":"proofs"}',
+        expectedRevision: initial.revision,
+        protectPaths: ['/name'],
+      });
+
+      const now = new Date();
+      await memory.saveThread({
+        thread: {
+          id: threadId,
+          resourceId,
+          metadata: { workingMemory: '{"name":"Grace","focus":"compilers"}' },
+          createdAt: now,
+          updatedAt: now,
+        },
+      });
+      await memory.updateThread({
+        id: threadId,
+        metadata: { workingMemory: '{"name":"Emmy","focus":"physics"}' },
+      });
+
+      const snapshot = await memory.getWorkingMemorySnapshot({ threadId, resourceId });
+      expect(JSON.parse(snapshot.value!)).toEqual({ name: 'Ada', focus: 'physics' });
+      expect(snapshot.protectedPaths).toEqual(['/name']);
+      expect(snapshot.provenance['/name']).toMatchObject({ source: 'owner' });
+    });
+
     it('fails closed when the storage adapter does not advertise the native capability', async () => {
       const storage = new InMemoryStore();
       const memory = new Memory({
@@ -358,6 +396,31 @@ describe('Memory', () => {
       await expect(memory.getWorkingMemorySnapshot({ resourceId: 'unsupported-resource' })).rejects.toThrow(
         'not supported by this storage adapter',
       );
+    });
+
+    it('does not overwrite thread titles in the legacy Working Memory fallback', async () => {
+      const storage = new InMemoryStore();
+      const memory = new Memory({
+        storage,
+        options: { workingMemory: { enabled: true, scope: 'thread' } },
+      });
+      const threadId = 'legacy-working-memory-title-thread';
+      const resourceId = 'legacy-working-memory-title-resource';
+      await memory.createThread({ threadId, resourceId, title: 'Current title' });
+      const memoryStore = (await storage.getStore('memory'))!;
+      Object.defineProperty(memoryStore, 'supportsRevisionedWorkingMemory', {
+        configurable: true,
+        value: false,
+      });
+      const updateThread = vi.spyOn(memoryStore, 'updateThread');
+
+      await memory.updateWorkingMemory({ threadId, resourceId, workingMemory: 'updated memory' });
+
+      expect(updateThread).toHaveBeenCalledWith({
+        id: threadId,
+        metadata: expect.objectContaining({ workingMemory: 'updated memory' }),
+      });
+      await expect(memory.getThreadById({ threadId })).resolves.toMatchObject({ title: 'Current title' });
     });
 
     it('enforces the configured UTF-8 storage bound for owner and observer writes', async () => {
@@ -1317,6 +1380,30 @@ describe('Memory', () => {
       await expect(wmMemory.getWorkingMemorySnapshot({ threadId: clonedThread.id, resourceId })).resolves.toMatchObject(
         { value: null, protectedPaths: [''] },
       );
+    });
+
+    it('rolls back the cloned thread when governed Working Memory copy fails', async () => {
+      const wmMemory = new Memory({
+        storage: new InMemoryStore(),
+        options: { workingMemory: { enabled: true, scope: 'thread', maxDataBytes: 5 } },
+      });
+      const sourceThread = await wmMemory.createThread({
+        threadId: 'source-thread-oversized-clone-wm',
+        resourceId,
+      });
+      await wmMemory.updateWorkingMemoryByOwner({
+        threadId: sourceThread.id,
+        resourceId,
+        workingMemory: 'long value',
+        expectedRevision: 0,
+        memoryConfig: { workingMemory: { enabled: true, scope: 'thread', maxDataBytes: 100 } },
+      });
+      const newThreadId = 'rolled-back-oversized-clone-wm';
+
+      await expect(wmMemory.cloneThread({ sourceThreadId: sourceThread.id, newThreadId })).rejects.toThrow(
+        'UTF-8 byte limit',
+      );
+      await expect(wmMemory.getThreadById({ threadId: newThreadId })).resolves.toBeNull();
     });
   });
 

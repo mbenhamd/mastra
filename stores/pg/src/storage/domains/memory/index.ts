@@ -88,7 +88,7 @@ export const OM_MIGRATION_COLUMNS: string[] = [
 
 /**
  * The OM schema is imported statically above: the peer dependency range
- * (`@mastra/core >= 1.49.0`) guarantees the export exists. This used to be a
+ * (`@mastra/core >= 1.58.0-alpha.11`) guarantees the export exists. This used to be a
  * dynamic `require` guarded by `typeof require === 'function'` for older core
  * versions, but esbuild rewrites the bare `require` identifier in the ESM
  * bundle to a shim that always throws, and the silent catch meant the
@@ -187,6 +187,38 @@ function parseMetadata(value: unknown): Record<string, unknown> {
   }
   if (typeof value === 'object' && !Array.isArray(value)) return value as Record<string, unknown>;
   throw new WorkingMemoryValidationError('Stored metadata is invalid.');
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+function mergeThreadMetadataPreservingWorkingMemory(
+  current: Record<string, unknown>,
+  update: Record<string, unknown>,
+): Record<string, unknown> {
+  const merged = { ...current, ...update };
+  const currentMastra = asRecord(current.mastra);
+  const updateMastra = asRecord(update.mastra);
+  if (Object.keys(currentMastra).length > 0 || Object.keys(updateMastra).length > 0) {
+    merged.mastra = { ...currentMastra, ...updateMastra };
+  }
+  if (hasWorkingMemorySnapshotControls(current)) {
+    (merged.mastra as Record<string, unknown>).workingMemory = currentMastra.workingMemory;
+    if (typeof current.workingMemory === 'string') merged.workingMemory = current.workingMemory;
+    else delete merged.workingMemory;
+  }
+  return merged;
+}
+
+function mergeObservationalThreadMetadata(
+  current: Record<string, unknown>,
+  update: Record<string, unknown>,
+): Record<string, unknown> {
+  const currentMastra = asRecord(current.mastra);
+  const updateMastra = asRecord(update.mastra);
+  if (!Object.prototype.hasOwnProperty.call(updateMastra, 'om')) return current;
+  return { ...current, mastra: { ...currentMastra, om: updateMastra.om } };
 }
 
 function getSchemaName(schema?: string) {
@@ -796,30 +828,29 @@ export class MemoryPG extends MemoryStorage {
     metadata?: Record<string, unknown>;
   }): Promise<StorageThreadType> {
     const threadTableName = getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) });
-    const existingThread = await this.getThreadById({ threadId: id });
-    if (!existingThread) {
-      throw new MastraError({
-        id: createStorageErrorId('PG', 'UPDATE_THREAD', 'FAILED'),
-        domain: ErrorDomain.STORAGE,
-        category: ErrorCategory.USER,
-        text: `Thread ${id} not found`,
-        details: {
-          threadId: id,
-          title: title ?? null,
-        },
-      });
-    }
-
-    const mergedMetadata = {
-      ...existingThread.metadata,
-      ...metadata,
-    };
-
     try {
-      const now = new Date();
-      const nowStr = toUtcISOString(now);
-      const thread = await this.#db.client.one<StorageThreadType & { createdAtZ: Date; updatedAtZ: Date }>(
-        `UPDATE ${threadTableName}
+      return await this.#db.client.tx(async t => {
+        const existingThread = await t.oneOrNone<StorageThreadType & { createdAtZ: Date; updatedAtZ: Date }>(
+          `SELECT * FROM ${threadTableName} WHERE id = $1 FOR UPDATE`,
+          [id],
+        );
+        if (!existingThread) {
+          throw new MastraError({
+            id: createStorageErrorId('PG', 'UPDATE_THREAD', 'FAILED'),
+            domain: ErrorDomain.STORAGE,
+            category: ErrorCategory.USER,
+            text: `Thread ${id} not found`,
+            details: { threadId: id, title: title ?? null },
+          });
+        }
+        const currentMetadata = parseMetadata(existingThread.metadata);
+        const mergedMetadata =
+          metadata === undefined
+            ? currentMetadata
+            : mergeThreadMetadataPreservingWorkingMemory(currentMetadata, metadata);
+        const nowStr = toUtcISOString(new Date());
+        const thread = await t.one<StorageThreadType & { createdAtZ: Date; updatedAtZ: Date }>(
+          `UPDATE ${threadTableName}
                     SET
                         title = COALESCE($1, title),
                         metadata = $2,
@@ -828,18 +859,20 @@ export class MemoryPG extends MemoryStorage {
                     WHERE id = $5
                     RETURNING *
                 `,
-        [title ?? null, mergedMetadata, nowStr, nowStr, id],
-      );
+          [title ?? null, mergedMetadata, nowStr, nowStr, id],
+        );
 
-      return {
-        id: thread.id,
-        resourceId: thread.resourceId,
-        title: thread.title,
-        metadata: typeof thread.metadata === 'string' ? JSON.parse(thread.metadata) : thread.metadata,
-        createdAt: thread.createdAtZ || thread.createdAt,
-        updatedAt: thread.updatedAtZ || thread.updatedAt,
-      };
+        return {
+          id: thread.id,
+          resourceId: thread.resourceId,
+          title: thread.title,
+          metadata: parseMetadata(thread.metadata),
+          createdAt: thread.createdAtZ || thread.createdAt,
+          updatedAt: thread.updatedAtZ || thread.updatedAt,
+        };
+      });
     } catch (error) {
+      if (error instanceof MastraError) throw error;
       throw new MastraError(
         {
           id: createStorageErrorId('PG', 'UPDATE_THREAD', 'FAILED'),
@@ -2204,13 +2237,21 @@ export class MemoryPG extends MemoryStorage {
       return await this.#db.client.tx(async t => {
         await this.lockObservationalMemoryResource(t, guard.resourceId);
         await this.assertCurrentObservationalMemoryGeneration(t, guard);
+        const currentRow = await t.oneOrNone<{ metadata: unknown }>(
+          `SELECT metadata FROM ${tableName} WHERE id = $1 AND "resourceId" = $2 FOR UPDATE`,
+          [id, guard.resourceId],
+        );
+        if (!currentRow) {
+          throw new Error('Observational memory guard does not match the target thread resource.');
+        }
+        const mergedMetadata = mergeObservationalThreadMetadata(parseMetadata(currentRow.metadata), metadata);
         const now = new Date();
         const row = await t.one<StorageThreadType & { createdAtZ: Date | string; updatedAtZ: Date | string }>(
           `UPDATE ${tableName}
-           SET title = COALESCE($1, title), metadata = $2, "updatedAt" = $3, "updatedAtZ" = $3
-           WHERE id = $4 AND "resourceId" = $5
+           SET title = COALESCE($1, title), metadata = $2, "updatedAt" = $3, "updatedAtZ" = $4
+           WHERE id = $5 AND "resourceId" = $6
            RETURNING *`,
-          [title, JSON.stringify(metadata), now.toISOString(), id, guard.resourceId],
+          [title, JSON.stringify(mergedMetadata), now.toISOString(), now.toISOString(), id, guard.resourceId],
         );
         return {
           id: row.id,

@@ -229,15 +229,18 @@ export class MockMemory extends MastraMemory {
     }
 
     const scope = workingMemoryConfig.scope || 'resource';
-    const id = scope === 'resource' ? resourceId : threadId;
-
-    if (!id) {
+    if (scope === 'resource' && !resourceId) {
       return null;
     }
 
     const memoryStorage = await this.getMemoryStore();
-    const resource = await memoryStorage.getResourceById({ resourceId: id });
-    return resource?.workingMemory || null;
+    if (scope === 'resource') {
+      const resource = await memoryStorage.getResourceById({ resourceId: resourceId! });
+      return resource?.workingMemory || null;
+    }
+
+    const thread = await memoryStorage.getThreadById({ threadId });
+    return typeof thread?.metadata?.workingMemory === 'string' ? thread.metadata.workingMemory : null;
   }
 
   public listTools(_config?: MemoryConfigInternal): Record<string, ToolAction<any, any, any>> {

@@ -56,6 +56,36 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+function mergeThreadMetadataPreservingWorkingMemory(
+  current: Record<string, unknown> | undefined,
+  update: Record<string, unknown>,
+): Record<string, unknown> {
+  const existing = current ?? {};
+  const merged = { ...existing, ...update };
+  const existingMastra = isRecord(existing.mastra) ? existing.mastra : {};
+  const updateMastra = isRecord(update.mastra) ? update.mastra : {};
+  if (Object.keys(existingMastra).length > 0 || Object.keys(updateMastra).length > 0) {
+    merged.mastra = { ...existingMastra, ...updateMastra };
+  }
+  if (hasWorkingMemorySnapshotControls(existing)) {
+    (merged.mastra as Record<string, unknown>).workingMemory = existingMastra.workingMemory;
+    if (typeof existing.workingMemory === 'string') merged.workingMemory = existing.workingMemory;
+    else delete merged.workingMemory;
+  }
+  return merged;
+}
+
+function mergeObservationalThreadMetadata(
+  current: Record<string, unknown> | undefined,
+  update: Record<string, unknown>,
+): Record<string, unknown> {
+  const existing = current ?? {};
+  const existingMastra = isRecord(existing.mastra) ? existing.mastra : {};
+  const updateMastra = isRecord(update.mastra) ? update.mastra : {};
+  if (!Object.prototype.hasOwnProperty.call(updateMastra, 'om')) return existing;
+  return { ...existing, mastra: { ...existingMastra, om: updateMastra.om } };
+}
+
 function getManagedWorkingMemoryScopes(records: readonly ObservationalMemoryRecord[]): Set<'thread' | 'resource'> {
   const scopes = new Set<'thread' | 'resource'>();
   for (const record of records) {
@@ -175,7 +205,9 @@ export class InMemoryMemory extends MemoryStorage {
 
     if (thread) {
       if (title !== undefined) thread.title = title;
-      thread.metadata = { ...thread.metadata, ...metadata };
+      if (metadata !== undefined) {
+        thread.metadata = mergeThreadMetadataPreservingWorkingMemory(thread.metadata, metadata);
+      }
       thread.updatedAt = new Date();
     }
     return thread;
@@ -884,7 +916,11 @@ export class InMemoryMemory extends MemoryStorage {
     if (current?.id !== guard.recordId) {
       throw new Error('Observational memory generation is no longer current.');
     }
-    return this.updateThread({ id, title, metadata });
+    return this.updateThread({
+      id,
+      title,
+      metadata: mergeObservationalThreadMetadata(thread.metadata, metadata),
+    });
   }
 
   async getWorkingMemorySnapshot(input: WorkingMemorySnapshotInput): Promise<WorkingMemorySnapshot> {
@@ -1647,7 +1683,7 @@ export class InMemoryMemory extends MemoryStorage {
   }
 
   async retractObservationalMemory(input: RetractObservationalMemoryInput): Promise<RetractObservationalMemoryResult> {
-    return this.retractObservationalMemoryState(input);
+    return this.withMemoryStateRollback(true, () => this.retractObservationalMemoryState(input));
   }
 
   async setPendingMessageTokens(id: string, tokenCount: number): Promise<void> {

@@ -103,6 +103,62 @@ describe('MemoryPG revisioned Working Memory', () => {
     ).resolves.toMatchObject({ revision: 1 });
   });
 
+  it('preserves governed thread metadata across stale generic and OM updates', async () => {
+    const protectedResourceId = `${resourceId}-stale-metadata`;
+    const protectedThreadId = `${threadId}-stale-metadata`;
+    const createdAt = new Date('2026-01-01T00:00:00.000Z');
+    await firstMemory.saveThread({
+      thread: {
+        id: protectedThreadId,
+        resourceId: protectedResourceId,
+        title: 'Thread',
+        metadata: {},
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+    const record = await firstMemory.initializeObservationalMemory({
+      config: { _managedWorkingMemoryScope: 'thread' },
+      resourceId: protectedResourceId,
+      scope: 'thread',
+      threadId: protectedThreadId,
+    });
+    const staleThread = await secondMemory.getThreadById({ threadId: protectedThreadId });
+    if (!staleThread) throw new Error('Expected stale thread snapshot.');
+    await firstMemory.applyWorkingMemoryUpdate({
+      scope: 'thread',
+      resourceId: protectedResourceId,
+      threadId: protectedThreadId,
+      value: '{"name":"Ada"}',
+      expectedRevision: 0,
+      source: 'owner',
+      protectPaths: ['/name'],
+    });
+
+    await secondMemory.updateThreadFromObservationalMemory({
+      id: protectedThreadId,
+      metadata: { mastra: { om: { currentTask: 'Keep controls current' } } },
+      guard: { recordId: record.id, resourceId: protectedResourceId, threadId: protectedThreadId },
+    });
+    await secondMemory.updateThread({
+      id: protectedThreadId,
+      title: 'Updated title',
+      metadata: staleThread.metadata,
+    });
+
+    await expect(
+      firstMemory.getWorkingMemorySnapshot({
+        scope: 'thread',
+        resourceId: protectedResourceId,
+        threadId: protectedThreadId,
+      }),
+    ).resolves.toMatchObject({ value: '{"name":"Ada"}', revision: 1, protectedPaths: ['/name'] });
+    await expect(firstMemory.getThreadById({ threadId: protectedThreadId })).resolves.toMatchObject({
+      title: 'Updated title',
+      metadata: { mastra: { om: { currentTask: 'Keep controls current' } } },
+    });
+  });
+
   it('rolls back when protected values make the merged observer value exceed its bound', async () => {
     const boundedResourceId = `${resourceId}-bounded`;
     const owner = await firstMemory.applyWorkingMemoryUpdate({

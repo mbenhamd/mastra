@@ -444,6 +444,45 @@ export class Memory extends MastraMemory {
     return store;
   }
 
+  /**
+   * Resolve Working Memory coordinates locally so ordinary memory updates keep
+   * working with every Core version allowed by this package's peer range.
+   */
+  private async resolveCompatibleWorkingMemorySnapshotInput({
+    threadId,
+    resourceId,
+    memoryConfig,
+  }: {
+    threadId?: string;
+    resourceId?: string;
+    memoryConfig?: MemoryConfigInternal;
+  }): Promise<WorkingMemorySnapshotInput> {
+    const config = this.getMergedThreadConfig(memoryConfig);
+    if (!config.workingMemory?.enabled) {
+      throw new Error('Working memory is not enabled for this memory instance');
+    }
+
+    const scope = config.workingMemory.scope || 'resource';
+    if (scope === 'resource') {
+      if (!resourceId) {
+        throw new Error('Memory error: Resource-scoped working memory requires a resourceId.');
+      }
+      return { scope, resourceId, ...(threadId ? { threadId } : {}) };
+    }
+
+    if (!threadId) {
+      throw new Error('Memory error: Thread-scoped working memory requires a threadId.');
+    }
+    const thread = await this.getThreadById({ threadId });
+    if (!thread) {
+      throw new Error('Working-memory thread was not found.');
+    }
+    if (resourceId && thread.resourceId !== resourceId) {
+      throw new Error('Working-memory thread does not belong to the requested resource.');
+    }
+    return { scope, resourceId: thread.resourceId, threadId };
+  }
+
   async listMessagesByResourceId(args: StorageListMessagesByResourceIdInput): Promise<StorageListMessagesOutput> {
     const memoryStore = await this.getMemoryStore();
     return memoryStore.listMessagesByResourceId(args);
@@ -719,23 +758,43 @@ export class Memory extends MastraMemory {
     return memoryStore.listThreads(args);
   }
 
-  /**
-   * Returns metadata working memory only when the active configuration persists it on the resource record.
-   */
-  private getResourceScopedWorkingMemoryFromMetadata({
+  private getManagedWorkingMemoryFromMetadata({
     workingMemory,
     memoryConfig,
   }: {
     workingMemory: unknown;
     memoryConfig?: MemoryConfigInternal;
-  }): string | undefined {
+  }): { scope: 'thread' | 'resource'; workingMemory: string } | undefined {
     if (!workingMemory || typeof workingMemory !== 'string') return undefined;
 
     const config = this.getMergedThreadConfig(memoryConfig || {});
     if (!config.workingMemory?.enabled) return undefined;
 
     const scope = config.workingMemory.scope || 'resource';
-    return scope === 'resource' ? workingMemory : undefined;
+    return { scope, workingMemory };
+  }
+
+  private prepareThreadMetadataForManagedWorkingMemory(
+    metadata: Record<string, unknown>,
+    existingMetadata?: Record<string, unknown>,
+  ): Record<string, unknown> {
+    const prepared = { ...metadata };
+    delete prepared.workingMemory;
+    if (isRecord(prepared.mastra)) {
+      const preparedMastra = { ...prepared.mastra };
+      delete preparedMastra.workingMemory;
+      prepared.mastra = preparedMastra;
+    }
+
+    if (typeof existingMetadata?.workingMemory === 'string') {
+      prepared.workingMemory = existingMetadata.workingMemory;
+    }
+    const existingMastra = isRecord(existingMetadata?.mastra) ? existingMetadata.mastra : undefined;
+    if (existingMastra && Object.prototype.hasOwnProperty.call(existingMastra, 'workingMemory')) {
+      const preparedMastra = isRecord(prepared.mastra) ? prepared.mastra : {};
+      prepared.mastra = { ...preparedMastra, workingMemory: existingMastra.workingMemory };
+    }
+    return prepared;
   }
 
   async saveThread({
@@ -746,12 +805,12 @@ export class Memory extends MastraMemory {
     memoryConfig?: MemoryConfigInternal;
   }): Promise<StorageThreadType> {
     const config = this.getMergedThreadConfig(memoryConfig || {});
-    const resourceWorkingMemory = this.getResourceScopedWorkingMemoryFromMetadata({
+    const managedWorkingMemory = this.getManagedWorkingMemoryFromMetadata({
       workingMemory: thread.metadata?.workingMemory,
       memoryConfig: config,
     });
 
-    if (resourceWorkingMemory && thread.resourceId) {
+    if (managedWorkingMemory?.scope === 'resource' && thread.resourceId) {
       return this.withResourceMetadataOperationMutex(async () => {
         return this.withWorkingMemoryMutex(`thread-${thread.id}`, async () => {
           return this.withWorkingMemoryMutex(`resource-${thread.resourceId}`, async () => {
@@ -760,7 +819,7 @@ export class Memory extends MastraMemory {
             await this.writeObserverWorkingMemory({
               memoryStore,
               coordinates: { scope: 'resource', resourceId: thread.resourceId, threadId: thread.id },
-              workingMemory: resourceWorkingMemory,
+              workingMemory: managedWorkingMemory.workingMemory,
               ...(config.workingMemory?.maxDataBytes !== undefined
                 ? { maxDataBytes: config.workingMemory.maxDataBytes }
                 : {}),
@@ -768,6 +827,31 @@ export class Memory extends MastraMemory {
             return savedThread;
           });
         });
+      });
+    }
+
+    if (managedWorkingMemory?.scope === 'thread') {
+      return this.withWorkingMemoryMutex(`thread-${thread.id}`, async () => {
+        const memoryStore = await this.getMemoryStore();
+        const existingThread = await memoryStore.getThreadById({ threadId: thread.id });
+        const savedThread = await memoryStore.saveThread({
+          thread: {
+            ...thread,
+            metadata: this.prepareThreadMetadataForManagedWorkingMemory(
+              thread.metadata ?? {},
+              existingThread?.metadata,
+            ),
+          },
+        });
+        await this.writeObserverWorkingMemory({
+          memoryStore,
+          coordinates: { scope: 'thread', resourceId: thread.resourceId, threadId: thread.id },
+          workingMemory: managedWorkingMemory.workingMemory,
+          ...(config.workingMemory?.maxDataBytes !== undefined
+            ? { maxDataBytes: config.workingMemory.maxDataBytes }
+            : {}),
+        });
+        return (await memoryStore.getThreadById({ threadId: thread.id })) ?? savedThread;
       });
     }
 
@@ -789,12 +873,12 @@ export class Memory extends MastraMemory {
     memoryConfig?: MemoryConfigInternal;
   }): Promise<StorageThreadType> {
     const config = this.getMergedThreadConfig(memoryConfig || {});
-    const resourceWorkingMemory = this.getResourceScopedWorkingMemoryFromMetadata({
+    const managedWorkingMemory = this.getManagedWorkingMemoryFromMetadata({
       workingMemory: metadata?.workingMemory,
       memoryConfig: config,
     });
 
-    if (resourceWorkingMemory) {
+    if (managedWorkingMemory?.scope === 'resource') {
       return this.withResourceMetadataOperationMutex(async () => {
         return this.withWorkingMemoryMutex(`thread-${id}`, async () => {
           const memoryStore = await this.getMemoryStore();
@@ -809,7 +893,7 @@ export class Memory extends MastraMemory {
               await this.writeObserverWorkingMemory({
                 memoryStore,
                 coordinates: { scope: 'resource', resourceId, threadId: id },
-                workingMemory: resourceWorkingMemory,
+                workingMemory: managedWorkingMemory.workingMemory,
                 ...(config.workingMemory?.maxDataBytes !== undefined
                   ? { maxDataBytes: config.workingMemory.maxDataBytes }
                   : {}),
@@ -818,6 +902,27 @@ export class Memory extends MastraMemory {
           }
           return updatedThread;
         });
+      });
+    }
+
+    if (managedWorkingMemory?.scope === 'thread') {
+      return this.withWorkingMemoryMutex(`thread-${id}`, async () => {
+        const memoryStore = await this.getMemoryStore();
+        const existingThread = await memoryStore.getThreadById({ threadId: id });
+        const updatedThread = await memoryStore.updateThread({
+          id,
+          title,
+          metadata: this.prepareThreadMetadataForManagedWorkingMemory(metadata ?? {}, existingThread?.metadata),
+        });
+        await this.writeObserverWorkingMemory({
+          memoryStore,
+          coordinates: { scope: 'thread', resourceId: updatedThread.resourceId, threadId: id },
+          workingMemory: managedWorkingMemory.workingMemory,
+          ...(config.workingMemory?.maxDataBytes !== undefined
+            ? { maxDataBytes: config.workingMemory.maxDataBytes }
+            : {}),
+        });
+        return (await memoryStore.getThreadById({ threadId: id })) ?? updatedThread;
       });
     }
 
@@ -1266,7 +1371,6 @@ export class Memory extends MastraMemory {
     }
     const update = {
       id: coordinates.threadId,
-      title: thread.title || '',
       metadata: { ...thread.metadata, workingMemory },
     };
     if (observationalMemoryGuard) {
@@ -1309,7 +1413,11 @@ export class Memory extends MastraMemory {
     );
 
     try {
-      const coordinates = await this.resolveWorkingMemorySnapshotInput({ threadId, resourceId, memoryConfig });
+      const coordinates = await this.resolveCompatibleWorkingMemorySnapshotInput({
+        threadId,
+        resourceId,
+        memoryConfig,
+      });
 
       // Use mutex to prevent race conditions when multiple concurrent calls update the same resource/thread
       const mutexKey =
@@ -1499,7 +1607,11 @@ ${workingMemory}`;
       }
 
       const memoryStore = await this.getMemoryStore();
-      const coordinates = await this.resolveWorkingMemorySnapshotInput({ threadId, resourceId, memoryConfig });
+      const coordinates = await this.resolveCompatibleWorkingMemorySnapshotInput({
+        threadId,
+        resourceId,
+        memoryConfig,
+      });
       await this.writeObserverWorkingMemory({
         memoryStore,
         coordinates,
@@ -3362,77 +3474,71 @@ Notes:
     memoryConfig?: MemoryConfigInternal,
   ): Promise<StorageCloneThreadOutput> {
     const memoryStore = await this.getMemoryStore();
-    const result = await memoryStore.cloneThread(args);
     const config = this.getMergedThreadConfig(memoryConfig);
-
-    // Fetch source thread once for working memory and OM cloning
     const sourceThread = await this.getThreadById({ threadId: args.sourceThreadId });
     const sourceResourceId = sourceThread?.resourceId;
+    const result = await memoryStore.cloneThread(args);
 
-    // Copy working memory from source thread to cloned thread.
-    // Thread-scoped: always copy since each thread has its own working memory.
-    // Resource-scoped: only copy when the clone uses a different resourceId (same resourceId shares memory naturally).
-    if (config.workingMemory?.enabled) {
-      const scope = config.workingMemory.scope || 'resource';
-      const shouldCopy =
-        scope === 'thread' || (scope === 'resource' && args.resourceId && args.resourceId !== sourceResourceId);
-
-      if (shouldCopy) {
-        const sourceSnapshot = memoryStore.supportsRevisionedWorkingMemory
-          ? await this.getWorkingMemorySnapshot({
-              threadId: args.sourceThreadId,
-              resourceId: sourceResourceId,
-              memoryConfig,
-            })
-          : undefined;
-        const sourceWm =
-          sourceSnapshot?.value ??
-          (await this.getWorkingMemory({
-            threadId: args.sourceThreadId,
-            resourceId: sourceResourceId,
-            memoryConfig,
-          }));
-        if (sourceWm !== null) {
-          await this.updateWorkingMemory({
-            threadId: result.thread.id,
-            resourceId: result.thread.resourceId,
-            workingMemory: sourceWm,
-            memoryConfig,
-          });
-        }
-        if (sourceSnapshot && sourceSnapshot.protectedPaths.length > 0) {
-          const clonedSnapshot = await this.getWorkingMemorySnapshot({
-            threadId: result.thread.id,
-            resourceId: result.thread.resourceId,
-            memoryConfig,
-          });
-          await this.updateWorkingMemoryByOwner({
-            threadId: result.thread.id,
-            resourceId: result.thread.resourceId,
-            workingMemory: sourceWm,
-            expectedRevision: clonedSnapshot.revision,
-            protectPaths: sourceSnapshot.protectedPaths,
-            memoryConfig,
-          });
-        }
-      }
-    }
-
-    // Clone observational memory if supported.
-    // Thread-scoped: always clone since each thread has its own OM.
-    // Resource-scoped: only clone when the resourceId changes (same resourceId shares OM naturally).
-    if (memoryStore.supportsObservationalMemory && sourceResourceId) {
-      try {
+    try {
+      // Clone OM before Working Memory so a failed WM write can roll the cloned
+      // thread and its remapped OM back without leaving a partially copied WM.
+      if (memoryStore.supportsObservationalMemory && sourceResourceId) {
         await this.cloneObservationalMemory(memoryStore, args.sourceThreadId, sourceResourceId, result);
-      } catch (error) {
-        // Rollback the already-persisted clone to avoid orphaned threads
-        try {
-          await memoryStore.deleteThread({ threadId: result.thread.id });
-        } catch (rollbackError) {
-          this.logger.error('Failed to rollback cloned thread after OM clone failure', rollbackError);
-        }
-        throw error;
       }
+
+      // Copy Working Memory from the source thread to the clone. A governed
+      // source snapshot is copied in one owner update so validation failures do
+      // not leave a half-copied observer value behind.
+      if (config.workingMemory?.enabled) {
+        const scope = config.workingMemory.scope || 'resource';
+        const shouldCopy =
+          scope === 'thread' || (scope === 'resource' && args.resourceId && args.resourceId !== sourceResourceId);
+        if (shouldCopy) {
+          const sourceSnapshot = memoryStore.supportsRevisionedWorkingMemory
+            ? await this.getWorkingMemorySnapshot({
+                threadId: args.sourceThreadId,
+                resourceId: sourceResourceId,
+                memoryConfig,
+              })
+            : undefined;
+          const sourceWm = sourceSnapshot
+            ? sourceSnapshot.value
+            : await this.getWorkingMemory({
+                threadId: args.sourceThreadId,
+                resourceId: sourceResourceId,
+                memoryConfig,
+              });
+          if (sourceSnapshot) {
+            const clonedSnapshot = await this.getWorkingMemorySnapshot({
+              threadId: result.thread.id,
+              resourceId: result.thread.resourceId,
+              memoryConfig,
+            });
+            await this.updateWorkingMemoryByOwner({
+              threadId: result.thread.id,
+              resourceId: result.thread.resourceId,
+              workingMemory: sourceWm,
+              expectedRevision: clonedSnapshot.revision,
+              protectPaths: sourceSnapshot.protectedPaths,
+              memoryConfig,
+            });
+          } else if (sourceWm !== null) {
+            await this.updateWorkingMemory({
+              threadId: result.thread.id,
+              resourceId: result.thread.resourceId,
+              workingMemory: sourceWm,
+              memoryConfig,
+            });
+          }
+        }
+      }
+    } catch (error) {
+      try {
+        await memoryStore.deleteThread({ threadId: result.thread.id });
+      } catch (rollbackError) {
+        this.logger.error('Failed to rollback cloned thread after post-clone failure', rollbackError);
+      }
+      throw error;
     }
 
     // Embed cloned messages only after OM cloning succeeds, so rollback doesn't leave orphan vectors

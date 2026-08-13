@@ -41,6 +41,22 @@ describe('MockMemory working memory merge semantics', () => {
     await (tool as any).execute({ memory: input }, { agent: { threadId, resourceId }, memory });
   }
 
+  it('round-trips thread-scoped working memory through thread metadata', async () => {
+    const memory = new MockMemory({
+      enableWorkingMemory: true,
+      options: { workingMemory: { enabled: true, scope: 'thread' } },
+    });
+    await memory.createThread({ threadId, resourceId });
+
+    await memory.updateWorkingMemory({
+      threadId,
+      resourceId,
+      workingMemory: 'thread-scoped value',
+    });
+
+    await expect(memory.getWorkingMemory({ threadId, resourceId })).resolves.toBe('thread-scoped value');
+  });
+
   it('replaces working memory entirely for template-based (no schema)', async () => {
     const memory = await setupMemory(false);
 
