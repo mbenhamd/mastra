@@ -43,6 +43,12 @@ const MAX_SIGNAL_ADMISSION_TOMBSTONES_PER_THREAD = 1000;
 const MAX_SIGNAL_ADMISSION_THREADS = 1000;
 const TERMINAL_PUBLISH_TIMEOUT_MS = 10_000;
 const TERMINAL_DELIVERY_TIMEOUT_MS = 30_000;
+// `run-aborted` can arrive just before an already-running tool publishes its
+// authoritative `tool-error`. Give that terminal a short, bounded chance to
+// cross the subscriber before cancelling its view and falling back to a
+// synthetic abort. The bound preserves prompt teardown for abort-ignoring
+// streams while keeping real tool errors observable.
+const ABORT_OUTPUT_DRAIN_GRACE_MS = 250;
 
 export type AgentThreadOutputDrainErrorReason =
   | 'subscription-closed'
@@ -176,6 +182,10 @@ type AgentThreadRunRecord<OUTPUT = unknown> = {
   // first reader. Absent for remote runs, whose subscribers already get a dedicated
   // per-subscription stream fed by `stream-part` pubsub events.
   createSubscriberStream?: () => ReadableStream<unknown>;
+  /** Force the broadcast/replay view closed after the bounded abort drain grace. */
+  abortBroadcast?: () => Promise<void>;
+  /** Terminalize this exact registered stream independently of provider settlement. */
+  finalizeAbort?: () => void;
 };
 
 type PreparedThreadRun = {
@@ -259,8 +269,8 @@ type AgentThreadRuntimeState = {
     string,
     Array<{ resolve: (out: MastraModelOutput<any>) => void; reject: (error: Error) => void }>
   >;
-  registrationPublishesByRunId: Map<string, Promise<void>>;
-  broadcastsByRunId: Map<string, Promise<void>>;
+  registrationPublishesByStreamId: Map<string, Promise<void>>;
+  broadcastsByStreamId: Map<string, Promise<void>>;
   /**
    * Active lease-renewal timers keyed by runId. Set when the owner
    * process wins the cross-process lease, cleared on release. Stored
@@ -280,7 +290,7 @@ type AgentThreadStreamRuntimeEvent =
   | { type: 'run-completed'; runId: string; streamId?: string }
   | { type: 'run-suspended'; runId: string; streamId?: string }
   | { type: 'run-abort-requested'; runId: string; streamId: string }
-  | { type: 'run-aborted'; runId: string; streamId?: string }
+  | { type: 'run-aborted'; runId: string; streamId?: string; sourceId?: string; afterBroadcast?: boolean }
   | { type: 'run-failed'; runId: string; streamId?: string; error: string }
   | { type: 'signal-enqueued'; runId: string; signal: SerializableAgentSignal; sourceId: string; preRun?: boolean };
 
@@ -321,8 +331,8 @@ function createRuntimeState(): AgentThreadRuntimeState {
     signalAdmissionsByThread: new Map(),
     leaseOwnerTokensByRunId: new Map(),
     pendingOutputWaiters: new Map(),
-    registrationPublishesByRunId: new Map(),
-    broadcastsByRunId: new Map(),
+    registrationPublishesByStreamId: new Map(),
+    broadcastsByStreamId: new Map(),
     leaseRenewalTimers: new Map(),
   };
 }
@@ -369,7 +379,7 @@ export class AgentThreadStreamRuntime {
     if (isFallback) return true;
     return provider
       .getLeaseOwner(key)
-      .then(owner => owner === runId)
+      .then(owner => owner !== undefined && this.#runIdFromLeaseOwner(owner) === runId)
       .catch(() => false);
   }
 
@@ -774,6 +784,23 @@ export class AgentThreadStreamRuntime {
     const waiters = new Set<() => void>();
     let started = false;
     let done = false;
+    let forceStopped = false;
+    let activeReader: ReadableStreamDefaultReader<unknown> | undefined;
+    let abortTimer: ReturnType<typeof setTimeout> | undefined;
+    let resolveBroadcast!: () => void;
+    const broadcastCompletion = new Promise<void>(resolve => {
+      resolveBroadcast = resolve;
+    });
+    let broadcastSettled = false;
+    const settleBroadcast = () => {
+      if (broadcastSettled) return;
+      broadcastSettled = true;
+      if (abortTimer !== undefined) {
+        clearTimeout(abortTimer);
+        abortTimer = undefined;
+      }
+      resolveBroadcast();
+    };
     let error: unknown;
     // Presence-tracked separately: a source that throws a FALSY value
     // (undefined/null/0/'') must still fail the subscriber stream instead of
@@ -797,6 +824,7 @@ export class AgentThreadStreamRuntime {
     const capturedSource = ownFullStream ? (output.fullStream as any) : undefined;
 
     const emitPart = async (part: unknown) => {
+      if (forceStopped) return;
       if (part && typeof part === 'object' && 'type' in part) {
         const typedPart = part as { type?: string; payload?: { toolCallId?: string; toolName?: string } };
         if (typedPart.type === 'tool-call-approval' || typedPart.type === 'tool-call-suspended') {
@@ -808,6 +836,11 @@ export class AgentThreadStreamRuntime {
         }
       }
       parts.push(part);
+      // Wake same-runtime replay subscribers before awaiting distributed
+      // publication. A lifecycle abort may be published by a concurrently
+      // settling completion watcher; local subscribers must not wait for the
+      // broker round trip before observing the authoritative tool terminal.
+      wake();
       await runtime.#publishAndWait(pubsub, key, {
         type: 'stream-part',
         runId: output.runId,
@@ -815,7 +848,6 @@ export class AgentThreadStreamRuntime {
         part,
         sourceId: runtime.#getSourceId(),
       });
-      wake();
     };
 
     // `start` is idempotent and returns the drain-completion promise so callers
@@ -825,8 +857,14 @@ export class AgentThreadStreamRuntime {
     // FIRST and ignore the late parts).
     let drain: Promise<void> | undefined;
     const start = (): Promise<void> => {
-      if (started) return drain!;
+      if (started) return broadcastCompletion;
       started = true;
+      if (forceStopped) {
+        done = true;
+        wake();
+        settleBroadcast();
+        return broadcastCompletion;
+      }
       drain = (async () => {
         try {
           // For getter-based outputs read `output.fullStream` lazily so the
@@ -838,6 +876,7 @@ export class AgentThreadStreamRuntime {
 
           if (typeof source.getReader === 'function') {
             const reader = source.getReader();
+            activeReader = reader;
             try {
               while (true) {
                 const { value: part, done: streamDone } = await reader.read();
@@ -845,6 +884,7 @@ export class AgentThreadStreamRuntime {
                 await emitPart(part);
               }
             } finally {
+              activeReader = undefined;
               reader.releaseLock();
             }
           } else {
@@ -858,9 +898,36 @@ export class AgentThreadStreamRuntime {
         } finally {
           done = true;
           wake();
+          settleBroadcast();
         }
       })();
-      return drain;
+      void drain.catch(() => {});
+      return broadcastCompletion;
+    };
+
+    const abortBroadcast = (): Promise<void> => {
+      if (done || forceStopped) {
+        settleBroadcast();
+        return broadcastCompletion;
+      }
+      if (abortTimer === undefined) {
+        abortTimer = setTimeout(() => {
+          abortTimer = undefined;
+          forceStopped = true;
+          done = true;
+          wake();
+          const reader = activeReader;
+          if (reader) {
+            void reader.cancel().catch(() => {
+              // The producer may ignore cancellation; its detached source must
+              // not keep the thread terminal/output-drain barriers pending.
+            });
+          }
+          settleBroadcast();
+        }, ABORT_OUTPUT_DRAIN_GRACE_MS);
+        abortTimer.unref?.();
+      }
+      return broadcastCompletion;
     };
 
     const createStream = () => {
@@ -904,7 +971,7 @@ export class AgentThreadStreamRuntime {
       });
     };
 
-    return { output, createSubscriberStream: createStream, startBroadcast: start };
+    return { output, createSubscriberStream: createStream, startBroadcast: start, abortBroadcast };
   }
 
   #getThreadTarget(options?: { memory?: AgentExecutionOptions<any>['memory']; requestContext?: RequestContext }) {
@@ -1149,11 +1216,48 @@ export class AgentThreadStreamRuntime {
     preparedRun.abortController.abort();
     this.#rememberAbortedRun(state, runId);
 
+    const registeredRecord = state.threadRunsById.get(runId);
+    if (registeredRecord) {
+      // Preserve a short window for the provider/tool stream to publish its
+      // authoritative cancellation terminal, then detach even if it ignores
+      // abort forever. Terminalize completion only after that bounded broadcast
+      // barrier so remote subscribers receive all prompt tool terminals before
+      // the lifecycle abort event closes their proxy.
+      const broadcastAbort = registeredRecord.abortBroadcast?.() ?? Promise.resolve();
+      const publishAbortAfterBroadcast = () => {
+        if (!key) return;
+        this.#publish(pubsub, key, {
+          type: 'run-aborted',
+          runId,
+          streamId: registeredRecord.streamId,
+          sourceId: this.#getSourceId(),
+          afterBroadcast: true,
+        });
+      };
+      void broadcastAbort.then(publishAbortAfterBroadcast, publishAbortAfterBroadcast);
+      registeredRecord.finalizeAbort?.();
+      if (key) {
+        // Same-runtime subscribers need their bounded drain timer armed now;
+        // the delayed second publication above is for remote proxies only.
+        this.#publish(pubsub, key, {
+          type: 'run-aborted',
+          runId,
+          streamId: registeredRecord.streamId,
+          sourceId: this.#getSourceId(),
+        });
+      }
+    }
+
     if (key) {
       state.pendingSignalsByThread.delete(key);
       const streamId = state.activeThreadRunIds.get(key) === runId ? state.activeThreadStreamIds.get(key) : undefined;
-      this.#releaseThreadLease(pubsub, key, runId);
-      this.#publish(pubsub, key, { type: 'run-aborted', runId, streamId });
+      // Registered runs retain the lease through their bounded abort finalizer,
+      // which either transfers it to queued work or releases it without a gap.
+      // Pre-registration abort paths still release in their reservation cleanup.
+      if (!registeredRecord) {
+        this.#releaseThreadLease(pubsub, key, runId);
+        this.#publish(pubsub, key, { type: 'run-aborted', runId, streamId });
+      }
     }
 
     return true;
@@ -1335,8 +1439,8 @@ export class AgentThreadStreamRuntime {
     for (const runId of state.rejectedRunErrorsByRunId.keys()) {
       this.#forgetRejectedRunError(state, runId);
     }
-    state.registrationPublishesByRunId.clear();
-    state.broadcastsByRunId.clear();
+    state.registrationPublishesByStreamId.clear();
+    state.broadcastsByStreamId.clear();
   }
 
   #cleanupPreparedRun(state: AgentThreadRuntimeState, runId: string, preserveAbort = false) {
@@ -1728,6 +1832,7 @@ export class AgentThreadStreamRuntime {
       output: outputForSubscribers,
       createSubscriberStream,
       startBroadcast,
+      abortBroadcast,
     } = this.#withBroadcastStream(output, pubsub, key, streamId);
     const record: AgentThreadRunRecord<any> = {
       agent: { id: `persisted-signal:${signal.id}` } as Agent<any, any, any, any>,
@@ -1740,6 +1845,7 @@ export class AgentThreadStreamRuntime {
       resourceId,
       streamOptions: {},
       createSubscriberStream,
+      abortBroadcast,
     };
 
     state.threadRunsById.set(runId, record);
@@ -1890,7 +1996,12 @@ export class AgentThreadStreamRuntime {
       state.inflightIdleAgentIdsByRunId.delete(output.runId);
     }
     const { streamId, streamSeq } = this.#nextStreamIdentity(state, output.runId);
-    const { createSubscriberStream, startBroadcast } = this.#withBroadcastStream(output, pubsub, key, streamId);
+    const { createSubscriberStream, startBroadcast, abortBroadcast } = this.#withBroadcastStream(
+      output,
+      pubsub,
+      key,
+      streamId,
+    );
     const resumedToolCallId = (streamOptions as AgentExecutionOptions<OUTPUT> & { toolCallId?: string }).toolCallId;
     if (resumedToolCallId) {
       this.#clearSuspendedToolCall(state, output.runId, resumedToolCallId);
@@ -1908,6 +2019,7 @@ export class AgentThreadStreamRuntime {
       resourceId,
       streamOptions: streamOptions as AgentThreadRunRecord<OUTPUT>['streamOptions'],
       createSubscriberStream,
+      abortBroadcast,
       suspensions: state.suspensionMetadataByRunId.get(output.runId),
     };
 
@@ -1970,7 +2082,7 @@ export class AgentThreadStreamRuntime {
     // the original rejecting promise below for that later waiter.
     void registrationPublish.catch(() => {});
     this.#threadOutputRegistrations.set(output, registrationPublish);
-    state.registrationPublishesByRunId.set(output.runId, registrationPublish);
+    state.registrationPublishesByStreamId.set(streamId, registrationPublish);
     // Always drive the run's stream to completion, even when no caller consumes
     // the returned output (e.g. a fire-and-forget schedule wake). The broadcast
     // tee buffers every part, so a later/external subscriber still replays the
@@ -1979,7 +2091,7 @@ export class AgentThreadStreamRuntime {
     // wedging the thread. The broadcast promise settles when the parts drain
     // finishes; the completion watcher gates `run-completed` on it (PR #202/#204).
     const broadcast = registrationPublish.then(startBroadcast, startBroadcast);
-    state.broadcastsByRunId.set(output.runId, broadcast);
+    state.broadcastsByStreamId.set(streamId, broadcast);
     void broadcast.catch(() => {});
     return this.#watchThreadRunCompletion(state, pubsub, key, record);
   }
@@ -2074,108 +2186,166 @@ export class AgentThreadStreamRuntime {
     this.#threadOutputTerminals.set(record.output, terminal);
     void terminal.catch(() => {});
 
-    const completion = record.output._waitUntilFinished().finally(async () => {
-      try {
-        // Gate finalization on the registration publish + the stream-part
-        // broadcast settling (PR #202/#204): publishing `run-completed` off
-        // `_waitUntilFinished()` alone let remote subscribers observe completion
-        // FIRST, delete the remote run, and ignore the late parts.
-        await state.registrationPublishesByRunId.get(record.runId)?.catch(() => {});
-        state.registrationPublishesByRunId.delete(record.runId);
-        await state.broadcastsByRunId.get(record.runId)?.catch(() => {});
-        state.broadcastsByRunId.delete(record.runId);
-        state.watchedThreadStreamIds.delete(record.streamId);
-        this.#cleanupPreparedRun(state, record.runId);
+    let completionSettled = false;
+    let abortRequested = false;
+    let resolveAbortCompletion!: () => void;
+    const abortCompletion = new Promise<void>(resolve => {
+      resolveAbortCompletion = resolve;
+    });
+    record.finalizeAbort = () => {
+      if (record.lifecycle === 'aborted') return;
+      record.lifecycle = 'aborted';
+      // The provider completion may already have won the race while its
+      // broadcast is still draining. Preserve the aborted lifecycle in that
+      // window so finalization cannot publish a competing run-completed.
+      if (completionSettled || abortRequested) return;
+      abortRequested = true;
+      resolveAbortCompletion();
+    };
 
-        // A suspended run (approval or generic tool suspension) is paused, not
-        // finished: surface run-suspended and leave its records in place so a
-        // later resume can re-attach to the same thread.
-        if (record.output.status === 'suspended' && this.#isSuspendedRun(state, record.runId)) {
-          record.lifecycle = 'suspended';
-          record.suspendedAt = Date.now();
+    const providerCompletion = record.output._waitUntilFinished().then(
+      () => 'provider' as const,
+      error => {
+        throw error;
+      },
+    );
+    const completion = Promise.race([providerCompletion, abortCompletion.then(() => 'abort' as const)]).then(
+      async terminalKind => {
+        completionSettled = true;
+        try {
+          // Gate finalization on the registration publish + the stream-part
+          // broadcast settling (PR #202/#204): publishing `run-completed` off
+          // `_waitUntilFinished()` alone let remote subscribers observe completion
+          // FIRST, delete the remote run, and ignore the late parts.
+          await state.registrationPublishesByStreamId.get(record.streamId)?.catch(() => {});
+          state.registrationPublishesByStreamId.delete(record.streamId);
+          await state.broadcastsByStreamId.get(record.streamId)?.catch(() => {});
+          state.broadcastsByStreamId.delete(record.streamId);
+          state.watchedThreadStreamIds.delete(record.streamId);
+          const abortedTerminal = terminalKind === 'abort' || record.lifecycle === 'aborted';
+          this.#cleanupPreparedRun(state, record.runId, abortedTerminal);
+
+          if (abortedTerminal) {
+            record.lifecycle = 'aborted';
+            this.#clearSuspendedRun(state, record.runId);
+            this.#forgetCallerSignalsForRun(state, record.runId);
+            resolveTerminal();
+            state.threadRunsByStreamId.delete(record.streamId);
+            if (
+              state.activeThreadRunIds.get(key) === record.runId &&
+              state.activeThreadStreamIds.get(key) === record.streamId
+            ) {
+              state.activeThreadRunIds.delete(key);
+              state.activeThreadStreamIds.delete(key);
+            }
+            if (state.threadKeysByRunId.get(record.runId) === key) {
+              state.threadKeysByRunId.delete(record.runId);
+            }
+            try {
+              if (this.#hasPendingThreadWork(state, key)) {
+                await this.#drainPendingSignals(state, pubsub, key, record);
+              } else {
+                this.#releaseThreadLease(pubsub, key, record.runId);
+              }
+            } finally {
+              if (state.threadRunsById.get(record.runId) === record) {
+                state.threadRunsById.delete(record.runId);
+              }
+              this.#resolveReservationWaiters(state, record.runId);
+            }
+            return;
+          }
+
+          // A suspended run (approval or generic tool suspension) is paused, not
+          // finished: surface run-suspended and leave its records in place so a
+          // later resume can re-attach to the same thread.
+          if (record.output.status === 'suspended' && this.#isSuspendedRun(state, record.runId)) {
+            record.lifecycle = 'suspended';
+            record.suspendedAt = Date.now();
+            await this.#publishTerminalAndWait(pubsub, key, {
+              type: 'run-suspended',
+              runId: record.runId,
+              streamId: record.streamId,
+            });
+            resolveTerminal();
+            return;
+          }
+
+          record.lifecycle = 'completed';
+          this.#clearSuspendedRun(state, record.runId);
+          this.#forgetCallerSignalsForRun(state, record.runId);
           await this.#publishTerminalAndWait(pubsub, key, {
-            type: 'run-suspended',
+            type: 'run-completed',
             runId: record.runId,
             streamId: record.streamId,
           });
           resolveTerminal();
-          return;
-        }
-
-        record.lifecycle = 'completed';
-        this.#clearSuspendedRun(state, record.runId);
-        this.#forgetCallerSignalsForRun(state, record.runId);
-        await this.#publishTerminalAndWait(pubsub, key, {
-          type: 'run-completed',
-          runId: record.runId,
-          streamId: record.streamId,
-        });
-        resolveTerminal();
-        state.threadRunsByStreamId.delete(record.streamId);
-        if (
-          state.activeThreadRunIds.get(key) === record.runId &&
-          state.activeThreadStreamIds.get(key) === record.streamId
-        ) {
-          state.activeThreadRunIds.delete(key);
-          state.activeThreadStreamIds.delete(key);
-        }
-        if (state.threadKeysByRunId.get(record.runId) === key) {
-          state.threadKeysByRunId.delete(record.runId);
-        }
-        // If queued follow-up work exists, keep the cross-process lease held by
-        // handing it to the next run instead of releasing it: releasing here
-        // would briefly empty the lease key, letting a racing process win it and
-        // start a competing run on this thread. The drain runs under the
-        // transferred lease and releases it only once every queue is empty. If
-        // there's no pending work, release as usual so other processes can wake
-        // the thread.
-        try {
-          if (this.#hasPendingThreadWork(state, key)) {
-            await this.#drainPendingSignals(state, pubsub, key, record);
-          } else {
-            this.#releaseThreadLease(pubsub, key, record.runId);
+          state.threadRunsByStreamId.delete(record.streamId);
+          if (
+            state.activeThreadRunIds.get(key) === record.runId &&
+            state.activeThreadStreamIds.get(key) === record.streamId
+          ) {
+            state.activeThreadRunIds.delete(key);
+            state.activeThreadStreamIds.delete(key);
           }
-        } finally {
+          if (state.threadKeysByRunId.get(record.runId) === key) {
+            state.threadKeysByRunId.delete(record.runId);
+          }
+          // If queued follow-up work exists, keep the cross-process lease held by
+          // handing it to the next run instead of releasing it: releasing here
+          // would briefly empty the lease key, letting a racing process win it and
+          // start a competing run on this thread. The drain runs under the
+          // transferred lease and releases it only once every queue is empty. If
+          // there's no pending work, release as usual so other processes can wake
+          // the thread.
+          try {
+            if (this.#hasPendingThreadWork(state, key)) {
+              await this.#drainPendingSignals(state, pubsub, key, record);
+            } else {
+              this.#releaseThreadLease(pubsub, key, record.runId);
+            }
+          } finally {
+            if (state.threadRunsById.get(record.runId) === record) {
+              state.threadRunsById.delete(record.runId);
+            }
+            this.#resolveReservationWaiters(state, record.runId);
+          }
+        } catch (error) {
+          if (terminalSettled) throw error;
+          const terminalError =
+            error instanceof AgentThreadOutputDrainError
+              ? error
+              : new AgentThreadOutputDrainError(
+                  'terminal-publish-failed',
+                  `Failed to finalize terminal delivery for agent thread run ${record.runId}`,
+                  error,
+                );
+          rejectTerminal(terminalError);
+          this.#clearSuspendedRun(state, record.runId);
+          state.pendingSignalsByThread.delete(key);
+          state.threadRunsByStreamId.delete(record.streamId);
+          if (
+            state.activeThreadRunIds.get(key) === record.runId &&
+            state.activeThreadStreamIds.get(key) === record.streamId
+          ) {
+            state.activeThreadRunIds.delete(key);
+            state.activeThreadStreamIds.delete(key);
+          }
+          if (state.threadKeysByRunId.get(record.runId) === key) {
+            state.threadKeysByRunId.delete(record.runId);
+          }
           if (state.threadRunsById.get(record.runId) === record) {
             state.threadRunsById.delete(record.runId);
           }
+          this.#forgetCallerSignalsForRun(state, record.runId);
+          this.#releaseThreadLease(pubsub, key, record.runId);
           this.#resolveReservationWaiters(state, record.runId);
+          this.#rememberRejectedRunError(state, record.runId, terminalError);
+          void this.#drainPendingIdleSignals(state, pubsub, key).catch(() => {});
+          throw terminalError;
         }
-      } catch (error) {
-        if (terminalSettled) throw error;
-        const terminalError =
-          error instanceof AgentThreadOutputDrainError
-            ? error
-            : new AgentThreadOutputDrainError(
-                'terminal-publish-failed',
-                `Failed to finalize terminal delivery for agent thread run ${record.runId}`,
-                error,
-              );
-        rejectTerminal(terminalError);
-        this.#clearSuspendedRun(state, record.runId);
-        state.pendingSignalsByThread.delete(key);
-        state.threadRunsByStreamId.delete(record.streamId);
-        if (
-          state.activeThreadRunIds.get(key) === record.runId &&
-          state.activeThreadStreamIds.get(key) === record.streamId
-        ) {
-          state.activeThreadRunIds.delete(key);
-          state.activeThreadStreamIds.delete(key);
-        }
-        if (state.threadKeysByRunId.get(record.runId) === key) {
-          state.threadKeysByRunId.delete(record.runId);
-        }
-        if (state.threadRunsById.get(record.runId) === record) {
-          state.threadRunsById.delete(record.runId);
-        }
-        this.#forgetCallerSignalsForRun(state, record.runId);
-        this.#releaseThreadLease(pubsub, key, record.runId);
-        this.#resolveReservationWaiters(state, record.runId);
-        this.#rememberRejectedRunError(state, record.runId, terminalError);
-        void this.#drainPendingIdleSignals(state, pubsub, key).catch(() => {});
-        throw terminalError;
-      }
-    });
+      },
+    );
     void completion.catch(() => {});
     return completion;
   }
@@ -2798,7 +2968,7 @@ export class AgentThreadStreamRuntime {
       if (isFallback) return;
       const owner = await provider.getLeaseOwner(key).catch(() => undefined);
       if (settled) return;
-      if (owner !== runId) {
+      if (owner === undefined || this.#runIdFromLeaseOwner(owner) !== runId) {
         clearRemoteActive();
         finish();
         return;
@@ -2852,13 +3022,14 @@ export class AgentThreadStreamRuntime {
     const key = this.#threadKey(options.resourceId, options.threadId);
     const topic = this.#threadTopic(key);
     const seenStreamIds = new Set<string>();
+    const highestLocalStreamSeqByRunId = new Map<string, number>();
     const pendingRuns: AgentThreadRunRecord<any>[] = [];
     const waiters: Array<() => void> = [];
     const drainedOutputs = new WeakSet<object>();
     const enqueuedOutputs = new WeakSet<object>();
     const streamDrainedOutputs = new WeakSet<object>();
     const terminalOutputs = new WeakSet<object>();
-    const outputsByRunId = new Map<string, MastraModelOutput<unknown>[]>();
+    const outputsByStreamId = new Map<string, MastraModelOutput<unknown>>();
     const outputDrainWaiters = new Map<object, Set<{ resolve: () => void; reject: (error: Error) => void }>>();
     const streamDrainWaiters = new Map<object, Set<{ resolve: () => void; reject: (error: Error) => void }>>();
     const remoteRuns = new Map<
@@ -2872,7 +3043,26 @@ export class AgentThreadStreamRuntime {
         closed: boolean;
       }
     >();
+    // Remote terminals can be redelivered out of order. Retain bounded stream
+    // tombstones so late registration/part events cannot resurrect a completed
+    // segment or overwrite a newer same-run stream's active identity.
+    const terminalRemoteStreamIds = new Set<string>();
+    // Suspended runs legitimately reuse their public run id across arbitrarily
+    // many resume segments. Retain every retired stream in that live chain; the
+    // global tombstone bound then only governs final runs whose released lease
+    // independently rejects stale distributed events.
+    const resumableTerminalStreamIdsByRunId = new Map<string, Set<string>>();
     let done = false;
+
+    const rememberTerminalRemoteStream = (streamId: string) => {
+      terminalRemoteStreamIds.delete(streamId);
+      terminalRemoteStreamIds.add(streamId);
+      while (terminalRemoteStreamIds.size > MAX_ABORTED_RUN_TOMBSTONES) {
+        const oldest = terminalRemoteStreamIds.values().next().value;
+        if (oldest === undefined) break;
+        terminalRemoteStreamIds.delete(oldest);
+      }
+    };
 
     const wake = () => {
       while (waiters.length) waiters.shift()?.();
@@ -2894,24 +3084,13 @@ export class AgentThreadStreamRuntime {
       settleOutputDrainIfReady(output);
     };
 
-    const removeTrackedOutput = (runId: string, output: MastraModelOutput<unknown>) => {
-      const outputs = outputsByRunId.get(runId);
-      if (!outputs) return;
-      const index = outputs.indexOf(output);
-      if (index === -1) return;
-      outputs.splice(index, 1);
-      if (outputs.length === 0) {
-        // Admission is guarded per streamId (a later approval-resume/retry
-        // segment mints a fresh streamId), so dropping the correlation queue is
-        // all that is needed to admit a legitimate later segment.
-        outputsByRunId.delete(runId);
-      }
+    const removeTrackedOutput = (streamId: string, output: MastraModelOutput<unknown>) => {
+      if (outputsByStreamId.get(streamId) === output) outputsByStreamId.delete(streamId);
     };
 
-    const markRunTerminalDelivered = (runId: string) => {
-      const outputs = outputsByRunId.get(runId);
-      const output = outputs?.shift();
-      if (outputs?.length === 0) outputsByRunId.delete(runId);
+    const markRunTerminalDelivered = (streamId: string) => {
+      const output = outputsByStreamId.get(streamId);
+      outputsByStreamId.delete(streamId);
       if (!output) return;
       terminalOutputs.add(output);
       settleOutputDrainIfReady(output);
@@ -2970,7 +3149,9 @@ export class AgentThreadStreamRuntime {
           // also a safe boundary after which this segment cannot emit more parts.
         }
       }
-      removeTrackedOutput(output.runId, output);
+      for (const [streamId, trackedOutput] of outputsByStreamId) {
+        if (trackedOutput === output) removeTrackedOutput(streamId, output);
+      }
       throw error;
     };
 
@@ -3045,16 +3226,14 @@ export class AgentThreadStreamRuntime {
       if (done || seenStreamIds.has(record.streamId)) return;
       seenStreamIds.add(record.streamId);
       enqueuedOutputs.add(record.output);
-      const outputs = outputsByRunId.get(record.runId) ?? [];
-      outputs.push(record.output);
-      outputsByRunId.set(record.runId, outputs);
+      outputsByStreamId.set(record.streamId, record.output);
       // The per-run correlation queue exists even when no caller uses the
       // internal output-drain waiter. A rejected terminal has no delivery event
       // that could shift this output, so observe the runtime's terminal promise
       // and remove this exact object on failure.
       queueMicrotask(() => {
         const terminal = this.#threadOutputTerminals.get(record.output);
-        void terminal?.catch(() => removeTrackedOutput(record.runId, record.output));
+        void terminal?.catch(() => removeTrackedOutput(record.streamId, record.output));
       });
       pendingRuns.push(record);
       wake();
@@ -3116,16 +3295,30 @@ export class AgentThreadStreamRuntime {
     };
 
     const localStreamIds = new Set<string>();
+    // Capture local ownership at callback delivery time. With many subscribers,
+    // the serialized event tail may not process `run-registered` until the fast
+    // run has already cleaned its shared state record; without this snapshot a
+    // legitimate local segment is misclassified as a stale remote replay.
+    const deliveredLocalRecordsByStreamId = new Map<string, AgentThreadRunRecord<any>>();
     const replayedStreamIds = new Set<string>();
     let currentReader: ReadableStreamDefaultReader<any> | null = null;
-    let activeReaderRunId: string | null = null;
-    let cancelledByAbort = false;
+    let activeReaderStreamId: string | null = null;
+    let abortTerminalPending = false;
+    const activeToolCallIdsByRunId = new Map<string, Set<string>>();
+    let abortDrainTimer: ReturnType<typeof setTimeout> | undefined;
 
-    const markActiveIfLive = async (runId: string, streamId: string, local: boolean) => {
-      if (!local && !(await this.#hasLiveThreadLease(resolvedPubSub, key, runId))) return;
+    const clearAbortDrainTimer = () => {
+      if (abortDrainTimer === undefined) return;
+      clearTimeout(abortDrainTimer);
+      abortDrainTimer = undefined;
+    };
+
+    const markActiveIfLive = async (runId: string, streamId: string, local: boolean): Promise<boolean> => {
+      if (!local && !(await this.#hasLiveThreadLease(resolvedPubSub, key, runId))) return false;
       state.activeThreadRunIds.set(key, runId);
       state.activeThreadStreamIds.set(key, streamId);
       if (!local) state.remoteThreadKeysByRunId.set(runId, key);
+      return true;
     };
 
     const clearActiveIfCurrent = (runId: string, streamId?: string) => {
@@ -3145,13 +3338,33 @@ export class AgentThreadStreamRuntime {
       const data = event.data as AgentThreadStreamRuntimeEvent | undefined;
       if (!data) return;
       if (data.type === 'run-registered') {
-        const localRecord = state.threadRunsByStreamId.get(data.streamId);
+        // At-least-once delivery can replay a registration after its aborted
+        // segment was terminalized. Never recreate a proxy that is intentionally
+        // tombstoned and can no longer receive a terminal.
+        const localRecord =
+          state.threadRunsByStreamId.get(data.streamId) ?? deliveredLocalRecordsByStreamId.get(data.streamId);
+        deliveredLocalRecordsByStreamId.delete(data.streamId);
+        if (
+          terminalRemoteStreamIds.has(data.streamId) ||
+          resumableTerminalStreamIdsByRunId.get(data.runId)?.has(data.streamId) ||
+          (!localRecord && seenStreamIds.has(data.streamId))
+        ) {
+          return;
+        }
         if (localRecord) {
+          if (
+            data.streamSeq < (highestLocalStreamSeqByRunId.get(data.runId) ?? 0) ||
+            localStreamIds.has(data.streamId)
+          ) {
+            return;
+          }
+          highestLocalStreamSeqByRunId.set(data.runId, data.streamSeq);
           localStreamIds.add(data.streamId);
         } else {
+          if (!(await markActiveIfLive(data.runId, data.streamId, false))) return;
           replayedStreamIds.add(data.streamId);
         }
-        await markActiveIfLive(data.runId, data.streamId, Boolean(localRecord));
+        if (localRecord) await markActiveIfLive(data.runId, data.streamId, true);
         const record = localRecord ?? createRemoteRun(data.runId, data.streamId, data.streamSeq);
         enqueueRun(record);
         wake();
@@ -3164,12 +3377,19 @@ export class AgentThreadStreamRuntime {
         ) {
           return;
         }
+        const activeStreamId =
+          state.activeThreadRunIds.get(key) === data.runId ? state.activeThreadStreamIds.get(key) : undefined;
+        // Once a newer stream for this stable run id is active, a delayed part
+        // from an older segment cannot reactivate it. `run-registered` is the
+        // sole authority that advances stream identity.
+        if (activeStreamId !== undefined && activeStreamId !== data.streamId) return;
         if (
-          state.activeThreadRunIds.get(key) !== data.runId ||
-          state.activeThreadStreamIds.get(key) !== data.streamId
+          terminalRemoteStreamIds.has(data.streamId) ||
+          resumableTerminalStreamIdsByRunId.get(data.runId)?.has(data.streamId)
         ) {
-          await markActiveIfLive(data.runId, data.streamId, false);
+          return;
         }
+        if (activeStreamId === undefined && !(await markActiveIfLive(data.runId, data.streamId, false))) return;
         let remoteRun = remoteRuns.get(data.streamId);
         if (!remoteRun) {
           // A subscriber can attach after another runtime already broadcast run-registered.
@@ -3235,8 +3455,37 @@ export class AgentThreadStreamRuntime {
         return;
       }
       if (data.type === 'run-completed' || data.type === 'run-aborted' || data.type === 'run-suspended') {
-        markRunTerminalDelivered(data.runId);
         const eventStreamId = data.streamId ?? data.runId;
+        const currentStreamId =
+          state.activeThreadRunIds.get(key) === data.runId ? state.activeThreadStreamIds.get(key) : undefined;
+        if (
+          data.type === 'run-aborted' &&
+          !data.afterBroadcast &&
+          data.sourceId !== undefined &&
+          data.sourceId !== this.#id
+        ) {
+          // The owner eagerly notifies only its same-runtime subscribers so they
+          // can arm the bounded drain timer. Other runtimes wait for the second
+          // post-broadcast publication, after authoritative parts are visible.
+          return;
+        }
+        // Delivery belongs to the exact stream even if a resume already made a
+        // newer same-run segment active. Mark that segment's barrier first, then
+        // refuse every thread-state mutation from the stale terminal.
+        markRunTerminalDelivered(eventStreamId);
+        if (data.type === 'run-suspended') {
+          const retired = resumableTerminalStreamIdsByRunId.get(data.runId) ?? new Set<string>();
+          retired.add(eventStreamId);
+          resumableTerminalStreamIdsByRunId.set(data.runId, retired);
+        }
+        if (data.streamId !== undefined && currentStreamId !== undefined && data.streamId !== currentStreamId) {
+          rememberTerminalRemoteStream(eventStreamId);
+          return;
+        }
+        // Keep retired identities for a live same-run resume chain. Once the
+        // run's lease is gone, stale registration/part events fail liveness
+        // admission independently; clearing this set is therefore unnecessary
+        // and would reopen older suspended segments during finalization races.
         if (data.type === 'run-suspended') {
           state.suspendedRunIds.add(data.runId);
           const record = state.threadRunsByStreamId.get(eventStreamId) ?? state.threadRunsById.get(data.runId);
@@ -3251,24 +3500,63 @@ export class AgentThreadStreamRuntime {
         if (data.type !== 'run-suspended') {
           this.#clearSuspendedRun(state, data.runId);
           this.#forgetCallerSignalsForRun(state, data.runId);
+          highestLocalStreamSeqByRunId.delete(data.runId);
+          resumableTerminalStreamIdsByRunId.delete(data.runId);
         }
         const remoteRun = remoteRuns.get(eventStreamId);
-        if (remoteRun) {
+        const abortingActiveReader =
+          data.type === 'run-aborted' && activeReaderStreamId === eventStreamId && currentReader !== null;
+        rememberTerminalRemoteStream(eventStreamId);
+        if (data.type !== 'run-suspended') {
+          localStreamIds.delete(eventStreamId);
+          replayedStreamIds.delete(eventStreamId);
+        }
+        if (data.type === 'run-aborted') {
+          // Only an actively consumed segment gets the grace period. A terminal
+          // for a queued/unconsumed remote proxy cannot be waiting on a visible
+          // tool_start in this subscriber, so retain the old prompt close.
+          if (remoteRun && !abortingActiveReader) {
+            remoteRun.done = true;
+            while (remoteRun.waiters.length) remoteRun.waiters.shift()?.();
+            while (remoteRun.finishWaiters.length) remoteRun.finishWaiters.shift()?.();
+            remoteRuns.delete(eventStreamId);
+            seenStreamIds.delete(eventStreamId);
+          }
+        } else if (remoteRun) {
           remoteRun.done = true;
           while (remoteRun.waiters.length) remoteRun.waiters.shift()?.();
           while (remoteRun.finishWaiters.length) remoteRun.finishWaiters.shift()?.();
           remoteRuns.delete(eventStreamId);
           seenStreamIds.delete(eventStreamId);
         }
-        // When a run is aborted, cancel the current subscriber stream reader so
-        // the generator's inner loop unblocks and can yield the synthetic abort.
-        if (data.type === 'run-aborted' && activeReaderRunId === data.runId && currentReader) {
-          cancelledByAbort = true;
-          try {
-            void currentReader.cancel();
-          } catch {
-            // Cancellation is best-effort after the run has already aborted.
-          }
+        // A run terminal can race the active tool's own abort rejection. Keep
+        // reading briefly so an authoritative `tool-error` can cross this
+        // subscriber; only then cancel the view and synthesize the abort. This
+        // never delays the abort signal itself, and the bound prevents an
+        // abort-ignoring stream from hanging the subscription.
+        if (data.type === 'run-aborted' && abortingActiveReader && currentReader) {
+          abortTerminalPending = true;
+          clearAbortDrainTimer();
+          const readerAtAbort = currentReader;
+          const remoteRunAtAbort = remoteRuns.get(eventStreamId);
+          abortDrainTimer = setTimeout(() => {
+            abortDrainTimer = undefined;
+            if (remoteRunAtAbort && remoteRuns.get(eventStreamId) === remoteRunAtAbort) {
+              remoteRunAtAbort.done = true;
+              while (remoteRunAtAbort.waiters.length) remoteRunAtAbort.waiters.shift()?.();
+              while (remoteRunAtAbort.finishWaiters.length) remoteRunAtAbort.finishWaiters.shift()?.();
+              remoteRuns.delete(eventStreamId);
+              // Waking the proxy lets it drain every buffered stream-part before
+              // closing. Cancelling its reader here would discard the very
+              // authoritative terminal this grace period protects.
+              return;
+            }
+            if (currentReader !== readerAtAbort || activeReaderStreamId !== eventStreamId) return;
+            void readerAtAbort.cancel().catch(() => {
+              // Cancellation is best-effort after the run has already aborted.
+            });
+          }, ABORT_OUTPUT_DRAIN_GRACE_MS);
+          abortDrainTimer.unref?.();
         }
         if (data.type !== 'run-suspended') {
           await this.#drainPendingIdleSignals(state, resolvedPubSub, key, data.runId);
@@ -3279,6 +3567,11 @@ export class AgentThreadStreamRuntime {
 
     let eventTail = Promise.resolve();
     const onEvent: EventCallback = (event, ack) => {
+      const deliveredData = event.data as AgentThreadStreamRuntimeEvent | undefined;
+      if (deliveredData?.type === 'run-registered') {
+        const localRecord = state.threadRunsByStreamId.get(deliveredData.streamId);
+        if (localRecord) deliveredLocalRecordsByStreamId.set(deliveredData.streamId, localRecord);
+      }
       // Events are processed strictly in publish order, but each delivery is
       // acknowledged on its own outcome. Every delivered event is acked once it
       // has been inspected — including events this subscriber filters out —
@@ -3307,10 +3600,13 @@ export class AgentThreadStreamRuntime {
       if (done) return;
       done = true;
       void resolvedPubSub.unsubscribe(topic, onEvent).catch(() => {});
+      clearAbortDrainTimer();
       // Cancel current reader so the generator's inner loop breaks.
       if (currentReader) {
         try {
-          void currentReader.cancel();
+          void currentReader.cancel().catch(() => {
+            // Cancellation is best-effort during unsubscribe.
+          });
         } catch {
           // Cancellation is best-effort during unsubscribe.
         }
@@ -3345,36 +3641,65 @@ export class AgentThreadStreamRuntime {
             const subscriberStream = run.createSubscriberStream?.() ?? run.output.fullStream;
             const reader = subscriberStream.getReader();
             currentReader = reader as ReadableStreamDefaultReader<any>;
-            activeReaderRunId = run.runId;
+            activeReaderStreamId = run.streamId;
             let readerReleased = false;
             let fullyDrained = false;
             try {
               while (true) {
                 const { value: part, done: streamDone } = await reader.read();
                 if (streamDone) {
-                  // A natural close (including a reader cancelled by a
-                  // run-aborted event) means every visible part crossed this
-                  // generator; only an explicit subscription teardown leaves
-                  // the segment un-drained.
+                  // A natural close, or the deliberate bounded abort fallback,
+                  // means no later part can cross this subscriber view. Only an
+                  // explicit subscription teardown leaves the segment un-drained.
                   fullyDrained = !done;
                   break;
                 }
                 const typedPart = part as any;
-                const partWithRunId =
-                  typedPart && typeof typedPart === 'object' && !('runId' in typedPart)
-                    ? { ...typedPart, runId: run.runId }
-                    : typedPart;
-                yield partWithRunId;
-                if (done) break;
+                const toolCallId =
+                  typedPart?.payload && typeof typedPart.payload.toolCallId === 'string'
+                    ? typedPart.payload.toolCallId
+                    : undefined;
+                const activeToolCallIds = activeToolCallIdsByRunId.get(run.runId) ?? new Set<string>();
+                if (typedPart.type === 'tool-call' && toolCallId !== undefined && !abortTerminalPending) {
+                  activeToolCallIds.add(toolCallId);
+                  activeToolCallIdsByRunId.set(run.runId, activeToolCallIds);
+                }
+                const isSettlingActiveTool =
+                  (typedPart.type === 'tool-result' || typedPart.type === 'tool-error') &&
+                  toolCallId !== undefined &&
+                  activeToolCallIds.has(toolCallId);
+                if (isSettlingActiveTool) {
+                  activeToolCallIds.delete(toolCallId!);
+                  if (activeToolCallIds.size === 0) activeToolCallIdsByRunId.delete(run.runId);
+                }
                 const finishReason = typedPart.finishReason ?? typedPart.payload?.finishReason;
-                const terminalBoundary =
+                const sourceTerminal =
                   typedPart.type === 'error' ||
                   typedPart.type === 'abort' ||
                   (typedPart.type === 'finish' && finishReason !== 'tool-calls');
-                if (terminalBoundary) {
-                  // After a final terminal chunk, drain any non-visible trailing
-                  // data in the background to prevent upstream backpressure while
-                  // allowing the generator to immediately serve subsequent runs.
+                const authoritativeAbortTerminal = typedPart.type === 'abort';
+                // `run-aborted` is a hard stop. During its bounded drain grace,
+                // surface only terminals for tools that were already visible
+                // before the abort, plus the source's matching abort boundary.
+                // Drop post-abort text, new tool calls, unrelated/orphan parts,
+                // and competing finish/error terminals.
+                const visibleAfterAbort = isSettlingActiveTool || authoritativeAbortTerminal;
+                const shouldYieldPart = !abortTerminalPending || visibleAfterAbort;
+                const acceptedSourceTerminal = sourceTerminal && (!abortTerminalPending || authoritativeAbortTerminal);
+                if (acceptedSourceTerminal) {
+                  // The source supplied its own terminal. A matching source abort
+                  // supersedes the synthetic fallback, while competing terminals
+                  // after `run-aborted` remain filtered until close/cancellation.
+                  abortTerminalPending = false;
+                  clearAbortDrainTimer();
+                  // Every model-visible part has crossed this generator once the
+                  // terminal below is delivered. Mark the barrier before pausing
+                  // at `yield`; otherwise a caller awaiting `_waitForOutputDrain()`
+                  // immediately after consuming it would deadlock.
+                  fullyDrained = true;
+                  markOutputStreamDrained(run.output);
+                  // Drain non-visible trailers in the background to prevent
+                  // upstream backpressure while serving subsequent runs.
                   readerReleased = true;
                   void (async () => {
                     try {
@@ -3387,27 +3712,41 @@ export class AgentThreadStreamRuntime {
                     }
                     reader.releaseLock();
                   })();
-                  // Every model-visible part has crossed the generator; the
-                  // background read above only discards non-visible trailers.
-                  fullyDrained = true;
-                  break;
                 }
+                if (shouldYieldPart) {
+                  const partWithRunId =
+                    typedPart && typeof typedPart === 'object' && !('runId' in typedPart)
+                      ? { ...typedPart, runId: run.runId }
+                      : typedPart;
+                  yield partWithRunId;
+                }
+                if (done || acceptedSourceTerminal) break;
               }
-              // If the stream closed because we cancelled the reader after a
-              // run-aborted event, yield a synthetic abort so subscribers
-              // finalize the run.
-              if (!readerReleased && !done && cancelledByAbort) {
+              // A source that closed without its own terminal still needs an
+              // abort boundary. This covers both a prompt authoritative tool
+              // error followed by close and the bounded cancellation fallback.
+              if (!readerReleased && !done && abortTerminalPending) {
+                // No later part can cross this subscriber once the source has
+                // closed/cancelled, so certify stream drain before yielding.
+                // An async generator pauses at `yield`; delaying the mark until
+                // `finally` would deadlock callers that await the drain barrier
+                // immediately after consuming this terminal.
+                fullyDrained = true;
+                markOutputStreamDrained(run.output);
                 yield { type: 'abort', runId: run.runId } as any;
-                cancelledByAbort = false;
+                abortTerminalPending = false;
               }
             } finally {
+              clearAbortDrainTimer();
+              abortTerminalPending = false;
+              activeToolCallIdsByRunId.delete(run.runId);
               currentReader = null;
-              activeReaderRunId = null;
+              activeReaderStreamId = null;
               if (!readerReleased) {
                 reader.releaseLock();
               }
               if (fullyDrained) {
-                markOutputStreamDrained(run.output);
+                if (!streamDrainedOutputs.has(run.output)) markOutputStreamDrained(run.output);
               } else {
                 rejectOutputDrain(
                   run.output,

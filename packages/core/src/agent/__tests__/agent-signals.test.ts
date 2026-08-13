@@ -1030,6 +1030,435 @@ describe('Agent signals', () => {
     await waitingForNextRun;
   });
 
+  it('drains an authoritative tool error before the bounded abort fallback', async () => {
+    const runtime = new AgentThreadStreamRuntime();
+    const pubsub = new EventEmitterPubSub();
+    const agent = { id: 'abort-drain-agent' } as Agent<any, any, any, any>;
+    const threadId = 'abort-drain-thread';
+    const resourceId = 'abort-drain-user';
+    const runId = 'abort-drain-run';
+    let finish!: () => void;
+    const finished = new Promise<void>(resolve => {
+      finish = resolve;
+    });
+    let streamController!: ReadableStreamDefaultController<unknown>;
+    const output = {
+      runId,
+      status: 'running',
+      fullStream: new ReadableStream({
+        start(controller) {
+          streamController = controller;
+          controller.enqueue({ type: 'start', runId });
+          controller.enqueue({
+            type: 'tool-call',
+            runId,
+            payload: { toolCallId: 'abort-tool', toolName: 'lookup', args: {} },
+          });
+        },
+      }),
+      _waitUntilFinished: () => finished,
+    } as any;
+    const options = runtime.prepareRunOptions(
+      { runId, memory: { thread: threadId, resource: resourceId } } as any,
+      pubsub,
+    );
+    const subscription = await runtime.subscribeToThread(agent, { threadId, resourceId }, pubsub);
+    const iterator = subscription.stream[Symbol.asyncIterator]();
+
+    try {
+      const completion = runtime.registerRun(agent, output, options, pubsub)!;
+      void completion.catch(() => {});
+      const start = await withTimeout(iterator.next(), 'Timed out waiting for abort-drain start');
+      const toolCall = await withTimeout(iterator.next(), 'Timed out waiting for abort-drain tool call');
+      expect([start.value.type, toolCall.value.type]).toEqual(['start', 'tool-call']);
+
+      expect(runtime.abortRun(runId, pubsub)).toBe(true);
+      queueMicrotask(() => {
+        streamController.enqueue({
+          type: 'tool-error',
+          runId,
+          payload: {
+            toolCallId: 'abort-tool',
+            toolName: 'lookup',
+            error: { message: 'local_project.operation_cancelled' },
+          },
+        });
+        streamController.close();
+        finish();
+      });
+
+      const authoritative = await withTimeout(iterator.next(), 'Timed out waiting for authoritative tool error');
+      expect(authoritative.value).toMatchObject({
+        type: 'tool-error',
+        runId,
+        payload: {
+          toolCallId: 'abort-tool',
+          toolName: 'lookup',
+          error: { message: 'local_project.operation_cancelled' },
+        },
+      });
+      const terminal = await withTimeout(iterator.next(), 'Timed out waiting for abort terminal');
+      expect(terminal.value).toEqual({ type: 'abort', runId });
+      await expect(subscription._waitForOutputDrain!(output)).resolves.toBeUndefined();
+    } finally {
+      subscription.unsubscribe();
+      await iterator.return?.();
+    }
+  });
+
+  it('drains a remote authoritative tool error that follows its abort terminal', async () => {
+    const pubsub = new EventEmitterPubSub();
+    const sourceRuntime = new AgentThreadStreamRuntime();
+    const subscriberRuntime = new AgentThreadStreamRuntime();
+    const agent = { id: 'remote-abort-drain-agent' } as Agent<any, any, any, any>;
+    const threadId = 'remote-abort-drain-thread';
+    const resourceId = 'remote-abort-drain-user';
+    const runId = 'remote-abort-drain-run';
+    let finish!: () => void;
+    const finished = new Promise<void>(resolve => {
+      finish = resolve;
+    });
+    let streamController!: ReadableStreamDefaultController<unknown>;
+    const output = {
+      runId,
+      status: 'running',
+      fullStream: new ReadableStream({
+        start(controller) {
+          streamController = controller;
+          controller.enqueue({ type: 'start', runId });
+          controller.enqueue({
+            type: 'tool-call',
+            runId,
+            payload: { toolCallId: 'remote-abort-tool', toolName: 'lookup', args: {} },
+          });
+        },
+      }),
+      _waitUntilFinished: () => finished,
+    } as any;
+    const options = sourceRuntime.prepareRunOptions(
+      { runId, memory: { thread: threadId, resource: resourceId } } as any,
+      pubsub,
+    );
+    const sourceSubscription = await sourceRuntime.subscribeToThread(agent, { threadId, resourceId }, pubsub);
+    const remoteSubscription = await subscriberRuntime.subscribeToThread(agent, { threadId, resourceId }, pubsub);
+    const remoteIterator = remoteSubscription.stream[Symbol.asyncIterator]();
+
+    try {
+      const completion = sourceRuntime.registerRun(agent, output, options, pubsub)!;
+      void completion.catch(() => {});
+      const start = await withTimeout(remoteIterator.next(), 'Timed out waiting for remote abort-drain start');
+      const toolCall = await withTimeout(remoteIterator.next(), 'Timed out waiting for remote abort-drain tool call');
+      expect([start.value.type, toolCall.value.type]).toEqual(['start', 'tool-call']);
+
+      expect(sourceRuntime.abortRun(runId, pubsub)).toBe(true);
+      queueMicrotask(() => {
+        streamController.enqueue({
+          type: 'tool-error',
+          runId,
+          payload: {
+            toolCallId: 'remote-abort-tool',
+            toolName: 'lookup',
+            error: { message: 'local_project.operation_cancelled' },
+          },
+        });
+        streamController.close();
+        finish();
+      });
+
+      const authoritative = await withTimeout(remoteIterator.next(), 'Timed out waiting for remote tool error');
+      expect(authoritative.value).toMatchObject({
+        type: 'tool-error',
+        runId,
+        payload: {
+          toolCallId: 'remote-abort-tool',
+          toolName: 'lookup',
+          error: { message: 'local_project.operation_cancelled' },
+        },
+      });
+      const terminal = await withTimeout(remoteIterator.next(), 'Timed out waiting for remote abort terminal');
+      expect(terminal.value).toEqual({ type: 'abort', runId });
+    } finally {
+      sourceSubscription.unsubscribe();
+      remoteSubscription.unsubscribe();
+      await remoteIterator.return?.();
+    }
+  });
+
+  it('filters post-abort text and new tools while settling an already-visible tool', async () => {
+    const runtime = new AgentThreadStreamRuntime();
+    const pubsub = new EventEmitterPubSub();
+    const agent = { id: 'abort-drain-filter-agent' } as Agent<any, any, any, any>;
+    const threadId = 'abort-drain-filter-thread';
+    const resourceId = 'abort-drain-filter-user';
+    const runId = 'abort-drain-filter-run';
+    let finish!: () => void;
+    const finished = new Promise<void>(resolve => {
+      finish = resolve;
+    });
+    let streamController!: ReadableStreamDefaultController<unknown>;
+    const output = {
+      runId,
+      status: 'running',
+      fullStream: new ReadableStream({
+        start(controller) {
+          streamController = controller;
+          controller.enqueue({ type: 'start', runId });
+          controller.enqueue({
+            type: 'tool-call',
+            runId,
+            payload: { toolCallId: 'visible-tool', toolName: 'lookup', args: {} },
+          });
+        },
+      }),
+      _waitUntilFinished: () => finished,
+    } as any;
+    const options = runtime.prepareRunOptions(
+      { runId, memory: { thread: threadId, resource: resourceId } } as any,
+      pubsub,
+    );
+    const subscription = await runtime.subscribeToThread(agent, { threadId, resourceId }, pubsub);
+    const iterator = subscription.stream[Symbol.asyncIterator]();
+
+    try {
+      const completion = runtime.registerRun(agent, output, options, pubsub)!;
+      void completion.catch(() => {});
+      await iterator.next();
+      await iterator.next();
+
+      expect(runtime.abortRun(runId, pubsub)).toBe(true);
+      queueMicrotask(() => {
+        streamController.enqueue({ type: 'text-delta', runId, payload: { id: 'late-text', text: 'must drop' } });
+        streamController.enqueue({
+          type: 'tool-call',
+          runId,
+          payload: { toolCallId: 'late-tool', toolName: 'write', args: {} },
+        });
+        streamController.enqueue({
+          type: 'finish',
+          runId,
+          payload: {
+            usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+            finishReason: 'stop',
+          },
+        });
+        streamController.enqueue({
+          type: 'tool-error',
+          runId,
+          payload: {
+            toolCallId: 'visible-tool',
+            toolName: 'lookup',
+            error: { message: 'local_project.operation_cancelled' },
+          },
+        });
+        streamController.close();
+        finish();
+      });
+
+      const authoritative = await withTimeout(iterator.next(), 'Timed out waiting for filtered tool terminal');
+      expect(authoritative.value).toMatchObject({
+        type: 'tool-error',
+        payload: { toolCallId: 'visible-tool', error: { message: 'local_project.operation_cancelled' } },
+      });
+      const terminal = await withTimeout(iterator.next(), 'Timed out waiting for filtered abort terminal');
+      expect(terminal.value).toEqual({ type: 'abort', runId });
+      expect([authoritative.value, terminal.value]).not.toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ type: 'text-delta' }),
+          expect.objectContaining({ type: 'tool-call', payload: expect.objectContaining({ toolCallId: 'late-tool' }) }),
+          expect.objectContaining({ type: 'finish' }),
+        ]),
+      );
+    } finally {
+      subscription.unsubscribe();
+      await iterator.return?.();
+    }
+  });
+
+  it('accepts a resumed remote stream with a process-local sequence reset', async () => {
+    const pubsub = new EventEmitterPubSub();
+    const runtime = new AgentThreadStreamRuntime();
+    const agent = { id: 'remote-resume-reset-agent' } as Agent<any, any, any, any>;
+    const target = { threadId: 'remote-resume-reset-thread', resourceId: 'remote-resume-reset-user' };
+    const key = `${target.resourceId}\u0000${target.threadId}`;
+    const topic = `agent.thread-stream.${encodeURIComponent(key)}`;
+    const runId = 'remote-resume-reset-run';
+    await pubsub.acquireLease(key, runId, 15_000);
+    const subscription = await runtime.subscribeToThread(agent, target, pubsub);
+    const iterator = subscription.stream[Symbol.asyncIterator]();
+
+    try {
+      await pubsub.publish(topic, {
+        type: 'run-registered',
+        runId,
+        data: { type: 'run-registered', runId, streamId: 'remote-resume-stream-1', streamSeq: 1 },
+      });
+      await pubsub.publish(topic, {
+        type: 'stream-part',
+        runId,
+        data: {
+          type: 'stream-part',
+          runId,
+          streamId: 'remote-resume-stream-1',
+          sourceId: 'remote-source-1',
+          part: { type: 'start' },
+        },
+      });
+      await iterator.next();
+      await pubsub.publish(topic, {
+        type: 'run-suspended',
+        runId,
+        data: { type: 'run-suspended', runId, streamId: 'remote-resume-stream-1' },
+      });
+
+      await pubsub.publish(topic, {
+        type: 'run-registered',
+        runId,
+        data: { type: 'run-registered', runId, streamId: 'remote-resume-stream-2', streamSeq: 1 },
+      });
+      await pubsub.publish(topic, {
+        type: 'stream-part',
+        runId,
+        data: {
+          type: 'stream-part',
+          runId,
+          streamId: 'remote-resume-stream-2',
+          sourceId: 'remote-source-2',
+          part: { type: 'start' },
+        },
+      });
+      await expect(
+        withTimeout(iterator.next(), 'Timed out waiting for cross-runtime resumed stream'),
+      ).resolves.toMatchObject({
+        value: { type: 'start', runId },
+      });
+    } finally {
+      subscription.unsubscribe();
+      await iterator.return?.();
+    }
+  });
+
+  it('does not resurrect a terminal remote stream from delayed registration or parts', async () => {
+    const pubsub = new EventEmitterPubSub();
+    const runtime = new AgentThreadStreamRuntime();
+    const agent = { id: 'remote-abort-tombstone-agent' } as Agent<any, any, any, any>;
+    const target = { threadId: 'remote-abort-tombstone-thread', resourceId: 'remote-abort-tombstone-user' };
+    const topic = `agent.thread-stream.${encodeURIComponent(`${target.resourceId}\u0000${target.threadId}`)}`;
+    const runId = 'remote-abort-tombstone-run';
+    const streamId = 'remote-abort-tombstone-stream';
+    await pubsub.acquireLease(`${target.resourceId}\u0000${target.threadId}`, runId, 15_000);
+    const subscription = await runtime.subscribeToThread(agent, target, pubsub);
+    const iterator = subscription.stream[Symbol.asyncIterator]();
+
+    try {
+      await pubsub.publish(topic, {
+        type: 'run-registered',
+        runId,
+        data: { type: 'run-registered', runId, streamId, streamSeq: 1 },
+      });
+      await pubsub.publish(topic, {
+        type: 'stream-part',
+        runId,
+        data: { type: 'stream-part', runId, streamId, sourceId: 'remote-source', part: { type: 'start' } },
+      });
+      await expect(withTimeout(iterator.next(), 'Timed out waiting for remote tombstone start')).resolves.toMatchObject(
+        {
+          value: { type: 'start', runId },
+        },
+      );
+      await pubsub.publish(topic, {
+        type: 'run-aborted',
+        runId,
+        data: { type: 'run-aborted', runId, streamId },
+      });
+      await expect(
+        withTimeout(iterator.next(), 'Timed out waiting for remote tombstone abort', 1_000),
+      ).resolves.toEqual({
+        value: { type: 'abort', runId },
+        done: false,
+      });
+
+      await pubsub.publish(topic, {
+        type: 'run-registered',
+        runId,
+        data: { type: 'run-registered', runId, streamId, streamSeq: 1 },
+      });
+      await pubsub.publish(topic, {
+        type: 'stream-part',
+        runId,
+        data: {
+          type: 'stream-part',
+          runId,
+          streamId,
+          sourceId: 'remote-source',
+          part: { type: 'text-delta', payload: { text: 'must not resurrect' } },
+        },
+      });
+      await new Promise(resolve => setTimeout(resolve, 25));
+      expect(subscription.activeRunId()).toBeNull();
+    } finally {
+      subscription.unsubscribe();
+      await iterator.return?.();
+    }
+  });
+
+  it('cancels an abort-ignoring subscriber stream after the bounded drain grace', async () => {
+    const runtime = new AgentThreadStreamRuntime();
+    const pubsub = new ControlledLeasePubSub();
+    const agent = { id: 'abort-drain-timeout-agent' } as Agent<any, any, any, any>;
+    const threadId = 'abort-drain-timeout-thread';
+    const resourceId = 'abort-drain-timeout-user';
+    const runId = 'abort-drain-timeout-run';
+    const finished = new Promise<void>(() => {});
+    const output = {
+      runId,
+      status: 'running',
+      fullStream: new ReadableStream({
+        start(controller) {
+          controller.enqueue({ type: 'start', runId });
+          controller.enqueue({
+            type: 'tool-call',
+            runId,
+            payload: { toolCallId: 'stuck-tool', toolName: 'lookup', args: {} },
+          });
+        },
+      }),
+      _waitUntilFinished: () => finished,
+    } as any;
+    const options = runtime.prepareRunOptions(
+      { runId, memory: { thread: threadId, resource: resourceId } } as any,
+      pubsub,
+    );
+    const subscription = await runtime.subscribeToThread(agent, { threadId, resourceId }, pubsub);
+    const iterator = subscription.stream[Symbol.asyncIterator]();
+
+    try {
+      const completion = runtime.registerRun(agent, output, options, pubsub)!;
+      void completion.catch(() => {});
+      await iterator.next();
+      await iterator.next();
+
+      const outputDrain = subscription._waitForOutputDrain!(output)!;
+      expect(runtime.abortRun(runId, pubsub)).toBe(true);
+      const terminal = iterator.next();
+      let settled = false;
+      void terminal.finally(() => (settled = true));
+      await new Promise(resolve => setTimeout(resolve, 25));
+      expect(settled).toBe(false);
+      await expect(withTimeout(terminal, 'Bounded abort drain did not settle', 1_000)).resolves.toEqual({
+        value: { type: 'abort', runId },
+        done: false,
+      });
+      // The producer never closes or settles. The runtime must still terminalize
+      // the registered output after the bounded drain grace.
+      await expect(withTimeout(outputDrain, 'Abort output drain did not settle', 1_000)).resolves.toBeUndefined();
+      expect(runtime.getRunOutput(runId, pubsub)).toBeUndefined();
+      expect(pubsub.publishedData.filter(data => data?.type === 'run-completed' && data.runId === runId)).toEqual([]);
+      subscription.unsubscribe();
+    } finally {
+      subscription.unsubscribe();
+    }
+  });
+
   it('removes a failed terminal without a drain waiter before the same run id is reused', async () => {
     const runtime = new AgentThreadStreamRuntime();
     const pubsub = new RejectFirstRunCompletedPubSub();
@@ -1158,6 +1587,9 @@ describe('Agent signals', () => {
       ]);
       expect(run1a.value).toMatchObject({ runId: runId1, text: 'response 1' });
       expect(run1b.value).toMatchObject({ runId: runId1, text: 'response 1' });
+      await waitForCondition(
+        () => firstSubscription.activeRunId() === null && secondSubscription.activeRunId() === null,
+      );
 
       const firstSubscriberRun2 = readNextRun(firstIterator);
       const secondSubscriberRun2 = readNextRun(secondIterator);
@@ -1391,7 +1823,9 @@ describe('Agent signals', () => {
     const runId = 'stream-identity-run';
     const topic = `agent.thread-stream.${encodeURIComponent(`${resourceId}\u0000${threadId}`)}`;
     const publishedEvents: any[] = [];
-    await pubsub.subscribe(topic, event => publishedEvents.push(event.data));
+    await pubsub.subscribe(topic, async event => {
+      publishedEvents.push(event.data);
+    });
 
     const createRun = (text: string, finished: Promise<void>) => {
       const fullStream = new ReadableStream({
@@ -1403,17 +1837,21 @@ describe('Agent signals', () => {
         },
       });
 
-      return runtime.registerRun(
-        agent,
-        {
-          runId,
-          status: 'running',
-          fullStream,
-          _waitUntilFinished: () => finished,
-        } as any,
-        { memory: { thread: threadId, resource: resourceId } } as any,
-        pubsub,
-      );
+      const output = {
+        runId,
+        status: 'running',
+        fullStream,
+        _waitUntilFinished: () => finished,
+      } as any;
+      return {
+        output,
+        completion: runtime.registerRun(
+          agent,
+          output,
+          { memory: { thread: threadId, resource: resourceId } } as any,
+          pubsub,
+        )!,
+      };
     };
 
     let finishInitial!: () => void;
@@ -1430,7 +1868,7 @@ describe('Agent signals', () => {
 
     try {
       const initialRun = readNextRun(iterator);
-      const initialCompletion = createRun('initial response', initialFinished)!;
+      const initial = createRun('initial response', initialFinished);
       await expect(withTimeout(initialRun, 'Timed out waiting for initial stream identity run')).resolves.toMatchObject(
         {
           value: { runId, text: 'initial response' },
@@ -1442,7 +1880,7 @@ describe('Agent signals', () => {
       await waitForCondition(() => pubsub.sawRunCompleted);
 
       const resumedRun = readNextRun(iterator);
-      const resumedCompletion = createRun('resumed response', resumedFinished)!;
+      const resumed = createRun('resumed response', resumedFinished);
       await expect(withTimeout(resumedRun, 'Timed out waiting for resumed stream identity run')).resolves.toMatchObject(
         {
           value: { runId, text: 'resumed response' },
@@ -1457,13 +1895,29 @@ describe('Agent signals', () => {
       expect(registeredEvents[1].streamId).toEqual(expect.any(String));
       expect(registeredEvents[1].streamId).not.toBe(registeredEvents[0].streamId);
 
+      const initialOutputDrain = subscription._waitForOutputDrain!(initial.output);
+      const resumedOutputDrain = subscription._waitForOutputDrain!(resumed.output);
+      // The current output handle belongs to the resumed segment; its barrier
+      // must not be satisfied by the delayed terminal for the initial stream.
       pubsub.unblockRunCompleted();
-      await initialCompletion;
+      await initial.completion;
       await nextTick();
       expect(subscription.activeRunId()).toBe(runId);
+      let resumedDrainSettled = false;
+      await expect(
+        withTimeout(initialOutputDrain!, 'Timed out waiting for initial output drain'),
+      ).resolves.toBeUndefined();
+      void resumedOutputDrain?.then(() => {
+        resumedDrainSettled = true;
+      });
+      await nextTick();
+      expect(resumedDrainSettled).toBe(false);
 
       finishResumed();
-      await resumedCompletion;
+      await resumed.completion;
+      await expect(
+        withTimeout(resumedOutputDrain!, 'Timed out waiting for resumed output drain'),
+      ).resolves.toBeUndefined();
       expect(subscription.activeRunId()).toBeNull();
     } finally {
       subscription.unsubscribe();
@@ -3475,6 +3929,7 @@ describe('Agent signals', () => {
         const runs = await withTimeout(
           Promise.all(nextRuns),
           `Timed out waiting for ${subscriberCount} subscribers to receive idle signal run ${runIndex}`,
+          5_000,
         );
         const [firstRun] = runs;
 
@@ -3493,6 +3948,7 @@ describe('Agent signals', () => {
           expect(signalPart?.data.createdAt).toBeDefined();
           expect(signalPart?.transient).toBe(true);
         }
+        await waitForCondition(() => subscriptions.every(subscription => subscription.activeRunId() === null));
       }
 
       expect(streamCount).toBe(runCount);
@@ -4018,7 +4474,7 @@ describe('Agent signals', () => {
     for (const data of [
       { type: 'run-registered', runId, streamId: 'ordered-stream-1', streamSeq: 1 },
       { type: 'run-registered', runId, streamId: 'ordered-stream-2', streamSeq: 2 },
-      { type: 'run-completed', runId, streamId: 'ordered-stream-1' },
+      { type: 'run-aborted', runId, streamId: 'ordered-stream-1' },
     ]) {
       await pubsub.publish(topic, { type: data.type, runId, data });
     }
@@ -4039,7 +4495,7 @@ describe('Agent signals', () => {
     const key = 'bounded-resource\u0000bounded-thread';
     const topic = `agent.thread-stream.${encodeURIComponent(key)}`;
     const runId = 'bounded-run';
-    pubsub.owners.set(key, runId);
+    pubsub.owners.set(key, `mastra-thread-owner:${JSON.stringify([runId, 'remote-owner-source', 'attempt'])}`);
     const subscription = await runtime.subscribeToThread(
       { id: 'bounded-owner-agent' } as Agent<any, any, any, any>,
       { resourceId: 'bounded-resource', threadId: 'bounded-thread' },
