@@ -16,6 +16,7 @@ import {
   storageMessageMatchesMetadataFilter,
   validateStorageMetadataFilter,
   applyWorkingMemorySnapshotUpdate,
+  assertThreadWorkingMemoryRemoved,
   assertWorkingMemorySnapshotUnchanged,
   hasWorkingMemorySnapshotControls,
   preserveWorkingMemorySnapshotControls,
@@ -142,6 +143,8 @@ import type {
   ApplyWorkingMemoryUpdateInput,
   WorkingMemorySnapshot,
   WorkingMemorySnapshotInput,
+  StorageTransitionThreadToResourceWorkingMemoryInput,
+  StorageTransitionThreadToResourceWorkingMemoryOutput,
 } from '@mastra/core/storage';
 import { parseSqlIdentifier } from '@mastra/core/utils';
 import type { TxClient } from '../../client';
@@ -2568,6 +2571,123 @@ export class MemoryPG extends MemoryStorage {
       this.logger?.error?.(safeError.toString());
       this.logger?.trackException(safeError);
       throw safeError;
+    }
+  }
+
+  async transitionThreadToResourceWorkingMemory(
+    input: StorageTransitionThreadToResourceWorkingMemoryInput,
+  ): Promise<StorageTransitionThreadToResourceWorkingMemoryOutput> {
+    assertThreadWorkingMemoryRemoved(input.thread.metadata);
+    const resourceId = input.thread.resourceId;
+    const threadTableName = getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) });
+    const resourceTableName = getTableName({ indexName: TABLE_RESOURCES, schemaName: getSchemaName(this.#schema) });
+
+    try {
+      return await this.#db.client.tx(async t => {
+        await this.lockObservationalMemoryResource(t, resourceId);
+        await this.lockWorkingMemoryTarget(t, 'resource', resourceId);
+        await this.lockWorkingMemoryTarget(t, 'thread', input.thread.id);
+
+        const currentThread = await t.oneOrNone<{ resourceId: string }>(
+          `SELECT "resourceId" FROM ${threadTableName} WHERE id = $1 FOR UPDATE`,
+          [input.thread.id],
+        );
+        if (currentThread && currentThread.resourceId !== resourceId) {
+          throw new WorkingMemoryValidationError('Working-memory thread does not belong to the requested resource.');
+        }
+
+        const currentResource = await t.oneOrNone<{
+          workingMemory: string | null;
+          metadata: unknown;
+          createdAt: Date | string;
+          createdAtZ?: Date | string;
+        }>(
+          `SELECT "workingMemory", metadata, "createdAt", "createdAtZ"
+           FROM ${resourceTableName} WHERE id = $1 FOR UPDATE`,
+          [resourceId],
+        );
+        const currentMetadata = parseMetadata(currentResource?.metadata);
+        const current = readWorkingMemorySnapshot(currentResource?.workingMemory, currentMetadata);
+        const now = new Date();
+        const nowString = now.toISOString();
+        const next = applyWorkingMemorySnapshotUpdate(
+          current,
+          {
+            value: input.value,
+            expectedRevision: input.expectedRevision,
+            source: 'observer',
+            ...(input.maxDataBytes === undefined ? {} : { maxDataBytes: input.maxDataBytes }),
+          },
+          nowString,
+        );
+        const nextMetadata = writeWorkingMemorySnapshotMetadata(currentMetadata, next);
+        if (currentResource) {
+          await t.none(
+            `UPDATE ${resourceTableName}
+             SET "workingMemory" = $1, metadata = $2, "updatedAt" = $3, "updatedAtZ" = $4
+             WHERE id = $5`,
+            [next.value, JSON.stringify(nextMetadata), nowString, nowString, resourceId],
+          );
+        } else {
+          await t.none(
+            `INSERT INTO ${resourceTableName}
+               (id, "workingMemory", metadata, "createdAt", "createdAtZ", "updatedAt", "updatedAtZ")
+             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+            [resourceId, next.value, JSON.stringify(nextMetadata), nowString, nowString, nowString, nowString],
+          );
+        }
+
+        const createdAt = toUtcISOString(input.thread.createdAt);
+        const updatedAt = toUtcISOString(input.thread.updatedAt);
+        const thread = await t.one<StorageThreadType & { createdAtZ: Date | string; updatedAtZ: Date | string }>(
+          `INSERT INTO ${threadTableName}
+             (id, "resourceId", title, metadata, "createdAt", "createdAtZ", "updatedAt", "updatedAtZ")
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+           ON CONFLICT (id) DO UPDATE SET
+             "resourceId" = EXCLUDED."resourceId",
+             title = EXCLUDED.title,
+             metadata = EXCLUDED.metadata,
+             "createdAt" = EXCLUDED."createdAt",
+             "createdAtZ" = EXCLUDED."createdAtZ",
+             "updatedAt" = EXCLUDED."updatedAt",
+             "updatedAtZ" = EXCLUDED."updatedAtZ"
+           RETURNING *`,
+          [
+            input.thread.id,
+            resourceId,
+            input.thread.title,
+            JSON.stringify(input.thread.metadata ?? {}),
+            createdAt,
+            createdAt,
+            updatedAt,
+            updatedAt,
+          ],
+        );
+        return {
+          thread: {
+            id: thread.id,
+            resourceId: thread.resourceId,
+            title: thread.title,
+            metadata: parseMetadata(thread.metadata),
+            createdAt: new Date(thread.createdAtZ || thread.createdAt),
+            updatedAt: new Date(thread.updatedAtZ || thread.updatedAt),
+          },
+          workingMemory: next,
+        };
+      });
+    } catch (error) {
+      if (error instanceof WorkingMemoryRevisionConflictError || error instanceof WorkingMemoryValidationError) {
+        throw error;
+      }
+      throw new MastraError(
+        {
+          id: createStorageErrorId('PG', 'TRANSITION_THREAD_TO_RESOURCE_WORKING_MEMORY', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: { threadId: input.thread.id, resourceId },
+        },
+        error,
+      );
     }
   }
 

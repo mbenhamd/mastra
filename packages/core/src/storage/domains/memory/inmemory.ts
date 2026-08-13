@@ -36,6 +36,8 @@ import type {
   ApplyWorkingMemoryUpdateInput,
   WorkingMemorySnapshot,
   WorkingMemorySnapshotInput,
+  StorageTransitionThreadToResourceWorkingMemoryInput,
+  StorageTransitionThreadToResourceWorkingMemoryOutput,
 } from '../../types';
 import {
   filterByDateRange,
@@ -48,6 +50,7 @@ import type { InMemoryDB } from '../inmemory-db';
 import { MemoryStorage } from './base';
 import {
   applyWorkingMemorySnapshotUpdate,
+  assertThreadWorkingMemoryRemoved,
   assertWorkingMemorySnapshotUnchanged,
   hasWorkingMemorySnapshotControls,
   preserveWorkingMemorySnapshotControls,
@@ -114,7 +117,7 @@ function preserveGovernedThreadMetadata(
     proposedValueProvided: proposed !== undefined && Object.prototype.hasOwnProperty.call(proposed, 'workingMemory'),
     proposedMetadata: proposed,
   });
-  if (!hasWorkingMemorySnapshotControls(current)) return next;
+  if (!current || !hasWorkingMemorySnapshotControls(current)) return next;
 
   const preserved = preserveWorkingMemorySnapshotControls(current, next);
   if (current !== undefined && Object.prototype.hasOwnProperty.call(current, 'workingMemory')) {
@@ -1139,6 +1142,50 @@ export class InMemoryMemory extends MemoryStorage {
       this.db.threads.set(input.threadId, cloneThreadBoundary({ ...thread, metadata, updatedAt: now }, true));
       this.rotateThreadGeneration(input.threadId);
       return next;
+    });
+  }
+
+  async transitionThreadToResourceWorkingMemory(
+    input: StorageTransitionThreadToResourceWorkingMemoryInput,
+  ): Promise<StorageTransitionThreadToResourceWorkingMemoryOutput> {
+    return this.withMemoryStateRollback(true, () => {
+      assertThreadWorkingMemoryRemoved(input.thread.metadata);
+      const currentThread = this.db.threads.get(input.thread.id);
+      if (currentThread && currentThread.resourceId !== input.thread.resourceId) {
+        throw new WorkingMemoryValidationError('Working-memory thread does not belong to the requested resource.');
+      }
+
+      const now = new Date();
+      const currentResource = this.db.resources.get(input.thread.resourceId);
+      const current = readWorkingMemorySnapshot(currentResource?.workingMemory, currentResource?.metadata);
+      const next = applyWorkingMemorySnapshotUpdate(
+        current,
+        {
+          value: input.value,
+          expectedRevision: input.expectedRevision,
+          source: 'observer',
+          ...(input.maxDataBytes === undefined ? {} : { maxDataBytes: input.maxDataBytes }),
+        },
+        now.toISOString(),
+      );
+      const resource = cloneResourceBoundary(
+        {
+          id: input.thread.resourceId,
+          workingMemory: next.value ?? undefined,
+          metadata: writeWorkingMemorySnapshotMetadata(currentResource?.metadata, next),
+          createdAt: currentResource?.createdAt ?? now,
+          updatedAt: now,
+        },
+        true,
+      );
+      const thread = cloneThreadBoundary(input.thread, true);
+      this.db.resources.set(resource.id, resource);
+      this.db.threads.set(thread.id, thread);
+      this.rotateThreadGeneration(thread.id);
+      return {
+        thread: cloneThreadBoundary(thread),
+        workingMemory: structuredClone(next),
+      };
     });
   }
 

@@ -472,6 +472,72 @@ describe('revisioned Working Memory controls', () => {
 });
 
 describe('InMemoryMemory revisioned Working Memory', () => {
+  it('atomically moves governed thread Working Memory to its canonical resource', async () => {
+    const storage = new InMemoryStore({ id: 'working-memory-scope-transition' });
+    const memory = await storage.getStore('memory');
+    if (!memory) throw new Error('Expected in-memory storage domain.');
+    const createdAt = new Date('2026-01-01T00:00:00.000Z');
+    const resourceId = 'transition-resource';
+    const threadId = 'transition-thread';
+    await memory.saveThread({
+      thread: { id: threadId, resourceId, metadata: {}, createdAt, updatedAt: createdAt },
+    });
+    const threadSnapshot = await memory.applyWorkingMemoryUpdate({
+      scope: 'thread',
+      resourceId,
+      threadId,
+      value: 'stale thread copy',
+      expectedRevision: 0,
+      source: 'owner',
+    });
+    await memory.applyWorkingMemoryUpdate({
+      scope: 'resource',
+      resourceId,
+      value: 'current resource value',
+      expectedRevision: 0,
+      source: 'owner',
+    });
+
+    await expect(
+      memory.transitionThreadToResourceWorkingMemory({
+        thread: {
+          id: threadId,
+          resourceId,
+          metadata: { preserved: true },
+          createdAt,
+          updatedAt: new Date(),
+        },
+        value: 'canonical resource value',
+        expectedRevision: 0,
+      }),
+    ).rejects.toMatchObject({ name: 'WorkingMemoryRevisionConflictError' });
+    await expect(memory.getWorkingMemorySnapshot({ scope: 'thread', resourceId, threadId })).resolves.toEqual(
+      threadSnapshot,
+    );
+
+    const currentResource = await memory.getWorkingMemorySnapshot({ scope: 'resource', resourceId });
+    const transitioned = await memory.transitionThreadToResourceWorkingMemory({
+      thread: {
+        id: threadId,
+        resourceId,
+        metadata: { preserved: true },
+        createdAt,
+        updatedAt: new Date(),
+      },
+      value: 'canonical resource value',
+      expectedRevision: currentResource.revision,
+    });
+
+    expect(transitioned.workingMemory).toMatchObject({ value: 'canonical resource value', revision: 2 });
+    expect(transitioned.thread.metadata).toEqual({ preserved: true });
+    await expect(memory.getWorkingMemorySnapshot({ scope: 'thread', resourceId, threadId })).resolves.toEqual({
+      value: null,
+      revision: 0,
+      protectedPaths: [],
+      provenance: {},
+    });
+  });
+
   it('rejects generic mutations while preserving governed fields omitted from whole-row saves', async () => {
     const storage = new InMemoryStore({ id: 'working-memory-generic-write-guards' });
     const memory = await storage.getStore('memory');

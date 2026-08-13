@@ -910,6 +910,25 @@ export type ApplyWorkingMemoryUpdateInput = WorkingMemorySnapshotInput & {
   observationalMemoryGuard?: ObservationalMemoryWriteGuard;
 };
 
+/**
+ * Atomically move a governed thread snapshot to resource scope.
+ *
+ * @internal This is a narrowly authorized scope transition. Generic thread
+ * writes must continue to preserve or reject governed Working Memory fields.
+ */
+export type StorageTransitionThreadToResourceWorkingMemoryInput = {
+  thread: StorageThreadType;
+  value: string;
+  expectedRevision: number;
+  maxDataBytes?: number;
+};
+
+/** @internal Result of a governed thread-to-resource Working Memory transition. */
+export type StorageTransitionThreadToResourceWorkingMemoryOutput = {
+  thread: StorageThreadType;
+  workingMemory: WorkingMemorySnapshot;
+};
+
 export type StorageMessageType = {
   id: string;
   thread_id: string;

@@ -851,6 +851,21 @@ export class Memory extends MastraMemory {
         return this.withWorkingMemoryMutex(`thread-${thread.id}`, async () => {
           return this.withWorkingMemoryMutex(`resource-${thread.resourceId}`, async () => {
             const memoryStore = await this.getMemoryStore();
+            if (memoryStore.supportsRevisionedWorkingMemory) {
+              const current = await memoryStore.getWorkingMemorySnapshot({
+                scope: 'resource',
+                resourceId: thread.resourceId,
+              });
+              const transitioned = await memoryStore.transitionThreadToResourceWorkingMemory({
+                thread: threadForStorage,
+                value: managedWorkingMemory.workingMemory,
+                expectedRevision: current.revision,
+                ...(config.workingMemory?.maxDataBytes === undefined
+                  ? {}
+                  : { maxDataBytes: config.workingMemory.maxDataBytes }),
+              });
+              return transitioned.thread;
+            }
             const savedThread = await memoryStore.saveThread({ thread: threadForStorage });
             await this.writeObserverWorkingMemory({
               memoryStore,
@@ -864,6 +879,10 @@ export class Memory extends MastraMemory {
           });
         });
       });
+    }
+
+    if (managedWorkingMemory?.scope === 'resource') {
+      throw new Error('Resource-scoped working memory requires a resourceId.');
     }
 
     if (managedWorkingMemory?.scope === 'thread') {
@@ -929,17 +948,28 @@ export class Memory extends MastraMemory {
               metadata: this.stripManagedWorkingMemoryFromThreadMetadata(metadata),
             });
           }
-          const updatedThread = await memoryStore.saveThread({
-            thread: {
-              ...existingThread,
-              ...(title !== undefined ? { title } : {}),
-              metadata: this.prepareResourceScopedThreadMetadata(metadata, existingThread.metadata),
-              updatedAt: new Date(),
-            },
-          });
-          const resourceId = updatedThread.resourceId;
+          const threadForStorage = {
+            ...existingThread,
+            ...(title !== undefined ? { title } : {}),
+            metadata: this.prepareResourceScopedThreadMetadata(metadata, existingThread.metadata),
+            updatedAt: new Date(),
+          };
+          const resourceId = threadForStorage.resourceId;
           if (managedWorkingMemory && resourceId) {
-            await this.withWorkingMemoryMutex(`resource-${resourceId}`, async () => {
+            return this.withWorkingMemoryMutex(`resource-${resourceId}`, async () => {
+              if (memoryStore.supportsRevisionedWorkingMemory) {
+                const current = await memoryStore.getWorkingMemorySnapshot({ scope: 'resource', resourceId });
+                const transitioned = await memoryStore.transitionThreadToResourceWorkingMemory({
+                  thread: threadForStorage,
+                  value: managedWorkingMemory.workingMemory,
+                  expectedRevision: current.revision,
+                  ...(config.workingMemory?.maxDataBytes === undefined
+                    ? {}
+                    : { maxDataBytes: config.workingMemory.maxDataBytes }),
+                });
+                return transitioned.thread;
+              }
+              const updatedThread = await memoryStore.saveThread({ thread: threadForStorage });
               await this.writeObserverWorkingMemory({
                 memoryStore,
                 coordinates: { scope: 'resource', resourceId, threadId: id },
@@ -948,9 +978,13 @@ export class Memory extends MastraMemory {
                   ? { maxDataBytes: config.workingMemory.maxDataBytes }
                   : {}),
               });
+              return updatedThread;
             });
           }
-          return updatedThread;
+          if (managedWorkingMemory) {
+            throw new Error('Resource-scoped working memory requires a resourceId.');
+          }
+          return memoryStore.saveThread({ thread: threadForStorage });
         });
       return managedWorkingMemory
         ? this.withResourceMetadataOperationMutex(updateResourceScopedThread)

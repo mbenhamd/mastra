@@ -433,6 +433,19 @@ describe('Memory', () => {
       });
       const threadId = 'empty-resource-working-memory-thread';
       const resourceId = 'empty-resource-working-memory-resource';
+      const memoryStore = (await storage.getStore('memory'))!;
+      const createdAt = new Date();
+      await memoryStore.saveThread({
+        thread: { id: threadId, resourceId, metadata: {}, createdAt, updatedAt: createdAt },
+      });
+      await memoryStore.applyWorkingMemoryUpdate({
+        scope: 'thread',
+        resourceId,
+        threadId,
+        value: 'stale thread copy',
+        expectedRevision: 0,
+        source: 'owner',
+      });
 
       await memory.saveThread({
         thread: {
@@ -445,7 +458,7 @@ describe('Memory', () => {
               preserved: true,
             },
           },
-          createdAt: new Date(),
+          createdAt,
           updatedAt: new Date(),
         },
       });
@@ -4250,8 +4263,7 @@ describe('Memory', () => {
         options: { workingMemory: { enabled: true, scope: 'resource' } },
       });
       const memoryStore = (await storage.getStore('memory'))!;
-      const originalSaveThread = memoryStore.saveThread.bind(memoryStore);
-      const originalApplyWorkingMemoryUpdate = memoryStore.applyWorkingMemoryUpdate.bind(memoryStore);
+      const originalTransition = memoryStore.transitionThreadToResourceWorkingMemory.bind(memoryStore);
       const originalDeleteResource = memoryStore.deleteResource.bind(memoryStore);
       const operationOrder: string[] = [];
       let markSaveStarted!: () => void;
@@ -4263,16 +4275,11 @@ describe('Memory', () => {
         releaseSave = resolve;
       });
 
-      vi.spyOn(memoryStore, 'saveThread').mockImplementation(async args => {
+      vi.spyOn(memoryStore, 'transitionThreadToResourceWorkingMemory').mockImplementation(async args => {
         markSaveStarted();
         await saveBlocked;
-        const result = await originalSaveThread(args);
-        operationOrder.push('save-thread');
-        return result;
-      });
-      vi.spyOn(memoryStore, 'applyWorkingMemoryUpdate').mockImplementation(async args => {
-        const result = await originalApplyWorkingMemoryUpdate(args);
-        operationOrder.push('update-working-memory');
+        const result = await originalTransition(args);
+        operationOrder.push('transition');
         return result;
       });
       const deleteSpy = vi.spyOn(memoryStore, 'deleteResource').mockImplementation(async args => {
@@ -4298,7 +4305,7 @@ describe('Memory', () => {
       releaseSave();
       await Promise.all([savePromise, deletePromise]);
 
-      expect(operationOrder).toEqual(['save-thread', 'update-working-memory', 'delete']);
+      expect(operationOrder).toEqual(['transition', 'delete']);
       await expect(memoryStore.getResourceById({ resourceId: 'resource-save-delete-race' })).resolves.toBeNull();
       const workingMemoryMutexes = Reflect.get(memory, 'updateWorkingMemoryMutexes') as Map<string, unknown>;
       expect(workingMemoryMutexes.size).toBe(0);
@@ -4314,7 +4321,7 @@ describe('Memory', () => {
       const threadId = 'thread-queued-save-delete-race';
       const resourceId = 'resource-queued-save-delete-race';
       const originalSaveThread = memoryStore.saveThread.bind(memoryStore);
-      const originalApplyWorkingMemoryUpdate = memoryStore.applyWorkingMemoryUpdate.bind(memoryStore);
+      const originalTransition = memoryStore.transitionThreadToResourceWorkingMemory.bind(memoryStore);
       const originalDeleteResource = memoryStore.deleteResource.bind(memoryStore);
       const operationOrder: string[] = [];
       let markBlockingSaveStarted!: () => void;
@@ -4332,12 +4339,12 @@ describe('Memory', () => {
           await blockingSaveBlocked;
         }
         const result = await originalSaveThread(args);
-        operationOrder.push(args.thread.title === 'Metadata save' ? 'metadata-save' : 'blocking-save');
+        operationOrder.push('blocking-save');
         return result;
       });
-      vi.spyOn(memoryStore, 'applyWorkingMemoryUpdate').mockImplementation(async args => {
-        const result = await originalApplyWorkingMemoryUpdate(args);
-        operationOrder.push('update-working-memory');
+      vi.spyOn(memoryStore, 'transitionThreadToResourceWorkingMemory').mockImplementation(async args => {
+        const result = await originalTransition(args);
+        operationOrder.push('metadata-save');
         return result;
       });
       const deleteSpy = vi.spyOn(memoryStore, 'deleteResource').mockImplementation(async args => {
@@ -4376,7 +4383,7 @@ describe('Memory', () => {
       releaseBlockingSave();
       await Promise.all([blockingSavePromise, metadataSavePromise, deletePromise]);
 
-      expect(operationOrder).toEqual(['blocking-save', 'metadata-save', 'update-working-memory', 'delete']);
+      expect(operationOrder).toEqual(['blocking-save', 'metadata-save', 'delete']);
       await expect(memoryStore.getResourceById({ resourceId })).resolves.toBeNull();
       const workingMemoryMutexes = Reflect.get(memory, 'updateWorkingMemoryMutexes') as Map<string, unknown>;
       expect(workingMemoryMutexes.size).toBe(0);
@@ -4401,8 +4408,7 @@ describe('Memory', () => {
         },
       });
 
-      const originalSaveThread = memoryStore.saveThread.bind(memoryStore);
-      const originalApplyWorkingMemoryUpdate = memoryStore.applyWorkingMemoryUpdate.bind(memoryStore);
+      const originalTransition = memoryStore.transitionThreadToResourceWorkingMemory.bind(memoryStore);
       const originalDeleteResource = memoryStore.deleteResource.bind(memoryStore);
       const operationOrder: string[] = [];
       let markUpdateStarted!: () => void;
@@ -4414,16 +4420,11 @@ describe('Memory', () => {
         releaseUpdate = resolve;
       });
 
-      vi.spyOn(memoryStore, 'saveThread').mockImplementation(async args => {
+      vi.spyOn(memoryStore, 'transitionThreadToResourceWorkingMemory').mockImplementation(async args => {
         markUpdateStarted();
         await updateBlocked;
-        const result = await originalSaveThread(args);
+        const result = await originalTransition(args);
         operationOrder.push('update-thread');
-        return result;
-      });
-      vi.spyOn(memoryStore, 'applyWorkingMemoryUpdate').mockImplementation(async args => {
-        const result = await originalApplyWorkingMemoryUpdate(args);
-        operationOrder.push('update-working-memory');
         return result;
       });
       const deleteSpy = vi.spyOn(memoryStore, 'deleteResource').mockImplementation(async args => {
@@ -4445,7 +4446,7 @@ describe('Memory', () => {
       releaseUpdate();
       await Promise.all([updatePromise, deletePromise]);
 
-      expect(operationOrder).toEqual(['update-thread', 'update-working-memory', 'delete']);
+      expect(operationOrder).toEqual(['update-thread', 'delete']);
       await expect(memoryStore.getResourceById({ resourceId })).resolves.toBeNull();
       const workingMemoryMutexes = Reflect.get(memory, 'updateWorkingMemoryMutexes') as Map<string, unknown>;
       expect(workingMemoryMutexes.size).toBe(0);
@@ -4471,7 +4472,7 @@ describe('Memory', () => {
       });
 
       const originalSaveThread = memoryStore.saveThread.bind(memoryStore);
-      const originalApplyWorkingMemoryUpdate = memoryStore.applyWorkingMemoryUpdate.bind(memoryStore);
+      const originalTransition = memoryStore.transitionThreadToResourceWorkingMemory.bind(memoryStore);
       const originalDeleteResource = memoryStore.deleteResource.bind(memoryStore);
       const operationOrder: string[] = [];
       let markBlockingSaveStarted!: () => void;
@@ -4489,12 +4490,12 @@ describe('Memory', () => {
           await blockingSaveBlocked;
         }
         const result = await originalSaveThread(args);
-        operationOrder.push(args.thread.title === 'Metadata update' ? 'update-thread' : 'blocking-save');
+        operationOrder.push('blocking-save');
         return result;
       });
-      vi.spyOn(memoryStore, 'applyWorkingMemoryUpdate').mockImplementation(async args => {
-        const result = await originalApplyWorkingMemoryUpdate(args);
-        operationOrder.push('update-working-memory');
+      vi.spyOn(memoryStore, 'transitionThreadToResourceWorkingMemory').mockImplementation(async args => {
+        const result = await originalTransition(args);
+        operationOrder.push('update-thread');
         return result;
       });
       const deleteSpy = vi.spyOn(memoryStore, 'deleteResource').mockImplementation(async args => {
@@ -4528,7 +4529,7 @@ describe('Memory', () => {
       releaseBlockingSave();
       await Promise.all([blockingSavePromise, updatePromise, deletePromise]);
 
-      expect(operationOrder).toEqual(['blocking-save', 'update-thread', 'update-working-memory', 'delete']);
+      expect(operationOrder).toEqual(['blocking-save', 'update-thread', 'delete']);
       await expect(memoryStore.getResourceById({ resourceId })).resolves.toBeNull();
       const workingMemoryMutexes = Reflect.get(memory, 'updateWorkingMemoryMutexes') as Map<string, unknown>;
       expect(workingMemoryMutexes.size).toBe(0);
@@ -4555,7 +4556,7 @@ describe('Memory', () => {
       });
 
       const originalSaveThread = memoryStore.saveThread.bind(memoryStore);
-      const originalApplyWorkingMemoryUpdate = memoryStore.applyWorkingMemoryUpdate.bind(memoryStore);
+      const originalTransition = memoryStore.transitionThreadToResourceWorkingMemory.bind(memoryStore);
       const operationOrder: string[] = [];
       let reassignCalls = 0;
       let markUpdateStarted!: () => void;
@@ -4567,20 +4568,19 @@ describe('Memory', () => {
         releaseUpdate = resolve;
       });
 
-      vi.spyOn(memoryStore, 'applyWorkingMemoryUpdate').mockImplementation(async args => {
-        const result = await originalApplyWorkingMemoryUpdate(args);
-        operationOrder.push('update-working-memory');
+      vi.spyOn(memoryStore, 'transitionThreadToResourceWorkingMemory').mockImplementation(async args => {
+        markUpdateStarted();
+        await updateBlocked;
+        const result = await originalTransition(args);
+        operationOrder.push('update-thread');
         return result;
       });
       vi.spyOn(memoryStore, 'saveThread').mockImplementation(async args => {
-        if (args.thread.title === 'Updated before reassignment') {
-          markUpdateStarted();
-          await updateBlocked;
-        } else if (args.thread.resourceId === reassignedResourceId) {
+        if (args.thread.resourceId === reassignedResourceId) {
           reassignCalls += 1;
         }
         const result = await originalSaveThread(args);
-        operationOrder.push(args.thread.title === 'Updated before reassignment' ? 'update-thread' : 'save-thread');
+        operationOrder.push('save-thread');
         return result;
       });
 
@@ -4606,7 +4606,7 @@ describe('Memory', () => {
       releaseUpdate();
       await Promise.all([updatePromise, reassignPromise]);
 
-      expect(operationOrder).toEqual(['update-thread', 'update-working-memory', 'save-thread']);
+      expect(operationOrder).toEqual(['update-thread', 'save-thread']);
       await expect(memoryStore.getResourceById({ resourceId: originalResourceId })).resolves.toEqual(
         expect.objectContaining({ workingMemory: 'private working memory' }),
       );

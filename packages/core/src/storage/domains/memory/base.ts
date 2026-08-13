@@ -33,6 +33,8 @@ import type {
   ApplyWorkingMemoryUpdateInput,
   WorkingMemorySnapshot,
   WorkingMemorySnapshotInput,
+  StorageTransitionThreadToResourceWorkingMemoryInput,
+  StorageTransitionThreadToResourceWorkingMemoryOutput,
 } from '../../types';
 import { StorageDomain } from '../base';
 
@@ -306,6 +308,21 @@ export abstract class MemoryStorage extends StorageDomain {
    */
   async applyWorkingMemoryUpdate(_args: ApplyWorkingMemoryUpdateInput): Promise<WorkingMemorySnapshot> {
     throw new Error(`Revisioned working memory is not implemented by this storage adapter (${this.constructor.name}).`);
+  }
+
+  /**
+   * Atomically replace a thread without governed Working Memory fields while
+   * writing that value to the thread's canonical resource snapshot.
+   *
+   * @internal Revision-capable adapters must implement this operation natively;
+   * generic saveThread/updateThread remain unable to remove governance fields.
+   */
+  async transitionThreadToResourceWorkingMemory(
+    _input: StorageTransitionThreadToResourceWorkingMemoryInput,
+  ): Promise<StorageTransitionThreadToResourceWorkingMemoryOutput> {
+    throw new Error(
+      `Atomic thread-to-resource working-memory transition is not implemented by this storage adapter (${this.constructor.name}).`,
+    );
   }
 
   /**

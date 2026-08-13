@@ -335,6 +335,18 @@ export function hasWorkingMemorySnapshotControls(metadata: Record<string, unknow
   return mastra !== undefined && Object.prototype.hasOwnProperty.call(mastra, CONTROL_METADATA_KEY);
 }
 
+/** Assert that a governed thread-to-resource transition cannot retain a duplicate snapshot. */
+export function assertThreadWorkingMemoryRemoved(metadata: Record<string, unknown> | undefined): void {
+  if (
+    Object.prototype.hasOwnProperty.call(metadata ?? {}, 'workingMemory') ||
+    hasWorkingMemorySnapshotControls(metadata)
+  ) {
+    throw new WorkingMemoryValidationError(
+      'Thread-to-resource working-memory transitions require sanitized thread metadata.',
+    );
+  }
+}
+
 function storedControlEquals(left: unknown, right: unknown): boolean {
   if (left === right) return true;
   if (left === null || right === null || typeof left !== 'object' || typeof right !== 'object') return false;
