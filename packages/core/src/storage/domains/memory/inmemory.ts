@@ -117,8 +117,11 @@ function preserveGovernedThreadMetadata(
   if (!hasWorkingMemorySnapshotControls(current)) return next;
 
   const preserved = preserveWorkingMemorySnapshotControls(current, next);
-  if (Object.prototype.hasOwnProperty.call(current, 'workingMemory')) preserved.workingMemory = current.workingMemory;
-  else delete preserved.workingMemory;
+  if (current !== undefined && Object.prototype.hasOwnProperty.call(current, 'workingMemory')) {
+    preserved.workingMemory = current.workingMemory;
+  } else {
+    delete preserved.workingMemory;
+  }
   return preserved;
 }
 
