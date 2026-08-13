@@ -955,17 +955,22 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
         }) as Promise<InngestAgentStreamResult<TOutput>>;
       }
 
-      // Inngest can move the next operation to another worker, so reject the
-      // live-only recovery capability before preparation or dispatch.
+      // Inngest can move the next operation to another worker. Resolve the
+      // effective defaults before preparation so a configured recovery budget
+      // is rejected before memory, processors, spans, or dispatch side effects.
+      const requestContext = streamOptions?.requestContext ?? new RequestContext();
+      const defaultOptions = await agent.getDefaultOptions({ requestContext });
       assertInngestResponseRecoveryDisabled(streamOptions);
+      assertInngestResponseRecoveryDisabled(defaultOptions);
 
       // 1. Prepare for durable execution
       const preparation = await prepareForDurableExecution<TOutput>({
         agent: agent as Agent<string, any, TOutput>,
         messages,
         options: streamOptions as AgentExecutionOptions<TOutput>,
+        resolvedDefaultOptions: defaultOptions as AgentExecutionOptions<TOutput>,
+        requestContext,
         runId: streamOptions?.runId,
-        requestContext: streamOptions?.requestContext,
         methodType: (streamOptions as any)?.__methodType ?? 'stream',
         durableRequestContextKeys,
       });
@@ -1445,12 +1450,16 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
     },
 
     async prepare(messages, prepareOptions) {
+      const requestContext = prepareOptions?.requestContext ?? new RequestContext();
+      const defaultOptions = await agent.getDefaultOptions({ requestContext });
       assertInngestResponseRecoveryDisabled(prepareOptions);
+      assertInngestResponseRecoveryDisabled(defaultOptions);
       const preparation = await prepareForDurableExecution<TOutput>({
         agent: agent as Agent<string, any, TOutput>,
         messages,
         options: prepareOptions,
-        requestContext: prepareOptions?.requestContext,
+        resolvedDefaultOptions: defaultOptions as AgentExecutionOptions<TOutput>,
+        requestContext,
         durableRequestContextKeys,
       });
 

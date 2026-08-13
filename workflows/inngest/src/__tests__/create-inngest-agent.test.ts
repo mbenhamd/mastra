@@ -783,6 +783,27 @@ describe('InngestAgent parity surface', () => {
     }
   });
 
+  it('rejects default response-only recovery before preparation side effects', async () => {
+    const createThread = vi.fn();
+    const agent = new Agent({
+      id: 'default-response-recovery',
+      name: 'default-response-recovery',
+      instructions: 'Test',
+      model: createMockModel() as any,
+      defaultOptions: { recoveryMaxSteps: 1 },
+    });
+    vi.spyOn(agent, 'getMemory').mockResolvedValue({ createThread } as any);
+    const durableAgent = createInngestAgent({ agent, inngest });
+
+    await expect(
+      durableAgent.prepare([{ role: 'user', content: 'hi' }], {
+        memory: { thread: 'thread-1', resource: 'resource-1' },
+      } as any),
+    ).rejects.toThrow('Inngest durable agents do not support response-only recovery; recoveryMaxSteps must be 0');
+
+    expect(createThread).not.toHaveBeenCalled();
+  });
+
   it('exposes result.abort and flips the registry abortSignal', async () => {
     // Slice 2: stream() must own an AbortController, expose it via
     // result.abort, and surface its signal on the run-registry entry so the

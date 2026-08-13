@@ -1526,7 +1526,7 @@ export class MessageList {
   private static isSuppressedFeedbackMessage(message: MastraDBMessage): boolean {
     const completionResult = message.content?.metadata?.completionResult as
       { passed?: boolean; suppressFeedback?: boolean } | undefined;
-    return completionResult?.suppressFeedback === true || completionResult?.passed === false;
+    return completionResult?.suppressFeedback === true;
   }
 
   /**

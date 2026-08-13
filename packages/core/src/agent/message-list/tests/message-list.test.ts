@@ -4385,6 +4385,40 @@ describe('MessageList', () => {
       expect(uiMessages[0].content).toBe('Assistant response');
     });
 
+    it('keeps failed completion feedback visible unless suppression is explicit', () => {
+      const visible = new MessageList();
+      visible.add(
+        {
+          role: 'assistant',
+          content: {
+            format: 2,
+            parts: [{ type: 'text', text: 'Try again with more evidence.' }],
+            metadata: { completionResult: { passed: false, suppressFeedback: false } },
+          },
+        } as any,
+        'response',
+      );
+      expect(visible.getFinalAssistantTurnText()).toBe('Try again with more evidence.');
+      expect(visible.getCallerVisibleResponseContent()).toEqual([
+        expect.objectContaining({ type: 'text', text: 'Try again with more evidence.' }),
+      ]);
+
+      const suppressed = new MessageList();
+      suppressed.add(
+        {
+          role: 'assistant',
+          content: {
+            format: 2,
+            parts: [{ type: 'text', text: 'Framework-only feedback.' }],
+            metadata: { completionResult: { passed: false, suppressFeedback: true } },
+          },
+        } as any,
+        'response',
+      );
+      expect(suppressed.getFinalAssistantTurnText()).toBe('');
+      expect(suppressed.getCallerVisibleResponseContent()).toEqual([]);
+    });
+
     it('should handle MastraDBMessage with empty parts array', () => {
       const messageWithEmptyParts: MastraDBMessage = {
         id: 'test-id-3',

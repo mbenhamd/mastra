@@ -44,7 +44,9 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
   const accumulatedSteps: StepResult<Tools>[] = [];
   // Track previous content to determine what's new in each step
   let previousContentLength = 0;
-  let previousCallerVisibleContentLength = 0;
+  let previousCallerVisibleContentLength = rest.resumeContext
+    ? messageList.getCallerVisibleResponseContent().length
+    : 0;
   // When continue:false + feedback, allow one more LLM turn then stop
   let pendingFeedbackStop = false;
   let responseRecoveryReserved = false;
@@ -196,7 +198,11 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
             .filter(part => part.type === 'text')
             .map(part => part.text)
             .join('');
-      const currentIterationText = typedInputData.stepResult?.reason === 'tripwire' ? '' : projectedStepText;
+      const stepWasRejected =
+        typedInputData.stepResult?.reason === 'tripwire' ||
+        typedInputData.stepResult?.reason === 'retry' ||
+        (latestCompletedStep as { tripwire?: unknown } | undefined)?.tripwire !== undefined;
+      const currentIterationText = stepWasRejected ? '' : projectedStepText;
 
       const currentStep: StepResult<Tools> = {
         content: currentContent,
