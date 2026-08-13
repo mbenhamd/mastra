@@ -13,6 +13,9 @@ import type {
   StorageListThreadsOutput,
   StorageCloneThreadInput,
   StorageCloneThreadOutput,
+  StorageRollbackThreadCloneInput,
+  StorageRollbackThreadCloneResult,
+  StorageObservationalMemoryCloneReceipt,
   ThreadCloneMetadata,
   ObservationalMemoryRecord,
   ObservationalMemoryHistoryOptions,
@@ -199,6 +202,7 @@ export class InMemoryMemory extends MemoryStorage {
   readonly supportsAtomicObservationalMemoryRetraction = true;
   readonly supportsRevisionedWorkingMemory = true;
   readonly supportsThreadUpdatedBeforeFilter = true;
+  readonly supportsAtomicThreadCloneRollback = true;
   private db: InMemoryDB;
 
   constructor({ db }: { db: InMemoryDB }) {
@@ -213,6 +217,8 @@ export class InMemoryMemory extends MemoryStorage {
     const messages = new Map([...this.db.messages].map(([key, value]) => [key, { ...value }]));
     const resources = new Map([...this.db.resources].map(([key, value]) => [key, cloneResourceBoundary(value, true)]));
     const observationalMemory = new Map([...this.db.observationalMemory].map(([key, value]) => [key, [...value]]));
+    const threadGenerations = new Map(this.db.memoryThreadGenerations);
+    const observationalGenerations = new Map(this.db.memoryObservationalGenerations);
     const restore = <K, V>(target: Map<K, V>, snapshot: Map<K, V>) => {
       target.clear();
       for (const [key, value] of snapshot) target.set(key, value);
@@ -225,6 +231,8 @@ export class InMemoryMemory extends MemoryStorage {
       restore(this.db.messages, messages);
       restore(this.db.resources, resources);
       restore(this.db.observationalMemory, observationalMemory);
+      restore(this.db.memoryThreadGenerations, threadGenerations);
+      restore(this.db.memoryObservationalGenerations, observationalGenerations);
       throw error;
     }
   }
@@ -234,6 +242,24 @@ export class InMemoryMemory extends MemoryStorage {
     this.db.messages.clear();
     this.db.resources.clear();
     this.db.observationalMemory.clear();
+    this.db.memoryThreadGenerations.clear();
+    this.db.memoryObservationalGenerations.clear();
+  }
+
+  private rotateThreadGeneration(threadId: string): string {
+    const generation = crypto.randomUUID();
+    this.db.memoryThreadGenerations.set(threadId, generation);
+    return generation;
+  }
+
+  private rotateObservationalMemoryGeneration(recordId: string): string {
+    const generation = crypto.randomUUID();
+    this.db.memoryObservationalGenerations.set(recordId, generation);
+    return generation;
+  }
+
+  private forgetObservationalMemoryGenerations(records: readonly ObservationalMemoryRecord[]): void {
+    for (const record of records) this.db.memoryObservationalGenerations.delete(record.id);
   }
 
   async getThreadById({
@@ -253,6 +279,7 @@ export class InMemoryMemory extends MemoryStorage {
     const metadata = replaceThreadMetadataPreservingWorkingMemory(current?.metadata, thread.metadata);
     const stored = cloneThreadBoundary({ ...thread, metadata }, true);
     this.db.threads.set(thread.id, stored);
+    this.rotateThreadGeneration(thread.id);
     return cloneThreadBoundary(stored);
   }
 
@@ -283,6 +310,7 @@ export class InMemoryMemory extends MemoryStorage {
       true,
     );
     this.db.threads.set(id, updated);
+    this.rotateThreadGeneration(id);
     return cloneThreadBoundary(updated);
   }
 
@@ -298,6 +326,7 @@ export class InMemoryMemory extends MemoryStorage {
 
     this.withMemoryStateRollback(true, () => {
       this.db.threads.delete(threadId);
+      this.db.memoryThreadGenerations.delete(threadId);
 
       this.db.messages.forEach((msg, key) => {
         if (msg.thread_id === threadId) {
@@ -637,6 +666,7 @@ export class InMemoryMemory extends MemoryStorage {
       const thread = this.db.threads.get(threadId);
       if (thread) {
         thread.updatedAt = new Date();
+        this.rotateThreadGeneration(threadId);
       }
     }
 
@@ -736,6 +766,7 @@ export class InMemoryMemory extends MemoryStorage {
             const prev = new Date(oldThread.updatedAt).getTime();
             oldThreadNewTime = Math.max(base, prev + 1);
             oldThread.updatedAt = new Date(oldThreadNewTime);
+            this.rotateThreadGeneration(oldThreadId);
           }
           const newThread = this.db.threads.get(newThreadId);
           if (newThread) {
@@ -745,6 +776,7 @@ export class InMemoryMemory extends MemoryStorage {
               newThreadNewTime = oldThreadNewTime + 1;
             }
             newThread.updatedAt = new Date(newThreadNewTime);
+            this.rotateThreadGeneration(newThreadId);
           }
         } else {
           // Only update the thread's updatedAt if not a move
@@ -754,6 +786,7 @@ export class InMemoryMemory extends MemoryStorage {
             let newTime = Date.now();
             if (newTime <= prev) newTime = prev + 1;
             thread.updatedAt = new Date(newTime);
+            this.rotateThreadGeneration(oldThreadId);
           }
         }
         // Save the updated message
@@ -831,6 +864,7 @@ export class InMemoryMemory extends MemoryStorage {
         const thread = this.db.threads.get(threadId);
         if (thread) {
           thread.updatedAt = now;
+          this.rotateThreadGeneration(threadId);
         }
       }
 
@@ -1100,6 +1134,7 @@ export class InMemoryMemory extends MemoryStorage {
       if (next.value === null) delete metadata.workingMemory;
       else metadata.workingMemory = next.value;
       this.db.threads.set(input.threadId, cloneThreadBoundary({ ...thread, metadata, updatedAt: now }, true));
+      this.rotateThreadGeneration(input.threadId);
       return next;
     });
   }
@@ -1120,6 +1155,7 @@ export class InMemoryMemory extends MemoryStorage {
     // memory record (thread-scoped records stay with their threads, which
     // deleteResource deliberately preserves).
     this.db.observationalMemory.delete(resourceObservationalMemoryKey);
+    for (const recordId of erasedRecordIds) this.db.memoryObservationalGenerations.delete(recordId);
     observationalMemoryRecordIds?.push(...erasedRecordIds);
   }
 
@@ -1229,11 +1265,87 @@ export class InMemoryMemory extends MemoryStorage {
       });
     }
 
+    const clonedMessageIds = clonedMessages.map(message => message.id);
     return {
       thread: newThread,
       clonedMessages,
       messageIdMap,
+      rollbackReceipt: {
+        threadId: newThreadId,
+        storageGeneration: this.rotateThreadGeneration(newThreadId),
+        clonedMessageIds,
+      },
     };
+  }
+
+  async rollbackThreadClone(input: StorageRollbackThreadCloneInput): Promise<StorageRollbackThreadCloneResult> {
+    return this.withMemoryStateRollback(true, () => {
+      const { thread: receipt, observationalMemory, unverifiedObservationalMemoryRecordId } = input;
+      if (
+        !this.db.threads.has(receipt.threadId) ||
+        this.db.memoryThreadGenerations.get(receipt.threadId) !== receipt.storageGeneration
+      ) {
+        return { status: 'conflict', reason: 'thread' };
+      }
+
+      const expectedMessageIds = [...receipt.clonedMessageIds].sort();
+      const currentMessageIds = [...this.db.messages.values()]
+        .filter(message => message.thread_id === receipt.threadId)
+        .map(message => message.id)
+        .sort();
+      if (
+        expectedMessageIds.length !== currentMessageIds.length ||
+        expectedMessageIds.some((messageId, index) => messageId !== currentMessageIds[index])
+      ) {
+        return { status: 'conflict', reason: 'messages' };
+      }
+
+      if (unverifiedObservationalMemoryRecordId && !observationalMemory) {
+        if (this.findObservationalMemoryRecordById(unverifiedObservationalMemoryRecordId)) {
+          return { status: 'conflict', reason: 'observational_memory' };
+        }
+      }
+
+      if (observationalMemory) {
+        if (
+          unverifiedObservationalMemoryRecordId &&
+          observationalMemory.recordId !== unverifiedObservationalMemoryRecordId
+        ) {
+          return { status: 'conflict', reason: 'observational_memory' };
+        }
+        const key = this.getObservationalMemoryKey(observationalMemory.threadId, observationalMemory.resourceId);
+        const currentRecords = this.db.observationalMemory.get(key) ?? [];
+        const expectedRecordIds = [...observationalMemory.priorRecordIds, observationalMemory.recordId].sort();
+        const currentRecordIds = currentRecords.map(record => record.id).sort();
+        if (
+          expectedRecordIds.length !== currentRecordIds.length ||
+          expectedRecordIds.some((recordId, index) => recordId !== currentRecordIds[index]) ||
+          this.db.memoryObservationalGenerations.get(observationalMemory.recordId) !==
+            observationalMemory.storageGeneration
+        ) {
+          return { status: 'conflict', reason: 'observational_memory' };
+        }
+      } else {
+        const threadRecords = this.db.observationalMemory.get(
+          this.getObservationalMemoryKey(receipt.threadId, this.db.threads.get(receipt.threadId)!.resourceId),
+        );
+        if (threadRecords?.length) return { status: 'conflict', reason: 'observational_memory' };
+      }
+
+      if (observationalMemory) {
+        const key = this.getObservationalMemoryKey(observationalMemory.threadId, observationalMemory.resourceId);
+        const remaining = (this.db.observationalMemory.get(key) ?? []).filter(
+          record => record.id !== observationalMemory.recordId,
+        );
+        if (remaining.length > 0) this.db.observationalMemory.set(key, remaining);
+        else this.db.observationalMemory.delete(key);
+        this.db.memoryObservationalGenerations.delete(observationalMemory.recordId);
+      }
+      for (const messageId of expectedMessageIds) this.db.messages.delete(messageId);
+      this.db.threads.delete(receipt.threadId);
+      this.db.memoryThreadGenerations.delete(receipt.threadId);
+      return { status: 'rolled_back' };
+    });
   }
 
   private sortThreads(threads: any[], field: ThreadOrderBy, direction: ThreadSortDirection): any[] {
@@ -1340,13 +1452,17 @@ export class InMemoryMemory extends MemoryStorage {
     // Add as first record (most recent)
     const existing = this.db.observationalMemory.get(key) ?? [];
     this.db.observationalMemory.set(key, [record, ...existing]);
+    this.rotateObservationalMemoryGeneration(record.id);
 
     return record;
   }
 
-  async insertObservationalMemoryRecord(record: ObservationalMemoryRecord): Promise<void> {
+  async insertObservationalMemoryRecord(
+    record: ObservationalMemoryRecord,
+  ): Promise<StorageObservationalMemoryCloneReceipt> {
     const key = this.getObservationalMemoryKey(record.threadId, record.resourceId);
     const existing = this.db.observationalMemory.get(key) ?? [];
+    const priorRecordIds = existing.map(existingRecord => existingRecord.id);
     // Insert in order by generationCount descending (newest first)
     let inserted = false;
     for (let i = 0; i < existing.length; i++) {
@@ -1358,6 +1474,13 @@ export class InMemoryMemory extends MemoryStorage {
     }
     if (!inserted) existing.push(record);
     this.db.observationalMemory.set(key, existing);
+    return {
+      recordId: record.id,
+      threadId: record.threadId,
+      resourceId: record.resourceId,
+      storageGeneration: this.rotateObservationalMemoryGeneration(record.id),
+      priorRecordIds,
+    };
   }
 
   async updateActiveObservations(input: UpdateActiveObservationsInput): Promise<void> {
@@ -1381,6 +1504,7 @@ export class InMemoryMemory extends MemoryStorage {
     if (observedMessageIds) {
       record.observedMessageIds = observedMessageIds;
     }
+    this.rotateObservationalMemoryGeneration(record.id);
   }
 
   async updateBufferedObservations(input: UpdateBufferedObservationsInput): Promise<void> {
@@ -1416,6 +1540,7 @@ export class InMemoryMemory extends MemoryStorage {
     }
 
     record.updatedAt = new Date();
+    this.rotateObservationalMemoryGeneration(record.id);
   }
 
   async swapBufferedToActive(input: SwapBufferedToActiveInput): Promise<SwapBufferedToActiveResult> {
@@ -1545,6 +1670,7 @@ export class InMemoryMemory extends MemoryStorage {
     // Update timestamps
     record.lastObservedAt = derivedLastObservedAt;
     record.updatedAt = new Date();
+    this.rotateObservationalMemoryGeneration(record.id);
 
     // Use hints from the most recent activated chunk only — stale hints from older chunks are discarded
     const latestChunkHints = activatedChunks[activatedChunks.length - 1];
@@ -1608,6 +1734,7 @@ export class InMemoryMemory extends MemoryStorage {
     // Add as first record (most recent)
     const existing = this.db.observationalMemory.get(key) ?? [];
     this.db.observationalMemory.set(key, [newRecord, ...existing]);
+    this.rotateObservationalMemoryGeneration(newRecord.id);
 
     return newRecord;
   }
@@ -1625,6 +1752,7 @@ export class InMemoryMemory extends MemoryStorage {
     record.bufferedReflectionInputTokens = (record.bufferedReflectionInputTokens || 0) + inputTokenCount;
     record.reflectedObservationLineCount = reflectedObservationLineCount;
     record.updatedAt = new Date();
+    this.rotateObservationalMemoryGeneration(record.id);
   }
 
   async swapBufferedReflectionToActive(input: SwapBufferedReflectionToActiveInput): Promise<ObservationalMemoryRecord> {
@@ -1665,6 +1793,7 @@ export class InMemoryMemory extends MemoryStorage {
     record.bufferedReflectionTokens = undefined;
     record.bufferedReflectionInputTokens = undefined;
     record.reflectedObservationLineCount = undefined;
+    this.rotateObservationalMemoryGeneration(record.id);
 
     return newRecord;
   }
@@ -1677,6 +1806,7 @@ export class InMemoryMemory extends MemoryStorage {
 
     record.isReflecting = isReflecting;
     record.updatedAt = new Date();
+    this.rotateObservationalMemoryGeneration(record.id);
   }
 
   async setObservingFlag(id: string, isObserving: boolean): Promise<void> {
@@ -1687,6 +1817,7 @@ export class InMemoryMemory extends MemoryStorage {
 
     record.isObserving = isObserving;
     record.updatedAt = new Date();
+    this.rotateObservationalMemoryGeneration(record.id);
   }
 
   async setBufferingObservationFlag(id: string, isBuffering: boolean, lastBufferedAtTokens?: number): Promise<void> {
@@ -1700,6 +1831,7 @@ export class InMemoryMemory extends MemoryStorage {
       record.lastBufferedAtTokens = lastBufferedAtTokens;
     }
     record.updatedAt = new Date();
+    this.rotateObservationalMemoryGeneration(record.id);
   }
 
   async setBufferingReflectionFlag(id: string, isBuffering: boolean): Promise<void> {
@@ -1710,10 +1842,12 @@ export class InMemoryMemory extends MemoryStorage {
 
     record.isBufferingReflection = isBuffering;
     record.updatedAt = new Date();
+    this.rotateObservationalMemoryGeneration(record.id);
   }
 
   async clearObservationalMemory(threadId: string | null, resourceId: string): Promise<void> {
     const key = this.getObservationalMemoryKey(threadId, resourceId);
+    this.forgetObservationalMemoryGenerations(this.db.observationalMemory.get(key) ?? []);
     this.db.observationalMemory.delete(key);
   }
 
@@ -1725,6 +1859,8 @@ export class InMemoryMemory extends MemoryStorage {
     const clearedScopes: Array<'resource' | 'thread'> = [];
     if (resourceRecords.length > 0) clearedScopes.push('resource');
     if (threadRecords.length > 0) clearedScopes.push('thread');
+    this.forgetObservationalMemoryGenerations(resourceRecords);
+    this.forgetObservationalMemoryGenerations(threadRecords);
     this.db.observationalMemory.delete(resourceKey);
     this.db.observationalMemory.delete(threadKey);
 
@@ -1791,6 +1927,7 @@ export class InMemoryMemory extends MemoryStorage {
         metadata,
         updatedAt: new Date(),
       });
+      this.rotateThreadGeneration(thread.id);
     }
 
     return {
@@ -1812,6 +1949,7 @@ export class InMemoryMemory extends MemoryStorage {
 
     record.pendingMessageTokens = tokenCount;
     record.updatedAt = new Date();
+    this.rotateObservationalMemoryGeneration(record.id);
   }
 
   async updateObservationalMemoryConfig(input: UpdateObservationalMemoryConfigInput): Promise<void> {
@@ -1822,6 +1960,7 @@ export class InMemoryMemory extends MemoryStorage {
 
     record.config = this.deepMergeConfig(record.config as Record<string, unknown>, input.config);
     record.updatedAt = new Date();
+    this.rotateObservationalMemoryGeneration(record.id);
   }
 
   /**

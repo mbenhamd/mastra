@@ -472,6 +472,48 @@ describe('cloneThread – Observational Memory', () => {
       expect(clonedOM!.bufferedObservationChunks![0]!.observations).toContain(`<thread id="${clonedObscured}">`);
       expect(clonedOM!.bufferedObservationChunks![0]!.observations).not.toContain(`<thread id="${sourceObscured}">`);
     });
+
+    it('rolls back only cloned artifacts after WM failure and preserves pre-existing target OM', async () => {
+      memory = new Memory({
+        storage: new InMemoryStore(),
+        options: { workingMemory: { enabled: true, scope: 'thread', maxDataBytes: 5 } },
+      });
+      await seedThread('src-thread-failed-cross-resource-clone', 1);
+      const memoryStore = await getMemoryStore(memory);
+      Object.defineProperty(memoryStore, 'supportsAtomicObservationalMemoryRetraction', { value: false });
+
+      await seedResourceScopedOM(memoryStore, {
+        activeObservations: '* Source resource observation',
+        observedMessageIds: ['msg-src-thread-failed-cross-resource-clone-0'],
+      });
+      const targetResourceId = 'target-resource-with-existing-om';
+      const targetRecord = await memoryStore.initializeObservationalMemory({
+        threadId: null,
+        resourceId: targetResourceId,
+        scope: 'resource',
+        config: {},
+      });
+      targetRecord.activeObservations = '* Pre-existing target observation';
+      await memory.updateWorkingMemoryByOwner({
+        threadId: 'src-thread-failed-cross-resource-clone',
+        resourceId,
+        workingMemory: 'long value',
+        expectedRevision: 0,
+        memoryConfig: { workingMemory: { enabled: true, scope: 'thread', maxDataBytes: 100 } },
+      });
+      const newThreadId = 'failed-cross-resource-clone';
+
+      await expect(
+        memory.cloneThread({
+          sourceThreadId: 'src-thread-failed-cross-resource-clone',
+          newThreadId,
+          resourceId: targetResourceId,
+        }),
+      ).rejects.toThrow('UTF-8 byte limit');
+
+      await expect(memoryStore.getThreadById({ threadId: newThreadId })).resolves.toBeNull();
+      await expect(memoryStore.getObservationalMemoryHistory(null, targetResourceId)).resolves.toEqual([targetRecord]);
+    });
   });
 
   describe('controller dynamic memory factory', () => {

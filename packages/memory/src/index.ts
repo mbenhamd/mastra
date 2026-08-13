@@ -35,6 +35,7 @@ import type {
   MemoryStorage,
   StorageCloneThreadInput,
   StorageCloneThreadOutput,
+  StorageObservationalMemoryCloneReceipt,
   ThreadCloneMetadata,
   ObservationalMemoryRecord,
   ObservationalMemoryRetractionReceipt,
@@ -3513,12 +3514,16 @@ Notes:
     const sourceThread = await this.getThreadById({ threadId: args.sourceThreadId });
     const sourceResourceId = sourceThread?.resourceId;
     const result = await memoryStore.cloneThread(args);
+    const rollbackState: {
+      observationalMemory?: StorageObservationalMemoryCloneReceipt;
+      unverifiedObservationalMemoryRecordId?: string;
+    } = {};
 
     try {
       // Clone OM before Working Memory so a failed WM write can roll the cloned
       // thread and its remapped OM back without leaving a partially copied WM.
       if (memoryStore.supportsObservationalMemory && sourceResourceId) {
-        await this.cloneObservationalMemory(memoryStore, args.sourceThreadId, sourceResourceId, result);
+        await this.cloneObservationalMemory(memoryStore, args.sourceThreadId, sourceResourceId, result, rollbackState);
       }
 
       // Copy Working Memory from the source thread to the clone. A governed
@@ -3568,10 +3573,27 @@ Notes:
         }
       }
     } catch (error) {
-      try {
-        await memoryStore.deleteThread({ threadId: result.thread.id });
-      } catch (rollbackError) {
-        this.logger.error('Failed to rollback cloned thread after post-clone failure', rollbackError);
+      if (memoryStore.supportsAtomicThreadCloneRollback && result.rollbackReceipt) {
+        try {
+          const rollback = await memoryStore.rollbackThreadClone({
+            thread: result.rollbackReceipt,
+            ...(rollbackState.observationalMemory ? { observationalMemory: rollbackState.observationalMemory } : {}),
+            ...(rollbackState.unverifiedObservationalMemoryRecordId
+              ? { unverifiedObservationalMemoryRecordId: rollbackState.unverifiedObservationalMemoryRecordId }
+              : {}),
+          });
+          if (rollback.status === 'conflict') {
+            this.logger.error(
+              `Preserved failed thread clone because rollback found concurrent ${rollback.reason} state.`,
+            );
+          }
+        } catch (rollbackError) {
+          this.logger.error('Failed to conditionally rollback cloned thread after post-clone failure', rollbackError);
+        }
+      } else {
+        this.logger.error(
+          'Preserved failed thread clone because its storage adapter did not issue an atomic rollback receipt.',
+        );
       }
       throw error;
     }
@@ -3595,6 +3617,10 @@ Notes:
     sourceThreadId: string,
     sourceResourceId: string,
     result: StorageCloneThreadOutput,
+    rollbackState: {
+      observationalMemory?: StorageObservationalMemoryCloneReceipt;
+      unverifiedObservationalMemoryRecordId?: string;
+    },
   ): Promise<void> {
     // Look up OM for thread-scoped first (threadId + resourceId), then resource-scoped (null + resourceId)
     let sourceOM = await memoryStore.getObservationalMemory(sourceThreadId, sourceResourceId);
@@ -3626,7 +3652,9 @@ Notes:
     cloned.id = crypto.randomUUID();
     cloned.createdAt = now;
     cloned.updatedAt = now;
-    await memoryStore.insertObservationalMemoryRecord(cloned);
+    rollbackState.unverifiedObservationalMemoryRecordId = cloned.id;
+    const receipt = await memoryStore.insertObservationalMemoryRecord(cloned);
+    if (receipt) rollbackState.observationalMemory = receipt;
   }
 
   /**

@@ -11,15 +11,20 @@ class RecordingTxClient implements TxClient {
   sourceMessages: Record<string, any>[] = [];
 
   async none(query: string, values?: QueryValues): Promise<null> {
+    if (query.includes('pg_advisory_xact_lock')) return null;
     this.queries.push({ query, values });
     return null;
   }
 
-  async one<T = any>(): Promise<T> {
+  async one<T = any>(query: string): Promise<T> {
+    if (query.includes('xmin::text')) return { storageGeneration: 'clone-generation' } as T;
     throw new Error('not implemented');
   }
 
-  async oneOrNone<T = any>(): Promise<T | null> {
+  async oneOrNone<T = any>(query: string, values?: QueryValues): Promise<T | null> {
+    if (query.includes('SELECT id FROM') && query.includes('FOR UPDATE')) {
+      return { id: String(values?.[0]) } as T;
+    }
     throw new Error('not implemented');
   }
 

@@ -225,6 +225,10 @@ export class InMemoryDB {
   readonly favorites = new Map<string, StorageFavoriteType>();
   /** Observational memory records, keyed by resourceId, each holding array of records (generations) */
   readonly observationalMemory = new Map<string, ObservationalMemoryRecord[]>();
+  /** Storage-private generations used by conditional thread-clone rollback. */
+  readonly memoryThreadGenerations = new Map<string, string>();
+  /** Storage-private generations used by conditional cloned-OM rollback. */
+  readonly memoryObservationalGenerations = new Map<string, string>();
 
   // Dataset domain maps
   readonly datasets = new Map<string, DatasetRecord>();

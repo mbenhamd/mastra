@@ -808,7 +808,46 @@ export type StorageCloneThreadOutput = {
   clonedMessages: MastraDBMessage[];
   /** Map from source message IDs to cloned message IDs (used for OM remapping) */
   messageIdMap?: Record<string, string>;
+  /**
+   * Storage-issued ownership proof for conditional post-clone rollback.
+   *
+   * @internal The token is opaque outside the adapter that issued it.
+   */
+  rollbackReceipt?: StorageThreadCloneRollbackReceipt;
 };
+
+/** @internal Storage-owned proof identifying one physical cloned-thread generation. */
+export type StorageThreadCloneRollbackReceipt = {
+  threadId: string;
+  storageGeneration: string;
+  clonedMessageIds: string[];
+};
+
+/** @internal Storage-owned proof identifying one exact cloned OM insertion. */
+export type StorageObservationalMemoryCloneReceipt = {
+  recordId: string;
+  threadId: string | null;
+  resourceId: string;
+  storageGeneration: string;
+  /** Records that occupied the same OM coordinate immediately before insertion. */
+  priorRecordIds: string[];
+};
+
+/** @internal Conditional cleanup input for a failed post-clone copy. */
+export type StorageRollbackThreadCloneInput = {
+  thread: StorageThreadCloneRollbackReceipt;
+  observationalMemory?: StorageObservationalMemoryCloneReceipt;
+  /**
+   * The prepared OM record id when its insertion result was not observed.
+   * Adapters must refuse rollback if this id exists without a matching receipt.
+   */
+  unverifiedObservationalMemoryRecordId?: string;
+};
+
+/** @internal A conflict preserves every artifact rather than risking another writer's state. */
+export type StorageRollbackThreadCloneResult =
+  | { status: 'rolled_back' }
+  | { status: 'conflict'; reason: 'thread' | 'messages' | 'observational_memory' };
 
 export type StorageResourceType = {
   id: string;

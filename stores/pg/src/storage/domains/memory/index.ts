@@ -61,6 +61,13 @@ class ObservationalMemoryGenerationConflictError extends Error {
   }
 }
 
+class ThreadCloneRollbackConflictError extends Error {
+  constructor(readonly reason: 'thread' | 'messages' | 'observational_memory') {
+    super(`Thread clone rollback conflict: ${reason}`);
+    this.name = 'ThreadCloneRollbackConflictError';
+  }
+}
+
 /**
  * Columns added to the OM table after its initial release.
  * Used in `alterTable({ ifNotExists })` so that databases created on older
@@ -107,6 +114,9 @@ import type {
   CreateIndexOptions,
   StorageCloneThreadInput,
   StorageCloneThreadOutput,
+  StorageRollbackThreadCloneInput,
+  StorageRollbackThreadCloneResult,
+  StorageObservationalMemoryCloneReceipt,
   ThreadCloneMetadata,
   ObservationalMemoryRecord,
   ObservationalMemoryHistoryOptions,
@@ -296,11 +306,21 @@ function dedupeMessagesForSave(messages: MastraDBMessage[]): MastraDBMessage[] {
   return Array.from(deduped.values());
 }
 
+function hasSameUniqueStrings(left: readonly string[], right: readonly string[]): boolean {
+  if (left.length !== right.length || new Set(left).size !== left.length || new Set(right).size !== right.length) {
+    return false;
+  }
+  const sortedLeft = [...left].sort();
+  const sortedRight = [...right].sort();
+  return sortedLeft.every((value, index) => value === sortedRight[index]);
+}
+
 export class MemoryPG extends MemoryStorage {
   readonly supportsObservationalMemory = true;
   readonly supportsAtomicObservationalMemoryRetraction = true;
   readonly supportsRevisionedWorkingMemory = true;
   readonly supportsThreadUpdatedBeforeFilter = true;
+  readonly supportsAtomicThreadCloneRollback = true;
 
   /**
    * Retention-eligible tables. `threads`, `messages`, and `resources` all anchor
@@ -1821,7 +1841,18 @@ export class MemoryPG extends MemoryStorage {
       }
 
       const messagesToSave = dedupeMessagesForSave(messages);
+      const threadTableName = getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) });
       await this.#db.client.tx(async t => {
+        for (const threadIdToCheck of [...threadIds].sort()) {
+          await this.lockThreadCloneLifecycle(t, threadIdToCheck);
+          const thread = await t.oneOrNone<{ id: string }>(
+            `SELECT id FROM ${threadTableName} WHERE id = $1 FOR UPDATE`,
+            [threadIdToCheck],
+          );
+          if (!thread) {
+            throw new Error(`Thread ${threadIdToCheck} no longer exists.`);
+          }
+        }
         for (let offset = 0; offset < messagesToSave.length; offset += MAX_MESSAGES_PER_INSERT) {
           const batch = messagesToSave.slice(offset, offset + MAX_MESSAGES_PER_INSERT);
           const values: unknown[] = [];
@@ -1860,7 +1891,6 @@ export class MemoryPG extends MemoryStorage {
           );
         }
 
-        const threadTableName = getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) });
         const now = toUtcISOString(new Date());
         for (const threadIdToUpdate of threadIds) {
           await t.none(
@@ -2632,6 +2662,7 @@ export class MemoryPG extends MemoryStorage {
 
     try {
       return await this.#db.client.tx(async t => {
+        await this.lockThreadCloneLifecycle(t, newThreadId);
         // Build message query with filters
         let messageQuery = `SELECT id, content, role, type, "createdAt", "createdAtZ", thread_id AS "threadId", "resourceId"
                             FROM ${messageTableName} WHERE thread_id = $1`;
@@ -2759,10 +2790,19 @@ export class MemoryPG extends MemoryStorage {
           });
         }
 
+        const generation = await t.one<{ storageGeneration: string }>(
+          `SELECT xmin::text AS "storageGeneration" FROM ${threadTableName} WHERE id = $1`,
+          [newThreadId],
+        );
         return {
           thread: newThread,
           clonedMessages,
           messageIdMap,
+          rollbackReceipt: {
+            threadId: newThreadId,
+            storageGeneration: generation.storageGeneration,
+            clonedMessageIds: clonedMessages.map(message => message.id),
+          },
         };
       });
     } catch (error) {
@@ -2781,12 +2821,120 @@ export class MemoryPG extends MemoryStorage {
     }
   }
 
+  async rollbackThreadClone(input: StorageRollbackThreadCloneInput): Promise<StorageRollbackThreadCloneResult> {
+    const threadTableName = getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) });
+    const messageTableName = getTableName({ indexName: TABLE_MESSAGES, schemaName: getSchemaName(this.#schema) });
+    const omTableName = getTableName({ indexName: OM_TABLE, schemaName: getSchemaName(this.#schema) });
+    try {
+      return await this.#db.client.tx(async t => {
+        const { thread: receipt, observationalMemory, unverifiedObservationalMemoryRecordId } = input;
+        await this.lockThreadCloneLifecycle(t, receipt.threadId);
+        const thread = await t.oneOrNone<{ resourceId: string; storageGeneration: string }>(
+          `SELECT "resourceId", xmin::text AS "storageGeneration"
+           FROM ${threadTableName} WHERE id = $1 FOR UPDATE`,
+          [receipt.threadId],
+        );
+        if (!thread || thread.storageGeneration !== receipt.storageGeneration) {
+          return { status: 'conflict', reason: 'thread' };
+        }
+
+        const currentMessages = await t.manyOrNone<{ id: string }>(
+          `SELECT id FROM ${messageTableName} WHERE thread_id = $1 FOR UPDATE`,
+          [receipt.threadId],
+        );
+        if (
+          !hasSameUniqueStrings(
+            receipt.clonedMessageIds,
+            currentMessages.map(message => message.id),
+          )
+        ) {
+          return { status: 'conflict', reason: 'messages' };
+        }
+
+        if (observationalMemory) {
+          if (
+            unverifiedObservationalMemoryRecordId &&
+            observationalMemory.recordId !== unverifiedObservationalMemoryRecordId
+          ) {
+            return { status: 'conflict', reason: 'observational_memory' };
+          }
+          await this.lockObservationalMemoryResource(t, observationalMemory.resourceId);
+          const coordinateRows = await t.manyOrNone<{ id: string; storageGeneration: string }>(
+            `SELECT id, xmin::text AS "storageGeneration"
+             FROM ${omTableName} WHERE "lookupKey" = $1 FOR UPDATE`,
+            [this.getOMKey(observationalMemory.threadId, observationalMemory.resourceId)],
+          );
+          if (
+            !hasSameUniqueStrings(
+              [...observationalMemory.priorRecordIds, observationalMemory.recordId],
+              coordinateRows.map(row => row.id),
+            ) ||
+            coordinateRows.find(row => row.id === observationalMemory.recordId)?.storageGeneration !==
+              observationalMemory.storageGeneration
+          ) {
+            return { status: 'conflict', reason: 'observational_memory' };
+          }
+        } else {
+          if (unverifiedObservationalMemoryRecordId) {
+            const unverified = await t.oneOrNone<{ id: string }>(
+              `SELECT id FROM ${omTableName} WHERE id = $1 FOR UPDATE`,
+              [unverifiedObservationalMemoryRecordId],
+            );
+            if (unverified) return { status: 'conflict', reason: 'observational_memory' };
+          }
+          await this.lockObservationalMemoryResource(t, thread.resourceId);
+          const threadScopedRecords = await t.manyOrNone<{ id: string }>(
+            `SELECT id FROM ${omTableName} WHERE "threadId" = $1 FOR UPDATE`,
+            [receipt.threadId],
+          );
+          if (threadScopedRecords.length > 0) return { status: 'conflict', reason: 'observational_memory' };
+        }
+
+        if (observationalMemory) {
+          const deleted = await t.oneOrNone<{ id: string }>(
+            `DELETE FROM ${omTableName}
+             WHERE id = $1 AND xmin::text = $2
+             RETURNING id`,
+            [observationalMemory.recordId, observationalMemory.storageGeneration],
+          );
+          if (!deleted) return { status: 'conflict', reason: 'observational_memory' };
+        }
+        await t.none(`DELETE FROM ${messageTableName} WHERE thread_id = $1`, [receipt.threadId]);
+        const deletedThread = await t.oneOrNone<{ id: string }>(
+          `DELETE FROM ${threadTableName}
+           WHERE id = $1 AND xmin::text = $2
+           RETURNING id`,
+          [receipt.threadId, receipt.storageGeneration],
+        );
+        if (!deletedThread) throw new ThreadCloneRollbackConflictError('thread');
+        return { status: 'rolled_back' };
+      });
+    } catch (error) {
+      if (error instanceof ThreadCloneRollbackConflictError) {
+        return { status: 'conflict', reason: error.reason };
+      }
+      throw new MastraError(
+        {
+          id: createStorageErrorId('PG', 'ROLLBACK_THREAD_CLONE', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: { threadId: input.thread.threadId },
+        },
+        error,
+      );
+    }
+  }
+
   // ============================================
   // Observational Memory Methods
   // ============================================
 
   private getOMKey(threadId: string | null, resourceId: string): string {
     return threadId ? `thread:${threadId}` : `resource:${resourceId}`;
+  }
+
+  private async lockThreadCloneLifecycle(t: TxClient, threadId: string): Promise<void> {
+    await t.none('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`mastra:thread-clone:${threadId}`]);
   }
 
   private async lockObservationalMemoryResource(t: TxClient, resourceId: string): Promise<void> {
@@ -3054,7 +3202,9 @@ export class MemoryPG extends MemoryStorage {
     }
   }
 
-  async insertObservationalMemoryRecord(record: ObservationalMemoryRecord): Promise<void> {
+  async insertObservationalMemoryRecord(
+    record: ObservationalMemoryRecord,
+  ): Promise<StorageObservationalMemoryCloneReceipt> {
     try {
       const lookupKey = this.getOMKey(record.threadId, record.resourceId);
       const tableName = getTableName({
@@ -3063,8 +3213,14 @@ export class MemoryPG extends MemoryStorage {
       });
       const lastObservedAtStr = record.lastObservedAt ? record.lastObservedAt.toISOString() : null;
       const lastBufferedAtTimeStr = record.lastBufferedAtTime ? record.lastBufferedAtTime.toISOString() : null;
-      await this.#db.client.none(
-        `INSERT INTO ${tableName} (
+      return await this.#db.client.tx(async t => {
+        await this.lockObservationalMemoryResource(t, record.resourceId);
+        const priorRecords = await t.manyOrNone<{ id: string }>(
+          `SELECT id FROM ${tableName} WHERE "lookupKey" = $1 FOR UPDATE`,
+          [lookupKey],
+        );
+        const inserted = await t.one<{ storageGeneration: string }>(
+          `INSERT INTO ${tableName} (
           id, "lookupKey", scope, "resourceId", "threadId",
           "activeObservations", "activeObservationsPendingUpdate",
           "originType", config, "generationCount", "lastObservedAt", "lastObservedAtZ", "lastReflectionAt", "lastReflectionAtZ",
@@ -3075,45 +3231,54 @@ export class MemoryPG extends MemoryStorage {
           "isObserving", "isReflecting", "isBufferingObservation", "isBufferingReflection",
           "lastBufferedAtTokens", "lastBufferedAtTime",
           "observedTimezone", metadata, "createdAt", "createdAtZ", "updatedAt", "updatedAtZ"
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35)`,
-        [
-          record.id,
-          lookupKey,
-          record.scope,
-          record.resourceId,
-          record.threadId || null,
-          record.activeObservations || '',
-          null,
-          record.originType || 'initial',
-          record.config ? JSON.stringify(record.config) : null,
-          record.generationCount || 0,
-          lastObservedAtStr,
-          lastObservedAtStr,
-          null, // lastReflectionAt
-          null, // lastReflectionAtZ
-          record.pendingMessageTokens || 0,
-          record.totalTokensObserved || 0,
-          record.observationTokenCount || 0,
-          record.observedMessageIds ? JSON.stringify(record.observedMessageIds) : null,
-          record.bufferedObservationChunks ? JSON.stringify(record.bufferedObservationChunks) : null,
-          record.bufferedReflection || null,
-          record.bufferedReflectionTokens ?? null,
-          record.bufferedReflectionInputTokens ?? null,
-          record.reflectedObservationLineCount ?? null,
-          record.isObserving || false,
-          record.isReflecting || false,
-          record.isBufferingObservation || false,
-          record.isBufferingReflection || false,
-          record.lastBufferedAtTokens || 0,
-          lastBufferedAtTimeStr,
-          record.observedTimezone || null,
-          record.metadata ? JSON.stringify(record.metadata) : null,
-          record.createdAt.toISOString(),
-          record.createdAt.toISOString(),
-          record.updatedAt.toISOString(),
-          record.updatedAt.toISOString(),
-        ],
-      );
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35)
+        RETURNING xmin::text AS "storageGeneration"`,
+          [
+            record.id,
+            lookupKey,
+            record.scope,
+            record.resourceId,
+            record.threadId || null,
+            record.activeObservations || '',
+            null,
+            record.originType || 'initial',
+            record.config ? JSON.stringify(record.config) : null,
+            record.generationCount || 0,
+            lastObservedAtStr,
+            lastObservedAtStr,
+            null, // lastReflectionAt
+            null, // lastReflectionAtZ
+            record.pendingMessageTokens || 0,
+            record.totalTokensObserved || 0,
+            record.observationTokenCount || 0,
+            record.observedMessageIds ? JSON.stringify(record.observedMessageIds) : null,
+            record.bufferedObservationChunks ? JSON.stringify(record.bufferedObservationChunks) : null,
+            record.bufferedReflection || null,
+            record.bufferedReflectionTokens ?? null,
+            record.bufferedReflectionInputTokens ?? null,
+            record.reflectedObservationLineCount ?? null,
+            record.isObserving || false,
+            record.isReflecting || false,
+            record.isBufferingObservation || false,
+            record.isBufferingReflection || false,
+            record.lastBufferedAtTokens || 0,
+            lastBufferedAtTimeStr,
+            record.observedTimezone || null,
+            record.metadata ? JSON.stringify(record.metadata) : null,
+            record.createdAt.toISOString(),
+            record.createdAt.toISOString(),
+            record.updatedAt.toISOString(),
+            record.updatedAt.toISOString(),
+          ],
+        );
+        return {
+          recordId: record.id,
+          threadId: record.threadId,
+          resourceId: record.resourceId,
+          storageGeneration: inserted.storageGeneration,
+          priorRecordIds: priorRecords.map(priorRecord => priorRecord.id),
+        };
+      });
     } catch (error) {
       throw new MastraError(
         {

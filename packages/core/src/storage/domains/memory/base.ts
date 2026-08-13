@@ -12,6 +12,9 @@ import type {
   StorageOrderBy,
   StorageCloneThreadInput,
   StorageCloneThreadOutput,
+  StorageRollbackThreadCloneInput,
+  StorageRollbackThreadCloneResult,
+  StorageObservationalMemoryCloneReceipt,
   ObservationalMemoryRecord,
   ObservationalMemoryHistoryOptions,
   CreateObservationalMemoryInput,
@@ -58,6 +61,9 @@ export abstract class MemoryStorage extends StorageDomain {
 
   /** Whether listThreads applies the updatedBefore filter before pagination. */
   readonly supportsThreadUpdatedBeforeFilter?: boolean = false;
+
+  /** Whether failed post-clone copies can be rolled back without deleting concurrent state. */
+  readonly supportsAtomicThreadCloneRollback?: boolean = false;
 
   constructor() {
     super({
@@ -195,6 +201,16 @@ export abstract class MemoryStorage extends StorageDomain {
     throw new Error(
       `Thread cloning is not implemented by this storage adapter (${this.constructor.name}). ` +
         `The cloneThread method needs to be implemented in the storage adapter.`,
+    );
+  }
+
+  /**
+   * Remove a cloned thread only while its storage-issued generation, cloned
+   * message set, and optional OM insertion are all still unchanged.
+   */
+  async rollbackThreadClone(_input: StorageRollbackThreadCloneInput): Promise<StorageRollbackThreadCloneResult> {
+    throw new Error(
+      `Atomic thread-clone rollback is not implemented by this storage adapter (${this.constructor.name}).`,
     );
   }
 
@@ -463,7 +479,9 @@ export abstract class MemoryStorage extends StorageDomain {
    * Insert a fully-formed observational memory record.
    * Used by thread cloning to copy OM state with remapped IDs.
    */
-  async insertObservationalMemoryRecord(_record: ObservationalMemoryRecord): Promise<void> {
+  async insertObservationalMemoryRecord(
+    _record: ObservationalMemoryRecord,
+  ): Promise<StorageObservationalMemoryCloneReceipt | void> {
     throw new Error(`Observational memory is not implemented by this storage adapter (${this.constructor.name}).`);
   }
 
