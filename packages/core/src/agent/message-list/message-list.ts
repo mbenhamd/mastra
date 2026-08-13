@@ -1520,14 +1520,29 @@ export class MessageList {
   /**
    * A feedback note a loop injects so the model sees an instruction on its next
    * turn (supervisor `onIterationComplete` feedback, network completion
-   * feedback). It is flagged `suppressFeedback` precisely because it must stay
-   * out of anything shown to the caller.
+   * feedback). A failing completion report remains model-visible so the next
+   * iteration can improve, but it is never part of the caller's answer.
    */
   private static isSuppressedFeedbackMessage(message: MastraDBMessage): boolean {
-    return (
-      (message.content?.metadata?.completionResult as { suppressFeedback?: boolean } | undefined)?.suppressFeedback ===
-      true
-    );
+    const completionResult = message.content?.metadata?.completionResult as
+      { passed?: boolean; suppressFeedback?: boolean } | undefined;
+    return completionResult?.suppressFeedback === true || completionResult?.passed === false;
+  }
+
+  /**
+   * Content emitted by this run after removing framework-only feedback
+   * messages. Unlike a completed AI SDK StepResult, this projection stays
+   * accurate when a suspended tool call resumes and when output processors
+   * rewrite or remove the current response message.
+   */
+  public getCallerVisibleResponseContent(): AIV5Type.StepResult<any>['content'] {
+    const dbMessages = this.response.db().filter(message => !MessageList.isSuppressedFeedbackMessage(message));
+    const modelMessages = convertAIV5UIToModelMessages(
+      this.toAIV5UIMessages(dbMessages, { transformToolPayloads: false }),
+      this.messages,
+    ).filter(message => message.role === 'tool' || message.role === 'assistant');
+
+    return modelMessages.flatMap(message => this.response.aiV5.stepContent(message));
   }
 
   /** Set by `markResponseMessageBoundary(id, { turnContinues: true })`. */

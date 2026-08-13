@@ -1,6 +1,6 @@
 import type { AgentBackgroundConfig } from '../../background-tasks/types';
 import { ErrorCategory, ErrorDomain, MastraError } from '../../error';
-import { validateMaxSteps } from '../../llm/model/max-steps';
+import { validateMaxSteps, validateRecoveryMaxSteps } from '../../llm/model/max-steps';
 import type { MastraLanguageModel } from '../../llm/model/shared.types';
 import type { IMastraLogger } from '../../logger';
 import type { Mastra } from '../../mastra';
@@ -420,6 +420,7 @@ async function preflightDurableExecution<OUTPUT = undefined>(
   } = options;
 
   validateMaxSteps(execOptions?.maxSteps, logger);
+  validateRecoveryMaxSteps(execOptions?.recoveryMaxSteps, logger);
   if (providedRunId !== undefined && providedRunId.trim().length === 0) {
     throw new Error('DurableAgent runId must be a non-empty string.');
   }
@@ -940,6 +941,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
       scorers,
       options: {
         maxSteps: execOptions?.maxSteps,
+        recoveryMaxSteps: execOptions?.recoveryMaxSteps,
         toolChoice: execOptions?.toolChoice as any,
         activeTools: execOptions?.activeTools?.filter((name): name is string => typeof name === 'string'),
         toolSurfaceFence,

@@ -33,6 +33,12 @@ import { z } from 'zod';
 
 import { Agent } from '../../agent';
 import type { AgentExecutionOptionsBase } from '../../agent/agent.types';
+import {
+  AGENT_EXECUTION_OPTION_COMPOSERS,
+  AGENT_RESPONSE_RECOVERY_CONTINUATION,
+  AGENT_RESPONSE_RECOVERY_STEP,
+  type AgentExecutionOptionComposers,
+} from '../../agent/merge-execution-options';
 import { createSignal } from '../../agent/signals';
 import type { AgentSignalContents, CreatedAgentSignal } from '../../agent/signals';
 import {
@@ -346,9 +352,7 @@ type MessageAdmissionHashes = {
 };
 
 type QueueResumeRecoveryResult =
-  | { status: 'none' }
-  | { status: 'completed'; result: AgentResult }
-  | { status: 'stale' };
+  { status: 'none' } | { status: 'completed'; result: AgentResult } | { status: 'stale' };
 
 type ResumeResponseMode = 'agent-result' | 'inbox-receipt';
 type InboxReceiptResponseOptions = Extract<InboxResponseOptions, { responseId: string }>;
@@ -393,46 +397,179 @@ const MAX_EXPIRED_PENDING_INTERACTIONS = 100;
 // (CONTROLLER_MAX_STEPS); the harness governs runaway turns through its own
 // budgets and abort lanes, so this is an escape-proof ceiling, not pacing.
 const HARNESS_SESSION_MAX_STEPS = 1000;
+type HarnessIterationCompleteHandler = NonNullable<AgentExecutionOptionsBase<unknown>['onIterationComplete']>;
+type HarnessPrepareStep = NonNullable<AgentExecutionOptionsBase<unknown>['prepareStep']>;
+type HarnessExecutionHookErrorReporter = (hook: 'onIterationComplete' | 'prepareStep', error: unknown) => void;
 
 /**
  * Empty-final-synthesis nudge. Live-diagnosed twice on the same day (a chat
  * turn whose approved create tool succeeded, and a scripted journey whose
  * create ran un-gated): some models execute action tools successfully and
  * then finish the turn with zero visible text, so the user gets a mutation
- * and silence. When the final iteration arrives with tool results somewhere
- * in the segment and no text anywhere in it, force exactly ONE continuation
- * step so the model states the outcome. One nudge per run segment — a model
- * that stays silent twice is allowed to finish (never loop). Turns that end
- * via a terminal tool result never reach this handler (the loop skips
- * iteration-result handling for terminal delivery), and error/abort finishes
- * are left alone.
+ * and silence. When the final iteration has no text after completed tools,
+ * force exactly ONE response-only continuation step so the model states the
+ * outcome. Text from an earlier tool-call iteration is not a terminal answer
+ * and must not suppress synthesis. The continuation has no active tools and
+ * uses toolChoice `none`, so this remains true even if the model ignores the
+ * feedback and attempts to repeat an action. One nudge per run segment — a
+ * model that stays silent twice is allowed to finish (never loop). The loop
+ * ignores continuation results for terminal tool delivery, and error, abort,
+ * safety, and output-length finishes are left alone.
  */
-function createHarnessEmptySynthesisNudge(): (context: {
-  text: string;
-  toolResults: Array<{ id: string; name: string; result: unknown; error?: Error }>;
-  isFinal: boolean;
-  finishReason: string;
-}) => { continue: boolean; feedback: string } | undefined {
-  let nudged = false;
-  let segmentHasToolResults = false;
-  let segmentHasText = false;
-  return context => {
-    if (context.toolResults.length > 0) segmentHasToolResults = true;
-    if (context.text.trim() !== '') segmentHasText = true;
-    if (!context.isFinal || nudged || segmentHasText || !segmentHasToolResults) return undefined;
-    if (context.finishReason === 'error' || context.finishReason === 'abort') return undefined;
-    nudged = true;
-    return {
-      continue: true,
-      // Bare regeneration is not enough for models that habitually stop after
-      // tool use (live-verified): without explicit direction the extra step
-      // can end silent again. The feedback rides as a suppressed assistant
-      // note, so the model sees the instruction but transcripts stay clean.
-      feedback:
-        'You completed tool actions but sent the user no reply. In one or two short ' +
-        'sentences, state plainly what you did and the outcome. Do not call any more tools.',
-    };
+function createHarnessEmptySynthesisOptions(reportConfiguredHookError: HarnessExecutionHookErrorReporter): {
+  [AGENT_EXECUTION_OPTION_COMPOSERS]: () => AgentExecutionOptionComposers;
+} {
+  return {
+    [AGENT_EXECUTION_OPTION_COMPOSERS]: () => {
+      let nudged = false;
+      let segmentHasToolResults = false;
+      let responseOnly = false;
+      let responseOnlyReservedAtIteration: number | undefined;
+      let responseOnlyPrepared = false;
+      let ordinaryBudgetExhausted = false;
+      return {
+        recoveryMaxSteps: 1,
+        onIterationComplete: existing => {
+          const configured = existing as HarnessIterationCompleteHandler | undefined;
+          return async (context: Parameters<HarnessIterationCompleteHandler>[0]) => {
+            // The recovery phase gets one provider response, even if that
+            // response tries to call a tool that prepareStep hid. Configured
+            // observers still see this iteration, but cannot reopen it.
+            if (responseOnly) {
+              // Durable loop predicates may be replayed before the transition
+              // commits. Return the same reservation for the same terminal
+              // iteration; only an actual later iteration closes recovery.
+              if (context.iteration === responseOnlyReservedAtIteration) {
+                return {
+                  continue: true,
+                  [AGENT_RESPONSE_RECOVERY_CONTINUATION]: true,
+                };
+              }
+              try {
+                await configured?.(context);
+              } catch (error) {
+                reportConfiguredHookError('onIterationComplete', error);
+              }
+              return { continue: false };
+            }
+
+            if (context.toolResults.length > 0) segmentHasToolResults = true;
+            ordinaryBudgetExhausted ||= context.iteration >= HARNESS_SESSION_MAX_STEPS;
+            const needsRecovery =
+              context.isFinal &&
+              !nudged &&
+              context.text.trim() === '' &&
+              segmentHasToolResults &&
+              context.finishReason !== 'error' &&
+              context.finishReason !== 'abort' &&
+              context.finishReason !== 'tripwire' &&
+              context.finishReason !== 'content-filter' &&
+              context.finishReason !== 'length';
+            let configuredResult: Awaited<ReturnType<HarnessIterationCompleteHandler>>;
+            try {
+              configuredResult = await configured?.(context);
+            } catch (error) {
+              // Keep the framework's established callback-error behavior for
+              // ordinary iterations. On the exact silent terminal that needs
+              // recovery, however, rethrowing would make the loop swallow the
+              // error and strand a completed mutation with no user response.
+              if (!needsRecovery) throw error;
+              reportConfiguredHookError('onIterationComplete', error);
+              configuredResult = undefined;
+            }
+
+            if (!needsRecovery) {
+              // The ordinary Harness budget is a hard ceiling even when the
+              // model, a scorer, a background-task wakeup, or an application
+              // hook asks to continue. Only the exact response-only recovery
+              // below may spend a provider call after this point.
+              if (ordinaryBudgetExhausted) return { ...(configuredResult ?? {}), continue: false };
+              return configuredResult;
+            }
+
+            // An application-level explicit stop/continue decision owns this
+            // iteration before the ordinary budget is exhausted. At the exact
+            // ceiling, `continue: true` is ordinary work and cannot consume the
+            // reserved response-only call; the Harness still recovers silence.
+            if (configuredResult?.continue !== undefined && !ordinaryBudgetExhausted) return configuredResult;
+            if (configuredResult?.continue === false) return configuredResult;
+
+            nudged = true;
+            responseOnly = true;
+            responseOnlyReservedAtIteration = context.iteration;
+            const recoveryFeedback =
+              'You received tool results but sent the user no reply. In one or two short sentences, ' +
+              'report the result accurately, including whether the action succeeded, failed, or was denied. ' +
+              'Do not claim an action ran unless its result confirms that. Do not call any more tools.';
+            return {
+              ...(configuredResult ?? {}),
+              continue: true,
+              [AGENT_RESPONSE_RECOVERY_CONTINUATION]: true,
+              // Bare regeneration is not enough for models that habitually stop
+              // after tool use (live-verified). Feedback is a suppressed assistant
+              // note, so the model sees it but transcripts stay clean.
+              feedback: configuredResult?.feedback
+                ? `${configuredResult.feedback}\n\n${recoveryFeedback}`
+                : recoveryFeedback,
+            };
+          };
+        },
+        prepareStep: existing => {
+          const configured = existing as HarnessPrepareStep | undefined;
+          return async (args: Parameters<HarnessPrepareStep>[0]) => {
+            // `prepareStep` runs before the provider call. Once the 0-based
+            // step index reaches the public ceiling, ordinary execution must
+            // fail closed unless the preceding terminal iteration explicitly
+            // armed the one response-only recovery call.
+            const stepNumber = (args as { stepNumber?: number } | undefined)?.stepNumber;
+            if (
+              !responseOnly &&
+              (ordinaryBudgetExhausted || (typeof stepNumber === 'number' && stepNumber >= HARNESS_SESSION_MAX_STEPS))
+            ) {
+              throw new HarnessOrdinaryStepBudgetExhaustedError();
+            }
+            if (responseOnly && responseOnlyPrepared) {
+              throw new HarnessResponseRecoveryAlreadyPreparedError();
+            }
+            if (responseOnly) responseOnlyPrepared = true;
+
+            let configuredResult: Awaited<ReturnType<HarnessPrepareStep>>;
+            try {
+              configuredResult = await configured?.(args);
+            } catch (error) {
+              // Keep configured prepareStep failures fatal during ordinary
+              // execution, but never let an optional observer strand completed
+              // tool work or bypass the response-only recovery fence.
+              if (!responseOnly) throw error;
+              reportConfiguredHookError('prepareStep', error);
+              configuredResult = undefined;
+            }
+            if (!responseOnly) return configuredResult;
+            return {
+              ...(configuredResult ?? {}),
+              activeTools: [],
+              toolChoice: 'none',
+              [AGENT_RESPONSE_RECOVERY_STEP]: true,
+            };
+          };
+        },
+      };
+    },
   };
+}
+
+class HarnessResponseRecoveryAlreadyPreparedError extends Error {
+  constructor() {
+    super('Harness response recovery has already admitted its one provider attempt');
+    this.name = 'HarnessResponseRecoveryAlreadyPreparedError';
+  }
+}
+
+class HarnessOrdinaryStepBudgetExhaustedError extends Error {
+  constructor() {
+    super(`Harness ordinary step budget exhausted at ${HARNESS_SESSION_MAX_STEPS} steps`);
+    this.name = 'HarnessOrdinaryStepBudgetExhaustedError';
+  }
 }
 
 // §10.2 receipts stay bounded on BOTH axes (PF-2250, live-diagnosed): the map
@@ -1722,6 +1859,16 @@ export class Session {
         maxCustomEventPayloadBytes: () => this._harness._internalMaxEventPayloadBytes,
       },
     );
+  }
+
+  private _createEmptySynthesisOptions() {
+    return createHarnessEmptySynthesisOptions((hook, error) => {
+      try {
+        this._harness.mastra.getLogger().error(`Error in ${hook} hook:`, error);
+      } catch {
+        // Diagnostics must never suppress the caller-visible recovery.
+      }
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -4204,8 +4351,7 @@ export class Session {
    * `_internalAwaitFlushChain()` so shutdown and tests can act on it. */
   private _pendingTokenUsageFlushError: unknown;
   private _pendingDurableTurnFlushError:
-    | { error: unknown; pendingResume?: { runId: string; toolCallId: string } }
-    | undefined;
+    { error: unknown; pendingResume?: { runId: string; toolCallId: string } } | undefined;
 
   /**
    * True while a turn (message or queued) is in flight against the agent.
@@ -7655,7 +7801,7 @@ export class Session {
             // The wake branch starts a REAL streamed turn; carry the silent-turn nudge.
             streamOptions: {
               ...baseExecOptions,
-              onIterationComplete: createHarnessEmptySynthesisNudge(),
+              ...this._createEmptySynthesisOptions(),
             } as never,
           },
         },
@@ -9907,7 +10053,7 @@ export class Session {
           abortSignal: turnAbortSignal,
           requestContext,
           maxSteps: HARNESS_SESSION_MAX_STEPS,
-          onIterationComplete: createHarnessEmptySynthesisNudge(),
+          ...this._createEmptySynthesisOptions(),
           ...toolSurface,
           ...(turnInstructions ? { instructions: turnInstructions } : {}),
         };
@@ -10296,7 +10442,7 @@ export class Session {
               behavior: 'wake',
               streamOptions: {
                 maxSteps: HARNESS_SESSION_MAX_STEPS,
-                onIterationComplete: createHarnessEmptySynthesisNudge(),
+                ...this._createEmptySynthesisOptions(),
               } as never,
             },
           },
@@ -10422,7 +10568,7 @@ export class Session {
           abortSignal: turnAbortSignal,
           requestContext,
           maxSteps: HARNESS_SESSION_MAX_STEPS,
-          onIterationComplete: createHarnessEmptySynthesisNudge(),
+          ...this._createEmptySynthesisOptions(),
           ...toolSurface,
           ...(turnInstructions ? { instructions: turnInstructions } : {}),
         };
@@ -10531,7 +10677,7 @@ export class Session {
           streamOptions: {
             memory: { thread: this.threadId, resource: this.resourceId },
             maxSteps: HARNESS_SESSION_MAX_STEPS,
-            onIterationComplete: createHarnessEmptySynthesisNudge(),
+            ...this._createEmptySynthesisOptions(),
           } as never,
         },
       },
@@ -13075,7 +13221,7 @@ export class Session {
         // RESUMED segment at the agent's 5-step default and ends it mid-task
         // (the agent-controller documents the identical trap for its lane).
         maxSteps: HARNESS_SESSION_MAX_STEPS,
-        onIterationComplete: createHarnessEmptySynthesisNudge(),
+        ...this._createEmptySynthesisOptions(),
         ...resumeToolSurface,
         ...(turnInstructions ? { instructions: turnInstructions } : {}),
       });
@@ -15159,7 +15305,7 @@ export class Session {
             // The wake branch starts a REAL streamed turn; carry the silent-turn nudge.
             streamOptions: {
               ...baseExecOptions,
-              onIterationComplete: createHarnessEmptySynthesisNudge(),
+              ...this._createEmptySynthesisOptions(),
             } as never,
           },
         },

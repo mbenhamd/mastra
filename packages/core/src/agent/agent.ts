@@ -1899,8 +1899,7 @@ export class Agent<
    * ```
    */
   public listAgents({ requestContext = new RequestContext() }: { requestContext?: RequestContext } = {}):
-    | Record<string, SubAgent<string, TRequestContext>>
-    | Promise<Record<string, SubAgent<string, TRequestContext>>> {
+    Record<string, SubAgent<string, TRequestContext>> | Promise<Record<string, SubAgent<string, TRequestContext>>> {
     const agentsToUse = this.#agents
       ? typeof this.#agents === 'function'
         ? this.#agents({ requestContext: requestContext as RequestContext<TRequestContext> })
@@ -2900,8 +2899,7 @@ export class Agent<
    * ```
    */
   public getInstructions({ requestContext = new RequestContext() }: { requestContext?: RequestContext } = {}):
-    | AgentInstructions
-    | Promise<AgentInstructions> {
+    AgentInstructions | Promise<AgentInstructions> {
     if (typeof this.#instructions === 'function') {
       const result = this.#instructions({
         requestContext: requestContext as RequestContext<TRequestContext>,
@@ -3044,9 +3042,7 @@ export class Agent<
    * ```
    */
   public getMetadata({ requestContext = new RequestContext() }: { requestContext?: RequestContext } = {}):
-    | Record<string, unknown>
-    | undefined
-    | Promise<Record<string, unknown> | undefined> {
+    Record<string, unknown> | undefined | Promise<Record<string, unknown> | undefined> {
     if (this.#metadata === undefined) {
       return undefined;
     }
@@ -3193,8 +3189,7 @@ export class Agent<
    * ```
    */
   public getDefaultOptions({ requestContext = new RequestContext() }: { requestContext?: RequestContext } = {}):
-    | AgentExecutionOptions<TOutput>
-    | Promise<AgentExecutionOptions<TOutput>> {
+    AgentExecutionOptions<TOutput> | Promise<AgentExecutionOptions<TOutput>> {
     if (typeof this.#defaultOptions !== 'function') {
       return this.#defaultOptions;
     }
@@ -3237,8 +3232,7 @@ export class Agent<
    * ```
    */
   public getDefaultNetworkOptions({ requestContext = new RequestContext() }: { requestContext?: RequestContext } = {}):
-    | NetworkOptions
-    | Promise<NetworkOptions> {
+    NetworkOptions | Promise<NetworkOptions> {
     if (typeof this.#defaultNetworkOptions !== 'function') {
       return this.#defaultNetworkOptions;
     }
@@ -7230,8 +7224,7 @@ export class Agent<
     requestContext: RequestContext;
     structuredOutput?: boolean;
     overrideScorers?:
-      | MastraScorers
-      | Record<string, { scorer: MastraScorer['name']; sampling?: ScoringSamplingConfig }>;
+      MastraScorers | Record<string, { scorer: MastraScorer['name']; sampling?: ScoringSamplingConfig }>;
     threadId?: string;
     resourceId?: string;
   } & ObservabilityContext) {
@@ -8425,8 +8418,7 @@ export class Agent<
       : undefined;
     const persistedTracingContext = isResume
       ? (resumeContext?.snapshot?.tracingContext as
-          | { traceId?: string; spanId?: string; parentSpanId?: string }
-          | undefined)
+          { traceId?: string; spanId?: string; parentSpanId?: string } | undefined)
       : undefined;
 
     // Only fall back to persisted traceId/parentSpanId when the caller didn't provide
@@ -10177,7 +10169,7 @@ export class Agent<
         (await this.getDefaultOptions({
           requestContext: requestContextToUse,
         }));
-      const mergedOptions = deepMerge(
+      const mergedOptions = mergeAgentExecutionOptions(
         defaultOptions as Record<string, unknown>,
         streamOptionsWithRunId as Record<string, unknown>,
       ) as AgentExecutionOptions<OUTPUT> & { model?: DynamicArgument<MastraModelConfig> };
@@ -10820,8 +10812,7 @@ export class Agent<
     const runId = streamOptionsWithPubSub?.runId ?? '';
     const requestContextToUse = streamOptionsWithPubSub?.requestContext;
     const preflightedDefaultOptions = streamOptionsWithPubSub?.[STREAM_UNTIL_IDLE_DEFAULT_OPTIONS] as
-      | AgentExecutionOptions<TOutput>
-      | undefined;
+      AgentExecutionOptions<TOutput> | undefined;
     let defaultOptions: AgentExecutionOptions<TOutput> | undefined = preflightedDefaultOptions;
     if (!streamOptionsWithPubSub?.[SKIP_AGENT_EXECUTION_PREFLIGHT]) {
       if (requestContextToUse) {
@@ -10944,7 +10935,7 @@ export class Agent<
     let stagedToolSurfaceFenceRestore = false;
 
     try {
-      let mergedStreamOptions = deepMerge(
+      let mergedStreamOptions = mergeAgentExecutionOptions(
         defaultOptions as Record<string, unknown>,
         (streamOptionsWithSnapshotTarget ?? {}) as Record<string, unknown>,
       ) as typeof defaultOptions & { model?: DynamicArgument<MastraModelConfig> };
@@ -11328,7 +11319,7 @@ export class Agent<
       requestContext: requestContextToUse,
     })) as AgentExecutionOptions<TOutput>;
 
-    const mergedOptions = deepMerge(
+    const mergedOptions = mergeAgentExecutionOptions(
       defaultOptions as Record<string, unknown>,
       (options ?? {}) as Record<string, unknown>,
     ) as typeof defaultOptions & { model?: DynamicArgument<MastraModelConfig> };

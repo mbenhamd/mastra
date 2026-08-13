@@ -762,6 +762,59 @@ describe('InngestAgent parity surface', () => {
     expect(opts.tracingOptions).toEqual({ metadata: { feature: 'parity' } });
   });
 
+  it('rejects response-only recovery before Inngest dispatch', async () => {
+    const runId = 'inngest-response-recovery-rejected';
+    const { durableAgent, mastra } = makeIsolatedAgent('parity-response-recovery');
+    const sendSpy = stubInngestSend();
+
+    try {
+      await expect(
+        durableAgent.prepare([{ role: 'user', content: 'hi' }], { recoveryMaxSteps: 1 } as any),
+      ).rejects.toThrow('Inngest durable agents do not support response-only recovery; recoveryMaxSteps must be 0');
+      await expect(
+        durableAgent.stream([{ role: 'user', content: 'hi' }], { runId, recoveryMaxSteps: 1 } as any),
+      ).rejects.toThrow('Inngest durable agents do not support response-only recovery; recoveryMaxSteps must be 0');
+
+      expect(sendSpy).not.toHaveBeenCalled();
+      expect(globalRunRegistry.has(runId)).toBe(false);
+    } finally {
+      sendSpy.mockRestore();
+      await mastra.shutdown();
+    }
+  });
+
+  it('rejects default response-only recovery before preparation side effects', async () => {
+    const createThread = vi.fn();
+    const getMemory = vi.fn().mockResolvedValue({ createThread } as any);
+    const agent = new Agent({
+      id: 'default-response-recovery',
+      name: 'default-response-recovery',
+      instructions: 'Test',
+      model: createMockModel() as any,
+      defaultOptions: { recoveryMaxSteps: 1 },
+    });
+    vi.spyOn(agent, 'getMemory').mockImplementation(getMemory);
+    const durableAgent = createInngestAgent({ agent, inngest });
+    const sendSpy = stubInngestSend();
+
+    await expect(
+      durableAgent.prepare([{ role: 'user', content: 'hi' }], {
+        memory: { thread: 'thread-1', resource: 'resource-1' },
+      } as any),
+    ).rejects.toThrow('Inngest durable agents do not support response-only recovery; recoveryMaxSteps must be 0');
+
+    await expect(
+      durableAgent.stream([{ role: 'user', content: 'hi' }], {
+        memory: { thread: 'thread-1', resource: 'resource-1' },
+      } as any),
+    ).rejects.toThrow('Inngest durable agents do not support response-only recovery; recoveryMaxSteps must be 0');
+
+    expect(getMemory).not.toHaveBeenCalled();
+    expect(createThread).not.toHaveBeenCalled();
+    expect(sendSpy).not.toHaveBeenCalled();
+    sendSpy.mockRestore();
+  });
+
   it('exposes result.abort and flips the registry abortSignal', async () => {
     // Slice 2: stream() must own an AbortController, expose it via
     // result.abort, and surface its signal on the run-registry entry so the

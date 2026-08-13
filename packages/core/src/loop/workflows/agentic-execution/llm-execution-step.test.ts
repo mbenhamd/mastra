@@ -1913,6 +1913,70 @@ describe('createLLMExecutionStep gateway provider tools', () => {
     expect(firstModelStream).toHaveBeenCalledTimes(1);
   });
 
+  it('carries a successful fallback model into the next iteration', async () => {
+    const primaryStream = vi.fn(async () => {
+      throw new Error('primary unavailable');
+    });
+    const secondaryStream = vi.fn(async () => ({
+      stream: new ReadableStream({
+        start(controller) {
+          controller.enqueue({ type: 'finish', finishReason: 'stop', usage: { inputTokens: 1, outputTokens: 1 } });
+          controller.close();
+        },
+      }),
+    }));
+    const llmExecutionStep = createLLMExecutionStep({
+      agentId: 'test-agent',
+      messageId: 'msg-0',
+      runId: 'test-run',
+      startTimestamp: Date.now(),
+      methodType: 'stream',
+      controller,
+      outputWriter: vi.fn(),
+      messageList,
+      models: [
+        {
+          id: 'primary-model',
+          maxRetries: 0,
+          model: {
+            specificationVersion: 'v2' as const,
+            provider: 'mock-provider',
+            modelId: 'primary-model',
+            supportedUrls: {},
+            doGenerate: vi.fn(),
+            doStream: primaryStream,
+          } as any,
+        },
+        {
+          id: 'secondary-model',
+          maxRetries: 0,
+          model: {
+            specificationVersion: 'v2' as const,
+            provider: 'mock-provider',
+            modelId: 'secondary-model',
+            supportedUrls: {},
+            doGenerate: vi.fn(),
+            doStream: secondaryStream,
+          } as any,
+        },
+      ],
+      tools: {},
+      streamState: { serialize: vi.fn(), deserialize: vi.fn() },
+      _internal: {
+        generateId: () => 'generated-id',
+        threadId: 'thread-123',
+        resourceId: 'resource-456',
+      },
+      logger: { error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as any,
+    } as unknown as OuterLLMRun<{}>);
+
+    const result = await llmExecutionStep.execute(createExecuteParams(createIterationInput()));
+
+    expect(result.fallbackModelIndex).toBe(1);
+    expect(primaryStream).toHaveBeenCalledTimes(1);
+    expect(secondaryStream).toHaveBeenCalledTimes(1);
+  });
+
   it('preserves fallback tool calls after an interjected primary attempt fails', async () => {
     const responseProcessor = vi
       .fn()

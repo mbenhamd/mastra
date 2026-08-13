@@ -73,6 +73,7 @@ import { InngestPubSub } from '../pubsub';
 import type { InngestRun } from '../run';
 import { INNGEST_WORKFLOW_LIFECYCLE_REPLAY, InngestWorkflow } from '../workflow';
 import {
+  assertInngestResponseRecoveryDisabled,
   createInngestDurableAgenticWorkflow,
   createInngestDurableAgenticWorkflowIds,
 } from './create-inngest-agentic-workflow';
@@ -751,8 +752,8 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
 
   /**
    * Make the worker resolver requirement part of the durable run contract.
-   * Protocol-v2 workers that receive this marker deny when the configured
-   * callback is unavailable. Versioned function IDs keep pre-v2 workers from
+   * Protocol-v3 workers that receive this marker deny when the configured
+   * callback is unavailable. Versioned function IDs keep pre-v3 workers from
    * claiming these events because those workers don't understand the marker.
    */
   function requireWorkerPermissionResolver(workflowInput: any): void {
@@ -954,18 +955,31 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
         }) as Promise<InngestAgentStreamResult<TOutput>>;
       }
 
+      // Inngest can move the next operation to another worker. Resolve the
+      // effective defaults before preparation so a configured recovery budget
+      // is rejected before memory, processors, spans, or dispatch side effects.
+      const callerRequestContext = streamOptions?.requestContext;
+      const defaultOptions = await agent.getDefaultOptions({
+        requestContext: callerRequestContext ?? new RequestContext(),
+      });
+      const requestContext = callerRequestContext ?? defaultOptions.requestContext;
+      assertInngestResponseRecoveryDisabled(streamOptions);
+      assertInngestResponseRecoveryDisabled(defaultOptions);
+
       // 1. Prepare for durable execution
       const preparation = await prepareForDurableExecution<TOutput>({
         agent: agent as Agent<string, any, TOutput>,
         messages,
         options: streamOptions as AgentExecutionOptions<TOutput>,
+        resolvedDefaultOptions: defaultOptions as AgentExecutionOptions<TOutput>,
+        ...(requestContext ? { requestContext } : {}),
         runId: streamOptions?.runId,
-        requestContext: streamOptions?.requestContext,
         methodType: (streamOptions as any)?.__methodType ?? 'stream',
         durableRequestContextKeys,
       });
 
       const { runId, messageId, workflowInput, registryEntry, threadId, resourceId } = preparation;
+      assertInngestResponseRecoveryDisabled(workflowInput.options);
       const runtimeBindingId = registryEntry.runtimeBindingId;
       if (!runtimeBindingId) {
         throw new TypeError(`Cannot start Inngest durable-agent run ${runId}: runtime binding is missing`);
@@ -1013,7 +1027,7 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
         // 2. Create AGENT_RUN span BEFORE the workflow starts
         // This ensures the agent_run is the root of the trace, not the workflow
         const observability = mastra?.observability?.getSelectedInstance({
-          requestContext: streamOptions?.requestContext,
+          requestContext,
         });
         const agentSpan = observability?.startSpan({
           type: SpanType.AGENT_RUN,
@@ -1439,13 +1453,23 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
     },
 
     async prepare(messages, prepareOptions) {
+      const callerRequestContext = prepareOptions?.requestContext;
+      const defaultOptions = await agent.getDefaultOptions({
+        requestContext: callerRequestContext ?? new RequestContext(),
+      });
+      const requestContext = callerRequestContext ?? defaultOptions.requestContext;
+      assertInngestResponseRecoveryDisabled(prepareOptions);
+      assertInngestResponseRecoveryDisabled(defaultOptions);
       const preparation = await prepareForDurableExecution<TOutput>({
         agent: agent as Agent<string, any, TOutput>,
         messages,
         options: prepareOptions,
-        requestContext: prepareOptions?.requestContext,
+        resolvedDefaultOptions: defaultOptions as AgentExecutionOptions<TOutput>,
+        ...(requestContext ? { requestContext } : {}),
         durableRequestContextKeys,
       });
+
+      assertInngestResponseRecoveryDisabled(preparation.workflowInput.options);
 
       // Override with durable agent's id/name
       preparation.workflowInput.agentId = agentId;

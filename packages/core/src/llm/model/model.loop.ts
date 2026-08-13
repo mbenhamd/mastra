@@ -12,7 +12,7 @@ import type { MastraModelOutput } from '../../stream/base/output';
 import type { ModelManagerModelConfig } from '../../stream/types';
 import { delay } from '../../utils';
 
-import { validateMaxSteps } from './max-steps';
+import { validateMaxSteps, validateRecoveryMaxSteps } from './max-steps';
 import type { ModelLoopStreamArgs } from './model.loop.types';
 import { resolveResponseModelId } from './server-side-fallback';
 import type { MastraModelOptions } from './shared.types';
@@ -114,6 +114,7 @@ export class MastraLLMVNext extends MastraBase {
     runId,
     stopWhen,
     maxSteps,
+    recoveryMaxSteps,
     tools = {} as Tools,
     modelSettings,
     toolChoice = 'auto',
@@ -152,6 +153,7 @@ export class MastraLLMVNext extends MastraBase {
   }: ModelLoopStreamArgs<Tools, OUTPUT>): MastraModelOutput<OUTPUT> {
     const observabilityContext = resolveObservabilityContext(rest);
     validateMaxSteps(maxSteps, this.logger);
+    validateRecoveryMaxSteps(recoveryMaxSteps, this.logger);
     // `maxSteps` is sugar for the stop condition `stepCountIs(maxSteps)`. When a
     // custom `stopWhen` is also provided, compose the two (the loop ORs stop
     // conditions) instead of letting the maxSteps cap replace the user's
@@ -376,6 +378,7 @@ export class MastraLLMVNext extends MastraBase {
           },
         },
         maxSteps,
+        recoveryMaxSteps,
       };
 
       return loop(loopOptions);

@@ -106,7 +106,7 @@ function findStepEntry(steps: any[], id: string): any {
 describe('createInngestDurableAgenticWorkflow ownership IDs', () => {
   const inngest = new Inngest({ id: 'inngest-agentic-workflow-id-tests' });
 
-  it('uses protocol-v2 shared IDs for direct factory callers', () => {
+  it('uses protocol-v3 shared IDs for direct factory callers', () => {
     const workflow = createInngestDurableAgenticWorkflow({ inngest }) as any;
     const functionIds = workflow.getFunctions().map((fn: any) => fn.id());
 
@@ -126,22 +126,22 @@ describe('createInngestDurableAgenticWorkflow ownership IDs', () => {
 
     expect(first).toEqual(repeated);
     expect(first).not.toEqual(other);
-    expect(INNGEST_DURABLE_AGENT_PROTOCOL_VERSION).toBe('v2');
-    expect(first.AGENTIC_LOOP).toMatch(/^inngest:v2:durable-agentic-loop:[a-f0-9]{32}$/);
-    expect(first.AGENTIC_EXECUTION).toMatch(/^inngest:v2:durable-agentic-execution:[a-f0-9]{32}$/);
+    expect(INNGEST_DURABLE_AGENT_PROTOCOL_VERSION).toBe('v3');
+    expect(first.AGENTIC_LOOP).toMatch(/^inngest:v3:durable-agentic-loop:[a-f0-9]{32}$/);
+    expect(first.AGENTIC_EXECUTION).toMatch(/^inngest:v3:durable-agentic-execution:[a-f0-9]{32}$/);
     expect(() => createInngestDurableAgenticWorkflowIds('')).toThrow(/non-empty agent ID/);
   });
 
-  it('does not reuse the protocol-v1 function identity', () => {
+  it('does not reuse the protocol-v2 function identity', () => {
     const agentId = 'policy-owner';
     const current = createInngestDurableAgenticWorkflowIds(agentId);
     const legacyOwnerHash = createHash('sha256')
-      .update(`mastra:inngest:durable-agent:v1\0${agentId}`)
+      .update(`mastra:inngest:durable-agent:v2\0${agentId}`)
       .digest('hex')
       .slice(0, 32);
 
-    expect(current.AGENTIC_LOOP).not.toBe(`inngest:durable-agentic-loop:${legacyOwnerHash}`);
-    expect(current.AGENTIC_EXECUTION).not.toBe(`inngest:durable-agentic-execution:${legacyOwnerHash}`);
+    expect(current.AGENTIC_LOOP).not.toBe(`inngest:v2:durable-agentic-loop:${legacyOwnerHash}`);
+    expect(current.AGENTIC_EXECUTION).not.toBe(`inngest:v2:durable-agentic-execution:${legacyOwnerHash}`);
   });
 
   it('applies the owner namespace to both parent and nested function IDs', () => {
@@ -154,6 +154,25 @@ describe('createInngestDurableAgenticWorkflow ownership IDs', () => {
       expect.arrayContaining([`workflow.${workflowIds.AGENTIC_LOOP}`, `workflow.${workflowIds.AGENTIC_EXECUTION}`]),
     );
     expect(functionIds).toHaveLength(2);
+  });
+});
+
+describe('createInngestDurableAgenticWorkflow response recovery boundary', () => {
+  const inngest = new Inngest({ id: 'inngest-agentic-workflow-recovery-tests' });
+  const workflow = createInngestDurableAgenticWorkflow({ inngest });
+  const initEntry = findStepEntry((workflow as any).executionGraph.steps, 'init-iteration-state');
+
+  it('rejects response-only recovery before the first durable iteration', async () => {
+    await expect(initEntry.step.execute({ inputData: { options: { recoveryMaxSteps: 1 } } })).rejects.toThrow(
+      'Inngest durable agents do not support response-only recovery; recoveryMaxSteps must be 0',
+    );
+  });
+
+  it('accepts an explicit zero recovery budget', async () => {
+    const state = await initEntry.step.execute({ inputData: { options: { recoveryMaxSteps: 0 } } });
+
+    expect(state.options.recoveryMaxSteps).toBe(0);
+    expect(state.iterationCount).toBe(0);
   });
 });
 

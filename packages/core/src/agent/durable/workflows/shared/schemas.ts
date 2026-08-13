@@ -36,6 +36,13 @@ export const modelListEntrySchema = z.object({
   enabled: z.boolean(),
 });
 
+/** Serialized guard for one live, response-only recovery admission. */
+export const durableResponseRecoveryStateSchema = z.object({
+  phase: z.literal('reserved'),
+  reservedAtIteration: z.number().int().nonnegative(),
+  modelEntryId: z.string().optional(),
+});
+
 /**
  * Schema for accumulated usage across iterations
  */
@@ -95,6 +102,7 @@ export const baseDurableAgenticInputSchema = z.object({
   toolsMetadata: z.array(z.any()),
   modelConfig: modelConfigSchema,
   options: z.any(),
+  responseRecovery: durableResponseRecoveryStateSchema.optional(),
   state: z.any(),
   messageId: z.string(),
 });
@@ -119,6 +127,7 @@ export const baseIterationStateSchema = z.object({
   toolsMetadata: z.array(z.any()),
   modelConfig: z.any(),
   options: z.any(),
+  responseRecovery: durableResponseRecoveryStateSchema.optional(),
   state: z.any(),
   messageId: z.string(),
   // Iteration tracking
@@ -127,6 +136,8 @@ export const baseIterationStateSchema = z.object({
   accumulatedUsage: accumulatedUsageSchema,
   // Last step result for continuation check
   lastStepResult: z.any().optional(),
+  // Enabled model-list entry that served the preceding iteration.
+  lastModelEntryId: z.string().optional(),
   // Background task tracking
   backgroundTaskPending: z.boolean().optional(),
   terminalToolResult: terminalToolResultSchema.optional(),

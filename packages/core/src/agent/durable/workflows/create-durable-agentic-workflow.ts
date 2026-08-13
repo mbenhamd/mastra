@@ -3,7 +3,7 @@ import { ErrorCategory, ErrorDomain, MastraError } from '../../../error';
 import type { MastraScorer, MastraScorerEntry } from '../../../evals/base';
 import { runScorer } from '../../../evals/hooks';
 import type { PubSub } from '../../../events/pubsub';
-import { validateMaxSteps } from '../../../llm/model/max-steps';
+import { validateMaxSteps, validateRecoveryMaxSteps } from '../../../llm/model/max-steps';
 import type { IMastraLogger } from '../../../logger';
 import { outputProcessorsOwnTerminalPersistence } from '../../../loop/shared/terminal-tool-result';
 import { pruneAgentLoopSnapshot } from '../../../loop/workflows/prune-snapshot';
@@ -14,6 +14,7 @@ import { RequestContext } from '../../../request-context';
 import { PUBSUB_SYMBOL } from '../../../workflows/constants';
 import { createWorkflow } from '../../../workflows/create';
 import type { WorkflowOptions } from '../../../workflows/types';
+import { AGENT_RESPONSE_RECOVERY_CONTINUATION } from '../../merge-execution-options';
 import { MessageList } from '../../message-list';
 import {
   TOOL_PERMISSION_POLICY_KEY,
@@ -64,6 +65,8 @@ import {
 export interface DurableAgenticWorkflowOptions {
   /** Maximum number of agentic loop iterations */
   maxSteps?: number;
+  /** Internal response-recovery calls available beyond maxSteps. */
+  recoveryMaxSteps?: number;
   /** Server-side lifecycle callback for the outer durable-agent workflow. */
   onFinish?: WorkflowOptions['onFinish'];
 }
@@ -89,6 +92,13 @@ const durableAgenticInputSchema = z.object({
   // Model list for fallback support (when agent configured with array of models)
   modelList: z.array(modelListEntrySchema).optional(),
   options: z.any(),
+  responseRecovery: z
+    .object({
+      phase: z.literal('reserved'),
+      reservedAtIteration: z.number().int().nonnegative(),
+      modelEntryId: z.string().optional(),
+    })
+    .optional(),
   state: z.any(),
   messageId: z.string(),
   // Exported AGENT_RUN / MODEL_GENERATION span data, threaded so the run shares one trace
@@ -133,8 +143,10 @@ type IterationState = z.infer<typeof iterationStateSchema>;
  */
 export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOptions, logger?: IMastraLogger) {
   validateMaxSteps(options?.maxSteps, logger);
+  validateRecoveryMaxSteps(options?.recoveryMaxSteps, logger);
 
   const maxSteps = options?.maxSteps ?? DurableAgentDefaults.MAX_STEPS;
+  const defaultRecoveryMaxSteps = options?.recoveryMaxSteps ?? 0;
 
   // Create the LLM execution step - tools and model are resolved from Mastra at runtime
   const llmExecutionStep = createDurableLLMExecutionStep();
@@ -344,6 +356,7 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
         async ({ inputData }) => {
           const input = inputData as DurableAgenticWorkflowInput;
           validateMaxSteps(input.options?.maxSteps, logger);
+          validateRecoveryMaxSteps(input.options?.recoveryMaxSteps, logger);
           const iterationState: IterationState = {
             ...input,
             iterationCount: 0,
@@ -403,6 +416,7 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
         // Declared as `let` because signal drain may force isContinued later.
         let shouldContinue = state.lastStepResult?.isContinued === true;
         const runMaxSteps = state.options?.maxSteps ?? maxSteps;
+        const recoveryMaxSteps = state.options?.recoveryMaxSteps ?? defaultRecoveryMaxSteps;
         const underMaxSteps = state.iterationCount < runMaxSteps;
 
         // Evaluate user-supplied stopWhen predicate(s) parked on the registry
@@ -412,7 +426,7 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
         // engines (Inngest after worker restart) won't have the registry entry
         // and fall back to maxSteps only.
         let stopWhenMatched = false;
-        if (shouldContinue && underMaxSteps && !hasFinishedSteps && !state.terminalToolResult) {
+        if (shouldContinue && !hasFinishedSteps && !state.terminalToolResult) {
           const stopWhen = registryEntry?.stopWhen;
           if (stopWhen && state.accumulatedSteps.length > 0) {
             const conditions = Array.isArray(stopWhen) ? stopWhen : [stopWhen];
@@ -539,8 +553,26 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
               // Determine whether we can run another turn. Hard stops
               // (pendingFeedbackStop, delegationBailed) are unconditional —
               // onIterationComplete cannot override them.
+              const responseRecoveryRequested =
+                iterationResult.continue === true && iterationResult[AGENT_RESPONSE_RECOVERY_CONTINUATION] === true;
+              const canUseRecoveryTurn =
+                responseRecoveryRequested &&
+                !stopWhenMatched &&
+                recoveryMaxSteps > 0 &&
+                state.iterationCount >= runMaxSteps &&
+                state.iterationCount < runMaxSteps + recoveryMaxSteps;
               const canRunAnotherTurn =
-                !hardStop && underMaxSteps && (shouldContinue || iterationResult.continue === true);
+                !hardStop &&
+                (underMaxSteps || canUseRecoveryTurn) &&
+                (shouldContinue || iterationResult.continue === true);
+
+              if (responseRecoveryRequested && canRunAnotherTurn) {
+                state.responseRecovery = {
+                  phase: 'reserved',
+                  reservedAtIteration: state.iterationCount,
+                  ...(state.lastModelEntryId ? { modelEntryId: state.lastModelEntryId } : {}),
+                };
+              }
 
               if (iterationResult.feedback && canRunAnotherTurn) {
                 // Inject feedback as a synthetic assistant message so the LLM
@@ -576,7 +608,7 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
                   // then stop on the next predicate evaluation.
                   state.pendingFeedbackStop = true;
                   isFinal = false;
-                } else if (!hasFinishedSteps && underMaxSteps) {
+                } else if (!hasFinishedSteps && (underMaxSteps || canUseRecoveryTurn)) {
                   isFinal = false;
                   if (state.lastStepResult) {
                     state.lastStepResult.isContinued = true;
@@ -586,7 +618,7 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
                 hasFinishedSteps = true;
                 isFinal = true;
               } else if (iterationResult.continue === true && !hardStop && (hasFinishedSteps || !shouldContinue)) {
-                if (underMaxSteps || !runMaxSteps) {
+                if (underMaxSteps || !runMaxSteps || canUseRecoveryTurn) {
                   hasFinishedSteps = false;
                   isFinal = false;
                   if (state.lastStepResult) {
@@ -607,6 +639,7 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
         if (registryEntry?.abortSignal?.aborted) {
           state.terminalToolResult = undefined;
           state.deferredStepFinishChunk = undefined;
+          state.responseRecovery = undefined;
           hasFinishedSteps = true;
           hardStop = true;
           isFinal = true;
@@ -614,6 +647,10 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
             state.lastStepResult.reason = 'abort';
             state.lastStepResult.isContinued = false;
           }
+        }
+
+        if (isFinal && state.lastStepResult) {
+          state.lastStepResult.isContinued = false;
         }
 
         // Rotate messageId for the next iteration. Each iteration's assistant

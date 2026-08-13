@@ -419,11 +419,9 @@ describe('Harness v1 real-agent E2E — S2 tool round-trip', () => {
       const result = (await session.message({ content: 'find Dero Israel' })) as any;
 
       const toolStart = events.find(e => e.type === 'tool_start') as
-        | { toolCallId: string; toolName: string; input: unknown; runId: string }
-        | undefined;
+        { toolCallId: string; toolName: string; input: unknown; runId: string } | undefined;
       const toolEnd = events.find(e => e.type === 'tool_end') as
-        | { toolCallId: string; toolName: string; output: any; isError: boolean; runId: string }
-        | undefined;
+        { toolCallId: string; toolName: string; output: any; isError: boolean; runId: string } | undefined;
 
       expect(toolStart).toBeDefined();
       expect(toolStart!.toolName).toBe('findUser');
@@ -1498,8 +1496,7 @@ describe('Harness v1 real-agent E2E — S3 approval suspend/resume', () => {
 
       // The approved tool's result surfaced as a live `tool_end` after resume.
       const postResumeToolEnd = postResumeEvents.find(e => e.type === 'tool_end') as
-        | { toolName: string; toolCallId: string; output: any; isError: boolean }
-        | undefined;
+        { toolName: string; toolCallId: string; output: any; isError: boolean } | undefined;
       expect(postResumeToolEnd).toBeDefined();
       expect(postResumeToolEnd!.toolName).toBe('findUser');
       expect(postResumeToolEnd!.toolCallId).toBe('call-approve');
@@ -1522,6 +1519,66 @@ describe('Harness v1 real-agent E2E — S3 approval suspend/resume', () => {
       // After the resume terminalizes, the display state's pending slot clears
       // (the captured approval registration is consumed).
       expect(session.getDisplayState().pending == null).toBe(true);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('synthesizes once after an approved tool resumes into a silent terminal response', async () => {
+    const execute = vi.fn(async () => ({ approved: true }));
+    const approvalTool = createTool({
+      id: 'silentApproval',
+      description: 'approval followed by a silent model response',
+      inputSchema: z.object({}),
+      requireApproval: true,
+      execute,
+    });
+    let providerCalls = 0;
+    const providerOptions: any[] = [];
+    const model = new MockLanguageModelV2({
+      doStream: async options => {
+        providerOptions.push(options);
+        providerCalls += 1;
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream:
+            providerCalls === 1
+              ? toolCallStream('silent-approval-call', 'silentApproval', '{}')
+              : providerCalls === 2
+                ? textStream([])
+                : textStream(['Approved action completed.']),
+        };
+      },
+    });
+    const agent = new Agent({
+      id: 'default',
+      name: 'default',
+      instructions: 'use silentApproval and report its outcome',
+      model,
+      tools: { silentApproval: approvalTool },
+    });
+    const harness = newHarness(agent);
+    try {
+      const session = await harness.session({ resourceId: 'u-silent-approval', threadId: { fresh: true } });
+      const events: HarnessEvent[] = [];
+      session.subscribe(event => events.push(event));
+
+      const suspended = (await session.message({ content: 'run the approved action' })) as any;
+      expect(suspended.finishReason).toBe('suspended');
+      const eventsAtSuspend = events.length;
+
+      await session.respondToToolApproval({ approved: true });
+
+      const resumedEvents = events.slice(eventsAtSuspend);
+      const visibleText = (resumedEvents.filter(event => event.type === 'text_delta') as Array<{ delta: string }>)
+        .map(event => event.delta)
+        .join('');
+      expect(visibleText).toBe('Approved action completed.');
+      expect(execute).toHaveBeenCalledOnce();
+      expect(providerCalls).toBe(3);
+      expect(providerOptions[2]?.tools ?? []).toHaveLength(0);
+      expect(session.getRecord().pendingResume).toBeUndefined();
     } finally {
       await harness.shutdown();
     }
@@ -1650,8 +1707,7 @@ describe('Harness v1 real-agent E2E — S4 settlement evidence', () => {
 
       await waitFor(() => events.some(e => e.type === 'queue_completed'), 'queue_completed');
       const completed = events.find(e => e.type === 'queue_completed') as
-        | { queuedItemId: string; signalId: string; runId: string }
-        | undefined;
+        { queuedItemId: string; signalId: string; runId: string } | undefined;
       expect(completed).toBeDefined();
       expect(completed!.queuedItemId.length).toBeGreaterThan(0);
       expect(completed!.signalId.length).toBeGreaterThan(0);
@@ -2418,8 +2474,7 @@ describe('Harness v1 real-agent E2E — S7 real subagent streaming', () => {
 
       // --- subagent_tool_start / subagent_tool_end (child's REAL tool) -------
       const subToolStart = events.find(e => e.type === 'subagent_tool_start') as
-        | { toolName: string; innerToolCallId: string; input: any; parentId: string; depth: number }
-        | undefined;
+        { toolName: string; innerToolCallId: string; input: any; parentId: string; depth: number } | undefined;
       const subToolEnd = events.find(e => e.type === 'subagent_tool_end') as
         | {
             toolName: string;
@@ -2452,8 +2507,7 @@ describe('Harness v1 real-agent E2E — S7 real subagent streaming', () => {
 
       // --- subagent_end -------------------------------------------------------
       const subEnd = events.find(e => e.type === 'subagent_end') as
-        | { output: any; isError: boolean; durationMs: number; parentId: string; depth: number }
-        | undefined;
+        { output: any; isError: boolean; durationMs: number; parentId: string; depth: number } | undefined;
       expect(subEnd).toBeDefined();
       expect(subEnd!.isError).toBe(false);
       expect(typeof subEnd!.durationMs).toBe('number');
@@ -3091,8 +3145,7 @@ describe('Harness v1 real-agent E2E — S12 resume runs a fresh tool', () => {
 
       // (a) the approved tool (findUser) surfaced its tool_end after resume.
       const approvedEnd = postResume.find(e => e.type === 'tool_end' && (e as any).toolName === 'findUser') as
-        | { output: any; isError: boolean }
-        | undefined;
+        { output: any; isError: boolean } | undefined;
       expect(approvedEnd).toBeDefined();
       expect(approvedEnd!.isError).toBe(false);
       expect(approvedEnd!.output).toEqual({ name: 'Dero', id: 7 });
@@ -3492,8 +3545,7 @@ describe('Harness v1 real-agent E2E — S14 subagent tool error', () => {
       // The child's failed tool surfaced as subagent_tool_end{isError:true},
       // carrying the projected error detail ({name,message}, JSON-safe).
       const subToolEnd = events.find(e => e.type === 'subagent_tool_end') as
-        | { toolName: string; output: any; isError: boolean; innerToolCallId: string }
-        | undefined;
+        { toolName: string; output: any; isError: boolean; innerToolCallId: string } | undefined;
       expect(subToolEnd).toBeDefined();
       expect(subToolEnd!.toolName).toBe('lookupFact');
       expect(subToolEnd!.innerToolCallId).toBe('child-throw-tc');
@@ -3678,8 +3730,7 @@ describe('Harness v1 real-agent E2E — S15 nested subagent depth>1', () => {
 
       // --- Root sees the CHILD as a depth-1 subagent --------------------------
       const rootSubStart = rootEvents.find(e => e.type === 'subagent_start') as
-        | { parentId: string; depth: number; subagentSessionId: string; agentType: string }
-        | undefined;
+        { parentId: string; depth: number; subagentSessionId: string; agentType: string } | undefined;
       expect(rootSubStart).toBeDefined();
       expect(rootSubStart!.agentType).toBe('explore');
       expect(rootSubStart!.depth).toBe(1);
@@ -3709,8 +3760,7 @@ describe('Harness v1 real-agent E2E — S15 nested subagent depth>1', () => {
       const childArr = perSession.get(childSessionId);
       expect(childArr).toBeDefined();
       const grandSubStart = childArr!.find(e => e.type === 'subagent_start') as
-        | { parentId: string; depth: number; subagentSessionId: string; agentType: string }
-        | undefined;
+        { parentId: string; depth: number; subagentSessionId: string; agentType: string } | undefined;
       expect(grandSubStart).toBeDefined();
       expect(grandSubStart!.agentType).toBe('deep');
       // depth is 2 at the grandchild hop.
@@ -4213,8 +4263,7 @@ describe('Harness v1 real-agent E2E — S18 subagent_tool_start carries projecte
       await session.message({ content: 'delegate query' });
 
       const subToolStart = events.find(e => e.type === 'subagent_tool_start') as
-        | { toolName: string; innerToolCallId: string; input: any }
-        | undefined;
+        { toolName: string; innerToolCallId: string; input: any } | undefined;
       expect(subToolStart).toBeDefined();
       expect(subToolStart!.toolName).toBe('query');
       expect(subToolStart!.innerToolCallId).toBe('child-args-tc');
@@ -4290,8 +4339,7 @@ describe('Harness v1 real-agent E2E — S19 oversized tool payload sentinel on t
       await session.message({ content: 'go big' });
 
       const toolEnd = events.find(e => e.type === 'tool_end') as
-        | { toolName: string; output: any; isError: boolean }
-        | undefined;
+        { toolName: string; output: any; isError: boolean } | undefined;
       expect(toolEnd).toBeDefined();
       expect(toolEnd!.toolName).toBe('big');
       expect(toolEnd!.isError).toBe(false);
@@ -4358,8 +4406,7 @@ describe('Harness v1 real-agent E2E — S20 top-level tool error', () => {
       const result = (await session.message({ content: 'find Dero' })) as any;
 
       const toolEnd = events.find(e => e.type === 'tool_end') as
-        | { toolName: string; toolCallId: string; output: any; isError: boolean }
-        | undefined;
+        { toolName: string; toolCallId: string; output: any; isError: boolean } | undefined;
       expect(toolEnd).toBeDefined();
       expect(toolEnd!.toolName).toBe('findUser');
       expect(toolEnd!.toolCallId).toBe('err-tc');
@@ -4431,6 +4478,274 @@ describe('Harness v1 real-agent E2E — S21 reasoning_delta streams (GAP-B)', ()
       // The reasoning_delta runId matches the turn's agent_end runId.
       const agentEnd = events.find(e => e.type === 'agent_end') as { runId: string };
       expect(reasoningDeltas.every(e => e.runId === agentEnd.runId)).toBe(true);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+});
+
+// ===========================================================================
+// S22 — EMPTY FINAL SYNTHESIS: successful tool work never leaves the user
+// silent, and the one recovery request cannot repeat an action even when the
+// provider ignores toolChoice. This runs through the real Session + Agent loop,
+// including composition with Agent.defaultOptions hooks.
+// ===========================================================================
+
+describe('Harness v1 real-agent E2E — S22 empty final synthesis', () => {
+  it('adds one tool-free response step while preserving configured agent hooks', async () => {
+    let providerCalls = 0;
+    let toolExecutions = 0;
+    let configuredIterations = 0;
+    let configuredPrepareSteps = 0;
+    const providerOptions: any[] = [];
+    const applyChange = createTool({
+      id: 'applyChange',
+      description: 'Apply one test change.',
+      inputSchema: z.object({}),
+      execute: async () => {
+        toolExecutions += 1;
+        return { applied: true };
+      },
+    });
+    const model = new MockLanguageModelV2({
+      doStream: async options => {
+        providerOptions.push(options);
+        providerCalls += 1;
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream:
+            providerCalls === 1
+              ? toolCallStream('apply-1', 'applyChange', '{}')
+              : providerCalls === 2
+                ? textStream([])
+                : textStream(['Applied the change.']),
+        };
+      },
+    });
+    const agent = new Agent({
+      id: 'default',
+      name: 'default',
+      instructions: 'apply the change and report the result',
+      model,
+      tools: { applyChange },
+      defaultOptions: {
+        onIterationComplete: async () => {
+          configuredIterations += 1;
+          return undefined;
+        },
+        prepareStep: async () => {
+          configuredPrepareSteps += 1;
+          return { activeTools: ['applyChange'] };
+        },
+      },
+    });
+    const harness = newHarness(agent);
+    try {
+      const session = await harness.session({ resourceId: 'u-empty-synthesis', threadId: { fresh: true } });
+      const result = (await session.message({ content: 'apply it' })) as any;
+
+      expect(result.text).toBe('Applied the change.');
+      expect(providerCalls).toBe(3);
+      expect(toolExecutions).toBe(1);
+      expect(configuredIterations).toBe(3);
+      expect(configuredPrepareSteps).toBe(3);
+      expect(providerOptions[0]?.tools).toHaveLength(1);
+      expect(providerOptions[2]?.tools ?? []).toHaveLength(0);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('hard-stops after one tool-free recovery request when the provider tries to repeat the action', async () => {
+    let providerCalls = 0;
+    let toolExecutions = 0;
+    const applyChange = createTool({
+      id: 'applyChange',
+      description: 'Apply one test change.',
+      inputSchema: z.object({}),
+      execute: async () => {
+        toolExecutions += 1;
+        return { applied: true };
+      },
+    });
+    const model = new MockLanguageModelV2({
+      doStream: async () => {
+        providerCalls += 1;
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream:
+            providerCalls === 1
+              ? toolCallStream('apply-1', 'applyChange', '{}')
+              : providerCalls === 2
+                ? textStream([])
+                : providerCalls === 3
+                  ? toolCallStream('apply-2', 'applyChange', '{}')
+                  : textStream(['UNEXPECTED_EXTRA_RECOVERY_STEP']),
+        };
+      },
+    });
+    const agent = new Agent({
+      id: 'default',
+      name: 'default',
+      instructions: 'apply the change and report the result',
+      model,
+      tools: { applyChange },
+      defaultOptions: {
+        // Feedback on the recovery response would normally request a two-phase
+        // stop. The Harness composer must discard it at the hard-stop point.
+        onIterationComplete: async () => ({ feedback: 'Configured feedback.' }),
+        prepareStep: async () => ({ activeTools: ['applyChange'] }),
+      },
+    });
+    const harness = newHarness(agent);
+    try {
+      const session = await harness.session({ resourceId: 'u-empty-synthesis-cap', threadId: { fresh: true } });
+      const events: HarnessEvent[] = [];
+      session.subscribe(event => {
+        events.push(event);
+      });
+      const result = (await session.message({ content: 'apply it once' })) as any;
+
+      expect(providerCalls).toBe(3);
+      expect(toolExecutions).toBe(1);
+      expect(events.filter(event => event.type === 'tool_start')).toHaveLength(1);
+      // A provider that violates the response-only request remains silent; the
+      // hard security boundary wins over replaying the tool or buying another call.
+      expect(result.text).toBe('');
+      expect(result.text).not.toContain('UNEXPECTED_EXTRA_RECOVERY_STEP');
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('does not spend provider retry or fallback budget after admitting recovery', async () => {
+    let primaryCalls = 0;
+    let backupCalls = 0;
+    let toolExecutions = 0;
+    const applyChange = createTool({
+      id: 'applyChange',
+      description: 'Apply one test change.',
+      inputSchema: z.object({}),
+      execute: async () => {
+        toolExecutions += 1;
+        return { applied: true };
+      },
+    });
+    const primary = new MockLanguageModelV2({
+      doStream: async () => {
+        primaryCalls += 1;
+        if (primaryCalls === 1) {
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: toolCallStream('apply-1', 'applyChange', '{}'),
+          };
+        }
+        if (primaryCalls === 2) {
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: textStream([]),
+          };
+        }
+        throw new Error('recovery provider failed');
+      },
+    });
+    const backup = new MockLanguageModelV2({
+      doStream: async () => {
+        backupCalls += 1;
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream: textStream(['UNEXPECTED_FALLBACK_RECOVERY']),
+        };
+      },
+    });
+    const agent = new Agent({
+      id: 'default',
+      name: 'default',
+      instructions: 'apply the change and report the result',
+      model: [
+        { model: primary, maxRetries: 2 },
+        { model: backup, maxRetries: 2 },
+      ],
+      tools: { applyChange },
+    });
+    const harness = newHarness(agent);
+    try {
+      const session = await harness.session({ resourceId: 'u-empty-synthesis-retry', threadId: { fresh: true } });
+      let rejection: unknown;
+      try {
+        await session.message({ content: 'apply it once' });
+      } catch (error) {
+        rejection = error;
+      }
+
+      expect(rejection).toMatchObject({
+        name: 'HarnessExecutionError',
+        message: 'An internal harness error occurred',
+      });
+      expect((rejection as { cause?: Error }).cause?.message).toBe('recovery provider failed');
+      expect(primaryCalls).toBe(3);
+      expect(backupCalls).toBe(0);
+      expect(toolExecutions).toBe(1);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('still synthesizes when a configured hook rejects on every iteration', async () => {
+    let providerCalls = 0;
+    let toolExecutions = 0;
+    let configuredIterations = 0;
+    const applyChange = createTool({
+      id: 'applyChange',
+      description: 'Apply one test change.',
+      inputSchema: z.object({}),
+      execute: async () => {
+        toolExecutions += 1;
+        return { applied: true };
+      },
+    });
+    const model = new MockLanguageModelV2({
+      doStream: async () => {
+        providerCalls += 1;
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream:
+            providerCalls === 1
+              ? toolCallStream('apply-1', 'applyChange', '{}')
+              : providerCalls === 2
+                ? textStream([])
+                : textStream(['Applied despite the optional hook failure.']),
+        };
+      },
+    });
+    const agent = new Agent({
+      id: 'default',
+      name: 'default',
+      instructions: 'apply the change and report the result',
+      model,
+      tools: { applyChange },
+      defaultOptions: {
+        onIterationComplete: async () => {
+          configuredIterations += 1;
+          throw new Error('configured hook failed');
+        },
+      },
+    });
+    const harness = newHarness(agent);
+    try {
+      const session = await harness.session({ resourceId: 'u-empty-synthesis-hook-error', threadId: { fresh: true } });
+      const result = (await session.message({ content: 'apply it' })) as any;
+
+      expect(result.text).toBe('Applied despite the optional hook failure.');
+      expect(providerCalls).toBe(3);
+      expect(toolExecutions).toBe(1);
+      expect(configuredIterations).toBe(3);
     } finally {
       await harness.shutdown();
     }

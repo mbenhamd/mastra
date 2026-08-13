@@ -15,6 +15,7 @@ import type { MastraStreamTransformOptions } from '../stream/types';
 import type { RequireToolApproval, ToolHooks, ToolPayloadTransformPolicy } from '../tools';
 import type { DynamicArgument } from '../types';
 import type { OutputWriter, WorkflowRunState } from '../workflows/types';
+import type { AGENT_RESPONSE_RECOVERY_CONTINUATION } from './merge-execution-options';
 import type { MessageListInput } from './message-list';
 import type { CreatedAgentSignal } from './signals';
 import type {
@@ -229,7 +230,7 @@ export interface IterationCompleteContext {
   iteration: number;
   /** Maximum iterations allowed */
   maxIterations?: number;
-  /** The text output from this iteration */
+  /** Caller-visible text from this iteration after output processors; empty when the step was rejected */
   text: string;
   /** Tool calls made in this iteration */
   toolCalls: Array<{
@@ -278,6 +279,8 @@ export interface IterationCompleteResult {
    * This allows injecting guidance to the LLM between iterations.
    */
   feedback?: string;
+  /** @internal Framework-owned response-only continuation reservation. */
+  [AGENT_RESPONSE_RECOVERY_CONTINUATION]?: true;
 }
 
 /**
@@ -510,8 +513,11 @@ export type AgentExecutionOptionsBase<OUTPUT> = {
    */
   versions?: VersionOverrides;
 
-  /** Maximum number of steps to run */
+  /** Maximum number of ordinary steps to run */
   maxSteps?: number;
+
+  /** @internal Framework-owned calls available only after ordinary maxSteps is reached. */
+  recoveryMaxSteps?: number;
 
   /** Conditions for stopping execution (e.g., step count, token limit) */
   stopWhen?: LoopOptions['stopWhen'];

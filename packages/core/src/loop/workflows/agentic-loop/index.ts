@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { StepResult, ToolSet } from '@internal/ai-sdk-v5';
+import { AGENT_RESPONSE_RECOVERY_CONTINUATION } from '../../../agent/merge-execution-options';
 import type { MastraDBMessage } from '../../../memory';
 import { InternalSpans } from '../../../observability';
 import { safeEnqueue } from '../../../stream/base';
@@ -43,8 +44,12 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
   const accumulatedSteps: StepResult<Tools>[] = [];
   // Track previous content to determine what's new in each step
   let previousContentLength = 0;
+  let previousCallerVisibleContentLength = rest.resumeContext
+    ? messageList.getCallerVisibleResponseContent().length
+    : 0;
   // When continue:false + feedback, allow one more LLM turn then stop
   let pendingFeedbackStop = false;
+  let responseRecoveryReserved = false;
   // When this loop is a resume (e.g. after tool approval), the suspended run
   // already flushed its in-progress assistant message to storage. The first
   // continuation must start a fresh response message instead of merging into
@@ -168,7 +173,36 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
       const currentContent = allContent.slice(previousContentLength);
       previousContentLength = allContent.length;
 
+      const callerVisibleContent = messageList.getCallerVisibleResponseContent();
+      const currentCallerVisibleContent = rest.outputProcessors?.length
+        ? []
+        : callerVisibleContent.slice(previousCallerVisibleContentLength);
+      previousCallerVisibleContentLength = callerVisibleContent.length;
+
       const toolResultParts = currentContent.filter(part => part.type === 'tool-result');
+
+      // Without output processors, the MessageList slice excludes framework
+      // feedback by provenance and preserves approval-resume behavior. With
+      // output processors, cumulative caller-visible content is not a stable
+      // cursor: a processor may insert, remove, or reorder earlier parts. The
+      // completed step's processed content is therefore the sole authority for
+      // the current iteration, including an intentionally empty/redacted step.
+      const latestCompletedStep = typedInputData.output.steps.at(-1);
+      const processedStepText = latestCompletedStep?.content
+        .filter(part => part.type === 'text')
+        .map(part => part.text)
+        .join('');
+      const projectedStepText = rest.outputProcessors?.length
+        ? (processedStepText ?? '')
+        : currentCallerVisibleContent
+            .filter(part => part.type === 'text')
+            .map(part => part.text)
+            .join('');
+      const stepWasRejected =
+        typedInputData.stepResult?.reason === 'tripwire' ||
+        typedInputData.stepResult?.reason === 'retry' ||
+        (latestCompletedStep as { tripwire?: unknown } | undefined)?.tripwire !== undefined;
+      const currentIterationText = stepWasRejected ? '' : projectedStepText;
 
       const currentStep: StepResult<Tools> = {
         content: currentContent,
@@ -182,7 +216,7 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
           modelId: typedInputData.metadata?.modelId || typedInputData.metadata?.model || '',
           messages: [],
         } as StepResult<Tools>['response'],
-        text: typedInputData.output.text || '',
+        text: currentIterationText,
         reasoning: typedInputData.output.reasoning || [],
         reasoningText: typedInputData.output.reasoningText || '',
         files: typedInputData.output.files || [],
@@ -207,6 +241,7 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
       }
 
       // Only call stopWhen if we're continuing (not on the final step)
+      let customStopWhenMatched = false;
       if (rest.stopWhen && !hasFinishedSteps && typedInputData.stepResult?.isContinued && accumulatedSteps.length > 0) {
         // Cast steps to any for v5/v6 StopCondition compatibility
         // v5 and v6 StepResult types have minor differences (e.g., rawFinishReason, finishReason format)
@@ -218,8 +253,13 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
           }),
         );
 
-        const hasStopped = conditions.some(condition => condition);
-        hasFinishedSteps = hasFinishedSteps || hasStopped;
+        const matchedStopConditionIndexes = conditions.flatMap((condition, index) => (condition ? [index] : []));
+        const maxStepsConditionMatched = rest.maxSteps !== undefined && accumulatedSteps.length >= rest.maxSteps;
+        // The loop prepends its internal maxSteps condition before caller
+        // conditions. Recovery may cross only that ordinary ceiling; any later
+        // matching condition is a caller-owned hard stop.
+        customStopWhenMatched = matchedStopConditionIndexes.some(index => !maxStepsConditionMatched || index > 0);
+        hasFinishedSteps = hasFinishedSteps || matchedStopConditionIndexes.length > 0;
       }
 
       // Call onIterationComplete hook if provided (call for every iteration, not just continued ones)
@@ -228,7 +268,7 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
         const iterationContext = {
           iteration: accumulatedSteps.length,
           maxIterations: rest.maxSteps,
-          text: typedInputData.output.text || '',
+          text: currentStep.text,
           toolCalls: (typedInputData.output.toolCalls || []).map((tc: any) => ({
             id: tc.toolCallId || tc.id || '',
             name: tc.toolName || tc.name || '',
@@ -251,13 +291,21 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
 
         try {
           const iterationResult = await rest.onIterationComplete(iterationContext);
+          const reservesResponseRecovery =
+            !customStopWhenMatched &&
+            iterationResult?.continue === true &&
+            iterationResult[AGENT_RESPONSE_RECOVERY_CONTINUATION] === true &&
+            rest.maxSteps !== undefined &&
+            rest.recoveryMaxSteps !== undefined &&
+            accumulatedSteps.length >= rest.maxSteps &&
+            accumulatedSteps.length < rest.maxSteps + rest.recoveryMaxSteps;
 
           // A terminal tool result is already the caller-visible answer. The
           // callback may observe that iteration, but its continuation feedback
           // must not become a hidden synthetic assistant message that appears
           // only in persisted history.
           if (iterationResult && !typedInputData.terminalToolResult) {
-            if (iterationResult.feedback && typedInputData.stepResult?.isContinued) {
+            if (iterationResult.feedback && typedInputData.stepResult?.isContinued && !reservesResponseRecovery) {
               messageList.add(
                 {
                   id: rest.mastra?.generateId() || randomUUID(),
@@ -303,7 +351,7 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
               // otherwise the loop re-enters against a sealed message and the
               // extra turn produces nothing caller-visible (live-diagnosed as
               // the silent-turn nudge failing to surface any text).
-              if (rest.maxSteps === undefined || accumulatedSteps.length < rest.maxSteps) {
+              if (rest.maxSteps === undefined || accumulatedSteps.length < rest.maxSteps || reservesResponseRecovery) {
                 if (iterationResult.feedback) {
                   messageList.add(
                     {
@@ -343,6 +391,7 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
                   user: messageList.get.input.aiV5.model(),
                   nonUser: messageList.get.response.aiV5.model(),
                 };
+                responseRecoveryReserved = reservesResponseRecovery;
               }
             }
           }
@@ -350,6 +399,19 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
           // Log error but don't fail the iteration
           rest.logger?.error('Error in onIterationComplete hook:', error);
         }
+      }
+
+      // The hook above may reserve one framework-owned response-only call at
+      // the exact ordinary maxSteps boundary. `maxSteps` still fences every
+      // natural/scorer/background/configured continuation; only a hook-forced
+      // continuation from an otherwise terminal iteration may cross it.
+      let forcedResponseOnlyContinuation = responseRecoveryReserved && typedInputData.stepResult?.isContinued === true;
+      responseRecoveryReserved = false;
+      if (forcedResponseOnlyContinuation) {
+        // The AI-SDK-compatible maxSteps stop condition already marked this
+        // iteration complete before the hook ran. Clear only that boundary so
+        // the callback-reserved response call can enter the workflow once.
+        hasFinishedSteps = false;
       }
 
       // Check if a delegation hook called ctx.bail() — stop the loop after this iteration
@@ -363,6 +425,7 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
       // race or reaches persistence through the final stream state.
       if (rest.options?.abortSignal?.aborted) {
         typedInputData.terminalToolResult = undefined;
+        forcedResponseOnlyContinuation = false;
         hasFinishedSteps = true;
         if (typedInputData.stepResult) {
           typedInputData.stepResult.reason = 'abort';
@@ -374,6 +437,7 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
       // terminal iteration but cannot spend another provider call by forcing it
       // to continue.
       if (typedInputData.terminalToolResult) {
+        forcedResponseOnlyContinuation = false;
         hasFinishedSteps = true;
       }
 
@@ -407,7 +471,7 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
         return false;
       }
 
-      return typedInputData.stepResult?.isContinued ?? false;
+      return forcedResponseOnlyContinuation || (typedInputData.stepResult?.isContinued ?? false);
     })
     .commit();
 }

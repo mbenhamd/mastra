@@ -16,3 +16,19 @@ export function validateMaxSteps(maxSteps: number | undefined, logger?: IMastraL
   logger?.trackException(mastraError);
   throw mastraError;
 }
+
+export function validateRecoveryMaxSteps(recoveryMaxSteps: number | undefined, logger?: IMastraLogger): void {
+  if (recoveryMaxSteps === undefined || (Number.isSafeInteger(recoveryMaxSteps) && recoveryMaxSteps >= 0)) {
+    return;
+  }
+
+  const mastraError = new MastraError({
+    id: 'LLM_INVALID_RECOVERY_MAX_STEPS',
+    domain: ErrorDomain.LLM,
+    category: ErrorCategory.USER,
+    text: 'recoveryMaxSteps must be a non-negative safe integer',
+    details: { recoveryMaxSteps },
+  });
+  logger?.trackException(mastraError);
+  throw mastraError;
+}

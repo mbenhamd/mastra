@@ -1,8 +1,13 @@
 import { it, expect } from 'vitest';
 import { z } from 'zod/v4';
+import type { OutputProcessor, Processor } from '../../../../processors';
 import { createTool } from '../../../../tools';
 import { runLoopScenario, useLoopScenarioAimock, describeForAllEngines } from '../aimock-scenario';
 import type { IterationCompleteContext } from '../../../../agent';
+import {
+  AGENT_RESPONSE_RECOVERY_CONTINUATION,
+  AGENT_RESPONSE_RECOVERY_STEP,
+} from '../../../../agent/merge-execution-options';
 
 /**
  * Regression class: onIterationComplete hook — supervisor iteration tracking.
@@ -184,6 +189,232 @@ describeForAllEngines('AIMock loop scenario: onIterationComplete hook', engine =
     expect(iterations[0].toolCalls[0].name).toBe('search');
     expect(iterations[1].isFinal).toBe(true);
   });
+
+  it('reports only the current step rather than cumulative narration', async () => {
+    const iterations: IterationCompleteContext[] = [];
+    const inspectTool = createTool({
+      id: 'inspect_current_step',
+      description: 'Inspect a value before reporting it.',
+      inputSchema: z.object({ value: z.string() }),
+      outputSchema: z.object({ value: z.string() }),
+      execute: async ({ value }) => ({ value }),
+    });
+
+    await runLoopScenario({
+      engine,
+      llm: getMock(),
+      prompt: 'Inspect the value and report it.',
+      tools: { inspect_current_step: inspectTool },
+      onIterationComplete: (context: IterationCompleteContext) => {
+        iterations.push(context);
+      },
+      fixtures: llm => {
+        llm.on(
+          { endpoint: 'chat', sequenceIndex: 0 },
+          {
+            content: 'Inspecting now.',
+            toolCalls: [
+              {
+                id: 'call_inspect_current_step',
+                name: 'inspect_current_step',
+                arguments: { value: 'ready' },
+              },
+            ],
+          },
+        );
+        llm.on({ endpoint: 'chat', sequenceIndex: 1 }, { content: 'Inspection complete.' });
+      },
+    });
+
+    expect(iterations.map(iteration => iteration.text)).toEqual(['Inspecting now.', 'Inspection complete.']);
+  });
+
+  it('reports text rewritten by a successful output-step processor', async () => {
+    const rawText = 'RAW_PRIVATE_TEXT';
+    const visibleText = 'Caller-visible text.';
+    const iterations: IterationCompleteContext[] = [];
+    const rewriteProcessor: OutputProcessor = {
+      id: 'rewrite-current-step-text',
+      processOutputStep({ messages }) {
+        return messages.map(message => ({
+          ...message,
+          ...(message.content.parts.some(part => part.type === 'text' && part.text === rawText)
+            ? { id: `${message.id}-processed` }
+            : {}),
+          content: {
+            ...message.content,
+            parts: message.content.parts.map(part =>
+              part.type === 'text' && part.text === rawText ? { ...part, text: visibleText } : part,
+            ),
+          },
+        }));
+      },
+    };
+
+    await runLoopScenario({
+      engine,
+      llm: getMock(),
+      prompt: 'Return a safe summary.',
+      outputProcessors: [rewriteProcessor],
+      onIterationComplete: (context: IterationCompleteContext) => {
+        iterations.push(context);
+      },
+      fixtures: llm => {
+        llm.on({ endpoint: 'chat' }, { content: rawText });
+      },
+    });
+
+    expect(iterations).toHaveLength(1);
+    expect(iterations[0]?.text).toBe(visibleText);
+  });
+
+  it('does not fall back to raw text when an output-step processor removes the response', async () => {
+    const privateText = 'PRIVATE_REMOVED_TEXT';
+    const iterations: IterationCompleteContext[] = [];
+    const removeResponseProcessor: OutputProcessor = {
+      id: 'remove-current-step-response',
+      processOutputStep({ messages }) {
+        return messages.filter(
+          message => !message.content.parts.some(part => part.type === 'text' && part.text.includes(privateText)),
+        );
+      },
+    };
+
+    await runLoopScenario({
+      engine,
+      llm: getMock(),
+      prompt: 'Return the private marker.',
+      outputProcessors: [removeResponseProcessor],
+      onIterationComplete: (context: IterationCompleteContext) => {
+        iterations.push(context);
+      },
+      fixtures: llm => {
+        llm.on({ endpoint: 'chat' }, { content: privateText });
+      },
+    });
+
+    expect(iterations).toHaveLength(1);
+    expect(iterations[0]?.text).toBe('');
+  });
+
+  it('attributes inserted prefix text to the processed step that introduced it', async () => {
+    const firstStepText = 'First step narration.';
+    const insertedPrefix = 'Inserted prefix before prior narration.';
+    const iterations: IterationCompleteContext[] = [];
+    const inspectTool = createTool({
+      id: 'insert_prefix_attribution_probe',
+      description: 'Return a value before the final silent step.',
+      inputSchema: z.object({ value: z.string() }),
+      outputSchema: z.object({ value: z.string() }),
+      execute: async ({ value }) => ({ value }),
+    });
+    const insertPrefixBeforePriorNarration: OutputProcessor = {
+      id: 'insert-prefix-before-prior-narration',
+      processOutputStep({ messages, stepNumber }) {
+        if (stepNumber === 0) return messages;
+        return messages.map(message => {
+          const containsPriorNarration = message.content.parts.some(
+            part => part.type === 'text' && part.text === firstStepText,
+          );
+          return containsPriorNarration
+            ? {
+                ...message,
+                content: {
+                  ...message.content,
+                  parts: [{ type: 'text' as const, text: insertedPrefix }, ...message.content.parts],
+                },
+              }
+            : message;
+        });
+      },
+    };
+
+    await runLoopScenario({
+      engine,
+      llm: getMock(),
+      prompt: 'Inspect the value, then finish silently.',
+      tools: { insert_prefix_attribution_probe: inspectTool },
+      outputProcessors: [insertPrefixBeforePriorNarration],
+      onIterationComplete: (context: IterationCompleteContext) => {
+        iterations.push(context);
+      },
+      fixtures: llm => {
+        llm.on(
+          { endpoint: 'chat', sequenceIndex: 0 },
+          {
+            content: firstStepText,
+            toolCalls: [
+              {
+                id: 'call_insert_prefix_attribution_probe',
+                name: 'insert_prefix_attribution_probe',
+                arguments: { value: 'ready' },
+              },
+            ],
+          },
+        );
+        llm.on({ endpoint: 'chat', sequenceIndex: 1 }, { content: '' });
+      },
+    });
+
+    expect(iterations.map(iteration => iteration.text)).toEqual([firstStepText, '']);
+    expect(iterations[1]?.text).not.toContain(insertedPrefix);
+    expect(iterations[1]?.text).not.toContain(firstStepText);
+  });
+
+  it('keeps the current step visible when a processor removes earlier narration', async () => {
+    const earlierText = 'Private setup narration.';
+    const finalText = 'Caller-visible final answer.';
+    const iterations: IterationCompleteContext[] = [];
+    const inspectTool = createTool({
+      id: 'remove_prior_narration_probe',
+      description: 'Return a value before the final answer.',
+      inputSchema: z.object({ value: z.string() }),
+      outputSchema: z.object({ value: z.string() }),
+      execute: async ({ value }) => ({ value }),
+    });
+    const removeEarlierNarration: OutputProcessor = {
+      id: 'remove-earlier-narration',
+      processOutputStep({ messages, stepNumber }) {
+        if (stepNumber === 0) return messages;
+        return messages.map(message => ({
+          ...message,
+          content: {
+            ...message.content,
+            parts: message.content.parts.filter(part => !(part.type === 'text' && part.text === earlierText)),
+          },
+        }));
+      },
+    };
+
+    await runLoopScenario({
+      engine,
+      llm: getMock(),
+      prompt: 'Inspect the value, remove setup narration, and report the final answer.',
+      tools: { remove_prior_narration_probe: inspectTool },
+      outputProcessors: [removeEarlierNarration],
+      onIterationComplete: (context: IterationCompleteContext) => {
+        iterations.push(context);
+      },
+      fixtures: llm => {
+        llm.on(
+          { endpoint: 'chat', sequenceIndex: 0 },
+          {
+            content: earlierText,
+            toolCalls: [
+              {
+                id: 'call_remove_prior_narration_probe',
+                name: 'remove_prior_narration_probe',
+                arguments: { value: 'ready' },
+              },
+            ],
+          },
+        );
+        llm.on({ endpoint: 'chat', sequenceIndex: 1 }, { content: finalText });
+      },
+    });
+
+    expect(iterations.map(iteration => iteration.text)).toEqual([earlierText, finalText]);
+  });
 });
 
 describeForAllEngines(
@@ -217,8 +448,7 @@ describeForAllEngines(
         onIterationComplete: async (context: IterationCompleteContext) => {
           iterations.push(context);
           const segmentHasToolResults = iterations.some(entry => entry.toolResults.length > 0);
-          const segmentHasText = iterations.some(entry => entry.text.trim() !== '');
-          if (context.isFinal && !nudged && segmentHasToolResults && !segmentHasText) {
+          if (context.isFinal && !nudged && segmentHasToolResults && context.text.trim() === '') {
             nudged = true;
             return { continue: true };
           }
@@ -246,6 +476,331 @@ describeForAllEngines(
       const textDeltas = chunks?.filter(c => c.type === 'text-delta') || [];
       const text = textDeltas.map((c: any) => c.payload?.text || '').join('');
       expect(text).toContain('Created the thing "probe".');
+    });
+
+    it('continues once after earlier tool-step text and does not replay the completed tool', async () => {
+      const iterations: IterationCompleteContext[] = [];
+      let nudged = false;
+      let toolExecutions = 0;
+      let segmentHasToolResults = false;
+      let responseOnly = false;
+      const outputProcessorToolParts: Array<{ type: string; toolCallId?: string }> = [];
+
+      const updateThing = createTool({
+        id: 'update_thing',
+        description: 'Update a thing',
+        inputSchema: z.object({ name: z.string() }),
+        outputSchema: z.object({ ok: z.boolean() }),
+        execute: async () => {
+          toolExecutions += 1;
+          return { ok: true };
+        },
+      });
+
+      const { chunks, requests, output } = await runLoopScenario({
+        engine,
+        llm: getMock(),
+        prompt: 'Update the probe and report the outcome.',
+        tools: { update_thing: updateThing },
+        maxSteps: 20,
+        collectChunks: true,
+        outputProcessors: [
+          {
+            id: 'observe-recovery-tool-chunks',
+            async processOutputStream({ part }: { part: any }) {
+              if (part?.type?.startsWith?.('tool-')) {
+                outputProcessorToolParts.push({ type: part.type, toolCallId: part.payload?.toolCallId });
+              }
+              return part;
+            },
+          },
+        ],
+        prepareStep: () => (responseOnly ? { activeTools: [], toolChoice: 'none' } : undefined),
+        onIterationComplete: async (context: IterationCompleteContext) => {
+          iterations.push(context);
+          if (context.toolResults.length > 0) segmentHasToolResults = true;
+          if (responseOnly) return { continue: false };
+          if (context.isFinal && !nudged && segmentHasToolResults && context.text.trim() === '') {
+            nudged = true;
+            responseOnly = true;
+            return {
+              continue: true,
+              feedback: 'Reply with the outcome only. Do not call tools.',
+            };
+          }
+          return undefined;
+        },
+        fixtures: llm => {
+          llm.on(
+            { endpoint: 'chat', sequenceIndex: 0 },
+            {
+              content: 'I will update the probe now.',
+              toolCalls: [{ id: 'call_update_1', name: 'update_thing', arguments: { name: 'probe' } }],
+            },
+          );
+          llm.on({ endpoint: 'chat', sequenceIndex: 1 }, { content: '' });
+          // Deliberately violate the feedback. The response-only prepareStep
+          // must keep the completed action unavailable, so this call is never
+          // executed and the model gets one more chance to return plain text.
+          llm.on(
+            { endpoint: 'chat', sequenceIndex: 2 },
+            {
+              toolCalls: [{ id: 'call_update_2', name: 'update_thing', arguments: { name: 'probe' } }],
+            },
+          );
+          llm.on({ endpoint: 'chat', sequenceIndex: 3 }, { content: 'UNEXPECTED_EXTRA_RECOVERY_STEP' });
+        },
+      });
+
+      expect(toolExecutions).toBe(1);
+      expect(requests).toHaveLength(3);
+      expect(JSON.stringify(requests[2]?.body?.messages ?? [])).toContain(
+        'Reply with the outcome only. Do not call tools.',
+      );
+      expect(requests[2]?.body?.tools ?? []).toHaveLength(0);
+      expect(outputProcessorToolParts).toContainEqual({ type: 'tool-call', toolCallId: 'call_update_1' });
+      expect(
+        outputProcessorToolParts.some(part => part.toolCallId === 'call_update_1' && part.type !== 'tool-call'),
+      ).toBe(true);
+      expect(
+        outputProcessorToolParts.some(part => part.toolCallId === 'call_update_2' && part.type !== 'tool-result'),
+      ).toBe(false);
+      expect(nudged).toBe(true);
+      expect(iterations[0]).toMatchObject({
+        text: 'I will update the probe now.',
+        isFinal: false,
+      });
+      expect(iterations[1]).toMatchObject({
+        text: '',
+        isFinal: true,
+      });
+      expect(
+        (chunks ?? []).some(
+          chunk =>
+            chunk.type.startsWith('tool-') &&
+            chunk.type !== 'tool-result' &&
+            (chunk as any).payload?.toolCallId === 'call_update_2',
+        ),
+      ).toBe(false);
+      const text = (chunks ?? [])
+        .filter(chunk => chunk.type === 'text-delta')
+        .map((chunk: any) => chunk.payload?.text ?? '')
+        .join('');
+      expect(text).not.toContain('UNEXPECTED_EXTRA_RECOVERY_STEP');
+      expect(JSON.stringify((await output.getFullOutput()).steps)).not.toContain('call_update_2');
+    });
+
+    it('uses a hook-forced continuation as the only call beyond maxSteps', async () => {
+      let responseOnly = false;
+      let toolExecutions = 0;
+      const cappedTool = createTool({
+        id: 'capped_tool',
+        description: 'Run the capped action',
+        inputSchema: z.object({}),
+        outputSchema: z.object({ ok: z.boolean() }),
+        execute: async () => {
+          toolExecutions += 1;
+          return { ok: true };
+        },
+      });
+
+      const { requests, chunks } = await runLoopScenario({
+        engine,
+        llm: getMock(),
+        prompt: 'Run the capped action and report it.',
+        tools: { capped_tool: cappedTool },
+        maxSteps: 1,
+        recoveryMaxSteps: 1,
+        collectChunks: true,
+        prepareStep: () =>
+          responseOnly ? { activeTools: [], toolChoice: 'none', [AGENT_RESPONSE_RECOVERY_STEP]: true } : undefined,
+        onIterationComplete: (context: IterationCompleteContext) => {
+          if (!responseOnly && context.isFinal && context.text.trim() === '' && context.toolResults.length > 0) {
+            responseOnly = true;
+            return {
+              continue: true,
+              feedback: 'Report the completed result without tools.',
+              [AGENT_RESPONSE_RECOVERY_CONTINUATION]: true,
+            };
+          }
+          if (responseOnly) return { continue: false };
+          return undefined;
+        },
+        fixtures: llm => {
+          llm.on(
+            { endpoint: 'chat', sequenceIndex: 0 },
+            { toolCalls: [{ id: 'capped-call', name: 'capped_tool', arguments: {} }] },
+          );
+          llm.on({ endpoint: 'chat', sequenceIndex: 1 }, { content: 'The capped action succeeded.' });
+          llm.on({ endpoint: 'chat', sequenceIndex: 2 }, { content: 'UNEXPECTED_THIRD_CALL' });
+        },
+      });
+
+      expect(toolExecutions).toBe(1);
+      expect(requests).toHaveLength(2);
+      expect(requests[1]?.body?.tools ?? []).toHaveLength(0);
+      const text = (chunks ?? [])
+        .filter(chunk => chunk.type === 'text-delta')
+        .map((chunk: any) => chunk.payload?.text ?? '')
+        .join('');
+      expect(text).toContain('The capped action succeeded.');
+      expect(text).not.toContain('UNEXPECTED_THIRD_CALL');
+    });
+
+    it('does not continue when the recovery hook aborts the run', async () => {
+      const abortController = new AbortController();
+      let responseOnly = false;
+      const recoveryTool = createTool({
+        id: 'abort_recovery_tool',
+        description: 'Run work before recovery',
+        inputSchema: z.object({}),
+        outputSchema: z.object({ ok: z.boolean() }),
+        execute: async () => ({ ok: true }),
+      });
+
+      const { requests } = await runLoopScenario({
+        engine,
+        llm: getMock(),
+        prompt: 'Run work, then recover.',
+        tools: { abort_recovery_tool: recoveryTool },
+        maxSteps: 1,
+        recoveryMaxSteps: 1,
+        abortSignal: abortController.signal,
+        prepareStep: () => (responseOnly ? { activeTools: [], toolChoice: 'none' } : undefined),
+        onIterationComplete: (context: IterationCompleteContext) => {
+          if (context.isFinal && context.toolResults.length > 0) {
+            responseOnly = true;
+            abortController.abort();
+            return {
+              continue: true,
+              [AGENT_RESPONSE_RECOVERY_CONTINUATION]: true,
+            };
+          }
+          return undefined;
+        },
+        fixtures: llm => {
+          llm.on(
+            { endpoint: 'chat', sequenceIndex: 0 },
+            { toolCalls: [{ id: 'abort-recovery-call', name: 'abort_recovery_tool', arguments: {} }] },
+          );
+          llm.on({ endpoint: 'chat', sequenceIndex: 1 }, { content: 'UNEXPECTED_ABORTED_RECOVERY' });
+        },
+      });
+
+      expect(requests).toHaveLength(1);
+    });
+
+    it('does not spend recoveryMaxSteps on an ordinary continued tool iteration', async () => {
+      let toolExecutions = 0;
+      const ordinaryTool = createTool({
+        id: 'ordinary_tool',
+        description: 'Run ordinary work',
+        inputSchema: z.object({}),
+        outputSchema: z.object({ ok: z.boolean() }),
+        execute: async () => {
+          toolExecutions += 1;
+          return { ok: true };
+        },
+      });
+
+      const { requests } = await runLoopScenario({
+        engine,
+        llm: getMock(),
+        prompt: 'Run ordinary work.',
+        tools: { ordinary_tool: ordinaryTool },
+        maxSteps: 1,
+        recoveryMaxSteps: 1,
+        fixtures: llm => {
+          llm.on(
+            { endpoint: 'chat', sequenceIndex: 0 },
+            { toolCalls: [{ id: 'ordinary-call-1', name: 'ordinary_tool', arguments: {} }] },
+          );
+          llm.on(
+            { endpoint: 'chat', sequenceIndex: 1 },
+            { toolCalls: [{ id: 'ordinary-call-2', name: 'ordinary_tool', arguments: {} }] },
+          );
+        },
+      });
+
+      expect(requests).toHaveLength(1);
+      expect(toolExecutions).toBe(1);
+    });
+
+    it('does not reopen a tripwire stop after earlier tool work', async () => {
+      const iterations: IterationCompleteContext[] = [];
+      let toolExecutions = 0;
+      let segmentHasToolResults = false;
+
+      const inspectThing = createTool({
+        id: 'inspect_thing',
+        description: 'Inspect a thing',
+        inputSchema: z.object({ name: z.string() }),
+        outputSchema: z.object({ ok: z.boolean() }),
+        execute: async () => {
+          toolExecutions += 1;
+          return { ok: true };
+        },
+      });
+      const blockFinalResponse = {
+        id: 'block-final-response',
+        processOutputStep: async ({
+          text,
+          abort,
+          messages,
+        }: Parameters<NonNullable<Processor['processOutputStep']>>[0]) => {
+          if (text === '') abort('Blocked after tool inspection.');
+          return messages;
+        },
+      } satisfies Processor;
+
+      const { output, requests } = await runLoopScenario({
+        engine,
+        llm: getMock(),
+        prompt: 'Inspect the probe and report the outcome.',
+        tools: { inspect_thing: inspectThing },
+        outputProcessors: [blockFinalResponse],
+        maxSteps: 20,
+        onIterationComplete: async (context: IterationCompleteContext) => {
+          iterations.push(context);
+          if (context.toolResults.length > 0) segmentHasToolResults = true;
+          const safetyBlocked = context.finishReason === 'tripwire' || context.finishReason === 'content-filter';
+          if (context.isFinal && segmentHasToolResults && context.text.trim() === '' && !safetyBlocked) {
+            return {
+              continue: true,
+              feedback: 'Reply with the outcome only. Do not call tools.',
+            };
+          }
+          return undefined;
+        },
+        fixtures: llm => {
+          llm.on(
+            { endpoint: 'chat', sequenceIndex: 0 },
+            {
+              content: 'I will inspect the probe now.',
+              toolCalls: [{ id: 'call_inspect_1', name: 'inspect_thing', arguments: { name: 'probe' } }],
+            },
+          );
+          llm.on({ endpoint: 'chat', sequenceIndex: 1 }, { content: '' });
+          llm.on({ endpoint: 'chat', sequenceIndex: 2 }, { content: 'UNEXPECTED_REOPENED_GENERATION' });
+        },
+      });
+
+      expect(toolExecutions).toBe(1);
+      expect(requests).toHaveLength(2);
+      if (engine === 'durable') {
+        // Durable terminalizes the tripwire before a second iteration callback;
+        // there is therefore no callback opportunity to reopen the run.
+        expect(iterations).toHaveLength(1);
+      } else {
+        expect(iterations).toHaveLength(2);
+        expect(iterations[1]).toMatchObject({
+          text: '',
+          isFinal: true,
+          finishReason: 'tripwire',
+        });
+      }
+      expect(await output.finishReason).toBe(engine === 'durable' ? 'other' : 'tripwire');
+      expect(await output.text).not.toContain('UNEXPECTED_REOPENED_GENERATION');
     });
   },
 );
