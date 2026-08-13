@@ -1735,6 +1735,8 @@ export class ObservationalMemory {
     messageList: MessageList,
   ): { threadId: string; resourceId?: string } | null {
     // First try RequestContext (set by Memory)
+    // Pinned Prettier and Oxfmt disagree on this assertion's line wrapping.
+    // prettier-ignore
     const memoryContext = requestContext?.get('MastraMemory') as
       | { thread?: { id: string }; resourceId?: string }
       | undefined;

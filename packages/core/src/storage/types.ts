@@ -265,6 +265,8 @@ export interface DeleteCompletedWorkflowTerminalizationsInput {
   olderThan: Date;
 }
 
+// Pinned Prettier and Oxfmt disagree on this union's line wrapping.
+// prettier-ignore
 export type DeleteCompletedWorkflowTerminalizationsResult =
   | { status: 'deleted'; count: number }
   | { status: 'missing_run' | 'unsupported'; count: 0 };

@@ -1151,6 +1151,8 @@ export class MemoryPG extends MemoryStorage {
     details,
     rawError,
   }: {
+    // Pinned Prettier and Oxfmt disagree on this union's line wrapping.
+    // prettier-ignore
     operation:
       | 'LIST_THREADS'
       | 'LIST_MESSAGES_BY_ID'

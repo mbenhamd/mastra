@@ -1245,6 +1245,8 @@ export type SharedMemoryConfig = {
 /** @deprecated Use the `format` field on `WorkingMemoryTemplate` discriminated union instead. */
 export type WorkingMemoryFormat = 'json' | 'markdown';
 
+// Pinned Prettier and Oxfmt disagree on this union's line wrapping.
+// prettier-ignore
 export type WorkingMemoryTemplate =
   | { format: 'markdown'; content: string }
   | { format: 'json'; content: string | Record<string, unknown> };
