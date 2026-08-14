@@ -3288,23 +3288,25 @@ Notes:
   }): Promise<MastraDBMessage[]> {
     if (messages.length === 0) return [];
 
+    const canonicalMessages = [...new Map(messages.map(message => [message.id, message])).values()];
+
     const memoryStore = await this.getMemoryStore();
     const config = this.getMergedThreadConfig(memoryConfig);
     const existingMessagesResult = await memoryStore.listMessagesById({
-      messageIds: messages.map(message => message.id),
+      messageIds: canonicalMessages.map(message => message.id),
     });
     const existingMessages = existingMessagesResult.messages;
     const existingMessagesMap = new Map(existingMessages.map(message => [message.id, message]));
     const retractionCoordinates = await this.getObservationalMemoryRetractionCoordinatesForUpdates(
       memoryStore,
       existingMessages,
-      messages,
+      canonicalMessages,
     );
     const atomicRetraction = memoryStore.supportsAtomicObservationalMemoryRetraction === true;
 
     // Update vector database if semantic recall is enabled and any messages have content updates
     if (this.vector && config.semanticRecall) {
-      const messagesWithContent = messages.filter(m => m.content !== undefined);
+      const messagesWithContent = canonicalMessages.filter(m => m.content !== undefined);
 
       if (messagesWithContent.length > 0) {
         // Collect embeddings for messages with new text content
@@ -3447,7 +3449,7 @@ Notes:
     let updatedMessages: MastraDBMessage[];
     try {
       updatedMessages = await memoryStore.updateMessages({
-        messages,
+        messages: canonicalMessages,
         ...(atomicRetraction
           ? {
               retractObservationalMemory: true,

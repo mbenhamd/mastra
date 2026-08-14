@@ -2,7 +2,7 @@
 '@mastra/memory': minor
 ---
 
-Improved Working Memory updates so owner corrections win over stale observations, protected JSON fields remain unchanged during later observation, and configured byte limits are enforced before persistence.
+Improved Working Memory updates so owner corrections win over stale observations, protected JSON fields remain unchanged during later observation, and configured byte limits are enforced before persistence. Duplicate message updates now apply only the final update for each message ID to semantic recall, derived-memory retraction, and storage.
 
 **Before**
 

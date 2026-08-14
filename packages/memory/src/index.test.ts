@@ -4036,6 +4036,123 @@ describe('Memory', () => {
       ).resolves.toBeNull();
     });
 
+    it('canonicalizes duplicate message updates before semantic and storage side effects', async () => {
+      const storage = new InMemoryStore();
+      const memoryStore = (await storage.getStore('memory'))!;
+      const mockVector: MastraVector = {
+        createIndex: vi.fn().mockResolvedValue(undefined),
+        upsert: vi.fn().mockResolvedValue(undefined),
+        query: vi.fn(),
+        listIndexes: vi.fn().mockResolvedValue([]),
+        deleteVectors: vi.fn().mockResolvedValue(undefined),
+        describeIndex: vi.fn().mockResolvedValue({ dimension: 3 }),
+        id: 'duplicate-update-vector',
+      } as any;
+      const mockEmbedder = {
+        doEmbed: vi.fn().mockResolvedValue({ embeddings: [[0.1, 0.2, 0.3]] }),
+        modelId: 'duplicate-update-embedder',
+        specificationVersion: 'v1',
+        provider: 'mock',
+      } as any;
+      const memory = new Memory({
+        storage,
+        vector: mockVector,
+        embedder: mockEmbedder,
+        options: { semanticRecall: { scope: 'thread' } },
+      });
+      const now = new Date('2026-01-01T00:00:00.000Z');
+      Object.defineProperty(memoryStore, 'supportsAtomicObservationalMemoryRetraction', {
+        configurable: true,
+        value: false,
+      });
+
+      for (const suffix of ['source', 'discarded', 'canonical']) {
+        await memoryStore.saveThread({
+          thread: {
+            id: `thread-${suffix}`,
+            resourceId: `resource-${suffix}`,
+            title: suffix,
+            metadata: {},
+            createdAt: now,
+            updatedAt: now,
+          },
+        });
+        await memoryStore.initializeObservationalMemory({
+          threadId: `thread-${suffix}`,
+          resourceId: `resource-${suffix}`,
+          scope: 'thread',
+        });
+      }
+      await memoryStore.saveMessages({
+        messages: [
+          {
+            id: 'message-duplicate-update',
+            threadId: 'thread-source',
+            resourceId: 'resource-source',
+            role: 'user',
+            content: { format: 2, parts: [{ type: 'text', text: 'Original content' }] },
+            createdAt: now,
+          },
+        ],
+      });
+      const listMessagesById = vi.spyOn(memoryStore, 'listMessagesById');
+      const updateMessages = vi.spyOn(memoryStore, 'updateMessages');
+
+      const updatedMessages = await memory.updateMessages({
+        messages: [
+          {
+            id: 'message-duplicate-update',
+            threadId: 'thread-discarded',
+            resourceId: 'resource-discarded',
+            content: { format: 2, parts: [{ type: 'text', text: 'Discarded content' }] },
+          },
+          {
+            id: 'message-duplicate-update',
+            threadId: 'thread-canonical',
+            resourceId: 'resource-canonical',
+            content: { format: 2, parts: [{ type: 'text', text: 'Canonical content' }] },
+          },
+        ],
+      });
+
+      expect(mockEmbedder.doEmbed).toHaveBeenCalledTimes(1);
+      expect(mockEmbedder.doEmbed).toHaveBeenCalledWith({ values: ['Canonical content'] });
+      expect(mockVector.upsert).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(mockVector.upsert).mock.calls[0]![0].metadata).toEqual([
+        expect.objectContaining({
+          message_id: 'message-duplicate-update',
+          content: 'Canonical content',
+        }),
+      ]);
+      expect(listMessagesById).toHaveBeenCalledWith({ messageIds: ['message-duplicate-update'] });
+      expect(updateMessages).toHaveBeenCalledTimes(1);
+      expect(updateMessages.mock.calls[0]![0].messages).toEqual([
+        expect.objectContaining({
+          id: 'message-duplicate-update',
+          threadId: 'thread-canonical',
+          resourceId: 'resource-canonical',
+          content: expect.objectContaining({
+            parts: [{ type: 'text', text: 'Canonical content' }],
+          }),
+        }),
+      ]);
+      expect(updatedMessages).toEqual([
+        expect.objectContaining({
+          id: 'message-duplicate-update',
+          threadId: 'thread-canonical',
+          resourceId: 'resource-canonical',
+          content: expect.objectContaining({
+            parts: [{ type: 'text', text: 'Canonical content' }],
+          }),
+        }),
+      ]);
+      await expect(memoryStore.getObservationalMemory('thread-source', 'resource-source')).resolves.toBeNull();
+      await expect(memoryStore.getObservationalMemory('thread-canonical', 'resource-canonical')).resolves.toBeNull();
+      await expect(
+        memoryStore.getObservationalMemory('thread-discarded', 'resource-discarded'),
+      ).resolves.not.toBeNull();
+    });
+
     it('keeps fallback vector cleanup scoped to the retracted thread generation', async () => {
       const storage = new InMemoryStore();
       const memoryStore = (await storage.getStore('memory'))!;
