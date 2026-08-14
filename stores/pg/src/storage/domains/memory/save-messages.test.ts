@@ -84,7 +84,12 @@ class RecordingTxClient implements TxClient {
     throw new Error('not implemented');
   }
 
-  async manyOrNone<T = any>(): Promise<T[]> {
+  async manyOrNone<T = any>(query: string, values?: QueryValues): Promise<T[]> {
+    if (query.includes('SELECT id, "resourceId" FROM') && query.includes('mastra_threads')) {
+      return (values ?? [])
+        .map(value => this.threads.get(String(value)))
+        .filter((thread): thread is Record<string, unknown> => thread !== undefined) as T[];
+    }
     return this.sourceMessages as T[];
   }
 

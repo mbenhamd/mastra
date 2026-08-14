@@ -73,6 +73,13 @@ class ThreadCloneRollbackConflictError extends Error {
   }
 }
 
+class MessageMutationConflictError extends Error {
+  constructor(readonly messageId: string) {
+    super(`Message ${messageId} changed concurrently while its observational memory was being retracted.`);
+    this.name = 'MessageMutationConflictError';
+  }
+}
+
 /**
  * Columns added to the OM table after its initial release.
  * Used in `alterTable({ ifNotExists })` so that databases created on older
@@ -174,8 +181,10 @@ type MessageRowFromDB = {
   createdAt: Date | string;
   createdAtZ?: Date | string;
   threadId: string;
-  resourceId: string;
+  resourceId: string | null;
 };
+
+type MessageCoordinateRow = Pick<MessageRowFromDB, 'id' | 'threadId' | 'resourceId'>;
 
 function getManagedWorkingMemoryScope(config: unknown): 'thread' | 'resource' | undefined {
   let parsed = config;
@@ -331,6 +340,22 @@ function hasSameUniqueStrings(left: readonly string[], right: readonly string[])
   const sortedLeft = [...left].sort();
   const sortedRight = [...right].sort();
   return sortedLeft.every((value, index) => value === sortedRight[index]);
+}
+
+function sortedUniqueStrings(values: Iterable<string | null | undefined>): string[] {
+  return [...new Set([...values].filter((value): value is string => typeof value === 'string'))].sort();
+}
+
+function hasSameMessageCoordinates(
+  left: readonly MessageCoordinateRow[],
+  right: readonly MessageCoordinateRow[],
+): boolean {
+  if (left.length !== right.length) return false;
+  const rightById = new Map(right.map(message => [message.id, message]));
+  return left.every(message => {
+    const current = rightById.get(message.id);
+    return current?.threadId === message.threadId && current.resourceId === message.resourceId;
+  });
 }
 
 export class MemoryPG extends MemoryStorage {
@@ -840,6 +865,7 @@ export class MemoryPG extends MemoryStorage {
       const createdAt = toUtcISOString(thread.createdAt);
       const updatedAt = toUtcISOString(thread.updatedAt);
       return await this.#db.client.tx(async t => {
+        await this.lockThreadLifecycles(t, [thread.id]);
         await this.lockWorkingMemoryTarget(t, 'thread', thread.id);
         const currentRow = await t.oneOrNone<{ resourceId: string; metadata: unknown }>(
           `SELECT "resourceId", metadata FROM ${tableName} WHERE id = $1 FOR UPDATE`,
@@ -989,7 +1015,8 @@ export class MemoryPG extends MemoryStorage {
       const threadTableName = getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) });
       let committedRetraction: ObservationalMemoryRetractionReceipt | undefined;
       await this.#db.client.tx(async t => {
-        const thread = await t.oneOrNone<{ resourceId: string }>(
+        await this.lockThreadLifecycles(t, [threadId]);
+        const threadSnapshot = await t.oneOrNone<{ resourceId: string }>(
           `SELECT "resourceId" FROM ${threadTableName} WHERE id = $1`,
           [threadId],
         );
@@ -999,17 +1026,25 @@ export class MemoryPG extends MemoryStorage {
           [schemaName, OM_TABLE],
         );
         let retraction: RetractObservationalMemoryResult | undefined;
-        if (thread?.resourceId) {
+        if (threadSnapshot?.resourceId) {
           if (omTableExists !== null) {
             const input = {
-              resourceId: thread.resourceId,
+              resourceId: threadSnapshot.resourceId,
               threadId,
             };
             retraction = await this.retractObservationalMemoryInTransaction(t, input);
             committedRetraction = { input, result: retraction };
           } else {
-            await this.lockObservationalMemoryResource(t, thread.resourceId);
+            await this.lockObservationalMemoryResource(t, threadSnapshot.resourceId);
           }
+        }
+
+        const thread = await t.oneOrNone<{ resourceId: string }>(
+          `SELECT "resourceId" FROM ${threadTableName} WHERE id = $1 FOR UPDATE`,
+          [threadId],
+        );
+        if (thread?.resourceId !== threadSnapshot?.resourceId) {
+          throw new Error(`Thread ${threadId} changed resources while it was being deleted.`);
         }
 
         await t.none(`DELETE FROM ${tableName} WHERE thread_id = $1`, [threadId]);
@@ -1033,7 +1068,9 @@ export class MemoryPG extends MemoryStorage {
           const vectorTableName = getTableName({ indexName: tablename, schemaName: getSchemaName(this.#schema) });
           const isObservationTable =
             tablename === 'memory_observations' || tablename.startsWith('memory_observations_');
-          const clearedResourceId = retraction?.clearedScopes.includes('resource') ? thread?.resourceId : undefined;
+          const clearedResourceId = retraction?.clearedScopes.includes('resource')
+            ? threadSnapshot?.resourceId
+            : undefined;
           if (isObservationTable && clearedResourceId) {
             await t.none(`DELETE FROM ${vectorTableName} WHERE metadata->>'resource_id' = $1`, [clearedResourceId]);
           } else {
@@ -1229,7 +1266,7 @@ export class MemoryPG extends MemoryStorage {
       role: normalized.role as MastraDBMessage['role'],
       createdAt: new Date(normalized.createdAt as string),
       threadId: normalized.threadId,
-      resourceId: normalized.resourceId,
+      resourceId: normalized.resourceId ?? undefined,
       ...(normalized.type && normalized.type !== 'v2' ? { type: normalized.type } : {}),
     } satisfies MastraDBMessage;
   }
@@ -1871,15 +1908,18 @@ export class MemoryPG extends MemoryStorage {
       const messagesToSave = dedupeMessagesForSave(messages);
       const threadTableName = getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) });
       await this.#db.client.tx(async t => {
-        for (const threadIdToCheck of [...threadIds].sort()) {
-          await this.lockThreadCloneLifecycle(t, threadIdToCheck);
-          const thread = await t.oneOrNone<{ id: string }>(
-            `SELECT id FROM ${threadTableName} WHERE id = $1 FOR UPDATE`,
-            [threadIdToCheck],
-          );
-          if (!thread) {
-            throw new Error(`Thread ${threadIdToCheck} no longer exists.`);
-          }
+        await this.lockThreadLifecycles(t, threadIds);
+        const sortedThreadIds = sortedUniqueStrings(threadIds);
+        const lockedThreads = await this.lockThreadRows(t, sortedThreadIds);
+        if (
+          !hasSameUniqueStrings(
+            lockedThreads.map(thread => thread.id),
+            sortedThreadIds,
+          )
+        ) {
+          const lockedThreadIds = new Set(lockedThreads.map(thread => thread.id));
+          const missingThreadId = sortedThreadIds.find(threadId => !lockedThreadIds.has(threadId));
+          throw new Error(`Thread ${missingThreadId ?? sortedThreadIds[0]} no longer exists.`);
         }
         for (let offset = 0; offset < messagesToSave.length; offset += MAX_MESSAGES_PER_INSERT) {
           const batch = messagesToSave.slice(offset, offset + MAX_MESSAGES_PER_INSERT);
@@ -1983,42 +2023,69 @@ export class MemoryPG extends MemoryStorage {
     }
 
     const messageIds = messages.map(m => m.id);
-
-    const selectQuery = `SELECT id, content, role, type, "createdAt", "createdAtZ", thread_id AS "threadId", "resourceId" FROM ${getTableName({ indexName: TABLE_MESSAGES, schemaName: getSchemaName(this.#schema) })} WHERE id IN (${inPlaceholders(messageIds.length)})`;
-
-    const existingMessagesDb = await this.#db.client.manyOrNone(selectQuery, messageIds);
-
-    if (existingMessagesDb.length === 0) {
-      return [];
-    }
-
-    const existingMessages: MastraDBMessage[] = existingMessagesDb.map(msg => {
-      if (typeof msg.content === 'string') {
-        try {
-          msg.content = JSON.parse(msg.content);
-        } catch {
-          // ignore if not valid json
-        }
-      }
-      return msg as MastraDBMessage;
+    const messageTableName = getTableName({
+      indexName: TABLE_MESSAGES,
+      schemaName: getSchemaName(this.#schema),
     });
+    const threadTableName = getTableName({
+      indexName: TABLE_THREADS,
+      schemaName: getSchemaName(this.#schema),
+    });
+    const selectQuery = `SELECT id, content, role, type, "createdAt", "createdAtZ", thread_id AS "threadId", "resourceId"
+      FROM ${messageTableName}
+      WHERE id IN (${inPlaceholders(messageIds.length)})
+      ORDER BY id`;
 
-    const threadIdsToUpdate = new Set<string>();
+    let existingMessages: MastraDBMessage[] = [];
     const committedRetractions: ObservationalMemoryRetractionReceipt[] = [];
 
     await this.#db.client.tx(async t => {
+      // This first read intentionally takes no row lock: OM advisory locks must
+      // precede thread/message row locks. Shared thread lifecycle locks and the
+      // authoritative checks below turn coordinate drift into a rolled-back
+      // conflict instead of retracting A and then mutating a message now at B.
+      const discoveredRows = await t.manyOrNone<MessageRowFromDB>(selectQuery, messageIds);
+      if (discoveredRows.length === 0) return;
+
+      const updatesById = new Map(messages.map(message => [message.id, message]));
+      const mutationThreadIds = sortedUniqueStrings(
+        discoveredRows.flatMap(message => [message.threadId, updatesById.get(message.id)?.threadId]),
+      );
+      await this.lockThreadLifecycles(t, mutationThreadIds);
+
+      const coordinateRows = await t.manyOrNone<MessageRowFromDB>(selectQuery, messageIds);
+      if (!hasSameMessageCoordinates(discoveredRows, coordinateRows)) {
+        throw new MessageMutationConflictError(messageIds[0]!);
+      }
+
+      const discoveredThreadRows =
+        mutationThreadIds.length === 0
+          ? []
+          : await t.manyOrNone<{ id: string; resourceId: string }>(
+              `SELECT id, "resourceId" FROM ${threadTableName}
+               WHERE id IN (${inPlaceholders(mutationThreadIds.length)})
+               ORDER BY id`,
+              mutationThreadIds,
+            );
+      const threadResources = new Map(discoveredThreadRows.map(thread => [thread.id, thread.resourceId]));
+
       if (retractObservationalMemory) {
-        const updatesById = new Map(messages.map(message => [message.id, message]));
-        const retractionRows = existingMessages.flatMap(existingMessage => {
+        const retractionRows = coordinateRows.flatMap(existingMessage => {
           const update = updatesById.get(existingMessage.id);
           const destinationThreadId = update?.threadId ?? existingMessage.threadId;
+          const sourceResourceId = existingMessage.resourceId ?? threadResources.get(existingMessage.threadId);
           return [
-            existingMessage,
+            {
+              threadId: existingMessage.threadId,
+              resourceId: sourceResourceId,
+            },
             {
               threadId: destinationThreadId,
               resourceId:
                 update?.resourceId ??
-                (destinationThreadId === existingMessage.threadId ? existingMessage.resourceId : undefined),
+                (destinationThreadId === existingMessage.threadId
+                  ? sourceResourceId
+                  : threadResources.get(destinationThreadId)),
             },
           ];
         });
@@ -2027,7 +2094,36 @@ export class MemoryPG extends MemoryStorage {
         );
       }
 
-      const queries = [];
+      const lockedThreadRows = await this.lockThreadRows(t, mutationThreadIds);
+      if (
+        discoveredThreadRows.length !== lockedThreadRows.length ||
+        discoveredThreadRows.some(
+          discovered =>
+            lockedThreadRows.find(locked => locked.id === discovered.id)?.resourceId !== discovered.resourceId,
+        )
+      ) {
+        throw new MessageMutationConflictError(messageIds[0]!);
+      }
+
+      const lockedMessageRows = await this.lockMessageRows(t, messageTableName, messageIds);
+      if (!hasSameMessageCoordinates(coordinateRows, lockedMessageRows)) {
+        throw new MessageMutationConflictError(messageIds[0]!);
+      }
+
+      existingMessages = lockedMessageRows.map(row => {
+        const normalized = this.normalizeMessageRow(row);
+        if (typeof normalized.content === 'string') {
+          try {
+            return { ...normalized, content: JSON.parse(normalized.content) } as MastraDBMessage;
+          } catch {
+            // Preserve non-JSON message content exactly as stored.
+          }
+        }
+        return normalized as MastraDBMessage;
+      });
+
+      const lockedRowsById = new Map(lockedMessageRows.map(message => [message.id, message]));
+      const threadIdsToUpdate = new Set<string>();
       const columnMapping: Record<string, string> = {
         threadId: 'thread_id',
       };
@@ -2077,27 +2173,35 @@ export class MemoryPG extends MemoryStorage {
         }
 
         if (setClauses.length > 0) {
-          values.push(id);
-          const sql = `UPDATE ${getTableName({ indexName: TABLE_MESSAGES, schemaName: getSchemaName(this.#schema) })} SET ${setClauses.join(', ')} WHERE id = $${paramIndex}`;
-          queries.push(t.none(sql, values));
+          const lockedRow = lockedRowsById.get(id);
+          if (!lockedRow) throw new MessageMutationConflictError(id);
+          values.push(id, lockedRow.threadId, lockedRow.resourceId);
+          const updated = await t.oneOrNone<{ id: string }>(
+            `UPDATE ${messageTableName}
+             SET ${setClauses.join(', ')}
+             WHERE id = $${paramIndex++}
+               AND thread_id = $${paramIndex++}
+               AND "resourceId" IS NOT DISTINCT FROM $${paramIndex}
+             RETURNING id`,
+            values,
+          );
+          if (!updated) throw new MessageMutationConflictError(id);
         }
       }
 
       if (threadIdsToUpdate.size > 0) {
-        const threadIds = Array.from(threadIdsToUpdate);
-        queries.push(
-          t.none(
-            `UPDATE ${getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) })} SET "updatedAt" = NOW(), "updatedAtZ" = NOW() WHERE id IN (${inPlaceholders(threadIds.length)})`,
-            threadIds,
-          ),
+        const threadIds = [...threadIdsToUpdate].sort();
+        await t.none(
+          `UPDATE ${threadTableName}
+           SET "updatedAt" = NOW(), "updatedAtZ" = NOW()
+           WHERE id IN (${inPlaceholders(threadIds.length)})`,
+          threadIds,
         );
-      }
-
-      if (queries.length > 0) {
-        await t.batch(queries);
       }
     });
     observationalMemoryRetractions?.push(...committedRetractions);
+
+    if (existingMessages.length === 0) return [];
 
     const updatedMessages = await this.#db.client.manyOrNone<MessageRowFromDB>(selectQuery, messageIds);
 
@@ -2132,21 +2236,63 @@ export class MemoryPG extends MemoryStorage {
 
       await this.#db.client.tx(async t => {
         const placeholders = messageIds.map((_, idx) => `$${idx + 1}`).join(',');
-        const messages = await t.manyOrNone<{ threadId: string; resourceId: string | null }>(
-          `SELECT DISTINCT
+        const coordinateQuery = `SELECT
+             messages.id,
              messages.thread_id AS "threadId",
-             COALESCE(messages."resourceId", threads."resourceId") AS "resourceId"
+             messages."resourceId",
+             COALESCE(messages."resourceId", threads."resourceId") AS "resolvedResourceId"
            FROM ${messageTableName} AS messages
            LEFT JOIN ${threadTableName} AS threads ON threads.id = messages.thread_id
-           WHERE messages.id IN (${placeholders})`,
-          messageIds,
-        );
+           WHERE messages.id IN (${placeholders})
+           ORDER BY messages.id`;
+        const discoveredMessages = await t.manyOrNone<{
+          id: string;
+          threadId: string;
+          resourceId: string | null;
+          resolvedResourceId: string | null;
+        }>(coordinateQuery, messageIds);
+        if (discoveredMessages.length === 0) return;
 
-        if (options?.retractObservationalMemory) {
-          committedRetractions.push(...(await this.retractObservationalMemoryForMessageRowsInTransaction(t, messages)));
+        const threadIds = sortedUniqueStrings(discoveredMessages.map(message => message.threadId));
+        await this.lockThreadLifecycles(t, threadIds);
+
+        const messages = await t.manyOrNone<{
+          id: string;
+          threadId: string;
+          resourceId: string | null;
+          resolvedResourceId: string | null;
+        }>(coordinateQuery, messageIds);
+        if (!hasSameMessageCoordinates(discoveredMessages, messages)) {
+          throw new MessageMutationConflictError(messageIds[0]!);
         }
 
-        const threadIds = messages?.map(message => message.threadId).filter(Boolean) || [];
+        if (options?.retractObservationalMemory) {
+          committedRetractions.push(
+            ...(await this.retractObservationalMemoryForMessageRowsInTransaction(
+              t,
+              messages.map(message => ({
+                threadId: message.threadId,
+                resourceId: message.resolvedResourceId,
+              })),
+            )),
+          );
+        }
+
+        const lockedThreadRows = await this.lockThreadRows(t, threadIds);
+        const threadResources = new Map(lockedThreadRows.map(thread => [thread.id, thread.resourceId]));
+        if (
+          messages.some(
+            message =>
+              message.resourceId === null && threadResources.get(message.threadId) !== message.resolvedResourceId,
+          )
+        ) {
+          throw new MessageMutationConflictError(messageIds[0]!);
+        }
+
+        const lockedMessages = await this.lockMessageRows(t, messageTableName, messageIds);
+        if (!hasSameMessageCoordinates(messages, lockedMessages)) {
+          throw new MessageMutationConflictError(messageIds[0]!);
+        }
 
         await t.none(`DELETE FROM ${messageTableName} WHERE id IN (${placeholders})`, messageIds);
 
@@ -3198,7 +3344,17 @@ export class MemoryPG extends MemoryStorage {
     try {
       return await this.#db.client.tx(async t => {
         const { thread: receipt, observationalMemory, unverifiedObservationalMemoryRecordId } = input;
-        await this.lockThreadCloneLifecycle(t, receipt.threadId);
+        await this.lockThreadLifecycles(t, [receipt.threadId]);
+        const threadSnapshot = await t.oneOrNone<{ resourceId: string }>(
+          `SELECT "resourceId" FROM ${threadTableName} WHERE id = $1`,
+          [receipt.threadId],
+        );
+        if (!threadSnapshot) return { status: 'conflict', reason: 'thread' };
+
+        // OM advisory locks must be acquired before either the thread row or
+        // its messages. delete/retraction paths take the same order, so neither
+        // side can hold a row the other needs while waiting on the OM lock.
+        await this.lockObservationalMemoryResources(t, [threadSnapshot.resourceId, observationalMemory?.resourceId]);
         const thread = await t.oneOrNone<{ resourceId: string; storageGeneration: string }>(
           `SELECT "resourceId", xmin::text AS "storageGeneration"
            FROM ${threadTableName} WHERE id = $1 FOR UPDATE`,
@@ -3209,7 +3365,7 @@ export class MemoryPG extends MemoryStorage {
         }
 
         const currentMessages = await t.manyOrNone<{ id: string }>(
-          `SELECT id FROM ${messageTableName} WHERE thread_id = $1 FOR UPDATE`,
+          `SELECT id FROM ${messageTableName} WHERE thread_id = $1 ORDER BY id FOR UPDATE`,
           [receipt.threadId],
         );
         if (
@@ -3228,7 +3384,6 @@ export class MemoryPG extends MemoryStorage {
         ) {
           return { status: 'conflict', reason: 'observational_memory' };
         }
-        await this.lockObservationalMemoryResource(t, observationalMemory?.resourceId ?? thread.resourceId);
         const schemaName = this.#schema || 'public';
         const omTableExists =
           (await t.oneOrNone<{ tablename: string }>(
@@ -3316,10 +3471,72 @@ export class MemoryPG extends MemoryStorage {
     await t.none('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`mastra:thread-clone:${threadId}`]);
   }
 
+  /**
+   * Memory mutations acquire locks in this order:
+   *
+   * 1. lexically sorted thread lifecycle/ownership advisory locks;
+   * 2. lexically sorted observational-memory resource advisory locks;
+   * 3. working-memory advisory locks when applicable;
+   * 4. thread/resource rows; and
+   * 5. message rows.
+   *
+   * The advisory key predates its broader ownership role, so it intentionally
+   * retains the `thread-clone` prefix for cross-version serialization.
+   */
+  private async lockThreadLifecycles(t: TxClient, threadIds: Iterable<string>): Promise<void> {
+    for (const threadId of sortedUniqueStrings(threadIds)) {
+      await this.lockThreadCloneLifecycle(t, threadId);
+    }
+  }
+
   private async lockObservationalMemoryResource(t: TxClient, resourceId: string): Promise<void> {
     await t.none('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [
       `mastra:observational-memory:${resourceId}`,
     ]);
+  }
+
+  private async lockObservationalMemoryResources(
+    t: TxClient,
+    resourceIds: Iterable<string | null | undefined>,
+  ): Promise<void> {
+    for (const resourceId of sortedUniqueStrings(resourceIds)) {
+      await this.lockObservationalMemoryResource(t, resourceId);
+    }
+  }
+
+  private async lockThreadRows(
+    t: TxClient,
+    threadIds: Iterable<string>,
+  ): Promise<Array<{ id: string; resourceId: string }>> {
+    const sortedThreadIds = sortedUniqueStrings(threadIds);
+    if (sortedThreadIds.length === 0) return [];
+    return t.manyOrNone<{ id: string; resourceId: string }>(
+      `SELECT id, "resourceId" FROM ${getTableName({
+        indexName: TABLE_THREADS,
+        schemaName: getSchemaName(this.#schema),
+      })}
+       WHERE id IN (${inPlaceholders(sortedThreadIds.length)})
+       ORDER BY id
+       FOR UPDATE`,
+      sortedThreadIds,
+    );
+  }
+
+  private async lockMessageRows(
+    t: TxClient,
+    messageTableName: string,
+    messageIds: Iterable<string>,
+  ): Promise<MessageRowFromDB[]> {
+    const sortedMessageIds = sortedUniqueStrings(messageIds);
+    if (sortedMessageIds.length === 0) return [];
+    return t.manyOrNone<MessageRowFromDB>(
+      `SELECT id, content, role, type, "createdAt", "createdAtZ", thread_id AS "threadId", "resourceId"
+       FROM ${messageTableName}
+       WHERE id IN (${inPlaceholders(sortedMessageIds.length)})
+       ORDER BY id
+       FOR UPDATE`,
+      sortedMessageIds,
+    );
   }
 
   private async lockWorkingMemoryTarget(t: TxClient, scope: 'thread' | 'resource', id: string): Promise<void> {
@@ -4111,6 +4328,7 @@ export class MemoryPG extends MemoryStorage {
       const threads = await t.manyOrNone<{ id: string; title: string; metadata: unknown }>(
         `SELECT id, title, metadata FROM ${threadTableName}
          WHERE ${threadSelector} AND ${metadataSelector}
+         ORDER BY id
          FOR UPDATE`,
         threadSelectorValues,
       );
@@ -4196,6 +4414,14 @@ export class MemoryPG extends MemoryStorage {
         threadId: message.threadId,
       });
     }
+
+    // Acquire the complete OM advisory set before retracting any record. A
+    // retraction can lock resource/thread rows, so taking a later OM lock from
+    // inside that loop would violate the global advisory-before-row order.
+    await this.lockObservationalMemoryResources(
+      t,
+      [...coordinates.values()].map(input => input.resourceId),
+    );
 
     const receipts: ObservationalMemoryRetractionReceipt[] = [];
     for (const input of [...coordinates.values()].sort((a, b) =>
