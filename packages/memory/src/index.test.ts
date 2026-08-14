@@ -1425,6 +1425,135 @@ describe('Memory', () => {
       expect(clonedThread.metadata?.clone).toBeDefined();
     });
 
+    it('preserves destination owner-protected paths when cloning resource-scoped working memory', async () => {
+      const wmMemory = new Memory({
+        storage: new InMemoryStore(),
+        options: { workingMemory: { enabled: true, scope: 'resource' } },
+      });
+      const sourceResourceId = 'source-resource-protected-wm';
+      const destinationResourceId = 'destination-resource-protected-wm';
+      const sourceThread = await wmMemory.createThread({
+        threadId: 'source-thread-resource-protected-wm',
+        resourceId: sourceResourceId,
+      });
+      const destinationThread = await wmMemory.createThread({
+        threadId: 'destination-thread-resource-protected-wm',
+        resourceId: destinationResourceId,
+      });
+      await wmMemory.updateWorkingMemoryByOwner({
+        threadId: sourceThread.id,
+        resourceId: sourceResourceId,
+        workingMemory: '{"name":"Grace","focus":"compilers"}',
+        expectedRevision: 0,
+        protectPaths: ['/name'],
+      });
+      await wmMemory.updateWorkingMemoryByOwner({
+        threadId: destinationThread.id,
+        resourceId: destinationResourceId,
+        workingMemory: '{"name":"Ada","focus":"proofs"}',
+        expectedRevision: 0,
+        protectPaths: ['/name'],
+      });
+
+      const { thread: clonedThread } = await wmMemory.cloneThread({
+        sourceThreadId: sourceThread.id,
+        resourceId: destinationResourceId,
+      });
+
+      const destination = await wmMemory.getWorkingMemorySnapshot({
+        threadId: clonedThread.id,
+        resourceId: destinationResourceId,
+      });
+      expect(JSON.parse(destination.value!)).toEqual({ name: 'Ada', focus: 'compilers' });
+      expect(destination.protectedPaths).toEqual(['/name']);
+      expect(destination.provenance['/name']).toMatchObject({ source: 'owner' });
+      expect(destination.provenance['/focus']).toMatchObject({ source: 'observer' });
+    });
+
+    it('copies resource-scoped working memory to an empty destination without transferring owner controls', async () => {
+      const wmMemory = new Memory({
+        storage: new InMemoryStore(),
+        options: { workingMemory: { enabled: true, scope: 'resource' } },
+      });
+      const sourceResourceId = 'source-resource-owner-controls-wm';
+      const destinationResourceId = 'empty-destination-resource-wm';
+      const sourceThread = await wmMemory.createThread({
+        threadId: 'source-thread-owner-controls-wm',
+        resourceId: sourceResourceId,
+      });
+      await wmMemory.updateWorkingMemoryByOwner({
+        threadId: sourceThread.id,
+        resourceId: sourceResourceId,
+        workingMemory: '{"name":"Grace","focus":"compilers"}',
+        expectedRevision: 0,
+        protectPaths: ['/name'],
+      });
+
+      const { thread: clonedThread } = await wmMemory.cloneThread({
+        sourceThreadId: sourceThread.id,
+        resourceId: destinationResourceId,
+      });
+
+      const destination = await wmMemory.getWorkingMemorySnapshot({
+        threadId: clonedThread.id,
+        resourceId: destinationResourceId,
+      });
+      expect(JSON.parse(destination.value!)).toEqual({ name: 'Grace', focus: 'compilers' });
+      expect(destination.protectedPaths).toEqual([]);
+      expect(Object.values(destination.provenance)).not.toHaveLength(0);
+      expect(Object.values(destination.provenance).every(entry => entry.source === 'observer')).toBe(true);
+    });
+
+    it('rolls back a cross-resource clone when the observer Working Memory copy fails', async () => {
+      const wmMemory = new Memory({
+        storage: new InMemoryStore(),
+        options: { workingMemory: { enabled: true, scope: 'resource', maxDataBytes: 5 } },
+      });
+      const sourceResourceId = 'source-resource-oversized-wm';
+      const destinationResourceId = 'destination-resource-before-failed-clone-wm';
+      const sourceThread = await wmMemory.createThread({
+        threadId: 'source-thread-resource-oversized-wm',
+        resourceId: sourceResourceId,
+      });
+      const destinationThread = await wmMemory.createThread({
+        threadId: 'destination-thread-before-failed-clone-wm',
+        resourceId: destinationResourceId,
+      });
+      await wmMemory.updateWorkingMemoryByOwner({
+        threadId: sourceThread.id,
+        resourceId: sourceResourceId,
+        workingMemory: 'long value',
+        expectedRevision: 0,
+        memoryConfig: { workingMemory: { enabled: true, scope: 'resource', maxDataBytes: 100 } },
+      });
+      await wmMemory.updateWorkingMemory({
+        threadId: destinationThread.id,
+        resourceId: destinationResourceId,
+        workingMemory: 'safe',
+      });
+      const destinationBefore = await wmMemory.getWorkingMemorySnapshot({
+        threadId: destinationThread.id,
+        resourceId: destinationResourceId,
+      });
+      const newThreadId = 'rolled-back-cross-resource-clone-wm';
+
+      await expect(
+        wmMemory.cloneThread({
+          sourceThreadId: sourceThread.id,
+          newThreadId,
+          resourceId: destinationResourceId,
+        }),
+      ).rejects.toThrow('UTF-8 byte limit');
+
+      await expect(wmMemory.getThreadById({ threadId: newThreadId })).resolves.toBeNull();
+      await expect(
+        wmMemory.getWorkingMemorySnapshot({
+          threadId: destinationThread.id,
+          resourceId: destinationResourceId,
+        }),
+      ).resolves.toEqual(destinationBefore);
+    });
+
     it('should clone thread-scoped working memory to the cloned thread', async () => {
       const wmMemory = new Memory({
         storage: new InMemoryStore(),

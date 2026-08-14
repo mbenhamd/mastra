@@ -3560,9 +3560,10 @@ Notes:
         await this.cloneObservationalMemory(memoryStore, args.sourceThreadId, sourceResourceId, result, rollbackState);
       }
 
-      // Copy Working Memory from the source thread to the clone. A governed
-      // source snapshot is copied in one owner update so validation failures do
-      // not leave a half-copied observer value behind.
+      // Copy Working Memory from the source thread to the clone. Only a fresh
+      // thread-scoped clone can inherit the source owner's controls. A
+      // cross-resource copy must use observer semantics so it cannot overwrite
+      // destination protections or manufacture owner authority there.
       if (config.workingMemory?.enabled) {
         const scope = config.workingMemory.scope || 'resource';
         const shouldCopy =
@@ -3582,7 +3583,7 @@ Notes:
                 resourceId: sourceResourceId,
                 memoryConfig,
               });
-          if (sourceSnapshot) {
+          if (sourceSnapshot && scope === 'thread') {
             const clonedSnapshot = await this.getWorkingMemorySnapshot({
               threadId: result.thread.id,
               resourceId: result.thread.resourceId,
