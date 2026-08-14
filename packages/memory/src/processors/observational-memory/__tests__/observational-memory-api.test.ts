@@ -1939,7 +1939,7 @@ describe('clear()', () => {
     await om.clear(threadId);
 
     expect(getThreadSpy).toHaveBeenCalledExactlyOnceWith({ threadId });
-    expect(clearSpy).toHaveBeenCalledExactlyOnceWith(threadId, resourceId);
+    expect(clearSpy).toHaveBeenCalledExactlyOnceWith(threadId, resourceId, { expectedRecordId: null });
     expect(BufferingCoordinator.lastBufferedBoundary.has(threadObsKey)).toBe(false);
     expect(BufferingCoordinator.lastBufferedBoundary.has(threadReflKey)).toBe(false);
     expect(BufferingCoordinator.lastBufferedBoundary.get(resourceObsKey)).toBe(3);
@@ -1947,14 +1947,26 @@ describe('clear()', () => {
 
   it('does not reload thread ownership when clear receives the resource explicitly', async () => {
     const resourceId = 'clear-explicit-resource';
-    await om.getOrCreateRecord(threadId, resourceId);
+    const record = await om.getOrCreateRecord(threadId, resourceId);
     const getThreadSpy = vi.spyOn(storage, 'getThreadById');
     const clearSpy = vi.spyOn(storage, 'clearObservationalMemory');
 
     await om.clear(threadId, resourceId);
 
     expect(getThreadSpy).not.toHaveBeenCalled();
-    expect(clearSpy).toHaveBeenCalledExactlyOnceWith(threadId, resourceId);
+    expect(clearSpy).toHaveBeenCalledExactlyOnceWith(threadId, resourceId, { expectedRecordId: record.id });
+  });
+
+  it('rejects an explicit resource that does not own the thread record', async () => {
+    const resourceId = 'clear-current-resource';
+    const staleResourceId = 'clear-stale-resource';
+    const record = await om.getOrCreateRecord(threadId, resourceId);
+    const clearSpy = vi.spyOn(storage, 'clearObservationalMemory');
+
+    await expect(om.clear(threadId, staleResourceId)).rejects.toThrow(/resource.*does not own/i);
+
+    expect(clearSpy).not.toHaveBeenCalled();
+    await expect(storage.getObservationalMemory(threadId, resourceId)).resolves.toMatchObject({ id: record.id });
   });
 
   it('uses the existing record owner when clearing after the thread row is gone', async () => {
@@ -1981,7 +1993,7 @@ describe('clear()', () => {
 
     expect(record.resourceId).toBe(resourceId);
     expect(getThreadSpy).not.toHaveBeenCalled();
-    expect(clearSpy).toHaveBeenCalledExactlyOnceWith(threadId, resourceId);
+    expect(clearSpy).toHaveBeenCalledExactlyOnceWith(threadId, resourceId, { expectedRecordId: record.id });
     await expect(orphanStorage.getObservationalMemory(threadId, resourceId)).resolves.toBeNull();
   });
 });

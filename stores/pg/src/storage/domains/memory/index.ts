@@ -32,6 +32,7 @@ import {
   writeWorkingMemorySnapshotMetadata,
   WorkingMemoryRevisionConflictError,
   WorkingMemoryValidationError,
+  assertObservationalMemoryClearExpectation,
 } from '@mastra/core/storage';
 
 /**
@@ -137,6 +138,7 @@ import type {
   ObservationalMemoryHistoryOptions,
   BufferedObservationChunk,
   CreateObservationalMemoryInput,
+  ClearObservationalMemoryOptions,
   UpdateActiveObservationsInput,
   UpdateBufferedObservationsInput,
   SwapBufferedToActiveInput,
@@ -4302,7 +4304,11 @@ export class MemoryPG extends MemoryStorage {
     }
   }
 
-  async clearObservationalMemory(threadId: string | null, resourceId: string): Promise<void> {
+  async clearObservationalMemory(
+    threadId: string | null,
+    resourceId: string,
+    options?: ClearObservationalMemoryOptions,
+  ): Promise<void> {
     try {
       const lookupKey = this.getOMKey(threadId, resourceId);
       const tableName = getTableName({
@@ -4311,6 +4317,16 @@ export class MemoryPG extends MemoryStorage {
       });
       await this.#db.client.tx(async t => {
         await this.lockObservationalMemoryResource(t, resourceId);
+        const currentRecord = await t.oneOrNone<{ id: string; resourceId: string }>(
+          `SELECT id, "resourceId"
+           FROM ${tableName}
+           WHERE "lookupKey" = $1
+           ORDER BY "generationCount" DESC
+           LIMIT 1
+           FOR UPDATE`,
+          [lookupKey],
+        );
+        assertObservationalMemoryClearExpectation(currentRecord, resourceId, options);
         await t.none(`DELETE FROM ${tableName} WHERE "lookupKey" = $1`, [lookupKey]);
       });
     } catch (error) {

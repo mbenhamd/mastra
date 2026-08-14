@@ -2032,6 +2032,17 @@ export interface CreateObservationalMemoryInput {
 }
 
 /**
+ * Compare-and-set fence for clearing observational memory.
+ *
+ * A string requires that exact record to still be current. `null` requires
+ * that no record has appeared since the caller's read. Omitting the option
+ * retains owner-only fencing for direct storage callers.
+ */
+export interface ClearObservationalMemoryOptions {
+  expectedRecordId?: string | null;
+}
+
+/**
  * Input for updating active observations.
  * Uses cursor-based message tracking via lastObservedAt instead of message IDs.
  */

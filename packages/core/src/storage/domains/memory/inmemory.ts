@@ -21,6 +21,7 @@ import type {
   ObservationalMemoryHistoryOptions,
   BufferedObservationChunk,
   CreateObservationalMemoryInput,
+  ClearObservationalMemoryOptions,
   UpdateActiveObservationsInput,
   UpdateBufferedObservationsInput,
   UpdateBufferedReflectionInput,
@@ -50,7 +51,7 @@ import {
   validateStorageMetadataFilter,
 } from '../../utils';
 import type { InMemoryDB } from '../inmemory-db';
-import { MemoryStorage } from './base';
+import { assertObservationalMemoryClearExpectation, MemoryStorage } from './base';
 import {
   applyWorkingMemorySnapshotUpdate,
   assertGovernedThreadResourceUnchanged,
@@ -2153,9 +2154,15 @@ export class InMemoryMemory extends MemoryStorage {
     this.rotateObservationalMemoryGeneration(record.id);
   }
 
-  async clearObservationalMemory(threadId: string | null, resourceId: string): Promise<void> {
+  async clearObservationalMemory(
+    threadId: string | null,
+    resourceId: string,
+    options?: ClearObservationalMemoryOptions,
+  ): Promise<void> {
     const key = this.getObservationalMemoryKey(threadId, resourceId);
-    this.forgetObservationalMemoryGenerations(this.db.observationalMemory.get(key) ?? []);
+    const records = this.db.observationalMemory.get(key) ?? [];
+    assertObservationalMemoryClearExpectation(records[0] ?? null, resourceId, options);
+    this.forgetObservationalMemoryGenerations(records);
     this.db.observationalMemory.delete(key);
   }
 

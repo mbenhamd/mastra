@@ -123,6 +123,41 @@ describe('MemoryPG lock ordering', () => {
     };
   }
 
+  async function replaceThreadObservationalMemoryOwner(
+    threadId: string,
+    currentResourceId: string,
+    replacementResourceId: string,
+  ) {
+    const pool = new Pool({ connectionString });
+    const client = await pool.connect();
+    let transactionOpen = true;
+    await client.query('BEGIN');
+    await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [
+      `mastra:observational-memory:${currentResourceId}`,
+    ]);
+    await client.query(
+      `UPDATE "${schemaName}"."mastra_observational_memory"
+       SET "resourceId" = $1
+       WHERE "lookupKey" = $2`,
+      [replacementResourceId, `thread:${threadId}`],
+    );
+    return {
+      async release() {
+        if (!transactionOpen) return;
+        await client.query('COMMIT');
+        transactionOpen = false;
+      },
+      async close() {
+        if (transactionOpen) {
+          await client.query('ROLLBACK');
+          transactionOpen = false;
+        }
+        client.release();
+        await pool.end();
+      },
+    };
+  }
+
   async function blockMessageDeletes() {
     const pool = new Pool({ connectionString });
     const client = await pool.connect();
@@ -187,6 +222,58 @@ describe('MemoryPG lock ordering', () => {
       rollbackReceipt: NonNullable<StorageCloneThreadOutput['rollbackReceipt']>;
     };
   }
+
+  it('rejects a stale clear after the thread OM owner changes while the clear waits', async () => {
+    const threadId = 'clear-owner-race-thread';
+    const currentResourceId = 'clear-owner-race-a';
+    const replacementResourceId = 'clear-owner-race-b';
+    await rollbackMemory.initializeObservationalMemory({
+      threadId,
+      resourceId: currentResourceId,
+      scope: 'thread',
+      config: {},
+    });
+    const replacement = await replaceThreadObservationalMemoryOwner(threadId, currentResourceId, replacementResourceId);
+    let clearPromise: ReturnType<MemoryPG['clearObservationalMemory']> | undefined;
+    try {
+      clearPromise = competitorMemory.clearObservationalMemory(threadId, currentResourceId);
+      await waitForAdvisoryLockWait(competitorApplicationName);
+      await replacement.release();
+
+      await expect(within(clearPromise, 'stale clear after owner replacement')).rejects.toThrow(/does not own/i);
+      await expect(rollbackMemory.getObservationalMemory(threadId, replacementResourceId)).resolves.toMatchObject({
+        resourceId: replacementResourceId,
+      });
+    } finally {
+      await replacement.close();
+      if (clearPromise) await Promise.allSettled([clearPromise]);
+    }
+  });
+
+  it('rejects a stale clear after the same owner recreates the thread OM record', async () => {
+    const threadId = 'clear-incarnation-thread';
+    const resourceId = 'clear-incarnation-resource';
+    const prior = await rollbackMemory.initializeObservationalMemory({
+      threadId,
+      resourceId,
+      scope: 'thread',
+      config: {},
+    });
+    await rollbackMemory.clearObservationalMemory(threadId, resourceId);
+    const current = await rollbackMemory.initializeObservationalMemory({
+      threadId,
+      resourceId,
+      scope: 'thread',
+      config: {},
+    });
+
+    await expect(
+      competitorMemory.clearObservationalMemory(threadId, resourceId, { expectedRecordId: prior.id }),
+    ).rejects.toThrow(/record changed/i);
+    await expect(rollbackMemory.getObservationalMemory(threadId, resourceId)).resolves.toMatchObject({
+      id: current.id,
+    });
+  });
 
   async function seedCloneWithObservationalMemory(suffix: string): Promise<{
     clone: StorageCloneThreadOutput & {

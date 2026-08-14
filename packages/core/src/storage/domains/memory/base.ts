@@ -18,6 +18,7 @@ import type {
   ObservationalMemoryRecord,
   ObservationalMemoryHistoryOptions,
   CreateObservationalMemoryInput,
+  ClearObservationalMemoryOptions,
   UpdateActiveObservationsInput,
   UpdateBufferedObservationsInput,
   UpdateBufferedReflectionInput,
@@ -40,6 +41,45 @@ import type {
   StorageMutateThreadWithWorkingMemoryOutput,
 } from '../../types';
 import { StorageDomain } from '../base';
+
+export class ObservationalMemoryClearConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ObservationalMemoryClearConflictError';
+  }
+}
+
+export function assertObservationalMemoryClearExpectation(
+  currentRecord: Pick<ObservationalMemoryRecord, 'id' | 'resourceId'> | null,
+  expectedResourceId: string,
+  options?: ClearObservationalMemoryOptions,
+): void {
+  if (!currentRecord) {
+    if (typeof options?.expectedRecordId === 'string') {
+      throw new ObservationalMemoryClearConflictError(
+        `Observational memory record changed before it could be cleared: expected record "${options.expectedRecordId}", but no current record exists.`,
+      );
+    }
+    return;
+  }
+
+  if (currentRecord.resourceId !== expectedResourceId) {
+    throw new ObservationalMemoryClearConflictError(
+      `Resource "${expectedResourceId}" does not own the current observational memory record; it is owned by "${currentRecord.resourceId}".`,
+    );
+  }
+
+  if (options?.expectedRecordId === null) {
+    throw new ObservationalMemoryClearConflictError(
+      `Observational memory record changed before it could be cleared: expected no record, but current record is "${currentRecord.id}".`,
+    );
+  }
+  if (typeof options?.expectedRecordId === 'string' && currentRecord.id !== options.expectedRecordId) {
+    throw new ObservationalMemoryClearConflictError(
+      `Observational memory record changed before it could be cleared: expected record "${options.expectedRecordId}", but current record is "${currentRecord.id}".`,
+    );
+  }
+}
 
 function isPlainObj(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -544,9 +584,14 @@ export abstract class MemoryStorage extends StorageDomain {
 
   /**
    * Clear all observational memory for a thread/resource.
-   * Removes all records and history.
+   * Removes all records and history only when the persisted owner and optional
+   * record identity still match the caller's expected mutation coordinate.
    */
-  async clearObservationalMemory(_threadId: string | null, _resourceId: string): Promise<void> {
+  async clearObservationalMemory(
+    _threadId: string | null,
+    _resourceId: string,
+    _options?: ClearObservationalMemoryOptions,
+  ): Promise<void> {
     throw new Error(`Observational memory is not implemented by this storage adapter (${this.constructor.name}).`);
   }
 

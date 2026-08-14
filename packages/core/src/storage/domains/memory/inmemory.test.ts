@@ -151,6 +151,39 @@ describe('InMemoryMemory listMessages include resource scope', () => {
   });
 });
 
+describe('InMemoryMemory observational-memory clear ownership', () => {
+  it('rejects a stale owner coordinate without deleting the current thread record', async () => {
+    const memory = new InMemoryMemory({ db: new InMemoryDB() });
+    const threadId = 'clear-owner-thread';
+    const resourceId = 'clear-owner-current';
+    const record = await memory.initializeObservationalMemory({
+      threadId,
+      resourceId,
+      scope: 'thread',
+      config: {},
+    });
+
+    await expect(memory.clearObservationalMemory(threadId, 'clear-owner-stale')).rejects.toThrow(
+      /resource.*does not own/i,
+    );
+    await expect(memory.getObservationalMemory(threadId, resourceId)).resolves.toMatchObject({ id: record.id });
+  });
+
+  it('rejects a recreated record with the same owner when its identity changed', async () => {
+    const memory = new InMemoryMemory({ db: new InMemoryDB() });
+    const threadId = 'clear-incarnation-thread';
+    const resourceId = 'clear-incarnation-resource';
+    const prior = await memory.initializeObservationalMemory({ threadId, resourceId, scope: 'thread', config: {} });
+    await memory.clearObservationalMemory(threadId, resourceId);
+    const current = await memory.initializeObservationalMemory({ threadId, resourceId, scope: 'thread', config: {} });
+
+    await expect(memory.clearObservationalMemory(threadId, resourceId, { expectedRecordId: prior.id })).rejects.toThrow(
+      /record changed/i,
+    );
+    await expect(memory.getObservationalMemory(threadId, resourceId)).resolves.toMatchObject({ id: current.id });
+  });
+});
+
 describe('InMemoryMemory updateThread partial updates', () => {
   it('leaves the stored title alone when only metadata is provided', async () => {
     const memory = new InMemoryMemory({ db: new InMemoryDB() });

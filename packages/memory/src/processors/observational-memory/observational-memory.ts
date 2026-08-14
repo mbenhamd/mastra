@@ -11,6 +11,7 @@ import type { ProcessorContext, ProcessorStreamWriter } from '@mastra/core/proce
 import { MessageHistory } from '@mastra/core/processors';
 import type { RequestContext } from '@mastra/core/request-context';
 import type { MemoryStorage, ObservationalMemoryRecord, ObservationalMemoryHistoryOptions } from '@mastra/core/storage';
+import { assertObservationalMemoryClearExpectation } from '@mastra/core/storage';
 import type { ProviderMetadata } from '@mastra/core/stream';
 import xxhash from 'xxhash-wasm';
 
@@ -1099,19 +1100,19 @@ export class ObservationalMemory {
     resourceId?: string,
   ): Promise<{
     ids: { threadId: string | null; resourceId: string };
-    existingRecord?: ObservationalMemoryRecord | null;
+    existingRecord: ObservationalMemoryRecord | null;
   }> {
     const lookupIds = this.getStorageIds(threadId, resourceId);
-    if (this.scope !== 'thread' || resourceId !== undefined) {
-      return { ids: lookupIds };
-    }
-
     const existingRecord = await this.storage.getObservationalMemory(lookupIds.threadId, lookupIds.resourceId);
     if (existingRecord) {
       return {
         ids: { threadId: lookupIds.threadId, resourceId: existingRecord.resourceId },
         existingRecord,
       };
+    }
+
+    if (this.scope !== 'thread' || resourceId !== undefined) {
+      return { ids: lookupIds, existingRecord: null };
     }
 
     const thread = await this.storage.getThreadById({ threadId });
@@ -1143,12 +1144,8 @@ export class ObservationalMemory {
     // read from returning a stale null after another caller has finished inserting.
     const initialization = Promise.resolve().then(async () => {
       const { ids, existingRecord } = await this.resolveMutationStorageState(threadId, resourceId);
-      const record =
-        existingRecord === undefined
-          ? await this.storage.getObservationalMemory(ids.threadId, ids.resourceId)
-          : existingRecord;
-      if (record) {
-        return record;
+      if (existingRecord) {
+        return existingRecord;
       }
 
       // Capture the timezone used for Observer date formatting
@@ -3890,8 +3887,13 @@ ${formattedMessages}
    * Clear all memory for a specific thread/resource
    */
   async clear(threadId: string, resourceId?: string): Promise<void> {
-    const { ids } = await this.resolveMutationStorageState(threadId, resourceId);
-    await this.storage.clearObservationalMemory(ids.threadId, ids.resourceId);
+    const { ids, existingRecord } = await this.resolveMutationStorageState(threadId, resourceId);
+    if (resourceId !== undefined && existingRecord) {
+      assertObservationalMemoryClearExpectation(existingRecord, resourceId);
+    }
+    await this.storage.clearObservationalMemory(ids.threadId, ids.resourceId, {
+      expectedRecordId: existingRecord?.id ?? null,
+    });
     // Clean up static maps to prevent memory leaks
     this.buffering.cleanupStaticMaps(ids.threadId ?? ids.resourceId, ids.resourceId);
   }
