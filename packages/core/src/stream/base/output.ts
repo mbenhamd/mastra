@@ -614,17 +614,25 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
               const meta = self.#toolCallStreamingMeta[toolCallId];
               const deltaParts = self.#toolCallArgsDeltas[toolCallId];
               let args: Record<string, unknown> = {};
+              let streamedArgsParseFailed = false;
               if (deltaParts?.length) {
                 try {
                   const merged = deltaParts.join('');
                   args = typeof merged === 'string' && merged.length > 0 ? JSON.parse(merged) : {};
                 } catch {
-                  args = {};
+                  // Truncated JSON is not an executable empty object. Leave
+                  // synthesis to a later authoritative tool-call chunk.
+                  streamedArgsParseFailed = true;
                 }
               }
               delete self.#toolCallStreamingMeta[toolCallId];
               delete self.#toolCallArgsDeltas[toolCallId];
               delete self.#toolCallDeltaIdNameMap[toolCallId];
+              if (meta && streamedArgsParseFailed) {
+                self.#emitChunk(chunk);
+                controller.enqueue(chunk);
+                return;
+              }
               if (meta) {
                 const synthetic: ToolCallChunk = {
                   type: 'tool-call',

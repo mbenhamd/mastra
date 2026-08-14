@@ -610,6 +610,55 @@ describe('MastraModelOutput', () => {
       expect(toolCalls.length).toBeGreaterThan(0);
       expect(toolCalls[0].payload.args).toEqual({ query: 'SELECT 1' });
     });
+
+    it('does not synthesize executable empty args from truncated streamed JSON', async () => {
+      const runId = 'test-run';
+      const messageList = new MessageList({ threadId: 'test-thread' });
+      const toolCallId = 'tool-1';
+
+      const stream = createChunkStream([
+        {
+          type: 'tool-call-input-streaming-start',
+          runId,
+          from: ChunkFrom.AGENT,
+          payload: {
+            toolCallId,
+            toolName: 'my-tool',
+          },
+        },
+        {
+          type: 'tool-call-delta',
+          runId,
+          from: ChunkFrom.AGENT,
+          payload: {
+            toolCallId,
+            argsTextDelta: '{"query":"SEL',
+          },
+        },
+        {
+          type: 'tool-call-input-streaming-end',
+          runId,
+          from: ChunkFrom.AGENT,
+          payload: {
+            toolCallId,
+          },
+        },
+        createStepFinishChunk(runId),
+        createFinishChunk(runId),
+      ]);
+
+      const output = new MastraModelOutput({
+        model: { modelId: 'test-model', provider: 'test', version: 'v3' },
+        stream,
+        messageList,
+        messageId: 'msg-1',
+        options: { runId },
+      });
+
+      await output.consumeStream();
+
+      expect(output._getImmediateToolCalls()).toEqual([]);
+    });
   });
 
   describe('usage raw passthrough', () => {

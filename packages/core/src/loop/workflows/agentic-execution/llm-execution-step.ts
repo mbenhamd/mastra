@@ -126,14 +126,19 @@ const TERMINAL_FINISH_REASONS = ['stop', 'error', 'length', 'content-filter'];
 function localToolCallPayloadIsComplete(toolCall: { args?: unknown; input?: unknown }): boolean {
   const raw = toolCall.args ?? toolCall.input;
   if (raw === undefined || raw === null) return false;
-  if (typeof raw === 'object') return true;
-  if (typeof raw !== 'string' || raw.trim().length === 0) return false;
-  try {
-    JSON.parse(raw);
-    return true;
-  } catch {
-    return false;
+  if (typeof raw === 'string') {
+    if (raw.trim().length === 0) return false;
+    try {
+      JSON.parse(raw);
+      return true;
+    } catch {
+      return false;
+    }
   }
+  // Already-parsed objects are complete. Empty `{}` can be a valid no-arg
+  // payload; truncated streamed JSON must not be coerced into that shape
+  // upstream (see MastraModelOutput streaming-end parse failure).
+  return typeof raw === 'object';
 }
 
 function getRequestInputProcessors({
@@ -2622,15 +2627,14 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
       // result. Incomplete/truncated tool JSON still stops the loop.
       // `error` and `content-filter` must never be overridden. `stop` is
       // intentionally allowed — some models return stop alongside tool calls.
-      const hasCompleteLocalToolCalls = toolCalls?.some(
-        tc => !tc.providerExecuted && localToolCallPayloadIsComplete(tc),
-      );
+      const localToolCalls = (toolCalls ?? []).filter(tc => !tc.providerExecuted);
+      const hasCompleteLocalToolCalls =
+        localToolCalls.length > 0 && localToolCalls.every(tc => localToolCallPayloadIsComplete(tc));
       const hasPendingToolCalls =
-        toolCalls &&
-        toolCalls.some(tc => !tc.providerExecuted) &&
+        localToolCalls.length > 0 &&
         finishReason !== 'error' &&
         finishReason !== 'content-filter' &&
-        (finishReason !== 'length' || Boolean(hasCompleteLocalToolCalls));
+        (finishReason !== 'length' || hasCompleteLocalToolCalls);
       const shouldContinue =
         !responseRecoveryStep &&
         !providerViolatedToolFence &&
