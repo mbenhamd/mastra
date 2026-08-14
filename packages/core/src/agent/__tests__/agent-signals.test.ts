@@ -8586,6 +8586,7 @@ describe('Agent signals', () => {
 
   it('runs idle wake rejection cleanup when a queued idle stream fails', async () => {
     const runtime = new AgentThreadStreamRuntime();
+    const pubsub = new RunFailedOwnershipPubSub();
     let finishActive!: () => void;
     const activeFinished = new Promise<void>(resolve => {
       finishActive = resolve;
@@ -8602,6 +8603,7 @@ describe('Agent signals', () => {
         runId: 'active-run',
         memory: { resource: 'queued-failure-user', thread: 'queued-failure-thread' },
       } as any,
+      pubsub,
     );
     const cleanup = vi.fn();
     const stream = vi.fn(async () => {
@@ -8619,6 +8621,7 @@ describe('Agent signals', () => {
           _onThreadStreamRunRejected: cleanup,
         } as any,
       },
+      pubsub,
     );
 
     expect(result.output).toBeUndefined();
@@ -8635,6 +8638,9 @@ describe('Agent signals', () => {
         memory: { resource: 'queued-failure-user', thread: 'queued-failure-thread' },
       }),
     );
+    expect(pubsub.runFailedLeaseOwner).toBeDefined();
+    expect(pubsub.runFailedPublishedWithLiveOwner).toBe(true);
+    expect(pubsub.publishedData.some(data => data?.type === 'run-aborted' && data.runId === result.runId)).toBe(false);
   });
 
   it('wakes reservation waiters when a queued idle stream fails', async () => {
@@ -9738,7 +9744,7 @@ describe('Agent signals', () => {
 
   it('releases waiters when draining a queued active signal fails', async () => {
     const runtime = new AgentThreadStreamRuntime();
-    const pubsub = new EventEmitterPubSub();
+    const pubsub = new RunFailedOwnershipPubSub();
     let finishActive!: () => void;
     const activeFinished = new Promise<void>(resolve => {
       finishActive = resolve;
@@ -9801,6 +9807,12 @@ describe('Agent signals', () => {
         pubsub,
       ),
     ).toEqual(expect.any(Function));
+    const failureTerminal = pubsub.publishedData.find(data => data?.type === 'run-failed');
+    expect(failureTerminal?.leaseOwner).toBe(pubsub.runFailedLeaseOwner);
+    expect(pubsub.runFailedPublishedWithLiveOwner).toBe(true);
+    expect(
+      pubsub.publishedData.some(data => data?.type === 'run-aborted' && data.runId === failureTerminal?.runId),
+    ).toBe(false);
   });
 
   it('drops queued signals when a prepared run is aborted', async () => {

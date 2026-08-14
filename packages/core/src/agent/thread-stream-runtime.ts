@@ -2706,12 +2706,17 @@ export class AgentThreadStreamRuntime {
         this.#resolveReservationWaiters(state, nextRunId);
         const runError = getErrorFromUnknown(error);
         this.#rejectPendingOutputWaiters(state, nextRunId, runError);
-        this.#publish(pubsub, key, {
-          type: 'run-failed',
-          runId: nextRunId,
-          error: runError.message,
-          leaseOwner: state.leaseOwnerTokensByRunId.get(nextRunId),
-        });
+        try {
+          await this.#publishTerminalAndWait(pubsub, key, {
+            type: 'run-failed',
+            runId: nextRunId,
+            error: runError.message,
+            leaseOwner: state.leaseOwnerTokensByRunId.get(nextRunId),
+          });
+        } catch {
+          // The original setup error remains authoritative while the failed
+          // segment still proceeds through bounded lease handoff cleanup.
+        }
 
         // Preserve FIFO progress for any work queued behind the failed setup.
         // The recursive drain transfers the lease from this failed run; with no
@@ -2806,25 +2811,32 @@ export class AgentThreadStreamRuntime {
           }
         }
       })
-      .catch(err => {
+      .catch(async err => {
         state.threadKeysByRunId.delete(pending.runId);
         this.#cleanupPreparedRun(state, pending.runId);
         if (state.activeThreadRunIds.get(key) === pending.runId) {
           state.activeThreadRunIds.delete(key);
         }
-        this.#publish(pubsub, key, {
-          type: 'run-failed',
-          runId: pending.runId,
-          error: getErrorFromUnknown(err).message,
-          leaseOwner: state.leaseOwnerTokensByRunId.get(pending.runId),
-        });
+        try {
+          await this.#publishTerminalAndWait(pubsub, key, {
+            type: 'run-failed',
+            runId: pending.runId,
+            error: getErrorFromUnknown(err).message,
+            leaseOwner: state.leaseOwnerTokensByRunId.get(pending.runId),
+          });
+        } catch {
+          // Continue bounded queue/lease cleanup without replacing the original
+          // continuation setup failure.
+        }
         // Hand the lease to remaining queued work (transfer keeps the key from
         // going empty); only release once nothing is left to drain.
-        void this.#drainPendingContinuations(state, pubsub, key, pending.runId).then(async started => {
+        try {
+          const started = await this.#drainPendingContinuations(state, pubsub, key, pending.runId);
           if (started) return;
           if (await this.#drainPendingIdleSignals(state, pubsub, key, pending.runId)) return;
-          this.#releaseThreadLease(pubsub, key, pending.runId);
-        });
+        } finally {
+          if (!state.activeThreadRunIds.has(key)) this.#releaseThreadLease(pubsub, key, pending.runId);
+        }
       });
   }
 
@@ -2984,12 +2996,25 @@ export class AgentThreadStreamRuntime {
         void this.#watchThreadRunCompletion(state, pubsub, key, registeredRecord);
       }
     } catch (err) {
+      const leaseOwner = state.leaseOwnerTokensByRunId.get(pendingIdle.runId);
+      try {
+        await this.#publishTerminalAndWait(pubsub, key, {
+          type: 'run-failed',
+          runId: pendingIdle.runId,
+          error: getErrorFromUnknown(err).message,
+          leaseOwner,
+        });
+      } catch {
+        // The queued setup failure stays authoritative; cleanup must proceed
+        // even when its bounded distributed terminal cannot be delivered.
+      }
       pendingIdle.onRunRejected?.();
       if (reserveBeforePreflight) {
         this.#releaseReservedRun(state, pubsub, key, pendingIdle.runId, {
           cleanupPrepared: true,
           clearAbort: true,
           rejectOutputWaiters: true,
+          announceAbort: false,
         });
       } else {
         state.inflightIdleThreadKeysByRunId.delete(pendingIdle.runId);
@@ -2997,12 +3022,6 @@ export class AgentThreadStreamRuntime {
         this.#forgetSignalAdmissionsForRun(state, key, pendingIdle.runId);
         this.rejectUnregisteredRun(pendingIdle.runId, pubsub);
       }
-      this.#publish(pubsub, key, {
-        type: 'run-failed',
-        runId: pendingIdle.runId,
-        error: getErrorFromUnknown(err).message,
-        leaseOwner: state.leaseOwnerTokensByRunId.get(pendingIdle.runId),
-      });
       // Hand the lease to remaining idle work; release only when none remains.
       if (!(await this.#drainPendingIdleSignals(state, pubsub, key, pendingIdle.runId))) {
         this.#releaseThreadLease(pubsub, key, pendingIdle.runId);
