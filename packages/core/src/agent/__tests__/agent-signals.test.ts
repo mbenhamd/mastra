@@ -1132,6 +1132,10 @@ describe('Agent signals', () => {
 
       expect(runtime.abortRun(runId, pubsub)).toBe(true);
       queueMicrotask(() => {
+        // AI SDK providers may surface the source abort before an in-flight
+        // tool observes cancellation. The subscription must retain that source
+        // terminal until the authoritative tool settlement crosses the drain.
+        streamController.enqueue({ type: 'abort', runId });
         streamController.enqueue({
           type: 'tool-error',
           runId,
