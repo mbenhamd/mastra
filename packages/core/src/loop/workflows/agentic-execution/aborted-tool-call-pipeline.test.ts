@@ -20,7 +20,7 @@ import { createToolCallStep } from './tool-call-step';
 // The unit tests in tool-call-step.test.ts and llm-mapping-step.test.ts each pin one
 // half of this chain; this test pins their composition.
 describe('aborted tool call pipeline (tool-call-step → schema boundary → llm-mapping-step)', () => {
-  it('leaves the call unrecorded end-to-end when the request abort interrupts the tool', async () => {
+  it('keeps request abort terminal when a sibling tool error could otherwise continue the loop', async () => {
     // -- Real tool that throws mid-flight, as fetch/etc. do when the request aborts.
     const abortedTool = createTool({
       id: 'slow-server-tool',
@@ -110,8 +110,14 @@ describe('aborted tool call pipeline (tool-call-step → schema boundary → llm
     // mapping step can't distinguish the call from a pending HITL tool. (Asserted at
     // the end so a pre-fix run fails on the persistence assertions — the actual bug.)
     const crossedBoundary = toolCallOutputSchema.parse(toolCallOutput);
+    const siblingErrorBoundary = toolCallOutputSchema.parse({
+      toolCallId: 'call-2',
+      toolName: 'broken-sibling-tool',
+      args: { q: 'also important' },
+      error: { name: 'Error', message: 'recoverable sibling failure' },
+    });
 
-    // -- Step 2: real llm-mapping-step consuming the parsed output.
+    // -- Step 2: real llm-mapping-step consuming the mixed abort/error output.
     const llmExecutionStep = createStep({
       id: 'test-llm-execution',
       inputSchema: z.any(),
@@ -142,12 +148,23 @@ describe('aborted tool call pipeline (tool-call-step → schema boundary → llm
         stepResult: { isContinued: true, reason: undefined },
         metadata: {},
       })),
-      inputData: [crossedBoundary],
+      inputData: [crossedBoundary, siblingErrorBoundary],
     } as any);
 
-    // Nothing persisted: the message history is never updated for the aborted call —
-    // no fabricated success, no output-error whose text the model could consume.
-    expect(updateToolInvocation).not.toHaveBeenCalled();
+    // Only the ordinary sibling error is persisted for diagnostics. The
+    // request-aborted call stays incomplete and cannot become model input.
+    expect(updateToolInvocation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toolInvocation: expect.objectContaining({
+          state: 'output-error',
+          toolCallId: 'call-2',
+          errorText: 'recoverable sibling failure',
+        }),
+      }),
+    );
+    expect(updateToolInvocation).not.toHaveBeenCalledWith(
+      expect.objectContaining({ toolInvocation: expect.objectContaining({ toolCallId: 'call-1' }) }),
+    );
     expect(controller.enqueue).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'tool-result' }));
     expect(controller.enqueue).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -158,7 +175,16 @@ describe('aborted tool call pipeline (tool-call-step → schema boundary → llm
         }),
       }),
     );
-    // The loop ends, leaving the call incomplete rather than continuing on a fake result.
+    expect(controller.enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'tool-error',
+        payload: expect.objectContaining({
+          toolCallId: 'call-2',
+          error: expect.objectContaining({ message: 'recoverable sibling failure' }),
+        }),
+      }),
+    );
+    // The abort wins over ordinary error recovery, so no second model iteration starts.
     expect(bail).toHaveBeenCalled();
     expect(result.stepResult.isContinued).toBe(false);
     // And the abort marker itself survived the schema boundary intact.
