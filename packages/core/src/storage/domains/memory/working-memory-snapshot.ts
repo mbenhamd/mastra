@@ -1,4 +1,9 @@
-import type { ApplyWorkingMemoryUpdateInput, WorkingMemoryPathProvenance, WorkingMemorySnapshot } from '../../types';
+import type {
+  ApplyWorkingMemoryUpdateInput,
+  StorageWorkingMemoryTransitionParticipantReceipt,
+  WorkingMemoryPathProvenance,
+  WorkingMemorySnapshot,
+} from '../../types';
 
 const CONTROL_METADATA_KEY = 'workingMemory';
 const MAX_JSON_NESTING_DEPTH = 256;
@@ -418,6 +423,23 @@ export function assertWorkingMemoryIncarnation(
   if (currentIncarnation !== null) assertWorkingMemoryIncarnationValue(currentIncarnation);
   if (expectedIncarnation !== null) assertWorkingMemoryIncarnationValue(expectedIncarnation);
   if (currentIncarnation !== expectedIncarnation) throw new WorkingMemoryRevisionConflictError();
+}
+
+/** @internal Validate one atomically prepared scope-transition participant. */
+export function assertWorkingMemoryTransitionParticipant(
+  currentSnapshot: WorkingMemorySnapshot,
+  currentIncarnation: string | null,
+  expected: StorageWorkingMemoryTransitionParticipantReceipt,
+): void {
+  assertWorkingMemoryIncarnation(currentIncarnation, expected.workingMemoryIncarnation);
+  assertWorkingMemorySnapshotRevision(currentSnapshot, expected.snapshot.revision);
+  if (
+    currentIncarnation === null &&
+    expected.workingMemoryIncarnation === null &&
+    currentSnapshot.value !== expected.snapshot.value
+  ) {
+    throw new WorkingMemoryRevisionConflictError();
+  }
 }
 
 /**

@@ -53,12 +53,11 @@ import type { InMemoryDB } from '../inmemory-db';
 import { MemoryStorage } from './base';
 import {
   applyWorkingMemorySnapshotUpdate,
-  assertWorkingMemoryIncarnation,
   assertGovernedThreadResourceUnchanged,
   assertThreadWorkingMemoryRemoved,
   assertThreadWorkingMemoryIsUngoverned,
-  assertWorkingMemorySnapshotRevision,
   assertWorkingMemorySnapshotUnchanged,
+  assertWorkingMemoryTransitionParticipant,
   hasWorkingMemorySnapshotControls,
   mergeThreadMetadataForWorkingMemoryTransition,
   preserveWorkingMemorySnapshotControls,
@@ -1312,7 +1311,7 @@ export class InMemoryMemory extends MemoryStorage {
 
       const baseMetadata =
         input.mutation.type === 'save'
-          ? (input.mutation.thread.metadata ?? {})
+          ? preserveWorkingMemorySnapshotControls(currentThread?.metadata, input.mutation.thread.metadata ?? {})
           : input.mutation.metadata === undefined
             ? (currentThread!.metadata ?? {})
             : mergeThreadMetadataPreservingWorkingMemory(currentThread!.metadata, input.mutation.metadata);
@@ -1372,18 +1371,19 @@ export class InMemoryMemory extends MemoryStorage {
       const currentThreadValue =
         typeof currentThread?.metadata?.workingMemory === 'string' ? currentThread.metadata.workingMemory : null;
       const currentThreadSnapshot = readWorkingMemorySnapshot(currentThreadValue, currentThread?.metadata);
-      assertWorkingMemoryIncarnation(
+      assertWorkingMemoryTransitionParticipant(
+        currentThreadSnapshot,
         readWorkingMemoryIncarnation(currentThread?.metadata),
-        input.preparation.sourceThread.workingMemoryIncarnation,
+        input.preparation.sourceThread,
       );
-      assertWorkingMemorySnapshotRevision(currentThreadSnapshot, input.preparation.sourceThread.snapshot.revision);
 
       const now = new Date();
       const currentResource = this.db.resources.get(resourceId);
       const current = readWorkingMemorySnapshot(currentResource?.workingMemory, currentResource?.metadata);
-      assertWorkingMemoryIncarnation(
+      assertWorkingMemoryTransitionParticipant(
+        current,
         readWorkingMemoryIncarnation(currentResource?.metadata),
-        input.preparation.destinationResource.workingMemoryIncarnation,
+        input.preparation.destinationResource,
       );
       const next = applyWorkingMemorySnapshotUpdate(
         current,

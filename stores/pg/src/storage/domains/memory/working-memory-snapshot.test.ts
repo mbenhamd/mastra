@@ -590,6 +590,118 @@ describe('MemoryPG revisioned Working Memory', () => {
     ).resolves.toEqual(replacementDestination);
   });
 
+  it.each([
+    ['source thread', 'delete/recreate'],
+    ['source thread', 'same-row update'],
+    ['destination resource', 'delete/recreate'],
+    ['destination resource', 'same-row update'],
+  ] as const)(
+    'rejects a stale transition after the %s plain Working Memory changes by %s at revision zero',
+    async (replacedParticipant, replacementMode) => {
+      const participantKey = replacedParticipant === 'source thread' ? 'source' : 'destination';
+      const replacementKey = replacementMode === 'delete/recreate' ? 'recreated' : 'mutated';
+      const transitionResourceId = `${resourceId}-plain-${participantKey}-${replacementKey}`;
+      const transitionThreadId = `${threadId}-plain-${participantKey}-${replacementKey}`;
+      const createdAt = new Date('2026-01-01T00:00:00.000Z');
+      await firstMemory.saveThread({
+        thread: {
+          id: transitionThreadId,
+          resourceId: transitionResourceId,
+          title: 'Original source',
+          metadata: { workingMemory: '{"owner":"Ada"}', plain: 'source' },
+          createdAt,
+          updatedAt: createdAt,
+        },
+      });
+      await firstMemory.saveResource({
+        resource: {
+          id: transitionResourceId,
+          workingMemory: '{"destination":"original"}',
+          metadata: { plain: 'destination' },
+          createdAt,
+          updatedAt: createdAt,
+        },
+      });
+      const preparation = await secondMemory.prepareThreadToResourceWorkingMemoryTransition({
+        threadId: transitionThreadId,
+        resourceId: transitionResourceId,
+      });
+      expect(preparation.sourceThread).toMatchObject({
+        snapshot: { value: '{"owner":"Ada"}', revision: 0 },
+        workingMemoryIncarnation: null,
+      });
+      expect(preparation.destinationResource).toMatchObject({
+        snapshot: { value: '{"destination":"original"}', revision: 0 },
+        workingMemoryIncarnation: null,
+      });
+
+      if (replacedParticipant === 'source thread') {
+        if (replacementMode === 'delete/recreate') {
+          await firstMemory.deleteThread({ threadId: transitionThreadId });
+          await firstMemory.saveThread({
+            thread: {
+              id: transitionThreadId,
+              resourceId: transitionResourceId,
+              title: 'Replacement source',
+              metadata: { workingMemory: '{"owner":"Grace"}', replacement: true },
+              createdAt,
+              updatedAt: new Date(),
+            },
+          });
+        } else {
+          await firstMemory.updateThread({
+            id: transitionThreadId,
+            metadata: { workingMemory: '{"owner":"Grace"}', replacement: true },
+          });
+        }
+      } else if (replacementMode === 'delete/recreate') {
+        await firstMemory.deleteResource({ resourceId: transitionResourceId });
+        await firstMemory.saveResource({
+          resource: {
+            id: transitionResourceId,
+            workingMemory: '{"destination":"replacement"}',
+            metadata: { replacement: true },
+            createdAt,
+            updatedAt: new Date(),
+          },
+        });
+      } else {
+        await firstMemory.updateResource({
+          resourceId: transitionResourceId,
+          workingMemory: '{"destination":"replacement"}',
+          metadata: { replacement: true },
+        });
+      }
+      const replacementSource = await firstMemory.getWorkingMemorySnapshot({
+        scope: 'thread',
+        resourceId: transitionResourceId,
+        threadId: transitionThreadId,
+      });
+      const replacementDestination = await firstMemory.getWorkingMemorySnapshot({
+        scope: 'resource',
+        resourceId: transitionResourceId,
+      });
+
+      await expect(
+        secondMemory.transitionThreadToResourceWorkingMemory({
+          mutation: { type: 'update', id: transitionThreadId, resourceId: transitionResourceId },
+          value: preparation.sourceThread.snapshot.value!,
+          preparation,
+        }),
+      ).rejects.toMatchObject({ name: 'WorkingMemoryRevisionConflictError' });
+      await expect(
+        firstMemory.getWorkingMemorySnapshot({
+          scope: 'thread',
+          resourceId: transitionResourceId,
+          threadId: transitionThreadId,
+        }),
+      ).resolves.toEqual(replacementSource);
+      await expect(
+        firstMemory.getWorkingMemorySnapshot({ scope: 'resource', resourceId: transitionResourceId }),
+      ).resolves.toEqual(replacementDestination);
+    },
+  );
+
   it('merges resource working memory transitions into the thread row locked by PostgreSQL', async () => {
     const transitionResourceId = `${resourceId}-partial-transition`;
     const transitionThreadId = `${threadId}-partial-transition`;
@@ -686,6 +798,100 @@ describe('MemoryPG revisioned Working Memory', () => {
       client.release();
       await blocker.end();
     }
+  });
+
+  it('preserves a governed incarnation across an atomic whole-row observer no-op save', async () => {
+    const atomicResourceId = `${resourceId}-atomic-save-incarnation`;
+    const atomicThreadId = `${threadId}-atomic-save-incarnation`;
+    const createdAt = new Date('2026-01-01T00:00:00.000Z');
+    const created = await firstMemory.mutateThreadWithWorkingMemory({
+      mutation: {
+        type: 'save',
+        thread: {
+          id: atomicThreadId,
+          resourceId: atomicResourceId,
+          title: 'Created',
+          metadata: { initial: true },
+          createdAt,
+          updatedAt: createdAt,
+        },
+      },
+      workingMemory: {
+        type: 'observer-update',
+        resourceId: atomicResourceId,
+        value: '{"version":1}',
+        expectedRevision: 0,
+      },
+    });
+    const before = await firstMemory.prepareThreadToResourceWorkingMemoryTransition({
+      threadId: atomicThreadId,
+      resourceId: atomicResourceId,
+    });
+    expect(before.sourceThread.workingMemoryIncarnation).not.toBeNull();
+
+    const saved = await secondMemory.mutateThreadWithWorkingMemory({
+      mutation: {
+        type: 'save',
+        thread: {
+          id: atomicThreadId,
+          resourceId: atomicResourceId,
+          title: 'Saved',
+          metadata: { saved: true },
+          createdAt,
+          updatedAt: new Date(),
+        },
+      },
+      workingMemory: {
+        type: 'observer-update',
+        resourceId: atomicResourceId,
+        value: created.workingMemory!.value,
+        expectedRevision: created.workingMemory!.revision,
+      },
+    });
+    const after = await firstMemory.prepareThreadToResourceWorkingMemoryTransition({
+      threadId: atomicThreadId,
+      resourceId: atomicResourceId,
+    });
+
+    expect(saved.workingMemory).toEqual(created.workingMemory);
+    expect(saved.thread).toMatchObject({ title: 'Saved', metadata: { saved: true, workingMemory: '{"version":1}' } });
+    expect(after.sourceThread.workingMemoryIncarnation).toBe(before.sourceThread.workingMemoryIncarnation);
+
+    const changed = await secondMemory.mutateThreadWithWorkingMemory({
+      mutation: {
+        type: 'save',
+        thread: {
+          id: atomicThreadId,
+          resourceId: atomicResourceId,
+          title: 'Changed',
+          metadata: { changed: true },
+          createdAt,
+          updatedAt: new Date(),
+        },
+      },
+      workingMemory: {
+        type: 'observer-update',
+        resourceId: atomicResourceId,
+        value: '{"version":2}',
+        expectedRevision: saved.workingMemory!.revision,
+      },
+    });
+    const afterChanged = await firstMemory.prepareThreadToResourceWorkingMemoryTransition({
+      threadId: atomicThreadId,
+      resourceId: atomicResourceId,
+    });
+    expect(changed.workingMemory).toMatchObject({
+      value: '{"version":2}',
+      revision: saved.workingMemory!.revision + 1,
+    });
+    expect(afterChanged.sourceThread.workingMemoryIncarnation).toBe(before.sourceThread.workingMemoryIncarnation);
+    await expect(
+      secondMemory.transitionThreadToResourceWorkingMemory({
+        mutation: { type: 'update', id: atomicThreadId, resourceId: atomicResourceId },
+        value: '{"version":1}',
+        preparation: after,
+      }),
+    ).rejects.toMatchObject({ name: 'WorkingMemoryRevisionConflictError' });
   });
 
   it('atomically mutates thread rows with governed thread Working Memory', async () => {

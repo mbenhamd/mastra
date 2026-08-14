@@ -1201,6 +1201,148 @@ describe('InMemoryMemory revisioned Working Memory', () => {
     },
   );
 
+  it.each([
+    ['source thread', 'delete/recreate'],
+    ['source thread', 'same-row update'],
+    ['destination resource', 'delete/recreate'],
+    ['destination resource', 'same-row update'],
+  ] as const)(
+    'rejects a stale transition after the %s plain Working Memory changes by %s at revision zero',
+    async (replacedParticipant, replacementMode) => {
+      const caseId = replacementMode === 'delete/recreate' ? 'recreated' : 'mutated';
+      const storage = new InMemoryStore({ id: `working-memory-${replacedParticipant}-${caseId}-plain-aba` });
+      const memory = await storage.getStore('memory');
+      if (!memory) throw new Error('Expected in-memory storage domain.');
+      const createdAt = new Date('2026-01-01T00:00:00.000Z');
+      const resourceId = `plain-transition-${replacedParticipant}-resource`;
+      const threadId = `plain-transition-${replacedParticipant}-thread`;
+      await memory.saveThread({
+        thread: {
+          id: threadId,
+          resourceId,
+          title: 'Original source',
+          metadata: { workingMemory: '{"owner":"Ada"}', plain: 'source' },
+          createdAt,
+          updatedAt: createdAt,
+        },
+      });
+      await memory.saveResource({
+        resource: {
+          id: resourceId,
+          workingMemory: '{"destination":"original"}',
+          metadata: { plain: 'destination' },
+          createdAt,
+          updatedAt: createdAt,
+        },
+      });
+      const preparation = await memory.prepareThreadToResourceWorkingMemoryTransition({ threadId, resourceId });
+      expect(preparation.sourceThread).toMatchObject({
+        snapshot: { value: '{"owner":"Ada"}', revision: 0 },
+        workingMemoryIncarnation: null,
+      });
+      expect(preparation.destinationResource).toMatchObject({
+        snapshot: { value: '{"destination":"original"}', revision: 0 },
+        workingMemoryIncarnation: null,
+      });
+
+      if (replacedParticipant === 'source thread') {
+        if (replacementMode === 'delete/recreate') {
+          await memory.deleteThread({ threadId });
+          await memory.saveThread({
+            thread: {
+              id: threadId,
+              resourceId,
+              title: 'Replacement source',
+              metadata: { workingMemory: '{"owner":"Grace"}', replacement: true },
+              createdAt,
+              updatedAt: new Date(),
+            },
+          });
+        } else {
+          await memory.updateThread({
+            id: threadId,
+            metadata: { workingMemory: '{"owner":"Grace"}', replacement: true },
+          });
+        }
+      } else if (replacementMode === 'delete/recreate') {
+        await memory.deleteResource({ resourceId });
+        await memory.saveResource({
+          resource: {
+            id: resourceId,
+            workingMemory: '{"destination":"replacement"}',
+            metadata: { replacement: true },
+            createdAt,
+            updatedAt: new Date(),
+          },
+        });
+      } else {
+        await memory.updateResource({
+          resourceId,
+          workingMemory: '{"destination":"replacement"}',
+          metadata: { replacement: true },
+        });
+      }
+      const replacementSource = await memory.getWorkingMemorySnapshot({ scope: 'thread', resourceId, threadId });
+      const replacementDestination = await memory.getWorkingMemorySnapshot({ scope: 'resource', resourceId });
+
+      await expect(
+        memory.transitionThreadToResourceWorkingMemory({
+          mutation: { type: 'update', id: threadId, resourceId },
+          value: preparation.sourceThread.snapshot.value!,
+          preparation,
+        }),
+      ).rejects.toMatchObject({ name: 'WorkingMemoryRevisionConflictError' });
+      await expect(memory.getWorkingMemorySnapshot({ scope: 'thread', resourceId, threadId })).resolves.toEqual(
+        replacementSource,
+      );
+      await expect(memory.getWorkingMemorySnapshot({ scope: 'resource', resourceId })).resolves.toEqual(
+        replacementDestination,
+      );
+    },
+  );
+
+  it('accepts equivalent tokenless no-WM states while merging unrelated metadata', async () => {
+    const storage = new InMemoryStore({ id: 'working-memory-tokenless-equivalent-transition' });
+    const memory = await storage.getStore('memory');
+    if (!memory) throw new Error('Expected in-memory storage domain.');
+    const createdAt = new Date('2026-01-01T00:00:00.000Z');
+    const resourceId = 'tokenless-equivalent-resource';
+    const threadId = 'tokenless-equivalent-thread';
+    await memory.saveThread({
+      thread: {
+        id: threadId,
+        resourceId,
+        title: 'Initial title',
+        metadata: { preserved: true },
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+    const preparation = await memory.prepareThreadToResourceWorkingMemoryTransition({ threadId, resourceId });
+    expect(preparation.sourceThread).toMatchObject({ snapshot: { value: null }, workingMemoryIncarnation: null });
+    expect(preparation.destinationResource).toMatchObject({
+      snapshot: { value: null },
+      workingMemoryIncarnation: null,
+    });
+
+    await memory.updateThread({ id: threadId, title: 'Concurrent title', metadata: { concurrent: true } });
+    await memory.updateResource({ resourceId, metadata: { destination: 'created without WM' } });
+    const transitioned = await memory.transitionThreadToResourceWorkingMemory({
+      mutation: { type: 'update', id: threadId, resourceId },
+      value: 'canonical resource value',
+      preparation,
+    });
+
+    expect(transitioned.thread).toMatchObject({
+      title: 'Concurrent title',
+      metadata: { preserved: true, concurrent: true },
+    });
+    await expect(memory.getResourceById({ resourceId })).resolves.toMatchObject({
+      workingMemory: 'canonical resource value',
+      metadata: { destination: 'created without WM' },
+    });
+  });
+
   it.each(['thread', 'resource'] as const)(
     're-incarnates caller-replayed %s controls on fresh and ungoverned rows',
     async scope => {
@@ -1330,6 +1472,94 @@ describe('InMemoryMemory revisioned Working Memory', () => {
       explicit: true,
       mastra: null,
     });
+  });
+
+  it('preserves a governed incarnation across an atomic whole-row observer no-op save', async () => {
+    const storage = new InMemoryStore({ id: 'working-memory-atomic-save-incarnation' });
+    const memory = await storage.getStore('memory');
+    if (!memory) throw new Error('Expected in-memory storage domain.');
+    const createdAt = new Date('2026-01-01T00:00:00.000Z');
+    const resourceId = 'atomic-save-incarnation-resource';
+    const threadId = 'atomic-save-incarnation-thread';
+    const created = await memory.mutateThreadWithWorkingMemory({
+      mutation: {
+        type: 'save',
+        thread: {
+          id: threadId,
+          resourceId,
+          title: 'Created',
+          metadata: { initial: true },
+          createdAt,
+          updatedAt: createdAt,
+        },
+      },
+      workingMemory: {
+        type: 'observer-update',
+        resourceId,
+        value: '{"version":1}',
+        expectedRevision: 0,
+      },
+    });
+    const before = await memory.prepareThreadToResourceWorkingMemoryTransition({ threadId, resourceId });
+    expect(before.sourceThread.workingMemoryIncarnation).not.toBeNull();
+
+    const saved = await memory.mutateThreadWithWorkingMemory({
+      mutation: {
+        type: 'save',
+        thread: {
+          id: threadId,
+          resourceId,
+          title: 'Saved',
+          metadata: { saved: true },
+          createdAt,
+          updatedAt: new Date(),
+        },
+      },
+      workingMemory: {
+        type: 'observer-update',
+        resourceId,
+        value: created.workingMemory!.value,
+        expectedRevision: created.workingMemory!.revision,
+      },
+    });
+    const after = await memory.prepareThreadToResourceWorkingMemoryTransition({ threadId, resourceId });
+
+    expect(saved.workingMemory).toEqual(created.workingMemory);
+    expect(saved.thread).toMatchObject({ title: 'Saved', metadata: { saved: true, workingMemory: '{"version":1}' } });
+    expect(after.sourceThread.workingMemoryIncarnation).toBe(before.sourceThread.workingMemoryIncarnation);
+
+    const changed = await memory.mutateThreadWithWorkingMemory({
+      mutation: {
+        type: 'save',
+        thread: {
+          id: threadId,
+          resourceId,
+          title: 'Changed',
+          metadata: { changed: true },
+          createdAt,
+          updatedAt: new Date(),
+        },
+      },
+      workingMemory: {
+        type: 'observer-update',
+        resourceId,
+        value: '{"version":2}',
+        expectedRevision: saved.workingMemory!.revision,
+      },
+    });
+    const afterChanged = await memory.prepareThreadToResourceWorkingMemoryTransition({ threadId, resourceId });
+    expect(changed.workingMemory).toMatchObject({
+      value: '{"version":2}',
+      revision: saved.workingMemory!.revision + 1,
+    });
+    expect(afterChanged.sourceThread.workingMemoryIncarnation).toBe(before.sourceThread.workingMemoryIncarnation);
+    await expect(
+      memory.transitionThreadToResourceWorkingMemory({
+        mutation: { type: 'update', id: threadId, resourceId },
+        value: '{"version":1}',
+        preparation: after,
+      }),
+    ).rejects.toMatchObject({ name: 'WorkingMemoryRevisionConflictError' });
   });
 
   it('atomically mutates thread rows with governed thread Working Memory', async () => {

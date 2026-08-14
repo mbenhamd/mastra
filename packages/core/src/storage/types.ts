@@ -918,10 +918,13 @@ export type ApplyWorkingMemoryUpdateInput = WorkingMemorySnapshotInput & {
   observationalMemoryGuard?: ObservationalMemoryWriteGuard;
 };
 
-/** @internal One atomically observed governed Working Memory participant. */
+/** @internal One atomically observed Working Memory transition participant. */
 export type StorageWorkingMemoryTransitionParticipantReceipt = {
   snapshot: WorkingMemorySnapshot;
-  /** Opaque identity of the governed control lifetime; null means no controls were observed. */
+  /**
+   * Opaque identity of the governed control lifetime; null means no controls
+   * were observed and the exact snapshot value fences the ungoverned state.
+   */
   workingMemoryIncarnation: string | null;
 };
 
