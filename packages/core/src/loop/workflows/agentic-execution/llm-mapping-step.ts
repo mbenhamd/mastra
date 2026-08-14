@@ -336,11 +336,9 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
       }) {
         const tool = ((
           readScoped(scopeCtx, STEP_TOOLS_KEY, 'stepTools') as
-            | Record<string, { toModelOutput?: (output: unknown) => unknown }>
-            | undefined
+            Record<string, { toModelOutput?: (output: unknown) => unknown }> | undefined
         )?.[toolCall.toolName] ?? rest.tools?.[toolCall.toolName]) as
-          | { toModelOutput?: (output: unknown) => unknown }
-          | undefined;
+          { toModelOutput?: (output: unknown) => unknown } | undefined;
         let modelOutput: unknown;
         if (tool?.toModelOutput && toolCall.result != null) {
           const parentSpan = observabilityContext?.tracingContext?.currentSpan;
@@ -560,6 +558,35 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
         )
       ) {
         const errorResults = inputData.filter(toolCall => toolCall?.error && !toolCall.providerExecuted);
+        const abortedResults = inputData.filter(
+          toolCall => toolCall?.aborted && toolCall.abortError && !toolCall.providerExecuted,
+        );
+
+        // Request-aborted tools remain incomplete in model history, but their
+        // actual cancellation error is still authoritative for live stream and
+        // Harness consumers. Emit that terminal without calling
+        // persistResolvedToolCall or allowing another model iteration.
+        for (const toolCall of abortedResults) {
+          const reifiedError = deserializeToolError(toolCall.abortError);
+          const chunk = await transformToolChunk(
+            {
+              type: 'tool-error',
+              runId: rest.runId,
+              from: ChunkFrom.AGENT,
+              payload: {
+                error: reifiedError,
+                args: toolCall.args,
+                toolCallId: toolCall.toolCallId,
+                toolName: toolCall.toolName,
+                providerMetadata: toolCall.providerMetadata as ProviderMetadata | undefined,
+              },
+            },
+            { ...toolCall, error: reifiedError },
+            'error',
+          );
+          const processed = await processAndEnqueueChunk(chunk, terminalResolutionState);
+          if (processed) await rest.options?.onChunk?.(processed);
+        }
 
         if (errorResults?.length) {
           for (const toolCall of errorResults) {
@@ -636,10 +663,10 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
           tc => tc.result === undefined && !tc.error && !tc.aborted && !tc.providerExecuted && !isDeniedApproval(tc),
         );
 
-        if (errorResults?.length > 0 && !hasPendingHITL) {
-          // Process any successful tool results from this turn before continuing.
-          // In a mixed turn (e.g., one valid tool + one hallucinated), the successful
-          // results need their chunks emitted and messages added to the messageList.
+        if (errorResults.length > 0 || abortedResults.length > 0) {
+          // Process successful siblings before either recovering from ordinary
+          // errors or honoring the request abort. Settlements that completed in
+          // this turn remain authoritative even though abort forbids another turn.
           const successfulResults = inputData.filter(tc => tc.result !== undefined);
           if (successfulResults.length) {
             const stepNumber = (initialResult?.output?.steps?.length ?? 0) as number;
@@ -652,8 +679,7 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
                 ? await getProviderMetadataWithModelOutput(toolCall)
                 : undefined;
               const chunkProviderMetadata = (providerMetadata ?? toolCall.providerMetadata) as
-                | ProviderMetadata
-                | undefined;
+                ProviderMetadata | undefined;
 
               const chunk = await transformToolChunk(
                 {
@@ -722,25 +748,27 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
             }
           }
 
-          // Continue the loop — the error messages are already in the messageList,
-          // so the model will see them and can retry with correct tool names
-          initialResult.stepResult.isContinued = true;
-          initialResult.stepResult.reason = 'tool-calls';
-          refreshLatestStepResult();
-          return {
-            ...initialResult,
-            messages: {
-              all: rest.messageList.get.all.aiV5.model(),
-              user: rest.messageList.get.input.aiV5.model(),
-              nonUser: rest.messageList.get.response.aiV5.model(),
-            },
-          };
+          if (abortedResults.length === 0 && !hasPendingHITL) {
+            // Ordinary tool errors remain model-visible and may self-recover
+            // only when no pending interaction must suspend the turn.
+            initialResult.stepResult.isContinued = true;
+            initialResult.stepResult.reason = 'tool-calls';
+            refreshLatestStepResult();
+            return {
+              ...initialResult,
+              messages: {
+                all: rest.messageList.get.all.aiV5.model(),
+                user: rest.messageList.get.input.aiV5.model(),
+                nonUser: rest.messageList.get.response.aiV5.model(),
+              },
+            };
+          }
         }
 
-        // Only set isContinued = false if this is NOT a retry scenario
-        // When stepResult.reason is 'retry', the llm-execution-step has already set
-        // isContinued = true and we should preserve that to allow the agentic loop to continue
-        if (initialResult.stepResult.reason !== 'retry') {
+        // A request abort is terminal even if a sibling error or processor had
+        // already prepared a retry. Without an aborted tool, preserve the
+        // existing processor-retry contract.
+        if (abortedResults.length > 0 || initialResult.stepResult.reason !== 'retry') {
           initialResult.stepResult.isContinued = false;
         }
 

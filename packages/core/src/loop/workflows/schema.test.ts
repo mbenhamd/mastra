@@ -1,26 +1,32 @@
 import { describe, expect, it } from 'vitest';
 import { toolCallOutputSchema } from './schema';
 
-// Guards the `aborted` field on toolCallOutputSchema (#17995). The evented engine validates
-// step outputs against this schema, and Zod strips undeclared keys — so without the field,
-// `{ aborted: true }` would be dropped before llm-mapping-step sees it, defeating the fix.
-// Pins that it survives both the single-object and array boundaries the engine uses.
+// Guards the request-abort fields on toolCallOutputSchema (#17995). The evented engine
+// validates step outputs against this schema, and Zod strips undeclared keys. Both the
+// incomplete-call marker and its terminal-only error must survive into llm-mapping-step.
 describe('toolCallOutputSchema aborted field survival', () => {
   const aborted = {
     toolCallId: 'srv-1',
     toolName: 'slowServerTool',
     args: { q: 'important' },
     aborted: true,
+    abortError: { name: 'Error', message: 'local_project.operation_cancelled' },
   };
 
-  it('preserves `aborted` through a single-object parse', () => {
+  it('preserves request-abort metadata through a single-object parse', () => {
     const parsed = toolCallOutputSchema.parse(aborted);
-    expect(parsed.aborted).toBe(true);
+    expect(parsed).toMatchObject({
+      aborted: true,
+      abortError: { name: 'Error', message: 'local_project.operation_cancelled' },
+    });
   });
 
-  it('preserves `aborted` through an array parse (the evented-engine step-output boundary)', () => {
+  it('preserves request-abort metadata through the evented-engine array boundary', () => {
     const parsed = toolCallOutputSchema.array().parse([aborted]);
-    expect(parsed[0]?.aborted).toBe(true);
+    expect(parsed[0]).toMatchObject({
+      aborted: true,
+      abortError: { name: 'Error', message: 'local_project.operation_cancelled' },
+    });
   });
 
   it('still allows the normal result/error shapes without an `aborted` flag', () => {
