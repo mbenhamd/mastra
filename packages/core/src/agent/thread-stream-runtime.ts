@@ -4145,6 +4145,33 @@ export class AgentThreadStreamRuntime {
             activeReaderStreamId = run.streamId;
             let readerReleased = false;
             let fullyDrained = false;
+            let pendingAuthoritativeAbortPart: any;
+            const partWithRunId = (part: any) =>
+              part && typeof part === 'object' && !('runId' in part) ? { ...part, runId: run.runId } : part;
+            const acceptSourceTerminal = () => {
+              abortTerminalPending = false;
+              clearAbortDrainTimer();
+              // Every model-visible part has crossed this generator once the
+              // terminal below is delivered. Mark the barrier before pausing
+              // at `yield`; otherwise a caller awaiting `_waitForOutputDrain()`
+              // immediately after consuming it would deadlock.
+              fullyDrained = true;
+              markOutputStreamDrained(run.output);
+              // Drain non-visible trailers in the background to prevent
+              // upstream backpressure while serving subsequent runs.
+              readerReleased = true;
+              void (async () => {
+                try {
+                  while (true) {
+                    const { done: d } = await reader.read();
+                    if (d) break;
+                  }
+                } catch {
+                  // Background trailer draining is best-effort.
+                }
+                reader.releaseLock();
+              })();
+            };
             try {
               while (true) {
                 const { value: part, done: streamDone } = await reader.read();
@@ -4182,44 +4209,39 @@ export class AgentThreadStreamRuntime {
                 // `run-aborted` is a hard stop. During its bounded drain grace,
                 // surface only terminals for tools that were already visible
                 // before the abort, plus the source's matching abort boundary.
-                // Drop post-abort text, new tool calls, unrelated/orphan parts,
-                // and competing finish/error terminals.
+                // Some providers emit their source `abort` before an in-flight
+                // tool observes cancellation. Hold that boundary until the
+                // already-visible tool settles (or the bounded reader cancel
+                // closes the source) so the authoritative tool payload is not
+                // discarded as a trailer.
+                const deferAuthoritativeAbort =
+                  abortTerminalPending && authoritativeAbortTerminal && activeToolCallIds.size > 0;
+                if (deferAuthoritativeAbort && pendingAuthoritativeAbortPart === undefined) {
+                  pendingAuthoritativeAbortPart = typedPart;
+                }
                 const visibleAfterAbort = isSettlingActiveTool || authoritativeAbortTerminal;
-                const shouldYieldPart = !abortTerminalPending || visibleAfterAbort;
-                const acceptedSourceTerminal = sourceTerminal && (!abortTerminalPending || authoritativeAbortTerminal);
+                const shouldYieldPart = (!abortTerminalPending || visibleAfterAbort) && !deferAuthoritativeAbort;
+                const acceptedSourceTerminal =
+                  sourceTerminal && (!abortTerminalPending || (authoritativeAbortTerminal && !deferAuthoritativeAbort));
                 if (acceptedSourceTerminal) {
-                  // The source supplied its own terminal. A matching source abort
-                  // supersedes the synthetic fallback, while competing terminals
+                  // A matching source abort supersedes the synthetic fallback
+                  // once every visible tool has settled. Competing terminals
                   // after `run-aborted` remain filtered until close/cancellation.
-                  abortTerminalPending = false;
-                  clearAbortDrainTimer();
-                  // Every model-visible part has crossed this generator once the
-                  // terminal below is delivered. Mark the barrier before pausing
-                  // at `yield`; otherwise a caller awaiting `_waitForOutputDrain()`
-                  // immediately after consuming it would deadlock.
-                  fullyDrained = true;
-                  markOutputStreamDrained(run.output);
-                  // Drain non-visible trailers in the background to prevent
-                  // upstream backpressure while serving subsequent runs.
-                  readerReleased = true;
-                  void (async () => {
-                    try {
-                      while (true) {
-                        const { done: d } = await reader.read();
-                        if (d) break;
-                      }
-                    } catch {
-                      // Background trailer draining is best-effort.
-                    }
-                    reader.releaseLock();
-                  })();
+                  acceptSourceTerminal();
                 }
                 if (shouldYieldPart) {
-                  const partWithRunId =
-                    typedPart && typeof typedPart === 'object' && !('runId' in typedPart)
-                      ? { ...typedPart, runId: run.runId }
-                      : typedPart;
-                  yield partWithRunId;
+                  yield partWithRunId(typedPart);
+                }
+                if (
+                  abortTerminalPending &&
+                  pendingAuthoritativeAbortPart !== undefined &&
+                  activeToolCallIds.size === 0
+                ) {
+                  const abortPart = pendingAuthoritativeAbortPart;
+                  pendingAuthoritativeAbortPart = undefined;
+                  acceptSourceTerminal();
+                  yield partWithRunId(abortPart);
+                  break;
                 }
                 if (done || acceptedSourceTerminal) break;
               }
@@ -4234,7 +4256,9 @@ export class AgentThreadStreamRuntime {
                 // immediately after consuming this terminal.
                 fullyDrained = true;
                 markOutputStreamDrained(run.output);
-                yield { type: 'abort', runId: run.runId } as any;
+                const abortPart = pendingAuthoritativeAbortPart ?? { type: 'abort', runId: run.runId };
+                pendingAuthoritativeAbortPart = undefined;
+                yield partWithRunId(abortPart);
                 abortTerminalPending = false;
               }
             } finally {
