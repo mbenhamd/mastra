@@ -772,6 +772,7 @@ export class InMemoryMemory extends MemoryStorage {
     retractObservationalMemory?: boolean;
     observationalMemoryRetractions?: ObservationalMemoryRetractionReceipt[];
   }): Promise<MastraDBMessage[]> {
+    const canonicalUpdates = [...new Map(args.messages.map(message => [message.id, message])).values()];
     const committedRetractions: ObservationalMemoryRetractionReceipt[] = [];
     const updatedMessages = this.withMemoryStateRollback(args.retractObservationalMemory === true, () => {
       const retractionCoordinates: Array<{ resourceId: string; threadId: string }> = [];
@@ -781,7 +782,7 @@ export class InMemoryMemory extends MemoryStorage {
           if (!resourceId || !threadId) return;
           coordinates.set(`${resourceId}\u0000${threadId}`, { resourceId, threadId });
         };
-        for (const update of args.messages) {
+        for (const update of canonicalUpdates) {
           const message = this.db.messages.get(update.id);
           if (!message?.thread_id) continue;
           const sourceResourceId = message.resourceId ?? this.db.threads.get(message.thread_id)?.resourceId;
@@ -803,7 +804,7 @@ export class InMemoryMemory extends MemoryStorage {
       }
 
       const mutationResults: MastraDBMessage[] = [];
-      for (const update of args.messages) {
+      for (const update of canonicalUpdates) {
         const storageMsg = this.db.messages.get(update.id);
         if (!storageMsg) continue;
 
