@@ -1,3 +1,4 @@
+import { deepEqual } from '../../../utils/deep-equal';
 import type {
   ApplyWorkingMemoryUpdateInput,
   StorageWorkingMemoryTransitionParticipantReceipt,
@@ -223,16 +224,19 @@ function preserveProtectedPaths(
     throw new WorkingMemoryValidationError('Path-protected working memory must contain valid JSON.');
   }
 
-  let merged = cloneJson(proposed);
+  let merged: JsonValue | undefined;
   for (const pointer of protectedPaths) {
     const segments = pointerSegments(pointer);
     const prior = getPointer(current, segments);
     if (!prior.exists) {
       throw new WorkingMemoryValidationError('Protected working-memory paths must exist in the stored value.');
     }
+    const proposedAtPointer = getPointer(proposed, segments);
+    if (proposedAtPointer.exists && deepEqual(proposedAtPointer.value, prior.value)) continue;
+    if (merged === undefined) merged = cloneJson(proposed);
     merged = setPointer(merged, segments, prior.value!, current);
   }
-  return JSON.stringify(merged);
+  return merged === undefined ? proposedValue : JSON.stringify(merged);
 }
 
 function valuesEqual(left: JsonValue | undefined, right: JsonValue | undefined): boolean {
@@ -693,7 +697,7 @@ export function retractObserverWorkingMemorySnapshot(current: WorkingMemorySnaps
         const existing = getPointer(parsed, segments);
         if (existing.exists) preserved = setPointer(preserved, segments, existing.value!, parsed);
       }
-      value = JSON.stringify(preserved);
+      value = deepEqual(parsed, preserved) ? current.value : JSON.stringify(preserved);
     }
   }
 
