@@ -37,3 +37,5 @@ await memory.updateWorkingMemoryByOwner({
   protectPaths: ['/profile/name'],
 });
 ```
+
+This release uses the coordinated revisioned Working Memory and conditional clone-rollback contracts from `@mastra/core`, so it requires `@mastra/core@2.0.0-alpha.11` or a later compatible 2.x release. Version Core and Memory atomically; do not publish Memory independently.
