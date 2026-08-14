@@ -21,11 +21,13 @@ describe('MemoryPG observational-memory retraction', () => {
       metadataText: string;
       updatedAt: Date;
       updatedAtZ: Date;
+      rowVersion: string;
     }>(
       `SELECT title,
               metadata::text AS "metadataText",
               "updatedAt",
-              "updatedAtZ"
+              "updatedAtZ",
+              xmin::text AS "rowVersion"
        FROM "${schemaName}"."mastra_threads"
        WHERE id = $1`,
       [storedThreadId],
@@ -477,7 +479,7 @@ describe('MemoryPG observational-memory retraction', () => {
     });
   });
 
-  it('does not rewrite an owner-only protected thread during managed OM retraction', async () => {
+  it('does not rewrite formatted owner-only non-root protected memory during managed OM retraction', async () => {
     const protectedResourceId = `${resourceId}-owner-only-noop`;
     const protectedThreadId = `${threadId}-owner-only-noop`;
     await observerMemory.saveThread({
@@ -496,15 +498,33 @@ describe('MemoryPG observational-memory retraction', () => {
       scope: 'thread',
       threadId: protectedThreadId,
     });
+    const initialOwner = await observerMemory.applyWorkingMemoryUpdate({
+      scope: 'thread',
+      resourceId: protectedResourceId,
+      threadId: protectedThreadId,
+      value: '{"preference":{"format":"markdown","tone":"concise"},"profile":{"name":"Ada"}}',
+      expectedRevision: 0,
+      source: 'owner',
+      protectPaths: ['/profile', '/preference'],
+    });
+    const ownerValue =
+      '{\n  "profile": { "name": "Ada" },\n  "preference": { "tone": "concise", "format": "markdown" }\n}';
     const owner = await observerMemory.applyWorkingMemoryUpdate({
       scope: 'thread',
       resourceId: protectedResourceId,
       threadId: protectedThreadId,
-      value: '{"owner":"Ada"}',
-      expectedRevision: 0,
+      value: ownerValue,
+      expectedRevision: initialOwner.revision,
       source: 'owner',
-      protectPaths: [''],
+      protectPaths: ['/profile', '/preference'],
     });
+    expect(owner).toMatchObject({
+      value: ownerValue,
+      revision: 2,
+      protectedPaths: ['/preference', '/profile'],
+    });
+    expect(Object.keys(owner.provenance).sort()).toEqual(['', '/preference', '/profile'].sort());
+    expect(Object.values(owner.provenance).every(entry => entry.source === 'owner')).toBe(true);
     await observerStore.db.none(
       `UPDATE "${schemaName}"."mastra_threads"
        SET "updatedAt" = $1, "updatedAtZ" = $2
