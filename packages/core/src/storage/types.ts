@@ -935,6 +935,8 @@ export type StorageTransitionThreadToResourceWorkingMemoryInput = {
         metadata?: Record<string, unknown>;
       };
   value: string;
+  /** Source thread revision captured before this transition was proposed. */
+  expectedSourceThreadRevision: number;
   expectedRevision: number;
   maxDataBytes?: number;
 };

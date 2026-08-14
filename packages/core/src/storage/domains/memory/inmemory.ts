@@ -55,6 +55,7 @@ import {
   assertGovernedThreadResourceUnchanged,
   assertThreadWorkingMemoryRemoved,
   assertThreadWorkingMemoryIsUngoverned,
+  assertWorkingMemorySnapshotRevision,
   assertWorkingMemorySnapshotUnchanged,
   hasWorkingMemorySnapshotControls,
   mergeThreadMetadataForWorkingMemoryTransition,
@@ -1323,6 +1324,10 @@ export class InMemoryMemory extends MemoryStorage {
       if (currentThread && currentThread.resourceId !== resourceId) {
         throw new WorkingMemoryValidationError('Working-memory thread does not belong to the requested resource.');
       }
+      const currentThreadValue =
+        typeof currentThread?.metadata?.workingMemory === 'string' ? currentThread.metadata.workingMemory : null;
+      const currentThreadSnapshot = readWorkingMemorySnapshot(currentThreadValue, currentThread?.metadata);
+      assertWorkingMemorySnapshotRevision(currentThreadSnapshot, input.expectedSourceThreadRevision);
 
       const now = new Date();
       const currentResource = this.db.resources.get(resourceId);

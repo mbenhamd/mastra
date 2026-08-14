@@ -319,7 +319,8 @@ export abstract class MemoryStorage extends StorageDomain {
    * Atomically save or partially update a thread without governed Working
    * Memory fields while writing that value to the thread's canonical resource
    * snapshot. Update mutations must merge only their explicit fields into the
-   * row read under the adapter's lock.
+   * row read under the adapter's lock. The source thread revision and target
+   * resource revision must both remain current until that atomic transition.
    *
    * @internal Revision-capable adapters must implement this operation natively;
    * generic saveThread/updateThread remain unable to remove governance fields.

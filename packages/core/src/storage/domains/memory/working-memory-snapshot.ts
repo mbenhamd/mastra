@@ -675,6 +675,19 @@ export function writeWorkingMemorySnapshotMetadata(
   };
 }
 
+/** Fail closed unless a stored snapshot still has the caller's observed revision. */
+export function assertWorkingMemorySnapshotRevision(
+  current: Pick<WorkingMemorySnapshot, 'revision'>,
+  expectedRevision: number,
+): void {
+  if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) {
+    throw new WorkingMemoryValidationError('Working-memory expectedRevision must be a non-negative safe integer.');
+  }
+  if (current.revision !== expectedRevision) {
+    throw new WorkingMemoryRevisionConflictError();
+  }
+}
+
 export function applyWorkingMemorySnapshotUpdate(
   current: WorkingMemorySnapshot,
   input: Pick<
@@ -683,12 +696,7 @@ export function applyWorkingMemorySnapshotUpdate(
   >,
   updatedAt = new Date().toISOString(),
 ): WorkingMemorySnapshot {
-  if (!Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 0) {
-    throw new WorkingMemoryValidationError('Working-memory expectedRevision must be a non-negative safe integer.');
-  }
-  if (current.revision !== input.expectedRevision) {
-    throw new WorkingMemoryRevisionConflictError();
-  }
+  assertWorkingMemorySnapshotRevision(current, input.expectedRevision);
   if (input.source !== 'observer' && input.source !== 'owner') {
     throw new WorkingMemoryValidationError('Working-memory source must be owner or observer.');
   }

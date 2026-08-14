@@ -19,6 +19,7 @@ import {
   assertGovernedThreadResourceUnchanged,
   assertThreadWorkingMemoryRemoved,
   assertThreadWorkingMemoryIsUngoverned,
+  assertWorkingMemorySnapshotRevision,
   assertWorkingMemorySnapshotUnchanged,
   hasWorkingMemorySnapshotControls,
   mergeThreadMetadataForWorkingMemoryTransition,
@@ -2954,6 +2955,11 @@ export class MemoryPG extends MemoryStorage {
         if (currentThread && currentThread.resourceId !== resourceId) {
           throw new WorkingMemoryValidationError('Working-memory thread does not belong to the requested resource.');
         }
+        const currentThreadMetadata = parseMetadata(currentThread?.metadata);
+        const currentThreadValue =
+          typeof currentThreadMetadata.workingMemory === 'string' ? currentThreadMetadata.workingMemory : null;
+        const currentThreadSnapshot = readWorkingMemorySnapshot(currentThreadValue, currentThreadMetadata);
+        assertWorkingMemorySnapshotRevision(currentThreadSnapshot, input.expectedSourceThreadRevision);
 
         const currentResource = await t.oneOrNone<{
           workingMemory: string | null;

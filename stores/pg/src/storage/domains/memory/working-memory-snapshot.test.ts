@@ -328,6 +328,7 @@ describe('MemoryPG revisioned Working Memory', () => {
       secondMemory.transitionThreadToResourceWorkingMemory({
         mutation: { type: 'save', thread },
         value: 'canonical resource value',
+        expectedSourceThreadRevision: threadSnapshot.revision,
         expectedRevision: 0,
       }),
     ).rejects.toMatchObject({ name: 'WorkingMemoryRevisionConflictError' });
@@ -343,9 +344,29 @@ describe('MemoryPG revisioned Working Memory', () => {
       scope: 'resource',
       resourceId: transitionResourceId,
     });
+    await expect(
+      secondMemory.transitionThreadToResourceWorkingMemory({
+        mutation: { type: 'save', thread },
+        value: 'canonical resource value',
+        expectedSourceThreadRevision: 0,
+        expectedRevision: currentResource.revision,
+      }),
+    ).rejects.toMatchObject({ name: 'WorkingMemoryRevisionConflictError' });
+    await expect(
+      firstMemory.getWorkingMemorySnapshot({ scope: 'resource', resourceId: transitionResourceId }),
+    ).resolves.toEqual(currentResource);
+    await expect(
+      firstMemory.getWorkingMemorySnapshot({
+        scope: 'thread',
+        resourceId: transitionResourceId,
+        threadId: transitionThreadId,
+      }),
+    ).resolves.toEqual(threadSnapshot);
+
     const transitioned = await secondMemory.transitionThreadToResourceWorkingMemory({
       mutation: { type: 'save', thread },
       value: 'canonical resource value',
+      expectedSourceThreadRevision: threadSnapshot.revision,
       expectedRevision: currentResource.revision,
     });
     expect(transitioned.workingMemory).toMatchObject({ value: 'canonical resource value', revision: 2 });
@@ -373,7 +394,7 @@ describe('MemoryPG revisioned Working Memory', () => {
         updatedAt: createdAt,
       },
     });
-    await firstMemory.applyWorkingMemoryUpdate({
+    const threadSnapshot = await firstMemory.applyWorkingMemoryUpdate({
       scope: 'thread',
       resourceId: transitionResourceId,
       threadId: transitionThreadId,
@@ -399,6 +420,7 @@ describe('MemoryPG revisioned Working Memory', () => {
           resourceId: transitionResourceId,
         },
         value: 'first resource value',
+        expectedSourceThreadRevision: threadSnapshot.revision,
         expectedRevision: 0,
       });
       const completedWhileLockHeld = await Promise.race([
@@ -433,6 +455,7 @@ describe('MemoryPG revisioned Working Memory', () => {
           metadata: { explicit: true, mastra: null },
         },
         value: 'second resource value',
+        expectedSourceThreadRevision: 0,
         expectedRevision: transitioned.workingMemory.revision,
       });
       expect(explicitlyUpdated.thread.title).toBe('Explicit transition title');

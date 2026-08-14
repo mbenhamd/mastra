@@ -964,6 +964,7 @@ describe('InMemoryMemory revisioned Working Memory', () => {
           },
         },
         value: 'canonical resource value',
+        expectedSourceThreadRevision: threadSnapshot.revision,
         expectedRevision: 0,
       }),
     ).rejects.toMatchObject({ name: 'WorkingMemoryRevisionConflictError' });
@@ -972,6 +973,28 @@ describe('InMemoryMemory revisioned Working Memory', () => {
     );
 
     const currentResource = await memory.getWorkingMemorySnapshot({ scope: 'resource', resourceId });
+    await expect(
+      memory.transitionThreadToResourceWorkingMemory({
+        mutation: {
+          type: 'save',
+          thread: {
+            id: threadId,
+            resourceId,
+            metadata: { preserved: true },
+            createdAt,
+            updatedAt: new Date(),
+          },
+        },
+        value: 'canonical resource value',
+        expectedSourceThreadRevision: 0,
+        expectedRevision: currentResource.revision,
+      }),
+    ).rejects.toMatchObject({ name: 'WorkingMemoryRevisionConflictError' });
+    await expect(memory.getWorkingMemorySnapshot({ scope: 'resource', resourceId })).resolves.toEqual(currentResource);
+    await expect(memory.getWorkingMemorySnapshot({ scope: 'thread', resourceId, threadId })).resolves.toEqual(
+      threadSnapshot,
+    );
+
     const transitioned = await memory.transitionThreadToResourceWorkingMemory({
       mutation: {
         type: 'save',
@@ -984,6 +1007,7 @@ describe('InMemoryMemory revisioned Working Memory', () => {
         },
       },
       value: 'canonical resource value',
+      expectedSourceThreadRevision: threadSnapshot.revision,
       expectedRevision: currentResource.revision,
     });
 
@@ -1014,7 +1038,7 @@ describe('InMemoryMemory revisioned Working Memory', () => {
         updatedAt: createdAt,
       },
     });
-    await memory.applyWorkingMemoryUpdate({
+    const threadSnapshot = await memory.applyWorkingMemoryUpdate({
       scope: 'thread',
       resourceId,
       threadId,
@@ -1026,6 +1050,7 @@ describe('InMemoryMemory revisioned Working Memory', () => {
     const omittedFieldsTransition = {
       mutation: { type: 'update' as const, id: threadId, resourceId },
       value: 'first resource value',
+      expectedSourceThreadRevision: threadSnapshot.revision,
       expectedRevision: 0,
     };
     await memory.updateThread({
@@ -1052,6 +1077,7 @@ describe('InMemoryMemory revisioned Working Memory', () => {
         metadata: { explicit: true, mastra: null },
       },
       value: 'second resource value',
+      expectedSourceThreadRevision: 0,
       expectedRevision: transitioned.workingMemory.revision,
     });
     expect(explicitlyUpdated.thread.title).toBe('Explicit transition title');
