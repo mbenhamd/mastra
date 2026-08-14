@@ -278,6 +278,48 @@ describe('InMemoryMemory thread storage boundaries', () => {
     });
   });
 
+  it('freezes cyclic controls without overflowing before validation rejects them', async () => {
+    const db = new InMemoryDB();
+    const memory = new InMemoryMemory({ db });
+    const createdAt = new Date('2026-01-01T00:00:00.000Z');
+    const cyclicControl = () => {
+      const provenance: Record<string, unknown> = {};
+      provenance['/invalid'] = provenance;
+      return { revision: 1, protectedPaths: [], provenance };
+    };
+
+    const thread = await memory.saveThread({
+      thread: {
+        id: 'cyclic-control-thread',
+        resourceId: 'cyclic-control-resource',
+        metadata: { mastra: { workingMemory: cyclicControl() } },
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+    const resource = await memory.saveResource({
+      resource: {
+        id: 'cyclic-control-resource',
+        metadata: { mastra: { workingMemory: cyclicControl() } },
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+
+    expect(Object.isFrozen((thread.metadata?.mastra as Record<string, unknown>).workingMemory)).toBe(true);
+    expect(Object.isFrozen((resource.metadata?.mastra as Record<string, unknown>).workingMemory)).toBe(true);
+    await expect(
+      memory.getWorkingMemorySnapshot({
+        scope: 'thread',
+        resourceId: 'cyclic-control-resource',
+        threadId: 'cyclic-control-thread',
+      }),
+    ).rejects.toThrow('Stored working-memory controls are invalid.');
+    await expect(
+      memory.getWorkingMemorySnapshot({ scope: 'resource', resourceId: 'cyclic-control-resource' }),
+    ).rejects.toThrow('Stored working-memory controls are invalid.');
+  });
+
   it('keeps metadata undefined unless existing governed controls must be preserved', async () => {
     const db = new InMemoryDB();
     const memory = new InMemoryMemory({ db });

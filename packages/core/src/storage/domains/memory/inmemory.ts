@@ -70,12 +70,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function freezeNested(value: unknown): unknown {
-  if (typeof value !== 'object' || value === null || Object.isFrozen(value)) return value;
-  for (const nested of Object.values(value)) freezeNested(nested);
-  return Object.freeze(value);
-}
-
 function cloneResourceMetadataBoundary(
   metadata: Record<string, unknown> | undefined,
   freezeWorkingMemoryControl = false,
@@ -86,7 +80,7 @@ function cloneResourceMetadataBoundary(
   const mastra = { ...metadata.mastra };
   if (Object.prototype.hasOwnProperty.call(metadata.mastra, 'workingMemory')) {
     const control = structuredClone(metadata.mastra.workingMemory);
-    mastra.workingMemory = freezeWorkingMemoryControl ? freezeNested(control) : control;
+    mastra.workingMemory = freezeWorkingMemoryControl ? freezeMemoryBoundaryValue(control) : control;
   }
   clone.mastra = mastra;
   return clone;
@@ -102,7 +96,7 @@ function cloneThreadMetadataBoundary(
   const mastra = cloneMemoryBoundaryValue({ ...metadata.mastra });
   if (Object.prototype.hasOwnProperty.call(metadata.mastra, 'workingMemory')) {
     const control = structuredClone(metadata.mastra.workingMemory);
-    mastra.workingMemory = freezeWorkingMemoryControl ? freezeNested(control) : control;
+    mastra.workingMemory = freezeWorkingMemoryControl ? freezeMemoryBoundaryValue(control) : control;
   }
   clone.mastra = mastra;
   return clone;
