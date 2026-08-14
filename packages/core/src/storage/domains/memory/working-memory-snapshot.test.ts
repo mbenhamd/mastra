@@ -14,6 +14,8 @@ import {
 } from './working-memory-snapshot';
 
 describe('revisioned Working Memory controls', () => {
+  const nestedJson = (depth: number, leaf: number) => `${'{"v":'.repeat(depth)}${leaf}${'}'.repeat(depth)}`;
+
   it('preserves owner-protected JSON paths across observer updates', () => {
     const owner = applyWorkingMemorySnapshotUpdate(
       { value: null, revision: 0, protectedPaths: [], provenance: {} },
@@ -563,6 +565,69 @@ describe('revisioned Working Memory controls', () => {
       protectedPaths: [],
       provenance: { '': { source: 'owner', revision: 1, updatedAt } },
     });
+  });
+
+  it.each([
+    [
+      'owner updates',
+      (value: string) =>
+        applyWorkingMemorySnapshotUpdate(
+          { value: '{}', revision: 1, protectedPaths: [], provenance: {} },
+          { value, expectedRevision: 1, source: 'owner' },
+        ),
+    ],
+    [
+      'observer updates',
+      (value: string) =>
+        applyWorkingMemorySnapshotUpdate(
+          { value: '{}', revision: 1, protectedPaths: [], provenance: {} },
+          { value, expectedRevision: 1, source: 'observer' },
+        ),
+    ],
+    [
+      'stored reads',
+      (value: string) =>
+        readWorkingMemorySnapshot(value, {
+          mastra: { workingMemory: { revision: 1, protectedPaths: [], provenance: {} } },
+        }),
+    ],
+    [
+      'metadata serialization',
+      (value: string) =>
+        writeWorkingMemorySnapshotMetadata({}, { value, revision: 1, protectedPaths: [], provenance: {} }),
+    ],
+  ] as const)('rejects deeply nested JSON before %s can overflow', (_boundary, admit) => {
+    let error: unknown;
+    try {
+      admit(nestedJson(5_000, 0));
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toBeInstanceOf(WorkingMemoryValidationError);
+    expect(error).toMatchObject({
+      message: 'Working-memory JSON values may contain at most 256 nested arrays or objects.',
+    });
+  });
+
+  it('accepts JSON at the 256-level nesting limit and rejects the next level', () => {
+    const owner = applyWorkingMemorySnapshotUpdate(
+      { value: null, revision: 0, protectedPaths: [], provenance: {} },
+      { value: nestedJson(256, 0), expectedRevision: 0, source: 'owner' },
+    );
+    const observer = applyWorkingMemorySnapshotUpdate(owner, {
+      value: nestedJson(256, 1),
+      expectedRevision: owner.revision,
+      source: 'observer',
+    });
+    const metadata = writeWorkingMemorySnapshotMetadata({}, observer);
+
+    expect(readWorkingMemorySnapshot(observer.value, metadata)).toEqual(observer);
+    expect(() =>
+      readWorkingMemorySnapshot(nestedJson(257, 0), {
+        mastra: { workingMemory: { revision: 1, protectedPaths: [], provenance: {} } },
+      }),
+    ).toThrow('Working-memory JSON values may contain at most 256 nested arrays or objects.');
   });
 
   it('rejects separately allocated cyclic ignored control properties with a validation error', () => {

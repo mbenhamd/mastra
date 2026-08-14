@@ -1,6 +1,7 @@
 import type { ApplyWorkingMemoryUpdateInput, WorkingMemoryPathProvenance, WorkingMemorySnapshot } from '../../types';
 
 const CONTROL_METADATA_KEY = 'workingMemory';
+const MAX_JSON_NESTING_DEPTH = 256;
 const MAX_PROTECTED_PATHS = 256;
 const MAX_POINTER_LENGTH = 1024;
 // maxDataBytes deliberately bounds only the stored value. Provenance has an
@@ -84,10 +85,10 @@ export function normalizeWorkingMemoryPaths(paths: readonly string[] | undefined
   });
 }
 
-function assertSupportedJsonNumbers(value: JsonValue): void {
-  const pending = [value];
+function assertSupportedJsonValue(value: JsonValue): void {
+  const pending: Array<{ value: JsonValue; depth: number }> = [{ value, depth: 0 }];
   while (pending.length > 0) {
-    const current = pending.pop()!;
+    const { value: current, depth } = pending.pop()!;
     if (typeof current === 'number') {
       if (!Number.isFinite(current) || (Number.isInteger(current) && !Number.isSafeInteger(current))) {
         throw new WorkingMemoryValidationError(
@@ -96,11 +97,16 @@ function assertSupportedJsonNumbers(value: JsonValue): void {
       }
       continue;
     }
-    if (Array.isArray(current)) {
-      for (const child of current) pending.push(child);
-    } else if (isRecord(current)) {
-      for (const child of Object.values(current)) pending.push(child as JsonValue);
+    if (!Array.isArray(current) && !isRecord(current)) continue;
+
+    const childDepth = depth + 1;
+    if (childDepth > MAX_JSON_NESTING_DEPTH) {
+      throw new WorkingMemoryValidationError(
+        `Working-memory JSON values may contain at most ${MAX_JSON_NESTING_DEPTH} nested arrays or objects.`,
+      );
     }
+    const children = Array.isArray(current) ? current : (Object.values(current) as JsonValue[]);
+    for (const child of children) pending.push({ value: child, depth: childDepth });
   }
 }
 
@@ -112,7 +118,7 @@ function parseJsonValue(value: string | null): JsonValue | undefined {
   } catch {
     return undefined;
   }
-  assertSupportedJsonNumbers(parsed);
+  assertSupportedJsonValue(parsed);
   return parsed;
 }
 
