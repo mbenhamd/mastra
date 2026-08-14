@@ -50,6 +50,7 @@ import type { InMemoryDB } from '../inmemory-db';
 import { MemoryStorage } from './base';
 import {
   applyWorkingMemorySnapshotUpdate,
+  assertGovernedThreadResourceUnchanged,
   assertThreadWorkingMemoryRemoved,
   assertWorkingMemorySnapshotUnchanged,
   hasWorkingMemorySnapshotControls,
@@ -282,6 +283,13 @@ export class InMemoryMemory extends MemoryStorage {
 
   async saveThread({ thread }: { thread: StorageThreadType }): Promise<StorageThreadType> {
     const current = this.db.threads.get(thread.id);
+    if (current) {
+      assertGovernedThreadResourceUnchanged({
+        currentResourceId: current.resourceId,
+        currentMetadata: current.metadata,
+        proposedResourceId: thread.resourceId,
+      });
+    }
     const metadata = replaceThreadMetadataPreservingWorkingMemory(current?.metadata, thread.metadata);
     const stored = cloneThreadBoundary({ ...thread, metadata }, true);
     this.db.threads.set(thread.id, stored);

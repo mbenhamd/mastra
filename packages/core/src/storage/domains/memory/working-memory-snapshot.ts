@@ -335,6 +335,23 @@ export function hasWorkingMemorySnapshotControls(metadata: Record<string, unknow
   return mastra !== undefined && Object.prototype.hasOwnProperty.call(mastra, CONTROL_METADATA_KEY);
 }
 
+/** Prevent generic whole-row saves from moving a governed snapshot to a different owner. */
+export function assertGovernedThreadResourceUnchanged({
+  currentResourceId,
+  currentMetadata,
+  proposedResourceId,
+}: {
+  currentResourceId: string;
+  currentMetadata: Record<string, unknown> | undefined;
+  proposedResourceId: string;
+}): void {
+  if (currentResourceId !== proposedResourceId && hasWorkingMemorySnapshotControls(currentMetadata)) {
+    throw new WorkingMemoryValidationError(
+      'Threads with revisioned working memory cannot be reassigned to another resource by saveThread.',
+    );
+  }
+}
+
 /** Assert that a governed thread-to-resource transition cannot retain a duplicate snapshot. */
 export function assertThreadWorkingMemoryRemoved(metadata: Record<string, unknown> | undefined): void {
   if (

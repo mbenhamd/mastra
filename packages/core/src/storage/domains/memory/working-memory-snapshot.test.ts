@@ -472,6 +472,83 @@ describe('revisioned Working Memory controls', () => {
 });
 
 describe('InMemoryMemory revisioned Working Memory', () => {
+  it('rejects cross-resource reassignment of governed threads while allowing ordinary reassignment', async () => {
+    const storage = new InMemoryStore({ id: 'working-memory-resource-reassignment' });
+    const memory = await storage.getStore('memory');
+    if (!memory) throw new Error('Expected in-memory storage domain.');
+    const createdAt = new Date('2026-01-01T00:00:00.000Z');
+    const guardedThreadId = 'guarded-reassignment-thread';
+    const originalResourceId = 'guarded-reassignment-resource-a';
+    const reassignedResourceId = 'guarded-reassignment-resource-b';
+
+    await memory.saveThread({
+      thread: {
+        id: guardedThreadId,
+        resourceId: originalResourceId,
+        metadata: {},
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+    const snapshot = await memory.applyWorkingMemoryUpdate({
+      scope: 'thread',
+      resourceId: originalResourceId,
+      threadId: guardedThreadId,
+      value: '{"owner":"Ada"}',
+      expectedRevision: 0,
+      source: 'owner',
+      protectPaths: ['/owner'],
+    });
+
+    await expect(
+      memory.saveThread({
+        thread: {
+          id: guardedThreadId,
+          resourceId: reassignedResourceId,
+          metadata: {},
+          createdAt,
+          updatedAt: new Date(),
+        },
+      }),
+    ).rejects.toMatchObject({
+      name: 'WorkingMemoryValidationError',
+      message: 'Threads with revisioned working memory cannot be reassigned to another resource by saveThread.',
+    });
+    await expect(memory.getThreadById({ threadId: guardedThreadId })).resolves.toMatchObject({
+      resourceId: originalResourceId,
+    });
+    await expect(
+      memory.getWorkingMemorySnapshot({
+        scope: 'thread',
+        resourceId: originalResourceId,
+        threadId: guardedThreadId,
+      }),
+    ).resolves.toEqual(snapshot);
+
+    const ordinaryThreadId = 'ordinary-reassignment-thread';
+    await memory.saveThread({
+      thread: {
+        id: ordinaryThreadId,
+        resourceId: originalResourceId,
+        metadata: {},
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+    await memory.saveThread({
+      thread: {
+        id: ordinaryThreadId,
+        resourceId: reassignedResourceId,
+        metadata: {},
+        createdAt,
+        updatedAt: new Date(),
+      },
+    });
+    await expect(memory.getThreadById({ threadId: ordinaryThreadId })).resolves.toMatchObject({
+      resourceId: reassignedResourceId,
+    });
+  });
+
   it('atomically moves governed thread Working Memory to its canonical resource', async () => {
     const storage = new InMemoryStore({ id: 'working-memory-scope-transition' });
     const memory = await storage.getStore('memory');

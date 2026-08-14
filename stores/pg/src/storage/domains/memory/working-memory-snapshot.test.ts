@@ -209,6 +209,83 @@ describe('MemoryPG revisioned Working Memory', () => {
     ).rejects.toMatchObject({ name: 'WorkingMemoryValidationError' });
   });
 
+  it('rejects cross-resource reassignment of governed threads while allowing ordinary reassignment', async () => {
+    const guardedThreadId = `${threadId}-guarded-reassignment`;
+    const originalResourceId = `${resourceId}-reassignment-a`;
+    const reassignedResourceId = `${resourceId}-reassignment-b`;
+    const createdAt = new Date('2026-01-01T00:00:00.000Z');
+    await firstMemory.saveThread({
+      thread: {
+        id: guardedThreadId,
+        resourceId: originalResourceId,
+        title: 'Guarded thread',
+        metadata: {},
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+    const snapshot = await firstMemory.applyWorkingMemoryUpdate({
+      scope: 'thread',
+      resourceId: originalResourceId,
+      threadId: guardedThreadId,
+      value: '{"owner":"Ada"}',
+      expectedRevision: 0,
+      source: 'owner',
+      protectPaths: ['/owner'],
+    });
+
+    await expect(
+      secondMemory.saveThread({
+        thread: {
+          id: guardedThreadId,
+          resourceId: reassignedResourceId,
+          title: 'Rejected reassignment',
+          metadata: {},
+          createdAt,
+          updatedAt: new Date(),
+        },
+      }),
+    ).rejects.toMatchObject({
+      name: 'WorkingMemoryValidationError',
+      message: 'Threads with revisioned working memory cannot be reassigned to another resource by saveThread.',
+    });
+    await expect(firstMemory.getThreadById({ threadId: guardedThreadId })).resolves.toMatchObject({
+      resourceId: originalResourceId,
+    });
+    await expect(
+      firstMemory.getWorkingMemorySnapshot({
+        scope: 'thread',
+        resourceId: originalResourceId,
+        threadId: guardedThreadId,
+      }),
+    ).resolves.toEqual(snapshot);
+
+    const ordinaryThreadId = `${threadId}-ordinary-reassignment`;
+    await firstMemory.saveThread({
+      thread: {
+        id: ordinaryThreadId,
+        resourceId: originalResourceId,
+        title: 'Ordinary thread',
+        metadata: {},
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+    await secondMemory.saveThread({
+      thread: {
+        id: ordinaryThreadId,
+        resourceId: reassignedResourceId,
+        title: 'Reassigned thread',
+        metadata: {},
+        createdAt,
+        updatedAt: new Date(),
+      },
+    });
+    await expect(firstMemory.getThreadById({ threadId: ordinaryThreadId })).resolves.toMatchObject({
+      resourceId: reassignedResourceId,
+    });
+  });
+
   it('atomically moves governed thread Working Memory to its canonical resource', async () => {
     const transitionResourceId = `${resourceId}-scope-transition`;
     const transitionThreadId = `${threadId}-scope-transition`;

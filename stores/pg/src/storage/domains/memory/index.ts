@@ -16,6 +16,7 @@ import {
   storageMessageMatchesMetadataFilter,
   validateStorageMetadataFilter,
   applyWorkingMemorySnapshotUpdate,
+  assertGovernedThreadResourceUnchanged,
   assertThreadWorkingMemoryRemoved,
   assertWorkingMemorySnapshotUnchanged,
   hasWorkingMemorySnapshotControls,
@@ -825,11 +826,18 @@ export class MemoryPG extends MemoryStorage {
       const updatedAt = toUtcISOString(thread.updatedAt);
       return await this.#db.client.tx(async t => {
         await this.lockWorkingMemoryTarget(t, 'thread', thread.id);
-        const currentRow = await t.oneOrNone<{ metadata: unknown }>(
-          `SELECT metadata FROM ${tableName} WHERE id = $1 FOR UPDATE`,
+        const currentRow = await t.oneOrNone<{ resourceId: string; metadata: unknown }>(
+          `SELECT "resourceId", metadata FROM ${tableName} WHERE id = $1 FOR UPDATE`,
           [thread.id],
         );
         const currentMetadata = currentRow ? parseMetadata(currentRow.metadata) : undefined;
+        if (currentRow) {
+          assertGovernedThreadResourceUnchanged({
+            currentResourceId: currentRow.resourceId,
+            currentMetadata,
+            proposedResourceId: thread.resourceId,
+          });
+        }
         const metadata = currentMetadata
           ? replaceThreadMetadataPreservingWorkingMemory(currentMetadata, thread.metadata)
           : (thread.metadata ?? {});
