@@ -442,6 +442,103 @@ describe('revisioned Working Memory controls', () => {
     expect(metadata).toMatchObject({ retained: true, mastra: { retained: true } });
   });
 
+  it('fails closed instead of serializing more than 256 protected paths', () => {
+    const protectedPaths = Array.from({ length: 257 }, (_, index) => `/k${index}`);
+    const value = JSON.stringify(Object.fromEntries(protectedPaths.map((_, index) => [`k${index}`, true])));
+
+    expect(() =>
+      writeWorkingMemorySnapshotMetadata({}, { value, revision: 1, protectedPaths, provenance: {} }),
+    ).toThrow('at most 256 protected paths');
+  });
+
+  it('fails closed instead of serializing an invalid revision', () => {
+    expect(() =>
+      writeWorkingMemorySnapshotMetadata({}, { value: '{}', revision: -1, protectedPaths: [], provenance: {} }),
+    ).toThrow('Stored working-memory controls are invalid');
+  });
+
+  it('rejects owner updates before unsafe JSON integers can be accepted or compare as unchanged', () => {
+    expect(() =>
+      applyWorkingMemorySnapshotUpdate(
+        { value: null, revision: 0, protectedPaths: [], provenance: {} },
+        {
+          value: '{"count":9007199254740992}',
+          expectedRevision: 0,
+          source: 'owner',
+        },
+      ),
+    ).toThrow('finite safe integers or finite decimals');
+
+    expect(() =>
+      applyWorkingMemorySnapshotUpdate(
+        { value: '{"count":9007199254740992}', revision: 4, protectedPaths: [], provenance: {} },
+        {
+          value: '{"count":9007199254740993}',
+          expectedRevision: 4,
+          source: 'owner',
+        },
+      ),
+    ).toThrow('finite safe integers or finite decimals');
+  });
+
+  it('rejects unsafe JSON integers during protected observer merges', () => {
+    const current = {
+      value: '{"profile":{"name":"Ada"},"count":1}',
+      revision: 1,
+      protectedPaths: ['/profile/name'],
+      provenance: {
+        '/profile/name': {
+          source: 'owner' as const,
+          revision: 1,
+          updatedAt: '2026-01-01T00:00:00.000Z',
+        },
+      },
+    };
+
+    expect(() =>
+      applyWorkingMemorySnapshotUpdate(current, {
+        value: '{"profile":{"name":"Grace"},"count":9007199254740993}',
+        expectedRevision: 1,
+        source: 'observer',
+      }),
+    ).toThrow('finite safe integers or finite decimals');
+  });
+
+  it('rejects stored and serialized JSON values containing unsafe integers', () => {
+    const snapshot = {
+      value: '{"count":9007199254740993}',
+      revision: 1,
+      protectedPaths: [],
+      provenance: {},
+    };
+    const metadata = {
+      mastra: {
+        workingMemory: {
+          revision: snapshot.revision,
+          protectedPaths: snapshot.protectedPaths,
+          provenance: snapshot.provenance,
+        },
+      },
+    };
+
+    expect(() => readWorkingMemorySnapshot(snapshot.value, metadata)).toThrow(
+      'finite safe integers or finite decimals',
+    );
+    expect(() => writeWorkingMemorySnapshotMetadata({}, snapshot)).toThrow('finite safe integers or finite decimals');
+  });
+
+  it('round-trips finite decimals and safe integers', () => {
+    const snapshot = {
+      value: '{"fraction":1.25,"integer":9007199254740991}',
+      revision: 1,
+      protectedPaths: [],
+      provenance: {},
+    };
+    const metadata = writeWorkingMemorySnapshotMetadata({}, snapshot);
+
+    expect(readWorkingMemorySnapshot(snapshot.value, metadata)).toEqual(snapshot);
+  });
+
   it('fails closed when stored controls are malformed', () => {
     const malformed = { mastra: { workingMemory: { revision: 'stale' } } };
     expect(hasWorkingMemorySnapshotControls(malformed)).toBe(true);

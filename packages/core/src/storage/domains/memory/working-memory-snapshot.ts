@@ -84,13 +84,33 @@ export function normalizeWorkingMemoryPaths(paths: readonly string[] | undefined
   });
 }
 
+function assertSupportedJsonNumbers(value: JsonValue): void {
+  const pending = [value];
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    if (typeof current === 'number') {
+      if (!Number.isFinite(current) || (Number.isInteger(current) && !Number.isSafeInteger(current))) {
+        throw new WorkingMemoryValidationError(
+          'Working-memory JSON numbers must be finite safe integers or finite decimals.',
+        );
+      }
+      continue;
+    }
+    if (Array.isArray(current)) pending.push(...current);
+    else if (isRecord(current)) pending.push(...(Object.values(current) as JsonValue[]));
+  }
+}
+
 function parseJsonValue(value: string | null): JsonValue | undefined {
   if (value === null) return null;
+  let parsed: JsonValue;
   try {
-    return JSON.parse(value) as JsonValue;
+    parsed = JSON.parse(value) as JsonValue;
   } catch {
     return undefined;
   }
+  assertSupportedJsonNumbers(parsed);
+  return parsed;
 }
 
 function cloneJson<T extends JsonValue>(value: T): T {
@@ -214,11 +234,11 @@ function isValidProvenanceTimestamp(value: unknown): value is string {
 }
 
 function changedJsonPointers(before: string | null, after: string | null): string[] {
+  const beforeJson = parseJsonValue(before);
+  const afterJson = parseJsonValue(after);
   // The storage contract distinguishes no value (`null`) from the literal JSON
   // text `"null"`, even though both parse to the same JavaScript value.
   if (before === null || after === null) return before === after ? [] : [''];
-  const beforeJson = parseJsonValue(before);
-  const afterJson = parseJsonValue(after);
   if (beforeJson === undefined || afterJson === undefined) return before === after ? [] : [''];
 
   const changed: string[] = [];
@@ -338,12 +358,12 @@ export function readWorkingMemorySnapshot(
   const protectedPaths = normalizeWorkingMemoryPaths(
     storedControl === undefined ? [] : (control.protectedPaths as string[]),
   );
+  const parsedValue = parseJsonValue(value ?? null);
   if (protectedPaths.length > 0 && !protectedPaths.includes('')) {
-    const parsed = parseJsonValue(value ?? null);
     if (
-      parsed === undefined ||
-      (!isRecord(parsed) && !Array.isArray(parsed)) ||
-      protectedPaths.some(path => !getPointer(parsed, pointerSegments(path)).exists)
+      parsedValue === undefined ||
+      (!isRecord(parsedValue) && !Array.isArray(parsedValue)) ||
+      protectedPaths.some(path => !getPointer(parsedValue, pointerSegments(path)).exists)
     ) {
       throw new WorkingMemoryValidationError('Stored working-memory controls are invalid.');
     }
@@ -580,15 +600,25 @@ export function writeWorkingMemorySnapshotMetadata(
   const mastra = isRecord(current.mastra) ? current.mastra : {};
   // Keep this public serialization helper fail-closed even when a caller did
   // not obtain its snapshot from applyWorkingMemorySnapshotUpdate.
-  const provenance = parseProvenance(snapshot.provenance, snapshot.revision);
+  const validated = readWorkingMemorySnapshot(snapshot.value, {
+    mastra: {
+      [CONTROL_METADATA_KEY]: {
+        revision: snapshot.revision,
+        protectedPaths: snapshot.protectedPaths,
+        provenance: snapshot.provenance,
+      },
+    },
+  });
   return {
     ...current,
     mastra: {
       ...mastra,
       [CONTROL_METADATA_KEY]: {
-        revision: snapshot.revision,
-        protectedPaths: [...snapshot.protectedPaths],
-        provenance: Object.fromEntries(Object.entries(provenance).map(([path, entry]) => [path, { ...entry }])),
+        revision: validated.revision,
+        protectedPaths: [...validated.protectedPaths],
+        provenance: Object.fromEntries(
+          Object.entries(validated.provenance).map(([path, entry]) => [path, { ...entry }]),
+        ),
       },
     },
   };
