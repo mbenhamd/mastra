@@ -26,4 +26,4 @@ const firstInactivePage = await memoryStore.listThreads({
 });
 ```
 
-`@mastra/pg` imports these governance contracts from `@mastra/core`. Pack both packages from the same workspace release so the packed PostgreSQL peer resolves to the exact compatible Core version; update them atomically.
+`@mastra/pg` imports these governance contracts from `@mastra/core`, so its peer range starts at `1.58.0-alpha.11`, the first coordinated Core prerelease containing them. Any release plan must version Core and PG atomically; do not publish PG independently.
