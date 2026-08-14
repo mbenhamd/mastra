@@ -31,7 +31,11 @@ import {
   signalToDataPartFormat,
   signalToMastraDBMessage,
 } from '../signals';
-import { AgentThreadStreamRuntime, agentThreadStreamRuntime } from '../thread-stream-runtime';
+import {
+  AgentThreadStreamRuntime,
+  agentThreadStreamRuntime,
+  rememberBoundedResumableTerminalStream,
+} from '../thread-stream-runtime';
 
 function createTextStreamModel(responseText: string) {
   return new MockLanguageModelV2({
@@ -304,6 +308,33 @@ class DeliverThenRejectRegistrationPubSub extends EventEmitterPubSub {
       this.#rejected = true;
       throw new Error('injected registration failure after subscriber delivery');
     }
+  }
+}
+
+class RejectRunAbortingPubSub extends ControlledLeasePubSub {
+  override async publish(topic: string, event: Parameters<PubSub['publish']>[1]): Promise<void> {
+    if ((event as { data?: { type?: string } }).data?.type === 'run-aborting') {
+      throw new Error('injected abort fence failure');
+    }
+    await super.publish(topic, event);
+  }
+}
+
+class DelayedRegistrationPubSub extends ControlledLeasePubSub {
+  #releaseRegistration!: () => void;
+  readonly registrationBlocked = new Promise<void>(resolve => {
+    this.#releaseRegistration = resolve;
+  });
+
+  override async publish(topic: string, event: Parameters<PubSub['publish']>[1]): Promise<void> {
+    if ((event as { data?: { type?: string } }).data?.type === 'run-registered') {
+      await this.registrationBlocked;
+    }
+    await super.publish(topic, event);
+  }
+
+  releaseRegistration() {
+    this.#releaseRegistration();
   }
 }
 
@@ -1106,6 +1137,316 @@ describe('Agent signals', () => {
     }
   });
 
+  it('finalizes abort when provider completion rejects synchronously during cancellation', async () => {
+    const runtime = new AgentThreadStreamRuntime();
+    const pubsub = new ControlledLeasePubSub();
+    const agent = { id: 'abort-provider-rejection-agent' } as Agent<any, any, any, any>;
+    const threadId = 'abort-provider-rejection-thread';
+    const resourceId = 'abort-provider-rejection-user';
+    const runId = 'abort-provider-rejection-run';
+    let rejectProvider!: (error: Error) => void;
+    const providerFinished = new Promise<void>((_resolve, reject) => {
+      rejectProvider = reject;
+    });
+    const output = {
+      runId,
+      status: 'running',
+      fullStream: new ReadableStream({
+        start(controller) {
+          controller.enqueue({ type: 'start', runId });
+        },
+      }),
+      _waitUntilFinished: () => providerFinished,
+    } as any;
+    const options = runtime.prepareRunOptions(
+      { runId, memory: { thread: threadId, resource: resourceId } } as any,
+      pubsub,
+    );
+    const subscription = await runtime.subscribeToThread(agent, { threadId, resourceId }, pubsub);
+    const iterator = subscription.stream[Symbol.asyncIterator]();
+
+    try {
+      const completion = runtime.registerRun(agent, output, options, pubsub)!;
+      await iterator.next();
+      options.abortSignal?.addEventListener(
+        'abort',
+        () => rejectProvider(new Error('provider cancellation rejection')),
+        { once: true },
+      );
+      expect(runtime.abortRun(runId, pubsub)).toBe(true);
+      await expect(withTimeout(iterator.next(), 'Timed out waiting for provider rejection abort')).resolves.toEqual({
+        value: { type: 'abort', runId },
+        done: false,
+      });
+      await expect(withTimeout(completion, 'Provider rejection abort did not finalize')).resolves.toBeUndefined();
+      expect(runtime.getRunOutput(runId, pubsub)).toBeUndefined();
+    } finally {
+      subscription.unsubscribe();
+      await iterator.return?.();
+    }
+  });
+
+  it('coordinates abort after prepared state cleanup without releasing the live lease early', async () => {
+    const runtime = new AgentThreadStreamRuntime();
+    const pubsub = new ControlledLeasePubSub();
+    let sawRunCompleted = false;
+    let releaseRunCompleted!: () => void;
+    const runCompletedBlocked = new Promise<void>(resolve => {
+      releaseRunCompleted = resolve;
+    });
+    const originalPublish = pubsub.publish.bind(pubsub);
+    pubsub.publish = async (topic, event) => {
+      if ((event as { data?: { type?: string } }).data?.type === 'run-completed') {
+        sawRunCompleted = true;
+        await runCompletedBlocked;
+      }
+      return originalPublish(topic, event);
+    };
+    const agent = { id: 'late-abort-agent' } as Agent<any, any, any, any>;
+    const resourceId = 'late-abort-user';
+    const threadId = 'late-abort-thread';
+    const runId = 'late-abort-run';
+    let finish!: () => void;
+    const finished = new Promise<void>(resolve => {
+      finish = resolve;
+    });
+    const options = runtime.prepareRunOptions(
+      { runId, memory: { resource: resourceId, thread: threadId } } as any,
+      pubsub,
+    );
+    const output = {
+      runId,
+      status: 'running',
+      fullStream: new ReadableStream({
+        start(controller) {
+          controller.enqueue({ type: 'start', runId });
+          controller.close();
+        },
+      }),
+      _waitUntilFinished: () => finished,
+    } as any;
+    const completion = runtime.registerRun(agent, output, options, pubsub)!;
+    finish();
+    await waitForCondition(() => sawRunCompleted);
+    const key = `${resourceId}\u0000${threadId}`;
+    expect(pubsub.owners.has(key)).toBe(true);
+    expect(runtime.abortRun(runId, pubsub)).toBe(true);
+    expect(pubsub.owners.has(key)).toBe(true);
+    expect(pubsub.publishedData.some(data => data?.type === 'run-aborting' && data.runId === runId)).toBe(false);
+    expect(pubsub.publishedData.some(data => data?.type === 'run-aborted' && data.runId === runId)).toBe(false);
+    releaseRunCompleted();
+    await completion;
+    await waitForCondition(() => !pubsub.owners.has(key));
+  });
+
+  it('converts an abort-time source rejection into the abort boundary', async () => {
+    const runtime = new AgentThreadStreamRuntime();
+    const pubsub = new ControlledLeasePubSub();
+    const agent = { id: 'abort-source-error-agent' } as Agent<any, any, any, any>;
+    const threadId = 'abort-source-error-thread';
+    const resourceId = 'abort-source-error-user';
+    const runId = 'abort-source-error-run';
+    let rejectSource!: (error: Error) => void;
+    const source = {
+      [Symbol.asyncIterator]() {
+        let emitted = false;
+        return {
+          async next() {
+            if (!emitted) {
+              emitted = true;
+              return { value: { type: 'start', runId }, done: false };
+            }
+            return new Promise<IteratorResult<unknown>>((_resolve, reject) => {
+              rejectSource = reject;
+            });
+          },
+        };
+      },
+    };
+    const output = {
+      runId,
+      status: 'running',
+      fullStream: source,
+      _waitUntilFinished: () => new Promise<void>(() => {}),
+    } as any;
+    const options = runtime.prepareRunOptions(
+      { runId, memory: { thread: threadId, resource: resourceId } } as any,
+      pubsub,
+    );
+    const subscription = await runtime.subscribeToThread(agent, { threadId, resourceId }, pubsub);
+    const iterator = subscription.stream[Symbol.asyncIterator]();
+
+    try {
+      const completion = runtime.registerRun(agent, output, options, pubsub)!;
+      void completion.catch(() => {});
+      await expect(withTimeout(iterator.next(), 'Timed out waiting for rejection start')).resolves.toMatchObject({
+        value: { type: 'start', runId },
+      });
+      expect(runtime.abortRun(runId, pubsub)).toBe(true);
+      rejectSource(new Error('provider cancellation rejection'));
+      await expect(withTimeout(iterator.next(), 'Timed out waiting for rejection abort')).resolves.toEqual({
+        value: { type: 'abort', runId },
+        done: false,
+      });
+      await expect(subscription._waitForOutputDrain!(output)).resolves.toBeUndefined();
+    } finally {
+      subscription.unsubscribe();
+      await iterator.return?.();
+    }
+  });
+
+  it('fails closed when the distributed abort fence cannot publish', async () => {
+    const runtime = new AgentThreadStreamRuntime();
+    const pubsub = new RejectRunAbortingPubSub();
+    const agent = { id: 'abort-fence-agent' } as Agent<any, any, any, any>;
+    const threadId = 'abort-fence-thread';
+    const resourceId = 'abort-fence-user';
+    const runId = 'abort-fence-run';
+    const output = {
+      runId,
+      status: 'running',
+      fullStream: new ReadableStream({
+        start(controller) {
+          controller.enqueue({ type: 'start', runId });
+        },
+      }),
+      _waitUntilFinished: () => new Promise<void>(() => {}),
+    } as any;
+    const options = runtime.prepareRunOptions(
+      { runId, memory: { thread: threadId, resource: resourceId } } as any,
+      pubsub,
+    );
+    const subscription = await runtime.subscribeToThread(agent, { threadId, resourceId }, pubsub);
+    const iterator = subscription.stream[Symbol.asyncIterator]();
+
+    try {
+      const completion = runtime.registerRun(agent, output, options, pubsub)!;
+      void completion.catch(() => {});
+      await iterator.next();
+      expect(runtime.abortRun(runId, pubsub)).toBe(true);
+      const outputDrain = subscription._waitForOutputDrain!(output)!;
+      await expect(withTimeout(outputDrain, 'Timed out waiting for abort-fence failure', 1_000)).rejects.toMatchObject({
+        name: 'AgentThreadOutputDrainError',
+        reason: 'terminal-publish-failed',
+      });
+      expect(pubsub.publishedData.filter(data => data?.type === 'run-aborted' && data.runId === runId)).toEqual([]);
+      await expect(withTimeout(completion, 'Abort-fence failure did not finalize', 1_000)).rejects.toMatchObject({
+        name: 'AgentThreadOutputDrainError',
+        reason: 'terminal-publish-failed',
+      });
+      expect(runtime.getRunOutput(runId, pubsub)).toBeUndefined();
+      const key = `${resourceId}\u0000${threadId}`;
+      await waitForCondition(() => !pubsub.owners.has(key));
+    } finally {
+      subscription.unsubscribe();
+    }
+  });
+
+  it('publishes the abort terminal only after delayed registration succeeds', async () => {
+    const runtime = new AgentThreadStreamRuntime();
+    const pubsub = new DelayedRegistrationPubSub();
+    const agent = { id: 'abort-registration-order-agent' } as Agent<any, any, any, any>;
+    const threadId = 'abort-registration-order-thread';
+    const resourceId = 'abort-registration-order-user';
+    const runId = 'abort-registration-order-run';
+    const output = {
+      runId,
+      status: 'running',
+      fullStream: new ReadableStream({
+        start(controller) {
+          controller.enqueue({ type: 'start', runId });
+        },
+      }),
+      _waitUntilFinished: () => new Promise<void>(() => {}),
+    } as any;
+    const options = runtime.prepareRunOptions(
+      { runId, memory: { thread: threadId, resource: resourceId } } as any,
+      pubsub,
+    );
+    const subscription = await runtime.subscribeToThread(agent, { threadId, resourceId }, pubsub);
+    const iterator = subscription.stream[Symbol.asyncIterator]();
+
+    try {
+      const completion = runtime.registerRun(agent, output, options, pubsub)!;
+      void completion.catch(() => {});
+      expect(runtime.abortRun(runId, pubsub)).toBe(true);
+      await new Promise(resolve => setTimeout(resolve, 300));
+      expect(pubsub.publishedData.some(data => data?.type === 'run-aborted' && data.runId === runId)).toBe(false);
+      pubsub.releaseRegistration();
+      await expect(withTimeout(iterator.next(), 'Timed out waiting for delayed abort')).resolves.toEqual({
+        value: { type: 'abort', runId },
+        done: false,
+      });
+      const registrationIndex = pubsub.publishedData.findIndex(
+        data => data?.type === 'run-registered' && data.runId === runId,
+      );
+      const terminalIndex = pubsub.publishedData.findIndex(
+        data => data?.type === 'run-aborted' && data.runId === runId,
+      );
+      expect(registrationIndex).toBeGreaterThanOrEqual(0);
+      expect(terminalIndex).toBeGreaterThan(registrationIndex);
+    } finally {
+      subscription.unsubscribe();
+      await iterator.return?.();
+    }
+  });
+
+  it('returns an abort-ignoring async iterator after the bounded grace', async () => {
+    const runtime = new AgentThreadStreamRuntime();
+    const pubsub = new ControlledLeasePubSub();
+    const agent = { id: 'abort-iterator-agent' } as Agent<any, any, any, any>;
+    const threadId = 'abort-iterator-thread';
+    const resourceId = 'abort-iterator-user';
+    const runId = 'abort-iterator-run';
+    let returned = false;
+    const source = {
+      [Symbol.asyncIterator]() {
+        let emitted = false;
+        return {
+          async next() {
+            if (!emitted) {
+              emitted = true;
+              return { value: { type: 'start', runId }, done: false };
+            }
+            return new Promise<IteratorResult<unknown>>(() => {});
+          },
+          async return() {
+            returned = true;
+            return { value: undefined, done: true };
+          },
+        };
+      },
+    };
+    const output = {
+      runId,
+      status: 'running',
+      fullStream: source,
+      _waitUntilFinished: () => new Promise<void>(() => {}),
+    } as any;
+    const options = runtime.prepareRunOptions(
+      { runId, memory: { thread: threadId, resource: resourceId } } as any,
+      pubsub,
+    );
+    const subscription = await runtime.subscribeToThread(agent, { threadId, resourceId }, pubsub);
+    const iterator = subscription.stream[Symbol.asyncIterator]();
+
+    try {
+      const completion = runtime.registerRun(agent, output, options, pubsub)!;
+      void completion.catch(() => {});
+      await iterator.next();
+      expect(runtime.abortRun(runId, pubsub)).toBe(true);
+      await expect(withTimeout(iterator.next(), 'Timed out waiting for iterator abort')).resolves.toEqual({
+        value: { type: 'abort', runId },
+        done: false,
+      });
+      await waitForCondition(() => returned);
+      await expect(subscription._waitForOutputDrain!(output)).resolves.toBeUndefined();
+    } finally {
+      subscription.unsubscribe();
+      await iterator.return?.();
+    }
+  });
+
   it('drains a remote authoritative tool error that follows its abort terminal', async () => {
     const pubsub = new EventEmitterPubSub();
     const sourceRuntime = new AgentThreadStreamRuntime();
@@ -1277,7 +1618,8 @@ describe('Agent signals', () => {
     const key = `${target.resourceId}\u0000${target.threadId}`;
     const topic = `agent.thread-stream.${encodeURIComponent(key)}`;
     const runId = 'remote-resume-reset-run';
-    await pubsub.acquireLease(key, runId, 15_000);
+    const leaseOwner = `mastra-thread-owner:${JSON.stringify([runId, 'remote-source', 'attempt'])}`;
+    await pubsub.acquireLease(key, leaseOwner, 15_000);
     const subscription = await runtime.subscribeToThread(agent, target, pubsub);
     const iterator = subscription.stream[Symbol.asyncIterator]();
 
@@ -1285,7 +1627,7 @@ describe('Agent signals', () => {
       await pubsub.publish(topic, {
         type: 'run-registered',
         runId,
-        data: { type: 'run-registered', runId, streamId: 'remote-resume-stream-1', streamSeq: 1 },
+        data: { type: 'run-registered', runId, streamId: 'remote-resume-stream-1', streamSeq: 1, leaseOwner },
       });
       await pubsub.publish(topic, {
         type: 'stream-part',
@@ -1295,6 +1637,7 @@ describe('Agent signals', () => {
           runId,
           streamId: 'remote-resume-stream-1',
           sourceId: 'remote-source-1',
+          leaseOwner,
           part: { type: 'start' },
         },
       });
@@ -1302,13 +1645,13 @@ describe('Agent signals', () => {
       await pubsub.publish(topic, {
         type: 'run-suspended',
         runId,
-        data: { type: 'run-suspended', runId, streamId: 'remote-resume-stream-1' },
+        data: { type: 'run-suspended', runId, streamId: 'remote-resume-stream-1', leaseOwner },
       });
 
       await pubsub.publish(topic, {
         type: 'run-registered',
         runId,
-        data: { type: 'run-registered', runId, streamId: 'remote-resume-stream-2', streamSeq: 1 },
+        data: { type: 'run-registered', runId, streamId: 'remote-resume-stream-2', streamSeq: 1, leaseOwner },
       });
       await pubsub.publish(topic, {
         type: 'stream-part',
@@ -1318,6 +1661,7 @@ describe('Agent signals', () => {
           runId,
           streamId: 'remote-resume-stream-2',
           sourceId: 'remote-source-2',
+          leaseOwner,
           part: { type: 'start' },
         },
       });
@@ -1325,6 +1669,45 @@ describe('Agent signals', () => {
         withTimeout(iterator.next(), 'Timed out waiting for cross-runtime resumed stream'),
       ).resolves.toMatchObject({
         value: { type: 'start', runId },
+      });
+      await pubsub.publish(topic, {
+        type: 'run-registered',
+        runId,
+        data: { type: 'run-registered', runId, streamId: 'unordered-stream', streamSeq: 0, leaseOwner },
+      });
+      await pubsub.publish(topic, {
+        type: 'stream-part',
+        runId,
+        data: {
+          type: 'stream-part',
+          runId,
+          streamId: 'unordered-stream',
+          sourceId: 'delayed-source',
+          leaseOwner,
+          part: { type: 'start' },
+        },
+      });
+      await pubsub.publish(topic, {
+        type: 'stream-part',
+        runId,
+        data: {
+          type: 'stream-part',
+          runId,
+          streamId: 'remote-resume-stream-2',
+          sourceId: 'remote-source-2',
+          leaseOwner,
+          part: { type: 'finish' },
+        },
+      });
+      await expect(
+        withTimeout(iterator.next(), 'Delayed registration replaced the active resume'),
+      ).resolves.toMatchObject({
+        value: { type: 'finish', runId },
+      });
+      await pubsub.publish(topic, {
+        type: 'run-completed',
+        runId,
+        data: { type: 'run-completed', runId, streamId: 'remote-resume-stream-2', leaseOwner },
       });
     } finally {
       subscription.unsubscribe();
@@ -1340,7 +1723,8 @@ describe('Agent signals', () => {
     const topic = `agent.thread-stream.${encodeURIComponent(`${target.resourceId}\u0000${target.threadId}`)}`;
     const runId = 'remote-abort-tombstone-run';
     const streamId = 'remote-abort-tombstone-stream';
-    await pubsub.acquireLease(`${target.resourceId}\u0000${target.threadId}`, runId, 15_000);
+    const leaseOwner = `mastra-thread-owner:${JSON.stringify([runId, 'remote-source', 'attempt'])}`;
+    await pubsub.acquireLease(`${target.resourceId}\u0000${target.threadId}`, leaseOwner, 15_000);
     const subscription = await runtime.subscribeToThread(agent, target, pubsub);
     const iterator = subscription.stream[Symbol.asyncIterator]();
 
@@ -1348,12 +1732,12 @@ describe('Agent signals', () => {
       await pubsub.publish(topic, {
         type: 'run-registered',
         runId,
-        data: { type: 'run-registered', runId, streamId, streamSeq: 1 },
+        data: { type: 'run-registered', runId, streamId, streamSeq: 1, leaseOwner },
       });
       await pubsub.publish(topic, {
         type: 'stream-part',
         runId,
-        data: { type: 'stream-part', runId, streamId, sourceId: 'remote-source', part: { type: 'start' } },
+        data: { type: 'stream-part', runId, streamId, sourceId: 'remote-source', leaseOwner, part: { type: 'start' } },
       });
       await expect(withTimeout(iterator.next(), 'Timed out waiting for remote tombstone start')).resolves.toMatchObject(
         {
@@ -1363,7 +1747,7 @@ describe('Agent signals', () => {
       await pubsub.publish(topic, {
         type: 'run-aborted',
         runId,
-        data: { type: 'run-aborted', runId, streamId },
+        data: { type: 'run-aborted', runId, streamId, leaseOwner },
       });
       await expect(
         withTimeout(iterator.next(), 'Timed out waiting for remote tombstone abort', 1_000),
@@ -1385,12 +1769,313 @@ describe('Agent signals', () => {
           runId,
           streamId,
           sourceId: 'remote-source',
+          leaseOwner,
           part: { type: 'text-delta', payload: { text: 'must not resurrect' } },
         },
       });
       await new Promise(resolve => setTimeout(resolve, 25));
       expect(subscription.activeRunId()).toBeNull();
     } finally {
+      subscription.unsubscribe();
+      await iterator.return?.();
+    }
+  });
+
+  it('rejects spoofed-source lifecycle terminals and stale-owner established parts', async () => {
+    const pubsub = new ControlledLeasePubSub();
+    const runtime = new AgentThreadStreamRuntime();
+    const agent = { id: 'forged-owner-agent' } as Agent<any, any, any, any>;
+    const identityRunId = 'forged-owner-identity-run';
+    const identityOptions = runtime.prepareRunOptions(
+      {
+        runId: identityRunId,
+        memory: { resource: 'forged-owner-identity-user', thread: 'forged-owner-identity-thread' },
+      } as any,
+      pubsub,
+    );
+    await runtime.registerRun(
+      agent,
+      {
+        runId: identityRunId,
+        status: 'running',
+        fullStream: (async function* () {
+          yield { type: 'start', runId: identityRunId };
+          yield { type: 'finish', runId: identityRunId };
+        })(),
+        _waitUntilFinished: async () => {},
+      } as any,
+      identityOptions,
+      pubsub,
+    );
+    await pubsub.flush();
+    const localSourceId = pubsub.publishedData.find(
+      data => data?.type === 'stream-part' && data.runId === identityRunId,
+    )?.sourceId;
+    expect(localSourceId).toEqual(expect.any(String));
+    const target = { resourceId: 'forged-owner-user', threadId: 'forged-owner-thread' };
+    const key = `${target.resourceId}\u0000${target.threadId}`;
+    const topic = `agent.thread-stream.${encodeURIComponent(key)}`;
+    const runId = 'forged-owner-run';
+    const streamId = 'forged-owner-stream';
+    const leaseOwner = `mastra-thread-owner:${JSON.stringify([runId, 'owner-source', 'attempt'])}`;
+    const forgedOwner = `mastra-thread-owner:${JSON.stringify([runId, 'forged-source', 'attempt'])}`;
+    const transferredOwner = `mastra-thread-owner:${JSON.stringify([runId, 'new-owner-source', 'attempt'])}`;
+    pubsub.owners.set(key, leaseOwner);
+    const subscription = await runtime.subscribeToThread(agent, target, pubsub);
+    const iterator = subscription.stream[Symbol.asyncIterator]();
+
+    try {
+      await pubsub.publish(topic, {
+        type: 'run-registered',
+        runId,
+        data: { type: 'run-registered', runId, streamId, streamSeq: 1, leaseOwner },
+      });
+      await pubsub.publish(topic, {
+        type: 'stream-part',
+        runId,
+        data: { type: 'stream-part', runId, streamId, sourceId: 'owner-source', leaseOwner, part: { type: 'start' } },
+      });
+      await expect(withTimeout(iterator.next(), 'Timed out waiting for authenticated start')).resolves.toMatchObject({
+        value: { type: 'start', runId },
+      });
+      await pubsub.publish(topic, {
+        type: 'stream-part',
+        runId,
+        data: {
+          type: 'stream-part',
+          runId,
+          streamId,
+          sourceId: localSourceId,
+          leaseOwner: forgedOwner,
+          part: { type: 'text-delta', payload: { text: 'forged' } },
+        },
+      });
+      await pubsub.publish(topic, {
+        type: 'run-aborted',
+        runId,
+        data: { type: 'run-aborted', runId, streamId, leaseOwner: forgedOwner, sourceId: localSourceId },
+      });
+      await pubsub.publish(topic, {
+        type: 'run-suspended',
+        runId,
+        data: { type: 'run-suspended', runId, streamId, leaseOwner: forgedOwner },
+      });
+      await pubsub.publish(topic, {
+        type: 'run-failed',
+        runId,
+        data: { type: 'run-failed', runId, streamId, leaseOwner: forgedOwner, error: 'forged failure' },
+      });
+      await new Promise(resolve => setTimeout(resolve, 25));
+      expect(subscription.activeRunId()).toBe(runId);
+
+      pubsub.owners.set(key, transferredOwner);
+      await pubsub.publish(topic, {
+        type: 'stream-part',
+        runId,
+        data: {
+          type: 'stream-part',
+          runId,
+          streamId,
+          sourceId: 'stale-owner-source',
+          leaseOwner,
+          part: { type: 'text-delta', payload: { text: 'stale owner' } },
+        },
+      });
+      await new Promise(resolve => setTimeout(resolve, 25));
+      expect(subscription.activeRunId()).toBe(runId);
+
+      pubsub.owners.set(key, leaseOwner);
+      await pubsub.publish(topic, {
+        type: 'run-completed',
+        runId,
+        data: { type: 'run-completed', runId, streamId, leaseOwner },
+      });
+      await new Promise(resolve => setTimeout(resolve, 25));
+      expect(subscription.activeRunId()).toBeNull();
+    } finally {
+      subscription.unsubscribe();
+      await iterator.return?.();
+    }
+  });
+
+  it('rejects a spoofed-source mismatched-owner terminal for a locally registered stream', async () => {
+    const pubsub = new ControlledLeasePubSub();
+    const runtime = new AgentThreadStreamRuntime();
+    const agent = { id: 'local-owner-fence-agent' } as Agent<any, any, any, any>;
+    const target = { resourceId: 'local-owner-fence-user', threadId: 'local-owner-fence-thread' };
+    const key = `${target.resourceId}\u0000${target.threadId}`;
+    const topic = `agent.thread-stream.${encodeURIComponent(key)}`;
+    const runId = 'local-owner-fence-run';
+    let finishRun!: () => void;
+    const finished = new Promise<void>(resolve => (finishRun = resolve));
+    const options = runtime.prepareRunOptions(
+      { runId, memory: { resource: target.resourceId, thread: target.threadId } } as any,
+      pubsub,
+    );
+    const subscription = await runtime.subscribeToThread(agent, target, pubsub);
+    const iterator = subscription.stream[Symbol.asyncIterator]();
+
+    try {
+      const completion = runtime.registerRun(
+        agent,
+        {
+          runId,
+          status: 'running',
+          fullStream: (async function* () {
+            yield { type: 'start', runId };
+            await finished;
+            yield { type: 'finish', runId };
+          })(),
+          _waitUntilFinished: () => finished,
+        } as any,
+        options,
+        pubsub,
+      )!;
+      await expect(withTimeout(iterator.next(), 'Timed out waiting for local owner start')).resolves.toMatchObject({
+        value: { type: 'start', runId },
+      });
+      await pubsub.flush();
+      const registration = pubsub.publishedData.find(data => data?.type === 'run-registered' && data.runId === runId)!;
+      const localSourceId = pubsub.publishedData.find(
+        data => data?.type === 'stream-part' && data.runId === runId,
+      )?.sourceId;
+      expect(localSourceId).toEqual(expect.any(String));
+      await pubsub.publish(topic, {
+        type: 'run-aborted',
+        runId,
+        data: {
+          type: 'run-aborted',
+          runId,
+          streamId: registration.streamId,
+          leaseOwner: `mastra-thread-owner:${JSON.stringify([runId, 'forged-local-source', 'attempt'])}`,
+          sourceId: localSourceId,
+        },
+      });
+      await pubsub.flush();
+      await nextTick();
+      expect(subscription.activeRunId()).toBe(runId);
+      expect(options.abortSignal?.aborted).toBe(false);
+
+      finishRun();
+      await completion;
+      await pubsub.flush();
+      await waitForCondition(() => subscription.activeRunId() === null);
+    } finally {
+      subscription.unsubscribe();
+      await iterator.return?.();
+    }
+  });
+
+  it('bounds retained suspended-stream identities per run and across runs', () => {
+    const retained = new Map<string, Set<string>>();
+
+    rememberBoundedResumableTerminalStream(retained, 'run-a', 'stream-a1', 2);
+    rememberBoundedResumableTerminalStream(retained, 'run-a', 'stream-a2', 2);
+    expect(rememberBoundedResumableTerminalStream(retained, 'run-a', 'stream-a3', 2)).toEqual(['stream-a1']);
+    expect([...retained.get('run-a')!]).toEqual(['stream-a2', 'stream-a3']);
+
+    rememberBoundedResumableTerminalStream(retained, 'run-b', 'stream-b1', 2);
+    expect(rememberBoundedResumableTerminalStream(retained, 'run-c', 'stream-c1', 2)).toEqual([
+      'stream-a2',
+      'stream-a3',
+    ]);
+    expect([...retained.keys()]).toEqual(['run-b', 'run-c']);
+    expect(retained.has('run-a')).toBe(false);
+  });
+
+  it('publishes an authenticated stale-suspension terminal before handing the lease to a new run', async () => {
+    const pubsub = new ControlledLeasePubSub();
+    const ownerRuntime = new AgentThreadStreamRuntime();
+    const followerRuntime = new AgentThreadStreamRuntime();
+    const agent = { id: 'stale-suspension-owner-agent' } as Agent<any, any, any, any>;
+    const target = { resourceId: 'stale-suspension-user', threadId: 'stale-suspension-thread' };
+    const key = `${target.resourceId}\u0000${target.threadId}`;
+    const oldRunId = 'stale-suspension-old-run';
+    const newRunId = 'stale-suspension-new-run';
+    let now = 1_000_000;
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const subscription = await followerRuntime.subscribeToThread(agent, target, pubsub);
+    const iterator = subscription.stream[Symbol.asyncIterator]();
+
+    try {
+      const oldCompletion = ownerRuntime.registerRun(
+        agent,
+        {
+          runId: oldRunId,
+          status: 'suspended',
+          fullStream: (async function* () {
+            yield { type: 'start', runId: oldRunId };
+            yield {
+              type: 'tool-call-approval',
+              runId: oldRunId,
+              payload: { toolCallId: 'stale-tool-call', toolName: 'testTool' },
+            };
+          })(),
+          _waitUntilFinished: async () => {},
+        } as any,
+        { runId: oldRunId, memory: { resource: target.resourceId, thread: target.threadId } } as any,
+        pubsub,
+      )!;
+      await waitForCondition(
+        () => pubsub.publishedData.some(data => data?.type === 'run-registered' && data.runId === oldRunId),
+        1_000,
+      );
+      await pubsub.flush();
+      expect(pubsub.publishedData.filter(data => data?.runId === oldRunId).map(data => data.type)).toContain(
+        'stream-part',
+      );
+      expect(subscription.activeRunId()).toBe(oldRunId);
+      await expect(withTimeout(iterator.next(), 'Timed out waiting for stale suspended start')).resolves.toMatchObject({
+        value: { type: 'start', runId: oldRunId },
+      });
+      await expect(
+        withTimeout(iterator.next(), 'Timed out waiting for stale suspended approval'),
+      ).resolves.toMatchObject({
+        value: { type: 'tool-call-approval', runId: oldRunId },
+      });
+      await oldCompletion;
+      await pubsub.flush();
+      await waitForCondition(() => subscription.activeRunId() === oldRunId);
+      const oldRegistration = pubsub.publishedData.find(
+        data => data?.type === 'run-registered' && data.runId === oldRunId,
+      )!;
+
+      now += 30 * 60 * 1_000 + 1;
+      let finishNewRun!: () => void;
+      const newRunFinished = new Promise<void>(resolve => (finishNewRun = resolve));
+      const newCompletion = ownerRuntime.registerRun(
+        agent,
+        {
+          runId: newRunId,
+          status: 'running',
+          fullStream: (async function* () {
+            yield { type: 'start', runId: newRunId };
+            await newRunFinished;
+            yield { type: 'finish', runId: newRunId };
+          })(),
+          _waitUntilFinished: () => newRunFinished,
+        } as any,
+        { runId: newRunId, memory: { resource: target.resourceId, thread: target.threadId } } as any,
+        pubsub,
+      )!;
+      await expect(withTimeout(iterator.next(), 'Timed out waiting for the post-sweep run')).resolves.toMatchObject({
+        value: { type: 'start', runId: newRunId },
+      });
+      await pubsub.flush();
+      const staleTerminal = pubsub.publishedData.find(
+        data => data?.type === 'run-completed' && data.runId === oldRunId,
+      );
+      expect(staleTerminal?.streamId).toBe(oldRegistration.streamId);
+      expect(staleTerminal?.leaseOwner).toBe(oldRegistration.leaseOwner);
+      await waitForCondition(() => subscription.activeRunId() === newRunId);
+      expect(pubsub.owners.get(key)).not.toBe(oldRegistration.leaseOwner);
+
+      finishNewRun();
+      await newCompletion;
+      await pubsub.flush();
+      await waitForCondition(() => subscription.activeRunId() === null);
+    } finally {
+      nowSpy.mockRestore();
       subscription.unsubscribe();
       await iterator.return?.();
     }
@@ -4065,6 +4750,51 @@ describe('Agent signals', () => {
     }
   });
 
+  it('publishes an authenticated persisted-signal terminal before releasing its cross-runtime lease', async () => {
+    const pubsub = new ControlledLeasePubSub();
+    const ownerRuntime = new AgentThreadStreamRuntime();
+    const followerRuntime = new AgentThreadStreamRuntime();
+    const memory = new MockMemory();
+    const target = { resourceId: 'remote-persist-user', threadId: 'remote-persist-thread' };
+    const key = `${target.resourceId}\u0000${target.threadId}`;
+    await memory.createThread({ threadId: target.threadId, resourceId: target.resourceId });
+    const agent = new Agent({
+      id: 'remote-persist-agent',
+      name: 'Remote Persist Agent',
+      instructions: 'Test',
+      model: createTextStreamModel('must not run'),
+      memory,
+    });
+    const subscription = await followerRuntime.subscribeToThread(agent, target, pubsub);
+    const nextRun = readNextRunWithParts(subscription.stream[Symbol.asyncIterator]());
+
+    try {
+      const result = ownerRuntime.sendSignal(
+        agent,
+        createSignal({ type: 'user-message', contents: 'persist across runtimes' }),
+        { ...target, ifIdle: { behavior: 'persist' as const } },
+        pubsub,
+      );
+      await expect(result.persisted).resolves.toBeUndefined();
+      const subscribedRun = await withTimeout(nextRun, 'Timed out waiting for remote persisted-signal stream');
+      expect(subscribedRun).toMatchObject({ value: { part: { type: 'finish' } } });
+      const runId = subscribedRun.value.runId;
+      await waitForCondition(
+        () => pubsub.publishedData.some(data => data?.type === 'run-completed' && data.runId === runId),
+        1_000,
+      );
+      await pubsub.flush();
+      await waitForCondition(() => subscription.activeRunId() === null, 1_000);
+      const registration = pubsub.publishedData.find(data => data?.type === 'run-registered' && data.runId === runId);
+      const terminal = pubsub.publishedData.find(data => data?.type === 'run-completed' && data.runId === runId);
+      expect(terminal?.streamId).toBe(registration?.streamId);
+      expect(terminal?.leaseOwner).toBe(registration?.leaseOwner);
+      await waitForCondition(() => pubsub.owners.get(key) === undefined, 1_000);
+    } finally {
+      subscription.unsubscribe();
+    }
+  });
+
   it('does not persist or broadcast a transient idle signal when idle behavior is persist', async () => {
     const memory = new MockMemory();
     await memory.createThread({ threadId: 'transient-idle-persist-thread', resourceId: 'transient-idle-persist-user' });
@@ -4250,7 +4980,8 @@ describe('Agent signals', () => {
     staleSubscription.unsubscribe();
 
     const livePubSub = new ControlledLeasePubSub();
-    livePubSub.owners.set(key, 'live-run');
+    const liveOwner = 'mastra-thread-owner:["live-run","peer-runtime","attempt"]';
+    livePubSub.owners.set(key, liveOwner);
     livePubSub.ownerReadFailures = 1;
     const liveRuntime = new AgentThreadStreamRuntime();
     const liveSubscription = await liveRuntime.subscribeToThread(
@@ -4261,7 +4992,39 @@ describe('Agent signals', () => {
     await livePubSub.publish(topic, {
       type: 'run-registered',
       runId: 'live-run',
-      data: { type: 'run-registered', runId: 'live-run', streamId: 'live-stream', streamSeq: 1 },
+      data: {
+        type: 'run-registered',
+        runId: 'live-run',
+        streamId: 'failed-owner-read-stream',
+        streamSeq: 1,
+        leaseOwner: liveOwner,
+      },
+    });
+    await livePubSub.flush();
+    expect(liveSubscription.activeRunId()).toBeNull();
+    await livePubSub.publish(topic, {
+      type: 'run-registered',
+      runId: 'live-run',
+      data: {
+        type: 'run-registered',
+        runId: 'live-run',
+        streamId: 'forged-owner-stream',
+        streamSeq: 1,
+        leaseOwner: 'mastra-thread-owner:["live-run","forged-runtime","attempt"]',
+      },
+    });
+    await livePubSub.flush();
+    expect(liveSubscription.activeRunId()).toBeNull();
+    await livePubSub.publish(topic, {
+      type: 'run-registered',
+      runId: 'live-run',
+      data: {
+        type: 'run-registered',
+        runId: 'live-run',
+        streamId: 'live-stream',
+        streamSeq: 1,
+        leaseOwner: liveOwner,
+      },
     });
     await livePubSub.publish(topic, {
       type: 'stream-part',
@@ -4271,6 +5034,7 @@ describe('Agent signals', () => {
         runId: 'live-run',
         streamId: 'live-stream',
         sourceId: 'peer-runtime',
+        leaseOwner: liveOwner,
         part: { type: 'start', runId: 'live-run' },
       },
     });
@@ -4410,7 +5174,6 @@ describe('Agent signals', () => {
       releaseTransfer = resolve;
     });
     pubsub.onTransferLease = signalTransferStarted;
-    pubsub.owners.set(key, oldRunId);
 
     const agent = {
       id: 'continuation-reservation-agent',
@@ -4449,7 +5212,9 @@ describe('Agent signals', () => {
 
     releaseTransfer();
     await waitForCondition(() => vi.mocked(agent.stream).mock.calls.length === 1);
-    await pubsub.releaseLease(key, continuation.runId);
+    const continuationOwner = pubsub.owners.get(key);
+    expect(continuationOwner).toContain(`"${continuation.runId}"`);
+    if (continuationOwner) await pubsub.releaseLease(key, continuationOwner);
   });
 
   it('orders delayed lease validation and ignores stale stream terminal events', async () => {
@@ -4458,7 +5223,8 @@ describe('Agent signals', () => {
     const key = 'ordered-resource\u0000ordered-thread';
     const topic = `agent.thread-stream.${encodeURIComponent(key)}`;
     const runId = 'ordered-run';
-    pubsub.owners.set(key, runId);
+    const leaseOwner = `mastra-thread-owner:${JSON.stringify([runId, 'ordered-source', 'attempt'])}`;
+    pubsub.owners.set(key, leaseOwner);
     pubsub.ownerReadDelayMs = 10;
     const subscription = await runtime.subscribeToThread(
       { id: 'ordered-agent' } as Agent<any, any, any, any>,
@@ -4467,9 +5233,9 @@ describe('Agent signals', () => {
     );
 
     for (const data of [
-      { type: 'run-registered', runId, streamId: 'ordered-stream-1', streamSeq: 1 },
-      { type: 'run-registered', runId, streamId: 'ordered-stream-2', streamSeq: 2 },
-      { type: 'run-aborted', runId, streamId: 'ordered-stream-1' },
+      { type: 'run-registered', runId, streamId: 'ordered-stream-1', streamSeq: 1, leaseOwner },
+      { type: 'run-registered', runId, streamId: 'ordered-stream-2', streamSeq: 2, leaseOwner },
+      { type: 'run-aborted', runId, streamId: 'ordered-stream-1', leaseOwner },
     ]) {
       await pubsub.publish(topic, { type: data.type, runId, data });
     }
@@ -4490,7 +5256,8 @@ describe('Agent signals', () => {
     const key = 'bounded-resource\u0000bounded-thread';
     const topic = `agent.thread-stream.${encodeURIComponent(key)}`;
     const runId = 'bounded-run';
-    pubsub.owners.set(key, `mastra-thread-owner:${JSON.stringify([runId, 'remote-owner-source', 'attempt'])}`);
+    const leaseOwner = `mastra-thread-owner:${JSON.stringify([runId, 'remote-owner-source', 'attempt'])}`;
+    pubsub.owners.set(key, leaseOwner);
     const subscription = await runtime.subscribeToThread(
       { id: 'bounded-owner-agent' } as Agent<any, any, any, any>,
       { resourceId: 'bounded-resource', threadId: 'bounded-thread' },
@@ -4499,7 +5266,7 @@ describe('Agent signals', () => {
     await pubsub.publish(topic, {
       type: 'run-registered',
       runId,
-      data: { type: 'run-registered', runId, streamId: 'bounded-stream', streamSeq: 1 },
+      data: { type: 'run-registered', runId, streamId: 'bounded-stream', streamSeq: 1, leaseOwner },
     });
     await pubsub.flush();
     await waitForCondition(() => subscription.activeRunId() === runId);
@@ -4536,7 +5303,8 @@ describe('Agent signals', () => {
     const key = 'terminal-wait-resource\u0000terminal-wait-thread';
     const topic = `agent.thread-stream.${encodeURIComponent(key)}`;
     const runId = 'terminal-wait-run';
-    pubsub.owners.set(key, runId);
+    const leaseOwner = `mastra-thread-owner:${JSON.stringify([runId, 'terminal-source', 'attempt'])}`;
+    pubsub.owners.set(key, leaseOwner);
     const subscription = await runtime.subscribeToThread(
       { id: 'terminal-wait-owner' } as Agent<any, any, any, any>,
       { resourceId: 'terminal-wait-resource', threadId: 'terminal-wait-thread' },
@@ -4545,7 +5313,7 @@ describe('Agent signals', () => {
     await pubsub.publish(topic, {
       type: 'run-registered',
       runId,
-      data: { type: 'run-registered', runId, streamId: 'terminal-wait-stream', streamSeq: 1 },
+      data: { type: 'run-registered', runId, streamId: 'terminal-wait-stream', streamSeq: 1, leaseOwner },
     });
     await pubsub.flush();
     await waitForCondition(() => subscription.activeRunId() === runId);
@@ -4555,10 +5323,27 @@ describe('Agent signals', () => {
       { memory: { resource: 'terminal-wait-resource', thread: 'terminal-wait-thread' } },
       pubsub,
     );
+    let waitResolved = false;
+    void wait.then(() => (waitResolved = true));
     await pubsub.publish(topic, {
       type: 'run-completed',
       runId,
-      data: { type: 'run-completed', runId, streamId: 'terminal-wait-stream' },
+      data: {
+        type: 'run-completed',
+        runId,
+        streamId: 'terminal-wait-stream',
+        leaseOwner: `mastra-thread-owner:${JSON.stringify([runId, 'forged-source', 'attempt'])}`,
+      },
+    });
+    await pubsub.flush();
+    await nextTick();
+    expect(waitResolved).toBe(false);
+    expect(subscription.activeRunId()).toBe(runId);
+    pubsub.owners.delete(key);
+    await pubsub.publish(topic, {
+      type: 'run-completed',
+      runId,
+      data: { type: 'run-completed', runId, streamId: 'terminal-wait-stream', leaseOwner },
     });
     await pubsub.flush();
     await expect(wait).resolves.toBeUndefined();
@@ -4601,6 +5386,33 @@ describe('Agent signals', () => {
     );
     await pubsub.flush();
     await waitForCondition(() => followerSubscription.activeRunId() === runId);
+    const leaseOwner = pubsub.owners.get(key)!;
+    const streamId = pubsub.publishedData.find(
+      data => data?.type === 'run-registered' && data.runId === runId,
+    )!.streamId;
+    await pubsub.publish(`agent.thread-stream.${encodeURIComponent(key)}`, {
+      type: 'run-abort-requested',
+      runId,
+      data: {
+        type: 'run-abort-requested',
+        runId,
+        streamId,
+        leaseOwner: `mastra-thread-owner:${JSON.stringify([runId, 'forged-runtime', 'attempt'])}`,
+      },
+    });
+    await pubsub.flush();
+    expect(options.abortSignal?.aborted).toBe(false);
+    expect(pubsub.owners.get(key)).toBe(leaseOwner);
+    const transferredOwner = `mastra-thread-owner:${JSON.stringify([runId, 'new-owner-runtime', 'attempt'])}`;
+    pubsub.owners.set(key, transferredOwner);
+    await pubsub.publish(`agent.thread-stream.${encodeURIComponent(key)}`, {
+      type: 'run-abort-requested',
+      runId,
+      data: { type: 'run-abort-requested', runId, streamId, leaseOwner },
+    });
+    await pubsub.flush();
+    expect(options.abortSignal?.aborted).toBe(false);
+    pubsub.owners.set(key, leaseOwner);
     expect(followerSubscription.abort()).toBe(true);
     expect(options.abortSignal?.aborted).toBe(false);
     await pubsub.flush();
@@ -4665,7 +5477,6 @@ describe('Agent signals', () => {
       pubsub,
     );
 
-    await pubsub.acquireLease('remote-resource\u0000remote-thread', 'remote-run-1', 15000);
     ownerRuntime.registerRun(
       owner,
       output,
@@ -4704,7 +5515,6 @@ describe('Agent signals', () => {
 
     finishRun();
     await waitForRemoteRun;
-    await pubsub.releaseLease('remote-resource\u0000remote-thread', 'remote-run-1');
     ownerSubscription.unsubscribe();
     senderSubscription.unsubscribe();
   });
@@ -4749,7 +5559,6 @@ describe('Agent signals', () => {
     const ownerSubscription = await ownerRuntime.subscribeToThread(owner, target, pubsub);
     const senderSubscriptionA = await senderRuntimeA.subscribeToThread(senderA, target, pubsub);
     const senderSubscriptionB = await senderRuntimeB.subscribeToThread(senderB, target, pubsub);
-    await pubsub.acquireLease('remote-idempotent-resource\u0000remote-idempotent-thread', output.runId, 15_000);
     ownerRuntime.registerRun(
       owner,
       output,
@@ -4779,7 +5588,6 @@ describe('Agent signals', () => {
 
     finishRun();
     await nextTick();
-    await pubsub.releaseLease('remote-idempotent-resource\u0000remote-idempotent-thread', output.runId);
     ownerSubscription.unsubscribe();
     senderSubscriptionA.unsubscribe();
     senderSubscriptionB.unsubscribe();
@@ -4955,7 +5763,6 @@ describe('Agent signals', () => {
     const ownerSubscription = await ownerRuntime.subscribeToThread(owner, target, pubsub);
     const senderSubscriptionA = await senderRuntimeA.subscribeToThread(senderA, target, pubsub);
     const senderSubscriptionB = await senderRuntimeB.subscribeToThread(senderB, target, pubsub);
-    await pubsub.acquireLease(`${target.resourceId}\u0000${target.threadId}`, output.runId, 15_000);
     const completion = ownerRuntime.registerRun(
       owner,
       output,
@@ -5130,7 +5937,6 @@ describe('Agent signals', () => {
       },
       pubsub,
     );
-    await pubsub.acquireLease('stale-remote-resource\u0000stale-remote-thread', 'stale-remote-run-1', 15000);
     ownerRuntime.registerRun(
       owner,
       output,
@@ -5145,7 +5951,6 @@ describe('Agent signals', () => {
     senderSubscription.unsubscribe();
     finishRun();
     await nextTick();
-    await pubsub.releaseLease('stale-remote-resource\u0000stale-remote-thread', 'stale-remote-run-1');
 
     const result = senderRuntime.sendSignal(
       sender,
@@ -8776,6 +9581,31 @@ describe('Agent signals', () => {
         memory: { resource: 'reserved-abort-idle-user', thread: 'reserved-abort-idle-thread' },
       }),
     );
+  });
+
+  it('cleans the run and lease when provider completion rejects without abort', async () => {
+    const runtime = new AgentThreadStreamRuntime();
+    const pubsub = new ControlledLeasePubSub();
+    const resourceId = 'provider-failure-user';
+    const threadId = 'provider-failure-thread';
+    const runId = 'provider-failure-run';
+    const failure = new Error('provider failed');
+    const completion = runtime.registerRun(
+      { id: 'provider-failure-agent' } as any,
+      {
+        runId,
+        status: 'running',
+        fullStream: (async function* () {})(),
+        _waitUntilFinished: () => Promise.reject(failure),
+      } as any,
+      { runId, memory: { resource: resourceId, thread: threadId } } as any,
+      pubsub,
+    )!;
+
+    await expect(completion).rejects.toBe(failure);
+    expect(runtime.getRunOutput(runId, pubsub)).toBeUndefined();
+    expect(runtime.getActiveThreadRunId({ resourceId, threadId }, pubsub)).toBeUndefined();
+    await waitForCondition(() => !pubsub.owners.has(`${resourceId}\u0000${threadId}`));
   });
 
   it('releases waiters when draining a queued active signal fails', async () => {
