@@ -335,6 +335,16 @@ class RejectRunAbortingPubSub extends ControlledLeasePubSub {
   }
 }
 
+class RejectVisibleToolTerminalPubSub extends ControlledLeasePubSub {
+  override async publish(topic: string, event: Parameters<PubSub['publish']>[1]): Promise<void> {
+    const data = (event as { data?: { type?: string; part?: { type?: string } } }).data;
+    if (data?.type === 'stream-part' && data.part?.type === 'tool-error') {
+      throw new Error('injected visible tool terminal publication failure');
+    }
+    await super.publish(topic, event);
+  }
+}
+
 class DelayedRegistrationPubSub extends ControlledLeasePubSub {
   #releaseRegistration!: () => void;
   readonly registrationBlocked = new Promise<void>(resolve => {
@@ -1304,6 +1314,78 @@ describe('Agent signals', () => {
         done: false,
       });
       await expect(subscription._waitForOutputDrain!(output)).resolves.toBeUndefined();
+    } finally {
+      subscription.unsubscribe();
+      await iterator.return?.();
+    }
+  });
+
+  it('fails closed when a visible abort-time tool terminal cannot publish', async () => {
+    const runtime = new AgentThreadStreamRuntime();
+    const pubsub = new RejectVisibleToolTerminalPubSub();
+    const agent = { id: 'abort-tool-terminal-failure-agent' } as Agent<any, any, any, any>;
+    const threadId = 'abort-tool-terminal-failure-thread';
+    const resourceId = 'abort-tool-terminal-failure-user';
+    const runId = 'abort-tool-terminal-failure-run';
+    let streamController!: ReadableStreamDefaultController<unknown>;
+    const output = {
+      runId,
+      status: 'running',
+      fullStream: new ReadableStream({
+        start(controller) {
+          streamController = controller;
+          controller.enqueue({ type: 'start', runId });
+          controller.enqueue({
+            type: 'tool-call',
+            runId,
+            payload: { toolCallId: 'abort-tool-terminal-failure-call', toolName: 'lookup', args: {} },
+          });
+        },
+      }),
+      _waitUntilFinished: () => new Promise<void>(() => {}),
+    } as any;
+    const options = runtime.prepareRunOptions(
+      { runId, memory: { thread: threadId, resource: resourceId } } as any,
+      pubsub,
+    );
+    const subscription = await runtime.subscribeToThread(agent, { threadId, resourceId }, pubsub);
+    const iterator = subscription.stream[Symbol.asyncIterator]();
+
+    try {
+      const completion = runtime.registerRun(agent, output, options, pubsub)!;
+      void completion.catch(() => {});
+      await expect(iterator.next()).resolves.toMatchObject({ value: { type: 'start', runId } });
+      await expect(iterator.next()).resolves.toMatchObject({
+        value: { type: 'tool-call', payload: { toolCallId: 'abort-tool-terminal-failure-call' } },
+      });
+
+      expect(runtime.abortRun(runId, pubsub)).toBe(true);
+      const outputDrain = subscription._waitForOutputDrain!(output)!;
+      streamController.enqueue({
+        type: 'tool-error',
+        runId,
+        payload: {
+          toolCallId: 'abort-tool-terminal-failure-call',
+          toolName: 'lookup',
+          error: new Error('authoritative cancellation terminal'),
+        },
+      });
+
+      await expect(
+        withTimeout(outputDrain, 'Timed out waiting for tool-terminal publication failure'),
+      ).rejects.toMatchObject({
+        name: 'AgentThreadOutputDrainError',
+        reason: 'terminal-publish-failed',
+      });
+      expect(pubsub.publishedData.filter(data => data?.type === 'run-aborted' && data.runId === runId)).toEqual([]);
+      await expect(withTimeout(completion, 'Tool-terminal publication failure did not finalize')).rejects.toMatchObject(
+        {
+          name: 'AgentThreadOutputDrainError',
+          reason: 'terminal-publish-failed',
+        },
+      );
+      expect(runtime.getRunOutput(runId, pubsub)).toBeUndefined();
+      await waitForCondition(() => !pubsub.owners.has(`${resourceId}\u0000${threadId}`));
     } finally {
       subscription.unsubscribe();
       await iterator.return?.();

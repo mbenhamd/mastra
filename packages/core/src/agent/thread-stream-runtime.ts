@@ -851,10 +851,14 @@ export class AgentThreadStreamRuntime {
     let activeIterator: AsyncIterator<unknown> | undefined;
     let abortTimer: ReturnType<typeof setTimeout> | undefined;
     let resolveBroadcast!: () => void;
-    const broadcastCompletion = new Promise<void>(resolve => {
+    let rejectBroadcast!: (error: unknown) => void;
+    const broadcastCompletion = new Promise<void>((resolve, reject) => {
       resolveBroadcast = resolve;
+      rejectBroadcast = reject;
     });
     let broadcastSettled = false;
+    let broadcastError: unknown;
+    let hasBroadcastError = false;
     const settleBroadcast = () => {
       if (broadcastSettled) return;
       broadcastSettled = true;
@@ -862,7 +866,8 @@ export class AgentThreadStreamRuntime {
         clearTimeout(abortTimer);
         abortTimer = undefined;
       }
-      resolveBroadcast();
+      if (hasBroadcastError) rejectBroadcast(broadcastError);
+      else resolveBroadcast();
     };
     let error: unknown;
     // Presence-tracked separately: a source that throws a FALSY value
@@ -925,6 +930,24 @@ export class AgentThreadStreamRuntime {
       });
     };
 
+    const emitPublishedPart = async (part: unknown) => {
+      try {
+        await emitPart(part);
+      } catch (cause) {
+        const error =
+          cause instanceof AgentThreadOutputDrainError
+            ? cause
+            : new AgentThreadOutputDrainError(
+                'terminal-publish-failed',
+                `Failed to publish a stream part for agent thread run ${output.runId}`,
+                cause,
+              );
+        broadcastError = error;
+        hasBroadcastError = true;
+        throw error;
+      }
+    };
+
     // `start` is idempotent and returns the drain-completion promise so callers
     // (registerRun / #broadcastPersistedSignal) can gate `run-completed` on the
     // stream-part broadcast settling (PR #202/#204: publishing completion off
@@ -956,7 +979,7 @@ export class AgentThreadStreamRuntime {
               while (true) {
                 const { value: part, done: streamDone } = await reader.read();
                 if (streamDone) break;
-                await emitPart(part);
+                await emitPublishedPart(part);
               }
             } finally {
               activeReader = undefined;
@@ -969,7 +992,7 @@ export class AgentThreadStreamRuntime {
               while (true) {
                 const { value: part, done: iteratorDone } = await iterator.next();
                 if (iteratorDone) break;
-                await emitPart(part);
+                await emitPublishedPart(part);
               }
             } finally {
               activeIterator = undefined;
@@ -979,7 +1002,7 @@ export class AgentThreadStreamRuntime {
           // Abort-time source rejection is the provider's cancellation boundary,
           // not a competing subscriber error. Preserve buffered tool terminals
           // and close replay views so they synthesize the authoritative abort.
-          if (!abortRequested) {
+          if (!abortRequested || hasBroadcastError) {
             error = caught;
             hasError = true;
           }
