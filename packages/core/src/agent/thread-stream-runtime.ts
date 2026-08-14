@@ -99,6 +99,8 @@ export class AgentThreadOutputDrainError extends Error {
   }
 }
 
+class AgentThreadLeaseOwnershipLostError extends AgentThreadOutputDrainError {}
+
 /** Pre-dispatch lease failure for callers that require strict signal admission. */
 export class AgentThreadSignalAdmissionError extends Error {
   readonly name = 'AgentThreadSignalAdmissionError';
@@ -2268,10 +2270,14 @@ export class AgentThreadStreamRuntime {
         // signed by the losing token: remote subscribers authenticate this
         // exact owner before projecting a live segment.
         state.leaseOwnerTokensByRunId.delete(output.runId);
-        throw new AgentThreadOutputDrainError(
+        const ownershipError = new AgentThreadLeaseOwnershipLostError(
           'registration-publish-failed',
           `Agent thread run ${output.runId} did not acquire its exact lease owner`,
         );
+        // The provider output may already exist, but a process that lost this
+        // exact lease must not execute or publish any part of the run.
+        this.abortRun(output.runId, resolvedPubSub);
+        throw ownershipError;
       }
       await this.#publishRegistrationAndWait(pubsub, key, {
         type: 'run-registered',
@@ -2294,7 +2300,10 @@ export class AgentThreadStreamRuntime {
     // its active-run record + thread lease would never release, permanently
     // wedging the thread. The broadcast promise settles when the parts drain
     // finishes; the completion watcher gates `run-completed` on it (PR #202/#204).
-    const broadcast = registrationPublish.then(startBroadcast, startBroadcast);
+    const broadcast = registrationPublish.then(startBroadcast, error => {
+      if (error instanceof AgentThreadLeaseOwnershipLostError) throw error;
+      return startBroadcast();
+    });
     state.broadcastsByStreamId.set(streamId, broadcast);
     void broadcast.catch(() => {});
     return this.#watchThreadRunCompletion(state, pubsub, key, record);

@@ -1086,6 +1086,64 @@ describe('Agent signals', () => {
     await waitingForNextRun;
   });
 
+  it('aborts a local provider without broadcasting after losing the exact thread lease', async () => {
+    const runtime = new AgentThreadStreamRuntime();
+    const pubsub = new ControlledLeasePubSub();
+    const agent = { id: 'lost-registration-lease-agent' } as Agent<any, any, any, any>;
+    const resourceId = 'lost-registration-lease-user';
+    const threadId = 'lost-registration-lease-thread';
+    const runId = 'lost-registration-lease-run';
+    const key = `${resourceId}\u0000${threadId}`;
+    const competingOwner = `mastra-thread-owner:${JSON.stringify(['competing-run', 'remote-source', 'attempt'])}`;
+    pubsub.owners.set(key, competingOwner);
+    const options = runtime.prepareRunOptions(
+      { runId, memory: { resource: resourceId, thread: threadId } } as any,
+      pubsub,
+    );
+    let providerAborted = false;
+    const providerFinished = new Promise<void>((_resolve, reject) => {
+      options.abortSignal?.addEventListener(
+        'abort',
+        () => {
+          providerAborted = true;
+          reject(new Error('provider stopped after losing lease'));
+        },
+        { once: true },
+      );
+    });
+    let sourceRead = false;
+    const output = {
+      runId,
+      status: 'running',
+      fullStream: {
+        [Symbol.asyncIterator]() {
+          sourceRead = true;
+          return {
+            next: () => new Promise<IteratorResult<unknown>>(() => {}),
+          };
+        },
+      },
+      _waitUntilFinished: () => providerFinished,
+    } as any;
+
+    const completion = runtime.registerRun(agent, output, options, pubsub)!;
+    await expect(withTimeout(completion, 'Lost-lease provider run did not finalize', 2_000)).rejects.toMatchObject({
+      name: 'AgentThreadOutputDrainError',
+      reason: 'registration-publish-failed',
+    });
+
+    expect(providerAborted).toBe(true);
+    expect(sourceRead).toBe(false);
+    expect(pubsub.owners.get(key)).toBe(competingOwner);
+    expect(
+      pubsub.publishedData.filter(data =>
+        ['run-registered', 'stream-part', 'run-aborting', 'run-aborted'].includes(data?.type),
+      ),
+    ).toEqual([]);
+    expect(runtime.getRunOutput(runId, pubsub)).toBeUndefined();
+    expect(runtime.getActiveThreadRunId({ resourceId, threadId }, pubsub)).toBeUndefined();
+  });
+
   it('drains an authoritative tool error before the bounded abort fallback', async () => {
     const runtime = new AgentThreadStreamRuntime();
     const pubsub = new EventEmitterPubSub();
@@ -5160,7 +5218,6 @@ describe('Agent signals', () => {
       releaseTransfer = resolve;
     });
     pubsub.onTransferLease = signalTransferStarted;
-    pubsub.owners.set(key, oldRunId);
 
     const agent = { id: 'drained-reservation-agent' } as Agent<any, any, any, any>;
     agent.stream = vi.fn(async (_signal, options) => ({ runId: options.runId })) as any;
