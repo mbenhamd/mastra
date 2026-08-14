@@ -633,6 +633,56 @@ describe('MemoryPG revisioned Working Memory', () => {
     ).resolves.toEqual(owner);
   });
 
+  it('persists bounded high-cardinality provenance with exact escaped owner markers', async () => {
+    const boundedProvenanceResourceId = `${resourceId}-bounded-provenance`;
+    const maxDataBytes = 70_000;
+    const initial = await firstMemory.applyWorkingMemoryUpdate({
+      scope: 'resource',
+      resourceId: boundedProvenanceResourceId,
+      value: '{}',
+      expectedRevision: 0,
+      source: 'owner',
+      maxDataBytes,
+    });
+    const owner = await firstMemory.applyWorkingMemoryUpdate({
+      scope: 'resource',
+      resourceId: boundedProvenanceResourceId,
+      value: JSON.stringify(
+        Object.fromEntries([
+          ...Array.from({ length: 4_998 }, (_, index) => [`k${index}`, index]),
+          ['owner/name', 'Ada'],
+          ['owner~field', 'mathematics'],
+        ]),
+      ),
+      expectedRevision: initial.revision,
+      source: 'owner',
+      maxDataBytes,
+      protectPaths: ['/owner~1name', '/owner~0field'],
+    });
+    const observer = await secondMemory.applyWorkingMemoryUpdate({
+      scope: 'resource',
+      resourceId: boundedProvenanceResourceId,
+      value: JSON.stringify(
+        Object.fromEntries([
+          ...Array.from({ length: 4_998 }, (_, index) => [`k${index}`, index + 1]),
+          ['owner/name', 'ignored'],
+          ['owner~field', 'ignored'],
+        ]),
+      ),
+      expectedRevision: owner.revision,
+      source: 'observer',
+      maxDataBytes,
+    });
+
+    await expect(
+      firstMemory.getWorkingMemorySnapshot({ scope: 'resource', resourceId: boundedProvenanceResourceId }),
+    ).resolves.toEqual(observer);
+    expect(Object.keys(observer.provenance).sort()).toEqual(['', '/owner~0field', '/owner~1name'].sort());
+    expect(observer.provenance['']).toMatchObject({ source: 'observer' });
+    expect(observer.provenance['/owner~0field']).toMatchObject({ source: 'owner' });
+    expect(observer.provenance['/owner~1name']).toMatchObject({ source: 'owner' });
+  });
+
   it('fails closed when persisted metadata is not an object', async () => {
     const malformedResourceId = `${resourceId}-malformed-metadata`;
     await firstMemory.applyWorkingMemoryUpdate({

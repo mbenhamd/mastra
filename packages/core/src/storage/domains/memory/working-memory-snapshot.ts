@@ -3,6 +3,11 @@ import type { ApplyWorkingMemoryUpdateInput, WorkingMemoryPathProvenance, Workin
 const CONTROL_METADATA_KEY = 'workingMemory';
 const MAX_PROTECTED_PATHS = 256;
 const MAX_POINTER_LENGTH = 1024;
+// maxDataBytes deliberately bounds only the stored value. Provenance has an
+// independent fixed cardinality, with room for one coarse entry plus every
+// protected-path marker, so even a tiny value limit cannot erase owner controls.
+const MAX_PROVENANCE_ENTRIES = MAX_PROTECTED_PATHS + 1;
+const MAX_PROVENANCE_TIMESTAMP_LENGTH = 64;
 const FORBIDDEN_POINTER_SEGMENTS = new Set(['__proto__', 'prototype', 'constructor']);
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
@@ -199,6 +204,15 @@ function valuesEqual(left: JsonValue | undefined, right: JsonValue | undefined):
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
+function isValidProvenanceTimestamp(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.length <= MAX_PROVENANCE_TIMESTAMP_LENGTH &&
+    value.trim() !== '' &&
+    Number.isFinite(Date.parse(value))
+  );
+}
+
 function changedJsonPointers(before: string | null, after: string | null): string[] {
   // The storage contract distinguishes no value (`null`) from the literal JSON
   // text `"null"`, even though both parse to the same JavaScript value.
@@ -208,8 +222,16 @@ function changedJsonPointers(before: string | null, after: string | null): strin
   if (beforeJson === undefined || afterJson === undefined) return before === after ? [] : [''];
 
   const changed: string[] = [];
+  let exceededEntryLimit = false;
+  const recordChange = (path: string) => {
+    if (changed.length >= MAX_PROVENANCE_ENTRIES) {
+      exceededEntryLimit = true;
+      return;
+    }
+    changed.push(path);
+  };
   const visit = (left: JsonValue | undefined, right: JsonValue | undefined, path: string) => {
-    if (valuesEqual(left, right)) return;
+    if (exceededEntryLimit || valuesEqual(left, right)) return;
     if (
       left === undefined ||
       right === undefined ||
@@ -220,7 +242,7 @@ function changedJsonPointers(before: string | null, after: string | null): strin
       Array.isArray(left) ||
       Array.isArray(right)
     ) {
-      changed.push(path);
+      recordChange(path);
       return;
     }
     const keys = new Set([...Object.keys(left), ...Object.keys(right)]);
@@ -229,31 +251,38 @@ function changedJsonPointers(before: string | null, after: string | null): strin
     // coarse provenance unit instead of emitting a control pointer that the
     // fail-closed reader would later reject.
     if ([...keys].some(key => FORBIDDEN_POINTER_SEGMENTS.has(key))) {
-      changed.push(path);
+      recordChange(path);
       return;
     }
     // Stored JSON keys are not control input and may be longer than a bounded
     // JSON pointer permits. Collapse their changes to the nearest valid
     // ancestor so a value we just wrote always remains readable.
     if ([...keys].some(key => `${path}/${encodePointerSegment(key)}`.length > MAX_POINTER_LENGTH)) {
-      changed.push(path);
+      recordChange(path);
       return;
     }
-    if (keys.size === 0) changed.push(path);
+    if (keys.size === 0) recordChange(path);
     for (const key of [...keys].sort()) {
       visit(left[key], right[key], `${path}/${encodePointerSegment(key)}`);
+      if (exceededEntryLimit) break;
     }
   };
   visit(beforeJson, afterJson, '');
-  return changed;
+  // A whole-value update can be represented safely at the root. Owner markers
+  // for protected descendants are restored after this coarse entry is applied.
+  return exceededEntryLimit ? [''] : changed;
 }
 
 function parseProvenance(value: unknown, currentRevision: number): Record<string, WorkingMemoryPathProvenance> {
   if (!isRecord(value)) {
     throw new WorkingMemoryValidationError('Stored working-memory controls are invalid.');
   }
+  const entries = Object.entries(value);
+  if (entries.length > MAX_PROVENANCE_ENTRIES) {
+    throw new WorkingMemoryValidationError('Stored working-memory controls are invalid.');
+  }
   const provenance: Record<string, WorkingMemoryPathProvenance> = {};
-  for (const [path, entry] of Object.entries(value)) {
+  for (const [path, entry] of entries) {
     if (!isRecord(entry)) {
       throw new WorkingMemoryValidationError('Stored working-memory controls are invalid.');
     }
@@ -263,9 +292,7 @@ function parseProvenance(value: unknown, currentRevision: number): Record<string
       !Number.isSafeInteger(entry.revision) ||
       entry.revision < 0 ||
       entry.revision > currentRevision ||
-      typeof entry.updatedAt !== 'string' ||
-      entry.updatedAt.trim() === '' ||
-      !Number.isFinite(Date.parse(entry.updatedAt))
+      !isValidProvenanceTimestamp(entry.updatedAt)
     )
       throw new WorkingMemoryValidationError('Stored working-memory controls are invalid.');
     try {
@@ -536,6 +563,9 @@ export function writeWorkingMemorySnapshotMetadata(
 ): Record<string, unknown> {
   const current = metadata ?? {};
   const mastra = isRecord(current.mastra) ? current.mastra : {};
+  // Keep this public serialization helper fail-closed even when a caller did
+  // not obtain its snapshot from applyWorkingMemorySnapshotUpdate.
+  const provenance = parseProvenance(snapshot.provenance, snapshot.revision);
   return {
     ...current,
     mastra: {
@@ -543,9 +573,7 @@ export function writeWorkingMemorySnapshotMetadata(
       [CONTROL_METADATA_KEY]: {
         revision: snapshot.revision,
         protectedPaths: [...snapshot.protectedPaths],
-        provenance: Object.fromEntries(
-          Object.entries(snapshot.provenance).map(([path, entry]) => [path, { ...entry }]),
-        ),
+        provenance: Object.fromEntries(Object.entries(provenance).map(([path, entry]) => [path, { ...entry }])),
       },
     },
   };
@@ -567,6 +595,9 @@ export function applyWorkingMemorySnapshotUpdate(
   }
   if (input.source !== 'observer' && input.source !== 'owner') {
     throw new WorkingMemoryValidationError('Working-memory source must be owner or observer.');
+  }
+  if (!isValidProvenanceTimestamp(updatedAt)) {
+    throw new WorkingMemoryValidationError('Working-memory provenance timestamp is invalid.');
   }
   if (input.value !== null && typeof input.value !== 'string') {
     throw new WorkingMemoryValidationError('Working-memory value must be a string or null.');
@@ -616,40 +647,51 @@ export function applyWorkingMemorySnapshotUpdate(
   if (!controlChanged && changedPaths.length === 0) return current;
 
   const revision = current.revision + 1;
-  const provenance = { ...current.provenance };
   const parsedValue = parseJsonValue(value);
-  for (const path of changedPaths) {
-    for (const existingPath of Object.keys(provenance)) {
-      if (existingPath === path || path === '' || existingPath.startsWith(`${path}/`)) {
-        delete provenance[existingPath];
+  const buildProvenance = (paths: readonly string[]) => {
+    const provenance = { ...current.provenance };
+    for (const path of paths) {
+      for (const existingPath of Object.keys(provenance)) {
+        if (existingPath === path || path === '' || existingPath.startsWith(`${path}/`)) {
+          delete provenance[existingPath];
+        }
+      }
+      if (path === '' || parsedValue === undefined || getPointer(parsedValue, pointerSegments(path)).exists) {
+        provenance[path] = { source: input.source, revision, updatedAt };
       }
     }
-    if (path === '' || parsedValue === undefined || getPointer(parsedValue, pointerSegments(path)).exists) {
-      provenance[path] = { source: input.source, revision, updatedAt };
+    if (input.source === 'observer') {
+      // Arrays and over-budget objects are tracked as coarse pointers. Restore
+      // every explicit owner marker after those entries are updated.
+      for (const protectedPath of current.protectedPaths) {
+        const priorOwnerEntry =
+          current.provenance[protectedPath] ??
+          Object.entries(current.provenance).find(
+            ([path, entry]) =>
+              entry.source === 'owner' &&
+              (path === '' ||
+                protectedPath === '' ||
+                path.startsWith(`${protectedPath}/`) ||
+                protectedPath.startsWith(`${path}/`)),
+          )?.[1];
+        if (priorOwnerEntry?.source === 'owner') provenance[protectedPath] = priorOwnerEntry;
+      }
     }
+    if (input.source === 'owner') {
+      const pathsToMark = paths.includes('') ? protectedPaths : protectPaths;
+      for (const path of pathsToMark) {
+        provenance[path] = { source: 'owner', revision, updatedAt };
+      }
+    }
+    return provenance;
+  };
+
+  let provenance = buildProvenance(changedPaths);
+  if (Object.keys(provenance).length > MAX_PROVENANCE_ENTRIES) {
+    provenance = buildProvenance(['']);
   }
-  if (input.source === 'observer') {
-    // Arrays are tracked as one changed pointer so that insertions/removals do
-    // not assign misleading per-index provenance. Restore the explicit owner
-    // marker for each protected path after that coarse entry is updated.
-    for (const protectedPath of current.protectedPaths) {
-      const priorOwnerEntry =
-        current.provenance[protectedPath] ??
-        Object.entries(current.provenance).find(
-          ([path, entry]) =>
-            entry.source === 'owner' &&
-            (path === '' ||
-              protectedPath === '' ||
-              path.startsWith(`${protectedPath}/`) ||
-              protectedPath.startsWith(`${path}/`)),
-        )?.[1];
-      if (priorOwnerEntry?.source === 'owner') provenance[protectedPath] = priorOwnerEntry;
-    }
-  }
-  if (input.source === 'owner') {
-    for (const path of protectPaths) {
-      provenance[path] = { source: 'owner', revision, updatedAt };
-    }
+  if (Object.keys(provenance).length > MAX_PROVENANCE_ENTRIES) {
+    throw new WorkingMemoryValidationError('Working-memory provenance exceeds the supported path limit.');
   }
 
   return { value, revision, protectedPaths, provenance };

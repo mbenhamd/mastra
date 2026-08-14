@@ -272,10 +272,83 @@ describe('revisioned Working Memory controls', () => {
     ).toThrow('UTF-8 byte limit');
   });
 
+  it('bounds high-cardinality provenance independently from value bytes while preserving escaped owner paths', () => {
+    const maxDataBytes = 70_000;
+    const ownerValue = JSON.stringify(
+      Object.fromEntries([
+        ...Array.from({ length: 4_998 }, (_, index) => [`k${index}`, index]),
+        ['owner/name', 'Ada'],
+        ['owner~field', 'mathematics'],
+      ]),
+    );
+    expect(new TextEncoder().encode(ownerValue).byteLength).toBeLessThanOrEqual(maxDataBytes);
+
+    const initial = applyWorkingMemorySnapshotUpdate(
+      { value: null, revision: 0, protectedPaths: [], provenance: {} },
+      { value: '{}', expectedRevision: 0, source: 'owner', maxDataBytes },
+      '2026-01-01T00:00:00.000Z',
+    );
+    const owner = applyWorkingMemorySnapshotUpdate(
+      initial,
+      {
+        value: ownerValue,
+        expectedRevision: initial.revision,
+        source: 'owner',
+        maxDataBytes,
+        protectPaths: ['/owner~1name', '/owner~0field'],
+      },
+      '2026-01-02T00:00:00.000Z',
+    );
+
+    expect(Object.keys(owner.provenance).sort()).toEqual(['', '/owner~0field', '/owner~1name'].sort());
+    expect(owner.provenance['']).toMatchObject({ source: 'owner' });
+    expect(owner.provenance['/owner~0field']).toMatchObject({ source: 'owner' });
+    expect(owner.provenance['/owner~1name']).toMatchObject({ source: 'owner' });
+
+    const observerValue = JSON.stringify(
+      Object.fromEntries([
+        ...Array.from({ length: 4_998 }, (_, index) => [`k${index}`, index + 1]),
+        ['owner/name', 'ignored'],
+        ['owner~field', 'ignored'],
+      ]),
+    );
+    expect(new TextEncoder().encode(observerValue).byteLength).toBeLessThanOrEqual(maxDataBytes);
+    const observer = applyWorkingMemorySnapshotUpdate(
+      owner,
+      {
+        value: observerValue,
+        expectedRevision: owner.revision,
+        source: 'observer',
+        maxDataBytes,
+      },
+      '2026-01-03T00:00:00.000Z',
+    );
+
+    expect(JSON.parse(observer.value!)).toMatchObject({
+      k0: 1,
+      'owner/name': 'Ada',
+      'owner~field': 'mathematics',
+    });
+    expect(Object.keys(observer.provenance).sort()).toEqual(['', '/owner~0field', '/owner~1name'].sort());
+    expect(observer.provenance['']).toMatchObject({ source: 'observer' });
+    expect(observer.provenance['/owner~0field']).toMatchObject({ source: 'owner' });
+    expect(observer.provenance['/owner~1name']).toMatchObject({ source: 'owner' });
+
+    const metadata = writeWorkingMemorySnapshotMetadata({}, observer);
+    expect(new TextEncoder().encode(JSON.stringify(metadata)).byteLength).toBeLessThan(1_024);
+    expect(readWorkingMemorySnapshot(observer.value, metadata)).toEqual(observer);
+  });
+
   it('normalizes bounded RFC 6901 paths and rejects prototype paths', () => {
     expect(normalizeWorkingMemoryPaths(['/profile/name', '/profile', '/profile/name'])).toEqual(['/profile']);
+    expect(normalizeWorkingMemoryPaths(['/owner~1name', '/owner~0field'])).toEqual(['/owner~0field', '/owner~1name']);
     expect(() => normalizeWorkingMemoryPaths(['/profile/__proto__/polluted'])).toThrow('prototype fields');
     expect(() => normalizeWorkingMemoryPaths(['profile/name'])).toThrow('RFC 6901');
+    expect(() => normalizeWorkingMemoryPaths(['/owner~2field'])).toThrow('RFC 6901');
+    expect(() => normalizeWorkingMemoryPaths([`/${'x'.repeat(1_024)}`])).toThrow('bounded RFC 6901');
+    expect(() => normalizeWorkingMemoryPaths(Array.from({ length: 257 }, (_, index) => `/k${index}`))).toThrow(
+      'at most 256 protected paths',
+    );
   });
 
   it('tracks objects with prototype-like data keys without creating invalid control pointers', () => {
@@ -396,6 +469,60 @@ describe('revisioned Working Memory controls', () => {
     expect(() => readWorkingMemorySnapshot('{"name":"Ada"}', malformed)).toThrow(
       'Stored working-memory controls are invalid',
     );
+    malformed.mastra.workingMemory.provenance['/name'] = {
+      source: 'owner',
+      revision: 2,
+      updatedAt: `${' '.repeat(41)}2026-01-01T00:00:00.000Z`,
+    };
+    expect(() => readWorkingMemorySnapshot('{"name":"Ada"}', malformed)).toThrow(
+      'Stored working-memory controls are invalid',
+    );
+  });
+
+  it('accepts exactly 257 provenance entries and fails closed above that deterministic cap', () => {
+    const provenance = Object.fromEntries(
+      Array.from({ length: 258 }, (_, index) => [
+        `/k${index}`,
+        { source: 'owner', revision: 1, updatedAt: '2026-01-01T00:00:00.000Z' },
+      ]),
+    );
+    const overBudgetMetadata = {
+      mastra: { workingMemory: { revision: 1, protectedPaths: [], provenance } },
+    };
+    const atBudgetMetadata = structuredClone(overBudgetMetadata);
+    delete atBudgetMetadata.mastra.workingMemory.provenance['/k257'];
+
+    expect(Object.keys(readWorkingMemorySnapshot('{}', atBudgetMetadata).provenance)).toHaveLength(257);
+    expect(() => readWorkingMemorySnapshot('{}', overBudgetMetadata)).toThrow(
+      'Stored working-memory controls are invalid',
+    );
+    expect(() =>
+      writeWorkingMemorySnapshotMetadata(
+        {},
+        {
+          value: '{}',
+          revision: 1,
+          protectedPaths: [],
+          provenance,
+        },
+      ),
+    ).toThrow('Stored working-memory controls are invalid');
+  });
+
+  it('fails closed when stored protected or provenance pointers exceed 1,024 characters', () => {
+    const overlongPath = `/${'x'.repeat(1_024)}`;
+    const entry = { source: 'owner', revision: 1, updatedAt: '2026-01-01T00:00:00.000Z' };
+
+    expect(() =>
+      readWorkingMemorySnapshot('{}', {
+        mastra: { workingMemory: { revision: 1, protectedPaths: [overlongPath], provenance: {} } },
+      }),
+    ).toThrow('bounded RFC 6901');
+    expect(() =>
+      readWorkingMemorySnapshot('{}', {
+        mastra: { workingMemory: { revision: 1, protectedPaths: [], provenance: { [overlongPath]: entry } } },
+      }),
+    ).toThrow('Stored working-memory controls are invalid');
   });
 
   it('fails closed when a stored protected path is absent from the value', () => {
@@ -472,6 +599,90 @@ describe('revisioned Working Memory controls', () => {
 });
 
 describe('InMemoryMemory revisioned Working Memory', () => {
+  it('rejects owner path controls above their bounds without persisting a snapshot', async () => {
+    const storage = new InMemoryStore({ id: 'working-memory-protected-path-bounds' });
+    const memory = await storage.getStore('memory');
+    if (!memory) throw new Error('Expected in-memory storage domain.');
+    const resourceId = 'protected-path-bounds-resource';
+    const empty = { value: null, revision: 0, protectedPaths: [], provenance: {} };
+
+    await expect(
+      memory.applyWorkingMemoryUpdate({
+        scope: 'resource',
+        resourceId,
+        value: '{}',
+        expectedRevision: 0,
+        source: 'owner',
+        protectPaths: Array.from({ length: 257 }, (_, index) => `/k${index}`),
+      }),
+    ).rejects.toThrow('at most 256 protected paths');
+    await expect(memory.getWorkingMemorySnapshot({ scope: 'resource', resourceId })).resolves.toEqual(empty);
+
+    await expect(
+      memory.applyWorkingMemoryUpdate({
+        scope: 'resource',
+        resourceId,
+        value: '{}',
+        expectedRevision: 0,
+        source: 'owner',
+        protectPaths: [`/${'x'.repeat(1_024)}`],
+      }),
+    ).rejects.toThrow('bounded RFC 6901');
+    await expect(memory.getWorkingMemorySnapshot({ scope: 'resource', resourceId })).resolves.toEqual(empty);
+  });
+
+  it('persists bounded provenance and retracts observer data without losing escaped owner paths', async () => {
+    const storage = new InMemoryStore({ id: 'working-memory-bounded-provenance' });
+    const memory = await storage.getStore('memory');
+    if (!memory) throw new Error('Expected in-memory storage domain.');
+    const resourceId = 'bounded-provenance-resource';
+    const maxDataBytes = 70_000;
+    const initial = await memory.applyWorkingMemoryUpdate({
+      scope: 'resource',
+      resourceId,
+      value: '{}',
+      expectedRevision: 0,
+      source: 'owner',
+      maxDataBytes,
+    });
+    const owner = await memory.applyWorkingMemoryUpdate({
+      scope: 'resource',
+      resourceId,
+      value: JSON.stringify(
+        Object.fromEntries([
+          ...Array.from({ length: 4_998 }, (_, index) => [`k${index}`, index]),
+          ['owner/name', 'Ada'],
+          ['owner~field', 'mathematics'],
+        ]),
+      ),
+      expectedRevision: initial.revision,
+      source: 'owner',
+      maxDataBytes,
+      protectPaths: ['/owner~1name', '/owner~0field'],
+    });
+    const observer = await memory.applyWorkingMemoryUpdate({
+      scope: 'resource',
+      resourceId,
+      value: JSON.stringify(
+        Object.fromEntries([
+          ...Array.from({ length: 4_998 }, (_, index) => [`k${index}`, index + 1]),
+          ['owner/name', 'ignored'],
+          ['owner~field', 'ignored'],
+        ]),
+      ),
+      expectedRevision: owner.revision,
+      source: 'observer',
+      maxDataBytes,
+    });
+
+    await expect(memory.getWorkingMemorySnapshot({ scope: 'resource', resourceId })).resolves.toEqual(observer);
+    expect(Object.keys(observer.provenance).sort()).toEqual(['', '/owner~0field', '/owner~1name'].sort());
+    expect(JSON.parse(retractObserverWorkingMemorySnapshot(observer).value!)).toEqual({
+      'owner/name': 'Ada',
+      'owner~field': 'mathematics',
+    });
+  });
+
   it('rejects cross-resource reassignment of governed threads while allowing ordinary reassignment', async () => {
     const storage = new InMemoryStore({ id: 'working-memory-resource-reassignment' });
     const memory = await storage.getStore('memory');
