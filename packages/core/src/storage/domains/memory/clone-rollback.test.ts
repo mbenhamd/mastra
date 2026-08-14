@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import type { MastraDBMessage } from '../../../memory';
 import type { ObservationalMemoryRecord, StorageCloneThreadOutput } from '../../types';
@@ -154,6 +154,82 @@ describe('InMemoryMemory conditional clone rollback', () => {
     await expect(memory.getThreadById({ threadId: clone.thread.id })).resolves.toBeNull();
     await expect(memory.listMessages({ threadId: clone.thread.id })).resolves.toMatchObject({ messages: [] });
     await expect(memory.getObservationalMemoryHistory(null, 'target-resource')).resolves.toEqual([priorRecord]);
+  });
+
+  it('removes every clone artifact when issuing the generation receipt fails', async () => {
+    const db = new InMemoryDB();
+    const memory = new InMemoryMemory({ db });
+    const createdAt = new Date('2026-01-01T00:00:00.000Z');
+    await memory.saveThread({
+      thread: {
+        id: 'generation-source',
+        resourceId: 'source-resource',
+        title: 'Generation source',
+        metadata: {},
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+    await memory.saveMessages({
+      messages: [
+        {
+          id: 'generation-source-message',
+          threadId: 'generation-source',
+          resourceId: 'source-resource',
+          role: 'user',
+          content: { format: 2, parts: [{ type: 'text', text: 'Source remains intact' }] },
+          createdAt,
+        } satisfies MastraDBMessage,
+      ],
+    });
+    const sourceThreadBefore = await memory.getThreadById({ threadId: 'generation-source' });
+    const sourceMessagesBefore = await memory.listMessages({ threadId: 'generation-source' });
+    const generationFailure = new Error('generation allocation failed');
+    const currentCrypto = globalThis.crypto;
+    const randomUUID = vi
+      .fn(currentCrypto.randomUUID)
+      .mockReturnValueOnce('00000000-0000-4000-8000-000000000001')
+      .mockImplementationOnce(() => {
+        throw generationFailure;
+      });
+    vi.stubGlobal(
+      'crypto',
+      new Proxy(currentCrypto, {
+        get(target, property, receiver) {
+          if (property === 'randomUUID') return randomUUID;
+          return Reflect.get(target, property, receiver);
+        },
+      }),
+    );
+
+    try {
+      await expect(
+        memory.cloneThread({
+          sourceThreadId: 'generation-source',
+          newThreadId: 'generation-target',
+          resourceId: 'target-resource',
+        }),
+      ).rejects.toBe(generationFailure);
+
+      await expect(memory.getThreadById({ threadId: 'generation-target' })).resolves.toBeNull();
+      await expect(memory.listMessages({ threadId: 'generation-target' })).resolves.toMatchObject({ messages: [] });
+      expect(db.memoryThreadGenerations.has('generation-target')).toBe(false);
+      await expect(memory.getThreadById({ threadId: 'generation-source' })).resolves.toEqual(sourceThreadBefore);
+      await expect(memory.listMessages({ threadId: 'generation-source' })).resolves.toEqual(sourceMessagesBefore);
+    } finally {
+      vi.stubGlobal('crypto', currentCrypto);
+    }
+
+    const retry = await memory.cloneThread({
+      sourceThreadId: 'generation-source',
+      newThreadId: 'generation-target',
+      resourceId: 'target-resource',
+    });
+    expect(retry).toMatchObject({
+      thread: { id: 'generation-target' },
+      clonedMessages: [{ threadId: 'generation-target' }],
+      rollbackReceipt: { threadId: 'generation-target' },
+    });
   });
 
   it('preserves a clone whose metadata was changed through the storage API after its rollback receipt was issued', async () => {

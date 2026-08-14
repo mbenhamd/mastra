@@ -1521,56 +1521,58 @@ export class InMemoryMemory extends MemoryStorage {
       updatedAt: now,
     };
 
-    // Save the new thread
-    const storedThread = cloneThreadBoundary(newThread, true);
-    this.db.threads.set(newThreadId, storedThread);
+    return this.withMemoryStateRollback(true, () => {
+      // Save the new thread
+      const storedThread = cloneThreadBoundary(newThread, true);
+      this.db.threads.set(newThreadId, storedThread);
 
-    // Clone messages with new IDs
-    const clonedMessages: MastraDBMessage[] = [];
-    const messageIdMap: Record<string, string> = {};
-    const targetResourceId = resourceId || sourceResourceId;
-    for (const sourceMsg of sourceMessages) {
-      const newMessageId = crypto.randomUUID();
-      messageIdMap[sourceMsg.id] = newMessageId;
-      const parsedContent = safelyParseJSON(sourceMsg.content);
+      // Clone messages with new IDs
+      const clonedMessages: MastraDBMessage[] = [];
+      const messageIdMap: Record<string, string> = {};
+      const targetResourceId = resourceId || sourceResourceId;
+      for (const sourceMsg of sourceMessages) {
+        const newMessageId = crypto.randomUUID();
+        messageIdMap[sourceMsg.id] = newMessageId;
+        const parsedContent = safelyParseJSON(sourceMsg.content);
 
-      // Create storage message
-      const newStorageMessage: StorageMessageType = {
-        id: newMessageId,
-        thread_id: newThreadId,
-        content: sourceMsg.content,
-        role: sourceMsg.role,
-        type: sourceMsg.type,
-        createdAt: new Date(sourceMsg.createdAt),
-        resourceId: targetResourceId,
+        // Create storage message
+        const newStorageMessage: StorageMessageType = {
+          id: newMessageId,
+          thread_id: newThreadId,
+          content: sourceMsg.content,
+          role: sourceMsg.role,
+          type: sourceMsg.type,
+          createdAt: new Date(sourceMsg.createdAt),
+          resourceId: targetResourceId,
+        };
+
+        this.db.messages.set(newMessageId, newStorageMessage);
+
+        // Create MastraDBMessage for return
+        clonedMessages.push({
+          id: newMessageId,
+          threadId: newThreadId,
+          content: parsedContent,
+          role: sourceMsg.role as MastraDBMessage['role'],
+          type: sourceMsg.type,
+          createdAt: new Date(sourceMsg.createdAt),
+          resourceId: targetResourceId,
+        });
+      }
+
+      const clonedMessageIds = clonedMessages.map(message => message.id);
+      return {
+        thread: cloneThreadBoundary(storedThread, true),
+        clonedMessages,
+        messageIdMap,
+        sourceResourceId,
+        rollbackReceipt: {
+          threadId: newThreadId,
+          storageGeneration: this.rotateThreadGeneration(newThreadId),
+          clonedMessageIds,
+        },
       };
-
-      this.db.messages.set(newMessageId, newStorageMessage);
-
-      // Create MastraDBMessage for return
-      clonedMessages.push({
-        id: newMessageId,
-        threadId: newThreadId,
-        content: parsedContent,
-        role: sourceMsg.role as MastraDBMessage['role'],
-        type: sourceMsg.type,
-        createdAt: new Date(sourceMsg.createdAt),
-        resourceId: targetResourceId,
-      });
-    }
-
-    const clonedMessageIds = clonedMessages.map(message => message.id);
-    return {
-      thread: cloneThreadBoundary(storedThread, true),
-      clonedMessages,
-      messageIdMap,
-      sourceResourceId,
-      rollbackReceipt: {
-        threadId: newThreadId,
-        storageGeneration: this.rotateThreadGeneration(newThreadId),
-        clonedMessageIds,
-      },
-    };
+    });
   }
 
   async rollbackThreadClone(input: StorageRollbackThreadCloneInput): Promise<StorageRollbackThreadCloneResult> {
