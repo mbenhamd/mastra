@@ -20,7 +20,7 @@ import { createToolCallStep } from './tool-call-step';
 // The unit tests in tool-call-step.test.ts and llm-mapping-step.test.ts each pin one
 // half of this chain; this test pins their composition.
 describe('aborted tool call pipeline (tool-call-step → schema boundary → llm-mapping-step)', () => {
-  it('keeps request abort terminal when a sibling tool error could otherwise continue the loop', async () => {
+  it('keeps abort terminal while preserving settled siblings around errors and pending calls', async () => {
     // -- Real tool that throws mid-flight, as fetch/etc. do when the request aborts.
     const abortedTool = createTool({
       id: 'slow-server-tool',
@@ -116,8 +116,19 @@ describe('aborted tool call pipeline (tool-call-step → schema boundary → llm
       args: { q: 'also important' },
       error: { name: 'Error', message: 'recoverable sibling failure' },
     });
+    const pendingSiblingBoundary = toolCallOutputSchema.parse({
+      toolCallId: 'call-3',
+      toolName: 'pending-client-tool',
+      args: { q: 'needs input' },
+    });
+    const successfulSiblingBoundary = toolCallOutputSchema.parse({
+      toolCallId: 'call-4',
+      toolName: 'completed-sibling-tool',
+      args: { q: 'finished first' },
+      result: { ok: true },
+    });
 
-    // -- Step 2: real llm-mapping-step consuming the mixed abort/error output.
+    // -- Step 2: real llm-mapping-step consuming the mixed turn.
     const llmExecutionStep = createStep({
       id: 'test-llm-execution',
       inputSchema: z.any(),
@@ -148,11 +159,11 @@ describe('aborted tool call pipeline (tool-call-step → schema boundary → llm
         stepResult: { isContinued: true, reason: undefined },
         metadata: {},
       })),
-      inputData: [crossedBoundary, siblingErrorBoundary],
+      inputData: [crossedBoundary, siblingErrorBoundary, pendingSiblingBoundary, successfulSiblingBoundary],
     } as any);
 
-    // Only the ordinary sibling error is persisted for diagnostics. The
-    // request-aborted call stays incomplete and cannot become model input.
+    // The ordinary error and already-completed sibling are persisted. The
+    // aborted and pending calls remain incomplete.
     expect(updateToolInvocation).toHaveBeenCalledWith(
       expect.objectContaining({
         toolInvocation: expect.objectContaining({
@@ -162,10 +173,26 @@ describe('aborted tool call pipeline (tool-call-step → schema boundary → llm
         }),
       }),
     );
-    expect(updateToolInvocation).not.toHaveBeenCalledWith(
-      expect.objectContaining({ toolInvocation: expect.objectContaining({ toolCallId: 'call-1' }) }),
+    expect(updateToolInvocation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toolInvocation: expect.objectContaining({
+          state: 'result',
+          toolCallId: 'call-4',
+          result: { ok: true },
+        }),
+      }),
     );
-    expect(controller.enqueue).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'tool-result' }));
+    for (const toolCallId of ['call-1', 'call-3']) {
+      expect(updateToolInvocation).not.toHaveBeenCalledWith(
+        expect.objectContaining({ toolInvocation: expect.objectContaining({ toolCallId }) }),
+      );
+    }
+    expect(controller.enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'tool-result',
+        payload: expect.objectContaining({ toolCallId: 'call-4', result: { ok: true } }),
+      }),
+    );
     expect(controller.enqueue).toHaveBeenCalledWith(
       expect.objectContaining({
         type: 'tool-error',

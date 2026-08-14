@@ -663,7 +663,7 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
           tc => tc.result === undefined && !tc.error && !tc.aborted && !tc.providerExecuted && !isDeniedApproval(tc),
         );
 
-        if ((errorResults.length > 0 || abortedResults.length > 0) && !hasPendingHITL) {
+        if (errorResults.length > 0 || abortedResults.length > 0) {
           // Process successful siblings before either recovering from ordinary
           // errors or honoring the request abort. Settlements that completed in
           // this turn remain authoritative even though abort forbids another turn.
@@ -748,8 +748,9 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
             }
           }
 
-          if (abortedResults.length === 0) {
-            // Ordinary tool errors remain model-visible and may self-recover.
+          if (abortedResults.length === 0 && !hasPendingHITL) {
+            // Ordinary tool errors remain model-visible and may self-recover
+            // only when no pending interaction must suspend the turn.
             initialResult.stepResult.isContinued = true;
             initialResult.stepResult.reason = 'tool-calls';
             refreshLatestStepResult();
