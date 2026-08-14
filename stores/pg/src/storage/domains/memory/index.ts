@@ -188,6 +188,15 @@ function getManagedWorkingMemoryScope(config: unknown): 'thread' | 'resource' | 
   return scope === 'thread' || scope === 'resource' ? scope : undefined;
 }
 
+function getManagedWorkingMemoryScopes(records: ReadonlyArray<{ config: unknown }>): Set<'thread' | 'resource'> {
+  const scopes = new Set<'thread' | 'resource'>();
+  for (const record of records) {
+    const scope = getManagedWorkingMemoryScope(record.config);
+    if (scope) scopes.add(scope);
+  }
+  return scopes;
+}
+
 function parseMetadata(value: unknown): Record<string, unknown> {
   if (value === null || value === undefined) return {};
   if (typeof value === 'string') {
@@ -3789,19 +3798,19 @@ export class MemoryPG extends MemoryStorage {
     await t.none(`DELETE FROM ${omTableName} WHERE "lookupKey" IN ($1, $2)`, [resourceLookupKey, threadLookupKey]);
 
     const lookupKeys = new Set(records.map(record => record.lookupKey));
-    const resourceRecordManagedWorkingMemoryScope = getManagedWorkingMemoryScope(
-      records.find(record => record.lookupKey === resourceLookupKey)?.config,
+    const resourceRecordManagedWorkingMemoryScopes = getManagedWorkingMemoryScopes(
+      records.filter(record => record.lookupKey === resourceLookupKey),
     );
-    const threadRecordManagedWorkingMemoryScope = getManagedWorkingMemoryScope(
-      records.find(record => record.lookupKey === threadLookupKey)?.config,
+    const threadRecordManagedWorkingMemoryScopes = getManagedWorkingMemoryScopes(
+      records.filter(record => record.lookupKey === threadLookupKey),
     );
     let clearedResourceWorkingMemory = false;
     let clearedThreadMetadata = false;
     if (lookupKeys.size > 0) {
       const now = new Date().toISOString();
       if (
-        resourceRecordManagedWorkingMemoryScope === 'resource' ||
-        threadRecordManagedWorkingMemoryScope === 'resource'
+        resourceRecordManagedWorkingMemoryScopes.has('resource') ||
+        threadRecordManagedWorkingMemoryScopes.has('resource')
       ) {
         const resource = await t.oneOrNone<{ workingMemory: string | null; metadata: unknown }>(
           `SELECT "workingMemory", metadata FROM ${resourceTableName} WHERE id = $1 FOR UPDATE`,
@@ -3845,9 +3854,9 @@ export class MemoryPG extends MemoryStorage {
       const workingMemorySelector = `(COALESCE(metadata, '{}'::jsonb) ? 'workingMemory'
          OR COALESCE(metadata->'mastra', '{}'::jsonb) ? 'workingMemory')`;
       let managedWorkingMemorySelector: string | undefined;
-      if (resourceRecordManagedWorkingMemoryScope === 'thread') {
+      if (resourceRecordManagedWorkingMemoryScopes.has('thread')) {
         managedWorkingMemorySelector = workingMemorySelector;
-      } else if (threadRecordManagedWorkingMemoryScope === 'thread') {
+      } else if (threadRecordManagedWorkingMemoryScopes.has('thread')) {
         if (resourceScopeCleared) {
           threadSelectorValues.push(input.threadId);
           managedWorkingMemorySelector = `(id = $${threadSelectorValues.length} AND ${workingMemorySelector})`;
@@ -3865,15 +3874,15 @@ export class MemoryPG extends MemoryStorage {
       );
       for (const thread of threads) {
         const metadata = parseMetadata(thread.metadata);
-        const mastra = parseMetadata(metadata.mastra);
-        const om = parseMetadata(mastra.om);
+        const mastra = { ...asRecord(metadata.mastra) };
+        const om = asRecord(mastra.om);
         const derivedTitle = typeof om.threadTitle === 'string' ? om.threadTitle : undefined;
         delete mastra.om;
         let nextMetadata: Record<string, unknown> = { ...metadata, mastra };
 
         const clearThreadWorkingMemory =
-          resourceRecordManagedWorkingMemoryScope === 'thread' ||
-          (thread.id === input.threadId && threadRecordManagedWorkingMemoryScope === 'thread');
+          resourceRecordManagedWorkingMemoryScopes.has('thread') ||
+          (thread.id === input.threadId && threadRecordManagedWorkingMemoryScopes.has('thread'));
         if (clearThreadWorkingMemory) {
           if (hasWorkingMemorySnapshotControls(metadata)) {
             const current = readWorkingMemorySnapshot(

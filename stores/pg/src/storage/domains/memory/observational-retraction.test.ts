@@ -602,6 +602,132 @@ describe('MemoryPG observational-memory retraction', () => {
     expect(siblingThread?.metadata?.mastra).not.toHaveProperty('om');
   });
 
+  it('unions working-memory ownership across every generation at a thread coordinate', async () => {
+    const generationsResourceId = `${resourceId}-generation-scopes`;
+    const editedThreadId = `${threadId}-generation-edited`;
+    const siblingThreadId = `${threadId}-generation-sibling`;
+    await observerMemory.saveResource({
+      resource: {
+        id: generationsResourceId,
+        workingMemory: 'observer-managed-resource',
+        metadata: {},
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+    for (const [generationThreadId, label] of [
+      [editedThreadId, 'edited'],
+      [siblingThreadId, 'sibling'],
+    ] as const) {
+      await observerMemory.saveThread({
+        thread: {
+          id: generationThreadId,
+          resourceId: generationsResourceId,
+          title: `Derived ${label}`,
+          metadata: {
+            workingMemory: `observer-managed-${label}`,
+            mastra: {
+              preserved: true,
+              om: { threadTitle: `Derived ${label}`, lastObservedMessageId: `message-${label}` },
+            },
+          },
+          createdAt,
+          updatedAt: createdAt,
+        },
+      });
+    }
+    const priorGeneration = await observerMemory.initializeObservationalMemory({
+      config: { _managedWorkingMemoryScope: 'resource' },
+      resourceId: generationsResourceId,
+      scope: 'thread',
+      threadId: editedThreadId,
+    });
+    const currentGeneration = await observerMemory.createReflectionGeneration({
+      currentRecord: priorGeneration,
+      reflection: 'Current generation.',
+      tokenCount: 3,
+    });
+    await observerMemory.updateObservationalMemoryConfig({
+      id: currentGeneration.id,
+      config: { _managedWorkingMemoryScope: 'thread' },
+    });
+
+    await expect(
+      retractorMemory.retractObservationalMemory({
+        resourceId: generationsResourceId,
+        threadId: editedThreadId,
+      }),
+    ).resolves.toEqual({
+      clearedScopes: ['thread'],
+      clearedResourceWorkingMemory: true,
+      clearedThreadMetadata: true,
+    });
+
+    await expect(retractorMemory.getResourceById({ resourceId: generationsResourceId })).resolves.toMatchObject({
+      workingMemory: null,
+    });
+    const editedThread = await retractorMemory.getThreadById({ threadId: editedThreadId });
+    expect(editedThread).toMatchObject({
+      title: '',
+      metadata: { mastra: { preserved: true } },
+    });
+    expect(editedThread?.metadata).not.toHaveProperty('workingMemory');
+    expect(editedThread?.metadata?.mastra).not.toHaveProperty('om');
+
+    await expect(retractorMemory.getThreadById({ threadId: siblingThreadId })).resolves.toMatchObject({
+      title: 'Derived sibling',
+      metadata: {
+        workingMemory: 'observer-managed-sibling',
+        mastra: {
+          preserved: true,
+          om: { threadTitle: 'Derived sibling', lastObservedMessageId: 'message-sibling' },
+        },
+      },
+    });
+  });
+
+  it.each([
+    ['mastra-value', 'not-an-object', {}],
+    ['om-value', { preserved: true, om: 'not-an-object' }, { preserved: true }],
+  ])('retracts managed thread memory when the stored %s is malformed', async (suffix, mastra, expectedMastra) => {
+    const malformedResourceId = `${resourceId}-malformed-${suffix}`;
+    const malformedThreadId = `${threadId}-malformed-${suffix}`;
+    await observerMemory.saveThread({
+      thread: {
+        id: malformedThreadId,
+        resourceId: malformedResourceId,
+        title: 'Preserved title',
+        metadata: {
+          workingMemory: 'observer-managed-thread',
+          mastra,
+        },
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+    await observerMemory.initializeObservationalMemory({
+      config: { _managedWorkingMemoryScope: 'thread' },
+      resourceId: malformedResourceId,
+      scope: 'thread',
+      threadId: malformedThreadId,
+    });
+
+    await expect(
+      retractorMemory.retractObservationalMemory({
+        resourceId: malformedResourceId,
+        threadId: malformedThreadId,
+      }),
+    ).resolves.toEqual({
+      clearedScopes: ['thread'],
+      clearedResourceWorkingMemory: false,
+      clearedThreadMetadata: true,
+    });
+
+    const thread = await retractorMemory.getThreadById({ threadId: malformedThreadId });
+    expect(thread).toMatchObject({ title: 'Preserved title' });
+    expect(thread?.metadata).toEqual({ mastra: expectedMastra });
+  });
+
   it('resolves nullable message resources and retracts both sides of a move', async () => {
     const sourceResourceId = `${resourceId}-move-source`;
     const destinationResourceId = `${resourceId}-move-destination`;
