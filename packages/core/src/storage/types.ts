@@ -845,6 +845,8 @@ export type StorageRollbackThreadCloneInput = {
 };
 
 /** @internal A conflict preserves every artifact rather than risking another writer's state. */
+// Pinned Prettier and Oxfmt disagree on this union's line wrapping.
+// prettier-ignore
 export type StorageRollbackThreadCloneResult =
   | { status: 'rolled_back' }
   | { status: 'conflict'; reason: 'thread' | 'messages' | 'observational_memory' };
