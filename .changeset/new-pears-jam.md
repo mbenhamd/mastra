@@ -2,4 +2,6 @@
 '@mastra/core': patch
 ---
 
-Harness conversations that end silently after tool results now make one bounded, response-only recovery attempt with tools disabled. Aborted in-flight tools also produce matching error receipts alongside their synthetic error terminal events.
+- Added one bounded, response-only recovery attempt after silent tool-result endings, with tools disabled.
+- Added matching error receipts for aborted in-flight tools.
+- Improved abort handling by briefly waiting for already-visible tools to emit authoritative terminal errors before falling back to synthetic abort events.
