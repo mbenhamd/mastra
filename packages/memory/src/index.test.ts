@@ -820,6 +820,196 @@ describe('Memory', () => {
     });
 
     it.each(['save', 'update'] as const)(
+      'rejects a stale %s transition after the source thread is deleted and recreated at the same revision',
+      async mutation => {
+        const storage = new InMemoryStore();
+        const memory = new Memory({
+          storage,
+          options: { workingMemory: { enabled: true, scope: 'thread' } },
+        });
+        const memoryStore = (await storage.getStore('memory'))!;
+        const threadId = `thread-resource-transition-aba-${mutation}`;
+        const resourceId = `resource-transition-aba-${mutation}`;
+        const createdAt = new Date('2026-01-01T00:00:00.000Z');
+        await memory.createThread({ threadId, resourceId, title: 'Original' });
+        const source = await memory.updateWorkingMemoryByOwner({
+          threadId,
+          resourceId,
+          workingMemory: '{"name":"Ada"}',
+          expectedRevision: 0,
+          protectPaths: ['/name'],
+        });
+        const staleThread = await memory.getThreadById({ threadId });
+        if (!staleThread) throw new Error('Expected source thread.');
+        const destination = await memoryStore.applyWorkingMemoryUpdate({
+          scope: 'resource',
+          resourceId,
+          value: '{"status":"preserved"}',
+          expectedRevision: 0,
+          source: 'owner',
+        });
+
+        const originalTransition = memoryStore.transitionThreadToResourceWorkingMemory.bind(memoryStore);
+        let markTransitionStarted!: () => void;
+        let releaseTransition!: () => void;
+        const transitionStarted = new Promise<void>(resolve => {
+          markTransitionStarted = resolve;
+        });
+        const transitionBlocked = new Promise<void>(resolve => {
+          releaseTransition = resolve;
+        });
+        vi.spyOn(memoryStore, 'transitionThreadToResourceWorkingMemory').mockImplementation(async args => {
+          markTransitionStarted();
+          await transitionBlocked;
+          return originalTransition(args);
+        });
+
+        const resourceConfig: MemoryConfig = { workingMemory: { enabled: true, scope: 'resource' } };
+        const transition =
+          mutation === 'save'
+            ? memory.saveThread({
+                thread: {
+                  ...staleThread,
+                  title: 'Stale save',
+                  metadata: { workingMemory: source.value },
+                  updatedAt: new Date(),
+                },
+                memoryConfig: resourceConfig,
+              })
+            : memory.updateThread({
+                id: threadId,
+                title: 'Stale update',
+                metadata: { workingMemory: source.value },
+                memoryConfig: resourceConfig,
+              });
+        await transitionStarted;
+
+        await memoryStore.deleteThread({ threadId });
+        await memoryStore.saveThread({
+          thread: {
+            id: threadId,
+            resourceId,
+            title: 'Replacement',
+            metadata: { replacement: true },
+            createdAt,
+            updatedAt: createdAt,
+          },
+        });
+        const replacement = await memoryStore.applyWorkingMemoryUpdate({
+          scope: 'thread',
+          resourceId,
+          threadId,
+          value: '{"name":"Grace"}',
+          expectedRevision: 0,
+          source: 'owner',
+          protectPaths: ['/name'],
+        });
+        expect(replacement.revision).toBe(source.revision);
+        releaseTransition();
+
+        await expect(transition).rejects.toMatchObject({ name: 'WorkingMemoryRevisionConflictError' });
+        await expect(memoryStore.getThreadById({ threadId })).resolves.toMatchObject({
+          title: 'Replacement',
+          metadata: { replacement: true },
+        });
+        await expect(memoryStore.getWorkingMemorySnapshot({ scope: 'thread', resourceId, threadId })).resolves.toEqual(
+          replacement,
+        );
+        await expect(memoryStore.getWorkingMemorySnapshot({ scope: 'resource', resourceId })).resolves.toEqual(
+          destination,
+        );
+      },
+    );
+
+    it.each(['save', 'update'] as const)(
+      'rejects a stale %s transition after the destination resource is deleted and recreated at the same revision',
+      async mutation => {
+        const storage = new InMemoryStore();
+        const memory = new Memory({
+          storage,
+          options: { workingMemory: { enabled: true, scope: 'thread' } },
+        });
+        const memoryStore = (await storage.getStore('memory'))!;
+        const threadId = `thread-resource-transition-destination-aba-${mutation}`;
+        const resourceId = `resource-transition-destination-aba-${mutation}`;
+        await memory.createThread({ threadId, resourceId, title: 'Original' });
+        const source = await memory.updateWorkingMemoryByOwner({
+          threadId,
+          resourceId,
+          workingMemory: '{"name":"Ada"}',
+          expectedRevision: 0,
+          protectPaths: ['/name'],
+        });
+        const staleThread = await memory.getThreadById({ threadId });
+        if (!staleThread) throw new Error('Expected source thread.');
+        const destination = await memoryStore.applyWorkingMemoryUpdate({
+          scope: 'resource',
+          resourceId,
+          value: '{"status":"original"}',
+          expectedRevision: 0,
+          source: 'owner',
+          protectPaths: ['/status'],
+        });
+
+        const originalTransition = memoryStore.transitionThreadToResourceWorkingMemory.bind(memoryStore);
+        let markTransitionStarted!: () => void;
+        let releaseTransition!: () => void;
+        const transitionStarted = new Promise<void>(resolve => {
+          markTransitionStarted = resolve;
+        });
+        const transitionBlocked = new Promise<void>(resolve => {
+          releaseTransition = resolve;
+        });
+        vi.spyOn(memoryStore, 'transitionThreadToResourceWorkingMemory').mockImplementation(async args => {
+          markTransitionStarted();
+          await transitionBlocked;
+          return originalTransition(args);
+        });
+
+        const resourceConfig: MemoryConfig = { workingMemory: { enabled: true, scope: 'resource' } };
+        const transition =
+          mutation === 'save'
+            ? memory.saveThread({
+                thread: {
+                  ...staleThread,
+                  title: 'Stale save',
+                  metadata: { workingMemory: source.value },
+                  updatedAt: new Date(),
+                },
+                memoryConfig: resourceConfig,
+              })
+            : memory.updateThread({
+                id: threadId,
+                title: 'Stale update',
+                metadata: { workingMemory: source.value },
+                memoryConfig: resourceConfig,
+              });
+        await transitionStarted;
+
+        await memoryStore.deleteResource({ resourceId });
+        const replacement = await memoryStore.applyWorkingMemoryUpdate({
+          scope: 'resource',
+          resourceId,
+          value: '{"status":"replacement"}',
+          expectedRevision: 0,
+          source: 'owner',
+          protectPaths: ['/status'],
+        });
+        expect(replacement.revision).toBe(destination.revision);
+        releaseTransition();
+
+        await expect(transition).rejects.toMatchObject({ name: 'WorkingMemoryRevisionConflictError' });
+        await expect(memoryStore.getThreadById({ threadId })).resolves.toMatchObject({ title: 'Original' });
+        await expect(memoryStore.getWorkingMemorySnapshot({ scope: 'thread', resourceId, threadId })).resolves.toEqual(
+          source,
+        );
+        await expect(memoryStore.getWorkingMemorySnapshot({ scope: 'resource', resourceId })).resolves.toEqual(
+          replacement,
+        );
+      },
+    );
+
+    it.each(['save', 'update'] as const)(
       'requires an explicit migration value before a resource-scoped %s can hide governed thread Working Memory',
       async mutation => {
         const storage = new InMemoryStore();
@@ -1951,8 +2141,9 @@ describe('Memory', () => {
     });
 
     it('preserves owner-protected paths when cloning thread-scoped working memory', async () => {
+      const storage = new InMemoryStore();
       const wmMemory = new Memory({
-        storage: new InMemoryStore(),
+        storage,
         options: { workingMemory: { enabled: true, scope: 'thread' } },
       });
       const sourceThread = await wmMemory.createThread({
@@ -1988,6 +2179,18 @@ describe('Memory', () => {
       expect(cloned.protectedPaths).toEqual(['/name']);
       expect(cloned.provenance['/name']).toMatchObject({ source: 'owner' });
       expect(cloned.provenance['/focus']).toMatchObject({ source: 'observer' });
+      const memoryStore = (await storage.getStore('memory'))!;
+      const sourcePreparation = await memoryStore.prepareThreadToResourceWorkingMemoryTransition({
+        threadId: sourceThread.id,
+        resourceId,
+      });
+      const clonePreparation = await memoryStore.prepareThreadToResourceWorkingMemoryTransition({
+        threadId: clonedThread.id,
+        resourceId,
+      });
+      expect(clonePreparation.sourceThread.workingMemoryIncarnation).not.toBe(
+        sourcePreparation.sourceThread.workingMemoryIncarnation,
+      );
     });
 
     it('preserves an owner-protected empty root value when cloning thread-scoped working memory', async () => {

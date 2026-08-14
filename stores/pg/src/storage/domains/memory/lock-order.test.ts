@@ -818,6 +818,10 @@ describe('MemoryPG lock ordering', () => {
       deletePromise = rollbackMemory.deleteThread({ threadId });
       await waitForLockWait(rollbackApplicationName, '%DELETE FROM%mastra_messages%', 'the message-table lock');
 
+      const preparation = await competitorMemory.prepareThreadToResourceWorkingMemoryTransition({
+        threadId,
+        resourceId,
+      });
       transitionPromise = competitorMemory.transitionThreadToResourceWorkingMemory({
         mutation: {
           type: 'save',
@@ -831,8 +835,7 @@ describe('MemoryPG lock ordering', () => {
           },
         },
         value: 'transition-created resource memory',
-        expectedRevision: 0,
-        expectedSourceThreadRevision: 0,
+        preparation,
       });
       await waitForAdvisoryLockWait(competitorApplicationName);
       await blocker.release();

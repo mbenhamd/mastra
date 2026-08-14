@@ -16,6 +16,7 @@ import {
   storageMessageMatchesMetadataFilter,
   validateStorageMetadataFilter,
   applyWorkingMemorySnapshotUpdate,
+  assertWorkingMemoryIncarnation,
   assertGovernedThreadResourceUnchanged,
   assertThreadWorkingMemoryRemoved,
   assertThreadWorkingMemoryIsUngoverned,
@@ -24,7 +25,9 @@ import {
   hasWorkingMemorySnapshotControls,
   mergeThreadMetadataForWorkingMemoryTransition,
   preserveWorkingMemorySnapshotControls,
+  readWorkingMemoryIncarnation,
   readWorkingMemorySnapshot,
+  reincarnateWorkingMemorySnapshotMetadata,
   retractObserverWorkingMemorySnapshot,
   stripThreadWorkingMemoryMetadata,
   writeWorkingMemorySnapshotMetadata,
@@ -155,6 +158,7 @@ import type {
   ApplyWorkingMemoryUpdateInput,
   WorkingMemorySnapshot,
   WorkingMemorySnapshotInput,
+  StorageThreadToResourceWorkingMemoryTransitionPreparation,
   StorageTransitionThreadToResourceWorkingMemoryInput,
   StorageTransitionThreadToResourceWorkingMemoryOutput,
   StorageMutateThreadWithWorkingMemoryInput,
@@ -880,9 +884,13 @@ export class MemoryPG extends MemoryStorage {
             proposedResourceId: thread.resourceId,
           });
         }
-        const metadata = currentMetadata
+        const proposedMetadata = currentMetadata
           ? replaceThreadMetadataPreservingWorkingMemory(currentMetadata, thread.metadata)
           : (thread.metadata ?? {});
+        const metadata =
+          currentMetadata && hasWorkingMemorySnapshotControls(currentMetadata)
+            ? proposedMetadata
+            : (reincarnateWorkingMemorySnapshotMetadata(proposedMetadata) ?? {});
         const row = await t.one<StorageThreadType & { createdAtZ: Date | string; updatedAtZ: Date | string }>(
           `INSERT INTO ${tableName} (
             id, "resourceId", title, metadata, "createdAt", "createdAtZ", "updatedAt", "updatedAtZ"
@@ -959,10 +967,13 @@ export class MemoryPG extends MemoryStorage {
           });
         }
         const currentMetadata = parseMetadata(existingThread.metadata);
-        const mergedMetadata =
+        const proposedMetadata =
           metadata === undefined
             ? currentMetadata
             : mergeThreadMetadataPreservingWorkingMemory(currentMetadata, metadata);
+        const mergedMetadata = hasWorkingMemorySnapshotControls(currentMetadata)
+          ? proposedMetadata
+          : (reincarnateWorkingMemorySnapshotMetadata(proposedMetadata) ?? {});
         const nowStr = toUtcISOString(new Date());
         const thread = await t.one<StorageThreadType & { createdAtZ: Date; updatedAtZ: Date }>(
           `UPDATE ${threadTableName}
@@ -2360,7 +2371,7 @@ export class MemoryPG extends MemoryStorage {
       const governed = currentMetadata && hasWorkingMemorySnapshotControls(currentMetadata);
       const metadata = governed
         ? preserveWorkingMemorySnapshotControls(currentMetadata, resource.metadata ?? {})
-        : (resource.metadata ?? {});
+        : (reincarnateWorkingMemorySnapshotMetadata(resource.metadata) ?? {});
       const row = await t.one<StorageResourceType & { createdAtZ: Date | string; updatedAtZ: Date | string }>(
         `INSERT INTO ${tableName}
              (id, "workingMemory", metadata, "createdAt", "createdAtZ", "updatedAt", "updatedAtZ")
@@ -2437,7 +2448,7 @@ export class MemoryPG extends MemoryStorage {
           [
             resourceId,
             workingMemory,
-            JSON.stringify(metadata ?? {}),
+            JSON.stringify(reincarnateWorkingMemorySnapshotMetadata(metadata) ?? {}),
             now.toISOString(),
             now.toISOString(),
             now.toISOString(),
@@ -2454,10 +2465,13 @@ export class MemoryPG extends MemoryStorage {
       }
 
       const governed = hasWorkingMemorySnapshotControls(currentMetadata);
-      const mergedMetadata = preserveWorkingMemorySnapshotControls(currentMetadata, {
+      const proposedMetadata = preserveWorkingMemorySnapshotControls(currentMetadata, {
         ...currentMetadata,
         ...metadata,
       });
+      const mergedMetadata = governed
+        ? proposedMetadata
+        : (reincarnateWorkingMemorySnapshotMetadata(proposedMetadata) ?? {});
       const row = await t.one<StorageResourceType & { createdAtZ: Date | string; updatedAtZ: Date | string }>(
         `UPDATE ${tableName}
            SET "workingMemory" = $1, metadata = $2, "updatedAt" = $3, "updatedAtZ" = $4
@@ -2924,6 +2938,64 @@ export class MemoryPG extends MemoryStorage {
     }
   }
 
+  async prepareThreadToResourceWorkingMemoryTransition({
+    threadId,
+    resourceId,
+  }: {
+    threadId: string;
+    resourceId: string;
+  }): Promise<StorageThreadToResourceWorkingMemoryTransitionPreparation> {
+    const threadTableName = getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) });
+    const resourceTableName = getTableName({ indexName: TABLE_RESOURCES, schemaName: getSchemaName(this.#schema) });
+    try {
+      const row = await this.#db.client.one<{
+        sourceResourceId: string | null;
+        sourceMetadata: unknown;
+        destinationWorkingMemory: string | null;
+        destinationMetadata: unknown;
+      }>(
+        `SELECT
+           source."resourceId" AS "sourceResourceId",
+           source.metadata AS "sourceMetadata",
+           destination."workingMemory" AS "destinationWorkingMemory",
+           destination.metadata AS "destinationMetadata"
+         FROM (VALUES (1)) AS seed(marker)
+         LEFT JOIN ${threadTableName} AS source ON source.id = $1
+         LEFT JOIN ${resourceTableName} AS destination ON destination.id = $2`,
+        [threadId, resourceId],
+      );
+      if (row.sourceResourceId !== null && row.sourceResourceId !== resourceId) {
+        throw new WorkingMemoryValidationError('Working-memory thread does not belong to the requested resource.');
+      }
+      const sourceMetadata = parseMetadata(row.sourceMetadata);
+      const sourceValue = typeof sourceMetadata.workingMemory === 'string' ? sourceMetadata.workingMemory : null;
+      const destinationMetadata = parseMetadata(row.destinationMetadata);
+      return {
+        threadId,
+        resourceId,
+        sourceThread: {
+          snapshot: readWorkingMemorySnapshot(sourceValue, sourceMetadata),
+          workingMemoryIncarnation: readWorkingMemoryIncarnation(sourceMetadata),
+        },
+        destinationResource: {
+          snapshot: readWorkingMemorySnapshot(row.destinationWorkingMemory, destinationMetadata),
+          workingMemoryIncarnation: readWorkingMemoryIncarnation(destinationMetadata),
+        },
+      };
+    } catch (error) {
+      if (error instanceof MastraError || error instanceof WorkingMemoryValidationError) throw error;
+      throw new MastraError(
+        {
+          id: createStorageErrorId('PG', 'PREPARE_THREAD_TO_RESOURCE_WORKING_MEMORY_TRANSITION', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: { threadId, resourceId },
+        },
+        error,
+      );
+    }
+  }
+
   async transitionThreadToResourceWorkingMemory(
     input: StorageTransitionThreadToResourceWorkingMemoryInput,
   ): Promise<StorageTransitionThreadToResourceWorkingMemoryOutput> {
@@ -2931,6 +3003,9 @@ export class MemoryPG extends MemoryStorage {
     const resourceId = input.mutation.type === 'save' ? input.mutation.thread.resourceId : input.mutation.resourceId;
     const proposedMetadata = input.mutation.type === 'save' ? input.mutation.thread.metadata : input.mutation.metadata;
     assertThreadWorkingMemoryRemoved(proposedMetadata);
+    if (input.preparation.threadId !== threadId || input.preparation.resourceId !== resourceId) {
+      throw new WorkingMemoryValidationError('Working-memory transition preparation does not match its coordinates.');
+    }
     const threadTableName = getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) });
     const resourceTableName = getTableName({ indexName: TABLE_RESOURCES, schemaName: getSchemaName(this.#schema) });
 
@@ -2962,7 +3037,11 @@ export class MemoryPG extends MemoryStorage {
         const currentThreadValue =
           typeof currentThreadMetadata.workingMemory === 'string' ? currentThreadMetadata.workingMemory : null;
         const currentThreadSnapshot = readWorkingMemorySnapshot(currentThreadValue, currentThreadMetadata);
-        assertWorkingMemorySnapshotRevision(currentThreadSnapshot, input.expectedSourceThreadRevision);
+        assertWorkingMemoryIncarnation(
+          readWorkingMemoryIncarnation(currentThreadMetadata),
+          input.preparation.sourceThread.workingMemoryIncarnation,
+        );
+        assertWorkingMemorySnapshotRevision(currentThreadSnapshot, input.preparation.sourceThread.snapshot.revision);
 
         const currentResource = await t.oneOrNone<{
           workingMemory: string | null;
@@ -2976,13 +3055,18 @@ export class MemoryPG extends MemoryStorage {
         );
         const currentMetadata = parseMetadata(currentResource?.metadata);
         const current = readWorkingMemorySnapshot(currentResource?.workingMemory, currentMetadata);
+        assertWorkingMemoryIncarnation(
+          readWorkingMemoryIncarnation(currentMetadata),
+          input.preparation.destinationResource.workingMemoryIncarnation,
+        );
+        assertWorkingMemorySnapshotRevision(current, input.preparation.destinationResource.snapshot.revision);
         const now = new Date();
         const nowString = now.toISOString();
         const next = applyWorkingMemorySnapshotUpdate(
           current,
           {
             value: input.value,
-            expectedRevision: input.expectedRevision,
+            expectedRevision: input.preparation.destinationResource.snapshot.revision,
             source: 'observer',
             ...(input.maxDataBytes === undefined ? {} : { maxDataBytes: input.maxDataBytes }),
           },
@@ -3237,14 +3321,15 @@ export class MemoryPG extends MemoryStorage {
         };
 
         // Create the new thread
+        const proposedMetadata = {
+          ...metadata,
+          clone: cloneMetadata,
+        };
         const newThread: StorageThreadType = {
           id: newThreadId,
           resourceId: resourceId || sourceResourceId,
           title: title || (sourceThread.title ? `Clone of ${sourceThread.title}` : ''),
-          metadata: {
-            ...metadata,
-            clone: cloneMetadata,
-          },
+          metadata: reincarnateWorkingMemorySnapshotMetadata(proposedMetadata),
           createdAt: now,
           updatedAt: now,
         };

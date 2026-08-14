@@ -9,6 +9,7 @@ const MAX_POINTER_LENGTH = 1024;
 // protected-path marker, so even a tiny value limit cannot erase owner controls.
 const MAX_PROVENANCE_ENTRIES = MAX_PROTECTED_PATHS + 1;
 const MAX_PROVENANCE_TIMESTAMP_LENGTH = 64;
+const WORKING_MEMORY_INCARNATION_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const FORBIDDEN_POINTER_SEGMENTS = new Set(['__proto__', 'prototype', 'constructor']);
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
@@ -391,6 +392,54 @@ export function hasWorkingMemorySnapshotControls(metadata: Record<string, unknow
   return mastra !== undefined && Object.prototype.hasOwnProperty.call(mastra, CONTROL_METADATA_KEY);
 }
 
+function assertWorkingMemoryIncarnationValue(value: unknown): asserts value is string {
+  if (typeof value !== 'string' || !WORKING_MEMORY_INCARNATION_PATTERN.test(value)) {
+    throw new WorkingMemoryValidationError('Stored working-memory incarnation is invalid.');
+  }
+}
+
+/** @internal Read the opaque identity of the governed control lifetime. */
+export function readWorkingMemoryIncarnation(metadata: Record<string, unknown> | undefined): string | null {
+  if (!hasWorkingMemorySnapshotControls(metadata)) return null;
+  const mastra = metadata!.mastra as Record<string, unknown>;
+  const control = mastra[CONTROL_METADATA_KEY];
+  if (!isRecord(control)) {
+    throw new WorkingMemoryValidationError('Stored working-memory controls are invalid.');
+  }
+  assertWorkingMemoryIncarnationValue(control.incarnation);
+  return control.incarnation;
+}
+
+/** @internal Reject a stale or malformed governed-control incarnation. */
+export function assertWorkingMemoryIncarnation(
+  currentIncarnation: string | null,
+  expectedIncarnation: string | null,
+): void {
+  if (currentIncarnation !== null) assertWorkingMemoryIncarnationValue(currentIncarnation);
+  if (expectedIncarnation !== null) assertWorkingMemoryIncarnationValue(expectedIncarnation);
+  if (currentIncarnation !== expectedIncarnation) throw new WorkingMemoryRevisionConflictError();
+}
+
+/**
+ * @internal Issue a fresh identity whenever caller-supplied governed metadata
+ * starts a new control lifetime at a coordinate that currently has no controls.
+ */
+export function reincarnateWorkingMemorySnapshotMetadata(
+  metadata: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (!hasWorkingMemorySnapshotControls(metadata)) return metadata;
+  const mastra = metadata!.mastra as Record<string, unknown>;
+  const control = mastra[CONTROL_METADATA_KEY];
+  if (!isRecord(control)) return metadata;
+  return {
+    ...metadata,
+    mastra: {
+      ...mastra,
+      [CONTROL_METADATA_KEY]: { ...control, incarnation: crypto.randomUUID() },
+    },
+  };
+}
+
 /** Prevent generic whole-row saves from moving a governed snapshot to a different owner. */
 export function assertGovernedThreadResourceUnchanged({
   currentResourceId,
@@ -655,6 +704,14 @@ export function writeWorkingMemorySnapshotMetadata(
 ): Record<string, unknown> {
   const current = metadata ?? {};
   const mastra = isRecord(current.mastra) ? current.mastra : {};
+  const currentControl = mastra[CONTROL_METADATA_KEY];
+  let incarnation: string;
+  if (isRecord(currentControl) && currentControl.incarnation !== undefined) {
+    assertWorkingMemoryIncarnationValue(currentControl.incarnation);
+    incarnation = currentControl.incarnation;
+  } else {
+    incarnation = crypto.randomUUID();
+  }
   // Keep this public serialization helper fail-closed even when a caller did
   // not obtain its snapshot from applyWorkingMemorySnapshotUpdate.
   const validated = readWorkingMemorySnapshot(snapshot.value, {
@@ -671,6 +728,7 @@ export function writeWorkingMemorySnapshotMetadata(
     mastra: {
       ...mastra,
       [CONTROL_METADATA_KEY]: {
+        incarnation,
         revision: validated.revision,
         protectedPaths: [...validated.protectedPaths],
         provenance: Object.fromEntries(

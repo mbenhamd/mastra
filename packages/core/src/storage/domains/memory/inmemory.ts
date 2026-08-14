@@ -36,6 +36,7 @@ import type {
   ApplyWorkingMemoryUpdateInput,
   WorkingMemorySnapshot,
   WorkingMemorySnapshotInput,
+  StorageThreadToResourceWorkingMemoryTransitionPreparation,
   StorageTransitionThreadToResourceWorkingMemoryInput,
   StorageTransitionThreadToResourceWorkingMemoryOutput,
   StorageMutateThreadWithWorkingMemoryInput,
@@ -52,6 +53,7 @@ import type { InMemoryDB } from '../inmemory-db';
 import { MemoryStorage } from './base';
 import {
   applyWorkingMemorySnapshotUpdate,
+  assertWorkingMemoryIncarnation,
   assertGovernedThreadResourceUnchanged,
   assertThreadWorkingMemoryRemoved,
   assertThreadWorkingMemoryIsUngoverned,
@@ -60,7 +62,9 @@ import {
   hasWorkingMemorySnapshotControls,
   mergeThreadMetadataForWorkingMemoryTransition,
   preserveWorkingMemorySnapshotControls,
+  readWorkingMemoryIncarnation,
   readWorkingMemorySnapshot,
+  reincarnateWorkingMemorySnapshotMetadata,
   retractObserverWorkingMemorySnapshot,
   stripThreadWorkingMemoryMetadata,
   writeWorkingMemorySnapshotMetadata,
@@ -355,7 +359,10 @@ export class InMemoryMemory extends MemoryStorage {
         proposedResourceId: thread.resourceId,
       });
     }
-    const metadata = replaceThreadMetadataPreservingWorkingMemory(current?.metadata, thread.metadata);
+    const proposedMetadata = replaceThreadMetadataPreservingWorkingMemory(current?.metadata, thread.metadata);
+    const metadata = hasWorkingMemorySnapshotControls(current?.metadata)
+      ? proposedMetadata
+      : reincarnateWorkingMemorySnapshotMetadata(proposedMetadata);
     const stored = cloneThreadBoundary({ ...thread, metadata }, true);
     this.db.threads.set(thread.id, stored);
     this.rotateThreadGeneration(thread.id);
@@ -377,13 +384,16 @@ export class InMemoryMemory extends MemoryStorage {
       throw new Error(`Thread with id ${id} not found`);
     }
 
+    const mergedMetadata =
+      metadata === undefined ? thread.metadata : mergeThreadMetadataPreservingWorkingMemory(thread.metadata, metadata);
+    const nextMetadata = hasWorkingMemorySnapshotControls(thread.metadata)
+      ? mergedMetadata
+      : reincarnateWorkingMemorySnapshotMetadata(mergedMetadata);
     const updated = cloneThreadBoundary(
       {
         ...thread,
         ...(title === undefined ? {} : { title }),
-        ...(metadata === undefined
-          ? {}
-          : { metadata: mergeThreadMetadataPreservingWorkingMemory(thread.metadata, metadata) }),
+        ...(metadata === undefined ? {} : { metadata: nextMetadata }),
         updatedAt: new Date(),
       },
       true,
@@ -1029,7 +1039,10 @@ export class InMemoryMemory extends MemoryStorage {
             workingMemory: current.workingMemory,
             metadata: preserveWorkingMemorySnapshotControls(current.metadata, resource.metadata ?? {}),
           }
-        : resource,
+        : {
+            ...resource,
+            metadata: reincarnateWorkingMemorySnapshotMetadata(resource.metadata),
+          },
       true,
     );
     this.db.resources.set(resource.id, stored);
@@ -1062,7 +1075,7 @@ export class InMemoryMemory extends MemoryStorage {
       resource = {
         id: resourceId,
         workingMemory,
-        metadata: metadata || {},
+        metadata: reincarnateWorkingMemorySnapshotMetadata(metadata) ?? {},
         createdAt: new Date(),
         updatedAt: new Date(),
       };
@@ -1077,7 +1090,9 @@ export class InMemoryMemory extends MemoryStorage {
           hasWorkingMemorySnapshotControls(resource.metadata) || workingMemory === undefined
             ? resource.workingMemory
             : workingMemory,
-        metadata: preserveWorkingMemorySnapshotControls(resource.metadata, mergedMetadata),
+        metadata: hasWorkingMemorySnapshotControls(resource.metadata)
+          ? preserveWorkingMemorySnapshotControls(resource.metadata, mergedMetadata)
+          : reincarnateWorkingMemorySnapshotMetadata(mergedMetadata),
         updatedAt: new Date(),
       };
     }
@@ -1159,6 +1174,33 @@ export class InMemoryMemory extends MemoryStorage {
     }
     const value = typeof thread.metadata?.workingMemory === 'string' ? thread.metadata.workingMemory : null;
     return readWorkingMemorySnapshot(value, thread.metadata);
+  }
+
+  async prepareThreadToResourceWorkingMemoryTransition({
+    threadId,
+    resourceId,
+  }: {
+    threadId: string;
+    resourceId: string;
+  }): Promise<StorageThreadToResourceWorkingMemoryTransitionPreparation> {
+    const thread = this.db.threads.get(threadId);
+    if (thread && thread.resourceId !== resourceId) {
+      throw new WorkingMemoryValidationError('Working-memory thread does not belong to the requested resource.');
+    }
+    const threadValue = typeof thread?.metadata?.workingMemory === 'string' ? thread.metadata.workingMemory : null;
+    const resource = this.db.resources.get(resourceId);
+    return {
+      threadId,
+      resourceId,
+      sourceThread: {
+        snapshot: readWorkingMemorySnapshot(threadValue, thread?.metadata),
+        workingMemoryIncarnation: readWorkingMemoryIncarnation(thread?.metadata),
+      },
+      destinationResource: {
+        snapshot: readWorkingMemorySnapshot(resource?.workingMemory, resource?.metadata),
+        workingMemoryIncarnation: readWorkingMemoryIncarnation(resource?.metadata),
+      },
+    };
   }
 
   async applyWorkingMemoryUpdate(input: ApplyWorkingMemoryUpdateInput): Promise<WorkingMemorySnapshot> {
@@ -1313,6 +1355,9 @@ export class InMemoryMemory extends MemoryStorage {
     return this.withMemoryStateRollback(true, () => {
       const threadId = input.mutation.type === 'save' ? input.mutation.thread.id : input.mutation.id;
       const resourceId = input.mutation.type === 'save' ? input.mutation.thread.resourceId : input.mutation.resourceId;
+      if (input.preparation.threadId !== threadId || input.preparation.resourceId !== resourceId) {
+        throw new WorkingMemoryValidationError('Working-memory transition preparation does not match its target.');
+      }
       const proposedMetadata =
         input.mutation.type === 'save' ? input.mutation.thread.metadata : input.mutation.metadata;
       assertThreadWorkingMemoryRemoved(proposedMetadata);
@@ -1327,16 +1372,24 @@ export class InMemoryMemory extends MemoryStorage {
       const currentThreadValue =
         typeof currentThread?.metadata?.workingMemory === 'string' ? currentThread.metadata.workingMemory : null;
       const currentThreadSnapshot = readWorkingMemorySnapshot(currentThreadValue, currentThread?.metadata);
-      assertWorkingMemorySnapshotRevision(currentThreadSnapshot, input.expectedSourceThreadRevision);
+      assertWorkingMemoryIncarnation(
+        readWorkingMemoryIncarnation(currentThread?.metadata),
+        input.preparation.sourceThread.workingMemoryIncarnation,
+      );
+      assertWorkingMemorySnapshotRevision(currentThreadSnapshot, input.preparation.sourceThread.snapshot.revision);
 
       const now = new Date();
       const currentResource = this.db.resources.get(resourceId);
       const current = readWorkingMemorySnapshot(currentResource?.workingMemory, currentResource?.metadata);
+      assertWorkingMemoryIncarnation(
+        readWorkingMemoryIncarnation(currentResource?.metadata),
+        input.preparation.destinationResource.workingMemoryIncarnation,
+      );
       const next = applyWorkingMemorySnapshotUpdate(
         current,
         {
           value: input.value,
-          expectedRevision: input.expectedRevision,
+          expectedRevision: input.preparation.destinationResource.snapshot.revision,
           source: 'observer',
           ...(input.maxDataBytes === undefined ? {} : { maxDataBytes: input.maxDataBytes }),
         },
@@ -1460,10 +1513,10 @@ export class InMemoryMemory extends MemoryStorage {
       id: newThreadId,
       resourceId: resourceId || sourceResourceId,
       title: title || (sourceThread.title ? `Clone of ${sourceThread.title}` : undefined),
-      metadata: {
+      metadata: reincarnateWorkingMemorySnapshotMetadata({
         ...metadata,
         clone: cloneMetadata,
-      },
+      }),
       createdAt: now,
       updatedAt: now,
     };

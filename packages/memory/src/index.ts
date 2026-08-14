@@ -852,23 +852,14 @@ export class Memory extends MastraMemory {
           return this.withWorkingMemoryMutex(`resource-${thread.resourceId}`, async () => {
             const memoryStore = await this.getMemoryStore();
             if (memoryStore.supportsRevisionedWorkingMemory) {
-              const existingThread = await memoryStore.getThreadById({ threadId: thread.id });
-              const sourceThread = existingThread
-                ? await memoryStore.getWorkingMemorySnapshot({
-                    scope: 'thread',
-                    resourceId: existingThread.resourceId,
-                    threadId: thread.id,
-                  })
-                : undefined;
-              const current = await memoryStore.getWorkingMemorySnapshot({
-                scope: 'resource',
+              const preparation = await memoryStore.prepareThreadToResourceWorkingMemoryTransition({
+                threadId: thread.id,
                 resourceId: thread.resourceId,
               });
               const transitioned = await memoryStore.transitionThreadToResourceWorkingMemory({
                 mutation: { type: 'save', thread: threadForStorage },
                 value: managedWorkingMemory.workingMemory,
-                expectedSourceThreadRevision: sourceThread?.revision ?? 0,
-                expectedRevision: current.revision,
+                preparation,
                 ...(config.workingMemory?.maxDataBytes === undefined
                   ? {}
                   : { maxDataBytes: config.workingMemory.maxDataBytes }),
@@ -1018,12 +1009,10 @@ export class Memory extends MastraMemory {
           if (managedWorkingMemory && resourceId) {
             return this.withWorkingMemoryMutex(`resource-${resourceId}`, async () => {
               if (memoryStore.supportsRevisionedWorkingMemory) {
-                const sourceThread = await memoryStore.getWorkingMemorySnapshot({
-                  scope: 'thread',
-                  resourceId,
+                const preparation = await memoryStore.prepareThreadToResourceWorkingMemoryTransition({
                   threadId: id,
+                  resourceId,
                 });
-                const current = await memoryStore.getWorkingMemorySnapshot({ scope: 'resource', resourceId });
                 const transitioned = await memoryStore.transitionThreadToResourceWorkingMemory({
                   mutation: {
                     type: 'update',
@@ -1035,8 +1024,7 @@ export class Memory extends MastraMemory {
                       : { metadata: this.stripManagedWorkingMemoryFromThreadMetadata(metadata) }),
                   },
                   value: managedWorkingMemory.workingMemory,
-                  expectedSourceThreadRevision: sourceThread.revision,
-                  expectedRevision: current.revision,
+                  preparation,
                   ...(config.workingMemory?.maxDataBytes === undefined
                     ? {}
                     : { maxDataBytes: config.workingMemory.maxDataBytes }),

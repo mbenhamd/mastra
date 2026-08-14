@@ -918,6 +918,21 @@ export type ApplyWorkingMemoryUpdateInput = WorkingMemorySnapshotInput & {
   observationalMemoryGuard?: ObservationalMemoryWriteGuard;
 };
 
+/** @internal One atomically observed governed Working Memory participant. */
+export type StorageWorkingMemoryTransitionParticipantReceipt = {
+  snapshot: WorkingMemorySnapshot;
+  /** Opaque identity of the governed control lifetime; null means no controls were observed. */
+  workingMemoryIncarnation: string | null;
+};
+
+/** @internal Coordinate-bound source and destination state for one scope transition. */
+export type StorageThreadToResourceWorkingMemoryTransitionPreparation = {
+  threadId: string;
+  resourceId: string;
+  sourceThread: StorageWorkingMemoryTransitionParticipantReceipt;
+  destinationResource: StorageWorkingMemoryTransitionParticipantReceipt;
+};
+
 /**
  * Atomically move a governed thread snapshot to resource scope.
  *
@@ -935,9 +950,8 @@ export type StorageTransitionThreadToResourceWorkingMemoryInput = {
         metadata?: Record<string, unknown>;
       };
   value: string;
-  /** Source thread revision captured before this transition was proposed. */
-  expectedSourceThreadRevision: number;
-  expectedRevision: number;
+  /** Source and destination state captured before this transition was proposed. */
+  preparation: StorageThreadToResourceWorkingMemoryTransitionPreparation;
   maxDataBytes?: number;
 };
 

@@ -33,6 +33,7 @@ import type {
   ApplyWorkingMemoryUpdateInput,
   WorkingMemorySnapshot,
   WorkingMemorySnapshotInput,
+  StorageThreadToResourceWorkingMemoryTransitionPreparation,
   StorageTransitionThreadToResourceWorkingMemoryInput,
   StorageTransitionThreadToResourceWorkingMemoryOutput,
   StorageMutateThreadWithWorkingMemoryInput,
@@ -316,11 +317,27 @@ export abstract class MemoryStorage extends StorageDomain {
   }
 
   /**
+   * Atomically capture the governed source and destination snapshots together
+   * with the opaque identity of each control lifetime.
+   *
+   * @internal Revision-capable adapters must implement this operation natively;
+   * separate public reads cannot provide one coherent preparation receipt.
+   */
+  async prepareThreadToResourceWorkingMemoryTransition(_args: {
+    threadId: string;
+    resourceId: string;
+  }): Promise<StorageThreadToResourceWorkingMemoryTransitionPreparation> {
+    throw new Error(
+      `Atomic thread-to-resource working-memory preparation is not implemented by this storage adapter (${this.constructor.name}).`,
+    );
+  }
+
+  /**
    * Atomically save or partially update a thread without governed Working
    * Memory fields while writing that value to the thread's canonical resource
    * snapshot. Update mutations must merge only their explicit fields into the
-   * row read under the adapter's lock. The source thread revision and target
-   * resource revision must both remain current until that atomic transition.
+   * row read under the adapter's lock. Both governed-control incarnations and
+   * revisions must remain current until that atomic transition.
    *
    * @internal Revision-capable adapters must implement this operation natively;
    * generic saveThread/updateThread remain unable to remove governance fields.
