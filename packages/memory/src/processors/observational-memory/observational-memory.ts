@@ -1089,20 +1089,36 @@ export class ObservationalMemory {
   }
 
   /**
-   * Resolve storage IDs for operations that may mutate observational memory.
+   * Resolve storage state for operations that may mutate observational memory.
    * Thread-scoped records are addressed by threadId, but storage adapters use
    * the owning resourceId to serialize mutations such as initialize and clear.
+   * An existing record owns that coordinate even if its thread no longer exists.
    */
-  private async resolveMutationStorageIds(
+  private async resolveMutationStorageState(
     threadId: string,
     resourceId?: string,
-  ): Promise<{ threadId: string | null; resourceId: string }> {
-    let resolvedResourceId = resourceId;
-    if (this.scope === 'thread' && resolvedResourceId === undefined) {
-      const thread = await this.storage.getThreadById({ threadId });
-      resolvedResourceId = thread?.resourceId;
+  ): Promise<{
+    ids: { threadId: string | null; resourceId: string };
+    existingRecord?: ObservationalMemoryRecord | null;
+  }> {
+    const lookupIds = this.getStorageIds(threadId, resourceId);
+    if (this.scope !== 'thread' || resourceId !== undefined) {
+      return { ids: lookupIds };
     }
-    return this.getStorageIds(threadId, resolvedResourceId);
+
+    const existingRecord = await this.storage.getObservationalMemory(lookupIds.threadId, lookupIds.resourceId);
+    if (existingRecord) {
+      return {
+        ids: { threadId: lookupIds.threadId, resourceId: existingRecord.resourceId },
+        existingRecord,
+      };
+    }
+
+    const thread = await this.storage.getThreadById({ threadId });
+    return {
+      ids: this.getStorageIds(threadId, thread?.resourceId),
+      existingRecord: null,
+    };
   }
 
   /**
@@ -1110,12 +1126,13 @@ export class ObservationalMemory {
    * Returns the existing record if one exists, otherwise initializes a new one.
    */
   async getOrCreateRecord(threadId: string, resourceId?: string): Promise<ObservationalMemoryRecord> {
-    const ids = await this.resolveMutationStorageIds(threadId, resourceId);
+    const lookupIds = this.getStorageIds(threadId, resourceId);
     // Storage adapters identify thread-scoped records by threadId alone and
     // resource-scoped records by resourceId alone. The single-flight key must
     // mirror that identity so optional resourceId differences cannot split a
     // thread-scoped initialization into separate operations.
-    const initializationKey = ids.threadId === null ? `resource:${ids.resourceId}` : `thread:${ids.threadId}`;
+    const initializationKey =
+      lookupIds.threadId === null ? `resource:${lookupIds.resourceId}` : `thread:${lookupIds.threadId}`;
     const pendingInitialization = this.recordInitializations.get(initializationKey);
     if (pendingInitialization) {
       return pendingInitialization;
@@ -1125,7 +1142,11 @@ export class ObservationalMemory {
     // registered before any adapter code runs. This prevents an already-started
     // read from returning a stale null after another caller has finished inserting.
     const initialization = Promise.resolve().then(async () => {
-      const record = await this.storage.getObservationalMemory(ids.threadId, ids.resourceId);
+      const { ids, existingRecord } = await this.resolveMutationStorageState(threadId, resourceId);
+      const record =
+        existingRecord === undefined
+          ? await this.storage.getObservationalMemory(ids.threadId, ids.resourceId)
+          : existingRecord;
       if (record) {
         return record;
       }
@@ -3869,7 +3890,7 @@ ${formattedMessages}
    * Clear all memory for a specific thread/resource
    */
   async clear(threadId: string, resourceId?: string): Promise<void> {
-    const ids = await this.resolveMutationStorageIds(threadId, resourceId);
+    const { ids } = await this.resolveMutationStorageState(threadId, resourceId);
     await this.storage.clearObservationalMemory(ids.threadId, ids.resourceId);
     // Clean up static maps to prevent memory leaks
     this.buffering.cleanupStaticMaps(ids.threadId ?? ids.resourceId, ids.resourceId);

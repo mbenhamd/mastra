@@ -8,11 +8,13 @@ import { RequestContext } from '@mastra/core/request-context';
 import { createTool } from '@mastra/core/tools';
 import { fastembed } from '@mastra/fastembed';
 import { Memory } from '@mastra/memory';
+import { ObservationalMemory } from '@mastra/memory/processors';
 import { PostgresStore, PgVector } from '@mastra/pg';
 import { afterAll, describe, it, expect, beforeAll, beforeEach, onTestFinished } from 'vitest';
 import { z } from 'zod';
 import { transformRequest } from '../transform-request';
 
+import { createOmOrderingMockObserverModel, createOmOrderingMockReflectorModel } from './om-libsql-ordering';
 import { getResuableTests } from './reusable-tests';
 
 // Helper function to extract text content from MastraDBMessage
@@ -187,6 +189,98 @@ export function getPgStorageTests(connectionString: string) {
       expect(storage.stores.scores).toBeDefined();
 
       await storage.close();
+    });
+  });
+
+  describe('ObservationalMemory clear coordination', () => {
+    it('waits on the persisted owner lock when clearing an orphaned thread record', async () => {
+      const clearApplicationName = `om-orphan-clear-${randomUUID()}`;
+      const clearConnectionUrl = new URL(connectionString);
+      clearConnectionUrl.searchParams.set('application_name', clearApplicationName);
+      const clearStorage = new PostgresStore({
+        id: clearApplicationName,
+        connectionString: clearConnectionUrl.toString(),
+        ...poolLimits,
+      });
+      const blockerStorage = new PostgresStore({
+        id: `om-orphan-clear-blocker-${randomUUID()}`,
+        ...config,
+        ...poolLimits,
+        disableInit: true,
+      });
+      allStorages.push(clearStorage, blockerStorage);
+      await clearStorage.init();
+      await blockerStorage.init();
+
+      const memoryStore = clearStorage.stores.memory;
+      if (!memoryStore) throw new Error('Memory store not found');
+      const om = new ObservationalMemory({
+        storage: memoryStore,
+        scope: 'thread',
+        observation: {
+          model: createOmOrderingMockObserverModel(),
+          messageTokens: 100,
+          bufferTokens: false,
+        },
+        reflection: {
+          model: createOmOrderingMockReflectorModel(),
+          observationTokens: 50_000,
+        },
+      });
+      const threadId = `om-orphan-thread-${randomUUID()}`;
+      const resourceId = `om-orphan-resource-${randomUUID()}`;
+      const now = new Date();
+      await memoryStore.saveThread({
+        thread: { id: threadId, resourceId, title: 'Orphaned OM thread', metadata: {}, createdAt: now, updatedAt: now },
+      });
+      await om.getOrCreateRecord(threadId);
+      await clearStorage.db.none('DELETE FROM "mastra_threads" WHERE id = $1', [threadId]);
+      await expect(memoryStore.getThreadById({ threadId })).resolves.toBeNull();
+
+      let releaseOwnerLock!: () => void;
+      const ownerLockRelease = new Promise<void>(resolve => {
+        releaseOwnerLock = resolve;
+      });
+      let ownerLockAcquired!: () => void;
+      const ownerLockReady = new Promise<void>(resolve => {
+        ownerLockAcquired = resolve;
+      });
+      const ownerLock = blockerStorage.db.tx(async tx => {
+        await tx.none('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [
+          `mastra:observational-memory:${resourceId}`,
+        ]);
+        ownerLockAcquired();
+        await ownerLockRelease;
+      });
+      await ownerLockReady;
+
+      const clearPromise = om.clear(threadId);
+      try {
+        const waitDeadline = Date.now() + 5_000;
+        while (true) {
+          const { waiting } = await blockerStorage.db.one<{ waiting: boolean }>(
+            `SELECT EXISTS (
+               SELECT 1
+               FROM pg_stat_activity
+               WHERE application_name = $1
+                 AND wait_event_type = 'Lock'
+                 AND query LIKE '%pg_advisory_xact_lock%'
+             ) AS waiting`,
+            [clearApplicationName],
+          );
+          if (waiting) break;
+          if (Date.now() >= waitDeadline) {
+            throw new Error('Clear did not wait on the persisted owner advisory lock.');
+          }
+          await new Promise(resolve => setTimeout(resolve, 20));
+        }
+      } finally {
+        releaseOwnerLock();
+        await ownerLock;
+      }
+
+      await clearPromise;
+      await expect(memoryStore.getObservationalMemory(threadId, resourceId)).resolves.toBeNull();
     });
   });
 

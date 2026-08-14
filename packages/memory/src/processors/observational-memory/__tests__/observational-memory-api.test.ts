@@ -26,8 +26,8 @@ import type { ObserveHooks } from '../types';
 // Helpers
 // =============================================================================
 
-function createInMemoryStorage(): InMemoryMemory {
-  return new InMemoryMemory({ db: new InMemoryDB() });
+function createInMemoryStorage(db = new InMemoryDB()): InMemoryMemory {
+  return new InMemoryMemory({ db });
 }
 
 function createTestMessage(
@@ -1926,8 +1926,6 @@ describe('clear()', () => {
         updatedAt: new Date(),
       },
     });
-    await om.getOrCreateRecord(threadId);
-
     const threadObsKey = `obs:thread:${threadId}`;
     const threadReflKey = `refl:thread:${threadId}`;
     const resourceObsKey = `obs:thread:${resourceId}`;
@@ -1957,6 +1955,34 @@ describe('clear()', () => {
 
     expect(getThreadSpy).not.toHaveBeenCalled();
     expect(clearSpy).toHaveBeenCalledExactlyOnceWith(threadId, resourceId);
+  });
+
+  it('uses the existing record owner when clearing after the thread row is gone', async () => {
+    const db = new InMemoryDB();
+    const orphanStorage = createInMemoryStorage(db);
+    const orphanOm = createOM(orphanStorage);
+    const resourceId = 'clear-orphan-resource';
+    await orphanStorage.saveThread({
+      thread: {
+        id: threadId,
+        resourceId,
+        title: 'Orphaned OM thread',
+        metadata: {},
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+    });
+    const record = await orphanOm.getOrCreateRecord(threadId);
+    db.threads.delete(threadId);
+    const getThreadSpy = vi.spyOn(orphanStorage, 'getThreadById');
+    const clearSpy = vi.spyOn(orphanStorage, 'clearObservationalMemory');
+
+    await orphanOm.clear(threadId);
+
+    expect(record.resourceId).toBe(resourceId);
+    expect(getThreadSpy).not.toHaveBeenCalled();
+    expect(clearSpy).toHaveBeenCalledExactlyOnceWith(threadId, resourceId);
+    await expect(orphanStorage.getObservationalMemory(threadId, resourceId)).resolves.toBeNull();
   });
 });
 
