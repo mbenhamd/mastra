@@ -51,9 +51,13 @@ class RecordingTxClient implements TxClient {
 
   async oneOrNone<T = any>(query: string, values?: QueryValues): Promise<T | null> {
     this.reads.push({ query, values });
-    if (query.includes('SELECT metadata FROM') && query.includes('mastra_threads') && query.includes('FOR UPDATE')) {
+    if (
+      query.includes('SELECT "resourceId", metadata FROM') &&
+      query.includes('mastra_threads') &&
+      query.includes('FOR UPDATE')
+    ) {
       const thread = this.threads.get(String(values?.[0]));
-      return thread ? ({ metadata: thread.metadata ?? {} } as T) : null;
+      return thread ? ({ resourceId: thread.resourceId, metadata: thread.metadata ?? {} } as T) : null;
     }
     if (
       query.includes('SELECT "workingMemory", metadata FROM') &&
@@ -344,7 +348,7 @@ describe('MemoryPG.saveThread', () => {
     });
 
     expect(client.txClient.reads).toHaveLength(1);
-    expect(client.txClient.reads[0]!.query).toContain('SELECT metadata FROM');
+    expect(client.txClient.reads[0]!.query).toContain('SELECT "resourceId", metadata FROM');
     expect(client.txClient.reads[0]!.query).toContain('FOR UPDATE');
     expect(client.txClient.queries).toHaveLength(1);
     expect(client.txClient.queries[0]!.values).toEqual([
