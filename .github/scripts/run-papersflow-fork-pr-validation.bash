@@ -2136,13 +2136,9 @@ run_validator_self_tests() {
     printf '%s\n' '{}' > packages/cli/package.json
     printf '%s\n' '{}' > packages/core/package.json
     printf '%s\n' 'export default {};' > packages/core/vitest.config.ts
-    printf '%s\n' "export const supervisorFixture = 'base';" \
-      > packages/core/src/agent/supervisor-fixture.ts
     printf '%s\n' \
       "import { openai } from '@ai-sdk/openai-v5';" \
       "import { describe, expect, it } from 'vitest';" \
-      "import { supervisorFixture } from '../supervisor-fixture';" \
-      'void supervisorFixture;' \
       "describe('Supervisor Pattern Integration Tests', () => {" \
       "  it('supervisor integration', () => expect(true).toBe(true));" \
       '});' \
@@ -5189,8 +5185,6 @@ NODE
     printf '%s\n' \
       "import { openai } from '@ai-sdk/openai-v5';" \
       "import { describe, expect, it } from 'vitest';" \
-      "import { supervisorFixture } from '../supervisor-fixture';" \
-      'void supervisorFixture;' \
       "describe('Supervisor Pattern Integration Tests', () => {" \
       "  it('supervisor integration head', () => expect(true).toBe(true));" \
       '});' \
@@ -5271,30 +5265,9 @@ NODE
   head_sha="$(
     cd "$fixture_repo"
     git reset -q --hard "$base_sha"
-    printf '%s\n' "export const supervisorFixture = 'head';" \
-      > packages/core/src/agent/supervisor-fixture.ts
-    git add packages/core/src/agent/supervisor-fixture.ts
-    git commit -q -m 'change an imported supervisor dependency'
-    git rev-parse HEAD
-  )"
-  : > "$command_log"
-  output="$test_root/core-supervisor-dependency-change-success.log"
-  run_fixture "$head_sha" "$output"
-  assert_contains \
-    'Running changed test file in full: packages/core/src/agent/__tests__/supervisor-integration.test.ts' \
-    "$output"
-  assert_contains \
-    'src/agent/__tests__/supervisor-integration.test.ts' \
-    "$command_log"
-
-  head_sha="$(
-    cd "$fixture_repo"
-    git reset -q --hard "$base_sha"
     printf '%s\n' \
       "import { openai } from '@ai-sdk/openai-v5';" \
       "import { describe, expect, it } from 'vitest';" \
-      "import { supervisorFixture } from '../supervisor-fixture';" \
-      'void supervisorFixture;' \
       "describe('Supervisor Pattern Integration Tests', () => {" \
       "  it('supervisor integration head', () => expect(true).toBe(true));" \
       '});' \
@@ -8603,15 +8576,15 @@ NODE
 }
 
 supervisor_provider_gate_verified=false
-if git_regular_file_at_head 'packages/core/src/agent/__tests__/supervisor-integration.test.ts'; then
-  if grep -Fxq 'packages/core/src/agent/__tests__/supervisor-integration.test.ts' "$changed_files" &&
+if grep -Fxq 'packages/core/src/agent/__tests__/supervisor-integration.test.ts' "$changed_files"; then
+  if git_regular_file_at_head 'packages/core/src/agent/__tests__/supervisor-integration.test.ts' &&
     ! core_supervisor_test_preserves_provider_gate; then
     echo 'The exact supervisor suite changed its frozen real-provider safety boundary.' >&2
     exit 1
   fi
-  # An unchanged suite inherits the exact reviewed provider boundary from the
-  # merge base, including when a changed dependency selects it for re-running.
-  supervisor_provider_gate_verified=true
+  if git_regular_file_at_head 'packages/core/src/agent/__tests__/supervisor-integration.test.ts'; then
+    supervisor_provider_gate_verified=true
+  fi
 fi
 
 tool_approval_replay_harness_verified=false
