@@ -173,6 +173,55 @@ describe('InMemoryMemory updateThread partial updates', () => {
 });
 
 describe('InMemoryMemory thread storage boundaries', () => {
+  it('isolates nested clone metadata across clone ingress, clone results, and reads', async () => {
+    class RuntimeHandle {
+      readonly id = 'live-runtime';
+    }
+
+    const db = new InMemoryDB();
+    const memory = new InMemoryMemory({ db });
+    const createdAt = new Date('2026-01-01T00:00:00.000Z');
+    const runtimeHandle = new RuntimeHandle();
+    const cloneMetadata = {
+      cloneOptions: {
+        labels: ['persisted'],
+        runtimeHandle,
+      },
+    };
+    await memory.saveThread({
+      thread: {
+        id: 'metadata-source',
+        resourceId: 'metadata-resource',
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+    const clone = await memory.cloneThread({
+      sourceThreadId: 'metadata-source',
+      newThreadId: 'metadata-clone',
+      metadata: cloneMetadata,
+    });
+
+    cloneMetadata.cloneOptions.labels.push('caller-input-mutation');
+    const returnedCloneOptions = clone.thread.metadata?.cloneOptions as {
+      labels: string[];
+      runtimeHandle: RuntimeHandle;
+    };
+    expect(returnedCloneOptions.labels).toEqual(['persisted']);
+    expect(returnedCloneOptions.runtimeHandle).toBe(runtimeHandle);
+
+    returnedCloneOptions.labels.push('clone-result-mutation');
+    const fetched = await memory.getThreadById({ threadId: 'metadata-clone' });
+    if (!fetched) throw new Error('Expected cloned thread.');
+    const fetchedCloneOptions = fetched.metadata?.cloneOptions as { labels: string[] };
+    expect(fetchedCloneOptions.labels).toEqual(['persisted']);
+
+    fetchedCloneOptions.labels.push('getter-mutation');
+    await expect(memory.getThreadById({ threadId: 'metadata-clone' })).resolves.toMatchObject({
+      metadata: { cloneOptions: { labels: ['persisted'] } },
+    });
+  });
+
   it('keeps cloned governed metadata separate from caller and persisted objects', async () => {
     const db = new InMemoryDB();
     const memory = new InMemoryMemory({ db });

@@ -75,7 +75,7 @@ function freezeNested(value: unknown): unknown {
   return Object.freeze(value);
 }
 
-function cloneMetadataBoundary(
+function cloneResourceMetadataBoundary(
   metadata: Record<string, unknown> | undefined,
   freezeWorkingMemoryControl = false,
 ): Record<string, unknown> | undefined {
@@ -91,10 +91,26 @@ function cloneMetadataBoundary(
   return clone;
 }
 
+function cloneThreadMetadataBoundary(
+  metadata: Record<string, unknown> | undefined,
+  freezeWorkingMemoryControl = false,
+): Record<string, unknown> | undefined {
+  if (metadata === undefined) return undefined;
+  const clone = cloneMemoryBoundaryValue(metadata);
+  if (!isRecord(metadata.mastra)) return clone;
+  const mastra = cloneMemoryBoundaryValue({ ...metadata.mastra });
+  if (Object.prototype.hasOwnProperty.call(metadata.mastra, 'workingMemory')) {
+    const control = structuredClone(metadata.mastra.workingMemory);
+    mastra.workingMemory = freezeWorkingMemoryControl ? freezeNested(control) : control;
+  }
+  clone.mastra = mastra;
+  return clone;
+}
+
 function cloneThreadBoundary(thread: StorageThreadType, freezeWorkingMemoryControl = true): StorageThreadType {
   return {
     ...thread,
-    metadata: cloneMetadataBoundary(thread.metadata, freezeWorkingMemoryControl),
+    metadata: cloneThreadMetadataBoundary(thread.metadata, freezeWorkingMemoryControl),
     createdAt: new Date(thread.createdAt),
     updatedAt: new Date(thread.updatedAt),
   };
@@ -103,7 +119,7 @@ function cloneThreadBoundary(thread: StorageThreadType, freezeWorkingMemoryContr
 function cloneResourceBoundary(resource: StorageResourceType, freezeWorkingMemoryControl = true): StorageResourceType {
   return {
     ...resource,
-    metadata: cloneMetadataBoundary(resource.metadata, freezeWorkingMemoryControl),
+    metadata: cloneResourceMetadataBoundary(resource.metadata, freezeWorkingMemoryControl),
     createdAt: new Date(resource.createdAt),
     updatedAt: new Date(resource.updatedAt),
   };
@@ -125,7 +141,7 @@ function cloneMemoryBoundaryValue<T>(value: T, seen = new WeakMap<object, unknow
     for (const nested of value) clone.push(cloneMemoryBoundaryValue(nested, seen));
     return clone as T;
   }
-  // OM config containers are JSON-like, but can hold live model instances and callbacks in memory.
+  // In-memory boundary containers are JSON-like, but can hold live model instances and callbacks.
   // Keep those opaque runtime values usable while isolating every mutable plain data container around them.
   if (!isPlainBoundaryObject(value)) return value;
 

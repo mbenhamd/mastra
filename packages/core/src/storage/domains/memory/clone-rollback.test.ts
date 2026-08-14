@@ -153,17 +153,21 @@ describe('InMemoryMemory conditional clone rollback', () => {
     await expect(memory.getObservationalMemoryHistory(null, 'target-resource')).resolves.toEqual([priorRecord]);
   });
 
-  it('preserves a clone that was modified after its rollback receipt was issued', async () => {
+  it('preserves a clone whose metadata was changed through the storage API after its rollback receipt was issued', async () => {
     const memory = await createMemory();
     const clone = await seedClone(memory, 'modified-clone');
-    await memory.updateThread({ id: clone.thread.id, title: 'Concurrent title' });
+    const updated = await memory.updateThread({
+      id: clone.thread.id,
+      metadata: { concurrent: { writer: 'storage-api' } },
+    });
+    (updated.metadata?.concurrent as { writer: string }).writer = 'returned-alias';
 
     await expect(memory.rollbackThreadClone({ thread: clone.rollbackReceipt })).resolves.toEqual({
       status: 'conflict',
       reason: 'thread',
     });
     await expect(memory.getThreadById({ threadId: clone.thread.id })).resolves.toMatchObject({
-      title: 'Concurrent title',
+      metadata: { concurrent: { writer: 'storage-api' } },
     });
   });
 
