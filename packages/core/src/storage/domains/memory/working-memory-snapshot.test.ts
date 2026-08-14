@@ -664,6 +664,29 @@ describe('InMemoryMemory revisioned Working Memory', () => {
           type: 'save',
           thread: {
             id: threadId,
+            resourceId: 'other-atomic-thread-resource',
+            title: 'Reassigned',
+            metadata: { changed: true },
+            createdAt,
+            updatedAt: new Date('2026-01-02T00:00:00.000Z'),
+          },
+        },
+        workingMemory: {
+          type: 'observer-update',
+          resourceId: 'other-atomic-thread-resource',
+          value: '{"version":2}',
+          expectedRevision: owner.revision,
+        },
+      }),
+    ).rejects.toThrow('cannot be reassigned');
+    await expect(memory.getThreadById({ threadId })).resolves.toEqual(beforeRejectedMutation);
+
+    await expect(
+      memory.mutateThreadWithWorkingMemory({
+        mutation: {
+          type: 'save',
+          thread: {
+            id: threadId,
             resourceId,
             title: 'Rejected save',
             metadata: { changed: true },

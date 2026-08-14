@@ -1220,6 +1220,13 @@ export class InMemoryMemory extends MemoryStorage {
       assertThreadWorkingMemoryRemoved(proposedMetadata);
 
       const resourceId = input.mutation.type === 'save' ? input.mutation.thread.resourceId : currentThread!.resourceId;
+      if (input.mutation.type === 'save' && currentThread) {
+        assertGovernedThreadResourceUnchanged({
+          currentResourceId: currentThread.resourceId,
+          currentMetadata: currentThread.metadata,
+          proposedResourceId: resourceId,
+        });
+      }
       if (input.workingMemory.type === 'observer-update' && input.workingMemory.resourceId !== resourceId) {
         throw new WorkingMemoryValidationError('Working-memory update does not match the mutated thread resource.');
       }

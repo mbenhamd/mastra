@@ -404,6 +404,29 @@ describe('MemoryPG revisioned Working Memory', () => {
           type: 'save',
           thread: {
             id: atomicThreadId,
+            resourceId: `${atomicResourceId}-other`,
+            title: 'Reassigned',
+            metadata: { changed: true },
+            createdAt,
+            updatedAt: new Date('2026-01-02T00:00:00.000Z'),
+          },
+        },
+        workingMemory: {
+          type: 'observer-update',
+          resourceId: `${atomicResourceId}-other`,
+          value: '{"version":2}',
+          expectedRevision: owner.revision,
+        },
+      }),
+    ).rejects.toThrow('cannot be reassigned');
+    await expect(firstMemory.getThreadById({ threadId: atomicThreadId })).resolves.toEqual(beforeRejectedMutation);
+
+    await expect(
+      secondMemory.mutateThreadWithWorkingMemory({
+        mutation: {
+          type: 'save',
+          thread: {
+            id: atomicThreadId,
             resourceId: atomicResourceId,
             title: 'Rejected save',
             metadata: { changed: true },
