@@ -4430,10 +4430,12 @@ export class MemoryPG extends MemoryStorage {
       for (const thread of threads) {
         const metadata = parseMetadata(thread.metadata);
         const mastra = { ...asRecord(metadata.mastra) };
+        const removedObservationalMemoryMetadata = Object.prototype.hasOwnProperty.call(mastra, 'om');
         const om = asRecord(mastra.om);
         const derivedTitle = typeof om.threadTitle === 'string' ? om.threadTitle : undefined;
         delete mastra.om;
         let nextMetadata: Record<string, unknown> = { ...metadata, mastra };
+        let workingMemoryStateChanged = false;
 
         const clearThreadWorkingMemory =
           resourceRecordManagedWorkingMemoryScopes.has('thread') ||
@@ -4445,22 +4447,27 @@ export class MemoryPG extends MemoryStorage {
               metadata,
             );
             const next = retractObserverWorkingMemorySnapshot(current);
-            nextMetadata = writeWorkingMemorySnapshotMetadata(nextMetadata, next);
-            if (next.value === null) delete nextMetadata.workingMemory;
-            else nextMetadata.workingMemory = next.value;
-          } else {
+            if (next !== current) {
+              nextMetadata = writeWorkingMemorySnapshotMetadata(nextMetadata, next);
+              if (next.value === null) delete nextMetadata.workingMemory;
+              else nextMetadata.workingMemory = next.value;
+              workingMemoryStateChanged = true;
+            }
+          } else if (Object.prototype.hasOwnProperty.call(metadata, 'workingMemory')) {
             delete nextMetadata.workingMemory;
+            workingMemoryStateChanged = true;
           }
         }
 
+        if (!removedObservationalMemoryMetadata && !workingMemoryStateChanged) continue;
         await t.none(
           `UPDATE ${threadTableName}
            SET title = $1, metadata = $2, "updatedAt" = $3, "updatedAtZ" = $4
-           WHERE id = $5`,
+          WHERE id = $5`,
           [derivedTitle === thread.title ? '' : thread.title, JSON.stringify(nextMetadata), now, now, thread.id],
         );
+        clearedThreadMetadata = true;
       }
-      clearedThreadMetadata = threads.length > 0;
     }
 
     return {
