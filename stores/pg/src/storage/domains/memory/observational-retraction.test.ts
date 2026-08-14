@@ -943,4 +943,57 @@ describe('MemoryPG observational-memory retraction', () => {
       workingMemory: null,
     });
   });
+
+  it('retracts observer-derived thread metadata stored in a legacy TEXT column', async () => {
+    const legacyResourceId = `${resourceId}-legacy-text`;
+    const legacyThreadId = `${threadId}-legacy-text`;
+    await observerMemory.saveThread({
+      thread: {
+        id: legacyThreadId,
+        resourceId: legacyResourceId,
+        title: 'Legacy derived title',
+        metadata: {
+          preserved: true,
+          workingMemory: 'Legacy derived memory',
+          mastra: {
+            preserved: true,
+            om: { threadTitle: 'Legacy derived title' },
+          },
+        },
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+    await observerMemory.initializeObservationalMemory({
+      config: { _managedWorkingMemoryScope: 'thread' },
+      resourceId: legacyResourceId,
+      scope: 'thread',
+      threadId: legacyThreadId,
+    });
+
+    await observerStore.db.none(
+      `ALTER TABLE "${schemaName}"."mastra_threads"
+       ALTER COLUMN metadata TYPE TEXT USING metadata::text`,
+    );
+    try {
+      await expect(
+        retractorMemory.retractObservationalMemory({
+          resourceId: legacyResourceId,
+          threadId: legacyThreadId,
+        }),
+      ).resolves.toEqual({
+        clearedScopes: ['thread'],
+        clearedResourceWorkingMemory: false,
+        clearedThreadMetadata: true,
+      });
+      const legacyThread = await retractorMemory.getThreadById({ threadId: legacyThreadId });
+      expect(legacyThread).toMatchObject({ title: '' });
+      expect(legacyThread?.metadata).toEqual({ preserved: true, mastra: { preserved: true } });
+    } finally {
+      await observerStore.db.none(
+        `ALTER TABLE "${schemaName}"."mastra_threads"
+         ALTER COLUMN metadata TYPE JSONB USING metadata::jsonb`,
+      );
+    }
+  });
 });

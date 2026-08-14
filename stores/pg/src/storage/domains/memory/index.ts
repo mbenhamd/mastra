@@ -792,7 +792,7 @@ export class MemoryPG extends MemoryStorage {
 
       // Add metadata filters if provided (AND logic)
       // Uses JSONB containment (@>) to avoid SQL injection and correctly match all value types including null
-      // metadata column is TEXT type storing JSON, so we need to cast to jsonb first
+      // Cast through JSONB so filters work with both current JSONB and legacy TEXT columns.
       if (filter?.metadata && Object.keys(filter.metadata).length > 0) {
         for (const [key, value] of Object.entries(filter.metadata)) {
           // Use JSONB containment operator - no key interpolation needed
@@ -4308,8 +4308,8 @@ export class MemoryPG extends MemoryStorage {
       const resourceScopeCleared = lookupKeys.has(resourceLookupKey);
       const threadSelector = resourceScopeCleared ? `"resourceId" = $1` : `id = $1 AND "resourceId" = $2`;
       const threadSelectorValues = resourceScopeCleared ? [input.resourceId] : [input.threadId, input.resourceId];
-      const workingMemorySelector = `(COALESCE(metadata, '{}'::jsonb) ? 'workingMemory'
-         OR COALESCE(metadata->'mastra', '{}'::jsonb) ? 'workingMemory')`;
+      const workingMemorySelector = `(COALESCE(metadata::jsonb, '{}'::jsonb) ? 'workingMemory'
+         OR COALESCE(metadata::jsonb->'mastra', '{}'::jsonb) ? 'workingMemory')`;
       let managedWorkingMemorySelector: string | undefined;
       if (resourceRecordManagedWorkingMemoryScopes.has('thread')) {
         managedWorkingMemorySelector = workingMemorySelector;
@@ -4321,7 +4321,7 @@ export class MemoryPG extends MemoryStorage {
           managedWorkingMemorySelector = workingMemorySelector;
         }
       }
-      const metadataSelector = `(jsonb_typeof(metadata->'mastra'->'om') = 'object'
+      const metadataSelector = `(jsonb_typeof(metadata::jsonb->'mastra'->'om') = 'object'
          ${managedWorkingMemorySelector ? `OR ${managedWorkingMemorySelector}` : ''})`;
       const threads = await t.manyOrNone<{ id: string; title: string; metadata: unknown }>(
         `SELECT id, title, metadata FROM ${threadTableName}
