@@ -279,6 +279,21 @@ async function readNextRunWithParts(iterator: AsyncIterator<any>) {
   }
 }
 
+class RunFailedOwnershipPubSub extends ControlledLeasePubSub {
+  runFailedLeaseOwner: string | undefined;
+  runFailedPublishedWithLiveOwner = false;
+
+  override async publish(topic: string, event: Parameters<PubSub['publish']>[1]): Promise<void> {
+    const data = (event as { data?: { type?: string; leaseOwner?: string } }).data;
+    if (data?.type === 'run-failed') {
+      this.runFailedLeaseOwner = data.leaseOwner;
+      this.runFailedPublishedWithLiveOwner =
+        data.leaseOwner !== undefined && [...this.owners.values()].includes(data.leaseOwner);
+    }
+    await super.publish(topic, event);
+  }
+}
+
 class BlockingRunCompletedPubSub extends EventEmitterPubSub {
   #unblockRunCompleted!: () => void;
   readonly blockedRunCompleted = new Promise<void>(resolve => {
@@ -8974,6 +8989,37 @@ describe('Agent signals', () => {
     expect(retryResult.runId).not.toBe(result.runId);
     await expect(retryResult.accepted).resolves.toMatchObject({ action: 'wake', runId: retryResult.runId });
     expect(stream).toHaveBeenCalledTimes(2);
+  });
+
+  it('publishes an authenticated setup failure before releasing its exact lease owner', async () => {
+    const runtime = new AgentThreadStreamRuntime();
+    const pubsub = new RunFailedOwnershipPubSub();
+    const resourceId = 'authenticated-setup-failure-user';
+    const threadId = 'authenticated-setup-failure-thread';
+    const result = runtime.sendSignal(
+      {
+        id: 'authenticated-setup-failure-agent',
+        stream: vi.fn(async () => {
+          throw new Error('authenticated setup failure');
+        }),
+      } as any,
+      { id: 'authenticated-setup-failure-signal', type: 'user-message', contents: 'wake and fail' },
+      {
+        resourceId,
+        threadId,
+        ifIdle: { streamOptions: { memory: { resource: resourceId, thread: threadId } } } as any,
+      },
+      pubsub,
+    );
+
+    await expect(result.accepted).rejects.toThrow('authenticated setup failure');
+    expect(pubsub.runFailedLeaseOwner).toBeDefined();
+    expect(pubsub.runFailedPublishedWithLiveOwner).toBe(true);
+    expect(
+      pubsub.publishedData.filter(data => data?.type === 'run-failed' && data.runId === result.runId),
+    ).toHaveLength(1);
+    expect(pubsub.publishedData.some(data => data?.type === 'run-aborted' && data.runId === result.runId)).toBe(false);
+    await waitForCondition(() => pubsub.owners.size === 0);
   });
 
   it('wakes waiters and drops queued signals when a reserved setup run is released', async () => {

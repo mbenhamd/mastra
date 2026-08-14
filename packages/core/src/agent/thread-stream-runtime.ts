@@ -803,7 +803,7 @@ export class AgentThreadStreamRuntime {
     key: string,
     event: Extract<
       AgentThreadStreamRuntimeEvent,
-      { type: 'run-aborting' | 'run-aborted' | 'run-completed' | 'run-suspended' }
+      { type: 'run-aborting' | 'run-aborted' | 'run-completed' | 'run-suspended' | 'run-failed' }
     >,
   ): Promise<void> {
     const state = this.#getState(pubsub);
@@ -4820,14 +4820,14 @@ export class AgentThreadStreamRuntime {
     const resolvedPubSub = this.#getPubSub(pubsub);
     const leaseProvider = this.#getLeaseProvider(resolvedPubSub);
     const reservedLeaseOwner = this.#leaseOwnerForRun(state, reservedRunId);
-    const rollbackLocalReservation = (rejectRun: boolean) => {
+    const rollbackLocalReservation = (rejectRun: boolean, announceAbort = rejectRun) => {
       onRunRejected?.();
       if (reserveBeforeIdleWake) {
         this.#releaseReservedRun(state, pubsub, reservedKey, reservedRunId, {
           cleanupPrepared: true,
           clearAbort: true,
           rejectOutputWaiters: rejectRun,
-          announceAbort: rejectRun,
+          announceAbort,
         });
       } else {
         state.inflightIdleThreadKeysByRunId.delete(reservedRunId);
@@ -4923,15 +4923,23 @@ export class AgentThreadStreamRuntime {
         state.inflightIdleAgentIdsByRunId.delete(reservedRunId);
         return { action: 'wake' as const, runId: reservedRunId, output };
       } catch (error) {
-        rollbackLocalReservation(true);
-        this.#releaseThreadLease(pubsub, reservedKey, reservedRunId);
-        this.#publish(pubsub, reservedKey, {
-          type: 'run-failed',
-          runId: reservedRunId,
-          error: getErrorFromUnknown(error).message,
-          leaseOwner: state.leaseOwnerTokensByRunId.get(reservedRunId),
-        });
-        void this.#drainPendingIdleSignals(state, pubsub, reservedKey);
+        const leaseOwner = state.leaseOwnerTokensByRunId.get(reservedRunId) ?? reservedLeaseOwner;
+        try {
+          await this.#publishTerminalAndWait(pubsub, reservedKey, {
+            type: 'run-failed',
+            runId: reservedRunId,
+            error: getErrorFromUnknown(error).message,
+            leaseOwner,
+          });
+        } catch {
+          // Stream setup failure remains authoritative even when its best-effort
+          // distributed terminal cannot be delivered within the bounded fence.
+        }
+        rollbackLocalReservation(true, false);
+        if (!reserveBeforeIdleWake) {
+          this.#releaseThreadLease(pubsub, reservedKey, reservedRunId);
+          void this.#drainPendingIdleSignals(state, pubsub, reservedKey);
+        }
         throw error;
       }
     })();
