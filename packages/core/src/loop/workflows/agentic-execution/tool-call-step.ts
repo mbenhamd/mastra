@@ -874,8 +874,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
         // defers entirely to the tool's own approval config.
         const toolPermissionPolicy = (
           requestContext.get('__mastra_toolPermissionPolicy') as
-            | ((toolName: string) => 'allow' | 'ask' | 'deny')
-            | undefined
+            ((toolName: string) => 'allow' | 'ask' | 'deny') | undefined
         )?.(inputData.toolName);
         if (toolPermissionPolicy === 'deny') {
           // §O4 — surface WHY a tool was blocked (action-time deny is otherwise
@@ -1304,8 +1303,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
             if (suspendedToolRunId) break;
             const suspendedTools = message.content.metadata?.suspendedTools as Record<string, any> | undefined;
             const pendingToolApprovals = message.content.metadata?.pendingToolApprovals as
-              | Record<string, any>
-              | undefined;
+              Record<string, any> | undefined;
             const pendingOrSuspendedTools =
               suspendedTools || pendingToolApprovals
                 ? { ...(pendingToolApprovals ?? {}), ...(suspendedTools ?? {}) }
