@@ -75,7 +75,7 @@ describe('MemoryPG lock ordering', () => {
     }
   });
 
-  async function waitForAdvisoryLockWait(applicationName: string): Promise<void> {
+  async function waitForLockWait(applicationName: string, queryPattern: string, label: string): Promise<void> {
     const deadline = Date.now() + 5_000;
     while (Date.now() < deadline) {
       const result = await inspector.query<{ waiting: boolean }>(
@@ -84,14 +84,18 @@ describe('MemoryPG lock ordering', () => {
            FROM pg_stat_activity
            WHERE application_name = $1
              AND wait_event_type = 'Lock'
-             AND query LIKE '%pg_advisory_xact_lock%'
+             AND query LIKE $2
          ) AS waiting`,
-        [applicationName],
+        [applicationName, queryPattern],
       );
       if (result.rows[0]?.waiting) return;
       await new Promise(resolve => setTimeout(resolve, 20));
     }
-    throw new Error(`Timed out waiting for ${applicationName} to block on an advisory lock.`);
+    throw new Error(`Timed out waiting for ${applicationName} to block on ${label}.`);
+  }
+
+  async function waitForAdvisoryLockWait(applicationName: string): Promise<void> {
+    await waitForLockWait(applicationName, '%pg_advisory_xact_lock%', 'an advisory lock');
   }
 
   async function blockObservationalMemory(resourceId: string) {
@@ -102,6 +106,29 @@ describe('MemoryPG lock ordering', () => {
     await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [
       `mastra:observational-memory:${resourceId}`,
     ]);
+    return {
+      async release() {
+        if (!transactionOpen) return;
+        await client.query('COMMIT');
+        transactionOpen = false;
+      },
+      async close() {
+        if (transactionOpen) {
+          await client.query('ROLLBACK');
+          transactionOpen = false;
+        }
+        client.release();
+        await pool.end();
+      },
+    };
+  }
+
+  async function blockMessageDeletes() {
+    const pool = new Pool({ connectionString });
+    const client = await pool.connect();
+    let transactionOpen = true;
+    await client.query('BEGIN');
+    await client.query(`LOCK TABLE "${schemaName}"."mastra_messages" IN ACCESS EXCLUSIVE MODE`);
     return {
       async release() {
         if (!transactionOpen) return;
@@ -778,6 +805,58 @@ describe('MemoryPG lock ordering', () => {
     } finally {
       await blocker.close();
       await Promise.allSettled([deletePromise, savePromise].filter(Boolean) as Promise<unknown>[]);
+    }
+  });
+
+  it('serializes an absent-thread delete before transition save creates resource working memory', async () => {
+    const resourceId = 'transition-save-race-resource';
+    const threadId = 'transition-save-race-thread';
+    const blocker = await blockMessageDeletes();
+    let deletePromise: ReturnType<MemoryPG['deleteThread']> | undefined;
+    let transitionPromise: ReturnType<MemoryPG['transitionThreadToResourceWorkingMemory']> | undefined;
+    try {
+      deletePromise = rollbackMemory.deleteThread({ threadId });
+      await waitForLockWait(rollbackApplicationName, '%DELETE FROM%mastra_messages%', 'the message-table lock');
+
+      transitionPromise = competitorMemory.transitionThreadToResourceWorkingMemory({
+        mutation: {
+          type: 'save',
+          thread: {
+            id: threadId,
+            resourceId,
+            title: 'Transition-created thread',
+            metadata: { transitioned: true },
+            createdAt,
+            updatedAt: createdAt,
+          },
+        },
+        value: 'transition-created resource memory',
+        expectedRevision: 0,
+        expectedSourceThreadRevision: 0,
+      });
+      await waitForAdvisoryLockWait(competitorApplicationName);
+      await blocker.release();
+      const [, transitioned] = await within(
+        Promise.all([deletePromise, transitionPromise]),
+        'absent-thread delete and transition save',
+      );
+
+      expect(transitioned.thread).toMatchObject({
+        id: threadId,
+        resourceId,
+        title: 'Transition-created thread',
+        metadata: { transitioned: true },
+      });
+      await expect(rollbackMemory.getThreadById({ threadId })).resolves.toMatchObject({
+        id: threadId,
+        resourceId,
+      });
+      await expect(rollbackMemory.getResourceById({ resourceId })).resolves.toMatchObject({
+        workingMemory: 'transition-created resource memory',
+      });
+    } finally {
+      await blocker.close();
+      await Promise.allSettled([deletePromise, transitionPromise].filter(Boolean) as Promise<unknown>[]);
     }
   });
 });
