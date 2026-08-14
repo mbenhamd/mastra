@@ -3635,8 +3635,16 @@ Notes:
   ): Promise<StorageCloneThreadOutput> {
     const memoryStore = await this.getMemoryStore();
     const config = this.getMergedThreadConfig(memoryConfig);
-    const sourceThread = await this.getThreadById({ threadId: args.sourceThreadId });
-    const sourceResourceId = sourceThread?.resourceId;
+    const workingMemoryScope = config.workingMemory?.scope || 'resource';
+    const mayCopyWorkingMemory =
+      config.workingMemory?.enabled === true &&
+      (workingMemoryScope === 'thread' || (workingMemoryScope === 'resource' && Boolean(args.resourceId)));
+    const mayCopyPostCloneMemory = Boolean(memoryStore.supportsObservationalMemory) || mayCopyWorkingMemory;
+    if (mayCopyPostCloneMemory && !memoryStore.supportsThreadCloneSourceSnapshot) {
+      throw new Error(
+        `Thread cloning with post-clone memory copies is not supported by this storage adapter (${memoryStore.constructor.name}) because it cannot atomically snapshot source ownership.`,
+      );
+    }
     const result = await memoryStore.cloneThread(args);
     const rollbackState: {
       observationalMemory?: StorageObservationalMemoryCloneReceipt;
@@ -3644,9 +3652,16 @@ Notes:
     } = {};
 
     try {
+      const sourceResourceId = memoryStore.supportsThreadCloneSourceSnapshot
+        ? this.requireCloneSourceResourceId(result)
+        : undefined;
+
       // Clone OM before Working Memory so a failed WM write can roll the cloned
       // thread and its remapped OM back without leaving a partially copied WM.
-      if (memoryStore.supportsObservationalMemory && sourceResourceId) {
+      if (memoryStore.supportsObservationalMemory) {
+        if (sourceResourceId === undefined) {
+          throw new Error('Storage did not provide the required clone source ownership snapshot.');
+        }
         await this.cloneObservationalMemory(memoryStore, args.sourceThreadId, sourceResourceId, result, rollbackState);
       }
 
@@ -3655,10 +3670,13 @@ Notes:
       // cross-resource copy must use observer semantics so it cannot overwrite
       // destination protections or manufacture owner authority there.
       if (config.workingMemory?.enabled) {
-        const scope = config.workingMemory.scope || 'resource';
+        const scope = workingMemoryScope;
         const shouldCopy =
           scope === 'thread' || (scope === 'resource' && args.resourceId && args.resourceId !== sourceResourceId);
         if (shouldCopy) {
+          if (sourceResourceId === undefined) {
+            throw new Error('Storage did not provide the required clone source ownership snapshot.');
+          }
           const sourceSnapshot = memoryStore.supportsRevisionedWorkingMemory
             ? await this.getWorkingMemorySnapshot({
                 threadId: args.sourceThreadId,
@@ -3729,6 +3747,15 @@ Notes:
     }
 
     return result;
+  }
+
+  private requireCloneSourceResourceId(result: StorageCloneThreadOutput): string {
+    if (typeof result.sourceResourceId !== 'string' || result.sourceResourceId.length === 0) {
+      throw new Error(
+        'Storage adapter advertised atomic clone source ownership snapshots but cloneThread did not return sourceResourceId.',
+      );
+    }
+    return result.sourceResourceId;
   }
 
   /**

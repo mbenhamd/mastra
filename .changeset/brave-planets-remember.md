@@ -2,7 +2,7 @@
 '@mastra/core': minor
 ---
 
-Added revision-aware Working Memory APIs so authorized applications can correct or forget saved facts without later observer runs restoring protected values. Applications can also detect whether storage supports safe inactive-thread filtering and failed-clone rollback.
+Added revision-aware Working Memory APIs so authorized applications can correct or forget saved facts without later observer runs restoring protected values. Applications can also detect whether storage supports safe inactive-thread filtering, failed-clone rollback, and atomic clone source-ownership snapshots.
 
 **Before**
 

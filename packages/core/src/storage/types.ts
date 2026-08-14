@@ -809,6 +809,12 @@ export type StorageCloneThreadOutput = {
   /** Map from source message IDs to cloned message IDs (used for OM remapping) */
   messageIdMap?: Record<string, string>;
   /**
+   * Resource that owned the source thread in the same atomic snapshot used to
+   * create the clone. Required when the adapter advertises
+   * `supportsThreadCloneSourceSnapshot`.
+   */
+  sourceResourceId?: string;
+  /**
    * Storage-issued ownership proof for conditional post-clone rollback.
    *
    * @internal The token is opaque outside the adapter that issued it.

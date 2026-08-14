@@ -69,6 +69,9 @@ export abstract class MemoryStorage extends StorageDomain {
   /** Whether failed post-clone copies can be rolled back without deleting concurrent state. */
   readonly supportsAtomicThreadCloneRollback?: boolean = false;
 
+  /** Whether cloneThread atomically captures and returns the source thread's resource ownership. */
+  readonly supportsThreadCloneSourceSnapshot?: boolean = false;
+
   constructor() {
     super({
       component: 'STORAGE',

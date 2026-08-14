@@ -278,6 +278,7 @@ export class InMemoryMemory extends MemoryStorage {
   readonly supportsRevisionedWorkingMemory = true;
   readonly supportsThreadUpdatedBeforeFilter = true;
   readonly supportsAtomicThreadCloneRollback = true;
+  readonly supportsThreadCloneSourceSnapshot = true;
   private db: InMemoryDB;
 
   constructor({ db }: { db: InMemoryDB }) {
@@ -1380,6 +1381,7 @@ export class InMemoryMemory extends MemoryStorage {
     if (!sourceThread) {
       throw new Error(`Source thread with id ${sourceThreadId} not found`);
     }
+    const sourceResourceId = sourceThread.resourceId;
 
     // Use provided ID or generate a new one
     const newThreadId = providedThreadId || crypto.randomUUID();
@@ -1432,7 +1434,7 @@ export class InMemoryMemory extends MemoryStorage {
     // Create the new thread
     const newThread: StorageThreadType = {
       id: newThreadId,
-      resourceId: resourceId || sourceThread.resourceId,
+      resourceId: resourceId || sourceResourceId,
       title: title || (sourceThread.title ? `Clone of ${sourceThread.title}` : undefined),
       metadata: {
         ...metadata,
@@ -1449,6 +1451,7 @@ export class InMemoryMemory extends MemoryStorage {
     // Clone messages with new IDs
     const clonedMessages: MastraDBMessage[] = [];
     const messageIdMap: Record<string, string> = {};
+    const targetResourceId = resourceId || sourceResourceId;
     for (const sourceMsg of sourceMessages) {
       const newMessageId = crypto.randomUUID();
       messageIdMap[sourceMsg.id] = newMessageId;
@@ -1462,7 +1465,7 @@ export class InMemoryMemory extends MemoryStorage {
         role: sourceMsg.role,
         type: sourceMsg.type,
         createdAt: sourceMsg.createdAt,
-        resourceId: resourceId || sourceMsg.resourceId,
+        resourceId: targetResourceId,
       };
 
       this.db.messages.set(newMessageId, newStorageMessage);
@@ -1475,7 +1478,7 @@ export class InMemoryMemory extends MemoryStorage {
         role: sourceMsg.role as MastraDBMessage['role'],
         type: sourceMsg.type,
         createdAt: sourceMsg.createdAt,
-        resourceId: resourceId || sourceMsg.resourceId || undefined,
+        resourceId: targetResourceId,
       });
     }
 
@@ -1484,6 +1487,7 @@ export class InMemoryMemory extends MemoryStorage {
       thread: cloneThreadBoundary(storedThread, true),
       clonedMessages,
       messageIdMap,
+      sourceResourceId,
       rollbackReceipt: {
         threadId: newThreadId,
         storageGeneration: this.rotateThreadGeneration(newThreadId),

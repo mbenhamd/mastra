@@ -338,6 +338,7 @@ export class MemoryPG extends MemoryStorage {
   readonly supportsRevisionedWorkingMemory = true;
   readonly supportsThreadUpdatedBeforeFilter = true;
   readonly supportsAtomicThreadCloneRollback = true;
+  readonly supportsThreadCloneSourceSnapshot = true;
 
   /**
    * Retention-eligible tables. `threads`, `messages`, and `resources` all anchor
@@ -2947,39 +2948,58 @@ export class MemoryPG extends MemoryStorage {
   async cloneThread(args: StorageCloneThreadInput): Promise<StorageCloneThreadOutput> {
     const { sourceThreadId, newThreadId: providedThreadId, resourceId, title, metadata, options } = args;
 
-    // Get the source thread
-    const sourceThread = await this.getThreadById({ threadId: sourceThreadId });
-    if (!sourceThread) {
-      throw new MastraError({
-        id: createStorageErrorId('PG', 'CLONE_THREAD', 'SOURCE_NOT_FOUND'),
-        domain: ErrorDomain.STORAGE,
-        category: ErrorCategory.USER,
-        text: `Source thread with id ${sourceThreadId} not found`,
-        details: { sourceThreadId },
-      });
-    }
-
     // Use provided ID or generate a new one
     const newThreadId = providedThreadId || crypto.randomUUID();
-
-    // Check if the new thread ID already exists
-    const existingThread = await this.getThreadById({ threadId: newThreadId });
-    if (existingThread) {
-      throw new MastraError({
-        id: createStorageErrorId('PG', 'CLONE_THREAD', 'THREAD_EXISTS'),
-        domain: ErrorDomain.STORAGE,
-        category: ErrorCategory.USER,
-        text: `Thread with id ${newThreadId} already exists`,
-        details: { newThreadId },
-      });
-    }
 
     const threadTableName = getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) });
     const messageTableName = getTableName({ indexName: TABLE_MESSAGES, schemaName: getSchemaName(this.#schema) });
 
     try {
       return await this.#db.client.tx(async t => {
-        await this.lockThreadCloneLifecycle(t, newThreadId);
+        const lifecycleThreadIds = [...new Set([sourceThreadId, newThreadId])].sort();
+        for (const threadId of lifecycleThreadIds) {
+          await this.lockThreadCloneLifecycle(t, threadId);
+        }
+        type CloneThreadRow = StorageThreadType & {
+          createdAtZ?: Date | string;
+          updatedAtZ?: Date | string;
+        };
+        const lockedThreadRows = new Map<string, CloneThreadRow>();
+        for (const threadId of lifecycleThreadIds) {
+          const row = await t.oneOrNone<CloneThreadRow>(`SELECT * FROM ${threadTableName} WHERE id = $1 FOR UPDATE`, [
+            threadId,
+          ]);
+          if (row) lockedThreadRows.set(threadId, row);
+        }
+        const sourceRow = lockedThreadRows.get(sourceThreadId);
+        if (!sourceRow) {
+          throw new MastraError({
+            id: createStorageErrorId('PG', 'CLONE_THREAD', 'SOURCE_NOT_FOUND'),
+            domain: ErrorDomain.STORAGE,
+            category: ErrorCategory.USER,
+            text: `Source thread with id ${sourceThreadId} not found`,
+            details: { sourceThreadId },
+          });
+        }
+        if (lockedThreadRows.has(newThreadId)) {
+          throw new MastraError({
+            id: createStorageErrorId('PG', 'CLONE_THREAD', 'THREAD_EXISTS'),
+            domain: ErrorDomain.STORAGE,
+            category: ErrorCategory.USER,
+            text: `Thread with id ${newThreadId} already exists`,
+            details: { newThreadId },
+          });
+        }
+        const sourceThread: StorageThreadType = {
+          id: sourceRow.id,
+          resourceId: sourceRow.resourceId,
+          title: sourceRow.title,
+          metadata: parseMetadata(sourceRow.metadata),
+          createdAt: new Date(sourceRow.createdAtZ || sourceRow.createdAt),
+          updatedAt: new Date(sourceRow.updatedAtZ || sourceRow.updatedAt),
+        };
+        const sourceResourceId = sourceThread.resourceId;
+
         // Build message query with filters
         let messageQuery = `SELECT id, content, role, type, "createdAt", "createdAtZ", thread_id AS "threadId", "resourceId"
                             FROM ${messageTableName} WHERE thread_id = $1`;
@@ -3030,7 +3050,7 @@ export class MemoryPG extends MemoryStorage {
         // Create the new thread
         const newThread: StorageThreadType = {
           id: newThreadId,
-          resourceId: resourceId || sourceThread.resourceId,
+          resourceId: resourceId || sourceResourceId,
           title: title || (sourceThread.title ? `Clone of ${sourceThread.title}` : ''),
           metadata: {
             ...metadata,
@@ -3067,7 +3087,7 @@ export class MemoryPG extends MemoryStorage {
         // Clone messages with new IDs
         const clonedMessages: MastraDBMessage[] = [];
         const messageIdMap: Record<string, string> = {};
-        const targetResourceId = resourceId || sourceThread.resourceId;
+        const targetResourceId = resourceId || sourceResourceId;
 
         for (const sourceMsg of sourceMessages) {
           const newMessageId = crypto.randomUUID();
@@ -3115,6 +3135,7 @@ export class MemoryPG extends MemoryStorage {
           thread: newThread,
           clonedMessages,
           messageIdMap,
+          sourceResourceId,
           rollbackReceipt: {
             threadId: newThreadId,
             storageGeneration: generation.storageGeneration,

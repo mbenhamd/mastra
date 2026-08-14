@@ -9,12 +9,16 @@ import { MemoryPG } from './index';
 class RecordingTxClient implements TxClient {
   queries: RecordedQuery[] = [];
   reads: RecordedQuery[] = [];
+  lifecycleLocks: string[] = [];
   sourceMessages: Record<string, any>[] = [];
 
   constructor(private readonly threads: Map<string, Record<string, unknown>>) {}
 
   async none(query: string, values?: QueryValues): Promise<null> {
-    if (query.includes('pg_advisory_xact_lock')) return null;
+    if (query.includes('pg_advisory_xact_lock')) {
+      this.lifecycleLocks.push(String(values?.[0]));
+      return null;
+    }
     this.queries.push({ query, values });
     return null;
   }
@@ -51,6 +55,10 @@ class RecordingTxClient implements TxClient {
 
   async oneOrNone<T = any>(query: string, values?: QueryValues): Promise<T | null> {
     this.reads.push({ query, values });
+    if (query.includes('SELECT * FROM') && query.includes('mastra_threads') && query.includes('FOR UPDATE')) {
+      const thread = this.threads.get(String(values?.[0]));
+      return (thread as T | undefined) ?? null;
+    }
     if (
       query.includes('SELECT "resourceId", metadata FROM') &&
       query.includes('mastra_threads') &&
@@ -417,5 +425,39 @@ describe('MemoryPG.cloneThread', () => {
     expect(messageInsert.values![4]).toBe(createdAtZ.toISOString());
     expect(messageInsert.values![3]).not.toBe(legacyCreatedAt.toISOString());
     expect(result.clonedMessages[0]!.createdAt).toEqual(createdAtZ);
+  });
+
+  it('locks source and destination before returning the in-transaction source owner', async () => {
+    const client = new RecordingDbClient();
+    const memory = new MemoryPG({ client });
+
+    const result = await memory.cloneThread({ sourceThreadId: 'thread-1', newThreadId: 'aaa-clone' });
+
+    expect(client.txClient.lifecycleLocks).toEqual(['mastra:thread-clone:aaa-clone', 'mastra:thread-clone:thread-1']);
+    expect(client.txClient.reads.map(read => read.values)).toEqual([['aaa-clone'], ['thread-1']]);
+    expect(client.txClient.reads.every(read => read.query.includes('SELECT * FROM'))).toBe(true);
+    expect(client.txClient.reads.every(read => read.query.includes('FOR UPDATE'))).toBe(true);
+    expect(result.sourceResourceId).toBe('resource-1');
+    expect(result.thread.resourceId).toBe('resource-1');
+  });
+
+  it('preserves source-not-found precedence when the requested clone id already exists', async () => {
+    const client = new RecordingDbClient({
+      threads: [
+        {
+          id: 'existing-clone',
+          resourceId: 'target-resource',
+          title: 'Existing clone',
+          metadata: {},
+          createdAt: new Date('2025-01-01T00:00:00.000Z'),
+          updatedAt: new Date('2025-01-01T00:00:00.000Z'),
+        },
+      ],
+    });
+    const memory = new MemoryPG({ client });
+
+    await expect(
+      memory.cloneThread({ sourceThreadId: 'missing-source', newThreadId: 'existing-clone' }),
+    ).rejects.toThrow('Source thread with id missing-source not found');
   });
 });

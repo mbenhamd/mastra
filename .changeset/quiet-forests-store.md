@@ -2,7 +2,7 @@
 '@mastra/pg': minor
 ---
 
-Added PostgreSQL support for revision-aware owner corrections and filtering inactive threads before pagination. Observational-memory edits and failed thread clones now preserve unrelated or concurrently changed data.
+Added PostgreSQL support for revision-aware owner corrections and filtering inactive threads before pagination. Observational-memory edits and failed thread clones now preserve unrelated or concurrently changed data, and clones capture source ownership in the same transaction as their thread and message snapshot.
 
 **Before**
 
