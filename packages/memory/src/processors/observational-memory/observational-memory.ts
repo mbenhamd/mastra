@@ -1089,16 +1089,28 @@ export class ObservationalMemory {
   }
 
   /**
-   * Get or create the observational memory record.
-   * Returns the existing record if one exists, otherwise initializes a new one.
+   * Resolve storage IDs for operations that may mutate observational memory.
+   * Thread-scoped records are addressed by threadId, but storage adapters use
+   * the owning resourceId to serialize mutations such as initialize and clear.
    */
-  async getOrCreateRecord(threadId: string, resourceId?: string): Promise<ObservationalMemoryRecord> {
+  private async resolveMutationStorageIds(
+    threadId: string,
+    resourceId?: string,
+  ): Promise<{ threadId: string | null; resourceId: string }> {
     let resolvedResourceId = resourceId;
     if (this.scope === 'thread' && resolvedResourceId === undefined) {
       const thread = await this.storage.getThreadById({ threadId });
       resolvedResourceId = thread?.resourceId;
     }
-    const ids = this.getStorageIds(threadId, resolvedResourceId);
+    return this.getStorageIds(threadId, resolvedResourceId);
+  }
+
+  /**
+   * Get or create the observational memory record.
+   * Returns the existing record if one exists, otherwise initializes a new one.
+   */
+  async getOrCreateRecord(threadId: string, resourceId?: string): Promise<ObservationalMemoryRecord> {
+    const ids = await this.resolveMutationStorageIds(threadId, resourceId);
     // Storage adapters identify thread-scoped records by threadId alone and
     // resource-scoped records by resourceId alone. The single-flight key must
     // mirror that identity so optional resourceId differences cannot split a
@@ -3857,7 +3869,7 @@ ${formattedMessages}
    * Clear all memory for a specific thread/resource
    */
   async clear(threadId: string, resourceId?: string): Promise<void> {
-    const ids = this.getStorageIds(threadId, resourceId);
+    const ids = await this.resolveMutationStorageIds(threadId, resourceId);
     await this.storage.clearObservationalMemory(ids.threadId, ids.resourceId);
     // Clean up static maps to prevent memory leaks
     this.buffering.cleanupStaticMaps(ids.threadId ?? ids.resourceId, ids.resourceId);

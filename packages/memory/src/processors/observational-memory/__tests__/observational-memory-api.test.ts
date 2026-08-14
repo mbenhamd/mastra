@@ -1913,6 +1913,51 @@ describe('clear()', () => {
     expect(await om.getRecord(threadId)).toBeNull();
     expect(await om.getRecord(otherThread)).not.toBeNull();
   });
+
+  it('uses the persisted resource to serialize a thread-scoped clear while cleaning only the thread buffer key', async () => {
+    const resourceId = 'clear-resource';
+    await storage.saveThread({
+      thread: {
+        id: threadId,
+        resourceId,
+        title: 'Clear thread',
+        metadata: {},
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+    });
+    await om.getOrCreateRecord(threadId);
+
+    const threadObsKey = `obs:thread:${threadId}`;
+    const threadReflKey = `refl:thread:${threadId}`;
+    const resourceObsKey = `obs:thread:${resourceId}`;
+    BufferingCoordinator.lastBufferedBoundary.set(threadObsKey, 1);
+    BufferingCoordinator.lastBufferedBoundary.set(threadReflKey, 2);
+    BufferingCoordinator.lastBufferedBoundary.set(resourceObsKey, 3);
+
+    const getThreadSpy = vi.spyOn(storage, 'getThreadById');
+    const clearSpy = vi.spyOn(storage, 'clearObservationalMemory');
+
+    await om.clear(threadId);
+
+    expect(getThreadSpy).toHaveBeenCalledExactlyOnceWith({ threadId });
+    expect(clearSpy).toHaveBeenCalledExactlyOnceWith(threadId, resourceId);
+    expect(BufferingCoordinator.lastBufferedBoundary.has(threadObsKey)).toBe(false);
+    expect(BufferingCoordinator.lastBufferedBoundary.has(threadReflKey)).toBe(false);
+    expect(BufferingCoordinator.lastBufferedBoundary.get(resourceObsKey)).toBe(3);
+  });
+
+  it('does not reload thread ownership when clear receives the resource explicitly', async () => {
+    const resourceId = 'clear-explicit-resource';
+    await om.getOrCreateRecord(threadId, resourceId);
+    const getThreadSpy = vi.spyOn(storage, 'getThreadById');
+    const clearSpy = vi.spyOn(storage, 'clearObservationalMemory');
+
+    await om.clear(threadId, resourceId);
+
+    expect(getThreadSpy).not.toHaveBeenCalled();
+    expect(clearSpy).toHaveBeenCalledExactlyOnceWith(threadId, resourceId);
+  });
 });
 
 // =============================================================================
