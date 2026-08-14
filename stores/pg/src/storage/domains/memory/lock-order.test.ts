@@ -704,4 +704,80 @@ describe('MemoryPG lock ordering', () => {
       await Promise.allSettled([deletePromise, savePromise].filter(Boolean) as Promise<unknown>[]);
     }
   });
+
+  it('serializes deleteThread with combined ungoverned save reassignment before retracting source state', async () => {
+    const sourceResourceId = 'combined-save-race-resource-a';
+    const destinationResourceId = 'combined-save-race-resource-b';
+    const threadId = 'combined-save-race-thread';
+    for (const resourceId of [sourceResourceId, destinationResourceId]) {
+      await rollbackMemory.saveResource({
+        resource: {
+          id: resourceId,
+          workingMemory: `derived-${resourceId}`,
+          metadata: {},
+          createdAt,
+          updatedAt: createdAt,
+        },
+      });
+      await rollbackMemory.initializeObservationalMemory({
+        config: { _managedWorkingMemoryScope: 'resource' },
+        resourceId,
+        scope: resourceId === sourceResourceId ? 'thread' : 'resource',
+        threadId: resourceId === sourceResourceId ? threadId : null,
+      });
+    }
+    await rollbackMemory.saveThread({
+      thread: {
+        id: threadId,
+        resourceId: sourceResourceId,
+        title: 'Source owner',
+        metadata: {},
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+
+    const blocker = await blockObservationalMemory(sourceResourceId);
+    let deletePromise: ReturnType<MemoryPG['deleteThread']> | undefined;
+    let savePromise: ReturnType<MemoryPG['mutateThreadWithWorkingMemory']> | undefined;
+    try {
+      deletePromise = rollbackMemory.deleteThread({ threadId });
+      await waitForAdvisoryLockWait(rollbackApplicationName);
+
+      savePromise = competitorMemory.mutateThreadWithWorkingMemory({
+        mutation: {
+          type: 'save',
+          thread: {
+            id: threadId,
+            resourceId: destinationResourceId,
+            title: 'Destination owner',
+            metadata: { recreated: true },
+            createdAt: new Date('2026-01-02T00:00:00.000Z'),
+            updatedAt: new Date('2026-01-02T00:00:00.000Z'),
+          },
+        },
+        workingMemory: { type: 'require-ungoverned' },
+      });
+      await waitForAdvisoryLockWait(competitorApplicationName);
+      await blocker.release();
+      await within(Promise.all([deletePromise, savePromise]), 'delete and combined ungoverned save reassignment');
+
+      await expect(rollbackMemory.getThreadById({ threadId })).resolves.toMatchObject({
+        resourceId: destinationResourceId,
+        title: 'Destination owner',
+        metadata: { recreated: true },
+      });
+      await expect(rollbackMemory.getObservationalMemory(threadId, sourceResourceId)).resolves.toBeNull();
+      await expect(rollbackMemory.getResourceById({ resourceId: sourceResourceId })).resolves.toMatchObject({
+        workingMemory: null,
+      });
+      await expect(rollbackMemory.getObservationalMemory(null, destinationResourceId)).resolves.not.toBeNull();
+      await expect(rollbackMemory.getResourceById({ resourceId: destinationResourceId })).resolves.toMatchObject({
+        workingMemory: `derived-${destinationResourceId}`,
+      });
+    } finally {
+      await blocker.close();
+      await Promise.allSettled([deletePromise, savePromise].filter(Boolean) as Promise<unknown>[]);
+    }
+  });
 });

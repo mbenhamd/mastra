@@ -2774,6 +2774,9 @@ export class MemoryPG extends MemoryStorage {
 
     try {
       return await this.#db.client.tx(async t => {
+        if (input.mutation.type === 'save') {
+          await this.lockThreadLifecycles(t, [threadId]);
+        }
         if (input.workingMemory.type === 'observer-update') {
           await this.lockObservationalMemoryResource(t, input.workingMemory.resourceId);
         }
