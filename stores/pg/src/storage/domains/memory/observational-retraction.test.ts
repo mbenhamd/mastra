@@ -783,6 +783,30 @@ describe('MemoryPG observational-memory retraction', () => {
     ).resolves.toBeNull();
   });
 
+  it('deletes a nullable-resource orphan whose thread row is absent', async () => {
+    const orphanMessageId = `${threadId}-missing-thread-orphan-message`;
+    const missingThreadId = `${threadId}-missing-thread-orphan`;
+
+    await observerStore.db.none(
+      `INSERT INTO "${schemaName}"."mastra_messages"
+         (id, thread_id, content, role, type, "createdAt", "resourceId")
+       VALUES ($1, $2, $3, 'user', 'v2', $4, NULL)`,
+      [orphanMessageId, missingThreadId, JSON.stringify({ format: 2, parts: [] }), createdAt],
+    );
+
+    await expect(
+      retractorMemory.deleteMessages([orphanMessageId], { retractObservationalMemory: true }),
+    ).resolves.toBeUndefined();
+    await expect(
+      observerStore.db.one<{ exists: boolean }>(
+        `SELECT EXISTS(
+           SELECT 1 FROM "${schemaName}"."mastra_messages" WHERE id = $1
+         ) AS exists`,
+        [orphanMessageId],
+      ),
+    ).resolves.toEqual({ exists: false });
+  });
+
   it('uses the last duplicate update for both the message move and OM retraction coordinates', async () => {
     const duplicateMessageId = `${threadId}-duplicate-update-message`;
     const source = {

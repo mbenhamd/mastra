@@ -2283,7 +2283,8 @@ export class MemoryPG extends MemoryStorage {
         if (
           messages.some(
             message =>
-              message.resourceId === null && threadResources.get(message.threadId) !== message.resolvedResourceId,
+              message.resourceId === null &&
+              (threadResources.get(message.threadId) ?? null) !== message.resolvedResourceId,
           )
         ) {
           throw new MessageMutationConflictError(messageIds[0]!);
