@@ -698,7 +698,7 @@ export class InMemoryMemory extends MemoryStorage {
   }
 
   protected parseStoredMessage(message: StorageMessageType): MastraDBMessage {
-    const { resourceId, content, role, thread_id, ...rest } = message;
+    const { resourceId, content, role, thread_id, createdAt, ...rest } = message;
 
     // Parse content using safelyParseJSON utility
     let parsedContent = safelyParseJSON(content);
@@ -718,6 +718,7 @@ export class InMemoryMemory extends MemoryStorage {
       ...(message.resourceId && { resourceId: message.resourceId }),
       content: parsedContent,
       role: role as MastraDBMessage['role'],
+      createdAt: new Date(createdAt),
     } satisfies MastraDBMessage;
   }
 
@@ -757,7 +758,7 @@ export class InMemoryMemory extends MemoryStorage {
         content: JSON.stringify(message.content),
         role: message.role || 'user',
         type: message.type || 'text',
-        createdAt: message.createdAt,
+        createdAt: new Date(message.createdAt),
         resourceId: message.resourceId || null,
       };
       this.db.messages.set(key, storageMessage);
@@ -819,7 +820,7 @@ export class InMemoryMemory extends MemoryStorage {
         // Update fields
         if (update.role !== undefined) storageMsg.role = update.role;
         if (update.type !== undefined) storageMsg.type = update.type;
-        if (update.createdAt !== undefined) storageMsg.createdAt = update.createdAt;
+        if (update.createdAt !== undefined) storageMsg.createdAt = new Date(update.createdAt);
         if (update.resourceId !== undefined) storageMsg.resourceId = update.resourceId;
         // Deep merge content if present
         if (update.content !== undefined) {
@@ -877,7 +878,7 @@ export class InMemoryMemory extends MemoryStorage {
           content: safelyParseJSON(storageMsg.content),
           role: storageMsg.role === 'user' || storageMsg.role === 'assistant' ? storageMsg.role : 'user',
           type: storageMsg.type,
-          createdAt: storageMsg.createdAt,
+          createdAt: new Date(storageMsg.createdAt),
           resourceId: storageMsg.resourceId === null ? undefined : storageMsg.resourceId,
         });
       }
@@ -1482,7 +1483,7 @@ export class InMemoryMemory extends MemoryStorage {
         content: sourceMsg.content,
         role: sourceMsg.role,
         type: sourceMsg.type,
-        createdAt: sourceMsg.createdAt,
+        createdAt: new Date(sourceMsg.createdAt),
         resourceId: targetResourceId,
       };
 
@@ -1495,7 +1496,7 @@ export class InMemoryMemory extends MemoryStorage {
         content: parsedContent,
         role: sourceMsg.role as MastraDBMessage['role'],
         type: sourceMsg.type,
-        createdAt: sourceMsg.createdAt,
+        createdAt: new Date(sourceMsg.createdAt),
         resourceId: targetResourceId,
       });
     }

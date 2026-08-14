@@ -10,8 +10,11 @@ async function createMemory() {
   return new InMemoryMemory({ db: new InMemoryDB() });
 }
 
-async function seedClone(memory: Awaited<ReturnType<typeof createMemory>>, newThreadId: string) {
-  const createdAt = new Date('2026-01-01T00:00:00.000Z');
+async function seedClone(
+  memory: Awaited<ReturnType<typeof createMemory>>,
+  newThreadId: string,
+  createdAt = new Date('2026-01-01T00:00:00.000Z'),
+) {
   await memory.saveThread({
     thread: {
       id: 'source-thread',
@@ -168,6 +171,56 @@ describe('InMemoryMemory conditional clone rollback', () => {
     });
     await expect(memory.getThreadById({ threadId: clone.thread.id })).resolves.toMatchObject({
       metadata: { concurrent: { writer: 'storage-api' } },
+    });
+  });
+
+  it('isolates cloned message dates from clone results and message reads', async () => {
+    const memory = await createMemory();
+    const sourceMessageCreatedAt = new Date('2026-01-01T00:00:00.000Z');
+    const clone = await seedClone(memory, 'date-alias-clone', sourceMessageCreatedAt);
+    const clonedMessage = clone.clonedMessages[0];
+    if (!clonedMessage) throw new Error('Expected a cloned message.');
+
+    clonedMessage.createdAt.setTime(0);
+    sourceMessageCreatedAt.setTime(1);
+    const sourceRead = await memory.listMessages({ threadId: 'source-thread' });
+    const cloneRead = await memory.listMessages({ threadId: clone.thread.id });
+    expect(sourceRead.messages[0]?.createdAt).toEqual(new Date('2026-01-01T00:00:00.000Z'));
+    expect(cloneRead.messages[0]?.createdAt).toEqual(new Date('2026-01-01T00:00:00.000Z'));
+
+    sourceRead.messages[0]!.createdAt.setTime(1);
+    cloneRead.messages[0]!.createdAt.setTime(2);
+    await expect(memory.listMessages({ threadId: 'source-thread' })).resolves.toMatchObject({
+      messages: [{ createdAt: new Date('2026-01-01T00:00:00.000Z') }],
+    });
+    await expect(memory.listMessages({ threadId: clone.thread.id })).resolves.toMatchObject({
+      messages: [{ createdAt: new Date('2026-01-01T00:00:00.000Z') }],
+    });
+    await expect(memory.rollbackThreadClone({ thread: clone.rollbackReceipt })).resolves.toEqual({
+      status: 'rolled_back',
+    });
+  });
+
+  it('preserves a clone whose message date was changed through the storage API', async () => {
+    const memory = await createMemory();
+    const clone = await seedClone(memory, 'updated-date-clone');
+    const clonedMessage = clone.clonedMessages[0];
+    if (!clonedMessage) throw new Error('Expected a cloned message.');
+    const updatedAt = new Date('2026-01-02T00:00:00.000Z');
+
+    const [updatedMessage] = await memory.updateMessages({
+      messages: [{ id: clonedMessage.id, createdAt: updatedAt }],
+    });
+    if (!updatedMessage) throw new Error('Expected the cloned message to be updated.');
+    updatedAt.setTime(0);
+    updatedMessage.createdAt.setTime(1);
+
+    await expect(memory.rollbackThreadClone({ thread: clone.rollbackReceipt })).resolves.toEqual({
+      status: 'conflict',
+      reason: 'thread',
+    });
+    await expect(memory.listMessages({ threadId: clone.thread.id })).resolves.toMatchObject({
+      messages: [{ createdAt: new Date('2026-01-02T00:00:00.000Z') }],
     });
   });
 
