@@ -266,7 +266,7 @@ describe('createLLMExecutionStep gateway provider tools', () => {
     expect(toolResult.result).toBeUndefined();
   });
 
-  it('does not continue when finishReason is length with pending tool calls', async () => {
+  it('does not continue when finishReason is length with a truncated tool payload', async () => {
     const tools = {
       echo: createTool({
         id: 'echo',
@@ -303,7 +303,7 @@ describe('createLLMExecutionStep gateway provider tools', () => {
                   type: 'tool-call',
                   toolCallId: 'call-1',
                   toolName: 'echo',
-                  input: '{"text":"partial"}',
+                  input: '{"text":"par',
                 },
                 {
                   type: 'finish',
@@ -345,6 +345,87 @@ describe('createLLMExecutionStep gateway provider tools', () => {
     ]);
     expect(result.stepResult.reason).toBe('length');
     expect(result.stepResult.isContinued).toBe(false);
+  });
+
+  it('continues when finishReason is length but the local tool payload is complete', async () => {
+    const tools = {
+      echo: createTool({
+        id: 'echo',
+        description: 'Echo input text',
+        inputSchema: z.object({
+          text: z.string(),
+        }),
+        execute: vi.fn(async ({ text }) => ({ text })),
+      }),
+    };
+
+    const llmExecutionStep = createLLMExecutionStep({
+      agentId: 'test-agent',
+      messageId: 'msg-0',
+      runId: 'test-run',
+      startTimestamp: Date.now(),
+      methodType: 'stream',
+      controller,
+      outputWriter: vi.fn(),
+      messageList,
+      models: [
+        {
+          id: 'test-model',
+          maxRetries: 0,
+          model: {
+            specificationVersion: 'v2' as const,
+            provider: 'mock-provider',
+            modelId: 'mock-model-id',
+            supportedUrls: {},
+            doGenerate: vi.fn(),
+            doStream: vi.fn(async () => ({
+              stream: convertArrayToReadableStream([
+                {
+                  type: 'tool-call',
+                  toolCallId: 'call-complete',
+                  toolName: 'echo',
+                  input: '{"text":"complete"}',
+                },
+                {
+                  type: 'finish',
+                  finishReason: 'length',
+                  usage: testUsage,
+                },
+              ]),
+              request: {},
+              response: {
+                headers: undefined,
+              },
+              warnings: [],
+            })),
+          } as any,
+        },
+      ],
+      tools,
+      streamState: {
+        serialize: vi.fn(),
+        deserialize: vi.fn(),
+      },
+      _internal: {
+        generateId: () => 'generated-id',
+      },
+      logger: {
+        error: vi.fn(),
+        warn: vi.fn(),
+        debug: vi.fn(),
+      } as any,
+    } as unknown as OuterLLMRun<typeof tools>);
+
+    const result = await llmExecutionStep.execute(createExecuteParams(createIterationInput()));
+
+    expect(result.output.toolCalls).toEqual([
+      expect.objectContaining({
+        toolCallId: 'call-complete',
+        toolName: 'echo',
+      }),
+    ]);
+    expect(result.stepResult.reason).toBe('length');
+    expect(result.stepResult.isContinued).toBe(true);
   });
 
   it('does not continue when finishReason is content-filter', async () => {

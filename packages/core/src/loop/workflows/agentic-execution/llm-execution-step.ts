@@ -123,6 +123,19 @@ import { notifyToolDenied } from './tool-permission-notify';
  */
 const TERMINAL_FINISH_REASONS = ['stop', 'error', 'length', 'content-filter'];
 
+function localToolCallPayloadIsComplete(toolCall: { args?: unknown; input?: unknown }): boolean {
+  const raw = toolCall.args ?? toolCall.input;
+  if (raw === undefined || raw === null) return false;
+  if (typeof raw === 'object') return true;
+  if (typeof raw !== 'string' || raw.trim().length === 0) return false;
+  try {
+    JSON.parse(raw);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function getRequestInputProcessors({
   inputProcessors,
   llmRequestInputProcessors,
@@ -2603,26 +2616,21 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
       // Provider-executed tools (e.g. web_search) are handled server-side — the response already
       // contains both the tool execution and the text output, so no additional loop iteration is needed.
       //
-      // NOTE: hasPendingToolCalls must NOT override finishReason='length'.
-      // When the provider hits max_tokens mid-generation, it returns finishReason='length' and
-      // may also emit a partial/truncated tool call. Retrying with the same parameters produces
-      // the same truncation → infinite loop until maxSteps. PR #13861 / issue #13012 explicitly
-      // excluded 'length' from shouldContinue; this guard prevents hasPendingToolCalls from
-      // inadvertently re-enabling it.
-      // See: https://github.com/mastra-ai/mastra/issues/15717
-      // `error` failures, `length` truncation, and `content-filter` refusals
-      // must never be overridden by a pending tool call: retrying re-sends the
-      // same request (reproducing the failure/truncation, or re-triggering the
-      // same refusal) and the loop spins until maxSteps — or forever when
-      // maxSteps is unset. Note we deliberately do NOT exclude `stop` here:
-      // some models return finishReason='stop' alongside tool calls, which the
-      // loop must process.
+      // NOTE: truncated (`length`) generations must not retry the same request
+      // (issue #15717). A *complete* local tool payload on a length finish is
+      // different: the tool can execute and the next iteration consumes the
+      // result. Incomplete/truncated tool JSON still stops the loop.
+      // `error` and `content-filter` must never be overridden. `stop` is
+      // intentionally allowed — some models return stop alongside tool calls.
+      const hasCompleteLocalToolCalls = toolCalls?.some(
+        tc => !tc.providerExecuted && localToolCallPayloadIsComplete(tc),
+      );
       const hasPendingToolCalls =
         toolCalls &&
         toolCalls.some(tc => !tc.providerExecuted) &&
         finishReason !== 'error' &&
-        finishReason !== 'length' &&
-        finishReason !== 'content-filter';
+        finishReason !== 'content-filter' &&
+        (finishReason !== 'length' || Boolean(hasCompleteLocalToolCalls));
       const shouldContinue =
         !responseRecoveryStep &&
         !providerViolatedToolFence &&
