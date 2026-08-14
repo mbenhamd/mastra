@@ -3135,9 +3135,7 @@ export class MemoryPG extends MemoryStorage {
     try {
       return await this.#db.client.tx(async t => {
         const lifecycleThreadIds = [...new Set([sourceThreadId, newThreadId])].sort();
-        for (const threadId of lifecycleThreadIds) {
-          await this.lockThreadCloneLifecycle(t, threadId);
-        }
+        await this.lockThreadLifecycles(t, lifecycleThreadIds);
         type CloneThreadRow = StorageThreadType & {
           createdAtZ?: Date | string;
           updatedAtZ?: Date | string;
