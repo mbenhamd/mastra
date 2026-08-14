@@ -790,16 +790,19 @@ export class InMemoryMemory extends MemoryStorage {
         for (const update of canonicalUpdates) {
           const message = this.db.messages.get(update.id);
           if (!message?.thread_id) continue;
-          const sourceResourceId = message.resourceId ?? this.db.threads.get(message.thread_id)?.resourceId;
-          addCoordinate(sourceResourceId, message.thread_id);
+          const source = this.resolveObservationalMemoryRetractionInput(
+            message.thread_id,
+            message.resourceId ?? undefined,
+          );
+          addCoordinate(source?.resourceId, source?.threadId);
 
           const destinationThreadId = update.threadId ?? message.thread_id;
-          const destinationResourceId =
+          const destination = this.resolveObservationalMemoryRetractionInput(
+            destinationThreadId,
             update.resourceId ??
-            (destinationThreadId === message.thread_id
-              ? sourceResourceId
-              : this.db.threads.get(destinationThreadId)?.resourceId);
-          addCoordinate(destinationResourceId, destinationThreadId);
+              (destinationThreadId === message.thread_id ? (message.resourceId ?? undefined) : undefined),
+          );
+          addCoordinate(destination?.resourceId, destination?.threadId);
         }
         retractionCoordinates.push(
           ...[...coordinates.values()].sort((a, b) =>
@@ -916,12 +919,12 @@ export class InMemoryMemory extends MemoryStorage {
         for (const messageId of messageIds) {
           const message = this.db.messages.get(messageId);
           if (!message?.thread_id) continue;
-          const resourceId = message.resourceId ?? this.db.threads.get(message.thread_id)?.resourceId;
-          if (!resourceId) continue;
-          coordinates.set(`${resourceId}\u0000${message.thread_id}`, {
-            resourceId,
-            threadId: message.thread_id,
-          });
+          const input = this.resolveObservationalMemoryRetractionInput(
+            message.thread_id,
+            message.resourceId ?? undefined,
+          );
+          if (!input) continue;
+          coordinates.set(`${input.resourceId}\u0000${input.threadId}`, input);
         }
         retractionCoordinates.push(
           ...[...coordinates.values()].sort((a, b) =>
@@ -1667,6 +1670,15 @@ export class InMemoryMemory extends MemoryStorage {
       return `thread:${threadId}`;
     }
     return `resource:${resourceId}`;
+  }
+
+  private resolveObservationalMemoryRetractionInput(
+    threadId: string,
+    fallbackResourceId?: string,
+  ): RetractObservationalMemoryInput | null {
+    const threadRecords = this.db.observationalMemory.get(this.getObservationalMemoryKey(threadId, '')) ?? [];
+    const resourceId = threadRecords[0]?.resourceId ?? fallbackResourceId ?? this.db.threads.get(threadId)?.resourceId;
+    return resourceId ? { resourceId, threadId } : null;
   }
 
   async getObservationalMemory(threadId: string | null, resourceId: string): Promise<ObservationalMemoryRecord | null> {

@@ -299,6 +299,80 @@ describe('MemoryStorage atomic observational-memory retraction', () => {
     await expect(memory.getObservationalMemory('thread-destination', 'resource-destination')).resolves.toBeNull();
   });
 
+  it.each(['update', 'delete'] as const)(
+    'uses the persisted thread OM owner for message %s retraction',
+    async operation => {
+      const storage = new InMemoryStore({ id: `memory-observational-retraction-owner-${operation}` });
+      const memory = await storage.getStore('memory');
+      if (!memory) throw new Error('Expected in-memory storage domain.');
+      const createdAt = new Date('2026-01-01T00:00:00.000Z');
+      const messageResourceId = `message-resource-${operation}`;
+      const ownerResourceId = `owner-resource-${operation}`;
+      const threadId = `owner-thread-${operation}`;
+      const messageId = `owner-message-${operation}`;
+
+      for (const [id, workingMemory] of [
+        [messageResourceId, 'unrelated message-resource memory'],
+        [ownerResourceId, 'observer-managed owner memory'],
+      ] as const) {
+        await memory.saveResource({
+          resource: { id, workingMemory, metadata: {}, createdAt, updatedAt: createdAt },
+        });
+      }
+      await memory.saveThread({
+        thread: {
+          id: threadId,
+          resourceId: ownerResourceId,
+          title: threadId,
+          metadata: {},
+          createdAt,
+          updatedAt: createdAt,
+        },
+      });
+      await memory.initializeObservationalMemory({
+        config: { _managedWorkingMemoryScope: 'resource' },
+        resourceId: ownerResourceId,
+        scope: 'thread',
+        threadId,
+      });
+      await memory.saveMessages({
+        messages: [
+          {
+            id: messageId,
+            threadId,
+            resourceId: messageResourceId,
+            role: 'user',
+            content: { format: 2, parts: [{ type: 'text', text: 'Retract by owner' }] },
+            createdAt,
+          },
+        ],
+      });
+
+      const retractions: Array<{ input: { resourceId: string; threadId: string } }> = [];
+      if (operation === 'update') {
+        await memory.updateMessages({
+          messages: [{ id: messageId, content: { content: 'authoritative edit' } }],
+          retractObservationalMemory: true,
+          observationalMemoryRetractions: retractions as any,
+        });
+      } else {
+        await memory.deleteMessages([messageId], {
+          retractObservationalMemory: true,
+          observationalMemoryRetractions: retractions as any,
+        });
+      }
+
+      expect(retractions).toMatchObject([{ input: { resourceId: ownerResourceId, threadId } }]);
+      await expect(memory.getObservationalMemory(threadId, ownerResourceId)).resolves.toBeNull();
+      await expect(memory.getResourceById({ resourceId: ownerResourceId })).resolves.toMatchObject({
+        workingMemory: undefined,
+      });
+      await expect(memory.getResourceById({ resourceId: messageResourceId })).resolves.toMatchObject({
+        workingMemory: 'unrelated message-resource memory',
+      });
+    },
+  );
+
   it('uses the last duplicate update for both the message move and OM retraction coordinates', async () => {
     const storage = new InMemoryStore({ id: 'memory-observational-retraction-duplicate-update' });
     const memory = await storage.getStore('memory');

@@ -2103,7 +2103,7 @@ export class MemoryPG extends MemoryStorage {
           ];
         });
         committedRetractions.push(
-          ...(await this.retractObservationalMemoryForMessageRowsInTransaction(t, retractionRows)),
+          ...(await this.retractObservationalMemoryForMessageRowsInTransaction(t, retractionRows, messageIds[0])),
         );
       }
 
@@ -2287,6 +2287,7 @@ export class MemoryPG extends MemoryStorage {
                 threadId: message.threadId,
                 resourceId: message.resolvedResourceId,
               })),
+              messageIds[0],
             )),
           );
         }
@@ -4499,33 +4500,38 @@ export class MemoryPG extends MemoryStorage {
   private async retractObservationalMemoryForMessageRowsInTransaction(
     t: TxClient,
     messages: ReadonlyArray<{ threadId?: string | null; resourceId?: string | null }>,
+    conflictId?: string,
   ): Promise<ObservationalMemoryRetractionReceipt[]> {
-    const unresolvedThreadIds = [
-      ...new Set(
-        messages.filter(message => message.threadId && !message.resourceId).map(message => message.threadId as string),
-      ),
-    ];
-    const threadResources = new Map<string, string>();
-    if (unresolvedThreadIds.length > 0) {
-      const threadTableName = getTableName({
-        indexName: TABLE_THREADS,
-        schemaName: getSchemaName(this.#schema),
-      });
-      const threads = await t.manyOrNone<{ threadId: string; resourceId: string }>(
-        `SELECT id AS "threadId", "resourceId"
-         FROM ${threadTableName}
-         WHERE id IN (${inPlaceholders(unresolvedThreadIds.length)})`,
-        unresolvedThreadIds,
+    const threadIds = sortedUniqueStrings(messages.map(message => message.threadId));
+    const lookupKeys = threadIds.map(threadId => this.getOMKey(threadId, ''));
+    const omTableName = getTableName({ indexName: OM_TABLE, schemaName: getSchemaName(this.#schema) });
+    const readCurrentRecords = async (lockRows: boolean) => {
+      if (lookupKeys.length === 0) return new Map<string, { id: string; resourceId: string }>();
+      const rows = await t.manyOrNone<{
+        id: string;
+        lookupKey: string;
+        resourceId: string;
+      }>(
+        `SELECT id, "lookupKey", "resourceId"
+         FROM ${omTableName}
+         WHERE "lookupKey" IN (${inPlaceholders(lookupKeys.length)})
+         ORDER BY "lookupKey", "generationCount" DESC, id
+         ${lockRows ? 'FOR UPDATE' : ''}`,
+        lookupKeys,
       );
-      for (const thread of threads) {
-        threadResources.set(thread.threadId, thread.resourceId);
+      const current = new Map<string, { id: string; resourceId: string }>();
+      for (const row of rows) {
+        if (!current.has(row.lookupKey)) current.set(row.lookupKey, row);
       }
-    }
+      return current;
+    };
+
+    const discoveredRecords = await readCurrentRecords(false);
 
     const coordinates = new Map<string, RetractObservationalMemoryInput>();
     for (const message of messages) {
       if (!message.threadId) continue;
-      const resourceId = message.resourceId ?? threadResources.get(message.threadId);
+      const resourceId = discoveredRecords.get(this.getOMKey(message.threadId, ''))?.resourceId ?? message.resourceId;
       if (!resourceId) continue;
       coordinates.set(`${resourceId}\u0000${message.threadId}`, {
         resourceId,
@@ -4540,6 +4546,17 @@ export class MemoryPG extends MemoryStorage {
       t,
       [...coordinates.values()].map(input => input.resourceId),
     );
+
+    const lockedRecords = await readCurrentRecords(true);
+    if (
+      lookupKeys.some(lookupKey => {
+        const discovered = discoveredRecords.get(lookupKey);
+        const locked = lockedRecords.get(lookupKey);
+        return discovered?.id !== locked?.id || discovered?.resourceId !== locked?.resourceId;
+      })
+    ) {
+      throw new MessageMutationConflictError(conflictId ?? threadIds[0] ?? 'unknown');
+    }
 
     const receipts: ObservationalMemoryRetractionReceipt[] = [];
     for (const input of [...coordinates.values()].sort((a, b) =>
