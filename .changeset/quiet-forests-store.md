@@ -25,3 +25,5 @@ const firstInactivePage = await memoryStore.listThreads({
   filter: { updatedBefore: new Date('2026-01-01T00:00:00.000Z') },
 });
 ```
+
+`@mastra/pg` imports these governance contracts from `@mastra/core`. Pack both packages from the same workspace release so the packed PostgreSQL peer resolves to the exact compatible Core version; update them atomically.
