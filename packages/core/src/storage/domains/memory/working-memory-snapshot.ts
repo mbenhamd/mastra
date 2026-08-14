@@ -96,8 +96,11 @@ function assertSupportedJsonNumbers(value: JsonValue): void {
       }
       continue;
     }
-    if (Array.isArray(current)) pending.push(...current);
-    else if (isRecord(current)) pending.push(...(Object.values(current) as JsonValue[]));
+    if (Array.isArray(current)) {
+      for (const child of current) pending.push(child);
+    } else if (isRecord(current)) {
+      for (const child of Object.values(current)) pending.push(child as JsonValue);
+    }
   }
 }
 
@@ -458,28 +461,76 @@ export function assertThreadWorkingMemoryIsUngoverned(metadata: Record<string, u
 }
 
 function storedControlEquals(left: unknown, right: unknown): boolean {
-  if (left === right) return true;
-  if (left === null || right === null || typeof left !== 'object' || typeof right !== 'object') return false;
-  if (Array.isArray(left) || Array.isArray(right)) {
-    return (
-      Array.isArray(left) &&
-      Array.isArray(right) &&
-      left.length === right.length &&
-      left.every((value, index) => storedControlEquals(value, right[index]))
-    );
+  type CompareFrame = { kind: 'compare'; left: unknown; right: unknown };
+  type CompleteFrame = { kind: 'complete'; left: object; right: object };
+  type ComparisonFrame = CompareFrame | CompleteFrame;
+  type PairState = 'visiting' | 'complete';
+
+  const pending: ComparisonFrame[] = [{ kind: 'compare', left, right }];
+  const pairStates = new WeakMap<object, WeakMap<object, PairState>>();
+  const setPairState = (leftObject: object, rightObject: object, state: PairState) => {
+    let rightStates = pairStates.get(leftObject);
+    if (!rightStates) {
+      rightStates = new WeakMap<object, PairState>();
+      pairStates.set(leftObject, rightStates);
+    }
+    rightStates.set(rightObject, state);
+  };
+
+  while (pending.length > 0) {
+    const frame = pending.pop()!;
+    if (frame.kind === 'complete') {
+      setPairState(frame.left, frame.right, 'complete');
+      continue;
+    }
+
+    const { left: currentLeft, right: currentRight } = frame;
+    if (currentLeft === currentRight) continue;
+    if (
+      currentLeft === null ||
+      currentRight === null ||
+      typeof currentLeft !== 'object' ||
+      typeof currentRight !== 'object'
+    ) {
+      return false;
+    }
+
+    const pairState = pairStates.get(currentLeft)?.get(currentRight);
+    // Separate cyclic control graphs are not safe repetitions of the stored
+    // value. Fail closed so the public guard emits its validation error.
+    if (pairState === 'visiting') return false;
+    if (pairState === 'complete') continue;
+
+    if (Array.isArray(currentLeft) || Array.isArray(currentRight)) {
+      if (!Array.isArray(currentLeft) || !Array.isArray(currentRight) || currentLeft.length !== currentRight.length) {
+        return false;
+      }
+      setPairState(currentLeft, currentRight, 'visiting');
+      pending.push({ kind: 'complete', left: currentLeft, right: currentRight });
+      for (let index = currentLeft.length - 1; index >= 0; index -= 1) {
+        pending.push({ kind: 'compare', left: currentLeft[index], right: currentRight[index] });
+      }
+      continue;
+    }
+
+    const leftRecord = currentLeft as Record<string, unknown>;
+    const rightRecord = currentRight as Record<string, unknown>;
+    const leftKeys = Object.keys(leftRecord);
+    if (
+      leftKeys.length !== Object.keys(rightRecord).length ||
+      leftKeys.some(key => !Object.prototype.hasOwnProperty.call(rightRecord, key))
+    ) {
+      return false;
+    }
+    setPairState(currentLeft, currentRight, 'visiting');
+    pending.push({ kind: 'complete', left: currentLeft, right: currentRight });
+    for (let index = leftKeys.length - 1; index >= 0; index -= 1) {
+      const key = leftKeys[index]!;
+      pending.push({ kind: 'compare', left: leftRecord[key], right: rightRecord[key] });
+    }
   }
-  const leftRecord = left as Record<string, unknown>;
-  const rightRecord = right as Record<string, unknown>;
-  const leftKeys = Object.keys(leftRecord);
-  const rightKeys = Object.keys(rightRecord);
-  return (
-    leftKeys.length === rightKeys.length &&
-    leftKeys.every(
-      key =>
-        Object.prototype.hasOwnProperty.call(rightRecord, key) &&
-        storedControlEquals(leftRecord[key], rightRecord[key]),
-    )
-  );
+
+  return true;
 }
 
 /**

@@ -3,11 +3,13 @@ import { describe, expect, it } from 'vitest';
 import { InMemoryStore } from '../../mock';
 import {
   applyWorkingMemorySnapshotUpdate,
+  assertWorkingMemorySnapshotUnchanged,
   hasWorkingMemorySnapshotControls,
   normalizeWorkingMemoryPaths,
   readWorkingMemorySnapshot,
   retractObserverWorkingMemorySnapshot,
   WorkingMemoryRevisionConflictError,
+  WorkingMemoryValidationError,
   writeWorkingMemorySnapshotMetadata,
 } from './working-memory-snapshot';
 
@@ -537,6 +539,72 @@ describe('revisioned Working Memory controls', () => {
     const metadata = writeWorkingMemorySnapshotMetadata({}, snapshot);
 
     expect(readWorkingMemorySnapshot(snapshot.value, metadata)).toEqual(snapshot);
+  });
+
+  it.each([
+    ['array', () => JSON.stringify(Array.from({ length: 200_000 }, () => 0))],
+    [
+      'object',
+      () => JSON.stringify(Object.fromEntries(Array.from({ length: 200_000 }, (_, index) => [`k${index}`, 0]))),
+    ],
+  ] as const)('validates a very large JSON %s without overflowing call arguments', (_kind, createValue) => {
+    const value = createValue();
+    const updatedAt = '2026-01-01T00:00:00.000Z';
+
+    const updated = applyWorkingMemorySnapshotUpdate(
+      { value: null, revision: 0, protectedPaths: [], provenance: {} },
+      { value, expectedRevision: 0, source: 'owner' },
+      updatedAt,
+    );
+
+    expect(updated).toMatchObject({
+      value,
+      revision: 1,
+      protectedPaths: [],
+      provenance: { '': { source: 'owner', revision: 1, updatedAt } },
+    });
+  });
+
+  it('rejects separately allocated cyclic ignored control properties with a validation error', () => {
+    const createControl = () => {
+      const control: Record<string, unknown> = { revision: 1, protectedPaths: [], provenance: {} };
+      control.ignored = control;
+      return control;
+    };
+
+    expect(() =>
+      assertWorkingMemorySnapshotUnchanged({
+        currentValue: '{}',
+        currentMetadata: { mastra: { workingMemory: createControl() } },
+        proposedValue: undefined,
+        proposedValueProvided: false,
+        proposedMetadata: { mastra: { workingMemory: createControl() } },
+      }),
+    ).toThrow(WorkingMemoryValidationError);
+  });
+
+  it('accepts equal acyclic ignored control properties deeper than shallow guard limits', () => {
+    const createControl = () => {
+      const control: Record<string, unknown> = { revision: 1, protectedPaths: [], provenance: {} };
+      let cursor = control;
+      for (let depth = 0; depth < 64; depth += 1) {
+        const child: Record<string, unknown> = {};
+        cursor.ignored = child;
+        cursor = child;
+      }
+      cursor.value = 'leaf';
+      return control;
+    };
+
+    expect(() =>
+      assertWorkingMemorySnapshotUnchanged({
+        currentValue: '{}',
+        currentMetadata: { mastra: { workingMemory: createControl() } },
+        proposedValue: undefined,
+        proposedValueProvided: false,
+        proposedMetadata: { mastra: { workingMemory: createControl() } },
+      }),
+    ).not.toThrow();
   });
 
   it('fails closed when stored controls are malformed', () => {
