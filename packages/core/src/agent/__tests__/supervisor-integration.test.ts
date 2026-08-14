@@ -14,9 +14,9 @@ import type { MessageFilterContext, DelegationCompleteContext, IterationComplete
 import type { MastraDBMessage } from '../message-list/state/types';
 
 // PF-2303 (fork PR #326) changes packages/core/src/llm/model/router.ts, and
-// PF-2935 (fork PRs #352 and #353) changes
-// packages/core/src/agent/thread-stream-runtime.ts. Both are part of this
-// suite's runtime surface. The fork PR validator
+// PF-2935 (fork PRs #352 through #354) changes thread-stream transport and
+// agentic tool settlement. Those are part of this suite's runtime surface.
+// The fork PR validator
 // re-verifies and re-runs this provider-gated suite whenever that surface
 // changes, so it is admitted here. Behaviour is unchanged and the reviewed
 // provider gate (imports, the real-provider describe, and its empty-key skip) is

@@ -15,9 +15,10 @@ import { createToolCallStep } from './tool-call-step';
 // engine validates/strips step outputs against toolCallOutputSchema), then feeds it
 // into the REAL llm-mapping-step. Pre-fix, the pipeline produced `{ error }` which the
 // mapping step recorded as a completed `output-error` invocation — a fabricated
-// completion whose text was the abort message. The unit tests in tool-call-step.test.ts
-// and llm-mapping-step.test.ts each pin one half of this chain; this test pins the
-// composition so neither half can silently regress against the other's expectations.
+// completion whose text was the abort message. The current contract preserves the
+// cancellation error only as a stream terminal while leaving model history incomplete.
+// The unit tests in tool-call-step.test.ts and llm-mapping-step.test.ts each pin one
+// half of this chain; this test pins their composition.
 describe('aborted tool call pipeline (tool-call-step → schema boundary → llm-mapping-step)', () => {
   it('leaves the call unrecorded end-to-end when the request abort interrupts the tool', async () => {
     // -- Real tool that throws mid-flight, as fetch/etc. do when the request aborts.
@@ -145,16 +146,24 @@ describe('aborted tool call pipeline (tool-call-step → schema boundary → llm
     } as any);
 
     // Nothing persisted: the message history is never updated for the aborted call —
-    // no fabricated success, no output-error whose text is the abort message.
+    // no fabricated success, no output-error whose text the model could consume.
     expect(updateToolInvocation).not.toHaveBeenCalled();
-    // No result/error chunks reach the stream for the aborted call.
     expect(controller.enqueue).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'tool-result' }));
-    expect(controller.enqueue).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'tool-error' }));
+    expect(controller.enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'tool-error',
+        payload: expect.objectContaining({
+          toolCallId: 'call-1',
+          error: expect.objectContaining({ message: 'The operation was aborted.' }),
+        }),
+      }),
+    );
     // The loop ends, leaving the call incomplete rather than continuing on a fake result.
     expect(bail).toHaveBeenCalled();
     expect(result.stepResult.isContinued).toBe(false);
     // And the abort marker itself survived the schema boundary intact.
     expect(crossedBoundary.aborted).toBe(true);
+    expect(crossedBoundary.abortError).toMatchObject({ message: 'The operation was aborted.' });
     expect(crossedBoundary).not.toHaveProperty('result');
     expect(crossedBoundary.error).toBeUndefined();
   });

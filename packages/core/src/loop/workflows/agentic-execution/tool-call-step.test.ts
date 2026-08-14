@@ -420,6 +420,10 @@ describe('createToolCallStep tool execution error handling', () => {
     const result = await toolCallStep.execute(makeExecuteParams({ inputData: makeInputData() }));
 
     expect(result).toHaveProperty('aborted', true);
+    expect(result).toHaveProperty(
+      'abortError',
+      expect.objectContaining({ name: 'Error', message: 'The operation was aborted.' }),
+    );
     expect(result).not.toHaveProperty('error');
     expect(result).not.toHaveProperty('result');
   });

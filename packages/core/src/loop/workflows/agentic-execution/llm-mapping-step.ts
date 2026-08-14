@@ -560,6 +560,35 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
         )
       ) {
         const errorResults = inputData.filter(toolCall => toolCall?.error && !toolCall.providerExecuted);
+        const abortedResults = inputData.filter(
+          toolCall => toolCall?.aborted && toolCall.abortError && !toolCall.providerExecuted,
+        );
+
+        // Request-aborted tools remain incomplete in model history, but their
+        // actual cancellation error is still authoritative for live stream and
+        // Harness consumers. Emit that terminal without calling
+        // persistResolvedToolCall or allowing another model iteration.
+        for (const toolCall of abortedResults) {
+          const reifiedError = deserializeToolError(toolCall.abortError);
+          const chunk = await transformToolChunk(
+            {
+              type: 'tool-error',
+              runId: rest.runId,
+              from: ChunkFrom.AGENT,
+              payload: {
+                error: reifiedError,
+                args: toolCall.args,
+                toolCallId: toolCall.toolCallId,
+                toolName: toolCall.toolName,
+                providerMetadata: toolCall.providerMetadata as ProviderMetadata | undefined,
+              },
+            },
+            { ...toolCall, error: reifiedError },
+            'error',
+          );
+          const processed = await processAndEnqueueChunk(chunk, terminalResolutionState);
+          if (processed) await rest.options?.onChunk?.(processed);
+        }
 
         if (errorResults?.length) {
           for (const toolCall of errorResults) {
