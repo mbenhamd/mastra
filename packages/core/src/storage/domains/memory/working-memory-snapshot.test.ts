@@ -615,6 +615,124 @@ describe('InMemoryMemory revisioned Working Memory', () => {
     });
   });
 
+  it('atomically mutates thread rows with governed thread Working Memory', async () => {
+    const storage = new InMemoryStore({ id: 'working-memory-atomic-thread-mutations' });
+    const memory = await storage.getStore('memory');
+    if (!memory) throw new Error('Expected in-memory storage domain.');
+    const createdAt = new Date('2026-01-01T00:00:00.000Z');
+    const resourceId = 'atomic-thread-resource';
+    const threadId = 'atomic-thread';
+
+    const created = await memory.mutateThreadWithWorkingMemory({
+      mutation: {
+        type: 'save',
+        thread: {
+          id: threadId,
+          resourceId,
+          title: 'Created',
+          metadata: { preserved: true },
+          createdAt,
+          updatedAt: createdAt,
+        },
+      },
+      workingMemory: {
+        type: 'observer-update',
+        resourceId,
+        value: '{"version":1}',
+        expectedRevision: 0,
+      },
+    });
+    expect(created.thread).toMatchObject({
+      title: 'Created',
+      metadata: { preserved: true, workingMemory: '{"version":1}' },
+    });
+    expect(created.workingMemory).toMatchObject({ value: '{"version":1}', revision: 1 });
+
+    const owner = await memory.applyWorkingMemoryUpdate({
+      scope: 'thread',
+      resourceId,
+      threadId,
+      value: '{"keep":"1234"}',
+      expectedRevision: 1,
+      source: 'owner',
+      protectPaths: ['/keep'],
+    });
+    const beforeRejectedMutation = await memory.getThreadById({ threadId });
+    await expect(
+      memory.mutateThreadWithWorkingMemory({
+        mutation: {
+          type: 'save',
+          thread: {
+            id: threadId,
+            resourceId,
+            title: 'Rejected save',
+            metadata: { changed: true },
+            createdAt,
+            updatedAt: new Date('2026-01-02T00:00:00.000Z'),
+          },
+        },
+        workingMemory: {
+          type: 'observer-update',
+          resourceId,
+          value: '{"new":"5678"}',
+          expectedRevision: owner.revision,
+          maxDataBytes: 20,
+        },
+      }),
+    ).rejects.toThrow('UTF-8 byte limit');
+    await expect(memory.getThreadById({ threadId })).resolves.toEqual(beforeRejectedMutation);
+
+    await expect(
+      memory.mutateThreadWithWorkingMemory({
+        mutation: { type: 'update', id: threadId, title: 'Rejected', metadata: { changed: true } },
+        workingMemory: {
+          type: 'observer-update',
+          resourceId,
+          value: '{"new":"5678"}',
+          expectedRevision: owner.revision,
+          maxDataBytes: 20,
+        },
+      }),
+    ).rejects.toThrow('UTF-8 byte limit');
+    await expect(memory.getThreadById({ threadId })).resolves.toEqual(beforeRejectedMutation);
+
+    await expect(
+      memory.mutateThreadWithWorkingMemory({
+        mutation: { type: 'update', id: threadId, title: 'Stale', metadata: { changed: true } },
+        workingMemory: {
+          type: 'observer-update',
+          resourceId,
+          value: '{"version":2}',
+          expectedRevision: owner.revision - 1,
+        },
+      }),
+    ).rejects.toMatchObject({ name: 'WorkingMemoryRevisionConflictError' });
+    await expect(memory.getThreadById({ threadId })).resolves.toEqual(beforeRejectedMutation);
+
+    await expect(
+      memory.mutateThreadWithWorkingMemory({
+        mutation: { type: 'update', id: threadId, title: 'Hidden', metadata: { changed: true } },
+        workingMemory: { type: 'require-ungoverned' },
+      }),
+    ).rejects.toThrow('explicit workingMemory value');
+    await expect(memory.getThreadById({ threadId })).resolves.toEqual(beforeRejectedMutation);
+
+    const updated = await memory.mutateThreadWithWorkingMemory({
+      mutation: { type: 'update', id: threadId, title: 'Updated', metadata: { changed: true } },
+      workingMemory: {
+        type: 'observer-update',
+        resourceId,
+        value: '{"keep":"ignored","version":2}',
+        expectedRevision: owner.revision,
+      },
+    });
+    expect(updated.thread).toMatchObject({
+      title: 'Updated',
+      metadata: { preserved: true, changed: true, workingMemory: '{"keep":"1234","version":2}' },
+    });
+    expect(updated.workingMemory).toMatchObject({ revision: owner.revision + 1 });
+  });
+
   it('rejects generic mutations while preserving governed fields omitted from whole-row saves', async () => {
     const storage = new InMemoryStore({ id: 'working-memory-generic-write-guards' });
     const memory = await storage.getStore('memory');

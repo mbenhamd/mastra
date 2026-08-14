@@ -359,6 +359,120 @@ describe('MemoryPG revisioned Working Memory', () => {
     ).resolves.toEqual({ value: null, revision: 0, protectedPaths: [], provenance: {} });
   });
 
+  it('atomically mutates thread rows with governed thread Working Memory', async () => {
+    const atomicResourceId = `${resourceId}-atomic-thread-row`;
+    const atomicThreadId = `${threadId}-atomic-thread-row`;
+    const createdAt = new Date('2026-01-01T00:00:00.000Z');
+    const created = await firstMemory.mutateThreadWithWorkingMemory({
+      mutation: {
+        type: 'save',
+        thread: {
+          id: atomicThreadId,
+          resourceId: atomicResourceId,
+          title: 'Created',
+          metadata: { preserved: true },
+          createdAt,
+          updatedAt: createdAt,
+        },
+      },
+      workingMemory: {
+        type: 'observer-update',
+        resourceId: atomicResourceId,
+        value: '{"version":1}',
+        expectedRevision: 0,
+      },
+    });
+    expect(created.thread).toMatchObject({
+      title: 'Created',
+      metadata: { preserved: true, workingMemory: '{"version":1}' },
+    });
+    expect(created.workingMemory).toMatchObject({ value: '{"version":1}', revision: 1 });
+
+    const owner = await firstMemory.applyWorkingMemoryUpdate({
+      scope: 'thread',
+      resourceId: atomicResourceId,
+      threadId: atomicThreadId,
+      value: '{"keep":"1234"}',
+      expectedRevision: 1,
+      source: 'owner',
+      protectPaths: ['/keep'],
+    });
+    const beforeRejectedMutation = await firstMemory.getThreadById({ threadId: atomicThreadId });
+    await expect(
+      secondMemory.mutateThreadWithWorkingMemory({
+        mutation: {
+          type: 'save',
+          thread: {
+            id: atomicThreadId,
+            resourceId: atomicResourceId,
+            title: 'Rejected save',
+            metadata: { changed: true },
+            createdAt,
+            updatedAt: new Date('2026-01-02T00:00:00.000Z'),
+          },
+        },
+        workingMemory: {
+          type: 'observer-update',
+          resourceId: atomicResourceId,
+          value: '{"new":"5678"}',
+          expectedRevision: owner.revision,
+          maxDataBytes: 20,
+        },
+      }),
+    ).rejects.toThrow('UTF-8 byte limit');
+    await expect(firstMemory.getThreadById({ threadId: atomicThreadId })).resolves.toEqual(beforeRejectedMutation);
+
+    await expect(
+      secondMemory.mutateThreadWithWorkingMemory({
+        mutation: { type: 'update', id: atomicThreadId, title: 'Rejected', metadata: { changed: true } },
+        workingMemory: {
+          type: 'observer-update',
+          resourceId: atomicResourceId,
+          value: '{"new":"5678"}',
+          expectedRevision: owner.revision,
+          maxDataBytes: 20,
+        },
+      }),
+    ).rejects.toThrow('UTF-8 byte limit');
+    await expect(firstMemory.getThreadById({ threadId: atomicThreadId })).resolves.toEqual(beforeRejectedMutation);
+
+    await expect(
+      secondMemory.mutateThreadWithWorkingMemory({
+        mutation: { type: 'update', id: atomicThreadId, title: 'Stale', metadata: { changed: true } },
+        workingMemory: {
+          type: 'observer-update',
+          resourceId: atomicResourceId,
+          value: '{"version":2}',
+          expectedRevision: owner.revision - 1,
+        },
+      }),
+    ).rejects.toMatchObject({ name: 'WorkingMemoryRevisionConflictError' });
+    await expect(firstMemory.getThreadById({ threadId: atomicThreadId })).resolves.toEqual(beforeRejectedMutation);
+
+    await expect(
+      secondMemory.mutateThreadWithWorkingMemory({
+        mutation: { type: 'update', id: atomicThreadId, title: 'Hidden', metadata: { changed: true } },
+        workingMemory: { type: 'require-ungoverned' },
+      }),
+    ).rejects.toThrow('explicit workingMemory value');
+    await expect(firstMemory.getThreadById({ threadId: atomicThreadId })).resolves.toEqual(beforeRejectedMutation);
+
+    const updated = await secondMemory.mutateThreadWithWorkingMemory({
+      mutation: { type: 'update', id: atomicThreadId, title: 'Updated', metadata: { changed: true } },
+      workingMemory: {
+        type: 'observer-update',
+        resourceId: atomicResourceId,
+        value: '{"keep":"ignored","version":2}',
+        expectedRevision: owner.revision,
+      },
+    });
+    expect(updated.thread).toMatchObject({
+      title: 'Updated',
+      metadata: { preserved: true, changed: true, workingMemory: '{"keep":"1234","version":2}' },
+    });
+    expect(updated.workingMemory).toMatchObject({ revision: owner.revision + 1 });
+  });
+
   it('serializes whole-row saves with owner compare-and-set updates for both scopes', async () => {
     for (const scope of ['resource', 'thread'] as const) {
       const concurrentResourceId = `${resourceId}-${scope}-save-cas`;

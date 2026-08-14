@@ -889,6 +889,36 @@ export class Memory extends MastraMemory {
       return this.withWorkingMemoryMutex(`thread-${thread.id}`, async () => {
         const memoryStore = await this.getMemoryStore();
         const existingThread = await memoryStore.getThreadById({ threadId: thread.id });
+        if (memoryStore.supportsRevisionedWorkingMemory) {
+          const expectedRevision = existingThread
+            ? (
+                await memoryStore.getWorkingMemorySnapshot({
+                  scope: 'thread',
+                  resourceId: existingThread.resourceId,
+                  threadId: thread.id,
+                })
+              ).revision
+            : 0;
+          const result = await memoryStore.mutateThreadWithWorkingMemory({
+            mutation: {
+              type: 'save',
+              thread: {
+                ...thread,
+                metadata: this.stripManagedWorkingMemoryFromThreadMetadata(thread.metadata),
+              },
+            },
+            workingMemory: {
+              type: 'observer-update',
+              resourceId: thread.resourceId,
+              value: managedWorkingMemory.workingMemory,
+              expectedRevision,
+              ...(config.workingMemory?.maxDataBytes === undefined
+                ? {}
+                : { maxDataBytes: config.workingMemory.maxDataBytes }),
+            },
+          });
+          return result.thread;
+        }
         const savedThread = await memoryStore.saveThread({
           thread: {
             ...thread,
@@ -912,6 +942,13 @@ export class Memory extends MastraMemory {
 
     return this.withWorkingMemoryMutex(`thread-${thread.id}`, async () => {
       const memoryStore = await this.getMemoryStore();
+      if (resourceScopedWorkingMemory && memoryStore.supportsRevisionedWorkingMemory) {
+        const result = await memoryStore.mutateThreadWithWorkingMemory({
+          mutation: { type: 'save', thread: threadForStorage },
+          workingMemory: { type: 'require-ungoverned' },
+        });
+        return result.thread;
+      }
       return memoryStore.saveThread({ thread: threadForStorage });
     });
   }
@@ -942,6 +979,20 @@ export class Memory extends MastraMemory {
           const memoryStore = await this.getMemoryStore();
           const existingThread = await memoryStore.getThreadById({ threadId: id });
           if (!existingThread) {
+            if (memoryStore.supportsRevisionedWorkingMemory && !managedWorkingMemory) {
+              const result = await memoryStore.mutateThreadWithWorkingMemory({
+                mutation: {
+                  type: 'update',
+                  id,
+                  ...(title === undefined ? {} : { title }),
+                  ...(metadata === undefined
+                    ? {}
+                    : { metadata: this.stripManagedWorkingMemoryFromThreadMetadata(metadata) }),
+                },
+                workingMemory: { type: 'require-ungoverned' },
+              });
+              return result.thread;
+            }
             return memoryStore.updateThread({
               id,
               title,
@@ -984,6 +1035,20 @@ export class Memory extends MastraMemory {
           if (managedWorkingMemory) {
             throw new Error('Resource-scoped working memory requires a resourceId.');
           }
+          if (memoryStore.supportsRevisionedWorkingMemory) {
+            const result = await memoryStore.mutateThreadWithWorkingMemory({
+              mutation: {
+                type: 'update',
+                id,
+                ...(title === undefined ? {} : { title }),
+                ...(metadata === undefined
+                  ? {}
+                  : { metadata: this.stripManagedWorkingMemoryFromThreadMetadata(metadata) }),
+              },
+              workingMemory: { type: 'require-ungoverned' },
+            });
+            return result.thread;
+          }
           return memoryStore.saveThread({ thread: threadForStorage });
         });
       return managedWorkingMemory
@@ -995,6 +1060,31 @@ export class Memory extends MastraMemory {
       return this.withWorkingMemoryMutex(`thread-${id}`, async () => {
         const memoryStore = await this.getMemoryStore();
         const existingThread = await memoryStore.getThreadById({ threadId: id });
+        if (memoryStore.supportsRevisionedWorkingMemory && existingThread) {
+          const current = await memoryStore.getWorkingMemorySnapshot({
+            scope: 'thread',
+            resourceId: existingThread.resourceId,
+            threadId: id,
+          });
+          const result = await memoryStore.mutateThreadWithWorkingMemory({
+            mutation: {
+              type: 'update',
+              id,
+              ...(title === undefined ? {} : { title }),
+              metadata: this.stripManagedWorkingMemoryFromThreadMetadata(metadata) ?? {},
+            },
+            workingMemory: {
+              type: 'observer-update',
+              resourceId: existingThread.resourceId,
+              value: managedWorkingMemory.workingMemory,
+              expectedRevision: current.revision,
+              ...(config.workingMemory?.maxDataBytes === undefined
+                ? {}
+                : { maxDataBytes: config.workingMemory.maxDataBytes }),
+            },
+          });
+          return result.thread;
+        }
         const updatedThread = await memoryStore.updateThread({
           id,
           title,

@@ -574,6 +574,199 @@ describe('Memory', () => {
       });
     });
 
+    it.each(['save', 'update'] as const)(
+      'leaves the thread row unchanged when protected values make a metadata %s exceed its bound',
+      async mutation => {
+        const storage = new InMemoryStore();
+        const memory = new Memory({
+          storage,
+          options: { workingMemory: { enabled: true, scope: 'thread', maxDataBytes: 20 } },
+        });
+        const threadId = 'bounded-thread-metadata-update';
+        const resourceId = 'bounded-thread-metadata-resource';
+        await memory.createThread({ threadId, resourceId, title: 'Before', metadata: { preserved: true } });
+        await memory.updateWorkingMemoryByOwner({
+          threadId,
+          resourceId,
+          workingMemory: '{"keep":"1234"}',
+          expectedRevision: 0,
+          protectPaths: ['/keep'],
+        });
+        const before = await memory.getThreadById({ threadId });
+        if (!before) throw new Error('Expected governed thread.');
+
+        const operation =
+          mutation === 'save'
+            ? memory.saveThread({
+                thread: {
+                  ...before,
+                  title: 'After',
+                  metadata: { changed: true, workingMemory: '{"new":"5678"}' },
+                  updatedAt: new Date(),
+                },
+              })
+            : memory.updateThread({
+                id: threadId,
+                title: 'After',
+                metadata: { changed: true, workingMemory: '{"new":"5678"}' },
+              });
+
+        await expect(operation).rejects.toThrow('UTF-8 byte limit');
+
+        await expect(memory.getThreadById({ threadId })).resolves.toEqual(before);
+      },
+    );
+
+    it('does not commit ordinary thread fields when a metadata update loses its Working Memory revision', async () => {
+      const storage = new InMemoryStore();
+      const memory = new Memory({
+        storage,
+        options: { workingMemory: { enabled: true, scope: 'thread' } },
+      });
+      const threadId = 'conflicting-thread-metadata-update';
+      const resourceId = 'conflicting-thread-metadata-resource';
+      await memory.createThread({ threadId, resourceId, title: 'Before', metadata: { preserved: true } });
+      await memory.updateWorkingMemoryByOwner({
+        threadId,
+        resourceId,
+        workingMemory: '{"version":1}',
+        expectedRevision: 0,
+      });
+
+      const memoryStore = (await storage.getStore('memory'))!;
+      const originalGetWorkingMemorySnapshot = memoryStore.getWorkingMemorySnapshot.bind(memoryStore);
+      const originalApplyWorkingMemoryUpdate = memoryStore.applyWorkingMemoryUpdate.bind(memoryStore);
+      let releaseSnapshotRead!: () => void;
+      let markSnapshotRead!: () => void;
+      let interceptedRevision: number | undefined;
+      const snapshotRead = new Promise<void>(resolve => {
+        markSnapshotRead = resolve;
+      });
+      const snapshotReadBlocked = new Promise<void>(resolve => {
+        releaseSnapshotRead = resolve;
+      });
+      const snapshotSpy = vi.spyOn(memoryStore, 'getWorkingMemorySnapshot').mockImplementation(async input => {
+        const snapshot = await originalGetWorkingMemorySnapshot(input);
+        if (input.scope === 'thread' && interceptedRevision === undefined) {
+          interceptedRevision = snapshot.revision;
+          markSnapshotRead();
+          await snapshotReadBlocked;
+        }
+        return snapshot;
+      });
+
+      const update = memory.updateThread({
+        id: threadId,
+        title: 'After',
+        metadata: { changed: true, workingMemory: '{"version":2}' },
+      });
+      await snapshotRead;
+      await originalApplyWorkingMemoryUpdate({
+        scope: 'thread',
+        resourceId,
+        threadId,
+        value: '{"version":3}',
+        expectedRevision: interceptedRevision!,
+        source: 'owner',
+      });
+      const afterOwnerWrite = await memory.getThreadById({ threadId });
+      expect(afterOwnerWrite).toMatchObject({ title: 'Before', metadata: { preserved: true } });
+      expect(afterOwnerWrite?.metadata).not.toHaveProperty('changed');
+
+      releaseSnapshotRead();
+      await expect(update).rejects.toMatchObject({ name: 'WorkingMemoryRevisionConflictError' });
+      snapshotSpy.mockRestore();
+      await expect(memory.getThreadById({ threadId })).resolves.toEqual(afterOwnerWrite);
+    });
+
+    it.each(['save', 'update'] as const)(
+      'requires an explicit migration value before a resource-scoped %s can hide governed thread Working Memory',
+      async mutation => {
+        const storage = new InMemoryStore();
+        const memory = new Memory({
+          storage,
+          options: { workingMemory: { enabled: true, scope: 'thread' } },
+        });
+        const threadId = `omitted-scope-switch-${mutation}-thread`;
+        const resourceId = `omitted-scope-switch-${mutation}-resource`;
+        await memory.createThread({ threadId, resourceId, title: 'Before', metadata: { preserved: true } });
+        await memory.updateWorkingMemoryByOwner({
+          threadId,
+          resourceId,
+          workingMemory: '{"name":"Ada"}',
+          expectedRevision: 0,
+          protectPaths: ['/name'],
+        });
+        const before = await memory.getThreadById({ threadId });
+        if (!before) throw new Error('Expected governed thread.');
+        const resourceScopedConfig: MemoryConfig = {
+          workingMemory: { enabled: true, scope: 'resource' },
+        };
+
+        const operation =
+          mutation === 'save'
+            ? memory.saveThread({
+                thread: {
+                  ...before,
+                  title: 'After',
+                  metadata: { changed: true },
+                  updatedAt: new Date(),
+                },
+                memoryConfig: resourceScopedConfig,
+              })
+            : memory.updateThread({
+                id: threadId,
+                title: 'After',
+                metadata: { changed: true },
+                memoryConfig: resourceScopedConfig,
+              });
+
+        await expect(operation).rejects.toThrow('explicit workingMemory value');
+        await expect(memory.getThreadById({ threadId })).resolves.toEqual(before);
+      },
+    );
+
+    it('atomically creates and then updates thread-scoped metadata Working Memory', async () => {
+      const storage = new InMemoryStore();
+      const memory = new Memory({
+        storage,
+        options: { workingMemory: { enabled: true, scope: 'thread' } },
+      });
+      const threadId = 'atomic-thread-metadata-save';
+      const resourceId = 'atomic-thread-metadata-resource';
+      const createdAt = new Date('2026-01-01T00:00:00.000Z');
+
+      await memory.saveThread({
+        thread: {
+          id: threadId,
+          resourceId,
+          title: 'Created',
+          metadata: { preserved: true, workingMemory: '{"version":1}' },
+          createdAt,
+          updatedAt: createdAt,
+        },
+      });
+      await expect(memory.getWorkingMemorySnapshot({ threadId, resourceId })).resolves.toMatchObject({
+        value: '{"version":1}',
+        revision: 1,
+      });
+
+      await memory.updateThread({
+        id: threadId,
+        title: 'Updated',
+        metadata: { changed: true, workingMemory: '{"version":2}' },
+      });
+
+      await expect(memory.getThreadById({ threadId })).resolves.toMatchObject({
+        title: 'Updated',
+        metadata: { preserved: true, changed: true, workingMemory: '{"version":2}' },
+      });
+      await expect(memory.getWorkingMemorySnapshot({ threadId, resourceId })).resolves.toMatchObject({
+        value: '{"version":2}',
+        revision: 2,
+      });
+    });
+
     it('rejects thread-scoped Working Memory reads for a mismatched resource', async () => {
       const memory = new Memory({
         storage: new InMemoryStore(),
@@ -4449,7 +4642,7 @@ describe('Memory', () => {
       const memoryStore = (await storage.getStore('memory'))!;
       const threadId = 'thread-queued-save-delete-race';
       const resourceId = 'resource-queued-save-delete-race';
-      const originalSaveThread = memoryStore.saveThread.bind(memoryStore);
+      const originalMutateThreadWithWorkingMemory = memoryStore.mutateThreadWithWorkingMemory.bind(memoryStore);
       const originalTransition = memoryStore.transitionThreadToResourceWorkingMemory.bind(memoryStore);
       const originalDeleteResource = memoryStore.deleteResource.bind(memoryStore);
       const operationOrder: string[] = [];
@@ -4462,12 +4655,13 @@ describe('Memory', () => {
         releaseBlockingSave = resolve;
       });
 
-      vi.spyOn(memoryStore, 'saveThread').mockImplementation(async args => {
-        if (args.thread.title === 'Blocking save') {
+      vi.spyOn(memoryStore, 'mutateThreadWithWorkingMemory').mockImplementation(async args => {
+        const thread = args.mutation.type === 'save' ? args.mutation.thread : undefined;
+        if (thread?.title === 'Blocking save') {
           markBlockingSaveStarted();
           await blockingSaveBlocked;
         }
-        const result = await originalSaveThread(args);
+        const result = await originalMutateThreadWithWorkingMemory(args);
         operationOrder.push('blocking-save');
         return result;
       });
@@ -4600,7 +4794,7 @@ describe('Memory', () => {
         },
       });
 
-      const originalSaveThread = memoryStore.saveThread.bind(memoryStore);
+      const originalMutateThreadWithWorkingMemory = memoryStore.mutateThreadWithWorkingMemory.bind(memoryStore);
       const originalTransition = memoryStore.transitionThreadToResourceWorkingMemory.bind(memoryStore);
       const originalDeleteResource = memoryStore.deleteResource.bind(memoryStore);
       const operationOrder: string[] = [];
@@ -4613,12 +4807,13 @@ describe('Memory', () => {
         releaseBlockingSave = resolve;
       });
 
-      vi.spyOn(memoryStore, 'saveThread').mockImplementation(async args => {
-        if (args.thread.title === 'Blocking save') {
+      vi.spyOn(memoryStore, 'mutateThreadWithWorkingMemory').mockImplementation(async args => {
+        const thread = args.mutation.type === 'save' ? args.mutation.thread : undefined;
+        if (thread?.title === 'Blocking save') {
           markBlockingSaveStarted();
           await blockingSaveBlocked;
         }
-        const result = await originalSaveThread(args);
+        const result = await originalMutateThreadWithWorkingMemory(args);
         operationOrder.push('blocking-save');
         return result;
       });
@@ -4684,7 +4879,7 @@ describe('Memory', () => {
         },
       });
 
-      const originalSaveThread = memoryStore.saveThread.bind(memoryStore);
+      const originalMutateThreadWithWorkingMemory = memoryStore.mutateThreadWithWorkingMemory.bind(memoryStore);
       const originalTransition = memoryStore.transitionThreadToResourceWorkingMemory.bind(memoryStore);
       const operationOrder: string[] = [];
       let reassignCalls = 0;
@@ -4704,11 +4899,12 @@ describe('Memory', () => {
         operationOrder.push('update-thread');
         return result;
       });
-      vi.spyOn(memoryStore, 'saveThread').mockImplementation(async args => {
-        if (args.thread.resourceId === reassignedResourceId) {
+      vi.spyOn(memoryStore, 'mutateThreadWithWorkingMemory').mockImplementation(async args => {
+        const thread = args.mutation.type === 'save' ? args.mutation.thread : undefined;
+        if (thread?.resourceId === reassignedResourceId) {
           reassignCalls += 1;
         }
-        const result = await originalSaveThread(args);
+        const result = await originalMutateThreadWithWorkingMemory(args);
         operationOrder.push('save-thread');
         return result;
       });

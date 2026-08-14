@@ -931,6 +931,36 @@ export type StorageTransitionThreadToResourceWorkingMemoryOutput = {
   workingMemory: WorkingMemorySnapshot;
 };
 
+/** @internal Thread-row mutation coordinated with its governed Working Memory. */
+export type StorageMutateThreadWithWorkingMemoryInput = {
+  mutation:
+    | { type: 'save'; thread: StorageThreadType }
+    | {
+        type: 'update';
+        id: string;
+        title?: string;
+        metadata?: Record<string, unknown>;
+      };
+  workingMemory:
+    | {
+        type: 'observer-update';
+        resourceId: string;
+        value: string;
+        expectedRevision: number;
+        maxDataBytes?: number;
+      }
+    | {
+        /** Fail before mutating the row when an explicit scope migration is required. */
+        type: 'require-ungoverned';
+      };
+};
+
+/** @internal Result of an atomic thread-row and Working Memory mutation. */
+export type StorageMutateThreadWithWorkingMemoryOutput = {
+  thread: StorageThreadType;
+  workingMemory?: WorkingMemorySnapshot;
+};
+
 export type StorageMessageType = {
   id: string;
   thread_id: string;

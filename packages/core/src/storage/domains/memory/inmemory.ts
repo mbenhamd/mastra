@@ -38,6 +38,8 @@ import type {
   WorkingMemorySnapshotInput,
   StorageTransitionThreadToResourceWorkingMemoryInput,
   StorageTransitionThreadToResourceWorkingMemoryOutput,
+  StorageMutateThreadWithWorkingMemoryInput,
+  StorageMutateThreadWithWorkingMemoryOutput,
 } from '../../types';
 import {
   filterByDateRange,
@@ -52,11 +54,13 @@ import {
   applyWorkingMemorySnapshotUpdate,
   assertGovernedThreadResourceUnchanged,
   assertThreadWorkingMemoryRemoved,
+  assertThreadWorkingMemoryIsUngoverned,
   assertWorkingMemorySnapshotUnchanged,
   hasWorkingMemorySnapshotControls,
   preserveWorkingMemorySnapshotControls,
   readWorkingMemorySnapshot,
   retractObserverWorkingMemorySnapshot,
+  stripThreadWorkingMemoryMetadata,
   writeWorkingMemorySnapshotMetadata,
   WorkingMemoryValidationError,
 } from './working-memory-snapshot';
@@ -1198,6 +1202,86 @@ export class InMemoryMemory extends MemoryStorage {
       this.db.threads.set(input.threadId, cloneThreadBoundary({ ...thread, metadata, updatedAt: now }, true));
       this.rotateThreadGeneration(input.threadId);
       return next;
+    });
+  }
+
+  async mutateThreadWithWorkingMemory(
+    input: StorageMutateThreadWithWorkingMemoryInput,
+  ): Promise<StorageMutateThreadWithWorkingMemoryOutput> {
+    return this.withMemoryStateRollback(true, () => {
+      const threadId = input.mutation.type === 'save' ? input.mutation.thread.id : input.mutation.id;
+      const currentThread = this.db.threads.get(threadId);
+      if (input.mutation.type === 'update' && !currentThread) {
+        throw new Error(`Thread with id ${threadId} not found`);
+      }
+
+      const proposedMetadata =
+        input.mutation.type === 'save' ? input.mutation.thread.metadata : input.mutation.metadata;
+      assertThreadWorkingMemoryRemoved(proposedMetadata);
+
+      const resourceId = input.mutation.type === 'save' ? input.mutation.thread.resourceId : currentThread!.resourceId;
+      if (input.workingMemory.type === 'observer-update' && input.workingMemory.resourceId !== resourceId) {
+        throw new WorkingMemoryValidationError('Working-memory update does not match the mutated thread resource.');
+      }
+
+      let workingMemory: WorkingMemorySnapshot | undefined;
+      let currentWorkingMemory: WorkingMemorySnapshot | undefined;
+      if (input.workingMemory.type === 'require-ungoverned') {
+        assertThreadWorkingMemoryIsUngoverned(currentThread?.metadata);
+      } else {
+        const currentValue =
+          typeof currentThread?.metadata?.workingMemory === 'string' ? currentThread.metadata.workingMemory : null;
+        currentWorkingMemory = readWorkingMemorySnapshot(currentValue, currentThread?.metadata);
+        workingMemory = applyWorkingMemorySnapshotUpdate(
+          currentWorkingMemory,
+          {
+            value: input.workingMemory.value,
+            expectedRevision: input.workingMemory.expectedRevision,
+            source: 'observer',
+            ...(input.workingMemory.maxDataBytes === undefined
+              ? {}
+              : { maxDataBytes: input.workingMemory.maxDataBytes }),
+          },
+          new Date().toISOString(),
+        );
+      }
+
+      const baseMetadata =
+        input.mutation.type === 'save'
+          ? (input.mutation.thread.metadata ?? {})
+          : input.mutation.metadata === undefined
+            ? (currentThread!.metadata ?? {})
+            : mergeThreadMetadataPreservingWorkingMemory(currentThread!.metadata, input.mutation.metadata);
+      let metadata: Record<string, unknown>;
+      if (input.workingMemory.type === 'require-ungoverned') {
+        metadata = stripThreadWorkingMemoryMetadata(baseMetadata) ?? {};
+      } else {
+        metadata =
+          workingMemory !== currentWorkingMemory || hasWorkingMemorySnapshotControls(currentThread?.metadata)
+            ? writeWorkingMemorySnapshotMetadata(baseMetadata, workingMemory!)
+            : { ...baseMetadata };
+        if (workingMemory!.value === null) delete metadata.workingMemory;
+        else metadata.workingMemory = workingMemory!.value;
+      }
+
+      const thread =
+        input.mutation.type === 'save'
+          ? cloneThreadBoundary({ ...input.mutation.thread, metadata }, true)
+          : cloneThreadBoundary(
+              {
+                ...currentThread!,
+                ...(input.mutation.title === undefined ? {} : { title: input.mutation.title }),
+                metadata,
+                updatedAt: new Date(),
+              },
+              true,
+            );
+      this.db.threads.set(threadId, thread);
+      this.rotateThreadGeneration(threadId);
+      return {
+        thread: cloneThreadBoundary(thread),
+        ...(workingMemory === undefined ? {} : { workingMemory: structuredClone(workingMemory) }),
+      };
     });
   }
 

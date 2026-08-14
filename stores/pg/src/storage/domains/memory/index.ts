@@ -18,11 +18,13 @@ import {
   applyWorkingMemorySnapshotUpdate,
   assertGovernedThreadResourceUnchanged,
   assertThreadWorkingMemoryRemoved,
+  assertThreadWorkingMemoryIsUngoverned,
   assertWorkingMemorySnapshotUnchanged,
   hasWorkingMemorySnapshotControls,
   preserveWorkingMemorySnapshotControls,
   readWorkingMemorySnapshot,
   retractObserverWorkingMemorySnapshot,
+  stripThreadWorkingMemoryMetadata,
   writeWorkingMemorySnapshotMetadata,
   WorkingMemoryRevisionConflictError,
   WorkingMemoryValidationError,
@@ -146,6 +148,8 @@ import type {
   WorkingMemorySnapshotInput,
   StorageTransitionThreadToResourceWorkingMemoryInput,
   StorageTransitionThreadToResourceWorkingMemoryOutput,
+  StorageMutateThreadWithWorkingMemoryInput,
+  StorageMutateThreadWithWorkingMemoryOutput,
 } from '@mastra/core/storage';
 import { parseSqlIdentifier } from '@mastra/core/utils';
 import type { TxClient } from '../../client';
@@ -2610,6 +2614,153 @@ export class MemoryPG extends MemoryStorage {
       this.logger?.error?.(safeError.toString());
       this.logger?.trackException(safeError);
       throw safeError;
+    }
+  }
+
+  async mutateThreadWithWorkingMemory(
+    input: StorageMutateThreadWithWorkingMemoryInput,
+  ): Promise<StorageMutateThreadWithWorkingMemoryOutput> {
+    const threadId = input.mutation.type === 'save' ? input.mutation.thread.id : input.mutation.id;
+    const threadTableName = getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) });
+
+    try {
+      return await this.#db.client.tx(async t => {
+        if (input.workingMemory.type === 'observer-update') {
+          await this.lockObservationalMemoryResource(t, input.workingMemory.resourceId);
+        }
+        await this.lockWorkingMemoryTarget(t, 'thread', threadId);
+
+        const currentThread = await t.oneOrNone<
+          StorageThreadType & { createdAtZ?: Date | string; updatedAtZ?: Date | string }
+        >(`SELECT * FROM ${threadTableName} WHERE id = $1 FOR UPDATE`, [threadId]);
+        if (input.mutation.type === 'update' && !currentThread) {
+          throw new MastraError({
+            id: createStorageErrorId('PG', 'UPDATE_THREAD', 'FAILED'),
+            domain: ErrorDomain.STORAGE,
+            category: ErrorCategory.USER,
+            text: `Thread ${threadId} not found`,
+            details: { threadId, title: input.mutation.title ?? null },
+          });
+        }
+
+        const currentMetadata = currentThread ? parseMetadata(currentThread.metadata) : undefined;
+        const proposedMetadata =
+          input.mutation.type === 'save' ? input.mutation.thread.metadata : input.mutation.metadata;
+        assertThreadWorkingMemoryRemoved(proposedMetadata);
+        const resourceId =
+          input.mutation.type === 'save' ? input.mutation.thread.resourceId : currentThread!.resourceId;
+        if (input.workingMemory.type === 'observer-update' && input.workingMemory.resourceId !== resourceId) {
+          throw new WorkingMemoryValidationError('Working-memory update does not match the mutated thread resource.');
+        }
+
+        let workingMemory: WorkingMemorySnapshot | undefined;
+        let currentWorkingMemory: WorkingMemorySnapshot | undefined;
+        if (input.workingMemory.type === 'require-ungoverned') {
+          assertThreadWorkingMemoryIsUngoverned(currentMetadata);
+        } else {
+          const currentValue =
+            typeof currentMetadata?.workingMemory === 'string' ? currentMetadata.workingMemory : null;
+          currentWorkingMemory = readWorkingMemorySnapshot(currentValue, currentMetadata);
+          workingMemory = applyWorkingMemorySnapshotUpdate(
+            currentWorkingMemory,
+            {
+              value: input.workingMemory.value,
+              expectedRevision: input.workingMemory.expectedRevision,
+              source: 'observer',
+              ...(input.workingMemory.maxDataBytes === undefined
+                ? {}
+                : { maxDataBytes: input.workingMemory.maxDataBytes }),
+            },
+            new Date().toISOString(),
+          );
+        }
+
+        const baseMetadata =
+          input.mutation.type === 'save'
+            ? (input.mutation.thread.metadata ?? {})
+            : input.mutation.metadata === undefined
+              ? (currentMetadata ?? {})
+              : mergeThreadMetadataPreservingWorkingMemory(currentMetadata ?? {}, input.mutation.metadata);
+        let metadata: Record<string, unknown>;
+        if (input.workingMemory.type === 'require-ungoverned') {
+          metadata = stripThreadWorkingMemoryMetadata(baseMetadata) ?? {};
+        } else {
+          metadata =
+            workingMemory !== currentWorkingMemory || hasWorkingMemorySnapshotControls(currentMetadata)
+              ? writeWorkingMemorySnapshotMetadata(baseMetadata, workingMemory!)
+              : { ...baseMetadata };
+          if (workingMemory!.value === null) delete metadata.workingMemory;
+          else metadata.workingMemory = workingMemory!.value;
+        }
+
+        let row: StorageThreadType & { createdAtZ?: Date | string; updatedAtZ?: Date | string };
+        if (input.mutation.type === 'save') {
+          const createdAt = toUtcISOString(input.mutation.thread.createdAt);
+          const updatedAt = toUtcISOString(input.mutation.thread.updatedAt);
+          row = await t.one(
+            `INSERT INTO ${threadTableName}
+               (id, "resourceId", title, metadata, "createdAt", "createdAtZ", "updatedAt", "updatedAtZ")
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT (id) DO UPDATE SET
+               "resourceId" = EXCLUDED."resourceId",
+               title = EXCLUDED.title,
+               metadata = EXCLUDED.metadata,
+               "createdAt" = EXCLUDED."createdAt",
+               "createdAtZ" = EXCLUDED."createdAtZ",
+               "updatedAt" = EXCLUDED."updatedAt",
+               "updatedAtZ" = EXCLUDED."updatedAtZ"
+             RETURNING *`,
+            [
+              threadId,
+              resourceId,
+              input.mutation.thread.title,
+              JSON.stringify(metadata),
+              createdAt,
+              createdAt,
+              updatedAt,
+              updatedAt,
+            ],
+          );
+        } else {
+          const now = toUtcISOString(new Date());
+          row = await t.one(
+            `UPDATE ${threadTableName}
+             SET title = COALESCE($1, title), metadata = $2, "updatedAt" = $3, "updatedAtZ" = $4
+             WHERE id = $5
+             RETURNING *`,
+            [input.mutation.title ?? null, JSON.stringify(metadata), now, now, threadId],
+          );
+        }
+
+        return {
+          thread: {
+            id: row.id,
+            resourceId: row.resourceId,
+            title: row.title,
+            metadata: parseMetadata(row.metadata),
+            createdAt: new Date(row.createdAtZ || row.createdAt),
+            updatedAt: new Date(row.updatedAtZ || row.updatedAt),
+          },
+          ...(workingMemory === undefined ? {} : { workingMemory }),
+        };
+      });
+    } catch (error) {
+      if (
+        error instanceof MastraError ||
+        error instanceof WorkingMemoryRevisionConflictError ||
+        error instanceof WorkingMemoryValidationError
+      ) {
+        throw error;
+      }
+      throw new MastraError(
+        {
+          id: createStorageErrorId('PG', 'MUTATE_THREAD_WITH_WORKING_MEMORY', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: { threadId },
+        },
+        error,
+      );
     }
   }
 

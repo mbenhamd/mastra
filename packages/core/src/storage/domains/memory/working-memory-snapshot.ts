@@ -364,6 +364,37 @@ export function assertThreadWorkingMemoryRemoved(metadata: Record<string, unknow
   }
 }
 
+/** Remove thread-local Working Memory fields after their governance has been handled explicitly. */
+export function stripThreadWorkingMemoryMetadata(
+  metadata: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (metadata === undefined) return undefined;
+
+  const stripped = { ...metadata };
+  delete stripped.workingMemory;
+  if (isRecord(stripped.mastra)) {
+    const mastra = { ...stripped.mastra };
+    delete mastra[CONTROL_METADATA_KEY];
+    if (Object.keys(mastra).length === 0) delete stripped.mastra;
+    else stripped.mastra = mastra;
+  }
+  return stripped;
+}
+
+/**
+ * Fail closed when changing scope without an explicit migration value would
+ * hide a governed thread snapshot.
+ */
+export function assertThreadWorkingMemoryIsUngoverned(metadata: Record<string, unknown> | undefined): void {
+  const value = typeof metadata?.workingMemory === 'string' ? metadata.workingMemory : null;
+  readWorkingMemorySnapshot(value, metadata);
+  if (hasWorkingMemorySnapshotControls(metadata)) {
+    throw new WorkingMemoryValidationError(
+      'Governed thread working memory requires an explicit workingMemory value before switching to resource scope.',
+    );
+  }
+}
+
 function storedControlEquals(left: unknown, right: unknown): boolean {
   if (left === right) return true;
   if (left === null || right === null || typeof left !== 'object' || typeof right !== 'object') return false;

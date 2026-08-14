@@ -35,6 +35,8 @@ import type {
   WorkingMemorySnapshotInput,
   StorageTransitionThreadToResourceWorkingMemoryInput,
   StorageTransitionThreadToResourceWorkingMemoryOutput,
+  StorageMutateThreadWithWorkingMemoryInput,
+  StorageMutateThreadWithWorkingMemoryOutput,
 } from '../../types';
 import { StorageDomain } from '../base';
 
@@ -322,6 +324,21 @@ export abstract class MemoryStorage extends StorageDomain {
   ): Promise<StorageTransitionThreadToResourceWorkingMemoryOutput> {
     throw new Error(
       `Atomic thread-to-resource working-memory transition is not implemented by this storage adapter (${this.constructor.name}).`,
+    );
+  }
+
+  /**
+   * Atomically mutate a thread row together with a thread-scoped observer
+   * update, or prove that no governed thread snapshot would be hidden by a
+   * resource-scoped mutation.
+   *
+   * @internal Revision-capable adapters must implement this operation natively.
+   */
+  async mutateThreadWithWorkingMemory(
+    _input: StorageMutateThreadWithWorkingMemoryInput,
+  ): Promise<StorageMutateThreadWithWorkingMemoryOutput> {
+    throw new Error(
+      `Atomic thread and working-memory mutation is not implemented by this storage adapter (${this.constructor.name}).`,
     );
   }
 
