@@ -815,7 +815,7 @@ export class MemoryPG extends MemoryStorage {
         hasMore: perPageInput === false ? false : offset + perPage < total,
       };
     } catch (rawError) {
-      throw this.createAndTrackSafeReadError({
+      throw this.createAndTrackSafeStorageError({
         operation: 'LIST_THREADS',
         text: 'Failed to list PostgreSQL threads',
         details: {
@@ -1228,10 +1228,10 @@ export class MemoryPG extends MemoryStorage {
     } satisfies MastraDBMessage;
   }
 
-  private createAndTrackSafeReadError({
+  private createAndTrackSafeStorageError({
     operation,
     text,
-    details,
+    details = {},
     rawError,
   }: {
     // Pinned Prettier and Oxfmt disagree on this union's line wrapping.
@@ -1241,12 +1241,14 @@ export class MemoryPG extends MemoryStorage {
       | 'LIST_MESSAGES_BY_ID'
       | 'HAS_MESSAGES'
       | 'LIST_MESSAGES'
-      | 'LIST_MESSAGES_BY_RESOURCE_ID';
+      | 'LIST_MESSAGES_BY_RESOURCE_ID'
+      | 'SAVE_RESOURCE'
+      | 'UPDATE_RESOURCE';
     text: string;
-    details: Record<string, string | number | boolean>;
+    details?: Record<string, string | number | boolean>;
     rawError: unknown;
   }): MastraError {
-    const failureCode = this.getSafeReadFailureCode(rawError);
+    const failureCode = this.getSafeStorageFailureCode(rawError);
     const definition = {
       id: createStorageErrorId('PG', operation, 'FAILED'),
       domain: ErrorDomain.STORAGE,
@@ -1265,7 +1267,7 @@ export class MemoryPG extends MemoryStorage {
     return error;
   }
 
-  private getSafeReadFailureCode(error: unknown): string | undefined {
+  private getSafeStorageFailureCode(error: unknown): string | undefined {
     try {
       if ((typeof error !== 'object' && typeof error !== 'function') || error === null) return undefined;
       const code = (error as { code?: unknown }).code;
@@ -1326,7 +1328,7 @@ export class MemoryPG extends MemoryStorage {
       );
       return { messages: list.get.all.db() };
     } catch (rawError) {
-      throw this.createAndTrackSafeReadError({
+      throw this.createAndTrackSafeStorageError({
         operation: 'LIST_MESSAGES_BY_ID',
         text: 'Failed to list PostgreSQL messages by ID',
         details: { messageIdCount: messageIds.length },
@@ -1372,7 +1374,7 @@ export class MemoryPG extends MemoryStorage {
       );
       return result.exists;
     } catch (rawError) {
-      throw this.createAndTrackSafeReadError({
+      throw this.createAndTrackSafeStorageError({
         operation: 'HAS_MESSAGES',
         text: 'Failed to check for PostgreSQL messages',
         details: { hasResourceId: resourceId !== undefined, threadIdCount: threadIds.length },
@@ -1609,7 +1611,7 @@ export class MemoryPG extends MemoryStorage {
         hasMore,
       };
     } catch (rawError) {
-      throw this.createAndTrackSafeReadError({
+      throw this.createAndTrackSafeStorageError({
         operation: 'LIST_MESSAGES',
         text: 'Failed to list PostgreSQL messages',
         details: {
@@ -1802,7 +1804,7 @@ export class MemoryPG extends MemoryStorage {
         hasMore,
       };
     } catch (rawError) {
-      throw this.createAndTrackSafeReadError({
+      throw this.createAndTrackSafeStorageError({
         operation: 'LIST_MESSAGES_BY_RESOURCE_ID',
         text: 'Failed to list PostgreSQL messages by resource ID',
         details: {
@@ -2187,7 +2189,7 @@ export class MemoryPG extends MemoryStorage {
     const createdAt = toUtcISOString(resource.createdAt);
     const updatedAt = toUtcISOString(resource.updatedAt);
     const tableName = getTableName({ indexName: TABLE_RESOURCES, schemaName: getSchemaName(this.#schema) });
-    return await this.#db.client.tx(async t => {
+    const write = this.#db.client.tx(async t => {
       await this.lockWorkingMemoryTarget(t, 'resource', resource.id);
       const current = await t.oneOrNone<{ workingMemory: string | null; metadata: unknown }>(
         `SELECT "workingMemory", metadata FROM ${tableName} WHERE id = $1 FOR UPDATE`,
@@ -2235,6 +2237,16 @@ export class MemoryPG extends MemoryStorage {
         updatedAt: new Date(row.updatedAtZ || row.updatedAt),
       };
     });
+    try {
+      return await write;
+    } catch (rawError) {
+      if (rawError instanceof WorkingMemoryValidationError) throw rawError;
+      throw this.createAndTrackSafeStorageError({
+        operation: 'SAVE_RESOURCE',
+        text: 'Failed to save PostgreSQL memory resource',
+        rawError,
+      });
+    }
   }
 
   async updateResource({
@@ -2247,7 +2259,7 @@ export class MemoryPG extends MemoryStorage {
     metadata?: Record<string, unknown>;
   }): Promise<StorageResourceType> {
     const tableName = getTableName({ indexName: TABLE_RESOURCES, schemaName: getSchemaName(this.#schema) });
-    return await this.#db.client.tx(async t => {
+    const write = this.#db.client.tx(async t => {
       await this.lockWorkingMemoryTarget(t, 'resource', resourceId);
       const current = await t.oneOrNone<StorageResourceType & { createdAtZ: Date | string; updatedAtZ: Date | string }>(
         `SELECT * FROM ${tableName} WHERE id = $1 FOR UPDATE`,
@@ -2313,6 +2325,16 @@ export class MemoryPG extends MemoryStorage {
         updatedAt: new Date(row.updatedAtZ || row.updatedAt),
       };
     });
+    try {
+      return await write;
+    } catch (rawError) {
+      if (rawError instanceof WorkingMemoryValidationError) throw rawError;
+      throw this.createAndTrackSafeStorageError({
+        operation: 'UPDATE_RESOURCE',
+        text: 'Failed to update PostgreSQL memory resource',
+        rawError,
+      });
+    }
   }
 
   async updateResourceFromObservationalMemory({
@@ -2464,7 +2486,7 @@ export class MemoryPG extends MemoryStorage {
       if (error instanceof MastraError) throw error;
       if (error instanceof WorkingMemoryValidationError) throw error;
       const text = 'Failed to read PostgreSQL working memory';
-      const failureCode = this.getSafeReadFailureCode(error);
+      const failureCode = this.getSafeStorageFailureCode(error);
       const safeError = new MastraError(
         {
           id: createStorageErrorId('PG', 'GET_WORKING_MEMORY_SNAPSHOT', 'FAILED'),
@@ -2570,7 +2592,7 @@ export class MemoryPG extends MemoryStorage {
       if (error instanceof WorkingMemoryValidationError || error instanceof ObservationalMemoryGenerationConflictError)
         throw error;
       const text = 'Failed to update PostgreSQL working memory';
-      const failureCode = this.getSafeReadFailureCode(error);
+      const failureCode = this.getSafeStorageFailureCode(error);
       const safeError = new MastraError(
         {
           id: createStorageErrorId('PG', 'APPLY_WORKING_MEMORY_UPDATE', 'FAILED'),
@@ -2746,7 +2768,7 @@ export class MemoryPG extends MemoryStorage {
       observationalMemoryRecordIds?.push(...committedRecordIds);
     } catch (rawError) {
       const text = 'Failed to delete PostgreSQL memory resource';
-      const failureCode = this.getSafeReadFailureCode(rawError);
+      const failureCode = this.getSafeStorageFailureCode(rawError);
       const error = new MastraError(
         {
           id: createStorageErrorId('PG', 'DELETE_RESOURCE', 'FAILED'),
@@ -2988,30 +3010,40 @@ export class MemoryPG extends MemoryStorage {
           return { status: 'conflict', reason: 'messages' };
         }
 
+        if (
+          observationalMemory &&
+          unverifiedObservationalMemoryRecordId &&
+          observationalMemory.recordId !== unverifiedObservationalMemoryRecordId
+        ) {
+          return { status: 'conflict', reason: 'observational_memory' };
+        }
+        await this.lockObservationalMemoryResource(t, observationalMemory?.resourceId ?? thread.resourceId);
+        const schemaName = this.#schema || 'public';
+        const omTableExists =
+          (await t.oneOrNone<{ tablename: string }>(
+            `SELECT tablename FROM pg_tables WHERE schemaname = $1 AND tablename = $2`,
+            [schemaName, OM_TABLE],
+          )) !== null;
+
         if (observationalMemory) {
-          if (
-            unverifiedObservationalMemoryRecordId &&
-            observationalMemory.recordId !== unverifiedObservationalMemoryRecordId
-          ) {
-            return { status: 'conflict', reason: 'observational_memory' };
+          if (omTableExists) {
+            const coordinateRows = await t.manyOrNone<{ id: string; storageGeneration: string }>(
+              `SELECT id, xmin::text AS "storageGeneration"
+               FROM ${omTableName} WHERE "lookupKey" = $1 FOR UPDATE`,
+              [this.getOMKey(observationalMemory.threadId, observationalMemory.resourceId)],
+            );
+            if (
+              !hasSameUniqueStrings(
+                [...observationalMemory.priorRecordIds, observationalMemory.recordId],
+                coordinateRows.map(row => row.id),
+              ) ||
+              coordinateRows.find(row => row.id === observationalMemory.recordId)?.storageGeneration !==
+                observationalMemory.storageGeneration
+            ) {
+              return { status: 'conflict', reason: 'observational_memory' };
+            }
           }
-          await this.lockObservationalMemoryResource(t, observationalMemory.resourceId);
-          const coordinateRows = await t.manyOrNone<{ id: string; storageGeneration: string }>(
-            `SELECT id, xmin::text AS "storageGeneration"
-             FROM ${omTableName} WHERE "lookupKey" = $1 FOR UPDATE`,
-            [this.getOMKey(observationalMemory.threadId, observationalMemory.resourceId)],
-          );
-          if (
-            !hasSameUniqueStrings(
-              [...observationalMemory.priorRecordIds, observationalMemory.recordId],
-              coordinateRows.map(row => row.id),
-            ) ||
-            coordinateRows.find(row => row.id === observationalMemory.recordId)?.storageGeneration !==
-              observationalMemory.storageGeneration
-          ) {
-            return { status: 'conflict', reason: 'observational_memory' };
-          }
-        } else {
+        } else if (omTableExists) {
           if (unverifiedObservationalMemoryRecordId) {
             const unverified = await t.oneOrNone<{ id: string }>(
               `SELECT id FROM ${omTableName} WHERE id = $1 FOR UPDATE`,
@@ -3019,7 +3051,6 @@ export class MemoryPG extends MemoryStorage {
             );
             if (unverified) return { status: 'conflict', reason: 'observational_memory' };
           }
-          await this.lockObservationalMemoryResource(t, thread.resourceId);
           const threadScopedRecords = await t.manyOrNone<{ id: string }>(
             `SELECT id FROM ${omTableName} WHERE "threadId" = $1 FOR UPDATE`,
             [receipt.threadId],
@@ -3027,7 +3058,7 @@ export class MemoryPG extends MemoryStorage {
           if (threadScopedRecords.length > 0) return { status: 'conflict', reason: 'observational_memory' };
         }
 
-        if (observationalMemory) {
+        if (observationalMemory && omTableExists) {
           const deleted = await t.oneOrNone<{ id: string }>(
             `DELETE FROM ${omTableName}
              WHERE id = $1 AND xmin::text = $2

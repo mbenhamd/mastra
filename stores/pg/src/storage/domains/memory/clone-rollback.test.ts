@@ -141,4 +141,69 @@ describe('MemoryPG conditional clone rollback', () => {
       metadata: { replacement: true },
     });
   });
+
+  it('preserves every clone artifact when the inserted OM generation changed', async () => {
+    const clone = await seedClone('om-modified');
+    const clonedRecord = await firstMemory.initializeObservationalMemory({
+      threadId: clone.thread.id,
+      resourceId: clone.thread.resourceId,
+      scope: 'thread',
+      config: {},
+    });
+    await firstMemory.clearObservationalMemory(clone.thread.id, clone.thread.resourceId);
+    const omReceipt = await firstMemory.insertObservationalMemoryRecord(clonedRecord);
+    await firstMemory.updateActiveObservations({
+      id: clonedRecord.id,
+      observations: 'Concurrent observations',
+      tokenCount: 2,
+      lastObservedAt: new Date('2026-01-04T00:00:00.000Z'),
+    });
+
+    await expect(
+      firstMemory.rollbackThreadClone({
+        thread: clone.rollbackReceipt,
+        observationalMemory: omReceipt,
+        unverifiedObservationalMemoryRecordId: clonedRecord.id,
+      }),
+    ).resolves.toEqual({ status: 'conflict', reason: 'observational_memory' });
+    await expect(firstMemory.getThreadById({ threadId: clone.thread.id })).resolves.not.toBeNull();
+    await expect(firstMemory.listMessages({ threadId: clone.thread.id })).resolves.toMatchObject({
+      messages: [{ threadId: clone.thread.id }],
+    });
+    await expect(firstMemory.getObservationalMemory(clone.thread.id, clone.thread.resourceId)).resolves.toMatchObject({
+      id: clonedRecord.id,
+      activeObservations: 'Concurrent observations',
+    });
+  });
+
+  it('rolls back verified and unverified OM artifacts after confirming the OM table is absent', async () => {
+    const verifiedClone = await seedClone('missing-om-table-verified');
+    const clonedRecord = await firstMemory.initializeObservationalMemory({
+      threadId: verifiedClone.thread.id,
+      resourceId: verifiedClone.thread.resourceId,
+      scope: 'thread',
+      config: {},
+    });
+    await firstMemory.clearObservationalMemory(verifiedClone.thread.id, verifiedClone.thread.resourceId);
+    const omReceipt = await firstMemory.insertObservationalMemoryRecord(clonedRecord);
+    const unverifiedClone = await seedClone('missing-om-table-unverified');
+
+    await firstStore.db.none(`DROP TABLE "${schemaName}"."mastra_observational_memory"`);
+
+    await expect(
+      firstMemory.rollbackThreadClone({
+        thread: verifiedClone.rollbackReceipt,
+        observationalMemory: omReceipt,
+        unverifiedObservationalMemoryRecordId: clonedRecord.id,
+      }),
+    ).resolves.toEqual({ status: 'rolled_back' });
+    await expect(
+      firstMemory.rollbackThreadClone({
+        thread: unverifiedClone.rollbackReceipt,
+        unverifiedObservationalMemoryRecordId: 'unverified-om-record',
+      }),
+    ).resolves.toEqual({ status: 'rolled_back' });
+    await expect(firstMemory.getThreadById({ threadId: verifiedClone.thread.id })).resolves.toBeNull();
+    await expect(firstMemory.getThreadById({ threadId: unverifiedClone.thread.id })).resolves.toBeNull();
+  });
 });
