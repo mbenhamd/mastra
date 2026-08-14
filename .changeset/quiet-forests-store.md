@@ -26,4 +26,4 @@ const firstInactivePage = await memoryStore.listThreads({
 });
 ```
 
-`@mastra/pg` imports these governance contracts from `@mastra/core`, so its peer range starts at `1.58.0-alpha.11`, the first coordinated Core prerelease containing them. Any release plan must version Core and PG atomically; do not publish PG independently.
+`@mastra/pg` imports these governance contracts from `@mastra/core`, so this release requires `@mastra/core@2.0.0-alpha.11` or a later compatible 2.x release. Version Core and PG atomically; do not publish PG independently.
