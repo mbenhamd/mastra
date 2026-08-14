@@ -31,11 +31,7 @@ import {
   signalToDataPartFormat,
   signalToMastraDBMessage,
 } from '../signals';
-import {
-  AgentThreadStreamRuntime,
-  agentThreadStreamRuntime,
-  rememberBoundedResumableTerminalStream,
-} from '../thread-stream-runtime';
+import { AgentThreadStreamRuntime, agentThreadStreamRuntime } from '../thread-stream-runtime';
 
 function createTextStreamModel(responseText: string) {
   return new MockLanguageModelV2({
@@ -279,21 +275,6 @@ async function readNextRunWithParts(iterator: AsyncIterator<any>) {
   }
 }
 
-class RunFailedOwnershipPubSub extends ControlledLeasePubSub {
-  runFailedLeaseOwner: string | undefined;
-  runFailedPublishedWithLiveOwner = false;
-
-  override async publish(topic: string, event: Parameters<PubSub['publish']>[1]): Promise<void> {
-    const data = (event as { data?: { type?: string; leaseOwner?: string } }).data;
-    if (data?.type === 'run-failed') {
-      this.runFailedLeaseOwner = data.leaseOwner;
-      this.runFailedPublishedWithLiveOwner =
-        data.leaseOwner !== undefined && [...this.owners.values()].includes(data.leaseOwner);
-    }
-    await super.publish(topic, event);
-  }
-}
-
 class BlockingRunCompletedPubSub extends EventEmitterPubSub {
   #unblockRunCompleted!: () => void;
   readonly blockedRunCompleted = new Promise<void>(resolve => {
@@ -323,43 +304,6 @@ class DeliverThenRejectRegistrationPubSub extends EventEmitterPubSub {
       this.#rejected = true;
       throw new Error('injected registration failure after subscriber delivery');
     }
-  }
-}
-
-class RejectRunAbortingPubSub extends ControlledLeasePubSub {
-  override async publish(topic: string, event: Parameters<PubSub['publish']>[1]): Promise<void> {
-    if ((event as { data?: { type?: string } }).data?.type === 'run-aborting') {
-      throw new Error('injected abort fence failure');
-    }
-    await super.publish(topic, event);
-  }
-}
-
-class RejectVisibleToolTerminalPubSub extends ControlledLeasePubSub {
-  override async publish(topic: string, event: Parameters<PubSub['publish']>[1]): Promise<void> {
-    const data = (event as { data?: { type?: string; part?: { type?: string } } }).data;
-    if (data?.type === 'stream-part' && data.part?.type === 'tool-error') {
-      throw new Error('injected visible tool terminal publication failure');
-    }
-    await super.publish(topic, event);
-  }
-}
-
-class DelayedRegistrationPubSub extends ControlledLeasePubSub {
-  #releaseRegistration!: () => void;
-  readonly registrationBlocked = new Promise<void>(resolve => {
-    this.#releaseRegistration = resolve;
-  });
-
-  override async publish(topic: string, event: Parameters<PubSub['publish']>[1]): Promise<void> {
-    if ((event as { data?: { type?: string } }).data?.type === 'run-registered') {
-      await this.registrationBlocked;
-    }
-    await super.publish(topic, event);
-  }
-
-  releaseRegistration() {
-    this.#releaseRegistration();
   }
 }
 
@@ -1380,7 +1324,15 @@ describe('Agent signals', () => {
 
   it('fails closed when a visible abort-time tool terminal cannot publish', async () => {
     const runtime = new AgentThreadStreamRuntime();
-    const pubsub = new RejectVisibleToolTerminalPubSub();
+    const pubsub = new ControlledLeasePubSub();
+    const publish = pubsub.publish.bind(pubsub);
+    pubsub.publish = async (topic, event) => {
+      const data = (event as { data?: { type?: string; part?: { type?: string } } }).data;
+      if (data?.type === 'stream-part' && data.part?.type === 'tool-error') {
+        throw new Error('injected visible tool terminal publication failure');
+      }
+      await publish(topic, event);
+    };
     const agent = { id: 'abort-tool-terminal-failure-agent' } as Agent<any, any, any, any>;
     const threadId = 'abort-tool-terminal-failure-thread';
     const resourceId = 'abort-tool-terminal-failure-user';
@@ -1452,7 +1404,14 @@ describe('Agent signals', () => {
 
   it('fails closed when the distributed abort fence cannot publish', async () => {
     const runtime = new AgentThreadStreamRuntime();
-    const pubsub = new RejectRunAbortingPubSub();
+    const pubsub = new ControlledLeasePubSub();
+    const publish = pubsub.publish.bind(pubsub);
+    pubsub.publish = async (topic, event) => {
+      if ((event as { data?: { type?: string } }).data?.type === 'run-aborting') {
+        throw new Error('injected abort fence failure');
+      }
+      await publish(topic, event);
+    };
     const agent = { id: 'abort-fence-agent' } as Agent<any, any, any, any>;
     const threadId = 'abort-fence-thread';
     const resourceId = 'abort-fence-user';
@@ -1499,7 +1458,18 @@ describe('Agent signals', () => {
 
   it('publishes the abort terminal only after delayed registration succeeds', async () => {
     const runtime = new AgentThreadStreamRuntime();
-    const pubsub = new DelayedRegistrationPubSub();
+    const pubsub = new ControlledLeasePubSub();
+    let releaseRegistration!: () => void;
+    const registrationBlocked = new Promise<void>(resolve => {
+      releaseRegistration = resolve;
+    });
+    const publish = pubsub.publish.bind(pubsub);
+    pubsub.publish = async (topic, event) => {
+      if ((event as { data?: { type?: string } }).data?.type === 'run-registered') {
+        await registrationBlocked;
+      }
+      await publish(topic, event);
+    };
     const agent = { id: 'abort-registration-order-agent' } as Agent<any, any, any, any>;
     const threadId = 'abort-registration-order-thread';
     const resourceId = 'abort-registration-order-user';
@@ -1527,7 +1497,7 @@ describe('Agent signals', () => {
       expect(runtime.abortRun(runId, pubsub)).toBe(true);
       await new Promise(resolve => setTimeout(resolve, 300));
       expect(pubsub.publishedData.some(data => data?.type === 'run-aborted' && data.runId === runId)).toBe(false);
-      pubsub.releaseRegistration();
+      releaseRegistration();
       await expect(withTimeout(iterator.next(), 'Timed out waiting for delayed abort')).resolves.toEqual({
         value: { type: 'abort', runId },
         done: false,
@@ -2121,7 +2091,8 @@ describe('Agent signals', () => {
     }
   });
 
-  it('bounds retained suspended-stream identities per run and across runs', () => {
+  it('bounds retained suspended-stream identities per run and across runs', async () => {
+    const { rememberBoundedResumableTerminalStream } = await import('../thread-stream-runtime');
     const retained = new Map<string, Set<string>>();
 
     rememberBoundedResumableTerminalStream(retained, 'run-a', 'stream-a1', 2);
@@ -8643,7 +8614,19 @@ describe('Agent signals', () => {
 
   it('runs idle wake rejection cleanup when a queued idle stream fails', async () => {
     const runtime = new AgentThreadStreamRuntime();
-    const pubsub = new RunFailedOwnershipPubSub();
+    const pubsub = new ControlledLeasePubSub();
+    let runFailedLeaseOwner: string | undefined;
+    let runFailedPublishedWithLiveOwner = false;
+    const publish = pubsub.publish.bind(pubsub);
+    pubsub.publish = async (topic, event) => {
+      const data = (event as { data?: { type?: string; leaseOwner?: string } }).data;
+      if (data?.type === 'run-failed') {
+        runFailedLeaseOwner = data.leaseOwner;
+        runFailedPublishedWithLiveOwner =
+          data.leaseOwner !== undefined && [...pubsub.owners.values()].includes(data.leaseOwner);
+      }
+      await publish(topic, event);
+    };
     let finishActive!: () => void;
     const activeFinished = new Promise<void>(resolve => {
       finishActive = resolve;
@@ -8695,8 +8678,8 @@ describe('Agent signals', () => {
         memory: { resource: 'queued-failure-user', thread: 'queued-failure-thread' },
       }),
     );
-    expect(pubsub.runFailedLeaseOwner).toBeDefined();
-    expect(pubsub.runFailedPublishedWithLiveOwner).toBe(true);
+    expect(runFailedLeaseOwner).toBeDefined();
+    expect(runFailedPublishedWithLiveOwner).toBe(true);
     expect(pubsub.publishedData.some(data => data?.type === 'run-aborted' && data.runId === result.runId)).toBe(false);
   });
 
@@ -9138,7 +9121,19 @@ describe('Agent signals', () => {
 
   it('publishes an authenticated setup failure before releasing its exact lease owner', async () => {
     const runtime = new AgentThreadStreamRuntime();
-    const pubsub = new RunFailedOwnershipPubSub();
+    const pubsub = new ControlledLeasePubSub();
+    let runFailedLeaseOwner: string | undefined;
+    let runFailedPublishedWithLiveOwner = false;
+    const publish = pubsub.publish.bind(pubsub);
+    pubsub.publish = async (topic, event) => {
+      const data = (event as { data?: { type?: string; leaseOwner?: string } }).data;
+      if (data?.type === 'run-failed') {
+        runFailedLeaseOwner = data.leaseOwner;
+        runFailedPublishedWithLiveOwner =
+          data.leaseOwner !== undefined && [...pubsub.owners.values()].includes(data.leaseOwner);
+      }
+      await publish(topic, event);
+    };
     const resourceId = 'authenticated-setup-failure-user';
     const threadId = 'authenticated-setup-failure-thread';
     const result = runtime.sendSignal(
@@ -9158,8 +9153,8 @@ describe('Agent signals', () => {
     );
 
     await expect(result.accepted).rejects.toThrow('authenticated setup failure');
-    expect(pubsub.runFailedLeaseOwner).toBeDefined();
-    expect(pubsub.runFailedPublishedWithLiveOwner).toBe(true);
+    expect(runFailedLeaseOwner).toBeDefined();
+    expect(runFailedPublishedWithLiveOwner).toBe(true);
     expect(
       pubsub.publishedData.filter(data => data?.type === 'run-failed' && data.runId === result.runId),
     ).toHaveLength(1);
@@ -9801,7 +9796,19 @@ describe('Agent signals', () => {
 
   it('releases waiters when draining a queued active signal fails', async () => {
     const runtime = new AgentThreadStreamRuntime();
-    const pubsub = new RunFailedOwnershipPubSub();
+    const pubsub = new ControlledLeasePubSub();
+    let runFailedLeaseOwner: string | undefined;
+    let runFailedPublishedWithLiveOwner = false;
+    const publish = pubsub.publish.bind(pubsub);
+    pubsub.publish = async (topic, event) => {
+      const data = (event as { data?: { type?: string; leaseOwner?: string } }).data;
+      if (data?.type === 'run-failed') {
+        runFailedLeaseOwner = data.leaseOwner;
+        runFailedPublishedWithLiveOwner =
+          data.leaseOwner !== undefined && [...pubsub.owners.values()].includes(data.leaseOwner);
+      }
+      await publish(topic, event);
+    };
     let finishActive!: () => void;
     const activeFinished = new Promise<void>(resolve => {
       finishActive = resolve;
@@ -9865,8 +9872,8 @@ describe('Agent signals', () => {
       ),
     ).toEqual(expect.any(Function));
     const failureTerminal = pubsub.publishedData.find(data => data?.type === 'run-failed');
-    expect(failureTerminal?.leaseOwner).toBe(pubsub.runFailedLeaseOwner);
-    expect(pubsub.runFailedPublishedWithLiveOwner).toBe(true);
+    expect(failureTerminal?.leaseOwner).toBe(runFailedLeaseOwner);
+    expect(runFailedPublishedWithLiveOwner).toBe(true);
     expect(
       pubsub.publishedData.some(data => data?.type === 'run-aborted' && data.runId === failureTerminal?.runId),
     ).toBe(false);
