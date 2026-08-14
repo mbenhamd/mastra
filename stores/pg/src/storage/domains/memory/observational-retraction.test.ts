@@ -954,6 +954,76 @@ describe('MemoryPG observational-memory retraction', () => {
     ).resolves.toBeNull();
   });
 
+  it.each(['update', 'delete'] as const)(
+    'uses the persisted thread OM owner for message %s retraction',
+    async operation => {
+      const messageResourceId = `${resourceId}-message-owner-${operation}`;
+      const ownerResourceId = `${resourceId}-thread-owner-${operation}`;
+      const ownerThreadId = `${threadId}-owner-${operation}`;
+      const ownerMessageId = `${threadId}-owner-message-${operation}`;
+
+      for (const [id, workingMemory] of [
+        [messageResourceId, 'unrelated message-resource memory'],
+        [ownerResourceId, 'observer-managed owner memory'],
+      ] as const) {
+        await observerMemory.saveResource({
+          resource: { id, workingMemory, metadata: {}, createdAt, updatedAt: createdAt },
+        });
+      }
+      await observerMemory.saveThread({
+        thread: {
+          id: ownerThreadId,
+          resourceId: ownerResourceId,
+          title: ownerThreadId,
+          metadata: {},
+          createdAt,
+          updatedAt: createdAt,
+        },
+      });
+      await observerMemory.initializeObservationalMemory({
+        config: { _managedWorkingMemoryScope: 'resource' },
+        resourceId: ownerResourceId,
+        scope: 'thread',
+        threadId: ownerThreadId,
+      });
+      await observerMemory.saveMessages({
+        messages: [
+          {
+            id: ownerMessageId,
+            threadId: ownerThreadId,
+            resourceId: messageResourceId,
+            role: 'user',
+            content: { format: 2, parts: [{ type: 'text', text: 'Retract by owner' }] },
+            createdAt,
+          },
+        ],
+      });
+
+      const retractions: Array<{ input: { resourceId: string; threadId: string } }> = [];
+      if (operation === 'update') {
+        await retractorMemory.updateMessages({
+          messages: [{ id: ownerMessageId, content: { content: 'authoritative edit' } }],
+          retractObservationalMemory: true,
+          observationalMemoryRetractions: retractions as any,
+        });
+      } else {
+        await retractorMemory.deleteMessages([ownerMessageId], {
+          retractObservationalMemory: true,
+          observationalMemoryRetractions: retractions as any,
+        });
+      }
+
+      expect(retractions).toMatchObject([{ input: { resourceId: ownerResourceId, threadId: ownerThreadId } }]);
+      await expect(retractorMemory.getObservationalMemory(ownerThreadId, ownerResourceId)).resolves.toBeNull();
+      await expect(retractorMemory.getResourceById({ resourceId: ownerResourceId })).resolves.toMatchObject({
+        workingMemory: null,
+      });
+      await expect(retractorMemory.getResourceById({ resourceId: messageResourceId })).resolves.toMatchObject({
+        workingMemory: 'unrelated message-resource memory',
+      });
+    },
+  );
+
   it('deletes a nullable-resource orphan whose thread row is absent', async () => {
     const orphanMessageId = `${threadId}-missing-thread-orphan-message`;
     const missingThreadId = `${threadId}-missing-thread-orphan`;
