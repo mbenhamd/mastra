@@ -925,7 +925,15 @@ export type ApplyWorkingMemoryUpdateInput = WorkingMemorySnapshotInput & {
  * writes must continue to preserve or reject governed Working Memory fields.
  */
 export type StorageTransitionThreadToResourceWorkingMemoryInput = {
-  thread: StorageThreadType;
+  mutation:
+    | { type: 'save'; thread: StorageThreadType }
+    | {
+        type: 'update';
+        id: string;
+        resourceId: string;
+        title?: string;
+        metadata?: Record<string, unknown>;
+      };
   value: string;
   expectedRevision: number;
   maxDataBytes?: number;

@@ -679,6 +679,81 @@ describe('Memory', () => {
       await expect(memory.getThreadById({ threadId })).resolves.toEqual(afterOwnerWrite);
     });
 
+    it('preserves concurrent partial thread updates during resource working memory transitions', async () => {
+      const storage = new InMemoryStore();
+      const memory = new Memory({
+        storage,
+        options: { workingMemory: { enabled: true, scope: 'resource' } },
+      });
+      const memoryStore = (await storage.getStore('memory'))!;
+      const threadId = 'thread-resource-transition-partial-update';
+      const resourceId = 'resource-transition-partial-update';
+      const createdAt = new Date('2026-01-01T00:00:00.000Z');
+      await memory.saveThread({
+        thread: {
+          id: threadId,
+          resourceId,
+          title: 'Initial title',
+          metadata: { preserved: 'initial', mastra: { custom: true } },
+          createdAt,
+          updatedAt: createdAt,
+        },
+      });
+
+      const originalTransition = memoryStore.transitionThreadToResourceWorkingMemory.bind(memoryStore);
+      let markTransitionStarted!: () => void;
+      let releaseTransition!: () => void;
+      const transitionStarted = new Promise<void>(resolve => {
+        markTransitionStarted = resolve;
+      });
+      const transitionBlocked = new Promise<void>(resolve => {
+        releaseTransition = resolve;
+      });
+      vi.spyOn(memoryStore, 'transitionThreadToResourceWorkingMemory').mockImplementation(async args => {
+        markTransitionStarted();
+        await transitionBlocked;
+        return originalTransition(args);
+      });
+
+      const transitionPromise = memory.updateThread({
+        id: threadId,
+        metadata: { workingMemory: 'first resource value' },
+      });
+      await transitionStarted;
+      await memoryStore.updateThread({
+        id: threadId,
+        title: 'Concurrent title',
+        metadata: { concurrent: true },
+      });
+      releaseTransition();
+      await transitionPromise;
+
+      const concurrentThread = await memoryStore.getThreadById({ threadId });
+      expect(concurrentThread?.title).toBe('Concurrent title');
+      expect(concurrentThread?.metadata).toEqual({
+        preserved: 'initial',
+        concurrent: true,
+        mastra: { custom: true },
+      });
+
+      await memory.updateThread({
+        id: threadId,
+        title: 'Explicit transition title',
+        metadata: { explicit: true, workingMemory: 'second resource value', mastra: null },
+      });
+      const explicitlyUpdatedThread = await memoryStore.getThreadById({ threadId });
+      expect(explicitlyUpdatedThread?.title).toBe('Explicit transition title');
+      expect(explicitlyUpdatedThread?.metadata).toEqual({
+        preserved: 'initial',
+        concurrent: true,
+        explicit: true,
+        mastra: null,
+      });
+      await expect(memoryStore.getResourceById({ resourceId })).resolves.toMatchObject({
+        workingMemory: 'second resource value',
+      });
+    });
+
     it.each(['save', 'update'] as const)(
       'requires an explicit migration value before a resource-scoped %s can hide governed thread Working Memory',
       async mutation => {

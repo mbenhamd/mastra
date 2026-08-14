@@ -21,6 +21,7 @@ import {
   assertThreadWorkingMemoryIsUngoverned,
   assertWorkingMemorySnapshotUnchanged,
   hasWorkingMemorySnapshotControls,
+  mergeThreadMetadataForWorkingMemoryTransition,
   preserveWorkingMemorySnapshotControls,
   readWorkingMemorySnapshot,
   retractObserverWorkingMemorySnapshot,
@@ -2775,8 +2776,10 @@ export class MemoryPG extends MemoryStorage {
   async transitionThreadToResourceWorkingMemory(
     input: StorageTransitionThreadToResourceWorkingMemoryInput,
   ): Promise<StorageTransitionThreadToResourceWorkingMemoryOutput> {
-    assertThreadWorkingMemoryRemoved(input.thread.metadata);
-    const resourceId = input.thread.resourceId;
+    const threadId = input.mutation.type === 'save' ? input.mutation.thread.id : input.mutation.id;
+    const resourceId = input.mutation.type === 'save' ? input.mutation.thread.resourceId : input.mutation.resourceId;
+    const proposedMetadata = input.mutation.type === 'save' ? input.mutation.thread.metadata : input.mutation.metadata;
+    assertThreadWorkingMemoryRemoved(proposedMetadata);
     const threadTableName = getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) });
     const resourceTableName = getTableName({ indexName: TABLE_RESOURCES, schemaName: getSchemaName(this.#schema) });
 
@@ -2784,12 +2787,20 @@ export class MemoryPG extends MemoryStorage {
       return await this.#db.client.tx(async t => {
         await this.lockObservationalMemoryResource(t, resourceId);
         await this.lockWorkingMemoryTarget(t, 'resource', resourceId);
-        await this.lockWorkingMemoryTarget(t, 'thread', input.thread.id);
+        await this.lockWorkingMemoryTarget(t, 'thread', threadId);
 
-        const currentThread = await t.oneOrNone<{ resourceId: string }>(
-          `SELECT "resourceId" FROM ${threadTableName} WHERE id = $1 FOR UPDATE`,
-          [input.thread.id],
-        );
+        const currentThread = await t.oneOrNone<
+          StorageThreadType & { createdAtZ?: Date | string; updatedAtZ?: Date | string }
+        >(`SELECT * FROM ${threadTableName} WHERE id = $1 FOR UPDATE`, [threadId]);
+        if (input.mutation.type === 'update' && !currentThread) {
+          throw new MastraError({
+            id: createStorageErrorId('PG', 'UPDATE_THREAD', 'FAILED'),
+            domain: ErrorDomain.STORAGE,
+            category: ErrorCategory.USER,
+            text: `Thread ${threadId} not found`,
+            details: { threadId, title: input.mutation.title ?? null },
+          });
+        }
         if (currentThread && currentThread.resourceId !== resourceId) {
           throw new WorkingMemoryValidationError('Working-memory thread does not belong to the requested resource.');
         }
@@ -2835,32 +2846,49 @@ export class MemoryPG extends MemoryStorage {
           );
         }
 
-        const createdAt = toUtcISOString(input.thread.createdAt);
-        const updatedAt = toUtcISOString(input.thread.updatedAt);
-        const thread = await t.one<StorageThreadType & { createdAtZ: Date | string; updatedAtZ: Date | string }>(
-          `INSERT INTO ${threadTableName}
-             (id, "resourceId", title, metadata, "createdAt", "createdAtZ", "updatedAt", "updatedAtZ")
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-           ON CONFLICT (id) DO UPDATE SET
-             "resourceId" = EXCLUDED."resourceId",
-             title = EXCLUDED.title,
-             metadata = EXCLUDED.metadata,
-             "createdAt" = EXCLUDED."createdAt",
-             "createdAtZ" = EXCLUDED."createdAtZ",
-             "updatedAt" = EXCLUDED."updatedAt",
-             "updatedAtZ" = EXCLUDED."updatedAtZ"
-           RETURNING *`,
-          [
-            input.thread.id,
-            resourceId,
-            input.thread.title,
-            JSON.stringify(input.thread.metadata ?? {}),
-            createdAt,
-            createdAt,
-            updatedAt,
-            updatedAt,
-          ],
-        );
+        let thread: StorageThreadType & { createdAtZ?: Date | string; updatedAtZ?: Date | string };
+        if (input.mutation.type === 'save') {
+          const createdAt = toUtcISOString(input.mutation.thread.createdAt);
+          const updatedAt = toUtcISOString(input.mutation.thread.updatedAt);
+          thread = await t.one(
+            `INSERT INTO ${threadTableName}
+               (id, "resourceId", title, metadata, "createdAt", "createdAtZ", "updatedAt", "updatedAtZ")
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT (id) DO UPDATE SET
+               "resourceId" = EXCLUDED."resourceId",
+               title = EXCLUDED.title,
+               metadata = EXCLUDED.metadata,
+               "createdAt" = EXCLUDED."createdAt",
+               "createdAtZ" = EXCLUDED."createdAtZ",
+               "updatedAt" = EXCLUDED."updatedAt",
+               "updatedAtZ" = EXCLUDED."updatedAtZ"
+             RETURNING *`,
+            [
+              threadId,
+              resourceId,
+              input.mutation.thread.title,
+              JSON.stringify(input.mutation.thread.metadata ?? {}),
+              createdAt,
+              createdAt,
+              updatedAt,
+              updatedAt,
+            ],
+          );
+        } else {
+          const metadata =
+            mergeThreadMetadataForWorkingMemoryTransition(
+              parseMetadata(currentThread!.metadata),
+              input.mutation.metadata,
+            ) ?? {};
+          const updatedAt = toUtcISOString(new Date());
+          thread = await t.one(
+            `UPDATE ${threadTableName}
+             SET title = COALESCE($1, title), metadata = $2, "updatedAt" = $3, "updatedAtZ" = $4
+             WHERE id = $5
+             RETURNING *`,
+            [input.mutation.title ?? null, JSON.stringify(metadata), updatedAt, updatedAt, threadId],
+          );
+        }
         return {
           thread: {
             id: thread.id,
@@ -2874,7 +2902,11 @@ export class MemoryPG extends MemoryStorage {
         };
       });
     } catch (error) {
-      if (error instanceof WorkingMemoryRevisionConflictError || error instanceof WorkingMemoryValidationError) {
+      if (
+        error instanceof MastraError ||
+        error instanceof WorkingMemoryRevisionConflictError ||
+        error instanceof WorkingMemoryValidationError
+      ) {
         throw error;
       }
       throw new MastraError(
@@ -2882,7 +2914,7 @@ export class MemoryPG extends MemoryStorage {
           id: createStorageErrorId('PG', 'TRANSITION_THREAD_TO_RESOURCE_WORKING_MEMORY', 'FAILED'),
           domain: ErrorDomain.STORAGE,
           category: ErrorCategory.THIRD_PARTY,
-          details: { threadId: input.thread.id, resourceId },
+          details: { threadId, resourceId },
         },
         error,
       );

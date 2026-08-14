@@ -857,7 +857,7 @@ export class Memory extends MastraMemory {
                 resourceId: thread.resourceId,
               });
               const transitioned = await memoryStore.transitionThreadToResourceWorkingMemory({
-                thread: threadForStorage,
+                mutation: { type: 'save', thread: threadForStorage },
                 value: managedWorkingMemory.workingMemory,
                 expectedRevision: current.revision,
                 ...(config.workingMemory?.maxDataBytes === undefined
@@ -1011,7 +1011,15 @@ export class Memory extends MastraMemory {
               if (memoryStore.supportsRevisionedWorkingMemory) {
                 const current = await memoryStore.getWorkingMemorySnapshot({ scope: 'resource', resourceId });
                 const transitioned = await memoryStore.transitionThreadToResourceWorkingMemory({
-                  thread: threadForStorage,
+                  mutation: {
+                    type: 'update',
+                    id,
+                    resourceId,
+                    ...(title === undefined ? {} : { title }),
+                    ...(metadata === undefined
+                      ? {}
+                      : { metadata: this.stripManagedWorkingMemoryFromThreadMetadata(metadata) }),
+                  },
                   value: managedWorkingMemory.workingMemory,
                   expectedRevision: current.revision,
                   ...(config.workingMemory?.maxDataBytes === undefined

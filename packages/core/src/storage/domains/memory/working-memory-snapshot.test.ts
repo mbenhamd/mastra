@@ -788,12 +788,15 @@ describe('InMemoryMemory revisioned Working Memory', () => {
 
     await expect(
       memory.transitionThreadToResourceWorkingMemory({
-        thread: {
-          id: threadId,
-          resourceId,
-          metadata: { preserved: true },
-          createdAt,
-          updatedAt: new Date(),
+        mutation: {
+          type: 'save',
+          thread: {
+            id: threadId,
+            resourceId,
+            metadata: { preserved: true },
+            createdAt,
+            updatedAt: new Date(),
+          },
         },
         value: 'canonical resource value',
         expectedRevision: 0,
@@ -805,12 +808,15 @@ describe('InMemoryMemory revisioned Working Memory', () => {
 
     const currentResource = await memory.getWorkingMemorySnapshot({ scope: 'resource', resourceId });
     const transitioned = await memory.transitionThreadToResourceWorkingMemory({
-      thread: {
-        id: threadId,
-        resourceId,
-        metadata: { preserved: true },
-        createdAt,
-        updatedAt: new Date(),
+      mutation: {
+        type: 'save',
+        thread: {
+          id: threadId,
+          resourceId,
+          metadata: { preserved: true },
+          createdAt,
+          updatedAt: new Date(),
+        },
       },
       value: 'canonical resource value',
       expectedRevision: currentResource.revision,
@@ -823,6 +829,72 @@ describe('InMemoryMemory revisioned Working Memory', () => {
       revision: 0,
       protectedPaths: [],
       provenance: {},
+    });
+  });
+
+  it('applies resource working memory transitions to the current in-memory thread row', async () => {
+    const storage = new InMemoryStore({ id: 'working-memory-partial-scope-transition' });
+    const memory = await storage.getStore('memory');
+    if (!memory) throw new Error('Expected in-memory storage domain.');
+    const createdAt = new Date('2026-01-01T00:00:00.000Z');
+    const resourceId = 'partial-transition-resource';
+    const threadId = 'partial-transition-thread';
+    await memory.saveThread({
+      thread: {
+        id: threadId,
+        resourceId,
+        title: 'Initial title',
+        metadata: { preserved: 'initial', mastra: { custom: true } },
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+    await memory.applyWorkingMemoryUpdate({
+      scope: 'thread',
+      resourceId,
+      threadId,
+      value: 'stale thread copy',
+      expectedRevision: 0,
+      source: 'owner',
+    });
+
+    const omittedFieldsTransition = {
+      mutation: { type: 'update' as const, id: threadId, resourceId },
+      value: 'first resource value',
+      expectedRevision: 0,
+    };
+    await memory.updateThread({
+      id: threadId,
+      title: 'Concurrent title',
+      metadata: { concurrent: true },
+    });
+    const transitioned = await memory.transitionThreadToResourceWorkingMemory(omittedFieldsTransition);
+
+    expect(transitioned.thread.title).toBe('Concurrent title');
+    expect(transitioned.thread.metadata).toEqual({
+      preserved: 'initial',
+      concurrent: true,
+      mastra: { custom: true },
+    });
+    expect(transitioned.workingMemory).toMatchObject({ value: 'first resource value', revision: 1 });
+
+    const explicitlyUpdated = await memory.transitionThreadToResourceWorkingMemory({
+      mutation: {
+        type: 'update',
+        id: threadId,
+        resourceId,
+        title: 'Explicit transition title',
+        metadata: { explicit: true, mastra: null },
+      },
+      value: 'second resource value',
+      expectedRevision: transitioned.workingMemory.revision,
+    });
+    expect(explicitlyUpdated.thread.title).toBe('Explicit transition title');
+    expect(explicitlyUpdated.thread.metadata).toEqual({
+      preserved: 'initial',
+      concurrent: true,
+      explicit: true,
+      mastra: null,
     });
   });
 

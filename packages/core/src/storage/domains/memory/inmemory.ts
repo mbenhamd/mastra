@@ -57,6 +57,7 @@ import {
   assertThreadWorkingMemoryIsUngoverned,
   assertWorkingMemorySnapshotUnchanged,
   hasWorkingMemorySnapshotControls,
+  mergeThreadMetadataForWorkingMemoryTransition,
   preserveWorkingMemorySnapshotControls,
   readWorkingMemorySnapshot,
   retractObserverWorkingMemorySnapshot,
@@ -1313,14 +1314,22 @@ export class InMemoryMemory extends MemoryStorage {
     input: StorageTransitionThreadToResourceWorkingMemoryInput,
   ): Promise<StorageTransitionThreadToResourceWorkingMemoryOutput> {
     return this.withMemoryStateRollback(true, () => {
-      assertThreadWorkingMemoryRemoved(input.thread.metadata);
-      const currentThread = this.db.threads.get(input.thread.id);
-      if (currentThread && currentThread.resourceId !== input.thread.resourceId) {
+      const threadId = input.mutation.type === 'save' ? input.mutation.thread.id : input.mutation.id;
+      const resourceId = input.mutation.type === 'save' ? input.mutation.thread.resourceId : input.mutation.resourceId;
+      const proposedMetadata =
+        input.mutation.type === 'save' ? input.mutation.thread.metadata : input.mutation.metadata;
+      assertThreadWorkingMemoryRemoved(proposedMetadata);
+
+      const currentThread = this.db.threads.get(threadId);
+      if (input.mutation.type === 'update' && !currentThread) {
+        throw new Error(`Thread with id ${threadId} not found`);
+      }
+      if (currentThread && currentThread.resourceId !== resourceId) {
         throw new WorkingMemoryValidationError('Working-memory thread does not belong to the requested resource.');
       }
 
       const now = new Date();
-      const currentResource = this.db.resources.get(input.thread.resourceId);
+      const currentResource = this.db.resources.get(resourceId);
       const current = readWorkingMemorySnapshot(currentResource?.workingMemory, currentResource?.metadata);
       const next = applyWorkingMemorySnapshotUpdate(
         current,
@@ -1334,7 +1343,7 @@ export class InMemoryMemory extends MemoryStorage {
       );
       const resource = cloneResourceBoundary(
         {
-          id: input.thread.resourceId,
+          id: resourceId,
           workingMemory: next.value ?? undefined,
           metadata: writeWorkingMemorySnapshotMetadata(currentResource?.metadata, next),
           createdAt: currentResource?.createdAt ?? now,
@@ -1342,7 +1351,21 @@ export class InMemoryMemory extends MemoryStorage {
         },
         true,
       );
-      const thread = cloneThreadBoundary(input.thread, true);
+      const thread =
+        input.mutation.type === 'save'
+          ? cloneThreadBoundary(input.mutation.thread, true)
+          : cloneThreadBoundary(
+              {
+                ...currentThread!,
+                ...(input.mutation.title === undefined ? {} : { title: input.mutation.title }),
+                metadata: mergeThreadMetadataForWorkingMemoryTransition(
+                  currentThread!.metadata,
+                  input.mutation.metadata,
+                ),
+                updatedAt: now,
+              },
+              true,
+            );
       this.db.resources.set(resource.id, resource);
       this.db.threads.set(thread.id, thread);
       this.rotateThreadGeneration(thread.id);

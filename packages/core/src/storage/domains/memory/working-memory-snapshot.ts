@@ -408,6 +408,21 @@ export function stripThreadWorkingMemoryMetadata(
   return stripped;
 }
 
+/** Merge a partial thread update before removing its governed Working Memory fields. */
+export function mergeThreadMetadataForWorkingMemoryTransition(
+  current: Record<string, unknown> | undefined,
+  update: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (update === undefined) return stripThreadWorkingMemoryMetadata(current);
+
+  const merged = { ...current, ...update };
+  if (isRecord(update.mastra)) {
+    const currentMastra = isRecord(current?.mastra) ? current.mastra : {};
+    merged.mastra = { ...currentMastra, ...update.mastra };
+  }
+  return stripThreadWorkingMemoryMetadata(merged);
+}
+
 /**
  * Fail closed when changing scope without an explicit migration value would
  * hide a governed thread snapshot.

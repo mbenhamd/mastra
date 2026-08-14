@@ -326,7 +326,7 @@ describe('MemoryPG revisioned Working Memory', () => {
 
     await expect(
       secondMemory.transitionThreadToResourceWorkingMemory({
-        thread,
+        mutation: { type: 'save', thread },
         value: 'canonical resource value',
         expectedRevision: 0,
       }),
@@ -344,7 +344,7 @@ describe('MemoryPG revisioned Working Memory', () => {
       resourceId: transitionResourceId,
     });
     const transitioned = await secondMemory.transitionThreadToResourceWorkingMemory({
-      thread,
+      mutation: { type: 'save', thread },
       value: 'canonical resource value',
       expectedRevision: currentResource.revision,
     });
@@ -357,6 +357,96 @@ describe('MemoryPG revisioned Working Memory', () => {
         threadId: transitionThreadId,
       }),
     ).resolves.toEqual({ value: null, revision: 0, protectedPaths: [], provenance: {} });
+  });
+
+  it('merges resource working memory transitions into the thread row locked by PostgreSQL', async () => {
+    const transitionResourceId = `${resourceId}-partial-transition`;
+    const transitionThreadId = `${threadId}-partial-transition`;
+    const createdAt = new Date('2026-01-01T00:00:00.000Z');
+    await firstMemory.saveThread({
+      thread: {
+        id: transitionThreadId,
+        resourceId: transitionResourceId,
+        title: 'Initial title',
+        metadata: { preserved: 'initial', mastra: { custom: true } },
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+    await firstMemory.applyWorkingMemoryUpdate({
+      scope: 'thread',
+      resourceId: transitionResourceId,
+      threadId: transitionThreadId,
+      value: 'stale thread copy',
+      expectedRevision: 0,
+      source: 'owner',
+    });
+
+    const blocker = new Pool({ connectionString });
+    const client = await blocker.connect();
+    let transactionOpen = false;
+    try {
+      await client.query('BEGIN');
+      transactionOpen = true;
+      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [
+        `mastra:observational-memory:${transitionResourceId}`,
+      ]);
+
+      const transitionPromise = secondMemory.transitionThreadToResourceWorkingMemory({
+        mutation: {
+          type: 'update',
+          id: transitionThreadId,
+          resourceId: transitionResourceId,
+        },
+        value: 'first resource value',
+        expectedRevision: 0,
+      });
+      const completedWhileLockHeld = await Promise.race([
+        transitionPromise.then(() => true),
+        new Promise<false>(resolve => setTimeout(() => resolve(false), 250)),
+      ]);
+      expect(completedWhileLockHeld).toBe(false);
+
+      await firstMemory.updateThread({
+        id: transitionThreadId,
+        title: 'Concurrent title',
+        metadata: { concurrent: true },
+      });
+      await client.query('COMMIT');
+      transactionOpen = false;
+
+      const transitioned = await transitionPromise;
+      expect(transitioned.thread.title).toBe('Concurrent title');
+      expect(transitioned.thread.metadata).toEqual({
+        preserved: 'initial',
+        concurrent: true,
+        mastra: { custom: true },
+      });
+      expect(transitioned.workingMemory).toMatchObject({ value: 'first resource value', revision: 1 });
+
+      const explicitlyUpdated = await secondMemory.transitionThreadToResourceWorkingMemory({
+        mutation: {
+          type: 'update',
+          id: transitionThreadId,
+          resourceId: transitionResourceId,
+          title: 'Explicit transition title',
+          metadata: { explicit: true, mastra: null },
+        },
+        value: 'second resource value',
+        expectedRevision: transitioned.workingMemory.revision,
+      });
+      expect(explicitlyUpdated.thread.title).toBe('Explicit transition title');
+      expect(explicitlyUpdated.thread.metadata).toEqual({
+        preserved: 'initial',
+        concurrent: true,
+        explicit: true,
+        mastra: null,
+      });
+    } finally {
+      if (transactionOpen) await client.query('ROLLBACK');
+      client.release();
+      await blocker.end();
+    }
   });
 
   it('atomically mutates thread rows with governed thread Working Memory', async () => {
