@@ -834,7 +834,7 @@ export function applyWorkingMemorySnapshotUpdate(
 
   const controlChanged = JSON.stringify(protectedPaths) !== JSON.stringify(current.protectedPaths);
   const changedPaths = changedJsonPointers(current.value, value);
-  if (!controlChanged && changedPaths.length === 0) return current;
+  if (!controlChanged && value === current.value) return current;
 
   const revision = current.revision + 1;
   const parsedValue = parseJsonValue(value);

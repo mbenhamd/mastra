@@ -432,6 +432,66 @@ describe('revisioned Working Memory controls', () => {
     expect(removed.provenance).not.toHaveProperty('/temporary');
   });
 
+  it('advances revision for byte-distinct owner JSON while preserving semantic provenance', () => {
+    const current = {
+      value: '{"a":1,"b":2}',
+      revision: 4,
+      protectedPaths: [],
+      provenance: {
+        '/a': { source: 'owner' as const, revision: 2, updatedAt: '2026-01-01T00:00:00.000Z' },
+        '/b': { source: 'observer' as const, revision: 3, updatedAt: '2026-01-02T00:00:00.000Z' },
+      },
+    };
+    const requestedValue = '{ "b": 2, "a": 1 }';
+
+    const updated = applyWorkingMemorySnapshotUpdate(
+      current,
+      { value: requestedValue, expectedRevision: current.revision, source: 'owner' },
+      '2026-01-03T00:00:00.000Z',
+    );
+
+    expect(updated).toEqual({ ...current, value: requestedValue, revision: 5 });
+    expect(
+      applyWorkingMemorySnapshotUpdate(updated, {
+        value: requestedValue,
+        expectedRevision: updated.revision,
+        source: 'owner',
+      }),
+    ).toBe(updated);
+  });
+
+  it('persists the exact protected-observer merge across metadata round trips', () => {
+    const current = {
+      value: '{ "profile": { "name": "Ada" }, "focus": "proofs" }',
+      revision: 7,
+      protectedPaths: ['/profile/name'],
+      provenance: {
+        '/profile/name': { source: 'owner' as const, revision: 2, updatedAt: '2026-01-01T00:00:00.000Z' },
+        '/focus': { source: 'observer' as const, revision: 7, updatedAt: '2026-01-02T00:00:00.000Z' },
+      },
+    };
+    const priorMetadata = writeWorkingMemorySnapshotMetadata({}, current);
+
+    const updated = applyWorkingMemorySnapshotUpdate(
+      current,
+      {
+        value: '{"focus":"proofs","profile":{"name":"Grace"}}',
+        expectedRevision: current.revision,
+        source: 'observer',
+      },
+      '2026-01-03T00:00:00.000Z',
+    );
+    const storedMetadata = writeWorkingMemorySnapshotMetadata(priorMetadata, updated);
+
+    expect(updated).toEqual({
+      ...current,
+      value: '{"focus":"proofs","profile":{"name":"Ada"}}',
+      revision: 8,
+    });
+    expect(readWorkingMemorySnapshot(updated.value, storedMetadata)).toEqual(updated);
+    expect(readWorkingMemoryIncarnation(storedMetadata)).toBe(readWorkingMemoryIncarnation(priorMetadata));
+  });
+
   it('round-trips controls without replacing unrelated metadata', () => {
     const snapshot = {
       value: '{"name":"Ada"}',
@@ -856,6 +916,45 @@ describe('revisioned Working Memory controls', () => {
 });
 
 describe('InMemoryMemory revisioned Working Memory', () => {
+  it('round-trips byte-distinct semantic no-ops through storage', async () => {
+    const storage = new InMemoryStore({ id: 'working-memory-exact-value' });
+    const memory = await storage.getStore('memory');
+    if (!memory) throw new Error('Expected in-memory storage domain.');
+    const resourceId = 'exact-value-resource';
+    const owner = await memory.applyWorkingMemoryUpdate({
+      scope: 'resource',
+      resourceId,
+      value: '{"profile":{"name":"Ada"},"focus":"proofs"}',
+      expectedRevision: 0,
+      source: 'owner',
+      protectPaths: ['/profile/name'],
+    });
+    const requestedOwnerValue = '{ "focus": "proofs", "profile": { "name": "Ada" } }';
+
+    const reorderedOwner = await memory.applyWorkingMemoryUpdate({
+      scope: 'resource',
+      resourceId,
+      value: requestedOwnerValue,
+      expectedRevision: owner.revision,
+      source: 'owner',
+    });
+    const observer = await memory.applyWorkingMemoryUpdate({
+      scope: 'resource',
+      resourceId,
+      value: '{"focus":"proofs","profile":{"name":"Grace"}}',
+      expectedRevision: reorderedOwner.revision,
+      source: 'observer',
+    });
+
+    expect(reorderedOwner).toEqual({ ...owner, value: requestedOwnerValue, revision: 2 });
+    expect(observer).toEqual({
+      ...reorderedOwner,
+      value: '{"focus":"proofs","profile":{"name":"Ada"}}',
+      revision: 3,
+    });
+    await expect(memory.getWorkingMemorySnapshot({ scope: 'resource', resourceId })).resolves.toEqual(observer);
+  });
+
   it('rejects owner path controls above their bounds without persisting a snapshot', async () => {
     const storage = new InMemoryStore({ id: 'working-memory-protected-path-bounds' });
     const memory = await storage.getStore('memory');
