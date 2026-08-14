@@ -79,16 +79,9 @@ function cloneResourceMetadataBoundary(
   metadata: Record<string, unknown> | undefined,
   freezeWorkingMemoryControl = false,
 ): Record<string, unknown> | undefined {
-  if (metadata === undefined) return undefined;
-  const clone = { ...metadata };
-  if (!isRecord(metadata.mastra)) return clone;
-  const mastra = { ...metadata.mastra };
-  if (Object.prototype.hasOwnProperty.call(metadata.mastra, 'workingMemory')) {
-    const control = structuredClone(metadata.mastra.workingMemory);
-    mastra.workingMemory = freezeWorkingMemoryControl ? freezeMemoryBoundaryValue(control) : control;
-  }
-  clone.mastra = mastra;
-  return clone;
+  // Same isolation as thread metadata: callers must not be able to mutate
+  // stored resource metadata through a returned nested object.
+  return cloneThreadMetadataBoundary(metadata, freezeWorkingMemoryControl);
 }
 
 function cloneThreadMetadataBoundary(
