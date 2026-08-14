@@ -105,6 +105,53 @@ function cloneResourceBoundary(resource: StorageResourceType, freezeWorkingMemor
   };
 }
 
+function isPlainBoundaryObject(value: object): boolean {
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function cloneMemoryBoundaryValue<T>(value: T, seen = new WeakMap<object, unknown>()): T {
+  if (typeof value !== 'object' || value === null) return value;
+  const cached = seen.get(value);
+  if (cached !== undefined) return cached as T;
+  if (value instanceof Date) return new Date(value.getTime()) as T;
+  if (Array.isArray(value)) {
+    const clone: unknown[] = [];
+    seen.set(value, clone);
+    for (const nested of value) clone.push(cloneMemoryBoundaryValue(nested, seen));
+    return clone as T;
+  }
+  // OM config containers are JSON-like, but can hold live model instances and callbacks in memory.
+  // Keep those opaque runtime values usable while isolating every mutable plain data container around them.
+  if (!isPlainBoundaryObject(value)) return value;
+
+  const clone = Object.create(Object.getPrototypeOf(value)) as Record<string, unknown>;
+  seen.set(value, clone);
+  for (const key of Object.keys(value)) {
+    Object.defineProperty(clone, key, {
+      configurable: true,
+      enumerable: true,
+      writable: true,
+      value: cloneMemoryBoundaryValue((value as Record<string, unknown>)[key], seen),
+    });
+  }
+  return clone as T;
+}
+
+function freezeMemoryBoundaryValue<T>(value: T, seen = new WeakSet<object>()): T {
+  if (typeof value !== 'object' || value === null || seen.has(value)) return value;
+  if (!Array.isArray(value) && !(value instanceof Date) && !isPlainBoundaryObject(value)) return value;
+
+  seen.add(value);
+  for (const nested of Object.values(value)) freezeMemoryBoundaryValue(nested, seen);
+  return Object.freeze(value);
+}
+
+function cloneObservationalMemoryBoundary(record: ObservationalMemoryRecord, freeze = true): ObservationalMemoryRecord {
+  const clone = cloneMemoryBoundaryValue(record);
+  return freeze ? freezeMemoryBoundaryValue(clone) : clone;
+}
+
 function preserveGovernedThreadMetadata(
   current: Record<string, unknown> | undefined,
   proposed: Record<string, unknown> | undefined,
@@ -1441,7 +1488,7 @@ export class InMemoryMemory extends MemoryStorage {
   async getObservationalMemory(threadId: string | null, resourceId: string): Promise<ObservationalMemoryRecord | null> {
     const key = this.getObservationalMemoryKey(threadId, resourceId);
     const records = this.db.observationalMemory.get(key);
-    return records?.[0] ?? null;
+    return records?.[0] ? cloneObservationalMemoryBoundary(records[0]) : null;
   }
 
   async getObservationalMemoryHistory(
@@ -1463,7 +1510,8 @@ export class InMemoryMemory extends MemoryStorage {
       records = records.slice(options.offset);
     }
 
-    return limit != null ? records.slice(0, limit) : records;
+    const selected = limit != null ? records.slice(0, limit) : records;
+    return selected.map(record => cloneObservationalMemoryBoundary(record));
   }
 
   async initializeObservationalMemory(input: CreateObservationalMemoryInput): Promise<ObservationalMemoryRecord> {
@@ -1509,36 +1557,39 @@ export class InMemoryMemory extends MemoryStorage {
       metadata: {},
     };
 
+    const stored = cloneObservationalMemoryBoundary(record, false);
+
     // Add as first record (most recent)
     const existing = this.db.observationalMemory.get(key) ?? [];
-    this.db.observationalMemory.set(key, [record, ...existing]);
-    this.rotateObservationalMemoryGeneration(record.id);
+    this.db.observationalMemory.set(key, [stored, ...existing]);
+    this.rotateObservationalMemoryGeneration(stored.id);
 
-    return record;
+    return cloneObservationalMemoryBoundary(stored);
   }
 
   async insertObservationalMemoryRecord(
     record: ObservationalMemoryRecord,
   ): Promise<StorageObservationalMemoryCloneReceipt> {
-    const key = this.getObservationalMemoryKey(record.threadId, record.resourceId);
+    const stored = cloneObservationalMemoryBoundary(record, false);
+    const key = this.getObservationalMemoryKey(stored.threadId, stored.resourceId);
     const existing = this.db.observationalMemory.get(key) ?? [];
     const priorRecordIds = existing.map(existingRecord => existingRecord.id);
     // Insert in order by generationCount descending (newest first)
     let inserted = false;
     for (let i = 0; i < existing.length; i++) {
-      if (record.generationCount >= existing[i]!.generationCount) {
-        existing.splice(i, 0, record);
+      if (stored.generationCount >= existing[i]!.generationCount) {
+        existing.splice(i, 0, stored);
         inserted = true;
         break;
       }
     }
-    if (!inserted) existing.push(record);
+    if (!inserted) existing.push(stored);
     this.db.observationalMemory.set(key, existing);
     return {
-      recordId: record.id,
-      threadId: record.threadId,
-      resourceId: record.resourceId,
-      storageGeneration: this.rotateObservationalMemoryGeneration(record.id),
+      recordId: stored.id,
+      threadId: stored.threadId,
+      resourceId: stored.resourceId,
+      storageGeneration: this.rotateObservationalMemoryGeneration(stored.id),
       priorRecordIds,
     };
   }
@@ -1557,12 +1608,12 @@ export class InMemoryMemory extends MemoryStorage {
     record.pendingMessageTokens = 0;
 
     // Update timestamps (top-level, not in metadata)
-    record.lastObservedAt = lastObservedAt;
+    record.lastObservedAt = new Date(lastObservedAt);
     record.updatedAt = new Date();
 
     // Store observed message IDs as safeguard against re-observation
     if (observedMessageIds) {
-      record.observedMessageIds = observedMessageIds;
+      record.observedMessageIds = [...observedMessageIds];
     }
     this.rotateObservationalMemoryGeneration(record.id);
   }
@@ -1575,7 +1626,7 @@ export class InMemoryMemory extends MemoryStorage {
     }
 
     // Create a new chunk with generated id and timestamp
-    const newChunk: BufferedObservationChunk = {
+    const newChunk: BufferedObservationChunk = cloneMemoryBoundaryValue({
       id: `ombuf-${crypto.randomUUID()}`,
       cycleId: chunk.cycleId,
       observations: chunk.observations,
@@ -1589,14 +1640,14 @@ export class InMemoryMemory extends MemoryStorage {
       threadTitle: chunk.threadTitle,
       extractedValues: chunk.extractedValues,
       extractionFailures: chunk.extractionFailures,
-    };
+    });
 
     // Add chunk to the array
     const existingChunks = Array.isArray(record.bufferedObservationChunks) ? record.bufferedObservationChunks : [];
     record.bufferedObservationChunks = [...existingChunks, newChunk];
 
     if (input.lastBufferedAtTime) {
-      record.lastBufferedAtTime = input.lastBufferedAtTime;
+      record.lastBufferedAtTime = new Date(input.lastBufferedAtTime);
     }
 
     record.updatedAt = new Date();
@@ -1614,7 +1665,9 @@ export class InMemoryMemory extends MemoryStorage {
     // activation math, falling back to persisted chunks otherwise.
     // Keep refreshed chunks local — don't overwrite the stored buffer.
     const persistedChunks = Array.isArray(record.bufferedObservationChunks) ? record.bufferedObservationChunks : [];
-    const chunks = Array.isArray(input.bufferedChunks) ? input.bufferedChunks : persistedChunks;
+    const chunks = Array.isArray(input.bufferedChunks)
+      ? cloneMemoryBoundaryValue(input.bufferedChunks)
+      : persistedChunks;
     if (chunks.length === 0) {
       return {
         chunksActivated: 0,
@@ -1701,8 +1754,11 @@ export class InMemoryMemory extends MemoryStorage {
 
     // Derive lastObservedAt from the latest activated chunk, or use provided value
     const latestChunk = activatedChunks[activatedChunks.length - 1];
-    const derivedLastObservedAt =
-      lastObservedAt ?? (latestChunk?.lastObservedAt ? new Date(latestChunk.lastObservedAt) : new Date());
+    const derivedLastObservedAt = lastObservedAt
+      ? new Date(lastObservedAt)
+      : latestChunk?.lastObservedAt
+        ? new Date(latestChunk.lastObservedAt)
+        : new Date();
 
     // Append activated content to active observations with message boundary for cache stability
     if (record.activeObservations) {
@@ -1791,12 +1847,14 @@ export class InMemoryMemory extends MemoryStorage {
       metadata: {},
     };
 
+    const stored = cloneObservationalMemoryBoundary(newRecord, false);
+
     // Add as first record (most recent)
     const existing = this.db.observationalMemory.get(key) ?? [];
-    this.db.observationalMemory.set(key, [newRecord, ...existing]);
-    this.rotateObservationalMemoryGeneration(newRecord.id);
+    this.db.observationalMemory.set(key, [stored, ...existing]);
+    this.rotateObservationalMemoryGeneration(stored.id);
 
-    return newRecord;
+    return cloneObservationalMemoryBoundary(stored);
   }
 
   async updateBufferedReflection(input: UpdateBufferedReflectionInput): Promise<void> {
@@ -2018,7 +2076,9 @@ export class InMemoryMemory extends MemoryStorage {
       throw new Error(`Observational memory record not found: ${input.id}`);
     }
 
-    record.config = this.deepMergeConfig(record.config as Record<string, unknown>, input.config);
+    record.config = cloneMemoryBoundaryValue(
+      this.deepMergeConfig(record.config as Record<string, unknown>, cloneMemoryBoundaryValue(input.config)),
+    );
     record.updatedAt = new Date();
     this.rotateObservationalMemoryGeneration(record.id);
   }

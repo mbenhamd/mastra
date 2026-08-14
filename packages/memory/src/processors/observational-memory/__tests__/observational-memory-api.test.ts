@@ -2851,9 +2851,9 @@ describe('getUnobservedMessages filtering', () => {
     const messages = createBulkMessages(5, threadId);
 
     // Simulate a record that has observed the first 3 messages
-    const record = await om.getOrCreateRecord(threadId);
+    const initializedRecord = await om.getOrCreateRecord(threadId);
     const observedIds = messages.slice(0, 3).map(m => m.id);
-    (record as any).observedMessageIds = observedIds;
+    const record = { ...initializedRecord, observedMessageIds: observedIds };
 
     const unobserved = om.getUnobservedMessages(messages, record);
     expect(unobserved.length).toBe(2);
@@ -2866,9 +2866,9 @@ describe('getUnobservedMessages filtering', () => {
     const messages = createBulkMessages(5, threadId, base);
 
     // Simulate a record with lastObservedAt set between message 2 and 3
-    const record = await om.getOrCreateRecord(threadId);
+    const initializedRecord = await om.getOrCreateRecord(threadId);
     // Set cursor to just after message index 2 (base + 2000ms)
-    (record as any).lastObservedAt = new Date(base + 2500);
+    const record = { ...initializedRecord, lastObservedAt: new Date(base + 2500) };
 
     const unobserved = om.getUnobservedMessages(messages, record);
     // Messages at base+3000 and base+4000 should pass the > check
@@ -3225,20 +3225,11 @@ describe('per-record config overrides', () => {
     const om = createOM(storage, { messageTokens: 500 });
     await storage.saveMessages({ messages: createBulkMessages(20, threadId) });
 
-    // Create the record first
-    const record = await om.getOrCreateRecord(threadId);
+    await om.getOrCreateRecord(threadId);
+    await om.updateRecordConfig(threadId, undefined, {
+      observation: { messageTokens: 2000 },
+    });
 
-    // Manually set _overrides on the record config (simulating what updateObservationalMemoryConfig would do)
-    const existingConfig = record.config as Record<string, unknown>;
-    record.config = {
-      ...existingConfig,
-      _overrides: {
-        observation: { messageTokens: 2000 },
-      },
-    };
-
-    // The record object is shared in InMemory storage, so the mutation above
-    // is visible to getStatus() which re-reads from the same reference.
     const status = await om.getStatus({ threadId });
     expect(status.threshold).toBe(2000);
   });
@@ -3247,16 +3238,10 @@ describe('per-record config overrides', () => {
     const om = createOM(storage, { messageTokens: 100, observationTokens: 10_000 });
     await storage.saveMessages({ messages: createBulkMessages(20, threadId) });
 
-    const record = await om.getOrCreateRecord(threadId);
-
-    // Set override to a lower reflection threshold
-    const existingConfig = record.config as Record<string, unknown>;
-    record.config = {
-      ...existingConfig,
-      _overrides: {
-        reflection: { observationTokens: 5_000 },
-      },
-    };
+    await om.getOrCreateRecord(threadId);
+    await om.updateRecordConfig(threadId, undefined, {
+      reflection: { observationTokens: 5_000 },
+    });
 
     const status = await om.getStatus({ threadId });
     // Reflection threshold should now be 5000 instead of 10000
@@ -3270,16 +3255,10 @@ describe('per-record config overrides', () => {
     const om = createOM(storage, { messageTokens: 500, bufferTokens: 200 });
     await storage.saveMessages({ messages: createBulkMessages(20, threadId) });
 
-    const record = await om.getOrCreateRecord(threadId);
-
-    // Set override below bufferTokens — should be clamped
-    const existingConfig = record.config as Record<string, unknown>;
-    record.config = {
-      ...existingConfig,
-      _overrides: {
-        observation: { messageTokens: 100 }, // Below bufferTokens of 200
-      },
-    };
+    await om.getOrCreateRecord(threadId);
+    await om.updateRecordConfig(threadId, undefined, {
+      observation: { messageTokens: 100 }, // Below bufferTokens of 200
+    });
 
     const status = await om.getStatus({ threadId });
     // Should fall back to instance-level 500, not the 100 override
@@ -3291,13 +3270,10 @@ describe('per-record config overrides', () => {
     await storage.saveMessages({ messages: createBulkMessages(20, threadId) });
 
     const record = await om.getOrCreateRecord(threadId);
-
-    // Set empty _overrides
-    const existingConfig = record.config as Record<string, unknown>;
-    record.config = {
-      ...existingConfig,
-      _overrides: {},
-    };
+    await om.getStorage().updateObservationalMemoryConfig({
+      id: record.id,
+      config: { _overrides: {} },
+    });
 
     const status = await om.getStatus({ threadId });
     expect(status.threshold).toBe(500);

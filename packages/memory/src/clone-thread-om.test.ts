@@ -54,8 +54,20 @@ describe('cloneThread – Observational Memory', () => {
   }
 
   /**
-   * Helper: seed a thread-scoped OM record with data.
+   * Helper: replace a stored OM record through supported storage operations.
    */
+  async function replaceObservationalMemory(
+    memoryStore: MemoryStorage,
+    record: ObservationalMemoryRecord,
+    overrides: Partial<ObservationalMemoryRecord>,
+  ) {
+    if (Object.keys(overrides).length === 0) return record;
+    await memoryStore.clearObservationalMemory(record.threadId, record.resourceId);
+    const seeded = { ...record, ...overrides };
+    await memoryStore.insertObservationalMemoryRecord(seeded);
+    return (await memoryStore.getObservationalMemory(seeded.threadId, seeded.resourceId))!;
+  }
+
   async function seedThreadScopedOM(
     memoryStore: MemoryStorage,
     threadId: string,
@@ -67,9 +79,7 @@ describe('cloneThread – Observational Memory', () => {
       scope: 'thread',
       config: {},
     });
-    // Apply overrides to the stored record (InMemory stores by reference)
-    Object.assign(record, overrides);
-    return record;
+    return replaceObservationalMemory(memoryStore, record, overrides);
   }
 
   /**
@@ -82,8 +92,7 @@ describe('cloneThread – Observational Memory', () => {
       scope: 'resource',
       config: {},
     });
-    Object.assign(record, overrides);
-    return record;
+    return replaceObservationalMemory(memoryStore, record, overrides);
   }
 
   describe('thread-scoped OM', () => {
@@ -487,13 +496,15 @@ describe('cloneThread – Observational Memory', () => {
         observedMessageIds: ['msg-src-thread-failed-cross-resource-clone-0'],
       });
       const targetResourceId = 'target-resource-with-existing-om';
-      const targetRecord = await memoryStore.initializeObservationalMemory({
+      const initializedTargetRecord = await memoryStore.initializeObservationalMemory({
         threadId: null,
         resourceId: targetResourceId,
         scope: 'resource',
         config: {},
       });
-      targetRecord.activeObservations = '* Pre-existing target observation';
+      const targetRecord = await replaceObservationalMemory(memoryStore, initializedTargetRecord, {
+        activeObservations: '* Pre-existing target observation',
+      });
       await memory.updateWorkingMemoryByOwner({
         threadId: 'src-thread-failed-cross-resource-clone',
         resourceId,

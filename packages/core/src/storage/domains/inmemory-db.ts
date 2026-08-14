@@ -321,6 +321,8 @@ export class InMemoryDB {
     this.skillVersions.clear();
     this.favorites.clear();
     this.observationalMemory.clear();
+    this.memoryThreadGenerations.clear();
+    this.memoryObservationalGenerations.clear();
     this.datasets.clear();
     this.datasetItems.clear();
     this.datasetVersions.clear();
