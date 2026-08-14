@@ -2022,7 +2022,8 @@ export class MemoryPG extends MemoryStorage {
       return [];
     }
 
-    const messageIds = messages.map(m => m.id);
+    const updatesById = new Map(messages.map(message => [message.id, message]));
+    const messageIds = [...updatesById.keys()];
     const messageTableName = getTableName({
       indexName: TABLE_MESSAGES,
       schemaName: getSchemaName(this.#schema),
@@ -2047,7 +2048,6 @@ export class MemoryPG extends MemoryStorage {
       const discoveredRows = await t.manyOrNone<MessageRowFromDB>(selectQuery, messageIds);
       if (discoveredRows.length === 0) return;
 
-      const updatesById = new Map(messages.map(message => [message.id, message]));
       const mutationThreadIds = sortedUniqueStrings(
         discoveredRows.flatMap(message => [message.threadId, updatesById.get(message.id)?.threadId]),
       );
@@ -2129,7 +2129,7 @@ export class MemoryPG extends MemoryStorage {
       };
 
       for (const existingMessage of existingMessages) {
-        const updatePayload = messages.find(m => m.id === existingMessage.id);
+        const updatePayload = updatesById.get(existingMessage.id);
         if (!updatePayload) continue;
 
         const { id, ...fieldsToUpdate } = updatePayload;

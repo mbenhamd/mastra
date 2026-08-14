@@ -783,6 +783,116 @@ describe('MemoryPG observational-memory retraction', () => {
     ).resolves.toBeNull();
   });
 
+  it('uses the last duplicate update for both the message move and OM retraction coordinates', async () => {
+    const duplicateMessageId = `${threadId}-duplicate-update-message`;
+    const source = {
+      resourceId: `${resourceId}-duplicate-source`,
+      threadId: `${threadId}-duplicate-source`,
+      workingMemory: 'source observer memory',
+    };
+    const discarded = {
+      resourceId: `${resourceId}-duplicate-discarded`,
+      threadId: `${threadId}-duplicate-discarded`,
+      workingMemory: 'discarded observer memory',
+    };
+    const canonical = {
+      resourceId: `${resourceId}-duplicate-canonical`,
+      threadId: `${threadId}-duplicate-canonical`,
+      workingMemory: 'canonical observer memory',
+    };
+
+    for (const coordinate of [source, discarded, canonical]) {
+      await observerMemory.saveResource({
+        resource: {
+          id: coordinate.resourceId,
+          workingMemory: coordinate.workingMemory,
+          metadata: {},
+          createdAt,
+          updatedAt: createdAt,
+        },
+      });
+      await observerMemory.saveThread({
+        thread: {
+          id: coordinate.threadId,
+          resourceId: coordinate.resourceId,
+          title: coordinate.threadId,
+          metadata: {},
+          createdAt,
+          updatedAt: createdAt,
+        },
+      });
+      await observerMemory.initializeObservationalMemory({
+        config: { _managedWorkingMemoryScope: 'resource' },
+        resourceId: coordinate.resourceId,
+        scope: 'thread',
+        threadId: coordinate.threadId,
+      });
+    }
+    await observerMemory.saveMessages({
+      messages: [
+        {
+          id: duplicateMessageId,
+          threadId: source.threadId,
+          resourceId: source.resourceId,
+          role: 'user',
+          content: { format: 2, parts: [{ type: 'text', text: 'Move me once' }] },
+          createdAt,
+        },
+      ],
+    });
+
+    const retractions: Array<{ input: { resourceId: string; threadId: string } }> = [];
+    const updatedMessages = await retractorMemory.updateMessages({
+      messages: [
+        {
+          id: duplicateMessageId,
+          threadId: discarded.threadId,
+          resourceId: discarded.resourceId,
+          content: { content: 'discarded update' },
+        },
+        {
+          id: duplicateMessageId,
+          threadId: canonical.threadId,
+          resourceId: canonical.resourceId,
+          content: { content: 'canonical update' },
+        },
+      ],
+      retractObservationalMemory: true,
+      observationalMemoryRetractions: retractions as any,
+    });
+
+    expect(updatedMessages).toMatchObject([
+      {
+        id: duplicateMessageId,
+        threadId: canonical.threadId,
+        resourceId: canonical.resourceId,
+        content: { content: 'canonical update' },
+      },
+    ]);
+    expect(
+      new Set(retractions.map(retraction => `${retraction.input.resourceId}\u0000${retraction.input.threadId}`)),
+    ).toEqual(
+      new Set([`${source.resourceId}\u0000${source.threadId}`, `${canonical.resourceId}\u0000${canonical.threadId}`]),
+    );
+    expect(retractions).toHaveLength(2);
+
+    await expect(retractorMemory.getObservationalMemory(source.threadId, source.resourceId)).resolves.toBeNull();
+    await expect(retractorMemory.getObservationalMemory(canonical.threadId, canonical.resourceId)).resolves.toBeNull();
+    await expect(retractorMemory.getResourceById({ resourceId: source.resourceId })).resolves.toMatchObject({
+      workingMemory: null,
+    });
+    await expect(retractorMemory.getResourceById({ resourceId: canonical.resourceId })).resolves.toMatchObject({
+      workingMemory: null,
+    });
+
+    await expect(
+      retractorMemory.getObservationalMemory(discarded.threadId, discarded.resourceId),
+    ).resolves.not.toBeNull();
+    await expect(retractorMemory.getResourceById({ resourceId: discarded.resourceId })).resolves.toMatchObject({
+      workingMemory: discarded.workingMemory,
+    });
+  });
+
   it('retracts observer-derived resource state when a thread is deleted directly', async () => {
     const deleteResourceId = `${resourceId}-delete-thread`;
     const deleteThreadId = `${threadId}-delete-thread`;
