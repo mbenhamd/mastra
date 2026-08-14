@@ -13,11 +13,15 @@ import type {
   StorageListThreadsOutput,
   StorageCloneThreadInput,
   StorageCloneThreadOutput,
+  StorageRollbackThreadCloneInput,
+  StorageRollbackThreadCloneResult,
+  StorageObservationalMemoryCloneReceipt,
   ThreadCloneMetadata,
   ObservationalMemoryRecord,
   ObservationalMemoryHistoryOptions,
   BufferedObservationChunk,
   CreateObservationalMemoryInput,
+  ClearObservationalMemoryOptions,
   UpdateActiveObservationsInput,
   UpdateBufferedObservationsInput,
   UpdateBufferedReflectionInput,
@@ -30,6 +34,14 @@ import type {
   RetractObservationalMemoryInput,
   RetractObservationalMemoryResult,
   UpdateObservationalMemoryConfigInput,
+  ApplyWorkingMemoryUpdateInput,
+  WorkingMemorySnapshot,
+  WorkingMemorySnapshotInput,
+  StorageThreadToResourceWorkingMemoryTransitionPreparation,
+  StorageTransitionThreadToResourceWorkingMemoryInput,
+  StorageTransitionThreadToResourceWorkingMemoryOutput,
+  StorageMutateThreadWithWorkingMemoryInput,
+  StorageMutateThreadWithWorkingMemoryOutput,
 } from '../../types';
 import {
   filterByDateRange,
@@ -39,10 +51,176 @@ import {
   validateStorageMetadataFilter,
 } from '../../utils';
 import type { InMemoryDB } from '../inmemory-db';
-import { MemoryStorage } from './base';
+import { assertObservationalMemoryClearExpectation, MemoryStorage } from './base';
+import {
+  applyWorkingMemorySnapshotUpdate,
+  assertGovernedThreadResourceUnchanged,
+  assertThreadWorkingMemoryRemoved,
+  assertThreadWorkingMemoryIsUngoverned,
+  assertWorkingMemorySnapshotUnchanged,
+  assertWorkingMemoryTransitionParticipant,
+  hasWorkingMemorySnapshotControls,
+  mergeThreadMetadataForWorkingMemoryTransition,
+  preserveWorkingMemorySnapshotControls,
+  readWorkingMemoryIncarnation,
+  readWorkingMemorySnapshot,
+  reincarnateWorkingMemorySnapshotMetadata,
+  retractObserverWorkingMemorySnapshot,
+  stripThreadWorkingMemoryMetadata,
+  writeWorkingMemorySnapshotMetadata,
+  WorkingMemoryValidationError,
+} from './working-memory-snapshot';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function cloneResourceMetadataBoundary(
+  metadata: Record<string, unknown> | undefined,
+  freezeWorkingMemoryControl = false,
+): Record<string, unknown> | undefined {
+  // Same isolation as thread metadata: callers must not be able to mutate
+  // stored resource metadata through a returned nested object.
+  return cloneThreadMetadataBoundary(metadata, freezeWorkingMemoryControl);
+}
+
+function cloneThreadMetadataBoundary(
+  metadata: Record<string, unknown> | undefined,
+  freezeWorkingMemoryControl = false,
+): Record<string, unknown> | undefined {
+  if (metadata === undefined) return undefined;
+  const clone = cloneMemoryBoundaryValue(metadata);
+  if (!isRecord(metadata.mastra)) return clone;
+  const mastra = cloneMemoryBoundaryValue({ ...metadata.mastra });
+  if (Object.prototype.hasOwnProperty.call(metadata.mastra, 'workingMemory')) {
+    const control = structuredClone(metadata.mastra.workingMemory);
+    mastra.workingMemory = freezeWorkingMemoryControl ? freezeMemoryBoundaryValue(control) : control;
+  }
+  clone.mastra = mastra;
+  return clone;
+}
+
+function cloneThreadBoundary(thread: StorageThreadType, freezeWorkingMemoryControl = true): StorageThreadType {
+  return {
+    ...thread,
+    metadata: cloneThreadMetadataBoundary(thread.metadata, freezeWorkingMemoryControl),
+    createdAt: new Date(thread.createdAt),
+    updatedAt: new Date(thread.updatedAt),
+  };
+}
+
+function cloneResourceBoundary(resource: StorageResourceType, freezeWorkingMemoryControl = true): StorageResourceType {
+  return {
+    ...resource,
+    metadata: cloneResourceMetadataBoundary(resource.metadata, freezeWorkingMemoryControl),
+    createdAt: new Date(resource.createdAt),
+    updatedAt: new Date(resource.updatedAt),
+  };
+}
+
+function isPlainBoundaryObject(value: object): boolean {
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function cloneMemoryBoundaryValue<T>(value: T, seen = new WeakMap<object, unknown>()): T {
+  if (typeof value !== 'object' || value === null) return value;
+  const cached = seen.get(value);
+  if (cached !== undefined) return cached as T;
+  if (value instanceof Date) return new Date(value.getTime()) as T;
+  if (Array.isArray(value)) {
+    const clone: unknown[] = [];
+    seen.set(value, clone);
+    for (const nested of value) clone.push(cloneMemoryBoundaryValue(nested, seen));
+    return clone as T;
+  }
+  // In-memory boundary containers are JSON-like, but can hold live model instances and callbacks.
+  // Keep those opaque runtime values usable while isolating every mutable plain data container around them.
+  if (!isPlainBoundaryObject(value)) return value;
+
+  const clone = Object.create(Object.getPrototypeOf(value)) as Record<string, unknown>;
+  seen.set(value, clone);
+  for (const key of Object.keys(value)) {
+    Object.defineProperty(clone, key, {
+      configurable: true,
+      enumerable: true,
+      writable: true,
+      value: cloneMemoryBoundaryValue((value as Record<string, unknown>)[key], seen),
+    });
+  }
+  return clone as T;
+}
+
+function freezeMemoryBoundaryValue<T>(value: T, seen = new WeakSet<object>()): T {
+  if (typeof value !== 'object' || value === null || seen.has(value)) return value;
+  if (!Array.isArray(value) && !(value instanceof Date) && !isPlainBoundaryObject(value)) return value;
+
+  seen.add(value);
+  for (const nested of Object.values(value)) freezeMemoryBoundaryValue(nested, seen);
+  return Object.freeze(value);
+}
+
+function cloneObservationalMemoryBoundary(record: ObservationalMemoryRecord, freeze = true): ObservationalMemoryRecord {
+  const clone = cloneMemoryBoundaryValue(record);
+  return freeze ? freezeMemoryBoundaryValue(clone) : clone;
+}
+
+function preserveGovernedThreadMetadata(
+  current: Record<string, unknown> | undefined,
+  proposed: Record<string, unknown> | undefined,
+  next: Record<string, unknown>,
+): Record<string, unknown> {
+  const currentValue = typeof current?.workingMemory === 'string' ? current.workingMemory : null;
+  assertWorkingMemorySnapshotUnchanged({
+    currentValue,
+    currentMetadata: current,
+    proposedValue: proposed?.workingMemory,
+    proposedValueProvided: proposed !== undefined && Object.prototype.hasOwnProperty.call(proposed, 'workingMemory'),
+    proposedMetadata: proposed,
+  });
+  if (!current || !hasWorkingMemorySnapshotControls(current)) return next;
+
+  const preserved = preserveWorkingMemorySnapshotControls(current, next);
+  if (current !== undefined && Object.prototype.hasOwnProperty.call(current, 'workingMemory')) {
+    preserved.workingMemory = current.workingMemory;
+  } else {
+    delete preserved.workingMemory;
+  }
+  return preserved;
+}
+
+function replaceThreadMetadataPreservingWorkingMemory(
+  current: Record<string, unknown> | undefined,
+  proposed: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (current === undefined && proposed === undefined) return undefined;
+  const next = proposed ?? {};
+  return preserveGovernedThreadMetadata(current, proposed, next);
+}
+
+function mergeThreadMetadataPreservingWorkingMemory(
+  current: Record<string, unknown> | undefined,
+  update: Record<string, unknown>,
+): Record<string, unknown> {
+  const existing = current ?? {};
+  const merged = { ...existing, ...update };
+  const existingMastra = isRecord(existing.mastra) ? existing.mastra : {};
+  const updateMastra = isRecord(update.mastra) ? update.mastra : {};
+  if (Object.keys(existingMastra).length > 0 || Object.keys(updateMastra).length > 0) {
+    merged.mastra = { ...existingMastra, ...updateMastra };
+  }
+  return preserveGovernedThreadMetadata(current, update, merged);
+}
+
+function mergeObservationalThreadMetadata(
+  current: Record<string, unknown> | undefined,
+  update: Record<string, unknown>,
+): Record<string, unknown> {
+  const existing = current ?? {};
+  const existingMastra = isRecord(existing.mastra) ? existing.mastra : {};
+  const updateMastra = isRecord(update.mastra) ? update.mastra : {};
+  if (!Object.prototype.hasOwnProperty.call(updateMastra, 'om')) return existing;
+  return { ...existing, mastra: { ...existingMastra, om: updateMastra.om } };
 }
 
 function getManagedWorkingMemoryScopes(records: readonly ObservationalMemoryRecord[]): Set<'thread' | 'resource'> {
@@ -90,6 +268,10 @@ function removeObservationalMemoryMetadata(
 export class InMemoryMemory extends MemoryStorage {
   readonly supportsObservationalMemory = true;
   readonly supportsAtomicObservationalMemoryRetraction = true;
+  readonly supportsRevisionedWorkingMemory = true;
+  readonly supportsThreadUpdatedBeforeFilter = true;
+  readonly supportsAtomicThreadCloneRollback = true;
+  readonly supportsThreadCloneSourceSnapshot = true;
   private db: InMemoryDB;
 
   constructor({ db }: { db: InMemoryDB }) {
@@ -100,10 +282,12 @@ export class InMemoryMemory extends MemoryStorage {
   private withMemoryStateRollback<T>(enabled: boolean, operation: () => T): T {
     if (!enabled) return operation();
 
-    const threads = new Map([...this.db.threads].map(([key, value]) => [key, { ...value }]));
+    const threads = new Map([...this.db.threads].map(([key, value]) => [key, cloneThreadBoundary(value, true)]));
     const messages = new Map([...this.db.messages].map(([key, value]) => [key, { ...value }]));
-    const resources = new Map([...this.db.resources].map(([key, value]) => [key, { ...value }]));
+    const resources = new Map([...this.db.resources].map(([key, value]) => [key, cloneResourceBoundary(value, true)]));
     const observationalMemory = new Map([...this.db.observationalMemory].map(([key, value]) => [key, [...value]]));
+    const threadGenerations = new Map(this.db.memoryThreadGenerations);
+    const observationalGenerations = new Map(this.db.memoryObservationalGenerations);
     const restore = <K, V>(target: Map<K, V>, snapshot: Map<K, V>) => {
       target.clear();
       for (const [key, value] of snapshot) target.set(key, value);
@@ -116,6 +300,8 @@ export class InMemoryMemory extends MemoryStorage {
       restore(this.db.messages, messages);
       restore(this.db.resources, resources);
       restore(this.db.observationalMemory, observationalMemory);
+      restore(this.db.memoryThreadGenerations, threadGenerations);
+      restore(this.db.memoryObservationalGenerations, observationalGenerations);
       throw error;
     }
   }
@@ -125,6 +311,24 @@ export class InMemoryMemory extends MemoryStorage {
     this.db.messages.clear();
     this.db.resources.clear();
     this.db.observationalMemory.clear();
+    this.db.memoryThreadGenerations.clear();
+    this.db.memoryObservationalGenerations.clear();
+  }
+
+  private rotateThreadGeneration(threadId: string): string {
+    const generation = crypto.randomUUID();
+    this.db.memoryThreadGenerations.set(threadId, generation);
+    return generation;
+  }
+
+  private rotateObservationalMemoryGeneration(recordId: string): string {
+    const generation = crypto.randomUUID();
+    this.db.memoryObservationalGenerations.set(recordId, generation);
+    return generation;
+  }
+
+  private forgetObservationalMemoryGenerations(records: readonly ObservationalMemoryRecord[]): void {
+    for (const record of records) this.db.memoryObservationalGenerations.delete(record.id);
   }
 
   async getThreadById({
@@ -136,13 +340,26 @@ export class InMemoryMemory extends MemoryStorage {
   }): Promise<StorageThreadType | null> {
     const thread = this.db.threads.get(threadId);
     if (!thread || (resourceId !== undefined && thread.resourceId !== resourceId)) return null;
-    return { ...thread, metadata: thread.metadata ? { ...thread.metadata } : thread.metadata };
+    return cloneThreadBoundary(thread);
   }
 
   async saveThread({ thread }: { thread: StorageThreadType }): Promise<StorageThreadType> {
-    const key = thread.id;
-    this.db.threads.set(key, thread);
-    return thread;
+    const current = this.db.threads.get(thread.id);
+    if (current) {
+      assertGovernedThreadResourceUnchanged({
+        currentResourceId: current.resourceId,
+        currentMetadata: current.metadata,
+        proposedResourceId: thread.resourceId,
+      });
+    }
+    const proposedMetadata = replaceThreadMetadataPreservingWorkingMemory(current?.metadata, thread.metadata);
+    const metadata = hasWorkingMemorySnapshotControls(current?.metadata)
+      ? proposedMetadata
+      : reincarnateWorkingMemorySnapshotMetadata(proposedMetadata);
+    const stored = cloneThreadBoundary({ ...thread, metadata }, true);
+    this.db.threads.set(thread.id, stored);
+    this.rotateThreadGeneration(thread.id);
+    return cloneThreadBoundary(stored);
   }
 
   async updateThread({
@@ -160,12 +377,23 @@ export class InMemoryMemory extends MemoryStorage {
       throw new Error(`Thread with id ${id} not found`);
     }
 
-    if (thread) {
-      if (title !== undefined) thread.title = title;
-      thread.metadata = { ...thread.metadata, ...metadata };
-      thread.updatedAt = new Date();
-    }
-    return thread;
+    const mergedMetadata =
+      metadata === undefined ? thread.metadata : mergeThreadMetadataPreservingWorkingMemory(thread.metadata, metadata);
+    const nextMetadata = hasWorkingMemorySnapshotControls(thread.metadata)
+      ? mergedMetadata
+      : reincarnateWorkingMemorySnapshotMetadata(mergedMetadata);
+    const updated = cloneThreadBoundary(
+      {
+        ...thread,
+        ...(title === undefined ? {} : { title }),
+        ...(metadata === undefined ? {} : { metadata: nextMetadata }),
+        updatedAt: new Date(),
+      },
+      true,
+    );
+    this.db.threads.set(id, updated);
+    this.rotateThreadGeneration(id);
+    return cloneThreadBoundary(updated);
   }
 
   async deleteThread({
@@ -180,6 +408,7 @@ export class InMemoryMemory extends MemoryStorage {
 
     this.withMemoryStateRollback(true, () => {
       this.db.threads.delete(threadId);
+      this.db.memoryThreadGenerations.delete(threadId);
 
       this.db.messages.forEach((msg, key) => {
         if (msg.thread_id === threadId) {
@@ -473,7 +702,7 @@ export class InMemoryMemory extends MemoryStorage {
   }
 
   protected parseStoredMessage(message: StorageMessageType): MastraDBMessage {
-    const { resourceId, content, role, thread_id, ...rest } = message;
+    const { resourceId, content, role, thread_id, createdAt, ...rest } = message;
 
     // Parse content using safelyParseJSON utility
     let parsedContent = safelyParseJSON(content);
@@ -493,6 +722,7 @@ export class InMemoryMemory extends MemoryStorage {
       ...(message.resourceId && { resourceId: message.resourceId }),
       content: parsedContent,
       role: role as MastraDBMessage['role'],
+      createdAt: new Date(createdAt),
     } satisfies MastraDBMessage;
   }
 
@@ -519,6 +749,7 @@ export class InMemoryMemory extends MemoryStorage {
       const thread = this.db.threads.get(threadId);
       if (thread) {
         thread.updatedAt = new Date();
+        this.rotateThreadGeneration(threadId);
       }
     }
 
@@ -531,7 +762,7 @@ export class InMemoryMemory extends MemoryStorage {
         content: JSON.stringify(message.content),
         role: message.role || 'user',
         type: message.type || 'text',
-        createdAt: message.createdAt,
+        createdAt: new Date(message.createdAt),
         resourceId: message.resourceId || null,
       };
       this.db.messages.set(key, storageMessage);
@@ -546,6 +777,7 @@ export class InMemoryMemory extends MemoryStorage {
     retractObservationalMemory?: boolean;
     observationalMemoryRetractions?: ObservationalMemoryRetractionReceipt[];
   }): Promise<MastraDBMessage[]> {
+    const canonicalUpdates = [...new Map(args.messages.map(message => [message.id, message])).values()];
     const committedRetractions: ObservationalMemoryRetractionReceipt[] = [];
     const updatedMessages = this.withMemoryStateRollback(args.retractObservationalMemory === true, () => {
       const retractionCoordinates: Array<{ resourceId: string; threadId: string }> = [];
@@ -555,7 +787,7 @@ export class InMemoryMemory extends MemoryStorage {
           if (!resourceId || !threadId) return;
           coordinates.set(`${resourceId}\u0000${threadId}`, { resourceId, threadId });
         };
-        for (const update of args.messages) {
+        for (const update of canonicalUpdates) {
           const message = this.db.messages.get(update.id);
           if (!message?.thread_id) continue;
           const sourceResourceId = message.resourceId ?? this.db.threads.get(message.thread_id)?.resourceId;
@@ -577,7 +809,7 @@ export class InMemoryMemory extends MemoryStorage {
       }
 
       const mutationResults: MastraDBMessage[] = [];
-      for (const update of args.messages) {
+      for (const update of canonicalUpdates) {
         const storageMsg = this.db.messages.get(update.id);
         if (!storageMsg) continue;
 
@@ -592,7 +824,7 @@ export class InMemoryMemory extends MemoryStorage {
         // Update fields
         if (update.role !== undefined) storageMsg.role = update.role;
         if (update.type !== undefined) storageMsg.type = update.type;
-        if (update.createdAt !== undefined) storageMsg.createdAt = update.createdAt;
+        if (update.createdAt !== undefined) storageMsg.createdAt = new Date(update.createdAt);
         if (update.resourceId !== undefined) storageMsg.resourceId = update.resourceId;
         // Deep merge content if present
         if (update.content !== undefined) {
@@ -618,6 +850,7 @@ export class InMemoryMemory extends MemoryStorage {
             const prev = new Date(oldThread.updatedAt).getTime();
             oldThreadNewTime = Math.max(base, prev + 1);
             oldThread.updatedAt = new Date(oldThreadNewTime);
+            this.rotateThreadGeneration(oldThreadId);
           }
           const newThread = this.db.threads.get(newThreadId);
           if (newThread) {
@@ -627,6 +860,7 @@ export class InMemoryMemory extends MemoryStorage {
               newThreadNewTime = oldThreadNewTime + 1;
             }
             newThread.updatedAt = new Date(newThreadNewTime);
+            this.rotateThreadGeneration(newThreadId);
           }
         } else {
           // Only update the thread's updatedAt if not a move
@@ -636,6 +870,7 @@ export class InMemoryMemory extends MemoryStorage {
             let newTime = Date.now();
             if (newTime <= prev) newTime = prev + 1;
             thread.updatedAt = new Date(newTime);
+            this.rotateThreadGeneration(oldThreadId);
           }
         }
         // Save the updated message
@@ -647,7 +882,7 @@ export class InMemoryMemory extends MemoryStorage {
           content: safelyParseJSON(storageMsg.content),
           role: storageMsg.role === 'user' || storageMsg.role === 'assistant' ? storageMsg.role : 'user',
           type: storageMsg.type,
-          createdAt: storageMsg.createdAt,
+          createdAt: new Date(storageMsg.createdAt),
           resourceId: storageMsg.resourceId === null ? undefined : storageMsg.resourceId,
         });
       }
@@ -713,6 +948,7 @@ export class InMemoryMemory extends MemoryStorage {
         const thread = this.db.threads.get(threadId);
         if (thread) {
           thread.updatedAt = now;
+          this.rotateThreadGeneration(threadId);
         }
       }
 
@@ -742,6 +978,14 @@ export class InMemoryMemory extends MemoryStorage {
       threads = threads.filter((t: any) => t.resourceId === filter.resourceId);
     }
 
+    if (filter?.updatedBefore) {
+      if (!(filter.updatedBefore instanceof Date) || Number.isNaN(filter.updatedBefore.getTime())) {
+        throw new TypeError('updatedBefore must be a valid Date.');
+      }
+      const updatedBefore = filter.updatedBefore.getTime();
+      threads = threads.filter(thread => new Date(thread.updatedAt).getTime() < updatedBefore);
+    }
+
     // Validate metadata keys before filtering
     this.validateMetadataKeys(filter?.metadata);
 
@@ -754,10 +998,7 @@ export class InMemoryMemory extends MemoryStorage {
     }
 
     const sortedThreads = this.sortThreads(threads, field, direction);
-    const clonedThreads = sortedThreads.map(thread => ({
-      ...thread,
-      metadata: thread.metadata ? { ...thread.metadata } : thread.metadata,
-    })) as StorageThreadType[];
+    const clonedThreads = sortedThreads.map(thread => cloneThreadBoundary(thread));
 
     const { offset, perPage: perPageForResponse } = calculatePagination(page, perPageInput, perPage);
 
@@ -772,14 +1013,33 @@ export class InMemoryMemory extends MemoryStorage {
 
   async getResourceById({ resourceId }: { resourceId: string }): Promise<StorageResourceType | null> {
     const resource = this.db.resources.get(resourceId);
-    return resource
-      ? { ...resource, metadata: resource.metadata ? { ...resource.metadata } : resource.metadata }
-      : null;
+    return resource ? cloneResourceBoundary(resource) : null;
   }
 
   async saveResource({ resource }: { resource: StorageResourceType }): Promise<StorageResourceType> {
-    this.db.resources.set(resource.id, resource);
-    return resource;
+    const current = this.db.resources.get(resource.id);
+    assertWorkingMemorySnapshotUnchanged({
+      currentValue: current?.workingMemory,
+      currentMetadata: current?.metadata,
+      proposedValue: resource.workingMemory,
+      proposedValueProvided: Object.prototype.hasOwnProperty.call(resource, 'workingMemory'),
+      proposedMetadata: resource.metadata,
+    });
+    const stored = cloneResourceBoundary(
+      current && hasWorkingMemorySnapshotControls(current.metadata)
+        ? {
+            ...resource,
+            workingMemory: current.workingMemory,
+            metadata: preserveWorkingMemorySnapshotControls(current.metadata, resource.metadata ?? {}),
+          }
+        : {
+            ...resource,
+            metadata: reincarnateWorkingMemorySnapshotMetadata(resource.metadata),
+          },
+      true,
+    );
+    this.db.resources.set(resource.id, stored);
+    return cloneResourceBoundary(stored);
   }
 
   async updateResource({
@@ -791,31 +1051,48 @@ export class InMemoryMemory extends MemoryStorage {
     workingMemory?: string;
     metadata?: Record<string, unknown>;
   }): Promise<StorageResourceType> {
-    let resource = this.db.resources.get(resourceId);
+    const current = this.db.resources.get(resourceId);
+
+    assertWorkingMemorySnapshotUnchanged({
+      currentValue: current?.workingMemory,
+      currentMetadata: current?.metadata,
+      proposedValue: workingMemory,
+      proposedValueProvided: workingMemory !== undefined,
+      proposedMetadata: metadata,
+    });
+
+    let resource = current;
 
     if (!resource) {
       // Create new resource if it doesn't exist
       resource = {
         id: resourceId,
         workingMemory,
-        metadata: metadata || {},
+        metadata: reincarnateWorkingMemorySnapshotMetadata(metadata) ?? {},
         createdAt: new Date(),
         updatedAt: new Date(),
       };
     } else {
+      const mergedMetadata = {
+        ...resource.metadata,
+        ...metadata,
+      };
       resource = {
         ...resource,
-        workingMemory: workingMemory !== undefined ? workingMemory : resource.workingMemory,
-        metadata: {
-          ...resource.metadata,
-          ...metadata,
-        },
+        workingMemory:
+          hasWorkingMemorySnapshotControls(resource.metadata) || workingMemory === undefined
+            ? resource.workingMemory
+            : workingMemory,
+        metadata: hasWorkingMemorySnapshotControls(resource.metadata)
+          ? preserveWorkingMemorySnapshotControls(resource.metadata, mergedMetadata)
+          : reincarnateWorkingMemorySnapshotMetadata(mergedMetadata),
         updatedAt: new Date(),
       };
     }
 
-    this.db.resources.set(resourceId, resource);
-    return resource;
+    const stored = cloneResourceBoundary(resource, true);
+    this.db.resources.set(resourceId, stored);
+    return cloneResourceBoundary(stored);
   }
 
   async updateResourceFromObservationalMemory({
@@ -836,6 +1113,14 @@ export class InMemoryMemory extends MemoryStorage {
     if (current?.id !== guard.recordId) {
       throw new Error('Observational memory generation is no longer current.');
     }
+    const resource = this.db.resources.get(resourceId);
+    assertWorkingMemorySnapshotUnchanged({
+      currentValue: resource?.workingMemory,
+      currentMetadata: resource?.metadata,
+      proposedValue: workingMemory,
+      proposedValueProvided: true,
+      proposedMetadata: undefined,
+    });
     return this.updateResource({ resourceId, workingMemory });
   }
 
@@ -863,7 +1148,280 @@ export class InMemoryMemory extends MemoryStorage {
     if (current?.id !== guard.recordId) {
       throw new Error('Observational memory generation is no longer current.');
     }
-    return this.updateThread({ id, title, metadata });
+    return this.updateThread({
+      id,
+      title,
+      metadata: mergeObservationalThreadMetadata(thread.metadata, metadata),
+    });
+  }
+
+  async getWorkingMemorySnapshot(input: WorkingMemorySnapshotInput): Promise<WorkingMemorySnapshot> {
+    if (input.scope === 'resource') {
+      const resource = this.db.resources.get(input.resourceId);
+      return readWorkingMemorySnapshot(resource?.workingMemory, resource?.metadata);
+    }
+
+    const thread = this.db.threads.get(input.threadId);
+    if (!thread || thread.resourceId !== input.resourceId) {
+      throw new WorkingMemoryValidationError('Working-memory thread was not found in the requested resource.');
+    }
+    const value = typeof thread.metadata?.workingMemory === 'string' ? thread.metadata.workingMemory : null;
+    return readWorkingMemorySnapshot(value, thread.metadata);
+  }
+
+  async prepareThreadToResourceWorkingMemoryTransition({
+    threadId,
+    resourceId,
+  }: {
+    threadId: string;
+    resourceId: string;
+  }): Promise<StorageThreadToResourceWorkingMemoryTransitionPreparation> {
+    const thread = this.db.threads.get(threadId);
+    if (thread && thread.resourceId !== resourceId) {
+      throw new WorkingMemoryValidationError('Working-memory thread does not belong to the requested resource.');
+    }
+    const threadValue = typeof thread?.metadata?.workingMemory === 'string' ? thread.metadata.workingMemory : null;
+    const resource = this.db.resources.get(resourceId);
+    return {
+      threadId,
+      resourceId,
+      sourceThread: {
+        snapshot: readWorkingMemorySnapshot(threadValue, thread?.metadata),
+        workingMemoryIncarnation: readWorkingMemoryIncarnation(thread?.metadata),
+      },
+      destinationResource: {
+        snapshot: readWorkingMemorySnapshot(resource?.workingMemory, resource?.metadata),
+        workingMemoryIncarnation: readWorkingMemoryIncarnation(resource?.metadata),
+      },
+    };
+  }
+
+  async applyWorkingMemoryUpdate(input: ApplyWorkingMemoryUpdateInput): Promise<WorkingMemorySnapshot> {
+    return this.withMemoryStateRollback(true, () => {
+      if (input.observationalMemoryGuard) {
+        if (input.source !== 'observer') {
+          throw new WorkingMemoryValidationError('Only observer updates may carry an observational-memory guard.');
+        }
+        const guard = input.observationalMemoryGuard;
+        if (guard.resourceId !== input.resourceId || (guard.threadId !== null && guard.threadId !== input.threadId)) {
+          throw new WorkingMemoryValidationError(
+            'Observational memory guard does not match the working-memory target.',
+          );
+        }
+        const currentGeneration = this.db.observationalMemory.get(
+          this.getObservationalMemoryKey(guard.threadId, guard.resourceId),
+        )?.[0];
+        if (currentGeneration?.id !== guard.recordId) {
+          throw new WorkingMemoryValidationError('Observational memory generation is no longer current.');
+        }
+      }
+
+      const now = new Date();
+      if (input.scope === 'resource') {
+        const resource = this.db.resources.get(input.resourceId);
+        const current = readWorkingMemorySnapshot(resource?.workingMemory, resource?.metadata);
+        const next = applyWorkingMemorySnapshotUpdate(current, input, now.toISOString());
+        if (next === current) return current;
+        this.db.resources.set(
+          input.resourceId,
+          cloneResourceBoundary(
+            {
+              id: input.resourceId,
+              ...(next.value === null ? {} : { workingMemory: next.value }),
+              metadata: writeWorkingMemorySnapshotMetadata(resource?.metadata, next),
+              createdAt: resource?.createdAt ?? now,
+              updatedAt: now,
+            },
+            true,
+          ),
+        );
+        return next;
+      }
+
+      const thread = this.db.threads.get(input.threadId);
+      if (!thread || thread.resourceId !== input.resourceId) {
+        throw new WorkingMemoryValidationError('Working-memory thread was not found in the requested resource.');
+      }
+      const currentValue = typeof thread.metadata?.workingMemory === 'string' ? thread.metadata.workingMemory : null;
+      const current = readWorkingMemorySnapshot(currentValue, thread.metadata);
+      const next = applyWorkingMemorySnapshotUpdate(current, input, now.toISOString());
+      if (next === current) return current;
+      const metadata = writeWorkingMemorySnapshotMetadata(thread.metadata, next);
+      if (next.value === null) delete metadata.workingMemory;
+      else metadata.workingMemory = next.value;
+      this.db.threads.set(input.threadId, cloneThreadBoundary({ ...thread, metadata, updatedAt: now }, true));
+      this.rotateThreadGeneration(input.threadId);
+      return next;
+    });
+  }
+
+  async mutateThreadWithWorkingMemory(
+    input: StorageMutateThreadWithWorkingMemoryInput,
+  ): Promise<StorageMutateThreadWithWorkingMemoryOutput> {
+    return this.withMemoryStateRollback(true, () => {
+      const threadId = input.mutation.type === 'save' ? input.mutation.thread.id : input.mutation.id;
+      const currentThread = this.db.threads.get(threadId);
+      if (input.mutation.type === 'update' && !currentThread) {
+        throw new Error(`Thread with id ${threadId} not found`);
+      }
+
+      const proposedMetadata =
+        input.mutation.type === 'save' ? input.mutation.thread.metadata : input.mutation.metadata;
+      assertThreadWorkingMemoryRemoved(proposedMetadata);
+
+      const resourceId = input.mutation.type === 'save' ? input.mutation.thread.resourceId : currentThread!.resourceId;
+      if (input.mutation.type === 'save' && currentThread) {
+        assertGovernedThreadResourceUnchanged({
+          currentResourceId: currentThread.resourceId,
+          currentMetadata: currentThread.metadata,
+          proposedResourceId: resourceId,
+        });
+      }
+      if (input.workingMemory.type === 'observer-update' && input.workingMemory.resourceId !== resourceId) {
+        throw new WorkingMemoryValidationError('Working-memory update does not match the mutated thread resource.');
+      }
+
+      let workingMemory: WorkingMemorySnapshot | undefined;
+      let currentWorkingMemory: WorkingMemorySnapshot | undefined;
+      if (input.workingMemory.type === 'require-ungoverned') {
+        assertThreadWorkingMemoryIsUngoverned(currentThread?.metadata);
+      } else {
+        const currentValue =
+          typeof currentThread?.metadata?.workingMemory === 'string' ? currentThread.metadata.workingMemory : null;
+        currentWorkingMemory = readWorkingMemorySnapshot(currentValue, currentThread?.metadata);
+        workingMemory = applyWorkingMemorySnapshotUpdate(
+          currentWorkingMemory,
+          {
+            value: input.workingMemory.value,
+            expectedRevision: input.workingMemory.expectedRevision,
+            source: 'observer',
+            ...(input.workingMemory.maxDataBytes === undefined
+              ? {}
+              : { maxDataBytes: input.workingMemory.maxDataBytes }),
+          },
+          new Date().toISOString(),
+        );
+      }
+
+      const baseMetadata =
+        input.mutation.type === 'save'
+          ? preserveWorkingMemorySnapshotControls(currentThread?.metadata, input.mutation.thread.metadata ?? {})
+          : input.mutation.metadata === undefined
+            ? (currentThread!.metadata ?? {})
+            : mergeThreadMetadataPreservingWorkingMemory(currentThread!.metadata, input.mutation.metadata);
+      let metadata: Record<string, unknown>;
+      if (input.workingMemory.type === 'require-ungoverned') {
+        metadata = stripThreadWorkingMemoryMetadata(baseMetadata) ?? {};
+      } else {
+        metadata =
+          workingMemory !== currentWorkingMemory || hasWorkingMemorySnapshotControls(currentThread?.metadata)
+            ? writeWorkingMemorySnapshotMetadata(baseMetadata, workingMemory!)
+            : { ...baseMetadata };
+        if (workingMemory!.value === null) delete metadata.workingMemory;
+        else metadata.workingMemory = workingMemory!.value;
+      }
+
+      const thread =
+        input.mutation.type === 'save'
+          ? cloneThreadBoundary({ ...input.mutation.thread, metadata }, true)
+          : cloneThreadBoundary(
+              {
+                ...currentThread!,
+                ...(input.mutation.title === undefined ? {} : { title: input.mutation.title }),
+                metadata,
+                updatedAt: new Date(),
+              },
+              true,
+            );
+      this.db.threads.set(threadId, thread);
+      this.rotateThreadGeneration(threadId);
+      return {
+        thread: cloneThreadBoundary(thread),
+        ...(workingMemory === undefined ? {} : { workingMemory: structuredClone(workingMemory) }),
+      };
+    });
+  }
+
+  async transitionThreadToResourceWorkingMemory(
+    input: StorageTransitionThreadToResourceWorkingMemoryInput,
+  ): Promise<StorageTransitionThreadToResourceWorkingMemoryOutput> {
+    return this.withMemoryStateRollback(true, () => {
+      const threadId = input.mutation.type === 'save' ? input.mutation.thread.id : input.mutation.id;
+      const resourceId = input.mutation.type === 'save' ? input.mutation.thread.resourceId : input.mutation.resourceId;
+      if (input.preparation.threadId !== threadId || input.preparation.resourceId !== resourceId) {
+        throw new WorkingMemoryValidationError('Working-memory transition preparation does not match its target.');
+      }
+      const proposedMetadata =
+        input.mutation.type === 'save' ? input.mutation.thread.metadata : input.mutation.metadata;
+      assertThreadWorkingMemoryRemoved(proposedMetadata);
+
+      const currentThread = this.db.threads.get(threadId);
+      if (input.mutation.type === 'update' && !currentThread) {
+        throw new Error(`Thread with id ${threadId} not found`);
+      }
+      if (currentThread && currentThread.resourceId !== resourceId) {
+        throw new WorkingMemoryValidationError('Working-memory thread does not belong to the requested resource.');
+      }
+      const currentThreadValue =
+        typeof currentThread?.metadata?.workingMemory === 'string' ? currentThread.metadata.workingMemory : null;
+      const currentThreadSnapshot = readWorkingMemorySnapshot(currentThreadValue, currentThread?.metadata);
+      assertWorkingMemoryTransitionParticipant(
+        currentThreadSnapshot,
+        readWorkingMemoryIncarnation(currentThread?.metadata),
+        input.preparation.sourceThread,
+      );
+
+      const now = new Date();
+      const currentResource = this.db.resources.get(resourceId);
+      const current = readWorkingMemorySnapshot(currentResource?.workingMemory, currentResource?.metadata);
+      assertWorkingMemoryTransitionParticipant(
+        current,
+        readWorkingMemoryIncarnation(currentResource?.metadata),
+        input.preparation.destinationResource,
+      );
+      const next = applyWorkingMemorySnapshotUpdate(
+        current,
+        {
+          value: input.value,
+          expectedRevision: input.preparation.destinationResource.snapshot.revision,
+          source: 'observer',
+          ...(input.maxDataBytes === undefined ? {} : { maxDataBytes: input.maxDataBytes }),
+        },
+        now.toISOString(),
+      );
+      const resource = cloneResourceBoundary(
+        {
+          id: resourceId,
+          workingMemory: next.value ?? undefined,
+          metadata: writeWorkingMemorySnapshotMetadata(currentResource?.metadata, next),
+          createdAt: currentResource?.createdAt ?? now,
+          updatedAt: now,
+        },
+        true,
+      );
+      const thread =
+        input.mutation.type === 'save'
+          ? cloneThreadBoundary(input.mutation.thread, true)
+          : cloneThreadBoundary(
+              {
+                ...currentThread!,
+                ...(input.mutation.title === undefined ? {} : { title: input.mutation.title }),
+                metadata: mergeThreadMetadataForWorkingMemoryTransition(
+                  currentThread!.metadata,
+                  input.mutation.metadata,
+                ),
+                updatedAt: now,
+              },
+              true,
+            );
+      this.db.resources.set(resource.id, resource);
+      this.db.threads.set(thread.id, thread);
+      this.rotateThreadGeneration(thread.id);
+      return {
+        thread: cloneThreadBoundary(thread),
+        workingMemory: structuredClone(next),
+      };
+    });
   }
 
   async deleteResource({
@@ -882,6 +1440,7 @@ export class InMemoryMemory extends MemoryStorage {
     // memory record (thread-scoped records stay with their threads, which
     // deleteResource deliberately preserves).
     this.db.observationalMemory.delete(resourceObservationalMemoryKey);
+    for (const recordId of erasedRecordIds) this.db.memoryObservationalGenerations.delete(recordId);
     observationalMemoryRecordIds?.push(...erasedRecordIds);
   }
 
@@ -893,6 +1452,7 @@ export class InMemoryMemory extends MemoryStorage {
     if (!sourceThread) {
       throw new Error(`Source thread with id ${sourceThreadId} not found`);
     }
+    const sourceResourceId = sourceThread.resourceId;
 
     // Use provided ID or generate a new one
     const newThreadId = providedThreadId || crypto.randomUUID();
@@ -945,57 +1505,138 @@ export class InMemoryMemory extends MemoryStorage {
     // Create the new thread
     const newThread: StorageThreadType = {
       id: newThreadId,
-      resourceId: resourceId || sourceThread.resourceId,
+      resourceId: resourceId || sourceResourceId,
       title: title || (sourceThread.title ? `Clone of ${sourceThread.title}` : undefined),
-      metadata: {
+      metadata: reincarnateWorkingMemorySnapshotMetadata({
         ...metadata,
         clone: cloneMetadata,
-      },
+      }),
       createdAt: now,
       updatedAt: now,
     };
 
-    // Save the new thread
-    this.db.threads.set(newThreadId, newThread);
+    return this.withMemoryStateRollback(true, () => {
+      // Save the new thread
+      const storedThread = cloneThreadBoundary(newThread, true);
+      this.db.threads.set(newThreadId, storedThread);
 
-    // Clone messages with new IDs
-    const clonedMessages: MastraDBMessage[] = [];
-    const messageIdMap: Record<string, string> = {};
-    for (const sourceMsg of sourceMessages) {
-      const newMessageId = crypto.randomUUID();
-      messageIdMap[sourceMsg.id] = newMessageId;
-      const parsedContent = safelyParseJSON(sourceMsg.content);
+      // Clone messages with new IDs
+      const clonedMessages: MastraDBMessage[] = [];
+      const messageIdMap: Record<string, string> = {};
+      const targetResourceId = resourceId || sourceResourceId;
+      for (const sourceMsg of sourceMessages) {
+        const newMessageId = crypto.randomUUID();
+        messageIdMap[sourceMsg.id] = newMessageId;
+        const parsedContent = safelyParseJSON(sourceMsg.content);
 
-      // Create storage message
-      const newStorageMessage: StorageMessageType = {
-        id: newMessageId,
-        thread_id: newThreadId,
-        content: sourceMsg.content,
-        role: sourceMsg.role,
-        type: sourceMsg.type,
-        createdAt: sourceMsg.createdAt,
-        resourceId: resourceId || sourceMsg.resourceId,
+        // Create storage message
+        const newStorageMessage: StorageMessageType = {
+          id: newMessageId,
+          thread_id: newThreadId,
+          content: sourceMsg.content,
+          role: sourceMsg.role,
+          type: sourceMsg.type,
+          createdAt: new Date(sourceMsg.createdAt),
+          resourceId: targetResourceId,
+        };
+
+        this.db.messages.set(newMessageId, newStorageMessage);
+
+        // Create MastraDBMessage for return
+        clonedMessages.push({
+          id: newMessageId,
+          threadId: newThreadId,
+          content: parsedContent,
+          role: sourceMsg.role as MastraDBMessage['role'],
+          type: sourceMsg.type,
+          createdAt: new Date(sourceMsg.createdAt),
+          resourceId: targetResourceId,
+        });
+      }
+
+      const clonedMessageIds = clonedMessages.map(message => message.id);
+      return {
+        thread: cloneThreadBoundary(storedThread, true),
+        clonedMessages,
+        messageIdMap,
+        sourceResourceId,
+        rollbackReceipt: {
+          threadId: newThreadId,
+          storageGeneration: this.rotateThreadGeneration(newThreadId),
+          clonedMessageIds,
+        },
       };
+    });
+  }
 
-      this.db.messages.set(newMessageId, newStorageMessage);
+  async rollbackThreadClone(input: StorageRollbackThreadCloneInput): Promise<StorageRollbackThreadCloneResult> {
+    return this.withMemoryStateRollback(true, () => {
+      const { thread: receipt, observationalMemory, unverifiedObservationalMemoryRecordId } = input;
+      if (
+        !this.db.threads.has(receipt.threadId) ||
+        this.db.memoryThreadGenerations.get(receipt.threadId) !== receipt.storageGeneration
+      ) {
+        return { status: 'conflict', reason: 'thread' };
+      }
 
-      // Create MastraDBMessage for return
-      clonedMessages.push({
-        id: newMessageId,
-        threadId: newThreadId,
-        content: parsedContent,
-        role: sourceMsg.role as MastraDBMessage['role'],
-        type: sourceMsg.type,
-        createdAt: sourceMsg.createdAt,
-        resourceId: resourceId || sourceMsg.resourceId || undefined,
-      });
-    }
+      const expectedMessageIds = [...receipt.clonedMessageIds].sort();
+      const currentMessageIds = [...this.db.messages.values()]
+        .filter(message => message.thread_id === receipt.threadId)
+        .map(message => message.id)
+        .sort();
+      if (
+        expectedMessageIds.length !== currentMessageIds.length ||
+        expectedMessageIds.some((messageId, index) => messageId !== currentMessageIds[index])
+      ) {
+        return { status: 'conflict', reason: 'messages' };
+      }
 
-    return {
-      thread: newThread,
-      clonedMessages,
-      messageIdMap,
-    };
+      if (unverifiedObservationalMemoryRecordId && !observationalMemory) {
+        if (this.findObservationalMemoryRecordById(unverifiedObservationalMemoryRecordId)) {
+          return { status: 'conflict', reason: 'observational_memory' };
+        }
+      }
+
+      if (observationalMemory) {
+        if (
+          unverifiedObservationalMemoryRecordId &&
+          observationalMemory.recordId !== unverifiedObservationalMemoryRecordId
+        ) {
+          return { status: 'conflict', reason: 'observational_memory' };
+        }
+        const key = this.getObservationalMemoryKey(observationalMemory.threadId, observationalMemory.resourceId);
+        const currentRecords = this.db.observationalMemory.get(key) ?? [];
+        const expectedRecordIds = [...observationalMemory.priorRecordIds, observationalMemory.recordId].sort();
+        const currentRecordIds = currentRecords.map(record => record.id).sort();
+        if (
+          expectedRecordIds.length !== currentRecordIds.length ||
+          expectedRecordIds.some((recordId, index) => recordId !== currentRecordIds[index]) ||
+          this.db.memoryObservationalGenerations.get(observationalMemory.recordId) !==
+            observationalMemory.storageGeneration
+        ) {
+          return { status: 'conflict', reason: 'observational_memory' };
+        }
+      } else {
+        const threadRecords = this.db.observationalMemory.get(
+          this.getObservationalMemoryKey(receipt.threadId, this.db.threads.get(receipt.threadId)!.resourceId),
+        );
+        if (threadRecords?.length) return { status: 'conflict', reason: 'observational_memory' };
+      }
+
+      if (observationalMemory) {
+        const key = this.getObservationalMemoryKey(observationalMemory.threadId, observationalMemory.resourceId);
+        const remaining = (this.db.observationalMemory.get(key) ?? []).filter(
+          record => record.id !== observationalMemory.recordId,
+        );
+        if (remaining.length > 0) this.db.observationalMemory.set(key, remaining);
+        else this.db.observationalMemory.delete(key);
+        this.db.memoryObservationalGenerations.delete(observationalMemory.recordId);
+      }
+      for (const messageId of expectedMessageIds) this.db.messages.delete(messageId);
+      this.db.threads.delete(receipt.threadId);
+      this.db.memoryThreadGenerations.delete(receipt.threadId);
+      return { status: 'rolled_back' };
+    });
   }
 
   private sortThreads(threads: any[], field: ThreadOrderBy, direction: ThreadSortDirection): any[] {
@@ -1031,7 +1672,7 @@ export class InMemoryMemory extends MemoryStorage {
   async getObservationalMemory(threadId: string | null, resourceId: string): Promise<ObservationalMemoryRecord | null> {
     const key = this.getObservationalMemoryKey(threadId, resourceId);
     const records = this.db.observationalMemory.get(key);
-    return records?.[0] ?? null;
+    return records?.[0] ? cloneObservationalMemoryBoundary(records[0]) : null;
   }
 
   async getObservationalMemoryHistory(
@@ -1053,7 +1694,8 @@ export class InMemoryMemory extends MemoryStorage {
       records = records.slice(options.offset);
     }
 
-    return limit != null ? records.slice(0, limit) : records;
+    const selected = limit != null ? records.slice(0, limit) : records;
+    return selected.map(record => cloneObservationalMemoryBoundary(record));
   }
 
   async initializeObservationalMemory(input: CreateObservationalMemoryInput): Promise<ObservationalMemoryRecord> {
@@ -1099,27 +1741,41 @@ export class InMemoryMemory extends MemoryStorage {
       metadata: {},
     };
 
+    const stored = cloneObservationalMemoryBoundary(record, false);
+
     // Add as first record (most recent)
     const existing = this.db.observationalMemory.get(key) ?? [];
-    this.db.observationalMemory.set(key, [record, ...existing]);
+    this.db.observationalMemory.set(key, [stored, ...existing]);
+    this.rotateObservationalMemoryGeneration(stored.id);
 
-    return record;
+    return cloneObservationalMemoryBoundary(stored);
   }
 
-  async insertObservationalMemoryRecord(record: ObservationalMemoryRecord): Promise<void> {
-    const key = this.getObservationalMemoryKey(record.threadId, record.resourceId);
+  async insertObservationalMemoryRecord(
+    record: ObservationalMemoryRecord,
+  ): Promise<StorageObservationalMemoryCloneReceipt> {
+    const stored = cloneObservationalMemoryBoundary(record, false);
+    const key = this.getObservationalMemoryKey(stored.threadId, stored.resourceId);
     const existing = this.db.observationalMemory.get(key) ?? [];
+    const priorRecordIds = existing.map(existingRecord => existingRecord.id);
     // Insert in order by generationCount descending (newest first)
     let inserted = false;
     for (let i = 0; i < existing.length; i++) {
-      if (record.generationCount >= existing[i]!.generationCount) {
-        existing.splice(i, 0, record);
+      if (stored.generationCount >= existing[i]!.generationCount) {
+        existing.splice(i, 0, stored);
         inserted = true;
         break;
       }
     }
-    if (!inserted) existing.push(record);
+    if (!inserted) existing.push(stored);
     this.db.observationalMemory.set(key, existing);
+    return {
+      recordId: stored.id,
+      threadId: stored.threadId,
+      resourceId: stored.resourceId,
+      storageGeneration: this.rotateObservationalMemoryGeneration(stored.id),
+      priorRecordIds,
+    };
   }
 
   async updateActiveObservations(input: UpdateActiveObservationsInput): Promise<void> {
@@ -1136,13 +1792,14 @@ export class InMemoryMemory extends MemoryStorage {
     record.pendingMessageTokens = 0;
 
     // Update timestamps (top-level, not in metadata)
-    record.lastObservedAt = lastObservedAt;
+    record.lastObservedAt = new Date(lastObservedAt);
     record.updatedAt = new Date();
 
     // Store observed message IDs as safeguard against re-observation
     if (observedMessageIds) {
-      record.observedMessageIds = observedMessageIds;
+      record.observedMessageIds = [...observedMessageIds];
     }
+    this.rotateObservationalMemoryGeneration(record.id);
   }
 
   async updateBufferedObservations(input: UpdateBufferedObservationsInput): Promise<void> {
@@ -1153,7 +1810,7 @@ export class InMemoryMemory extends MemoryStorage {
     }
 
     // Create a new chunk with generated id and timestamp
-    const newChunk: BufferedObservationChunk = {
+    const newChunk: BufferedObservationChunk = cloneMemoryBoundaryValue({
       id: `ombuf-${crypto.randomUUID()}`,
       cycleId: chunk.cycleId,
       observations: chunk.observations,
@@ -1167,17 +1824,18 @@ export class InMemoryMemory extends MemoryStorage {
       threadTitle: chunk.threadTitle,
       extractedValues: chunk.extractedValues,
       extractionFailures: chunk.extractionFailures,
-    };
+    });
 
     // Add chunk to the array
     const existingChunks = Array.isArray(record.bufferedObservationChunks) ? record.bufferedObservationChunks : [];
     record.bufferedObservationChunks = [...existingChunks, newChunk];
 
     if (input.lastBufferedAtTime) {
-      record.lastBufferedAtTime = input.lastBufferedAtTime;
+      record.lastBufferedAtTime = new Date(input.lastBufferedAtTime);
     }
 
     record.updatedAt = new Date();
+    this.rotateObservationalMemoryGeneration(record.id);
   }
 
   async swapBufferedToActive(input: SwapBufferedToActiveInput): Promise<SwapBufferedToActiveResult> {
@@ -1191,7 +1849,9 @@ export class InMemoryMemory extends MemoryStorage {
     // activation math, falling back to persisted chunks otherwise.
     // Keep refreshed chunks local — don't overwrite the stored buffer.
     const persistedChunks = Array.isArray(record.bufferedObservationChunks) ? record.bufferedObservationChunks : [];
-    const chunks = Array.isArray(input.bufferedChunks) ? input.bufferedChunks : persistedChunks;
+    const chunks = Array.isArray(input.bufferedChunks)
+      ? cloneMemoryBoundaryValue(input.bufferedChunks)
+      : persistedChunks;
     if (chunks.length === 0) {
       return {
         chunksActivated: 0,
@@ -1278,8 +1938,11 @@ export class InMemoryMemory extends MemoryStorage {
 
     // Derive lastObservedAt from the latest activated chunk, or use provided value
     const latestChunk = activatedChunks[activatedChunks.length - 1];
-    const derivedLastObservedAt =
-      lastObservedAt ?? (latestChunk?.lastObservedAt ? new Date(latestChunk.lastObservedAt) : new Date());
+    const derivedLastObservedAt = lastObservedAt
+      ? new Date(lastObservedAt)
+      : latestChunk?.lastObservedAt
+        ? new Date(latestChunk.lastObservedAt)
+        : new Date();
 
     // Append activated content to active observations with message boundary for cache stability
     if (record.activeObservations) {
@@ -1307,6 +1970,7 @@ export class InMemoryMemory extends MemoryStorage {
     // Update timestamps
     record.lastObservedAt = derivedLastObservedAt;
     record.updatedAt = new Date();
+    this.rotateObservationalMemoryGeneration(record.id);
 
     // Use hints from the most recent activated chunk only — stale hints from older chunks are discarded
     const latestChunkHints = activatedChunks[activatedChunks.length - 1];
@@ -1367,11 +2031,14 @@ export class InMemoryMemory extends MemoryStorage {
       metadata: {},
     };
 
+    const stored = cloneObservationalMemoryBoundary(newRecord, false);
+
     // Add as first record (most recent)
     const existing = this.db.observationalMemory.get(key) ?? [];
-    this.db.observationalMemory.set(key, [newRecord, ...existing]);
+    this.db.observationalMemory.set(key, [stored, ...existing]);
+    this.rotateObservationalMemoryGeneration(stored.id);
 
-    return newRecord;
+    return cloneObservationalMemoryBoundary(stored);
   }
 
   async updateBufferedReflection(input: UpdateBufferedReflectionInput): Promise<void> {
@@ -1387,6 +2054,7 @@ export class InMemoryMemory extends MemoryStorage {
     record.bufferedReflectionInputTokens = (record.bufferedReflectionInputTokens || 0) + inputTokenCount;
     record.reflectedObservationLineCount = reflectedObservationLineCount;
     record.updatedAt = new Date();
+    this.rotateObservationalMemoryGeneration(record.id);
   }
 
   async swapBufferedReflectionToActive(input: SwapBufferedReflectionToActiveInput): Promise<ObservationalMemoryRecord> {
@@ -1427,6 +2095,7 @@ export class InMemoryMemory extends MemoryStorage {
     record.bufferedReflectionTokens = undefined;
     record.bufferedReflectionInputTokens = undefined;
     record.reflectedObservationLineCount = undefined;
+    this.rotateObservationalMemoryGeneration(record.id);
 
     return newRecord;
   }
@@ -1439,6 +2108,7 @@ export class InMemoryMemory extends MemoryStorage {
 
     record.isReflecting = isReflecting;
     record.updatedAt = new Date();
+    this.rotateObservationalMemoryGeneration(record.id);
   }
 
   async setObservingFlag(id: string, isObserving: boolean): Promise<void> {
@@ -1449,6 +2119,7 @@ export class InMemoryMemory extends MemoryStorage {
 
     record.isObserving = isObserving;
     record.updatedAt = new Date();
+    this.rotateObservationalMemoryGeneration(record.id);
   }
 
   async setBufferingObservationFlag(id: string, isBuffering: boolean, lastBufferedAtTokens?: number): Promise<void> {
@@ -1462,6 +2133,7 @@ export class InMemoryMemory extends MemoryStorage {
       record.lastBufferedAtTokens = lastBufferedAtTokens;
     }
     record.updatedAt = new Date();
+    this.rotateObservationalMemoryGeneration(record.id);
   }
 
   async setBufferingReflectionFlag(id: string, isBuffering: boolean): Promise<void> {
@@ -1472,10 +2144,18 @@ export class InMemoryMemory extends MemoryStorage {
 
     record.isBufferingReflection = isBuffering;
     record.updatedAt = new Date();
+    this.rotateObservationalMemoryGeneration(record.id);
   }
 
-  async clearObservationalMemory(threadId: string | null, resourceId: string): Promise<void> {
+  async clearObservationalMemory(
+    threadId: string | null,
+    resourceId: string,
+    options?: ClearObservationalMemoryOptions,
+  ): Promise<void> {
     const key = this.getObservationalMemoryKey(threadId, resourceId);
+    const records = this.db.observationalMemory.get(key) ?? [];
+    assertObservationalMemoryClearExpectation(records[0] ?? null, resourceId, options);
+    this.forgetObservationalMemoryGenerations(records);
     this.db.observationalMemory.delete(key);
   }
 
@@ -1487,19 +2167,40 @@ export class InMemoryMemory extends MemoryStorage {
     const clearedScopes: Array<'resource' | 'thread'> = [];
     if (resourceRecords.length > 0) clearedScopes.push('resource');
     if (threadRecords.length > 0) clearedScopes.push('thread');
+    this.forgetObservationalMemoryGenerations(resourceRecords);
+    this.forgetObservationalMemoryGenerations(threadRecords);
     this.db.observationalMemory.delete(resourceKey);
     this.db.observationalMemory.delete(threadKey);
 
-    const managedWorkingMemoryScopes = getManagedWorkingMemoryScopes([...resourceRecords, ...threadRecords]);
+    const resourceManagedWorkingMemoryScopes = getManagedWorkingMemoryScopes(resourceRecords);
+    const threadManagedWorkingMemoryScopes = getManagedWorkingMemoryScopes(threadRecords);
     const resource = this.db.resources.get(input.resourceId);
-    const clearedResourceWorkingMemory =
-      managedWorkingMemoryScopes.has('resource') && resource?.workingMemory !== undefined;
-    if (resource && clearedResourceWorkingMemory) {
-      this.db.resources.set(input.resourceId, {
-        ...resource,
-        workingMemory: undefined,
-        updatedAt: new Date(),
-      });
+    let clearedResourceWorkingMemory = false;
+    if (
+      resource &&
+      (resourceManagedWorkingMemoryScopes.has('resource') || threadManagedWorkingMemoryScopes.has('resource')) &&
+      (resource.workingMemory !== undefined || hasWorkingMemorySnapshotControls(resource.metadata))
+    ) {
+      if (hasWorkingMemorySnapshotControls(resource.metadata)) {
+        const current = readWorkingMemorySnapshot(resource.workingMemory, resource.metadata);
+        const next = retractObserverWorkingMemorySnapshot(current);
+        clearedResourceWorkingMemory = next.value !== current.value;
+        if (next !== current) {
+          this.db.resources.set(input.resourceId, {
+            ...resource,
+            workingMemory: next.value ?? undefined,
+            metadata: writeWorkingMemorySnapshotMetadata(resource.metadata, next),
+            updatedAt: new Date(),
+          });
+        }
+      } else {
+        clearedResourceWorkingMemory = true;
+        this.db.resources.set(input.resourceId, {
+          ...resource,
+          workingMemory: undefined,
+          updatedAt: new Date(),
+        });
+      }
     }
 
     let clearedThreadMetadata = false;
@@ -1510,15 +2211,31 @@ export class InMemoryMemory extends MemoryStorage {
           ? [this.db.threads.get(input.threadId)].filter((thread): thread is StorageThreadType => thread !== undefined)
           : [];
     for (const thread of threads) {
-      const cleaned = removeObservationalMemoryMetadata(thread.metadata, managedWorkingMemoryScopes.has('thread'));
-      if (!cleaned.removed) continue;
+      const clearWorkingMemory =
+        resourceManagedWorkingMemoryScopes.has('thread') ||
+        (thread.id === input.threadId && threadManagedWorkingMemoryScopes.has('thread'));
+      const hasControls = clearWorkingMemory && hasWorkingMemorySnapshotControls(thread.metadata);
+      const cleaned = removeObservationalMemoryMetadata(thread.metadata, clearWorkingMemory && !hasControls);
+      let metadata = cleaned.metadata;
+      let workingMemoryStateChanged = false;
+      if (hasControls) {
+        const currentValue = typeof thread.metadata?.workingMemory === 'string' ? thread.metadata.workingMemory : null;
+        const current = readWorkingMemorySnapshot(currentValue, thread.metadata);
+        const next = retractObserverWorkingMemorySnapshot(current);
+        workingMemoryStateChanged = next !== current;
+        metadata = writeWorkingMemorySnapshotMetadata(metadata, next);
+        if (next.value === null) delete metadata.workingMemory;
+        else metadata.workingMemory = next.value;
+      }
+      if (!cleaned.removed && !workingMemoryStateChanged) continue;
       clearedThreadMetadata = true;
       this.db.threads.set(thread.id, {
         ...thread,
         title: cleaned.derivedTitle === thread.title ? '' : thread.title,
-        metadata: cleaned.metadata,
+        metadata,
         updatedAt: new Date(),
       });
+      this.rotateThreadGeneration(thread.id);
     }
 
     return {
@@ -1529,7 +2246,7 @@ export class InMemoryMemory extends MemoryStorage {
   }
 
   async retractObservationalMemory(input: RetractObservationalMemoryInput): Promise<RetractObservationalMemoryResult> {
-    return this.retractObservationalMemoryState(input);
+    return this.withMemoryStateRollback(true, () => this.retractObservationalMemoryState(input));
   }
 
   async setPendingMessageTokens(id: string, tokenCount: number): Promise<void> {
@@ -1540,6 +2257,7 @@ export class InMemoryMemory extends MemoryStorage {
 
     record.pendingMessageTokens = tokenCount;
     record.updatedAt = new Date();
+    this.rotateObservationalMemoryGeneration(record.id);
   }
 
   async updateObservationalMemoryConfig(input: UpdateObservationalMemoryConfigInput): Promise<void> {
@@ -1548,8 +2266,11 @@ export class InMemoryMemory extends MemoryStorage {
       throw new Error(`Observational memory record not found: ${input.id}`);
     }
 
-    record.config = this.deepMergeConfig(record.config as Record<string, unknown>, input.config);
+    record.config = cloneMemoryBoundaryValue(
+      this.deepMergeConfig(record.config as Record<string, unknown>, cloneMemoryBoundaryValue(input.config)),
+    );
     record.updatedAt = new Date();
+    this.rotateObservationalMemoryGeneration(record.id);
   }
 
   /**

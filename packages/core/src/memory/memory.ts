@@ -24,6 +24,8 @@ import type {
   StorageListThreadsOutput,
   StorageCloneThreadInput,
   StorageCloneThreadOutput,
+  WorkingMemorySnapshot,
+  WorkingMemorySnapshotInput,
 } from '../storage';
 import { augmentWithInit } from '../storage/storageWithInit';
 import type { ToolAction } from '../tools';
@@ -661,6 +663,124 @@ https://mastra.ai/en/docs/memory/overview`,
     resourceId?: string;
     memoryConfig?: MemoryConfigInternal;
   }): Promise<string | null>;
+
+  /**
+   * Resolve the storage coordinates for the configured Working Memory scope.
+   * Thread ownership is verified before returning thread-scoped coordinates.
+   */
+  protected async resolveWorkingMemorySnapshotInput({
+    threadId,
+    resourceId,
+    memoryConfig,
+  }: {
+    threadId?: string;
+    resourceId?: string;
+    memoryConfig?: MemoryConfigInternal;
+  }): Promise<WorkingMemorySnapshotInput> {
+    const config = this.getMergedThreadConfig(memoryConfig);
+    if (!config.workingMemory?.enabled) {
+      throw new Error('Working memory is not enabled for this memory instance');
+    }
+
+    const scope = config.workingMemory.scope || 'resource';
+    if (scope === 'resource') {
+      if (!resourceId) {
+        throw new Error('Memory error: Resource-scoped working memory requires a resourceId.');
+      }
+      return { scope, resourceId, ...(threadId ? { threadId } : {}) };
+    }
+
+    if (!threadId) {
+      throw new Error('Memory error: Thread-scoped working memory requires a threadId.');
+    }
+    const thread = await this.getThreadById({ threadId });
+    if (!thread) {
+      throw new Error('Working-memory thread was not found.');
+    }
+    if (resourceId && thread.resourceId !== resourceId) {
+      throw new Error('Working-memory thread does not belong to the requested resource.');
+    }
+    return { scope, resourceId: thread.resourceId, threadId };
+  }
+
+  /**
+   * Read Working Memory together with its owner-protection controls.
+   *
+   * Callers must perform their own owner authorization before exposing this
+   * value. The storage capability is intentionally fail-closed.
+   */
+  async getWorkingMemorySnapshot({
+    threadId,
+    resourceId,
+    memoryConfig,
+  }: {
+    threadId?: string;
+    resourceId?: string;
+    memoryConfig?: MemoryConfigInternal;
+  }): Promise<WorkingMemorySnapshot> {
+    const config = this.getMergedThreadConfig(memoryConfig);
+    const coordinates = await this.resolveWorkingMemorySnapshotInput({
+      threadId,
+      resourceId,
+      memoryConfig: config,
+    });
+    const memoryStore = await this.storage.getStore('memory');
+    if (!memoryStore?.supportsRevisionedWorkingMemory) {
+      throw new Error(
+        `Revisioned working memory is not supported by this storage adapter (${memoryStore?.constructor.name ?? 'unknown'}).`,
+      );
+    }
+    return memoryStore.getWorkingMemorySnapshot(coordinates);
+  }
+
+  /**
+   * Apply an owner-authorized correction or forget operation with compare-and-set semantics.
+   * Protected RFC 6901 paths are preserved by subsequent observer writes.
+   *
+   * This method does not authenticate the caller. Services must verify that
+   * the trusted principal owns the resource/thread before invoking it.
+   */
+  async updateWorkingMemoryByOwner({
+    threadId,
+    resourceId,
+    workingMemory,
+    expectedRevision,
+    protectPaths,
+    unprotectPaths,
+    memoryConfig,
+  }: {
+    threadId?: string;
+    resourceId?: string;
+    workingMemory: string | null;
+    expectedRevision: number;
+    protectPaths?: string[];
+    unprotectPaths?: string[];
+    memoryConfig?: MemoryConfigInternal;
+  }): Promise<WorkingMemorySnapshot> {
+    const config = this.getMergedThreadConfig(memoryConfig);
+    const coordinates = await this.resolveWorkingMemorySnapshotInput({
+      threadId,
+      resourceId,
+      memoryConfig: config,
+    });
+    const memoryStore = await this.storage.getStore('memory');
+    if (!memoryStore?.supportsRevisionedWorkingMemory) {
+      throw new Error(
+        `Revisioned working memory is not supported by this storage adapter (${memoryStore?.constructor.name ?? 'unknown'}).`,
+      );
+    }
+    return memoryStore.applyWorkingMemoryUpdate({
+      ...coordinates,
+      value: workingMemory,
+      expectedRevision,
+      source: 'owner',
+      ...(typeof config.workingMemory === 'object' && config.workingMemory.maxDataBytes !== undefined
+        ? { maxDataBytes: config.workingMemory.maxDataBytes }
+        : {}),
+      ...(protectPaths ? { protectPaths } : {}),
+      ...(unprotectPaths ? { unprotectPaths } : {}),
+    });
+  }
 
   /**
    * Get working memory template

@@ -15,6 +15,24 @@ describe('MemoryPG observational-memory retraction', () => {
   let observerMemory: MemoryPG;
   let retractorMemory: MemoryPG;
 
+  const readStoredThread = (storedThreadId: string) =>
+    observerStore.db.one<{
+      title: string;
+      metadataText: string;
+      updatedAt: Date;
+      updatedAtZ: Date;
+      rowVersion: string;
+    }>(
+      `SELECT title,
+              metadata::text AS "metadataText",
+              "updatedAt",
+              "updatedAtZ",
+              xmin::text AS "rowVersion"
+       FROM "${schemaName}"."mastra_threads"
+       WHERE id = $1`,
+      [storedThreadId],
+    );
+
   beforeAll(async () => {
     observerStore = new PostgresStore({
       id: 'om-retraction-observer',
@@ -461,6 +479,159 @@ describe('MemoryPG observational-memory retraction', () => {
     });
   });
 
+  it('does not rewrite formatted owner-only non-root protected memory during managed OM retraction', async () => {
+    const protectedResourceId = `${resourceId}-owner-only-noop`;
+    const protectedThreadId = `${threadId}-owner-only-noop`;
+    await observerMemory.saveThread({
+      thread: {
+        id: protectedThreadId,
+        resourceId: protectedResourceId,
+        title: 'Owner title',
+        metadata: { preserved: true },
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+    await observerMemory.initializeObservationalMemory({
+      config: { _managedWorkingMemoryScope: 'thread' },
+      resourceId: protectedResourceId,
+      scope: 'thread',
+      threadId: protectedThreadId,
+    });
+    const initialOwner = await observerMemory.applyWorkingMemoryUpdate({
+      scope: 'thread',
+      resourceId: protectedResourceId,
+      threadId: protectedThreadId,
+      value: '{"preference":{"format":"markdown","tone":"concise"},"profile":{"name":"Ada"}}',
+      expectedRevision: 0,
+      source: 'owner',
+      protectPaths: ['/profile', '/preference'],
+    });
+    const ownerValue =
+      '{\n  "profile": { "name": "Ada" },\n  "preference": { "tone": "concise", "format": "markdown" }\n}';
+    const owner = await observerMemory.applyWorkingMemoryUpdate({
+      scope: 'thread',
+      resourceId: protectedResourceId,
+      threadId: protectedThreadId,
+      value: ownerValue,
+      expectedRevision: initialOwner.revision,
+      source: 'owner',
+      protectPaths: ['/profile', '/preference'],
+    });
+    expect(owner).toMatchObject({
+      value: ownerValue,
+      revision: 2,
+      protectedPaths: ['/preference', '/profile'],
+    });
+    expect(Object.keys(owner.provenance).sort()).toEqual(['', '/preference', '/profile'].sort());
+    expect(Object.values(owner.provenance).every(entry => entry.source === 'owner')).toBe(true);
+    await observerStore.db.none(
+      `UPDATE "${schemaName}"."mastra_threads"
+       SET "updatedAt" = $1, "updatedAtZ" = $2
+       WHERE id = $3`,
+      [createdAt.toISOString(), createdAt.toISOString(), protectedThreadId],
+    );
+    const before = await readStoredThread(protectedThreadId);
+
+    await expect(
+      retractorMemory.retractObservationalMemory({
+        resourceId: protectedResourceId,
+        threadId: protectedThreadId,
+      }),
+    ).resolves.toEqual({
+      clearedScopes: ['thread'],
+      clearedResourceWorkingMemory: false,
+      clearedThreadMetadata: false,
+    });
+
+    await expect(retractorMemory.getObservationalMemory(protectedThreadId, protectedResourceId)).resolves.toBeNull();
+    await expect(
+      retractorMemory.getWorkingMemorySnapshot({
+        scope: 'thread',
+        resourceId: protectedResourceId,
+        threadId: protectedThreadId,
+      }),
+    ).resolves.toEqual(owner);
+    await expect(readStoredThread(protectedThreadId)).resolves.toEqual(before);
+  });
+
+  it('removes OM metadata while retaining owner-only protected thread memory', async () => {
+    const protectedResourceId = `${resourceId}-owner-only-om`;
+    const protectedThreadId = `${threadId}-owner-only-om`;
+    await observerMemory.saveThread({
+      thread: {
+        id: protectedThreadId,
+        resourceId: protectedResourceId,
+        title: 'Original title',
+        metadata: { preserved: true },
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+    const record = await observerMemory.initializeObservationalMemory({
+      config: { _managedWorkingMemoryScope: 'thread' },
+      resourceId: protectedResourceId,
+      scope: 'thread',
+      threadId: protectedThreadId,
+    });
+    const owner = await observerMemory.applyWorkingMemoryUpdate({
+      scope: 'thread',
+      resourceId: protectedResourceId,
+      threadId: protectedThreadId,
+      value: '{"owner":"Ada"}',
+      expectedRevision: 0,
+      source: 'owner',
+      protectPaths: [''],
+    });
+    await observerMemory.updateThreadFromObservationalMemory({
+      id: protectedThreadId,
+      title: 'Derived title',
+      metadata: { mastra: { om: { threadTitle: 'Derived title', currentTask: 'Observe only' } } },
+      guard: {
+        recordId: record.id,
+        resourceId: protectedResourceId,
+        threadId: protectedThreadId,
+      },
+    });
+    await observerStore.db.none(
+      `UPDATE "${schemaName}"."mastra_threads"
+       SET "updatedAt" = $1, "updatedAtZ" = $2
+       WHERE id = $3`,
+      [createdAt.toISOString(), createdAt.toISOString(), protectedThreadId],
+    );
+    const before = await readStoredThread(protectedThreadId);
+    const expectedMetadata = JSON.parse(before.metadataText) as {
+      mastra: Record<string, unknown>;
+      [key: string]: unknown;
+    };
+    expect(expectedMetadata.mastra).toHaveProperty('om');
+    delete expectedMetadata.mastra.om;
+
+    await expect(
+      retractorMemory.retractObservationalMemory({
+        resourceId: protectedResourceId,
+        threadId: protectedThreadId,
+      }),
+    ).resolves.toEqual({
+      clearedScopes: ['thread'],
+      clearedResourceWorkingMemory: false,
+      clearedThreadMetadata: true,
+    });
+
+    const after = await readStoredThread(protectedThreadId);
+    expect(after.title).toBe('');
+    expect(JSON.parse(after.metadataText)).toEqual(expectedMetadata);
+    expect(after.updatedAt).not.toEqual(before.updatedAt);
+    expect(after.updatedAtZ).not.toEqual(before.updatedAtZ);
+    await expect(
+      retractorMemory.getWorkingMemorySnapshot({
+        scope: 'thread',
+        resourceId: protectedResourceId,
+        threadId: protectedThreadId,
+      }),
+    ).resolves.toEqual(owner);
+  });
+
   it('clears observer-managed thread memory and every sibling cursor for resource OM', async () => {
     const sharedResourceId = `${resourceId}-shared-cursors`;
     const sharedThreadIds = [`${threadId}-shared-a`, `${threadId}-shared-b`];
@@ -522,6 +693,212 @@ describe('MemoryPG observational-memory retraction', () => {
     }
   });
 
+  it('preserves sibling thread memory when resource and thread OM records own different scopes', async () => {
+    const mixedResourceId = `${resourceId}-mixed-scopes`;
+    const editedThreadId = `${threadId}-mixed-edited`;
+    const siblingThreadId = `${threadId}-mixed-sibling`;
+    await observerMemory.saveResource({
+      resource: {
+        id: mixedResourceId,
+        workingMemory: 'observer-managed-resource',
+        metadata: {},
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+    for (const [mixedThreadId, label] of [
+      [editedThreadId, 'edited'],
+      [siblingThreadId, 'sibling'],
+    ] as const) {
+      await observerMemory.saveThread({
+        thread: {
+          id: mixedThreadId,
+          resourceId: mixedResourceId,
+          title: `Derived ${label}`,
+          metadata: {
+            workingMemory: `observer-managed-${label}`,
+            mastra: {
+              preserved: true,
+              om: { threadTitle: `Derived ${label}`, lastObservedMessageId: `message-${label}` },
+            },
+          },
+          createdAt,
+          updatedAt: createdAt,
+        },
+      });
+    }
+    await observerMemory.initializeObservationalMemory({
+      config: { _managedWorkingMemoryScope: 'resource' },
+      resourceId: mixedResourceId,
+      scope: 'resource',
+      threadId: null,
+    });
+    await observerMemory.initializeObservationalMemory({
+      config: { _managedWorkingMemoryScope: 'thread' },
+      resourceId: mixedResourceId,
+      scope: 'thread',
+      threadId: editedThreadId,
+    });
+
+    await expect(
+      retractorMemory.retractObservationalMemory({
+        resourceId: mixedResourceId,
+        threadId: editedThreadId,
+      }),
+    ).resolves.toEqual({
+      clearedScopes: ['resource', 'thread'],
+      clearedResourceWorkingMemory: true,
+      clearedThreadMetadata: true,
+    });
+
+    await expect(retractorMemory.getResourceById({ resourceId: mixedResourceId })).resolves.toMatchObject({
+      workingMemory: null,
+    });
+    const editedThread = await retractorMemory.getThreadById({ threadId: editedThreadId });
+    expect(editedThread).toMatchObject({
+      title: '',
+      metadata: { mastra: { preserved: true } },
+    });
+    expect(editedThread?.metadata).not.toHaveProperty('workingMemory');
+    expect(editedThread?.metadata?.mastra).not.toHaveProperty('om');
+
+    const siblingThread = await retractorMemory.getThreadById({ threadId: siblingThreadId });
+    expect(siblingThread).toMatchObject({
+      title: '',
+      metadata: {
+        workingMemory: 'observer-managed-sibling',
+        mastra: { preserved: true },
+      },
+    });
+    expect(siblingThread?.metadata?.mastra).not.toHaveProperty('om');
+  });
+
+  it('unions working-memory ownership across every generation at a thread coordinate', async () => {
+    const generationsResourceId = `${resourceId}-generation-scopes`;
+    const editedThreadId = `${threadId}-generation-edited`;
+    const siblingThreadId = `${threadId}-generation-sibling`;
+    await observerMemory.saveResource({
+      resource: {
+        id: generationsResourceId,
+        workingMemory: 'observer-managed-resource',
+        metadata: {},
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+    for (const [generationThreadId, label] of [
+      [editedThreadId, 'edited'],
+      [siblingThreadId, 'sibling'],
+    ] as const) {
+      await observerMemory.saveThread({
+        thread: {
+          id: generationThreadId,
+          resourceId: generationsResourceId,
+          title: `Derived ${label}`,
+          metadata: {
+            workingMemory: `observer-managed-${label}`,
+            mastra: {
+              preserved: true,
+              om: { threadTitle: `Derived ${label}`, lastObservedMessageId: `message-${label}` },
+            },
+          },
+          createdAt,
+          updatedAt: createdAt,
+        },
+      });
+    }
+    const priorGeneration = await observerMemory.initializeObservationalMemory({
+      config: { _managedWorkingMemoryScope: 'resource' },
+      resourceId: generationsResourceId,
+      scope: 'thread',
+      threadId: editedThreadId,
+    });
+    const currentGeneration = await observerMemory.createReflectionGeneration({
+      currentRecord: priorGeneration,
+      reflection: 'Current generation.',
+      tokenCount: 3,
+    });
+    await observerMemory.updateObservationalMemoryConfig({
+      id: currentGeneration.id,
+      config: { _managedWorkingMemoryScope: 'thread' },
+    });
+
+    await expect(
+      retractorMemory.retractObservationalMemory({
+        resourceId: generationsResourceId,
+        threadId: editedThreadId,
+      }),
+    ).resolves.toEqual({
+      clearedScopes: ['thread'],
+      clearedResourceWorkingMemory: true,
+      clearedThreadMetadata: true,
+    });
+
+    await expect(retractorMemory.getResourceById({ resourceId: generationsResourceId })).resolves.toMatchObject({
+      workingMemory: null,
+    });
+    const editedThread = await retractorMemory.getThreadById({ threadId: editedThreadId });
+    expect(editedThread).toMatchObject({
+      title: '',
+      metadata: { mastra: { preserved: true } },
+    });
+    expect(editedThread?.metadata).not.toHaveProperty('workingMemory');
+    expect(editedThread?.metadata?.mastra).not.toHaveProperty('om');
+
+    await expect(retractorMemory.getThreadById({ threadId: siblingThreadId })).resolves.toMatchObject({
+      title: 'Derived sibling',
+      metadata: {
+        workingMemory: 'observer-managed-sibling',
+        mastra: {
+          preserved: true,
+          om: { threadTitle: 'Derived sibling', lastObservedMessageId: 'message-sibling' },
+        },
+      },
+    });
+  });
+
+  it.each([
+    ['mastra-value', 'not-an-object', {}],
+    ['om-value', { preserved: true, om: 'not-an-object' }, { preserved: true }],
+  ])('retracts managed thread memory when the stored %s is malformed', async (suffix, mastra, expectedMastra) => {
+    const malformedResourceId = `${resourceId}-malformed-${suffix}`;
+    const malformedThreadId = `${threadId}-malformed-${suffix}`;
+    await observerMemory.saveThread({
+      thread: {
+        id: malformedThreadId,
+        resourceId: malformedResourceId,
+        title: 'Preserved title',
+        metadata: {
+          workingMemory: 'observer-managed-thread',
+          mastra,
+        },
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+    await observerMemory.initializeObservationalMemory({
+      config: { _managedWorkingMemoryScope: 'thread' },
+      resourceId: malformedResourceId,
+      scope: 'thread',
+      threadId: malformedThreadId,
+    });
+
+    await expect(
+      retractorMemory.retractObservationalMemory({
+        resourceId: malformedResourceId,
+        threadId: malformedThreadId,
+      }),
+    ).resolves.toEqual({
+      clearedScopes: ['thread'],
+      clearedResourceWorkingMemory: false,
+      clearedThreadMetadata: true,
+    });
+
+    const thread = await retractorMemory.getThreadById({ threadId: malformedThreadId });
+    expect(thread).toMatchObject({ title: 'Preserved title' });
+    expect(thread?.metadata).toEqual({ mastra: expectedMastra });
+  });
+
   it('resolves nullable message resources and retracts both sides of a move', async () => {
     const sourceResourceId = `${resourceId}-move-source`;
     const destinationResourceId = `${resourceId}-move-destination`;
@@ -577,6 +954,140 @@ describe('MemoryPG observational-memory retraction', () => {
     ).resolves.toBeNull();
   });
 
+  it('deletes a nullable-resource orphan whose thread row is absent', async () => {
+    const orphanMessageId = `${threadId}-missing-thread-orphan-message`;
+    const missingThreadId = `${threadId}-missing-thread-orphan`;
+
+    await observerStore.db.none(
+      `INSERT INTO "${schemaName}"."mastra_messages"
+         (id, thread_id, content, role, type, "createdAt", "resourceId")
+       VALUES ($1, $2, $3, 'user', 'v2', $4, NULL)`,
+      [orphanMessageId, missingThreadId, JSON.stringify({ format: 2, parts: [] }), createdAt],
+    );
+
+    await expect(
+      retractorMemory.deleteMessages([orphanMessageId], { retractObservationalMemory: true }),
+    ).resolves.toBeUndefined();
+    await expect(
+      observerStore.db.one<{ exists: boolean }>(
+        `SELECT EXISTS(
+           SELECT 1 FROM "${schemaName}"."mastra_messages" WHERE id = $1
+         ) AS exists`,
+        [orphanMessageId],
+      ),
+    ).resolves.toEqual({ exists: false });
+  });
+
+  it('uses the last duplicate update for both the message move and OM retraction coordinates', async () => {
+    const duplicateMessageId = `${threadId}-duplicate-update-message`;
+    const source = {
+      resourceId: `${resourceId}-duplicate-source`,
+      threadId: `${threadId}-duplicate-source`,
+      workingMemory: 'source observer memory',
+    };
+    const discarded = {
+      resourceId: `${resourceId}-duplicate-discarded`,
+      threadId: `${threadId}-duplicate-discarded`,
+      workingMemory: 'discarded observer memory',
+    };
+    const canonical = {
+      resourceId: `${resourceId}-duplicate-canonical`,
+      threadId: `${threadId}-duplicate-canonical`,
+      workingMemory: 'canonical observer memory',
+    };
+
+    for (const coordinate of [source, discarded, canonical]) {
+      await observerMemory.saveResource({
+        resource: {
+          id: coordinate.resourceId,
+          workingMemory: coordinate.workingMemory,
+          metadata: {},
+          createdAt,
+          updatedAt: createdAt,
+        },
+      });
+      await observerMemory.saveThread({
+        thread: {
+          id: coordinate.threadId,
+          resourceId: coordinate.resourceId,
+          title: coordinate.threadId,
+          metadata: {},
+          createdAt,
+          updatedAt: createdAt,
+        },
+      });
+      await observerMemory.initializeObservationalMemory({
+        config: { _managedWorkingMemoryScope: 'resource' },
+        resourceId: coordinate.resourceId,
+        scope: 'thread',
+        threadId: coordinate.threadId,
+      });
+    }
+    await observerMemory.saveMessages({
+      messages: [
+        {
+          id: duplicateMessageId,
+          threadId: source.threadId,
+          resourceId: source.resourceId,
+          role: 'user',
+          content: { format: 2, parts: [{ type: 'text', text: 'Move me once' }] },
+          createdAt,
+        },
+      ],
+    });
+
+    const retractions: Array<{ input: { resourceId: string; threadId: string } }> = [];
+    const updatedMessages = await retractorMemory.updateMessages({
+      messages: [
+        {
+          id: duplicateMessageId,
+          threadId: discarded.threadId,
+          resourceId: discarded.resourceId,
+          content: { content: 'discarded update' },
+        },
+        {
+          id: duplicateMessageId,
+          threadId: canonical.threadId,
+          resourceId: canonical.resourceId,
+          content: { content: 'canonical update' },
+        },
+      ],
+      retractObservationalMemory: true,
+      observationalMemoryRetractions: retractions as any,
+    });
+
+    expect(updatedMessages).toMatchObject([
+      {
+        id: duplicateMessageId,
+        threadId: canonical.threadId,
+        resourceId: canonical.resourceId,
+        content: { content: 'canonical update' },
+      },
+    ]);
+    expect(
+      new Set(retractions.map(retraction => `${retraction.input.resourceId}\u0000${retraction.input.threadId}`)),
+    ).toEqual(
+      new Set([`${source.resourceId}\u0000${source.threadId}`, `${canonical.resourceId}\u0000${canonical.threadId}`]),
+    );
+    expect(retractions).toHaveLength(2);
+
+    await expect(retractorMemory.getObservationalMemory(source.threadId, source.resourceId)).resolves.toBeNull();
+    await expect(retractorMemory.getObservationalMemory(canonical.threadId, canonical.resourceId)).resolves.toBeNull();
+    await expect(retractorMemory.getResourceById({ resourceId: source.resourceId })).resolves.toMatchObject({
+      workingMemory: null,
+    });
+    await expect(retractorMemory.getResourceById({ resourceId: canonical.resourceId })).resolves.toMatchObject({
+      workingMemory: null,
+    });
+
+    await expect(
+      retractorMemory.getObservationalMemory(discarded.threadId, discarded.resourceId),
+    ).resolves.not.toBeNull();
+    await expect(retractorMemory.getResourceById({ resourceId: discarded.resourceId })).resolves.toMatchObject({
+      workingMemory: discarded.workingMemory,
+    });
+  });
+
   it('retracts observer-derived resource state when a thread is deleted directly', async () => {
     const deleteResourceId = `${resourceId}-delete-thread`;
     const deleteThreadId = `${threadId}-delete-thread`;
@@ -626,5 +1137,58 @@ describe('MemoryPG observational-memory retraction', () => {
     await expect(retractorMemory.getResourceById({ resourceId: deleteResourceId })).resolves.toMatchObject({
       workingMemory: null,
     });
+  });
+
+  it('retracts observer-derived thread metadata stored in a legacy TEXT column', async () => {
+    const legacyResourceId = `${resourceId}-legacy-text`;
+    const legacyThreadId = `${threadId}-legacy-text`;
+    await observerMemory.saveThread({
+      thread: {
+        id: legacyThreadId,
+        resourceId: legacyResourceId,
+        title: 'Legacy derived title',
+        metadata: {
+          preserved: true,
+          workingMemory: 'Legacy derived memory',
+          mastra: {
+            preserved: true,
+            om: { threadTitle: 'Legacy derived title' },
+          },
+        },
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+    await observerMemory.initializeObservationalMemory({
+      config: { _managedWorkingMemoryScope: 'thread' },
+      resourceId: legacyResourceId,
+      scope: 'thread',
+      threadId: legacyThreadId,
+    });
+
+    await observerStore.db.none(
+      `ALTER TABLE "${schemaName}"."mastra_threads"
+       ALTER COLUMN metadata TYPE TEXT USING metadata::text`,
+    );
+    try {
+      await expect(
+        retractorMemory.retractObservationalMemory({
+          resourceId: legacyResourceId,
+          threadId: legacyThreadId,
+        }),
+      ).resolves.toEqual({
+        clearedScopes: ['thread'],
+        clearedResourceWorkingMemory: false,
+        clearedThreadMetadata: true,
+      });
+      const legacyThread = await retractorMemory.getThreadById({ threadId: legacyThreadId });
+      expect(legacyThread).toMatchObject({ title: '' });
+      expect(legacyThread?.metadata).toEqual({ preserved: true, mastra: { preserved: true } });
+    } finally {
+      await observerStore.db.none(
+        `ALTER TABLE "${schemaName}"."mastra_threads"
+         ALTER COLUMN metadata TYPE JSONB USING metadata::jsonb`,
+      );
+    }
   });
 });

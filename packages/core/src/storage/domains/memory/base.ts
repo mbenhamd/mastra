@@ -12,9 +12,13 @@ import type {
   StorageOrderBy,
   StorageCloneThreadInput,
   StorageCloneThreadOutput,
+  StorageRollbackThreadCloneInput,
+  StorageRollbackThreadCloneResult,
+  StorageObservationalMemoryCloneReceipt,
   ObservationalMemoryRecord,
   ObservationalMemoryHistoryOptions,
   CreateObservationalMemoryInput,
+  ClearObservationalMemoryOptions,
   UpdateActiveObservationsInput,
   UpdateBufferedObservationsInput,
   UpdateBufferedReflectionInput,
@@ -27,8 +31,55 @@ import type {
   RetractObservationalMemoryInput,
   RetractObservationalMemoryResult,
   UpdateObservationalMemoryConfigInput,
+  ApplyWorkingMemoryUpdateInput,
+  WorkingMemorySnapshot,
+  WorkingMemorySnapshotInput,
+  StorageThreadToResourceWorkingMemoryTransitionPreparation,
+  StorageTransitionThreadToResourceWorkingMemoryInput,
+  StorageTransitionThreadToResourceWorkingMemoryOutput,
+  StorageMutateThreadWithWorkingMemoryInput,
+  StorageMutateThreadWithWorkingMemoryOutput,
 } from '../../types';
 import { StorageDomain } from '../base';
+
+export class ObservationalMemoryClearConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ObservationalMemoryClearConflictError';
+  }
+}
+
+export function assertObservationalMemoryClearExpectation(
+  currentRecord: Pick<ObservationalMemoryRecord, 'id' | 'resourceId'> | null,
+  expectedResourceId: string,
+  options?: ClearObservationalMemoryOptions,
+): void {
+  if (!currentRecord) {
+    if (typeof options?.expectedRecordId === 'string') {
+      throw new ObservationalMemoryClearConflictError(
+        `Observational memory record changed before it could be cleared: expected record "${options.expectedRecordId}", but no current record exists.`,
+      );
+    }
+    return;
+  }
+
+  if (currentRecord.resourceId !== expectedResourceId) {
+    throw new ObservationalMemoryClearConflictError(
+      `Resource "${expectedResourceId}" does not own the current observational memory record; it is owned by "${currentRecord.resourceId}".`,
+    );
+  }
+
+  if (options?.expectedRecordId === null) {
+    throw new ObservationalMemoryClearConflictError(
+      `Observational memory record changed before it could be cleared: expected no record, but current record is "${currentRecord.id}".`,
+    );
+  }
+  if (typeof options?.expectedRecordId === 'string' && currentRecord.id !== options.expectedRecordId) {
+    throw new ObservationalMemoryClearConflictError(
+      `Observational memory record changed before it could be cleared: expected record "${options.expectedRecordId}", but current record is "${currentRecord.id}".`,
+    );
+  }
+}
 
 function isPlainObj(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -49,6 +100,18 @@ export abstract class MemoryStorage extends StorageDomain {
 
   /** Whether edit/delete retraction and guarded derived writes are atomic. */
   readonly supportsAtomicObservationalMemoryRetraction?: boolean = false;
+
+  /** Whether owner-protected, revisioned Working Memory updates are atomic. */
+  readonly supportsRevisionedWorkingMemory?: boolean = false;
+
+  /** Whether listThreads applies the updatedBefore filter before pagination. */
+  readonly supportsThreadUpdatedBeforeFilter?: boolean = false;
+
+  /** Whether failed post-clone copies can be rolled back without deleting concurrent state. */
+  readonly supportsAtomicThreadCloneRollback?: boolean = false;
+
+  /** Whether cloneThread atomically captures and returns the source thread's resource ownership. */
+  readonly supportsThreadCloneSourceSnapshot?: boolean = false;
 
   constructor() {
     super({
@@ -189,6 +252,16 @@ export abstract class MemoryStorage extends StorageDomain {
     );
   }
 
+  /**
+   * Remove a cloned thread only while its storage-issued generation, cloned
+   * message set, and optional OM insertion are all still unchanged.
+   */
+  async rollbackThreadClone(_input: StorageRollbackThreadCloneInput): Promise<StorageRollbackThreadCloneResult> {
+    throw new Error(
+      `Atomic thread-clone rollback is not implemented by this storage adapter (${this.constructor.name}).`,
+    );
+  }
+
   async getResourceById(_: { resourceId: string }): Promise<StorageResourceType | null> {
     throw new Error(
       `Resource working memory is not implemented by this storage adapter (${this.constructor.name}). ` +
@@ -263,6 +336,73 @@ export abstract class MemoryStorage extends StorageDomain {
       throw new Error('Observational memory generation is no longer current.');
     }
     return await this.updateThread({ id: args.id, title: args.title, metadata: args.metadata });
+  }
+
+  /**
+   * Read working memory together with its compare-and-set revision and
+   * owner-protection controls. Adapters must override this together with
+   * applyWorkingMemoryUpdate; a non-atomic compatibility fallback would let
+   * observer writes race owner corrections.
+   */
+  async getWorkingMemorySnapshot(_args: WorkingMemorySnapshotInput): Promise<WorkingMemorySnapshot> {
+    throw new Error(`Revisioned working memory is not implemented by this storage adapter (${this.constructor.name}).`);
+  }
+
+  /**
+   * Atomically apply a revisioned working-memory update. Owner-protected paths
+   * must be preserved by observer writes in the same storage transaction.
+   */
+  async applyWorkingMemoryUpdate(_args: ApplyWorkingMemoryUpdateInput): Promise<WorkingMemorySnapshot> {
+    throw new Error(`Revisioned working memory is not implemented by this storage adapter (${this.constructor.name}).`);
+  }
+
+  /**
+   * Atomically capture the governed source and destination snapshots together
+   * with the opaque identity of each control lifetime.
+   *
+   * @internal Revision-capable adapters must implement this operation natively;
+   * separate public reads cannot provide one coherent preparation receipt.
+   */
+  async prepareThreadToResourceWorkingMemoryTransition(_args: {
+    threadId: string;
+    resourceId: string;
+  }): Promise<StorageThreadToResourceWorkingMemoryTransitionPreparation> {
+    throw new Error(
+      `Atomic thread-to-resource working-memory preparation is not implemented by this storage adapter (${this.constructor.name}).`,
+    );
+  }
+
+  /**
+   * Atomically save or partially update a thread without governed Working
+   * Memory fields while writing that value to the thread's canonical resource
+   * snapshot. Update mutations must merge only their explicit fields into the
+   * row read under the adapter's lock. Both governed-control incarnations and
+   * revisions must remain current until that atomic transition.
+   *
+   * @internal Revision-capable adapters must implement this operation natively;
+   * generic saveThread/updateThread remain unable to remove governance fields.
+   */
+  async transitionThreadToResourceWorkingMemory(
+    _input: StorageTransitionThreadToResourceWorkingMemoryInput,
+  ): Promise<StorageTransitionThreadToResourceWorkingMemoryOutput> {
+    throw new Error(
+      `Atomic thread-to-resource working-memory transition is not implemented by this storage adapter (${this.constructor.name}).`,
+    );
+  }
+
+  /**
+   * Atomically mutate a thread row together with a thread-scoped observer
+   * update, or prove that no governed thread snapshot would be hidden by a
+   * resource-scoped mutation.
+   *
+   * @internal Revision-capable adapters must implement this operation natively.
+   */
+  async mutateThreadWithWorkingMemory(
+    _input: StorageMutateThreadWithWorkingMemoryInput,
+  ): Promise<StorageMutateThreadWithWorkingMemoryOutput> {
+    throw new Error(
+      `Atomic thread and working-memory mutation is not implemented by this storage adapter (${this.constructor.name}).`,
+    );
   }
 
   /**
@@ -436,15 +576,22 @@ export abstract class MemoryStorage extends StorageDomain {
    * Insert a fully-formed observational memory record.
    * Used by thread cloning to copy OM state with remapped IDs.
    */
-  async insertObservationalMemoryRecord(_record: ObservationalMemoryRecord): Promise<void> {
+  async insertObservationalMemoryRecord(
+    _record: ObservationalMemoryRecord,
+  ): Promise<StorageObservationalMemoryCloneReceipt | void> {
     throw new Error(`Observational memory is not implemented by this storage adapter (${this.constructor.name}).`);
   }
 
   /**
    * Clear all observational memory for a thread/resource.
-   * Removes all records and history.
+   * Removes all records and history only when the persisted owner and optional
+   * record identity still match the caller's expected mutation coordinate.
    */
-  async clearObservationalMemory(_threadId: string | null, _resourceId: string): Promise<void> {
+  async clearObservationalMemory(
+    _threadId: string | null,
+    _resourceId: string,
+    _options?: ClearObservationalMemoryOptions,
+  ): Promise<void> {
     throw new Error(`Observational memory is not implemented by this storage adapter (${this.constructor.name}).`);
   }
 

@@ -229,15 +229,21 @@ export class MockMemory extends MastraMemory {
     }
 
     const scope = workingMemoryConfig.scope || 'resource';
-    const id = scope === 'resource' ? resourceId : threadId;
-
-    if (!id) {
+    if (scope === 'resource' && !resourceId) {
       return null;
     }
 
     const memoryStorage = await this.getMemoryStore();
-    const resource = await memoryStorage.getResourceById({ resourceId: id });
-    return resource?.workingMemory || null;
+    if (scope === 'resource') {
+      const resource = await memoryStorage.getResourceById({ resourceId: resourceId! });
+      return resource?.workingMemory || null;
+    }
+
+    const thread = await memoryStorage.getThreadById({ threadId });
+    if (thread && resourceId !== undefined && thread.resourceId !== resourceId) {
+      throw new Error('Working-memory thread does not belong to the requested resource.');
+    }
+    return typeof thread?.metadata?.workingMemory === 'string' ? thread.metadata.workingMemory : null;
   }
 
   public listTools(_config?: MemoryConfigInternal): Record<string, ToolAction<any, any, any>> {
@@ -406,17 +412,15 @@ export class MockMemory extends MastraMemory {
       return;
     }
 
-    const scope = workingMemoryConfig.scope || 'resource';
-    const id = scope === 'resource' ? resourceId : threadId;
-
-    if (!id) {
-      throw new Error(`Cannot update working memory: ${scope} ID is required`);
-    }
-
+    const coordinates = await this.resolveWorkingMemorySnapshotInput({ threadId, resourceId, memoryConfig });
     const memoryStorage = await this.getMemoryStore();
-    await memoryStorage.updateResource({
-      resourceId: id,
-      workingMemory,
+    const current = await memoryStorage.getWorkingMemorySnapshot(coordinates);
+    await memoryStorage.applyWorkingMemoryUpdate({
+      ...coordinates,
+      value: workingMemory,
+      expectedRevision: current.revision,
+      source: 'observer',
+      ...(workingMemoryConfig.maxDataBytes !== undefined ? { maxDataBytes: workingMemoryConfig.maxDataBytes } : {}),
     });
   }
 

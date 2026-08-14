@@ -151,6 +151,39 @@ describe('InMemoryMemory listMessages include resource scope', () => {
   });
 });
 
+describe('InMemoryMemory observational-memory clear ownership', () => {
+  it('rejects a stale owner coordinate without deleting the current thread record', async () => {
+    const memory = new InMemoryMemory({ db: new InMemoryDB() });
+    const threadId = 'clear-owner-thread';
+    const resourceId = 'clear-owner-current';
+    const record = await memory.initializeObservationalMemory({
+      threadId,
+      resourceId,
+      scope: 'thread',
+      config: {},
+    });
+
+    await expect(memory.clearObservationalMemory(threadId, 'clear-owner-stale')).rejects.toThrow(
+      /resource.*does not own/i,
+    );
+    await expect(memory.getObservationalMemory(threadId, resourceId)).resolves.toMatchObject({ id: record.id });
+  });
+
+  it('rejects a recreated record with the same owner when its identity changed', async () => {
+    const memory = new InMemoryMemory({ db: new InMemoryDB() });
+    const threadId = 'clear-incarnation-thread';
+    const resourceId = 'clear-incarnation-resource';
+    const prior = await memory.initializeObservationalMemory({ threadId, resourceId, scope: 'thread', config: {} });
+    await memory.clearObservationalMemory(threadId, resourceId);
+    const current = await memory.initializeObservationalMemory({ threadId, resourceId, scope: 'thread', config: {} });
+
+    await expect(memory.clearObservationalMemory(threadId, resourceId, { expectedRecordId: prior.id })).rejects.toThrow(
+      /record changed/i,
+    );
+    await expect(memory.getObservationalMemory(threadId, resourceId)).resolves.toMatchObject({ id: current.id });
+  });
+});
+
 describe('InMemoryMemory updateThread partial updates', () => {
   it('leaves the stored title alone when only metadata is provided', async () => {
     const memory = new InMemoryMemory({ db: new InMemoryDB() });
@@ -169,5 +202,194 @@ describe('InMemoryMemory updateThread partial updates', () => {
 
     expect(updated.title).toBe('Generated title');
     expect(updated.metadata).toEqual({ a: 1, b: 2 });
+  });
+});
+
+describe('InMemoryMemory thread storage boundaries', () => {
+  it('isolates nested clone metadata across clone ingress, clone results, and reads', async () => {
+    class RuntimeHandle {
+      readonly id = 'live-runtime';
+    }
+
+    const db = new InMemoryDB();
+    const memory = new InMemoryMemory({ db });
+    const createdAt = new Date('2026-01-01T00:00:00.000Z');
+    const runtimeHandle = new RuntimeHandle();
+    const cloneMetadata = {
+      cloneOptions: {
+        labels: ['persisted'],
+        runtimeHandle,
+      },
+    };
+    await memory.saveThread({
+      thread: {
+        id: 'metadata-source',
+        resourceId: 'metadata-resource',
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+    const clone = await memory.cloneThread({
+      sourceThreadId: 'metadata-source',
+      newThreadId: 'metadata-clone',
+      metadata: cloneMetadata,
+    });
+
+    cloneMetadata.cloneOptions.labels.push('caller-input-mutation');
+    const returnedCloneOptions = clone.thread.metadata?.cloneOptions as {
+      labels: string[];
+      runtimeHandle: RuntimeHandle;
+    };
+    expect(returnedCloneOptions.labels).toEqual(['persisted']);
+    expect(returnedCloneOptions.runtimeHandle).toBe(runtimeHandle);
+
+    returnedCloneOptions.labels.push('clone-result-mutation');
+    const fetched = await memory.getThreadById({ threadId: 'metadata-clone' });
+    if (!fetched) throw new Error('Expected cloned thread.');
+    const fetchedCloneOptions = fetched.metadata?.cloneOptions as { labels: string[] };
+    expect(fetchedCloneOptions.labels).toEqual(['persisted']);
+
+    fetchedCloneOptions.labels.push('getter-mutation');
+    await expect(memory.getThreadById({ threadId: 'metadata-clone' })).resolves.toMatchObject({
+      metadata: { cloneOptions: { labels: ['persisted'] } },
+    });
+  });
+
+  it('keeps cloned governed metadata separate from caller and persisted objects', async () => {
+    const db = new InMemoryDB();
+    const memory = new InMemoryMemory({ db });
+    const createdAt = new Date('2026-01-01T00:00:00.000Z');
+    await memory.saveThread({
+      thread: {
+        id: 'source-thread',
+        resourceId: 'source-resource',
+        title: 'Source',
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+    const workingMemoryControl = {
+      revision: 1,
+      protectedPaths: ['/profile/name'],
+      provenance: {
+        '/profile/name': {
+          source: 'owner',
+          revision: 1,
+          updatedAt: '2026-01-01T00:00:00.000Z',
+        },
+      },
+    };
+
+    const clone = await memory.cloneThread({
+      sourceThreadId: 'source-thread',
+      newThreadId: 'cloned-thread',
+      metadata: {
+        workingMemory: '{"profile":{"name":"Ada"}}',
+        mastra: { workingMemory: workingMemoryControl },
+      },
+    });
+    const stored = db.threads.get('cloned-thread');
+    if (!stored) throw new Error('Expected cloned thread to be persisted.');
+    const returnedControl = (clone.thread.metadata?.mastra as Record<string, unknown>)
+      .workingMemory as typeof workingMemoryControl;
+    const storedControl = (stored.metadata?.mastra as Record<string, unknown>)
+      .workingMemory as typeof workingMemoryControl;
+
+    expect(clone.thread).not.toBe(stored);
+    expect(clone.thread.metadata).not.toBe(stored.metadata);
+    expect(returnedControl).not.toBe(storedControl);
+    workingMemoryControl.revision = 99;
+    workingMemoryControl.protectedPaths.push('/tampered');
+    expect(storedControl).toMatchObject({ revision: 1, protectedPaths: ['/profile/name'] });
+    expect(() => returnedControl.protectedPaths.push('/caller-mutation')).toThrow(TypeError);
+    await expect(memory.getThreadById({ threadId: 'cloned-thread' })).resolves.toMatchObject({
+      metadata: {
+        mastra: {
+          workingMemory: { revision: 1, protectedPaths: ['/profile/name'] },
+        },
+      },
+    });
+  });
+
+  it('freezes cyclic controls without overflowing before validation rejects them', async () => {
+    const db = new InMemoryDB();
+    const memory = new InMemoryMemory({ db });
+    const createdAt = new Date('2026-01-01T00:00:00.000Z');
+    const cyclicControl = () => {
+      const provenance: Record<string, unknown> = {};
+      provenance['/invalid'] = provenance;
+      return { revision: 1, protectedPaths: [], provenance };
+    };
+
+    const thread = await memory.saveThread({
+      thread: {
+        id: 'cyclic-control-thread',
+        resourceId: 'cyclic-control-resource',
+        metadata: { mastra: { workingMemory: cyclicControl() } },
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+    const resource = await memory.saveResource({
+      resource: {
+        id: 'cyclic-control-resource',
+        metadata: { mastra: { workingMemory: cyclicControl() } },
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+
+    expect(Object.isFrozen((thread.metadata?.mastra as Record<string, unknown>).workingMemory)).toBe(true);
+    expect(Object.isFrozen((resource.metadata?.mastra as Record<string, unknown>).workingMemory)).toBe(true);
+    await expect(
+      memory.getWorkingMemorySnapshot({
+        scope: 'thread',
+        resourceId: 'cyclic-control-resource',
+        threadId: 'cyclic-control-thread',
+      }),
+    ).rejects.toThrow('Stored working-memory controls are invalid.');
+    await expect(
+      memory.getWorkingMemorySnapshot({ scope: 'resource', resourceId: 'cyclic-control-resource' }),
+    ).rejects.toThrow('Stored working-memory controls are invalid.');
+  });
+
+  it('keeps metadata undefined unless existing governed controls must be preserved', async () => {
+    const db = new InMemoryDB();
+    const memory = new InMemoryMemory({ db });
+    const createdAt = new Date('2026-01-01T00:00:00.000Z');
+    const thread = {
+      id: 'shape-thread',
+      resourceId: 'shape-resource',
+      title: 'No metadata',
+      createdAt,
+      updatedAt: createdAt,
+    };
+
+    const saved = await memory.saveThread({ thread });
+
+    expect(saved.metadata).toBeUndefined();
+    expect(db.threads.get(thread.id)?.metadata).toBeUndefined();
+    await expect(memory.getThreadById({ threadId: thread.id })).resolves.toMatchObject({ metadata: undefined });
+
+    const governed = await memory.applyWorkingMemoryUpdate({
+      scope: 'thread',
+      resourceId: thread.resourceId,
+      threadId: thread.id,
+      value: '{"preference":"concise"}',
+      expectedRevision: 0,
+      source: 'owner',
+      protectPaths: ['/preference'],
+    });
+    const resaved = await memory.saveThread({
+      thread: { ...thread, updatedAt: new Date('2026-01-02T00:00:00.000Z') },
+    });
+
+    expect(resaved.metadata).toMatchObject({
+      workingMemory: '{"preference":"concise"}',
+      mastra: { workingMemory: { revision: 1, protectedPaths: ['/preference'] } },
+    });
+    await expect(
+      memory.getWorkingMemorySnapshot({ scope: 'thread', resourceId: thread.resourceId, threadId: thread.id }),
+    ).resolves.toEqual(governed);
   });
 });

@@ -265,6 +265,8 @@ export interface DeleteCompletedWorkflowTerminalizationsInput {
   olderThan: Date;
 }
 
+// Pinned Prettier and Oxfmt disagree on this union's line wrapping.
+// prettier-ignore
 export type DeleteCompletedWorkflowTerminalizationsResult =
   | { status: 'deleted'; count: number }
   | { status: 'missing_run' | 'unsupported'; count: 0 };
@@ -735,6 +737,14 @@ export type StorageListThreadsInput = {
      */
     resourceId?: string;
     /**
+     * Return only threads whose last activity is strictly older than this
+     * instant. Storage adapters must apply this predicate before pagination so
+     * callers can run bounded, cursor-free retention sweeps safely. Callers
+     * must first require `supportsThreadUpdatedBeforeFilter`; other adapters
+     * may not implement this optional filter.
+     */
+    updatedBefore?: Date;
+    /**
      * Filter threads by metadata key-value pairs.
      * All specified key-value pairs must match (AND logic).
      */
@@ -798,7 +808,54 @@ export type StorageCloneThreadOutput = {
   clonedMessages: MastraDBMessage[];
   /** Map from source message IDs to cloned message IDs (used for OM remapping) */
   messageIdMap?: Record<string, string>;
+  /**
+   * Resource that owned the source thread in the same atomic snapshot used to
+   * create the clone. Required when the adapter advertises
+   * `supportsThreadCloneSourceSnapshot`.
+   */
+  sourceResourceId?: string;
+  /**
+   * Storage-issued ownership proof for conditional post-clone rollback.
+   *
+   * @internal The token is opaque outside the adapter that issued it.
+   */
+  rollbackReceipt?: StorageThreadCloneRollbackReceipt;
 };
+
+/** @internal Storage-owned proof identifying one physical cloned-thread generation. */
+export type StorageThreadCloneRollbackReceipt = {
+  threadId: string;
+  storageGeneration: string;
+  clonedMessageIds: string[];
+};
+
+/** @internal Storage-owned proof identifying one exact cloned OM insertion. */
+export type StorageObservationalMemoryCloneReceipt = {
+  recordId: string;
+  threadId: string | null;
+  resourceId: string;
+  storageGeneration: string;
+  /** Records that occupied the same OM coordinate immediately before insertion. */
+  priorRecordIds: string[];
+};
+
+/** @internal Conditional cleanup input for a failed post-clone copy. */
+export type StorageRollbackThreadCloneInput = {
+  thread: StorageThreadCloneRollbackReceipt;
+  observationalMemory?: StorageObservationalMemoryCloneReceipt;
+  /**
+   * The prepared OM record id when its insertion result was not observed.
+   * Adapters must refuse rollback if this id exists without a matching receipt.
+   */
+  unverifiedObservationalMemoryRecordId?: string;
+};
+
+/** @internal A conflict preserves every artifact rather than risking another writer's state. */
+// Pinned Prettier and Oxfmt disagree on this union's line wrapping.
+// prettier-ignore
+export type StorageRollbackThreadCloneResult =
+  | { status: 'rolled_back' }
+  | { status: 'conflict'; reason: 'thread' | 'messages' | 'observational_memory' };
 
 export type StorageResourceType = {
   id: string;
@@ -806,6 +863,135 @@ export type StorageResourceType = {
   metadata?: Record<string, unknown>;
   createdAt: Date;
   updatedAt: Date;
+};
+
+/** The writer that produced a revisioned working-memory value. */
+export type WorkingMemoryUpdateSource = 'observer' | 'owner';
+
+/** Audit-safe provenance for one JSON-pointer path in working memory. */
+export type WorkingMemoryPathProvenance = {
+  source: WorkingMemoryUpdateSource;
+  revision: number;
+  updatedAt: string;
+};
+
+/**
+ * A revisioned working-memory view. Paths use RFC 6901 JSON Pointer syntax;
+ * the empty string identifies the complete value.
+ */
+export type WorkingMemorySnapshot = {
+  value: string | null;
+  revision: number;
+  protectedPaths: string[];
+  provenance: Record<string, WorkingMemoryPathProvenance>;
+};
+
+/** Coordinates for a resource- or thread-scoped working-memory record. */
+export type WorkingMemorySnapshotInput =
+  | {
+      scope: 'resource';
+      resourceId: string;
+      /** Required only when fencing an observer write to a thread-scoped OM generation. */
+      threadId?: string;
+    }
+  | {
+      scope: 'thread';
+      resourceId: string;
+      threadId: string;
+    };
+
+/**
+ * Compare-and-set update for working memory.
+ *
+ * Owner writes may protect or unprotect JSON-pointer paths. Observer writes
+ * never change those controls and must preserve every protected value.
+ */
+export type ApplyWorkingMemoryUpdateInput = WorkingMemorySnapshotInput & {
+  value: string | null;
+  expectedRevision: number;
+  source: WorkingMemoryUpdateSource;
+  /** Reject a non-null value whose UTF-8 encoding exceeds this many bytes. */
+  maxDataBytes?: number;
+  protectPaths?: string[];
+  unprotectPaths?: string[];
+  /** Optional OM generation fence for observer-managed writes. */
+  observationalMemoryGuard?: ObservationalMemoryWriteGuard;
+};
+
+/** @internal One atomically observed Working Memory transition participant. */
+export type StorageWorkingMemoryTransitionParticipantReceipt = {
+  snapshot: WorkingMemorySnapshot;
+  /**
+   * Opaque identity of the governed control lifetime; null means no controls
+   * were observed and the exact snapshot value fences the ungoverned state.
+   */
+  workingMemoryIncarnation: string | null;
+};
+
+/** @internal Coordinate-bound source and destination state for one scope transition. */
+export type StorageThreadToResourceWorkingMemoryTransitionPreparation = {
+  threadId: string;
+  resourceId: string;
+  sourceThread: StorageWorkingMemoryTransitionParticipantReceipt;
+  destinationResource: StorageWorkingMemoryTransitionParticipantReceipt;
+};
+
+/**
+ * Atomically move a governed thread snapshot to resource scope.
+ *
+ * @internal This is a narrowly authorized scope transition. Generic thread
+ * writes must continue to preserve or reject governed Working Memory fields.
+ */
+export type StorageTransitionThreadToResourceWorkingMemoryInput = {
+  mutation:
+    | { type: 'save'; thread: StorageThreadType }
+    | {
+        type: 'update';
+        id: string;
+        resourceId: string;
+        title?: string;
+        metadata?: Record<string, unknown>;
+      };
+  value: string;
+  /** Source and destination state captured before this transition was proposed. */
+  preparation: StorageThreadToResourceWorkingMemoryTransitionPreparation;
+  maxDataBytes?: number;
+};
+
+/** @internal Result of a governed thread-to-resource Working Memory transition. */
+export type StorageTransitionThreadToResourceWorkingMemoryOutput = {
+  thread: StorageThreadType;
+  workingMemory: WorkingMemorySnapshot;
+};
+
+/** @internal Thread-row mutation coordinated with its governed Working Memory. */
+export type StorageMutateThreadWithWorkingMemoryInput = {
+  mutation:
+    | { type: 'save'; thread: StorageThreadType }
+    | {
+        type: 'update';
+        id: string;
+        title?: string;
+        metadata?: Record<string, unknown>;
+      };
+  workingMemory:
+    | {
+        type: 'observer-update';
+        resourceId: string;
+        value: string;
+        expectedRevision: number;
+        maxDataBytes?: number;
+      }
+    | {
+        /** Fail before mutating the row when an explicit scope migration is required. */
+        type: 'require-ungoverned';
+      };
+};
+
+/** @internal Result of an atomic thread-row and Working Memory mutation. */
+export type StorageMutateThreadWithWorkingMemoryOutput = {
+  thread: StorageThreadType;
+  workingMemory?: WorkingMemorySnapshot;
 };
 
 export type StorageMessageType = {
@@ -1843,6 +2029,17 @@ export interface CreateObservationalMemoryInput {
   config: Record<string, unknown>;
   /** The timezone used when formatting dates for the Observer agent (e.g., "America/Los_Angeles") */
   observedTimezone?: string;
+}
+
+/**
+ * Compare-and-set fence for clearing observational memory.
+ *
+ * A string requires that exact record to still be current. `null` requires
+ * that no record has appeared since the caller's read. Omitting the option
+ * retains owner-only fencing for direct storage callers.
+ */
+export interface ClearObservationalMemoryOptions {
+  expectedRecordId?: string | null;
 }
 
 /**

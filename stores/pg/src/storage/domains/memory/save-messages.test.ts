@@ -8,18 +8,75 @@ import { MemoryPG } from './index';
 
 class RecordingTxClient implements TxClient {
   queries: RecordedQuery[] = [];
+  reads: RecordedQuery[] = [];
+  lifecycleLocks: string[] = [];
   sourceMessages: Record<string, any>[] = [];
 
+  constructor(private readonly threads: Map<string, Record<string, unknown>>) {}
+
   async none(query: string, values?: QueryValues): Promise<null> {
+    if (query.includes('pg_advisory_xact_lock')) {
+      this.lifecycleLocks.push(String(values?.[0]));
+      return null;
+    }
     this.queries.push({ query, values });
     return null;
   }
 
-  async one<T = any>(): Promise<T> {
+  async one<T = any>(query: string, values?: QueryValues): Promise<T> {
+    if (query.includes('xmin::text')) return { storageGeneration: 'clone-generation' } as T;
+
+    this.queries.push({ query, values });
+    if (query.includes('INSERT INTO') && query.includes('mastra_threads') && query.includes('RETURNING *')) {
+      return {
+        id: values?.[0],
+        resourceId: values?.[1],
+        title: values?.[2],
+        metadata: values?.[3],
+        createdAt: values?.[4],
+        createdAtZ: values?.[5],
+        updatedAt: values?.[6],
+        updatedAtZ: values?.[7],
+      } as T;
+    }
+    if (query.includes('INSERT INTO') && query.includes('mastra_resources') && query.includes('RETURNING *')) {
+      return {
+        id: values?.[0],
+        workingMemory: values?.[1],
+        metadata: values?.[2],
+        createdAt: values?.[3],
+        createdAtZ: values?.[4],
+        updatedAt: values?.[5],
+        updatedAtZ: values?.[6],
+      } as T;
+    }
     throw new Error('not implemented');
   }
 
-  async oneOrNone<T = any>(): Promise<T | null> {
+  async oneOrNone<T = any>(query: string, values?: QueryValues): Promise<T | null> {
+    this.reads.push({ query, values });
+    if (query.includes('SELECT * FROM') && query.includes('mastra_threads') && query.includes('FOR UPDATE')) {
+      const thread = this.threads.get(String(values?.[0]));
+      return (thread as T | undefined) ?? null;
+    }
+    if (
+      query.includes('SELECT "resourceId", metadata FROM') &&
+      query.includes('mastra_threads') &&
+      query.includes('FOR UPDATE')
+    ) {
+      const thread = this.threads.get(String(values?.[0]));
+      return thread ? ({ resourceId: thread.resourceId, metadata: thread.metadata ?? {} } as T) : null;
+    }
+    if (
+      query.includes('SELECT "workingMemory", metadata FROM') &&
+      query.includes('mastra_resources') &&
+      query.includes('FOR UPDATE')
+    ) {
+      return null;
+    }
+    if (query.includes('SELECT id FROM') && query.includes('FOR UPDATE')) {
+      return { id: String(values?.[0]) } as T;
+    }
     throw new Error('not implemented');
   }
 
@@ -27,7 +84,12 @@ class RecordingTxClient implements TxClient {
     throw new Error('not implemented');
   }
 
-  async manyOrNone<T = any>(): Promise<T[]> {
+  async manyOrNone<T = any>(query: string, values?: QueryValues): Promise<T[]> {
+    if (query.includes('SELECT id, "resourceId" FROM') && query.includes('mastra_threads')) {
+      return (values ?? [])
+        .map(value => this.threads.get(String(value)))
+        .filter((thread): thread is Record<string, unknown> => thread !== undefined) as T[];
+    }
     return this.sourceMessages as T[];
   }
 
@@ -45,7 +107,7 @@ class RecordingTxClient implements TxClient {
 }
 
 class RecordingDbClient extends RecordingDbClientBase {
-  readonly txClient = new RecordingTxClient();
+  readonly txClient: RecordingTxClient;
   readonly threads = new Map<string, Record<string, unknown>>();
 
   constructor({
@@ -65,6 +127,7 @@ class RecordingDbClient extends RecordingDbClientBase {
     for (const threadToAdd of threadsToAdd) {
       this.threads.set(String(threadToAdd.id), threadToAdd);
     }
+    this.txClient = new RecordingTxClient(this.threads);
   }
 
   override async none(query: string, values?: QueryValues): Promise<null> {
@@ -297,8 +360,11 @@ describe('MemoryPG.saveThread', () => {
       },
     });
 
-    expect(client.queries).toHaveLength(1);
-    expect(client.queries[0]!.values).toEqual([
+    expect(client.txClient.reads).toHaveLength(1);
+    expect(client.txClient.reads[0]!.query).toContain('SELECT "resourceId", metadata FROM');
+    expect(client.txClient.reads[0]!.query).toContain('FOR UPDATE');
+    expect(client.txClient.queries).toHaveLength(1);
+    expect(client.txClient.queries[0]!.values).toEqual([
       'thread-1',
       'resource-1',
       'Test thread',
@@ -328,11 +394,14 @@ describe('MemoryPG.saveResource', () => {
       },
     });
 
-    expect(client.queries).toHaveLength(1);
-    expect(client.queries[0]!.values![3]).toBe(createdAt.toISOString());
-    expect(client.queries[0]!.values![4]).toBe(updatedAt.toISOString());
-    expect(client.queries[0]!.values![5]).toBe(createdAt.toISOString());
-    expect(client.queries[0]!.values![6]).toBe(updatedAt.toISOString());
+    expect(client.txClient.reads).toHaveLength(1);
+    expect(client.txClient.reads[0]!.query).toContain('SELECT "workingMemory", metadata FROM');
+    expect(client.txClient.reads[0]!.query).toContain('FOR UPDATE');
+    expect(client.txClient.queries).toHaveLength(1);
+    expect(client.txClient.queries[0]!.values![3]).toBe(createdAt.toISOString());
+    expect(client.txClient.queries[0]!.values![4]).toBe(createdAt.toISOString());
+    expect(client.txClient.queries[0]!.values![5]).toBe(updatedAt.toISOString());
+    expect(client.txClient.queries[0]!.values![6]).toBe(updatedAt.toISOString());
   });
 });
 
@@ -361,5 +430,39 @@ describe('MemoryPG.cloneThread', () => {
     expect(messageInsert.values![4]).toBe(createdAtZ.toISOString());
     expect(messageInsert.values![3]).not.toBe(legacyCreatedAt.toISOString());
     expect(result.clonedMessages[0]!.createdAt).toEqual(createdAtZ);
+  });
+
+  it('locks source and destination before returning the in-transaction source owner', async () => {
+    const client = new RecordingDbClient();
+    const memory = new MemoryPG({ client });
+
+    const result = await memory.cloneThread({ sourceThreadId: 'thread-1', newThreadId: 'aaa-clone' });
+
+    expect(client.txClient.lifecycleLocks).toEqual(['mastra:thread-clone:aaa-clone', 'mastra:thread-clone:thread-1']);
+    expect(client.txClient.reads.map(read => read.values)).toEqual([['aaa-clone'], ['thread-1']]);
+    expect(client.txClient.reads.every(read => read.query.includes('SELECT * FROM'))).toBe(true);
+    expect(client.txClient.reads.every(read => read.query.includes('FOR UPDATE'))).toBe(true);
+    expect(result.sourceResourceId).toBe('resource-1');
+    expect(result.thread.resourceId).toBe('resource-1');
+  });
+
+  it('preserves source-not-found precedence when the requested clone id already exists', async () => {
+    const client = new RecordingDbClient({
+      threads: [
+        {
+          id: 'existing-clone',
+          resourceId: 'target-resource',
+          title: 'Existing clone',
+          metadata: {},
+          createdAt: new Date('2025-01-01T00:00:00.000Z'),
+          updatedAt: new Date('2025-01-01T00:00:00.000Z'),
+        },
+      ],
+    });
+    const memory = new MemoryPG({ client });
+
+    await expect(
+      memory.cloneThread({ sourceThreadId: 'missing-source', newThreadId: 'existing-clone' }),
+    ).rejects.toThrow('Source thread with id missing-source not found');
   });
 });

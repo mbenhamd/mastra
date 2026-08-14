@@ -82,7 +82,7 @@
     "vitest": "catalog:"
   },
   "peerDependencies": {
-    "@mastra/core": ">=1.4.1-0 <2.0.0-0"
+    "@mastra/core": ">=2.0.0-alpha.11 <3.0.0-0"
   },
   "homepage": "https://mastra.ai",
   "repository": {

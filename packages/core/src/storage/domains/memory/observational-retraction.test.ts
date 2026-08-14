@@ -3,6 +3,69 @@ import { describe, expect, it } from 'vitest';
 import { InMemoryStore } from '../../mock';
 
 describe('MemoryStorage atomic observational-memory retraction', () => {
+  it('does not clear sibling thread memory when a resource record owns only resource memory', async () => {
+    const storage = new InMemoryStore({ id: 'memory-observational-retraction-mixed-scope' });
+    const memory = await storage.getStore('memory');
+    if (!memory) throw new Error('Expected in-memory storage domain.');
+    const resourceId = 'mixed-scope-resource';
+    const editedThreadId = 'mixed-scope-edited';
+    const siblingThreadId = 'mixed-scope-sibling';
+    const createdAt = new Date('2026-01-01T00:00:00.000Z');
+    for (const id of [editedThreadId, siblingThreadId]) {
+      await memory.saveThread({
+        thread: { id, resourceId, title: id, metadata: {}, createdAt, updatedAt: createdAt },
+      });
+    }
+    await memory.initializeObservationalMemory({
+      config: { _managedWorkingMemoryScope: 'resource' },
+      resourceId,
+      scope: 'resource',
+      threadId: null,
+    });
+    const editedRecord = await memory.initializeObservationalMemory({
+      config: { _managedWorkingMemoryScope: 'thread' },
+      resourceId,
+      scope: 'thread',
+      threadId: editedThreadId,
+    });
+    const siblingRecord = await memory.initializeObservationalMemory({
+      config: { _managedWorkingMemoryScope: 'thread' },
+      resourceId,
+      scope: 'thread',
+      threadId: siblingThreadId,
+    });
+    await memory.applyWorkingMemoryUpdate({
+      scope: 'thread',
+      resourceId,
+      threadId: editedThreadId,
+      value: '{"task":"edited"}',
+      expectedRevision: 0,
+      source: 'observer',
+      observationalMemoryGuard: { recordId: editedRecord.id, resourceId, threadId: editedThreadId },
+    });
+    const siblingSnapshot = await memory.applyWorkingMemoryUpdate({
+      scope: 'thread',
+      resourceId,
+      threadId: siblingThreadId,
+      value: '{"task":"sibling"}',
+      expectedRevision: 0,
+      source: 'observer',
+      observationalMemoryGuard: { recordId: siblingRecord.id, resourceId, threadId: siblingThreadId },
+    });
+
+    await memory.retractObservationalMemory({ resourceId, threadId: editedThreadId });
+
+    await expect(
+      memory.getWorkingMemorySnapshot({ scope: 'thread', resourceId, threadId: editedThreadId }),
+    ).resolves.toMatchObject({ value: null, revision: 2 });
+    await expect(
+      memory.getWorkingMemorySnapshot({ scope: 'thread', resourceId, threadId: siblingThreadId }),
+    ).resolves.toEqual(siblingSnapshot);
+    await expect(memory.getObservationalMemory(siblingThreadId, resourceId)).resolves.toMatchObject({
+      id: siblingRecord.id,
+    });
+  });
+
   it('clears every derived surface and fences an in-flight generation', async () => {
     const storage = new InMemoryStore({ id: 'memory-observational-retraction' });
     const memory = await storage.getStore('memory');
@@ -234,6 +297,129 @@ describe('MemoryStorage atomic observational-memory retraction', () => {
 
     await expect(memory.getObservationalMemory('thread-source', 'resource-source')).resolves.toBeNull();
     await expect(memory.getObservationalMemory('thread-destination', 'resource-destination')).resolves.toBeNull();
+  });
+
+  it('uses the last duplicate update for both the message move and OM retraction coordinates', async () => {
+    const storage = new InMemoryStore({ id: 'memory-observational-retraction-duplicate-update' });
+    const memory = await storage.getStore('memory');
+    if (!memory) throw new Error('Expected in-memory storage domain.');
+    const createdAt = new Date('2026-01-01T00:00:00.000Z');
+    const messageId = 'message-duplicate-update';
+    const source = {
+      resourceId: 'resource-duplicate-source',
+      threadId: 'thread-duplicate-source',
+      workingMemory: 'source observer memory',
+    };
+    const discarded = {
+      resourceId: 'resource-duplicate-discarded',
+      threadId: 'thread-duplicate-discarded',
+      workingMemory: 'discarded observer memory',
+    };
+    const canonical = {
+      resourceId: 'resource-duplicate-canonical',
+      threadId: 'thread-duplicate-canonical',
+      workingMemory: 'canonical observer memory',
+    };
+
+    for (const coordinate of [source, discarded, canonical]) {
+      await memory.saveResource({
+        resource: {
+          id: coordinate.resourceId,
+          workingMemory: coordinate.workingMemory,
+          metadata: {},
+          createdAt,
+          updatedAt: createdAt,
+        },
+      });
+      await memory.saveThread({
+        thread: {
+          id: coordinate.threadId,
+          resourceId: coordinate.resourceId,
+          title: coordinate.threadId,
+          metadata: {},
+          createdAt,
+          updatedAt: createdAt,
+        },
+      });
+      await memory.initializeObservationalMemory({
+        config: { _managedWorkingMemoryScope: 'resource' },
+        resourceId: coordinate.resourceId,
+        scope: 'thread',
+        threadId: coordinate.threadId,
+      });
+    }
+    await memory.saveMessages({
+      messages: [
+        {
+          id: messageId,
+          threadId: source.threadId,
+          resourceId: source.resourceId,
+          role: 'user',
+          content: { format: 2, parts: [{ type: 'text', text: 'Move me once' }] },
+          createdAt,
+        },
+      ],
+    });
+
+    const retractions: Array<{ input: { resourceId: string; threadId: string } }> = [];
+    const updatedMessages = await memory.updateMessages({
+      messages: [
+        {
+          id: messageId,
+          threadId: discarded.threadId,
+          resourceId: discarded.resourceId,
+          content: { content: 'discarded update' },
+        },
+        {
+          id: messageId,
+          threadId: canonical.threadId,
+          resourceId: canonical.resourceId,
+          content: { content: 'canonical update' },
+        },
+      ],
+      retractObservationalMemory: true,
+      observationalMemoryRetractions: retractions as any,
+    });
+
+    expect(updatedMessages).toMatchObject([
+      {
+        id: messageId,
+        threadId: canonical.threadId,
+        resourceId: canonical.resourceId,
+        content: { content: 'canonical update' },
+      },
+    ]);
+    expect(updatedMessages).toHaveLength(1);
+    expect(
+      new Set(retractions.map(retraction => `${retraction.input.resourceId}\u0000${retraction.input.threadId}`)),
+    ).toEqual(
+      new Set([`${source.resourceId}\u0000${source.threadId}`, `${canonical.resourceId}\u0000${canonical.threadId}`]),
+    );
+    expect(retractions).toHaveLength(2);
+
+    await expect(memory.listMessagesById({ messageIds: [messageId] })).resolves.toMatchObject({
+      messages: [
+        {
+          id: messageId,
+          threadId: canonical.threadId,
+          resourceId: canonical.resourceId,
+          content: { content: 'canonical update' },
+        },
+      ],
+    });
+    await expect(memory.getObservationalMemory(source.threadId, source.resourceId)).resolves.toBeNull();
+    await expect(memory.getObservationalMemory(canonical.threadId, canonical.resourceId)).resolves.toBeNull();
+    await expect(memory.getResourceById({ resourceId: source.resourceId })).resolves.toMatchObject({
+      workingMemory: undefined,
+    });
+    await expect(memory.getResourceById({ resourceId: canonical.resourceId })).resolves.toMatchObject({
+      workingMemory: undefined,
+    });
+
+    await expect(memory.getObservationalMemory(discarded.threadId, discarded.resourceId)).resolves.not.toBeNull();
+    await expect(memory.getResourceById({ resourceId: discarded.resourceId })).resolves.toMatchObject({
+      workingMemory: discarded.workingMemory,
+    });
   });
 
   it('rejects generation guards whose coordinates do not match the target row', async () => {

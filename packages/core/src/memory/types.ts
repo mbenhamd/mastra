@@ -177,9 +177,9 @@ export type MessageResponse<T extends 'raw' | 'core_message'> = {
 type BaseWorkingMemory = {
   enabled: boolean;
   /**
-   * Maximum UTF-8 bytes of escaped stored data that may be injected through
-   * the system-message delivery path. Storage is not modified when the prompt
-   * view is truncated.
+   * Maximum UTF-8 bytes accepted for newly stored working-memory values. The
+   * system-message delivery path also bounds escaped legacy data to this size
+   * without rewriting that legacy value.
    */
   maxDataBytes?: number;
   /**
@@ -1245,6 +1245,8 @@ export type SharedMemoryConfig = {
 /** @deprecated Use the `format` field on `WorkingMemoryTemplate` discriminated union instead. */
 export type WorkingMemoryFormat = 'json' | 'markdown';
 
+// Pinned Prettier and Oxfmt disagree on this union's line wrapping.
+// prettier-ignore
 export type WorkingMemoryTemplate =
   | { format: 'markdown'; content: string }
   | { format: 'json'; content: string | Record<string, unknown> };

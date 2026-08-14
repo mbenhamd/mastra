@@ -11,6 +11,7 @@ import type { ProcessorContext, ProcessorStreamWriter } from '@mastra/core/proce
 import { MessageHistory } from '@mastra/core/processors';
 import type { RequestContext } from '@mastra/core/request-context';
 import type { MemoryStorage, ObservationalMemoryRecord, ObservationalMemoryHistoryOptions } from '@mastra/core/storage';
+import { assertObservationalMemoryClearExpectation } from '@mastra/core/storage';
 import type { ProviderMetadata } from '@mastra/core/stream';
 import xxhash from 'xxhash-wasm';
 
@@ -1089,16 +1090,50 @@ export class ObservationalMemory {
   }
 
   /**
+   * Resolve storage state for operations that may mutate observational memory.
+   * Thread-scoped records are addressed by threadId, but storage adapters use
+   * the owning resourceId to serialize mutations such as initialize and clear.
+   * An existing record owns that coordinate even if its thread no longer exists.
+   */
+  private async resolveMutationStorageState(
+    threadId: string,
+    resourceId?: string,
+  ): Promise<{
+    ids: { threadId: string | null; resourceId: string };
+    existingRecord: ObservationalMemoryRecord | null;
+  }> {
+    const lookupIds = this.getStorageIds(threadId, resourceId);
+    const existingRecord = await this.storage.getObservationalMemory(lookupIds.threadId, lookupIds.resourceId);
+    if (existingRecord) {
+      return {
+        ids: { threadId: lookupIds.threadId, resourceId: existingRecord.resourceId },
+        existingRecord,
+      };
+    }
+
+    if (this.scope !== 'thread' || resourceId !== undefined) {
+      return { ids: lookupIds, existingRecord: null };
+    }
+
+    const thread = await this.storage.getThreadById({ threadId });
+    return {
+      ids: this.getStorageIds(threadId, thread?.resourceId),
+      existingRecord: null,
+    };
+  }
+
+  /**
    * Get or create the observational memory record.
    * Returns the existing record if one exists, otherwise initializes a new one.
    */
   async getOrCreateRecord(threadId: string, resourceId?: string): Promise<ObservationalMemoryRecord> {
-    const ids = this.getStorageIds(threadId, resourceId);
+    const lookupIds = this.getStorageIds(threadId, resourceId);
     // Storage adapters identify thread-scoped records by threadId alone and
     // resource-scoped records by resourceId alone. The single-flight key must
     // mirror that identity so optional resourceId differences cannot split a
     // thread-scoped initialization into separate operations.
-    const initializationKey = ids.threadId === null ? `resource:${ids.resourceId}` : `thread:${ids.threadId}`;
+    const initializationKey =
+      lookupIds.threadId === null ? `resource:${lookupIds.resourceId}` : `thread:${lookupIds.threadId}`;
     const pendingInitialization = this.recordInitializations.get(initializationKey);
     if (pendingInitialization) {
       return pendingInitialization;
@@ -1108,9 +1143,9 @@ export class ObservationalMemory {
     // registered before any adapter code runs. This prevents an already-started
     // read from returning a stale null after another caller has finished inserting.
     const initialization = Promise.resolve().then(async () => {
-      const record = await this.storage.getObservationalMemory(ids.threadId, ids.resourceId);
-      if (record) {
-        return record;
+      const { ids, existingRecord } = await this.resolveMutationStorageState(threadId, resourceId);
+      if (existingRecord) {
+        return existingRecord;
       }
 
       // Capture the timezone used for Observer date formatting
@@ -1730,6 +1765,8 @@ export class ObservationalMemory {
     messageList: MessageList,
   ): { threadId: string; resourceId?: string } | null {
     // First try RequestContext (set by Memory)
+    // Pinned Prettier and Oxfmt disagree on this assertion's line wrapping.
+    // prettier-ignore
     const memoryContext = requestContext?.get('MastraMemory') as
       | { thread?: { id: string }; resourceId?: string }
       | undefined;
@@ -3850,8 +3887,13 @@ ${formattedMessages}
    * Clear all memory for a specific thread/resource
    */
   async clear(threadId: string, resourceId?: string): Promise<void> {
-    const ids = this.getStorageIds(threadId, resourceId);
-    await this.storage.clearObservationalMemory(ids.threadId, ids.resourceId);
+    const { ids, existingRecord } = await this.resolveMutationStorageState(threadId, resourceId);
+    if (resourceId !== undefined && existingRecord) {
+      assertObservationalMemoryClearExpectation(existingRecord, resourceId);
+    }
+    await this.storage.clearObservationalMemory(ids.threadId, ids.resourceId, {
+      expectedRecordId: existingRecord?.id ?? null,
+    });
     // Clean up static maps to prevent memory leaks
     this.buffering.cleanupStaticMaps(ids.threadId ?? ids.resourceId, ids.resourceId);
   }

@@ -15,6 +15,24 @@ import {
   createStorageErrorId,
   storageMessageMatchesMetadataFilter,
   validateStorageMetadataFilter,
+  applyWorkingMemorySnapshotUpdate,
+  assertGovernedThreadResourceUnchanged,
+  assertThreadWorkingMemoryRemoved,
+  assertThreadWorkingMemoryIsUngoverned,
+  assertWorkingMemorySnapshotUnchanged,
+  assertWorkingMemoryTransitionParticipant,
+  hasWorkingMemorySnapshotControls,
+  mergeThreadMetadataForWorkingMemoryTransition,
+  preserveWorkingMemorySnapshotControls,
+  readWorkingMemoryIncarnation,
+  readWorkingMemorySnapshot,
+  reincarnateWorkingMemorySnapshotMetadata,
+  retractObserverWorkingMemorySnapshot,
+  stripThreadWorkingMemoryMetadata,
+  writeWorkingMemorySnapshotMetadata,
+  WorkingMemoryRevisionConflictError,
+  WorkingMemoryValidationError,
+  assertObservationalMemoryClearExpectation,
 } from '@mastra/core/storage';
 
 /**
@@ -45,6 +63,27 @@ const SAFE_PAGINATION_ERROR_MESSAGES = new Set([
   'perPage must be false or a safe integer',
 ]);
 
+class ObservationalMemoryGenerationConflictError extends Error {
+  constructor() {
+    super('Observational memory generation is no longer current.');
+    this.name = 'ObservationalMemoryGenerationConflictError';
+  }
+}
+
+class ThreadCloneRollbackConflictError extends Error {
+  constructor(readonly reason: 'thread' | 'messages' | 'observational_memory') {
+    super(`Thread clone rollback conflict: ${reason}`);
+    this.name = 'ThreadCloneRollbackConflictError';
+  }
+}
+
+class MessageMutationConflictError extends Error {
+  constructor(readonly messageId: string) {
+    super(`Message ${messageId} changed concurrently while its observational memory was being retracted.`);
+    this.name = 'MessageMutationConflictError';
+  }
+}
+
 /**
  * Columns added to the OM table after its initial release.
  * Used in `alterTable({ ifNotExists })` so that databases created on older
@@ -74,7 +113,7 @@ export const OM_MIGRATION_COLUMNS: string[] = [
 
 /**
  * The OM schema is imported statically above: the peer dependency range
- * (`@mastra/core >= 1.49.0`) guarantees the export exists. This used to be a
+ * (`@mastra/core >= 1.58.0-alpha.11`) guarantees the export exists. This used to be a
  * dynamic `require` guarded by `typeof require === 'function'` for older core
  * versions, but esbuild rewrites the bare `require` identifier in the ESM
  * bundle to a shim that always throws, and the silent catch meant the
@@ -91,11 +130,15 @@ import type {
   CreateIndexOptions,
   StorageCloneThreadInput,
   StorageCloneThreadOutput,
+  StorageRollbackThreadCloneInput,
+  StorageRollbackThreadCloneResult,
+  StorageObservationalMemoryCloneReceipt,
   ThreadCloneMetadata,
   ObservationalMemoryRecord,
   ObservationalMemoryHistoryOptions,
   BufferedObservationChunk,
   CreateObservationalMemoryInput,
+  ClearObservationalMemoryOptions,
   UpdateActiveObservationsInput,
   UpdateBufferedObservationsInput,
   SwapBufferedToActiveInput,
@@ -113,6 +156,14 @@ import type {
   RetentionTablesDescriptor,
   TableRetentionPolicy,
   TABLE_NAMES,
+  ApplyWorkingMemoryUpdateInput,
+  WorkingMemorySnapshot,
+  WorkingMemorySnapshotInput,
+  StorageThreadToResourceWorkingMemoryTransitionPreparation,
+  StorageTransitionThreadToResourceWorkingMemoryInput,
+  StorageTransitionThreadToResourceWorkingMemoryOutput,
+  StorageMutateThreadWithWorkingMemoryInput,
+  StorageMutateThreadWithWorkingMemoryOutput,
 } from '@mastra/core/storage';
 import { parseSqlIdentifier } from '@mastra/core/utils';
 import type { TxClient } from '../../client';
@@ -136,8 +187,10 @@ type MessageRowFromDB = {
   createdAt: Date | string;
   createdAtZ?: Date | string;
   threadId: string;
-  resourceId: string;
+  resourceId: string | null;
 };
+
+type MessageCoordinateRow = Pick<MessageRowFromDB, 'id' | 'threadId' | 'resourceId'>;
 
 function getManagedWorkingMemoryScope(config: unknown): 'thread' | 'resource' | undefined {
   let parsed = config;
@@ -153,6 +206,91 @@ function getManagedWorkingMemoryScope(config: unknown): 'thread' | 'resource' | 
   }
   const scope = (parsed as Record<string, unknown>)._managedWorkingMemoryScope;
   return scope === 'thread' || scope === 'resource' ? scope : undefined;
+}
+
+function getManagedWorkingMemoryScopes(records: ReadonlyArray<{ config: unknown }>): Set<'thread' | 'resource'> {
+  const scopes = new Set<'thread' | 'resource'>();
+  for (const record of records) {
+    const scope = getManagedWorkingMemoryScope(record.config);
+    if (scope) scopes.add(scope);
+  }
+  return scopes;
+}
+
+function parseMetadata(value: unknown): Record<string, unknown> {
+  if (value === null || value === undefined) return {};
+  if (typeof value === 'string') {
+    try {
+      const parsed: unknown = JSON.parse(value);
+      if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      throw new WorkingMemoryValidationError('Stored metadata is invalid.');
+    }
+    throw new WorkingMemoryValidationError('Stored metadata is invalid.');
+  }
+  if (typeof value === 'object' && !Array.isArray(value)) return value as Record<string, unknown>;
+  throw new WorkingMemoryValidationError('Stored metadata is invalid.');
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+function mergeThreadMetadataPreservingWorkingMemory(
+  current: Record<string, unknown>,
+  update: Record<string, unknown>,
+): Record<string, unknown> {
+  const merged = { ...current, ...update };
+  const currentMastra = asRecord(current.mastra);
+  const updateMastra = asRecord(update.mastra);
+  if (Object.keys(currentMastra).length > 0 || Object.keys(updateMastra).length > 0) {
+    merged.mastra = { ...currentMastra, ...updateMastra };
+  }
+  const currentValue = typeof current.workingMemory === 'string' ? current.workingMemory : null;
+  assertWorkingMemorySnapshotUnchanged({
+    currentValue,
+    currentMetadata: current,
+    proposedValue: update.workingMemory,
+    proposedValueProvided: Object.prototype.hasOwnProperty.call(update, 'workingMemory'),
+    proposedMetadata: update,
+  });
+  if (!hasWorkingMemorySnapshotControls(current)) return merged;
+
+  const preserved = preserveWorkingMemorySnapshotControls(current, merged);
+  if (Object.prototype.hasOwnProperty.call(current, 'workingMemory')) preserved.workingMemory = current.workingMemory;
+  else delete preserved.workingMemory;
+  return preserved;
+}
+
+function replaceThreadMetadataPreservingWorkingMemory(
+  current: Record<string, unknown>,
+  proposed: Record<string, unknown> | undefined,
+): Record<string, unknown> {
+  const next = proposed ?? {};
+  const currentValue = typeof current.workingMemory === 'string' ? current.workingMemory : null;
+  assertWorkingMemorySnapshotUnchanged({
+    currentValue,
+    currentMetadata: current,
+    proposedValue: proposed?.workingMemory,
+    proposedValueProvided: proposed !== undefined && Object.prototype.hasOwnProperty.call(proposed, 'workingMemory'),
+    proposedMetadata: proposed,
+  });
+  if (!hasWorkingMemorySnapshotControls(current)) return next;
+  const preserved = preserveWorkingMemorySnapshotControls(current, next);
+  if (Object.prototype.hasOwnProperty.call(current, 'workingMemory')) preserved.workingMemory = current.workingMemory;
+  return preserved;
+}
+
+function mergeObservationalThreadMetadata(
+  current: Record<string, unknown>,
+  update: Record<string, unknown>,
+): Record<string, unknown> {
+  const currentMastra = asRecord(current.mastra);
+  const updateMastra = asRecord(update.mastra);
+  if (!Object.prototype.hasOwnProperty.call(updateMastra, 'om')) return current;
+  return { ...current, mastra: { ...currentMastra, om: updateMastra.om } };
 }
 
 function getSchemaName(schema?: string) {
@@ -201,9 +339,38 @@ function dedupeMessagesForSave(messages: MastraDBMessage[]): MastraDBMessage[] {
   return Array.from(deduped.values());
 }
 
+function hasSameUniqueStrings(left: readonly string[], right: readonly string[]): boolean {
+  if (left.length !== right.length || new Set(left).size !== left.length || new Set(right).size !== right.length) {
+    return false;
+  }
+  const sortedLeft = [...left].sort();
+  const sortedRight = [...right].sort();
+  return sortedLeft.every((value, index) => value === sortedRight[index]);
+}
+
+function sortedUniqueStrings(values: Iterable<string | null | undefined>): string[] {
+  return [...new Set([...values].filter((value): value is string => typeof value === 'string'))].sort();
+}
+
+function hasSameMessageCoordinates(
+  left: readonly MessageCoordinateRow[],
+  right: readonly MessageCoordinateRow[],
+): boolean {
+  if (left.length !== right.length) return false;
+  const rightById = new Map(right.map(message => [message.id, message]));
+  return left.every(message => {
+    const current = rightById.get(message.id);
+    return current?.threadId === message.threadId && current.resourceId === message.resourceId;
+  });
+}
+
 export class MemoryPG extends MemoryStorage {
   readonly supportsObservationalMemory = true;
   readonly supportsAtomicObservationalMemoryRetraction = true;
+  readonly supportsRevisionedWorkingMemory = true;
+  readonly supportsThreadUpdatedBeforeFilter = true;
+  readonly supportsAtomicThreadCloneRollback = true;
+  readonly supportsThreadCloneSourceSnapshot = true;
 
   /**
    * Retention-eligible tables. `threads`, `messages`, and `resources` all anchor
@@ -581,6 +748,19 @@ export class MemoryPG extends MemoryStorage {
 
     const perPage = normalizePerPage(perPageInput, 100);
 
+    if (
+      filter?.updatedBefore !== undefined &&
+      (!(filter.updatedBefore instanceof Date) || Number.isNaN(filter.updatedBefore.getTime()))
+    ) {
+      throw new MastraError({
+        id: createStorageErrorId('PG', 'LIST_THREADS', 'INVALID_UPDATED_BEFORE'),
+        domain: ErrorDomain.STORAGE,
+        category: ErrorCategory.USER,
+        text: 'updatedBefore must be a valid Date',
+        details: { hasUpdatedBeforeFilter: true },
+      });
+    }
+
     // Validate metadata keys to prevent SQL injection
     try {
       this.validateMetadataKeys(filter?.metadata);
@@ -610,9 +790,15 @@ export class MemoryPG extends MemoryStorage {
         paramIndex++;
       }
 
+      if (filter?.updatedBefore) {
+        whereClauses.push(`COALESCE("updatedAtZ", "updatedAt") < $${paramIndex}`);
+        queryParams.push(filter.updatedBefore);
+        paramIndex++;
+      }
+
       // Add metadata filters if provided (AND logic)
       // Uses JSONB containment (@>) to avoid SQL injection and correctly match all value types including null
-      // metadata column is TEXT type storing JSON, so we need to cast to jsonb first
+      // Cast through JSONB so filters work with both current JSONB and legacy TEXT columns.
       if (filter?.metadata && Object.keys(filter.metadata).length > 0) {
         for (const [key, value] of Object.entries(filter.metadata)) {
           // Use JSONB containment operator - no key interpolation needed
@@ -666,7 +852,7 @@ export class MemoryPG extends MemoryStorage {
         hasMore: perPageInput === false ? false : offset + perPage < total,
       };
     } catch (rawError) {
-      throw this.createAndTrackSafeReadError({
+      throw this.createAndTrackSafeStorageError({
         operation: 'LIST_THREADS',
         text: 'Failed to list PostgreSQL threads',
         details: {
@@ -680,43 +866,67 @@ export class MemoryPG extends MemoryStorage {
   }
 
   async saveThread({ thread }: { thread: StorageThreadType }): Promise<StorageThreadType> {
+    const tableName = getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) });
     try {
-      const tableName = getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) });
       const createdAt = toUtcISOString(thread.createdAt);
       const updatedAt = toUtcISOString(thread.updatedAt);
-      await this.#db.client.none(
-        `INSERT INTO ${tableName} (
-          id,
-          "resourceId",
-          title,
-          metadata,
-          "createdAt",
-          "createdAtZ",
-          "updatedAt",
-          "updatedAtZ"
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        ON CONFLICT (id) DO UPDATE SET
-          "resourceId" = EXCLUDED."resourceId",
-          title = EXCLUDED.title,
-          metadata = EXCLUDED.metadata,
-          "createdAt" = EXCLUDED."createdAt",
-          "createdAtZ" = EXCLUDED."createdAtZ",
-          "updatedAt" = EXCLUDED."updatedAt",
-          "updatedAtZ" = EXCLUDED."updatedAtZ"`,
-        [
-          thread.id,
-          thread.resourceId,
-          thread.title,
-          thread.metadata ? JSON.stringify(thread.metadata) : null,
-          createdAt,
-          createdAt,
-          updatedAt,
-          updatedAt,
-        ],
-      );
-
-      return thread;
+      return await this.#db.client.tx(async t => {
+        await this.lockThreadLifecycles(t, [thread.id]);
+        await this.lockWorkingMemoryTarget(t, 'thread', thread.id);
+        const currentRow = await t.oneOrNone<{ resourceId: string; metadata: unknown }>(
+          `SELECT "resourceId", metadata FROM ${tableName} WHERE id = $1 FOR UPDATE`,
+          [thread.id],
+        );
+        const currentMetadata = currentRow ? parseMetadata(currentRow.metadata) : undefined;
+        if (currentRow) {
+          assertGovernedThreadResourceUnchanged({
+            currentResourceId: currentRow.resourceId,
+            currentMetadata,
+            proposedResourceId: thread.resourceId,
+          });
+        }
+        const proposedMetadata = currentMetadata
+          ? replaceThreadMetadataPreservingWorkingMemory(currentMetadata, thread.metadata)
+          : (thread.metadata ?? {});
+        const metadata =
+          currentMetadata && hasWorkingMemorySnapshotControls(currentMetadata)
+            ? proposedMetadata
+            : (reincarnateWorkingMemorySnapshotMetadata(proposedMetadata) ?? {});
+        const row = await t.one<StorageThreadType & { createdAtZ: Date | string; updatedAtZ: Date | string }>(
+          `INSERT INTO ${tableName} (
+            id, "resourceId", title, metadata, "createdAt", "createdAtZ", "updatedAt", "updatedAtZ"
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+          ON CONFLICT (id) DO UPDATE SET
+            "resourceId" = EXCLUDED."resourceId",
+            title = EXCLUDED.title,
+            metadata = EXCLUDED.metadata,
+            "createdAt" = EXCLUDED."createdAt",
+            "createdAtZ" = EXCLUDED."createdAtZ",
+            "updatedAt" = EXCLUDED."updatedAt",
+            "updatedAtZ" = EXCLUDED."updatedAtZ"
+          RETURNING *`,
+          [
+            thread.id,
+            thread.resourceId,
+            thread.title,
+            JSON.stringify(metadata),
+            createdAt,
+            createdAt,
+            updatedAt,
+            updatedAt,
+          ],
+        );
+        return {
+          id: row.id,
+          resourceId: row.resourceId,
+          title: row.title,
+          metadata: parseMetadata(row.metadata),
+          createdAt: new Date(row.createdAtZ || row.createdAt),
+          updatedAt: new Date(row.updatedAtZ || row.updatedAt),
+        };
+      });
     } catch (error) {
+      if (error instanceof WorkingMemoryValidationError) throw error;
       throw new MastraError(
         {
           id: createStorageErrorId('PG', 'SAVE_THREAD', 'FAILED'),
@@ -741,30 +951,33 @@ export class MemoryPG extends MemoryStorage {
     metadata?: Record<string, unknown>;
   }): Promise<StorageThreadType> {
     const threadTableName = getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) });
-    const existingThread = await this.getThreadById({ threadId: id });
-    if (!existingThread) {
-      throw new MastraError({
-        id: createStorageErrorId('PG', 'UPDATE_THREAD', 'FAILED'),
-        domain: ErrorDomain.STORAGE,
-        category: ErrorCategory.USER,
-        text: `Thread ${id} not found`,
-        details: {
-          threadId: id,
-          title: title ?? null,
-        },
-      });
-    }
-
-    const mergedMetadata = {
-      ...existingThread.metadata,
-      ...metadata,
-    };
-
     try {
-      const now = new Date();
-      const nowStr = toUtcISOString(now);
-      const thread = await this.#db.client.one<StorageThreadType & { createdAtZ: Date; updatedAtZ: Date }>(
-        `UPDATE ${threadTableName}
+      return await this.#db.client.tx(async t => {
+        await this.lockWorkingMemoryTarget(t, 'thread', id);
+        const existingThread = await t.oneOrNone<StorageThreadType & { createdAtZ: Date; updatedAtZ: Date }>(
+          `SELECT * FROM ${threadTableName} WHERE id = $1 FOR UPDATE`,
+          [id],
+        );
+        if (!existingThread) {
+          throw new MastraError({
+            id: createStorageErrorId('PG', 'UPDATE_THREAD', 'FAILED'),
+            domain: ErrorDomain.STORAGE,
+            category: ErrorCategory.USER,
+            text: `Thread ${id} not found`,
+            details: { threadId: id, title: title ?? null },
+          });
+        }
+        const currentMetadata = parseMetadata(existingThread.metadata);
+        const proposedMetadata =
+          metadata === undefined
+            ? currentMetadata
+            : mergeThreadMetadataPreservingWorkingMemory(currentMetadata, metadata);
+        const mergedMetadata = hasWorkingMemorySnapshotControls(currentMetadata)
+          ? proposedMetadata
+          : (reincarnateWorkingMemorySnapshotMetadata(proposedMetadata) ?? {});
+        const nowStr = toUtcISOString(new Date());
+        const thread = await t.one<StorageThreadType & { createdAtZ: Date; updatedAtZ: Date }>(
+          `UPDATE ${threadTableName}
                     SET
                         title = COALESCE($1, title),
                         metadata = $2,
@@ -773,18 +986,21 @@ export class MemoryPG extends MemoryStorage {
                     WHERE id = $5
                     RETURNING *
                 `,
-        [title ?? null, mergedMetadata, nowStr, nowStr, id],
-      );
+          [title ?? null, mergedMetadata, nowStr, nowStr, id],
+        );
 
-      return {
-        id: thread.id,
-        resourceId: thread.resourceId,
-        title: thread.title,
-        metadata: typeof thread.metadata === 'string' ? JSON.parse(thread.metadata) : thread.metadata,
-        createdAt: thread.createdAtZ || thread.createdAt,
-        updatedAt: thread.updatedAtZ || thread.updatedAt,
-      };
+        return {
+          id: thread.id,
+          resourceId: thread.resourceId,
+          title: thread.title,
+          metadata: parseMetadata(thread.metadata),
+          createdAt: thread.createdAtZ || thread.createdAt,
+          updatedAt: thread.updatedAtZ || thread.updatedAt,
+        };
+      });
     } catch (error) {
+      if (error instanceof MastraError) throw error;
+      if (error instanceof WorkingMemoryValidationError) throw error;
       throw new MastraError(
         {
           id: createStorageErrorId('PG', 'UPDATE_THREAD', 'FAILED'),
@@ -812,7 +1028,8 @@ export class MemoryPG extends MemoryStorage {
       const threadTableName = getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) });
       let committedRetraction: ObservationalMemoryRetractionReceipt | undefined;
       await this.#db.client.tx(async t => {
-        const thread = await t.oneOrNone<{ resourceId: string }>(
+        await this.lockThreadLifecycles(t, [threadId]);
+        const threadSnapshot = await t.oneOrNone<{ resourceId: string }>(
           `SELECT "resourceId" FROM ${threadTableName} WHERE id = $1`,
           [threadId],
         );
@@ -822,17 +1039,25 @@ export class MemoryPG extends MemoryStorage {
           [schemaName, OM_TABLE],
         );
         let retraction: RetractObservationalMemoryResult | undefined;
-        if (thread?.resourceId) {
+        if (threadSnapshot?.resourceId) {
           if (omTableExists !== null) {
             const input = {
-              resourceId: thread.resourceId,
+              resourceId: threadSnapshot.resourceId,
               threadId,
             };
             retraction = await this.retractObservationalMemoryInTransaction(t, input);
             committedRetraction = { input, result: retraction };
           } else {
-            await this.lockObservationalMemoryResource(t, thread.resourceId);
+            await this.lockObservationalMemoryResource(t, threadSnapshot.resourceId);
           }
+        }
+
+        const thread = await t.oneOrNone<{ resourceId: string }>(
+          `SELECT "resourceId" FROM ${threadTableName} WHERE id = $1 FOR UPDATE`,
+          [threadId],
+        );
+        if (thread?.resourceId !== threadSnapshot?.resourceId) {
+          throw new Error(`Thread ${threadId} changed resources while it was being deleted.`);
         }
 
         await t.none(`DELETE FROM ${tableName} WHERE thread_id = $1`, [threadId]);
@@ -856,7 +1081,9 @@ export class MemoryPG extends MemoryStorage {
           const vectorTableName = getTableName({ indexName: tablename, schemaName: getSchemaName(this.#schema) });
           const isObservationTable =
             tablename === 'memory_observations' || tablename.startsWith('memory_observations_');
-          const clearedResourceId = retraction?.clearedScopes.includes('resource') ? thread?.resourceId : undefined;
+          const clearedResourceId = retraction?.clearedScopes.includes('resource')
+            ? threadSnapshot?.resourceId
+            : undefined;
           if (isObservationTable && clearedResourceId) {
             await t.none(`DELETE FROM ${vectorTableName} WHERE metadata->>'resource_id' = $1`, [clearedResourceId]);
           } else {
@@ -1052,28 +1279,32 @@ export class MemoryPG extends MemoryStorage {
       role: normalized.role as MastraDBMessage['role'],
       createdAt: new Date(normalized.createdAt as string),
       threadId: normalized.threadId,
-      resourceId: normalized.resourceId,
+      resourceId: normalized.resourceId ?? undefined,
       ...(normalized.type && normalized.type !== 'v2' ? { type: normalized.type } : {}),
     } satisfies MastraDBMessage;
   }
 
-  private createAndTrackSafeReadError({
+  private createAndTrackSafeStorageError({
     operation,
     text,
-    details,
+    details = {},
     rawError,
   }: {
+    // Pinned Prettier and Oxfmt disagree on this union's line wrapping.
+    // prettier-ignore
     operation:
       | 'LIST_THREADS'
       | 'LIST_MESSAGES_BY_ID'
       | 'HAS_MESSAGES'
       | 'LIST_MESSAGES'
-      | 'LIST_MESSAGES_BY_RESOURCE_ID';
+      | 'LIST_MESSAGES_BY_RESOURCE_ID'
+      | 'SAVE_RESOURCE'
+      | 'UPDATE_RESOURCE';
     text: string;
-    details: Record<string, string | number | boolean>;
+    details?: Record<string, string | number | boolean>;
     rawError: unknown;
   }): MastraError {
-    const failureCode = this.getSafeReadFailureCode(rawError);
+    const failureCode = this.getSafeStorageFailureCode(rawError);
     const definition = {
       id: createStorageErrorId('PG', operation, 'FAILED'),
       domain: ErrorDomain.STORAGE,
@@ -1092,7 +1323,7 @@ export class MemoryPG extends MemoryStorage {
     return error;
   }
 
-  private getSafeReadFailureCode(error: unknown): string | undefined {
+  private getSafeStorageFailureCode(error: unknown): string | undefined {
     try {
       if ((typeof error !== 'object' && typeof error !== 'function') || error === null) return undefined;
       const code = (error as { code?: unknown }).code;
@@ -1153,7 +1384,7 @@ export class MemoryPG extends MemoryStorage {
       );
       return { messages: list.get.all.db() };
     } catch (rawError) {
-      throw this.createAndTrackSafeReadError({
+      throw this.createAndTrackSafeStorageError({
         operation: 'LIST_MESSAGES_BY_ID',
         text: 'Failed to list PostgreSQL messages by ID',
         details: { messageIdCount: messageIds.length },
@@ -1199,7 +1430,7 @@ export class MemoryPG extends MemoryStorage {
       );
       return result.exists;
     } catch (rawError) {
-      throw this.createAndTrackSafeReadError({
+      throw this.createAndTrackSafeStorageError({
         operation: 'HAS_MESSAGES',
         text: 'Failed to check for PostgreSQL messages',
         details: { hasResourceId: resourceId !== undefined, threadIdCount: threadIds.length },
@@ -1436,7 +1667,7 @@ export class MemoryPG extends MemoryStorage {
         hasMore,
       };
     } catch (rawError) {
-      throw this.createAndTrackSafeReadError({
+      throw this.createAndTrackSafeStorageError({
         operation: 'LIST_MESSAGES',
         text: 'Failed to list PostgreSQL messages',
         details: {
@@ -1629,7 +1860,7 @@ export class MemoryPG extends MemoryStorage {
         hasMore,
       };
     } catch (rawError) {
-      throw this.createAndTrackSafeReadError({
+      throw this.createAndTrackSafeStorageError({
         operation: 'LIST_MESSAGES_BY_RESOURCE_ID',
         text: 'Failed to list PostgreSQL messages by resource ID',
         details: {
@@ -1688,7 +1919,21 @@ export class MemoryPG extends MemoryStorage {
       }
 
       const messagesToSave = dedupeMessagesForSave(messages);
+      const threadTableName = getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) });
       await this.#db.client.tx(async t => {
+        await this.lockThreadLifecycles(t, threadIds);
+        const sortedThreadIds = sortedUniqueStrings(threadIds);
+        const lockedThreads = await this.lockThreadRows(t, sortedThreadIds);
+        if (
+          !hasSameUniqueStrings(
+            lockedThreads.map(thread => thread.id),
+            sortedThreadIds,
+          )
+        ) {
+          const lockedThreadIds = new Set(lockedThreads.map(thread => thread.id));
+          const missingThreadId = sortedThreadIds.find(threadId => !lockedThreadIds.has(threadId));
+          throw new Error(`Thread ${missingThreadId ?? sortedThreadIds[0]} no longer exists.`);
+        }
         for (let offset = 0; offset < messagesToSave.length; offset += MAX_MESSAGES_PER_INSERT) {
           const batch = messagesToSave.slice(offset, offset + MAX_MESSAGES_PER_INSERT);
           const values: unknown[] = [];
@@ -1727,7 +1972,6 @@ export class MemoryPG extends MemoryStorage {
           );
         }
 
-        const threadTableName = getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) });
         const now = toUtcISOString(new Date());
         for (const threadIdToUpdate of threadIds) {
           await t.none(
@@ -1791,43 +2035,70 @@ export class MemoryPG extends MemoryStorage {
       return [];
     }
 
-    const messageIds = messages.map(m => m.id);
-
-    const selectQuery = `SELECT id, content, role, type, "createdAt", "createdAtZ", thread_id AS "threadId", "resourceId" FROM ${getTableName({ indexName: TABLE_MESSAGES, schemaName: getSchemaName(this.#schema) })} WHERE id IN (${inPlaceholders(messageIds.length)})`;
-
-    const existingMessagesDb = await this.#db.client.manyOrNone(selectQuery, messageIds);
-
-    if (existingMessagesDb.length === 0) {
-      return [];
-    }
-
-    const existingMessages: MastraDBMessage[] = existingMessagesDb.map(msg => {
-      if (typeof msg.content === 'string') {
-        try {
-          msg.content = JSON.parse(msg.content);
-        } catch {
-          // ignore if not valid json
-        }
-      }
-      return msg as MastraDBMessage;
+    const updatesById = new Map(messages.map(message => [message.id, message]));
+    const messageIds = [...updatesById.keys()];
+    const messageTableName = getTableName({
+      indexName: TABLE_MESSAGES,
+      schemaName: getSchemaName(this.#schema),
     });
+    const threadTableName = getTableName({
+      indexName: TABLE_THREADS,
+      schemaName: getSchemaName(this.#schema),
+    });
+    const selectQuery = `SELECT id, content, role, type, "createdAt", "createdAtZ", thread_id AS "threadId", "resourceId"
+      FROM ${messageTableName}
+      WHERE id IN (${inPlaceholders(messageIds.length)})
+      ORDER BY id`;
 
-    const threadIdsToUpdate = new Set<string>();
+    let existingMessages: MastraDBMessage[] = [];
     const committedRetractions: ObservationalMemoryRetractionReceipt[] = [];
 
     await this.#db.client.tx(async t => {
+      // This first read intentionally takes no row lock: OM advisory locks must
+      // precede thread/message row locks. Shared thread lifecycle locks and the
+      // authoritative checks below turn coordinate drift into a rolled-back
+      // conflict instead of retracting A and then mutating a message now at B.
+      const discoveredRows = await t.manyOrNone<MessageRowFromDB>(selectQuery, messageIds);
+      if (discoveredRows.length === 0) return;
+
+      const mutationThreadIds = sortedUniqueStrings(
+        discoveredRows.flatMap(message => [message.threadId, updatesById.get(message.id)?.threadId]),
+      );
+      await this.lockThreadLifecycles(t, mutationThreadIds);
+
+      const coordinateRows = await t.manyOrNone<MessageRowFromDB>(selectQuery, messageIds);
+      if (!hasSameMessageCoordinates(discoveredRows, coordinateRows)) {
+        throw new MessageMutationConflictError(messageIds[0]!);
+      }
+
+      const discoveredThreadRows =
+        mutationThreadIds.length === 0
+          ? []
+          : await t.manyOrNone<{ id: string; resourceId: string }>(
+              `SELECT id, "resourceId" FROM ${threadTableName}
+               WHERE id IN (${inPlaceholders(mutationThreadIds.length)})
+               ORDER BY id`,
+              mutationThreadIds,
+            );
+      const threadResources = new Map(discoveredThreadRows.map(thread => [thread.id, thread.resourceId]));
+
       if (retractObservationalMemory) {
-        const updatesById = new Map(messages.map(message => [message.id, message]));
-        const retractionRows = existingMessages.flatMap(existingMessage => {
+        const retractionRows = coordinateRows.flatMap(existingMessage => {
           const update = updatesById.get(existingMessage.id);
           const destinationThreadId = update?.threadId ?? existingMessage.threadId;
+          const sourceResourceId = existingMessage.resourceId ?? threadResources.get(existingMessage.threadId);
           return [
-            existingMessage,
+            {
+              threadId: existingMessage.threadId,
+              resourceId: sourceResourceId,
+            },
             {
               threadId: destinationThreadId,
               resourceId:
                 update?.resourceId ??
-                (destinationThreadId === existingMessage.threadId ? existingMessage.resourceId : undefined),
+                (destinationThreadId === existingMessage.threadId
+                  ? sourceResourceId
+                  : threadResources.get(destinationThreadId)),
             },
           ];
         });
@@ -1836,13 +2107,42 @@ export class MemoryPG extends MemoryStorage {
         );
       }
 
-      const queries = [];
+      const lockedThreadRows = await this.lockThreadRows(t, mutationThreadIds);
+      if (
+        discoveredThreadRows.length !== lockedThreadRows.length ||
+        discoveredThreadRows.some(
+          discovered =>
+            lockedThreadRows.find(locked => locked.id === discovered.id)?.resourceId !== discovered.resourceId,
+        )
+      ) {
+        throw new MessageMutationConflictError(messageIds[0]!);
+      }
+
+      const lockedMessageRows = await this.lockMessageRows(t, messageTableName, messageIds);
+      if (!hasSameMessageCoordinates(coordinateRows, lockedMessageRows)) {
+        throw new MessageMutationConflictError(messageIds[0]!);
+      }
+
+      existingMessages = lockedMessageRows.map(row => {
+        const normalized = this.normalizeMessageRow(row);
+        if (typeof normalized.content === 'string') {
+          try {
+            return { ...normalized, content: JSON.parse(normalized.content) } as MastraDBMessage;
+          } catch {
+            // Preserve non-JSON message content exactly as stored.
+          }
+        }
+        return normalized as MastraDBMessage;
+      });
+
+      const lockedRowsById = new Map(lockedMessageRows.map(message => [message.id, message]));
+      const threadIdsToUpdate = new Set<string>();
       const columnMapping: Record<string, string> = {
         threadId: 'thread_id',
       };
 
       for (const existingMessage of existingMessages) {
-        const updatePayload = messages.find(m => m.id === existingMessage.id);
+        const updatePayload = updatesById.get(existingMessage.id);
         if (!updatePayload) continue;
 
         const { id, ...fieldsToUpdate } = updatePayload;
@@ -1886,27 +2186,35 @@ export class MemoryPG extends MemoryStorage {
         }
 
         if (setClauses.length > 0) {
-          values.push(id);
-          const sql = `UPDATE ${getTableName({ indexName: TABLE_MESSAGES, schemaName: getSchemaName(this.#schema) })} SET ${setClauses.join(', ')} WHERE id = $${paramIndex}`;
-          queries.push(t.none(sql, values));
+          const lockedRow = lockedRowsById.get(id);
+          if (!lockedRow) throw new MessageMutationConflictError(id);
+          values.push(id, lockedRow.threadId, lockedRow.resourceId);
+          const updated = await t.oneOrNone<{ id: string }>(
+            `UPDATE ${messageTableName}
+             SET ${setClauses.join(', ')}
+             WHERE id = $${paramIndex++}
+               AND thread_id = $${paramIndex++}
+               AND "resourceId" IS NOT DISTINCT FROM $${paramIndex}
+             RETURNING id`,
+            values,
+          );
+          if (!updated) throw new MessageMutationConflictError(id);
         }
       }
 
       if (threadIdsToUpdate.size > 0) {
-        const threadIds = Array.from(threadIdsToUpdate);
-        queries.push(
-          t.none(
-            `UPDATE ${getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) })} SET "updatedAt" = NOW(), "updatedAtZ" = NOW() WHERE id IN (${inPlaceholders(threadIds.length)})`,
-            threadIds,
-          ),
+        const threadIds = [...threadIdsToUpdate].sort();
+        await t.none(
+          `UPDATE ${threadTableName}
+           SET "updatedAt" = NOW(), "updatedAtZ" = NOW()
+           WHERE id IN (${inPlaceholders(threadIds.length)})`,
+          threadIds,
         );
-      }
-
-      if (queries.length > 0) {
-        await t.batch(queries);
       }
     });
     observationalMemoryRetractions?.push(...committedRetractions);
+
+    if (existingMessages.length === 0) return [];
 
     const updatedMessages = await this.#db.client.manyOrNone<MessageRowFromDB>(selectQuery, messageIds);
 
@@ -1941,21 +2249,64 @@ export class MemoryPG extends MemoryStorage {
 
       await this.#db.client.tx(async t => {
         const placeholders = messageIds.map((_, idx) => `$${idx + 1}`).join(',');
-        const messages = await t.manyOrNone<{ threadId: string; resourceId: string | null }>(
-          `SELECT DISTINCT
+        const coordinateQuery = `SELECT
+             messages.id,
              messages.thread_id AS "threadId",
-             COALESCE(messages."resourceId", threads."resourceId") AS "resourceId"
+             messages."resourceId",
+             COALESCE(messages."resourceId", threads."resourceId") AS "resolvedResourceId"
            FROM ${messageTableName} AS messages
            LEFT JOIN ${threadTableName} AS threads ON threads.id = messages.thread_id
-           WHERE messages.id IN (${placeholders})`,
-          messageIds,
-        );
+           WHERE messages.id IN (${placeholders})
+           ORDER BY messages.id`;
+        const discoveredMessages = await t.manyOrNone<{
+          id: string;
+          threadId: string;
+          resourceId: string | null;
+          resolvedResourceId: string | null;
+        }>(coordinateQuery, messageIds);
+        if (discoveredMessages.length === 0) return;
 
-        if (options?.retractObservationalMemory) {
-          committedRetractions.push(...(await this.retractObservationalMemoryForMessageRowsInTransaction(t, messages)));
+        const threadIds = sortedUniqueStrings(discoveredMessages.map(message => message.threadId));
+        await this.lockThreadLifecycles(t, threadIds);
+
+        const messages = await t.manyOrNone<{
+          id: string;
+          threadId: string;
+          resourceId: string | null;
+          resolvedResourceId: string | null;
+        }>(coordinateQuery, messageIds);
+        if (!hasSameMessageCoordinates(discoveredMessages, messages)) {
+          throw new MessageMutationConflictError(messageIds[0]!);
         }
 
-        const threadIds = messages?.map(message => message.threadId).filter(Boolean) || [];
+        if (options?.retractObservationalMemory) {
+          committedRetractions.push(
+            ...(await this.retractObservationalMemoryForMessageRowsInTransaction(
+              t,
+              messages.map(message => ({
+                threadId: message.threadId,
+                resourceId: message.resolvedResourceId,
+              })),
+            )),
+          );
+        }
+
+        const lockedThreadRows = await this.lockThreadRows(t, threadIds);
+        const threadResources = new Map(lockedThreadRows.map(thread => [thread.id, thread.resourceId]));
+        if (
+          messages.some(
+            message =>
+              message.resourceId === null &&
+              (threadResources.get(message.threadId) ?? null) !== message.resolvedResourceId,
+          )
+        ) {
+          throw new MessageMutationConflictError(messageIds[0]!);
+        }
+
+        const lockedMessages = await this.lockMessageRows(t, messageTableName, messageIds);
+        if (!hasSameMessageCoordinates(messages, lockedMessages)) {
+          throw new MessageMutationConflictError(messageIds[0]!);
+        }
 
         await t.none(`DELETE FROM ${messageTableName} WHERE id IN (${placeholders})`, messageIds);
 
@@ -2003,17 +2354,65 @@ export class MemoryPG extends MemoryStorage {
   async saveResource({ resource }: { resource: StorageResourceType }): Promise<StorageResourceType> {
     const createdAt = toUtcISOString(resource.createdAt);
     const updatedAt = toUtcISOString(resource.updatedAt);
-    await this.#db.insert({
-      tableName: TABLE_RESOURCES,
-      record: {
-        ...resource,
-        metadata: JSON.stringify(resource.metadata),
-        createdAt,
-        updatedAt,
-      },
+    const tableName = getTableName({ indexName: TABLE_RESOURCES, schemaName: getSchemaName(this.#schema) });
+    const write = this.#db.client.tx(async t => {
+      await this.lockWorkingMemoryTarget(t, 'resource', resource.id);
+      const current = await t.oneOrNone<{ workingMemory: string | null; metadata: unknown }>(
+        `SELECT "workingMemory", metadata FROM ${tableName} WHERE id = $1 FOR UPDATE`,
+        [resource.id],
+      );
+      const currentMetadata = current ? parseMetadata(current.metadata) : undefined;
+      assertWorkingMemorySnapshotUnchanged({
+        currentValue: current?.workingMemory,
+        currentMetadata,
+        proposedValue: resource.workingMemory,
+        proposedValueProvided: Object.prototype.hasOwnProperty.call(resource, 'workingMemory'),
+        proposedMetadata: resource.metadata,
+      });
+      const governed = currentMetadata && hasWorkingMemorySnapshotControls(currentMetadata);
+      const metadata = governed
+        ? preserveWorkingMemorySnapshotControls(currentMetadata, resource.metadata ?? {})
+        : (reincarnateWorkingMemorySnapshotMetadata(resource.metadata) ?? {});
+      const row = await t.one<StorageResourceType & { createdAtZ: Date | string; updatedAtZ: Date | string }>(
+        `INSERT INTO ${tableName}
+             (id, "workingMemory", metadata, "createdAt", "createdAtZ", "updatedAt", "updatedAtZ")
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
+           ON CONFLICT (id) DO UPDATE SET
+             "workingMemory" = EXCLUDED."workingMemory",
+             metadata = EXCLUDED.metadata,
+             "createdAt" = EXCLUDED."createdAt",
+             "createdAtZ" = EXCLUDED."createdAtZ",
+             "updatedAt" = EXCLUDED."updatedAt",
+             "updatedAtZ" = EXCLUDED."updatedAtZ"
+           RETURNING *`,
+        [
+          resource.id,
+          governed ? current?.workingMemory : resource.workingMemory,
+          JSON.stringify(metadata),
+          createdAt,
+          createdAt,
+          updatedAt,
+          updatedAt,
+        ],
+      );
+      return {
+        id: row.id,
+        workingMemory: row.workingMemory,
+        metadata: parseMetadata(row.metadata),
+        createdAt: new Date(row.createdAtZ || row.createdAt),
+        updatedAt: new Date(row.updatedAtZ || row.updatedAt),
+      };
     });
-
-    return resource;
+    try {
+      return await write;
+    } catch (rawError) {
+      if (rawError instanceof WorkingMemoryValidationError) throw rawError;
+      throw this.createAndTrackSafeStorageError({
+        operation: 'SAVE_RESOURCE',
+        text: 'Failed to save PostgreSQL memory resource',
+        rawError,
+      });
+    }
   }
 
   async updateResource({
@@ -2025,58 +2424,86 @@ export class MemoryPG extends MemoryStorage {
     workingMemory?: string;
     metadata?: Record<string, unknown>;
   }): Promise<StorageResourceType> {
-    const existingResource = await this.getResourceById({ resourceId });
-
-    if (!existingResource) {
-      const newResource: StorageResourceType = {
-        id: resourceId,
-        workingMemory,
-        metadata: metadata || {},
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      };
-      return this.saveResource({ resource: newResource });
-    }
-
-    const updatedResource = {
-      ...existingResource,
-      workingMemory: workingMemory !== undefined ? workingMemory : existingResource.workingMemory,
-      metadata: {
-        ...existingResource.metadata,
-        ...metadata,
-      },
-      updatedAt: new Date(),
-    };
-
     const tableName = getTableName({ indexName: TABLE_RESOURCES, schemaName: getSchemaName(this.#schema) });
+    const write = this.#db.client.tx(async t => {
+      await this.lockWorkingMemoryTarget(t, 'resource', resourceId);
+      const current = await t.oneOrNone<StorageResourceType & { createdAtZ: Date | string; updatedAtZ: Date | string }>(
+        `SELECT * FROM ${tableName} WHERE id = $1 FOR UPDATE`,
+        [resourceId],
+      );
+      const currentMetadata = current ? parseMetadata(current.metadata) : undefined;
+      assertWorkingMemorySnapshotUnchanged({
+        currentValue: current?.workingMemory,
+        currentMetadata,
+        proposedValue: workingMemory,
+        proposedValueProvided: workingMemory !== undefined,
+        proposedMetadata: metadata,
+      });
+      const now = new Date();
+      if (!current) {
+        const row = await t.one<StorageResourceType & { createdAtZ: Date | string; updatedAtZ: Date | string }>(
+          `INSERT INTO ${tableName}
+               (id, "workingMemory", metadata, "createdAt", "createdAtZ", "updatedAt", "updatedAtZ")
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             RETURNING *`,
+          [
+            resourceId,
+            workingMemory,
+            JSON.stringify(reincarnateWorkingMemorySnapshotMetadata(metadata) ?? {}),
+            now.toISOString(),
+            now.toISOString(),
+            now.toISOString(),
+            now.toISOString(),
+          ],
+        );
+        return {
+          id: row.id,
+          workingMemory: row.workingMemory,
+          metadata: parseMetadata(row.metadata),
+          createdAt: new Date(row.createdAtZ || row.createdAt),
+          updatedAt: new Date(row.updatedAtZ || row.updatedAt),
+        };
+      }
 
-    const updates: string[] = [];
-    const values: any[] = [];
-    let paramIndex = 1;
-
-    if (workingMemory !== undefined) {
-      updates.push(`"workingMemory" = $${paramIndex}`);
-      values.push(workingMemory);
-      paramIndex++;
+      const governed = hasWorkingMemorySnapshotControls(currentMetadata);
+      const proposedMetadata = preserveWorkingMemorySnapshotControls(currentMetadata, {
+        ...currentMetadata,
+        ...metadata,
+      });
+      const mergedMetadata = governed
+        ? proposedMetadata
+        : (reincarnateWorkingMemorySnapshotMetadata(proposedMetadata) ?? {});
+      const row = await t.one<StorageResourceType & { createdAtZ: Date | string; updatedAtZ: Date | string }>(
+        `UPDATE ${tableName}
+           SET "workingMemory" = $1, metadata = $2, "updatedAt" = $3, "updatedAtZ" = $4
+           WHERE id = $5
+           RETURNING *`,
+        [
+          governed || workingMemory === undefined ? current.workingMemory : workingMemory,
+          JSON.stringify(mergedMetadata),
+          now.toISOString(),
+          now.toISOString(),
+          resourceId,
+        ],
+      );
+      return {
+        id: row.id,
+        workingMemory: row.workingMemory,
+        metadata: parseMetadata(row.metadata),
+        createdAt: new Date(row.createdAtZ || row.createdAt),
+        updatedAt: new Date(row.updatedAtZ || row.updatedAt),
+      };
+    });
+    try {
+      return await write;
+    } catch (rawError) {
+      if (rawError instanceof WorkingMemoryValidationError) throw rawError;
+      throw this.createAndTrackSafeStorageError({
+        operation: 'UPDATE_RESOURCE',
+        text: 'Failed to update PostgreSQL memory resource',
+        rawError,
+      });
     }
-
-    if (metadata) {
-      updates.push(`metadata = $${paramIndex}`);
-      values.push(JSON.stringify(updatedResource.metadata));
-      paramIndex++;
-    }
-
-    const updatedAtStr = updatedResource.updatedAt.toISOString();
-    updates.push(`"updatedAt" = $${paramIndex++}`);
-    values.push(updatedAtStr);
-    updates.push(`"updatedAtZ" = $${paramIndex++}`);
-    values.push(updatedAtStr);
-
-    values.push(resourceId);
-
-    await this.#db.client.none(`UPDATE ${tableName} SET ${updates.join(', ')} WHERE id = $${paramIndex}`, values);
-
-    return updatedResource;
   }
 
   async updateResourceFromObservationalMemory({
@@ -2095,7 +2522,19 @@ export class MemoryPG extends MemoryStorage {
     try {
       return await this.#db.client.tx(async t => {
         await this.lockObservationalMemoryResource(t, guard.resourceId);
+        await this.lockWorkingMemoryTarget(t, 'resource', resourceId);
         await this.assertCurrentObservationalMemoryGeneration(t, guard);
+        const currentRow = await t.oneOrNone<{ workingMemory: string | null; metadata: unknown }>(
+          `SELECT "workingMemory", metadata FROM ${tableName} WHERE id = $1 FOR UPDATE`,
+          [resourceId],
+        );
+        assertWorkingMemorySnapshotUnchanged({
+          currentValue: currentRow?.workingMemory,
+          currentMetadata: currentRow ? parseMetadata(currentRow.metadata) : undefined,
+          proposedValue: workingMemory,
+          proposedValueProvided: true,
+          proposedMetadata: undefined,
+        });
         const now = new Date();
         const nowStr = now.toISOString();
         const row = await t.one<StorageResourceType & { createdAtZ: Date | string; updatedAtZ: Date | string }>(
@@ -2118,6 +2557,7 @@ export class MemoryPG extends MemoryStorage {
         };
       });
     } catch (error) {
+      if (error instanceof WorkingMemoryValidationError) throw error;
       throw new MastraError(
         {
           id: createStorageErrorId('PG', 'UPDATE_RESOURCE_FROM_OBSERVATIONAL_MEMORY', 'FAILED'),
@@ -2148,14 +2588,23 @@ export class MemoryPG extends MemoryStorage {
     try {
       return await this.#db.client.tx(async t => {
         await this.lockObservationalMemoryResource(t, guard.resourceId);
+        await this.lockWorkingMemoryTarget(t, 'thread', id);
         await this.assertCurrentObservationalMemoryGeneration(t, guard);
+        const currentRow = await t.oneOrNone<{ metadata: unknown }>(
+          `SELECT metadata FROM ${tableName} WHERE id = $1 AND "resourceId" = $2 FOR UPDATE`,
+          [id, guard.resourceId],
+        );
+        if (!currentRow) {
+          throw new Error('Observational memory guard does not match the target thread resource.');
+        }
+        const mergedMetadata = mergeObservationalThreadMetadata(parseMetadata(currentRow.metadata), metadata);
         const now = new Date();
         const row = await t.one<StorageThreadType & { createdAtZ: Date | string; updatedAtZ: Date | string }>(
           `UPDATE ${tableName}
-           SET title = COALESCE($1, title), metadata = $2, "updatedAt" = $3, "updatedAtZ" = $3
-           WHERE id = $4 AND "resourceId" = $5
+           SET title = COALESCE($1, title), metadata = $2, "updatedAt" = $3, "updatedAtZ" = $4
+           WHERE id = $5 AND "resourceId" = $6
            RETURNING *`,
-          [title, JSON.stringify(metadata), now.toISOString(), id, guard.resourceId],
+          [title, JSON.stringify(mergedMetadata), now.toISOString(), now.toISOString(), id, guard.resourceId],
         );
         return {
           id: row.id,
@@ -2173,6 +2622,543 @@ export class MemoryPG extends MemoryStorage {
           domain: ErrorDomain.STORAGE,
           category: ErrorCategory.THIRD_PARTY,
           details: { threadId: id, recordId: guard.recordId },
+        },
+        error,
+      );
+    }
+  }
+
+  async getWorkingMemorySnapshot(input: WorkingMemorySnapshotInput): Promise<WorkingMemorySnapshot> {
+    try {
+      if (input.scope === 'resource') {
+        const tableName = getTableName({ indexName: TABLE_RESOURCES, schemaName: getSchemaName(this.#schema) });
+        const row = await this.#db.client.oneOrNone<{ workingMemory: string | null; metadata: unknown }>(
+          `SELECT "workingMemory", metadata FROM ${tableName} WHERE id = $1`,
+          [input.resourceId],
+        );
+        return readWorkingMemorySnapshot(row?.workingMemory, parseMetadata(row?.metadata));
+      }
+
+      const tableName = getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) });
+      const row = await this.#db.client.oneOrNone<{ metadata: unknown }>(
+        `SELECT metadata FROM ${tableName} WHERE id = $1 AND "resourceId" = $2`,
+        [input.threadId, input.resourceId],
+      );
+      if (!row)
+        throw new WorkingMemoryValidationError('Working-memory thread was not found in the requested resource.');
+      const metadata = parseMetadata(row.metadata);
+      return readWorkingMemorySnapshot(
+        typeof metadata.workingMemory === 'string' ? metadata.workingMemory : null,
+        metadata,
+      );
+    } catch (error) {
+      if (error instanceof MastraError) throw error;
+      if (error instanceof WorkingMemoryValidationError) throw error;
+      const text = 'Failed to read PostgreSQL working memory';
+      const failureCode = this.getSafeStorageFailureCode(error);
+      const safeError = new MastraError(
+        {
+          id: createStorageErrorId('PG', 'GET_WORKING_MEMORY_SNAPSHOT', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          text,
+          details: {
+            scope: input.scope,
+            ...(failureCode ? { failureCode } : {}),
+          },
+        },
+        new Error(text),
+      );
+      this.logger?.error?.(safeError.toString());
+      this.logger?.trackException(safeError);
+      throw safeError;
+    }
+  }
+
+  async applyWorkingMemoryUpdate(input: ApplyWorkingMemoryUpdateInput): Promise<WorkingMemorySnapshot> {
+    try {
+      return await this.#db.client.tx(async t => {
+        await this.lockObservationalMemoryResource(t, input.resourceId);
+        await this.lockWorkingMemoryTarget(
+          t,
+          input.scope,
+          input.scope === 'resource' ? input.resourceId : input.threadId,
+        );
+        if (input.observationalMemoryGuard) {
+          if (input.source !== 'observer') {
+            throw new WorkingMemoryValidationError('Only observer updates may carry an observational-memory guard.');
+          }
+          const guard = input.observationalMemoryGuard;
+          if (guard.resourceId !== input.resourceId || (guard.threadId !== null && guard.threadId !== input.threadId)) {
+            throw new WorkingMemoryValidationError(
+              'Observational memory guard does not match the working-memory target.',
+            );
+          }
+          await this.assertCurrentObservationalMemoryGeneration(t, guard);
+        }
+
+        const now = new Date();
+        const nowString = now.toISOString();
+        if (input.scope === 'resource') {
+          const tableName = getTableName({ indexName: TABLE_RESOURCES, schemaName: getSchemaName(this.#schema) });
+          const row = await t.oneOrNone<{
+            workingMemory: string | null;
+            metadata: unknown;
+            createdAt: Date | string;
+            createdAtZ?: Date | string;
+          }>(`SELECT "workingMemory", metadata, "createdAt", "createdAtZ" FROM ${tableName} WHERE id = $1 FOR UPDATE`, [
+            input.resourceId,
+          ]);
+          const metadata = parseMetadata(row?.metadata);
+          const current = readWorkingMemorySnapshot(row?.workingMemory, metadata);
+          const next = applyWorkingMemorySnapshotUpdate(current, input, nowString);
+          if (next === current) return current;
+          const nextMetadata = writeWorkingMemorySnapshotMetadata(metadata, next);
+          if (row) {
+            await t.none(
+              `UPDATE ${tableName}
+               SET "workingMemory" = $1, metadata = $2, "updatedAt" = $3, "updatedAtZ" = $4
+               WHERE id = $5`,
+              [next.value, JSON.stringify(nextMetadata), nowString, nowString, input.resourceId],
+            );
+          } else {
+            await t.none(
+              `INSERT INTO ${tableName}
+                 (id, "workingMemory", metadata, "createdAt", "createdAtZ", "updatedAt", "updatedAtZ")
+               VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+              [input.resourceId, next.value, JSON.stringify(nextMetadata), nowString, nowString, nowString, nowString],
+            );
+          }
+          return next;
+        }
+
+        const tableName = getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) });
+        const row = await t.oneOrNone<{ metadata: unknown }>(
+          `SELECT metadata FROM ${tableName} WHERE id = $1 AND "resourceId" = $2 FOR UPDATE`,
+          [input.threadId, input.resourceId],
+        );
+        if (!row)
+          throw new WorkingMemoryValidationError('Working-memory thread was not found in the requested resource.');
+        const metadata = parseMetadata(row.metadata);
+        const current = readWorkingMemorySnapshot(
+          typeof metadata.workingMemory === 'string' ? metadata.workingMemory : null,
+          metadata,
+        );
+        const next = applyWorkingMemorySnapshotUpdate(current, input, nowString);
+        if (next === current) return current;
+        const nextMetadata = writeWorkingMemorySnapshotMetadata(metadata, next);
+        if (next.value === null) delete nextMetadata.workingMemory;
+        else nextMetadata.workingMemory = next.value;
+        await t.none(
+          `UPDATE ${tableName} SET metadata = $1, "updatedAt" = $2, "updatedAtZ" = $3
+           WHERE id = $4 AND "resourceId" = $5`,
+          [JSON.stringify(nextMetadata), nowString, nowString, input.threadId, input.resourceId],
+        );
+        return next;
+      });
+    } catch (error) {
+      if (error instanceof WorkingMemoryRevisionConflictError) throw error;
+      if (error instanceof WorkingMemoryValidationError || error instanceof ObservationalMemoryGenerationConflictError)
+        throw error;
+      const text = 'Failed to update PostgreSQL working memory';
+      const failureCode = this.getSafeStorageFailureCode(error);
+      const safeError = new MastraError(
+        {
+          id: createStorageErrorId('PG', 'APPLY_WORKING_MEMORY_UPDATE', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          text,
+          details: {
+            scope: input.scope,
+            source: input.source,
+            ...(failureCode ? { failureCode } : {}),
+          },
+        },
+        new Error(text),
+      );
+      this.logger?.error?.(safeError.toString());
+      this.logger?.trackException(safeError);
+      throw safeError;
+    }
+  }
+
+  async mutateThreadWithWorkingMemory(
+    input: StorageMutateThreadWithWorkingMemoryInput,
+  ): Promise<StorageMutateThreadWithWorkingMemoryOutput> {
+    const threadId = input.mutation.type === 'save' ? input.mutation.thread.id : input.mutation.id;
+    const threadTableName = getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) });
+
+    try {
+      return await this.#db.client.tx(async t => {
+        if (input.mutation.type === 'save') {
+          await this.lockThreadLifecycles(t, [threadId]);
+        }
+        if (input.workingMemory.type === 'observer-update') {
+          await this.lockObservationalMemoryResource(t, input.workingMemory.resourceId);
+        }
+        await this.lockWorkingMemoryTarget(t, 'thread', threadId);
+
+        const currentThread = await t.oneOrNone<
+          StorageThreadType & { createdAtZ?: Date | string; updatedAtZ?: Date | string }
+        >(`SELECT * FROM ${threadTableName} WHERE id = $1 FOR UPDATE`, [threadId]);
+        if (input.mutation.type === 'update' && !currentThread) {
+          throw new MastraError({
+            id: createStorageErrorId('PG', 'UPDATE_THREAD', 'FAILED'),
+            domain: ErrorDomain.STORAGE,
+            category: ErrorCategory.USER,
+            text: `Thread ${threadId} not found`,
+            details: { threadId, title: input.mutation.title ?? null },
+          });
+        }
+
+        const currentMetadata = currentThread ? parseMetadata(currentThread.metadata) : undefined;
+        const proposedMetadata =
+          input.mutation.type === 'save' ? input.mutation.thread.metadata : input.mutation.metadata;
+        assertThreadWorkingMemoryRemoved(proposedMetadata);
+        const resourceId =
+          input.mutation.type === 'save' ? input.mutation.thread.resourceId : currentThread!.resourceId;
+        if (input.mutation.type === 'save' && currentThread) {
+          assertGovernedThreadResourceUnchanged({
+            currentResourceId: currentThread.resourceId,
+            currentMetadata,
+            proposedResourceId: resourceId,
+          });
+        }
+        if (input.workingMemory.type === 'observer-update' && input.workingMemory.resourceId !== resourceId) {
+          throw new WorkingMemoryValidationError('Working-memory update does not match the mutated thread resource.');
+        }
+
+        let workingMemory: WorkingMemorySnapshot | undefined;
+        let currentWorkingMemory: WorkingMemorySnapshot | undefined;
+        if (input.workingMemory.type === 'require-ungoverned') {
+          assertThreadWorkingMemoryIsUngoverned(currentMetadata);
+        } else {
+          const currentValue =
+            typeof currentMetadata?.workingMemory === 'string' ? currentMetadata.workingMemory : null;
+          currentWorkingMemory = readWorkingMemorySnapshot(currentValue, currentMetadata);
+          workingMemory = applyWorkingMemorySnapshotUpdate(
+            currentWorkingMemory,
+            {
+              value: input.workingMemory.value,
+              expectedRevision: input.workingMemory.expectedRevision,
+              source: 'observer',
+              ...(input.workingMemory.maxDataBytes === undefined
+                ? {}
+                : { maxDataBytes: input.workingMemory.maxDataBytes }),
+            },
+            new Date().toISOString(),
+          );
+        }
+
+        const baseMetadata =
+          input.mutation.type === 'save'
+            ? preserveWorkingMemorySnapshotControls(currentMetadata, input.mutation.thread.metadata ?? {})
+            : input.mutation.metadata === undefined
+              ? (currentMetadata ?? {})
+              : mergeThreadMetadataPreservingWorkingMemory(currentMetadata ?? {}, input.mutation.metadata);
+        let metadata: Record<string, unknown>;
+        if (input.workingMemory.type === 'require-ungoverned') {
+          metadata = stripThreadWorkingMemoryMetadata(baseMetadata) ?? {};
+        } else {
+          metadata =
+            workingMemory !== currentWorkingMemory || hasWorkingMemorySnapshotControls(currentMetadata)
+              ? writeWorkingMemorySnapshotMetadata(baseMetadata, workingMemory!)
+              : { ...baseMetadata };
+          if (workingMemory!.value === null) delete metadata.workingMemory;
+          else metadata.workingMemory = workingMemory!.value;
+        }
+
+        let row: StorageThreadType & { createdAtZ?: Date | string; updatedAtZ?: Date | string };
+        if (input.mutation.type === 'save') {
+          const createdAt = toUtcISOString(input.mutation.thread.createdAt);
+          const updatedAt = toUtcISOString(input.mutation.thread.updatedAt);
+          row = await t.one(
+            `INSERT INTO ${threadTableName}
+               (id, "resourceId", title, metadata, "createdAt", "createdAtZ", "updatedAt", "updatedAtZ")
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT (id) DO UPDATE SET
+               "resourceId" = EXCLUDED."resourceId",
+               title = EXCLUDED.title,
+               metadata = EXCLUDED.metadata,
+               "createdAt" = EXCLUDED."createdAt",
+               "createdAtZ" = EXCLUDED."createdAtZ",
+               "updatedAt" = EXCLUDED."updatedAt",
+               "updatedAtZ" = EXCLUDED."updatedAtZ"
+             RETURNING *`,
+            [
+              threadId,
+              resourceId,
+              input.mutation.thread.title,
+              JSON.stringify(metadata),
+              createdAt,
+              createdAt,
+              updatedAt,
+              updatedAt,
+            ],
+          );
+        } else {
+          const now = toUtcISOString(new Date());
+          row = await t.one(
+            `UPDATE ${threadTableName}
+             SET title = COALESCE($1, title), metadata = $2, "updatedAt" = $3, "updatedAtZ" = $4
+             WHERE id = $5
+             RETURNING *`,
+            [input.mutation.title ?? null, JSON.stringify(metadata), now, now, threadId],
+          );
+        }
+
+        return {
+          thread: {
+            id: row.id,
+            resourceId: row.resourceId,
+            title: row.title,
+            metadata: parseMetadata(row.metadata),
+            createdAt: new Date(row.createdAtZ || row.createdAt),
+            updatedAt: new Date(row.updatedAtZ || row.updatedAt),
+          },
+          ...(workingMemory === undefined ? {} : { workingMemory }),
+        };
+      });
+    } catch (error) {
+      if (
+        error instanceof MastraError ||
+        error instanceof WorkingMemoryRevisionConflictError ||
+        error instanceof WorkingMemoryValidationError
+      ) {
+        throw error;
+      }
+      throw new MastraError(
+        {
+          id: createStorageErrorId('PG', 'MUTATE_THREAD_WITH_WORKING_MEMORY', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: { threadId },
+        },
+        error,
+      );
+    }
+  }
+
+  async prepareThreadToResourceWorkingMemoryTransition({
+    threadId,
+    resourceId,
+  }: {
+    threadId: string;
+    resourceId: string;
+  }): Promise<StorageThreadToResourceWorkingMemoryTransitionPreparation> {
+    const threadTableName = getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) });
+    const resourceTableName = getTableName({ indexName: TABLE_RESOURCES, schemaName: getSchemaName(this.#schema) });
+    try {
+      const row = await this.#db.client.one<{
+        sourceResourceId: string | null;
+        sourceMetadata: unknown;
+        destinationWorkingMemory: string | null;
+        destinationMetadata: unknown;
+      }>(
+        `SELECT
+           source."resourceId" AS "sourceResourceId",
+           source.metadata AS "sourceMetadata",
+           destination."workingMemory" AS "destinationWorkingMemory",
+           destination.metadata AS "destinationMetadata"
+         FROM (VALUES (1)) AS seed(marker)
+         LEFT JOIN ${threadTableName} AS source ON source.id = $1
+         LEFT JOIN ${resourceTableName} AS destination ON destination.id = $2`,
+        [threadId, resourceId],
+      );
+      if (row.sourceResourceId !== null && row.sourceResourceId !== resourceId) {
+        throw new WorkingMemoryValidationError('Working-memory thread does not belong to the requested resource.');
+      }
+      const sourceMetadata = parseMetadata(row.sourceMetadata);
+      const sourceValue = typeof sourceMetadata.workingMemory === 'string' ? sourceMetadata.workingMemory : null;
+      const destinationMetadata = parseMetadata(row.destinationMetadata);
+      return {
+        threadId,
+        resourceId,
+        sourceThread: {
+          snapshot: readWorkingMemorySnapshot(sourceValue, sourceMetadata),
+          workingMemoryIncarnation: readWorkingMemoryIncarnation(sourceMetadata),
+        },
+        destinationResource: {
+          snapshot: readWorkingMemorySnapshot(row.destinationWorkingMemory, destinationMetadata),
+          workingMemoryIncarnation: readWorkingMemoryIncarnation(destinationMetadata),
+        },
+      };
+    } catch (error) {
+      if (error instanceof MastraError || error instanceof WorkingMemoryValidationError) throw error;
+      throw new MastraError(
+        {
+          id: createStorageErrorId('PG', 'PREPARE_THREAD_TO_RESOURCE_WORKING_MEMORY_TRANSITION', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: { threadId, resourceId },
+        },
+        error,
+      );
+    }
+  }
+
+  async transitionThreadToResourceWorkingMemory(
+    input: StorageTransitionThreadToResourceWorkingMemoryInput,
+  ): Promise<StorageTransitionThreadToResourceWorkingMemoryOutput> {
+    const threadId = input.mutation.type === 'save' ? input.mutation.thread.id : input.mutation.id;
+    const resourceId = input.mutation.type === 'save' ? input.mutation.thread.resourceId : input.mutation.resourceId;
+    const proposedMetadata = input.mutation.type === 'save' ? input.mutation.thread.metadata : input.mutation.metadata;
+    assertThreadWorkingMemoryRemoved(proposedMetadata);
+    if (input.preparation.threadId !== threadId || input.preparation.resourceId !== resourceId) {
+      throw new WorkingMemoryValidationError('Working-memory transition preparation does not match its coordinates.');
+    }
+    const threadTableName = getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) });
+    const resourceTableName = getTableName({ indexName: TABLE_RESOURCES, schemaName: getSchemaName(this.#schema) });
+
+    try {
+      return await this.#db.client.tx(async t => {
+        if (input.mutation.type === 'save') {
+          await this.lockThreadLifecycles(t, [threadId]);
+        }
+        await this.lockObservationalMemoryResource(t, resourceId);
+        await this.lockWorkingMemoryTarget(t, 'resource', resourceId);
+        await this.lockWorkingMemoryTarget(t, 'thread', threadId);
+
+        const currentThread = await t.oneOrNone<
+          StorageThreadType & { createdAtZ?: Date | string; updatedAtZ?: Date | string }
+        >(`SELECT * FROM ${threadTableName} WHERE id = $1 FOR UPDATE`, [threadId]);
+        if (input.mutation.type === 'update' && !currentThread) {
+          throw new MastraError({
+            id: createStorageErrorId('PG', 'UPDATE_THREAD', 'FAILED'),
+            domain: ErrorDomain.STORAGE,
+            category: ErrorCategory.USER,
+            text: `Thread ${threadId} not found`,
+            details: { threadId, title: input.mutation.title ?? null },
+          });
+        }
+        if (currentThread && currentThread.resourceId !== resourceId) {
+          throw new WorkingMemoryValidationError('Working-memory thread does not belong to the requested resource.');
+        }
+        const currentThreadMetadata = parseMetadata(currentThread?.metadata);
+        const currentThreadValue =
+          typeof currentThreadMetadata.workingMemory === 'string' ? currentThreadMetadata.workingMemory : null;
+        const currentThreadSnapshot = readWorkingMemorySnapshot(currentThreadValue, currentThreadMetadata);
+        assertWorkingMemoryTransitionParticipant(
+          currentThreadSnapshot,
+          readWorkingMemoryIncarnation(currentThreadMetadata),
+          input.preparation.sourceThread,
+        );
+
+        const currentResource = await t.oneOrNone<{
+          workingMemory: string | null;
+          metadata: unknown;
+          createdAt: Date | string;
+          createdAtZ?: Date | string;
+        }>(
+          `SELECT "workingMemory", metadata, "createdAt", "createdAtZ"
+           FROM ${resourceTableName} WHERE id = $1 FOR UPDATE`,
+          [resourceId],
+        );
+        const currentMetadata = parseMetadata(currentResource?.metadata);
+        const current = readWorkingMemorySnapshot(currentResource?.workingMemory, currentMetadata);
+        assertWorkingMemoryTransitionParticipant(
+          current,
+          readWorkingMemoryIncarnation(currentMetadata),
+          input.preparation.destinationResource,
+        );
+        const now = new Date();
+        const nowString = now.toISOString();
+        const next = applyWorkingMemorySnapshotUpdate(
+          current,
+          {
+            value: input.value,
+            expectedRevision: input.preparation.destinationResource.snapshot.revision,
+            source: 'observer',
+            ...(input.maxDataBytes === undefined ? {} : { maxDataBytes: input.maxDataBytes }),
+          },
+          nowString,
+        );
+        const nextMetadata = writeWorkingMemorySnapshotMetadata(currentMetadata, next);
+        if (currentResource) {
+          await t.none(
+            `UPDATE ${resourceTableName}
+             SET "workingMemory" = $1, metadata = $2, "updatedAt" = $3, "updatedAtZ" = $4
+             WHERE id = $5`,
+            [next.value, JSON.stringify(nextMetadata), nowString, nowString, resourceId],
+          );
+        } else {
+          await t.none(
+            `INSERT INTO ${resourceTableName}
+               (id, "workingMemory", metadata, "createdAt", "createdAtZ", "updatedAt", "updatedAtZ")
+             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+            [resourceId, next.value, JSON.stringify(nextMetadata), nowString, nowString, nowString, nowString],
+          );
+        }
+
+        let thread: StorageThreadType & { createdAtZ?: Date | string; updatedAtZ?: Date | string };
+        if (input.mutation.type === 'save') {
+          const createdAt = toUtcISOString(input.mutation.thread.createdAt);
+          const updatedAt = toUtcISOString(input.mutation.thread.updatedAt);
+          thread = await t.one(
+            `INSERT INTO ${threadTableName}
+               (id, "resourceId", title, metadata, "createdAt", "createdAtZ", "updatedAt", "updatedAtZ")
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT (id) DO UPDATE SET
+               "resourceId" = EXCLUDED."resourceId",
+               title = EXCLUDED.title,
+               metadata = EXCLUDED.metadata,
+               "createdAt" = EXCLUDED."createdAt",
+               "createdAtZ" = EXCLUDED."createdAtZ",
+               "updatedAt" = EXCLUDED."updatedAt",
+               "updatedAtZ" = EXCLUDED."updatedAtZ"
+             RETURNING *`,
+            [
+              threadId,
+              resourceId,
+              input.mutation.thread.title,
+              JSON.stringify(input.mutation.thread.metadata ?? {}),
+              createdAt,
+              createdAt,
+              updatedAt,
+              updatedAt,
+            ],
+          );
+        } else {
+          const metadata =
+            mergeThreadMetadataForWorkingMemoryTransition(
+              parseMetadata(currentThread!.metadata),
+              input.mutation.metadata,
+            ) ?? {};
+          const updatedAt = toUtcISOString(new Date());
+          thread = await t.one(
+            `UPDATE ${threadTableName}
+             SET title = COALESCE($1, title), metadata = $2, "updatedAt" = $3, "updatedAtZ" = $4
+             WHERE id = $5
+             RETURNING *`,
+            [input.mutation.title ?? null, JSON.stringify(metadata), updatedAt, updatedAt, threadId],
+          );
+        }
+        return {
+          thread: {
+            id: thread.id,
+            resourceId: thread.resourceId,
+            title: thread.title,
+            metadata: parseMetadata(thread.metadata),
+            createdAt: new Date(thread.createdAtZ || thread.createdAt),
+            updatedAt: new Date(thread.updatedAtZ || thread.updatedAt),
+          },
+          workingMemory: next,
+        };
+      });
+    } catch (error) {
+      if (
+        error instanceof MastraError ||
+        error instanceof WorkingMemoryRevisionConflictError ||
+        error instanceof WorkingMemoryValidationError
+      ) {
+        throw error;
+      }
+      throw new MastraError(
+        {
+          id: createStorageErrorId('PG', 'TRANSITION_THREAD_TO_RESOURCE_WORKING_MEMORY', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: { threadId, resourceId },
         },
         error,
       );
@@ -2217,7 +3203,7 @@ export class MemoryPG extends MemoryStorage {
       observationalMemoryRecordIds?.push(...committedRecordIds);
     } catch (rawError) {
       const text = 'Failed to delete PostgreSQL memory resource';
-      const failureCode = this.getSafeReadFailureCode(rawError);
+      const failureCode = this.getSafeStorageFailureCode(rawError);
       const error = new MastraError(
         {
           id: createStorageErrorId('PG', 'DELETE_RESOURCE', 'FAILED'),
@@ -2238,38 +3224,56 @@ export class MemoryPG extends MemoryStorage {
   async cloneThread(args: StorageCloneThreadInput): Promise<StorageCloneThreadOutput> {
     const { sourceThreadId, newThreadId: providedThreadId, resourceId, title, metadata, options } = args;
 
-    // Get the source thread
-    const sourceThread = await this.getThreadById({ threadId: sourceThreadId });
-    if (!sourceThread) {
-      throw new MastraError({
-        id: createStorageErrorId('PG', 'CLONE_THREAD', 'SOURCE_NOT_FOUND'),
-        domain: ErrorDomain.STORAGE,
-        category: ErrorCategory.USER,
-        text: `Source thread with id ${sourceThreadId} not found`,
-        details: { sourceThreadId },
-      });
-    }
-
     // Use provided ID or generate a new one
     const newThreadId = providedThreadId || crypto.randomUUID();
-
-    // Check if the new thread ID already exists
-    const existingThread = await this.getThreadById({ threadId: newThreadId });
-    if (existingThread) {
-      throw new MastraError({
-        id: createStorageErrorId('PG', 'CLONE_THREAD', 'THREAD_EXISTS'),
-        domain: ErrorDomain.STORAGE,
-        category: ErrorCategory.USER,
-        text: `Thread with id ${newThreadId} already exists`,
-        details: { newThreadId },
-      });
-    }
 
     const threadTableName = getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) });
     const messageTableName = getTableName({ indexName: TABLE_MESSAGES, schemaName: getSchemaName(this.#schema) });
 
     try {
       return await this.#db.client.tx(async t => {
+        const lifecycleThreadIds = [...new Set([sourceThreadId, newThreadId])].sort();
+        await this.lockThreadLifecycles(t, lifecycleThreadIds);
+        type CloneThreadRow = StorageThreadType & {
+          createdAtZ?: Date | string;
+          updatedAtZ?: Date | string;
+        };
+        const lockedThreadRows = new Map<string, CloneThreadRow>();
+        for (const threadId of lifecycleThreadIds) {
+          const row = await t.oneOrNone<CloneThreadRow>(`SELECT * FROM ${threadTableName} WHERE id = $1 FOR UPDATE`, [
+            threadId,
+          ]);
+          if (row) lockedThreadRows.set(threadId, row);
+        }
+        const sourceRow = lockedThreadRows.get(sourceThreadId);
+        if (!sourceRow) {
+          throw new MastraError({
+            id: createStorageErrorId('PG', 'CLONE_THREAD', 'SOURCE_NOT_FOUND'),
+            domain: ErrorDomain.STORAGE,
+            category: ErrorCategory.USER,
+            text: `Source thread with id ${sourceThreadId} not found`,
+            details: { sourceThreadId },
+          });
+        }
+        if (lockedThreadRows.has(newThreadId)) {
+          throw new MastraError({
+            id: createStorageErrorId('PG', 'CLONE_THREAD', 'THREAD_EXISTS'),
+            domain: ErrorDomain.STORAGE,
+            category: ErrorCategory.USER,
+            text: `Thread with id ${newThreadId} already exists`,
+            details: { newThreadId },
+          });
+        }
+        const sourceThread: StorageThreadType = {
+          id: sourceRow.id,
+          resourceId: sourceRow.resourceId,
+          title: sourceRow.title,
+          metadata: parseMetadata(sourceRow.metadata),
+          createdAt: new Date(sourceRow.createdAtZ || sourceRow.createdAt),
+          updatedAt: new Date(sourceRow.updatedAtZ || sourceRow.updatedAt),
+        };
+        const sourceResourceId = sourceThread.resourceId;
+
         // Build message query with filters
         let messageQuery = `SELECT id, content, role, type, "createdAt", "createdAtZ", thread_id AS "threadId", "resourceId"
                             FROM ${messageTableName} WHERE thread_id = $1`;
@@ -2318,14 +3322,15 @@ export class MemoryPG extends MemoryStorage {
         };
 
         // Create the new thread
+        const proposedMetadata = {
+          ...metadata,
+          clone: cloneMetadata,
+        };
         const newThread: StorageThreadType = {
           id: newThreadId,
-          resourceId: resourceId || sourceThread.resourceId,
+          resourceId: resourceId || sourceResourceId,
           title: title || (sourceThread.title ? `Clone of ${sourceThread.title}` : ''),
-          metadata: {
-            ...metadata,
-            clone: cloneMetadata,
-          },
+          metadata: reincarnateWorkingMemorySnapshotMetadata(proposedMetadata),
           createdAt: now,
           updatedAt: now,
         };
@@ -2357,7 +3362,7 @@ export class MemoryPG extends MemoryStorage {
         // Clone messages with new IDs
         const clonedMessages: MastraDBMessage[] = [];
         const messageIdMap: Record<string, string> = {};
-        const targetResourceId = resourceId || sourceThread.resourceId;
+        const targetResourceId = resourceId || sourceResourceId;
 
         for (const sourceMsg of sourceMessages) {
           const newMessageId = crypto.randomUUID();
@@ -2397,10 +3402,20 @@ export class MemoryPG extends MemoryStorage {
           });
         }
 
+        const generation = await t.one<{ storageGeneration: string }>(
+          `SELECT xmin::text AS "storageGeneration" FROM ${threadTableName} WHERE id = $1`,
+          [newThreadId],
+        );
         return {
           thread: newThread,
           clonedMessages,
           messageIdMap,
+          sourceResourceId,
+          rollbackReceipt: {
+            threadId: newThreadId,
+            storageGeneration: generation.storageGeneration,
+            clonedMessageIds: clonedMessages.map(message => message.id),
+          },
         };
       });
     } catch (error) {
@@ -2419,6 +3434,128 @@ export class MemoryPG extends MemoryStorage {
     }
   }
 
+  async rollbackThreadClone(input: StorageRollbackThreadCloneInput): Promise<StorageRollbackThreadCloneResult> {
+    const threadTableName = getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) });
+    const messageTableName = getTableName({ indexName: TABLE_MESSAGES, schemaName: getSchemaName(this.#schema) });
+    const omTableName = getTableName({ indexName: OM_TABLE, schemaName: getSchemaName(this.#schema) });
+    try {
+      return await this.#db.client.tx(async t => {
+        const { thread: receipt, observationalMemory, unverifiedObservationalMemoryRecordId } = input;
+        await this.lockThreadLifecycles(t, [receipt.threadId]);
+        const threadSnapshot = await t.oneOrNone<{ resourceId: string }>(
+          `SELECT "resourceId" FROM ${threadTableName} WHERE id = $1`,
+          [receipt.threadId],
+        );
+        if (!threadSnapshot) return { status: 'conflict', reason: 'thread' };
+
+        // OM advisory locks must be acquired before either the thread row or
+        // its messages. delete/retraction paths take the same order, so neither
+        // side can hold a row the other needs while waiting on the OM lock.
+        await this.lockObservationalMemoryResources(t, [threadSnapshot.resourceId, observationalMemory?.resourceId]);
+        const thread = await t.oneOrNone<{ resourceId: string; storageGeneration: string }>(
+          `SELECT "resourceId", xmin::text AS "storageGeneration"
+           FROM ${threadTableName} WHERE id = $1 FOR UPDATE`,
+          [receipt.threadId],
+        );
+        if (!thread || thread.storageGeneration !== receipt.storageGeneration) {
+          return { status: 'conflict', reason: 'thread' };
+        }
+
+        const currentMessages = await t.manyOrNone<{ id: string }>(
+          `SELECT id FROM ${messageTableName} WHERE thread_id = $1 ORDER BY id FOR UPDATE`,
+          [receipt.threadId],
+        );
+        if (
+          !hasSameUniqueStrings(
+            receipt.clonedMessageIds,
+            currentMessages.map(message => message.id),
+          )
+        ) {
+          return { status: 'conflict', reason: 'messages' };
+        }
+
+        if (
+          observationalMemory &&
+          unverifiedObservationalMemoryRecordId &&
+          observationalMemory.recordId !== unverifiedObservationalMemoryRecordId
+        ) {
+          return { status: 'conflict', reason: 'observational_memory' };
+        }
+        const schemaName = this.#schema || 'public';
+        const omTableExists =
+          (await t.oneOrNone<{ tablename: string }>(
+            `SELECT tablename FROM pg_tables WHERE schemaname = $1 AND tablename = $2`,
+            [schemaName, OM_TABLE],
+          )) !== null;
+
+        if (observationalMemory) {
+          if (omTableExists) {
+            const coordinateRows = await t.manyOrNone<{ id: string; storageGeneration: string }>(
+              `SELECT id, xmin::text AS "storageGeneration"
+               FROM ${omTableName} WHERE "lookupKey" = $1 FOR UPDATE`,
+              [this.getOMKey(observationalMemory.threadId, observationalMemory.resourceId)],
+            );
+            if (
+              !hasSameUniqueStrings(
+                [...observationalMemory.priorRecordIds, observationalMemory.recordId],
+                coordinateRows.map(row => row.id),
+              ) ||
+              coordinateRows.find(row => row.id === observationalMemory.recordId)?.storageGeneration !==
+                observationalMemory.storageGeneration
+            ) {
+              return { status: 'conflict', reason: 'observational_memory' };
+            }
+          }
+        } else if (omTableExists) {
+          if (unverifiedObservationalMemoryRecordId) {
+            const unverified = await t.oneOrNone<{ id: string }>(
+              `SELECT id FROM ${omTableName} WHERE id = $1 FOR UPDATE`,
+              [unverifiedObservationalMemoryRecordId],
+            );
+            if (unverified) return { status: 'conflict', reason: 'observational_memory' };
+          }
+          const threadScopedRecords = await t.manyOrNone<{ id: string }>(
+            `SELECT id FROM ${omTableName} WHERE "threadId" = $1 FOR UPDATE`,
+            [receipt.threadId],
+          );
+          if (threadScopedRecords.length > 0) return { status: 'conflict', reason: 'observational_memory' };
+        }
+
+        if (observationalMemory && omTableExists) {
+          const deleted = await t.oneOrNone<{ id: string }>(
+            `DELETE FROM ${omTableName}
+             WHERE id = $1 AND xmin::text = $2
+             RETURNING id`,
+            [observationalMemory.recordId, observationalMemory.storageGeneration],
+          );
+          if (!deleted) return { status: 'conflict', reason: 'observational_memory' };
+        }
+        await t.none(`DELETE FROM ${messageTableName} WHERE thread_id = $1`, [receipt.threadId]);
+        const deletedThread = await t.oneOrNone<{ id: string }>(
+          `DELETE FROM ${threadTableName}
+           WHERE id = $1 AND xmin::text = $2
+           RETURNING id`,
+          [receipt.threadId, receipt.storageGeneration],
+        );
+        if (!deletedThread) throw new ThreadCloneRollbackConflictError('thread');
+        return { status: 'rolled_back' };
+      });
+    } catch (error) {
+      if (error instanceof ThreadCloneRollbackConflictError) {
+        return { status: 'conflict', reason: error.reason };
+      }
+      throw new MastraError(
+        {
+          id: createStorageErrorId('PG', 'ROLLBACK_THREAD_CLONE', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: { threadId: input.thread.threadId },
+        },
+        error,
+      );
+    }
+  }
+
   // ============================================
   // Observational Memory Methods
   // ============================================
@@ -2427,10 +3564,80 @@ export class MemoryPG extends MemoryStorage {
     return threadId ? `thread:${threadId}` : `resource:${resourceId}`;
   }
 
+  private async lockThreadCloneLifecycle(t: TxClient, threadId: string): Promise<void> {
+    await t.none('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`mastra:thread-clone:${threadId}`]);
+  }
+
+  /**
+   * Memory mutations acquire locks in this order:
+   *
+   * 1. lexically sorted thread lifecycle/ownership advisory locks;
+   * 2. lexically sorted observational-memory resource advisory locks;
+   * 3. working-memory advisory locks when applicable;
+   * 4. thread/resource rows; and
+   * 5. message rows.
+   *
+   * The advisory key predates its broader ownership role, so it intentionally
+   * retains the `thread-clone` prefix for cross-version serialization.
+   */
+  private async lockThreadLifecycles(t: TxClient, threadIds: Iterable<string>): Promise<void> {
+    for (const threadId of sortedUniqueStrings(threadIds)) {
+      await this.lockThreadCloneLifecycle(t, threadId);
+    }
+  }
+
   private async lockObservationalMemoryResource(t: TxClient, resourceId: string): Promise<void> {
     await t.none('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [
       `mastra:observational-memory:${resourceId}`,
     ]);
+  }
+
+  private async lockObservationalMemoryResources(
+    t: TxClient,
+    resourceIds: Iterable<string | null | undefined>,
+  ): Promise<void> {
+    for (const resourceId of sortedUniqueStrings(resourceIds)) {
+      await this.lockObservationalMemoryResource(t, resourceId);
+    }
+  }
+
+  private async lockThreadRows(
+    t: TxClient,
+    threadIds: Iterable<string>,
+  ): Promise<Array<{ id: string; resourceId: string }>> {
+    const sortedThreadIds = sortedUniqueStrings(threadIds);
+    if (sortedThreadIds.length === 0) return [];
+    return t.manyOrNone<{ id: string; resourceId: string }>(
+      `SELECT id, "resourceId" FROM ${getTableName({
+        indexName: TABLE_THREADS,
+        schemaName: getSchemaName(this.#schema),
+      })}
+       WHERE id IN (${inPlaceholders(sortedThreadIds.length)})
+       ORDER BY id
+       FOR UPDATE`,
+      sortedThreadIds,
+    );
+  }
+
+  private async lockMessageRows(
+    t: TxClient,
+    messageTableName: string,
+    messageIds: Iterable<string>,
+  ): Promise<MessageRowFromDB[]> {
+    const sortedMessageIds = sortedUniqueStrings(messageIds);
+    if (sortedMessageIds.length === 0) return [];
+    return t.manyOrNone<MessageRowFromDB>(
+      `SELECT id, content, role, type, "createdAt", "createdAtZ", thread_id AS "threadId", "resourceId"
+       FROM ${messageTableName}
+       WHERE id IN (${inPlaceholders(sortedMessageIds.length)})
+       ORDER BY id
+       FOR UPDATE`,
+      sortedMessageIds,
+    );
+  }
+
+  private async lockWorkingMemoryTarget(t: TxClient, scope: 'thread' | 'resource', id: string): Promise<void> {
+    await t.none('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`mastra:working-memory:${scope}:${id}`]);
   }
 
   private async assertCurrentObservationalMemoryGeneration(
@@ -2449,7 +3656,7 @@ export class MemoryPG extends MemoryStorage {
       [this.getOMKey(guard.threadId, guard.resourceId)],
     );
     if (current?.id !== guard.recordId) {
-      throw new Error('Observational memory generation is no longer current.');
+      throw new ObservationalMemoryGenerationConflictError();
     }
   }
 
@@ -2688,7 +3895,9 @@ export class MemoryPG extends MemoryStorage {
     }
   }
 
-  async insertObservationalMemoryRecord(record: ObservationalMemoryRecord): Promise<void> {
+  async insertObservationalMemoryRecord(
+    record: ObservationalMemoryRecord,
+  ): Promise<StorageObservationalMemoryCloneReceipt> {
     try {
       const lookupKey = this.getOMKey(record.threadId, record.resourceId);
       const tableName = getTableName({
@@ -2697,8 +3906,14 @@ export class MemoryPG extends MemoryStorage {
       });
       const lastObservedAtStr = record.lastObservedAt ? record.lastObservedAt.toISOString() : null;
       const lastBufferedAtTimeStr = record.lastBufferedAtTime ? record.lastBufferedAtTime.toISOString() : null;
-      await this.#db.client.none(
-        `INSERT INTO ${tableName} (
+      return await this.#db.client.tx(async t => {
+        await this.lockObservationalMemoryResource(t, record.resourceId);
+        const priorRecords = await t.manyOrNone<{ id: string }>(
+          `SELECT id FROM ${tableName} WHERE "lookupKey" = $1 FOR UPDATE`,
+          [lookupKey],
+        );
+        const inserted = await t.one<{ storageGeneration: string }>(
+          `INSERT INTO ${tableName} (
           id, "lookupKey", scope, "resourceId", "threadId",
           "activeObservations", "activeObservationsPendingUpdate",
           "originType", config, "generationCount", "lastObservedAt", "lastObservedAtZ", "lastReflectionAt", "lastReflectionAtZ",
@@ -2709,45 +3924,54 @@ export class MemoryPG extends MemoryStorage {
           "isObserving", "isReflecting", "isBufferingObservation", "isBufferingReflection",
           "lastBufferedAtTokens", "lastBufferedAtTime",
           "observedTimezone", metadata, "createdAt", "createdAtZ", "updatedAt", "updatedAtZ"
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35)`,
-        [
-          record.id,
-          lookupKey,
-          record.scope,
-          record.resourceId,
-          record.threadId || null,
-          record.activeObservations || '',
-          null,
-          record.originType || 'initial',
-          record.config ? JSON.stringify(record.config) : null,
-          record.generationCount || 0,
-          lastObservedAtStr,
-          lastObservedAtStr,
-          null, // lastReflectionAt
-          null, // lastReflectionAtZ
-          record.pendingMessageTokens || 0,
-          record.totalTokensObserved || 0,
-          record.observationTokenCount || 0,
-          record.observedMessageIds ? JSON.stringify(record.observedMessageIds) : null,
-          record.bufferedObservationChunks ? JSON.stringify(record.bufferedObservationChunks) : null,
-          record.bufferedReflection || null,
-          record.bufferedReflectionTokens ?? null,
-          record.bufferedReflectionInputTokens ?? null,
-          record.reflectedObservationLineCount ?? null,
-          record.isObserving || false,
-          record.isReflecting || false,
-          record.isBufferingObservation || false,
-          record.isBufferingReflection || false,
-          record.lastBufferedAtTokens || 0,
-          lastBufferedAtTimeStr,
-          record.observedTimezone || null,
-          record.metadata ? JSON.stringify(record.metadata) : null,
-          record.createdAt.toISOString(),
-          record.createdAt.toISOString(),
-          record.updatedAt.toISOString(),
-          record.updatedAt.toISOString(),
-        ],
-      );
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35)
+        RETURNING xmin::text AS "storageGeneration"`,
+          [
+            record.id,
+            lookupKey,
+            record.scope,
+            record.resourceId,
+            record.threadId || null,
+            record.activeObservations || '',
+            null,
+            record.originType || 'initial',
+            record.config ? JSON.stringify(record.config) : null,
+            record.generationCount || 0,
+            lastObservedAtStr,
+            lastObservedAtStr,
+            null, // lastReflectionAt
+            null, // lastReflectionAtZ
+            record.pendingMessageTokens || 0,
+            record.totalTokensObserved || 0,
+            record.observationTokenCount || 0,
+            record.observedMessageIds ? JSON.stringify(record.observedMessageIds) : null,
+            record.bufferedObservationChunks ? JSON.stringify(record.bufferedObservationChunks) : null,
+            record.bufferedReflection || null,
+            record.bufferedReflectionTokens ?? null,
+            record.bufferedReflectionInputTokens ?? null,
+            record.reflectedObservationLineCount ?? null,
+            record.isObserving || false,
+            record.isReflecting || false,
+            record.isBufferingObservation || false,
+            record.isBufferingReflection || false,
+            record.lastBufferedAtTokens || 0,
+            lastBufferedAtTimeStr,
+            record.observedTimezone || null,
+            record.metadata ? JSON.stringify(record.metadata) : null,
+            record.createdAt.toISOString(),
+            record.createdAt.toISOString(),
+            record.updatedAt.toISOString(),
+            record.updatedAt.toISOString(),
+          ],
+        );
+        return {
+          recordId: record.id,
+          threadId: record.threadId,
+          resourceId: record.resourceId,
+          storageGeneration: inserted.storageGeneration,
+          priorRecordIds: priorRecords.map(priorRecord => priorRecord.id),
+        };
+      });
     } catch (error) {
       throw new MastraError(
         {
@@ -3080,7 +4304,11 @@ export class MemoryPG extends MemoryStorage {
     }
   }
 
-  async clearObservationalMemory(threadId: string | null, resourceId: string): Promise<void> {
+  async clearObservationalMemory(
+    threadId: string | null,
+    resourceId: string,
+    options?: ClearObservationalMemoryOptions,
+  ): Promise<void> {
     try {
       const lookupKey = this.getOMKey(threadId, resourceId);
       const tableName = getTableName({
@@ -3089,6 +4317,16 @@ export class MemoryPG extends MemoryStorage {
       });
       await this.#db.client.tx(async t => {
         await this.lockObservationalMemoryResource(t, resourceId);
+        const currentRecord = await t.oneOrNone<{ id: string; resourceId: string }>(
+          `SELECT id, "resourceId"
+           FROM ${tableName}
+           WHERE "lookupKey" = $1
+           ORDER BY "generationCount" DESC
+           LIMIT 1
+           FOR UPDATE`,
+          [lookupKey],
+        );
+        assertObservationalMemoryClearExpectation(currentRecord, resourceId, options);
         await t.none(`DELETE FROM ${tableName} WHERE "lookupKey" = $1`, [lookupKey]);
       });
     } catch (error) {
@@ -3130,57 +4368,122 @@ export class MemoryPG extends MemoryStorage {
     await t.none(`DELETE FROM ${omTableName} WHERE "lookupKey" IN ($1, $2)`, [resourceLookupKey, threadLookupKey]);
 
     const lookupKeys = new Set(records.map(record => record.lookupKey));
-    const managedWorkingMemoryScopes = new Set(
-      records
-        .map(record => getManagedWorkingMemoryScope(record.config))
-        .filter((scope): scope is 'thread' | 'resource' => scope !== undefined),
+    const resourceRecordManagedWorkingMemoryScopes = getManagedWorkingMemoryScopes(
+      records.filter(record => record.lookupKey === resourceLookupKey),
+    );
+    const threadRecordManagedWorkingMemoryScopes = getManagedWorkingMemoryScopes(
+      records.filter(record => record.lookupKey === threadLookupKey),
     );
     let clearedResourceWorkingMemory = false;
     let clearedThreadMetadata = false;
     if (lookupKeys.size > 0) {
       const now = new Date().toISOString();
-      if (managedWorkingMemoryScopes.has('resource')) {
-        const resourceUpdate = await t.query(
-          `UPDATE ${resourceTableName}
-           SET "workingMemory" = NULL, "updatedAt" = $1, "updatedAtZ" = $2
-           WHERE id = $3 AND "workingMemory" IS NOT NULL`,
-          [now, now, input.resourceId],
+      if (
+        resourceRecordManagedWorkingMemoryScopes.has('resource') ||
+        threadRecordManagedWorkingMemoryScopes.has('resource')
+      ) {
+        const resource = await t.oneOrNone<{ workingMemory: string | null; metadata: unknown }>(
+          `SELECT "workingMemory", metadata FROM ${resourceTableName} WHERE id = $1 FOR UPDATE`,
+          [input.resourceId],
         );
-        clearedResourceWorkingMemory = (resourceUpdate.rowCount ?? 0) > 0;
+        if (resource) {
+          const metadata = parseMetadata(resource.metadata);
+          if (hasWorkingMemorySnapshotControls(metadata)) {
+            const current = readWorkingMemorySnapshot(resource.workingMemory, metadata);
+            const next = retractObserverWorkingMemorySnapshot(current);
+            clearedResourceWorkingMemory = next.value !== current.value;
+            if (next !== current) {
+              await t.none(
+                `UPDATE ${resourceTableName}
+                 SET "workingMemory" = $1, metadata = $2, "updatedAt" = $3, "updatedAtZ" = $4
+                 WHERE id = $5`,
+                [
+                  next.value,
+                  JSON.stringify(writeWorkingMemorySnapshotMetadata(metadata, next)),
+                  now,
+                  now,
+                  input.resourceId,
+                ],
+              );
+            }
+          } else if (resource.workingMemory !== null) {
+            await t.none(
+              `UPDATE ${resourceTableName}
+               SET "workingMemory" = NULL, "updatedAt" = $1, "updatedAtZ" = $2
+               WHERE id = $3`,
+              [now, now, input.resourceId],
+            );
+            clearedResourceWorkingMemory = true;
+          }
+        }
       }
 
       const resourceScopeCleared = lookupKeys.has(resourceLookupKey);
-      const clearThreadWorkingMemory = managedWorkingMemoryScopes.has('thread');
-      const metadataWithoutObservationalMemory = `jsonb_set(
-             COALESCE(metadata, '{}'::jsonb),
-             '{mastra}',
-             COALESCE(metadata->'mastra', '{}'::jsonb) - 'om'
-           )`;
-      const metadataUpdate = clearThreadWorkingMemory
-        ? `(${metadataWithoutObservationalMemory}) - 'workingMemory'`
-        : metadataWithoutObservationalMemory;
-      const threadSelector = resourceScopeCleared ? `"resourceId" = $3` : `id = $3 AND "resourceId" = $4`;
-      const threadSelectorValues = resourceScopeCleared
-        ? [now, now, input.resourceId]
-        : [now, now, input.threadId, input.resourceId];
-      const metadataSelector = clearThreadWorkingMemory
-        ? `(jsonb_typeof(metadata->'mastra'->'om') = 'object' OR COALESCE(metadata, '{}'::jsonb) ? 'workingMemory')`
-        : `jsonb_typeof(metadata->'mastra'->'om') = 'object'`;
-      const threadUpdate = await t.query(
-        `UPDATE ${threadTableName}
-         SET
-           title = CASE
-             WHEN metadata #>> '{mastra,om,threadTitle}' = title THEN ''
-             ELSE title
-           END,
-           metadata = ${metadataUpdate},
-           "updatedAt" = $1,
-           "updatedAtZ" = $2
-         WHERE ${threadSelector}
-           AND ${metadataSelector}`,
+      const threadSelector = resourceScopeCleared ? `"resourceId" = $1` : `id = $1 AND "resourceId" = $2`;
+      const threadSelectorValues = resourceScopeCleared ? [input.resourceId] : [input.threadId, input.resourceId];
+      const workingMemorySelector = `(COALESCE(metadata::jsonb, '{}'::jsonb) ? 'workingMemory'
+         OR COALESCE(metadata::jsonb->'mastra', '{}'::jsonb) ? 'workingMemory')`;
+      let managedWorkingMemorySelector: string | undefined;
+      if (resourceRecordManagedWorkingMemoryScopes.has('thread')) {
+        managedWorkingMemorySelector = workingMemorySelector;
+      } else if (threadRecordManagedWorkingMemoryScopes.has('thread')) {
+        if (resourceScopeCleared) {
+          threadSelectorValues.push(input.threadId);
+          managedWorkingMemorySelector = `(id = $${threadSelectorValues.length} AND ${workingMemorySelector})`;
+        } else {
+          managedWorkingMemorySelector = workingMemorySelector;
+        }
+      }
+      const metadataSelector = `(jsonb_typeof(metadata::jsonb->'mastra'->'om') = 'object'
+         ${managedWorkingMemorySelector ? `OR ${managedWorkingMemorySelector}` : ''})`;
+      const threads = await t.manyOrNone<{ id: string; title: string; metadata: unknown }>(
+        `SELECT id, title, metadata FROM ${threadTableName}
+         WHERE ${threadSelector} AND ${metadataSelector}
+         ORDER BY id
+         FOR UPDATE`,
         threadSelectorValues,
       );
-      clearedThreadMetadata = (threadUpdate.rowCount ?? 0) > 0;
+      for (const thread of threads) {
+        const metadata = parseMetadata(thread.metadata);
+        const mastra = { ...asRecord(metadata.mastra) };
+        const removedObservationalMemoryMetadata = Object.prototype.hasOwnProperty.call(mastra, 'om');
+        const om = asRecord(mastra.om);
+        const derivedTitle = typeof om.threadTitle === 'string' ? om.threadTitle : undefined;
+        delete mastra.om;
+        let nextMetadata: Record<string, unknown> = { ...metadata, mastra };
+        let workingMemoryStateChanged = false;
+
+        const clearThreadWorkingMemory =
+          resourceRecordManagedWorkingMemoryScopes.has('thread') ||
+          (thread.id === input.threadId && threadRecordManagedWorkingMemoryScopes.has('thread'));
+        if (clearThreadWorkingMemory) {
+          if (hasWorkingMemorySnapshotControls(metadata)) {
+            const current = readWorkingMemorySnapshot(
+              typeof metadata.workingMemory === 'string' ? metadata.workingMemory : null,
+              metadata,
+            );
+            const next = retractObserverWorkingMemorySnapshot(current);
+            if (next !== current) {
+              nextMetadata = writeWorkingMemorySnapshotMetadata(nextMetadata, next);
+              if (next.value === null) delete nextMetadata.workingMemory;
+              else nextMetadata.workingMemory = next.value;
+              workingMemoryStateChanged = true;
+            }
+          } else if (Object.prototype.hasOwnProperty.call(metadata, 'workingMemory')) {
+            delete nextMetadata.workingMemory;
+            workingMemoryStateChanged = true;
+          }
+        }
+
+        if (!removedObservationalMemoryMetadata && !workingMemoryStateChanged) continue;
+        await t.none(
+          `UPDATE ${threadTableName}
+           SET title = $1, metadata = $2, "updatedAt" = $3, "updatedAtZ" = $4
+          WHERE id = $5`,
+          [derivedTitle === thread.title ? '' : thread.title, JSON.stringify(nextMetadata), now, now, thread.id],
+        );
+        clearedThreadMetadata = true;
+      }
     }
 
     return {
@@ -3229,6 +4532,14 @@ export class MemoryPG extends MemoryStorage {
         threadId: message.threadId,
       });
     }
+
+    // Acquire the complete OM advisory set before retracting any record. A
+    // retraction can lock resource/thread rows, so taking a later OM lock from
+    // inside that loop would violate the global advisory-before-row order.
+    await this.lockObservationalMemoryResources(
+      t,
+      [...coordinates.values()].map(input => input.resourceId),
+    );
 
     const receipts: ObservationalMemoryRetractionReceipt[] = [];
     for (const input of [...coordinates.values()].sort((a, b) =>

@@ -23,6 +23,12 @@ import type { MastraDBMessage } from '../message-list/state/types';
 // preserved; the suite confirms those runtime changes do not regress supervisor
 // working-memory forwarding.
 
+// PF-1690 changes MockMemory and the native memory-storage contracts that this
+// suite reaches through supervisor working-memory forwarding. Keeping this
+// suite in the changed-file set makes the fork validator re-verify its existing
+// provider boundary before running the deterministic cases. The real-provider
+// import, describe block, and empty-key skip remain unchanged.
+
 // Helper: create a sub-agent with a fixed text response
 function makeSubAgent(id: string, responseText: string) {
   return new Agent({
