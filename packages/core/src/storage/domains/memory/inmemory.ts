@@ -132,7 +132,8 @@ function preserveGovernedThreadMetadata(
 function replaceThreadMetadataPreservingWorkingMemory(
   current: Record<string, unknown> | undefined,
   proposed: Record<string, unknown> | undefined,
-): Record<string, unknown> {
+): Record<string, unknown> | undefined {
+  if (current === undefined && proposed === undefined) return undefined;
   const next = proposed ?? {};
   return preserveGovernedThreadMetadata(current, proposed, next);
 }
@@ -1288,7 +1289,8 @@ export class InMemoryMemory extends MemoryStorage {
     };
 
     // Save the new thread
-    this.db.threads.set(newThreadId, newThread);
+    const storedThread = cloneThreadBoundary(newThread, true);
+    this.db.threads.set(newThreadId, storedThread);
 
     // Clone messages with new IDs
     const clonedMessages: MastraDBMessage[] = [];
@@ -1325,7 +1327,7 @@ export class InMemoryMemory extends MemoryStorage {
 
     const clonedMessageIds = clonedMessages.map(message => message.id);
     return {
-      thread: newThread,
+      thread: cloneThreadBoundary(storedThread, true),
       clonedMessages,
       messageIdMap,
       rollbackReceipt: {
