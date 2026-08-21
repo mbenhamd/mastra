@@ -791,7 +791,13 @@ export class ModelSpanTracker {
     this.#preparedRequestAggregate =
       runSpanOperation(() => preparedRequestAggregateFromAttributes(modelAttributes)) ??
       emptyPreparedRequestAggregate();
-    this.#providerUsageState = runSpanOperation(() => modelAttributes?.providerUsageState);
+    const restoredProviderUsageState = runSpanOperation(() => modelAttributes?.providerUsageState);
+    this.#providerUsageState =
+      restoredProviderUsageState === 'reported' ||
+      restoredProviderUsageState === 'provider_not_reported' ||
+      restoredProviderUsageState === 'not_applicable'
+        ? restoredProviderUsageState
+        : undefined;
     this.#providerOutcomeCounts = {
       providerSucceededInferenceCount: nonnegativeInteger(modelAttributes?.providerSucceededInferenceCount),
       providerErrorInferenceCount: nonnegativeInteger(modelAttributes?.providerErrorInferenceCount),

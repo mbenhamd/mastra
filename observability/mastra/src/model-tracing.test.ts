@@ -2610,6 +2610,27 @@ describe('ModelSpanTracker', () => {
       });
     });
 
+    it('derives provider usage state when a durable span restores a malformed value', () => {
+      const modelSpan = tracing.startSpan({
+        type: SpanType.MODEL_GENERATION,
+        name: 'rebuilt-generation-with-malformed-usage-state',
+        attributes: {
+          providerAggregateMeasurementState: 'unknown',
+          providerBreakdownState: 'serialized_components_non_additive',
+          providerInferenceCount: 1,
+          providerMeasuredInferenceCount: 0,
+          providerUnknownInferenceCount: 1,
+          providerUsageState: 'bogus' as never,
+        },
+      });
+      const tracker = new ModelSpanTracker(modelSpan);
+
+      tracker.endGeneration();
+
+      const [generationSpan] = testExporter.getSpansByType(SpanType.MODEL_GENERATION);
+      expect(generationSpan?.attributes.providerUsageState).toBe('provider_not_reported');
+    });
+
     it('retains prepared-request evidence and missing-usage state when provider inference errors', () => {
       const modelSpan = tracing.startSpan({
         type: SpanType.MODEL_GENERATION,
