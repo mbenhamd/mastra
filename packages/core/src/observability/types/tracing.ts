@@ -1493,6 +1493,8 @@ export interface ChildSpanOptions<TType extends SpanType> extends CreateBaseOpti
 export interface ChildEventOptions<TType extends SpanType> extends CreateBaseOptions<TType> {
   /** Output data */
   output?: any;
+  /** Actual event time when the event is observed before downstream processing. */
+  startTime?: Date;
 }
 
 interface UpdateBaseOptions<TType extends SpanType> {

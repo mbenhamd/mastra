@@ -880,6 +880,22 @@ describe('regular Agent provider request ledger (real exporter)', () => {
       })),
       { type: 'text-end', id: 'backpressured-text' },
       {
+        type: 'tool-call',
+        toolCallType: 'function',
+        toolCallId: 'provider-result',
+        toolName: 'provider_lookup',
+        input: '{}',
+        providerExecuted: true,
+      },
+      {
+        type: 'tool-result',
+        toolCallId: 'provider-result',
+        toolName: 'provider_lookup',
+        result: { answer: 'served' },
+        isError: false,
+        providerExecuted: true,
+      },
+      {
         type: 'finish',
         finishReason: 'stop',
         usage: { inputTokens: 4, outputTokens: 64, totalTokens: 68 },
@@ -915,6 +931,9 @@ describe('regular Agent provider request ledger (real exporter)', () => {
     const [textChunk] = testExporter
       .getSpansByType('model_chunk' as any)
       .filter(span => span.attributes?.chunkType === 'text');
+    const [providerToolResult] = testExporter
+      .getSpansByType('model_chunk' as any)
+      .filter(span => span.attributes?.chunkType === 'tool-result' && span.metadata?.providerExecuted === true);
     expect(firstDeltaProcessorStartedAt).toBeDefined();
     expect(firstDeltaProcessorCompletedAt).toBeDefined();
     expect(inference?.attributes).toMatchObject({
@@ -924,6 +943,17 @@ describe('regular Agent provider request ledger (real exporter)', () => {
     });
     expect(new Date(textChunk!.startTime!).getTime()).toBeGreaterThanOrEqual(new Date(inference!.startTime!).getTime());
     expect(new Date(textChunk!.endTime!).getTime()).toBeLessThanOrEqual(new Date(inference!.endTime!).getTime());
+    expect(providerToolResult?.metadata).toMatchObject({
+      toolCallId: 'provider-result',
+      toolName: 'provider_lookup',
+      providerExecuted: true,
+    });
+    expect(new Date(providerToolResult!.startTime!).getTime()).toBeGreaterThanOrEqual(
+      new Date(inference!.startTime!).getTime(),
+    );
+    expect(new Date(providerToolResult!.startTime!).getTime()).toBeLessThanOrEqual(
+      new Date(inference!.endTime!).getTime(),
+    );
     expect(new Date(inference!.endTime!).getTime()).toBeLessThan(firstDeltaProcessorCompletedAt!.getTime());
     expect(new Date(step!.endTime!).getTime()).toBeGreaterThanOrEqual(firstDeltaProcessorCompletedAt!.getTime());
     expect(testExporter.getIncompleteSpans()).toHaveLength(0);

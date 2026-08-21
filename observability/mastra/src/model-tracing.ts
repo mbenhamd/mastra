@@ -1612,7 +1612,7 @@ export class ModelSpanTracker {
   #createEventSpan(
     chunkType: string,
     output: any,
-    options?: { attributes?: Record<string, any>; metadata?: Record<string, any> },
+    options?: { attributes?: Record<string, any>; metadata?: Record<string, any>; startTime?: Date },
   ) {
     this.#ensureStepAndInference();
 
@@ -1627,6 +1627,7 @@ export class ModelSpanTracker {
         },
         metadata: options?.metadata,
         output,
+        startTime: options?.startTime,
         tracingPolicy: this.#modelSpan?.tracingPolicy,
       }),
     );
@@ -1770,7 +1771,7 @@ export class ModelSpanTracker {
    * Handle tool-call-approval chunks.
    * Creates a span for approval requests so they can be seen in traces for debugging.
    */
-  #handleToolApprovalChunk<OUTPUT>(chunk: ChunkType<OUTPUT>) {
+  #handleToolApprovalChunk<OUTPUT>(chunk: ChunkType<OUTPUT>, observedAt?: Date) {
     if (chunk.type !== 'tool-call-approval') return;
     const payload = chunk.payload;
 
@@ -1787,6 +1788,7 @@ export class ModelSpanTracker {
           sequenceNumber: this.#chunkSequence,
         },
         output: payload,
+        startTime: observedAt,
         tracingPolicy: this.#modelSpan?.tracingPolicy,
       }),
     );
@@ -1946,7 +1948,7 @@ export class ModelSpanTracker {
                 break;
 
               case 'tool-call-approval': // Approval request - create span for debugging
-                this.#handleToolApprovalChunk(chunk);
+                this.#handleToolApprovalChunk(chunk, providerObservedAt);
                 break;
 
               case 'tool-output':
@@ -1987,7 +1989,7 @@ export class ModelSpanTracker {
                     ? mastraMeta.modelOutput
                     : undefined;
 
-                this.#createEventSpan(chunk.type, spanOutput, { metadata });
+                this.#createEventSpan(chunk.type, spanOutput, { metadata, startTime: providerObservedAt });
                 break;
               }
 
