@@ -2610,6 +2610,56 @@ describe('ModelSpanTracker', () => {
       });
     });
 
+    it('restores only prepared-request aggregate fields from a durable generation span', () => {
+      const staleUsage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
+      const freshUsage = { inputTokens: 7, outputTokens: 3, totalTokens: 10 };
+      const aggregateAttributes = {
+        providerAggregateMeasurementState: 'measured' as const,
+        providerBreakdownState: 'serialized_components_non_additive' as const,
+        providerInferenceCount: 1,
+        providerMeasuredInferenceCount: 1,
+        providerUnknownInferenceCount: 0,
+      };
+
+      const successfulSpan = tracing.startSpan({
+        type: SpanType.MODEL_GENERATION,
+        name: 'rebuilt-successful-generation',
+        attributes: {
+          ...aggregateAttributes,
+          finishReason: 'stale-finish',
+          usage: staleUsage,
+        },
+      });
+      new ModelSpanTracker(successfulSpan).endGeneration({
+        attributes: { finishReason: 'stop' },
+        usage: freshUsage,
+      });
+
+      const failedSpan = tracing.startSpan({
+        type: SpanType.MODEL_GENERATION,
+        name: 'rebuilt-failed-generation',
+        attributes: {
+          ...aggregateAttributes,
+          finishReason: 'stale-finish',
+          usage: staleUsage,
+        },
+      });
+      new ModelSpanTracker(failedSpan).reportGenerationError({
+        error: new Error('fresh failure'),
+        attributes: { usage: freshUsage },
+      });
+
+      const [successfulGeneration, failedGeneration] = testExporter.getSpansByType(SpanType.MODEL_GENERATION);
+      expect(successfulGeneration?.attributes).toMatchObject({
+        finishReason: 'stop',
+        usage: { inputTokens: 7, outputTokens: 3 },
+      });
+      expect(failedGeneration?.attributes).toMatchObject({
+        finishReason: 'error',
+        usage: { inputTokens: 7, outputTokens: 3 },
+      });
+    });
+
     it('derives provider usage state when a durable span restores a malformed value', () => {
       const modelSpan = tracing.startSpan({
         type: SpanType.MODEL_GENERATION,

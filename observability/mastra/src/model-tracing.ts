@@ -492,7 +492,32 @@ function preparedRequestAggregateFromAttributes(
     return undefined;
   }
 
-  return attributes as PreparedModelRequestAggregateMetrics;
+  return {
+    providerAggregateMeasurementState: expectedState,
+    providerBreakdownState: 'serialized_components_non_additive',
+    providerInferenceCount: inferenceCount,
+    providerMeasuredInferenceCount: measuredCount,
+    providerUnknownInferenceCount: unknownCount,
+    providerMessageCountTotal: attributes.providerMessageCountTotal,
+    providerMessageBytesTotal: attributes.providerMessageBytesTotal,
+    providerSystemMessageCountTotal: attributes.providerSystemMessageCountTotal,
+    providerSystemMessageBytesTotal: attributes.providerSystemMessageBytesTotal,
+    providerUserMessageCountTotal: attributes.providerUserMessageCountTotal,
+    providerUserMessageBytesTotal: attributes.providerUserMessageBytesTotal,
+    providerAssistantMessageCountTotal: attributes.providerAssistantMessageCountTotal,
+    providerAssistantMessageBytesTotal: attributes.providerAssistantMessageBytesTotal,
+    providerToolMessageCountTotal: attributes.providerToolMessageCountTotal,
+    providerToolMessageBytesTotal: attributes.providerToolMessageBytesTotal,
+    providerOtherMessageCountTotal: attributes.providerOtherMessageCountTotal,
+    providerOtherMessageBytesTotal: attributes.providerOtherMessageBytesTotal,
+    providerInstructionBytesTotal: attributes.providerInstructionBytesTotal,
+    providerToolCountTotal: attributes.providerToolCountTotal,
+    providerToolSchemaBytesTotal: attributes.providerToolSchemaBytesTotal,
+    providerResponseSchemaBytesTotal: attributes.providerResponseSchemaBytesTotal,
+    providerRequestBytesTotal: attributes.providerRequestBytesTotal,
+    providerPreparationMsTotal: attributes.providerPreparationMsTotal,
+    providerMeasurementMsTotal: attributes.providerMeasurementMsTotal,
+  };
 }
 
 function formatPreviewLabel(label: unknown, fallback: string): string {
