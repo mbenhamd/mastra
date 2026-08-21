@@ -74,6 +74,13 @@ function isDescriptorSafeAbortError(error: unknown): boolean {
   return ownStringDataProperty(error, 'name') === 'AbortError';
 }
 
+function boundedProviderFinishError(outcome: Extract<ProviderInferenceOutcome, 'error' | 'abort'>): Error {
+  const error = new Error(outcome === 'abort' ? 'Provider inference aborted' : 'Provider inference failed');
+  error.name = outcome === 'abort' ? 'AbortError' : 'ProviderInferenceError';
+  error.stack = undefined;
+  return error;
+}
+
 function nonnegativeInteger(value: unknown): number {
   return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : 0;
 }
@@ -742,6 +749,8 @@ export class ModelSpanTracker {
   #pendingStepFinishPayload?: StepFinishPayload<any, any>;
   /** Provider finish observed before core-normalized response identity is ready. */
   #pendingInferenceFinishPayload?: StepFinishPayload<any, any>;
+  /** Provider-boundary timestamp retained while core finishes response attribution. */
+  #pendingInferenceEndTime?: Date;
   /** Whether post-inference work has finished before step-finish was observed. */
   #deferredStepCloseRequested: boolean = false;
   /** Provider-returned identity for the currently open inference. */
@@ -900,6 +909,7 @@ export class ModelSpanTracker {
     this.#currentInferenceCompletionStartTime = undefined;
     this.#currentInferenceResponse = undefined;
     this.#hasNormalizedInferenceResponse = false;
+    this.#pendingInferenceEndTime = undefined;
     if (stepSpan) this.#resetCurrentStep();
     this.#recordProviderOutcome(providerOutcome);
     if (providerOutcome === 'abort') this.#terminalGenerationFinishReason = 'abort';
@@ -1097,6 +1107,7 @@ export class ModelSpanTracker {
     this.#currentInferenceCompletionStartTime = undefined;
     this.#currentInferenceResponse = undefined;
     this.#hasNormalizedInferenceResponse = false;
+    this.#pendingInferenceEndTime = undefined;
     if (inferenceSpan || this.#currentInferenceLifecycleOpen) {
       const providerOutcome: ProviderInferenceOutcome =
         finishReason === 'abort' || finishReason === 'tripwire' ? 'abort' : 'error';
@@ -1145,24 +1156,26 @@ export class ModelSpanTracker {
    *
    * Safe to call multiple times - no-ops if the span is already closed.
    */
-  #endInferenceSpan(payload: ModelInferenceFinishPayload): void {
+  #endInferenceSpan(payload: ModelInferenceFinishPayload | StepFinishPayload<any, any>): void {
     const inferenceSpan = this.#currentInferenceSpan;
     if (!inferenceSpan && !this.#currentInferenceLifecycleOpen) return;
     this.#endChunkSpan();
     const completionStartTime = this.#currentInferenceCompletionStartTime;
     const inferenceResponse = this.#currentInferenceResponse;
+    const inferenceEndTime = this.#pendingInferenceEndTime;
     this.#currentInferenceSpan = undefined;
     this.#currentInferenceCompletionStartTime = undefined;
     this.#currentInferenceResponse = undefined;
     this.#hasNormalizedInferenceResponse = false;
     this.#pendingInferenceFinishPayload = undefined;
+    this.#pendingInferenceEndTime = undefined;
     const providerOutcome: ProviderInferenceOutcome =
       payload.stepResult.reason === 'abort' ? 'abort' : payload.stepResult.reason === 'error' ? 'error' : 'success';
     this.#recordProviderOutcome(providerOutcome);
     if (providerOutcome === 'abort') this.#terminalGenerationFinishReason = 'abort';
     this.#currentStepInferenceApplicable = false;
 
-    let endedWithOutput = false;
+    let endedWithPayload = false;
     if (inferenceSpan)
       runSpanOperation(() => {
         const { usage: rawUsage, ...otherOutput } = payload.output;
@@ -1176,33 +1189,48 @@ export class ModelSpanTracker {
         runSpanOperation(() =>
           this.#modelSpan?.update({ attributes: { providerUsageState: this.#providerUsageState } }),
         );
-        inferenceSpan.end({
-          output: otherOutput,
-          attributes: {
-            usage,
-            finishReason: payload.stepResult.reason,
-            warnings: payload.stepResult.warnings,
-            completionStartTime,
-            ...inferenceResponse,
-            ...usageStates,
-            providerOutcome,
-          },
-        });
-        endedWithOutput = true;
+        const attributes = {
+          usage,
+          finishReason: payload.stepResult.reason,
+          warnings: payload.stepResult.warnings,
+          completionStartTime,
+          ...inferenceResponse,
+          ...usageStates,
+          providerOutcome,
+        };
+        if (providerOutcome === 'success') {
+          inferenceSpan.end({ output: otherOutput, attributes, endTime: inferenceEndTime });
+        } else {
+          inferenceSpan.error({
+            error: boundedProviderFinishError(providerOutcome),
+            endSpan: true,
+            attributes,
+            endTime: inferenceEndTime,
+          });
+        }
+        endedWithPayload = true;
       });
-    if (inferenceSpan && !endedWithOutput) {
+    if (inferenceSpan && !endedWithPayload) {
       this.#providerUsageState = 'provider_not_reported';
       runSpanOperation(() => this.#modelSpan?.update({ attributes: { providerUsageState: this.#providerUsageState } }));
-      runSpanOperation(() =>
-        inferenceSpan.end({
-          attributes: {
-            ...providerUsageStates(undefined, {}),
-            ...(completionStartTime === undefined ? {} : { completionStartTime }),
-            ...inferenceResponse,
-            providerOutcome,
-          },
-        }),
-      );
+      runSpanOperation(() => {
+        const attributes = {
+          ...providerUsageStates(undefined, {}),
+          ...(completionStartTime === undefined ? {} : { completionStartTime }),
+          ...inferenceResponse,
+          providerOutcome,
+        };
+        if (providerOutcome === 'success') {
+          inferenceSpan.end({ attributes, endTime: inferenceEndTime });
+        } else {
+          inferenceSpan.error({
+            error: boundedProviderFinishError(providerOutcome),
+            endSpan: true,
+            attributes,
+            endTime: inferenceEndTime,
+          });
+        }
+      });
     }
   }
 
@@ -1234,6 +1262,8 @@ export class ModelSpanTracker {
     if (runSpanOperation(supportsModelInference) !== true) return;
 
     this.#currentInferenceCompletionStartTime = undefined;
+    this.#pendingInferenceFinishPayload = undefined;
+    this.#pendingInferenceEndTime = undefined;
     const stepSpan = this.#currentStepSpan;
     this.#currentInferenceSpan = runSpanOperation(() => {
       const input = extractStepInput(payload);
@@ -1280,13 +1310,14 @@ export class ModelSpanTracker {
     this.#currentInferenceResponse = undefined;
     this.#hasNormalizedInferenceResponse = false;
     this.#pendingInferenceFinishPayload = undefined;
+    this.#pendingInferenceEndTime = undefined;
     this.#recordProviderOutcome(providerOutcome);
     this.#providerUsageState = 'provider_not_reported';
     if (providerOutcome === 'abort') {
       this.#terminalGenerationFinishReason = 'abort';
     }
     runSpanOperation(() =>
-      inferenceSpan.error({
+      inferenceSpan?.error({
         ...options,
         endSpan: true,
         attributes: {
@@ -1430,6 +1461,7 @@ export class ModelSpanTracker {
     this.#currentStepInferenceApplicable = true;
     this.#pendingStepFinishPayload = undefined;
     this.#pendingInferenceFinishPayload = undefined;
+    this.#pendingInferenceEndTime = undefined;
     this.#deferredStepCloseRequested = false;
     this.#currentInferenceResponse = undefined;
     this.#hasNormalizedInferenceResponse = false;
@@ -1812,6 +1844,7 @@ export class ModelSpanTracker {
               case 'finish':
                 if (this.#currentInferenceLifecycleOpen) {
                   this.#pendingInferenceFinishPayload = chunk.payload;
+                  this.#pendingInferenceEndTime ??= new Date();
                   this.#endChunkSpan();
                 }
                 break;

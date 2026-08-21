@@ -538,8 +538,6 @@ describe('execute prepared provider request measurements', () => {
   });
 
   it('measures every provider retry and anchors the successful attempt separately', async () => {
-    let measurementClockMs = 10_000;
-    const dateNow = vi.spyOn(Date, 'now').mockImplementation(() => ++measurementClockMs);
     const measurements: Array<Record<string, unknown>> = [];
     const providerRequests: Array<Record<string, unknown>> = [];
     const startedAttempts: number[] = [];
@@ -586,11 +584,13 @@ describe('execute prepared provider request measurements', () => {
     expect(failedAttempts).toEqual([1]);
     expect(measurements).toHaveLength(2);
     expect(measurements.map(value => value.providerAttempt)).toEqual([1, 2]);
-    expect(Number(measurements[0]?.providerPreparationMs)).toBeGreaterThan(0);
-    expect(Number(measurements[1]?.providerPreparationMs)).toBeGreaterThan(0);
-    expect(Number(measurements[1]?.providerDispatchTimestampMs)).toBeGreaterThanOrEqual(
-      Number(measurements[0]?.providerDispatchTimestampMs),
-    );
-    dateNow.mockRestore();
+    const firstDispatchTimestampMs = Number(measurements[0]?.providerDispatchTimestampMs);
+    const secondDispatchTimestampMs = Number(measurements[1]?.providerDispatchTimestampMs);
+    const secondPreparationMs = Number(measurements[1]?.providerPreparationMs);
+    const retryDispatchGapMs = secondDispatchTimestampMs - firstDispatchTimestampMs;
+    expect(Number(measurements[0]?.providerPreparationMs)).toBeGreaterThanOrEqual(0);
+    expect(secondPreparationMs).toBeGreaterThanOrEqual(0);
+    expect(retryDispatchGapMs).toBeGreaterThanOrEqual(900);
+    expect(secondPreparationMs).toBeLessThan(retryDispatchGapMs / 2);
   });
 });

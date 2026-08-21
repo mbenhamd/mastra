@@ -407,6 +407,17 @@ async function waitForProviderCall(providerCall: ReturnType<typeof vi.fn>, maxMs
   throw new Error('Timed out waiting for the provider call');
 }
 
+async function waitForStartedSpan(testExporter: TestExporter, type: string, maxMs = 2000) {
+  for (let waited = 0; waited < maxMs; waited += 10) {
+    const event = testExporter.events.find(
+      candidate => candidate.type === 'span_started' && candidate.exportedSpan.type === type,
+    );
+    if (event) return event;
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for ${type} to start`);
+}
+
 const idOf = (s: any) => s.id ?? s.spanId;
 const parentOf = (s: any) => s.parentSpanId;
 
@@ -459,6 +470,100 @@ function expectExactRequestAggregate(generation: any, inferences: any[]) {
     }
   }
 }
+
+describe('provider adapter dispatch boundary (real exporter)', () => {
+  it.each(['regular', 'durable'] as const)(
+    '%s excludes a blocked request processor from MODEL_INFERENCE',
+    async variant => {
+      const testExporter = new TestExporter();
+      let releaseProcessor!: () => void;
+      let releaseAdapter!: () => void;
+      let processorReleasedAt: Date | undefined;
+      let adapterEnteredAt: Date | undefined;
+      const processorGate = new Promise<void>(resolve => {
+        releaseProcessor = resolve;
+      });
+      const adapterGate = new Promise<void>(resolve => {
+        releaseAdapter = resolve;
+      });
+      const processLLMRequest = vi.fn(async () => {
+        await processorGate;
+      });
+      const doStream = vi.fn(async () => {
+        adapterEnteredAt = new Date();
+        await adapterGate;
+        return {
+          stream: convertArrayToReadableStream([
+            { type: 'stream-start', warnings: [] },
+            { type: 'response-metadata', id: 'dispatch-id', modelId: 'dispatch-model', timestamp: new Date(0) },
+            { type: 'text-start', id: 'dispatch-text' },
+            { type: 'text-delta', id: 'dispatch-text', delta: 'done' },
+            { type: 'text-end', id: 'dispatch-text' },
+            { type: 'finish', finishReason: 'stop', usage: { inputTokens: 2, outputTokens: 1, totalTokens: 3 } },
+          ]),
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+        };
+      });
+      const agent = new Agent({
+        id: `${variant}-dispatch-boundary`,
+        name: `${variant}-dispatch-boundary`,
+        instructions: 'x',
+        model: new MockLanguageModelV2({
+          provider: 'dispatch-provider',
+          modelId: 'dispatch-model',
+          doStream,
+        }) as any,
+        inputProcessors: [{ id: 'blocked-request-processor', processLLMRequest }],
+      });
+      let cleanup: (() => void) | undefined;
+      const run = (async () => {
+        if (variant === 'regular') {
+          const result = await buildRegularMastra(testExporter, agent).stream('hi');
+          await result.consumeStream();
+          return;
+        }
+        const { wrapped } = buildMastra(testExporter, agent, 'durable');
+        const result = await wrapped.stream('hi');
+        cleanup = result.cleanup;
+        await result.output.consumeStream();
+      })();
+
+      try {
+        await waitForProviderCall(processLLMRequest);
+        await new Promise(resolve => setTimeout(resolve, 40));
+        expect(doStream).not.toHaveBeenCalled();
+        expect(
+          testExporter.events.filter(
+            event => event.type === 'span_started' && event.exportedSpan.type === 'model_inference',
+          ),
+        ).toHaveLength(0);
+
+        processorReleasedAt = new Date();
+        releaseProcessor();
+        await waitForProviderCall(doStream);
+        const inferenceStart = await waitForStartedSpan(testExporter, 'model_inference');
+        expect(new Date(inferenceStart.exportedSpan.startTime).getTime()).toBeGreaterThanOrEqual(
+          processorReleasedAt.getTime(),
+        );
+        expect(new Date(inferenceStart.exportedSpan.startTime).getTime()).toBeLessThanOrEqual(
+          adapterEnteredAt!.getTime(),
+        );
+
+        releaseAdapter();
+        await run;
+        await settle(testExporter);
+        expect(testExporter.getSpansByType('model_inference' as any)).toHaveLength(1);
+        expect(testExporter.getIncompleteSpans()).toHaveLength(0);
+      } finally {
+        releaseProcessor();
+        releaseAdapter();
+        await run.catch(() => undefined);
+        cleanup?.();
+      }
+    },
+  );
+});
 
 describe('regular Agent provider request ledger (real exporter)', () => {
   let testExporter: TestExporter;
@@ -583,6 +688,57 @@ describe('regular Agent provider request ledger (real exporter)', () => {
     expect(testExporter.getIncompleteSpans()).toHaveLength(0);
   });
 
+  it('preserves first content and exact error aggregates after a terminal stream rejection', async () => {
+    const { model, doStream } = partialErrorThenTextModel();
+    const agent = buildRegularMastra(
+      testExporter,
+      new Agent({
+        id: 'partial-terminal-error',
+        name: 'partial-terminal-error',
+        instructions: 'x',
+        model: model as any,
+        maxRetries: 0,
+      }),
+    );
+    const result = await agent.stream('hi');
+    let visibleText = '';
+    try {
+      for await (const text of result.textStream) {
+        visibleText += text;
+      }
+    } catch {
+      // Some stream consumers rethrow the terminal provider rejection; the
+      // provider-attempt ledger below is the canonical failure observable.
+    }
+    await settle(testExporter);
+
+    expect(doStream).toHaveBeenCalledOnce();
+    expect(visibleText).toBe('partial');
+    const [inference] = testExporter.getSpansByType('model_inference' as any);
+    expect(inference?.attributes).toMatchObject({
+      responseId: 'partial-failure',
+      responseModel: 'partial-model',
+      completionStartTime: expect.any(Date),
+      measurementState: 'measured',
+      providerUsageState: 'provider_not_reported',
+      providerOutcome: 'error',
+    });
+    expect((inference?.attributes?.completionStartTime as Date).getTime()).toBeGreaterThanOrEqual(
+      new Date(inference!.startTime).getTime(),
+    );
+    const [generation] = testExporter.getSpansByType('model_generation' as any);
+    expect(generation?.attributes).toMatchObject({
+      providerAggregateMeasurementState: 'measured',
+      providerInferenceCount: 1,
+      providerUsageState: 'provider_not_reported',
+      providerSucceededInferenceCount: 0,
+      providerErrorInferenceCount: 1,
+      providerAbortedInferenceCount: 0,
+    });
+    expectExactRequestAggregate(generation, [inference]);
+    expect(testExporter.getIncompleteSpans()).toHaveLength(0);
+  });
+
   it('numbers fallback-model calls cumulatively within one regular model step', async () => {
     const { primary, fallback, primaryDoStream, fallbackDoStream } = fallbackModelPair();
     const agent = buildRegularMastra(
@@ -636,6 +792,50 @@ describe('regular Agent provider request ledger (real exporter)', () => {
       responseModel: 'served-fallback-model',
       providerOutcome: 'success',
     });
+    expect(testExporter.getIncompleteSpans()).toHaveLength(0);
+  });
+
+  it('ends regular inference at provider finish before delayed finish output processing', async () => {
+    let finishProcessorStartedAt: Date | undefined;
+    let finishProcessorCompletedAt: Date | undefined;
+    const delayedFinishProcessor = {
+      id: 'delayed-finish-output',
+      name: 'Delayed finish output',
+      async processOutputStream({ part }: { part: { type?: string } }) {
+        if (part.type === 'finish') {
+          finishProcessorStartedAt = new Date();
+          await new Promise(resolve => setTimeout(resolve, 220));
+          finishProcessorCompletedAt = new Date();
+        }
+        return part;
+      },
+    };
+    const agent = buildRegularMastra(
+      testExporter,
+      new Agent({
+        id: 'regular-provider-finish-boundary',
+        name: 'regular-provider-finish-boundary',
+        instructions: 'x',
+        model: responseIdentityModel('served-response', 'requested-response-model', {
+          anthropic: { iterations: [{ type: 'fallback_message', model: 'served-fallback-model' }] },
+        }) as any,
+        outputProcessors: [delayedFinishProcessor as any],
+      }),
+    );
+
+    await runRegularToCompletion(agent, 'hi', testExporter);
+
+    const [inference] = testExporter.getSpansByType('model_inference' as any);
+    const [step] = testExporter.getSpansByType('model_step' as any);
+    expect(finishProcessorStartedAt).toBeDefined();
+    expect(finishProcessorCompletedAt).toBeDefined();
+    expect(inference?.attributes).toMatchObject({
+      responseId: 'served-response',
+      responseModel: 'served-fallback-model',
+      providerOutcome: 'success',
+    });
+    expect(new Date(inference!.endTime!).getTime()).toBeLessThanOrEqual(finishProcessorStartedAt!.getTime());
+    expect(new Date(step!.endTime!).getTime()).toBeGreaterThanOrEqual(finishProcessorCompletedAt!.getTime());
     expect(testExporter.getIncompleteSpans()).toHaveLength(0);
   });
 
@@ -742,6 +942,38 @@ describe('durable-agent observability — full span tree (real exporter)', () =>
       providerRequestBytesTotal: expect.any(Number),
     });
     // the whole point: nothing dangling
+    expect(testExporter.getIncompleteSpans()).toHaveLength(0);
+  });
+
+  it('keeps a durable output-step processor inside its live MODEL_STEP', async () => {
+    const processOutputStep = vi.fn(async ({ messageList }: { messageList: unknown }) => messageList);
+    const agent = new Agent({
+      id: 'durable-output-step-parent',
+      name: 'durable-output-step-parent',
+      instructions: 'x',
+      model: textModel('Hello') as any,
+      outputProcessors: [{ id: 'durable-output-step', processOutputStep } as any],
+    });
+    const { wrapped } = buildMastra(testExporter, agent, 'durable');
+    await runToCompletion(wrapped, 'hi', testExporter);
+
+    expect(processOutputStep).toHaveBeenCalledOnce();
+    const [step] = testExporter.getSpansByType('model_step' as any);
+    const outputStepProcessor = testExporter
+      .getSpansByType('processor_run' as any)
+      .find(span => span.name === 'output step processor: durable-output-step');
+    expect(step).toBeDefined();
+    expect(outputStepProcessor).toBeDefined();
+    expect(parentOf(outputStepProcessor)).toBe(idOf(step));
+    expect(new Date(outputStepProcessor!.endTime!).getTime()).toBeLessThanOrEqual(new Date(step!.endTime!).getTime());
+    const processorEndEventIndex = testExporter.events.findIndex(
+      event => event.type === 'span_ended' && idOf(event.exportedSpan) === idOf(outputStepProcessor),
+    );
+    const stepEndEventIndex = testExporter.events.findIndex(
+      event => event.type === 'span_ended' && idOf(event.exportedSpan) === idOf(step),
+    );
+    expect(processorEndEventIndex).toBeGreaterThanOrEqual(0);
+    expect(processorEndEventIndex).toBeLessThan(stepEndEventIndex);
     expect(testExporter.getIncompleteSpans()).toHaveLength(0);
   });
 

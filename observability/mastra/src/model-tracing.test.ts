@@ -1774,6 +1774,127 @@ describe('ModelSpanTracker', () => {
       expect(inferenceSpan!.attributes.usage).toBeDefined();
     });
 
+    it.each([
+      { reason: 'error' as const, outcome: 'error', errorName: 'ProviderInferenceError' },
+      { reason: 'abort' as const, outcome: 'abort', errorName: 'AbortError' },
+    ])(
+      'exports terminal provider $reason finishes as errored inference spans',
+      async ({ reason, outcome, errorName }) => {
+        const modelSpan = tracing.startSpan({
+          type: SpanType.MODEL_GENERATION,
+          name: 'test-generation',
+        });
+        const tracker = new ModelSpanTracker(modelSpan);
+        tracker.startStep();
+        tracker.startInference();
+
+        await consumeStream(
+          tracker.wrapStream(
+            createMockStream([
+              {
+                type: 'finish',
+                payload: {
+                  output: {
+                    usage: { inputTokens: 2, outputTokens: 1, totalTokens: 3 },
+                    rawError: 'SENSITIVE_PROVIDER_ERROR',
+                  },
+                  stepResult: { reason, warnings: [], isContinued: false },
+                  metadata: {},
+                },
+              },
+            ]),
+          ),
+        );
+        tracker.endInference();
+        modelSpan.end();
+
+        const [inferenceSpan] = testExporter.getSpansByType(SpanType.MODEL_INFERENCE);
+        expect(inferenceSpan?.attributes).toMatchObject({
+          finishReason: reason,
+          providerOutcome: outcome,
+          usage: { inputTokens: 2, outputTokens: 1 },
+        });
+        expect(inferenceSpan?.errorInfo).toMatchObject({
+          name: errorName,
+          message: reason === 'abort' ? 'Provider inference aborted' : 'Provider inference failed',
+        });
+        expect(inferenceSpan?.output).toBeUndefined();
+        expect(JSON.stringify(inferenceSpan)).not.toContain('SENSITIVE_PROVIDER_ERROR');
+      },
+    );
+
+    it('passes through accessor and proxy response metadata without invoking hooks or attributing it', async () => {
+      const modelSpan = tracing.startSpan({
+        type: SpanType.MODEL_GENERATION,
+        name: 'test-generation',
+      });
+      const tracker = new ModelSpanTracker(modelSpan);
+      const metadataHookCalls: string[] = [];
+      const accessorMetadata = Object.defineProperties(
+        {},
+        {
+          id: {
+            enumerable: true,
+            get() {
+              metadataHookCalls.push('accessor:id');
+              return 'unsafe-accessor-id';
+            },
+          },
+          modelId: {
+            enumerable: true,
+            get() {
+              metadataHookCalls.push('accessor:modelId');
+              return 'unsafe-accessor-model';
+            },
+          },
+        },
+      );
+      const proxyMetadata = new Proxy(
+        { id: 'unsafe-proxy-id', modelId: 'unsafe-proxy-model' },
+        {
+          get(target, key, receiver) {
+            metadataHookCalls.push(`proxy:get:${String(key)}`);
+            return Reflect.get(target, key, receiver);
+          },
+          getOwnPropertyDescriptor(target, key) {
+            metadataHookCalls.push(`proxy:descriptor:${String(key)}`);
+            return Reflect.getOwnPropertyDescriptor(target, key);
+          },
+          ownKeys(target) {
+            metadataHookCalls.push('proxy:ownKeys');
+            return Reflect.ownKeys(target);
+          },
+        },
+      );
+
+      tracker.startStep();
+      tracker.startInference();
+      const forwarded = await consumeStream(
+        tracker.wrapStream(
+          createMockStream([
+            { type: 'response-metadata', payload: accessorMetadata },
+            { type: 'response-metadata', payload: proxyMetadata },
+            { type: 'text-delta', payload: { text: 'safe output' } },
+            {
+              type: 'step-finish',
+              payload: {
+                output: { usage: { inputTokens: 2, outputTokens: 1, totalTokens: 3 } },
+                stepResult: { reason: 'stop', warnings: [], isContinued: false },
+                metadata: {},
+              },
+            },
+          ]),
+        ),
+      );
+      modelSpan.end();
+
+      expect(forwarded).toHaveLength(4);
+      expect(metadataHookCalls).toEqual([]);
+      const [inferenceSpan] = testExporter.getSpansByType(SpanType.MODEL_INFERENCE);
+      expect(inferenceSpan?.attributes).not.toHaveProperty('responseId');
+      expect(inferenceSpan?.attributes).not.toHaveProperty('responseModel');
+    });
+
     it('records first-content time independently for every provider inference', async () => {
       const modelSpan = tracing.startSpan({
         type: SpanType.MODEL_GENERATION,

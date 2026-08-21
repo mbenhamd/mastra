@@ -65,7 +65,7 @@ export class DefaultSpan<TType extends SpanType> extends BaseSpan<TType> {
     if (this.isEvent) {
       return;
     }
-    this.endTime = new Date();
+    this.endTime = options?.endTime ? new Date(options.endTime.getTime()) : new Date();
     // Metadata is always updated (read by correlation/logger/metrics contexts).
     if (options?.metadata) {
       this.metadata = { ...this.metadata, ...deepClean(options.metadata, this.deepCleanOptions) };
@@ -88,7 +88,7 @@ export class DefaultSpan<TType extends SpanType> extends BaseSpan<TType> {
       return;
     }
 
-    const { error, endSpan = true, attributes, metadata } = options;
+    const { error, endSpan = true, endTime, attributes, metadata } = options;
 
     if (metadata) {
       this.metadata = { ...this.metadata, ...deepClean(metadata, this.deepCleanOptions) };
@@ -123,7 +123,7 @@ export class DefaultSpan<TType extends SpanType> extends BaseSpan<TType> {
     }
 
     if (endSpan) {
-      this.end();
+      this.end({ endTime });
     } else {
       // Trigger span update event when not ending the span
       this.update({});

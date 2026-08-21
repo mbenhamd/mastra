@@ -1496,6 +1496,11 @@ interface UpdateBaseOptions<TType extends SpanType> {
 export interface EndSpanOptions<TType extends SpanType> extends UpdateBaseOptions<TType> {
   /** Output data */
   output?: any;
+  /**
+   * Actual operation end time when final span enrichment happens later.
+   * Defaults to the time `end()` is called.
+   */
+  endTime?: Date;
 }
 
 /** Options for updating a span's attributes, input, or output mid-flight. */
@@ -1514,6 +1519,11 @@ export interface ErrorSpanOptions<TType extends SpanType> extends UpdateBaseOpti
   error: MastraError | Error;
   /** End the span when true */
   endSpan?: boolean;
+  /**
+   * Actual operation end time when final span enrichment happens later.
+   * Used only when `endSpan` is true.
+   */
+  endTime?: Date;
 }
 
 /** Options for retrieving an existing span or creating a new one from a tracing context. */
