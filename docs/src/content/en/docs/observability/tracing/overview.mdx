@@ -886,6 +886,80 @@ Mastra automatically creates spans for:
 - **Tool executions**: Function calls with inputs and outputs
 - **Memory operations**: Thread and semantic recall
 
+### Provider request measurements
+
+Model tracing records content-free measurements for the final request passed to
+each provider adapter. These attributes help separate prompt construction,
+provider latency, retries, and provider-reported usage without adding another
+copy of the request content to the trace.
+
+Each `MODEL_INFERENCE` span represents one provider adapter invocation. Its
+`model` and `provider` attributes identify the effective model selected for that
+call, including a model selected by an input processor. `providerAttempt` is a
+one-based counter within the model step.
+
+The inference span can include these request attributes:
+
+- `measurementState`: `measured` when the bounded request snapshot is complete,
+  otherwise `unknown`.
+- `providerMessageCount` and `providerMessageBytes`: The serialized provider
+  prompt size, with separate count and byte fields for system, user, assistant,
+  tool, and other roles.
+- `providerInstructionBytes`: The serialized system-message subset.
+- `providerToolCount` and `providerToolSchemaBytes`: The prepared tool surface.
+  `providerToolSchemaState` distinguishes `measured`, `not_applicable`, and
+  `unknown`.
+- `providerResponseSchemaBytes`: The response schema size when present.
+  `providerResponseSchemaState` also uses `inline_in_prompt` when the schema was
+  injected into the prompt.
+- `providerRequestBytes`: The serialized size of the complete object passed to
+  the adapter.
+- `providerPreparationMs`, `providerMeasurementMs`, and
+  `providerDispatchTimestampMs`: Request preparation, diagnostic measurement,
+  and dispatch timing.
+- `providerReasoningEffort`: The `none`, `low`, `medium`, `high`, `xhigh`, or
+  `max` effort found in the final provider options.
+  `providerReasoningEffortState` distinguishes an explicit `measured` value from
+  `provider_default` and `unknown`; Mastra doesn't guess a provider default.
+
+The request, role, instruction, tool-schema, and response-schema byte fields are
+serialized views that can overlap. `providerBreakdownState` is therefore
+`serialized_components_non_additive`. Don't add those fields to estimate the
+complete request size. Use `providerRequestBytes` for that value.
+
+Provider usage has its own state fields. `reported` means the provider returned
+the measurement, `provider_not_reported` means an inference occurred without
+that measurement, and `not_applicable` means no provider inference occurred.
+Missing usage is not zero usage. Cache-read, cache-write, and reasoning-token
+usage use the same state distinction.
+
+The parent `MODEL_GENERATION` span rolls up every provider attempt. It records
+the inference, measured, and unknown counts plus complete byte, count,
+preparation, and measurement totals. `providerAggregateMeasurementState` is
+`measured`, `partial`, `unknown`, or `not_applicable`. An optional total is
+omitted when any contributing inference lacks that measurement, so a partial
+sum isn't presented as complete.
+
+Retries open a new inference span and rebuild the top-level provider request for
+each attempt. A failed attempt ends as an error span, while the generation
+aggregate retains its measurement. An abort after dispatch closes the active
+inference as an error and retains the aggregate. A cache replay or processor
+decision that stops before dispatch creates no provider inference and reports
+the aggregate and usage as `not_applicable`.
+
+Exact measurement accepts only bounded, data-only JSON shapes. It doesn't call
+request getters, iterators, proxies, or `toJSON` methods. The snapshot is limited
+to 256 KiB of JSON code units, 10,000 nodes, and 64 levels of nesting. Unsupported
+or larger values produce an unknown measurement, and measurement or observer
+failures don't change provider dispatch, retry, abort, or result behavior.
+
+These attributes don't make the rest of a trace content-free. Normal span input
+and output still follow the configured tracing policy and sensitive-data
+filters. The measurement attributes themselves contain counts, byte sizes,
+durations, timestamps, bounded states, and effective model settings. They don't
+contain prompts, instructions, tool schemas, tool arguments, tool results, or
+model output.
+
 ### Workflow operations
 
 - **Workflow runs**: Full execution from start to finish

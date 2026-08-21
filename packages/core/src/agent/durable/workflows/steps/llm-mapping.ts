@@ -60,6 +60,7 @@ const durableLLMMappingOutputSchema = z.object({
   processorRetryCount: z.number().optional(),
   processorRetryFeedback: z.string().optional(),
   modelEntryId: z.string().optional(),
+  modelSpanData: z.any().optional(),
   responseRecoveryConsumed: z.boolean().optional(),
 });
 
@@ -229,7 +230,8 @@ export function createDurableLLMMappingStep() {
           // toModelOutput is absent or fails — otherwise provider-executed tools
           // or tools without a mapper lose their metadata.
           let providerMetadata: Record<string, unknown> | undefined = toolResult.providerMetadata as
-            Record<string, unknown> | undefined;
+            | Record<string, unknown>
+            | undefined;
           if (
             !toolResult.error &&
             toolResult.result != null &&
@@ -237,7 +239,8 @@ export function createDurableLLMMappingStep() {
             !toolResult.modelOutputComputed
           ) {
             const tool = registryTools?.[toolResult.toolName] as
-              { toModelOutput?: (output: unknown) => unknown } | undefined;
+              | { toModelOutput?: (output: unknown) => unknown }
+              | undefined;
 
             if (tool?.toModelOutput) {
               const mappingSpan = stepSpan?.createChildSpan({
@@ -432,6 +435,7 @@ export function createDurableLLMMappingStep() {
         processorRetryCount: llmOutput.processorRetryCount,
         processorRetryFeedback: llmOutput.processorRetryFeedback,
         modelEntryId: llmOutput.modelEntryId,
+        modelSpanData: llmOutput.modelSpanData,
         responseRecoveryConsumed: llmOutput.responseRecoveryConsumed,
         delegationBailed,
         ...(terminalToolResult ? { terminalToolResult } : {}),

@@ -1774,6 +1774,57 @@ describe('ModelSpanTracker', () => {
       expect(inferenceSpan!.attributes.usage).toBeDefined();
     });
 
+    it('records first-content time independently for every provider inference', async () => {
+      const modelSpan = tracing.startSpan({
+        type: SpanType.MODEL_GENERATION,
+        name: 'test-generation',
+        attributes: { model: 'gpt-test', provider: 'test', streaming: true },
+      });
+      const tracker = new ModelSpanTracker(modelSpan);
+      const finish = {
+        type: 'step-finish',
+        payload: {
+          output: { usage: { totalTokens: 1 } },
+          stepResult: { reason: 'tool-calls', warnings: [] },
+          metadata: {},
+        },
+      } as const;
+
+      tracker.startStep();
+      tracker.startInference();
+      await consumeStream(
+        tracker.wrapStream(
+          createMockStream([
+            {
+              type: 'tool-call',
+              payload: { toolCallId: 'tool-first', toolName: 'search', args: { query: 'x' } },
+            },
+            finish,
+          ]),
+        ),
+      );
+      await new Promise(resolve => setTimeout(resolve, 15));
+      tracker.startStep();
+      tracker.startInference();
+      await consumeStream(
+        tracker.wrapStream(createMockStream([{ type: 'text-delta', payload: { text: 'second' } }, finish])),
+      );
+      modelSpan.end();
+
+      const inferenceSpans = testExporter.getSpansByType(SpanType.MODEL_INFERENCE);
+      expect(inferenceSpans).toHaveLength(2);
+      for (const inferenceSpan of inferenceSpans) {
+        const completionStartTime = inferenceSpan.attributes.completionStartTime;
+        expect(completionStartTime).toBeInstanceOf(Date);
+        expect((completionStartTime as Date).getTime()).toBeGreaterThanOrEqual(
+          new Date(inferenceSpan.startTime).getTime(),
+        );
+      }
+      expect((inferenceSpans[1]!.attributes.completionStartTime as Date).getTime()).toBeGreaterThan(
+        (inferenceSpans[0]!.attributes.completionStartTime as Date).getTime(),
+      );
+    });
+
     it('applies inference context (parameters / providerOptions / availableTools / toolChoice / responseFormat) set via setInferenceContext', async () => {
       const modelSpan = tracing.startSpan({
         type: SpanType.MODEL_GENERATION,
@@ -1899,6 +1950,32 @@ describe('ModelSpanTracker', () => {
         toolChoice: 'required',
       });
       tracker.startInference();
+      tracker.recordPreparedRequest({
+        measurementState: 'measured',
+        providerBreakdownState: 'serialized_components_non_additive',
+        providerMessageCount: 2,
+        providerMessageBytes: 101,
+        providerSystemMessageCount: 1,
+        providerSystemMessageBytes: 45,
+        providerUserMessageCount: 1,
+        providerUserMessageBytes: 54,
+        providerAssistantMessageCount: 0,
+        providerAssistantMessageBytes: 0,
+        providerToolMessageCount: 0,
+        providerToolMessageBytes: 0,
+        providerOtherMessageCount: 0,
+        providerOtherMessageBytes: 0,
+        providerInstructionBytes: 45,
+        providerToolCount: 2,
+        providerToolSchemaBytes: 88,
+        providerToolSchemaState: 'measured',
+        providerResponseSchemaState: 'not_applicable',
+        providerReasoningEffortState: 'provider_default',
+        providerRequestBytes: 233,
+        providerPreparationMs: 4,
+        providerMeasurementMs: 1,
+        providerDispatchTimestampMs: 1_700_000_000_000,
+      });
 
       const chunks = [
         { type: 'text-delta', payload: { text: 'ok' } },
@@ -1911,9 +1988,475 @@ describe('ModelSpanTracker', () => {
       modelSpan.end();
 
       const [inferenceSpan] = testExporter.getSpansByType(SpanType.MODEL_INFERENCE);
+      const [generationSpan] = testExporter.getSpansByType(SpanType.MODEL_GENERATION);
       expect(inferenceSpan).toBeDefined();
       expect(inferenceSpan!.attributes?.availableTools).toEqual(['searchDocs', 'lookupOrder']);
       expect(inferenceSpan!.attributes?.toolChoice).toEqual('required');
+      expect(inferenceSpan!.attributes).toMatchObject({
+        measurementState: 'measured',
+        providerBreakdownState: 'serialized_components_non_additive',
+        providerMessageBytes: 101,
+        providerToolSchemaBytes: 88,
+        providerRequestBytes: 233,
+      });
+      expect(generationSpan!.attributes).toMatchObject({
+        providerAggregateMeasurementState: 'measured',
+        providerBreakdownState: 'serialized_components_non_additive',
+        providerInferenceCount: 1,
+        providerMeasuredInferenceCount: 1,
+        providerUnknownInferenceCount: 0,
+        providerMessageCountTotal: 2,
+        providerMessageBytesTotal: 101,
+        providerSystemMessageCountTotal: 1,
+        providerSystemMessageBytesTotal: 45,
+        providerUserMessageCountTotal: 1,
+        providerUserMessageBytesTotal: 54,
+        providerAssistantMessageCountTotal: 0,
+        providerAssistantMessageBytesTotal: 0,
+        providerToolMessageCountTotal: 0,
+        providerToolMessageBytesTotal: 0,
+        providerOtherMessageCountTotal: 0,
+        providerOtherMessageBytesTotal: 0,
+        providerInstructionBytesTotal: 45,
+        providerToolCountTotal: 2,
+        providerToolSchemaBytesTotal: 88,
+        providerResponseSchemaBytesTotal: 0,
+        providerRequestBytesTotal: 233,
+        providerPreparationMsTotal: 4,
+        providerMeasurementMsTotal: 1,
+      });
+    });
+
+    it('keeps tool-result request growth and provider usage availability explicit across two inferences', async () => {
+      const modelSpan = tracing.startSpan({
+        type: SpanType.MODEL_GENERATION,
+        name: 'test-generation',
+      });
+      const tracker = new ModelSpanTracker(modelSpan);
+
+      tracker.startStep();
+      tracker.startInference();
+      tracker.recordPreparedRequest({
+        measurementState: 'measured',
+        providerBreakdownState: 'serialized_components_non_additive',
+        providerMessageCount: 1,
+        providerMessageBytes: 20,
+        providerSystemMessageCount: 0,
+        providerSystemMessageBytes: 0,
+        providerUserMessageCount: 1,
+        providerUserMessageBytes: 20,
+        providerAssistantMessageCount: 0,
+        providerAssistantMessageBytes: 0,
+        providerToolMessageCount: 0,
+        providerToolMessageBytes: 0,
+        providerOtherMessageCount: 0,
+        providerOtherMessageBytes: 0,
+        providerInstructionBytes: 0,
+        providerToolCount: 0,
+        providerToolSchemaState: 'not_applicable',
+        providerResponseSchemaState: 'not_applicable',
+        providerReasoningEffortState: 'provider_default',
+        providerRequestBytes: 42,
+        providerPreparationMs: 2,
+        providerMeasurementMs: 1,
+        providerDispatchTimestampMs: 100,
+      });
+      await consumeStream(
+        tracker.wrapStream(
+          createMockStream([
+            {
+              type: 'step-finish',
+              payload: {
+                output: { usage: { inputTokens: 8, outputTokens: 2 } },
+                stepResult: { reason: 'tool-calls', warnings: [] },
+                metadata: {},
+              },
+            },
+          ]),
+        ),
+      );
+
+      tracker.startStep();
+      tracker.startInference();
+      tracker.recordPreparedRequest({
+        measurementState: 'unknown',
+        providerBreakdownState: 'serialized_components_non_additive',
+        providerMessageCount: 3,
+        providerMessageBytes: 50,
+        providerSystemMessageCount: 1,
+        providerSystemMessageBytes: 15,
+        providerUserMessageCount: 1,
+        providerUserMessageBytes: 25,
+        providerAssistantMessageCount: 0,
+        providerAssistantMessageBytes: 0,
+        providerToolMessageCount: 1,
+        providerToolMessageBytes: 10,
+        providerOtherMessageCount: 0,
+        providerOtherMessageBytes: 0,
+        providerInstructionBytes: 15,
+        providerToolCount: 1,
+        providerToolSchemaState: 'unknown',
+        providerResponseSchemaState: 'not_applicable',
+        providerReasoningEffortState: 'provider_default',
+        providerPreparationMs: 3,
+        providerMeasurementMs: 1,
+        providerDispatchTimestampMs: 200,
+      });
+      await consumeStream(
+        tracker.wrapStream(
+          createMockStream([
+            {
+              type: 'step-finish',
+              payload: {
+                output: {},
+                stepResult: { reason: 'stop', warnings: [] },
+                metadata: {},
+              },
+            },
+          ]),
+        ),
+      );
+
+      // A durable accumulator may present numeric totals even when one provider
+      // omitted usage. The per-inference state must keep the turn conservative.
+      tracker.endGeneration({
+        attributes: {},
+        usage: { inputTokens: 8, outputTokens: 2, totalTokens: 10 },
+      });
+
+      const inferenceSpans = testExporter.getSpansByType(SpanType.MODEL_INFERENCE);
+      expect(inferenceSpans).toHaveLength(2);
+      expect(inferenceSpans[0]!.attributes).toMatchObject({
+        providerUsageState: 'reported',
+        providerCacheReadUsageState: 'provider_not_reported',
+        providerReasoningUsageState: 'provider_not_reported',
+      });
+      expect(inferenceSpans[1]!.attributes).toMatchObject({
+        providerUsageState: 'provider_not_reported',
+        providerMessageCount: 3,
+        providerToolMessageCount: 1,
+        providerToolMessageBytes: 10,
+      });
+
+      const [generationSpan] = testExporter.getSpansByType(SpanType.MODEL_GENERATION);
+      expect(generationSpan!.attributes).toMatchObject({
+        providerAggregateMeasurementState: 'partial',
+        providerBreakdownState: 'serialized_components_non_additive',
+        providerInferenceCount: 2,
+        providerMeasuredInferenceCount: 1,
+        providerUnknownInferenceCount: 1,
+        providerMessageCountTotal: 4,
+        providerMessageBytesTotal: 70,
+        providerSystemMessageCountTotal: 1,
+        providerSystemMessageBytesTotal: 15,
+        providerUserMessageCountTotal: 2,
+        providerUserMessageBytesTotal: 45,
+        providerAssistantMessageCountTotal: 0,
+        providerAssistantMessageBytesTotal: 0,
+        providerToolMessageCountTotal: 1,
+        providerToolMessageBytesTotal: 10,
+        providerOtherMessageCountTotal: 0,
+        providerOtherMessageBytesTotal: 0,
+        providerInstructionBytesTotal: 15,
+        providerToolCountTotal: 1,
+        providerResponseSchemaBytesTotal: 0,
+        providerPreparationMsTotal: 5,
+        providerMeasurementMsTotal: 2,
+        providerUsageState: 'provider_not_reported',
+      });
+      expect(generationSpan!.attributes.providerToolSchemaBytesTotal).toBeUndefined();
+      expect(generationSpan!.attributes.providerRequestBytesTotal).toBeUndefined();
+    });
+
+    it('keeps retry attempts as distinct provider inference spans', async () => {
+      const modelSpan = tracing.startSpan({
+        type: SpanType.MODEL_GENERATION,
+        name: 'retry-generation',
+      });
+      const tracker = new ModelSpanTracker(modelSpan);
+      const requestMetrics = {
+        measurementState: 'measured' as const,
+        providerBreakdownState: 'serialized_components_non_additive' as const,
+        providerMessageCount: 1,
+        providerMessageBytes: 20,
+        providerSystemMessageCount: 0,
+        providerSystemMessageBytes: 0,
+        providerUserMessageCount: 1,
+        providerUserMessageBytes: 20,
+        providerAssistantMessageCount: 0,
+        providerAssistantMessageBytes: 0,
+        providerToolMessageCount: 0,
+        providerToolMessageBytes: 0,
+        providerOtherMessageCount: 0,
+        providerOtherMessageBytes: 0,
+        providerInstructionBytes: 0,
+        providerToolCount: 0,
+        providerToolSchemaState: 'not_applicable' as const,
+        providerResponseSchemaState: 'not_applicable' as const,
+        providerReasoningEffortState: 'measured' as const,
+        providerReasoningEffort: 'low' as const,
+        providerRequestBytes: 42,
+        providerMeasurementMs: 1,
+      };
+
+      tracker.startStep();
+      tracker.startInference();
+      tracker.recordPreparedRequest({
+        ...requestMetrics,
+        providerAttempt: 1,
+        providerPreparationMs: 3,
+        providerDispatchTimestampMs: 100,
+      });
+      tracker.reportInferenceError({ error: new Error('retryable provider failure') });
+      tracker.startInference(undefined, 2);
+      tracker.recordPreparedRequest({
+        ...requestMetrics,
+        providerAttempt: 2,
+        providerPreparationMs: 0,
+        providerDispatchTimestampMs: 200,
+      });
+      await consumeStream(
+        tracker.wrapStream(
+          createMockStream([
+            { type: 'text-delta', payload: { text: 'ok' } },
+            {
+              type: 'step-finish',
+              payload: {
+                output: { usage: { inputTokens: 9, outputTokens: 2 } },
+                stepResult: { reason: 'stop', warnings: [] },
+                metadata: {},
+              },
+            },
+          ]),
+        ),
+      );
+      tracker.endGeneration({ usage: { inputTokens: 9, outputTokens: 2, totalTokens: 11 } });
+
+      const inferenceSpans = testExporter.getSpansByType(SpanType.MODEL_INFERENCE);
+      expect(inferenceSpans).toHaveLength(2);
+      expect(inferenceSpans[0]).toMatchObject({
+        attributes: {
+          providerAttempt: 1,
+          providerUsageState: 'provider_not_reported',
+        },
+        errorInfo: expect.any(Object),
+      });
+      expect(inferenceSpans[1]).toMatchObject({
+        attributes: {
+          providerAttempt: 2,
+          providerReasoningEffort: 'low',
+          providerUsageState: 'reported',
+        },
+      });
+      const [generationSpan] = testExporter.getSpansByType(SpanType.MODEL_GENERATION);
+      expect(generationSpan?.attributes).toMatchObject({
+        providerAggregateMeasurementState: 'measured',
+        providerInferenceCount: 2,
+        providerMessageBytesTotal: 40,
+        providerPreparationMsTotal: 3,
+        providerUsageState: 'provider_not_reported',
+      });
+    });
+
+    it('continues a validated prepared-request aggregate after a durable span rebuild', () => {
+      const modelSpan = tracing.startSpan({
+        type: SpanType.MODEL_GENERATION,
+        name: 'rebuilt-generation',
+        attributes: {
+          providerAggregateMeasurementState: 'measured',
+          providerBreakdownState: 'serialized_components_non_additive',
+          providerInferenceCount: 1,
+          providerMeasuredInferenceCount: 1,
+          providerUnknownInferenceCount: 0,
+          providerMessageCountTotal: 1,
+          providerMessageBytesTotal: 20,
+          providerSystemMessageCountTotal: 0,
+          providerSystemMessageBytesTotal: 0,
+          providerUserMessageCountTotal: 1,
+          providerUserMessageBytesTotal: 20,
+          providerAssistantMessageCountTotal: 0,
+          providerAssistantMessageBytesTotal: 0,
+          providerToolMessageCountTotal: 0,
+          providerToolMessageBytesTotal: 0,
+          providerOtherMessageCountTotal: 0,
+          providerOtherMessageBytesTotal: 0,
+          providerInstructionBytesTotal: 0,
+          providerToolCountTotal: 0,
+          providerToolSchemaBytesTotal: 0,
+          providerResponseSchemaBytesTotal: 0,
+          providerRequestBytesTotal: 42,
+          providerPreparationMsTotal: 2,
+          providerMeasurementMsTotal: 1,
+        },
+      });
+      const tracker = new ModelSpanTracker(modelSpan);
+
+      tracker.startStep();
+      tracker.startInference();
+      tracker.recordPreparedRequest({
+        measurementState: 'measured',
+        providerBreakdownState: 'serialized_components_non_additive',
+        providerMessageCount: 3,
+        providerMessageBytes: 60,
+        providerSystemMessageCount: 1,
+        providerSystemMessageBytes: 10,
+        providerUserMessageCount: 1,
+        providerUserMessageBytes: 20,
+        providerAssistantMessageCount: 0,
+        providerAssistantMessageBytes: 0,
+        providerToolMessageCount: 1,
+        providerToolMessageBytes: 30,
+        providerOtherMessageCount: 0,
+        providerOtherMessageBytes: 0,
+        providerInstructionBytes: 10,
+        providerToolCount: 1,
+        providerToolSchemaBytes: 15,
+        providerToolSchemaState: 'measured',
+        providerResponseSchemaState: 'not_applicable',
+        providerReasoningEffortState: 'provider_default',
+        providerRequestBytes: 90,
+        providerPreparationMs: 3,
+        providerMeasurementMs: 1,
+        providerDispatchTimestampMs: 200,
+      });
+      tracker.reportGenerationError({ error: new Error('after rebuild') });
+
+      const [generationSpan] = testExporter.getSpansByType(SpanType.MODEL_GENERATION);
+      expect(generationSpan?.attributes).toMatchObject({
+        providerAggregateMeasurementState: 'measured',
+        providerInferenceCount: 2,
+        providerMeasuredInferenceCount: 2,
+        providerUnknownInferenceCount: 0,
+        providerMessageCountTotal: 4,
+        providerMessageBytesTotal: 80,
+        providerToolMessageCountTotal: 1,
+        providerToolMessageBytesTotal: 30,
+        providerToolCountTotal: 1,
+        providerToolSchemaBytesTotal: 15,
+        providerRequestBytesTotal: 132,
+        providerPreparationMsTotal: 5,
+        providerMeasurementMsTotal: 2,
+      });
+    });
+
+    it('retains prepared-request evidence and missing-usage state when provider inference errors', () => {
+      const modelSpan = tracing.startSpan({
+        type: SpanType.MODEL_GENERATION,
+        name: 'test-generation',
+      });
+      const tracker = new ModelSpanTracker(modelSpan);
+
+      tracker.startStep();
+      tracker.startInference();
+      tracker.recordPreparedRequest({
+        measurementState: 'measured',
+        providerBreakdownState: 'serialized_components_non_additive',
+        providerMessageCount: 1,
+        providerMessageBytes: 20,
+        providerSystemMessageCount: 0,
+        providerSystemMessageBytes: 0,
+        providerUserMessageCount: 1,
+        providerUserMessageBytes: 20,
+        providerAssistantMessageCount: 0,
+        providerAssistantMessageBytes: 0,
+        providerToolMessageCount: 0,
+        providerToolMessageBytes: 0,
+        providerOtherMessageCount: 0,
+        providerOtherMessageBytes: 0,
+        providerInstructionBytes: 0,
+        providerToolCount: 0,
+        providerToolSchemaState: 'not_applicable',
+        providerResponseSchemaState: 'not_applicable',
+        providerReasoningEffortState: 'provider_default',
+        providerRequestBytes: 42,
+        providerPreparationMs: 2,
+        providerMeasurementMs: 1,
+        providerDispatchTimestampMs: 100,
+      });
+      tracker.reportGenerationError({ error: new Error('provider unavailable') });
+
+      const [inferenceSpan] = testExporter.getSpansByType(SpanType.MODEL_INFERENCE);
+      const [generationSpan] = testExporter.getSpansByType(SpanType.MODEL_GENERATION);
+      expect(inferenceSpan?.attributes).toMatchObject({
+        providerUsageState: 'provider_not_reported',
+        providerMessageBytes: 20,
+      });
+      expect(generationSpan?.attributes).toMatchObject({
+        providerAggregateMeasurementState: 'measured',
+        providerInferenceCount: 1,
+        providerRequestBytesTotal: 42,
+        providerUsageState: 'provider_not_reported',
+      });
+    });
+
+    it('marks provider usage not applicable when generation fails before inference starts', () => {
+      const modelSpan = tracing.startSpan({
+        type: SpanType.MODEL_GENERATION,
+        name: 'test-generation',
+      });
+      const tracker = new ModelSpanTracker(modelSpan);
+
+      tracker.startStep();
+      tracker.reportGenerationError({ error: new Error('input processor failed') });
+
+      const [generationSpan] = testExporter.getSpansByType(SpanType.MODEL_GENERATION);
+      expect(generationSpan?.attributes).toMatchObject({
+        providerAggregateMeasurementState: 'not_applicable',
+        providerInferenceCount: 0,
+        providerUsageState: 'not_applicable',
+      });
+    });
+
+    it('does not invoke extra provider-usage accessors while classifying missing usage', () => {
+      const modelSpan = tracing.startSpan({
+        type: SpanType.MODEL_GENERATION,
+        name: 'test-generation',
+      });
+      const tracker = new ModelSpanTracker(modelSpan);
+      const usage = Object.defineProperty({}, 'totalTokens', {
+        enumerable: true,
+        get() {
+          throw new Error('provider usage accessor must not run');
+        },
+      });
+
+      expect(() => tracker.endGeneration({ usage: usage as never })).not.toThrow();
+
+      const [generationSpan] = testExporter.getSpansByType(SpanType.MODEL_GENERATION);
+      expect(generationSpan?.attributes).toMatchObject({
+        providerAggregateMeasurementState: 'not_applicable',
+        providerInferenceCount: 0,
+        providerUsageState: 'not_applicable',
+      });
+    });
+
+    it('does not erase reported provider usage when a later callback fails', async () => {
+      const modelSpan = tracing.startSpan({
+        type: SpanType.MODEL_GENERATION,
+        name: 'test-generation',
+      });
+      const tracker = new ModelSpanTracker(modelSpan);
+
+      tracker.startStep();
+      tracker.startInference();
+      await consumeStream(
+        tracker.wrapStream(
+          createMockStream([
+            {
+              type: 'step-finish',
+              payload: {
+                output: { usage: { inputTokens: 5, outputTokens: 2 } },
+                stepResult: { reason: 'stop', warnings: [] },
+                metadata: {},
+              },
+            },
+          ]),
+        ),
+      );
+      tracker.reportGenerationError({ error: new Error('onFinish callback failed') });
+
+      const [generationSpan] = testExporter.getSpansByType(SpanType.MODEL_GENERATION);
+      expect(generationSpan?.attributes.providerUsageState).toBe('reported');
     });
 
     it('MODEL_INFERENCE.startTime excludes work between startStep and startInference', async () => {

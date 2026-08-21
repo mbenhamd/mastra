@@ -18,10 +18,15 @@ import { SpanType } from '@mastra/core/observability';
 import type {
   Span,
   EndGenerationOptions,
+  EndSpanOptions,
   ErrorSpanOptions,
   ModelInferenceContext,
+  PreparedModelRequestAggregateMetrics,
+  PreparedModelRequestMetrics,
+  ProviderUsageMeasurementState,
   TracingContext,
   UpdateSpanOptions,
+  UsageStats,
 } from '@mastra/core/observability';
 import type { ChunkType, StepStartPayload, StepFinishPayload } from '@mastra/core/stream';
 
@@ -41,6 +46,15 @@ function supportsModelInference(): boolean {
 import { extractUsageMetrics } from './usage';
 
 type StepInputPreview = Array<{ role: string; content: string }> | Record<string, unknown> | string | undefined;
+
+/** Observability must never become part of provider or processor control flow. */
+function runSpanOperation<T>(operation: () => T): T | undefined {
+  try {
+    return operation();
+  } catch {
+    return undefined;
+  }
+}
 
 function parseGatewayCost(providerMetadata: EndGenerationOptions['providerMetadata']): number | undefined {
   const rawCost = providerMetadata?.gateway?.cost;
@@ -88,6 +102,242 @@ function getGatewayCostContext({ stepProviderMetadata }: Pick<EndGenerationOptio
       reportedStepCount: costs.length,
     },
   };
+}
+
+function hasReportedUsage(rawUsage: unknown, usage: UsageStats): boolean {
+  if (
+    usage.inputTokens !== undefined ||
+    usage.outputTokens !== undefined ||
+    Object.values(usage.inputDetails ?? {}).some(value => value !== undefined) ||
+    Object.values(usage.outputDetails ?? {}).some(value => value !== undefined)
+  ) {
+    return true;
+  }
+  if (!rawUsage || typeof rawUsage !== 'object') return false;
+  return [
+    'inputTokens',
+    'outputTokens',
+    'totalTokens',
+    'promptTokens',
+    'completionTokens',
+    'cachedInputTokens',
+    'cacheCreationInputTokens',
+    'reasoningTokens',
+  ].some(key => {
+    try {
+      const descriptor = Object.getOwnPropertyDescriptor(rawUsage, key);
+      return descriptor !== undefined && 'value' in descriptor && typeof descriptor.value === 'number';
+    } catch {
+      return false;
+    }
+  });
+}
+
+function providerUsageStates(rawUsage: unknown, usage: UsageStats) {
+  const state: ProviderUsageMeasurementState = hasReportedUsage(rawUsage, usage) ? 'reported' : 'provider_not_reported';
+  return {
+    providerUsageState: state,
+    providerCacheReadUsageState: usage.inputDetails?.cacheRead === undefined ? 'provider_not_reported' : 'reported',
+    providerCacheWriteUsageState: usage.inputDetails?.cacheWrite === undefined ? 'provider_not_reported' : 'reported',
+    providerReasoningUsageState: usage.outputDetails?.reasoning === undefined ? 'provider_not_reported' : 'reported',
+  } as const;
+}
+
+function emptyPreparedRequestAggregate(): PreparedModelRequestAggregateMetrics {
+  return {
+    providerAggregateMeasurementState: 'not_applicable',
+    providerBreakdownState: 'serialized_components_non_additive',
+    providerInferenceCount: 0,
+    providerMeasuredInferenceCount: 0,
+    providerUnknownInferenceCount: 0,
+    providerMessageCountTotal: 0,
+    providerMessageBytesTotal: 0,
+    providerSystemMessageCountTotal: 0,
+    providerSystemMessageBytesTotal: 0,
+    providerUserMessageCountTotal: 0,
+    providerUserMessageBytesTotal: 0,
+    providerAssistantMessageCountTotal: 0,
+    providerAssistantMessageBytesTotal: 0,
+    providerToolMessageCountTotal: 0,
+    providerToolMessageBytesTotal: 0,
+    providerOtherMessageCountTotal: 0,
+    providerOtherMessageBytesTotal: 0,
+    providerInstructionBytesTotal: 0,
+    providerToolCountTotal: 0,
+    providerToolSchemaBytesTotal: 0,
+    providerResponseSchemaBytesTotal: 0,
+    providerRequestBytesTotal: 0,
+    providerPreparationMsTotal: 0,
+    providerMeasurementMsTotal: 0,
+  };
+}
+
+function appendCompleteTotal(previousCount: number, previous: number | undefined, current: number | undefined) {
+  if (previousCount === 0) return current;
+  if (previous === undefined || current === undefined) return undefined;
+  return previous + current;
+}
+
+function appendPreparedRequestAggregate(
+  previous: PreparedModelRequestAggregateMetrics,
+  metric: PreparedModelRequestMetrics,
+): PreparedModelRequestAggregateMetrics {
+  const previousCount = previous.providerInferenceCount;
+  const measured = previous.providerMeasuredInferenceCount + (metric.measurementState === 'measured' ? 1 : 0);
+  const unknown = previous.providerUnknownInferenceCount + (metric.measurementState === 'unknown' ? 1 : 0);
+  const inferenceCount = previousCount + 1;
+  const state =
+    measured === inferenceCount ? ('measured' as const) : measured === 0 ? ('unknown' as const) : ('partial' as const);
+  const toolSchemaBytes = metric.providerToolSchemaState === 'not_applicable' ? 0 : metric.providerToolSchemaBytes;
+  const responseSchemaBytes =
+    metric.providerResponseSchemaState === 'not_applicable' ? 0 : metric.providerResponseSchemaBytes;
+
+  return {
+    providerAggregateMeasurementState: state,
+    providerBreakdownState: 'serialized_components_non_additive',
+    providerInferenceCount: inferenceCount,
+    providerMeasuredInferenceCount: measured,
+    providerUnknownInferenceCount: unknown,
+    providerMessageCountTotal: previous.providerMessageCountTotal + metric.providerMessageCount,
+    providerMessageBytesTotal: appendCompleteTotal(
+      previousCount,
+      previous.providerMessageBytesTotal,
+      metric.providerMessageBytes,
+    ),
+    providerSystemMessageCountTotal: previous.providerSystemMessageCountTotal + metric.providerSystemMessageCount,
+    providerSystemMessageBytesTotal: appendCompleteTotal(
+      previousCount,
+      previous.providerSystemMessageBytesTotal,
+      metric.providerSystemMessageBytes,
+    ),
+    providerUserMessageCountTotal: previous.providerUserMessageCountTotal + metric.providerUserMessageCount,
+    providerUserMessageBytesTotal: appendCompleteTotal(
+      previousCount,
+      previous.providerUserMessageBytesTotal,
+      metric.providerUserMessageBytes,
+    ),
+    providerAssistantMessageCountTotal:
+      previous.providerAssistantMessageCountTotal + metric.providerAssistantMessageCount,
+    providerAssistantMessageBytesTotal: appendCompleteTotal(
+      previousCount,
+      previous.providerAssistantMessageBytesTotal,
+      metric.providerAssistantMessageBytes,
+    ),
+    providerToolMessageCountTotal: previous.providerToolMessageCountTotal + metric.providerToolMessageCount,
+    providerToolMessageBytesTotal: appendCompleteTotal(
+      previousCount,
+      previous.providerToolMessageBytesTotal,
+      metric.providerToolMessageBytes,
+    ),
+    providerOtherMessageCountTotal: previous.providerOtherMessageCountTotal + metric.providerOtherMessageCount,
+    providerOtherMessageBytesTotal: appendCompleteTotal(
+      previousCount,
+      previous.providerOtherMessageBytesTotal,
+      metric.providerOtherMessageBytes,
+    ),
+    providerInstructionBytesTotal: appendCompleteTotal(
+      previousCount,
+      previous.providerInstructionBytesTotal,
+      metric.providerInstructionBytes,
+    ),
+    providerToolCountTotal: previous.providerToolCountTotal + metric.providerToolCount,
+    providerToolSchemaBytesTotal: appendCompleteTotal(
+      previousCount,
+      previous.providerToolSchemaBytesTotal,
+      toolSchemaBytes,
+    ),
+    providerResponseSchemaBytesTotal: appendCompleteTotal(
+      previousCount,
+      previous.providerResponseSchemaBytesTotal,
+      responseSchemaBytes,
+    ),
+    providerRequestBytesTotal: appendCompleteTotal(
+      previousCount,
+      previous.providerRequestBytesTotal,
+      metric.providerRequestBytes,
+    ),
+    providerPreparationMsTotal: appendCompleteTotal(
+      previousCount,
+      previous.providerPreparationMsTotal,
+      metric.providerPreparationMs,
+    ),
+    providerMeasurementMsTotal: appendCompleteTotal(
+      previousCount,
+      previous.providerMeasurementMsTotal,
+      metric.providerMeasurementMs,
+    ),
+  };
+}
+
+function preparedRequestAggregateFromAttributes(
+  attributes: Partial<PreparedModelRequestAggregateMetrics> | undefined,
+): PreparedModelRequestAggregateMetrics | undefined {
+  if (
+    attributes?.providerBreakdownState !== 'serialized_components_non_additive' ||
+    !['measured', 'partial', 'unknown', 'not_applicable'].includes(attributes.providerAggregateMeasurementState ?? '')
+  ) {
+    return undefined;
+  }
+
+  const requiredTotals = [
+    attributes.providerInferenceCount,
+    attributes.providerMeasuredInferenceCount,
+    attributes.providerUnknownInferenceCount,
+    attributes.providerMessageCountTotal,
+    attributes.providerSystemMessageCountTotal,
+    attributes.providerUserMessageCountTotal,
+    attributes.providerAssistantMessageCountTotal,
+    attributes.providerToolMessageCountTotal,
+    attributes.providerOtherMessageCountTotal,
+    attributes.providerToolCountTotal,
+  ];
+  if (!requiredTotals.every(value => typeof value === 'number' && Number.isInteger(value) && value >= 0)) {
+    return undefined;
+  }
+
+  const inferenceCount = attributes.providerInferenceCount!;
+  const measuredCount = attributes.providerMeasuredInferenceCount!;
+  const unknownCount = attributes.providerUnknownInferenceCount!;
+  const expectedState =
+    inferenceCount === 0
+      ? 'not_applicable'
+      : measuredCount === inferenceCount
+        ? 'measured'
+        : measuredCount === 0
+          ? 'unknown'
+          : 'partial';
+  if (
+    measuredCount + unknownCount !== inferenceCount ||
+    attributes.providerAggregateMeasurementState !== expectedState
+  ) {
+    return undefined;
+  }
+
+  const optionalIntegerTotals = [
+    attributes.providerMessageBytesTotal,
+    attributes.providerSystemMessageBytesTotal,
+    attributes.providerUserMessageBytesTotal,
+    attributes.providerAssistantMessageBytesTotal,
+    attributes.providerToolMessageBytesTotal,
+    attributes.providerOtherMessageBytesTotal,
+    attributes.providerInstructionBytesTotal,
+    attributes.providerToolSchemaBytesTotal,
+    attributes.providerResponseSchemaBytesTotal,
+    attributes.providerRequestBytesTotal,
+  ];
+  if (!optionalIntegerTotals.every(value => value === undefined || (Number.isInteger(value) && value >= 0))) {
+    return undefined;
+  }
+  const optionalDurations = [attributes.providerPreparationMsTotal, attributes.providerMeasurementMsTotal];
+  if (
+    !optionalDurations.every(
+      value => value === undefined || (typeof value === 'number' && Number.isFinite(value) && value >= 0),
+    )
+  ) {
+    return undefined;
+  }
+
+  return attributes as PreparedModelRequestAggregateMetrics;
 }
 
 function formatPreviewLabel(label: unknown, fallback: string): string {
@@ -335,6 +585,8 @@ export class ModelSpanTracker {
   #stepIndex: number = 0;
   #chunkSequence: number = 0;
   #completionStartTime?: Date;
+  /** First provider content for the currently open inference only. */
+  #currentInferenceCompletionStartTime?: Date;
   #currentStepInputIsFinal: boolean = false;
   /** When true, step-finish chunks don't auto-close the step span (for durable execution) */
   #deferStepClose: boolean = false;
@@ -342,9 +594,26 @@ export class ModelSpanTracker {
   #pendingStepFinishPayload?: StepFinishPayload<any, any>;
   /** Static request-side context applied to every MODEL_INFERENCE span */
   #inferenceContext?: ModelInferenceContext;
+  /** Content-free rollup for all provider calls, including rebuilt durable spans. */
+  #preparedRequestAggregate: PreparedModelRequestAggregateMetrics;
+  /** Conservative aggregate: one missing provider report keeps the turn missing. */
+  #providerUsageState?: ProviderUsageMeasurementState;
+  /** Whether this generation reached a provider inference boundary. */
+  #providerInferenceStarted: boolean;
+  /** Whether the current step is expected to reach a provider boundary. */
+  #currentStepInferenceApplicable: boolean = true;
 
   constructor(modelSpan?: Span<SpanType.MODEL_GENERATION>) {
     this.#modelSpan = modelSpan;
+    const modelAttributes = runSpanOperation(() => modelSpan?.attributes);
+    this.#preparedRequestAggregate =
+      runSpanOperation(() => preparedRequestAggregateFromAttributes(modelAttributes)) ??
+      emptyPreparedRequestAggregate();
+    this.#providerUsageState = runSpanOperation(() => modelAttributes?.providerUsageState);
+    this.#providerInferenceStarted =
+      this.#preparedRequestAggregate.providerInferenceCount > 0 ||
+      this.#providerUsageState === 'reported' ||
+      this.#providerUsageState === 'provider_not_reported';
   }
 
   /**
@@ -356,13 +625,28 @@ export class ModelSpanTracker {
   }
 
   /**
+   * Attach the content-free measurement captured from the exact object passed
+   * to the provider adapter. The inference span is already open at this point.
+   */
+  recordPreparedRequest(metrics: PreparedModelRequestMetrics): void {
+    const aggregate = runSpanOperation(() => appendPreparedRequestAggregate(this.#preparedRequestAggregate, metrics));
+    if (!aggregate) return;
+    this.#preparedRequestAggregate = aggregate;
+    runSpanOperation(() => this.#currentInferenceSpan?.update({ attributes: metrics }));
+    runSpanOperation(() => this.#modelSpan?.update({ attributes: aggregate }));
+  }
+
+  /**
    * Capture the completion start time (time to first token) when the first content chunk arrives.
    */
   #captureCompletionStartTime(): void {
-    if (this.#completionStartTime) {
-      return;
-    }
-    this.#completionStartTime = new Date();
+    // Older callers may omit the explicit pre-dispatch startInference() call.
+    // Open its bounded fallback before taking the timestamp so TTFT never
+    // predates the inference span that owns it.
+    if (!this.#currentInferenceSpan) this.#ensureStepAndInference();
+    const completionStartedAt = new Date();
+    this.#completionStartTime ??= completionStartedAt;
+    this.#currentInferenceCompletionStartTime ??= completionStartedAt;
   }
 
   /**
@@ -381,15 +665,37 @@ export class ModelSpanTracker {
    * doesn't leave them dangling. No-op if they were already closed.
    */
   reportGenerationError(options: ErrorSpanOptions<SpanType.MODEL_GENERATION>): void {
-    if (this.#currentInferenceSpan) {
-      this.#currentInferenceSpan.error({ error: options.error, endSpan: true });
-      this.#currentInferenceSpan = undefined;
+    this.#endChunkSpan();
+    const inferenceSpan = this.#currentInferenceSpan;
+    const stepSpan = this.#currentStepSpan;
+    const providerInferenceEndedWithoutUsage = inferenceSpan !== undefined;
+    this.#currentInferenceSpan = undefined;
+    this.#currentInferenceCompletionStartTime = undefined;
+    if (stepSpan) this.#resetCurrentStep();
+
+    runSpanOperation(() =>
+      inferenceSpan?.error({
+        error: options.error,
+        endSpan: true,
+        attributes: providerUsageStates(undefined, {}),
+      }),
+    );
+    runSpanOperation(() => stepSpan?.error({ error: options.error, endSpan: true }));
+    if (providerInferenceEndedWithoutUsage) {
+      this.#providerUsageState = 'provider_not_reported';
+    } else if (this.#providerUsageState === undefined) {
+      this.#providerUsageState = this.#providerInferenceStarted ? 'provider_not_reported' : 'not_applicable';
     }
-    if (this.#currentStepSpan) {
-      this.#currentStepSpan.error({ error: options.error, endSpan: true });
-      this.#currentStepSpan = undefined;
-    }
-    this.#modelSpan?.error(options);
+    runSpanOperation(() =>
+      this.#modelSpan?.error({
+        ...options,
+        attributes: {
+          ...options.attributes,
+          ...this.#preparedRequestAggregate,
+          providerUsageState: this.#providerUsageState,
+        },
+      }),
+    );
   }
 
   /**
@@ -397,24 +703,38 @@ export class ModelSpanTracker {
    * If usage is provided, it will be converted to UsageStats with cache token details.
    */
   endGeneration(options?: EndGenerationOptions): void {
-    const { usage, providerMetadata, stepProviderMetadata, ...spanOptions } = options ?? {};
+    runSpanOperation(() => {
+      const { usage, providerMetadata, stepProviderMetadata, ...spanOptions } = options ?? {};
+      const normalizedUsage = extractUsageMetrics(usage, providerMetadata);
+      const costContext = spanOptions.attributes?.costContext ?? getGatewayCostContext({ stepProviderMetadata });
+      const reportedUsageState = providerUsageStates(usage, normalizedUsage).providerUsageState;
+      const providerUsageState =
+        this.#providerUsageState ??
+        (!this.#providerInferenceStarted
+          ? 'not_applicable'
+          : reportedUsageState === 'reported'
+            ? 'reported'
+            : 'provider_not_reported');
 
-    if (spanOptions.attributes) {
-      spanOptions.attributes.completionStartTime = this.#completionStartTime;
-      spanOptions.attributes.usage = extractUsageMetrics(usage, providerMetadata);
-      if (!spanOptions.attributes.costContext) {
-        spanOptions.attributes.costContext = getGatewayCostContext({ stepProviderMetadata });
-      }
-    }
-
-    this.#modelSpan?.end(spanOptions);
+      this.#modelSpan?.end({
+        ...spanOptions,
+        attributes: {
+          ...spanOptions.attributes,
+          ...this.#preparedRequestAggregate,
+          completionStartTime: this.#completionStartTime,
+          usage: normalizedUsage,
+          providerUsageState,
+          ...(costContext === undefined ? {} : { costContext }),
+        },
+      });
+    });
   }
 
   /**
    * Update the generation span
    */
   updateGeneration(options: UpdateSpanOptions<SpanType.MODEL_GENERATION>): void {
-    this.#modelSpan?.update(options);
+    runSpanOperation(() => this.#modelSpan?.update(options));
   }
 
   /**
@@ -431,7 +751,7 @@ export class ModelSpanTracker {
    * Returns undefined if no step span is active.
    */
   exportCurrentStep(): ReturnType<Span<SpanType.MODEL_STEP>['exportSpan']> | undefined {
-    return this.#currentStepSpan?.exportSpan();
+    return runSpanOperation(() => this.#currentStepSpan?.exportSpan());
   }
 
   /**
@@ -473,21 +793,53 @@ export class ModelSpanTracker {
       return;
     }
 
-    const input = extractStepInput(payload);
-    this.#currentStepSpan = this.#modelSpan?.createChildSpan({
-      name: `step: ${this.#stepIndex}`,
-      type: SpanType.MODEL_STEP,
-      attributes: {
-        stepIndex: this.#stepIndex,
-        ...(payload?.messageId ? { messageId: payload.messageId } : {}),
-        ...(payload?.warnings?.length ? { warnings: payload.warnings } : {}),
-      },
-      input,
-      tracingPolicy: this.#modelSpan?.tracingPolicy,
+    this.#currentStepSpan = runSpanOperation(() => {
+      const input = extractStepInput(payload);
+      return this.#modelSpan?.createChildSpan({
+        name: `step: ${this.#stepIndex}`,
+        type: SpanType.MODEL_STEP,
+        attributes: {
+          stepIndex: this.#stepIndex,
+          ...(payload?.messageId ? { messageId: payload.messageId } : {}),
+          ...(payload?.warnings?.length ? { warnings: payload.warnings } : {}),
+        },
+        input,
+        tracingPolicy: this.#modelSpan?.tracingPolicy,
+      });
     });
-    this.#currentStepInputIsFinal = Array.isArray(payload?.inputMessages);
+    this.#currentStepInputIsFinal = runSpanOperation(() => Array.isArray(payload?.inputMessages)) ?? false;
+    this.#currentStepInferenceApplicable = true;
     // Reset chunk sequence for new step
     this.#chunkSequence = 0;
+  }
+
+  /** End the active step without closing its generation. */
+  endStep(options?: EndSpanOptions<SpanType.MODEL_STEP>): void {
+    this.#endChunkSpan();
+    const inferenceSpan = this.#currentInferenceSpan;
+    this.#currentInferenceSpan = undefined;
+    if (inferenceSpan) {
+      this.#currentInferenceCompletionStartTime = undefined;
+      this.#providerUsageState = 'provider_not_reported';
+      runSpanOperation(() => inferenceSpan.end({ attributes: providerUsageStates(undefined, {}) }));
+      runSpanOperation(() => this.#modelSpan?.update({ attributes: { providerUsageState: this.#providerUsageState } }));
+    }
+    const stepSpan = this.#currentStepSpan;
+    if (!stepSpan) return;
+    this.#resetCurrentStep();
+    runSpanOperation(() => stepSpan.end(options));
+  }
+
+  /** Error the active step without closing its generation. */
+  reportStepError(options: ErrorSpanOptions<SpanType.MODEL_STEP>): void {
+    this.#endChunkSpan();
+    if (this.#currentInferenceSpan) {
+      this.reportInferenceError({ error: options.error });
+    }
+    const stepSpan = this.#currentStepSpan;
+    if (!stepSpan) return;
+    this.#resetCurrentStep();
+    runSpanOperation(() => stepSpan.error({ ...options, endSpan: true }));
   }
 
   /**
@@ -499,21 +851,40 @@ export class ModelSpanTracker {
    * Safe to call multiple times - no-ops if the span is already closed.
    */
   #endInferenceSpan<OUTPUT>(payload: StepFinishPayload<any, OUTPUT>): void {
-    if (!this.#currentInferenceSpan) return;
-
-    const { usage: rawUsage, ...otherOutput } = payload.output;
-    const usage = extractUsageMetrics(rawUsage, payload.metadata?.providerMetadata);
-
-    this.#currentInferenceSpan.end({
-      output: otherOutput,
-      attributes: {
-        usage,
-        finishReason: payload.stepResult.reason,
-        warnings: payload.stepResult.warnings,
-        completionStartTime: this.#completionStartTime,
-      },
-    });
+    const inferenceSpan = this.#currentInferenceSpan;
+    if (!inferenceSpan) return;
+    const completionStartTime = this.#currentInferenceCompletionStartTime;
     this.#currentInferenceSpan = undefined;
+    this.#currentInferenceCompletionStartTime = undefined;
+
+    let endedWithOutput = false;
+    runSpanOperation(() => {
+      const { usage: rawUsage, ...otherOutput } = payload.output;
+      const usage = extractUsageMetrics(rawUsage, payload.metadata?.providerMetadata);
+      const usageStates = providerUsageStates(rawUsage, usage);
+      this.#providerUsageState =
+        this.#providerUsageState === 'provider_not_reported' ||
+        usageStates.providerUsageState === 'provider_not_reported'
+          ? 'provider_not_reported'
+          : 'reported';
+      runSpanOperation(() => this.#modelSpan?.update({ attributes: { providerUsageState: this.#providerUsageState } }));
+      inferenceSpan.end({
+        output: otherOutput,
+        attributes: {
+          usage,
+          finishReason: payload.stepResult.reason,
+          warnings: payload.stepResult.warnings,
+          completionStartTime,
+          ...usageStates,
+        },
+      });
+      endedWithOutput = true;
+    });
+    if (!endedWithOutput) {
+      this.#providerUsageState = 'provider_not_reported';
+      runSpanOperation(() => this.#modelSpan?.update({ attributes: { providerUsageState: this.#providerUsageState } }));
+      runSpanOperation(() => inferenceSpan.end({ attributes: providerUsageStates(undefined, {}) }));
+    }
   }
 
   /**
@@ -531,34 +902,69 @@ export class ModelSpanTracker {
    * chunk handlers as a safety net; explicit callers get the most accurate
    * start time.
    */
-  startInference(payload?: StepStartPayload): void {
-    if (!supportsModelInference()) {
+  startInference(payload?: StepStartPayload, providerAttempt?: number): void {
+    if (!this.#currentStepSpan || !this.#currentStepInferenceApplicable) {
       return;
     }
-    if (!this.#currentStepSpan || this.#currentInferenceSpan) {
+    this.#providerInferenceStarted = true;
+    if (runSpanOperation(supportsModelInference) !== true) return;
+    if (this.#currentInferenceSpan) {
+      if (providerAttempt !== undefined) {
+        runSpanOperation(() => this.#currentInferenceSpan?.update({ attributes: { providerAttempt } }));
+      }
       return;
     }
 
-    const input = extractStepInput(payload);
-    const generationAttrs = this.#modelSpan?.attributes;
-    const ctx = this.#inferenceContext;
-    this.#currentInferenceSpan = this.#currentStepSpan.createChildSpan({
-      name: `inference: ${this.#stepIndex}`,
-      type: SpanType.MODEL_INFERENCE,
-      attributes: {
-        stepIndex: this.#stepIndex,
-        model: generationAttrs?.model,
-        provider: generationAttrs?.provider,
-        streaming: generationAttrs?.streaming,
-        ...(ctx?.parameters !== undefined ? { parameters: ctx.parameters } : {}),
-        ...(ctx?.providerOptions !== undefined ? { providerOptions: ctx.providerOptions } : {}),
-        ...(ctx?.availableTools !== undefined ? { availableTools: ctx.availableTools } : {}),
-        ...(ctx?.toolChoice !== undefined ? { toolChoice: ctx.toolChoice } : {}),
-        ...(ctx?.responseFormat !== undefined ? { responseFormat: ctx.responseFormat } : {}),
-      },
-      input,
-      tracingPolicy: this.#modelSpan?.tracingPolicy,
+    this.#currentInferenceCompletionStartTime = undefined;
+    const stepSpan = this.#currentStepSpan;
+    this.#currentInferenceSpan = runSpanOperation(() => {
+      const input = extractStepInput(payload);
+      const generationAttrs = this.#modelSpan?.attributes;
+      const ctx = this.#inferenceContext;
+      return stepSpan.createChildSpan({
+        name: `inference: ${this.#stepIndex}`,
+        type: SpanType.MODEL_INFERENCE,
+        attributes: {
+          stepIndex: this.#stepIndex,
+          model: generationAttrs?.model,
+          provider: generationAttrs?.provider,
+          streaming: generationAttrs?.streaming,
+          ...(providerAttempt === undefined ? {} : { providerAttempt }),
+          ...(ctx?.parameters !== undefined ? { parameters: ctx.parameters } : {}),
+          ...(ctx?.providerOptions !== undefined ? { providerOptions: ctx.providerOptions } : {}),
+          ...(ctx?.availableTools !== undefined ? { availableTools: ctx.availableTools } : {}),
+          ...(ctx?.toolChoice !== undefined ? { toolChoice: ctx.toolChoice } : {}),
+          ...(ctx?.responseFormat !== undefined ? { responseFormat: ctx.responseFormat } : {}),
+        },
+        input,
+        tracingPolicy: this.#modelSpan?.tracingPolicy,
+      });
     });
+  }
+
+  /** Close a failed provider attempt while retaining its parent step for retry. */
+  reportInferenceError(options: ErrorSpanOptions<SpanType.MODEL_INFERENCE>): void {
+    const inferenceSpan = this.#currentInferenceSpan;
+    if (!inferenceSpan) return;
+    this.#currentInferenceSpan = undefined;
+    this.#currentInferenceCompletionStartTime = undefined;
+    this.#providerUsageState = 'provider_not_reported';
+    runSpanOperation(() =>
+      inferenceSpan.error({
+        ...options,
+        endSpan: true,
+        attributes: {
+          ...options.attributes,
+          ...providerUsageStates(undefined, {}),
+        },
+      }),
+    );
+    runSpanOperation(() => this.#modelSpan?.update({ attributes: { providerUsageState: this.#providerUsageState } }));
+  }
+
+  /** Prevent replayed cache chunks from fabricating a provider inference. */
+  markInferenceNotApplicable(): void {
+    this.#currentStepInferenceApplicable = false;
   }
 
   /**
@@ -570,20 +976,23 @@ export class ModelSpanTracker {
       return;
     }
 
-    const hasFinalInput = Array.isArray(payload.inputMessages);
-    const input = hasFinalInput || !this.#currentStepInputIsFinal ? extractStepInput(payload) : undefined;
+    const stepSpan = this.#currentStepSpan;
+    runSpanOperation(() => {
+      const hasFinalInput = Array.isArray(payload.inputMessages);
+      const input = hasFinalInput || !this.#currentStepInputIsFinal ? extractStepInput(payload) : undefined;
 
-    // Update span with request/warnings from the step-start chunk
-    this.#currentStepSpan.update({
-      ...(input !== undefined ? { input } : {}),
-      attributes: {
-        ...(payload.messageId ? { messageId: payload.messageId } : {}),
-        ...(payload.warnings?.length ? { warnings: payload.warnings } : {}),
-      },
+      // Update span with request/warnings from the step-start chunk
+      stepSpan.update({
+        ...(input !== undefined ? { input } : {}),
+        attributes: {
+          ...(payload.messageId ? { messageId: payload.messageId } : {}),
+          ...(payload.warnings?.length ? { warnings: payload.warnings } : {}),
+        },
+      });
+      if (hasFinalInput) {
+        this.#currentStepInputIsFinal = true;
+      }
     });
-    if (hasFinalInput) {
-      this.#currentStepInputIsFinal = true;
-    }
   }
 
   /**
@@ -594,47 +1003,54 @@ export class ModelSpanTracker {
     // (handles case where text-delta arrives without text-end)
     this.#endChunkSpan();
 
-    if (!this.#currentStepSpan) return;
-
-    // Extract all data from step-finish chunk
-    const output = payload.output;
-    const { usage: rawUsage, ...otherOutput } = output;
-    const stepResult = payload.stepResult;
-    const metadata = payload.metadata;
-
-    // Convert raw usage to UsageStats with cache token details
-    const usage = extractUsageMetrics(rawUsage, metadata?.providerMetadata);
-
-    // Remove verbose/redundant fields from metadata:
-    // - request: too verbose
-    // - id/timestamp: chunk-level data, not step-related
-    // - modelId/modelVersion/modelProvider: duplicates of modelMetadata
-    const cleanMetadata = metadata ? { ...metadata } : undefined;
-    if (cleanMetadata) {
-      for (const key of ['request', 'id', 'timestamp', 'modelId', 'modelVersion', 'modelProvider']) {
-        delete cleanMetadata[key];
-      }
-    }
+    const stepSpan = this.#currentStepSpan;
+    if (!stepSpan) return;
 
     // Inference may already be closed (closed eagerly on step-finish in defer
     // mode so its duration reflects pure model latency, not subsequent tool
     // execution). Close it here for the non-deferred path.
     this.#endInferenceSpan(payload);
+    this.#resetCurrentStep();
 
-    this.#currentStepSpan.end({
-      output: otherOutput,
-      attributes: {
-        usage,
-        isContinued: stepResult.isContinued,
-        finishReason: stepResult.reason,
-        warnings: stepResult.warnings,
-      },
-      metadata: {
-        ...cleanMetadata,
-      },
+    let endedWithOutput = false;
+    runSpanOperation(() => {
+      // Extract all data from step-finish chunk
+      const output = payload.output;
+      const { usage: rawUsage, ...otherOutput } = output;
+      const stepResult = payload.stepResult;
+      const metadata = payload.metadata;
+      const usage = extractUsageMetrics(rawUsage, metadata?.providerMetadata);
+
+      // Remove verbose/redundant fields from metadata.
+      const cleanMetadata = metadata ? { ...metadata } : undefined;
+      if (cleanMetadata) {
+        for (const key of ['request', 'id', 'timestamp', 'modelId', 'modelVersion', 'modelProvider']) {
+          delete cleanMetadata[key];
+        }
+      }
+
+      stepSpan.end({
+        output: otherOutput,
+        attributes: {
+          usage,
+          isContinued: stepResult.isContinued,
+          finishReason: stepResult.reason,
+          warnings: stepResult.warnings,
+        },
+        metadata: {
+          ...cleanMetadata,
+        },
+      });
+      endedWithOutput = true;
     });
+    if (!endedWithOutput) runSpanOperation(() => stepSpan.end());
+  }
+
+  #resetCurrentStep(): void {
     this.#currentStepSpan = undefined;
     this.#currentStepInputIsFinal = false;
+    this.#currentStepInferenceApplicable = true;
+    this.#pendingStepFinishPayload = undefined;
     this.#stepIndex++;
   }
 
@@ -673,15 +1089,17 @@ export class ModelSpanTracker {
 
     this.#ensureStepAndInference();
 
-    this.#currentChunkSpan = this.#chunkParent()?.createChildSpan({
-      name: `chunk: '${chunkType}'`,
-      type: SpanType.MODEL_CHUNK,
-      attributes: {
-        chunkType,
-        sequenceNumber: this.#chunkSequence,
-      },
-      tracingPolicy: this.#modelSpan?.tracingPolicy,
-    });
+    this.#currentChunkSpan = runSpanOperation(() =>
+      this.#chunkParent()?.createChildSpan({
+        name: `chunk: '${chunkType}'`,
+        type: SpanType.MODEL_CHUNK,
+        attributes: {
+          chunkType,
+          sequenceNumber: this.#chunkSequence,
+        },
+        tracingPolicy: this.#modelSpan?.tracingPolicy,
+      }),
+    );
     this.#currentChunkType = chunkType;
     this.#accumulator = initialData || {};
   }
@@ -702,15 +1120,14 @@ export class ModelSpanTracker {
    * Safe to call multiple times - will no-op if span already ended.
    */
   #endChunkSpan(output?: any) {
-    if (!this.#currentChunkSpan) return;
-
-    this.#currentChunkSpan.end({
-      output: output !== undefined ? output : this.#accumulator,
-    });
+    const chunkSpan = this.#currentChunkSpan;
+    if (!chunkSpan) return;
+    const spanOutput = output !== undefined ? output : this.#accumulator;
     this.#currentChunkSpan = undefined;
     this.#currentChunkType = undefined;
     this.#accumulator = {};
     this.#chunkSequence++;
+    runSpanOperation(() => chunkSpan.end({ output: spanOutput }));
   }
 
   /**
@@ -723,18 +1140,20 @@ export class ModelSpanTracker {
   ) {
     this.#ensureStepAndInference();
 
-    const span = this.#chunkParent()?.createEventSpan({
-      name: `chunk: '${chunkType}'`,
-      type: SpanType.MODEL_CHUNK,
-      attributes: {
-        chunkType,
-        sequenceNumber: this.#chunkSequence,
-        ...options?.attributes,
-      },
-      metadata: options?.metadata,
-      output,
-      tracingPolicy: this.#modelSpan?.tracingPolicy,
-    });
+    const span = runSpanOperation(() =>
+      this.#chunkParent()?.createEventSpan({
+        name: `chunk: '${chunkType}'`,
+        type: SpanType.MODEL_CHUNK,
+        attributes: {
+          chunkType,
+          sequenceNumber: this.#chunkSequence,
+          ...options?.attributes,
+        },
+        metadata: options?.metadata,
+        output,
+        tracingPolicy: this.#modelSpan?.tracingPolicy,
+      }),
+    );
 
     if (span) {
       this.#chunkSequence++;
@@ -876,16 +1295,18 @@ export class ModelSpanTracker {
 
     // Create an event span for the approval request
     // Using createEventSpan since approvals are point-in-time events (not time ranges)
-    const span = this.#chunkParent()?.createEventSpan({
-      name: `chunk: 'tool-call-approval'`,
-      type: SpanType.MODEL_CHUNK,
-      attributes: {
-        chunkType: 'tool-call-approval',
-        sequenceNumber: this.#chunkSequence,
-      },
-      output: payload,
-      tracingPolicy: this.#modelSpan?.tracingPolicy,
-    });
+    const span = runSpanOperation(() =>
+      this.#chunkParent()?.createEventSpan({
+        name: `chunk: 'tool-call-approval'`,
+        type: SpanType.MODEL_CHUNK,
+        attributes: {
+          chunkType: 'tool-call-approval',
+          sequenceNumber: this.#chunkSequence,
+        },
+        output: payload,
+        tracingPolicy: this.#modelSpan?.tracingPolicy,
+      }),
+    );
 
     if (span) {
       this.#chunkSequence++;
@@ -902,147 +1323,154 @@ export class ModelSpanTracker {
       new TransformStream({
         transform: (chunk, controller) => {
           // Capture completion start time on first actual content (for time-to-first-token)
-          switch (chunk.type) {
-            case 'text-delta':
-            case 'tool-call-delta':
-            case 'reasoning-delta':
-              this.#captureCompletionStartTime();
-              break;
-          }
+          runSpanOperation(() => {
+            switch (chunk.type) {
+              case 'text-delta':
+              case 'tool-call-delta':
+              case 'tool-call':
+              case 'reasoning-delta':
+              case 'object':
+              case 'object-result':
+                this.#captureCompletionStartTime();
+                break;
+            }
+          });
 
           controller.enqueue(chunk);
 
           // Handle chunk span tracking based on chunk type
-          switch (chunk.type) {
-            case 'text-start':
-            case 'text-delta':
-            case 'text-end':
-              this.#handleTextChunk(chunk);
-              break;
+          runSpanOperation(() => {
+            switch (chunk.type) {
+              case 'text-start':
+              case 'text-delta':
+              case 'text-end':
+                this.#handleTextChunk(chunk);
+                break;
 
-            case 'tool-call-input-streaming-start':
-            case 'tool-call-delta':
-            case 'tool-call-input-streaming-end':
-            case 'tool-call':
-              this.#handleToolCallChunk(chunk);
-              break;
+              case 'tool-call-input-streaming-start':
+              case 'tool-call-delta':
+              case 'tool-call-input-streaming-end':
+              case 'tool-call':
+                this.#handleToolCallChunk(chunk);
+                break;
 
-            case 'reasoning-start':
-            case 'reasoning-delta':
-            case 'reasoning-end':
-              this.#handleReasoningChunk(chunk);
-              break;
+              case 'reasoning-start':
+              case 'reasoning-delta':
+              case 'reasoning-end':
+                this.#handleReasoningChunk(chunk);
+                break;
 
-            case 'object':
-            case 'object-result':
-              this.#handleObjectChunk(chunk);
-              break;
+              case 'object':
+              case 'object-result':
+                this.#handleObjectChunk(chunk);
+                break;
 
-            case 'step-start':
-              // If step already started (via startStep()), just update with payload data
-              // Otherwise start a new step (for backwards compatibility)
-              if (this.#currentStepSpan) {
-                this.updateStep(chunk.payload);
-              } else {
-                this.startStep(chunk.payload);
+              case 'step-start':
+                // If step already started (via startStep()), just update with payload data
+                // Otherwise start a new step (for backwards compatibility)
+                if (this.#currentStepSpan) {
+                  this.updateStep(chunk.payload);
+                } else {
+                  this.startStep(chunk.payload);
+                }
+                // step-start fires when the provider stream has begun. Open the
+                // inference span here as a safety net for callers that don't
+                // explicitly call startInference() before invoking the model —
+                // chunks that follow will parent under MODEL_INFERENCE.
+                if (!this.#currentInferenceSpan) {
+                  this.startInference(chunk.payload);
+                }
+                break;
+
+              case 'step-finish':
+                if (this.#deferStepClose) {
+                  // Durable mode: save payload for later, don't close the step.
+                  // Close MODEL_INFERENCE eagerly though - the provider stream is
+                  // done, and any subsequent tool execution under the step should
+                  // not inflate inference duration.
+                  this.#pendingStepFinishPayload = chunk.payload;
+                  this.#endChunkSpan();
+                  this.#endInferenceSpan(chunk.payload);
+                } else {
+                  // Normal mode: close the step immediately
+                  this.#endStepSpan(chunk.payload);
+                }
+                break;
+
+              // Infrastructure chunks - skip creating spans for these
+              // They are either redundant, metadata-only, or error/control flow
+              case 'raw': // Redundant raw data
+              case 'start': // Stream start marker
+              case 'finish': // Stream finish marker (step-finish already captures this)
+              case 'response-metadata': // Response metadata (not semantic content)
+              case 'source': // Source references (metadata)
+              case 'file': // Binary file data (too large/not semantic)
+              case 'error': // Error handling
+              case 'abort': // Abort signal
+              case 'tripwire': // Processor rejection
+              case 'watch': // Internal watch event
+              case 'tool-error': // Tool error handling
+              case 'tool-call-suspended': // Suspension (not content)
+              case 'reasoning-signature': // Signature metadata
+              case 'redacted-reasoning': // Redacted content metadata
+              case 'step-output': // Step output wrapper (content is nested)
+                // Don't create spans for these chunks
+                break;
+
+              case 'tool-call-approval': // Approval request - create span for debugging
+                this.#handleToolApprovalChunk(chunk);
+                break;
+
+              case 'tool-output':
+                // tool-output chunks are streaming progress from tools (e.g., sub-agents)
+                // No span created - the final tool-result event captures the result
+                break;
+
+              case 'tool-result': {
+                // tool-result is always a point-in-time event span
+                // (tool execution duration is captured by the parent tool_call span)
+                const {
+                  // Metadata - tool call context (unique to tool-result chunks)
+                  toolCallId,
+                  toolName,
+                  isError,
+                  dynamic,
+                  providerExecuted,
+                  providerMetadata,
+                  // Keep provider-executed results on MODEL_CHUNK because they come
+                  // from the model/provider stream and may not have a sibling TOOL_CALL span.
+                  // For locally executed tools, the canonical payload lives on TOOL_CALL.
+                  result,
+                  // Stripped - redundant (already on TOOL_CALL span input)
+                  args: _args,
+                } = (chunk.payload as Record<string, any>) || {};
+
+                // All tool-result specific fields go in metadata
+                const metadata: Record<string, any> = { toolCallId, toolName };
+                if (isError !== undefined) metadata.isError = isError;
+                if (dynamic !== undefined) metadata.dynamic = dynamic;
+                if (providerExecuted !== undefined) metadata.providerExecuted = providerExecuted;
+                if (providerMetadata !== undefined) metadata.providerMetadata = providerMetadata;
+
+                const mastraMeta = providerMetadata?.mastra as Record<string, unknown> | undefined;
+                const spanOutput = providerExecuted
+                  ? result
+                  : mastraMeta?.modelOutput !== undefined
+                    ? mastraMeta.modelOutput
+                    : undefined;
+
+                this.#createEventSpan(chunk.type, spanOutput, { metadata });
+                break;
               }
-              // step-start fires when the provider stream has begun. Open the
-              // inference span here as a safety net for callers that don't
-              // explicitly call startInference() before invoking the model —
-              // chunks that follow will parent under MODEL_INFERENCE.
-              if (!this.#currentInferenceSpan) {
-                this.startInference(chunk.payload);
-              }
-              break;
 
-            case 'step-finish':
-              if (this.#deferStepClose) {
-                // Durable mode: save payload for later, don't close the step.
-                // Close MODEL_INFERENCE eagerly though - the provider stream is
-                // done, and any subsequent tool execution under the step should
-                // not inflate inference duration.
-                this.#pendingStepFinishPayload = chunk.payload;
-                this.#endChunkSpan();
-                this.#endInferenceSpan(chunk.payload);
-              } else {
-                // Normal mode: close the step immediately
-                this.#endStepSpan(chunk.payload);
-              }
-              break;
-
-            // Infrastructure chunks - skip creating spans for these
-            // They are either redundant, metadata-only, or error/control flow
-            case 'raw': // Redundant raw data
-            case 'start': // Stream start marker
-            case 'finish': // Stream finish marker (step-finish already captures this)
-            case 'response-metadata': // Response metadata (not semantic content)
-            case 'source': // Source references (metadata)
-            case 'file': // Binary file data (too large/not semantic)
-            case 'error': // Error handling
-            case 'abort': // Abort signal
-            case 'tripwire': // Processor rejection
-            case 'watch': // Internal watch event
-            case 'tool-error': // Tool error handling
-            case 'tool-call-suspended': // Suspension (not content)
-            case 'reasoning-signature': // Signature metadata
-            case 'redacted-reasoning': // Redacted content metadata
-            case 'step-output': // Step output wrapper (content is nested)
-              // Don't create spans for these chunks
-              break;
-
-            case 'tool-call-approval': // Approval request - create span for debugging
-              this.#handleToolApprovalChunk(chunk);
-              break;
-
-            case 'tool-output':
-              // tool-output chunks are streaming progress from tools (e.g., sub-agents)
-              // No span created - the final tool-result event captures the result
-              break;
-
-            case 'tool-result': {
-              // tool-result is always a point-in-time event span
-              // (tool execution duration is captured by the parent tool_call span)
-              const {
-                // Metadata - tool call context (unique to tool-result chunks)
-                toolCallId,
-                toolName,
-                isError,
-                dynamic,
-                providerExecuted,
-                providerMetadata,
-                // Keep provider-executed results on MODEL_CHUNK because they come
-                // from the model/provider stream and may not have a sibling TOOL_CALL span.
-                // For locally executed tools, the canonical payload lives on TOOL_CALL.
-                result,
-                // Stripped - redundant (already on TOOL_CALL span input)
-                args: _args,
-              } = (chunk.payload as Record<string, any>) || {};
-
-              // All tool-result specific fields go in metadata
-              const metadata: Record<string, any> = { toolCallId, toolName };
-              if (isError !== undefined) metadata.isError = isError;
-              if (dynamic !== undefined) metadata.dynamic = dynamic;
-              if (providerExecuted !== undefined) metadata.providerExecuted = providerExecuted;
-              if (providerMetadata !== undefined) metadata.providerMetadata = providerMetadata;
-
-              const mastraMeta = providerMetadata?.mastra as Record<string, unknown> | undefined;
-              const spanOutput = providerExecuted
-                ? result
-                : mastraMeta?.modelOutput !== undefined
-                  ? mastraMeta.modelOutput
-                  : undefined;
-
-              this.#createEventSpan(chunk.type, spanOutput, { metadata });
-              break;
+              // Default: skip creating spans for unrecognized chunk types
+              // All semantic content chunks should be explicitly handled above
+              // Unknown chunks are likely infrastructure or custom chunks that don't need tracing
+              default:
+                // No span created - reduces trace noise
+                break;
             }
-
-            // Default: skip creating spans for unrecognized chunk types
-            // All semantic content chunks should be explicitly handled above
-            // Unknown chunks are likely infrastructure or custom chunks that don't need tracing
-            default:
-              // No span created - reduces trace noise
-              break;
-          }
+          });
         },
       }),
     ) as T;

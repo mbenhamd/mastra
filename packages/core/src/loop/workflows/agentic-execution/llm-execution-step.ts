@@ -1588,7 +1588,8 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
         // the pre-action gate in tool-call-step). Mirrors the channel-tool-fence
         // pattern above.
         const permissionPolicy = requestContext?.get(TOOL_PERMISSION_POLICY_KEY) as
-          ((toolName: string) => 'allow' | 'ask' | 'deny') | undefined;
+          | ((toolName: string) => 'allow' | 'ask' | 'deny')
+          | undefined;
         if (permissionPolicy) {
           const toolSurface = (currentStep.tools ?? {}) as Record<string, unknown>;
           const toolChoice = currentStep.toolChoice as { type?: string; toolName?: string } | string | undefined;
@@ -1775,6 +1776,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
           // Short-circuit: replay cached chunks instead of calling the model.
           // Output processors are skipped on cache hit because the cached
           // chunks already reflect their effects from the original call.
+          modelSpanTracker?.markInferenceNotApplicable?.();
           warnings = cachedResponse.warnings ?? [];
           request = cachedResponse.request ?? {};
           rawResponse = cachedResponse.rawResponse;
@@ -1850,6 +1852,17 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                 }),
                 methodType,
                 generateId: readScoped(scopeCtx, GENERATE_ID_KEY, 'generateId'),
+                ...(typeof modelSpanTracker?.recordPreparedRequest === 'function'
+                  ? {
+                      onPreparedRequest: metrics => modelSpanTracker.recordPreparedRequest?.(metrics),
+                    }
+                  : {}),
+                onProviderAttemptStart: providerAttempt =>
+                  modelSpanTracker?.startInference?.(undefined, providerAttempt),
+                onProviderAttemptError: ({ error }) =>
+                  modelSpanTracker?.reportInferenceError?.({
+                    error: error instanceof Error ? error : new Error('Provider attempt failed'),
+                  }),
                 onResult: ({
                   warnings: warningsFromStream,
                   request: requestFromStream,

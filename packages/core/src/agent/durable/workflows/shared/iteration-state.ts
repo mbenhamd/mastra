@@ -112,8 +112,9 @@ export function createBaseIterationStateUpdate(input: IterationStateUpdateInput)
     // rebuilds the state for the next iteration, so we must carry the
     // flag forward explicitly.
     pendingFeedbackStop: currentState.pendingFeedbackStop,
-    // Carry span identity forward unchanged so every iteration shares one trace.
+    // Carry span identity forward while retaining the latest content-free
+    // generation attributes emitted by the LLM step.
     agentSpanData: currentState.agentSpanData,
-    modelSpanData: currentState.modelSpanData,
+    modelSpanData: executionOutput.modelSpanData ?? currentState.modelSpanData,
   };
 }

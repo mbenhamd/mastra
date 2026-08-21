@@ -1,7 +1,11 @@
 import { convertArrayToReadableStream, MockLanguageModelV2 } from '@internal/ai-sdk-v5/test';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
 import { coreFeatures } from '../../../features';
+import {
+  isExactJsonMeasurementCandidate,
+  MAX_EXACT_JSON_MEASUREMENT_CODE_UNITS,
+} from '../../../observability/content-free-measurement';
 import { execute, resolveJsonPromptInjection } from './execute';
 import { testUsage } from './test-utils';
 
@@ -249,5 +253,341 @@ describe('execute structured output prompt handling', () => {
     const promptJson = JSON.stringify(capturedPrompt);
     expect(promptJson).toContain('Your response will be processed by another agent to extract structured data');
     expect(promptJson).toContain('suggestions');
+  });
+});
+
+describe('execute prepared provider request measurements', () => {
+  const utf8JsonBytes = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).byteLength;
+
+  it('fails binary JSON measurement closed before typed-array serialization can expand it', () => {
+    expect(isExactJsonMeasurementCandidate(new Uint8Array([1, 2, 3]))).toBe(false);
+    expect(isExactJsonMeasurementCandidate({ payload: Buffer.from('private bytes') })).toBe(false);
+  });
+
+  it('measures repeated JSON references but rejects cycles and serialization hooks', () => {
+    const shared = { value: 'safe' };
+    expect(isExactJsonMeasurementCandidate({ first: shared, second: shared })).toBe(true);
+    const cyclic: { self?: unknown } = {};
+    cyclic.self = cyclic;
+    expect(isExactJsonMeasurementCandidate(cyclic)).toBe(false);
+    expect(
+      isExactJsonMeasurementCandidate({
+        toJSON: () => ({ expanded: 'private' }),
+      }),
+    ).toBe(false);
+  });
+
+  it('reports exact content-free sizes for the final request passed to the provider adapter', async () => {
+    let capturedRequest: Record<string, unknown> | undefined;
+    let measurement: Record<string, unknown> | undefined;
+    const model = new MockLanguageModelV2({
+      doStream: async (request: any) => {
+        capturedRequest = request;
+        return {
+          stream: convertArrayToReadableStream([
+            { type: 'stream-start', warnings: [] },
+            { type: 'response-metadata', id: 'id-sized', modelId: 'mock-model-id', timestamp: new Date(0) },
+            { type: 'text-start', id: 'text-1' },
+            { type: 'text-delta', id: 'text-1', delta: '{"suggestions":["ship"]}' },
+            { type: 'text-end', id: 'text-1' },
+            { type: 'finish', finishReason: 'stop', usage: testUsage, providerMetadata: undefined },
+          ]),
+          request: { body: '' },
+          response: { headers: {} },
+          warnings: [] as any[],
+        };
+      },
+    });
+    const messages = [
+      { role: 'system' as const, content: 'SYSTEM_INSTRUCTION_CANARY' },
+      { role: 'user' as const, content: [{ type: 'text' as const, text: 'PROMPT_SECRET_CANARY café' }] },
+      { role: 'assistant' as const, content: [{ type: 'text' as const, text: 'MODEL_OUTPUT_CANARY' }] },
+      {
+        role: 'tool' as const,
+        content: [
+          {
+            type: 'tool-result' as const,
+            toolCallId: 'call-1',
+            toolName: 'lookup',
+            output: { type: 'text' as const, value: 'TOOL_RESULT_CANARY' },
+          },
+        ],
+      },
+    ];
+
+    const stream = execute({
+      runId: 'test-run-id-sized',
+      model: model as any,
+      inputMessages: messages,
+      tools: {
+        lookup: {
+          description: 'TOOL_SCHEMA_CANARY',
+          inputSchema: z.object({ query: z.string().describe('TOOL_SCHEMA_FIELD_CANARY') }),
+          execute: async () => 'unused',
+        },
+      },
+      toolChoice: 'auto',
+      providerOptions: {
+        azure: { reasoningEffort: 'low', privateDeployment: 'PROVIDER_OPTION_CANARY' },
+      },
+      modelSettings: { temperature: 0.2 },
+      structuredOutput: { schema },
+      onPreparedRequest: value => {
+        measurement = value as unknown as Record<string, unknown>;
+      },
+      onResult: () => {},
+      methodType: 'stream',
+    });
+
+    await readStream(stream);
+
+    expect(capturedRequest).toBeDefined();
+    expect(measurement).toMatchObject({
+      measurementState: 'measured',
+      providerBreakdownState: 'serialized_components_non_additive',
+      providerMessageCount: 4,
+      providerSystemMessageCount: 1,
+      providerUserMessageCount: 1,
+      providerAssistantMessageCount: 1,
+      providerToolMessageCount: 1,
+      providerOtherMessageCount: 0,
+      providerToolCount: 1,
+      providerResponseSchemaState: 'measured',
+      providerReasoningEffortState: 'measured',
+      providerReasoningEffort: 'low',
+    });
+    expect(measurement?.providerRequestBytes).toBe(utf8JsonBytes(capturedRequest));
+    expect(measurement?.providerMessageBytes).toBe(utf8JsonBytes(capturedRequest?.prompt));
+    expect(measurement?.providerToolSchemaBytes).toBe(utf8JsonBytes(capturedRequest?.tools));
+    expect(measurement?.providerResponseSchemaBytes).toBe(
+      utf8JsonBytes((capturedRequest?.responseFormat as { schema?: unknown } | undefined)?.schema),
+    );
+    expect(measurement?.providerSystemMessageBytes).toBe(utf8JsonBytes(messages[0]));
+    expect(measurement?.providerUserMessageBytes).toBe(utf8JsonBytes(messages[1]));
+    expect(measurement?.providerAssistantMessageBytes).toBe(utf8JsonBytes(messages[2]));
+    expect(measurement?.providerToolMessageBytes).toBe(utf8JsonBytes(messages[3]));
+    expect(measurement?.providerPreparationMs).toEqual(expect.any(Number));
+    expect(measurement?.providerMeasurementMs).toEqual(expect.any(Number));
+    expect(measurement?.providerDispatchTimestampMs).toEqual(expect.any(Number));
+    expect(JSON.stringify(measurement)).not.toMatch(
+      /PROMPT_SECRET_CANARY|SYSTEM_INSTRUCTION_CANARY|MODEL_OUTPUT_CANARY|TOOL_SCHEMA_CANARY|TOOL_RESULT_CANARY/u,
+    );
+    expect(JSON.stringify(measurement)).not.toContain('PROVIDER_OPTION_CANARY');
+  });
+
+  it('labels inline and absent response schemas without success-shaped zeroes', async () => {
+    const measurements: Array<Record<string, unknown>> = [];
+    const model = new MockLanguageModelV2({
+      doStream: async () => ({
+        stream: convertArrayToReadableStream([
+          { type: 'stream-start', warnings: [] },
+          { type: 'finish', finishReason: 'stop', usage: testUsage, providerMetadata: undefined },
+        ]),
+        request: { body: '' },
+        response: { headers: {} },
+        warnings: [] as any[],
+      }),
+    });
+
+    for (const structuredOutput of [{ schema, jsonPromptInjection: 'inline' as const }, undefined]) {
+      const stream = execute({
+        runId: `test-run-id-schema-${measurements.length}`,
+        model: model as any,
+        inputMessages,
+        structuredOutput,
+        onPreparedRequest: value => measurements.push(value as unknown as Record<string, unknown>),
+        onResult: () => {},
+        methodType: 'stream',
+      });
+      await readStream(stream);
+    }
+
+    expect(measurements[0]).toMatchObject({
+      providerResponseSchemaState: 'inline_in_prompt',
+      providerReasoningEffortState: 'provider_default',
+    });
+    expect(measurements[0]?.providerResponseSchemaBytes).toEqual(expect.any(Number));
+    expect(measurements[1]).toMatchObject({ providerResponseSchemaState: 'not_applicable' });
+    expect(measurements[1]).not.toHaveProperty('providerResponseSchemaBytes');
+  });
+
+  it('fails oversized exact measurement closed without changing provider dispatch', async () => {
+    const oversizedText = 'x'.repeat(MAX_EXACT_JSON_MEASUREMENT_CODE_UNITS + 1);
+    let capturedPrompt: unknown;
+    let measurement: Record<string, unknown> | undefined;
+    const model = new MockLanguageModelV2({
+      doStream: async ({ prompt }: any) => {
+        capturedPrompt = prompt;
+        return {
+          stream: convertArrayToReadableStream([
+            { type: 'stream-start', warnings: [] },
+            { type: 'finish', finishReason: 'stop', usage: testUsage, providerMetadata: undefined },
+          ]),
+          request: { body: '' },
+          response: { headers: {} },
+          warnings: [] as any[],
+        };
+      },
+    });
+
+    const stream = execute({
+      runId: 'test-run-id-oversized-measurement',
+      model: model as any,
+      inputMessages: [{ role: 'user', content: [{ type: 'text', text: oversizedText }] }],
+      onPreparedRequest: value => {
+        measurement = value as unknown as Record<string, unknown>;
+      },
+      onResult: () => {},
+      methodType: 'stream',
+    });
+    await readStream(stream);
+
+    expect(JSON.stringify(capturedPrompt)).toContain(oversizedText);
+    expect(measurement).toMatchObject({
+      measurementState: 'unknown',
+      providerMessageCount: 1,
+      providerUserMessageCount: 1,
+      providerToolCount: 0,
+      providerToolSchemaState: 'not_applicable',
+      providerResponseSchemaState: 'not_applicable',
+    });
+    expect(measurement).not.toHaveProperty('providerMessageBytes');
+    expect(measurement).not.toHaveProperty('providerRequestBytes');
+    expect(JSON.stringify(measurement)).not.toContain(oversizedText);
+  });
+
+  it('does not invoke provider-option accessors while classifying reasoning telemetry', async () => {
+    let reasoningAccessorReads = 0;
+    const azureOptions = Object.defineProperty({}, 'reasoningEffort', {
+      enumerable: true,
+      get() {
+        reasoningAccessorReads += 1;
+        return 'low';
+      },
+    });
+    let readsAtDispatch = -1;
+    let measurement: Record<string, unknown> | undefined;
+    const model = new MockLanguageModelV2({
+      doStream: async () => {
+        readsAtDispatch = reasoningAccessorReads;
+        return {
+          stream: convertArrayToReadableStream([
+            { type: 'stream-start', warnings: [] },
+            { type: 'finish', finishReason: 'stop', usage: testUsage, providerMetadata: undefined },
+          ]),
+          request: { body: '' },
+          response: { headers: {} },
+          warnings: [] as any[],
+        };
+      },
+    });
+
+    const stream = execute({
+      runId: 'test-run-id-provider-accessor',
+      model: model as any,
+      inputMessages,
+      providerOptions: { azure: azureOptions } as any,
+      onPreparedRequest: value => {
+        measurement = value as unknown as Record<string, unknown>;
+      },
+      onResult: () => {},
+      methodType: 'stream',
+    });
+    await readStream(stream);
+
+    expect(readsAtDispatch).toBeGreaterThanOrEqual(0);
+    expect(reasoningAccessorReads).toBe(readsAtDispatch);
+    expect(measurement).toMatchObject({
+      measurementState: 'unknown',
+      providerReasoningEffortState: 'unknown',
+    });
+  });
+
+  it('dispatches before measuring or notifying and ignores observability callback failures', async () => {
+    const order: string[] = [];
+    const doStream = vi.fn(async () => {
+      order.push('provider-dispatched');
+      return {
+        stream: convertArrayToReadableStream([
+          { type: 'stream-start', warnings: [] },
+          { type: 'finish', finishReason: 'stop', usage: testUsage, providerMetadata: undefined },
+        ]),
+        request: { body: '' },
+        response: { headers: {} },
+        warnings: [] as any[],
+      };
+    });
+    const stream = execute({
+      runId: 'test-run-id-callback-error',
+      model: new MockLanguageModelV2({ doStream }) as any,
+      inputMessages,
+      onPreparedRequest: () => {
+        order.push('observer-notified');
+        throw new Error('observer failed');
+      },
+      onResult: () => {},
+      methodType: 'stream',
+    });
+
+    await readStream(stream);
+    expect(doStream).toHaveBeenCalledTimes(1);
+    expect(order).toEqual(['provider-dispatched', 'observer-notified']);
+  });
+
+  it('measures every provider retry and anchors the successful attempt separately', async () => {
+    let measurementClockMs = 10_000;
+    const dateNow = vi.spyOn(Date, 'now').mockImplementation(() => ++measurementClockMs);
+    const measurements: Array<Record<string, unknown>> = [];
+    const providerRequests: Array<Record<string, unknown>> = [];
+    const startedAttempts: number[] = [];
+    const failedAttempts: number[] = [];
+    let providerCalls = 0;
+    const model = new MockLanguageModelV2({
+      doStream: async providerRequest => {
+        providerCalls += 1;
+        const mutableProviderRequest = providerRequest as unknown as Record<string, unknown>;
+        providerRequests.push(mutableProviderRequest);
+        expect(mutableProviderRequest.adapterMutation).toBeUndefined();
+        if (providerCalls === 1) {
+          mutableProviderRequest.adapterMutation = 'failed-attempt-only';
+          throw new Error('transient provider failure');
+        }
+        return {
+          stream: convertArrayToReadableStream([
+            { type: 'stream-start', warnings: [] },
+            { type: 'finish', finishReason: 'stop', usage: testUsage, providerMetadata: undefined },
+          ]),
+          request: { body: '' },
+          response: { headers: {} },
+          warnings: [] as any[],
+        };
+      },
+    });
+    const stream = execute({
+      runId: 'test-run-id-provider-retry',
+      model: model as any,
+      inputMessages,
+      modelSettings: { maxRetries: 1 },
+      onPreparedRequest: value => measurements.push(value as unknown as Record<string, unknown>),
+      onProviderAttemptStart: providerAttempt => startedAttempts.push(providerAttempt),
+      onProviderAttemptError: ({ providerAttempt }) => failedAttempts.push(providerAttempt),
+      onResult: () => {},
+      methodType: 'stream',
+    });
+
+    await readStream(stream);
+
+    expect(providerCalls).toBe(2);
+    expect(providerRequests[1]).not.toBe(providerRequests[0]);
+    expect(startedAttempts).toEqual([1, 2]);
+    expect(failedAttempts).toEqual([1]);
+    expect(measurements).toHaveLength(2);
+    expect(measurements.map(value => value.providerAttempt)).toEqual([1, 2]);
+    expect(Number(measurements[0]?.providerPreparationMs)).toBeGreaterThan(0);
+    expect(Number(measurements[1]?.providerPreparationMs)).toBeGreaterThan(0);
+    expect(Number(measurements[1]?.providerDispatchTimestampMs)).toBeGreaterThanOrEqual(
+      Number(measurements[0]?.providerDispatchTimestampMs),
+    );
+    dateNow.mockRestore();
   });
 });

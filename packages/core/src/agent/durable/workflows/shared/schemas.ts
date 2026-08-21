@@ -147,7 +147,7 @@ export const baseIterationStateSchema = z.object({
   // Set when onIterationComplete returns { continue: false, feedback } — allows
   // one more LLM turn with the feedback, then stops on the next predicate eval.
   pendingFeedbackStop: z.boolean().optional(),
-  // Span data, carried unchanged so every iteration shares one trace
+  // Span identity stays stable while content-free generation attributes advance.
   agentSpanData: z.any().optional(),
   modelSpanData: z.any().optional(),
 });

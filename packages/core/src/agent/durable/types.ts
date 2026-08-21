@@ -387,7 +387,7 @@ export interface DurableLLMStepOutput {
   modelEntryId?: string;
   /** The live response-only capability was consumed, even if a later hard stop prevented provider I/O. */
   responseRecoveryConsumed?: boolean;
-  /** Exported model_generation span data (only set when there are tool calls) */
+  /** Latest exported model_generation span data, including content-free request totals. */
   modelSpanData?: unknown;
   /** Exported model_step span data (only set when there are tool calls) */
   stepSpanData?: unknown;
@@ -483,6 +483,8 @@ export interface DurableAgenticExecutionOutput {
   state: SerializableDurableState;
   /** Enabled model-list entry that served this iteration. */
   modelEntryId?: string;
+  /** Latest exported model-generation attributes for durable continuation/finalization. */
+  modelSpanData?: unknown;
   /** The live response-only capability was consumed by this iteration. */
   responseRecoveryConsumed?: boolean;
   /** Processor retry tracking */
@@ -524,7 +526,14 @@ export interface DurableAgenticLoopOutput {
  * Event types emitted via pubsub for agent streaming
  */
 export type AgentStreamEventType =
-  'chunk' | 'step-start' | 'step-finish' | 'finish' | 'error' | 'suspended' | 'abort' | 'iteration-complete';
+  | 'chunk'
+  | 'step-start'
+  | 'step-finish'
+  | 'finish'
+  | 'error'
+  | 'suspended'
+  | 'abort'
+  | 'iteration-complete';
 
 /**
  * Event emitted via pubsub for agent streaming

@@ -12,7 +12,7 @@ import type {
   AnyExportedSpan,
   TracingContext,
 } from '@mastra/core/observability';
-import type { Processor, ProcessOutputStreamArgs } from '@mastra/core/processors';
+import type { Processor, ProcessLLMRequestArgs, ProcessOutputStreamArgs } from '@mastra/core/processors';
 import { ModerationProcessor, ProcessorStepSchema } from '@mastra/core/processors';
 import { MockStore } from '@mastra/core/storage';
 import type { ChunkType } from '@mastra/core/stream';
@@ -268,6 +268,29 @@ class InputStepProcessor implements Processor {
   }
 }
 
+/** Provider-bound processor that rewrites the final prompt for one call. */
+class LLMRequestProcessor implements Processor {
+  readonly id: string;
+  readonly name: string;
+
+  constructor(id: string = 'llm-request') {
+    this.id = id;
+    this.name = `LLM Request: ${id}`;
+  }
+
+  processLLMRequest({ prompt }: ProcessLLMRequestArgs) {
+    return {
+      prompt: [
+        ...prompt,
+        {
+          role: 'user' as const,
+          content: [{ type: 'text' as const, text: 'LLM_REQUEST_OUTPUT_CANARY' }],
+        },
+      ],
+    };
+  }
+}
+
 /**
  * Output step processor that implements processOutputStep.
  */
@@ -500,6 +523,101 @@ describe('Processor Tracing Tests', () => {
 
       // EXECUTION ORDER: input processor starts before MODEL_GENERATION
       testExporter.expectStartedBefore(inputProcessorSpan, modelSpan);
+
+      await testExporter.finalExpectations();
+    });
+
+    it('traces provider-bound request processors before model inference', async () => {
+      const model = createMockModel();
+      const agent = new Agent({
+        id: 'test-agent',
+        name: 'Test Agent',
+        instructions: 'Test',
+        model,
+        inputProcessors: [new LLMRequestProcessor('provider-compat')],
+      });
+      const mastra = new Mastra({
+        ...getBaseMastraConfig(testExporter),
+        agents: { agent },
+      });
+
+      await mastra.getAgent('agent').generate('Hello');
+
+      const requestSpan = testExporter
+        .getProcessorSpans()
+        .find(span => span.name === 'llm request processor: provider-compat');
+      const [stepSpan] = testExporter.getModelStepSpans();
+      const [inferenceSpan] = testExporter.getModelInferenceSpans();
+      const [generationSpan] = testExporter.getModelSpans();
+
+      expect(requestSpan).toBeDefined();
+      expect(requestSpan).toMatchObject({
+        entityType: EntityType.INPUT_STEP_PROCESSOR,
+        entityId: 'provider-compat',
+        parentSpanId: stepSpan?.id,
+        attributes: expect.objectContaining({
+          processorExecutor: 'legacy',
+          processorIndex: 0,
+          processorPhase: 'llm_request',
+        }),
+      });
+      expect(requestSpan?.input).toBeUndefined();
+      expect(requestSpan?.output).toBeUndefined();
+      expect(requestSpan?.attributes).toMatchObject({
+        processorMeasurementState: 'measured',
+        processorMeasurementMs: expect.any(Number),
+        processorRoleBreakdownState: 'serialized_subsets_non_additive',
+        processorInputMessageCount: 1,
+        processorOutputMessageCount: 2,
+        processorInputUserMessageCount: 1,
+        processorOutputUserMessageCount: 2,
+        processorUserMessageDeltaBytes: expect.any(Number),
+        processorTotalDeltaBytes: expect.any(Number),
+      });
+      expect(JSON.stringify(requestSpan)).not.toContain('LLM_REQUEST_OUTPUT_CANARY');
+      expect(requestSpan?.attributes?.processorUserMessageDeltaBytes).toBeGreaterThan(0);
+      testExporter.expectStartedBefore(requestSpan, inferenceSpan);
+      expect(inferenceSpan?.attributes).toMatchObject({
+        measurementState: 'measured',
+        providerBreakdownState: 'serialized_components_non_additive',
+        providerMessageCount: expect.any(Number),
+        providerRequestBytes: expect.any(Number),
+      });
+      expect(generationSpan?.attributes).toMatchObject({
+        providerAggregateMeasurementState: 'measured',
+        providerInferenceCount: 1,
+        providerRequestBytesTotal: expect.any(Number),
+      });
+
+      await testExporter.finalExpectations();
+    });
+
+    it('fails oversized provider-bound processor measurement closed without retaining content', async () => {
+      const oversizedCanary = `OVERSIZED_PROCESSOR_CANARY_${'x'.repeat(300 * 1024)}`;
+      const agent = new Agent({
+        id: 'test-agent',
+        name: 'Test Agent',
+        instructions: 'Test',
+        model: createMockModel(),
+        inputProcessors: [new LLMRequestProcessor('provider-compat')],
+      });
+      const mastra = new Mastra({
+        ...getBaseMastraConfig(testExporter),
+        agents: { agent },
+      });
+
+      await mastra.getAgent('agent').generate(oversizedCanary);
+
+      const requestSpan = testExporter
+        .getProcessorSpans()
+        .find(span => span.name === 'llm request processor: provider-compat');
+      expect(requestSpan?.attributes).toMatchObject({
+        processorMeasurementState: 'unknown',
+        processorMeasurementMs: expect.any(Number),
+      });
+      expect(requestSpan?.input).toBeUndefined();
+      expect(requestSpan?.output).toBeUndefined();
+      expect(JSON.stringify(requestSpan)).not.toContain('OVERSIZED_PROCESSOR_CANARY');
 
       await testExporter.finalExpectations();
     });

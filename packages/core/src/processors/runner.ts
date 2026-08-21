@@ -15,7 +15,8 @@ import type { MastraMemory } from '../memory/memory';
 import { parseMemoryRequestContext } from '../memory/types';
 import { EntityType, SpanType, createObservabilityContext, resolveObservabilityContext } from '../observability';
 import type { ObservabilityContext, Span } from '../observability';
-import type { TracingContext } from '../observability/types';
+import { isExactJsonMeasurementCandidate, jsonUtf8ByteLength } from '../observability/content-free-measurement';
+import type { ProcessorRunAttributes, TracingContext } from '../observability/types';
 import type { RequestContext } from '../request-context';
 import type { ChunkType } from '../stream';
 import type { MastraModelOutput } from '../stream/base/output';
@@ -91,6 +92,121 @@ function outputProcessorSupportsResult(processorOrWorkflow: ProcessorOrWorkflow)
 
 export function outputProcessorsSupportResult(outputProcessors: readonly ProcessorOrWorkflow[] | undefined): boolean {
   return Boolean(outputProcessors?.some(outputProcessorSupportsResult));
+}
+
+const measuredPromptRoles = ['user', 'assistant', 'tool', 'other'] as const;
+type MeasuredPromptRole = (typeof measuredPromptRoles)[number];
+
+type PromptMeasurementSnapshot = {
+  messageCount: number;
+  messageBytes: number;
+  promptBytes: number;
+  systemMessageCount: number;
+  systemMessageBytes: number;
+  roles: Record<MeasuredPromptRole, { count: number; bytes: number }>;
+};
+
+type TimedPromptMeasurement = {
+  snapshot: PromptMeasurementSnapshot | undefined;
+  durationMs: number;
+};
+
+function measuredPromptRole(message: LanguageModelV2Prompt[number]): MeasuredPromptRole | 'system' {
+  const role = message.role;
+  if (role === 'system' || role === 'user' || role === 'assistant' || role === 'tool') return role;
+  return 'other';
+}
+
+function serializedArrayBytes(serializedItems: readonly number[]): number {
+  if (serializedItems.length === 0) return 2;
+  return 2 + serializedItems.length - 1 + serializedItems.reduce((total, itemBytes) => total + itemBytes, 0);
+}
+
+function measurePrompt(prompt: LanguageModelV2Prompt): PromptMeasurementSnapshot | undefined {
+  try {
+    if (!isExactJsonMeasurementCandidate(prompt)) return undefined;
+    const serializedMessages: number[] = [];
+    const serializedPrompt: number[] = [];
+    const serializedSystemMessages: number[] = [];
+    const serializedByRole: Record<MeasuredPromptRole, number[]> = {
+      user: [],
+      assistant: [],
+      tool: [],
+      other: [],
+    };
+
+    for (const message of prompt) {
+      const utf8Bytes = jsonUtf8ByteLength(message);
+      if (utf8Bytes === undefined) return undefined;
+      const role = measuredPromptRole(message);
+      serializedPrompt.push(utf8Bytes);
+      if (role === 'system') serializedSystemMessages.push(utf8Bytes);
+      else {
+        serializedMessages.push(utf8Bytes);
+        serializedByRole[role].push(utf8Bytes);
+      }
+    }
+
+    return {
+      messageCount: serializedMessages.length,
+      messageBytes: serializedArrayBytes(serializedMessages),
+      promptBytes: serializedArrayBytes(serializedPrompt),
+      systemMessageCount: serializedSystemMessages.length,
+      systemMessageBytes: serializedArrayBytes(serializedSystemMessages),
+      roles: Object.fromEntries(
+        measuredPromptRoles.map(role => [
+          role,
+          { count: serializedByRole[role].length, bytes: serializedArrayBytes(serializedByRole[role]) },
+        ]),
+      ) as PromptMeasurementSnapshot['roles'],
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function timedPromptMeasurement(prompt: LanguageModelV2Prompt): TimedPromptMeasurement {
+  const startedAt = globalThis.performance?.now() ?? Date.now();
+  const snapshot = measurePrompt(prompt);
+  return {
+    snapshot,
+    durationMs: Math.max(0, (globalThis.performance?.now() ?? Date.now()) - startedAt),
+  };
+}
+
+function promptProcessorMeasurements(
+  before: PromptMeasurementSnapshot | undefined,
+  after: PromptMeasurementSnapshot | undefined,
+  processorMeasurementMs: number,
+): Partial<ProcessorRunAttributes> {
+  if (!before || !after) {
+    return { processorMeasurementState: 'unknown' as const, processorMeasurementMs };
+  }
+  const measurements: Record<string, number | string> = {
+    processorMeasurementState: 'measured',
+    processorMeasurementMs,
+    processorRoleBreakdownState: 'serialized_subsets_non_additive',
+    processorInputMessageCount: before.messageCount,
+    processorInputMessageBytes: before.messageBytes,
+    processorOutputMessageCount: after.messageCount,
+    processorOutputMessageBytes: after.messageBytes,
+    processorMessageDeltaBytes: after.messageBytes - before.messageBytes,
+    processorInputSystemMessageCount: before.systemMessageCount,
+    processorInputSystemMessageBytes: before.systemMessageBytes,
+    processorOutputSystemMessageCount: after.systemMessageCount,
+    processorOutputSystemMessageBytes: after.systemMessageBytes,
+    processorSystemMessageDeltaBytes: after.systemMessageBytes - before.systemMessageBytes,
+    processorTotalDeltaBytes: after.promptBytes - before.promptBytes,
+  };
+  for (const role of measuredPromptRoles) {
+    const label = `${role[0]!.toUpperCase()}${role.slice(1)}`;
+    measurements[`processorInput${label}MessageCount`] = before.roles[role].count;
+    measurements[`processorInput${label}MessageBytes`] = before.roles[role].bytes;
+    measurements[`processorOutput${label}MessageCount`] = after.roles[role].count;
+    measurements[`processorOutput${label}MessageBytes`] = after.roles[role].bytes;
+    measurements[`processor${label}MessageDeltaBytes`] = after.roles[role].bytes - before.roles[role].bytes;
+  }
+  return measurements as Partial<ProcessorRunAttributes>;
 }
 
 /**
@@ -1952,13 +2068,31 @@ export class ProcessorRunner {
 
     let currentPrompt = args.prompt;
     let cachedResponse: CachedLLMStepResponse | undefined;
+    let currentPromptMeasurement: TimedPromptMeasurement | undefined;
 
-    for (const processorOrWorkflow of this.inputProcessors) {
+    for (const [index, processorOrWorkflow] of this.inputProcessors.entries()) {
       // Workflows do not currently participate in processLLMRequest.
       if (isProcessorWorkflow(processorOrWorkflow)) continue;
       const processor = processorOrWorkflow;
       const processMethod = processor.processLLMRequest?.bind(processor);
       if (!processMethod) continue;
+
+      const currentSpan = observabilityContext.tracingContext?.currentSpan;
+      const processorSpan = currentSpan?.createChildSpan({
+        type: SpanType.PROCESSOR_RUN,
+        name: `llm request processor: ${processor.id}`,
+        entityType: EntityType.INPUT_STEP_PROCESSOR,
+        entityId: processor.id,
+        entityName: processor.name,
+        attributes: {
+          processorExecutor: 'legacy',
+          processorIndex: index,
+          processorPhase: 'llm_request',
+        },
+      });
+      const promptBeforeProcessor = processorSpan
+        ? (currentPromptMeasurement ?? timedPromptMeasurement(currentPrompt))
+        : undefined;
 
       const abort = <TMetadata = unknown>(reason?: string, options?: TripWireOptions<TMetadata>): never => {
         throw new TripWire(reason || `Tripwire triggered by ${processor.id}`, options, processor.id);
@@ -1982,7 +2116,7 @@ export class ProcessorRunner {
           abort,
           abortSignal: args.abortSignal,
           writer: args.writer,
-          ...createObservabilityContext(args.tracingContext),
+          ...createObservabilityContext({ currentSpan: processorSpan }),
         });
 
         if (result && typeof result === 'object') {
@@ -2000,15 +2134,38 @@ export class ProcessorRunner {
             cachedResponse = result.response;
           }
         }
+
+        if (processorSpan && promptBeforeProcessor) {
+          const promptAfterProcessor = timedPromptMeasurement(currentPrompt);
+          processorSpan.end({
+            attributes: promptProcessorMeasurements(
+              promptBeforeProcessor.snapshot,
+              promptAfterProcessor.snapshot,
+              promptBeforeProcessor.durationMs + promptAfterProcessor.durationMs,
+            ),
+          });
+          // The previous output is the next processor's input. Reuse the exact
+          // snapshot without charging or performing the same serialization twice.
+          currentPromptMeasurement = { ...promptAfterProcessor, durationMs: 0 };
+        }
       } catch (error) {
+        const spanError = error instanceof Error ? error : new Error(String(error));
+        processorSpan?.error({
+          error: spanError,
+          endSpan: true,
+          attributes: {
+            processorMeasurementState: 'unknown',
+            ...(promptBeforeProcessor === undefined
+              ? {}
+              : { processorMeasurementMs: promptBeforeProcessor.durationMs }),
+          },
+        });
         if (error instanceof TripWire) {
           await invokeOnViolation(processor, error);
         }
         throw error;
       }
     }
-
-    void observabilityContext;
     return { prompt: currentPrompt, response: cachedResponse };
   }
 
