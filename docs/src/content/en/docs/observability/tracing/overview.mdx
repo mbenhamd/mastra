@@ -930,7 +930,7 @@ complete request size. Use `providerRequestBytes` for that value.
 Provider usage has its own state fields. `reported` means the provider returned
 the measurement, `provider_not_reported` means an inference occurred without
 that measurement, and `not_applicable` means no provider inference occurred.
-Missing usage is not zero usage. Cache-read, cache-write, and reasoning-token
+Missing usage isn't zero usage. Cache-read, cache-write, and reasoning-token
 usage use the same state distinction.
 
 The parent `MODEL_GENERATION` span rolls up every provider attempt. It records
@@ -941,11 +941,11 @@ omitted when any contributing inference lacks that measurement, so a partial
 sum isn't presented as complete.
 
 Retries open a new inference span and rebuild the top-level provider request for
-each attempt. A failed attempt ends as an error span, while the generation
-aggregate retains its measurement. An abort after dispatch closes the active
-inference as an error and retains the aggregate. A cache replay or processor
-decision that stops before dispatch creates no provider inference and reports
-the aggregate and usage as `not_applicable`.
+each attempt. Failed attempts end as error spans, while the generation aggregate
+retains their measurements; an abort after dispatch likewise closes the active
+inference as an error without discarding the aggregate. A cache replay or
+processor decision that stops before dispatch creates no provider inference and
+reports the aggregate and usage as `not_applicable`.
 
 Exact measurement accepts only bounded, data-only JSON shapes. It doesn't call
 request getters, iterators, proxies, or `toJSON` methods. The snapshot is limited
