@@ -266,6 +266,7 @@ function removeObservationalMemoryMetadata(
 }
 
 export class InMemoryMemory extends MemoryStorage {
+  override readonly supportsPartialThreadUpdate: boolean = true;
   readonly supportsObservationalMemory = true;
   readonly supportsAtomicObservationalMemoryRetraction = true;
   readonly supportsRevisionedWorkingMemory = true;

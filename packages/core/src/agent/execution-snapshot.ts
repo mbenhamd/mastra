@@ -96,6 +96,18 @@ export function snapshotAgentExecutionValue<T>(value: T): T {
   return snapshotAgentExecutionValueInternal(value, new WeakMap());
 }
 
+/**
+ * Execution-option fields that are live capability handles rather than caller-owned
+ * data, so they cross the boundary by reference like the AbortSignal and Workspace
+ * instances above. `mcp` is the calling MCP server's transport-bound context: its
+ * `extra` carries the request signal plus `sendNotification`/`sendRequest`, and
+ * `elicitation`/`log`/`progress` are transport closures. A durable run parks this
+ * object on the run registry for the tool-call step (`preparation.ts` ->
+ * `RunRegistryEntry.mcp`), so deep-copying the plain container would hand tools a
+ * detached copy of a handle whose whole purpose is to talk to the live client.
+ */
+const LIVE_HANDLE_OPTION_FIELDS: readonly PropertyKey[] = ['mcp'];
+
 function snapshotAgentExecutionOptionsInternal<T>(
   value: T,
   inheritedFields: readonly PropertyKey[],
@@ -117,6 +129,18 @@ function snapshotAgentExecutionOptionsInternal<T>(
         false,
         requestContextSnapshots,
       ),
+    });
+  }
+
+  for (const key of LIVE_HANDLE_OPTION_FIELDS) {
+    if (!Object.prototype.hasOwnProperty.call(value as object, key)) continue;
+    const handle = (value as Record<PropertyKey, unknown>)[key];
+    if (handle === undefined) continue;
+    Object.defineProperty(clone as object, key, {
+      configurable: true,
+      enumerable: true,
+      writable: true,
+      value: handle,
     });
   }
 

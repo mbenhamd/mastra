@@ -1073,6 +1073,14 @@ export class InngestWorkflow<
               resumeLabels: result.resumeLabels ?? existingSnapshot?.resumeLabels ?? {},
               result: result.status === 'success' ? toSnapshotResult(result.result) : undefined,
               error: serializedError,
+              // Persist the durable tracing anchor so a later resume can rebuild the
+              // workflow span lineage (upstream #21566) without a live span handle.
+              tracingContext: workflowSpanData
+                ? {
+                    traceId: workflowSpanData.traceId,
+                    spanId: workflowSpanData.id,
+                  }
+                : existingSnapshot?.tracingContext,
               timestamp: Date.now(),
               ...finalLifecycleExecution,
               ...(disableScorers !== undefined

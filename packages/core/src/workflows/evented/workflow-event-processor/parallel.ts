@@ -349,6 +349,9 @@ export async function processWorkflowConditional(
   // Get current state from stepResults or passed state
   const currentState = resolveCurrentState({ stepResults, state });
 
+  // On restart, executionPath already includes the persisted branch index, so replace it instead of appending.
+  const branchPath = (idx: number) => (restart ? executionPath.slice(0, -1) : executionPath).concat([idx]);
+
   // Create a proper RequestContext from the plain object passed in ProcessorArgs
   const reqContext = new RequestContext(Object.entries(requestContext ?? {}) as any);
 
@@ -378,7 +381,7 @@ export async function processWorkflowConditional(
   if (onlyStepToRun) {
     const onlyStepToRunId = getSingleStepEntryId(onlyStepToRun);
     const stepIndex = step.steps.findIndex(child => getSingleStepEntryId(child) === onlyStepToRunId);
-    const branchExecutionPath = executionPath.concat([stepIndex]);
+    const branchExecutionPath = branchPath(stepIndex);
     const lifecycleReservation = await reserveBranchLifecycleAttempts({
       workflowsStore,
       workflowId,
@@ -390,7 +393,7 @@ export async function processWorkflowConditional(
       lifecycleAttemptBaselineCaptured,
       branches: [{ stepId: onlyStepToRunId, executionPath: branchExecutionPath }],
     });
-    activeStepsPath[onlyStepToRunId] = executionPath.concat([stepIndex]);
+    activeStepsPath[onlyStepToRunId] = branchExecutionPath;
     await pubsub.publish('workflows', {
       type: 'workflow.step.run',
       runId,
@@ -415,9 +418,7 @@ export async function processWorkflowConditional(
     });
   } else {
     const selectedBranches = step.steps.flatMap((branch, idx) =>
-      truthyIdxs[idx] && branch
-        ? [{ stepId: getSingleStepEntryId(branch), executionPath: executionPath.concat([idx]) }]
-        : [],
+      truthyIdxs[idx] && branch ? [{ stepId: getSingleStepEntryId(branch), executionPath: branchPath(idx) }] : [],
     );
     const lifecycleReservation = await reserveBranchLifecycleAttempts({
       workflowsStore,
@@ -439,7 +440,7 @@ export async function processWorkflowConditional(
       step.steps.map(async (child, idx) => {
         if (truthyIdxs[idx]) {
           if (child) {
-            activeStepsPath[getSingleStepEntryId(child)] = executionPath.concat([idx]);
+            activeStepsPath[getSingleStepEntryId(child)] = branchPath(idx);
           }
           return pubsub.publish('workflows', {
             type: 'workflow.step.run',
@@ -448,7 +449,7 @@ export async function processWorkflowConditional(
               ...lifecycleReservation,
               workflowId,
               runId,
-              executionPath: executionPath.concat([idx]),
+              executionPath: branchPath(idx),
               resumeSteps,
               stepResults,
               timeTravel,
@@ -471,7 +472,7 @@ export async function processWorkflowConditional(
               ...lifecycleExecution,
               workflowId,
               runId,
-              executionPath: executionPath.concat([idx]),
+              executionPath: branchPath(idx),
               resumeSteps,
               stepResults,
               prevResult: { status: 'skipped' },

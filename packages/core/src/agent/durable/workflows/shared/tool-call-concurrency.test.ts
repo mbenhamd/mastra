@@ -233,4 +233,46 @@ describe('resolveDurableToolCallConcurrency', () => {
       }),
     ).toBe(4);
   });
+
+  describe("strategy: 'called'", () => {
+    it('parallelizes a pure-safe batch even when a suspend/approval tool is registered', () => {
+      expect(
+        resolveDurableToolCallConcurrency({
+          options: { toolCallConcurrency: { limit: 5, strategy: 'called' } },
+          toolsMetadata: [tool({ name: 'a' }), tool({ name: 'b' }), tool({ name: 'danger', hasSuspendSchema: true })],
+          toolCalls: [call('a'), call('b')],
+        }),
+      ).toBe(5);
+    });
+
+    it('serializes a batch that actually called a suspend tool', () => {
+      expect(
+        resolveDurableToolCallConcurrency({
+          options: { toolCallConcurrency: { limit: 5, strategy: 'called' } },
+          toolsMetadata: [tool({ name: 'a' }), tool({ name: 'danger', hasSuspendSchema: true })],
+          toolCalls: [call('a'), call('danger')],
+        }),
+      ).toBe(1);
+    });
+
+    it('serializes a batch that actually called an approval tool', () => {
+      expect(
+        resolveDurableToolCallConcurrency({
+          options: { toolCallConcurrency: { limit: 5, strategy: 'called' } },
+          toolsMetadata: [tool({ name: 'a' }), tool({ name: 'gated', requireApproval: true })],
+          toolCalls: [call('gated')],
+        }),
+      ).toBe(1);
+    });
+
+    it('still forces sequential when run-wide requireToolApproval is set', () => {
+      expect(
+        resolveDurableToolCallConcurrency({
+          options: { requireToolApproval: true, toolCallConcurrency: { limit: 5, strategy: 'called' } },
+          toolsMetadata: [tool({ name: 'a' })],
+          toolCalls: [call('a')],
+        }),
+      ).toBe(1);
+    });
+  });
 });

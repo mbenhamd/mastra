@@ -1,5 +1,6 @@
 import { TTLCache } from '@isaacs/ttlcache';
 import type { MastraLanguageModel } from '../../llm/model/shared.types';
+import type { Mastra } from '../../mastra';
 import type { CoreTool } from '../../tools/types';
 import type { MessageList } from '../message-list';
 import type { SaveQueueManager } from '../save-queue';
@@ -72,6 +73,25 @@ export function clearGlobalRunRegistry(): void {
   pinnedRunRegistry.clear();
   globalRunRegistry.clear();
   for (const entry of pinnedOnlyEntries) entry.cleanup?.();
+}
+
+/**
+ * Collect the in-flight durable workflow executions owned by `mastra` so graceful
+ * shutdown can await them. Pinned segments are included: an active segment may have
+ * been evicted from the TTL cache while it is still running.
+ */
+export function getActiveDurableAgentWorkflowExecutions(mastra: Mastra): Promise<unknown>[] {
+  // `globalRunRegistry` is a TTLCache, and — as the `dispose` handler above already
+  // documents — it can surface an `undefined` value after a missing `get()` refreshes
+  // expiration metadata. Type the set honestly and optional-chain the read; the
+  // unguarded `entry.mastra` threw during `Mastra.shutdown()`.
+  const entries = new Set<RunRegistryEntry | undefined>([
+    ...globalRunRegistry.values(),
+    ...[...pinnedRunRegistry.values()].map(({ entry }) => entry),
+  ]);
+  return Array.from(entries).flatMap(entry =>
+    entry?.mastra === mastra && entry.workflowExecution ? [entry.workflowExecution] : [],
+  );
 }
 
 /**

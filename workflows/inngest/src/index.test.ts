@@ -5423,13 +5423,16 @@ describe('MastraInngestWorkflow', () => {
           endedAt: expect.any(Number),
         },
         promptAgent: {
+          // A resumed step's record no longer carries the suspension it recovered from:
+          // upstream a7dd3224 (#21565) strips suspendPayload/suspendedAt from the persisted
+          // step result on re-entry, and packages/core/.../nested-suspend-steps.test.ts asserts
+          // their absence after a successful resume. toEqual is exact, so omitting them here
+          // asserts that absence rather than ignoring it.
           status: 'success',
           output: { modelOutput: 'test output' },
-          suspendPayload: { testPayload: 'hello' },
           resumePayload: { userInput: 'test input for resumption' },
           startedAt: expect.any(Number),
           endedAt: expect.any(Number),
-          suspendedAt: expect.any(Number),
           resumedAt: expect.any(Number),
         },
       });
@@ -5610,8 +5613,6 @@ describe('MastraInngestWorkflow', () => {
           startedAt: expect.any(Number),
           endedAt: expect.any(Number),
           resumedAt: expect.any(Number),
-          suspendPayload: { testPayload: 'hello' },
-          suspendedAt: expect.any(Number),
         },
         evaluateToneConsistency: {
           status: 'success',
@@ -5657,8 +5658,6 @@ describe('MastraInngestWorkflow', () => {
           startedAt: expect.any(Number),
           endedAt: expect.any(Number),
           resumedAt: expect.any(Number),
-          suspendedAt: expect.any(Number),
-          suspendPayload: { testPayload: 'hello' },
         },
         evaluateToneConsistency: {
           status: 'success',
@@ -5679,7 +5678,6 @@ describe('MastraInngestWorkflow', () => {
           startedAt: expect.any(Number),
           endedAt: expect.any(Number),
           resumedAt: expect.any(Number),
-          suspendedAt: expect.any(Number),
         },
         evaluateImprovedResponse: {
           status: 'success',
@@ -6121,11 +6119,9 @@ describe('MastraInngestWorkflow', () => {
         promptAgent: {
           status: 'success',
           output: { modelOutput: 'test input for resumption' },
-          suspendPayload: { testPayload: 'suspend message' },
           resumePayload: { userInput: 'input for resumption' },
           startedAt: expect.any(Number),
           endedAt: expect.any(Number),
-          suspendedAt: expect.any(Number),
           resumedAt: expect.any(Number),
         },
         evaluateToneConsistency: {
@@ -6166,11 +6162,9 @@ describe('MastraInngestWorkflow', () => {
         promptAgent: {
           status: 'success',
           output: { modelOutput: 'test input for resumption' },
-          suspendPayload: { testPayload: 'suspend message' },
           resumePayload: { userInput: 'input for resumption' },
           startedAt: expect.any(Number),
           endedAt: expect.any(Number),
-          suspendedAt: expect.any(Number),
           resumedAt: expect.any(Number),
         },
         evaluateToneConsistency: {
@@ -6194,7 +6188,6 @@ describe('MastraInngestWorkflow', () => {
           },
           startedAt: expect.any(Number),
           endedAt: expect.any(Number),
-          suspendedAt: expect.any(Number),
           resumedAt: expect.any(Number),
         },
         evaluateImprovedResponse: {
@@ -7515,8 +7508,6 @@ describe('MastraInngestWorkflow', () => {
           startedAt: expect.any(Number),
           endedAt: expect.any(Number),
           resumedAt: expect.any(Number),
-          suspendPayload: { testPayload: 'hello' },
-          suspendedAt: expect.any(Number),
         },
         evaluateToneConsistency: {
           status: 'success',
@@ -7702,8 +7693,6 @@ describe('MastraInngestWorkflow', () => {
           startedAt: expect.any(Number),
           endedAt: expect.any(Number),
           resumedAt: expect.any(Number),
-          suspendPayload: { testPayload: 'hello' },
-          suspendedAt: expect.any(Number),
         },
         evaluateToneConsistency: {
           status: 'success',

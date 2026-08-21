@@ -37,12 +37,22 @@ function createController() {
   });
 }
 
-async function processSubscribedChunks(session: Session<any>, chunks: any[], activeRunId = 'run-b') {
+async function processSubscribedChunks(
+  session: Session<any>,
+  chunks: any[],
+  activeRunId = 'run-b',
+  requestContexts = new Map<string, RequestContext>(),
+) {
+  let currentRequestContext: RequestContext | undefined;
   const subscription = {
     stream: (async function* () {
-      for (const chunk of chunks) yield chunk;
+      for (const chunk of chunks) {
+        if (chunk.runId) currentRequestContext = requestContexts.get(chunk.runId);
+        yield chunk;
+      }
     })(),
     activeRunId: () => activeRunId,
+    __getCurrentRunRequestContext: () => currentRequestContext,
     abort: () => {},
     unsubscribe: () => {},
   };
@@ -126,6 +136,51 @@ describe('Trailing guard does not swallow new-run null-runId chunks', () => {
     });
   });
 
+  // No caller bound a context to these runs, so the engine falls back to the
+  // context the subscription owns for the run whose chunks it is yielding.
+  it('uses the request context owned by each subscribed run', async () => {
+    const controller = createController();
+    await controller.init();
+    const session = await controller.createSession({ id: 'test-session', ownerId: 'test-owner' });
+    const firstContext = new RequestContext();
+    firstContext.set('user', { id: 'first-user' });
+    const secondContext = new RequestContext();
+    secondContext.set('user', { id: 'second-user' });
+    const contexts = new Map([
+      ['run-a', firstContext],
+      ['run-b', secondContext],
+    ]);
+
+    vi.spyOn(session, 'resolveToolApproval').mockReturnValue('allow');
+    const approveToolCall = vi.spyOn(session, 'approveToolCall').mockResolvedValue();
+
+    await processSubscribedChunks(
+      session,
+      [
+        { type: 'start', runId: 'run-a' },
+        {
+          type: 'tool-call-approval',
+          runId: 'run-a',
+          payload: { toolCallId: 'tool-call-1', toolName: 'factory_transition_work_item', args: {} },
+        },
+        { type: 'finish', runId: 'run-a', payload: { stepResult: { reason: 'stop' } } },
+        { type: 'start', runId: 'run-b' },
+        {
+          type: 'tool-call-approval',
+          runId: 'run-b',
+          payload: { toolCallId: 'tool-call-2', toolName: 'factory_transition_work_item', args: {} },
+        },
+        { type: 'finish', runId: 'run-b', payload: { stepResult: { reason: 'stop' } } },
+      ],
+      'run-b',
+      contexts,
+    );
+
+    expect(approveToolCall).toHaveBeenCalledTimes(2);
+    expect(approveToolCall.mock.calls[0]?.[0].requestContext?.get('user')).toEqual({ id: 'first-user' });
+    expect(approveToolCall.mock.calls[1]?.[0].requestContext?.get('user')).toEqual({ id: 'second-user' });
+  });
+
   it('does not reuse a previous principal for a context-less run', async () => {
     const controller = createController();
     await controller.init();
@@ -148,6 +203,52 @@ describe('Trailing guard does not swallow new-run null-runId chunks', () => {
 
     await processSubscribedChunks(session, approvalChunks('run-a'), 'run-a');
     await processSubscribedChunks(session, approvalChunks('run-b'), 'run-b');
+
+    expect(approveToolCall).toHaveBeenCalledTimes(2);
+    expect(approveToolCall.mock.calls[0]?.[0].requestContext?.get('user')).toEqual({
+      id: 'user-a',
+      organizationId: 'org-1',
+    });
+    expect(approveToolCall.mock.calls[1]?.[0].requestContext?.get('user')).toBeUndefined();
+  });
+
+  // The subscription-owned context is only a fallback for runs no caller bound a
+  // context to, and it has to stay run-scoped: a run that carries no principal of
+  // its own must not inherit the one the same subscription held for the run
+  // before it. Same guarantee as the test above, exercised on the fallback path
+  // rather than the bound-context path.
+  it('does not inherit the previous run principal through the subscription fallback', async () => {
+    const controller = createController();
+    await controller.init();
+    const session = await controller.createSession({ id: 'test-session', ownerId: 'test-owner' });
+    const principalA = new RequestContext();
+    principalA.set('user', { id: 'user-a', organizationId: 'org-1' });
+
+    vi.spyOn(session, 'resolveToolApproval').mockReturnValue('allow');
+    const approveToolCall = vi.spyOn(session, 'approveToolCall').mockResolvedValue();
+
+    await processSubscribedChunks(
+      session,
+      [
+        { type: 'start', runId: 'run-a' },
+        {
+          type: 'tool-call-approval',
+          runId: 'run-a',
+          payload: { toolCallId: 'tool-call-1', toolName: 'factory_transition_work_item', args: {} },
+        },
+        { type: 'finish', runId: 'run-a', payload: { stepResult: { reason: 'stop' } } },
+        { type: 'start', runId: 'run-b' },
+        {
+          type: 'tool-call-approval',
+          runId: 'run-b',
+          payload: { toolCallId: 'tool-call-2', toolName: 'factory_transition_work_item', args: {} },
+        },
+        { type: 'finish', runId: 'run-b', payload: { stepResult: { reason: 'stop' } } },
+      ],
+      'run-b',
+      // Only run-a is given a subscription-owned context; run-b has none.
+      new Map([['run-a', principalA]]),
+    );
 
     expect(approveToolCall).toHaveBeenCalledTimes(2);
     expect(approveToolCall.mock.calls[0]?.[0].requestContext?.get('user')).toEqual({

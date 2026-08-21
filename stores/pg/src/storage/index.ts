@@ -26,6 +26,7 @@ import { DatasetsPG } from './domains/datasets';
 import { ExperimentsPG } from './domains/experiments';
 import { FavoritesPG } from './domains/favorites';
 import { HarnessPG } from './domains/harness';
+import { KnowledgePG } from './domains/knowledge';
 import { MCPClientsPG } from './domains/mcp-clients';
 import { MCPServersPG } from './domains/mcp-servers';
 import { MemoryPG } from './domains/memory';
@@ -95,6 +96,7 @@ function createHostPool(config: HostPoolConfig): Pool {
  */
 const ALL_DOMAINS = [
   MemoryPG,
+  KnowledgePG,
   NotificationsPG,
   ObservabilityPG,
   ScoresPG,
@@ -149,6 +151,7 @@ export {
   DatasetsPG,
   ExperimentsPG,
   HarnessPG,
+  KnowledgePG,
   MCPClientsPG,
   MCPServersPG,
   MemoryPG,
@@ -242,6 +245,7 @@ export class PostgresStore extends MastraCompositeStore {
         workflows: new WorkflowsPG(domainConfig),
         workflowDefinitions: new WorkflowDefinitionsPG(domainConfig),
         memory: new MemoryPG(domainConfig),
+        knowledge: new KnowledgePG(domainConfig),
         notifications: new NotificationsPG(domainConfig),
         observability: new ObservabilityPG(domainConfig),
         agents: new AgentsPG(domainConfig),

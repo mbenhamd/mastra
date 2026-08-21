@@ -7,7 +7,7 @@ import { InngestRun, unwrapWorkflowRealtimeData } from './run';
 
 const realtimeMocks = vi.hoisted(() => ({
   handlers: [] as Array<(message: any) => Promise<void> | void>,
-  cancel: vi.fn(async () => {}),
+  close: vi.fn(() => {}),
   subscribe: vi.fn(),
 }));
 
@@ -24,12 +24,14 @@ function createFixture(workflowId = 'workflow-id') {
 describe('InngestPubSub', () => {
   beforeEach(() => {
     realtimeMocks.handlers.length = 0;
-    realtimeMocks.cancel.mockClear();
+    realtimeMocks.close.mockClear();
     realtimeMocks.subscribe.mockReset();
-    realtimeMocks.subscribe.mockImplementation(async (_options: unknown, handler: (message: any) => void) => {
-      realtimeMocks.handlers.push(handler);
-      return { cancel: realtimeMocks.cancel };
-    });
+    realtimeMocks.subscribe.mockImplementation(
+      async ({ onMessage }: { onMessage: (message: any) => Promise<void> | void }) => {
+        realtimeMocks.handlers.push(onMessage);
+        return { close: realtimeMocks.close };
+      },
+    );
   });
 
   it('routes canonical lifecycle topics by full execution identity and preserves the replay envelope', async () => {
@@ -177,11 +179,11 @@ describe('InngestPubSub', () => {
 
   it('shares one realtime connection when subscribers race on the same topic', async () => {
     const { pubsub } = createFixture();
-    let resolveStream: ((stream: { cancel: typeof realtimeMocks.cancel }) => void) | undefined;
+    let resolveStream: ((stream: { close: typeof realtimeMocks.close }) => void) | undefined;
     realtimeMocks.subscribe.mockImplementationOnce(
-      async (_options: unknown, handler: (message: any) => Promise<void> | void) => {
-        realtimeMocks.handlers.push(handler);
-        return new Promise<{ cancel: typeof realtimeMocks.cancel }>(resolve => {
+      async ({ onMessage }: { onMessage: (message: any) => Promise<void> | void }) => {
+        realtimeMocks.handlers.push(onMessage);
+        return new Promise<{ close: typeof realtimeMocks.close }>(resolve => {
           resolveStream = resolve;
         });
       },
@@ -193,7 +195,7 @@ describe('InngestPubSub', () => {
     const secondSubscription = pubsub.subscribe('workflow.events.v2.run-1', second);
 
     expect(realtimeMocks.subscribe).toHaveBeenCalledTimes(1);
-    resolveStream?.({ cancel: realtimeMocks.cancel });
+    resolveStream?.({ close: realtimeMocks.close });
     await Promise.all([firstSubscription, secondSubscription]);
 
     await realtimeMocks.handlers[0]!({
@@ -209,9 +211,9 @@ describe('InngestPubSub', () => {
     expect(second).toHaveBeenCalledTimes(1);
 
     await pubsub.unsubscribe('workflow.events.v2.run-1', first);
-    expect(realtimeMocks.cancel).not.toHaveBeenCalled();
+    expect(realtimeMocks.close).not.toHaveBeenCalled();
     await pubsub.unsubscribe('workflow.events.v2.run-1', second);
-    expect(realtimeMocks.cancel).toHaveBeenCalledTimes(1);
+    expect(realtimeMocks.close).toHaveBeenCalledTimes(1);
   });
 
   it('keeps local-only delivery in-process and preserves the caller envelope', async () => {
@@ -259,8 +261,11 @@ describe('InngestPubSub', () => {
     });
 
     expect(realtimeMocks.subscribe).toHaveBeenCalledWith(
-      expect.objectContaining({ channel: 'agent:run%2E1.binding%2E1', topics: ['agent-control'] }),
-      expect.any(Function),
+      expect.objectContaining({
+        channel: 'agent:run%2E1.binding%2E1',
+        topics: ['agent-control'],
+        onMessage: expect.any(Function),
+      }),
     );
     expect(publish).toHaveBeenCalledWith(
       expect.objectContaining({ channel: 'agent:run%2E1.binding%2E1', topic: 'agent-control' }),

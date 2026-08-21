@@ -163,6 +163,10 @@ async function runGoalStep(
           : {}),
     },
     messageList,
+    rotateResponseMessageId: (sealMessageId?: string) => {
+      messageList.markResponseMessageBoundary(sealMessageId);
+      return 'response-2';
+    },
     requestContext,
     mastra,
     controller: { enqueue: (c: any) => chunks.push(c) },

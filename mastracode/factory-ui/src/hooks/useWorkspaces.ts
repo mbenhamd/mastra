@@ -1,6 +1,14 @@
 import { toast } from '@mastra/playground-ui/components/Toaster';
-import { queryOptions, skipToken, useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
-import { useNavigate } from 'react-router';
+import {
+  type QueryClient,
+  queryOptions,
+  skipToken,
+  useMutation,
+  useQueries,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query';
+import { useNavigate, useParams } from 'react-router';
 
 import { useApiConfig } from '../api/config';
 import { queryKeys } from '../api/keys';
@@ -41,21 +49,12 @@ export function workspacesQueryOptions(baseUrl: string, projectRepositoryId: str
   });
 }
 
-/**
- * Drop a deleted session from the cached list right away. Invalidation alone
- * leaves every consumer rendering the session until the refetch lands — a
- * window in which the board still offers to open a thread that died with its
- * workspace. The refetch still runs behind this to reconcile.
- *
- * In-flight list fetches are cancelled first: one issued before the delete
- * committed still carries the deleted session, and letting it settle would
- * write it straight back over this removal.
- */
 export function removeCachedSession(
-  queryClient: ReturnType<typeof useQueryClient>,
+  queryClient: QueryClient,
   projectRepositoryId: string | undefined,
   sessionId: string,
 ) {
+  // an in-flight list fetch still carries the stale entry and would clobber the edit below
   void queryClient.cancelQueries({ queryKey: queryKeys.sessions(projectRepositoryId) });
   queryClient.setQueryData<WorkspacesData>(queryKeys.sessions(projectRepositoryId), current => {
     if (!current) return current;
@@ -66,8 +65,22 @@ export function removeCachedSession(
   });
 }
 
+export function addCachedSession(queryClient: QueryClient, projectRepositoryId: string, session: FactoryUserSession) {
+  const queryKey = queryKeys.sessions(projectRepositoryId);
+  if (!queryClient.getQueryData<WorkspacesData>(queryKey)) {
+    void queryClient.invalidateQueries({ queryKey });
+    return;
+  }
+  void queryClient.cancelQueries({ queryKey });
+  queryClient.setQueryData<WorkspacesData>(queryKey, current => {
+    if (!current) return current;
+    const all = [...current.workspaces, ...current.userSessions];
+    return all.some(cached => cached.sessionId === session.sessionId) ? current : splitSessions([...all, session]);
+  });
+}
+
 function invalidateSessionQueries(
-  queryClient: ReturnType<typeof useQueryClient>,
+  queryClient: QueryClient,
   projectRepositoryId: string | undefined,
   scope?: AgentControllerThreadsScope,
   projectPath?: string,
@@ -81,6 +94,30 @@ function invalidateSessionQueries(
   }
 }
 
+const UNMATERIALIZED_POLL_MS = 15_000;
+/**
+ * A session created but never run stays un-materialized forever — without a
+ * bound it would keep the list polling indefinitely. Materialization follows
+ * within minutes of the activity that starts it, and every such trigger (run
+ * start, run end, attention) invalidates the sessions list, refreshing
+ * `updatedAt` and re-opening this window.
+ */
+const UNMATERIALIZED_POLL_WINDOW_MS = 10 * 60_000;
+
+/**
+ * Poll gently while any listed session has not been materialized yet. The
+ * sidebar status dots derive "initializing" from `materializedAt`, which the
+ * server stamps out-of-band (first agent exec, warm-up, another tab) — with no
+ * poll the cached `null` never resolved and dots wedged on "initializing".
+ */
+export function sessionsRefetchInterval(data: WorkspacesData | undefined, now = Date.now()): number | false {
+  if (!data) return false;
+  const unresolved = [...data.workspaces, ...data.userSessions].some(
+    session => !session.materializedAt && now - Date.parse(session.updatedAt) < UNMATERIALIZED_POLL_WINDOW_MS,
+  );
+  return unresolved ? UNMATERIALIZED_POLL_MS : false;
+}
+
 export function useWorkspacesQuery(projectRepositoryId: string | undefined) {
   const { baseUrl } = useApiConfig();
   return useQuery({
@@ -88,6 +125,7 @@ export function useWorkspacesQuery(projectRepositoryId: string | undefined) {
     queryFn: projectRepositoryId
       ? ({ signal }): Promise<WorkspacesData> => loadWorkspaces(baseUrl, projectRepositoryId, signal)
       : skipToken,
+    refetchInterval: query => sessionsRefetchInterval(query.state.data),
   });
 }
 
@@ -120,7 +158,7 @@ export function useCreateWorkspaceMutation(
       const trimmedBranch = branch.trim();
       if (!factoryId) throw new Error('No Factory selected');
       if (!projectRepositoryId) throw new Error('Connect a repository before creating a workspace');
-      return createUserSession(baseUrl, projectRepositoryId, trimmedBranch);
+      return createUserSession(baseUrl, projectRepositoryId, { branch: trimmedBranch });
     },
     onSuccess: session => {
       invalidateSessionQueries(queryClient, projectRepositoryId, scope, session.sessionId);
@@ -131,15 +169,6 @@ export function useCreateWorkspaceMutation(
   });
 }
 
-/**
- * Delete a workspace: removes the sandbox checkout + branch server-side.
- *
- * The threads that ran inside it are deliberately left in place. A workspace is
- * a disposable checkout, but its transcripts are the record of what was decided
- * and why, and they stay readable long after the branch is gone. Session ids are
- * freshly generated per session, so a workspace recreated on the same branch can
- * never inherit these threads.
- */
 export function useDeleteWorkspaceMutation(
   factoryId: string | undefined,
   projectRepositoryId: string | undefined,
@@ -148,6 +177,9 @@ export function useDeleteWorkspaceMutation(
   const { baseUrl } = useApiConfig();
   const queryClient = useQueryClient();
   const navigate = useNavigate();
+  // user-session routes carry the session id as :threadId (user/threads/:threadId)
+  const { sessionId, threadId } = useParams<{ sessionId?: string; threadId?: string }>();
+  const viewedSessionId = sessionId ?? threadId;
 
   return useMutation({
     mutationFn: async (workspace: FactoryUserSession) => {
@@ -163,7 +195,7 @@ export function useDeleteWorkspaceMutation(
       void queryClient.invalidateQueries({
         queryKey: queryKeys.agentControllerThreads(scope?.agentControllerId, scope?.resourceId, workspace.sessionId),
       });
-      void navigate(`/factories/${factoryId}`);
+      if (workspace.sessionId === viewedSessionId) void navigate(`/factories/${factoryId}/new`);
       toast('Workspace deleted');
     },
     onError: error => toast.error(error instanceof Error ? error.message : 'Failed to delete workspace'),

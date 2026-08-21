@@ -16,6 +16,11 @@ import type * as surfaceModule from './routes/surface.js';
 import type * as tenantCredentialsModule from './routes/tenant-credentials.js';
 import { defaultFactoryRules, DEFAULT_FACTORY_RULE_VERSION } from './rules/defaults.js';
 import type * as dispatcherModule from './rules/dispatcher.js';
+import type * as terminalCleanupModule from './rules/terminal-cleanup.js';
+import type * as transitionServiceModule from './rules/transition-service.js';
+import type { MemorySettingsStorage } from './storage/domains/memory-settings/base.js';
+import type { FactoryProjectsStorage } from './storage/domains/projects/base.js';
+import type { SourceControlStorage } from './storage/domains/source-control/base.js';
 import type { WorkItemsStorage } from './storage/domains/work-items/base.js';
 import { getFactoryWorkspace } from './workspace.js';
 /** A real in-memory FactoryStorage with init spied for boot-order assertions. */
@@ -38,6 +43,11 @@ const controllerMock = {
   setChannels: vi.fn(),
 };
 
+const sessionNotifierStub = {
+  onSessionCreated: () => () => {},
+  onSessionDeleted: () => () => {},
+};
+
 const prepareMock = vi.fn(async (config: Record<string, unknown>) => ({
   base: { controller: controllerMock },
   mastraArgs: { __capturedConfig: config },
@@ -47,6 +57,37 @@ const prepareMock = vi.fn(async (config: Record<string, unknown>) => ({
 vi.mock('@mastra/code-sdk', () => ({
   prepareAgentControllerMount: (config: Record<string, unknown>) => prepareMock(config),
 }));
+
+// Track what the factory actually wires as the terminal-stage hook: the
+// cleanup must be constructed by production code (not just by its own unit
+// tests) and its result handed to the transition service. Without this,
+// `createTerminalStageCleanup` can silently become orphaned in a refactor.
+const terminalCleanups = vi.hoisted(() => [] as unknown[]);
+vi.mock('./rules/terminal-cleanup', async importOriginal => {
+  const actual = await importOriginal<typeof terminalCleanupModule>();
+  return {
+    ...actual,
+    createTerminalStageCleanup: (options: Parameters<typeof actual.createTerminalStageCleanup>[0]) => {
+      const cleanup = actual.createTerminalStageCleanup(options);
+      terminalCleanups.push(cleanup);
+      return cleanup;
+    },
+  };
+});
+
+const transitionServiceOptions = vi.hoisted(
+  () => [] as Array<ConstructorParameters<typeof transitionServiceModule.FactoryTransitionService>[0]>,
+);
+vi.mock('./rules/transition-service', async importOriginal => {
+  const actual = await importOriginal<typeof transitionServiceModule>();
+  class TrackedFactoryTransitionService extends actual.FactoryTransitionService {
+    constructor(options: ConstructorParameters<typeof actual.FactoryTransitionService>[0]) {
+      super(options);
+      transitionServiceOptions.push(options);
+    }
+  }
+  return { ...actual, FactoryTransitionService: TrackedFactoryTransitionService };
+});
 
 const dispatcherOptions = vi.hoisted(
   () => [] as Array<ConstructorParameters<typeof dispatcherModule.FactoryDecisionDispatcher>[0]>,
@@ -146,7 +187,7 @@ async function prepareIntegrationContext(config: ConstructorParameters<typeof Ma
     integrations: [...(config.integrations ?? []), fakeIntegration({ id: 'context-probe', routes })],
   });
   const buildApiRoutes = prepared.buildApiRoutes as (deps: object) => unknown;
-  buildApiRoutes({ controller: {}, authStorage: {} });
+  buildApiRoutes({ controller: sessionNotifierStub, authStorage: {} });
   expect(routes).toHaveBeenCalledOnce();
   return routes.mock.calls[0]![0];
 }
@@ -155,6 +196,8 @@ beforeEach(() => {
   vi.clearAllMocks();
   studioInstances.length = 0;
   dispatcherOptions.length = 0;
+  terminalCleanups.length = 0;
+  transitionServiceOptions.length = 0;
 });
 
 describe('MastraFactory constructor', () => {
@@ -182,6 +225,76 @@ describe('MastraFactory.prepare', () => {
     expect(prepareMock).toHaveBeenCalledOnce();
   });
 
+  it('registers a blocking session-created listener that seeds stored OM settings', async () => {
+    const storage = fakeStorage();
+    const factory = new MastraFactory({ storage });
+    await factory.prepare();
+
+    const blockingCalls = controllerMock.onSessionCreated.mock.calls.filter(
+      call => (call[1] as { blocking?: boolean } | undefined)?.blocking === true,
+    );
+    expect(blockingCalls).toHaveLength(2);
+    const blockingCall = blockingCalls[0];
+
+    // Seed the owner's web session row and stored memory settings through the
+    // same storage domains the factory registered.
+    await storage.init();
+    const sourceControl = storage.getDomain<SourceControlStorage>('source-control').forIntegration('github');
+    const project = await storage
+      .getDomain<FactoryProjectsStorage>('projects')
+      .create({ orgId: 'org-1', userId: 'user-1', input: { name: 'Mastra' } });
+    const installation = await sourceControl.installations.upsert({
+      orgId: 'org-1',
+      connectedByUserId: 'user-1',
+      externalId: '123',
+    });
+    const repository = await sourceControl.repositories.upsert({
+      orgId: 'org-1',
+      input: { installationId: installation.id, externalId: '456', slug: 'mastra-ai/mastra', defaultBranch: 'main' },
+    });
+    const connection = await sourceControl.connections.create({
+      orgId: 'org-1',
+      factoryProjectId: project.id,
+      installationId: installation.id,
+      createdByUserId: 'user-1',
+    });
+    const projectRepository = await sourceControl.projectRepositories.link({
+      orgId: 'org-1',
+      connectionId: connection.id,
+      repositoryId: repository.id,
+      createdByUserId: 'user-1',
+      sandboxProvider: 'local',
+      sandboxWorkdir: '/sandbox/mastra',
+    });
+    await sourceControl.sessions.create({
+      sessionId: 'session-1',
+      projectRepositoryId: projectRepository.id,
+      orgId: 'org-1',
+      userId: 'user-1',
+      branch: 'user/session-1',
+      baseBranch: 'main',
+    });
+    await storage.getDomain<MemorySettingsStorage>('memory-settings').patch({
+      orgId: 'org-1',
+      userId: 'user-1',
+      patch: { observerModelId: 'anthropic/claude-haiku-4-5', reflectorModelId: 'anthropic/claude-haiku-4-5' },
+    });
+
+    const session = {
+      identity: { getResourceId: () => 'session-1' },
+      om: {
+        observer: { modelId: () => undefined, switchModel: vi.fn().mockResolvedValue(undefined) },
+        reflector: { modelId: () => undefined, switchModel: vi.fn().mockResolvedValue(undefined) },
+      },
+      state: { get: () => ({}), set: vi.fn().mockResolvedValue(undefined) },
+    };
+
+    await (blockingCall![0] as (session: unknown) => Promise<void>)(session);
+
+    expect(session.om.observer.switchModel).toHaveBeenCalledWith({ modelId: 'anthropic/claude-haiku-4-5' });
+    expect(session.om.reflector.switchModel).toHaveBeenCalledWith({ modelId: 'anthropic/claude-haiku-4-5' });
+  });
+
   it('constructs an enabled sandbox fleet from the configured machine', async () => {
     const sandbox = new LocalSandbox({ workingDirectory: '/tmp/mc-factory-test' });
     const ctx = await prepareIntegrationContext({ storage: fakeStorage(), sandbox: { machine: sandbox } });
@@ -189,9 +302,20 @@ describe('MastraFactory.prepare', () => {
     expect(ctx.fleet.provider).toBe('local');
   });
 
+  it('hands the terminal-stage cleanup to the transition service', async () => {
+    const prepared = await prepareFactory({ storage: fakeStorage() });
+    (prepared.buildApiRoutes as (deps: object) => unknown)({ controller: sessionNotifierStub, authStorage: {} });
+    // The composition must construct the cleanup and wire its result as the
+    // transition service's terminal-stage hook — retiring sessions alone is
+    // not enough (bindings would stay active until the 24h sweep).
+    expect(terminalCleanups).toHaveLength(1);
+    expect(transitionServiceOptions).toHaveLength(1);
+    expect(transitionServiceOptions[0]!.onTerminalStage).toBe(terminalCleanups[0]);
+  });
+
   it('threads conservative versioned Factory rules when the slot is omitted', async () => {
     const prepared = await prepareFactory({ storage: fakeStorage() });
-    (prepared.buildApiRoutes as (deps: object) => unknown)({ controller: {}, authStorage: {} });
+    (prepared.buildApiRoutes as (deps: object) => unknown)({ controller: sessionNotifierStub, authStorage: {} });
     expect(assembleFactoryApiRoutesSpy).toHaveBeenCalledOnce();
     const rules = assembleFactoryApiRoutesSpy.mock.calls[0]![0].rules;
     expect(rules?.version).toBe(DEFAULT_FACTORY_RULE_VERSION);
@@ -210,7 +334,7 @@ describe('MastraFactory.prepare', () => {
       overrides: { tools: { submit_plan: { onResult } } },
     });
     const prepared = await prepareFactory({ storage: fakeStorage(), rules });
-    (prepared.buildApiRoutes as (deps: object) => unknown)({ controller: {}, authStorage: {} });
+    (prepared.buildApiRoutes as (deps: object) => unknown)({ controller: sessionNotifierStub, authStorage: {} });
     expect(assembleFactoryApiRoutesSpy).toHaveBeenCalledOnce();
     const threaded = assembleFactoryApiRoutesSpy.mock.calls[0]![0].rules;
     expect(threaded).toBe(rules);
@@ -219,7 +343,7 @@ describe('MastraFactory.prepare', () => {
 
   it('forwards the configured dispatcher concurrency cap to the decision dispatcher', async () => {
     const prepared = await prepareFactory({ storage: fakeStorage(), dispatcher: { maxInFlight: 7 } });
-    (prepared.buildApiRoutes as (deps: object) => unknown)({ controller: {}, authStorage: {} });
+    (prepared.buildApiRoutes as (deps: object) => unknown)({ controller: sessionNotifierStub, authStorage: {} });
 
     const onFactoryRuntime = assembleFactoryApiRoutesSpy.mock.calls[0]![0].onFactoryRuntime;
     expect(onFactoryRuntime).toBeTypeOf('function');
@@ -395,7 +519,7 @@ describe('MastraFactory.prepare', () => {
   it('folds the provider /auth/* routes into buildApiRoutes when auth is configured', async () => {
     const config = await prepareFactory({ storage: fakeStorage(), auth: fakeProvider() });
     const buildApiRoutes = config.buildApiRoutes as (deps: object) => Array<{ path: string }>;
-    const paths = buildApiRoutes({ controller: {}, authStorage: {} }).map(r => r.path);
+    const paths = buildApiRoutes({ controller: sessionNotifierStub, authStorage: {} }).map(r => r.path);
     expect(paths).toContain('/auth/login');
     expect(paths).toContain('/auth/callback');
     expect(paths).toContain('/auth/logout');
@@ -443,7 +567,7 @@ describe('MastraFactory.prepare', () => {
     const buildApiRoutes = config.buildApiRoutes as (
       deps: object,
     ) => Array<{ path: string; method: string; handler: (c: unknown) => unknown }>;
-    const routes = buildApiRoutes({ controller: {}, authStorage: {} });
+    const routes = buildApiRoutes({ controller: sessionNotifierStub, authStorage: {} });
     const stub = routes.find(r => r.path === '/web/channel-accounts');
     expect(stub).toBeDefined();
     expect(stub!.method).toBe('GET');
@@ -460,14 +584,14 @@ describe('MastraFactory.prepare', () => {
       integrations: [fakeIntegration({ id: 'slack' })],
     });
     const buildApiRoutes = config.buildApiRoutes as (deps: object) => Array<{ path: string }>;
-    const paths = buildApiRoutes({ controller: {}, authStorage: {} }).map(r => r.path);
+    const paths = buildApiRoutes({ controller: sessionNotifierStub, authStorage: {} }).map(r => r.path);
     expect(paths).not.toContain('/web/channel-accounts');
   });
 
   it('omits auth routes when auth is explicitly disabled (auth: null)', async () => {
     const config = await prepareFactory({ storage: fakeStorage(), auth: null });
     const buildApiRoutes = config.buildApiRoutes as (deps: object) => Array<{ path: string }>;
-    const paths = buildApiRoutes({ controller: {}, authStorage: {} }).map(r => r.path);
+    const paths = buildApiRoutes({ controller: sessionNotifierStub, authStorage: {} }).map(r => r.path);
     expect(paths.some(p => p.startsWith('/auth/'))).toBe(false);
   });
 
@@ -533,7 +657,7 @@ describe('MastraFactory.prepare', () => {
     expect(provider).toBeDefined();
     expect(provider?.name).toBe('mastra-studio');
     const buildApiRoutes = config.buildApiRoutes as (deps: object) => Array<{ path: string }>;
-    const paths = buildApiRoutes({ controller: {}, authStorage: {} }).map(r => r.path);
+    const paths = buildApiRoutes({ controller: sessionNotifierStub, authStorage: {} }).map(r => r.path);
     expect(paths).toContain('/auth/login');
     expect(paths).toContain('/auth/callback');
     expect(paths).toContain('/auth/logout');
@@ -653,7 +777,7 @@ describe('MastraFactory.prepare audit-capable integrations', () => {
   it('mounts audit domain routes without an audit integration', async () => {
     const config = await prepareFactory({ storage: fakeStorage() });
     const buildApiRoutes = config.buildApiRoutes as (deps: object) => Array<{ path: string }>;
-    const paths = buildApiRoutes({ controller: {}, authStorage: {} }).map(r => r.path);
+    const paths = buildApiRoutes({ controller: sessionNotifierStub, authStorage: {} }).map(r => r.path);
     expect(paths).toContain('/web/factory/projects/:id/audit');
     expect(paths).not.toContain('/web/audit/portal-link');
   });
@@ -669,7 +793,7 @@ describe('MastraFactory.prepare audit-capable integrations', () => {
       ],
     });
     const buildApiRoutes = config.buildApiRoutes as (deps: object) => Array<{ path: string }>;
-    const paths = buildApiRoutes({ controller: {}, authStorage: {} }).map(r => r.path);
+    const paths = buildApiRoutes({ controller: sessionNotifierStub, authStorage: {} }).map(r => r.path);
     expect(paths).toContain('/web/factory/projects/:id/audit');
     expect(paths).toContain('/web/audit/portal-link');
   });
@@ -694,7 +818,7 @@ describe('MastraFactory.prepare audit-capable integrations', () => {
           : [],
       });
       const buildApiRoutes = config.buildApiRoutes as (deps: object) => Array<{ path: string }>;
-      const paths = buildApiRoutes({ controller: {}, authStorage: {} }).map(r => r.path);
+      const paths = buildApiRoutes({ controller: sessionNotifierStub, authStorage: {} }).map(r => r.path);
       expect(paths.includes('/web/audit/portal-link')).toBe(expectsPortal);
     },
   );
@@ -736,7 +860,7 @@ describe('MastraFactory.prepare integrations', () => {
       integrations: [fakeIntegration({ id: 'custom', routes })],
     });
     const buildApiRoutes = config.buildApiRoutes as (deps: object) => Array<{ path: string }>;
-    const paths = buildApiRoutes({ controller: {}, authStorage: {} }).map(r => r.path);
+    const paths = buildApiRoutes({ controller: sessionNotifierStub, authStorage: {} }).map(r => r.path);
     expect(paths).toContain('/web/custom/status');
     const ctx = routes.mock.calls[0]![0];
     expect(ctx.stateSigner).toBeDefined();
@@ -747,7 +871,7 @@ describe('MastraFactory.prepare integrations', () => {
   it('mounts disabled status stubs when no integrations are registered', async () => {
     const config = await prepareFactory({ storage: fakeStorage() });
     const buildApiRoutes = config.buildApiRoutes as (deps: object) => Array<{ path: string }>;
-    const paths = buildApiRoutes({ controller: {}, authStorage: {} }).map(r => r.path);
+    const paths = buildApiRoutes({ controller: sessionNotifierStub, authStorage: {} }).map(r => r.path);
     expect(paths).toContain('/web/github/status');
     expect(paths).toContain('/web/linear/status');
   });

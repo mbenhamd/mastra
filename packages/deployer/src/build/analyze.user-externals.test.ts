@@ -114,5 +114,13 @@ describe('user externals validation', () => {
         },
       }),
     );
+
+    // `normalizeExternals` folds GLOBAL_EXTERNALS and DEPRECATED_EXTERNALS into
+    // the merged list, so the stub list must carry them alongside user externals.
+    for (const [, opts] of vi.mocked(validate).mock.calls) {
+      expect(opts.stubbedExternals).toEqual(
+        expect.arrayContaining(['pg', 'pino', 'fastembed', 'nodemailer', 'jsdom', 'sqlite3']),
+      );
+    }
   });
 });

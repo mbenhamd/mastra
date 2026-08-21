@@ -24,14 +24,26 @@ class ChildProcessError extends Error implements ProcessFailure {
   readonly signal?: string;
   readonly timedOut: boolean;
   readonly isCanceled: boolean;
+  /**
+   * Captured process output. `buffer: false` keeps execa from retaining it, so
+   * callers that classify package-manager failures (for example pnpm's blocked
+   * build scripts) read the captured text from the thrown error instead.
+   */
+  readonly stdout: string;
+  readonly stderr: string;
 
-  constructor({ exitCode, signal, timedOut, isCanceled }: Omit<ProcessFailure, 'name'>) {
+  constructor(
+    { exitCode, signal, timedOut, isCanceled }: Omit<ProcessFailure, 'name'>,
+    capturedOutput: { stdout: string; stderr: string } = { stdout: '', stderr: '' },
+  ) {
     super('Package manager process failed');
     this.name = 'ChildProcessError';
     this.exitCode = exitCode;
     this.signal = signal;
     this.timedOut = timedOut;
     this.isCanceled = isCanceled;
+    this.stdout = capturedOutput.stdout;
+    this.stderr = capturedOutput.stderr;
   }
 }
 
@@ -186,6 +198,8 @@ export function createChildProcessLogger({
       waitForTermination: () => Promise.resolve(),
     };
     let removeExitCleanup = () => {};
+    let stdout = '';
+    let stderr = '';
     try {
       const { execa } = await import('execa');
       const subprocess = execa(cmd, args, {
@@ -203,6 +217,21 @@ export function createChildProcessLogger({
       removeExitCleanup = registerProcessTreeExitCleanup(subprocess);
 
       if (output === 'log') {
+        // Capture the output as well as streaming it, so a *failure* can be
+        // classified by the caller off ChildProcessError.stdout/stderr (see
+        // DeployerDeps' pnpm ERR_PNPM_IGNORED_BUILDS handling). The listeners
+        // and the pipes are attached in the same tick, so no chunk is observed
+        // by only one of them.
+        subprocess.stdout?.on('data', chunk => {
+          stdout += chunk.toString();
+        });
+        subprocess.stderr?.on('data', chunk => {
+          stderr += chunk.toString();
+        });
+
+        // Pipe stdout and stderr through the logging stream.
+        // { end: false } prevents the first stream to close from ending pinoStream
+        // while the other may still be writing.
         subprocess.stdout?.pipe(pinoStream, { end: false });
         subprocess.stderr?.pipe(pinoStream, { end: false });
       }
@@ -212,8 +241,10 @@ export function createChildProcessLogger({
         await processTreeTimeout.waitForTermination();
         const processFailure = toProcessFailure({ name: 'TimeoutError' }, true);
         logger.error('Process failed', { error: processFailure });
-        throw new ChildProcessError(processFailure);
+        throw new ChildProcessError(processFailure, { stdout, stderr });
       }
+      // The captured text is deliberately NOT returned on success: no caller
+      // reads it, and every call site awaits this for its side effects only.
       return { success: true };
     } catch (error) {
       if (error instanceof ChildProcessError) {
@@ -227,7 +258,7 @@ export function createChildProcessLogger({
       logger.error('Process failed', {
         error: processFailure,
       });
-      throw new ChildProcessError(processFailure);
+      throw new ChildProcessError(processFailure, { stdout, stderr });
     } finally {
       processTreeTimeout.clear();
       removeExitCleanup();

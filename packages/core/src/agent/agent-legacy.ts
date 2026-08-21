@@ -36,6 +36,7 @@ import type { CoreTool, ToolHooks } from '../tools/types';
 import type { DynamicArgument } from '../types';
 import type { OutputWriter } from '../workflows';
 import type { ResolvedAgentMemory } from './execution-memory';
+import { assertThreadOwnedByResource } from './memory-thread-ownership';
 import { MessageList } from './message-list';
 import type { MastraDBMessage, MessageListInput, UIMessageWithMetadata } from './message-list/index';
 import type {
@@ -49,6 +50,7 @@ import type {
 } from './types';
 
 import { resolveThreadIdFromArgs } from './utils';
+import { fireClientToolOutputHooks } from './workflows/prepare-stream/client-tool-output-hooks';
 
 /**
  * Interface for accessing Agent methods needed by the legacy handler.
@@ -347,6 +349,14 @@ export class AgentLegacyHandler {
           resolvedMemory,
         });
 
+        // The legacy path has no abort signal to forward to the hook.
+        const fireClientHooks = () =>
+          fireClientToolOutputHooks({
+            messages,
+            tools: convertedTools,
+            logger: this.capabilities.logger,
+          });
+
         let messageList = new MessageList({
           threadId,
           resourceId,
@@ -397,6 +407,9 @@ export class AgentLegacyHandler {
               };
             }
           }
+          if (!tripwire) {
+            await fireClientHooks();
+          }
           return {
             messageObjects: tripwire ? [] : messageList.get.all.prompt(),
             convertedTools,
@@ -427,6 +440,12 @@ export class AgentLegacyHandler {
         let threadObject: StorageThreadType | undefined = undefined;
         const existingThread = await memory.getThreadById({ threadId });
         if (existingThread) {
+          assertThreadOwnedByResource({
+            thread: existingThread,
+            resourceId,
+            agentName: this.capabilities.name,
+          });
+
           if (
             (!existingThread.metadata && thread.metadata) ||
             (thread.metadata && !deepEqual(existingThread.metadata, thread.metadata))
@@ -506,6 +525,10 @@ export class AgentLegacyHandler {
               threadExists: !!existingThread,
             };
           }
+        }
+
+        if (!tripwire) {
+          await fireClientHooks();
         }
 
         // Messages are already processed by __runInputProcessors and __runProcessInputStep above

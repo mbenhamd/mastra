@@ -4,9 +4,11 @@ import { createDurableToolCallStep } from './tool-call';
 
 vi.mock('../../utils/resolve-runtime', () => ({
   resolveTool: vi.fn(),
-  toolRequiresApproval: vi.fn().mockResolvedValue(false),
+  toolApprovalRequirement: vi.fn().mockResolvedValue({ required: false, reasons: [] }),
   rebuildRunToolsFromMastra: vi.fn().mockResolvedValue(undefined),
 }));
+
+const RUNTIME_BINDING_ID = 'durable-tool-fga-binding';
 
 function makeParams(runId: string, overrides: Record<string, any> = {}) {
   return {
@@ -19,6 +21,7 @@ function makeParams(runId: string, overrides: Record<string, any> = {}) {
     suspend: vi.fn(),
     getInitData: () => ({
       runId,
+      runtimeBindingId: RUNTIME_BINDING_ID,
       agentId: 'agent-1',
       options: {},
       state: {},
@@ -33,7 +36,7 @@ describe('durable tool-call FGA error propagation', () => {
     const denial = new Error('access denied');
     denial.name = 'FGADeniedError';
     const execute = vi.fn().mockRejectedValue(denial);
-    globalRunRegistry.set(runId, { tools: { secureTool: { execute } } } as any);
+    globalRunRegistry.set(runId, { runtimeBindingId: RUNTIME_BINDING_ID, tools: { secureTool: { execute } } } as any);
 
     try {
       await expect((createDurableToolCallStep() as any).execute(makeParams(runId))).rejects.toThrow('access denied');
@@ -45,7 +48,7 @@ describe('durable tool-call FGA error propagation', () => {
   it('serializes non-FGA errors as recoverable tool errors', async () => {
     const runId = 'durable-tool-generic-error-run';
     const execute = vi.fn().mockRejectedValue(new Error('boom'));
-    globalRunRegistry.set(runId, { tools: { secureTool: { execute } } } as any);
+    globalRunRegistry.set(runId, { runtimeBindingId: RUNTIME_BINDING_ID, tools: { secureTool: { execute } } } as any);
 
     try {
       const result = await (createDurableToolCallStep() as any).execute(makeParams(runId));

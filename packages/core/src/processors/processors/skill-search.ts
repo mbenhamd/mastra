@@ -26,6 +26,9 @@ import { createHash } from 'node:crypto';
 
 import { z } from 'zod/v4';
 import type { MastraDBMessage } from '../../agent/message-list';
+import type { IMastraLogger } from '../../logger';
+import type { Mastra } from '../../mastra';
+import { parseMemoryRequestContext } from '../../memory/types';
 import { MASTRA_THREAD_ID_KEY } from '../../request-context';
 import { createTool } from '../../tools';
 import type { Skill, WorkspaceSkills } from '../../workspace/skills';
@@ -252,6 +255,16 @@ export interface SkillSearchProcessorOptions {
    * @default 3600000 (1 hour)
    */
   ttl?: number;
+
+  /**
+   * When true, the processor awaits the skills staleness check and refresh
+   * before the first step, so search results reflect disk (subject to the
+   * staleness cooldown). Defaults to false: the turn proceeds on the cached
+   * catalog and revalidates in the background, so mid-session skill changes
+   * appear one turn later. Enable this only when same-turn freshness matters
+   * more than turn latency (e.g. local filesystems where the walk is cheap).
+   */
+  blockingRefresh?: boolean;
 }
 
 /**
@@ -275,6 +288,10 @@ export class SkillSearchProcessor implements Processor<'skill-search'> {
   private readonly searchConfig: { topK: number; minScore: number; autoLoad: boolean };
   private readonly storage: 'context' | 'in-memory';
   private readonly ttl: number;
+  /** When true, await the staleness check before step 0 (same-turn freshness) */
+  private readonly blockingRefresh: boolean;
+  /** Mastra logger, attached via __registerMastra; console.warn fallback until then */
+  private logger?: IMastraLogger;
   private cleanupIntervalId?: ReturnType<typeof setInterval>;
 
   /**
@@ -293,11 +310,21 @@ export class SkillSearchProcessor implements Processor<'skill-search'> {
     };
     this.storage = options.storage ?? 'in-memory';
     this.ttl = options.ttl ?? 3600000; // Default: 1 hour
+    this.blockingRefresh = options.blockingRefresh ?? false;
 
     if (this.storage === 'in-memory' && this.ttl > 0) {
       this.scheduleCleanup();
     }
   }
+
+  __registerMastra(mastra: Mastra<any, any, any, any, any, any, any, any, any, any>): void {
+    this.logger = mastra.getLogger();
+  }
+
+  /** Log a refresh failure without ever throwing or blocking the step. */
+  private warnRefreshFailed = (error: unknown): void => {
+    (this.logger ?? console).warn('SkillSearchProcessor: skills refresh failed', { error });
+  };
 
   /**
    * Dispose of this processor, clearing the cleanup interval and all thread state.
@@ -318,8 +345,22 @@ export class SkillSearchProcessor implements Processor<'skill-search'> {
     return this.workspace.skills;
   }
 
+  /**
+   * Get the thread ID from the request context, or undefined when no thread is
+   * active. Anonymous requests deliberately do not fall back to a shared
+   * `'default'` key; callers that need the in-memory bucket opt into it.
+   *
+   * The reserved `mastra__threadId` key is only populated by server middleware
+   * overrides, so also fall back to the memory context the agent sets after
+   * resolving the thread (covers HTTP calls that pass the thread via
+   * `memory.thread`).
+   */
   private getThreadId(args: ProcessInputStepArgs): string | undefined {
-    return (args.requestContext?.get(MASTRA_THREAD_ID_KEY) as string | undefined) || undefined;
+    return (
+      (args.requestContext?.get(MASTRA_THREAD_ID_KEY) as string | undefined) ||
+      parseMemoryRequestContext(args.requestContext)?.thread?.id ||
+      undefined
+    );
   }
 
   /**
@@ -458,15 +499,29 @@ export class SkillSearchProcessor implements Processor<'skill-search'> {
 
   async processInputStep(args: ProcessInputStepArgs) {
     const { tools, messageList } = args;
-    const skills = this.skills;
+    const configuredSkills = this.skills;
 
-    if (!skills) {
+    if (!configuredSkills) {
       return { tools };
     }
 
-    // Refresh skills on first step only
+    const skills = configuredSkills.getScoped
+      ? await configuredSkills.getScoped({ requestContext: args.requestContext })
+      : configuredSkills;
+
+    // Revalidate skills on first step only. Fire-and-forget by default: the
+    // staleness walk can cost seconds of filesystem I/O over remote sandboxes,
+    // so the turn proceeds on the cached catalog while the walk runs in the
+    // background. Rejections are contained (an unhandled rejection in a
+    // processor can kill the process) but logged so sandbox outages stay
+    // visible. With blockingRefresh the walk is awaited so search results
+    // reflect disk.
     if (args.stepNumber === 0) {
-      await skills.maybeRefresh({ requestContext: args.requestContext });
+      if (this.blockingRefresh) {
+        await skills.maybeRefresh({ requestContext: args.requestContext })?.catch(this.warnRefreshFailed);
+      } else {
+        void skills.maybeRefresh({ requestContext: args.requestContext })?.catch(this.warnRefreshFailed);
+      }
     }
 
     const loadedSkillReferences = this.getLoadedSkillReferences(args);

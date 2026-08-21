@@ -229,7 +229,8 @@ export function createDurableLLMMappingStep() {
           // toModelOutput is absent or fails — otherwise provider-executed tools
           // or tools without a mapper lose their metadata.
           let providerMetadata: Record<string, unknown> | undefined = toolResult.providerMetadata as
-            Record<string, unknown> | undefined;
+            | Record<string, unknown>
+            | undefined;
           if (
             !toolResult.error &&
             toolResult.result != null &&
@@ -237,7 +238,8 @@ export function createDurableLLMMappingStep() {
             !toolResult.modelOutputComputed
           ) {
             const tool = registryTools?.[toolResult.toolName] as
-              { toModelOutput?: (output: unknown) => unknown } | undefined;
+              | { toModelOutput?: (output: unknown) => unknown }
+              | undefined;
 
             if (tool?.toModelOutput) {
               const mappingSpan = stepSpan?.createChildSpan({

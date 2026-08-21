@@ -10,6 +10,7 @@ import { SUBMIT_PLAN_TOOL_ID } from './shared';
  * from it, and fill `title`/`plan` for approval rendering and history replay.
  */
 export interface SubmitPlanSuspendPayload {
+  toolId?: typeof SUBMIT_PLAN_TOOL_ID;
   path: string;
   title?: string;
   plan?: string;
@@ -86,6 +87,7 @@ export const submitPlanTool = createTool({
     path: z.string().describe('Path to the plan markdown file on disk (e.g. `.mastracode/plans/add-dark-mode.md`).'),
   }),
   suspendSchema: z.object({
+    toolId: z.literal(SUBMIT_PLAN_TOOL_ID).optional(),
     path: z.string(),
     title: z.string().optional(),
     plan: z.string().optional(),
@@ -97,6 +99,7 @@ export const submitPlanTool = createTool({
       if (resumeData !== undefined) {
         if (resumeData.action === 'approved') {
           return {
+            toolId: SUBMIT_PLAN_TOOL_ID,
             content: 'Plan approved. Proceed with implementation following the approved plan.',
             isError: false,
             submittedPlan: {
@@ -109,12 +112,14 @@ export const submitPlanTool = createTool({
 
         if (resumeData.feedback) {
           return {
+            toolId: SUBMIT_PLAN_TOOL_ID,
             content: `Plan was not approved. The user wants revisions.\n\nUser feedback: ${resumeData.feedback}\n\nPlease revise the plan based on the feedback and submit again with submit_plan.`,
             isError: false,
             submittedPlan: {
               title: resumeData.title,
               path: resumeData.path,
               plan: resumeData.plan,
+              feedback: resumeData.feedback,
             },
           };
         }
@@ -122,6 +127,7 @@ export const submitPlanTool = createTool({
         // No inline feedback — the user will provide revision instructions in
         // their next chat message. Stop and wait for it.
         return {
+          toolId: SUBMIT_PLAN_TOOL_ID,
           content:
             'Plan was not approved. The user will send revision instructions in their next message. Stop now and wait for the user to provide feedback before revising the plan.',
           isError: false,
@@ -137,7 +143,7 @@ export const submitPlanTool = createTool({
       if (suspend) {
         // The host validates `path`, reads that file to render the approval UI, and
         // fills title/plan into the resume payload for history replay.
-        await suspend({ path });
+        await suspend({ toolId: SUBMIT_PLAN_TOOL_ID, path });
         return;
       }
 
