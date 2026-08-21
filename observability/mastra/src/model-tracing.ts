@@ -748,7 +748,7 @@ export class ModelSpanTracker {
   /** Stored step-finish payload when defer mode is enabled */
   #pendingStepFinishPayload?: StepFinishPayload<any, any>;
   /** Provider finish observed before core-normalized response identity is ready. */
-  #pendingInferenceFinishPayload?: StepFinishPayload<any, any>;
+  #pendingInferenceFinishPayload?: ModelInferenceFinishPayload;
   /** Provider-boundary timestamp retained while core finishes response attribution. */
   #pendingInferenceEndTime?: Date;
   /** Whether post-inference work has finished before step-finish was observed. */
@@ -895,6 +895,7 @@ export class ModelSpanTracker {
    */
   reportGenerationError(options: ErrorSpanOptions<SpanType.MODEL_GENERATION>): void {
     this.#endChunkSpan();
+    this.#flushPendingInferenceFinish();
     const inferenceSpan = this.#currentInferenceSpan;
     const stepSpan = this.#currentStepSpan;
     const completionStartTime = this.#currentInferenceCompletionStartTime;
@@ -1099,9 +1100,11 @@ export class ModelSpanTracker {
   /** End the active step without closing its generation. */
   endStep(options?: EndSpanOptions<SpanType.MODEL_STEP>): void {
     this.#endChunkSpan();
+    this.#flushPendingInferenceFinish();
     const inferenceSpan = this.#currentInferenceSpan;
     const completionStartTime = this.#currentInferenceCompletionStartTime;
     const inferenceResponse = this.#currentInferenceResponse;
+    const inferenceEndTime = this.#pendingInferenceEndTime;
     const finishReason = runSpanOperation(() => options?.attributes?.finishReason);
     this.#currentInferenceSpan = undefined;
     this.#currentInferenceCompletionStartTime = undefined;
@@ -1109,12 +1112,14 @@ export class ModelSpanTracker {
     this.#hasNormalizedInferenceResponse = false;
     this.#pendingInferenceEndTime = undefined;
     if (inferenceSpan || this.#currentInferenceLifecycleOpen) {
-      const providerOutcome: ProviderInferenceOutcome =
+      const providerOutcome: Extract<ProviderInferenceOutcome, 'error' | 'abort'> =
         finishReason === 'abort' || finishReason === 'tripwire' ? 'abort' : 'error';
       this.#recordProviderOutcome(providerOutcome);
       this.#providerUsageState = 'provider_not_reported';
       runSpanOperation(() =>
-        inferenceSpan?.end({
+        inferenceSpan?.error({
+          error: boundedProviderFinishError(providerOutcome),
+          endSpan: true,
           attributes: {
             ...providerUsageStates(undefined, {}),
             providerOutcome,
@@ -1122,6 +1127,7 @@ export class ModelSpanTracker {
             ...(completionStartTime === undefined ? {} : { completionStartTime }),
             ...inferenceResponse,
           },
+          endTime: inferenceEndTime,
         }),
       );
       runSpanOperation(() => this.#modelSpan?.update({ attributes: { providerUsageState: this.#providerUsageState } }));
@@ -1139,6 +1145,7 @@ export class ModelSpanTracker {
   /** Error the active step without closing its generation. */
   reportStepError(options: ErrorSpanOptions<SpanType.MODEL_STEP>): void {
     this.#endChunkSpan();
+    this.#flushPendingInferenceFinish();
     if (this.#currentInferenceSpan || this.#currentInferenceLifecycleOpen) {
       this.reportInferenceError({ error: options.error });
     }
@@ -1356,6 +1363,20 @@ export class ModelSpanTracker {
     if (pendingPayload) this.#endInferenceSpan(pendingPayload);
   }
 
+  /** Capture provider finish before downstream stream backpressure. */
+  recordInferenceFinish(payload: ModelInferenceFinishPayload, endTime: Date = new Date()): void {
+    if (!this.#currentInferenceLifecycleOpen) return;
+    this.#pendingInferenceFinishPayload = payload;
+    this.#pendingInferenceEndTime ??= endTime;
+  }
+
+  #flushPendingInferenceFinish(): boolean {
+    const pendingPayload = this.#pendingInferenceFinishPayload;
+    if (!pendingPayload) return false;
+    this.#endInferenceSpan(pendingPayload);
+    return true;
+  }
+
   /** Prevent replayed cache chunks from fabricating a provider inference. */
   markInferenceNotApplicable(): void {
     this.#currentStepInferenceApplicable = false;
@@ -1418,7 +1439,7 @@ export class ModelSpanTracker {
     // Inference may already be closed (closed eagerly on step-finish in defer
     // mode so its duration reflects pure model latency, not subsequent tool
     // execution). Close it here for the non-deferred path.
-    this.#endInferenceSpan(payload);
+    if (!this.#flushPendingInferenceFinish()) this.#endInferenceSpan(payload);
     this.#resetCurrentStep();
 
     let endedWithOutput = false;
@@ -1843,8 +1864,7 @@ export class ModelSpanTracker {
 
               case 'finish':
                 if (this.#currentInferenceLifecycleOpen) {
-                  this.#pendingInferenceFinishPayload = chunk.payload;
-                  this.#pendingInferenceEndTime ??= new Date();
+                  this.recordInferenceFinish(chunk.payload);
                   this.#endChunkSpan();
                 }
                 break;

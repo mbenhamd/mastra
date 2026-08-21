@@ -1214,6 +1214,9 @@ export interface IModelSpanTracker {
   /** Record first semantic content at the provider adapter boundary. */
   recordInferenceContentStart?(): void;
 
+  /** Record provider finish and its producer-boundary time before downstream backpressure. */
+  recordInferenceFinish?(payload: ModelInferenceFinishPayload, endTime?: Date): void;
+
   /**
    * Close only the current provider-attempt span after a retryable adapter
    * failure. The enclosing model step and generation remain open for the next

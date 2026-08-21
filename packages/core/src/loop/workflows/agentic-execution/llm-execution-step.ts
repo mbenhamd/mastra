@@ -1937,6 +1937,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                   else modelSpanTracker?.reportInferenceError?.({ error: tracingError });
                 },
                 onProviderFirstContent: () => modelSpanTracker?.recordInferenceContentStart?.(),
+                onProviderFinish: (payload, endTime) => modelSpanTracker?.recordInferenceFinish?.(payload, endTime),
                 onResult: ({
                   warnings: warningsFromStream,
                   request: requestFromStream,

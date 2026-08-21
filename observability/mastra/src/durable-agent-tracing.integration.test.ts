@@ -795,31 +795,64 @@ describe('regular Agent provider request ledger (real exporter)', () => {
     expect(testExporter.getIncompleteSpans()).toHaveLength(0);
   });
 
-  it('ends regular inference at provider finish before delayed finish output processing', async () => {
-    let finishProcessorStartedAt: Date | undefined;
-    let finishProcessorCompletedAt: Date | undefined;
-    const delayedFinishProcessor = {
-      id: 'delayed-finish-output',
-      name: 'Delayed finish output',
+  it('ends regular inference at producer finish despite downstream chunk backpressure', async () => {
+    let firstDeltaProcessorStartedAt: Date | undefined;
+    let firstDeltaProcessorCompletedAt: Date | undefined;
+    let delayedFirstDelta = false;
+    const delayedDeltaProcessor = {
+      id: 'delayed-first-delta-output',
+      name: 'Delayed first delta output',
       async processOutputStream({ part }: { part: { type?: string } }) {
-        if (part.type === 'finish') {
-          finishProcessorStartedAt = new Date();
-          await new Promise(resolve => setTimeout(resolve, 220));
-          finishProcessorCompletedAt = new Date();
+        if (part.type === 'text-delta' && !delayedFirstDelta) {
+          delayedFirstDelta = true;
+          firstDeltaProcessorStartedAt = new Date();
+          await new Promise(resolve => setTimeout(resolve, 300));
+          firstDeltaProcessorCompletedAt = new Date();
         }
         return part;
       },
     };
+    const providerChunks = [
+      { type: 'stream-start', warnings: [] },
+      {
+        type: 'response-metadata',
+        id: 'backpressured-response',
+        modelId: 'requested-response-model',
+        timestamp: new Date(0),
+      },
+      { type: 'text-start', id: 'backpressured-text' },
+      ...Array.from({ length: 64 }, (_, index) => ({
+        type: 'text-delta' as const,
+        id: 'backpressured-text',
+        delta: `chunk-${index}`,
+      })),
+      { type: 'text-end', id: 'backpressured-text' },
+      {
+        type: 'finish',
+        finishReason: 'stop',
+        usage: { inputTokens: 4, outputTokens: 64, totalTokens: 68 },
+        providerMetadata: {
+          anthropic: { iterations: [{ type: 'fallback_message', model: 'served-fallback-model' }] },
+        },
+      },
+    ];
+    const backpressuredModel = new MockLanguageModelV2({
+      provider: 'identity-provider',
+      modelId: 'requested-model',
+      doStream: async () => ({
+        stream: convertArrayToReadableStream(providerChunks as any),
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        warnings: [],
+      }),
+    });
     const agent = buildRegularMastra(
       testExporter,
       new Agent({
         id: 'regular-provider-finish-boundary',
         name: 'regular-provider-finish-boundary',
         instructions: 'x',
-        model: responseIdentityModel('served-response', 'requested-response-model', {
-          anthropic: { iterations: [{ type: 'fallback_message', model: 'served-fallback-model' }] },
-        }) as any,
-        outputProcessors: [delayedFinishProcessor as any],
+        model: backpressuredModel as any,
+        outputProcessors: [delayedDeltaProcessor as any],
       }),
     );
 
@@ -827,15 +860,15 @@ describe('regular Agent provider request ledger (real exporter)', () => {
 
     const [inference] = testExporter.getSpansByType('model_inference' as any);
     const [step] = testExporter.getSpansByType('model_step' as any);
-    expect(finishProcessorStartedAt).toBeDefined();
-    expect(finishProcessorCompletedAt).toBeDefined();
+    expect(firstDeltaProcessorStartedAt).toBeDefined();
+    expect(firstDeltaProcessorCompletedAt).toBeDefined();
     expect(inference?.attributes).toMatchObject({
-      responseId: 'served-response',
+      responseId: 'backpressured-response',
       responseModel: 'served-fallback-model',
       providerOutcome: 'success',
     });
-    expect(new Date(inference!.endTime!).getTime()).toBeLessThanOrEqual(finishProcessorStartedAt!.getTime());
-    expect(new Date(step!.endTime!).getTime()).toBeGreaterThanOrEqual(finishProcessorCompletedAt!.getTime());
+    expect(new Date(inference!.endTime!).getTime()).toBeLessThan(firstDeltaProcessorCompletedAt!.getTime());
+    expect(new Date(step!.endTime!).getTime()).toBeGreaterThanOrEqual(firstDeltaProcessorCompletedAt!.getTime());
     expect(testExporter.getIncompleteSpans()).toHaveLength(0);
   });
 

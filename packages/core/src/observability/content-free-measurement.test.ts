@@ -5,8 +5,6 @@ import {
   MAX_EXACT_JSON_MEASUREMENT_DEPTH,
   MAX_EXACT_JSON_MEASUREMENT_NODES,
   createExactJsonMeasurementSnapshot,
-  isExactJsonMeasurementCandidate,
-  jsonUtf8ByteLength,
 } from './content-free-measurement';
 
 describe('createExactJsonMeasurementSnapshot', () => {
@@ -36,8 +34,6 @@ describe('createExactJsonMeasurementSnapshot', () => {
     const expected = '{"a":{"text":"private café"},"b":[{"text":"private café"},null]}';
     expect(JSON.stringify(measurement.snapshot)).toBe(expected);
     expect(measurement.utf8ByteLength).toBe(new TextEncoder().encode(expected).byteLength);
-    expect(jsonUtf8ByteLength(input)).toBe(measurement.utf8ByteLength);
-    expect(isExactJsonMeasurementCandidate(input)).toBe(true);
 
     shared.text = 'changed after measurement';
     expect(JSON.stringify(measurement.snapshot)).toBe(expected);
@@ -119,8 +115,6 @@ describe('createExactJsonMeasurementSnapshot', () => {
       Symbol('private'),
     ]) {
       expect(createExactJsonMeasurementSnapshot(value)).toEqual({ state: 'unavailable' });
-      expect(isExactJsonMeasurementCandidate(value)).toBe(false);
-      expect(jsonUtf8ByteLength(value)).toBeUndefined();
     }
 
     const shared = { value: 'safe' };

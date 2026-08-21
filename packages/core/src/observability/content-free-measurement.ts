@@ -242,14 +242,3 @@ export function createExactJsonMeasurementSnapshot(value: unknown): ExactJsonMea
     return UNAVAILABLE_RESULT;
   }
 }
-
-/** @deprecated Prefer the one-shot snapshot result so callers retain the reason exact measurement was unavailable. */
-export function isExactJsonMeasurementCandidate(value: unknown): boolean {
-  return createExactJsonMeasurementSnapshot(value).state === 'measured';
-}
-
-/** @deprecated Prefer `createExactJsonMeasurementSnapshot` to avoid repeating the bounded traversal. */
-export function jsonUtf8ByteLength(value: unknown): number | undefined {
-  const measurement = createExactJsonMeasurementSnapshot(value);
-  return measurement.state === 'measured' ? measurement.utf8ByteLength : undefined;
-}

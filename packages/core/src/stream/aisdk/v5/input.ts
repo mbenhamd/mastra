@@ -7,6 +7,8 @@ import type { ChunkType } from '../../types';
 import { convertFullStreamChunkToMastra } from './transform';
 import type { StreamPart } from './transform';
 
+type ProviderFinishPayload = Extract<ChunkType, { type: 'finish' }>['payload'];
+
 /**
  * Checks if an ID is a simple numeric string (e.g., "0", "1", "2").
  * Anthropic and Google providers use these indices which reset per LLM call,
@@ -19,6 +21,7 @@ function isNumericId(id: string): boolean {
 export class AISDKV5InputStream extends MastraModelInput {
   #generateId: IdGenerator;
   #onProviderFirstContent?: () => void;
+  #onProviderFinish?: (payload: ProviderFinishPayload, endTime: Date) => void;
   #providerContentObserved = false;
 
   constructor({
@@ -26,15 +29,18 @@ export class AISDKV5InputStream extends MastraModelInput {
     name,
     generateId,
     onProviderFirstContent,
+    onProviderFinish,
   }: {
     component: RegisteredLogger;
     name: string;
     generateId?: IdGenerator;
     onProviderFirstContent?: () => void;
+    onProviderFinish?: (payload: ProviderFinishPayload, endTime: Date) => void;
   }) {
     super({ component, name });
     this.#generateId = generateId ?? defaultGenerateId;
     this.#onProviderFirstContent = onProviderFirstContent;
+    this.#onProviderFinish = onProviderFinish;
   }
 
   async transform({
@@ -54,6 +60,7 @@ export class AISDKV5InputStream extends MastraModelInput {
 
     for await (const chunk of stream) {
       const rawChunk = chunk as StreamPart;
+      const providerFinishedAt = rawChunk.type === 'finish' ? new Date() : undefined;
 
       // Clear ID map on new step so each step gets fresh UUIDs
       if ((rawChunk as { type: string }).type === 'stream-start') {
@@ -63,6 +70,13 @@ export class AISDKV5InputStream extends MastraModelInput {
       const transformedChunk = convertFullStreamChunkToMastra(rawChunk, { runId });
 
       if (transformedChunk) {
+        if (transformedChunk.type === 'finish') {
+          try {
+            this.#onProviderFinish?.(transformedChunk.payload, providerFinishedAt ?? new Date());
+          } catch {
+            // Observability must never affect provider stream conversion.
+          }
+        }
         if (
           !this.#providerContentObserved &&
           (transformedChunk.type === 'text-delta' ||

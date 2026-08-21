@@ -2,10 +2,7 @@ import { convertArrayToReadableStream, MockLanguageModelV2 } from '@internal/ai-
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
 import { coreFeatures } from '../../../features';
-import {
-  isExactJsonMeasurementCandidate,
-  MAX_EXACT_JSON_MEASUREMENT_CODE_UNITS,
-} from '../../../observability/content-free-measurement';
+import { MAX_EXACT_JSON_MEASUREMENT_CODE_UNITS } from '../../../observability/content-free-measurement';
 import { execute, resolveJsonPromptInjection } from './execute';
 import { testUsage } from './test-utils';
 
@@ -258,24 +255,6 @@ describe('execute structured output prompt handling', () => {
 
 describe('execute prepared provider request measurements', () => {
   const utf8JsonBytes = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).byteLength;
-
-  it('fails binary JSON measurement closed before typed-array serialization can expand it', () => {
-    expect(isExactJsonMeasurementCandidate(new Uint8Array([1, 2, 3]))).toBe(false);
-    expect(isExactJsonMeasurementCandidate({ payload: Buffer.from('private bytes') })).toBe(false);
-  });
-
-  it('measures repeated JSON references but rejects cycles and serialization hooks', () => {
-    const shared = { value: 'safe' };
-    expect(isExactJsonMeasurementCandidate({ first: shared, second: shared })).toBe(true);
-    const cyclic: { self?: unknown } = {};
-    cyclic.self = cyclic;
-    expect(isExactJsonMeasurementCandidate(cyclic)).toBe(false);
-    expect(
-      isExactJsonMeasurementCandidate({
-        toJSON: () => ({ expanded: 'private' }),
-      }),
-    ).toBe(false);
-  });
 
   it('reports exact content-free sizes for the final request passed to the provider adapter', async () => {
     let capturedRequest: Record<string, unknown> | undefined;

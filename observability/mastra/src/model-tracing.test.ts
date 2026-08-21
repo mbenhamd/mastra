@@ -2,7 +2,7 @@ import { ReadableStream } from 'node:stream/web';
 import { coreFeatures } from '@mastra/core/features';
 import type { ObservabilityExporter, TracingEvent, ExportedSpan, MetricEvent } from '@mastra/core/observability';
 import { SpanType, SamplingStrategyType, TracingEventType } from '@mastra/core/observability';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { DefaultObservabilityInstance } from './instances';
 import { ModelSpanTracker } from './model-tracing';
@@ -1780,9 +1780,97 @@ describe('ModelSpanTracker', () => {
     ])(
       'exports terminal provider $reason finishes as errored inference spans',
       async ({ reason, outcome, errorName }) => {
+        vi.useFakeTimers();
+        try {
+          const providerFinishedAt = new Date('2026-08-21T10:00:00.000Z');
+          vi.setSystemTime(providerFinishedAt);
+          const modelSpan = tracing.startSpan({
+            type: SpanType.MODEL_GENERATION,
+            name: 'test-generation',
+          });
+          const tracker = new ModelSpanTracker(modelSpan);
+          tracker.startStep();
+          tracker.startInference();
+
+          await consumeStream(
+            tracker.wrapStream(
+              createMockStream([
+                {
+                  type: 'finish',
+                  payload: {
+                    output: {
+                      usage: { inputTokens: 2, outputTokens: 1, totalTokens: 3 },
+                      rawError: 'SENSITIVE_PROVIDER_ERROR',
+                    },
+                    stepResult: { reason, warnings: [], isContinued: false },
+                    metadata: {},
+                  },
+                },
+              ]),
+            ),
+          );
+          vi.setSystemTime(new Date(providerFinishedAt.getTime() + 5_000));
+          tracker.endInference();
+          modelSpan.end();
+
+          const [inferenceSpan] = testExporter.getSpansByType(SpanType.MODEL_INFERENCE);
+          expect(inferenceSpan?.attributes).toMatchObject({
+            finishReason: reason,
+            providerOutcome: outcome,
+            usage: { inputTokens: 2, outputTokens: 1 },
+          });
+          expect(inferenceSpan?.errorInfo).toMatchObject({
+            name: errorName,
+            message: reason === 'abort' ? 'Provider inference aborted' : 'Provider inference failed',
+          });
+          expect(inferenceSpan?.endTime).toEqual(providerFinishedAt);
+          expect(inferenceSpan?.output).toBeUndefined();
+          expect(JSON.stringify(inferenceSpan)).not.toContain('SENSITIVE_PROVIDER_ERROR');
+        } finally {
+          vi.useRealTimers();
+        }
+      },
+    );
+
+    it('exports a direct abort without provider finish as an errored inference', async () => {
+      const modelSpan = tracing.startSpan({
+        type: SpanType.MODEL_GENERATION,
+        name: 'direct-abort-generation',
+      });
+      const tracker = new ModelSpanTracker(modelSpan);
+      tracker.startStep();
+      tracker.startInference();
+
+      await consumeStream(
+        tracker.wrapStream(
+          createMockStream([
+            { type: 'text-delta', payload: { text: 'partial' } },
+            { type: 'abort', payload: { reason: 'cancelled' } },
+          ]),
+        ),
+      );
+      tracker.endGeneration();
+
+      const [inferenceSpan] = testExporter.getSpansByType(SpanType.MODEL_INFERENCE);
+      expect(inferenceSpan?.attributes).toMatchObject({
+        finishReason: 'abort',
+        providerOutcome: 'abort',
+        providerUsageState: 'provider_not_reported',
+      });
+      expect(inferenceSpan?.errorInfo).toMatchObject({
+        name: 'AbortError',
+        message: 'Provider inference aborted',
+      });
+    });
+
+    it('preserves a completed provider inference when a downstream tripwire closes the step', async () => {
+      vi.useFakeTimers();
+      try {
+        const providerFinishedAt = new Date('2026-08-21T11:00:00.000Z');
+        vi.setSystemTime(providerFinishedAt);
         const modelSpan = tracing.startSpan({
           type: SpanType.MODEL_GENERATION,
-          name: 'test-generation',
+          name: 'downstream-tripwire-generation',
         });
         const tracker = new ModelSpanTracker(modelSpan);
         tracker.startStep();
@@ -1794,34 +1882,40 @@ describe('ModelSpanTracker', () => {
               {
                 type: 'finish',
                 payload: {
-                  output: {
-                    usage: { inputTokens: 2, outputTokens: 1, totalTokens: 3 },
-                    rawError: 'SENSITIVE_PROVIDER_ERROR',
-                  },
-                  stepResult: { reason, warnings: [], isContinued: false },
+                  output: { usage: { inputTokens: 2, outputTokens: 1, totalTokens: 3 } },
+                  stepResult: { reason: 'stop', warnings: [], isContinued: false },
                   metadata: {},
                 },
               },
             ]),
           ),
         );
-        tracker.endInference();
-        modelSpan.end();
+        vi.setSystemTime(new Date(providerFinishedAt.getTime() + 5_000));
+        tracker.endStep({ attributes: { finishReason: 'tripwire', isContinued: false } });
+        tracker.endGeneration({ attributes: { finishReason: 'tripwire' } });
 
         const [inferenceSpan] = testExporter.getSpansByType(SpanType.MODEL_INFERENCE);
         expect(inferenceSpan?.attributes).toMatchObject({
-          finishReason: reason,
-          providerOutcome: outcome,
-          usage: { inputTokens: 2, outputTokens: 1 },
+          finishReason: 'stop',
+          providerOutcome: 'success',
+          providerUsageState: 'reported',
         });
-        expect(inferenceSpan?.errorInfo).toMatchObject({
-          name: errorName,
-          message: reason === 'abort' ? 'Provider inference aborted' : 'Provider inference failed',
+        expect(inferenceSpan?.errorInfo).toBeUndefined();
+        expect(inferenceSpan?.endTime).toEqual(providerFinishedAt);
+
+        const [stepSpan] = testExporter.getSpansByType(SpanType.MODEL_STEP);
+        expect(stepSpan?.attributes).toMatchObject({ finishReason: 'tripwire' });
+        const [generationSpan] = testExporter.getSpansByType(SpanType.MODEL_GENERATION);
+        expect(generationSpan?.attributes).toMatchObject({
+          finishReason: 'tripwire',
+          providerSucceededInferenceCount: 1,
+          providerErrorInferenceCount: 0,
+          providerAbortedInferenceCount: 0,
         });
-        expect(inferenceSpan?.output).toBeUndefined();
-        expect(JSON.stringify(inferenceSpan)).not.toContain('SENSITIVE_PROVIDER_ERROR');
-      },
-    );
+      } finally {
+        vi.useRealTimers();
+      }
+    });
 
     it('passes through accessor and proxy response metadata without invoking hooks or attributing it', async () => {
       const modelSpan = tracing.startSpan({

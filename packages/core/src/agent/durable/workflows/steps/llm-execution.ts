@@ -1367,6 +1367,9 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                 onProviderFirstContent: () => {
                   runTracingSafely(() => modelSpanTracker?.recordInferenceContentStart?.());
                 },
+                onProviderFinish: (payload, endTime) => {
+                  runTracingSafely(() => modelSpanTracker?.recordInferenceFinish?.(payload, endTime));
+                },
                 onResult: ({ warnings: w, request: r, rawResponse: rr }) => {
                   warnings = w || [];
                   request = r || {};

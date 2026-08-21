@@ -9,7 +9,7 @@ import type { ModelMethodType } from '../../../llm/model/model.loop.types';
 import { modelSupportsStructuredOutput } from '../../../llm/model/provider-registry';
 import type { MastraLanguageModel, SharedProviderOptions } from '../../../llm/model/shared.types';
 import type { LoopOptions } from '../../../loop/types';
-import type { PreparedModelRequestMetrics } from '../../../observability';
+import type { ModelInferenceFinishPayload, PreparedModelRequestMetrics } from '../../../observability';
 import { createExactJsonMeasurementSnapshot } from '../../../observability/content-free-measurement';
 import type { ExactJsonMeasurementSnapshot } from '../../../observability/content-free-measurement';
 import { DEFAULT_MAX_RETRY_AFTER_MS, getRetryAfterMs, waitDelay } from '../../../utils/retry-after';
@@ -420,6 +420,8 @@ type ExecutionProps<OUTPUT = undefined> = {
   onProviderAttemptError?: (input: { error: unknown; providerAttempt: number; aborted: boolean }) => void;
   /** Records the provider's first semantic chunk before downstream buffering. */
   onProviderFirstContent?: () => void;
+  /** Records provider finish before downstream buffering or processor backpressure. */
+  onProviderFinish?: (payload: ModelInferenceFinishPayload, endTime: Date) => void;
   /** Zero-based logical attempt offset for callers that own retries outside this adapter loop. */
   providerAttemptOffset?: number;
   structuredOutput?: StructuredOutputOptions<OUTPUT>;
@@ -447,6 +449,7 @@ export function execute<OUTPUT = undefined>({
   onProviderAttemptStart,
   onProviderAttemptError,
   onProviderFirstContent,
+  onProviderFinish,
   providerAttemptOffset = 0,
   includeRawChunks,
   modelSettings,
@@ -462,6 +465,7 @@ export function execute<OUTPUT = undefined>({
     name: model.modelId,
     generateId,
     onProviderFirstContent,
+    onProviderFinish,
   });
 
   // Determine target version based on model's specificationVersion
