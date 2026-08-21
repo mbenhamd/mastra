@@ -1100,6 +1100,79 @@ describe('durable-agent observability — full span tree (real exporter)', () =>
     expect(testExporter.getIncompleteSpans()).toHaveLength(0);
   });
 
+  it('ends durable inference at producer finish despite downstream chunk backpressure', async () => {
+    let firstDeltaProcessorStartedAt: Date | undefined;
+    let firstDeltaProcessorCompletedAt: Date | undefined;
+    let delayedFirstDelta = false;
+    const delayedDeltaProcessor = {
+      id: 'durable-delayed-first-delta-output',
+      name: 'Durable delayed first delta output',
+      async processOutputStream({ part }: { part: { type?: string } }) {
+        if (part.type === 'text-delta' && !delayedFirstDelta) {
+          delayedFirstDelta = true;
+          firstDeltaProcessorStartedAt = new Date();
+          await new Promise(resolve => setTimeout(resolve, 300));
+          firstDeltaProcessorCompletedAt = new Date();
+        }
+        return part;
+      },
+    };
+    const providerChunks = [
+      { type: 'stream-start', warnings: [] },
+      {
+        type: 'response-metadata',
+        id: 'durable-backpressured-response',
+        modelId: 'requested-response-model',
+        timestamp: new Date(0),
+      },
+      { type: 'text-start', id: 'durable-backpressured-text' },
+      ...Array.from({ length: 64 }, (_, index) => ({
+        type: 'text-delta' as const,
+        id: 'durable-backpressured-text',
+        delta: `chunk-${index}`,
+      })),
+      { type: 'text-end', id: 'durable-backpressured-text' },
+      {
+        type: 'finish',
+        finishReason: 'stop',
+        usage: { inputTokens: 4, outputTokens: 64, totalTokens: 68 },
+        providerMetadata: {
+          anthropic: { iterations: [{ type: 'fallback_message', model: 'served-fallback-model' }] },
+        },
+      },
+    ];
+    const backpressuredModel = new MockLanguageModelV2({
+      provider: 'identity-provider',
+      modelId: 'requested-model',
+      doStream: async () => ({
+        stream: convertArrayToReadableStream(providerChunks as any),
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        warnings: [],
+      }),
+    });
+    const agent = new Agent({
+      id: 'durable-provider-finish-boundary',
+      name: 'durable-provider-finish-boundary',
+      instructions: 'x',
+      model: backpressuredModel as any,
+      outputProcessors: [delayedDeltaProcessor as any],
+    });
+    const { wrapped } = buildMastra(testExporter, agent, 'durable');
+
+    await runToCompletion(wrapped, 'hi', testExporter);
+
+    const [inference] = testExporter.getSpansByType('model_inference' as any);
+    expect(firstDeltaProcessorStartedAt).toBeDefined();
+    expect(firstDeltaProcessorCompletedAt).toBeDefined();
+    expect(inference?.attributes).toMatchObject({
+      responseId: 'durable-backpressured-response',
+      responseModel: 'served-fallback-model',
+      providerOutcome: 'success',
+    });
+    expect(new Date(inference!.endTime!).getTime()).toBeLessThan(firstDeltaProcessorCompletedAt!.getTime());
+    expect(testExporter.getIncompleteSpans()).toHaveLength(0);
+  });
+
   it('keeps a durable output-step processor inside its live MODEL_STEP', async () => {
     const processOutputStep = vi.fn(async ({ messageList }: { messageList: unknown }) => messageList);
     const agent = new Agent({
