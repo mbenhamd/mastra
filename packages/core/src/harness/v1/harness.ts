@@ -23,6 +23,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import type { Agent } from '../../agent';
 import { Mastra } from '../../mastra';
 import { MCPServerBase } from '../../mcp';
+import { isInfrastructureRequestContextKey } from '../../request-context';
 import type {
   PermissionRules,
   SessionGrants,
@@ -972,6 +973,7 @@ export class Harness {
   private readonly _fileConfig: Readonly<HarnessFileConfig>;
   private readonly _subagentTypes: ReadonlyMap<string, SubagentDefinition>;
   private readonly _subagentMaxDepth: number;
+  private readonly _subagentInheritedRequestContextAppKeys: readonly string[];
   private readonly _subagentInheritRootSessionGrants: boolean;
   /** §SA3 — per-parent concurrent `spawn_subagent` cap; `undefined` = no limit. */
   private readonly _subagentMaxConcurrent?: number;
@@ -1162,6 +1164,25 @@ export class Harness {
     // exclusion of tool overlays); agent-existence resolution happens at
     // _bindMastra so it matches how modes are validated.
     const subagentTypes = new Map<string, SubagentDefinition>();
+    const inheritedRequestContextAppKeys = config.subagents?.inheritRequestContextAppKeys;
+    if (inheritedRequestContextAppKeys !== undefined && !Array.isArray(inheritedRequestContextAppKeys)) {
+      throw new HarnessConfigError('subagents.inheritRequestContextAppKeys', 'must be an array of app keys');
+    }
+    const seenInheritedRequestContextAppKeys = new Set<string>();
+    for (const [index, key] of (inheritedRequestContextAppKeys ?? []).entries()) {
+      const field = `subagents.inheritRequestContextAppKeys[${index}]`;
+      if (typeof key !== 'string' || key.length === 0) {
+        throw new HarnessConfigError(field, 'must be a non-empty string');
+      }
+      if (key === 'app' || isInfrastructureRequestContextKey(key)) {
+        throw new HarnessConfigError(field, `request-context key "${key}" is infrastructure-owned`);
+      }
+      if (seenInheritedRequestContextAppKeys.has(key)) {
+        throw new HarnessConfigError(field, `duplicate app key "${key}"`);
+      }
+      seenInheritedRequestContextAppKeys.add(key);
+    }
+    this._subagentInheritedRequestContextAppKeys = Object.freeze([...seenInheritedRequestContextAppKeys]);
     if (
       config.subagents?.inheritRootSessionGrants !== undefined &&
       typeof config.subagents.inheritRootSessionGrants !== 'boolean'
@@ -1937,6 +1958,11 @@ export class Harness {
   /** @internal — Session enforces the subagent depth cap inside the spawn tool. */
   _getSubagentMaxDepth(): number {
     return this._subagentMaxDepth;
+  }
+
+  /** @internal — exact app keys approved for descendant request-context lineage. */
+  _getSubagentInheritedRequestContextAppKeys(): readonly string[] {
+    return this._subagentInheritedRequestContextAppKeys;
   }
 
   /** @internal — per-parent concurrent spawn_subagent cap (SA3); `undefined` = no limit. */

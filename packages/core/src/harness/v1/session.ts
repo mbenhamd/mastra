@@ -203,7 +203,12 @@ import {
   readDelegationAttemptMetadata,
 } from './plan-task-session';
 import { createPlanTaskTools } from './plan-task-tool';
-import { callerRequestContextToPersisted, validateCallerRequestContext } from './request-context-input';
+import {
+  callerRequestContextToPersisted,
+  projectInheritedRequestContextApp,
+  projectInheritedRequestContextAppBag,
+  validateCallerRequestContext,
+} from './request-context-input';
 import { createSpawnSubagentTool, SPAWN_SUBAGENT_TOOL_ID } from './spawn-subagent-tool';
 import { createSubagentOutcomeReportTool } from './subagent-outcome-tool';
 import type {
@@ -352,7 +357,9 @@ type MessageAdmissionHashes = {
 };
 
 type QueueResumeRecoveryResult =
-  { status: 'none' } | { status: 'completed'; result: AgentResult } | { status: 'stale' };
+  | { status: 'none' }
+  | { status: 'completed'; result: AgentResult }
+  | { status: 'stale' };
 
 type ResumeResponseMode = 'agent-result' | 'inbox-receipt';
 type InboxReceiptResponseOptions = Extract<InboxResponseOptions, { responseId: string }>;
@@ -4356,7 +4363,8 @@ export class Session {
    * `_internalAwaitFlushChain()` so shutdown and tests can act on it. */
   private _pendingTokenUsageFlushError: unknown;
   private _pendingDurableTurnFlushError:
-    { error: unknown; pendingResume?: { runId: string; toolCallId: string } } | undefined;
+    | { error: unknown; pendingResume?: { runId: string; toolCallId: string } }
+    | undefined;
 
   /**
    * True while a turn (message or queued) is in flight against the agent.
@@ -16911,6 +16919,15 @@ export class Session {
     if (persistedRequestContext?.channel) {
       entries.push(['channel', persistedRequestContext.channel]);
     }
+    const inheritedRequestContext = projectInheritedRequestContextAppBag(
+      persistedRequestContext?.metadata,
+      this._harness._getSubagentInheritedRequestContextAppKeys(),
+    );
+    if (inheritedRequestContext !== undefined) {
+      for (const [key, value] of Object.entries(inheritedRequestContext.app)) {
+        entries.push([key, value]);
+      }
+    }
     // §4.2e permission GATE — thread a per-tool policy resolver the loop's
     // tool-call step consults (deny → block, ask → require approval, allow →
     // proceed). OPT-IN: only engaged when the operator configured a policy
@@ -17596,6 +17613,7 @@ export class Session {
     callerSignal?: AbortSignal,
     parentToolCallId?: string,
     parentRunId?: string,
+    callerRequestContext?: RequestContext,
   ): Promise<PlanTaskView & { subagentSessionId: string }> {
     this._assertLive('task_delegate');
     const admissionEpoch = this._captureActiveWorkAdmission('task_delegate');
@@ -17607,6 +17625,10 @@ export class Session {
     if (input.modelOverride !== undefined && typeof input.modelOverride !== 'string') {
       throw new HarnessValidationError('modelOverride', 'must be a string when provided');
     }
+    const delegatedRequestContext = projectInheritedRequestContextApp(
+      callerRequestContext,
+      this._harness._getSubagentInheritedRequestContextAppKeys(),
+    );
 
     // §8 depth cap — fail closed BEFORE creating any child record (mirrors the
     // spawn tool's pre-creation gate).
@@ -17669,6 +17691,7 @@ export class Session {
           expectedScopeFingerprint: scopeSnapshot.fingerprint,
           ...(parentToolCallId !== undefined ? { parentToolCallId } : {}),
           ...(parentRunId !== undefined ? { parentRunId } : {}),
+          ...(delegatedRequestContext !== undefined ? { requestContextApp: delegatedRequestContext.app } : {}),
         }),
       );
       this._assertActiveWorkAdmission(admissionEpoch, 'task_delegate', callerSignal);
@@ -17797,6 +17820,7 @@ export class Session {
       delegationStartedAt,
       delegationDeadlineAt,
       delegationParentToolCallId,
+      delegatedRequestContext?.app,
     );
 
     return { ...view, subagentSessionId: child.id };
@@ -17882,6 +17906,7 @@ export class Session {
     startedAt: number,
     deadlineAt: number,
     parentToolCallId: string,
+    requestContextApp?: Record<string, JsonValue>,
   ): Promise<void> {
     let outcome: DelegatedSubagentOutcome = 'failed';
     let rawResult: unknown;
@@ -17976,7 +18001,11 @@ export class Session {
       // signal() itself able to retain the parent reservation forever.
       const terminal = await waitForDelegationResult(
         child
-          .signal({ content: taskBody, admissionId: this._delegationAdmissionId(taskId) })
+          .signal({
+            content: taskBody,
+            admissionId: this._delegationAdmissionId(taskId),
+            ...(requestContextApp !== undefined ? { requestContext: { app: requestContextApp } } : {}),
+          })
           .then(dispatched => dispatched.result),
         deadlineAt,
       );
@@ -18492,6 +18521,7 @@ export class Session {
         delegationAttempt.startedAt,
         delegationAttempt.deadlineAt,
         delegationAttempt.parentToolCallId,
+        delegationAttempt.requestContextApp,
       );
     }
     if (needsRetry) this._scheduleDelegationReconcileRetry(attempt);

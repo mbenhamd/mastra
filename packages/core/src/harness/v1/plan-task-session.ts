@@ -29,7 +29,7 @@ import type {
   LoadPlanTaskSubtreeResult,
   PlanTaskMutationOp,
 } from '../../storage/domains/harness/types';
-import { sha256CanonicalJsonChecked } from './canonical-json';
+import { assertJsonValue, sha256CanonicalJsonChecked } from './canonical-json';
 import { HarnessValidationError } from './errors';
 import {
   assertNoBlockedByCycle,
@@ -1203,6 +1203,12 @@ export interface DelegateTaskInput {
   parentToolCallId?: string;
   /** Internal correlation to the parent provider run. */
   parentRunId?: string;
+  /**
+   * Exact JSON app-key subset approved for the delegated child turn. Kept out
+   * of the model-facing plan projection, but persisted so restart reattachment
+   * reproduces the original signal admission byte-for-byte.
+   */
+  requestContextApp?: Record<string, JsonValue>;
 }
 
 export interface PlanTaskDelegationScopeSnapshot {
@@ -1217,6 +1223,8 @@ interface DelegationAttemptMetadata {
   attemptId: string;
   taskBody: string;
   taskBodySha256: string;
+  requestContextApp?: Record<string, JsonValue>;
+  requestContextAppSha256?: string;
   subagentSessionId: string;
   parentToolCallId: string;
   parentRunId?: string;
@@ -1263,6 +1271,14 @@ function delegationAttemptMetadata(
     deadlineAt,
     hadPriorMetadata: priorMetadata !== undefined,
   };
+  if (input.requestContextApp !== undefined) {
+    const requestContextApp = assertJsonValue(input.requestContextApp, 'requestContextApp');
+    if (requestContextApp === null || typeof requestContextApp !== 'object' || Array.isArray(requestContextApp)) {
+      throw new HarnessValidationError('requestContextApp', 'must be a JSON object');
+    }
+    attempt.requestContextApp = requestContextApp;
+    attempt.requestContextAppSha256 = sha256CanonicalJsonChecked(requestContextApp);
+  }
   if (input.parentRunId !== undefined) attempt.parentRunId = input.parentRunId;
   if (priorMetadata !== undefined) attempt.priorMetadata = priorMetadata;
   return { [DELEGATION_ATTEMPT_METADATA_KEY]: attempt };
@@ -1327,6 +1343,34 @@ export function readDelegationAttemptMetadata(
     return undefined;
   }
   if (raw.hadPriorMetadata && !Object.prototype.hasOwnProperty.call(raw, 'priorMetadata')) return undefined;
+  const hasRequestContextApp = Object.prototype.hasOwnProperty.call(raw, 'requestContextApp');
+  const hasRequestContextAppSha256 = Object.prototype.hasOwnProperty.call(raw, 'requestContextAppSha256');
+  if (hasRequestContextApp !== hasRequestContextAppSha256) return undefined;
+  let requestContextApp: Record<string, JsonValue> | undefined;
+  if (hasRequestContextApp) {
+    if (
+      raw.requestContextApp === null ||
+      typeof raw.requestContextApp !== 'object' ||
+      Array.isArray(raw.requestContextApp) ||
+      typeof raw.requestContextAppSha256 !== 'string'
+    ) {
+      return undefined;
+    }
+    try {
+      const normalized = assertJsonValue(raw.requestContextApp, 'delegation.requestContextApp');
+      if (
+        normalized === null ||
+        typeof normalized !== 'object' ||
+        Array.isArray(normalized) ||
+        sha256CanonicalJsonChecked(normalized) !== raw.requestContextAppSha256
+      ) {
+        return undefined;
+      }
+      requestContextApp = normalized;
+    } catch {
+      return undefined;
+    }
+  }
   let settlement: DelegationAttemptMetadata['settlement'];
   if (raw.settlement !== undefined) {
     if (raw.settlement === null || typeof raw.settlement !== 'object' || Array.isArray(raw.settlement))
@@ -1355,6 +1399,9 @@ export function readDelegationAttemptMetadata(
     attemptId: raw.attemptId,
     taskBody: raw.taskBody,
     taskBodySha256: raw.taskBodySha256,
+    ...(requestContextApp !== undefined
+      ? { requestContextApp, requestContextAppSha256: raw.requestContextAppSha256 as string }
+      : {}),
     subagentSessionId: raw.subagentSessionId,
     parentToolCallId: raw.parentToolCallId,
     ...(typeof raw.parentRunId === 'string' ? { parentRunId: raw.parentRunId } : {}),
