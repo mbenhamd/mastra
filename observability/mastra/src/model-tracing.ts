@@ -832,18 +832,9 @@ export class ModelSpanTracker {
 
   /** Record response identity after core has normalized provider-side fallbacks. */
   recordResponseMetadata(metadata: { responseId?: string; responseModel?: string }): void {
-    const responseId =
-      this.#hasNormalizedInferenceResponse && this.#currentInferenceResponse?.responseId !== undefined
-        ? undefined
-        : typeof metadata.responseId === 'string'
-          ? metadata.responseId
-          : undefined;
-    const responseModel =
-      this.#hasNormalizedInferenceResponse && this.#currentInferenceResponse?.responseModel !== undefined
-        ? undefined
-        : typeof metadata.responseModel === 'string'
-          ? metadata.responseModel
-          : undefined;
+    if (this.#hasNormalizedInferenceResponse) return;
+    const responseId = typeof metadata.responseId === 'string' ? metadata.responseId : undefined;
+    const responseModel = typeof metadata.responseModel === 'string' ? metadata.responseModel : undefined;
     if (responseId === undefined && responseModel === undefined) return;
     const attributes = {
       ...(responseId === undefined ? {} : { responseId }),
@@ -1378,7 +1369,9 @@ export class ModelSpanTracker {
   /** Retain an eager provider timestamp without observing chunk content. */
   recordInferenceChunkTimestamp(chunk: unknown, observedAt: Date = new Date()): void {
     if ((typeof chunk !== 'object' && typeof chunk !== 'function') || chunk === null) return;
-    this.#providerChunkTimestamps.set(chunk, observedAt);
+    const timestamp = runSpanOperation(() => observedAt.getTime());
+    if (typeof timestamp !== 'number' || !Number.isFinite(timestamp)) return;
+    this.#providerChunkTimestamps.set(chunk, new Date(timestamp));
   }
 
   /** Capture provider finish before downstream stream backpressure. */
@@ -1391,18 +1384,20 @@ export class ModelSpanTracker {
     if (response) {
       const responseId = typeof response.responseId === 'string' ? response.responseId : undefined;
       const responseModel = typeof response.responseModel === 'string' ? response.responseModel : undefined;
+      const attributes = {
+        ...(responseId === undefined ? {} : { responseId }),
+        ...(responseModel === undefined ? {} : { responseModel }),
+      };
+      this.#currentInferenceResponse = responseId === undefined && responseModel === undefined ? undefined : attributes;
+      this.#hasNormalizedInferenceResponse = true;
       if (responseId !== undefined || responseModel !== undefined) {
-        const attributes = {
-          ...(responseId === undefined ? {} : { responseId }),
-          ...(responseModel === undefined ? {} : { responseModel }),
-        };
-        this.#currentInferenceResponse = { ...this.#currentInferenceResponse, ...attributes };
-        this.#hasNormalizedInferenceResponse = true;
         runSpanOperation(() => this.#currentInferenceSpan?.update({ attributes }));
       }
     }
     this.#pendingInferenceFinishPayload = payload;
-    this.#pendingInferenceEndTime = endTime;
+    const timestamp = runSpanOperation(() => endTime.getTime());
+    this.#pendingInferenceEndTime =
+      typeof timestamp === 'number' && Number.isFinite(timestamp) ? new Date(timestamp) : undefined;
   }
 
   #flushPendingInferenceFinish(): boolean {

@@ -19,6 +19,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { z } from 'zod';
 import { Observability } from './default';
 import { TestExporter } from './exporters';
+import { ModelSpanTracker } from './model-tracing';
 
 function textModel(text: string) {
   return new MockLanguageModelV2({
@@ -847,6 +848,54 @@ describe('regular Agent provider request ledger (real exporter)', () => {
     expect(testExporter.getIncompleteSpans()).toHaveLength(0);
   });
 
+  it('keeps absent producer response identity absent when a processor adds one', async () => {
+    const identityAddingProcessor = {
+      id: 'adding-provider-identity',
+      name: 'Adding provider identity',
+      processOutputStream({ part }: { part: any }) {
+        if (part.type !== 'response-metadata') return part;
+        return {
+          ...part,
+          payload: { ...part.payload, id: 'processor-response', modelId: 'processor-model' },
+        };
+      },
+    };
+    const model = new MockLanguageModelV2({
+      provider: 'identity-provider',
+      modelId: 'requested-model',
+      doStream: async () => ({
+        stream: convertArrayToReadableStream([
+          { type: 'stream-start', warnings: [] },
+          { type: 'response-metadata', timestamp: new Date(0) },
+          { type: 'text-start', id: 'identity-absent-text' },
+          { type: 'text-delta', id: 'identity-absent-text', delta: 'served' },
+          { type: 'text-end', id: 'identity-absent-text' },
+          { type: 'finish', finishReason: 'stop', usage: { inputTokens: 4, outputTokens: 2, totalTokens: 6 } },
+        ] as any),
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        warnings: [],
+      }),
+    });
+    const agent = buildRegularMastra(
+      testExporter,
+      new Agent({
+        id: 'regular-provider-identity-absence',
+        name: 'regular-provider-identity-absence',
+        instructions: 'x',
+        model: model as any,
+        outputProcessors: [identityAddingProcessor as any],
+      }),
+    );
+
+    await runRegularToCompletion(agent, 'hi', testExporter);
+
+    const [inference] = testExporter.getSpansByType('model_inference' as any);
+    expect(inference?.attributes?.responseId).toBeUndefined();
+    expect(inference?.attributes?.responseModel).toBeUndefined();
+    expect(inference?.attributes?.providerOutcome).toBe('success');
+    expect(testExporter.getIncompleteSpans()).toHaveLength(0);
+  });
+
   it('ends regular inference at producer finish despite downstream chunk backpressure', async () => {
     let firstDeltaProcessorStartedAt: Date | undefined;
     let firstDeltaProcessorCompletedAt: Date | undefined;
@@ -861,7 +910,7 @@ describe('regular Agent provider request ledger (real exporter)', () => {
           await new Promise(resolve => setTimeout(resolve, 300));
           firstDeltaProcessorCompletedAt = new Date();
         }
-        return part;
+        return { ...part };
       },
     };
     const providerChunks = [
@@ -1144,7 +1193,7 @@ describe('durable-agent observability — full span tree (real exporter)', () =>
           await new Promise(resolve => setTimeout(resolve, 300));
           firstDeltaProcessorCompletedAt = new Date();
         }
-        return part;
+        return { ...part };
       },
     };
     const providerChunks = [
@@ -1192,6 +1241,9 @@ describe('durable-agent observability — full span tree (real exporter)', () =>
     await runToCompletion(wrapped, 'hi', testExporter);
 
     const [inference] = testExporter.getSpansByType('model_inference' as any);
+    const [textChunk] = testExporter
+      .getSpansByType('model_chunk' as any)
+      .filter(span => span.attributes?.chunkType === 'text');
     expect(firstDeltaProcessorStartedAt).toBeDefined();
     expect(firstDeltaProcessorCompletedAt).toBeDefined();
     expect(inference?.attributes).toMatchObject({
@@ -1199,8 +1251,45 @@ describe('durable-agent observability — full span tree (real exporter)', () =>
       responseModel: 'served-fallback-model',
       providerOutcome: 'success',
     });
+    expect(new Date(textChunk!.startTime!).getTime()).toBeGreaterThanOrEqual(new Date(inference!.startTime!).getTime());
+    expect(new Date(textChunk!.endTime!).getTime()).toBeLessThanOrEqual(new Date(inference!.endTime!).getTime());
     expect(new Date(inference!.endTime!).getTime()).toBeLessThan(firstDeltaProcessorCompletedAt!.getTime());
     expect(testExporter.getIncompleteSpans()).toHaveLength(0);
+  });
+
+  it('isolates durable producer timestamps from tracker callback mutation', async () => {
+    const recordChunkTimestamp = ModelSpanTracker.prototype.recordInferenceChunkTimestamp;
+    const callbackSpy = vi
+      .spyOn(ModelSpanTracker.prototype, 'recordInferenceChunkTimestamp')
+      .mockImplementation(function (this: ModelSpanTracker, chunk, observedAt) {
+        recordChunkTimestamp.call(this, chunk, observedAt);
+        observedAt?.setTime(0);
+      });
+    try {
+      const agent = new Agent({
+        id: 'durable-provider-timestamp-isolation',
+        name: 'durable-provider-timestamp-isolation',
+        instructions: 'x',
+        model: textModel('Hello') as any,
+      });
+      const { wrapped } = buildMastra(testExporter, agent, 'durable');
+
+      await runToCompletion(wrapped, 'hi', testExporter);
+
+      expect(callbackSpy).toHaveBeenCalled();
+      const [inference] = testExporter.getSpansByType('model_inference' as any);
+      const [textChunk] = testExporter
+        .getSpansByType('model_chunk' as any)
+        .filter(span => span.attributes?.chunkType === 'text');
+      expect(new Date(inference!.endTime!).getTime()).toBeGreaterThanOrEqual(new Date(inference!.startTime!).getTime());
+      expect(new Date(textChunk!.startTime!).getTime()).toBeGreaterThanOrEqual(
+        new Date(inference!.startTime!).getTime(),
+      );
+      expect(new Date(textChunk!.endTime!).getTime()).toBeLessThanOrEqual(new Date(inference!.endTime!).getTime());
+      expect(testExporter.getIncompleteSpans()).toHaveLength(0);
+    } finally {
+      callbackSpy.mockRestore();
+    }
   });
 
   it('keeps a durable output-step processor inside its live MODEL_STEP', async () => {

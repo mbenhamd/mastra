@@ -311,4 +311,40 @@ describe('AISDKV5InputStream', () => {
       },
     });
   });
+
+  it('isolates provider finish time from an earlier chunk callback mutation', async () => {
+    let finishEndTime: Date | undefined;
+    const inputStream = new AISDKV5InputStream({
+      component: RegisteredLogger.LLM,
+      name: 'timestamp-isolation',
+      onProviderChunk(chunk, observedAt) {
+        if (chunk.type === 'finish') observedAt.setTime(0);
+      },
+      onProviderFinish(_payload, endTime) {
+        finishEndTime = endTime;
+      },
+    });
+    const model = createTestModel();
+    const stream = inputStream.initialize({
+      runId: 'timestamp-isolation',
+      createStream: async () => {
+        const result = await model.doStream({
+          prompt: [{ role: 'user', content: [{ type: 'text', text: 'test' }] }],
+        });
+        return {
+          stream: result.stream,
+          warnings: {},
+          request: result.request || {},
+          rawResponse: result.response || {},
+        };
+      },
+      onResult: () => {},
+    });
+
+    for await (const _chunk of stream) {
+      // Consume the transformed stream.
+    }
+
+    expect(finishEndTime?.getTime()).toBeGreaterThan(0);
+  });
 });

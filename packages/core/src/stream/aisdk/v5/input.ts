@@ -107,7 +107,7 @@ export class AISDKV5InputStream extends MastraModelInput {
 
       if (transformedChunk) {
         try {
-          this.#onProviderChunk?.(transformedChunk, providerObservedAt);
+          this.#onProviderChunk?.(transformedChunk, new Date(providerObservedAt.getTime()));
         } catch {
           // Observability must never affect provider stream conversion.
         }
@@ -119,7 +119,7 @@ export class AISDKV5InputStream extends MastraModelInput {
         if (transformedChunk.type === 'finish') {
           try {
             const finishPayload = providerFinishEvidence(transformedChunk.payload);
-            this.#onProviderFinish?.(finishPayload, providerObservedAt, {
+            this.#onProviderFinish?.(finishPayload, new Date(providerObservedAt.getTime()), {
               responseId: this.#providerResponseId,
               responseModel: resolveResponseModelId(
                 finishPayload.metadata?.providerMetadata,
