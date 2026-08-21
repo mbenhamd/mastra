@@ -1972,6 +1972,84 @@ describe('ProcessorRunner', () => {
     });
   });
 
+  describe('processLLMRequest', () => {
+    const prompt = [{ role: 'user', content: [{ type: 'text', text: 'before' }] }] as any;
+
+    it('preserves a successful processor result when span completion throws', async () => {
+      const transformedPrompt = [{ role: 'user', content: [{ type: 'text', text: 'after' }] }] as any;
+      const processorSpan = {
+        end: vi.fn(() => {
+          throw new Error('span end failed');
+        }),
+        error: vi.fn(),
+      };
+      const currentSpan = { createChildSpan: vi.fn(() => processorSpan) };
+      runner = new ProcessorRunner({
+        inputProcessors: [
+          {
+            id: 'request-transform',
+            processLLMRequest: async () => ({ prompt: transformedPrompt }),
+          },
+        ],
+        outputProcessors: [],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+
+      const result = await runner.runProcessLLMRequest({
+        prompt,
+        model: {},
+        stepNumber: 0,
+        steps: [],
+        tracingContext: { currentSpan } as any,
+      });
+
+      expect(result.prompt).toBe(transformedPrompt);
+      expect(processorSpan.end).toHaveBeenCalledOnce();
+      expect(processorSpan.error).not.toHaveBeenCalled();
+    });
+
+    it('preserves a hostile non-Error rejection when span error reporting throws', async () => {
+      const coercionHook = vi.fn(() => {
+        throw new Error('coercion must not run');
+      });
+      const rejection = {
+        toString: coercionHook,
+        [Symbol.toPrimitive]: coercionHook,
+      };
+      const processorSpan = {
+        end: vi.fn(),
+        error: vi.fn(() => {
+          throw new Error('span error failed');
+        }),
+      };
+      const currentSpan = { createChildSpan: vi.fn(() => processorSpan) };
+      runner = new ProcessorRunner({
+        inputProcessors: [
+          {
+            id: 'request-rejection',
+            processLLMRequest: async () => Promise.reject(rejection),
+          },
+        ],
+        outputProcessors: [],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+
+      const result = runner.runProcessLLMRequest({
+        prompt,
+        model: {},
+        stepNumber: 0,
+        steps: [],
+        tracingContext: { currentSpan } as any,
+      });
+
+      await expect(result).rejects.toBe(rejection);
+      expect(processorSpan.error).toHaveBeenCalledOnce();
+      expect(coercionHook).not.toHaveBeenCalled();
+    });
+  });
+
   describe('processOutputStep', () => {
     it('should run output step processors in order', async () => {
       const executionOrder: string[] = [];

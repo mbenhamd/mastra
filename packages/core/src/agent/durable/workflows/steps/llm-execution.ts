@@ -1,8 +1,10 @@
+import { isProxy } from 'node:util/types';
 import type { LanguageModelV2Prompt } from '@ai-sdk/provider-v5';
 import type { ToolChoice, ToolSet } from '@internal/ai-sdk-v5';
 import { z } from 'zod';
 import type { PubSub } from '../../../../events/pubsub';
 import { mergeProviderOptions } from '../../../../llm/model/provider-options';
+import { resolveResponseModelId } from '../../../../llm/model/server-side-fallback';
 import type { SharedProviderOptions } from '../../../../llm/model/shared.types';
 import { ConsoleLogger } from '../../../../logger';
 import { applyAutoResumeSystemMessage } from '../../../../loop/shared/auto-resume-system-message';
@@ -23,6 +25,7 @@ import type {
   AnySpan,
 } from '../../../../observability';
 import { EntityType } from '../../../../observability';
+import { createExactJsonMeasurementSnapshot } from '../../../../observability/content-free-measurement';
 import { getRootExportSpan, getStepAvailableToolNames } from '../../../../observability/utils';
 import type { CachedLLMStepResponse } from '../../../../processors';
 import { PrepareStepProcessor } from '../../../../processors/processors/prepare-step';
@@ -154,6 +157,40 @@ function asDurableModelError(value: unknown, fallbackMessage: string): Error {
     // A thrown proxy can reject prototype inspection. Use the bounded fallback.
   }
   return new Error(fallbackMessage);
+}
+
+function ownDurableDataProperty(value: unknown, key: string): unknown {
+  if (!value || typeof value !== 'object') return undefined;
+  try {
+    if (isProxy(value)) return undefined;
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor && 'value' in descriptor ? descriptor.value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function durableResponseMetadata(payload: unknown) {
+  const id = ownDurableDataProperty(payload, 'id');
+  const modelId = ownDurableDataProperty(payload, 'modelId');
+  const timestamp = ownDurableDataProperty(payload, 'timestamp');
+  const headers = ownDurableDataProperty(payload, 'headers');
+  return {
+    ...(typeof id === 'string' ? { id } : {}),
+    ...(typeof modelId === 'string' ? { modelId } : {}),
+    ...(timestamp === undefined ? {} : { timestamp }),
+    ...(headers === undefined ? {} : { headers }),
+  };
+}
+
+function resolveDurableResponseModel(providerMetadata: unknown, responseModelId: string | undefined) {
+  const measurement = createExactJsonMeasurementSnapshot(providerMetadata);
+  if (measurement.state !== 'measured') return responseModelId;
+  try {
+    return resolveResponseModelId(JSON.parse(JSON.stringify(measurement.snapshot)), responseModelId);
+  } catch {
+    return responseModelId;
+  }
 }
 
 function durableErrorMessage(value: unknown, fallbackMessage: string): string {
@@ -404,6 +441,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
         return latestModelSpanData;
       };
 
+      let providerAttemptCount = 0;
       for (let modelIndex = 0; modelIndex < modelList.length; modelIndex++) {
         const modelEntry = modelList[modelIndex]!;
         const maxRetries = responseRecoveryReserved ? 0 : modelEntry.maxRetries || 0;
@@ -1268,7 +1306,6 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                 },
               }) as unknown as ReturnType<typeof execute>;
             } else {
-              runTracingSafely(() => modelSpanTracker?.startInference?.());
               const canRecordPreparedRequest =
                 runTracingSafely(() => typeof modelSpanTracker?.recordPreparedRequest === 'function') === true;
               // No awaits occur between this exact-binding read and execute().
@@ -1304,6 +1341,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                 },
                 includeRawChunks: execOptions.includeRawChunks,
                 methodType: 'stream',
+                providerAttemptOffset: providerAttemptCount,
                 structuredOutput: structuredOutput as any,
                 ...(canRecordPreparedRequest
                   ? {
@@ -1313,12 +1351,21 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                       },
                     }
                   : {}),
-                onProviderAttemptStart: providerAttempt =>
-                  runTracingSafely(() => modelSpanTracker?.startInference?.(undefined, providerAttempt)),
-                onProviderAttemptError: ({ error }) => {
+                onProviderAttemptStart: providerAttempt => {
+                  providerAttemptCount = providerAttempt;
+                  runTracingSafely(() => modelSpanTracker?.startInference?.(undefined, providerAttempt));
+                },
+                onProviderAttemptError: ({ error, aborted }) => {
                   const providerError = asDurableModelError(error, 'Provider attempt failed');
-                  runTracingSafely(() => modelSpanTracker?.reportInferenceError?.({ error: providerError }));
+                  runTracingSafely(() =>
+                    aborted
+                      ? modelSpanTracker?.reportInferenceAbort?.({ error: providerError })
+                      : modelSpanTracker?.reportInferenceError?.({ error: providerError }),
+                  );
                   snapshotLatestModelSpanData(modelSpan);
+                },
+                onProviderFirstContent: () => {
+                  runTracingSafely(() => modelSpanTracker?.recordInferenceContentStart?.());
                 },
                 onResult: ({ warnings: w, request: r, rawResponse: rr }) => {
                   warnings = w || [];
@@ -1381,6 +1428,16 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
               new TransformStream<any, any>({
                 transform(chunk, controller) {
                   if (chunk?.type === 'finish') {
+                    const finishMetadata = ownDurableDataProperty(chunk.payload, 'metadata');
+                    const providerMetadata =
+                      ownDurableDataProperty(finishMetadata, 'providerMetadata') ??
+                      ownDurableDataProperty(chunk.payload, 'providerMetadata');
+                    runTracingSafely(() =>
+                      modelSpanTracker?.recordResponseMetadata?.({
+                        responseId: responseMetadata?.id,
+                        responseModel: resolveDurableResponseModel(providerMetadata, responseMetadata?.modelId),
+                      }),
+                    );
                     controller.enqueue({ ...chunk, type: 'step-finish' });
                   } else {
                     controller.enqueue(chunk);
@@ -1695,13 +1752,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                   }
 
                   case 'response-metadata': {
-                    const payload = rawChunk.payload as any;
-                    responseMetadata = {
-                      id: payload.id,
-                      timestamp: payload.timestamp,
-                      modelId: payload.modelId,
-                      headers: payload.headers,
-                    };
+                    responseMetadata = durableResponseMetadata(rawChunk.payload);
                     break;
                   }
 
@@ -1727,9 +1778,6 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
               logger?.error?.('Error processing LLM stream', { error, runId });
 
               const errorObj = asDurableModelError(error, 'Durable model stream failed');
-              reportDurableStepErrorSafely(modelSpanTracker, modelSpan, errorObj);
-              const failedModelSpanData = snapshotLatestModelSpanData(modelSpan);
-
               // If this error was triggered by abortSignal cancellation, surface an
               // abort event to the client so onAbort callbacks fire and bail out
               // of the entire fallback/retry flow — a confirmed abort should not
@@ -1739,6 +1787,14 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
               // errors whose message happens to mention "abort"; we only trust
               // the canonical AbortError name or an actual aborted signal.
               const isAbort = executionAbortSignal?.aborted === true || errorObj.name === 'AbortError';
+              if (isAbort) {
+                runTracingSafely(() =>
+                  modelSpanTracker?.endStep?.({ attributes: { finishReason: 'abort', isContinued: false } }),
+                );
+              } else {
+                reportDurableStepErrorSafely(modelSpanTracker, modelSpan, errorObj);
+              }
+              const failedModelSpanData = snapshotLatestModelSpanData(modelSpan);
               if (isAbort) {
                 // Return a clean output instead of throwing so the workflow
                 // engine doesn't crash. The dowhile predicate will see
@@ -1811,9 +1867,9 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
             }
 
             if (streamAborted) {
-              const streamAbortError = new Error('Durable model stream aborted');
-              streamAbortError.name = 'AbortError';
-              reportDurableStepErrorSafely(modelSpanTracker, modelSpan, streamAbortError);
+              runTracingSafely(() =>
+                modelSpanTracker?.endStep?.({ attributes: { finishReason: 'abort', isContinued: false } }),
+              );
               return {
                 messageListState: messageList.serialize(),
                 text: textDeltas.join(''),
@@ -1836,12 +1892,17 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
               const streamErrorObj = asDurableModelError(streamError, 'Durable model stream failed');
               logger?.error?.('Stream captured error', { error: streamErrorObj, runId });
 
-              reportDurableStepErrorSafely(modelSpanTracker, modelSpan, streamErrorObj);
-              const failedModelSpanData = snapshotLatestModelSpanData(modelSpan);
-
               // Mirror the iterator catch: a captured stream error that turns out
               // to be a confirmed abort must short-circuit retry/fallback.
               const isStreamErrorAbort = executionAbortSignal?.aborted === true || streamErrorObj.name === 'AbortError';
+              if (isStreamErrorAbort) {
+                runTracingSafely(() =>
+                  modelSpanTracker?.endStep?.({ attributes: { finishReason: 'abort', isContinued: false } }),
+                );
+              } else {
+                reportDurableStepErrorSafely(modelSpanTracker, modelSpan, streamErrorObj);
+              }
+              const failedModelSpanData = snapshotLatestModelSpanData(modelSpan);
               if (isStreamErrorAbort) {
                 return {
                   messageListState: messageList.serialize(),
@@ -2233,9 +2294,6 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
             }
 
             lastError = asDurableModelError(error, 'Durable model execution failed');
-            reportDurableStepErrorSafely(attemptModelSpanTracker, attemptModelSpan, lastError);
-            const failedModelSpanData = snapshotLatestModelSpanData(attemptModelSpan);
-
             // Confirmed aborts bypass all retry / fallback / processAPIError
             // handling — the user (or upstream caller) explicitly cancelled the
             // run and we must terminate immediately rather than burning more
@@ -2245,6 +2303,14 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
             const outerRegistryEntry = getBoundRunRegistryEntry(runId, typedInput.runtimeBindingId);
             const outerAbortSignal = outerRegistryEntry?.abortSignal ?? abortSignal;
             const isAbort = outerAbortSignal?.aborted === true || lastError.name === 'AbortError';
+            if (isAbort) {
+              runTracingSafely(() =>
+                attemptModelSpanTracker?.endStep?.({ attributes: { finishReason: 'abort', isContinued: false } }),
+              );
+            } else {
+              reportDurableStepErrorSafely(attemptModelSpanTracker, attemptModelSpan, lastError);
+            }
+            const failedModelSpanData = snapshotLatestModelSpanData(attemptModelSpan);
             if (isAbort) {
               // Return a clean output instead of throwing so the workflow
               // engine doesn't crash. The abort event was already emitted

@@ -15,7 +15,7 @@ import type { MastraMemory } from '../memory/memory';
 import { parseMemoryRequestContext } from '../memory/types';
 import { EntityType, SpanType, createObservabilityContext, resolveObservabilityContext } from '../observability';
 import type { ObservabilityContext, Span } from '../observability';
-import { isExactJsonMeasurementCandidate, jsonUtf8ByteLength } from '../observability/content-free-measurement';
+import { createExactJsonMeasurementSnapshot } from '../observability/content-free-measurement';
 import type { ProcessorRunAttributes, TracingContext } from '../observability/types';
 import type { RequestContext } from '../request-context';
 import type { ChunkType } from '../stream';
@@ -74,6 +74,15 @@ async function invokeOnViolation(processor: Processor, error: TripWire): Promise
   }
 }
 
+/** Processor observability must not participate in processor control flow. */
+function runProcessorSpanOperation<T>(operation: () => T): T | undefined {
+  try {
+    return operation();
+  } catch {
+    return undefined;
+  }
+}
+
 function outputProcessorSupportsStream(processorOrWorkflow: ProcessorOrWorkflow): boolean {
   return isProcessorWorkflow(processorOrWorkflow)
     ? processorWorkflowSupportsPhase(processorOrWorkflow, 'outputStream')
@@ -96,6 +105,7 @@ export function outputProcessorsSupportResult(outputProcessors: readonly Process
 
 const measuredPromptRoles = ['user', 'assistant', 'tool', 'other'] as const;
 type MeasuredPromptRole = (typeof measuredPromptRoles)[number];
+const promptMeasurementEncoder = new TextEncoder();
 
 type PromptMeasurementSnapshot = {
   messageCount: number;
@@ -124,9 +134,9 @@ function serializedArrayBytes(serializedItems: readonly number[]): number {
 
 function measurePrompt(prompt: LanguageModelV2Prompt): PromptMeasurementSnapshot | undefined {
   try {
-    if (!isExactJsonMeasurementCandidate(prompt)) return undefined;
+    const detachedPrompt = createExactJsonMeasurementSnapshot(prompt);
+    if (detachedPrompt.state !== 'measured' || !Array.isArray(detachedPrompt.snapshot)) return undefined;
     const serializedMessages: number[] = [];
-    const serializedPrompt: number[] = [];
     const serializedSystemMessages: number[] = [];
     const serializedByRole: Record<MeasuredPromptRole, number[]> = {
       user: [],
@@ -135,11 +145,17 @@ function measurePrompt(prompt: LanguageModelV2Prompt): PromptMeasurementSnapshot
       other: [],
     };
 
-    for (const message of prompt) {
-      const utf8Bytes = jsonUtf8ByteLength(message);
-      if (utf8Bytes === undefined) return undefined;
-      const role = measuredPromptRole(message);
-      serializedPrompt.push(utf8Bytes);
+    // The one bounded snapshot above is the only walk over processor-owned
+    // prompt data. Component sizing below reads and serializes detached
+    // null-prototype data, so getters, proxies, iterators, and toJSON hooks on
+    // the live prompt cannot run during observability measurement.
+    for (let index = 0; index < detachedPrompt.snapshot.length; index++) {
+      const message = detachedPrompt.snapshot[index];
+      if (!message || typeof message !== 'object' || Array.isArray(message)) return undefined;
+      const serializedMessage = JSON.stringify(message);
+      if (serializedMessage === undefined) return undefined;
+      const utf8Bytes = promptMeasurementEncoder.encode(serializedMessage).byteLength;
+      const role = measuredPromptRole(message as LanguageModelV2Prompt[number]);
       if (role === 'system') serializedSystemMessages.push(utf8Bytes);
       else {
         serializedMessages.push(utf8Bytes);
@@ -150,7 +166,7 @@ function measurePrompt(prompt: LanguageModelV2Prompt): PromptMeasurementSnapshot
     return {
       messageCount: serializedMessages.length,
       messageBytes: serializedArrayBytes(serializedMessages),
-      promptBytes: serializedArrayBytes(serializedPrompt),
+      promptBytes: detachedPrompt.utf8ByteLength,
       systemMessageCount: serializedSystemMessages.length,
       systemMessageBytes: serializedArrayBytes(serializedSystemMessages),
       roles: Object.fromEntries(
@@ -2078,18 +2094,20 @@ export class ProcessorRunner {
       if (!processMethod) continue;
 
       const currentSpan = observabilityContext.tracingContext?.currentSpan;
-      const processorSpan = currentSpan?.createChildSpan({
-        type: SpanType.PROCESSOR_RUN,
-        name: `llm request processor: ${processor.id}`,
-        entityType: EntityType.INPUT_STEP_PROCESSOR,
-        entityId: processor.id,
-        entityName: processor.name,
-        attributes: {
-          processorExecutor: 'legacy',
-          processorIndex: index,
-          processorPhase: 'llm_request',
-        },
-      });
+      const processorSpan = runProcessorSpanOperation(() =>
+        currentSpan?.createChildSpan({
+          type: SpanType.PROCESSOR_RUN,
+          name: `llm request processor: ${processor.id}`,
+          entityType: EntityType.INPUT_STEP_PROCESSOR,
+          entityId: processor.id,
+          entityName: processor.name,
+          attributes: {
+            processorExecutor: 'legacy',
+            processorIndex: index,
+            processorPhase: 'llm_request',
+          },
+        }),
+      );
       const promptBeforeProcessor = processorSpan
         ? (currentPromptMeasurement ?? timedPromptMeasurement(currentPrompt))
         : undefined;
@@ -2137,29 +2155,33 @@ export class ProcessorRunner {
 
         if (processorSpan && promptBeforeProcessor) {
           const promptAfterProcessor = timedPromptMeasurement(currentPrompt);
-          processorSpan.end({
-            attributes: promptProcessorMeasurements(
-              promptBeforeProcessor.snapshot,
-              promptAfterProcessor.snapshot,
-              promptBeforeProcessor.durationMs + promptAfterProcessor.durationMs,
-            ),
-          });
+          runProcessorSpanOperation(() =>
+            processorSpan.end({
+              attributes: promptProcessorMeasurements(
+                promptBeforeProcessor.snapshot,
+                promptAfterProcessor.snapshot,
+                promptBeforeProcessor.durationMs + promptAfterProcessor.durationMs,
+              ),
+            }),
+          );
           // The previous output is the next processor's input. Reuse the exact
           // snapshot without charging or performing the same serialization twice.
           currentPromptMeasurement = { ...promptAfterProcessor, durationMs: 0 };
         }
       } catch (error) {
-        const spanError = error instanceof Error ? error : new Error(String(error));
-        processorSpan?.error({
-          error: spanError,
-          endSpan: true,
-          attributes: {
-            processorMeasurementState: 'unknown',
-            ...(promptBeforeProcessor === undefined
-              ? {}
-              : { processorMeasurementMs: promptBeforeProcessor.durationMs }),
-          },
-        });
+        const spanError = error instanceof Error ? error : new Error('Processor rejected with a non-Error value');
+        runProcessorSpanOperation(() =>
+          processorSpan?.error({
+            error: spanError,
+            endSpan: true,
+            attributes: {
+              processorMeasurementState: 'unknown',
+              ...(promptBeforeProcessor === undefined
+                ? {}
+                : { processorMeasurementMs: promptBeforeProcessor.durationMs }),
+            },
+          }),
+        );
         if (error instanceof TripWire) {
           await invokeOnViolation(processor, error);
         }
@@ -2370,8 +2392,7 @@ export class ProcessorRunner {
         totalTokens: undefined,
       };
       const currentSpan = observabilityContext.tracingContext?.currentSpan;
-      const parentSpan = currentSpan?.findParent(SpanType.AGENT_RUN) || currentSpan?.parent || currentSpan;
-      const processorSpan = parentSpan?.createChildSpan({
+      const processorSpan = currentSpan?.createChildSpan({
         type: SpanType.PROCESSOR_RUN,
         name: `output step processor: ${processor.id}`,
         entityType: EntityType.OUTPUT_STEP_PROCESSOR,

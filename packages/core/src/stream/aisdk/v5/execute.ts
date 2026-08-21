@@ -1,5 +1,5 @@
 import { isProxy } from 'node:util/types';
-import { injectJsonInstructionIntoMessages } from '@ai-sdk/provider-utils-v5';
+import { injectJsonInstructionIntoMessages, isAbortError } from '@ai-sdk/provider-utils-v5';
 import type { LanguageModelV2Prompt } from '@ai-sdk/provider-v5';
 import { APICallError } from '@internal/ai-sdk-v5';
 import type { IdGenerator, ToolChoice, ToolSet } from '@internal/ai-sdk-v5';
@@ -34,6 +34,11 @@ const RETRY_BACKOFF_FACTOR = 2;
  * `shouldRetry` so a terminal error never waits out a provider delay it will not use.
  */
 function isRetryableModelError(error: unknown): boolean {
+  try {
+    if (isAbortError(error)) return false;
+  } catch {
+    // A hostile thrown value must not make observability or retry inspection throw.
+  }
   if (APICallError.isInstance(error)) {
     return error.isRetryable;
   }
@@ -117,14 +122,15 @@ function ownProperty(value: unknown, key: string): OwnProperty {
   }
 }
 
-function providerMessageRole(message: unknown): ProviderMessageRole {
+function providerMessageRole(message: unknown): ProviderMessageRole | undefined {
   if (!isDescriptorSafeObject(message)) return 'other';
   try {
     if (Array.isArray(message)) return 'other';
   } catch {
-    return 'other';
+    return undefined;
   }
   const roleProperty = ownProperty(message, 'role');
+  if (roleProperty.state === 'unsupported') return undefined;
   const role = roleProperty.state === 'data' ? roleProperty.value : undefined;
   return role === 'system' || role === 'user' || role === 'assistant' || role === 'tool' ? role : 'other';
 }
@@ -152,21 +158,30 @@ function detachedJsonUtf8ByteLength(value: unknown): number | undefined {
 }
 
 function providerMessageMeasurements(prompt: unknown, measureBytes: boolean) {
-  const roles: Record<ProviderMessageRole, { count: number; bytes: number | undefined }> = {
+  const roles: Record<ProviderMessageRole, { count: number | undefined; bytes: number | undefined }> = {
     system: { count: 0, bytes: measureBytes ? 0 : undefined },
     user: { count: 0, bytes: measureBytes ? 0 : undefined },
     assistant: { count: 0, bytes: measureBytes ? 0 : undefined },
     tool: { count: 0, bytes: measureBytes ? 0 : undefined },
     other: { count: 0, bytes: measureBytes ? 0 : undefined },
   };
-  const length = arrayLength(prompt) ?? 0;
+  const length = arrayLength(prompt);
+  if (length === undefined) {
+    for (const role of Object.values(roles)) role.count = undefined;
+    return { count: undefined, roles, totalBytes: undefined };
+  }
   let totalBytes: number | undefined = measureBytes ? 2 + Math.max(0, length - 1) : undefined;
   for (let index = 0; index < length; index += 1) {
     const item = ownProperty(prompt, String(index));
     const message = item.state === 'data' ? item.value : undefined;
     const role = providerMessageRole(message);
+    if (item.state !== 'data' || role === undefined) {
+      for (const metrics of Object.values(roles)) metrics.count = undefined;
+      totalBytes = undefined;
+      continue;
+    }
     const roleMetrics = roles[role];
-    roleMetrics.count += 1;
+    if (roleMetrics.count !== undefined) roleMetrics.count += 1;
     if (!measureBytes) continue;
     const measured = detachedJsonUtf8ByteLength(message);
     if (measured === undefined) {
@@ -260,16 +275,22 @@ function measuredSnapshotRecord(measurement: ExactJsonMeasurementSnapshot): Reco
 
 function preparedRequestMeasurement({
   providerRequest,
+  providerOptions,
   prompt,
   responseSchema,
   responseSchemaInline,
 }: {
   providerRequest: Record<string, unknown>;
+  providerOptions: unknown;
   prompt: LanguageModelV2Prompt;
   responseSchema: unknown;
   responseSchemaInline: boolean;
 }): PreparedRequestMeasurement {
   const measurementStartedAtMs = Date.now();
+  // Reasoning effort is a small, fixed-path diagnostic independent of whether
+  // the full provider envelope exceeds the exact-snapshot bound. This reads
+  // only descriptor-safe, non-Proxy data properties and returns primitives.
+  const providerReasoning = preparedProviderReasoning(providerOptions);
   // AbortSignal is a live cancellation handle, not provider request content.
   // Exclude it before detaching the exact JSON-safe envelope; every value used
   // after adapter dispatch then comes from this immutable snapshot or a
@@ -311,9 +332,11 @@ function preparedRequestMeasurement({
         ? arrayLength(providerToolsProperty.value)
         : undefined;
   const measuredProviderToolCount = providerRequestSnapshot ? detachedProviderToolCount : fallbackProviderToolCount;
-  const providerToolCount = measuredProviderToolCount ?? 0;
+  const providerToolCount = measuredProviderToolCount;
   const providerToolSchemaBytes =
-    providerRequestSnapshot && providerToolCount > 0 ? detachedJsonUtf8ByteLength(detachedTools) : undefined;
+    providerRequestSnapshot && providerToolCount !== undefined && providerToolCount > 0
+      ? detachedJsonUtf8ByteLength(detachedTools)
+      : undefined;
   const providerToolSchemaState =
     measuredProviderToolCount === undefined
       ? ('unknown' as const)
@@ -346,33 +369,25 @@ function preparedRequestMeasurement({
     providerResponseSchemaState === 'unknown'
       ? ('unknown' as const)
       : ('measured' as const);
-  const detachedProviderOptionsProperty = providerRequestSnapshot
-    ? ownProperty(providerRequestSnapshot, 'providerOptions')
-    : undefined;
-  const providerReasoning = providerRequestSnapshot
-    ? preparedProviderReasoning(
-        detachedProviderOptionsProperty?.state === 'data' ? detachedProviderOptionsProperty.value : undefined,
-      )
-    : { providerReasoningEffortState: 'unknown' as const };
   const providerMeasurementMs = Math.max(0, Date.now() - measurementStartedAtMs);
 
   return {
     measurementState,
     providerBreakdownState: 'serialized_components_non_additive',
-    providerMessageCount: messageMeasurements.count,
+    ...(messageMeasurements.count === undefined ? {} : { providerMessageCount: messageMeasurements.count }),
     ...(providerMessageBytes === undefined ? {} : { providerMessageBytes }),
-    providerSystemMessageCount: system.count,
+    ...(system.count === undefined ? {} : { providerSystemMessageCount: system.count }),
     ...(system.bytes === undefined ? {} : { providerSystemMessageBytes: system.bytes }),
-    providerUserMessageCount: user.count,
+    ...(user.count === undefined ? {} : { providerUserMessageCount: user.count }),
     ...(user.bytes === undefined ? {} : { providerUserMessageBytes: user.bytes }),
-    providerAssistantMessageCount: assistant.count,
+    ...(assistant.count === undefined ? {} : { providerAssistantMessageCount: assistant.count }),
     ...(assistant.bytes === undefined ? {} : { providerAssistantMessageBytes: assistant.bytes }),
-    providerToolMessageCount: tool.count,
+    ...(tool.count === undefined ? {} : { providerToolMessageCount: tool.count }),
     ...(tool.bytes === undefined ? {} : { providerToolMessageBytes: tool.bytes }),
-    providerOtherMessageCount: other.count,
+    ...(other.count === undefined ? {} : { providerOtherMessageCount: other.count }),
     ...(other.bytes === undefined ? {} : { providerOtherMessageBytes: other.bytes }),
     ...(system.bytes === undefined ? {} : { providerInstructionBytes: system.bytes }),
-    providerToolCount,
+    ...(providerToolCount === undefined ? {} : { providerToolCount }),
     ...(providerToolSchemaBytes === undefined ? {} : { providerToolSchemaBytes }),
     providerToolSchemaState,
     ...(providerResponseSchemaBytes === undefined ? {} : { providerResponseSchemaBytes }),
@@ -402,7 +417,11 @@ type ExecutionProps<OUTPUT = undefined> = {
   /** Starts one tracing boundary immediately before each provider adapter invocation. */
   onProviderAttemptStart?: (providerAttempt: number) => void;
   /** Closes only the failed provider-attempt boundary so a retry can open another. */
-  onProviderAttemptError?: (input: { error: unknown; providerAttempt: number }) => void;
+  onProviderAttemptError?: (input: { error: unknown; providerAttempt: number; aborted: boolean }) => void;
+  /** Records the provider's first semantic chunk before downstream buffering. */
+  onProviderFirstContent?: () => void;
+  /** Zero-based logical attempt offset for callers that own retries outside this adapter loop. */
+  providerAttemptOffset?: number;
   structuredOutput?: StructuredOutputOptions<OUTPUT>;
   /**
   Additional HTTP headers to be sent with the request.
@@ -427,6 +446,8 @@ export function execute<OUTPUT = undefined>({
   onPreparedRequest,
   onProviderAttemptStart,
   onProviderAttemptError,
+  onProviderFirstContent,
+  providerAttemptOffset = 0,
   includeRawChunks,
   modelSettings,
   structuredOutput,
@@ -440,6 +461,7 @@ export function execute<OUTPUT = undefined>({
     component: 'LLM',
     name: model.modelId,
     generateId,
+    onProviderFirstContent,
   });
 
   // Determine target version based on model's specificationVersion
@@ -557,6 +579,7 @@ export function execute<OUTPUT = undefined>({
         const pRetry = await import('p-retry');
         return await pRetry.default(
           async attemptNumber => {
+            const providerAttempt = providerAttemptOffset + attemptNumber;
             // Starts after p-retry has completed any backoff, so retry delay is
             // never reported as provider request preparation.
             const attemptPreparationStartedAtMs = Date.now();
@@ -583,6 +606,7 @@ export function execute<OUTPUT = undefined>({
                 // synchronously or retain it beyond this invocation.
                 requestMeasurement = preparedRequestMeasurement({
                   providerRequest,
+                  providerOptions: providerOptionsToUse,
                   prompt,
                   responseSchema: responseSchemaForMeasurement,
                   responseSchemaInline,
@@ -592,7 +616,7 @@ export function execute<OUTPUT = undefined>({
               }
             }
             try {
-              onProviderAttemptStart?.(attemptNumber);
+              onProviderAttemptStart?.(providerAttempt);
             } catch {
               // Tracing must never prevent the provider call.
             }
@@ -612,7 +636,7 @@ export function execute<OUTPUT = undefined>({
                   try {
                     onPreparedRequest({
                       ...requestMeasurement,
-                      providerAttempt: attemptNumber,
+                      providerAttempt,
                       providerDispatchTimestampMs,
                       // Each retry receives a fresh request object, but only the
                       // first attempt owns shared prompt/tool preparation. Every
@@ -635,8 +659,16 @@ export function execute<OUTPUT = undefined>({
               // We have to cast this because doStream is missing the warnings property in its return type even though it exists
               return streamResult as unknown as LanguageModelV2StreamResult;
             } catch (error) {
+              let aborted = abortSignal?.aborted === true;
+              if (!aborted) {
+                try {
+                  aborted = isAbortError(error);
+                } catch {
+                  // Retry/error behavior remains unchanged for hostile thrown values.
+                }
+              }
               try {
-                onProviderAttemptError?.({ error, providerAttempt: attemptNumber });
+                onProviderAttemptError?.({ error, providerAttempt, aborted });
               } catch {
                 // Tracing must never change retry or terminal error behavior.
               }

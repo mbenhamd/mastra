@@ -411,7 +411,7 @@ describe('execute prepared provider request measurements', () => {
     expect(measurements[1]).not.toHaveProperty('providerResponseSchemaBytes');
   });
 
-  it('fails oversized exact measurement closed without changing provider dispatch', async () => {
+  it('retains descriptor-safe reasoning when the provider envelope is too large to measure', async () => {
     const oversizedText = 'x'.repeat(MAX_EXACT_JSON_MEASUREMENT_CODE_UNITS + 1);
     let capturedPrompt: unknown;
     let measurement: Record<string, unknown> | undefined;
@@ -434,6 +434,7 @@ describe('execute prepared provider request measurements', () => {
       runId: 'test-run-id-oversized-measurement',
       model: model as any,
       inputMessages: [{ role: 'user', content: [{ type: 'text', text: oversizedText }] }],
+      providerOptions: { azure: { reasoningEffort: 'low' } },
       onPreparedRequest: value => {
         measurement = value as unknown as Record<string, unknown>;
       },
@@ -450,6 +451,8 @@ describe('execute prepared provider request measurements', () => {
       providerToolCount: 0,
       providerToolSchemaState: 'not_applicable',
       providerResponseSchemaState: 'not_applicable',
+      providerReasoningEffortState: 'measured',
+      providerReasoningEffort: 'low',
     });
     expect(measurement).not.toHaveProperty('providerMessageBytes');
     expect(measurement).not.toHaveProperty('providerRequestBytes');

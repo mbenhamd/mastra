@@ -18,18 +18,23 @@ function isNumericId(id: string): boolean {
 
 export class AISDKV5InputStream extends MastraModelInput {
   #generateId: IdGenerator;
+  #onProviderFirstContent?: () => void;
+  #providerContentObserved = false;
 
   constructor({
     component,
     name,
     generateId,
+    onProviderFirstContent,
   }: {
     component: RegisteredLogger;
     name: string;
     generateId?: IdGenerator;
+    onProviderFirstContent?: () => void;
   }) {
     super({ component, name });
     this.#generateId = generateId ?? defaultGenerateId;
+    this.#onProviderFirstContent = onProviderFirstContent;
   }
 
   async transform({
@@ -58,6 +63,22 @@ export class AISDKV5InputStream extends MastraModelInput {
       const transformedChunk = convertFullStreamChunkToMastra(rawChunk, { runId });
 
       if (transformedChunk) {
+        if (
+          !this.#providerContentObserved &&
+          (transformedChunk.type === 'text-delta' ||
+            transformedChunk.type === 'tool-call-delta' ||
+            transformedChunk.type === 'tool-call' ||
+            transformedChunk.type === 'reasoning-delta' ||
+            transformedChunk.type === 'object' ||
+            transformedChunk.type === 'object-result')
+        ) {
+          this.#providerContentObserved = true;
+          try {
+            this.#onProviderFirstContent?.();
+          } catch {
+            // Observability must never affect provider stream conversion.
+          }
+        }
         // Replace numeric IDs with unique IDs for text chunks
         if (
           (transformedChunk.type === 'text-start' ||

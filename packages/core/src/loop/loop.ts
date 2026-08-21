@@ -142,8 +142,18 @@ export function loop<Tools extends ToolSet = ToolSet, OUTPUT = undefined>({
   }
   const baseStream = workflowLoopStream(workflowLoopProps);
 
-  // Apply chunk tracing transform to track MODEL_STEP and MODEL_CHUNK spans
-  const stream = rest.modelSpanTracker?.wrapStream(baseStream) ?? baseStream;
+  // The public workflow boundary owns MODEL_STEP. Its step-finish chunk is
+  // emitted only after output processors and client tool execution complete,
+  // so the step stays live while those child spans run.
+  let stream = baseStream;
+  try {
+    stream =
+      rest.modelSpanTracker?.wrapStepStream?.(baseStream) ??
+      rest.modelSpanTracker?.wrapStream(baseStream) ??
+      baseStream;
+  } catch {
+    // Tracing must never affect the public stream.
+  }
 
   // Build observability context from modelSpanTracker if tracing context is available
   const observabilityContext = createObservabilityContext(rest.modelSpanTracker?.getTracingContext());

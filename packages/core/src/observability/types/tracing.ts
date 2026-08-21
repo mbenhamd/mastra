@@ -10,7 +10,7 @@ import { EntityType } from '@internal/core/storage';
 import type { MastraError } from '../../error';
 import type { Mastra } from '../../mastra';
 import type { RequestContext } from '../../request-context';
-import type { LanguageModelUsage, ProviderMetadata, StepStartPayload } from '../../stream/types';
+import type { LanguageModelUsage, ProviderMetadata, StepFinishPayload, StepStartPayload } from '../../stream/types';
 import type { WorkflowRunStatus, WorkflowStepStatus } from '../../workflows';
 import type {
   CustomSamplerOptions,
@@ -263,6 +263,12 @@ export interface ModelGenerationAttributes extends AIBaseAttributes, Partial<Pre
   usage?: UsageStats;
   /** Whether aggregate provider usage was reported or applicable for this generation. */
   providerUsageState?: ProviderUsageMeasurementState;
+  /** Provider attempts that completed with a model response. */
+  providerSucceededInferenceCount?: number;
+  /** Provider attempts that ended in an adapter or stream error. */
+  providerErrorInferenceCount?: number;
+  /** Provider attempts that ended because the call was aborted. */
+  providerAbortedInferenceCount?: number;
   /** Estimated cost context, when provided directly by an SDK or provider */
   costContext?: CostContext;
   /** Model parameters */
@@ -320,6 +326,7 @@ export type ProviderRequestBreakdownState = 'serialized_components_non_additive'
 export type ProviderOptionalPayloadMeasurementState = 'measured' | 'not_applicable' | 'unknown';
 export type ProviderResponseSchemaMeasurementState = ProviderOptionalPayloadMeasurementState | 'inline_in_prompt';
 export type ProviderUsageMeasurementState = 'reported' | 'provider_not_reported' | 'not_applicable';
+export type ProviderInferenceOutcome = 'success' | 'error' | 'abort';
 export type ProviderReasoningEffort = 'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 export type ProviderReasoningEffortState = 'measured' | 'provider_default' | 'unknown';
 export type ProviderRequestAggregateMeasurementState = 'measured' | 'partial' | 'unknown' | 'not_applicable';
@@ -335,20 +342,20 @@ export interface PreparedModelRequestMetrics {
   providerBreakdownState: ProviderRequestBreakdownState;
   /** One-based adapter invocation within this logical model step, including provider retries. */
   providerAttempt: number;
-  providerMessageCount: number;
+  providerMessageCount?: number;
   providerMessageBytes?: number;
-  providerSystemMessageCount: number;
+  providerSystemMessageCount?: number;
   providerSystemMessageBytes?: number;
-  providerUserMessageCount: number;
+  providerUserMessageCount?: number;
   providerUserMessageBytes?: number;
-  providerAssistantMessageCount: number;
+  providerAssistantMessageCount?: number;
   providerAssistantMessageBytes?: number;
-  providerToolMessageCount: number;
+  providerToolMessageCount?: number;
   providerToolMessageBytes?: number;
-  providerOtherMessageCount: number;
+  providerOtherMessageCount?: number;
   providerOtherMessageBytes?: number;
   providerInstructionBytes?: number;
-  providerToolCount: number;
+  providerToolCount?: number;
   providerToolSchemaBytes?: number;
   providerToolSchemaState: ProviderOptionalPayloadMeasurementState;
   providerResponseSchemaBytes?: number;
@@ -373,20 +380,20 @@ export interface PreparedModelRequestAggregateMetrics {
   providerInferenceCount: number;
   providerMeasuredInferenceCount: number;
   providerUnknownInferenceCount: number;
-  providerMessageCountTotal: number;
+  providerMessageCountTotal?: number;
   providerMessageBytesTotal?: number;
-  providerSystemMessageCountTotal: number;
+  providerSystemMessageCountTotal?: number;
   providerSystemMessageBytesTotal?: number;
-  providerUserMessageCountTotal: number;
+  providerUserMessageCountTotal?: number;
   providerUserMessageBytesTotal?: number;
-  providerAssistantMessageCountTotal: number;
+  providerAssistantMessageCountTotal?: number;
   providerAssistantMessageBytesTotal?: number;
-  providerToolMessageCountTotal: number;
+  providerToolMessageCountTotal?: number;
   providerToolMessageBytesTotal?: number;
-  providerOtherMessageCountTotal: number;
+  providerOtherMessageCountTotal?: number;
   providerOtherMessageBytesTotal?: number;
   providerInstructionBytesTotal?: number;
-  providerToolCountTotal: number;
+  providerToolCountTotal?: number;
   providerToolSchemaBytesTotal?: number;
   providerResponseSchemaBytesTotal?: number;
   providerRequestBytesTotal?: number;
@@ -416,6 +423,8 @@ export interface ModelInferenceAttributes extends AIBaseAttributes, Partial<Prep
   usage?: UsageStats;
   /** Whether the provider returned any token-usage measurement for this inference. */
   providerUsageState?: ProviderUsageMeasurementState;
+  /** Bounded terminal outcome owned by this provider attempt. */
+  providerOutcome?: ProviderInferenceOutcome;
   /** Whether the provider returned cache-read token usage for this inference. */
   providerCacheReadUsageState?: ProviderUsageMeasurementState;
   /** Whether the provider returned cache-write token usage for this inference. */
@@ -1162,6 +1171,13 @@ export interface ModelInferenceContext {
   responseFormat?: ModelInferenceAttributes['responseFormat'];
 }
 
+/** Shared terminal shape emitted by both inner provider and outer step streams. */
+export interface ModelInferenceFinishPayload {
+  stepResult: Omit<StepFinishPayload['stepResult'], 'reason'> & { reason: string };
+  output: StepFinishPayload['output'];
+  metadata?: StepFinishPayload['metadata'];
+}
+
 /** Tracks model execution steps and streaming chunks within a MODEL_GENERATION span. */
 export interface IModelSpanTracker {
   getTracingContext(): TracingContext;
@@ -1169,6 +1185,8 @@ export interface IModelSpanTracker {
   endGeneration(options?: EndGenerationOptions): void;
   updateGeneration(options: UpdateSpanOptions<SpanType.MODEL_GENERATION>): void;
   wrapStream<T extends { pipeThrough: Function }>(stream: T): T;
+  /** Observe only outer workflow-owned MODEL_STEP terminal boundaries. */
+  wrapStepStream?<T extends { pipeThrough: Function }>(stream: T): T;
   startStep(payload?: StepStartPayload): void;
   updateStep?(payload?: StepStartPayload): void;
 
@@ -1193,12 +1211,21 @@ export interface IModelSpanTracker {
    */
   startInference?(payload?: StepStartPayload, providerAttempt?: number): void;
 
+  /** Record first semantic content at the provider adapter boundary. */
+  recordInferenceContentStart?(): void;
+
   /**
    * Close only the current provider-attempt span after a retryable adapter
    * failure. The enclosing model step and generation remain open for the next
    * attempt.
    */
   reportInferenceError?(options: ErrorSpanOptions<SpanType.MODEL_INFERENCE>): void;
+
+  /** Close a cancelled provider attempt without converting it to a provider error. */
+  reportInferenceAbort?(options: ErrorSpanOptions<SpanType.MODEL_INFERENCE>): void;
+
+  /** Close the current inference from the provider's inner finish boundary. */
+  endInference?(payload?: ModelInferenceFinishPayload): void;
 
   /**
    * Mark the current step as having no provider inference boundary. This is
@@ -1218,12 +1245,22 @@ export interface IModelSpanTracker {
   /** Attach content-free measurements from the final prepared provider request. */
   recordPreparedRequest?(metrics: PreparedModelRequestMetrics): void;
 
+  /** Attach provider-returned response identity normalized by the core runtime. */
+  recordResponseMetadata?(metadata: { responseId?: string; responseModel?: string }): void;
+
   /**
    * Enable or disable deferred step closing for durable execution.
    * When enabled, step-finish chunks won't automatically close the step span.
    * Use exportCurrentStep() to get the span data, then endDeferredStep() to close later.
    */
   setDeferStepClose(defer: boolean): void;
+
+  /**
+   * Close the current deferred step after step-owned post-inference work has
+   * finished. If the step-finish chunk has not reached the tracker yet, the
+   * tracker closes the step when that chunk arrives.
+   */
+  endDeferredStep?(payload?: StepFinishPayload): void;
 
   /**
    * Export the current step span for later rebuilding (durable execution).

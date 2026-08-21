@@ -13,6 +13,8 @@
  */
 
 import { TransformStream } from 'node:stream/web';
+import { isProxy } from 'node:util/types';
+import { RequestContext } from '@mastra/core/di';
 import { coreFeatures } from '@mastra/core/features';
 import { SpanType } from '@mastra/core/observability';
 import type {
@@ -20,7 +22,9 @@ import type {
   EndGenerationOptions,
   EndSpanOptions,
   ErrorSpanOptions,
+  ModelInferenceFinishPayload,
   ModelInferenceContext,
+  ProviderInferenceOutcome,
   PreparedModelRequestAggregateMetrics,
   PreparedModelRequestMetrics,
   ProviderUsageMeasurementState,
@@ -54,6 +58,39 @@ function runSpanOperation<T>(operation: () => T): T | undefined {
   } catch {
     return undefined;
   }
+}
+
+function ownStringDataProperty(value: unknown, key: string): string | undefined {
+  if (!value || typeof value !== 'object' || isProxy(value)) return undefined;
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor && 'value' in descriptor && typeof descriptor.value === 'string' ? descriptor.value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function isDescriptorSafeAbortError(error: unknown): boolean {
+  return ownStringDataProperty(error, 'name') === 'AbortError';
+}
+
+function nonnegativeInteger(value: unknown): number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : 0;
+}
+
+function inheritedRequestContext(span: Span<SpanType.MODEL_GENERATION> | undefined): RequestContext | undefined {
+  const snapshot = runSpanOperation(() => span?.requestContext);
+  if (!snapshot || typeof snapshot !== 'object' || isProxy(snapshot)) return undefined;
+  const entries: Array<[string, unknown]> = [];
+  const keys = runSpanOperation(() => Reflect.ownKeys(snapshot));
+  if (!keys) return undefined;
+  for (const key of keys) {
+    if (typeof key !== 'string') return undefined;
+    const descriptor = runSpanOperation(() => Object.getOwnPropertyDescriptor(snapshot, key));
+    if (!descriptor || !('value' in descriptor)) return undefined;
+    entries.push([key, descriptor.value]);
+  }
+  return runSpanOperation(() => new RequestContext(entries));
 }
 
 function parseGatewayCost(providerMetadata: EndGenerationOptions['providerMetadata']): number | undefined {
@@ -198,38 +235,61 @@ function appendPreparedRequestAggregate(
     providerInferenceCount: inferenceCount,
     providerMeasuredInferenceCount: measured,
     providerUnknownInferenceCount: unknown,
-    providerMessageCountTotal: previous.providerMessageCountTotal + metric.providerMessageCount,
+    providerMessageCountTotal: appendCompleteTotal(
+      previousCount,
+      previous.providerMessageCountTotal,
+      metric.providerMessageCount,
+    ),
     providerMessageBytesTotal: appendCompleteTotal(
       previousCount,
       previous.providerMessageBytesTotal,
       metric.providerMessageBytes,
     ),
-    providerSystemMessageCountTotal: previous.providerSystemMessageCountTotal + metric.providerSystemMessageCount,
+    providerSystemMessageCountTotal: appendCompleteTotal(
+      previousCount,
+      previous.providerSystemMessageCountTotal,
+      metric.providerSystemMessageCount,
+    ),
     providerSystemMessageBytesTotal: appendCompleteTotal(
       previousCount,
       previous.providerSystemMessageBytesTotal,
       metric.providerSystemMessageBytes,
     ),
-    providerUserMessageCountTotal: previous.providerUserMessageCountTotal + metric.providerUserMessageCount,
+    providerUserMessageCountTotal: appendCompleteTotal(
+      previousCount,
+      previous.providerUserMessageCountTotal,
+      metric.providerUserMessageCount,
+    ),
     providerUserMessageBytesTotal: appendCompleteTotal(
       previousCount,
       previous.providerUserMessageBytesTotal,
       metric.providerUserMessageBytes,
     ),
-    providerAssistantMessageCountTotal:
-      previous.providerAssistantMessageCountTotal + metric.providerAssistantMessageCount,
+    providerAssistantMessageCountTotal: appendCompleteTotal(
+      previousCount,
+      previous.providerAssistantMessageCountTotal,
+      metric.providerAssistantMessageCount,
+    ),
     providerAssistantMessageBytesTotal: appendCompleteTotal(
       previousCount,
       previous.providerAssistantMessageBytesTotal,
       metric.providerAssistantMessageBytes,
     ),
-    providerToolMessageCountTotal: previous.providerToolMessageCountTotal + metric.providerToolMessageCount,
+    providerToolMessageCountTotal: appendCompleteTotal(
+      previousCount,
+      previous.providerToolMessageCountTotal,
+      metric.providerToolMessageCount,
+    ),
     providerToolMessageBytesTotal: appendCompleteTotal(
       previousCount,
       previous.providerToolMessageBytesTotal,
       metric.providerToolMessageBytes,
     ),
-    providerOtherMessageCountTotal: previous.providerOtherMessageCountTotal + metric.providerOtherMessageCount,
+    providerOtherMessageCountTotal: appendCompleteTotal(
+      previousCount,
+      previous.providerOtherMessageCountTotal,
+      metric.providerOtherMessageCount,
+    ),
     providerOtherMessageBytesTotal: appendCompleteTotal(
       previousCount,
       previous.providerOtherMessageBytesTotal,
@@ -240,7 +300,11 @@ function appendPreparedRequestAggregate(
       previous.providerInstructionBytesTotal,
       metric.providerInstructionBytes,
     ),
-    providerToolCountTotal: previous.providerToolCountTotal + metric.providerToolCount,
+    providerToolCountTotal: appendCompleteTotal(
+      previousCount,
+      previous.providerToolCountTotal,
+      metric.providerToolCount,
+    ),
     providerToolSchemaBytesTotal: appendCompleteTotal(
       previousCount,
       previous.providerToolSchemaBytesTotal,
@@ -269,6 +333,90 @@ function appendPreparedRequestAggregate(
   };
 }
 
+/** Reserve one real provider attempt when request measurement is unavailable. */
+function appendUnknownPreparedRequestAggregate(
+  previous: PreparedModelRequestAggregateMetrics,
+): PreparedModelRequestAggregateMetrics {
+  const previousCount = previous.providerInferenceCount;
+  const inferenceCount = previousCount + 1;
+  const measured = previous.providerMeasuredInferenceCount;
+  const unknown = previous.providerUnknownInferenceCount + 1;
+  return {
+    providerAggregateMeasurementState: measured === 0 ? 'unknown' : 'partial',
+    providerBreakdownState: 'serialized_components_non_additive',
+    providerInferenceCount: inferenceCount,
+    providerMeasuredInferenceCount: measured,
+    providerUnknownInferenceCount: unknown,
+    providerMessageCountTotal: appendCompleteTotal(previousCount, previous.providerMessageCountTotal, undefined),
+    providerMessageBytesTotal: appendCompleteTotal(previousCount, previous.providerMessageBytesTotal, undefined),
+    providerSystemMessageCountTotal: appendCompleteTotal(
+      previousCount,
+      previous.providerSystemMessageCountTotal,
+      undefined,
+    ),
+    providerSystemMessageBytesTotal: appendCompleteTotal(
+      previousCount,
+      previous.providerSystemMessageBytesTotal,
+      undefined,
+    ),
+    providerUserMessageCountTotal: appendCompleteTotal(
+      previousCount,
+      previous.providerUserMessageCountTotal,
+      undefined,
+    ),
+    providerUserMessageBytesTotal: appendCompleteTotal(
+      previousCount,
+      previous.providerUserMessageBytesTotal,
+      undefined,
+    ),
+    providerAssistantMessageCountTotal: appendCompleteTotal(
+      previousCount,
+      previous.providerAssistantMessageCountTotal,
+      undefined,
+    ),
+    providerAssistantMessageBytesTotal: appendCompleteTotal(
+      previousCount,
+      previous.providerAssistantMessageBytesTotal,
+      undefined,
+    ),
+    providerToolMessageCountTotal: appendCompleteTotal(
+      previousCount,
+      previous.providerToolMessageCountTotal,
+      undefined,
+    ),
+    providerToolMessageBytesTotal: appendCompleteTotal(
+      previousCount,
+      previous.providerToolMessageBytesTotal,
+      undefined,
+    ),
+    providerOtherMessageCountTotal: appendCompleteTotal(
+      previousCount,
+      previous.providerOtherMessageCountTotal,
+      undefined,
+    ),
+    providerOtherMessageBytesTotal: appendCompleteTotal(
+      previousCount,
+      previous.providerOtherMessageBytesTotal,
+      undefined,
+    ),
+    providerInstructionBytesTotal: appendCompleteTotal(
+      previousCount,
+      previous.providerInstructionBytesTotal,
+      undefined,
+    ),
+    providerToolCountTotal: appendCompleteTotal(previousCount, previous.providerToolCountTotal, undefined),
+    providerToolSchemaBytesTotal: appendCompleteTotal(previousCount, previous.providerToolSchemaBytesTotal, undefined),
+    providerResponseSchemaBytesTotal: appendCompleteTotal(
+      previousCount,
+      previous.providerResponseSchemaBytesTotal,
+      undefined,
+    ),
+    providerRequestBytesTotal: appendCompleteTotal(previousCount, previous.providerRequestBytesTotal, undefined),
+    providerPreparationMsTotal: appendCompleteTotal(previousCount, previous.providerPreparationMsTotal, undefined),
+    providerMeasurementMsTotal: appendCompleteTotal(previousCount, previous.providerMeasurementMsTotal, undefined),
+  };
+}
+
 function preparedRequestAggregateFromAttributes(
   attributes: Partial<PreparedModelRequestAggregateMetrics> | undefined,
 ): PreparedModelRequestAggregateMetrics | undefined {
@@ -283,13 +431,6 @@ function preparedRequestAggregateFromAttributes(
     attributes.providerInferenceCount,
     attributes.providerMeasuredInferenceCount,
     attributes.providerUnknownInferenceCount,
-    attributes.providerMessageCountTotal,
-    attributes.providerSystemMessageCountTotal,
-    attributes.providerUserMessageCountTotal,
-    attributes.providerAssistantMessageCountTotal,
-    attributes.providerToolMessageCountTotal,
-    attributes.providerOtherMessageCountTotal,
-    attributes.providerToolCountTotal,
   ];
   if (!requiredTotals.every(value => typeof value === 'number' && Number.isInteger(value) && value >= 0)) {
     return undefined;
@@ -314,13 +455,20 @@ function preparedRequestAggregateFromAttributes(
   }
 
   const optionalIntegerTotals = [
+    attributes.providerMessageCountTotal,
     attributes.providerMessageBytesTotal,
+    attributes.providerSystemMessageCountTotal,
     attributes.providerSystemMessageBytesTotal,
+    attributes.providerUserMessageCountTotal,
     attributes.providerUserMessageBytesTotal,
+    attributes.providerAssistantMessageCountTotal,
     attributes.providerAssistantMessageBytesTotal,
+    attributes.providerToolMessageCountTotal,
     attributes.providerToolMessageBytesTotal,
+    attributes.providerOtherMessageCountTotal,
     attributes.providerOtherMessageBytesTotal,
     attributes.providerInstructionBytesTotal,
+    attributes.providerToolCountTotal,
     attributes.providerToolSchemaBytesTotal,
     attributes.providerResponseSchemaBytesTotal,
     attributes.providerRequestBytesTotal,
@@ -592,24 +740,53 @@ export class ModelSpanTracker {
   #deferStepClose: boolean = false;
   /** Stored step-finish payload when defer mode is enabled */
   #pendingStepFinishPayload?: StepFinishPayload<any, any>;
+  /** Provider finish observed before core-normalized response identity is ready. */
+  #pendingInferenceFinishPayload?: StepFinishPayload<any, any>;
+  /** Whether post-inference work has finished before step-finish was observed. */
+  #deferredStepCloseRequested: boolean = false;
+  /** Provider-returned identity for the currently open inference. */
+  #currentInferenceResponse?: { responseModel?: string; responseId?: string };
+  /** Core-normalized response identity takes precedence over raw stream metadata. */
+  #hasNormalizedInferenceResponse: boolean = false;
   /** Static request-side context applied to every MODEL_INFERENCE span */
   #inferenceContext?: ModelInferenceContext;
+  /** Generation-level request context inherited by provider-attempt spans. */
+  #requestContext?: RequestContext;
   /** Content-free rollup for all provider calls, including rebuilt durable spans. */
   #preparedRequestAggregate: PreparedModelRequestAggregateMetrics;
   /** Conservative aggregate: one missing provider report keeps the turn missing. */
   #providerUsageState?: ProviderUsageMeasurementState;
   /** Whether this generation reached a provider inference boundary. */
   #providerInferenceStarted: boolean;
+  /** Provider-attempt lifecycle is independent of exporter span creation. */
+  #currentInferenceLifecycleOpen: boolean = false;
+  /** Aggregate immediately before reserving the current unknown attempt. */
+  #preparedRequestAggregateBeforeCurrentInference?: PreparedModelRequestAggregateMetrics;
+  /** Whether the current attempt's unknown reservation was replaced by measurement. */
+  #currentInferencePreparedRequestRecorded: boolean = false;
+  #providerOutcomeCounts: {
+    providerSucceededInferenceCount: number;
+    providerErrorInferenceCount: number;
+    providerAbortedInferenceCount: number;
+  };
+  /** Terminal control-flow reason observed without a normal generation finish. */
+  #terminalGenerationFinishReason?: string;
   /** Whether the current step is expected to reach a provider boundary. */
   #currentStepInferenceApplicable: boolean = true;
 
   constructor(modelSpan?: Span<SpanType.MODEL_GENERATION>) {
     this.#modelSpan = modelSpan;
+    this.#requestContext = inheritedRequestContext(modelSpan);
     const modelAttributes = runSpanOperation(() => modelSpan?.attributes);
     this.#preparedRequestAggregate =
       runSpanOperation(() => preparedRequestAggregateFromAttributes(modelAttributes)) ??
       emptyPreparedRequestAggregate();
     this.#providerUsageState = runSpanOperation(() => modelAttributes?.providerUsageState);
+    this.#providerOutcomeCounts = {
+      providerSucceededInferenceCount: nonnegativeInteger(modelAttributes?.providerSucceededInferenceCount),
+      providerErrorInferenceCount: nonnegativeInteger(modelAttributes?.providerErrorInferenceCount),
+      providerAbortedInferenceCount: nonnegativeInteger(modelAttributes?.providerAbortedInferenceCount),
+    };
     this.#providerInferenceStarted =
       this.#preparedRequestAggregate.providerInferenceCount > 0 ||
       this.#providerUsageState === 'reported' ||
@@ -629,11 +806,54 @@ export class ModelSpanTracker {
    * to the provider adapter. The inference span is already open at this point.
    */
   recordPreparedRequest(metrics: PreparedModelRequestMetrics): void {
-    const aggregate = runSpanOperation(() => appendPreparedRequestAggregate(this.#preparedRequestAggregate, metrics));
+    const aggregateBase =
+      this.#currentInferenceLifecycleOpen &&
+      !this.#currentInferencePreparedRequestRecorded &&
+      this.#preparedRequestAggregateBeforeCurrentInference
+        ? this.#preparedRequestAggregateBeforeCurrentInference
+        : this.#preparedRequestAggregate;
+    const aggregate = runSpanOperation(() => appendPreparedRequestAggregate(aggregateBase, metrics));
     if (!aggregate) return;
     this.#preparedRequestAggregate = aggregate;
+    if (this.#currentInferenceLifecycleOpen) this.#currentInferencePreparedRequestRecorded = true;
     runSpanOperation(() => this.#currentInferenceSpan?.update({ attributes: metrics }));
     runSpanOperation(() => this.#modelSpan?.update({ attributes: aggregate }));
+  }
+
+  /** Record response identity after core has normalized provider-side fallbacks. */
+  recordResponseMetadata(metadata: { responseId?: string; responseModel?: string }): void {
+    const responseId = typeof metadata.responseId === 'string' ? metadata.responseId : undefined;
+    const responseModel = typeof metadata.responseModel === 'string' ? metadata.responseModel : undefined;
+    if (responseId === undefined && responseModel === undefined) return;
+    const attributes = {
+      ...(responseId === undefined ? {} : { responseId }),
+      ...(responseModel === undefined ? {} : { responseModel }),
+    };
+    this.#hasNormalizedInferenceResponse = true;
+    this.#currentInferenceResponse = { ...this.#currentInferenceResponse, ...attributes };
+    runSpanOperation(() => this.#currentInferenceSpan?.update({ attributes }));
+  }
+
+  #startProviderInferenceLifecycle(): boolean {
+    if (this.#currentInferenceLifecycleOpen) return false;
+    this.#providerInferenceStarted = true;
+    this.#currentInferenceLifecycleOpen = true;
+    this.#currentInferencePreparedRequestRecorded = false;
+    this.#preparedRequestAggregateBeforeCurrentInference = this.#preparedRequestAggregate;
+    this.#preparedRequestAggregate = appendUnknownPreparedRequestAggregate(this.#preparedRequestAggregate);
+    runSpanOperation(() => this.#modelSpan?.update({ attributes: this.#preparedRequestAggregate }));
+    return true;
+  }
+
+  #recordProviderOutcome(outcome: ProviderInferenceOutcome): void {
+    if (!this.#currentInferenceLifecycleOpen) return;
+    this.#currentInferenceLifecycleOpen = false;
+    this.#currentInferencePreparedRequestRecorded = false;
+    this.#preparedRequestAggregateBeforeCurrentInference = undefined;
+    if (outcome === 'success') this.#providerOutcomeCounts.providerSucceededInferenceCount++;
+    else if (outcome === 'error') this.#providerOutcomeCounts.providerErrorInferenceCount++;
+    else this.#providerOutcomeCounts.providerAbortedInferenceCount++;
+    runSpanOperation(() => this.#modelSpan?.update({ attributes: this.#providerOutcomeCounts }));
   }
 
   /**
@@ -668,16 +888,33 @@ export class ModelSpanTracker {
     this.#endChunkSpan();
     const inferenceSpan = this.#currentInferenceSpan;
     const stepSpan = this.#currentStepSpan;
-    const providerInferenceEndedWithoutUsage = inferenceSpan !== undefined;
+    const completionStartTime = this.#currentInferenceCompletionStartTime;
+    const inferenceResponse = this.#currentInferenceResponse;
+    const providerInferenceEndedWithoutUsage = inferenceSpan !== undefined || this.#currentInferenceLifecycleOpen;
+    const providerOutcome: Extract<ProviderInferenceOutcome, 'error' | 'abort'> = isDescriptorSafeAbortError(
+      options.error,
+    )
+      ? 'abort'
+      : 'error';
     this.#currentInferenceSpan = undefined;
     this.#currentInferenceCompletionStartTime = undefined;
+    this.#currentInferenceResponse = undefined;
+    this.#hasNormalizedInferenceResponse = false;
     if (stepSpan) this.#resetCurrentStep();
+    this.#recordProviderOutcome(providerOutcome);
+    if (providerOutcome === 'abort') this.#terminalGenerationFinishReason = 'abort';
 
     runSpanOperation(() =>
       inferenceSpan?.error({
         error: options.error,
         endSpan: true,
-        attributes: providerUsageStates(undefined, {}),
+        attributes: {
+          ...providerUsageStates(undefined, {}),
+          providerOutcome,
+          ...(providerOutcome === 'abort' ? { finishReason: 'abort' } : {}),
+          ...(completionStartTime === undefined ? {} : { completionStartTime }),
+          ...inferenceResponse,
+        },
       }),
     );
     runSpanOperation(() => stepSpan?.error({ error: options.error, endSpan: true }));
@@ -691,7 +928,9 @@ export class ModelSpanTracker {
         ...options,
         attributes: {
           ...options.attributes,
+          ...(providerOutcome === 'abort' ? { finishReason: 'abort' } : {}),
           ...this.#preparedRequestAggregate,
+          ...this.#providerOutcomeCounts,
           providerUsageState: this.#providerUsageState,
         },
       }),
@@ -703,6 +942,17 @@ export class ModelSpanTracker {
    * If usage is provided, it will be converted to UsageStats with cache token details.
    */
   endGeneration(options?: EndGenerationOptions): void {
+    if (this.#currentStepSpan) {
+      const finishReason = runSpanOperation(() => options?.attributes?.finishReason);
+      const pendingInferenceFinish = this.#pendingInferenceFinishPayload;
+      if (pendingInferenceFinish) this.#endInferenceSpan(pendingInferenceFinish);
+      this.endStep({
+        attributes: {
+          finishReason: typeof finishReason === 'string' ? finishReason : 'unknown',
+          isContinued: false,
+        },
+      });
+    }
     runSpanOperation(() => {
       const { usage, providerMetadata, stepProviderMetadata, ...spanOptions } = options ?? {};
       const normalizedUsage = extractUsageMetrics(usage, providerMetadata);
@@ -720,7 +970,11 @@ export class ModelSpanTracker {
         ...spanOptions,
         attributes: {
           ...spanOptions.attributes,
+          ...(spanOptions.attributes?.finishReason === undefined && this.#terminalGenerationFinishReason !== undefined
+            ? { finishReason: this.#terminalGenerationFinishReason }
+            : {}),
           ...this.#preparedRequestAggregate,
+          ...this.#providerOutcomeCounts,
           completionStartTime: this.#completionStartTime,
           usage: normalizedUsage,
           providerUsageState,
@@ -744,6 +998,21 @@ export class ModelSpanTracker {
    */
   setDeferStepClose(defer: boolean): void {
     this.#deferStepClose = defer;
+  }
+
+  /** Close a deferred step without racing the asynchronously consumed stream. */
+  endDeferredStep(payload?: StepFinishPayload<any, any>): void {
+    if (!this.#currentStepSpan) return;
+    if (payload) {
+      this.#endStepSpan(payload);
+      return;
+    }
+    const pendingPayload = this.#pendingStepFinishPayload;
+    if (pendingPayload) {
+      this.#endStepSpan(pendingPayload);
+      return;
+    }
+    this.#deferredStepCloseRequested = true;
   }
 
   /**
@@ -804,11 +1073,15 @@ export class ModelSpanTracker {
           ...(payload?.warnings?.length ? { warnings: payload.warnings } : {}),
         },
         input,
+        requestContext: this.#requestContext,
         tracingPolicy: this.#modelSpan?.tracingPolicy,
       });
     });
     this.#currentStepInputIsFinal = runSpanOperation(() => Array.isArray(payload?.inputMessages)) ?? false;
     this.#currentStepInferenceApplicable = true;
+    this.#deferredStepCloseRequested = false;
+    this.#currentInferenceResponse = undefined;
+    this.#hasNormalizedInferenceResponse = false;
     // Reset chunk sequence for new step
     this.#chunkSequence = 0;
   }
@@ -817,12 +1090,34 @@ export class ModelSpanTracker {
   endStep(options?: EndSpanOptions<SpanType.MODEL_STEP>): void {
     this.#endChunkSpan();
     const inferenceSpan = this.#currentInferenceSpan;
+    const completionStartTime = this.#currentInferenceCompletionStartTime;
+    const inferenceResponse = this.#currentInferenceResponse;
+    const finishReason = runSpanOperation(() => options?.attributes?.finishReason);
     this.#currentInferenceSpan = undefined;
-    if (inferenceSpan) {
-      this.#currentInferenceCompletionStartTime = undefined;
+    this.#currentInferenceCompletionStartTime = undefined;
+    this.#currentInferenceResponse = undefined;
+    this.#hasNormalizedInferenceResponse = false;
+    if (inferenceSpan || this.#currentInferenceLifecycleOpen) {
+      const providerOutcome: ProviderInferenceOutcome =
+        finishReason === 'abort' || finishReason === 'tripwire' ? 'abort' : 'error';
+      this.#recordProviderOutcome(providerOutcome);
       this.#providerUsageState = 'provider_not_reported';
-      runSpanOperation(() => inferenceSpan.end({ attributes: providerUsageStates(undefined, {}) }));
+      runSpanOperation(() =>
+        inferenceSpan?.end({
+          attributes: {
+            ...providerUsageStates(undefined, {}),
+            providerOutcome,
+            ...(typeof finishReason === 'string' ? { finishReason } : {}),
+            ...(completionStartTime === undefined ? {} : { completionStartTime }),
+            ...inferenceResponse,
+          },
+        }),
+      );
       runSpanOperation(() => this.#modelSpan?.update({ attributes: { providerUsageState: this.#providerUsageState } }));
+    }
+    if (finishReason === 'abort') {
+      this.#terminalGenerationFinishReason = finishReason;
+      runSpanOperation(() => this.#modelSpan?.update({ attributes: { finishReason } }));
     }
     const stepSpan = this.#currentStepSpan;
     if (!stepSpan) return;
@@ -833,7 +1128,7 @@ export class ModelSpanTracker {
   /** Error the active step without closing its generation. */
   reportStepError(options: ErrorSpanOptions<SpanType.MODEL_STEP>): void {
     this.#endChunkSpan();
-    if (this.#currentInferenceSpan) {
+    if (this.#currentInferenceSpan || this.#currentInferenceLifecycleOpen) {
       this.reportInferenceError({ error: options.error });
     }
     const stepSpan = this.#currentStepSpan;
@@ -850,40 +1145,64 @@ export class ModelSpanTracker {
    *
    * Safe to call multiple times - no-ops if the span is already closed.
    */
-  #endInferenceSpan<OUTPUT>(payload: StepFinishPayload<any, OUTPUT>): void {
+  #endInferenceSpan(payload: ModelInferenceFinishPayload): void {
     const inferenceSpan = this.#currentInferenceSpan;
-    if (!inferenceSpan) return;
+    if (!inferenceSpan && !this.#currentInferenceLifecycleOpen) return;
+    this.#endChunkSpan();
     const completionStartTime = this.#currentInferenceCompletionStartTime;
+    const inferenceResponse = this.#currentInferenceResponse;
     this.#currentInferenceSpan = undefined;
     this.#currentInferenceCompletionStartTime = undefined;
+    this.#currentInferenceResponse = undefined;
+    this.#hasNormalizedInferenceResponse = false;
+    this.#pendingInferenceFinishPayload = undefined;
+    const providerOutcome: ProviderInferenceOutcome =
+      payload.stepResult.reason === 'abort' ? 'abort' : payload.stepResult.reason === 'error' ? 'error' : 'success';
+    this.#recordProviderOutcome(providerOutcome);
+    if (providerOutcome === 'abort') this.#terminalGenerationFinishReason = 'abort';
+    this.#currentStepInferenceApplicable = false;
 
     let endedWithOutput = false;
-    runSpanOperation(() => {
-      const { usage: rawUsage, ...otherOutput } = payload.output;
-      const usage = extractUsageMetrics(rawUsage, payload.metadata?.providerMetadata);
-      const usageStates = providerUsageStates(rawUsage, usage);
-      this.#providerUsageState =
-        this.#providerUsageState === 'provider_not_reported' ||
-        usageStates.providerUsageState === 'provider_not_reported'
-          ? 'provider_not_reported'
-          : 'reported';
-      runSpanOperation(() => this.#modelSpan?.update({ attributes: { providerUsageState: this.#providerUsageState } }));
-      inferenceSpan.end({
-        output: otherOutput,
-        attributes: {
-          usage,
-          finishReason: payload.stepResult.reason,
-          warnings: payload.stepResult.warnings,
-          completionStartTime,
-          ...usageStates,
-        },
+    if (inferenceSpan)
+      runSpanOperation(() => {
+        const { usage: rawUsage, ...otherOutput } = payload.output;
+        const usage = extractUsageMetrics(rawUsage, payload.metadata?.providerMetadata);
+        const usageStates = providerUsageStates(rawUsage, usage);
+        this.#providerUsageState =
+          this.#providerUsageState === 'provider_not_reported' ||
+          usageStates.providerUsageState === 'provider_not_reported'
+            ? 'provider_not_reported'
+            : 'reported';
+        runSpanOperation(() =>
+          this.#modelSpan?.update({ attributes: { providerUsageState: this.#providerUsageState } }),
+        );
+        inferenceSpan.end({
+          output: otherOutput,
+          attributes: {
+            usage,
+            finishReason: payload.stepResult.reason,
+            warnings: payload.stepResult.warnings,
+            completionStartTime,
+            ...inferenceResponse,
+            ...usageStates,
+            providerOutcome,
+          },
+        });
+        endedWithOutput = true;
       });
-      endedWithOutput = true;
-    });
-    if (!endedWithOutput) {
+    if (inferenceSpan && !endedWithOutput) {
       this.#providerUsageState = 'provider_not_reported';
       runSpanOperation(() => this.#modelSpan?.update({ attributes: { providerUsageState: this.#providerUsageState } }));
-      runSpanOperation(() => inferenceSpan.end({ attributes: providerUsageStates(undefined, {}) }));
+      runSpanOperation(() =>
+        inferenceSpan.end({
+          attributes: {
+            ...providerUsageStates(undefined, {}),
+            ...(completionStartTime === undefined ? {} : { completionStartTime }),
+            ...inferenceResponse,
+            providerOutcome,
+          },
+        }),
+      );
     }
   }
 
@@ -906,14 +1225,13 @@ export class ModelSpanTracker {
     if (!this.#currentStepSpan || !this.#currentStepInferenceApplicable) {
       return;
     }
-    this.#providerInferenceStarted = true;
-    if (runSpanOperation(supportsModelInference) !== true) return;
-    if (this.#currentInferenceSpan) {
+    if (!this.#startProviderInferenceLifecycle()) {
       if (providerAttempt !== undefined) {
         runSpanOperation(() => this.#currentInferenceSpan?.update({ attributes: { providerAttempt } }));
       }
       return;
     }
+    if (runSpanOperation(supportsModelInference) !== true) return;
 
     this.#currentInferenceCompletionStartTime = undefined;
     const stepSpan = this.#currentStepSpan;
@@ -937,18 +1255,36 @@ export class ModelSpanTracker {
           ...(ctx?.responseFormat !== undefined ? { responseFormat: ctx.responseFormat } : {}),
         },
         input,
+        requestContext: this.#requestContext,
         tracingPolicy: this.#modelSpan?.tracingPolicy,
       });
     });
   }
 
-  /** Close a failed provider attempt while retaining its parent step for retry. */
-  reportInferenceError(options: ErrorSpanOptions<SpanType.MODEL_INFERENCE>): void {
+  /** Record first semantic content before adapter buffering can hide a later stream error. */
+  recordInferenceContentStart(): void {
+    this.#captureCompletionStartTime();
+  }
+
+  #reportInferenceFailure(
+    options: ErrorSpanOptions<SpanType.MODEL_INFERENCE>,
+    providerOutcome: Extract<ProviderInferenceOutcome, 'error' | 'abort'>,
+  ): void {
     const inferenceSpan = this.#currentInferenceSpan;
-    if (!inferenceSpan) return;
+    if (!inferenceSpan && !this.#currentInferenceLifecycleOpen) return;
+    this.#endChunkSpan();
+    const completionStartTime = this.#currentInferenceCompletionStartTime;
+    const inferenceResponse = this.#currentInferenceResponse;
     this.#currentInferenceSpan = undefined;
     this.#currentInferenceCompletionStartTime = undefined;
+    this.#currentInferenceResponse = undefined;
+    this.#hasNormalizedInferenceResponse = false;
+    this.#pendingInferenceFinishPayload = undefined;
+    this.#recordProviderOutcome(providerOutcome);
     this.#providerUsageState = 'provider_not_reported';
+    if (providerOutcome === 'abort') {
+      this.#terminalGenerationFinishReason = 'abort';
+    }
     runSpanOperation(() =>
       inferenceSpan.error({
         ...options,
@@ -956,10 +1292,37 @@ export class ModelSpanTracker {
         attributes: {
           ...options.attributes,
           ...providerUsageStates(undefined, {}),
+          providerOutcome,
+          ...(providerOutcome === 'abort' ? { finishReason: 'abort' } : {}),
+          ...(completionStartTime === undefined ? {} : { completionStartTime }),
+          ...inferenceResponse,
         },
       }),
     );
-    runSpanOperation(() => this.#modelSpan?.update({ attributes: { providerUsageState: this.#providerUsageState } }));
+    runSpanOperation(() =>
+      this.#modelSpan?.update({
+        attributes: {
+          providerUsageState: this.#providerUsageState,
+          ...(providerOutcome === 'abort' ? { finishReason: 'abort' } : {}),
+        },
+      }),
+    );
+  }
+
+  /** Close a failed provider attempt while retaining its parent step for retry. */
+  reportInferenceError(options: ErrorSpanOptions<SpanType.MODEL_INFERENCE>): void {
+    this.#reportInferenceFailure(options, isDescriptorSafeAbortError(options.error) ? 'abort' : 'error');
+  }
+
+  /** Close a cancelled provider attempt while retaining its parent step. */
+  reportInferenceAbort(options: ErrorSpanOptions<SpanType.MODEL_INFERENCE>): void {
+    this.#reportInferenceFailure(options, 'abort');
+  }
+
+  /** Close at the inner provider finish boundary after core normalization. */
+  endInference(payload?: ModelInferenceFinishPayload): void {
+    const pendingPayload = payload ?? this.#pendingInferenceFinishPayload;
+    if (pendingPayload) this.#endInferenceSpan(pendingPayload);
   }
 
   /** Prevent replayed cache chunks from fabricating a provider inference. */
@@ -993,6 +1356,21 @@ export class ModelSpanTracker {
         this.#currentStepInputIsFinal = true;
       }
     });
+  }
+
+  /** Capture provider-returned response identity without invoking payload hooks. */
+  #recordInferenceResponse(payload: unknown): void {
+    if (this.#hasNormalizedInferenceResponse) return;
+    const responseId = ownStringDataProperty(payload, 'id');
+    const responseModel = ownStringDataProperty(payload, 'modelId');
+    if (responseId === undefined && responseModel === undefined) return;
+
+    const attributes = {
+      ...(responseId === undefined ? {} : { responseId }),
+      ...(responseModel === undefined ? {} : { responseModel }),
+    };
+    this.#currentInferenceResponse = { ...this.#currentInferenceResponse, ...attributes };
+    runSpanOperation(() => this.#currentInferenceSpan?.update({ attributes }));
   }
 
   /**
@@ -1051,6 +1429,10 @@ export class ModelSpanTracker {
     this.#currentStepInputIsFinal = false;
     this.#currentStepInferenceApplicable = true;
     this.#pendingStepFinishPayload = undefined;
+    this.#pendingInferenceFinishPayload = undefined;
+    this.#deferredStepCloseRequested = false;
+    this.#currentInferenceResponse = undefined;
+    this.#hasNormalizedInferenceResponse = false;
     this.#stepIndex++;
   }
 
@@ -1313,6 +1695,35 @@ export class ModelSpanTracker {
     }
   }
   /**
+   * Observe the outer workflow boundary without reprocessing provider chunks.
+   * Regular agents use this wrapper so MODEL_STEP remains live through output
+   * processors and client tools while the inner provider wrapper owns precise
+   * MODEL_INFERENCE / MODEL_CHUNK timing.
+   */
+  wrapStepStream<T extends { pipeThrough: Function }>(stream: T): T {
+    return stream.pipeThrough(
+      new TransformStream({
+        transform: (chunk, controller) => {
+          runSpanOperation(() => {
+            switch (chunk.type) {
+              case 'step-finish':
+                this.#endStepSpan(chunk.payload);
+                break;
+              case 'abort':
+                this.endStep({ attributes: { finishReason: 'abort', isContinued: false } });
+                break;
+              case 'tripwire':
+                this.endStep({ attributes: { finishReason: 'tripwire', isContinued: false } });
+                break;
+            }
+          });
+          controller.enqueue(chunk);
+        },
+      }),
+    ) as T;
+  }
+
+  /**
    * Wraps a stream with model tracing transform to track MODEL_STEP and MODEL_CHUNK spans.
    *
    * This should be added to the stream pipeline to automatically
@@ -1335,8 +1746,6 @@ export class ModelSpanTracker {
                 break;
             }
           });
-
-          controller.enqueue(chunk);
 
           // Handle chunk span tracking based on chunk type
           runSpanOperation(() => {
@@ -1391,23 +1800,40 @@ export class ModelSpanTracker {
                   this.#pendingStepFinishPayload = chunk.payload;
                   this.#endChunkSpan();
                   this.#endInferenceSpan(chunk.payload);
+                  if (this.#deferredStepCloseRequested) {
+                    this.#endStepSpan(chunk.payload);
+                  }
                 } else {
                   // Normal mode: close the step immediately
                   this.#endStepSpan(chunk.payload);
                 }
                 break;
 
+              case 'finish':
+                if (this.#currentInferenceLifecycleOpen) {
+                  this.#pendingInferenceFinishPayload = chunk.payload;
+                  this.#endChunkSpan();
+                }
+                break;
+
+              case 'response-metadata': // Response metadata (not semantic content)
+                this.#recordInferenceResponse(chunk.payload);
+                break;
+              case 'abort': // Terminal abort may arrive without step-finish
+                this.endStep({ attributes: { finishReason: 'abort', isContinued: false } });
+                break;
+
+              case 'tripwire': // Terminal processor bail may arrive without step-finish
+                this.endStep({ attributes: { finishReason: 'tripwire', isContinued: false } });
+                break;
+
               // Infrastructure chunks - skip creating spans for these
               // They are either redundant, metadata-only, or error/control flow
               case 'raw': // Redundant raw data
               case 'start': // Stream start marker
-              case 'finish': // Stream finish marker (step-finish already captures this)
-              case 'response-metadata': // Response metadata (not semantic content)
               case 'source': // Source references (metadata)
               case 'file': // Binary file data (too large/not semantic)
               case 'error': // Error handling
-              case 'abort': // Abort signal
-              case 'tripwire': // Processor rejection
               case 'watch': // Internal watch event
               case 'tool-error': // Tool error handling
               case 'tool-call-suspended': // Suspension (not content)
@@ -1471,6 +1897,12 @@ export class ModelSpanTracker {
                 break;
             }
           });
+
+          // Observe the provider boundary before releasing the chunk to the
+          // workflow queue. A fast provider and slow consumer must not let a
+          // later finish close MODEL_INFERENCE before its semantic chunks (or
+          // terminal abort) have been attributed.
+          controller.enqueue(chunk);
         },
       }),
     ) as T;

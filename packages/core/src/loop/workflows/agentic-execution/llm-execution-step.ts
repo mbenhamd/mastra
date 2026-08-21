@@ -1,4 +1,5 @@
 import { ReadableStream, TransformStream } from 'node:stream/web';
+import { isProxy } from 'node:util/types';
 import { isAbortError } from '@ai-sdk/provider-utils-v5';
 import type { LanguageModelV2Usage } from '@ai-sdk/provider-v5';
 import { APICallError, generateId } from '@internal/ai-sdk-v5';
@@ -24,6 +25,7 @@ import { isSupportedLanguageModel, supportedLanguageModelSpecifications } from '
 import { getErrorFromUnknown } from '../../../error/utils.js';
 import { mergeProviderOptions } from '../../../llm/model/provider-options';
 import { ModelRouterLanguageModel } from '../../../llm/model/router';
+import { resolveResponseModelId } from '../../../llm/model/server-side-fallback';
 import type { MastraLanguageModel, SharedProviderOptions } from '../../../llm/model/shared.types';
 import type { IMastraLogger } from '../../../logger';
 import { ConsoleLogger } from '../../../logger';
@@ -36,6 +38,7 @@ import type {
   ObservabilityContext,
   TracingContext,
 } from '../../../observability';
+import { createExactJsonMeasurementSnapshot } from '../../../observability/content-free-measurement';
 import { executeWithContextSync, getRootExportSpan, getStepAvailableToolNames } from '../../../observability/utils';
 import type {
   CachedLLMStepResponse,
@@ -122,6 +125,52 @@ import { notifyToolDenied } from './tool-permission-notify';
  *   refusal, so the run would hang indefinitely.
  */
 const TERMINAL_FINISH_REASONS = ['stop', 'error', 'length', 'content-filter'];
+
+function asTracingError(value: unknown, fallbackMessage: string): Error {
+  try {
+    if (value instanceof Error) return value;
+  } catch {
+    // A hostile proxy can reject prototype inspection.
+  }
+  return new Error(fallbackMessage);
+}
+
+function ownDataProperty(value: unknown, key: string): unknown {
+  if (!value || typeof value !== 'object') return undefined;
+  try {
+    if (isProxy(value)) return undefined;
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor && 'value' in descriptor ? descriptor.value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function descriptorSafeResponseMetadata(payload: unknown) {
+  const id = ownDataProperty(payload, 'id');
+  const modelId = ownDataProperty(payload, 'modelId');
+  const timestamp = ownDataProperty(payload, 'timestamp');
+  const headers = ownDataProperty(payload, 'headers');
+  return {
+    ...(typeof id === 'string' ? { id } : {}),
+    ...(typeof modelId === 'string' ? { modelId } : {}),
+    ...(timestamp === undefined ? {} : { timestamp }),
+    ...(headers === undefined ? {} : { headers }),
+  };
+}
+
+function detachedResponseProviderMetadata(providerMetadata: unknown): Record<string, unknown> | undefined {
+  const measurement = createExactJsonMeasurementSnapshot(providerMetadata);
+  if (measurement.state !== 'measured') return undefined;
+  try {
+    const detached = JSON.parse(JSON.stringify(measurement.snapshot));
+    return detached && typeof detached === 'object' && !Array.isArray(detached)
+      ? (detached as Record<string, unknown>)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 function localToolCallPayloadIsComplete(toolCall: { args?: unknown; input?: unknown }): boolean {
   const raw = toolCall.args ?? toolCall.input;
@@ -859,14 +908,7 @@ async function processOutputStream<OUTPUT = undefined>({
 
     switch (chunk.type) {
       case 'response-metadata':
-        runState.setState({
-          responseMetadata: {
-            id: chunk.payload.id,
-            timestamp: chunk.payload.timestamp,
-            modelId: chunk.payload.modelId,
-            headers: chunk.payload.headers,
-          },
-        });
+        runState.setState({ responseMetadata: descriptorSafeResponseMetadata(chunk.payload) });
         break;
 
       case 'tool-call-input-streaming-start': {
@@ -907,9 +949,26 @@ async function processOutputStream<OUTPUT = undefined>({
         break;
       }
 
-      case 'finish':
+      case 'finish': {
+        const finishMetadata = ownDataProperty(chunk.payload, 'metadata');
+        const providerMetadata = detachedResponseProviderMetadata(
+          ownDataProperty(finishMetadata, 'providerMetadata') ?? ownDataProperty(chunk.payload, 'providerMetadata'),
+        );
+        try {
+          modelSpanTracker?.recordResponseMetadata?.({
+            responseId: runState.state.responseMetadata?.id,
+            responseModel: resolveResponseModelId(providerMetadata, runState.state.responseMetadata?.modelId),
+          });
+        } catch {
+          // Response attribution must never affect stream processing.
+        }
+        try {
+          modelSpanTracker?.endInference?.(chunk.payload);
+        } catch {
+          // Tracing must never affect stream processing.
+        }
         runState.setState({
-          providerOptions: chunk.payload.metadata?.providerMetadata ?? chunk.payload.providerMetadata,
+          providerOptions: providerMetadata,
           stepResult: {
             reason: chunk.payload.reason,
             logprobs: chunk.payload.logprobs,
@@ -922,6 +981,7 @@ async function processOutputStream<OUTPUT = undefined>({
           },
         });
         break;
+      }
 
       case 'error':
         if (isAbortError(chunk.payload.error) && options?.abortSignal?.aborted) {
@@ -1223,9 +1283,21 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
       let currentMessageId = inputData.isTaskCompleteCheckFailed
         ? `${messageIdPassed}-${currentIteration}`
         : inputData.messageId || messageIdPassed;
-      // Start the MODEL_STEP span at the beginning of LLM execution
-      modelSpanTracker?.startStep();
-
+      try {
+        // Open MODEL_STEP before any step-owned processor work. The outer
+        // workflow stream closes it from the authoritative step-finish emitted
+        // after output processors and client tool execution.
+        modelSpanTracker?.startStep();
+      } catch {
+        // Tracing must never affect model or processor control flow.
+      }
+      const currentModelStepTracingContext = () => {
+        try {
+          return modelSpanTracker?.getTracingContext() ?? tracingContext;
+        } catch {
+          return tracingContext;
+        }
+      };
       let modelResult: ReturnType<typeof execute> | undefined;
       let warnings: any;
       let request: any;
@@ -1236,6 +1308,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
       let responseRecoveryStep = false;
       let toolExecutionDisabled = false;
       let providerToolChunkSuppressed = false;
+      let providerAttemptCount = 0;
       // Tool-call ids already surfaced to the stream when a follow-up signal
       // interjected. Only tool calls that were NOT yet emitted are discarded;
       // already-visible calls must still be executed so they never orphan.
@@ -1369,8 +1442,6 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
 
           try {
             // Use MODEL_STEP context so step processor spans are children of MODEL_STEP
-            const stepTracingContext = modelSpanTracker?.getTracingContext() ?? tracingContext;
-
             // Create a ProcessorStreamWriter from outputWriter if available.
             // Forward any processor-supplied options (e.g. a future `transient`
             // flag) and override messageId so the step always owns the
@@ -1385,7 +1456,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
             const processInputStepResult = await processorRunner.runProcessInputStep({
               messageList,
               stepNumber: inputData.output?.steps?.length || 0,
-              ...createObservabilityContext(stepTracingContext),
+              ...createObservabilityContext(currentModelStepTracingContext()),
               requestContext,
               memory: readScoped(scopeCtx, MEMORY_KEY, 'memory'),
               resourceId: readScoped(scopeCtx, RESOURCE_ID_KEY, 'resourceId'),
@@ -1819,8 +1890,6 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
             toolChoice: currentStep.toolChoice as ModelInferenceContext['toolChoice'],
             responseFormat: currentStep.structuredOutput ? 'json_schema' : undefined,
           });
-          modelSpanTracker?.startInference?.();
-
           modelResult = executeWithContextSync({
             span: modelSpanTracker?.getTracingContext()?.currentSpan,
             fn: () =>
@@ -1852,17 +1921,22 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                 }),
                 methodType,
                 generateId: readScoped(scopeCtx, GENERATE_ID_KEY, 'generateId'),
+                providerAttemptOffset: providerAttemptCount,
                 ...(typeof modelSpanTracker?.recordPreparedRequest === 'function'
                   ? {
                       onPreparedRequest: metrics => modelSpanTracker.recordPreparedRequest?.(metrics),
                     }
                   : {}),
-                onProviderAttemptStart: providerAttempt =>
-                  modelSpanTracker?.startInference?.(undefined, providerAttempt),
-                onProviderAttemptError: ({ error }) =>
-                  modelSpanTracker?.reportInferenceError?.({
-                    error: error instanceof Error ? error : new Error('Provider attempt failed'),
-                  }),
+                onProviderAttemptStart: providerAttempt => {
+                  providerAttemptCount = providerAttempt;
+                  modelSpanTracker?.startInference?.(undefined, providerAttempt);
+                },
+                onProviderAttemptError: ({ error, aborted }) => {
+                  const tracingError = asTracingError(error, 'Provider attempt failed');
+                  if (aborted) modelSpanTracker?.reportInferenceAbort?.({ error: tracingError });
+                  else modelSpanTracker?.reportInferenceError?.({ error: tracingError });
+                },
+                onProviderFirstContent: () => modelSpanTracker?.recordInferenceContentStart?.(),
                 onResult: ({
                   warnings: warningsFromStream,
                   request: requestFromStream,
@@ -1919,13 +1993,23 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
             )
           : modelResult;
 
+        // Observe provider chunks before they enter the workflow queue. The
+        // outer wrapper owns only MODEL_STEP closure; this inner boundary owns
+        // MODEL_INFERENCE/chunk timing and is not subject to consumer backpressure.
+        let trackedModelResult = guardedModelResult;
+        try {
+          trackedModelResult = modelSpanTracker?.wrapStream(guardedModelResult) ?? guardedModelResult;
+        } catch {
+          // Tracing must never affect provider stream behavior.
+        }
+
         const outputStream = new MastraModelOutput<OUTPUT>({
           model: {
             modelId: currentStep.model.modelId,
             provider: currentStep.model.provider,
             version: currentStep.model.specificationVersion,
           },
-          stream: guardedModelResult as ReadableStream<ChunkType<OUTPUT>>,
+          stream: trackedModelResult as ReadableStream<ChunkType<OUTPUT>>,
           messageList,
           messageId: currentStep.messageId,
           options: {
@@ -2110,6 +2194,12 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
             safeEnqueue(controller, { type: 'abort', runId, from: ChunkFrom.AGENT, payload: {} });
 
             return { callBail: true, outputStream, runState, stepTools: currentStep.tools };
+          }
+
+          try {
+            modelSpanTracker?.reportInferenceError?.({ error: asTracingError(error, 'Model stream failed') });
+          } catch {
+            // Tracing must never affect fallback or error-processor behavior.
           }
 
           const isUpstreamError = APICallError.isInstance(error);
@@ -2487,8 +2577,6 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
           const currentRetryCount = inputData.processorRetryCount || 0;
 
           // Use MODEL_STEP context so step processor spans are children of MODEL_STEP
-          const outputStepTracingContext = modelSpanTracker?.getTracingContext() ?? tracingContext;
-
           // Create a ProcessorStreamWriter from outputWriter if available.
           // Forward any processor-supplied options and override messageId so
           // the step always owns the response id for persisted data-* chunks.
@@ -2509,7 +2597,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
             toolCalls: toolCallInfos.length > 0 ? toolCallInfos : undefined,
             text: immediateText,
             usage: outputStream._getImmediateUsage(),
-            ...createObservabilityContext(outputStepTracingContext),
+            ...createObservabilityContext(currentModelStepTracingContext()),
             requestContext,
             retryCount: currentRetryCount,
             writer: processorWriter,

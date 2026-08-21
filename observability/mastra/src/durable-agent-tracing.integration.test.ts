@@ -87,6 +87,143 @@ function abortableModel() {
   return { model: new MockLanguageModelV2({ doStream: doStream as any }), doStream };
 }
 
+function streamThenError(parts: unknown[], error: Error) {
+  let index = 0;
+  return new ReadableStream({
+    async pull(controller) {
+      // Force each part through the adapter before the terminal rejection so
+      // this exercises a real mid-stream failure rather than a queued error.
+      await new Promise(resolve => setTimeout(resolve, 0));
+      if (index < parts.length) {
+        controller.enqueue(parts[index++]);
+      } else {
+        controller.error(error);
+      }
+    },
+  });
+}
+
+function providerAbortChunkModel() {
+  const abortError = new Error('Provider aborted the stream');
+  abortError.name = 'AbortError';
+  const doStream = vi.fn(async () => ({
+    stream: streamThenError(
+      [
+        { type: 'stream-start', warnings: [] },
+        {
+          type: 'response-metadata',
+          id: 'provider-abort-id',
+          modelId: 'provider-abort-model',
+          timestamp: new Date(0),
+        },
+        { type: 'text-start', id: 'abort-text' },
+        { type: 'text-delta', id: 'abort-text', delta: 'partial' },
+      ],
+      abortError,
+    ),
+    rawCall: { rawPrompt: null, rawSettings: {} },
+    warnings: [],
+  }));
+  return {
+    model: new MockLanguageModelV2({
+      provider: 'abort-provider',
+      modelId: 'requested-abort-model',
+      doStream: doStream as any,
+    }),
+    doStream,
+  };
+}
+
+function responseIdentityModel(responseId: string, responseModel: string, providerMetadata?: Record<string, unknown>) {
+  return new MockLanguageModelV2({
+    provider: 'identity-provider',
+    modelId: 'requested-model',
+    doStream: async () => ({
+      stream: convertArrayToReadableStream([
+        { type: 'stream-start', warnings: [] },
+        { type: 'response-metadata', id: responseId, modelId: responseModel, timestamp: new Date(0) },
+        { type: 'text-start', id: 'identity-text' },
+        { type: 'text-delta', id: 'identity-text', delta: 'served' },
+        { type: 'text-end', id: 'identity-text' },
+        {
+          type: 'finish',
+          finishReason: 'stop',
+          usage: { inputTokens: 4, outputTokens: 2, totalTokens: 6 },
+          providerMetadata,
+        },
+      ]),
+      rawCall: { rawPrompt: null, rawSettings: {} },
+      warnings: [],
+    }),
+  });
+}
+
+function fallbackModelPair() {
+  const primaryDoStream = vi.fn(async () => {
+    throw new Error('primary unavailable');
+  });
+  const fallbackDoStream = vi.fn(async () => ({
+    stream: convertArrayToReadableStream([
+      { type: 'stream-start', warnings: [] },
+      { type: 'response-metadata', id: 'fallback-id', modelId: 'fallback-model', timestamp: new Date(0) },
+      { type: 'text-start', id: 'fallback-text' },
+      { type: 'text-delta', id: 'fallback-text', delta: 'fallback response' },
+      { type: 'text-end', id: 'fallback-text' },
+      { type: 'finish', finishReason: 'stop', usage: { inputTokens: 6, outputTokens: 3, totalTokens: 9 } },
+    ]),
+    rawCall: { rawPrompt: null, rawSettings: {} },
+    warnings: [],
+  }));
+  return {
+    primary: new MockLanguageModelV2({
+      provider: 'primary-provider',
+      modelId: 'primary-model',
+      doStream: primaryDoStream,
+    }),
+    fallback: new MockLanguageModelV2({
+      provider: 'fallback-provider',
+      modelId: 'fallback-model',
+      doStream: fallbackDoStream,
+    }),
+    primaryDoStream,
+    fallbackDoStream,
+  };
+}
+
+function partialErrorThenTextModel() {
+  const doStream = vi.fn(async () => {
+    const firstAttempt = doStream.mock.calls.length === 1;
+    return {
+      stream: firstAttempt
+        ? streamThenError(
+            [
+              { type: 'stream-start', warnings: [] },
+              {
+                type: 'response-metadata',
+                id: 'partial-failure',
+                modelId: 'partial-model',
+                timestamp: new Date(0),
+              },
+              { type: 'text-start', id: 'partial-text' },
+              { type: 'text-delta', id: 'partial-text', delta: 'partial' },
+            ],
+            new Error('stream failed after content'),
+          )
+        : convertArrayToReadableStream([
+            { type: 'stream-start', warnings: [] },
+            { type: 'response-metadata', id: 'partial-retry', modelId: 'partial-model', timestamp: new Date(0) },
+            { type: 'text-start', id: 'retry-text' },
+            { type: 'text-delta', id: 'retry-text', delta: 'recovered' },
+            { type: 'text-end', id: 'retry-text' },
+            { type: 'finish', finishReason: 'stop', usage: { inputTokens: 7, outputTokens: 3, totalTokens: 10 } },
+          ]),
+      rawCall: { rawPrompt: null, rawSettings: {} },
+      warnings: [],
+    };
+  });
+  return { model: new MockLanguageModelV2({ doStream: doStream as any }), doStream };
+}
+
 /** First call requests a tool, second call returns final text — a 2-step agentic loop. */
 function toolThenTextModel(toolName: string, toolArgs: object, finalText: string) {
   let call = 0;
@@ -350,20 +487,182 @@ describe('regular Agent provider request ledger (real exporter)', () => {
     expect(new Set(inferences.map(idOf))).toHaveLength(2);
     expect(inferences.map(span => span.attributes?.providerAttempt)).toEqual([1, 2]);
     expect(inferences[0]).toMatchObject({
-      attributes: { measurementState: 'measured', providerUsageState: 'provider_not_reported' },
+      attributes: {
+        measurementState: 'measured',
+        providerUsageState: 'provider_not_reported',
+        providerOutcome: 'error',
+      },
       errorInfo: expect.any(Object),
     });
     expect(inferences[1]?.attributes).toMatchObject({
       measurementState: 'measured',
       providerUsageState: 'reported',
+      providerOutcome: 'success',
     });
     const [generation] = testExporter.getSpansByType('model_generation' as any);
     expect(generation?.attributes).toMatchObject({
       providerAggregateMeasurementState: 'measured',
       providerInferenceCount: 2,
       providerUsageState: 'provider_not_reported',
+      providerSucceededInferenceCount: 1,
+      providerErrorInferenceCount: 1,
+      providerAbortedInferenceCount: 0,
     });
     expectExactRequestAggregate(generation, inferences);
+    expect(testExporter.getIncompleteSpans()).toHaveLength(0);
+  });
+
+  it('closes and classifies a publicly aborted provider attempt', async () => {
+    const { model, doStream } = abortableModel();
+    const abortController = new AbortController();
+    const agent = buildRegularMastra(
+      testExporter,
+      new Agent({ id: 'regular-abort', name: 'regular-abort', instructions: 'x', model: model as any, maxRetries: 0 }),
+    );
+
+    const result = await agent.stream('hi', { abortSignal: abortController.signal });
+    await waitForProviderCall(doStream);
+    abortController.abort();
+    try {
+      await result.consumeStream();
+    } catch {
+      // Public cancellation may reject the consumer after the abort signal wins.
+    }
+    await settle(testExporter);
+
+    const [inference] = testExporter.getSpansByType('model_inference' as any);
+    expect(inference?.attributes).toMatchObject({
+      providerOutcome: 'abort',
+      finishReason: 'abort',
+      providerUsageState: 'provider_not_reported',
+      measurementState: 'measured',
+    });
+    const [generation] = testExporter.getSpansByType('model_generation' as any);
+    expect(generation?.attributes).toMatchObject({
+      finishReason: 'aborted',
+      providerInferenceCount: 1,
+      providerSucceededInferenceCount: 0,
+      providerErrorInferenceCount: 0,
+      providerAbortedInferenceCount: 1,
+    });
+    expect(testExporter.getIncompleteSpans()).toHaveLength(0);
+  });
+
+  it('closes a provider-originated abort stream without waiting for step-finish', async () => {
+    const { model, doStream } = providerAbortChunkModel();
+    const agent = buildRegularMastra(
+      testExporter,
+      new Agent({
+        id: 'provider-abort',
+        name: 'provider-abort',
+        instructions: 'x',
+        model: model as any,
+        maxRetries: 0,
+      }),
+    );
+
+    try {
+      await runRegularToCompletion(agent, 'hi', testExporter);
+    } catch {
+      await settle(testExporter);
+    }
+
+    expect(doStream).toHaveBeenCalledOnce();
+    const [inference] = testExporter.getSpansByType('model_inference' as any);
+    expect(inference?.attributes).toMatchObject({
+      providerOutcome: 'abort',
+      finishReason: 'abort',
+      completionStartTime: expect.anything(),
+    });
+    const [generation] = testExporter.getSpansByType('model_generation' as any);
+    expect(generation?.attributes).toMatchObject({
+      providerSucceededInferenceCount: 0,
+      providerErrorInferenceCount: 0,
+      providerAbortedInferenceCount: 1,
+    });
+    expect(testExporter.getIncompleteSpans()).toHaveLength(0);
+  });
+
+  it('numbers fallback-model calls cumulatively within one regular model step', async () => {
+    const { primary, fallback, primaryDoStream, fallbackDoStream } = fallbackModelPair();
+    const agent = buildRegularMastra(
+      testExporter,
+      new Agent({
+        id: 'regular-fallback',
+        name: 'regular-fallback',
+        instructions: 'x',
+        model: [
+          { id: 'primary', model: primary as any, maxRetries: 0 },
+          { id: 'fallback', model: fallback as any, maxRetries: 0 },
+        ],
+      }),
+    );
+
+    await runRegularToCompletion(agent, 'hi', testExporter);
+
+    expect(primaryDoStream).toHaveBeenCalledOnce();
+    expect(fallbackDoStream).toHaveBeenCalledOnce();
+    const inferences = testExporter.getSpansByType('model_inference' as any);
+    expect(inferences.map(span => span.attributes?.providerAttempt)).toEqual([1, 2]);
+    expect(inferences.map(span => span.attributes?.providerOutcome)).toEqual(['error', 'success']);
+    const [generation] = testExporter.getSpansByType('model_generation' as any);
+    expect(generation?.attributes).toMatchObject({
+      providerInferenceCount: 2,
+      providerSucceededInferenceCount: 1,
+      providerErrorInferenceCount: 1,
+      providerAbortedInferenceCount: 0,
+    });
+    expect(testExporter.getIncompleteSpans()).toHaveLength(0);
+  });
+
+  it('attributes the regular inference to normalized provider response identity', async () => {
+    const agent = buildRegularMastra(
+      testExporter,
+      new Agent({
+        id: 'regular-response-identity',
+        name: 'regular-response-identity',
+        instructions: 'x',
+        model: responseIdentityModel('served-response', 'requested-response-model', {
+          anthropic: { iterations: [{ type: 'fallback_message', model: 'served-fallback-model' }] },
+        }) as any,
+      }),
+    );
+
+    await runRegularToCompletion(agent, 'hi', testExporter);
+
+    const [inference] = testExporter.getSpansByType('model_inference' as any);
+    expect(inference?.attributes).toMatchObject({
+      responseId: 'served-response',
+      responseModel: 'served-fallback-model',
+      providerOutcome: 'success',
+    });
+    expect(testExporter.getIncompleteSpans()).toHaveLength(0);
+  });
+
+  it('keeps a regular tool call inside its live MODEL_STEP after inference closes', async () => {
+    const agent = buildRegularMastra(
+      testExporter,
+      new Agent({
+        id: 'regular-tool-lifecycle',
+        name: 'regular-tool-lifecycle',
+        instructions: 'use the tool',
+        model: toolThenTextModel('get_weather', { city: 'Paris' }, 'It is 21C in Paris.') as any,
+        tools: { get_weather: weatherTool },
+      }),
+    );
+
+    await runRegularToCompletion(agent, 'weather?', testExporter);
+
+    const [toolCall] = testExporter.getSpansByType('tool_call' as any);
+    const owningStep = testExporter.getSpansByType('model_step' as any).find(span => idOf(span) === parentOf(toolCall));
+    const owningInference = testExporter
+      .getSpansByType('model_inference' as any)
+      .find(span => parentOf(span) === idOf(owningStep));
+    expect(toolCall).toBeDefined();
+    expect(owningStep).toBeDefined();
+    expect(owningInference).toBeDefined();
+    expect(new Date(owningInference!.endTime!).getTime()).toBeLessThanOrEqual(new Date(toolCall!.startTime!).getTime());
+    expect(new Date(owningStep!.endTime!).getTime()).toBeGreaterThanOrEqual(new Date(toolCall!.endTime!).getTime());
     expect(testExporter.getIncompleteSpans()).toHaveLength(0);
   });
 
@@ -482,6 +781,68 @@ describe('durable-agent observability — full span tree (real exporter)', () =>
     expect(testExporter.getIncompleteSpans()).toHaveLength(0);
   });
 
+  it('attributes durable processor model and reasoning overrides to the effective provider call', async () => {
+    const originalDoStream = vi.fn();
+    const replacementDoStream = vi.fn(async () => ({
+      stream: convertArrayToReadableStream([
+        { type: 'stream-start', warnings: [] },
+        { type: 'response-metadata', id: 'replacement-id', modelId: 'replacement-model', timestamp: new Date(0) },
+        { type: 'text-start', id: 'replacement-text' },
+        { type: 'text-delta', id: 'replacement-text', delta: 'Replacement response' },
+        { type: 'text-end', id: 'replacement-text' },
+        { type: 'finish', finishReason: 'stop', usage: { inputTokens: 7, outputTokens: 3, totalTokens: 10 } },
+      ]),
+      rawCall: { rawPrompt: null, rawSettings: {} },
+      warnings: [],
+    }));
+    const originalModel = new MockLanguageModelV2({
+      provider: 'original-provider',
+      modelId: 'original-model',
+      doStream: originalDoStream,
+    });
+    const replacementModel = new MockLanguageModelV2({
+      provider: 'azure.responses',
+      modelId: 'replacement-model',
+      doStream: replacementDoStream,
+    });
+    const agent = new Agent({
+      id: 'durable-model-override',
+      name: 'durable-model-override',
+      instructions: 'x',
+      model: originalModel as any,
+      inputProcessors: [
+        {
+          id: 'effective-provider-router',
+          processInputStep: async () => ({
+            model: replacementModel as any,
+            providerOptions: { azure: { reasoningEffort: 'low' } },
+          }),
+        },
+      ],
+    });
+    const { wrapped } = buildMastra(testExporter, agent, 'durable');
+    await runToCompletion(wrapped, 'hi', testExporter);
+
+    expect(originalDoStream).not.toHaveBeenCalled();
+    expect(replacementDoStream).toHaveBeenCalledOnce();
+    expect(replacementDoStream.mock.calls[0]?.[0]).toMatchObject({
+      providerOptions: { azure: { reasoningEffort: 'low' } },
+    });
+    const [generation] = testExporter.getSpansByType('model_generation' as any);
+    expect(generation).toMatchObject({
+      name: "llm: 'replacement-model'",
+      attributes: { model: 'replacement-model', provider: 'azure.responses' },
+    });
+    const [inference] = testExporter.getSpansByType('model_inference' as any);
+    expect(inference?.attributes).toMatchObject({
+      model: 'replacement-model',
+      provider: 'azure.responses',
+      providerReasoningEffortState: 'measured',
+      providerReasoningEffort: 'low',
+    });
+    expect(testExporter.getIncompleteSpans()).toHaveLength(0);
+  });
+
   it('DurableAgent tool call: ONE generation, 2 steps, TOOL_CALL nested under a model_step, all closed', async () => {
     const agent = new Agent({
       id: 'a',
@@ -559,19 +920,28 @@ describe('durable-agent observability — full span tree (real exporter)', () =>
     const inferences = testExporter.getSpansByType('model_inference' as any);
     expect(inferences).toHaveLength(2);
     expect(new Set(inferences.map(idOf))).toHaveLength(2);
+    expect(inferences.map(span => span.attributes?.providerAttempt)).toEqual([1, 2]);
     expect(inferences[0]).toMatchObject({
-      attributes: { measurementState: 'measured', providerUsageState: 'provider_not_reported' },
+      attributes: {
+        measurementState: 'measured',
+        providerUsageState: 'provider_not_reported',
+        providerOutcome: 'error',
+      },
       errorInfo: expect.any(Object),
     });
     expect(inferences[1]?.attributes).toMatchObject({
       measurementState: 'measured',
       providerUsageState: 'reported',
+      providerOutcome: 'success',
     });
     const [generation] = testExporter.getSpansByType('model_generation' as any);
     expect(generation?.attributes).toMatchObject({
       providerAggregateMeasurementState: 'measured',
       providerInferenceCount: 2,
       providerUsageState: 'provider_not_reported',
+      providerSucceededInferenceCount: 1,
+      providerErrorInferenceCount: 1,
+      providerAbortedInferenceCount: 0,
     });
     expectExactRequestAggregate(generation, inferences);
     expect(testExporter.getIncompleteSpans()).toHaveLength(0);
@@ -593,12 +963,16 @@ describe('durable-agent observability — full span tree (real exporter)', () =>
       measurementState: 'measured',
       providerUsageState: 'provider_not_reported',
       providerRequestBytes: expect.any(Number),
+      providerOutcome: 'error',
     });
     const [generation] = testExporter.getSpansByType('model_generation' as any);
     expect(generation?.attributes).toMatchObject({
       providerAggregateMeasurementState: 'measured',
       providerInferenceCount: 1,
       providerUsageState: 'provider_not_reported',
+      providerSucceededInferenceCount: 0,
+      providerErrorInferenceCount: 1,
+      providerAbortedInferenceCount: 0,
     });
     expectExactRequestAggregate(generation, [inference]);
     // Regression guard for the durable-specific gap: MODEL_STEP + MODEL_INFERENCE
@@ -634,12 +1008,17 @@ describe('durable-agent observability — full span tree (real exporter)', () =>
       measurementState: 'measured',
       providerUsageState: 'provider_not_reported',
       providerRequestBytes: expect.any(Number),
+      providerOutcome: 'abort',
+      finishReason: 'abort',
     });
     const [generation] = testExporter.getSpansByType('model_generation' as any);
     expect(generation?.attributes).toMatchObject({
       providerAggregateMeasurementState: 'measured',
       providerInferenceCount: 1,
       providerUsageState: 'provider_not_reported',
+      providerSucceededInferenceCount: 0,
+      providerErrorInferenceCount: 0,
+      providerAbortedInferenceCount: 1,
     });
     expectExactRequestAggregate(generation, inferences);
     expect(testExporter.getIncompleteSpans().map(info => info.span?.type)).toEqual([]);
