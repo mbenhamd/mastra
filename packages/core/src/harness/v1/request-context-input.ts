@@ -2,8 +2,26 @@ import { isInfrastructureRequestContextKey } from '../../request-context';
 import type { RequestContext } from '../../request-context';
 import type { JsonValue, PersistedRequestContextInput } from '../../storage/domains/harness';
 
-import { assertJsonValue, isPlainJsonObject } from './canonical-json';
+import { assertJsonValue, canonicalJson, isPlainJsonObject } from './canonical-json';
 import { HarnessValidationError } from './errors';
+
+/** Canonical JSON budget for the observability-only app subset inherited by subagents. */
+export const MAX_INHERITED_REQUEST_CONTEXT_APP_BYTES = 256;
+const REQUEST_CONTEXT_APP_ENCODER = new TextEncoder();
+
+/** Enforce the bounded persistence/hash contract after the selected app bag is JSON-normalized. */
+export function assertInheritedRequestContextAppByteLimit(
+  app: Record<string, JsonValue>,
+  path = 'requestContext.app',
+): void {
+  const bytes = REQUEST_CONTEXT_APP_ENCODER.encode(canonicalJson(app)).byteLength;
+  if (bytes > MAX_INHERITED_REQUEST_CONTEXT_APP_BYTES) {
+    throw new HarnessValidationError(
+      path,
+      `must be at most ${MAX_INHERITED_REQUEST_CONTEXT_APP_BYTES} canonical JSON UTF-8 bytes; received ${bytes}`,
+    );
+  }
+}
 
 /**
  * §4.4c — caller-supplied request-context input.
@@ -116,7 +134,9 @@ export function projectInheritedRequestContextAppBag(
     });
     selected += 1;
   }
-  return selected === 0 ? undefined : { app };
+  if (selected === 0) return undefined;
+  assertInheritedRequestContextAppByteLimit(app);
+  return { app };
 }
 
 /** Project the approved app-key subset from a live tool/agent RequestContext. */

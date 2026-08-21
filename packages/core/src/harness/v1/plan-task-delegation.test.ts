@@ -15,6 +15,7 @@ import { describe, expect, it } from 'vitest';
 import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
 import type { JsonValue, SessionRecord } from '../../storage/domains/harness/types';
 import { InMemoryDB } from '../../storage/domains/inmemory-db';
+import { sha256CanonicalJson } from './canonical-json';
 import { HarnessPlanTaskInProgressConflictError } from './plan-task-hierarchy';
 import {
   capturePlanTaskDelegationScope,
@@ -26,11 +27,20 @@ import {
   planTaskReparent,
   planTaskUpdate,
   PLAN_TASK_DELEGATED_BODY_MAX_BYTES,
+  readDelegationAttemptMetadata,
 } from './plan-task-session';
 import type { PlanTaskSessionPort, PlanTaskSummary, PlanTaskUpdatedPayload } from './plan-task-session';
+import { MAX_INHERITED_REQUEST_CONTEXT_APP_BYTES } from './request-context-input';
 
 const OWNER = 'owner-1';
 const SESSION_ID = 's1';
+
+function lineageAppWithCanonicalBytes(bytes: number): Record<string, JsonValue> {
+  const emptyEnvelopeBytes = new TextEncoder().encode(JSON.stringify({ turnCorrelationId: '' })).byteLength;
+  const app = { turnCorrelationId: 'x'.repeat(bytes - emptyEnvelopeBytes) };
+  expect(new TextEncoder().encode(JSON.stringify(app))).toHaveLength(bytes);
+  return app;
+}
 
 function sessionRecord(): SessionRecord {
   return {
@@ -353,6 +363,51 @@ describe('planTaskDelegate', () => {
       }),
     ).rejects.toThrow(/UTF-8 bytes/);
     expect((await listAll(storage)).get(task.taskId)?.delegatedSubagentSessionId).toBeUndefined();
+  });
+
+  it('rejects an oversized inherited app before writing the durable delegation link', async () => {
+    const { storage, port } = await setup();
+    const task = await planTaskAdd(port, { content: 'bounded lineage' });
+    const oversizedApp = lineageAppWithCanonicalBytes(MAX_INHERITED_REQUEST_CONTEXT_APP_BYTES + 1);
+
+    await expect(
+      planTaskDelegate(port, {
+        taskId: task.taskId,
+        subagentSessionId: 'sub-oversized-lineage',
+        requestContextApp: oversizedApp,
+      }),
+    ).rejects.toThrow(/canonical JSON UTF-8 bytes/u);
+    expect((await listAll(storage)).get(task.taskId)?.delegatedSubagentSessionId).toBeUndefined();
+  });
+
+  it('fails closed on an oversized restored app even when its integrity hash matches', async () => {
+    const { storage, port } = await setup();
+    const task = await planTaskAdd(port, { content: 'restore bounded lineage' });
+    const justUnderApp = lineageAppWithCanonicalBytes(MAX_INHERITED_REQUEST_CONTEXT_APP_BYTES - 1);
+    await planTaskDelegate(port, {
+      taskId: task.taskId,
+      subagentSessionId: 'sub-restore-lineage',
+      requestContextApp: justUnderApp,
+    });
+
+    const stored = (await listAll(storage)).get(task.taskId)!;
+    expect(readDelegationAttemptMetadata(stored)?.requestContextApp).toEqual(justUnderApp);
+    const metadata = stored.metadata as Record<string, JsonValue>;
+    const attempt = metadata.mastraHarnessDelegationAttemptV1 as Record<string, JsonValue>;
+    const oversizedApp = lineageAppWithCanonicalBytes(MAX_INHERITED_REQUEST_CONTEXT_APP_BYTES + 1);
+    const tampered = {
+      ...stored,
+      metadata: {
+        ...metadata,
+        mastraHarnessDelegationAttemptV1: {
+          ...attempt,
+          requestContextApp: oversizedApp,
+          requestContextAppSha256: sha256CanonicalJson(oversizedApp),
+        },
+      },
+    };
+
+    expect(readDelegationAttemptMetadata(tampered)).toBeUndefined();
   });
 });
 

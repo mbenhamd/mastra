@@ -1,9 +1,17 @@
 import { describe, expect, it } from 'vitest';
 
 import { HarnessValidationError } from './errors';
-import { validateCallerRequestContext } from './request-context-input';
+import { projectInheritedRequestContextAppBag, validateCallerRequestContext } from './request-context-input';
 
 const M = 'message';
+const INHERITED_APP_MAX_CANONICAL_BYTES = 256;
+
+function lineageAppWithCanonicalBytes(bytes: number): { turnCorrelationId: string } {
+  const emptyEnvelopeBytes = new TextEncoder().encode(JSON.stringify({ turnCorrelationId: '' })).byteLength;
+  const app = { turnCorrelationId: 'x'.repeat(bytes - emptyEnvelopeBytes) };
+  expect(new TextEncoder().encode(JSON.stringify(app))).toHaveLength(bytes);
+  return app;
+}
 
 describe('validateCallerRequestContext — accepted shapes', () => {
   it('returns undefined when no request context is supplied', () => {
@@ -93,5 +101,19 @@ describe('validateCallerRequestContext — malformed input rejection', () => {
 
   it('rejects an app containing negative zero (canonicalization profile)', () => {
     expect(() => validateCallerRequestContext({ app: { z: -0 } }, M)).toThrow(HarnessValidationError);
+  });
+});
+
+describe('projectInheritedRequestContextAppBag — lineage byte budget', () => {
+  it('accepts canonical JSON through the cap and rejects one byte above it', () => {
+    const justUnder = lineageAppWithCanonicalBytes(INHERITED_APP_MAX_CANONICAL_BYTES - 1);
+    expect(projectInheritedRequestContextAppBag(justUnder, ['turnCorrelationId'])).toEqual({ app: justUnder });
+    const atLimit = lineageAppWithCanonicalBytes(INHERITED_APP_MAX_CANONICAL_BYTES);
+    expect(projectInheritedRequestContextAppBag(atLimit, ['turnCorrelationId'])).toEqual({ app: atLimit });
+
+    const justOver = lineageAppWithCanonicalBytes(INHERITED_APP_MAX_CANONICAL_BYTES + 1);
+    expect(() => projectInheritedRequestContextAppBag(justOver, ['turnCorrelationId'])).toThrow(
+      /canonical JSON UTF-8 bytes/u,
+    );
   });
 });

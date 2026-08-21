@@ -38,6 +38,7 @@ import {
   TASK_DELEGATE_TOOL_ID,
   TASK_UPDATE_TOOL_ID,
 } from './plan-task-tool';
+import { MAX_INHERITED_REQUEST_CONTEXT_APP_BYTES } from './request-context-input';
 import { Session } from './session';
 import {
   HARNESS_SUBAGENT_OUTCOME_REPORT_KIND,
@@ -134,6 +135,13 @@ const toolCtx = {
   agent: { toolCallId: 'tc-deleg', runId: 'mock-run' },
   requestContext: { get: () => undefined },
 } as any;
+
+function lineageValueForCanonicalAppBytes(bytes: number): string {
+  const emptyEnvelopeBytes = new TextEncoder().encode(JSON.stringify({ turnCorrelationId: '' })).byteLength;
+  const value = 'x'.repeat(bytes - emptyEnvelopeBytes);
+  expect(new TextEncoder().encode(JSON.stringify({ turnCorrelationId: value }))).toHaveLength(bytes);
+  return value;
+}
 
 async function poll(pred: () => boolean | Promise<boolean>, timeoutMs = 2000): Promise<void> {
   const start = Date.now();
@@ -1518,7 +1526,7 @@ describe('task_delegate — recovery on rehydrate', () => {
   it('restores only approved lineage when restart occurs before the delegated signal dispatches', async () => {
     const db = new InMemoryDB();
     const lineageKey = 'turnCorrelationId';
-    const lineageValue = 'opaque-pre-dispatch-turn-5049';
+    const lineageValue = lineageValueForCanonicalAppBytes(MAX_INHERITED_REQUEST_CONTEXT_APP_BYTES - 1);
     const privateCanary = 'PRE_DISPATCH_PRIVATE_APP_CANARY';
     const inheritedAppKeys = [lineageKey];
     const a = buildHarness(db, { maxConcurrent: 1, inheritRequestContextAppKeys: inheritedAppKeys });

@@ -41,6 +41,7 @@ import {
   rollupTree,
   TERMINAL_PLAN_TASK_STATUSES,
 } from './plan-task-hierarchy';
+import { assertInheritedRequestContextAppByteLimit } from './request-context-input';
 import { harnessSubagentResultSummarySchema } from './terminal-subagent-result';
 import type { HarnessSubagentResultSummary } from './terminal-subagent-result';
 
@@ -1206,7 +1207,8 @@ export interface DelegateTaskInput {
   /**
    * Exact JSON app-key subset approved for the delegated child turn. Kept out
    * of the model-facing plan projection, but persisted so restart reattachment
-   * reproduces the original signal admission byte-for-byte.
+   * reproduces the original signal admission byte-for-byte. The canonical JSON
+   * representation must fit the inherited request-context app budget.
    */
   requestContextApp?: Record<string, JsonValue>;
 }
@@ -1276,6 +1278,7 @@ function delegationAttemptMetadata(
     if (requestContextApp === null || typeof requestContextApp !== 'object' || Array.isArray(requestContextApp)) {
       throw new HarnessValidationError('requestContextApp', 'must be a JSON object');
     }
+    assertInheritedRequestContextAppByteLimit(requestContextApp, 'requestContextApp');
     attempt.requestContextApp = requestContextApp;
     attempt.requestContextAppSha256 = sha256CanonicalJsonChecked(requestContextApp);
   }
@@ -1358,14 +1361,11 @@ export function readDelegationAttemptMetadata(
     }
     try {
       const normalized = assertJsonValue(raw.requestContextApp, 'delegation.requestContextApp');
-      if (
-        normalized === null ||
-        typeof normalized !== 'object' ||
-        Array.isArray(normalized) ||
-        sha256CanonicalJsonChecked(normalized) !== raw.requestContextAppSha256
-      ) {
+      if (normalized === null || typeof normalized !== 'object' || Array.isArray(normalized)) {
         return undefined;
       }
+      assertInheritedRequestContextAppByteLimit(normalized, 'delegation.requestContextApp');
+      if (sha256CanonicalJsonChecked(normalized) !== raw.requestContextAppSha256) return undefined;
       requestContextApp = normalized;
     } catch {
       return undefined;

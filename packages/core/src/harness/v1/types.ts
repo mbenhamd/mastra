@@ -1269,6 +1269,7 @@ export interface HarnessConfigCommon {
      * Keys are matched literally (not as dotted paths), and every other app
      * field remains isolated. The selected JSON values are copied rather than
      * sharing object identity with the parent.
+     * The complete selected bag is capped at 256 canonical JSON UTF-8 bytes.
      *
      * Selected keys are also exposed as top-level entries on the descendant's
      * agent `RequestContext` so observability integrations can correlate nested
