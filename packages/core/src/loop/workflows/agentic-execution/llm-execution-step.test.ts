@@ -8,6 +8,7 @@ import { MessageList } from '../../../agent/message-list';
 import { createSignal } from '../../../agent/signals';
 import { stampToolSurfaceFence } from '../../../agent/tool-surface-fence';
 import { SpanType } from '../../../observability';
+import { MAX_EXACT_JSON_MEASUREMENT_CODE_UNITS } from '../../../observability/content-free-measurement';
 import { StreamErrorRetryProcessor } from '../../../processors';
 import { ProviderHistoryCompat } from '../../../processors/provider-history-compat';
 import { RequestContext } from '../../../request-context';
@@ -674,6 +675,91 @@ describe('createLLMExecutionStep gateway provider tools', () => {
     // request and re-trigger the refusal, hanging the run until maxSteps.
     expect(result.stepResult.reason).toBe('content-filter');
     expect(result.stepResult.isContinued).toBe(false);
+  });
+
+  it('preserves size-limited provider metadata publicly while tracing fails closed', async () => {
+    const providerMetadata = {
+      anthropic: {
+        iterations: [{ type: 'fallback_message', model: 'must-not-be-attributed' }],
+        trace: 'x'.repeat(MAX_EXACT_JSON_MEASUREMENT_CODE_UNITS + 1),
+      },
+    };
+    const modelSpanTracker = {
+      getTracingContext: vi.fn(() => ({})),
+      startStep: vi.fn(),
+      recordInferenceFinish: vi.fn(),
+      recordResponseMetadata: vi.fn(),
+      endInference: vi.fn(),
+    };
+    const llmExecutionStep = createLLMExecutionStep({
+      agentId: 'test-agent',
+      messageId: 'msg-0',
+      runId: 'test-run',
+      startTimestamp: Date.now(),
+      methodType: 'stream',
+      controller,
+      outputWriter: vi.fn(),
+      messageList,
+      models: [
+        {
+          id: 'test-model',
+          maxRetries: 0,
+          model: {
+            specificationVersion: 'v2' as const,
+            provider: 'anthropic',
+            modelId: 'requested-model',
+            supportedUrls: {},
+            doGenerate: vi.fn(),
+            doStream: vi.fn(async () => ({
+              stream: convertArrayToReadableStream([
+                {
+                  type: 'response-metadata',
+                  id: 'response-id',
+                  modelId: 'response-model',
+                  timestamp: new Date(0),
+                },
+                {
+                  type: 'finish',
+                  finishReason: 'stop',
+                  providerMetadata,
+                  usage: testUsage,
+                },
+              ]),
+              request: {},
+              response: { headers: undefined },
+              warnings: [],
+            })),
+          } as any,
+        },
+      ],
+      streamState: {
+        serialize: vi.fn(),
+        deserialize: vi.fn(),
+      },
+      _internal: {
+        generateId: () => 'generated-id',
+      },
+      modelSpanTracker,
+      logger: {
+        error: vi.fn(),
+        warn: vi.fn(),
+        debug: vi.fn(),
+      } as any,
+    } as unknown as OuterLLMRun);
+
+    const result = await llmExecutionStep.execute(createExecuteParams(createIterationInput()));
+
+    expect(result.metadata.providerMetadata === providerMetadata).toBe(true);
+    expect(result.output.steps.at(-1)?.providerMetadata === providerMetadata).toBe(true);
+    expect(modelSpanTracker.recordInferenceFinish).toHaveBeenCalledWith(
+      expect.objectContaining({ metadata: {} }),
+      expect.any(Date),
+      { responseId: 'response-id', responseModel: 'response-model' },
+    );
+    expect(modelSpanTracker.recordResponseMetadata).toHaveBeenCalledWith({
+      responseId: 'response-id',
+      responseModel: 'response-model',
+    });
   });
 
   it('does not continue when finishReason is content-filter even with a pending tool call', async () => {

@@ -951,13 +951,13 @@ async function processOutputStream<OUTPUT = undefined>({
 
       case 'finish': {
         const finishMetadata = ownDataProperty(chunk.payload, 'metadata');
-        const providerMetadata = detachedResponseProviderMetadata(
-          ownDataProperty(finishMetadata, 'providerMetadata') ?? ownDataProperty(chunk.payload, 'providerMetadata'),
-        );
+        const providerMetadata =
+          ownDataProperty(finishMetadata, 'providerMetadata') ?? ownDataProperty(chunk.payload, 'providerMetadata');
+        const tracingProviderMetadata = detachedResponseProviderMetadata(providerMetadata);
         try {
           modelSpanTracker?.recordResponseMetadata?.({
             responseId: runState.state.responseMetadata?.id,
-            responseModel: resolveResponseModelId(providerMetadata, runState.state.responseMetadata?.modelId),
+            responseModel: resolveResponseModelId(tracingProviderMetadata, runState.state.responseMetadata?.modelId),
           });
         } catch {
           // Response attribution must never affect stream processing.
@@ -968,7 +968,7 @@ async function processOutputStream<OUTPUT = undefined>({
           // Tracing must never affect stream processing.
         }
         runState.setState({
-          providerOptions: providerMetadata,
+          providerOptions: providerMetadata as Record<string, unknown> | undefined,
           stepResult: {
             reason: chunk.payload.reason,
             logprobs: chunk.payload.logprobs,
