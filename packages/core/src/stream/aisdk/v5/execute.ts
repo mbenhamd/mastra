@@ -14,7 +14,7 @@ import { createExactJsonMeasurementSnapshot } from '../../../observability/conte
 import type { ExactJsonMeasurementSnapshot } from '../../../observability/content-free-measurement';
 import { DEFAULT_MAX_RETRY_AFTER_MS, getRetryAfterMs, waitDelay } from '../../../utils/retry-after';
 import { getResponseFormat } from '../../base/schema';
-import type { LanguageModelV2StreamResult, OnResult } from '../../types';
+import type { ChunkType, LanguageModelV2StreamResult, OnResult } from '../../types';
 import { prepareToolsAndToolChoice } from './compat';
 import type { ModelSpecVersion } from './compat';
 import { AISDKV5InputStream } from './input';
@@ -420,8 +420,14 @@ type ExecutionProps<OUTPUT = undefined> = {
   onProviderAttemptError?: (input: { error: unknown; providerAttempt: number; aborted: boolean }) => void;
   /** Records the provider's first semantic chunk before downstream buffering. */
   onProviderFirstContent?: () => void;
+  /** Records provider chunk timing before downstream buffering or processor backpressure. */
+  onProviderChunk?: (chunk: ChunkType, observedAt: Date) => void;
   /** Records provider finish before downstream buffering or processor backpressure. */
-  onProviderFinish?: (payload: ModelInferenceFinishPayload, endTime: Date) => void;
+  onProviderFinish?: (
+    payload: ModelInferenceFinishPayload,
+    endTime: Date,
+    response: { responseId?: string; responseModel?: string },
+  ) => void;
   /** Zero-based logical attempt offset for callers that own retries outside this adapter loop. */
   providerAttemptOffset?: number;
   structuredOutput?: StructuredOutputOptions<OUTPUT>;
@@ -449,6 +455,7 @@ export function execute<OUTPUT = undefined>({
   onProviderAttemptStart,
   onProviderAttemptError,
   onProviderFirstContent,
+  onProviderChunk,
   onProviderFinish,
   providerAttemptOffset = 0,
   includeRawChunks,
@@ -465,6 +472,7 @@ export function execute<OUTPUT = undefined>({
     name: model.modelId,
     generateId,
     onProviderFirstContent,
+    onProviderChunk,
     onProviderFinish,
   });
 

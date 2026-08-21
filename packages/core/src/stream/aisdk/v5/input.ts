@@ -1,13 +1,41 @@
 import type { LanguageModelV2StreamPart } from '@ai-sdk/provider-v5';
 import type { IdGenerator } from '@internal/ai-sdk-v5';
 import { generateId as defaultGenerateId } from '@internal/ai-sdk-v5';
+import { resolveResponseModelId } from '../../../llm/model/server-side-fallback';
 import type { RegisteredLogger } from '../../../logger';
+import { createExactJsonMeasurementSnapshot } from '../../../observability/content-free-measurement';
 import { safeEnqueue, MastraModelInput } from '../../base';
 import type { ChunkType } from '../../types';
 import { convertFullStreamChunkToMastra } from './transform';
 import type { StreamPart } from './transform';
 
 type ProviderFinishPayload = Extract<ChunkType, { type: 'finish' }>['payload'];
+type ProviderResponseIdentity = { responseId?: string; responseModel?: string };
+
+function detachedJsonRecord(value: unknown): Record<string, unknown> | undefined {
+  const measurement = createExactJsonMeasurementSnapshot(value);
+  if (measurement.state !== 'measured') return undefined;
+  try {
+    const detached = JSON.parse(JSON.stringify(measurement.snapshot));
+    return detached && typeof detached === 'object' && !Array.isArray(detached)
+      ? (detached as Record<string, unknown>)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function providerFinishEvidence(payload: ProviderFinishPayload): ProviderFinishPayload {
+  const usage = detachedJsonRecord(payload.output.usage) ?? {};
+  const providerMetadata = detachedJsonRecord(payload.metadata?.providerMetadata ?? payload.providerMetadata);
+  return {
+    stepResult: {
+      reason: typeof payload.stepResult.reason === 'string' ? payload.stepResult.reason : 'unknown',
+    },
+    output: { usage },
+    metadata: providerMetadata ? { providerMetadata } : {},
+  } as ProviderFinishPayload;
+}
 
 /**
  * Checks if an ID is a simple numeric string (e.g., "0", "1", "2").
@@ -21,25 +49,31 @@ function isNumericId(id: string): boolean {
 export class AISDKV5InputStream extends MastraModelInput {
   #generateId: IdGenerator;
   #onProviderFirstContent?: () => void;
-  #onProviderFinish?: (payload: ProviderFinishPayload, endTime: Date) => void;
+  #onProviderChunk?: (chunk: ChunkType, observedAt: Date) => void;
+  #onProviderFinish?: (payload: ProviderFinishPayload, endTime: Date, response: ProviderResponseIdentity) => void;
   #providerContentObserved = false;
+  #providerResponseId?: string;
+  #providerResponseModel?: string;
 
   constructor({
     component,
     name,
     generateId,
     onProviderFirstContent,
+    onProviderChunk,
     onProviderFinish,
   }: {
     component: RegisteredLogger;
     name: string;
     generateId?: IdGenerator;
     onProviderFirstContent?: () => void;
-    onProviderFinish?: (payload: ProviderFinishPayload, endTime: Date) => void;
+    onProviderChunk?: (chunk: ChunkType, observedAt: Date) => void;
+    onProviderFinish?: (payload: ProviderFinishPayload, endTime: Date, response: ProviderResponseIdentity) => void;
   }) {
     super({ component, name });
     this.#generateId = generateId ?? defaultGenerateId;
     this.#onProviderFirstContent = onProviderFirstContent;
+    this.#onProviderChunk = onProviderChunk;
     this.#onProviderFinish = onProviderFinish;
   }
 
@@ -60,19 +94,38 @@ export class AISDKV5InputStream extends MastraModelInput {
 
     for await (const chunk of stream) {
       const rawChunk = chunk as StreamPart;
-      const providerFinishedAt = rawChunk.type === 'finish' ? new Date() : undefined;
+      const providerObservedAt = new Date();
 
       // Clear ID map on new step so each step gets fresh UUIDs
       if ((rawChunk as { type: string }).type === 'stream-start') {
         idMap.clear();
+        this.#providerResponseId = undefined;
+        this.#providerResponseModel = undefined;
       }
 
       const transformedChunk = convertFullStreamChunkToMastra(rawChunk, { runId });
 
       if (transformedChunk) {
+        try {
+          this.#onProviderChunk?.(transformedChunk, providerObservedAt);
+        } catch {
+          // Observability must never affect provider stream conversion.
+        }
+        if (transformedChunk.type === 'response-metadata') {
+          const { id, modelId } = transformedChunk.payload;
+          this.#providerResponseId = typeof id === 'string' ? id : undefined;
+          this.#providerResponseModel = typeof modelId === 'string' ? modelId : undefined;
+        }
         if (transformedChunk.type === 'finish') {
           try {
-            this.#onProviderFinish?.(transformedChunk.payload, providerFinishedAt ?? new Date());
+            const finishPayload = providerFinishEvidence(transformedChunk.payload);
+            this.#onProviderFinish?.(finishPayload, providerObservedAt, {
+              responseId: this.#providerResponseId,
+              responseModel: resolveResponseModelId(
+                finishPayload.metadata?.providerMetadata,
+                this.#providerResponseModel,
+              ),
+            });
           } catch {
             // Observability must never affect provider stream conversion.
           }

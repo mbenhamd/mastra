@@ -737,6 +737,7 @@ export class ModelSpanTracker {
   #currentChunkSpan?: Span<SpanType.MODEL_CHUNK>;
   #currentChunkType?: string;
   #accumulator: Record<string, any> = {};
+  #providerChunkTimestamps = new WeakMap<object, Date>();
   #stepIndex: number = 0;
   #chunkSequence: number = 0;
   #completionStartTime?: Date;
@@ -831,8 +832,18 @@ export class ModelSpanTracker {
 
   /** Record response identity after core has normalized provider-side fallbacks. */
   recordResponseMetadata(metadata: { responseId?: string; responseModel?: string }): void {
-    const responseId = typeof metadata.responseId === 'string' ? metadata.responseId : undefined;
-    const responseModel = typeof metadata.responseModel === 'string' ? metadata.responseModel : undefined;
+    const responseId =
+      this.#hasNormalizedInferenceResponse && this.#currentInferenceResponse?.responseId !== undefined
+        ? undefined
+        : typeof metadata.responseId === 'string'
+          ? metadata.responseId
+          : undefined;
+    const responseModel =
+      this.#hasNormalizedInferenceResponse && this.#currentInferenceResponse?.responseModel !== undefined
+        ? undefined
+        : typeof metadata.responseModel === 'string'
+          ? metadata.responseModel
+          : undefined;
     if (responseId === undefined && responseModel === undefined) return;
     const attributes = {
       ...(responseId === undefined ? {} : { responseId }),
@@ -894,8 +905,7 @@ export class ModelSpanTracker {
    * doesn't leave them dangling. No-op if they were already closed.
    */
   reportGenerationError(options: ErrorSpanOptions<SpanType.MODEL_GENERATION>): void {
-    this.#endChunkSpan();
-    this.#flushPendingInferenceFinish();
+    if (!this.#flushPendingInferenceFinish()) this.#endChunkSpan();
     const inferenceSpan = this.#currentInferenceSpan;
     const stepSpan = this.#currentStepSpan;
     const completionStartTime = this.#currentInferenceCompletionStartTime;
@@ -906,6 +916,7 @@ export class ModelSpanTracker {
     )
       ? 'abort'
       : 'error';
+    const failureFinishReason = providerOutcome === 'abort' ? 'abort' : 'error';
     this.#currentInferenceSpan = undefined;
     this.#currentInferenceCompletionStartTime = undefined;
     this.#currentInferenceResponse = undefined;
@@ -922,13 +933,15 @@ export class ModelSpanTracker {
         attributes: {
           ...providerUsageStates(undefined, {}),
           providerOutcome,
-          ...(providerOutcome === 'abort' ? { finishReason: 'abort' } : {}),
+          finishReason: failureFinishReason,
           ...(completionStartTime === undefined ? {} : { completionStartTime }),
           ...inferenceResponse,
         },
       }),
     );
-    runSpanOperation(() => stepSpan?.error({ error: options.error, endSpan: true }));
+    runSpanOperation(() =>
+      stepSpan?.error({ error: options.error, endSpan: true, attributes: { finishReason: failureFinishReason } }),
+    );
     if (providerInferenceEndedWithoutUsage) {
       this.#providerUsageState = 'provider_not_reported';
     } else if (this.#providerUsageState === undefined) {
@@ -939,7 +952,7 @@ export class ModelSpanTracker {
         ...options,
         attributes: {
           ...options.attributes,
-          ...(providerOutcome === 'abort' ? { finishReason: 'abort' } : {}),
+          finishReason: failureFinishReason,
           ...this.#preparedRequestAggregate,
           ...this.#providerOutcomeCounts,
           providerUsageState: this.#providerUsageState,
@@ -1099,8 +1112,7 @@ export class ModelSpanTracker {
 
   /** End the active step without closing its generation. */
   endStep(options?: EndSpanOptions<SpanType.MODEL_STEP>): void {
-    this.#endChunkSpan();
-    this.#flushPendingInferenceFinish();
+    if (!this.#flushPendingInferenceFinish()) this.#endChunkSpan();
     const inferenceSpan = this.#currentInferenceSpan;
     const completionStartTime = this.#currentInferenceCompletionStartTime;
     const inferenceResponse = this.#currentInferenceResponse;
@@ -1144,8 +1156,7 @@ export class ModelSpanTracker {
 
   /** Error the active step without closing its generation. */
   reportStepError(options: ErrorSpanOptions<SpanType.MODEL_STEP>): void {
-    this.#endChunkSpan();
-    this.#flushPendingInferenceFinish();
+    if (!this.#flushPendingInferenceFinish()) this.#endChunkSpan();
     if (this.#currentInferenceSpan || this.#currentInferenceLifecycleOpen) {
       this.reportInferenceError({ error: options.error });
     }
@@ -1166,10 +1177,10 @@ export class ModelSpanTracker {
   #endInferenceSpan(payload: ModelInferenceFinishPayload | StepFinishPayload<any, any>): void {
     const inferenceSpan = this.#currentInferenceSpan;
     if (!inferenceSpan && !this.#currentInferenceLifecycleOpen) return;
-    this.#endChunkSpan();
+    const inferenceEndTime = this.#pendingInferenceEndTime;
+    this.#endChunkSpan(undefined, inferenceEndTime);
     const completionStartTime = this.#currentInferenceCompletionStartTime;
     const inferenceResponse = this.#currentInferenceResponse;
-    const inferenceEndTime = this.#pendingInferenceEndTime;
     this.#currentInferenceSpan = undefined;
     this.#currentInferenceCompletionStartTime = undefined;
     this.#currentInferenceResponse = undefined;
@@ -1307,6 +1318,7 @@ export class ModelSpanTracker {
     options: ErrorSpanOptions<SpanType.MODEL_INFERENCE>,
     providerOutcome: Extract<ProviderInferenceOutcome, 'error' | 'abort'>,
   ): void {
+    if (this.#flushPendingInferenceFinish()) return;
     const inferenceSpan = this.#currentInferenceSpan;
     if (!inferenceSpan && !this.#currentInferenceLifecycleOpen) return;
     this.#endChunkSpan();
@@ -1359,15 +1371,38 @@ export class ModelSpanTracker {
 
   /** Close at the inner provider finish boundary after core normalization. */
   endInference(payload?: ModelInferenceFinishPayload): void {
-    const pendingPayload = payload ?? this.#pendingInferenceFinishPayload;
+    const pendingPayload = this.#pendingInferenceFinishPayload ?? payload;
     if (pendingPayload) this.#endInferenceSpan(pendingPayload);
   }
 
+  /** Retain an eager provider timestamp without observing chunk content. */
+  recordInferenceChunkTimestamp(chunk: unknown, observedAt: Date = new Date()): void {
+    if ((typeof chunk !== 'object' && typeof chunk !== 'function') || chunk === null) return;
+    this.#providerChunkTimestamps.set(chunk, observedAt);
+  }
+
   /** Capture provider finish before downstream stream backpressure. */
-  recordInferenceFinish(payload: ModelInferenceFinishPayload, endTime: Date = new Date()): void {
-    if (!this.#currentInferenceLifecycleOpen) return;
+  recordInferenceFinish(
+    payload: ModelInferenceFinishPayload,
+    endTime: Date = new Date(),
+    response?: { responseId?: string; responseModel?: string },
+  ): void {
+    if (!this.#currentInferenceLifecycleOpen || this.#pendingInferenceFinishPayload) return;
+    if (response) {
+      const responseId = typeof response.responseId === 'string' ? response.responseId : undefined;
+      const responseModel = typeof response.responseModel === 'string' ? response.responseModel : undefined;
+      if (responseId !== undefined || responseModel !== undefined) {
+        const attributes = {
+          ...(responseId === undefined ? {} : { responseId }),
+          ...(responseModel === undefined ? {} : { responseModel }),
+        };
+        this.#currentInferenceResponse = { ...this.#currentInferenceResponse, ...attributes };
+        this.#hasNormalizedInferenceResponse = true;
+        runSpanOperation(() => this.#currentInferenceSpan?.update({ attributes }));
+      }
+    }
     this.#pendingInferenceFinishPayload = payload;
-    this.#pendingInferenceEndTime ??= endTime;
+    this.#pendingInferenceEndTime = endTime;
   }
 
   #flushPendingInferenceFinish(): boolean {
@@ -1429,10 +1464,6 @@ export class ModelSpanTracker {
    * End the current Model execution step with token usage, finish reason, output, and metadata
    */
   #endStepSpan<OUTPUT>(payload: StepFinishPayload<any, OUTPUT>) {
-    // Flush any pending chunk span before ending the step
-    // (handles case where text-delta arrives without text-end)
-    this.#endChunkSpan();
-
     const stepSpan = this.#currentStepSpan;
     if (!stepSpan) return;
 
@@ -1440,6 +1471,8 @@ export class ModelSpanTracker {
     // mode so its duration reflects pure model latency, not subsequent tool
     // execution). Close it here for the non-deferred path.
     if (!this.#flushPendingInferenceFinish()) this.#endInferenceSpan(payload);
+    // Safety net for callers that created a chunk without an inference span.
+    this.#endChunkSpan();
     this.#resetCurrentStep();
 
     let endedWithOutput = false;
@@ -1514,13 +1547,20 @@ export class ModelSpanTracker {
     }
   }
 
+  #takeProviderChunkTimestamp(chunk: unknown): Date | undefined {
+    if ((typeof chunk !== 'object' && typeof chunk !== 'function') || chunk === null) return undefined;
+    const timestamp = this.#providerChunkTimestamps.get(chunk);
+    this.#providerChunkTimestamps.delete(chunk);
+    return timestamp;
+  }
+
   /**
    * Create a new chunk span (for multi-part chunks like text-start/delta/end)
    */
-  #startChunkSpan(chunkType: string, initialData?: Record<string, any>) {
+  #startChunkSpan(chunkType: string, initialData?: Record<string, any>, startTime?: Date) {
     // End any existing chunk span before starting a new one
     // (handles transitions like text-delta → tool-call without text-end)
-    this.#endChunkSpan();
+    this.#endChunkSpan(undefined, startTime);
 
     this.#ensureStepAndInference();
 
@@ -1532,6 +1572,7 @@ export class ModelSpanTracker {
           chunkType,
           sequenceNumber: this.#chunkSequence,
         },
+        startTime,
         tracingPolicy: this.#modelSpan?.tracingPolicy,
       }),
     );
@@ -1554,7 +1595,7 @@ export class ModelSpanTracker {
    * End the current chunk span.
    * Safe to call multiple times - will no-op if span already ended.
    */
-  #endChunkSpan(output?: any) {
+  #endChunkSpan(output?: any, endTime?: Date) {
     const chunkSpan = this.#currentChunkSpan;
     if (!chunkSpan) return;
     const spanOutput = output !== undefined ? output : this.#accumulator;
@@ -1562,7 +1603,7 @@ export class ModelSpanTracker {
     this.#currentChunkType = undefined;
     this.#accumulator = {};
     this.#chunkSequence++;
-    runSpanOperation(() => chunkSpan.end({ output: spanOutput }));
+    runSpanOperation(() => chunkSpan.end({ output: spanOutput, endTime }));
   }
 
   /**
@@ -1612,10 +1653,10 @@ export class ModelSpanTracker {
   /**
    * Handle text chunk spans (text-start/delta/end)
    */
-  #handleTextChunk<OUTPUT>(chunk: ChunkType<OUTPUT>) {
+  #handleTextChunk<OUTPUT>(chunk: ChunkType<OUTPUT>, observedAt?: Date) {
     switch (chunk.type) {
       case 'text-start':
-        this.#startChunkSpan('text');
+        this.#startChunkSpan('text', undefined, observedAt);
         break;
 
       case 'text-delta':
@@ -1623,13 +1664,13 @@ export class ModelSpanTracker {
         // (AI SDK streaming doesn't always emit wrapper events)
         // Allow transition from any other chunk type
         if (this.#currentChunkType !== 'text') {
-          this.#startChunkSpan('text');
+          this.#startChunkSpan('text', undefined, observedAt);
         }
         this.#appendToAccumulator('text', chunk.payload.text);
         break;
 
       case 'text-end': {
-        this.#endChunkSpan();
+        this.#endChunkSpan(undefined, observedAt);
         break;
       }
     }
@@ -1638,10 +1679,10 @@ export class ModelSpanTracker {
   /**
    * Handle reasoning chunk spans (reasoning-start/delta/end)
    */
-  #handleReasoningChunk<OUTPUT>(chunk: ChunkType<OUTPUT>) {
+  #handleReasoningChunk<OUTPUT>(chunk: ChunkType<OUTPUT>, observedAt?: Date) {
     switch (chunk.type) {
       case 'reasoning-start':
-        this.#startChunkSpan('reasoning');
+        this.#startChunkSpan('reasoning', undefined, observedAt);
         break;
 
       case 'reasoning-delta':
@@ -1649,13 +1690,13 @@ export class ModelSpanTracker {
         // (AI SDK streaming doesn't always emit wrapper events)
         // Allow transition from any other chunk type
         if (this.#currentChunkType !== 'reasoning') {
-          this.#startChunkSpan('reasoning');
+          this.#startChunkSpan('reasoning', undefined, observedAt);
         }
         this.#appendToAccumulator('text', chunk.payload.text);
         break;
 
       case 'reasoning-end': {
-        this.#endChunkSpan();
+        this.#endChunkSpan(undefined, observedAt);
         break;
       }
     }
@@ -1664,13 +1705,17 @@ export class ModelSpanTracker {
   /**
    * Handle tool call chunk spans (tool-call-input-streaming-start/delta/end, tool-call)
    */
-  #handleToolCallChunk<OUTPUT>(chunk: ChunkType<OUTPUT>) {
+  #handleToolCallChunk<OUTPUT>(chunk: ChunkType<OUTPUT>, observedAt?: Date) {
     switch (chunk.type) {
       case 'tool-call-input-streaming-start':
-        this.#startChunkSpan('tool-call', {
-          toolName: chunk.payload.toolName,
-          toolCallId: chunk.payload.toolCallId,
-        });
+        this.#startChunkSpan(
+          'tool-call',
+          {
+            toolName: chunk.payload.toolName,
+            toolCallId: chunk.payload.toolCallId,
+          },
+          observedAt,
+        );
         break;
 
       case 'tool-call-delta':
@@ -1687,11 +1732,14 @@ export class ModelSpanTracker {
         } catch {
           toolInput = acc.toolInput; // Keep as string if parsing fails
         }
-        this.#endChunkSpan({
-          toolName: acc.toolName,
-          toolCallId: acc.toolCallId,
-          toolInput,
-        });
+        this.#endChunkSpan(
+          {
+            toolName: acc.toolName,
+            toolCallId: acc.toolCallId,
+            toolInput,
+          },
+          observedAt,
+        );
         break;
       }
     }
@@ -1700,20 +1748,20 @@ export class ModelSpanTracker {
   /**
    * Handle object chunk spans (object, object-result)
    */
-  #handleObjectChunk<OUTPUT>(chunk: ChunkType<OUTPUT>) {
+  #handleObjectChunk<OUTPUT>(chunk: ChunkType<OUTPUT>, observedAt?: Date) {
     switch (chunk.type) {
       case 'object':
         // Start span on first partial object chunk (only if not already started)
         // Multiple object chunks may arrive as the object is being generated
         // Check specifically for object chunk type to allow transitioning from other types
         if (this.#currentChunkType !== 'object') {
-          this.#startChunkSpan('object');
+          this.#startChunkSpan('object', undefined, observedAt);
         }
         break;
 
       case 'object-result':
         // End the span with the final complete object as output
-        this.#endChunkSpan(chunk.object);
+        this.#endChunkSpan(chunk.object, observedAt);
         break;
     }
   }
@@ -1786,6 +1834,7 @@ export class ModelSpanTracker {
     return stream.pipeThrough(
       new TransformStream({
         transform: (chunk, controller) => {
+          const providerObservedAt = this.#takeProviderChunkTimestamp(chunk);
           // Capture completion start time on first actual content (for time-to-first-token)
           runSpanOperation(() => {
             switch (chunk.type) {
@@ -1806,25 +1855,25 @@ export class ModelSpanTracker {
               case 'text-start':
               case 'text-delta':
               case 'text-end':
-                this.#handleTextChunk(chunk);
+                this.#handleTextChunk(chunk, providerObservedAt);
                 break;
 
               case 'tool-call-input-streaming-start':
               case 'tool-call-delta':
               case 'tool-call-input-streaming-end':
               case 'tool-call':
-                this.#handleToolCallChunk(chunk);
+                this.#handleToolCallChunk(chunk, providerObservedAt);
                 break;
 
               case 'reasoning-start':
               case 'reasoning-delta':
               case 'reasoning-end':
-                this.#handleReasoningChunk(chunk);
+                this.#handleReasoningChunk(chunk, providerObservedAt);
                 break;
 
               case 'object':
               case 'object-result':
-                this.#handleObjectChunk(chunk);
+                this.#handleObjectChunk(chunk, providerObservedAt);
                 break;
 
               case 'step-start':
@@ -1864,8 +1913,8 @@ export class ModelSpanTracker {
 
               case 'finish':
                 if (this.#currentInferenceLifecycleOpen) {
-                  this.recordInferenceFinish(chunk.payload);
-                  this.#endChunkSpan();
+                  this.recordInferenceFinish(chunk.payload, providerObservedAt);
+                  this.#endChunkSpan(undefined, providerObservedAt);
                 }
                 break;
 

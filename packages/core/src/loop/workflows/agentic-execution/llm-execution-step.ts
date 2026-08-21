@@ -1937,7 +1937,10 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                   else modelSpanTracker?.reportInferenceError?.({ error: tracingError });
                 },
                 onProviderFirstContent: () => modelSpanTracker?.recordInferenceContentStart?.(),
-                onProviderFinish: (payload, endTime) => modelSpanTracker?.recordInferenceFinish?.(payload, endTime),
+                onProviderChunk: (chunk, observedAt) =>
+                  modelSpanTracker?.recordInferenceChunkTimestamp?.(chunk, observedAt),
+                onProviderFinish: (payload, endTime, response) =>
+                  modelSpanTracker?.recordInferenceFinish?.(payload, endTime, response),
                 onResult: ({
                   warnings: warningsFromStream,
                   request: requestFromStream,
@@ -2502,6 +2505,11 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
         const deferredError = getErrorFromUnknown(deferredChunk.payload.error, {
           fallbackMessage: 'Unknown error in agent stream',
         });
+        try {
+          modelSpanTracker?.reportGenerationError({ error: deferredError });
+        } catch {
+          // Tracing must never affect terminal error delivery.
+        }
         safeEnqueue(controller, { ...deferredChunk, payload: { ...deferredChunk.payload, error: deferredError } });
         await options?.onError?.({ error: deferredError });
         runState.setState({ deferredErrorChunk: undefined });

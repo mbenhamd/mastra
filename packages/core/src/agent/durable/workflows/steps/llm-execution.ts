@@ -1367,8 +1367,11 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                 onProviderFirstContent: () => {
                   runTracingSafely(() => modelSpanTracker?.recordInferenceContentStart?.());
                 },
-                onProviderFinish: (payload, endTime) => {
-                  runTracingSafely(() => modelSpanTracker?.recordInferenceFinish?.(payload, endTime));
+                onProviderChunk: (chunk, observedAt) => {
+                  runTracingSafely(() => modelSpanTracker?.recordInferenceChunkTimestamp?.(chunk, observedAt));
+                },
+                onProviderFinish: (payload, endTime, response) => {
+                  runTracingSafely(() => modelSpanTracker?.recordInferenceFinish?.(payload, endTime, response));
                 },
                 onResult: ({ warnings: w, request: r, rawResponse: rr }) => {
                   warnings = w || [];

@@ -1917,6 +1917,62 @@ describe('ModelSpanTracker', () => {
       }
     });
 
+    it.each(['step', 'generation'] as const)(
+      'preserves a pending successful inference when reporting a downstream %s error',
+      async failureScope => {
+        const modelSpan = tracing.startSpan({
+          type: SpanType.MODEL_GENERATION,
+          name: `downstream-${failureScope}-error-generation`,
+        });
+        const tracker = new ModelSpanTracker(modelSpan);
+        tracker.startStep();
+        tracker.startInference();
+
+        await consumeStream(
+          tracker.wrapStream(
+            createMockStream([
+              {
+                type: 'finish',
+                payload: {
+                  output: { usage: { inputTokens: 2, outputTokens: 1, totalTokens: 3 } },
+                  stepResult: { reason: 'stop', warnings: [], isContinued: false },
+                  metadata: {},
+                },
+              },
+            ]),
+          ),
+        );
+
+        const downstreamError = new Error(`downstream ${failureScope} failed`);
+        if (failureScope === 'step') {
+          tracker.reportStepError({ error: downstreamError });
+          tracker.endGeneration({ attributes: { finishReason: 'error' } });
+        } else {
+          tracker.reportGenerationError({ error: downstreamError });
+        }
+
+        const [inferenceSpan] = testExporter.getSpansByType(SpanType.MODEL_INFERENCE);
+        expect(inferenceSpan?.attributes).toMatchObject({
+          finishReason: 'stop',
+          providerOutcome: 'success',
+          providerUsageState: 'reported',
+        });
+        expect(inferenceSpan?.errorInfo).toBeUndefined();
+
+        const [generationSpan] = testExporter.getSpansByType(SpanType.MODEL_GENERATION);
+        expect(generationSpan?.attributes).toMatchObject({
+          providerSucceededInferenceCount: 1,
+          providerErrorInferenceCount: 0,
+          providerAbortedInferenceCount: 0,
+        });
+        const [stepSpan] = testExporter.getSpansByType(SpanType.MODEL_STEP);
+        expect(stepSpan?.errorInfo).toMatchObject({ message: downstreamError.message });
+        if (failureScope === 'generation') {
+          expect(generationSpan?.errorInfo).toMatchObject({ message: downstreamError.message });
+        }
+      },
+    );
+
     it('passes through accessor and proxy response metadata without invoking hooks or attributing it', async () => {
       const modelSpan = tracing.startSpan({
         type: SpanType.MODEL_GENERATION,

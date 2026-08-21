@@ -795,6 +795,58 @@ describe('regular Agent provider request ledger (real exporter)', () => {
     expect(testExporter.getIncompleteSpans()).toHaveLength(0);
   });
 
+  it('keeps producer response identity and terminal evidence authoritative over processor mutation', async () => {
+    const mutatingProcessor = {
+      id: 'mutating-provider-evidence',
+      name: 'Mutating provider evidence',
+      processOutputStream({ part }: { part: any }) {
+        if (part.type === 'response-metadata') {
+          part.payload.id = 'processor-response';
+          part.payload.modelId = 'processor-model';
+        }
+        if (part.type === 'finish') {
+          part.payload.stepResult.reason = 'error';
+          part.payload.output.usage = { inputTokens: 900, outputTokens: 99, totalTokens: 999 };
+          part.payload.metadata.providerMetadata = {
+            anthropic: { iterations: [{ type: 'fallback_message', model: 'processor-fallback-model' }] },
+          };
+        }
+        return part;
+      },
+    };
+    const agent = buildRegularMastra(
+      testExporter,
+      new Agent({
+        id: 'regular-provider-evidence-mutation',
+        name: 'regular-provider-evidence-mutation',
+        instructions: 'x',
+        model: responseIdentityModel('provider-response', 'requested-response-model', {
+          anthropic: { iterations: [{ type: 'fallback_message', model: 'served-fallback-model' }] },
+        }) as any,
+        outputProcessors: [mutatingProcessor as any],
+      }),
+    );
+
+    await runRegularToCompletion(agent, 'hi', testExporter);
+
+    const [inference] = testExporter.getSpansByType('model_inference' as any);
+    expect(inference?.attributes).toMatchObject({
+      responseId: 'provider-response',
+      responseModel: 'served-fallback-model',
+      finishReason: 'stop',
+      providerOutcome: 'success',
+      providerUsageState: 'reported',
+      usage: { inputTokens: 4, outputTokens: 2 },
+    });
+    const [generation] = testExporter.getSpansByType('model_generation' as any);
+    expect(generation?.attributes).toMatchObject({
+      providerSucceededInferenceCount: 1,
+      providerErrorInferenceCount: 0,
+      providerAbortedInferenceCount: 0,
+    });
+    expect(testExporter.getIncompleteSpans()).toHaveLength(0);
+  });
+
   it('ends regular inference at producer finish despite downstream chunk backpressure', async () => {
     let firstDeltaProcessorStartedAt: Date | undefined;
     let firstDeltaProcessorCompletedAt: Date | undefined;
@@ -860,6 +912,9 @@ describe('regular Agent provider request ledger (real exporter)', () => {
 
     const [inference] = testExporter.getSpansByType('model_inference' as any);
     const [step] = testExporter.getSpansByType('model_step' as any);
+    const [textChunk] = testExporter
+      .getSpansByType('model_chunk' as any)
+      .filter(span => span.attributes?.chunkType === 'text');
     expect(firstDeltaProcessorStartedAt).toBeDefined();
     expect(firstDeltaProcessorCompletedAt).toBeDefined();
     expect(inference?.attributes).toMatchObject({
@@ -867,8 +922,75 @@ describe('regular Agent provider request ledger (real exporter)', () => {
       responseModel: 'served-fallback-model',
       providerOutcome: 'success',
     });
+    expect(new Date(textChunk!.startTime!).getTime()).toBeGreaterThanOrEqual(new Date(inference!.startTime!).getTime());
+    expect(new Date(textChunk!.endTime!).getTime()).toBeLessThanOrEqual(new Date(inference!.endTime!).getTime());
     expect(new Date(inference!.endTime!).getTime()).toBeLessThan(firstDeltaProcessorCompletedAt!.getTime());
     expect(new Date(step!.endTime!).getTime()).toBeGreaterThanOrEqual(firstDeltaProcessorCompletedAt!.getTime());
+    expect(testExporter.getIncompleteSpans()).toHaveLength(0);
+  });
+
+  it('preserves a completed inference when an output processor fails after provider finish', async () => {
+    let finishFilteredAt: Date | undefined;
+    let responseProcessorFailedAt: Date | undefined;
+    const processorError = new Error('post-finish output processor failure');
+    const postFinishProcessor = {
+      id: 'post-finish-output-error',
+      name: 'Post-finish output error',
+      async processOutputStream({ part }: { part: { type?: string } }) {
+        if (part.type === 'finish') {
+          finishFilteredAt = new Date();
+          return null;
+        }
+        return part;
+      },
+      async processLLMResponse() {
+        await new Promise(resolve => setTimeout(resolve, 120));
+        responseProcessorFailedAt = new Date();
+        throw processorError;
+      },
+    };
+    const agent = buildRegularMastra(
+      testExporter,
+      new Agent({
+        id: 'regular-post-finish-processor-error',
+        name: 'regular-post-finish-processor-error',
+        instructions: 'x',
+        model: textModel('completed provider response') as any,
+        inputProcessors: [postFinishProcessor as any],
+        outputProcessors: [postFinishProcessor as any],
+      }),
+    );
+
+    try {
+      await runRegularToCompletion(agent, 'hi', testExporter);
+    } catch {
+      await settle(testExporter);
+    }
+
+    expect(finishFilteredAt).toBeDefined();
+    expect(responseProcessorFailedAt).toBeDefined();
+    const [inference] = testExporter.getSpansByType('model_inference' as any);
+    expect(inference?.attributes).toMatchObject({
+      providerOutcome: 'success',
+      providerUsageState: 'reported',
+      usage: { inputTokens: 10, outputTokens: 20 },
+    });
+    expect(inference?.errorInfo).toBeUndefined();
+    expect(new Date(inference!.endTime!).getTime()).toBeLessThan(responseProcessorFailedAt!.getTime());
+
+    const [step] = testExporter.getSpansByType('model_step' as any);
+    const [generation] = testExporter.getSpansByType('model_generation' as any);
+    expect(step?.attributes).toMatchObject({ finishReason: 'error' });
+    expect(step?.errorInfo).toMatchObject({ message: processorError.message });
+    expect(generation).toMatchObject({
+      attributes: {
+        finishReason: 'error',
+        providerSucceededInferenceCount: 1,
+        providerErrorInferenceCount: 0,
+        providerAbortedInferenceCount: 0,
+      },
+      errorInfo: { message: processorError.message },
+    });
     expect(testExporter.getIncompleteSpans()).toHaveLength(0);
   });
 
