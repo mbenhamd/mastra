@@ -6,24 +6,20 @@ import { SaveQueueManager } from '../../save-queue';
 import { globalRunRegistry } from '../run-registry';
 import { createDurableAgenticWorkflow } from './create-durable-agentic-workflow';
 
-function findStepEntry(steps: any[], id: string): any {
-  for (const entry of steps ?? []) {
-    if (entry.type === 'step' && entry.step?.id === id) return entry;
-    if (entry.step?.executionGraph) {
-      const nested = findStepEntry(entry.step.executionGraph.steps, id);
-      if (nested) return nested;
-    }
-    if (entry.steps) {
-      const nested = findStepEntry(entry.steps, id);
-      if (nested) return nested;
-    }
-  }
-  return undefined;
-}
-
 describe('createDurableAgenticWorkflow terminal result finalization', () => {
   const workflow = createDurableAgenticWorkflow() as any;
-  const finalOutputEntry = findStepEntry(workflow.executionGraph.steps, 'map-final-output');
+  // `map-final-output` is declared with `.map()`, so the execution graph holds a
+  // `{ type: 'mapping' }` entry that carries no `.step`. The runnable step exists only
+  // in `workflow.steps`, where `.map()` registers it via `createMappingStep`; that step
+  // dispatches through the same `runMappingEntry` the evented engine uses, so invoking
+  // it here exercises the real finalization path.
+  const finalOutputEntry = { step: workflow.steps['map-final-output'] };
+
+  it('resolves the map-final-output step this suite drives', () => {
+    // Guard the lookup itself: if `.map()` ever registers its runnable step elsewhere,
+    // fail here once and legibly instead of throwing an undefined-read in all 14 cases.
+    expect(finalOutputEntry.step).toBeDefined();
+  });
 
   function createRecoverableTerminalState(runId: string, runtimeBindingId: string, threadExists = true) {
     return {

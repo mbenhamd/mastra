@@ -83,7 +83,7 @@ Grants are intentionally in-memory and reset when the session restarts. See [Too
 
 ## Run state
 
-`session.run` tracks the in-flight generation: whether a run is active, its run and trace IDs, and the abort signal. Use it to reflect run status in your UI:
+`session.run` tracks the in-flight generation. It reports whether a run is active and exposes its run and trace IDs alongside the abort signal. Use it to reflect run status in your UI:
 
 ```typescript
 if (harness.session.run.isRunning()) {
@@ -102,7 +102,7 @@ A user may want to add to the conversation while the agent is still working. Ins
 const queued = harness.session.followUps.count()
 ```
 
-Queue a follow-up with `harness.followUp({ content })`. To redirect the agent mid-run instead of waiting, use `harness.steer({ content })`. Both build on [signals](/docs/long-running-agents/signals).
+Queue a follow-up with `harness.followUp({ content })`. To redirect the agent mid-run instead of waiting, use `harness.steer({ content })`. Both build on [signals](/docs/harness/signals).
 
 ## State
 

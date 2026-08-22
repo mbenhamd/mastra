@@ -43,7 +43,6 @@ import { PUBSUB_SYMBOL } from '../../../../workflows/constants';
 import { createStep } from '../../../../workflows/workflow';
 import { enforceChannelToolFence, readChannelToolFence } from '../../../channel-tool-fence';
 import { AGENT_RESPONSE_RECOVERY_STEP } from '../../../merge-execution-options';
-import { MessageList } from '../../../message-list';
 import {
   createProcessorToolSurfaceView,
   createToolSurfaceFence,
@@ -92,6 +91,10 @@ const durableLLMInputSchema = z.object({
   responseRecovery: durableResponseRecoveryStateSchema.optional(),
   state: z.any(),
   messageId: z.string(),
+  // JSON-safe request context snapshot, forwarded from iteration state so the
+  // rebuild-from-Mastra path resolves the model and tools with the caller's
+  // context rather than an empty one.
+  requestContextEntries: z.record(z.string(), z.any()).optional(),
   // Agent span data for model span parenting
   agentSpanData: z.any().optional(),
   // Model span data (ONE span for entire agent run, created before workflow)
@@ -441,7 +444,18 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
         return latestModelSpanData;
       };
 
+      // Provider attempts number monotonically across every retry and fallback model of this
+      // step, so the offset lives outside both loops — resetting it per model would collapse
+      // distinct provider attempts into one in the span aggregate.
       let providerAttemptCount = 0;
+
+      // Hoisted: a retry must keep the id an error processor rotated to.
+      let currentMessageId = messageId;
+      const rotateResponseMessageId = () => {
+        currentMessageId = messageList.rotateResponseMessageId(currentMessageId);
+        return currentMessageId;
+      };
+
       for (let modelIndex = 0; modelIndex < modelList.length; modelIndex++) {
         const modelEntry = modelList[modelIndex]!;
         const maxRetries = responseRecoveryReserved ? 0 : modelEntry.maxRetries || 0;
@@ -466,8 +480,6 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                 `Unsupported model version: ${(model as any).specificationVersion}. Model must implement doStream.${hint}`,
               );
             }
-
-            let currentMessageId = messageId;
 
             // 5. Prepare tools - cast through unknown as CoreTool and ToolSet are structurally compatible at runtime
             let currentModel = model;
@@ -581,10 +593,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                   threadId: typedInput.state?.threadId,
                   model: currentModel,
                   messageId: currentMessageId,
-                  rotateResponseMessageId: () => {
-                    currentMessageId = crypto.randomUUID();
-                    return currentMessageId;
-                  },
+                  rotateResponseMessageId,
                   tools: currentTools,
                   toolChoice: currentToolChoice,
                   providerOptions: currentProviderOptions,
@@ -816,7 +825,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
               if (isFirstModelRequest && registryEntry?.drainPendingSignals) {
                 const preRunSignals = registryEntry.drainPendingSignals('pre-run');
                 if (preRunSignals.length > 0) {
-                  currentMessageId = mastra?.generateId?.() ?? crypto.randomUUID();
+                  rotateResponseMessageId();
                 }
                 for (const preRunSignal of preRunSignals) {
                   const signalForTranscript = messageList.addSignal(preRunSignal);
@@ -1486,14 +1495,13 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
 
                 // Emit step-start before the first stream chunk so the
                 // ordering matches the regular agent: start → step-start → response-metadata → …
-                // onResult has already fired by the time the first chunk arrives,
-                // so `request` and `warnings` are populated.
+                // Keep the full model request out of the durable event stream; the helper
+                // preserves the canonical payload shape with an empty `request` object.
                 if (!stepStartEmitted && pubsub) {
                   stepStartEmitted = true;
                   await emitStepStartEvent(pubsub, runId, {
                     stepId: DurableStepIds.LLM_EXECUTION,
                     messageId: currentMessageId,
-                    request,
                     warnings,
                   });
                 }
@@ -1764,11 +1772,45 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
 
                   case 'error': {
                     const payload = rawChunk.payload as any;
+                    // Every read of a transported error payload is bounded: the payload is
+                    // untrusted `any`, and a proxy or throwing getter must not escape this switch.
+                    // The fatal emitter below serializes errors to a plain `{ message, stack, name }`
+                    // (a raw Error stringifies to `{}`), so prefer the producer's own text over the
+                    // generic fallback and carry cause/stack/name through — the catch below reads
+                    // `errorObj.name === 'AbortError'` to tell an abort from a retryable failure.
+                    const errorPayload = runTracingSafely(() => payload?.error);
                     const errorMessage =
-                      runTracingSafely(() =>
-                        durableErrorMessage(payload?.error ?? payload?.message, 'LLM execution error'),
-                      ) ?? 'LLM execution error';
-                    const errorObj = new Error(errorMessage);
+                      runTracingSafely(() => {
+                        // `payload.error.message` covers both a real Error and the flattened object.
+                        const transported = errorPayload?.message;
+                        // Return before touching `payload.message` so a throwing outer getter
+                        // cannot discard a message we already recovered.
+                        if (typeof transported === 'string' && transported) return transported;
+                        // `payload.error` may itself be a bare string; durableErrorMessage passes
+                        // those through and guards `instanceof Error` against hostile prototypes.
+                        // The empty fallback lets a message-less error object fall through to
+                        // `payload.message`, keeping this consumer's chain identical to the sibling
+                        // consumer in stream-adapter.ts that the same upstream commit added.
+                        return (
+                          durableErrorMessage(errorPayload, '') ||
+                          durableErrorMessage(payload?.message, 'LLM execution error')
+                        );
+                      }) || 'LLM execution error';
+                    const errorObj = new Error(errorMessage, { cause: errorPayload ?? payload });
+                    // Keep the producer's stack so crashes stay attributable to their real throw site.
+                    const producerStack = runTracingSafely(() =>
+                      typeof errorPayload?.stack === 'string' ? errorPayload.stack : undefined,
+                    );
+                    if (producerStack) {
+                      errorObj.stack = producerStack;
+                    }
+                    // Retain the producer's error name so classification (e.g. AbortError) survives transport.
+                    const producerName = runTracingSafely(() =>
+                      typeof errorPayload?.name === 'string' && errorPayload.name ? errorPayload.name : undefined,
+                    );
+                    if (producerName) {
+                      errorObj.name = producerName;
+                    }
                     // DON'T emit error event here - we might have fallback models to try
                     // Error event will be emitted after all models are exhausted
                     throw errorObj;
@@ -1840,12 +1882,12 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                     agentName: typedInput.agentName ?? typedInput.agentId,
                     processorStates: registryEntryInner.processorStates,
                   });
-                  const currentMessageList = new MessageList();
-                  currentMessageList.deserialize(typedInput.messageListState);
                   const { retry } = await runner.runProcessAPIError({
                     error: lastError,
-                    messages: currentMessageList.get.all.db(),
-                    messageList: currentMessageList,
+                    messages: messageList.get.all.db(),
+                    messageList,
+                    messageId: currentMessageId,
+                    rotateResponseMessageId,
                     stepNumber: (inputData as any).stepIndex ?? 0,
                     steps: (inputData as any).accumulatedSteps ?? [],
                     retryCount: processorRetryCount,
@@ -2363,12 +2405,12 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                   agentName: typedInput.agentName ?? typedInput.agentId,
                   processorStates: registryEntry.processorStates,
                 });
-                const currentMessageList = new MessageList();
-                currentMessageList.deserialize(typedInput.messageListState);
                 const { retry } = await runner.runProcessAPIError({
                   error: lastError,
-                  messages: currentMessageList.get.all.db(),
-                  messageList: currentMessageList,
+                  messages: messageList.get.all.db(),
+                  messageList,
+                  messageId: currentMessageId,
+                  rotateResponseMessageId,
                   stepNumber: (inputData as any).stepIndex ?? 0,
                   steps: (inputData as any).accumulatedSteps ?? [],
                   retryCount: processorRetryCount,
@@ -2414,7 +2456,16 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
           type: 'error',
           runId,
           from: ChunkFrom.AGENT,
-          payload: { error: fatalError },
+          // Serialize explicitly: a raw Error JSON-stringifies to `{}` on plain
+          // transports, which destroys the producer stack and makes crashes
+          // unattributable on the consumer side.
+          payload: {
+            error: {
+              message: fatalError.message,
+              stack: fatalError.stack,
+              name: fatalError.name,
+            },
+          },
         });
 
         // Emit step-finish so MastraModelOutput resolves finishReason to 'error'

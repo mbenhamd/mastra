@@ -1,13 +1,19 @@
-import type { EntityType } from '@mastra/core/observability';
+import { EntityType } from '@mastra/core/observability';
 import { useMastraClient } from '@mastra/react';
 import { useQuery } from '@tanstack/react-query';
 import { ROOT_ENTITY_TYPE_OPTIONS } from '@/domains/traces/trace-filters';
 
+type EntityTypeValue = `${EntityType}`;
+
 type UseEntityNamesOptions = {
-  entityType?: EntityType;
+  entityType?: EntityTypeValue;
   rootOnly?: boolean;
   enabled?: boolean;
 };
+
+function resolveEntityType(entityType: EntityTypeValue) {
+  return Object.values(EntityType).find(candidate => candidate === entityType);
+}
 
 export const useEntityNames = ({ entityType, rootOnly = false, enabled = true }: UseEntityNamesOptions = {}) => {
   const client = useMastraClient();
@@ -24,7 +30,9 @@ export const useEntityNames = ({ entityType, rootOnly = false, enabled = true }:
     queryFn: async () => {
       try {
         if (entityType) {
-          return await client.getEntityNames({ entityType });
+          const resolvedEntityType = resolveEntityType(entityType);
+          if (!resolvedEntityType) return { names: [] };
+          return await client.getEntityNames({ entityType: resolvedEntityType });
         }
 
         if (!rootOnly) {
@@ -32,9 +40,11 @@ export const useEntityNames = ({ entityType, rootOnly = false, enabled = true }:
         }
 
         const responses = await Promise.all(
-          ROOT_ENTITY_TYPE_OPTIONS.map(option =>
-            client.getEntityNames({ entityType: option.entityType as EntityType }),
-          ),
+          ROOT_ENTITY_TYPE_OPTIONS.map(option => {
+            const resolvedEntityType = resolveEntityType(option.entityType);
+            if (!resolvedEntityType) return { names: [] };
+            return client.getEntityNames({ entityType: resolvedEntityType });
+          }),
         );
 
         return {

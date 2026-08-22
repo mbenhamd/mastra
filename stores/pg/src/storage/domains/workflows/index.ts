@@ -5,6 +5,7 @@ import {
   normalizePerPage,
   TABLE_WORKFLOW_SNAPSHOT,
   TABLE_SCHEMAS,
+  matchesExpectedWorkflowStatus,
   WorkflowsStorage,
   applyWorkflowTerminalParentContinuationPatch,
   copyWorkflowTerminalParentContinuationContract,
@@ -125,6 +126,7 @@ import type {
   RetentionTablesDescriptor,
   TableRetentionPolicy,
 } from '@mastra/core/storage';
+import { parseSqlIdentifier } from '@mastra/core/utils';
 import type {
   StepResult,
   WorkflowRunState,
@@ -143,6 +145,7 @@ import {
 import type { TxClient } from '../../client';
 import { PgDB, resolvePgConfig, generateIndexSQL, generateTableSQL } from '../../db';
 import type { PgDomainConfig } from '../../db';
+import { buildConstraintName } from '../../db/constraint-utils';
 import { runPrune, resolveTargets } from '../../retention';
 
 class CorruptWorkflowTerminalSnapshotRecordError extends TypeError {
@@ -174,6 +177,44 @@ function getSchemaName(schema?: string) {
 function getTableName({ indexName, schemaName }: { indexName: string; schemaName?: string }) {
   const quotedIndexName = `"${indexName}"`;
   return schemaName ? `${schemaName}.${quotedIndexName}` : quotedIndexName;
+}
+
+/** Base name (before any schema prefix) of the `(workflow_name, "createdAt" DESC)` snapshot index. */
+const WORKFLOW_SNAPSHOT_CREATEDAT_INDEX = 'mastra_workflow_snapshot_name_createdat_idx';
+
+/**
+ * Schema-prefixed name of the createdAt snapshot index, normalized exactly like
+ * {@link workflowSnapshotStatusIndexName}. Raw concatenation is not safe here: the base name is
+ * 43 bytes, so any schema of 20 bytes or more overflows Postgres' 63-byte identifier limit, and
+ * `parseSqlIdentifier` throws on that — which would make `getExportDDL()` fail outright and make
+ * `createDefaultIndexes()` silently drop this index (its per-index catch only logs).
+ */
+function workflowSnapshotCreatedAtIndexName(schemaPrefix: string): string {
+  return buildConstraintName({ baseName: `${schemaPrefix}${WORKFLOW_SNAPSHOT_CREATEDAT_INDEX}` });
+}
+
+/** Base name (before any schema prefix) of the expression index backing the status filter. */
+const WORKFLOW_SNAPSHOT_STATUS_INDEX = 'mastra_workflow_snapshot_name_status_createdat_idx';
+
+/**
+ * Schema-prefixed name of the status index, lowercased and truncated the same way Postgres
+ * stores it, so the init snapshot's index set answers "does it exist?" without a probe or a
+ * no-op `CREATE INDEX` (schema-prefixed names routinely exceed the 63-byte limit).
+ */
+function workflowSnapshotStatusIndexName(schemaName?: string): string {
+  return buildConstraintName({
+    baseName: WORKFLOW_SNAPSHOT_STATUS_INDEX,
+    schemaName: schemaName && schemaName !== 'public' ? schemaName : undefined,
+  });
+}
+
+/**
+ * Expression index on `(workflow_name, snapshot->>'status', "createdAt" DESC)` so
+ * listWorkflowRuns() status filters can use an index instead of scanning every snapshot.
+ */
+function workflowSnapshotStatusIndexSQL(indexName: string, schemaName?: string): string {
+  const tableName = getTableName({ indexName: TABLE_WORKFLOW_SNAPSHOT, schemaName: getSchemaName(schemaName) });
+  return `CREATE INDEX IF NOT EXISTS "${indexName}" ON ${tableName} (workflow_name, (snapshot ->> 'status'), "createdAt" DESC)`;
 }
 
 /**
@@ -2591,38 +2632,20 @@ export class WorkflowsPG extends WorkflowsStorage {
   }
 
   /**
-   * Returns all DDL statements for this domain: table with unique constraint.
-   * Used by exportSchemas to produce a complete, reproducible schema export.
+   * Returns the workflow snapshot index plus the terminalization recovery and retention indexes.
+   *
+   * Only the snapshot index carries the schema prefix (truncated to Postgres' identifier limit
+   * by {@link workflowSnapshotCreatedAtIndexName}). The terminalization index names stay
+   * schema-unprefixed on purpose: they are created inside the target schema and the durable
+   * terminal-recovery contract asserts those stable identifiers in every schema.
    */
-  static getExportDDL(schemaName?: string): string[] {
-    const statements: string[] = [];
-
-    // Table (includes the UNIQUE constraint on workflow_name, run_id via generateTableSQL)
-    statements.push(
-      generateTableSQL({
-        tableName: TABLE_WORKFLOW_SNAPSHOT,
-        schema: TABLE_SCHEMAS[TABLE_WORKFLOW_SNAPSHOT],
-        schemaName,
-        includeAllConstraints: true,
-      }),
-    );
-    statements.push(WorkflowsPG.getTerminalizationTableDDL(schemaName));
-    statements.push(WorkflowsPG.getTerminalEffectTableDDL(schemaName));
-    statements.push(WorkflowsPG.getTerminalSnapshotTableDDL(schemaName));
-    statements.push(WorkflowsPG.getTerminalRecoveryAncestryTableDDL(schemaName));
-    statements.push(WorkflowsPG.getTerminalDestinationReceiptTableDDL(schemaName));
-    statements.push(WorkflowsPG.getWorkflowParentRevisionTableDDL(schemaName));
-    statements.push(WorkflowsPG.getTerminalContinuationPlanTableDDL(schemaName));
-    for (const index of WorkflowsPG.getDefaultIndexDefs(schemaName)) {
-      statements.push(generateIndexSQL(index, schemaName));
-    }
-
-    return statements;
-  }
-
-  /** Returns the terminalization recovery and retention indexes. */
-  static getDefaultIndexDefs(_schemaName?: string): CreateIndexOptions[] {
+  static getDefaultIndexDefs(schemaPrefix: string): CreateIndexOptions[] {
     return [
+      {
+        name: workflowSnapshotCreatedAtIndexName(schemaPrefix),
+        table: TABLE_WORKFLOW_SNAPSHOT,
+        columns: ['workflow_name', 'createdAt DESC'],
+      },
       {
         name: 'mastra_workflow_terminalizations_phase_lease_idx',
         table: TABLE_WORKFLOW_TERMINALIZATIONS,
@@ -2655,6 +2678,40 @@ export class WorkflowsPG extends WorkflowsStorage {
         where: `"effect_kind" = 'parent-workflow-step-end'`,
       },
     ];
+  }
+
+  /**
+   * Returns all DDL statements for this domain: table with unique constraint.
+   * Used by exportSchemas to produce a complete, reproducible schema export.
+   */
+  static getExportDDL(schemaName?: string): string[] {
+    const statements: string[] = [];
+    const parsedSchema = schemaName ? parseSqlIdentifier(schemaName, 'schema name') : '';
+    const schemaPrefix = parsedSchema && parsedSchema !== 'public' ? `${parsedSchema}_` : '';
+
+    // Table (includes the UNIQUE constraint on workflow_name, run_id via generateTableSQL)
+    statements.push(
+      generateTableSQL({
+        tableName: TABLE_WORKFLOW_SNAPSHOT,
+        schema: TABLE_SCHEMAS[TABLE_WORKFLOW_SNAPSHOT],
+        schemaName,
+        includeAllConstraints: true,
+      }),
+    );
+    statements.push(WorkflowsPG.getTerminalizationTableDDL(schemaName));
+    statements.push(WorkflowsPG.getTerminalEffectTableDDL(schemaName));
+    statements.push(WorkflowsPG.getTerminalSnapshotTableDDL(schemaName));
+    statements.push(WorkflowsPG.getTerminalRecoveryAncestryTableDDL(schemaName));
+    statements.push(WorkflowsPG.getTerminalDestinationReceiptTableDDL(schemaName));
+    statements.push(WorkflowsPG.getWorkflowParentRevisionTableDDL(schemaName));
+    statements.push(WorkflowsPG.getTerminalContinuationPlanTableDDL(schemaName));
+    for (const idx of WorkflowsPG.getDefaultIndexDefs(schemaPrefix)) {
+      statements.push(generateIndexSQL(idx, schemaName));
+    }
+
+    statements.push(`${workflowSnapshotStatusIndexSQL(workflowSnapshotStatusIndexName(parsedSchema), schemaName)};`);
+
+    return statements;
   }
 
   private static getTerminalizationTableDDL(schemaName?: string): string {
@@ -2899,21 +2956,39 @@ export class WorkflowsPG extends WorkflowsStorage {
     );`;
   }
 
+  /**
+   * Returns the workflow snapshot index plus the terminalization recovery and retention indexes.
+   */
   getDefaultIndexDefinitions(): CreateIndexOptions[] {
-    return WorkflowsPG.getDefaultIndexDefs(this.#schema);
+    const schemaPrefix = this.#schema !== 'public' ? `${this.#schema}_` : '';
+    return WorkflowsPG.getDefaultIndexDefs(schemaPrefix);
   }
 
-  /** Creates the terminalization recovery and retention indexes. */
+  /**
+   * Creates default indexes for optimal query performance, including the
+   * terminalization recovery and retention indexes.
+   */
   async createDefaultIndexes(): Promise<void> {
-    if (this.#skipDefaultIndexes) {
-      return;
-    }
+    if (this.#skipDefaultIndexes) return;
     for (const indexDef of this.getDefaultIndexDefinitions()) {
       try {
         await this.#db.createIndex(indexDef);
       } catch (error) {
-        this.logger?.warn?.(`Failed to create workflow index ${indexDef.name}:`, error);
+        this.logger?.warn?.(`Failed to create index ${indexDef.name}:`, error);
       }
+    }
+
+    // Expression index backing the status filter in listWorkflowRuns(). Only valid on jsonb
+    // columns — legacy json/text snapshot columns still go through the sanitizing regexp,
+    // which cannot use an index anyway.
+    const snapshotType = await this.#db.getColumnType(TABLE_WORKFLOW_SNAPSHOT, 'snapshot');
+    if (snapshotType !== 'jsonb') return;
+
+    const indexName = workflowSnapshotStatusIndexName(this.#schema);
+    try {
+      await this.#db.createIndexFromStatement(indexName, workflowSnapshotStatusIndexSQL(indexName, this.#schema));
+    } catch (error) {
+      this.logger?.warn?.(`Failed to create index ${indexName}:`, error);
     }
   }
 
@@ -3569,10 +3644,17 @@ export class WorkflowsPG extends WorkflowsStorage {
           throw new Error(`Snapshot not found for runId ${runId}`);
         }
 
+        // `expectedStatus` is a compare-and-set guard, not state. It is checked here, inside the
+        // row lock, and stripped so it can never be merged into the persisted snapshot.
+        // `finalState` is likewise a directive rather than snapshot state.
+        const { expectedStatus, finalState, ...stateOptions } = opts;
+        if (!matchesExpectedWorkflowStatus(snapshot.status, expectedStatus)) {
+          return undefined;
+        }
+
         // Merge the new options with the existing snapshot. A terminal
         // final-state write replaces both persisted state views under the same
         // row lock and uses the database clock for the workflow timestamp.
-        const { finalState, ...stateOptions } = opts;
         const updatedSnapshot = { ...snapshot, ...stateOptions };
         if (finalState !== undefined) {
           const clock = await t.one<{ now_ms: string }>(
@@ -3805,15 +3887,20 @@ export class WorkflowsPG extends WorkflowsStorage {
       }
 
       if (status) {
-        // Use regexp_replace to strip problematic Unicode escape sequences before casting to jsonb.
-        // PostgreSQL's jsonb cast fails on:
-        // - \u0000 (null character) with error 22P05 "unsupported Unicode escape sequence"
-        // - \uD800-\uDFFF (unpaired surrogates) with "Unicode low surrogate must follow a high surrogate"
-        // The regex pattern matches \u0000 and all surrogate code points (D800-DFFF).
+        // On jsonb columns PostgreSQL already rejects problematic Unicode escape sequences at
+        // insert time, so the sanitizing regexp is a no-op there — and it prevents the planner
+        // from using any index on the status field, forcing a sequential scan.
+        // Legacy tables whose snapshot column is still json/text can contain those sequences,
+        // so they keep the regexp_replace path:
+        // - \u0000 (null character) fails the jsonb cast with 22P05 "unsupported Unicode escape sequence"
+        // - \uD800-\uDFFF (unpaired surrogates) fail with "Unicode low surrogate must follow a high surrogate"
         // See: https://github.com/mastra-ai/mastra/issues/11563
-        conditions.push(
-          `regexp_replace(snapshot::text, '\\\\u(0000|[Dd][89A-Fa-f][0-9A-Fa-f]{2})', '', 'g')::jsonb ->> 'status' = $${paramIndex}`,
-        );
+        const snapshotType = await this.#db.getColumnType(TABLE_WORKFLOW_SNAPSHOT, 'snapshot');
+        const statusExpr =
+          snapshotType === 'jsonb'
+            ? `snapshot ->> 'status'`
+            : `regexp_replace(snapshot::text, '\\\\u(0000|[Dd][89A-Fa-f][0-9A-Fa-f]{2})', '', 'g')::jsonb ->> 'status'`;
+        conditions.push(`${statusExpr} = $${paramIndex}`);
         values.push(status);
         paramIndex++;
       }

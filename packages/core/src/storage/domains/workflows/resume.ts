@@ -496,10 +496,17 @@ export function persistWorkflowStepUpdateRecord(
   }
   if (isUnadmittedOrdinaryResume) {
     const existingResumeAttempt = existing.lifecycleResumeAttempt ?? 0;
-    if (existing.status !== 'suspended' && existing.status !== 'paused') {
-      return { status: 'stale_execution' };
-    }
-    if (existing.resumeCheckpoint !== undefined || input.expectedLifecycleResumeAttempt !== existingResumeAttempt + 1) {
+    // Two shapes complete an ordinary resume. Without an atomic claim the snapshot is
+    // still `suspended`/`paused` and the write carries the next attempt. With upstream's
+    // concurrent-resume claim (#21725) the snapshot is already `running` and stamped with
+    // the attempt now completing. Anything else — including a `running` row from some
+    // other attempt — stays stale.
+    const completesUnclaimedResume =
+      (existing.status === 'suspended' || existing.status === 'paused') &&
+      input.expectedLifecycleResumeAttempt === existingResumeAttempt + 1;
+    const completesClaimedResume =
+      existing.status === 'running' && input.expectedLifecycleResumeAttempt === existingResumeAttempt;
+    if (existing.resumeCheckpoint !== undefined || (!completesUnclaimedResume && !completesClaimedResume)) {
       return { status: 'stale_execution' };
     }
   } else if (

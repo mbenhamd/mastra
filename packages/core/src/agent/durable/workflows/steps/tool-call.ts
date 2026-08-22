@@ -1254,6 +1254,7 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
         messages: [],
         workspace,
         requestContext,
+        mcp: registryEntry?.mcp,
         tracingContext: toolTracingContext,
         // Use the actor supplied for this workflow segment (so FGA checks inside
         // tool execution see the same actor as the non-durable Agent path). A

@@ -11,13 +11,17 @@ import type {
   InputProcessorOrWorkflow,
   OutputProcessorOrWorkflow,
 } from '../../../processors';
-import { MASTRA_RESOURCE_ID_KEY, MASTRA_THREAD_ID_KEY, RequestContext } from '../../../request-context';
+import {
+  MASTRA_AUTH_TOKEN_KEY,
+  MASTRA_RESOURCE_ID_KEY,
+  MASTRA_THREAD_ID_KEY,
+  RequestContext,
+} from '../../../request-context';
 import { resolveToolApprovalRequirement, resolveToolRequiresApproval } from '../../../tools/approval';
 import type { ResolvedToolApproval } from '../../../tools/approval';
 import type { CoreTool, RequireToolApproval } from '../../../tools/types';
 import type { Workspace } from '../../../workspace';
-import { MessageList } from '../../message-list';
-import type { MastraDBMessage } from '../../message-list';
+import type { MastraDBMessage, MessageList } from '../../message-list';
 import { stableStringify } from '../../message-list/cache/stable-stringify';
 import type { SerializedMessageListState } from '../../message-list/state';
 import { SaveQueueManager } from '../../save-queue';
@@ -38,6 +42,7 @@ import type {
   DurableAgenticWorkflowInput,
   RegistryModelListEntry,
 } from '../types';
+import { createRunMessageList } from './run-message-list';
 import { serializeToolsMetadata } from './serialize-state';
 import { assertDurableToolHookPolicyAvailable } from './tool-hook-policy';
 
@@ -145,7 +150,18 @@ export function createDurableRuntimeRequestContext(options: {
 }): RequestContext {
   const context = new RequestContext();
   for (const [key, value] of Object.entries(options.entries ?? {})) {
-    if (key === 'MastraMemory' || key === MASTRA_THREAD_ID_KEY || key === MASTRA_RESOURCE_ID_KEY) continue;
+    // The framework-managed bearer token is deliberately never persisted into
+    // `requestContextEntries` (see preparation.ts). Legacy snapshots may still
+    // carry one, and a stale bearer token must never be restored — only the
+    // live run-level context below may reinstate it.
+    if (
+      key === 'MastraMemory' ||
+      key === MASTRA_THREAD_ID_KEY ||
+      key === MASTRA_RESOURCE_ID_KEY ||
+      key === MASTRA_AUTH_TOKEN_KEY
+    ) {
+      continue;
+    }
     context.set(key, value);
   }
   for (const [key, value] of options.liveContext?.entries() ?? []) {
@@ -245,7 +261,8 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
   // stale objects).
   const messageList = globalEntry?.messageList
     ? globalEntry.messageList.deserialize(input.messageListState)
-    : new MessageList({
+    : createRunMessageList({
+        mastra,
         threadId: input.state.threadId,
         resourceId: input.state.resourceId,
       }).deserialize(input.messageListState);
@@ -484,7 +501,7 @@ export async function rebuildRunToolsFromMastra(options: {
     const processorMessages =
       options.processorMessages ??
       (messageListState
-        ? new MessageList({ threadId: state.threadId, resourceId: state.resourceId })
+        ? createRunMessageList({ mastra, threadId: state.threadId, resourceId: state.resourceId })
             .deserialize(messageListState)
             .get.all.db()
         : undefined);

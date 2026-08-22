@@ -14,8 +14,8 @@ import { createLLMExecutionStep } from './llm-execution-step';
 import { createLLMMappingStep } from './llm-mapping-step';
 import { createSignalDrainStep } from './signal-drain-step';
 import {
+  normalizeToolCallConcurrency,
   resolveCalledBatchToolCallConcurrency,
-  resolveConfiguredToolCallConcurrency,
   resolveToolCallConcurrency,
 } from './tool-call-concurrency';
 import type { ToolCallForeachOptions } from './tool-call-concurrency';
@@ -28,11 +28,25 @@ export function createAgenticExecutionWorkflow<Tools extends ToolSet = ToolSet, 
   _internal,
   ...rest
 }: OuterLLMRun<Tools, OUTPUT>) {
-  const configuredToolCallConcurrency = resolveConfiguredToolCallConcurrency(rest.toolCallConcurrency);
+  // Upstream shipped the fork's called-batch narrowing (perf: c86ba4ac5af8) as the
+  // opt-in `'called'` strategy with an `'available'` default, so the fork's
+  // behaviour is now expressed by CONFIGURING the strategy, not by diverging on the
+  // default. `normalizeToolCallConcurrency` owns that default (and its test pins it);
+  // resolving it here instead of re-deriving keeps the loop, the durable engine
+  // (agent/durable/workflows/shared/tool-call-concurrency.ts) and the documented
+  // `ToolCallConcurrency` contract in loop/types.ts on one answer.
+  // Surfaces that want the fork's parallel batches pass
+  // `toolCallConcurrency: { limit, strategy: 'called' }`.
+  const { limit: configuredToolCallConcurrency, strategy: toolCallConcurrencyStrategy } = normalizeToolCallConcurrency(
+    rest.toolCallConcurrency,
+  );
   const permissionPolicy = rest.requestContext?.get(TOOL_PERMISSION_POLICY_KEY) as ToolPermissionPolicy | undefined;
   const toolCallForeachOptions: ToolCallForeachOptions = {
     // This initial value is a conservative fallback for resume paths that can enter
     // a suspended foreach before llm-execution recomputes the effective step tools.
+    // Use the 'available' strategy here regardless of the configured strategy: the
+    // called tool set is not known yet, and map-tool-calls narrows it before the
+    // foreach actually consumes this value.
     concurrency: resolveToolCallConcurrency({
       requireToolApproval: rest.requireToolApproval,
       tools: rest.tools,
@@ -123,16 +137,35 @@ export function createAgenticExecutionWorkflow<Tools extends ToolSet = ToolSet, 
       async ({ inputData }) => {
         const typedInputData = inputData as LLMIterationData<Tools, OUTPUT>;
         const toolCalls = typedInputData.output.toolCalls || [];
-        // Recompute concurrency from the tools the model actually CALLED this
-        // step, not from the whole registered/active set — see
-        // resolveCalledBatchToolCallConcurrency for the safety argument.
-        toolCallForeachOptions.concurrency = resolveCalledBatchToolCallConcurrency({
-          toolCalls,
-          requireToolApproval: rest.requireToolApproval,
-          tools: ((_internal?.stepTools as Tools | undefined) ?? rest.tools) as Tools | undefined,
-          permissionPolicy,
-          configuredConcurrency: configuredToolCallConcurrency,
-        });
+        // Recompute concurrency now that the model has emitted its tool calls.
+        //
+        // Default ('available'): resolve from the step's effective active tool
+        // set (set by llm-execution-step), NOT from the tools the model actually
+        // called. A registered approval/suspending tool that the model did not
+        // call this step still forces sequential execution.
+        //
+        // Opt-in ('called'): resolve from the tools the model actually called
+        // this step — see resolveCalledBatchToolCallConcurrency for the safety
+        // argument. A pure-safe batch parallelizes even while an approval/suspend
+        // tool stays registered; a batch that calls one still serializes; run-wide
+        // requireToolApproval still forces sequential.
+        const stepTools = ((_internal?.stepTools as Tools | undefined) ?? rest.tools) as Tools | undefined;
+        toolCallForeachOptions.concurrency =
+          toolCallConcurrencyStrategy === 'called'
+            ? resolveCalledBatchToolCallConcurrency({
+                toolCalls,
+                requireToolApproval: rest.requireToolApproval,
+                tools: stepTools,
+                permissionPolicy,
+                configuredConcurrency: configuredToolCallConcurrency,
+              })
+            : resolveToolCallConcurrency({
+                requireToolApproval: rest.requireToolApproval,
+                tools: stepTools,
+                activeTools: _internal?.stepActiveTools as string[] | undefined,
+                permissionPolicy,
+                configuredConcurrency: configuredToolCallConcurrency,
+              });
         return toolCalls;
       },
       { id: 'map-tool-calls' },

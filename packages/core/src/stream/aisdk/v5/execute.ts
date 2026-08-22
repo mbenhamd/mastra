@@ -8,6 +8,12 @@ import type { StructuredOutputOptions } from '../../../agent/types';
 import type { ModelMethodType } from '../../../llm/model/model.loop.types';
 import { modelSupportsStructuredOutput } from '../../../llm/model/provider-registry';
 import type { MastraLanguageModel, SharedProviderOptions } from '../../../llm/model/shared.types';
+import {
+  createTimeoutAbortSignal,
+  guardStreamWithAbort,
+  isMastraTimeoutError,
+  raceAgainstAbort,
+} from '../../../loop/timeout';
 import type { LoopOptions } from '../../../loop/types';
 import type { ModelInferenceFinishPayload, PreparedModelRequestMetrics } from '../../../observability';
 import { createExactJsonMeasurementSnapshot } from '../../../observability/content-free-measurement';
@@ -35,6 +41,11 @@ const RETRY_BACKOFF_FACTOR = 2;
  */
 function isRetryableModelError(error: unknown): boolean {
   try {
+    // A step budget covers the whole attempt, so burning what is left of it on retries
+    // against the same model would only delay the fallback to the next one.
+    if (isMastraTimeoutError(error)) return false;
+    // Guarded together: both predicates walk the thrown value's prototype chain
+    // (`instanceof` / `name`), which a hostile value can make throw.
     if (isAbortError(error)) return false;
   } catch {
     // A hostile thrown value must not make observability or retry inspection throw.
@@ -585,137 +596,181 @@ export function execute<OUTPUT = undefined>({
     createStream: async () => {
       const preparationResumedAtMs = Date.now();
       try {
-        const filteredModelSettings = omit(modelSettings || {}, ['maxRetries', 'headers']);
-        const abortSignal = options?.abortSignal;
+        const filteredModelSettings = omit(modelSettings || {}, ['maxRetries', 'headers', 'timeout']);
+
+        // Bound this single model call by modelSettings.timeout.stepMs, composed with
+        // whatever signal the run already carries. The budget stays armed until the
+        // returned stream ends, so a provider that stalls mid-stream is caught too.
+        const { signal: abortSignal, cleanup: cleanupStepTimeout } = createTimeoutAbortSignal({
+          parentSignal: options?.abortSignal,
+          timeoutMs: modelSettings?.timeout?.stepMs,
+          timeoutType: 'step',
+        });
 
         const pRetry = await import('p-retry');
-        return await pRetry.default(
-          async attemptNumber => {
-            const providerAttempt = providerAttemptOffset + attemptNumber;
-            // Starts after p-retry has completed any backoff, so retry delay is
-            // never reported as provider request preparation.
-            const attemptPreparationStartedAtMs = Date.now();
-            const fn = (methodType === 'stream' ? model.doStream : model.doGenerate).bind(model);
-            // Preserve the pre-observability retry contract: every provider
-            // attempt receives a fresh top-level request object. Some adapters
-            // annotate their input synchronously, and reusing one object here
-            // would let a failed attempt contaminate the next retry.
-            const providerRequest = {
-              ...toolsAndToolChoice,
-              prompt,
-              providerOptions: providerOptionsToUse,
-              abortSignal,
-              includeRawChunks,
-              responseFormat: providerResponseFormat,
-              ...filteredModelSettings,
-              headers,
-            };
-            let requestMeasurement: PreparedRequestMeasurement | undefined;
-            if (onPreparedRequest) {
-              try {
-                // Detach all measurement inputs before the adapter takes
-                // ownership of providerRequest. Adapters may mutate it
-                // synchronously or retain it beyond this invocation.
-                requestMeasurement = preparedRequestMeasurement({
-                  providerRequest,
-                  providerOptions: providerOptionsToUse,
-                  prompt,
-                  responseSchema: responseSchemaForMeasurement,
-                  responseSchemaInline,
-                });
-              } catch {
-                // Measurement must never prevent or delay a provider failure.
+        const retryResult = await pRetry
+          .default(
+            async attemptNumber => {
+              const providerAttempt = providerAttemptOffset + attemptNumber;
+              // Starts after p-retry has completed any backoff, so retry delay is
+              // never reported as provider request preparation.
+              const attemptPreparationStartedAtMs = Date.now();
+              const fn = (methodType === 'stream' ? model.doStream : model.doGenerate).bind(model);
+              // Preserve the pre-observability retry contract: every provider
+              // attempt receives a fresh top-level request object. Some adapters
+              // annotate their input synchronously, and reusing one object here
+              // would let a failed attempt contaminate the next retry.
+              const providerRequest = {
+                ...toolsAndToolChoice,
+                prompt,
+                providerOptions: providerOptionsToUse,
+                abortSignal,
+                includeRawChunks,
+                responseFormat: providerResponseFormat,
+                ...filteredModelSettings,
+                headers,
+              };
+              let requestMeasurement: PreparedRequestMeasurement | undefined;
+              if (onPreparedRequest) {
+                try {
+                  // Detach all measurement inputs before the adapter takes
+                  // ownership of providerRequest. Adapters may mutate it
+                  // synchronously or retain it beyond this invocation.
+                  requestMeasurement = preparedRequestMeasurement({
+                    providerRequest,
+                    providerOptions: providerOptionsToUse,
+                    prompt,
+                    responseSchema: responseSchemaForMeasurement,
+                    responseSchemaInline,
+                  });
+                } catch {
+                  // Measurement must never prevent or delay a provider failure.
+                }
               }
-            }
-            try {
-              onProviderAttemptStart?.(providerAttempt);
-            } catch {
-              // Tracing must never prevent the provider call.
-            }
-            // Cast needed: V2 and V3 call options are structurally compatible but typed differently
-            // (e.g., tool types differ: V2 uses 'provider-defined', V3 uses 'provider')
-            const providerDispatchTimestampMs = Date.now();
-            try {
-              let streamResultPromise: unknown;
               try {
-                // Invoke the adapter before notifying observers so they cannot add
-                // to provider dispatch latency. Post-dispatch reporting consumes
-                // only the detached, content-free measurement captured before the
-                // adapter received the live request object.
-                streamResultPromise = (fn as Function)(providerRequest);
-              } finally {
-                if (onPreparedRequest && requestMeasurement) {
-                  try {
-                    onPreparedRequest({
-                      ...requestMeasurement,
-                      providerAttempt,
-                      providerDispatchTimestampMs,
-                      // Each retry receives a fresh request object, but only the
-                      // first attempt owns shared prompt/tool preparation. Every
-                      // attempt reports its own request construction and detached
-                      // measurement work without including p-retry backoff.
-                      providerPreparationMs:
-                        Math.max(0, providerDispatchTimestampMs - attemptPreparationStartedAtMs) +
-                        (attemptNumber === 1
-                          ? preparationBeforeProviderCallbackMs +
-                            Math.max(0, attemptPreparationStartedAtMs - preparationResumedAtMs)
-                          : 0),
-                    });
-                  } catch {
-                    // Measurement and observers must never prevent the provider call.
+                onProviderAttemptStart?.(providerAttempt);
+              } catch {
+                // Tracing must never prevent the provider call.
+              }
+              // Cast needed: V2 and V3 call options are structurally compatible but typed differently
+              // (e.g., tool types differ: V2 uses 'provider-defined', V3 uses 'provider')
+              const providerDispatchTimestampMs = Date.now();
+              try {
+                let streamResultPromise: unknown;
+                try {
+                  // Invoke the adapter before notifying observers so they cannot add
+                  // to provider dispatch latency. Post-dispatch reporting consumes
+                  // only the detached, content-free measurement captured before the
+                  // adapter received the live request object.
+                  streamResultPromise = (fn as Function)(providerRequest);
+                } finally {
+                  if (onPreparedRequest && requestMeasurement) {
+                    try {
+                      onPreparedRequest({
+                        ...requestMeasurement,
+                        providerAttempt,
+                        providerDispatchTimestampMs,
+                        // Each retry receives a fresh request object, but only the
+                        // first attempt owns shared prompt/tool preparation. Every
+                        // attempt reports its own request construction and detached
+                        // measurement work without including p-retry backoff.
+                        providerPreparationMs:
+                          Math.max(0, providerDispatchTimestampMs - attemptPreparationStartedAtMs) +
+                          (attemptNumber === 1
+                            ? preparationBeforeProviderCallbackMs +
+                              Math.max(0, attemptPreparationStartedAtMs - preparationResumedAtMs)
+                            : 0),
+                      });
+                    } catch {
+                      // Measurement and observers must never prevent the provider call.
+                    }
                   }
                 }
-              }
-              const streamResult = await streamResultPromise;
+                // Raced rather than merely signalled: a provider that ignores `abortSignal`
+                // would otherwise hang straight past its budget. The race is armed on the
+                // already-dispatched promise, in the same synchronous turn as the dispatch,
+                // so the budget still bounds the provider call while
+                // `providerDispatchTimestampMs` stays the exact provider request boundary.
+                // Promise.resolve keeps the pre-race tolerance for an adapter that returns a
+                // non-thenable; it is identity for a native promise, so it costs no tick.
+                const streamResult = await raceAgainstAbort(Promise.resolve(streamResultPromise), abortSignal);
 
-              // We have to cast this because doStream is missing the warnings property in its return type even though it exists
-              return streamResult as unknown as LanguageModelV2StreamResult;
-            } catch (error) {
-              let aborted = abortSignal?.aborted === true;
-              if (!aborted) {
+                // We have to cast this because doStream is missing the warnings property in its return type even though it exists
+                return streamResult as unknown as LanguageModelV2StreamResult;
+              } catch (error) {
+                // `abortSignal` is now the composed step budget, not the caller's signal, so
+                // `aborted` alone would relabel every timeout as a clean cancellation. A
+                // Mastra timeout is a failure (see MastraTimeoutError in loop/timeout.ts) and
+                // must stay on the inference-error boundary. The signal reason is checked
+                // first because our own budget sets it, which settles the classification even
+                // when the provider's AbortError wins the race against the budget rejection.
+                let timedOut = false;
                 try {
-                  aborted = isAbortError(error);
+                  // `instanceof` walks the value's prototype chain, so it is guarded exactly
+                  // like isAbortError below.
+                  timedOut = isMastraTimeoutError(abortSignal?.reason) || isMastraTimeoutError(error);
                 } catch {
-                  // Retry/error behavior remains unchanged for hostile thrown values.
+                  // A hostile value must not stop the attempt boundary from being reported.
                 }
+                let aborted = !timedOut && abortSignal?.aborted === true;
+                if (!aborted && !timedOut) {
+                  try {
+                    aborted = isAbortError(error);
+                  } catch {
+                    // Retry/error behavior remains unchanged for hostile thrown values.
+                  }
+                }
+                try {
+                  onProviderAttemptError?.({ error, providerAttempt, aborted });
+                } catch {
+                  // Tracing must never change retry or terminal error behavior.
+                }
+                throw error;
               }
-              try {
-                onProviderAttemptError?.({ error, providerAttempt, aborted });
-              } catch {
-                // Tracing must never change retry or terminal error behavior.
-              }
-              throw error;
-            }
-          },
-          {
-            retries: modelSettings?.maxRetries ?? 2,
-            signal: abortSignal,
-            // Pinned to p-retry's own defaults so the backoff it schedules stays
-            // unchanged while remaining computable in onFailedAttempt below.
-            minTimeout: RETRY_MIN_TIMEOUT_MS,
-            factor: RETRY_BACKOFF_FACTOR,
-            async onFailedAttempt(context) {
-              // Runs before shouldRetry, so bail on anything that will not be retried:
-              // a terminal error must not wait out a provider delay it will never use.
-              if (context.retriesLeft <= 0 || !isRetryableModelError(context.error)) return;
-
-              const retryAfterMs = getRetryAfterMs(context.error);
-              if (retryAfterMs === undefined) return;
-
-              // p-retry applies its own exponential delay after this hook resolves, so
-              // wait only the remainder. Total wait lands on
-              // max(backoff, min(Retry-After, cap)), the same rule
-              // StreamErrorRetryProcessor applies, keeping a hostile or very large
-              // Retry-After from wedging the run.
-              const boundedRetryAfterMs = Math.min(retryAfterMs, DEFAULT_MAX_RETRY_AFTER_MS);
-              const scheduledBackoffMs = RETRY_MIN_TIMEOUT_MS * RETRY_BACKOFF_FACTOR ** (context.attemptNumber - 1);
-              await waitDelay(boundedRetryAfterMs - scheduledBackoffMs, abortSignal);
             },
-            shouldRetry(context) {
-              return isRetryableModelError(context.error);
+            {
+              retries: modelSettings?.maxRetries ?? 2,
+              signal: abortSignal,
+              // Pinned to p-retry's own defaults so the backoff it schedules stays
+              // unchanged while remaining computable in onFailedAttempt below.
+              minTimeout: RETRY_MIN_TIMEOUT_MS,
+              factor: RETRY_BACKOFF_FACTOR,
+              async onFailedAttempt(context) {
+                // Runs before shouldRetry, so bail on anything that will not be retried:
+                // a terminal error must not wait out a provider delay it will never use.
+                if (context.retriesLeft <= 0 || !isRetryableModelError(context.error)) return;
+
+                const retryAfterMs = getRetryAfterMs(context.error);
+                if (retryAfterMs === undefined) return;
+
+                // p-retry applies its own exponential delay after this hook resolves, so
+                // wait only the remainder. Total wait lands on
+                // max(backoff, min(Retry-After, cap)), the same rule
+                // StreamErrorRetryProcessor applies, keeping a hostile or very large
+                // Retry-After from wedging the run.
+                const boundedRetryAfterMs = Math.min(retryAfterMs, DEFAULT_MAX_RETRY_AFTER_MS);
+                const scheduledBackoffMs = RETRY_MIN_TIMEOUT_MS * RETRY_BACKOFF_FACTOR ** (context.attemptNumber - 1);
+                await waitDelay(boundedRetryAfterMs - scheduledBackoffMs, abortSignal);
+              },
+              shouldRetry(context) {
+                return isRetryableModelError(context.error);
+              },
             },
-          },
-        );
+          )
+          .catch(error => {
+            cleanupStepTimeout();
+            throw error;
+          });
+
+        if (!retryResult?.stream) {
+          cleanupStepTimeout();
+          return retryResult;
+        }
+
+        return {
+          ...retryResult,
+          stream: guardStreamWithAbort(retryResult.stream, abortSignal, cleanupStepTimeout),
+        } as unknown as LanguageModelV2StreamResult;
       } catch (error) {
         if (shouldThrowError) {
           throw error;

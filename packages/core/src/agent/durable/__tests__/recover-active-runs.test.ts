@@ -146,8 +146,8 @@ describe('DurableAgent.recoverActiveRuns', () => {
   });
 
   it('restarts every discovered running run for this agent', async () => {
-    await seed(store, makeSnapshot('run-1', 'running', { agentId: 'agent-A', threadId: 't', resourceId: 'r' }), 'r');
-    await seed(store, makeSnapshot('run-2', 'running', { agentId: 'agent-A', threadId: 't', resourceId: 'r' }), 'r');
+    await seed(store, makeSnapshot('run-1', 'running', { agentId: 'agent-A', threadId: 't-1', resourceId: 'r' }), 'r');
+    await seed(store, makeSnapshot('run-2', 'running', { agentId: 'agent-A', threadId: 't-2', resourceId: 'r' }), 'r');
     const { restartedRunIds } = stubWorkflow(agent);
 
     const { recovered, succeeded, failed } = await agent.recoverActiveRuns();
@@ -248,7 +248,7 @@ describe('DurableAgent.recoverActiveRuns', () => {
       store,
       makeSnapshot('run-good-1', 'running', {
         agentId: 'agent-A',
-        threadId: 't',
+        threadId: 't-good-1',
         resourceId: 'r',
       }),
       'r',
@@ -257,7 +257,7 @@ describe('DurableAgent.recoverActiveRuns', () => {
       store,
       makeSnapshot('run-bad', 'running', {
         agentId: 'agent-A',
-        threadId: 't',
+        threadId: 't-bad',
         resourceId: 'r',
       }),
       'r',
@@ -266,7 +266,7 @@ describe('DurableAgent.recoverActiveRuns', () => {
       store,
       makeSnapshot('run-good-2', 'running', {
         agentId: 'agent-A',
-        threadId: 't',
+        threadId: 't-good-2',
         resourceId: 'r',
       }),
       'r',

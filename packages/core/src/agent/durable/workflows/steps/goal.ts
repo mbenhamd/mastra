@@ -20,10 +20,10 @@ import {
   resolveEffectiveGoalSettings,
   resolveGoalStore,
 } from '../../../goal';
-import { MessageList } from '../../../message-list';
 import type { ToolsInput } from '../../../types';
 import { globalRunRegistry } from '../../run-registry';
 import { emitChunkEvent } from '../../stream-adapter';
+import { createRunMessageList } from '../../utils/run-message-list';
 import { resolveDurableRequestContext } from '../shared';
 
 function isWorkingMemoryTool(name: string): boolean {
@@ -345,8 +345,7 @@ export function createDurableGoalStep() {
         }
 
         // Build scorer context.
-        const messageList = new MessageList();
-        messageList.deserialize(state.messageListState);
+        const messageList = createRunMessageList({ mastra }).deserialize(state.messageListState);
 
         const toolCalls = (lastStep?.toolCalls ?? []) as Array<{ toolName?: string; args?: unknown }>;
         const toolResults = (lastStep?.toolResults ?? []) as Array<{ toolName?: string; result?: unknown }>;
@@ -486,8 +485,7 @@ export function createDurableGoalStep() {
       };
 
       // Inject feedback into messageList via signal so the next LLM call sees it.
-      const messageList = new MessageList();
-      messageList.deserialize(nextState.messageListState);
+      const messageList = createRunMessageList({ mastra }).deserialize(nextState.messageListState);
 
       let currentMessageId = nextState.messageId;
       const sendSignal = createProcessorSendSignal({
@@ -500,7 +498,7 @@ export function createDurableGoalStep() {
             }
           : undefined,
         rotateResponseMessageId: () => {
-          currentMessageId = mastra?.generateId?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+          currentMessageId = messageList.rotateResponseMessageId(currentMessageId);
           nextState.messageId = currentMessageId;
           return currentMessageId;
         },

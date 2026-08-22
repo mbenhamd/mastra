@@ -10,20 +10,18 @@ import { derivePredicateLabel } from '../predicate';
 import type { Step } from '../step';
 import { createStepFromAgent, createStepFromTool } from '../step-factories';
 import { SERIALIZED_AGENT_PASSTHROUGH_OPTION_KEYS } from '../types';
-import type {
-  SerializedSingleStepEntry,
-  SerializedStepFlowEntry,
-  SerializedStepOptions,
-  SingleStepEntry,
-  StepFlowEntry,
-} from '../types';
+import type { SerializedSingleStepEntry, SerializedStepOptions, SingleStepEntry, StepFlowEntry } from '../types';
 import { getSingleStepEntryId } from '../utils';
 import { mapVariable, predicateToCondition } from '../workflow';
 import { jsonSchemaToZod } from './json-schema-to-zod';
 import type { JsonSchema, JsonSchemaToZodOptions } from './json-schema-to-zod';
 import { parseMapConfig } from './mapping-config';
+import type { ValidatableStepFlowEntry } from './validate/types';
 
-/** JSON shape persisted to WorkflowDefinitionsStorage. */
+/**
+ * JSON shape persisted to WorkflowDefinitionsStorage, and the same shape
+ * `addDynamicWorkflows` hydrates from before it writes the row.
+ */
 export interface DynamicWorkflowGraph {
   id: string;
   description?: string;
@@ -32,7 +30,7 @@ export interface DynamicWorkflowGraph {
   outputSchema: JsonSchema;
   stateSchema?: JsonSchema;
   requestContextSchema?: JsonSchema;
-  graph: SerializedStepFlowEntry[];
+  graph: ValidatableStepFlowEntry[];
 }
 
 /**
@@ -83,7 +81,7 @@ export async function rehydrateWorkflow(
 
 function applyGraphEntry(
   wf: any,
-  entry: SerializedStepFlowEntry,
+  entry: ValidatableStepFlowEntry,
   mastra: Mastra,
   schemaOpts?: JsonSchemaToZodOptions,
 ): void {

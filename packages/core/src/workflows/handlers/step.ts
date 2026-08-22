@@ -37,6 +37,7 @@ import type {
 import {
   validateStepInput,
   createDeprecationProxy,
+  omitPriorCompletionFields,
   runCountDeprecationMessage,
   validateStepResumeData,
   validateStepSuspendData,
@@ -93,7 +94,7 @@ export async function executeStep(
     abortController,
     requestContext,
     actor,
-    skipEmits = false,
+    skipEmits: skipEmitsParam = false,
     outputWriter,
     disableScorers,
     serializedStepGraph,
@@ -102,6 +103,7 @@ export async function executeStep(
     deferLifecycleResult,
     ...rest
   } = params;
+  const skipEmits = skipEmitsParam || engine.options.emitStepEvents === false;
   const observabilityContext = resolveObservabilityContext(rest);
 
   const executionGeneration = requireWorkflowExecutionGeneration(
@@ -193,7 +195,9 @@ export async function executeStep(
   const resumeTime = isResume ? Date.now() : undefined;
 
   const stepInfo = {
-    ...stepResults[step.id],
+    // Drop prior completion/suspend fields so they cannot linger across re-entry
+    // (e.g. suspendPayload/suspendedAt after resume, or startedAt > suspendedAt on loops).
+    ...omitPriorCompletionFields((stepResults[step.id] ?? {}) as Record<string, unknown>),
     ...(isResume ? { resumePayload: resumeDataToUse } : { payload: inputData }),
     ...(startTime ? { startedAt: startTime } : {}),
     ...(resumeTime ? { resumedAt: resumeTime } : {}),
@@ -323,7 +327,10 @@ export async function executeStep(
         }
       }
 
-      const stepResult = { ...stepInfo, ...workflowResult } as StepResult<any, any, any, any>;
+      const stepResult = {
+        ...omitPriorCompletionFields(stepInfo),
+        ...workflowResult,
+      } as StepResult<any, any, any, any>;
       const authoritativeDisposition = executionContext.transientExecution
         ? undefined
         : await engine.getAuthoritativeExecutionDisposition({
@@ -671,7 +678,9 @@ export async function executeStep(
         stepAttempt: lifecycleStepState.stepAttempt,
         workflowId,
         executionGeneration,
-        execResults: { ...stepInfo, ...execResults } as StepResult<any, any, any, any>,
+        // Emit uses the same omit+merge as the persisted stepResult below so
+        // watch events and snapshots agree on cleared prior completion fields.
+        execResults: { ...omitPriorCompletionFields(stepInfo), ...execResults } as StepResult<any, any, any, any>,
         pubsub,
         runId,
         emitLegacy: !skipEmits,
@@ -697,7 +706,10 @@ export async function executeStep(
     });
   }
 
-  const stepResult = { ...stepInfo, ...execResults } as StepResult<any, any, any, any>;
+  const stepResult = {
+    ...omitPriorCompletionFields(stepInfo),
+    ...execResults,
+  } as StepResult<any, any, any, any>;
 
   return {
     result: stepResult,

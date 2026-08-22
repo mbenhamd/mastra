@@ -365,6 +365,7 @@ function hasSameMessageCoordinates(
 }
 
 export class MemoryPG extends MemoryStorage {
+  override readonly supportsPartialThreadUpdate = true;
   readonly supportsObservationalMemory = true;
   readonly supportsAtomicObservationalMemoryRetraction = true;
   readonly supportsRevisionedWorkingMemory = true;

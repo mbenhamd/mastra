@@ -1,9 +1,8 @@
 import { it, describe, expect, beforeAll, afterAll, inject } from 'vitest';
 import { join } from 'path';
 import { setupMonorepo } from './prepare';
-import { mkdtemp, mkdir, rm, readFile, writeFile } from 'fs/promises';
+import { mkdtemp, mkdir, readdir, rm, readFile, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
-import { pathToFileURL } from 'url';
 import getPort from 'get-port';
 import { execa, execaNode } from 'execa';
 
@@ -99,6 +98,14 @@ describe.sequential.for([['pnpm'] as const])(`%s monorepo`, ([pkgManager]) => {
       expect(res.status).toBe(200);
       expect(body).toEqual({ message: 'Hello, world!', a: 'b' });
     });
+
+    it('should resolve createRoute api routes', async () => {
+      const res = await fetch(`http://localhost:${port}/create-route`);
+      const body = await res.json();
+      expect(res.status).toBe(200);
+      expect(body).toEqual({ message: 'Hello from createRoute!' });
+    });
+
     it('should resolve api ALL routes', async () => {
       let res = await fetch(`http://localhost:${port}/all`);
       let body = await res.json();
@@ -319,6 +326,35 @@ describe.sequential.for([['pnpm'] as const])(`%s monorepo`, ([pkgManager]) => {
       expect(hasWorkspaceMappedPath).toBeFalsy();
     });
 
+    it('should keep deprecated externals out of optimized dependency bundles', async () => {
+      const outputDir = join(fixturePath, 'apps', 'custom', '.mastra', 'output');
+      const outputFiles = await readdir(outputDir);
+      const output = (
+        await Promise.all(
+          outputFiles.filter(file => file.endsWith('.mjs')).map(file => readFile(join(outputDir, file), 'utf-8')),
+        )
+      ).join('\n');
+      const packageJson = JSON.parse(await readFile(join(outputDir, 'package.json'), 'utf-8'));
+
+      expect(outputFiles).not.toContain('nodemailer.mjs');
+      expect(output).not.toContain('nodemailer/lib');
+      expect(packageJson.dependencies?.nodemailer).toBe('^7.0.0');
+    });
+
+    // This stays in the monorepo E2E suite because it builds the generated fixture and validates its output manifest.
+    it('should keep default and user-configured externals in the output manifest', async () => {
+      const packageJsonPath = join(fixturePath, 'apps', 'custom', '.mastra', 'output', 'package.json');
+      const packageJson = JSON.parse(await readFile(packageJsonPath, 'utf-8'));
+
+      expect(packageJson.dependencies).toEqual(
+        expect.objectContaining({
+          '@mastra/core': expect.any(String),
+          bcrypt: expect.any(String),
+          typescript: expect.any(String),
+        }),
+      );
+    });
+
     afterAll(async () => {
       if (proc) {
         try {
@@ -397,6 +433,32 @@ describe.sequential.for([['pnpm'] as const])(`%s monorepo`, ([pkgManager]) => {
     }, timeout);
 
     runApiTests(port);
+
+    it(
+      'drains an in-flight response before the generated server exits on SIGTERM',
+      async () => {
+        const response = await fetch(`http://localhost:${port}/shutdown-drain`);
+        const reader = response.body!.getReader();
+        const decoder = new TextDecoder();
+        const firstChunk = await reader.read();
+        expect(decoder.decode(firstChunk.value)).toBe('started\n');
+
+        proc!.kill('SIGTERM');
+
+        let remaining = '';
+        while (true) {
+          const chunk = await reader.read();
+          if (chunk.done) break;
+          remaining += decoder.decode(chunk.value, { stream: true });
+        }
+
+        expect(remaining).toBe('finished\n');
+        await expect(proc).resolves.toMatchObject({ exitCode: 0 });
+        // Full shutdown includes the drain window plus core teardown; the vitest
+        // default 5s timeout is tighter than the server's own worst-case bounds.
+      },
+      timeout,
+    );
   });
 
   describe.sequential('build without externals', async () => {
@@ -491,95 +553,11 @@ describe.sequential.for([['pnpm'] as const])(`%s monorepo`, ([pkgManager]) => {
           expect(dependencies[pkg]).toMatch(/^[\d^~>=<]/);
         }
       }
+
+      // Automatic version resolution must read the copy installed for the app (0.4.0),
+      // not the older copy installed at the workspace root (0.2.0) (#18849).
+      expect(dependencies['unicorn-magic']).toBe('0.4.0');
     });
-  });
-
-  describe.sequential('extra bundler entries', async () => {
-    let originalConfig: string;
-    const mastraDir = () => join(fixturePath, 'apps', 'custom', 'src', 'mastra');
-    const mastraConfigPath = () => join(mastraDir(), 'index.ts');
-    const workerSourcePath = () => join(mastraDir(), 'voice-worker.ts');
-    const outputDir = () => join(fixturePath, 'apps', 'custom', '.mastra', 'output');
-
-    // `date-fns` is a dependency of apps/custom that no source file imports, so it can
-    // only reach the built output through the extra entry below. That makes it a probe
-    // for the dependency-analysis contract: extra entries are analyzed, so their
-    // externals land in the generated package.json and resolve at runtime.
-    beforeAll(async () => {
-      originalConfig = await readFile(mastraConfigPath(), 'utf-8');
-
-      await writeFile(
-        workerSourcePath(),
-        [
-          `import { format } from 'date-fns';`,
-          ``,
-          `export default { kind: 'voice-worker', entryUrl: import.meta.url };`,
-          ``,
-          // Build and format from local calendar fields on both sides, so the result is the
-          // same in every timezone. `formatISO(new Date(0))` would not be: date-fns formats
-          // in local time, so the epoch renders as 1969-12-31 anywhere west of UTC.
-          `console.log('VOICE_WORKER_OK ' + JSON.stringify({ entryUrl: import.meta.url, stamp: format(new Date(2020, 0, 2), 'yyyy-MM-dd') }));`,
-          ``,
-        ].join('\n'),
-      );
-
-      // Keep date-fns external so it has to be installed rather than inlined, which is
-      // what makes running the worker prove the manifest is correct.
-      const modifiedConfig = originalConfig.replace(
-        /bundler:\s*\{\s*externals:\s*\[[^\]]*\],?\s*\}/m,
-        `bundler: {\n    externals: ['bcrypt', 'date-fns'],\n    entries: { 'voice-worker': './voice-worker.ts' },\n  }`,
-      );
-      expect(modifiedConfig).not.toBe(originalConfig);
-      await writeFile(mastraConfigPath(), modifiedConfig);
-
-      await runBuild(fixturePath);
-    }, timeout);
-
-    afterAll(async () => {
-      await writeFile(mastraConfigPath(), originalConfig);
-      await rm(workerSourcePath(), { force: true });
-    });
-
-    it('emits the extra entry as its own bundle beside the server', async () => {
-      const serverBundle = await readFile(join(outputDir(), 'index.mjs'), 'utf-8');
-      const workerBundle = await readFile(join(outputDir(), 'voice-worker.mjs'), 'utf-8');
-
-      expect(workerBundle).toContain('VOICE_WORKER_OK');
-      // The server must be untouched by the extra entry.
-      expect(serverBundle).not.toContain('VOICE_WORKER_OK');
-    });
-
-    it('adds dependencies reachable only from the extra entry to the output package.json', async () => {
-      const packageJson = JSON.parse(await readFile(join(outputDir(), 'package.json'), 'utf-8'));
-      const serverBundle = await readFile(join(outputDir(), 'index.mjs'), 'utf-8');
-
-      // The server bundle never references date-fns, so its presence in the manifest is
-      // attributable to the extra entry alone.
-      expect(serverBundle).not.toMatch(/['"]date-fns['"]/);
-      expect(packageJson.dependencies).toHaveProperty('date-fns');
-    });
-
-    it(
-      'runs the built extra entry as its own process',
-      async () => {
-        // Only succeeds if date-fns was installed into the output, which in turn only
-        // happens if the extra entry was analyzed. LiveKit re-imports this path in
-        // forked child processes, so import.meta.url must resolve to the built file.
-        const { stdout } = await execaNode('voice-worker.mjs', { cwd: outputDir() });
-
-        expect(stdout).toContain('VOICE_WORKER_OK');
-        const payload = JSON.parse(stdout.slice(stdout.indexOf('{')));
-        expect(payload.entryUrl.endsWith('/.mastra/output/voice-worker.mjs')).toBe(true);
-        expect(payload.stamp).toBe('2020-01-02');
-
-        const workerModule = await import(pathToFileURL(join(outputDir(), 'voice-worker.mjs')).href);
-        expect(workerModule.default).toEqual({
-          kind: 'voice-worker',
-          entryUrl: pathToFileURL(join(outputDir(), 'voice-worker.mjs')).href,
-        });
-      },
-      timeout,
-    );
   });
 
   describe.sequential('subpath-only externals', () => {
@@ -655,6 +633,37 @@ describe.sequential.for([['pnpm'] as const])(`%s monorepo`, ([pkgManager]) => {
           }
 
           await writeFile(mastraConfigPath, originalMastraConfig);
+          await rm(isolatedFixturePath, { recursive: true, force: true });
+        }
+      },
+      timeout,
+    );
+  });
+
+  describe.sequential('pnpm build approvals', () => {
+    it(
+      'reports blocked native build scripts as a user configuration error',
+      async () => {
+        const isolatedFixturePath = await mkdtemp(join(tmpdir(), `mastra-monorepo-build-approval-test-${pkgManager}-`));
+        try {
+          await setupMonorepo(isolatedFixturePath, pkgManager);
+          const workspacePath = join(isolatedFixturePath, 'pnpm-workspace.yaml');
+          const workspace = await readFile(workspacePath, 'utf8');
+          await writeFile(workspacePath, workspace.replace('  bcrypt: true\n', ''));
+
+          await removeOutputDir(isolatedFixturePath);
+          const build = await execa(pkgManager, ['build'], {
+            cwd: join(isolatedFixturePath, 'apps', 'custom'),
+            env: process.env,
+            reject: false,
+          });
+          const output = `${build.stdout}\n${build.stderr}`;
+
+          expect(build.exitCode).not.toBe(0);
+          expect(output).toContain('pnpm blocked build scripts for: bcrypt');
+          expect(output).toContain('Add these packages to allowBuilds in pnpm-workspace.yaml and retry the build.');
+          expect(output).not.toContain('DEPLOYER_BUNDLER_BUNDLE_STAGE_FAILED');
+        } finally {
           await rm(isolatedFixturePath, { recursive: true, force: true });
         }
       },

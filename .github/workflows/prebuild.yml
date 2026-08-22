@@ -15,7 +15,7 @@ jobs:
   changes:
     name: Detect code changes
     if: github.repository == 'mastra-ai/mastra'
-    runs-on: starsling-ubuntu-24.04
+    runs-on: starsling-ubuntu-24.04-2
     permissions:
       contents: read
     outputs:
@@ -23,8 +23,11 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@e8d4307400f9427dba7cb98e488d6ab85f1cec5f
+        timeout-minutes: 20
         with:
           fetch-depth: 0
+          # Partial clone: name-only diffs need trees, not blob contents.
+          filter: blob:none
 
       - name: Check for code changes
         id: filter
@@ -54,6 +57,7 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@e8d4307400f9427dba7cb98e488d6ab85f1cec5f
+        timeout-minutes: 20
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 2
@@ -98,8 +102,11 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@e8d4307400f9427dba7cb98e488d6ab85f1cec5f
+        timeout-minutes: 20
         with:
           fetch-depth: 0
+          # Partial clone: name-only diffs need trees, not blob contents.
+          filter: blob:none
 
       - name: Setup pnpm and Node.js
         uses: ./.github/actions/setup-pnpm-node
@@ -383,6 +390,7 @@ jobs:
 
     steps:
       - uses: actions/checkout@e8d4307400f9427dba7cb98e488d6ab85f1cec5f
+        timeout-minutes: 20
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 

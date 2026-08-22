@@ -31,6 +31,7 @@ import type {
 import { NonRetriableError } from 'inngest';
 import type { Inngest } from 'inngest';
 import { subscribe } from 'inngest/realtime';
+import type { Realtime } from 'inngest/realtime';
 import { inngestWorkflowResumeOperationHash } from './resume-operation';
 import type { InngestEngineType, InngestWorkflowRunState } from './types';
 
@@ -244,17 +245,15 @@ export class InngestRun<
       };
 
       // Start realtime subscription for workflow-finish event
-      let realtimeStreamPromise: ReturnType<typeof subscribe> | null = null;
+      let realtimeSubscriptionPromise: Promise<Realtime.Subscribe.CallbackSubscription> | null = null;
 
       const startRealtimeSubscription = async () => {
         try {
-          realtimeStreamPromise = realtimeSubscribe(
-            {
-              channel: `workflow:${this.workflowId}:${this.runId}`,
-              topics: ['watch'],
-              app: this.inngest,
-            },
-            async (message: any) => {
+          realtimeSubscriptionPromise = realtimeSubscribe({
+            channel: `workflow:${this.workflowId}:${this.runId}`,
+            topics: ['watch'],
+            app: this.inngest,
+            onMessage: async (message: any) => {
               if (resolved) return;
 
               const event = unwrapWorkflowRealtimeData(message.data);
@@ -316,14 +315,14 @@ export class InngestRun<
                 handleResult(result, 'realtime');
               }
             },
-          );
+          });
 
-          // Set unsubscribe immediately so cleanup can cancel even before await resolves
+          // Set unsubscribe immediately so cleanup can close the subscription even before setup resolves.
           unsubscribe = () => {
-            realtimeStreamPromise?.then(stream => stream.cancel().catch(() => {})).catch(() => {});
+            realtimeSubscriptionPromise?.then(subscription => subscription.close()).catch(() => {});
           };
 
-          await realtimeStreamPromise;
+          await realtimeSubscriptionPromise;
         } catch {
           // Realtime subscription failed - polling will still work as fallback
         }
@@ -828,6 +827,13 @@ export class InngestRun<
     __requestContextMode?: 'replace';
     actor?: ActorSignal;
     perStep?: boolean;
+    /**
+     * Rebuilds the suspended run's trace lineage on the worker (upstream #21566).
+     * It is a hashed input of the resume operation identity and is carried on the
+     * dispatched event, so both sides derive the same hash; see the matching
+     * `inngestWorkflowResumeOperationHash` call in `workflow.ts`.
+     */
+    tracingOptions?: TracingOptions;
   }): Promise<{ eventId: string; receipt: WorkflowResumeReceiptExpectation }> {
     const storage = this.#mastra?.getStorage();
 
@@ -920,6 +926,13 @@ export class InngestRun<
       resumePayload: resumeDataToUse,
       resumePath,
       requestContext: mergedRequestContext,
+      // The worker recomputes this hash from the dispatched event, and both `workflow.ts`
+      // and the nested-resume path in `execution-engine.ts` feed `tracingOptions` into it.
+      // Omitting it here while the event below carries it makes every traced resume fail
+      // admission with "resume operation identity is stale". The durable-agent anchor is
+      // read back off the suspend snapshot, so it is stable across dispatch retries from
+      // any process and hashes identically on both sides.
+      tracingOptions: params.tracingOptions,
       perStep: params.perStep ?? false,
       disableScorers,
     });
@@ -1001,6 +1014,9 @@ export class InngestRun<
         actor: params.actor,
         perStep: params.perStep,
         disableScorers,
+        // Omitted rather than sent as `undefined` so the dispatched event keeps a
+        // stable shape; the worker recomputes the operation hash from this field.
+        ...(params.tracingOptions === undefined ? {} : { tracingOptions: params.tracingOptions }),
         ...lifecycleExecution,
       },
     });
@@ -1072,6 +1088,8 @@ export class InngestRun<
     __requestContextMode?: 'replace';
     actor?: ActorSignal;
     perStep?: boolean;
+    /** Continue the trace the run suspended in instead of minting a new one. */
+    tracingOptions?: TracingOptions;
   }): Promise<{ runId: string }> {
     await this._resumeAndSendEvent(params);
     // Return immediately - NO POLLING

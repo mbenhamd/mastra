@@ -97,6 +97,9 @@ export function createBaseIterationStateUpdate(input: IterationStateUpdateInput)
     responseRecovery: executionOutput.responseRecoveryConsumed ? undefined : currentState.responseRecovery,
     state: executionOutput.state,
     messageId: executionOutput.messageId,
+    // Carried, not recomputed: the request context is fixed for the run, and
+    // the steps that rebuild from Mastra have no other source for it.
+    requestContextEntries: currentState.requestContextEntries,
     iterationCount: currentState.iterationCount + 1,
     accumulatedSteps: [...currentState.accumulatedSteps, stepRecord],
     accumulatedUsage: newUsage,

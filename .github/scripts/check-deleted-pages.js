@@ -17,7 +17,12 @@ function getDeletedMdxFiles() {
       .split('\n')
       .filter(line => line.startsWith('D\t') && line.endsWith('.mdx'))
       .map(line => line.replace('D\t', '').trim())
-      .filter(file => file.length > 0);
+      .filter(file => file.length > 0)
+      // Underscore-prefixed files are MDX partials imported as components
+      // (e.g. `import AgentQuickstart from '.../_partial-agent-quickstart.mdx'`),
+      // never routed as pages. Deleting one retires no URL, so requiring a
+      // redirect for it would demand a redirect to a route that never existed.
+      .filter(file => !file.split('/').pop().startsWith('_'));
 
     return deletedFiles;
   } catch (error) {

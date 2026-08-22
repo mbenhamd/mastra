@@ -1,5 +1,6 @@
 import type { JSONSchema7 } from 'json-schema';
 import type { MastraLanguageModel } from '../../../llm/model/shared.types';
+import type { ToolCallConcurrency } from '../../../loop/types';
 import type { MemoryConfig } from '../../../memory/types';
 import type { VersionOverrides } from '../../../request-context';
 import { createToolRecoveryFingerprint, normalizeToolRecoverySchema } from '../../../tools/recovery-fingerprint';
@@ -269,7 +270,7 @@ export function serializeDurableOptions(options: {
   modelSettings?: SerializableModelSettings | Record<string, unknown>;
   requireToolApproval?: boolean;
   permissionPolicyRequired?: boolean;
-  toolCallConcurrency?: number;
+  toolCallConcurrency?: ToolCallConcurrency;
   autoResumeSuspendedTools?: boolean;
   maxProcessorRetries?: number;
   includeRawChunks?: boolean;

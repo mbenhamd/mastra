@@ -1220,6 +1220,12 @@ export class ModelSpanTracker {
       runSpanOperation(() => {
         const { usage: rawUsage, ...otherOutput } = payload.output;
         const usage = extractUsageMetrics(rawUsage, payload.metadata?.providerMetadata);
+        // Upstream fallback (#21154): providers that never emit a `response-metadata` chunk
+        // still report the served model on the finish payload. Read it here, inside the
+        // guarded payload block, so a payload whose accessors throw still reaches the
+        // `endedWithPayload` recovery path below instead of losing the span entirely.
+        const payloadResponseModel =
+          typeof payload.metadata?.modelId === 'string' ? payload.metadata.modelId : undefined;
         const usageStates = providerUsageStates(rawUsage, usage);
         this.#providerUsageState =
           this.#providerUsageState === 'provider_not_reported' ||
@@ -1234,6 +1240,12 @@ export class ModelSpanTracker {
           finishReason: payload.stepResult.reason,
           warnings: payload.stepResult.warnings,
           completionStartTime,
+          // Precedence is encoded by spread order: the raw finish-payload model is the
+          // weakest source. `inferenceResponse` holds either the core-normalized identity
+          // (resolveResponseModelId, which resolves server-side model fallback from
+          // providerMetadata) or this attempt's `response-metadata` chunk, and both must
+          // win when present. The payload value only fills a gap neither one reported.
+          ...(payloadResponseModel?.trim() ? { responseModel: payloadResponseModel } : {}),
           ...inferenceResponse,
           ...usageStates,
           providerOutcome,

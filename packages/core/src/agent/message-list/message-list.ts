@@ -765,7 +765,9 @@ export class MessageList {
         // provider item (rs_/fc_ ids) in history twice; the provider rejects
         // duplicate item ids and the thread wedges. Dedup at the final prompt
         // boundary, then drop any assistant message the dedup emptied.
-        return dedupeResponseProviderItemParts(messages.map(aiV5ModelMessageToV2PromptMessage)).filter(
+        return dedupeResponseProviderItemParts(
+          messages.filter(message => message != null).map(aiV5ModelMessageToV2PromptMessage),
+        ).filter(
           message => message.role === 'system' || typeof message.content === 'string' || message.content.length > 0,
         );
       },
@@ -1517,6 +1519,12 @@ export class MessageList {
     return true;
   }
 
+  /** Sealing is not optional: a moved id whose boundary is missing folds the next response into the previous row. */
+  public rotateResponseMessageId(sealMessageId?: string): string {
+    if (!this.markResponseMessageBoundary(sealMessageId)) this.markResponseMessageBoundary();
+    return this.newMessageId('assistant');
+  }
+
   /**
    * A feedback note a loop injects so the model sees an instruction on its next
    * turn (supervisor `onIterationComplete` feedback, network completion
@@ -1525,7 +1533,8 @@ export class MessageList {
    */
   private static isSuppressedFeedbackMessage(message: MastraDBMessage): boolean {
     const completionResult = message.content?.metadata?.completionResult as
-      { passed?: boolean; suppressFeedback?: boolean } | undefined;
+      | { passed?: boolean; suppressFeedback?: boolean }
+      | undefined;
     return completionResult?.suppressFeedback === true || completionResult?.passed === false;
   }
 

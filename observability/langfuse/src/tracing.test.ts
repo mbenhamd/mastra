@@ -182,6 +182,9 @@ describe('LangfuseExporter', () => {
         publicKey: 'pk-test',
         secretKey: 'sk-test',
         baseUrl: 'https://custom.langfuse.com',
+        additionalHeaders: {
+          'x-custom-header': 'custom-value',
+        },
         environment: 'production',
         release: '1.0.0',
       });
@@ -191,6 +194,9 @@ describe('LangfuseExporter', () => {
           publicKey: 'pk-test',
           secretKey: 'sk-test',
           baseUrl: 'https://custom.langfuse.com',
+          additionalHeaders: {
+            'x-custom-header': 'custom-value',
+          },
           environment: 'production',
           release: '1.0.0',
           exportMode: 'batched',
@@ -233,6 +239,9 @@ describe('LangfuseExporter', () => {
         publicKey: 'pk-test',
         secretKey: 'sk-test',
         baseUrl: 'https://custom.langfuse.com',
+        additionalHeaders: {
+          'x-custom-header': 'custom-value',
+        },
       });
 
       expect(clientConstructorArgs[0]).toEqual(
@@ -240,6 +249,9 @@ describe('LangfuseExporter', () => {
           publicKey: 'pk-test',
           secretKey: 'sk-test',
           baseUrl: 'https://custom.langfuse.com',
+          additionalHeaders: {
+            'x-custom-header': 'custom-value',
+          },
         }),
       );
     });
@@ -712,6 +724,31 @@ describe('LangfuseExporter', () => {
       } as any);
 
       expect(mockScoreCreate).toHaveBeenCalledWith(expect.objectContaining({ name: 'accuracy' }));
+    });
+
+    it('includes the configured environment on the score', async () => {
+      exporter = new LangfuseExporter({ publicKey: 'pk-test', secretKey: 'sk-test', environment: 'production' });
+
+      await exporter.onScoreEvent({ type: 'score', score: { ...baseScore } } as any);
+
+      expect(mockScoreCreate).toHaveBeenCalledWith(expect.objectContaining({ environment: 'production' }));
+    });
+
+    it('falls back to LANGFUSE_TRACING_ENVIRONMENT when no environment is configured', async () => {
+      process.env.LANGFUSE_TRACING_ENVIRONMENT = 'staging';
+      exporter = new LangfuseExporter({ publicKey: 'pk-test', secretKey: 'sk-test' });
+
+      await exporter.onScoreEvent({ type: 'score', score: { ...baseScore } } as any);
+
+      expect(mockScoreCreate).toHaveBeenCalledWith(expect.objectContaining({ environment: 'staging' }));
+    });
+
+    it('omits environment when none is configured', async () => {
+      exporter = new LangfuseExporter({ publicKey: 'pk-test', secretKey: 'sk-test' });
+
+      await exporter.onScoreEvent({ type: 'score', score: { ...baseScore } } as any);
+
+      expect(mockScoreCreate.mock.calls[0][0]).not.toHaveProperty('environment');
     });
 
     it('omits the call when traceId is missing', async () => {

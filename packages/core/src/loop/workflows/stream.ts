@@ -14,6 +14,7 @@ import type { ChunkType } from '../../stream/types';
 import { ChunkFrom } from '../../stream/types';
 import { hydrateRunScopeFromInternal } from '../hydrate-run-scope';
 import { createTerminalToolResultPartId, materializeTerminalToolResult } from '../shared/terminal-tool-result';
+import { createTimeoutAbortSignal, isMastraTimeoutError } from '../timeout';
 import type { LoopRun } from '../types';
 import { AGENTIC_EXECUTION_WORKFLOW_ID } from './agentic-execution';
 import { createAgenticLoopWorkflow } from './agentic-loop';
@@ -241,6 +242,23 @@ export function workflowLoopStream<Tools extends ToolSet = ToolSet, OUTPUT = und
         safeEnqueue(controller, chunk);
       };
 
+      // Bound the whole run (every loop iteration, tool call and retry) by composing the
+      // caller's abort signal with modelSettings.timeout.totalMs. Everything downstream
+      // reads `options.abortSignal`, so injecting here covers the entire agentic loop.
+      const {
+        signal: totalTimeoutSignal,
+        timeoutPromise: totalTimeoutPromise,
+        cleanup: cleanupTotalTimeout,
+      } = createTimeoutAbortSignal({
+        parentSignal: rest.options?.abortSignal,
+        timeoutMs: modelSettings?.timeout?.totalMs,
+        timeoutType: 'total',
+      });
+
+      const restWithTimeoutSignal = totalTimeoutPromise
+        ? { ...rest, options: { ...rest.options, abortSignal: totalTimeoutSignal } }
+        : rest;
+
       const agenticLoopWorkflow = createAgenticLoopWorkflow<Tools, OUTPUT>({
         resumeContext,
         messageId: messageId,
@@ -257,7 +275,7 @@ export function workflowLoopStream<Tools extends ToolSet = ToolSet, OUTPUT = und
         agentId,
         requireToolApproval,
         toolCallConcurrency,
-        ...rest,
+        ...restWithTimeoutSignal,
       });
 
       // Register as internal so the evented engine's event processor can
@@ -405,20 +423,50 @@ export function workflowLoopStream<Tools extends ToolSet = ToolSet, OUTPUT = und
           });
         }
 
-        const executionResult = resumeContext
-          ? await run.resume({
+        const executionPromise = resumeContext
+          ? run.resume({
               resumeData: resumeContext.resumeData,
               ...createObservabilityContext(rest.modelSpanTracker?.getTracingContext()),
               requestContext,
               actor: rest.actor,
               label: toolCallId,
             })
-          : await run.start({
+          : run.start({
               inputData: initialData,
               ...createObservabilityContext(rest.modelSpanTracker?.getTracingContext()),
               requestContext,
               actor: rest.actor,
             });
+
+        let executionResult: Awaited<typeof executionPromise>;
+        try {
+          if (totalTimeoutPromise) {
+            // The abort signal alone can't guarantee the run settles, so race the budget
+            // and let the timeout win. The losing branch is never observed by callers.
+            executionPromise.catch(() => {});
+            executionResult = await Promise.race([executionPromise, totalTimeoutPromise]);
+          } else {
+            executionResult = await executionPromise;
+          }
+        } catch (err) {
+          if (!isMastraTimeoutError(err)) throw err;
+
+          const error = getErrorFromUnknown(err, {
+            fallbackMessage: 'Agent execution timed out',
+          });
+
+          safeEnqueue(controller, {
+            type: 'error',
+            runId,
+            from: ChunkFrom.AGENT,
+            payload: { error },
+          });
+
+          await rest.options?.onError?.({ error });
+          await deleteRunSnapshots();
+          safeClose(controller);
+          return;
+        }
 
         if (executionResult.status !== 'success') {
           if (executionResult.status === 'failed') {
@@ -497,6 +545,7 @@ export function workflowLoopStream<Tools extends ToolSet = ToolSet, OUTPUT = und
 
         safeClose(controller);
       } finally {
+        cleanupTotalTimeout();
         await stopGoalActivity({ agentId, runId, now: _internal?.now });
         if (!keepRegisteredForResume) {
           rest.mastra?.__unregisterInternalWorkflow(agenticLoopWorkflow.id, runId, agenticLoopWorkflowRegistration);

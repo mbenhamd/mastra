@@ -7,9 +7,9 @@ packages:
 
 # Agent.listSuspendedRuns()
 
-The `.listSuspendedRuns()` method lists suspended `Agent` or `DurableAgent` runs from workflow snapshot storage. It returns runs waiting on a tool call requiring [approval](/docs/agents/agent-approval), or on a tool that called `suspend()`. Storage-backed discovery works after a server restart. Multiple instances can discover the same rows, but this API doesn't provide a distributed claim for consuming an approval.
+The `.listSuspendedRuns()` method lists suspended `Agent` or `DurableAgent` runs from workflow snapshot storage. It returns runs waiting on a tool call requiring [approval](/docs/agents/human-in-the-loop), or on a tool that called `suspend()`. Storage-backed discovery works after a server restart. Multiple instances can discover the same rows, but this API doesn't provide a distributed claim for consuming an approval.
 
-Pass the returned `runId` and matching `toolCallId` to [`resumeStream()`](/docs/agents/agent-approval#runtime-suspension-with-suspend), `approveToolCall()`, or `declineToolCall()` to continue the suspended call.
+Pass the returned `runId` and matching `toolCallId` to [`resumeStream()`](/docs/agents/human-in-the-loop#runtime-suspension-with-suspend), `approveToolCall()`, or `declineToolCall()` to continue the suspended call.
 
 The filter contract mirrors the workflow run listing APIs (`listWorkflowRuns`), plus the agent-level `threadId` filter.
 
@@ -199,7 +199,7 @@ interface AgentRunToolCall {
 
 ## Discovery scope
 
-Results are scoped to runs started by the agent you call `listSuspendedRuns()` on. Snapshots without a matching agent ID aren't returned. In [supervisor setups](/docs/agents/agent-approval#tool-approval-supervisor-agents), the supervisor sees its outer run while a subagent's inner run is only visible from the subagent itself. Filter by both `threadId` and `resourceId` before presenting approval controls.
+Results are scoped to runs started by the agent you call `listSuspendedRuns()` on. Snapshots without a matching agent ID aren't returned. In [supervisor setups](/docs/agents/human-in-the-loop#tool-approval-supervisor-agents), the supervisor sees its outer run while a subagent's inner run is only visible from the subagent itself. Filter by both `threadId` and `resourceId` before presenting approval controls.
 
 Cold durable recovery requires the caller's resource and thread to match the persisted ownership tuple. The run isn't resumed when ownership can't be verified. If more than one approval matches a conversation, `sendToolApproval()` requires an exact `toolCallId`.
 
@@ -209,13 +209,15 @@ Request-local processor state isn't serializable today. A durable run configured
 
 The built-in durable runtime keeps validated tool, model, memory, workspace, processor, and request-context bindings in a private registry. It snapshots caller-owned message, option, resume-data, and supported request-context values before asynchronous authorization or execution, and pins the validated registry entry while an active workflow segment reads it. A missing or replaced entry fails closed instead of falling back to the current agent configuration. Integration-owned durable engines keep their documented reconstruction contract and don't use this built-in registry requirement.
 
-When function-level authorization (FGA) is configured, pass an authenticated `requestContext`. Discovery requires a non-empty reserved resource ID, rejects conflicting resource or thread filters, validates the agent request context, and checks `AGENTS_EXECUTE` before scanning workflow storage. Durable resume requires non-empty reserved resource and thread IDs and preflights the restored owner before dependency resolution. Standard resume snapshots supported caller-owned inputs before awaiting authorization or storage. It rejects any persisted status other than `suspended` and rechecks execution authorization against the verified owner immediately before execution. An agent `requestContextSchema` is always validated before discovery, including when FGA isn't configured.
+When function-level authorization (FGA) is configured, pass an authenticated `requestContext`. Discovery requires a non-empty reserved resource ID and rejects conflicting resource or thread filters. It then validates the agent request context and checks `AGENTS_EXECUTE` before scanning workflow storage. Durable resume requires non-empty reserved resource and thread IDs and preflights the restored owner before dependency resolution. Standard resume snapshots supported caller-owned inputs before awaiting authorization or storage. It rejects any persisted status other than `suspended` and rechecks execution authorization against the verified owner immediately before execution. An agent `requestContextSchema` is always validated before discovery, including when FGA isn't configured.
 
-Only suspended runs are returned. Terminal durable snapshot cleanup is best-effort: Mastra retries transient deletion failures and then attempts to write a terminal tombstone. If storage rejects both deletion and tombstoning, a stale suspended row can remain discoverable. Monitor the emitted warning and reconcile storage before accepting another decision for that run. Suspended runs survive restarts only when the Mastra instance has a persistent [storage provider](/docs/storage/overview). Calling this method without configured workflow storage throws `AGENT_LIST_SUSPENDED_RUNS_NO_STORAGE`.
+Only suspended runs are returned. Terminal durable snapshot cleanup is best-effort: Mastra retries transient deletion failures and then attempts to write a terminal tombstone. If storage rejects both deletion and tombstoning, a stale suspended row can remain discoverable. Monitor the emitted warning and reconcile storage before accepting another decision for that run. Suspended runs survive restarts only when the Mastra instance has a persistent [storage provider](/docs/storage). Calling this method without configured workflow storage throws `AGENT_LIST_SUSPENDED_RUNS_NO_STORAGE`.
 
 This core method doesn't add an HTTP server route or client SDK method. It also doesn't atomically claim a suspended checkpoint across workers, and `(runId, toolCallId)` isn't a one-time approval token. Until an application adds a storage-backed claim/lease and checkpoint token, route approvals through a single serialized consumer that authenticates the caller and supplies verified resource and thread IDs.
 
+Run snapshots are only persisted while a run is waiting on input and are deleted when it finishes, so suspended runs are the only runs discoverable from storage. With the default in-memory store, snapshots are lost on restart.
+
 ## Related
 
-- [Agent approval](/docs/agents/agent-approval)
-- [Storage](/docs/storage/overview)
+- [Agent approval](/docs/agents/human-in-the-loop)
+- [Storage](/docs/storage)

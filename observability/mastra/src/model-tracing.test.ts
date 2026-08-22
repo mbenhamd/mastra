@@ -1774,6 +1774,81 @@ describe('ModelSpanTracker', () => {
       expect(inferenceSpan!.attributes.usage).toBeDefined();
     });
 
+    it('strips step-finish step history from MODEL_STEP and MODEL_INFERENCE outputs', async () => {
+      const modelSpan = tracing.startSpan({
+        type: SpanType.MODEL_GENERATION,
+        name: 'test-generation',
+        attributes: { model: 'gpt-test', provider: 'test', streaming: true },
+      });
+
+      const tracker = new ModelSpanTracker(modelSpan);
+
+      const chunks = [
+        { type: 'step-start', payload: { messageId: 'msg-1' } },
+        { type: 'text-delta', payload: { text: 'hi' } },
+        {
+          type: 'step-finish',
+          payload: {
+            output: {
+              text: 'hi',
+              usage: { promptTokens: 4, completionTokens: 6, totalTokens: 10 },
+              steps: [{ request: { body: 'large request' } }],
+              object: { steps: ['domain step'] },
+            },
+            stepResult: { reason: 'stop', warnings: [], isContinued: false },
+            metadata: {
+              providerMetadata: { provider: { noisy: true } },
+              experimental_providerMetadata: { provider: { legacy: true } },
+              keep: 'metadata',
+            },
+          },
+        },
+      ];
+
+      await consumeStream(tracker.wrapStream(createMockStream(chunks)));
+      modelSpan.end();
+
+      const [stepSpan] = testExporter.getSpansByType(SpanType.MODEL_STEP);
+      const [inferenceSpan] = testExporter.getSpansByType(SpanType.MODEL_INFERENCE);
+
+      expect(stepSpan!.output).toEqual({ text: 'hi', object: { steps: ['domain step'] } });
+      expect(inferenceSpan!.output).toEqual({ text: 'hi', object: { steps: ['domain step'] } });
+      expect(stepSpan!.metadata).toEqual({ keep: 'metadata' });
+    });
+
+    it('preserves the provider response model on MODEL_INFERENCE', async () => {
+      const modelSpan = tracing.startSpan({
+        type: SpanType.MODEL_GENERATION,
+        name: 'test-generation',
+        attributes: { model: 'requested-model', provider: 'test', streaming: true },
+      });
+
+      const tracker = new ModelSpanTracker(modelSpan);
+      tracker.setDeferStepClose(true);
+
+      const chunks = [
+        { type: 'step-start', payload: { messageId: 'msg-1' } },
+        { type: 'text-delta', payload: { text: 'hi' } },
+        {
+          type: 'step-finish',
+          payload: {
+            output: { usage: { totalTokens: 5 } },
+            stepResult: { reason: 'tool-calls', warnings: [], isContinued: true },
+            metadata: { modelId: 'provider/selected-model' },
+          },
+        },
+      ];
+
+      await consumeStream(tracker.wrapStream(createMockStream(chunks)));
+
+      const [inferenceSpan] = testExporter.getSpansByType(SpanType.MODEL_INFERENCE);
+      expect(inferenceSpan).toBeDefined();
+      expect(inferenceSpan!.attributes.model).toBe('requested-model');
+      expect(inferenceSpan!.attributes.responseModel).toBe('provider/selected-model');
+
+      modelSpan.end();
+    });
+
     it.each([
       { reason: 'error' as const, outcome: 'error', errorName: 'ProviderInferenceError' },
       { reason: 'abort' as const, outcome: 'abort', errorName: 'AbortError' },
@@ -2041,6 +2116,13 @@ describe('ModelSpanTracker', () => {
       expect(forwarded).toHaveLength(4);
       expect(metadataHookCalls).toEqual([]);
       const [inferenceSpan] = testExporter.getSpansByType(SpanType.MODEL_INFERENCE);
+      // Not a contradiction with the 'preserves the provider response model on
+      // MODEL_INFERENCE' case above: responseId/responseModel are attributed only when the
+      // response identity is recorded explicitly (recordResponseMetadata /
+      // recordInferenceFinish), when a response-metadata chunk exposes them as own *data*
+      // properties, or when step-finish metadata reports a modelId. Here the chunk fields
+      // are accessors/proxies (rejected, and never invoked) and the step-finish metadata is
+      // empty, so neither attribute may appear.
       expect(inferenceSpan?.attributes).not.toHaveProperty('responseId');
       expect(inferenceSpan?.attributes).not.toHaveProperty('responseModel');
     });
