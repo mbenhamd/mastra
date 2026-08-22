@@ -1,4 +1,3 @@
-import { generateId } from '@internal/ai-sdk-v5';
 import type { ToolSet } from '@internal/ai-sdk-v5';
 import {
   commitGoalEvaluation,
@@ -100,8 +99,19 @@ function formatJudgeActivityMessage(name: string | undefined, args: unknown): st
 export function createGoalStep<Tools extends ToolSet = ToolSet, OUTPUT = undefined>(
   params: OuterLLMRun<Tools, OUTPUT>,
 ) {
-  const { goal, messageList, requestContext, mastra, controller, runId, _internal, agentId, agentName, outputWriter } =
-    params;
+  const {
+    goal,
+    messageList,
+    requestContext,
+    mastra,
+    controller,
+    runId,
+    _internal,
+    agentId,
+    agentName,
+    outputWriter,
+    rotateResponseMessageId: rotateLoopResponseMessageId,
+  } = params;
 
   return createStep({
     id: 'goalStep',
@@ -484,7 +494,7 @@ export function createGoalStep<Tools extends ToolSet = ToolSet, OUTPUT = undefin
             }
           : undefined,
         rotateResponseMessageId: () => {
-          currentMessageId = _internal?.generateId?.() ?? generateId();
+          currentMessageId = rotateLoopResponseMessageId(currentMessageId);
           inputData.messageId = currentMessageId;
           return currentMessageId;
         },

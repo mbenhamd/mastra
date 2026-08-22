@@ -135,6 +135,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
   mastra,
   requireToolApproval: requireToolApprovalFromFactory,
   actor,
+  mcp,
 }: OuterLLMRun<Tools, OUTPUT>) {
   return createStep({
     id: 'toolCallStep',
@@ -541,6 +542,14 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
         }
 
         let resumeData = resumeDataFromArgs !== undefined ? resumeDataFromArgs : workflowResumeData;
+        // An APPROVAL decision may only arrive through the workflow resume boundary
+        // (`agent.resumeStream` / the durable resume envelope). `resumeData` the model wrote
+        // into its own tool arguments is untrusted: the pending approval's coordinates —
+        // toolCallId, args, even `identityDigest` — are persisted on the
+        // `data-tool-call-approval` part the model can read back, so identity alone does not
+        // establish human consent. Suspension-typed args-borne resume (autoResumeSuspendedTools)
+        // is unaffected; only consent is boundary-only.
+        let isModelAuthoredResumeData = resumeDataFromArgs !== undefined;
 
         let isResumeToolCall = resumeDataFromArgs !== undefined;
         const isAgentTool = inputData.toolName?.startsWith('agent-');
@@ -721,6 +730,9 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
         if (isIdentityFreeProviderNullResume && workflowResumeData !== undefined) {
           resumeData = workflowResumeData;
           isResumeToolCall = false;
+          // The effective payload now comes from the workflow boundary, not the provider
+          // placeholder, so it is no longer model-authored.
+          isModelAuthoredResumeData = false;
         }
 
         // Null is also a valid resumed tool payload, so a fresh provider null is
@@ -784,7 +796,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           effectiveResumeType === 'suspension' &&
           (authoritativeResumeType === 'suspension' || storedResumeMetadata?.identityMatches === true);
         resumedFromSuspension = isKnownSuspensionResume;
-        const isApprovalResumeData = hasApprovalResumeShape && isKnownApprovalResume;
+        const isApprovalResumeData = hasApprovalResumeShape && isKnownApprovalResume && !isModelAuthoredResumeData;
         const isToolExecutionApprovalResume = isApprovalResumeData && effectiveApprovalSource === 'tool-execution';
         const persistedApprovalGrant =
           effectiveResumeType === 'suspension'
@@ -874,7 +886,8 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
         // defers entirely to the tool's own approval config.
         const toolPermissionPolicy = (
           requestContext.get('__mastra_toolPermissionPolicy') as
-            ((toolName: string) => 'allow' | 'ask' | 'deny') | undefined
+            | ((toolName: string) => 'allow' | 'ask' | 'deny')
+            | undefined
         )?.(inputData.toolName);
         if (toolPermissionPolicy === 'deny') {
           // §O4 — surface WHY a tool was blocked (action-time deny is otherwise
@@ -966,6 +979,11 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           (suspendData as { requireToolApproval?: unknown }).requireToolApproval &&
           !isDelegatedApproval,
         );
+        // `approvalDecision` / `hasApprovalResumeShape` are resolved above from the
+        // identity-verified resume envelope (authoritative `toolCallResume` or the
+        // persisted approval metadata), which is this fork's trust boundary for a
+        // resume decision: an approval-typed resume whose identity does not match is
+        // rejected as invalid resume evidence before reaching this gate.
         const isApprovalResume =
           resumeData != null && typeof resumeData === 'object' && 'approved' in (resumeData as Record<string, unknown>);
         // Gate the resume branch on either a live policy or a prior outer approval suspend.
@@ -1058,6 +1076,10 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           } else if (!isApprovalResumeData && !isKnownSuspensionResume && !isDelegatedApprovalResume) {
             await removeToolMetadata(metadataToolCallId, inputData.toolName, 'approval');
 
+            // Return the approval decision (not a `result` string) so it persists as
+            // `state: 'output-denied'` with `approval`. The denial reason carries the
+            // caller-supplied reason when one was provided, otherwise the default string
+            // so downstream consumers/UI keep the same message.
             if (!hasApprovalResumeShape || approvalDecision.approved === false) {
               return {
                 ...inputData,
@@ -1122,6 +1144,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           // Forward requestContext so tools receive values set by the workflow step
           requestContext: toolRequestContext,
           actor,
+          mcp,
           // Let tools that read thread history mid-stream (e.g. forked subagents
           // cloning the parent thread) drain the save queue so the store reflects
           // the latest user/assistant messages before they read.
@@ -1285,6 +1308,9 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
         //if resuming a subAgent or workflow tool, we want to find the runId from when it got suspended.
         // Also look up the runId when the LLM provided resumeData in args (isResumeToolCall)
         // but omitted suspendedToolRunId — without it, workflow tools start a fresh run and re-suspend.
+        // Defined, not truthy: a delegated tool can be resumed with `false` / `0` / `''` / `null`
+        // (a provider-materialized null resume is normalized above), and skipping the lookup for
+        // those would start a fresh sub-run instead of resuming the suspended one.
         const needsRunIdLookup = resumeDataToPassToToolOptions !== undefined && (isAgentTool || isWorkflowTool);
         if (needsRunIdLookup) {
           // Primary source: the per-iteration workflow suspend payload, which carries the
@@ -1303,7 +1329,8 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
             if (suspendedToolRunId) break;
             const suspendedTools = message.content.metadata?.suspendedTools as Record<string, any> | undefined;
             const pendingToolApprovals = message.content.metadata?.pendingToolApprovals as
-              Record<string, any> | undefined;
+              | Record<string, any>
+              | undefined;
             const pendingOrSuspendedTools =
               suspendedTools || pendingToolApprovals
                 ? { ...(pendingToolApprovals ?? {}), ...(suspendedTools ?? {}) }
@@ -1366,6 +1393,11 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           }
         }
 
+        // Clear both entries for BOTH resume conventions: `resumeData` embedded in the LLM's
+        // re-emitted args (autoResumeSuspendedTools) and the workflow-level resumeData that
+        // `agent.resumeStream(resumeData, { runId, toolCallId })` delivers. Keyed on the
+        // identity-mapped `metadataToolCallId` so a concurrently suspended sibling that shares
+        // this tool name keeps its own pending entry.
         if (resumeData !== undefined && (isResumeToolCall || isAgentTool || isWorkflowTool)) {
           await removeToolMetadata(metadataToolCallId, inputData.toolName, 'approval');
           await removeToolMetadata(metadataToolCallId, inputData.toolName, 'suspension');

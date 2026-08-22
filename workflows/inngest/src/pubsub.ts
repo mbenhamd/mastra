@@ -319,13 +319,11 @@ export class InngestPubSub extends PubSub {
     // before we consider the subscription "ready". This prevents race conditions
     // where the workflow triggers before the subscription can receive events.
     subscription.ready = (async () => {
-      const stream = await this.realtimeSubscribe(
-        {
-          channel,
-          topics: [inngestTopic],
-          app: this.inngest,
-        },
-        async (message: any) => {
+      const realtimeSubscription = await this.realtimeSubscribe({
+        channel,
+        topics: [inngestTopic],
+        app: this.inngest,
+        onMessage: async (message: any) => {
           const event = this.toEvent(message, requireReplayIdentity);
           if (event.runId !== runId) {
             throw new TypeError(`Inngest event runId ${event.runId} does not match topic runId ${runId}`);
@@ -341,10 +339,10 @@ export class InngestPubSub extends PubSub {
             }
           }
         },
-      );
+      });
       subscription.unsubscribe = () => {
         try {
-          void stream.cancel();
+          void realtimeSubscription.close();
         } catch (err) {
           console.error('InngestPubSub unsubscribe error:', err);
         }

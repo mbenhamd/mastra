@@ -16,26 +16,26 @@ TINFOIL_API_KEY=your-api-key
 ```
 
 ```typescript title="src/mastra/agents/my-agent.ts" {7}
-import { Agent } from '@mastra/core/agent'
+import { Agent } from "@mastra/core/agent";
 
 const agent = new Agent({
-  id: 'my-agent',
-  name: 'My Agent',
-  instructions: 'You are a helpful assistant',
-  model: 'tinfoil/gemma4-31b',
-})
+  id: "my-agent",
+  name: "My Agent",
+  instructions: "You are a helpful assistant",
+  model: "tinfoil/deepseek-v4-flash"
+});
 
 // Generate a response
-const response = await agent.generate('Hello!')
+const response = await agent.generate("Hello!");
 
 // Stream a response
-const stream = await agent.stream('Tell me a story')
+const stream = await agent.stream("Tell me a story");
 for await (const chunk of stream) {
-  console.log(chunk)
+  console.log(chunk);
 }
 ```
 
-:::info
+:::note
 
 Mastra uses the OpenAI-compatible `/chat/completions` endpoint. Some provider-specific features may not be available. Check the [Tinfoil documentation](https://docs.tinfoil.sh) for details.
 
@@ -46,101 +46,101 @@ Mastra uses the OpenAI-compatible `/chat/completions` endpoint. Some provider-sp
 <ProviderModelsTable
   models={[
   {
-    model: 'tinfoil/gemma4-31b',
-    imageInput: true,
-    audioInput: false,
-    videoInput: false,
-    toolUsage: true,
-    reasoning: true,
-    contextWindow: 256000,
-    maxOutput: 32768,
-    inputCost: 0.4,
-    outputCost: 1,
+    "model": "tinfoil/deepseek-v4-flash",
+    "imageInput": false,
+    "audioInput": false,
+    "videoInput": false,
+    "toolUsage": true,
+    "reasoning": true,
+    "contextWindow": 1048576,
+    "maxOutput": 384000,
+    "inputCost": 0.3,
+    "outputCost": 0.7
   },
   {
-    model: 'tinfoil/glm-5-2',
-    imageInput: false,
-    audioInput: false,
-    videoInput: false,
-    toolUsage: true,
-    reasoning: true,
-    contextWindow: 384000,
-    maxOutput: 131072,
-    inputCost: 1.5,
-    outputCost: 5.25,
+    "model": "tinfoil/gemma4-31b",
+    "imageInput": true,
+    "audioInput": false,
+    "videoInput": false,
+    "toolUsage": true,
+    "reasoning": true,
+    "contextWindow": 262144,
+    "maxOutput": 32768,
+    "inputCost": 0.4,
+    "outputCost": 1
   },
   {
-    model: 'tinfoil/gpt-oss-120b',
-    imageInput: false,
-    audioInput: false,
-    videoInput: false,
-    toolUsage: true,
-    reasoning: true,
-    contextWindow: 131000,
-    maxOutput: 32768,
-    inputCost: 0.15,
-    outputCost: 0.6,
+    "model": "tinfoil/glm-5-2",
+    "imageInput": false,
+    "audioInput": false,
+    "videoInput": false,
+    "toolUsage": true,
+    "reasoning": true,
+    "contextWindow": 393216,
+    "maxOutput": 131072,
+    "inputCost": 1.5,
+    "outputCost": 5.25
   },
   {
-    model: 'tinfoil/gpt-oss-safeguard-120b',
-    imageInput: false,
-    audioInput: false,
-    videoInput: false,
-    toolUsage: true,
-    reasoning: true,
-    contextWindow: 131000,
-    maxOutput: 32768,
-    inputCost: 0.15,
-    outputCost: 0.6,
+    "model": "tinfoil/gpt-oss-120b",
+    "imageInput": false,
+    "audioInput": false,
+    "videoInput": false,
+    "toolUsage": true,
+    "reasoning": true,
+    "contextWindow": 131072,
+    "maxOutput": 32768,
+    "inputCost": 0.15,
+    "outputCost": 0.6
   },
   {
-    model: 'tinfoil/kimi-k2-6',
-    imageInput: true,
-    audioInput: false,
-    videoInput: true,
-    toolUsage: true,
-    reasoning: true,
-    contextWindow: 256000,
-    maxOutput: 262144,
-    inputCost: 1.5,
-    outputCost: 5.25,
+    "model": "tinfoil/gpt-oss-safeguard-120b",
+    "imageInput": false,
+    "audioInput": false,
+    "videoInput": false,
+    "toolUsage": true,
+    "reasoning": true,
+    "contextWindow": 131072,
+    "maxOutput": 32768,
+    "inputCost": 0.15,
+    "outputCost": 0.6
   },
   {
-    model: 'tinfoil/kimi-k3',
-    imageInput: true,
-    audioInput: false,
-    videoInput: true,
-    toolUsage: true,
-    reasoning: true,
-    contextWindow: 256000,
-    maxOutput: 131072,
-    inputCost: 2,
-    outputCost: 6,
+    "model": "tinfoil/kimi-k3",
+    "imageInput": true,
+    "audioInput": false,
+    "videoInput": true,
+    "toolUsage": true,
+    "reasoning": true,
+    "contextWindow": 262144,
+    "maxOutput": 131072,
+    "inputCost": 4,
+    "outputCost": 20
   },
   {
-    model: 'tinfoil/llama3-3-70b',
-    imageInput: false,
-    audioInput: false,
-    videoInput: false,
-    toolUsage: true,
-    reasoning: false,
-    contextWindow: 128000,
-    maxOutput: 4096,
-    inputCost: 1.75,
-    outputCost: 2.75,
+    "model": "tinfoil/llama3-3-70b",
+    "imageInput": false,
+    "audioInput": false,
+    "videoInput": false,
+    "toolUsage": true,
+    "reasoning": false,
+    "contextWindow": 131072,
+    "maxOutput": 4096,
+    "inputCost": 1.75,
+    "outputCost": 2.75
   },
   {
-    model: 'tinfoil/nomic-embed-text',
-    imageInput: false,
-    audioInput: false,
-    videoInput: false,
-    toolUsage: false,
-    reasoning: false,
-    contextWindow: 8192,
-    maxOutput: 768,
-    inputCost: 0.05,
-    outputCost: null,
-  },
+    "model": "tinfoil/nomic-embed-text",
+    "imageInput": false,
+    "audioInput": false,
+    "videoInput": false,
+    "toolUsage": false,
+    "reasoning": false,
+    "contextWindow": 8192,
+    "maxOutput": 768,
+    "inputCost": 0.05,
+    "outputCost": null
+  }
 ]}
 />
 
@@ -150,28 +150,30 @@ Mastra uses the OpenAI-compatible `/chat/completions` endpoint. Some provider-sp
 
 ```typescript title="src/mastra/agents/my-agent.ts"
 const agent = new Agent({
-  id: 'custom-agent',
-  name: 'custom-agent',
+  id: "custom-agent",
+  name: "custom-agent",
   model: {
-    url: 'https://inference.tinfoil.sh/v1',
-    id: 'tinfoil/gemma4-31b',
+    url: "https://inference.tinfoil.sh/v1",
+    id: "tinfoil/deepseek-v4-flash",
     apiKey: process.env.TINFOIL_API_KEY,
     headers: {
-      'X-Custom-Header': 'value',
-    },
-  },
-})
+      "X-Custom-Header": "value"
+    }
+  }
+});
 ```
 
 ### Dynamic model selection
 
 ```typescript title="src/mastra/agents/my-agent.ts"
 const agent = new Agent({
-  id: 'dynamic-agent',
-  name: 'Dynamic Agent',
+  id: "dynamic-agent",
+  name: "Dynamic Agent",
   model: ({ requestContext }) => {
-    const useAdvanced = requestContext.task === 'complex'
-    return useAdvanced ? 'tinfoil/nomic-embed-text' : 'tinfoil/gemma4-31b'
-  },
-})
+    const useAdvanced = requestContext.task === "complex";
+    return useAdvanced
+      ? "tinfoil/nomic-embed-text"
+      : "tinfoil/deepseek-v4-flash";
+  }
+});
 ```

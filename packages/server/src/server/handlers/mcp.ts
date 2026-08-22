@@ -19,6 +19,7 @@ import {
   listResourcesResponseSchema,
 } from '../schemas/mcp';
 import type { ServerContext } from '../server-adapter';
+import type { SetMcpRequestAuth } from '../server-adapter/mcp-auth';
 import { createRoute } from '../server-adapter/routes/route-builder';
 
 // ============================================================================
@@ -341,6 +342,11 @@ export interface MCPTransportOptions {
    * Custom session ID generator function.
    */
   sessionIdGenerator?: () => string;
+  /**
+   * Sets `req.auth` before the MCP transport reads it. Overrides the default
+   * bridge that forwards the principal resolved by `server.auth`.
+   */
+  setRequestAuth?: SetMcpRequestAuth;
 }
 
 /**

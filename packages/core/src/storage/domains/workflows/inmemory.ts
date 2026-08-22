@@ -72,6 +72,7 @@ import type {
   WorkflowTerminalizationCapabilities,
   WorkflowResumeCapabilities,
 } from '../../types';
+import { matchesExpectedWorkflowStatus } from '../../types';
 import {
   createEmptyWorkflowSnapshot,
   mergeWorkflowStepResult,
@@ -1637,7 +1638,13 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       throw new Error(`Snapshot not found for runId ${runId}`);
     }
 
-    const { finalState, ...stateOptions } = opts;
+    const { expectedStatus, finalState, ...stateOptions } = opts;
+    // Compare-and-set guard runs before any mutation: a mismatched status makes
+    // the whole update a no-op, including the terminal `finalState` replacement.
+    if (!matchesExpectedWorkflowStatus(snapshot.status, expectedStatus)) {
+      return;
+    }
+
     const existingTimestamp = snapshot.timestamp;
     snapshot = { ...snapshot, ...stateOptions };
     if (finalState !== undefined) {

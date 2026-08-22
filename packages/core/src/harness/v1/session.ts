@@ -352,7 +352,9 @@ type MessageAdmissionHashes = {
 };
 
 type QueueResumeRecoveryResult =
-  { status: 'none' } | { status: 'completed'; result: AgentResult } | { status: 'stale' };
+  | { status: 'none' }
+  | { status: 'completed'; result: AgentResult }
+  | { status: 'stale' };
 
 type ResumeResponseMode = 'agent-result' | 'inbox-receipt';
 type InboxReceiptResponseOptions = Extract<InboxResponseOptions, { responseId: string }>;
@@ -4356,7 +4358,8 @@ export class Session {
    * `_internalAwaitFlushChain()` so shutdown and tests can act on it. */
   private _pendingTokenUsageFlushError: unknown;
   private _pendingDurableTurnFlushError:
-    { error: unknown; pendingResume?: { runId: string; toolCallId: string } } | undefined;
+    | { error: unknown; pendingResume?: { runId: string; toolCallId: string } }
+    | undefined;
 
   /**
    * True while a turn (message or queued) is in flight against the agent.

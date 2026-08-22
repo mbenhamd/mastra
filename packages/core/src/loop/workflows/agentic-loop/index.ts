@@ -124,9 +124,9 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
       // fresh response message for the continuation. See issue #19445.
       if (isResumeContinuationPending) {
         isResumeContinuationPending = false;
-        messageList.markResponseMessageBoundary(typedInputData.stepResult?.messageId ?? typedInputData.messageId);
-
-        const nextMessageId = rest.rotateResponseMessageId();
+        const nextMessageId = rest.rotateResponseMessageId(
+          typedInputData.stepResult?.messageId ?? typedInputData.messageId,
+        );
         typedInputData.messageId = nextMessageId;
         if (typedInputData.stepResult) {
           typedInputData.stepResult.messageId = nextMessageId;
@@ -141,9 +141,12 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
         // Signals arriving after the execution workflow settled still win over
         // a terminal candidate. The next provider turn must see them.
         typedInputData.terminalToolResult = undefined;
-        messageList.markResponseMessageBoundary(typedInputData.stepResult?.messageId ?? typedInputData.messageId);
-
-        const nextMessageId = rest.rotateResponseMessageId();
+        // Sealing the flushed response message is what keeps the signal turn out
+        // of the previous row; `rotateResponseMessageId` now marks that boundary
+        // itself, so pass the id it must seal.
+        const nextMessageId = rest.rotateResponseMessageId(
+          typedInputData.stepResult?.messageId ?? typedInputData.messageId,
+        );
         typedInputData.messageId = nextMessageId;
         for (const pendingSignal of pendingSignals) {
           const signalForTranscript = messageList.addSignal(pendingSignal);

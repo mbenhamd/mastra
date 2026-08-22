@@ -74,7 +74,20 @@ describe('AgentController tracing propagation', () => {
   });
 
   it('should forward tracingContext to agent.stream() when provided', async () => {
-    const mockSpan = { spanContext: () => ({ traceId: 'abc', spanId: 'def' }) };
+    // The assertion below is only that `tracingContext` is forwarded verbatim, but the
+    // turn really executes, and `getOrCreateSpan` calls `currentSpan.createChildSpan(...)`
+    // on the way through. A span stub that only implements `spanContext` throws there, so
+    // the mock returns itself as its own child and no-ops the lifecycle calls.
+    const mockSpan: any = {
+      spanContext: () => ({ traceId: 'abc', spanId: 'def' }),
+      createChildSpan: () => mockSpan,
+      // `IModelSpanTracker | undefined` per observability/types/tracing.ts, and every
+      // caller optional-chains the result, so `undefined` is the honest stub here.
+      createTracker: () => undefined,
+      end: () => {},
+      error: () => {},
+      update: () => {},
+    };
     const tracingContext: TracingContext = { currentSpan: mockSpan as any };
 
     await session.sendMessage({ content: 'hello', tracingContext });

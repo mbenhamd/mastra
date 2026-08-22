@@ -9,10 +9,12 @@ import {
   TABLE_THREADS,
 } from '@mastra/core/storage';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { buildConstraintName } from '../db/constraint-utils';
 import { HarnessPG } from '../domains/harness';
 import { MemoryPG } from '../domains/memory';
 import { ObservabilityPG } from '../domains/observability';
 import { ScoresPG } from '../domains/scores';
+import { WorkflowsPG } from '../domains/workflows';
 
 // Mock DbClient
 const mockClient = {
@@ -172,6 +174,68 @@ describe('PostgresStore Domain Performance Indexes', () => {
         columns: ['harness_name', 'channel_id', 'idempotency_key'],
         unique: true,
       });
+    });
+  });
+
+  describe('WorkflowsPG.getDefaultIndexDefinitions', () => {
+    it('should return a composite index for workflow_snapshot on (workflow_name, "createdAt" DESC)', () => {
+      const workflows = new WorkflowsPG({
+        client: mockClient as any,
+        schemaName: 'test_schema',
+      });
+
+      const indexes = workflows.getDefaultIndexDefinitions();
+
+      // 1 snapshot index + 6 terminalization recovery/retention indexes.
+      expect(indexes.length).toBe(7);
+      expect(indexes).toContainEqual({
+        name: 'test_schema_mastra_workflow_snapshot_name_createdat_idx',
+        table: 'mastra_workflow_snapshot',
+        columns: ['workflow_name', 'createdAt DESC'],
+      });
+    });
+
+    it('should work with default schema (public)', () => {
+      const workflows = new WorkflowsPG({
+        client: mockClient as any,
+      });
+
+      const indexes = workflows.getDefaultIndexDefinitions();
+
+      expect(indexes).toContainEqual({
+        name: 'mastra_workflow_snapshot_name_createdat_idx',
+        table: 'mastra_workflow_snapshot',
+        columns: ['workflow_name', 'createdAt DESC'],
+      });
+    });
+
+    it('should export the status expression index in the schema DDL', () => {
+      const ddl = WorkflowsPG.getExportDDL().join('\n');
+
+      expect(ddl).toContain('mastra_workflow_snapshot_name_status_createdat_idx');
+      expect(ddl).toContain(`(workflow_name, (snapshot ->> 'status'), "createdAt" DESC)`);
+    });
+
+    it('should prefix the status expression index with a non-public schema', () => {
+      const ddl = WorkflowsPG.getExportDDL('test_schema').join('\n');
+
+      expect(ddl).toContain('test_schema_mastra_workflow_snapshot_name_status_createdat_idx');
+    });
+
+    // Postgres stores identifiers truncated to 63 bytes. Emitting the untruncated name would
+    // make init's snapshot lookup miss and re-issue CREATE INDEX on every warm init.
+    it('should truncate the status expression index name to the Postgres identifier limit', () => {
+      const longSchema = 'deployment_schema';
+      const ddl = WorkflowsPG.getExportDDL(longSchema).join('\n');
+
+      const indexName = ddl.match(/CREATE INDEX IF NOT EXISTS "([^"]+)" ON [^\n]*snapshot ->> 'status'/)?.[1];
+      expect(indexName).toBe(
+        buildConstraintName({
+          baseName: 'mastra_workflow_snapshot_name_status_createdat_idx',
+          schemaName: longSchema,
+        }),
+      );
+      expect(Buffer.byteLength(indexName!, 'utf-8')).toBeLessThanOrEqual(63);
     });
   });
 

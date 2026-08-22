@@ -7,6 +7,7 @@ import { getErrorFromUnknown } from '../error/utils.js';
 import type { PubSub } from '../events/pubsub';
 import type { ObservabilityContext, Span, SpanType, TracingPolicy } from '../observability';
 import { createObservabilityContext } from '../observability';
+import { MASTRA_AUTH_TOKEN_KEY } from '../request-context';
 import { deepEqual } from '../utils/deep-equal';
 import type { ExecutionGraph } from './execution-engine';
 import { ExecutionEngine } from './execution-engine';
@@ -55,7 +56,7 @@ import type {
 } from './types';
 // Used by the per-type execute methods (executeAgent/executeTool/executeMapping)
 // to build a runnable step from a declarative entry.
-import { getSingleStepEntryId } from './utils';
+import { abortableSleep, getSingleStepEntryId, omitPriorCompletionFields } from './utils';
 
 // Re-export ExecutionContext for backwards compatibility
 export type { ExecutionContext } from './types';
@@ -201,8 +202,13 @@ export class DefaultExecutionEngine extends ExecutionEngine {
    * @param _sleepId - Unique identifier for this sleep operation
    * @param _workflowId - The workflow ID (for constructing platform-specific IDs)
    */
-  async executeSleepDuration(duration: number, _sleepId: string, _workflowId: string): Promise<void> {
-    await new Promise(resolve => setTimeout(resolve, duration < 0 ? 0 : duration));
+  async executeSleepDuration(
+    duration: number,
+    _sleepId: string,
+    _workflowId: string,
+    abortSignal?: AbortSignal,
+  ): Promise<void> {
+    await abortableSleep(duration, abortSignal);
   }
 
   /**
@@ -212,9 +218,13 @@ export class DefaultExecutionEngine extends ExecutionEngine {
    * @param _sleepUntilId - Unique identifier for this sleep operation
    * @param _workflowId - The workflow ID (for constructing platform-specific IDs)
    */
-  async executeSleepUntilDate(date: Date, _sleepUntilId: string, _workflowId: string): Promise<void> {
-    const time = date.getTime() - Date.now();
-    await new Promise(resolve => setTimeout(resolve, time < 0 ? 0 : time));
+  async executeSleepUntilDate(
+    date: Date,
+    _sleepUntilId: string,
+    _workflowId: string,
+    abortSignal?: AbortSignal,
+  ): Promise<void> {
+    await abortableSleep(date.getTime() - Date.now(), abortSignal);
   }
 
   /**
@@ -289,7 +299,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
             payload: {
               id: params.step.id,
               stepCallId: params.stepCallId,
-              ...params.stepInfo,
+              ...omitPriorCompletionFields(params.stepInfo),
             },
           },
         });
@@ -716,13 +726,18 @@ export class DefaultExecutionEngine extends ExecutionEngine {
    * Used by durable execution engines to persist context across step replays.
    */
   serializeRequestContext(requestContext: RequestContext): Record<string, any> {
+    let obj: Record<string, any>;
     if (typeof requestContext.toJSON === 'function') {
-      return requestContext.toJSON();
+      obj = requestContext.toJSON();
+    } else {
+      obj = {};
+      requestContext.forEach((value, key) => {
+        obj[key] = value;
+      });
     }
-    const obj: Record<string, any> = {};
-    requestContext.forEach((value, key) => {
-      obj[key] = value;
-    });
+    // Never persist the framework-managed bearer token in durable snapshots.
+    // A resumed authenticated request supplies its own fresh live token.
+    delete obj[MASTRA_AUTH_TOKEN_KEY];
     return obj;
   }
 

@@ -40,7 +40,6 @@ import { PUBSUB_SYMBOL } from '../../../../workflows/constants';
 import { createStep } from '../../../../workflows/workflow';
 import { enforceChannelToolFence, readChannelToolFence } from '../../../channel-tool-fence';
 import { AGENT_RESPONSE_RECOVERY_STEP } from '../../../merge-execution-options';
-import { MessageList } from '../../../message-list';
 import {
   createProcessorToolSurfaceView,
   createToolSurfaceFence,
@@ -89,6 +88,10 @@ const durableLLMInputSchema = z.object({
   responseRecovery: durableResponseRecoveryStateSchema.optional(),
   state: z.any(),
   messageId: z.string(),
+  // JSON-safe request context snapshot, forwarded from iteration state so the
+  // rebuild-from-Mastra path resolves the model and tools with the caller's
+  // context rather than an empty one.
+  requestContextEntries: z.record(z.string(), z.any()).optional(),
   // Agent span data for model span parenting
   agentSpanData: z.any().optional(),
   // Model span data (ONE span for entire agent run, created before workflow)
@@ -326,6 +329,13 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
         typedInput.options?.maxProcessorRetries ??
         (getBoundRunRegistryEntry(runId, typedInput.runtimeBindingId)?.errorProcessors?.length ? 10 : undefined);
 
+      // Hoisted: a retry must keep the id an error processor rotated to.
+      let currentMessageId = messageId;
+      const rotateResponseMessageId = () => {
+        currentMessageId = messageList.rotateResponseMessageId(currentMessageId);
+        return currentMessageId;
+      };
+
       for (let modelIndex = 0; modelIndex < modelList.length; modelIndex++) {
         const modelEntry = modelList[modelIndex]!;
         const maxRetries = responseRecoveryReserved ? 0 : modelEntry.maxRetries || 0;
@@ -349,8 +359,6 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
               );
             }
 
-            let currentMessageId = messageId;
-
             // 5. Prepare tools - cast through unknown as CoreTool and ToolSet are structurally compatible at runtime
             let currentModel = model;
             let currentTools = tools as unknown as ToolSet;
@@ -373,7 +381,8 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                 Object.keys(currentTools),
               );
               currentToolChoice = enforceToolChoiceFence(currentToolChoice as any, toolSurfaceFence) as
-                ToolChoice<ToolSet> | undefined;
+                | ToolChoice<ToolSet>
+                | undefined;
             }
             let currentModelSettings: Record<string, unknown> = { ...(execOptions.modelSettings ?? {}) };
             let currentProviderOptions: SharedProviderOptions | undefined = mergeProviderOptions(
@@ -390,7 +399,8 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
             // after a resume the registry override points steps at the resumed generation.
             const inputModelSpanData = (getBoundRunRegistryEntry(runId, typedInput.runtimeBindingId)
               ?.resumeModelSpanData ?? (inputData as any).modelSpanData) as
-              ExportedSpan<SpanType.MODEL_GENERATION> | undefined;
+              | ExportedSpan<SpanType.MODEL_GENERATION>
+              | undefined;
             const modelSpan = inputModelSpanData
               ? (observability?.rebuildSpan(inputModelSpanData) as AIModelGenerationSpan | undefined)
               : undefined;
@@ -459,10 +469,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                   threadId: typedInput.state?.threadId,
                   model: currentModel,
                   messageId: currentMessageId,
-                  rotateResponseMessageId: () => {
-                    currentMessageId = crypto.randomUUID();
-                    return currentMessageId;
-                  },
+                  rotateResponseMessageId,
                   tools: currentTools,
                   toolChoice: currentToolChoice,
                   providerOptions: currentProviderOptions,
@@ -500,7 +507,8 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                 try {
                   currentActiveTools = enforceActiveToolsFence(merged.activeTools, reconstructibleToolSurface);
                   currentToolChoice = enforceToolChoiceFence(merged.toolChoice as any, reconstructibleToolSurface) as
-                    ToolChoice<ToolSet> | undefined;
+                    | ToolChoice<ToolSet>
+                    | undefined;
                 } catch (error) {
                   selectionControlError = error;
                   hasSelectionControlError = true;
@@ -692,7 +700,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
               if (isFirstModelRequest && registryEntry?.drainPendingSignals) {
                 const preRunSignals = registryEntry.drainPendingSignals('pre-run');
                 if (preRunSignals.length > 0) {
-                  currentMessageId = mastra?.generateId?.() ?? crypto.randomUUID();
+                  rotateResponseMessageId();
                 }
                 for (const preRunSignal of preRunSignals) {
                   const signalForTranscript = messageList.addSignal(preRunSignal);
@@ -1283,14 +1291,13 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
 
                 // Emit step-start before the first stream chunk so the
                 // ordering matches the regular agent: start → step-start → response-metadata → …
-                // onResult has already fired by the time the first chunk arrives,
-                // so `request` and `warnings` are populated.
+                // Keep the full model request out of the durable event stream; the helper
+                // preserves the canonical payload shape with an empty `request` object.
                 if (!stepStartEmitted && pubsub) {
                   stepStartEmitted = true;
                   await emitStepStartEvent(pubsub, runId, {
                     stepId: DurableStepIds.LLM_EXECUTION,
                     messageId: currentMessageId,
-                    request,
                     warnings,
                   });
                 }
@@ -1558,7 +1565,15 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                   case 'error': {
                     const payload = rawChunk.payload as any;
                     const errorMessage = payload?.error?.message || payload?.message || 'LLM execution error';
-                    const errorObj = new Error(errorMessage);
+                    const errorObj = new Error(errorMessage, { cause: payload?.error ?? payload });
+                    // Keep the producer's stack so crashes stay attributable to their real throw site.
+                    if (typeof payload?.error?.stack === 'string') {
+                      errorObj.stack = payload.error.stack;
+                    }
+                    // Retain the producer's error name so classification (e.g. AbortError) survives transport.
+                    if (typeof payload?.error?.name === 'string' && payload.error.name) {
+                      errorObj.name = payload.error.name;
+                    }
                     // DON'T emit error event here - we might have fallback models to try
                     // Error event will be emitted after all models are exhausted
                     throw errorObj;
@@ -1627,12 +1642,12 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                     agentName: typedInput.agentName ?? typedInput.agentId,
                     processorStates: registryEntryInner.processorStates,
                   });
-                  const currentMessageList = new MessageList();
-                  currentMessageList.deserialize(typedInput.messageListState);
                   const { retry } = await runner.runProcessAPIError({
                     error: lastError,
-                    messages: currentMessageList.get.all.db(),
-                    messageList: currentMessageList,
+                    messages: messageList.get.all.db(),
+                    messageList,
+                    messageId: currentMessageId,
+                    rotateResponseMessageId,
                     stepNumber: (inputData as any).stepIndex ?? 0,
                     steps: (inputData as any).accumulatedSteps ?? [],
                     retryCount: processorRetryCount,
@@ -2082,12 +2097,12 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                   agentName: typedInput.agentName ?? typedInput.agentId,
                   processorStates: registryEntry.processorStates,
                 });
-                const currentMessageList = new MessageList();
-                currentMessageList.deserialize(typedInput.messageListState);
                 const { retry } = await runner.runProcessAPIError({
                   error: lastError,
-                  messages: currentMessageList.get.all.db(),
-                  messageList: currentMessageList,
+                  messages: messageList.get.all.db(),
+                  messageList,
+                  messageId: currentMessageId,
+                  rotateResponseMessageId,
                   stepNumber: (inputData as any).stepIndex ?? 0,
                   steps: (inputData as any).accumulatedSteps ?? [],
                   retryCount: processorRetryCount,
@@ -2133,7 +2148,16 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
           type: 'error',
           runId,
           from: ChunkFrom.AGENT,
-          payload: { error: fatalError },
+          // Serialize explicitly: a raw Error JSON-stringifies to `{}` on plain
+          // transports, which destroys the producer stack and makes crashes
+          // unattributable on the consumer side.
+          payload: {
+            error: {
+              message: fatalError.message,
+              stack: fatalError.stack,
+              name: fatalError.name,
+            },
+          },
         });
 
         // Emit step-finish so MastraModelOutput resolves finishReason to 'error'

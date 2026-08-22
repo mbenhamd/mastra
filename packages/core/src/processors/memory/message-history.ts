@@ -1,4 +1,4 @@
-import type { Processor } from '..';
+import type { OutputResult, Processor } from '..';
 import type { MastraDBMessage, MessageList } from '../../agent';
 import { isTransientSignalMessage } from '../../agent/signals';
 import { materializeTerminalToolResult } from '../../loop/shared/terminal-tool-result';
@@ -413,9 +413,10 @@ export class MessageHistory implements Processor {
       messageList: MessageList;
       abort: (reason?: string) => never;
       requestContext?: RequestContext;
+      result?: OutputResult;
     } & Partial<ObservabilityContext>,
   ): Promise<MessageList> {
-    const { messageList, requestContext, ...observabilityContext } = args;
+    const { messageList, requestContext, result, ...observabilityContext } = args;
 
     // Get memory context from RequestContext or MessageList
     const context = this.getMemoryContext(requestContext, messageList);
@@ -435,6 +436,12 @@ export class MessageHistory implements Processor {
     const messagesToSave = [...newInput, ...newOutput];
 
     if (messagesToSave.length === 0) {
+      return messageList;
+    }
+
+    // Don't persist an input-only failed turn: if the provider errored before
+    // producing any output, saving the user message would orphan it in history.
+    if (result?.finishReason === 'error' && newOutput.length === 0) {
       return messageList;
     }
 

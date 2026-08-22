@@ -57,6 +57,10 @@ const durableAgenticInputSchema = z.object({
   options: z.any(),
   state: z.any(),
   messageId: z.string(),
+  // JSON-safe snapshot of the caller's request context. Inngest runs durable
+  // steps on a separate worker process, so this snapshot is the only way the
+  // rebuild path can recover request-scoped configuration.
+  requestContextEntries: z.record(z.string(), z.any()).optional(),
   // Observability fields (Inngest-specific)
   agentSpanData: z.any().optional(),
   modelSpanData: z.any().optional(),

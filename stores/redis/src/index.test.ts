@@ -138,6 +138,30 @@ describe('RedisServerCache', () => {
     });
   });
 
+  describe('increment', () => {
+    it('should increment with prefixed key and refresh TTL', async () => {
+      mockClient.incr.mockResolvedValue(3);
+      mockClient.expire.mockResolvedValue(1);
+
+      const result = await cache.increment('counter');
+
+      expect(mockClient.incr).toHaveBeenCalledWith('mastra:cache:counter');
+      expect(mockClient.expire).toHaveBeenCalledWith('mastra:cache:counter', 300);
+      expect(result).toBe(3);
+    });
+
+    it('should not refresh TTL when ttlSeconds is 0', async () => {
+      const noTtlCache = new RedisServerCache({ client: mockClient }, { ttlSeconds: 0 });
+      mockClient.incr.mockResolvedValue(1);
+
+      const result = await noTtlCache.increment('counter');
+
+      expect(mockClient.incr).toHaveBeenCalledWith('mastra:cache:counter');
+      expect(mockClient.expire).not.toHaveBeenCalled();
+      expect(result).toBe(1);
+    });
+  });
+
   describe('delete', () => {
     it('should delete a key', async () => {
       mockClient.del.mockResolvedValue(1);

@@ -60,7 +60,7 @@ import type {
 import type { MessageListInput } from '@mastra/core/agent/message-list';
 import { InMemoryServerCache } from '@mastra/core/cache';
 import type { MastraServerCache } from '@mastra/core/cache';
-import { CachingPubSub } from '@mastra/core/events';
+import { CachingPubSub, isRunLocalTopic } from '@mastra/core/events';
 import type { PubSub } from '@mastra/core/events';
 import type { Mastra } from '@mastra/core/mastra';
 import { SpanType, EntityType } from '@mastra/core/observability';
@@ -695,6 +695,12 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
     getPubsub();
     return new CachingPubSub(defaultPubsub, resolveCache(), {
       indexedReplay: INNGEST_WORKFLOW_LIFECYCLE_REPLAY,
+      // Run-local `workflow.events.v2.*` watch events carry cumulative step
+      // results (often megabytes) and no other instance ever replays them, so
+      // they bypass retention while still being delivered live over Inngest
+      // realtime (upstream #21572 / issue #20646). This mirrors the in-memory
+      // DurableAgent wiring in packages/core/src/agent/durable/durable-agent.ts.
+      shouldCache: topic => !isRunLocalTopic(topic),
     });
   });
 
@@ -1379,6 +1385,19 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
 
               // Find the suspended step from the snapshot
               const steps = Object.keys(snapshot.suspendedPaths ?? {});
+              // Continue the trace the run suspended in (upstream #21566). The
+              // anchor is persisted on the suspend snapshot, so it is stable across
+              // dispatch retries and hashes identically on the worker, which reads
+              // it back off the resume event.
+              const suspendedTracingContext = snapshot.tracingContext;
+              const tracingOptions = suspendedTracingContext?.traceId
+                ? {
+                    traceId: suspendedTracingContext.traceId,
+                    ...(suspendedTracingContext.spanId === undefined
+                      ? {}
+                      : { parentSpanId: suspendedTracingContext.spanId }),
+                  }
+                : undefined;
               const run = (await admittedWorkflow.createRun({
                 runId,
                 resourceId: resumeOptions?.resourceId,
@@ -1395,6 +1414,7 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
                 // it with the independently allowlisted snapshot/fresh subset above
                 // so pre-hardening snapshots can't reintroduce stored credentials.
                 __requestContextMode: 'replace',
+                ...(tracingOptions === undefined ? {} : { tracingOptions }),
               });
             } catch (error) {
               // A lost resume acknowledgement does not prove non-admission. Keep

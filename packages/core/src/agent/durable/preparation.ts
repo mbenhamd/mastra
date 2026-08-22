@@ -27,6 +27,7 @@ import type { Workspace } from '../../workspace';
 import type { Agent } from '../agent';
 import type { AgentExecutionOptions, DelegationConfig } from '../agent.types';
 import type { ResolvedAgentMemory } from '../execution-memory';
+import { assertThreadOwnedByResource } from '../memory-thread-ownership';
 import { mergeAgentExecutionOptions } from '../merge-execution-options';
 import { MessageList } from '../message-list';
 import type { MastraDBMessage, MessageListInput } from '../message-list';
@@ -49,6 +50,7 @@ import type {
   ToolsetsInput,
   ToolsInput,
 } from '../types';
+import { fireClientToolOutputHooks } from '../workflows/prepare-stream/client-tool-output-hooks';
 import type { DurableAgenticWorkflowInput, RunRegistryEntry, SerializableStructuredOutput } from './types';
 import { createRuntimeDependencyFingerprint, createWorkflowInput } from './utils/serialize-state';
 
@@ -653,6 +655,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
     if (memory && threadId && resourceId) {
       const existingThread = await memory.getThreadById({ threadId });
       if (existingThread) {
+        assertThreadOwnedByResource({ thread: existingThread, resourceId, agentName: publicAgentName });
         threadObject = existingThread;
       } else {
         threadObject = await memory.createThread({
@@ -837,6 +840,17 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
       throw new Error('Agent model not available');
     }
 
+    // Client-executed results fire only after processors accept the request and
+    // the required runtime model has resolved.
+    if (!tripwireData) {
+      await fireClientToolOutputHooks({
+        messages,
+        tools,
+        abortSignal: execOptions?.abortSignal,
+        logger,
+      });
+    }
+
     const modelList = resolvedModels.modelList;
 
     // 8b. Get scorers configuration
@@ -1014,6 +1028,9 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
           >)
         : undefined;
     const registryEntry: RunRegistryEntry = {
+      // Owning Mastra instance — graceful shutdown awaits only the durable
+      // workflow executions that belong to it.
+      mastra,
       runtimeBindingId,
       agentId: publicAgentId,
       threadId,
@@ -1035,6 +1052,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
         : undefined,
       workspace,
       requestContext,
+      mcp: execOptions?.mcp,
       versions: mergedVersions ? structuredClone(mergedVersions) : undefined,
       inputProcessors,
       llmRequestInputProcessors,
