@@ -2588,6 +2588,16 @@ run_validator_self_tests() {
     fi
   }
 
+  assert_line_matches() {
+    local expected_regex="$1"
+    local file="$2"
+    if ! grep -Eq -- "$expected_regex" "$file"; then
+      echo "Expected a fixture-output line to match: $expected_regex" >&2
+      cat "$file" >&2
+      exit 1
+    fi
+  }
+
   assert_route_consumer_commands() {
     assert_contains '--dir client-sdks/client-js exec tsc-files --noEmit src/route-types.generated.ts src/types.ts src/resources/harness.ts src/resources/agent.test.ts' "$command_log"
     assert_contains '--dir packages/cli exec tsc-files --noEmit src/commands/api/route-metadata.generated.ts src/commands/api/index.ts src/commands/api/descriptors.test.ts' "$command_log"
@@ -2831,7 +2841,9 @@ run_validator_self_tests() {
   : > "$command_log"
   output="$test_root/favorites-approved-external-success.log"
   run_fixture "$head_sha" "$output"
-  assert_contains 'packages/server/src/server/handlers/favorites.integration.test.ts' "$command_log"
+  assert_line_matches \
+    '^--dir packages/server exec vitest run .* src/server/handlers/favorites\.integration\.test\.ts$' \
+    "$command_log"
 
   head_sha="$(
     cd "$fixture_repo"
@@ -3253,7 +3265,9 @@ run_validator_self_tests() {
   assert_contains \
     'Running changed test file in full: packages/server/src/server/handlers/favorites.integration.test.ts' \
     "$output"
-  assert_contains 'src/server/handlers/favorites.integration.test.ts' "$command_log"
+  assert_line_matches \
+    '^--dir packages/server exec vitest run .* src/server/handlers/favorites\.integration\.test\.ts$' \
+    "$command_log"
 
   head_sha="$(
     cd "$fixture_repo"
@@ -4278,7 +4292,9 @@ NODE
   : > "$command_log"
   output="$test_root/harness-spec-success.log"
   run_fixture "$head_sha" "$output"
-  assert_contains 'exec prettier --check harnessv1/sections/04-public-api/02-session/messages.md' "$command_log"
+  assert_contains \
+    'exec oxfmt --check --no-error-on-unmatched-pattern harnessv1/sections/04-public-api/02-session/messages.md' \
+    "$command_log"
 
   head_sha="$(
     cd "$fixture_repo"
@@ -10004,9 +10020,47 @@ if [[ "$inngest_index_test_changed" == true ]]; then
   run_with_validation_budget 120 docker compose -f workflows/inngest/docker-compose.yaml config --quiet
 fi
 
+# Formatter ownership. `oxfmt` is this repository's formatter for root-owned source: `pnpm run
+# format` is `format:eslint && format:oxfmt`, there is no prettier format script, and
+# `lint:format` runs `oxfmt --check .` over everything except docs/, examples/, explorations/ and
+# observability/_examples/. Checking a root-owned file with BOTH tools is not redundancy but
+# contradiction - they disagree on a union type whose declaration does not fit on one line while
+# its members fit on a continuation line, so each rewrites what the other just wrote and a PR
+# touching such a file cannot satisfy both gates. Nine files on `main` are in exactly that state.
+# So: oxfmt checks what it owns, prettier keeps only the trees oxfmt excludes, and docs are left
+# to their own package-owned oxfmt-mdx check in .github/workflows/lint-docs.yml.
+mapfile -t oxfmt_files < <(
+  while IFS= read -r file; do
+    if [[ ! -f "$file" || -L "$file" ]]; then
+      continue
+    fi
+    case "$file" in
+      docs/* | examples/* | explorations/* | observability/_examples/*)
+        continue
+        ;;
+    esac
+    if [[ "$file" =~ \.(cjs|css|gql|graphql|js|json|json5|jsonc|jsx|less|md|mdx|mjs|scss|toml|ts|tsx|ya?ml)$ ]]; then
+      printf '%s\n' "$file"
+    fi
+  done < "$changed_files"
+)
+
+if (( ${#oxfmt_files[@]} > 0 )); then
+  run_with_validation_budget 300 pnpm exec oxfmt --check --no-error-on-unmatched-pattern "${oxfmt_files[@]}"
+fi
+
 mapfile -t prettier_files < <(
   while IFS= read -r file; do
-    if [[ -f "$file" && "$file" =~ \.(cjs|css|js|json|jsx|md|mdx|mjs|ts|tsx|ya?ml)$ ]]; then
+    if [[ ! -f "$file" || -L "$file" ]]; then
+      continue
+    fi
+    case "$file" in
+      examples/* | explorations/* | observability/_examples/*) ;;
+      *)
+        continue
+        ;;
+    esac
+    if [[ "$file" =~ \.(cjs|css|js|json|jsx|md|mdx|mjs|ts|tsx|ya?ml)$ ]]; then
       printf '%s\n' "$file"
     fi
   done < "$changed_files"
