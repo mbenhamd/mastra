@@ -1552,7 +1552,7 @@ export class ModelSpanTracker {
           // separately in the normalized `response` argument that `recordInferenceFinish`
           // retained. A `modelId` sitting on the step payload can have been injected by a
           // processor, and the fork pins that a processor-supplied model must NOT be reported
-          // as producer identity (durable-agent-tracing.integration.test.ts: "keeps absent
+          // as producer identity (durable-agent-tracing.test.ts: "keeps absent
           // producer response identity absent when a processor adds one").
           // `providerMetadata` is NOT taken from the step side either. Provider evidence is
           // captured before output processors run, so its absence is authoritative: a
