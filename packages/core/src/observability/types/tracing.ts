@@ -1193,7 +1193,7 @@ export interface ModelInferenceContext {
 /** Shared terminal shape emitted by both inner provider and outer step streams. */
 export interface ModelInferenceFinishPayload {
   stepResult: Omit<StepFinishPayload['stepResult'], 'reason'> & { reason: string };
-  output: StepFinishPayload['output'];
+  output: StepFinishPayload<any, any>['output'];
   metadata?: StepFinishPayload['metadata'];
 }
 

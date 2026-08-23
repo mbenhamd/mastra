@@ -60,14 +60,19 @@ function runSpanOperation<T>(operation: () => T): T | undefined {
   }
 }
 
-function ownStringDataProperty(value: unknown, key: string): string | undefined {
+function ownDataProperty(value: unknown, key: string): unknown {
   if (!value || typeof value !== 'object' || isProxy(value)) return undefined;
   try {
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    return descriptor && 'value' in descriptor && typeof descriptor.value === 'string' ? descriptor.value : undefined;
+    return descriptor && 'value' in descriptor ? descriptor.value : undefined;
   } catch {
     return undefined;
   }
+}
+
+function ownStringDataProperty(value: unknown, key: string): string | undefined {
+  const property = ownDataProperty(value, key);
+  return typeof property === 'string' ? property : undefined;
 }
 
 function isDescriptorSafeAbortError(error: unknown): boolean {
@@ -1224,8 +1229,10 @@ export class ModelSpanTracker {
         // still report the served model on the finish payload. Read it here, inside the
         // guarded payload block, so a payload whose accessors throw still reaches the
         // `endedWithPayload` recovery path below instead of losing the span entirely.
-        const payloadResponseModel =
-          typeof payload.metadata?.modelId === 'string' ? payload.metadata.modelId : undefined;
+        // Read through the descriptor-safe helper: a bare optional chain evaluates the
+        // `metadata` and `modelId` getters twice, and a throwing accessor would abort this
+        // guarded block and lose the span's output and finish attributes entirely.
+        const payloadResponseModel = ownStringDataProperty(ownDataProperty(payload, 'metadata'), 'modelId');
         const usageStates = providerUsageStates(rawUsage, usage);
         this.#providerUsageState =
           this.#providerUsageState === 'provider_not_reported' ||
@@ -1406,6 +1413,15 @@ export class ModelSpanTracker {
   /** Close at the inner provider finish boundary after core normalization. */
   endInference(payload?: ModelInferenceFinishPayload): void {
     const pendingPayload = this.#pendingInferenceFinishPayload ?? payload;
+    // `providerFinishEvidence` is deliberately content-free - usage and providerMetadata only.
+    // Closing on it here would publish a MODEL_INFERENCE span with an empty `output`, which
+    // contradicts the documented contract that provider measurements do not make the rest of
+    // the trace content-free (docs/.../observability/tracing/overview.mdx) and the unit
+    // contract pinning identical output on MODEL_STEP and MODEL_INFERENCE. Hold the evidence
+    // and let `#endStepSpan` merge it with the completed step payload; the provider's own end
+    // timestamp is retained separately in `#pendingInferenceEndTime`, so waiting does not
+    // inflate measured provider latency.
+    if (payload && this.#pendingInferenceFinishPayload) return;
     if (pendingPayload) this.#endInferenceSpan(pendingPayload);
   }
 
@@ -1508,7 +1524,40 @@ export class ModelSpanTracker {
     // Inference may already be closed (closed eagerly on step-finish in defer
     // mode so its duration reflects pure model latency, not subsequent tool
     // execution). Close it here for the non-deferred path.
-    if (!this.#flushPendingInferenceFinish()) this.#endInferenceSpan(payload);
+    const providerEvidence = this.#pendingInferenceFinishPayload;
+    if (!providerEvidence) {
+      this.#endInferenceSpan(payload);
+    } else {
+      // Provider evidence wins for measurement fields; the completed step payload supplies the
+      // content (text, object, warnings, modelId) the evidence deliberately omits.
+      const merged = runSpanOperation<ModelInferenceFinishPayload>(() => {
+        const { usage: _stepUsage, ...stepOutput } = payload.output;
+        const { modelId: _producerIdentityFromStep, ...stepMetadata } = (payload.metadata ?? {}) as Record<
+          string,
+          unknown
+        >;
+        return {
+          ...payload,
+          ...providerEvidence,
+          stepResult: { ...payload.stepResult, ...providerEvidence.stepResult },
+          output: { ...stepOutput, ...providerEvidence.output },
+          // `modelId` is deliberately excluded from the step side. The #21154 fallback below
+          // reads `metadata.modelId` to attribute providers that never emit a
+          // `response-metadata` chunk, but on this path the producer's identity travels
+          // separately in the normalized `response` argument that `recordInferenceFinish`
+          // retained. A `modelId` sitting on the step payload can have been injected by a
+          // processor, and the fork pins that a processor-supplied model must NOT be reported
+          // as producer identity (durable-agent-tracing.integration.test.ts: "keeps absent
+          // producer response identity absent when a processor adds one").
+          metadata: {
+            ...stepMetadata,
+            ...providerEvidence.metadata,
+            providerMetadata: providerEvidence.metadata?.providerMetadata ?? payload.metadata?.providerMetadata,
+          },
+        } as ModelInferenceFinishPayload;
+      });
+      this.#endInferenceSpan(merged ?? providerEvidence);
+    }
     // Safety net for callers that created a chunk without an inference span.
     this.#endChunkSpan();
     this.#resetCurrentStep();
@@ -1787,6 +1836,49 @@ export class ModelSpanTracker {
   /**
    * Handle object chunk spans (object, object-result)
    */
+  /**
+   * Emit the point-in-time MODEL_CHUNK event span for a `tool-result` chunk. Extracted from
+   * the inner provider stream so the outer step stream can emit it for downstream and
+   * client-executed tools, which the provider stream never sees.
+   */
+  #handleToolResultChunk<OUTPUT>(chunk: ChunkType<OUTPUT>, observedAt?: Date) {
+    if (chunk.type !== 'tool-result') return;
+
+    // tool-result is always a point-in-time event span
+    // (tool execution duration is captured by the parent tool_call span)
+    const {
+      // Metadata - tool call context (unique to tool-result chunks)
+      toolCallId,
+      toolName,
+      isError,
+      dynamic,
+      providerExecuted,
+      providerMetadata,
+      // Keep provider-executed results on MODEL_CHUNK because they come
+      // from the model/provider stream and may not have a sibling TOOL_CALL span.
+      // For locally executed tools, the canonical payload lives on TOOL_CALL.
+      result,
+      // Stripped - redundant (already on TOOL_CALL span input)
+      args: _args,
+    } = (chunk.payload as Record<string, any>) || {};
+
+    // All tool-result specific fields go in metadata
+    const metadata: Record<string, any> = { toolCallId, toolName };
+    if (isError !== undefined) metadata.isError = isError;
+    if (dynamic !== undefined) metadata.dynamic = dynamic;
+    if (providerExecuted !== undefined) metadata.providerExecuted = providerExecuted;
+    if (providerMetadata !== undefined) metadata.providerMetadata = providerMetadata;
+
+    const mastraMeta = providerMetadata?.mastra as Record<string, unknown> | undefined;
+    const spanOutput = providerExecuted
+      ? result
+      : mastraMeta?.modelOutput !== undefined
+        ? mastraMeta.modelOutput
+        : undefined;
+
+    this.#createEventSpan(chunk.type, spanOutput, { metadata, startTime: observedAt });
+  }
+
   #handleObjectChunk<OUTPUT>(chunk: ChunkType<OUTPUT>, observedAt?: Date) {
     switch (chunk.type) {
       case 'object':
@@ -1841,12 +1933,30 @@ export class ModelSpanTracker {
    * processors and client tools while the inner provider wrapper owns precise
    * MODEL_INFERENCE / MODEL_CHUNK timing.
    */
+  /**
+   * Chunk objects already observed by the inner provider stream. The outer step stream sees the
+   * identical object (llm-execution-step forwards it unchanged), so without this marker every
+   * provider chunk would produce two MODEL_CHUNK spans. Semantic chunks that only ever appear
+   * downstream - client-executed tool results, structured-output objects - are absent from the
+   * set and so are emitted exactly once by the outer wrapper.
+   */
+  #providerObservedChunks = new WeakSet<object>();
+
   wrapStepStream<T extends { pipeThrough: Function }>(stream: T): T {
     return stream.pipeThrough(
       new TransformStream({
         transform: (chunk, controller) => {
+          const providerObserved =
+            typeof chunk === 'object' && chunk !== null && this.#providerObservedChunks.delete(chunk);
           runSpanOperation(() => {
             switch (chunk.type) {
+              case 'object':
+              case 'object-result':
+                if (!providerObserved) this.#handleObjectChunk(chunk);
+                break;
+              case 'tool-result':
+                if (!providerObserved) this.#handleToolResultChunk(chunk);
+                break;
               case 'step-finish':
                 this.#endStepSpan(chunk.payload);
                 break;
@@ -1875,6 +1985,7 @@ export class ModelSpanTracker {
       new TransformStream({
         transform: (chunk, controller) => {
           const providerObservedAt = this.#takeProviderChunkTimestamp(chunk);
+          if (typeof chunk === 'object' && chunk !== null) this.#providerObservedChunks.add(chunk);
           // Capture completion start time on first actual content (for time-to-first-token)
           runSpanOperation(() => {
             switch (chunk.type) {
@@ -1994,42 +2105,9 @@ export class ModelSpanTracker {
                 // No span created - the final tool-result event captures the result
                 break;
 
-              case 'tool-result': {
-                // tool-result is always a point-in-time event span
-                // (tool execution duration is captured by the parent tool_call span)
-                const {
-                  // Metadata - tool call context (unique to tool-result chunks)
-                  toolCallId,
-                  toolName,
-                  isError,
-                  dynamic,
-                  providerExecuted,
-                  providerMetadata,
-                  // Keep provider-executed results on MODEL_CHUNK because they come
-                  // from the model/provider stream and may not have a sibling TOOL_CALL span.
-                  // For locally executed tools, the canonical payload lives on TOOL_CALL.
-                  result,
-                  // Stripped - redundant (already on TOOL_CALL span input)
-                  args: _args,
-                } = (chunk.payload as Record<string, any>) || {};
-
-                // All tool-result specific fields go in metadata
-                const metadata: Record<string, any> = { toolCallId, toolName };
-                if (isError !== undefined) metadata.isError = isError;
-                if (dynamic !== undefined) metadata.dynamic = dynamic;
-                if (providerExecuted !== undefined) metadata.providerExecuted = providerExecuted;
-                if (providerMetadata !== undefined) metadata.providerMetadata = providerMetadata;
-
-                const mastraMeta = providerMetadata?.mastra as Record<string, unknown> | undefined;
-                const spanOutput = providerExecuted
-                  ? result
-                  : mastraMeta?.modelOutput !== undefined
-                    ? mastraMeta.modelOutput
-                    : undefined;
-
-                this.#createEventSpan(chunk.type, spanOutput, { metadata, startTime: providerObservedAt });
+              case 'tool-result':
+                this.#handleToolResultChunk(chunk, providerObservedAt);
                 break;
-              }
 
               // Default: skip creating spans for unrecognized chunk types
               // All semantic content chunks should be explicitly handled above

@@ -1623,6 +1623,10 @@ export class ProcessorRunner {
         input: {
           messages: processableMessages,
           systemMessages: currentSystemMessages,
+          // The hook below receives `retryCount`, and the output-processor span already
+          // records it. Omitting it here made the two span kinds disagree about the same
+          // observable input.
+          retryCount,
         },
       });
 

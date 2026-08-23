@@ -2281,17 +2281,24 @@ describe('Tracing', () => {
       span.end();
     });
 
-    it('should preserve nested requestContext values by walking them through deepClean', () => {
+    it('collapses nested requestContext values without traversing or serializing them', () => {
       const observability = new DefaultObservabilityInstance({
         serviceName: 'test-service',
         name: 'test',
         exporters: [testExporter],
       });
 
+      // This fork deliberately does NOT walk stored objects when snapshotting a
+      // RequestContext onto a span - see packages/_internal-core/src/request-context/index.ts,
+      // whose no-traversal behaviour is pinned by packages/core/src/request-context/index.test.ts.
+      // Walking them would run user serialization hooks and could copy nested secrets into an
+      // exported trace. The upstream assertion this replaces expected the opposite and was
+      // imported with a sync; it is asserted here in the stronger direction instead.
+      const toJSON = vi.fn(() => ({ secret: 'SECRET_NESTED_VALUE' }));
       const requestContext = new RequestContext();
       requestContext.set('userId', 'user-123');
       requestContext.set('callback', () => {});
-      requestContext.set('nested', { data: 'value' });
+      requestContext.set('nested', { data: 'value', toJSON });
 
       const span = observability.startSpan({
         type: SpanType.AGENT_RUN,
@@ -2300,14 +2307,14 @@ describe('Tracing', () => {
         requestContext,
       });
 
-      // Plain objects are handed to deepClean and walked (nested data stays
-      // visible in the trace); functions and other non-plain types are
-      // collapsed by serializeForSpan rather than walked.
       expect(span.requestContext).toEqual({
         userId: 'user-123',
         callback: '[function]',
-        nested: { data: 'value' },
+        nested: '[object]',
       });
+      // The privacy contract, asserted directly: no user hook runs and nothing nested leaks.
+      expect(toJSON).not.toHaveBeenCalled();
+      expect(JSON.stringify(span.requestContext)).not.toContain('SECRET_NESTED_VALUE');
 
       span.end();
     });
