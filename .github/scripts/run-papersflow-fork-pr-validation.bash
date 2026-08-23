@@ -8914,7 +8914,7 @@ while IFS= read -r workspace; do
     continue
   fi
   case "$workspace" in
-    auth/okta | browser/stagehand | packages/_internal-core | packages/cli | packages/codemod | packages/core | packages/deployer | packages/mcp | packages/memory | packages/server | client-sdks/ai-sdk | client-sdks/client-js | stores/_test-utils | stores/convex | stores/libsql | stores/pg | stores/redis | mastracode | mastracode/sdk | mastracode/tui | pubsub/google-cloud-pubsub | pubsub/redis-streams | workflows/inngest | workflows/temporal | docs) ;;
+    auth/okta | browser/stagehand | packages/_internal-core | packages/cli | packages/codemod | packages/core | packages/deployer | packages/mcp | packages/memory | packages/server | client-sdks/ai-sdk | client-sdks/client-js | stores/_test-utils | stores/convex | stores/libsql | stores/pg | stores/redis | mastracode | mastracode/sdk | mastracode/tui | pubsub/google-cloud-pubsub | pubsub/redis-streams | workflows/inngest | workflows/temporal | observability/mastra | docs) ;;
     *) printf '%s\n' "$workspace" >> "$unsupported_workspaces" ;;
   esac
 done < "$changed_workspaces"
@@ -10273,6 +10273,17 @@ if workspace_changed workflows/temporal; then
   run_with_validation_budget 900 pnpm --filter ./workflows/temporal --fail-if-no-match build
   run_with_validation_budget 600 pnpm --filter ./workflows/temporal --fail-if-no-match exec tsc --noEmit
   run_with_validation_budget 600 pnpm --filter ./workflows/temporal --fail-if-no-match lint
+fi
+
+if workspace_changed observability/mastra; then
+  # @mastra/observability is consumed through its dist export - that is already why
+  # ensure_inngest_prerequisites builds it before touching an Inngest suite - so a clean
+  # runner needs the build before tsc can resolve the package's own emitted types.
+  # The package declares no `typecheck` script, so typechecking goes through `exec tsc`
+  # exactly as Temporal's does.
+  run_with_validation_budget 900 pnpm --filter ./observability/mastra --fail-if-no-match build
+  run_with_validation_budget 600 pnpm --filter ./observability/mastra --fail-if-no-match exec tsc --noEmit
+  run_with_validation_budget 600 pnpm --filter ./observability/mastra --fail-if-no-match lint
 fi
 
 mastracode_prerequisites_built=false
