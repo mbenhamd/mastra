@@ -21,6 +21,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 
+import { RequestContext } from '../../request-context';
 import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
 import { InMemoryDB } from '../../storage/domains/inmemory-db';
 import { createTool } from '../../tools';
@@ -37,6 +38,7 @@ import {
   TASK_DELEGATE_TOOL_ID,
   TASK_UPDATE_TOOL_ID,
 } from './plan-task-tool';
+import { MAX_INHERITED_REQUEST_CONTEXT_APP_BYTES } from './request-context-input';
 import { Session } from './session';
 import {
   HARNESS_SUBAGENT_OUTCOME_REPORT_KIND,
@@ -89,6 +91,7 @@ function buildHarness(
     delegationTimeoutMs?: number;
     maxLive?: number;
     allowInline?: boolean;
+    inheritRequestContextAppKeys?: string[];
   } = {},
 ): { harness: Harness; parentAgent: MockAgent; childAgent: MockAgent } {
   const parentAgent = new MockAgent({ id: 'parent-agent' });
@@ -109,6 +112,9 @@ function buildHarness(
       maxDepth: 2,
       ...(opts.maxConcurrent !== undefined ? { maxConcurrent: opts.maxConcurrent } : {}),
       ...(opts.delegationTimeoutMs !== undefined ? { delegationTimeoutMs: opts.delegationTimeoutMs } : {}),
+      ...(opts.inheritRequestContextAppKeys !== undefined
+        ? { inheritRequestContextAppKeys: opts.inheritRequestContextAppKeys }
+        : {}),
       types: {
         worker: {
           agentId: 'child-agent',
@@ -129,6 +135,13 @@ const toolCtx = {
   agent: { toolCallId: 'tc-deleg', runId: 'mock-run' },
   requestContext: { get: () => undefined },
 } as any;
+
+function lineageValueForCanonicalAppBytes(bytes: number): string {
+  const emptyEnvelopeBytes = new TextEncoder().encode(JSON.stringify({ turnCorrelationId: '' })).byteLength;
+  const value = 'x'.repeat(bytes - emptyEnvelopeBytes);
+  expect(new TextEncoder().encode(JSON.stringify({ turnCorrelationId: value }))).toHaveLength(bytes);
+  return value;
+}
 
 async function poll(pred: () => boolean | Promise<boolean>, timeoutMs = 2000): Promise<void> {
   const start = Date.now();
@@ -1510,9 +1523,87 @@ describe('task_delegate — recovery on rehydrate', () => {
     await harness.shutdown();
   });
 
+  it('restores only approved lineage when restart occurs before the delegated signal dispatches', async () => {
+    const db = new InMemoryDB();
+    const lineageKey = 'turnCorrelationId';
+    const lineageValue = lineageValueForCanonicalAppBytes(MAX_INHERITED_REQUEST_CONTEXT_APP_BYTES - 1);
+    const privateCanary = 'PRE_DISPATCH_PRIVATE_APP_CANARY';
+    const inheritedAppKeys = [lineageKey];
+    const a = buildHarness(db, { maxConcurrent: 1, inheritRequestContextAppKeys: inheritedAppKeys });
+    const skippedInitialDriver = vi
+      .spyOn(Session.prototype as any, '_driveDelegatedSubagent')
+      .mockResolvedValueOnce(undefined);
+    const parentA = await a.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const closeParentTurn = await openParentTurn(parentA, a.parentAgent);
+    const toolsA = createPlanTaskTools(parentA);
+    const task = (await toolsA[TASK_ADD_TOOL_ID]!.execute!(
+      { content: 'dispatch after restart' } as any,
+      toolCtx,
+    )) as any;
+    let delegated: any;
+    try {
+      delegated = await toolsA[TASK_DELEGATE_TOOL_ID]!.execute!(
+        { taskId: task.taskId, agentType: 'worker' } as any,
+        {
+          ...toolCtx,
+          requestContext: new RequestContext<unknown>([
+            [
+              'app',
+              {
+                [lineageKey]: lineageValue,
+                'papersflow.requestId': 'functional-request-must-not-cross',
+                instructions: privateCanary,
+              },
+            ],
+          ]),
+        } as any,
+      );
+      expect(skippedInitialDriver).toHaveBeenCalledOnce();
+    } finally {
+      skippedInitialDriver.mockRestore();
+    }
+    expect(a.childAgent.streamCalls).toHaveLength(0);
+    const pendingPlan = JSON.stringify(await planRow(parentA, task.taskId));
+    expect(pendingPlan).toContain(lineageValue);
+    expect(pendingPlan).not.toContain(privateCanary);
+    expect(pendingPlan).not.toContain('functional-request-must-not-cross');
+    closeParentTurn();
+
+    for (const [key, row] of db.harnessSessions) {
+      if (row.ownerId === (parentA as any)._internalOwnerId) {
+        db.harnessSessions.set(key, { ...row, ownerId: 'crashed', leaseExpiresAt: Date.now() - 1 });
+      }
+    }
+
+    const b = buildHarness(db, { maxConcurrent: 1, inheritRequestContextAppKeys: inheritedAppKeys });
+    const parentB = await b.harness.session({ sessionId: parentA.id, resourceId: 'u1' });
+    await poll(async () => (await planRow(parentB, task.taskId))?.status === 'completed');
+
+    expect(b.childAgent.streamCalls).toHaveLength(1);
+    const childRequestContext = b.childAgent.streamCalls[0]?.options.requestContext as RequestContext | undefined;
+    expect(childRequestContext?.get(lineageKey)).toBe(lineageValue);
+    expect(childRequestContext?.get('app')).toEqual({ [lineageKey]: lineageValue });
+    expect(childRequestContext?.get('requestId')).toBeUndefined();
+    expect(JSON.stringify(childRequestContext?.toJSON())).not.toContain(privateCanary);
+    expect(JSON.stringify(childRequestContext?.toJSON())).not.toContain('functional-request-must-not-cross');
+    const settledPlan = await planRow(parentB, task.taskId);
+    expect(JSON.stringify(settledPlan)).not.toContain(lineageValue);
+    expect((settledPlan?.metadata as any)?.mastraHarnessDelegationAttemptV1).not.toHaveProperty('requestContextApp');
+    expect((settledPlan?.metadata as any)?.mastraHarnessDelegationAttemptV1).not.toHaveProperty(
+      'requestContextAppSha256',
+    );
+    expect(delegated.subagentSessionId).toBeTruthy();
+    await b.harness.shutdown();
+  });
+
   it('reattaches a suspended admitted signal after a crash and rolls up only after HITL resume', async () => {
     const db = new InMemoryDB();
-    const a = buildHarness(db, { maxConcurrent: 1 });
+    const lineageKey = 'turnCorrelationId';
+    const lineageValue = 'opaque-durable-turn-5049';
+    const functionalRequestId = 'durable-functional-request-must-not-cross';
+    const secretCanary = 'DURABLE_PRIVATE_APP_METADATA_CANARY';
+    const inheritedAppKeys = [lineageKey];
+    const a = buildHarness(db, { maxConcurrent: 1, inheritRequestContextAppKeys: inheritedAppKeys });
     a.childAgent.enqueueRun({
       finishReason: 'suspended',
       suspendPayload: { toolCallId: 'cold-approval', toolName: 'write_file', args: { path: 'main.tex' } },
@@ -1523,13 +1614,49 @@ describe('task_delegate — recovery on rehydrate', () => {
     const task = (await toolsA[TASK_ADD_TOOL_ID]!.execute!({ content: 'durable edit' } as any, toolCtx)) as any;
     const delegated = (await toolsA[TASK_DELEGATE_TOOL_ID]!.execute!(
       { taskId: task.taskId, agentType: 'worker', task: 'apply the exact admitted custom edit' } as any,
-      toolCtx,
+      {
+        ...toolCtx,
+        requestContext: new RequestContext<unknown>([
+          [
+            'app',
+            {
+              [lineageKey]: lineageValue,
+              'papersflow.requestId': functionalRequestId,
+              'papersflow.userId': 'durable-user-must-not-cross',
+              instructions: secretCanary,
+            },
+          ],
+        ]),
+      } as any,
     )) as any;
 
     await poll(async () => {
       const child = await parentA._internalStorage.loadSession({ sessionId: delegated.subagentSessionId });
       return child?.pendingResume?.toolCallId === 'cold-approval';
     });
+    const initialChildRequestContext = a.childAgent.streamCalls[0]?.options.requestContext as
+      | RequestContext
+      | undefined;
+    expect(initialChildRequestContext?.get(lineageKey)).toBe(lineageValue);
+    expect(initialChildRequestContext?.get('app')).toEqual({ [lineageKey]: lineageValue });
+    expect((initialChildRequestContext?.get('harness') as { app?: unknown } | undefined)?.app).toEqual({
+      [lineageKey]: lineageValue,
+    });
+    expect(initialChildRequestContext?.get('requestId')).toBeUndefined();
+    expect(initialChildRequestContext?.get('userId')).toBeUndefined();
+    expect((initialChildRequestContext?.get('app') as Record<string, unknown>)['papersflow.requestId']).toBeUndefined();
+    expect(initialChildRequestContext?.get('papersflow.userId')).toBeUndefined();
+    const persistedChildBeforeCrash = await parentA._internalStorage.loadSession({
+      sessionId: delegated.subagentSessionId,
+    });
+    const persistedLineage = JSON.stringify({
+      task: await planRow(parentA, task.taskId),
+      pendingResume: persistedChildBeforeCrash?.pendingResume,
+    });
+    expect(persistedLineage).toContain(lineageValue);
+    expect(persistedLineage).not.toContain(secretCanary);
+    expect(persistedLineage).not.toContain(functionalRequestId);
+    expect(persistedLineage).not.toContain('durable-user-must-not-cross');
     // The visible label remains editable while the immutable admitted body is
     // preserved separately for byte-identical recovery.
     await toolsA[TASK_UPDATE_TOOL_ID]!.execute!(
@@ -1547,7 +1674,7 @@ describe('task_delegate — recovery on rehydrate', () => {
       }
     }
 
-    const b = buildHarness(db, { maxConcurrent: 1 });
+    const b = buildHarness(db, { maxConcurrent: 1, inheritRequestContextAppKeys: inheritedAppKeys });
     b.childAgent.enqueueRun({ finishReason: 'stop', text: 'edit applied after reconnect' });
     const parentB = await b.harness.session({ sessionId: parentA.id, resourceId: 'u1' });
     await poll(() => parentB._internalSubagentExecutionsInFlight === 1);
@@ -1561,6 +1688,25 @@ describe('task_delegate — recovery on rehydrate', () => {
     await poll(async () => (await planRow(parentB, task.taskId))?.status === 'completed');
     expect(b.childAgent.streamCalls).toHaveLength(0);
     expect(b.childAgent.resumeCalls).toHaveLength(1);
+    const resumedChildRequestContext = (b.childAgent.resumeCalls[0]?.options as { requestContext?: RequestContext })
+      .requestContext;
+    expect(resumedChildRequestContext?.get(lineageKey)).toBe(lineageValue);
+    expect(resumedChildRequestContext?.get('app')).toEqual({ [lineageKey]: lineageValue });
+    expect((resumedChildRequestContext?.get('harness') as { app?: unknown } | undefined)?.app).toEqual({
+      [lineageKey]: lineageValue,
+    });
+    expect(resumedChildRequestContext?.get('requestId')).toBeUndefined();
+    expect(resumedChildRequestContext?.get('userId')).toBeUndefined();
+    expect((resumedChildRequestContext?.get('app') as Record<string, unknown>)['papersflow.requestId']).toBeUndefined();
+    expect(resumedChildRequestContext?.get('papersflow.userId')).toBeUndefined();
+    expect(JSON.stringify(resumedChildRequestContext?.toJSON())).not.toContain(secretCanary);
+    expect(JSON.stringify(resumedChildRequestContext?.toJSON())).not.toContain(functionalRequestId);
+    const settledPlan = await planRow(parentB, task.taskId);
+    expect(JSON.stringify(settledPlan)).not.toContain(lineageValue);
+    expect((settledPlan?.metadata as any)?.mastraHarnessDelegationAttemptV1).not.toHaveProperty('requestContextApp');
+    expect((settledPlan?.metadata as any)?.mastraHarnessDelegationAttemptV1).not.toHaveProperty(
+      'requestContextAppSha256',
+    );
     expect(parentB._internalSubagentExecutionsInFlight).toBe(0);
     await b.harness.shutdown();
   });

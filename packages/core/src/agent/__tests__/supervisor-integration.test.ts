@@ -41,6 +41,12 @@ import type { MastraDBMessage } from '../message-list/state/types';
 // provider boundary before running the deterministic cases. The real-provider
 // import, describe block, and empty-key skip remain unchanged.
 
+// PF-3243 changes agentic LLM execution, AISDK v5 stream execute/input, the
+// processor runner, and tracing types on this suite's runtime surface.
+// Keeping the suite in the changed-file set re-verifies the existing provider
+// boundary before the deterministic cases run. Imports, the real-provider
+// describe block, and its empty-key skip remain unchanged.
+
 // Helper: create a sub-agent with a fixed text response
 function makeSubAgent(id: string, responseText: string) {
   return new Agent({

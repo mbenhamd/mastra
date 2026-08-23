@@ -1,4 +1,5 @@
-import { injectJsonInstructionIntoMessages } from '@ai-sdk/provider-utils-v5';
+import { isProxy } from 'node:util/types';
+import { injectJsonInstructionIntoMessages, isAbortError } from '@ai-sdk/provider-utils-v5';
 import type { LanguageModelV2Prompt } from '@ai-sdk/provider-v5';
 import { APICallError } from '@internal/ai-sdk-v5';
 import type { IdGenerator, ToolChoice, ToolSet } from '@internal/ai-sdk-v5';
@@ -14,9 +15,12 @@ import {
   raceAgainstAbort,
 } from '../../../loop/timeout';
 import type { LoopOptions } from '../../../loop/types';
+import type { ModelInferenceFinishPayload, PreparedModelRequestMetrics } from '../../../observability';
+import { createExactJsonMeasurementSnapshot } from '../../../observability/content-free-measurement';
+import type { ExactJsonMeasurementSnapshot } from '../../../observability/content-free-measurement';
 import { DEFAULT_MAX_RETRY_AFTER_MS, getRetryAfterMs, waitDelay } from '../../../utils/retry-after';
 import { getResponseFormat } from '../../base/schema';
-import type { LanguageModelV2StreamResult, OnResult } from '../../types';
+import type { ChunkType, LanguageModelV2StreamResult, OnResult } from '../../types';
 import { prepareToolsAndToolChoice } from './compat';
 import type { ModelSpecVersion } from './compat';
 import { AISDKV5InputStream } from './input';
@@ -36,10 +40,15 @@ const RETRY_BACKOFF_FACTOR = 2;
  * `shouldRetry` so a terminal error never waits out a provider delay it will not use.
  */
 function isRetryableModelError(error: unknown): boolean {
-  // A step budget covers the whole attempt, so burning what is left of it on retries
-  // against the same model would only delay the fallback to the next one.
-  if (isMastraTimeoutError(error)) {
-    return false;
+  try {
+    // A step budget covers the whole attempt, so burning what is left of it on retries
+    // against the same model would only delay the fallback to the next one.
+    if (isMastraTimeoutError(error)) return false;
+    // Guarded together: both predicates walk the thrown value's prototype chain
+    // (`instanceof` / `name`), which a hostile value can make throw.
+    if (isAbortError(error)) return false;
+  } catch {
+    // A hostile thrown value must not make observability or retry inspection throw.
   }
   if (APICallError.isInstance(error)) {
     return error.isRetryable;
@@ -98,6 +107,308 @@ function omit<T extends object, K extends keyof T>(obj: T, keys: K[]): Omit<T, K
   return newObj;
 }
 
+type ProviderMessageRole = 'system' | 'user' | 'assistant' | 'tool' | 'other';
+
+const measurementEncoder = new TextEncoder();
+
+type OwnProperty = { state: 'absent' } | { state: 'data'; value: unknown } | { state: 'unsupported' };
+
+function isDescriptorSafeObject(value: unknown): value is object {
+  if (typeof value !== 'object' || value === null) return false;
+  try {
+    return !isProxy(value);
+  } catch {
+    return false;
+  }
+}
+
+function ownProperty(value: unknown, key: string): OwnProperty {
+  if (!isDescriptorSafeObject(value)) return { state: 'unsupported' };
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined) return { state: 'absent' };
+    return 'value' in descriptor ? { state: 'data', value: descriptor.value } : { state: 'unsupported' };
+  } catch {
+    return { state: 'unsupported' };
+  }
+}
+
+function providerMessageRole(message: unknown): ProviderMessageRole | undefined {
+  if (!isDescriptorSafeObject(message)) return 'other';
+  try {
+    if (Array.isArray(message)) return 'other';
+  } catch {
+    return undefined;
+  }
+  const roleProperty = ownProperty(message, 'role');
+  if (roleProperty.state === 'unsupported') return undefined;
+  const role = roleProperty.state === 'data' ? roleProperty.value : undefined;
+  return role === 'system' || role === 'user' || role === 'assistant' || role === 'tool' ? role : 'other';
+}
+
+function arrayLength(value: unknown): number | undefined {
+  if (!isDescriptorSafeObject(value)) return undefined;
+  try {
+    if (!Array.isArray(value)) return undefined;
+    const descriptor = Object.getOwnPropertyDescriptor(value, 'length');
+    const length = descriptor && 'value' in descriptor ? descriptor.value : undefined;
+    return Number.isSafeInteger(length) && length >= 0 ? length : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Serialize only values already detached by createExactJsonMeasurementSnapshot. */
+function detachedJsonUtf8ByteLength(value: unknown): number | undefined {
+  try {
+    const serialized = JSON.stringify(value);
+    return serialized === undefined ? undefined : measurementEncoder.encode(serialized).byteLength;
+  } catch {
+    return undefined;
+  }
+}
+
+function providerMessageMeasurements(prompt: unknown, measureBytes: boolean) {
+  const roles: Record<ProviderMessageRole, { count: number | undefined; bytes: number | undefined }> = {
+    system: { count: 0, bytes: measureBytes ? 0 : undefined },
+    user: { count: 0, bytes: measureBytes ? 0 : undefined },
+    assistant: { count: 0, bytes: measureBytes ? 0 : undefined },
+    tool: { count: 0, bytes: measureBytes ? 0 : undefined },
+    other: { count: 0, bytes: measureBytes ? 0 : undefined },
+  };
+  const length = arrayLength(prompt);
+  if (length === undefined) {
+    for (const role of Object.values(roles)) role.count = undefined;
+    return { count: undefined, roles, totalBytes: undefined };
+  }
+  let totalBytes: number | undefined = measureBytes ? 2 + Math.max(0, length - 1) : undefined;
+  for (let index = 0; index < length; index += 1) {
+    const item = ownProperty(prompt, String(index));
+    const message = item.state === 'data' ? item.value : undefined;
+    const role = providerMessageRole(message);
+    if (item.state !== 'data' || role === undefined) {
+      for (const metrics of Object.values(roles)) metrics.count = undefined;
+      totalBytes = undefined;
+      continue;
+    }
+    const roleMetrics = roles[role];
+    if (roleMetrics.count !== undefined) roleMetrics.count += 1;
+    if (!measureBytes) continue;
+    const measured = detachedJsonUtf8ByteLength(message);
+    if (measured === undefined) {
+      roleMetrics.bytes = undefined;
+      totalBytes = undefined;
+      continue;
+    }
+    if (roleMetrics.bytes !== undefined) roleMetrics.bytes += measured;
+    if (totalBytes !== undefined) totalBytes += measured;
+  }
+  return { count: length, roles, totalBytes };
+}
+
+const measuredProviderReasoningEfforts = new Set(['none', 'low', 'medium', 'high', 'xhigh', 'max']);
+
+function plainRecord(value: unknown): Record<string, unknown> | undefined {
+  if (!isDescriptorSafeObject(value)) return undefined;
+  try {
+    if (Array.isArray(value)) return undefined;
+    const prototype = Reflect.getPrototypeOf(value);
+    return prototype === Object.prototype || prototype === null ? (value as Record<string, unknown>) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function preparedProviderReasoning(providerOptions: unknown) {
+  const options = plainRecord(providerOptions);
+  if (!options) return { providerReasoningEffortState: 'provider_default' as const };
+  const candidates: unknown[] = [];
+  let unsupported = false;
+  for (const [providerKey, effortPath] of [
+    ['azure', ['reasoningEffort']],
+    ['openai', ['reasoningEffort']],
+    ['openrouter', ['reasoning', 'effort']],
+  ] as const) {
+    const providerProperty = ownProperty(options, providerKey);
+    if (providerProperty.state === 'absent') continue;
+    if (providerProperty.state === 'unsupported') {
+      unsupported = true;
+      continue;
+    }
+    let current = plainRecord(providerProperty.value);
+    if (current === undefined) {
+      unsupported = true;
+      continue;
+    }
+    for (const [index, key] of effortPath.entries()) {
+      const property = ownProperty(current, key);
+      if (property.state === 'absent') {
+        current = undefined;
+        break;
+      }
+      if (property.state === 'unsupported') {
+        unsupported = true;
+        current = undefined;
+        break;
+      }
+      if (index === effortPath.length - 1) {
+        if (property.value !== undefined) candidates.push(property.value);
+      } else {
+        current = plainRecord(property.value);
+        if (current === undefined) {
+          unsupported = true;
+          break;
+        }
+      }
+    }
+  }
+  if (unsupported) return { providerReasoningEffortState: 'unknown' as const };
+  const effort = candidates[0];
+  if (candidates.length !== 1 || typeof effort !== 'string' || !measuredProviderReasoningEfforts.has(effort)) {
+    return candidates.length === 0
+      ? { providerReasoningEffortState: 'provider_default' as const }
+      : { providerReasoningEffortState: 'unknown' as const };
+  }
+  return {
+    providerReasoningEffortState: 'measured' as const,
+    providerReasoningEffort: effort as 'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max',
+  };
+}
+
+type PreparedRequestMeasurement = Omit<
+  PreparedModelRequestMetrics,
+  'providerAttempt' | 'providerPreparationMs' | 'providerDispatchTimestampMs'
+>;
+
+function measuredSnapshotRecord(measurement: ExactJsonMeasurementSnapshot): Record<string, unknown> | undefined {
+  return measurement.state === 'measured' ? plainRecord(measurement.snapshot) : undefined;
+}
+
+function preparedRequestMeasurement({
+  providerRequest,
+  providerOptions,
+  prompt,
+  responseSchema,
+  responseSchemaInline,
+}: {
+  providerRequest: Record<string, unknown>;
+  providerOptions: unknown;
+  prompt: LanguageModelV2Prompt;
+  responseSchema: unknown;
+  responseSchemaInline: boolean;
+}): PreparedRequestMeasurement {
+  const measurementStartedAtMs = Date.now();
+  // Reasoning effort is a small, fixed-path diagnostic independent of whether
+  // the full provider envelope exceeds the exact-snapshot bound. This reads
+  // only descriptor-safe, non-Proxy data properties and returns primitives.
+  const providerReasoning = preparedProviderReasoning(providerOptions);
+  // AbortSignal is a live cancellation handle, not provider request content.
+  // Exclude it before detaching the exact JSON-safe envelope; every value used
+  // after adapter dispatch then comes from this immutable snapshot or a
+  // content-free primitive captured alongside it.
+  const providerRequestMeasurement = createExactJsonMeasurementSnapshot(omit(providerRequest, ['abortSignal']));
+  const providerRequestSnapshot = measuredSnapshotRecord(providerRequestMeasurement);
+  const detachedPromptProperty = providerRequestSnapshot ? ownProperty(providerRequestSnapshot, 'prompt') : undefined;
+  const detachedPrompt = detachedPromptProperty?.state === 'data' ? detachedPromptProperty.value : undefined;
+  // Counts remain available when exact byte measurement is bounded out, but
+  // only through descriptor reads guarded against Proxy traps. No content,
+  // accessors, iterators, or serialization hooks are invoked.
+  const fallbackMessageMeasurements = providerMessageMeasurements(prompt, false);
+  const messageMeasurements = providerRequestSnapshot
+    ? providerMessageMeasurements(detachedPrompt, true)
+    : fallbackMessageMeasurements;
+  const system = messageMeasurements.roles.system;
+  const user = messageMeasurements.roles.user;
+  const assistant = messageMeasurements.roles.assistant;
+  const tool = messageMeasurements.roles.tool;
+  const other = messageMeasurements.roles.other;
+  const providerMessageBytes = messageMeasurements.totalBytes;
+  const providerRequestBytes =
+    providerRequestMeasurement.state === 'measured' ? providerRequestMeasurement.utf8ByteLength : undefined;
+  const detachedToolsProperty = providerRequestSnapshot ? ownProperty(providerRequestSnapshot, 'tools') : undefined;
+  const detachedTools = detachedToolsProperty?.state === 'data' ? detachedToolsProperty.value : undefined;
+  const detachedProviderToolCount =
+    detachedToolsProperty?.state === 'absent' ||
+    (detachedToolsProperty?.state === 'data' && detachedToolsProperty.value === undefined)
+      ? 0
+      : detachedToolsProperty?.state === 'data'
+        ? arrayLength(detachedToolsProperty.value)
+        : undefined;
+  const providerToolsProperty = ownProperty(providerRequest, 'tools');
+  const fallbackProviderToolCount =
+    providerToolsProperty.state === 'absent' ||
+    (providerToolsProperty.state === 'data' && providerToolsProperty.value === undefined)
+      ? 0
+      : providerToolsProperty.state === 'data'
+        ? arrayLength(providerToolsProperty.value)
+        : undefined;
+  const measuredProviderToolCount = providerRequestSnapshot ? detachedProviderToolCount : fallbackProviderToolCount;
+  const providerToolCount = measuredProviderToolCount;
+  const providerToolSchemaBytes =
+    providerRequestSnapshot && providerToolCount !== undefined && providerToolCount > 0
+      ? detachedJsonUtf8ByteLength(detachedTools)
+      : undefined;
+  const providerToolSchemaState =
+    measuredProviderToolCount === undefined
+      ? ('unknown' as const)
+      : providerToolCount === 0
+        ? ('not_applicable' as const)
+        : providerToolSchemaBytes === undefined
+          ? ('unknown' as const)
+          : ('measured' as const);
+  const responseSchemaMeasurement =
+    responseSchema === undefined ? undefined : createExactJsonMeasurementSnapshot(responseSchema);
+  const providerResponseSchemaBytes =
+    responseSchemaMeasurement?.state === 'measured' ? responseSchemaMeasurement.utf8ByteLength : undefined;
+  const providerResponseSchemaState =
+    responseSchema === undefined
+      ? ('not_applicable' as const)
+      : providerResponseSchemaBytes === undefined
+        ? ('unknown' as const)
+        : responseSchemaInline
+          ? ('inline_in_prompt' as const)
+          : ('measured' as const);
+  const measurementState =
+    providerMessageBytes === undefined ||
+    providerRequestBytes === undefined ||
+    system.bytes === undefined ||
+    user.bytes === undefined ||
+    assistant.bytes === undefined ||
+    tool.bytes === undefined ||
+    other.bytes === undefined ||
+    providerToolSchemaState === 'unknown' ||
+    providerResponseSchemaState === 'unknown'
+      ? ('unknown' as const)
+      : ('measured' as const);
+  const providerMeasurementMs = Math.max(0, Date.now() - measurementStartedAtMs);
+
+  return {
+    measurementState,
+    providerBreakdownState: 'serialized_components_non_additive',
+    ...(messageMeasurements.count === undefined ? {} : { providerMessageCount: messageMeasurements.count }),
+    ...(providerMessageBytes === undefined ? {} : { providerMessageBytes }),
+    ...(system.count === undefined ? {} : { providerSystemMessageCount: system.count }),
+    ...(system.bytes === undefined ? {} : { providerSystemMessageBytes: system.bytes }),
+    ...(user.count === undefined ? {} : { providerUserMessageCount: user.count }),
+    ...(user.bytes === undefined ? {} : { providerUserMessageBytes: user.bytes }),
+    ...(assistant.count === undefined ? {} : { providerAssistantMessageCount: assistant.count }),
+    ...(assistant.bytes === undefined ? {} : { providerAssistantMessageBytes: assistant.bytes }),
+    ...(tool.count === undefined ? {} : { providerToolMessageCount: tool.count }),
+    ...(tool.bytes === undefined ? {} : { providerToolMessageBytes: tool.bytes }),
+    ...(other.count === undefined ? {} : { providerOtherMessageCount: other.count }),
+    ...(other.bytes === undefined ? {} : { providerOtherMessageBytes: other.bytes }),
+    ...(system.bytes === undefined ? {} : { providerInstructionBytes: system.bytes }),
+    ...(providerToolCount === undefined ? {} : { providerToolCount }),
+    ...(providerToolSchemaBytes === undefined ? {} : { providerToolSchemaBytes }),
+    providerToolSchemaState,
+    ...(providerResponseSchemaBytes === undefined ? {} : { providerResponseSchemaBytes }),
+    providerResponseSchemaState,
+    ...providerReasoning,
+    ...(providerRequestBytes === undefined ? {} : { providerRequestBytes }),
+    providerMeasurementMs,
+  };
+}
+
 type ExecutionProps<OUTPUT = undefined> = {
   runId: string;
   model: MastraLanguageModel;
@@ -112,6 +423,24 @@ type ExecutionProps<OUTPUT = undefined> = {
   includeRawChunks?: boolean;
   modelSettings?: LoopOptions['modelSettings'];
   onResult: OnResult;
+  /** Receives only content-free measurements after the provider request has been dispatched. */
+  onPreparedRequest?: (metrics: PreparedModelRequestMetrics) => void;
+  /** Starts one tracing boundary immediately before each provider adapter invocation. */
+  onProviderAttemptStart?: (providerAttempt: number) => void;
+  /** Closes only the failed provider-attempt boundary so a retry can open another. */
+  onProviderAttemptError?: (input: { error: unknown; providerAttempt: number; aborted: boolean }) => void;
+  /** Records the provider's first semantic chunk before downstream buffering. */
+  onProviderFirstContent?: () => void;
+  /** Records provider chunk timing before downstream buffering or processor backpressure. */
+  onProviderChunk?: (chunk: ChunkType, observedAt: Date) => void;
+  /** Records provider finish before downstream buffering or processor backpressure. */
+  onProviderFinish?: (
+    payload: ModelInferenceFinishPayload,
+    endTime: Date,
+    response: { responseId?: string; responseModel?: string },
+  ) => void;
+  /** Zero-based logical attempt offset for callers that own retries outside this adapter loop. */
+  providerAttemptOffset?: number;
   structuredOutput?: StructuredOutputOptions<OUTPUT>;
   /**
   Additional HTTP headers to be sent with the request.
@@ -133,6 +462,13 @@ export function execute<OUTPUT = undefined>({
   activeTools,
   options,
   onResult,
+  onPreparedRequest,
+  onProviderAttemptStart,
+  onProviderAttemptError,
+  onProviderFirstContent,
+  onProviderChunk,
+  onProviderFinish,
+  providerAttemptOffset = 0,
   includeRawChunks,
   modelSettings,
   structuredOutput,
@@ -141,10 +477,14 @@ export function execute<OUTPUT = undefined>({
   methodType,
   generateId,
 }: ExecutionProps<OUTPUT>) {
+  const preparationStartedAtMs = Date.now();
   const v5 = new AISDKV5InputStream({
     component: 'LLM',
     name: model.modelId,
     generateId,
+    onProviderFirstContent,
+    onProviderChunk,
+    onProviderFinish,
   });
 
   // Determine target version based on model's specificationVersion
@@ -237,10 +577,24 @@ export function execute<OUTPUT = undefined>({
       }
     : providerOptions;
 
+  const providerResponseFormat = structuredOutputMode === 'direct' && !injectionMode ? responseFormat : undefined;
+  const responseSchema = responseFormat?.type === 'json' ? responseFormat.schema : undefined;
+  const responseSchemaInline =
+    responseSchema !== undefined &&
+    (injectionMode !== undefined || (structuredOutputMode === 'processor' && !structuredOutput?.useAgent));
+  const responseSchemaForMeasurement =
+    providerResponseFormat?.type === 'json'
+      ? providerResponseFormat.schema
+      : responseSchemaInline
+        ? responseSchema
+        : undefined;
+  const preparationBeforeProviderCallbackMs = Math.max(0, Date.now() - preparationStartedAtMs);
+
   const stream = v5.initialize({
     runId,
     onResult,
     createStream: async () => {
+      const preparationResumedAtMs = Date.now();
       try {
         const filteredModelSettings = omit(modelSettings || {}, ['maxRetries', 'headers', 'timeout']);
 
@@ -256,29 +610,123 @@ export function execute<OUTPUT = undefined>({
         const pRetry = await import('p-retry');
         const retryResult = await pRetry
           .default(
-            async () => {
+            async attemptNumber => {
+              const providerAttempt = providerAttemptOffset + attemptNumber;
+              // Starts after p-retry has completed any backoff, so retry delay is
+              // never reported as provider request preparation.
+              const attemptPreparationStartedAtMs = Date.now();
               const fn = (methodType === 'stream' ? model.doStream : model.doGenerate).bind(model);
-
+              // Preserve the pre-observability retry contract: every provider
+              // attempt receives a fresh top-level request object. Some adapters
+              // annotate their input synchronously, and reusing one object here
+              // would let a failed attempt contaminate the next retry.
+              const providerRequest = {
+                ...toolsAndToolChoice,
+                prompt,
+                providerOptions: providerOptionsToUse,
+                abortSignal,
+                includeRawChunks,
+                responseFormat: providerResponseFormat,
+                ...filteredModelSettings,
+                headers,
+              };
+              let requestMeasurement: PreparedRequestMeasurement | undefined;
+              if (onPreparedRequest) {
+                try {
+                  // Detach all measurement inputs before the adapter takes
+                  // ownership of providerRequest. Adapters may mutate it
+                  // synchronously or retain it beyond this invocation.
+                  requestMeasurement = preparedRequestMeasurement({
+                    providerRequest,
+                    providerOptions: providerOptionsToUse,
+                    prompt,
+                    responseSchema: responseSchemaForMeasurement,
+                    responseSchemaInline,
+                  });
+                } catch {
+                  // Measurement must never prevent or delay a provider failure.
+                }
+              }
+              try {
+                onProviderAttemptStart?.(providerAttempt);
+              } catch {
+                // Tracing must never prevent the provider call.
+              }
               // Cast needed: V2 and V3 call options are structurally compatible but typed differently
               // (e.g., tool types differ: V2 uses 'provider-defined', V3 uses 'provider')
-              // Raced rather than merely signalled: a provider that ignores `abortSignal`
-              // would otherwise hang straight past its budget.
-              const streamResult = await raceAgainstAbort(
-                (fn as Function)({
-                  ...toolsAndToolChoice,
-                  prompt,
-                  providerOptions: providerOptionsToUse,
-                  abortSignal,
-                  includeRawChunks,
-                  responseFormat: structuredOutputMode === 'direct' && !injectionMode ? responseFormat : undefined,
-                  ...filteredModelSettings,
-                  headers,
-                }),
-                abortSignal,
-              );
+              const providerDispatchTimestampMs = Date.now();
+              try {
+                let streamResultPromise: unknown;
+                try {
+                  // Invoke the adapter before notifying observers so they cannot add
+                  // to provider dispatch latency. Post-dispatch reporting consumes
+                  // only the detached, content-free measurement captured before the
+                  // adapter received the live request object.
+                  streamResultPromise = (fn as Function)(providerRequest);
+                } finally {
+                  if (onPreparedRequest && requestMeasurement) {
+                    try {
+                      onPreparedRequest({
+                        ...requestMeasurement,
+                        providerAttempt,
+                        providerDispatchTimestampMs,
+                        // Each retry receives a fresh request object, but only the
+                        // first attempt owns shared prompt/tool preparation. Every
+                        // attempt reports its own request construction and detached
+                        // measurement work without including p-retry backoff.
+                        providerPreparationMs:
+                          Math.max(0, providerDispatchTimestampMs - attemptPreparationStartedAtMs) +
+                          (attemptNumber === 1
+                            ? preparationBeforeProviderCallbackMs +
+                              Math.max(0, attemptPreparationStartedAtMs - preparationResumedAtMs)
+                            : 0),
+                      });
+                    } catch {
+                      // Measurement and observers must never prevent the provider call.
+                    }
+                  }
+                }
+                // Raced rather than merely signalled: a provider that ignores `abortSignal`
+                // would otherwise hang straight past its budget. The race is armed on the
+                // already-dispatched promise, in the same synchronous turn as the dispatch,
+                // so the budget still bounds the provider call while
+                // `providerDispatchTimestampMs` stays the exact provider request boundary.
+                // Promise.resolve keeps the pre-race tolerance for an adapter that returns a
+                // non-thenable; it is identity for a native promise, so it costs no tick.
+                const streamResult = await raceAgainstAbort(Promise.resolve(streamResultPromise), abortSignal);
 
-              // We have to cast this because doStream is missing the warnings property in its return type even though it exists
-              return streamResult as unknown as LanguageModelV2StreamResult;
+                // We have to cast this because doStream is missing the warnings property in its return type even though it exists
+                return streamResult as unknown as LanguageModelV2StreamResult;
+              } catch (error) {
+                // `abortSignal` is now the composed step budget, not the caller's signal, so
+                // `aborted` alone would relabel every timeout as a clean cancellation. A
+                // Mastra timeout is a failure (see MastraTimeoutError in loop/timeout.ts) and
+                // must stay on the inference-error boundary. The signal reason is checked
+                // first because our own budget sets it, which settles the classification even
+                // when the provider's AbortError wins the race against the budget rejection.
+                let timedOut = false;
+                try {
+                  // `instanceof` walks the value's prototype chain, so it is guarded exactly
+                  // like isAbortError below.
+                  timedOut = isMastraTimeoutError(abortSignal?.reason) || isMastraTimeoutError(error);
+                } catch {
+                  // A hostile value must not stop the attempt boundary from being reported.
+                }
+                let aborted = !timedOut && abortSignal?.aborted === true;
+                if (!aborted && !timedOut) {
+                  try {
+                    aborted = isAbortError(error);
+                  } catch {
+                    // Retry/error behavior remains unchanged for hostile thrown values.
+                  }
+                }
+                try {
+                  onProviderAttemptError?.({ error, providerAttempt, aborted });
+                } catch {
+                  // Tracing must never change retry or terminal error behavior.
+                }
+                throw error;
+              }
             },
             {
               retries: modelSettings?.maxRetries ?? 2,

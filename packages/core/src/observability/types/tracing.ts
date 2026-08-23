@@ -10,7 +10,7 @@ import { EntityType } from '@internal/core/storage';
 import type { MastraError } from '../../error';
 import type { Mastra } from '../../mastra';
 import type { RequestContext } from '../../request-context';
-import type { LanguageModelUsage, ProviderMetadata, StepStartPayload } from '../../stream/types';
+import type { LanguageModelUsage, ProviderMetadata, StepFinishPayload, StepStartPayload } from '../../stream/types';
 import type { WorkflowRunStatus, WorkflowStepStatus } from '../../workflows';
 import type {
   CustomSamplerOptions,
@@ -252,7 +252,7 @@ export interface ModelToolDefinition {
 /**
  * Model Generation attributes
  */
-export interface ModelGenerationAttributes extends AIBaseAttributes {
+export interface ModelGenerationAttributes extends AIBaseAttributes, Partial<PreparedModelRequestAggregateMetrics> {
   /** Model name (e.g., 'gpt-4', 'claude-3') */
   model?: string;
   /** Model provider (e.g., 'openai', 'anthropic') */
@@ -267,6 +267,14 @@ export interface ModelGenerationAttributes extends AIBaseAttributes {
   resultType?: 'tool_selection' | 'response_generation' | 'reasoning' | 'planning';
   /** Token usage statistics */
   usage?: UsageStats;
+  /** Whether aggregate provider usage was reported or applicable for this generation. */
+  providerUsageState?: ProviderUsageMeasurementState;
+  /** Provider attempts that completed with a model response. */
+  providerSucceededInferenceCount?: number;
+  /** Provider attempts that ended in an adapter or stream error. */
+  providerErrorInferenceCount?: number;
+  /** Provider attempts that ended because the call was aborted. */
+  providerAbortedInferenceCount?: number;
   /** Estimated cost context, when provided directly by an SDK or provider */
   costContext?: CostContext;
   /** Model parameters */
@@ -319,6 +327,86 @@ export interface ModelStepAttributes extends AIBaseAttributes {
   warnings?: Record<string, any>;
 }
 
+export type ProviderInputMeasurementState = 'measured' | 'unknown';
+export type ProviderRequestBreakdownState = 'serialized_components_non_additive';
+export type ProviderOptionalPayloadMeasurementState = 'measured' | 'not_applicable' | 'unknown';
+export type ProviderResponseSchemaMeasurementState = ProviderOptionalPayloadMeasurementState | 'inline_in_prompt';
+export type ProviderUsageMeasurementState = 'reported' | 'provider_not_reported' | 'not_applicable';
+export type ProviderInferenceOutcome = 'success' | 'error' | 'abort';
+export type ProviderReasoningEffort = 'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+export type ProviderReasoningEffortState = 'measured' | 'provider_default' | 'unknown';
+export type ProviderRequestAggregateMeasurementState = 'measured' | 'partial' | 'unknown' | 'not_applicable';
+
+/**
+ * Content-free measurements captured from the exact object passed to the
+ * provider adapter. The fields intentionally contain only counts, byte sizes,
+ * durations, timestamps, and bounded states; request content never crosses
+ * this interface.
+ */
+export interface PreparedModelRequestMetrics {
+  measurementState: ProviderInputMeasurementState;
+  providerBreakdownState: ProviderRequestBreakdownState;
+  /** One-based adapter invocation within this logical model step, including provider retries. */
+  providerAttempt: number;
+  providerMessageCount?: number;
+  providerMessageBytes?: number;
+  providerSystemMessageCount?: number;
+  providerSystemMessageBytes?: number;
+  providerUserMessageCount?: number;
+  providerUserMessageBytes?: number;
+  providerAssistantMessageCount?: number;
+  providerAssistantMessageBytes?: number;
+  providerToolMessageCount?: number;
+  providerToolMessageBytes?: number;
+  providerOtherMessageCount?: number;
+  providerOtherMessageBytes?: number;
+  providerInstructionBytes?: number;
+  providerToolCount?: number;
+  providerToolSchemaBytes?: number;
+  providerToolSchemaState: ProviderOptionalPayloadMeasurementState;
+  providerResponseSchemaBytes?: number;
+  providerResponseSchemaState: ProviderResponseSchemaMeasurementState;
+  providerReasoningEffort?: ProviderReasoningEffort;
+  providerReasoningEffortState: ProviderReasoningEffortState;
+  providerRequestBytes?: number;
+  providerPreparationMs: number;
+  providerMeasurementMs: number;
+  providerDispatchTimestampMs: number;
+}
+
+/**
+ * Content-free rollup of every provider request prepared within one model
+ * generation. Optional byte totals are present only when every contributing
+ * inference supplied that measurement, so a partial sum is never presented as
+ * complete.
+ */
+export interface PreparedModelRequestAggregateMetrics {
+  providerAggregateMeasurementState: ProviderRequestAggregateMeasurementState;
+  providerBreakdownState: ProviderRequestBreakdownState;
+  providerInferenceCount: number;
+  providerMeasuredInferenceCount: number;
+  providerUnknownInferenceCount: number;
+  providerMessageCountTotal?: number;
+  providerMessageBytesTotal?: number;
+  providerSystemMessageCountTotal?: number;
+  providerSystemMessageBytesTotal?: number;
+  providerUserMessageCountTotal?: number;
+  providerUserMessageBytesTotal?: number;
+  providerAssistantMessageCountTotal?: number;
+  providerAssistantMessageBytesTotal?: number;
+  providerToolMessageCountTotal?: number;
+  providerToolMessageBytesTotal?: number;
+  providerOtherMessageCountTotal?: number;
+  providerOtherMessageBytesTotal?: number;
+  providerInstructionBytesTotal?: number;
+  providerToolCountTotal?: number;
+  providerToolSchemaBytesTotal?: number;
+  providerResponseSchemaBytesTotal?: number;
+  providerRequestBytesTotal?: number;
+  providerPreparationMsTotal?: number;
+  providerMeasurementMsTotal?: number;
+}
+
 /**
  * Model Inference attributes - for the provider call within a MODEL_STEP.
  *
@@ -330,7 +418,7 @@ export interface ModelStepAttributes extends AIBaseAttributes {
  * ModelGenerationAttributes so existing integrations that read those
  * attributes continue to work unchanged.
  */
-export interface ModelInferenceAttributes extends AIBaseAttributes {
+export interface ModelInferenceAttributes extends AIBaseAttributes, Partial<PreparedModelRequestMetrics> {
   /** Model name (e.g., 'gpt-4', 'claude-3') */
   model?: string;
   /** Model provider (e.g., 'openai', 'anthropic') */
@@ -339,6 +427,16 @@ export interface ModelInferenceAttributes extends AIBaseAttributes {
   stepIndex?: number;
   /** Token usage statistics */
   usage?: UsageStats;
+  /** Whether the provider returned any token-usage measurement for this inference. */
+  providerUsageState?: ProviderUsageMeasurementState;
+  /** Bounded terminal outcome owned by this provider attempt. */
+  providerOutcome?: ProviderInferenceOutcome;
+  /** Whether the provider returned cache-read token usage for this inference. */
+  providerCacheReadUsageState?: ProviderUsageMeasurementState;
+  /** Whether the provider returned cache-write token usage for this inference. */
+  providerCacheWriteUsageState?: ProviderUsageMeasurementState;
+  /** Whether the provider returned reasoning-token usage for this inference. */
+  providerReasoningUsageState?: ProviderUsageMeasurementState;
   /** Reason this inference finished (stop, tool-calls, length, etc.) */
   finishReason?: string;
   /** Whether this was a streaming response */
@@ -461,6 +559,52 @@ export interface MappingAttributes extends AIBaseAttributes {
   toolCallId?: string;
 }
 
+export type ProcessorPromptMeasurementState = 'measured' | 'unknown';
+export type ProcessorPromptRoleBreakdownState = 'serialized_subsets_non_additive';
+
+/**
+ * Content-free before/after measurements for processors that mutate the
+ * provider-bound prompt. Prompt content intentionally never crosses this
+ * interface.
+ */
+export interface ProcessorPromptMeasurementAttributes {
+  processorMeasurementState: ProcessorPromptMeasurementState;
+  /** Time spent producing the content-free before/after measurements. */
+  processorMeasurementMs: number;
+  processorRoleBreakdownState: ProcessorPromptRoleBreakdownState;
+  processorInputMessageCount: number;
+  processorInputMessageBytes: number;
+  processorOutputMessageCount: number;
+  processorOutputMessageBytes: number;
+  processorMessageDeltaBytes: number;
+  processorInputSystemMessageCount: number;
+  processorInputSystemMessageBytes: number;
+  processorOutputSystemMessageCount: number;
+  processorOutputSystemMessageBytes: number;
+  processorSystemMessageDeltaBytes: number;
+  processorTotalDeltaBytes: number;
+  processorInputUserMessageCount: number;
+  processorInputUserMessageBytes: number;
+  processorOutputUserMessageCount: number;
+  processorOutputUserMessageBytes: number;
+  processorUserMessageDeltaBytes: number;
+  processorInputAssistantMessageCount: number;
+  processorInputAssistantMessageBytes: number;
+  processorOutputAssistantMessageCount: number;
+  processorOutputAssistantMessageBytes: number;
+  processorAssistantMessageDeltaBytes: number;
+  processorInputToolMessageCount: number;
+  processorInputToolMessageBytes: number;
+  processorOutputToolMessageCount: number;
+  processorOutputToolMessageBytes: number;
+  processorToolMessageDeltaBytes: number;
+  processorInputOtherMessageCount: number;
+  processorInputOtherMessageBytes: number;
+  processorOutputOtherMessageCount: number;
+  processorOutputOtherMessageBytes: number;
+  processorOtherMessageDeltaBytes: number;
+}
+
 /**
  * Skill resolution attributes — for a dynamic agent skills resolver run.
  */
@@ -474,9 +618,11 @@ export interface SkillResolutionAttributes extends AIBaseAttributes {
 /**
  * Processor attributes
  */
-export interface ProcessorRunAttributes extends AIBaseAttributes {
+export interface ProcessorRunAttributes extends AIBaseAttributes, Partial<ProcessorPromptMeasurementAttributes> {
   /** Processor executor type (workflow or legacy) */
   processorExecutor?: 'workflow' | 'legacy';
+  /** Provider-bound request phase for processors that run after prompt conversion. */
+  processorPhase?: 'llm_request';
   /** Processor index in the agent */
   processorIndex?: number;
   /** MessageList mutations performed by this processor */
@@ -1044,6 +1190,13 @@ export interface ModelInferenceContext {
   responseFormat?: ModelInferenceAttributes['responseFormat'];
 }
 
+/** Shared terminal shape emitted by both inner provider and outer step streams. */
+export interface ModelInferenceFinishPayload {
+  stepResult: Omit<StepFinishPayload['stepResult'], 'reason'> & { reason: string };
+  output: StepFinishPayload<any, any>['output'];
+  metadata?: StepFinishPayload['metadata'];
+}
+
 /** Tracks model execution steps and streaming chunks within a MODEL_GENERATION span. */
 export interface IModelSpanTracker {
   getTracingContext(): TracingContext;
@@ -1051,8 +1204,23 @@ export interface IModelSpanTracker {
   endGeneration(options?: EndGenerationOptions): void;
   updateGeneration(options: UpdateSpanOptions<SpanType.MODEL_GENERATION>): void;
   wrapStream<T extends { pipeThrough: Function }>(stream: T): T;
+  /** Observe only outer workflow-owned MODEL_STEP terminal boundaries. */
+  wrapStepStream?<T extends { pipeThrough: Function }>(stream: T): T;
   startStep(payload?: StepStartPayload): void;
   updateStep?(payload?: StepStartPayload): void;
+
+  /**
+   * End only the current model step while leaving its generation open. Durable
+   * execution uses this for terminal processor decisions that occur outside a
+   * provider inference boundary.
+   */
+  endStep?(options?: EndSpanOptions<SpanType.MODEL_STEP>): void;
+
+  /**
+   * Error only the current model step while leaving its generation open for a
+   * durable retry or fallback attempt.
+   */
+  reportStepError?(options: ErrorSpanOptions<SpanType.MODEL_STEP>): void;
 
   /**
    * Open the MODEL_INFERENCE span for the current step. Call this immediately
@@ -1060,7 +1228,40 @@ export interface IModelSpanTracker {
    * work (and `setInferenceContext` reflects the post-processor tool set).
    * Falls back to auto-creation on first chunk if the caller forgets.
    */
-  startInference?(payload?: StepStartPayload): void;
+  startInference?(payload?: StepStartPayload, providerAttempt?: number): void;
+
+  /** Record first semantic content at the provider adapter boundary. */
+  recordInferenceContentStart?(): void;
+
+  /** Retain a provider-boundary timestamp for a chunk observed later downstream. */
+  recordInferenceChunkTimestamp?(chunk: unknown, observedAt?: Date): void;
+
+  /** Record provider finish and its producer-boundary time before downstream backpressure. */
+  recordInferenceFinish?(
+    payload: ModelInferenceFinishPayload,
+    endTime?: Date,
+    response?: { responseId?: string; responseModel?: string },
+  ): void;
+
+  /**
+   * Close only the current provider-attempt span after a retryable adapter
+   * failure. The enclosing model step and generation remain open for the next
+   * attempt.
+   */
+  reportInferenceError?(options: ErrorSpanOptions<SpanType.MODEL_INFERENCE>): void;
+
+  /** Close a cancelled provider attempt without converting it to a provider error. */
+  reportInferenceAbort?(options: ErrorSpanOptions<SpanType.MODEL_INFERENCE>): void;
+
+  /** Close the current inference from the provider's inner finish boundary. */
+  endInference?(payload?: ModelInferenceFinishPayload): void;
+
+  /**
+   * Mark the current step as having no provider inference boundary. This is
+   * used for processor-owned cached-response replay so streamed cache chunks
+   * do not trigger the backwards-compatible inference-span safety net.
+   */
+  markInferenceNotApplicable?(): void;
 
   /**
    * Set the request-side context applied to subsequent MODEL_INFERENCE spans
@@ -1070,12 +1271,25 @@ export interface IModelSpanTracker {
    */
   setInferenceContext?(context: ModelInferenceContext): void;
 
+  /** Attach content-free measurements from the final prepared provider request. */
+  recordPreparedRequest?(metrics: PreparedModelRequestMetrics): void;
+
+  /** Attach provider-returned response identity normalized by the core runtime. */
+  recordResponseMetadata?(metadata: { responseId?: string; responseModel?: string }): void;
+
   /**
    * Enable or disable deferred step closing for durable execution.
    * When enabled, step-finish chunks won't automatically close the step span.
    * Use exportCurrentStep() to get the span data, then endDeferredStep() to close later.
    */
   setDeferStepClose(defer: boolean): void;
+
+  /**
+   * Close the current deferred step after step-owned post-inference work has
+   * finished. If the step-finish chunk has not reached the tracker yet, the
+   * tracker closes the step when that chunk arrives.
+   */
+  endDeferredStep?(payload?: StepFinishPayload): void;
 
   /**
    * Export the current step span for later rebuilding (durable execution).
@@ -1307,6 +1521,8 @@ export interface ChildSpanOptions<TType extends SpanType> extends CreateBaseOpti
 export interface ChildEventOptions<TType extends SpanType> extends CreateBaseOptions<TType> {
   /** Output data */
   output?: any;
+  /** Actual event time when the event is observed before downstream processing. */
+  startTime?: Date;
 }
 
 interface UpdateBaseOptions<TType extends SpanType> {
@@ -1320,6 +1536,11 @@ interface UpdateBaseOptions<TType extends SpanType> {
 export interface EndSpanOptions<TType extends SpanType> extends UpdateBaseOptions<TType> {
   /** Output data */
   output?: any;
+  /**
+   * Actual operation end time when final span enrichment happens later.
+   * Defaults to the time `end()` is called.
+   */
+  endTime?: Date;
 }
 
 /** Options for updating a span's attributes, input, or output mid-flight. */
@@ -1338,6 +1559,11 @@ export interface ErrorSpanOptions<TType extends SpanType> extends UpdateBaseOpti
   error: MastraError | Error;
   /** End the span when true */
   endSpan?: boolean;
+  /**
+   * Actual operation end time when final span enrichment happens later.
+   * Used only when `endSpan` is true.
+   */
+  endTime?: Date;
 }
 
 /** Options for retrieving an existing span or creating a new one from a tracing context. */

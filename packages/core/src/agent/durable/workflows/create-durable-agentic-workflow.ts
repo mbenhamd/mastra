@@ -945,7 +945,7 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
               requestContext,
             });
             const reg = globalRunRegistry.get(initData.runId);
-            const modelSpanData = reg?.resumeModelSpanData ?? initData.modelSpanData;
+            const modelSpanData = reg?.resumeModelSpanData ?? state.modelSpanData ?? initData.modelSpanData;
             const agentSpanData = reg?.resumeAgentSpanData ?? initData.agentSpanData;
             if (observability) {
               if (modelSpanData) {

@@ -1,8 +1,27 @@
 import { isInfrastructureRequestContextKey } from '../../request-context';
+import type { RequestContext } from '../../request-context';
 import type { JsonValue, PersistedRequestContextInput } from '../../storage/domains/harness';
 
-import { assertJsonValue, isPlainJsonObject } from './canonical-json';
+import { assertJsonValue, canonicalJson, isPlainJsonObject } from './canonical-json';
 import { HarnessValidationError } from './errors';
+
+/** Canonical JSON budget for the observability-only app subset inherited by subagents. */
+export const MAX_INHERITED_REQUEST_CONTEXT_APP_BYTES = 256;
+const REQUEST_CONTEXT_APP_ENCODER = new TextEncoder();
+
+/** Enforce the bounded persistence/hash contract after the selected app bag is JSON-normalized. */
+export function assertInheritedRequestContextAppByteLimit(
+  app: Record<string, JsonValue>,
+  path = 'requestContext.app',
+): void {
+  const bytes = REQUEST_CONTEXT_APP_ENCODER.encode(canonicalJson(app)).byteLength;
+  if (bytes > MAX_INHERITED_REQUEST_CONTEXT_APP_BYTES) {
+    throw new HarnessValidationError(
+      path,
+      `must be at most ${MAX_INHERITED_REQUEST_CONTEXT_APP_BYTES} canonical JSON UTF-8 bytes; received ${bytes}`,
+    );
+  }
+}
 
 /**
  * §4.4c — caller-supplied request-context input.
@@ -79,4 +98,51 @@ export function callerRequestContextToPersisted(
 ): PersistedRequestContextInput | undefined {
   if (normalized === undefined) return undefined;
   return { metadata: normalized.app };
+}
+
+/**
+ * Select an exact, operator-approved subset of an application metadata bag for
+ * a descendant subagent turn. Keys are literal top-level app keys, not dotted
+ * paths. The selected values are JSON-normalized again so the child never
+ * shares mutable object identity with the parent turn.
+ */
+export function projectInheritedRequestContextAppBag(
+  rawApp: unknown,
+  appKeys: readonly string[],
+): { app: Record<string, JsonValue> } | undefined {
+  if (rawApp === undefined || appKeys.length === 0) return undefined;
+  if (rawApp === null || typeof rawApp !== 'object' || Array.isArray(rawApp) || !isPlainJsonObject(rawApp)) {
+    throw new HarnessValidationError('requestContext.app', 'must remain a JSON object during subagent delegation');
+  }
+
+  const app: Record<string, JsonValue> = {};
+  let selected = 0;
+  for (const key of appKeys) {
+    const descriptor = Object.getOwnPropertyDescriptor(rawApp, key);
+    if (descriptor === undefined || ('value' in descriptor && descriptor.value === undefined)) continue;
+    if (!('value' in descriptor)) {
+      throw new HarnessValidationError(
+        `requestContext.app[${JSON.stringify(key)}]`,
+        'must be an own JSON data property during subagent delegation',
+      );
+    }
+    Object.defineProperty(app, key, {
+      value: assertJsonValue(descriptor.value, `requestContext.app[${JSON.stringify(key)}]`),
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+    selected += 1;
+  }
+  if (selected === 0) return undefined;
+  assertInheritedRequestContextAppByteLimit(app);
+  return { app };
+}
+
+/** Project the approved app-key subset from a live tool/agent RequestContext. */
+export function projectInheritedRequestContextApp(
+  requestContext: RequestContext | undefined,
+  appKeys: readonly string[],
+): { app: Record<string, JsonValue> } | undefined {
+  return projectInheritedRequestContextAppBag(requestContext?.get('app'), appKeys);
 }

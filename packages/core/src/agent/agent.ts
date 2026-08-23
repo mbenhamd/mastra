@@ -5605,15 +5605,17 @@ export class Agent<
                   entityId: agentName,
                 }) || `${slugify.default(this.id)}-${agentName}`;
 
-            // Record a throwing delegation hook on the run's request context so
+            // Record a throwing delegation hook on the parent run context so
             // callers can detect "delegation ran but the hook failed" without
-            // scraping logs. Runs for every hookErrorStrategy.
+            // scraping logs. The execute closure clones requestContext so child
+            // memory-coordinate mutations stay isolated; hook errors must still
+            // land on the caller's object. Runs for every hookErrorStrategy.
             const recordHookError = (hook: DelegationHookError['hook'], hookError: unknown, logMessage: string) => {
               const error = hookError instanceof Error ? hookError : new Error(String(hookError));
               this.logger.error(logMessage, { agent: this.name, error });
               const existing =
-                (requestContext.get('__mastra_delegationHookErrors') as DelegationHookError[] | undefined) ?? [];
-              requestContext.set('__mastra_delegationHookErrors', [
+                (parentRequestContext.get('__mastra_delegationHookErrors') as DelegationHookError[] | undefined) ?? [];
+              parentRequestContext.set('__mastra_delegationHookErrors', [
                 ...existing,
                 {
                   hook,

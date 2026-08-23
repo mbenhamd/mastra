@@ -17,6 +17,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { Agent } from '../../agent';
+import { RequestContext } from '../../request-context';
 import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
 import { InMemoryDB } from '../../storage/domains/inmemory-db';
 import { buildFakeOutput } from './__test-utils__/fake-output';
@@ -53,6 +54,7 @@ function outcomeTerminalResult(summary = 'child-result') {
 class FakeAgent extends Agent<any, any, any> {
   chunks: any[] = [];
   streamCalls = 0;
+  streamOptions: any[] = [];
   fullOutput: any = {
     text: 'child-result',
     usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
@@ -87,6 +89,7 @@ class FakeAgent extends Agent<any, any, any> {
 
   async stream(_messages: any, options?: any): Promise<any> {
     this.streamCalls += 1;
+    this.streamOptions.push(options);
     const out = buildFakeOutput({
       runId: options?.runId ?? this.fullOutput.runId,
       fullOutput: this.fullOutput,
@@ -111,6 +114,7 @@ function setup(opts?: {
   closeTimeoutMs?: number;
   chunks?: any[];
   allowInline?: boolean;
+  inheritRequestContextAppKeys?: string[];
 }) {
   const parentAgent = new FakeAgent('parent-agent');
   const childAgent = new FakeAgent('child-agent');
@@ -127,6 +131,9 @@ function setup(opts?: {
     subagents: {
       maxDepth: opts?.maxDepth ?? 2,
       ...(opts?.maxConcurrent !== undefined ? { maxConcurrent: opts.maxConcurrent } : {}),
+      ...(opts?.inheritRequestContextAppKeys !== undefined
+        ? { inheritRequestContextAppKeys: opts.inheritRequestContextAppKeys }
+        : {}),
       types: {
         explore: {
           agentId: 'child-agent',
@@ -143,18 +150,28 @@ function setup(opts?: {
 }
 
 // Minimal mock execution context for direct tool.execute() calls.
-function execCtx(toolCallId = 'tc-1') {
+function execCtx(toolCallId = 'tc-1', requestContext = new RequestContext()) {
   return {
     abortSignal: new AbortController().signal,
     agent: { toolCallId, runId: 'run-1' },
     runId: 'run-1',
     tracingContext: {} as any,
-    requestContext: { get: () => undefined } as any,
+    requestContext,
     mastra: undefined,
   } as any;
 }
 
 describe('spawn_subagent tool — registration', () => {
+  it.each([
+    ['a non-array value', 'turnCorrelationId', /array/],
+    ['an empty key', [''], /non-empty/],
+    ['a duplicate key', ['turnCorrelationId', 'turnCorrelationId'], /duplicate/],
+    ['the app container', ['app'], /infrastructure-owned/],
+    ['an infrastructure key', ['harness'], /infrastructure-owned/],
+  ])('rejects %s in inheritRequestContextAppKeys', (_label, value, expected) => {
+    expect(() => setup({ inheritRequestContextAppKeys: value as never })).toThrow(expected);
+  });
+
   it('rejects a non-boolean allowInline boundary', () => {
     expect(() => setup({ allowInline: 'sometimes' as never })).toThrow(/allowInline/);
   });
@@ -193,6 +210,76 @@ describe('spawn_subagent tool — registration', () => {
 });
 
 describe('spawn_subagent tool — execution', () => {
+  it('inherits no caller app metadata by default', async () => {
+    const { harness, childAgent } = setup();
+    try {
+      const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const tool = createSpawnSubagentTool(parent)!;
+      const parentRequestContext = new RequestContext<unknown>([
+        ['app', { turnCorrelationId: 'must-not-cross-without-approval' }],
+      ]);
+
+      const result = (await tool.execute!(
+        { agentType: 'explore', task: 'keep caller context isolated' },
+        execCtx('tc-no-lineage', parentRequestContext),
+      )) as any;
+
+      expect(result.isError).not.toBe(true);
+      const childRequestContext = childAgent.streamOptions[0]?.requestContext as RequestContext | undefined;
+      expect(childRequestContext?.get('turnCorrelationId')).toBeUndefined();
+      expect(childRequestContext?.get('app')).toBeUndefined();
+      expect((childRequestContext?.get('harness') as { app?: unknown } | undefined)?.app).toBeUndefined();
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('copies only an explicitly approved observability key into the child turn context', async () => {
+    const lineageKey = 'turnCorrelationId';
+    const lineageValue = 'opaque-turn-5049';
+    const functionalRequestId = 'functional-request-must-not-cross';
+    const secretCanary = 'PRIVATE_APP_METADATA_CANARY';
+    const { harness, childAgent } = setup({ inheritRequestContextAppKeys: [lineageKey] });
+    try {
+      const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const tool = createSpawnSubagentTool(parent)!;
+      const parentRequestContext = new RequestContext<unknown>([
+        [
+          'app',
+          {
+            [lineageKey]: lineageValue,
+            'papersflow.requestId': functionalRequestId,
+            'papersflow.userId': 'user-must-not-cross',
+            instructions: secretCanary,
+          },
+        ],
+      ]);
+
+      const result = (await tool.execute!(
+        { agentType: 'explore', task: 'inspect lineage safely' },
+        execCtx('tc-lineage', parentRequestContext),
+      )) as any;
+
+      expect(result.isError).not.toBe(true);
+      const childRequestContext = childAgent.streamOptions[0]?.requestContext as RequestContext | undefined;
+      expect(childRequestContext).toBeInstanceOf(RequestContext);
+      expect(childRequestContext?.get(lineageKey)).toBe(lineageValue);
+      expect(childRequestContext?.get('app')).toEqual({ [lineageKey]: lineageValue });
+      expect((childRequestContext?.get('harness') as { app?: unknown } | undefined)?.app).toEqual({
+        [lineageKey]: lineageValue,
+      });
+      expect(childRequestContext?.get('requestId')).toBeUndefined();
+      expect(childRequestContext?.get('userId')).toBeUndefined();
+      expect((childRequestContext?.get('app') as Record<string, unknown>)['papersflow.requestId']).toBeUndefined();
+      expect(childRequestContext?.get('papersflow.userId')).toBeUndefined();
+      expect(JSON.stringify(childRequestContext?.toJSON())).not.toContain(secretCanary);
+      expect(JSON.stringify(childRequestContext?.toJSON())).not.toContain(functionalRequestId);
+      expect(JSON.stringify(childRequestContext?.toJSON())).not.toContain('user-must-not-cross');
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
   it('rejects unknown agentType via input-schema validation', async () => {
     const { harness } = setup();
     const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });

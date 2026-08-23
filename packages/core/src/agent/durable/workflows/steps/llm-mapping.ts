@@ -60,6 +60,7 @@ const durableLLMMappingOutputSchema = z.object({
   processorRetryCount: z.number().optional(),
   processorRetryFeedback: z.string().optional(),
   modelEntryId: z.string().optional(),
+  modelSpanData: z.any().optional(),
   responseRecoveryConsumed: z.boolean().optional(),
 });
 
@@ -434,6 +435,7 @@ export function createDurableLLMMappingStep() {
         processorRetryCount: llmOutput.processorRetryCount,
         processorRetryFeedback: llmOutput.processorRetryFeedback,
         modelEntryId: llmOutput.modelEntryId,
+        modelSpanData: llmOutput.modelSpanData,
         responseRecoveryConsumed: llmOutput.responseRecoveryConsumed,
         delegationBailed,
         ...(terminalToolResult ? { terminalToolResult } : {}),

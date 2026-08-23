@@ -21,6 +21,7 @@ import { z } from 'zod';
 import { createTool } from '../../tools/tool';
 import { HarnessSubagentDepthExceededError, HarnessValidationError } from './errors';
 import { projectHarnessPublicError } from './events';
+import { projectInheritedRequestContextApp } from './request-context-input';
 import type { Session } from './session';
 import {
   HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID,
@@ -48,6 +49,7 @@ export function createSpawnSubagentTool(parent: Session) {
     _listSubagentTypeIds(options: { invocation: 'inline' | 'delegated' }): string[];
     _getSubagentType(id: string): SubagentDefinition | undefined;
     _getSubagentMaxDepth(): number;
+    _getSubagentInheritedRequestContextAppKeys(): readonly string[];
     session(opts: unknown): Promise<Session>;
     _internalCloseSessionIfUnclaimed(session: Session): Promise<void> | undefined;
   };
@@ -347,7 +349,15 @@ export function createSpawnSubagentTool(parent: Session) {
           // first provider call. There is no await between the check and
           // `child.message()` invocation.
           parent._internalAssertSubagentAdmission(admissionEpoch, ctx.abortSignal);
-          rawResult = await child.message({ content: task, abortSignal: ctx.abortSignal });
+          const childRequestContext = projectInheritedRequestContextApp(
+            ctx.requestContext,
+            harness._getSubagentInheritedRequestContextAppKeys(),
+          );
+          rawResult = await child.message({
+            content: task,
+            abortSignal: ctx.abortSignal,
+            ...(childRequestContext !== undefined ? { requestContext: childRequestContext } : {}),
+          });
           const finishReason = (rawResult as { finishReason?: string } | undefined)?.finishReason;
           const declaredReport = parseHarnessSubagentOutcomeReport(rawResult);
           const declaredTerminalText = parseHarnessTerminalToolResultText(

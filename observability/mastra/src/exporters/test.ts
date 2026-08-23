@@ -272,6 +272,18 @@ export interface TestExporterConfig extends BaseExporterConfig {
  * const jsonString = exporter.toJSON();
  * ```
  */
+/**
+ * Provider request telemetry attributes whose values are wall-clock samples of the current run
+ * (preparation/measurement durations and the dispatch epoch).
+ */
+const WALL_CLOCK_PROVIDER_METRIC_KEYS = new Set([
+  'providerPreparationMs',
+  'providerPreparationMsTotal',
+  'providerMeasurementMs',
+  'providerMeasurementMsTotal',
+  'providerDispatchTimestampMs',
+]);
+
 export class TestExporter extends BaseExporter {
   name = 'test-exporter';
 
@@ -1004,6 +1016,16 @@ export class TestExporter extends BaseExporter {
       }
       if (key === 'createdAt' && typeof value === 'number') {
         return '<date>';
+      }
+      // PF-3243 provider request telemetry records wall-clock samples of the current run -
+      // preparation/measurement durations and the dispatch epoch. They never repeat between
+      // runs, so golden trees pin that the attribute is present and numeric rather than baking
+      // in an unreproducible sample. The placeholder names its own key, so a dropped, renamed,
+      // or retyped attribute still fails the snapshot: this masks the value, not the assertion.
+      // The arithmetic over these values is pinned separately, with exact injected numbers, in
+      // model-tracing.test.ts.
+      if (typeof value === 'number' && key !== undefined && WALL_CLOCK_PROVIDER_METRIC_KEYS.has(key)) {
+        return `<${key}>`;
       }
       if (typeof value === 'string') {
         // Special handling for traceId - use the shared traceIdMap (handles both UUID and 32-char hex formats)

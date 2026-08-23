@@ -1263,6 +1263,24 @@ export interface HarnessConfigCommon {
    */
   subagents?: {
     /**
+     * Exact top-level observability-lineage keys from a parent turn's
+     * caller-supplied `app` request context that may be copied into inline and
+     * durable descendant turns.
+     * Keys are matched literally (not as dotted paths), and every other app
+     * field remains isolated. The selected JSON values are copied rather than
+     * sharing object identity with the parent.
+     * The complete selected bag is capped at 256 canonical JSON UTF-8 bytes.
+     *
+     * Selected keys are also exposed as top-level entries on the descendant's
+     * agent `RequestContext` so observability integrations can correlate nested
+     * provider calls without inspecting the complete application metadata bag.
+     * Infrastructure-owned keys and `app` itself are rejected at construction.
+     * Do not configure instruction, identity, authorization, entitlement, or
+     * tool-behavior keys; use a dedicated opaque correlation value instead.
+     * Defaults to `[]` (no request-context inheritance).
+     */
+    inheritRequestContextAppKeys?: string[];
+    /**
      * Copy the root session's durable tool/category grants into each newly
      * created descendant session. The copy is a creation-time snapshot: it
      * does not share mutable permission state and never updates descendants
