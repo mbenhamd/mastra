@@ -1528,14 +1528,19 @@ export class ModelSpanTracker {
     if (!providerEvidence) {
       this.#endInferenceSpan(payload);
     } else {
-      // Provider evidence wins for measurement fields; the completed step payload supplies the
-      // content (text, object, warnings, modelId) the evidence deliberately omits.
+      // Provider evidence wins for every field it carries; the completed step payload supplies
+      // only the content the evidence deliberately omits (text, object, warnings).
       const merged = runSpanOperation<ModelInferenceFinishPayload>(() => {
         const { usage: _stepUsage, ...stepOutput } = payload.output;
-        const { modelId: _producerIdentityFromStep, ...stepMetadata } = (payload.metadata ?? {}) as Record<
-          string,
-          unknown
-        >;
+        // Both producer-identity fields are dropped from the step side. Provider evidence is
+        // captured before output processors run, so its absence is authoritative: anything that
+        // appears only on the step payload crossed the provider boundary and may have been
+        // written by a processor.
+        const {
+          modelId: _producerIdentityFromStep,
+          providerMetadata: _producerMetadataFromStep,
+          ...stepMetadata
+        } = (payload.metadata ?? {}) as Record<string, unknown>;
         return {
           ...payload,
           ...providerEvidence,
@@ -1549,10 +1554,16 @@ export class ModelSpanTracker {
           // processor, and the fork pins that a processor-supplied model must NOT be reported
           // as producer identity (durable-agent-tracing.integration.test.ts: "keeps absent
           // producer response identity absent when a processor adds one").
+          // `providerMetadata` is NOT taken from the step side either. Provider evidence is
+          // captured before output processors run, so its absence is authoritative: a
+          // `providerMetadata` appearing only on the step payload was written after the
+          // provider boundary and cannot be attributed to the provider. Falling back to it let
+          // a processor inject metadata that `extractUsageMetrics` then treats as provider
+          // evidence - with injected `cacheReadInputTokens: 1000` against a real
+          // `inputTokens: 4`, the exported input count became 1004.
           metadata: {
             ...stepMetadata,
             ...providerEvidence.metadata,
-            providerMetadata: providerEvidence.metadata?.providerMetadata ?? payload.metadata?.providerMetadata,
           },
         } as ModelInferenceFinishPayload;
       });
@@ -1606,6 +1617,7 @@ export class ModelSpanTracker {
     this.#deferredStepCloseRequested = false;
     this.#currentInferenceResponse = undefined;
     this.#hasNormalizedInferenceResponse = false;
+    this.#providerObservedChunkKeys.clear();
     this.#stepIndex++;
   }
 
@@ -1934,20 +1946,46 @@ export class ModelSpanTracker {
    * MODEL_INFERENCE / MODEL_CHUNK timing.
    */
   /**
-   * Chunk objects already observed by the inner provider stream. The outer step stream sees the
-   * identical object (llm-execution-step forwards it unchanged), so without this marker every
-   * provider chunk would produce two MODEL_CHUNK spans. Semantic chunks that only ever appear
-   * downstream - client-executed tool results, structured-output objects - are absent from the
-   * set and so are emitted exactly once by the outer wrapper.
+   * Records what the inner provider stream already observed, so the outer step stream does not
+   * emit a second MODEL_CHUNK span for the same event. Two records, because object identity
+   * alone is not sufficient: an output processor may return a REPLACEMENT object rather than
+   * the one it was given (see `safeEnqueue` of the processed part in stream/base/output.ts, and
+   * the backpressure processor that clones every part), and a clone defeats a WeakSet. The
+   * semantic key survives cloning; the WeakSet still covers events that carry no stable key.
+   * Both are cleared per step, so a later step reusing an id is not wrongly suppressed.
    */
   #providerObservedChunks = new WeakSet<object>();
+  #providerObservedChunkKeys = new Set<string>();
+
+  /** Stable per-step identity for the semantic events both wrappers can see. */
+  #observedChunkKey(chunk: { type?: unknown; payload?: unknown }): string | undefined {
+    if (chunk.type === 'tool-result') {
+      const toolCallId = ownStringDataProperty(chunk.payload, 'toolCallId');
+      return toolCallId === undefined ? undefined : `tool-result:${toolCallId}`;
+    }
+    if (chunk.type === 'object' || chunk.type === 'object-result') return String(chunk.type);
+    return undefined;
+  }
+
+  #markProviderObserved(chunk: unknown): void {
+    if (typeof chunk !== 'object' || chunk === null) return;
+    this.#providerObservedChunks.add(chunk);
+    const key = this.#observedChunkKey(chunk as { type?: unknown; payload?: unknown });
+    if (key !== undefined) this.#providerObservedChunkKeys.add(key);
+  }
+
+  #wasProviderObserved(chunk: unknown): boolean {
+    if (typeof chunk !== 'object' || chunk === null) return false;
+    const key = this.#observedChunkKey(chunk as { type?: unknown; payload?: unknown });
+    if (key !== undefined && this.#providerObservedChunkKeys.has(key)) return true;
+    return this.#providerObservedChunks.has(chunk);
+  }
 
   wrapStepStream<T extends { pipeThrough: Function }>(stream: T): T {
     return stream.pipeThrough(
       new TransformStream({
         transform: (chunk, controller) => {
-          const providerObserved =
-            typeof chunk === 'object' && chunk !== null && this.#providerObservedChunks.delete(chunk);
+          const providerObserved = this.#wasProviderObserved(chunk);
           runSpanOperation(() => {
             switch (chunk.type) {
               case 'object':
@@ -1985,7 +2023,7 @@ export class ModelSpanTracker {
       new TransformStream({
         transform: (chunk, controller) => {
           const providerObservedAt = this.#takeProviderChunkTimestamp(chunk);
-          if (typeof chunk === 'object' && chunk !== null) this.#providerObservedChunks.add(chunk);
+          this.#markProviderObserved(chunk);
           // Capture completion start time on first actual content (for time-to-first-token)
           runSpanOperation(() => {
             switch (chunk.type) {

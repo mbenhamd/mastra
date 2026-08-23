@@ -3109,4 +3109,98 @@ describe('ModelSpanTracker', () => {
       });
     });
   });
+
+  describe('provider evidence trust boundary and double-wrapper dedupe', () => {
+    // Regression coverage for three defects an earlier review reproduced by hand and that no
+    // test detected. Each asserts the exact falsifier that review named.
+
+    it('emits one tool-result event when a processor replaces the chunk between wrappers', async () => {
+      const modelSpan = tracing.startSpan({ type: SpanType.MODEL_GENERATION, name: 'test-generation' });
+      const tracker = new ModelSpanTracker(modelSpan);
+      const toolCallId = 'call_clone_1';
+
+      const inner = tracker.wrapStream(
+        createMockStream([
+          { type: 'step-start', payload: { messageId: 'msg-1' } },
+          { type: 'tool-result', payload: { toolCallId, toolName: 'echo', result: { ok: true } } },
+        ]),
+      );
+
+      // Output processors may return a REPLACEMENT object rather than the one they were given
+      // (stream/base/output.ts enqueues the processed part; the backpressure processor clones
+      // every part). A dedupe keyed on object identity does not survive that, so the outer
+      // wrapper would emit a second span for the same event.
+      const cloning = new TransformStream({
+        transform(chunk: any, controller: any) {
+          controller.enqueue(JSON.parse(JSON.stringify(chunk)));
+        },
+      });
+      await consumeStream(tracker.wrapStepStream(inner.pipeThrough(cloning)));
+      modelSpan.end();
+
+      expect(testExporter.getSpansByName("chunk: 'tool-result'")).toHaveLength(1);
+    });
+
+    it('still emits a tool-result the provider stream never saw', async () => {
+      // The guard must not over-suppress: a client-executed tool result only ever appears
+      // downstream, so the outer wrapper is its only observer.
+      const modelSpan = tracing.startSpan({ type: SpanType.MODEL_GENERATION, name: 'test-generation' });
+      const tracker = new ModelSpanTracker(modelSpan);
+
+      const inner = tracker.wrapStream(createMockStream([{ type: 'step-start', payload: { messageId: 'msg-1' } }]));
+      const injecting = new TransformStream({
+        transform(chunk: any, controller: any) {
+          controller.enqueue(chunk);
+        },
+        flush(controller: any) {
+          controller.enqueue({
+            type: 'tool-result',
+            payload: { toolCallId: 'call_client_1', toolName: 'clientTool', result: { ok: true } },
+          });
+        },
+      });
+      await consumeStream(tracker.wrapStepStream(inner.pipeThrough(injecting)));
+      modelSpan.end();
+
+      expect(testExporter.getSpansByName("chunk: 'tool-result'")).toHaveLength(1);
+    });
+
+    it('ignores providerMetadata a processor added after the provider boundary', async () => {
+      const modelSpan = tracing.startSpan({ type: SpanType.MODEL_GENERATION, name: 'test-generation' });
+      const tracker = new ModelSpanTracker(modelSpan);
+      tracker.startStep();
+      tracker.startInference();
+
+      // Provider evidence is captured pre-processor: four input tokens and NO providerMetadata.
+      // Its absence is authoritative - anything appearing later crossed the provider boundary.
+      tracker.recordInferenceFinish({
+        stepResult: { reason: 'stop', warnings: [], isContinued: false },
+        output: { usage: { inputTokens: 4, outputTokens: 1 } },
+        metadata: {},
+      } as any);
+
+      // A downstream output processor then fabricates provider metadata. Trusting it would let
+      // extractUsageMetrics apply Anthropic cache-token adjustments to forged numbers, turning
+      // an input count of 4 into 1004.
+      await consumeStream(
+        tracker.wrapStream(
+          createMockStream([
+            {
+              type: 'step-finish',
+              payload: {
+                output: { usage: { inputTokens: 4, outputTokens: 1 } },
+                stepResult: { reason: 'stop', warnings: [], isContinued: false },
+                metadata: { providerMetadata: { anthropic: { cacheReadInputTokens: 1000 } } },
+              },
+            },
+          ]),
+        ),
+      );
+      modelSpan.end();
+
+      const [inferenceSpan] = testExporter.getSpansByType(SpanType.MODEL_INFERENCE);
+      expect(inferenceSpan).toBeDefined();
+      expect((inferenceSpan!.attributes as any).usage.inputTokens).toBe(4);
+    });
+  });
 });

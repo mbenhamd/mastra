@@ -25,15 +25,35 @@ function detachedJsonRecord(value: unknown): Record<string, unknown> | undefined
   }
 }
 
+function ownStringDataProperty(value: unknown, key: string): string | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor && 'value' in descriptor && typeof descriptor.value === 'string' ? descriptor.value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function providerFinishEvidence(payload: ProviderFinishPayload): ProviderFinishPayload {
   const usage = detachedJsonRecord(payload.output.usage) ?? {};
   const providerMetadata = detachedJsonRecord(payload.metadata?.providerMetadata ?? payload.providerMetadata);
+  // Capture the finish-payload model here, while the payload is still pre-processor and so
+  // still trustworthy. Providers that never emit a `response-metadata` chunk report the served
+  // model only on this payload (upstream #21154), and tracing reads it as producer identity.
+  // Downstream the same field can be written by an output processor, so a value recovered later
+  // cannot be attributed to the producer - which is why the tracing merge refuses the step-side
+  // `modelId`. Reading it now is what keeps the legitimate case working.
+  const finishModelId = ownStringDataProperty(payload.metadata, 'modelId');
   return {
     stepResult: {
       reason: typeof payload.stepResult.reason === 'string' ? payload.stepResult.reason : 'unknown',
     },
     output: { usage },
-    metadata: providerMetadata ? { providerMetadata } : {},
+    metadata: {
+      ...(providerMetadata ? { providerMetadata } : {}),
+      ...(finishModelId === undefined ? {} : { modelId: finishModelId }),
+    },
   } as ProviderFinishPayload;
 }
 
