@@ -1,8 +1,8 @@
 ---
-title: "Traces | Observability"
-description: "Record and inspect hierarchical execution for agents, workflows, tools, and model calls."
+title: 'Traces | Observability'
+description: 'Record and inspect hierarchical execution for agents, workflows, tools, and model calls.'
 packages:
-  - "@mastra/observability"
+  - '@mastra/observability'
 ---
 
 # Traces
@@ -54,7 +54,7 @@ export const mastra = new Mastra({
       },
     },
   }),
-})
+});
 ```
 
 The `sampling` option allows you to control which traces are collected, helping you balance between observability needs and resource costs. Mastra supports four sampling strategies:
@@ -63,7 +63,7 @@ The `sampling` option allows you to control which traces are collected, helping 
 
    ```ts
    sampling: {
-     type: 'always'
+     type: 'always';
    }
    ```
 
@@ -71,7 +71,7 @@ The `sampling` option allows you to control which traces are collected, helping 
 
    ```ts
    sampling: {
-     type: 'never'
+     type: 'never';
    }
    ```
 
@@ -111,8 +111,8 @@ You can add metadata to any span using the tracing context:
 
 ```ts
 execute: async (inputData, context) => {
-  const startTime = Date.now()
-  const response = await fetch(inputData.endpoint)
+  const startTime = Date.now();
+  const response = await fetch(inputData.endpoint);
 
   // Add custom metadata to the current span
   context?.tracingContext.currentSpan?.update({
@@ -123,10 +123,10 @@ execute: async (inputData, context) => {
       userTier: inputData.userTier,
       region: process.env.AWS_REGION,
     },
-  })
+  });
 
-  return await response.json()
-}
+  return await response.json();
+};
 ```
 
 Metadata set here will be shown in all configured exporters.
@@ -146,7 +146,7 @@ export const mastra = new Mastra({
       },
     },
   }),
-})
+});
 ```
 
 If `environment` isn't set, Mastra falls back to `process.env.NODE_ENV`. If neither is set, the field is left undefined rather than guessed.
@@ -172,21 +172,21 @@ export const mastra = new Mastra({
       },
     },
   }),
-})
+});
 ```
 
 Now when you execute agents or workflows with a RequestContext, these values are automatically extracted:
 
 ```ts
-const requestContext = new RequestContext()
-requestContext.set('userId', 'user-123')
-requestContext.set('environment', 'production')
-requestContext.set('tenantId', 'tenant-456')
+const requestContext = new RequestContext();
+requestContext.set('userId', 'user-123');
+requestContext.set('environment', 'production');
+requestContext.set('tenantId', 'tenant-456');
 
 // All spans in this trace automatically get userId, environment, and tenantId metadata
 const result = await agent.generate('Hello', {
   requestContext,
-})
+});
 ```
 
 #### Per-request additions
@@ -194,17 +194,17 @@ const result = await agent.generate('Hello', {
 You can add trace-specific keys using `tracingOptions.requestContextKeys`. These are merged with the configuration-level keys:
 
 ```ts
-const requestContext = new RequestContext()
-requestContext.set('userId', 'user-123')
-requestContext.set('environment', 'production')
-requestContext.set('experimentId', 'exp-789')
+const requestContext = new RequestContext();
+requestContext.set('userId', 'user-123');
+requestContext.set('environment', 'production');
+requestContext.set('experimentId', 'exp-789');
 
 const result = await agent.generate('Hello', {
   requestContext,
   tracingOptions: {
     requestContextKeys: ['experimentId'], // Adds to configured keys
   },
-})
+});
 
 // All spans now have: userId, environment, AND experimentId
 ```
@@ -223,11 +223,11 @@ export const mastra = new Mastra({
       },
     },
   }),
-})
+});
 
-const requestContext = new RequestContext()
-requestContext.set('user', { id: 'user-456', name: 'John Doe' })
-requestContext.set('session', { data: { experimentId: 'exp-999' } })
+const requestContext = new RequestContext();
+requestContext.set('user', { id: 'user-456', name: 'John Doe' });
+requestContext.set('session', { data: { experimentId: 'exp-999' } });
 
 // Metadata will include: { user: { id: 'user-456' }, session: { data: { experimentId: 'exp-999' } } }
 ```
@@ -251,16 +251,16 @@ const result = await agent.generate('Hello', {
   tracingOptions: {
     tags: ['production', 'experiment-v2', 'user-request'],
   },
-})
+});
 
 // With workflows
-const run = await mastra.getWorkflow('myWorkflow').createRun()
+const run = await mastra.getWorkflow('myWorkflow').createRun();
 const result = await run.start({
   inputData: { data: 'process this' },
   tracingOptions: {
     tags: ['batch-processing', 'priority-high'],
   },
-})
+});
 ```
 
 #### How tags work
@@ -280,7 +280,7 @@ const result = await agent.generate([{ role: 'user', content: 'Analyze this' }],
     tags: ['production', 'analytics'],
     metadata: { userId: 'user-123', experimentId: 'exp-456' },
   },
-})
+});
 ```
 
 #### Common tag patterns
@@ -301,14 +301,14 @@ const result = await agent.generate([{ role: 'user', content: 'Process this sens
   tracingOptions: {
     hideInput: true, // Input will be hidden from all spans
   },
-})
+});
 
 // Hide output data (e.g., generated secrets, confidential results)
 const result = await agent.generate([{ role: 'user', content: 'Generate API keys' }], {
   tracingOptions: {
     hideOutput: true, // Output will be hidden from all spans
   },
-})
+});
 
 // Hide both input and output
 const result = await agent.generate([{ role: 'user', content: 'Handle confidential request' }], {
@@ -316,7 +316,7 @@ const result = await agent.generate([{ role: 'user', content: 'Handle confidenti
     hideInput: true,
     hideOutput: true,
   },
-})
+});
 ```
 
 #### How it works
@@ -333,7 +333,7 @@ const result = await agent.generate([{ role: 'user', content: 'Sensitive operati
     tags: ['sensitive-operation', 'pii-handling'],
     metadata: { operationType: 'credential-processing' },
   },
-})
+});
 ```
 
 For more fine-grained control over sensitive data, consider using the [Sensitive Data Filter](/reference/observability/tracing/processors/sensitive-data-filter) processor, which can redact specific fields (like passwords, tokens, and keys) while preserving the rest of the input/output.
@@ -349,20 +349,20 @@ execute: async (inputData, context) => {
     type: 'generic',
     name: 'database-query',
     requestContext: context?.requestContext, // Pass to enable metadata extraction
-  })
+  });
 
-  const results = await db.query('SELECT * FROM users')
-  dbSpan?.end({ output: results })
+  const results = await db.query('SELECT * FROM users');
+  dbSpan?.end({ output: results });
 
   // Or create child span WITHOUT requestContext - no metadata extraction
   const cacheSpan = context?.tracingContext.currentSpan?.createChildSpan({
     type: 'generic',
     name: 'cache-check',
     // No requestContext - won't extract metadata
-  })
+  });
 
-  return results
-}
+  return results;
+};
 ```
 
 You get fine-grained control over which child spans include RequestContext metadata. Root spans (agent/workflow executions) always extract metadata automatically, while child spans only extract when you explicitly pass `requestContext`.
@@ -381,10 +381,10 @@ execute: async (inputData, context) => {
     name: 'database-query',
     input: { query: inputData.query },
     metadata: { database: 'production' },
-  })
+  });
 
   try {
-    const results = await db.query(inputData.query)
+    const results = await db.query(inputData.query);
     querySpan?.end({
       output: results.data,
       metadata: {
@@ -392,16 +392,16 @@ execute: async (inputData, context) => {
         queryTimeMs: results.executionTime,
         cacheHit: results.fromCache,
       },
-    })
-    return results
+    });
+    return results;
   } catch (error) {
     querySpan?.error({
       error,
       metadata: { retryable: isRetryableError(error) },
-    })
-    throw error
+    });
+    throw error;
   }
-}
+};
 ```
 
 Child spans automatically inherit the trace context from their parent, maintaining the relationship hierarchy in your observability platform.
@@ -410,13 +410,13 @@ Child spans automatically inherit the trace context from their parent, maintaini
 
 Mastra provides two ways to transform span data before it reaches your observability platform: **span processors** and **custom span formatters**. Both allow you to modify, filter, or enrich trace data, but they operate at different levels and serve different purposes.
 
-| Feature | Span Processors | Custom Span Formatters |
-| - | - | - |
-| Configuration level | Observability config | Per-exporter |
-| Operates on | Internal `Span` object | Exported `ExportedSpan` data |
-| Applies to | All exporters | Single exporter |
-| Async support | No | Yes |
-| Use case | Security, filtering, enrichment | Platform-specific formatting, async enrichment |
+| Feature             | Span Processors                 | Custom Span Formatters                         |
+| ------------------- | ------------------------------- | ---------------------------------------------- |
+| Configuration level | Observability config            | Per-exporter                                   |
+| Operates on         | Internal `Span` object          | Exported `ExportedSpan` data                   |
+| Applies to          | All exporters                   | Single exporter                                |
+| Async support       | No                              | Yes                                            |
+| Use case            | Security, filtering, enrichment | Platform-specific formatting, async enrichment |
 
 Use **span processors** for synchronous transformations that should apply to all exporters (like redacting sensitive data). Use **custom span formatters** when different exporters need different representations of the same data (like plain text for one platform and structured data for another), or when you need to perform asynchronous operations like fetching data from external APIs.
 
@@ -433,14 +433,14 @@ Span processors transform, filter, or enrich trace data before it's exported. Th
 You can create custom span processors by implementing the `SpanOutputProcessor` interface. Here's a basic example that converts all input text in spans to lowercase:
 
 ```ts title="src/processors/lowercase-input-processor.ts"
-import type { SpanOutputProcessor, AnySpan } from '@mastra/observability'
+import type { SpanOutputProcessor, AnySpan } from '@mastra/observability';
 
 export class LowercaseInputProcessor implements SpanOutputProcessor {
-  name = 'lowercase-processor'
+  name = 'lowercase-processor';
 
   process(span: AnySpan): AnySpan {
-    span.input = `${span.input}`.toLowerCase()
-    return span
+    span.input = `${span.input}`.toLowerCase();
+    return span;
   }
 
   async shutdown(): Promise<void> {
@@ -458,7 +458,7 @@ export const mastra = new Mastra({
       },
     },
   }),
-})
+});
 ```
 
 Processors are executed in the order they're defined, allowing you to chain multiple transformations. Common use cases include:
@@ -479,10 +479,10 @@ Span filtering lets you reduce noise and per-span costs before data reaches your
 The following example demonstrates how to combine both options in a single config:
 
 ```ts title="src/mastra/index.ts"
-import { Mastra } from '@mastra/core'
-import { SpanType } from '@mastra/core/observability'
-import { Observability, MastraStorageExporter } from '@mastra/observability'
-import { LangfuseExporter } from '@mastra/langfuse'
+import { Mastra } from '@mastra/core';
+import { SpanType } from '@mastra/core/observability';
+import { Observability, MastraStorageExporter } from '@mastra/observability';
+import { LangfuseExporter } from '@mastra/langfuse';
 
 export const mastra = new Mastra({
   observability: new Observability({
@@ -493,15 +493,15 @@ export const mastra = new Mastra({
         excludeSpanTypes: [SpanType.MODEL_CHUNK, SpanType.MODEL_STEP],
         spanFilter: span => {
           if (span.type === SpanType.TOOL_CALL && span.attributes?.success) {
-            return false
+            return false;
           }
 
-          return true
+          return true;
         },
       },
     },
   }),
-})
+});
 ```
 
 Filtering happens at export time in this order:
@@ -529,22 +529,22 @@ Custom span formatters transform how spans appear in specific observability plat
 Add a `customSpanFormatter` to any exporter configuration:
 
 ```ts title="src/mastra/index.ts"
-import { BraintrustExporter } from '@mastra/braintrust'
-import { LangfuseExporter } from '@mastra/langfuse'
-import { SpanType } from '@mastra/core/observability'
-import type { CustomSpanFormatter } from '@mastra/core/observability'
+import { BraintrustExporter } from '@mastra/braintrust';
+import { LangfuseExporter } from '@mastra/langfuse';
+import { SpanType } from '@mastra/core/observability';
+import type { CustomSpanFormatter } from '@mastra/core/observability';
 
 // Formatter that extracts plain text from AI messages
 const plainTextFormatter: CustomSpanFormatter = span => {
   if (span.type === SpanType.AGENT_RUN && Array.isArray(span.input)) {
-    const userMessage = span.input.find(m => m.role === 'user')
+    const userMessage = span.input.find(m => m.role === 'user');
     return {
       ...span,
       input: userMessage?.content ?? span.input,
-    }
+    };
   }
-  return span
-}
+  return span;
+};
 
 export const mastra = new Mastra({
   observability: new Observability({
@@ -562,7 +562,7 @@ export const mastra = new Mastra({
       },
     },
   }),
-})
+});
 ```
 
 #### Chaining multiple formatters
@@ -570,21 +570,21 @@ export const mastra = new Mastra({
 Use `chainFormatters` to combine multiple formatters. Chains support both sync and async formatters:
 
 ```ts
-import { chainFormatters } from '@mastra/observability'
+import { chainFormatters } from '@mastra/observability';
 
 const inputFormatter: CustomSpanFormatter = span => ({
   ...span,
   input: extractPlainText(span.input),
-})
+});
 
 const outputFormatter: CustomSpanFormatter = span => ({
   ...span,
   output: extractPlainText(span.output),
-})
+});
 
 const exporter = new BraintrustExporter({
   customSpanFormatter: chainFormatters([inputFormatter, outputFormatter]),
-})
+});
 ```
 
 #### Async formatters
@@ -592,15 +592,15 @@ const exporter = new BraintrustExporter({
 Custom span formatters support asynchronous operations, enabling use cases like fetching data from external APIs or databases to enrich your spans:
 
 ```ts
-import type { CustomSpanFormatter } from '@mastra/core/observability'
+import type { CustomSpanFormatter } from '@mastra/core/observability';
 
 // Async formatter that enriches spans with user data
 const userEnrichmentFormatter: CustomSpanFormatter = async span => {
-  const userId = span.metadata?.userId
-  if (!userId) return span
+  const userId = span.metadata?.userId;
+  if (!userId) return span;
 
   // Fetch user data from your API or database
-  const userData = await fetchUserData(userId)
+  const userData = await fetchUserData(userId);
 
   return {
     ...span,
@@ -610,15 +610,15 @@ const userEnrichmentFormatter: CustomSpanFormatter = async span => {
       userEmail: userData.email,
       department: userData.department,
     },
-  }
-}
+  };
+};
 
 // Async formatter that looks up additional context
 const contextEnrichmentFormatter: CustomSpanFormatter = async span => {
-  if (span.type !== SpanType.AGENT_RUN) return span
+  if (span.type !== SpanType.AGENT_RUN) return span;
 
   // Fetch experiment configuration
-  const experimentConfig = await getExperimentConfig(span.metadata?.experimentId)
+  const experimentConfig = await getExperimentConfig(span.metadata?.experimentId);
 
   return {
     ...span,
@@ -627,13 +627,13 @@ const contextEnrichmentFormatter: CustomSpanFormatter = async span => {
       experimentVariant: experimentConfig?.variant,
       experimentGroup: experimentConfig?.group,
     },
-  }
-}
+  };
+};
 
 // Use async formatters with an exporter
 const exporter = new BraintrustExporter({
   customSpanFormatter: userEnrichmentFormatter,
-})
+});
 
 // Or chain sync and async formatters together
 const exporter = new LangfuseExporter({
@@ -642,7 +642,7 @@ const exporter = new LangfuseExporter({
     userEnrichmentFormatter, // async
     contextEnrichmentFormatter, // async
   ]),
-})
+});
 ```
 
 :::note
@@ -673,17 +673,17 @@ export const mastra = new Mastra({
       },
     },
   }),
-})
+});
 ```
 
 ### Available options
 
-| Option | Default | Description |
-| - | - | - |
-| `maxStringLength` | 1024 | Maximum length for string values. Longer strings are truncated. |
-| `maxDepth` | 6 | Maximum depth for nested objects. Deeper levels are omitted. |
-| `maxArrayLength` | 50 | Maximum number of items in arrays. Additional items are omitted. |
-| `maxObjectKeys` | 50 | Maximum number of keys in objects. Additional keys are omitted. |
+| Option            | Default | Description                                                      |
+| ----------------- | ------- | ---------------------------------------------------------------- |
+| `maxStringLength` | 1024    | Maximum length for string values. Longer strings are truncated.  |
+| `maxDepth`        | 6       | Maximum depth for nested objects. Deeper levels are omitted.     |
+| `maxArrayLength`  | 50      | Maximum number of items in arrays. Additional items are omitted. |
+| `maxObjectKeys`   | 50      | Maximum number of keys in objects. Additional keys are omitted.  |
 
 ### Use cases
 
@@ -720,14 +720,14 @@ Both `generate` and `stream` methods return the trace ID in their response:
 
 ```ts
 // Using generate
-const result = await agent.generate('Hello')
+const result = await agent.generate('Hello');
 
-console.log('Trace ID:', result.traceId)
+console.log('Trace ID:', result.traceId);
 
 // Using stream
-const streamResult = await agent.stream('Tell me a story')
+const streamResult = await agent.stream('Tell me a story');
 
-console.log('Trace ID:', streamResult.traceId)
+console.log('Trace ID:', streamResult.traceId);
 ```
 
 ### Workflow trace IDs
@@ -736,23 +736,23 @@ Workflow executions also return trace IDs:
 
 ```ts
 // Create a workflow run
-const run = await mastra.getWorkflow('myWorkflow').createRun()
+const run = await mastra.getWorkflow('myWorkflow').createRun();
 
 // Start the workflow
 const result = await run.start({
   inputData: { data: 'process this' },
-})
+});
 
-console.log('Trace ID:', result.traceId)
+console.log('Trace ID:', result.traceId);
 
 // Or stream the workflow
 const { stream, getWorkflowState } = run.stream({
   inputData: { data: 'process this' },
-})
+});
 
 // Get the final state which includes the trace ID
-const finalState = await getWorkflowState()
-console.log('Trace ID:', finalState.traceId)
+const finalState = await getWorkflowState();
+console.log('Trace ID:', finalState.traceId);
 ```
 
 ### Using trace IDs
@@ -776,8 +776,8 @@ Use the `tracingOptions` parameter to specify the trace context from your parent
 
 ```ts
 // Get trace context from your existing tracing system
-const parentTraceId = getCurrentTraceId() // Your tracing system
-const parentSpanId = getCurrentSpanId() // Your tracing system
+const parentTraceId = getCurrentTraceId(); // Your tracing system
+const parentSpanId = getCurrentSpanId(); // Your tracing system
 
 // Execute Mastra operations as part of the parent trace
 const result = await agent.generate('Analyze this data', {
@@ -785,7 +785,7 @@ const result = await agent.generate('Analyze this data', {
     traceId: parentTraceId,
     parentSpanId: parentSpanId,
   },
-})
+});
 
 // The Mastra trace will now appear as a child in your distributed trace
 ```
@@ -795,11 +795,11 @@ const result = await agent.generate('Analyze this data', {
 Integration with OpenTelemetry allows Mastra traces to appear directly in your existing observability platform:
 
 ```ts
-import { trace } from '@opentelemetry/api'
+import { trace } from '@opentelemetry/api';
 
 // Get the current OpenTelemetry span
-const currentSpan = trace.getActiveSpan()
-const spanContext = currentSpan?.spanContext()
+const currentSpan = trace.getActiveSpan();
+const spanContext = currentSpan?.spanContext();
 
 if (spanContext) {
   const result = await agent.generate(userMessage, {
@@ -807,7 +807,7 @@ if (spanContext) {
       traceId: spanContext.traceId,
       parentSpanId: spanContext.spanId,
     },
-  })
+  });
 }
 ```
 
@@ -816,8 +816,8 @@ if (spanContext) {
 Workflows support the same pattern for trace propagation:
 
 ```ts
-const workflow = mastra.getWorkflow('data-pipeline')
-const run = await workflow.createRun()
+const workflow = mastra.getWorkflow('data-pipeline');
+const run = await workflow.createRun();
 
 const result = await run.start({
   inputData: { data: '...' },
@@ -825,7 +825,7 @@ const result = await run.start({
     traceId: externalTraceId,
     parentSpanId: externalSpanId,
   },
-})
+});
 ```
 
 ### ID format requirements
@@ -847,15 +847,15 @@ As a result, tracing never crashes your application, even with malformed input.
 Here's a complete example showing trace propagation in an Express application:
 
 ```ts
-import { trace } from '@opentelemetry/api'
-import express from 'express'
+import { trace } from '@opentelemetry/api';
+import express from 'express';
 
-const app = express()
+const app = express();
 
 app.post('/api/analyze', async (req, res) => {
   // Get current OpenTelemetry context
-  const currentSpan = trace.getActiveSpan()
-  const spanContext = currentSpan?.spanContext()
+  const currentSpan = trace.getActiveSpan();
+  const spanContext = currentSpan?.spanContext();
 
   const result = await agent.generate(req.body.message, {
     tracingOptions: spanContext
@@ -864,10 +864,10 @@ app.post('/api/analyze', async (req, res) => {
           parentSpanId: spanContext.spanId,
         }
       : undefined,
-  })
+  });
 
-  res.json(result)
-})
+  res.json(result);
+});
 ```
 
 This creates a single distributed trace that includes both the HTTP request handling and the Mastra agent execution, viewable in your observability platform of choice.
