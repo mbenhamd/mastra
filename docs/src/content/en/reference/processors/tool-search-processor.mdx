@@ -85,6 +85,27 @@ const toolSearch = new ToolSearchProcessor({
             default: 'false',
           },
           {
+            name: 'budget',
+            type: '{ maxToolCount?: number; maxToolSchemaBytes?: number }',
+            description:
+              'Optional cumulative limits for dynamically loaded tools. A search or load that would exceed either limit is refused atomically, while tools already loaded remain available.',
+            isOptional: true,
+          },
+          {
+            name: 'budget.maxToolCount',
+            type: 'number',
+            description:
+              'Maximum number of distinct dynamically loaded tools in the complete loaded set. Must be a non-negative safe integer.',
+            isOptional: true,
+          },
+          {
+            name: 'budget.maxToolSchemaBytes',
+            type: 'number',
+            description:
+              'Maximum cumulative UTF-8 bytes for dynamically loaded tool definitions. Must be a non-negative safe integer.',
+            isOptional: true,
+          },
+          {
             name: 'storage',
             type: "'in-memory' | 'context'",
             description:
@@ -221,6 +242,8 @@ The `phase` value describes where the filter is being applied:
 
 If the hook throws or rejects, `ToolSearchProcessor` treats the tool as disallowed for that request. The hook may run for every matching search candidate, so keep async policy checks cheap or cached. The `search_tools` meta-tool is always available. `load_tool` is available unless `search.autoLoad` is enabled. Tools passed directly through the agent or `processInputStep` remain available unless you filter them outside `ToolSearchProcessor`, or enable `includeResolvedTools`.
 
+In `storage: 'context'` mode, retained activation receipts are rechecked in the `load` phase before they consume cumulative budget. A receipt denied by current load policy is neither injected nor charged. A load-authorized tool hidden only by the `active` phase still consumes budget because active filtering doesn't unload it.
+
 ## Searching request-resolved tools
 
 The `tools` option is fixed at construction, so you can't list tools that only exist per request (MCP tools that need the caller's credentials, or anything returned by a dynamic `tools` function). By default those tools bypass search and occupy prompt space on every turn.
@@ -314,6 +337,31 @@ With `autoLoad` the workflow becomes:
 1. Agent uses the tool normally
 
 Every match is activated, so keep `topK` small (for example, `3`) to avoid adding tools the agent didn't need. Activated tools are appended after existing tools, which keeps the cached prompt prefix stable for providers that support prompt caching.
+
+## Cumulative loaded-tool budgets
+
+`search.topK` limits one search result, but tools loaded by multiple searches are additive. Use `budget` when the complete loaded set must stay within a count or serialized-schema limit:
+
+```typescript
+const toolSearch = new ToolSearchProcessor({
+  tools: allTools,
+  search: { topK: 3, autoLoad: true },
+  budget: {
+    maxToolCount: 12,
+    maxToolSchemaBytes: 32_768,
+  },
+})
+```
+
+Both limits apply only to tools loaded through ToolSearch. They don't count the ToolSearch meta-tools or tools kept eagerly available outside the searchable catalog. `maxToolSchemaBytes` measures the UTF-8 byte length of a JSON array containing each loaded tool's callable `name`, normalized draft-07 input `schema`, and `description` when present. It excludes output schemas, provider-specific options, and executable state. For request-resolved CoreTools, measurement uses the input schema available at the processor boundary, including any model compatibility rewrite applied before input processors run.
+
+Limits are checked against the full loaded set before state is changed. A batch that would exceed either limit is refused as a whole. ToolSearch never loads a prefix of an over-budget batch. In `autoLoad` mode, `search_tools` still returns the discovery results but omits its activation receipt. Both meta-tools return a structured `budget` refusal with the violated `tool_count` or `tool_schema_bytes` metric, configured limit, current usage, attempted increase, and resulting usage. Explicit `load_tool` refusals also return `success: false`.
+
+If a candidate input schema can't be converted or serialized safely, the operation returns `budget.code: 'tool_search_budget_measurement_failed'` and loads nothing. Request-resolved tools may replace the schema of an admitted name. An unmeasurable replacement stops the processor before model input instead of being treated as zero bytes.
+
+Loaded names continue consuming the count budget when they're absent from a later request's searchable catalog. With a schema-byte limit, an unresolved loaded name also stops processing because its cumulative byte usage can't be measured safely.
+
+Loading a tool that's already active remains successful at the limit because it doesn't increase usage. If reconstructed conversation or in-memory state already exceeds a newly configured budget, input processing and resume fail instead of silently removing tools. Set either limit to `0` to prohibit dynamic loading along that dimension. Omitting `budget`, or omitting one of its fields, preserves the unbounded behavior for that dimension.
 
 ## Loaded-tool storage
 

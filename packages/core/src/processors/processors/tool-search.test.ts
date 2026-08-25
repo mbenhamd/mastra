@@ -1,10 +1,14 @@
+import { jsonSchema } from '@internal/ai-sdk-v5';
 import { describe, it, expect, beforeEach } from 'vitest';
+import { z } from 'zod/v4';
 
 import { MessageList } from '../../agent/message-list';
 import type { MastraDBMessage } from '../../agent/message-list';
 import { RequestContext, MASTRA_THREAD_ID_KEY } from '../../request-context';
+import { standardSchemaToJSONSchema, toStandardSchema } from '../../schema';
+import type { PublicSchema } from '../../schema';
 import { createTool } from '../../tools';
-import type { Tool } from '../../tools';
+import type { CoreTool, Tool } from '../../tools';
 import type { ProcessInputStepArgs } from '../index';
 import { ToolSearchProcessor } from './tool-search';
 
@@ -20,7 +24,7 @@ function createMockTool(id: string, description: string): Tool<any, any> {
 // Helper to create ProcessInputStepArgs
 function createMockArgs(
   threadId?: string,
-  tools?: Record<string, Tool<any, any>>,
+  tools?: Record<string, unknown>,
   options: {
     messages?: MastraDBMessage[];
     state?: Record<string, unknown>;
@@ -105,6 +109,548 @@ describe('ToolSearchProcessor', () => {
       });
 
       expect(processor).toBeDefined();
+    });
+
+    it('should reject invalid cumulative budget limits', () => {
+      expect(() => new ToolSearchProcessor({ tools: {}, budget: { maxToolCount: -1 } })).toThrow(
+        'budget.maxToolCount must be a non-negative safe integer',
+      );
+      expect(() => new ToolSearchProcessor({ tools: {}, budget: { maxToolSchemaBytes: 1.5 } })).toThrow(
+        'budget.maxToolSchemaBytes must be a non-negative safe integer',
+      );
+    });
+  });
+
+  describe('cumulative loaded-tool budgets', () => {
+    it('refuses a new tool at the count limit while allowing an already-loaded tool', async () => {
+      const processor = new ToolSearchProcessor({
+        tools: {
+          weather: createMockTool('weather', 'Get weather'),
+          calendar: createMockTool('calendar', 'Manage calendar'),
+        },
+        budget: { maxToolCount: 1 },
+      });
+
+      const first = await processor.processInputStep(createMockArgs('thread-count-budget'));
+      expect(await first.tools?.load_tool!.execute?.({ toolName: 'weather' }, undefined)).toMatchObject({
+        success: true,
+        loaded: ['weather'],
+      });
+      expect(await first.tools?.load_tool!.execute?.({ toolName: 'weather' }, undefined)).toMatchObject({
+        success: true,
+        loaded: ['weather'],
+      });
+
+      const refused = await first.tools?.load_tool!.execute?.({ toolName: 'calendar' }, undefined);
+      expect(refused).toMatchObject({
+        success: false,
+        loadedCount: 0,
+        toolName: 'calendar',
+        budget: {
+          code: 'tool_search_budget_exceeded',
+          violations: [{ metric: 'tool_count', limit: 1, current: 1, attempted: 1, next: 2 }],
+        },
+      });
+
+      const next = await processor.processInputStep(createMockArgs('thread-count-budget'));
+      expect(next.tools?.weather).toBeDefined();
+      expect(next.tools?.calendar).toBeUndefined();
+    });
+
+    it('refuses an auto-load search when cumulative schema bytes would exceed the limit', async () => {
+      const processor = new ToolSearchProcessor({
+        tools: {
+          weather: createMockTool('weather', 'Get weather'),
+          calendar: createTool({
+            id: 'calendar',
+            description: 'Manage calendar',
+            inputSchema: z.object({ notes: z.string().describe('x'.repeat(1_024)) }),
+            execute: async () => ({ success: true }),
+          }),
+        },
+        search: { autoLoad: true, topK: 1 },
+        budget: { maxToolSchemaBytes: 512 },
+      });
+
+      const first = await processor.processInputStep(createMockArgs('thread-schema-budget'));
+      const loaded = await first.tools?.search_tools!.execute?.({ query: 'weather' }, undefined);
+      expect(loaded.activation?.loaded).toEqual(['weather']);
+
+      const refused = await first.tools?.search_tools!.execute?.({ query: 'calendar' }, undefined);
+      expect(refused.results.map((result: any) => result.name)).toEqual(['calendar']);
+      expect(refused.activation).toBeUndefined();
+      expect(refused.budget).toMatchObject({
+        code: 'tool_search_budget_exceeded',
+        violations: [{ metric: 'tool_schema_bytes', limit: 512 }],
+      });
+      expect(refused.budget.violations[0].current).toBeGreaterThan(0);
+      expect(refused.budget.violations[0].next).toBeGreaterThan(512);
+
+      const next = await processor.processInputStep(createMockArgs('thread-schema-budget'));
+      expect(next.tools?.weather).toBeDefined();
+      expect(next.tools?.calendar).toBeUndefined();
+    });
+
+    it('refuses an over-budget multi-load atomically', async () => {
+      const processor = new ToolSearchProcessor({
+        tools: {
+          weather: createMockTool('weather', 'Get weather'),
+          calendar: createMockTool('calendar', 'Manage calendar'),
+        },
+        budget: { maxToolCount: 1 },
+      });
+
+      const first = await processor.processInputStep(createMockArgs('thread-atomic-budget'));
+      const refused = await first.tools?.load_tool!.execute?.({ toolNames: ['weather', 'calendar'] }, undefined);
+
+      expect(refused).toMatchObject({
+        success: false,
+        loadedCount: 0,
+        budget: {
+          code: 'tool_search_budget_exceeded',
+          violations: [{ metric: 'tool_count', limit: 1, current: 0, attempted: 2, next: 2 }],
+        },
+      });
+      const next = await processor.processInputStep(createMockArgs('thread-atomic-budget'));
+      expect(next.tools?.weather).toBeUndefined();
+      expect(next.tools?.calendar).toBeUndefined();
+    });
+
+    it('counts loaded request-resolved names that are absent from a later catalog', async () => {
+      for (const storage of ['in-memory', 'context'] as const) {
+        const processor = new ToolSearchProcessor({
+          tools: {},
+          includeResolvedTools: true,
+          storage,
+          budget: { maxToolCount: 1 },
+        });
+        const state: Record<string, unknown> = {};
+        const weather = createMockTool('weather', 'Get weather');
+        const calendar = createMockTool('calendar', 'Manage calendar');
+
+        const first = await processor.processInputStep(
+          createMockArgs(`thread-resolved-count-${storage}`, { weather }, { state }),
+        );
+        expect(await first.tools?.load_tool!.execute?.({ toolName: 'weather' }, undefined)).toMatchObject({
+          success: true,
+          loaded: ['weather'],
+        });
+
+        const second = await processor.processInputStep(
+          createMockArgs(`thread-resolved-count-${storage}`, { calendar }, { state }),
+        );
+        expect(await second.tools?.load_tool!.execute?.({ toolName: 'calendar' }, undefined)).toMatchObject({
+          success: false,
+          budget: {
+            code: 'tool_search_budget_exceeded',
+            violations: [{ metric: 'tool_count', limit: 1, current: 1, attempted: 1, next: 2 }],
+          },
+        });
+      }
+    });
+
+    it('fails closed when a byte-limited loaded name is absent from the current catalog', async () => {
+      for (const storage of ['in-memory', 'context'] as const) {
+        const processor = new ToolSearchProcessor({
+          tools: {},
+          includeResolvedTools: true,
+          storage,
+          budget: { maxToolSchemaBytes: Number.MAX_SAFE_INTEGER },
+        });
+        const state: Record<string, unknown> = {};
+
+        const first = await processor.processInputStep(
+          createMockArgs(
+            `thread-unresolved-schema-${storage}`,
+            { weather: createMockTool('weather', 'Get weather') },
+            { state },
+          ),
+        );
+        expect(await first.tools?.load_tool!.execute?.({ toolName: 'weather' }, undefined)).toMatchObject({
+          success: true,
+          loaded: ['weather'],
+        });
+
+        await expect(
+          processor.processInputStep(
+            createMockArgs(
+              `thread-unresolved-schema-${storage}`,
+              { calendar: createMockTool('calendar', 'Manage calendar') },
+              { state },
+            ),
+          ),
+        ).rejects.toThrow('cannot measure loaded tool "weather" because it is absent');
+      }
+    });
+
+    it('measures the current request-resolved CoreTool schema', async () => {
+      const resolvedTool = (schemaDescription: string): CoreTool => ({
+        description: 'Get weather',
+        parameters: jsonSchema({
+          type: 'object',
+          properties: {
+            location: { type: 'string', description: schemaDescription },
+          },
+          required: ['location'],
+          additionalProperties: false,
+        }),
+        execute: async () => ({ success: true }),
+      });
+      const processor = new ToolSearchProcessor({
+        tools: {},
+        includeResolvedTools: true,
+        budget: { maxToolSchemaBytes: 512 },
+      });
+
+      const first = await processor.processInputStep(
+        createMockArgs('thread-resolved-budget', { weather: resolvedTool('City name') }),
+      );
+      expect(await first.tools?.load_tool!.execute?.({ toolName: 'weather' }, undefined)).toMatchObject({
+        success: true,
+        loaded: ['weather'],
+      });
+
+      await expect(
+        processor.processInputStep(
+          createMockArgs('thread-resolved-budget', { weather: resolvedTool('x'.repeat(1_024)) }),
+        ),
+      ).rejects.toThrow(/schema bytes .*\/512/);
+    });
+
+    it('uses the documented serialized projection and admits at the exact byte limit', async () => {
+      const rawSchema = {
+        type: 'object',
+        properties: { city: { type: 'string' } },
+        required: ['city'],
+        additionalProperties: false,
+      } as const;
+      const weather: CoreTool = {
+        description: 'Get weather',
+        parameters: { jsonSchema: rawSchema } as CoreTool['parameters'],
+        execute: async () => ({ success: true }),
+      };
+      const normalizedSchema = standardSchemaToJSONSchema(toStandardSchema(rawSchema as PublicSchema), {
+        io: 'input',
+        target: 'draft-07',
+      });
+      const expectedBytes = new TextEncoder().encode(
+        JSON.stringify([{ name: 'weather', schema: normalizedSchema, description: 'Get weather' }]),
+      ).byteLength;
+      const createProcessor = (maxToolSchemaBytes: number) =>
+        new ToolSearchProcessor({
+          tools: {},
+          includeResolvedTools: true,
+          budget: { maxToolSchemaBytes },
+        });
+
+      const belowLimit = createProcessor(expectedBytes - 1);
+      const refusedStep = await belowLimit.processInputStep(createMockArgs('thread-exact-byte-refusal', { weather }));
+      const refusal = await refusedStep.tools?.load_tool!.execute?.({ toolName: 'weather' }, undefined);
+      expect(refusal).toMatchObject({
+        success: false,
+        budget: {
+          code: 'tool_search_budget_exceeded',
+          violations: [{ metric: 'tool_schema_bytes', next: expectedBytes }],
+        },
+      });
+
+      const exactLimit = createProcessor(expectedBytes);
+      const admittedStep = await exactLimit.processInputStep(
+        createMockArgs('thread-exact-byte-admission', { weather }),
+      );
+      expect(await admittedStep.tools?.load_tool!.execute?.({ toolName: 'weather' }, undefined)).toMatchObject({
+        success: true,
+        loaded: ['weather'],
+      });
+    });
+
+    it('measures callable Standard Schemas without invoking them as factories', async () => {
+      const { type } = await import('arktype');
+      const processor = new ToolSearchProcessor({
+        tools: {
+          weather: createTool({
+            id: 'weather',
+            description: 'Get weather',
+            inputSchema: type({ city: 'string' }),
+            execute: async () => ({ success: true }),
+          }),
+        },
+        budget: { maxToolSchemaBytes: 1_024 },
+      });
+
+      const first = await processor.processInputStep(createMockArgs('thread-callable-standard-schema'));
+      expect(await first.tools?.load_tool!.execute?.({ toolName: 'weather' }, undefined)).toMatchObject({
+        success: true,
+        loaded: ['weather'],
+      });
+    });
+
+    it('returns a structured refusal when a candidate schema cannot be measured', async () => {
+      const circularSchema: Record<string, unknown> = { type: 'object' };
+      circularSchema.self = circularSchema;
+      const brokenTool: CoreTool = {
+        description: 'Broken weather schema',
+        parameters: circularSchema as any,
+        execute: async () => ({ success: true }),
+      };
+      const processor = new ToolSearchProcessor({
+        tools: {},
+        includeResolvedTools: true,
+        budget: { maxToolSchemaBytes: 512 },
+      });
+
+      const first = await processor.processInputStep(
+        createMockArgs('thread-unmeasurable-candidate', { weather: brokenTool }),
+      );
+      const refused = await first.tools?.load_tool!.execute?.({ toolName: 'weather' }, undefined);
+
+      expect(refused).toMatchObject({
+        success: false,
+        loadedCount: 0,
+        budget: {
+          code: 'tool_search_budget_measurement_failed',
+          metric: 'tool_schema_bytes',
+        },
+      });
+      const next = await processor.processInputStep(
+        createMockArgs('thread-unmeasurable-candidate', { weather: brokenTool }),
+      );
+      expect(next.tools?.weather).toBeUndefined();
+    });
+
+    it('measures schemas when the configured byte limit is the largest safe integer', async () => {
+      const circularSchema: Record<string, unknown> = { type: 'object' };
+      circularSchema.self = circularSchema;
+      const brokenTool: CoreTool = {
+        description: 'Broken weather schema',
+        parameters: circularSchema as any,
+        execute: async () => ({ success: true }),
+      };
+      const processor = new ToolSearchProcessor({
+        tools: {},
+        includeResolvedTools: true,
+        budget: { maxToolSchemaBytes: Number.MAX_SAFE_INTEGER },
+      });
+
+      const first = await processor.processInputStep(
+        createMockArgs('thread-largest-safe-byte-budget', { weather: brokenTool }),
+      );
+
+      await expect(first.tools?.load_tool!.execute?.({ toolName: 'weather' }, undefined)).resolves.toMatchObject({
+        success: false,
+        loadedCount: 0,
+        budget: {
+          code: 'tool_search_budget_measurement_failed',
+          metric: 'tool_schema_bytes',
+        },
+      });
+    });
+
+    it('does not inspect schemas when only the count budget is configured', async () => {
+      const circularSchema: Record<string, unknown> = { type: 'object' };
+      circularSchema.self = circularSchema;
+      const brokenTool: CoreTool = {
+        description: 'Broken weather schema',
+        parameters: circularSchema as any,
+        execute: async () => ({ success: true }),
+      };
+      const processor = new ToolSearchProcessor({
+        tools: {},
+        includeResolvedTools: true,
+        budget: { maxToolCount: 1 },
+      });
+
+      const first = await processor.processInputStep(
+        createMockArgs('thread-count-only-budget', { weather: brokenTool }),
+      );
+      expect(await first.tools?.load_tool!.execute?.({ toolName: 'weather' }, undefined)).toMatchObject({
+        success: true,
+        loaded: ['weather'],
+      });
+    });
+
+    it('fails before provider input when an admitted schema can no longer be measured', async () => {
+      const circularSchema: Record<string, unknown> = { type: 'object' };
+      circularSchema.self = circularSchema;
+      const brokenTool: CoreTool = {
+        description: 'Broken weather schema',
+        parameters: circularSchema as any,
+        execute: async () => ({ success: true }),
+      };
+      const processor = new ToolSearchProcessor({
+        tools: {},
+        includeResolvedTools: true,
+        storage: 'context',
+        budget: { maxToolSchemaBytes: 512 },
+      });
+      const messages = [createToolResultMessage('load_tool', { success: true, loaded: ['weather'] })];
+
+      await expect(
+        processor.processInputStep(createMockArgs('thread-unmeasurable-replay', { weather: brokenTool }, { messages })),
+      ).rejects.toThrow();
+    });
+
+    it('does not charge a context receipt denied by load policy', async () => {
+      const phases: string[] = [];
+      const circularSchema: Record<string, unknown> = { type: 'object' };
+      circularSchema.self = circularSchema;
+      const brokenTool: CoreTool = {
+        description: 'Broken weather schema',
+        parameters: circularSchema as any,
+        execute: async () => ({ success: true }),
+      };
+      const processor = new ToolSearchProcessor({
+        tools: {},
+        includeResolvedTools: true,
+        storage: 'context',
+        budget: { maxToolCount: 0, maxToolSchemaBytes: 0 },
+        filter: ({ phase }) => {
+          phases.push(phase);
+          return phase !== 'load';
+        },
+      });
+      const messages = [createToolResultMessage('load_tool', { success: true, loaded: ['weather'] })];
+
+      const result = await processor.processInputStep(
+        createMockArgs('thread-denied-receipt-budget', { weather: brokenTool }, { messages }),
+      );
+
+      expect(result.tools?.weather).toBeUndefined();
+      expect(phases).toEqual(['load']);
+    });
+
+    it('charges a load-authorized receipt even when active policy hides it', async () => {
+      const processor = new ToolSearchProcessor({
+        tools: { weather: createMockTool('weather', 'Get weather') },
+        storage: 'context',
+        budget: { maxToolCount: 0 },
+        filter: ({ phase }) => phase !== 'active',
+      });
+      const messages = [createToolResultMessage('load_tool', { success: true, loaded: ['weather'] })];
+
+      await expect(
+        processor.processInputStep(createMockArgs('thread-active-hidden-budget', undefined, { messages })),
+      ).rejects.toThrow('loaded state exceeds its cumulative budget (tool count 1/0)');
+    });
+
+    it('frees context-backed capacity when an activation receipt leaves the messages', async () => {
+      const processor = new ToolSearchProcessor({
+        tools: {
+          weather: createMockTool('weather', 'Get weather'),
+          calendar: createMockTool('calendar', 'Manage calendar'),
+        },
+        storage: 'context',
+        budget: { maxToolCount: 1 },
+      });
+      const withWeather = [createToolResultMessage('load_tool', { success: true, loaded: ['weather'] })];
+      const loaded = await processor.processInputStep(
+        createMockArgs('thread-edited-budget', undefined, { messages: withWeather }),
+      );
+      expect(loaded.tools?.weather).toBeDefined();
+
+      const editedArgs = createMockArgs('thread-edited-budget');
+      const edited = await processor.processInputStep(editedArgs);
+      expect(edited.tools?.weather).toBeUndefined();
+      expect(await edited.tools?.load_tool!.execute?.({ toolName: 'calendar' }, undefined)).toMatchObject({
+        success: true,
+        loaded: ['calendar'],
+      });
+    });
+
+    it('measures schema limits in UTF-8 bytes', async () => {
+      const createDescriptionProcessor = (description: string) =>
+        new ToolSearchProcessor({
+          tools: { weather: createMockTool('weather', description) },
+          search: { autoLoad: true, topK: 1 },
+          budget: { maxToolSchemaBytes: 512 },
+        });
+
+      const ascii = createDescriptionProcessor(`Weather ${'a'.repeat(200)}`);
+      const asciiStep = await ascii.processInputStep(createMockArgs('thread-ascii-budget'));
+      const asciiResult = await asciiStep.tools?.search_tools!.execute?.({ query: 'weather' }, undefined);
+      expect(asciiResult.activation?.loaded).toEqual(['weather']);
+
+      const unicode = createDescriptionProcessor(`Weather ${'😀'.repeat(200)}`);
+      const unicodeStep = await unicode.processInputStep(createMockArgs('thread-unicode-budget'));
+      const unicodeResult = await unicodeStep.tools?.search_tools!.execute?.({ query: 'weather' }, undefined);
+      expect(unicodeResult.activation).toBeUndefined();
+      expect(unicodeResult.budget).toMatchObject({
+        code: 'tool_search_budget_exceeded',
+        violations: [{ metric: 'tool_schema_bytes', limit: 512 }],
+      });
+    });
+
+    it('serializes concurrent admissions within each loaded-state scope', async () => {
+      for (const storage of ['in-memory', 'context'] as const) {
+        const processor = new ToolSearchProcessor({
+          tools: {
+            weather: createMockTool('weather', 'Get weather'),
+            calendar: createMockTool('calendar', 'Manage calendar'),
+          },
+          storage,
+          budget: { maxToolCount: 1 },
+        });
+
+        const args = createMockArgs(`thread-concurrent-budget-${storage}`);
+        const first = await processor.processInputStep(args);
+        const results = await Promise.all([
+          first.tools?.load_tool!.execute?.({ toolName: 'weather' }, undefined),
+          first.tools?.load_tool!.execute?.({ toolName: 'calendar' }, undefined),
+        ]);
+
+        expect(results.filter(result => result?.success === true)).toHaveLength(1);
+        expect(results.filter(result => result?.budget?.code === 'tool_search_budget_exceeded')).toHaveLength(1);
+
+        const next = await processor.processInputStep(args);
+        expect([next.tools?.weather, next.tools?.calendar].filter(Boolean)).toHaveLength(1);
+      }
+    });
+
+    it('does not reauthorize existing context-loaded tools during admission when no budget is configured', async () => {
+      const loadChecks: string[] = [];
+      const processor = new ToolSearchProcessor({
+        tools: {
+          weather: createMockTool('weather', 'Get weather'),
+          calendar: createMockTool('calendar', 'Manage calendar'),
+        },
+        storage: 'context',
+        filter: ({ toolName, phase }) => {
+          if (phase === 'load') loadChecks.push(toolName);
+          return true;
+        },
+      });
+      const step = await processor.processInputStep(createMockArgs('thread-unbounded-admission'));
+
+      await expect(step.tools?.load_tool!.execute?.({ toolName: 'weather' }, undefined)).resolves.toMatchObject({
+        success: true,
+      });
+      await expect(step.tools?.load_tool!.execute?.({ toolName: 'calendar' }, undefined)).resolves.toMatchObject({
+        success: true,
+      });
+
+      expect(loadChecks).toEqual(['weather', 'calendar']);
+    });
+
+    it('fails closed when reconstructed context already exceeds the configured budget', async () => {
+      const processor = new ToolSearchProcessor({
+        tools: {
+          weather: createMockTool('weather', 'Get weather'),
+          calendar: createMockTool('calendar', 'Manage calendar'),
+        },
+        storage: 'context',
+        budget: { maxToolCount: 1 },
+      });
+      const messages = [
+        createToolResultMessage('load_tool', { success: true, loaded: ['weather'] }),
+        createToolResultMessage('load_tool', { success: true, loaded: ['calendar'] }),
+      ];
+
+      await expect(
+        processor.processInputStep(createMockArgs('thread-replay-budget', undefined, { messages })),
+      ).rejects.toThrow('loaded state exceeds its cumulative budget (tool count 2/1)');
+      await expect(processor.getLoadedToolsForRequestContext({ messages })).rejects.toThrow(
+        'loaded state exceeds its cumulative budget (tool count 2/1)',
+      );
     });
   });
 

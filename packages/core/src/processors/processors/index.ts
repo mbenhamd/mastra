@@ -77,6 +77,7 @@ export { AgentsMDInjector, type ToolResultReminderOptions, type ReminderFileRead
 
 export {
   ToolSearchProcessor,
+  type ToolSearchBudgetOptions,
   type ToolSearchFilterArgs,
   type ToolSearchFilterPhase,
   type ToolSearchProcessorOptions,

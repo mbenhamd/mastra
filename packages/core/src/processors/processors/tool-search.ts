@@ -2,8 +2,10 @@ import { z } from 'zod/v4';
 import { parseMemoryRequestContext } from '../../memory/types';
 import { MASTRA_THREAD_ID_KEY } from '../../request-context';
 import type { RequestContext } from '../../request-context';
+import { isStandardSchemaWithJSON, standardSchemaToJSONSchema, toStandardSchema } from '../../schema';
+import type { PublicSchema } from '../../schema';
 import { createTool } from '../../tools';
-import type { Tool } from '../../tools';
+import type { CoreTool, Tool } from '../../tools';
 import { BM25Index } from '../../workspace/search/bm25';
 import type { TokenizeOptions } from '../../workspace/search/bm25';
 import type { ProcessInputStepArgs, Processor } from '../index';
@@ -24,6 +26,19 @@ export type ToolSearchFilterArgs = {
   requestContext?: RequestContext;
   phase: ToolSearchFilterPhase;
 };
+
+export interface ToolSearchBudgetOptions {
+  /** Maximum number of distinct dynamically loaded tools. */
+  maxToolCount?: number;
+  /**
+   * Maximum cumulative UTF-8 bytes for loaded tool definitions.
+   *
+   * The serialized catalog contains each callable name, description when
+   * present, and normalized input JSON Schema at the processor boundary. It
+   * intentionally excludes output schemas and executable implementation state.
+   */
+  maxToolSchemaBytes?: number;
+}
 
 /**
  * Configuration options for ToolSearchProcessor
@@ -86,6 +101,18 @@ export interface ToolSearchProcessorOptions {
   };
 
   /**
+   * Optional cumulative limits for dynamically loaded tools.
+   *
+   * Unlike `search.topK`, which limits one search result, these limits apply to
+   * the complete loaded set reconstructed for the run. A search or load that
+   * would exceed either limit is rejected atomically; tools that were already
+   * loaded remain available. Existing loaded state that already exceeds a
+   * configured limit fails the processor step instead of silently dropping
+   * tools.
+   */
+  budget?: ToolSearchBudgetOptions;
+
+  /**
    * Where loaded-tool state lives. The `'context'` store is opt-in.
    *
    * - `'in-memory'` (default): the original behavior — loaded state lives in an
@@ -126,6 +153,74 @@ interface SearchResult {
   name: string;
   description: string;
   score: number;
+}
+
+type ToolSearchBudgetMetric = 'tool_count' | 'tool_schema_bytes';
+
+type ToolSearchBudgetViolation = {
+  metric: ToolSearchBudgetMetric;
+  limit: number;
+  current: number;
+  attempted: number;
+  next: number;
+};
+
+type ToolSearchBudgetExceeded = {
+  code: 'tool_search_budget_exceeded';
+  violations: ToolSearchBudgetViolation[];
+};
+
+type ToolSearchBudgetRefusal =
+  | ToolSearchBudgetExceeded
+  | {
+      code: 'tool_search_budget_measurement_failed';
+      metric: 'tool_schema_bytes';
+    };
+
+const TOOL_SEARCH_BUDGET_REFUSAL_SCHEMA = z.discriminatedUnion('code', [
+  z.object({
+    code: z.literal('tool_search_budget_exceeded'),
+    violations: z.array(
+      z.object({
+        metric: z.enum(['tool_count', 'tool_schema_bytes']),
+        limit: z.number(),
+        current: z.number(),
+        attempted: z.number(),
+        next: z.number(),
+      }),
+    ),
+  }),
+  z.object({
+    code: z.literal('tool_search_budget_measurement_failed'),
+    metric: z.literal('tool_schema_bytes'),
+  }),
+]);
+
+const EMPTY_TOOL_INPUT_SCHEMA = Object.freeze({
+  type: 'object',
+  properties: Object.freeze({}),
+  additionalProperties: false,
+});
+
+const UTF8_ENCODER = new TextEncoder();
+
+function normalizeBudgetLimit(name: keyof ToolSearchBudgetOptions, value: number | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`ToolSearchProcessor budget.${name} must be a non-negative safe integer.`);
+  }
+  return value;
+}
+
+function normalizeBudget(options: ToolSearchBudgetOptions | undefined): ToolSearchBudgetOptions | undefined {
+  if (!options) return undefined;
+  const maxToolCount = normalizeBudgetLimit('maxToolCount', options.maxToolCount);
+  const maxToolSchemaBytes = normalizeBudgetLimit('maxToolSchemaBytes', options.maxToolSchemaBytes);
+  if (maxToolCount === undefined && maxToolSchemaBytes === undefined) return undefined;
+  return {
+    ...(maxToolCount !== undefined ? { maxToolCount } : {}),
+    ...(maxToolSchemaBytes !== undefined ? { maxToolSchemaBytes } : {}),
+  };
 }
 
 /**
@@ -249,7 +344,14 @@ export class ToolSearchProcessor implements Processor<'tool-search'> {
 
   private includeResolvedTools: boolean;
   private searchConfig: Required<NonNullable<ToolSearchProcessorOptions['search']>>;
+  private budget?: ToolSearchBudgetOptions;
   private filter?: ToolSearchProcessorOptions['filter'];
+
+  /** Serialized input schemas are immutable after tool registration. */
+  private convertedInputSchemaCache = new WeakMap<object, unknown>();
+
+  /** Serializes concurrent search/load admissions for one loaded-state scope. */
+  private admissionTails = new Map<string | object, Promise<void>>();
 
   /** Context-backed receipts are durable evidence, not authorization credentials. */
   private reauthorizeLoadedNames: boolean;
@@ -262,6 +364,7 @@ export class ToolSearchProcessor implements Processor<'tool-search'> {
 
   constructor(options: ToolSearchProcessorOptions) {
     this.includeResolvedTools = options.includeResolvedTools ?? false;
+    this.budget = normalizeBudget(options.budget);
     this.filter = options.filter;
     this.searchConfig = {
       topK: options.search?.topK ?? 5,
@@ -301,6 +404,210 @@ export class ToolSearchProcessor implements Processor<'tool-search'> {
 
   private makeStoreContext(args: ProcessInputStepArgs): LoadedToolStoreContext {
     return { threadId: this.getThreadId(args), args };
+  }
+
+  private async withAdmissionLock<T>(ctx: LoadedToolStoreContext, operation: () => Promise<T>): Promise<T> {
+    // Context-backed state is intentionally request-local, even when two runs
+    // share a thread ID. Lock by that state object so parallel tool calls in one
+    // run are atomic without queueing independent or anonymous requests behind
+    // each other. The in-memory store is thread-scoped and uses its store key.
+    const lockKey =
+      this.store instanceof ContextLoadedToolStore && ctx.args ? ctx.args.state : (ctx.threadId ?? 'default');
+    const previous = this.admissionTails.get(lockKey) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    this.admissionTails.set(lockKey, current);
+
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.admissionTails.get(lockKey) === current) {
+        this.admissionTails.delete(lockKey);
+      }
+    }
+  }
+
+  private inputSchemaForBudget(tool: Tool<any, any> | CoreTool): unknown {
+    const schemaHolder = 'inputSchema' in tool ? tool.inputSchema : 'parameters' in tool ? tool.parameters : undefined;
+    const cacheKey =
+      (typeof schemaHolder === 'object' && schemaHolder !== null) || typeof schemaHolder === 'function'
+        ? (schemaHolder as object)
+        : undefined;
+    if (cacheKey) {
+      const cached = this.convertedInputSchemaCache.get(cacheKey);
+      if (cached !== undefined) return cached;
+    }
+
+    let inputSchema: unknown = schemaHolder;
+    if (typeof inputSchema === 'function' && !isStandardSchemaWithJSON(inputSchema)) inputSchema = inputSchema();
+    if (typeof inputSchema === 'object' && inputSchema !== null && 'jsonSchema' in inputSchema) {
+      inputSchema = (inputSchema as { jsonSchema?: unknown }).jsonSchema;
+      if (typeof inputSchema === 'function' && !isStandardSchemaWithJSON(inputSchema)) inputSchema = inputSchema();
+    }
+    if (!inputSchema) return EMPTY_TOOL_INPUT_SCHEMA;
+
+    const converted = standardSchemaToJSONSchema(toStandardSchema(inputSchema as PublicSchema), {
+      io: 'input',
+      target: 'draft-07',
+    });
+    if (cacheKey) this.convertedInputSchemaCache.set(cacheKey, converted);
+    return converted;
+  }
+
+  private toolSchemaProjection(
+    toolName: string,
+    tool: Tool<any, any> | CoreTool,
+  ): {
+    name: string;
+    schema: unknown;
+    description?: string;
+  } {
+    return {
+      name: toolName,
+      schema: this.inputSchemaForBudget(tool),
+      ...(typeof tool.description === 'string' ? { description: tool.description } : {}),
+    };
+  }
+
+  private budgetUsage(catalog: ToolCatalog, names: ReadonlySet<string>): { toolCount: number; schemaBytes: number } {
+    const measureSchemaBytes = this.budget?.maxToolSchemaBytes !== undefined;
+    const tools: Array<{ name: string; schema: unknown; description?: string }> = [];
+    let toolCount = 0;
+    for (const name of names) {
+      toolCount += 1;
+      const tool = this.findToolForDynamicName(catalog, name);
+      if (!tool) {
+        if (measureSchemaBytes) {
+          throw new Error(
+            `ToolSearchProcessor cannot measure loaded tool "${name}" because it is absent from the current searchable catalog.`,
+          );
+        }
+        continue;
+      }
+      if (measureSchemaBytes) tools.push(this.toolSchemaProjection(name, tool));
+    }
+
+    let schemaBytes = 0;
+    if (tools.length > 0 && measureSchemaBytes) {
+      const serialized = JSON.stringify(tools);
+      if (typeof serialized !== 'string') {
+        throw new Error('ToolSearchProcessor could not serialize the loaded tool catalog for budget enforcement.');
+      }
+      schemaBytes = UTF8_ENCODER.encode(serialized).byteLength;
+    }
+    return { toolCount, schemaBytes };
+  }
+
+  private checkBudget(
+    catalog: ToolCatalog,
+    currentNames: ReadonlySet<string>,
+    namesToAdd: readonly string[],
+  ): ToolSearchBudgetExceeded | undefined {
+    if (!this.budget) return undefined;
+
+    const nextNames = new Set(currentNames);
+    for (const name of namesToAdd) nextNames.add(name);
+
+    const current = this.budgetUsage(catalog, currentNames);
+    const next = this.budgetUsage(catalog, nextNames);
+    const violations: ToolSearchBudgetViolation[] = [];
+
+    if (this.budget.maxToolCount !== undefined && next.toolCount > this.budget.maxToolCount) {
+      violations.push({
+        metric: 'tool_count',
+        limit: this.budget.maxToolCount,
+        current: current.toolCount,
+        attempted: next.toolCount - current.toolCount,
+        next: next.toolCount,
+      });
+    }
+    if (this.budget.maxToolSchemaBytes !== undefined && next.schemaBytes > this.budget.maxToolSchemaBytes) {
+      violations.push({
+        metric: 'tool_schema_bytes',
+        limit: this.budget.maxToolSchemaBytes,
+        current: current.schemaBytes,
+        attempted: next.schemaBytes - current.schemaBytes,
+        next: next.schemaBytes,
+      });
+    }
+
+    return violations.length > 0
+      ? {
+          code: 'tool_search_budget_exceeded',
+          violations,
+        }
+      : undefined;
+  }
+
+  private budgetRefusalMessage(refusal: ToolSearchBudgetRefusal): string {
+    if (refusal.code === 'tool_search_budget_measurement_failed') {
+      return 'Tool loading was refused because the cumulative tool-schema byte budget could not be measured safely. Already loaded tools remain available.';
+    }
+
+    const limits = refusal.violations
+      .map(violation =>
+        violation.metric === 'tool_count'
+          ? `tool count ${violation.next}/${violation.limit}`
+          : `schema bytes ${violation.next}/${violation.limit}`,
+      )
+      .join(' and ');
+    return `Tool loading was refused because the cumulative ToolSearch budget would be exceeded (${limits}). Already loaded tools remain available.`;
+  }
+
+  private assertLoadedSetWithinBudget(catalog: ToolCatalog, loadedNames: ReadonlySet<string>): void {
+    const refusal = this.checkBudget(catalog, loadedNames, []);
+    if (!refusal) return;
+
+    const limits = refusal.violations
+      .map(violation =>
+        violation.metric === 'tool_count'
+          ? `tool count ${violation.current}/${violation.limit}`
+          : `schema bytes ${violation.current}/${violation.limit}`,
+      )
+      .join(' and ');
+    throw new Error(`ToolSearchProcessor loaded state exceeds its cumulative budget (${limits}).`);
+  }
+
+  private async admitLoadedTools(
+    catalog: ToolCatalog,
+    storeContext: LoadedToolStoreContext,
+    candidateNames: readonly string[],
+  ): Promise<{ newlyLoaded: string[]; alreadyLoaded: string[]; refusal?: ToolSearchBudgetRefusal }> {
+    return this.withAdmissionLock(storeContext, async () => {
+      const storedNames = await this.store.getLoadedNames(storeContext);
+      const uniqueCandidates = [...new Set(candidateNames)];
+      const alreadyLoaded = uniqueCandidates.filter(name => storedNames.has(name));
+      const newlyLoaded = uniqueCandidates.filter(name => !storedNames.has(name));
+
+      // Keep the unbounded path free of budget-only work. Candidate policy was
+      // already checked by the caller, and re-authorizing every existing
+      // context receipt here would add observable filter calls and latency.
+      if (!this.budget) {
+        await this.store.addLoaded(newlyLoaded, storeContext);
+        return { newlyLoaded, alreadyLoaded };
+      }
+
+      const currentNames = await this.getAuthorizedLoadedNames(catalog, storedNames, storeContext.args?.requestContext);
+      this.assertLoadedSetWithinBudget(catalog, currentNames);
+
+      let refusal: ToolSearchBudgetRefusal | undefined;
+      try {
+        refusal = this.checkBudget(catalog, currentNames, newlyLoaded);
+      } catch {
+        refusal = {
+          code: 'tool_search_budget_measurement_failed',
+          metric: 'tool_schema_bytes',
+        };
+      }
+      if (refusal) return { newlyLoaded: [], alreadyLoaded, refusal };
+
+      await this.store.addLoaded(newlyLoaded, storeContext);
+      return { newlyLoaded, alreadyLoaded };
+    });
   }
 
   private findToolById(catalog: ToolCatalog, toolId: string): Tool<any, any> | undefined {
@@ -347,6 +654,27 @@ export class ToolSearchProcessor implements Processor<'tool-search'> {
     }
   }
 
+  private async getAuthorizedLoadedNames(
+    catalog: ToolCatalog,
+    loadedNames: ReadonlySet<string>,
+    requestContext?: RequestContext,
+  ): Promise<Set<string>> {
+    if (!this.reauthorizeLoadedNames) return new Set(loadedNames);
+
+    const authorized = new Set<string>();
+    for (const toolName of loadedNames) {
+      const tool = this.findToolForDynamicName(catalog, toolName);
+      // A persisted name that is unresolved for this request cannot be
+      // re-authorized or measured. Keep it in the budget set so catalog churn
+      // cannot reset cumulative count; byte-limited runs then fail closed. It is
+      // still omitted from the executable tool surface by getLoadedTools().
+      if (!tool || (await this.isToolAllowed(toolName, tool, requestContext, 'load'))) {
+        authorized.add(toolName);
+      }
+    }
+    return authorized;
+  }
+
   private async getSuggestedToolNames(
     catalog: ToolCatalog,
     toolName: string,
@@ -391,9 +719,6 @@ export class ToolSearchProcessor implements Processor<'tool-search'> {
     for (const toolName of loadedNames) {
       const tool = this.findToolForDynamicName(catalog, toolName);
       if (tool) {
-        if (this.reauthorizeLoadedNames && !(await this.isToolAllowed(toolName, tool, requestContext, 'load'))) {
-          continue;
-        }
         const isAllowed = await this.isToolAllowed(toolName, tool, requestContext, 'active');
         if (isAllowed) {
           loadedTools[toolName] = tool;
@@ -426,19 +751,22 @@ export class ToolSearchProcessor implements Processor<'tool-search'> {
     tools?: Record<string, unknown>;
   }): Promise<Record<string, Tool<any, any>>> {
     if (args?.stepArgs) {
-      const loadedNames = await this.store.getLoadedNames(this.makeStoreContext(args.stepArgs));
+      const catalog = this.catalogForStep(args.stepArgs.tools);
+      const storedNames = await this.store.getLoadedNames(this.makeStoreContext(args.stepArgs));
+      const requestContext = args.requestContext ?? args.stepArgs.requestContext;
+      const loadedNames = await this.getAuthorizedLoadedNames(catalog, storedNames, requestContext);
+      this.assertLoadedSetWithinBudget(catalog, loadedNames);
       // Fall back to the step's own request context so active-phase filtering still
       // runs when the caller only supplies stepArgs.
-      return this.getLoadedTools(
-        this.catalogForStep(args.stepArgs.tools),
-        loadedNames,
-        args.requestContext ?? args.stepArgs.requestContext,
-      );
+      return this.getLoadedTools(catalog, loadedNames, requestContext);
     }
 
     const threadId = this.resolveThreadId(args?.requestContext);
-    const loadedNames = await this.store.getLoadedNames({ threadId, args: undefined, messages: args?.messages });
-    return this.getLoadedTools(this.catalogForStep(args?.tools), loadedNames, args?.requestContext);
+    const catalog = this.catalogForStep(args?.tools);
+    const storedNames = await this.store.getLoadedNames({ threadId, args: undefined, messages: args?.messages });
+    const loadedNames = await this.getAuthorizedLoadedNames(catalog, storedNames, args?.requestContext);
+    this.assertLoadedSetWithinBudget(catalog, loadedNames);
+    return this.getLoadedTools(catalog, loadedNames, args?.requestContext);
   }
 
   /**
@@ -464,6 +792,7 @@ export class ToolSearchProcessor implements Processor<'tool-search'> {
 
   /** Release cleanup timers and process-local loaded-tool state. */
   public dispose(): void {
+    this.admissionTails.clear();
     this.store.dispose();
   }
 
@@ -572,7 +901,9 @@ export class ToolSearchProcessor implements Processor<'tool-search'> {
     const storeContext = this.makeStoreContext(args);
     // Snapshot of names already loaded as of this step. Newly activated tools are
     // recorded via the store and become available on the model's next turn.
-    const loadedToolNames = await this.store.getLoadedNames(storeContext);
+    const storedLoadedToolNames = await this.store.getLoadedNames(storeContext);
+    const loadedToolNames = await this.getAuthorizedLoadedNames(catalog, storedLoadedToolNames, args.requestContext);
+    this.assertLoadedSetWithinBudget(catalog, loadedToolNames);
 
     const autoLoad = this.searchConfig.autoLoad;
 
@@ -618,6 +949,7 @@ export class ToolSearchProcessor implements Processor<'tool-search'> {
             loaded: z.array(z.string()),
           })
           .optional(),
+        budget: TOOL_SEARCH_BUDGET_REFUSAL_SCHEMA.optional(),
       }),
       execute: async ({ query }) => {
         // Use BM25 search for relevance-ranked results
@@ -655,13 +987,20 @@ export class ToolSearchProcessor implements Processor<'tool-search'> {
           // Activate the matches immediately. They become usable on the next turn —
           // no explicit load_tool call needed. The store records the activation;
           // for the context store this result in the conversation messages is the durable record.
-          const newlyLoaded: string[] = [];
-          for (const result of results) {
-            if (!loadedToolNames.has(result.name)) {
-              newlyLoaded.push(result.name);
-            }
+          const admission = await this.admitLoadedTools(
+            catalog,
+            storeContext,
+            results.map(result => result.name),
+          );
+          if (admission.refusal) {
+            return {
+              results,
+              budget: admission.refusal,
+              message: this.budgetRefusalMessage(admission.refusal),
+            };
           }
-          await this.store.addLoaded(newlyLoaded, storeContext);
+
+          const { newlyLoaded } = admission;
           for (const name of newlyLoaded) loadedToolNames.add(name);
 
           const activation: {
@@ -717,6 +1056,7 @@ export class ToolSearchProcessor implements Processor<'tool-search'> {
         loaded: z.array(z.string()).optional(),
         notFound: z.array(z.string()).optional(),
         alreadyLoaded: z.array(z.string()).optional(),
+        budget: TOOL_SEARCH_BUDGET_REFUSAL_SCHEMA.optional(),
       }),
       execute: async ({ toolName, toolNames }) => {
         // Determine which tools to load
@@ -743,8 +1083,7 @@ export class ToolSearchProcessor implements Processor<'tool-search'> {
         }
 
         const notFound: string[] = [];
-        const alreadyLoaded: string[] = [];
-        const loaded: string[] = [];
+        const allowed: string[] = [];
 
         for (const name of toLoad) {
           // Check if tool exists
@@ -761,19 +1100,27 @@ export class ToolSearchProcessor implements Processor<'tool-search'> {
             continue;
           }
 
-          // Check if already loaded (snapshot of prior steps, plus this call).
-          if (loadedToolNames.has(name) || loaded.includes(name)) {
-            alreadyLoaded.push(name);
-            continue;
-          }
-
-          loaded.push(name);
+          allowed.push(name);
         }
 
-        // Record newly loaded tools in the store. For the context store the
-        // canonical assistant result is the durable record; request state only
-        // bridges execution to later steps in this run.
-        await this.store.addLoaded(loaded, storeContext);
+        // Re-read state and reserve the complete valid batch under one lock so
+        // concurrent calls cannot each admit against the same stale snapshot.
+        // Refusal is atomic: no prefix of the batch is persisted.
+        const admission = await this.admitLoadedTools(catalog, storeContext, allowed);
+        if (admission.refusal) {
+          return {
+            success: false,
+            message: this.budgetRefusalMessage(admission.refusal),
+            ...(toLoad.length === 1 && !toolNamesProvided ? { toolName: toLoad[0] } : {}),
+            loadedCount: 0,
+            notFound: notFound.length > 0 ? notFound : undefined,
+            alreadyLoaded: admission.alreadyLoaded.length > 0 ? admission.alreadyLoaded : undefined,
+            budget: admission.refusal,
+          };
+        }
+
+        const loaded = admission.newlyLoaded;
+        const alreadyLoaded = admission.alreadyLoaded;
         for (const name of loaded) loadedToolNames.add(name);
 
         // Build response based on how many tools were requested
