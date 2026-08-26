@@ -51,6 +51,26 @@
         "default": "./dist/server/server-adapter/index.cjs"
       }
     },
+    "./server-adapter/selected": {
+      "import": {
+        "types": "./dist/server/server-adapter/selected.d.ts",
+        "default": "./dist/server/server-adapter/selected.js"
+      },
+      "require": {
+        "types": "./dist/server/server-adapter/selected.d.ts",
+        "default": "./dist/server/server-adapter/selected.cjs"
+      }
+    },
+    "./server-adapter/routes/harness": {
+      "import": {
+        "types": "./dist/server/server-adapter/routes/harness.d.ts",
+        "default": "./dist/server/server-adapter/routes/harness.js"
+      },
+      "require": {
+        "types": "./dist/server/server-adapter/routes/harness.d.ts",
+        "default": "./dist/server/server-adapter/routes/harness.cjs"
+      }
+    },
     "./a2a/store": {
       "import": {
         "types": "./dist/server/a2a/store.d.ts",

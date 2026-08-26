@@ -8,6 +8,8 @@ export default defineConfig({
     'src/server/handlers/*.ts',
     'src/server/a2a/store.ts',
     'src/server/server-adapter/index.ts',
+    'src/server/server-adapter/selected.ts',
+    'src/server/server-adapter/routes/harness.ts',
     'src/server/auth/index.ts',
     'src/server/schemas/index.ts',
     'src/server/browser-stream/index.ts',
