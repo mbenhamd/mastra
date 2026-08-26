@@ -50,7 +50,7 @@ You can build your own adapter, read [custom adapters](/docs/server/custom-adapt
 
 ## Selected routes
 
-Default adapter imports still register the complete built-in route registry. Hosts that only need a reviewed subset can import the selected-route entrypoints instead. Those constructors require an explicit `routeRegistry`. The `routes` selector is optional: omit it to register every route in that injected registry. Unknown or duplicate selections are rejected, canonical registry order is preserved, and the chosen set is frozen before the server accepts traffic. Handlers are not lazy-loaded on the first request.
+Default adapter imports still register the complete built-in route registry. Hosts that only need a reviewed subset can import the selected-route entrypoints instead. Those constructors require an explicit `routeRegistry`. The `routes` selector is optional: omit it to register every route in that injected registry. Unknown or duplicate selections are rejected, canonical registry order is preserved, and the chosen set is frozen before the server accepts traffic. Handlers aren't lazy-loaded on the first request.
 
 The Harness session-control allowlist is `HARNESS_SESSION_CONTROL_ROUTES` from `@mastra/server/server-adapter/routes/harness`. Pass that tuple as `routes` with `routeRegistry: HARNESS_ROUTES` when a host should expose only those three Harness routes. Install both `@mastra/fastify` and `@mastra/server` for this entrypoint:
 
