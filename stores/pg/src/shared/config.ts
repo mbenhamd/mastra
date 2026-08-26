@@ -1,6 +1,9 @@
 import type { ConnectionOptions } from 'node:tls';
+import { DOMAIN_KEYS } from '@mastra/core/storage';
 import type { CreateIndexOptions, RetentionConfig } from '@mastra/core/storage';
 import type { ClientConfig, Pool, PoolConfig } from 'pg';
+
+export type PostgresDomainKey = (typeof DOMAIN_KEYS)[number];
 
 /**
  * Base configuration options shared across PostgreSQL configs.
@@ -112,6 +115,21 @@ export interface PoolInstanceConfig extends PostgresBaseConfig {
   pool: Pool;
 }
 
+type PostgresStoreDomainConfig = {
+  /**
+   * Restricts which storage domains this store constructs and initializes.
+   *
+   * When omitted, every canonical storage domain is registered, preserving the
+   * default behavior. When provided, only the listed domains are constructed,
+   * exposed through `stores` / `getStore()`, and initialized.
+   *
+   * The list must contain at least one unique canonical domain name. Empty
+   * lists, unknown names, and duplicates throw during construction before an
+   * internal connection pool is created. Omit the option to enable all domains.
+   */
+  enabledDomains?: ReadonlyArray<PostgresDomainKey>;
+};
+
 /**
  * PostgreSQL configuration for PostgresStore.
  *
@@ -121,11 +139,13 @@ export interface PoolInstanceConfig extends PostgresBaseConfig {
  * - Host/port config: `{ id, host, port, database, user, password, ... }`
  * - Cloud SQL connector config: `{ id, stream, ... }` (via pg.ClientConfig)
  */
-export type PostgresStoreConfig =
+export type PostgresStoreConfig = (
   | PoolInstanceConfig
   | ConnectionStringConfig
   | HostConfig
-  | (PostgresBaseConfig & ClientConfig);
+  | (PostgresBaseConfig & ClientConfig)
+) &
+  PostgresStoreDomainConfig;
 
 /**
  * PostgreSQL configuration for PgVector (uses pg with ConnectionOptions)
@@ -168,6 +188,34 @@ export const isCloudSqlConfig = (cfg: PostgresStoreConfig): cfg is PostgresBaseC
 export const validateConfig = (name: string, config: PostgresStoreConfig) => {
   if (!config.id || typeof config.id !== 'string' || config.id.trim() === '') {
     throw new Error(`${name}: id must be provided and cannot be empty.`);
+  }
+
+  if (config.enabledDomains !== undefined) {
+    if (!Array.isArray(config.enabledDomains)) {
+      throw new Error(`${name}: enabledDomains must be an array of canonical domain names when provided.`);
+    }
+    if (config.enabledDomains.length === 0) {
+      throw new Error(
+        `${name}: enabledDomains must contain at least one domain when provided. Omit enabledDomains to enable all domains.`,
+      );
+    }
+
+    const validDomains = new Set<string>(DOMAIN_KEYS);
+    const seenDomains = new Set<string>();
+    for (const key of config.enabledDomains as readonly unknown[]) {
+      const domainName = String(key);
+      if (typeof key !== 'string' || !validDomains.has(key)) {
+        throw new Error(
+          `${name}: enabledDomains contains unknown domain '${domainName}'. Valid domains: ${DOMAIN_KEYS.join(', ')}.`,
+        );
+      }
+      if (seenDomains.has(key)) {
+        throw new Error(
+          `${name}: enabledDomains contains duplicate domain '${key}'. Each domain may be listed only once.`,
+        );
+      }
+      seenDomains.add(key);
+    }
   }
 
   // Pool config: user provides pre-configured pg.Pool

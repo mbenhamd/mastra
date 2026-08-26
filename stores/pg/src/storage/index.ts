@@ -11,7 +11,7 @@ import {
   isHostConfig,
   isPoolConfig,
 } from '../shared/config';
-import type { PostgresStoreConfig } from '../shared/config';
+import type { PostgresDomainKey, PostgresStoreConfig } from '../shared/config';
 import { buildConnectionStringPoolConfig } from '../shared/pool-config';
 import { PinnedClientAdapter, PoolAdapter, RoutingDbClient } from './client';
 import type { DbClient, PoolClient } from './client';
@@ -122,6 +122,34 @@ const ALL_DOMAINS = [
   ThreadStatePG,
 ] as const;
 
+function createPostgresInitializationError(cause: unknown): MastraError {
+  return new MastraError(
+    {
+      id: createStorageErrorId('PG', 'INITIALIZATION', 'FAILED'),
+      domain: ErrorDomain.STORAGE,
+      category: ErrorCategory.USER,
+    },
+    cause,
+  );
+}
+
+function validatePostgresStoreVNextConfig(config: PostgresStoreConfig): void {
+  try {
+    // Validate the complete base config before super() can create and own the
+    // primary pool. PostgresStore validates again when construction proceeds;
+    // this preflight exists specifically to keep VNext selection failures
+    // resource-free while preserving the base store's error contract.
+    validateConfig('PostgresStore', config);
+    if (config.enabledDomains !== undefined && !config.enabledDomains.includes('observability')) {
+      throw new Error(
+        "PostgresStoreVNext: enabledDomains must include 'observability' when provided. Omit enabledDomains to enable all domains.",
+      );
+    }
+  } catch (error) {
+    throw createPostgresInitializationError(error);
+  }
+}
+
 /**
  * Exports the Mastra database schema as SQL DDL statements, including tables, indexes, and triggers.
  * Does not require a database connection. Each domain class provides its own DDL contribution
@@ -211,6 +239,10 @@ export class PostgresStore extends MastraCompositeStore {
   // Caches the in-flight init() so concurrent callers share one initialization
   // instead of each acquiring + pinning a client. See init() / issue #18282.
   #initPromise: Promise<void> | null = null;
+  // Domains initially constructed by PostgresStore use the primary pool.
+  // Subclasses that replace a domain with an externally-backed implementation
+  // remove it through markDomainAsUsingExternalPool().
+  readonly #primaryPoolDomains = new Set<PostgresDomainKey>();
 
   stores: StorageDomains;
 
@@ -240,42 +272,51 @@ export class PostgresStore extends MastraCompositeStore {
         indexes: config.indexes,
       };
 
+      const enabledDomains =
+        config.enabledDomains === undefined ? null : new Set<PostgresDomainKey>(config.enabledDomains);
+      const wants = (key: PostgresDomainKey) => enabledDomains === null || enabledDomains.has(key);
+
       this.stores = {
-        scores: new ScoresPG(domainConfig),
-        workflows: new WorkflowsPG(domainConfig),
-        workflowDefinitions: new WorkflowDefinitionsPG(domainConfig),
-        memory: new MemoryPG(domainConfig),
-        knowledge: new KnowledgePG(domainConfig),
-        notifications: new NotificationsPG(domainConfig),
-        observability: new ObservabilityPG(domainConfig),
-        agents: new AgentsPG(domainConfig),
-        promptBlocks: new PromptBlocksPG(domainConfig),
-        scorerDefinitions: new ScorerDefinitionsPG(domainConfig),
-        mcpClients: new MCPClientsPG(domainConfig),
-        mcpServers: new MCPServersPG(domainConfig),
-        workspaces: new WorkspacesPG(domainConfig),
-        skills: new SkillsPG(domainConfig),
-        favorites: new FavoritesPG(domainConfig),
-        toolProviderConnections: new ToolProviderConnectionsPG(domainConfig),
-        blobs: new BlobsPG(domainConfig),
-        datasets: new DatasetsPG(domainConfig),
-        experiments: new ExperimentsPG(domainConfig),
-        harness: new HarnessPG(domainConfig),
-        backgroundTasks: new BackgroundTasksPG(domainConfig),
-        channels: new ChannelsPG(domainConfig),
-        schedules: new SchedulesPG(domainConfig),
-        threadState: new ThreadStatePG(domainConfig),
+        ...(wants('scores') && { scores: new ScoresPG(domainConfig) }),
+        ...(wants('workflows') && { workflows: new WorkflowsPG(domainConfig) }),
+        ...(wants('workflowDefinitions') && {
+          workflowDefinitions: new WorkflowDefinitionsPG(domainConfig),
+        }),
+        ...(wants('memory') && { memory: new MemoryPG(domainConfig) }),
+        ...(wants('knowledge') && { knowledge: new KnowledgePG(domainConfig) }),
+        ...(wants('notifications') && { notifications: new NotificationsPG(domainConfig) }),
+        ...(wants('observability') && { observability: new ObservabilityPG(domainConfig) }),
+        ...(wants('agents') && { agents: new AgentsPG(domainConfig) }),
+        ...(wants('promptBlocks') && { promptBlocks: new PromptBlocksPG(domainConfig) }),
+        ...(wants('scorerDefinitions') && { scorerDefinitions: new ScorerDefinitionsPG(domainConfig) }),
+        ...(wants('mcpClients') && { mcpClients: new MCPClientsPG(domainConfig) }),
+        ...(wants('mcpServers') && { mcpServers: new MCPServersPG(domainConfig) }),
+        ...(wants('workspaces') && { workspaces: new WorkspacesPG(domainConfig) }),
+        ...(wants('skills') && { skills: new SkillsPG(domainConfig) }),
+        ...(wants('favorites') && { favorites: new FavoritesPG(domainConfig) }),
+        ...(wants('toolProviderConnections') && {
+          toolProviderConnections: new ToolProviderConnectionsPG(domainConfig),
+        }),
+        ...(wants('blobs') && { blobs: new BlobsPG(domainConfig) }),
+        ...(wants('datasets') && { datasets: new DatasetsPG(domainConfig) }),
+        ...(wants('experiments') && { experiments: new ExperimentsPG(domainConfig) }),
+        ...(wants('harness') && { harness: new HarnessPG(domainConfig) }),
+        ...(wants('backgroundTasks') && { backgroundTasks: new BackgroundTasksPG(domainConfig) }),
+        ...(wants('channels') && { channels: new ChannelsPG(domainConfig) }),
+        ...(wants('schedules') && { schedules: new SchedulesPG(domainConfig) }),
+        ...(wants('threadState') && { threadState: new ThreadStatePG(domainConfig) }),
       };
+      for (const key of Object.keys(this.stores) as PostgresDomainKey[]) {
+        this.#primaryPoolDomains.add(key);
+      }
     } catch (e) {
-      throw new MastraError(
-        {
-          id: createStorageErrorId('PG', 'INITIALIZATION', 'FAILED'),
-          domain: ErrorDomain.STORAGE,
-          category: ErrorCategory.USER,
-        },
-        e,
-      );
+      throw createPostgresInitializationError(e);
     }
+  }
+
+  /** Removes a subclass-replaced domain from primary-pool init bookkeeping. */
+  protected markDomainAsUsingExternalPool(domain: PostgresDomainKey): void {
+    this.#primaryPoolDomains.delete(domain);
   }
 
   private createPool(config: PostgresStoreConfig): Pool {
@@ -316,11 +357,10 @@ export class PostgresStore extends MastraCompositeStore {
   }
 
   async init(): Promise<void> {
-    // Skip the pinned-init path entirely when initialization is disabled. The
-    // caller manages schema/migrations externally, so init() must not connect,
-    // pin, or run DDL. This also keeps the call-site contract in @mastra/core
-    // (which calls storage.init() directly and assumes it is "a no-op when
-    // disabled") true for Postgres. See issue #18282.
+    // Skip initialization entirely when disabled. The caller manages schema /
+    // migrations externally, so init() must not connect to either the primary
+    // or external domain pools, pin, or run DDL. This also keeps the call-site
+    // contract in @mastra/core true for Postgres. See issue #18282.
     if (this.disableInit || process.env.MASTRA_DISABLE_STORAGE_INIT === 'true') {
       return;
     }
@@ -329,36 +369,36 @@ export class PostgresStore extends MastraCompositeStore {
       return;
     }
 
-    // Coalesce concurrent init() calls into a single in-flight promise. A
-    // PostgresStore shared across request-scoped Mastra instances can have
-    // init() invoked from several callers at once; without this guard both
-    // race past the `isInitialized` check and pin the RoutingDbClient twice,
-    // throwing "RoutingDbClient already has a pinned client" (issue #18282).
-    this.#initPromise ??= this.#runPinnedInit();
+    // Coalesce concurrent init() calls into a single in-flight promise. This
+    // protects both the pinned primary-pool path and stores whose selected
+    // domains are all backed by external pools.
+    this.#initPromise ??= this.#runInit();
     await this.#initPromise;
   }
 
-  async #runPinnedInit(): Promise<void> {
-    // Acquire a single backend connection and pin every domain's DDL to it
-    // for the duration of init(). This avoids:
+  async #runInit(): Promise<void> {
+    // When at least one selected domain uses the primary pool, acquire a
+    // single backend connection and pin that pool's DDL for the duration of
+    // init(). This avoids:
     //   - per-statement pool.connect() RTT on remote/managed Postgres
     //   - transaction-pooler budget exhaustion under concurrent DDL fan-out
     //   - inter-statement lock contention across domains (issue #17679)
-    // Runtime queries continue to use the pool normally once init completes.
-    // connect() runs inside the try so a failing connection (e.g. a network
-    // blip during boot) is caught below and resets #initPromise, keeping
-    // init() retryable instead of permanently rejecting.
+    // An externally-backed-only store still initializes its selected domains,
+    // but does not connect, pin, or load a schema snapshot on the unused
+    // primary pool. connect() remains inside the try so either path is
+    // retryable instead of permanently caching a rejected init.
     let pinnedClient: PoolClient | undefined;
 
     try {
-      pinnedClient = await this.#pool.connect();
-      const pinned = new PinnedClientAdapter(this.#pool, pinnedClient);
-      this.#db.pin(pinned);
-      // Read the schema's catalog once, up front, so the domains below can
-      // answer "does this table/column/index already exist?" locally instead of
-      // asking the server ~350 times over this one serialized connection.
-      // Cleared in the finally: the snapshot never outlives init().
-      this.#db.setSchemaSnapshot(await loadSchemaSnapshot(pinned, this.schema));
+      if (this.#primaryPoolDomains.size > 0) {
+        pinnedClient = await this.#pool.connect();
+        const pinned = new PinnedClientAdapter(this.#pool, pinnedClient);
+        this.#db.pin(pinned);
+        // Read the schema's catalog once, up front, so primary-backed domains
+        // can answer existence checks locally instead of re-querying the
+        // server. Cleared in finally: the snapshot never outlives init().
+        this.#db.setSchemaSnapshot(await loadSchemaSnapshot(pinned, this.schema));
+      }
       await super.init();
       // Only mark initialized after schema creation actually finishes so a
       // racing second init() caller can't return early and issue runtime
@@ -382,13 +422,12 @@ export class PostgresStore extends MastraCompositeStore {
         error,
       );
     } finally {
-      // Drop the snapshot unconditionally — including when loading it or
-      // super.init() threw — so no code path can read a stale catalog picture
-      // after init returns.
-      this.#db.setSchemaSnapshot(null);
       // Only unpin/release when connect() actually handed us a client; on a
-      // failed connect() pinnedClient is undefined and pin() never ran.
+      // failed or deliberately skipped primary connection, it is undefined.
       if (pinnedClient) {
+        // Drop the snapshot even when loading it or a domain init threw, so no
+        // code path can read a stale catalog picture after init returns.
+        this.#db.setSchemaSnapshot(null);
         this.#db.unpin();
         pinnedClient.release();
       }
@@ -543,10 +582,12 @@ export class PostgresStoreVNext extends PostgresStore {
        * Connection config for the vNext observability domain. Required.
        * Pass a dedicated connection in production; reusing the primary
        * connection logs a runtime warning every construction.
+       * When `enabledDomains` is provided, it must include `observability`.
        */
       observability: PostgresStoreVNextObservabilityConfig;
     },
   ) {
+    validatePostgresStoreVNextConfig(config);
     super(config);
     this.name = 'PostgresStoreVNext';
 
@@ -590,6 +631,7 @@ export class PostgresStoreVNext extends PostgresStore {
       ...this.stores,
       observability,
     };
+    this.markDomainAsUsingExternalPool('observability');
   }
 
   #createObservabilityClient(cfg: PostgresStoreVNextObservabilityConfig): {

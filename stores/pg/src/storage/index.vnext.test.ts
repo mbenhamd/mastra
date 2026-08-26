@@ -13,6 +13,7 @@ vi.setConfig({ testTimeout: 60_000, hookTimeout: 60_000 });
 
 const integrationEnabled = process.env.PG_VNEXT_INTEGRATION_TESTS === '1';
 const TIMESCALE_URL = process.env.PG_VNEXT_TIMESCALE_URL ?? 'postgres://postgres:postgres@localhost:5435/mastra';
+const UNREACHABLE_PRIMARY_URL = 'postgresql://user:pass@127.0.0.1:1/unreachable';
 
 /**
  * The local `TEST_CONFIG` is a host-based primary config (typed as the union
@@ -123,33 +124,83 @@ describe('PostgresStoreVNext', () => {
   });
 
   describe('initialization', () => {
-    it('runs init() end-to-end without throwing', async () => {
+    it('initializes selected primary and observability domains through their owning pools', async () => {
       vi.spyOn(console, 'warn').mockImplementation(() => {});
       const store = new PostgresStoreVNext({
         ...primaryTestConfig,
         id: 'pgvnext-init-test',
+        enabledDomains: ['memory', 'observability'],
         observability: observabilityFromTestConfig,
       });
+      const primaryConnect = vi.spyOn(store.pool, 'connect');
+      const observability = store.stores.observability as ObservabilityStoragePostgresVNext;
+      const observabilityInit = vi.spyOn(observability, 'init');
 
       try {
         await store.init();
-        const observability = store.stores.observability as ObservabilityStoragePostgresVNext;
+        expect(primaryConnect).toHaveBeenCalledTimes(1);
+        expect(observabilityInit).toHaveBeenCalledTimes(1);
         expect(['native', 'partman', 'timescale']).toContain(observability.partitionMode);
       } finally {
         await store.close();
       }
     });
 
-    it('honors an explicit partitioning.mode override', async () => {
+    it('initializes observability-only without touching the unreachable primary pool', async () => {
+      const schemaName = `pgvnext_obsonly_${randomUUID().replace(/-/g, '').slice(0, 8)}`;
+      const cleanupPool = new Pool(primaryTestConfig);
+      const store = new PostgresStoreVNext({
+        id: 'pgvnext-observability-only-init-test',
+        connectionString: UNREACHABLE_PRIMARY_URL,
+        enabledDomains: ['observability'],
+        observability: {
+          ...observabilityFromTestConfig,
+          schemaName,
+          partitioning: { mode: 'native' },
+        },
+      });
+      const primaryConnect = vi.spyOn(store.pool, 'connect');
+      const observability = store.stores.observability as ObservabilityStoragePostgresVNext;
+      const realObservabilityInit = observability.init.bind(observability);
+      const observabilityInit = vi.spyOn(observability, 'init').mockImplementation(() => realObservabilityInit());
+      observabilityInit.mockRejectedValueOnce(new Error('transient observability init failure'));
+
+      try {
+        await expect(store.init()).rejects.toMatchObject({ id: 'MASTRA_STORAGE_PG_INIT_FAILED' });
+        await expect(Promise.all([store.init(), store.init(), store.init()])).resolves.toEqual([
+          undefined,
+          undefined,
+          undefined,
+        ]);
+
+        expect(primaryConnect).not.toHaveBeenCalled();
+        expect(observabilityInit).toHaveBeenCalledTimes(2);
+        expect(observability.partitionMode).toBe('native');
+
+        await expect(store.init()).resolves.toBeUndefined();
+        expect(observabilityInit).toHaveBeenCalledTimes(2);
+      } finally {
+        await store.close();
+        try {
+          await cleanupPool.query(`DROP SCHEMA IF EXISTS "${schemaName}" CASCADE`);
+        } finally {
+          await cleanupPool.end();
+        }
+      }
+    });
+
+    it('preserves default all-domain primary initialization with an explicit partition mode', async () => {
       vi.spyOn(console, 'warn').mockImplementation(() => {});
       const store = new PostgresStoreVNext({
         ...primaryTestConfig,
         id: 'pgvnext-explicit-mode-test',
         observability: { ...observabilityFromTestConfig, partitioning: { mode: 'native' } },
       });
+      const primaryConnect = vi.spyOn(store.pool, 'connect');
       try {
         await store.init();
         const observability = store.stores.observability as ObservabilityStoragePostgresVNext;
+        expect(primaryConnect).toHaveBeenCalledTimes(1);
         expect(observability.partitionMode).toBe('native');
       } finally {
         await store.close();
