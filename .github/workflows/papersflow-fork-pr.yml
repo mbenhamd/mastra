@@ -4,7 +4,6 @@ on:
   pull_request:
     branches:
       - main
-      - 'ci/**'
     types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
@@ -310,10 +309,17 @@ jobs:
           VALIDATION_LANE: ${{ steps.install-policy.outputs.lane }}
         run: |
           script_path=".github/scripts/run-papersflow-fork-pr-validation.bash"
-          # This exact same-repository policy branch is the sole bootstrap for
-          # incremental validator updates. Every other PR uses the protected
-          # base copy, including after the original PF-2044 policy merged.
+          # This exact same-repository policy PR is the sole bootstrap for this
+          # incremental validator update. Every other PR uses the protected
+          # base copy, including any later reuse of this branch name.
           if [[ "${HEAD_REPOSITORY}" == "${GITHUB_REPOSITORY}" && \
+            "${PR_NUMBER}" == '375' && \
+            "${HEAD_REF}" == 'ci/pf-3557-selected-route-export-validation' && \
+            "${BASE_REF}" == 'main' ]]; then
+            echo 'Bootstrapping the validator from exact PF-3557 policy PR #375.'
+            /usr/bin/git show "${HEAD_SHA}:${script_path}" \
+              > "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash"
+          elif [[ "${HEAD_REPOSITORY}" == "${GITHUB_REPOSITORY}" && \
             "${HEAD_REF}" == 'ci/pf-2247-upstream-sync-validation' && \
             "${BASE_REF}" == 'main' ]]; then
             echo 'Bootstrapping the validator from the exact PF-2247 policy branch.'

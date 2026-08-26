@@ -24,9 +24,36 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
 
 - PR code runs only in the unprivileged `pull_request` sandbox on ephemeral
   GitHub-hosted `ubuntu-24.04` runners.
-- The validator also runs for PRs targeting `ci/**` policy branches, allowing a
-  stacked feature PR to prove a new trusted-base validation target before that
-  policy branch reaches `main`.
+- The validator runs for PRs targeting protected `main`. Unprotected `ci/**`
+  branches are not a trusted policy base.
+- PF-3553 PR `#373` has one exact same-repository lane for the reviewed 22-file
+  selected-route feature. The lane accepts only protected `main` as its base.
+  After this policy lands, `#373` must be rebased so current `main` is an
+  ancestor of the admitted head. Admission reads immutable
+  Git objects from the protected base and feature head, requires the exact
+  reviewed changed-path set and SHA-256 base/head surface digests, permits only
+  `packages/server/package.json` and
+  `server-adapters/fastify/package.json` to change in the dependency graph, and
+  admits exactly `./server-adapter/selected`,
+  `./server-adapter/routes/harness`, and `./selected` with their reviewed
+  condition order and import, require, type, ESM, and CommonJS targets. Every
+  other manifest field must remain deeply equal. Root or nested manifests,
+  lockfiles, workspace policy, pnpm hooks, patches, lifecycle scripts,
+  dependencies, reordered/retargeted/wildcard/extra export conditions, source
+  drift, invalid JSON, deletions, and non-regular manifests fail before package
+  commands run. The main validator recomputes both predicates instead of
+  trusting its lane environment. Fastify remains unsupported outside this exact
+  reviewed lane. A clean runner builds Server plus the LibSQL, observability,
+  and MCP dependencies reached by Fastify's examples and shared tests, requires
+  all nine selected export artifacts, and uses the full-suite JSON report to
+  prove all three changed Fastify suites were collected and passed. The three
+  reviewed Server suites receive the same exact-PF-3553 admission before each
+  runs through the normal per-file JSON-report gate; the generic runtime scanner
+  remains fail-closed for every other Server test.
+- PF-3557 policy PR `#375` is the sole head-script bootstrap for that validator
+  update. The workflow binds the bootstrap to the same-repository name, exact PR
+  number, exact branch, and `main` base; later branch-name reuse cannot execute
+  PR-controlled policy before the protected-base copy owns it.
 - PF-558 PR `#266` has one base-owned upstream-sync lane because its reviewed
   upstream merge necessarily updates the root manifest, Server manifest,
   workspace policy, and upstream's pinned `pi-tui` patch. Admission is bound to
@@ -92,7 +119,7 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   validator's complete isolated policy fixture suite, then always builds and
   type-checks Core,
   runs explicit affected-package checks for Okta Auth, Stagehand, Internal Core, CLI,
-  Codemod, Deployer, MCP, Memory, Server, AI SDK, the exact Client SDK Harness
+  Codemod, Deployer, MCP, Memory, Server, Fastify, AI SDK, the exact Client SDK Harness
   resource and public-entrypoint pairs, shared Storage Test Utils, PostgreSQL, Redis, Convex, LibSQL,
   Google Cloud PubSub, Redis Streams,
   Inngest, and the MastraCode SDK/TUI, and
@@ -145,8 +172,13 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   interfaces are mapped narrowly to the Server validation lane. Route
   regeneration fails unless both route artifacts are tracked and unchanged
   from the PR head. The Server permission check owns the generated RBAC
-  interface. Server package manifest changes fail closed before package-owned
-  commands run. This allows route and permission PRs to commit canonical output
+  interface. Server and Fastify package manifest changes fail closed before
+  package-owned commands run unless they satisfy the exact PF-3553 predicate.
+  An admitted Fastify change retains the complete Server owner and runs a
+  focused typecheck over the exact reviewed production/test sources, the
+  declaration-producing package build, lint, and full Vitest suite exactly once;
+  its changed tests are not repeated by the generic per-file runner. This allows
+  route and permission PRs to commit canonical output
   without granting general validation coverage to the Client SDK beyond its
   exact Harness resource and public-entrypoint pairs, or to the CLI or Core
   workspaces. Direct Client Harness resource changes run the Client SDK
@@ -332,6 +364,7 @@ or command plan:
 
 ```bash
 .github/scripts/run-papersflow-fork-pr-validation.bash --self-test
+.github/scripts/run-papersflow-fork-pr-validation.bash --self-test-pf3553-selected-route-exports
 .github/scripts/run-papersflow-fork-pr-validation.bash --self-test-pf558-upstream-sync
 .github/scripts/run-papersflow-fork-pr-validation.bash --self-test-pf2009-upstream-sync
 .github/scripts/run-papersflow-fork-pr-validation.bash --self-test-pf2045-upstream-sync
@@ -341,8 +374,9 @@ or command plan:
 The fixtures use an isolated temporary Git repository and mocked package
 commands. They prove Server permission and route-generation selection, map
 each generated artifact back to Server even when it is the only changed file,
-reject stale or deleted generated output, reject Server manifest changes before
-package commands run, exercise route-contract and generated-consumer checks,
+reject stale or deleted generated output, reject unsupported Server and Fastify
+manifest changes before package commands run, exercise route-contract and
+generated-consumer checks,
 run route consistency coverage and the exact fork-safe favorites integration
 test, reject exact and ordinary Server tests when their changed or newly
 reachable local dependencies gain unsafe runtime requirements, distinguish real
@@ -377,6 +411,14 @@ trusted lane to the exact reviewed merge commit, ordered parent pair, tree,
 repository metadata, and protected-base intersection. They reject forged trees,
 reversed and extra parents, non-merge heads, unreviewed base lineages, and
 wrong branch metadata.
+The PF-3553 fixtures separately prove both reviewed base refs and the exact
+additive export maps, and reject
+script, lifecycle, dependency, files-list, lockfile, workspace, nested
+manifest, pnpm-hook, patch, export-retarget, traversal, wildcard, extra,
+missing, invalid, deleted, non-regular, wrong-metadata, lane-spoof, and unknown
+workspace mutations. Their command log also proves the complete Server owner
+is retained and each Fastify typecheck, build, lint, and full Vitest command
+runs exactly once.
 
 Do not register a self-hosted runner for public PR code. Keep canonical
 release, secret, cloud, and scheduled workflows gated to `mastra-ai/mastra`
