@@ -46,7 +46,7 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   reviewed lane. A clean runner builds Server plus the LibSQL, observability,
   and MCP dependencies reached by Fastify's examples and shared tests, requires
   all nine selected export artifacts, and uses the full-suite JSON report to
-  prove all three changed Fastify suites were collected and passed. The three
+  prove all three changed Fastify suites were collected and passed. The four
   reviewed Server suites receive the same exact-PF-3553 admission before each
   runs through the normal per-file JSON-report gate; the generic runtime scanner
   remains fail-closed for every other Server test.

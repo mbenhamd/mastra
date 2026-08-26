@@ -3827,6 +3827,7 @@ JSON
     '^--dir server-adapters/fastify exec vitest run --reporter=dot --reporter=json --outputFile\.json=' \
     "$command_log"
   for reviewed_server_test in \
+    src/server/server-adapter/http-logging.test.ts \
     src/server/server-adapter/index.test.ts \
     src/server/server-adapter/selected-import-closure.test.ts \
     src/server/server-adapter/selected.test.ts; do
@@ -12228,7 +12229,8 @@ is_pf3553_reviewed_server_test() {
   local file="$1"
   [[ "$pf3553_selected_route_exports" == true ]] || return 1
   case "$file" in
-    packages/server/src/server/server-adapter/index.test.ts | \
+    packages/server/src/server/server-adapter/http-logging.test.ts | \
+      packages/server/src/server/server-adapter/index.test.ts | \
       packages/server/src/server/server-adapter/selected-import-closure.test.ts | \
       packages/server/src/server/server-adapter/selected.test.ts) return 0 ;;
     *) return 1 ;;
