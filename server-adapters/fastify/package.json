@@ -16,6 +16,16 @@
         "default": "./dist/index.cjs"
       }
     },
+    "./selected": {
+      "import": {
+        "types": "./dist/selected.d.ts",
+        "default": "./dist/selected.js"
+      },
+      "require": {
+        "types": "./dist/selected.d.ts",
+        "default": "./dist/selected.cjs"
+      }
+    },
     "./package.json": "./package.json"
   },
   "scripts": {

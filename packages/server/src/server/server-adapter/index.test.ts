@@ -224,9 +224,10 @@ describe('built-in route selection', () => {
     expect(adapter.registerRoute.mock.calls.map(call => call[1])).toEqual(SERVER_ROUTES);
   });
 
-  it('registers only the provided built-in server route array', async () => {
+  it('registers the provided built-in server route array in canonical registry order', async () => {
     const selectedRoutes = [SERVER_ROUTES[2], SERVER_ROUTES[0]].filter(Boolean) as ServerRoute[];
-    const expectedRoutes = [...selectedRoutes];
+    const selectedRouteKeys = new Set(selectedRoutes.map(route => `${route.method} ${route.path}`));
+    const expectedRoutes = SERVER_ROUTES.filter(route => selectedRouteKeys.has(`${route.method} ${route.path}`));
     const adapter = new TestMastraServer({
       app: {},
       mastra: {

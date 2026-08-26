@@ -53,3 +53,16 @@ export const HARNESS_ROUTES = [
   DELETE_HARNESS_GOAL_ROUTE,
   CLOSE_HARNESS_SESSION_ROUTE,
 ] as const;
+
+/**
+ * Authenticated Harness session-control routes used by hosts that expose only
+ * inbox responses and per-session permission controls.
+ *
+ * The tuple contains the canonical route objects from `HARNESS_ROUTES`. Its
+ * array is frozen so a host cannot add, remove, or reorder those references.
+ */
+export const HARNESS_SESSION_CONTROL_ROUTES = Object.freeze([
+  RESPOND_HARNESS_INBOX_ROUTE,
+  GET_HARNESS_PERMISSIONS_ROUTE,
+  PATCH_HARNESS_PERMISSIONS_ROUTE,
+] as const);
