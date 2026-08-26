@@ -212,8 +212,12 @@ describe('PostgresStore memory-only initialization', () => {
       expect(warmStatements.every(sql => /^\s*SELECT\b/i.test(sql))).toBe(true);
       expect(catalogStatements).toHaveLength(3);
       expect(count(catalogStatements, /pg_catalog\.pg_tables/i)).toBe(1);
-      expect(count(catalogStatements, /pg_catalog\.pg_attribute/i)).toBe(1);
-      expect(count(catalogStatements, /pg_catalog\.pg_index\b/i)).toBe(1);
+      expect(count(catalogStatements, /SELECT c\.relname AS table_name[\s\S]*JOIN pg_catalog\.pg_attribute a/i)).toBe(
+        1,
+      );
+      expect(
+        count(catalogStatements, /SELECT index_row\.relname AS indexname[\s\S]*FROM pg_catalog\.pg_index\b/i),
+      ).toBe(1);
       expect(warmStatements.filter(sql => CROSS_DOMAIN_SQL.test(sql))).toEqual([]);
       expect(count(warmStatements, CREATE_TABLE)).toBe(0);
       expect(count(warmStatements, NO_OP_ALTER)).toBe(0);

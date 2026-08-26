@@ -475,21 +475,25 @@ describe('WorkflowsPG terminalization journal', () => {
       await expect(workflowsA.getWorkflowTerminalParentContext(fence)).resolves.toEqual({
         status: 'corrupt_parent_state',
       });
-      const revisionAfterStaleContextRead = await pool.query(
-        `SELECT generation FROM mastra_workflow_parent_revisions
+      const revisionAfterStaleContextRead = await pool.query<{ generation: string }>(
+        `SELECT generation::text FROM mastra_workflow_parent_revisions
          WHERE workflow_name = $1 AND run_id = $2`,
         [parent.workflowName, parent.runId],
       );
-      expect(revisionAfterStaleContextRead.rowCount).toBe(0);
+      expect(revisionAfterStaleContextRead.rows).toEqual([{ generation: '0' }]);
       await expect(workflowsA.applyWorkflowTerminalParentEffect({ ...fence, contract })).resolves.toEqual({
         status: 'corrupt_parent_state',
       });
-      const revisionAfterRejectedApply = await pool.query(
-        `SELECT generation FROM mastra_workflow_parent_revisions
+      const revisionAfterRejectedApply = await pool.query<{ generation: string }>(
+        `SELECT generation::text FROM mastra_workflow_parent_revisions
          WHERE workflow_name = $1 AND run_id = $2`,
         [parent.workflowName, parent.runId],
       );
-      expect(revisionAfterRejectedApply.rowCount).toBe(0);
+      expect(revisionAfterRejectedApply.rows).toEqual([{ generation: '0' }]);
+      await pool.query(`DELETE FROM mastra_workflow_parent_revisions WHERE workflow_name = $1 AND run_id = $2`, [
+        parent.workflowName,
+        parent.runId,
+      ]);
       await pool.query(
         `INSERT INTO mastra_workflow_parent_revisions (workflow_name, run_id, generation, updated_at)
          VALUES ($1, $2, 1, $3)`,
@@ -1407,10 +1411,6 @@ describe('WorkflowsPG terminalization journal', () => {
       if (claim.status !== 'acquired') throw new Error('claim failed');
       const validSnapshot = { ...createEmptyWorkflowSnapshot(runId), status: 'failed' as const };
       const validRecovery = recoveryEnvelope(validSnapshot, run, 'failed');
-      await pool.query(`DELETE FROM mastra_workflow_parent_revisions WHERE workflow_name = $1 AND run_id = $2`, [
-        run.workflowName,
-        run.runId,
-      ]);
       await expect(
         workflowsA.persistWorkflowTerminalState({
           ...run,
@@ -1466,18 +1466,18 @@ describe('WorkflowsPG terminalization journal', () => {
         [run.workflowName, run.runId],
       );
       expect(retained.rows[0]?.count).toBe('0');
-      const revision = await pool.query(
-        `SELECT generation FROM mastra_workflow_parent_revisions
+      const revision = await pool.query<{ generation: string; terminal_status: string | null }>(
+        `SELECT generation::text, terminal_status FROM mastra_workflow_parent_revisions
          WHERE workflow_name = $1 AND run_id = $2`,
         [run.workflowName, run.runId],
       );
-      expect(revision.rowCount).toBe(0);
+      expect(revision.rows).toEqual([{ generation: '2', terminal_status: 'failed' }]);
     } finally {
       await cleanup(workflowName);
     }
   });
 
-  it('seeds a missing parent revision when terminal persistence succeeds', async () => {
+  it('rejects terminal persistence when an existing snapshot loses revision evidence', async () => {
     const workflowName = `terminalization-revision-seed-${randomUUID()}`;
     const runId = 'run';
     const run = { workflowName, runId };
@@ -1507,13 +1507,18 @@ describe('WorkflowsPG terminalization journal', () => {
           snapshot,
           recoveryEnvelope: recoveryEnvelope(snapshot, run, 'failed'),
         }),
-      ).resolves.toMatchObject({ status: 'persisted', record: { phase: 'run_state_persisted' } });
+      ).rejects.toThrow('missing parent revision evidence');
       const revision = await pool.query<{ generation: string; terminal_status: string | null }>(
         `SELECT generation::text, terminal_status FROM mastra_workflow_parent_revisions
          WHERE workflow_name = $1 AND run_id = $2`,
         [run.workflowName, run.runId],
       );
-      expect(revision.rows).toEqual([{ generation: '1', terminal_status: 'failed' }]);
+      expect(revision.rows).toEqual([]);
+      await expect(workflowsA.getWorkflowTerminalization(run)).resolves.toMatchObject({
+        status: 'found',
+        record: { phase: 'terminalization_pending' },
+      });
+      await expect(workflowsA.loadWorkflowSnapshot(run)).resolves.toMatchObject({ status: 'pending' });
     } finally {
       await cleanup(workflowName);
     }
@@ -1983,7 +1988,7 @@ describe('WorkflowsPG terminalization journal', () => {
     ).rejects.toThrow(TypeError);
   });
 
-  it('keeps journal state isolated from snapshot replacement and deletion', async () => {
+  it('keeps journal state isolated from rejected snapshot replacement and deletion', async () => {
     const workflowName = `terminalization-isolation-${Date.now()}`;
     const runId = 'run';
     const run = { workflowName, runId };
@@ -1998,7 +2003,10 @@ describe('WorkflowsPG terminalization journal', () => {
         leaseMs: 1_000,
       });
       expect(claim.status).toBe('acquired');
-      await workflowsB.persistWorkflowSnapshot({ ...run, snapshot: createEmptyWorkflowSnapshot(runId) });
+      await expect(
+        workflowsB.persistWorkflowSnapshot({ ...run, snapshot: createEmptyWorkflowSnapshot(runId) }),
+      ).rejects.toThrow('Workflow parent revision conflict');
+      await expect(workflowsB.loadWorkflowSnapshot(run)).resolves.toMatchObject({ status: 'pending' });
       await expect(workflowsB.getWorkflowTerminalization(run)).resolves.toMatchObject({
         status: 'found',
         record: { eventKey: 'event' },
@@ -2053,7 +2061,7 @@ describe('WorkflowsPG terminalization journal', () => {
     }
   });
 
-  it('idempotently seeds revision evidence for workflow snapshots created before upgrade', async () => {
+  it('does not rescan or repair revision evidence after the migration marker is installed', async () => {
     const workflowName = `revision-upgrade-${randomUUID()}`;
     const runId = 'pre-upgrade-run';
     const now = new Date();
@@ -2073,51 +2081,18 @@ describe('WorkflowsPG terminalization journal', () => {
       ).resolves.toMatchObject({ rows: [] });
 
       await Promise.all([workflowsA.init(), workflowsB.init()]);
-      const seeded = await pool.query<{ generation: string }>(
+      const afterInit = await pool.query<{ generation: string }>(
         `SELECT generation FROM mastra_workflow_parent_revisions
          WHERE workflow_name = $1 AND run_id = $2`,
         [workflowName, runId],
       );
-      expect(seeded.rows).toEqual([{ generation: '1' }]);
-      await workflowsA.init();
-      const repeated = await pool.query<{ generation: string }>(
-        `SELECT generation FROM mastra_workflow_parent_revisions
-         WHERE workflow_name = $1 AND run_id = $2`,
+      expect(afterInit.rows).toEqual([]);
+      await expect(workflowsA.deleteWorkflowRunById({ workflowName, runId })).rejects.toThrow();
+      const retained = await pool.query(
+        `SELECT 1 FROM mastra_workflow_snapshot WHERE workflow_name = $1 AND run_id = $2`,
         [workflowName, runId],
       );
-      expect(repeated.rows).toEqual([{ generation: '1' }]);
-      await expect(workflowsA.deleteWorkflowRunById({ workflowName, runId })).resolves.toBeUndefined();
-      const tombstone = await pool.query<{ generation: string }>(
-        `SELECT generation FROM mastra_workflow_parent_revisions
-         WHERE workflow_name = $1 AND run_id = $2`,
-        [workflowName, runId],
-      );
-      expect(tombstone.rows).toEqual([{ generation: '2' }]);
-
-      const missingRevisionRunId = 'missing-revision-delete';
-      await pool.query(
-        `INSERT INTO mastra_workflow_snapshot
-         (workflow_name, run_id, snapshot, "createdAt", "updatedAt", "createdAtZ", "updatedAtZ")
-         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-        [
-          workflowName,
-          missingRevisionRunId,
-          JSON.stringify(createEmptyWorkflowSnapshot(missingRevisionRunId)),
-          now,
-          now,
-          now,
-          now,
-        ],
-      );
-      await expect(
-        workflowsA.deleteWorkflowRunById({ workflowName, runId: missingRevisionRunId }),
-      ).resolves.toBeUndefined();
-      const selfHealedTombstone = await pool.query<{ generation: string }>(
-        `SELECT generation FROM mastra_workflow_parent_revisions
-         WHERE workflow_name = $1 AND run_id = $2`,
-        [workflowName, missingRevisionRunId],
-      );
-      expect(selfHealedTombstone.rows).toEqual([{ generation: '1' }]);
+      expect(retained.rowCount).toBe(1);
     } finally {
       await cleanup(workflowName);
     }
@@ -2217,19 +2192,28 @@ describe('WorkflowsPG terminalization journal', () => {
     await pool.query(`CREATE SCHEMA "${schema}"`);
     try {
       const exportDDL = WorkflowsPG.getExportDDL(schema);
-      for (const fragment of [
-        'terminal_effects',
-        'terminal_destination_receipts',
-        'workflow_parent_revisions',
-        'terminal_continuation_plans',
-      ]) {
-        const ddl = exportDDL.find(statement => statement.startsWith('CREATE TABLE') && statement.includes(fragment));
-        if (!ddl) throw new Error(`${fragment} DDL missing`);
-        await pool.query(ddl);
+      for (const ddl of exportDDL) await pool.query(ddl);
+      const tableDefinitions = new Map(
+        [
+          'mastra_workflow_terminal_effects_v2',
+          'mastra_workflow_terminal_destination_receipts_v2',
+          'mastra_workflow_terminal_continuation_plans_v2',
+        ].map(table => [
+          table,
+          exportDDL.find(statement => statement.startsWith('CREATE TABLE') && statement.includes(`"${table}"`)),
+        ]),
+      );
+      const revisionDDL = exportDDL.find(
+        statement =>
+          statement.includes('DO $mastra_workflow_parent_revision_export$') &&
+          statement.includes('mastra_workflow_parent_revisions'),
+      );
+      for (const [table, ddl] of tableDefinitions) {
+        if (!ddl) throw new Error(`${table} DDL missing`);
       }
-      const planDDL = exportDDL.find(statement =>
-        statement.includes('mastra_workflow_terminal_continuation_plans_v2'),
-      )!;
+      if (!revisionDDL) throw new Error('mastra_workflow_parent_revisions DDL missing');
+
+      const planDDL = tableDefinitions.get('mastra_workflow_terminal_continuation_plans_v2')!;
       expect(planDDL).toContain('"contract_hash" TEXT NOT NULL');
       expect(planDDL).toContain('"contract" JSONB NOT NULL');
       expect(planDDL).toContain('"framework_action_key" TEXT');
@@ -2240,7 +2224,6 @@ describe('WorkflowsPG terminalization journal', () => {
       expect(planDDL).not.toContain('targets');
       expect(planDDL).not.toContain('per-step-pause');
 
-      const revisionDDL = exportDDL.find(statement => statement.includes('mastra_workflow_parent_revisions'))!;
       expect(revisionDDL).toContain('PRIMARY KEY ("workflow_name", "run_id")');
       expect(revisionDDL).toContain('"generation" BIGINT NOT NULL');
       expect(revisionDDL).toContain('"terminal_status" TEXT');

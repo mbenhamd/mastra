@@ -142,10 +142,12 @@ import {
   validateWorkflowTerminalRecoveryEnvelopeIntegrity,
   validateWorkflowTerminalRecoveryParentFrameGraphBinding,
 } from '@mastra/core/workflows';
-import type { TxClient } from '../../client';
+import type { DbClient, TxClient } from '../../client';
 import { PgDB, resolvePgConfig, generateIndexSQL, generateTableSQL } from '../../db';
 import type { PgDomainConfig } from '../../db';
 import { buildConstraintName } from '../../db/constraint-utils';
+import { getSchemaSnapshot } from '../../db/schema-snapshot';
+import type { SchemaCheckConstraint } from '../../db/schema-snapshot';
 import { runPrune, resolveTargets } from '../../retention';
 
 class CorruptWorkflowTerminalSnapshotRecordError extends TypeError {
@@ -163,11 +165,76 @@ const TABLE_WORKFLOW_TERMINAL_RECOVERY_ANCESTRIES = 'mastra_workflow_terminal_re
 const TABLE_WORKFLOW_TERMINAL_DESTINATION_RECEIPTS = 'mastra_workflow_terminal_destination_receipts_v2';
 const TABLE_WORKFLOW_TERMINAL_CONTINUATION_PLANS = 'mastra_workflow_terminal_continuation_plans_v2';
 const TABLE_WORKFLOW_PARENT_REVISIONS = 'mastra_workflow_parent_revisions';
+const TABLE_WORKFLOW_SCHEMA_MIGRATIONS = 'mastra_workflow_schema_migrations';
+const TABLE_WORKFLOW_PARENT_REVISION_MIGRATION_EPOCH = 'mastra_workflow_parent_revision_migration_epoch';
+const WORKFLOW_PARENT_REVISION_MIGRATION = 'workflow-parent-revision-v1';
+const WORKFLOW_PARENT_REVISION_MIGRATION_EPOCH = 1;
 const TERMINAL_WORKFLOW_RUN_STATUSES = ['success', 'failed', 'canceled', 'tripwire', 'bailed', 'skipped'] as const;
+const WORKFLOW_TERMINALIZATION_STATUSES = ['success', 'failed', 'canceled'] as const;
 type TerminalWorkflowRunStatus = (typeof TERMINAL_WORKFLOW_RUN_STATUSES)[number];
+type WorkflowSnapshotColumnType = 'jsonb' | 'json' | 'text';
+const WORKFLOW_PARENT_REVISION_BASE_CHECKS = ['generation >= 0', 'updated_at >= 0'] as const;
+const WORKFLOW_PARENT_REVISION_TERMINAL_STATUS_CHECK =
+  "terminal_status IS NULL OR (terminal_status = ANY (ARRAY['success'::text, 'failed'::text, 'canceled'::text, 'tripwire'::text, 'bailed'::text, 'skipped'::text]))";
+const WORKFLOW_SCHEMA_MIGRATION_CHECKS = [
+  'length(migration_key) >= 1 AND length(migration_key) <= 256',
+  'applied_at >= 0',
+] as const;
+const WORKFLOW_PARENT_REVISION_MIGRATION_EPOCH_CHECKS = ['epoch = 1', 'created_at >= 0'] as const;
+const WORKFLOW_PARENT_REVISION_EXPORT_MIGRATION_REQUIRED =
+  'WORKFLOW_PARENT_REVISION_MIGRATION_REQUIRED: run PostgresStore.init() with disableInit=false before applying exported schema to populated workflow storage';
+
+type WorkflowSchemaRelationShape = 'absent' | 'legacy' | 'current' | 'incompatible';
+
+interface WorkflowMigrationSchemaState {
+  markerTable: 'absent' | 'current' | 'incompatible';
+  epochTable: 'absent' | 'current' | 'incompatible';
+  parentRevisions: WorkflowSchemaRelationShape;
+  snapshotColumnType: string | null;
+}
+
+interface WorkflowParentRevisionMigrationEvidence {
+  marker: boolean;
+  epoch: boolean;
+}
+
+interface WorkflowCatalogRelation {
+  kind: string;
+  isPartition: boolean;
+  hasInheritance: boolean;
+  persistence: string;
+  columns: Map<string, string>;
+  notNullColumns: Set<string>;
+  columnsWithDefaults: Set<string>;
+  primaryKeyColumns: string[];
+  primaryKeyImmediate: boolean;
+  checkConstraints: SchemaCheckConstraint[];
+}
+
+interface WorkflowParentRevisionLock {
+  generation: number;
+  terminalStatus: TerminalWorkflowRunStatus | null;
+}
+
+interface WorkflowParentRevisionCreationLock extends WorkflowParentRevisionLock {
+  created: boolean;
+}
 
 function isTerminalWorkflowRunStatus(value: unknown): value is TerminalWorkflowRunStatus {
   return typeof value === 'string' && TERMINAL_WORKFLOW_RUN_STATUSES.includes(value as TerminalWorkflowRunStatus);
+}
+
+function isWorkflowTerminalizationStatus(value: unknown): value is (typeof WORKFLOW_TERMINALIZATION_STATUSES)[number] {
+  return (
+    typeof value === 'string' &&
+    WORKFLOW_TERMINALIZATION_STATUSES.includes(value as (typeof WORKFLOW_TERMINALIZATION_STATUSES)[number])
+  );
+}
+
+function isInvalidLegacyWorkflowSnapshotJsonError(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) return false;
+  const code = (error as { code?: unknown }).code;
+  return code === '22P02' || code === '22P05';
 }
 
 function getSchemaName(schema?: string) {
@@ -217,22 +284,23 @@ function workflowSnapshotStatusIndexSQL(indexName: string, schemaName?: string):
   return `CREATE INDEX IF NOT EXISTS "${indexName}" ON ${tableName} (workflow_name, (snapshot ->> 'status'), "createdAt" DESC)`;
 }
 
+const PG_UNSAFE_JSON_UNICODE_ESCAPE_PATTERN = String.raw`(?<!\\)((?:\\\\)*)(?:(\\u[Dd][89AaBb][0-9A-Fa-f]{2}\\u[Dd][CcDdEeFf][0-9A-Fa-f]{2})|\\u(?:0000|[Dd][89A-Fa-f][0-9A-Fa-f]{2}))`;
+const PG_UNSAFE_JSON_UNICODE_ESCAPE_RE = new RegExp(PG_UNSAFE_JSON_UNICODE_ESCAPE_PATTERN, 'g');
+
 /**
  * Sanitizes JSON string for PostgreSQL jsonb:
  * - Removes problematic Unicode sequences:
  *   - \u0000 (null character) - causes error 22P05 "unsupported Unicode escape sequence"
  *   - \uD800-\uDFFF (unpaired surrogates) - causes "Unicode low surrogate must follow a high surrogate"
- *   - \\uD800 (escaped-backslash + surrogate, e.g. from JS regex literals like [^\ud800-\udfff]):
- *     removing just \uXXXX would leave a dangling backslash that creates a new invalid escape (e.g. \-)
+ * - Preserves escaped-backslash pairs and valid high+low surrogate pairs.
  * - Escapes any remaining invalid JSON escape sequences (e.g. \v, \k, \-)
  */
 export function sanitizeJsonForPg(jsonString: string): string {
   return (
     jsonString
-      // Remove null char and surrogate escape sequences. The optional extra backslash (\\\\?)
-      // also handles the escaped-backslash variant (\\uXXXX), which would otherwise leave a
-      // dangling backslash and produce a new invalid escape sequence after removal.
-      .replace(/\\\\?u(0000|[Dd][89A-Fa-f][0-9A-Fa-f]{2})/g, '')
+      // Preserve each complete escaped-backslash pair. For an odd run, remove
+      // only the final unsafe escape; valid high+low surrogate pairs survive.
+      .replace(PG_UNSAFE_JSON_UNICODE_ESCAPE_RE, '$1$2')
       // Fix any remaining invalid JSON escape sequences safely without rewriting
       // already-escaped backslashes. Running this AFTER surrogate removal ensures that
       // characters newly exposed by the removal (e.g. a hyphen left after \\ud800-\\udfff)
@@ -246,6 +314,7 @@ export class WorkflowsPG extends WorkflowsStorage {
   #schema: string;
   #skipDefaultIndexes?: boolean;
   #indexes?: CreateIndexOptions[];
+  #initializedWorkflowSnapshotColumnType?: WorkflowSnapshotColumnType;
 
   /** Tables managed by this domain */
   static readonly MANAGED_TABLES = [
@@ -257,6 +326,7 @@ export class WorkflowsPG extends WorkflowsStorage {
     TABLE_WORKFLOW_TERMINAL_DESTINATION_RECEIPTS,
     TABLE_WORKFLOW_TERMINAL_CONTINUATION_PLANS,
     TABLE_WORKFLOW_PARENT_REVISIONS,
+    TABLE_WORKFLOW_SCHEMA_MIGRATIONS,
   ] as const;
 
   /**
@@ -313,12 +383,15 @@ export class WorkflowsPG extends WorkflowsStorage {
   ): Promise<T> {
     try {
       return await this.#db.client.tx(async t => {
-        const revision = await this.lockWorkflowParentRevision(t, workflowName, runId);
+        const revision = await this.lockExistingWorkflowParentRevision(t, workflowName, runId);
         const row = await t.oneOrNone<{ snapshot: WorkflowRunState | string; resourceId?: string | null }>(
           `SELECT snapshot, "resourceId" FROM ${this.workflowSnapshotTableName()}
            WHERE workflow_name = $1 AND run_id = $2 FOR UPDATE`,
           [workflowName, runId],
         );
+        if (!revision && row) {
+          throw new TypeError('Workflow snapshot is missing parent revision evidence');
+        }
         const snapshot = row?.snapshot
           ? this.materializeResumeSnapshot(typeof row.snapshot === 'string' ? JSON.parse(row.snapshot) : row.snapshot)
           : undefined;
@@ -333,7 +406,7 @@ export class WorkflowsPG extends WorkflowsStorage {
              WHERE workflow_name = $5 AND run_id = $6`,
             [retainedResourceId, sanitizeJsonForPg(JSON.stringify(updatedSnapshot)), now, now, workflowName, runId],
           );
-          await this.bumpWorkflowParentRevision(t, workflowName, runId, revision);
+          await this.bumpWorkflowParentRevision(t, workflowName, runId, revision!.generation);
         }
         return publicResult as T;
       });
@@ -397,12 +470,15 @@ export class WorkflowsPG extends WorkflowsStorage {
   async persistWorkflowStepUpdate(input: PersistWorkflowStepUpdateInput): Promise<PersistWorkflowStepUpdateResult> {
     try {
       return await this.#db.client.tx(async t => {
-        const revision = await this.lockWorkflowParentRevision(t, input.workflowName, input.runId);
+        const revision = await this.lockWorkflowParentRevisionForSnapshotUpsert(t, input.workflowName, input.runId);
         const row = await t.oneOrNone<{ snapshot: WorkflowRunState | string; resourceId?: string | null }>(
           `SELECT snapshot, "resourceId" FROM ${this.workflowSnapshotTableName()}
            WHERE workflow_name = $1 AND run_id = $2 FOR UPDATE`,
           [input.workflowName, input.runId],
         );
+        if (revision.created && row) {
+          throw new TypeError('Workflow snapshot is missing parent revision evidence');
+        }
         const snapshot = row?.snapshot
           ? this.materializeResumeSnapshot(typeof row.snapshot === 'string' ? JSON.parse(row.snapshot) : row.snapshot)
           : undefined;
@@ -430,7 +506,9 @@ export class WorkflowsPG extends WorkflowsStorage {
               now,
             ],
           );
-          await this.bumpWorkflowParentRevision(t, input.workflowName, input.runId, revision);
+          await this.bumpWorkflowParentRevision(t, input.workflowName, input.runId, revision.generation);
+        } else {
+          await this.deleteProvisionalWorkflowParentRevision(t, input.workflowName, input.runId, revision.created);
         }
         return result;
       });
@@ -500,11 +578,66 @@ export class WorkflowsPG extends WorkflowsStorage {
     });
   }
 
-  private async lockWorkflowParentRevisionWithPresence(
+  private workflowSchemaMigrationTableName(): string {
+    return getTableName({
+      indexName: TABLE_WORKFLOW_SCHEMA_MIGRATIONS,
+      schemaName: getSchemaName(this.#schema),
+    });
+  }
+
+  private workflowParentRevisionMigrationEpochTableName(): string {
+    return getTableName({
+      indexName: TABLE_WORKFLOW_PARENT_REVISION_MIGRATION_EPOCH,
+      schemaName: getSchemaName(this.#schema),
+    });
+  }
+
+  private decodeWorkflowParentRevision(
+    row: { generation: number | string; terminal_status: string | null },
+    minimumGeneration: 0 | 1,
+  ): WorkflowParentRevisionLock {
+    const generation = typeof row.generation === 'string' ? Number(row.generation) : row.generation;
+    if (!Number.isSafeInteger(generation) || generation < minimumGeneration) {
+      throw new TypeError('Invalid workflow parent revision generation');
+    }
+    if (row.terminal_status !== null && !isTerminalWorkflowRunStatus(row.terminal_status)) {
+      throw new TypeError('Invalid workflow parent terminal status');
+    }
+    return { generation, terminalStatus: row.terminal_status };
+  }
+
+  /**
+   * Locks revision evidence that must already exist for durable workflow state.
+   * Missing evidence is returned to the caller so its existing structured
+   * missing/corruption contract can be preserved without manufacturing a new
+   * identity. A committed generation zero is always corruption.
+   */
+  private async lockExistingWorkflowParentRevision(
     t: TxClient,
     workflowName: string,
     runId: string,
-  ): Promise<{ generation: number; created: boolean; terminalStatus: TerminalWorkflowRunStatus | null }> {
+  ): Promise<WorkflowParentRevisionLock | undefined> {
+    const row = await t.oneOrNone<{ generation: number | string; terminal_status: string | null }>(
+      `SELECT generation, terminal_status FROM ${this.workflowParentRevisionTableName()}
+       WHERE workflow_name = $1 AND run_id = $2
+       FOR UPDATE`,
+      [workflowName, runId],
+    );
+    return row ? this.decodeWorkflowParentRevision(row, 1) : undefined;
+  }
+
+  /**
+   * Reserves revision evidence for a path that is authorized to create a new
+   * canonical snapshot. The generation-zero row is provisional: every caller
+   * must either create the snapshot and bump it to generation one or remove it
+   * before returning. Discovering a pre-existing snapshot after creating this
+   * row is corruption, not permission to repair the missing evidence.
+   */
+  private async lockWorkflowParentRevisionForSnapshotUpsert(
+    t: TxClient,
+    workflowName: string,
+    runId: string,
+  ): Promise<WorkflowParentRevisionCreationLock> {
     const inserted = await t.oneOrNone<{ generation: number | string }>(
       `INSERT INTO ${this.workflowParentRevisionTableName()}
        (workflow_name, run_id, generation, updated_at)
@@ -519,18 +652,29 @@ export class WorkflowsPG extends WorkflowsStorage {
        FOR UPDATE`,
       [workflowName, runId],
     );
-    const generation = typeof row.generation === 'string' ? Number(row.generation) : row.generation;
-    if (!Number.isSafeInteger(generation) || generation < 0) {
-      throw new TypeError('Invalid workflow parent revision generation');
+    const created = inserted !== null;
+    const decoded = this.decodeWorkflowParentRevision(row, created ? 0 : 1);
+    if (created && decoded.generation !== 0) {
+      throw new TypeError('Invalid provisional workflow parent revision generation');
     }
-    if (row.terminal_status !== null && !isTerminalWorkflowRunStatus(row.terminal_status)) {
-      throw new TypeError('Invalid workflow parent terminal status');
-    }
-    return { generation, created: inserted !== null, terminalStatus: row.terminal_status };
+    return { ...decoded, created };
   }
 
-  private async lockWorkflowParentRevision(t: TxClient, workflowName: string, runId: string): Promise<number> {
-    return (await this.lockWorkflowParentRevisionWithPresence(t, workflowName, runId)).generation;
+  private async deleteProvisionalWorkflowParentRevision(
+    t: TxClient,
+    workflowName: string,
+    runId: string,
+    created: boolean,
+  ): Promise<void> {
+    if (!created) return;
+    const result = await t.query(
+      `DELETE FROM ${this.workflowParentRevisionTableName()}
+       WHERE workflow_name = $1 AND run_id = $2 AND generation = 0 AND terminal_status IS NULL`,
+      [workflowName, runId],
+    );
+    if ((result.rowCount ?? 0) !== 1) {
+      throw new TypeError('Provisional workflow parent revision could not be rolled back');
+    }
   }
 
   private async bumpWorkflowParentRevision(
@@ -541,6 +685,8 @@ export class WorkflowsPG extends WorkflowsStorage {
   ): Promise<number> {
     const next = generation + 1;
     if (!Number.isSafeInteger(next)) throw new TypeError('Workflow parent revision exhausted');
+    const snapshotColumnType = await this.resolveWorkflowSnapshotColumnType(t);
+    const snapshotStatus = this.workflowSnapshotStatusExpression(snapshotColumnType, 'snapshot.snapshot');
     const result = await t.query(
       `UPDATE ${this.workflowParentRevisionTableName()} AS revision
        SET generation = $1,
@@ -548,8 +694,8 @@ export class WorkflowsPG extends WorkflowsStorage {
              revision.terminal_status,
              (
                SELECT CASE
-                 WHEN snapshot.snapshot->>'status' IN ('success', 'failed', 'canceled', 'tripwire', 'bailed', 'skipped')
-                   THEN snapshot.snapshot->>'status'
+                 WHEN ${snapshotStatus} IN ('success', 'failed', 'canceled', 'tripwire', 'bailed', 'skipped')
+                   THEN ${snapshotStatus}
                  ELSE NULL
                END
                FROM ${this.workflowSnapshotTableName()} AS snapshot
@@ -557,7 +703,23 @@ export class WorkflowsPG extends WorkflowsStorage {
              )
            ),
            updated_at = floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint
-       WHERE workflow_name = $2 AND run_id = $3 AND generation = $4`,
+       WHERE workflow_name = $2 AND run_id = $3 AND generation = $4
+         AND (
+           revision.terminal_status IS NULL
+           OR NOT EXISTS (
+             SELECT 1 FROM ${this.workflowSnapshotTableName()} AS snapshot
+             WHERE snapshot.workflow_name = $2 AND snapshot.run_id = $3
+           )
+           OR revision.terminal_status = (
+             SELECT CASE
+               WHEN ${snapshotStatus} IN ('success', 'failed', 'canceled', 'tripwire', 'bailed', 'skipped')
+                 THEN ${snapshotStatus}
+               ELSE NULL
+             END
+             FROM ${this.workflowSnapshotTableName()} AS snapshot
+             WHERE snapshot.workflow_name = $2 AND snapshot.run_id = $3
+           )
+         )`,
       [next, workflowName, runId, generation],
     );
     if ((result.rowCount ?? 0) !== 1) throw new TypeError('Workflow parent revision conflict');
@@ -1374,13 +1536,20 @@ export class WorkflowsPG extends WorkflowsStorage {
             : { status: 'ancestry_conflict' };
         }
         for (const frame of desired.ancestry) {
-          const parentRevision = await t.oneOrNone<{ terminal_status: string | null }>(
-            `SELECT terminal_status FROM ${this.workflowParentRevisionTableName()}
-             WHERE workflow_name = $1 AND run_id = $2
-             FOR UPDATE`,
-            [frame.parentWorkflowName, frame.parentRunId],
-          );
-          if (!parentRevision || parentRevision.terminal_status !== null) {
+          let parentRevision: WorkflowParentRevisionLock | undefined;
+          try {
+            parentRevision = await this.lockExistingWorkflowParentRevision(
+              t,
+              frame.parentWorkflowName,
+              frame.parentRunId,
+            );
+          } catch (error) {
+            if (error instanceof TypeError) {
+              throw new TypeError('Workflow terminal recovery ancestry parent evidence is unavailable');
+            }
+            throw error;
+          }
+          if (!parentRevision || parentRevision.terminalStatus !== null) {
             throw new TypeError('Workflow terminal recovery ancestry parent evidence is unavailable');
           }
           const parentEvidence = await t.oneOrNone<{ snapshot: unknown }>(
@@ -1505,11 +1674,14 @@ export class WorkflowsPG extends WorkflowsStorage {
         if (!context.record && !context.snapshotExists) return { status: 'missing_run' };
         const result = claimWorkflowTerminalizationRecord(context.record, operation, context.now, randomUUID());
         if (result.status === 'acquired' || result.status === 'renewed') {
-          const revisionLock = await this.lockWorkflowParentRevisionWithPresence(
+          const revisionLock = await this.lockExistingWorkflowParentRevision(
             t,
             operation.workflowName,
             operation.runId,
           );
+          if (!revisionLock) {
+            throw new TypeError('Workflow terminalization is missing parent revision evidence');
+          }
           if (!context.record) {
             const snapshot = await t.oneOrNone<{ exists: boolean }>(
               `SELECT TRUE AS exists FROM ${this.workflowSnapshotTableName()}
@@ -1517,13 +1689,6 @@ export class WorkflowsPG extends WorkflowsStorage {
               [operation.workflowName, operation.runId],
             );
             if (!snapshot) {
-              if (revisionLock.created) {
-                await t.none(
-                  `DELETE FROM ${this.workflowParentRevisionTableName()}
-                   WHERE workflow_name = $1 AND run_id = $2`,
-                  [operation.workflowName, operation.runId],
-                );
-              }
               return { status: 'missing_run' };
             }
           }
@@ -1567,33 +1732,76 @@ export class WorkflowsPG extends WorkflowsStorage {
   ): Promise<GetWorkflowRunTerminalStatusResult> {
     const operation = captureWorkflowRunIdentity(input);
     try {
+      const snapshotColumnType = await this.resolveWorkflowSnapshotColumnType(this.#db.client);
+      const snapshotStatus = this.workflowSnapshotStatusExpression(snapshotColumnType, 'snapshot.snapshot');
       const row = await this.#db.client.one<{
+        revision_exists: boolean;
+        generation: number | string | null;
         terminal_status: string | null;
+        journal_exists: boolean;
+        journal_terminal_status: string | null;
         snapshot_exists: boolean;
         snapshot_status: string | null;
       }>(
-        `SELECT revision.terminal_status,
+        `SELECT revision.run_id IS NOT NULL AS revision_exists,
+                revision.generation,
+                revision.terminal_status,
+                journal.run_id IS NOT NULL AS journal_exists,
+                journal.terminal_status AS journal_terminal_status,
                 snapshot.run_id IS NOT NULL AS snapshot_exists,
-                snapshot.snapshot->>'status' AS snapshot_status
+                ${snapshotStatus} AS snapshot_status
          FROM (SELECT $1::text AS workflow_name, $2::text AS run_id) AS identity
          LEFT JOIN ${this.workflowParentRevisionTableName()} AS revision
            ON revision.workflow_name = identity.workflow_name AND revision.run_id = identity.run_id
          LEFT JOIN ${this.workflowSnapshotTableName()} AS snapshot
-           ON snapshot.workflow_name = identity.workflow_name AND snapshot.run_id = identity.run_id`,
+           ON snapshot.workflow_name = identity.workflow_name AND snapshot.run_id = identity.run_id
+         LEFT JOIN ${this.terminalizationTableName()} AS journal
+           ON journal.workflow_name = identity.workflow_name AND journal.run_id = identity.run_id`,
         [operation.workflowName, operation.runId],
       );
+      if (!row.revision_exists) {
+        if (row.snapshot_exists || row.journal_exists) {
+          throw new TypeError('Workflow run is missing parent revision evidence');
+        }
+        return { status: 'missing_run' };
+      }
+      const generation = typeof row.generation === 'string' ? Number(row.generation) : row.generation;
+      if (!Number.isSafeInteger(generation) || generation === null || generation < 1) {
+        throw new TypeError('Invalid workflow parent revision generation');
+      }
+      const snapshotIsTerminal = isTerminalWorkflowRunStatus(row.snapshot_status);
+      const snapshotIsNonterminal = ['running', 'suspended', 'waiting', 'pending', 'paused'].includes(
+        row.snapshot_status ?? '',
+      );
+      if (row.snapshot_exists && !snapshotIsTerminal && !snapshotIsNonterminal) {
+        throw new TypeError('Invalid workflow run status');
+      }
+      if (row.journal_exists) {
+        if (!isWorkflowTerminalizationStatus(row.journal_terminal_status)) {
+          throw new TypeError('Invalid workflow terminalization status');
+        }
+        if (row.terminal_status !== row.journal_terminal_status) {
+          throw new TypeError('Workflow parent revision conflicts with terminalization status');
+        }
+        if (snapshotIsTerminal && row.snapshot_status !== row.journal_terminal_status) {
+          throw new TypeError('Workflow terminalization conflicts with terminal snapshot status');
+        }
+      }
       if (row.terminal_status !== null) {
         if (!isTerminalWorkflowRunStatus(row.terminal_status)) {
           throw new TypeError('Invalid workflow parent terminal status');
         }
+        if (!row.journal_exists && row.snapshot_exists && !snapshotIsTerminal) {
+          throw new TypeError('Workflow parent revision conflicts with nonterminal snapshot status');
+        }
+        if (snapshotIsTerminal && row.snapshot_status !== row.terminal_status) {
+          throw new TypeError('Workflow parent revision conflicts with terminal snapshot status');
+        }
         return { status: 'terminal', terminalStatus: row.terminal_status };
       }
       if (!row.snapshot_exists) return { status: 'missing_run' };
-      if (isTerminalWorkflowRunStatus(row.snapshot_status)) {
-        return { status: 'terminal', terminalStatus: row.snapshot_status };
-      }
-      if (!['running', 'suspended', 'waiting', 'pending', 'paused'].includes(row.snapshot_status ?? '')) {
-        throw new TypeError('Invalid workflow run status');
+      if (snapshotIsTerminal) {
+        throw new TypeError('Workflow terminal snapshot is missing terminal revision evidence');
       }
       return { status: 'nonterminal' };
     } catch (error) {
@@ -1742,7 +1950,10 @@ export class WorkflowsPG extends WorkflowsStorage {
         );
         if (dependencyState.pending) return { status: 'deleted', count: 0 };
 
-        await this.lockWorkflowParentRevisionWithPresence(t, operation.workflowName, operation.runId);
+        const revision = await this.lockExistingWorkflowParentRevision(t, operation.workflowName, operation.runId);
+        if (!revision) {
+          throw new TypeError('Workflow terminalization is missing parent revision evidence');
+        }
         await this.latchWorkflowParentTerminalStatus(
           t,
           operation.workflowName,
@@ -1825,26 +2036,16 @@ export class WorkflowsPG extends WorkflowsStorage {
             ? { status: authorization.status, record: observeWorkflowTerminalizationRecord(authorization.record) }
             : authorization;
         }
-        const revisionLock = await this.lockWorkflowParentRevisionWithPresence(
-          t,
-          operation.workflowName,
-          operation.runId,
-        );
-        const deleteCreatedRevision = async (): Promise<void> => {
-          if (!revisionLock.created) return;
-          await t.none(
-            `DELETE FROM ${this.workflowParentRevisionTableName()}
-             WHERE workflow_name = $1 AND run_id = $2 AND generation = 0 AND terminal_status IS NULL`,
-            [operation.workflowName, operation.runId],
-          );
-        };
+        const revisionLock = await this.lockExistingWorkflowParentRevision(t, operation.workflowName, operation.runId);
+        if (!revisionLock) {
+          throw new TypeError('Workflow terminal state is missing parent revision evidence');
+        }
         const snapshotRow = await t.oneOrNone<{ resource_id: unknown }>(
           `SELECT "resourceId" AS resource_id FROM ${this.workflowSnapshotTableName()}
            WHERE workflow_name = $1 AND run_id = $2 FOR UPDATE`,
           [operation.workflowName, operation.runId],
         );
         if (!snapshotRow) {
-          await deleteCreatedRevision();
           return { status: 'missing_run' };
         }
         const ancestryRow = await t.oneOrNone<Record<string, unknown>>(
@@ -1865,7 +2066,6 @@ export class WorkflowsPG extends WorkflowsStorage {
           }
         })();
         if (snapshotCapture.status === 'invalid_snapshot') {
-          await deleteCreatedRevision();
           return snapshotCapture;
         }
         const recoveryCapture:
@@ -1878,7 +2078,6 @@ export class WorkflowsPG extends WorkflowsStorage {
           }
         })();
         if (recoveryCapture.status === 'invalid_recovery_envelope') {
-          await deleteCreatedRevision();
           return recoveryCapture;
         }
         const authorizedOperation: PersistWorkflowTerminalStateInput = {
@@ -1914,7 +2113,6 @@ export class WorkflowsPG extends WorkflowsStorage {
           await this.saveTerminalizationRecord(t, operation.workflowName, operation.runId, result.record);
           return { status: 'persisted', record: observeWorkflowTerminalizationRecord(result.record) };
         }
-        await deleteCreatedRevision();
         return 'record' in result
           ? { status: result.status, record: observeWorkflowTerminalizationRecord(result.record) }
           : result;
@@ -2274,28 +2472,23 @@ export class WorkflowsPG extends WorkflowsStorage {
         validateWorkflowTerminalEffectRecoveryLink(result.effect, retained);
         const parentWorkflowName = result.effect.parentWorkflowName;
         const parentRunId = result.effect.parentRunId;
-        const revisionLock = await this.lockWorkflowParentRevisionWithPresence(t, parentWorkflowName, parentRunId);
-        const deleteProvisionalRevision = async (): Promise<void> => {
-          await t.none(
-            `DELETE FROM ${this.workflowParentRevisionTableName()}
-             WHERE workflow_name = $1 AND run_id = $2 AND generation = 0 AND terminal_status IS NULL`,
-            [parentWorkflowName, parentRunId],
-          );
-        };
+        let revisionLock: WorkflowParentRevisionLock | undefined;
+        try {
+          revisionLock = await this.lockExistingWorkflowParentRevision(t, parentWorkflowName, parentRunId);
+        } catch (error) {
+          if (error instanceof TypeError) return { status: 'corrupt_parent_state' };
+          throw error;
+        }
         const row = await t.oneOrNone<{ snapshot: WorkflowRunState | string }>(
           `SELECT snapshot FROM ${this.workflowSnapshotTableName()}
            WHERE workflow_name = $1 AND run_id = $2 FOR UPDATE`,
           [parentWorkflowName, parentRunId],
         );
         if (!row) {
-          await deleteProvisionalRevision();
           return { status: 'missing_parent' };
         }
+        if (!revisionLock) return { status: 'corrupt_parent_state' };
         let generation = revisionLock.generation;
-        if (!Number.isSafeInteger(generation) || generation < 1) {
-          await deleteProvisionalRevision();
-          return { status: 'corrupt_parent_state' };
-        }
         const snapshot = typeof row.snapshot === 'string' ? JSON.parse(row.snapshot) : row.snapshot;
         const snapshotTerminalStatus = isTerminalWorkflowRunStatus(snapshot.status) ? snapshot.status : undefined;
         if (revisionLock.terminalStatus && revisionLock.terminalStatus !== snapshotTerminalStatus) {
@@ -2698,20 +2891,51 @@ export class WorkflowsPG extends WorkflowsStorage {
         includeAllConstraints: true,
       }),
     );
+    statements.push(WorkflowsPG.getWorkflowSnapshotStatusIndexExportDDL(schemaName));
     statements.push(WorkflowsPG.getTerminalizationTableDDL(schemaName));
     statements.push(WorkflowsPG.getTerminalEffectTableDDL(schemaName));
     statements.push(WorkflowsPG.getTerminalSnapshotTableDDL(schemaName));
     statements.push(WorkflowsPG.getTerminalRecoveryAncestryTableDDL(schemaName));
     statements.push(WorkflowsPG.getTerminalDestinationReceiptTableDDL(schemaName));
-    statements.push(WorkflowsPG.getWorkflowParentRevisionTableDDL(schemaName));
+    statements.push(WorkflowsPG.getWorkflowSchemaMigrationTableDDL(schemaName));
+    statements.push(WorkflowsPG.getWorkflowParentRevisionExportDDL(schemaName));
     statements.push(WorkflowsPG.getTerminalContinuationPlanTableDDL(schemaName));
     for (const idx of WorkflowsPG.getDefaultIndexDefs(schemaPrefix)) {
       statements.push(generateIndexSQL(idx, schemaName));
     }
 
-    statements.push(`${workflowSnapshotStatusIndexSQL(workflowSnapshotStatusIndexName(parsedSchema), schemaName)};`);
-
     return statements;
+  }
+
+  private static getWorkflowSnapshotStatusIndexExportDDL(schemaName?: string): string {
+    const parsedSchema = schemaName ? parseSqlIdentifier(schemaName, 'schema name') : 'public';
+    const indexSql = workflowSnapshotStatusIndexSQL(workflowSnapshotStatusIndexName(parsedSchema), parsedSchema);
+    return `DO $mastra_workflow_snapshot_status_index$
+    DECLARE
+      snapshot_column_type text;
+    BEGIN
+      SELECT format_type(column_row.atttypid, column_row.atttypmod)
+      INTO snapshot_column_type
+      FROM pg_catalog.pg_class AS table_row
+      JOIN pg_catalog.pg_namespace AS namespace_row ON namespace_row.oid = table_row.relnamespace
+      JOIN pg_catalog.pg_attribute AS column_row ON column_row.attrelid = table_row.oid
+      WHERE namespace_row.nspname = '${parsedSchema}'
+        AND table_row.relname = '${TABLE_WORKFLOW_SNAPSHOT}'
+        AND table_row.relkind IN ('r', 'p')
+        AND column_row.attname = 'snapshot'
+        AND column_row.attnum > 0
+        AND NOT column_row.attisdropped;
+
+      IF snapshot_column_type = 'jsonb' THEN
+        EXECUTE $mastra_snapshot_status_index_sql$${indexSql}$mastra_snapshot_status_index_sql$;
+      ELSIF snapshot_column_type IN ('json', 'text') THEN
+        NULL;
+      ELSE
+        RAISE EXCEPTION 'Workflow parent revision migration does not support snapshot column type %',
+          COALESCE(snapshot_column_type, 'missing');
+      END IF;
+    END
+    $mastra_workflow_snapshot_status_index$;`;
   }
 
   private static getTerminalizationTableDDL(schemaName?: string): string {
@@ -2899,6 +3123,370 @@ export class WorkflowsPG extends WorkflowsStorage {
     );`;
   }
 
+  private static getWorkflowParentRevisionExportDDL(schemaName?: string): string {
+    const parsedSchema = schemaName ? parseSqlIdentifier(schemaName, 'schema name') : 'public';
+    const revisionRegclass = `${getSchemaName(parsedSchema)}."${TABLE_WORKFLOW_PARENT_REVISIONS}"`;
+    const revisionTableName = getTableName({
+      indexName: TABLE_WORKFLOW_PARENT_REVISIONS,
+      schemaName: getSchemaName(parsedSchema),
+    });
+    const markerTableName = getTableName({
+      indexName: TABLE_WORKFLOW_SCHEMA_MIGRATIONS,
+      schemaName: getSchemaName(parsedSchema),
+    });
+    const epochTableName = getTableName({
+      indexName: TABLE_WORKFLOW_PARENT_REVISION_MIGRATION_EPOCH,
+      schemaName: getSchemaName(parsedSchema),
+    });
+    const snapshotTableName = getTableName({
+      indexName: TABLE_WORKFLOW_SNAPSHOT,
+      schemaName: getSchemaName(parsedSchema),
+    });
+    const terminalizationTableName = getTableName({
+      indexName: TABLE_WORKFLOW_TERMINALIZATIONS,
+      schemaName: getSchemaName(parsedSchema),
+    });
+    return `DO $mastra_workflow_parent_revision_export$
+    DECLARE
+      marker_oid oid;
+      marker_kind "char";
+      marker_is_partition boolean;
+      marker_has_inheritance boolean;
+      marker_persistence "char";
+      marker_present boolean;
+      epoch_oid oid;
+      epoch_kind "char";
+      epoch_is_partition boolean;
+      epoch_has_inheritance boolean;
+      epoch_persistence "char";
+      epoch_row_count bigint;
+      revision_oid oid;
+      revision_kind "char";
+      revision_is_partition boolean;
+      revision_has_inheritance boolean;
+      revision_persistence "char";
+      revision_columns jsonb;
+      revision_primary_key text[];
+      revision_primary_key_immediate boolean;
+      revision_checks text[];
+      revision_checks_valid boolean;
+    BEGIN
+      PERFORM pg_advisory_xact_lock(
+        hashtextextended(current_database() || E'\\n' || '${parsedSchema}' || E'\\n' || '${WORKFLOW_PARENT_REVISION_MIGRATION}', 0)
+      );
+      marker_oid := to_regclass('${getSchemaName(parsedSchema)}."${TABLE_WORKFLOW_SCHEMA_MIGRATIONS}"');
+      SELECT relation_row.relkind,
+             relation_row.relispartition,
+             EXISTS (
+               SELECT 1 FROM pg_catalog.pg_inherits AS inheritance_row
+               WHERE inheritance_row.inhrelid = relation_row.oid
+                  OR inheritance_row.inhparent = relation_row.oid
+             ),
+             relation_row.relpersistence
+      INTO marker_kind, marker_is_partition, marker_has_inheritance, marker_persistence
+      FROM pg_catalog.pg_class AS relation_row
+      WHERE relation_row.oid = marker_oid;
+      IF marker_oid IS NULL
+         OR marker_kind <> 'r'
+         OR marker_is_partition
+         OR marker_has_inheritance
+         OR marker_persistence <> 'p' THEN
+        RAISE EXCEPTION 'Workflow parent revision migration marker table has an incompatible shape';
+      END IF;
+      LOCK TABLE ${markerTableName} IN ACCESS SHARE MODE;
+
+      SELECT COALESCE(
+               jsonb_object_agg(
+                 column_row.attname,
+                 jsonb_build_object(
+                   'type', format_type(column_row.atttypid, column_row.atttypmod),
+                   'not_null', column_row.attnotnull,
+                   'has_default', (column_row.atthasdef OR column_row.attidentity <> '')
+                 )
+               ),
+               '{}'::jsonb
+             )
+      INTO revision_columns
+      FROM pg_catalog.pg_attribute AS column_row
+      WHERE column_row.attrelid = marker_oid
+        AND column_row.attnum > 0
+        AND NOT column_row.attisdropped;
+      SELECT COALESCE(array_agg(primary_column.attname::text ORDER BY key_column.ordinal_position), ARRAY[]::text[]),
+             COALESCE(bool_and(primary_index.indimmediate), FALSE)
+      INTO revision_primary_key, revision_primary_key_immediate
+      FROM pg_catalog.pg_index AS primary_index
+      CROSS JOIN LATERAL unnest(primary_index.indkey)
+        WITH ORDINALITY AS key_column(attnum, ordinal_position)
+      JOIN pg_catalog.pg_attribute AS primary_column
+        ON primary_column.attrelid = primary_index.indrelid
+       AND primary_column.attnum = key_column.attnum
+      WHERE primary_index.indrelid = marker_oid
+        AND primary_index.indisprimary
+        AND key_column.ordinal_position <= primary_index.indnkeyatts;
+      SELECT COALESCE(
+               array_agg(
+                 btrim(regexp_replace(pg_get_expr(check_row.conbin, check_row.conrelid, true), '[[:space:]]+', ' ', 'g'))
+                 ORDER BY btrim(
+                   regexp_replace(pg_get_expr(check_row.conbin, check_row.conrelid, true), '[[:space:]]+', ' ', 'g')
+                 )
+               ),
+               ARRAY[]::text[]
+             ),
+             COALESCE(bool_and(check_row.convalidated), TRUE)
+      INTO revision_checks, revision_checks_valid
+      FROM pg_catalog.pg_constraint AS check_row
+      WHERE check_row.conrelid = marker_oid
+        AND check_row.contype = 'c';
+      IF revision_columns <> '{
+           "migration_key": {"type": "text", "not_null": true, "has_default": false},
+           "applied_at": {"type": "bigint", "not_null": true, "has_default": false}
+         }'::jsonb
+         OR revision_primary_key <> ARRAY['migration_key']::text[]
+         OR NOT revision_primary_key_immediate
+         OR revision_checks <> ARRAY[
+           'applied_at >= 0',
+           'length(migration_key) >= 1 AND length(migration_key) <= 256'
+         ]::text[]
+         OR NOT revision_checks_valid THEN
+        RAISE EXCEPTION 'Workflow parent revision migration marker table has an incompatible shape';
+      END IF;
+
+      SELECT EXISTS (
+        SELECT 1 FROM ${markerTableName}
+        WHERE migration_key = '${WORKFLOW_PARENT_REVISION_MIGRATION}'
+      )
+      INTO marker_present;
+
+      epoch_oid := to_regclass('${getSchemaName(parsedSchema)}."${TABLE_WORKFLOW_PARENT_REVISION_MIGRATION_EPOCH}"');
+      IF epoch_oid IS NOT NULL THEN
+        SELECT relation_row.relkind,
+               relation_row.relispartition,
+               EXISTS (
+                 SELECT 1 FROM pg_catalog.pg_inherits AS inheritance_row
+                 WHERE inheritance_row.inhrelid = relation_row.oid
+                    OR inheritance_row.inhparent = relation_row.oid
+               ),
+               relation_row.relpersistence
+        INTO epoch_kind, epoch_is_partition, epoch_has_inheritance, epoch_persistence
+        FROM pg_catalog.pg_class AS relation_row
+        WHERE relation_row.oid = epoch_oid;
+        IF epoch_kind <> 'r' OR epoch_is_partition OR epoch_has_inheritance OR epoch_persistence <> 'p' THEN
+          RAISE EXCEPTION 'Workflow parent revision migration epoch table has an incompatible shape';
+        END IF;
+        LOCK TABLE ${epochTableName} IN ACCESS SHARE MODE;
+
+        SELECT COALESCE(
+                 jsonb_object_agg(
+                   column_row.attname,
+                   jsonb_build_object(
+                     'type', format_type(column_row.atttypid, column_row.atttypmod),
+                     'not_null', column_row.attnotnull,
+                     'has_default', (column_row.atthasdef OR column_row.attidentity <> '')
+                   )
+                 ),
+                 '{}'::jsonb
+               )
+        INTO revision_columns
+        FROM pg_catalog.pg_attribute AS column_row
+        WHERE column_row.attrelid = epoch_oid
+          AND column_row.attnum > 0
+          AND NOT column_row.attisdropped;
+
+        SELECT COALESCE(array_agg(primary_column.attname::text ORDER BY key_column.ordinal_position), ARRAY[]::text[]),
+               COALESCE(bool_and(primary_index.indimmediate), FALSE)
+        INTO revision_primary_key, revision_primary_key_immediate
+        FROM pg_catalog.pg_index AS primary_index
+        CROSS JOIN LATERAL unnest(primary_index.indkey)
+          WITH ORDINALITY AS key_column(attnum, ordinal_position)
+        JOIN pg_catalog.pg_attribute AS primary_column
+          ON primary_column.attrelid = primary_index.indrelid
+         AND primary_column.attnum = key_column.attnum
+        WHERE primary_index.indrelid = epoch_oid
+          AND primary_index.indisprimary
+          AND key_column.ordinal_position <= primary_index.indnkeyatts;
+
+        SELECT COALESCE(
+                 array_agg(
+                   btrim(regexp_replace(pg_get_expr(check_row.conbin, check_row.conrelid, true), '[[:space:]]+', ' ', 'g'))
+                   ORDER BY btrim(
+                     regexp_replace(pg_get_expr(check_row.conbin, check_row.conrelid, true), '[[:space:]]+', ' ', 'g')
+                   )
+                 ),
+                 ARRAY[]::text[]
+               ),
+               COALESCE(bool_and(check_row.convalidated), TRUE)
+        INTO revision_checks, revision_checks_valid
+        FROM pg_catalog.pg_constraint AS check_row
+        WHERE check_row.conrelid = epoch_oid
+          AND check_row.contype = 'c';
+
+        IF revision_columns <> '{
+             "epoch": {"type": "smallint", "not_null": true, "has_default": false},
+             "created_at": {"type": "bigint", "not_null": true, "has_default": false}
+           }'::jsonb
+           OR revision_primary_key <> ARRAY['epoch']::text[]
+           OR NOT revision_primary_key_immediate
+           OR revision_checks <> ARRAY['created_at >= 0', 'epoch = 1']::text[]
+           OR NOT revision_checks_valid THEN
+          RAISE EXCEPTION 'Workflow parent revision migration epoch table has an incompatible shape';
+        END IF;
+
+        SELECT count(*) INTO epoch_row_count FROM ${epochTableName};
+      END IF;
+
+      IF (marker_present AND (epoch_oid IS NULL OR epoch_row_count <> 1))
+         OR (NOT marker_present AND epoch_oid IS NOT NULL) THEN
+        RAISE EXCEPTION 'Workflow parent revision migration provenance is damaged or incomplete';
+      END IF;
+
+      revision_oid := to_regclass('${revisionRegclass}');
+
+      IF revision_oid IS NULL THEN
+        LOCK TABLE ${terminalizationTableName} IN EXCLUSIVE MODE;
+        LOCK TABLE ${snapshotTableName} IN EXCLUSIVE MODE;
+        revision_oid := to_regclass('${revisionRegclass}');
+        IF revision_oid IS NULL THEN
+          IF marker_present THEN
+            RAISE EXCEPTION 'Workflow parent revision migration marker conflicts with the durable schema';
+          ELSIF EXISTS (SELECT 1 FROM ${snapshotTableName})
+             OR EXISTS (SELECT 1 FROM ${terminalizationTableName}) THEN
+            RAISE EXCEPTION '${WORKFLOW_PARENT_REVISION_EXPORT_MIGRATION_REQUIRED}';
+          ELSE
+            ${WorkflowsPG.getWorkflowParentRevisionTableDDL(parsedSchema)}
+          END IF;
+          RETURN;
+        END IF;
+      END IF;
+
+      SELECT relation_row.relkind,
+             relation_row.relispartition,
+             EXISTS (
+               SELECT 1 FROM pg_catalog.pg_inherits AS inheritance_row
+               WHERE inheritance_row.inhrelid = relation_row.oid
+                  OR inheritance_row.inhparent = relation_row.oid
+             ),
+             relation_row.relpersistence
+      INTO revision_kind, revision_is_partition, revision_has_inheritance, revision_persistence
+      FROM pg_catalog.pg_class AS relation_row
+      WHERE relation_row.oid = revision_oid;
+      IF revision_kind <> 'r'
+         OR revision_is_partition
+         OR revision_has_inheritance
+         OR revision_persistence <> 'p' THEN
+        RAISE EXCEPTION 'Workflow parent revision table has an incompatible shape';
+      END IF;
+      LOCK TABLE ${revisionTableName} IN ACCESS SHARE MODE;
+
+      SELECT COALESCE(
+               jsonb_object_agg(
+                 column_row.attname,
+                 jsonb_build_object(
+                   'type', format_type(column_row.atttypid, column_row.atttypmod),
+                   'not_null', column_row.attnotnull,
+                   'has_default', (column_row.atthasdef OR column_row.attidentity <> '')
+                 )
+               ),
+               '{}'::jsonb
+             )
+      INTO revision_columns
+      FROM pg_catalog.pg_attribute AS column_row
+      WHERE column_row.attrelid = revision_oid
+        AND column_row.attnum > 0
+        AND NOT column_row.attisdropped;
+
+      SELECT COALESCE(array_agg(primary_column.attname::text ORDER BY key_column.ordinal_position), ARRAY[]::text[]),
+             COALESCE(bool_and(primary_index.indimmediate), FALSE)
+      INTO revision_primary_key, revision_primary_key_immediate
+      FROM pg_catalog.pg_index AS primary_index
+      CROSS JOIN LATERAL unnest(primary_index.indkey)
+        WITH ORDINALITY AS key_column(attnum, ordinal_position)
+      JOIN pg_catalog.pg_attribute AS primary_column
+        ON primary_column.attrelid = primary_index.indrelid
+       AND primary_column.attnum = key_column.attnum
+      WHERE primary_index.indrelid = revision_oid
+        AND primary_index.indisprimary
+        AND key_column.ordinal_position <= primary_index.indnkeyatts;
+
+      SELECT COALESCE(
+               array_agg(
+                 btrim(regexp_replace(pg_get_expr(check_row.conbin, check_row.conrelid, true), '[[:space:]]+', ' ', 'g'))
+                 ORDER BY btrim(
+                   regexp_replace(pg_get_expr(check_row.conbin, check_row.conrelid, true), '[[:space:]]+', ' ', 'g')
+                 )
+               ),
+               ARRAY[]::text[]
+             ),
+             COALESCE(bool_and(check_row.convalidated), TRUE)
+      INTO revision_checks, revision_checks_valid
+      FROM pg_catalog.pg_constraint AS check_row
+      WHERE check_row.conrelid = revision_oid
+        AND check_row.contype = 'c';
+
+      IF revision_columns = '{
+           "workflow_name": {"type": "text", "not_null": true, "has_default": false},
+           "run_id": {"type": "text", "not_null": true, "has_default": false},
+           "generation": {"type": "bigint", "not_null": true, "has_default": false},
+           "terminal_status": {"type": "text", "not_null": false, "has_default": false},
+           "updated_at": {"type": "bigint", "not_null": true, "has_default": false}
+         }'::jsonb
+         AND revision_primary_key = ARRAY['workflow_name', 'run_id']::text[]
+         AND revision_primary_key_immediate
+         AND revision_checks = ARRAY[
+           'generation >= 0',
+           $mastra_revision_check$${WORKFLOW_PARENT_REVISION_TERMINAL_STATUS_CHECK}$mastra_revision_check$,
+           'updated_at >= 0'
+         ]::text[]
+         AND revision_checks_valid THEN
+        RETURN;
+      END IF;
+
+      IF revision_columns = '{
+           "workflow_name": {"type": "text", "not_null": true, "has_default": false},
+           "run_id": {"type": "text", "not_null": true, "has_default": false},
+           "generation": {"type": "bigint", "not_null": true, "has_default": false},
+           "updated_at": {"type": "bigint", "not_null": true, "has_default": false}
+         }'::jsonb
+         AND revision_primary_key = ARRAY['workflow_name', 'run_id']::text[]
+         AND revision_primary_key_immediate
+         AND revision_checks = ARRAY['generation >= 0', 'updated_at >= 0']::text[]
+         AND revision_checks_valid THEN
+        IF marker_present THEN
+          RAISE EXCEPTION 'Workflow parent revision migration marker conflicts with the durable schema';
+        END IF;
+        RAISE EXCEPTION '${WORKFLOW_PARENT_REVISION_EXPORT_MIGRATION_REQUIRED}';
+      END IF;
+
+      RAISE EXCEPTION 'Workflow parent revision table has an incompatible shape';
+    END
+    $mastra_workflow_parent_revision_export$;`;
+  }
+
+  private static getWorkflowSchemaMigrationTableDDL(schemaName?: string): string {
+    const tableName = getTableName({
+      indexName: TABLE_WORKFLOW_SCHEMA_MIGRATIONS,
+      schemaName: getSchemaName(schemaName),
+    });
+    return `CREATE TABLE IF NOT EXISTS ${tableName} (
+      "migration_key" TEXT NOT NULL PRIMARY KEY,
+      "applied_at" BIGINT NOT NULL,
+      CHECK (length("migration_key") BETWEEN 1 AND 256),
+      CHECK ("applied_at" >= 0)
+    );`;
+  }
+
+  private static getWorkflowParentRevisionMigrationEpochTableDDL(schemaName?: string): string {
+    const tableName = getTableName({
+      indexName: TABLE_WORKFLOW_PARENT_REVISION_MIGRATION_EPOCH,
+      schemaName: getSchemaName(schemaName),
+    });
+    return `CREATE TABLE ${tableName} (
+      "epoch" SMALLINT NOT NULL PRIMARY KEY,
+      "created_at" BIGINT NOT NULL,
+      CHECK ("epoch" = ${WORKFLOW_PARENT_REVISION_MIGRATION_EPOCH}),
+      CHECK ("created_at" >= 0)
+    );`;
+  }
+
   private static getTerminalContinuationPlanTableDDL(schemaName?: string): string {
     const tableName = getTableName({
       indexName: TABLE_WORKFLOW_TERMINAL_CONTINUATION_PLANS,
@@ -2956,6 +3544,752 @@ export class WorkflowsPG extends WorkflowsStorage {
     );`;
   }
 
+  private classifyWorkflowMigrationSchema(
+    relations: Map<string, WorkflowCatalogRelation>,
+  ): WorkflowMigrationSchemaState {
+    const matches = (
+      relation: WorkflowCatalogRelation,
+      expectedColumns: Readonly<Record<string, { type: string; notNull: boolean }>>,
+      expectedPrimaryKey: readonly string[],
+      expectedCheckExpressions: readonly string[],
+    ): boolean => {
+      const expectedEntries = Object.entries(expectedColumns);
+      const expectedNotNull = expectedEntries.filter(([, column]) => column.notNull).map(([column]) => column);
+      const actualChecks = relation.checkConstraints
+        .map(check => ({ ...check, expression: check.expression.replace(/\s+/g, ' ').trim() }))
+        .sort((a, b) => a.expression.localeCompare(b.expression));
+      const expectedChecks = [...expectedCheckExpressions].sort((a, b) => a.localeCompare(b));
+      return (
+        relation.kind === 'r' &&
+        !relation.isPartition &&
+        !relation.hasInheritance &&
+        relation.persistence === 'p' &&
+        relation.columns.size === expectedEntries.length &&
+        expectedEntries.every(([column, expected]) => relation.columns.get(column) === expected.type) &&
+        relation.notNullColumns.size === expectedNotNull.length &&
+        expectedNotNull.every(column => relation.notNullColumns.has(column)) &&
+        relation.columnsWithDefaults.size === 0 &&
+        relation.primaryKeyImmediate &&
+        relation.primaryKeyColumns.length === expectedPrimaryKey.length &&
+        relation.primaryKeyColumns.every((column, index) => column === expectedPrimaryKey[index]) &&
+        actualChecks.length === expectedChecks.length &&
+        actualChecks.every((check, index) => check.validated && check.expression === expectedChecks[index])
+      );
+    };
+
+    const marker = relations.get(TABLE_WORKFLOW_SCHEMA_MIGRATIONS);
+    const markerTable = !marker
+      ? 'absent'
+      : matches(
+            marker,
+            {
+              migration_key: { type: 'text', notNull: true },
+              applied_at: { type: 'bigint', notNull: true },
+            },
+            ['migration_key'],
+            WORKFLOW_SCHEMA_MIGRATION_CHECKS,
+          )
+        ? 'current'
+        : 'incompatible';
+
+    const epoch = relations.get(TABLE_WORKFLOW_PARENT_REVISION_MIGRATION_EPOCH);
+    const epochTable = !epoch
+      ? 'absent'
+      : matches(
+            epoch,
+            {
+              epoch: { type: 'smallint', notNull: true },
+              created_at: { type: 'bigint', notNull: true },
+            },
+            ['epoch'],
+            WORKFLOW_PARENT_REVISION_MIGRATION_EPOCH_CHECKS,
+          )
+        ? 'current'
+        : 'incompatible';
+
+    const revision = relations.get(TABLE_WORKFLOW_PARENT_REVISIONS);
+    let parentRevisions: WorkflowSchemaRelationShape;
+    if (!revision) {
+      parentRevisions = 'absent';
+    } else if (
+      matches(
+        revision,
+        {
+          workflow_name: { type: 'text', notNull: true },
+          run_id: { type: 'text', notNull: true },
+          generation: { type: 'bigint', notNull: true },
+          updated_at: { type: 'bigint', notNull: true },
+        },
+        ['workflow_name', 'run_id'],
+        WORKFLOW_PARENT_REVISION_BASE_CHECKS,
+      )
+    ) {
+      parentRevisions = 'legacy';
+    } else if (
+      matches(
+        revision,
+        {
+          workflow_name: { type: 'text', notNull: true },
+          run_id: { type: 'text', notNull: true },
+          generation: { type: 'bigint', notNull: true },
+          terminal_status: { type: 'text', notNull: false },
+          updated_at: { type: 'bigint', notNull: true },
+        },
+        ['workflow_name', 'run_id'],
+        [...WORKFLOW_PARENT_REVISION_BASE_CHECKS, WORKFLOW_PARENT_REVISION_TERMINAL_STATUS_CHECK],
+      )
+    ) {
+      parentRevisions = 'current';
+    } else {
+      parentRevisions = 'incompatible';
+    }
+
+    const snapshotColumnType = relations.get(TABLE_WORKFLOW_SNAPSHOT)?.columns.get('snapshot') ?? null;
+
+    return { markerTable, epochTable, parentRevisions, snapshotColumnType };
+  }
+
+  private async inspectWorkflowMigrationSchema(
+    client: Pick<DbClient, 'manyOrNone'>,
+    useInitSnapshot: boolean,
+  ): Promise<WorkflowMigrationSchemaState> {
+    const snapshot = useInitSnapshot ? getSchemaSnapshot(this.#db.client, this.#schema) : null;
+    if (snapshot) {
+      const relations = new Map<string, WorkflowCatalogRelation>();
+      for (const table of [
+        TABLE_WORKFLOW_SCHEMA_MIGRATIONS,
+        TABLE_WORKFLOW_PARENT_REVISION_MIGRATION_EPOCH,
+        TABLE_WORKFLOW_PARENT_REVISIONS,
+        TABLE_WORKFLOW_SNAPSHOT,
+      ] as const) {
+        if (!snapshot.tables.has(table)) continue;
+        const columns = new Map<string, string>();
+        for (const column of snapshot.columns.get(table) ?? []) {
+          columns.set(column, snapshot.columnTypes.get(table)?.get(column) ?? '');
+        }
+        relations.set(table, {
+          kind: snapshot.tableKinds.get(table) ?? '',
+          isPartition: snapshot.partitionedTables.has(table),
+          hasInheritance: snapshot.inheritedTables.has(table),
+          persistence: snapshot.tablePersistence.get(table) ?? '',
+          columns,
+          notNullColumns: new Set(snapshot.notNullColumns.get(table) ?? []),
+          columnsWithDefaults: new Set(snapshot.columnsWithDefaults.get(table) ?? []),
+          primaryKeyColumns: [...(snapshot.primaryKeyColumns.get(table) ?? [])],
+          primaryKeyImmediate: snapshot.immediatePrimaryKeyTables.has(table),
+          checkConstraints: [...(snapshot.checkConstraints.get(table) ?? [])],
+        });
+      }
+      return this.classifyWorkflowMigrationSchema(relations);
+    }
+
+    const rows = await client.manyOrNone<{
+      table_name: string;
+      column_name: string | null;
+      data_type: string | null;
+      is_not_null: boolean | null;
+      has_default: boolean | null;
+      kind: string;
+      is_partition: boolean;
+      has_inheritance: boolean;
+      persistence: string;
+      primary_key_columns: string[];
+      primary_key_immediate: boolean;
+      check_constraints: SchemaCheckConstraint[];
+    }>(
+      `SELECT table_row.relname AS table_name,
+              table_row.relkind AS kind,
+              table_row.relispartition AS is_partition,
+              EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_inherits AS inheritance_row
+                WHERE inheritance_row.inhrelid = table_row.oid
+                   OR inheritance_row.inhparent = table_row.oid
+              ) AS has_inheritance,
+              table_row.relpersistence AS persistence,
+              column_row.attname AS column_name,
+              CASE WHEN column_row.attname IS NULL THEN NULL
+                   ELSE format_type(column_row.atttypid, column_row.atttypmod)
+              END AS data_type,
+              column_row.attnotnull AS is_not_null,
+              (column_row.atthasdef OR column_row.attidentity <> '') AS has_default,
+              ARRAY(
+                SELECT primary_column.attname::text
+                FROM pg_catalog.pg_index AS primary_index
+                CROSS JOIN LATERAL unnest(primary_index.indkey)
+                  WITH ORDINALITY AS key_column(attnum, ordinal_position)
+                JOIN pg_catalog.pg_attribute AS primary_column
+                  ON primary_column.attrelid = primary_index.indrelid
+                 AND primary_column.attnum = key_column.attnum
+                WHERE primary_index.indrelid = table_row.oid
+                  AND primary_index.indisprimary
+                  AND key_column.ordinal_position <= primary_index.indnkeyatts
+                ORDER BY key_column.ordinal_position
+              ) AS primary_key_columns,
+              COALESCE(
+                (
+                  SELECT primary_index.indimmediate
+                  FROM pg_catalog.pg_index AS primary_index
+                  WHERE primary_index.indrelid = table_row.oid
+                    AND primary_index.indisprimary
+                ),
+                FALSE
+              ) AS primary_key_immediate,
+              COALESCE(
+                (
+                  SELECT jsonb_agg(
+                           jsonb_build_object(
+                             'expression', pg_get_expr(check_row.conbin, check_row.conrelid, true),
+                             'validated', check_row.convalidated
+                           )
+                           ORDER BY check_row.oid
+                         )
+                  FROM pg_catalog.pg_constraint AS check_row
+                  WHERE check_row.conrelid = table_row.oid
+                    AND check_row.contype = 'c'
+                ),
+                '[]'::jsonb
+              ) AS check_constraints
+       FROM pg_catalog.pg_class AS table_row
+       JOIN pg_catalog.pg_namespace AS namespace_row ON namespace_row.oid = table_row.relnamespace
+       LEFT JOIN pg_catalog.pg_attribute AS column_row
+         ON column_row.attrelid = table_row.oid
+        AND column_row.attnum > 0
+        AND NOT column_row.attisdropped
+       WHERE namespace_row.nspname = $1
+         AND table_row.relkind IN ('r', 'p')
+         AND table_row.relname IN ($2, $3, $4, $5)
+       ORDER BY table_row.relname, column_row.attnum`,
+      [
+        this.#schema,
+        TABLE_WORKFLOW_SCHEMA_MIGRATIONS,
+        TABLE_WORKFLOW_PARENT_REVISION_MIGRATION_EPOCH,
+        TABLE_WORKFLOW_PARENT_REVISIONS,
+        TABLE_WORKFLOW_SNAPSHOT,
+      ],
+    );
+    const relations = new Map<string, WorkflowCatalogRelation>();
+    for (const row of rows) {
+      let relation = relations.get(row.table_name);
+      if (!relation) {
+        relation = {
+          kind: row.kind,
+          isPartition: row.is_partition,
+          hasInheritance: row.has_inheritance,
+          persistence: row.persistence,
+          columns: new Map(),
+          notNullColumns: new Set(),
+          columnsWithDefaults: new Set(),
+          primaryKeyColumns: row.primary_key_columns,
+          primaryKeyImmediate: row.primary_key_immediate,
+          checkConstraints: row.check_constraints,
+        };
+        relations.set(row.table_name, relation);
+      }
+      if (row.column_name !== null && row.data_type !== null) {
+        relation.columns.set(row.column_name, row.data_type);
+        if (row.is_not_null) relation.notNullColumns.add(row.column_name);
+        if (row.has_default) relation.columnsWithDefaults.add(row.column_name);
+      }
+    }
+    return this.classifyWorkflowMigrationSchema(relations);
+  }
+
+  private async hasWorkflowParentRevisionMigrationMarker(client: Pick<DbClient, 'oneOrNone'>): Promise<boolean> {
+    const marker = await client.oneOrNone<{ migration_key: string }>(
+      `SELECT migration_key FROM ${this.workflowSchemaMigrationTableName()} WHERE migration_key = $1`,
+      [WORKFLOW_PARENT_REVISION_MIGRATION],
+    );
+    return marker?.migration_key === WORKFLOW_PARENT_REVISION_MIGRATION;
+  }
+
+  private async readWorkflowParentRevisionMigrationEvidence(
+    client: Pick<DbClient, 'one'>,
+  ): Promise<WorkflowParentRevisionMigrationEvidence> {
+    return client.one<WorkflowParentRevisionMigrationEvidence>(
+      `SELECT
+         EXISTS (
+           SELECT 1 FROM ${this.workflowSchemaMigrationTableName()} WHERE migration_key = $1
+         ) AS marker,
+         EXISTS (
+           SELECT 1 FROM ${this.workflowParentRevisionMigrationEpochTableName()} WHERE epoch = $2
+         ) AS epoch`,
+      [WORKFLOW_PARENT_REVISION_MIGRATION, WORKFLOW_PARENT_REVISION_MIGRATION_EPOCH],
+    );
+  }
+
+  private workflowSnapshotStatusExpression(snapshotColumnType: string, columnReference: string): string {
+    if (snapshotColumnType === 'jsonb') {
+      return `${columnReference}->>'status'`;
+    }
+    if (snapshotColumnType === 'json' || snapshotColumnType === 'text') {
+      return this.sanitizedWorkflowSnapshotStatusExpression(columnReference);
+    }
+    throw new TypeError(
+      `Workflow parent revision migration does not support snapshot column type ${snapshotColumnType || 'missing'}`,
+    );
+  }
+
+  private sanitizedWorkflowSnapshotStatusExpression(columnReference: string): string {
+    return `regexp_replace((${columnReference}::json)::text, '${PG_UNSAFE_JSON_UNICODE_ESCAPE_PATTERN}', E'\\\\1\\\\2', 'g')::jsonb->>'status'`;
+  }
+
+  private requireSupportedWorkflowSnapshotColumnType(snapshotColumnType: string | null): WorkflowSnapshotColumnType {
+    if (snapshotColumnType === 'jsonb' || snapshotColumnType === 'json' || snapshotColumnType === 'text') {
+      return snapshotColumnType;
+    }
+    throw new TypeError(
+      `Workflow parent revision migration does not support snapshot column type ${snapshotColumnType || 'missing'}`,
+    );
+  }
+
+  private async resolveWorkflowSnapshotColumnType(
+    client: Pick<DbClient, 'oneOrNone'> | Pick<TxClient, 'oneOrNone'>,
+  ): Promise<WorkflowSnapshotColumnType> {
+    if (this.#initializedWorkflowSnapshotColumnType) {
+      return this.#initializedWorkflowSnapshotColumnType;
+    }
+    const row = await client.oneOrNone<{ data_type: string }>(
+      `SELECT format_type(column_row.atttypid, column_row.atttypmod) AS data_type
+       FROM pg_catalog.pg_attribute AS column_row
+       JOIN pg_catalog.pg_class AS table_row ON table_row.oid = column_row.attrelid
+       JOIN pg_catalog.pg_namespace AS namespace_row ON namespace_row.oid = table_row.relnamespace
+       WHERE namespace_row.nspname = $1
+         AND table_row.relname = $2
+         AND table_row.relkind IN ('r', 'p')
+         AND column_row.attname = 'snapshot'
+         AND column_row.attnum > 0
+         AND NOT column_row.attisdropped`,
+      [this.#schema, TABLE_WORKFLOW_SNAPSHOT],
+    );
+    const snapshotColumnType = this.requireSupportedWorkflowSnapshotColumnType(row?.data_type ?? null);
+    this.#initializedWorkflowSnapshotColumnType = snapshotColumnType;
+    return snapshotColumnType;
+  }
+
+  private async withWorkflowSnapshotJsonValidation<T>(operation: () => Promise<T>): Promise<T> {
+    try {
+      return await operation();
+    } catch (error) {
+      if (isInvalidLegacyWorkflowSnapshotJsonError(error)) {
+        throw new TypeError('Workflow parent revision migration found invalid legacy snapshot JSON', { cause: error });
+      }
+      throw error;
+    }
+  }
+
+  private noteCurrentWorkflowMigrationSchema(): void {
+    const snapshot = getSchemaSnapshot(this.#db.client, this.#schema);
+    if (!snapshot) return;
+    const noteRelation = (
+      table: string,
+      columns: Readonly<Record<string, { type: string; notNull: boolean }>>,
+      primaryKeyColumns: readonly string[],
+      checkExpressions: readonly string[],
+    ): void => {
+      snapshot.tables.add(table);
+      snapshot.tableKinds.set(table, 'r');
+      snapshot.partitionedTables.delete(table);
+      snapshot.inheritedTables.delete(table);
+      snapshot.tablePersistence.set(table, 'p');
+      snapshot.columns.set(table, new Set(Object.keys(columns)));
+      snapshot.columnTypes.set(table, new Map(Object.entries(columns).map(([column, shape]) => [column, shape.type])));
+      snapshot.notNullColumns.set(
+        table,
+        new Set(Object.entries(columns).flatMap(([column, shape]) => (shape.notNull ? [column] : []))),
+      );
+      snapshot.columnsWithDefaults.set(table, new Set());
+      snapshot.checkConstraints.set(
+        table,
+        checkExpressions.map(expression => ({ expression, validated: true })),
+      );
+      snapshot.primaryKeyColumns.set(table, [...primaryKeyColumns]);
+      snapshot.immediatePrimaryKeyTables.add(table);
+      const primaryKeyName = `${table}_pkey`.toLowerCase();
+      snapshot.indexes.add(primaryKeyName);
+      snapshot.primaryKeyIndexes.add(primaryKeyName);
+    };
+    noteRelation(
+      TABLE_WORKFLOW_SCHEMA_MIGRATIONS,
+      {
+        migration_key: { type: 'text', notNull: true },
+        applied_at: { type: 'bigint', notNull: true },
+      },
+      ['migration_key'],
+      WORKFLOW_SCHEMA_MIGRATION_CHECKS,
+    );
+    noteRelation(
+      TABLE_WORKFLOW_PARENT_REVISION_MIGRATION_EPOCH,
+      {
+        epoch: { type: 'smallint', notNull: true },
+        created_at: { type: 'bigint', notNull: true },
+      },
+      ['epoch'],
+      WORKFLOW_PARENT_REVISION_MIGRATION_EPOCH_CHECKS,
+    );
+    noteRelation(
+      TABLE_WORKFLOW_PARENT_REVISIONS,
+      {
+        workflow_name: { type: 'text', notNull: true },
+        run_id: { type: 'text', notNull: true },
+        generation: { type: 'bigint', notNull: true },
+        terminal_status: { type: 'text', notNull: false },
+        updated_at: { type: 'bigint', notNull: true },
+      },
+      ['workflow_name', 'run_id'],
+      [...WORKFLOW_PARENT_REVISION_BASE_CHECKS, WORKFLOW_PARENT_REVISION_TERMINAL_STATUS_CHECK],
+    );
+  }
+
+  private async assertWorkflowParentRevisionIdentityCoverage(t: TxClient, snapshotColumnType: string): Promise<void> {
+    const snapshotStatus = this.workflowSnapshotStatusExpression(snapshotColumnType, 'snapshot.snapshot');
+    const result = await this.withWorkflowSnapshotJsonValidation(() =>
+      t.one<{
+        missing_revision: boolean;
+        invalid_generation: boolean;
+        invalid_updated_at: boolean;
+        invalid_snapshot_status: boolean;
+        invalid_journal_status: boolean;
+        conflicting_terminal_evidence: boolean;
+      }>(
+        `WITH evidence AS (
+         SELECT identity.workflow_name,
+                identity.run_id,
+                snapshot.run_id IS NOT NULL AS snapshot_exists,
+                ${snapshotStatus} AS snapshot_status,
+                journal.run_id IS NOT NULL AS journal_exists,
+                journal.terminal_status AS journal_terminal_status
+         FROM (
+           SELECT workflow_name, run_id FROM ${this.workflowSnapshotTableName()}
+           UNION
+           SELECT workflow_name, run_id FROM ${this.terminalizationTableName()}
+         ) AS identity
+         LEFT JOIN ${this.workflowSnapshotTableName()} AS snapshot
+           ON snapshot.workflow_name = identity.workflow_name AND snapshot.run_id = identity.run_id
+         LEFT JOIN ${this.terminalizationTableName()} AS journal
+           ON journal.workflow_name = identity.workflow_name AND journal.run_id = identity.run_id
+       )
+       SELECT
+         EXISTS (
+           SELECT workflow_name, run_id FROM evidence
+           EXCEPT
+           SELECT workflow_name, run_id FROM ${this.workflowParentRevisionTableName()}
+         ) AS missing_revision,
+         EXISTS (
+           SELECT 1 FROM ${this.workflowParentRevisionTableName()}
+           WHERE generation IS NULL OR generation < 1 OR generation > 9007199254740991
+         ) AS invalid_generation,
+         EXISTS (
+           SELECT 1 FROM ${this.workflowParentRevisionTableName()}
+           WHERE updated_at IS NULL OR updated_at < 0
+         ) AS invalid_updated_at,
+         EXISTS (
+           SELECT 1 FROM evidence
+           WHERE snapshot_exists
+             AND (
+               snapshot_status IS NULL
+               OR snapshot_status NOT IN (
+                 'running', 'success', 'failed', 'tripwire', 'suspended', 'waiting', 'pending',
+                 'canceled', 'bailed', 'paused', 'skipped'
+               )
+             )
+         ) AS invalid_snapshot_status,
+         EXISTS (
+           SELECT 1 FROM evidence
+           WHERE journal_exists
+             AND (
+               journal_terminal_status IS NULL
+               OR journal_terminal_status NOT IN ('success', 'failed', 'canceled')
+             )
+         ) AS invalid_journal_status,
+         EXISTS (
+           SELECT 1 FROM evidence
+           WHERE journal_exists
+             AND snapshot_status IN ('success', 'failed', 'canceled', 'tripwire', 'bailed', 'skipped')
+             AND journal_terminal_status IS DISTINCT FROM snapshot_status
+         ) AS conflicting_terminal_evidence`,
+      ),
+    );
+    if (result.missing_revision) {
+      throw new TypeError('Workflow parent revision migration found durable identities without revision evidence');
+    }
+    if (result.invalid_generation) {
+      throw new TypeError('Workflow parent revision migration found a non-durable generation');
+    }
+    if (result.invalid_updated_at) {
+      throw new TypeError('Workflow parent revision migration found an invalid update timestamp');
+    }
+    if (result.invalid_snapshot_status) {
+      throw new TypeError('Workflow parent revision migration found an invalid snapshot status');
+    }
+    if (result.invalid_journal_status) {
+      throw new TypeError('Workflow parent revision migration found an invalid terminalization status');
+    }
+    if (result.conflicting_terminal_evidence) {
+      throw new TypeError('Workflow parent revision migration found conflicting terminal evidence');
+    }
+  }
+
+  private async verifyWorkflowParentRevisionInvariants(t: TxClient, snapshotColumnType: string): Promise<void> {
+    await this.assertWorkflowParentRevisionIdentityCoverage(t, snapshotColumnType);
+    const snapshotStatus = this.workflowSnapshotStatusExpression(snapshotColumnType, 'snapshot.snapshot');
+    const result = await this.withWorkflowSnapshotJsonValidation(() =>
+      t.one<{ invalid_terminal_status: boolean; terminal_status_mismatch: boolean }>(
+        `WITH evidence AS (
+         SELECT identity.workflow_name,
+                identity.run_id,
+                journal.terminal_status AS journal_terminal_status,
+                CASE
+                  WHEN ${snapshotStatus} IN ('success', 'failed', 'canceled', 'tripwire', 'bailed', 'skipped')
+                    THEN ${snapshotStatus}
+                  ELSE NULL
+                END AS snapshot_terminal_status
+         FROM (
+           SELECT workflow_name, run_id FROM ${this.workflowSnapshotTableName()}
+           UNION
+           SELECT workflow_name, run_id FROM ${this.terminalizationTableName()}
+         ) AS identity
+         LEFT JOIN ${this.terminalizationTableName()} AS journal
+           ON journal.workflow_name = identity.workflow_name AND journal.run_id = identity.run_id
+         LEFT JOIN ${this.workflowSnapshotTableName()} AS snapshot
+           ON snapshot.workflow_name = identity.workflow_name AND snapshot.run_id = identity.run_id
+       )
+       SELECT
+         EXISTS (
+           SELECT 1 FROM ${this.workflowParentRevisionTableName()}
+           WHERE terminal_status IS NOT NULL
+             AND terminal_status NOT IN ('success', 'failed', 'canceled', 'tripwire', 'bailed', 'skipped')
+         ) AS invalid_terminal_status,
+         EXISTS (
+           SELECT 1
+           FROM evidence
+           JOIN ${this.workflowParentRevisionTableName()} AS revision
+             ON revision.workflow_name = evidence.workflow_name AND revision.run_id = evidence.run_id
+           WHERE revision.terminal_status IS DISTINCT FROM
+             COALESCE(evidence.journal_terminal_status, evidence.snapshot_terminal_status)
+         ) AS terminal_status_mismatch`,
+      ),
+    );
+    if (result.invalid_terminal_status) {
+      throw new TypeError('Workflow parent revision migration found an invalid terminal status');
+    }
+    if (result.terminal_status_mismatch) {
+      throw new TypeError('Workflow parent revision migration found mismatched terminal status evidence');
+    }
+  }
+
+  private async migrateWorkflowParentRevisions(): Promise<WorkflowSnapshotColumnType> {
+    const initial = await this.inspectWorkflowMigrationSchema(this.#db.client, true);
+    if (initial.markerTable === 'incompatible') {
+      throw new TypeError('Workflow parent revision migration marker table has an incompatible shape');
+    }
+    if (initial.epochTable === 'incompatible') {
+      throw new TypeError('Workflow parent revision migration epoch table has an incompatible shape');
+    }
+    if (initial.epochTable === 'current') {
+      if (initial.markerTable !== 'current') {
+        throw new TypeError('Workflow parent revision migration provenance is damaged or incomplete');
+      }
+      const evidence = await this.readWorkflowParentRevisionMigrationEvidence(this.#db.client);
+      if (!evidence.marker || !evidence.epoch) {
+        throw new TypeError('Workflow parent revision migration provenance is damaged or incomplete');
+      }
+      if (initial.parentRevisions !== 'current') {
+        throw new TypeError('Workflow parent revision migration marker conflicts with the durable schema');
+      }
+      if (initial.snapshotColumnType !== null) {
+        return this.requireSupportedWorkflowSnapshotColumnType(initial.snapshotColumnType);
+      }
+      const live = await this.inspectWorkflowMigrationSchema(this.#db.client, false);
+      return this.requireSupportedWorkflowSnapshotColumnType(live.snapshotColumnType);
+    }
+    if (initial.markerTable === 'current' && (await this.hasWorkflowParentRevisionMigrationMarker(this.#db.client))) {
+      throw new TypeError('Workflow parent revision migration provenance is damaged or incomplete');
+    }
+
+    const snapshotColumnType = await this.#db.client.tx(async t => {
+      await t.none(
+        `SELECT pg_advisory_xact_lock(
+           hashtextextended(current_database() || E'\\n' || $1 || E'\\n' || $2, 0)
+         )`,
+        [this.#schema, WORKFLOW_PARENT_REVISION_MIGRATION],
+      );
+
+      let state = await this.inspectWorkflowMigrationSchema(t, false);
+      if (state.markerTable === 'incompatible') {
+        throw new TypeError('Workflow parent revision migration marker table has an incompatible shape');
+      }
+      if (state.epochTable === 'incompatible') {
+        throw new TypeError('Workflow parent revision migration epoch table has an incompatible shape');
+      }
+      if (state.epochTable === 'current' && state.markerTable !== 'current') {
+        throw new TypeError('Workflow parent revision migration provenance is damaged or incomplete');
+      }
+      if (
+        state.markerTable === 'current' &&
+        state.epochTable === 'absent' &&
+        (await this.hasWorkflowParentRevisionMigrationMarker(t))
+      ) {
+        throw new TypeError('Workflow parent revision migration provenance is damaged or incomplete');
+      }
+      if (state.markerTable === 'absent') {
+        await t.none(WorkflowsPG.getWorkflowSchemaMigrationTableDDL(this.#schema));
+      }
+      if (state.epochTable === 'absent') {
+        await t.none(WorkflowsPG.getWorkflowParentRevisionMigrationEpochTableDDL(this.#schema));
+      }
+      state = await this.inspectWorkflowMigrationSchema(t, false);
+      if (state.markerTable !== 'current') {
+        throw new TypeError('Workflow parent revision migration marker table has an incompatible shape');
+      }
+      if (state.epochTable !== 'current') {
+        throw new TypeError('Workflow parent revision migration epoch table has an incompatible shape');
+      }
+
+      const evidence = await this.readWorkflowParentRevisionMigrationEvidence(t);
+      if (evidence.marker || evidence.epoch) {
+        if (!evidence.marker || !evidence.epoch) {
+          throw new TypeError('Workflow parent revision migration provenance is damaged or incomplete');
+        }
+        if (state.parentRevisions !== 'current') {
+          throw new TypeError('Workflow parent revision migration marker conflicts with the durable schema');
+        }
+        return this.requireSupportedWorkflowSnapshotColumnType(state.snapshotColumnType);
+      }
+
+      if (state.parentRevisions === 'incompatible') {
+        throw new TypeError('Workflow parent revision table has an incompatible shape');
+      }
+      const preLockRevisionShape = state.parentRevisions;
+
+      // Acquire each relation's final blocking mode up front. Journal-first
+      // matches terminalization, while EXCLUSIVE revision/snapshot locks drain
+      // both SELECT ... FOR UPDATE and DML before migration inspects evidence.
+      await t.none(`LOCK TABLE ${this.terminalizationTableName()} IN EXCLUSIVE MODE`);
+      if (preLockRevisionShape === 'legacy') {
+        await t.none(`LOCK TABLE ${this.workflowParentRevisionTableName()} IN ACCESS EXCLUSIVE MODE`);
+      } else if (preLockRevisionShape === 'current') {
+        await t.none(`LOCK TABLE ${this.workflowParentRevisionTableName()} IN EXCLUSIVE MODE`);
+      }
+      await t.none(`LOCK TABLE ${this.workflowSnapshotTableName()} IN EXCLUSIVE MODE`);
+
+      state = await this.inspectWorkflowMigrationSchema(t, false);
+      if (state.markerTable !== 'current' || state.epochTable !== 'current') {
+        throw new TypeError('Workflow parent revision migration provenance changed during migration');
+      }
+      const evidenceAfterLocks = await this.readWorkflowParentRevisionMigrationEvidence(t);
+      if (evidenceAfterLocks.marker || evidenceAfterLocks.epoch) {
+        if (!evidenceAfterLocks.marker || !evidenceAfterLocks.epoch) {
+          throw new TypeError('Workflow parent revision migration provenance is damaged or incomplete');
+        }
+        if (state.parentRevisions !== 'current') {
+          throw new TypeError('Workflow parent revision migration marker conflicts with the durable schema');
+        }
+        return this.requireSupportedWorkflowSnapshotColumnType(state.snapshotColumnType);
+      }
+      if (state.parentRevisions !== preLockRevisionShape) {
+        throw new TypeError('Workflow parent revision table changed during migration');
+      }
+      const snapshotColumnType = this.requireSupportedWorkflowSnapshotColumnType(state.snapshotColumnType);
+      const snapshotStatus = this.workflowSnapshotStatusExpression(snapshotColumnType, 'snapshot.snapshot');
+
+      if (state.parentRevisions === 'absent') {
+        await t.none(WorkflowsPG.getWorkflowParentRevisionTableDDL(this.#schema));
+        await this.withWorkflowSnapshotJsonValidation(() =>
+          t.none(
+            `INSERT INTO ${this.workflowParentRevisionTableName()}
+           (workflow_name, run_id, generation, terminal_status, updated_at)
+           SELECT identity.workflow_name,
+                  identity.run_id,
+                  1,
+                  COALESCE(
+                    journal.terminal_status,
+                    CASE
+                      WHEN ${snapshotStatus} IN
+                        ('success', 'failed', 'canceled', 'tripwire', 'bailed', 'skipped')
+                        THEN ${snapshotStatus}
+                      ELSE NULL
+                    END
+                  ),
+                  floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint
+           FROM (
+             SELECT workflow_name, run_id FROM ${this.workflowSnapshotTableName()}
+             UNION
+             SELECT workflow_name, run_id FROM ${this.terminalizationTableName()}
+           ) AS identity
+           LEFT JOIN ${this.terminalizationTableName()} AS journal
+             ON journal.workflow_name = identity.workflow_name AND journal.run_id = identity.run_id
+           LEFT JOIN ${this.workflowSnapshotTableName()} AS snapshot
+             ON snapshot.workflow_name = identity.workflow_name AND snapshot.run_id = identity.run_id`,
+          ),
+        );
+      } else if (state.parentRevisions === 'legacy') {
+        await this.assertWorkflowParentRevisionIdentityCoverage(t, snapshotColumnType);
+        await t.none(`ALTER TABLE ${this.workflowParentRevisionTableName()} ADD COLUMN "terminal_status" TEXT`);
+        await t.none(
+          `ALTER TABLE ${this.workflowParentRevisionTableName()}
+           ADD CONSTRAINT "mastra_workflow_parent_revisions_terminal_status_check"
+           CHECK ("terminal_status" IS NULL OR "terminal_status" IN
+             ('success', 'failed', 'canceled', 'tripwire', 'bailed', 'skipped'))`,
+        );
+        await this.withWorkflowSnapshotJsonValidation(() =>
+          t.none(
+            `WITH evidence AS (
+             SELECT identity.workflow_name,
+                    identity.run_id,
+                    COALESCE(
+                      journal.terminal_status,
+                      CASE
+                        WHEN ${snapshotStatus} IN
+                          ('success', 'failed', 'canceled', 'tripwire', 'bailed', 'skipped')
+                          THEN ${snapshotStatus}
+                        ELSE NULL
+                      END
+                    ) AS terminal_status
+             FROM (
+               SELECT workflow_name, run_id FROM ${this.workflowSnapshotTableName()}
+               UNION
+               SELECT workflow_name, run_id FROM ${this.terminalizationTableName()}
+             ) AS identity
+             LEFT JOIN ${this.terminalizationTableName()} AS journal
+               ON journal.workflow_name = identity.workflow_name AND journal.run_id = identity.run_id
+             LEFT JOIN ${this.workflowSnapshotTableName()} AS snapshot
+               ON snapshot.workflow_name = identity.workflow_name AND snapshot.run_id = identity.run_id
+           )
+           UPDATE ${this.workflowParentRevisionTableName()} AS revision
+           SET terminal_status = evidence.terminal_status
+           FROM evidence
+           WHERE revision.workflow_name = evidence.workflow_name
+             AND revision.run_id = evidence.run_id
+             AND evidence.terminal_status IS NOT NULL`,
+          ),
+        );
+      } else if (state.parentRevisions !== 'current') {
+        throw new TypeError('Workflow parent revision table has an incompatible shape');
+      }
+
+      const converged = await this.inspectWorkflowMigrationSchema(t, false);
+      if (converged.parentRevisions !== 'current') {
+        throw new TypeError('Workflow parent revision migration did not produce the current schema');
+      }
+      await this.verifyWorkflowParentRevisionInvariants(t, snapshotColumnType);
+      await t.none(
+        `INSERT INTO ${this.workflowParentRevisionMigrationEpochTableName()} (epoch, created_at)
+         VALUES ($1, floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint)`,
+        [WORKFLOW_PARENT_REVISION_MIGRATION_EPOCH],
+      );
+      await t.none(
+        `INSERT INTO ${this.workflowSchemaMigrationTableName()} (migration_key, applied_at)
+         VALUES ($1, floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint)`,
+        [WORKFLOW_PARENT_REVISION_MIGRATION],
+      );
+      return snapshotColumnType;
+    });
+
+    this.noteCurrentWorkflowMigrationSchema();
+    return snapshotColumnType;
+  }
+
   /**
    * Returns the workflow snapshot index plus the terminalization recovery and retention indexes.
    */
@@ -2999,87 +4333,7 @@ export class WorkflowsPG extends WorkflowsStorage {
     await this.#db.client.none(WorkflowsPG.getTerminalSnapshotTableDDL(this.#schema));
     await this.#db.client.none(WorkflowsPG.getTerminalRecoveryAncestryTableDDL(this.#schema));
     await this.#db.client.none(WorkflowsPG.getTerminalDestinationReceiptTableDDL(this.#schema));
-    await this.#db.client.none(WorkflowsPG.getWorkflowParentRevisionTableDDL(this.#schema));
-    await this.#db.client.tx(async t => {
-      await t.none(
-        `ALTER TABLE ${this.workflowParentRevisionTableName()}
-         ADD COLUMN IF NOT EXISTS terminal_status TEXT`,
-      );
-      await t.none(
-        `ALTER TABLE ${this.workflowParentRevisionTableName()}
-         DROP CONSTRAINT IF EXISTS "mastra_workflow_parent_revisions_terminal_status_check"`,
-      );
-      await t.none(
-        `ALTER TABLE ${this.workflowParentRevisionTableName()}
-         ADD CONSTRAINT "mastra_workflow_parent_revisions_terminal_status_check"
-         CHECK (terminal_status IS NULL OR terminal_status IN ('success', 'failed', 'canceled', 'tripwire', 'bailed', 'skipped'))`,
-      );
-      await t.none(
-        `INSERT INTO ${this.workflowParentRevisionTableName()}
-         (workflow_name, run_id, generation, terminal_status, updated_at)
-         SELECT identity.workflow_name, identity.run_id, 1,
-           COALESCE(
-             journal.terminal_status,
-             CASE
-               WHEN snapshot.snapshot->>'status' IN ('success', 'failed', 'canceled', 'tripwire', 'bailed', 'skipped')
-                 THEN snapshot.snapshot->>'status'
-               ELSE NULL
-             END
-           ),
-           floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint
-         FROM (
-           SELECT workflow_name, run_id FROM ${this.workflowSnapshotTableName()}
-           UNION
-           SELECT workflow_name, run_id FROM ${this.terminalizationTableName()}
-         ) AS identity
-         LEFT JOIN ${this.terminalizationTableName()} AS journal
-           ON journal.workflow_name = identity.workflow_name AND journal.run_id = identity.run_id
-         LEFT JOIN ${this.workflowSnapshotTableName()} AS snapshot
-           ON snapshot.workflow_name = identity.workflow_name AND snapshot.run_id = identity.run_id
-         ON CONFLICT (workflow_name, run_id) DO NOTHING`,
-      );
-      const conflict = await t.one<{ conflict: boolean }>(
-        `SELECT EXISTS (
-           SELECT 1
-           FROM ${this.workflowParentRevisionTableName()} AS revision
-           LEFT JOIN ${this.terminalizationTableName()} AS journal
-             ON journal.workflow_name = revision.workflow_name AND journal.run_id = revision.run_id
-           LEFT JOIN ${this.workflowSnapshotTableName()} AS snapshot
-             ON snapshot.workflow_name = revision.workflow_name AND snapshot.run_id = revision.run_id
-           WHERE
-             (journal.terminal_status IS NOT NULL
-               AND snapshot.snapshot->>'status' IN ('success', 'failed', 'canceled', 'tripwire', 'bailed', 'skipped')
-               AND journal.terminal_status <> snapshot.snapshot->>'status')
-             OR (revision.terminal_status IS NOT NULL
-               AND journal.terminal_status IS NOT NULL
-               AND revision.terminal_status <> journal.terminal_status)
-             OR (revision.terminal_status IS NOT NULL
-               AND journal.terminal_status IS NULL
-               AND snapshot.snapshot->>'status' IN ('success', 'failed', 'canceled', 'tripwire', 'bailed', 'skipped')
-               AND revision.terminal_status <> snapshot.snapshot->>'status')
-         ) AS conflict`,
-      );
-      if (conflict.conflict) {
-        throw new TypeError('Workflow parent terminal marker conflicts with authoritative terminal evidence');
-      }
-      await t.none(
-        `UPDATE ${this.workflowParentRevisionTableName()} AS revision
-         SET terminal_status = journal.terminal_status
-         FROM ${this.terminalizationTableName()} AS journal
-         WHERE revision.workflow_name = journal.workflow_name
-           AND revision.run_id = journal.run_id
-           AND revision.terminal_status IS NULL`,
-      );
-      await t.none(
-        `UPDATE ${this.workflowParentRevisionTableName()} AS revision
-         SET terminal_status = snapshot.snapshot->>'status'
-         FROM ${this.workflowSnapshotTableName()} AS snapshot
-         WHERE revision.workflow_name = snapshot.workflow_name
-           AND revision.run_id = snapshot.run_id
-           AND revision.terminal_status IS NULL
-           AND snapshot.snapshot->>'status' IN ('success', 'failed', 'canceled', 'tripwire', 'bailed', 'skipped')`,
-      );
-    });
+    const snapshotColumnType = await this.migrateWorkflowParentRevisions();
     await this.#db.client.none(WorkflowsPG.getTerminalContinuationPlanTableDDL(this.#schema));
     await this.#db.alterTable({
       tableName: TABLE_WORKFLOW_SNAPSHOT,
@@ -3088,6 +4342,7 @@ export class WorkflowsPG extends WorkflowsStorage {
     });
     await this.createDefaultIndexes();
     await this.createCustomIndexes();
+    this.#initializedWorkflowSnapshotColumnType = snapshotColumnType;
   }
 
   /**
@@ -3166,24 +4421,16 @@ export class WorkflowsPG extends WorkflowsStorage {
     try {
       return await this.#db.client.tx(async t => {
         const tableName = this.workflowSnapshotTableName();
-        const revisionLock = await this.lockWorkflowParentRevisionWithPresence(
-          t,
-          operation.workflowName,
-          operation.runId,
-        );
+        const revisionLock = await this.lockExistingWorkflowParentRevision(t, operation.workflowName, operation.runId);
         const row = await t.oneOrNone<{ snapshot: WorkflowRunState }>(
           `SELECT snapshot FROM ${tableName} WHERE workflow_name = $1 AND run_id = $2 FOR UPDATE`,
           [operation.workflowName, operation.runId],
         );
         if (!row) {
-          if (revisionLock.created) {
-            await t.none(
-              `DELETE FROM ${this.workflowParentRevisionTableName()}
-               WHERE workflow_name = $1 AND run_id = $2`,
-              [operation.workflowName, operation.runId],
-            );
-          }
           return { status: 'missing_run' };
+        }
+        if (!revisionLock) {
+          throw new TypeError('Workflow snapshot is missing parent revision evidence');
         }
         const revision = revisionLock.generation;
         const snapshot = typeof row.snapshot === 'string' ? JSON.parse(row.snapshot) : row.snapshot;
@@ -3283,38 +4530,27 @@ export class WorkflowsPG extends WorkflowsStorage {
               immediate.source.iterationIndex === operation.forEachIndex);
         if (!expectedSource) return { status: 'ancestry_conflict' };
 
-        const revisionLock = await this.lockWorkflowParentRevisionWithPresence(
-          t,
-          operation.workflowName,
-          operation.runId,
-        );
+        let revisionLock: WorkflowParentRevisionLock | undefined;
+        try {
+          revisionLock = await this.lockExistingWorkflowParentRevision(t, operation.workflowName, operation.runId);
+        } catch (error) {
+          if (error instanceof TypeError) return { status: 'parent_snapshot_conflict' };
+          throw error;
+        }
         const parentRow = await t.oneOrNone<{ snapshot: WorkflowRunState | string }>(
           `SELECT snapshot FROM ${this.workflowSnapshotTableName()}
            WHERE workflow_name = $1 AND run_id = $2 FOR UPDATE`,
           [operation.workflowName, operation.runId],
         );
         if (!parentRow) {
-          if (revisionLock.created) {
-            await t.none(
-              `DELETE FROM ${this.workflowParentRevisionTableName()}
-               WHERE workflow_name = $1 AND run_id = $2`,
-              [operation.workflowName, operation.runId],
-            );
-          }
           return { status: 'missing_run' };
         }
+        if (!revisionLock) return { status: 'parent_snapshot_conflict' };
         if (revisionLock.terminalStatus !== null) return { status: 'parent_terminal' };
         const snapshot = typeof parentRow.snapshot === 'string' ? JSON.parse(parentRow.snapshot) : parentRow.snapshot;
         try {
           validateWorkflowRunSnapshotShape(snapshot, operation.runId, 'Nested workflow parent snapshot');
         } catch {
-          if (revisionLock.created) {
-            await t.none(
-              `DELETE FROM ${this.workflowParentRevisionTableName()}
-               WHERE workflow_name = $1 AND run_id = $2 AND generation = 0 AND terminal_status IS NULL`,
-              [operation.workflowName, operation.runId],
-            );
-          }
           return { status: 'parent_snapshot_conflict' };
         }
         if (isTerminalWorkflowRunStatus(snapshot.status)) {
@@ -3367,11 +4603,17 @@ export class WorkflowsPG extends WorkflowsStorage {
         // The child revision is the serialization point shared with generic
         // snapshot writers. Inspect the retained row while that lock is held,
         // before mutating parent ownership or recovery ancestry.
-        const childRevision = await this.lockWorkflowParentRevisionWithPresence(
-          t,
-          operation.nestedWorkflowName,
-          operation.nestedRunId,
-        );
+        let childRevision: WorkflowParentRevisionCreationLock;
+        try {
+          childRevision = await this.lockWorkflowParentRevisionForSnapshotUpsert(
+            t,
+            operation.nestedWorkflowName,
+            operation.nestedRunId,
+          );
+        } catch (error) {
+          if (error instanceof TypeError) return { status: 'child_snapshot_conflict' };
+          throw error;
+        }
         if (childRevision.terminalStatus !== null) return { status: 'child_terminal' };
         const childRow = await t.oneOrNone<{ snapshot: WorkflowRunState | string }>(
           `SELECT snapshot FROM ${this.workflowSnapshotTableName()}
@@ -3380,17 +4622,19 @@ export class WorkflowsPG extends WorkflowsStorage {
         );
         let retainedChildSnapshot: WorkflowRunState | undefined;
         if (childRow) {
+          if (childRevision.created) {
+            await this.deleteProvisionalWorkflowParentRevision(
+              t,
+              operation.nestedWorkflowName,
+              operation.nestedRunId,
+              true,
+            );
+            return { status: 'child_snapshot_conflict' };
+          }
           try {
             retainedChildSnapshot =
               typeof childRow.snapshot === 'string' ? JSON.parse(childRow.snapshot) : childRow.snapshot;
           } catch {
-            if (childRevision.created) {
-              await t.none(
-                `DELETE FROM ${this.workflowParentRevisionTableName()}
-                 WHERE workflow_name = $1 AND run_id = $2 AND generation = 0 AND terminal_status IS NULL`,
-                [operation.nestedWorkflowName, operation.nestedRunId],
-              );
-            }
             return { status: 'child_snapshot_conflict' };
           }
           const inspection = inspectWorkflowNestedRunRetainedSnapshot(
@@ -3399,13 +4643,6 @@ export class WorkflowsPG extends WorkflowsStorage {
             expectedChildGraphFingerprint,
           );
           if (inspection.status === 'conflict') {
-            if (childRevision.created) {
-              await t.none(
-                `DELETE FROM ${this.workflowParentRevisionTableName()}
-                 WHERE workflow_name = $1 AND run_id = $2 AND generation = 0 AND terminal_status IS NULL`,
-                [operation.nestedWorkflowName, operation.nestedRunId],
-              );
-            }
             return { status: 'child_snapshot_conflict' };
           }
           if (inspection.status === 'terminal') {
@@ -3421,24 +4658,15 @@ export class WorkflowsPG extends WorkflowsStorage {
 
         const ensureInitialChildSnapshot = async (): Promise<'initialized' | 'retained' | 'not_requested'> => {
           if (retainedChildSnapshot) {
-            if (childRevision.created) {
-              await this.bumpWorkflowParentRevision(
-                t,
-                operation.nestedWorkflowName,
-                operation.nestedRunId,
-                childRevision.generation,
-              );
-            }
             return initialChildSnapshot ? 'retained' : 'not_requested';
           }
           if (!initialChildSnapshot || serializedInitialChildSnapshot === undefined) {
-            if (childRevision.created) {
-              await t.none(
-                `DELETE FROM ${this.workflowParentRevisionTableName()}
-                 WHERE workflow_name = $1 AND run_id = $2 AND generation = 0 AND terminal_status IS NULL`,
-                [operation.nestedWorkflowName, operation.nestedRunId],
-              );
-            }
+            await this.deleteProvisionalWorkflowParentRevision(
+              t,
+              operation.nestedWorkflowName,
+              operation.nestedRunId,
+              childRevision.created,
+            );
             return 'not_requested';
           }
           const timestamp = new Date(now);
@@ -3480,6 +4708,12 @@ export class WorkflowsPG extends WorkflowsStorage {
         // that exact owner under the same transaction; missing child evidence
         // still fails closed.
         if (ownership.status === 'already_bound' && !retainedChildSnapshot && !initialChildSnapshot) {
+          await this.deleteProvisionalWorkflowParentRevision(
+            t,
+            operation.nestedWorkflowName,
+            operation.nestedRunId,
+            childRevision.created,
+          );
           return { status: 'ancestry_conflict' };
         }
         const serialized = sanitizeJsonForPg(JSON.stringify(ownership.snapshot));
@@ -3543,7 +4777,7 @@ export class WorkflowsPG extends WorkflowsStorage {
       // Use a transaction with row-level locking to ensure atomicity
       return await this.#db.client.tx(async t => {
         const tableName = getTableName({ indexName: TABLE_WORKFLOW_SNAPSHOT, schemaName: getSchemaName(this.#schema) });
-        const revision = await this.lockWorkflowParentRevision(t, workflowName, runId);
+        const revision = await this.lockWorkflowParentRevisionForSnapshotUpsert(t, workflowName, runId);
 
         // Load existing snapshot within transaction with FOR UPDATE to lock the row
         // This prevents concurrent updates from reading stale data
@@ -3551,6 +4785,9 @@ export class WorkflowsPG extends WorkflowsStorage {
           `SELECT snapshot FROM ${tableName} WHERE workflow_name = $1 AND run_id = $2 FOR UPDATE`,
           [workflowName, runId],
         );
+        if (revision.created && existingSnapshotResult) {
+          throw new TypeError('Workflow snapshot is missing parent revision evidence');
+        }
 
         let snapshot: WorkflowRunState;
         if (!existingSnapshotResult) {
@@ -3590,7 +4827,7 @@ export class WorkflowsPG extends WorkflowsStorage {
            SET snapshot = $3, "updatedAt" = $5, "updatedAtZ" = $7`,
           [workflowName, runId, sanitizedSnapshot, now, now, now, now],
         );
-        await this.bumpWorkflowParentRevision(t, workflowName, runId, revision);
+        await this.bumpWorkflowParentRevision(t, workflowName, runId, revision.generation);
 
         return snapshot.context;
       });
@@ -3623,7 +4860,7 @@ export class WorkflowsPG extends WorkflowsStorage {
       // Use a transaction with row-level locking to ensure atomicity
       return await this.#db.client.tx(async t => {
         const tableName = getTableName({ indexName: TABLE_WORKFLOW_SNAPSHOT, schemaName: getSchemaName(this.#schema) });
-        const revision = await this.lockWorkflowParentRevision(t, workflowName, runId);
+        const revision = await this.lockExistingWorkflowParentRevision(t, workflowName, runId);
 
         // Load existing snapshot within transaction with FOR UPDATE to lock the row
         // This prevents concurrent updates from reading stale data
@@ -3634,6 +4871,9 @@ export class WorkflowsPG extends WorkflowsStorage {
 
         if (!existingSnapshotResult) {
           return undefined;
+        }
+        if (!revision) {
+          throw new TypeError('Workflow snapshot is missing parent revision evidence');
         }
 
         // Parse existing snapshot
@@ -3680,7 +4920,7 @@ export class WorkflowsPG extends WorkflowsStorage {
            WHERE workflow_name = $4 AND run_id = $5`,
           [sanitizedSnapshot, now, now, workflowName, runId],
         );
-        await this.bumpWorkflowParentRevision(t, workflowName, runId, revision);
+        await this.bumpWorkflowParentRevision(t, workflowName, runId, revision.generation);
 
         return updatedSnapshot;
       });
@@ -3722,7 +4962,15 @@ export class WorkflowsPG extends WorkflowsStorage {
       // Sanitize the snapshot JSON to remove problematic Unicode sequences
       const sanitizedSnapshot = sanitizeJsonForPg(JSON.stringify(snapshot));
       await this.#db.client.tx(async t => {
-        const revision = await this.lockWorkflowParentRevision(t, workflowName, runId);
+        const revision = await this.lockWorkflowParentRevisionForSnapshotUpsert(t, workflowName, runId);
+        const existingSnapshot = await t.oneOrNone<{ exists: boolean }>(
+          `SELECT TRUE AS exists FROM ${this.workflowSnapshotTableName()}
+           WHERE workflow_name = $1 AND run_id = $2 FOR UPDATE`,
+          [workflowName, runId],
+        );
+        if (revision.created && existingSnapshot) {
+          throw new TypeError('Workflow snapshot is missing parent revision evidence');
+        }
         await t.none(
           `INSERT INTO ${getTableName({ indexName: TABLE_WORKFLOW_SNAPSHOT, schemaName: getSchemaName(this.#schema) })}
                  (workflow_name, run_id, "resourceId", snapshot, "createdAt", "updatedAt", "createdAtZ", "updatedAtZ")
@@ -3740,7 +4988,7 @@ export class WorkflowsPG extends WorkflowsStorage {
             updatedAtValue,
           ],
         );
-        await this.bumpWorkflowParentRevision(t, workflowName, runId, revision);
+        await this.bumpWorkflowParentRevision(t, workflowName, runId, revision.generation);
       });
     } catch (error) {
       throw new MastraError(
@@ -3840,14 +5088,23 @@ export class WorkflowsPG extends WorkflowsStorage {
   async deleteWorkflowRunById({ runId, workflowName }: { runId: string; workflowName: string }): Promise<void> {
     try {
       await this.#db.client.tx(async t => {
-        const generation = await this.lockWorkflowParentRevision(t, workflowName, runId);
+        const revision = await this.lockExistingWorkflowParentRevision(t, workflowName, runId);
+        const snapshot = await t.oneOrNone<{ exists: boolean }>(
+          `SELECT TRUE AS exists FROM ${this.workflowSnapshotTableName()}
+           WHERE run_id = $1 AND workflow_name = $2 FOR UPDATE`,
+          [runId, workflowName],
+        );
+        if (!snapshot) return;
+        if (!revision) {
+          throw new TypeError('Workflow snapshot is missing parent revision evidence');
+        }
         const result = await t.query(
           `DELETE FROM ${getTableName({ indexName: TABLE_WORKFLOW_SNAPSHOT, schemaName: getSchemaName(this.#schema) })}
            WHERE run_id = $1 AND workflow_name = $2`,
           [runId, workflowName],
         );
         if ((result.rowCount ?? 0) > 0) {
-          await this.bumpWorkflowParentRevision(t, workflowName, runId, generation);
+          await this.bumpWorkflowParentRevision(t, workflowName, runId, revision.generation);
         }
       });
     } catch (error) {
@@ -3895,11 +5152,8 @@ export class WorkflowsPG extends WorkflowsStorage {
         // - \u0000 (null character) fails the jsonb cast with 22P05 "unsupported Unicode escape sequence"
         // - \uD800-\uDFFF (unpaired surrogates) fail with "Unicode low surrogate must follow a high surrogate"
         // See: https://github.com/mastra-ai/mastra/issues/11563
-        const snapshotType = await this.#db.getColumnType(TABLE_WORKFLOW_SNAPSHOT, 'snapshot');
-        const statusExpr =
-          snapshotType === 'jsonb'
-            ? `snapshot ->> 'status'`
-            : `regexp_replace(snapshot::text, '\\\\u(0000|[Dd][89A-Fa-f][0-9A-Fa-f]{2})', '', 'g')::jsonb ->> 'status'`;
+        const snapshotType = await this.resolveWorkflowSnapshotColumnType(this.#db.client);
+        const statusExpr = this.workflowSnapshotStatusExpression(snapshotType, 'snapshot');
         conditions.push(`${statusExpr} = $${paramIndex}`);
         values.push(status);
         paramIndex++;

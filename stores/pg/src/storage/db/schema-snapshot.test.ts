@@ -58,12 +58,30 @@ function count(statements: string[], pattern: RegExp): number {
   return statements.filter(s => pattern.test(s)).length;
 }
 
+function createdTableNames(statements: string[]): string[] {
+  return statements
+    .filter(statement => CREATE_TABLE.test(statement))
+    .map(statement => {
+      const match = /CREATE TABLE IF NOT EXISTS\s+(?:"[^"]+"\.)?"([^"]+)"\s*\(/i.exec(statement);
+      if (!match) throw new Error(`Could not identify CREATE TABLE target: ${statement}`);
+      return match[1]!;
+    });
+}
+
 const INFORMATION_SCHEMA_COLUMN_PROBE = /information_schema\.columns/i;
 const NO_OP_ALTER = /ALTER TABLE[\s\S]*ADD COLUMN IF NOT EXISTS/i;
 const CREATE_TABLE = /CREATE TABLE IF NOT EXISTS/i;
 const INDEX_PROBE = /FROM pg_indexes\b[\s\S]*indexname\s*=/i;
 const CREATE_INDEX = /CREATE (UNIQUE )?INDEX/i;
 const CONSTRAINT_PROBE = /FROM pg_constraint\b[\s\S]*conname\s*=/i;
+const WORKFLOW_BOOTSTRAP_TABLES = [
+  'mastra_workflow_terminalizations',
+  'mastra_workflow_terminal_effects_v2',
+  'mastra_workflow_terminal_snapshots_v2',
+  'mastra_workflow_terminal_recovery_ancestries',
+  'mastra_workflow_terminal_destination_receipts_v2',
+  'mastra_workflow_terminal_continuation_plans_v2',
+] as const;
 
 async function indexesIn(schemaName: string): Promise<string[]> {
   const rows = await admin(`SELECT indexname FROM pg_catalog.pg_indexes WHERE schemaname = $1 ORDER BY indexname`, [
@@ -104,7 +122,7 @@ afterAll(async () => {
 }, 60000);
 
 describe('init catalog snapshot', () => {
-  it('issues no column probes, no-op ALTERs, or CREATE TABLEs on a warm init', async () => {
+  it('issues no column probes, no-op ALTERs, or non-workflow CREATE TABLEs on a warm init', async () => {
     const schema = uniqueSchema('snapshot_warm');
     await admin(`CREATE SCHEMA "${schema}"`);
 
@@ -118,16 +136,49 @@ describe('init catalog snapshot', () => {
     // Guards the capture hook itself: the three snapshot reads must show up, or
     // the zero-counts below would be vacuously true.
     expect(count(statements, /pg_catalog\.pg_tables/i)).toBe(1);
-    expect(count(statements, /pg_catalog\.pg_attribute/i)).toBe(1);
+    // Column shape and ordered PRIMARY KEY columns share the same three-query
+    // snapshot budget but both read pg_attribute.
+    expect(count(statements, /pg_catalog\.pg_attribute/i)).toBe(2);
     expect(count(statements, /pg_catalog\.pg_index\b/i)).toBe(1);
 
     expect(count(statements, INFORMATION_SCHEMA_COLUMN_PROBE)).toBe(0);
     expect(count(statements, NO_OP_ALTER)).toBe(0);
-    expect(count(statements, CREATE_TABLE)).toBe(0);
+    expect(createdTableNames(statements).sort()).toEqual([...WORKFLOW_BOOTSTRAP_TABLES].sort());
     expect(count(statements, INDEX_PROBE)).toBe(0);
     expect(count(statements, CREATE_INDEX)).toBe(0);
     // The spans PRIMARY KEY is index-backed, so the snapshot answers it too.
     expect(count(statements, CONSTRAINT_PROBE)).toBe(0);
+  }, 60000);
+
+  it('uses one indexed workflow migration evidence lookup without revision DDL or backfill on warm init', async () => {
+    const schema = uniqueSchema('snapshot_revision_warm');
+    await admin(`CREATE SCHEMA "${schema}"`);
+
+    const cold = await newStore(schema);
+    await cold.init();
+    await cold.close();
+
+    const warm = await newStore(schema);
+    const statements = await captureStatements(() => warm.init());
+    expect(
+      count(
+        statements,
+        /SELECT[\s\S]*EXISTS\s*\([\s\S]*mastra_workflow_schema_migrations[\s\S]*EXISTS\s*\([\s\S]*mastra_workflow_parent_revision_migration_epoch/i,
+      ),
+    ).toBe(1);
+    expect(
+      count(
+        statements,
+        /(?:CREATE TABLE|ALTER TABLE|INSERT INTO|UPDATE|DELETE FROM)[\s\S]*mastra_workflow_parent_revisions/i,
+      ),
+    ).toBe(0);
+    expect(count(statements, /FROM[\s\S]*mastra_workflow_parent_revisions[\s\S]*(?:UNION|JOIN)/i)).toBe(0);
+    expect(
+      count(
+        statements,
+        /SELECT\s+table_row\.relname\s+AS\s+table_name[\s\S]*table_row\.relname\s+IN\s*\(\$2,\s*\$3,\s*\$4,\s*\$5\)/i,
+      ),
+    ).toBe(0);
   }, 60000);
 
   it('skips the schemata existence probe on a warm init in a fresh process', async () => {
@@ -299,10 +350,11 @@ describe('init catalog snapshot', () => {
     // Same capture-hook guard as the warm-init test above.
     expect(count(statements, /pg_catalog\.pg_tables/i)).toBe(1);
 
-    // The extra objects neither reintroduce probes nor provoke DDL.
+    // The extra objects neither reintroduce probes nor provoke DDL beyond the
+    // six workflow bootstrap statements that PF-3554 owns.
     expect(count(statements, INFORMATION_SCHEMA_COLUMN_PROBE)).toBe(0);
     expect(count(statements, INDEX_PROBE)).toBe(0);
-    expect(count(statements, CREATE_TABLE)).toBe(0);
+    expect(createdTableNames(statements).sort()).toEqual([...WORKFLOW_BOOTSTRAP_TABLES].sort());
     expect(count(statements, CREATE_INDEX)).toBe(0);
     expect(count(statements, NO_OP_ALTER)).toBe(0);
 
