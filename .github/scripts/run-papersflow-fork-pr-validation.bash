@@ -50,6 +50,96 @@ pf2009_config() {
     PF2009_LOCKFILE_SHA256 PF2009_DEPENDENCY_GRAPH_SHA256
 }
 
+pf3553_config() {
+  PF3553_PR_NUMBER="${PAPERSFLOW_PF3553_PR_NUMBER:-373}"
+  PF3553_HEAD_REPOSITORY="${PAPERSFLOW_PF3553_HEAD_REPOSITORY:-mbenhamd/mastra}"
+  PF3553_HEAD_REF="${PAPERSFLOW_PF3553_HEAD_REF:-feature/pf-3553-selected-routes}"
+  PF3553_BASE_REF="${PAPERSFLOW_PF3553_BASE_REF:-main}"
+  PF3553_POLICY_BASE_REF="${PAPERSFLOW_PF3553_POLICY_BASE_REF:-ci/pf-3557-selected-route-export-validation}"
+  PF3553_BASE_SURFACE_SHA256="${PAPERSFLOW_PF3553_BASE_SURFACE_SHA256:-2f0aba283874dd626a54b8e18ec37ba5cddacf01c4a74ab9373076ce53501942}"
+  PF3553_HEAD_SURFACE_SHA256="${PAPERSFLOW_PF3553_HEAD_SURFACE_SHA256:-ebed2920c714252d70f08646d09acfafbe748e2829996170c7add18cd3956f64}"
+  readonly PF3553_PR_NUMBER PF3553_HEAD_REPOSITORY PF3553_HEAD_REF \
+    PF3553_BASE_REF PF3553_POLICY_BASE_REF PF3553_BASE_SURFACE_SHA256 \
+    PF3553_HEAD_SURFACE_SHA256
+}
+
+pf3553_base_ref_allowed() {
+  [[ "$1" == "$PF3553_BASE_REF" || "$1" == "$PF3553_POLICY_BASE_REF" ]]
+}
+
+pf3553_reviewed_paths() {
+  cat <<'EOF'
+.changeset/calm-routes-select.md
+.changeset/lean-fastify-select.md
+docs/src/content/en/docs/server/server-adapters.mdx
+packages/server/package.json
+packages/server/src/server/server-adapter/index.test.ts
+packages/server/src/server/server-adapter/index.ts
+packages/server/src/server/server-adapter/routes/harness.ts
+packages/server/src/server/server-adapter/selected-import-closure.test.ts
+packages/server/src/server/server-adapter/selected.test.ts
+packages/server/src/server/server-adapter/selected.ts
+packages/server/tsdown.config.ts
+server-adapters/fastify/package.json
+server-adapters/fastify/src/__tests__/selected-import-closure.test.ts
+server-adapters/fastify/src/__tests__/selected-package-exports.test.ts
+server-adapters/fastify/src/__tests__/selected-routes.test.ts
+server-adapters/fastify/src/index.ts
+server-adapters/fastify/src/selected.ts
+server-adapters/fastify/test-fixtures/selected-package-types/consumer.cts
+server-adapters/fastify/test-fixtures/selected-package-types/consumer.mts
+server-adapters/fastify/test-fixtures/selected-package-types/tsconfig.json
+server-adapters/fastify/tsdown.config.ts
+EOF
+}
+
+pf3553_surface_digest() {
+  local revision="${1:?revision is required}"
+  local path entry
+
+  while IFS= read -r path; do
+    entry="$(git ls-tree "$revision" -- "$path")"
+    printf '%s\t%s\n' "$path" "${entry:-missing}"
+  done < <(pf3553_reviewed_paths) |
+    sha256sum |
+    awk '{print $1}'
+}
+
+verify_pf3553_reviewed_surface() (
+  local base_revision="${1:?base revision is required}"
+  local head_revision="${2:?head revision is required}"
+  local merge_base expected_paths actual_paths base_digest head_digest
+
+  merge_base="$(git merge-base "$base_revision" "$head_revision")"
+  expected_paths="$(mktemp)"
+  actual_paths="$(mktemp)"
+  trap 'rm -f "$expected_paths" "$actual_paths"' EXIT
+
+  pf3553_reviewed_paths | LC_ALL=C sort > "$expected_paths"
+  git diff --no-renames --name-only "$merge_base..$head_revision" |
+    LC_ALL=C sort > "$actual_paths"
+  if ! cmp -s "$expected_paths" "$actual_paths"; then
+    echo 'PF-3553 changed paths differ from the reviewed selected-route surface:' >&2
+    diff -u "$expected_paths" "$actual_paths" >&2 || true
+    return 1
+  fi
+
+  base_digest="$(pf3553_surface_digest "$merge_base")"
+  head_digest="$(pf3553_surface_digest "$head_revision")"
+  if [[ "$base_digest" != "$PF3553_BASE_SURFACE_SHA256" ]]; then
+    echo 'PF-3553 reviewed base files changed after the selected-route review.' >&2
+    echo "expected: $PF3553_BASE_SURFACE_SHA256" >&2
+    echo "actual:   $base_digest" >&2
+    return 1
+  fi
+  if [[ "$head_digest" != "$PF3553_HEAD_SURFACE_SHA256" ]]; then
+    echo 'PF-3553 selected-route file identities differ from the reviewed head.' >&2
+    echo "expected: $PF3553_HEAD_SURFACE_SHA256" >&2
+    echo "actual:   $head_digest" >&2
+    return 1
+  fi
+)
+
 pf3375_config() {
   PF3375_HEAD_REPOSITORY="${PAPERSFLOW_PF3375_HEAD_REPOSITORY:-mbenhamd/mastra}"
   PF3375_HEAD_REF="${PAPERSFLOW_PF3375_HEAD_REF:-feature/pf-3375-mastra-upstream-sync-372b1a71}"
@@ -611,6 +701,252 @@ git_dependency_graph_sha256() {
     awk '{print $1}'
 }
 
+verify_pf3553_selected_route_exports() {
+  local base_revision="${1:?base revision is required}"
+  local head_revision="${2:?head revision is required}"
+
+  node - "$base_revision" "$head_revision" <<'NODE'
+const { execFileSync } = require('node:child_process');
+const { isDeepStrictEqual, TextDecoder } = require('node:util');
+
+const [baseRevision, headRevision] = process.argv.slice(2);
+const manifestPaths = [
+  'packages/server/package.json',
+  'server-adapters/fastify/package.json',
+];
+const manifestPathSet = new Set(manifestPaths);
+const decoder = new TextDecoder('utf-8', { fatal: true });
+
+function fail(message) {
+  throw new Error(message);
+}
+
+function decodeUtf8(value, description) {
+  try {
+    return decoder.decode(value);
+  } catch {
+    fail(`${description} is not valid UTF-8.`);
+  }
+}
+
+function treeEntries(revision) {
+  const output = execFileSync(
+    'git',
+    ['ls-tree', '-r', '-z', '--full-tree', revision],
+    { encoding: 'buffer', maxBuffer: 64 * 1024 * 1024 },
+  );
+  const entries = new Map();
+  let offset = 0;
+  while (offset < output.length) {
+    const end = output.indexOf(0, offset);
+    if (end < 0) fail(`Git tree listing for ${revision} is not NUL-terminated.`);
+    if (end === offset) {
+      offset = end + 1;
+      continue;
+    }
+    const rawEntry = output.subarray(offset, end);
+    const separator = rawEntry.indexOf(9);
+    if (separator < 1) fail(`Git tree listing for ${revision} has a malformed entry.`);
+    const metadata = rawEntry.subarray(0, separator).toString('ascii');
+    const match = /^(\d{6}) (blob|commit) ([0-9a-f]{40,64})$/.exec(metadata);
+    if (!match) fail(`Git tree listing for ${revision} has unsupported metadata: ${metadata}`);
+    const path = decodeUtf8(rawEntry.subarray(separator + 1), `Git path at ${revision}`);
+    if (entries.has(path)) fail(`Git tree listing for ${revision} repeats ${JSON.stringify(path)}.`);
+    entries.set(path, { mode: match[1], type: match[2], oid: match[3] });
+    offset = end + 1;
+  }
+  return entries;
+}
+
+function isDependencyGraphPath(path) {
+  const segments = path.split('/');
+  const basename = segments.at(-1);
+  if (
+    basename === '.npmrc' ||
+    basename === '.pnpmfile.cjs' ||
+    basename === 'pnpmfile.cjs' ||
+    basename === 'pnpm-workspace.yaml' ||
+    basename === 'package.json' ||
+    basename === 'pnpm-lock.yaml'
+  ) {
+    return true;
+  }
+  const patchesIndex = segments.indexOf('patches');
+  return patchesIndex >= 0 && patchesIndex < segments.length - 1;
+}
+
+function entryIdentity(entry) {
+  return entry ? `${entry.mode} ${entry.type} ${entry.oid}` : undefined;
+}
+
+function requireManifestEntry(entries, revision, path) {
+  const entry = entries.get(path);
+  if (!entry || entry.mode !== '100644' || entry.type !== 'blob') {
+    fail(`${path} must be a non-executable regular blob at ${revision}.`);
+  }
+  return entry;
+}
+
+function parseManifest(entry, revision, path) {
+  const bytes = execFileSync('git', ['cat-file', 'blob', entry.oid], {
+    encoding: 'buffer',
+    maxBuffer: 8 * 1024 * 1024,
+  });
+  const source = decodeUtf8(bytes, `${path} at ${revision}`);
+  let manifest;
+  try {
+    manifest = JSON.parse(source);
+  } catch (error) {
+    fail(`${path} is invalid JSON at ${revision}: ${error.message}`);
+  }
+  if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
+    fail(`${path} must contain a JSON object at ${revision}.`);
+  }
+  return manifest;
+}
+
+function requireExactExports(baseManifest, headManifest, additions, path) {
+  const baseExports = baseManifest.exports;
+  const headExports = headManifest.exports;
+  if (
+    !baseExports ||
+    typeof baseExports !== 'object' ||
+    Array.isArray(baseExports) ||
+    !headExports ||
+    typeof headExports !== 'object' ||
+    Array.isArray(headExports)
+  ) {
+    fail(`${path} must preserve an object-valued exports map.`);
+  }
+
+  const expectedExports = structuredClone(baseExports);
+  for (const [exportPath, target] of Object.entries(additions)) {
+    if (Object.hasOwn(baseExports, exportPath)) {
+      fail(`${path} base already contains reviewed export ${exportPath}.`);
+    }
+    expectedExports[exportPath] = target;
+  }
+  if (!isDeepStrictEqual(headExports, expectedExports)) {
+    fail(`${path} exports differ from the exact PF-3553 additive map.`);
+  }
+
+  // Conditional-export object order is runtime behavior: `default` before
+  // `types`, for example, changes Node/TypeScript resolution even when the
+  // object has the same keys and values. Preserve the order of every base
+  // entry and require each reviewed addition in its literal reviewed order.
+  const headWithoutAdditions = structuredClone(headExports);
+  for (const exportPath of Object.keys(additions)) delete headWithoutAdditions[exportPath];
+  if (JSON.stringify(headWithoutAdditions) !== JSON.stringify(baseExports)) {
+    fail(`${path} reordered an existing exports entry or condition.`);
+  }
+  for (const [exportPath, target] of Object.entries(additions)) {
+    if (JSON.stringify(headExports[exportPath]) !== JSON.stringify(target)) {
+      fail(`${path} reordered reviewed conditions for ${exportPath}.`);
+    }
+  }
+
+  const normalizedHead = structuredClone(headManifest);
+  normalizedHead.exports = structuredClone(baseExports);
+  if (!isDeepStrictEqual(normalizedHead, baseManifest)) {
+    fail(`${path} metadata outside exports changed.`);
+  }
+}
+
+try {
+  const baseEntries = treeEntries(baseRevision);
+  const headEntries = treeEntries(headRevision);
+  const dependencyPaths = new Set();
+  for (const path of baseEntries.keys()) {
+    if (isDependencyGraphPath(path) && !manifestPathSet.has(path)) dependencyPaths.add(path);
+  }
+  for (const path of headEntries.keys()) {
+    if (isDependencyGraphPath(path) && !manifestPathSet.has(path)) dependencyPaths.add(path);
+  }
+  const changedDependencyPaths = [...dependencyPaths]
+    .filter(
+      path => entryIdentity(baseEntries.get(path)) !== entryIdentity(headEntries.get(path)),
+    )
+    .sort();
+  if (changedDependencyPaths.length > 0) {
+    fail(
+      `dependency graph changed outside the two reviewed manifests: ${changedDependencyPaths
+        .map(path => JSON.stringify(path))
+        .join(', ')}`,
+    );
+  }
+
+  const baseServerEntry = requireManifestEntry(
+    baseEntries,
+    baseRevision,
+    manifestPaths[0],
+  );
+  const headServerEntry = requireManifestEntry(
+    headEntries,
+    headRevision,
+    manifestPaths[0],
+  );
+  const baseFastifyEntry = requireManifestEntry(
+    baseEntries,
+    baseRevision,
+    manifestPaths[1],
+  );
+  const headFastifyEntry = requireManifestEntry(
+    headEntries,
+    headRevision,
+    manifestPaths[1],
+  );
+
+  requireExactExports(
+    parseManifest(baseServerEntry, baseRevision, manifestPaths[0]),
+    parseManifest(headServerEntry, headRevision, manifestPaths[0]),
+    {
+      './server-adapter/selected': {
+        import: {
+          types: './dist/server/server-adapter/selected.d.ts',
+          default: './dist/server/server-adapter/selected.js',
+        },
+        require: {
+          types: './dist/server/server-adapter/selected.d.ts',
+          default: './dist/server/server-adapter/selected.cjs',
+        },
+      },
+      './server-adapter/routes/harness': {
+        import: {
+          types: './dist/server/server-adapter/routes/harness.d.ts',
+          default: './dist/server/server-adapter/routes/harness.js',
+        },
+        require: {
+          types: './dist/server/server-adapter/routes/harness.d.ts',
+          default: './dist/server/server-adapter/routes/harness.cjs',
+        },
+      },
+    },
+    manifestPaths[0],
+  );
+  requireExactExports(
+    parseManifest(baseFastifyEntry, baseRevision, manifestPaths[1]),
+    parseManifest(headFastifyEntry, headRevision, manifestPaths[1]),
+    {
+      './selected': {
+        import: {
+          types: './dist/selected.d.ts',
+          default: './dist/selected.js',
+        },
+        require: {
+          types: './dist/selected.d.ts',
+          default: './dist/selected.cjs',
+        },
+      },
+    },
+    manifestPaths[1],
+  );
+} catch (error) {
+  console.error(`PF-3553 selected-route export admission failed: ${error.message}`);
+  process.exit(1);
+}
+NODE
+}
+
 emit_validation_lane() {
   local lane="$1"
   if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
@@ -629,7 +965,7 @@ classify_install_lane() (
   trap 'rm -f "$manifest_changes"' EXIT
   git diff --no-renames --name-only "${BASE_SHA}...${HEAD_SHA}" -- \
     .npmrc .pnpmfile.cjs pnpmfile.cjs package.json pnpm-workspace.yaml \
-    patches packages/server/package.json |
+    patches packages/server/package.json server-adapters/fastify/package.json |
     sort -u > "$manifest_changes"
 
   # PF-3375 is frozen to one reviewed merge commit, tree, branch, repository,
@@ -711,6 +1047,22 @@ classify_install_lane() (
 
     echo 'PF-2045 exact two-parent upstream merge and reconstructed tree accepted from trusted base policy.'
     emit_validation_lane pf2045-upstream-sync
+    return
+  fi
+
+  # PF-3553 is frozen to the complete reviewed 21-file Server/Fastify feature
+  # surface. In addition, require the exact three additive selected-route
+  # exports, preserve conditional-export ordering, and keep every other
+  # dependency-graph entry and all non-export manifest metadata unchanged.
+  pf3553_config
+  if [[ "${PR_NUMBER:-}" == "$PF3553_PR_NUMBER" && \
+    "${HEAD_REPOSITORY:-}" == "$PF3553_HEAD_REPOSITORY" && \
+    "${HEAD_REF:-}" == "$PF3553_HEAD_REF" ]] && \
+    pf3553_base_ref_allowed "${BASE_REF:-}"; then
+    verify_pf3553_selected_route_exports "$BASE_SHA" "$HEAD_SHA"
+    verify_pf3553_reviewed_surface "$BASE_SHA" "$HEAD_SHA"
+    echo 'PF-3553 exact reviewed selected-route surface and export maps accepted from trusted base policy.'
+    emit_validation_lane pf3553-selected-route-exports
     return
   fi
 
@@ -839,6 +1191,556 @@ EOF
 
   echo 'PF-558 exact dependency-graph exception accepted from trusted base policy.'
   emit_validation_lane pf558-upstream-sync
+)
+
+run_pf3553_admission_self_tests() (
+  local script_path test_root fixture_repo base_sha valid_head mutation_head output
+  local fixture_base_surface_sha256 fixture_head_surface_sha256
+  script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+  test_root="$(mktemp -d)"
+  fixture_repo="$test_root/repo"
+
+  # Invoked indirectly by the EXIT trap below.
+  # shellcheck disable=SC2317
+  pf3553_fixture_cleanup() {
+    local status=$?
+    trap - EXIT
+    if (( status != 0 )); then
+      echo 'PF-3553 admission fixture failed; captured classifier output follows:' >&2
+      find "$test_root" -maxdepth 1 -type f -name '*.log' -print \
+        -exec sed -n '1,240p' {} \; >&2 || true
+    fi
+    rm -rf -- "$test_root"
+    exit "$status"
+  }
+  trap pf3553_fixture_cleanup EXIT
+
+  mkdir -p \
+    "$fixture_repo/docs/src/content/en/docs/server" \
+    "$fixture_repo/packages/core" \
+    "$fixture_repo/packages/server/src/server/server-adapter/routes" \
+    "$fixture_repo/server-adapters/fastify/src" \
+    "$fixture_repo/patches"
+  git -C "$fixture_repo" init -q -b main
+  git -C "$fixture_repo" config user.email validator@example.test
+  git -C "$fixture_repo" config user.name 'PF-3553 validator fixture'
+
+  cat > "$fixture_repo/package.json" <<'JSON'
+{
+  "name": "fixture-root",
+  "private": true,
+  "scripts": {
+    "check": "trusted-root-check"
+  }
+}
+JSON
+  cat > "$fixture_repo/packages/core/package.json" <<'JSON'
+{
+  "name": "@mastra/core",
+  "version": "1.0.0"
+}
+JSON
+  cat > "$fixture_repo/packages/server/package.json" <<'JSON'
+{
+  "name": "@mastra/server",
+  "version": "1.0.0",
+  "files": [
+    "dist",
+    "CHANGELOG.md"
+  ],
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./server-adapter": {
+      "import": {
+        "types": "./dist/server/server-adapter/index.d.ts",
+        "default": "./dist/server/server-adapter/index.js"
+      },
+      "require": {
+        "types": "./dist/server/server-adapter/index.d.ts",
+        "default": "./dist/server/server-adapter/index.cjs"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "build:lib": "trusted-server-build",
+    "lint": "trusted-server-lint",
+    "test": "trusted-server-test"
+  },
+  "dependencies": {
+    "hono": "^4.0.0"
+  },
+  "peerDependencies": {
+    "zod": "^4.0.0"
+  }
+}
+JSON
+  cat > "$fixture_repo/server-adapters/fastify/package.json" <<'JSON'
+{
+  "name": "@mastra/fastify",
+  "version": "1.0.0",
+  "files": [
+    "dist",
+    "CHANGELOG.md"
+  ],
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "build": "trusted-fastify-build",
+    "lint": "trusted-fastify-lint",
+    "test": "trusted-fastify-test"
+  },
+  "dependencies": {
+    "@mastra/server": "workspace:*"
+  },
+  "peerDependencies": {
+    "fastify": "^5.0.0"
+  }
+}
+JSON
+  printf '%s\n' 'base adapter documentation' \
+    > "$fixture_repo/docs/src/content/en/docs/server/server-adapters.mdx"
+  printf '%s\n' 'base server adapter test' \
+    > "$fixture_repo/packages/server/src/server/server-adapter/index.test.ts"
+  printf '%s\n' 'base server adapter' \
+    > "$fixture_repo/packages/server/src/server/server-adapter/index.ts"
+  printf '%s\n' 'base Harness routes' \
+    > "$fixture_repo/packages/server/src/server/server-adapter/routes/harness.ts"
+  printf '%s\n' 'base Server build configuration' \
+    > "$fixture_repo/packages/server/tsdown.config.ts"
+  printf '%s\n' 'base Fastify adapter' \
+    > "$fixture_repo/server-adapters/fastify/src/index.ts"
+  printf '%s\n' 'base Fastify build configuration' \
+    > "$fixture_repo/server-adapters/fastify/tsdown.config.ts"
+  printf '%s\n' '{"name":"symlink-target"}' \
+    > "$fixture_repo/server-adapters/fastify-package.json"
+  printf '%s\n' 'registry=https://registry.npmjs.org/' > "$fixture_repo/.npmrc"
+  printf '%s\n' 'module.exports = { hooks: {} };' > "$fixture_repo/.pnpmfile.cjs"
+  printf '%s\n' 'packages:' "  - 'packages/*'" "  - 'server-adapters/*'" \
+    > "$fixture_repo/pnpm-workspace.yaml"
+  printf '%s\n' "lockfileVersion: '9.0'" 'importers: {}' \
+    > "$fixture_repo/pnpm-lock.yaml"
+  printf '%s\n' 'trusted patch' > "$fixture_repo/patches/trusted.patch"
+  git -C "$fixture_repo" add .
+  git -C "$fixture_repo" commit -q -m base
+  base_sha="$(git -C "$fixture_repo" rev-parse HEAD)"
+  fixture_base_surface_sha256="$(cd "$fixture_repo" && pf3553_surface_digest "$base_sha")"
+
+  cat > "$fixture_repo/packages/server/package.json" <<'JSON'
+{
+  "name": "@mastra/server",
+  "version": "1.0.0",
+  "files": [
+    "dist",
+    "CHANGELOG.md"
+  ],
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./server-adapter": {
+      "import": {
+        "types": "./dist/server/server-adapter/index.d.ts",
+        "default": "./dist/server/server-adapter/index.js"
+      },
+      "require": {
+        "types": "./dist/server/server-adapter/index.d.ts",
+        "default": "./dist/server/server-adapter/index.cjs"
+      }
+    },
+    "./server-adapter/selected": {
+      "import": {
+        "types": "./dist/server/server-adapter/selected.d.ts",
+        "default": "./dist/server/server-adapter/selected.js"
+      },
+      "require": {
+        "types": "./dist/server/server-adapter/selected.d.ts",
+        "default": "./dist/server/server-adapter/selected.cjs"
+      }
+    },
+    "./server-adapter/routes/harness": {
+      "import": {
+        "types": "./dist/server/server-adapter/routes/harness.d.ts",
+        "default": "./dist/server/server-adapter/routes/harness.js"
+      },
+      "require": {
+        "types": "./dist/server/server-adapter/routes/harness.d.ts",
+        "default": "./dist/server/server-adapter/routes/harness.cjs"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "build:lib": "trusted-server-build",
+    "lint": "trusted-server-lint",
+    "test": "trusted-server-test"
+  },
+  "dependencies": {
+    "hono": "^4.0.0"
+  },
+  "peerDependencies": {
+    "zod": "^4.0.0"
+  }
+}
+JSON
+  cat > "$fixture_repo/server-adapters/fastify/package.json" <<'JSON'
+{
+  "name": "@mastra/fastify",
+  "version": "1.0.0",
+  "files": [
+    "dist",
+    "CHANGELOG.md"
+  ],
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./selected": {
+      "import": {
+        "types": "./dist/selected.d.ts",
+        "default": "./dist/selected.js"
+      },
+      "require": {
+        "types": "./dist/selected.d.ts",
+        "default": "./dist/selected.cjs"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "build": "trusted-fastify-build",
+    "lint": "trusted-fastify-lint",
+    "test": "trusted-fastify-test"
+  },
+  "dependencies": {
+    "@mastra/server": "workspace:*"
+  },
+  "peerDependencies": {
+    "fastify": "^5.0.0"
+  }
+}
+JSON
+  mkdir -p \
+    "$fixture_repo/.changeset" \
+    "$fixture_repo/packages/server/src/server/server-adapter" \
+    "$fixture_repo/server-adapters/fastify/src/__tests__" \
+    "$fixture_repo/server-adapters/fastify/test-fixtures/selected-package-types"
+  printf '%s\n' 'reviewed Server changeset' > "$fixture_repo/.changeset/calm-routes-select.md"
+  printf '%s\n' 'reviewed Fastify changeset' > "$fixture_repo/.changeset/lean-fastify-select.md"
+  printf '%s\n' 'reviewed adapter documentation' \
+    > "$fixture_repo/docs/src/content/en/docs/server/server-adapters.mdx"
+  printf '%s\n' 'reviewed server adapter test' \
+    > "$fixture_repo/packages/server/src/server/server-adapter/index.test.ts"
+  printf '%s\n' 'reviewed server adapter' \
+    > "$fixture_repo/packages/server/src/server/server-adapter/index.ts"
+  printf '%s\n' 'reviewed Harness routes' \
+    > "$fixture_repo/packages/server/src/server/server-adapter/routes/harness.ts"
+  printf '%s\n' 'reviewed selected Server import test' \
+    > "$fixture_repo/packages/server/src/server/server-adapter/selected-import-closure.test.ts"
+  printf '%s\n' 'reviewed selected Server test' \
+    > "$fixture_repo/packages/server/src/server/server-adapter/selected.test.ts"
+  printf '%s\n' 'reviewed selected Server adapter' \
+    > "$fixture_repo/packages/server/src/server/server-adapter/selected.ts"
+  printf '%s\n' 'reviewed Server build configuration' \
+    > "$fixture_repo/packages/server/tsdown.config.ts"
+  printf '%s\n' 'reviewed selected Fastify import test' \
+    > "$fixture_repo/server-adapters/fastify/src/__tests__/selected-import-closure.test.ts"
+  printf '%s\n' 'reviewed selected package exports test' \
+    > "$fixture_repo/server-adapters/fastify/src/__tests__/selected-package-exports.test.ts"
+  printf '%s\n' 'reviewed selected Fastify routes test' \
+    > "$fixture_repo/server-adapters/fastify/src/__tests__/selected-routes.test.ts"
+  printf '%s\n' 'reviewed Fastify adapter' \
+    > "$fixture_repo/server-adapters/fastify/src/index.ts"
+  printf '%s\n' 'reviewed selected Fastify adapter' \
+    > "$fixture_repo/server-adapters/fastify/src/selected.ts"
+  printf '%s\n' 'reviewed CommonJS type consumer' \
+    > "$fixture_repo/server-adapters/fastify/test-fixtures/selected-package-types/consumer.cts"
+  printf '%s\n' 'reviewed ESM type consumer' \
+    > "$fixture_repo/server-adapters/fastify/test-fixtures/selected-package-types/consumer.mts"
+  printf '%s\n' '{"compilerOptions":{"module":"NodeNext"}}' \
+    > "$fixture_repo/server-adapters/fastify/test-fixtures/selected-package-types/tsconfig.json"
+  printf '%s\n' 'reviewed Fastify build configuration' \
+    > "$fixture_repo/server-adapters/fastify/tsdown.config.ts"
+  git -C "$fixture_repo" add -A
+  git -C "$fixture_repo" commit -q -m 'exact selected-route exports'
+  valid_head="$(git -C "$fixture_repo" rev-parse HEAD)"
+  fixture_head_surface_sha256="$(cd "$fixture_repo" && pf3553_surface_digest "$valid_head")"
+
+  run_fixture_admission() {
+    local fixture_head="$1"
+    local fixture_output="$2"
+    shift 2
+    (
+      cd "$fixture_repo"
+      env \
+        GITHUB_OUTPUT= \
+        BASE_SHA="$base_sha" \
+        HEAD_SHA="$fixture_head" \
+        PR_NUMBER=373 \
+        HEAD_REPOSITORY=mbenhamd/mastra \
+        HEAD_REF=feature/pf-3553-selected-routes \
+        BASE_REF=main \
+        PAPERSFLOW_PF3553_BASE_SURFACE_SHA256="$fixture_base_surface_sha256" \
+        PAPERSFLOW_PF3553_HEAD_SURFACE_SHA256="$fixture_head_surface_sha256" \
+        "$@" \
+        bash "$script_path" --classify-install
+    ) > "$fixture_output" 2>&1
+  }
+
+  assert_rejected() {
+    local label="$1"
+    local fixture_head="$2"
+    output="$test_root/${label}.log"
+    if run_fixture_admission "$fixture_head" "$output"; then
+      echo "PF-3553 hostile fixture unexpectedly passed: $label" >&2
+      cat "$output" >&2
+      return 1
+    fi
+    if ! grep -Fq 'PF-3553 selected-route export admission failed:' "$output"; then
+      echo "PF-3553 hostile fixture failed for an unexpected reason: $label" >&2
+      cat "$output" >&2
+      return 1
+    fi
+  }
+
+  json_mutation_head() (
+    local path="$1"
+    local mode="$2"
+    cd "$fixture_repo"
+    git reset -q --hard "$valid_head"
+    node - "$path" "$mode" <<'NODE'
+const fs = require('node:fs');
+const [path, mode] = process.argv.slice(2);
+const manifest = JSON.parse(fs.readFileSync(path, 'utf8'));
+switch (mode) {
+  case 'script':
+    manifest.scripts.reviewed = 'untrusted-script';
+    break;
+  case 'lifecycle':
+    manifest.scripts.preinstall = 'untrusted-lifecycle';
+    break;
+  case 'dependency':
+    manifest.dependencies['untrusted-dependency'] = '^1.0.0';
+    break;
+  case 'files':
+    manifest.files.push('unreviewed-output');
+    break;
+  case 'retarget':
+    manifest.exports['./server-adapter/selected'].import.default =
+      './dist/server/server-adapter/retargeted.js';
+    break;
+  case 'traversal':
+    manifest.exports['./selected'].require.default = '../outside.cjs';
+    break;
+  case 'wildcard':
+    manifest.exports['./*'] = './dist/*.js';
+    break;
+  case 'extra-export':
+    manifest.exports['./unreviewed'] = './dist/unreviewed.js';
+    break;
+  case 'extra-condition':
+    manifest.exports['./selected'].import.browser = './dist/selected.browser.js';
+    break;
+  case 'missing-export':
+    delete manifest.exports['./server-adapter/routes/harness'];
+    break;
+  case 'reorder-added-condition': {
+    const selected = manifest.exports['./selected'].import;
+    manifest.exports['./selected'].import = {
+      default: selected.default,
+      types: selected.types,
+    };
+    break;
+  }
+  case 'reorder-existing-condition': {
+    const root = manifest.exports['.'].import;
+    manifest.exports['.'].import = {
+      default: root.default,
+      types: root.types,
+    };
+    break;
+  }
+  default:
+    throw new Error(`Unknown fixture mutation: ${mode}`);
+}
+fs.writeFileSync(path, `${JSON.stringify(manifest, null, 2)}\n`);
+NODE
+    git add -A
+    git commit -q -m "mutate manifest: $mode"
+    git rev-parse HEAD
+  )
+
+  graph_mutation_head() (
+    local mode="$1"
+    cd "$fixture_repo"
+    git reset -q --hard "$valid_head"
+    case "$mode" in
+      lockfile)
+        printf '%s\n' 'unreviewed: true' >> pnpm-lock.yaml
+        ;;
+      workspace)
+        printf '%s\n' "  - 'unreviewed/*'" >> pnpm-workspace.yaml
+        ;;
+      nested-manifest)
+        printf '%s\n' '{"name":"@mastra/core","version":"2.0.0"}' \
+          > packages/core/package.json
+        ;;
+      pnpm-hook)
+        printf '%s\n' 'module.exports.unreviewed = true;' >> .pnpmfile.cjs
+        ;;
+      patch)
+        printf '%s\n' 'unreviewed patch content' >> patches/trusted.patch
+        ;;
+      unknown-workspace)
+        mkdir -p server-adapters/unreviewed
+        printf '%s\n' '{"name":"@mastra/unreviewed"}' \
+          > server-adapters/unreviewed/package.json
+        ;;
+      *)
+        echo "Unknown graph mutation: $mode" >&2
+        return 2
+        ;;
+    esac
+    git add -A
+    git commit -q -m "mutate dependency graph: $mode"
+    git rev-parse HEAD
+  )
+
+  output="$test_root/accepted.log"
+  run_fixture_admission "$valid_head" "$output"
+  grep -Fxq 'lane=pf3553-selected-route-exports' "$output"
+
+  output="$test_root/accepted-stacked-policy-base.log"
+  run_fixture_admission "$valid_head" "$output" \
+    BASE_REF=ci/pf-3557-selected-route-export-validation
+  grep -Fxq 'lane=pf3553-selected-route-exports' "$output"
+
+  mutation_head="$(json_mutation_head packages/server/package.json script)"
+  assert_rejected script-metadata "$mutation_head"
+  mutation_head="$(json_mutation_head server-adapters/fastify/package.json lifecycle)"
+  assert_rejected lifecycle-metadata "$mutation_head"
+  mutation_head="$(json_mutation_head server-adapters/fastify/package.json dependency)"
+  assert_rejected dependency-metadata "$mutation_head"
+  mutation_head="$(json_mutation_head packages/server/package.json files)"
+  assert_rejected files-metadata "$mutation_head"
+  mutation_head="$(json_mutation_head packages/server/package.json retarget)"
+  assert_rejected export-retarget "$mutation_head"
+  mutation_head="$(json_mutation_head server-adapters/fastify/package.json traversal)"
+  assert_rejected export-traversal "$mutation_head"
+  mutation_head="$(json_mutation_head packages/server/package.json wildcard)"
+  assert_rejected wildcard-export "$mutation_head"
+  mutation_head="$(json_mutation_head server-adapters/fastify/package.json extra-export)"
+  assert_rejected extra-export "$mutation_head"
+  mutation_head="$(json_mutation_head server-adapters/fastify/package.json extra-condition)"
+  assert_rejected extra-condition "$mutation_head"
+  mutation_head="$(json_mutation_head server-adapters/fastify/package.json reorder-added-condition)"
+  assert_rejected reorder-added-condition "$mutation_head"
+  mutation_head="$(json_mutation_head server-adapters/fastify/package.json reorder-existing-condition)"
+  assert_rejected reorder-existing-condition "$mutation_head"
+  mutation_head="$(json_mutation_head packages/server/package.json missing-export)"
+  assert_rejected missing-export "$mutation_head"
+
+  for graph_mutation in \
+    lockfile workspace nested-manifest pnpm-hook patch unknown-workspace; do
+    mutation_head="$(graph_mutation_head "$graph_mutation")"
+    assert_rejected "$graph_mutation" "$mutation_head"
+  done
+
+  mutation_head="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$valid_head"
+    printf '%s\n' '{invalid json' > packages/server/package.json
+    git add -A
+    git commit -q -m 'invalid Server manifest'
+    git rev-parse HEAD
+  )"
+  assert_rejected invalid-json "$mutation_head"
+
+  mutation_head="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$valid_head"
+    git rm -q server-adapters/fastify/package.json
+    git commit -q -m 'delete Fastify manifest'
+    git rev-parse HEAD
+  )"
+  assert_rejected deleted-manifest "$mutation_head"
+
+  mutation_head="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$valid_head"
+    rm server-adapters/fastify/package.json
+    ln -s ../fastify-package.json server-adapters/fastify/package.json
+    git add -A
+    git commit -q -m 'replace Fastify manifest with symlink'
+    git rev-parse HEAD
+  )"
+  assert_rejected nonregular-manifest "$mutation_head"
+
+  mutation_head="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$valid_head"
+    printf '%s\n' 'unreviewed selected implementation' \
+      > server-adapters/fastify/src/selected.ts
+    git add server-adapters/fastify/src/selected.ts
+    git commit -q -m 'mutate reviewed selected source'
+    git rev-parse HEAD
+  )"
+  output="$test_root/reviewed-surface-drift.log"
+  if run_fixture_admission "$mutation_head" "$output"; then
+    echo 'PF-3553 source drift outside the reviewed file identities unexpectedly passed.' >&2
+    return 1
+  fi
+  grep -Fq 'PF-3553 selected-route file identities differ from the reviewed head.' "$output"
+
+  output="$test_root/wrong-head-metadata.log"
+  if run_fixture_admission "$valid_head" "$output" HEAD_REF=feature/not-pf-3553; then
+    echo 'PF-3553 exact manifests with wrong PR metadata unexpectedly passed.' >&2
+    return 1
+  fi
+  grep -Fq 'do not match a reviewed upstream-sync lane' "$output"
+
+  output="$test_root/wrong-base-metadata.log"
+  if run_fixture_admission "$valid_head" "$output" BASE_REF=ci/unreviewed-policy; then
+    echo 'PF-3553 exact manifests with an unreviewed base unexpectedly passed.' >&2
+    return 1
+  fi
+  grep -Fq 'do not match a reviewed upstream-sync lane' "$output"
+
+  echo 'PF-3553 exact reviewed-surface, export-order, dependency-graph, metadata, and file-mode admission fixtures passed.'
 )
 
 run_pf558_admission_self_tests() (
@@ -2145,6 +3047,10 @@ case "${1:-}" in
     classify_install_lane
     exit
     ;;
+  --self-test-pf3553-selected-route-exports)
+    run_pf3553_admission_self_tests
+    exit
+    ;;
   --self-test-pf558-upstream-sync)
     run_pf558_admission_self_tests
     exit
@@ -2190,6 +3096,8 @@ run_validator_self_tests() {
   local service_log
   local base_sha
   local head_sha
+  local pf3553_base_sha pf3553_head_sha pf3553_lane_spoof_head_sha
+  local pf3553_base_surface_sha256 pf3553_head_surface_sha256
   local inngest_trio_head_sha inngest_pf2050_head_sha inngest_manager_followup_head_sha
   local fixture_inngest_test_blob fixture_inngest_test_sha
   local fixture_inngest_compose_blob fixture_inngest_compose_sha
@@ -2197,6 +3105,10 @@ run_validator_self_tests() {
   local temporal_build_line temporal_typecheck_line
   local output
   local status
+
+  # Keep the dedicated manifest/dependency admission suite in the aggregate
+  # validator self-test as well as exposing it through its focused entrypoint.
+  run_pf3553_admission_self_tests
 
   validator_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
   test_root="$(mktemp -d)"
@@ -2265,6 +3177,18 @@ run_validator_self_tests() {
     '  mkdir -p packages/cli/src/commands/api' \
     '  printf '\''%s\n'\'' "export const routeMetadata = '\''regenerated'\'';" > packages/cli/src/commands/api/route-metadata.generated.ts' \
     'fi' \
+    'if [[ " $* " == *" --filter ./packages/server --fail-if-no-match build:lib "* ]]; then' \
+    '  mkdir -p packages/server/dist/server/server-adapter/routes' \
+    '  for path in packages/server/dist/server/server-adapter/selected.{d.ts,js,cjs} packages/server/dist/server/server-adapter/routes/harness.{d.ts,js,cjs}; do' \
+    '    printf '\''%s\n'\'' "// fixture build output" > "$path"' \
+    '  done' \
+    'fi' \
+    'if [[ " $* " == *" --filter ./server-adapters/fastify --fail-if-no-match build "* ]]; then' \
+    '  mkdir -p server-adapters/fastify/dist' \
+    '  for path in server-adapters/fastify/dist/selected.{d.ts,js,cjs}; do' \
+    '    printf '\''%s\n'\'' "// fixture build output" > "$path"' \
+    '  done' \
+    'fi' \
     'for argument in "$@"; do' \
     '  case "$argument" in' \
     '    --outputFile.json=*)' \
@@ -2275,6 +3199,8 @@ run_validator_self_tests() {
     '          nonnumeric) printf '\''%s\n'\'' '\''{"numPassedTests":"one","numFailedTests":0}'\'' > "${argument#*=}" ;;' \
     '          *) printf '\''%s\n'\'' '\''{"numPassedTests":1,"numFailedTests":0}'\'' > "${argument#*=}" ;;' \
     '        esac' \
+    '      elif [[ " $* " == *" --dir server-adapters/fastify exec vitest run "* ]]; then' \
+    '        printf '\''%s\n'\'' '\''{"numPassedTests":3,"numFailedTests":0,"testResults":[{"name":"server-adapters/fastify/src/__tests__/selected-import-closure.test.ts","status":"passed","assertionResults":[{"status":"passed"}]},{"name":"server-adapters/fastify/src/__tests__/selected-package-exports.test.ts","status":"passed","assertionResults":[{"status":"passed"}]},{"name":"server-adapters/fastify/src/__tests__/selected-routes.test.ts","status":"passed","assertionResults":[{"status":"passed"}]}]}'\'' > "${argument#*=}"' \
     '      else' \
     '        printf '\''%s\n'\'' '\''{"numPassedTests":1,"numFailedTests":0}'\'' > "${argument#*=}"' \
     '      fi' \
@@ -2598,12 +3524,361 @@ run_validator_self_tests() {
     fi
   }
 
+  assert_line_count() {
+    local expected_count="$1"
+    local expected_line="$2"
+    local file="$3"
+    local actual_count
+    actual_count="$(grep -Fxc -- "$expected_line" "$file" || true)"
+    if [[ "$actual_count" != "$expected_count" ]]; then
+      echo "Expected fixture line count $expected_count for: $expected_line" >&2
+      echo "Actual fixture line count: $actual_count" >&2
+      cat "$file" >&2
+      exit 1
+    fi
+  }
+
   assert_route_consumer_commands() {
     assert_contains '--dir client-sdks/client-js exec tsc-files --noEmit src/route-types.generated.ts src/types.ts src/resources/harness.ts src/resources/agent.test.ts' "$command_log"
     assert_contains '--dir packages/cli exec tsc-files --noEmit src/commands/api/route-metadata.generated.ts src/commands/api/index.ts src/commands/api/descriptors.test.ts' "$command_log"
     assert_contains '--dir client-sdks/client-js exec vitest run src/resources/harness.test.ts --reporter=dot' "$command_log"
     assert_contains '--dir packages/cli exec vitest run src/commands/api/descriptors.test.ts --reporter=dot' "$command_log"
   }
+
+  pf3553_base_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    mkdir -p \
+      docs/src/content/en/docs/server \
+      packages/server/src/server/server-adapter/routes \
+      server-adapters/fastify/src
+    printf '%s\n' '{}' > docs/package.json
+    cat > packages/server/package.json <<'JSON'
+{
+  "name": "@mastra/server",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./server-adapter": {
+      "import": {
+        "types": "./dist/server/server-adapter/index.d.ts",
+        "default": "./dist/server/server-adapter/index.js"
+      },
+      "require": {
+        "types": "./dist/server/server-adapter/index.d.ts",
+        "default": "./dist/server/server-adapter/index.cjs"
+      }
+    }
+  },
+  "scripts": {
+    "build:lib": "trusted-server-build",
+    "lint": "trusted-server-lint",
+    "test": "trusted-server-test"
+  },
+  "dependencies": {
+    "hono": "^4.0.0"
+  }
+}
+JSON
+    cat > server-adapters/fastify/package.json <<'JSON'
+{
+  "name": "@mastra/fastify",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.cjs"
+      }
+    }
+  },
+  "scripts": {
+    "build": "trusted-fastify-build",
+    "lint": "trusted-fastify-lint",
+    "test": "trusted-fastify-test"
+  },
+  "dependencies": {
+    "@mastra/server": "workspace:*"
+  }
+}
+JSON
+    printf '%s\n' 'base adapter documentation' \
+      > docs/src/content/en/docs/server/server-adapters.mdx
+    printf '%s\n' 'base server adapter test' \
+      > packages/server/src/server/server-adapter/index.test.ts
+    printf '%s\n' 'base server adapter' \
+      > packages/server/src/server/server-adapter/index.ts
+    printf '%s\n' 'base Harness routes' \
+      > packages/server/src/server/server-adapter/routes/harness.ts
+    printf '%s\n' 'base Server build configuration' > packages/server/tsdown.config.ts
+    printf '%s\n' 'base Fastify adapter' > server-adapters/fastify/src/index.ts
+    printf '%s\n' 'base Fastify build configuration' > server-adapters/fastify/tsdown.config.ts
+    rm -rf \
+      .changeset/calm-routes-select.md \
+      .changeset/lean-fastify-select.md \
+      packages/server/src/server/server-adapter/selected-import-closure.test.ts \
+      packages/server/src/server/server-adapter/selected.test.ts \
+      packages/server/src/server/server-adapter/selected.ts \
+      server-adapters/fastify/src/__tests__/selected-import-closure.test.ts \
+      server-adapters/fastify/src/__tests__/selected-package-exports.test.ts \
+      server-adapters/fastify/src/__tests__/selected-routes.test.ts \
+      server-adapters/fastify/src/selected.ts \
+      server-adapters/fastify/test-fixtures/selected-package-types
+    git add -A
+    git commit -q -m 'PF-3553 fixture base manifests'
+    git rev-parse HEAD
+  )"
+  pf3553_base_surface_sha256="$(
+    cd "$fixture_repo"
+    pf3553_surface_digest "$pf3553_base_sha"
+  )"
+
+  pf3553_head_sha="$(
+    cd "$fixture_repo"
+    cat > packages/server/package.json <<'JSON'
+{
+  "name": "@mastra/server",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./server-adapter": {
+      "import": {
+        "types": "./dist/server/server-adapter/index.d.ts",
+        "default": "./dist/server/server-adapter/index.js"
+      },
+      "require": {
+        "types": "./dist/server/server-adapter/index.d.ts",
+        "default": "./dist/server/server-adapter/index.cjs"
+      }
+    },
+    "./server-adapter/selected": {
+      "import": {
+        "types": "./dist/server/server-adapter/selected.d.ts",
+        "default": "./dist/server/server-adapter/selected.js"
+      },
+      "require": {
+        "types": "./dist/server/server-adapter/selected.d.ts",
+        "default": "./dist/server/server-adapter/selected.cjs"
+      }
+    },
+    "./server-adapter/routes/harness": {
+      "import": {
+        "types": "./dist/server/server-adapter/routes/harness.d.ts",
+        "default": "./dist/server/server-adapter/routes/harness.js"
+      },
+      "require": {
+        "types": "./dist/server/server-adapter/routes/harness.d.ts",
+        "default": "./dist/server/server-adapter/routes/harness.cjs"
+      }
+    }
+  },
+  "scripts": {
+    "build:lib": "trusted-server-build",
+    "lint": "trusted-server-lint",
+    "test": "trusted-server-test"
+  },
+  "dependencies": {
+    "hono": "^4.0.0"
+  }
+}
+JSON
+    cat > server-adapters/fastify/package.json <<'JSON'
+{
+  "name": "@mastra/fastify",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./selected": {
+      "import": {
+        "types": "./dist/selected.d.ts",
+        "default": "./dist/selected.js"
+      },
+      "require": {
+        "types": "./dist/selected.d.ts",
+        "default": "./dist/selected.cjs"
+      }
+    }
+  },
+  "scripts": {
+    "build": "trusted-fastify-build",
+    "lint": "trusted-fastify-lint",
+    "test": "trusted-fastify-test"
+  },
+  "dependencies": {
+    "@mastra/server": "workspace:*"
+  }
+}
+JSON
+    mkdir -p \
+      .changeset \
+      packages/server/src/server/server-adapter \
+      server-adapters/fastify/src/__tests__ \
+      server-adapters/fastify/test-fixtures/selected-package-types
+    printf '%s\n' 'reviewed Server changeset' > .changeset/calm-routes-select.md
+    printf '%s\n' 'reviewed Fastify changeset' > .changeset/lean-fastify-select.md
+    printf '%s\n' 'reviewed adapter documentation' \
+      > docs/src/content/en/docs/server/server-adapters.mdx
+    printf '%s\n' 'reviewed server adapter test' \
+      > packages/server/src/server/server-adapter/index.test.ts
+    printf '%s\n' 'reviewed server adapter' \
+      > packages/server/src/server/server-adapter/index.ts
+    printf '%s\n' 'reviewed Harness routes' \
+      > packages/server/src/server/server-adapter/routes/harness.ts
+    printf '%s\n' 'reviewed selected Server import test' \
+      > packages/server/src/server/server-adapter/selected-import-closure.test.ts
+    printf '%s\n' 'reviewed selected Server test' \
+      > packages/server/src/server/server-adapter/selected.test.ts
+    printf '%s\n' 'reviewed selected Server adapter' \
+      > packages/server/src/server/server-adapter/selected.ts
+    printf '%s\n' 'reviewed Server build configuration' > packages/server/tsdown.config.ts
+    printf '%s\n' 'reviewed selected Fastify import test' \
+      > server-adapters/fastify/src/__tests__/selected-import-closure.test.ts
+    printf '%s\n' 'reviewed selected package exports test' \
+      > server-adapters/fastify/src/__tests__/selected-package-exports.test.ts
+    printf '%s\n' 'reviewed selected Fastify routes test' \
+      > server-adapters/fastify/src/__tests__/selected-routes.test.ts
+    printf '%s\n' 'reviewed Fastify adapter' > server-adapters/fastify/src/index.ts
+    printf '%s\n' 'reviewed selected Fastify adapter' > server-adapters/fastify/src/selected.ts
+    printf '%s\n' 'reviewed CommonJS type consumer' \
+      > server-adapters/fastify/test-fixtures/selected-package-types/consumer.cts
+    printf '%s\n' 'reviewed ESM type consumer' \
+      > server-adapters/fastify/test-fixtures/selected-package-types/consumer.mts
+    printf '%s\n' '{"compilerOptions":{"module":"NodeNext"}}' \
+      > server-adapters/fastify/test-fixtures/selected-package-types/tsconfig.json
+    printf '%s\n' 'reviewed Fastify build configuration' \
+      > server-adapters/fastify/tsdown.config.ts
+    git add -A
+    git commit -q -m 'PF-3553 exact export maps'
+    git rev-parse HEAD
+  )"
+  pf3553_head_surface_sha256="$(
+    cd "$fixture_repo"
+    pf3553_surface_digest "$pf3553_head_sha"
+  )"
+  : > "$command_log"
+  output="$test_root/pf3553-command-owner-success.log"
+  set +e
+  run_fixture "$pf3553_head_sha" "$output" \
+    BASE_SHA="$pf3553_base_sha" \
+    PAPERSFLOW_PF3553_BASE_SURFACE_SHA256="$pf3553_base_surface_sha256" \
+    PAPERSFLOW_PF3553_HEAD_SURFACE_SHA256="$pf3553_head_surface_sha256"
+  status=$?
+  set -e
+  if (( status != 0 )); then
+    echo 'Exact PF-3553 command-owner fixture failed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains '--filter ./packages/server --fail-if-no-match build:lib' "$command_log"
+  assert_contains '--filter ./packages/server --fail-if-no-match exec tsc --noEmit' "$command_log"
+  assert_contains '--filter ./packages/server --fail-if-no-match lint' "$command_log"
+  assert_contains '--filter ./packages/server --fail-if-no-match check:core-imports' "$command_log"
+  assert_contains 'build:server' "$command_log"
+  assert_contains '--filter @mastra/server lint' "$command_log"
+  assert_contains '--filter @mastra/server check:core-imports' "$command_log"
+  assert_contains '--filter @mastra/server check:permissions' "$command_log"
+  assert_contains '--filter @mastra/server generate:route-types' "$command_log"
+  assert_contains '--filter @mastra/server generate:api-cli-route-metadata' "$command_log"
+  assert_line_count 1 \
+    '--filter ./stores/libsql --fail-if-no-match build:lib' \
+    "$command_log"
+  assert_line_count 1 \
+    '--filter ./observability/mastra --fail-if-no-match build' \
+    "$command_log"
+  assert_line_count 1 \
+    '--filter ./packages/mcp --fail-if-no-match build:lib' \
+    "$command_log"
+  assert_line_count 1 \
+    '--dir server-adapters/fastify exec tsc-files --noEmit src/index.ts src/selected.ts src/__tests__/selected-import-closure.test.ts src/__tests__/selected-package-exports.test.ts src/__tests__/selected-routes.test.ts' \
+    "$command_log"
+  assert_line_count 1 \
+    '--filter ./server-adapters/fastify --fail-if-no-match build' \
+    "$command_log"
+  assert_line_count 1 \
+    '--filter ./server-adapters/fastify --fail-if-no-match lint' \
+    "$command_log"
+  assert_line_matches \
+    '^--dir server-adapters/fastify exec vitest run --reporter=dot --reporter=json --outputFile\.json=' \
+    "$command_log"
+  for reviewed_server_test in \
+    src/server/server-adapter/index.test.ts \
+    src/server/server-adapter/selected-import-closure.test.ts \
+    src/server/server-adapter/selected.test.ts; do
+    assert_line_matches \
+      "^--dir packages/server exec vitest run --reporter=dot --reporter=json --outputFile\\.json=.* ${reviewed_server_test}$" \
+      "$command_log"
+    assert_line_matches \
+      "^OPENAI_API_KEY=[[:space:]]--dir packages/server exec vitest run --reporter=dot --reporter=json --outputFile\\.json=.* ${reviewed_server_test}$" \
+      "$command_environment_log"
+  done
+  rm -rf -- \
+    "$fixture_repo/packages/server/dist" \
+    "$fixture_repo/server-adapters/fastify/dist"
+
+  pf3553_lane_spoof_head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$pf3553_head_sha"
+    node - <<'NODE'
+const fs = require('node:fs');
+const path = 'server-adapters/fastify/package.json';
+const manifest = JSON.parse(fs.readFileSync(path, 'utf8'));
+manifest.scripts.preinstall = 'untrusted-lifecycle';
+fs.writeFileSync(path, `${JSON.stringify(manifest, null, 2)}\n`);
+NODE
+    git add server-adapters/fastify/package.json
+    git commit -q -m 'spoof PF-3553 lane with lifecycle mutation'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/pf3553-lane-spoof-failure.log"
+  set +e
+  run_fixture "$pf3553_lane_spoof_head_sha" "$output" \
+    BASE_SHA="$pf3553_base_sha" \
+    PAPERSFLOW_PF3553_BASE_SURFACE_SHA256="$pf3553_base_surface_sha256" \
+    PAPERSFLOW_PF3553_HEAD_SURFACE_SHA256="$pf3553_head_surface_sha256" \
+    VALIDATION_LANE=pf3553-selected-route-exports
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Spoofed PF-3553 lane with changed lifecycle metadata unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'PF-3553 selected-route export admission failed:' "$output"
+  assert_contains 'server-adapters/fastify/package.json' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Spoofed PF-3553 lane executed PR-controlled package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+  git -C "$fixture_repo" reset -q --hard "$base_sha"
 
   head_sha="$(
     cd "$fixture_repo"
@@ -2619,7 +3894,15 @@ run_validator_self_tests() {
   )"
   : > "$command_log"
   output="$test_root/server-success.log"
+  set +e
   run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status != 0 )); then
+    echo 'Server route command-owner fixture failed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
   assert_contains '--filter @mastra/server check:permissions' "$command_log"
   assert_contains '--filter @mastra/server generate:route-types' "$command_log"
   assert_contains '--filter @mastra/server generate:api-cli-route-metadata' "$command_log"
@@ -7376,6 +8659,8 @@ changed_files="$(mktemp)"
 changed_lockfile_importers="$(mktemp)"
 changed_workspaces="$(mktemp)"
 changed_tests="$(mktemp)"
+fastify_changed_tests="$(mktemp)"
+fastify_test_result="$(mktemp)"
 forced_mastracode_tests="$(mktemp)"
 forced_workspace_tests="$(mktemp)"
 delegated_docs_tests="$(mktemp)"
@@ -7393,7 +8678,7 @@ unsupported_owned_workspace_tests="$(mktemp)"
 unsupported_owned_workspace_pairs="$(mktemp)"
 unsupported_workspaces="$(mktemp)"
 workspace_candidates="$(mktemp)"
-trap 'rm -f "$changed_files" "$changed_lockfile_importers" "$changed_workspaces" "$changed_tests" "$forced_mastracode_tests" "$forced_workspace_tests" "$delegated_docs_tests" "$deleted_tests" "$fixer_test_result" "$root_vitest_config_list" "$unowned_files" "$unsupported_inputs" "$missing_mastracode_tests" "$unsupported_mastracode_tests" "$unsupported_mastracode_sources" "$unsupported_tests" "$unsupported_owned_workspace_sources" "$unsupported_owned_workspace_tests" "$unsupported_owned_workspace_pairs" "$unsupported_workspaces" "$workspace_candidates"' EXIT
+trap 'rm -f "$changed_files" "$changed_lockfile_importers" "$changed_workspaces" "$changed_tests" "$fastify_changed_tests" "$fastify_test_result" "$forced_mastracode_tests" "$forced_workspace_tests" "$delegated_docs_tests" "$deleted_tests" "$fixer_test_result" "$root_vitest_config_list" "$unowned_files" "$unsupported_inputs" "$missing_mastracode_tests" "$unsupported_mastracode_sources" "$unsupported_mastracode_tests" "$unsupported_tests" "$unsupported_owned_workspace_sources" "$unsupported_owned_workspace_tests" "$unsupported_owned_workspace_pairs" "$unsupported_workspaces" "$workspace_candidates"' EXIT
 
 # Treat renames as a delete plus an add so both ownership boundaries are
 # validated. Otherwise moving a generated artifact out of its canonical path
@@ -7410,6 +8695,20 @@ git diff --no-renames --name-only --diff-filter=D "${merge_base_sha}..${HEAD_SHA
 
 echo "Changed files:"
 cat "$changed_files"
+
+# Recompute the PF-3553 semantic boundary in the main validator. The
+# classifier's lane output is intentionally not consulted here: a spoofed or
+# stale VALIDATION_LANE value must not suppress unsupported-manifest checks.
+pf3553_config
+pf3553_selected_route_exports=false
+if grep -Eq \
+  '^(packages/server/package\.json|server-adapters/fastify/package\.json)$' \
+  "$changed_files"; then
+  if verify_pf3553_selected_route_exports "$BASE_SHA" "$HEAD_SHA" &&
+    verify_pf3553_reviewed_surface "$BASE_SHA" "$HEAD_SHA"; then
+    pf3553_selected_route_exports=true
+  fi
+fi
 
 git_regular_file_at_head() {
   git ls-tree "$HEAD_SHA" -- "$1" | grep -Eq '^100(644|755) blob '
@@ -8931,6 +10230,11 @@ while IFS= read -r workspace; do
   fi
   case "$workspace" in
     auth/okta | browser/stagehand | packages/_internal-core | packages/cli | packages/codemod | packages/core | packages/deployer | packages/mcp | packages/memory | packages/server | client-sdks/ai-sdk | client-sdks/client-js | stores/_test-utils | stores/convex | stores/libsql | stores/pg | stores/redis | mastracode | mastracode/sdk | mastracode/tui | pubsub/google-cloud-pubsub | pubsub/redis-streams | workflows/inngest | workflows/temporal | observability/mastra | docs) ;;
+    server-adapters/fastify)
+      if [[ "$pf3553_selected_route_exports" == false ]]; then
+        printf '%s\n' "$workspace" >> "$unsupported_workspaces"
+      fi
+      ;;
     *) printf '%s\n' "$workspace" >> "$unsupported_workspaces" ;;
   esac
 done < "$changed_workspaces"
@@ -8966,9 +10270,14 @@ done < "$unowned_files"
 
 grep -E '^(package\.json|pnpm-workspace\.yaml|patches/)' "$changed_files" \
   >> "$unsupported_inputs" || true
-# Server validation invokes package-owned scripts. Reject manifest edits before
-# any PR-controlled Server command can weaken or replace those checks.
-grep -Fx 'packages/server/package.json' "$changed_files" >> "$unsupported_inputs" || true
+# Server and Fastify validation invoke package-owned scripts. Admit their two
+# manifests only after the exact PF-3553 semantic predicate above succeeds;
+# every other edit fails before PR-controlled package commands can run.
+if [[ "$pf3553_selected_route_exports" == false ]]; then
+  grep -E \
+    '^(packages/server/package\.json|server-adapters/fastify/package\.json)$' \
+    "$changed_files" >> "$unsupported_inputs" || true
+fi
 
 verify_pf2057_inngest_dependency_cleanup() {
   node - "$merge_base_sha" "$HEAD_SHA" <<'NODE'
@@ -9985,6 +11294,23 @@ ensure_server_prerequisites() {
   server_prerequisites_built=true
 }
 
+fastify_prerequisites_built=false
+ensure_fastify_prerequisites() {
+  if [[ "$fastify_prerequisites_built" == true ]]; then
+    return
+  fi
+
+  # Fastify's TypeScript project includes examples that resolve LibSQL and
+  # observability through their dist exports. Its complete Vitest suite loads
+  # @mastra/mcp through the shared adapter test utilities. A clean install has
+  # none of those generated trees, so build the exact runtime prerequisites.
+  ensure_server_prerequisites
+  run_with_validation_budget 900 pnpm --filter ./stores/libsql --fail-if-no-match build:lib
+  run_with_validation_budget 900 pnpm --filter ./observability/mastra --fail-if-no-match build
+  run_with_validation_budget 900 pnpm --filter ./packages/mcp --fail-if-no-match build:lib
+  fastify_prerequisites_built=true
+}
+
 deployer_prerequisites_built=false
 ensure_deployer_prerequisites() {
   if [[ "$deployer_prerequisites_built" == true ]]; then
@@ -10241,6 +11567,56 @@ if workspace_changed packages/server; then
     run_with_validation_budget 600 \
       pnpm --dir packages/cli exec vitest run src/commands/api/descriptors.test.ts --reporter=dot
   fi
+fi
+
+if workspace_changed server-adapters/fastify; then
+  # Fastify is admitted only for the exact PF-3553 reviewed file identities.
+  # The pinned base's package tsconfig includes an unrelated example that does
+  # not typecheck, so compile the complete reviewed production/test source set
+  # directly. The package declaration build below independently compiles every
+  # production source under tsconfig.build.json. The package suite runs later,
+  # after changed-test admission.
+  ensure_fastify_prerequisites
+  run_with_validation_budget 600 \
+    pnpm --dir server-adapters/fastify exec tsc-files --noEmit \
+      src/index.ts \
+      src/selected.ts \
+      src/__tests__/selected-import-closure.test.ts \
+      src/__tests__/selected-package-exports.test.ts \
+      src/__tests__/selected-routes.test.ts
+  run_with_validation_budget 900 \
+    pnpm --filter ./server-adapters/fastify --fail-if-no-match build
+  run_with_validation_budget 600 \
+    pnpm --filter ./server-adapters/fastify --fail-if-no-match lint
+  node <<'NODE'
+const fs = require('node:fs');
+
+const expectedOutputs = [
+  'packages/server/dist/server/server-adapter/selected.d.ts',
+  'packages/server/dist/server/server-adapter/selected.js',
+  'packages/server/dist/server/server-adapter/selected.cjs',
+  'packages/server/dist/server/server-adapter/routes/harness.d.ts',
+  'packages/server/dist/server/server-adapter/routes/harness.js',
+  'packages/server/dist/server/server-adapter/routes/harness.cjs',
+  'server-adapters/fastify/dist/selected.d.ts',
+  'server-adapters/fastify/dist/selected.js',
+  'server-adapters/fastify/dist/selected.cjs',
+];
+
+for (const path of expectedOutputs) {
+  let stat;
+  try {
+    stat = fs.lstatSync(path);
+  } catch {
+    console.error(`PF-3553 build did not emit reviewed export target: ${path}`);
+    process.exit(1);
+  }
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    console.error(`PF-3553 export target is not a regular build output: ${path}`);
+    process.exit(1);
+  }
+}
+NODE
 fi
 
 if workspace_changed client-sdks/ai-sdk; then
@@ -10849,6 +12225,17 @@ test_runtime_surface_has_unsupported_runtime() {
   return 1
 }
 
+is_pf3553_reviewed_server_test() {
+  local file="$1"
+  [[ "$pf3553_selected_route_exports" == true ]] || return 1
+  case "$file" in
+    packages/server/src/server/server-adapter/index.test.ts | \
+      packages/server/src/server/server-adapter/selected-import-closure.test.ts | \
+      packages/server/src/server/server-adapter/selected.test.ts) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # Collection is by path alone, because -f follows symlinks: a changed suite
 # replaced by a dangling symlink would drop out of validation entirely instead
 # of failing closed. git_regular_file_at_head below is the mode-aware existence
@@ -10920,6 +12307,13 @@ if (( ${#detected_tests[@]} > 0 )); then
     elif is_explicit_fork_safe_test "$file" &&
       test_runtime_surface_has_unsupported_runtime "$file"; then
       printf '%s\n' "$file" >> "$unsupported_tests"
+    elif is_pf3553_reviewed_server_test "$file"; then
+      # These exact Server suites and their complete local dependency closure
+      # are frozen by PF-3553's reviewed changed-path set and Git-object
+      # digests. Their current closure contains conservative fetch()/process.env
+      # markers but the reviewed tests make no provider or external-service
+      # calls. Keep the generic runtime scanner fail-closed for every other PR.
+      printf '%s\n' "$file" >> "$changed_tests"
     elif [[ "$file" == packages/server/* ]] &&
       test_runtime_surface_has_unsupported_runtime "$file"; then
       printf '%s\n' "$file" >> "$unsupported_tests"
@@ -10936,6 +12330,18 @@ if (( ${#detected_tests[@]} > 0 )); then
       # exercises real route handlers against InMemoryStore without credentials,
       # provider calls, containers, or other external infrastructure.
       printf '%s\n' "$file" >> "$changed_tests"
+    elif [[ "$file" == server-adapters/fastify/* ]]; then
+      # The complete Fastify suite is deferred until every changed test has
+      # been admitted. PF-3553 freezes the complete file surface by Git object
+      # identity, so only these three reviewed suites may enter that run.
+      case "$file" in
+        server-adapters/fastify/src/__tests__/selected-import-closure.test.ts | \
+          server-adapters/fastify/src/__tests__/selected-package-exports.test.ts | \
+          server-adapters/fastify/src/__tests__/selected-routes.test.ts)
+          printf '%s\n' "$file" >> "$fastify_changed_tests"
+          ;;
+        *) printf '%s\n' "$file" >> "$unsupported_tests" ;;
+      esac
     elif [[ "$file" == browser/stagehand/src/__tests__/profile-lifecycle.test.ts ]]; then
       printf '%s\n' "$file" >> "$unsupported_tests"
     elif [[ "$file" == e2e-tests/* || "$file" == */integration-tests/* || \
@@ -11010,6 +12416,41 @@ if [[ -s "$unsupported_tests" ]]; then
   cat "$unsupported_tests" >&2
   echo "Failing closed instead of reporting incomplete validation as successful." >&2
   exit 1
+fi
+
+if [[ -s "$fastify_changed_tests" ]]; then
+  LC_ALL=C sort -u -o "$fastify_changed_tests" "$fastify_changed_tests"
+  : > "$fastify_test_result"
+  run_with_validation_budget 900 \
+    env OPENAI_API_KEY= ANTHROPIC_API_KEY= GOOGLE_GENERATIVE_AI_API_KEY= \
+    pnpm --dir server-adapters/fastify exec vitest run \
+      --reporter=dot --reporter=json --outputFile.json="$fastify_test_result"
+  node - "$fastify_test_result" "$fastify_changed_tests" <<'NODE'
+const fs = require('node:fs');
+
+const [reportPath, requiredPathsFile] = process.argv.slice(2);
+const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+const requiredPaths = fs.readFileSync(requiredPathsFile, 'utf8').split('\n').filter(Boolean);
+if (requiredPaths.length !== 3) {
+  console.error(`PF-3553 expected exactly three reviewed Fastify suites; found ${requiredPaths.length}.`);
+  process.exit(1);
+}
+if (!Number.isSafeInteger(report.numFailedTests) || report.numFailedTests !== 0) {
+  console.error('The complete Fastify suite reported failed tests.');
+  process.exit(1);
+}
+for (const requiredPath of requiredPaths) {
+  const testResult = report.testResults?.find(result => {
+    const normalizedName = String(result.name ?? '').replaceAll('\\', '/');
+    return normalizedName === requiredPath || normalizedName.endsWith(`/${requiredPath}`);
+  });
+  const passedAssertions = testResult?.assertionResults?.filter(result => result.status === 'passed') ?? [];
+  if (!testResult || testResult.status !== 'passed' || passedAssertions.length < 1) {
+    console.error(`The complete Fastify suite did not collect and pass ${requiredPath}.`);
+    process.exit(1);
+  }
+}
+NODE
 fi
 
 storage_test_utils_runnable_test=false
@@ -11278,6 +12719,10 @@ while IFS= read -r file; do
     # The frozen provider subtree remains skipped even if the runner happens to
     # carry an ambient OpenAI credential.
     vitest_environment=(env OPENAI_API_KEY=)
+  elif is_pf3553_reviewed_server_test "$file"; then
+    # Keep accidental hosted-runner provider credentials out of these exact
+    # local Server suites even though the reviewed tests do not call providers.
+    vitest_environment=(env OPENAI_API_KEY= ANTHROPIC_API_KEY= GOOGLE_GENERATIVE_AI_API_KEY=)
   fi
   search_dir="$(dirname "$file")"
 
