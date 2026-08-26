@@ -271,5 +271,17 @@ describe('HTTP Logging Configuration', () => {
         'access_token[1]': '[REDACTED]',
       });
     });
+
+    it('redacts nested credential keys', () => {
+      expect(
+        redactSensitiveQueryParams({
+          foo: 'bar',
+          auth: { token: 'secret', nested: ['ok', { apiKey: 'secret' }] },
+        }),
+      ).toEqual({
+        foo: 'bar',
+        auth: { token: '[REDACTED]', nested: ['ok', { apiKey: '[REDACTED]' }] },
+      });
+    });
   });
 });

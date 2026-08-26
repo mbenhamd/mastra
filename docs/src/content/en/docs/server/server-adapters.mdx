@@ -5,6 +5,8 @@ packages:
   - "@mastra/express"
   - "@mastra/hono"
   - "@mastra/nestjs"
+  - "@mastra/fastify"
+  - "@mastra/server"
 ---
 
 import Tabs from "@theme/Tabs";
@@ -45,6 +47,31 @@ Mastra currently provides these official server adapters:
 - [@mastra/nestjs](/reference/server/nestjs-adapter)
 
 You can build your own adapter, read [custom adapters](/docs/server/custom-adapters) for details.
+
+## Selected routes
+
+Default adapter imports still register the complete built-in route registry. Hosts that only need a reviewed subset can import the selected-route entrypoints instead. Those constructors require an explicit `routeRegistry` and a `routes` selector; unknown or duplicate selections are rejected, canonical registry order is preserved, and the chosen set is frozen before the server accepts traffic. Handlers are not lazy-loaded on the first request.
+
+The Harness session-control allowlist is `HARNESS_SESSION_CONTROL_ROUTES` from `@mastra/server/server-adapter/routes/harness`. Pass that tuple as `routes` with `routeRegistry: HARNESS_ROUTES` when a host should expose only those three Harness routes.
+
+```typescript title="src/fastify-selected-server.ts"
+import Fastify from 'fastify'
+import { MastraServer } from '@mastra/fastify/selected'
+import { HARNESS_ROUTES, HARNESS_SESSION_CONTROL_ROUTES } from '@mastra/server/server-adapter/routes/harness'
+import { mastra } from './mastra'
+
+const app = Fastify()
+const server = new MastraServer({
+  app,
+  mastra,
+  routeRegistry: HARNESS_ROUTES,
+  routes: HARNESS_SESSION_CONTROL_ROUTES,
+})
+
+await server.init()
+```
+
+Array selectors keep caller order for custom lists. Prefer the frozen Harness tuple when the host should match the canonical three-route allowlist.
 
 ## Installation
 

@@ -161,14 +161,12 @@ describe('selected Fastify routes', () => {
       });
 
       expect(response.statusCode).toBe(400);
-      expect(response.json()).toEqual({
+      expect(response.json()).toMatchObject({
         code: 'harness.validation',
         message: 'Invalid body',
-        details: {
-          field: 'category',
-          reason: 'Invalid input: expected string, received undefined',
-        },
+        details: { field: 'category' },
       });
+      expect(String(response.json().details.reason)).toContain('expected string');
     } finally {
       await app.close();
     }

@@ -138,7 +138,7 @@ declare module 'fastify' {
     requestContext: RequestContext;
     registeredTools: ToolsInput;
     abortSignal: AbortSignal;
-    taskStore: InMemoryTaskStore;
+    taskStore?: InMemoryTaskStore;
     customRouteAuthConfig?: Map<string, boolean>;
   }
 }
@@ -857,7 +857,10 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
           options: Object.keys(options).length > 0 ? options : undefined,
         });
         // Response handled by startHTTP
-      } catch {
+      } catch (error) {
+        this.mastra.getLogger()?.error('Error handling MCP HTTP request', {
+          error: error instanceof Error ? { message: error.message, stack: error.stack } : error,
+        });
         if (!reply.raw.headersSent) {
           reply.raw.writeHead(500, { 'Content-Type': 'application/json' });
           reply.raw.end(
@@ -898,7 +901,10 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
           res: reply.raw,
         });
         // Response handled by startSSE
-      } catch {
+      } catch (error) {
+        this.mastra.getLogger()?.error('Error handling MCP SSE request', {
+          error: error instanceof Error ? { message: error.message, stack: error.stack } : error,
+        });
         if (!reply.raw.headersSent) {
           reply.raw.writeHead(500, { 'Content-Type': 'application/json' });
           reply.raw.end(JSON.stringify({ error: 'Error handling MCP SSE request' }));
@@ -1025,7 +1031,7 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
         }
       }
 
-      if (params.body) {
+      if (params.body !== undefined) {
         try {
           params.body = await this.parseBody(route, params.body);
         } catch (error) {
@@ -1158,6 +1164,9 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
           ) {
             status = (error.details as any).status;
           }
+        }
+        if (typeof status !== 'number' || !Number.isInteger(status) || status < 100 || status > 599) {
+          status = 500;
         }
         await reply.status(status).send({ error: error instanceof Error ? error.message : 'Unknown error' });
       }

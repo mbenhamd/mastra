@@ -427,10 +427,23 @@ function isSensitiveQueryParamKey(key: string): boolean {
 /**
  * Returns a copy of query parameters with credential-like values redacted.
  */
+function redactQueryValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(redactQueryValue);
+  }
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, nested]) => [
+        key,
+        isSensitiveQueryParamKey(key) ? '[REDACTED]' : redactQueryValue(nested),
+      ]),
+    );
+  }
+  return value;
+}
+
 export function redactSensitiveQueryParams(rawQuery: Record<string, unknown>): Record<string, unknown> {
-  return Object.fromEntries(
-    Object.entries(rawQuery).map(([key, value]) => [key, isSensitiveQueryParamKey(key) ? '[REDACTED]' : value]),
-  );
+  return redactQueryValue(rawQuery) as Record<string, unknown>;
 }
 
 /**
