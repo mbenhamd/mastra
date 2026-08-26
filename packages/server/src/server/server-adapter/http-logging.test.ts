@@ -276,11 +276,15 @@ describe('HTTP Logging Configuration', () => {
       expect(
         redactSensitiveQueryParams({
           foo: 'bar',
-          auth: { token: 'secret', nested: ['ok', { apiKey: 'secret' }] },
+          auth: 'jwt-here',
+          signature: 'hmac',
+          wrapper: { token: 'secret', nested: ['ok', { apiKey: 'secret' }] },
         }),
       ).toEqual({
         foo: 'bar',
-        auth: { token: '[REDACTED]', nested: ['ok', { apiKey: '[REDACTED]' }] },
+        auth: '[REDACTED]',
+        signature: '[REDACTED]',
+        wrapper: { token: '[REDACTED]', nested: ['ok', { apiKey: '[REDACTED]' }] },
       });
     });
   });

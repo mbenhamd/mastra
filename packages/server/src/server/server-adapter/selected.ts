@@ -420,7 +420,9 @@ function isSensitiveQueryParamKey(key: string): boolean {
     normalized.includes('token') ||
     normalized.includes('secret') ||
     normalized.includes('password') ||
-    normalized.includes('authorization')
+    normalized.includes('authorization') ||
+    normalized === 'auth' ||
+    normalized.includes('signature')
   );
 }
 
