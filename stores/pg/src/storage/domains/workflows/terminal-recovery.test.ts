@@ -1289,7 +1289,7 @@ describe('WorkflowsPG terminal recovery envelope parity', () => {
     }
   });
 
-  it('retains terminal ancestry evidence after journal cleanup and a running snapshot rewrite', async () => {
+  it('retains terminal ancestry evidence after journal cleanup and rejects a running snapshot rewrite', async () => {
     const suffix = randomUUID();
     const parent = { workflowName: `terminal-marker-parent-${suffix}`, runId: 'parent-run' };
     const child = { workflowName: `terminal-marker-child-${suffix}`, runId: 'child-run' };
@@ -1325,11 +1325,13 @@ describe('WorkflowsPG terminal recovery envelope parity', () => {
         }),
       ).resolves.toEqual({ status: 'deleted', count: 1 });
 
-      await workflowsB.persistWorkflowSnapshot({
-        ...parent,
-        snapshot: { ...createParentSnapshot(parent.runId), status: 'running' },
-      });
-      await expect(workflowsA.loadWorkflowSnapshot(parent)).resolves.toMatchObject({ status: 'running' });
+      await expect(
+        workflowsB.persistWorkflowSnapshot({
+          ...parent,
+          snapshot: { ...createParentSnapshot(parent.runId), status: 'running' },
+        }),
+      ).rejects.toThrow('Workflow parent revision conflict');
+      await expect(workflowsA.loadWorkflowSnapshot(parent)).resolves.toMatchObject({ status: 'failed' });
       await expect(
         workflowsA.persistWorkflowTerminalRecoveryAncestry({ ...child, ancestry: ancestry(child, parent) }),
       ).rejects.toThrow('Workflow terminal recovery ancestry parent evidence is unavailable');

@@ -246,6 +246,23 @@ const memoryStore = await storage.getStore('memory')
 const thread = await memoryStore?.getThreadById({ threadId: '...' })
 ```
 
+#### Workflow revision migration rollout and recovery
+
+Workflow storage uses durable parent-revision evidence to prevent an old continuation contract from targeting a reused run ID. The first privileged `init()` after upgrading validates existing workflow snapshots and terminalization records, migrates the revision table in one transaction, and records both a migration marker and a private migration-epoch sentinel.
+
+Treat this as a quiesced, forward-only migration boundary:
+
+1. Stop every older process that can initialize or write workflow storage.
+1. Back up the complete PostgreSQL schema and workflow data together.
+1. Start one upgraded process and let `init()` finish.
+1. Verify that initialization succeeds before starting the remaining upgraded processes.
+
+Do not run a rolling mixture of pre-migration and upgraded workflow writers. Older initializers don't participate in the new migration contract and can recreate revision rows that the upgraded runtime must treat as missing durable evidence.
+
+The migration marker row, private epoch relation and row, parent-revision rows, snapshots, and terminalization records form one recovery unit. Back up and restore that complete unit atomically from the same recovery point. Losing only the marker or only the epoch is detected as incomplete provenance and fails initialization; `PostgresStore` doesn't reconstruct the missing record because doing so could make a reused run ID look like its earlier generation. Losing both provenance records is indistinguishable from a schema that has never completed this migration, so provenance tables are not a substitute for a complete database backup.
+
+After this migration commits, don't roll back by starting a pre-migration binary against the migrated database. Roll forward with a corrected binary, or restore the complete pre-upgrade database backup before starting the older version. Applying an exported schema creates neither the migration marker row nor the private epoch relation or row; populated workflow storage must first complete a privileged `init()`.
+
 ### Limit initialization to selected domains
 
 Set `enabledDomains` when a PostgreSQL store owns only part of a composite storage configuration. The store constructs, exposes, and initializes only the listed domains. Calls to `getStore()` return `undefined` for domains that aren't selected.
