@@ -116,6 +116,13 @@ const storage = new PostgresStore({
     isOptional: true,
   },
   {
+    name: 'enabledDomains',
+    type: 'ReadonlyArray<PostgresDomainKey>',
+    description:
+      'Restricts the store to a non-empty list of unique storage domain names. When omitted, all domains are enabled. Empty lists, unknown names, and duplicates throw during construction before PostgresStore creates an internal connection pool.',
+    isOptional: true,
+  },
+  {
     name: 'skipDefaultIndexes',
     type: 'boolean',
     description: 'When true, default indexes will not be created during initialization.',
@@ -238,6 +245,33 @@ await storage.init()
 const memoryStore = await storage.getStore('memory')
 const thread = await memoryStore?.getThreadById({ threadId: '...' })
 ```
+
+### Limit initialization to selected domains
+
+Set `enabledDomains` when a PostgreSQL store owns only part of a composite storage configuration. The store constructs, exposes, and initializes only the listed domains. Calls to `getStore()` return `undefined` for domains that aren't selected.
+
+This example limits schema initialization and runtime access to memory tables:
+
+```typescript
+import { PostgresStore } from '@mastra/pg'
+
+const memoryStorage = new PostgresStore({
+  id: 'memory-storage',
+  connectionString: process.env.DATABASE_URL,
+  enabledDomains: ['memory'],
+})
+
+await memoryStorage.init()
+
+const memory = await memoryStorage.getStore('memory')
+const workflows = await memoryStorage.getStore('workflows') // undefined
+```
+
+Omit `enabledDomains` to preserve the default behavior and initialize every PostgreSQL storage domain. When you provide it, the array must contain at least one unique `PostgresDomainKey`. The constructor rejects empty arrays, duplicate names, and unknown names before it creates an internal pool.
+
+`PostgresStoreVNext` always owns its required vNext observability domain. If you provide `enabledDomains` to `PostgresStoreVNext`, the list must include `observability`.
+
+When `observability` is the only enabled domain, `init()` initializes it through the required observability connection without connecting to or loading a schema snapshot from the otherwise unused primary pool. Selecting any primary-backed domain, or omitting `enabledDomains`, preserves the normal primary-pool initialization path.
 
 :::warning
 If `init()` isn't called, tables won't be created and storage operations will fail silently or throw errors.
