@@ -318,9 +318,9 @@ class TransactionClient implements TxClient {
  */
 export class PinnedClientAdapter implements DbClient {
   /**
-   * Serialization tail. Domain init() methods fire via Promise.all in
-   * MastraCompositeStore.#runInit(), so without our own gate every domain's
-   * query() lands on the same PoolClient concurrently. pg@8 queues those
+   * Serialization tail. PostgresStore starts domain init() methods
+   * concurrently, so without our own gate every domain's query() lands on the
+   * same PoolClient concurrently. pg@8 queues those
    * internally and emits a deprecation warning; pg@9 will throw. Chaining
    * each new query off the previous one's settlement (success or failure)
    * gives us deterministic FIFO ordering at the adapter layer and removes
@@ -355,6 +355,22 @@ export class PinnedClientAdapter implements DbClient {
       'PinnedClientAdapter.connect() is not supported during PostgresStore.init(). ' +
         'All DDL must flow through the pinned client.',
     );
+  }
+
+  /**
+   * Wait until every query enqueued so far has settled.
+   *
+   * A completed query can resume its domain and enqueue another statement,
+   * so keep observing the tail until it stops advancing. Rejections remain on
+   * the individual query promises returned to callers; the serialization tail
+   * absorbs them so draining cannot replace the init error that triggered it.
+   */
+  async drain(): Promise<void> {
+    let seen: Promise<unknown> | undefined;
+    while (seen !== this.#tail) {
+      seen = this.#tail;
+      await seen.catch(() => undefined);
+    }
   }
 
   none(query: string, values?: QueryValues): Promise<null> {

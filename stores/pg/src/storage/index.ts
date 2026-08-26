@@ -372,8 +372,52 @@ export class PostgresStore extends MastraCompositeStore {
     // Coalesce concurrent init() calls into a single in-flight promise. This
     // protects both the pinned primary-pool path and stores whose selected
     // domains are all backed by external pools.
-    this.#initPromise ??= this.#runInit();
-    await this.#initPromise;
+    const initPromise = (this.#initPromise ??= this.#runInit());
+    try {
+      await initPromise;
+    } catch (error) {
+      // Keep the rejected promise cached until #runInit has settled every
+      // selected domain and released any pinned client. A caller arriving
+      // during cleanup must join this attempt instead of starting a retry.
+      if (this.#initPromise === initPromise) {
+        this.#initPromise = null;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Start every distinct selected domain initializer and observe all of them
+   * through settlement before surfacing the first failure. The generic
+   * composite initializer is intentionally fail-fast; PG needs the narrower
+   * guarantee because primary-backed siblings share a pinned client that
+   * cannot be released while an initializer can still enqueue work.
+   */
+  async #initDomainStores(): Promise<void> {
+    const started = new Set<unknown>();
+    const initTasks: Promise<void>[] = [];
+    let firstError: { value: unknown } | undefined;
+
+    const observeInit = async (domain: { init(): Promise<void> }) => {
+      try {
+        await domain.init();
+      } catch (error) {
+        firstError ??= { value: error };
+      }
+    };
+
+    for (const domain of Object.values(this.stores)) {
+      if (!domain || started.has(domain) || typeof domain.init !== 'function') {
+        continue;
+      }
+      started.add(domain);
+      initTasks.push(observeInit(domain));
+    }
+
+    await Promise.all(initTasks);
+    if (firstError) {
+      throw firstError.value;
+    }
   }
 
   async #runInit(): Promise<void> {
@@ -385,30 +429,23 @@ export class PostgresStore extends MastraCompositeStore {
     //   - inter-statement lock contention across domains (issue #17679)
     // An externally-backed-only store still initializes its selected domains,
     // but does not connect, pin, or load a schema snapshot on the unused
-    // primary pool. connect() remains inside the try so either path is
-    // retryable instead of permanently caching a rejected init.
+    // primary pool. connect() remains inside the try; init() clears a rejected
+    // promise only after this method settles all domains and finishes cleanup.
     let pinnedClient: PoolClient | undefined;
+    let pinned: PinnedClientAdapter | undefined;
 
     try {
       if (this.#primaryPoolDomains.size > 0) {
         pinnedClient = await this.#pool.connect();
-        const pinned = new PinnedClientAdapter(this.#pool, pinnedClient);
+        pinned = new PinnedClientAdapter(this.#pool, pinnedClient);
         this.#db.pin(pinned);
         // Read the schema's catalog once, up front, so primary-backed domains
         // can answer existence checks locally instead of re-querying the
         // server. Cleared in finally: the snapshot never outlives init().
         this.#db.setSchemaSnapshot(await loadSchemaSnapshot(pinned, this.schema));
       }
-      await super.init();
-      // Only mark initialized after schema creation actually finishes so a
-      // racing second init() caller can't return early and issue runtime
-      // queries against tables that aren't yet created.
-      this.isInitialized = true;
+      await this.#initDomainStores();
     } catch (error) {
-      // Drop the cached promise so a transient failure (e.g. a network blip
-      // during boot) can be retried by a later init() call instead of
-      // permanently rejecting. Mirrors storageWithInit's cacheInit behavior.
-      this.#initPromise = null;
       // Rethrow MastraError directly to preserve structured error IDs (e.g., MIGRATION_REQUIRED::DUPLICATE_SPANS)
       if (error instanceof MastraError) {
         throw error;
@@ -422,6 +459,9 @@ export class PostgresStore extends MastraCompositeStore {
         error,
       );
     } finally {
+      if (pinned) {
+        await pinned.drain();
+      }
       // Only unpin/release when connect() actually handed us a client; on a
       // failed or deliberately skipped primary connection, it is undefined.
       if (pinnedClient) {
@@ -432,6 +472,11 @@ export class PostgresStore extends MastraCompositeStore {
         pinnedClient.release();
       }
     }
+
+    // Publish success only after the pinned route is fully drained, unpinned,
+    // and released. Until then, concurrent callers must remain attached to the
+    // in-flight promise so runtime queries cannot reach the cleanup client.
+    this.isInitialized = true;
   }
 
   /**
