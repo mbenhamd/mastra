@@ -257,8 +257,11 @@ export function createMultipartTestSuite(config: MultipartTestSuiteConfig) {
                   'routePrefix',
                   'request',
                   'getHeader',
+                  'getHeaders',
+                  'rawBody',
                   'requestBody',
                   'requestPathParams',
+                  'serverRoutes',
                 ].includes(k),
             ),
           };

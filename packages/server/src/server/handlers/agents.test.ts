@@ -1597,6 +1597,26 @@ describe('Agent Routes Authorization', () => {
       });
     }
 
+    it.each(approvalRoutes)('$name rejects a missing durable run', async ({ route, method }) => {
+      const execution = vi.spyOn(mockAgent as any, method).mockResolvedValue({
+        fullStream: new ReadableStream(),
+      });
+
+      await expect(
+        (route.handler as any)({
+          mastra,
+          agentId: 'test-agent',
+          requestContext: createContextWithReservedKeys({ resourceId: 'user-a' }),
+          abortSignal: new AbortController().signal,
+          runId: 'missing-durable-run',
+          toolCallId: 'tool-call-1',
+        }),
+      ).rejects.toThrow(
+        new HTTPException(403, { message: 'Access denied: durable run belongs to a different resource' }),
+      );
+      expect(execution).not.toHaveBeenCalled();
+    });
+
     it.each(approvalRoutes)('$name rejects a durable run owned by another resource', async ({ route, method }) => {
       await persistSuspendedDurableRun({ resourceId: 'user-b' });
       const execution = vi.spyOn(mockAgent as any, method).mockResolvedValue({
