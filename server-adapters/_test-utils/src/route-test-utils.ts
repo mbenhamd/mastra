@@ -458,6 +458,7 @@ export function getDefaultValidPathParams(route: ServerRoute): Record<string, an
   // Harness route params
   if (route.path.startsWith('/harness/')) {
     if (route.path.includes(':name')) params.name = 'test-harness';
+    if (route.path.includes(':channelId')) params.channelId = 'test-channel';
     if (route.path.includes(':sessionId')) params.sessionId = 'test-session';
     if (route.path.includes(':attachmentId')) params.attachmentId = 'test-attachment';
     if (route.path.includes(':signalId')) params.signalId = 'test-signal';

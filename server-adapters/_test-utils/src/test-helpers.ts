@@ -1,10 +1,4 @@
-import {
-  Agent,
-  createMessageSignal,
-  createSignal,
-  isDurableAgentLike,
-  isRecoverableDurableAgentLike,
-} from '@mastra/core/agent';
+import { Agent, createMessageSignal, createSignal } from '@mastra/core/agent';
 import { Mastra } from '@mastra/core';
 import { expect, Mock, vi } from 'vitest';
 import { Workflow, createWorkflow, createStep } from '@mastra/core/workflows';
@@ -186,28 +180,11 @@ export function mockAgentMethods(agent: Agent) {
   // Mock resumeStream method - returns object with fullStream property
   vi.spyOn(agent, 'resumeStream').mockResolvedValue({ fullStream: createMockStream() } as any);
 
-  // Mock the built-in recovery capability. Base Agent exposes delegator methods,
-  // but only an explicit marker admits the object to Mastra-driven recovery.
-  (agent as any).recover = vi.fn().mockResolvedValue({ fullStream: createMockStream() });
-  (agent as any).recoverActiveRuns = vi.fn().mockResolvedValue({ recovered: [], succeeded: 0, failed: 0 });
-  (agent as any).supportsRunRecovery = true;
-  // Force a self-referential `agent` property so the mock satisfies
-  // isDurableAgentLike. The base Agent class exposes an `agent` getter that
-  // returns undefined unless `durable: true` is configured.
-  Object.defineProperty(agent, 'agent', {
-    value: agent,
-    configurable: true,
-  });
-  if (!isDurableAgentLike(agent)) {
-    throw new Error(
-      'mockAgentMethods: mocked agent does not satisfy isDurableAgentLike. Update the mock to match the current contract.',
-    );
-  }
-  if (!isRecoverableDurableAgentLike(agent)) {
-    throw new Error(
-      'mockAgentMethods: mocked agent does not satisfy isRecoverableDurableAgentLike. Update the recovery capability mock.',
-    );
-  }
+  // These adapter tests own HTTP wiring; Core suites own the real idle loop.
+  // Return a fresh finite stream per request so seeded background-task state
+  // cannot keep an adapter connection open until the production idle timeout.
+  vi.spyOn(agent, 'streamUntilIdle').mockImplementation(async () => ({ fullStream: createMockStream() }) as any);
+  vi.spyOn(agent, 'resumeStreamUntilIdle').mockImplementation(async () => ({ fullStream: createMockStream() }) as any);
 
   // Mock legacy generate - returns GenerateTextResult (JSON object, not stream)
   vi.spyOn(agent, 'generateLegacy').mockResolvedValue({

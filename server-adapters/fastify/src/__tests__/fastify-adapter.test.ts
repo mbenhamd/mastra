@@ -850,7 +850,7 @@ describe('Fastify Server Adapter', () => {
         path: '/test/upload',
         responseType: 'json',
         handler: async (params: any) => {
-          return params;
+          return { file: params.file };
         },
       };
 
