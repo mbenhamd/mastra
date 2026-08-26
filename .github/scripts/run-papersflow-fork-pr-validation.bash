@@ -55,16 +55,15 @@ pf3553_config() {
   PF3553_HEAD_REPOSITORY="${PAPERSFLOW_PF3553_HEAD_REPOSITORY:-mbenhamd/mastra}"
   PF3553_HEAD_REF="${PAPERSFLOW_PF3553_HEAD_REF:-feature/pf-3553-selected-routes}"
   PF3553_BASE_REF="${PAPERSFLOW_PF3553_BASE_REF:-main}"
-  PF3553_POLICY_BASE_REF="${PAPERSFLOW_PF3553_POLICY_BASE_REF:-ci/pf-3557-selected-route-export-validation}"
-  PF3553_BASE_SURFACE_SHA256="${PAPERSFLOW_PF3553_BASE_SURFACE_SHA256:-2f0aba283874dd626a54b8e18ec37ba5cddacf01c4a74ab9373076ce53501942}"
-  PF3553_HEAD_SURFACE_SHA256="${PAPERSFLOW_PF3553_HEAD_SURFACE_SHA256:-ebed2920c714252d70f08646d09acfafbe748e2829996170c7add18cd3956f64}"
+  PF3553_BASE_SURFACE_SHA256="${PAPERSFLOW_PF3553_BASE_SURFACE_SHA256:-2e08146bdcac60f3982fb9110146cc0c3d0a03849906bfd82b0fdec415c36103}"
+  PF3553_HEAD_SURFACE_SHA256="${PAPERSFLOW_PF3553_HEAD_SURFACE_SHA256:-6ab6beeaaa1a08e31750a2e384c3e46d4908af5bb07631b72a6547b85d156519}"
   readonly PF3553_PR_NUMBER PF3553_HEAD_REPOSITORY PF3553_HEAD_REF \
-    PF3553_BASE_REF PF3553_POLICY_BASE_REF PF3553_BASE_SURFACE_SHA256 \
+    PF3553_BASE_REF PF3553_BASE_SURFACE_SHA256 \
     PF3553_HEAD_SURFACE_SHA256
 }
 
 pf3553_base_ref_allowed() {
-  [[ "$1" == "$PF3553_BASE_REF" || "$1" == "$PF3553_POLICY_BASE_REF" ]]
+  [[ "$1" == "$PF3553_BASE_REF" ]]
 }
 
 pf3553_reviewed_paths() {
@@ -73,6 +72,7 @@ pf3553_reviewed_paths() {
 .changeset/lean-fastify-select.md
 docs/src/content/en/docs/server/server-adapters.mdx
 packages/server/package.json
+packages/server/src/server/server-adapter/http-logging.test.ts
 packages/server/src/server/server-adapter/index.test.ts
 packages/server/src/server/server-adapter/index.ts
 packages/server/src/server/server-adapter/routes/harness.ts
@@ -1050,7 +1050,7 @@ classify_install_lane() (
     return
   fi
 
-  # PF-3553 is frozen to the complete reviewed 21-file Server/Fastify feature
+  # PF-3553 is frozen to the complete reviewed 22-file Server/Fastify feature
   # surface. In addition, require the exact three additive selected-route
   # exports, preserve conditional-export ordering, and keep every other
   # dependency-graph entry and all non-export manifest metadata unchanged.
@@ -1463,6 +1463,8 @@ JSON
   printf '%s\n' 'reviewed Fastify changeset' > "$fixture_repo/.changeset/lean-fastify-select.md"
   printf '%s\n' 'reviewed adapter documentation' \
     > "$fixture_repo/docs/src/content/en/docs/server/server-adapters.mdx"
+  printf '%s\n' 'reviewed HTTP logging test' \
+    > "$fixture_repo/packages/server/src/server/server-adapter/http-logging.test.ts"
   printf '%s\n' 'reviewed server adapter test' \
     > "$fixture_repo/packages/server/src/server/server-adapter/index.test.ts"
   printf '%s\n' 'reviewed server adapter' \
@@ -1642,11 +1644,6 @@ NODE
 
   output="$test_root/accepted.log"
   run_fixture_admission "$valid_head" "$output"
-  grep -Fxq 'lane=pf3553-selected-route-exports' "$output"
-
-  output="$test_root/accepted-stacked-policy-base.log"
-  run_fixture_admission "$valid_head" "$output" \
-    BASE_REF=ci/pf-3557-selected-route-export-validation
   grep -Fxq 'lane=pf3553-selected-route-exports' "$output"
 
   mutation_head="$(json_mutation_head packages/server/package.json script)"
@@ -3745,6 +3742,8 @@ JSON
     printf '%s\n' 'reviewed Fastify changeset' > .changeset/lean-fastify-select.md
     printf '%s\n' 'reviewed adapter documentation' \
       > docs/src/content/en/docs/server/server-adapters.mdx
+    printf '%s\n' 'reviewed HTTP logging test' \
+      > packages/server/src/server/server-adapter/http-logging.test.ts
     printf '%s\n' 'reviewed server adapter test' \
       > packages/server/src/server/server-adapter/index.test.ts
     printf '%s\n' 'reviewed server adapter' \

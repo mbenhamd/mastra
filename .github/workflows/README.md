@@ -24,13 +24,12 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
 
 - PR code runs only in the unprivileged `pull_request` sandbox on ephemeral
   GitHub-hosted `ubuntu-24.04` runners.
-- The validator also runs for PRs targeting `ci/**` policy branches, allowing a
-  stacked feature PR to prove a new trusted-base validation target before that
-  policy branch reaches `main`.
-- PF-3553 PR `#373` has one exact same-repository lane for the reviewed 21-file
-  selected-route feature. The lane accepts either protected `main` or the exact
-  `ci/pf-3557-selected-route-export-validation` policy branch as its base so the
-  feature can prove the policy before and after merge. Admission reads immutable
+- The validator runs for PRs targeting protected `main`. Unprotected `ci/**`
+  branches are not a trusted policy base.
+- PF-3553 PR `#373` has one exact same-repository lane for the reviewed 22-file
+  selected-route feature. The lane accepts only protected `main` as its base.
+  After this policy lands, `#373` must be rebased so current `main` is an
+  ancestor of the admitted head. Admission reads immutable
   Git objects from the protected base and feature head, requires the exact
   reviewed changed-path set and SHA-256 base/head surface digests, permits only
   `packages/server/package.json` and
