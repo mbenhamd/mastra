@@ -6800,7 +6800,9 @@ NODE
   head_sha="$(
     cd "$fixture_repo"
     git reset -q --hard "$base_sha"
-    printf '%s\n' "export const supervisorRuntime = 'dependency-head';" \
+    printf '%s\n' \
+      "export const supervisorRuntime = 'base';" \
+      "export const supervisorRuntimeRevision = 'dependency-head';" \
       > packages/core/src/agent/supervisor-runtime.ts
     git add .
     git commit -q -m 'change a supervisor runtime dependency'
