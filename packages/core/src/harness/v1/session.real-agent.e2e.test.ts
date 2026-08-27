@@ -28,11 +28,11 @@
  *       right harness error / `agent_end:error` (redacted public error), and
  *       the in-process `message()` rejection is REDACTED too (§13.3f.1): its
  *       `.message` is generic and the raw provider detail is kept on `.cause`
- *   S6  abort terminalizes the real run: a MID-RUN abort (fired from inside a
- *       running tool) drives the real `turnAbortController` path to an
- *       `agent_end:aborted` terminal; an ALREADY-aborted caller signal instead
- *       rejects `message()` pre-dispatch with `agent_aborted` and emits NO
- *       harness events (no run is ever dispatched).
+ *   S6  abort terminalizes the real run: an external `abortActiveWork()` while
+ *       the provider stream is live produces `agent_end:aborted` and
+ *       `run_completed:interrupted`; a MID-RUN abort fired from inside a tool
+ *       drives the same terminal; an ALREADY-aborted caller signal rejects
+ *       `message()` pre-dispatch with no harness events.
  *
  * No `MockAgent` / `FakeAgent` is used in this file — the agent is the real
  * `Agent` class; only the LANGUAGE MODEL is mocked (deterministic, no network).
@@ -2084,10 +2084,16 @@ describe('Harness v1 real-agent E2E — S5 provider error', () => {
 // ===========================================================================
 // S6 — abort terminalizes the real run
 //
-// Two distinct real behaviors, both verified at runtime against the real Agent
+// Three distinct real behaviors, all verified at runtime against the real Agent
 // over InMemoryStore (instrumented probe):
 //
-//   (a) MID-RUN abort — abort fired from INSIDE a running tool, AFTER the run is
+//   (a) EXTERNAL active-work abort — abortActiveWork() fires while a provider
+//       stream is live. The provider observes its abort signal, errors with an
+//       AbortError, and the AI SDK may append a synthetic `finish:stop` while
+//       unwinding. The earlier abort remains authoritative: the full output is
+//       aborted and the Harness terminal is interrupted, never completed.
+//
+//   (b) MID-RUN abort — abort fired from INSIDE a running tool, AFTER the run is
 //       dispatched. This is the path that exercises the real
 //       `turnAbortController`: the live turn aborts and the harness emits a
 //       terminal `agent_end:aborted` (observed sequence:
@@ -2097,7 +2103,7 @@ describe('Harness v1 real-agent E2E — S5 provider error', () => {
 //       coverage the file header claims, and it catches a regression if the
 //       loop ever stops terminalizing an aborted run.
 //
-//   (b) ALREADY-aborted caller signal — `_beginTurn` (session.ts:1397) aborts
+//   (c) ALREADY-aborted caller signal — `_beginTurn` (session.ts:1397) aborts
 //       the turn controller synchronously before the run is ever dispatched, so
 //       `message()` rejects pre-dispatch with `agent_aborted` and emits ZERO
 //       harness events (no agent_start, no agent_end). This characterizes the
@@ -2106,7 +2112,83 @@ describe('Harness v1 real-agent E2E — S5 provider error', () => {
 // ===========================================================================
 
 describe('Harness v1 real-agent E2E — S6 abort', () => {
-  it('(a) a MID-RUN abort (from inside a running tool) terminalizes the real run as agent_end:aborted', async () => {
+  it('(a) abortActiveWork while the provider streams terminalizes the real run as interrupted', async () => {
+    let providerAbortSignal: AbortSignal | undefined;
+    const model = new MockLanguageModelV2({
+      doStream: async options => {
+        providerAbortSignal = options.abortSignal;
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream: new ReadableStream({
+            start(controller) {
+              controller.enqueue({ type: 'stream-start', warnings: [] });
+              controller.enqueue({
+                type: 'response-metadata',
+                id: 'id-external-abort',
+                modelId: 'mock-model-id',
+                timestamp: new Date(0),
+              });
+              controller.enqueue({ type: 'text-start', id: 'text-external-abort' });
+              controller.enqueue({
+                type: 'text-delta',
+                id: 'text-external-abort',
+                delta: 'partial response',
+              });
+
+              const abort = () => {
+                const error = new Error('Aborted');
+                error.name = 'AbortError';
+                controller.error(error);
+              };
+              if (options.abortSignal?.aborted) abort();
+              else options.abortSignal?.addEventListener('abort', abort, { once: true });
+            },
+          }),
+        };
+      },
+    });
+    const agent = new Agent({ id: 'default', name: 'default', instructions: 'reply', model });
+    const harness = newHarness(agent);
+    try {
+      const session = await harness.session({ resourceId: 'u-abort-active-work', threadId: { fresh: true } });
+      const events: HarnessEvent[] = [];
+      session.subscribe(event => events.push(event));
+
+      const output = await session.message({ content: 'go', stream: true });
+      await waitFor(() => events.some(event => event.type === 'text_delta'), 'provider text before active-work abort');
+      expect(providerAbortSignal?.aborted).toBe(false);
+
+      await session.abortActiveWork({ reason: 'user_requested', settleTimeoutMs: 2_000 });
+      expect(providerAbortSignal?.aborted).toBe(true);
+
+      const full = await output.getFullOutput();
+      expect(full.finishReason).toBe('aborted');
+      await waitFor(
+        () => events.some(event => event.type === 'run_completed'),
+        'run_completed (external active-work abort)',
+      );
+      const runId = full.runId;
+      expect(events.filter(event => event.type === 'agent_end' && event.runId === runId)).toEqual([
+        expect.objectContaining({ finishReason: 'aborted' }),
+      ]);
+      expect(events.filter(event => event.type === 'run_completed' && event.runId === runId)).toEqual([
+        expect.objectContaining({ finishReason: 'aborted', status: 'interrupted' }),
+      ]);
+      expect(
+        events.filter(
+          event =>
+            event.runId === runId &&
+            ((event.type === 'agent_end' && event.finishReason === 'complete') ||
+              (event.type === 'run_completed' && event.status === 'completed')),
+        ),
+      ).toHaveLength(0);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('(b) a MID-RUN abort (from inside a running tool) terminalizes the real run as agent_end:aborted', async () => {
     const ac = new AbortController();
     // The tool aborts the run while it is executing, then yields so the loop
     // observes the abort mid-flight (real turnAbortController path).
@@ -2186,7 +2268,7 @@ describe('Harness v1 real-agent E2E — S6 abort', () => {
     }
   });
 
-  it('(b) an ALREADY-aborted caller signal rejects message() pre-dispatch with agent_aborted and emits NO harness events', async () => {
+  it('(c) an ALREADY-aborted caller signal rejects message() pre-dispatch with agent_aborted and emits NO harness events', async () => {
     const model = new MockLanguageModelV2({
       doStream: async () => ({
         rawCall: { rawPrompt: null, rawSettings: {} },
