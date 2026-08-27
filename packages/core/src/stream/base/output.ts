@@ -579,6 +579,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
             }
             case 'abort':
               self.#status = 'canceled';
+              self.#finishReason = 'aborted';
               if (!self.#finishCallbackSent) {
                 self.#finishCallbackSent = true;
                 await options?.onFinish?.(self.#createAbortedOnFinishPayload());
@@ -999,7 +1000,12 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
               if (self.#status !== 'failed' && self.#status !== 'canceled') {
                 self.#status = 'success';
               }
-              if (chunk.payload.stepResult.reason) {
+              // A provider/AI SDK may emit a synthetic stop finish while
+              // unwinding its aborted stream. The earlier abort chunk is the
+              // authoritative terminal and must remain visible in FullOutput.
+              if (self.#status === 'canceled') {
+                self.#finishReason = 'aborted';
+              } else if (chunk.payload.stepResult.reason) {
                 self.#finishReason = chunk.payload.stepResult.reason;
               }
 

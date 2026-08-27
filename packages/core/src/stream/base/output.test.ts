@@ -842,6 +842,7 @@ describe('MastraModelOutput', () => {
           from: ChunkFrom.AGENT,
           payload: { text: ' post-abort provider output' },
         },
+        createFinishChunk(runId),
       ] as ChunkType[]);
 
       const output = new MastraModelOutput({
@@ -858,11 +859,13 @@ describe('MastraModelOutput', () => {
       });
 
       await output.consumeStream();
+      const fullOutput = await output.getFullOutput();
 
       // Core field the AGENT_RUN span end reads.
       expect(finishPayload).toMatchObject({
         finishReason: 'aborted',
       });
+      expect(fullOutput.finishReason).toBe('aborted');
       // The abort payload snapshots only text buffered before the terminal abort chunk.
       expect(finishPayload.text).toBe('partial answer');
       expect(finishPayload.text).not.toContain('post-abort provider output');
