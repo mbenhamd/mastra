@@ -3538,6 +3538,20 @@ run_validator_self_tests() {
     fi
   }
 
+  assert_line_match_count() {
+    local expected_count="$1"
+    local expected_regex="$2"
+    local file="$3"
+    local actual_count
+    actual_count="$(grep -Ec -- "$expected_regex" "$file" || true)"
+    if [[ "$actual_count" != "$expected_count" ]]; then
+      echo "Expected fixture matching-line count $expected_count for: $expected_regex" >&2
+      echo "Actual fixture matching-line count: $actual_count" >&2
+      cat "$file" >&2
+      exit 1
+    fi
+  }
+
   assert_route_consumer_commands() {
     assert_contains '--dir client-sdks/client-js exec tsc-files --noEmit src/route-types.generated.ts src/types.ts src/resources/harness.ts src/resources/agent.test.ts' "$command_log"
     assert_contains '--dir packages/cli exec tsc-files --noEmit src/commands/api/route-metadata.generated.ts src/commands/api/index.ts src/commands/api/descriptors.test.ts' "$command_log"
@@ -6818,8 +6832,11 @@ NODE
   assert_contains \
     'Running changed test file in full: packages/core/src/agent/__tests__/supervisor-integration.test.ts' \
     "$output"
-  assert_contains \
-    'src/agent/__tests__/supervisor-integration.test.ts' \
+  assert_line_match_count 1 \
+    '^--dir packages/core exec vitest run ' \
+    "$command_log"
+  assert_line_match_count 1 \
+    '^--dir packages/core exec vitest run --reporter=dot --reporter=json --outputFile\.json=[^[:space:]]+ src/agent/__tests__/supervisor-integration\.test\.ts$' \
     "$command_log"
   assert_contains \
     $'OPENAI_API_KEY=\t--dir packages/core exec vitest run' \
