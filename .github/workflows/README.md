@@ -216,7 +216,9 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   language models. The supervisor integration suite has a narrower exception:
   its imports and existing real-provider subtree must match the trusted base,
   the OpenAI binding and `process` credential gate cannot be reused elsewhere,
-  and the runner clears any ambient OpenAI key. The tool-approval E2E exception
+  and the runner clears any ambient OpenAI key. That safety proof applies to
+  both direct and dependency-triggered supervisor-suite admission. The
+  tool-approval E2E exception
   similarly freezes its imports and recorder setup/lifecycle, rejects live,
   recording, spread, or in-test overrides, and runs with forced replay mode.
   The durable-agent background-task E2E

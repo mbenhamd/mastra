@@ -3291,11 +3291,14 @@ run_validator_self_tests() {
     printf '%s\n' '{}' > packages/cli/package.json
     printf '%s\n' '{}' > packages/core/package.json
     printf '%s\n' 'export default {};' > packages/core/vitest.config.ts
+    printf '%s\n' "export const supervisorRuntime = 'base';" \
+      > packages/core/src/agent/supervisor-runtime.ts
     printf '%s\n' \
       "import { openai } from '@ai-sdk/openai-v5';" \
       "import { describe, expect, it } from 'vitest';" \
+      "import { supervisorRuntime } from '../supervisor-runtime';" \
       "describe('Supervisor Pattern Integration Tests', () => {" \
-      "  it('supervisor integration', () => expect(true).toBe(true));" \
+      "  it('supervisor integration', () => expect(supervisorRuntime).toBe('base'));" \
       '});' \
       "describe('Supervisor Pattern - Working memory forwarding', () => {" \
       '  it.skipIf(!process.env.OPENAI_API_KEY)(' \
@@ -6716,8 +6719,9 @@ NODE
     printf '%s\n' \
       "import { openai } from '@ai-sdk/openai-v5';" \
       "import { describe, expect, it } from 'vitest';" \
+      "import { supervisorRuntime } from '../supervisor-runtime';" \
       "describe('Supervisor Pattern Integration Tests', () => {" \
-      "  it('supervisor integration head', () => expect(true).toBe(true));" \
+      "  it('supervisor integration head', () => expect(supervisorRuntime).toBe('base'));" \
       '});' \
       "describe('Supervisor Pattern - Working memory forwarding', () => {" \
       '  it.skipIf(!process.env.OPENAI_API_KEY)(' \
@@ -6796,11 +6800,38 @@ NODE
   head_sha="$(
     cd "$fixture_repo"
     git reset -q --hard "$base_sha"
+    printf '%s\n' "export const supervisorRuntime = 'dependency-head';" \
+      > packages/core/src/agent/supervisor-runtime.ts
+    git add .
+    git commit -q -m 'change a supervisor runtime dependency'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  : > "$command_environment_log"
+  output="$test_root/core-supervisor-dependency-success.log"
+  run_fixture "$head_sha" "$output" OPENAI_API_KEY=fixture-secret
+  assert_contains \
+    'Verified the exact supervisor suite provider-safety boundary.' \
+    "$output"
+  assert_contains \
+    'Running changed test file in full: packages/core/src/agent/__tests__/supervisor-integration.test.ts' \
+    "$output"
+  assert_contains \
+    'src/agent/__tests__/supervisor-integration.test.ts' \
+    "$command_log"
+  assert_contains \
+    $'OPENAI_API_KEY=\t--dir packages/core exec vitest run' \
+    "$command_environment_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
     printf '%s\n' \
       "import { openai } from '@ai-sdk/openai-v5';" \
       "import { describe, expect, it } from 'vitest';" \
+      "import { supervisorRuntime } from '../supervisor-runtime';" \
       "describe('Supervisor Pattern Integration Tests', () => {" \
-      "  it('supervisor integration head', () => expect(true).toBe(true));" \
+      "  it('supervisor integration head', () => expect(supervisorRuntime).toBe('base'));" \
       '});' \
       "describe('Supervisor Pattern - Working memory forwarding', () => {" \
       '  it(' \
@@ -8715,7 +8746,7 @@ git_regular_file_at_head() {
 }
 
 core_supervisor_test_preserves_provider_gate() {
-  node - "$merge_base_sha" "$HEAD_SHA" <<'NODE'
+  if ! node - "$merge_base_sha" "$HEAD_SHA" <<'NODE'
 const { execFileSync } = require('node:child_process');
 const ts = require('typescript');
 
@@ -8826,6 +8857,10 @@ if (invalidReference) {
   throw new Error(`${file} may not enable or reuse its real-provider binding outside the frozen skipped suite.`);
 }
 NODE
+  then
+    return 1
+  fi
+  echo 'Verified the exact supervisor suite provider-safety boundary.'
 }
 
 tool_approval_test_preserves_replay_harness() {
@@ -12278,6 +12313,23 @@ done
 
 if (( ${#detected_tests[@]} > 0 )); then
   mapfile -t detected_tests < <(printf '%s\n' "${detected_tests[@]}" | sort -u)
+fi
+
+if (( ${#detected_tests[@]} > 0 )) && [[ "$supervisor_provider_gate_verified" != true ]]; then
+  for file in "${detected_tests[@]}"; do
+    if [[ "$file" != packages/core/src/agent/__tests__/supervisor-integration.test.ts ]]; then
+      continue
+    fi
+    if ! git_regular_file_at_head "$file"; then
+      break
+    fi
+    if ! core_supervisor_test_preserves_provider_gate; then
+      echo 'The exact supervisor suite changed its frozen real-provider safety boundary.' >&2
+      exit 1
+    fi
+    supervisor_provider_gate_verified=true
+    break
+  done
 fi
 
 if (( ${#detected_tests[@]} > 0 )); then
