@@ -84,12 +84,20 @@ import type { HarnessWakeupWorkerConfig, HarnessChannelOutboxWorkerConfig, Mastr
 import type { AnyWorkflow, Workflow } from '../workflows';
 import { normalizeWorkflowBuilderDefinition } from '../workflows/builder';
 import type { WorkflowBuilderDefinitionInput } from '../workflows/builder';
-import type { DynamicWorkflowGraph, WorkflowRegistryIndex, WorkflowRegistrySchemas } from '../workflows/dynamic';
+import type {
+  DynamicWorkflowGraph,
+  JsonSchemaAdmissionIssue,
+  QuarantinedDynamicWorkflow,
+  WorkflowRegistryIndex,
+  WorkflowRegistrySchemas,
+} from '../workflows/dynamic';
 import {
   assertValidDynamicWorkflow,
   collectNestedWorkflowIds,
+  collectWorkflowJsonSchemaAdmissionIssues,
   rehydrateWorkflow,
   toJsonSchemaOrUndefined,
+  UnsupportedJsonSchemaError,
 } from '../workflows/dynamic';
 import { WorkflowEventProcessor } from '../workflows/evented/workflow-event-processor';
 import { computeNextFireAt } from '../workflows/scheduler';
@@ -164,6 +172,10 @@ function createUndefinedPrimitiveError(
     text: `Cannot add ${typeLabel}: ${typeLabel} is ${value === null ? 'null' : 'undefined'}. This may occur if config was spread ({ ...config }) and the original object had getters or non-enumerable properties.`,
     details: { status: 400, ...(key && { key }) },
   });
+}
+
+function formatAdmissionIssues(issues: JsonSchemaAdmissionIssue[]): string {
+  return issues.map(issue => `${issue.path ? `${issue.path} ` : ''}${issue.pointer} (${issue.keyword})`).join('; ');
 }
 
 /**
@@ -746,6 +758,7 @@ export class Mastra<
   #loggerExplicit = false;
   #workflows: TWorkflows;
   #hiddenWorkflowKeys = new Set<string>();
+  #quarantinedDynamicWorkflows = new Map<string, QuarantinedDynamicWorkflow>();
   #observability: ObservabilityEntrypoint;
   #observabilityExplicit = false;
   #onScorerHook?: ReturnType<typeof createOnScorerHook>;
@@ -3813,6 +3826,23 @@ export class Mastra<
   ): TWorkflows[TWorkflowId] {
     const workflow = this.#workflows?.[id];
     if (!workflow) {
+      const quarantined = this.#quarantinedDynamicWorkflows.get(String(id));
+      if (quarantined) {
+        const error = new MastraError({
+          id: 'MASTRA_DYNAMIC_WORKFLOW_QUARANTINED',
+          domain: ErrorDomain.MASTRA,
+          category: ErrorCategory.USER,
+          text: `Dynamic workflow "${String(id)}" is quarantined and not executable: ${formatAdmissionIssues(quarantined.issues)}`,
+          details: {
+            status: 409,
+            workflowId: String(id),
+            reason: quarantined.reason,
+            issues: formatAdmissionIssues(quarantined.issues),
+          },
+        });
+        this.#logger?.trackException(error);
+        throw error;
+      }
       const error = new MastraError({
         id: 'MASTRA_GET_WORKFLOW_BY_ID_NOT_FOUND',
         domain: ErrorDomain.MASTRA,
@@ -5421,7 +5451,16 @@ export class Mastra<
 
     (this.#workflows as Record<string, AnyWorkflow>)[key] = workflow;
     this.#hiddenWorkflowKeys.delete(key);
+    this.#quarantinedDynamicWorkflows.delete(key);
     this.registerStaticWorkflowScorers(workflow);
+  }
+
+  /**
+   * Dynamic workflows whose persisted schemas are outside the admitted JSON
+   * Schema dialect. They are not registered and cannot execute.
+   */
+  public listQuarantinedDynamicWorkflows(): QuarantinedDynamicWorkflow[] {
+    return Array.from(this.#quarantinedDynamicWorkflows.values());
   }
 
   /**
@@ -5527,7 +5566,7 @@ export class Mastra<
       seen.add(def.id);
     }
 
-    // Save-path is strict (boot-time load is lenient — see #loadDynamicWorkflows).
+    // Save-path is strict (boot-time load quarantines unsupported schemas — see #loadDynamicWorkflows).
     // Normalization coerces the wire shape; one validation call per member
     // covers structure, JSON-Schema keywords, references, and schema-flow.
     const members = defs.map(def => ({
@@ -5664,28 +5703,46 @@ export class Mastra<
         if (unresolved.length > 0) continue;
         remaining.delete(id);
         progress = true;
-        try {
-          const { workflow } = await rehydrateWorkflow(
-            {
-              id: def.id,
-              description: def.description,
-              metadata: def.metadata,
-              inputSchema: def.inputSchema as Record<string, any>,
-              outputSchema: def.outputSchema as Record<string, any>,
-              stateSchema: def.stateSchema as Record<string, any> | undefined,
-              requestContextSchema: def.requestContextSchema as Record<string, any> | undefined,
-              graph: def.graph,
-            },
-            this,
-            // Lenient at boot (save path is strict): degrade to z.any() + warn.
-            {
-              onUnsupportedSchema: 'warn',
-              onUnsupported: message => this.#logger?.warn?.(`Dynamic workflow "${def.id}": ${message}`),
-            },
+        const graphDef = {
+          id: def.id,
+          description: def.description,
+          metadata: def.metadata,
+          inputSchema: def.inputSchema as Record<string, any>,
+          outputSchema: def.outputSchema as Record<string, any>,
+          stateSchema: def.stateSchema as Record<string, any> | undefined,
+          requestContextSchema: def.requestContextSchema as Record<string, any> | undefined,
+          graph: def.graph,
+        };
+        const schemaIssues = collectWorkflowJsonSchemaAdmissionIssues(graphDef);
+        if (schemaIssues.length > 0) {
+          const quarantined: QuarantinedDynamicWorkflow = {
+            id: def.id,
+            reason: 'unsupported-schema',
+            issues: schemaIssues,
+          };
+          this.#quarantinedDynamicWorkflows.set(def.id, quarantined);
+          this.#logger?.warn?.(
+            `Dynamic workflow "${def.id}" quarantined and will not execute: ${formatAdmissionIssues(schemaIssues)}`,
           );
+          continue;
+        }
+        try {
+          const { workflow } = await rehydrateWorkflow(graphDef, this);
           this.addWorkflow(workflow as AnyWorkflow, def.id);
           loaded.add(def.id);
         } catch (error) {
+          if (error instanceof UnsupportedJsonSchemaError) {
+            const quarantined: QuarantinedDynamicWorkflow = {
+              id: def.id,
+              reason: 'unsupported-schema',
+              issues: error.issues,
+            };
+            this.#quarantinedDynamicWorkflows.set(def.id, quarantined);
+            this.#logger?.warn?.(
+              `Dynamic workflow "${def.id}" quarantined and will not execute: ${formatAdmissionIssues(error.issues)}`,
+            );
+            continue;
+          }
           this.#logger?.error?.(`Failed to load dynamic workflow "${def.id}"`, { error });
         }
       }

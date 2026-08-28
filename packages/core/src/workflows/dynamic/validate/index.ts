@@ -25,7 +25,7 @@ export type {
 } from './types';
 export { validateWorkflowStructure } from './structure';
 export { validateWorkflowRefs } from './refs';
-export { validateWorkflowSchemas } from './schemas';
+export { collectWorkflowJsonSchemaAdmissionIssues, validateWorkflowSchemas } from './schemas';
 export { inferGraphSchemas } from './schema-flow';
 export type { GraphSchemaInference } from './schema-flow';
 export { schemaCompatibility, toJsonSchemaOrUndefined } from './schema-utils';

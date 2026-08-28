@@ -5,10 +5,10 @@
  *   Save path (`Mastra.addDynamicWorkflow`) is STRICT — throws before touching
  *   storage or registry. The author is right there and can simplify.
  *
- *   Boot path (`#loadDynamicWorkflows`, exercised via `startWorkers()`) is
- *   LENIENT — degrades the offending schema to `z.any()`, emits a warning,
- *   and keeps registering the workflow so one bad pre-existing row can't
- *   take down startup for every other workflow.
+ *   Boot path (`#loadDynamicWorkflows`, exercised via `startWorkers()`)
+ *   quarantines unsupported historical rows with a typed diagnostic and
+ *   continues loading siblings. It must never substitute `z.any()` and let
+ *   the workflow execute unvalidated.
  */
 import { MockLanguageModelV2 } from '@internal/ai-sdk-v5/test';
 import { describe, expect, it, vi } from 'vitest';
@@ -117,6 +117,29 @@ describe('Mastra.addDynamicWorkflow — save path is strict on unsupported schem
 
     await expect(mastra.addDynamicWorkflow(definitionWithRuntimeContext)).resolves.toBeUndefined();
     expect(mastra.getWorkflow('request-context-wf')).toBeDefined();
+  });
+
+  it('throws when a nested uniqueItems-era silent keyword is unknown, before touching storage', async () => {
+    const storage = new InMemoryStore({ id: 'nested-unevaluated' });
+    const mastra = new Mastra({
+      logger: false,
+      tools: { 'passthrough-tool': passthroughTool } as any,
+      storage,
+    });
+
+    await expect(
+      mastra.addDynamicWorkflow({
+        id: 'unevaluated-wf',
+        inputSchema: {
+          type: 'object',
+          properties: { payload: { type: 'object', unevaluatedProperties: false } as any },
+        },
+        outputSchema: { type: 'object', properties: { value: { type: 'number' } }, required: ['value'] },
+        graph: [{ type: 'tool', id: 'passthrough-tool', toolId: 'passthrough-tool' }],
+      }),
+    ).rejects.toThrow(/unevaluatedProperties/);
+
+    expect(() => mastra.getWorkflow('unevaluated-wf')).toThrow();
   });
 
   it('throws when top-level outputSchema uses oneOf, before touching storage', async () => {
@@ -325,9 +348,9 @@ describe('Mastra.addDynamicWorkflow — save path is strict on unsupported schem
   });
 });
 
-describe('Mastra boot load — lenient on unsupported schema keywords', () => {
-  it('degrades unsupported top-level outputSchema to z.any(), warns, and still registers the workflow', async () => {
-    const storage = new InMemoryStore({ id: 'boot-lenient' });
+describe('Mastra boot load — quarantine unsupported schema keywords', () => {
+  it('quarantines unsupported top-level outputSchema, does not register it, and does not use z.any()', async () => {
+    const storage = new InMemoryStore({ id: 'boot-quarantine' });
 
     // Seed a bad row directly into storage (bypassing addDynamicWorkflow so we
     // simulate a definition saved by a prior version that predated stricter
@@ -337,7 +360,6 @@ describe('Mastra boot load — lenient on unsupported schema keywords', () => {
     await store.upsert({
       id: 'legacy-oneof-wf',
       inputSchema: { type: 'object', properties: { value: { type: 'number' } }, required: ['value'] },
-      // oneOf is unsupported — jsonSchemaToZod would throw in strict mode.
       outputSchema: { oneOf: [{ type: 'string' }, { type: 'number' }] } as any,
       graph: [{ type: 'tool', id: 'passthrough-tool', toolId: 'passthrough-tool' }],
     });
@@ -355,15 +377,21 @@ describe('Mastra boot load — lenient on unsupported schema keywords', () => {
       storage,
     });
 
-    // Kick the boot-time loader.
     await (mastra as any).startWorkers?.();
 
-    // Workflow is registered despite the unsupported keyword.
-    expect(mastra.getWorkflow('legacy-oneof-wf')).toBeDefined();
+    expect(() => mastra.getWorkflow('legacy-oneof-wf')).toThrow(/quarantined/);
+    const quarantined = mastra.listQuarantinedDynamicWorkflows();
+    expect(quarantined).toEqual([
+      expect.objectContaining({
+        id: 'legacy-oneof-wf',
+        reason: 'unsupported-schema',
+      }),
+    ]);
+    expect(quarantined[0]?.issues.some(issue => issue.keyword === 'oneOf')).toBe(true);
 
-    // A warning was emitted naming the offense.
     const messages = warn.mock.calls.map(c => String(c[0]));
-    expect(messages.some(m => /legacy-oneof-wf.*oneOf/.test(m))).toBe(true);
+    expect(messages.some(m => /legacy-oneof-wf.*quarantined/.test(m))).toBe(true);
+    expect(messages.some(m => /oneOf/.test(m))).toBe(true);
   });
 
   it('skips a row that fails rehydration, logs it, and still loads sibling rows', async () => {

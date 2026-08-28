@@ -7,9 +7,11 @@ const emptyObjectSchema = { type: 'object', properties: {} };
 function def(overrides: Partial<WorkflowValidationInput>): WorkflowValidationInput {
   return {
     id: 'wf-under-test',
-    // Untyped by default so schema-flow stays 'unknown' unless a test opts in.
-    inputSchema: {},
-    outputSchema: {},
+    // Admitted object schemas (untyped `{}` is rejected). Default input matches
+    // the implied agent `{ prompt }` contract so schema-flow stays quiet unless
+    // a test supplies a more specific shape.
+    inputSchema: { type: 'object', properties: { prompt: { type: 'string' } }, required: ['prompt'] },
+    outputSchema: emptyObjectSchema,
     graph: [],
     ...overrides,
   };
@@ -325,6 +327,7 @@ describe('validateDynamicWorkflow', () => {
     it('treats an unstructured agent as returning { text } so invented output paths are rejected', () => {
       const invented = validateDynamicWorkflow(
         def({
+          inputSchema: { type: 'object', properties: { prompt: { type: 'string' } }, required: ['prompt'] },
           graph: [
             { type: 'agent', id: 'ask-support', agentId: 'support-agent' },
             {
@@ -420,7 +423,7 @@ describe('validateDynamicWorkflow', () => {
       const ok = validateDynamicWorkflow(
         def({
           inputSchema: arrayIn,
-          outputSchema: {},
+          outputSchema: { type: 'array', items: lookupTool.outputSchema },
           graph: [
             { type: 'foreach', step: { type: 'tool', id: 'body', toolId: 'lookupCustomer' }, opts: { concurrency: 1 } },
           ],
@@ -438,25 +441,28 @@ describe('validateDynamicWorkflow', () => {
         }),
         { tools: { lookupCustomer: lookupTool } },
       );
-      expect(nonArray).toEqual([
-        expect.objectContaining({
-          code: 'incompatible-schema',
-          path: 'graph.0',
-          // The old message just said "must be an array", and the repair advertised
-          // inserting a mapping step — which can never satisfy foreach, because
-          // mappings always emit an object.
-          message: expect.stringContaining('A mapping step cannot produce one'),
-        }),
-      ]);
+      expect(nonArray).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            code: 'incompatible-schema',
+            path: 'graph.0',
+            // The old message just said "must be an array", and the repair advertised
+            // inserting a mapping step — which can never satisfy foreach, because
+            // mappings always emit an object.
+            message: expect.stringContaining('A mapping step cannot produce one'),
+          }),
+        ]),
+      );
+      const foreachIssue = nonArray.find(issue => issue.path === 'graph.0');
       // The expected schema must describe the iterable foreach input, not the
       // workflow's final outputSchema.
-      expect((nonArray[0] as any).repair.expectedSchema).toEqual({
+      expect((foreachIssue as any).repair.expectedSchema).toEqual({
         type: 'array',
         items: expect.objectContaining({ type: 'object' }),
       });
       // Inserting a mapping can never satisfy a foreach (mappings emit
       // objects), so the repair must point at the upstream producer instead.
-      expect((nonArray[0] as any).repair.operation).toBe('update-workflow-step');
+      expect((foreachIssue as any).repair.operation).toBe('update-workflow-step');
     });
 
     it('allows mappings to reference parallel and conditional child results', () => {

@@ -1,16 +1,34 @@
 /**
- * Rehydrating dynamic workflows must not silently drop schema constraints.
- * Guard the MVP subset by asserting we hard-crash on keywords the converter
- * does not understand — otherwise unsupported schemas would degrade to
- * `z.any()` and let malformed data flow through execution.
+ * Fail-closed admission + conversion for persisted dynamic-workflow schemas.
+ * Unsupported keywords must not rehydrate as a weaker Zod validator.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 
-import { standardSchemaToJSONSchema, toStandardSchema } from '../../schema';
-import { jsonSchemaToZod, validateStorableJsonSchema } from './json-schema-to-zod';
+import {
+  ADMITTED_JSON_SCHEMA_BOUNDS,
+  ADMITTED_JSON_SCHEMA_DIALECT,
+  jsonSchemaToZod,
+  UnsupportedJsonSchemaError,
+  validateStorableJsonSchema,
+} from './json-schema-to-zod';
+import type { JsonSchema } from './json-schema-to-zod';
 
-describe('jsonSchemaToZod', () => {
+function expectRejected(schema: unknown, keyword: string, pointer?: string): void {
+  const result = validateStorableJsonSchema(schema as JsonSchema);
+  expect(result.ok).toBe(false);
+  if (result.ok) return;
+  expect(result.issues.some(issue => issue.keyword === keyword && (pointer ? issue.pointer === pointer : true))).toBe(
+    true,
+  );
+  expect(() => jsonSchemaToZod(schema as JsonSchema)).toThrow(UnsupportedJsonSchemaError);
+}
+
+describe('jsonSchemaToZod admitted dialect', () => {
+  it('declares the canonical 2020-12 dialect', () => {
+    expect(ADMITTED_JSON_SCHEMA_DIALECT).toBe('https://json-schema.org/draft/2020-12/schema');
+  });
+
   it('round-trips supported primitive + object shapes', () => {
     const zod = jsonSchemaToZod({
       type: 'object',
@@ -21,7 +39,7 @@ describe('jsonSchemaToZod', () => {
       },
       required: ['name'],
     });
-    const parsed = (zod as z.ZodObject<any>).parse({ name: 'Tony', tags: ['a', 'b'] });
+    const parsed = zod.parse({ name: 'Tony', tags: ['a', 'b'] });
     expect(parsed).toEqual({ name: 'Tony', tags: ['a', 'b'] });
   });
 
@@ -40,14 +58,7 @@ describe('jsonSchemaToZod', () => {
   });
 
   it('rejects non-primitive const values instead of dropping the constraint', () => {
-    expect(() => jsonSchemaToZod({ const: { nested: true } })).toThrow(/non-primitive "const"/);
-    const messages: string[] = [];
-    const zod = jsonSchemaToZod(
-      { const: [1, 2] },
-      { onUnsupportedSchema: 'warn', onUnsupported: m => messages.push(m) },
-    );
-    expect(zod.parse('anything')).toBe('anything'); // degraded to z.any()
-    expect(messages[0]).toMatch(/non-primitive "const"/);
+    expectRejected({ const: { nested: true } }, 'const', '#/const');
   });
 
   it('preserves non-string enum member types instead of coercing to string', () => {
@@ -64,81 +75,56 @@ describe('jsonSchemaToZod', () => {
   });
 
   it('rejects enums with non-primitive members', () => {
-    expect(() => jsonSchemaToZod({ enum: [{ bad: true }] })).toThrow(/non-primitive members/);
+    expectRejected({ enum: [{ bad: true }] }, 'enum');
   });
 
-  it('rejects tuple-form items instead of widening to z.array(z.any())', () => {
-    expect(() => jsonSchemaToZod({ type: 'array', items: [{ type: 'string' }, { type: 'number' }] })).toThrow(
-      /tuple-form "items"/,
-    );
-    const messages: string[] = [];
-    const zod = jsonSchemaToZod(
-      { type: 'array', items: [{ type: 'string' }] },
-      { onUnsupportedSchema: 'warn', onUnsupported: m => messages.push(m) },
-    );
-    expect(zod.parse({ not: 'an array' })).toEqual({ not: 'an array' }); // degraded to z.any()
-    expect(messages[0]).toMatch(/tuple-form "items"/);
+  it('rejects draft-07 tuple-form items instead of widening', () => {
+    expectRejected({ type: 'array', items: [{ type: 'string' }, { type: 'number' }] }, 'items', '#/items');
   });
 
   it.each(['oneOf', 'anyOf', 'allOf', 'not', '$ref', 'patternProperties', 'discriminator'])(
-    'throws on unsupported keyword %s (default mode)',
+    'rejects unsupported keyword %s at write and convert',
     keyword => {
-      expect(() => jsonSchemaToZod({ [keyword]: [{ type: 'string' }] } as any)).toThrow(
-        new RegExp(`unsupported JSON Schema keyword "${keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"`),
-      );
+      expectRejected({ type: 'string', [keyword]: [{ type: 'string' }] }, keyword);
     },
   );
 
-  it('in warn mode, degrades unsupported keyword to z.any() and calls onUnsupported', () => {
-    const messages: string[] = [];
-    const zod = jsonSchemaToZod({ oneOf: [{ type: 'string' }, { type: 'number' }] } as any, {
-      onUnsupportedSchema: 'warn',
-      onUnsupported: m => messages.push(m),
-    });
-    // z.any() accepts anything.
-    expect(zod.parse('hello')).toBe('hello');
-    expect(zod.parse(42)).toBe(42);
-    expect(zod.parse({ arbitrary: true })).toEqual({ arbitrary: true });
-    expect(messages).toHaveLength(1);
-    expect(messages[0]).toMatch(/oneOf/);
-  });
-
-  it('in warn mode, degrades a nested unsupported keyword under properties and keeps other fields typed', () => {
-    const messages: string[] = [];
-    const zod = jsonSchemaToZod(
+  it('rejects nested unsupported keywords with a JSON pointer', () => {
+    expectRejected(
       {
         type: 'object',
-        properties: {
-          name: { type: 'string' },
-          payload: { anyOf: [{ type: 'string' }, { type: 'number' }] },
-        },
-        required: ['name'],
-      } as any,
-      { onUnsupportedSchema: 'warn', onUnsupported: m => messages.push(m) },
+        properties: { payload: { anyOf: [{ type: 'string' }, { type: 'number' }] } },
+      },
+      'anyOf',
+      '#/properties/payload/anyOf',
     );
-    // `name` is still a required string; `payload` is z.any().
-    const parsed = (zod as any).parse({ name: 'Tony', payload: { anything: true } });
-    expect(parsed.name).toBe('Tony');
-    // Required-string constraint is preserved.
-    expect(() => (zod as any).parse({ name: 42, payload: 'ok' })).toThrow();
-    expect(messages).toHaveLength(1);
-    expect(messages[0]).toMatch(/anyOf/);
+  });
+
+  it('throws UnsupportedJsonSchemaError listing every offense, never z.any()', () => {
+    try {
+      jsonSchemaToZod({ oneOf: [{ type: 'string' }] } as JsonSchema);
+      expect.unreachable('should throw');
+    } catch (error) {
+      expect(error).toBeInstanceOf(UnsupportedJsonSchemaError);
+      const issues = (error as UnsupportedJsonSchemaError).issues;
+      expect(issues.some(issue => issue.keyword === 'oneOf')).toBe(true);
+      expect(issues.some(issue => issue.keyword === 'type')).toBe(true);
+    }
   });
 
   it('throws on unsupported type keyword', () => {
-    expect(() => jsonSchemaToZod({ type: 'never' } as any)).toThrow(/unsupported JSON Schema type "never"/);
+    expectRejected({ type: 'never' }, 'type');
   });
 
-  it('tolerates a bare schema with no type (annotation-only)', () => {
-    const zod = jsonSchemaToZod({ description: 'freeform' } as any);
-    expect(zod.parse(42)).toBe(42);
-    expect(zod.parse('anything')).toBe('anything');
+  it('rejects a bare schema with no type (would rehydrate unconstrained)', () => {
+    expectRejected({ description: 'freeform' }, 'type', '#');
   });
 });
 
 describe('validateStorableJsonSchema', () => {
-  it('returns ok for a schema with only supported keywords', () => {
+  it('returns ok for a schema with only admitted keywords', () => {
     const result = validateStorableJsonSchema({
+      $schema: ADMITTED_JSON_SCHEMA_DIALECT,
       type: 'object',
       properties: { name: { type: 'string' }, tags: { type: 'array', items: { type: 'string' } } },
       required: ['name'],
@@ -146,24 +132,18 @@ describe('validateStorableJsonSchema', () => {
     expect(result).toEqual({ ok: true });
   });
 
-  it('returns ok for undefined / empty schema', () => {
+  it('returns ok for undefined / null (schema absent) but not empty object', () => {
     expect(validateStorableJsonSchema(undefined)).toEqual({ ok: true });
-    expect(validateStorableJsonSchema({})).toEqual({ ok: true });
+    expect(validateStorableJsonSchema(null as unknown as JsonSchema)).toEqual({ ok: true });
+    expectRejected({}, 'type', '#');
   });
 
-  it('flags top-level oneOf without throwing', () => {
+  it('flags top-level oneOf with a JSON pointer', () => {
     const result = validateStorableJsonSchema({ oneOf: [{ type: 'string' }, { type: 'number' }] });
-    expect(result).toEqual({ ok: false, unsupported: ['#: oneOf'] });
-  });
-
-  it('flags unsupported keywords nested inside properties with a JSON pointer', () => {
-    const result = validateStorableJsonSchema({
-      type: 'object',
-      properties: {
-        payload: { anyOf: [{ type: 'string' }, { type: 'number' }] },
-      },
-    });
-    expect(result).toEqual({ ok: false, unsupported: ['/properties/payload: anyOf'] });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.issues.some(issue => issue.pointer === '#/oneOf' && issue.keyword === 'oneOf')).toBe(true);
+    }
   });
 
   it('flags unsupported keywords nested inside array items', () => {
@@ -171,7 +151,10 @@ describe('validateStorableJsonSchema', () => {
       type: 'array',
       items: { allOf: [{ type: 'string' }] },
     });
-    expect(result).toEqual({ ok: false, unsupported: ['/items: allOf'] });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.issues.some(issue => issue.pointer === '#/items/allOf' && issue.keyword === 'allOf')).toBe(true);
+    }
   });
 
   it('collects multiple offenses in one walk', () => {
@@ -181,8 +164,167 @@ describe('validateStorableJsonSchema', () => {
     });
     expect(result.ok).toBe(false);
     if (!result.ok) {
-      expect(result.unsupported).toEqual(expect.arrayContaining(['#: oneOf', '/properties/x: $ref']));
+      const keys = result.issues.map(issue => `${issue.pointer}:${issue.keyword}`);
+      expect(keys.some(key => key.includes('oneOf'))).toBe(true);
+      expect(keys.some(key => key.includes('$ref'))).toBe(true);
     }
+  });
+});
+
+describe('additionalProperties', () => {
+  it('omitted additionalProperties passthroughs extras (2020-12 default true)', () => {
+    const zod = jsonSchemaToZod({
+      type: 'object',
+      properties: { name: { type: 'string' } },
+      required: ['name'],
+    });
+    expect(zod.parse({ name: 'Ada', extra: 1 })).toEqual({ name: 'Ada', extra: 1 });
+  });
+
+  it('additionalProperties: true keeps extras', () => {
+    const zod = jsonSchemaToZod({
+      type: 'object',
+      properties: { name: { type: 'string' } },
+      additionalProperties: true,
+    });
+    expect(zod.parse({ name: 'Ada', extra: 1 })).toEqual({ name: 'Ada', extra: 1 });
+  });
+
+  it('additionalProperties: false rejects extras', () => {
+    const zod = jsonSchemaToZod({
+      type: 'object',
+      properties: { name: { type: 'string' } },
+      additionalProperties: false,
+    });
+    expect(zod.parse({ name: 'Ada' })).toEqual({ name: 'Ada' });
+    expect(zod.safeParse({ name: 'Ada', extra: 1 }).success).toBe(false);
+  });
+
+  it('schema-valued additionalProperties validates extras', () => {
+    const zod = jsonSchemaToZod({
+      type: 'object',
+      properties: { name: { type: 'string' } },
+      additionalProperties: { type: 'number' },
+    });
+    expect(zod.parse({ name: 'Ada', n: 2 })).toEqual({ name: 'Ada', n: 2 });
+    expect(zod.safeParse({ name: 'Ada', n: 'no' }).success).toBe(false);
+  });
+});
+
+describe('arrays, tuples, uniqueItems, contains', () => {
+  it('homogeneous arrays keep item + length constraints', () => {
+    const zod = jsonSchemaToZod({ type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 2 });
+    expect(zod.parse(['a'])).toEqual(['a']);
+    expect(zod.safeParse([]).success).toBe(false);
+    expect(zod.safeParse(['a', 'b', 'c']).success).toBe(false);
+    expect(zod.safeParse([1]).success).toBe(false);
+  });
+
+  it('closed prefixItems tuples rehydrate as fixed-length tuples', () => {
+    const zod = jsonSchemaToZod({
+      type: 'array',
+      prefixItems: [{ type: 'string' }, { type: 'number' }],
+      items: false,
+    });
+    expect(zod.parse(['a', 1])).toEqual(['a', 1]);
+    expect(zod.safeParse(['a']).success).toBe(false);
+    expect(zod.safeParse(['a', 1, true]).success).toBe(false);
+    expect(zod.safeParse([1, 'a']).success).toBe(false);
+  });
+
+  it('rejects open tuples (prefixItems without items: false)', () => {
+    expectRejected({ type: 'array', prefixItems: [{ type: 'string' }] }, 'items');
+  });
+
+  it('uniqueItems rejects duplicates including object-key-order variants', () => {
+    const zod = jsonSchemaToZod({
+      type: 'array',
+      items: { type: 'object', properties: { a: { type: 'number' }, b: { type: 'number' } } },
+      uniqueItems: true,
+    });
+    expect(zod.parse([{ a: 1, b: 2 }])).toEqual([{ a: 1, b: 2 }]);
+    expect(
+      zod.safeParse([
+        { a: 1, b: 2 },
+        { b: 2, a: 1 },
+      ]).success,
+    ).toBe(false);
+  });
+
+  it('contains / minContains / maxContains are enforced', () => {
+    const zod = jsonSchemaToZod({
+      type: 'array',
+      items: { type: 'number' },
+      contains: { const: 1 },
+      minContains: 1,
+      maxContains: 2,
+    });
+    expect(zod.parse([1, 2])).toEqual([1, 2]);
+    expect(zod.safeParse([2, 3]).success).toBe(false);
+    expect(zod.safeParse([1, 1, 1]).success).toBe(false);
+  });
+});
+
+describe('object property counts and propertyNames', () => {
+  it('minProperties / maxProperties are enforced after passthrough', () => {
+    const zod = jsonSchemaToZod({
+      type: 'object',
+      properties: { a: { type: 'string' } },
+      minProperties: 2,
+      maxProperties: 3,
+    });
+    expect(zod.safeParse({ a: 'x' }).success).toBe(false);
+    expect(zod.parse({ a: 'x', b: 1 })).toEqual({ a: 'x', b: 1 });
+    expect(zod.safeParse({ a: 'x', b: 1, c: 2, d: 3 }).success).toBe(false);
+  });
+
+  it('propertyNames constrains keys', () => {
+    const zod = jsonSchemaToZod({
+      type: 'object',
+      additionalProperties: { type: 'number' },
+      propertyNames: { type: 'string', pattern: '^[a-z]+$' },
+    });
+    expect(zod.parse({ ab: 1 })).toEqual({ ab: 1 });
+    expect(zod.safeParse({ 'A-b': 1 }).success).toBe(false);
+  });
+
+  it('rejects nested minProperties that would previously have been dropped', () => {
+    expectRejected(
+      {
+        type: 'object',
+        properties: {
+          nested: { type: 'object', properties: {}, minProperties: 1, unevaluatedProperties: false },
+        },
+      },
+      'unevaluatedProperties',
+    );
+  });
+});
+
+describe('nullable type arrays, literals, annotations', () => {
+  it('applies constraints per branch of a multi-type schema', () => {
+    const rebuilt = jsonSchemaToZod({ type: ['string', 'null'], minLength: 2 });
+    expect(rebuilt.safeParse('ok').success).toBe(true);
+    expect(rebuilt.safeParse(null).success).toBe(true);
+    expect(rebuilt.safeParse('x').success).toBe(false);
+  });
+
+  it('keeps description and records default as annotation, not a parse default', () => {
+    const zod = jsonSchemaToZod({
+      type: 'string',
+      description: 'name',
+      title: 'Name',
+      default: 'anon',
+    });
+    expect(zod.description).toBe('name');
+    expect(zod.safeParse(undefined).success).toBe(false);
+    expect(zod.parse('Ada')).toBe('Ada');
+  });
+
+  it('admits known string formats and rejects unknown ones', () => {
+    expect(jsonSchemaToZod({ type: 'string', format: 'email' }).safeParse('a@b.com').success).toBe(true);
+    expect(jsonSchemaToZod({ type: 'string', format: 'email' }).safeParse('nope').success).toBe(false);
+    expectRejected({ type: 'string', format: 'hostname' }, 'format', '#/format');
   });
 });
 
@@ -194,7 +336,7 @@ describe('primitive constraint keywords', () => {
       ratio: z.number().gte(0.5).lt(2),
       tags: z.array(z.string()).min(1).max(2),
     });
-    const json = standardSchemaToJSONSchema(toStandardSchema(original)) as Record<string, any>;
+    const json = z.toJSONSchema(original, { target: 'draft-2020-12' }) as JsonSchema;
     const rebuilt = jsonSchemaToZod(json);
 
     const good = { name: 'abcd', count: 4, ratio: 0.5, tags: ['x'] };
@@ -220,35 +362,34 @@ describe('primitive constraint keywords', () => {
     }
   });
 
-  it('applies draft-4 boolean exclusive bounds against minimum/maximum', () => {
-    const rebuilt = jsonSchemaToZod({
-      type: 'number',
-      minimum: 1,
-      exclusiveMinimum: true,
-      maximum: 5,
-      exclusiveMaximum: true,
-    });
-    expect(rebuilt.safeParse(1).success).toBe(false);
-    expect(rebuilt.safeParse(5).success).toBe(false);
-    expect(rebuilt.safeParse(3).success).toBe(true);
-  });
-
-  it('applies constraints per branch of a multi-type schema', () => {
-    const rebuilt = jsonSchemaToZod({ type: ['string', 'null'], minLength: 2 });
-    expect(rebuilt.safeParse('ok').success).toBe(true);
-    expect(rebuilt.safeParse(null).success).toBe(true);
-    expect(rebuilt.safeParse('x').success).toBe(false);
+  it('rejects draft-4 boolean exclusive bounds instead of misreading them', () => {
+    expectRejected({ type: 'number', minimum: 1, exclusiveMinimum: true }, 'exclusiveMinimum', '#/exclusiveMinimum');
   });
 
   it('rejects an uncompilable string pattern instead of dropping it', () => {
-    expect(() => jsonSchemaToZod({ type: 'string', pattern: '(' })).toThrow(/invalid "pattern"/);
+    expectRejected({ type: 'string', pattern: '(' }, 'pattern', '#/pattern');
+  });
+});
 
-    const messages: string[] = [];
-    const degraded = jsonSchemaToZod(
-      { type: 'string', pattern: '(' },
-      { onUnsupportedSchema: 'warn', onUnsupported: m => messages.push(m) },
-    );
-    expect(degraded.safeParse(123).success).toBe(true); // degraded to z.any()
-    expect(messages[0]).toMatch(/invalid "pattern"/);
+describe('converter bounds', () => {
+  it('rejects too many object properties', () => {
+    const properties: Record<string, JsonSchema> = {};
+    for (let i = 0; i < ADMITTED_JSON_SCHEMA_BOUNDS.maxProperties + 1; i++) {
+      properties[`p${i}`] = { type: 'string' };
+    }
+    expectRejected({ type: 'object', properties }, 'properties');
+  });
+
+  it('rejects excessive depth', () => {
+    let schema: JsonSchema = { type: 'string' };
+    for (let i = 0; i < ADMITTED_JSON_SCHEMA_BOUNDS.maxDepth + 2; i++) {
+      schema = { type: 'object', properties: { nested: schema } };
+    }
+    expectRejected(schema, 'depth');
+  });
+
+  it('rejects oversized enums', () => {
+    const values = Array.from({ length: ADMITTED_JSON_SCHEMA_BOUNDS.maxEnumSize + 1 }, (_, i) => `v${i}`);
+    expectRejected({ enum: values }, 'enum');
   });
 });
