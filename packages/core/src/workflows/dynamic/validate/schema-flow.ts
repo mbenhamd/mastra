@@ -172,6 +172,7 @@ export function inferGraphSchemas(def: WorkflowValidationInput, index: WorkflowR
   const issues: WorkflowValidationIssue[] = [];
   const stepOutputs = new Map<string, JsonSchema | undefined>();
   const entryInputs = new Map<string, JsonSchema | undefined>();
+  const registeredWorkflowIds = index.workflows ? new Set(Object.keys(index.workflows)) : undefined;
 
   /** Evaluates one leaf entry: checks its input against `incoming`, returns its output. */
   const evalLeaf = (
@@ -188,6 +189,8 @@ export function inferGraphSchemas(def: WorkflowValidationInput, index: WorkflowR
         path,
         availableOutputs: stepOutputs,
         inputSchema: def.inputSchema,
+        workflowId: def.id,
+        registeredWorkflowIds,
         requestContextSchema: def.requestContextSchema,
       });
       issues.push(...analysis.issues);

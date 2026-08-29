@@ -5335,19 +5335,26 @@ export class Mastra<
     const workflows = this.#workflows as Record<string, AnyWorkflow>;
 
     if (workflows[keyOrId]) {
+      const workflowId = workflows[keyOrId].id;
       delete workflows[keyOrId];
       this.#hiddenWorkflowKeys.delete(keyOrId);
+      this.#quarantinedDynamicWorkflows.delete(keyOrId);
+      this.#quarantinedDynamicWorkflows.delete(workflowId);
       return true;
     }
 
     const key = Object.keys(workflows).find(k => workflows[k]?.id === keyOrId);
     if (key) {
+      const workflowId = workflows[key]?.id;
       delete workflows[key];
       this.#hiddenWorkflowKeys.delete(key);
+      this.#quarantinedDynamicWorkflows.delete(key);
+      this.#quarantinedDynamicWorkflows.delete(keyOrId);
+      if (workflowId) this.#quarantinedDynamicWorkflows.delete(workflowId);
       return true;
     }
 
-    return false;
+    return this.#quarantinedDynamicWorkflows.delete(keyOrId);
   }
 
   /**
@@ -5415,6 +5422,7 @@ export class Mastra<
     }
     workflows[workflowKey] = workflow;
     this.#quarantinedDynamicWorkflows.delete(workflowKey);
+    this.#quarantinedDynamicWorkflows.delete(workflow.id);
 
     this.registerStaticWorkflowScorers(workflow);
 
@@ -5690,8 +5698,16 @@ export class Mastra<
 
     const { definitions } = await store.list({ status: 'active' });
 
-    // Code-registered workflows win; storage is additive.
-    const pending = definitions.filter(d => !(this.#workflows as Record<string, AnyWorkflow>)[d.id]);
+    // Code-registered workflows win by both registration key and intrinsic ID;
+    // storage is additive. The ID check matters when a code workflow is stored
+    // under a custom key: a stale row with its intrinsic ID must not shadow the
+    // live workflow or quarantine otherwise-valid parents that reference it.
+    const liveWorkflows = Object.values(this.#workflows as Record<string, AnyWorkflow>);
+    const liveWorkflowIds = new Set(liveWorkflows.map(workflow => workflow.id));
+    const pending = definitions.filter(
+      definition =>
+        !(this.#workflows as Record<string, AnyWorkflow>)[definition.id] && !liveWorkflowIds.has(definition.id),
+    );
 
     const pendingIds = new Set(pending.map(d => d.id));
     const deps = new Map<string, Set<string>>();
@@ -5739,9 +5755,32 @@ export class Mastra<
     while (remaining.size > 0 && progress) {
       progress = false;
       for (const [id, def] of Array.from(remaining)) {
-        const unresolved = Array.from(deps.get(id) ?? []).filter(
-          d => !loaded.has(d) && remaining.has(d) && !this.#quarantinedDynamicWorkflows.has(d),
+        const dependencies = Array.from(deps.get(id) ?? []);
+        const quarantinedDependencies = dependencies.filter(dependency =>
+          this.#quarantinedDynamicWorkflows.has(dependency),
         );
+        if (quarantinedDependencies.length > 0) {
+          const issues = quarantinedDependencies.flatMap(dependency => {
+            const source = this.#quarantinedDynamicWorkflows.get(dependency);
+            return (source?.issues ?? []).map(issue => ({
+              ...issue,
+              path: issue.path ? `${dependency}.${issue.path}` : dependency,
+            }));
+          });
+          const quarantined: QuarantinedDynamicWorkflow = {
+            id: def.id,
+            reason: 'unsupported-schema',
+            issues,
+          };
+          remaining.delete(id);
+          progress = true;
+          this.#quarantinedDynamicWorkflows.set(def.id, quarantined);
+          this.#logger?.warn?.(
+            `Dynamic workflow "${def.id}" quarantined because it depends on quarantined workflow(s) ${quarantinedDependencies.join(', ')}: ${formatAdmissionIssues(issues)}`,
+          );
+          continue;
+        }
+        const unresolved = dependencies.filter(d => !loaded.has(d) && remaining.has(d));
         if (unresolved.length > 0) continue;
         remaining.delete(id);
         progress = true;

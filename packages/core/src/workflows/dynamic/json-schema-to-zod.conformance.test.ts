@@ -29,10 +29,10 @@ type RejectCase = {
 
 const ACCEPT: AcceptCase[] = [
   {
-    name: 'string with length and pattern',
-    schema: { type: 'string', minLength: 2, maxLength: 4, pattern: '^a' },
+    name: 'string with length constraints',
+    schema: { type: 'string', minLength: 2, maxLength: 4 },
     valid: [{ input: 'ab', output: 'ab' }],
-    invalid: ['a', 'abcde', 'ba'],
+    invalid: ['a', 'abcde'],
   },
   {
     name: 'integer exclusive bounds',
@@ -76,6 +76,7 @@ const ACCEPT: AcceptCase[] = [
       type: 'array',
       prefixItems: [{ const: 'ok' }, { type: 'number' }],
       items: false,
+      minItems: 2,
     },
     valid: [{ input: ['ok', 2], output: ['ok', 2] }],
     invalid: [['ok'], ['ok', 2, 3], [2, 'ok']],
@@ -93,7 +94,10 @@ const ACCEPT: AcceptCase[] = [
   {
     name: 'uuid format',
     schema: { type: 'string', format: 'uuid' },
-    valid: [{ input: '123e4567-e89b-12d3-a456-426614174000', output: '123e4567-e89b-12d3-a456-426614174000' }],
+    valid: [
+      { input: '00000000-0000-0000-0000-000000000000', output: '00000000-0000-0000-0000-000000000000' },
+      { input: '123e4567-e89b-02d3-0456-426614174000', output: '123e4567-e89b-02d3-0456-426614174000' },
+    ],
     invalid: ['not-a-uuid'],
   },
   {
@@ -107,15 +111,6 @@ const ACCEPT: AcceptCase[] = [
     },
     valid: [{ input: { id: 'a' }, output: { id: 'a' } }],
     invalid: [{}, { id: 'a', extra: 1 }],
-  },
-  {
-    name: 'date-time with RFC 3339 offset',
-    schema: { type: 'string', format: 'date-time' },
-    valid: [
-      { input: '2026-08-28T12:00:00Z', output: '2026-08-28T12:00:00Z' },
-      { input: '2026-08-28T12:00:00+02:00', output: '2026-08-28T12:00:00+02:00' },
-    ],
-    invalid: ['2026-08-28T12:00:00', 'not-a-date'],
   },
 ];
 
@@ -154,6 +149,15 @@ const REJECT: RejectCase[] = [
   },
   { name: 'boolean schema', schema: true, keyword: 'boolean-schema', pointer: '#' },
   { name: 'untyped node', schema: { title: 'x' }, keyword: 'type', pointer: '#' },
+  { name: 'string pattern', schema: { type: 'string', pattern: '^a' }, keyword: 'pattern', pointer: '#/pattern' },
+  { name: 'email format', schema: { type: 'string', format: 'email' }, keyword: 'format', pointer: '#/format' },
+  { name: 'URI format', schema: { type: 'string', format: 'uri' }, keyword: 'format', pointer: '#/format' },
+  {
+    name: 'date-time format',
+    schema: { type: 'string', format: 'date-time' },
+    keyword: 'format',
+    pointer: '#/format',
+  },
   { name: 'unknown format', schema: { type: 'string', format: 'idn-email' }, keyword: 'format', pointer: '#/format' },
   {
     name: 'contentEncoding',

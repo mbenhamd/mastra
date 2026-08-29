@@ -27,6 +27,20 @@ export function parseMapConfig(raw: string, stepId: string): Record<string, any>
   }
 }
 
+/** Workflow ids referenced by serialized `mapVariable({ initData: workflow })` sources. */
+export function collectMapConfigWorkflowIds(raw: string, stepId: string): Set<string> {
+  const config = parseMapConfig(raw, stepId);
+  const ids = new Set<string>();
+  if (!isRecord(config)) return ids;
+
+  for (const descriptor of Object.values(config)) {
+    if (isRecord(descriptor) && typeof descriptor.initData === 'string') {
+      ids.add(descriptor.initData);
+    }
+  }
+  return ids;
+}
+
 /** A recognizable Handlebars/Mustache placeholder: `{{ name }}`, `{{a.b}}`, … */
 const HANDLEBARS_PLACEHOLDER = /\{\{\s*[\w$][\w.$-]*\s*\}\}/;
 
@@ -35,8 +49,12 @@ export interface MapConfigAnalysisOptions {
   path: string;
   /** Outputs of preceding workflow-local steps (schema may be undefined when unknown). */
   availableOutputs: ReadonlyMap<string, JsonSchema | undefined>;
-  /** The workflow's input schema (for `{ initData: true }` sources). */
+  /** The workflow's input schema (for live or serialized `initData` sources). */
   inputSchema: JsonSchema | undefined;
+  /** The definition currently being analyzed; its own serialized init-data id is valid before registration. */
+  workflowId?: string;
+  /** Registered workflow keys and intrinsic ids, when the caller can enumerate them. */
+  registeredWorkflowIds?: ReadonlySet<string>;
   /** The workflow's request-context schema (for `{ requestContextPath }` sources). */
   requestContextSchema: JsonSchema | undefined;
 }
@@ -147,7 +165,11 @@ export function analyzeMapConfig(rawConfig: string, opts: MapConfigAnalysisOptio
       });
       continue;
     }
-    const hasInitData = descriptor.initData === true;
+    // Live fluent mappings carry `true`; persisted mappings carry the source
+    // workflow's id. Execution treats both as an init-data marker, so the
+    // validator must admit both representations of the same mapping.
+    const serializedInitDataId = typeof descriptor.initData === 'string' ? descriptor.initData : undefined;
+    const hasInitData = descriptor.initData === true || serializedInitDataId !== undefined;
     const stepIds =
       typeof descriptor.step === 'string' ? [descriptor.step] : Array.isArray(descriptor.step) ? descriptor.step : [];
     if (hasInitData === stepIds.length > 0 || stepIds.some(stepId => typeof stepId !== 'string')) {
@@ -155,6 +177,22 @@ export function analyzeMapConfig(rawConfig: string, opts: MapConfigAnalysisOptio
         code: 'invalid-map-config',
         path: descriptorPath,
         message: 'Path mappings must reference exactly one of initData or step.',
+      });
+      continue;
+    }
+    if (
+      serializedInitDataId !== undefined &&
+      (serializedInitDataId.length === 0 ||
+        (serializedInitDataId !== opts.workflowId &&
+          opts.registeredWorkflowIds !== undefined &&
+          !opts.registeredWorkflowIds.has(serializedInitDataId)))
+    ) {
+      issues.push({
+        code: 'invalid-map-reference',
+        path: `${descriptorPath}.initData`,
+        message: serializedInitDataId
+          ? `Mapping init-data workflow "${serializedInitDataId}" is not registered.`
+          : 'Mapping init-data workflow id must not be empty.',
       });
       continue;
     }

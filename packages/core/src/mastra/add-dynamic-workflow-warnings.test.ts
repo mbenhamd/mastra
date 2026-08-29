@@ -16,6 +16,7 @@ import { z } from 'zod/v4';
 import { Agent } from '../agent';
 import { InMemoryStore } from '../storage';
 import { createTool } from '../tools';
+import { createWorkflow } from '../workflows/create';
 import { Mastra } from './index';
 
 const passthroughTool = createTool({
@@ -121,6 +122,8 @@ describe('Mastra.addDynamicWorkflow — save path is strict on unsupported schem
 
   it('throws when a nested uniqueItems-era silent keyword is unknown, before touching storage', async () => {
     const storage = new InMemoryStore({ id: 'nested-unevaluated' });
+    const store = await storage.getStore('workflowDefinitions');
+    const upsert = vi.spyOn(store!, 'upsert');
     const mastra = new Mastra({
       logger: false,
       tools: { 'passthrough-tool': passthroughTool } as any,
@@ -140,6 +143,7 @@ describe('Mastra.addDynamicWorkflow — save path is strict on unsupported schem
     ).rejects.toThrow(/unevaluatedProperties/);
 
     expect(() => mastra.getWorkflow('unevaluated-wf')).toThrow();
+    expect(upsert).not.toHaveBeenCalled();
   });
 
   it('throws when top-level outputSchema uses oneOf, before touching storage', async () => {
@@ -395,7 +399,7 @@ describe('Mastra boot load — quarantine unsupported schema keywords', () => {
     expect(messages.some(m => /oneOf/.test(m))).toBe(true);
   });
 
-  it('quarantines a nested workflow and a dependent that also has an unsupported schema', async () => {
+  it('quarantines an admitted workflow when a nested dependency is quarantined', async () => {
     const storage = new InMemoryStore({ id: 'boot-quarantine-nested-dep' });
     const store = await storage.getStore('workflowDefinitions');
     if (!store) throw new Error('workflowDefinitions store not available');
@@ -408,7 +412,7 @@ describe('Mastra boot load — quarantine unsupported schema keywords', () => {
     await store.upsert({
       id: 'bad-parent',
       inputSchema: { type: 'object' },
-      outputSchema: { anyOf: [{ type: 'string' }] } as any,
+      outputSchema: { type: 'object' },
       graph: [{ type: 'workflow', id: 'child-call', workflowId: 'bad-child' }],
     });
 
@@ -425,6 +429,183 @@ describe('Mastra boot load — quarantine unsupported schema keywords', () => {
     expect(quarantinedIds).toEqual(['bad-child', 'bad-parent']);
     expect(() => mastra.getWorkflow('bad-child')).toThrow(/quarantined/);
     expect(() => mastra.getWorkflow('bad-parent')).toThrow(/quarantined/);
+    const parent = mastra.listQuarantinedDynamicWorkflows().find(row => row.id === 'bad-parent');
+    expect(parent?.issues).toEqual(
+      expect.arrayContaining([expect.objectContaining({ keyword: 'oneOf', path: 'bad-child.outputSchema' })]),
+    );
+  });
+
+  it('quarantines a mapping whose workflow init-data source is quarantined', async () => {
+    const storage = new InMemoryStore({ id: 'boot-quarantine-mapping-dep' });
+    const store = await storage.getStore('workflowDefinitions');
+    if (!store) throw new Error('workflowDefinitions store not available');
+    await store.upsert({
+      id: 'bad-child',
+      inputSchema: { type: 'object' },
+      outputSchema: { oneOf: [{ type: 'object' }] } as any,
+      graph: [],
+    });
+    await store.upsert({
+      id: 'mapped-parent',
+      inputSchema: { type: 'object' },
+      outputSchema: { type: 'object' },
+      graph: [
+        {
+          type: 'mapping',
+          id: 'map-child-input',
+          mapConfig: JSON.stringify({ value: { initData: 'bad-child', path: 'value' } }),
+        },
+      ],
+    });
+
+    const mastra = new Mastra({ logger: false, storage });
+    await (mastra as any).startWorkers?.();
+
+    expect(
+      mastra
+        .listQuarantinedDynamicWorkflows()
+        .map(row => row.id)
+        .sort(),
+    ).toEqual(['bad-child', 'mapped-parent']);
+    expect(() => mastra.getWorkflow('mapped-parent')).toThrow(/quarantined/);
+    expect(mastra.listQuarantinedDynamicWorkflows().find(row => row.id === 'mapped-parent')?.issues).toEqual(
+      expect.arrayContaining([expect.objectContaining({ path: 'bad-child.outputSchema', keyword: 'oneOf' })]),
+    );
+  });
+
+  it('uses a live workflow intrinsic ID instead of a quarantined shadow row', async () => {
+    const storage = new InMemoryStore({ id: 'boot-live-id-precedence' });
+    const store = await storage.getStore('workflowDefinitions');
+    if (!store) throw new Error('workflowDefinitions store not available');
+    await store.upsert({
+      id: 'live-child',
+      inputSchema: { type: 'object' },
+      outputSchema: { oneOf: [{ type: 'object' }] } as any,
+      graph: [],
+    });
+    await store.upsert({
+      id: 'stored-parent',
+      inputSchema: { type: 'object' },
+      outputSchema: { type: 'object' },
+      graph: [{ type: 'workflow', id: 'child-call', workflowId: 'live-child' }],
+    });
+
+    const liveChild = createWorkflow({
+      id: 'live-child',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+    }).commit();
+    const mastra = new Mastra({
+      logger: false,
+      storage,
+      workflows: { alias: liveChild } as any,
+    });
+    await (mastra as any).startWorkers?.();
+
+    expect(mastra.getWorkflow('alias')).toBe(liveChild);
+    expect(mastra.getWorkflowById('live-child')).toBe(liveChild);
+    expect(mastra.getWorkflow('stored-parent')).toBeDefined();
+    expect(mastra.listQuarantinedDynamicWorkflows()).toEqual([]);
+  });
+
+  it('resolves a mapped init-data source through a live workflow intrinsic ID', async () => {
+    const storage = new InMemoryStore({ id: 'boot-live-mapped-id-precedence' });
+    const store = await storage.getStore('workflowDefinitions');
+    if (!store) throw new Error('workflowDefinitions store not available');
+    await store.upsert({
+      id: 'live-mapped-child',
+      inputSchema: { type: 'object' },
+      outputSchema: { oneOf: [{ type: 'object' }] } as any,
+      graph: [],
+    });
+    await store.upsert({
+      id: 'stored-mapped-parent',
+      inputSchema: { type: 'object' },
+      outputSchema: { type: 'object' },
+      graph: [
+        {
+          type: 'mapping',
+          id: 'map-input',
+          mapConfig: JSON.stringify({ value: { initData: 'live-mapped-child', path: '' } }),
+        },
+      ],
+    });
+
+    const liveChild = createWorkflow({
+      id: 'live-mapped-child',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+    }).commit();
+    const mastra = new Mastra({
+      logger: false,
+      storage,
+      workflows: { alias: liveChild } as any,
+    });
+    await (mastra as any).startWorkers?.();
+
+    expect(mastra.getWorkflow('stored-mapped-parent')).toBeDefined();
+    expect(mastra.listQuarantinedDynamicWorkflows()).toEqual([]);
+  });
+
+  it('clears intrinsic-ID quarantine when a live workflow is added under a custom key', async () => {
+    const storage = new InMemoryStore({ id: 'runtime-live-id-precedence' });
+    const store = await storage.getStore('workflowDefinitions');
+    if (!store) throw new Error('workflowDefinitions store not available');
+    await store.upsert({
+      id: 'live-child',
+      inputSchema: { type: 'object' },
+      outputSchema: { oneOf: [{ type: 'object' }] } as any,
+      graph: [],
+    });
+
+    const mastra = new Mastra({ logger: false, storage });
+    await (mastra as any).startWorkers?.();
+    expect(() => mastra.getWorkflow('live-child')).toThrow(/quarantined/);
+
+    const liveChild = createWorkflow({
+      id: 'live-child',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+    }).commit();
+    mastra.addWorkflow(liveChild, 'alias');
+
+    expect(mastra.getWorkflow('alias')).toBe(liveChild);
+    expect(mastra.getWorkflowById('live-child')).toBe(liveChild);
+    expect(mastra.listQuarantinedDynamicWorkflows()).toEqual([]);
+  });
+
+  it('quarantines a historical row that omits a required workflow schema', async () => {
+    const storage = new InMemoryStore({ id: 'boot-quarantine-missing-schema' });
+    const store = await storage.getStore('workflowDefinitions');
+    if (!store) throw new Error('workflowDefinitions store not available');
+    await store.upsert({
+      id: 'missing-input-schema',
+      inputSchema: { type: 'object' },
+      outputSchema: { type: 'object' },
+      graph: [],
+    });
+    const realList = store.list.bind(store);
+    store.list = (async options => {
+      const result = await realList(options);
+      return {
+        ...result,
+        definitions: result.definitions.map(definition => {
+          const { inputSchema: _omitted, ...historicalRow } = definition;
+          return historicalRow as any;
+        }),
+      };
+    }) as typeof store.list;
+
+    const mastra = new Mastra({ logger: false, storage });
+    await (mastra as any).startWorkers?.();
+
+    expect(() => mastra.getWorkflow('missing-input-schema')).toThrow(/quarantined/);
+    expect(mastra.listQuarantinedDynamicWorkflows()).toEqual([
+      expect.objectContaining({
+        id: 'missing-input-schema',
+        issues: [expect.objectContaining({ path: 'inputSchema', keyword: 'required-schema' })],
+      }),
+    ]);
   });
 
   it('skips a row that fails rehydration, logs it, and still loads sibling rows', async () => {

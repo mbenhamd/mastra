@@ -176,6 +176,22 @@ describe('validateStorableJsonSchema', () => {
       expect(keys.some(key => key.includes('$ref'))).toBe(true);
     }
   });
+
+  it('returns an issue instead of throwing when schema inspection fails', () => {
+    const hostile = new Proxy(
+      {},
+      {
+        getPrototypeOf() {
+          throw new Error('inspection denied');
+        },
+      },
+    );
+    expect(() => validateStorableJsonSchema(hostile as JsonSchema)).not.toThrow();
+    expect(validateStorableJsonSchema(hostile as JsonSchema)).toEqual({
+      ok: false,
+      issues: [expect.objectContaining({ pointer: '#', keyword: 'schema' })],
+    });
+  });
 });
 
 describe('additionalProperties', () => {
@@ -232,6 +248,7 @@ describe('arrays, tuples, uniqueItems, contains', () => {
       type: 'array',
       prefixItems: [{ type: 'string' }, { type: 'number' }],
       items: false,
+      minItems: 2,
     });
     expect(zod.parse(['a', 1])).toEqual(['a', 1]);
     expect(zod.safeParse(['a']).success).toBe(false);
@@ -241,6 +258,14 @@ describe('arrays, tuples, uniqueItems, contains', () => {
 
   it('rejects open tuples (prefixItems without items: false)', () => {
     expectRejected({ type: 'array', prefixItems: [{ type: 'string' }] }, 'items');
+  });
+
+  it('rejects a closed tuple without the minimum length required by a fixed Zod tuple', () => {
+    expectRejected(
+      { type: 'array', prefixItems: [{ type: 'string' }, { type: 'number' }], items: false },
+      'minItems',
+      '#/minItems',
+    );
   });
 
   it('rejects non-object items and contains instead of crashing convert', () => {
@@ -261,6 +286,31 @@ describe('arrays, tuples, uniqueItems, contains', () => {
         { b: 2, a: 1 },
       ]).success,
     ).toBe(false);
+  });
+
+  it('uniqueItems handles deeply nested JSON and rejects cyclic non-JSON values without throwing', () => {
+    const schema = jsonSchemaToZod({
+      type: 'array',
+      items: { type: 'object', properties: {} },
+      uniqueItems: true,
+    });
+    const buildDeep = () => {
+      const root: Record<string, unknown> = {};
+      let cursor = root;
+      for (let i = 0; i < 5_000; i += 1) {
+        const child: Record<string, unknown> = {};
+        cursor.child = child;
+        cursor = child;
+      }
+      return root;
+    };
+    expect(() => schema.safeParse([buildDeep(), buildDeep()])).not.toThrow();
+    expect(schema.safeParse([buildDeep(), buildDeep()]).success).toBe(false);
+
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    expect(() => schema.safeParse([cyclic])).not.toThrow();
+    expect(schema.safeParse([cyclic]).success).toBe(false);
   });
 
   it('contains / minContains / maxContains are enforced', () => {
@@ -294,10 +344,24 @@ describe('object property counts and propertyNames', () => {
     const zod = jsonSchemaToZod({
       type: 'object',
       additionalProperties: { type: 'number' },
-      propertyNames: { type: 'string', pattern: '^[a-z]+$' },
+      propertyNames: { type: 'string', minLength: 2, maxLength: 2 },
     });
     expect(zod.parse({ ab: 1 })).toEqual({ ab: 1 });
-    expect(zod.safeParse({ 'A-b': 1 }).success).toBe(false);
+    expect(zod.safeParse({ long: 1 }).success).toBe(false);
+  });
+
+  it('rejects own __proto__ input keys before object parsing can strip them', () => {
+    const input = JSON.parse('{"__proto__":1}');
+    const schemas = [
+      { type: 'object' },
+      { type: 'object', additionalProperties: false },
+      { type: 'object', additionalProperties: { type: 'number' } },
+      { type: 'object', propertyNames: false },
+      { type: 'object', minProperties: 1 },
+    ];
+    for (const schema of schemas) {
+      expect(jsonSchemaToZod(schema).safeParse(input).success).toBe(false);
+    }
   });
 
   it('rejects nested minProperties that would previously have been dropped', () => {
@@ -333,24 +397,39 @@ describe('nullable type arrays, literals, annotations', () => {
     expect(zod.parse('Ada')).toBe('Ada');
   });
 
-  it('admits known string formats and rejects unknown ones', () => {
-    expect(jsonSchemaToZod({ type: 'string', format: 'email' }).safeParse('a@b.com').success).toBe(true);
-    expect(jsonSchemaToZod({ type: 'string', format: 'email' }).safeParse('nope').success).toBe(false);
+  it('preserves UUID string-representation semantics and rejects formats without a lossless converter', () => {
+    const uuid = jsonSchemaToZod({ type: 'string', format: 'uuid' });
+    expect(uuid.safeParse('00000000-0000-0000-0000-000000000000').success).toBe(true);
+    expect(uuid.safeParse('123e4567-e89b-02d3-0456-426614174000').success).toBe(true);
+    expect(uuid.safeParse('not-a-uuid').success).toBe(false);
+    expectRejected({ type: 'string', format: 'email' }, 'format', '#/format');
+    expectRejected({ type: 'string', format: 'uri' }, 'format', '#/format');
+    expectRejected({ type: 'string', format: 'date-time' }, 'format', '#/format');
     expectRejected({ type: 'string', format: 'hostname' }, 'format', '#/format');
   });
 
-  it('accepts RFC 3339 offsets for date-time', () => {
-    const zod = jsonSchemaToZod({ type: 'string', format: 'date-time' });
-    expect(zod.parse('2026-08-28T12:00:00Z')).toBe('2026-08-28T12:00:00Z');
-    expect(zod.parse('2026-08-28T12:00:00+02:00')).toBe('2026-08-28T12:00:00+02:00');
-    expect(zod.safeParse('2026-08-28T12:00:00').success).toBe(false);
+  it('counts Unicode code points for string lengths', () => {
+    const oneCharacter = jsonSchemaToZod({ type: 'string', minLength: 1, maxLength: 1 });
+    expect(oneCharacter.safeParse('😀').success).toBe(true);
+    expect(oneCharacter.safeParse('ab').success).toBe(false);
+  });
+
+  it('freezes string bounds when converting a retained schema object', () => {
+    const schema: JsonSchema = { type: 'string', minLength: 2, maxLength: 3 };
+    const rebuilt = jsonSchemaToZod(schema);
+
+    schema.minLength = 0;
+    schema.maxLength = 10;
+
+    expect(rebuilt.safeParse('a').success).toBe(false);
+    expect(rebuilt.safeParse('abcd').success).toBe(false);
   });
 });
 
 describe('primitive constraint keywords', () => {
   it('round-trips string/number/array constraints instead of silently widening', () => {
     const original = z.object({
-      name: z.string().min(3).max(5).regex(/^a/),
+      name: z.string().min(3).max(5),
       count: z.number().int().gt(0).lte(10).multipleOf(2),
       ratio: z.number().gte(0.5).lt(2),
       tags: z.array(z.string()).min(1).max(2),
@@ -365,7 +444,6 @@ describe('primitive constraint keywords', () => {
     const bads: Array<[string, Record<string, unknown>]> = [
       ['minLength', { ...good, name: 'ab' }],
       ['maxLength', { ...good, name: 'abcdef' }],
-      ['pattern', { ...good, name: 'bcde' }],
       ['exclusiveMinimum', { ...good, count: 0 }],
       ['maximum', { ...good, count: 12 }],
       ['multipleOf', { ...good, count: 3 }],
@@ -385,8 +463,27 @@ describe('primitive constraint keywords', () => {
     expectRejected({ type: 'number', minimum: 1, exclusiveMinimum: true }, 'exclusiveMinimum', '#/exclusiveMinimum');
   });
 
-  it('rejects an uncompilable string pattern instead of dropping it', () => {
-    expectRejected({ type: 'string', pattern: '(' }, 'pattern', '#/pattern');
+  it('rejects string patterns because runtime RegExp matching is not bounded', () => {
+    expectRejected({ type: 'string', pattern: '^a' }, 'pattern', '#/pattern');
+  });
+
+  it('rejects non-finite JavaScript numbers under every supported Zod peer', () => {
+    const number = jsonSchemaToZod({ type: 'number' });
+    expect(number.safeParse(Number.POSITIVE_INFINITY).success).toBe(false);
+    expect(number.safeParse(Number.NEGATIVE_INFINITY).success).toBe(false);
+  });
+
+  it('uses JSON Schema integer and decimal multiple semantics', () => {
+    const integer = jsonSchemaToZod({ type: 'integer' });
+    expect(integer.safeParse(1e100).success).toBe(true);
+    expect(integer.safeParse(1.5).success).toBe(false);
+
+    const decimal = jsonSchemaToZod({ type: 'number', multipleOf: 0.1 });
+    expect(decimal.safeParse(0.3).success).toBe(true);
+    expect(decimal.safeParse(0.31).success).toBe(false);
+
+    const subnormal = jsonSchemaToZod({ type: 'number', multipleOf: 5e-324 });
+    expect(subnormal.safeParse(1e-323).success).toBe(true);
   });
 });
 

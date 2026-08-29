@@ -156,6 +156,29 @@ describe('validateDynamicWorkflow', () => {
         ]),
       );
     });
+
+    it('flags omitted required workflow schemas with explicit admission evidence', () => {
+      const issues = validateDynamicWorkflow(
+        def({
+          inputSchema: undefined as any,
+          outputSchema: undefined as any,
+        }),
+      );
+      expect(issues).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            code: 'unsupported-schema-keyword',
+            path: 'inputSchema',
+            message: expect.stringContaining('is required'),
+          }),
+          expect.objectContaining({
+            code: 'unsupported-schema-keyword',
+            path: 'outputSchema',
+            message: expect.stringContaining('is required'),
+          }),
+        ]),
+      );
+    });
   });
 
   describe('references', () => {
@@ -251,6 +274,61 @@ describe('validateDynamicWorkflow', () => {
         { tools: { lookupCustomer: lookupTool } },
       );
       expect(issues).toEqual([]);
+    });
+
+    it('accepts the serialized workflow-id form of an init-data mapping', () => {
+      const issues = validateDynamicWorkflow(
+        def({
+          inputSchema,
+          outputSchema: { type: 'object', properties: { email: { type: 'string' } }, required: ['email'] },
+          graph: [
+            {
+              type: 'mapping',
+              id: 'serialized-init-data',
+              mapConfig: JSON.stringify({ email: { initData: 'source-workflow', path: 'email' } }),
+            },
+          ],
+        }),
+        { workflows: { 'source-workflow': {} } },
+      );
+
+      expect(issues).toEqual([]);
+    });
+
+    it('rejects missing and empty serialized init-data workflow ids', () => {
+      const definition = def({
+        inputSchema,
+        graph: [
+          {
+            type: 'mapping',
+            id: 'serialized-init-data',
+            mapConfig: JSON.stringify({ email: { initData: 'missing-workflow', path: 'email' } }),
+          },
+        ],
+      });
+
+      expect(validateDynamicWorkflow(definition, { workflows: {} })).toEqual([
+        expect.objectContaining({
+          code: 'invalid-map-reference',
+          path: 'graph.0.mapConfig.email.initData',
+          message: expect.stringContaining('missing-workflow'),
+        }),
+      ]);
+
+      definition.graph = [
+        {
+          type: 'mapping',
+          id: 'serialized-init-data',
+          mapConfig: JSON.stringify({ email: { initData: '', path: 'email' } }),
+        },
+      ];
+      expect(validateDynamicWorkflow(definition)).toEqual([
+        expect.objectContaining({
+          code: 'invalid-map-reference',
+          path: 'graph.0.mapConfig.email.initData',
+          message: expect.stringContaining('must not be empty'),
+        }),
+      ]);
     });
 
     it('rejects noncanonical paths and step references that are missing or not preceding', () => {

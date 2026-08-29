@@ -7,6 +7,7 @@
  * evidence so rehydration cannot silently widen validation.
  */
 import { z } from 'zod';
+import { rememberAdmittedJsonSchema } from './admitted-schema-source';
 
 /**
  * Minimal JSON-Schema shape we accept. Intentionally untyped on the value side
@@ -39,16 +40,16 @@ export const ADMITTED_JSON_SCHEMA_BOUNDS = {
   maxProperties: 64,
   maxEnumSize: 128,
   maxSerializedBytes: 32 * 1024,
-  maxPatternLength: 256,
   maxPrefixItems: 16,
 } as const;
 
 const ANNOTATION_KEYS = ['title', 'description', '$comment', 'examples', 'default'] as const;
-const STRING_FORMATS = new Set(['email', 'uri', 'uuid', 'date-time']);
+const STRING_FORMATS = new Set(['uuid']);
+const UUID_FORMAT_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const JSON_TYPES = new Set(['object', 'array', 'string', 'number', 'integer', 'boolean', 'null']);
 
 const KEYS_BY_TYPE: Record<string, ReadonlySet<string>> = {
-  string: new Set([...ANNOTATION_KEYS, 'type', 'enum', 'const', 'minLength', 'maxLength', 'pattern', 'format']),
+  string: new Set([...ANNOTATION_KEYS, 'type', 'enum', 'const', 'minLength', 'maxLength', 'format']),
   number: new Set([
     ...ANNOTATION_KEYS,
     'type',
@@ -107,19 +108,13 @@ function isLiteralValue(v: unknown): v is string | number | boolean | null {
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
 }
 
 function isJsonValue(value: unknown): boolean {
-  if (value === null) return true;
-  const t = typeof value;
-  if (t === 'string' || t === 'boolean') return true;
-  if (t === 'number') return Number.isFinite(value);
-  if (t !== 'object') return false;
-  if (Array.isArray(value)) return value.every(isJsonValue);
-  const proto = Object.getPrototypeOf(value);
-  if (proto !== Object.prototype && proto !== null) return false;
-  return Object.values(value as Record<string, unknown>).every(isJsonValue);
+  return canonicalJson(value) !== undefined;
 }
 
 function pointerSegment(segment: string): string {
@@ -434,29 +429,6 @@ function visitStringKeywords(schema: Record<string, unknown>, pointer: string, c
   ) {
     addIssue(ctx, childPointer(pointer, 'minLength'), 'minLength', 'minLength must be <= maxLength');
   }
-  if ('pattern' in schema) {
-    if (typeof schema.pattern !== 'string') {
-      addIssue(ctx, childPointer(pointer, 'pattern'), 'pattern', 'pattern must be a string');
-    } else if (schema.pattern.length > ADMITTED_JSON_SCHEMA_BOUNDS.maxPatternLength) {
-      addIssue(
-        ctx,
-        childPointer(pointer, 'pattern'),
-        'pattern',
-        `pattern exceeds ${ADMITTED_JSON_SCHEMA_BOUNDS.maxPatternLength} characters`,
-      );
-    } else {
-      try {
-        new RegExp(schema.pattern);
-      } catch {
-        addIssue(
-          ctx,
-          childPointer(pointer, 'pattern'),
-          'pattern',
-          `pattern ${JSON.stringify(schema.pattern)} is not a valid regular expression`,
-        );
-      }
-    }
-  }
   if ('format' in schema) {
     if (typeof schema.format !== 'string' || !STRING_FORMATS.has(schema.format)) {
       addIssue(
@@ -615,14 +587,12 @@ function visitArrayKeywords(schema: Record<string, unknown>, pointer: string, ct
       );
     }
     const prefixLen = Array.isArray(schema.prefixItems) ? schema.prefixItems.length : 0;
-    // This dialect treats omitted minItems/maxItems as prefixItems.length so
-    // rehydration can use a fixed-length tuple instead of a shorter JSON Schema array.
-    if (typeof schema.minItems === 'number' && schema.minItems !== prefixLen) {
+    if (schema.minItems !== prefixLen) {
       addIssue(
         ctx,
         childPointer(pointer, 'minItems'),
         'minItems',
-        'closed tuples must set minItems equal to prefixItems.length (or omit it)',
+        'closed tuples must set minItems equal to prefixItems.length',
       );
     }
     if (typeof schema.maxItems === 'number' && schema.maxItems !== prefixLen) {
@@ -630,7 +600,7 @@ function visitArrayKeywords(schema: Record<string, unknown>, pointer: string, ct
         ctx,
         childPointer(pointer, 'maxItems'),
         'maxItems',
-        'closed tuples must set maxItems equal to prefixItems.length (or omit it)',
+        'closed tuples must set maxItems equal to prefixItems.length when present',
       );
     }
   } else if (!hasItems) {
@@ -711,7 +681,11 @@ export function validateStorableJsonSchema(schema: JsonSchema | undefined): Stor
     addIssue(ctx, '#', 'bytes', 'schema is not JSON-serializable');
     return { ok: false, issues: ctx.issues };
   }
-  visit(schema, '#', 1, ctx);
+  try {
+    visit(schema, '#', 1, ctx);
+  } catch {
+    addIssue(ctx, '#', 'schema', 'schema inspection failed');
+  }
   return ctx.issues.length === 0 ? { ok: true } : { ok: false, issues: ctx.issues };
 }
 
@@ -724,11 +698,11 @@ function applyAnnotations(out: z.ZodTypeAny, schema: JsonSchema): z.ZodTypeAny {
   if (typeof schema.$comment === 'string') meta.$comment = schema.$comment;
   if (Array.isArray(schema.examples)) meta.examples = schema.examples;
   if ('default' in schema) meta.default = schema.default;
-  if (
-    Object.keys(meta).length > 0 &&
-    typeof (out as { meta?: (value: Record<string, unknown>) => z.ZodTypeAny }).meta === 'function'
-  ) {
-    out = (out as { meta: (value: Record<string, unknown>) => z.ZodTypeAny }).meta(meta);
+  const annotationTarget = out as unknown as {
+    meta?: (value: Record<string, unknown>) => z.ZodTypeAny;
+  };
+  if (Object.keys(meta).length > 0 && typeof annotationTarget.meta === 'function') {
+    out = annotationTarget.meta(meta);
   }
   return out;
 }
@@ -795,25 +769,77 @@ function convert(schema: JsonSchema): z.ZodTypeAny {
 
 function convertString(schema: JsonSchema): z.ZodTypeAny {
   let str = z.string();
-  if (schema.format === 'email') str = str.email();
-  else if (schema.format === 'uri') str = str.url();
-  else if (schema.format === 'uuid') str = str.uuid();
-  else if (schema.format === 'date-time') str = str.datetime({ offset: true });
-  if (typeof schema.minLength === 'number') str = str.min(schema.minLength);
-  if (typeof schema.maxLength === 'number') str = str.max(schema.maxLength);
-  if (typeof schema.pattern === 'string') str = str.regex(new RegExp(schema.pattern));
-  return str;
+  if (schema.format === 'uuid') str = str.regex(UUID_FORMAT_PATTERN, 'invalid UUID');
+  // Capture admitted bounds now. Refinements must not retain the caller's
+  // mutable schema object and drift from the cloned schema we persist.
+  const minLength = typeof schema.minLength === 'number' ? schema.minLength : undefined;
+  const maxLength = typeof schema.maxLength === 'number' ? schema.maxLength : undefined;
+  if (minLength === undefined && maxLength === undefined) return str;
+
+  return str.superRefine((value, ctx) => {
+    let length = 0;
+    for (const _codePoint of value) {
+      length += 1;
+      // Once maxLength is violated, the exact remaining length is irrelevant.
+      if (maxLength !== undefined && length > maxLength) break;
+    }
+    if (minLength !== undefined && length < minLength) {
+      ctx.addIssue({ code: 'custom', message: `must contain at least ${minLength} characters` });
+    }
+    if (maxLength !== undefined && length > maxLength) {
+      ctx.addIssue({ code: 'custom', message: `must contain at most ${maxLength} characters` });
+    }
+  });
 }
 
 function convertNumber(schema: JsonSchema): z.ZodTypeAny {
   let num = z.number();
-  if (schema.type === 'integer') num = num.int();
   if (typeof schema.exclusiveMinimum === 'number') num = num.gt(schema.exclusiveMinimum);
   if (typeof schema.minimum === 'number') num = num.gte(schema.minimum);
   if (typeof schema.exclusiveMaximum === 'number') num = num.lt(schema.exclusiveMaximum);
   if (typeof schema.maximum === 'number') num = num.lte(schema.maximum);
-  if (typeof schema.multipleOf === 'number') num = num.multipleOf(schema.multipleOf);
-  return num;
+
+  let out: z.ZodTypeAny = num.refine(Number.isFinite, { message: 'must be a finite JSON number' });
+  if (schema.type === 'integer') {
+    // Zod 4's `.int()` restricts values to safe integers while Zod 3 admits
+    // every finite mathematical integer. JSON Schema uses the latter meaning.
+    out = out.refine(value => typeof value === 'number' && Number.isInteger(value), { message: 'must be an integer' });
+  }
+  if (typeof schema.multipleOf === 'number') {
+    const divisor = schema.multipleOf;
+    // Zod 3's `.multipleOf()` rejects valid subnormal/scientific-notation
+    // multiples. Compare the exact base-10 values represented by the two JS
+    // numbers so every supported peer enforces the same JSON-number contract.
+    out = out.refine(value => typeof value === 'number' && isDecimalMultiple(value, divisor), {
+      message: `must be a multiple of ${divisor}`,
+    });
+  }
+  return out;
+}
+
+function decimalParts(value: number): { coefficient: bigint; exponent: number } {
+  const [mantissa = '0', exponentText] = Math.abs(value).toString().toLowerCase().split('e');
+  const dot = mantissa.indexOf('.');
+  const fractionDigits = dot === -1 ? 0 : mantissa.length - dot - 1;
+  const digits = dot === -1 ? mantissa : `${mantissa.slice(0, dot)}${mantissa.slice(dot + 1)}`;
+  return {
+    coefficient: BigInt(digits),
+    exponent: (exponentText === undefined ? 0 : Number(exponentText)) - fractionDigits,
+  };
+}
+
+function isDecimalMultiple(value: number, divisor: number): boolean {
+  if (!Number.isFinite(value)) return false;
+  if (value === 0) return true;
+  const dividendParts = decimalParts(value);
+  const divisorParts = decimalParts(divisor);
+  const exponentDelta = dividendParts.exponent - divisorParts.exponent;
+  if (exponentDelta >= 0) {
+    const scaledDividend = dividendParts.coefficient * 10n ** BigInt(exponentDelta);
+    return scaledDividend % divisorParts.coefficient === 0n;
+  }
+  const scaledDivisor = divisorParts.coefficient * 10n ** BigInt(-exponentDelta);
+  return dividendParts.coefficient % scaledDivisor === 0n;
 }
 
 function convertObject(schema: JsonSchema): z.ZodTypeAny {
@@ -831,23 +857,39 @@ function convertObject(schema: JsonSchema): z.ZodTypeAny {
 
   const additional = schema.additionalProperties;
   let obj: z.ZodTypeAny;
+  const zodCompat = z as unknown as {
+    looseObject?: (shape: Record<string, z.ZodTypeAny>) => z.ZodTypeAny;
+  };
   if (additional === false) {
-    obj = z.strictObject(shape);
+    obj = z.object(shape).strict();
   } else if (additional && typeof additional === 'object') {
     obj = z.object(shape).catchall(convert(additional as JsonSchema));
-  } else if (typeof z.looseObject === 'function') {
+  } else if (typeof zodCompat.looseObject === 'function') {
     // omitted or true — JSON Schema 2020-12 default additionalProperties: true
-    obj = z.looseObject(shape);
+    obj = zodCompat.looseObject(shape);
   } else {
     // Zod 3 peer: passthrough is the admitted extra-key equivalent of looseObject.
     obj = z.object(shape).passthrough();
   }
 
+  // Every supported Zod version silently removes an own `__proto__` key before
+  // object refinements run. The dialect cannot then validate or preserve that
+  // JSON member, so reject it on the original input instead of widening strict,
+  // catchall, propertyNames, or property-count semantics.
+  const objectWithSafeKeys = z
+    .unknown()
+    .superRefine((value, ctx) => {
+      if (isPlainObject(value) && Object.prototype.hasOwnProperty.call(value, '__proto__')) {
+        ctx.addIssue({ code: 'custom', message: 'property name "__proto__" is not admitted' });
+      }
+    })
+    .pipe(obj);
+
   const minProperties = schema.minProperties;
   const maxProperties = schema.maxProperties;
   const propertyNames = schema.propertyNames;
   if (typeof minProperties !== 'number' && typeof maxProperties !== 'number' && propertyNames === undefined) {
-    return obj;
+    return objectWithSafeKeys;
   }
 
   const namesZod =
@@ -859,7 +901,7 @@ function convertObject(schema: JsonSchema): z.ZodTypeAny {
           ? z.string()
           : convert(propertyNames as JsonSchema);
 
-  return obj.superRefine((value, ctx) => {
+  return objectWithSafeKeys.superRefine((value, ctx) => {
     if (!isPlainObject(value)) return;
     const keys = Object.keys(value);
     if (typeof minProperties === 'number' && keys.length < minProperties) {
@@ -878,11 +920,86 @@ function convertObject(schema: JsonSchema): z.ZodTypeAny {
   });
 }
 
-function canonicalJson(value: unknown): string {
-  if (value === null || typeof value !== 'object') return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
-  const keys = Object.keys(value as object).sort();
-  return `{${keys.map(key => `${JSON.stringify(key)}:${canonicalJson((value as Record<string, unknown>)[key])}`).join(',')}}`;
+type CanonicalJsonAction =
+  | { kind: 'value'; value: unknown }
+  | { kind: 'text'; value: string }
+  | { kind: 'leave'; value: object };
+
+/**
+ * Stable, non-recursive JSON encoding for `uniqueItems` equality. Returns
+ * undefined for cyclic or non-JSON values instead of throwing from a Zod
+ * refinement.
+ */
+function canonicalJson(value: unknown): string | undefined {
+  try {
+    return canonicalJsonUnchecked(value);
+  } catch {
+    return undefined;
+  }
+}
+
+function canonicalJsonUnchecked(value: unknown): string | undefined {
+  const active = new WeakSet<object>();
+  const parts: string[] = [];
+  const stack: CanonicalJsonAction[] = [{ kind: 'value', value }];
+
+  while (stack.length > 0) {
+    const action = stack.pop();
+    if (!action) break;
+    if (action.kind === 'text') {
+      parts.push(action.value);
+      continue;
+    }
+    if (action.kind === 'leave') {
+      active.delete(action.value);
+      continue;
+    }
+
+    const current = action.value;
+    if (current === null) {
+      parts.push('null');
+      continue;
+    }
+    if (typeof current === 'string' || typeof current === 'boolean') {
+      parts.push(JSON.stringify(current));
+      continue;
+    }
+    if (typeof current === 'number') {
+      if (!Number.isFinite(current)) return undefined;
+      parts.push(JSON.stringify(current));
+      continue;
+    }
+    if (typeof current !== 'object' || (!Array.isArray(current) && !isPlainObject(current))) {
+      return undefined;
+    }
+    if (active.has(current)) return undefined;
+    active.add(current);
+    stack.push({ kind: 'leave', value: current });
+
+    if (Array.isArray(current)) {
+      stack.push({ kind: 'text', value: ']' });
+      for (let i = current.length - 1; i >= 0; i -= 1) {
+        stack.push({ kind: 'value', value: current[i] });
+        if (i > 0) stack.push({ kind: 'text', value: ',' });
+      }
+      stack.push({ kind: 'text', value: '[' });
+      continue;
+    }
+
+    const keys = Object.keys(current).sort();
+    stack.push({ kind: 'text', value: '}' });
+    for (let i = keys.length - 1; i >= 0; i -= 1) {
+      const key = keys[i];
+      if (key === undefined) continue;
+      stack.push({ kind: 'value', value: (current as Record<string, unknown>)[key] });
+      stack.push({ kind: 'text', value: ':' });
+      stack.push({ kind: 'text', value: JSON.stringify(key) });
+      if (i > 0) stack.push({ kind: 'text', value: ',' });
+    }
+    stack.push({ kind: 'text', value: '{' });
+  }
+
+  return parts.join('');
 }
 
 function convertArray(schema: JsonSchema): z.ZodTypeAny {
@@ -904,6 +1021,10 @@ function convertArray(schema: JsonSchema): z.ZodTypeAny {
       const seen = new Set<string>();
       for (const item of value) {
         const key = canonicalJson(item);
+        if (key === undefined) {
+          ctx.addIssue({ code: 'custom', message: 'items must be JSON values to evaluate uniqueness' });
+          return;
+        }
         if (seen.has(key)) {
           ctx.addIssue({ code: 'custom', message: 'items must be unique' });
           return;
@@ -944,5 +1065,5 @@ export function jsonSchemaToZod(schema: JsonSchema): z.ZodTypeAny {
   if (!result.ok) {
     throw new UnsupportedJsonSchemaError(result.issues);
   }
-  return convert(schema);
+  return rememberAdmittedJsonSchema(convert(schema), schema);
 }

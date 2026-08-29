@@ -62,14 +62,14 @@ export async function rehydrateWorkflow(def: DynamicWorkflowGraph, mastra: Mastr
   });
 
   for (const entry of def.graph) {
-    applyGraphEntry(wf, entry, mastra);
+    applyGraphEntry(wf, entry, mastra, def.id);
   }
   const built: any = wf.commit();
   built.origin = 'dynamic';
   return { workflow: built };
 }
 
-function applyGraphEntry(wf: any, entry: ValidatableStepFlowEntry, mastra: Mastra): void {
+function applyGraphEntry(wf: any, entry: ValidatableStepFlowEntry, mastra: Mastra, workflowId: string): void {
   switch (entry.type) {
     case 'agent':
     case 'tool':
@@ -77,7 +77,7 @@ function applyGraphEntry(wf: any, entry: ValidatableStepFlowEntry, mastra: Mastr
       return;
     case 'mapping': {
       const cfg = parseMapConfig(entry.mapConfig, entry.id);
-      const live = rehydrateMapConfig(cfg, mastra);
+      const live = rehydrateMapConfig(cfg, mastra, workflowId);
       wf.map(live, { id: entry.id });
       return;
     }
@@ -300,7 +300,7 @@ function rehydrateSingleEntry(entry: SerializedSingleStepEntry, mastra: Mastra):
  * Rebuild the object shape that `.map()` accepts. Step sources remain workflow-local
  * step IDs because mapping execution resolves them from the run's step results.
  */
-function rehydrateMapConfig(cfg: Record<string, any>, mastra: Mastra): Record<string, any> {
+function rehydrateMapConfig(cfg: Record<string, any>, mastra: Mastra, workflowId: string): Record<string, any> {
   const out: Record<string, any> = {};
   for (const [key, source] of Object.entries(cfg)) {
     if (!source || typeof source !== 'object') {
@@ -314,7 +314,15 @@ function rehydrateMapConfig(cfg: Record<string, any>, mastra: Mastra): Record<st
     } else if ('requestContextPath' in source) {
       out[key] = { requestContextPath: source.requestContextPath };
     } else if ('initData' in source && typeof source.initData === 'string') {
-      const wf = mastra.getWorkflow?.(source.initData);
+      // `mapVariable({ initData: workflow })` serializes the workflow id, but
+      // execution uses initData only as a marker and reads this run's own
+      // `getInitData()`. On first hydration the current workflow is not yet in
+      // the registry, so restore its self id directly to that marker.
+      if (source.initData === workflowId) {
+        out[key] = { initData: true, path: source.path };
+        continue;
+      }
+      const wf = tryGetWorkflowById(mastra, source.initData);
       if (!wf) {
         throw new Error(`Mapping references unknown workflow init-data "${source.initData}".`);
       }

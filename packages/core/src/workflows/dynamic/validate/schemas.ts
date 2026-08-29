@@ -11,15 +11,26 @@ import type { WorkflowValidationInput, WorkflowValidationIssue } from './types';
 
 export function collectWorkflowJsonSchemaAdmissionIssues(def: WorkflowValidationInput): JsonSchemaAdmissionIssue[] {
   const issues: JsonSchemaAdmissionIssue[] = [];
-  const check = (schema: JsonSchema | undefined, path: string): void => {
+  const check = (schema: JsonSchema | undefined, path: string, required = false): void => {
+    if (schema === undefined) {
+      if (required) {
+        issues.push({
+          path,
+          pointer: '#',
+          keyword: 'required-schema',
+          message: `${path} is required`,
+        });
+      }
+      return;
+    }
     const result = validateStorableJsonSchema(schema);
     if (result.ok) return;
     for (const issue of result.issues) {
       issues.push({ ...issue, path });
     }
   };
-  check(def.inputSchema, 'inputSchema');
-  check(def.outputSchema, 'outputSchema');
+  check(def.inputSchema, 'inputSchema', true);
+  check(def.outputSchema, 'outputSchema', true);
   if (def.stateSchema !== undefined) check(def.stateSchema, 'stateSchema');
   if (def.requestContextSchema !== undefined) check(def.requestContextSchema, 'requestContextSchema');
   forEachSingleStepEntryWithPath(def.graph, (entry, path) => {
@@ -46,6 +57,14 @@ export function validateWorkflowSchemas(def: WorkflowValidationInput): WorkflowV
   for (const [path, group] of byPath) {
     const stepId = path.startsWith('graph') && path.endsWith('.outputSchema') ? findAgentStepId(def, path) : undefined;
     const label = stepId ? `step "${stepId}" outputSchema` : path;
+    if (group.every(issue => issue.keyword === 'required-schema')) {
+      issues.push({
+        code: 'unsupported-schema-keyword',
+        path,
+        message: `${label} is required and must declare a schema in the ${ADMITTED_JSON_SCHEMA_DIALECT} dialect.`,
+      });
+      continue;
+    }
     issues.push({
       code: 'unsupported-schema-keyword',
       path,

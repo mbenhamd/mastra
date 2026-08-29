@@ -17,9 +17,9 @@ import { Mastra } from '../../mastra';
 import { InMemoryStore } from '../../storage';
 import { createTool } from '../../tools';
 import { createWorkflow } from '../create';
-import { rehydrateWorkflow, toStorableGraph } from '../dynamic';
+import { rehydrateWorkflow, toStorableGraph, validateStorableJsonSchema } from '../dynamic';
 import type { SerializedStepFlowEntry } from '../types';
-import { createStepFromTool } from '../workflow';
+import { createStepFromTool, mapVariable } from '../workflow';
 
 function fixedResponseAgent(id: string, response: string) {
   return new Agent({
@@ -144,6 +144,66 @@ describe('storage round-trip', () => {
     // mapConfig contains the literal template (full, untruncated)
     const cfg = JSON.parse(mapping.mapConfig) as Record<string, any>;
     expect(cfg.message.template).toContain('${stepResults.double-tool.doubled}');
+  });
+
+  it('first-save rehydrates a serializer-produced self init-data mapping', async () => {
+    const builder = createWorkflow({
+      id: 'self-init-data-round-trip',
+      inputSchema: z.object({ seed: z.number() }),
+      outputSchema: z.object({ seed: z.number() }),
+    });
+    const original = builder
+      .map(
+        {
+          seed: mapVariable({ initData: builder as any, path: 'seed' }) as any,
+        },
+        { id: 'project-seed' },
+      )
+      .commit();
+    const graph = JSON.parse(JSON.stringify(toStorableGraph(original.stepGraph))) as SerializedStepFlowEntry[];
+    const mapping = graph[0] as Extract<SerializedStepFlowEntry, { type: 'mapping' }>;
+    expect(JSON.parse(mapping.mapConfig)).toEqual({
+      seed: { initData: 'self-init-data-round-trip', path: 'seed' },
+    });
+
+    const mastra = new Mastra({
+      logger: false,
+      storage: new InMemoryStore({ id: 'self-init-data-round-trip' }),
+    });
+    await mastra.addDynamicWorkflow({
+      id: 'self-init-data-round-trip',
+      inputSchema: { type: 'object', properties: { seed: { type: 'number' } }, required: ['seed'] },
+      outputSchema: { type: 'object', properties: { seed: { type: 'number' } }, required: ['seed'] },
+      graph,
+    });
+
+    const run = await mastra.getWorkflow('self-init-data-round-trip').createRun();
+    const result = await run.start({ inputData: { seed: 7 } });
+    expect(result.status).toBe('success');
+    expect((result as any).result).toEqual({ seed: 7 });
+
+    const reserialized = JSON.parse(
+      JSON.stringify(toStorableGraph(mastra.getWorkflow('self-init-data-round-trip').stepGraph)),
+    ) as SerializedStepFlowEntry[];
+    const reserializedMapping = reserialized[0] as Extract<SerializedStepFlowEntry, { type: 'mapping' }>;
+    expect(JSON.parse(reserializedMapping.mapConfig)).toEqual({
+      seed: { initData: true, path: 'seed' },
+    });
+
+    const freshMastra = new Mastra({
+      logger: false,
+      storage: new InMemoryStore({ id: 'self-init-data-second-round-trip' }),
+    });
+    await freshMastra.addDynamicWorkflow({
+      id: 'self-init-data-round-trip',
+      inputSchema: { type: 'object', properties: { seed: { type: 'number' } }, required: ['seed'] },
+      outputSchema: { type: 'object', properties: { seed: { type: 'number' } }, required: ['seed'] },
+      graph: reserialized,
+    });
+    const secondRun = await freshMastra.getWorkflow('self-init-data-round-trip').createRun();
+    const secondResult = await secondRun.start({ inputData: { seed: 8 } });
+    expect(secondResult.status).toBe('success');
+    expect((secondResult as any).result).toEqual({ seed: 8 });
   });
 
   it('rehydrated workflow produces the same output as the original', async () => {
@@ -717,8 +777,8 @@ describe('rehydrate static subset — parallel / foreach / sleep / sleepUntil', 
       rehydrateWorkflow(
         {
           id: 'foreach-mapping-wf',
-          inputSchema: { type: 'array' },
-          outputSchema: { type: 'array' },
+          inputSchema: { type: 'array', items: { type: 'object' } },
+          outputSchema: { type: 'array', items: { type: 'object' } },
           graph: [
             {
               type: 'foreach',
@@ -782,6 +842,89 @@ describe('rehydrate agent/tool step options', () => {
       type: 'agent',
       outputSchema: { type: 'array', items: { type: 'string' } },
     });
+  });
+
+  it.each([
+    {
+      id: 'nullable',
+      name: 'nullable type arrays',
+      schema: {
+        $schema: 'https://json-schema.org/draft/2020-12/schema',
+        type: ['string', 'null'],
+        minLength: 1,
+      },
+    },
+    {
+      id: 'closed-tuple',
+      name: 'closed tuples',
+      schema: {
+        type: 'array',
+        prefixItems: [{ type: 'string' }, { type: 'number' }],
+        items: false,
+        minItems: 2,
+      },
+    },
+    { id: 'uuid', name: 'UUID format', schema: { type: 'string', format: 'uuid' } },
+    {
+      id: 'numeric',
+      name: 'numeric refinements',
+      schema: { type: 'integer', minimum: 0, maximum: 10, multipleOf: 2 },
+    },
+    {
+      id: 'object',
+      name: 'object refinements',
+      schema: {
+        type: 'object',
+        properties: { name: { type: 'string' } },
+        required: ['name'],
+        additionalProperties: false,
+        minProperties: 1,
+        maxProperties: 2,
+        propertyNames: { type: 'string', minLength: 1 },
+      },
+    },
+    {
+      id: 'array',
+      name: 'array refinements',
+      schema: {
+        type: 'array',
+        items: { type: 'number' },
+        uniqueItems: true,
+        contains: { const: 1 },
+        minContains: 1,
+        maxContains: 2,
+      },
+    },
+  ])('preserves admitted $name when a rehydrated graph is serialized again', async ({ id, name, schema }) => {
+    const agent = fixedResponseAgent('schema-agent', 'ok');
+    const mastra = new Mastra({
+      logger: false,
+      agents: { 'schema-agent': agent } as any,
+      storage: new InMemoryStore({ id: `rehydrate-admitted-schema-${id}` }),
+    });
+
+    const { workflow } = await rehydrateWorkflow(
+      {
+        id: `admitted-schema-${id}`,
+        inputSchema: { type: 'object' },
+        outputSchema: { type: 'object' },
+        graph: [
+          {
+            type: 'agent',
+            id: `schema-step-${id}`,
+            agentId: 'schema-agent',
+            outputSchema: schema,
+          },
+        ],
+      },
+      mastra,
+    );
+
+    const reserialized = JSON.parse(JSON.stringify(toStorableGraph(workflow.stepGraph)))[0] as {
+      outputSchema: Record<string, any>;
+    };
+    expect(reserialized.outputSchema).toEqual(schema);
+    expect(validateStorableJsonSchema(reserialized.outputSchema)).toEqual({ ok: true });
   });
 
   it('round-trips retries and metadata on both agent and tool steps', async () => {

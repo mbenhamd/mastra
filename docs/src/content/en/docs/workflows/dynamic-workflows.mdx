@@ -96,6 +96,14 @@ The workflow prints `Hello, Ada!`. Calling [`addDynamicWorkflow()`](/reference/c
 
 The definition uses JSON Schema because it must survive a JSON round trip. The `graph` describes which registered components to invoke and how data moves between them. See the [dynamic workflow definition reference](/reference/workflows/dynamic-workflow-definition) for every field and graph entry.
 
+## Use the admitted schema dialect
+
+Mastra accepts a bounded subset of JSON Schema Draft 2020-12 for dynamic workflow schemas. It rejects a definition before persistence when a schema uses an unknown keyword or a constraint that Mastra can't convert to an equivalent Zod validator. Validation errors include the schema field and a JSON Pointer to the rejected keyword.
+
+Both `inputSchema` and `outputSchema` are required. Optional state, request-context, and agent output schemas use the same contract when present. The subset supports typed objects, homogeneous arrays, exact-length closed tuples, primitive constraints, primitive `enum` and `const` values, nullable type arrays, and the `uuid` string format. Composition keywords such as `$ref`, `oneOf`, and `allOf` aren't admitted.
+
+The [dynamic workflow definition reference](/reference/workflows/dynamic-workflow-definition#admitted-json-schema) lists every admitted keyword, tuple rule, format, and size limit.
+
 ## Build and update definitions
 
 A definition can come from any source that produces JSON. For example, an API route can accept a definition created by a visual editor and register it directly:
@@ -144,6 +152,18 @@ On authenticated servers, dynamic-workflow management requires the `stored-workf
 
 Stored definitions use the `workflowDefinitions` storage domain. On startup, Mastra loads active definitions from storage and registers them in dependency order.
 
+An active historical definition that no longer satisfies the admitted schema contract is quarantined. Mastra continues loading unrelated workflows, but it doesn't register or execute the quarantined workflow. A workflow that depends on a quarantined workflow is also quarantined.
+
+Inspect these rows with [`listQuarantinedDynamicWorkflows()`](/reference/core/listQuarantinedDynamicWorkflows):
+
+```typescript
+for (const workflow of mastra.listQuarantinedDynamicWorkflows()) {
+  console.log(workflow.id, workflow.issues)
+}
+```
+
+Each issue identifies the definition field, JSON Pointer, keyword, and reason. Replace the definition with an admitted schema under the same ID to clear its quarantine entry, or delete the stored definition through the dynamic-workflow management API.
+
 Without a storage adapter that supports this domain, `addDynamicWorkflow()` still registers the workflow in memory, but the definition is lost when the process restarts. See the [storage reference](/reference/storage/overview) for adapter support.
 
 ## Related
@@ -151,5 +171,6 @@ Without a storage adapter that supports this domain, `addDynamicWorkflow()` stil
 - [Dynamic workflow definition](/reference/workflows/dynamic-workflow-definition)
 - [`Mastra.addDynamicWorkflow()`](/reference/core/addDynamicWorkflow)
 - [`Mastra.addDynamicWorkflows()`](/reference/core/addDynamicWorkflows)
+- [`Mastra.listQuarantinedDynamicWorkflows()`](/reference/core/listQuarantinedDynamicWorkflows)
 - [Client SDK workflows API](/reference/client-js/workflows)
 - [Server routes](/reference/server/routes)

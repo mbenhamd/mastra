@@ -1,8 +1,9 @@
 ---
 '@mastra/core': major
+'@mastra/server': patch
 ---
 
-Changed dynamic workflow schemas to fail closed against an admitted JSON Schema 2020-12 subset before they are saved. Unknown or unimplemented keywords are now rejected with JSON Pointer evidence. Historical rows that cannot rehydrate losslessly are quarantined at boot instead of executing through `z.any()`.
+Improved dynamic workflow schema safety. Unsupported schemas are now rejected before storage with JSON Pointer evidence. Stored workflows whose schemas are unsupported are quarantined during startup instead of being registered or run.
 
 **Before**
 
@@ -15,7 +16,7 @@ await mastra.addDynamicWorkflow({
 });
 ```
 
-`minProperties` was stored, then dropped on rehydrate, so the live validator was weaker than the saved schema.
+`minProperties` was stored, then ignored while creating the runtime validator, so the live validator was weaker than the saved schema.
 
 **After**
 
