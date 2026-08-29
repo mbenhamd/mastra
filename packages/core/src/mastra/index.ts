@@ -5705,37 +5705,47 @@ export class Mastra<
     // Hydrate in dependency order; anything left after the loop is a cycle.
     const remaining = new Map(pending.map(d => [d.id, d] as const));
     const loaded = new Set<string>();
+
+    const toGraphDef = (def: (typeof pending)[number]) => ({
+      id: def.id,
+      description: def.description,
+      metadata: def.metadata,
+      inputSchema: def.inputSchema as Record<string, any>,
+      outputSchema: def.outputSchema as Record<string, any>,
+      stateSchema: def.stateSchema as Record<string, any> | undefined,
+      requestContextSchema: def.requestContextSchema as Record<string, any> | undefined,
+      graph: def.graph,
+    });
+
+    // Admit every stored row before dependency order. Otherwise a quarantined
+    // nested workflow keeps dependents unresolved and their own unsupported
+    // schemas never reach listQuarantinedDynamicWorkflows().
+    for (const [id, def] of Array.from(remaining)) {
+      const schemaIssues = collectWorkflowJsonSchemaAdmissionIssues(toGraphDef(def));
+      if (schemaIssues.length === 0) continue;
+      remaining.delete(id);
+      const quarantined: QuarantinedDynamicWorkflow = {
+        id: def.id,
+        reason: 'unsupported-schema',
+        issues: schemaIssues,
+      };
+      this.#quarantinedDynamicWorkflows.set(def.id, quarantined);
+      this.#logger?.warn?.(
+        `Dynamic workflow "${def.id}" quarantined and will not execute: ${formatAdmissionIssues(schemaIssues)}`,
+      );
+    }
+
     let progress = true;
     while (remaining.size > 0 && progress) {
       progress = false;
       for (const [id, def] of Array.from(remaining)) {
-        const unresolved = Array.from(deps.get(id) ?? []).filter(d => !loaded.has(d));
+        const unresolved = Array.from(deps.get(id) ?? []).filter(
+          d => !loaded.has(d) && remaining.has(d) && !this.#quarantinedDynamicWorkflows.has(d),
+        );
         if (unresolved.length > 0) continue;
         remaining.delete(id);
         progress = true;
-        const graphDef = {
-          id: def.id,
-          description: def.description,
-          metadata: def.metadata,
-          inputSchema: def.inputSchema as Record<string, any>,
-          outputSchema: def.outputSchema as Record<string, any>,
-          stateSchema: def.stateSchema as Record<string, any> | undefined,
-          requestContextSchema: def.requestContextSchema as Record<string, any> | undefined,
-          graph: def.graph,
-        };
-        const schemaIssues = collectWorkflowJsonSchemaAdmissionIssues(graphDef);
-        if (schemaIssues.length > 0) {
-          const quarantined: QuarantinedDynamicWorkflow = {
-            id: def.id,
-            reason: 'unsupported-schema',
-            issues: schemaIssues,
-          };
-          this.#quarantinedDynamicWorkflows.set(def.id, quarantined);
-          this.#logger?.warn?.(
-            `Dynamic workflow "${def.id}" quarantined and will not execute: ${formatAdmissionIssues(schemaIssues)}`,
-          );
-          continue;
-        }
+        const graphDef = toGraphDef(def);
         try {
           const { workflow } = await rehydrateWorkflow(graphDef, this);
           this.addWorkflow(workflow as AnyWorkflow, def.id);

@@ -724,8 +724,11 @@ function applyAnnotations(out: z.ZodTypeAny, schema: JsonSchema): z.ZodTypeAny {
   if (typeof schema.$comment === 'string') meta.$comment = schema.$comment;
   if (Array.isArray(schema.examples)) meta.examples = schema.examples;
   if ('default' in schema) meta.default = schema.default;
-  if (Object.keys(meta).length > 0) {
-    out = out.meta(meta);
+  if (
+    Object.keys(meta).length > 0 &&
+    typeof (out as { meta?: (value: Record<string, unknown>) => z.ZodTypeAny }).meta === 'function'
+  ) {
+    out = (out as { meta: (value: Record<string, unknown>) => z.ZodTypeAny }).meta(meta);
   }
   return out;
 }
@@ -832,9 +835,12 @@ function convertObject(schema: JsonSchema): z.ZodTypeAny {
     obj = z.strictObject(shape);
   } else if (additional && typeof additional === 'object') {
     obj = z.object(shape).catchall(convert(additional as JsonSchema));
-  } else {
+  } else if (typeof z.looseObject === 'function') {
     // omitted or true — JSON Schema 2020-12 default additionalProperties: true
     obj = z.looseObject(shape);
+  } else {
+    // Zod 3 peer: passthrough is the admitted extra-key equivalent of looseObject.
+    obj = z.object(shape).passthrough();
   }
 
   const minProperties = schema.minProperties;

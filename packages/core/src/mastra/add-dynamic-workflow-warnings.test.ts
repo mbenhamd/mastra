@@ -395,6 +395,38 @@ describe('Mastra boot load — quarantine unsupported schema keywords', () => {
     expect(messages.some(m => /oneOf/.test(m))).toBe(true);
   });
 
+  it('quarantines a nested workflow and a dependent that also has an unsupported schema', async () => {
+    const storage = new InMemoryStore({ id: 'boot-quarantine-nested-dep' });
+    const store = await storage.getStore('workflowDefinitions');
+    if (!store) throw new Error('workflowDefinitions store not available');
+    await store.upsert({
+      id: 'bad-child',
+      inputSchema: { type: 'object' },
+      outputSchema: { oneOf: [{ type: 'string' }] } as any,
+      graph: [],
+    });
+    await store.upsert({
+      id: 'bad-parent',
+      inputSchema: { type: 'object' },
+      outputSchema: { anyOf: [{ type: 'string' }] } as any,
+      graph: [{ type: 'workflow', id: 'child-call', workflowId: 'bad-child' }],
+    });
+
+    const mastra = new Mastra({
+      logger: false,
+      storage,
+    });
+    await (mastra as any).startWorkers?.();
+
+    const quarantinedIds = mastra
+      .listQuarantinedDynamicWorkflows()
+      .map(row => row.id)
+      .sort();
+    expect(quarantinedIds).toEqual(['bad-child', 'bad-parent']);
+    expect(() => mastra.getWorkflow('bad-child')).toThrow(/quarantined/);
+    expect(() => mastra.getWorkflow('bad-parent')).toThrow(/quarantined/);
+  });
+
   it('skips a row that fails rehydration, logs it, and still loads sibling rows', async () => {
     const storage = new InMemoryStore({ id: 'boot-isolation' });
 
