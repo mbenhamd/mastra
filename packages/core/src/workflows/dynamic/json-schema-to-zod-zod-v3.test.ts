@@ -1,8 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 
 vi.mock('zod', async () => {
-  const { z } = await import('zod/v3');
-  return { z };
+  const zodV3 = await import('zod/v3');
+  return { ...zodV3, default: zodV3.default };
 });
 
 import { toStandardSchema } from '../../schema';

@@ -98,7 +98,7 @@ The definition uses JSON Schema because it must survive a JSON round trip. The `
 
 ## Use the admitted schema dialect
 
-Mastra accepts a bounded subset of JSON Schema Draft 2020-12 for dynamic workflow schemas. It rejects a definition before persistence when a schema uses an unknown keyword or a constraint that Mastra can't convert to an equivalent Zod validator. Validation errors include the schema field and a JSON Pointer to the rejected keyword.
+Mastra accepts a bounded JSON Schema Draft 2020-12 subset for dynamic workflow schemas. Historical draft-07 `$schema` URIs are accepted as aliases, but draft-07-only keywords aren't. Mastra rejects a definition before persistence when a schema uses an unknown keyword or a constraint that it can't convert to an equivalent Zod validator. Validation errors include the schema field and a JSON Pointer to the rejected keyword.
 
 Both `inputSchema` and `outputSchema` are required. Optional state, request-context, and agent output schemas use the same contract when present. The subset supports typed objects, homogeneous arrays, exact-length closed tuples, primitive constraints, primitive `enum` and `const` values, nullable type arrays, and the `uuid` string format. Composition keywords such as `$ref`, `oneOf`, and `allOf` aren't admitted.
 

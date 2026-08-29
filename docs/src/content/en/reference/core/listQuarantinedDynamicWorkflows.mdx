@@ -13,7 +13,7 @@ Breaking changes may occur without a major version bump until the API is stable.
 
 :::
 
-The `.listQuarantinedDynamicWorkflows()` method returns active stored dynamic workflows that Mastra didn't register because their schemas are outside the [admitted JSON Schema contract](/reference/workflows/dynamic-workflow-definition#admitted-json-schema). Quarantine keeps an unsupported historical row from executing while unrelated workflows continue to load.
+The `.listQuarantinedDynamicWorkflows()` method returns active stored dynamic workflows that Mastra didn't register because their schemas, or a workflow they depend on, are outside the [admitted JSON Schema contract](/reference/workflows/dynamic-workflow-definition#admitted-json-schema). Quarantine keeps an unsupported historical row from executing while unrelated workflows continue to load.
 
 ## Usage example
 

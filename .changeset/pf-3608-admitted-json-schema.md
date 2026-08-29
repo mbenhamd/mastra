@@ -1,6 +1,5 @@
 ---
 '@mastra/core': major
-'@mastra/server': patch
 ---
 
 Improved dynamic workflow schema safety. Unsupported schemas are now rejected before storage with JSON Pointer evidence. Stored workflows whose schemas are unsupported are quarantined during startup instead of being registered or run.
