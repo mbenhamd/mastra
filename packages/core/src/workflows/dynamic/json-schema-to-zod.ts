@@ -296,6 +296,29 @@ function visit(node: unknown, pointer: string, depth: number, ctx: VisitCtx): vo
     }
   }
 
+  if (hasEnum && hasConst) {
+    addIssue(
+      ctx,
+      childPointer(pointer, 'const'),
+      'const',
+      'const and enum cannot both be present; conversion would keep only const and drop enum',
+    );
+  }
+
+  if (hasEnum || hasConst) {
+    const reserved = new Set<string>(['type', 'enum', 'const', '$schema', ...ANNOTATION_KEYS]);
+    for (const key of Object.keys(schema)) {
+      if (allowed.has(key) && !reserved.has(key)) {
+        addIssue(
+          ctx,
+          childPointer(pointer, key),
+          key,
+          `keyword "${key}" is not admitted next to enum/const; conversion would drop it and widen validation`,
+        );
+      }
+    }
+  }
+
   if (hasConst) {
     if (!isLiteralValue(schema.const)) {
       addIssue(
@@ -360,52 +383,39 @@ function visit(node: unknown, pointer: string, depth: number, ctx: VisitCtx): vo
   if (types.includes('number') || types.includes('integer')) visitNumberKeywords(schema, pointer, ctx);
   if (types.includes('object')) visitObjectKeywords(schema, pointer, ctx);
   if (types.includes('array')) visitArrayKeywords(schema, pointer, ctx);
-  visitChildSchemas(schema, pointer, depth, ctx);
+  visitChildSchemas(schema, pointer, depth, types, ctx);
 }
 
-function visitChildSchemas(schema: Record<string, unknown>, pointer: string, depth: number, ctx: VisitCtx): void {
+function visitChildSchemas(
+  schema: Record<string, unknown>,
+  pointer: string,
+  depth: number,
+  types: string[],
+  ctx: VisitCtx,
+): void {
   const next = depth + 1;
-  if (isPlainObject(schema.properties)) {
-    for (const [key, child] of Object.entries(schema.properties)) {
-      visit(child, `${childPointer(pointer, 'properties')}/${pointerSegment(key)}`, next, ctx);
-    }
-  }
-  if (isPlainObject(schema.patternProperties)) {
-    for (const [key, child] of Object.entries(schema.patternProperties)) {
-      visit(child, `${childPointer(pointer, 'patternProperties')}/${pointerSegment(key)}`, next, ctx);
-    }
-  }
-  if (isPlainObject(schema.additionalProperties)) {
-    visit(schema.additionalProperties, childPointer(pointer, 'additionalProperties'), next, ctx);
-  }
-  if (isPlainObject(schema.propertyNames)) {
-    visit(schema.propertyNames, childPointer(pointer, 'propertyNames'), next, ctx);
-  }
-  if (isPlainObject(schema.items)) {
-    visit(schema.items, childPointer(pointer, 'items'), next, ctx);
-  } else if (Array.isArray(schema.items)) {
-    schema.items.forEach((item, i) => visit(item, `${childPointer(pointer, 'items')}/${i}`, next, ctx));
-  }
-  if (Array.isArray(schema.prefixItems)) {
-    schema.prefixItems.forEach((item, i) => visit(item, `${childPointer(pointer, 'prefixItems')}/${i}`, next, ctx));
-  }
-  if (isPlainObject(schema.contains)) {
-    visit(schema.contains, childPointer(pointer, 'contains'), next, ctx);
-  }
-  for (const combinator of ['oneOf', 'anyOf', 'allOf'] as const) {
-    const value = schema[combinator];
-    if (Array.isArray(value)) {
-      value.forEach((item, i) => visit(item, `${childPointer(pointer, combinator)}/${i}`, next, ctx));
-    }
-  }
-  for (const key of ['not', 'if', 'then', 'else'] as const) {
-    if (isPlainObject(schema[key])) visit(schema[key], childPointer(pointer, key), next, ctx);
-  }
-  for (const defsKey of ['$defs', 'definitions'] as const) {
-    if (isPlainObject(schema[defsKey])) {
-      for (const [key, child] of Object.entries(schema[defsKey])) {
-        visit(child, `${childPointer(pointer, defsKey)}/${pointerSegment(key)}`, next, ctx);
+  if (types.includes('object')) {
+    if (isPlainObject(schema.properties)) {
+      for (const [key, child] of Object.entries(schema.properties)) {
+        visit(child, `${childPointer(pointer, 'properties')}/${pointerSegment(key)}`, next, ctx);
       }
+    }
+    if (isPlainObject(schema.additionalProperties)) {
+      visit(schema.additionalProperties, childPointer(pointer, 'additionalProperties'), next, ctx);
+    }
+    if (isPlainObject(schema.propertyNames)) {
+      visit(schema.propertyNames, childPointer(pointer, 'propertyNames'), next, ctx);
+    }
+  }
+  if (types.includes('array')) {
+    if (isPlainObject(schema.items)) {
+      visit(schema.items, childPointer(pointer, 'items'), next, ctx);
+    }
+    if (Array.isArray(schema.prefixItems)) {
+      schema.prefixItems.forEach((item, i) => visit(item, `${childPointer(pointer, 'prefixItems')}/${i}`, next, ctx));
+    }
+    if (isPlainObject(schema.contains)) {
+      visit(schema.contains, childPointer(pointer, 'contains'), next, ctx);
     }
   }
 }
@@ -494,7 +504,17 @@ function visitObjectKeywords(schema: Record<string, unknown>, pointer: string, c
           `object exceeds ${ADMITTED_JSON_SCHEMA_BOUNDS.maxProperties} properties`,
         );
       }
-      for (const key of keys) propertyKeys.add(key);
+      for (const key of keys) {
+        if (key === '__proto__') {
+          addIssue(
+            ctx,
+            `${childPointer(pointer, 'properties')}/${pointerSegment(key)}`,
+            'properties',
+            'property name "__proto__" is not admitted',
+          );
+        }
+        propertyKeys.add(key);
+      }
     }
   }
 
@@ -595,6 +615,8 @@ function visitArrayKeywords(schema: Record<string, unknown>, pointer: string, ct
       );
     }
     const prefixLen = Array.isArray(schema.prefixItems) ? schema.prefixItems.length : 0;
+    // This dialect treats omitted minItems/maxItems as prefixItems.length so
+    // rehydration can use a fixed-length tuple instead of a shorter JSON Schema array.
     if (typeof schema.minItems === 'number' && schema.minItems !== prefixLen) {
       addIssue(
         ctx,
@@ -632,6 +654,8 @@ function visitArrayKeywords(schema: Record<string, unknown>, pointer: string, ct
       'items',
       'boolean items is not admitted; unconstrained array elements would rehydrate as z.any()',
     );
+  } else if (!isPlainObject(schema.items)) {
+    addIssue(ctx, childPointer(pointer, 'items'), 'items', 'items must be an admitted schema object');
   }
 
   for (const key of ['minItems', 'maxItems'] as const) {
@@ -649,6 +673,8 @@ function visitArrayKeywords(schema: Record<string, unknown>, pointer: string, ct
   if ('contains' in schema) {
     if (typeof schema.contains === 'boolean') {
       addIssue(ctx, childPointer(pointer, 'contains'), 'contains', 'boolean contains is not admitted');
+    } else if (!isPlainObject(schema.contains)) {
+      addIssue(ctx, childPointer(pointer, 'contains'), 'contains', 'contains must be an admitted schema object');
     }
   } else if ('minContains' in schema || 'maxContains' in schema) {
     addIssue(ctx, pointer, 'contains', 'minContains/maxContains require contains');
@@ -673,11 +699,11 @@ function visitArrayKeywords(schema: Record<string, unknown>, pointer: string, ct
  * throws for any input shape. `undefined` means "no schema present".
  */
 export function validateStorableJsonSchema(schema: JsonSchema | undefined): StorableJsonSchemaValidation {
-  if (schema === undefined || schema === null) return { ok: true };
+  if (schema === undefined) return { ok: true };
   const ctx: VisitCtx = { issues: [], nodeCount: 0 };
   try {
     const serialized = JSON.stringify(schema);
-    if (serialized.length > ADMITTED_JSON_SCHEMA_BOUNDS.maxSerializedBytes) {
+    if (new TextEncoder().encode(serialized).byteLength > ADMITTED_JSON_SCHEMA_BOUNDS.maxSerializedBytes) {
       addIssue(ctx, '#', 'bytes', `schema exceeds ${ADMITTED_JSON_SCHEMA_BOUNDS.maxSerializedBytes} serialized bytes`);
       return { ok: false, issues: ctx.issues };
     }
@@ -769,7 +795,7 @@ function convertString(schema: JsonSchema): z.ZodTypeAny {
   if (schema.format === 'email') str = str.email();
   else if (schema.format === 'uri') str = str.url();
   else if (schema.format === 'uuid') str = str.uuid();
-  else if (schema.format === 'date-time') str = str.datetime();
+  else if (schema.format === 'date-time') str = str.datetime({ offset: true });
   if (typeof schema.minLength === 'number') str = str.min(schema.minLength);
   if (typeof schema.maxLength === 'number') str = str.max(schema.maxLength);
   if (typeof schema.pattern === 'string') str = str.regex(new RegExp(schema.pattern));
@@ -788,11 +814,16 @@ function convertNumber(schema: JsonSchema): z.ZodTypeAny {
 }
 
 function convertObject(schema: JsonSchema): z.ZodTypeAny {
-  const shape: Record<string, z.ZodTypeAny> = {};
+  const shape = Object.create(null) as Record<string, z.ZodTypeAny>;
   const required = new Set<string>(Array.isArray(schema.required) ? schema.required : []);
   for (const [key, child] of Object.entries((schema.properties ?? {}) as Record<string, JsonSchema>)) {
     const childSchema = convert(child);
-    shape[key] = required.has(key) ? childSchema : childSchema.optional();
+    Object.defineProperty(shape, key, {
+      value: required.has(key) ? childSchema : childSchema.optional(),
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
   }
 
   const additional = schema.additionalProperties;

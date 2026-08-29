@@ -47,8 +47,9 @@ export interface RehydratedWorkflow {
 export async function rehydrateWorkflow(def: DynamicWorkflowGraph, mastra: Mastra): Promise<RehydratedWorkflow> {
   const inputSchema = jsonSchemaToZod(def.inputSchema);
   const outputSchema = jsonSchemaToZod(def.outputSchema);
-  const stateSchema = def.stateSchema ? jsonSchemaToZod(def.stateSchema) : undefined;
-  const requestContextSchema = def.requestContextSchema ? jsonSchemaToZod(def.requestContextSchema) : undefined;
+  const stateSchema = def.stateSchema === undefined ? undefined : jsonSchemaToZod(def.stateSchema);
+  const requestContextSchema =
+    def.requestContextSchema === undefined ? undefined : jsonSchemaToZod(def.requestContextSchema);
 
   const wf = createWorkflow({
     id: def.id,
@@ -206,7 +207,7 @@ function rebuildAgentOptions(entry: {
   options?: SerializedStepOptions;
 }): Record<string, any> | undefined {
   const opts: Record<string, any> = {};
-  if (entry.outputSchema) {
+  if (entry.outputSchema !== undefined) {
     opts.structuredOutput = { schema: jsonSchemaToZod(entry.outputSchema) };
   }
   if (entry.options?.retries !== undefined) opts.retries = entry.options.retries;

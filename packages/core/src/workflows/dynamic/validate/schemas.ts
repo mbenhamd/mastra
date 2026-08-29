@@ -20,10 +20,10 @@ export function collectWorkflowJsonSchemaAdmissionIssues(def: WorkflowValidation
   };
   check(def.inputSchema, 'inputSchema');
   check(def.outputSchema, 'outputSchema');
-  if (def.stateSchema) check(def.stateSchema, 'stateSchema');
-  if (def.requestContextSchema) check(def.requestContextSchema, 'requestContextSchema');
+  if (def.stateSchema !== undefined) check(def.stateSchema, 'stateSchema');
+  if (def.requestContextSchema !== undefined) check(def.requestContextSchema, 'requestContextSchema');
   forEachSingleStepEntryWithPath(def.graph, (entry, path) => {
-    if (entry.type === 'agent' && entry.outputSchema) {
+    if (entry.type === 'agent' && entry.outputSchema !== undefined) {
       check(entry.outputSchema, `${path}.outputSchema`);
     }
   });

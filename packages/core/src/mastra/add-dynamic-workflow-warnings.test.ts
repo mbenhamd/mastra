@@ -380,6 +380,7 @@ describe('Mastra boot load — quarantine unsupported schema keywords', () => {
     await (mastra as any).startWorkers?.();
 
     expect(() => mastra.getWorkflow('legacy-oneof-wf')).toThrow(/quarantined/);
+    expect(() => mastra.getWorkflowById('legacy-oneof-wf')).toThrow(/quarantined/);
     const quarantined = mastra.listQuarantinedDynamicWorkflows();
     expect(quarantined).toEqual([
       expect.objectContaining({

@@ -139,6 +139,23 @@ describe('validateDynamicWorkflow', () => {
         ]),
       );
     });
+
+    it('flags falsy optional schemas instead of treating them as absent', () => {
+      const issues = validateDynamicWorkflow(
+        def({
+          stateSchema: false as any,
+          requestContextSchema: null as any,
+          graph: [{ type: 'agent', id: 'a1', agentId: 'writer', outputSchema: false as any }],
+        }),
+      );
+      expect(issues).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ code: 'unsupported-schema-keyword', path: 'stateSchema' }),
+          expect.objectContaining({ code: 'unsupported-schema-keyword', path: 'requestContextSchema' }),
+          expect.objectContaining({ code: 'unsupported-schema-keyword', path: 'graph.0.outputSchema' }),
+        ]),
+      );
+    });
   });
 
   describe('references', () => {

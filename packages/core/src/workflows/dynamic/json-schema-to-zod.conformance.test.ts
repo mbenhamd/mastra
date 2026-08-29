@@ -5,7 +5,12 @@
  */
 import { describe, expect, it } from 'vitest';
 
-import { ADMITTED_JSON_SCHEMA_DIALECT, jsonSchemaToZod, validateStorableJsonSchema } from './json-schema-to-zod';
+import {
+  ADMITTED_JSON_SCHEMA_DIALECT,
+  jsonSchemaToZod,
+  UnsupportedJsonSchemaError,
+  validateStorableJsonSchema,
+} from './json-schema-to-zod';
 import type { JsonSchema } from './json-schema-to-zod';
 
 type AcceptCase = {
@@ -91,6 +96,27 @@ const ACCEPT: AcceptCase[] = [
     valid: [{ input: '123e4567-e89b-12d3-a456-426614174000', output: '123e4567-e89b-12d3-a456-426614174000' }],
     invalid: ['not-a-uuid'],
   },
+  {
+    name: 'draft-07 $schema alias is admitted as historical output',
+    schema: {
+      $schema: 'http://json-schema.org/draft-07/schema#',
+      type: 'object',
+      properties: { id: { type: 'string' } },
+      required: ['id'],
+      additionalProperties: false,
+    },
+    valid: [{ input: { id: 'a' }, output: { id: 'a' } }],
+    invalid: [{}, { id: 'a', extra: 1 }],
+  },
+  {
+    name: 'date-time with RFC 3339 offset',
+    schema: { type: 'string', format: 'date-time' },
+    valid: [
+      { input: '2026-08-28T12:00:00Z', output: '2026-08-28T12:00:00Z' },
+      { input: '2026-08-28T12:00:00+02:00', output: '2026-08-28T12:00:00+02:00' },
+    ],
+    invalid: ['2026-08-28T12:00:00', 'not-a-date'],
+  },
 ];
 
 const REJECT: RejectCase[] = [
@@ -147,6 +173,12 @@ const REJECT: RejectCase[] = [
     keyword: '$schema',
     pointer: '#/properties/x/$schema',
   },
+  {
+    name: 'enum sibling maxLength',
+    schema: { type: 'string', enum: ['a', 'bb'], maxLength: 1 },
+    keyword: 'maxLength',
+    pointer: '#/maxLength',
+  },
 ];
 
 describe('admitted JSON Schema conformance — accept', () => {
@@ -171,5 +203,11 @@ describe('admitted JSON Schema conformance — reject', () => {
       result.issues.some(issue => issue.keyword === keyword && issue.pointer === pointer),
       JSON.stringify(result.issues),
     ).toBe(true);
+    try {
+      jsonSchemaToZod(schema as JsonSchema);
+      expect.unreachable('should throw');
+    } catch (error) {
+      expect(error).toBeInstanceOf(UnsupportedJsonSchemaError);
+    }
   });
 });

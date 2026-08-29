@@ -61,6 +61,12 @@ describe('jsonSchemaToZod admitted dialect', () => {
     expectRejected({ const: { nested: true } }, 'const', '#/const');
   });
 
+  it('rejects sibling constraints next to enum or const instead of dropping them', () => {
+    expectRejected({ type: 'string', enum: ['a', 'bb'], maxLength: 1 }, 'maxLength', '#/maxLength');
+    expectRejected({ type: 'string', const: 'x', minLength: 2 }, 'minLength', '#/minLength');
+    expectRejected({ enum: ['a'], const: 'a' }, 'const', '#/const');
+  });
+
   it('preserves non-string enum member types instead of coercing to string', () => {
     const numeric = jsonSchemaToZod({ enum: [1, 2, 3] });
     expect(numeric.parse(2)).toBe(2);
@@ -132,9 +138,9 @@ describe('validateStorableJsonSchema', () => {
     expect(result).toEqual({ ok: true });
   });
 
-  it('returns ok for undefined / null (schema absent) but not empty object', () => {
+  it('returns ok for undefined (schema absent) but rejects null and empty object', () => {
     expect(validateStorableJsonSchema(undefined)).toEqual({ ok: true });
-    expect(validateStorableJsonSchema(null as unknown as JsonSchema)).toEqual({ ok: true });
+    expectRejected(null, 'type', '#');
     expectRejected({}, 'type', '#');
   });
 
@@ -159,6 +165,7 @@ describe('validateStorableJsonSchema', () => {
 
   it('collects multiple offenses in one walk', () => {
     const result = validateStorableJsonSchema({
+      type: 'object',
       oneOf: [{ type: 'string' }],
       properties: { x: { $ref: '#/definitions/foo' } },
     });
@@ -234,6 +241,11 @@ describe('arrays, tuples, uniqueItems, contains', () => {
 
   it('rejects open tuples (prefixItems without items: false)', () => {
     expectRejected({ type: 'array', prefixItems: [{ type: 'string' }] }, 'items');
+  });
+
+  it('rejects non-object items and contains instead of crashing convert', () => {
+    expectRejected({ type: 'array', items: 'string' }, 'items', '#/items');
+    expectRejected({ type: 'array', items: { type: 'number' }, contains: 1 }, 'contains', '#/contains');
   });
 
   it('uniqueItems rejects duplicates including object-key-order variants', () => {
@@ -326,6 +338,13 @@ describe('nullable type arrays, literals, annotations', () => {
     expect(jsonSchemaToZod({ type: 'string', format: 'email' }).safeParse('nope').success).toBe(false);
     expectRejected({ type: 'string', format: 'hostname' }, 'format', '#/format');
   });
+
+  it('accepts RFC 3339 offsets for date-time', () => {
+    const zod = jsonSchemaToZod({ type: 'string', format: 'date-time' });
+    expect(zod.parse('2026-08-28T12:00:00Z')).toBe('2026-08-28T12:00:00Z');
+    expect(zod.parse('2026-08-28T12:00:00+02:00')).toBe('2026-08-28T12:00:00+02:00');
+    expect(zod.safeParse('2026-08-28T12:00:00').success).toBe(false);
+  });
 });
 
 describe('primitive constraint keywords', () => {
@@ -391,5 +410,40 @@ describe('converter bounds', () => {
   it('rejects oversized enums', () => {
     const values = Array.from({ length: ADMITTED_JSON_SCHEMA_BOUNDS.maxEnumSize + 1 }, (_, i) => `v${i}`);
     expectRejected({ enum: values }, 'enum');
+  });
+
+  it('measures maxSerializedBytes as UTF-8 bytes, not UTF-16 code units', () => {
+    const schema = { type: 'string', default: '中'.repeat(11_000) };
+    const serialized = JSON.stringify(schema);
+    expect(serialized.length).toBeLessThan(ADMITTED_JSON_SCHEMA_BOUNDS.maxSerializedBytes);
+    expect(new TextEncoder().encode(serialized).byteLength).toBeGreaterThan(
+      ADMITTED_JSON_SCHEMA_BOUNDS.maxSerializedBytes,
+    );
+    expectRejected(schema, 'bytes', '#');
+  });
+
+  it('does not let rejected $defs exhaust the node budget before the keyword issue', () => {
+    const definitions: Record<string, JsonSchema> = {};
+    for (let i = 0; i < ADMITTED_JSON_SCHEMA_BOUNDS.maxNodes; i++) {
+      definitions[`d${i}`] = { type: 'string' };
+    }
+    const result = validateStorableJsonSchema({
+      type: 'string',
+      $defs: definitions,
+    });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.issues.some(issue => issue.keyword === '$defs' && issue.pointer === '#/$defs')).toBe(true);
+    expect(result.issues.some(issue => issue.keyword === 'nodes')).toBe(false);
+  });
+});
+
+describe('object property names', () => {
+  it('rejects __proto__ property names', () => {
+    expectRejected(
+      JSON.parse('{"type":"object","properties":{"__proto__":{"type":"string"}}}'),
+      'properties',
+      '#/properties/__proto__',
+    );
   });
 });

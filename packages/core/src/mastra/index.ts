@@ -4323,8 +4323,10 @@ export class Mastra<
     if (!workflow) {
       try {
         workflow = this.getWorkflow(id);
-      } catch {
-        // do nothing
+      } catch (error) {
+        if (error instanceof MastraError && error.id === 'MASTRA_DYNAMIC_WORKFLOW_QUARANTINED') {
+          throw error;
+        }
       }
     }
 
@@ -5412,6 +5414,7 @@ export class Mastra<
       workflow.commit();
     }
     workflows[workflowKey] = workflow;
+    this.#quarantinedDynamicWorkflows.delete(workflowKey);
 
     this.registerStaticWorkflowScorers(workflow);
 
@@ -5628,8 +5631,10 @@ export class Mastra<
     const registry = this.#workflows as Record<string, AnyWorkflow>;
     const priorWorkflows = new Map<string, AnyWorkflow | undefined>();
     const priorHiddenKeys = new Set<string>();
+    const priorQuarantine = new Map<string, QuarantinedDynamicWorkflow | undefined>();
     for (const { normalized } of ordered) {
       priorWorkflows.set(normalized.id, registry[normalized.id]);
+      priorQuarantine.set(normalized.id, this.#quarantinedDynamicWorkflows.get(normalized.id));
       if (this.#hiddenWorkflowKeys.has(normalized.id)) priorHiddenKeys.add(normalized.id);
     }
     const restoreRegistry = () => {
@@ -5637,6 +5642,11 @@ export class Mastra<
         if (prior) registry[id] = prior;
         else delete registry[id];
         if (priorHiddenKeys.has(id)) this.#hiddenWorkflowKeys.add(id);
+        else this.#hiddenWorkflowKeys.delete(id);
+      }
+      for (const [id, prior] of priorQuarantine) {
+        if (prior) this.#quarantinedDynamicWorkflows.set(id, prior);
+        else this.#quarantinedDynamicWorkflows.delete(id);
       }
     };
 

@@ -1,8 +1,8 @@
 ---
-'@mastra/core': minor
+'@mastra/core': major
 ---
 
-Dynamic workflow schemas now fail closed against an admitted JSON Schema 2020-12 subset before they are saved. Unknown or unimplemented keywords are rejected with JSON Pointer evidence, and historical rows that cannot rehydrate losslessly are quarantined at boot instead of executing through `z.any()`.
+Changed dynamic workflow schemas to fail closed against an admitted JSON Schema 2020-12 subset before they are saved. Unknown or unimplemented keywords are now rejected with JSON Pointer evidence. Historical rows that cannot rehydrate losslessly are quarantined at boot instead of executing through `z.any()`.
 
 **Before**
 
