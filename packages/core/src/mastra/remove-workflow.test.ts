@@ -86,6 +86,25 @@ describe('Mastra.removeWorkflow', () => {
     const cfg = JSON.parse(mapping.mapConfig) as Record<string, { template: string }>;
     expect(cfg.message.template).toBe('replacement=${stepResults.double-tool.doubled}');
   });
+
+  it('clears a boot-time quarantine entry even when no live workflow was registered', async () => {
+    const storage = new InMemoryStore({ id: 'remove-quarantined-workflow' });
+    const store = await storage.getStore('workflowDefinitions');
+    if (!store) throw new Error('workflowDefinitions store not available');
+    await store.upsert({
+      id: 'quarantined-workflow',
+      inputSchema: { type: 'object' },
+      outputSchema: { oneOf: [{ type: 'string' }] } as any,
+      graph: [],
+    });
+    const mastra = new Mastra({ logger: false, storage });
+    await (mastra as any).startWorkers?.();
+
+    expect(mastra.listQuarantinedDynamicWorkflows()).toHaveLength(1);
+    expect(mastra.removeWorkflow('quarantined-workflow')).toBe(true);
+    expect(mastra.listQuarantinedDynamicWorkflows()).toEqual([]);
+    expect(() => mastra.getWorkflow('quarantined-workflow')).toThrow(/not found/i);
+  });
 });
 
 describe('Mastra.addDynamicWorkflow replaces on re-save', () => {

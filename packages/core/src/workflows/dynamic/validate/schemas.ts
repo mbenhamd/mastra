@@ -1,33 +1,87 @@
 /**
- * JSON-Schema keyword checks: every schema embedded in the definition must be
- * convertible by `jsonSchemaToZod` (no oneOf/anyOf/allOf/not/$ref/
- * patternProperties/discriminator). Covers the four top-level schemas plus
- * each `agent.outputSchema` reachable through containers.
+ * JSON-Schema dialect checks: every schema embedded in the definition must
+ * belong to the admitted 2020-12 subset `jsonSchemaToZod` can convert
+ * losslessly. Covers the four top-level schemas plus each `agent.outputSchema`
+ * reachable through containers.
  */
 import { forEachSingleStepEntryWithPath } from '../graph';
-import { validateStorableJsonSchema } from '../json-schema-to-zod';
-import type { JsonSchema } from '../json-schema-to-zod';
+import { ADMITTED_JSON_SCHEMA_DIALECT, validateStorableJsonSchema } from '../json-schema-to-zod';
+import type { JsonSchema, JsonSchemaAdmissionIssue } from '../json-schema-to-zod';
 import type { WorkflowValidationInput, WorkflowValidationIssue } from './types';
 
-export function validateWorkflowSchemas(def: WorkflowValidationInput): WorkflowValidationIssue[] {
-  const issues: WorkflowValidationIssue[] = [];
-  const check = (schema: JsonSchema | undefined, path: string, label: string): void => {
+export function collectWorkflowJsonSchemaAdmissionIssues(def: WorkflowValidationInput): JsonSchemaAdmissionIssue[] {
+  const issues: JsonSchemaAdmissionIssue[] = [];
+  const check = (schema: JsonSchema | undefined, path: string, required = false): void => {
+    if (schema === undefined) {
+      if (required) {
+        issues.push({
+          path,
+          pointer: '#',
+          keyword: 'required-schema',
+          message: `${path} is required`,
+        });
+      }
+      return;
+    }
     const result = validateStorableJsonSchema(schema);
     if (result.ok) return;
-    issues.push({
-      code: 'unsupported-schema-keyword',
-      path,
-      message: `${label} uses JSON Schema keyword(s) jsonSchemaToZod cannot convert: ${result.unsupported.join(', ')}. Simplify the schema (or extend the converter).`,
-    });
+    for (const issue of result.issues) {
+      issues.push({ ...issue, path });
+    }
   };
-  check(def.inputSchema, 'inputSchema', 'inputSchema');
-  check(def.outputSchema, 'outputSchema', 'outputSchema');
-  if (def.stateSchema) check(def.stateSchema, 'stateSchema', 'stateSchema');
-  if (def.requestContextSchema) check(def.requestContextSchema, 'requestContextSchema', 'requestContextSchema');
+  check(def.inputSchema, 'inputSchema', true);
+  check(def.outputSchema, 'outputSchema', true);
+  if (def.stateSchema !== undefined) check(def.stateSchema, 'stateSchema');
+  if (def.requestContextSchema !== undefined) check(def.requestContextSchema, 'requestContextSchema');
   forEachSingleStepEntryWithPath(def.graph, (entry, path) => {
-    if (entry.type === 'agent' && entry.outputSchema) {
-      check(entry.outputSchema, `${path}.outputSchema`, `step "${entry.id}" outputSchema`);
+    if (entry.type === 'agent' && entry.outputSchema !== undefined) {
+      check(entry.outputSchema, `${path}.outputSchema`);
     }
   });
   return issues;
+}
+
+export function validateWorkflowSchemas(def: WorkflowValidationInput): WorkflowValidationIssue[] {
+  const admissions = collectWorkflowJsonSchemaAdmissionIssues(def);
+  if (admissions.length === 0) return [];
+
+  const byPath = new Map<string, JsonSchemaAdmissionIssue[]>();
+  for (const issue of admissions) {
+    const path = issue.path ?? '';
+    const group = byPath.get(path) ?? [];
+    group.push(issue);
+    byPath.set(path, group);
+  }
+
+  const issues: WorkflowValidationIssue[] = [];
+  for (const [path, group] of byPath) {
+    const stepId = path.startsWith('graph') && path.endsWith('.outputSchema') ? findAgentStepId(def, path) : undefined;
+    const label = stepId ? `step "${stepId}" outputSchema` : path;
+    if (group.every(issue => issue.keyword === 'required-schema')) {
+      issues.push({
+        code: 'unsupported-schema-keyword',
+        path,
+        message: `${label} is required and must declare a schema in the ${ADMITTED_JSON_SCHEMA_DIALECT} dialect.`,
+      });
+      continue;
+    }
+    issues.push({
+      code: 'unsupported-schema-keyword',
+      path,
+      message: `${label} uses JSON Schema features outside the admitted ${ADMITTED_JSON_SCHEMA_DIALECT} dialect: ${group
+        .map(issue => `${issue.pointer} (${issue.keyword})`)
+        .join(', ')}.`,
+    });
+  }
+  return issues;
+}
+
+function findAgentStepId(def: WorkflowValidationInput, outputSchemaPath: string): string | undefined {
+  let found: string | undefined;
+  forEachSingleStepEntryWithPath(def.graph, (entry, path) => {
+    if (entry.type === 'agent' && `${path}.outputSchema` === outputSchemaPath) {
+      found = entry.id;
+    }
+  });
+  return found;
 }

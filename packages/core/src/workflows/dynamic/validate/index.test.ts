@@ -7,9 +7,11 @@ const emptyObjectSchema = { type: 'object', properties: {} };
 function def(overrides: Partial<WorkflowValidationInput>): WorkflowValidationInput {
   return {
     id: 'wf-under-test',
-    // Untyped by default so schema-flow stays 'unknown' unless a test opts in.
-    inputSchema: {},
-    outputSchema: {},
+    // Admitted object schemas (untyped `{}` is rejected). Default input matches
+    // the implied agent `{ prompt }` contract so schema-flow stays quiet unless
+    // a test supplies a more specific shape.
+    inputSchema: { type: 'object', properties: { prompt: { type: 'string' } }, required: ['prompt'] },
+    outputSchema: emptyObjectSchema,
     graph: [],
     ...overrides,
   };
@@ -137,6 +139,46 @@ describe('validateDynamicWorkflow', () => {
         ]),
       );
     });
+
+    it('flags falsy optional schemas instead of treating them as absent', () => {
+      const issues = validateDynamicWorkflow(
+        def({
+          stateSchema: false as any,
+          requestContextSchema: null as any,
+          graph: [{ type: 'agent', id: 'a1', agentId: 'writer', outputSchema: false as any }],
+        }),
+      );
+      expect(issues).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ code: 'unsupported-schema-keyword', path: 'stateSchema' }),
+          expect.objectContaining({ code: 'unsupported-schema-keyword', path: 'requestContextSchema' }),
+          expect.objectContaining({ code: 'unsupported-schema-keyword', path: 'graph.0.outputSchema' }),
+        ]),
+      );
+    });
+
+    it('flags omitted required workflow schemas with explicit admission evidence', () => {
+      const issues = validateDynamicWorkflow(
+        def({
+          inputSchema: undefined as any,
+          outputSchema: undefined as any,
+        }),
+      );
+      expect(issues).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            code: 'unsupported-schema-keyword',
+            path: 'inputSchema',
+            message: expect.stringContaining('is required'),
+          }),
+          expect.objectContaining({
+            code: 'unsupported-schema-keyword',
+            path: 'outputSchema',
+            message: expect.stringContaining('is required'),
+          }),
+        ]),
+      );
+    });
   });
 
   describe('references', () => {
@@ -234,6 +276,61 @@ describe('validateDynamicWorkflow', () => {
       expect(issues).toEqual([]);
     });
 
+    it('accepts the serialized workflow-id form of an init-data mapping', () => {
+      const issues = validateDynamicWorkflow(
+        def({
+          inputSchema,
+          outputSchema: { type: 'object', properties: { email: { type: 'string' } }, required: ['email'] },
+          graph: [
+            {
+              type: 'mapping',
+              id: 'serialized-init-data',
+              mapConfig: JSON.stringify({ email: { initData: 'source-workflow', path: 'email' } }),
+            },
+          ],
+        }),
+        { workflows: { 'source-workflow': {} } },
+      );
+
+      expect(issues).toEqual([]);
+    });
+
+    it('rejects missing and empty serialized init-data workflow ids', () => {
+      const definition = def({
+        inputSchema,
+        graph: [
+          {
+            type: 'mapping',
+            id: 'serialized-init-data',
+            mapConfig: JSON.stringify({ email: { initData: 'missing-workflow', path: 'email' } }),
+          },
+        ],
+      });
+
+      expect(validateDynamicWorkflow(definition, { workflows: {} })).toEqual([
+        expect.objectContaining({
+          code: 'invalid-map-reference',
+          path: 'graph.0.mapConfig.email.initData',
+          message: expect.stringContaining('missing-workflow'),
+        }),
+      ]);
+
+      definition.graph = [
+        {
+          type: 'mapping',
+          id: 'serialized-init-data',
+          mapConfig: JSON.stringify({ email: { initData: '', path: 'email' } }),
+        },
+      ];
+      expect(validateDynamicWorkflow(definition)).toEqual([
+        expect.objectContaining({
+          code: 'invalid-map-reference',
+          path: 'graph.0.mapConfig.email.initData',
+          message: expect.stringContaining('must not be empty'),
+        }),
+      ]);
+    });
+
     it('rejects noncanonical paths and step references that are missing or not preceding', () => {
       const issues = validateDynamicWorkflow(
         def({
@@ -325,6 +422,7 @@ describe('validateDynamicWorkflow', () => {
     it('treats an unstructured agent as returning { text } so invented output paths are rejected', () => {
       const invented = validateDynamicWorkflow(
         def({
+          inputSchema: { type: 'object', properties: { prompt: { type: 'string' } }, required: ['prompt'] },
           graph: [
             { type: 'agent', id: 'ask-support', agentId: 'support-agent' },
             {
@@ -420,7 +518,7 @@ describe('validateDynamicWorkflow', () => {
       const ok = validateDynamicWorkflow(
         def({
           inputSchema: arrayIn,
-          outputSchema: {},
+          outputSchema: { type: 'array', items: lookupTool.outputSchema },
           graph: [
             { type: 'foreach', step: { type: 'tool', id: 'body', toolId: 'lookupCustomer' }, opts: { concurrency: 1 } },
           ],
@@ -438,25 +536,28 @@ describe('validateDynamicWorkflow', () => {
         }),
         { tools: { lookupCustomer: lookupTool } },
       );
-      expect(nonArray).toEqual([
-        expect.objectContaining({
-          code: 'incompatible-schema',
-          path: 'graph.0',
-          // The old message just said "must be an array", and the repair advertised
-          // inserting a mapping step — which can never satisfy foreach, because
-          // mappings always emit an object.
-          message: expect.stringContaining('A mapping step cannot produce one'),
-        }),
-      ]);
+      expect(nonArray).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            code: 'incompatible-schema',
+            path: 'graph.0',
+            // The old message just said "must be an array", and the repair advertised
+            // inserting a mapping step — which can never satisfy foreach, because
+            // mappings always emit an object.
+            message: expect.stringContaining('A mapping step cannot produce one'),
+          }),
+        ]),
+      );
+      const foreachIssue = nonArray.find(issue => issue.path === 'graph.0');
       // The expected schema must describe the iterable foreach input, not the
       // workflow's final outputSchema.
-      expect((nonArray[0] as any).repair.expectedSchema).toEqual({
+      expect((foreachIssue as any).repair.expectedSchema).toEqual({
         type: 'array',
         items: expect.objectContaining({ type: 'object' }),
       });
       // Inserting a mapping can never satisfy a foreach (mappings emit
       // objects), so the repair must point at the upstream producer instead.
-      expect((nonArray[0] as any).repair.operation).toBe('update-workflow-step');
+      expect((foreachIssue as any).repair.operation).toBe('update-workflow-step');
     });
 
     it('allows mappings to reference parallel and conditional child results', () => {

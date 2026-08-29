@@ -14,7 +14,7 @@ import type { SerializedSingleStepEntry, SerializedStepOptions, SingleStepEntry,
 import { getSingleStepEntryId } from '../utils';
 import { mapVariable, predicateToCondition } from '../workflow';
 import { jsonSchemaToZod } from './json-schema-to-zod';
-import type { JsonSchema, JsonSchemaToZodOptions } from './json-schema-to-zod';
+import type { JsonSchema } from './json-schema-to-zod';
 import { parseMapConfig } from './mapping-config';
 import type { ValidatableStepFlowEntry } from './validate/types';
 
@@ -44,22 +44,12 @@ export interface RehydratedWorkflow {
   workflow: any;
 }
 
-/**
- * Options controlling how `rehydrateWorkflow` handles unsupported JSON Schema
- * keywords. Forwarded to `jsonSchemaToZod` for every schema on the definition
- * (top-level + per-step `agent.outputSchema`). See `JsonSchemaToZodOptions`.
- */
-export type RehydrateWorkflowOptions = JsonSchemaToZodOptions;
-
-export async function rehydrateWorkflow(
-  def: DynamicWorkflowGraph,
-  mastra: Mastra,
-  opts?: RehydrateWorkflowOptions,
-): Promise<RehydratedWorkflow> {
-  const inputSchema = jsonSchemaToZod(def.inputSchema, opts);
-  const outputSchema = jsonSchemaToZod(def.outputSchema, opts);
-  const stateSchema = def.stateSchema ? jsonSchemaToZod(def.stateSchema, opts) : undefined;
-  const requestContextSchema = def.requestContextSchema ? jsonSchemaToZod(def.requestContextSchema, opts) : undefined;
+export async function rehydrateWorkflow(def: DynamicWorkflowGraph, mastra: Mastra): Promise<RehydratedWorkflow> {
+  const inputSchema = jsonSchemaToZod(def.inputSchema);
+  const outputSchema = jsonSchemaToZod(def.outputSchema);
+  const stateSchema = def.stateSchema === undefined ? undefined : jsonSchemaToZod(def.stateSchema);
+  const requestContextSchema =
+    def.requestContextSchema === undefined ? undefined : jsonSchemaToZod(def.requestContextSchema);
 
   const wf = createWorkflow({
     id: def.id,
@@ -72,27 +62,22 @@ export async function rehydrateWorkflow(
   });
 
   for (const entry of def.graph) {
-    applyGraphEntry(wf, entry, mastra, opts);
+    applyGraphEntry(wf, entry, mastra, def.id);
   }
   const built: any = wf.commit();
   built.origin = 'dynamic';
   return { workflow: built };
 }
 
-function applyGraphEntry(
-  wf: any,
-  entry: ValidatableStepFlowEntry,
-  mastra: Mastra,
-  schemaOpts?: JsonSchemaToZodOptions,
-): void {
+function applyGraphEntry(wf: any, entry: ValidatableStepFlowEntry, mastra: Mastra, workflowId: string): void {
   switch (entry.type) {
     case 'agent':
     case 'tool':
-      wf.__pushStepFlowEntry(rehydrateSingleEntry(entry, mastra, schemaOpts), entry);
+      wf.__pushStepFlowEntry(rehydrateSingleEntry(entry, mastra), entry);
       return;
     case 'mapping': {
       const cfg = parseMapConfig(entry.mapConfig, entry.id);
-      const live = rehydrateMapConfig(cfg, mastra);
+      const live = rehydrateMapConfig(cfg, mastra, workflowId);
       wf.map(live, { id: entry.id });
       return;
     }
@@ -121,7 +106,7 @@ function applyGraphEntry(
     case 'parallel': {
       const live: StepFlowEntry = {
         type: 'parallel',
-        steps: entry.steps.map(s => rehydrateSingleEntry(s, mastra, schemaOpts)),
+        steps: entry.steps.map(s => rehydrateSingleEntry(s, mastra)),
       };
       wf.__pushStepFlowEntry(live, entry);
       return;
@@ -134,14 +119,14 @@ function applyGraphEntry(
       }
       const live: StepFlowEntry = {
         type: 'foreach',
-        step: rehydrateSingleEntry(entry.step, mastra, schemaOpts),
+        step: rehydrateSingleEntry(entry.step, mastra),
         opts: { concurrency: entry.opts?.concurrency ?? 1 },
       };
       wf.__pushStepFlowEntry(live, entry);
       return;
     }
     case 'step': {
-      const live = rehydrateSingleEntry(entry, mastra, schemaOpts);
+      const live = rehydrateSingleEntry(entry, mastra);
       wf.__pushStepFlowEntry(live, entry);
       return;
     }
@@ -162,7 +147,7 @@ function applyGraphEntry(
           `Cannot rehydrate conditional step: missing or mismatched predicates. Only declarative predicate branches round-trip.`,
         );
       }
-      const steps = entry.steps.map(s => rehydrateSingleEntry(s, mastra, schemaOpts));
+      const steps = entry.steps.map(s => rehydrateSingleEntry(s, mastra));
       // Wire graphs may omit the Studio-facing condition labels; derive them
       // from the predicates (same convention as the fluent builder).
       const serializedConditions =
@@ -185,7 +170,7 @@ function applyGraphEntry(
           `Cannot rehydrate loop step: missing declarative predicate or loopType. Only declarative predicate loops round-trip.`,
         );
       }
-      const step = rehydrateSingleEntry(entry.step, mastra, schemaOpts);
+      const step = rehydrateSingleEntry(entry.step, mastra);
       const serializedCondition = entry.serializedCondition ?? {
         id: `${getSingleStepEntryId(step)}-condition`,
         fn: derivePredicateLabel(predicate),
@@ -217,16 +202,13 @@ function applyGraphEntry(
  * run. Returns `undefined` when nothing to restore so `.agent(agentId)`
  * stays a clean call.
  */
-function rebuildAgentOptions(
-  entry: {
-    outputSchema?: Record<string, any>;
-    options?: SerializedStepOptions;
-  },
-  schemaOpts?: JsonSchemaToZodOptions,
-): Record<string, any> | undefined {
+function rebuildAgentOptions(entry: {
+  outputSchema?: Record<string, any>;
+  options?: SerializedStepOptions;
+}): Record<string, any> | undefined {
   const opts: Record<string, any> = {};
-  if (entry.outputSchema) {
-    opts.structuredOutput = { schema: jsonSchemaToZod(entry.outputSchema, schemaOpts) };
+  if (entry.outputSchema !== undefined) {
+    opts.structuredOutput = { schema: jsonSchemaToZod(entry.outputSchema) };
   }
   if (entry.options?.retries !== undefined) opts.retries = entry.options.retries;
   if (entry.options?.metadata !== undefined) opts.metadata = entry.options.metadata;
@@ -256,11 +238,7 @@ function rebuildToolOptions(entry: { options?: SerializedStepOptions }): Record<
  * instance; `workflow` entries resolve the registered instance. Both become
  * plain `{ type: 'step' }` entries, same as the fluent builder emits.
  */
-function rehydrateSingleEntry(
-  entry: SerializedSingleStepEntry,
-  mastra: Mastra,
-  schemaOpts?: JsonSchemaToZodOptions,
-): SingleStepEntry {
+function rehydrateSingleEntry(entry: SerializedSingleStepEntry, mastra: Mastra): SingleStepEntry {
   switch (entry.type) {
     case 'agent': {
       const agent = tryGetAgentById(mastra, entry.agentId);
@@ -274,7 +252,7 @@ function rehydrateSingleEntry(
         id: entry.id,
         agentId: entry.agentId,
         agent,
-        options: rebuildAgentOptions(entry, schemaOpts),
+        options: rebuildAgentOptions(entry),
       };
     }
     case 'tool': {
@@ -322,7 +300,7 @@ function rehydrateSingleEntry(
  * Rebuild the object shape that `.map()` accepts. Step sources remain workflow-local
  * step IDs because mapping execution resolves them from the run's step results.
  */
-function rehydrateMapConfig(cfg: Record<string, any>, mastra: Mastra): Record<string, any> {
+function rehydrateMapConfig(cfg: Record<string, any>, mastra: Mastra, workflowId: string): Record<string, any> {
   const out: Record<string, any> = {};
   for (const [key, source] of Object.entries(cfg)) {
     if (!source || typeof source !== 'object') {
@@ -336,7 +314,15 @@ function rehydrateMapConfig(cfg: Record<string, any>, mastra: Mastra): Record<st
     } else if ('requestContextPath' in source) {
       out[key] = { requestContextPath: source.requestContextPath };
     } else if ('initData' in source && typeof source.initData === 'string') {
-      const wf = mastra.getWorkflow?.(source.initData);
+      // `mapVariable({ initData: workflow })` serializes the workflow id, but
+      // execution uses initData only as a marker and reads this run's own
+      // `getInitData()`. On first hydration the current workflow is not yet in
+      // the registry, so restore its self id directly to that marker.
+      if (source.initData === workflowId) {
+        out[key] = { initData: true, path: source.path };
+        continue;
+      }
+      const wf = tryGetWorkflowById(mastra, source.initData);
       if (!wf) {
         throw new Error(`Mapping references unknown workflow init-data "${source.initData}".`);
       }

@@ -68,6 +68,7 @@ A promise that resolves once the definition is validated, registered, and persis
 ## Behavior
 
 - The definition is fully validated (structure, references, schema flow) before anything is mutated. Agents, tools, and workflows referenced by the graph must already be registered on the instance.
+- Every supplied schema must satisfy the [admitted JSON Schema contract](/reference/workflows/dynamic-workflow-definition#admitted-json-schema). Rejections identify the definition field, JSON Pointer, and unsupported keyword.
 - Adding a definition with an existing ID replaces both the stored definition and the live registration. In-flight runs keep the graph they started with.
 - Without a storage adapter that supports the `workflowDefinitions` domain, the workflow is still validated and registered in memory, but the definition is lost on restart.
 - To add a root workflow together with helper workflows it nests, use [`addDynamicWorkflows()`](/reference/core/addDynamicWorkflows).
@@ -76,5 +77,6 @@ A promise that resolves once the definition is validated, registered, and persis
 
 - [Mastra.addDynamicWorkflows()](/reference/core/addDynamicWorkflows): Add a dependency-ordered bundle of definitions
 - [Mastra.getWorkflow()](/reference/core/getWorkflow): Retrieve a registered workflow
+- [Mastra.listQuarantinedDynamicWorkflows()](/reference/core/listQuarantinedDynamicWorkflows): Inspect unsupported historical definitions
 - [Dynamic workflows](/docs/workflows/dynamic-workflows): Set up and use dynamic workflows
 - [Dynamic workflow definition](/reference/workflows/dynamic-workflow-definition): Definition fields and graph entries

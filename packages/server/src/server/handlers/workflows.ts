@@ -49,6 +49,13 @@ import { getEffectiveResourceId, validateRunOwnership } from './utils';
  * in the workflow's run map, and a finished run has already been dropped from it.
  */
 const TERMINAL_RUN_STATUSES: WorkflowRunStatus[] = ['success', 'failed', 'canceled', 'tripwire'];
+const DYNAMIC_WORKFLOW_QUARANTINED_CODE = 'MASTRA_DYNAMIC_WORKFLOW_QUARANTINED';
+
+function isDynamicWorkflowQuarantinedError(error: unknown): boolean {
+  return (
+    typeof error === 'object' && error !== null && (error as { id?: unknown }).id === DYNAMIC_WORKFLOW_QUARANTINED_CODE
+  );
+}
 
 /**
  * Runs whose chunks are already being written to the cache in this process,
@@ -127,6 +134,7 @@ async function listWorkflowsFromSystem({ mastra, workflowId }: WorkflowContext) 
     try {
       workflow = mastra.getWorkflowById(workflowId);
     } catch (error) {
+      if (isDynamicWorkflowQuarantinedError(error)) throw error;
       logger.debug('Error getting workflow, searching agents for workflow', error);
     }
   }

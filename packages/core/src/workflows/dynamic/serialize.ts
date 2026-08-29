@@ -27,6 +27,7 @@ import type {
   StepFlowEntry,
 } from '../types';
 import { getSingleStepEntryId } from '../utils';
+import { getAdmittedJsonSchema } from './admitted-schema-source';
 
 /**
  * Walk a live `stepFlow` and emit a JSON-safe `SerializedStepFlowEntry[]` with
@@ -152,7 +153,10 @@ function serializeSingleEntry(entry: SingleStepEntry): SerializedSingleStepEntry
       } else if (typeof m.template === 'string') {
         serialized[key] = { template: m.template };
       } else if (m.initData) {
-        serialized[key] = { initData: m.initData?.id, path: m.path };
+        // Rehydrated canonical mappings use the boolean marker while fluent
+        // mappings carry a Workflow instance. Preserve both forms: omitting
+        // `initData` here would make the next round trip invalid.
+        serialized[key] = { initData: m.initData?.id ?? true, path: m.path };
       } else if (m.step) {
         serialized[key] = {
           step: Array.isArray(m.step) ? m.step.map((s: any) => s?.id) : m.step?.id,
@@ -361,6 +365,8 @@ function pickSerializableStepOptions(
 function extractStructuredOutputJsonSchema(options: any, entryId: string): Record<string, any> | undefined {
   const raw = options?.structuredOutput?.schema;
   if (raw === undefined || raw === null) return undefined;
+  const admitted = getAdmittedJsonSchema(raw);
+  if (admitted !== undefined) return admitted;
   try {
     // `.agent()`'s typed overload requires a StandardSchemaWithJSON, but the
     // any-form accepts a raw Zod schema. Normalize either shape here so the

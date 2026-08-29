@@ -1,0 +1,66 @@
+---
+title: "Reference: Mastra.listQuarantinedDynamicWorkflows() | Core"
+description: "Documentation for inspecting stored dynamic workflows that Mastra quarantined because their schemas can't be rehydrated losslessly."
+packages:
+  - "@mastra/core"
+---
+
+# Mastra.listQuarantinedDynamicWorkflows()
+
+:::beta
+
+Breaking changes may occur without a major version bump until the API is stable.
+
+:::
+
+The `.listQuarantinedDynamicWorkflows()` method returns active stored dynamic workflows that Mastra didn't register because their schemas, or a workflow they depend on, are outside the [admitted JSON Schema contract](/reference/workflows/dynamic-workflow-definition#admitted-json-schema). Quarantine keeps an unsupported historical row from executing while unrelated workflows continue to load.
+
+## Usage example
+
+```typescript
+const quarantined = mastra.listQuarantinedDynamicWorkflows()
+
+for (const workflow of quarantined) {
+  console.log(workflow.id)
+  for (const issue of workflow.issues) {
+    console.log(issue.path, issue.pointer, issue.keyword, issue.message)
+  }
+}
+```
+
+## Parameters
+
+This method doesn't accept parameters.
+
+## Returns
+
+Returns `QuarantinedDynamicWorkflow[]`. Each item has this shape:
+
+```typescript
+type QuarantinedDynamicWorkflow = {
+  id: string
+  reason: 'unsupported-schema'
+  issues: Array<{
+    path?: string
+    pointer: string
+    keyword: string
+    message: string
+  }>
+}
+```
+
+The `path` identifies the schema field in the workflow definition. The `pointer` identifies the rejected location inside that schema. A dependent workflow's path starts with the quarantined dependency ID.
+
+## Recovery
+
+Replace the stored definition with an admitted schema under the same ID by calling [`addDynamicWorkflow()`](/reference/core/addDynamicWorkflow). Mastra clears the quarantine entry only after the replacement is validated and registered successfully.
+
+If another workflow was quarantined because it depended on this definition, re-add that dependent workflow after restoring its dependencies, or restart the process so stored definitions load again in dependency order. Replacing only the dependency doesn't re-register workflows that are already quarantined, so `getWorkflow()` continues to report those dependents as unavailable.
+
+To remove the definition instead, delete it through the [dynamic-workflow management API](/reference/client-js/workflows#dynamic-workflows). The delete path removes both the stored row and its in-memory quarantine entry.
+
+## Related
+
+- [Dynamic workflows](/docs/workflows/dynamic-workflows)
+- [Dynamic workflow definition](/reference/workflows/dynamic-workflow-definition)
+- [`Mastra.addDynamicWorkflow()`](/reference/core/addDynamicWorkflow)

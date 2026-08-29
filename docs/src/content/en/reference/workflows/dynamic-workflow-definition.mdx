@@ -56,6 +56,70 @@ Schemas use JSON Schema rather than Zod so the definition can round-trip through
 }
 ```
 
+## Admitted JSON Schema
+
+Every workflow schema must use Mastra's bounded JSON Schema Draft 2020-12 subset. The root may omit `$schema` or set it to `https://json-schema.org/draft/2020-12/schema`. Draft-07 schema URIs are accepted for historical Zod output, but the admitted keyword contract remains the subset below.
+
+Every schema node must declare `type`, `enum`, or `const`. Boolean schemas and untyped nodes such as `{}` aren't admitted. `enum` and `const` accept only string, finite number, boolean, or null values and can't have sibling assertion keywords.
+
+| Node | Admitted keywords |
+| - | - |
+| Every node | `type`, `enum`, `const`, `title`, `description`, `$comment`, `examples`, `default` |
+| String | `minLength`, `maxLength`, `format` |
+| Number or integer | `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`, `multipleOf` |
+| Object | `properties`, `required`, `additionalProperties`, `minProperties`, `maxProperties`, `propertyNames` |
+| Array | `items`, `prefixItems`, `minItems`, `maxItems`, `uniqueItems`, `contains`, `minContains`, `maxContains` |
+
+`type` may be a single JSON type or a non-empty array of unique JSON types. Assertion keywords apply only to their matching type in a type array.
+
+### Objects
+
+Object conversion preserves these `additionalProperties` forms:
+
+| Value | Rehydrated behavior |
+| - | - |
+| Omitted or `true` | Preserve additional properties without constraining them |
+| `false` | Reject additional properties |
+| An admitted schema | Validate every additional property against that schema |
+
+Every name in `required` must also appear in `properties`. `propertyNames` accepts `true`, `false`, or an admitted schema. The property name `__proto__` isn't admitted.
+
+### Arrays and tuples
+
+A homogeneous array must declare an admitted schema object in `items`. `uniqueItems` compares JSON values structurally, so object key order doesn't affect equality. `contains` must be an admitted schema object. `minContains` and `maxContains` require `contains`.
+
+An admitted tuple uses all of these fields:
+
+```json
+{
+  "type": "array",
+  "prefixItems": [{ "type": "string" }, { "type": "number" }],
+  "items": false,
+  "minItems": 2
+}
+```
+
+`prefixItems` must be non-empty, `items` must be `false`, and `minItems` must equal the number of prefix schemas. If present, `maxItems` must equal the same number. Open tuples, optional tuple positions, and draft-07 tuple-form `items: [...]` aren't admitted.
+
+### Strings and formats
+
+String lengths count Unicode code points. `pattern` isn't admitted because runtime regular-expression matching doesn't provide a bounded execution guarantee.
+
+Only `format: "uuid"` is admitted. It validates the hexadecimal 8-4-4-4-12 string representation defined by RFC 4122, including the nil UUID. Other formats, including `email`, `uri`, and `date-time`, are rejected because the converter doesn't claim lossless assertion semantics for them.
+
+### Bounds
+
+| Limit | Maximum |
+| - | -: |
+| Schema depth | 16 |
+| Schema nodes | 256 |
+| Properties per object | 64 |
+| Enum members | 128 |
+| Serialized schema size | 32 KiB of UTF-8 |
+| Tuple prefix schemas | 16 |
+
+Annotations must contain JSON values. `default` is retained as metadata and doesn't supply a parse-time default.
+
 ## Graph entries
 
 Entries in the `graph` run in order. Each entry receives the previous entry's output, and the first entry receives the workflow input.
@@ -295,9 +359,12 @@ Mastra validates definitions before it persists or registers them:
 
 Validation errors include a dotted path, such as `graph.2.steps.0`, that identifies the invalid entry.
 
+Schema admission errors also include a JSON Pointer, such as `#/properties/name/format`, and the rejected keyword. Historical active rows that fail this contract are [quarantined instead of registered](/reference/core/listQuarantinedDynamicWorkflows).
+
 ## Related
 
 - [Use dynamic workflows](/docs/workflows/dynamic-workflows)
 - [`Mastra.addDynamicWorkflow()`](/reference/core/addDynamicWorkflow)
 - [`Mastra.addDynamicWorkflows()`](/reference/core/addDynamicWorkflows)
+- [`Mastra.listQuarantinedDynamicWorkflows()`](/reference/core/listQuarantinedDynamicWorkflows)
 - [Client SDK workflows API](/reference/client-js/workflows)

@@ -549,6 +549,29 @@ describe('vNext Workflow Handlers', () => {
       ).rejects.toThrow(new HTTPException(404, { message: 'Workflow not found' }));
     });
 
+    it('should preserve quarantine conflicts without falling back to an agent workflow', async () => {
+      const quarantineError = Object.assign(new Error('Dynamic workflow is quarantined'), {
+        id: 'MASTRA_DYNAMIC_WORKFLOW_QUARANTINED',
+        details: { status: 409 },
+      });
+      const listWorkflows = vi.fn().mockResolvedValue({ 'quarantined-workflow': mockWorkflow });
+      const mastra = {
+        getLogger: () => ({ debug: vi.fn() }),
+        getWorkflowById: vi.fn(() => {
+          throw quarantineError;
+        }),
+        listAgents: () => ({ fallback: { listWorkflows } }),
+      } as unknown as Mastra;
+
+      await expect(
+        GET_WORKFLOW_BY_ID_ROUTE.handler({
+          ...createTestServerContext({ mastra }),
+          workflowId: 'quarantined-workflow',
+        }),
+      ).rejects.toMatchObject({ status: 409, message: 'Dynamic workflow is quarantined' });
+      expect(listWorkflows).not.toHaveBeenCalled();
+    });
+
     it('should get workflow by ID successfully', async () => {
       const result = await GET_WORKFLOW_BY_ID_ROUTE.handler({
         ...createTestServerContext({ mastra: mockMastra }),

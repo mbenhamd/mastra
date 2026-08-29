@@ -125,8 +125,8 @@ describe('workflow builder authoring contract', () => {
   it('preserves nested workflow call-site ids that differ from the referenced workflow id', () => {
     const definition = normalizeWorkflowBuilderDefinition({
       id: 'outer-flow',
-      inputSchema: {},
-      outputSchema: {},
+      inputSchema: { type: 'object', properties: {} },
+      outputSchema: { type: 'object', properties: {} },
       graph: [
         {
           type: 'parallel',
@@ -219,8 +219,8 @@ describe('workflow builder authoring contract', () => {
       const result = preflightWorkflowDefinition(
         {
           id: 'invalid-flow',
-          inputSchema: {},
-          outputSchema: {},
+          inputSchema: { type: 'object', properties: {} },
+          outputSchema: { type: 'object', properties: {} },
           graph: [
             { type: 'tool', id: 'duplicate', toolId: 'missingTool' },
             { type: 'agent', id: 'duplicate', agentId: 'missingAgent' },
@@ -277,8 +277,8 @@ describe('workflow builder authoring contract', () => {
     it('rejects mapping entries inside containers', () => {
       const result = preflightWorkflowDefinition({
         id: 'invalid-container',
-        inputSchema: {},
-        outputSchema: {},
+        inputSchema: { type: 'object', properties: {} },
+        outputSchema: { type: 'object', properties: {} },
         graph: [
           {
             type: 'parallel',

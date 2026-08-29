@@ -7,6 +7,7 @@
  * covers both persisted rows and wire-shaped authoring submissions.
  */
 import type { SerializedSingleStepEntry } from '../types';
+import { collectMapConfigWorkflowIds } from './mapping-config';
 import type { ValidatableStepFlowEntry } from './validate/types';
 
 /**
@@ -50,13 +51,22 @@ export function forEachSingleStepEntry(
 }
 
 /**
- * Collect the ids of every nested workflow referenced by a stored graph.
- * Used by boot-time loading to hydrate stored definitions in dependency order.
+ * Collect every workflow id resolved while hydrating a stored graph, including
+ * nested workflow entries and workflow-backed mapping init-data sources. Used
+ * by boot-time loading to hydrate stored definitions in dependency order.
  */
 export function collectNestedWorkflowIds(graph: readonly ValidatableStepFlowEntry[]): Set<string> {
   const out = new Set<string>();
   forEachSingleStepEntry(graph, entry => {
     if (entry.type === 'workflow') out.add(entry.workflowId);
+    if (entry.type === 'mapping') {
+      try {
+        for (const workflowId of collectMapConfigWorkflowIds(entry.mapConfig, entry.id)) out.add(workflowId);
+      } catch {
+        // Invalid mapConfig is reported by the normal validation/rehydration
+        // path; dependency discovery must not abort loading every stored row.
+      }
+    }
   });
   return out;
 }

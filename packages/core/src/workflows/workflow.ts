@@ -56,6 +56,7 @@ import type { ToolExecutionContext } from '../tools/types';
 import type { DynamicArgument } from '../types';
 import { PROCESSOR_EXECUTION_SYMBOL, PUBSUB_SYMBOL, TRANSIENT_EXECUTION_SYMBOL } from './constants';
 import { DefaultExecutionEngine } from './default';
+import { getAdmittedJsonSchema } from './dynamic/admitted-schema-source';
 import type { ExecutionEngine, ExecutionGraph } from './execution-engine';
 import {
   createWorkflowExecutionGeneration,
@@ -170,10 +171,15 @@ function serializeAgentStepFields(options: any): {
   const out: { outputSchema?: Record<string, any>; options?: { retries?: number; metadata?: StepMetadata } } = {};
   const raw = options?.structuredOutput?.schema;
   if (raw !== undefined && raw !== null) {
-    try {
-      out.outputSchema = standardSchemaToJSONSchema(toStandardSchema(raw)) as Record<string, any>;
-    } catch {
-      // best-effort; toStorableGraph will surface the real error at persist time
+    const admitted = getAdmittedJsonSchema(raw);
+    if (admitted !== undefined) {
+      out.outputSchema = admitted;
+    } else {
+      try {
+        out.outputSchema = standardSchemaToJSONSchema(toStandardSchema(raw)) as Record<string, any>;
+      } catch {
+        // best-effort; toStorableGraph will surface the real error at persist time
+      }
     }
   }
   const opts: { retries?: number; metadata?: StepMetadata } = {};

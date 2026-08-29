@@ -5,6 +5,7 @@
  * schemas degrade to `unknown` instead of producing false positives.
  */
 import { standardSchemaToJSONSchema, toStandardSchema } from '../../../schema';
+import { getAdmittedJsonSchema } from '../admitted-schema-source';
 import type { JsonSchema } from '../json-schema-to-zod';
 
 export type SchemaCompatibility = 'compatible' | 'incompatible' | 'unknown';
@@ -16,6 +17,8 @@ export type SchemaCompatibility = 'compatible' | 'incompatible' | 'unknown';
  */
 export function toJsonSchemaOrUndefined(schema: unknown): JsonSchema | undefined {
   if (schema === undefined || schema === null) return undefined;
+  const admitted = getAdmittedJsonSchema(schema);
+  if (admitted !== undefined) return admitted;
   try {
     return standardSchemaToJSONSchema(toStandardSchema(schema)) as JsonSchema;
   } catch {

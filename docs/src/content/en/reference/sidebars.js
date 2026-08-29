@@ -237,6 +237,12 @@ const sidebars = {
         { type: 'doc', id: 'core/listLogsByRunId', label: '.listLogsByRunId()' },
         { type: 'doc', id: 'core/listMCPServers', label: '.listMCPServers()' },
         { type: 'doc', id: 'core/listMemory', label: '.listMemory()' },
+        {
+          type: 'doc',
+          id: 'core/listQuarantinedDynamicWorkflows',
+          label: '.listQuarantinedDynamicWorkflows()',
+          customProps: { tags: ['new'] },
+        },
         { type: 'doc', id: 'core/listScorers', label: '.listScorers()' },
         { type: 'doc', id: 'core/listTools', label: '.listTools()' },
         { type: 'doc', id: 'core/listVectors', label: '.listVectors()' },
