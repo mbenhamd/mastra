@@ -202,12 +202,13 @@ export function createPrepareStreamWorkflow<OUTPUT = undefined>({
     outputSchema: z.instanceof(MastraModelOutput<OUTPUT>),
     steps: [prepareToolsStep, prepareMemoryStep, streamStep],
     options: {
+      ...(useEventedExecution ? {} : { executionMode: 'transient' as const }),
       tracingPolicy: {
         internal: InternalSpans.WORKFLOW,
       },
       // This is an internal, non-resumable workflow created per agent generate/stream call.
-      // It must never write snapshot rows to the user's storage. Registering Mastra (done by
-      // the agent) lets it read storage to suppress noise, while this keeps writes off.
+      // Direct execution is transient and performs no lifecycle storage I/O. Evented execution
+      // must stay durable for dispatch, so it retains the no-write policy and cleanup below.
       shouldPersistSnapshot: () => false,
       validateInputs: false,
     },
