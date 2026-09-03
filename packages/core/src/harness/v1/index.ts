@@ -67,6 +67,7 @@ export { HARNESS_EVENT_ID_PREFIX, formatHarnessEventId, parseHarnessEventId } fr
 export {
   parseHarnessSubagentOutcomeReport,
   parseHarnessSubagentTerminalResult,
+  parseHarnessTerminalToolResultArtifacts,
   parseHarnessTerminalToolResultText,
   projectHarnessSubagentOutcomeReceipts,
   verifyHarnessSubagentOutcomeReport,
