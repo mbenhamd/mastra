@@ -135,6 +135,7 @@ import type { ToolOptions } from '../utils';
 import { slugify } from '../utils/slugify';
 import type { MastraVoice } from '../voice';
 import { DefaultVoice } from '../voice';
+import { TRANSIENT_EXECUTION_SYMBOL } from '../workflows/constants';
 import { createWorkflow } from '../workflows/create';
 import type { Step } from '../workflows/step';
 import type { OutputWriter, WorkflowResult, WorkflowRunState, WorkflowRunStatus } from '../workflows/types';
@@ -8914,7 +8915,13 @@ export class Agent<
 
     const observabilityContext = createObservabilityContext({ currentSpan: agentSpan });
     try {
-      const run = await executionWorkflow.createRun({ runId: executionRunId });
+      // The direct wrapper is non-resumable but uses this explicit ID for
+      // internal registration. Preserve its declared transient mode instead
+      // of letting the explicit-ID collision rule promote it to durable.
+      const run = await executionWorkflow.createRun({
+        runId: executionRunId,
+        ...(useEventedExecution ? {} : { [TRANSIENT_EXECUTION_SYMBOL]: true }),
+      });
       return await run.start({ requestContext, actor: options.actor, ...observabilityContext });
     } finally {
       // Evented terminal handlers may already have released this registration;
