@@ -6,7 +6,9 @@ import {
   HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID,
   harnessSubagentOutcomeReportSchema,
   parseHarnessSubagentOutcomeReport,
+  parseHarnessTerminalToolResultArtifacts,
   parseHarnessTerminalToolResultText,
+  projectHarnessSpawnSubagentResult,
   projectHarnessSubagentOutcomeReceipts,
   summarizeHarnessSubagentEventResult,
   summarizeHarnessSubagentResult,
@@ -191,6 +193,16 @@ describe('Harness subagent outcome terminal contract', () => {
   });
 
   it('accepts a receipt-verified domain terminal tool as completed without a report turn', () => {
+    const artifact = {
+      kind: 'generated-image',
+      artifactId: 'python-plot-1',
+      attachmentId: 'python-plot-1',
+      sessionId: 'child-session-1',
+      mimeType: 'image/png',
+      sha256: 'a'.repeat(64),
+      bytes: 1_024,
+      title: 'Computed chart',
+    };
     const terminalToolResult = {
       status: 'success',
       items: [
@@ -198,7 +210,7 @@ describe('Harness subagent outcome terminal contract', () => {
           toolName: 'run_python_analysis',
           toolCallId: 'python-1',
           status: 'success',
-          value: { text: 'Computed the requested analysis.' },
+          value: { text: 'Computed the requested analysis.', artifacts: [artifact] },
         },
       ],
     };
@@ -212,6 +224,7 @@ describe('Harness subagent outcome terminal contract', () => {
     );
 
     expect(parseHarnessTerminalToolResultText(terminalToolResult)).toBe('Computed the requested analysis.');
+    expect(parseHarnessTerminalToolResultArtifacts(terminalToolResult)).toEqual([artifact]);
     expect(verifyHarnessSubagentTerminalCompletion(rawResult)).toMatchObject({
       outcome: 'completed',
       summary: 'Computed the requested analysis.',
@@ -224,12 +237,53 @@ describe('Harness subagent outcome terminal contract', () => {
         },
       ],
     });
-    expect(summarizeHarnessSubagentResult(rawResult)).toMatchObject({
+    const summary = summarizeHarnessSubagentResult(rawResult);
+    expect(summary).toMatchObject({
       status: 'success',
       outcome: 'completed',
       text: 'Computed the requested analysis.',
       finishReason: 'tool-calls',
+      artifacts: [artifact],
     });
+    expect(summarizeHarnessSubagentEventResult(summary)).not.toHaveProperty('artifacts');
+    expect(
+      projectHarnessSpawnSubagentResult({
+        subagentSessionId: 'child-session-1',
+        result: summary,
+      }),
+    ).toEqual({
+      kind: 'subagent-direct-answer',
+      subagentSessionId: 'child-session-1',
+      text: 'Computed the requested analysis.',
+      artifacts: [artifact],
+    });
+  });
+
+  it('drops oversized or unprojected terminal artifact metadata without rejecting the verified text', () => {
+    const oversizedTerminal = {
+      status: 'success',
+      items: [
+        {
+          toolName: 'run_python_analysis',
+          toolCallId: 'python-oversized',
+          status: 'success',
+          value: {
+            text: 'The computed answer remains valid.',
+            artifacts: [{ metadata: 'x'.repeat(13 * 1024) }],
+          },
+        },
+      ],
+    };
+
+    expect(parseHarnessTerminalToolResultText(oversizedTerminal)).toBe('The computed answer remains valid.');
+    expect(parseHarnessTerminalToolResultArtifacts(oversizedTerminal)).toBeUndefined();
+    expect(
+      parseHarnessTerminalToolResultArtifacts({
+        nested: {
+          artifacts: [{ kind: 'generated-image' }],
+        },
+      }),
+    ).toBeUndefined();
   });
 
   it('rejects forged domain terminal identity and arbitrary nested terminal text', () => {

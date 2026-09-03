@@ -20,6 +20,8 @@ export const MAX_HARNESS_SUBAGENT_EVENT_TEXT_BYTES = 4 * 1024;
  */
 export const MAX_HARNESS_SUBAGENT_DIRECT_ANSWER_BYTES = 64 * 1024;
 export const MAX_HARNESS_SUBAGENT_ERROR_MESSAGE_BYTES = 4 * 1024;
+/** Maximum projected artifact metadata retained from a child's terminal tool result. */
+export const MAX_HARNESS_SUBAGENT_TERMINAL_ARTIFACTS_BYTES = 12 * 1024;
 
 const MAX_HARNESS_SUBAGENT_LABEL_LENGTH = 256;
 const MAX_HARNESS_SUBAGENT_EVIDENCE_DESCRIPTION_LENGTH = 2 * 1024;
@@ -29,7 +31,23 @@ const MAX_HARNESS_SUBAGENT_EVENT_EVIDENCE_ITEMS = 1;
 const MAX_HARNESS_SUBAGENT_EVENT_EVIDENCE_TEXT_BYTES = 256;
 const MAX_HARNESS_SUBAGENT_EVENT_ISSUE_TEXT_BYTES = 512;
 const MAX_HARNESS_SUBAGENT_TOOL_RECEIPTS = 4_096;
+const MAX_HARNESS_SUBAGENT_TERMINAL_ARTIFACTS = 16;
 const HARNESS_SUBAGENT_TEXT_TRUNCATION_MARKER = '\n\u2026 [truncated by Harness]';
+
+const harnessSubagentTerminalArtifactsSchema = z
+  .array(z.json())
+  .min(1)
+  .max(MAX_HARNESS_SUBAGENT_TERMINAL_ARTIFACTS)
+  .superRefine((artifacts, ctx) => {
+    if (
+      new TextEncoder().encode(JSON.stringify(artifacts)).byteLength > MAX_HARNESS_SUBAGENT_TERMINAL_ARTIFACTS_BYTES
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `subagent terminal artifacts exceed ${MAX_HARNESS_SUBAGENT_TERMINAL_ARTIFACTS_BYTES} UTF-8 bytes`,
+      });
+    }
+  });
 
 export const harnessSubagentOutcomeSchema = z.enum(['completed', 'blocked', 'failed']);
 
@@ -117,6 +135,7 @@ export const harnessSubagentResultSummarySchema = z
     toolCallCount: z.number().int().nonnegative(),
     toolResultCount: z.number().int().nonnegative(),
     usage: harnessSubagentUsageSchema.optional(),
+    artifacts: harnessSubagentTerminalArtifactsSchema.optional(),
     evidence: z.array(harnessSubagentOutcomeEvidenceSchema).max(MAX_HARNESS_SUBAGENT_EVIDENCE_ITEMS).optional(),
     evidenceTruncated: z.boolean().optional(),
     issue: harnessSubagentOutcomeIssueSchema.optional(),
@@ -138,8 +157,17 @@ export const harnessSubagentDirectAnswerSchema = z
     kind: z.literal(HARNESS_SUBAGENT_DIRECT_ANSWER_KIND),
     subagentSessionId: z.string().min(1).max(512),
     text: z.string().min(1),
+    artifacts: harnessSubagentTerminalArtifactsSchema.optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((answer, ctx) => {
+    if (new TextEncoder().encode(JSON.stringify(answer)).byteLength > MAX_HARNESS_SUBAGENT_DIRECT_ANSWER_BYTES) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `subagent direct answer exceeds ${MAX_HARNESS_SUBAGENT_DIRECT_ANSWER_BYTES} UTF-8 bytes`,
+      });
+    }
+  });
 
 export type HarnessSubagentDirectAnswer = z.infer<typeof harnessSubagentDirectAnswerSchema>;
 
@@ -365,6 +393,10 @@ export function summarizeHarnessSubagentResult(
     };
   }
   const usage = summarizeUsage(record?.totalUsage ?? record?.usage);
+  const artifacts =
+    status === 'success' && report?.outcome === 'completed'
+      ? parseHarnessTerminalToolResultArtifacts(record?.terminalToolResult)
+      : undefined;
 
   return {
     status,
@@ -376,6 +408,7 @@ export function summarizeHarnessSubagentResult(
     toolCallCount: arrayLength(record?.toolCalls),
     toolResultCount: arrayLength(record?.toolResults),
     ...(usage ? { usage } : {}),
+    ...(artifacts ? { artifacts } : {}),
     ...(report ? { evidence: report.evidence } : {}),
     ...(report?.issue ? { issue: report.issue } : {}),
     ...(error ? { error } : {}),
@@ -391,6 +424,7 @@ export function summarizeHarnessSubagentResult(
 export function summarizeHarnessSubagentEventResult(
   summary: HarnessSubagentResultSummary,
 ): HarnessSubagentResultSummary {
+  const { artifacts: _artifacts, ...eventSummary } = summary;
   const text = truncateUtf8(summary.text, MAX_HARNESS_SUBAGENT_EVENT_TEXT_BYTES);
   const evidence = summary.evidence?.slice(0, MAX_HARNESS_SUBAGENT_EVENT_EVIDENCE_ITEMS).map(item => ({
     ...item,
@@ -422,7 +456,7 @@ export function summarizeHarnessSubagentEventResult(
           messageTruncated: summary.error.messageTruncated || errorMessage.truncated,
         };
   return {
-    ...summary,
+    ...eventSummary,
     text: text.value,
     textTruncated: summary.textTruncated || text.truncated,
     ...(evidence === undefined ? {} : { evidence }),
@@ -546,6 +580,22 @@ function parseGenericHarnessTerminalToolResult(value: unknown) {
 }
 
 /**
+ * Preserve only the explicit, bounded `artifacts` projection from one validated
+ * domain terminal tool result. The Harness never searches raw child output or
+ * provider payloads for similarly named fields.
+ */
+export function parseHarnessTerminalToolResultArtifacts(
+  value: unknown,
+): z.infer<typeof harnessSubagentTerminalArtifactsSchema> | undefined {
+  const terminal = parseGenericHarnessTerminalToolResult(value);
+  if (terminal === undefined || terminal.items.length !== 1) return undefined;
+  const projected = terminal.items[0]?.value;
+  if (!isRecord(projected) || !Object.hasOwn(projected, 'artifacts')) return undefined;
+  const parsed = harnessSubagentTerminalArtifactsSchema.safeParse(projected.artifacts);
+  return parsed.success ? parsed.data : undefined;
+}
+
+/**
  * Materialize caller-visible text from a framework terminal envelope without
  * searching arbitrary nested objects. This accepts the Harness direct-answer
  * envelope and explicitly opted-in domain tools, but never the outcome-report
@@ -557,6 +607,12 @@ export function parseHarnessTerminalToolResultText(value: unknown): string | und
 
   const terminal = parseGenericHarnessTerminalToolResult(value);
   if (terminal === undefined) return undefined;
+  if (terminal.items.length === 1) {
+    const projected = terminal.items[0]?.value;
+    if (isRecord(projected) && typeof projected.text === 'string' && isBoundedAnswerText(projected.text)) {
+      return projected.text;
+    }
+  }
   const text = tryFormatTerminalToolResultForModel(terminal);
   return text !== undefined && isBoundedAnswerText(text) ? text : undefined;
 }
@@ -653,6 +709,7 @@ export function projectHarnessSpawnSubagentResult(output: unknown): HarnessSubag
     kind: HARNESS_SUBAGENT_DIRECT_ANSWER_KIND,
     subagentSessionId,
     text: parsed.data.text,
+    ...(parsed.data.artifacts === undefined ? {} : { artifacts: parsed.data.artifacts }),
   };
 }
 
