@@ -155,14 +155,14 @@ verify_pf3553_reviewed_surface() (
 
 pf3759_config() {
   PF3759_HEAD_REPOSITORY="${PAPERSFLOW_PF3759_HEAD_REPOSITORY:-mbenhamd/mastra}"
-  PF3759_HEAD_REF="${PAPERSFLOW_PF3759_HEAD_REF:-feature/pf-3759-mastra-upstream-sync-3cf8e685-r3}"
+  PF3759_HEAD_REF="${PAPERSFLOW_PF3759_HEAD_REF:-feature/pf-3759-mastra-upstream-sync-3cf8e685-r6}"
   PF3759_BASE_REF="${PAPERSFLOW_PF3759_BASE_REF:-main}"
   PF3759_PENDING_MERGE_COMMIT='PENDING_PF3759_MERGE_COMMIT'
   PF3759_PENDING_REVIEWED_TREE='PENDING_PF3759_REVIEWED_TREE'
-  PF3759_MERGE_COMMIT="${PAPERSFLOW_PF3759_MERGE_COMMIT:-be11240bd6fe4d9d8116d51414fad6e9a9381f57}"
+  PF3759_MERGE_COMMIT="${PAPERSFLOW_PF3759_MERGE_COMMIT:-67f13be1abf22fb8545b97354c571e89744984aa}"
   PF3759_FORK_PARENT="${PAPERSFLOW_PF3759_FORK_PARENT:-ef6dab0a7183bb403918f4a63738987146935a00}"
   PF3759_UPSTREAM_PARENT="${PAPERSFLOW_PF3759_UPSTREAM_PARENT:-3cf8e68555e212f3465c5cbf12516e87709f7f5d}"
-  PF3759_REVIEWED_TREE="${PAPERSFLOW_PF3759_REVIEWED_TREE:-dfe1cbe8fceab9d2b28ba4c3af378dca9018870f}"
+  PF3759_REVIEWED_TREE="${PAPERSFLOW_PF3759_REVIEWED_TREE:-64f7f65c2e6767d83da065ef0053d7f3806dfe7d}"
   readonly \
     PF3759_HEAD_REPOSITORY PF3759_HEAD_REF PF3759_BASE_REF PF3759_MERGE_COMMIT \
     PF3759_FORK_PARENT PF3759_UPSTREAM_PARENT PF3759_REVIEWED_TREE \
@@ -2587,7 +2587,7 @@ run_pf3759_admission_self_tests() (
         GITHUB_OUTPUT= \
         BASE_SHA="$protected_base" HEAD_SHA="$fixture_head" PR_NUMBER=999 \
         HEAD_REPOSITORY=mbenhamd/mastra \
-        HEAD_REF=feature/pf-3759-mastra-upstream-sync-3cf8e685-r3 \
+        HEAD_REF=feature/pf-3759-mastra-upstream-sync-3cf8e685-r6 \
         BASE_REF=main \
         PAPERSFLOW_PF3759_MERGE_COMMIT="$reviewed_head" \
         PAPERSFLOW_PF3759_FORK_PARENT="$fork_parent" \
@@ -3356,6 +3356,7 @@ run_validator_self_tests() {
   local service_log
   local base_sha
   local head_sha
+  local server_root_core_imports_base_sha server_root_core_imports_head_sha
   local pf3553_base_sha pf3553_head_sha pf3553_lane_spoof_head_sha
   local pf3553_base_surface_sha256 pf3553_head_surface_sha256
   local inngest_trio_head_sha inngest_pf2050_head_sha inngest_manager_followup_head_sha
@@ -3422,6 +3423,7 @@ run_validator_self_tests() {
     'printf '\''%s\n'\'' "$*" >> "${MOCK_PNPM_LOG:?}"' \
     'printf '\''LLM_TEST_MODE=%s\t%s\n'\'' "${LLM_TEST_MODE:-}" "$*" >> "${MOCK_PNPM_ENVIRONMENT_LOG:?}"' \
     'printf '\''OPENAI_API_KEY=%s\t%s\n'\'' "${OPENAI_API_KEY:-}" "$*" >> "${MOCK_PNPM_ENVIRONMENT_LOG:?}"' \
+    'if [[ " $* " == *" check:core-imports "* && "${MOCK_FAIL_CORE_IMPORTS:-0}" == 1 ]]; then exit 23; fi' \
     'if [[ " $* " == *" check:permissions "* && "${MOCK_FAIL_PERMISSIONS:-0}" == 1 ]]; then exit 17; fi' \
     'if [[ " $* " == *" generate:route-types "* && "${MOCK_STALE_ROUTE_TYPES:-0}" == 1 ]]; then' \
     '  printf '\''%s\n'\'' "// regenerated" >> client-sdks/client-js/src/route-types.generated.ts' \
@@ -4190,6 +4192,44 @@ NODE
   assert_route_consumer_commands
   assert_contains 'src/server/server-adapter/schema-consistency.test.ts' "$command_log"
   assert_contains 'src/server/server-adapter/api-schema-manifest.test.ts' "$command_log"
+
+  server_root_core_imports_base_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' '{"scripts":{"check:core-imports":"tsx scripts/check-core-imports.ts"}}' > package.json
+    git add package.json
+    git commit -q -m 'root owns the core import check'
+    git rev-parse HEAD
+  )"
+  server_root_core_imports_head_sha="$(
+    cd "$fixture_repo"
+    printf '%s\n' "export const route = 'head';" > packages/server/src/server/server-adapter/routes/index.ts
+    git add packages/server/src/server/server-adapter/routes/index.ts
+    git commit -q -m 'server route change with root core import check'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/server-root-core-imports-success.log"
+  run_fixture "$server_root_core_imports_head_sha" "$output" BASE_SHA="$server_root_core_imports_base_sha"
+  assert_line_count 2 'run check:core-imports packages/server' "$command_log"
+  assert_not_contains '--filter ./packages/server --fail-if-no-match check:core-imports' "$command_log"
+  assert_not_contains '--filter @mastra/server check:core-imports' "$command_log"
+
+  : > "$command_log"
+  output="$test_root/server-root-core-imports-failure.log"
+  set +e
+  run_fixture "$server_root_core_imports_head_sha" "$output" \
+    BASE_SHA="$server_root_core_imports_base_sha" MOCK_FAIL_CORE_IMPORTS=1
+  status=$?
+  set -e
+  if (( status != 23 )); then
+    echo 'Root core import check failure did not propagate its exit status.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_line_count 1 'run check:core-imports packages/server' "$command_log"
+  assert_not_contains '--filter ./packages/server --fail-if-no-match check:core-imports' "$command_log"
+  assert_not_contains '--filter @mastra/server check:core-imports' "$command_log"
 
   head_sha="$(
     cd "$fixture_repo"
@@ -8570,7 +8610,9 @@ run_pf3759_upstream_sync_validation() {
       src/processors/observational-memory/__tests__/sync-end-of-turn-observation.test.ts
   run_with_validation_budget 600 \
     pnpm --dir workspaces/platform-workspace exec vitest run --reporter=dot \
-      src/sandbox.test.ts src/provider.test.ts src/template-compatibility.test.ts
+      src/sandbox.test.ts src/provider.test.ts
+  run_with_validation_budget 600 \
+    pnpm --filter @mastra/platform-workspace --fail-if-no-match test:types
   run_with_validation_budget 600 \
     pnpm --dir stores/valkey exec vitest run --reporter=dot src/index.test.ts
   run_with_validation_budget 600 \
@@ -11716,6 +11758,26 @@ if grep -Fxq 'client-sdks/client-js/src/index.ts' "$changed_files"; then
   check_client_index_entrypoint_contract
 fi
 
+run_standard_server_core_imports_check() {
+  local maximum_seconds="$1"
+  shift
+  local root_owns_check
+
+  # Read ownership as data; do not load a PR's check script to select its lane.
+  root_owns_check="$(node - "$VALIDATOR_REPOSITORY_ROOT/package.json" <<'NODE'
+const fs = require('node:fs');
+const manifest = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+process.stdout.write(String(Object.hasOwn(manifest.scripts ?? {}, 'check:core-imports')));
+NODE
+)" || return
+
+  if [[ "$root_owns_check" == true ]]; then
+    run_with_validation_budget "$maximum_seconds" pnpm run check:core-imports packages/server
+  else
+    run_with_validation_budget "$maximum_seconds" pnpm "$@" check:core-imports
+  fi
+}
+
 server_prerequisites_built=false
 ensure_server_prerequisites() {
   if [[ "$server_prerequisites_built" == true ]]; then
@@ -11867,7 +11929,7 @@ if workspace_changed packages/server; then
   ensure_server_prerequisites
   run_with_validation_budget 600 pnpm --filter ./packages/server --fail-if-no-match exec tsc --noEmit
   run_with_validation_budget 600 pnpm --filter ./packages/server --fail-if-no-match lint
-  run_with_validation_budget 300 pnpm --filter ./packages/server --fail-if-no-match check:core-imports
+  run_standard_server_core_imports_check 300 --filter ./packages/server --fail-if-no-match
 fi
 
 if workspace_changed packages/deployer; then
@@ -11945,7 +12007,7 @@ fi
 if workspace_changed packages/server; then
   run_with_validation_budget 900 pnpm build:server
   run_with_validation_budget 600 pnpm --filter @mastra/server lint
-  run_with_validation_budget 600 pnpm --filter @mastra/server check:core-imports
+  run_standard_server_core_imports_check 600 --filter @mastra/server
   run_with_validation_budget 300 pnpm --filter @mastra/server check:permissions
   if grep -Fxq 'packages/server/src/server/server-adapter/routes/permissions.ts' "$changed_files" || \
     grep -Fxq 'packages/core/src/auth/ee/interfaces/permissions.generated.ts' "$changed_files"; then
