@@ -4047,7 +4047,7 @@ NODE
   done
 
   for rejected_case in types-builder-source agent-builder-source nested-test types-builder-manifest \
-    deleted-generator symlink-generator deleted-builder symlink-builder; do
+    deleted-generator symlink-generator excluded-generator deleted-builder symlink-builder; do
     head_sha="$(
       cd "$fixture_repo"
       git reset -q --hard "$package_contract_base_sha"
@@ -4058,6 +4058,11 @@ NODE
         types-builder-manifest) printf '%s\n' '{"private":false}' > packages/_types-builder/package.json ;;
         deleted-generator) rm scripts/types-builder.test.ts ;;
         symlink-generator) rm scripts/types-builder.test.ts; ln -s missing.test.ts scripts/types-builder.test.ts ;;
+        excluded-generator)
+          printf '%s\n' 'export const generateTypes = false;' > packages/_types-builder/src/index.js
+          printf '%s\n' '{"compilerOptions":{"strict":true,"noUncheckedIndexedAccess":true},"include":["types-builder.test.ts"],"exclude":["types-builder.test.ts"]}' \
+            > scripts/tsconfig.json
+          ;;
         deleted-builder) rm packages/agent-builder/src/agent-builder.test.ts ;;
         symlink-builder) rm packages/agent-builder/src/agent-builder.test.ts; ln -s missing.test.ts packages/agent-builder/src/agent-builder.test.ts ;;
       esac
@@ -11544,6 +11549,27 @@ while IFS= read -r file; do
       ;;
   esac
 done < "$changed_files"
+
+if [[ "$types_builder_changed" == true ]]; then
+  if ! node - "$TYPESCRIPT_MODULE_PATH" <<'NODE'
+const path = require('node:path');
+const ts = require(process.argv[2]);
+const project = ts.getParsedCommandLineOfConfigFile('scripts/tsconfig.json', {}, {
+  ...ts.sys,
+  onUnRecoverableConfigFileDiagnostic(diagnostic) {
+    console.error(ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n'));
+  },
+});
+if (!project || project.errors.length > 0 ||
+  !project.fileNames.includes(path.resolve('scripts/types-builder.test.ts'))) {
+  console.error('Generator validation requires scripts/types-builder.test.ts in the resolved scripts TypeScript project.');
+  process.exit(1);
+}
+NODE
+  then
+    printf '%s\n' 'scripts/tsconfig.json' >> "$unsupported_owned_workspace_sources"
+  fi
+fi
 
 # The Client SDK is admitted only through exact source-and-test ownership.
 # Generated route types remain owned by the Server generator path above.
