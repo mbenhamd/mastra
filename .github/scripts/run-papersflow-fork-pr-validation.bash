@@ -4164,6 +4164,7 @@ NODE
         exit 1
       fi
       assert_contains 'Running changed test file in full: packages/server/src/server/handlers/favorites.integration.test.ts' "$output"
+      schema_runtime_base_sha="$head_sha"
     else
       if run_fixture "$head_sha" "$output" BASE_SHA="$schema_runtime_base_sha"; then
         echo "Unsupported native schema import unexpectedly passed: $schema_runtime_case" >&2
@@ -13142,10 +13143,14 @@ function unsupportedRuntimeReasons(file, source) {
     if (reason && !(baseSource !== undefined && baseSpecifiers.has(specifier))) {
       reasons.add(`module ${reason}`);
     }
+    // The Tool Builder approval names one export, so it remains scoped after
+    // that import reaches the trusted base.
     if (
       exactTestEntries.has(entryFile) &&
       !specifier.startsWith('.') &&
-      (!wasReachableFromExactTest || !baseSpecifiers.has(specifier)) &&
+      (!wasReachableFromExactTest || !baseSpecifiers.has(specifier) ||
+        (specifier === '@internal/ai-v6' &&
+          repositoryPath(file) === 'packages/core/src/tools/tool-builder/builder.ts')) &&
       !approvedExactExternalSpecifier(specifier, file, runtimeOccurrences.get(specifier))
     ) {
       reasons.add(`unreviewed external module ${specifier}`);
