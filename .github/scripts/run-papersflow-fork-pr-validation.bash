@@ -155,14 +155,14 @@ verify_pf3553_reviewed_surface() (
 
 pf3759_config() {
   PF3759_HEAD_REPOSITORY="${PAPERSFLOW_PF3759_HEAD_REPOSITORY:-mbenhamd/mastra}"
-  PF3759_HEAD_REF="${PAPERSFLOW_PF3759_HEAD_REF:-feature/pf-3759-mastra-upstream-sync-3cf8e685-r8}"
+  PF3759_HEAD_REF="${PAPERSFLOW_PF3759_HEAD_REF:-feature/pf-3759-mastra-upstream-sync-3cf8e685-r11}"
   PF3759_BASE_REF="${PAPERSFLOW_PF3759_BASE_REF:-main}"
   PF3759_PENDING_MERGE_COMMIT='PENDING_PF3759_MERGE_COMMIT'
   PF3759_PENDING_REVIEWED_TREE='PENDING_PF3759_REVIEWED_TREE'
-  PF3759_MERGE_COMMIT="${PAPERSFLOW_PF3759_MERGE_COMMIT:-37749cd063df354c787bfbae1ca22d1b636c4382}"
+  PF3759_MERGE_COMMIT="${PAPERSFLOW_PF3759_MERGE_COMMIT:-ec0de7726251d200d9d68ef41a1798b21d449db1}"
   PF3759_FORK_PARENT="${PAPERSFLOW_PF3759_FORK_PARENT:-ef6dab0a7183bb403918f4a63738987146935a00}"
   PF3759_UPSTREAM_PARENT="${PAPERSFLOW_PF3759_UPSTREAM_PARENT:-3cf8e68555e212f3465c5cbf12516e87709f7f5d}"
-  PF3759_REVIEWED_TREE="${PAPERSFLOW_PF3759_REVIEWED_TREE:-9c0b1818a5797d2aae6254e3a6d604e623b509dc}"
+  PF3759_REVIEWED_TREE="${PAPERSFLOW_PF3759_REVIEWED_TREE:-f4903f29f0a924f08ec7a5f531c647b0ac1700f1}"
   readonly \
     PF3759_HEAD_REPOSITORY PF3759_HEAD_REF PF3759_BASE_REF PF3759_MERGE_COMMIT \
     PF3759_FORK_PARENT PF3759_UPSTREAM_PARENT PF3759_REVIEWED_TREE \
@@ -2587,7 +2587,7 @@ run_pf3759_admission_self_tests() (
         GITHUB_OUTPUT= \
         BASE_SHA="$protected_base" HEAD_SHA="$fixture_head" PR_NUMBER=999 \
         HEAD_REPOSITORY=mbenhamd/mastra \
-        HEAD_REF=feature/pf-3759-mastra-upstream-sync-3cf8e685-r8 \
+        HEAD_REF=feature/pf-3759-mastra-upstream-sync-3cf8e685-r11 \
         BASE_REF=main \
         PAPERSFLOW_PF3759_MERGE_COMMIT="$reviewed_head" \
         PAPERSFLOW_PF3759_FORK_PARENT="$fork_parent" \
@@ -8608,6 +8608,8 @@ run_pf3759_upstream_sync_validation() {
   run_with_validation_budget 600 \
     pnpm --dir packages/core exec vitest run --reporter=dot \
       src/storage/workflow-snapshot.test.ts \
+      src/workflows/dynamic/validate/index.test.ts \
+      src/mastra/add-dynamic-workflows-bundle.test.ts \
       src/workflows/scheduler/definition-hash.test.ts \
       src/loop/workflows/prune-snapshot.test.ts \
       src/loop/test-utils/aimock/scenarios/evented-sequential-approval.scenario.test.ts
