@@ -39,7 +39,7 @@ it('preserves native module resolution in generated declarations', async () => {
       ['module.d.ts', "export type ModuleJs = 'wrong';\n"],
       ['script.d.ts', "export type ScriptJs = 'script';\n"],
       ['script.d.cts', "export type ScriptJs = 'wrong';\n"],
-    ]) {
+    ] as const) {
       await writeFile(join(dependency, file), declaration);
     }
     await mkdir(join(root, 'src', 'utils'), { recursive: true });
