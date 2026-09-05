@@ -155,14 +155,14 @@ verify_pf3553_reviewed_surface() (
 
 pf3759_config() {
   PF3759_HEAD_REPOSITORY="${PAPERSFLOW_PF3759_HEAD_REPOSITORY:-mbenhamd/mastra}"
-  PF3759_HEAD_REF="${PAPERSFLOW_PF3759_HEAD_REF:-feature/pf-3759-mastra-upstream-sync-3cf8e685-r6}"
+  PF3759_HEAD_REF="${PAPERSFLOW_PF3759_HEAD_REF:-feature/pf-3759-mastra-upstream-sync-3cf8e685-r7}"
   PF3759_BASE_REF="${PAPERSFLOW_PF3759_BASE_REF:-main}"
   PF3759_PENDING_MERGE_COMMIT='PENDING_PF3759_MERGE_COMMIT'
   PF3759_PENDING_REVIEWED_TREE='PENDING_PF3759_REVIEWED_TREE'
-  PF3759_MERGE_COMMIT="${PAPERSFLOW_PF3759_MERGE_COMMIT:-67f13be1abf22fb8545b97354c571e89744984aa}"
+  PF3759_MERGE_COMMIT="${PAPERSFLOW_PF3759_MERGE_COMMIT:-8272c48ffddcf31b715bbe771b8e96f98cf7f7f8}"
   PF3759_FORK_PARENT="${PAPERSFLOW_PF3759_FORK_PARENT:-ef6dab0a7183bb403918f4a63738987146935a00}"
   PF3759_UPSTREAM_PARENT="${PAPERSFLOW_PF3759_UPSTREAM_PARENT:-3cf8e68555e212f3465c5cbf12516e87709f7f5d}"
-  PF3759_REVIEWED_TREE="${PAPERSFLOW_PF3759_REVIEWED_TREE:-64f7f65c2e6767d83da065ef0053d7f3806dfe7d}"
+  PF3759_REVIEWED_TREE="${PAPERSFLOW_PF3759_REVIEWED_TREE:-8cea2048512de09574a82da9d493cac461875213}"
   readonly \
     PF3759_HEAD_REPOSITORY PF3759_HEAD_REF PF3759_BASE_REF PF3759_MERGE_COMMIT \
     PF3759_FORK_PARENT PF3759_UPSTREAM_PARENT PF3759_REVIEWED_TREE \
@@ -2587,7 +2587,7 @@ run_pf3759_admission_self_tests() (
         GITHUB_OUTPUT= \
         BASE_SHA="$protected_base" HEAD_SHA="$fixture_head" PR_NUMBER=999 \
         HEAD_REPOSITORY=mbenhamd/mastra \
-        HEAD_REF=feature/pf-3759-mastra-upstream-sync-3cf8e685-r6 \
+        HEAD_REF=feature/pf-3759-mastra-upstream-sync-3cf8e685-r7 \
         BASE_REF=main \
         PAPERSFLOW_PF3759_MERGE_COMMIT="$reviewed_head" \
         PAPERSFLOW_PF3759_FORK_PARENT="$fork_parent" \
@@ -8605,6 +8605,14 @@ run_pf3759_upstream_sync_validation() {
       src/stream/base/output.test.ts \
       src/storage/domains/workflows/inmemory-persist.test.ts \
       src/storage/types.test.ts
+  run_with_validation_budget 600 \
+    pnpm --dir packages/core exec vitest run --reporter=dot \
+      src/storage/workflow-snapshot.test.ts \
+      src/workflows/scheduler/definition-hash.test.ts \
+      src/loop/workflows/prune-snapshot.test.ts \
+      src/loop/test-utils/aimock/scenarios/evented-sequential-approval.scenario.test.ts
+  run_with_validation_budget 600 \
+    pnpm --dir stores/convex exec vitest run --reporter=dot src/server/storage.test.ts
   run_with_validation_budget 600 \
     pnpm --dir packages/memory exec vitest run --reporter=dot \
       src/processors/observational-memory/__tests__/sync-end-of-turn-observation.test.ts
