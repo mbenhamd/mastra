@@ -1,5 +1,6 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { MessageList } from '../../agent/message-list';
+import { ConsoleLogger } from '../../logger';
 import { Mastra } from '../../mastra';
 import type { Processor, ProcessorStreamWriter } from '../../processors';
 import { InMemoryStore } from '../../storage';
@@ -11,6 +12,7 @@ import type { ChunkType } from '../../stream/types';
 // invoke it directly in tests without spinning up a real agentic loop.
 let capturedOutputWriter: ((chunk: ChunkType, options?: { messageId?: string }) => Promise<void>) | undefined;
 let capturedCreateRunArgs: any;
+const { deleteAgenticLoopRun } = vi.hoisted(() => ({ deleteAgenticLoopRun: vi.fn() }));
 
 vi.mock('./agentic-loop', () => ({
   createAgenticLoopWorkflow: (params: any) => {
@@ -18,9 +20,10 @@ vi.mock('./agentic-loop', () => ({
 
     return {
       id: 'agentic-loop',
+      __markInternal: vi.fn(),
       __registerMastra: vi.fn(),
       __registerPrimitives: vi.fn(),
-      deleteWorkflowRunById: vi.fn().mockResolvedValue(undefined),
+      deleteWorkflowRunById: deleteAgenticLoopRun,
       createRun: vi.fn().mockImplementation(async (args: any) => {
         capturedCreateRunArgs = args;
         return {
@@ -55,7 +58,19 @@ vi.mock('./agentic-loop', () => ({
 
 const { workflowLoopStream } = await import('./stream');
 
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>(r => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
 describe('workflowLoopStream', () => {
+  beforeEach(() => {
+    deleteAgenticLoopRun.mockReset().mockResolvedValue(undefined);
+  });
+
   it('should pass a defined writer to output processors when processing data-* chunks', async () => {
     let receivedWriter: ProcessorStreamWriter | undefined;
 
@@ -132,7 +147,7 @@ describe('workflowLoopStream', () => {
     expect(capturedCreateRunArgs.resourceId).toBe('user-abc-123');
   });
 
-  it('deletes the evented nested execution row by its retained child run id', async () => {
+  it('starts independent snapshot deletions after lookup and waits for the parent before finish', async () => {
     const mastra = new Mastra({ logger: false, storage: new InMemoryStore() });
     const workflowsStore = (await mastra.getStorage()!.getStore('workflows'))!;
     const runId = 'run-cleanup';
@@ -151,7 +166,27 @@ describe('workflowLoopStream', () => {
         } as any,
       },
     });
-    const deleteWorkflowRunById = vi.spyOn(workflowsStore, 'deleteWorkflowRunById');
+    for (const executionRunId of [runId, nestedRunId]) {
+      await workflowsStore.persistWorkflowSnapshot({
+        workflowName: 'executionWorkflow',
+        runId: executionRunId,
+        snapshot: createEmptyWorkflowSnapshot(executionRunId),
+      });
+    }
+    const lookup = deferred();
+    const parentDeletion = deferred();
+    const childDeletions = deferred();
+    const getRun = workflowsStore.getWorkflowRunById.bind(workflowsStore);
+    const deleteRun = workflowsStore.deleteWorkflowRunById.bind(workflowsStore);
+    const lookupSpy = vi.spyOn(workflowsStore, 'getWorkflowRunById').mockImplementation(async args => {
+      await lookup.promise;
+      return getRun(args);
+    });
+    deleteAgenticLoopRun.mockImplementation(() => parentDeletion.promise);
+    const deleteWorkflowRunById = vi.spyOn(workflowsStore, 'deleteWorkflowRunById').mockImplementation(async args => {
+      await childDeletions.promise;
+      await deleteRun(args);
+    });
 
     const stream = workflowLoopStream({
       mastra,
@@ -166,14 +201,108 @@ describe('workflowLoopStream', () => {
       methodType: 'stream',
     });
 
-    for await (const _chunk of stream) {
-      // consume
+    const chunks: ChunkType[] = [];
+    const consume = (async () => {
+      for await (const chunk of stream) chunks.push(chunk);
+    })();
+    try {
+      await vi.waitFor(() => expect(lookupSpy).toHaveBeenCalledOnce());
+      expect(deleteAgenticLoopRun).not.toHaveBeenCalled();
+      expect(deleteWorkflowRunById).not.toHaveBeenCalled();
+      lookup.resolve();
+      await vi.waitFor(() => expect(deleteWorkflowRunById).toHaveBeenCalledTimes(2));
+      expect(deleteAgenticLoopRun).toHaveBeenCalledExactlyOnceWith(runId);
+      expect(deleteWorkflowRunById.mock.calls).toEqual([
+        [{ workflowName: 'executionWorkflow', runId }],
+        [{ workflowName: 'executionWorkflow', runId: nestedRunId }],
+      ]);
+      expect(chunks.some(chunk => chunk.type === 'finish')).toBe(false);
+      childDeletions.resolve();
+      await vi.waitFor(async () => {
+        expect(await getRun({ workflowName: 'executionWorkflow', runId: nestedRunId })).toBeNull();
+      });
+      expect(chunks.some(chunk => chunk.type === 'finish')).toBe(false);
+      parentDeletion.resolve();
+      await consume;
+      expect(chunks.filter(chunk => chunk.type === 'finish')).toHaveLength(1);
+      expect(chunks.some(chunk => chunk.type === 'error')).toBe(false);
+    } finally {
+      lookup.resolve();
+      parentDeletion.resolve();
+      childDeletions.resolve();
+      await consume;
+      await mastra.shutdown();
     }
+  });
 
-    expect(deleteWorkflowRunById).toHaveBeenCalledWith({
-      workflowName: 'executionWorkflow',
-      runId: nestedRunId,
+  it('attempts every snapshot deletion after failures and waits for the remaining child before finish', async () => {
+    const mastra = new Mastra({ logger: false, storage: new InMemoryStore() });
+    const workflowsStore = (await mastra.getStorage()!.getStore('workflows'))!;
+    const runId = 'run-cleanup-failure';
+    const nestedRunId = 'wfn:v1:nested-cleanup-failure';
+    await workflowsStore.persistWorkflowSnapshot({
+      workflowName: 'agentic-loop',
+      runId,
+      snapshot: {
+        ...createEmptyWorkflowSnapshot(runId),
+        status: 'suspended',
+        context: {
+          executionWorkflow: { status: 'suspended', metadata: { nestedRunId } },
+        } as any,
+      },
     });
-    await mastra.shutdown();
+    const parentError = new Error('parent deletion failed');
+    const childError = new Error('child deletion failed');
+    const remainingChild = deferred();
+    deleteAgenticLoopRun.mockRejectedValue(parentError);
+    const deleteWorkflowRunById = vi.spyOn(workflowsStore, 'deleteWorkflowRunById').mockImplementation(async args => {
+      if (args.runId === runId) throw childError;
+      await remainingChild.promise;
+    });
+    const logger = new ConsoleLogger({ level: 'error' });
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    const stream = workflowLoopStream({
+      mastra,
+      logger,
+      messageId: 'msg-cleanup-failure',
+      runId,
+      startTimestamp: Date.now(),
+      agentId: 'test-agent',
+      messageList: new MessageList({ threadId: 'test-thread' }),
+      models: [{ model: {} as any, toolChoice: undefined }],
+      _internal: {},
+      streamState: { serialize: () => ({}), deserialize: () => {} },
+      methodType: 'stream',
+    });
+    const chunks: ChunkType[] = [];
+    const consume = (async () => {
+      for await (const chunk of stream) chunks.push(chunk);
+    })();
+    try {
+      await vi.waitFor(() => expect(deleteWorkflowRunById).toHaveBeenCalledTimes(2));
+      expect(deleteAgenticLoopRun).toHaveBeenCalledExactlyOnceWith(runId);
+      expect(deleteWorkflowRunById.mock.calls).toEqual([
+        [{ workflowName: 'executionWorkflow', runId }],
+        [{ workflowName: 'executionWorkflow', runId: nestedRunId }],
+      ]);
+      expect(warn).toHaveBeenCalledWith('Failed to delete agentic-loop snapshot after terminal state', {
+        runId,
+        error: parentError,
+      });
+      expect(warn).toHaveBeenCalledWith('Failed to delete nested agent execution snapshot after terminal state', {
+        runId,
+        executionRunId: runId,
+        error: childError,
+      });
+      expect(chunks.some(chunk => chunk.type === 'finish')).toBe(false);
+      remainingChild.resolve();
+      await consume;
+      expect(chunks.filter(chunk => chunk.type === 'finish')).toHaveLength(1);
+      expect(chunks.some(chunk => chunk.type === 'error')).toBe(false);
+    } finally {
+      remainingChild.resolve();
+      await consume;
+      await mastra.shutdown();
+    }
   });
 });
