@@ -204,10 +204,13 @@ export async function generateTypes(rootDir, bundledPackages = new Set()) {
 
         modified = true;
 
-        // if the import is a directory, append /index.js to it, else just add .js
+        // Match TypeScript's file-before-directory resolution for extensionless imports.
         try {
-          // console.log('statfsSync', path.join(path.dirname(fullPath), p));
-          if (statSync(path.join(path.dirname(fullPath), p)).isDirectory()) {
+          const resolvedPath = path.join(path.dirname(fullPath), p);
+          if (statSync(`${resolvedPath}.d.ts`, { throwIfNoEntry: false })?.isFile()) {
+            return `'${p}.js'`;
+          }
+          if (statSync(resolvedPath).isDirectory()) {
             return `'${p}/index.js'`;
           }
         } catch {

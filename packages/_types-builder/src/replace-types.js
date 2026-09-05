@@ -109,6 +109,9 @@ async function resolveRelativeDeclaration(moduleSpecifier, fromFile) {
   if (moduleSpecifier.endsWith('.d.ts') || moduleSpecifier.endsWith('.d.cts') || moduleSpecifier.endsWith('.d.mts')) {
     candidates.push(resolvedSpecifier);
   } else if (moduleSpecifier.endsWith('.js') || moduleSpecifier.endsWith('.mjs') || moduleSpecifier.endsWith('.cjs')) {
+    if (moduleSpecifier.endsWith('.mjs') || moduleSpecifier.endsWith('.cjs')) {
+      candidates.push(resolvedSpecifier.replace(/\.([cm])js$/, '.d.$1ts'));
+    }
     candidates.push(resolvedSpecifier.replace(/\.(mjs|cjs|js)$/, '.d.ts'));
     candidates.push(resolvedSpecifier.replace(/\.(mjs|cjs|js)$/, '.d.mts'));
     candidates.push(resolvedSpecifier.replace(/\.(mjs|cjs|js)$/, '.d.cts'));

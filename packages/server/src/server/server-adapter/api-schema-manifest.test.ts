@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { apiSchemaManifestResponseSchema } from '../schemas/system';
 import { buildApiSchemaManifest } from './api-schema-manifest';
 
 const apiSchemaManifest = buildApiSchemaManifest();
@@ -79,6 +80,8 @@ describe('apiSchemaManifest', () => {
   });
 
   it('converts path, query, and body route schemas to JSON Schema', () => {
+    expect(apiSchemaManifestResponseSchema.parse(apiSchemaManifest)).toEqual(apiSchemaManifest);
+
     const getAgent = apiSchemaManifest.routes.find(
       route => route.method === 'GET' && route.path === '/agents/:agentId',
     );

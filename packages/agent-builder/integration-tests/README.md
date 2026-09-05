@@ -30,6 +30,19 @@ Lightweight tests with mocked dependencies that validate:
 
 ## Running Tests
 
+### Typechecks (no API key required)
+
+The `@mastra/agent-builder` workspace package owns the dependencies used to typecheck the fixture source. From the repository root, run:
+
+```bash
+pnpm install --frozen-lockfile
+pnpm turbo build --filter=@mastra/agent-builder...
+pnpm --filter @mastra/agent-builder check
+pnpm --filter @mastra/agent-builder check:fixtures
+```
+
+The package check retains its existing fixture coverage. The dedicated fixture check compiles `src/fixtures/**/*` with the same compiler settings and built workspace dependencies. Both checks run without starting servers, calling providers, or installing the copied fixture's dependencies.
+
 ### Prerequisites
 
 - Node.js and pnpm installed
