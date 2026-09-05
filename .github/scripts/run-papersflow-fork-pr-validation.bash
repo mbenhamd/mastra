@@ -1037,6 +1037,79 @@ emit_validation_lane() {
   fi
 }
 
+verify_agent_builder_fixture_config() {
+  git_regular_file_at_revision "$1" packages/agent-builder/tsconfig.fixtures.json || return 1
+  node - "$1" <<'NODE'
+const { execFileSync } = require('node:child_process');
+const { isDeepStrictEqual } = require('node:util');
+const config = JSON.parse(execFileSync('git', [
+  'show', `${process.argv[2]}:packages/agent-builder/tsconfig.fixtures.json`,
+], { encoding: 'utf8' }));
+if (!isDeepStrictEqual(config, {
+  extends: './tsconfig.json',
+  include: ['integration-tests/src/fixtures/**/*'],
+})) {
+  throw new Error('Agent Builder fixture checking must inherit the package project and include every fixture source.');
+}
+NODE
+}
+
+verify_agent_builder_fixture_dependency() {
+  local base_sha="$1" head_sha="$2" file
+  for file in packages/agent-builder/package.json pnpm-lock.yaml; do
+    git_regular_file_at_revision "$base_sha" "$file" || return 1
+    git_regular_file_at_revision "$head_sha" "$file" || return 1
+  done
+  verify_agent_builder_fixture_config "$head_sha" || return 1
+  node - "$base_sha" "$head_sha" <<'NODE'
+const { execFileSync } = require('node:child_process');
+const { isDeepStrictEqual } = require('node:util');
+const [baseSha, headSha] = process.argv.slice(2);
+const readAt = (sha, file) => execFileSync('git', ['show', `${sha}:${file}`], {
+  encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
+});
+const manifestPath = 'packages/agent-builder/package.json';
+const before = JSON.parse(readAt(baseSha, manifestPath));
+const after = JSON.parse(readAt(headSha, manifestPath));
+if (Object.hasOwn(before.scripts ?? {}, 'check:fixtures') ||
+  Object.hasOwn(before.devDependencies ?? {}, '@mastra/mcp')) {
+  throw new Error('Agent Builder fixture admission only adds its owning check and existing MCP workspace dependency.');
+}
+const expected = structuredClone(before);
+expected.scripts = { ...expected.scripts, 'check:fixtures': 'tsc --noEmit --project tsconfig.fixtures.json' };
+expected.devDependencies = { ...expected.devDependencies, '@mastra/mcp': 'workspace:*' };
+if (!isDeepStrictEqual(after, expected)) {
+  throw new Error('Agent Builder package.json changed outside the owned fixture script and MCP devDependency.');
+}
+
+// Remove the one new workspace link from the proposed lockfile and require
+// the complete remaining file to equal the base, including every other graph.
+const lines = readAt(headSha, 'pnpm-lock.yaml').split('\n');
+const importer = lines.indexOf('  packages/agent-builder:');
+if (importer < 0 || lines.lastIndexOf('  packages/agent-builder:') !== importer) {
+  throw new Error('Agent Builder lockfile importer is missing or ambiguous.');
+}
+let end = importer + 1;
+while (end < lines.length && (lines[end] === '' || lines[end].startsWith('    '))) end += 1;
+const devDependencies = lines.indexOf('    devDependencies:', importer + 1);
+if (devDependencies < 0 || devDependencies >= end) {
+  throw new Error('Agent Builder lockfile devDependencies are missing.');
+}
+let devEnd = devDependencies + 1;
+while (devEnd < end && (lines[devEnd] === '' || lines[devEnd].startsWith('      '))) devEnd += 1;
+const dependency = lines.indexOf("      '@mastra/mcp':", devDependencies + 1);
+if (dependency < 0 || dependency >= devEnd ||
+  lines[dependency + 1] !== '        specifier: workspace:*' ||
+  lines[dependency + 2] !== '        version: link:../mcp') {
+  throw new Error('Agent Builder must resolve its MCP fixture dependency to the existing workspace package.');
+}
+lines.splice(dependency, 3);
+if (lines.join('\n') !== readAt(baseSha, 'pnpm-lock.yaml')) {
+  throw new Error('Agent Builder fixture admission may only add its MCP importer link to pnpm-lock.yaml.');
+}
+NODE
+}
+
 classify_install_lane() (
   : "${BASE_SHA:?BASE_SHA is required}"
   : "${HEAD_SHA:?HEAD_SHA is required}"
@@ -1046,7 +1119,8 @@ classify_install_lane() (
   trap 'rm -f "$manifest_changes"' EXIT
   git diff --no-renames --name-only "${BASE_SHA}...${HEAD_SHA}" -- \
     .npmrc .pnpmfile.cjs pnpmfile.cjs package.json pnpm-workspace.yaml \
-    patches packages/server/package.json server-adapters/fastify/package.json |
+    patches packages/server/package.json server-adapters/fastify/package.json \
+    packages/_types-builder/package.json packages/agent-builder/package.json |
     sort -u > "$manifest_changes"
 
   # PF-3759 is frozen to one reviewed merge commit, tree, branch, repository,
@@ -1161,6 +1235,12 @@ classify_install_lane() (
   fi
 
   if [[ ! -s "$manifest_changes" ]]; then
+    emit_validation_lane standard
+    return
+  fi
+
+  if [[ "$(cat "$manifest_changes")" == 'packages/agent-builder/package.json' ]]; then
+    verify_agent_builder_fixture_dependency "$(git merge-base "$BASE_SHA" "$HEAD_SHA")" "$HEAD_SHA"
     emit_validation_lane standard
     return
   fi
@@ -3364,12 +3444,15 @@ run_validator_self_tests() {
   local fixture_inngest_compose_blob fixture_inngest_compose_sha
   local fixture_inngest_adapter_blob fixture_inngest_adapter_sha
   local temporal_build_line temporal_typecheck_line
+  local package_contract_dependency_base_sha package_contract_base_sha package_contract_head_sha rejected_case failed_command
   local output
   local status
 
   # Keep the dedicated manifest/dependency admission suite in the aggregate
   # validator self-test as well as exposing it through its focused entrypoint.
-  run_pf3553_admission_self_tests
+  if [[ "${1:-}" != '--package-contracts-only' ]]; then
+    run_pf3553_admission_self_tests
+  fi
 
   validator_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
   test_root="$(mktemp -d)"
@@ -3392,6 +3475,10 @@ run_validator_self_tests() {
     "$fixture_repo/packages/core/src/agent/__tests__" \
     "$fixture_repo/packages/core/src/agent/durable/__tests__" \
     "$fixture_repo/packages/core/src/harness/v1" \
+    "$fixture_repo/packages/_types-builder/src" \
+    "$fixture_repo/packages/agent-builder/src" \
+    "$fixture_repo/packages/agent-builder/integration-tests/src" \
+    "$fixture_repo/scripts" \
     "$fixture_repo/packages/server/src/server/handlers" \
     "$fixture_repo/packages/server/src/server/server-adapter/routes" \
     "$fixture_repo/pubsub/google-cloud-pubsub/src" \
@@ -3425,6 +3512,8 @@ run_validator_self_tests() {
     'printf '\''OPENAI_API_KEY=%s\t%s\n'\'' "${OPENAI_API_KEY:-}" "$*" >> "${MOCK_PNPM_ENVIRONMENT_LOG:?}"' \
     'if [[ " $* " == *" check:core-imports "* && "${MOCK_FAIL_CORE_IMPORTS:-0}" == 1 ]]; then exit 23; fi' \
     'if [[ " $* " == *" check:permissions "* && "${MOCK_FAIL_PERMISSIONS:-0}" == 1 ]]; then exit 17; fi' \
+    'if [[ -n "${MOCK_FAIL_PACKAGE_CONTRACT_COMMAND:-}" && "$*" == "$MOCK_FAIL_PACKAGE_CONTRACT_COMMAND" ]]; then exit 29; fi' \
+    'if [[ -n "${MOCK_FAIL_PACKAGE_CONTRACT_TEST:-}" && " $* " == *" $MOCK_FAIL_PACKAGE_CONTRACT_TEST "* ]]; then exit 31; fi' \
     'if [[ " $* " == *" generate:route-types "* && "${MOCK_STALE_ROUTE_TYPES:-0}" == 1 ]]; then' \
     '  printf '\''%s\n'\'' "// regenerated" >> client-sdks/client-js/src/route-types.generated.ts' \
     'fi' \
@@ -3454,7 +3543,9 @@ run_validator_self_tests() {
     'for argument in "$@"; do' \
     '  case "$argument" in' \
     '    --outputFile.json=*)' \
-    '      if [[ " $* " == *" --typecheck.only "* ]]; then' \
+    '      if [[ -n "${MOCK_ZERO_PACKAGE_CONTRACT_TEST:-}" && " $* " == *" $MOCK_ZERO_PACKAGE_CONTRACT_TEST "* ]]; then' \
+    '        printf '\''%s\n'\'' '\''{"numPassedTests":0,"numFailedTests":0}'\'' > "${argument#*=}"' \
+    '      elif [[ " $* " == *" --typecheck.only "* ]]; then' \
     '        case "${MOCK_TYPE_TEST_REPORT:-pass}" in' \
     '          zero) printf '\''%s\n'\'' '\''{"numPassedTests":0,"numFailedTests":0}'\'' > "${argument#*=}" ;;' \
     '          partial) printf '\''%s\n'\'' '\''{"numPassedTests":1}'\'' > "${argument#*=}" ;;' \
@@ -3554,6 +3645,22 @@ run_validator_self_tests() {
       'void indexObservationGroupsFromMessages(memory, {});' \
       > mastracode/sdk/scripts/index-messages.ts
     printf '%s\n' '{}' > packages/cli/package.json
+    printf '%s\n' '{"private":true,"scripts":{}}' > packages/_types-builder/package.json
+    printf '%s\n' 'export const generateTypes = true;' > packages/_types-builder/src/index.js
+    printf '%s\n' 'export const replaceTypes = true;' > packages/_types-builder/src/replace-types.js
+    printf '%s\n' '{"scripts":{"check":"tsc --noEmit","lint":"oxlint .","build":"tsdown"},"devDependencies":{"@mastra/core":"workspace:*"}}' \
+      > packages/agent-builder/package.json
+    printf '%s\n' 'export default {};' > packages/agent-builder/tsdown.config.ts
+    printf '%s\n' 'export default {};' > packages/agent-builder/vitest.config.ts
+    printf '%s\n' '{"compilerOptions":{"strict":true},"include":["src"]}' > packages/agent-builder/tsconfig.json
+    printf '%s\n' '{}' > packages/agent-builder/integration-tests/package.json
+    printf '%s\n' '# Agent Builder integration tests' > packages/agent-builder/integration-tests/README.md
+    printf '%s\n' "import { it } from 'vitest';" "it('agent builder', () => {});" \
+      > packages/agent-builder/src/agent-builder.test.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('native declarations', () => {});" \
+      > scripts/types-builder.test.ts
+    printf '%s\n' '{"compilerOptions":{"strict":true,"noUncheckedIndexedAccess":true},"include":["types-builder.test.ts"]}' \
+      > scripts/tsconfig.json
     printf '%s\n' '{}' > packages/core/package.json
     printf '%s\n' 'export default {};' > packages/core/vitest.config.ts
     printf '%s\n' "export const supervisorRuntime = 'base';" \
@@ -3823,6 +3930,188 @@ run_validator_self_tests() {
     assert_contains '--dir client-sdks/client-js exec vitest run src/resources/harness.test.ts --reporter=dot' "$command_log"
     assert_contains '--dir packages/cli exec vitest run src/commands/api/descriptors.test.ts --reporter=dot' "$command_log"
   }
+
+  assert_package_contract_rejected() {
+    : > "$command_log"
+    if run_fixture "$1" "$3" BASE_SHA="$2"; then
+      echo 'An unsupported package contract change unexpectedly passed.' >&2
+      cat "$3" >&2
+      exit 1
+    fi
+    if [[ -s "$command_log" ]]; then
+      echo 'An unsupported package contract change executed package commands.' >&2
+      cat "$command_log" >&2
+      exit 1
+    fi
+  }
+
+  package_contract_dependency_base_sha="$(
+    cd "$fixture_repo"
+    node <<'NODE'
+const fs = require('node:fs');
+const lock = fs.readFileSync('pnpm-lock.yaml', 'utf8');
+fs.writeFileSync('pnpm-lock.yaml', lock.replace('importers:\n',
+  'importers:\n\n  packages/agent-builder:\n    devDependencies:\n' +
+  "      '@mastra/core':\n        specifier: workspace:*\n        version: link:../core\n"));
+NODE
+    git add pnpm-lock.yaml
+    git commit -q -m 'prepare Agent Builder importer fixture'
+    git rev-parse HEAD
+  )"
+  package_contract_base_sha="$(
+    cd "$fixture_repo"
+    node <<'NODE'
+const fs = require('node:fs');
+const file = 'packages/agent-builder/package.json';
+const manifest = JSON.parse(fs.readFileSync(file, 'utf8'));
+manifest.scripts['check:fixtures'] = 'tsc --noEmit --project tsconfig.fixtures.json';
+manifest.devDependencies['@mastra/mcp'] = 'workspace:*';
+fs.writeFileSync(file, JSON.stringify(manifest));
+const lock = fs.readFileSync('pnpm-lock.yaml', 'utf8');
+fs.writeFileSync('pnpm-lock.yaml', lock.replace('        version: link:../core\n',
+  '        version: link:../core\n' +
+  "      '@mastra/mcp':\n        specifier: workspace:*\n        version: link:../mcp\n"));
+NODE
+    printf '%s\n' '{"extends":"./tsconfig.json","include":["integration-tests/src/fixtures/**/*"]}' \
+      > packages/agent-builder/tsconfig.fixtures.json
+    printf '%s\n' 'Run both package and fixture checks after building the workspace dependencies.' \
+      >> packages/agent-builder/integration-tests/README.md
+    git add .
+    git commit -q -m 'own Agent Builder fixture compilation'
+    git rev-parse HEAD
+  )"
+  output="$test_root/package-contract-fixture-admission.log"
+  (
+    cd "$fixture_repo"
+    BASE_SHA="$package_contract_dependency_base_sha" HEAD_SHA="$package_contract_base_sha" \
+      bash "$validator_path" --classify-install
+  ) > "$output" 2>&1
+  assert_contains 'lane=standard' "$output"
+  : > "$command_log"
+  if ! run_fixture "$package_contract_base_sha" "$output" BASE_SHA="$package_contract_dependency_base_sha"; then
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'exec turbo run build --filter=@mastra/agent-builder... --concurrency=2' "$command_log"
+  assert_contains '--filter ./packages/agent-builder --fail-if-no-match check' "$command_log"
+  assert_contains '--filter ./packages/agent-builder --fail-if-no-match check:fixtures' "$command_log"
+  assert_contains '--filter ./packages/agent-builder --fail-if-no-match lint' "$command_log"
+  assert_contains 'src/agent-builder.test.ts' "$command_log"
+
+  package_contract_head_sha="$(
+    cd "$fixture_repo"
+    printf '%s\n' 'export const generateTypes = false;' > packages/_types-builder/src/index.js
+    printf '%s\n' 'export const replaceTypes = false;' > packages/_types-builder/src/replace-types.js
+    printf '%s\n' "export default { format: ['esm', 'cjs'] };" > packages/agent-builder/tsdown.config.ts
+    git add .
+    git commit -q -m 'change owned package build sources without changing tests'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/package-contract-owned-sources.log"
+  if ! run_fixture "$package_contract_head_sha" "$output" BASE_SHA="$package_contract_base_sha"; then
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'build:core' "$command_log"
+  assert_contains '--filter ./packages/core --fail-if-no-match check' "$command_log"
+  assert_contains 'exec tsc --project scripts/tsconfig.json --noEmit' "$command_log"
+  assert_contains 'exec oxlint packages/_types-builder/src/index.js packages/_types-builder/src/replace-types.js' "$command_log"
+  assert_line_count 1 'exec turbo run build --filter=@mastra/agent-builder... --concurrency=2' "$command_log"
+  assert_contains '--filter ./packages/agent-builder --fail-if-no-match check:fixtures' "$command_log"
+  assert_contains 'scripts/types-builder.test.ts' "$command_log"
+  assert_contains 'src/agent-builder.test.ts' "$command_log"
+
+  for failed_command in \
+    'build:core' \
+    'exec tsc --project scripts/tsconfig.json --noEmit' \
+    'exec turbo run build --filter=@mastra/agent-builder... --concurrency=2' \
+    '--filter ./packages/agent-builder --fail-if-no-match check' \
+    '--filter ./packages/agent-builder --fail-if-no-match check:fixtures'; do
+    output="$test_root/package-contract-command-failure.log"
+    if run_fixture "$package_contract_head_sha" "$output" BASE_SHA="$package_contract_base_sha" \
+      MOCK_FAIL_PACKAGE_CONTRACT_COMMAND="$failed_command"; then
+      echo "Failed owning command unexpectedly passed: $failed_command" >&2
+      exit 1
+    fi
+  done
+  for rejected_case in scripts/types-builder.test.ts src/agent-builder.test.ts; do
+    for failed_command in MOCK_FAIL_PACKAGE_CONTRACT_TEST MOCK_ZERO_PACKAGE_CONTRACT_TEST; do
+      output="$test_root/package-contract-test-failure.log"
+      if run_fixture "$package_contract_head_sha" "$output" BASE_SHA="$package_contract_base_sha" \
+        "$failed_command=$rejected_case"; then
+        echo "An unexecuted or failed owning test unexpectedly passed: $rejected_case ($failed_command)" >&2
+        exit 1
+      fi
+    done
+  done
+
+  for rejected_case in types-builder-source agent-builder-source nested-test types-builder-manifest \
+    deleted-generator symlink-generator deleted-builder symlink-builder; do
+    head_sha="$(
+      cd "$fixture_repo"
+      git reset -q --hard "$package_contract_base_sha"
+      case "$rejected_case" in
+        types-builder-source) printf '%s\n' 'export const unknown = true;' > packages/_types-builder/src/unknown.js ;;
+        agent-builder-source) printf '%s\n' 'export const unknown = true;' > packages/agent-builder/src/unknown.ts ;;
+        nested-test) printf '%s\n' "it('external fixture', () => {});" > packages/agent-builder/integration-tests/src/unknown.test.ts ;;
+        types-builder-manifest) printf '%s\n' '{"private":false}' > packages/_types-builder/package.json ;;
+        deleted-generator) rm scripts/types-builder.test.ts ;;
+        symlink-generator) rm scripts/types-builder.test.ts; ln -s missing.test.ts scripts/types-builder.test.ts ;;
+        deleted-builder) rm packages/agent-builder/src/agent-builder.test.ts ;;
+        symlink-builder) rm packages/agent-builder/src/agent-builder.test.ts; ln -s missing.test.ts packages/agent-builder/src/agent-builder.test.ts ;;
+      esac
+      git add .
+      git commit -q -m "reject $rejected_case"
+      git rev-parse HEAD
+    )"
+    assert_package_contract_rejected "$head_sha" "$package_contract_base_sha" "$test_root/package-contract-$rejected_case.log"
+  done
+
+  for rejected_case in metadata script dependency lock-link lock-graph lock-other-importer fixture-exclusion; do
+    head_sha="$(
+      cd "$fixture_repo"
+      git reset -q --hard "$package_contract_base_sha"
+      node - "$rejected_case" <<'NODE'
+const fs = require('node:fs');
+const variant = process.argv[2];
+const file = 'packages/agent-builder/package.json';
+const manifest = JSON.parse(fs.readFileSync(file, 'utf8'));
+if (variant === 'metadata') manifest.description = 'unreviewed metadata';
+if (variant === 'script') manifest.scripts.check = 'echo skipped';
+if (variant === 'dependency') manifest.devDependencies['@mastra/core'] = 'latest';
+fs.writeFileSync(file, JSON.stringify(manifest));
+let lock = fs.readFileSync('pnpm-lock.yaml', 'utf8');
+if (variant === 'lock-link') lock = lock.replace('link:../mcp', '1.0.0');
+if (variant === 'lock-graph') lock = lock.replace('sha512-retained', 'sha512-changed');
+if (variant === 'lock-other-importer') lock = lock.replace('specifier: ^1.26.0', 'specifier: ^1.27.0');
+fs.writeFileSync('pnpm-lock.yaml', lock);
+if (variant === 'fixture-exclusion') {
+  const configFile = 'packages/agent-builder/tsconfig.fixtures.json';
+  const config = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+  config.exclude = ['**/*'];
+  fs.writeFileSync(configFile, JSON.stringify(config));
+}
+NODE
+      git add .
+      git commit -q -m "reject fixture $rejected_case drift"
+      git rev-parse HEAD
+    )"
+    output="$test_root/package-contract-$rejected_case-admission.log"
+    if (
+      cd "$fixture_repo"
+      BASE_SHA="$package_contract_dependency_base_sha" HEAD_SHA="$head_sha" bash "$validator_path" --classify-install
+    ) > "$output" 2>&1; then
+      echo "Unsupported fixture $rejected_case drift passed install admission." >&2
+      exit 1
+    fi
+    assert_package_contract_rejected "$head_sha" "$package_contract_dependency_base_sha" "$test_root/package-contract-$rejected_case-validation.log"
+  done
+  git -C "$fixture_repo" reset -q --hard "$base_sha"
+  echo 'Package contract ownership, native command, fixture metadata, and fail-closed validation fixtures passed.'
+  if [[ "${1:-}" == '--package-contracts-only' ]]; then
+    return
+  fi
 
   pf3553_base_sha="$(
     cd "$fixture_repo"
@@ -8053,6 +8342,11 @@ if [[ "${1:-}" == "--self-test" ]]; then
   exit 0
 fi
 
+if [[ "${1:-}" == "--self-test-package-contracts" ]]; then
+  run_validator_self_tests --package-contracts-only
+  exit 0
+fi
+
 
 run_stagehand_validation_self_test() {
   local script_path test_root test_repo stub_bin command_log base_sha head_sha deleted_test_sha deletion_log
@@ -10674,6 +10968,12 @@ is_server_generated_artifact() {
 }
 
 while IFS= read -r file; do
+  if [[ "$file" == packages/agent-builder/integration-tests/README.md ]]; then
+    # The root workspace owns fixture compilation; the nested integration
+    # package remains outside the installed and runnable workspace graph.
+    printf '%s\n' packages/agent-builder >> "$workspace_candidates"
+    continue
+  fi
   if is_server_generated_artifact "$file"; then
     # These exact generated consumers are owned by Server route/permission
     # sources. Their output can be committed without granting general fork
@@ -10715,7 +11015,7 @@ while IFS= read -r workspace; do
     continue
   fi
   case "$workspace" in
-    auth/okta | browser/stagehand | packages/_internal-core | packages/cli | packages/codemod | packages/core | packages/deployer | packages/mcp | packages/memory | packages/server | client-sdks/ai-sdk | client-sdks/client-js | stores/_test-utils | stores/convex | stores/libsql | stores/pg | stores/redis | mastracode | mastracode/sdk | mastracode/tui | pubsub/google-cloud-pubsub | pubsub/redis-streams | workflows/inngest | workflows/temporal | observability/mastra | docs) ;;
+    auth/okta | browser/stagehand | packages/_internal-core | packages/_types-builder | packages/agent-builder | packages/cli | packages/codemod | packages/core | packages/deployer | packages/mcp | packages/memory | packages/server | client-sdks/ai-sdk | client-sdks/client-js | stores/_test-utils | stores/convex | stores/libsql | stores/pg | stores/redis | mastracode | mastracode/sdk | mastracode/tui | pubsub/google-cloud-pubsub | pubsub/redis-streams | workflows/inngest | workflows/temporal | observability/mastra | docs) ;;
     server-adapters/fastify)
       if [[ "$pf3553_selected_route_exports" == false ]]; then
         printf '%s\n' "$workspace" >> "$unsupported_workspaces"
@@ -10740,6 +11040,7 @@ while IFS= read -r file; do
       pnpm-lock.yaml | \
       scripts/commonjs-tsc-fixer.js | \
       scripts/commonjs-tsc-fixer.test.ts | \
+      scripts/types-builder.test.ts | \
       scripts/tsconfig.json | \
       scripts/vitest.config.ts | \
       vitest.config.ts) ;;
@@ -10763,6 +11064,15 @@ if [[ "$pf3553_selected_route_exports" == false ]]; then
   grep -E \
     '^(packages/server/package\.json|server-adapters/fastify/package\.json)$' \
     "$changed_files" >> "$unsupported_inputs" || true
+fi
+
+agent_builder_fixture_dependency=false
+if grep -Fxq packages/agent-builder/package.json "$changed_files"; then
+  if verify_agent_builder_fixture_dependency "$merge_base_sha" "$HEAD_SHA"; then
+    agent_builder_fixture_dependency=true
+  else
+    printf '%s\n' packages/agent-builder/package.json >> "$unsupported_inputs"
+  fi
 fi
 
 verify_pf2057_inngest_dependency_cleanup() {
@@ -11199,6 +11509,41 @@ queue_owned_workspace_test() {
     printf '%s\n' "$test_file" >> "$forced_workspace_tests"
   fi
 }
+
+types_builder_changed=false
+while IFS= read -r file; do
+  case "$file" in
+    packages/_types-builder/src/index.js | packages/_types-builder/src/replace-types.js | \
+      scripts/types-builder.test.ts)
+      types_builder_changed=true
+      queue_owned_workspace_test "$file" scripts/types-builder.test.ts
+      ;;
+    packages/_types-builder/*)
+      printf '%s\n' "$file" >> "$unsupported_owned_workspace_sources"
+      ;;
+    packages/agent-builder/tsdown.config.ts | packages/agent-builder/src/agent-builder.test.ts | \
+      packages/agent-builder/integration-tests/README.md)
+      queue_owned_workspace_test "$file" packages/agent-builder/src/agent-builder.test.ts
+      ;;
+    packages/agent-builder/tsconfig.fixtures.json)
+      if verify_agent_builder_fixture_config "$HEAD_SHA"; then
+        queue_owned_workspace_test "$file" packages/agent-builder/src/agent-builder.test.ts
+      else
+        printf '%s\n' "$file" >> "$unsupported_owned_workspace_sources"
+      fi
+      ;;
+    packages/agent-builder/package.json)
+      if [[ "$agent_builder_fixture_dependency" == true ]]; then
+        queue_owned_workspace_test "$file" packages/agent-builder/src/agent-builder.test.ts
+      else
+        printf '%s\n' "$file" >> "$unsupported_owned_workspace_sources"
+      fi
+      ;;
+    packages/agent-builder/*)
+      printf '%s\n' "$file" >> "$unsupported_owned_workspace_sources"
+      ;;
+  esac
+done < "$changed_files"
 
 # The Client SDK is admitted only through exact source-and-test ownership.
 # Generated route types remain owned by the Server generator path above.
@@ -11788,14 +12133,23 @@ NODE
   fi
 }
 
+agent_builder_prerequisites_built=false
+ensure_agent_builder_prerequisites() {
+  if [[ "$agent_builder_prerequisites_built" == true ]]; then
+    return
+  fi
+  # Build the native dependency graph, including MCP's fixture declarations.
+  run_with_validation_budget 900 pnpm exec turbo run build --filter=@mastra/agent-builder... --concurrency=2
+  agent_builder_prerequisites_built=true
+}
+
 server_prerequisites_built=false
 ensure_server_prerequisites() {
   if [[ "$server_prerequisites_built" == true ]]; then
     return
   fi
 
-  run_with_validation_budget 900 pnpm --filter ./packages/memory --fail-if-no-match build:lib
-  run_with_validation_budget 900 pnpm --filter ./packages/agent-builder --fail-if-no-match build
+  ensure_agent_builder_prerequisites
   run_with_validation_budget 900 pnpm --filter ./packages/server --fail-if-no-match build:lib
   server_prerequisites_built=true
 }
@@ -11935,6 +12289,22 @@ if workspace_changed packages/_internal-core; then
   run_with_validation_budget 600 pnpm --dir packages/_internal-core typecheck
 fi
 
+if [[ "$types_builder_changed" == true ]]; then
+  # This private build tool has no package scripts. Check its two owned JS
+  # sources with native tools; build:core above consumes the real declarations
+  # and the queued generator regression exercises both source boundaries.
+  run_with_validation_budget 120 node --check packages/_types-builder/src/index.js
+  run_with_validation_budget 120 node --check packages/_types-builder/src/replace-types.js
+  run_with_validation_budget 300 pnpm exec oxlint packages/_types-builder/src/index.js packages/_types-builder/src/replace-types.js
+fi
+
+if workspace_changed packages/agent-builder; then
+  ensure_agent_builder_prerequisites
+  run_with_validation_budget 600 pnpm --filter ./packages/agent-builder --fail-if-no-match check
+  run_with_validation_budget 600 pnpm --filter ./packages/agent-builder --fail-if-no-match check:fixtures
+  run_with_validation_budget 600 pnpm --filter ./packages/agent-builder --fail-if-no-match lint
+fi
+
 if workspace_changed packages/server; then
   ensure_server_prerequisites
   run_with_validation_budget 600 pnpm --filter ./packages/server --fail-if-no-match exec tsc --noEmit
@@ -11961,7 +12331,8 @@ if workspace_changed packages/codemod; then
   run_with_validation_budget 600 pnpm --filter ./packages/codemod --fail-if-no-match lint
 fi
 
-if grep -Eq '^(scripts/(commonjs-tsc-fixer\.(js|test\.ts)|tsconfig\.json|vitest\.config\.ts)|vitest\.config\.ts)$' "$changed_files"; then
+if [[ "$types_builder_changed" == true ]] ||
+  grep -Eq '^(scripts/(commonjs-tsc-fixer\.(js|test\.ts)|tsconfig\.json|vitest\.config\.ts)|vitest\.config\.ts)$' "$changed_files"; then
   # scripts/tsconfig.json includes the root vitest.config.ts, so this also
   # type-checks root Vitest config changes.
   run_with_validation_budget 600 pnpm exec tsc --project scripts/tsconfig.json --noEmit
