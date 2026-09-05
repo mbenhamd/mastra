@@ -3,7 +3,20 @@
 set -euo pipefail
 
 VALIDATOR_REPOSITORY_ROOT="$(git rev-parse --show-toplevel)"
-TYPESCRIPT_MODULE_PATH="$VALIDATOR_REPOSITORY_ROOT/node_modules/typescript"
+# TypeScript 7 keeps the compiler API in the upstream typescript-classic alias.
+# Select from manifest metadata so pre-install admission needs no dependencies.
+TYPESCRIPT_MODULE_PATH="$(node - "$VALIDATOR_REPOSITORY_ROOT" <<'NODE'
+const fs = require('node:fs');
+const path = require('node:path');
+const root = process.argv[2];
+const manifestPath = path.join(root, 'package.json');
+const manifest = fs.existsSync(manifestPath) ? JSON.parse(fs.readFileSync(manifestPath, 'utf8')) : {};
+const compilerPackage = Object.hasOwn(manifest.devDependencies ?? {}, 'typescript-classic')
+  ? 'typescript-classic'
+  : 'typescript';
+process.stdout.write(path.join(root, 'node_modules', compilerPackage));
+NODE
+)"
 readonly VALIDATOR_REPOSITORY_ROOT TYPESCRIPT_MODULE_PATH
 
 pf558_config() {
@@ -139,6 +152,22 @@ verify_pf3553_reviewed_surface() (
     return 1
   fi
 )
+
+pf3759_config() {
+  PF3759_HEAD_REPOSITORY="${PAPERSFLOW_PF3759_HEAD_REPOSITORY:-mbenhamd/mastra}"
+  PF3759_HEAD_REF="${PAPERSFLOW_PF3759_HEAD_REF:-feature/pf-3759-mastra-upstream-sync-3cf8e685-r8}"
+  PF3759_BASE_REF="${PAPERSFLOW_PF3759_BASE_REF:-main}"
+  PF3759_PENDING_MERGE_COMMIT='PENDING_PF3759_MERGE_COMMIT'
+  PF3759_PENDING_REVIEWED_TREE='PENDING_PF3759_REVIEWED_TREE'
+  PF3759_MERGE_COMMIT="${PAPERSFLOW_PF3759_MERGE_COMMIT:-37749cd063df354c787bfbae1ca22d1b636c4382}"
+  PF3759_FORK_PARENT="${PAPERSFLOW_PF3759_FORK_PARENT:-ef6dab0a7183bb403918f4a63738987146935a00}"
+  PF3759_UPSTREAM_PARENT="${PAPERSFLOW_PF3759_UPSTREAM_PARENT:-3cf8e68555e212f3465c5cbf12516e87709f7f5d}"
+  PF3759_REVIEWED_TREE="${PAPERSFLOW_PF3759_REVIEWED_TREE:-9c0b1818a5797d2aae6254e3a6d604e623b509dc}"
+  readonly \
+    PF3759_HEAD_REPOSITORY PF3759_HEAD_REF PF3759_BASE_REF PF3759_MERGE_COMMIT \
+    PF3759_FORK_PARENT PF3759_UPSTREAM_PARENT PF3759_REVIEWED_TREE \
+    PF3759_PENDING_MERGE_COMMIT PF3759_PENDING_REVIEWED_TREE
+}
 
 pf3375_config() {
   PF3375_HEAD_REPOSITORY="${PAPERSFLOW_PF3375_HEAD_REPOSITORY:-mbenhamd/mastra}"
@@ -422,6 +451,58 @@ EOF
     echo 'PF-2045 reviewed reconciled first-parent path count changed.' >&2
     echo "expected: $PF2045_RECONCILED_PATH_COUNT" >&2
     echo "actual:   $reconciled_path_count" >&2
+    return 1
+  fi
+)
+
+verify_pf3759_reviewed_merge() (
+  : "${BASE_SHA:?BASE_SHA is required}"
+  : "${HEAD_SHA:?HEAD_SHA is required}"
+
+  local merge_topology actual_tree protected_merge_base
+
+  if [[ "$PF3759_MERGE_COMMIT" == "$PF3759_PENDING_MERGE_COMMIT" || \
+    "$PF3759_REVIEWED_TREE" == "$PF3759_PENDING_REVIEWED_TREE" ]]; then
+    echo 'PF-3759 exact-sync admission pins are pending; refusing admission.' >&2
+    return 1
+  fi
+
+  if [[ "$HEAD_SHA" != "$PF3759_MERGE_COMMIT" ]]; then
+    echo 'PF-3759 head is not the exact reviewed merge commit.' >&2
+    echo "expected: $PF3759_MERGE_COMMIT" >&2
+    echo "actual:   $HEAD_SHA" >&2
+    return 1
+  fi
+
+  merge_topology="$(git rev-list --parents -n 1 "$HEAD_SHA")"
+  if [[ "$merge_topology" != "$HEAD_SHA $PF3759_FORK_PARENT $PF3759_UPSTREAM_PARENT" ]]; then
+    echo 'PF-3759 head is not the exact reviewed two-parent upstream merge topology.' >&2
+    echo "expected: $HEAD_SHA $PF3759_FORK_PARENT $PF3759_UPSTREAM_PARENT" >&2
+    echo "actual:   $merge_topology" >&2
+    return 1
+  fi
+
+  actual_tree="$(git rev-parse "$HEAD_SHA^{tree}")"
+  if [[ "$actual_tree" != "$PF3759_REVIEWED_TREE" ]]; then
+    echo 'PF-3759 head tree does not match the reviewed merge tree.' >&2
+    echo "expected: $PF3759_REVIEWED_TREE" >&2
+    echo "actual:   $actual_tree" >&2
+    return 1
+  fi
+
+  if ! git merge-base --is-ancestor "$PF3759_FORK_PARENT" "$BASE_SHA"; then
+    echo 'PF-3759 protected base does not descend from the reviewed fork parent.' >&2
+    return 1
+  fi
+  protected_merge_base="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
+  if [[ "$protected_merge_base" != "$PF3759_FORK_PARENT" ]]; then
+    echo 'PF-3759 protected base and reviewed head no longer meet at the reviewed fork parent.' >&2
+    echo "expected: $PF3759_FORK_PARENT" >&2
+    echo "actual:   $protected_merge_base" >&2
+    return 1
+  fi
+  if ! git merge-base --is-ancestor "$PF3759_UPSTREAM_PARENT" "$HEAD_SHA"; then
+    echo 'PF-3759 head does not contain the reviewed official upstream parent.' >&2
     return 1
   fi
 )
@@ -967,6 +1048,19 @@ classify_install_lane() (
     .npmrc .pnpmfile.cjs pnpmfile.cjs package.json pnpm-workspace.yaml \
     patches packages/server/package.json server-adapters/fastify/package.json |
     sort -u > "$manifest_changes"
+
+  # PF-3759 is frozen to one reviewed merge commit, tree, branch, repository,
+  # and parent pair. The policy PR advances protected main after that merge was
+  # constructed, so the checked PR base may descend from (but must meet the
+  # feature head exactly at) the reviewed fork parent.
+  pf3759_config
+  if [[ "${HEAD_REPOSITORY:-}" == "$PF3759_HEAD_REPOSITORY" && \
+    "${HEAD_REF:-}" == "$PF3759_HEAD_REF" && "${BASE_REF:-}" == "$PF3759_BASE_REF" ]]; then
+    verify_pf3759_reviewed_merge
+    echo 'PF-3759 exact two-parent upstream merge and reviewed tree accepted from trusted base policy.'
+    emit_validation_lane pf3759-upstream-sync
+    return
+  fi
 
   # PF-3375 is frozen to one reviewed merge commit, tree, branch, repository,
   # and parent pair. The policy PR advances protected main after that merge was
@@ -2415,6 +2509,171 @@ run_pf2045_admission_self_tests() (
   echo 'PF-2045 upstream-sync topology and reconstructed-tree admission fixtures passed.'
 )
 
+run_pf3759_admission_self_tests() (
+  local script_path test_root fixture_repo common_sha fork_parent upstream_parent
+  local reviewed_head reviewed_tree protected_base forged_tree forged_head
+  local reversed_head extra_parent octopus_head non_merge_head output
+
+  script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+  test_root="$(mktemp -d)"
+  fixture_repo="$test_root/repo"
+  pf3759_fixture_cleanup() {
+    local status=$?
+    trap - EXIT
+    if (( status != 0 )); then
+      echo 'PF-3759 admission fixture failed; captured classifier output follows:' >&2
+      find "$test_root" -maxdepth 1 -type f -name '*.log' -print -exec sed -n '1,240p' {} \; >&2 || true
+    fi
+    rm -rf -- "$test_root"
+    exit "$status"
+  }
+  trap pf3759_fixture_cleanup EXIT
+  mkdir -p "$fixture_repo"
+
+  git -C "$fixture_repo" init -q -b main
+  git -C "$fixture_repo" config user.email validator@example.invalid
+  git -C "$fixture_repo" config user.name 'PF-3759 admission fixture'
+  printf '{"name":"fixture","version":"1.0.0"}\n' > "$fixture_repo/package.json"
+  git -C "$fixture_repo" add package.json
+  git -C "$fixture_repo" commit -q -m common
+  common_sha="$(git -C "$fixture_repo" rev-parse HEAD)"
+
+  git -C "$fixture_repo" switch -q -c upstream
+  printf '{"name":"fixture","version":"2.0.0"}\n' > "$fixture_repo/package.json"
+  printf 'official upstream\n' > "$fixture_repo/upstream.txt"
+  git -C "$fixture_repo" add package.json upstream.txt
+  git -C "$fixture_repo" commit -q -m upstream
+  upstream_parent="$(git -C "$fixture_repo" rev-parse HEAD)"
+
+  git -C "$fixture_repo" switch -q main
+  printf 'fork work\n' > "$fixture_repo/fork.txt"
+  git -C "$fixture_repo" add fork.txt
+  git -C "$fixture_repo" commit -q -m fork
+  fork_parent="$(git -C "$fixture_repo" rev-parse HEAD)"
+  git -C "$fixture_repo" merge -q --no-ff upstream -m 'reviewed upstream merge'
+  reviewed_head="$(git -C "$fixture_repo" rev-parse HEAD)"
+  reviewed_tree="$(git -C "$fixture_repo" rev-parse "$reviewed_head^{tree}")"
+
+  git -C "$fixture_repo" switch -q -c protected-base "$fork_parent"
+  mkdir -p "$fixture_repo/.github"
+  printf 'trusted policy advance\n' > "$fixture_repo/.github/policy.txt"
+  git -C "$fixture_repo" add .github/policy.txt
+  git -C "$fixture_repo" commit -q -m 'advance protected policy'
+  protected_base="$(git -C "$fixture_repo" rev-parse HEAD)"
+
+  git -C "$fixture_repo" switch -q --detach "$reviewed_head"
+  printf 'not reviewed\n' > "$fixture_repo/forged.txt"
+  git -C "$fixture_repo" add forged.txt
+  forged_tree="$(git -C "$fixture_repo" write-tree)"
+  git -C "$fixture_repo" reset -q --hard "$reviewed_head"
+  forged_head="$(printf 'forged tree\n' | git -C "$fixture_repo" commit-tree \
+    "$forged_tree" -p "$fork_parent" -p "$upstream_parent")"
+  reversed_head="$(printf 'reversed parents\n' | git -C "$fixture_repo" commit-tree \
+    "$reviewed_tree" -p "$upstream_parent" -p "$fork_parent")"
+  extra_parent="$(printf 'extra parent\n' | git -C "$fixture_repo" commit-tree \
+    "$common_sha^{tree}" -p "$common_sha")"
+  octopus_head="$(printf 'octopus merge\n' | git -C "$fixture_repo" commit-tree \
+    "$reviewed_tree" -p "$fork_parent" -p "$upstream_parent" -p "$extra_parent")"
+  non_merge_head="$(printf 'not a merge\n' | git -C "$fixture_repo" commit-tree \
+    "$reviewed_tree" -p "$fork_parent")"
+
+  run_fixture_admission() {
+    local fixture_head="$1"
+    local fixture_output="$2"
+    shift 2
+    (
+      cd "$fixture_repo"
+      env \
+        GITHUB_OUTPUT= \
+        BASE_SHA="$protected_base" HEAD_SHA="$fixture_head" PR_NUMBER=999 \
+        HEAD_REPOSITORY=mbenhamd/mastra \
+        HEAD_REF=feature/pf-3759-mastra-upstream-sync-3cf8e685-r8 \
+        BASE_REF=main \
+        PAPERSFLOW_PF3759_MERGE_COMMIT="$reviewed_head" \
+        PAPERSFLOW_PF3759_FORK_PARENT="$fork_parent" \
+        PAPERSFLOW_PF3759_UPSTREAM_PARENT="$upstream_parent" \
+        PAPERSFLOW_PF3759_REVIEWED_TREE="$reviewed_tree" \
+        "$@" bash "$script_path" --classify-install
+    ) > "$fixture_output" 2>&1
+  }
+
+  output="$test_root/pending-pins.log"
+  if run_fixture_admission "$reviewed_head" "$output" \
+    PAPERSFLOW_PF3759_MERGE_COMMIT=PENDING_PF3759_MERGE_COMMIT \
+    PAPERSFLOW_PF3759_REVIEWED_TREE=PENDING_PF3759_REVIEWED_TREE; then
+    echo 'PF-3759 pending admission pins unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'exact-sync admission pins are pending; refusing admission' "$output"
+
+  output="$test_root/approved.log"
+  run_fixture_admission "$reviewed_head" "$output"
+  grep -Fxq 'lane=pf3759-upstream-sync' "$output"
+
+  output="$test_root/forged-tree.log"
+  if run_fixture_admission "$forged_head" "$output" \
+    PAPERSFLOW_PF3759_MERGE_COMMIT="$forged_head"; then
+    echo 'PF-3759 forged tree with the reviewed parents unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'head tree does not match the reviewed merge tree' "$output"
+
+  output="$test_root/reversed-parents.log"
+  if run_fixture_admission "$reversed_head" "$output" \
+    PAPERSFLOW_PF3759_MERGE_COMMIT="$reversed_head"; then
+    echo 'PF-3759 reversed parent order unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'not the exact reviewed two-parent upstream merge topology' "$output"
+
+  output="$test_root/octopus.log"
+  if run_fixture_admission "$octopus_head" "$output" \
+    PAPERSFLOW_PF3759_MERGE_COMMIT="$octopus_head"; then
+    echo 'PF-3759 octopus merge unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'not the exact reviewed two-parent upstream merge topology' "$output"
+
+  output="$test_root/non-merge.log"
+  if run_fixture_admission "$non_merge_head" "$output" \
+    PAPERSFLOW_PF3759_MERGE_COMMIT="$non_merge_head"; then
+    echo 'PF-3759 non-merge head unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'not the exact reviewed two-parent upstream merge topology' "$output"
+
+  output="$test_root/wrong-head.log"
+  if run_fixture_admission "$reviewed_head" "$output" \
+    PAPERSFLOW_PF3759_MERGE_COMMIT="$fork_parent"; then
+    echo 'PF-3759 head that differs from the reviewed commit unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'head is not the exact reviewed merge commit' "$output"
+
+  output="$test_root/untrusted-base.log"
+  if run_fixture_admission "$reviewed_head" "$output" BASE_SHA="$common_sha"; then
+    echo 'PF-3759 base outside the reviewed fork lineage unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'protected base does not descend from the reviewed fork parent' "$output"
+
+  output="$test_root/base-contained-in-head.log"
+  if run_fixture_admission "$reviewed_head" "$output" BASE_SHA="$reviewed_head"; then
+    echo 'PF-3759 base/head intersection beyond the reviewed fork parent unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'no longer meet at the reviewed fork parent' "$output"
+
+  output="$test_root/wrong-metadata.log"
+  if run_fixture_admission "$reviewed_head" "$output" HEAD_REF=feature/not-pf-3759; then
+    echo 'Wrong PF-3759 branch metadata unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'do not match a reviewed upstream-sync lane' "$output"
+
+  echo 'PF-3759 pending-pin, exact-commit, topology, tree, ancestry, and metadata admission fixtures passed.'
+)
+
 run_pf3375_admission_self_tests() (
   local script_path test_root fixture_repo common_sha fork_parent upstream_parent
   local reviewed_head reviewed_tree protected_base forged_tree forged_head
@@ -3060,6 +3319,10 @@ case "${1:-}" in
     run_pf2045_admission_self_tests
     exit
     ;;
+  --self-test-pf3759-upstream-sync)
+    run_pf3759_admission_self_tests
+    exit
+    ;;
   --self-test-pf3375-upstream-sync)
     run_pf3375_admission_self_tests
     exit
@@ -3093,6 +3356,7 @@ run_validator_self_tests() {
   local service_log
   local base_sha
   local head_sha
+  local server_root_core_imports_base_sha server_root_core_imports_head_sha
   local pf3553_base_sha pf3553_head_sha pf3553_lane_spoof_head_sha
   local pf3553_base_surface_sha256 pf3553_head_surface_sha256
   local inngest_trio_head_sha inngest_pf2050_head_sha inngest_manager_followup_head_sha
@@ -3159,6 +3423,7 @@ run_validator_self_tests() {
     'printf '\''%s\n'\'' "$*" >> "${MOCK_PNPM_LOG:?}"' \
     'printf '\''LLM_TEST_MODE=%s\t%s\n'\'' "${LLM_TEST_MODE:-}" "$*" >> "${MOCK_PNPM_ENVIRONMENT_LOG:?}"' \
     'printf '\''OPENAI_API_KEY=%s\t%s\n'\'' "${OPENAI_API_KEY:-}" "$*" >> "${MOCK_PNPM_ENVIRONMENT_LOG:?}"' \
+    'if [[ " $* " == *" check:core-imports "* && "${MOCK_FAIL_CORE_IMPORTS:-0}" == 1 ]]; then exit 23; fi' \
     'if [[ " $* " == *" check:permissions "* && "${MOCK_FAIL_PERMISSIONS:-0}" == 1 ]]; then exit 17; fi' \
     'if [[ " $* " == *" generate:route-types "* && "${MOCK_STALE_ROUTE_TYPES:-0}" == 1 ]]; then' \
     '  printf '\''%s\n'\'' "// regenerated" >> client-sdks/client-js/src/route-types.generated.ts' \
@@ -3927,6 +4192,44 @@ NODE
   assert_route_consumer_commands
   assert_contains 'src/server/server-adapter/schema-consistency.test.ts' "$command_log"
   assert_contains 'src/server/server-adapter/api-schema-manifest.test.ts' "$command_log"
+
+  server_root_core_imports_base_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' '{"scripts":{"check:core-imports":"tsx scripts/check-core-imports.ts"}}' > package.json
+    git add package.json
+    git commit -q -m 'root owns the core import check'
+    git rev-parse HEAD
+  )"
+  server_root_core_imports_head_sha="$(
+    cd "$fixture_repo"
+    printf '%s\n' "export const route = 'head';" > packages/server/src/server/server-adapter/routes/index.ts
+    git add packages/server/src/server/server-adapter/routes/index.ts
+    git commit -q -m 'server route change with root core import check'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/server-root-core-imports-success.log"
+  run_fixture "$server_root_core_imports_head_sha" "$output" BASE_SHA="$server_root_core_imports_base_sha"
+  assert_line_count 2 'run check:core-imports packages/server' "$command_log"
+  assert_not_contains '--filter ./packages/server --fail-if-no-match check:core-imports' "$command_log"
+  assert_not_contains '--filter @mastra/server check:core-imports' "$command_log"
+
+  : > "$command_log"
+  output="$test_root/server-root-core-imports-failure.log"
+  set +e
+  run_fixture "$server_root_core_imports_head_sha" "$output" \
+    BASE_SHA="$server_root_core_imports_base_sha" MOCK_FAIL_CORE_IMPORTS=1
+  status=$?
+  set -e
+  if (( status != 23 )); then
+    echo 'Root core import check failure did not propagate its exit status.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_line_count 1 'run check:core-imports packages/server' "$command_log"
+  assert_not_contains '--filter ./packages/server --fail-if-no-match check:core-imports' "$command_log"
+  assert_not_contains '--filter @mastra/server check:core-imports' "$command_log"
 
   head_sha="$(
     cd "$fixture_repo"
@@ -8105,6 +8408,57 @@ TEST
   trap - EXIT
 )
 
+check_pf3759_reconciled_whitespace() (
+  local merge_base_sha="${1:?merge base is required}"
+  local path
+  local -a checked_paths=(.)
+  pf3759_config
+
+  # These 31 files contain upstream whitespace, including an expected-output
+  # literal. Exclude only their exact upstream blobs, never fork-edited content.
+  while IFS= read -r path; do
+    if ! git_regular_file_at_revision "$HEAD_SHA" "$path" ||
+      [[ "$(git rev-parse "$HEAD_SHA:$path")" != "$(git rev-parse "$PF3759_UPSTREAM_PARENT:$path")" ]]; then
+      echo "PF-3759 whitespace baseline differs from the pinned upstream blob: $path" >&2
+      return 1
+    fi
+    checked_paths+=(":(exclude,literal)$path")
+  done <<'EOF'
+docs/src/content/en/models/gateways/merge-gateway.mdx
+docs/src/content/en/models/gateways/netlify.mdx
+docs/src/content/en/models/providers/above.mdx
+docs/src/content/en/models/providers/agnes.mdx
+docs/src/content/en/models/providers/aixy.mdx
+docs/src/content/en/models/providers/alibaba-cn.mdx
+docs/src/content/en/models/providers/alibaba.mdx
+docs/src/content/en/models/providers/bothub.mdx
+docs/src/content/en/models/providers/friendli.mdx
+docs/src/content/en/models/providers/iteracompute.mdx
+docs/src/content/en/models/providers/klokintegration.mdx
+docs/src/content/en/models/providers/llmtech.mdx
+docs/src/content/en/models/providers/meta.mdx
+docs/src/content/en/models/providers/modal.mdx
+docs/src/content/en/models/providers/nan.mdx
+docs/src/content/en/models/providers/nebius.mdx
+docs/src/content/en/models/providers/neosmith.mdx
+docs/src/content/en/models/providers/neuralwatt.mdx
+docs/src/content/en/models/providers/ollama-cloud.mdx
+docs/src/content/en/models/providers/openreason.mdx
+docs/src/content/en/models/providers/opper.mdx
+docs/src/content/en/models/providers/pendra.mdx
+docs/src/content/en/models/providers/regolo-ai.mdx
+docs/src/content/en/models/providers/sensenova.mdx
+docs/src/content/en/models/providers/standardcompute.mdx
+docs/src/content/en/models/providers/tokengo.mdx
+docs/src/content/en/models/providers/tokenrouter.mdx
+docs/src/content/en/models/providers/vancine.mdx
+docs/src/content/en/models/providers/volcengine-coding-plan.mdx
+docs/src/content/en/models/providers/volcengine.mdx
+packages/evals/src/vitest/reporter.test.ts
+EOF
+  git diff --check "${merge_base_sha}..${HEAD_SHA}" -- "${checked_paths[@]}"
+)
+
 run_upstream_sync_validation() {
   local expected_lane="${1:?validation lane is required}"
   local issue_key="${2:?issue key is required}"
@@ -8122,7 +8476,11 @@ run_upstream_sync_validation() {
   rm -f "$admission_output"
 
   merge_base_sha="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
-  git diff --check "${merge_base_sha}..${HEAD_SHA}"
+  if [[ "$expected_lane" == pf3759-upstream-sync ]]; then
+    check_pf3759_reconciled_whitespace "$merge_base_sha"
+  else
+    git diff --check "${merge_base_sha}..${HEAD_SHA}"
+  fi
 
   # The upstream AgentController surface is additive. These Harness v1 paths
   # are the fork-owned compatibility boundary and must remain real tracked
@@ -8174,7 +8532,11 @@ EOF
   run_with_validation_budget 600 pnpm --filter mastracode --fail-if-no-match lint
   run_with_validation_budget 600 pnpm --filter @mastra/slack --fail-if-no-match typecheck
   run_with_validation_budget 600 pnpm --filter @mastra/vercel --fail-if-no-match lint
-  run_with_validation_budget 600 pnpm --filter @mastra/server --fail-if-no-match check:core-imports
+  if [[ "$expected_lane" == pf3759-upstream-sync ]]; then
+    run_with_validation_budget 600 pnpm run check:core-imports packages/server
+  else
+    run_with_validation_budget 600 pnpm --filter @mastra/server --fail-if-no-match check:core-imports
+  fi
   run_with_validation_budget 600 pnpm --filter @mastra/server --fail-if-no-match check:permissions
   run_with_validation_budget 600 pnpm --filter @mastra/server --fail-if-no-match generate:route-types
   run_with_validation_budget 600 pnpm --filter @mastra/server --fail-if-no-match generate:api-cli-route-metadata
@@ -8221,6 +8583,70 @@ run_pf558_upstream_sync_validation() {
 
 run_pf2009_upstream_sync_validation() {
   run_upstream_sync_validation pf2009-upstream-sync PF-2009
+}
+
+run_pf3759_upstream_sync_validation() {
+  run_upstream_sync_validation pf3759-upstream-sync PF-3759
+
+  echo 'Building/linting the PF-3759 workspace and testing the selected reconciliation boundaries.'
+  run_with_validation_budget 1200 pnpm run build
+  run_with_validation_budget 900 pnpm run lint
+  run_with_validation_budget 900 \
+    pnpm --dir packages/core exec vitest run --reporter=dot \
+      src/agent/durable/__tests__/durable-agent-cross-process-abort.test.ts \
+      src/agent/durable/__tests__/suspended-run-discovery.test.ts \
+      src/agent/durable/run-registry.test.ts \
+      src/agent/durable/workflows/steps/signal-drain.test.ts \
+      src/agent/durable/workflows/steps/tool-approval-recall.test.ts \
+      src/events/caching-pubsub.test.ts \
+      src/agent/durable/workflows/steps/tool-call-approval-context.test.ts \
+      src/agent/durable/utils/resolve-runtime-approval.test.ts \
+      src/tools/approval.test.ts \
+      src/stream/base/output.test.ts \
+      src/storage/domains/workflows/inmemory-persist.test.ts \
+      src/storage/types.test.ts
+  run_with_validation_budget 600 \
+    pnpm --dir packages/core exec vitest run --reporter=dot \
+      src/storage/workflow-snapshot.test.ts \
+      src/workflows/scheduler/definition-hash.test.ts \
+      src/loop/workflows/prune-snapshot.test.ts \
+      src/loop/test-utils/aimock/scenarios/evented-sequential-approval.scenario.test.ts
+  run_with_validation_budget 600 \
+    pnpm --dir stores/convex exec vitest run --reporter=dot src/server/storage.test.ts
+  run_with_validation_budget 600 \
+    pnpm --dir packages/memory exec vitest run --reporter=dot \
+      src/processors/observational-memory/__tests__/sync-end-of-turn-observation.test.ts
+  run_with_validation_budget 600 \
+    pnpm --dir workspaces/platform-workspace exec vitest run --reporter=dot \
+      src/sandbox.test.ts src/provider.test.ts
+  run_with_validation_budget 600 \
+    pnpm --filter @mastra/platform-workspace --fail-if-no-match test:types
+  run_with_validation_budget 600 \
+    pnpm --dir stores/valkey exec vitest run --reporter=dot src/index.test.ts
+  run_with_validation_budget 600 \
+    pnpm --dir packages/server exec vitest run --reporter=dot \
+      src/server/schemas/dynamic-workflows.test.ts src/server/handlers/dynamic-workflows.test.ts
+  run_with_validation_budget 600 \
+    pnpm --dir stores/libsql exec vitest run --reporter=dot \
+      src/storage/domains/workflows/atomic-resume.test.ts src/storage/index.test.ts \
+      -t 'atomic.*resume|workflow-state guard|expected .* guard does not match|stale claim after suspended'
+  run_with_validation_budget 600 \
+    env POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=5434 \
+      pnpm --dir stores/pg exec vitest run --reporter=dot \
+        src/storage/domains/workflows/atomic-resume.test.ts src/storage/index.test.ts \
+        -t 'atomic.*resume|workflow-state guard|expected .* guard does not match|stale claim after suspended'
+  run_with_validation_budget 900 \
+    pnpm --dir workflows/inngest exec vitest run --no-isolate --reporter=dot \
+      src/__tests__/create-inngest-agent.test.ts \
+      src/durable-agent/create-inngest-agentic-workflow.test.ts \
+      src/durable-agent/create-inngest-agentic-workflow.scorers.test.ts \
+      src/workflow-failure-transport.test.ts
+  run_with_validation_budget 600 \
+    pnpm --dir pubsub/redis-streams exec vitest run --reporter=dot \
+      src/connection-and-cleanup.test.ts \
+      src/pubsub-ack-audit.test.ts
+
+  echo 'PF-3759 workspace build/lint and selected reconciliation validation passed.'
 }
 
 run_pf3375_upstream_sync_validation() {
@@ -8672,6 +9098,10 @@ case "${1:-}" in
     run_pf2045_upstream_sync_validation
     exit
     ;;
+  --validate-pf3759-upstream-sync)
+    run_pf3759_upstream_sync_validation
+    exit
+    ;;
   --validate-pf3375-upstream-sync)
     run_pf3375_upstream_sync_validation
     exit
@@ -8765,11 +9195,11 @@ git_regular_file_at_head() {
 }
 
 core_supervisor_test_preserves_provider_gate() {
-  if ! node - "$merge_base_sha" "$HEAD_SHA" <<'NODE'
+  if ! node - "$TYPESCRIPT_MODULE_PATH" "$merge_base_sha" "$HEAD_SHA" <<'NODE'
 const { execFileSync } = require('node:child_process');
-const ts = require('typescript');
+const ts = require(process.argv[2]);
 
-const [baseSha, headSha] = process.argv.slice(2);
+const [baseSha, headSha] = process.argv.slice(3);
 const file = 'packages/core/src/agent/__tests__/supervisor-integration.test.ts';
 const read = sha => execFileSync('git', ['show', `${sha}:${file}`], { encoding: 'utf8' });
 const parse = source => ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
@@ -8883,11 +9313,11 @@ NODE
 }
 
 tool_approval_test_preserves_replay_harness() {
-  node - "$merge_base_sha" "$HEAD_SHA" <<'NODE'
+  node - "$TYPESCRIPT_MODULE_PATH" "$merge_base_sha" "$HEAD_SHA" <<'NODE'
 const { execFileSync } = require('node:child_process');
-const ts = require('typescript');
+const ts = require(process.argv[2]);
 
-const [baseSha, headSha] = process.argv.slice(2);
+const [baseSha, headSha] = process.argv.slice(3);
 const file = 'packages/core/src/agent/__tests__/tool-approval.e2e.test.ts';
 const read = sha => execFileSync('git', ['show', `${sha}:${file}`], { encoding: 'utf8' });
 const parse = source => ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
@@ -8992,12 +9422,12 @@ NODE
 }
 
 storage_harness_factory_registers_suite() {
-  node - "$HEAD_SHA" <<'NODE'
+  node - "$TYPESCRIPT_MODULE_PATH" "$HEAD_SHA" <<'NODE'
 const { execFileSync } = require('node:child_process');
 const path = require('node:path');
-const ts = require('typescript');
+const ts = require(process.argv[2]);
 
-const [headSha] = process.argv.slice(2);
+const [headSha] = process.argv.slice(3);
 const factoryPath = 'stores/_test-utils/src/factory.ts';
 const sourceText = execFileSync('git', ['show', `${headSha}:${factoryPath}`], {
   encoding: 'utf8',
@@ -9309,12 +9739,12 @@ NODE
 }
 
 storage_harness_entrypoint_registers_suite() {
-  node - "$HEAD_SHA" <<'NODE'
+  node - "$TYPESCRIPT_MODULE_PATH" "$HEAD_SHA" <<'NODE'
 const { execFileSync } = require('node:child_process');
 const path = require('node:path');
-const ts = require('typescript');
+const ts = require(process.argv[2]);
 
-const [headSha] = process.argv.slice(2);
+const [headSha] = process.argv.slice(3);
 const testPath = 'stores/_test-utils/src/index.test.ts';
 const sourceText = execFileSync('git', ['show', `${headSha}:${testPath}`], {
   encoding: 'utf8',
@@ -9497,12 +9927,12 @@ NODE
 }
 
 mastracode_observation_migration_uses_helper() {
-  node - "$HEAD_SHA" <<'NODE'
+  node - "$TYPESCRIPT_MODULE_PATH" "$HEAD_SHA" <<'NODE'
 const { execFileSync } = require('node:child_process');
 const path = require('node:path');
-const ts = require('typescript');
+const ts = require(process.argv[2]);
 
-const [headSha] = process.argv.slice(2);
+const [headSha] = process.argv.slice(3);
 const scriptPath = 'mastracode/sdk/scripts/index-messages.ts';
 const sourceText = execFileSync('git', ['show', `${headSha}:${scriptPath}`], {
   encoding: 'utf8',
@@ -11336,6 +11766,26 @@ if grep -Fxq 'client-sdks/client-js/src/index.ts' "$changed_files"; then
   check_client_index_entrypoint_contract
 fi
 
+run_standard_server_core_imports_check() {
+  local maximum_seconds="$1"
+  shift
+  local root_owns_check
+
+  # Read ownership as data; do not load a PR's check script to select its lane.
+  root_owns_check="$(node - "$VALIDATOR_REPOSITORY_ROOT/package.json" <<'NODE'
+const fs = require('node:fs');
+const manifest = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+process.stdout.write(String(Object.hasOwn(manifest.scripts ?? {}, 'check:core-imports')));
+NODE
+)" || return
+
+  if [[ "$root_owns_check" == true ]]; then
+    run_with_validation_budget "$maximum_seconds" pnpm run check:core-imports packages/server
+  else
+    run_with_validation_budget "$maximum_seconds" pnpm "$@" check:core-imports
+  fi
+}
+
 server_prerequisites_built=false
 ensure_server_prerequisites() {
   if [[ "$server_prerequisites_built" == true ]]; then
@@ -11487,7 +11937,7 @@ if workspace_changed packages/server; then
   ensure_server_prerequisites
   run_with_validation_budget 600 pnpm --filter ./packages/server --fail-if-no-match exec tsc --noEmit
   run_with_validation_budget 600 pnpm --filter ./packages/server --fail-if-no-match lint
-  run_with_validation_budget 300 pnpm --filter ./packages/server --fail-if-no-match check:core-imports
+  run_standard_server_core_imports_check 300 --filter ./packages/server --fail-if-no-match
 fi
 
 if workspace_changed packages/deployer; then
@@ -11565,7 +12015,7 @@ fi
 if workspace_changed packages/server; then
   run_with_validation_budget 900 pnpm build:server
   run_with_validation_budget 600 pnpm --filter @mastra/server lint
-  run_with_validation_budget 600 pnpm --filter @mastra/server check:core-imports
+  run_standard_server_core_imports_check 600 --filter @mastra/server
   run_with_validation_budget 300 pnpm --filter @mastra/server check:permissions
   if grep -Fxq 'packages/server/src/server/server-adapter/routes/permissions.ts' "$changed_files" || \
     grep -Fxq 'packages/core/src/auth/ee/interfaces/permissions.generated.ts' "$changed_files"; then
@@ -12624,11 +13074,11 @@ select_changed_agent_signal_tests() {
   local file="$1"
   local output_file="$2"
 
-  node - "$merge_base_sha" "$HEAD_SHA" "$file" > "$output_file" <<'NODE'
+  node - "$TYPESCRIPT_MODULE_PATH" "$merge_base_sha" "$HEAD_SHA" "$file" > "$output_file" <<'NODE'
 const { execFileSync } = require('node:child_process');
-const ts = require('typescript');
+const ts = require(process.argv[2]);
 
-const [baseSha, headSha, file] = process.argv.slice(2);
+const [baseSha, headSha, file] = process.argv.slice(3);
 const readSource = sha => execFileSync('git', ['show', `${sha}:${file}`], { encoding: 'utf8' });
 const diff = execFileSync('git', ['diff', '--unified=0', '--no-color', baseSha, headSha, '--', file], {
   encoding: 'utf8',
