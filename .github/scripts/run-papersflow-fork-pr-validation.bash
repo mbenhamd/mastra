@@ -140,6 +140,22 @@ verify_pf3553_reviewed_surface() (
   fi
 )
 
+pf3759_config() {
+  PF3759_HEAD_REPOSITORY="${PAPERSFLOW_PF3759_HEAD_REPOSITORY:-mbenhamd/mastra}"
+  PF3759_HEAD_REF="${PAPERSFLOW_PF3759_HEAD_REF:-feature/pf-3759-mastra-upstream-sync-3cf8e685}"
+  PF3759_BASE_REF="${PAPERSFLOW_PF3759_BASE_REF:-main}"
+  PF3759_PENDING_MERGE_COMMIT='PENDING_PF3759_MERGE_COMMIT'
+  PF3759_PENDING_REVIEWED_TREE='PENDING_PF3759_REVIEWED_TREE'
+  PF3759_MERGE_COMMIT="${PAPERSFLOW_PF3759_MERGE_COMMIT:-f70ba8e30a687413352b4ed5ddb57bc9add99783}"
+  PF3759_FORK_PARENT="${PAPERSFLOW_PF3759_FORK_PARENT:-ef6dab0a7183bb403918f4a63738987146935a00}"
+  PF3759_UPSTREAM_PARENT="${PAPERSFLOW_PF3759_UPSTREAM_PARENT:-3cf8e68555e212f3465c5cbf12516e87709f7f5d}"
+  PF3759_REVIEWED_TREE="${PAPERSFLOW_PF3759_REVIEWED_TREE:-e1c8a80349ea259c429e84c2a85b6762256a8884}"
+  readonly \
+    PF3759_HEAD_REPOSITORY PF3759_HEAD_REF PF3759_BASE_REF PF3759_MERGE_COMMIT \
+    PF3759_FORK_PARENT PF3759_UPSTREAM_PARENT PF3759_REVIEWED_TREE \
+    PF3759_PENDING_MERGE_COMMIT PF3759_PENDING_REVIEWED_TREE
+}
+
 pf3375_config() {
   PF3375_HEAD_REPOSITORY="${PAPERSFLOW_PF3375_HEAD_REPOSITORY:-mbenhamd/mastra}"
   PF3375_HEAD_REF="${PAPERSFLOW_PF3375_HEAD_REF:-feature/pf-3375-mastra-upstream-sync-372b1a71}"
@@ -422,6 +438,58 @@ EOF
     echo 'PF-2045 reviewed reconciled first-parent path count changed.' >&2
     echo "expected: $PF2045_RECONCILED_PATH_COUNT" >&2
     echo "actual:   $reconciled_path_count" >&2
+    return 1
+  fi
+)
+
+verify_pf3759_reviewed_merge() (
+  : "${BASE_SHA:?BASE_SHA is required}"
+  : "${HEAD_SHA:?HEAD_SHA is required}"
+
+  local merge_topology actual_tree protected_merge_base
+
+  if [[ "$PF3759_MERGE_COMMIT" == "$PF3759_PENDING_MERGE_COMMIT" || \
+    "$PF3759_REVIEWED_TREE" == "$PF3759_PENDING_REVIEWED_TREE" ]]; then
+    echo 'PF-3759 exact-sync admission pins are pending; refusing admission.' >&2
+    return 1
+  fi
+
+  if [[ "$HEAD_SHA" != "$PF3759_MERGE_COMMIT" ]]; then
+    echo 'PF-3759 head is not the exact reviewed merge commit.' >&2
+    echo "expected: $PF3759_MERGE_COMMIT" >&2
+    echo "actual:   $HEAD_SHA" >&2
+    return 1
+  fi
+
+  merge_topology="$(git rev-list --parents -n 1 "$HEAD_SHA")"
+  if [[ "$merge_topology" != "$HEAD_SHA $PF3759_FORK_PARENT $PF3759_UPSTREAM_PARENT" ]]; then
+    echo 'PF-3759 head is not the exact reviewed two-parent upstream merge topology.' >&2
+    echo "expected: $HEAD_SHA $PF3759_FORK_PARENT $PF3759_UPSTREAM_PARENT" >&2
+    echo "actual:   $merge_topology" >&2
+    return 1
+  fi
+
+  actual_tree="$(git rev-parse "$HEAD_SHA^{tree}")"
+  if [[ "$actual_tree" != "$PF3759_REVIEWED_TREE" ]]; then
+    echo 'PF-3759 head tree does not match the reviewed merge tree.' >&2
+    echo "expected: $PF3759_REVIEWED_TREE" >&2
+    echo "actual:   $actual_tree" >&2
+    return 1
+  fi
+
+  if ! git merge-base --is-ancestor "$PF3759_FORK_PARENT" "$BASE_SHA"; then
+    echo 'PF-3759 protected base does not descend from the reviewed fork parent.' >&2
+    return 1
+  fi
+  protected_merge_base="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
+  if [[ "$protected_merge_base" != "$PF3759_FORK_PARENT" ]]; then
+    echo 'PF-3759 protected base and reviewed head no longer meet at the reviewed fork parent.' >&2
+    echo "expected: $PF3759_FORK_PARENT" >&2
+    echo "actual:   $protected_merge_base" >&2
+    return 1
+  fi
+  if ! git merge-base --is-ancestor "$PF3759_UPSTREAM_PARENT" "$HEAD_SHA"; then
+    echo 'PF-3759 head does not contain the reviewed official upstream parent.' >&2
     return 1
   fi
 )
@@ -967,6 +1035,19 @@ classify_install_lane() (
     .npmrc .pnpmfile.cjs pnpmfile.cjs package.json pnpm-workspace.yaml \
     patches packages/server/package.json server-adapters/fastify/package.json |
     sort -u > "$manifest_changes"
+
+  # PF-3759 is frozen to one reviewed merge commit, tree, branch, repository,
+  # and parent pair. The policy PR advances protected main after that merge was
+  # constructed, so the checked PR base may descend from (but must meet the
+  # feature head exactly at) the reviewed fork parent.
+  pf3759_config
+  if [[ "${HEAD_REPOSITORY:-}" == "$PF3759_HEAD_REPOSITORY" && \
+    "${HEAD_REF:-}" == "$PF3759_HEAD_REF" && "${BASE_REF:-}" == "$PF3759_BASE_REF" ]]; then
+    verify_pf3759_reviewed_merge
+    echo 'PF-3759 exact two-parent upstream merge and reviewed tree accepted from trusted base policy.'
+    emit_validation_lane pf3759-upstream-sync
+    return
+  fi
 
   # PF-3375 is frozen to one reviewed merge commit, tree, branch, repository,
   # and parent pair. The policy PR advances protected main after that merge was
@@ -2415,6 +2496,171 @@ run_pf2045_admission_self_tests() (
   echo 'PF-2045 upstream-sync topology and reconstructed-tree admission fixtures passed.'
 )
 
+run_pf3759_admission_self_tests() (
+  local script_path test_root fixture_repo common_sha fork_parent upstream_parent
+  local reviewed_head reviewed_tree protected_base forged_tree forged_head
+  local reversed_head extra_parent octopus_head non_merge_head output
+
+  script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+  test_root="$(mktemp -d)"
+  fixture_repo="$test_root/repo"
+  pf3759_fixture_cleanup() {
+    local status=$?
+    trap - EXIT
+    if (( status != 0 )); then
+      echo 'PF-3759 admission fixture failed; captured classifier output follows:' >&2
+      find "$test_root" -maxdepth 1 -type f -name '*.log' -print -exec sed -n '1,240p' {} \; >&2 || true
+    fi
+    rm -rf -- "$test_root"
+    exit "$status"
+  }
+  trap pf3759_fixture_cleanup EXIT
+  mkdir -p "$fixture_repo"
+
+  git -C "$fixture_repo" init -q -b main
+  git -C "$fixture_repo" config user.email validator@example.invalid
+  git -C "$fixture_repo" config user.name 'PF-3759 admission fixture'
+  printf '{"name":"fixture","version":"1.0.0"}\n' > "$fixture_repo/package.json"
+  git -C "$fixture_repo" add package.json
+  git -C "$fixture_repo" commit -q -m common
+  common_sha="$(git -C "$fixture_repo" rev-parse HEAD)"
+
+  git -C "$fixture_repo" switch -q -c upstream
+  printf '{"name":"fixture","version":"2.0.0"}\n' > "$fixture_repo/package.json"
+  printf 'official upstream\n' > "$fixture_repo/upstream.txt"
+  git -C "$fixture_repo" add package.json upstream.txt
+  git -C "$fixture_repo" commit -q -m upstream
+  upstream_parent="$(git -C "$fixture_repo" rev-parse HEAD)"
+
+  git -C "$fixture_repo" switch -q main
+  printf 'fork work\n' > "$fixture_repo/fork.txt"
+  git -C "$fixture_repo" add fork.txt
+  git -C "$fixture_repo" commit -q -m fork
+  fork_parent="$(git -C "$fixture_repo" rev-parse HEAD)"
+  git -C "$fixture_repo" merge -q --no-ff upstream -m 'reviewed upstream merge'
+  reviewed_head="$(git -C "$fixture_repo" rev-parse HEAD)"
+  reviewed_tree="$(git -C "$fixture_repo" rev-parse "$reviewed_head^{tree}")"
+
+  git -C "$fixture_repo" switch -q -c protected-base "$fork_parent"
+  mkdir -p "$fixture_repo/.github"
+  printf 'trusted policy advance\n' > "$fixture_repo/.github/policy.txt"
+  git -C "$fixture_repo" add .github/policy.txt
+  git -C "$fixture_repo" commit -q -m 'advance protected policy'
+  protected_base="$(git -C "$fixture_repo" rev-parse HEAD)"
+
+  git -C "$fixture_repo" switch -q --detach "$reviewed_head"
+  printf 'not reviewed\n' > "$fixture_repo/forged.txt"
+  git -C "$fixture_repo" add forged.txt
+  forged_tree="$(git -C "$fixture_repo" write-tree)"
+  git -C "$fixture_repo" reset -q --hard "$reviewed_head"
+  forged_head="$(printf 'forged tree\n' | git -C "$fixture_repo" commit-tree \
+    "$forged_tree" -p "$fork_parent" -p "$upstream_parent")"
+  reversed_head="$(printf 'reversed parents\n' | git -C "$fixture_repo" commit-tree \
+    "$reviewed_tree" -p "$upstream_parent" -p "$fork_parent")"
+  extra_parent="$(printf 'extra parent\n' | git -C "$fixture_repo" commit-tree \
+    "$common_sha^{tree}" -p "$common_sha")"
+  octopus_head="$(printf 'octopus merge\n' | git -C "$fixture_repo" commit-tree \
+    "$reviewed_tree" -p "$fork_parent" -p "$upstream_parent" -p "$extra_parent")"
+  non_merge_head="$(printf 'not a merge\n' | git -C "$fixture_repo" commit-tree \
+    "$reviewed_tree" -p "$fork_parent")"
+
+  run_fixture_admission() {
+    local fixture_head="$1"
+    local fixture_output="$2"
+    shift 2
+    (
+      cd "$fixture_repo"
+      env \
+        GITHUB_OUTPUT= \
+        BASE_SHA="$protected_base" HEAD_SHA="$fixture_head" PR_NUMBER=999 \
+        HEAD_REPOSITORY=mbenhamd/mastra \
+        HEAD_REF=feature/pf-3759-mastra-upstream-sync-3cf8e685 \
+        BASE_REF=main \
+        PAPERSFLOW_PF3759_MERGE_COMMIT="$reviewed_head" \
+        PAPERSFLOW_PF3759_FORK_PARENT="$fork_parent" \
+        PAPERSFLOW_PF3759_UPSTREAM_PARENT="$upstream_parent" \
+        PAPERSFLOW_PF3759_REVIEWED_TREE="$reviewed_tree" \
+        "$@" bash "$script_path" --classify-install
+    ) > "$fixture_output" 2>&1
+  }
+
+  output="$test_root/pending-pins.log"
+  if run_fixture_admission "$reviewed_head" "$output" \
+    PAPERSFLOW_PF3759_MERGE_COMMIT=PENDING_PF3759_MERGE_COMMIT \
+    PAPERSFLOW_PF3759_REVIEWED_TREE=PENDING_PF3759_REVIEWED_TREE; then
+    echo 'PF-3759 pending admission pins unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'exact-sync admission pins are pending; refusing admission' "$output"
+
+  output="$test_root/approved.log"
+  run_fixture_admission "$reviewed_head" "$output"
+  grep -Fxq 'lane=pf3759-upstream-sync' "$output"
+
+  output="$test_root/forged-tree.log"
+  if run_fixture_admission "$forged_head" "$output" \
+    PAPERSFLOW_PF3759_MERGE_COMMIT="$forged_head"; then
+    echo 'PF-3759 forged tree with the reviewed parents unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'head tree does not match the reviewed merge tree' "$output"
+
+  output="$test_root/reversed-parents.log"
+  if run_fixture_admission "$reversed_head" "$output" \
+    PAPERSFLOW_PF3759_MERGE_COMMIT="$reversed_head"; then
+    echo 'PF-3759 reversed parent order unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'not the exact reviewed two-parent upstream merge topology' "$output"
+
+  output="$test_root/octopus.log"
+  if run_fixture_admission "$octopus_head" "$output" \
+    PAPERSFLOW_PF3759_MERGE_COMMIT="$octopus_head"; then
+    echo 'PF-3759 octopus merge unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'not the exact reviewed two-parent upstream merge topology' "$output"
+
+  output="$test_root/non-merge.log"
+  if run_fixture_admission "$non_merge_head" "$output" \
+    PAPERSFLOW_PF3759_MERGE_COMMIT="$non_merge_head"; then
+    echo 'PF-3759 non-merge head unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'not the exact reviewed two-parent upstream merge topology' "$output"
+
+  output="$test_root/wrong-head.log"
+  if run_fixture_admission "$reviewed_head" "$output" \
+    PAPERSFLOW_PF3759_MERGE_COMMIT="$fork_parent"; then
+    echo 'PF-3759 head that differs from the reviewed commit unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'head is not the exact reviewed merge commit' "$output"
+
+  output="$test_root/untrusted-base.log"
+  if run_fixture_admission "$reviewed_head" "$output" BASE_SHA="$common_sha"; then
+    echo 'PF-3759 base outside the reviewed fork lineage unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'protected base does not descend from the reviewed fork parent' "$output"
+
+  output="$test_root/base-contained-in-head.log"
+  if run_fixture_admission "$reviewed_head" "$output" BASE_SHA="$reviewed_head"; then
+    echo 'PF-3759 base/head intersection beyond the reviewed fork parent unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'no longer meet at the reviewed fork parent' "$output"
+
+  output="$test_root/wrong-metadata.log"
+  if run_fixture_admission "$reviewed_head" "$output" HEAD_REF=feature/not-pf-3759; then
+    echo 'Wrong PF-3759 branch metadata unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'do not match a reviewed upstream-sync lane' "$output"
+
+  echo 'PF-3759 pending-pin, exact-commit, topology, tree, ancestry, and metadata admission fixtures passed.'
+)
+
 run_pf3375_admission_self_tests() (
   local script_path test_root fixture_repo common_sha fork_parent upstream_parent
   local reviewed_head reviewed_tree protected_base forged_tree forged_head
@@ -3058,6 +3304,10 @@ case "${1:-}" in
     ;;
   --self-test-pf2045-upstream-sync)
     run_pf2045_admission_self_tests
+    exit
+    ;;
+  --self-test-pf3759-upstream-sync)
+    run_pf3759_admission_self_tests
     exit
     ;;
   --self-test-pf3375-upstream-sync)
@@ -8223,6 +8473,34 @@ run_pf2009_upstream_sync_validation() {
   run_upstream_sync_validation pf2009-upstream-sync PF-2009
 }
 
+run_pf3759_upstream_sync_validation() {
+  run_upstream_sync_validation pf3759-upstream-sync PF-3759
+
+  echo 'Validating the complete PF-3759 reconciled workspace and durable-runtime boundaries.'
+  run_with_validation_budget 1200 pnpm run build
+  run_with_validation_budget 900 pnpm run lint
+  run_with_validation_budget 900 \
+    pnpm --dir packages/core exec vitest run --reporter=dot \
+      src/agent/durable/__tests__/durable-agent-cross-process-abort.test.ts \
+      src/agent/durable/__tests__/suspended-run-discovery.test.ts \
+      src/agent/durable/run-registry.test.ts \
+      src/agent/durable/workflows/steps/signal-drain.test.ts \
+      src/agent/durable/workflows/steps/tool-approval-recall.test.ts \
+      src/events/caching-pubsub.test.ts
+  run_with_validation_budget 900 \
+    pnpm --dir workflows/inngest exec vitest run --no-isolate --reporter=dot \
+      src/__tests__/create-inngest-agent.test.ts \
+      src/durable-agent/create-inngest-agentic-workflow.test.ts \
+      src/durable-agent/create-inngest-agentic-workflow.scorers.test.ts \
+      src/workflow-failure-transport.test.ts
+  run_with_validation_budget 600 \
+    pnpm --dir pubsub/redis-streams exec vitest run --reporter=dot \
+      src/connection-and-cleanup.test.ts \
+      src/pubsub-ack-audit.test.ts
+
+  echo 'PF-3759 complete workspace and durable-runtime validation passed.'
+}
+
 run_pf3375_upstream_sync_validation() {
   run_upstream_sync_validation pf3375-upstream-sync PF-3375
 
@@ -8670,6 +8948,10 @@ case "${1:-}" in
     ;;
   --validate-pf2045-upstream-sync)
     run_pf2045_upstream_sync_validation
+    exit
+    ;;
+  --validate-pf3759-upstream-sync)
+    run_pf3759_upstream_sync_validation
     exit
     ;;
   --validate-pf3375-upstream-sync)
