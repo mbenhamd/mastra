@@ -4112,6 +4112,68 @@ NODE
     fi
     assert_package_contract_rejected "$head_sha" "$package_contract_dependency_base_sha" "$test_root/package-contract-$rejected_case-validation.log"
   done
+
+  local schema_runtime_base_sha schema_runtime_case
+  schema_runtime_base_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$package_contract_base_sha"
+    mkdir -p packages/core/src/tools/tool-builder
+    printf '%s\n' 'export const schema = {};' > packages/core/src/tools/tool-builder/builder.ts
+    printf '%s\n' "import '../../../../core/src/tools/tool-builder/builder';" \
+      >> packages/server/src/server/handlers/favorites.integration.test.ts
+    git add .
+    git commit -q -m 'prepare the native Tool Builder schema runtime fixture'
+    git rev-parse HEAD
+  )"
+  for schema_runtime_case in named extra-value namespace default side-effect reexport require dynamic outside-owner; do
+    head_sha="$(
+      cd "$fixture_repo"
+      git reset -q --hard "$schema_runtime_base_sha"
+      node - "$schema_runtime_case" <<'NODE'
+const fs = require('node:fs');
+const variant = process.argv[2];
+const file = 'packages/core/src/tools/tool-builder/builder.ts';
+const named = "import { jsonSchema } from '@internal/ai-v6';\n";
+const schema = 'export const schema = jsonSchema({ type: "object" });\n';
+const extra = {
+  named: "import type { Schema } from '@internal/ai-v6';\n",
+  'extra-value': "import { generateText } from '@internal/ai-v6';\nvoid generateText;\n",
+  namespace: "import * as sdk from '@internal/ai-v6';\nvoid sdk;\n",
+  default: "import sdk from '@internal/ai-v6';\nvoid sdk;\n",
+  'side-effect': "import '@internal/ai-v6';\n",
+  reexport: "export { generateText } from '@internal/ai-v6';\n",
+  require: "void require('@internal/ai-v6');\n",
+  dynamic: "void import('@internal/ai-v6');\n",
+};
+if (variant === 'outside-owner') {
+  fs.writeFileSync(file, "export { schema } from './schema-helper';\n");
+  fs.writeFileSync('packages/core/src/tools/tool-builder/schema-helper.ts', named + schema);
+} else {
+  fs.writeFileSync(file, named + extra[variant] + schema);
+}
+NODE
+      git add .
+      git commit -q -m "exercise native schema import $schema_runtime_case"
+      git rev-parse HEAD
+    )"
+    : > "$command_log"
+    output="$test_root/package-contract-schema-runtime-$schema_runtime_case.log"
+    if [[ "$schema_runtime_case" == named ]]; then
+      if ! run_fixture "$head_sha" "$output" BASE_SHA="$schema_runtime_base_sha"; then
+        cat "$output" >&2
+        exit 1
+      fi
+      assert_contains 'Running changed test file in full: packages/server/src/server/handlers/favorites.integration.test.ts' "$output"
+    else
+      if run_fixture "$head_sha" "$output" BASE_SHA="$schema_runtime_base_sha"; then
+        echo "Unsupported native schema import unexpectedly passed: $schema_runtime_case" >&2
+        cat "$output" >&2
+        exit 1
+      fi
+      assert_contains 'unreviewed external module @internal/ai-v6' "$output"
+      assert_not_contains 'Running changed test file in full:' "$output"
+    fi
+  done
   git -C "$fixture_repo" reset -q --hard "$base_sha"
   echo 'Package contract ownership, native command, fixture metadata, and fail-closed validation fixtures passed.'
   if [[ "${1:-}" == '--package-contracts-only' ]]; then
@@ -12746,8 +12808,16 @@ function exportDeclarationHasRuntimeValue(node) {
   return node.exportClause.elements.some(element => !element.isTypeOnly);
 }
 
-function runtimeModuleSpecifiers(file, source, computedSpecifiers) {
+function runtimeModuleSpecifiers(file, source, computedSpecifiers, runtimeOccurrences) {
   const specifiers = new Set();
+  const addSpecifier = (specifier, node) => {
+    specifiers.add(specifier);
+    if (runtimeOccurrences) {
+      const occurrences = runtimeOccurrences.get(specifier) ?? [];
+      occurrences.push(node);
+      runtimeOccurrences.set(specifier, occurrences);
+    }
+  };
   const parsed = sourceFile(file, source);
   const visit = node => {
     if (
@@ -12755,14 +12825,14 @@ function runtimeModuleSpecifiers(file, source, computedSpecifiers) {
       importDeclarationHasRuntimeValue(node) &&
       ts.isStringLiteralLike(node.moduleSpecifier)
     ) {
-      specifiers.add(node.moduleSpecifier.text);
+      addSpecifier(node.moduleSpecifier.text, node);
     } else if (
       ts.isExportDeclaration(node) &&
       exportDeclarationHasRuntimeValue(node) &&
       node.moduleSpecifier &&
       ts.isStringLiteralLike(node.moduleSpecifier)
     ) {
-      specifiers.add(node.moduleSpecifier.text);
+      addSpecifier(node.moduleSpecifier.text, node);
     } else if (
       ts.isImportEqualsDeclaration(node) &&
       !node.isTypeOnly &&
@@ -12770,14 +12840,14 @@ function runtimeModuleSpecifiers(file, source, computedSpecifiers) {
       node.moduleReference.expression &&
       ts.isStringLiteralLike(node.moduleReference.expression)
     ) {
-      specifiers.add(node.moduleReference.expression.text);
+      addSpecifier(node.moduleReference.expression.text, node);
     } else if (
       ts.isCallExpression(node) &&
       (node.expression.kind === ts.SyntaxKind.ImportKeyword ||
         (ts.isIdentifier(node.expression) && node.expression.text === 'require'))
     ) {
       if (node.arguments.length >= 1 && ts.isStringLiteralLike(node.arguments[0])) {
-        specifiers.add(node.arguments[0].text);
+        addSpecifier(node.arguments[0].text, node);
       } else if (computedSpecifiers) {
         // A computed specifier hides the loaded module from this literal-only
         // scan, so the caller must fail closed instead of trusting the graph.
@@ -12933,7 +13003,20 @@ function unsupportedModuleReason(specifier) {
   return undefined;
 }
 
-function approvedExactExternalSpecifier(specifier) {
+function approvedExactExternalSpecifier(specifier, importer, occurrences) {
+  // Tool Builder's owning SDK supplies this schema constructor. Every runtime
+  // occurrence must retain the reviewed named import, including repeated uses
+  // of the same module through another import or loader expression.
+  if (specifier === '@internal/ai-v6' &&
+    repositoryPath(importer) === 'packages/core/src/tools/tool-builder/builder.ts') {
+    return Boolean(occurrences?.length && occurrences.every(node => {
+      if (!ts.isImportDeclaration(node)) return false;
+      const clause = node.importClause;
+      return clause && !clause.name && clause.namedBindings && ts.isNamedImports(clause.namedBindings) &&
+        clause.namedBindings.elements.every(element =>
+          element.isTypeOnly || (element.propertyName ?? element.name).text === 'jsonSchema');
+    }));
+  }
   const bareSpecifier = specifier.startsWith('node:') ? specifier.slice('node:'.length) : specifier;
   return (
     specifier === 'vitest' ||
@@ -13048,7 +13131,8 @@ function unsupportedRuntimeReasons(file, source) {
   const baseSource = readBaseSource(file);
   const baseSpecifiers = baseSource ? runtimeModuleSpecifiers(file, baseSource) : new Set();
   const computedSpecifiers = new Set();
-  for (const specifier of runtimeModuleSpecifiers(file, source, computedSpecifiers)) {
+  const runtimeOccurrences = new Map();
+  for (const specifier of runtimeModuleSpecifiers(file, source, computedSpecifiers, runtimeOccurrences)) {
     const reason = unsupportedModuleReason(specifier);
     // A banned specifier that already existed in this file at the trusted
     // base commit is part of the reviewed production surface (e.g. a server
@@ -13062,7 +13146,7 @@ function unsupportedRuntimeReasons(file, source) {
       exactTestEntries.has(entryFile) &&
       !specifier.startsWith('.') &&
       (!wasReachableFromExactTest || !baseSpecifiers.has(specifier)) &&
-      !approvedExactExternalSpecifier(specifier)
+      !approvedExactExternalSpecifier(specifier, file, runtimeOccurrences.get(specifier))
     ) {
       reasons.add(`unreviewed external module ${specifier}`);
     }
