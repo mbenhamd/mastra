@@ -11,6 +11,7 @@ import type { z } from 'zod';
 import type { ActorSignal } from '../../auth/ee/fga-check';
 import type { BackgroundTaskManager } from '../../background-tasks/manager';
 import type { AgentBackgroundConfig } from '../../background-tasks/types';
+import type { ScoringFilter } from '../../evals/predicate';
 import type { PubSub } from '../../events/pubsub';
 import type { SystemMessage } from '../../llm';
 import type { ProviderOptions } from '../../llm/model/provider-options';
@@ -100,6 +101,8 @@ export interface SerializableModelConfig {
 export interface SerializableModelListEntry {
   /** Unique identifier for this model entry */
   id: string;
+  /** True when the id was generated because the caller omitted an explicit id. */
+  generatedId?: boolean;
   /** Model configuration */
   config: SerializableModelConfig;
   /** Maximum retries before moving to next model */
@@ -121,6 +124,8 @@ export interface SerializableScorerEntry {
   scorerName: string;
   /** Optional sampling configuration */
   sampling?: SerializableScoringSamplingConfig;
+  /** Optional eligibility filter (JSON-safe predicate, survives round-trips as-is) */
+  filter?: ScoringFilter;
 }
 
 /**
@@ -924,6 +929,15 @@ export interface RunRegistryEntry {
    * and structured output degrades to raw text.
    */
   structuredOutput?: StructuredOutputOptions;
+  /**
+   * Call-time `returnScorerData` flag. Also serialized into
+   * `SerializableDurableOptions`, but parked here too so warm resume() and
+   * observe() can rebuild `scoringData` on their client-side
+   * `MastraModelOutput` without re-reading the snapshot. Cross-process
+   * engines lose this slot; cold resume restores it from the persisted
+   * workflow input instead.
+   */
+  returnScorerData?: boolean;
 }
 
 /**

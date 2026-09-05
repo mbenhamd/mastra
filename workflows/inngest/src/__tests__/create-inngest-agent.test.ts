@@ -525,10 +525,9 @@ describe('createInngestAgent with Mastra auto-registration', () => {
     const firstIds = workflowIdsFor('multi-agent-1');
     const secondIds = workflowIdsFor('multi-agent-2');
     expect(firstIds).not.toEqual(secondIds);
-    expect(Object.keys(mastra.listWorkflows())).toEqual(
-      expect.arrayContaining([firstIds.AGENTIC_LOOP, secondIds.AGENTIC_LOOP]),
-    );
-    expect(Object.keys(mastra.listWorkflows())).toHaveLength(2);
+    expect(mastra.listWorkflows()).toEqual({});
+    expect(mastra.getWorkflow(firstIds.AGENTIC_LOOP)).toBe(durableAgent1.getDurableWorkflows()[0]);
+    expect(mastra.getWorkflow(secondIds.AGENTIC_LOOP)).toBe(durableAgent2.getDurableWorkflows()[0]);
 
     const functionIds = collectInngestFunctions({ mastra }).map(fn => fn.id());
     expect(functionIds).toEqual(
@@ -749,6 +748,35 @@ describe('InngestAgent parity surface', () => {
       agents: { [id]: durableAgent },
     });
     (durableAgent.pubsub as any).inner = new EventEmitterPubSub();
+    return { durableAgent, mastra };
+  }
+
+  async function makeAgentWithSnapshot(id: string, runId: string, snapshot: any) {
+    const { durableAgent, mastra } = makeIsolatedAgent(id);
+    const workflowsStore = await mastra.getStorage()!.getStore('workflows');
+    const [workflow] = durableAgent.getDurableWorkflows() as any[];
+    await workflowsStore.persistWorkflowSnapshot({
+      workflowName: workflowIdsFor(id).AGENTIC_LOOP,
+      runId,
+      snapshot: {
+        executionGeneration: `${runId}-generation`,
+        lifecycleResumeAttempt: 0,
+        lifecycleStepStates: {},
+        status: 'suspended',
+        activePaths: [],
+        activeStepsPath: {},
+        waitingPaths: {},
+        resumeLabels: {},
+        serializedStepGraph: workflow.serializedStepGraph,
+        timestamp: Date.now(),
+        ...snapshot,
+        runId,
+        context: {
+          ...snapshot.context,
+          input: { __workflowKind: 'durable-agent', runId, runtimeBindingId: `${runId}-binding` },
+        },
+      },
+    });
     return { durableAgent, mastra };
   }
 
@@ -1344,22 +1372,23 @@ describe('InngestAgent parity surface', () => {
         timestamp: Date.now(),
       },
     });
-    let resolveSend!: () => void;
-    const sendPending = new Promise<void>(resolve => {
+    let resolveSend!: (result: { ids: string[] }) => void;
+    const sendPending = new Promise<{ ids: string[] }>(resolve => {
       resolveSend = resolve;
     });
     const sendSpy = vi.spyOn(inngest as any, 'send').mockImplementation(() => sendPending);
-    const first = await durableAgent.resume(runId, { answer: 'first' });
-    const firstEntry = globalRunRegistry.get(runId);
-    const firstController = firstEntry?.abortController;
+    const firstPending = durableAgent.resume(runId, { answer: 'first' });
 
     try {
+      await vi.waitFor(() => expect(sendSpy).toHaveBeenCalledTimes(1));
+      const firstEntry = globalRunRegistry.get(runId);
+      const firstController = firstEntry?.abortController;
       await expect(durableAgent.resume(runId, { answer: 'second' })).rejects.toThrow(/resume is already pending/);
       expect(globalRunRegistry.get(runId)).toBe(firstEntry);
       expect(globalRunRegistry.get(runId)?.abortController).toBe(firstController);
     } finally {
-      resolveSend();
-      await firstEntry?.workflowExecution;
+      resolveSend({ ids: ['resume-event'] });
+      const first = await firstPending;
       first.cleanup();
       sendSpy.mockRestore();
       await mastra.shutdown();
@@ -1494,12 +1523,13 @@ describe('InngestAgent parity surface', () => {
     };
     globalRunRegistry.set(runId, previousEntry);
     const external = new AbortController();
-    const result = await durableAgent.resume(runId, undefined, { abortSignal: external.signal });
+    const result = durableAgent.resume(runId, undefined, { abortSignal: external.signal });
+    const rejected = expect(result).rejects.toThrow('resume subscription setup failed');
 
     try {
-      result.cleanup();
+      await vi.waitFor(() => expect(previousEntry.abortController).not.toBe(previousController));
       rejectSubscription(new Error('resume subscription setup failed'));
-      await vi.waitFor(() => expect(previousEntry.workflowExecution).toBe(previousWorkflowExecution));
+      await rejected;
       expect(globalRunRegistry.get(runId)).toBe(previousEntry);
       expect(previousEntry.abortController).toBe(previousController);
       expect(previousEntry.abortSignal).toBe(previousController.signal);
@@ -1509,12 +1539,12 @@ describe('InngestAgent parity surface', () => {
 
       // Error publication is still pending, but the reservation was released
       // before awaiting it, so a retry can acquire admission immediately.
-      const retry = await durableAgent.resume(runId, undefined);
-      retry.cleanup();
+      await expect(durableAgent.resume(runId, undefined)).rejects.toThrow('resume subscription setup failed');
       releaseErrorPublish();
     } finally {
       releaseErrorPublish();
-      result.cleanup();
+      rejectSubscription(new Error('resume subscription setup failed'));
+      await rejected;
       globalRunRegistry.delete(runId);
       await mastra.shutdown();
     }
@@ -1792,6 +1822,207 @@ describe('InngestAgent parity surface', () => {
     expect(prepared.workflowInput.options.permissionPolicyRequired).toBe(true);
   });
 
+  it('forwards the per-call actor signal into the workflow trigger event', async () => {
+    // `actor` reaches FGA checks and tool execution by riding on the event
+    // payload the execution engine reads. The durable-agent wrapper used to
+    // accept the option and drop it, unlike InngestRun's start path.
+    const { durableAgent, mastra } = makeIsolatedAgent('parity-actor-trigger');
+    const sendSpy = stubInngestSend();
+    const actor = { actorKind: 'system', sourceWorkflow: 'nightly-workflow' };
+
+    const result = await durableAgent.stream([{ role: 'user', content: 'hi' }], { actor: actor as any });
+    try {
+      const deadline = Date.now() + 1_000;
+      let entry = globalRunRegistry.get(result.runId);
+      while (!entry?.workflowExecution && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 0));
+        entry = globalRunRegistry.get(result.runId);
+      }
+      await expect(entry?.workflowExecution).resolves.toBeUndefined();
+
+      expect(sendSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ actor }),
+        }),
+      );
+    } finally {
+      result.cleanup();
+      sendSpy.mockRestore();
+      await mastra.shutdown();
+    }
+  });
+
+  it('forwards a re-supplied actor on resume and never reads one from the snapshot', async () => {
+    // Matches InngestRun._resumeAndSendEvent: `actor` is a per-call trust
+    // signal, so it comes from the caller every time and a value sitting in
+    // the persisted snapshot must not leak into the event.
+    const sendSpy = stubInngestSend();
+    const runId = 'actor-resume-run';
+    const { durableAgent, mastra } = await makeAgentWithSnapshot('parity-actor-resume', runId, {
+      value: {},
+      context: {},
+      suspendedPaths: { 'agentic-loop': [0] },
+      // A stale actor persisted in storage must be ignored.
+      actor: { actorKind: 'system', sourceWorkflow: 'stale-workflow' },
+    });
+
+    const actor = { actorKind: 'system', sourceWorkflow: 'fresh-workflow' };
+    const result = await durableAgent.resume(runId, { answer: 'approved' }, { actor: actor as any });
+    try {
+      const deadline = Date.now() + 1_000;
+      let entry = globalRunRegistry.get(runId);
+      while (!entry?.workflowExecution && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 0));
+        entry = globalRunRegistry.get(runId);
+      }
+      await expect(entry?.workflowExecution).resolves.toBeUndefined();
+
+      const sentEvent = sendSpy.mock.calls[0]?.[0] as any;
+      expect(sentEvent?.data.actor).toEqual(actor);
+    } finally {
+      result.cleanup();
+      sendSpy.mockRestore();
+      await mastra.shutdown();
+    }
+  });
+
+  // The agentic loop suspends each tool call under `resumeLabels[toolCallId]`.
+  // These cover resume() honouring that label instead of guessing a target from
+  // the run's suspended paths, which is ambiguous once two tools are parked.
+  describe('resume targeting by toolCallId', () => {
+    // A tool call suspends inside the nested tool-execution workflow, so the outer
+    // agentic-loop step records the leaf under `__workflow_meta.path`.
+    const nestedSuspension = {
+      status: 'suspended',
+      suspendPayload: { __workflow_meta: { runId: 'nested-run', path: ['ask-human'] } },
+    };
+
+    const twoSuspendedSteps = {
+      value: {},
+      context: {
+        'agentic-loop': nestedSuspension,
+        'other-step': { status: 'suspended', suspendPayload: {} },
+      },
+      suspendedPaths: { 'agentic-loop': [0], 'other-step': [1] },
+      resumeLabels: {
+        'tool-call-a': { stepId: 'agentic-loop' },
+        'tool-call-b': { stepId: 'other-step' },
+      },
+    };
+
+    it('targets the step the named tool call is parked on, down to the nested leaf', async () => {
+      const runId = 'resume-by-tool-call-id-run';
+      const { durableAgent, mastra } = await makeAgentWithSnapshot('resume-by-tool-call-id', runId, twoSuspendedSteps);
+      const sendSpy = stubInngestSend();
+
+      const result = await durableAgent.resume(runId, { answer: 'yes' }, { toolCallId: 'tool-call-a' });
+      try {
+        expect(sendSpy).toHaveBeenCalledTimes(1);
+        const sentEvent = sendSpy.mock.calls[0]?.[0];
+        // Without the nested leaf appended the engine only knows the outer step and has
+        // to guess which suspension inside it to resume.
+        expect(sentEvent?.data.resume.steps).toEqual(['agentic-loop', 'ask-human']);
+        expect(sentEvent?.data.resume.resumePath).toEqual([0]);
+        expect(sentEvent?.data.resume.resumePayload).toEqual({ answer: 'yes' });
+      } finally {
+        result.cleanup();
+        sendSpy.mockRestore();
+        await mastra.shutdown();
+      }
+    });
+
+    it('rejects an unknown toolCallId instead of resuming the wrong leaf', async () => {
+      const { durableAgent, mastra } = await makeAgentWithSnapshot(
+        'resume-unknown-tool-call-id',
+        'resume-unknown-run',
+        twoSuspendedSteps,
+      );
+      const sendSpy = stubInngestSend();
+
+      await expect(
+        durableAgent.resume('resume-unknown-run', { answer: 'yes' }, { toolCallId: 'tool-call-z' }),
+      ).rejects.toThrow(/no suspended tool call with id "tool-call-z"/);
+      expect(sendSpy).not.toHaveBeenCalled();
+      expect(globalRunRegistry.get('resume-unknown-run')).toBeUndefined();
+
+      sendSpy.mockRestore();
+      await mastra.shutdown();
+    });
+
+    it('rejects an ambiguous resume when multiple tool calls are suspended', async () => {
+      const { durableAgent, mastra } = await makeAgentWithSnapshot(
+        'resume-ambiguous',
+        'resume-ambiguous-run',
+        twoSuspendedSteps,
+      );
+      const sendSpy = stubInngestSend();
+
+      await expect(durableAgent.resume('resume-ambiguous-run', { answer: 'yes' })).rejects.toThrow(
+        /more than one suspension is parked/,
+      );
+      expect(sendSpy).not.toHaveBeenCalled();
+
+      sendSpy.mockRestore();
+      await mastra.shutdown();
+    });
+
+    it('still infers the single suspended step when no toolCallId is given', async () => {
+      const runId = 'resume-single-inferred-run';
+      const { durableAgent, mastra } = await makeAgentWithSnapshot('resume-single-inferred', runId, {
+        value: {},
+        context: {},
+        suspendedPaths: { 'agentic-loop': [0] },
+        resumeLabels: { 'tool-call-a': { stepId: 'agentic-loop' } },
+      });
+      const sendSpy = stubInngestSend();
+
+      const result = await durableAgent.resume(runId, { answer: 'yes' });
+      try {
+        const sentEvent = sendSpy.mock.calls[0]?.[0];
+        expect(sentEvent?.data.resume.steps).toEqual(['agentic-loop']);
+      } finally {
+        result.cleanup();
+        sendSpy.mockRestore();
+        await mastra.shutdown();
+      }
+    });
+
+    it('rejects a lost resume acknowledgement while retaining the admitted binding', async () => {
+      // Dispatch used to be fire-and-forget: resume() resolved while the run
+      // stayed parked, and the failure only ever showed up as a stream error.
+      const runId = 'resume-dispatch-failure-run';
+      const { durableAgent, mastra } = await makeAgentWithSnapshot('resume-dispatch-failure', runId, {
+        value: {},
+        context: {},
+        suspendedPaths: { 'agentic-loop': [0] },
+        resumeLabels: {},
+      });
+      const sendSpy = vi.spyOn(inngest as any, 'send').mockRejectedValueOnce(new Error('inngest unavailable'));
+
+      try {
+        await expect(durableAgent.resume(runId, { answer: 'yes' })).rejects.toThrow('inngest unavailable');
+        // A lost acknowledgement may already have queued the worker. Its
+        // admitted identity must survive even though the caller sees failure.
+        expect(globalRunRegistry.get(runId)).toMatchObject({ runtimeBindingId: `${runId}-binding` });
+        expect(sendSpy).toHaveBeenCalledTimes(1);
+        const workflowsStore = await mastra.getStorage()!.getStore('workflows');
+        await expect(
+          workflowsStore.loadWorkflowSnapshot({
+            workflowName: workflowIdsFor('resume-dispatch-failure').AGENTIC_LOOP,
+            runId,
+          }),
+        ).resolves.toMatchObject({
+          status: 'running',
+          resumeCheckpoint: { runId },
+        });
+      } finally {
+        globalRunRegistry.delete(runId);
+        sendSpy.mockRestore();
+        await mastra.shutdown();
+      }
+    });
+  });
+
   it('exposes generate() and resumeGenerate() with durable signatures', () => {
     // Slice 5 surface check. The Proxy used to forward both methods to the
     // underlying Agent; after parity work generate() must be the durable
@@ -1805,5 +2036,199 @@ describe('InngestAgent parity surface', () => {
     // durable replacement is the function defined on the inngestAgent object
     // itself, so it should NOT be the agent's bound generate.
     expect(durableAgent.generate).not.toBe((durableAgent.agent as any).generate);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Observability tracing (regression for #19841)
+//
+// The Inngest wrapper used to call prepareForDurableExecution() without a
+// `mastra` instance, so the preparation phase could not open its AGENT_RUN root
+// and every span it parents (input processors, memory recall) was dropped or
+// orphaned into whatever trace the caller happened to supply. The wrapper then
+// minted a *second* AGENT_RUN of its own, producing two traces per run.
+//
+// These tests drive the driver-side preparation path with a recording
+// observability instance and assert a single root with correctly parented
+// children.
+// ---------------------------------------------------------------------------
+describe('InngestAgent observability tracing', () => {
+  const inngest = new Inngest({
+    id: 'observability-tests',
+    baseUrl: `http://localhost:${INNGEST_PORT}`,
+  });
+
+  function createRecordingObservability() {
+    const spans: any[] = [];
+    let idCounter = 0;
+
+    function makeSpan(opts: any, parent?: any): any {
+      idCounter += 1;
+      const span: any = {
+        id: `span-${idCounter}`,
+        traceId: parent?.traceId ?? `trace-${idCounter}`,
+        type: opts?.type,
+        name: opts?.name,
+        input: opts?.input,
+        parent,
+        end: vi.fn(),
+        error: vi.fn(),
+        update: vi.fn(),
+        findParent: (spanType: string) => {
+          let current = span.parent;
+          while (current) {
+            if (current.type === spanType) return current;
+            current = current.parent;
+          }
+          return undefined;
+        },
+        createChildSpan: (childOpts: any) => makeSpan(childOpts, span),
+        createEventSpan: (childOpts: any) => makeSpan(childOpts, span),
+        executeInContext: async (fn: () => Promise<any>) => fn(),
+        executeInContextSync: (fn: () => any) => fn(),
+        createTracker: () => ({
+          getTracingContext: () => ({ currentSpan: span }),
+          reportGenerationError: vi.fn(),
+          endGeneration: vi.fn(),
+          updateGeneration: vi.fn(),
+          wrapStream: <T>(stream: T) => stream,
+          startStep: vi.fn(),
+          startInference: vi.fn(),
+          updateStep: vi.fn(),
+          setStepIndex: vi.fn(),
+          setDeferStepClose: vi.fn(),
+          setInferenceContext: vi.fn(),
+          exportCurrentStep: vi.fn(),
+          getPendingStepFinishPayload: vi.fn(),
+        }),
+        exportSpan: () => ({ id: span.id, traceId: span.traceId, type: span.type }),
+        getParentSpanId: () => parent?.id,
+        getCorrelationContext: vi.fn(),
+        observabilityInstance: {},
+      };
+      spans.push(span);
+      return span;
+    }
+
+    const mastra = new Mastra({
+      logger: false,
+      storage: new DefaultStorage({ id: 'tracing-storage', url: ':memory:' }),
+    });
+    vi.spyOn(mastra, 'observability', 'get').mockReturnValue({
+      getSelectedInstance: () => ({
+        startSpan: (opts: any) => makeSpan(opts),
+      }),
+    } as any);
+
+    return {
+      mastra,
+      spans,
+      spansOfType: (type: string) => spans.filter(span => span.type === type),
+    };
+  }
+
+  function makeTracedAgent(id: string, inputProcessors: any[] = []) {
+    const agent = new Agent({
+      id,
+      name: id,
+      instructions: 'Test',
+      model: createMockModel() as any,
+      ...(inputProcessors.length > 0 ? { inputProcessors } : {}),
+    });
+    const durableAgent = createInngestAgent({ agent, inngest });
+    (durableAgent.pubsub as any).inner = new EventEmitterPubSub();
+    return durableAgent;
+  }
+
+  it('opens exactly one AGENT_RUN span per durable run', async () => {
+    // The wrapper used to mint its own AGENT_RUN on top of preparation's, so a
+    // single run reported two roots on two different traces.
+    const durableAgent = makeTracedAgent('tracing-single-root');
+    const recording = createRecordingObservability();
+    recording.mastra.addAgent(durableAgent);
+    const sendSpy = vi.spyOn(inngest as any, 'send').mockResolvedValue({ ids: ['tracing-event'] } as any);
+
+    const result = await durableAgent.stream([{ role: 'user', content: 'hi' }]);
+    try {
+      await globalRunRegistry.get(result.runId)?.workflowExecution;
+      const agentRuns = recording.spansOfType('agent_run');
+      expect(agentRuns).toHaveLength(1);
+      expect(agentRuns[0].parent).toBeUndefined();
+
+      // Every span produced by the run shares the root's traceId.
+      const traceIds = new Set(recording.spans.map(span => span.traceId));
+      expect(traceIds).toEqual(new Set([agentRuns[0].traceId]));
+    } finally {
+      result.cleanup();
+      sendSpy.mockRestore();
+      await recording.mastra.shutdown();
+    }
+  });
+
+  it('parents preparation-phase input processor spans to the AGENT_RUN root', async () => {
+    const durableAgent = makeTracedAgent('tracing-input-proc', [
+      { id: 'test-input-processor', processInput: async ({ messageList }: any) => messageList },
+    ]);
+    const recording = createRecordingObservability();
+    recording.mastra.addAgent(durableAgent);
+    const sendSpy = vi.spyOn(inngest as any, 'send').mockResolvedValue({ ids: ['tracing-event'] } as any);
+
+    const result = await durableAgent.stream([{ role: 'user', content: 'hi' }]);
+    try {
+      await globalRunRegistry.get(result.runId)?.workflowExecution;
+      const agentRun = recording.spansOfType('agent_run')[0];
+      expect(agentRun).toBeDefined();
+
+      const processorSpan = recording
+        .spansOfType('processor_run')
+        .find(span => span.name === 'input processor: test-input-processor');
+      expect(processorSpan).toBeDefined();
+      // Used to be a parentless root on its own trace.
+      expect(processorSpan.findParent('agent_run')).toBe(agentRun);
+      expect(processorSpan.traceId).toBe(agentRun.traceId);
+    } finally {
+      result.cleanup();
+      sendSpy.mockRestore();
+      await recording.mastra.shutdown();
+    }
+  });
+
+  it('records the caller messages as AGENT_RUN input, not serialized message-list state', async () => {
+    const durableAgent = makeTracedAgent('tracing-span-input');
+    const recording = createRecordingObservability();
+    recording.mastra.addAgent(durableAgent);
+    const sendSpy = vi.spyOn(inngest as any, 'send').mockResolvedValue({ ids: ['tracing-event'] } as any);
+
+    const result = await durableAgent.stream([{ role: 'user', content: 'hi' }]);
+    try {
+      await globalRunRegistry.get(result.runId)?.workflowExecution;
+      const agentRun = recording.spansOfType('agent_run')[0];
+      expect(agentRun.input).toEqual([{ role: 'user', content: 'hi' }]);
+      // messageListState is the internal serialized shape the wrapper used to record.
+      expect(agentRun.input).not.toHaveProperty('messageListState');
+    } finally {
+      result.cleanup();
+      sendSpy.mockRestore();
+      await recording.mastra.shutdown();
+    }
+  });
+
+  it('exports preparation spans onto workflowInput from prepare()', async () => {
+    const durableAgent = makeTracedAgent('tracing-prepare');
+    const recording = createRecordingObservability();
+    recording.mastra.addAgent(durableAgent);
+
+    try {
+      const prepared = await durableAgent.prepare([{ role: 'user', content: 'hi' }]);
+
+      const agentRun = recording.spansOfType('agent_run')[0];
+      expect(agentRun).toBeDefined();
+      expect(prepared.workflowInput.agentSpanData).toMatchObject({
+        id: agentRun.id,
+        traceId: agentRun.traceId,
+      });
+    } finally {
+      await recording.mastra.shutdown();
+    }
   });
 });

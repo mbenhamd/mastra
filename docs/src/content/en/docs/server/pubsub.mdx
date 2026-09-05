@@ -1,6 +1,6 @@
 ---
 title: "PubSub | Server"
-description: Learn how Mastra uses pub/sub to deliver events between components and when to configure a distributed backend for multi-process or multi-instance deployments.
+description: "Configure Mastra PubSub event delivery for components, resumable streams, workers, and schedules across one process, multiple processes, or distributed instances."
 packages:
   - "@mastra/core"
   - "@mastra/redis-streams"
@@ -11,7 +11,7 @@ packages:
 
 Mastra uses a publish/subscribe (pub/sub) system as its internal event bus. Components publish events to topics, and other components subscribe to those topics to react. The backend you configure decides how far those events travel: within one process or across processes on one host, or alternatively across separate instances.
 
-You set the backend once on the `Mastra` instance, and the rest of the system uses it without changes. By default, Mastra uses an in-process backend that needs no setup.
+Set the backend once on the `Mastra` instance for use throughout the system. The default is an in-process backend that requires no setup.
 
 ## How Mastra uses PubSub
 
@@ -112,7 +112,7 @@ The bracketed parent path is skipped for a root workflow. The journal reserves o
 
 `persistWorkflowTerminalState` is the only operation that can enter `run_state_persisted`. It replaces the canonical workflow snapshot and advances the journal in one in-memory critical section or PostgreSQL transaction, so the phase can't certify a snapshot that was never written. The canonical snapshot remains replaceable. A later producer-outbox capability must retain immutable recovery evidence before source acknowledgment. Generic phase advancement can't enter snapshot, outbox, or effect-evidence phases. Each evidence-producing capability owns its atomic transition.
 
-This storage capability is an adapter primitive, so configuring a supporting store doesn't by itself change workflow-event execution. A runtime consuming it must fail visibly when durable mode is requested with an unsupported adapter and keep the original event or a durable outbox payload available for recovery. It must also use a stable idempotency key for every external effect and acknowledge the source event only after `complete`. The journal alone doesn't store an effect payload and doesn't claim exactly-once delivery.
+This storage capability is an adapter primitive, so configuring a supporting store doesn't by itself change workflow-event execution. A runtime consuming it must fail visibly when durable mode is requested with an unsupported adapter and keep the original event or a durable outbox payload available for recovery. It must also use a stable idempotency key for every external effect and acknowledge the source event only after `complete`. The journal provides no effect-payload storage or exactly-once delivery guarantee.
 
 Completed records deliberately survive normal workflow-run deletion. Delete them only after a retention horizon longer than every broker redelivery and reclaim window. Deleting deduplication evidence earlier allows a sufficiently late delivery to acquire the run again.
 

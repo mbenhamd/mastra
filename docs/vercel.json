@@ -867,12 +867,12 @@
     },
     {
       "source": "/docs/observability/datasets/overview",
-      "destination": "/docs/datasets/overview",
+      "destination": "/docs/evals/datasets",
       "permanent": true
     },
     {
       "source": "/docs/observability/datasets/running-experiments",
-      "destination": "/docs/datasets/running-experiments",
+      "destination": "/docs/evals/experiments",
       "permanent": true
     },
     {
@@ -957,11 +957,6 @@
     },
     {
       "source": "/docs/harness/modes",
-      "destination": "/docs/harness/agent-controller",
-      "permanent": true
-    },
-    {
-      "source": "/docs/harness/overview",
       "destination": "/docs/harness/agent-controller",
       "permanent": true
     },
@@ -1228,11 +1223,6 @@
     {
       "source": "/docs/voice/:path*",
       "destination": "/reference/voice/:path*",
-      "permanent": true
-    },
-    {
-      "source": "/docs/evals/datasets/:path*",
-      "destination": "/docs/datasets/:path*",
       "permanent": true
     },
     {
@@ -2216,6 +2206,31 @@
       "permanent": true
     },
     {
+      "source": "/docs/observability/metrics/querying",
+      "destination": "/reference/observability/metrics/queries",
+      "permanent": true
+    },
+    {
+      "source": "/docs/datasets/running-experiments",
+      "destination": "/docs/evals/experiments",
+      "permanent": true
+    },
+    {
+      "source": "/docs/datasets/:path*",
+      "destination": "/docs/evals/datasets",
+      "permanent": true
+    },
+    {
+      "source": "/docs/evals/datasets/overview",
+      "destination": "/docs/evals/datasets",
+      "permanent": true
+    },
+    {
+      "source": "/docs/evals/datasets/running-experiments",
+      "destination": "/docs/evals/experiments",
+      "permanent": true
+    },
+    {
       "source": "/docs/workspace/overview/llms.txt",
       "destination": "/docs/sandbox/overview/llms.txt",
       "permanent": true
@@ -2802,12 +2817,12 @@
     },
     {
       "source": "/docs/observability/datasets/overview/llms.txt",
-      "destination": "/docs/datasets/overview/llms.txt",
+      "destination": "/docs/evals/datasets/llms.txt",
       "permanent": true
     },
     {
       "source": "/docs/observability/datasets/running-experiments/llms.txt",
-      "destination": "/docs/datasets/running-experiments/llms.txt",
+      "destination": "/docs/evals/experiments/llms.txt",
       "permanent": true
     },
     {
@@ -2892,11 +2907,6 @@
     },
     {
       "source": "/docs/harness/modes/llms.txt",
-      "destination": "/docs/harness/agent-controller/llms.txt",
-      "permanent": true
-    },
-    {
-      "source": "/docs/harness/overview/llms.txt",
       "destination": "/docs/harness/agent-controller/llms.txt",
       "permanent": true
     },
@@ -3078,11 +3088,6 @@
     {
       "source": "/docs/voice/:path*/llms.txt",
       "destination": "/reference/voice/:path*/llms.txt",
-      "permanent": true
-    },
-    {
-      "source": "/docs/evals/datasets/:path*/llms.txt",
-      "destination": "/docs/datasets/:path*/llms.txt",
       "permanent": true
     },
     {
@@ -4013,6 +4018,31 @@
     {
       "source": "/docs/agents/llms.txt",
       "destination": "/docs/agents/overview/llms.txt",
+      "permanent": true
+    },
+    {
+      "source": "/docs/observability/metrics/querying/llms.txt",
+      "destination": "/reference/observability/metrics/queries/llms.txt",
+      "permanent": true
+    },
+    {
+      "source": "/docs/datasets/running-experiments/llms.txt",
+      "destination": "/docs/evals/experiments/llms.txt",
+      "permanent": true
+    },
+    {
+      "source": "/docs/datasets/:path*/llms.txt",
+      "destination": "/docs/evals/datasets/llms.txt",
+      "permanent": true
+    },
+    {
+      "source": "/docs/evals/datasets/overview/llms.txt",
+      "destination": "/docs/evals/datasets/llms.txt",
+      "permanent": true
+    },
+    {
+      "source": "/docs/evals/datasets/running-experiments/llms.txt",
+      "destination": "/docs/evals/experiments/llms.txt",
       "permanent": true
     }
   ]

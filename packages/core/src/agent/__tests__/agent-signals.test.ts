@@ -2113,104 +2113,6 @@ describe('Agent signals', () => {
     expect(retained.has('run-a')).toBe(false);
   });
 
-  it('publishes an authenticated stale-suspension terminal before handing the lease to a new run', async () => {
-    const pubsub = new ControlledLeasePubSub();
-    const ownerRuntime = new AgentThreadStreamRuntime();
-    const followerRuntime = new AgentThreadStreamRuntime();
-    const agent = { id: 'stale-suspension-owner-agent' } as Agent<any, any, any, any>;
-    const target = { resourceId: 'stale-suspension-user', threadId: 'stale-suspension-thread' };
-    const key = `${target.resourceId}\u0000${target.threadId}`;
-    const oldRunId = 'stale-suspension-old-run';
-    const newRunId = 'stale-suspension-new-run';
-    let now = 1_000_000;
-    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => now);
-    const subscription = await followerRuntime.subscribeToThread(agent, target, pubsub);
-    const iterator = subscription.stream[Symbol.asyncIterator]();
-
-    try {
-      const oldCompletion = ownerRuntime.registerRun(
-        agent,
-        {
-          runId: oldRunId,
-          status: 'suspended',
-          fullStream: (async function* () {
-            yield { type: 'start', runId: oldRunId };
-            yield {
-              type: 'tool-call-approval',
-              runId: oldRunId,
-              payload: { toolCallId: 'stale-tool-call', toolName: 'testTool' },
-            };
-          })(),
-          _waitUntilFinished: async () => {},
-        } as any,
-        { runId: oldRunId, memory: { resource: target.resourceId, thread: target.threadId } } as any,
-        pubsub,
-      )!;
-      await waitForCondition(
-        () => pubsub.publishedData.some(data => data?.type === 'run-registered' && data.runId === oldRunId),
-        1_000,
-      );
-      await pubsub.flush();
-      expect(pubsub.publishedData.filter(data => data?.runId === oldRunId).map(data => data.type)).toContain(
-        'stream-part',
-      );
-      expect(subscription.activeRunId()).toBe(oldRunId);
-      await expect(withTimeout(iterator.next(), 'Timed out waiting for stale suspended start')).resolves.toMatchObject({
-        value: { type: 'start', runId: oldRunId },
-      });
-      await expect(
-        withTimeout(iterator.next(), 'Timed out waiting for stale suspended approval'),
-      ).resolves.toMatchObject({
-        value: { type: 'tool-call-approval', runId: oldRunId },
-      });
-      await oldCompletion;
-      await pubsub.flush();
-      await waitForCondition(() => subscription.activeRunId() === oldRunId);
-      const oldRegistration = pubsub.publishedData.find(
-        data => data?.type === 'run-registered' && data.runId === oldRunId,
-      )!;
-
-      now += 30 * 60 * 1_000 + 1;
-      let finishNewRun!: () => void;
-      const newRunFinished = new Promise<void>(resolve => (finishNewRun = resolve));
-      const newCompletion = ownerRuntime.registerRun(
-        agent,
-        {
-          runId: newRunId,
-          status: 'running',
-          fullStream: (async function* () {
-            yield { type: 'start', runId: newRunId };
-            await newRunFinished;
-            yield { type: 'finish', runId: newRunId };
-          })(),
-          _waitUntilFinished: () => newRunFinished,
-        } as any,
-        { runId: newRunId, memory: { resource: target.resourceId, thread: target.threadId } } as any,
-        pubsub,
-      )!;
-      await expect(withTimeout(iterator.next(), 'Timed out waiting for the post-sweep run')).resolves.toMatchObject({
-        value: { type: 'start', runId: newRunId },
-      });
-      await pubsub.flush();
-      const staleTerminal = pubsub.publishedData.find(
-        data => data?.type === 'run-completed' && data.runId === oldRunId,
-      );
-      expect(staleTerminal?.streamId).toBe(oldRegistration.streamId);
-      expect(staleTerminal?.leaseOwner).toBe(oldRegistration.leaseOwner);
-      await waitForCondition(() => subscription.activeRunId() === newRunId);
-      expect(pubsub.owners.get(key)).not.toBe(oldRegistration.leaseOwner);
-
-      finishNewRun();
-      await newCompletion;
-      await pubsub.flush();
-      await waitForCondition(() => subscription.activeRunId() === null);
-    } finally {
-      nowSpy.mockRestore();
-      subscription.unsubscribe();
-      await iterator.return?.();
-    }
-  });
-
   it('cancels an abort-ignoring subscriber stream after the bounded drain grace', async () => {
     const runtime = new AgentThreadStreamRuntime();
     const pubsub = new ControlledLeasePubSub();
@@ -6152,6 +6054,200 @@ describe('Agent signals', () => {
     await expect(wait).resolves.toBeUndefined();
     expect(pubsub.unsubscribeCount).toBeGreaterThanOrEqual(1);
     subscription.unsubscribe();
+  });
+
+  describe('same-agent thread serialization', () => {
+    const threadId = 'same-agent-wait-thread';
+    const resourceId = 'same-agent-wait-user';
+
+    const registerRunningRun = async (
+      runtime: AgentThreadStreamRuntime,
+      agent: Agent<any, any, any, any>,
+      runId: string,
+    ) => {
+      let finish!: () => void;
+      const finished = new Promise<void>(resolve => {
+        finish = resolve;
+      });
+      const output = {
+        runId,
+        status: 'running',
+        fullStream: new ReadableStream({
+          start(controller) {
+            void finished.then(() => controller.close());
+          },
+        }),
+        _waitUntilFinished: () => finished,
+      } as any;
+      const completion = runtime.registerRun(agent, output, {
+        memory: { thread: threadId, resource: resourceId },
+      } as any);
+      void completion?.catch(() => {});
+      return {
+        output,
+        finish: () => {
+          output.status = 'success';
+          finish();
+        },
+      };
+    };
+
+    it('parks a same-agent reservation retry behind an actively running record', async () => {
+      const runtime = new AgentThreadStreamRuntime();
+      const agent = { id: 'same-agent-wait-agent' } as Agent<any, any, any, any>;
+      const run = await registerRunningRun(runtime, agent, 'same-agent-wait-run-1');
+
+      let resolved = false;
+      const wait = runtime
+        .waitForThreadRunReservation(
+          {
+            runId: 'same-agent-wait-run-2',
+            memory: { thread: threadId, resource: resourceId },
+          },
+          undefined,
+          agent.id,
+        )
+        .then(() => {
+          resolved = true;
+        });
+      await new Promise(resolve => setTimeout(resolve, 25));
+      expect(resolved).toBe(false);
+
+      run.finish();
+      await withTimeout(wait, 'Timed out waiting for the same-agent wait to release');
+      expect(resolved).toBe(true);
+    });
+
+    it('does not wait when the caller targets the active run (continuation)', async () => {
+      const runtime = new AgentThreadStreamRuntime();
+      const agent = { id: 'same-agent-continuation-agent' } as Agent<any, any, any, any>;
+      const run = await registerRunningRun(runtime, agent, 'same-agent-continuation-run');
+
+      await withTimeout(
+        runtime.waitForCrossAgentThreadRun(agent, {
+          memory: { thread: threadId, resource: resourceId },
+          runId: 'same-agent-continuation-run',
+        }),
+        'Continuation wait should resolve immediately',
+      );
+
+      run.finish();
+    });
+
+    it('does not wait on a same-agent suspended record', async () => {
+      const runtime = new AgentThreadStreamRuntime();
+      const agent = { id: 'same-agent-suspended-agent' } as Agent<any, any, any, any>;
+      const run = await registerRunningRun(runtime, agent, 'same-agent-suspended-run');
+      run.output.status = 'suspended';
+
+      await withTimeout(
+        runtime.waitForCrossAgentThreadRun(agent, { memory: { thread: threadId, resource: resourceId } }),
+        'Suspended-record wait should resolve immediately',
+      );
+
+      run.finish();
+    });
+
+    it('still waits on a different-agent running record', async () => {
+      const runtime = new AgentThreadStreamRuntime();
+      const owner = { id: 'other-agent-owner' } as Agent<any, any, any, any>;
+      const run = await registerRunningRun(runtime, owner, 'other-agent-run');
+
+      let resolved = false;
+      const wait = runtime
+        .waitForCrossAgentThreadRun({ id: 'other-agent-contender' } as Agent<any, any, any, any>, {
+          memory: { thread: threadId, resource: resourceId },
+        })
+        .then(() => {
+          resolved = true;
+        });
+      await new Promise(resolve => setTimeout(resolve, 25));
+      expect(resolved).toBe(false);
+
+      run.finish();
+      await withTimeout(wait, 'Timed out waiting for the cross-agent wait to release');
+      expect(resolved).toBe(true);
+    });
+
+    it('serializes two concurrent agent.stream() calls on the same thread', async () => {
+      let concurrent = 0;
+      let maxConcurrent = 0;
+      const model = new MockLanguageModelV2({
+        doStream: async () => {
+          concurrent += 1;
+          maxConcurrent = Math.max(maxConcurrent, concurrent);
+          await new Promise(resolve => setTimeout(resolve, 25));
+          concurrent -= 1;
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: convertArrayToReadableStream([
+              { type: 'stream-start', warnings: [] },
+              { type: 'response-metadata', id: 'id-0', modelId: 'mock-model-id', timestamp: new Date(0) },
+              { type: 'text-start', id: 'text-1' },
+              { type: 'text-delta', id: 'text-1', delta: 'serialized response' },
+              { type: 'text-end', id: 'text-1' },
+              {
+                type: 'finish',
+                finishReason: 'stop',
+                usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+              },
+            ]),
+          };
+        },
+      });
+      const agent = new Agent({
+        id: 'concurrent-stream-agent',
+        name: 'Concurrent Stream Agent',
+        instructions: 'Test',
+        model,
+      });
+      const memory = { thread: 'concurrent-stream-thread', resource: 'concurrent-stream-user' };
+
+      const [first, second] = await Promise.all([
+        agent.stream('first message', { memory }),
+        agent.stream('second message', { memory }),
+      ]);
+      await Promise.all([first.consumeStream(), second.consumeStream()]);
+
+      expect(maxConcurrent).toBe(1);
+    });
+
+    it('does not reserve or wait for a read-only same-thread stream while a parent run is active', async () => {
+      const { model, releaseFirst, getStreamCount } = createBlockingFirstTextStreamModel(
+        'parent response',
+        'read-only response',
+      );
+      const agent = new Agent({
+        id: 'read-only-reentrant-stream-agent',
+        name: 'Read-only Reentrant Stream Agent',
+        instructions: 'Test',
+        model,
+      });
+      const memory = { thread: 'read-only-reentrant-thread', resource: 'read-only-reentrant-user' };
+      const target = { threadId: memory.thread, resourceId: memory.resource };
+
+      const parent = await agent.stream('parent message', { memory });
+      const parentConsumption = parent.consumeStream();
+      try {
+        await waitForCondition(() => getStreamCount() === 1);
+        expect(agentThreadStreamRuntime.getActiveThreadRunId(target)).toBe(parent.runId);
+
+        const readOnly = await withTimeout(
+          agent.stream('structure the parent response', {
+            memory: { ...memory, options: { readOnly: true } },
+          }),
+          'Read-only same-thread stream waited for its active parent',
+        );
+        await withTimeout(readOnly.consumeStream(), 'Read-only same-thread stream did not complete');
+
+        expect(getStreamCount()).toBe(2);
+        expect(agentThreadStreamRuntime.getActiveThreadRunId(target)).toBe(parent.runId);
+      } finally {
+        releaseFirst();
+        await parentConsumption;
+      }
+    });
   });
 
   it('routes remote abort requests to only the live lease owner', async () => {

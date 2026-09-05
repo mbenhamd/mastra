@@ -508,6 +508,8 @@ describe('loadMcpConfig', () => {
     previousUserProfile = process.env.USERPROFILE;
     previousCodexHome = process.env.CODEX_HOME;
     previousCodexToken = process.env.CODEX_TOKEN;
+    // External Codex discovery must stay inside this test's isolated home.
+    delete process.env.CODEX_HOME;
     process.env.HOME = homeDir;
     process.env.USERPROFILE = homeDir;
   });

@@ -28,8 +28,8 @@ import { createDurableAgent } from '../create-durable-agent';
 import type { DurableAgent } from '../durable-agent';
 import { globalRunRegistry } from '../run-registry';
 import { emitChunkEvent, emitFinishEvent } from '../stream-adapter';
-import type { DurableAgenticWorkflowInput, SerializableDurableOptions } from '../types';
-import { serializeModelConfig } from '../utils/serialize-state';
+import type { DurableAgenticWorkflowInput, SerializableDurableOptions, SerializableModelListEntry } from '../types';
+import { serializeModelConfig, serializeModelList } from '../utils/serialize-state';
 
 const RECOVERY_LEASE_RENEW_INTERVAL_MS_FOR_TEST = 10_000;
 
@@ -39,6 +39,8 @@ function makeSnapshot(
   agentId: string,
   options: SerializableDurableOptions = {},
   inputOverrides: Partial<DurableAgenticWorkflowInput> = {},
+  requestContextEntries: Record<string, unknown> = { userId: 'u-1' },
+  modelList?: SerializableModelListEntry[],
 ): WorkflowRunState {
   return {
     runId,
@@ -54,10 +56,14 @@ function makeSnapshot(
         agentName: agentId,
         messageListState: new MessageList({ threadId: 't', resourceId: 'r' }).serialize(),
         toolsMetadata: [],
-        modelConfig: serializeModelConfig(makeMockModel() as any),
+        // Real preparation persists the first enabled fallback as both the
+        // primary model and the first model-list entry. Keep hand-built
+        // snapshots coherent with that exact-binding contract.
+        modelConfig: modelList?.[0]?.config ?? serializeModelConfig(makeMockModel() as any),
         runtimeBindings: {},
         options,
-        requestContextEntries: { userId: 'u-1' },
+        requestContextEntries,
+        ...(modelList ? { modelList } : {}),
         state: { threadId: 't', resourceId: 'r' },
         messageId: `message-${runId}`,
         ...inputOverrides,
@@ -73,8 +79,9 @@ function makeSnapshot(
   } as WorkflowRunState;
 }
 
-function makeMockModel(): LanguageModelV2 {
+function makeMockModel(modelId?: string): LanguageModelV2 {
   return new MockLanguageModelV2({
+    ...(modelId ? { modelId } : {}),
     doStream: async () => ({
       stream: convertArrayToReadableStream([
         { type: 'text-delta', textDelta: 'ok' },
@@ -108,19 +115,21 @@ async function seed(
   agentId: string,
   options: SerializableDurableOptions = {},
   inputOverrides: Partial<DurableAgenticWorkflowInput> = {},
+  requestContextEntries: Record<string, unknown> = { userId: 'u-1' },
+  modelList?: SerializableModelListEntry[],
 ) {
   const workflows = (await store.getStore('workflows'))!;
   await workflows.persistWorkflowSnapshot({
     workflowName: DurableStepIds.AGENTIC_LOOP,
     runId,
     resourceId: 'r',
-    snapshot: makeSnapshot(runId, status, agentId, options, inputOverrides),
+    snapshot: makeSnapshot(runId, status, agentId, options, inputOverrides, requestContextEntries, modelList),
   });
   await workflows.persistWorkflowSnapshot({
     workflowName: DurableStepIds.AGENTIC_EXECUTION,
     runId,
     resourceId: 'r',
-    snapshot: makeSnapshot(runId, status, agentId, options, inputOverrides),
+    snapshot: makeSnapshot(runId, status, agentId, options, inputOverrides, requestContextEntries, modelList),
   });
 }
 
@@ -192,6 +201,105 @@ describe('DurableAgent.recover(runId)', () => {
 
     await entry?.workflowExecution;
     cleanup();
+  });
+
+  it('rehydrates signal draining for signals delivered after recovery', async () => {
+    const runId = 'run-recovered-signal';
+    await seed(store, runId, 'running', 'agent-A');
+    stubWorkflow(agent, 'success');
+
+    const recovered = await agent.recover(runId);
+    const signalResult = agent.sendSignal(
+      { type: 'user-message', contents: 'after restart' },
+      { runId, resourceId: 'r', threadId: 't' },
+    );
+
+    await expect(signalResult.accepted).resolves.toEqual({ action: 'deliver', runId });
+    const drainPendingSignals = globalRunRegistry.get(runId)?.drainPendingSignals;
+    expect(drainPendingSignals).toBeTypeOf('function');
+    expect(drainPendingSignals?.('pending')).toEqual([
+      expect.objectContaining({ type: 'user', contents: 'after restart' }),
+    ]);
+
+    await globalRunRegistry.get(runId)?.workflowExecution;
+    recovered.cleanup();
+  });
+
+  it("replaces a snapshotted parent memory context with the recovered run's persisted context", async () => {
+    const runId = 'run-recovered-context';
+    const recoveredContexts: unknown[] = [];
+    const baseAgent = new Agent({
+      id: 'agent-recovered-context',
+      name: 'Recovered Context Agent',
+      instructions: 'x',
+      model: makeMockModel(),
+      outputProcessors: ({ requestContext }) => {
+        recoveredContexts.push(requestContext.get('MastraMemory'));
+        return [];
+      },
+    });
+    const recoveryStore = new InMemoryStore();
+    const recoveryAgent = createDurableAgent({ agent: baseAgent });
+    new Mastra({ agents: { recoveredContext: recoveryAgent as any }, storage: recoveryStore, logger: false });
+    await seed(
+      recoveryStore,
+      runId,
+      'running',
+      recoveryAgent.id,
+      {},
+      {},
+      {
+        userId: 'u-1',
+        MastraMemory: { thread: { id: 'parent-thread' }, resourceId: 'parent-resource' },
+      },
+    );
+
+    stubWorkflow(recoveryAgent, 'success');
+
+    const recovered = await recoveryAgent.recover(runId);
+    await globalRunRegistry.get(runId)?.workflowExecution;
+
+    expect(recoveredContexts).toContainEqual({
+      thread: { id: 't' },
+      resourceId: 'r',
+      memoryConfig: undefined,
+    });
+    recovered.cleanup();
+  });
+
+  it('fails closed when a recovered run had request-local processor state', async () => {
+    const runId = 'run-recovered-output-processor';
+    const processOutputStream = vi.fn();
+    const baseAgent = new Agent({
+      id: 'agent-recovered-output-processor',
+      name: 'Recovered Output Processor Agent',
+      instructions: 'x',
+      model: makeMockModel(),
+      outputProcessors: [{ id: 'recover-uppercase', processOutputStream } as any],
+    });
+    const recoveryStore = new InMemoryStore();
+    const recoveryAgent = createDurableAgent({ agent: baseAgent });
+    new Mastra({
+      agents: { recoveredOutputProcessor: recoveryAgent as any },
+      storage: recoveryStore,
+      logger: false,
+    });
+    await seed(
+      recoveryStore,
+      runId,
+      'running',
+      recoveryAgent.id,
+      {},
+      {
+        hasProcessors: true,
+      },
+    );
+
+    await expect(recoveryAgent.recover(runId)).rejects.toMatchObject({
+      id: 'DURABLE_AGENT_RESUME_PROCESSOR_STATE_UNRECOVERABLE',
+    });
+    expect(processOutputStream).not.toHaveBeenCalled();
+    expect(globalRunRegistry.has(runId)).toBe(false);
   });
 
   it('re-reads the authoritative snapshot after acquiring recovery ownership', async () => {
@@ -314,14 +422,14 @@ describe('DurableAgent.recover(runId)', () => {
 
       releaseRestart();
       await globalRunRegistry.get(runId)?.workflowExecution;
+
+      // Observer cleanup must not release the thread lease for a logical run
+      // that remains suspended. Sequential takeover belongs to the explicit
+      // owner-termination/lease-expiry contract, not stream cleanup.
       firstRecovery.cleanup();
       firstRecovery = undefined;
-
-      const secondRecovery = await secondAgent.recover(runId);
-      await globalRunRegistry.get(runId)?.workflowExecution;
-      expect(secondWorkflow.createRun).toHaveBeenCalledTimes(1);
-      expect(registerRun).toHaveBeenCalledTimes(2);
-      secondRecovery.cleanup();
+      expect(secondWorkflow.createRun).not.toHaveBeenCalled();
+      expect(registerRun).toHaveBeenCalledTimes(1);
     } finally {
       releaseRestart();
       await globalRunRegistry.get(runId)?.workflowExecution?.catch(() => {});
@@ -459,6 +567,111 @@ describe('DurableAgent.recover(runId)', () => {
       await globalRunRegistry.get(runId)?.workflowExecution?.catch(() => {});
       recovery?.cleanup();
     }
+  });
+
+  it('waits for an in-flight recovery renewal before releasing the same owner lease', async () => {
+    vi.useFakeTimers();
+    const runId = 'run-renewal-release-order';
+    const orderedStore = new InMemoryStore();
+    const orderedPubsub = new EventEmitterPubSub();
+    const actualRenewLease = orderedPubsub.renewLease.bind(orderedPubsub);
+    let resolveRenewal!: (renewed: boolean) => void;
+    const renewalPending = new Promise<boolean>(resolve => {
+      resolveRenewal = resolve;
+    });
+    const renewLease = vi.spyOn(orderedPubsub, 'renewLease').mockImplementation((key, owner, ttlMs) => {
+      if (key.startsWith('mastra:durable-agent-recovery:')) return renewalPending;
+      return actualRenewLease(key, owner, ttlMs);
+    });
+    const releaseLease = vi.spyOn(orderedPubsub, 'releaseLease');
+    const recoveryReleases = () =>
+      releaseLease.mock.calls.filter(([key]) => key.startsWith('mastra:durable-agent-recovery:'));
+    const { agent: orderedAgent } = createDurableWithStore('agent-renewal-release-order', orderedStore, orderedPubsub);
+    await seed(orderedStore, runId, 'running', 'agent-renewal-release-order');
+
+    let markRestartStarted!: () => void;
+    const restartStarted = new Promise<void>(resolve => {
+      markRestartStarted = resolve;
+    });
+    let releaseRestart!: () => void;
+    const restartGate = new Promise<void>(resolve => {
+      releaseRestart = resolve;
+    });
+    vi.spyOn(orderedAgent, 'getWorkflow').mockReturnValue({
+      createRun: vi.fn(async () => ({
+        runId,
+        restart: vi.fn(async () => {
+          markRestartStarted();
+          await restartGate;
+          return { status: 'suspended' as const };
+        }),
+      })),
+    } as any);
+
+    const recovered = await orderedAgent.recover(runId);
+    const workflowExecution = globalRunRegistry.get(runId)!.workflowExecution!;
+    await restartStarted;
+    await vi.advanceTimersByTimeAsync(RECOVERY_LEASE_RENEW_INTERVAL_MS_FOR_TEST);
+    expect(renewLease.mock.calls.filter(([key]) => key.startsWith('mastra:durable-agent-recovery:'))).toHaveLength(1);
+
+    releaseRestart();
+    await Promise.resolve();
+    expect(recoveryReleases()).toHaveLength(0);
+
+    resolveRenewal(true);
+    await workflowExecution;
+    expect(recoveryReleases()).toHaveLength(1);
+    recovered.cleanup();
+  });
+
+  it('rejects recovery when an in-flight renewal reports ownership loss during release', async () => {
+    vi.useFakeTimers();
+    const runId = 'run-renewal-release-loss';
+    const lossStore = new InMemoryStore();
+    const lossPubsub = new EventEmitterPubSub();
+    const actualRenewLease = lossPubsub.renewLease.bind(lossPubsub);
+    let resolveRenewal!: (renewed: boolean) => void;
+    const renewalPending = new Promise<boolean>(resolve => {
+      resolveRenewal = resolve;
+    });
+    vi.spyOn(lossPubsub, 'renewLease').mockImplementation((key, owner, ttlMs) => {
+      if (key.startsWith('mastra:durable-agent-recovery:')) return renewalPending;
+      return actualRenewLease(key, owner, ttlMs);
+    });
+    const { agent: lossAgent } = createDurableWithStore('agent-renewal-release-loss', lossStore, lossPubsub);
+    await seed(lossStore, runId, 'running', 'agent-renewal-release-loss');
+
+    let markRestartStarted!: () => void;
+    const restartStarted = new Promise<void>(resolve => {
+      markRestartStarted = resolve;
+    });
+    let releaseRestart!: () => void;
+    const restartGate = new Promise<void>(resolve => {
+      releaseRestart = resolve;
+    });
+    vi.spyOn(lossAgent, 'getWorkflow').mockReturnValue({
+      createRun: vi.fn(async () => ({
+        runId,
+        restart: vi.fn(async () => {
+          markRestartStarted();
+          await restartGate;
+          return { status: 'suspended' as const };
+        }),
+      })),
+    } as any);
+
+    const recovered = await lossAgent.recover(runId);
+    const workflowExecution = globalRunRegistry.get(runId)!.workflowExecution!;
+    await restartStarted;
+    await vi.advanceTimersByTimeAsync(RECOVERY_LEASE_RENEW_INTERVAL_MS_FOR_TEST);
+
+    releaseRestart();
+    await Promise.resolve();
+    resolveRenewal(false);
+
+    await expect(workflowExecution).rejects.toMatchObject({ id: 'DURABLE_AGENT_RECOVER_LEASE_LOST' });
+    expect(globalRunRegistry.get(runId)).toBeUndefined();
+    recovered.cleanup();
   });
 
   it('rolls back before restart when the recovery lease is definitively lost', async () => {
@@ -682,7 +895,10 @@ describe('DurableAgent.recover(runId)', () => {
       storage: dynamicStore,
     });
     expect(modelResolver).not.toHaveBeenCalled();
-    expect(inputProcessorResolver).not.toHaveBeenCalled();
+    // Mastra resolves processors once while registering the durable workflow;
+    // recovery must still take only one new coherent processor snapshot.
+    expect(inputProcessorResolver).toHaveBeenCalledTimes(1);
+    inputProcessorResolver.mockClear();
 
     await seed(dynamicStore, 'run-dynamic-model', 'running', agentId);
     stubWorkflow(durableAgent as any, 'success');
@@ -722,6 +938,35 @@ describe('DurableAgent.recover(runId)', () => {
     expect(processorResolver).toHaveBeenCalledTimes(1);
     expect(getWorkflow).not.toHaveBeenCalled();
     expect(durableAgent.runRegistry.has('run-processor-failure')).toBe(false);
+  });
+
+  it('fails closed when the live agent gained processors after the snapshot was written', async () => {
+    const agentId = 'processor-drift-recover-agent';
+    const processInputStep = vi.fn(({ messages }) => ({ messages }));
+    const processorAgent = new Agent({
+      id: agentId,
+      name: agentId,
+      instructions: 'x',
+      model: makeMockModel(),
+      inputProcessors: [{ id: 'new-live-processor', processInputStep }],
+    });
+    const processorStore = new InMemoryStore();
+    const durableAgent = createDurableAgent({ agent: processorAgent });
+    void new Mastra({
+      agents: { [agentId]: durableAgent as any },
+      storage: processorStore,
+    });
+    // The persisted input intentionally has no `hasProcessors` marker: this
+    // models a run created before the live agent configuration gained one.
+    await seed(processorStore, 'run-processor-drift', 'running', agentId);
+    const getWorkflow = vi.spyOn(durableAgent, 'getWorkflow');
+
+    await expect(durableAgent.recover('run-processor-drift')).rejects.toMatchObject({
+      id: 'DURABLE_AGENT_RESUME_PROCESSOR_STATE_UNRECOVERABLE',
+    });
+    expect(processInputStep).not.toHaveBeenCalled();
+    expect(getWorkflow).not.toHaveBeenCalled();
+    expect(durableAgent.runRegistry.has('run-processor-drift')).toBe(false);
   });
 
   it('throws when the persisted snapshot is not a durable-agent workflow', async () => {
@@ -884,5 +1129,258 @@ describe('DurableAgent.recover(runId)', () => {
     expect(workflow.createRun).not.toHaveBeenCalled();
     expect(globalRunRegistry.get(runId)).toBeUndefined();
     expect(failingAgent.runRegistry.get(runId)).toBeUndefined();
+  });
+
+  it('rehydrates dynamic fallback models with their persisted ids', async () => {
+    const runId = 'run-fallback-recovery';
+
+    // Fresh instances on every resolver call, entries without explicit ids:
+    // normalizeModelFallbacks assigns `id: mdl.id ?? randomUUID()`, so
+    // re-resolution during recovery yields ids that differ from the persisted
+    // ones. Recovery must rebind live entries to the persisted ids, not trust
+    // re-derived ids.
+    let resolveCount = 0;
+    const resolvedCalls: Array<{ a: LanguageModelV2; b: LanguageModelV2 }> = [];
+    const baseAgent = new Agent({
+      id: 'agent-fallback-recovery',
+      name: 'Fallback Recovery Agent',
+      instructions: 'x',
+      model: (() => {
+        const call = ++resolveCount;
+        const a = makeMockModel('primary');
+        const b = makeMockModel('fallback');
+        resolvedCalls.push({ a, b });
+        return [{ model: makeMockModel(`disabled-${call}`), enabled: false }, { model: a }, { model: b }];
+      }) as any,
+    });
+    const recoveryStore = new InMemoryStore();
+    const recoveryAgent = createDurableAgent({ agent: baseAgent });
+    new Mastra({ agents: { fallbackRecovery: recoveryAgent as any }, storage: recoveryStore, logger: false });
+
+    // Persist exactly what preparation persists: serializeModelList(getModelList())
+    // (preparation.ts createWorkflowInput → serialize-state.ts). Resolver call #1.
+    const prepared = await baseAgent.getModelList();
+    const persistedModelList = serializeModelList(prepared!);
+    const persistedIds = persistedModelList.map(m => m.id);
+    expect(persistedIds).toHaveLength(2);
+    expect(new Set(persistedIds).size).toBe(2);
+
+    await seed(recoveryStore, runId, 'running', recoveryAgent.id, {}, {}, undefined, persistedModelList);
+    stubWorkflow(recoveryAgent, 'success');
+
+    const recovered = await recoveryAgent.recover(runId);
+    const entry = globalRunRegistry.get(runId);
+
+    // #22594: recovery restored the primary model but dropped the fallback
+    // list from the registry entry, so cross-process fallback resolution saw
+    // a "hydrated" entry without a modelList and never rebuilt it.
+    expect(entry?.modelList).toBeDefined();
+
+    // Disabled entries stay excluded, mirroring the serializeModelList contract.
+    expect(entry!.modelList).toHaveLength(2);
+    expect(entry!.modelList!.map(m => m.enabled)).toEqual([true, true]);
+
+    // Persisted ids survive recovery so llm-execution's lookup by id
+    // (`resolvedModelList.find(m => m.id === modelEntry.id)`) hits instead of
+    // falling back to config-based reconstruction.
+    expect(entry!.modelList!.map(m => m.id)).toEqual(persistedIds);
+
+    // The recovered list uses fresh live wrappers while preserving the stable
+    // provider/model configuration required by the fork's exact model fence.
+    expect(resolvedCalls.length).toBeGreaterThan(1);
+    expect(entry!.modelList![0]!.model).not.toBe(prepared![0]!.model);
+    expect(entry!.modelList![1]!.model).not.toBe(prepared![1]!.model);
+    expect(entry!.modelList!.map(m => m.model.modelId)).toEqual(['primary', 'fallback']);
+
+    await entry?.workflowExecution;
+    recovered.cleanup();
+  });
+
+  it('keeps modelList undefined after recovery for single-model agents', async () => {
+    await seed(store, 'run-single-model', 'running', 'agent-A');
+    stubWorkflow(agent, 'success');
+
+    const { cleanup } = await agent.recover('run-single-model');
+    const entry = globalRunRegistry.get('run-single-model');
+
+    expect(entry?.modelList).toBeUndefined();
+    await entry?.workflowExecution;
+    cleanup();
+  });
+
+  it('fails closed when the model list drifts between prepare and recovery', async () => {
+    const runId = 'run-fallback-drift';
+
+    // Prepare-time: two enabled entries (one explicit id, one generated).
+    // Recovery-time: only the explicit-id entry remains. Positional binding
+    // would silently attach the wrong model to a persisted id, so the drift
+    // branch must bind by exact id only and drop the rest.
+    let drifted = false;
+    let resolveCount = 0;
+    const baseAgent = new Agent({
+      id: 'agent-fallback-drift',
+      name: 'Fallback Drift Agent',
+      instructions: 'x',
+      model: (() => {
+        const call = ++resolveCount;
+        return drifted
+          ? [{ id: 'stable-model', model: makeMockModel('stable') }]
+          : [{ id: 'stable-model', model: makeMockModel('stable') }, { model: makeMockModel(`extra-${call}`) }];
+      }) as any,
+    });
+    const driftStore = new InMemoryStore();
+    const driftAgent = createDurableAgent({ agent: baseAgent });
+    new Mastra({ agents: { fallbackDrift: driftAgent as any }, storage: driftStore, logger: false });
+
+    const prepared = await baseAgent.getModelList();
+    const persistedModelList = serializeModelList(prepared!);
+    expect(persistedModelList.map(m => m.id)).toContain('stable-model');
+    expect(persistedModelList).toHaveLength(2);
+
+    await seed(driftStore, runId, 'running', driftAgent.id, {}, {}, undefined, persistedModelList);
+    stubWorkflow(driftAgent, 'success');
+
+    drifted = true;
+    await expect(driftAgent.recover(runId)).rejects.toMatchObject({
+      id: 'DURABLE_AGENT_RECOVER_MODEL_BINDING_MISMATCH',
+    });
+    expect(globalRunRegistry.get(runId)).toBeUndefined();
+    expect(driftAgent.runRegistry.get(runId)).toBeUndefined();
+  });
+
+  it('rebinds reordered explicit-id fallback models by their persisted ids', async () => {
+    const runId = 'run-fallback-reorder';
+
+    // Explicit ids are stable across resolutions, but a resolver may return
+    // the same entries in a different order (Map iteration, Promise.all
+    // races, remote lists). With equal counts, positional binding would swap
+    // the models across the persisted ids; binding must follow identity.
+    let reordered = false;
+    const baseAgent = new Agent({
+      id: 'agent-fallback-reorder',
+      name: 'Fallback Reorder Agent',
+      instructions: 'x',
+      model: (() => {
+        const a = { id: 'exp-a', model: makeMockModel('model-a') };
+        const b = { id: 'exp-b', model: makeMockModel('model-b') };
+        return reordered ? [b, a] : [a, b];
+      }) as any,
+    });
+    const reorderStore = new InMemoryStore();
+    const reorderAgent = createDurableAgent({ agent: baseAgent });
+    new Mastra({ agents: { fallbackReorder: reorderAgent as any }, storage: reorderStore, logger: false });
+
+    const prepared = await baseAgent.getModelList();
+    const persistedModelList = serializeModelList(prepared!);
+    expect(persistedModelList.map(m => m.id)).toEqual(['exp-a', 'exp-b']);
+
+    await seed(reorderStore, runId, 'running', reorderAgent.id, {}, {}, undefined, persistedModelList);
+    stubWorkflow(reorderAgent, 'success');
+
+    reordered = true;
+    const recovered = await reorderAgent.recover(runId);
+    const entry = globalRunRegistry.get(runId);
+
+    expect(entry?.modelList).toBeDefined();
+    expect(entry!.modelList!.map(m => m.id).sort()).toEqual(['exp-a', 'exp-b']);
+
+    // Each persisted id must be bound to *its* model, not whichever model
+    // happens to occupy the same position in the reordered resolver output.
+    const boundA = entry!.modelList!.find(m => m.id === 'exp-a')!;
+    const boundB = entry!.modelList!.find(m => m.id === 'exp-b')!;
+    expect(boundA.model.modelId).toBe('model-a');
+    expect(boundB.model.modelId).toBe('model-b');
+    // And to recovery-time live instances, not the stale prepare-time ones.
+    expect(boundA.model).not.toBe(prepared![0]!.model);
+    expect(boundB.model).not.toBe(prepared![1]!.model);
+
+    await entry?.workflowExecution;
+    recovered.cleanup();
+  });
+
+  it('rejects an explicit fallback id substitution even when cardinality is unchanged', async () => {
+    const runId = 'run-fallback-explicit-substitution';
+    let substituted = false;
+    const baseAgent = new Agent({
+      id: 'agent-fallback-explicit-substitution',
+      name: 'Fallback Explicit Substitution Agent',
+      instructions: 'x',
+      model: (() => [
+        {
+          id: substituted ? 'exp-b' : 'exp-a',
+          model: makeMockModel('same-provider-model'),
+        },
+      ]) as any,
+    });
+    const store = new InMemoryStore();
+    const durableAgent = createDurableAgent({ agent: baseAgent });
+    new Mastra({ agents: { fallbackExplicitSubstitution: durableAgent as any }, storage: store, logger: false });
+
+    const prepared = await baseAgent.getModelList();
+    const persistedModelList = serializeModelList(prepared!);
+    expect(persistedModelList).toMatchObject([{ id: 'exp-a', generatedId: false }]);
+    await seed(store, runId, 'running', durableAgent.id, {}, {}, undefined, persistedModelList);
+    stubWorkflow(durableAgent, 'success');
+
+    substituted = true;
+    await expect(durableAgent.recover(runId)).rejects.toMatchObject({
+      id: 'DURABLE_AGENT_RECOVER_MODEL_BINDING_MISMATCH',
+    });
+    expect(globalRunRegistry.get(runId)).toBeUndefined();
+    expect(durableAgent.runRegistry.get(runId)).toBeUndefined();
+  });
+
+  it('binds id-less entries positionally after explicit-id entries match by id', async () => {
+    const runId = 'run-fallback-residue';
+
+    // Mixed list: one id-less entry (uuid regenerates every resolution) and
+    // one explicit-id entry, reordered at recovery. The explicit id must bind
+    // by identity; the persisted uuid entry must then bind to the remaining
+    // id-less live model — not to whatever sits at its original position.
+    let reordered = false;
+    const baseAgent = new Agent({
+      id: 'agent-fallback-residue',
+      name: 'Fallback Residue Agent',
+      instructions: 'x',
+      model: (() => {
+        const idLess = { model: makeMockModel('idless') };
+        const explicit = { id: 'exp-1', model: makeMockModel('explicit') };
+        return reordered ? [explicit, idLess] : [idLess, explicit];
+      }) as any,
+    });
+    const residueStore = new InMemoryStore();
+    const residueAgent = createDurableAgent({ agent: baseAgent });
+    new Mastra({ agents: { fallbackResidue: residueAgent as any }, storage: residueStore, logger: false });
+
+    const prepared = await baseAgent.getModelList();
+    const persistedModelList = serializeModelList(prepared!);
+    expect(persistedModelList).toHaveLength(2);
+    expect(persistedModelList[1]!.id).toBe('exp-1');
+    const persistedUuid = persistedModelList[0]!.id;
+    expect(persistedUuid).not.toBe('exp-1');
+
+    await seed(residueStore, runId, 'running', residueAgent.id, {}, {}, undefined, persistedModelList);
+    stubWorkflow(residueAgent, 'success');
+
+    reordered = true;
+    const recovered = await residueAgent.recover(runId);
+    const entry = globalRunRegistry.get(runId);
+
+    expect(entry?.modelList).toBeDefined();
+    // Persisted order is preserved in the registry entry.
+    expect(entry!.modelList!.map(m => m.id)).toEqual([persistedUuid, 'exp-1']);
+
+    const boundExplicit = entry!.modelList!.find(m => m.id === 'exp-1')!;
+    const boundIdLess = entry!.modelList!.find(m => m.id === persistedUuid)!;
+    // Explicit id binds by identity despite the reorder...
+    expect(boundExplicit.model.modelId).toBe('explicit');
+    // ...and the uuid entry binds the residual id-less live model.
+    expect(boundIdLess.model.modelId).toBe('idless');
+    // Both are recovery-time instances, not stale prepare-time ones.
+    expect(boundExplicit.model).not.toBe(prepared![1]!.model);
+    expect(boundIdLess.model).not.toBe(prepared![0]!.model);
+
+    await entry?.workflowExecution;
+    recovered.cleanup();
   });
 });

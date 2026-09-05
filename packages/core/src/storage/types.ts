@@ -3039,13 +3039,18 @@ export interface UpdateWorkflowStateOptions {
    * persisted snapshot's status matches one of these values. Otherwise the update is a
    * no-op and `updateWorkflowState` resolves to `undefined`.
    *
-   * This is only enforced atomically by stores that report `supportsConcurrentUpdates()`,
-   * because those stores load and write the snapshot inside a single critical section.
-   * Stores without concurrent update support apply it on a best-effort basis.
+   * These guards are only enforced atomically by stores that report
+   * `supportsConcurrentUpdates()`, because those stores load and write the
+   * snapshot inside one critical section. Non-concurrent stores that implement
+   * this method may only apply them on a best-effort basis.
    *
-   * This field is a guard only: it is never merged into the persisted snapshot.
+   * Guard fields are never merged into the persisted snapshot.
    */
   expectedStatus?: WorkflowRunStatus | WorkflowRunStatus[];
+  /** Require the persisted snapshot to belong to this exact execution lineage. Guard only. */
+  expectedExecutionGeneration?: string;
+  /** Require the persisted snapshot to be at this exact resume cycle. Guard only. */
+  expectedLifecycleResumeAttempt?: number;
 }
 
 /**
@@ -3059,6 +3064,29 @@ export function matchesExpectedWorkflowStatus(
   if (expectedStatus === undefined) return true;
   const expected = Array.isArray(expectedStatus) ? expectedStatus : [expectedStatus];
   return currentStatus !== undefined && expected.includes(currentStatus);
+}
+
+/**
+ * Returns true when every supplied workflow-state compare-and-set guard matches.
+ * A snapshot written before resume attempts were introduced is attempt zero.
+ */
+export function matchesExpectedWorkflowState(
+  snapshot: Pick<WorkflowRunState, 'status' | 'executionGeneration' | 'lifecycleResumeAttempt'>,
+  expected: Pick<
+    UpdateWorkflowStateOptions,
+    'expectedStatus' | 'expectedExecutionGeneration' | 'expectedLifecycleResumeAttempt'
+  >,
+): boolean {
+  return (
+    matchesExpectedWorkflowStatus(snapshot.status, expected.expectedStatus) &&
+    (expected.expectedExecutionGeneration === undefined ||
+      snapshot.executionGeneration === expected.expectedExecutionGeneration) &&
+    // Only an absent legacy field denotes attempt zero. Persisted null or other
+    // malformed values must fail the guard rather than admit a stale writer.
+    (expected.expectedLifecycleResumeAttempt === undefined ||
+      (snapshot.lifecycleResumeAttempt === undefined ? 0 : snapshot.lifecycleResumeAttempt) ===
+        expected.expectedLifecycleResumeAttempt)
+  );
 }
 
 function unwrapSchema(schema: z.ZodTypeAny): { base: z.ZodTypeAny; nullable: boolean } {
@@ -3729,6 +3757,7 @@ export interface ExperimentResult {
   input: unknown;
   output: unknown | null;
   groundTruth: unknown | null;
+  metadata: Record<string, unknown> | null;
   error: { message: string; stack?: string; code?: string } | null;
   startedAt: Date;
   completedAt: Date;
@@ -3822,6 +3851,7 @@ export interface AddExperimentResultInput {
   input: unknown;
   output: unknown | null;
   groundTruth: unknown | null;
+  metadata?: Record<string, unknown> | null;
   error: { message: string; stack?: string; code?: string } | null;
   startedAt: Date;
   completedAt: Date;

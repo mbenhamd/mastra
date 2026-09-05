@@ -81,6 +81,7 @@ async function createHarness(options: Parameters<typeof createInspector>[0] = {}
   const inspector = createInspector(options);
   let observerCallback: ((entries: PerformanceEntry[]) => void) | null = null;
   const observer = { observe: vi.fn(), disconnect: vi.fn() };
+  let idSequence = 0;
   const diagnostics = new ProcessMemoryDiagnostics(
     {
       parentDirectory,
@@ -94,7 +95,7 @@ async function createHarness(options: Parameters<typeof createInspector>[0] = {}
         observerCallback = callback;
         return observer;
       },
-      randomId: () => 'test-id',
+      randomId: () => `test-id-${++idSequence}`,
     },
   );
   return {
@@ -460,6 +461,8 @@ describe('ProcessMemoryDiagnostics', () => {
   });
 
   it('waits for an in-progress stop before starting a new diagnostics run', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
     const finalCapture = deferred<Record<string, unknown>>();
     const harness = await createHarness({ stopResponses: [finalCapture.promise] });
     roots.push(harness.parentDirectory);
@@ -476,7 +479,7 @@ describe('ProcessMemoryDiagnostics', () => {
 
     finalCapture.resolve({ profile: allocationProfile() });
     await expect(stopping).resolves.toMatchObject({ state: 'inactive' });
-    await expect(restarting).resolves.toMatchObject({ state: 'active' });
+    await expect(restarting).resolves.toMatchObject({ state: 'active', error: null });
     expect(harness.diagnostics.getStatus().outputDirectory).not.toBe(firstRun.outputDirectory);
     await harness.diagnostics.stop();
   });

@@ -1,6 +1,6 @@
 ---
 title: "Reference: Agent.listSuspendedRuns() | Agents"
-description: "API reference for Agent.listSuspendedRuns(), which discovers suspended agent runs from storage so approvals survive restarts."
+description: "The .listSuspendedRuns() method lists suspended agent runs from workflow snapshot storage: runs waiting on a tool call requiring approval, or on a tool that called suspend()."
 packages:
   - "@mastra/core"
 ---
@@ -213,7 +213,7 @@ When function-level authorization (FGA) is configured, pass an authenticated `re
 
 Only suspended runs are returned. Terminal durable snapshot cleanup is best-effort: Mastra retries transient deletion failures and then attempts to write a terminal tombstone. If storage rejects both deletion and tombstoning, a stale suspended row can remain discoverable. Monitor the emitted warning and reconcile storage before accepting another decision for that run. Suspended runs survive restarts only when the Mastra instance has a persistent [storage provider](/docs/storage). Calling this method without configured workflow storage throws `AGENT_LIST_SUSPENDED_RUNS_NO_STORAGE`.
 
-This core method doesn't add an HTTP server route or client SDK method. It also doesn't atomically claim a suspended checkpoint across workers, and `(runId, toolCallId)` isn't a one-time approval token. Until an application adds a storage-backed claim/lease and checkpoint token, route approvals through a single serialized consumer that authenticates the caller and supplies verified resource and thread IDs.
+This core method provides neither an HTTP server route nor a client SDK method. It can't atomically claim a suspended checkpoint across workers, and `(runId, toolCallId)` isn't a one-time approval token. Until an application adds a storage-backed claim/lease and checkpoint token, route approvals through a single serialized consumer that authenticates the caller and supplies verified resource and thread IDs.
 
 Run snapshots are only persisted while a run is waiting on input and are deleted when it finishes, so suspended runs are the only runs discoverable from storage. With the default in-memory store, snapshots are lost on restart.
 

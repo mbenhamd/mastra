@@ -1126,6 +1126,7 @@ describe('useChat forwards clientTools', () => {
         modelSettings: {
           maxSteps: 3,
           instructions: 'use the hook tool',
+          system: 'current hook state',
         },
         requestContext: { userId: 'user-123' } as any,
       });
@@ -1144,6 +1145,7 @@ describe('useChat forwards clientTools', () => {
         modelSettings: {
           maxSteps: 5,
           instructions: 'use the per-send tool',
+          system: 'current per-send state',
           temperature: 0.2,
         },
         requestContext: { userId: 'user-456' } as any,
@@ -1159,6 +1161,7 @@ describe('useChat forwards clientTools', () => {
       expect.objectContaining({
         maxSteps: 3,
         instructions: 'use the hook tool',
+        system: 'current hook state',
         requestContext: { userId: 'user-123' },
         clientTools,
       }),
@@ -1167,6 +1170,7 @@ describe('useChat forwards clientTools', () => {
       expect.objectContaining({
         maxSteps: 5,
         instructions: 'use the per-send tool',
+        system: 'current per-send state',
         requestContext: { userId: 'user-456' },
         clientTools: perSendClientTools,
       }),

@@ -265,6 +265,38 @@ describe('Dynamic Workflows handlers', () => {
       expect(serialized[0].outputSchema).toBeDefined();
     });
 
+    it('persists schedules and agent passthrough options without transport loss', async () => {
+      const schedule = {
+        cron: '0 0 * * *',
+        inputData: { prompt: '', count: 0 },
+        initialState: false,
+        requestContext: { tenant: '' },
+      };
+      await UPSERT_DYNAMIC_WORKFLOW_ROUTE.handler({
+        ...ctx(mastra),
+        id: 'wf-scheduled-agent',
+        description: undefined,
+        metadata: undefined,
+        stateSchema: { type: 'boolean' },
+        requestContextSchema: objectWith({ tenant: stringSchema }, ['tenant']),
+        schedule,
+        inputSchema: objectWith({ prompt: stringSchema, count: { type: 'integer' } }, ['prompt', 'count']),
+        outputSchema: objectWith({ text: stringSchema }, ['text']),
+        graph: [
+          {
+            type: 'agent',
+            id: 'summarize',
+            agentId: 'summarizer',
+            options: { retries: 1, maxSteps: 3 },
+          },
+        ],
+      });
+
+      const stored = await (await mastra.getStorage()?.getStore('workflowDefinitions'))?.get('wf-scheduled-agent');
+      expect(stored?.schedule).toEqual(schedule);
+      expect(stored?.graph[0]).toMatchObject({ options: { retries: 1, maxSteps: 3 } });
+    });
+
     it('foreach(agent) round-trips inner agent step', async () => {
       await UPSERT_DYNAMIC_WORKFLOW_ROUTE.handler({
         ...ctx(mastra),
@@ -947,6 +979,61 @@ describe('Dynamic Workflows handlers', () => {
       await expect(
         GET_DYNAMIC_WORKFLOW_ROUTE.handler({ ...ctx(mastra), dynamicWorkflowId: 'wf-fanout' }),
       ).rejects.toBeInstanceOf(HTTPException);
+    });
+
+    it('rejects invalid root or helper scheduled payloads with 400 before any writes and keeps unexpected errors at 500', async () => {
+      const schedule = {
+        id: 'daily',
+        cron: '0 9 * * *',
+        inputData: { first: '', second: '' },
+        initialState: false,
+        requestContext: { tenant: '' },
+      };
+      const scheduled = {
+        stateSchema: { type: 'boolean' },
+        requestContextSchema: objectWith({ tenant: stringSchema }, ['tenant']),
+        schedule: [schedule],
+      };
+      for (const invalidId of ['wf-fanout', 'echo-second']) {
+        for (const field of ['inputData', 'initialState', 'requestContext'] as const) {
+          const definitions = [
+            { ...fanoutRoot, ...scheduled },
+            { ...echoHelper('echo-first', 'first'), ...scheduled },
+            { ...echoHelper('echo-second', 'second'), ...scheduled },
+          ].map(definition =>
+            definition.id === invalidId
+              ? { ...definition, schedule: [{ ...schedule, [field]: { invalid: true } }] }
+              : definition,
+          );
+          const [root, ...dependencies] = definitions;
+          await expect(
+            UPSERT_DYNAMIC_WORKFLOW_ROUTE.handler({ ...ctx(mastra), ...root!, dependencies }),
+          ).rejects.toMatchObject({
+            status: 400,
+            message: expect.stringContaining(`Dynamic workflow "${invalidId}" failed validation`),
+            cause: expect.objectContaining({
+              id: 'WORKFLOW_SCHEMA_VALIDATION_FAILED',
+              message: expect.stringContaining(`schedule.0.${field}`),
+            }),
+          });
+          for (const { id } of definitions) expect(() => mastra.getWorkflow(id)).toThrow();
+          const storage = mastra.getStorage()!;
+          expect((await (await storage.getStore('workflowDefinitions'))!.list({})).definitions).toEqual([]);
+          expect(await (await storage.getStore('schedules'))!.listSchedules()).toEqual([]);
+        }
+      }
+
+      const store = (await mastra.getStorage()!.getStore('workflowDefinitions'))!;
+      store.upsert = async () => {
+        throw new Error('unexpected persistence failure');
+      };
+      await expect(
+        UPSERT_DYNAMIC_WORKFLOW_ROUTE.handler({
+          ...ctx(mastra),
+          ...fanoutRoot,
+          dependencies: [echoHelper('echo-first', 'first'), echoHelper('echo-second', 'second')],
+        }),
+      ).rejects.toMatchObject({ status: 500, message: 'unexpected persistence failure' });
     });
 
     it('omitting dependencies leaves the single-workflow response shape untouched', async () => {

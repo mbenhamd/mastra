@@ -363,6 +363,22 @@ describe.each([
       expect(scoped.total).toBe(1);
     }, 30000);
 
+    it('pushes the resourceId filter down to the storage query', async () => {
+      const storage = new InMemoryStore();
+      const { agent } = createSuspendedSetup({ storage });
+      await suspendRun(agent, 'thread-1', 'resource-1');
+
+      const workflowsStore = (await storage.getStore('workflows'))!;
+      const listSpy = vi.spyOn(workflowsStore, 'listWorkflowRuns');
+
+      await agent.listSuspendedRuns({ resourceId: 'resource-1' });
+
+      expect(listSpy).toHaveBeenCalledTimes(1);
+      expect(listSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ workflowName: 'agentic-loop', status: 'suspended', resourceId: 'resource-1' }),
+      );
+    }, 30000);
+
     it('paginates with perPage/page while keeping total accurate', async () => {
       // The mock model only tool-calls on its first invocation, so suspend each
       // run from a fresh agent sharing the same storage.

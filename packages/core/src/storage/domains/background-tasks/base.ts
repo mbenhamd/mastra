@@ -5,8 +5,6 @@ import type {
   TaskListResult,
   UpdateBackgroundTask,
 } from '../../../background-tasks/types';
-import { ErrorCategory, ErrorDomain, MastraError } from '../../../error';
-import { createStorageErrorId } from '../../utils';
 import { StorageDomain } from '../base';
 
 /**
@@ -31,35 +29,14 @@ export abstract class BackgroundTasksStorage extends StorageDomain {
   /**
    * Partial update of a task record.
    * Only the provided fields are updated; others are left unchanged.
+   * When `expectedStatus` is provided, the update is applied only if the task
+   * still has that status. Returns whether the update was applied.
    */
-  abstract updateTask(taskId: string, update: UpdateBackgroundTask): Promise<void>;
-
-  /**
-   * Update a task only when its current status still matches the expected state.
-   * Implementations should use the strongest conditional write primitive the
-   * backend supports and return false when the expected status no longer
-   * matches. The default fails closed for external adapters that have not yet
-   * implemented the conditional claim contract.
-   */
-  async updateTaskIfStatus(
+  abstract updateTask(
     taskId: string,
-    expectedStatus: BackgroundTaskStatus,
     update: UpdateBackgroundTask,
-  ): Promise<boolean> {
-    throw new MastraError(
-      {
-        id: createStorageErrorId('MASTRA', 'UPDATE_BACKGROUND_TASK_IF_STATUS', 'NOT_SUPPORTED'),
-        domain: ErrorDomain.STORAGE,
-        category: ErrorCategory.USER,
-        details: {
-          taskId,
-          expectedStatus,
-          updateStatus: update.status ?? null,
-        },
-      },
-      'Background task dispatch requires storage support for atomic conditional status updates.',
-    );
-  }
+    options?: { expectedStatus?: BackgroundTaskStatus },
+  ): Promise<boolean>;
 
   /** Get a single task by ID. Returns null if not found. */
   abstract getTask(taskId: string): Promise<BackgroundTask | null>;

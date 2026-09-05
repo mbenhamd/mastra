@@ -3808,9 +3808,15 @@ describe('PROVIDER_TOOL_CALL observability spans', () => {
 
     await llmExecutionStep.execute(executeParams);
 
-    // Without a step tracker there is no live step to parent under — the span
-    // anchors to the AGENT_RUN fallback recorded at call time.
-    expect(modelStepSpan.createChildSpan).not.toHaveBeenCalled();
+    // Without a step tracker there is no live step to parent under — the provider tool span
+    // anchors to the AGENT_RUN fallback recorded at call time. The Anthropic input guard still
+    // records its processor span under the model step.
+    expect(modelStepSpan.createChildSpan).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: SpanType.PROCESSOR_RUN,
+        name: 'input step processor: trailing-assistant-guard',
+      }),
+    );
     expect(agentRunSpan.createChildSpan).toHaveBeenCalledWith(
       expect.objectContaining({
         type: SpanType.PROVIDER_TOOL_CALL,
@@ -3925,7 +3931,12 @@ describe('PROVIDER_TOOL_CALL observability spans', () => {
         startTime: expect.any(Date),
       }),
     );
-    expect(modelStepSpan.createChildSpan).not.toHaveBeenCalled();
+    expect(modelStepSpan.createChildSpan).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: SpanType.PROCESSOR_RUN,
+        name: 'input step processor: trailing-assistant-guard',
+      }),
+    );
     expect(providerToolSpan.end).toHaveBeenCalledWith(undefined);
   });
 });

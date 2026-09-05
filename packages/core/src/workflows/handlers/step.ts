@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { ActorSignal } from '../../auth/ee';
 import type { RequestContext } from '../../di';
 import { MastraError, ErrorDomain, ErrorCategory, getErrorFromUnknown } from '../../error';
@@ -130,6 +131,8 @@ export async function executeStep(
         states: lifecycleStepStates,
       }).state;
   const stepCallId = lifecycleStepState.stepCallId;
+  const nestedRunId =
+    step.component === 'WORKFLOW' && executionContext.foreachIndex !== undefined ? randomUUID() : undefined;
 
   const { inputData, validationError: inputValidationError } = await validateStepInput({
     prevOutput,
@@ -458,7 +461,7 @@ export async function executeStep(
         : undefined;
 
       const output = await runStep({
-        runId,
+        runId: nestedRunId ?? runId,
         resourceId,
         workflowId,
         mastra: mastraForStep,
@@ -704,6 +707,10 @@ export async function executeStep(
         },
       },
     });
+  }
+
+  if (nestedRunId) {
+    execResults.metadata = { ...execResults.metadata, nestedRunId };
   }
 
   const stepResult = {

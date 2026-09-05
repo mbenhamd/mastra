@@ -322,6 +322,7 @@ describe('MCP Tool Tracing', () => {
     const mockToolSpan = {
       end: vi.fn(),
       error: vi.fn(),
+      update: vi.fn(),
     };
 
     const mockAgentSpan = {
@@ -353,7 +354,6 @@ describe('MCP Tool Tracing', () => {
       expect.objectContaining({
         type: SpanType.MCP_TOOL_CALL,
         name: "mcp_tool: 'mcp-server_list-files' on 'filesystem-server'",
-        input: { path: '/tmp' },
         attributes: {
           toolCallId: 'test-call-id',
           mcpServer: 'filesystem-server',
@@ -364,6 +364,8 @@ describe('MCP Tool Tracing', () => {
       }),
     );
 
+    expect((mockAgentSpan.createChildSpan as ReturnType<typeof vi.fn>).mock.calls[0]?.[0]).not.toHaveProperty('input');
+    expect(mockToolSpan.update).toHaveBeenCalledWith({ input: { path: '/tmp' } });
     expect(mockToolSpan.end).toHaveBeenCalledWith({ attributes: { success: true }, output: { files: ['/tmp'] } });
   });
 
@@ -378,6 +380,7 @@ describe('MCP Tool Tracing', () => {
     const mockToolSpan = {
       end: vi.fn(),
       error: vi.fn(),
+      update: vi.fn(),
     };
 
     const mockAgentSpan = {
@@ -407,7 +410,6 @@ describe('MCP Tool Tracing', () => {
       expect.objectContaining({
         type: SpanType.TOOL_CALL,
         name: "tool: 'regular-tool'",
-        input: { value: 'test' },
         attributes: {
           toolCallId: 'test-call-id',
           toolDescription: 'A regular tool',
@@ -416,6 +418,8 @@ describe('MCP Tool Tracing', () => {
         },
       }),
     );
+    expect((mockAgentSpan.createChildSpan as ReturnType<typeof vi.fn>).mock.calls[0]?.[0]).not.toHaveProperty('input');
+    expect(mockToolSpan.update).toHaveBeenCalledWith({ input: { value: 'test' } });
   });
 
   it('should handle mcpMetadata with missing serverVersion', async () => {
@@ -432,6 +436,7 @@ describe('MCP Tool Tracing', () => {
     const mockToolSpan = {
       end: vi.fn(),
       error: vi.fn(),
+      update: vi.fn(),
     };
 
     const mockAgentSpan = {
@@ -480,6 +485,7 @@ describe('MCP Tool Tracing', () => {
     const mockToolSpan = {
       end: vi.fn(),
       error: vi.fn(),
+      update: vi.fn(),
     };
 
     const mockAgentSpan = {
@@ -1204,5 +1210,254 @@ describe('resume input normalization', () => {
     await builtTool.execute!({}, { toolCallId: 'call-1', messages: [], requestContext: execRC });
 
     expect(receivedCtx.requestContext).toBe(execRC);
+  });
+});
+
+describe('CoreToolBuilder execution failures', () => {
+  it('keeps author-returned ValidationError-shaped output as successful data', async () => {
+    const authorOutput = {
+      error: true as const,
+      message: 'domain result, not framework validation',
+      validationErrors: { errors: ['domain-status'], fields: {} },
+    };
+    const testTool = createTool({
+      id: 'validation-shaped-output',
+      description: 'Returns a domain object that resembles a validation error.',
+      inputSchema: z.object({}),
+      execute: async () => authorOutput,
+    });
+    const mockToolSpan = { end: vi.fn(), error: vi.fn(), update: vi.fn() };
+    const mockAgentSpan = { createChildSpan: vi.fn().mockReturnValue(mockToolSpan) } as unknown as AnySpan;
+    const builtTool = new CoreToolBuilder({
+      originalTool: testTool,
+      options: { name: 'validation-shaped-output', logger: noopLogger, tracingContext: { currentSpan: mockAgentSpan } },
+    }).build();
+
+    await expect(builtTool.execute!({}, { toolCallId: 'call-1', messages: [] })).resolves.toBe(authorOutput);
+    expect(mockToolSpan.end).toHaveBeenCalledWith({ output: authorOutput, attributes: { success: true } });
+    expect(mockToolSpan.error).not.toHaveBeenCalled();
+  });
+
+  it('validates suspension data exactly once before delegating', async () => {
+    const transform = vi.fn((value: { answer: string }) => ({ answer: value.answer.toUpperCase() }));
+    const suspend = vi.fn().mockResolvedValue(undefined);
+    const testTool = createTool({
+      id: 'single-suspend-validation',
+      description: 'Suspends once.',
+      inputSchema: z.object({}),
+      suspendSchema: z.object({ answer: z.string() }).transform(transform),
+      execute: async (_input, context) => {
+        const suspendTool = (context as any).agent?.suspend ?? (context as any).suspend;
+        await suspendTool({ answer: 'raw' });
+      },
+    });
+    const builtTool = new CoreToolBuilder({
+      originalTool: testTool,
+      options: { name: 'single-suspend-validation', logger: noopLogger },
+    }).build();
+
+    await expect(
+      builtTool.execute!({}, { toolCallId: 'call-1', messages: [], suspend } as any),
+    ).resolves.toBeUndefined();
+    expect(transform).toHaveBeenCalledTimes(1);
+    // Suspension validation is a gate, not a transform contract.
+    expect(suspend).toHaveBeenCalledWith({ answer: 'raw' }, expect.any(Object));
+  });
+
+  it('rejects invalid suspension data without invoking the delegate or exposing it to telemetry', async () => {
+    const marker = 'SENSITIVE_INVALID_SUSPEND';
+    const suspend = vi.fn().mockResolvedValue(undefined);
+    const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), trackException: vi.fn() };
+    const mockToolSpan = { end: vi.fn(), error: vi.fn(), update: vi.fn() };
+    const mockAgentSpan = { createChildSpan: vi.fn().mockReturnValue(mockToolSpan) } as unknown as AnySpan;
+    const testTool = createTool({
+      id: 'invalid-suspend',
+      description: 'Attempts an invalid suspension.',
+      inputSchema: z.object({}),
+      suspendSchema: z.object({ approved: z.boolean() }),
+      execute: async (_input, context) => {
+        const suspendTool = (context as any).agent?.suspend ?? (context as any).suspend;
+        await suspendTool({ approved: marker });
+      },
+    });
+    const builtTool = new CoreToolBuilder({
+      originalTool: testTool,
+      options: {
+        name: 'invalid-suspend',
+        logger: logger as any,
+        tracingContext: { currentSpan: mockAgentSpan },
+      },
+    }).build();
+
+    const result = await builtTool.execute!({}, { toolCallId: 'call-1', messages: [], suspend } as any);
+    expect(result).toMatchObject({ error: true });
+    expect(result.message).toContain(marker);
+    expect(suspend).not.toHaveBeenCalled();
+    expect(mockToolSpan.end).toHaveBeenCalledWith({ output: { error: true }, attributes: { success: false } });
+    expect(
+      JSON.stringify({ logs: Object.values(logger).map(mock => mock.mock.calls), spans: mockToolSpan }),
+    ).not.toContain(marker);
+  });
+
+  it.each([false, 0, '', null])('treats falsy resume data %j as present', async resumeData => {
+    const execute = vi.fn();
+    const testTool = createTool({
+      id: 'falsy-resume',
+      description: 'Requires structured resume data.',
+      inputSchema: z.object({}),
+      resumeSchema: z.object({ approved: z.boolean() }),
+      execute,
+    });
+    const builtTool = new CoreToolBuilder({
+      originalTool: testTool,
+      options: { name: 'falsy-resume', logger: noopLogger },
+    }).build();
+
+    await expect(
+      builtTool.execute!({}, { toolCallId: 'call-1', messages: [], resumeData } as any),
+    ).resolves.toMatchObject({ error: true });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('rejects invalid resume data before attaching it to telemetry', async () => {
+    const marker = 'SENSITIVE_INVALID_RESUME';
+    const execute = vi.fn();
+    const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), trackException: vi.fn() };
+    const mockToolSpan = { end: vi.fn(), error: vi.fn(), update: vi.fn() };
+    const mockAgentSpan = { createChildSpan: vi.fn().mockReturnValue(mockToolSpan) } as unknown as AnySpan;
+    const testTool = createTool({
+      id: 'invalid-resume',
+      description: 'Requires structured resume data.',
+      inputSchema: z.object({}),
+      resumeSchema: z.object({ approved: z.boolean() }),
+      execute,
+    });
+    const builtTool = new CoreToolBuilder({
+      originalTool: testTool,
+      options: {
+        name: 'invalid-resume',
+        logger: logger as any,
+        tracingContext: { currentSpan: mockAgentSpan },
+      },
+    }).build();
+
+    const result = await builtTool.execute!({}, {
+      toolCallId: 'call-1',
+      messages: [],
+      resumeData: { approved: marker },
+    } as any);
+
+    expect(result).toMatchObject({ error: true });
+    expect(result.message).toContain(marker);
+    expect(execute).not.toHaveBeenCalled();
+    expect(mockToolSpan.update).not.toHaveBeenCalled();
+    expect(mockToolSpan.end).toHaveBeenCalledWith({ output: { error: true }, attributes: { success: false } });
+    expect(
+      JSON.stringify({ logger: Object.values(logger).map(mock => mock.mock.calls), spans: mockToolSpan }),
+    ).not.toContain(marker);
+  });
+
+  it('keeps invalid input in the returned validation error but excludes it from logs and spans', async () => {
+    const marker = 'SENSITIVE_INVALID_TOOL_INPUT';
+    const execute = vi.fn();
+    const testTool = createTool({
+      id: 'invalid_input_tool',
+      description: 'Rejects string content',
+      inputSchema: z.object({ content: z.number() }),
+      execute,
+    });
+    const logger = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      trackException: vi.fn(),
+    };
+    const mockToolSpan = {
+      end: vi.fn(),
+      error: vi.fn(),
+      update: vi.fn(),
+    };
+    const mockAgentSpan = {
+      createChildSpan: vi.fn().mockReturnValue(mockToolSpan),
+    } as unknown as AnySpan;
+
+    const builtTool = new CoreToolBuilder({
+      originalTool: testTool,
+      options: {
+        name: 'invalid_input_tool',
+        logger: logger as any,
+        tracingContext: { currentSpan: mockAgentSpan },
+      },
+    }).build();
+
+    const result = await builtTool.execute!({ content: marker } as any, { toolCallId: 'call-1', messages: [] });
+
+    expect(result).toMatchObject({ error: true });
+    expect(result.message).toContain(marker);
+    expect(execute).not.toHaveBeenCalled();
+    expect(mockToolSpan.update).not.toHaveBeenCalled();
+    expect(mockToolSpan.end).toHaveBeenCalledWith({ output: { error: true }, attributes: { success: false } });
+
+    const telemetry = {
+      logger: Object.values(logger).flatMap(mock => mock.mock.calls),
+      spans: [
+        (mockAgentSpan.createChildSpan as ReturnType<typeof vi.fn>).mock.calls,
+        mockToolSpan.update.mock.calls,
+        mockToolSpan.end.mock.calls,
+        mockToolSpan.error.mock.calls,
+      ],
+    };
+    expect(JSON.stringify(telemetry)).not.toContain(marker);
+  });
+
+  it('does not copy raw tool args into logs, error details, or exception metadata', async () => {
+    const marker = 'SENSITIVE_REPORT_CONTENT';
+    const testTool = createTool({
+      id: 'failing_tool',
+      description: 'Always throws',
+      inputSchema: z.object({ content: z.string() }),
+      execute: async () => {
+        throw new Error('boom');
+      },
+    });
+    const logger = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      trackException: vi.fn(),
+    };
+
+    const builder = new CoreToolBuilder({
+      originalTool: testTool,
+      options: {
+        name: 'failing_tool',
+        logger: logger as any,
+      },
+    });
+
+    const builtTool = builder.build();
+    let thrown: any;
+    try {
+      await builtTool.execute!({ content: marker }, { toolCallId: 'call-1', messages: [] });
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown?.id).toBe('TOOL_EXECUTION_FAILED');
+    expect(thrown.details.argsJson).toBeUndefined();
+    expect(JSON.stringify(thrown.details)).not.toContain(marker);
+
+    expect(logger.trackException).toHaveBeenCalledTimes(1);
+    const metadata = logger.trackException.mock.calls[0]?.[1];
+    expect(metadata).not.toHaveProperty('args');
+    expect(JSON.stringify(metadata)).not.toContain(marker);
+
+    for (const level of ['debug', 'info', 'warn', 'error'] as const) {
+      for (const call of logger[level].mock.calls) {
+        expect(JSON.stringify(call)).not.toContain(marker);
+      }
+    }
   });
 });

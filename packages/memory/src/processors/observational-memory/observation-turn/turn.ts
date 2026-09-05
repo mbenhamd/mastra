@@ -1,4 +1,5 @@
 import type { MessageList } from '@mastra/core/agent';
+import type { MemoryRunState } from '@mastra/core/memory';
 import type { ObservabilityContext } from '@mastra/core/observability';
 import type { ProcessorContext, ProcessorStreamWriter } from '@mastra/core/processors';
 import type { RequestContext } from '@mastra/core/request-context';
@@ -136,11 +137,12 @@ export class ObservationTurn {
    * If a MemoryContextProvider is passed, loads historical messages and adds
    * them to the MessageList. Without a provider, only fetches/caches the record.
    */
-  async start(memory?: MemoryContextProvider): Promise<TurnContext> {
+  async start(memory?: MemoryContextProvider, runState?: MemoryRunState): Promise<TurnContext> {
     if (this._started) throw new Error('Turn already started');
     this._started = true;
 
     this._record = await this.om.getOrCreateRecord(this.threadId, this.resourceId);
+    runState?.set(`observational-memory:record:${this.threadId}:${this.resourceId ?? ''}`, this._record);
     this._generationCountAtStart = this._record.generationCount;
     this.memory = memory;
 
@@ -150,6 +152,7 @@ export class ObservationTurn {
         messageList: this.messageList,
         threadId: this.threadId,
         resourceId: this.resourceId,
+        runState,
       });
 
       this._context = {
@@ -205,13 +208,13 @@ export class ObservationTurn {
    * proactively while the agent is idle, rather than waiting for the next turn.
    * The returned record does not wait for that background buffering pass to finish.
    */
-  async end(): Promise<TurnResult> {
+  async end(messageList: MessageList = this.messageList): Promise<TurnResult> {
     if (this._ended) throw new Error('Turn already ended');
     this._ended = true;
 
     // Save any unsaved messages from the last step
-    const unsavedInput = this.messageList.get.input.db();
-    const unsavedOutput = this.messageList.get.response.db();
+    const unsavedInput = messageList.get.input.db();
+    const unsavedOutput = messageList.get.response.db();
     const unsavedMessages = [...unsavedInput, ...unsavedOutput];
     if (unsavedMessages.length > 0) {
       await this.om.persistMessages(unsavedMessages, this.threadId, this.resourceId);
@@ -234,7 +237,7 @@ export class ObservationTurn {
         const observeResult = await this.om.observe({
           threadId: this.threadId,
           resourceId: this.resourceId,
-          messages: this.messageList.get.all.db(),
+          messages: messageList.get.all.db(),
           agent: this.agent,
           requestContext: this.requestContext,
           writer: this.writer,
@@ -250,7 +253,7 @@ export class ObservationTurn {
       }
     }
     if (asyncObservationEnabled && bufferOnIdle) {
-      const allMessages = getObservableMessages(this.messageList);
+      const allMessages = getObservableMessages(messageList);
       const record = this._record!;
       const unobservedMessages = this.om.getUnobservedMessages(allMessages, record);
       if (unobservedMessages.length > 0) {
@@ -310,16 +313,15 @@ export class ObservationTurn {
    * references (the `ObservationalMemory` engine, the `MessageList`, the stream writer, the
    * memory provider, lifecycle hooks) and a back-reference to its current `ObservationStep`,
    * which points back at the turn — a cycle. None of that is persistable state. The turn is
-   * stashed in the shared processor-state map (`state.__omTurn`) only so the input and output
-   * OM processor instances can reach the *live* object within a single request; that map is
-   * also threaded into processor workflows, whose snapshots the storage layer serializes with
-   * `JSON.stringify`. Without this projection, that serialization throws "Converting circular
-   * structure to JSON" via `_currentStep` <-> `turn`.
+   * stashed in the request-local processor-state map (`state.__omTurn`) only so the input and
+   * output OM processor instances can reach the *live* object within a single request. Workflow
+   * snapshots deliberately exclude that map. This projection protects callers that explicitly
+   * serialize the turn from the `_currentStep` <-> `turn` cycle.
    *
    * The projection is lossless: the dropped fields are live runtime objects that cannot and
-   * should not round-trip through storage, and OM never reads the turn back from a snapshot —
-   * it always reads the live `__omTurn` from the in-memory map and re-establishes a fresh turn
-   * when a deserialized `MessageList` no longer matches (see the processor's turn handling).
+   * should not round-trip through storage. OM reads the live `__omTurn` from the in-memory map
+   * and re-establishes a fresh turn if it receives a projection (see the processor's turn
+   * handling).
    */
   toJSON() {
     return {

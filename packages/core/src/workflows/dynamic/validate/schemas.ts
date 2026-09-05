@@ -2,10 +2,11 @@
  * JSON-Schema dialect checks: every schema embedded in the definition must
  * belong to the admitted 2020-12 subset `jsonSchemaToZod` can convert
  * losslessly. Covers the four top-level schemas plus each `agent.outputSchema`
- * reachable through containers.
+ * reachable through containers. Scheduled payloads must satisfy the admitted
+ * schemas before any definition or schedule is persisted.
  */
 import { forEachSingleStepEntryWithPath } from '../graph';
-import { ADMITTED_JSON_SCHEMA_DIALECT, validateStorableJsonSchema } from '../json-schema-to-zod';
+import { ADMITTED_JSON_SCHEMA_DIALECT, jsonSchemaToZod, validateStorableJsonSchema } from '../json-schema-to-zod';
 import type { JsonSchema, JsonSchemaAdmissionIssue } from '../json-schema-to-zod';
 import type { WorkflowValidationInput, WorkflowValidationIssue } from './types';
 
@@ -43,7 +44,6 @@ export function collectWorkflowJsonSchemaAdmissionIssues(def: WorkflowValidation
 
 export function validateWorkflowSchemas(def: WorkflowValidationInput): WorkflowValidationIssue[] {
   const admissions = collectWorkflowJsonSchemaAdmissionIssues(def);
-  if (admissions.length === 0) return [];
 
   const byPath = new Map<string, JsonSchemaAdmissionIssue[]>();
   for (const issue of admissions) {
@@ -72,6 +72,30 @@ export function validateWorkflowSchemas(def: WorkflowValidationInput): WorkflowV
         .map(issue => `${issue.pointer} (${issue.keyword})`)
         .join(', ')}.`,
     });
+  }
+
+  if (def.schedule === undefined) return issues;
+  const schedules = Array.isArray(def.schedule) ? def.schedule : [def.schedule];
+  if (schedules.length === 0) return issues;
+  for (const [schemaField, payloadField] of [
+    ['inputSchema', 'inputData'],
+    ['stateSchema', 'initialState'],
+    ['requestContextSchema', 'requestContext'],
+  ] as const) {
+    const schema = def[schemaField];
+    if (schema === undefined || byPath.has(schemaField)) continue;
+    const validator = jsonSchemaToZod(schema);
+    for (const [index, schedule] of schedules.entries()) {
+      // The scheduler supplies {} for absent or null payloads. Validate the
+      // effective value without changing the stored schedule or its defaults.
+      if (!validator.safeParse(schedule[payloadField] ?? {}).success) {
+        issues.push({
+          code: 'invalid-schedule-payload',
+          path: `schedule.${Array.isArray(def.schedule) ? `${index}.` : ''}${payloadField}`,
+          message: `Scheduled ${payloadField} must satisfy ${schemaField}.`,
+        });
+      }
+    }
   }
   return issues;
 }

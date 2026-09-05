@@ -1,5 +1,6 @@
 import { useMastraClient } from '@mastra/react';
 import { useQuery } from '@tanstack/react-query';
+import { DISCOVERY_STALE_TIME } from './discovery-cache';
 
 type UseTagsOptions = {
   enabled?: boolean;
@@ -21,5 +22,6 @@ export const useTags = ({ enabled = true }: UseTagsOptions = {}) => {
     select: data => data?.tags ?? [],
     retry: false,
     enabled,
+    staleTime: DISCOVERY_STALE_TIME,
   });
 };

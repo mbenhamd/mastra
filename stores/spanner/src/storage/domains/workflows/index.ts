@@ -2,7 +2,7 @@ import type { Database } from '@google-cloud/spanner';
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
 import {
   createStorageErrorId,
-  matchesExpectedWorkflowStatus,
+  matchesExpectedWorkflowState,
   WorkflowsStorage,
   TABLE_WORKFLOW_SNAPSHOT,
   TABLE_SCHEMAS,
@@ -432,20 +432,27 @@ export class WorkflowsSpanner extends WorkflowsStorage {
                 new Error(`Snapshot not found for runId ${runId}`),
               );
             }
-            const { expectedStatus, ...state } = opts;
-            if (!matchesExpectedWorkflowStatus(snapshot.status, expectedStatus)) {
+            const { expectedStatus, expectedExecutionGeneration, expectedLifecycleResumeAttempt, ...state } = opts;
+            if (
+              !matchesExpectedWorkflowState(snapshot, {
+                expectedStatus,
+                expectedExecutionGeneration,
+                expectedLifecycleResumeAttempt,
+              })
+            ) {
               await tx.rollback();
               return;
             }
 
-            updated = { ...snapshot, ...state } as WorkflowRunState;
+            const candidate = { ...snapshot, ...state } as WorkflowRunState;
             await this.db.update({
               tableName: TABLE_WORKFLOW_SNAPSHOT,
               keys: { workflow_name: workflowName, run_id: runId },
-              data: { snapshot: updated, updatedAt: new Date() },
+              data: { snapshot: candidate, updatedAt: new Date() },
               transaction: tx,
             });
             await tx.commit();
+            updated = candidate;
           } catch (err) {
             await tx.rollback().catch(rollbackErr => {
               throw new AggregateError([err, rollbackErr], 'Transaction and rollback both failed');

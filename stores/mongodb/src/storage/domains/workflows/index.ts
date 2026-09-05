@@ -229,13 +229,31 @@ export class WorkflowsStorageMongoDB extends WorkflowsStorage {
     try {
       const collection = await this.getCollection(TABLE_WORKFLOW_SNAPSHOT);
 
-      // `expectedStatus` is a compare-and-set guard, not state. It becomes part of the query
-      // filter so the match and the write stay a single atomic operation, and it is stripped
-      // from the merged document so it can never be persisted into the snapshot.
-      const { expectedStatus, ...state } = opts;
+      // Expected values are compare-and-set guards, not state. They become part
+      // of the query filter so the match and write stay one atomic operation.
+      const { expectedStatus, expectedExecutionGeneration, expectedLifecycleResumeAttempt, ...state } = opts;
       const filter: Record<string, unknown> = { workflow_name: workflowName, run_id: runId };
       if (expectedStatus !== undefined) {
         filter['snapshot.status'] = { $in: Array.isArray(expectedStatus) ? expectedStatus : [expectedStatus] };
+      }
+      if (expectedExecutionGeneration !== undefined) {
+        filter['snapshot.executionGeneration'] = expectedExecutionGeneration;
+      }
+      if (expectedLifecycleResumeAttempt !== undefined) {
+        filter.$expr = {
+          $eq: [
+            {
+              // `$ifNull` also defaults explicit null, allowing corrupt state
+              // to masquerade as the legacy missing attempt-zero field.
+              $cond: [
+                { $eq: [{ $type: '$snapshot.lifecycleResumeAttempt' }, 'missing'] },
+                0,
+                '$snapshot.lifecycleResumeAttempt',
+              ],
+            },
+            expectedLifecycleResumeAttempt,
+          ],
+        };
       }
 
       // Use findOneAndUpdate with aggregation pipeline for atomic read-modify-write

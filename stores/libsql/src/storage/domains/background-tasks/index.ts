@@ -1,4 +1,3 @@
-import type { Client, InValue } from '@libsql/client';
 import type {
   BackgroundTask,
   BackgroundTaskStatus,
@@ -10,6 +9,7 @@ import { BackgroundTasksStorage, TABLE_BACKGROUND_TASKS, TABLE_SCHEMAS } from '@
 import type { PruneOptions, PruneResult, RetentionTablesDescriptor, TableRetentionPolicy } from '@mastra/core/storage';
 import { LibSQLDB, resolveClient } from '../../db';
 import type { LibSQLDomainConfig } from '../../db';
+import type { SqliteClient as Client, SqliteInValue as InValue } from '../../db/client';
 import { buildSelectColumns } from '../../db/utils';
 import { runPrune, resolveTargets } from '../../retention';
 
@@ -129,56 +129,10 @@ export class BackgroundTasksLibSQL extends BackgroundTasksStorage {
     });
   }
 
-  async updateTask(taskId: string, update: UpdateBackgroundTask): Promise<void> {
-    const setClauses: string[] = [];
-    const params: InValue[] = [];
-
-    if ('status' in update) {
-      setClauses.push('status = ?');
-      params.push(update.status as string);
-    }
-    if ('result' in update) {
-      setClauses.push('result = jsonb(?)');
-      params.push(serializeJson(update.result));
-    }
-    if ('error' in update) {
-      setClauses.push('error = jsonb(?)');
-      params.push(serializeJson(update.error));
-    }
-    if ('suspendPayload' in update) {
-      setClauses.push('suspend_payload = jsonb(?)');
-      params.push(serializeJson(update.suspendPayload));
-    }
-    if ('retryCount' in update) {
-      setClauses.push('retry_count = ?');
-      params.push(update.retryCount as number);
-    }
-    if ('startedAt' in update) {
-      setClauses.push('startedAt = ?');
-      params.push(update.startedAt?.toISOString() ?? null);
-    }
-    if ('suspendedAt' in update) {
-      setClauses.push('suspendedAt = ?');
-      params.push(update.suspendedAt?.toISOString() ?? null);
-    }
-    if ('completedAt' in update) {
-      setClauses.push('completedAt = ?');
-      params.push(update.completedAt?.toISOString() ?? null);
-    }
-
-    if (setClauses.length === 0) return;
-
-    params.push(taskId);
-    await this.#client.execute({
-      sql: `UPDATE ${TABLE_BACKGROUND_TASKS} SET ${setClauses.join(', ')} WHERE id = ?`,
-      args: params,
-    });
-  }
-
-  async updateTaskIfStatus(
+  async updateTask(
     taskId: string,
-    expectedStatus: BackgroundTaskStatus,
     update: UpdateBackgroundTask,
+    options?: { expectedStatus?: BackgroundTask['status'] },
   ): Promise<boolean> {
     const setClauses: string[] = [];
     const params: InValue[] = [];
@@ -218,12 +172,17 @@ export class BackgroundTasksLibSQL extends BackgroundTasksStorage {
 
     if (setClauses.length === 0) return false;
 
-    params.push(taskId, expectedStatus);
+    params.push(taskId);
+    let where = 'id = ?';
+    if (options?.expectedStatus) {
+      where += ' AND status = ?';
+      params.push(options.expectedStatus);
+    }
     const result = await this.#client.execute({
-      sql: `UPDATE ${TABLE_BACKGROUND_TASKS} SET ${setClauses.join(', ')} WHERE id = ? AND status = ?`,
+      sql: `UPDATE ${TABLE_BACKGROUND_TASKS} SET ${setClauses.join(', ')} WHERE ${where}`,
       args: params,
     });
-    return Number(result.rowsAffected ?? 0) > 0;
+    return result.rowsAffected > 0;
   }
 
   async getTask(taskId: string): Promise<BackgroundTask | null> {

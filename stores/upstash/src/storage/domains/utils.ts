@@ -19,7 +19,6 @@ export function processRecord(tableName: TABLE_NAMES, record: Record<string, any
       namespace: record.namespace || 'workflows',
       workflow_name: record.workflow_name,
       run_id: record.run_id,
-      ...(record.resourceId ? { resourceId: record.resourceId } : {}),
     });
   } else if (tableName === TABLE_SCORERS) {
     key = getKey(tableName, { id: record.id });

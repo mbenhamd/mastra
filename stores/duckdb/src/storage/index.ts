@@ -14,8 +14,8 @@ type ObservabilityStoreImpl = ObservabilityStorageDuckDBImpl;
 const OBSERVABILITY_UPGRADE_MESSAGE =
   'DuckDB observability storage requires `@mastra/core` with observability storage support. Upgrade `@mastra/core` to use this store.';
 const OBSERVABILITY_DELTA_POLLING_FEATURE = 'observability-delta-polling';
-const DUCKDB_OBSERVABILITY_FEATURES = ['metrics', 'logs'] as const;
-const DUCKDB_OBSERVABILITY_DELTA_FEATURES = ['metrics', 'logs', 'delta-polling'] as const;
+const DUCKDB_OBSERVABILITY_FEATURES = ['metrics', 'logs', 'trace-query'] as const;
+const DUCKDB_OBSERVABILITY_DELTA_FEATURES = ['metrics', 'logs', 'delta-polling', 'trace-query'] as const;
 const DUCKDB_OBSERVABILITY_STRATEGY: ObservabilityStoreImpl['observabilityStrategy'] = {
   preferred: 'event-sourced',
   supported: ['event-sourced'],
@@ -247,6 +247,13 @@ export class ObservabilityStorageDuckDB extends CoreObservabilityStorage {
     return delegate.listTraces(...args);
   }
 
+  async queryTraces(
+    ...args: Parameters<ObservabilityStoreImpl['queryTraces']>
+  ): ReturnType<ObservabilityStoreImpl['queryTraces']> {
+    const delegate = await this.requireDelegate();
+    return delegate.queryTraces(...args);
+  }
+
   async listTracesLight(
     ...args: Parameters<ObservabilityStoreImpl['listTracesLight']>
   ): ReturnType<ObservabilityStoreImpl['listTracesLight']> {
@@ -467,6 +474,13 @@ export class ObservabilityStorageDuckDB extends CoreObservabilityStorage {
   ): ReturnType<ObservabilityStoreImpl['listFeedback']> {
     const delegate = await this.requireDelegate();
     return delegate.listFeedback(...args);
+  }
+
+  async updateFeedbackReviewStatus(
+    ...args: Parameters<ObservabilityStoreImpl['updateFeedbackReviewStatus']>
+  ): ReturnType<ObservabilityStoreImpl['updateFeedbackReviewStatus']> {
+    const delegate = await this.requireDelegate();
+    return delegate.updateFeedbackReviewStatus(...args);
   }
 
   async getFeedbackAggregate(

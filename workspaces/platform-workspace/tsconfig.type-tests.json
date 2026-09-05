@@ -1,0 +1,5 @@
+{
+  "extends": "./tsconfig.json",
+  "include": ["src/template-compatibility.test.ts"],
+  "exclude": ["node_modules"]
+}

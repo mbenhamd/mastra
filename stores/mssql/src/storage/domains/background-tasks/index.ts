@@ -186,61 +186,10 @@ export class BackgroundTasksMSSQL extends BackgroundTasksStorage {
     });
   }
 
-  async updateTask(taskId: string, update: UpdateBackgroundTask): Promise<void> {
-    const setClauses: string[] = [];
-    const params: Record<string, any> = {};
-    let idx = 1;
-
-    if ('status' in update) {
-      setClauses.push(`[status] = @p${idx}`);
-      params[`p${idx++}`] = update.status;
-    }
-    if ('result' in update) {
-      setClauses.push(`[result] = @p${idx}`);
-      params[`p${idx++}`] = serializeJson(update.result);
-    }
-    if ('error' in update) {
-      setClauses.push(`[error] = @p${idx}`);
-      params[`p${idx++}`] = serializeJson(update.error);
-    }
-    if ('suspendPayload' in update) {
-      setClauses.push(`[suspend_payload] = @p${idx}`);
-      params[`p${idx++}`] = serializeJson(update.suspendPayload);
-    }
-    if ('retryCount' in update) {
-      setClauses.push(`[retry_count] = @p${idx}`);
-      params[`p${idx++}`] = update.retryCount;
-    }
-    if ('startedAt' in update) {
-      setClauses.push(`[startedAt] = @p${idx}`);
-      params[`p${idx++}`] = update.startedAt?.toISOString() ?? null;
-    }
-    if ('suspendedAt' in update) {
-      setClauses.push(`[suspendedAt] = @p${idx}`);
-      params[`p${idx++}`] = update.suspendedAt?.toISOString() ?? null;
-    }
-    if ('completedAt' in update) {
-      setClauses.push(`[completedAt] = @p${idx}`);
-      params[`p${idx++}`] = update.completedAt?.toISOString() ?? null;
-    }
-
-    if (setClauses.length === 0) return;
-
-    setClauses.push(`[id] = [id]`); // no-op to ensure valid SET
-    params[`p${idx}`] = taskId;
-
-    const request = this.pool.request();
-    for (const [name, value] of Object.entries(params)) {
-      request.input(name, value);
-    }
-
-    await request.query(`UPDATE ${this.tableName()} SET ${setClauses.join(', ')} WHERE [id] = @p${idx}`);
-  }
-
-  async updateTaskIfStatus(
+  async updateTask(
     taskId: string,
-    expectedStatus: BackgroundTaskStatus,
     update: UpdateBackgroundTask,
+    options?: { expectedStatus?: BackgroundTask['status'] },
   ): Promise<boolean> {
     const setClauses: string[] = [];
     const params: Record<string, any> = {};
@@ -281,10 +230,14 @@ export class BackgroundTasksMSSQL extends BackgroundTasksStorage {
 
     if (setClauses.length === 0) return false;
 
+    setClauses.push(`[id] = [id]`); // no-op to ensure valid SET
+    params[`p${idx}`] = taskId;
     const taskIdParam = `p${idx++}`;
-    const statusParam = `p${idx}`;
-    params[taskIdParam] = taskId;
-    params[statusParam] = expectedStatus;
+    let statusPredicate = '';
+    if (options?.expectedStatus) {
+      params[`p${idx}`] = options.expectedStatus;
+      statusPredicate = ` AND [status] = @p${idx}`;
+    }
 
     const request = this.pool.request();
     for (const [name, value] of Object.entries(params)) {
@@ -292,11 +245,10 @@ export class BackgroundTasksMSSQL extends BackgroundTasksStorage {
     }
 
     const result = await request.query(
-      `UPDATE ${this.tableName()} SET ${setClauses.join(', ')} WHERE [id] = @${taskIdParam} AND [status] = @${statusParam}`,
+      `UPDATE ${this.tableName()} SET ${setClauses.join(', ')} WHERE [id] = @${taskIdParam}${statusPredicate}`,
     );
-    return (result.rowsAffected?.[0] ?? 0) > 0;
+    return (result.rowsAffected[0] ?? 0) > 0;
   }
-
   async getTask(taskId: string): Promise<BackgroundTask | null> {
     const request = this.pool.request();
     request.input('p1', taskId);

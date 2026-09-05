@@ -893,6 +893,7 @@ export class WorkspaceSkillsImpl implements WorkspaceSkills {
           const entry = resolved[index];
           if (entry && result.status === 'rejected') {
             const error = result.reason;
+            if (isProgrammingError(error)) throw error;
             if (error instanceof Error) {
               console.error(`[WorkspaceSkills] Failed to load skill from ${entry.path}:`, error.message);
             }
@@ -924,6 +925,10 @@ export class WorkspaceSkillsImpl implements WorkspaceSkills {
         return;
       }
     } catch (error) {
+      // Programming errors (bad argument types, mis-wired content sources) must
+      // surface rather than be mistaken for an inaccessible path.
+      if (isProgrammingError(error)) throw error;
+
       const msg = error instanceof Error ? error.message : String(error);
       let hint = '';
 
@@ -970,12 +975,14 @@ export class WorkspaceSkillsImpl implements WorkspaceSkills {
           this.#addToSkillsMap(result.value, target);
         } else if (result.status === 'rejected') {
           const error = result.reason;
+          if (isProgrammingError(error)) throw error;
           if (error instanceof Error) {
             console.error(`[WorkspaceSkills] Failed to load skill from ${skillsPath}:`, error.message);
           }
         }
       }
     } catch (error) {
+      if (isProgrammingError(error)) throw error;
       if (error instanceof Error) {
         console.error(`[WorkspaceSkills] Failed to scan skills directory ${skillsPath}:`, error.message);
       }
@@ -1037,7 +1044,8 @@ export class WorkspaceSkillsImpl implements WorkspaceSkills {
       }
 
       return false;
-    } catch {
+    } catch (error) {
+      if (isProgrammingError(error)) throw error;
       return false;
     }
   }
@@ -1504,6 +1512,17 @@ export class WorkspaceSkillsImpl implements WorkspaceSkills {
     const lastSlash = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
     return lastSlash > 0 ? path.substring(0, lastSlash) : '/';
   }
+}
+
+/**
+ * Whether an error is a Node `ERR_INVALID_ARG*` error (e.g. a non-string path
+ * handed to `fs`/`path`). Only coded errors qualify: a bare `TypeError` can also
+ * come from `fetch` network failures in fetch-backed content sources, which must
+ * keep the warn-and-continue path.
+ */
+function isProgrammingError(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null)?.code;
+  return typeof code === 'string' && code.startsWith('ERR_INVALID_ARG');
 }
 
 /**

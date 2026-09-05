@@ -41,9 +41,9 @@ export class ObservationStep {
    *
    * The `turn` back-reference exists only so a step can read context off its parent turn at
    * runtime. It closes the `ObservationTurn._currentStep -> ObservationStep.turn` cycle, so
-   * serializing it throws "Converting circular structure to JSON" (e.g. when a turn is stashed
-   * in processor state that flows into a processor-workflow snapshot). The parent turn fully
-   * owns the step, so omitting the back-reference is lossless.
+   * serializing it throws "Converting circular structure to JSON". The parent turn fully owns
+   * the step, so omitting the back-reference is lossless. Workflow snapshots exclude processor
+   * state; this projection protects explicit serialization by other callers.
    */
   toJSON() {
     return { stepNumber: this.stepNumber, prepared: this._prepared };

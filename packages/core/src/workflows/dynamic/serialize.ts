@@ -25,9 +25,28 @@ import type {
   SerializedStepOptions,
   SingleStepEntry,
   StepFlowEntry,
+  StepFlowEntryOptions,
 } from '../types';
 import { getSingleStepEntryId } from '../utils';
 import { getAdmittedJsonSchema } from './admitted-schema-source';
+
+/**
+ * The optional identity/display fields (`id` / `description` / `metadata`) of a
+ * control-flow entry, as a spreadable object. Both halves of the round-trip
+ * rebuild entries from a whitelist (`serializeEntry` here, `applyGraphEntry` in
+ * `./rehydrate`), so these must be picked explicitly or they'd be dropped.
+ */
+export function entryOptionFields(entry: {
+  id?: string;
+  description?: string;
+  metadata?: Record<string, any>;
+}): StepFlowEntryOptions {
+  const out: StepFlowEntryOptions = {};
+  if (entry.id !== undefined) out.id = entry.id;
+  if (entry.description !== undefined) out.description = entry.description;
+  if (entry.metadata !== undefined) out.metadata = entry.metadata;
+  return out;
+}
 
 /**
  * Walk a live `stepFlow` and emit a JSON-safe `SerializedStepFlowEntry[]` with
@@ -49,14 +68,14 @@ function serializeEntry(entry: StepFlowEntry): SerializedStepFlowEntry {
       if (typeof entry.duration !== 'number') {
         throw new Error(`Sleep step "${entry.id}" cannot be stored: dynamic duration (function) is not supported.`);
       }
-      return { type: 'sleep', id: entry.id, duration: entry.duration };
+      return { type: 'sleep', ...entryOptionFields(entry), id: entry.id, duration: entry.duration };
     case 'sleepUntil':
       if (!(entry.date instanceof Date)) {
         throw new Error(`SleepUntil step "${entry.id}" cannot be stored: dynamic date (function) is not supported.`);
       }
-      return { type: 'sleepUntil', id: entry.id, date: entry.date };
+      return { type: 'sleepUntil', ...entryOptionFields(entry), id: entry.id, date: entry.date };
     case 'parallel':
-      return { type: 'parallel', steps: entry.steps.map(s => serializeSingleEntry(s)) };
+      return { type: 'parallel', ...entryOptionFields(entry), steps: entry.steps.map(s => serializeSingleEntry(s)) };
     case 'foreach':
       if (entry.step.type === 'mapping') {
         throw new Error(
@@ -72,8 +91,12 @@ function serializeEntry(entry: StepFlowEntry): SerializedStepFlowEntry {
       }
       return {
         type: 'foreach',
+        ...entryOptionFields(entry),
         step: serializeSingleEntry(entry.step),
-        opts: { concurrency: entry.opts.concurrency },
+        // The live entry keeps the caller's options object by reference, and
+        // `.foreach(step, { id })` is valid without a concurrency — default it
+        // here so stored graphs never carry an empty (schema-invalid) opts.
+        opts: { concurrency: entry.opts.concurrency ?? 1 },
       };
     case 'conditional': {
       const predicates = entry.predicates;
@@ -84,6 +107,7 @@ function serializeEntry(entry: StepFlowEntry): SerializedStepFlowEntry {
       }
       return {
         type: 'conditional',
+        ...entryOptionFields(entry),
         steps: entry.steps.map(s => serializeSingleEntry(s)),
         serializedConditions: entry.serializedConditions,
         predicates,
@@ -98,6 +122,7 @@ function serializeEntry(entry: StepFlowEntry): SerializedStepFlowEntry {
       }
       return {
         type: 'loop',
+        ...entryOptionFields(entry),
         step: serializeSingleEntry(entry.step),
         serializedCondition: entry.serializedCondition,
         loopType: entry.loopType,
@@ -166,7 +191,7 @@ function serializeSingleEntry(entry: SingleStepEntry): SerializedSingleStepEntry
         serialized[key] = m;
       }
     }
-    return { type: 'mapping', id: entry.id, mapConfig: JSON.stringify(serialized) };
+    return { type: 'mapping', ...entryOptionFields(entry), id: entry.id, mapConfig: JSON.stringify(serialized) };
   }
   // A nested Workflow reached the generic `.then(step)` fallback (its
   // component discriminator is 'WORKFLOW'). Emit a declarative `workflow`

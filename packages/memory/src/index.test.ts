@@ -5572,6 +5572,22 @@ describe('Memory', () => {
       expect(engine?.getObservationConfig().bufferOnIdle).toBe(true);
     });
 
+    it('passes hook execution mode to the ObservationalMemory engine', async () => {
+      const memory = new Memory({
+        storage: new InMemoryStore(),
+        options: {
+          observationalMemory: {
+            hookExecution: 'await',
+            hooks: {},
+          },
+        },
+      });
+
+      const engine = await (memory as any)._initOMEngine();
+
+      expect(engine?.hookExecution).toBe('await');
+    });
+
     it.fails('creates OM processors when observational memory is enabled by the per-turn memory config', async () => {
       const memory = new Memory({
         storage: new InMemoryStore(),
@@ -5601,6 +5617,30 @@ describe('Memory', () => {
         input: ['observational-memory'],
         output: ['observational-memory'],
       });
+    });
+
+    it('passes continuationHints to the ObservationalMemory engine on both pipelines', async () => {
+      const storage = new InMemoryStore();
+      const memory = new Memory({
+        storage,
+        options: {
+          observationalMemory: {
+            observation: {
+              continuationHints: { suggestedResponse: false },
+            },
+            reflection: {
+              continuationHints: { suggestedResponse: false },
+            },
+          },
+        },
+      });
+
+      const engine = await (memory as any)._initOMEngine();
+
+      const observationSlugs = engine?.getObservationConfig().extractors.map((e: { slug: string }) => e.slug);
+      const reflectionSlugs = engine?.getReflectionConfig().extractors.map((e: { slug: string }) => e.slug);
+      expect(observationSlugs).toEqual(['current-task']);
+      expect(reflectionSlugs).toEqual(['current-task']);
     });
 
     it('should clear thread-scoped observational memory when deleting a thread', async () => {

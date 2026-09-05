@@ -215,6 +215,47 @@ describe('MastraModelOutput', () => {
   );
 
   describe('writer in output processors (outer context)', () => {
+    it.each([true, false])('materializes only the aborted step after buffer reset (partial: %s)', async partial => {
+      const runId = 'aborted-step-reset';
+      const messageList = new MessageList({ threadId: 'test-thread' });
+      const received: string[] = [];
+      const abortedStep = createStepFinishChunk(runId);
+      if (abortedStep.type !== 'step-finish') throw new Error('Expected step-finish fixture');
+      abortedStep.payload.stepResult.reason = 'abort';
+      const processor: Processor = {
+        id: 'capture-aborted-transcript',
+        processOutputResult: async ({ messageList, messages }) => {
+          received.push(
+            ...messageList.get.response.db().map(message =>
+              message.content.parts
+                .filter(part => part.type === 'text')
+                .map(part => part.text)
+                .join(''),
+            ),
+          );
+          return messages;
+        },
+      };
+      const output = new MastraModelOutput({
+        model: { modelId: 'test-model', provider: 'test', version: 'v3' },
+        stream: createChunkStream([
+          createTextDeltaChunk(runId, 'earlier completed answer'),
+          createStepFinishChunk(runId),
+          ...(partial ? [createTextDeltaChunk(runId, 'partial answer')] : []),
+          { type: 'abort', runId, from: ChunkFrom.AGENT, payload: {} },
+          ...(partial ? [abortedStep] : []),
+          createFinishChunk(runId),
+        ]),
+        messageList,
+        messageId: 'msg-aborted',
+        options: { runId, outputProcessors: [processor] },
+      });
+
+      await output.consumeStream();
+
+      expect(received).toEqual(partial ? ['partial answer'] : []);
+    });
+
     it('should pass a defined writer to processOutputResult', async () => {
       let receivedWriter: ProcessorStreamWriter | undefined;
 

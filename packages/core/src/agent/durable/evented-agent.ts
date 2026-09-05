@@ -2,10 +2,10 @@
  * EventedAgent - A durable agent that uses fire-and-forget execution.
  *
  * EventedAgent extends DurableAgent and overrides the execution strategy to use
- * fire-and-forget execution via the workflow engine's startAsync() method.
+ * fire-and-forget execution: the workflow run is started without awaiting it.
  *
  * Unlike DurableAgent which runs the workflow synchronously, EventedAgent:
- * 1. Uses startAsync() for non-blocking execution
+ * 1. Uses an un-awaited start() for non-blocking execution
  * 2. Fire-and-forget pattern - execution starts and returns immediately
  * 3. Events are streamed via pubsub as the workflow executes
  */
@@ -38,7 +38,7 @@ export interface EventedAgentConfig<
  *
  * The key difference from DurableAgent is the execution strategy:
  * - DurableAgent: Runs the workflow synchronously via createRun + start
- * - EventedAgent: Uses run.startAsync() for fire-and-forget execution
+ * - EventedAgent: Starts the run without awaiting it (fire-and-forget)
  *
  * @example
  * ```typescript
@@ -73,8 +73,9 @@ export class EventedAgent<
   /**
    * Execute the durable workflow using fire-and-forget pattern.
    *
-   * Unlike DurableAgent which runs the workflow synchronously, EventedAgent uses
-   * the workflow's startAsync() method for non-blocking execution.
+   * Unlike DurableAgent which runs the workflow synchronously, EventedAgent starts
+   * the run without awaiting it, then cleans up snapshots when the background
+   * promise reaches a non-suspended terminal status.
    *
    * @param runId - The unique run ID
    * @param workflowInput - The serialized workflow input
@@ -84,9 +85,14 @@ export class EventedAgent<
     try {
       const workflow = this.getWorkflow();
       const entry = pinGlobalRunRegistryEntry(runId);
+      // Populate the run row's resourceId column so storage-level resource
+      // filters (listSuspendedRuns / listActiveRuns) can narrow the query.
+      const memoryInfo = (
+        workflowInput.messageListState as { memoryInfo?: { threadId?: string; resourceId?: string } } | undefined
+      )?.memoryInfo;
       const run = await workflow.createRun({
         runId,
-        resourceId: workflowInput.state?.resourceId,
+        resourceId: workflowInput.state?.resourceId ?? memoryInfo?.resourceId,
         pubsub: this.pubsubInternal,
       });
       // The caller already runs executeWorkflow() in the background. Keep this

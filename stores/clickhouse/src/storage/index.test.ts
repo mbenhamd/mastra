@@ -32,7 +32,7 @@ const createTestClient = () =>
 
 const storage = new ClickhouseStore(TEST_CONFIG);
 
-createTestSuite(storage, { backgroundTasksUpdateIfStatus: false });
+createTestSuite(storage);
 
 // Configuration validation tests
 createConfigValidationTests({

@@ -32,7 +32,10 @@ vi.mock('../../abort-transport', () => ({
   ensureRemoteAbortListener: vi.fn().mockResolvedValue(undefined),
 }));
 
-vi.mock('../../utils/resolve-runtime', () => ({
+vi.mock('../../utils/resolve-runtime', async () => ({
+  restoreRequestContext: (
+    await vi.importActual<typeof import('../../utils/resolve-runtime')>('../../utils/resolve-runtime')
+  ).restoreRequestContext,
   resolveTool: vi.fn(),
   rebuildRunToolsFromMastra: vi.fn().mockResolvedValue({ tools: {} }),
   resolveRuntimeDependencies: vi.fn(),

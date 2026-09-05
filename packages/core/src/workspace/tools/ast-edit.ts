@@ -67,6 +67,9 @@ interface AstGrepModule {
 let astGrepModule: AstGrepModule | null | undefined;
 let loadingPromise: Promise<AstGrepModule | null> | undefined;
 
+// Keep the specifier as a parameter so tsdown cannot fold it into a literal dynamic import.
+const importModule = (moduleName: string) => import(/* @vite-ignore */ /* webpackIgnore: true */ moduleName);
+
 /**
  * Try to load @ast-grep/napi. Returns null if not available.
  * Uses dynamic import to avoid compile-time dependency.
@@ -79,15 +82,7 @@ export async function loadAstGrep(): Promise<AstGrepModule | null> {
   if (!loadingPromise) {
     loadingPromise = (async () => {
       try {
-        // Bundler-proof dynamic import. String concatenation is NOT enough:
-        // tsdown's CJS lowering constant-folds it and rewrites the import into
-        // a createRequire().resolve("@ast-grep/napi") that downstream bundlers
-        // (vite's commonjs resolver in playground/factory-ui) statically follow
-        // into the platform-native .node binary and fail on. Indirect eval
-        // keeps the specifier opaque to every bundler; this path only executes
-        // in the Node-side workspace tool runtime.
-        const importOpaque = (0, eval)('s => import(s)') as (spec: string) => Promise<any>;
-        const mod = await importOpaque('@ast-grep' + '/napi');
+        const mod = await importModule('@ast-grep/napi');
         astGrepModule = { parse: mod.parse, Lang: mod.Lang };
         return astGrepModule;
       } catch {

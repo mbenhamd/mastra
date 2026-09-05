@@ -1,6 +1,7 @@
 import { EntityType } from '@mastra/core/observability';
 import { useMastraClient } from '@mastra/react';
 import { useQuery } from '@tanstack/react-query';
+import { DISCOVERY_STALE_TIME } from './discovery-cache';
 import { ROOT_ENTITY_TYPE_OPTIONS } from '@/domains/traces/trace-filters';
 
 type EntityTypeValue = `${EntityType}`;
@@ -57,5 +58,6 @@ export const useEntityNames = ({ entityType, rootOnly = false, enabled = true }:
     select: data => data?.names ?? [],
     retry: false,
     enabled,
+    staleTime: DISCOVERY_STALE_TIME,
   });
 };

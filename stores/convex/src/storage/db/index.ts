@@ -148,16 +148,19 @@ export class ConvexDB extends MastraBase {
     tableName,
     id,
     record,
+    expected,
   }: {
     tableName: ConvexStorageTable;
     id: string;
     record: Record<string, any>;
+    expected?: Record<string, any>;
   }): Promise<boolean> {
     return this.client.callStorage<boolean>({
       op: 'patch',
       tableName,
       id,
       record: this.normalizePatch(record),
+      expected,
     });
   }
 
@@ -254,29 +257,6 @@ export class ConvexDB extends MastraBase {
       op: 'deleteMany',
       tableName,
       ids,
-    });
-  }
-
-  public async updateIfFieldEquals({
-    tableName,
-    id,
-    field,
-    expectedValue,
-    patch,
-  }: {
-    tableName: ConvexStorageTable;
-    id: string;
-    field: string;
-    expectedValue: string | number | boolean | null;
-    patch: Record<string, any>;
-  }): Promise<boolean> {
-    return this.client.callStorage<boolean>({
-      op: 'updateIfFieldEquals',
-      tableName,
-      id,
-      field,
-      expectedValue,
-      patch: this.normalizePatch(patch),
     });
   }
 
