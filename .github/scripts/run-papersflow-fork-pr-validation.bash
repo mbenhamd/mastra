@@ -3,7 +3,20 @@
 set -euo pipefail
 
 VALIDATOR_REPOSITORY_ROOT="$(git rev-parse --show-toplevel)"
-TYPESCRIPT_MODULE_PATH="$VALIDATOR_REPOSITORY_ROOT/node_modules/typescript"
+# TypeScript 7 keeps the compiler API in the upstream typescript-classic alias.
+# Select from manifest metadata so pre-install admission needs no dependencies.
+TYPESCRIPT_MODULE_PATH="$(node - "$VALIDATOR_REPOSITORY_ROOT" <<'NODE'
+const fs = require('node:fs');
+const path = require('node:path');
+const root = process.argv[2];
+const manifestPath = path.join(root, 'package.json');
+const manifest = fs.existsSync(manifestPath) ? JSON.parse(fs.readFileSync(manifestPath, 'utf8')) : {};
+const compilerPackage = Object.hasOwn(manifest.devDependencies ?? {}, 'typescript-classic')
+  ? 'typescript-classic'
+  : 'typescript';
+process.stdout.write(path.join(root, 'node_modules', compilerPackage));
+NODE
+)"
 readonly VALIDATOR_REPOSITORY_ROOT TYPESCRIPT_MODULE_PATH
 
 pf558_config() {
@@ -142,14 +155,14 @@ verify_pf3553_reviewed_surface() (
 
 pf3759_config() {
   PF3759_HEAD_REPOSITORY="${PAPERSFLOW_PF3759_HEAD_REPOSITORY:-mbenhamd/mastra}"
-  PF3759_HEAD_REF="${PAPERSFLOW_PF3759_HEAD_REF:-feature/pf-3759-mastra-upstream-sync-3cf8e685}"
+  PF3759_HEAD_REF="${PAPERSFLOW_PF3759_HEAD_REF:-feature/pf-3759-mastra-upstream-sync-3cf8e685-r2}"
   PF3759_BASE_REF="${PAPERSFLOW_PF3759_BASE_REF:-main}"
   PF3759_PENDING_MERGE_COMMIT='PENDING_PF3759_MERGE_COMMIT'
   PF3759_PENDING_REVIEWED_TREE='PENDING_PF3759_REVIEWED_TREE'
-  PF3759_MERGE_COMMIT="${PAPERSFLOW_PF3759_MERGE_COMMIT:-f70ba8e30a687413352b4ed5ddb57bc9add99783}"
+  PF3759_MERGE_COMMIT="${PAPERSFLOW_PF3759_MERGE_COMMIT:-f9c6e022d80bcad045e2eb421d6443a91f81204b}"
   PF3759_FORK_PARENT="${PAPERSFLOW_PF3759_FORK_PARENT:-ef6dab0a7183bb403918f4a63738987146935a00}"
   PF3759_UPSTREAM_PARENT="${PAPERSFLOW_PF3759_UPSTREAM_PARENT:-3cf8e68555e212f3465c5cbf12516e87709f7f5d}"
-  PF3759_REVIEWED_TREE="${PAPERSFLOW_PF3759_REVIEWED_TREE:-e1c8a80349ea259c429e84c2a85b6762256a8884}"
+  PF3759_REVIEWED_TREE="${PAPERSFLOW_PF3759_REVIEWED_TREE:-65a120f4ff107c97920ede2f03ba6e1a664c0b3b}"
   readonly \
     PF3759_HEAD_REPOSITORY PF3759_HEAD_REF PF3759_BASE_REF PF3759_MERGE_COMMIT \
     PF3759_FORK_PARENT PF3759_UPSTREAM_PARENT PF3759_REVIEWED_TREE \
@@ -2574,7 +2587,7 @@ run_pf3759_admission_self_tests() (
         GITHUB_OUTPUT= \
         BASE_SHA="$protected_base" HEAD_SHA="$fixture_head" PR_NUMBER=999 \
         HEAD_REPOSITORY=mbenhamd/mastra \
-        HEAD_REF=feature/pf-3759-mastra-upstream-sync-3cf8e685 \
+        HEAD_REF=feature/pf-3759-mastra-upstream-sync-3cf8e685-r2 \
         BASE_REF=main \
         PAPERSFLOW_PF3759_MERGE_COMMIT="$reviewed_head" \
         PAPERSFLOW_PF3759_FORK_PARENT="$fork_parent" \
@@ -9047,11 +9060,11 @@ git_regular_file_at_head() {
 }
 
 core_supervisor_test_preserves_provider_gate() {
-  if ! node - "$merge_base_sha" "$HEAD_SHA" <<'NODE'
+  if ! node - "$TYPESCRIPT_MODULE_PATH" "$merge_base_sha" "$HEAD_SHA" <<'NODE'
 const { execFileSync } = require('node:child_process');
-const ts = require('typescript');
+const ts = require(process.argv[2]);
 
-const [baseSha, headSha] = process.argv.slice(2);
+const [baseSha, headSha] = process.argv.slice(3);
 const file = 'packages/core/src/agent/__tests__/supervisor-integration.test.ts';
 const read = sha => execFileSync('git', ['show', `${sha}:${file}`], { encoding: 'utf8' });
 const parse = source => ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
@@ -9165,11 +9178,11 @@ NODE
 }
 
 tool_approval_test_preserves_replay_harness() {
-  node - "$merge_base_sha" "$HEAD_SHA" <<'NODE'
+  node - "$TYPESCRIPT_MODULE_PATH" "$merge_base_sha" "$HEAD_SHA" <<'NODE'
 const { execFileSync } = require('node:child_process');
-const ts = require('typescript');
+const ts = require(process.argv[2]);
 
-const [baseSha, headSha] = process.argv.slice(2);
+const [baseSha, headSha] = process.argv.slice(3);
 const file = 'packages/core/src/agent/__tests__/tool-approval.e2e.test.ts';
 const read = sha => execFileSync('git', ['show', `${sha}:${file}`], { encoding: 'utf8' });
 const parse = source => ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
@@ -9274,12 +9287,12 @@ NODE
 }
 
 storage_harness_factory_registers_suite() {
-  node - "$HEAD_SHA" <<'NODE'
+  node - "$TYPESCRIPT_MODULE_PATH" "$HEAD_SHA" <<'NODE'
 const { execFileSync } = require('node:child_process');
 const path = require('node:path');
-const ts = require('typescript');
+const ts = require(process.argv[2]);
 
-const [headSha] = process.argv.slice(2);
+const [headSha] = process.argv.slice(3);
 const factoryPath = 'stores/_test-utils/src/factory.ts';
 const sourceText = execFileSync('git', ['show', `${headSha}:${factoryPath}`], {
   encoding: 'utf8',
@@ -9591,12 +9604,12 @@ NODE
 }
 
 storage_harness_entrypoint_registers_suite() {
-  node - "$HEAD_SHA" <<'NODE'
+  node - "$TYPESCRIPT_MODULE_PATH" "$HEAD_SHA" <<'NODE'
 const { execFileSync } = require('node:child_process');
 const path = require('node:path');
-const ts = require('typescript');
+const ts = require(process.argv[2]);
 
-const [headSha] = process.argv.slice(2);
+const [headSha] = process.argv.slice(3);
 const testPath = 'stores/_test-utils/src/index.test.ts';
 const sourceText = execFileSync('git', ['show', `${headSha}:${testPath}`], {
   encoding: 'utf8',
@@ -9779,12 +9792,12 @@ NODE
 }
 
 mastracode_observation_migration_uses_helper() {
-  node - "$HEAD_SHA" <<'NODE'
+  node - "$TYPESCRIPT_MODULE_PATH" "$HEAD_SHA" <<'NODE'
 const { execFileSync } = require('node:child_process');
 const path = require('node:path');
-const ts = require('typescript');
+const ts = require(process.argv[2]);
 
-const [headSha] = process.argv.slice(2);
+const [headSha] = process.argv.slice(3);
 const scriptPath = 'mastracode/sdk/scripts/index-messages.ts';
 const sourceText = execFileSync('git', ['show', `${headSha}:${scriptPath}`], {
   encoding: 'utf8',
@@ -12906,11 +12919,11 @@ select_changed_agent_signal_tests() {
   local file="$1"
   local output_file="$2"
 
-  node - "$merge_base_sha" "$HEAD_SHA" "$file" > "$output_file" <<'NODE'
+  node - "$TYPESCRIPT_MODULE_PATH" "$merge_base_sha" "$HEAD_SHA" "$file" > "$output_file" <<'NODE'
 const { execFileSync } = require('node:child_process');
-const ts = require('typescript');
+const ts = require(process.argv[2]);
 
-const [baseSha, headSha, file] = process.argv.slice(2);
+const [baseSha, headSha, file] = process.argv.slice(3);
 const readSource = sha => execFileSync('git', ['show', `${sha}:${file}`], { encoding: 'utf8' });
 const diff = execFileSync('git', ['diff', '--unified=0', '--no-color', baseSha, headSha, '--', file], {
   encoding: 'utf8',
