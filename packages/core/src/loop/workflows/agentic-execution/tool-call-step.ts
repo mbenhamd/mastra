@@ -132,6 +132,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
   _internal,
   logger,
   agentId,
+  agentVersionId,
   mastra,
   requireToolApproval: requireToolApprovalFromFactory,
   actor,
@@ -1068,6 +1069,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                 },
                 __streamState: streamState.serialize(),
                 __agentId: agentId,
+                ...(agentVersionId ? { __agentVersionId: agentVersionId } : {}),
               },
               {
                 resumeLabel: inputData.toolCallId,
@@ -1232,6 +1234,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                   },
                   __streamState: streamState.serialize(),
                   __agentId: agentId,
+                  ...(agentVersionId ? { __agentVersionId: agentVersionId } : {}),
                   // Persist the inner suspended run id in the workflow snapshot, partitioned per
                   // tool call (resumeLabel = toolCallId). Persisted message metadata exposes the
                   // same id as delegatedRunId for cold reloads, while the snapshot remains the
@@ -1291,6 +1294,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                   toolCallSuspended: suspendPayload,
                   __streamState: streamState.serialize(),
                   __agentId: agentId,
+                  ...(agentVersionId ? { __agentVersionId: agentVersionId } : {}),
                   toolCallId: metadataToolCallId,
                   toolName: inputData.toolName,
                   resumeLabel: options?.resumeLabel,
@@ -1540,7 +1544,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                       const bgRunId = chunk.payload.runId;
                       const replayKey = `${bgRunId}:${chunk.payload.toolCallId}`;
                       if (
-                        (bgRunId !== runId || (bgRunId === runId && workflowResumeData)) &&
+                        (bgRunId !== runId || (bgRunId === runId && workflowResumeData != null)) &&
                         !emittedReplayedToolCalls.has(replayKey)
                       ) {
                         safeEnqueue(
@@ -1760,7 +1764,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                   // message so memory still records the result, even if it
                   // means a duplicate entry for that toolCallId.
                   if (!updated) {
-                    if (params.runId !== runId || (params.runId === runId && workflowResumeData)) {
+                    if (params.runId !== runId || (params.runId === runId && workflowResumeData != null)) {
                       messageList.add(
                         [
                           {
@@ -1842,6 +1846,8 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
               resourceId: readScoped(scopeCtx, RESOURCE_ID_KEY, 'resourceId'),
               toolName: inputData.toolName,
             });
+            // Treat only `undefined` as absent: primitive resume schemas may
+            // legitimately resolve to false, 0, an empty string, or null.
             if (isSuspended && resumeDataToPassToToolOptions !== undefined) {
               const task = await bgTask.resume(resumeDataToPassToToolOptions);
 

@@ -9,6 +9,8 @@ import type {
   ListTracesArgs,
   ListTracesResponse,
   ListTracesLightResponse,
+  TraceQueryRequest,
+  TraceQueryResponse,
   ListBranchesArgs,
   ListBranchesResponse,
   GetBranchArgs,
@@ -34,6 +36,8 @@ import type {
   ListFeedbackResponse,
   CreateFeedbackBody,
   CreateFeedbackResponse,
+  UpdateFeedbackReviewStatusArgs,
+  FeedbackRecord,
   GetFeedbackAggregateArgs,
   GetFeedbackAggregateResponse,
   GetFeedbackBreakdownArgs,
@@ -193,6 +197,7 @@ import type {
   GenerateDatasetItemsParams,
   GeneratedItem,
   TriggerDatasetExperimentParams,
+  UpdateDatasetExperimentParams,
   CreateDatasetExperimentParams,
   CreateDatasetExperimentResponse,
   RunExperimentItemParams,
@@ -1093,6 +1098,11 @@ export class MastraClient extends BaseResource {
     return this.observability.listTraces(params);
   }
 
+  /** Queries completed logical traces using recursive trace and related-record predicates. */
+  queryTraces(params: TraceQueryRequest): Promise<TraceQueryResponse> {
+    return this.observability.queryTraces(params);
+  }
+
   /**
    * Retrieves paginated list of traces carrying only the fields a trace list renders.
    * Same contract as {@link listTraces}, but rows omit the `attributes`/`input`/`output`
@@ -1125,6 +1135,16 @@ export class MastraClient extends BaseResource {
 
   listScoresBySpan(params: ListScoresBySpanParams): Promise<ListScoresResponse> {
     return this.observability.listScoresBySpan(params);
+  }
+
+  /**
+   * Deletes traces by ID, cascading to all associated spans and trace-linked
+   * signal events (scores, feedback, metrics, logs). Signals without a trace ID
+   * are untouched. On ClickHouse-backed stores, reads may briefly return
+   * deleted rows until the delete is fully applied.
+   */
+  deleteTraces(params: { traceIds: string[] }): Promise<{ success: true }> {
+    return this.observability.deleteTraces(params);
   }
 
   /** Scores one or more traces using a specified scorer (fire-and-forget). */
@@ -1190,6 +1210,11 @@ export class MastraClient extends BaseResource {
   /** Creates a single feedback record in the observability store. */
   createFeedback(params: CreateFeedbackBody): Promise<CreateFeedbackResponse> {
     return this.observability.createFeedback(params);
+  }
+
+  /** Updates a feedback record's review workflow status. */
+  updateFeedbackReviewStatus(params: UpdateFeedbackReviewStatusArgs): Promise<FeedbackRecord> {
+    return this.observability.updateFeedbackReviewStatus(params);
   }
 
   /** Returns an aggregated feedback value with optional period-over-period comparison. */
@@ -2158,6 +2183,17 @@ export class MastraClient extends BaseResource {
   }
 
   /**
+   * Updates a dataset experiment's name, description or metadata
+   */
+  public updateDatasetExperiment(params: UpdateDatasetExperimentParams): Promise<DatasetExperiment> {
+    const { datasetId, experimentId, ...body } = params;
+    return this.request(`/datasets/${encodeURIComponent(datasetId)}/experiments/${encodeURIComponent(experimentId)}`, {
+      method: 'PATCH',
+      body,
+    });
+  }
+
+  /**
    * Lists results for a dataset experiment
    */
   public listDatasetExperimentResults(
@@ -2205,6 +2241,7 @@ export class MastraClient extends BaseResource {
       input: unknown;
       output: unknown | null;
       groundTruth: unknown | null;
+      metadata?: Record<string, unknown> | null;
       error: string | null;
       startedAt: string | Date;
       completedAt: string | Date;

@@ -1,6 +1,6 @@
 ---
 title: "Reference: SkillSearchProcessor | Processors"
-description: "Documentation for the SkillSearchProcessor in Mastra, which enables on-demand skill discovery and loading for agents with many skills."
+description: "The SkillSearchProcessor is an input processor that enables on-demand skill discovery and loading."
 packages:
   - "@mastra/core"
 ---
@@ -187,7 +187,7 @@ With `search.autoLoad: true`, the agent workflow is:
 
 ## Single-step discovery with `autoLoad`
 
-Set `search.autoLoad` to `true` to remove the separate `load_skill` call. `search_skills` activates every returned match, emits a durable activation receipt, and the instructions become available on the next model turn. `load_skill` isn't exposed in this mode, so the model can't spend turns repeatedly loading the same skill.
+Set `search.autoLoad` to `true` to remove the separate `load_skill` call. `search_skills` activates every returned match and emits a durable activation receipt. The instructions become available on the next model turn. `load_skill` isn't exposed in this mode, so the model can't spend turns repeatedly loading the same skill.
 
 ```typescript
 const skillSearch = new SkillSearchProcessor({

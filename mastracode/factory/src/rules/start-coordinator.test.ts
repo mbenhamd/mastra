@@ -32,6 +32,7 @@ function makeController(sendMessage = vi.fn(async () => {})) {
     },
     getWorkspace: vi.fn(() => ({ skills: undefined })),
     state: { get: vi.fn(() => ({})), set: vi.fn(async () => {}) },
+    permissions: { setForTool: vi.fn(async () => {}) },
     model: { switch: vi.fn(async () => {}) },
     om: {
       observer: { modelId: vi.fn(() => undefined), switchModel: vi.fn(async () => {}) },
@@ -94,7 +95,6 @@ function startRequest(
     sessionId: string;
     kickoffKey: string;
     role: string;
-    kickoffMessage: string | null;
     defaultModelId: string;
     id: string;
   }> = {},
@@ -105,12 +105,7 @@ function startRequest(
     factoryProjectId: PROJECT_ID,
     sessionId: overrides.sessionId ?? 'session-1',
     threadTitle: 'Investigate issue 1',
-    threadTags: { role: overrides.role ?? 'work' },
     kickoffKey: overrides.kickoffKey ?? 'kickoff-1',
-    invocation:
-      overrides.kickoffMessage === null
-        ? undefined
-        : { type: 'prompt' as const, prompt: overrides.kickoffMessage ?? 'Start work' },
     destinationStage: 'intake' as const,
     defaultModelId: overrides.defaultModelId,
     workItem: {
@@ -148,10 +143,15 @@ describe('FactoryStartCoordinator', () => {
       threadId: 'session-1',
       resourceId: 'session-1',
       sessionId: 'session-1',
-      kickoffStatus: 'pending',
+      kickoffStatus: 'sent',
       replayed: false,
     });
-    expect((await storage.listPendingStarts('org-1', PROJECT_ID))[0]?.status).toBe('pending');
+    expect((await storage.listPendingStarts('org-1', PROJECT_ID))[0]?.status).toBe('sent');
+    const session = await vi.mocked(controller.createSession).mock.results[0]?.value;
+    expect(session.permissions.setForTool).toHaveBeenCalledWith({
+      toolName: 'factory_transition_work_item',
+      policy: 'allow',
+    });
     const requestContext = vi.mocked(controller.createSession).mock.calls[0]?.[0].requestContext;
     expect(requestContext?.get('user')).toEqual({
       workosId: 'user-1',
@@ -305,7 +305,7 @@ describe('FactoryStartCoordinator', () => {
 
     await expect(
       coordinator.prepare(startRequest({ defaultModelId: 'anthropic/claude-fable-5' })),
-    ).resolves.toMatchObject({ threadId: 'session-1', kickoffStatus: 'pending' });
+    ).resolves.toMatchObject({ threadId: 'session-1', kickoffStatus: 'sent' });
     expect(warn).toHaveBeenCalledWith('[Factory Start] Failed to apply factory default model', {
       modelId: 'anthropic/claude-fable-5',
       error: 'Unknown model',
@@ -347,7 +347,7 @@ describe('FactoryStartCoordinator', () => {
     expect((await storage.get({ orgId: 'org-1', id: prepared.workItemId }))?.stages).toEqual(['execute']);
     expect(bindingsDuringRule).toBe(1);
     expect(sendMessage).not.toHaveBeenCalled();
-    expect((await storage.listPendingStarts('org-1', PROJECT_ID))[0]?.status).toBe('pending');
+    expect((await storage.listPendingStarts('org-1', PROJECT_ID))[0]?.status).toBe('sent');
   });
 
   it('binds the controller session to the exact Factory session thread', async () => {
@@ -360,7 +360,7 @@ describe('FactoryStartCoordinator', () => {
       makeSourceControl() as never,
     );
 
-    const prepared = await coordinator.prepare(startRequest({ kickoffMessage: null }));
+    const prepared = await coordinator.prepare(startRequest());
 
     expect(prepared).toMatchObject({ threadId: 'session-1', resourceId: 'session-1', sessionId: 'session-1' });
     expect(controller.createSession).toHaveBeenCalledWith(
@@ -394,7 +394,7 @@ describe('FactoryStartCoordinator', () => {
       makeSourceControl() as never,
     );
 
-    const request = startRequest({ role: 'review', kickoffMessage: null });
+    const request = startRequest({ role: 'review' });
     request.workItem.input.externalSource.type = 'pull-request' as never;
     await coordinator.prepare(request);
 
@@ -411,38 +411,6 @@ describe('FactoryStartCoordinator', () => {
     });
   });
 
-  it.each(['factory-review', 'factory-rereview'] as const)(
-    'tags %s skill kickoffs with untrustedCheckout',
-    async skillName => {
-      const storage = (await createFactoryStorageForTests()).workItems;
-      const { controller, session } = makeController();
-      session.getWorkspace.mockReturnValue({
-        skills: {
-          maybeRefresh: vi.fn(async () => {}),
-          get: vi.fn(async () => ({ name: skillName, description: 'Review a PR', instructions: 'Review.' })),
-        },
-      } as never);
-      const coordinator = new FactoryStartCoordinator(
-        controller as never,
-        storage,
-        undefined,
-        makeSourceControl() as never,
-      );
-
-      const request = startRequest({ kickoffMessage: null });
-      request.invocation = { type: 'skill', skillName, arguments: 'PR #1' } as never;
-      await coordinator.prepare(request);
-
-      expect(session.state.set).toHaveBeenCalledWith({
-        factoryProjectId: PROJECT_ID,
-        projectRepositoryId: 'project-repository-1',
-        factoryOrgId: 'org-1',
-        untrustedCheckout: true,
-        baseRef: 'main',
-      });
-    },
-  );
-
   it('falls back to intake metadata for baseRef when the session record has no base branch', async () => {
     const storage = (await createFactoryStorageForTests()).workItems;
     const { controller, session } = makeController();
@@ -451,7 +419,7 @@ describe('FactoryStartCoordinator', () => {
     record!.baseBranch = '';
     const coordinator = new FactoryStartCoordinator(controller as never, storage, undefined, sourceControl as never);
 
-    const request = startRequest({ role: 'review', kickoffMessage: null });
+    const request = startRequest({ role: 'review' });
     request.workItem.input.externalSource.type = 'pull-request' as never;
     request.workItem.input.metadata = { baseBranch: 'release-1.x' };
     await coordinator.prepare(request);
@@ -475,7 +443,7 @@ describe('FactoryStartCoordinator', () => {
       makeSourceControl() as never,
     );
 
-    await coordinator.prepare(startRequest({ kickoffMessage: null }));
+    await coordinator.prepare(startRequest());
 
     expect(session.state.set).toHaveBeenCalledWith({
       factoryProjectId: PROJECT_ID,
@@ -494,12 +462,8 @@ describe('FactoryStartCoordinator', () => {
       makeSourceControl() as never,
     );
 
-    const triage = await coordinator.prepare(
-      startRequest({ role: 'triage', kickoffKey: 'triage-1', kickoffMessage: null }),
-    );
-    const plan = await coordinator.prepare(
-      startRequest({ id: triage.workItemId, role: 'plan', kickoffKey: 'plan-1', kickoffMessage: null }),
-    );
+    const triage = await coordinator.prepare(startRequest({ role: 'triage', kickoffKey: 'triage-1' }));
+    const plan = await coordinator.prepare(startRequest({ id: triage.workItemId, role: 'plan', kickoffKey: 'plan-1' }));
 
     expect(plan.threadId).toBe('session-1');
     expect(plan.threadId).toBe(triage.threadId);
@@ -569,7 +533,7 @@ describe('FactoryStartCoordinator', () => {
     const replay = await coordinator.prepare(input);
 
     expect(replay).toMatchObject({ workItemId: first.workItemId, bindingId: first.bindingId, replayed: true });
-    expect((await storage.listPendingStarts('org-1', PROJECT_ID))[0]).toMatchObject({ status: 'pending' });
+    expect((await storage.listPendingStarts('org-1', PROJECT_ID))[0]).toMatchObject({ status: 'sent' });
     expect(sendMessage).not.toHaveBeenCalled();
     expect(await storage.listRunBindings('org-1', PROJECT_ID)).toHaveLength(1);
   });
@@ -583,11 +547,9 @@ describe('FactoryStartCoordinator', () => {
       undefined,
       makeSourceControl() as never,
     );
-    const first = await coordinator.prepare(startRequest({ kickoffMessage: null }));
+    const first = await coordinator.prepare(startRequest());
 
-    await coordinator.prepare(
-      startRequest({ id: first.workItemId, kickoffKey: 'kickoff-2', role: 'work', kickoffMessage: null }),
-    );
+    await coordinator.prepare(startRequest({ id: first.workItemId, kickoffKey: 'kickoff-2', role: 'work' }));
     const bindings = await storage.listRunBindings('org-1', PROJECT_ID, first.workItemId);
     expect(bindings.map(binding => binding.status).sort()).toEqual(['active', 'revoked']);
     expect(bindings.every(binding => binding.role === 'work')).toBe(true);
@@ -602,9 +564,9 @@ describe('FactoryStartCoordinator', () => {
       undefined,
       makeSourceControl() as never,
     );
-    const first = await coordinator.prepare(startRequest({ kickoffMessage: null }));
+    const first = await coordinator.prepare(startRequest());
     const second = await coordinator.prepare({
-      ...startRequest({ sessionId: 'session-2', kickoffMessage: null }),
+      ...startRequest({ sessionId: 'session-2' }),
       orgId: 'org-2',
       workItem: {
         ...startRequest().workItem,

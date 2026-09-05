@@ -2081,6 +2081,9 @@ export async function createNetworkLoop({
     }),
     options: {
       shouldPersistSnapshot: ({ workflowStatus }) => workflowStatus === 'suspended',
+      // Excluding `running` means resume claims cannot persist; suppress the
+      // per-resume warning for this internal workflow.
+      allowUnclaimedResumes: true,
       // Agent-loop snapshots are pure resume artifacts — strip everything a
       // resume never reads before persisting.
       pruneSnapshot: pruneAgentLoopSnapshot,
@@ -2684,6 +2687,9 @@ export async function networkLoop<OUTPUT = undefined>({
     outputSchema: validationStep.outputSchema,
     options: {
       shouldPersistSnapshot: ({ workflowStatus }) => workflowStatus === 'suspended',
+      // Excluding `running` means resume claims cannot persist; suppress the
+      // per-resume warning for this internal workflow.
+      allowUnclaimedResumes: true,
       pruneSnapshot: pruneAgentLoopSnapshot,
       validateInputs: false,
       // Internal agent.network() plumbing — see networkWorkflow above.
@@ -2722,6 +2728,9 @@ export async function networkLoop<OUTPUT = undefined>({
     }),
     options: {
       shouldPersistSnapshot: ({ workflowStatus }) => workflowStatus === 'suspended',
+      // Excluding `running` means resume claims cannot persist; suppress the
+      // per-resume warning for this internal workflow.
+      allowUnclaimedResumes: true,
       pruneSnapshot: pruneAgentLoopSnapshot,
       validateInputs: false,
       // Internal agent.network() plumbing — see networkWorkflow above.

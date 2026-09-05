@@ -15,6 +15,19 @@ import {
 } from './foreach-suspension';
 import type { ProcessorArgs } from '.';
 
+const FOREACH_QUEUED = '__mastra_foreach_queued__';
+
+export function isQueuedForeachIteration(value: unknown): value is { [FOREACH_QUEUED]: true } {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    !Array.isArray(value) &&
+    Object.hasOwn(value, FOREACH_QUEUED) &&
+    (value as Record<string, unknown>)[FOREACH_QUEUED] === true &&
+    Object.keys(value).length === 1
+  );
+}
+
 export async function processWorkflowLoop(
   {
     workflowId,
@@ -508,9 +521,110 @@ export async function processWorkflowForEach(
   }
 
   const workflowsStore = await mastra.getStorage()?.getStore('workflows');
+  const stepId = getEntryId(step.step);
+  const preservedForeachOutput = currentResult?.suspendPayload?.__workflow_meta?.foreachOutput;
+  const preservedForeachEntries = Array.isArray(preservedForeachOutput)
+    ? preservedForeachOutput
+    : preservedForeachOutput && typeof preservedForeachOutput === 'object'
+      ? preservedForeachOutput
+      : undefined;
+
+  // Time travel reconstructs the target step without its output. Restore only
+  // durable successes and queue every failed or unfinished iteration for replay.
+  if (
+    timeTravel &&
+    (!Array.isArray(currentResult?.output) ||
+      currentResult.output.length === 0 ||
+      currentResult.output.some((result: any) => result?.status === 'failed')) &&
+    preservedForeachEntries &&
+    Object.keys(preservedForeachEntries).length > 0
+  ) {
+    const progressLength = Math.max(
+      targetLen,
+      ...Object.keys(preservedForeachEntries)
+        .map(Number)
+        .filter(Number.isSafeInteger)
+        .map(index => index + 1),
+    );
+    currentResult.output = Array.from({ length: progressLength }, (_unused, index) => {
+      const iterationResult = (preservedForeachEntries as Record<number, any>)[index];
+      return iterationResult?.status === 'success'
+        ? iterationResult.output
+        : ({ [FOREACH_QUEUED]: true } as { [FOREACH_QUEUED]: true });
+    });
+
+    await workflowsStore?.updateWorkflowResults({
+      workflowName: workflowId,
+      runId,
+      stepId,
+      result: currentResult,
+      requestContext,
+    });
+    stepResults[stepId] = currentResult;
+  }
+
+  const queuedIndices = Array.isArray(currentResult?.output)
+    ? currentResult.output.flatMap((result: any, index: number) => (isQueuedForeachIteration(result) ? [index] : []))
+    : [];
+  if (queuedIndices.length > 0) {
+    const concurrency = resolveForeachConcurrency(step.opts, {
+      inputData: (prevResult as any)?.output,
+      getInitData: () => (stepResults as any)?.input,
+      requestContext: reqContext,
+    });
+    const runningCount = currentResult.output.filter((result: any) => result === null).length;
+    const indicesToRun = queuedIndices.slice(0, Math.max(0, concurrency - runningCount));
+
+    if (indicesToRun.length > 0) {
+      const updatedOutput = [...currentResult.output];
+      for (const index of indicesToRun) {
+        updatedOutput[index] = createPendingMarker() as any;
+      }
+      await workflowsStore?.updateWorkflowResults({
+        workflowName: workflowId,
+        runId,
+        stepId,
+        result: { ...currentResult, output: updatedOutput } as any,
+        requestContext,
+      });
+
+      const isNestedWorkflow = getEntryWorkflow(step.step) !== null;
+      for (const index of indicesToRun) {
+        const targetArray = (prevResult as any)?.output;
+        const iterationPrevResult =
+          isNestedWorkflow && prevResult.status === 'success' && Array.isArray(targetArray)
+            ? { status: 'success' as const, output: targetArray[index] }
+            : prevResult;
+        await pubsub.publish('workflows', {
+          type: 'workflow.step.run',
+          runId,
+          data: {
+            ...lifecycleExecution,
+            parentWorkflow,
+            workflowId,
+            runId,
+            executionPath: [executionPath[0]!, index],
+            resumeSteps,
+            timeTravel,
+            restart,
+            stepResults,
+            prevResult: iterationPrevResult,
+            resumeData,
+            activeStepsPath,
+            requestContext,
+            perStep,
+            state: currentState,
+            outputOptions,
+          },
+        });
+      }
+    }
+    return;
+  }
 
   if (
-    (idx >= targetLen && currentResult?.output?.filter((r: any) => r !== null)?.length >= targetLen) ||
+    (idx >= targetLen &&
+      currentResult?.output?.filter((r: any) => r !== null && !isQueuedForeachIteration(r))?.length >= targetLen) ||
     (prevResult as any)?.output?.length === 0
   ) {
     // Foreach completed all iterations or the previous result is an empty array - advance to next step

@@ -13,6 +13,7 @@ describe('DynamicWorkflow resource', () => {
     description: 'Summarizes the day',
     inputSchema: { type: 'object', properties: { prompt: { type: 'string' } } },
     outputSchema: { type: 'object', properties: { summary: { type: 'string' } } },
+    schedule: { cron: '0 0 * * *', inputData: { prompt: 'daily' } },
     graph: [{ type: 'tool', id: 'load-items', toolId: 'load-items' }],
     status: 'active',
     source: 'storage',
@@ -51,6 +52,7 @@ describe('DynamicWorkflow resource', () => {
       description: workflow.description,
       inputSchema: workflow.inputSchema,
       outputSchema: workflow.outputSchema,
+      schedule: workflow.schedule,
       graph: workflow.graph,
     };
     respond({ ok: true, id: workflow.id });

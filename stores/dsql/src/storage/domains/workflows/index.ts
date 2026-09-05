@@ -3,7 +3,7 @@ import {
   normalizePerPage,
   TABLE_WORKFLOW_SNAPSHOT,
   TABLE_SCHEMAS,
-  matchesExpectedWorkflowStatus,
+  matchesExpectedWorkflowState,
   WorkflowsStorage,
   createStorageErrorId,
 } from '@mastra/core/storage';
@@ -238,8 +238,14 @@ export class WorkflowsDSQL extends WorkflowsStorage {
               throw new Error(`Snapshot not found for runId ${runId}`);
             }
 
-            const { expectedStatus, ...state } = opts;
-            if (!matchesExpectedWorkflowStatus(snapshot.status, expectedStatus)) {
+            const { expectedStatus, expectedExecutionGeneration, expectedLifecycleResumeAttempt, ...state } = opts;
+            if (
+              !matchesExpectedWorkflowState(snapshot, {
+                expectedStatus,
+                expectedExecutionGeneration,
+                expectedLifecycleResumeAttempt,
+              })
+            ) {
               return undefined;
             }
 

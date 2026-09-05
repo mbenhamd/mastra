@@ -190,7 +190,11 @@ export class BackgroundTasksStorageDynamoDB extends BackgroundTasksStorage {
     }
   }
 
-  async updateTask(taskId: string, update: UpdateBackgroundTask): Promise<void> {
+  async updateTask(
+    taskId: string,
+    update: UpdateBackgroundTask,
+    options?: { expectedStatus?: BackgroundTask['status'] },
+  ): Promise<boolean> {
     try {
       const setFields: Record<string, unknown> = {};
       // ElectroDB's .set() ignores undefined values, so any field explicitly set
@@ -246,13 +250,17 @@ export class BackgroundTasksStorageDynamoDB extends BackgroundTasksStorage {
         }
       }
 
-      if (Object.keys(setFields).length === 0 && removeFields.length === 0) return;
+      if (Object.keys(setFields).length === 0 && removeFields.length === 0) return false;
 
       let op = this.service.entities.background_task.patch({ entity: ENTITY, id: taskId }) as any;
       if (Object.keys(setFields).length > 0) op = op.set(setFields);
       if (removeFields.length > 0) op = op.remove(removeFields);
+      if (options?.expectedStatus) {
+        op = op.where(({ status }: any, { eq }: any) => eq(status, options.expectedStatus));
+      }
       await op.go();
-    } catch (error) {
+    } catch (error: any) {
+      if (options?.expectedStatus && error?.cause?.name === 'ConditionalCheckFailedException') return false;
       throw new MastraError(
         {
           id: createStorageErrorId('DYNAMODB', 'BACKGROUND_TASKS_UPDATE', 'FAILED'),
@@ -263,39 +271,8 @@ export class BackgroundTasksStorageDynamoDB extends BackgroundTasksStorage {
         error,
       );
     }
+    return true;
   }
-
-  async updateTaskIfStatus(
-    taskId: string,
-    expectedStatus: BackgroundTaskStatus,
-    update: UpdateBackgroundTask,
-  ): Promise<boolean> {
-    try {
-      const { setFields, removeFields } = buildBackgroundTaskUpdateFields(update);
-
-      if (Object.keys(setFields).length === 0 && removeFields.length === 0) return false;
-
-      let op = this.service.entities.background_task
-        .patch({ entity: ENTITY, id: taskId })
-        .where((attr: any, op: any) => op.eq(attr.status, expectedStatus)) as any;
-      if (Object.keys(setFields).length > 0) op = op.set(setFields);
-      if (removeFields.length > 0) op = op.remove(removeFields);
-      await op.go();
-      return true;
-    } catch (error) {
-      if (this.isConditionalCheckFailed(error)) return false;
-      throw new MastraError(
-        {
-          id: createStorageErrorId('DYNAMODB', 'BACKGROUND_TASKS_UPDATE_IF_STATUS', 'FAILED'),
-          domain: ErrorDomain.STORAGE,
-          category: ErrorCategory.THIRD_PARTY,
-          details: { taskId, expectedStatus },
-        },
-        error,
-      );
-    }
-  }
-
   async getTask(taskId: string): Promise<BackgroundTask | null> {
     try {
       const result = await this.service.entities.background_task.get({ entity: ENTITY, id: taskId }).go();

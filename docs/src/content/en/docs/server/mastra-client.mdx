@@ -1,6 +1,6 @@
 ---
 title: "Mastra client | Server"
-description: "Learn how to set up and use the Mastra Client SDK"
+description: "Use the type-safe Mastra Client SDK from browser applications to call agents, workflows, tools, memory, and server APIs with streaming support."
 packages:
   - "@mastra/client-js"
   - "@mastra/core"
@@ -121,7 +121,7 @@ Durable storage requires a configured storage adapter that supports the `workflo
 
 Stored definitions support declarative agent, tool, mapping, nested workflow, parallel, foreach, sleep, sleep-until, conditional, and loop entries. They can't contain JavaScript closures. Conditional and loop logic must use the declarative predicate format, and referenced agents, tools, and nested workflows must already be registered.
 
-Authenticated servers require `stored-workflows:read` or `stored-workflows:write` for definition operations and `workflows:execute` to run the workflow.
+Authenticated servers require `dynamic-workflows:read` or `dynamic-workflows:write` for definition operations and `workflows:execute` to run the workflow.
 
 :::
 
@@ -331,7 +331,7 @@ export const colorAgent = new Agent({
 
 ## Use MastraClient on the server
 
-You can also use `MastraClient` in server-side environments such as API routes, serverless functions, or actions. The usage remains the same, but you may need to recreate the response for your client:
+Server-side API routes and serverless functions, including actions, can also use `MastraClient`. The usage is unchanged, although you may need to recreate the response for your client:
 
 ```typescript {8}
 export async function action() {

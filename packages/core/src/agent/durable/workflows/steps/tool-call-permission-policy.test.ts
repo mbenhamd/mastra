@@ -13,7 +13,10 @@ vi.mock('../../../../workflows', () => ({
   createStep: (config: unknown) => config,
 }));
 
-vi.mock('../../utils/resolve-runtime', () => ({
+vi.mock('../../utils/resolve-runtime', async () => ({
+  restoreRequestContext: (
+    await vi.importActual<typeof import('../../utils/resolve-runtime')>('../../utils/resolve-runtime')
+  ).restoreRequestContext,
   resolveTool: vi.fn(),
   rebuildRunToolsFromMastra: vi.fn().mockResolvedValue(undefined),
   toolApprovalRequirement: vi.fn().mockResolvedValue({ required: false, reasons: [] }),

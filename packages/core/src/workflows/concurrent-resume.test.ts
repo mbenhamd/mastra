@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
 import { Mastra } from '../mastra';
+import { toStandardSchema } from '../schema';
 import { MockStore } from '../storage/mock';
 import { createWorkflow } from './create';
 import { createStep } from './workflow';
@@ -23,7 +24,11 @@ describe('concurrent resume', () => {
    * in-flight at the same time. This makes the race deterministic instead of timing-dependent:
    * without the fix the second caller enters the engine while the first is still parked.
    */
-  function createApprovalWorkflow() {
+  function createApprovalWorkflow(options?: {
+    shouldPersistSnapshot?: (args: { workflowStatus: string }) => boolean;
+    resumeSchema?: any;
+    validateInputs?: boolean;
+  }) {
     let downstreamExecutions = 0;
     let releaseDownstream!: () => void;
     const downstreamReleased = new Promise<void>(resolve => {
@@ -40,7 +45,7 @@ describe('concurrent resume', () => {
       inputSchema: z.object({ item: z.string() }),
       outputSchema: z.object({ item: z.string(), approved: z.boolean() }),
       suspendSchema: z.object({ reason: z.string() }),
-      resumeSchema: z.object({ approved: z.boolean() }),
+      resumeSchema: options?.resumeSchema ?? z.object({ approved: z.boolean() }),
       execute: async ({ inputData, resumeData, suspend }) => {
         if (!resumeData) {
           await suspend({ reason: `Needs approval: ${inputData.item}` });
@@ -67,7 +72,10 @@ describe('concurrent resume', () => {
       inputSchema: z.object({ item: z.string() }),
       outputSchema: z.object({ executions: z.number() }),
       steps: [approvalStep, downstreamStep],
-      options: { validateInputs: false },
+      options: {
+        validateInputs: options?.validateInputs ?? false,
+        ...(options?.shouldPersistSnapshot ? { shouldPersistSnapshot: options.shouldPersistSnapshot } : {}),
+      },
     })
       .then(approvalStep)
       .then(downstreamStep)
@@ -82,8 +90,9 @@ describe('concurrent resume', () => {
   }
 
   async function suspendRun(workflow: ReturnType<typeof createApprovalWorkflow>['workflow']) {
+    const storage = new MockStore();
     const mastra = new Mastra({
-      storage: new MockStore(),
+      storage,
       workflows: { 'concurrent-resume-wf': workflow },
       logger: false,
     });
@@ -92,7 +101,7 @@ describe('concurrent resume', () => {
     const started = await run.start({ inputData: { item: 'widget' } });
     expect(started.status).toBe('suspended');
 
-    return { mastra, run };
+    return { mastra, run, storage };
   }
 
   it('runs downstream steps once when two resume() calls race', async () => {
@@ -121,6 +130,132 @@ describe('concurrent resume', () => {
     const reason = (rejected[0] as PromiseRejectedResult).reason;
     expect(reason.id).toBe('WORKFLOW_RESUME_ALREADY_CLAIMED');
     expect(reason.message).toContain('already resumed by another caller');
+  });
+
+  it('does not let a delayed stale resume claim a later suspension at the same status', async () => {
+    let validationCall = 0;
+    let firstValidationStarted!: () => void;
+    let secondValidationStarted!: () => void;
+    let releaseFirstValidation!: () => void;
+    let releaseSecondValidation!: () => void;
+    const firstStarted = new Promise<void>(resolve => {
+      firstValidationStarted = resolve;
+    });
+    const secondStarted = new Promise<void>(resolve => {
+      secondValidationStarted = resolve;
+    });
+    const firstReleased = new Promise<void>(resolve => {
+      releaseFirstValidation = resolve;
+    });
+    const secondReleased = new Promise<void>(resolve => {
+      releaseSecondValidation = resolve;
+    });
+    const baseResumeSchema = toStandardSchema(z.object({ approved: z.boolean() }));
+    const resumeSchema = {
+      '~standard': {
+        ...baseResumeSchema['~standard'],
+        validate: async (value: unknown) => {
+          const call = ++validationCall;
+          if (call === 1) {
+            firstValidationStarted();
+            await firstReleased;
+          } else if (call === 2) {
+            secondValidationStarted();
+            await secondReleased;
+          }
+          return baseResumeSchema['~standard'].validate(value);
+        },
+      },
+    };
+    const harness = createApprovalWorkflow({ resumeSchema, validateInputs: true });
+    const { run, storage } = await suspendRun(harness.workflow);
+
+    const winner = run.resume({ step: 'approval', resumeData: { approved: true } });
+    await firstStarted;
+    const loser = run.resume({ step: 'approval', resumeData: { approved: true } });
+    await secondStarted;
+
+    releaseFirstValidation();
+    await harness.downstreamHasStarted;
+    harness.releaseDownstream();
+    expect((await winner).status).toBe('success');
+    expect(run.workflowRunStatus).toBe('success');
+
+    // Recreate the ABA coordinate produced when a winner reaches the next
+    // suspension: status and execution generation match the stale snapshot,
+    // but the resume attempt has advanced from 0 to 1.
+    const workflowsStore = storage.stores.workflows;
+    const resuspended = await workflowsStore.updateWorkflowState({
+      workflowName: 'concurrent-resume-wf',
+      runId: run.runId,
+      opts: { status: 'suspended', lifecycleResumeAttempt: 1 },
+    });
+    expect(resuspended).toMatchObject({ status: 'suspended', lifecycleResumeAttempt: 1 });
+
+    // The loser loaded attempt 0 before validation. A status-only claim would
+    // now succeed against this later `suspended` state and repeat side effects.
+    releaseSecondValidation();
+    await expect(loser).rejects.toMatchObject({
+      id: 'WORKFLOW_RESUME_ALREADY_CLAIMED',
+      details: expect.objectContaining({
+        expectedLifecycleResumeAttempt: 0,
+        actualLifecycleResumeAttempt: 1,
+      }),
+    });
+    expect(run.workflowRunStatus).toBe('success');
+    expect(harness.getDownstreamExecutions()).toBe(1);
+  });
+
+  it('uses a per-run persistence override to claim resumes when the workflow default does not persist', async () => {
+    const harness = createApprovalWorkflow({ shouldPersistSnapshot: () => false });
+    const storage = new MockStore();
+    new Mastra({
+      storage,
+      workflows: { 'concurrent-resume-wf': harness.workflow },
+      logger: false,
+    });
+
+    const run = await harness.workflow.createRun({ shouldPersistSnapshot: () => true });
+    const started = await run.start({ inputData: { item: 'widget' } });
+    expect(started.status).toBe('suspended');
+
+    const inFlight = [
+      run.resume({ step: 'approval', resumeData: { approved: true } }),
+      run.resume({ step: 'approval', resumeData: { approved: true } }),
+    ];
+    await harness.downstreamHasStarted;
+    harness.releaseDownstream();
+    const results = await Promise.allSettled(inFlight);
+
+    expect(harness.getDownstreamExecutions()).toBe(1);
+    expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(1);
+    const rejected = results.find(result => result.status === 'rejected') as PromiseRejectedResult;
+    expect(rejected.reason.id).toBe('WORKFLOW_RESUME_ALREADY_CLAIMED');
+  });
+
+  it('does not claim a resume when the per-run persistence override excludes running', async () => {
+    const harness = createApprovalWorkflow();
+    const storage = new MockStore();
+    const workflowsStore = storage.stores.workflows as any;
+    const updateSpy = vi.spyOn(workflowsStore, 'updateWorkflowState');
+    new Mastra({
+      storage,
+      workflows: { 'concurrent-resume-wf': harness.workflow },
+      logger: false,
+    });
+
+    const run = await harness.workflow.createRun({
+      shouldPersistSnapshot: ({ workflowStatus }) => workflowStatus !== 'running',
+    });
+    const started = await run.start({ inputData: { item: 'widget' } });
+    expect(started.status).toBe('suspended');
+
+    const resumed = run.resume({ step: 'approval', resumeData: { approved: true } });
+    await harness.downstreamHasStarted;
+    harness.releaseDownstream();
+
+    expect((await resumed).status).toBe('success');
+    expect(updateSpy).not.toHaveBeenCalled();
   });
 
   it('runs downstream steps once when two resumeStream() calls race', async () => {
@@ -209,6 +344,130 @@ describe('concurrent resume', () => {
 
     expect(retried.status).toBe('success');
     expect(harness.getDownstreamExecutions()).toBe(1);
+  });
+
+  it.each([
+    {
+      label: 'a newer resume attempt',
+      replace: (snapshot: any) => ({
+        status: 'running' as const,
+        lifecycleResumeAttempt: (snapshot.lifecycleResumeAttempt ?? 0) + 1,
+      }),
+      expected: { status: 'running', lifecycleResumeAttempt: 2 },
+    },
+    {
+      label: 'a replacement execution generation',
+      replace: () => ({ status: 'running' as const, executionGeneration: 'wfeg:replacement' }),
+      expected: { status: 'running', executionGeneration: 'wfeg:replacement' },
+    },
+  ])('does not let failed-resume rollback overwrite $label', async ({ replace, expected }) => {
+    const harness = createApprovalWorkflow();
+    const { run, storage } = await suspendRun(harness.workflow);
+    const workflowsStore = storage.stores.workflows;
+    const executeSpy = vi.spyOn((run as any).executionEngine, 'execute').mockImplementationOnce(async () => {
+      const claimed = await workflowsStore.loadWorkflowSnapshot({
+        workflowName: 'concurrent-resume-wf',
+        runId: run.runId,
+      });
+      expect(claimed).toMatchObject({ status: 'running', lifecycleResumeAttempt: 1 });
+      await workflowsStore.updateWorkflowState({
+        workflowName: 'concurrent-resume-wf',
+        runId: run.runId,
+        opts: replace(claimed),
+      });
+      throw new Error('engine boom after replacement');
+    });
+
+    await expect(run.resume({ step: 'approval', resumeData: { approved: true } })).rejects.toThrow(
+      'engine boom after replacement',
+    );
+    executeSpy.mockRestore();
+
+    await expect(
+      workflowsStore.loadWorkflowSnapshot({ workflowName: 'concurrent-resume-wf', runId: run.runId }),
+    ).resolves.toMatchObject(expected);
+  });
+
+  function fakeLogger() {
+    return {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      trackException: vi.fn(),
+    } as any;
+  }
+
+  function createUnclaimableWorkflow(options: { allowUnclaimedResumes?: boolean }) {
+    const approvalStep = createStep({
+      id: 'approval',
+      inputSchema: z.object({ item: z.string() }),
+      outputSchema: z.object({ approved: z.boolean() }),
+      suspendSchema: z.object({ reason: z.string() }),
+      resumeSchema: z.object({ approved: z.boolean() }),
+      execute: async ({ inputData, resumeData, suspend }) => {
+        if (!resumeData) {
+          await suspend({ reason: `Needs approval: ${inputData.item}` });
+          return { approved: false };
+        }
+        return { approved: resumeData.approved };
+      },
+    });
+
+    const workflow = createWorkflow({
+      id: 'unclaimable-resume-wf',
+      inputSchema: z.object({ item: z.string() }),
+      outputSchema: z.object({ approved: z.boolean() }),
+      options: {
+        validateInputs: false,
+        // Same persistence shape as the internal agent loop: never persist
+        // `running`, so the resume claim cannot be written.
+        shouldPersistSnapshot: ({ workflowStatus }) => workflowStatus !== 'running',
+        ...options,
+      },
+    })
+      .then(approvalStep)
+      .commit();
+    return { workflow };
+  }
+
+  it('warns when shouldPersistSnapshot excludes "running" and the resume cannot be claimed', async () => {
+    const harness = createUnclaimableWorkflow({});
+    const logger = fakeLogger();
+    new Mastra({
+      storage: new MockStore(),
+      workflows: { 'unclaimable-resume-wf': harness.workflow },
+      logger,
+    });
+
+    const run = await harness.workflow.createRun();
+    const started = await run.start({ inputData: { item: 'widget' } });
+    expect(started.status).toBe('suspended');
+
+    const result = await run.resume({ step: 'approval', resumeData: { approved: true } });
+    expect(result.status).toBe('success');
+
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('cannot be de-duplicated'));
+  });
+
+  it('does not warn when allowUnclaimedResumes acknowledges the unclaimable resume', async () => {
+    const harness = createUnclaimableWorkflow({ allowUnclaimedResumes: true });
+    const logger = fakeLogger();
+    new Mastra({
+      storage: new MockStore(),
+      workflows: { 'unclaimable-resume-wf': harness.workflow },
+      logger,
+    });
+
+    const run = await harness.workflow.createRun();
+    const started = await run.start({ inputData: { item: 'widget' } });
+    expect(started.status).toBe('suspended');
+
+    const result = await run.resume({ step: 'approval', resumeData: { approved: true } });
+    expect(result.status).toBe('success');
+
+    const warnings = logger.warn.mock.calls.map((c: any[]) => String(c[0]));
+    expect(warnings.filter((m: string) => m.includes('cannot be de-duplicated'))).toHaveLength(0);
   });
 
   it('still resumes normally when there is no contention', async () => {

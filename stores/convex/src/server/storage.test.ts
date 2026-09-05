@@ -235,6 +235,227 @@ describe('mastraStorage workflow snapshot merge operations', () => {
     expect(typeof testCtx.patches[0]?.data.updatedAt).toBe('string');
   });
 
+  it('preserves completed array-form foreach progress across serialized stale sibling writes', async () => {
+    const failed = { status: 'failed', error: 'child failed', endedAt: 2 };
+    const succeeded = { status: 'success', output: 'sibling' };
+    const earlier = { status: 'success', output: 'earlier' };
+    const existingProgress = Array(4);
+    existingProgress[0] = failed;
+    existingProgress[2] = earlier;
+    const testCtx = createWorkflowSnapshotCtx(
+      JSON.stringify({
+        runId: 'run-1',
+        status: 'running',
+        context: {
+          foreach: {
+            status: 'failed',
+            output: [failed, null, 'earlier', null],
+            suspendPayload: { __workflow_meta: { foreachOutput: existingProgress } },
+          },
+        },
+      }),
+    );
+    const incomingProgress = Array(4);
+    incomingProgress[1] = succeeded;
+    incomingProgress[2] = null;
+
+    const result = await handleTypedOperation(testCtx.ctx, 'mastra_workflow_snapshots', {
+      op: 'mergeWorkflowStepResult',
+      tableName: TABLE_WORKFLOW_SNAPSHOT,
+      workflowName: 'workflow-a',
+      runId: 'run-1',
+      stepId: 'foreach',
+      result: JSON.stringify({
+        status: 'success',
+        output: [null, 'sibling', null, null],
+        suspendPayload: { __workflow_meta: { foreachOutput: incomingProgress } },
+      }),
+      requestContext: JSON.stringify({}),
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error(result.error);
+    const patchedSnapshot = JSON.parse(testCtx.patches[0]?.data.snapshot as string);
+    expect(patchedSnapshot.context.foreach.output).toEqual([failed, 'sibling', 'earlier', null]);
+    expect(patchedSnapshot.context.foreach.suspendPayload.__workflow_meta.foreachOutput).toEqual([
+      failed,
+      succeeded,
+      earlier,
+      null,
+    ]);
+  });
+
+  it('removes completed coordinates from a serialized propagated suspension map', async () => {
+    const first = { status: 'suspended', suspendPayload: { toolCallId: 'first' } };
+    const second = { status: 'suspended', suspendPayload: { toolCallId: 'second' } };
+    const testCtx = createWorkflowSnapshotCtx(
+      JSON.stringify({
+        runId: 'run-1',
+        context: {
+          foreach: {
+            status: 'suspended',
+            output: [first, second],
+            suspendPayload: { __workflow_meta: { foreachOutput: { 0: first, 1: second } } },
+          },
+        },
+      }),
+    );
+
+    await handleTypedOperation(testCtx.ctx, 'mastra_workflow_snapshots', {
+      op: 'mergeWorkflowStepResult',
+      tableName: TABLE_WORKFLOW_SNAPSHOT,
+      workflowName: 'workflow-a',
+      runId: 'run-1',
+      stepId: 'foreach',
+      result: JSON.stringify({
+        status: 'suspended',
+        output: ['approved-first', second],
+        suspendPayload: {
+          __workflow_meta: {
+            foreachOutput: { 1: second },
+            resumeLabels: { second: { stepId: 'foreach', foreachIndex: 1 } },
+          },
+        },
+      }),
+      requestContext: JSON.stringify({}),
+    });
+
+    const patchedSnapshot = JSON.parse(testCtx.patches[0]?.data.snapshot as string);
+    expect(patchedSnapshot.context.foreach.output).toEqual(['approved-first', second]);
+    expect(patchedSnapshot.context.foreach.suspendPayload.__workflow_meta).toEqual({
+      foreachOutput: { 1: second },
+      resumeLabels: { second: { stepId: 'foreach', foreachIndex: 1 } },
+    });
+  });
+
+  it('keeps recovered progress when a serialized pending reset carries copied failures', async () => {
+    const failed = { status: 'failed', error: 'old failure', endedAt: 2 };
+    const succeeded = { status: 'success', output: 'recovered', endedAt: 3 };
+    const testCtx = createWorkflowSnapshotCtx(
+      JSON.stringify({
+        runId: 'run-1',
+        context: {
+          foreach: {
+            status: 'success',
+            output: ['recovered', failed],
+            suspendPayload: { __workflow_meta: { foreachOutput: [succeeded, failed] } },
+          },
+        },
+      }),
+    );
+
+    await handleTypedOperation(testCtx.ctx, 'mastra_workflow_snapshots', {
+      op: 'mergeWorkflowStepResult',
+      tableName: TABLE_WORKFLOW_SNAPSHOT,
+      workflowName: 'workflow-a',
+      runId: 'run-1',
+      stepId: 'foreach',
+      result: JSON.stringify({
+        status: 'running',
+        output: [failed, { __mastra_pending__: true }],
+        suspendPayload: { __workflow_meta: { foreachOutput: [failed, failed] } },
+      }),
+      requestContext: JSON.stringify({}),
+    });
+
+    const patchedSnapshot = JSON.parse(testCtx.patches[0]?.data.snapshot as string);
+    expect(patchedSnapshot.context.foreach.output).toEqual(['recovered', null]);
+    expect(patchedSnapshot.context.foreach.suspendPayload.__workflow_meta.foreachOutput).toEqual([succeeded, failed]);
+  });
+
+  it('persists a serialized fresh failure without overwriting a successful sibling', async () => {
+    const succeeded = { status: 'success', output: 'previous success' };
+    const failed = { status: 'failed', error: 'new attempt failed', endedAt: 3 };
+    const testCtx = createWorkflowSnapshotCtx(
+      JSON.stringify({
+        runId: 'run-1',
+        context: {
+          foreach: {
+            status: 'success',
+            output: ['previous success', 'sibling success'],
+            suspendPayload: {
+              __workflow_meta: { foreachOutput: [succeeded, { status: 'success', output: 'sibling success' }] },
+            },
+          },
+        },
+      }),
+    );
+
+    await handleTypedOperation(testCtx.ctx, 'mastra_workflow_snapshots', {
+      op: 'mergeWorkflowStepResult',
+      tableName: TABLE_WORKFLOW_SNAPSHOT,
+      workflowName: 'workflow-a',
+      runId: 'run-1',
+      stepId: 'foreach',
+      result: JSON.stringify({
+        status: 'failed',
+        output: [failed, null],
+        suspendPayload: { __workflow_meta: { foreachOutput: { 0: failed } } },
+      }),
+      requestContext: JSON.stringify({}),
+    });
+
+    const patchedSnapshot = JSON.parse(testCtx.patches[0]?.data.snapshot as string);
+    expect(patchedSnapshot.context.foreach.status).toBe('failed');
+    expect(patchedSnapshot.context.foreach.output).toEqual([failed, 'sibling success']);
+    expect(patchedSnapshot.context.foreach.suspendPayload.__workflow_meta.foreachOutput).toEqual([
+      failed,
+      { status: 'success', output: 'sibling success' },
+    ]);
+  });
+
+  it('persists a failed retry suspension while protecting a completed sibling after a serialized reset', async () => {
+    const succeeded = { status: 'success', output: 'sibling success' };
+    const failed = { status: 'failed', error: 'previous attempt failed' };
+    const staleSuspension = { status: 'suspended', suspendPayload: { token: 'stale sibling' } };
+    const freshSuspension = { status: 'suspended', suspendPayload: { token: 'retry approval' } };
+    const resetCtx = createWorkflowSnapshotCtx(
+      JSON.stringify({
+        runId: 'run-1',
+        context: {
+          foreach: {
+            status: 'failed',
+            output: ['sibling success', failed],
+            suspendPayload: { __workflow_meta: { foreachOutput: [succeeded, failed] } },
+          },
+        },
+      }),
+    );
+    await handleTypedOperation(resetCtx.ctx, 'mastra_workflow_snapshots', {
+      op: 'mergeWorkflowStepResult',
+      tableName: TABLE_WORKFLOW_SNAPSHOT,
+      workflowName: 'workflow-a',
+      runId: 'run-1',
+      stepId: 'foreach',
+      result: JSON.stringify({ status: 'running', output: [null, { __mastra_pending__: true }] }),
+      requestContext: JSON.stringify({}),
+    });
+    const resetSnapshot = JSON.parse(resetCtx.patches[0]?.data.snapshot as string);
+    expect(resetSnapshot.context.foreach.output).toEqual(['sibling success', null]);
+    const testCtx = createWorkflowSnapshotCtx(resetCtx.patches[0]?.data.snapshot);
+
+    await handleTypedOperation(testCtx.ctx, 'mastra_workflow_snapshots', {
+      op: 'mergeWorkflowStepResult',
+      tableName: TABLE_WORKFLOW_SNAPSHOT,
+      workflowName: 'workflow-a',
+      runId: 'run-1',
+      stepId: 'foreach',
+      result: JSON.stringify({
+        status: 'suspended',
+        output: [null, freshSuspension],
+        suspendPayload: { __workflow_meta: { foreachOutput: { 0: staleSuspension, 1: freshSuspension } } },
+      }),
+      requestContext: JSON.stringify({}),
+    });
+
+    const patchedSnapshot = JSON.parse(testCtx.patches[0]?.data.snapshot as string);
+    expect(patchedSnapshot.context.foreach.output).toEqual(['sibling success', freshSuspension]);
+    expect(patchedSnapshot.context.foreach.suspendPayload.__workflow_meta.foreachOutput).toEqual([
+      succeeded,
+      freshSuspension,
+    ]);
+  });
+
   it('persists __proto__ as an own step result without changing the context prototype', async () => {
     const snapshot = {
       runId: 'run-1',
@@ -266,6 +487,10 @@ describe('mastraStorage workflow snapshot merge operations', () => {
   });
 
   it('applies pending marker resets without trusting stale sibling values or status', async () => {
+    const failed = { status: 'failed', error: 'engine failure', endedAt: 2 };
+    const suspendPayload = {
+      __workflow_meta: { foreachOutput: { 15: failed, 16: { status: 'success', output: failed } } },
+    };
     const snapshot = {
       runId: 'run-1',
       status: 'running',
@@ -275,6 +500,7 @@ describe('mastraStorage workflow snapshot merge operations', () => {
           status: 'success',
           startedAt: 1,
           endedAt: 2,
+          suspendPayload,
           output: [
             { status: 'suspended', startedAt: 1, suspendedAt: 2, suspendPayload: { __workflow_meta: {} } },
             {
@@ -293,6 +519,11 @@ describe('mastraStorage workflow snapshot merge operations', () => {
             { status: 'success', output: 'newer-tail' },
             { status: 'suspended', payload: { type: 'user-status' } },
             { status: 'suspended', startedAt: 10 },
+            { __mastra_foreach_queued__: true },
+            { __mastra_foreach_queued__: true, value: 'user-data' },
+            { status: 'failed', message: 'domain result' },
+            failed,
+            failed,
           ],
         },
       },
@@ -320,6 +551,12 @@ describe('mastraStorage workflow snapshot merge operations', () => {
           { __mastra_pending__: true },
           { __mastra_pending__: true },
           { __mastra_pending__: true },
+          { __mastra_pending__: true },
+          { __mastra_pending__: true },
+          { __mastra_pending__: true },
+          { __mastra_pending__: true },
+          { __mastra_pending__: true },
+          { __mastra_pending__: true },
         ],
       }),
       requestContext: JSON.stringify({ incoming: true, shared: 'new' }),
@@ -332,6 +569,7 @@ describe('mastraStorage workflow snapshot merge operations', () => {
       status: 'success',
       startedAt: 1,
       endedAt: 2,
+      suspendPayload,
       output: [
         null,
         null,
@@ -345,6 +583,11 @@ describe('mastraStorage workflow snapshot merge operations', () => {
         { status: 'success', output: 'newer-tail' },
         { status: 'suspended', payload: { type: 'user-status' } },
         { status: 'suspended', startedAt: 10 },
+        null,
+        { __mastra_foreach_queued__: true, value: 'user-data' },
+        { status: 'failed', message: 'domain result' },
+        null,
+        failed,
       ],
     });
     expect(patchedSnapshot.requestContext).toEqual({ existing: true, incoming: true, shared: 'new' });
@@ -1784,6 +2027,43 @@ describe('mastraStorage bulk mutations', () => {
     });
   });
 
+  it('does not patch a legacy background task when the expected status mismatches', async () => {
+    const legacyTask = {
+      _id: asConvexId('legacy-task-doc'),
+      record: { id: 'task-1', status: 'cancelled', agentId: 'agent-1' },
+    };
+    const builder: TestQueryBuilder = {
+      eq: vi.fn((_field: string, _value: string) => builder),
+    };
+    const query = vi.fn((table: string) => {
+      if (table === 'mastra_background_tasks') {
+        throw new Error("Table 'mastra_background_tasks' does not exist");
+      }
+
+      return {
+        withIndex: vi.fn((_indexName: string, queryBuilder: (q: TestQueryBuilder) => TestQueryBuilder) => {
+          queryBuilder(builder);
+          return { unique: vi.fn(async () => legacyTask) };
+        }),
+      };
+    });
+    const patch = vi.fn();
+    const ctx = { db: { query, patch } } as unknown as TypedOperationCtx;
+
+    const result = await (mastraStorage as StorageHandlerForTest)._handler(ctx, {
+      op: 'patch',
+      tableName: 'mastra_background_tasks',
+      id: 'task-1',
+      record: { status: 'running' },
+      expected: { status: 'pending' },
+    });
+
+    expect(result).toEqual({ ok: true, result: false });
+    expect(query).toHaveBeenNthCalledWith(1, 'mastra_background_tasks');
+    expect(query).toHaveBeenNthCalledWith(2, 'mastra_documents');
+    expect(patch).not.toHaveBeenCalled();
+  });
+
   it('routes background task operations to the typed background task table', async () => {
     const batchCtx = createBatchInsertCtx(new Map([['task-1', { _id: asConvexId('task-doc') }]]));
 
@@ -1798,6 +2078,24 @@ describe('mastraStorage bulk mutations', () => {
     expect(batchCtx.lookupKeys).toEqual(['task-1', 'mastra_background_tasks|task-1']);
     expect(batchCtx.patches).toEqual([{ id: asConvexId('task-doc'), data: { status: 'running' } }]);
     expect(batchCtx.inserts).toEqual([]);
+  });
+
+  it('does not patch a typed background task when the expected status mismatches', async () => {
+    const batchCtx = createBatchInsertCtx(
+      new Map([['task-1', { _id: asConvexId('task-doc'), id: 'task-1', status: 'cancelled' }]]),
+    );
+
+    const result = await (mastraStorage as StorageHandlerForTest)._handler(batchCtx.ctx, {
+      op: 'patch',
+      tableName: 'mastra_background_tasks',
+      id: 'task-1',
+      record: { status: 'running' },
+      expected: { status: 'pending' },
+    });
+
+    expect(result).toEqual({ ok: true, result: false });
+    expect(batchCtx.lookupKeys).toEqual(['task-1']);
+    expect(batchCtx.patches).toEqual([]);
   });
 
   it('background task loadMany preserves request order across typed and legacy fallback rows', async () => {

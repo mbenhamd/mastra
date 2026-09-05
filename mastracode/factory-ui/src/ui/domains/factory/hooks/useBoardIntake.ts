@@ -1,3 +1,4 @@
+import { AUTO_TRIAGED_LABEL } from '@mastra/factory/rules/types';
 import { useMemo, useState } from 'react';
 
 import { useFactoriesQuery } from '../../../../hooks/useFactories';
@@ -6,9 +7,10 @@ import { useIntakeBindingsQuery, useIntakeConfigQuery } from '../../../../hooks/
 import { useLinearIssuesQuery, useLinearStatusQuery } from '../../../../hooks/useLinearData';
 import type { LinkedRepositoryPayload } from '../../workspaces/services/github';
 import { issueCandidate, linearCandidate, pullRequestCandidate } from '../boardCandidates';
-import type { BoardCandidate, IntakeSource } from '../boardCandidates';
-import { AUTO_TRIAGED_LABEL, hasLabel } from '../boardItems';
+import type { BoardCandidate, IntakeFeed, IntakeSource } from '../boardCandidates';
+import { hasLabel } from '../boardItems';
 import type { BoardKind } from '../boardStages';
+import type { BoardStageId } from '../stages';
 
 /**
  * The Intake swimlane's feed: which candidate source is browsed, the queries
@@ -93,6 +95,14 @@ export function useBoardIntake({
     return all.filter(candidate => !knownSourceKeys.has(candidate.sourceKey));
   }, [knownSourceKeys, participantCandidates, intakeIssues, triageIssues.data, linearIssues.data, active, review]);
 
+  const browsed = { github: issues, 'github-prs': pulls, linear: linearIssues };
+  const feed = active ? browsed[active] : undefined;
+  // Triage is fed by its own labelled query, so it fails (and retries) on its own.
+  const feedByColumn: Partial<Record<BoardStageId, IntakeFeed>> = {
+    intake: feed,
+    triage: active === 'github' ? triageIssues : undefined,
+  };
+
   return {
     available,
     active,
@@ -100,14 +110,10 @@ export function useBoardIntake({
     select: setSelected,
     candidates,
     participantCandidates,
-    issues,
-    pulls,
-    linearIssues,
+    feedByColumn,
     isPending:
       (!review && (configQuery.isPending || ((config?.linear.enabled ?? false) && linearStatusQuery.isPending))) ||
-      (active === 'github' && issues.isPending) ||
-      (active === 'github-prs' && pulls.isPending) ||
-      (active === 'linear' && linearIssues.isPending),
+      Boolean(feed?.isPending),
     isTriagePending: !review && active === 'github' && triageIssues.isPending,
   };
 }

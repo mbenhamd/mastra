@@ -25,6 +25,7 @@ export const modelConfigSchema = z.object({
  */
 export const modelListEntrySchema = z.object({
   id: z.string(),
+  generatedId: z.boolean().optional(),
   config: z.object({
     provider: z.string(),
     modelId: z.string(),

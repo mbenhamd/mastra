@@ -6,6 +6,7 @@
  * analysis, each emitting `{ code, path, message }` issues. UIs consume the
  * array; the save path throws via `assertValidDynamicWorkflow`.
  */
+import { ErrorCategory, ErrorDomain, MastraError } from '../../../error';
 import { validateWorkflowRefs } from './refs';
 import { addWorkflowValidationRepairActions } from './repair-actions';
 import { inferGraphSchemas } from './schema-flow';
@@ -63,5 +64,15 @@ export function assertValidDynamicWorkflow(def: WorkflowValidationInput, index: 
   const issues = validateDynamicWorkflow(def, index);
   if (issues.length === 0) return;
   const details = issues.map(issue => `- [${issue.code}] ${issue.path}: ${issue.message}`).join('\n');
-  throw new Error(`Dynamic workflow "${def.id}" failed validation with ${issues.length} issue(s):\n${details}`);
+  const message = `Dynamic workflow "${def.id}" failed validation with ${issues.length} issue(s):\n${details}`;
+  if (issues.some(issue => issue.code === 'invalid-schedule-payload' || issue.code === 'unsupported-schema-keyword')) {
+    throw new MastraError({
+      id: 'WORKFLOW_SCHEMA_VALIDATION_FAILED',
+      category: ErrorCategory.USER,
+      domain: ErrorDomain.MASTRA_WORKFLOW,
+      text: message,
+      details: { workflowId: def.id },
+    });
+  }
+  throw new Error(message);
 }

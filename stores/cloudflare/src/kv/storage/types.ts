@@ -5,7 +5,6 @@ import type {
   TABLE_MESSAGES,
   TABLE_THREADS,
   TABLE_WORKFLOW_SNAPSHOT,
-  TABLE_BACKGROUND_TASKS,
   TABLE_TRACES,
   TABLE_HARNESS_SESSIONS,
   TABLE_HARNESS_ATTACHMENTS,
@@ -97,8 +96,7 @@ type RequiredCloudflareKVBindingTable =
   | typeof TABLE_MESSAGES
   | typeof TABLE_RESOURCES
   | typeof TABLE_WORKFLOW_SNAPSHOT
-  | typeof TABLE_SCORERS
-  | typeof TABLE_BACKGROUND_TASKS;
+  | typeof TABLE_SCORERS;
 
 export type CloudflareKVBindings = Record<RequiredCloudflareKVBindingTable, KVNamespace> &
   Partial<Record<Exclude<TABLE_NAMES, RequiredCloudflareKVBindingTable>, KVNamespace>>;

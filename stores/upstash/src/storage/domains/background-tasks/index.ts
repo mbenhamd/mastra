@@ -1,10 +1,4 @@
-import type {
-  BackgroundTask,
-  BackgroundTaskStatus,
-  TaskFilter,
-  TaskListResult,
-  UpdateBackgroundTask,
-} from '@mastra/core/background-tasks';
+import type { BackgroundTask, BackgroundTaskStatus, TaskFilter, TaskListResult } from '@mastra/core/background-tasks';
 import { BackgroundTasksStorage, TABLE_BACKGROUND_TASKS } from '@mastra/core/storage';
 import type { Redis } from '@upstash/redis';
 import { UpstashDB, resolveUpstashConfig } from '../../db';
@@ -80,33 +74,12 @@ export class BackgroundTasksUpstash extends BackgroundTasksStorage {
     await this.client.set(key, processedRecord);
   }
 
-  async updateTask(taskId: string, update: Partial<BackgroundTask>): Promise<void> {
-    const existing = await this.getTask(taskId);
-    if (!existing) return;
-
-    const merged = { ...existing };
-
-    if ('status' in update) merged.status = update.status!;
-    if ('result' in update) merged.result = update.result;
-    if ('error' in update) merged.error = update.error;
-    if ('suspendPayload' in update) merged.suspendPayload = update.suspendPayload;
-    if ('retryCount' in update) merged.retryCount = update.retryCount!;
-    if ('startedAt' in update) merged.startedAt = update.startedAt;
-    if ('suspendedAt' in update) merged.suspendedAt = update.suspendedAt;
-    if ('completedAt' in update) merged.completedAt = update.completedAt;
-
-    const record = toStorageRecord(merged);
-    const { key, processedRecord } = processRecord(TABLE_BACKGROUND_TASKS, record);
-    await this.client.set(key, processedRecord);
-  }
-
-  async updateTaskIfStatus(
+  async updateTask(
     taskId: string,
-    expectedStatus: BackgroundTaskStatus,
-    update: UpdateBackgroundTask,
+    update: Partial<BackgroundTask>,
+    options?: { expectedStatus?: BackgroundTask['status'] },
   ): Promise<boolean> {
-    const patch: Record<string, any> = {};
-
+    const patch: Record<string, unknown> = {};
     if ('status' in update) patch.status = update.status;
     if ('result' in update) patch.result = update.result ?? null;
     if ('error' in update) patch.error = update.error ?? null;
@@ -115,25 +88,22 @@ export class BackgroundTasksUpstash extends BackgroundTasksStorage {
     if ('startedAt' in update) patch.startedAt = update.startedAt?.toISOString() ?? null;
     if ('suspendedAt' in update) patch.suspendedAt = update.suspendedAt?.toISOString() ?? null;
     if ('completedAt' in update) patch.completedAt = update.completedAt?.toISOString() ?? null;
-
     if (Object.keys(patch).length === 0) return false;
 
     const key = getKey(TABLE_BACKGROUND_TASKS, { id: taskId });
     const result = await this.client.eval(
       `
-local raw = redis.call("GET", KEYS[1])
-if not raw then return 0 end
-local record = cjson.decode(raw)
-if record["status"] ~= ARGV[1] then return 0 end
-local patch = cjson.decode(ARGV[2])
-for key, value in pairs(patch) do
-  record[key] = value
-end
-redis.call("SET", KEYS[1], cjson.encode(record))
-return 1
-`,
+        local existing = redis.call('GET', KEYS[1])
+        if not existing then return 0 end
+        local record = cjson.decode(existing)
+        if ARGV[1] ~= '' and record.status ~= ARGV[1] then return 0 end
+        local patch = cjson.decode(ARGV[2])
+        for field, value in pairs(patch) do record[field] = value end
+        redis.call('SET', KEYS[1], cjson.encode(record))
+        return 1
+      `,
       [key],
-      [expectedStatus, JSON.stringify(patch)],
+      [options?.expectedStatus ?? '', JSON.stringify(patch)],
     );
     return Number(result) === 1;
   }

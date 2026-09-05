@@ -32,6 +32,12 @@ import { NonRetriableError } from 'inngest';
 import type { Inngest } from 'inngest';
 import { subscribe } from 'inngest/realtime';
 import type { Realtime } from 'inngest/realtime';
+import {
+  buildDurableResumeEventData,
+  buildDurableTimeTravelEventData,
+  buildDurableTriggerEventData,
+  mergeResumeRequestContext,
+} from './durable-event-payload';
 import { inngestWorkflowResumeOperationHash } from './resume-operation';
 import type { InngestEngineType, InngestWorkflowRunState } from './types';
 
@@ -647,16 +653,18 @@ export class InngestRun<
         }),
         name: `workflow.${this.workflowId}`,
         data: {
-          inputData: inputDataToUse,
-          initialState: initialStateToUse,
-          runId: this.runId,
-          resourceId: this.resourceId,
-          outputOptions,
-          tracingOptions,
-          format,
-          requestContext: requestContext ? Object.fromEntries(requestContext.entries()) : {},
-          actor,
-          perStep,
+          ...buildDurableTriggerEventData({
+            inputData: inputDataToUse,
+            initialState: initialStateToUse,
+            runId: this.runId,
+            resourceId: this.resourceId,
+            outputOptions,
+            tracingOptions,
+            format,
+            requestContext,
+            actor,
+            perStep,
+          }),
           disableScorers,
           ...lifecycleExecution,
         },
@@ -901,9 +909,10 @@ export class InngestRun<
     // can opt into replacement after they have independently filtered and
     // rebuilt the context at their security boundary.
     const persistedRequestContext =
-      params.__requestContextMode === 'replace' ? {} : (snapshot.requestContext ?? resumeSource?.requestContext ?? {});
-    const newRequestContext = params.requestContext ? Object.fromEntries(params.requestContext.entries()) : {};
-    const mergedRequestContext = { ...persistedRequestContext, ...newRequestContext };
+      params.__requestContextMode === 'replace'
+        ? undefined
+        : (snapshot.requestContext ?? resumeSource?.requestContext ?? {});
+    const mergedRequestContext = mergeResumeRequestContext(persistedRequestContext, params.requestContext);
     const disableScorers = this.getDurableDisableScorers(snapshot as InngestWorkflowRunState);
     const retainedTerminalSteps = terminalReceipt?.operationReplayContext.steps;
     const terminalSelectionMatches =
@@ -992,31 +1001,25 @@ export class InngestRun<
       id: receiptKey,
       name: `workflow.${this.workflowId}`,
       data: {
-        inputData: resumeDataToUse,
-        runId: this.runId,
-        resourceId,
-        workflowId: this.workflowId,
-        resume: {
-          steps,
-          resumePayload: resumeDataToUse,
-          resumePath,
-          label: params.label,
-        },
+        ...buildDurableResumeEventData({
+          inputData: resumeDataToUse,
+          runId: this.runId,
+          resourceId,
+          workflowId: this.workflowId,
+          resume: {
+            steps,
+            resumePayload: resumeDataToUse,
+            resumePath,
+            label: params.label,
+          },
+          requestContext: mergedRequestContext,
+          actor: params.actor,
+          perStep: params.perStep,
+          tracingOptions: params.tracingOptions,
+        }),
         receiptKey,
         resumeOperationHash,
-        requestContext: mergedRequestContext,
-        // `actor` is a per-call trust signal, not rehydrated from the snapshot like
-        // `requestContext` is above. This intentionally matches the default engine,
-        // which passes `actor: params.actor` on resume and never reads it from the
-        // snapshot (see packages/core/src/workflows/workflow.ts `_resume`). The caller
-        // (a trusted background system) re-supplies `actor` on each resume; we never
-        // persist a membership-bypass signal into durable storage.
-        actor: params.actor,
-        perStep: params.perStep,
         disableScorers,
-        // Omitted rather than sent as `undefined` so the dispatched event keeps a
-        // stable shape; the worker recomputes the operation hash from this field.
-        ...(params.tracingOptions === undefined ? {} : { tracingOptions: params.tracingOptions }),
         ...lifecycleExecution,
       },
     });
@@ -1276,16 +1279,18 @@ export class InngestRun<
         }),
         name: `workflow.${this.workflowId}`,
         data: {
-          initialState: timeTravelData.state,
-          runId: this.runId,
-          workflowId: this.workflowId,
-          stepResults: timeTravelData.stepResults,
-          timeTravel: timeTravelData,
-          tracingOptions: params.tracingOptions,
-          outputOptions: params.outputOptions,
-          requestContext: params.requestContext ? Object.fromEntries(params.requestContext.entries()) : {},
-          actor: params.actor,
-          perStep: params.perStep,
+          ...buildDurableTimeTravelEventData({
+            initialState: timeTravelData.state,
+            runId: this.runId,
+            workflowId: this.workflowId,
+            stepResults: timeTravelData.stepResults,
+            timeTravel: timeTravelData,
+            tracingOptions: params.tracingOptions,
+            outputOptions: params.outputOptions,
+            requestContext: params.requestContext,
+            actor: params.actor,
+            perStep: params.perStep,
+          }),
           disableScorers,
           ...lifecycleExecution,
         },

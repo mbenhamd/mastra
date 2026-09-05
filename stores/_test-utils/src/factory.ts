@@ -36,8 +36,6 @@ export * from './domains/tool-provider-connections/data';
 export type TestCapabilities = {
   /** Whether the adapter supports listing scores by span (defaults to true) */
   listScoresBySpan?: boolean;
-  /** Whether background task storage supports atomic status-conditional updates (defaults to true) */
-  backgroundTasksUpdateIfStatus?: boolean;
   /** Whether scorer-based pagination is guaranteed to be ordered newest-first. */
   deterministicScorePagination?: boolean;
   /**
@@ -48,6 +46,12 @@ export type TestCapabilities = {
   toolMocks?: boolean;
   /** Whether identity-aware dataset item insertion is supported (defaults to true). */
   datasetItemIdentity?: boolean;
+  /**
+   * Whether batchDeleteTraces supports tenant-scoped deletion via
+   * organizationId/resourceId (defaults to false). Adapters without tenant
+   * columns must reject scoped calls; the suite asserts that rejection.
+   */
+  scopedTraceDeletion?: boolean;
 };
 
 export function createTestSuite(storage: MastraStorage, capabilities: TestCapabilities = {}) {
@@ -134,7 +138,7 @@ export function createTestSuite(storage: MastraStorage, capabilities: TestCapabi
     createWorkflowsTests({ storage });
     createMemoryTest({ storage });
     createScoresTest({ storage, capabilities });
-    createObservabilityTests({ storage });
+    createObservabilityTests({ storage, capabilities });
     createAgentsTests({ storage });
     createDatasetsTests({ storage, capabilities });
     createExperimentsTests({ storage, capabilities });

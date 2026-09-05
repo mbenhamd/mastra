@@ -43,6 +43,97 @@ describe('validateDynamicWorkflow', () => {
       );
     });
 
+    it('flags duplicated container entry ids, including collisions with leaf ids', () => {
+      const issues = validateDynamicWorkflow(
+        def({
+          graph: [
+            { type: 'parallel', id: 'duplicate', steps: [{ type: 'tool', id: 'left', toolId: 'a' }] },
+            { type: 'parallel', id: 'duplicate', steps: [{ type: 'tool', id: 'right', toolId: 'b' }] },
+            {
+              type: 'foreach',
+              id: 'left',
+              step: { type: 'tool', id: 'body', toolId: 'c' },
+              opts: { concurrency: 1 },
+            },
+          ],
+        }),
+      );
+      expect(issues).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ code: 'duplicate-step-id', path: 'graph.1.id' }),
+          expect.objectContaining({ code: 'duplicate-step-id', path: 'graph.2.id' }),
+        ]),
+      );
+    });
+
+    it('rejects a supplied-but-empty container entry id', () => {
+      const issues = validateDynamicWorkflow(
+        def({
+          graph: [{ type: 'parallel', id: '', steps: [{ type: 'tool', id: 'left', toolId: 'a' }] }],
+        }),
+      );
+      expect(issues).toEqual(
+        expect.arrayContaining([expect.objectContaining({ code: 'missing-step-id', path: 'graph.0.id' })]),
+      );
+    });
+
+    it('flags a container id colliding with a sleep id regardless of graph order', () => {
+      const issues = validateDynamicWorkflow(
+        def({
+          graph: [
+            { type: 'parallel', id: 'same', steps: [{ type: 'tool', id: 'left', toolId: 'a' }] },
+            { type: 'sleep', id: 'same', duration: 5 },
+          ],
+        }),
+      );
+      expect(issues).toEqual(
+        expect.arrayContaining([expect.objectContaining({ code: 'duplicate-step-id', path: 'graph.0.id' })]),
+      );
+    });
+
+    it('flags the container id when the sleep comes first in the graph', () => {
+      const issues = validateDynamicWorkflow(
+        def({
+          graph: [
+            { type: 'sleep', id: 'same', duration: 5 },
+            { type: 'parallel', id: 'same', steps: [{ type: 'tool', id: 'left', toolId: 'a' }] },
+          ],
+        }),
+      );
+      expect(issues).toEqual(
+        expect.arrayContaining([expect.objectContaining({ code: 'duplicate-step-id', path: 'graph.1.id' })]),
+      );
+    });
+
+    it('still accepts pre-existing sleep-to-sleep duplicate ids (backward compatibility)', () => {
+      const issues = validateDynamicWorkflow(
+        def({
+          graph: [
+            { type: 'sleep', id: 'wait', duration: 5 },
+            { type: 'sleep', id: 'wait', duration: 10 },
+          ],
+        }),
+      );
+      expect(issues.filter(issue => issue.code === 'duplicate-step-id')).toEqual([]);
+    });
+
+    it('accepts unique container entry ids', () => {
+      const issues = validateDynamicWorkflow(
+        def({
+          graph: [
+            { type: 'parallel', id: 'fan-out', steps: [{ type: 'tool', id: 'left', toolId: 'a' }] },
+            {
+              type: 'foreach',
+              id: 'each-item',
+              step: { type: 'tool', id: 'body', toolId: 'b' },
+              opts: { concurrency: 1 },
+            },
+          ],
+        }),
+      );
+      expect(issues.filter(issue => issue.code === 'duplicate-step-id')).toEqual([]);
+    });
+
     it('rejects a mapping inside a container with exactly one issue', () => {
       const issues = validateDynamicWorkflow(
         def({
@@ -125,6 +216,60 @@ describe('validateDynamicWorkflow', () => {
   });
 
   describe('schemas', () => {
+    it('validates effective scheduled payloads without rewriting stored values or suggesting graph repairs', () => {
+      const definition = {
+        ...def({
+          inputSchema: { type: 'number' },
+          stateSchema: { type: 'boolean' },
+          requestContextSchema: {
+            type: 'object',
+            properties: { tenant: { type: 'string' } },
+            required: ['tenant'],
+          },
+          graph: [{ type: 'tool', id: 'echo', toolId: 'echo-tool' }],
+        }),
+        schedule: {
+          id: 'daily',
+          cron: '0 9 * * *',
+          inputData: 0,
+          initialState: false,
+          requestContext: { tenant: '' },
+        },
+      };
+      const original = structuredClone(definition);
+      expect(validateDynamicWorkflow(definition)).toEqual([]);
+      expect(validateDynamicWorkflow({ ...definition, schedule: [definition.schedule] })).toEqual([]);
+      expect(definition).toEqual(original);
+      expect(validateDynamicWorkflow({ ...definition, schedule: undefined })).toEqual([]);
+      expect(validateDynamicWorkflow({ ...definition, schedule: [] })).toEqual([]);
+
+      // Null and absent payloads reach the workflow as {}, so neither can
+      // satisfy these required scalar/context schemas.
+      const schedules = [
+        { id: 'null', cron: '0 9 * * *', inputData: null, initialState: null, requestContext: {} },
+        { id: 'absent', cron: '0 10 * * *' },
+      ];
+      const issues = validateDynamicWorkflow({ ...definition, schedule: schedules });
+      expect(issues).toEqual(
+        ['inputData', 'initialState', 'requestContext'].flatMap(field =>
+          schedules.map((_, index) => ({
+            code: 'invalid-schedule-payload',
+            path: `schedule.${index}.${field}`,
+            message: expect.stringContaining(`Scheduled ${field} must satisfy`),
+          })),
+        ),
+      );
+      expect(
+        validateDynamicWorkflow({
+          ...definition,
+          inputSchema: emptyObjectSchema,
+          stateSchema: emptyObjectSchema,
+          requestContextSchema: emptyObjectSchema,
+          schedule: schedules,
+        }),
+      ).toEqual([]);
+    });
+
     it('flags unsupported JSON Schema keywords on top-level and agent schemas', () => {
       const issues = validateDynamicWorkflow(
         def({

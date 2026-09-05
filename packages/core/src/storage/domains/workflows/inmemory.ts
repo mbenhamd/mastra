@@ -72,7 +72,7 @@ import type {
   WorkflowTerminalizationCapabilities,
   WorkflowResumeCapabilities,
 } from '../../types';
-import { matchesExpectedWorkflowStatus } from '../../types';
+import { matchesExpectedWorkflowState } from '../../types';
 import {
   createEmptyWorkflowSnapshot,
   mergeWorkflowStepResult,
@@ -1638,10 +1638,17 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       throw new Error(`Snapshot not found for runId ${runId}`);
     }
 
-    const { expectedStatus, finalState, ...stateOptions } = opts;
-    // Compare-and-set guard runs before any mutation: a mismatched status makes
+    const { expectedStatus, expectedExecutionGeneration, expectedLifecycleResumeAttempt, finalState, ...stateOptions } =
+      opts;
+    // Compare-and-set guards run before any mutation: a mismatch makes
     // the whole update a no-op, including the terminal `finalState` replacement.
-    if (!matchesExpectedWorkflowStatus(snapshot.status, expectedStatus)) {
+    if (
+      !matchesExpectedWorkflowState(snapshot, {
+        expectedStatus,
+        expectedExecutionGeneration,
+        expectedLifecycleResumeAttempt,
+      })
+    ) {
       return;
     }
 
@@ -1689,7 +1696,9 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     const data: StorageWorkflowRun = {
       workflow_name: workflowName,
       run_id: runId,
-      resourceId,
+      // A re-persist without a resourceId (e.g. resume) must not erase a
+      // previously-set value. Matches the persistent stores' COALESCE upserts.
+      resourceId: resourceId ?? existing?.resourceId,
       snapshot: cloneRunData(snapshot),
       // Preserve the original creation time when re-persisting an existing run; only set it
       // on first insert. Otherwise listWorkflowRuns ordering and date filters drift to the

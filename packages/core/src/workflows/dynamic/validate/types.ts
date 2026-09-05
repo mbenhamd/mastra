@@ -7,6 +7,7 @@
  * (`assertValidDynamicWorkflow`), not a separate rule set.
  */
 import type { Predicate } from '../../predicate';
+import type { WorkflowScheduleInput } from '../../scheduler/types';
 import type { SerializedSingleStepEntry, SerializedStepFlowEntry } from '../../types';
 import type { JsonSchema } from '../json-schema-to-zod';
 
@@ -25,6 +26,7 @@ export type WorkflowValidationIssueCode =
   | 'invalid-loop'
   | 'invalid-predicate-reference'
   | 'incompatible-schema'
+  | 'invalid-schedule-payload'
   | 'unsupported-schema-keyword'
   | 'self-reference';
 
@@ -122,6 +124,7 @@ export interface WorkflowValidationInput {
   outputSchema: JsonSchema;
   stateSchema?: JsonSchema;
   requestContextSchema?: JsonSchema;
+  schedule?: WorkflowScheduleInput;
   graph: readonly ValidatableStepFlowEntry[];
 }
 

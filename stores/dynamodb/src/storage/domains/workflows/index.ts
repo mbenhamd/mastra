@@ -3,7 +3,7 @@ import {
   createStorageErrorId,
   normalizePerPage,
   TABLE_WORKFLOW_SNAPSHOT,
-  matchesExpectedWorkflowStatus,
+  matchesExpectedWorkflowState,
   WorkflowsStorage,
 } from '@mastra/core/storage';
 import type {
@@ -41,6 +41,11 @@ function formatWorkflowRun(snapshotData: WorkflowSnapshotDBItem): WorkflowRun {
     updatedAt: new Date(snapshotData.updatedAt),
     resourceId: snapshotData.resourceId,
   };
+}
+
+function nextWorkflowUpdatedAt(previousUpdatedAt: string | undefined, nowMs = Date.now()): string {
+  const previousMs = previousUpdatedAt === undefined ? Number.NaN : Date.parse(previousUpdatedAt);
+  return new Date(Number.isFinite(previousMs) ? Math.max(nowMs, previousMs + 1) : nowMs).toISOString();
 }
 
 // Maximum retry attempts for optimistic locking conflicts
@@ -164,7 +169,7 @@ export class WorkflowStorageDynamoDB extends WorkflowsStorage {
           run_id: runId,
           snapshot: JSON.stringify(snapshot),
           createdAt: existingRecord.data?.createdAt ?? now.toISOString(),
-          updatedAt: now.toISOString(),
+          updatedAt: nextWorkflowUpdatedAt(previousUpdatedAt, now.getTime()),
           ...getTtlProps('workflow_snapshot', this.ttlConfig),
         };
 
@@ -253,8 +258,14 @@ export class WorkflowStorageDynamoDB extends WorkflowsStorage {
 
         const previousUpdatedAt = existingRecord.data.updatedAt;
 
-        const { expectedStatus, ...state } = opts;
-        if (!matchesExpectedWorkflowStatus(existingSnapshot.status, expectedStatus)) {
+        const { expectedStatus, expectedExecutionGeneration, expectedLifecycleResumeAttempt, ...state } = opts;
+        if (
+          !matchesExpectedWorkflowState(existingSnapshot, {
+            expectedStatus,
+            expectedExecutionGeneration,
+            expectedLifecycleResumeAttempt,
+          })
+        ) {
           return undefined;
         }
 
@@ -268,7 +279,7 @@ export class WorkflowStorageDynamoDB extends WorkflowsStorage {
           run_id: runId,
           snapshot: JSON.stringify(updatedSnapshot),
           createdAt: existingRecord.data.createdAt,
-          updatedAt: now.toISOString(),
+          updatedAt: nextWorkflowUpdatedAt(previousUpdatedAt, now.getTime()),
           resourceId: existingRecord.data.resourceId,
           ...getTtlProps('workflow_snapshot', this.ttlConfig),
         };

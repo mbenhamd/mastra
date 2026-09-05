@@ -1,6 +1,6 @@
 ---
 title: "Reference: MessageHistory | Processors"
-description: "Documentation for the MessageHistory processor in Mastra, which handles retrieval and persistence of conversation history."
+description: "The MessageHistory is a hybrid processor that handles both retrieval and persistence of message history."
 packages:
   - "@mastra/core"
   - "@mastra/pg"
@@ -243,7 +243,7 @@ const messageHistory = new MessageHistory({
 
 ## Persist only the final turn
 
-Set `persistence.mode` to `final-turn` to store one stable user message, approved compact outcomes, and the final assistant text. This mode removes raw tool calls and results, reasoning, step markers, provisional text, transient assistant rows, and provider metadata.
+Set `persistence.mode` to `final-turn` to store one stable user message together with approved compact outcomes and the final assistant text. This mode removes raw tool calls and results, reasoning, step markers, provisional text, transient assistant rows, and provider metadata.
 
 `persistence` and `toolCallFilter` are mutually exclusive. Passing both throws a `TypeError` when `MessageHistory` is constructed.
 

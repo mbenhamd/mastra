@@ -143,6 +143,19 @@ export interface ResolveRuntimeOptions {
  * resolution (tenant/user, workspace, dynamic model/memory) working for tools
  * rebuilt on a cross-process worker, including a delegated subagent's.
  */
+export function restoreRequestContext(entries?: Record<string, unknown>, runLevel?: RequestContext): RequestContext {
+  if (!entries) return runLevel ?? new RequestContext();
+
+  // Legacy snapshots may contain a bearer token. Never restore it; only the
+  // live run-level context is authorized to provide the current token.
+  const restored = new RequestContext<unknown>(
+    Object.entries(entries).filter(([key]) => key !== MASTRA_AUTH_TOKEN_KEY),
+  );
+  const liveToken = runLevel?.getRaw?.(MASTRA_AUTH_TOKEN_KEY);
+  if (liveToken !== undefined) restored.setRaw(MASTRA_AUTH_TOKEN_KEY, liveToken);
+  return restored;
+}
+
 export function createDurableRuntimeRequestContext(options: {
   entries?: Record<string, unknown>;
   state: Pick<SerializableDurableState, 'memoryConfigured' | 'threadId' | 'resourceId' | 'memoryConfig'>;
@@ -628,7 +641,8 @@ export function resolveTool(toolName: string, mastra?: Mastra): CoreTool | undef
  *    `(toolName, args, ...)`. Throwing defaults to "require approval" (safe).
  *  - Boolean global / tool-level `requireApproval` seed the decision.
  *  - A per-tool `needsApprovalFn` (e.g. skill tools) is authoritative when
- *    present and overrides the seed.
+ *    present and overrides the seed. It receives `{ requestContext, workspace }`
+ *    as its second argument, exactly like the non-durable loop.
  *
  * In durable execution the function form lives on the run registry, not on
  * the serialized workflow input — pass the resolved value from the caller.

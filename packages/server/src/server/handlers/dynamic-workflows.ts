@@ -108,6 +108,7 @@ export const UPSERT_DYNAMIC_WORKFLOW_ROUTE = createRoute({
     outputSchema,
     stateSchema,
     requestContextSchema,
+    schedule,
     graph,
     dependencies,
   }) => {
@@ -115,7 +116,17 @@ export const UPSERT_DYNAMIC_WORKFLOW_ROUTE = createRoute({
       // Pick the body fields explicitly — handler args also carry server
       // context (requestContext, abortSignal, ...) which must not leak into
       // the stored definition.
-      const def = { id, description, metadata, inputSchema, outputSchema, stateSchema, requestContextSchema, graph };
+      const def = {
+        id,
+        description,
+        metadata,
+        inputSchema,
+        outputSchema,
+        stateSchema,
+        requestContextSchema,
+        schedule,
+        graph,
+      };
       // Helpers are saved with the root as one unit so a nested workflow that
       // does not exist yet resolves, and so a rejected root can never leave
       // its helpers behind as orphans. Order within the bundle is derived

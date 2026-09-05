@@ -210,6 +210,10 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
       validateInputs: false,
       emitStepEvents: false,
       sharePubsub: true,
+      // Generic boot-time restart must not re-drive agent loops — recovery
+      // is owned by the dedicated opt-in path (`recovery.durableAgents:
+      // 'auto'`) with leasing/fencing (issue #22598).
+      autoRestartActiveRuns: false,
       // Internal durable-agent execution plumbing — hide workflow spans;
       // the agent/tool/model spans within still surface for users.
       tracingPolicy: {
@@ -347,6 +351,10 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
         validateInputs: false,
         onFinish: options?.onFinish,
         emitStepEvents: false,
+        // Generic boot-time restart must not re-drive agent loops — recovery
+        // is owned by the dedicated opt-in path (`recovery.durableAgents:
+        // 'auto'`) with leasing/fencing (issue #22598).
+        autoRestartActiveRuns: false,
         // Internal durable-agent execution plumbing — see singleIterationWorkflow.
         tracingPolicy: {
           internal: InternalSpans.WORKFLOW,

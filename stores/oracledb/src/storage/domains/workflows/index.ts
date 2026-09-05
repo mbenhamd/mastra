@@ -3,7 +3,7 @@ import {
   normalizePerPage,
   TABLE_WORKFLOW_SNAPSHOT,
   WorkflowsStorage,
-  matchesExpectedWorkflowStatus,
+  matchesExpectedWorkflowState,
 } from '@mastra/core/storage';
 import type {
   StorageListWorkflowRunsInput,
@@ -136,8 +136,14 @@ export class WorkflowsOracle extends WorkflowsStorage {
           throw new Error(`Snapshot not found for runId ${runId}`);
         }
 
-        const { expectedStatus, ...state } = opts;
-        if (!matchesExpectedWorkflowStatus(snapshot.status, expectedStatus)) {
+        const { expectedStatus, expectedExecutionGeneration, expectedLifecycleResumeAttempt, ...state } = opts;
+        if (
+          !matchesExpectedWorkflowState(snapshot, {
+            expectedStatus,
+            expectedExecutionGeneration,
+            expectedLifecycleResumeAttempt,
+          })
+        ) {
           return undefined;
         }
 

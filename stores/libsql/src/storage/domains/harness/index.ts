@@ -1,6 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
 
-import type { Client, Transaction } from '@libsql/client';
 import {
   HarnessStorage,
   HarnessStorageAdmissionConflictError,
@@ -141,6 +140,7 @@ import type {
 } from '@mastra/core/storage';
 import { LibSQLDB, resolveClient } from '../../db';
 import type { LibSQLDomainConfig } from '../../db';
+import type { SqliteClient as Client, SqliteTransaction as Transaction } from '../../db/client';
 
 type HarnessWakeupClaimStatus = Extract<HarnessWakeupItem['status'], 'due' | 'claimed' | 'failed'>;
 type HarnessLibSQLConfig = LibSQLDomainConfig & { transactionalInit?: boolean };

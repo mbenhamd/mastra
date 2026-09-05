@@ -6,6 +6,9 @@
  * since tokenx is a deterministic pure function.
  */
 import { describe, expect, it } from 'vitest';
+import { z } from 'zod/v4';
+
+import { validateToolOutput } from '../../tools/validation';
 
 import {
   DEFAULT_MAX_OUTPUT_TOKENS,
@@ -84,6 +87,33 @@ describe('sandboxToModelOutput', () => {
 
   it('returns an array as-is', () => {
     expect(sandboxToModelOutput([1, 2, 3])).toEqual([1, 2, 3]);
+  });
+
+  it('tags a validation-error envelope as error-json', () => {
+    const validation = validateToolOutput(z.object({ value: z.string() }), { value: 1 }, 'get-process-output');
+    expect(validation.error).toBeDefined();
+    const envelope = validation.error!;
+    expect(sandboxToModelOutput(envelope)).toEqual({ type: 'error-json', value: envelope });
+  });
+
+  it('does not reclassify an author-owned validation-error-shaped output', () => {
+    const output = {
+      error: true,
+      message: 'This is ordinary tool data.',
+      validationErrors: { errors: ['author data'], fields: {} },
+    };
+
+    expect(sandboxToModelOutput(output)).toBe(output);
+  });
+
+  it('does not tag an object with error: true but no validationErrors', () => {
+    const output = { error: true, message: 'something failed' };
+    expect(sandboxToModelOutput(output)).toBe(output);
+  });
+
+  it('does not tag an object with validationErrors but error not true', () => {
+    const output = { error: false, validationErrors: { errors: [], fields: {} } };
+    expect(sandboxToModelOutput(output)).toBe(output);
   });
 });
 

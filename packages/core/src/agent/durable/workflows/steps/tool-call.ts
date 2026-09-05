@@ -8,8 +8,8 @@ import { notifyToolDenied } from '../../../../loop/workflows/agentic-execution/t
 import type { Mastra } from '../../../../mastra';
 import type { MastraMemory } from '../../../../memory/memory';
 import type { MemoryConfig } from '../../../../memory/types';
-import { EntityType, SpanType } from '../../../../observability';
-import type { ExportedSpan } from '../../../../observability';
+import { EntityType, SpanType, createObservabilityContext } from '../../../../observability';
+import type { ExportedSpan, ObservabilityContext } from '../../../../observability';
 import type { ProcessorState } from '../../../../processors';
 import { ProcessorRunner, outputProcessorsSupportStream } from '../../../../processors/runner';
 import type { RequestContext } from '../../../../request-context';
@@ -35,7 +35,7 @@ import type { ToolPermissionDecision, ToolPermissionPolicy } from '../../../tool
 import { createToolSurfaceFence, materializeToolSurfaceFence } from '../../../tool-surface-fence';
 import { ensureRemoteAbortListener } from '../../abort-transport';
 import { DurableStepIds } from '../../constants';
-import { getBoundRunRegistryEntry, globalRunRegistry } from '../../run-registry';
+import { getBoundRunRegistryEntry, globalRunRegistry, markRunActive } from '../../run-registry';
 import { emitSuspendedEvent, emitChunkEvent } from '../../stream-adapter';
 import type {
   DurableToolCallInput,
@@ -46,7 +46,12 @@ import type {
   RunRegistryEntry,
 } from '../../types';
 import { applyToolPayloadTransformToChunk } from '../../utils/apply-tool-payload-transform';
-import { rebuildRunToolsFromMastra, resolveTool, toolApprovalRequirement } from '../../utils/resolve-runtime';
+import {
+  rebuildRunToolsFromMastra,
+  resolveTool,
+  restoreRequestContext,
+  toolApprovalRequirement,
+} from '../../utils/resolve-runtime';
 import { serializeError } from '../../utils/serialize-state';
 import {
   assertDurableToolHookPolicyAvailable,
@@ -151,6 +156,11 @@ async function flushMessagesBeforeSuspension({
   }
 }
 
+// Concurrent durable tool calls share processor-owned state. Serialize only
+// their output-chunk pipeline so each chunk completes one span segment before
+// the next starts, while the tool executions themselves remain concurrent.
+const outputProcessorQueues = new WeakMap<RunRegistryEntry, Promise<void>>();
+
 /**
  * Run a tool-result or tool-error chunk through the run's output processor pipeline.
  * Returns the processed chunk (possibly modified), or `null` if a processor blocked it
@@ -166,11 +176,21 @@ async function processChunkThroughOutputProcessors(
   agentName: string,
   logger: any,
   messageList?: MessageList,
+  observabilityContext?: ObservabilityContext,
 ): Promise<ChunkType | null> {
   if (!registryEntry?.processorStates) {
     return chunk;
   }
 
+  const previous = outputProcessorQueues.get(registryEntry) ?? Promise.resolve();
+  let releaseQueue!: () => void;
+  const queueTail = new Promise<void>(resolve => {
+    releaseQueue = resolve;
+  });
+  outputProcessorQueues.set(registryEntry, queueTail);
+  await previous.catch(() => {});
+
+  let runner: ProcessorRunner | null | undefined;
   try {
     if (registryEntry.outputProcessorRunner === undefined) {
       registryEntry.outputProcessorRunner = outputProcessorsSupportStream(registryEntry.outputProcessors)
@@ -183,7 +203,7 @@ async function processChunkThroughOutputProcessors(
           })
         : null;
     }
-    const runner = registryEntry.outputProcessorRunner;
+    runner = registryEntry.outputProcessorRunner;
     if (!runner) return chunk;
 
     let writer = registryEntry.outputProcessorWriter;
@@ -200,6 +220,11 @@ async function processChunkThroughOutputProcessors(
       registryEntry.outputProcessorWriter = writer;
     }
 
+    // A durable tool chunk is a separate stream segment from the model
+    // chunks surrounding it. Close any still-open model segment before the
+    // processor state opens a span owned by this tool chunk.
+    runner.endStreamProcessorSpans(registryEntry.processorStates as Map<string, ProcessorState>);
+
     const {
       part: processed,
       blocked,
@@ -209,7 +234,7 @@ async function processChunkThroughOutputProcessors(
     } = await runner.processPart(
       chunk,
       registryEntry.processorStates as Map<string, ProcessorState>,
-      undefined, // observabilityContext
+      observabilityContext,
       registryEntry.requestContext,
       messageList,
       0,
@@ -237,6 +262,14 @@ async function processChunkThroughOutputProcessors(
     logger?.warn?.(`[DurableAgent] Output processor error for tool chunk: ${error}`);
     // Fall through: emit the original chunk if processor fails
     return chunk;
+  } finally {
+    // The finish chunk that normally ends stream-processor spans never reaches
+    // this pipeline, so end the spans opened for this chunk here.
+    runner?.endStreamProcessorSpans(registryEntry.processorStates as Map<string, ProcessorState>);
+    releaseQueue();
+    if (outputProcessorQueues.get(registryEntry) === queueTail) {
+      outputProcessorQueues.delete(registryEntry);
+    }
   }
 }
 
@@ -484,6 +517,19 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
           >);
       }
       let tool = replacementToolNames?.has(toolName) === false ? undefined : toolSourceMap?.[toolName];
+      const observability = (mastra as Mastra | undefined)?.observability?.getSelectedInstance({ requestContext });
+
+      // Parent per-chunk processor spans under the active durable agent segment.
+      const processorAgentSpanData = registryEntry?.resumeAgentSpanData ?? initData.agentSpanData;
+      const processorAgentSpan =
+        registryEntry?.resumeAgentSpan ??
+        registryEntry?.agentSpan ??
+        (processorAgentSpanData && observability
+          ? observability.rebuildSpan(processorAgentSpanData as ExportedSpan<SpanType.AGENT_RUN>)
+          : undefined);
+      const processorObservabilityContext = processorAgentSpan
+        ? createObservabilityContext({ currentSpan: processorAgentSpan })
+        : undefined;
       let mastraTools: Record<string, any> | undefined;
       // Tools rebuilt from the Mastra instance when the per-process registry is
       // empty (cross-process worker). Populated lazily below; reused for
@@ -751,6 +797,9 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
       const registryRequireToolApproval = registryEntry?.requireToolApproval;
       const effectiveRequireToolApproval =
         registryRequireToolApproval !== undefined ? registryRequireToolApproval : agentOptions.requireToolApproval;
+      // Preserve approval context across cross-process execution and restarts.
+      const approvalRequestContext =
+        registryEntry?.requestContext ?? restoreRequestContext(initData.requestContextEntries, requestContext);
 
       // Add suspended-tool / pending-approval metadata to the last assistant
       // message so `extractSuspendedToolsFromMessages` can detect it on the
@@ -919,6 +968,7 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
               initData.agentId,
               logger,
               messageList,
+              processorObservabilityContext,
             );
             if (processed) await emitChunkEvent(pubsub, runId, processed);
           } catch (emitError) {
@@ -1019,16 +1069,14 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
         };
       }
 
-      // 2. Check if a fresh tool call requires approval. A resume uses its persisted decision.
-      // The live registry policy (function form) is preferred over the serialized boolean
-      // shadow; internal transport keys are filtered from the policy's requestContext view.
+      // 2. Check whether a fresh tool call requires approval. An authenticated
+      // resume uses its persisted decision; live permission checks above still apply.
+      // Internal transport keys are filtered from the policy's requestContext view.
       const approvalRequirement = !isAuthenticatedResume
         ? await toolApprovalRequirement(tool, effectiveRequireToolApproval, args, {
-            requestContext: registryEntry?.requestContext
-              ? Object.fromEntries(
-                  [...registryEntry.requestContext.entries()].filter(([key]) => key !== '__mastra_requireToolApproval'),
-                )
-              : requestContext,
+            requestContext: Object.fromEntries(
+              [...approvalRequestContext.entries()].filter(([key]) => key !== '__mastra_requireToolApproval'),
+            ),
             // Use the same rebuilt-workspace fallback as execution (above), so
             // workspace-aware approval policies see their workspace cross-process.
             workspace,
@@ -1232,7 +1280,6 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
 
       // Rebuild the forwarded model_step span and pass it as the tool's tracing context so
       // the TOOL_CALL span nests under the LLM call (matches the non-durable path).
-      const observability = (mastra as Mastra | undefined)?.observability?.getSelectedInstance({ requestContext });
       const stepSpan =
         typedInput.stepSpanData && observability
           ? observability.rebuildSpan(typedInput.stepSpanData as ExportedSpan<SpanType.MODEL_STEP>)
@@ -1733,7 +1780,13 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
       }
 
       try {
-        const result = await tool.execute(cleanedArgs, toolOptions);
+        const releaseRunActivity = markRunActive(runId);
+        let result: unknown;
+        try {
+          result = await tool.execute(cleanedArgs, toolOptions);
+        } finally {
+          releaseRunActivity();
+        }
         const delegationBailed =
           requestContext?.get('__mastra_delegationBailed') === true ||
           registryEntry?.requestContext?.get('__mastra_delegationBailed') === true;
@@ -1817,6 +1870,7 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
               initData.agentId,
               logger,
               messageList,
+              processorObservabilityContext,
             );
             if (processed) {
               await emitChunkEvent(pubsub, runId, processed);
@@ -1875,6 +1929,7 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
               initData.agentId,
               logger,
               messageList,
+              processorObservabilityContext,
             );
             if (processed) {
               await emitChunkEvent(pubsub, runId, processed);

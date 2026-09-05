@@ -1,6 +1,34 @@
 import { describe, it, expect } from 'vitest';
 import { z } from 'zod/v4';
-import { buildStorageSchema } from './types';
+import { buildStorageSchema, matchesExpectedWorkflowState } from './types';
+
+const workflowStateWithAttempt = (
+  lifecycleResumeAttempt: unknown,
+): Parameters<typeof matchesExpectedWorkflowState>[0] =>
+  ({
+    status: 'suspended',
+    executionGeneration: 'wfeg:test',
+    lifecycleResumeAttempt,
+  }) as Parameters<typeof matchesExpectedWorkflowState>[0];
+
+describe('matchesExpectedWorkflowState', () => {
+  const expected = {
+    expectedStatus: 'suspended' as const,
+    expectedExecutionGeneration: 'wfeg:test',
+    expectedLifecycleResumeAttempt: 0,
+  };
+
+  it('defaults only an omitted persisted lifecycle attempt to attempt zero', () => {
+    expect(matchesExpectedWorkflowState(workflowStateWithAttempt(undefined), expected)).toBe(true);
+    expect(matchesExpectedWorkflowState(workflowStateWithAttempt(0), expected)).toBe(true);
+  });
+
+  it('rejects invalid persisted lifecycle attempts instead of treating them as attempt zero', () => {
+    for (const lifecycleResumeAttempt of [null, '']) {
+      expect(matchesExpectedWorkflowState(workflowStateWithAttempt(lifecycleResumeAttempt), expected)).toBe(false);
+    }
+  });
+});
 
 describe('buildStorageSchema', () => {
   describe('basic types', () => {

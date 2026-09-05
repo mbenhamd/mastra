@@ -1,8 +1,119 @@
+import { runInNewContext } from 'node:vm';
+
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod/v4';
 
+import { RequestContext } from '../request-context';
 import { createTool } from './tool';
-import { validateToolInput } from './validation';
+import {
+  ToolSchemaValidationError,
+  validateRequestContext,
+  validateToolInput,
+  validateToolOutput,
+  validateToolSuspendData,
+} from './validation';
+
+describe('hostile schema failure privacy', () => {
+  function standardSchema(validate: (value: unknown) => unknown) {
+    const jsonSchema = () => ({ type: 'object' as const });
+    return {
+      '~standard': {
+        vendor: 'hostile-test',
+        version: 1 as const,
+        validate,
+        types: undefined,
+        jsonSchema: { input: jsonSchema, output: jsonSchema },
+      },
+    } as any;
+  }
+
+  it.each([
+    ['input', (schema: any) => validateToolInput(schema, {})],
+    ['output', (schema: any) => validateToolOutput(schema, {})],
+    ['suspension data', (schema: any) => validateToolSuspendData(schema, {})],
+    [
+      'request context',
+      (schema: any) => {
+        const requestContext = new RequestContext();
+        requestContext.set('report', 'SENSITIVE_REQUEST_CONTEXT');
+        return validateRequestContext(schema, requestContext);
+      },
+    ],
+  ])('sanitizes a thrown %s validator exception', (_label, validate) => {
+    const marker = 'SENSITIVE_THROWN_SCHEMA_VALUE';
+    const schema = standardSchema(() => {
+      throw new Error(marker);
+    });
+
+    expect(() => validate(schema)).toThrow(ToolSchemaValidationError);
+    expect(() => validate(schema)).toThrow('Tool schema validation failed unexpectedly.');
+    try {
+      validate(schema);
+    } catch (error) {
+      expect(JSON.stringify(error)).not.toContain(marker);
+      expect((error as Error).message).not.toContain(marker);
+    }
+  });
+
+  it('sanitizes exceptions thrown while inspecting a validator result', () => {
+    const marker = 'SENSITIVE_RESULT_PROXY';
+    const schema = standardSchema(
+      () =>
+        new Proxy(
+          {},
+          {
+            has() {
+              throw new Error(marker);
+            },
+          },
+        ),
+    );
+
+    expect(() => validateToolInput(schema, {})).toThrow('Tool schema validation failed unexpectedly.');
+    try {
+      validateToolInput(schema, {});
+    } catch (error) {
+      expect((error as Error).message).not.toContain(marker);
+    }
+  });
+
+  it.each(['input', 'request context'])('observes a rejected async %s validator before rejecting it', async kind => {
+    const marker = 'SENSITIVE_ASYNC_SCHEMA_REJECTION';
+    const schema = standardSchema(() => Promise.reject(new Error(marker)));
+    const invoke = () => {
+      if (kind === 'input') return validateToolInput(schema, {});
+      return validateRequestContext(schema, new RequestContext());
+    };
+
+    expect(invoke).toThrow('Tool schema validation failed unexpectedly.');
+    // Let the rejected promise's microtask run. Vitest will fail this test as an
+    // unhandled rejection if the validation boundary did not attach a handler.
+    await new Promise(resolve => setImmediate(resolve));
+  });
+
+  it('observes a rejected cross-realm validator promise before rejecting it', async () => {
+    const schema = standardSchema(() => runInNewContext(`Promise.reject(new Error('cross-realm rejection'))`));
+
+    expect(() => validateToolOutput(schema, {})).toThrow(ToolSchemaValidationError);
+    // Vitest reports an unhandled rejection if the boundary only recognizes
+    // promises created in this realm or throws without observing the result.
+    await new Promise(resolve => setImmediate(resolve));
+  });
+
+  it('sanitizes a hostile schema proxy before conversion or normalization', () => {
+    const marker = 'SENSITIVE_SCHEMA_PROXY';
+    const schema = new Proxy(
+      {},
+      {
+        has() {
+          throw new Error(marker);
+        },
+      },
+    );
+
+    expect(() => validateToolInput(schema as any, {})).toThrow('Tool schema validation failed unexpectedly.');
+  });
+});
 
 describe('Tool Input Validation Integration Tests', () => {
   describe('createTool validation', () => {

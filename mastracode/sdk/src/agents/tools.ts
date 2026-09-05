@@ -16,7 +16,7 @@ import type { HookManager } from '../hooks/index.js';
 import type { McpManager } from '../mcp/index.js';
 import type { MastraCodeComposedState } from '../schema.js';
 import { MC_TOOLS } from '../tool-names.js';
-import { createWebSearchTool, createWebExtractTool, hasTavilyKey, requestSandboxAccessTool } from '../tools/index.js';
+import { createConfiguredWebTools, requestSandboxAccessTool } from '../tools/index.js';
 import { createWorkflowTool } from '../tools/workflows/create-workflow.js';
 import { deleteWorkflowTool } from '../tools/workflows/delete-workflow.js';
 import { getWorkflowTool } from '../tools/workflows/get-workflow.js';
@@ -160,9 +160,9 @@ export function createDynamicTools(
       });
     }
 
-    if (hasTavilyKey()) {
-      tools.web_search = createWebSearchTool();
-      tools.web_extract = createWebExtractTool();
+    const configuredWebTools = createConfiguredWebTools();
+    if (configuredWebTools) {
+      Object.assign(tools, configuredWebTools);
     } else if (isAnthropicModel) {
       const anthropic = createAnthropic({});
       tools.web_search = anthropic.tools.webSearch_20250305();

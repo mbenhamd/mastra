@@ -1,7 +1,14 @@
 import type { MastraDBMessage, MessageList } from '@mastra/core/agent';
 import { parseMemoryRequestContext } from '@mastra/core/memory';
-import type { ObservabilityContext } from '@mastra/core/observability';
-import type { Processor, ProcessInputStepArgs, ProcessOutputResultArgs } from '@mastra/core/processors';
+import type { MemoryRunState } from '@mastra/core/memory';
+import type { MemoryOperationAttributes, ObservabilityContext } from '@mastra/core/observability';
+import { SpanType } from '@mastra/core/observability';
+import type {
+  Processor,
+  ProcessInputStepArgs,
+  ProcessOutputResultArgs,
+  ProcessorSpanPhase,
+} from '@mastra/core/processors';
 import type { ObservationalMemoryRecord } from '@mastra/core/storage';
 
 import { OBSERVATION_CONTINUATION_HINT } from './constants';
@@ -16,12 +23,11 @@ import type { TokenCounterModelContext } from './token-counter';
 /**
  * Coerce a shared `state.__omTurn` value to a usable live turn.
  *
- * The turn is stashed in the shared processor-state map as a live `ObservationTurn`, but it
- * serializes (via `ObservationTurn.toJSON`) to a plain, method-less projection. If such a snapshot
- * were ever resumed back through here, `__omTurn` would be that plain object and calling `.end()`
- * on it would throw a synchronous TypeError the surrounding `.catch()` could not trap. Only treat a
- * value with a callable `end()` as a turn, so OM falls through to creating a fresh one. In practice
- * OM reads the live turn from the in-memory map, so this is defensive.
+ * The turn is stashed in the request-local processor-state map as a live `ObservationTurn`.
+ * Processor state is deliberately excluded from workflow snapshots, but a caller can still hand
+ * this code a serialized projection. Calling `.end()` on that projection would throw a synchronous
+ * TypeError the surrounding `.catch()` could not trap. Only treat a value with a callable `end()`
+ * as a turn, so OM falls through to creating a fresh one.
  */
 function asLiveTurn(value: unknown): ObservationTurn | undefined {
   return value && typeof (value as ObservationTurn).end === 'function' ? (value as ObservationTurn) : undefined;
@@ -29,7 +35,7 @@ function asLiveTurn(value: unknown): ObservationTurn | undefined {
 
 /** Subset of Memory that the processor needs — avoids circular imports. */
 export interface MemoryContextProvider {
-  getContext(opts: { threadId: string; resourceId?: string }): Promise<{
+  getContext(opts: { threadId: string; resourceId?: string; runState?: MemoryRunState }): Promise<{
     systemMessage: string | undefined;
     messages: MastraDBMessage[];
     hasObservations: boolean;
@@ -112,11 +118,36 @@ function injectObservationContextMessages({
   messageList.add(contMsg, 'memory');
 }
 
+/**
+ * Observational memory runs on the processor pipeline, but a user configures
+ * `memory`, not a processor — so its spans are labelled as memory operations
+ * rather than as anonymous pipeline entries.
+ *
+ * The two phases do different things and are named separately: the input step
+ * builds observation context into the system messages (a recall), and the
+ * output result persists what the turn produced (a save).
+ */
+const OM_PHASE_OPERATION: Partial<Record<ProcessorSpanPhase, NonNullable<MemoryOperationAttributes['operationType']>>> =
+  {
+    inputStep: 'recall',
+    output: 'save',
+    outputStep: 'save',
+  };
+
 export class ObservationalMemoryProcessor implements Processor<'observational-memory'> {
   readonly id = 'observational-memory' as const;
   readonly name = 'Observational Memory';
   readonly terminalToolResultPolicy = 'pass-through' as const;
   readonly terminalToolResultPersistence = 'owner' as const;
+
+  readonly spanType = SpanType.MEMORY_OPERATION;
+
+  readonly spanName = (phase: ProcessorSpanPhase): string => `memory: ${OM_PHASE_OPERATION[phase] ?? 'observational'}`;
+
+  readonly spanAttributes = (phase: ProcessorSpanPhase): Partial<MemoryOperationAttributes> => {
+    const operationType = OM_PHASE_OPERATION[phase];
+    return operationType ? { operationType } : {};
+  };
 
   /** The underlying ObservationalMemory engine. */
   readonly engine: ObservationalMemory;
@@ -176,6 +207,7 @@ export class ObservationalMemoryProcessor implements Processor<'observational-me
 
     const { threadId, resourceId } = context;
     const memoryContext = parseMemoryRequestContext(requestContext);
+    const runState = memoryContext?.runState?.();
     const readOnly = memoryContext?.memoryConfig?.readOnly;
 
     const actorModelContext = model?.modelId
@@ -203,6 +235,7 @@ export class ObservationalMemoryProcessor implements Processor<'observational-me
           messageList,
           threadId,
           resourceId,
+          runState,
         });
         // Pass the record through even without observations — resource-scoped
         // retrieval still injects recall guidance so the actor can browse and
@@ -265,7 +298,7 @@ export class ObservationalMemoryProcessor implements Processor<'observational-me
         this.turn.sendStateSignal = args.sendStateSignal;
         this.turn.agent = args.agent;
         this.turn.requestContext = requestContext;
-        await this.turn.start(this.memory);
+        await this.turn.start(this.memory, runState);
         if (stepNumber === 0 && this.temporalMarkers) {
           await insertTemporalGapMarkers({ messageList, sendSignal: args.sendSignal });
         }
@@ -383,7 +416,10 @@ export class ObservationalMemoryProcessor implements Processor<'observational-me
         // and output processors are separate instances (see comment in processInputStep).
         const turn = asLiveTurn(state.__omTurn) ?? this.turn;
         if (turn) {
-          await turn.end();
+          // Canceled streams materialize their in-flight assistant text on the
+          // outer output MessageList. Finalize from that authoritative list,
+          // which may differ from the one captured by the input-step turn.
+          await turn.end(messageList);
           this.turn = undefined;
           state.__omTurn = undefined;
         } else {

@@ -586,9 +586,74 @@ export function createWorkflowsTests({ storage }: WorkflowsTestOptions) {
       expect(run?.runId).toBe(runId);
     });
 
-    it('should apply an update when the expectedStatus guard matches', async () => {
+    it('should apply an update when every workflow-state guard matches without persisting guards', async () => {
       if (!supportsConcurrentUpdates) {
         console.log('Skipping expectedStatus guard test');
+        return;
+      }
+      const workflowName = 'test-workflow';
+      const runId = `run-${randomUUID()}`;
+      const resourceId = `resource-${randomUUID()}`;
+
+      await workflowsStorage.persistWorkflowSnapshot({
+        workflowName,
+        runId,
+        resourceId,
+        snapshot: {
+          status: 'suspended',
+          context: {},
+          suspendedPaths: { 'step-1': [0] },
+          executionGeneration: 'wfeg:guard-match',
+          // Missing persisted attempts are the first suspension (attempt zero).
+        } as any,
+      });
+
+      const updated = await workflowsStorage.updateWorkflowState({
+        workflowName,
+        runId,
+        opts: {
+          status: 'running',
+          expectedStatus: 'suspended',
+          expectedExecutionGeneration: 'wfeg:guard-match',
+          expectedLifecycleResumeAttempt: 0,
+          lifecycleResumeAttempt: 1,
+        },
+      });
+
+      expect(updated?.status).toBe('running');
+      expect(updated?.lifecycleResumeAttempt).toBe(1);
+      // Guards must never leak into the persisted snapshot.
+      expect(updated).not.toHaveProperty('expectedStatus');
+      expect(updated).not.toHaveProperty('expectedExecutionGeneration');
+      expect(updated).not.toHaveProperty('expectedLifecycleResumeAttempt');
+
+      const persisted = await workflowsStorage.loadWorkflowSnapshot({ workflowName, runId });
+      expect(persisted?.status).toBe('running');
+      expect(persisted).not.toHaveProperty('expectedStatus');
+      expect(persisted).not.toHaveProperty('expectedExecutionGeneration');
+      expect(persisted).not.toHaveProperty('expectedLifecycleResumeAttempt');
+    });
+
+    it.each([
+      {
+        label: 'execution generation',
+        guards: {
+          expectedStatus: 'suspended' as const,
+          expectedExecutionGeneration: 'wfeg:stale',
+          expectedLifecycleResumeAttempt: 1,
+        },
+      },
+      {
+        label: 'resume attempt',
+        guards: {
+          expectedStatus: 'suspended' as const,
+          expectedExecutionGeneration: 'wfeg:current',
+          expectedLifecycleResumeAttempt: 0,
+        },
+      },
+    ])('should not apply an update when the expected $label guard does not match', async ({ guards }) => {
+      if (!supportsConcurrentUpdates) {
+        console.log('Skipping workflow-state guard test');
         return;
       }
       const workflowName = 'test-workflow';
@@ -597,22 +662,81 @@ export function createWorkflowsTests({ storage }: WorkflowsTestOptions) {
       await workflowsStorage.persistWorkflowSnapshot({
         workflowName,
         runId,
-        snapshot: { status: 'suspended', context: {}, suspendedPaths: { 'step-1': [0] } } as any,
+        snapshot: {
+          status: 'suspended',
+          context: {},
+          executionGeneration: 'wfeg:current',
+          lifecycleResumeAttempt: 1,
+        } as any,
       });
 
-      const updated = await workflowsStorage.updateWorkflowState({
+      await expect(
+        workflowsStorage.updateWorkflowState({
+          workflowName,
+          runId,
+          opts: { status: 'running', ...guards },
+        }),
+      ).resolves.toBeUndefined();
+      await expect(workflowsStorage.loadWorkflowSnapshot({ workflowName, runId })).resolves.toMatchObject({
+        status: 'suspended',
+        executionGeneration: 'wfeg:current',
+        lifecycleResumeAttempt: 1,
+      });
+    });
+
+    it('should reject a stale claim after suspended-running-suspended ABA', async () => {
+      if (!supportsConcurrentUpdates) {
+        console.log('Skipping workflow-state ABA guard test');
+        return;
+      }
+      const workflowName = 'test-workflow';
+      const runId = `run-${randomUUID()}`;
+      const resourceId = `resource-${randomUUID()}`;
+      const staleGuards = {
+        expectedStatus: 'suspended' as const,
+        expectedExecutionGeneration: 'wfeg:aba',
+        expectedLifecycleResumeAttempt: 0,
+      };
+
+      await workflowsStorage.persistWorkflowSnapshot({
         workflowName,
         runId,
-        opts: { status: 'running', expectedStatus: 'suspended' },
+        resourceId,
+        snapshot: {
+          status: 'suspended',
+          context: {},
+          executionGeneration: 'wfeg:aba',
+          lifecycleResumeAttempt: 0,
+        } as any,
       });
+      await expect(
+        workflowsStorage.updateWorkflowState({
+          workflowName,
+          runId,
+          opts: { status: 'running', ...staleGuards, lifecycleResumeAttempt: 1, result: { winner: true } },
+        }),
+      ).resolves.toMatchObject({ status: 'running', lifecycleResumeAttempt: 1 });
+      await expect(
+        workflowsStorage.updateWorkflowState({
+          workflowName,
+          runId,
+          opts: { status: 'suspended', lifecycleResumeAttempt: 1 },
+        }),
+      ).resolves.toMatchObject({ status: 'suspended', lifecycleResumeAttempt: 1 });
 
-      expect(updated?.status).toBe('running');
-      // The guard must never leak into the persisted snapshot.
-      expect(updated).not.toHaveProperty('expectedStatus');
-
-      const persisted = await workflowsStorage.loadWorkflowSnapshot({ workflowName, runId });
-      expect(persisted?.status).toBe('running');
-      expect(persisted).not.toHaveProperty('expectedStatus');
+      await expect(
+        workflowsStorage.updateWorkflowState({
+          workflowName,
+          runId,
+          opts: { status: 'running', ...staleGuards, result: { stale: true } },
+        }),
+      ).resolves.toBeUndefined();
+      await expect(workflowsStorage.loadWorkflowSnapshot({ workflowName, runId })).resolves.toMatchObject({
+        status: 'suspended',
+        executionGeneration: 'wfeg:aba',
+        lifecycleResumeAttempt: 1,
+        result: { winner: true },
+      });
     });
 
     it('should not apply an update when the expectedStatus guard does not match', async () => {

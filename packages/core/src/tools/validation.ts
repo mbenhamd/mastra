@@ -5,6 +5,33 @@ import type { PublicSchema, StandardSchemaWithJSON, StandardSchemaIssue } from '
 import { getZodTypeName, isZodArray, isZodObject, unwrapZodType } from '../utils/zod-utils';
 
 /**
+ * A schema implementation threw instead of returning Standard Schema issues.
+ *
+ * Keep the public message deliberately generic: validator exceptions can
+ * interpolate the value being validated, so forwarding their text into tool
+ * spans or logs can disclose arguments or results. The original exception is
+ * intentionally discarded because MastraError serialization recursively emits
+ * causes; retaining it would reintroduce the same disclosure at an API boundary.
+ */
+export class ToolSchemaValidationError extends Error {
+  constructor(message = 'Tool schema validation failed unexpectedly.') {
+    super(message);
+    this.name = 'ToolSchemaValidationError';
+  }
+}
+
+function runSchemaValidationBoundary<T>(operation: () => T): T {
+  try {
+    return operation();
+  } catch {
+    // Conversion, normalization, custom issue objects, JSON-schema access, and
+    // result inspection are all part of the same hostile schema/input
+    // boundary. Never let an exception from any of them carry values outward.
+    throw new ToolSchemaValidationError();
+  }
+}
+
+/**
  * Safely validates data against a Standard Schema.
  * Catches internal Zod errors (like undefined union options) and provides better error messages.
  *
@@ -16,28 +43,44 @@ function safeValidate<T>(
   schema: StandardSchemaWithJSON<T>,
   data: unknown,
 ): { value: T } | { issues: readonly StandardSchemaIssue[] } {
+  let result;
   try {
-    const result = schema['~standard'].validate(data);
-    if (result instanceof Promise) {
-      throw new Error('Your schema is async, which is not supported. Please use a sync schema.');
-    }
-    // Prioritise issues over value: Valibot returns both on failure (typed: false).
-    if ('issues' in result && Array.isArray(result.issues) && result.issues.length > 0) {
-      return { issues: result.issues as readonly StandardSchemaIssue[] };
-    }
-    return result as { value: T } | { issues: readonly StandardSchemaIssue[] };
+    result = schema['~standard'].validate(data);
   } catch (err) {
     // Catch Zod internal errors like "Cannot read properties of undefined (reading 'run')"
     // This happens when a union schema has undefined options
     if (err instanceof TypeError && err.message.includes('Cannot read properties of undefined')) {
-      throw new Error(
+      throw new ToolSchemaValidationError(
         `Schema validation failed due to an invalid schema definition. ` +
           `This often happens when a union schema (z.union or z.or) has undefined options. ` +
-          `Please check that all schema options are properly defined. Original error: ${err.message}`,
+          `Please check that all schema options are properly defined.`,
       );
     }
-    throw err;
+    throw new ToolSchemaValidationError();
   }
+
+  let isPromiseLike = false;
+  try {
+    isPromiseLike =
+      result !== null &&
+      (typeof result === 'object' || typeof result === 'function') &&
+      typeof (result as PromiseLike<unknown>).then === 'function';
+  } catch {
+    throw new ToolSchemaValidationError();
+  }
+  if (isPromiseLike) {
+    // We reject async schemas synchronously, but the validator may already
+    // have returned a rejected promise. Observe it before throwing so its
+    // rejection cannot escape as a process-level unhandledRejection. Resolve
+    // through the current realm so cross-realm promises/thenables are covered.
+    void Promise.resolve(result as PromiseLike<unknown>).catch(() => {});
+    throw new ToolSchemaValidationError('Your schema is async, which is not supported. Please use a sync schema.');
+  }
+  // Prioritise issues over value: Valibot returns both on failure (typed: false).
+  if ('issues' in result && Array.isArray(result.issues) && result.issues.length > 0) {
+    return { issues: result.issues as readonly StandardSchemaIssue[] };
+  }
+  return result as { value: T } | { issues: readonly StandardSchemaIssue[] };
 }
 
 /**
@@ -53,6 +96,21 @@ export interface ValidationError<T = unknown> {
   error: true;
   message: string;
   validationErrors: FormattedValidationErrors<T>;
+}
+
+// Structural ValidationError-shaped values are a valid tool output contract.
+// Track only errors created by this validation module so internal wrappers can
+// report their telemetry as failures without reclassifying author data.
+const toolValidationErrors = new WeakSet<object>();
+
+function markToolValidationError<T>(error: ValidationError<T>): ValidationError<T> {
+  toolValidationErrors.add(error);
+  return error;
+}
+
+/** @internal Provenance check for validation failures created by this module. */
+export function isToolValidationError(value: unknown): value is ValidationError {
+  return value !== null && typeof value === 'object' && toolValidationErrors.has(value);
 }
 
 export function isValidationError(value: unknown): value is ValidationError {
@@ -151,6 +209,14 @@ export function validateToolSuspendData<T = unknown>(
   suspendData: unknown,
   toolId?: string,
 ): { data: T; error?: undefined } | { data?: undefined; error: ValidationError<T> } {
+  return runSchemaValidationBoundary(() => validateToolSuspendDataUnsafe(schema, suspendData, toolId));
+}
+
+function validateToolSuspendDataUnsafe<T = unknown>(
+  schema: StandardSchemaWithJSON<T> | undefined,
+  suspendData: unknown,
+  toolId?: string,
+): { data: T; error?: undefined } | { data?: undefined; error: ValidationError<T> } {
   // If no schema, or schema is not a Standard Schema, return suspend data as-is
   if (!schema || !('~standard' in schema)) {
     return { data: suspendData as T };
@@ -168,11 +234,11 @@ export function validateToolSuspendData<T = unknown>(
     .map(e => `- ${e.path?.map(p => getPathKey(p)).join('.') || 'root'}: ${e.message}`)
     .join('\n');
 
-  const error: ValidationError<T> = {
+  const error = markToolValidationError<T>({
     error: true,
     message: `Tool suspension data validation failed${toolId ? ` for ${toolId}` : ''}. Please fix the following errors and try again:\n${errorMessages}\n\nProvided arguments: ${truncateForLogging(suspendData)}`,
     validationErrors: buildFormattedErrors<T>(validation.issues),
-  };
+  });
 
   return { error };
 }
@@ -453,6 +519,14 @@ export function validateToolInput<T = unknown>(
   input: unknown,
   toolId?: string,
 ): { data: T; error?: undefined } | { data?: undefined; error: ValidationError<T> } {
+  return runSchemaValidationBoundary(() => validateToolInputUnsafe(schema, input, toolId));
+}
+
+function validateToolInputUnsafe<T = unknown>(
+  schema: StandardSchemaWithJSON<T> | undefined,
+  input: unknown,
+  toolId?: string,
+): { data: T; error?: undefined } | { data?: undefined; error: ValidationError<T> } {
   // If no schema, or schema is not a Standard Schema (e.g. plain JSON Schema from Vercel tools),
   // return input as-is. Only validate when we have a proper Standard Schema with ~standard.validate.
   if (!schema || !('~standard' in schema)) {
@@ -571,11 +645,11 @@ export function validateToolInput<T = unknown>(
     .map(e => `- ${e.path?.map(p => getPathKey(p)).join('.') || 'root'}: ${e.message}`)
     .join('\n');
 
-  const error: ValidationError<T> = {
+  const error = markToolValidationError<T>({
     error: true,
     message: `Tool input validation failed${toolId ? ` for ${toolId}` : ''}. Please fix the following errors and try again:\n${errorMessages}\n\nProvided arguments: ${truncateForLogging(input)}`,
     validationErrors: buildFormattedErrors<T>(validation.issues),
-  };
+  });
 
   return { error };
 }
@@ -589,6 +663,15 @@ export function validateToolInput<T = unknown>(
  * @returns The validated data or a validation error
  */
 export function validateToolOutput<T = unknown>(
+  schema: StandardSchemaWithJSON<T> | undefined,
+  output: unknown,
+  toolId?: string,
+  suspendCalled?: boolean,
+): { data: T; error?: undefined } | { data?: undefined; error: ValidationError<T> } {
+  return runSchemaValidationBoundary(() => validateToolOutputUnsafe(schema, output, toolId, suspendCalled));
+}
+
+function validateToolOutputUnsafe<T = unknown>(
   schema: StandardSchemaWithJSON<T> | undefined,
   output: unknown,
   toolId?: string,
@@ -611,11 +694,11 @@ export function validateToolOutput<T = unknown>(
     .map(e => `- ${e.path?.map(p => getPathKey(p)).join('.') || 'root'}: ${e.message}`)
     .join('\n');
 
-  const error: ValidationError<T> = {
+  const error = markToolValidationError<T>({
     error: true,
     message: `Tool output validation failed${toolId ? ` for ${toolId}` : ''}. The tool returned invalid output:\n${errorMessages}\n\nReturned output: ${truncateForLogging(output)}`,
     validationErrors: buildFormattedErrors<T>(validation.issues),
-  };
+  });
 
   return { error };
 }
@@ -666,6 +749,14 @@ export function validateRequestContext<T = any>(
   requestContext: RequestContext | undefined,
   identifier?: string,
 ): { data: T | Record<string, any>; error?: ValidationError<T> } {
+  return runSchemaValidationBoundary(() => validateRequestContextUnsafe(schema, requestContext, identifier));
+}
+
+function validateRequestContextUnsafe<T = any>(
+  schema: PublicSchema<T> | undefined,
+  requestContext: RequestContext | undefined,
+  identifier?: string,
+): { data: T | Record<string, any>; error?: ValidationError<T> } {
   // If no schema, return request context values as-is
   if (!schema) {
     return { data: getRequestContextInputValues(requestContext) as T };
@@ -677,14 +768,12 @@ export function validateRequestContext<T = any>(
   // Convert PublicSchema to StandardSchemaWithJSON for validation
   const standardSchema = toStandardSchema(schema);
 
-  // Validate using standard schema interface
-  const validation = standardSchema['~standard'].validate(contextValues);
+  // Use the same guarded path as tool input/output validation. A custom
+  // Standard Schema can throw values from the context or return an already
+  // rejected promise; neither may escape into logs or process-level handlers.
+  const validation = safeValidate(standardSchema, contextValues);
 
-  if (validation instanceof Promise) {
-    throw new Error('Your schema is async, which is not supported. Please use a sync schema.');
-  }
-
-  if ('value' in validation) {
+  if (!('issues' in validation)) {
     return { data: validation.value };
   }
 
@@ -696,11 +785,11 @@ export function validateRequestContext<T = any>(
   // Redact sensitive keys before including in error message
   const redactedContext = redactSensitiveKeys(contextValues);
 
-  const error: ValidationError<T> = {
+  const error = markToolValidationError<T>({
     error: true,
     message: `Request context validation failed${identifier ? ` for ${identifier}` : ''}. Please fix the following errors and try again:\n${errorMessages}\n\nProvided request context: ${truncateForLogging(redactedContext)}`,
     validationErrors: buildFormattedErrors<T>(validation.issues),
-  };
+  });
 
   return { data: contextValues as T, error };
 }

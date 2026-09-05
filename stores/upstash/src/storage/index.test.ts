@@ -383,7 +383,6 @@ describe('WorkflowsUpstash.persistWorkflowSnapshot', () => {
     await workflowsDomain.persistWorkflowSnapshot({
       workflowName,
       runId,
-      resourceId,
       snapshot: createWorkflowSnapshot(runId, 'success'),
       updatedAt,
     });
@@ -402,5 +401,31 @@ describe('WorkflowsUpstash.persistWorkflowSnapshot', () => {
       workflowsDomain.loadWorkflowSnapshot({ namespace: 'workflows', workflowName, runId }),
     ).resolves.toBeNull();
     await expect(workflowsDomain.getWorkflowRunById({ runId, workflowName })).resolves.toBeNull();
+  });
+
+  it('does not treat an explicitly empty expected execution generation as an omitted guard', async () => {
+    const workflowsDomain = new WorkflowsUpstash({ client: createTestClient() });
+    const workflowName = `workflow-${randomUUID()}`;
+    const runId = `run-${randomUUID()}`;
+
+    await workflowsDomain.persistWorkflowSnapshot({
+      workflowName,
+      runId,
+      snapshot: {
+        ...createWorkflowSnapshot(runId, 'suspended'),
+        executionGeneration: 'current-generation',
+      },
+    });
+
+    await expect(
+      workflowsDomain.updateWorkflowState({
+        workflowName,
+        runId,
+        opts: { status: 'running', expectedExecutionGeneration: '' },
+      }),
+    ).resolves.toBeUndefined();
+    await expect(
+      workflowsDomain.loadWorkflowSnapshot({ namespace: 'workflows', workflowName, runId }),
+    ).resolves.toMatchObject({ status: 'suspended', executionGeneration: 'current-generation' });
   });
 });

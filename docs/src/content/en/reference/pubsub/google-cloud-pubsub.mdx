@@ -1,6 +1,6 @@
 ---
 title: "Reference: GoogleCloudPubSub | PubSub"
-description: API reference for GoogleCloudPubSub, the Google Cloud Pub/Sub implementation for distributed event delivery.
+description: "Configure GoogleCloudPubSub to deliver Mastra events through Google Cloud Pub/Sub topics and subscriptions in distributed deployments."
 packages:
   - "@mastra/core"
   - "@mastra/google-cloud-pubsub"
@@ -91,4 +91,4 @@ await pubsub.destroy('workflow.events')
 
 Each delivered event includes `ack` and `nack` functions. Call `ack` after successful processing to remove the event from the subscription. When neither is called, Google Cloud redelivers the event after its acknowledgment deadline expires. Mastra forwards Google Cloud's message ID and `deliveryAttempt`.
 
-Google Cloud reports a positive delivery attempt only when the subscription has a correctly configured dead-letter policy and the required IAM permissions. Without that policy it reports `0`, which Mastra treats as an untracked first delivery. Configure dead lettering on the shared workflow subscription when the retry budget must survive worker rotation or process restart; Google documents the count as approximate and notes that it can reset.
+Google Cloud reports a positive delivery attempt only when the subscription has a correctly configured dead-letter policy and the required IAM permissions. Without that policy it reports `0`, which Mastra treats as an untracked first delivery. Configure dead lettering on the shared workflow subscription when the retry budget must survive worker rotation or process restart. Google documents the count as approximate and notes that it can reset.

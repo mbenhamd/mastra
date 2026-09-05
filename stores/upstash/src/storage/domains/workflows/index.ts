@@ -275,6 +275,9 @@ export class WorkflowsUpstash extends WorkflowsStorage {
         local optsJson = ARGV[1]
         local now = ARGV[2]
         local expectedStatusJson = ARGV[3]
+        local hasExpectedGeneration = ARGV[4]
+        local expectedGeneration = ARGV[5]
+        local expectedAttempt = ARGV[6]
 
         -- Get existing data
         local existing = redis.call('GET', key)
@@ -308,6 +311,16 @@ export class WorkflowsUpstash extends WorkflowsStorage {
             return nil
           end
         end
+        if hasExpectedGeneration == '1' and snapshot.executionGeneration ~= expectedGeneration then
+          return nil
+        end
+        if expectedAttempt ~= '' then
+          local currentAttempt = snapshot.lifecycleResumeAttempt
+          if currentAttempt == nil then currentAttempt = 0 end
+          if currentAttempt ~= tonumber(expectedAttempt) then
+            return nil
+          end
+        end
 
         -- Merge the new options with the existing snapshot
         local opts = cjson.decode(optsJson)
@@ -326,13 +339,24 @@ export class WorkflowsUpstash extends WorkflowsStorage {
         return cjson.encode(data)
       `;
 
-      const { expectedStatus, ...state } = opts;
+      const { expectedStatus, expectedExecutionGeneration, expectedLifecycleResumeAttempt, ...state } = opts;
       const expectedStatusJson =
         expectedStatus === undefined
           ? ''
           : JSON.stringify(Array.isArray(expectedStatus) ? expectedStatus : [expectedStatus]);
 
-      const resultJson = await this.client.eval(luaScript, [key], [JSON.stringify(state), now, expectedStatusJson]);
+      const resultJson = await this.client.eval(
+        luaScript,
+        [key],
+        [
+          JSON.stringify(state),
+          now,
+          expectedStatusJson,
+          expectedExecutionGeneration === undefined ? '0' : '1',
+          expectedExecutionGeneration ?? '',
+          expectedLifecycleResumeAttempt === undefined ? '' : String(expectedLifecycleResumeAttempt),
+        ],
+      );
 
       if (!resultJson) {
         return undefined;
@@ -378,7 +402,6 @@ export class WorkflowsUpstash extends WorkflowsStorage {
         namespace,
         workflow_name: workflowName,
         run_id: runId,
-        ...(resourceId ? { resourceId } : {}),
       });
 
       const record = {
@@ -399,6 +422,9 @@ export class WorkflowsUpstash extends WorkflowsStorage {
           local current = cjson.decode(existing)
           if current["createdAt"] then
             next["createdAt"] = current["createdAt"]
+          end
+          if next["resourceId"] == nil and current["resourceId"] then
+            next["resourceId"] = current["resourceId"]
           end
         end
         redis.call("SET", KEYS[1], cjson.encode(next))
@@ -481,12 +507,10 @@ export class WorkflowsUpstash extends WorkflowsStorage {
 
   async deleteWorkflowRunById({ runId, workflowName }: { runId: string; workflowName: string }): Promise<void> {
     try {
-      const record = await this.getWorkflowRunRecord({ namespace: 'workflows', runId, workflowName });
       const key = getKey(TABLE_WORKFLOW_SNAPSHOT, {
         namespace: 'workflows',
         workflow_name: workflowName,
         run_id: runId,
-        ...(record?.resourceId ? { resourceId: record.resourceId } : {}),
       });
       await this.client.del(key);
     } catch (error) {

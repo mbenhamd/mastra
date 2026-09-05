@@ -23,6 +23,7 @@ import {
   SpanType,
   createObservabilityContext,
   getOrCreateSpan,
+  getRootExportSpan,
   resolveObservabilityContext,
 } from '../../observability';
 import type { ObservabilityContext, TracingContext, TracingPolicy } from '../../observability';
@@ -36,6 +37,12 @@ import {
 } from '../../processors';
 import type { OutputResult, Processor, ProcessorStreamWriter } from '../../processors';
 import { copyProcessorWorkflowTraits } from '../../processors/is-processor-workflow';
+import {
+  resolveProcessorSpanAttributes,
+  resolveProcessorSpanName,
+  resolveProcessorSpanType,
+  toProcessorSpanPhase,
+} from '../../processors/span-declaration';
 import {
   summarizeActiveToolsForSpan,
   summarizeProcessorModelForSpan,
@@ -87,6 +94,7 @@ import type { WorkflowScheduleConfig } from '../scheduler/types';
 import { getEntryId } from '../step-entry';
 import { forwardAgentStreamChunk } from '../stream-utils';
 import type { StreamChunkWriter } from '../stream-utils';
+import { waitForSuspendedSnapshot } from '../utils';
 import { Workflow, Run } from '../workflow';
 import type { AgentStepOptions, RunWithRawInput } from '../workflow';
 import { watchWorkflowLifecycleEvents } from '../workflow-lifecycle';
@@ -1039,21 +1047,29 @@ function createStepFromProcessor<TProcessorId extends string>(
       // - For input/outputResult: find AGENT_RUN (processor runs once at start/end)
       // - For inputStep/outputStep/toolResult: find MODEL_STEP (processor runs per LLM call / tool round-trip)
       // When workflow is executed, currentSpan is WORKFLOW_STEP, so we walk up the parent chain
+      // Fall back to currentSpan only when its tree can reach exporters — otherwise
+      // the public processor span would export as an orphan trace root.
+      const fallbackSpan = currentSpan && getRootExportSpan(currentSpan) ? currentSpan : undefined;
       const parentSpan =
         phase === 'inputStep' || phase === 'outputStep' || phase === 'toolResult'
-          ? currentSpan?.findParent(SpanType.MODEL_STEP) || currentSpan
-          : currentSpan?.findParent(SpanType.AGENT_RUN) || currentSpan;
+          ? currentSpan?.findParent(SpanType.MODEL_STEP) || fallbackSpan
+          : currentSpan?.findParent(SpanType.AGENT_RUN) || fallbackSpan;
 
       const processorSpan =
         phase !== 'outputStream'
           ? parentSpan?.createChildSpan({
-              type: SpanType.PROCESSOR_RUN,
-              name: `${getSpanNamePrefix(phase)}: ${processor.id}`,
+              type: resolveProcessorSpanType(processor) ?? SpanType.PROCESSOR_RUN,
+              name: resolveProcessorSpanName(
+                processor,
+                toProcessorSpanPhase(phase),
+                `${getSpanNamePrefix(phase)}: ${processor.id}`,
+              ),
               entityType: getProcessorEntityType(phase),
               entityId: processor.id,
               entityName: processor.name ?? processor.id,
               input: buildProcessorSpanInput(),
               attributes: {
+                ...resolveProcessorSpanAttributes(processor, toProcessorSpanPhase(phase)),
                 processorExecutor: 'workflow',
                 // Read processorIndex from processor (set in combineProcessorsIntoWorkflow)
                 processorIndex: processor.processorIndex,
@@ -1069,6 +1085,7 @@ function createStepFromProcessor<TProcessorId extends string>(
       // If processorStates map is provided (from ProcessorRunner), use it to get this processor's state
       // Otherwise fall back to the state passed in inputData
       let processorState: Record<string, unknown>;
+      let processorRuntimeState: ProcessorState | undefined;
       if (processorStates) {
         // Get or create the ProcessorState for this processor
         let ps = processorStates.get(processor.id);
@@ -1076,6 +1093,7 @@ function createStepFromProcessor<TProcessorId extends string>(
           ps = new ProcessorState();
           processorStates.set(processor.id, ps);
         }
+        processorRuntimeState = ps;
         processorState = ps.customState;
       } else {
         processorState = state ?? {};
@@ -1169,7 +1187,17 @@ function createStepFromProcessor<TProcessorId extends string>(
         } catch (error) {
           // TripWire errors should end span but bubble up to halt the workflow
           if (error instanceof TripWire) {
-            processorSpan?.end({ output: { tripwire: error.message } });
+            processorSpan?.error({
+              error,
+              endSpan: true,
+              attributes: {
+                tripwireAbort: {
+                  reason: error.message,
+                  retry: error.options?.retry,
+                  metadata: error.options?.metadata,
+                },
+              },
+            });
           } else {
             processorSpan?.error({ error: error as Error, endSpan: true });
           }
@@ -1317,30 +1345,26 @@ function createStepFromProcessor<TProcessorId extends string>(
 
           case 'outputStream': {
             if (processor.processOutputStream && part) {
-              // Manage per-processor span lifecycle across stream chunks
-              // Use unique key to store span on shared state object
-              const spanKey = `__outputStreamSpan_${processor.id}`;
               // Use processorState (from the shared processorStates Map) so state persists
               // across processOutputStream and processOutputResult calls
               const mutableState = processorState;
-              let processorSpan = mutableState[spanKey] as
-                | ReturnType<NonNullable<typeof parentSpan>['createChildSpan']>
-                | undefined;
+              let processorSpan = processorRuntimeState?.getWorkflowOutputStreamSpan(processor.id);
 
               if (!processorSpan && parentSpan) {
                 // First chunk - create span for this processor
                 processorSpan = parentSpan.createChildSpan({
-                  type: SpanType.PROCESSOR_RUN,
-                  name: `output stream processor: ${processor.id}`,
+                  type: resolveProcessorSpanType(processor) ?? SpanType.PROCESSOR_RUN,
+                  name: resolveProcessorSpanName(processor, 'output', `output stream processor: ${processor.id}`),
                   entityType: EntityType.OUTPUT_PROCESSOR,
                   entityId: processor.id,
                   entityName: processor.name ?? processor.id,
                   attributes: {
+                    ...resolveProcessorSpanAttributes(processor, 'output'),
                     processorExecutor: 'workflow',
                     processorIndex: processor.processorIndex,
                   },
                 });
-                mutableState[spanKey] = processorSpan;
+                processorRuntimeState?.setWorkflowOutputStreamSpan(processor.id, processorSpan);
               }
 
               // Create observability context with processor span for internal agent calls
@@ -1361,19 +1385,49 @@ function createStepFromProcessor<TProcessorId extends string>(
                   messageList: passThrough.messageList, // Optional for stream processing
                 });
 
-                // End span on finish chunk
-                if (part && (part as ChunkType).type === 'finish') {
-                  processorSpan?.end({ output: { totalChunks: (streamParts ?? []).length } });
-                  delete mutableState[spanKey];
+                // Shared runtime state owns a span across chunks. Without it,
+                // this invocation owns the span and must end it directly.
+                if (processorRuntimeState) {
+                  if (part && (part as ChunkType).type === 'finish') {
+                    processorRuntimeState.endWorkflowOutputStreamSpan(processor.id, {
+                      output: { totalChunks: (streamParts ?? []).length },
+                    });
+                  }
+                } else {
+                  processorSpan?.end({
+                    output: { totalChunks: (streamParts ?? []).length },
+                  });
                 }
               } catch (error) {
                 // End span with error and clean up state
                 if (error instanceof TripWire) {
-                  processorSpan?.end({ output: { tripwire: error.message } });
+                  const spanError = {
+                    error,
+                    endSpan: true,
+                    attributes: {
+                      tripwireAbort: {
+                        reason: error.message,
+                        retry: error.options?.retry,
+                        metadata: error.options?.metadata,
+                      },
+                    },
+                  };
+                  if (processorRuntimeState) {
+                    processorRuntimeState.errorWorkflowOutputStreamSpan(processor.id, spanError);
+                  } else {
+                    processorSpan?.error(spanError);
+                  }
                 } else {
-                  processorSpan?.error({ error: error as Error, endSpan: true });
+                  const spanError = {
+                    error: error as Error,
+                    endSpan: true,
+                  };
+                  if (processorRuntimeState) {
+                    processorRuntimeState.errorWorkflowOutputStreamSpan(processor.id, spanError);
+                  } else {
+                    processorSpan?.error(spanError);
+                  }
                 }
-                delete mutableState[spanKey];
                 throw error;
               }
 
@@ -2101,6 +2155,7 @@ export class EventedRun<
       requestContext,
       mastra: this.mastra,
     });
+    this.workflowRunSpan = workflowSpan;
     if (workflowSpan) {
       this.mastra?.__registerRunTracingContext(this.runId, { currentSpan: workflowSpan });
     }
@@ -2501,10 +2556,7 @@ export class EventedRun<
     if (!workflowsStore) {
       throw new Error('Cannot resume workflow: workflows store is required');
     }
-    const snapshot = await workflowsStore.loadWorkflowSnapshot({
-      workflowName: this.workflowId,
-      runId: this.runId,
-    });
+    const snapshot = await waitForSuspendedSnapshot(workflowsStore, this.workflowId, this.runId);
     if (!snapshot) {
       throw new Error(`Cannot resume workflow: no snapshot found for runId ${this.runId}`);
     }
@@ -2836,6 +2888,10 @@ export class EventedRun<
         },
       });
     }
+
+    // End the whole span tree now: a step that ignores abortSignal keeps running, so the
+    // execution engine may never unwind and no span in the tree would otherwise be ended.
+    this.workflowRunSpan?.endTree({ attributes: { status: 'canceled' } });
 
     // Trigger abort signal - the abort handler will publish the workflow.cancel event
     // This ensures consistent behavior whether cancel() or abort() is called
