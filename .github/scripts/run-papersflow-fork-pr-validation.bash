@@ -155,14 +155,14 @@ verify_pf3553_reviewed_surface() (
 
 pf3759_config() {
   PF3759_HEAD_REPOSITORY="${PAPERSFLOW_PF3759_HEAD_REPOSITORY:-mbenhamd/mastra}"
-  PF3759_HEAD_REF="${PAPERSFLOW_PF3759_HEAD_REF:-feature/pf-3759-mastra-upstream-sync-3cf8e685-r2}"
+  PF3759_HEAD_REF="${PAPERSFLOW_PF3759_HEAD_REF:-feature/pf-3759-mastra-upstream-sync-3cf8e685-r3}"
   PF3759_BASE_REF="${PAPERSFLOW_PF3759_BASE_REF:-main}"
   PF3759_PENDING_MERGE_COMMIT='PENDING_PF3759_MERGE_COMMIT'
   PF3759_PENDING_REVIEWED_TREE='PENDING_PF3759_REVIEWED_TREE'
-  PF3759_MERGE_COMMIT="${PAPERSFLOW_PF3759_MERGE_COMMIT:-f9c6e022d80bcad045e2eb421d6443a91f81204b}"
+  PF3759_MERGE_COMMIT="${PAPERSFLOW_PF3759_MERGE_COMMIT:-be11240bd6fe4d9d8116d51414fad6e9a9381f57}"
   PF3759_FORK_PARENT="${PAPERSFLOW_PF3759_FORK_PARENT:-ef6dab0a7183bb403918f4a63738987146935a00}"
   PF3759_UPSTREAM_PARENT="${PAPERSFLOW_PF3759_UPSTREAM_PARENT:-3cf8e68555e212f3465c5cbf12516e87709f7f5d}"
-  PF3759_REVIEWED_TREE="${PAPERSFLOW_PF3759_REVIEWED_TREE:-65a120f4ff107c97920ede2f03ba6e1a664c0b3b}"
+  PF3759_REVIEWED_TREE="${PAPERSFLOW_PF3759_REVIEWED_TREE:-dfe1cbe8fceab9d2b28ba4c3af378dca9018870f}"
   readonly \
     PF3759_HEAD_REPOSITORY PF3759_HEAD_REF PF3759_BASE_REF PF3759_MERGE_COMMIT \
     PF3759_FORK_PARENT PF3759_UPSTREAM_PARENT PF3759_REVIEWED_TREE \
@@ -2587,7 +2587,7 @@ run_pf3759_admission_self_tests() (
         GITHUB_OUTPUT= \
         BASE_SHA="$protected_base" HEAD_SHA="$fixture_head" PR_NUMBER=999 \
         HEAD_REPOSITORY=mbenhamd/mastra \
-        HEAD_REF=feature/pf-3759-mastra-upstream-sync-3cf8e685-r2 \
+        HEAD_REF=feature/pf-3759-mastra-upstream-sync-3cf8e685-r3 \
         BASE_REF=main \
         PAPERSFLOW_PF3759_MERGE_COMMIT="$reviewed_head" \
         PAPERSFLOW_PF3759_FORK_PARENT="$fork_parent" \
@@ -8368,6 +8368,57 @@ TEST
   trap - EXIT
 )
 
+check_pf3759_reconciled_whitespace() (
+  local merge_base_sha="${1:?merge base is required}"
+  local path
+  local -a checked_paths=(.)
+  pf3759_config
+
+  # These 31 files contain upstream whitespace, including an expected-output
+  # literal. Exclude only their exact upstream blobs, never fork-edited content.
+  while IFS= read -r path; do
+    if ! git_regular_file_at_revision "$HEAD_SHA" "$path" ||
+      [[ "$(git rev-parse "$HEAD_SHA:$path")" != "$(git rev-parse "$PF3759_UPSTREAM_PARENT:$path")" ]]; then
+      echo "PF-3759 whitespace baseline differs from the pinned upstream blob: $path" >&2
+      return 1
+    fi
+    checked_paths+=(":(exclude,literal)$path")
+  done <<'EOF'
+docs/src/content/en/models/gateways/merge-gateway.mdx
+docs/src/content/en/models/gateways/netlify.mdx
+docs/src/content/en/models/providers/above.mdx
+docs/src/content/en/models/providers/agnes.mdx
+docs/src/content/en/models/providers/aixy.mdx
+docs/src/content/en/models/providers/alibaba-cn.mdx
+docs/src/content/en/models/providers/alibaba.mdx
+docs/src/content/en/models/providers/bothub.mdx
+docs/src/content/en/models/providers/friendli.mdx
+docs/src/content/en/models/providers/iteracompute.mdx
+docs/src/content/en/models/providers/klokintegration.mdx
+docs/src/content/en/models/providers/llmtech.mdx
+docs/src/content/en/models/providers/meta.mdx
+docs/src/content/en/models/providers/modal.mdx
+docs/src/content/en/models/providers/nan.mdx
+docs/src/content/en/models/providers/nebius.mdx
+docs/src/content/en/models/providers/neosmith.mdx
+docs/src/content/en/models/providers/neuralwatt.mdx
+docs/src/content/en/models/providers/ollama-cloud.mdx
+docs/src/content/en/models/providers/openreason.mdx
+docs/src/content/en/models/providers/opper.mdx
+docs/src/content/en/models/providers/pendra.mdx
+docs/src/content/en/models/providers/regolo-ai.mdx
+docs/src/content/en/models/providers/sensenova.mdx
+docs/src/content/en/models/providers/standardcompute.mdx
+docs/src/content/en/models/providers/tokengo.mdx
+docs/src/content/en/models/providers/tokenrouter.mdx
+docs/src/content/en/models/providers/vancine.mdx
+docs/src/content/en/models/providers/volcengine-coding-plan.mdx
+docs/src/content/en/models/providers/volcengine.mdx
+packages/evals/src/vitest/reporter.test.ts
+EOF
+  git diff --check "${merge_base_sha}..${HEAD_SHA}" -- "${checked_paths[@]}"
+)
+
 run_upstream_sync_validation() {
   local expected_lane="${1:?validation lane is required}"
   local issue_key="${2:?issue key is required}"
@@ -8385,7 +8436,11 @@ run_upstream_sync_validation() {
   rm -f "$admission_output"
 
   merge_base_sha="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
-  git diff --check "${merge_base_sha}..${HEAD_SHA}"
+  if [[ "$expected_lane" == pf3759-upstream-sync ]]; then
+    check_pf3759_reconciled_whitespace "$merge_base_sha"
+  else
+    git diff --check "${merge_base_sha}..${HEAD_SHA}"
+  fi
 
   # The upstream AgentController surface is additive. These Harness v1 paths
   # are the fork-owned compatibility boundary and must remain real tracked
@@ -8437,7 +8492,11 @@ EOF
   run_with_validation_budget 600 pnpm --filter mastracode --fail-if-no-match lint
   run_with_validation_budget 600 pnpm --filter @mastra/slack --fail-if-no-match typecheck
   run_with_validation_budget 600 pnpm --filter @mastra/vercel --fail-if-no-match lint
-  run_with_validation_budget 600 pnpm --filter @mastra/server --fail-if-no-match check:core-imports
+  if [[ "$expected_lane" == pf3759-upstream-sync ]]; then
+    run_with_validation_budget 600 pnpm run check:core-imports packages/server
+  else
+    run_with_validation_budget 600 pnpm --filter @mastra/server --fail-if-no-match check:core-imports
+  fi
   run_with_validation_budget 600 pnpm --filter @mastra/server --fail-if-no-match check:permissions
   run_with_validation_budget 600 pnpm --filter @mastra/server --fail-if-no-match generate:route-types
   run_with_validation_budget 600 pnpm --filter @mastra/server --fail-if-no-match generate:api-cli-route-metadata
@@ -8489,7 +8548,7 @@ run_pf2009_upstream_sync_validation() {
 run_pf3759_upstream_sync_validation() {
   run_upstream_sync_validation pf3759-upstream-sync PF-3759
 
-  echo 'Validating the complete PF-3759 reconciled workspace and durable-runtime boundaries.'
+  echo 'Building/linting the PF-3759 workspace and testing the selected reconciliation boundaries.'
   run_with_validation_budget 1200 pnpm run build
   run_with_validation_budget 900 pnpm run lint
   run_with_validation_budget 900 \
@@ -8499,7 +8558,33 @@ run_pf3759_upstream_sync_validation() {
       src/agent/durable/run-registry.test.ts \
       src/agent/durable/workflows/steps/signal-drain.test.ts \
       src/agent/durable/workflows/steps/tool-approval-recall.test.ts \
-      src/events/caching-pubsub.test.ts
+      src/events/caching-pubsub.test.ts \
+      src/agent/durable/workflows/steps/tool-call-approval-context.test.ts \
+      src/agent/durable/utils/resolve-runtime-approval.test.ts \
+      src/tools/approval.test.ts \
+      src/stream/base/output.test.ts \
+      src/storage/domains/workflows/inmemory-persist.test.ts \
+      src/storage/types.test.ts
+  run_with_validation_budget 600 \
+    pnpm --dir packages/memory exec vitest run --reporter=dot \
+      src/processors/observational-memory/__tests__/sync-end-of-turn-observation.test.ts
+  run_with_validation_budget 600 \
+    pnpm --dir workspaces/platform-workspace exec vitest run --reporter=dot \
+      src/sandbox.test.ts src/provider.test.ts src/template-compatibility.test.ts
+  run_with_validation_budget 600 \
+    pnpm --dir stores/valkey exec vitest run --reporter=dot src/index.test.ts
+  run_with_validation_budget 600 \
+    pnpm --dir packages/server exec vitest run --reporter=dot \
+      src/server/schemas/dynamic-workflows.test.ts src/server/handlers/dynamic-workflows.test.ts
+  run_with_validation_budget 600 \
+    pnpm --dir stores/libsql exec vitest run --reporter=dot \
+      src/storage/domains/workflows/atomic-resume.test.ts src/storage/index.test.ts \
+      -t 'atomic.*resume|workflow-state guard|expected .* guard does not match|stale claim after suspended'
+  run_with_validation_budget 600 \
+    env POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=5434 \
+      pnpm --dir stores/pg exec vitest run --reporter=dot \
+        src/storage/domains/workflows/atomic-resume.test.ts src/storage/index.test.ts \
+        -t 'atomic.*resume|workflow-state guard|expected .* guard does not match|stale claim after suspended'
   run_with_validation_budget 900 \
     pnpm --dir workflows/inngest exec vitest run --no-isolate --reporter=dot \
       src/__tests__/create-inngest-agent.test.ts \
@@ -8511,7 +8596,7 @@ run_pf3759_upstream_sync_validation() {
       src/connection-and-cleanup.test.ts \
       src/pubsub-ack-audit.test.ts
 
-  echo 'PF-3759 complete workspace and durable-runtime validation passed.'
+  echo 'PF-3759 workspace build/lint and selected reconciliation validation passed.'
 }
 
 run_pf3375_upstream_sync_validation() {
