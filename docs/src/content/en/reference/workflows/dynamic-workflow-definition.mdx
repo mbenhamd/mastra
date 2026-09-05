@@ -1,6 +1,6 @@
 ---
 title: "Reference: Dynamic workflow definition | Workflows"
-description: "Reference for the JSON definition format used to persist and register dynamic workflows."
+description: "A dynamic workflow definition is a JSON-compatible DynamicWorkflowGraph accepted by Mastra.addDynamicWorkflow(), the stored-workflow server routes, and the Client SDK workflows API."
 packages:
   - "@mastra/core"
 ---
@@ -28,9 +28,12 @@ See [Dynamic workflows](/docs/workflows/dynamic-workflows) for a complete setup 
 | `stateSchema` | `JsonSchema` | No | JSON Schema for shared workflow state |
 | `requestContextSchema` | `JsonSchema` | No | JSON Schema for values read from the request context |
 | `metadata` | `Record<string, unknown>` | No | Arbitrary JSON metadata preserved through storage |
+| `schedule` | `WorkflowScheduleConfig \| WorkflowScheduleConfig[]` | No | Declarative schedule configuration preserved through storage and restored at boot |
 | `graph` | `SerializedStepFlowEntry[]` | Yes | Step entries that make up the workflow |
 
 Schemas use JSON Schema rather than Zod so the definition can round-trip through JSON. Mastra converts each schema to Zod when it registers the workflow.
+
+A definition with `schedule` is rehydrated on the evented workflow engine. Scheduled execution therefore requires a storage adapter that supports concurrent workflow updates, plus the schedules storage domain. Replacing a definition also synchronizes its declarative schedules after the definition is persisted.
 
 ```json
 {
@@ -139,6 +142,31 @@ Entries in the `graph` run in order. Each entry receives the previous entry's ou
 
 Code-defined workflows that use [`.agent()`](/reference/workflows/workflow-methods/agent) and [`.tool()`](/reference/workflows/workflow-methods/tool) produce the same declarative entries when serialized.
 
+### Identity and display fields
+
+Control-flow entries accept optional fields that identify and describe the entry without affecting execution:
+
+| Field | Type | Description |
+| - | - | - |
+| `id` | `string` | Stable identity for addressing the entry across edits and serialization. Optional on `parallel`, `conditional`, `foreach`, and `loop`; required on `mapping`, `sleep`, and `sleepUntil`. |
+| `description` | `string` | Human-readable intent of the control-flow operation |
+| `metadata` | `Record<string, unknown>` | Arbitrary JSON metadata preserved through storage, for example a display title for visual editors |
+
+```json
+{
+  "type": "parallel",
+  "id": "independent-enrichment",
+  "description": "Run independent document enrichment tasks concurrently",
+  "metadata": { "title": "Independent enrichment" },
+  "steps": [
+    { "type": "tool", "id": "extract-entities", "toolId": "entity-tool" },
+    { "type": "tool", "id": "classify", "toolId": "classify-tool" }
+  ]
+}
+```
+
+All three fields survive storage and rehydration, and they appear in `serializedStepGraph` for API and Studio consumers. Agent and tool steps carry the equivalent information on their own `description` and `options.metadata` fields.
+
 ### Agent steps
 
 An `agent` entry invokes a registered agent by ID. Agent steps accept `{ prompt: string }` as input and return `{ text: string }` by default.
@@ -185,7 +213,7 @@ Agent entries accept an optional `description` and an `options` object:
 }
 ```
 
-Only `retries` and `metadata` persist. Function-valued options such as `onFinish` and function-valued `toolChoice` are rejected when a code-defined workflow is stored. Other agent call options don't persist.
+Agent options persist when they belong to the serialized subset and contain only JSON-safe values. In addition to `retries` and `metadata`, the subset is `maxSteps`, `toolChoice`, `activeTools`, `modelSettings`, `providerOptions`, `instructions`, `system`, `temperature`, `savePerStep`, `maxProcessorRetries`, `returnScorerData`, `requireToolApproval`, `autoResumeSuspendedTools`, `toolCallConcurrency`, `includeRawChunks`, `toolsetsMode`, `disableBackgroundTasks`, and `versions`. A `structuredOutput.schema` from a code-defined workflow is stored as the entry's `outputSchema`. Function-valued callbacks and every option outside the serialized subset are rejected rather than silently dropped.
 
 ### Tool steps
 

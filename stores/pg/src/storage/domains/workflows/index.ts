@@ -5,7 +5,7 @@ import {
   normalizePerPage,
   TABLE_WORKFLOW_SNAPSHOT,
   TABLE_SCHEMAS,
-  matchesExpectedWorkflowStatus,
+  matchesExpectedWorkflowState,
   WorkflowsStorage,
   applyWorkflowTerminalParentContinuationPatch,
   copyWorkflowTerminalParentContinuationContract,
@@ -146,6 +146,7 @@ import type { DbClient, TxClient } from '../../client';
 import { PgDB, resolvePgConfig, generateIndexSQL, generateTableSQL } from '../../db';
 import type { PgDomainConfig } from '../../db';
 import { buildConstraintName } from '../../db/constraint-utils';
+import { PG_UNSAFE_JSON_UNICODE_ESCAPE_PATTERN, sanitizeJsonForPg } from '../../db/sanitize-json';
 import { getSchemaSnapshot } from '../../db/schema-snapshot';
 import type { SchemaCheckConstraint } from '../../db/schema-snapshot';
 import { runPrune, resolveTargets } from '../../retention';
@@ -236,6 +237,7 @@ function isInvalidLegacyWorkflowSnapshotJsonError(error: unknown): boolean {
   const code = (error as { code?: unknown }).code;
   return code === '22P02' || code === '22P05';
 }
+export { sanitizeJsonForPg };
 
 function getSchemaName(schema?: string) {
   return schema ? `"${schema}"` : '"public"';
@@ -282,31 +284,6 @@ function workflowSnapshotStatusIndexName(schemaName?: string): string {
 function workflowSnapshotStatusIndexSQL(indexName: string, schemaName?: string): string {
   const tableName = getTableName({ indexName: TABLE_WORKFLOW_SNAPSHOT, schemaName: getSchemaName(schemaName) });
   return `CREATE INDEX IF NOT EXISTS "${indexName}" ON ${tableName} (workflow_name, (snapshot ->> 'status'), "createdAt" DESC)`;
-}
-
-const PG_UNSAFE_JSON_UNICODE_ESCAPE_PATTERN = String.raw`(?<!\\)((?:\\\\)*)(?:(\\u[Dd][89AaBb][0-9A-Fa-f]{2}\\u[Dd][CcDdEeFf][0-9A-Fa-f]{2})|\\u(?:0000|[Dd][89A-Fa-f][0-9A-Fa-f]{2}))`;
-const PG_UNSAFE_JSON_UNICODE_ESCAPE_RE = new RegExp(PG_UNSAFE_JSON_UNICODE_ESCAPE_PATTERN, 'g');
-
-/**
- * Sanitizes JSON string for PostgreSQL jsonb:
- * - Removes problematic Unicode sequences:
- *   - \u0000 (null character) - causes error 22P05 "unsupported Unicode escape sequence"
- *   - \uD800-\uDFFF (unpaired surrogates) - causes "Unicode low surrogate must follow a high surrogate"
- * - Preserves escaped-backslash pairs and valid high+low surrogate pairs.
- * - Escapes any remaining invalid JSON escape sequences (e.g. \v, \k, \-)
- */
-export function sanitizeJsonForPg(jsonString: string): string {
-  return (
-    jsonString
-      // Preserve each complete escaped-backslash pair. For an odd run, remove
-      // only the final unsafe escape; valid high+low surrogate pairs survive.
-      .replace(PG_UNSAFE_JSON_UNICODE_ESCAPE_RE, '$1$2')
-      // Fix any remaining invalid JSON escape sequences safely without rewriting
-      // already-escaped backslashes. Running this AFTER surrogate removal ensures that
-      // characters newly exposed by the removal (e.g. a hyphen left after \\ud800-\\udfff)
-      // are also caught and escaped.
-      .replace(/(^|[^\\])(\\(?!["\\/bfnrtu]))/g, '$1\\\\')
-  );
 }
 
 export class WorkflowsPG extends WorkflowsStorage {
@@ -4887,8 +4864,20 @@ export class WorkflowsPG extends WorkflowsStorage {
         // `expectedStatus` is a compare-and-set guard, not state. It is checked here, inside the
         // row lock, and stripped so it can never be merged into the persisted snapshot.
         // `finalState` is likewise a directive rather than snapshot state.
-        const { expectedStatus, finalState, ...stateOptions } = opts;
-        if (!matchesExpectedWorkflowStatus(snapshot.status, expectedStatus)) {
+        const {
+          expectedStatus,
+          expectedExecutionGeneration,
+          expectedLifecycleResumeAttempt,
+          finalState,
+          ...stateOptions
+        } = opts;
+        if (
+          !matchesExpectedWorkflowState(snapshot, {
+            expectedStatus,
+            expectedExecutionGeneration,
+            expectedLifecycleResumeAttempt,
+          })
+        ) {
           return undefined;
         }
 
@@ -4972,11 +4961,11 @@ export class WorkflowsPG extends WorkflowsStorage {
           throw new TypeError('Workflow snapshot is missing parent revision evidence');
         }
         await t.none(
-          `INSERT INTO ${getTableName({ indexName: TABLE_WORKFLOW_SNAPSHOT, schemaName: getSchemaName(this.#schema) })}
+          `INSERT INTO ${getTableName({ indexName: TABLE_WORKFLOW_SNAPSHOT, schemaName: getSchemaName(this.#schema) })} AS t
                  (workflow_name, run_id, "resourceId", snapshot, "createdAt", "updatedAt", "createdAtZ", "updatedAtZ")
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                  ON CONFLICT (workflow_name, run_id) DO UPDATE
-                 SET "resourceId" = $3, snapshot = $4, "updatedAt" = $6, "updatedAtZ" = $8`,
+                 SET "resourceId" = COALESCE($3, t."resourceId"), snapshot = $4, "updatedAt" = $6, "updatedAtZ" = $8`,
           [
             workflowName,
             runId,

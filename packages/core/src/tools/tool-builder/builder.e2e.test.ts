@@ -554,8 +554,9 @@ describe('CoreToolBuilder ID Preservation', () => {
 });
 
 describe('Tool Tracing Context Injection', () => {
-  it('should inject tracingContext for Mastra tools when agentSpan is available', async () => {
+  it('should inject tracingContext and a span-backed observe helper for Mastra tools when agentSpan is available', async () => {
     let receivedTracingContext: any = null;
+    const info = vi.fn();
 
     const testTool = createTool({
       id: 'tracing-test-tool',
@@ -563,14 +564,26 @@ describe('Tool Tracing Context Injection', () => {
       inputSchema: z.object({ message: z.string() }),
       execute: async (inputData, context) => {
         receivedTracingContext = context?.tracingContext;
+        context?.observe.log('info', 'tool executed', { message: inputData.message });
         return { result: `processed: ${inputData.message}` };
       },
     });
 
     // Mock agent span
     const mockToolSpan = {
+      isValid: true,
+      observabilityInstance: {
+        getLoggerContext: vi.fn(() => ({
+          debug: vi.fn(),
+          info,
+          warn: vi.fn(),
+          error: vi.fn(),
+          fatal: vi.fn(),
+        })),
+      },
       end: vi.fn(),
       error: vi.fn(),
+      update: vi.fn(),
     };
 
     const mockAgentSpan = {
@@ -601,7 +614,6 @@ describe('Tool Tracing Context Injection', () => {
     expect(mockAgentSpan.createChildSpan).toHaveBeenCalledWith({
       type: SpanType.TOOL_CALL,
       name: "tool: 'tracing-test-tool'",
-      input: { message: 'test' },
       attributes: {
         toolCallId: 'test-call-id',
         toolDescription: 'Test tool that captures tracing context',
@@ -615,10 +627,12 @@ describe('Tool Tracing Context Injection', () => {
       mastra: undefined,
       metadata: {},
     });
+    expect(mockToolSpan.update).toHaveBeenCalledWith({ input: { message: 'test' } });
 
     // Verify tracingContext was injected with the tool span
     expect(receivedTracingContext).toBeTruthy();
     expect(receivedTracingContext.currentSpan).toBe(mockToolSpan);
+    expect(info).toHaveBeenCalledWith('tool executed', { message: 'test' });
 
     // Verify tool span was ended with result and success attribute
     expect(mockToolSpan.end).toHaveBeenCalledWith({
@@ -682,6 +696,7 @@ describe('Tool Tracing Context Injection', () => {
     const mockToolSpan = {
       end: vi.fn(),
       error: vi.fn(),
+      update: vi.fn(),
     };
 
     const mockAgentSpan = {
@@ -711,7 +726,6 @@ describe('Tool Tracing Context Injection', () => {
     expect(mockAgentSpan.createChildSpan).toHaveBeenCalledWith({
       type: SpanType.TOOL_CALL,
       name: "tool: 'vercel-tool'",
-      input: { input: 'test' },
       attributes: {
         toolCallId: 'test-call-id',
         toolDescription: 'Vercel tool test',
@@ -725,6 +739,7 @@ describe('Tool Tracing Context Injection', () => {
       mastra: undefined,
       metadata: {},
     });
+    expect(mockToolSpan.update).toHaveBeenCalledWith({ input: { input: 'test' } });
 
     // Verify Vercel tool execute was called (without tracingContext)
     expect(executeCalled).toBe(true);
@@ -753,6 +768,7 @@ describe('Tool Tracing Context Injection', () => {
     const mockToolSpan = {
       end: vi.fn(),
       error: vi.fn(),
+      update: vi.fn(),
     };
 
     const mockAgentSpan = {
@@ -808,6 +824,7 @@ describe('Tool Tracing Context Injection', () => {
     const mockToolSpan = {
       end: vi.fn(),
       error: vi.fn(),
+      update: vi.fn(),
     };
 
     const mockAgentSpan = {
@@ -844,13 +861,14 @@ describe('Tool Tracing Context Injection', () => {
       expect.objectContaining({
         type: SpanType.TOOL_CALL,
         name: "tool: 'input-validation-span-tool'",
-        input: { name: 'A', age: 25 },
       }),
     );
+    expect((mockAgentSpan.createChildSpan as ReturnType<typeof vi.fn>).mock.calls[0]?.[0]).not.toHaveProperty('input');
+    expect(mockToolSpan.update).not.toHaveBeenCalled();
 
     // Verify span was ended with failure attributes
     expect(mockToolSpan.end).toHaveBeenCalledWith({
-      output: result,
+      output: { error: true },
       attributes: { success: false },
     });
 
@@ -871,6 +889,7 @@ describe('Tool Tracing Context Injection', () => {
     const mockToolSpan = {
       end: vi.fn(),
       error: vi.fn(),
+      update: vi.fn(),
     };
 
     const mockAgentSpan = {
@@ -902,8 +921,9 @@ describe('Tool Tracing Context Injection', () => {
 
     // Span was created and ended with error
     expect(mockAgentSpan.createChildSpan).toHaveBeenCalled();
+    expect(mockToolSpan.update).not.toHaveBeenCalled();
     expect(mockToolSpan.end).toHaveBeenCalledWith({
-      output: result,
+      output: { error: true },
       attributes: { success: false },
     });
   });
@@ -926,6 +946,7 @@ describe('Tool Tracing Context Injection', () => {
     const mockToolSpan = {
       end: vi.fn(),
       error: vi.fn(),
+      update: vi.fn(),
     };
 
     const mockAgentSpan = {
@@ -962,7 +983,7 @@ describe('Tool Tracing Context Injection', () => {
 
     // Verify span was ended with failure (not error, since output validation is a soft failure)
     expect(mockToolSpan.end).toHaveBeenCalledWith({
-      output: result,
+      output: { error: true },
       attributes: { success: false },
     });
     expect(mockToolSpan.error).not.toHaveBeenCalled();
@@ -980,6 +1001,7 @@ describe('Tool Tracing Context Injection', () => {
     const mockToolSpan = {
       end: vi.fn(),
       error: vi.fn(),
+      update: vi.fn(),
     };
 
     const mockAgentSpan = {
@@ -1010,7 +1032,6 @@ describe('Tool Tracing Context Injection', () => {
     expect(mockAgentSpan.createChildSpan).toHaveBeenCalledWith({
       type: SpanType.TOOL_CALL,
       name: "tool: 'toolset-tool'",
-      input: { message: 'test' },
       attributes: {
         toolCallId: 'test-call-id',
         toolDescription: 'Tool from a toolset',
@@ -1024,6 +1045,7 @@ describe('Tool Tracing Context Injection', () => {
       mastra: undefined,
       metadata: {},
     });
+    expect(mockToolSpan.update).toHaveBeenCalledWith({ input: { message: 'test' } });
   });
 });
 

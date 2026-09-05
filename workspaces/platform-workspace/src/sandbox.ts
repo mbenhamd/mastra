@@ -8,6 +8,7 @@ import type {
   ProviderStatus,
   SandboxCloneOptions,
   SandboxInfo,
+  SandboxStartResult,
   SpawnProcessOptions,
 } from '@mastra/core/workspace';
 import {
@@ -17,7 +18,7 @@ import {
   SandboxNotReadyError,
   SandboxProcessManager,
 } from '@mastra/core/workspace';
-import type { PlatformClientOptions } from './client.js';
+import type { PlatformClientOptions, PlatformRequestOptions } from './client.js';
 import { PlatformApiError, PlatformClient } from './client.js';
 import type { DirectExecWebSocketFactory, ExecLease } from './direct-exec.js';
 import { execViaLease } from './direct-exec.js';
@@ -25,8 +26,14 @@ import type { E2BExecRunner } from './e2b-exec.js';
 import { execViaE2BLease } from './e2b-exec.js';
 import type { PrivateNetExecOptions, PrivateNetExecResult, PrivateNetFetch } from './private-net-exec.js';
 import { execViaPrivateNetwork, PrivateNetExecHttpError } from './private-net-exec.js';
+import type { SandboxTemplateBuilder, SerializedSandboxTemplate } from './template.js';
+import { getSandboxTemplateBuildEnvs, serializeSandboxTemplate } from './template.js';
 
 export type PlatformSandboxNetworkIsolation = 'ISOLATED' | 'PRIVATE';
+
+export type PlatformSandboxTemplate =
+  | SandboxTemplateBuilder
+  | (() => SandboxTemplateBuilder | undefined | Promise<SandboxTemplateBuilder | undefined>);
 
 /**
  * In-process `sandboxId → instanceUrl` map that lets
@@ -58,6 +65,21 @@ export interface PlatformSandboxOptions extends Omit<MastraSandboxOptions, 'proc
   sandboxId?: string;
   /** Boot-only fallback checkpoint for a fresh sandbox whose primary recovery key has no state. */
   seedCheckpointName?: string;
+  /**
+   * Template builder or a lazy resolver for one. The resolver runs only when
+   * start() must provision a fresh sandbox. Platform content-addresses the
+   * serialized definition and starts or reuses its provider build without
+   * blocking sandbox creation. With E2B, cpuCount() and memoryMB() default to 2
+   * CPUs and 1,024 MB; the latest setters determine the template identity and
+   * stale fallback is restricted to builds with the same effective resources.
+   * A provider-base fallback may use provider-default resources while the exact
+   * build is pending; inspect templatePending to detect that case. Railway
+   * ignores the resource setters. `setEnvs(values, { ephemeral: true })`
+   * supplies build-only values outside the serialized definition, content
+   * identity, and persistent template record. Resolver failures also fall back
+   * to the provider default and are retried on the next fresh provision.
+   */
+  template?: PlatformSandboxTemplate;
   idleTimeoutMinutes?: number;
   networkIsolation?: PlatformSandboxNetworkIsolation;
   env?: Record<string, string>;
@@ -112,6 +134,21 @@ interface CachedExecLease extends ExecLease {
   expiresAtMs: number | null;
 }
 
+interface SandboxIdentity {
+  sandboxId: string;
+  generation: number;
+}
+
+interface LeaseInFlight {
+  identity: SandboxIdentity;
+  promise: Promise<CachedExecLease>;
+}
+
+interface CaptureInFlight {
+  identity: SandboxIdentity;
+  promise: Promise<CaptureCheckpointResult>;
+}
+
 /**
  * How long before a lease's stated `expiresAt` we should treat it as
  * expired. Avoids a race where the JWT is valid at cache-hit time but the
@@ -125,6 +162,17 @@ interface CreateSandboxResponse {
   status?: string;
   createdAt?: string;
   destroyedAt?: string | null;
+  /**
+   * Present when the sandbox booted from a prior member of the same
+   * template family or the provider base template while the requested
+   * exact template continues to build in the background. Absent when the
+   * sandbox booted on the exact template. See {@link SandboxTemplatePending}
+   * for semantics.
+   *
+   * Only emitted by the create route today; reattach responses never carry
+   * this field.
+   */
+  templatePending?: SandboxTemplatePending;
   /**
    * Full sidecar URL (`http://[<ipv6>]:<port>`) the runtime can dial over
    * Railway's private network to reach the in-sandbox exec sidecar. The
@@ -142,6 +190,23 @@ interface CreateSandboxResponse {
 const CREATE_MAX_ATTEMPTS = 3;
 /** Base delay between create retries; multiplied by the attempt number. */
 const CREATE_RETRY_BASE_DELAY_MS = 2_000;
+
+/**
+ * Observability handle for a template that was requested but is still being
+ * built by the platform. Present on {@link CreateSandboxResponse} and echoed
+ * as {@link PlatformSandbox.templatePending} when the sandbox booted from
+ * a prior member of the same template family or from the provider's base
+ * template while the exact template continues to build in the background.
+ * Absent when the sandbox booted on the exact template.
+ *
+ * `PlatformSandbox` does not act on this: freshness is reconciled by the
+ * caller's own `onStart` runtime setup (e.g. `git fetch && checkout`), not
+ * by replaying template operations inside the running sandbox.
+ */
+export interface SandboxTemplatePending {
+  templateId: string;
+  retryAfterMs: number;
+}
 
 /**
  * How long to wait for the in-sandbox sidecar's `/health` endpoint to respond
@@ -351,11 +416,32 @@ export class PlatformSandbox extends MastraSandbox {
   readonly provider = 'platform';
   status: ProviderStatus = 'pending';
   declare readonly processes: PlatformProcessManager;
+  /**
+   * Populated from the platform's create/reattach response when the sandbox
+   * booted from a prior member of the same template family or the provider
+   * base template while the requested exact template continues to build in
+   * the background.
+   * `undefined` when the sandbox booted on the exact template (or when no
+   * template was requested). Observability-only; consumers reconcile freshness
+   * in their own runtime setup and reprovision to pick up the ready template
+   * on a later start.
+   */
+  templatePending?: SandboxTemplatePending;
 
   private readonly _client: PlatformClient;
+  private readonly _usesProviderRoutes: boolean;
+  private readonly _sandboxProviderExplicit: boolean;
   private readonly _environmentId: string;
   private _sandboxId?: string;
+  /** Monotonic local identity for each adopted or freshly provisioned VM. */
+  private _sandboxGeneration = 0;
+  /** Last VM associated with the recovery key; retained across stop() for a later destroy(). */
+  private _checkpointTarget?: SandboxIdentity;
   private readonly _seedCheckpointName?: string;
+  private _templateDefinition?: SerializedSandboxTemplate;
+  private _templateBuildEnvs?: Record<string, string>;
+  private readonly _template?: PlatformSandboxTemplate;
+  private _templateResolutionInFlight?: Promise<void>;
   private readonly _idleTimeoutMinutes?: number;
   private readonly _networkIsolation?: PlatformSandboxNetworkIsolation;
   private readonly _env: Record<string, string>;
@@ -390,7 +476,7 @@ export class PlatformSandbox extends MastraSandbox {
    * `POST /exec-lease` round-trips when the sandbox is doing N parallel execs.
    * Cleared (regardless of success or failure) when the request settles.
    */
-  private _leaseInFlight: Promise<CachedExecLease> | null = null;
+  private _leaseInFlight: LeaseInFlight | null = null;
   /**
    * True when this sandbox was constructed with a caller-supplied `id` (the
    * recovery key the proxy hashes into an on-provider checkpoint name).
@@ -407,23 +493,15 @@ export class PlatformSandbox extends MastraSandbox {
    * /checkpoint` round-trips when the fleet fires several turn-end captures
    * before the first one resolves. Cleared when the request settles.
    */
-  private _captureInFlight: Promise<CaptureCheckpointResult> | null = null;
+  private _captureInFlight: CaptureInFlight | null = null;
+  /** Every dispatched checkpoint write, including captures from superseded VM generations. */
+  private readonly _outstandingCaptures = new Set<Promise<CaptureCheckpointResult>>();
   /** Once teardown begins, checkpoint capture must stay closed to prevent post-delete recreation. */
   private _teardownStarted = false;
-  /** Teardown serialization; start waits for destroy to finish before provisioning again. */
+  /** Teardown serialization; start waits for stop/destroy to finish before provisioning again. */
   private _teardownInFlight: Promise<void> | null = null;
-  /**
-   * In-flight `start()` attempt. Concurrent callers on a fresh instance
-   * coalesce onto this single promise so a `POST /sandbox` is not fired
-   * N times when N fleet callers race to bring the same logical sandbox
-   * up. Published **synchronously** with `??=` before the first `await`
-   * so a later caller cannot slip through the null check while the
-   * originator is mid-round-trip. Cleared when the shared attempt
-   * settles (success or failure) so the next call sees a clean slot.
-   *
-   * Mirrors OSS `@mastra/railway` `RailwaySandbox._startInFlight`.
-   */
-  private _startInFlight: Promise<void> | null = null;
+  /** A destroy racing an existing stop promotes the shared teardown instead of losing checkpoint deletion. */
+  private _teardownIntent: 'stop' | 'destroy' | null = null;
   /**
    * Generation token for the sidecar probe. Incremented on every `start()`
    * and on teardown. The probe captures this value when it begins; if the
@@ -452,10 +530,17 @@ export class PlatformSandbox extends MastraSandbox {
     this._hasRecoveryKey = options.id !== undefined;
     this.id = options.id ?? this.generateId();
     this._client = new PlatformClient(options);
+    this._sandboxProviderExplicit = options.sandboxProvider !== undefined;
     this._environmentId = options.environmentId ?? process.env.MASTRA_ENVIRONMENT_ID ?? '';
     if (!this._environmentId && !options.sandboxId) throw new Error('environmentId is required');
     this._sandboxId = options.sandboxId;
+    if (options.sandboxId) {
+      this._sandboxGeneration = 1;
+      this._checkpointTarget = { sandboxId: options.sandboxId, generation: this._sandboxGeneration };
+    }
     this._seedCheckpointName = options.seedCheckpointName;
+    this._usesProviderRoutes = options.template !== undefined;
+    this._template = options.template;
     this._idleTimeoutMinutes = options.idleTimeoutMinutes;
     this._networkIsolation = options.networkIsolation;
     this._env = options.env ?? {};
@@ -469,6 +554,33 @@ export class PlatformSandbox extends MastraSandbox {
 
   private generateId(): string {
     return `platform-sandbox-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  }
+
+  private _currentIdentity(): SandboxIdentity | undefined {
+    if (!this._sandboxId) return undefined;
+    return { sandboxId: this._sandboxId, generation: this._sandboxGeneration };
+  }
+
+  private _isCurrentIdentity(identity: SandboxIdentity): boolean {
+    return this._sandboxId === identity.sandboxId && this._sandboxGeneration === identity.generation;
+  }
+
+  private _adoptSandbox(sandboxId: string): SandboxIdentity {
+    const previousSandboxId = this._sandboxId;
+    this._sandboxGeneration++;
+    const identity = { sandboxId, generation: this._sandboxGeneration };
+    this._sandboxId = sandboxId;
+    this._checkpointTarget = identity;
+    this._lease = null;
+    this._leaseInFlight = null;
+    if (previousSandboxId && previousSandboxId !== sandboxId) {
+      this._addressRegistry?.delete(previousSandboxId);
+    }
+    return identity;
+  }
+
+  private _request(path: string, options: PlatformRequestOptions = {}): Promise<Response> {
+    return this._usesProviderRoutes ? this._client.requestProvider(path, options) : this._client.request(path, options);
   }
 
   /**
@@ -495,10 +607,13 @@ export class PlatformSandbox extends MastraSandbox {
       options.seedCheckpointName ??
       (this._client.sandboxProvider === 'e2b' ? options.checkpointName : undefined) ??
       this._seedCheckpointName;
-    return new PlatformSandbox({
+    const clone = new PlatformSandbox({
       ...(id !== undefined && { id }),
       accessToken: this._client.accessToken,
       projectId: this._client.projectId,
+      ...(this._sandboxProviderExplicit || this._usesProviderRoutes || this._client.sandboxProvider !== 'railway'
+        ? { sandboxProvider: this._client.sandboxProvider }
+        : {}),
       actingUserId: options.actingUserId ?? this._client.actingUserId,
       ...(this._client.sessionId !== undefined && { sessionId: this._client.sessionId }),
       ...(this._client.threadId !== undefined && { threadId: this._client.threadId }),
@@ -506,9 +621,13 @@ export class PlatformSandbox extends MastraSandbox {
       environmentId: this._environmentId,
       ...(options.sandboxId !== undefined && { sandboxId: options.sandboxId }),
       ...(seedCheckpointName !== undefined && { seedCheckpointName }),
+      ...(this._template !== undefined && { template: this._template }),
       idleTimeoutMinutes: options.idleTimeoutMinutes ?? this._idleTimeoutMinutes,
       ...(this._networkIsolation !== undefined && { networkIsolation: this._networkIsolation }),
       env: options.env ?? this._env,
+      ...(options.workingDirectory !== undefined || this.workingDirectory !== undefined
+        ? { workingDirectory: options.workingDirectory ?? this.workingDirectory }
+        : {}),
       ...(this._timeout !== undefined && { timeout: this._timeout }),
       ...(this._instructionsOverride !== undefined && { instructions: this._instructionsOverride }),
       ...(this._webSocketFactory !== undefined && { webSocketFactory: this._webSocketFactory }),
@@ -520,93 +639,98 @@ export class PlatformSandbox extends MastraSandbox {
       // `.scratch/factory-deploy/issue-platform-sandbox-exec-via-private-network.md`.
       ...(this._addressRegistry !== undefined && { addressRegistry: this._addressRegistry }),
     });
+    clone._templateDefinition = this._templateDefinition ? structuredClone(this._templateDefinition) : undefined;
+    clone._templateBuildEnvs = this._templateBuildEnvs ? { ...this._templateBuildEnvs } : undefined;
+    return clone;
   }
 
-  async start(): Promise<void> {
-    // A successful fresh start reopens capture admission after an earlier teardown.
-    // Do this inside the shared attempt so failed starts leave teardown closed.
-    const startAttempt = async () => {
-      if (this._teardownInFlight) {
-        await this._teardownInFlight;
-      }
-      await this._doStart();
-      this._teardownStarted = false;
-    };
-
-    // Coalesce concurrent callers onto a single in-flight attempt. `??=`
-    // publishes the promise **synchronously** before the first `await`
-    // below, so a second caller entering `start()` while the first is
-    // mid-round-trip sees a populated `_startInFlight` and joins it
-    // instead of racing to `POST /sandbox` alongside the originator. On
-    // settle (success or failure) the slot is cleared so the next call
-    // starts fresh — a failed attempt is not a permanent latch.
-    // Mirrors OSS @mastra/railway RailwaySandbox._startInFlight.
-    this._startInFlight ??= startAttempt().finally(() => {
-      this._startInFlight = null;
-    });
-    return this._startInFlight;
+  override async _start(): Promise<SandboxStartResult | void> {
+    // A pending start can mark the sandbox running after direct teardown began.
+    // Join teardown before the base lifecycle's already-running fast path.
+    if (this._teardownInFlight) await this._teardownInFlight;
+    return super._start();
   }
 
   /**
-   * The single `start` attempt behind {@link start}'s coalescing wrapper.
+   * Start the sandbox: reattach to a known provider `sandboxId` when one is
+   * set and still live, otherwise provision a fresh sandbox via the proxy.
    *
-   * Split out so the wrapper can install a shared in-flight promise
-   * synchronously (before the first `await`) without inlining the reattach
-   * / retry logic. Joined callers observe whatever outcome this method
-   * produces — success returns normally, failures propagate to every
-   * awaiter.
+   * Concurrent-caller coalescing lives in the `MastraSandbox` base class
+   * (constructor-wrapped `start()`): joined callers share one attempt and
+   * observe its result; the in-flight slot is cleared on settle so a failed
+   * attempt is not a permanent latch.
+   *
+   * Reports `outcome: 'connected'` on reattach and `outcome: 'created'` on provision.
+   * Note: a `POST /sandbox` seeded from an id-keyed checkpoint is still a
+   * fresh VM and reports `outcome: 'created'`.
    */
-  private async _doStart(): Promise<void> {
+  async start(): Promise<SandboxStartResult> {
     const startedAt = Date.now();
     if (this._sandboxId) {
+      const reattachIdentity = this._currentIdentity()!;
       try {
         const requestStartedAt = Date.now();
-        const response = await this._client.request(`/sandbox/${encodeURIComponent(this._sandboxId)}`);
+        const response = await this._request(`/sandbox/${encodeURIComponent(this._sandboxId)}`);
         const requestMs = Date.now() - requestStartedAt;
         const json = (await response.json()) as CreateSandboxResponse;
         // A destroyed record (idle GC, manual delete) is not reattachable —
         // treat it like a missing sandbox so we fall through to a fresh
         // provision instead of pointing exec at a dead resource.
         if (!json.destroyedAt) {
+          this._adoptSandbox(json.id);
           this._createdAt = json.createdAt ? new Date(json.createdAt) : new Date();
+          // Reattach responses never carry templatePending — the field is
+          // set only by the create route. Leave the instance's value alone.
           this._populateAddressFromResponse(json);
           this._logStartComplete(json.id, startedAt, requestMs, 'reattach');
-          return;
+          if (!this._teardownInFlight) this._teardownStarted = false;
+          return { outcome: 'connected' };
         }
-        this._sandboxId = undefined;
+        this._clearDestroyedState(reattachIdentity);
       } catch (error) {
         if (!(error instanceof PlatformApiError) || error.status !== 404) throw error;
-        this._sandboxId = undefined;
+        this._clearDestroyedState(reattachIdentity);
       }
     }
 
     if (!this._environmentId) throw new Error('environmentId is required');
 
-    const body = JSON.stringify({
-      // Sent so the platform can associate the provisioned resource with a
-      // caller-stable identifier (used for opt-in checkpoint recovery). The
-      // platform treats it as an advisory key: unknown values fall through
-      // to a fresh sandbox, matching pre-existing behavior.
-      id: this.id,
-      seedCheckpointName: this._seedCheckpointName,
-      environmentId: this._environmentId,
-      idleTimeoutMinutes: this._idleTimeoutMinutes,
-      networkIsolation: this._networkIsolation,
-      env: this._env,
-    });
+    await this._prepareLazyTemplate();
+
+    const createBody = () =>
+      JSON.stringify({
+        // Sent so the platform can associate the provisioned resource with a
+        // caller-stable identifier (used for opt-in checkpoint recovery). The
+        // platform treats it as an advisory key: unknown values fall through
+        // to a fresh sandbox, matching pre-existing behavior.
+        id: this.id,
+        seedCheckpointName: this._seedCheckpointName,
+        templateDefinition: this._templateDefinition,
+        templateBuildEnvs: this._templateBuildEnvs,
+        environmentId: this._environmentId,
+        idleTimeoutMinutes: this._idleTimeoutMinutes,
+        networkIsolation: this._networkIsolation,
+        env: this._env,
+      });
     // Provisioning is observed to fail intermittently with proxy 500s while
     // the provider is under load. A create either succeeds (201) or fails
     // without allocating a caller-visible resource, so retrying transient
     // 5xx responses with a short backoff is safe and keeps a single flaky
     // window from killing the caller's whole workflow.
+    //
+    // Template builds never block a create anymore: the proxy always returns
+    // a running sandbox on the best available fallback (a prior member of the
+    // same template family if one exists, otherwise the provider base
+    // template) and surfaces `templatePending` in the 201 body describing the
+    // build that continues in the background.
     let response: Response | undefined;
     const requestStartedAt = Date.now();
     for (let attempt = 1; ; attempt++) {
       try {
-        response = await this._client.request('/sandbox', {
+        response = await this._request('/sandbox', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body,
+          body: createBody(),
         });
         break;
       } catch (error) {
@@ -617,10 +741,38 @@ export class PlatformSandbox extends MastraSandbox {
     }
     const requestMs = Date.now() - requestStartedAt;
     const json = (await response.json()) as CreateSandboxResponse;
-    this._sandboxId = json.id;
+    this._adoptSandbox(json.id);
     this._createdAt = json.createdAt ? new Date(json.createdAt) : new Date();
+    this.templatePending = json.templatePending;
     this._populateAddressFromResponse(json);
     this._logStartComplete(json.id, startedAt, requestMs, 'provision');
+    // Stop/destroy may have closed admission while this start was in flight.
+    if (!this._teardownInFlight) this._teardownStarted = false;
+    return { outcome: 'created' };
+  }
+
+  private async _prepareLazyTemplate(): Promise<void> {
+    if (this._templateDefinition !== undefined || this._template === undefined) return;
+    if (!this._templateResolutionInFlight) {
+      const attempt = this._resolveTemplate();
+      this._templateResolutionInFlight = attempt.finally(() => {
+        this._templateResolutionInFlight = undefined;
+      });
+    }
+    await this._templateResolutionInFlight;
+  }
+
+  private async _resolveTemplate(): Promise<void> {
+    try {
+      const resolved = typeof this._template === 'function' ? await this._template() : this._template;
+      if (!resolved) return;
+      this._templateDefinition = serializeSandboxTemplate(resolved);
+      this._templateBuildEnvs = getSandboxTemplateBuildEnvs(resolved);
+    } catch (error) {
+      this.logger.warn(
+        `Platform sandbox template resolution failed; using provider default template: ${String(error)}`,
+      );
+    }
   }
 
   /**
@@ -765,9 +917,10 @@ export class PlatformSandbox extends MastraSandbox {
    * lease path is still coalesced via `_leaseInFlight`, so even if the probe
    * times out, we only mint one lease for all concurrent execs.
    */
-  private async _awaitTransportReady(): Promise<void> {
+  private async _awaitTransportReady(identity: SandboxIdentity): Promise<void> {
+    if (!this._isCurrentIdentity(identity)) throw new SandboxNotReadyError(this.id);
     // Fast path: registry already has an entry, transport is warm.
-    if (this._sandboxId && this._addressRegistry?.get(this._sandboxId)) {
+    if (this._addressRegistry?.get(identity.sandboxId)) {
       return;
     }
     // No probe in flight. If a previous probe timed out for the current
@@ -775,7 +928,7 @@ export class PlatformSandbox extends MastraSandbox {
     // one exec paying a short wait beats every exec going via lease forever.
     if (!this._transportReadyPromise) {
       const target = this._probeTarget;
-      if (!target || this._sandboxId !== target.sandboxId) return;
+      if (!target || identity.sandboxId !== target.sandboxId) return;
       const generation = ++this._probeGeneration;
       this._transportReadyPromise = this._probeSidecarThenRegister(target.sandboxId, target.instanceUrl, generation);
     }
@@ -783,6 +936,7 @@ export class PlatformSandbox extends MastraSandbox {
     // if the sidecar is slow to boot — they can proceed via lease after a
     // short wait, and later execs will use private-net once the probe succeeds.
     await Promise.race([this._transportReadyPromise, new Promise<void>(r => setTimeout(r, TRANSPORT_READY_WAIT_MS))]);
+    if (!this._isCurrentIdentity(identity)) throw new SandboxNotReadyError(this.id);
   }
 
   /**
@@ -799,16 +953,7 @@ export class PlatformSandbox extends MastraSandbox {
    * {@link destroy} when you want the checkpoint released too.
    */
   async stop(): Promise<void> {
-    // Await any in-flight capture so the preserved checkpoint reflects the
-    // latest capture the caller triggered. Never rethrow — a failing capture
-    // must not block teardown; the proxy's safety-net refresh timer is a
-    // fallback for the checkpoint state.
-    if (this._captureInFlight) {
-      await this._captureInFlight.catch(error => {
-        this.logger.warn(`stop(): failed to flush in-flight capture before teardown:`, error);
-      });
-    }
-    await this._teardownSandbox();
+    return this._beginTeardown('stop');
   }
 
   /**
@@ -822,56 +967,144 @@ export class PlatformSandbox extends MastraSandbox {
    * sandbox they can't safely retry.
    *
    * Railway requires a caller-supplied recovery `id` before it can have a
-   * checkpoint to delete. E2B also permits capture with the automatic id, so
-   * destroy releases that named snapshot even when no recovery id was supplied.
+   * checkpoint to delete. On E2B the sandbox itself is the persistent thing
+   * (idle sandboxes pause and resume in place), so destroy only kills the
+   * VM; any snapshot a caller captured on purpose is the caller's to manage.
    */
   async destroy(): Promise<void> {
-    if (this._teardownInFlight) return this._teardownInFlight;
-    if (!this._sandboxId) return;
-    const destroyedSandboxId = this._sandboxId;
-    this._teardownStarted = true;
+    return this._beginTeardown('destroy');
+  }
 
-    const teardown = async () => {
-      // A capture request cannot be canceled after dispatch. Wait for it to settle before
-      // deleting the checkpoint so a late POST cannot recreate state after destroy returns.
-      if (this._captureInFlight) {
-        await this._captureInFlight.catch(error => {
-          this.logger.warn(`destroy(): in-flight checkpoint capture failed before deletion:`, error);
-        });
-      }
+  /**
+   * Serialize stop/destroy around one captured VM identity. A destroy that
+   * arrives during stop promotes the same operation so checkpoint deletion is
+   * never lost, while a later start waits on the base lifecycle promise slot.
+   */
+  private _beginTeardown(intent: 'stop' | 'destroy'): Promise<void> {
+    const expectedStatus = intent === 'stop' ? 'stopping' : 'destroying';
+    const baseLifecycleOwnsStatus =
+      this.status === expectedStatus &&
+      (intent === 'stop' ? this._stopPromise !== undefined : this._destroyPromise !== undefined) &&
+      this._teardownInFlight === null;
 
-      if (this._hasRecoveryKey || this._client.sandboxProvider === 'e2b') {
-        // Body mirrors the POST /checkpoint shape (`{ id }`) so the proxy
-        // can hash the same recovery key into the same checkpoint name.
-        // Best-effort: a proxy 404/410 means the checkpoint is already
-        // absent (idle GC, prior delete) and we can proceed with the VM
-        // teardown; other failures are surfaced in logs but do not abort
-        // — the VM DELETE below is the operation the caller most needs.
-        try {
-          await this._client.request(`/sandbox/${encodeURIComponent(destroyedSandboxId)}/checkpoint`, {
-            method: 'DELETE',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ id: this.id }),
+    if (this._teardownInFlight) {
+      if (intent === 'destroy') {
+        this._teardownIntent = 'destroy';
+        if (!baseLifecycleOwnsStatus) this.status = 'destroying';
+
+        const promotedPromise = this._teardownInFlight
+          .then(
+            () => {
+              if (!baseLifecycleOwnsStatus) this.status = 'pending';
+            },
+            error => {
+              if (!baseLifecycleOwnsStatus) this.status = 'error';
+              throw error;
+            },
+          )
+          .finally(() => {
+            if (this._destroyPromise === promotedPromise) this._destroyPromise = undefined;
           });
-        } catch (error) {
-          if (error instanceof PlatformApiError && (error.status === 404 || error.status === 410)) {
-            this.logger.debug(`destroy(): checkpoint already absent upstream (status=${error.status})`);
-          } else {
-            this.logger.warn(`destroy(): failed to delete checkpoint upstream:`, error);
+        if (!baseLifecycleOwnsStatus) this._destroyPromise = promotedPromise;
+        return promotedPromise;
+      }
+      return this._teardownInFlight;
+    }
+
+    this._teardownIntent = intent;
+    this._teardownStarted = true;
+    if (!baseLifecycleOwnsStatus) this.status = expectedStatus;
+
+    const teardownPromise = this._performTeardown()
+      .then(
+        () => {
+          if (!baseLifecycleOwnsStatus) {
+            this.status = this._teardownIntent === 'destroy' ? 'pending' : 'stopped';
           }
+        },
+        error => {
+          if (!baseLifecycleOwnsStatus) this.status = 'error';
+          throw error;
+        },
+      )
+      .finally(() => {
+        if (this._teardownInFlight === teardownPromise) {
+          this._teardownInFlight = null;
+          this._teardownIntent = null;
+        }
+        if (this._stopPromise === teardownPromise) this._stopPromise = undefined;
+        if (this._destroyPromise === teardownPromise) this._destroyPromise = undefined;
+      });
+    this._teardownInFlight = teardownPromise;
+    if (!baseLifecycleOwnsStatus) {
+      if (intent === 'stop') this._stopPromise = teardownPromise;
+      else this._destroyPromise = teardownPromise;
+    }
+    return teardownPromise;
+  }
+
+  private async _performTeardown(): Promise<void> {
+    // A direct lifecycle call can race the initial start before `_sandboxId`
+    // exists. Wait for that attempt, then tear down whatever it adopted.
+    if (this._startPromise) await this._startPromise.catch(() => {});
+
+    // A capture request cannot be canceled after dispatch. Wait for it to
+    // settle before deleting a checkpoint or VM so it cannot recreate state
+    // after teardown returns.
+    if (this._outstandingCaptures.size > 0) {
+      const captures = [...this._outstandingCaptures];
+      const results = await Promise.allSettled(captures);
+      for (const result of results) {
+        if (result.status === 'rejected') {
+          this.logger.warn(
+            `${this._teardownIntent ?? 'teardown'}(): in-flight checkpoint capture failed:`,
+            result.reason,
+          );
         }
       }
+    }
 
-      await this._teardownSandbox();
-    };
+    let checkpointDeleted = false;
+    if (this._teardownIntent === 'destroy' && this._checkpointTarget) {
+      const checkpointTarget = this._checkpointTarget;
+      await this._deleteRecoveryCheckpoint(checkpointTarget);
+      checkpointDeleted = true;
+    }
 
-    const teardownPromise = teardown().finally(() => {
-      if (this._teardownInFlight === teardownPromise) {
-        this._teardownInFlight = null;
+    const activeIdentity = this._currentIdentity();
+    if (activeIdentity) await this._teardownSandbox(activeIdentity);
+
+    // If destroy promoted a stop while the VM DELETE was already in flight,
+    // the pre-delete branch above observed `stop`. Release the retained
+    // checkpoint now rather than silently downgrading destroy to stop.
+    if (this._teardownIntent === 'destroy' && !checkpointDeleted && this._checkpointTarget) {
+      await this._deleteRecoveryCheckpoint(this._checkpointTarget);
+    }
+  }
+
+  private async _deleteRecoveryCheckpoint(target: SandboxIdentity): Promise<void> {
+    try {
+      if (this._hasRecoveryKey && this._client.sandboxProvider !== 'e2b') {
+        await this._request(`/sandbox/${encodeURIComponent(target.sandboxId)}/checkpoint`, {
+          method: 'DELETE',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ id: this.id }),
+        });
       }
-    });
-    this._teardownInFlight = teardownPromise;
-    return teardownPromise;
+    } catch (error) {
+      if (error instanceof PlatformApiError && (error.status === 404 || error.status === 410)) {
+        this.logger.debug(`destroy(): checkpoint already absent upstream (status=${error.status})`);
+      } else {
+        this.logger.warn(`destroy(): failed to delete checkpoint upstream:`, error);
+      }
+    } finally {
+      if (
+        this._checkpointTarget?.sandboxId === target.sandboxId &&
+        this._checkpointTarget.generation === target.generation
+      ) {
+        this._checkpointTarget = undefined;
+      }
+    }
   }
 
   /**
@@ -884,9 +1117,8 @@ export class PlatformSandbox extends MastraSandbox {
    * leaves the checkpoint intact and `destroy()` has already removed it
    * before this call.
    */
-  private async _teardownSandbox(): Promise<void> {
-    if (!this._sandboxId) return;
-    const destroyedSandboxId = this._sandboxId;
+  private async _teardownSandbox(identity: SandboxIdentity): Promise<void> {
+    const destroyedSandboxId = identity.sandboxId;
     // Invalidate any in-flight probe so it doesn't re-populate the registry
     // after we've deleted the entry below. The probe checks this generation
     // before calling set(). Also drop the re-probe target so later execs
@@ -894,14 +1126,22 @@ export class PlatformSandbox extends MastraSandbox {
     this._probeGeneration++;
     this._probeTarget = null;
     this._transportReadyPromise = null;
-    await this._client.request(`/sandbox/${encodeURIComponent(destroyedSandboxId)}`, { method: 'DELETE' });
+    this._leaseInFlight = null;
+    try {
+      await this._request(`/sandbox/${encodeURIComponent(destroyedSandboxId)}`, { method: 'DELETE' });
+    } catch (error) {
+      if (!(error instanceof PlatformApiError) || (error.status !== 404 && error.status !== 410)) throw error;
+      this.logger.debug(`teardown(): sandbox already absent upstream (status=${error.status})`);
+    }
     // Clear local state so a subsequent start() creates a fresh remote sandbox
     // instead of taking the reattach branch and pointing exec at a deleted resource.
-    this._sandboxId = undefined;
-    this._createdAt = null;
+    if (this._isCurrentIdentity(identity)) {
+      this._sandboxId = undefined;
+      this._createdAt = null;
+      this._lease = null;
+    }
     // Drop the exec lease with the sandbox — the JWT is tied to the provider
     // instance id and would be rejected against a fresh one.
-    this._lease = null;
     // Evict the sidecar address from the registry explicitly. Destroy
     // deallocates the IPv6, so any stale entry would be a dial-to-nowhere;
     // clearing here prevents a transport-failure round-trip on the next
@@ -969,22 +1209,28 @@ export class PlatformSandbox extends MastraSandbox {
       return { status: 'skipped', reason: 'no-checkpoint-name-configured' };
     }
 
-    if (!this._sandboxId || this._teardownStarted) {
+    const identity = this._currentIdentity();
+    if (!identity || this._teardownStarted) {
       this.logger.debug(`captureCheckpoint skipped: sandbox not running (local pre-flight, id=${this.id})`);
       return { status: 'skipped', reason: 'sandbox-not-running' };
     }
 
-    if (this._captureInFlight) {
-      return this._captureInFlight;
+    if (
+      this._captureInFlight &&
+      this._captureInFlight.identity.sandboxId === identity.sandboxId &&
+      this._captureInFlight.identity.generation === identity.generation
+    ) {
+      return this._captureInFlight.promise;
     }
 
-    const sandboxId = this._sandboxId;
-    const capture = this._doCaptureCheckpoint(sandboxId).finally(() => {
-      if (this._captureInFlight === capture) {
+    const capture = this._doCaptureCheckpoint(identity).finally(() => {
+      this._outstandingCaptures.delete(capture);
+      if (this._captureInFlight?.promise === capture) {
         this._captureInFlight = null;
       }
     });
-    this._captureInFlight = capture;
+    this._outstandingCaptures.add(capture);
+    this._captureInFlight = { identity, promise: capture };
     return capture;
   }
 
@@ -998,10 +1244,11 @@ export class PlatformSandbox extends MastraSandbox {
    * proxy returned. Both are legitimate: the OSS mirror uses the same
    * "initiator sees the truth, joiners see coalesced" split.
    */
-  private async _doCaptureCheckpoint(sandboxId: string): Promise<CaptureCheckpointResult> {
+  private async _doCaptureCheckpoint(identity: SandboxIdentity): Promise<CaptureCheckpointResult> {
+    const { sandboxId } = identity;
     let response: Response;
     try {
-      response = await this._client.request(`/sandbox/${encodeURIComponent(sandboxId)}/checkpoint`, {
+      response = await this._request(`/sandbox/${encodeURIComponent(sandboxId)}/checkpoint`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ id: this.id }),
@@ -1009,7 +1256,7 @@ export class PlatformSandbox extends MastraSandbox {
     } catch (error) {
       if (error instanceof PlatformApiError && error.status === 410) {
         this.logger.warn(`captureCheckpoint skipped: sandbox destroyed upstream (proxy 410, sandboxId=${sandboxId})`);
-        this._clearDestroyedState(sandboxId);
+        this._clearDestroyedState(identity);
         return { status: 'skipped', reason: 'sandbox-not-running' };
       }
       throw error;
@@ -1022,7 +1269,7 @@ export class PlatformSandbox extends MastraSandbox {
       this.logger.warn(
         `captureCheckpoint skipped: sandbox destroyed upstream (proxy reported skipped, sandboxId=${sandboxId})`,
       );
-      this._clearDestroyedState(sandboxId);
+      this._clearDestroyedState(identity);
       return { status: 'skipped', reason: 'sandbox-not-running' };
     }
     return { status: json.status, checkpointName: json.checkpointName };
@@ -1038,15 +1285,18 @@ export class PlatformSandbox extends MastraSandbox {
    * reused instance re-runs provisioning instead of short-circuiting on
    * the cached `'running'` state (see `MastraSandbox._start`).
    */
-  private _clearDestroyedState(destroyedSandboxId: string): void {
+  private _clearDestroyedState(identity: SandboxIdentity): boolean {
+    if (!this._isCurrentIdentity(identity)) return false;
     this._probeGeneration++;
     this._probeTarget = null;
     this._transportReadyPromise = null;
     this._sandboxId = undefined;
     this._createdAt = null;
     this._lease = null;
-    this._addressRegistry?.delete(destroyedSandboxId);
+    this._leaseInFlight = null;
+    this._addressRegistry?.delete(identity.sandboxId);
     this.status = 'pending';
+    return true;
   }
 
   /**
@@ -1068,7 +1318,8 @@ export class PlatformSandbox extends MastraSandbox {
    */
   async executeCommand(command: string, args?: string[], options?: ExecuteCommandOptions): Promise<CommandResult> {
     await this.ensureRunning();
-    if (!this._sandboxId) throw new SandboxNotReadyError(this.id);
+    const identity = this._currentIdentity();
+    if (!identity || this._teardownStarted) throw new SandboxNotReadyError(this.id);
 
     const started = Date.now();
     const fullCommand = buildCommand(command, args);
@@ -1077,13 +1328,21 @@ export class PlatformSandbox extends MastraSandbox {
     // the value is 0, which disables the client-side timer entirely.
     const effectiveTimeout = options?.timeout ?? this._timeout;
 
+    // Merge the sandbox env under per-call env once, up front — every exec
+    // transport below (private network, WebSocket lease, E2B lease) receives
+    // these options, and none of them route through the process manager.
+    const sandboxEnv = this.getEnv();
+    const execCallOptions =
+      Object.keys(sandboxEnv).length > 0 ? { ...options, env: { ...sandboxEnv, ...options?.env } } : options;
+
     // Wait for the transport to become ready before proceeding. During the
     // sidecar boot window (immediately after start()), concurrent execs all
     // await the same probe promise rather than each independently racing to
     // the lease path — this coalesces the cold-start storm into a single
     // warmup attempt. Once the probe resolves (or times out after
     // TRANSPORT_READY_WAIT_MS), we check the registry and proceed.
-    await this._awaitTransportReady();
+    await this._awaitTransportReady(identity);
+    if (!this._isCurrentIdentity(identity) || this._teardownStarted) throw new SandboxNotReadyError(this.id);
 
     // Preferred path: dial the in-sandbox sidecar over Railway's private
     // network (~16 ms p50). No GraphQL, no lease mint, no public tcp-proxy.
@@ -1095,9 +1354,15 @@ export class PlatformSandbox extends MastraSandbox {
     // path — application-level failures (sidecar returns 5xx) still fall
     // back for this call but do NOT invalidate the entry. See
     // `.scratch/factory-deploy/issue-platform-sandbox-exec-via-private-network.md`.
-    const instanceUrl = this._addressRegistry?.get(this._sandboxId);
+    const instanceUrl = this._addressRegistry?.get(identity.sandboxId);
     if (instanceUrl) {
-      const privateNet = await this._tryExecViaPrivateNetwork(instanceUrl, fullCommand, effectiveTimeout, options);
+      const privateNet = await this._tryExecViaPrivateNetwork(
+        identity,
+        instanceUrl,
+        fullCommand,
+        effectiveTimeout,
+        execCallOptions,
+      );
       if (privateNet) {
         const privateExit = privateNet.exitCode ?? 124;
         return {
@@ -1114,6 +1379,8 @@ export class PlatformSandbox extends MastraSandbox {
       // registry entry if this was a transport failure.
     }
 
+    if (!this._isCurrentIdentity(identity)) throw new SandboxNotReadyError(this.id);
+
     // Fallback: WebSocket direct-exec via `/exec-lease`. `_runDirectExec`
     // handles single-shot transport retry and throws typed errors on
     // unrecoverable failure: `SandboxDestroyedError` when `/exec-lease`
@@ -1122,7 +1389,7 @@ export class PlatformSandbox extends MastraSandbox {
     // `PlatformApiError` for other `/exec-lease` errors (404/500/501).
     // See ./direct-exec.ts and `docs/factory/direct-sandbox-connection.md`
     // in the Platform repo.
-    const result = await this._runDirectExec(fullCommand, effectiveTimeout, options);
+    const result = await this._runDirectExec(identity, fullCommand, effectiveTimeout, execCallOptions);
     // `_runDirectExec` throws on transport failure (see its jsdoc), so a
     // `null` exitCode here can only mean `timedOut: true` — the sandbox
     // never got to send an exit frame because we cut the command short.
@@ -1161,19 +1428,28 @@ export class PlatformSandbox extends MastraSandbox {
    * Returns a result with a real `exitCode` OR `timedOut: true`. Never
    * returns `{ exitCode: null, timedOut: false }` — that case throws.
    */
+  /**
+   * Drop undefined values so the result matches the Record<string, string>
+   * shape the exec transports expect (`ExecuteCommandOptions.env` is
+   * NodeJS.ProcessEnv). The sandbox's own env is already merged in by
+   * `executeCommand` before a transport sees these options. Returns undefined
+   * when there is nothing to send.
+   */
+  private _execEnv(options: ExecuteCommandOptions | undefined): Record<string, string> | undefined {
+    if (!options?.env) return undefined;
+    const filtered = Object.fromEntries(
+      Object.entries(options.env).filter((entry): entry is [string, string] => entry[1] !== undefined),
+    );
+    return Object.keys(filtered).length > 0 ? filtered : undefined;
+  }
+
   private async _runDirectExec(
+    identity: SandboxIdentity,
     fullCommand: string,
     effectiveTimeout: number | undefined,
     options: ExecuteCommandOptions | undefined,
   ): Promise<{ exitCode: number | null; stdout: string; stderr: string; timedOut: boolean }> {
-    // Filter undefined values out of the env overlay so we match the
-    // Record<string, string> shape execViaLease expects. `ExecuteCommandOptions.env`
-    // is NodeJS.ProcessEnv (string | undefined).
-    const filteredEnv = options?.env
-      ? Object.fromEntries(
-          Object.entries(options.env).filter((entry): entry is [string, string] => entry[1] !== undefined),
-        )
-      : undefined;
+    const filteredEnv = this._execEnv(options);
 
     let lastResult: Awaited<ReturnType<typeof execViaLease>> | undefined;
     let lastLease: CachedExecLease | undefined;
@@ -1185,10 +1461,11 @@ export class PlatformSandbox extends MastraSandbox {
     // may have already cached a fresh, unrelated lease in between, and we
     // must not discard that.
     for (let attempt = 0; attempt < 2; attempt++) {
+      if (!this._isCurrentIdentity(identity)) throw new SandboxNotReadyError(this.id);
       if (attempt > 0 && lastLease && this._lease === lastLease) this._lease = null;
       let lease: CachedExecLease;
       try {
-        lease = await this._ensureLease();
+        lease = await this._ensureLease(identity);
       } catch (error) {
         // 410 → sandbox has been destroyed. Clear all cached state so a
         // reused instance re-provisions cleanly, then hand off to the fleet
@@ -1196,9 +1473,8 @@ export class PlatformSandbox extends MastraSandbox {
         // propagate as-is — those are configuration or platform errors, not
         // a "reprovision me" signal.
         if (error instanceof PlatformApiError && error.status === 410) {
-          this._lease = null;
-          const priorSandboxId = this._sandboxId;
-          this._sandboxId = undefined;
+          if (this._clearDestroyedState(identity)) this.status = 'stopped';
+          const priorSandboxId = identity.sandboxId;
           throw new SandboxDestroyedError(
             `Sandbox ${priorSandboxId ?? '(unknown)'} was destroyed; /exec-lease returned 410`,
             {
@@ -1212,9 +1488,10 @@ export class PlatformSandbox extends MastraSandbox {
       }
       lastLease = lease;
       attemptsMade = attempt + 1;
+      const leaseCwd = options?.cwd ?? this.workingDirectory;
       const execOptions = {
         command: fullCommand,
-        ...(options?.cwd !== undefined && { cwd: options.cwd }),
+        ...(leaseCwd !== undefined && { cwd: leaseCwd }),
         ...(filteredEnv !== undefined && { env: filteredEnv }),
         ...(effectiveTimeout != null && effectiveTimeout > 0 && { timeoutMs: effectiveTimeout }),
         ...(this._webSocketFactory && { webSocketFactory: this._webSocketFactory }),
@@ -1224,6 +1501,7 @@ export class PlatformSandbox extends MastraSandbox {
           ? await this._e2bExecRunner(lease, execOptions)
           : await execViaLease(lease, execOptions);
       lastResult = result;
+      if (!this._isCurrentIdentity(identity)) throw new SandboxNotReadyError(this.id);
       // `null` exitCode with `timedOut: false` means the socket closed
       // without an exit frame — a transport failure (handshake stalled,
       // mid-stream drop, expired token). Any other outcome (real exit code
@@ -1244,12 +1522,12 @@ export class PlatformSandbox extends MastraSandbox {
     // isn't collateral-damaged.
     if (this._lease === lease) this._lease = null;
     throw new SandboxExecTransportError(
-      `Direct-exec transport failed for sandbox ${this._sandboxId ?? '(unknown)'} after ${attemptsMade} attempt(s)` +
+      `Direct-exec transport failed for sandbox ${identity.sandboxId} after ${attemptsMade} attempt(s)` +
         (result.closeCode !== undefined
           ? ` (close ${result.closeCode}${result.closeReason ? ` ${result.closeReason}` : ''})`
           : ''),
       {
-        ...(this._sandboxId && { sandboxId: this._sandboxId }),
+        sandboxId: identity.sandboxId,
         command: fullCommand,
         attempts: attemptsMade,
         opened: result.opened ?? false,
@@ -1274,23 +1552,18 @@ export class PlatformSandbox extends MastraSandbox {
    *   sidecar bug). Only this specific exec falls back.
    */
   private async _tryExecViaPrivateNetwork(
+    identity: SandboxIdentity,
     instanceUrl: string,
     fullCommand: string,
     effectiveTimeout: number | undefined,
     options: ExecuteCommandOptions | undefined,
   ): Promise<PrivateNetExecResult | undefined> {
-    // Match the env-filter dance in `_runDirectExec`: ExecuteCommandOptions.env
-    // is NodeJS.ProcessEnv (string | undefined) but the wire body wants a
-    // Record<string, string>.
-    const filteredEnv = options?.env
-      ? Object.fromEntries(
-          Object.entries(options.env).filter((entry): entry is [string, string] => entry[1] !== undefined),
-        )
-      : undefined;
+    const filteredEnv = this._execEnv(options);
 
+    const privateNetCwd = options?.cwd ?? this.workingDirectory;
     const execOptions: PrivateNetExecOptions = {
       command: fullCommand,
-      ...(options?.cwd !== undefined && { cwd: options.cwd }),
+      ...(privateNetCwd !== undefined && { cwd: privateNetCwd }),
       ...(filteredEnv !== undefined && { env: filteredEnv }),
       ...(effectiveTimeout != null && effectiveTimeout > 0 && { timeoutMs: effectiveTimeout }),
       ...(this._privateNetFetch && { fetch: this._privateNetFetch }),
@@ -1308,7 +1581,7 @@ export class PlatformSandbox extends MastraSandbox {
       }
       // Anything else escaping is unexpected (e.g. options validation). Treat
       // it like a transport failure so we don't wedge the caller.
-      this._invalidateAddress();
+      this._invalidateAddress(identity);
       return undefined;
     }
 
@@ -1320,7 +1593,7 @@ export class PlatformSandbox extends MastraSandbox {
     // still evicted so subsequent execs skip a dial we already know is slow —
     // but the timed-out result itself flows back to the caller unchanged.
     if (result.timedOut) {
-      if (!result.opened) this._invalidateAddress();
+      if (!result.opened) this._invalidateAddress(identity);
       return result;
     }
 
@@ -1330,7 +1603,7 @@ export class PlatformSandbox extends MastraSandbox {
     // means connection refused (no timeout to disambiguate).
     const transportFailed = !result.opened || result.exitCode === null;
     if (transportFailed) {
-      this._invalidateAddress();
+      this._invalidateAddress(identity);
       return undefined;
     }
 
@@ -1343,8 +1616,8 @@ export class PlatformSandbox extends MastraSandbox {
    * `instanceUrl` from a workspace-proxy response — until then, execs skip
    * the private-net dial and go straight to the lease path.
    */
-  private _invalidateAddress(): void {
-    if (this._sandboxId) this._addressRegistry?.delete(this._sandboxId);
+  private _invalidateAddress(identity: SandboxIdentity): void {
+    if (this._isCurrentIdentity(identity)) this._addressRegistry?.delete(identity.sandboxId);
   }
 
   /**
@@ -1354,8 +1627,9 @@ export class PlatformSandbox extends MastraSandbox {
    * Callers are expected to be on the "sandbox is running" path; we don't
    * re-check `_sandboxId` here because `executeCommand` already gated on it.
    */
-  private async _ensureLease(): Promise<CachedExecLease> {
+  private async _ensureLease(identity: SandboxIdentity): Promise<CachedExecLease> {
     const now = Date.now();
+    if (!this._isCurrentIdentity(identity) || this._teardownStarted) throw new SandboxNotReadyError(this.id);
     // Cache hit only when we know the expiry AND we're comfortably before it.
     // A null `expiresAtMs` means the provider didn't disclose a TTL — treat
     // that as "refresh every call" rather than "cache forever", so a token
@@ -1364,11 +1638,16 @@ export class PlatformSandbox extends MastraSandbox {
       return this._lease;
     }
     // Coalesce concurrent mints on a cold/expired cache.
-    if (this._leaseInFlight) return this._leaseInFlight;
-    if (!this._sandboxId) throw new SandboxNotReadyError(this.id);
-    const sandboxId = this._sandboxId;
+    if (
+      this._leaseInFlight &&
+      this._leaseInFlight.identity.sandboxId === identity.sandboxId &&
+      this._leaseInFlight.identity.generation === identity.generation
+    ) {
+      return this._leaseInFlight.promise;
+    }
+    const { sandboxId } = identity;
     const inFlight = (async () => {
-      const response = await this._client.request(`/sandbox/${encodeURIComponent(sandboxId)}/exec-lease`, {
+      const response = await this._request(`/sandbox/${encodeURIComponent(sandboxId)}/exec-lease`, {
         method: 'POST',
       });
       const json = (await response.json()) as ExecLeaseResponse;
@@ -1386,16 +1665,19 @@ export class PlatformSandbox extends MastraSandbox {
         // rather than silently caching a broken lease forever.
         expiresAtMs: expiresAtMs !== null && !Number.isNaN(expiresAtMs) ? expiresAtMs : null,
       };
+      if (!this._isCurrentIdentity(identity) || this._teardownStarted) {
+        throw new SandboxNotReadyError(this.id);
+      }
       this._lease = lease;
       return lease;
     })();
-    this._leaseInFlight = inFlight;
+    this._leaseInFlight = { identity, promise: inFlight };
     try {
       return await inFlight;
     } finally {
       // Clear on both success and failure so a failed mint doesn't wedge
       // future callers into awaiting the same rejected promise forever.
-      if (this._leaseInFlight === inFlight) this._leaseInFlight = null;
+      if (this._leaseInFlight?.promise === inFlight) this._leaseInFlight = null;
     }
   }
 
@@ -1433,7 +1715,7 @@ export class PlatformSandbox extends MastraSandbox {
         },
       };
     }
-    const response = await this._client.request(`/sandbox/${encodeURIComponent(this._sandboxId)}`);
+    const response = await this._request(`/sandbox/${encodeURIComponent(this._sandboxId)}`);
     const json = (await response.json()) as CreateSandboxResponse;
     return {
       id: json.id,

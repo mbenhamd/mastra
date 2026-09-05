@@ -4,12 +4,9 @@ import { createSampleTask } from './data';
 
 export interface BackgroundTasksTestOptions {
   storage: MastraStorage;
-  capabilities?: {
-    backgroundTasksUpdateIfStatus?: boolean;
-  };
 }
 
-export function createBackgroundTasksTests({ storage, capabilities = {} }: BackgroundTasksTestOptions) {
+export function createBackgroundTasksTests({ storage }: BackgroundTasksTestOptions) {
   let bgStorage: BackgroundTasksStorage;
 
   beforeAll(async () => {
@@ -91,6 +88,30 @@ export function createBackgroundTasksTests({ storage, capabilities = {} }: Backg
     });
 
     describe('updateTask', () => {
+      it('applies an update only when the expected status matches', async () => {
+        if (!bgStorage) return;
+        const task = createSampleTask({ status: 'pending' });
+        await bgStorage.createTask(task);
+
+        await expect(
+          bgStorage.updateTask(task.id, { status: 'running', startedAt: new Date() }, { expectedStatus: 'pending' }),
+        ).resolves.toBe(true);
+
+        expect((await bgStorage.getTask(task.id))!.status).toBe('running');
+      });
+
+      it('rejects an update when the expected status no longer matches', async () => {
+        if (!bgStorage) return;
+        const task = createSampleTask({ status: 'cancelled', completedAt: new Date() });
+        await bgStorage.createTask(task);
+
+        await expect(
+          bgStorage.updateTask(task.id, { status: 'running', startedAt: new Date() }, { expectedStatus: 'pending' }),
+        ).resolves.toBe(false);
+
+        expect((await bgStorage.getTask(task.id))!.status).toBe('cancelled');
+      });
+
       it('updates status and timestamps', async () => {
         if (!bgStorage) return;
         const task = createSampleTask();

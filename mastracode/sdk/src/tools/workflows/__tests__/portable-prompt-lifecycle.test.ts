@@ -133,7 +133,11 @@ const scenarios = [
     definition: {
       id: 'portable-defaults-workflow',
       inputSchema: objectSchema({}),
-      outputSchema: {},
+      outputSchema: objectSchema({ enabled: { type: 'boolean' }, retries: numberSchema, mode: stringSchema }, [
+        'enabled',
+        'retries',
+        'mode',
+      ]),
       graph: [
         {
           type: 'mapping',

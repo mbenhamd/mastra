@@ -49,7 +49,7 @@ export function buildBackgroundTaskWorkflow(manager: BackgroundTaskManager) {
     id: 'run-attempt',
     inputSchema: bodyIOSchema,
     outputSchema: bodyOutputSchema,
-    execute: async ({ inputData, abortSignal: workflowAbortSignal, suspend, resumeData }) => {
+    execute: async ({ inputData, abortSignal: workflowAbortSignal, suspend, resumeData, suspendData }) => {
       const { taskId } = inputData;
       const storage = await manager.getStorage();
       const task = await storage.getTask(taskId);
@@ -231,7 +231,13 @@ export function buildBackgroundTaskWorkflow(manager: BackgroundTaskManager) {
       let attemptResult: unknown;
       let attemptError: { name?: string; message: string; stack?: string } | undefined;
       try {
-        attemptResult = await executor.execute(task.args, {
+        const args = { ...task.args };
+        const suspendedToolRunId = (suspendData as { suspendedToolRunId?: unknown } | undefined)?.suspendedToolRunId;
+        if (resumeData !== undefined && !args.suspendedToolRunId && typeof suspendedToolRunId === 'string') {
+          args.suspendedToolRunId = suspendedToolRunId;
+        }
+
+        attemptResult = await executor.execute(args, {
           abortSignal: abortController.signal,
           onProgress,
           suspend: wrappedSuspend,

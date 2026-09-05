@@ -29,6 +29,7 @@ import { createExactJsonMeasurementSnapshot } from '../../../../observability/co
 import { getRootExportSpan, getStepAvailableToolNames } from '../../../../observability/utils';
 import type { CachedLLMStepResponse } from '../../../../processors';
 import { PrepareStepProcessor } from '../../../../processors/processors/prepare-step';
+import { isMaybeAnthropicWithoutAssistantPrefill } from '../../../../processors/provider-history-compat';
 import { ProcessorRunner } from '../../../../processors/runner';
 import { execute } from '../../../../stream/aisdk/v5/execute';
 import { MastraModelOutput } from '../../../../stream/base/output';
@@ -55,7 +56,7 @@ import { TripWire } from '../../../trip-wire';
 import { isSupportedLanguageModel } from '../../../utils';
 import { ensureRemoteAbortListener } from '../../abort-transport';
 import { DurableStepIds } from '../../constants';
-import { endRunSpansWithError, getBoundRunRegistryEntry } from '../../run-registry';
+import { endRunSpansWithError, getBoundRunRegistryEntry, markRunActive } from '../../run-registry';
 import { emitChunkEvent, emitStepStartEvent } from '../../stream-adapter';
 import type { DurableAgenticWorkflowInput, DurableLLMStepOutput, DurableToolCallInput } from '../../types';
 import { applyToolPayloadTransformToChunk } from '../../utils/apply-tool-payload-transform';
@@ -463,6 +464,11 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
         for (let attempt = 0; attempt <= maxRetries; attempt++) {
           let attemptModelSpan: AIModelGenerationSpan | undefined;
           let attemptModelSpanTracker: IModelSpanTracker | undefined;
+          // Declared outside the try so the outer catch can persist
+          // already-streamed partial output on abort (#22593). Assigned inside
+          // once streaming state exists; undefined means nothing streamed yet.
+          const textDeltas: string[] = [];
+          let materializeStreamedMessages: (() => void) | undefined;
           try {
             // Resolve the model - for single model case (no modelList), use resolved model
             // For model list case, try registry first (works with mock models), then config resolution (for Inngest)
@@ -557,7 +563,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
             const stepInputProcessors = registryEntry?.prepareStep
               ? [...baseInputProcessors, new PrepareStepProcessor({ prepareStep: registryEntry.prepareStep })]
               : baseInputProcessors;
-            if (stepInputProcessors.length) {
+            if (stepInputProcessors.length || isMaybeAnthropicWithoutAssistantPrefill(currentModel)) {
               // A durable tool-call can execute on another worker, where the
               // only valid implementation is the one reconstructed from the
               // registered Agent/workspace surface. Give processors an
@@ -720,6 +726,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                           workspace: registryEntry?.workspace,
                           requireApproval: (tool as any).requireApproval,
                           backgroundConfig: (tool as any).background,
+                          agentBackgroundConfig: registryEntry?.backgroundTasksConfig,
                           // Emit context.writer.write() / .custom() output through pubsub,
                           // matching how the durable tool-call step builds its writer.
                           outputWriter: pubsub
@@ -865,7 +872,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
             inputMessages = injectBackgroundTaskPrompt({
               inputMessages,
               backgroundTaskManager: registryEntry?.backgroundTaskManager,
-              tools: currentTools as Record<string, { background?: any; description?: string }> | undefined,
+              tools: currentTools,
               agentBackgroundConfig: registryEntry?.backgroundTasksConfig,
             });
 
@@ -1027,7 +1034,6 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
             let warnings: any[] = [];
             let request: any = {};
             let rawResponse: any = {};
-            const textDeltas: string[] = [];
             const toolCalls: DurableToolCallInput[] = [];
             let finishReason: string = 'stop';
             let usage: any = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
@@ -1283,6 +1289,52 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
             // (e.g. OpenAI itemId) required by subsequent turns (#19365).
             const collectedChunks: CollectedChunk[] = [];
 
+            // Materialize collected chunks into the messageList via the same
+            // helper the regular Agent uses, preserving reasoning spans
+            // (#19365) and modelId/provider/traceId metadata (#19891).
+            // Called on the success path AND both abort returns: the
+            // serialized messageListState is the only channel to finalize-run
+            // persistence, so skipping this on abort would drop
+            // already-streamed partial output (#22593).
+            materializeStreamedMessages = () => {
+              const responseModelId = currentModel.modelId ?? responseMetadata?.modelId;
+              const responseTraceId = runTracingSafely(
+                () =>
+                  getRootExportSpan(
+                    runTracingSafely(() => modelSpanTracker?.getTracingContext())?.currentSpan ??
+                      tracingContext?.currentSpan,
+                  )?.externalTraceId,
+              );
+              const responseModelMetadata =
+                responseModelId || currentModel.provider || responseTraceId
+                  ? {
+                      metadata: {
+                        ...(responseModelId ? { modelId: responseModelId } : {}),
+                        ...(currentModel.provider ? { provider: currentModel.provider } : {}),
+                        ...(responseTraceId ? { traceId: responseTraceId } : {}),
+                      },
+                    }
+                  : undefined;
+              const builtMessages = buildMessagesFromChunks({
+                chunks: collectedChunks,
+                messageId: currentMessageId,
+                tools: currentTools,
+                responseModelMetadata,
+              });
+              if (builtMessages.length > 0) {
+                for (const msg of builtMessages) {
+                  messageList.add(msg, 'response');
+                }
+
+                // Sync the updated messageList to the in-process registry so
+                // downstream steps (e.g. tool-call.ts's doFlush()) see the
+                // assistant message when persisting before suspension.
+                if (registryEntry) {
+                  registryEntry.messageList = messageList;
+                }
+              }
+            };
+
             // 10. Execute LLM call (or replay cached response)
             let modelResult: ReturnType<typeof execute>;
             if (cachedResponse) {
@@ -1321,76 +1373,81 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
               // Use the freshly read signal and per-call headers as well, never
               // capabilities retained from a stale entry before processors ran.
               const providerRegistryEntry = getBoundRunRegistryEntry(runId, typedInput.runtimeBindingId);
-              modelResult = execute({
-                runId,
-                model: currentModel,
-                providerOptions: currentProviderOptions,
-                inputMessages,
-                tools: currentTools,
-                toolChoice: currentToolChoice,
-                activeTools: currentActiveTools,
-                options: { abortSignal: providerRegistryEntry?.abortSignal ?? executionAbortSignal },
-                headers: mergeLlmCallHeaders({
-                  memoryHeaders: buildMemoryHeaders({
-                    threadId: typedInput.state?.threadId,
-                    resourceId: typedInput.state?.resourceId,
+              const releaseModelCallActivity = markRunActive(runId);
+              try {
+                modelResult = execute({
+                  runId,
+                  model: currentModel,
+                  providerOptions: currentProviderOptions,
+                  inputMessages,
+                  tools: currentTools,
+                  toolChoice: currentToolChoice,
+                  activeTools: currentActiveTools,
+                  options: { abortSignal: providerRegistryEntry?.abortSignal ?? executionAbortSignal },
+                  headers: mergeLlmCallHeaders({
+                    memoryHeaders: buildMemoryHeaders({
+                      threadId: typedInput.state?.threadId,
+                      resourceId: typedInput.state?.resourceId,
+                    }),
+                    modelConfigHeaders: resolvedModelList?.find(m => m.id === modelEntry.id)?.headers,
+                    callTimeHeaders:
+                      providerRegistryEntry?.callTimeHeaders || currentModelSettings?.headers
+                        ? {
+                            ...(providerRegistryEntry?.callTimeHeaders as Record<string, string> | undefined),
+                            ...(currentModelSettings?.headers as Record<string, string> | undefined),
+                          }
+                        : undefined,
                   }),
-                  modelConfigHeaders: resolvedModelList?.find(m => m.id === modelEntry.id)?.headers,
-                  callTimeHeaders:
-                    providerRegistryEntry?.callTimeHeaders || currentModelSettings?.headers
-                      ? {
-                          ...(providerRegistryEntry?.callTimeHeaders as Record<string, string> | undefined),
-                          ...(currentModelSettings?.headers as Record<string, string> | undefined),
-                        }
-                      : undefined,
-                }),
-                modelSettings: {
-                  ...currentModelSettings,
-                  maxRetries: 0,
-                },
-                includeRawChunks: execOptions.includeRawChunks,
-                methodType: 'stream',
-                providerAttemptOffset: providerAttemptCount,
-                structuredOutput: structuredOutput as any,
-                ...(canRecordPreparedRequest
-                  ? {
-                      onPreparedRequest: metrics => {
-                        runTracingSafely(() => modelSpanTracker?.recordPreparedRequest?.(metrics));
-                        snapshotLatestModelSpanData(modelSpan);
-                      },
-                    }
-                  : {}),
-                onProviderAttemptStart: providerAttempt => {
-                  providerAttemptCount = providerAttempt;
-                  runTracingSafely(() => modelSpanTracker?.startInference?.(undefined, providerAttempt));
-                },
-                onProviderAttemptError: ({ error, aborted }) => {
-                  const providerError = asDurableModelError(error, 'Provider attempt failed');
-                  runTracingSafely(() =>
-                    aborted
-                      ? modelSpanTracker?.reportInferenceAbort?.({ error: providerError })
-                      : modelSpanTracker?.reportInferenceError?.({ error: providerError }),
-                  );
-                  snapshotLatestModelSpanData(modelSpan);
-                },
-                onProviderFirstContent: () => {
-                  runTracingSafely(() => modelSpanTracker?.recordInferenceContentStart?.());
-                },
-                onProviderChunk: (chunk, observedAt) => {
-                  runTracingSafely(() => modelSpanTracker?.recordInferenceChunkTimestamp?.(chunk, observedAt));
-                },
-                onProviderFinish: (payload, endTime, response) => {
-                  runTracingSafely(() => modelSpanTracker?.recordInferenceFinish?.(payload, endTime, response));
-                },
-                onResult: ({ warnings: w, request: r, rawResponse: rr }) => {
-                  warnings = w || [];
-                  request = r || {};
-                  rawResponse = rr || {};
-                  runTracingSafely(() =>
-                    modelSpanTracker?.updateStep?.({ request, inputMessages, warnings, messageId: currentMessageId }),
-                  );
-                },
-              });
+                  modelSettings: {
+                    ...currentModelSettings,
+                    maxRetries: 0,
+                  },
+                  includeRawChunks: execOptions.includeRawChunks,
+                  methodType: 'stream',
+                  providerAttemptOffset: providerAttemptCount,
+                  structuredOutput: structuredOutput as any,
+                  ...(canRecordPreparedRequest
+                    ? {
+                        onPreparedRequest: metrics => {
+                          runTracingSafely(() => modelSpanTracker?.recordPreparedRequest?.(metrics));
+                          snapshotLatestModelSpanData(modelSpan);
+                        },
+                      }
+                    : {}),
+                  onProviderAttemptStart: providerAttempt => {
+                    providerAttemptCount = providerAttempt;
+                    runTracingSafely(() => modelSpanTracker?.startInference?.(undefined, providerAttempt));
+                  },
+                  onProviderAttemptError: ({ error, aborted }) => {
+                    const providerError = asDurableModelError(error, 'Provider attempt failed');
+                    runTracingSafely(() =>
+                      aborted
+                        ? modelSpanTracker?.reportInferenceAbort?.({ error: providerError })
+                        : modelSpanTracker?.reportInferenceError?.({ error: providerError }),
+                    );
+                    snapshotLatestModelSpanData(modelSpan);
+                  },
+                  onProviderFirstContent: () => {
+                    runTracingSafely(() => modelSpanTracker?.recordInferenceContentStart?.());
+                  },
+                  onProviderChunk: (chunk, observedAt) => {
+                    runTracingSafely(() => modelSpanTracker?.recordInferenceChunkTimestamp?.(chunk, observedAt));
+                  },
+                  onProviderFinish: (payload, endTime, response) => {
+                    runTracingSafely(() => modelSpanTracker?.recordInferenceFinish?.(payload, endTime, response));
+                  },
+                  onResult: ({ warnings: w, request: r, rawResponse: rr }) => {
+                    warnings = w || [];
+                    request = r || {};
+                    rawResponse = rr || {};
+                    runTracingSafely(() =>
+                      modelSpanTracker?.updateStep?.({ request, inputMessages, warnings, messageId: currentMessageId }),
+                    );
+                  },
+                });
+              } finally {
+                releaseModelCallActivity();
+              }
             }
 
             // Filter the effective no-tools boundary before MastraModelOutput,
@@ -1466,6 +1523,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
 
             let deferredStepFinishChunk: any = null;
             let streamAborted = false;
+            const releaseStreamActivity = markRunActive(runId);
             try {
               let stepStartEmitted = false;
               for await (const rawChunk of trackedStream) {
@@ -1844,6 +1902,8 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
               }
               const failedModelSpanData = snapshotLatestModelSpanData(modelSpan);
               if (isAbort) {
+                // Persist already-streamed partial output (#22593).
+                materializeStreamedMessages();
                 // Return a clean output instead of throwing so the workflow
                 // engine doesn't crash. The dowhile predicate will see
                 // isContinued: false and stop the loop. The FINISH event
@@ -1912,12 +1972,15 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
 
               if (attempt < maxRetries) continue; // retry same model
               break; // exhausted retries, try next model
+            } finally {
+              releaseStreamActivity();
             }
 
             if (streamAborted) {
               runTracingSafely(() =>
                 modelSpanTracker?.endStep?.({ attributes: { finishReason: 'abort', isContinued: false } }),
               );
+              materializeStreamedMessages();
               return {
                 messageListState: messageList.serialize(),
                 text: textDeltas.join(''),
@@ -1952,6 +2015,8 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
               }
               const failedModelSpanData = snapshotLatestModelSpanData(modelSpan);
               if (isStreamErrorAbort) {
+                // Persist already-streamed partial output (#22593).
+                materializeStreamedMessages();
                 return {
                   messageListState: messageList.serialize(),
                   text: textDeltas.join(''),
@@ -2043,61 +2108,11 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
               }
             }
 
-            // 12. Add assistant response to message list.
-            // Build parts from the full chunk sequence via the same helper
-            // the regular Agent uses, so reasoning spans (including empty
-            // reasoning with providerMetadata.openai.itemId) are preserved
-            // alongside text and tool-calls in stream order. Without this
-            // OpenAI reasoning models fail on the next turn with
-            // "Item 'fc_...' of type 'function_call' was provided without
-            // its required 'reasoning' item" (#19365).
-            //
-            // Mirror the regular Agent's buildResponseModelMetadata so the
-            // persisted assistant message carries the same content.metadata
-            // (modelId/provider): prefer the static model, fall back to the
-            // response-metadata chunk.
-            // The traceId link (#19891) mirrors it too: message rows carry no traceId
-            // column, so this metadata is the only way a stored assistant message can
-            // be correlated back to its trace.
+            // Preserve the pre-step response set for caller-visible text after output processors run.
             const responseMessageIdsBeforeCurrentStep = new Set(
               messageList.get.response.db().map(message => message.id),
             );
-            const responseModelId = currentModel.modelId ?? responseMetadata?.modelId;
-            const responseTraceId = runTracingSafely(
-              () =>
-                getRootExportSpan(
-                  runTracingSafely(() => modelSpanTracker?.getTracingContext())?.currentSpan ??
-                    tracingContext?.currentSpan,
-                )?.externalTraceId,
-            );
-            const responseModelMetadata =
-              responseModelId || currentModel.provider || responseTraceId
-                ? {
-                    metadata: {
-                      ...(responseModelId ? { modelId: responseModelId } : {}),
-                      ...(currentModel.provider ? { provider: currentModel.provider } : {}),
-                      ...(responseTraceId ? { traceId: responseTraceId } : {}),
-                    },
-                  }
-                : undefined;
-            const builtMessages = buildMessagesFromChunks({
-              chunks: collectedChunks,
-              messageId: currentMessageId,
-              tools: currentTools,
-              responseModelMetadata,
-            });
-            if (builtMessages.length > 0) {
-              for (const msg of builtMessages) {
-                messageList.add(msg, 'response');
-              }
-
-              // Sync the updated messageList to the in-process registry so
-              // downstream steps (e.g. tool-call.ts's doFlush()) see the
-              // assistant message when persisting before suspension.
-              if (registryEntry) {
-                registryEntry.messageList = messageList;
-              }
-            }
+            materializeStreamedMessages();
 
             // 13. Determine if we should continue (has tool calls). A
             // non-compliant recovery provider cannot create executable work.
@@ -2361,11 +2376,14 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
             const failedModelSpanData = snapshotLatestModelSpanData(attemptModelSpan);
             if (isAbort) {
               // Return a clean output instead of throwing so the workflow
-              // engine doesn't crash. The abort event was already emitted
-              // by the inner catch.
+              // engine doesn't crash. Persist already-streamed partial output
+              // first (#22593) — errors thrown after the stream loop (e.g. a
+              // response processor rethrown at the processLLMResponse call)
+              // land here without passing through the inner catch.
+              materializeStreamedMessages?.();
               return {
                 messageListState: messageList.serialize(),
-                text: '',
+                text: textDeltas.join(''),
                 toolCalls: [],
                 stepResult: {
                   reason: 'abort' as any,

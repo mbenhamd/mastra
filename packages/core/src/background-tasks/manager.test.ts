@@ -189,7 +189,7 @@ describe('BackgroundTaskManager', () => {
         createdAt: new Date(),
       });
       manager.registerTaskContext(taskId, ctx(vi.fn().mockResolvedValue('ok')));
-      const claim = vi.spyOn(backgroundTasksStore!, 'updateTaskIfStatus').mockResolvedValueOnce(false);
+      const claim = vi.spyOn(backgroundTasksStore!, 'updateTask').mockResolvedValueOnce(false);
 
       const consumed = await dispatchWithPrivateHandler(manager, {
         id: 'event-claim-race',
@@ -201,7 +201,9 @@ describe('BackgroundTaskManager', () => {
 
       expect(consumed).toBe(true);
       expect(manager.taskContexts.has(taskId)).toBe(true);
-      expect(claim).toHaveBeenCalledWith(taskId, 'pending', expect.objectContaining({ status: 'running' }));
+      expect(claim).toHaveBeenCalledWith(taskId, expect.objectContaining({ status: 'running' }), {
+        expectedStatus: 'pending',
+      });
       claim.mockRestore();
     });
 
@@ -222,7 +224,7 @@ describe('BackgroundTaskManager', () => {
         createdAt: new Date(),
       });
       manager.registerTaskContext(taskId, ctx(vi.fn().mockResolvedValue('ok')));
-      const claim = vi.spyOn(backgroundTasksStore!, 'updateTaskIfStatus').mockImplementationOnce(async () => {
+      const claim = vi.spyOn(backgroundTasksStore!, 'updateTask').mockImplementationOnce(async () => {
         await backgroundTasksStore!.updateTask(taskId, { status: 'cancelled', completedAt: new Date() });
         return false;
       });
@@ -237,7 +239,9 @@ describe('BackgroundTaskManager', () => {
 
       expect(consumed).toBe(true);
       expect(manager.taskContexts.has(taskId)).toBe(true);
-      expect(claim).toHaveBeenCalledWith(taskId, 'pending', expect.objectContaining({ status: 'running' }));
+      expect(claim).toHaveBeenCalledWith(taskId, expect.objectContaining({ status: 'running' }), {
+        expectedStatus: 'pending',
+      });
       claim.mockRestore();
 
       const cancelledTask = await backgroundTasksStore!.getTask(taskId);
@@ -264,7 +268,7 @@ describe('BackgroundTaskManager', () => {
         createdAt: new Date(),
       });
       manager.registerTaskContext(taskId, ctx(vi.fn().mockResolvedValue('ok')));
-      const claim = vi.spyOn(backgroundTasksStore!, 'updateTaskIfStatus').mockImplementationOnce(async () => {
+      const claim = vi.spyOn(backgroundTasksStore!, 'updateTask').mockImplementationOnce(async () => {
         await backgroundTasksStore!.updateTask(taskId, { status: 'running', startedAt: new Date() });
         return false;
       });
@@ -915,13 +919,19 @@ describe('BackgroundTaskManager', () => {
       expect(suspendedChunk.payload.suspendPayload).toEqual({ ask: 'pause' });
     });
 
-    it('resumes a suspended task with resumeData and completes', async () => {
-      const executeFn = vi.fn(async (_args, opts: any) => {
+    it('resumes a suspended task with resumeData and the suspended tool run id', async () => {
+      const executeFn = vi.fn(async (args, opts: any) => {
         if (!opts.resumeData) {
-          await opts.suspend({ awaiting: 'approval' });
+          await opts.suspend(
+            { awaiting: 'approval', suspendedToolRunId: 'delegated-run-id' },
+            { runId: 'delegated-run-id' },
+          );
           return undefined;
         }
-        return { approvedBy: (opts.resumeData as { user: string }).user };
+        return {
+          approvedBy: (opts.resumeData as { user: string }).user,
+          suspendedToolRunId: args.suspendedToolRunId,
+        };
       });
 
       const { task } = await manager.enqueue(
@@ -930,13 +940,14 @@ describe('BackgroundTaskManager', () => {
       );
       await tick(200);
       expect((await manager.getTask(task.id))?.status).toBe('suspended');
+      expect(executeFn.mock.calls[0]?.[0]).not.toHaveProperty('suspendedToolRunId');
 
       await manager.resume(task.id, { user: 'alice' });
       await tick(200);
 
       const completed = await manager.getTask(task.id);
       expect(completed?.status).toBe('completed');
-      expect(completed?.result).toEqual({ approvedBy: 'alice' });
+      expect(completed?.result).toEqual({ approvedBy: 'alice', suspendedToolRunId: 'delegated-run-id' });
       expect(completed?.suspendPayload).toBeUndefined();
       expect(executeFn).toHaveBeenCalledTimes(2);
     });
@@ -1221,15 +1232,13 @@ describe('BackgroundTaskManager', () => {
         createdAt: new Date(),
         startedAt: new Date(Date.now() - 60_000),
       });
-      const update = vi.spyOn(bgStore!, 'updateTaskIfStatus').mockResolvedValueOnce(false);
+      const update = vi.spyOn(bgStore!, 'updateTask').mockResolvedValueOnce(false);
 
       try {
         await withRecoveringManager(seedStorage, async () => {
-          expect(update).toHaveBeenCalledWith(
-            'recovery-cas-race',
-            'running',
-            expect.objectContaining({ status: 'failed' }),
-          );
+          expect(update).toHaveBeenCalledWith('recovery-cas-race', expect.objectContaining({ status: 'failed' }), {
+            expectedStatus: 'running',
+          });
           const stillRunning = await bgStore!.getTask('recovery-cas-race');
           expect(stillRunning?.status).toBe('running');
         });

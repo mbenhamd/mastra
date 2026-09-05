@@ -1,7 +1,7 @@
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
 import {
   createStorageErrorId,
-  matchesExpectedWorkflowStatus,
+  matchesExpectedWorkflowState,
   WorkflowsStorage,
   TABLE_WORKFLOW_SNAPSHOT,
   TABLE_SCHEMAS,
@@ -262,8 +262,14 @@ export class WorkflowsMSSQL extends WorkflowsStorage {
         );
       }
 
-      const { expectedStatus, ...state } = opts;
-      if (!matchesExpectedWorkflowStatus(snapshot.status, expectedStatus)) {
+      const { expectedStatus, expectedExecutionGeneration, expectedLifecycleResumeAttempt, ...state } = opts;
+      if (
+        !matchesExpectedWorkflowState(snapshot, {
+          expectedStatus,
+          expectedExecutionGeneration,
+          expectedLifecycleResumeAttempt,
+        })
+      ) {
         await transaction.rollback();
         return undefined;
       }

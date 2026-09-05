@@ -11,13 +11,13 @@
  *    input and output OM processor instances can share it within one request.
  *  - A second input processor is composed as a workflow (the documented "run guardrails in
  *    parallel" pattern). The agent runs all input processors as a combined
- *    `${id}-input-processor` workflow; the guardrails workflow becomes a nested workflow
- *    whose pending snapshot carries the processor state in `context.input`.
- *  - Serializing that snapshot reaches the OM cycle and used to throw.
+ *    `${id}-input-processor` workflow while retaining processor state in the request-local
+ *    runtime map.
+ *  - Serializing a processor workflow snapshot must not reach that live OM cycle.
  *
- * The fix is at the source: `ObservationTurn`/`ObservationStep` project to a minimal, acyclic
- * representation via `toJSON()`, so any `JSON.stringify` of a snapshot that happens to carry a
- * turn produces a correct, lossless value instead of crashing.
+ * The persistence boundary is the primary fix: live processor state is not workflow state and
+ * must remain process-local. `ObservationTurn`/`ObservationStep` still provide minimal acyclic
+ * `toJSON()` projections for callers that explicitly serialize those runtime objects.
  */
 import { MockLanguageModelV2, convertArrayToReadableStream } from '@internal/ai-sdk-v5/test';
 import { Agent } from '@mastra/core/agent';
@@ -104,21 +104,6 @@ function createGuardrailWorkflow(): InputProcessorOrWorkflow {
     .commit() as unknown as InputProcessorOrWorkflow;
 }
 
-// Recursively look for the ObservationTurn projection produced by `ObservationTurn.toJSON()`.
-function findTurnProjection(value: unknown, seen = new Set<unknown>()): Record<string, unknown> | undefined {
-  if (value === null || typeof value !== 'object' || seen.has(value)) return undefined;
-  seen.add(value);
-  const obj = value as Record<string, unknown>;
-  if (obj.threadId === 'thread-1' && typeof obj.started === 'boolean' && typeof obj.ended === 'boolean') {
-    return obj;
-  }
-  for (const child of Object.values(obj)) {
-    const found = findTurnProjection(child, seen);
-    if (found) return found;
-  }
-  return undefined;
-}
-
 describe('processor workflow + observational memory (issue #17933)', () => {
   let store: InMemoryStore;
   let memory: Memory;
@@ -144,9 +129,8 @@ describe('processor workflow + observational memory (issue #17933)', () => {
   });
 
   // Make the workflows store serialize the snapshot the way a standard SQL adapter (e.g. pg) does:
-  // a plain JSON.stringify with no circular-safe replacer. libsql's safeStringify hides the bug by
-  // silently rewriting cycles to "[Circular]" — that lossy behaviour is exactly what we must NOT
-  // rely on. Capture every snapshot so the test can prove they round-trip losslessly. If a snapshot
+  // a plain JSON.stringify with no circular-safe replacer. Capture every snapshot so the test can
+  // prove the request-local processor state never crosses the persistence boundary. If a snapshot
   // is unserializable, report which top-level field still holds the cycle.
   async function captureSnapshotSerialization(storage: InMemoryStore) {
     // Capture the serialized string at persist time — the live snapshot objects are mutated
@@ -176,7 +160,7 @@ describe('processor workflow + observational memory (issue #17933)', () => {
     return captured;
   }
 
-  it('serializes the workflow snapshot losslessly with a workflow-composed input processor', async () => {
+  it('keeps a live OM turn out of workflow snapshots with a workflow-composed input processor', async () => {
     const agent = new Agent({
       id: 'om-guardrails-agent',
       name: 'om-guardrails-agent',
@@ -200,13 +184,12 @@ describe('processor workflow + observational memory (issue #17933)', () => {
       });
     expect(result.text).toBeTruthy();
 
-    // Losslessness: the turn rode into at least one persisted snapshot, and that snapshot
-    // round-trips to a CORRECT, acyclic projection of the turn — not a "[Circular]" stub.
-    const turnProjection = snapshots.map(s => findTurnProjection(JSON.parse(s))).find(Boolean);
-    expect(turnProjection).toBeDefined();
-    expect(turnProjection).toMatchObject({ threadId: 'thread-1', resourceId: 'resource-1', started: true });
-    // No mangled circular markers leaked into any snapshot.
+    // Processor workflow snapshots still persist, but live request-local state must not.
+    expect(snapshots.length).toBeGreaterThan(0);
     for (const snapshot of snapshots) {
+      expect(() => JSON.parse(snapshot)).not.toThrow();
+      expect(snapshot).not.toContain('"__omTurn"');
+      expect(snapshot).not.toContain('"__type":"ObservationTurn"');
       expect(snapshot).not.toContain('[Circular]');
     }
 

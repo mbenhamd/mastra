@@ -83,6 +83,7 @@ export type StorageRequest =
       tableName: TABLE_NAMES | string;
       id: string;
       record: Record<string, any>;
+      expected?: Record<string, any>;
     }
   | {
       op: 'updateThread';
@@ -130,14 +131,6 @@ export type StorageRequest =
       op: 'deleteMany';
       tableName: TABLE_NAMES | string;
       ids: string[];
-    }
-  | {
-      op: 'updateIfFieldEquals';
-      tableName: TABLE_NAMES | string;
-      id: string;
-      field: string;
-      expectedValue: string | number | boolean | null;
-      patch: Record<string, any>;
     }
   | {
       op: 'mergeWorkflowStepResult';

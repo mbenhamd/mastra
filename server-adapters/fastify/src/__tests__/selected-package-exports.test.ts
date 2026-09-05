@@ -177,7 +177,7 @@ describe('selected public package exports', () => {
 
   it('resolves the built selected declaration exports for NodeNext ESM and CommonJS consumers', () => {
     runNode([
-      requireFromTest.resolve('typescript/bin/tsc'),
+      resolve(dirname(requireFromTest.resolve('typescript/package.json')), 'bin/tsc'),
       '--project',
       'test-fixtures/selected-package-types/tsconfig.json',
     ]);

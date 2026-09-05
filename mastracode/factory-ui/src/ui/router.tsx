@@ -17,6 +17,8 @@ import type { RouteObject } from 'react-router';
 import Chat from './domains/chat/Chat';
 import { RootGuards } from './domains/auth/components/RootGuards';
 import { AuditPage } from './pages/AuditPage';
+import { ActivityPage } from './pages/ActivityPage';
+import { AttentionPage } from './pages/AttentionPage';
 import { KnowledgePage } from './pages/KnowledgePage';
 import { ReviewBoardPage, WorkBoardPage } from './pages/BoardPage';
 import { CreateFactoryPage } from './pages/CreateFactoryPage';
@@ -27,6 +29,7 @@ import { SettingsPage } from './pages/SettingsPage';
 import { SlackConnectionPage } from './pages/SlackConnectionPage';
 import { RulesPage } from './pages/RulesPage';
 import { SignInPage } from './pages/SignInPage';
+import { SupervisorPage } from './pages/SupervisorPage';
 import { ThreadPage } from './pages/ThreadPage';
 
 import { useFactoriesQuery } from '../hooks/useFactories';
@@ -161,6 +164,11 @@ export function createAppRoutes(): RouteObject[] {
               children: [{ index: true, element: <ThreadPage /> }],
             },
             {
+              path: 'supervisor',
+              element: <Chat />,
+              children: [{ index: true, element: <SupervisorPage /> }],
+            },
+            {
               element: <Chat />,
               children: [
                 { path: 'new', element: <NewPage /> },
@@ -168,6 +176,8 @@ export function createAppRoutes(): RouteObject[] {
                 { path: 'work', element: <WorkBoardPage /> },
                 { path: 'review', element: <ReviewBoardPage /> },
                 { path: 'overview', element: <OverviewPage /> },
+                { path: 'attention', element: <AttentionPage /> },
+                { path: 'activity', element: <ActivityPage /> },
                 { path: 'metrics', element: <MetricsRedirect /> },
                 { path: 'rules', element: <RulesPage /> },
                 { path: 'audit', element: <AuditPage /> },

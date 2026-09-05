@@ -1,6 +1,6 @@
 import { ReadableStream, TransformStream } from 'node:stream/web';
 import { isProxy } from 'node:util/types';
-import { isAbortError } from '@ai-sdk/provider-utils-v5';
+import { isAbortError } from '@ai-sdk/provider-utils-v6';
 import type { LanguageModelV2Usage } from '@ai-sdk/provider-v5';
 import { APICallError } from '@internal/ai-sdk-v5';
 import type { CallSettings, StepResult, ToolChoice, ToolSet } from '@internal/ai-sdk-v5';
@@ -49,8 +49,9 @@ import type {
 } from '../../../processors/index';
 import { isProcessorWorkflow } from '../../../processors/index';
 import { PrepareStepProcessor } from '../../../processors/processors/prepare-step';
-import { ProcessorRunner } from '../../../processors/runner';
+import { isMaybeAnthropicWithoutAssistantPrefill } from '../../../processors/provider-history-compat';
 import type { ProcessorState } from '../../../processors/runner';
+import { ProcessorRunner } from '../../../processors/runner';
 import { RequestContext } from '../../../request-context';
 import { execute } from '../../../stream/aisdk/v5/execute';
 import { DefaultStepResult } from '../../../stream/aisdk/v5/output-helpers';
@@ -191,6 +192,24 @@ function localToolCallPayloadIsComplete(toolCall: { args?: unknown; input?: unkn
   // upstream (see MastraModelOutput streaming-end parse failure).
   return typeof raw === 'object';
 }
+
+/**
+ * Chunk types that represent actual model output for a step. Used to detect a
+ * "zero-output" step: a stream that finishes with reason `other` without ever
+ * producing any of these must not re-enter the loop (issue #21897) — the
+ * request would be re-issued unchanged and spin until maxSteps.
+ */
+const STEP_CONTENT_CHUNK_TYPES = new Set([
+  'text-delta',
+  'reasoning-delta',
+  'tool-call',
+  'tool-call-delta',
+  'tool-result',
+  'object',
+  'object-result',
+  'file',
+  'source',
+]);
 
 function getRequestInputProcessors({
   inputProcessors,
@@ -621,6 +640,7 @@ async function processOutputStream<OUTPUT = undefined>({
 }: ProcessOutputStreamOptions<OUTPUT>): Promise<ProcessOutputStreamResult> {
   let transportSet = false;
   const collectedChunks: CollectedChunk[] = [];
+  let hasStepContent = false;
   let toolResultTripwire: TripWire | null = null;
   let toolChunkSuppressed = false;
   let toolResultProcessorRunner: ProcessorRunner | null = null;
@@ -824,6 +844,7 @@ async function processOutputStream<OUTPUT = undefined>({
     }
 
     if (chunk.type == 'object' || chunk.type == 'object-result') {
+      hasStepContent = true;
       controller.enqueue(chunk);
       continue;
     }
@@ -899,6 +920,10 @@ async function processOutputStream<OUTPUT = undefined>({
         args: chunk.payload.args,
         providerExecuted: chunk.payload.providerExecuted,
       });
+    }
+
+    if (STEP_CONTENT_CHUNK_TYPES.has(chunk.type)) {
+      hasStepContent = true;
     }
 
     // Collect every chunk for post-stream message building
@@ -1025,6 +1050,45 @@ async function processOutputStream<OUTPUT = undefined>({
               runId: chunk.runId,
               from: chunk.from,
               payload: { error: syntheticError },
+            },
+          });
+        }
+
+        // A provider can also close the stream cleanly with finishReason 'other' without
+        // producing any output (e.g. @ai-sdk/openai defaults to 'other' when the SSE
+        // stream ends before a response.completed event arrives). 'other' is not terminal,
+        // so the loop would re-issue the identical request and spin until maxSteps
+        // (issue #21897). When the step produced zero output, treat it as a stream error
+        // via the same deferred-error path so error processors can intercept and retry
+        // boundedly. A finish with reason 'other' that DID produce output continues as usual.
+        if (chunk.payload.stepResult.reason === 'other' && !hasStepContent && !runState.state.hasErrored) {
+          const rawReason = chunk.payload.stepResult.rawReason;
+          const syntheticError = new MastraError({
+            id: 'AGENT_STREAM_ERROR',
+            text: rawReason
+              ? `Agent stream finished with finishReason "other" (provider reported "${rawReason}") without producing any output`
+              : 'Agent stream finished with finishReason "other" without producing any output',
+            domain: ErrorDomain.AGENT,
+            category: ErrorCategory.SYSTEM,
+            details: {
+              runId: chunk.runId,
+              ...(rawReason && { rawFinishReason: rawReason }),
+            },
+          });
+
+          runState.setState({
+            hasErrored: true,
+            apiError: syntheticError,
+            deferredErrorChunk: {
+              type: 'error',
+              runId: chunk.runId,
+              from: chunk.from,
+              payload: { error: syntheticError },
+            },
+            stepResult: {
+              ...runState.state.stepResult,
+              reason: 'error',
+              isContinued: false,
             },
           });
         }
@@ -1487,11 +1551,38 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
           return currentMessageId;
         };
 
+        // Steps completed so far. The content of the most recent one is
+        // re-extracted here because it was captured at step-finish time, before
+        // that step's tool results reached the messageList. By now the list is
+        // complete, so this is what makes `steps[i].toolResults` visible to
+        // input-step processors.
+        const previousSteps = inputData.output?.steps || [];
+        const lastPreviousStep = previousSteps[previousSteps.length - 1];
+        if (lastPreviousStep) {
+          // modelContent is 1-indexed, so the last completed step is `length`.
+          const refreshedContent = messageList.get.response.aiV5.modelContent(previousSteps.length);
+          // Durable agents deserialize a fresh MessageList per workflow step, so
+          // the re-extraction can legitimately come back empty there. Never let
+          // that wipe content we already have.
+          if (refreshedContent.length > 0) {
+            previousSteps[previousSteps.length - 1] = new DefaultStepResult({
+              content: refreshedContent,
+              finishReason: lastPreviousStep.finishReason,
+              usage: lastPreviousStep.usage,
+              warnings: lastPreviousStep.warnings,
+              request: lastPreviousStep.request,
+              response: lastPreviousStep.response,
+              providerMetadata: lastPreviousStep.providerMetadata,
+              tripwire: lastPreviousStep.tripwire,
+            });
+          }
+        }
+
         const inputStepProcessors = [
           ...(inputProcessors || []),
           ...(options?.prepareStep ? [new PrepareStepProcessor({ prepareStep: options.prepareStep })] : []),
         ];
-        if (inputStepProcessors && inputStepProcessors.length > 0) {
+        if (inputStepProcessors.length > 0 || isMaybeAnthropicWithoutAssistantPrefill(model)) {
           const processorRunner = new ProcessorRunner({
             inputProcessors: inputStepProcessors,
             outputProcessors: [],
@@ -1650,6 +1741,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                       workspace: currentStep.workspace,
                       requireApproval: (tool as any).requireApproval,
                       backgroundConfig: (tool as any).background,
+                      agentBackgroundConfig: readScoped(scopeCtx, AGENT_BACKGROUND_CONFIG_KEY, 'agentBackgroundConfig'),
                     },
                     undefined,
                     autoResumeSuspendedTools,
@@ -1963,11 +2055,15 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                 activeTools: currentStep.activeTools as string[] | undefined,
                 options,
                 // Per-model modelSettings shallow-merge on top of call-time modelSettings.
-                // Per-model maxRetries always wins so p-retry uses the right retry count for this model.
+                // An explicit model or agent maxRetries wins; otherwise preserve modelSettings before using the default.
                 modelSettings: {
                   ...currentStep.modelSettings,
                   ...modelConfig.modelSettings,
-                  maxRetries: responseRecoveryStep ? 0 : modelConfig.maxRetries,
+                  maxRetries: responseRecoveryStep
+                    ? 0
+                    : modelConfig.maxRetriesConfigured
+                      ? modelConfig.maxRetries
+                      : (currentStep.modelSettings?.maxRetries ?? modelConfig.maxRetries),
                 },
                 includeRawChunks,
                 structuredOutput: currentStep.structuredOutput,

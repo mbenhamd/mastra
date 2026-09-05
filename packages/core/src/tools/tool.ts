@@ -5,7 +5,7 @@ import { getRequestContextInputSource, REQUEST_CONTEXT_INPUT_SOURCE } from '../r
 import { toStandardSchema } from '../schema';
 import type { PublicSchema, StandardSchemaWithJSON, InferPublicSchema, InferPublicSchemaInput } from '../schema';
 import type { SuspendOptions } from '../workflows';
-import { consumeBuilderValidatedInput } from './builder-validation-context';
+import { consumeBuilderValidatedInput, consumeBuilderValidatedSuspend } from './builder-validation-context';
 import {
   createToolRecoveryFingerprint,
   defineLazyToolRecoveryFingerprint,
@@ -42,6 +42,7 @@ function getRequestContextInputValidator(schema: PublicSchema): RequestContextIn
     try {
       const result = standardSchema['~standard'].validate(values);
       if (result instanceof Promise) {
+        void result.catch(() => {});
         throw new Error('Your schema is async, which is not supported. Please use a sync schema.');
       }
       return !('issues' in result) || !result.issues?.length;
@@ -494,8 +495,15 @@ export class Tool<
         // fields as null), and tools that re-parse their input with the original
         // zod schema would throw on the resumed leg even though the initial leg
         // passed (see the identical branch in tool-builder/builder.ts).
-        const isResuming = !!(context?.resumeData || context?.agent?.resumeData);
+        const rawResumeData =
+          context?.agent?.resumeData !== undefined
+            ? context.agent.resumeData
+            : context?.workflow?.resumeData !== undefined
+              ? context.workflow.resumeData
+              : context?.resumeData;
+        const isResuming = rawResumeData !== undefined;
         const wasBuilderValidated = consumeBuilderValidatedInput(context);
+        const wasBuilderSuspendValidated = consumeBuilderValidatedSuspend(context);
         const skipInputValidation = isResuming || wasBuilderValidated;
 
         let data: any = inputData;
@@ -536,7 +544,27 @@ export class Tool<
             )
           : context?.requestContext;
 
-        let suspendData = null;
+        let suspendCalled = false;
+        let suspendValidationError: unknown;
+
+        const validateAndSuspend = (
+          suspend: ((args: any, suspendOptions?: SuspendOptions) => any) | undefined,
+          args: any,
+          suspendOptions?: SuspendOptions,
+        ) => {
+          suspendCalled = true;
+          if (!wasBuilderSuspendValidated) {
+            const validation = validateToolSuspendData(this.suspendSchema, args, this.id);
+            if (validation.error) {
+              suspendValidationError = validation.error;
+              return Promise.resolve(validation.error);
+            }
+          }
+          // Suspend validation has historically been a gate rather than a
+          // transform. Forward the original payload so a builder-level gate
+          // cannot apply the same schema transform a second time.
+          return suspend?.(args, suspendOptions);
+        };
 
         const baseContext = context
           ? {
@@ -544,8 +572,7 @@ export class Tool<
               ...(context.suspend
                 ? {
                     suspend: (args: any, suspendOptions?: SuspendOptions) => {
-                      suspendData = args;
-                      return context.suspend?.(args, suspendOptions);
+                      return validateAndSuspend(context.suspend, args, suspendOptions);
                     },
                   }
                 : {}),
@@ -623,8 +650,7 @@ export class Tool<
                     ...baseContext.agent,
                     agentId: baseContext.agent.agentId ?? '',
                     suspend: (args: any, suspendOptions?: SuspendOptions) => {
-                      suspendData = args;
-                      return baseContext.agent?.suspend?.(args, suspendOptions);
+                      return validateAndSuspend(baseContext.agent?.suspend, args, suspendOptions);
                     },
                   }
                 : baseContext.agent,
@@ -632,8 +658,7 @@ export class Tool<
                 ? {
                     ...baseContext.workflow,
                     suspend: (args: any, suspendOptions?: SuspendOptions) => {
-                      suspendData = args;
-                      return baseContext.workflow?.suspend?.(args, suspendOptions);
+                      return validateAndSuspend(baseContext.workflow?.suspend, args, suspendOptions);
                     },
                   }
                 : baseContext.workflow,
@@ -642,10 +667,9 @@ export class Tool<
           }
         }
 
-        const resumeData =
-          organizedContext.agent?.resumeData ?? organizedContext.workflow?.resumeData ?? organizedContext?.resumeData;
+        const resumeData = rawResumeData;
 
-        if (resumeData) {
+        if (resumeData !== undefined) {
           const resumeValidation = validateToolInput(this.resumeSchema, resumeData, this.id);
           if (resumeValidation.error) {
             return resumeValidation.error as any;
@@ -655,14 +679,11 @@ export class Tool<
         // Call the original execute with validated input and organized context
         const output = await originalExecute(data as any, organizedContext);
 
-        if (suspendData) {
-          const suspendValidation = validateToolSuspendData(this.suspendSchema, suspendData, this.id);
-          if (suspendValidation.error) {
-            return suspendValidation.error as any;
-          }
+        if (suspendValidationError) {
+          return suspendValidationError as any;
         }
 
-        const skiptOutputValidation = !!(typeof output === 'undefined' && suspendData);
+        const skiptOutputValidation = typeof output === 'undefined' && suspendCalled;
 
         // Validate output if schema exists
         const outputValidation = validateToolOutput(this.outputSchema, output, this.id, skiptOutputValidation);

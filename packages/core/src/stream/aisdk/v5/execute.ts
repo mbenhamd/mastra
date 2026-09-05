@@ -1,5 +1,8 @@
 import { isProxy } from 'node:util/types';
-import { injectJsonInstructionIntoMessages, isAbortError } from '@ai-sdk/provider-utils-v5';
+import {
+  injectJsonInstructionIntoMessages as injectJsonInstructionIntoMessagesV3,
+  isAbortError,
+} from '@ai-sdk/provider-utils-v6';
 import type { LanguageModelV2Prompt } from '@ai-sdk/provider-v5';
 import { APICallError } from '@internal/ai-sdk-v5';
 import type { IdGenerator, ToolChoice, ToolSet } from '@internal/ai-sdk-v5';
@@ -21,6 +24,7 @@ import type { ExactJsonMeasurementSnapshot } from '../../../observability/conten
 import { DEFAULT_MAX_RETRY_AFTER_MS, getRetryAfterMs, waitDelay } from '../../../utils/retry-after';
 import { getResponseFormat } from '../../base/schema';
 import type { ChunkType, LanguageModelV2StreamResult, OnResult } from '../../types';
+import { attachModelStreamTransport, readModelStreamTransport } from '../../types';
 import { prepareToolsAndToolChoice } from './compat';
 import type { ModelSpecVersion } from './compat';
 import { AISDKV5InputStream } from './input';
@@ -62,6 +66,21 @@ export function resolveJsonPromptInjection(
 ): ResolvedJsonPromptInjection {
   if (value !== 'auto') return value;
   return capability === true ? undefined : 'inline';
+}
+
+type InjectJsonInstructionArgs = Parameters<typeof injectJsonInstructionIntoMessagesV3>[0];
+
+/**
+ * Typed V2 wrapper for the provider-utils v4 helper, which only reads and rewrites the
+ * leading system message's string content — a shape shared by V2 and V3 prompts.
+ */
+function injectJsonInstructionIntoMessages(
+  args: Omit<InjectJsonInstructionArgs, 'messages'> & { messages: LanguageModelV2Prompt },
+): LanguageModelV2Prompt {
+  return injectJsonInstructionIntoMessagesV3({
+    ...args,
+    messages: args.messages as unknown as InjectJsonInstructionArgs['messages'],
+  }) as unknown as LanguageModelV2Prompt;
 }
 
 function buildJsonInstruction(schema: unknown) {
@@ -767,10 +786,15 @@ export function execute<OUTPUT = undefined>({
           return retryResult;
         }
 
-        return {
+        const guardedResult = {
           ...retryResult,
           stream: guardStreamWithAbort(retryResult.stream, abortSignal, cleanupStepTimeout),
         } as unknown as LanguageModelV2StreamResult;
+        // The router attaches its stream transport as a non-enumerable symbol,
+        // which object spread drops. Re-attach it so transport handles survive
+        // the step-timeout wrapper.
+        attachModelStreamTransport(guardedResult, readModelStreamTransport(retryResult));
+        return guardedResult;
       } catch (error) {
         if (shouldThrowError) {
           throw error;

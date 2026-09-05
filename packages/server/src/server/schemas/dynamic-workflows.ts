@@ -1,3 +1,4 @@
+import { validateCron } from '@mastra/core/workflows';
 import { z } from 'zod/v4';
 
 // ============================================================================
@@ -10,12 +11,47 @@ import { z } from 'zod/v4';
 // handles at runtime.
 // ============================================================================
 
-const stepOptionsSchema = z
+const stepOptionsShape = {
+  retries: z.number().int().nonnegative().optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+};
+const stepOptionsSchema = z.object(stepOptionsShape).optional();
+const agentStepOptionsSchema = z
   .object({
-    retries: z.number().int().nonnegative().optional(),
-    metadata: z.record(z.string(), z.unknown()).optional(),
+    ...stepOptionsShape,
+    maxSteps: z.number().int().positive().optional(),
+    toolChoice: z.unknown().optional(),
+    activeTools: z.array(z.string()).optional(),
+    modelSettings: z.record(z.string(), z.unknown()).optional(),
+    providerOptions: z.record(z.string(), z.unknown()).optional(),
+    instructions: z.unknown().optional(),
+    system: z.unknown().optional(),
+    temperature: z.number().optional(),
+    savePerStep: z.boolean().optional(),
+    maxProcessorRetries: z.number().int().nonnegative().optional(),
+    returnScorerData: z.boolean().optional(),
+    requireToolApproval: z.boolean().optional(),
+    autoResumeSuspendedTools: z.boolean().optional(),
+    toolCallConcurrency: z.number().int().positive().optional(),
+    includeRawChunks: z.boolean().optional(),
+    toolsetsMode: z.unknown().optional(),
+    disableBackgroundTasks: z.boolean().optional(),
+    versions: z.record(z.string(), z.string()).optional(),
   })
   .optional();
+
+// Optional identity/display fields on control-flow entries (mirrors core's
+// `StepFlowEntryOptions`). Declared explicitly because zod's default object
+// mode strips unknown keys — without these, posted fields would vanish
+// silently before reaching core.
+const entryDisplayFields = {
+  description: z.string().optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+};
+const containerIdentityFields = {
+  id: z.string().optional(),
+  ...entryDisplayFields,
+};
 
 // ----------------------------------------------------------------------------
 // Predicate DSL — declarative condition for `conditional` / `loop` entries.
@@ -56,7 +92,7 @@ const agentEntrySchema = z.object({
   agentId: z.string(),
   description: z.string().optional(),
   outputSchema: z.record(z.string(), z.unknown()).optional(),
-  options: stepOptionsSchema,
+  options: agentStepOptionsSchema,
 });
 
 const toolEntrySchema = z.object({
@@ -70,6 +106,7 @@ const toolEntrySchema = z.object({
 const mappingEntrySchema = z.object({
   type: z.literal('mapping'),
   id: z.string(),
+  ...entryDisplayFields,
   mapConfig: z.string(),
 });
 
@@ -96,21 +133,25 @@ const graphEntrySchema = z.discriminatedUnion('type', [
   workflowEntrySchema,
   z.object({
     type: z.literal('parallel'),
+    ...containerIdentityFields,
     steps: z.array(singleStepEntrySchema),
   }),
   z.object({
     type: z.literal('foreach'),
+    ...containerIdentityFields,
     step: foreachInnerStepSchema,
     opts: z.object({ concurrency: z.number().int().positive() }).optional(),
   }),
   z.object({
     type: z.literal('sleep'),
     id: z.string(),
+    ...entryDisplayFields,
     duration: z.number(),
   }),
   z.object({
     type: z.literal('sleepUntil'),
     id: z.string(),
+    ...entryDisplayFields,
     date: z.string(),
   }),
   z
@@ -120,6 +161,7 @@ const graphEntrySchema = z.discriminatedUnion('type', [
       // accepted over the wire (they'd be arbitrary JS strings we can't
       // safely rehydrate).
       type: z.literal('conditional'),
+      ...containerIdentityFields,
       steps: z.array(singleStepEntrySchema),
       predicates: z.array(predicateSchema),
     })
@@ -131,11 +173,67 @@ const graphEntrySchema = z.discriminatedUnion('type', [
   z.object({
     // Declarative-only loop. Same rationale as `conditional`.
     type: z.literal('loop'),
+    ...containerIdentityFields,
     step: singleStepEntrySchema,
     loopType: z.enum(['dowhile', 'dountil']),
     predicate: predicateSchema,
   }),
 ]);
+
+const jsonValueSchema: z.ZodType = z.lazy(() =>
+  z.union([
+    z.null(),
+    z.string(),
+    z.number().finite(),
+    z.boolean(),
+    z.array(jsonValueSchema),
+    z.record(z.string(), jsonValueSchema),
+  ]),
+);
+const workflowScheduleConfigSchema = z.strictObject({
+  id: z.string().min(1).optional(),
+  cron: z.string().min(1),
+  timezone: z.string().min(1).optional(),
+  inputData: jsonValueSchema.optional(),
+  initialState: jsonValueSchema.optional(),
+  requestContext: z.record(z.string(), jsonValueSchema).optional(),
+  metadata: z.record(z.string(), jsonValueSchema).optional(),
+});
+const workflowScheduleSchema = z
+  .union([workflowScheduleConfigSchema, z.array(workflowScheduleConfigSchema)])
+  .superRefine((schedule, ctx) => {
+    const isArray = Array.isArray(schedule);
+    const schedules = isArray ? schedule : [schedule];
+    const ids = new Set<string>();
+    for (const [index, entry] of schedules.entries()) {
+      const path = isArray ? [index] : [];
+      if (isArray) {
+        if (!entry.id || ids.has(entry.id)) {
+          ctx.addIssue({
+            code: 'custom',
+            path: [...path, 'id'],
+            message: 'Every schedule in an array must have a unique stable id.',
+          });
+        }
+        if (entry.id) ids.add(entry.id);
+      }
+      try {
+        validateCron(entry.cron, entry.timezone);
+      } catch (error) {
+        if (
+          !(error instanceof Error) ||
+          (!error.message.startsWith('Invalid cron expression') && !error.message.startsWith('Invalid timezone'))
+        ) {
+          throw error;
+        }
+        ctx.addIssue({
+          code: 'custom',
+          path: [...path, error.message.startsWith('Invalid timezone') ? 'timezone' : 'cron'],
+          message: error.message,
+        });
+      }
+    }
+  });
 
 // ============================================================================
 // Path params
@@ -177,6 +275,7 @@ export const dynamicWorkflowDefinitionBodySchema = z.object({
   outputSchema: z.record(z.string(), z.unknown()).describe('JSON Schema (Draft 2020-12) for the workflow output'),
   stateSchema: z.record(z.string(), z.unknown()).optional(),
   requestContextSchema: z.record(z.string(), z.unknown()).optional(),
+  schedule: workflowScheduleSchema.optional(),
   graph: z
     .array(graphEntrySchema)
     .describe('Static workflow graph — ordered array of serialized step entries with all refs as ids.'),
@@ -215,6 +314,7 @@ export const dynamicWorkflowResponseSchema = z.object({
   outputSchema: z.unknown(),
   stateSchema: z.unknown().optional(),
   requestContextSchema: z.unknown().optional(),
+  schedule: workflowScheduleSchema.optional(),
   graph: z.array(z.unknown()),
   status: z.enum(['active', 'archived']),
   source: z.literal('storage'),

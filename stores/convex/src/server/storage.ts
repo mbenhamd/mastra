@@ -627,6 +627,8 @@ export async function handleTypedOperation(
 
     case 'patch': {
       const patchRecord = stripPatchKeys(request.record, ['id']);
+      const matchesExpected = (record: Record<string, any>) =>
+        !request.expected || Object.entries(request.expected).every(([key, value]) => record[key] === value);
       const existing = await ctx.db
         .query(convexTable)
         .withIndex('by_record_id', (q: any) => q.eq('id', request.id))
@@ -635,7 +637,7 @@ export async function handleTypedOperation(
       if (!existing) {
         if (isBackgroundTasksTable(convexTable, request)) {
           const legacy = await findGenericDocumentById(ctx, request.tableName, request.id);
-          if (legacy) {
+          if (legacy && matchesExpected(legacy.record)) {
             await ctx.db.patch(legacy._id, { record: mergeLegacyRecord(legacy.record, patchRecord) });
             return { ok: true, result: true };
           }
@@ -643,6 +645,7 @@ export async function handleTypedOperation(
         return { ok: true, result: false };
       }
 
+      if (!matchesExpected(existing)) return { ok: true, result: false };
       await ctx.db.patch(existing._id, patchRecord);
       if (isBackgroundTasksTable(convexTable, request)) {
         const legacy = await findGenericDocumentById(ctx, request.tableName, request.id);
@@ -818,41 +821,6 @@ export async function handleTypedOperation(
       return { ok: true };
     }
 
-    case 'updateIfFieldEquals': {
-      const existing = await ctx.db
-        .query(convexTable)
-        .withIndex('by_record_id', (q: any) => q.eq('id', request.id))
-        .unique();
-
-      if (!existing) {
-        if (isBackgroundTasksTable(convexTable, request)) {
-          const legacy = await findGenericDocumentById(ctx, request.tableName, request.id);
-          if (legacy) {
-            if (legacy.record[request.field] !== request.expectedValue) {
-              return { ok: true, result: false };
-            }
-            await ctx.db.patch(legacy._id, { record: mergeLegacyRecord(legacy.record, request.patch) });
-            return { ok: true, result: true };
-          }
-        }
-        return { ok: true, result: false };
-      }
-
-      if (existing[request.field] !== request.expectedValue) {
-        return { ok: true, result: false };
-      }
-
-      const { id: _, ...patch } = request.patch;
-      await ctx.db.patch(existing._id, patch);
-      if (isBackgroundTasksTable(convexTable, request)) {
-        const legacy = await findGenericDocumentById(ctx, request.tableName, request.id);
-        if (legacy) {
-          await ctx.db.delete(legacy._id);
-        }
-      }
-      return { ok: true, result: true };
-    }
-
     case 'mergeWorkflowStepResult': {
       if (convexTable !== CONVEX_TABLE_WORKFLOW_SNAPSHOTS) {
         return { ok: false, error: `Unsupported operation ${request.op} for table ${request.tableName}` };
@@ -937,16 +905,26 @@ export async function handleTypedOperation(
         return { ok: false, error: parsedOpts.error };
       }
 
-      // `expectedStatus` is a compare-and-set guard, not state. Convex mutations are
-      // serializable, so checking it here keeps the guard and the write atomic. It is stripped
-      // from the merge so it can never be persisted into the snapshot. An empty result signals
-      // "guard did not match" to the caller.
-      const { expectedStatus, ...state } = parsedOpts.value;
+      // Expected values are compare-and-set guards, not state. Convex mutations
+      // are serializable, so checking them here keeps the guard and write atomic.
+      // An empty result signals "guard did not match" to the caller.
+      const { expectedStatus, expectedExecutionGeneration, expectedLifecycleResumeAttempt, ...state } =
+        parsedOpts.value;
       if (expectedStatus !== undefined) {
         const expected = Array.isArray(expectedStatus) ? expectedStatus : [expectedStatus];
         if (!expected.includes(snapshot.status)) {
           return { ok: true, result: '' };
         }
+      }
+      if (expectedExecutionGeneration !== undefined && snapshot.executionGeneration !== expectedExecutionGeneration) {
+        return { ok: true, result: '' };
+      }
+      if (
+        expectedLifecycleResumeAttempt !== undefined &&
+        (snapshot.lifecycleResumeAttempt === undefined ? 0 : snapshot.lifecycleResumeAttempt) !==
+          expectedLifecycleResumeAttempt
+      ) {
+        return { ok: true, result: '' };
       }
 
       const mergedSnapshot = { ...snapshot, ...state };
@@ -1220,6 +1198,13 @@ async function handleGenericOperation(ctx: MutationCtx<any>, request: StorageReq
         return { ok: true, result: false };
       }
 
+      if (
+        request.expected &&
+        !Object.entries(request.expected).every(([key, value]) => existing.record?.[key] === value)
+      ) {
+        return { ok: true, result: false };
+      }
+
       await ctx.db.patch(existing._id, {
         record:
           tableName === TABLE_BACKGROUND_TASKS
@@ -1306,26 +1291,6 @@ async function handleGenericOperation(ctx: MutationCtx<any>, request: StorageReq
       );
       await deleteDocs(ctx, docsToDelete);
       return { ok: true };
-    }
-
-    case 'updateIfFieldEquals': {
-      const existing = await ctx.db
-        .query(convexTable)
-        .withIndex('by_table_primary', (q: any) => q.eq('table', tableName).eq('primaryKey', String(request.id)))
-        .unique();
-
-      if (!existing || existing.record?.[request.field] !== request.expectedValue) {
-        return { ok: true, result: false };
-      }
-
-      const { id: _, ...patch } = request.patch;
-      await ctx.db.patch(existing._id, {
-        record:
-          tableName === TABLE_BACKGROUND_TASKS
-            ? mergeLegacyRecord(existing.record, patch)
-            : { ...existing.record, ...patch },
-      });
-      return { ok: true, result: true };
     }
 
     default:

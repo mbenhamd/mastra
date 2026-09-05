@@ -483,6 +483,70 @@ describe('Resume API', () => {
       result.cleanup();
     });
 
+    it('does not let a stale resume mutate a run id rebound during the replay-offset read', async () => {
+      const baseAgent = new Agent({
+        id: 'resume-offset-race-agent',
+        name: 'Resume Offset Race Agent',
+        instructions: 'Test resume binding fences',
+        model: createTextModel('Unused') as LanguageModelV2,
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+      const runId = 'resume-offset-rebound-run';
+      const first = await durableAgent.prepare('first', { runId });
+      const streamTopic = `agent.stream.${runId}`;
+      const activePubsub = durableAgent.pubsub;
+      const originalGetHistory = activePubsub.getHistory.bind(activePubsub);
+      let markOffsetReadStarted!: () => void;
+      const offsetReadStarted = new Promise<void>(resolve => {
+        markOffsetReadStarted = resolve;
+      });
+      let releaseOffsetRead!: (events: Event[]) => void;
+      const offsetReadGate = new Promise<Event[]>(resolve => {
+        releaseOffsetRead = resolve;
+      });
+      const getHistory = vi.spyOn(activePubsub, 'getHistory').mockImplementation(async (topic, offset) => {
+        if (topic === streamTopic) {
+          markOffsetReadStarted();
+          return offsetReadGate;
+        }
+        return originalGetHistory(topic, offset);
+      });
+      let secondBindingId: string | undefined;
+
+      try {
+        const staleResume = durableAgent.resumeStream({ approved: true }, { runId });
+        await offsetReadStarted;
+
+        durableAgent.runRegistry.cleanupBound(runId, first.workflowInput.runtimeBindingId);
+        globalRunRegistry.delete(runId);
+        const second = await durableAgent.prepare('second', { runId });
+        secondBindingId = second.workflowInput.runtimeBindingId;
+        const newerEntry = globalRunRegistry.get(runId)!;
+        const newerController = new AbortController();
+        const newerAgentSpan = { id: 'newer-agent-span' } as any;
+        const newerModelSpan = { id: 'newer-model-span' } as any;
+        newerEntry.abortController = newerController;
+        newerEntry.abortSignal = newerController.signal;
+        newerEntry.resumeAgentSpan = newerAgentSpan;
+        newerEntry.resumeModelSpan = newerModelSpan;
+
+        releaseOffsetRead([]);
+
+        await expect(staleResume).rejects.toMatchObject({ id: 'DURABLE_AGENT_RUN_ID_CONFLICT' });
+        expect(newerEntry.abortController).toBe(newerController);
+        expect(newerEntry.abortSignal).toBe(newerController.signal);
+        expect(newerEntry.resumeAgentSpan).toBe(newerAgentSpan);
+        expect(newerEntry.resumeModelSpan).toBe(newerModelSpan);
+        expect(newerEntry.workflowExecution).toBeUndefined();
+        expect(globalRunRegistry.get(runId)?.runtimeBindingId).toBe(secondBindingId);
+      } finally {
+        releaseOffsetRead([]);
+        getHistory.mockRestore();
+        if (secondBindingId) durableAgent.runRegistry.cleanupBound(runId, secondBindingId);
+        globalRunRegistry.delete(runId);
+      }
+    });
+
     it('forwards approval execution options into the durable resume path', async () => {
       const baseAgent = new Agent({
         id: 'approval-options-agent',

@@ -4,7 +4,7 @@ import {
   TABLE_SCHEMAS,
   WorkflowsStorage,
   normalizePerPage,
-  matchesExpectedWorkflowStatus,
+  matchesExpectedWorkflowState,
 } from '@mastra/core/storage';
 import type {
   CreateIndexOptions,
@@ -254,8 +254,14 @@ export class WorkflowsMySQL extends WorkflowsStorage {
 
       const existing = parseSnapshot(rows[0]!.snapshot) as WorkflowRunState;
 
-      const { expectedStatus, ...state } = opts;
-      if (!matchesExpectedWorkflowStatus(existing.status, expectedStatus)) {
+      const { expectedStatus, expectedExecutionGeneration, expectedLifecycleResumeAttempt, ...state } = opts;
+      if (
+        !matchesExpectedWorkflowState(existing, {
+          expectedStatus,
+          expectedExecutionGeneration,
+          expectedLifecycleResumeAttempt,
+        })
+      ) {
         await connection.rollback();
         return undefined;
       }

@@ -11,7 +11,7 @@ import {
   ensureRemoteAbortListener as ensureRemoteAbortListenerForBinding,
   publishAbortRequest as publishAbortRequestForBinding,
 } from '../abort-transport';
-import { AGENT_CONTROL_TOPIC, AGENT_STREAM_TOPIC } from '../constants';
+import { AGENT_CONTROL_TOPIC, AGENT_STREAM_TOPIC, DurableStepIds } from '../constants';
 import { createDurableAgent } from '../create-durable-agent';
 import {
   getGlobalRunRegistryEntry,
@@ -63,6 +63,71 @@ function createHangingModel() {
 }
 
 describe('DurableAgent cross-process abort', () => {
+  it('does not adopt a future persisted binding after abortRunStream returns false', async () => {
+    const runId = 'public-remote-abort';
+    const runtimeBindingId = 'future-binding';
+    const pubsub = new EventEmitterPubSub();
+    const publish = vi.spyOn(pubsub, 'publish');
+    const storage = new InMemoryStore();
+    const agent = new Agent({
+      id: 'public-remote-abort-agent',
+      name: 'Public Remote Abort Agent',
+      instructions: 'test',
+      model: createHangingModel() as unknown as LanguageModelV2,
+    });
+    const durableAgent = createDurableAgent({ agent, pubsub });
+    new Mastra({ agents: { [agent.id]: durableAgent as any }, storage, logger: false });
+    const workflows = (await storage.getStore('workflows'))!;
+    const originalGetWorkflowRunById = workflows.getWorkflowRunById.bind(workflows);
+    let releaseStorageRead!: () => void;
+    const storageReadGate = new Promise<void>(resolve => {
+      releaseStorageRead = resolve;
+    });
+    const getWorkflowRunById = vi.spyOn(workflows, 'getWorkflowRunById').mockImplementation(async options => {
+      await storageReadGate;
+      return originalGetWorkflowRunById(options);
+    });
+
+    try {
+      // There is no execution with this ID when the synchronous call returns.
+      expect(durableAgent.abortRunStream(runId)).toBe(false);
+
+      // Let any asynchronous lookup reach the delayed storage boundary, then
+      // create a new execution that legitimately reuses the caller-supplied ID.
+      await Promise.resolve();
+      await workflows.persistWorkflowSnapshot({
+        workflowName: DurableStepIds.AGENTIC_LOOP,
+        runId,
+        snapshot: {
+          runId,
+          status: 'running',
+          context: {
+            input: {
+              __workflowKind: 'durable-agent',
+              runId,
+              runtimeBindingId,
+              agentId: agent.id,
+            },
+          },
+        } as any,
+      });
+      releaseStorageRead();
+      await new Promise(resolve => setTimeout(resolve, 0));
+
+      expect(getWorkflowRunById).not.toHaveBeenCalled();
+      expect(publish).not.toHaveBeenCalledWith(
+        AGENT_CONTROL_TOPIC(runId, runtimeBindingId),
+        expect.objectContaining({ type: 'abort-request', runId, data: { runtimeBindingId } }),
+        undefined,
+      );
+    } finally {
+      releaseStorageRead();
+      getWorkflowRunById.mockRestore();
+      await durableAgent.pubsub.clearTopic(AGENT_CONTROL_TOPIC(runId, runtimeBindingId));
+      await pubsub.close();
+    }
+  });
+
   it('aborts a run whose executing process never held the caller AbortController', async () => {
     // A worker that rehydrated a run from storage has no controller in its
     // registry entry — that is precisely why a caller's local abort() could

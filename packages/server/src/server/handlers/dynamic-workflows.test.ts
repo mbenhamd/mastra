@@ -265,6 +265,33 @@ describe('Dynamic Workflows handlers', () => {
       expect(serialized[0].outputSchema).toBeDefined();
     });
 
+    it('persists schedules and agent passthrough options without transport loss', async () => {
+      const schedule = { cron: '0 0 * * *', inputData: { prompt: 'daily' } };
+      await UPSERT_DYNAMIC_WORKFLOW_ROUTE.handler({
+        ...ctx(mastra),
+        id: 'wf-scheduled-agent',
+        description: undefined,
+        metadata: undefined,
+        stateSchema: undefined,
+        requestContextSchema: undefined,
+        schedule,
+        inputSchema: objectWith({ prompt: stringSchema }, ['prompt']),
+        outputSchema: objectWith({ text: stringSchema }, ['text']),
+        graph: [
+          {
+            type: 'agent',
+            id: 'summarize',
+            agentId: 'summarizer',
+            options: { retries: 1, maxSteps: 3 },
+          },
+        ],
+      });
+
+      const stored = await (await mastra.getStorage()?.getStore('workflowDefinitions'))?.get('wf-scheduled-agent');
+      expect(stored?.schedule).toEqual(schedule);
+      expect(stored?.graph[0]).toMatchObject({ options: { retries: 1, maxSteps: 3 } });
+    });
+
     it('foreach(agent) round-trips inner agent step', async () => {
       await UPSERT_DYNAMIC_WORKFLOW_ROUTE.handler({
         ...ctx(mastra),

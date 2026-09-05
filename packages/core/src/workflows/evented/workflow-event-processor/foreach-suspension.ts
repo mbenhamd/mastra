@@ -61,14 +61,14 @@ export function restoreEventedForeachSuspensionPayloads(
   foreachOutput: unknown,
   freshSuspensionIndices: readonly number[] = [],
 ): unknown[] {
-  if (!isRecord(foreachOutput)) return [...iterationResults];
+  if (!Array.isArray(foreachOutput) && !isRecord(foreachOutput)) return [...iterationResults];
   assertValidEventedForeachSuspensionResults(Object.values(foreachOutput));
   const freshIndices = new Set(freshSuspensionIndices);
 
   return iterationResults.map((iterationResult, index) => {
     if (freshIndices.has(index)) return iterationResult;
     if (!isEventedForeachSuspensionResult(iterationResult)) return iterationResult;
-    const authoritativeResult = foreachOutput[index];
+    const authoritativeResult = Array.isArray(foreachOutput) ? foreachOutput[index] : foreachOutput[String(index)];
     if (!isEventedForeachSuspensionResult(authoritativeResult)) return iterationResult;
     return { ...iterationResult, suspendPayload: authoritativeResult.suspendPayload };
   });
@@ -78,7 +78,7 @@ export function restoreEventedForeachSuspensionPayloads(
 export function stripEventedForeachStreamStateForPropagation(
   foreachOutput: unknown,
 ): Record<string, unknown> | undefined {
-  if (!isRecord(foreachOutput)) return undefined;
+  if (!Array.isArray(foreachOutput) && !isRecord(foreachOutput)) return undefined;
 
   const propagated: Record<string, unknown> = {};
   for (const [index, entry] of Object.entries(foreachOutput)) {

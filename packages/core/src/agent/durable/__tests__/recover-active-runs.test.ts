@@ -20,6 +20,7 @@ import { MessageList } from '../../message-list';
 import { DurableStepIds } from '../constants';
 import { createDurableAgent } from '../create-durable-agent';
 import type { DurableAgent } from '../durable-agent';
+import { globalRunRegistry } from '../run-registry';
 import { serializeModelConfig } from '../utils/serialize-state';
 
 function makeSnapshot(
@@ -312,5 +313,56 @@ describe('DurableAgent.recoverActiveRuns', () => {
     expect(succeeded).toBe(1);
     // `discovered` must not have been picked up when `runId` is set.
     expect(restartedRunIds).toEqual(['explicit-run']);
+  });
+
+  it('awaits the exact recovered execution even when its registry entry disappears', async () => {
+    const runId = 'exact-owner-await';
+    await seed(
+      store,
+      makeSnapshot(runId, 'running', { agentId: 'agent-A', threadId: 'thread-1', resourceId: 'resource-1' }),
+      'resource-1',
+    );
+
+    let markRestarted!: () => void;
+    const restarted = new Promise<void>(resolve => {
+      markRestarted = resolve;
+    });
+    let releaseRestart!: () => void;
+    const restartGate = new Promise<void>(resolve => {
+      releaseRestart = resolve;
+    });
+    vi.spyOn(agent, 'getWorkflow').mockReturnValue({
+      deleteWorkflowRunById: vi.fn(async () => {}),
+      createRun: vi.fn(async () => ({
+        restart: vi.fn(async () => {
+          markRestarted();
+          await restartGate;
+          await (agent as any).onDurableWorkflowFinish({ runId, status: 'success' });
+          return { status: 'success' };
+        }),
+      })),
+    } as any);
+
+    const recover = agent.recover.bind(agent);
+    vi.spyOn(agent, 'recover').mockImplementation(async (...args: Parameters<typeof agent.recover>) => {
+      const result = await recover(...args);
+      // Model terminal cleanup/TTL eviction between recover() returning and
+      // the bulk helper choosing what to await. A run-ID lookup is no longer
+      // an ownership-safe way to find this execution.
+      globalRunRegistry.delete(runId);
+      return result;
+    });
+
+    const recovery = agent.recoverActiveRuns({ runId });
+    await restarted;
+    let settled = false;
+    void recovery.finally(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    releaseRestart();
+    await expect(recovery).resolves.toMatchObject({ succeeded: 1, failed: 0 });
   });
 });

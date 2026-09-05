@@ -124,6 +124,25 @@ describe('BackgroundTasksConvex', () => {
     });
   });
 
+  it('forwards the expected status through the generic conditional patch contract', async () => {
+    const { client, callStorage } = createClient({
+      callStorage: vi.fn(async () => false),
+    });
+    const storage = new BackgroundTasksConvex({ client });
+
+    await expect(storage.updateTask('task-1', { status: 'running' }, { expectedStatus: 'pending' })).resolves.toBe(
+      false,
+    );
+
+    expect(callStorage).toHaveBeenCalledWith({
+      op: 'patch',
+      tableName: TABLE_BACKGROUND_TASKS,
+      id: 'task-1',
+      record: { status: 'running' },
+      expected: { status: 'pending' },
+    });
+  });
+
   it('clears nullable JSON fields while omitting undefined non-null fields from task patches', async () => {
     const { client, callStorage } = createClient({
       callStorage: vi.fn(async () => true),

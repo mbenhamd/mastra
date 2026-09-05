@@ -1822,6 +1822,9 @@ export class InMemoryMemory extends MemoryStorage {
       throw new Error(`Observational memory record not found: ${id}`);
     }
 
+    const existingChunks = Array.isArray(record.bufferedObservationChunks) ? record.bufferedObservationChunks : [];
+    if (existingChunks.some(existing => existing.cycleId === chunk.cycleId)) return;
+
     // Create a new chunk with generated id and timestamp
     const newChunk: BufferedObservationChunk = cloneMemoryBoundaryValue({
       id: `ombuf-${crypto.randomUUID()}`,
@@ -1840,7 +1843,6 @@ export class InMemoryMemory extends MemoryStorage {
     });
 
     // Add chunk to the array
-    const existingChunks = Array.isArray(record.bufferedObservationChunks) ? record.bufferedObservationChunks : [];
     record.bufferedObservationChunks = [...existingChunks, newChunk];
 
     if (input.lastBufferedAtTime) {

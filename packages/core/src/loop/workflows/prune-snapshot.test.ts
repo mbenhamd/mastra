@@ -7,6 +7,10 @@
  * it back; resume rebuilds requests from `messageListState`.
  */
 import { describe, expect, it } from 'vitest';
+import {
+  aggregateEventedForeachSuspensions,
+  restoreEventedForeachSuspensionPayloads,
+} from '../../workflows/evented/workflow-event-processor/foreach-suspension';
 import type { WorkflowRunState } from '../../workflows/types';
 import { pruneAgentLoopSnapshot } from './prune-snapshot';
 
@@ -45,6 +49,36 @@ function countRequestEchoes(value: unknown): number {
   for (const v of Object.values(record)) n += countRequestEchoes(v);
   return n;
 }
+
+describe('pruneAgentLoopSnapshot running history', () => {
+  it('keeps the active terminal step conversation for restart after an end-phase write', () => {
+    const conversation = { messages: [{ role: 'user', content: 'earlier turn' }] };
+    const snapshot = {
+      status: 'running',
+      activePaths: [1],
+      activeStepsPath: { previous: [0], current: [1] },
+      context: {
+        input: { initial: true },
+        previous: {
+          status: 'success',
+          payload: { messageListState: conversation, accumulatedSteps: ['old'] },
+        },
+        current: {
+          status: 'success',
+          payload: { messageListState: conversation, accumulatedSteps: ['old', 'current'] },
+        },
+      },
+    } as unknown as WorkflowRunState;
+
+    const pruned = pruneAgentLoopSnapshot({ snapshot });
+    const context = pruned.context as Record<string, any>;
+
+    expect(context.previous.payload).not.toHaveProperty('messageListState');
+    expect(context.previous.payload).not.toHaveProperty('accumulatedSteps');
+    expect(context.current.payload.messageListState).toEqual(conversation);
+    expect(context.current.payload.accumulatedSteps).toEqual(['old', 'current']);
+  });
+});
 
 describe('pruneAgentLoopSnapshot stepResult.request strip', () => {
   it('strips the request echo from a terminal step on both payload and output', () => {
@@ -118,7 +152,7 @@ describe('pruneAgentLoopSnapshot stepResult.request strip', () => {
     expect(countRequestEchoes(pruneAgentLoopSnapshot({ snapshot: build() }))).toBe(0);
   });
 
-  it('prunes array-shaped foreach entries while preserving the array and live resume state', () => {
+  it('prunes and restores array-shaped foreach entries while preserving live resume state', () => {
     const original = snapshotWith({
       'durable-tool-call': {
         status: 'suspended',
@@ -133,10 +167,12 @@ describe('pruneAgentLoopSnapshot stepResult.request strip', () => {
               },
               {
                 status: 'suspended',
+                suspendedAt: 1,
                 payload: { stepResult: stepResult(), messages: { all: ['current conversation'] } },
                 suspendPayload: {
                   __streamState: { messageList: 'live' },
                   approval: { toolCallId: 'tool-1' },
+                  __workflow_meta: { path: ['durable-tool-call'] },
                 },
               },
             ],
@@ -144,10 +180,12 @@ describe('pruneAgentLoopSnapshot stepResult.request strip', () => {
         },
       },
     });
+    const originalStep = (original.context as Record<string, any>)['durable-tool-call'];
+    originalStep.output = ['completed', originalStep.suspendPayload.__workflow_meta.foreachOutput[1]];
 
-    const pruned = pruneAgentLoopSnapshot({ snapshot: original });
-    const foreachOutput = (pruned.context as Record<string, any>)['durable-tool-call'].suspendPayload.__workflow_meta
-      .foreachOutput;
+    const pruned = JSON.parse(JSON.stringify(pruneAgentLoopSnapshot({ snapshot: original })));
+    const prunedStep = pruned.context['durable-tool-call'];
+    const foreachOutput = prunedStep.suspendPayload.__workflow_meta.foreachOutput;
 
     expect(Array.isArray(foreachOutput)).toBe(true);
     expect(foreachOutput).toHaveLength(2);
@@ -159,7 +197,16 @@ describe('pruneAgentLoopSnapshot stepResult.request strip', () => {
     expect(foreachOutput[1].suspendPayload).toEqual({
       __streamState: { messageList: 'live' },
       approval: { toolCallId: 'tool-1' },
+      __workflow_meta: { path: ['durable-tool-call'] },
     });
+    expect(prunedStep.output[1].suspendPayload).not.toHaveProperty('__streamState');
+
+    // The evented completion handler reaggregates the remaining suspension.
+    // loop/loop.ts restores its conversation from that step-level stream state.
+    const suspension = aggregateEventedForeachSuspensions(
+      restoreEventedForeachSuspensionPayloads(prunedStep.output, foreachOutput),
+    );
+    expect(suspension?.firstSuspendPayload?.__streamState).toEqual({ messageList: 'live' });
 
     const originalForeachOutput = (original.context as Record<string, any>)['durable-tool-call'].suspendPayload
       .__workflow_meta.foreachOutput;
@@ -207,5 +254,143 @@ describe('pruneAgentLoopSnapshot stepResult.request strip', () => {
     pruneAgentLoopSnapshot({ snapshot: original });
 
     expect(countRequestEchoes(original)).toBe(1);
+  });
+});
+
+/**
+ * The durable agent loop threads its iteration state through every step as
+ * that step's input, so each completed step's `payload` pins another copy of
+ * the whole conversation. A terminal step is never re-invoked, so nothing
+ * reads that copy back — but the readers that do exist (the suspended step's
+ * payload, a terminal `output`, and `context.input`) must survive untouched.
+ */
+describe('pruneAgentLoopSnapshot terminal payload iteration state', () => {
+  function iterationState() {
+    return {
+      messageListState: { messages: [{ role: 'user', content: 'x'.repeat(2000) }] },
+      accumulatedSteps: [{ text: 'step one' }, { text: 'step two' }],
+      lastStepResult: { reason: 'tool-calls', isContinued: true },
+    };
+  }
+
+  it('drops the threaded iteration state from a terminal payload while keeping routing fields', () => {
+    const pruned = pruneAgentLoopSnapshot({
+      snapshot: snapshotWith({
+        'durable-llm-execution': {
+          status: 'success',
+          payload: { ...iterationState(), stepResult: stepResult(), runId: 'run-1', iteration: 3 },
+        },
+      }),
+    });
+
+    const payload = (pruned.context as Record<string, any>)['durable-llm-execution'].payload;
+    expect(payload).not.toHaveProperty('messageListState');
+    expect(payload).not.toHaveProperty('accumulatedSteps');
+    expect(payload).not.toHaveProperty('lastStepResult');
+    expect(payload.runId).toBe('run-1');
+    expect(payload.iteration).toBe(3);
+    expect(payload.stepResult.reason).toBe('tool-calls');
+  });
+
+  it('applies to every terminal status', () => {
+    const pruned = pruneAgentLoopSnapshot({
+      snapshot: snapshotWith({
+        a: { status: 'failed', payload: iterationState() },
+        b: { status: 'skipped', payload: iterationState() },
+        c: { status: 'bailed', payload: iterationState() },
+        d: { status: 'canceled', payload: iterationState() },
+      }),
+    });
+
+    for (const id of ['a', 'b', 'c', 'd']) {
+      expect((pruned.context as Record<string, any>)[id].payload).toEqual({});
+    }
+  });
+
+  it('keeps a suspended step payload and its resume state intact', () => {
+    const pruned = pruneAgentLoopSnapshot({
+      snapshot: snapshotWith({
+        'durable-tool-call': {
+          status: 'suspended',
+          payload: iterationState(),
+          suspendPayload: { __streamState: { messageList: 'live' }, approval: { toolCallId: 'tool-1' } },
+        },
+      }),
+    });
+
+    const step = (pruned.context as Record<string, any>)['durable-tool-call'];
+    expect(step.payload).toEqual(iterationState());
+    expect(step.suspendPayload).toEqual({
+      __streamState: { messageList: 'live' },
+      approval: { toolCallId: 'tool-1' },
+    });
+  });
+
+  it('leaves a terminal output untouched, since a same-run continuation reads it', () => {
+    const pruned = pruneAgentLoopSnapshot({
+      snapshot: snapshotWith({
+        'durable-llm-execution': { status: 'success', output: iterationState() },
+      }),
+    });
+
+    expect((pruned.context as Record<string, any>)['durable-llm-execution'].output).toEqual(iterationState());
+  });
+
+  it('leaves context.input untouched, since recovery rebuilds the conversation from it', () => {
+    const snapshot = {
+      context: {
+        input: { ...iterationState(), __workflowKind: 'durable-agent' },
+        step: { status: 'success', payload: iterationState() },
+      },
+    } as unknown as WorkflowRunState;
+
+    const prunedInput = (pruneAgentLoopSnapshot({ snapshot }).context as Record<string, any>).input;
+    expect(prunedInput.messageListState).toEqual(iterationState().messageListState);
+    expect(prunedInput.accumulatedSteps).toEqual(iterationState().accumulatedSteps);
+    expect(prunedInput.__workflowKind).toBe('durable-agent');
+  });
+
+  it('strips completed foreach entries while preserving still-suspended ones', () => {
+    const pruned = pruneAgentLoopSnapshot({
+      snapshot: snapshotWith({
+        'durable-tool-call': {
+          status: 'suspended',
+          suspendPayload: {
+            __workflow_meta: {
+              foreachOutput: [
+                { status: 'success', payload: iterationState() },
+                { status: 'suspended', payload: iterationState() },
+              ],
+            },
+          },
+        },
+      }),
+    });
+
+    const foreachOutput = (pruned.context as Record<string, any>)['durable-tool-call'].suspendPayload.__workflow_meta
+      .foreachOutput;
+    expect(foreachOutput[0].payload).toEqual({});
+    expect(foreachOutput[1].payload).toEqual(iterationState());
+  });
+
+  it('is copy-on-write and does not mutate the caller snapshot', () => {
+    const original = snapshotWith({
+      step: { status: 'success', payload: iterationState() },
+    });
+    pruneAgentLoopSnapshot({ snapshot: original });
+
+    expect((original.context as Record<string, any>).step.payload).toEqual(iterationState());
+  });
+
+  it('passes terminal payloads without iteration state through untouched', () => {
+    const pruned = pruneAgentLoopSnapshot({
+      snapshot: snapshotWith({
+        'collect-tool-results': { status: 'success', payload: { toolResults: [{ result: 'ok' }] } },
+      }),
+    });
+
+    expect((pruned.context as Record<string, any>)['collect-tool-results'].payload).toEqual({
+      toolResults: [{ result: 'ok' }],
+    });
   });
 });

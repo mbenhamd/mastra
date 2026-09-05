@@ -175,6 +175,11 @@ export class AgentThreadLeaseConflictError extends Error {
 
 export let defaultAgentThreadPubSub: PubSub = new EventEmitterPubSub();
 
+function hasReadOnlyMemory(options?: { memory?: AgentExecutionOptions<any>['memory'] }): boolean {
+  const memory = options?.memory;
+  return Boolean(memory && typeof memory === 'object' && 'options' in memory && memory.options?.readOnly);
+}
+
 function callerSignalPayloadKey(signal: AgentSignal): string | undefined {
   try {
     return JSON.stringify({
@@ -1257,6 +1262,8 @@ export class AgentThreadStreamRuntime {
   }
 
   prepareRunOptions<OUTPUT>(options: AgentExecutionOptions<OUTPUT>, pubsub?: PubSub): AgentExecutionOptions<OUTPUT> {
+    if (hasReadOnlyMemory(options)) return options;
+
     const { threadId } = this.#getThreadTarget(options);
     if (!threadId || !options.runId) return options;
 
@@ -1290,6 +1297,8 @@ export class AgentThreadStreamRuntime {
     pubsub?: PubSub,
     agentId?: string,
   ): (() => void) | undefined {
+    if (hasReadOnlyMemory(options)) return;
+
     const { threadId, resourceId } = this.#getThreadTarget(options);
     const runId = options.runId;
     if (!threadId || !runId) return;
@@ -1444,6 +1453,10 @@ export class AgentThreadStreamRuntime {
     this.#rejectPendingOutputWaiters(state, runId, new Error(`Agent thread run id "${runId}" was rejected`));
   }
 
+  isRunAborted(runId: string, pubsub?: PubSub): boolean {
+    return this.#getState(pubsub).abortedRunIds.has(runId);
+  }
+
   abortRun(runId: string, pubsub?: PubSub): boolean {
     const resolvedPubSub = this.#getPubSub(pubsub);
     const state = this.#getState(resolvedPubSub);
@@ -1473,6 +1486,8 @@ export class AgentThreadStreamRuntime {
         this.#publish(pubsub, inflightIdleKey, { type: 'run-aborted', runId });
         return true;
       }
+      // No execution owns this bare ID. Do not create a tombstone that could
+      // abort a legitimate future execution reusing the caller-supplied ID.
       return false;
     }
 
@@ -2244,17 +2259,14 @@ export class AgentThreadStreamRuntime {
    * records left behind by abandoned suspends and by resumes that land on a
    * different instance (which never clean the origin instance's record).
    *
-   * When the expiring record is still the run's current record — an abandoned
-   * suspend, not one superseded by a same-instance resume — the teardown mirrors
-   * #watchThreadRunCompletion's terminal path: it clears run-level state, releases
-   * the cross-process lease, and publishes `run-completed` so remote subscribers
-   * stop treating the thread as blocked and drain any queued follow-up work. A
-   * superseded older stream just has its stream entry dropped; the resumed run
-   * keeps its lease, suspended marker, and active slot.
+   * An expiring record only proves that this runtime no longer owns warm state.
+   * Another instance may have resumed the same runId and taken over its lease, so
+   * cleanup must remain local: stop this runtime's renewal timer and let an
+   * abandoned lease expire naturally instead of releasing or broadcasting a
+   * terminal event that could disrupt the resumed run.
    */
-  #sweepStaleSuspendedRecords(state: AgentThreadRuntimeState, pubsub: PubSub | undefined): Promise<void> {
+  #sweepStaleSuspendedRecords(state: AgentThreadRuntimeState, pubsub: PubSub | undefined) {
     const now = Date.now();
-    const terminalPublishes: Promise<void>[] = [];
     for (const [streamId, record] of state.threadRunsByStreamId) {
       if (record.lifecycle !== 'suspended' || record.suspendedAt === undefined) continue;
       if (now - record.suspendedAt <= AGENT_SUSPENDED_RUN_TTL_MS) continue;
@@ -2269,8 +2281,10 @@ export class AgentThreadStreamRuntime {
       state.threadRunsById.delete(record.runId);
       state.threadKeysByRunId.delete(record.runId);
       this.#clearSuspendedRun(state, record.runId);
-      // Remove the retired token from local reuse immediately, but retain the
-      // exact distributed lease until its authenticated terminal is published.
+      this.#stopLeaseRenewal(this.#getPubSub(pubsub), record.runId);
+      // Remove the retired token from local reuse while leaving any distributed
+      // lease untouched. Another instance may already own the resumed run, and an
+      // abandoned lease will expire naturally now that renewal has stopped.
       if (state.leaseOwnerTokensByRunId.get(record.runId) === record.leaseOwner) {
         state.leaseOwnerTokensByRunId.delete(record.runId);
       }
@@ -2281,22 +2295,7 @@ export class AgentThreadStreamRuntime {
         state.activeThreadRunIds.delete(staleKey);
         state.activeThreadStreamIds.delete(staleKey);
       }
-      terminalPublishes.push(
-        this.#publishTerminalAndWait(pubsub, staleKey, {
-          type: 'run-completed',
-          runId: record.runId,
-          streamId,
-          // An abandoned suspend persisted its snapshot before parking.
-          persisted: true,
-          leaseOwner: record.leaseOwner,
-        })
-          .catch(() => {})
-          .finally(() =>
-            this.#releaseThreadLeaseOwner(this.#getPubSub(pubsub), staleKey, record.runId, record.leaseOwner),
-          ),
-      );
     }
-    return Promise.all(terminalPublishes).then(() => {});
   }
 
   registerRun<OUTPUT>(
@@ -2319,6 +2318,8 @@ export class AgentThreadStreamRuntime {
     pubsub?: PubSub,
     registrationOptions?: AgentThreadStrictRegistrationOptions,
   ): Promise<void | AgentThreadRunRegistration> | undefined {
+    if (hasReadOnlyMemory(streamOptions)) return;
+
     const { threadId, resourceId } = this.#getThreadTarget(streamOptions);
     if (!threadId) return;
 
@@ -2327,7 +2328,7 @@ export class AgentThreadStreamRuntime {
     }
 
     const state = this.#getState(pubsub);
-    const staleSuspensionTeardown = this.#sweepStaleSuspendedRecords(state, pubsub);
+    this.#sweepStaleSuspendedRecords(state, pubsub);
     const key = this.#threadKey(resourceId, threadId);
     // An approval resume re-registers the suspended run's id; drop its retained
     // record so registration overwrites it on the same thread (upstream parity).
@@ -2423,7 +2424,6 @@ export class AgentThreadStreamRuntime {
     // executed cannot become retryable merely because PubSub rejected the
     // segment's run-registered publication.
     const registrationPublish = (async () => {
-      await staleSuspensionTeardown;
       // Every thread-bound run must hold the cross-process lease while it is
       // live: the liveness checks (markActiveIfLive / #waitForRemoteRunToFinish)
       // treat a lease-less run as a ghost, so a plain `agent.stream()` run that
@@ -2566,12 +2566,7 @@ export class AgentThreadStreamRuntime {
     await registrationOptions.validate?.();
 
     const state = this.#getState(pubsub);
-    // Upstream calls this synchronously, so the sweep completes before the lines
-    // below observe thread state. The fork's version returns a promise, so the same
-    // ordering requires an explicit await — the non-strict registration path awaits
-    // it for the same reason. `void` here would silently downgrade a
-    // complete-before-proceed guarantee to fire-and-forget.
-    await this.#sweepStaleSuspendedRecords(state, pubsub);
+    this.#sweepStaleSuspendedRecords(state, pubsub);
     const key = this.#threadKey(resourceId, threadId);
     const activeRunId = state.activeThreadRunIds.get(key);
     const activeRecord = activeRunId ? state.threadRunsById.get(activeRunId) : undefined;
@@ -3481,12 +3476,17 @@ export class AgentThreadStreamRuntime {
 
   async waitForCrossAgentThreadRun(
     agent: Agent<any, any, any, any>,
-    options: { memory?: AgentExecutionOptions<any>['memory']; requestContext?: RequestContext },
+    options: { memory?: AgentExecutionOptions<any>['memory']; requestContext?: RequestContext; runId?: string },
     pubsub?: PubSub,
     ownsReservation = false,
   ) {
     const { threadId, resourceId } = this.#getThreadTarget(options);
     if (!threadId) return;
+
+    // Read-only runs never persist to the thread, so they cannot corrupt
+    // message ordering and must not serialize (or reserve): structured-output's
+    // `useAgent` path re-enters agent.stream() on the same thread mid-run.
+    if (hasReadOnlyMemory(options)) return;
 
     const state = this.#getState(pubsub);
     const key = this.#threadKey(resourceId, threadId);
@@ -3557,13 +3557,30 @@ export class AgentThreadStreamRuntime {
     const { threadId, resourceId } = this.#getThreadTarget(options);
     if (!threadId) return;
 
+    // Read-only runs are outside the reservation protocol; callers should not
+    // park or retry them if a thread-bound run is already active.
+    if (hasReadOnlyMemory(options)) return;
+
     const state = this.#getState(pubsub);
     const key = this.#threadKey(resourceId, threadId);
     while (true) {
       const activeRunId = state.activeThreadRunIds.get(key);
-      if (!activeRunId) return;
+      if (!activeRunId) {
+        // The caller owns the retrying `reserveRun()` operation. Reserving here
+        // would make that immediate retry collide with its own run id; multiple
+        // awakened callers instead race through the single atomic local reserve,
+        // and losers park again on the winner's lifecycle.
+        return;
+      }
+
+      // A caller that targets the active run (resumeStream, approval continuations) is a
+      // continuation of that run, not a contender — never wait on ourselves.
+      if (options.runId && options.runId === activeRunId) return;
 
       const activeRecord = state.threadRunsById.get(activeRunId);
+      if (activeRecord && !this.#isThreadBlockingRun(state, activeRecord)) {
+        return;
+      }
       const requestedRunId = options.runId;
       const canRotateSuspendedOwner =
         requestedRunId !== undefined &&
@@ -3631,6 +3648,23 @@ export class AgentThreadStreamRuntime {
         waiters.push(resolve);
         state.reservationWaitersByRunId.set(activeRunId, waiters);
       });
+    }
+  }
+
+  /**
+   * Releases a thread reservation made by `waitForCrossAgentThreadRun` when the
+   * run fails before reaching `registerRun`. No-op once the run has registered
+   * (registration owns cleanup from then on) or if the reservation was already
+   * replaced.
+   */
+  releaseThreadRunReservation(runId: string, pubsub?: PubSub) {
+    const state = this.#getState(pubsub);
+    if (state.threadRunsById.has(runId)) return;
+    const key = state.threadKeysByRunId.get(runId);
+    if (!key) return;
+    state.threadKeysByRunId.delete(runId);
+    if (state.activeThreadRunIds.get(key) === runId) {
+      state.activeThreadRunIds.delete(key);
     }
   }
 

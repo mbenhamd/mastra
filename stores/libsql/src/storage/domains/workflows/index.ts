@@ -1,4 +1,3 @@
-import type { Client, InValue } from '@libsql/client';
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
 import type {
   WorkflowRun,
@@ -31,13 +30,14 @@ import {
   persistWorkflowStepUpdateRecord,
   TABLE_WORKFLOW_SNAPSHOT,
   TABLE_SCHEMAS,
-  matchesExpectedWorkflowStatus,
+  matchesExpectedWorkflowState,
   WorkflowsStorage,
   rollbackWorkflowResumeRecord,
 } from '@mastra/core/storage';
 import type { WorkflowRunState, StepResult } from '@mastra/core/workflows';
 import { LibSQLDB, resolveClient } from '../../db';
 import type { LibSQLDomainConfig } from '../../db';
+import type { SqliteClient as Client, SqliteInValue as InValue } from '../../db/client';
 import { createExecuteWriteOperationWithRetry, safeStringify } from '../../db/utils';
 import { withClientWriteLock } from '../../db/write-lock';
 import { runPrune, resolveTargets } from '../../retention';
@@ -402,8 +402,14 @@ export class WorkflowsLibSQL extends WorkflowsStorage {
               throw new Error(`Snapshot not found for runId ${runId}`);
             }
 
-            const { expectedStatus, ...state } = opts;
-            if (!matchesExpectedWorkflowStatus(snapshot.status, expectedStatus)) {
+            const { expectedStatus, expectedExecutionGeneration, expectedLifecycleResumeAttempt, ...state } = opts;
+            if (
+              !matchesExpectedWorkflowState(snapshot, {
+                expectedStatus,
+                expectedExecutionGeneration,
+                expectedLifecycleResumeAttempt,
+              })
+            ) {
               await tx.rollback();
               return undefined;
             }
@@ -462,7 +468,7 @@ export class WorkflowsLibSQL extends WorkflowsStorage {
             sql: `INSERT INTO ${TABLE_WORKFLOW_SNAPSHOT} (workflow_name, run_id, resourceId, snapshot, createdAt, updatedAt)
                 VALUES (?, ?, ?, jsonb(?), ?, ?)
                 ON CONFLICT(workflow_name, run_id)
-                DO UPDATE SET resourceId = excluded.resourceId, snapshot = excluded.snapshot, updatedAt = excluded.updatedAt`,
+                DO UPDATE SET resourceId = COALESCE(excluded.resourceId, ${TABLE_WORKFLOW_SNAPSHOT}.resourceId), snapshot = excluded.snapshot, updatedAt = excluded.updatedAt`,
             args: [workflowName, runId, resourceId ?? null, safeStringify(snapshot), createdAtValue, updatedAtValue],
           }),
         ),

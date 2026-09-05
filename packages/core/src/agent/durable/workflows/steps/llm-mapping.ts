@@ -100,12 +100,10 @@ export function createDurableLLMMappingStep() {
       const durableInitData = getInitData() as DurableAgenticWorkflowInput;
       let registryEntry = getBoundRunRegistryEntry(_runId, durableInitData.runtimeBindingId);
 
-      // 1. Deserialize message list
-      const messageList = new MessageList({
-        threadId: state.threadId,
-        resourceId: state.resourceId,
-      });
-      messageList.deserialize(llmOutput.messageListState);
+      // 1. Deserialize message list.
+      // Reuse the run's existing MessageList when the in-process registry has
+      // one so external consumers holding a reference to it keep seeing state
+      // updates.
       const pubsub = (params as any)[PUBSUB_SYMBOL] as PubSub | undefined;
       if (pubsub) {
         try {
@@ -118,6 +116,13 @@ export function createDurableLLMMappingStep() {
         }
         registryEntry = getBoundRunRegistryEntry(_runId, durableInitData.runtimeBindingId);
       }
+      const messageList = (
+        registryEntry?.messageList ??
+        new MessageList({
+          threadId: state.threadId,
+          resourceId: state.resourceId,
+        })
+      ).deserialize(llmOutput.messageListState);
 
       // A declined approval has no `result` but is fully resolved: persist it as `output-denied`
       // with the approval decision (rather than as a successful `result`) so it round-trips on

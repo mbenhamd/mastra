@@ -50,7 +50,10 @@ import type {
   ToolsetsInput,
   ToolsInput,
 } from '../types';
-import { fireClientToolOutputHooks } from '../workflows/prepare-stream/client-tool-output-hooks';
+import {
+  applyClientToolModelOutput,
+  fireClientToolOutputHooks,
+} from '../workflows/prepare-stream/client-tool-output-hooks';
 import type { DurableAgenticWorkflowInput, RunRegistryEntry, SerializableStructuredOutput } from './types';
 import { createRuntimeDependencyFingerprint, createWorkflowInput } from './utils/serialize-state';
 
@@ -154,6 +157,9 @@ export function snapshotDurableRequestContextEntries(
   }
   const out: Record<string, unknown> = {};
   for (const key of uniqueKeys) {
+    // Rebuilt from persisted run state; never snapshot a caller's parent-run
+    // memory context even when it appears in the application allowlist.
+    if (key === 'MastraMemory') continue;
     if (isInfrastructureRequestContextKey(key)) {
       throw new MastraError({
         id: 'DURABLE_AGENT_REQUEST_CONTEXT_INFRASTRUCTURE_KEY_FORBIDDEN',
@@ -849,6 +855,11 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
         abortSignal: execOptions?.abortSignal,
         logger,
       });
+      await applyClientToolModelOutput({
+        messageList,
+        tools,
+        logger,
+      });
     }
 
     const modelList = resolvedModels.modelList;
@@ -978,7 +989,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
         autoResumeSuspendedTools: execOptions?.autoResumeSuspendedTools,
         maxProcessorRetries: execOptions?.maxProcessorRetries,
         includeRawChunks: execOptions?.includeRawChunks,
-        returnScorerData: (execOptions as any)?.returnScorerData,
+        returnScorerData: execOptions?.returnScorerData,
         hasErrorProcessors: errorProcessors.length > 0,
         providerOptions: execOptions?.providerOptions,
         structuredOutput: serializedStructuredOutput,
@@ -1171,6 +1182,9 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
             schema: toStandardSchema(execOptions.structuredOutput.schema),
           }
         : undefined,
+      // Retain the call-time flag for warm resume/observe paths that rebuild
+      // scoring data without rereading the persisted workflow input.
+      returnScorerData: execOptions?.returnScorerData,
     };
 
     return {

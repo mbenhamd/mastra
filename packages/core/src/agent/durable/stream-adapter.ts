@@ -3,7 +3,9 @@ import type { PubSub } from '../../events/pubsub';
 import type { Event } from '../../events/types';
 import type { IMastraLogger } from '../../logger';
 import { createTerminalToolResultPartId, materializeTerminalToolResult } from '../../loop/shared/terminal-tool-result';
+import type { TracingContext } from '../../observability';
 import type { OutputProcessorOrWorkflow } from '../../processors';
+import type { RequestContext } from '../../request-context';
 import { safeClose, safeEnqueue } from '../../stream/base';
 import { MastraModelOutput } from '../../stream/base/output';
 import { ChunkFrom } from '../../stream/types';
@@ -121,6 +123,12 @@ export interface DurableAgentStreamOptions<OUTPUT = undefined> {
   structuredOutput?: StructuredOutputOptions<OUTPUT>;
   /** Output processors to run in MastraModelOutput's stream pipeline */
   outputProcessors?: OutputProcessorOrWorkflow[];
+  /** When true, `getFullOutput()` includes `scoringData` assembled from the MessageList. */
+  returnScorerData?: boolean;
+  /** Run context passed to output processors for every streamed chunk. */
+  requestContext?: RequestContext;
+  /** Tracing context whose current span is the run's AGENT_RUN span; parents per-chunk processor spans. */
+  tracingContext?: TracingContext;
   /** Experimental transforms applied whenever the returned full stream is consumed. */
   experimentalTransform?: MastraStreamTransformOptions<OUTPUT>;
   /**
@@ -230,6 +238,9 @@ export function createDurableAgentStream<OUTPUT = undefined>(
     closeOnSuspend = false,
     structuredOutput,
     outputProcessors,
+    returnScorerData,
+    requestContext,
+    tracingContext,
     experimentalTransform,
     messageList: externalMessageList,
   } = options;
@@ -908,6 +919,9 @@ export function createDurableAgentStream<OUTPUT = undefined>(
       isLLMExecutionStep: true,
       resolveFinalPromises: true,
       outputProcessors,
+      returnScorerData,
+      requestContext,
+      tracingContext,
       experimentalTransform,
     },
   });
