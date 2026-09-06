@@ -329,6 +329,13 @@ jobs:
           # incremental validator update. Every other PR uses the protected
           # base copy, including any later reuse of this branch name.
           if [[ "${HEAD_REPOSITORY}" == "${GITHUB_REPOSITORY}" && \
+            "${PR_NUMBER}" == '391' && \
+            "${HEAD_REF}" == 'ci/pf-3911-package-contract-validation' && \
+            "${BASE_REF}" == 'main' ]]; then
+            echo 'Bootstrapping the validator from exact PF-3911 policy PR #391.'
+            /usr/bin/git show "${HEAD_SHA}:${script_path}" \
+              > "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash"
+          elif [[ "${HEAD_REPOSITORY}" == "${GITHUB_REPOSITORY}" && \
             "${PR_NUMBER}" == '380' && \
             "${HEAD_REF}" == 'ci/pf-3580-dependency-triggered-supervisor-validation' && \
             "${BASE_REF}" == 'main' ]]; then
@@ -381,6 +388,17 @@ jobs:
           # coverage for this PR. The fixture suite is isolated and resets the
           # validator's per-invocation time budget.
           /bin/bash "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash" --self-test
+          packed_check_path=".github/scripts/check-packed-declaration-fixture.mjs"
+          packed_check_revision="${BASE_SHA}"
+          if [[ "${HEAD_REPOSITORY}" == "${GITHUB_REPOSITORY}" && \
+            "${PR_NUMBER}" == '391' && \
+            "${HEAD_REF}" == 'ci/pf-3911-package-contract-validation' && \
+            "${BASE_REF}" == 'main' ]]; then
+            packed_check_revision="${HEAD_SHA}"
+          fi
+          /usr/bin/git show "${packed_check_revision}:${packed_check_path}" \
+            > "${RUNNER_TEMP}/check-packed-declaration-fixture.mjs"
+          node "${RUNNER_TEMP}/check-packed-declaration-fixture.mjs" --self-test
           case "$VALIDATION_LANE" in
             pf558-upstream-sync)
               /bin/bash "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash" \

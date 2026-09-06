@@ -18,6 +18,8 @@ process.stdout.write(path.join(root, 'node_modules', compilerPackage));
 NODE
 )"
 readonly VALIDATOR_REPOSITORY_ROOT TYPESCRIPT_MODULE_PATH
+PACKED_DECLARATION_CHECK="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/check-packed-declaration-fixture.mjs"
+readonly PACKED_DECLARATION_CHECK
 
 pf558_config() {
   PF558_PR_NUMBER="${PAPERSFLOW_PF558_PR_NUMBER:-266}"
@@ -4099,7 +4101,7 @@ NODE
   (
     cd "$fixture_repo"
     BASE_SHA="$package_contract_dependency_base_sha" HEAD_SHA="$package_contract_base_sha" \
-      bash "$validator_path" --classify-install
+      GITHUB_OUTPUT= bash "$validator_path" --classify-install
   ) > "$output" 2>&1
   assert_contains 'lane=standard' "$output"
   : > "$command_log"
@@ -4133,6 +4135,7 @@ NODE
   assert_contains 'exec tsc --project scripts/tsconfig.json --noEmit' "$command_log"
   assert_contains 'exec oxlint packages/_types-builder/src/index.js packages/_types-builder/src/replace-types.js' "$command_log"
   assert_line_count 1 'exec turbo run build --filter=@mastra/agent-builder... --concurrency=2' "$command_log"
+  assert_contains "exec node $PACKED_DECLARATION_CHECK --package packages/agent-builder" "$command_log"
   assert_contains '--filter ./packages/agent-builder --fail-if-no-match check:fixtures' "$command_log"
   assert_contains 'scripts/types-builder.test.ts' "$command_log"
   assert_contains 'src/agent-builder.test.ts' "$command_log"
@@ -4141,6 +4144,7 @@ NODE
     'build:core' \
     'exec tsc --project scripts/tsconfig.json --noEmit' \
     'exec turbo run build --filter=@mastra/agent-builder... --concurrency=2' \
+    "exec node $PACKED_DECLARATION_CHECK --package packages/agent-builder" \
     '--filter ./packages/agent-builder --fail-if-no-match check' \
     '--filter ./packages/agent-builder --fail-if-no-match check:fixtures'; do
     output="$test_root/package-contract-command-failure.log"
@@ -4220,7 +4224,8 @@ NODE
     output="$test_root/package-contract-$rejected_case-admission.log"
     if (
       cd "$fixture_repo"
-      BASE_SHA="$package_contract_dependency_base_sha" HEAD_SHA="$head_sha" bash "$validator_path" --classify-install
+      BASE_SHA="$package_contract_dependency_base_sha" HEAD_SHA="$head_sha" \
+        GITHUB_OUTPUT= bash "$validator_path" --classify-install
     ) > "$output" 2>&1; then
       echo "Unsupported fixture $rejected_case drift passed install admission." >&2
       exit 1
@@ -11263,6 +11268,7 @@ while IFS= read -r file; do
   case "$file" in
     .changeset/* | \
       .github/scripts/run-papersflow-fork-pr-validation.bash | \
+      .github/scripts/check-packed-declaration-fixture.mjs | \
       .github/workflows/README.md | \
       .github/workflows/e2e-docs.yml | \
       .github/workflows/labeler.yml | \
@@ -12555,6 +12561,9 @@ fi
 
 if workspace_changed packages/agent-builder; then
   ensure_agent_builder_prerequisites
+  # The workflow extracts this helper beside the validator from the same
+  # trusted revision, so a source PR cannot replace its own archive checker.
+  run_with_validation_budget 300 pnpm exec node "$PACKED_DECLARATION_CHECK" --package packages/agent-builder
   run_with_validation_budget 600 pnpm --filter ./packages/agent-builder --fail-if-no-match check
   run_with_validation_budget 600 pnpm --filter ./packages/agent-builder --fail-if-no-match check:fixtures
   run_with_validation_budget 600 pnpm --filter ./packages/agent-builder --fail-if-no-match lint
