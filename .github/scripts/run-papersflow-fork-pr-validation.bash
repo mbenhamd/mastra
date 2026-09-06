@@ -1112,6 +1112,82 @@ if (lines.join('\n') !== readAt(baseSha, 'pnpm-lock.yaml')) {
 NODE
 }
 
+verify_pf2057_inngest_dependency_cleanup() {
+  node - "$1" "$2" <<'NODE'
+const { execFileSync } = require('node:child_process');
+const { isDeepStrictEqual } = require('node:util');
+
+const [baseSha, headSha] = process.argv.slice(2);
+const readAt = (sha, path) =>
+  execFileSync('git', ['show', `${sha}:${path}`], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+
+const manifestPath = 'workflows/inngest/package.json';
+const baseManifest = JSON.parse(readAt(baseSha, manifestPath));
+const headManifest = JSON.parse(readAt(headSha, manifestPath));
+for (const [dependency, version] of [
+  ['@ai-sdk/openai', '^1.3.24'],
+  ['inngest-cli', '^1.26.0'],
+]) {
+  if (baseManifest.devDependencies?.[dependency] !== version) {
+    throw new Error(`PF-2057 base no longer contains the reviewed ${dependency}@${version} devDependency.`);
+  }
+}
+const expectedManifest = structuredClone(baseManifest);
+delete expectedManifest.devDependencies['@ai-sdk/openai'];
+delete expectedManifest.devDependencies['inngest-cli'];
+if (!isDeepStrictEqual(headManifest, expectedManifest)) {
+  throw new Error('PF-2057 package.json may only remove the two reviewed unused devDependencies.');
+}
+
+const baseLock = readAt(baseSha, 'pnpm-lock.yaml');
+const headLock = readAt(headSha, 'pnpm-lock.yaml');
+const lines = baseLock.split('\n');
+
+function indentation(line) {
+  return line.length - line.trimStart().length;
+}
+
+function sectionEnd(start) {
+  const startIndent = indentation(lines[start]);
+  let end = start + 1;
+  while (end < lines.length && (lines[end] === '' || indentation(lines[end]) > startIndent)) end += 1;
+  return end;
+}
+
+function findUniqueLine(marker, start = 0, end = lines.length) {
+  const matches = [];
+  for (let index = start; index < end; index += 1) {
+    if (lines[index] === marker) matches.push(index);
+  }
+  if (matches.length !== 1) {
+    throw new Error(`PF-2057 expected exactly one lockfile line ${JSON.stringify(marker)}, found ${matches.length}.`);
+  }
+  return matches[0];
+}
+
+function removeBlock(marker, start = 0, end = lines.length) {
+  const blockStart = findUniqueLine(marker, start, end);
+  lines.splice(blockStart, sectionEnd(blockStart) - blockStart);
+}
+
+function importerBounds() {
+  const start = findUniqueLine('  workflows/inngest:');
+  return [start + 1, sectionEnd(start)];
+}
+
+for (const marker of ["      '@ai-sdk/openai':", '      inngest-cli:']) {
+  const [start, end] = importerBounds();
+  removeBlock(marker, start, end);
+}
+removeBlock('  inngest-cli@1.27.0:');
+removeBlock('  inngest-cli@1.27.0(encoding@0.1.13):');
+
+if (lines.join('\n') !== headLock) {
+  throw new Error('PF-2057 pnpm-lock.yaml may only remove the reviewed Inngest importer and inngest-cli graph blocks.');
+}
+NODE
+}
+
 classify_install_lane() (
   : "${BASE_SHA:?BASE_SHA is required}"
   : "${HEAD_SHA:?HEAD_SHA is required}"
@@ -1237,6 +1313,15 @@ classify_install_lane() (
   fi
 
   if [[ ! -s "$manifest_changes" ]]; then
+    if ! git diff --quiet "${BASE_SHA}...${HEAD_SHA}" -- pnpm-lock.yaml; then
+      if ! git diff --quiet "${BASE_SHA}...${HEAD_SHA}" -- workflows/inngest/package.json &&
+        verify_pf2057_inngest_dependency_cleanup "$(git merge-base "$BASE_SHA" "$HEAD_SHA")" "$HEAD_SHA"; then
+        emit_validation_lane standard
+        return
+      fi
+      echo 'Lockfile-only changes require a reviewed dependency-graph lane.' >&2
+      return 1
+    fi
     emit_validation_lane standard
     return
   fi
@@ -3960,6 +4045,17 @@ NODE
     git commit -q -m 'prepare Agent Builder importer fixture'
     git rev-parse HEAD
   )"
+  output="$test_root/package-contract-lockfile-only-admission.log"
+  if (
+    cd "$fixture_repo"
+    BASE_SHA="$base_sha" HEAD_SHA="$package_contract_dependency_base_sha" \
+      GITHUB_OUTPUT= bash "$validator_path" --classify-install
+  ) > "$output" 2>&1; then
+    echo 'A lockfile-only change unexpectedly entered the standard install lane.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'Lockfile-only changes require a reviewed dependency-graph lane.' "$output"
   package_contract_base_sha="$(
     cd "$fixture_repo"
     node <<'NODE'
@@ -5809,6 +5905,15 @@ NODE
     git rev-parse HEAD
   )"
   inngest_pf2057_head_sha="$head_sha"
+  output="$test_root/inngest-pf2057-install-admission.log"
+  if ! (
+    cd "$fixture_repo"
+    BASE_SHA="$base_sha" HEAD_SHA="$head_sha" GITHUB_OUTPUT= bash "$validator_path" --classify-install
+  ) > "$output" 2>&1; then
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'lane=standard' "$output"
   : > "$command_log"
   : > "$docker_log"
   : > "$service_log"
@@ -5835,6 +5940,16 @@ NODE
   )"
   : > "$command_log"
   : > "$docker_log"
+  output="$test_root/inngest-pf2057-lock-tamper-admission.log"
+  if (
+    cd "$fixture_repo"
+    BASE_SHA="$base_sha" HEAD_SHA="$head_sha" GITHUB_OUTPUT= bash "$validator_path" --classify-install
+  ) > "$output" 2>&1; then
+    echo 'PF-2057 tampered lockfile unexpectedly passed install admission.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'Lockfile-only changes require a reviewed dependency-graph lane.' "$output"
   output="$test_root/inngest-pf2057-lock-tamper-failure.log"
   set +e
   run_fixture "$head_sha" "$output"
@@ -11149,81 +11264,6 @@ if grep -Fxq packages/agent-builder/package.json "$changed_files"; then
   fi
 fi
 
-verify_pf2057_inngest_dependency_cleanup() {
-  node - "$merge_base_sha" "$HEAD_SHA" <<'NODE'
-const { execFileSync } = require('node:child_process');
-const { isDeepStrictEqual } = require('node:util');
-
-const [baseSha, headSha] = process.argv.slice(2);
-const readAt = (sha, path) =>
-  execFileSync('git', ['show', `${sha}:${path}`], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
-
-const manifestPath = 'workflows/inngest/package.json';
-const baseManifest = JSON.parse(readAt(baseSha, manifestPath));
-const headManifest = JSON.parse(readAt(headSha, manifestPath));
-for (const [dependency, version] of [
-  ['@ai-sdk/openai', '^1.3.24'],
-  ['inngest-cli', '^1.26.0'],
-]) {
-  if (baseManifest.devDependencies?.[dependency] !== version) {
-    throw new Error(`PF-2057 base no longer contains the reviewed ${dependency}@${version} devDependency.`);
-  }
-}
-const expectedManifest = structuredClone(baseManifest);
-delete expectedManifest.devDependencies['@ai-sdk/openai'];
-delete expectedManifest.devDependencies['inngest-cli'];
-if (!isDeepStrictEqual(headManifest, expectedManifest)) {
-  throw new Error('PF-2057 package.json may only remove the two reviewed unused devDependencies.');
-}
-
-const baseLock = readAt(baseSha, 'pnpm-lock.yaml');
-const headLock = readAt(headSha, 'pnpm-lock.yaml');
-const lines = baseLock.split('\n');
-
-function indentation(line) {
-  return line.length - line.trimStart().length;
-}
-
-function sectionEnd(start) {
-  const startIndent = indentation(lines[start]);
-  let end = start + 1;
-  while (end < lines.length && (lines[end] === '' || indentation(lines[end]) > startIndent)) end += 1;
-  return end;
-}
-
-function findUniqueLine(marker, start = 0, end = lines.length) {
-  const matches = [];
-  for (let index = start; index < end; index += 1) {
-    if (lines[index] === marker) matches.push(index);
-  }
-  if (matches.length !== 1) {
-    throw new Error(`PF-2057 expected exactly one lockfile line ${JSON.stringify(marker)}, found ${matches.length}.`);
-  }
-  return matches[0];
-}
-
-function removeBlock(marker, start = 0, end = lines.length) {
-  const blockStart = findUniqueLine(marker, start, end);
-  lines.splice(blockStart, sectionEnd(blockStart) - blockStart);
-}
-
-function importerBounds() {
-  const start = findUniqueLine('  workflows/inngest:');
-  return [start + 1, sectionEnd(start)];
-}
-
-for (const marker of ["      '@ai-sdk/openai':", '      inngest-cli:']) {
-  const [start, end] = importerBounds();
-  removeBlock(marker, start, end);
-}
-removeBlock('  inngest-cli@1.27.0:');
-removeBlock('  inngest-cli@1.27.0(encoding@0.1.13):');
-
-if (lines.join('\n') !== headLock) {
-  throw new Error('PF-2057 pnpm-lock.yaml may only remove the reviewed Inngest importer and inngest-cli graph blocks.');
-}
-NODE
-}
 
 inngest_pf2057_dependency_cleanup=false
 inngest_manifest_changed=false
@@ -11231,7 +11271,7 @@ lockfile_changed=false
 grep -Fxq 'workflows/inngest/package.json' "$changed_files" && inngest_manifest_changed=true
 grep -Fxq 'pnpm-lock.yaml' "$changed_files" && lockfile_changed=true
 if [[ "$inngest_manifest_changed" == true && "$lockfile_changed" == true ]] &&
-  verify_pf2057_inngest_dependency_cleanup; then
+  verify_pf2057_inngest_dependency_cleanup "$merge_base_sha" "$HEAD_SHA"; then
   inngest_pf2057_dependency_cleanup=true
 fi
 
