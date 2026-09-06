@@ -107,6 +107,15 @@ export async function validatePackedArchive(archive) {
       directoryExists: ts.sys.directoryExists,
       getCurrentDirectory: ts.sys.getCurrentDirectory,
     };
+    const syntaxProgram = ts.createProgram(
+      declarationFiles.map(relative => path.join(root, relative)),
+      { ...options, noEmit: true, skipLibCheck: false },
+    );
+    for (const diagnostic of syntaxProgram.getSyntacticDiagnostics()) {
+      const file = diagnostic.file?.fileName;
+      const relative = file ? path.relative(root, file).replaceAll(path.sep, '/') : 'declaration';
+      errors.push(`syntax error in ${relative}: ${ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n')}`);
+    }
     for (const relative of declarationFiles) {
       const file = path.join(root, relative);
       const source = ts.createSourceFile(file, await fs.readFile(file, 'utf8'), ts.ScriptTarget.Latest, true);
@@ -198,7 +207,7 @@ async function checkConsumer(archive, kind = 'good') {
         expectFailure ? `${kind}: broken archive unexpectedly typechecked` : `consumer typecheck failed:\n${text}`,
       );
     if (expectFailure) {
-      const expectedCode = kind === 'precedence' ? 2322 : 2307;
+      const expectedCode = kind === 'precedence' ? 2322 : kind === 'malformed' ? 1110 : 2307;
       if (!diagnostics.some(diagnostic => diagnostic.code === expectedCode))
         throw new Error(`${kind}: missing expected TS${expectedCode} diagnostic:\n${text}`);
       return;
@@ -242,11 +251,13 @@ async function fixture(dir, kind) {
   await fs.writeFile(path.join(dir, 'dist/index.cjs'), 'exports.answer = 42;\n');
   await fs.writeFile(
     path.join(dir, 'dist/index.d.mts'),
-    kind === 'missing-export'
-      ? 'export declare const answer: number;\n'
-      : kind === 'broken-reference'
-        ? 'export { answer } from "./missing.mjs";\n'
-        : 'declare const answer: number; export { answer };\n',
+    kind === 'malformed'
+      ? 'declare const answer: ; export { answer };\n'
+      : kind === 'missing-export'
+        ? 'export declare const answer: number;\n'
+        : kind === 'broken-reference'
+          ? 'export { answer } from "./missing.mjs";\n'
+          : 'declare const answer: number; export { answer };\n',
   );
   await fs.writeFile(
     path.join(dir, 'dist/index.d.cts'),
@@ -281,7 +292,7 @@ async function main() {
   }
   const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'mastra-fixtures-'));
   try {
-    for (const kind of ['good', 'missing-export', 'broken-reference', 'precedence', 'cjs-graph']) {
+    for (const kind of ['good', 'missing-export', 'broken-reference', 'precedence', 'cjs-graph', 'malformed']) {
       const dir = path.join(temp, kind);
       await fixture(dir, kind);
       const archive = await pack(dir, temp);
@@ -291,6 +302,7 @@ async function main() {
         'missing-export': 'missing export target ./dist/missing.mjs',
         'broken-reference': 'unresolved declaration reference dist/index.d.mts -> ./missing.mjs',
         'cjs-graph': 'unresolved declaration reference dist/index.d.cts -> ./internal.js',
+        malformed: 'syntax error in dist/index.d.mts: Type expected.',
       }[kind];
       if (expectedError && !errors.includes(expectedError))
         throw new Error(`${kind}: archive validator did not report ${expectedError}: ${errors.join('; ')}`);
