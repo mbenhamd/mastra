@@ -161,10 +161,10 @@ pf4051_config() {
   PF4051_BASE_REF="${PAPERSFLOW_PF4051_BASE_REF:-main}"
   PF4051_PENDING_MERGE_COMMIT='PENDING_PF4051_MERGE_COMMIT'
   PF4051_PENDING_REVIEWED_TREE='PENDING_PF4051_REVIEWED_TREE'
-  PF4051_MERGE_COMMIT="${PAPERSFLOW_PF4051_MERGE_COMMIT:-b3258fc4b4b7ee5404575a68af8d267432ce473b}"
+  PF4051_MERGE_COMMIT="${PAPERSFLOW_PF4051_MERGE_COMMIT:-d375f2062852b94079179b115733e0f2ff32e188}"
   PF4051_FORK_PARENT="${PAPERSFLOW_PF4051_FORK_PARENT:-7db2862fa0b3818f0a3a7ba417457b8e6782f6dc}"
   PF4051_UPSTREAM_PARENT="${PAPERSFLOW_PF4051_UPSTREAM_PARENT:-2e476c33bd8311597a2de14fa31a263a1ce7669a}"
-  PF4051_REVIEWED_TREE="${PAPERSFLOW_PF4051_REVIEWED_TREE:-b99e64f56afefd6245ad474a2dcf1fb7943f73ea}"
+  PF4051_REVIEWED_TREE="${PAPERSFLOW_PF4051_REVIEWED_TREE:-dbacb2283f52041611597bf6752214afd7d37567}"
   PF4051_TRUSTED_MAIN="${PAPERSFLOW_PF4051_TRUSTED_MAIN:-6a1bc91e152c2462dd078b27ed191064a3d1a8f9}"
   PF4051_NATIVE_POLICY="${PAPERSFLOW_PF4051_NATIVE_POLICY:-d6a1eccb09186968d8e372900fe4d52c01d8af26}"
   readonly \
@@ -2844,6 +2844,7 @@ SH
   }
   output="$test_root/validation-selection.log"
   run_fixture_validation > "$output" 2>&1
+  grep -Fq -- "exec node $PACKED_DECLARATION_CHECK --package packages/agent-builder" "$command_log"
   grep -Fq -- '--fail-if-no-match check:fixtures' "$command_log"
   grep -Fq -- 'scripts/types-builder.test.ts' "$command_log"
   grep -Fq -- 'read/write pools' "$command_log"
@@ -9023,6 +9024,7 @@ run_pf4051_upstream_sync_validation() {
 
   echo 'Building/linting the PF-4051 workspace and testing the selected reconciliation boundaries.'
   run_with_validation_budget 1200 pnpm run build
+  run_with_validation_budget 300 pnpm exec node "$PACKED_DECLARATION_CHECK" --package packages/agent-builder
   run_with_validation_budget 900 pnpm run lint
   # The dedicated sync lane exits before generic changed-workspace ownership.
   # Execute the native package contracts explicitly against the frozen source.
@@ -9169,6 +9171,7 @@ run_pf4051_upstream_sync_validation() {
       src/integrations/linear/default-rules.test.ts src/integrations/linear/integration.test.ts \
       src/integrations/linear/rules.test.ts src/integrations/platform/github/integration.test.ts \
       src/integrations/platform/linear/integration.test.ts src/integrations/slack/slack.test.ts \
+      src/integrations/slack/integration.test.ts \
       src/rules/defaults.test.ts src/rules/dispatcher.test.ts src/rules/processor.test.ts \
       src/rules/resolve.test.ts src/rules/start-coordinator.test.ts src/rules/tools.test.ts \
       src/rules/transition-service.test.ts src/rules/validation.test.ts src/supervisor/read-tools.test.ts
