@@ -54,6 +54,7 @@ function exportTargets(value, targets = []) {
 function declarationEdges(file, source, root) {
   const result = [];
   const add = node => {
+    if (!node) return;
     const specifier = ts.isLiteralTypeNode(node) ? node.literal.text : node?.text;
     if (specifier?.startsWith('.')) result.push({ file, specifier, source, root });
   };
@@ -245,7 +246,7 @@ async function fixture(dir, kind) {
       ? 'export declare const answer: number;\n'
       : kind === 'broken-reference'
         ? 'export { answer } from "./missing.mjs";\n'
-        : 'export declare const answer: number;\n',
+        : 'declare const answer: number; export { answer };\n',
   );
   await fs.writeFile(
     path.join(dir, 'dist/index.d.cts'),
