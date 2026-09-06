@@ -317,8 +317,8 @@ export class WorkflowsPG extends WorkflowsStorage {
 
   constructor(config: PgDomainConfig) {
     super();
-    const { client, schemaName, skipDefaultIndexes, indexes } = resolvePgConfig(config);
-    this.#db = new PgDB({ client, schemaName, skipDefaultIndexes });
+    const { client, readClient, schemaName, skipDefaultIndexes, indexes } = resolvePgConfig(config);
+    this.#db = new PgDB({ client, readClient, schemaName, skipDefaultIndexes });
     this.#schema = schemaName || 'public';
     this.#skipDefaultIndexes = skipDefaultIndexes;
     // Filter indexes to only those for tables managed by this domain
@@ -5051,7 +5051,7 @@ export class WorkflowsPG extends WorkflowsStorage {
 
       const queryValues = values;
 
-      const result = await this.#db.client.oneOrNone(query, queryValues);
+      const result = await this.#db.readClient.oneOrNone(query, queryValues);
 
       if (!result) {
         return null;

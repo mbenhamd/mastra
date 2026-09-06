@@ -103,6 +103,23 @@ describe('PostgresStoreVNext', () => {
   });
 
   describe('lifecycle', () => {
+    it('warns when the explicit writer pool also backs observability', async () => {
+      const pool = new Pool({ connectionString: UNREACHABLE_PRIMARY_URL });
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const store = new PostgresStoreVNext({
+        id: 'pgvnext-shared-write-pool-warning',
+        writePool: pool,
+        observability: { pool },
+      });
+
+      try {
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining('same Postgres instance'));
+      } finally {
+        await store.close();
+        await pool.end();
+      }
+    });
+
     it('allows PostgresStore.close() to be called multiple times', async () => {
       const store = new PostgresStore({ ...primaryTestConfig, id: 'pg-close-idempotency-test' });
 

@@ -6,6 +6,7 @@ vi.mock('@mastra/slack', () => ({
 }));
 
 import { SlackIntegration } from './integration.js';
+import { createSlackChannelsConfig } from './slack.js';
 
 function ctxWith(overrides: Record<string, unknown> = {}) {
   return {
@@ -85,11 +86,14 @@ describe('SlackIntegration.channels', () => {
 
   it('allows adapter options to override the defaults', () => {
     const typingStatus = vi.fn(() => 'custom status');
+    const formatToolCall = vi.fn(() => 'legacy result');
     const integration = new SlackIntegration({
       signingSecret: 'secret',
       adapterOptions: {
         streaming: false,
         toolDisplay: 'cards',
+        cards: false,
+        formatToolCall,
         typingStatus,
         textFormat: 'plain',
       },
@@ -103,6 +107,24 @@ describe('SlackIntegration.channels', () => {
       typingStatus,
       textFormat: 'plain',
     });
+    expect(config.adapters.slack).not.toHaveProperty('cards');
+    expect(config.adapters.slack).not.toHaveProperty('formatToolCall');
+  });
+
+  it('preserves legacy display options when no modern display is configured', () => {
+    const formatToolCall = vi.fn(() => 'legacy result');
+    const config = createSlackChannelsConfig({
+      slack: { signingSecret: 'secret' },
+      adapterOptions: { streaming: false, cards: false, formatToolCall, textFormat: 'plain' },
+    });
+
+    expect(config.adapters.slack).toMatchObject({
+      streaming: false,
+      cards: false,
+      formatToolCall,
+      textFormat: 'plain',
+    });
+    expect(config.adapters.slack.toolDisplay).toBeUndefined();
   });
 
   it('reports repo-backed sessions when the context carries a source-control owner', () => {
