@@ -18,6 +18,8 @@ process.stdout.write(path.join(root, 'node_modules', compilerPackage));
 NODE
 )"
 readonly VALIDATOR_REPOSITORY_ROOT TYPESCRIPT_MODULE_PATH
+PACKED_DECLARATION_CHECK="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/check-packed-declaration-fixture.mjs"
+readonly PACKED_DECLARATION_CHECK
 
 pf558_config() {
   PF558_PR_NUMBER="${PAPERSFLOW_PF558_PR_NUMBER:-266}"
@@ -1037,6 +1039,155 @@ emit_validation_lane() {
   fi
 }
 
+verify_agent_builder_fixture_config() {
+  git_regular_file_at_revision "$1" packages/agent-builder/tsconfig.fixtures.json || return 1
+  node - "$1" <<'NODE'
+const { execFileSync } = require('node:child_process');
+const { isDeepStrictEqual } = require('node:util');
+const config = JSON.parse(execFileSync('git', [
+  'show', `${process.argv[2]}:packages/agent-builder/tsconfig.fixtures.json`,
+], { encoding: 'utf8' }));
+if (!isDeepStrictEqual(config, {
+  extends: './tsconfig.json',
+  include: ['integration-tests/src/fixtures/**/*'],
+})) {
+  throw new Error('Agent Builder fixture checking must inherit the package project and include every fixture source.');
+}
+NODE
+}
+
+verify_agent_builder_fixture_dependency() {
+  local base_sha="$1" head_sha="$2" file
+  for file in packages/agent-builder/package.json pnpm-lock.yaml; do
+    git_regular_file_at_revision "$base_sha" "$file" || return 1
+    git_regular_file_at_revision "$head_sha" "$file" || return 1
+  done
+  verify_agent_builder_fixture_config "$head_sha" || return 1
+  node - "$base_sha" "$head_sha" <<'NODE'
+const { execFileSync } = require('node:child_process');
+const { isDeepStrictEqual } = require('node:util');
+const [baseSha, headSha] = process.argv.slice(2);
+const readAt = (sha, file) => execFileSync('git', ['show', `${sha}:${file}`], {
+  encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
+});
+const manifestPath = 'packages/agent-builder/package.json';
+const before = JSON.parse(readAt(baseSha, manifestPath));
+const after = JSON.parse(readAt(headSha, manifestPath));
+if (Object.hasOwn(before.scripts ?? {}, 'check:fixtures') ||
+  Object.hasOwn(before.devDependencies ?? {}, '@mastra/mcp')) {
+  throw new Error('Agent Builder fixture admission only adds its owning check and existing MCP workspace dependency.');
+}
+const expected = structuredClone(before);
+expected.scripts = { ...expected.scripts, 'check:fixtures': 'tsc --noEmit --project tsconfig.fixtures.json' };
+expected.devDependencies = { ...expected.devDependencies, '@mastra/mcp': 'workspace:*' };
+if (!isDeepStrictEqual(after, expected)) {
+  throw new Error('Agent Builder package.json changed outside the owned fixture script and MCP devDependency.');
+}
+
+// Remove the one new workspace link from the proposed lockfile and require
+// the complete remaining file to equal the base, including every other graph.
+const lines = readAt(headSha, 'pnpm-lock.yaml').split('\n');
+const importer = lines.indexOf('  packages/agent-builder:');
+if (importer < 0 || lines.lastIndexOf('  packages/agent-builder:') !== importer) {
+  throw new Error('Agent Builder lockfile importer is missing or ambiguous.');
+}
+let end = importer + 1;
+while (end < lines.length && (lines[end] === '' || lines[end].startsWith('    '))) end += 1;
+const devDependencies = lines.indexOf('    devDependencies:', importer + 1);
+if (devDependencies < 0 || devDependencies >= end) {
+  throw new Error('Agent Builder lockfile devDependencies are missing.');
+}
+let devEnd = devDependencies + 1;
+while (devEnd < end && (lines[devEnd] === '' || lines[devEnd].startsWith('      '))) devEnd += 1;
+const dependency = lines.indexOf("      '@mastra/mcp':", devDependencies + 1);
+if (dependency < 0 || dependency >= devEnd ||
+  lines[dependency + 1] !== '        specifier: workspace:*' ||
+  lines[dependency + 2] !== '        version: link:../mcp') {
+  throw new Error('Agent Builder must resolve its MCP fixture dependency to the existing workspace package.');
+}
+lines.splice(dependency, 3);
+if (lines.join('\n') !== readAt(baseSha, 'pnpm-lock.yaml')) {
+  throw new Error('Agent Builder fixture admission may only add its MCP importer link to pnpm-lock.yaml.');
+}
+NODE
+}
+
+verify_pf2057_inngest_dependency_cleanup() {
+  node - "$1" "$2" <<'NODE'
+const { execFileSync } = require('node:child_process');
+const { isDeepStrictEqual } = require('node:util');
+
+const [baseSha, headSha] = process.argv.slice(2);
+const readAt = (sha, path) =>
+  execFileSync('git', ['show', `${sha}:${path}`], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+
+const manifestPath = 'workflows/inngest/package.json';
+const baseManifest = JSON.parse(readAt(baseSha, manifestPath));
+const headManifest = JSON.parse(readAt(headSha, manifestPath));
+for (const [dependency, version] of [
+  ['@ai-sdk/openai', '^1.3.24'],
+  ['inngest-cli', '^1.26.0'],
+]) {
+  if (baseManifest.devDependencies?.[dependency] !== version) {
+    throw new Error(`PF-2057 base no longer contains the reviewed ${dependency}@${version} devDependency.`);
+  }
+}
+const expectedManifest = structuredClone(baseManifest);
+delete expectedManifest.devDependencies['@ai-sdk/openai'];
+delete expectedManifest.devDependencies['inngest-cli'];
+if (!isDeepStrictEqual(headManifest, expectedManifest)) {
+  throw new Error('PF-2057 package.json may only remove the two reviewed unused devDependencies.');
+}
+
+const baseLock = readAt(baseSha, 'pnpm-lock.yaml');
+const headLock = readAt(headSha, 'pnpm-lock.yaml');
+const lines = baseLock.split('\n');
+
+function indentation(line) {
+  return line.length - line.trimStart().length;
+}
+
+function sectionEnd(start) {
+  const startIndent = indentation(lines[start]);
+  let end = start + 1;
+  while (end < lines.length && (lines[end] === '' || indentation(lines[end]) > startIndent)) end += 1;
+  return end;
+}
+
+function findUniqueLine(marker, start = 0, end = lines.length) {
+  const matches = [];
+  for (let index = start; index < end; index += 1) {
+    if (lines[index] === marker) matches.push(index);
+  }
+  if (matches.length !== 1) {
+    throw new Error(`PF-2057 expected exactly one lockfile line ${JSON.stringify(marker)}, found ${matches.length}.`);
+  }
+  return matches[0];
+}
+
+function removeBlock(marker, start = 0, end = lines.length) {
+  const blockStart = findUniqueLine(marker, start, end);
+  lines.splice(blockStart, sectionEnd(blockStart) - blockStart);
+}
+
+function importerBounds() {
+  const start = findUniqueLine('  workflows/inngest:');
+  return [start + 1, sectionEnd(start)];
+}
+
+for (const marker of ["      '@ai-sdk/openai':", '      inngest-cli:']) {
+  const [start, end] = importerBounds();
+  removeBlock(marker, start, end);
+}
+removeBlock('  inngest-cli@1.27.0:');
+removeBlock('  inngest-cli@1.27.0(encoding@0.1.13):');
+
+if (lines.join('\n') !== headLock) {
+  throw new Error('PF-2057 pnpm-lock.yaml may only remove the reviewed Inngest importer and inngest-cli graph blocks.');
+}
+NODE
+}
+
 classify_install_lane() (
   : "${BASE_SHA:?BASE_SHA is required}"
   : "${HEAD_SHA:?HEAD_SHA is required}"
@@ -1046,7 +1197,8 @@ classify_install_lane() (
   trap 'rm -f "$manifest_changes"' EXIT
   git diff --no-renames --name-only "${BASE_SHA}...${HEAD_SHA}" -- \
     .npmrc .pnpmfile.cjs pnpmfile.cjs package.json pnpm-workspace.yaml \
-    patches packages/server/package.json server-adapters/fastify/package.json |
+    patches packages/server/package.json server-adapters/fastify/package.json \
+    packages/_types-builder/package.json packages/agent-builder/package.json |
     sort -u > "$manifest_changes"
 
   # PF-3759 is frozen to one reviewed merge commit, tree, branch, repository,
@@ -1161,6 +1313,21 @@ classify_install_lane() (
   fi
 
   if [[ ! -s "$manifest_changes" ]]; then
+    if ! git diff --quiet "${BASE_SHA}...${HEAD_SHA}" -- pnpm-lock.yaml; then
+      if ! git diff --quiet "${BASE_SHA}...${HEAD_SHA}" -- workflows/inngest/package.json &&
+        verify_pf2057_inngest_dependency_cleanup "$(git merge-base "$BASE_SHA" "$HEAD_SHA")" "$HEAD_SHA"; then
+        emit_validation_lane standard
+        return
+      fi
+      echo 'Lockfile-only changes require a reviewed dependency-graph lane.' >&2
+      return 1
+    fi
+    emit_validation_lane standard
+    return
+  fi
+
+  if [[ "$(cat "$manifest_changes")" == 'packages/agent-builder/package.json' ]]; then
+    verify_agent_builder_fixture_dependency "$(git merge-base "$BASE_SHA" "$HEAD_SHA")" "$HEAD_SHA"
     emit_validation_lane standard
     return
   fi
@@ -3364,12 +3531,15 @@ run_validator_self_tests() {
   local fixture_inngest_compose_blob fixture_inngest_compose_sha
   local fixture_inngest_adapter_blob fixture_inngest_adapter_sha
   local temporal_build_line temporal_typecheck_line
+  local package_contract_dependency_base_sha package_contract_base_sha package_contract_head_sha rejected_case failed_command
   local output
   local status
 
   # Keep the dedicated manifest/dependency admission suite in the aggregate
   # validator self-test as well as exposing it through its focused entrypoint.
-  run_pf3553_admission_self_tests
+  if [[ "${1:-}" != '--package-contracts-only' ]]; then
+    run_pf3553_admission_self_tests
+  fi
 
   validator_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
   test_root="$(mktemp -d)"
@@ -3392,6 +3562,10 @@ run_validator_self_tests() {
     "$fixture_repo/packages/core/src/agent/__tests__" \
     "$fixture_repo/packages/core/src/agent/durable/__tests__" \
     "$fixture_repo/packages/core/src/harness/v1" \
+    "$fixture_repo/packages/_types-builder/src" \
+    "$fixture_repo/packages/agent-builder/src" \
+    "$fixture_repo/packages/agent-builder/integration-tests/src" \
+    "$fixture_repo/scripts" \
     "$fixture_repo/packages/server/src/server/handlers" \
     "$fixture_repo/packages/server/src/server/server-adapter/routes" \
     "$fixture_repo/pubsub/google-cloud-pubsub/src" \
@@ -3425,6 +3599,8 @@ run_validator_self_tests() {
     'printf '\''OPENAI_API_KEY=%s\t%s\n'\'' "${OPENAI_API_KEY:-}" "$*" >> "${MOCK_PNPM_ENVIRONMENT_LOG:?}"' \
     'if [[ " $* " == *" check:core-imports "* && "${MOCK_FAIL_CORE_IMPORTS:-0}" == 1 ]]; then exit 23; fi' \
     'if [[ " $* " == *" check:permissions "* && "${MOCK_FAIL_PERMISSIONS:-0}" == 1 ]]; then exit 17; fi' \
+    'if [[ -n "${MOCK_FAIL_PACKAGE_CONTRACT_COMMAND:-}" && "$*" == "$MOCK_FAIL_PACKAGE_CONTRACT_COMMAND" ]]; then exit 29; fi' \
+    'if [[ -n "${MOCK_FAIL_PACKAGE_CONTRACT_TEST:-}" && " $* " == *" $MOCK_FAIL_PACKAGE_CONTRACT_TEST "* ]]; then exit 31; fi' \
     'if [[ " $* " == *" generate:route-types "* && "${MOCK_STALE_ROUTE_TYPES:-0}" == 1 ]]; then' \
     '  printf '\''%s\n'\'' "// regenerated" >> client-sdks/client-js/src/route-types.generated.ts' \
     'fi' \
@@ -3454,7 +3630,9 @@ run_validator_self_tests() {
     'for argument in "$@"; do' \
     '  case "$argument" in' \
     '    --outputFile.json=*)' \
-    '      if [[ " $* " == *" --typecheck.only "* ]]; then' \
+    '      if [[ -n "${MOCK_ZERO_PACKAGE_CONTRACT_TEST:-}" && " $* " == *" $MOCK_ZERO_PACKAGE_CONTRACT_TEST "* ]]; then' \
+    '        printf '\''%s\n'\'' '\''{"numPassedTests":0,"numFailedTests":0}'\'' > "${argument#*=}"' \
+    '      elif [[ " $* " == *" --typecheck.only "* ]]; then' \
     '        case "${MOCK_TYPE_TEST_REPORT:-pass}" in' \
     '          zero) printf '\''%s\n'\'' '\''{"numPassedTests":0,"numFailedTests":0}'\'' > "${argument#*=}" ;;' \
     '          partial) printf '\''%s\n'\'' '\''{"numPassedTests":1}'\'' > "${argument#*=}" ;;' \
@@ -3554,6 +3732,22 @@ run_validator_self_tests() {
       'void indexObservationGroupsFromMessages(memory, {});' \
       > mastracode/sdk/scripts/index-messages.ts
     printf '%s\n' '{}' > packages/cli/package.json
+    printf '%s\n' '{"private":true,"scripts":{}}' > packages/_types-builder/package.json
+    printf '%s\n' 'export const generateTypes = true;' > packages/_types-builder/src/index.js
+    printf '%s\n' 'export const replaceTypes = true;' > packages/_types-builder/src/replace-types.js
+    printf '%s\n' '{"scripts":{"check":"tsc --noEmit","lint":"oxlint .","build":"tsdown"},"devDependencies":{"@mastra/core":"workspace:*"}}' \
+      > packages/agent-builder/package.json
+    printf '%s\n' 'export default {};' > packages/agent-builder/tsdown.config.ts
+    printf '%s\n' 'export default {};' > packages/agent-builder/vitest.config.ts
+    printf '%s\n' '{"compilerOptions":{"strict":true},"include":["src"]}' > packages/agent-builder/tsconfig.json
+    printf '%s\n' '{}' > packages/agent-builder/integration-tests/package.json
+    printf '%s\n' '# Agent Builder integration tests' > packages/agent-builder/integration-tests/README.md
+    printf '%s\n' "import { it } from 'vitest';" "it('agent builder', () => {});" \
+      > packages/agent-builder/src/agent-builder.test.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('native declarations', () => {});" \
+      > scripts/types-builder.test.ts
+    printf '%s\n' '{"compilerOptions":{"strict":true,"noUncheckedIndexedAccess":true},"include":["types-builder.test.ts"]}' \
+      > scripts/tsconfig.json
     printf '%s\n' '{}' > packages/core/package.json
     printf '%s\n' 'export default {};' > packages/core/vitest.config.ts
     printf '%s\n' "export const supervisorRuntime = 'base';" \
@@ -3823,6 +4017,270 @@ run_validator_self_tests() {
     assert_contains '--dir client-sdks/client-js exec vitest run src/resources/harness.test.ts --reporter=dot' "$command_log"
     assert_contains '--dir packages/cli exec vitest run src/commands/api/descriptors.test.ts --reporter=dot' "$command_log"
   }
+
+  assert_package_contract_rejected() {
+    : > "$command_log"
+    if run_fixture "$1" "$3" BASE_SHA="$2"; then
+      echo 'An unsupported package contract change unexpectedly passed.' >&2
+      cat "$3" >&2
+      exit 1
+    fi
+    if [[ -s "$command_log" ]]; then
+      echo 'An unsupported package contract change executed package commands.' >&2
+      cat "$command_log" >&2
+      exit 1
+    fi
+  }
+
+  package_contract_dependency_base_sha="$(
+    cd "$fixture_repo"
+    node <<'NODE'
+const fs = require('node:fs');
+const lock = fs.readFileSync('pnpm-lock.yaml', 'utf8');
+fs.writeFileSync('pnpm-lock.yaml', lock.replace('importers:\n',
+  'importers:\n\n  packages/agent-builder:\n    devDependencies:\n' +
+  "      '@mastra/core':\n        specifier: workspace:*\n        version: link:../core\n"));
+NODE
+    git add pnpm-lock.yaml
+    git commit -q -m 'prepare Agent Builder importer fixture'
+    git rev-parse HEAD
+  )"
+  output="$test_root/package-contract-lockfile-only-admission.log"
+  if (
+    cd "$fixture_repo"
+    BASE_SHA="$base_sha" HEAD_SHA="$package_contract_dependency_base_sha" \
+      GITHUB_OUTPUT= bash "$validator_path" --classify-install
+  ) > "$output" 2>&1; then
+    echo 'A lockfile-only change unexpectedly entered the standard install lane.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'Lockfile-only changes require a reviewed dependency-graph lane.' "$output"
+  package_contract_base_sha="$(
+    cd "$fixture_repo"
+    node <<'NODE'
+const fs = require('node:fs');
+const file = 'packages/agent-builder/package.json';
+const manifest = JSON.parse(fs.readFileSync(file, 'utf8'));
+manifest.scripts['check:fixtures'] = 'tsc --noEmit --project tsconfig.fixtures.json';
+manifest.devDependencies['@mastra/mcp'] = 'workspace:*';
+fs.writeFileSync(file, JSON.stringify(manifest));
+const lock = fs.readFileSync('pnpm-lock.yaml', 'utf8');
+fs.writeFileSync('pnpm-lock.yaml', lock.replace('        version: link:../core\n',
+  '        version: link:../core\n' +
+  "      '@mastra/mcp':\n        specifier: workspace:*\n        version: link:../mcp\n"));
+NODE
+    printf '%s\n' '{"extends":"./tsconfig.json","include":["integration-tests/src/fixtures/**/*"]}' \
+      > packages/agent-builder/tsconfig.fixtures.json
+    printf '%s\n' 'Run both package and fixture checks after building the workspace dependencies.' \
+      >> packages/agent-builder/integration-tests/README.md
+    git add .
+    git commit -q -m 'own Agent Builder fixture compilation'
+    git rev-parse HEAD
+  )"
+  output="$test_root/package-contract-fixture-admission.log"
+  (
+    cd "$fixture_repo"
+    BASE_SHA="$package_contract_dependency_base_sha" HEAD_SHA="$package_contract_base_sha" \
+      GITHUB_OUTPUT= bash "$validator_path" --classify-install
+  ) > "$output" 2>&1
+  assert_contains 'lane=standard' "$output"
+  : > "$command_log"
+  if ! run_fixture "$package_contract_base_sha" "$output" BASE_SHA="$package_contract_dependency_base_sha"; then
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'exec turbo run build --filter=@mastra/agent-builder... --concurrency=2' "$command_log"
+  assert_contains '--filter ./packages/agent-builder --fail-if-no-match check' "$command_log"
+  assert_contains '--filter ./packages/agent-builder --fail-if-no-match check:fixtures' "$command_log"
+  assert_contains '--filter ./packages/agent-builder --fail-if-no-match lint' "$command_log"
+  assert_contains 'src/agent-builder.test.ts' "$command_log"
+
+  package_contract_head_sha="$(
+    cd "$fixture_repo"
+    printf '%s\n' 'export const generateTypes = false;' > packages/_types-builder/src/index.js
+    printf '%s\n' 'export const replaceTypes = false;' > packages/_types-builder/src/replace-types.js
+    printf '%s\n' "export default { format: ['esm', 'cjs'] };" > packages/agent-builder/tsdown.config.ts
+    git add .
+    git commit -q -m 'change owned package build sources without changing tests'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/package-contract-owned-sources.log"
+  if ! run_fixture "$package_contract_head_sha" "$output" BASE_SHA="$package_contract_base_sha"; then
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'build:core' "$command_log"
+  assert_contains '--filter ./packages/core --fail-if-no-match check' "$command_log"
+  assert_contains 'exec tsc --project scripts/tsconfig.json --noEmit' "$command_log"
+  assert_contains 'exec oxlint packages/_types-builder/src/index.js packages/_types-builder/src/replace-types.js' "$command_log"
+  assert_line_count 1 'exec turbo run build --filter=@mastra/agent-builder... --concurrency=2' "$command_log"
+  assert_contains "exec node $PACKED_DECLARATION_CHECK --package packages/agent-builder" "$command_log"
+  assert_contains '--filter ./packages/agent-builder --fail-if-no-match check:fixtures' "$command_log"
+  assert_contains 'scripts/types-builder.test.ts' "$command_log"
+  assert_contains 'src/agent-builder.test.ts' "$command_log"
+
+  for failed_command in \
+    'build:core' \
+    'exec tsc --project scripts/tsconfig.json --noEmit' \
+    'exec turbo run build --filter=@mastra/agent-builder... --concurrency=2' \
+    "exec node $PACKED_DECLARATION_CHECK --package packages/agent-builder" \
+    '--filter ./packages/agent-builder --fail-if-no-match check' \
+    '--filter ./packages/agent-builder --fail-if-no-match check:fixtures'; do
+    output="$test_root/package-contract-command-failure.log"
+    if run_fixture "$package_contract_head_sha" "$output" BASE_SHA="$package_contract_base_sha" \
+      MOCK_FAIL_PACKAGE_CONTRACT_COMMAND="$failed_command"; then
+      echo "Failed owning command unexpectedly passed: $failed_command" >&2
+      exit 1
+    fi
+  done
+  for rejected_case in scripts/types-builder.test.ts src/agent-builder.test.ts; do
+    for failed_command in MOCK_FAIL_PACKAGE_CONTRACT_TEST MOCK_ZERO_PACKAGE_CONTRACT_TEST; do
+      output="$test_root/package-contract-test-failure.log"
+      if run_fixture "$package_contract_head_sha" "$output" BASE_SHA="$package_contract_base_sha" \
+        "$failed_command=$rejected_case"; then
+        echo "An unexecuted or failed owning test unexpectedly passed: $rejected_case ($failed_command)" >&2
+        exit 1
+      fi
+    done
+  done
+
+  for rejected_case in types-builder-source agent-builder-source nested-test types-builder-manifest \
+    deleted-generator symlink-generator excluded-generator deleted-builder symlink-builder; do
+    head_sha="$(
+      cd "$fixture_repo"
+      git reset -q --hard "$package_contract_base_sha"
+      case "$rejected_case" in
+        types-builder-source) printf '%s\n' 'export const unknown = true;' > packages/_types-builder/src/unknown.js ;;
+        agent-builder-source) printf '%s\n' 'export const unknown = true;' > packages/agent-builder/src/unknown.ts ;;
+        nested-test) printf '%s\n' "it('external fixture', () => {});" > packages/agent-builder/integration-tests/src/unknown.test.ts ;;
+        types-builder-manifest) printf '%s\n' '{"private":false}' > packages/_types-builder/package.json ;;
+        deleted-generator) rm scripts/types-builder.test.ts ;;
+        symlink-generator) rm scripts/types-builder.test.ts; ln -s missing.test.ts scripts/types-builder.test.ts ;;
+        excluded-generator)
+          printf '%s\n' 'export const generateTypes = false;' > packages/_types-builder/src/index.js
+          printf '%s\n' '{"compilerOptions":{"strict":true,"noUncheckedIndexedAccess":true},"include":["types-builder.test.ts"],"exclude":["types-builder.test.ts"]}' \
+            > scripts/tsconfig.json
+          ;;
+        deleted-builder) rm packages/agent-builder/src/agent-builder.test.ts ;;
+        symlink-builder) rm packages/agent-builder/src/agent-builder.test.ts; ln -s missing.test.ts packages/agent-builder/src/agent-builder.test.ts ;;
+      esac
+      git add .
+      git commit -q -m "reject $rejected_case"
+      git rev-parse HEAD
+    )"
+    assert_package_contract_rejected "$head_sha" "$package_contract_base_sha" "$test_root/package-contract-$rejected_case.log"
+  done
+
+  for rejected_case in metadata script dependency lock-link lock-graph lock-other-importer fixture-exclusion; do
+    head_sha="$(
+      cd "$fixture_repo"
+      git reset -q --hard "$package_contract_base_sha"
+      node - "$rejected_case" <<'NODE'
+const fs = require('node:fs');
+const variant = process.argv[2];
+const file = 'packages/agent-builder/package.json';
+const manifest = JSON.parse(fs.readFileSync(file, 'utf8'));
+if (variant === 'metadata') manifest.description = 'unreviewed metadata';
+if (variant === 'script') manifest.scripts.check = 'echo skipped';
+if (variant === 'dependency') manifest.devDependencies['@mastra/core'] = 'latest';
+fs.writeFileSync(file, JSON.stringify(manifest));
+let lock = fs.readFileSync('pnpm-lock.yaml', 'utf8');
+if (variant === 'lock-link') lock = lock.replace('link:../mcp', '1.0.0');
+if (variant === 'lock-graph') lock = lock.replace('sha512-retained', 'sha512-changed');
+if (variant === 'lock-other-importer') lock = lock.replace('specifier: ^1.26.0', 'specifier: ^1.27.0');
+fs.writeFileSync('pnpm-lock.yaml', lock);
+if (variant === 'fixture-exclusion') {
+  const configFile = 'packages/agent-builder/tsconfig.fixtures.json';
+  const config = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+  config.exclude = ['**/*'];
+  fs.writeFileSync(configFile, JSON.stringify(config));
+}
+NODE
+      git add .
+      git commit -q -m "reject fixture $rejected_case drift"
+      git rev-parse HEAD
+    )"
+    output="$test_root/package-contract-$rejected_case-admission.log"
+    if (
+      cd "$fixture_repo"
+      BASE_SHA="$package_contract_dependency_base_sha" HEAD_SHA="$head_sha" \
+        GITHUB_OUTPUT= bash "$validator_path" --classify-install
+    ) > "$output" 2>&1; then
+      echo "Unsupported fixture $rejected_case drift passed install admission." >&2
+      exit 1
+    fi
+    assert_package_contract_rejected "$head_sha" "$package_contract_dependency_base_sha" "$test_root/package-contract-$rejected_case-validation.log"
+  done
+
+  local schema_runtime_base_sha schema_runtime_case
+  schema_runtime_base_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$package_contract_base_sha"
+    mkdir -p packages/core/src/tools/tool-builder
+    printf '%s\n' 'export const schema = {};' > packages/core/src/tools/tool-builder/builder.ts
+    printf '%s\n' "import '../../../../core/src/tools/tool-builder/builder';" \
+      >> packages/server/src/server/handlers/favorites.integration.test.ts
+    git add .
+    git commit -q -m 'prepare the native Tool Builder schema runtime fixture'
+    git rev-parse HEAD
+  )"
+  for schema_runtime_case in named extra-value namespace default side-effect reexport require dynamic outside-owner; do
+    head_sha="$(
+      cd "$fixture_repo"
+      git reset -q --hard "$schema_runtime_base_sha"
+      node - "$schema_runtime_case" <<'NODE'
+const fs = require('node:fs');
+const variant = process.argv[2];
+const file = 'packages/core/src/tools/tool-builder/builder.ts';
+const named = "import { jsonSchema } from '@internal/ai-v6';\n";
+const schema = 'export const schema = jsonSchema({ type: "object" });\n';
+const extra = {
+  named: "import type { Schema } from '@internal/ai-v6';\n",
+  'extra-value': "import { generateText } from '@internal/ai-v6';\nvoid generateText;\n",
+  namespace: "import * as sdk from '@internal/ai-v6';\nvoid sdk;\n",
+  default: "import sdk from '@internal/ai-v6';\nvoid sdk;\n",
+  'side-effect': "import '@internal/ai-v6';\n",
+  reexport: "export { generateText } from '@internal/ai-v6';\n",
+  require: "void require('@internal/ai-v6');\n",
+  dynamic: "void import('@internal/ai-v6');\n",
+};
+if (variant === 'outside-owner') {
+  fs.writeFileSync(file, "export { schema } from './schema-helper';\n");
+  fs.writeFileSync('packages/core/src/tools/tool-builder/schema-helper.ts', named + schema);
+} else {
+  fs.writeFileSync(file, named + extra[variant] + schema);
+}
+NODE
+      git add .
+      git commit -q -m "exercise native schema import $schema_runtime_case"
+      git rev-parse HEAD
+    )"
+    : > "$command_log"
+    output="$test_root/package-contract-schema-runtime-$schema_runtime_case.log"
+    if [[ "$schema_runtime_case" == named ]]; then
+      if ! run_fixture "$head_sha" "$output" BASE_SHA="$schema_runtime_base_sha"; then
+        cat "$output" >&2
+        exit 1
+      fi
+      assert_contains 'Running changed test file in full: packages/server/src/server/handlers/favorites.integration.test.ts' "$output"
+      schema_runtime_base_sha="$head_sha"
+    else
+      if run_fixture "$head_sha" "$output" BASE_SHA="$schema_runtime_base_sha"; then
+        echo "Unsupported native schema import unexpectedly passed: $schema_runtime_case" >&2
+        cat "$output" >&2
+        exit 1
+      fi
+      assert_contains 'unreviewed external module @internal/ai-v6' "$output"
+      assert_not_contains 'Running changed test file in full:' "$output"
+    fi
+  done
+  git -C "$fixture_repo" reset -q --hard "$base_sha"
+  echo 'Package contract ownership, native command, fixture metadata, and fail-closed validation fixtures passed.'
+  if [[ "${1:-}" == '--package-contracts-only' ]]; then
+    return
+  fi
 
   pf3553_base_sha="$(
     cd "$fixture_repo"
@@ -5447,6 +5905,15 @@ NODE
     git rev-parse HEAD
   )"
   inngest_pf2057_head_sha="$head_sha"
+  output="$test_root/inngest-pf2057-install-admission.log"
+  if ! (
+    cd "$fixture_repo"
+    BASE_SHA="$base_sha" HEAD_SHA="$head_sha" GITHUB_OUTPUT= bash "$validator_path" --classify-install
+  ) > "$output" 2>&1; then
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'lane=standard' "$output"
   : > "$command_log"
   : > "$docker_log"
   : > "$service_log"
@@ -5473,6 +5940,16 @@ NODE
   )"
   : > "$command_log"
   : > "$docker_log"
+  output="$test_root/inngest-pf2057-lock-tamper-admission.log"
+  if (
+    cd "$fixture_repo"
+    BASE_SHA="$base_sha" HEAD_SHA="$head_sha" GITHUB_OUTPUT= bash "$validator_path" --classify-install
+  ) > "$output" 2>&1; then
+    echo 'PF-2057 tampered lockfile unexpectedly passed install admission.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'Lockfile-only changes require a reviewed dependency-graph lane.' "$output"
   output="$test_root/inngest-pf2057-lock-tamper-failure.log"
   set +e
   run_fixture "$head_sha" "$output"
@@ -8050,6 +8527,11 @@ NODE
 
 if [[ "${1:-}" == "--self-test" ]]; then
   run_validator_self_tests
+  exit 0
+fi
+
+if [[ "${1:-}" == "--self-test-package-contracts" ]]; then
+  run_validator_self_tests --package-contracts-only
   exit 0
 fi
 
@@ -10674,6 +11156,12 @@ is_server_generated_artifact() {
 }
 
 while IFS= read -r file; do
+  if [[ "$file" == packages/agent-builder/integration-tests/README.md ]]; then
+    # The root workspace owns fixture compilation; the nested integration
+    # package remains outside the installed and runnable workspace graph.
+    printf '%s\n' packages/agent-builder >> "$workspace_candidates"
+    continue
+  fi
   if is_server_generated_artifact "$file"; then
     # These exact generated consumers are owned by Server route/permission
     # sources. Their output can be committed without granting general fork
@@ -10715,7 +11203,7 @@ while IFS= read -r workspace; do
     continue
   fi
   case "$workspace" in
-    auth/okta | browser/stagehand | packages/_internal-core | packages/cli | packages/codemod | packages/core | packages/deployer | packages/mcp | packages/memory | packages/server | client-sdks/ai-sdk | client-sdks/client-js | stores/_test-utils | stores/convex | stores/libsql | stores/pg | stores/redis | mastracode | mastracode/sdk | mastracode/tui | pubsub/google-cloud-pubsub | pubsub/redis-streams | workflows/inngest | workflows/temporal | observability/mastra | docs) ;;
+    auth/okta | browser/stagehand | packages/_internal-core | packages/_types-builder | packages/agent-builder | packages/cli | packages/codemod | packages/core | packages/deployer | packages/mcp | packages/memory | packages/server | client-sdks/ai-sdk | client-sdks/client-js | stores/_test-utils | stores/convex | stores/libsql | stores/pg | stores/redis | mastracode | mastracode/sdk | mastracode/tui | pubsub/google-cloud-pubsub | pubsub/redis-streams | workflows/inngest | workflows/temporal | observability/mastra | docs) ;;
     server-adapters/fastify)
       if [[ "$pf3553_selected_route_exports" == false ]]; then
         printf '%s\n' "$workspace" >> "$unsupported_workspaces"
@@ -10729,6 +11217,7 @@ while IFS= read -r file; do
   case "$file" in
     .changeset/* | \
       .github/scripts/run-papersflow-fork-pr-validation.bash | \
+      .github/scripts/check-packed-declaration-fixture.mjs | \
       .github/workflows/README.md | \
       .github/workflows/e2e-docs.yml | \
       .github/workflows/labeler.yml | \
@@ -10740,6 +11229,7 @@ while IFS= read -r file; do
       pnpm-lock.yaml | \
       scripts/commonjs-tsc-fixer.js | \
       scripts/commonjs-tsc-fixer.test.ts | \
+      scripts/types-builder.test.ts | \
       scripts/tsconfig.json | \
       scripts/vitest.config.ts | \
       vitest.config.ts) ;;
@@ -10765,81 +11255,15 @@ if [[ "$pf3553_selected_route_exports" == false ]]; then
     "$changed_files" >> "$unsupported_inputs" || true
 fi
 
-verify_pf2057_inngest_dependency_cleanup() {
-  node - "$merge_base_sha" "$HEAD_SHA" <<'NODE'
-const { execFileSync } = require('node:child_process');
-const { isDeepStrictEqual } = require('node:util');
+agent_builder_fixture_dependency=false
+if grep -Fxq packages/agent-builder/package.json "$changed_files"; then
+  if verify_agent_builder_fixture_dependency "$merge_base_sha" "$HEAD_SHA"; then
+    agent_builder_fixture_dependency=true
+  else
+    printf '%s\n' packages/agent-builder/package.json >> "$unsupported_inputs"
+  fi
+fi
 
-const [baseSha, headSha] = process.argv.slice(2);
-const readAt = (sha, path) =>
-  execFileSync('git', ['show', `${sha}:${path}`], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
-
-const manifestPath = 'workflows/inngest/package.json';
-const baseManifest = JSON.parse(readAt(baseSha, manifestPath));
-const headManifest = JSON.parse(readAt(headSha, manifestPath));
-for (const [dependency, version] of [
-  ['@ai-sdk/openai', '^1.3.24'],
-  ['inngest-cli', '^1.26.0'],
-]) {
-  if (baseManifest.devDependencies?.[dependency] !== version) {
-    throw new Error(`PF-2057 base no longer contains the reviewed ${dependency}@${version} devDependency.`);
-  }
-}
-const expectedManifest = structuredClone(baseManifest);
-delete expectedManifest.devDependencies['@ai-sdk/openai'];
-delete expectedManifest.devDependencies['inngest-cli'];
-if (!isDeepStrictEqual(headManifest, expectedManifest)) {
-  throw new Error('PF-2057 package.json may only remove the two reviewed unused devDependencies.');
-}
-
-const baseLock = readAt(baseSha, 'pnpm-lock.yaml');
-const headLock = readAt(headSha, 'pnpm-lock.yaml');
-const lines = baseLock.split('\n');
-
-function indentation(line) {
-  return line.length - line.trimStart().length;
-}
-
-function sectionEnd(start) {
-  const startIndent = indentation(lines[start]);
-  let end = start + 1;
-  while (end < lines.length && (lines[end] === '' || indentation(lines[end]) > startIndent)) end += 1;
-  return end;
-}
-
-function findUniqueLine(marker, start = 0, end = lines.length) {
-  const matches = [];
-  for (let index = start; index < end; index += 1) {
-    if (lines[index] === marker) matches.push(index);
-  }
-  if (matches.length !== 1) {
-    throw new Error(`PF-2057 expected exactly one lockfile line ${JSON.stringify(marker)}, found ${matches.length}.`);
-  }
-  return matches[0];
-}
-
-function removeBlock(marker, start = 0, end = lines.length) {
-  const blockStart = findUniqueLine(marker, start, end);
-  lines.splice(blockStart, sectionEnd(blockStart) - blockStart);
-}
-
-function importerBounds() {
-  const start = findUniqueLine('  workflows/inngest:');
-  return [start + 1, sectionEnd(start)];
-}
-
-for (const marker of ["      '@ai-sdk/openai':", '      inngest-cli:']) {
-  const [start, end] = importerBounds();
-  removeBlock(marker, start, end);
-}
-removeBlock('  inngest-cli@1.27.0:');
-removeBlock('  inngest-cli@1.27.0(encoding@0.1.13):');
-
-if (lines.join('\n') !== headLock) {
-  throw new Error('PF-2057 pnpm-lock.yaml may only remove the reviewed Inngest importer and inngest-cli graph blocks.');
-}
-NODE
-}
 
 inngest_pf2057_dependency_cleanup=false
 inngest_manifest_changed=false
@@ -10847,7 +11271,7 @@ lockfile_changed=false
 grep -Fxq 'workflows/inngest/package.json' "$changed_files" && inngest_manifest_changed=true
 grep -Fxq 'pnpm-lock.yaml' "$changed_files" && lockfile_changed=true
 if [[ "$inngest_manifest_changed" == true && "$lockfile_changed" == true ]] &&
-  verify_pf2057_inngest_dependency_cleanup; then
+  verify_pf2057_inngest_dependency_cleanup "$merge_base_sha" "$HEAD_SHA"; then
   inngest_pf2057_dependency_cleanup=true
 fi
 
@@ -11199,6 +11623,62 @@ queue_owned_workspace_test() {
     printf '%s\n' "$test_file" >> "$forced_workspace_tests"
   fi
 }
+
+types_builder_changed=false
+while IFS= read -r file; do
+  case "$file" in
+    packages/_types-builder/src/index.js | packages/_types-builder/src/replace-types.js | \
+      scripts/types-builder.test.ts)
+      types_builder_changed=true
+      queue_owned_workspace_test "$file" scripts/types-builder.test.ts
+      ;;
+    packages/_types-builder/*)
+      printf '%s\n' "$file" >> "$unsupported_owned_workspace_sources"
+      ;;
+    packages/agent-builder/tsdown.config.ts | packages/agent-builder/src/agent-builder.test.ts | \
+      packages/agent-builder/integration-tests/README.md)
+      queue_owned_workspace_test "$file" packages/agent-builder/src/agent-builder.test.ts
+      ;;
+    packages/agent-builder/tsconfig.fixtures.json)
+      if verify_agent_builder_fixture_config "$HEAD_SHA"; then
+        queue_owned_workspace_test "$file" packages/agent-builder/src/agent-builder.test.ts
+      else
+        printf '%s\n' "$file" >> "$unsupported_owned_workspace_sources"
+      fi
+      ;;
+    packages/agent-builder/package.json)
+      if [[ "$agent_builder_fixture_dependency" == true ]]; then
+        queue_owned_workspace_test "$file" packages/agent-builder/src/agent-builder.test.ts
+      else
+        printf '%s\n' "$file" >> "$unsupported_owned_workspace_sources"
+      fi
+      ;;
+    packages/agent-builder/*)
+      printf '%s\n' "$file" >> "$unsupported_owned_workspace_sources"
+      ;;
+  esac
+done < "$changed_files"
+
+if [[ "$types_builder_changed" == true ]]; then
+  if ! node - "$TYPESCRIPT_MODULE_PATH" <<'NODE'
+const path = require('node:path');
+const ts = require(process.argv[2]);
+const project = ts.getParsedCommandLineOfConfigFile('scripts/tsconfig.json', {}, {
+  ...ts.sys,
+  onUnRecoverableConfigFileDiagnostic(diagnostic) {
+    console.error(ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n'));
+  },
+});
+if (!project || project.errors.length > 0 ||
+  !project.fileNames.includes(path.resolve('scripts/types-builder.test.ts'))) {
+  console.error('Generator validation requires scripts/types-builder.test.ts in the resolved scripts TypeScript project.');
+  process.exit(1);
+}
+NODE
+  then
+    printf '%s\n' 'scripts/tsconfig.json' >> "$unsupported_owned_workspace_sources"
+  fi
+fi
 
 # The Client SDK is admitted only through exact source-and-test ownership.
 # Generated route types remain owned by the Server generator path above.
@@ -11788,14 +12268,23 @@ NODE
   fi
 }
 
+agent_builder_prerequisites_built=false
+ensure_agent_builder_prerequisites() {
+  if [[ "$agent_builder_prerequisites_built" == true ]]; then
+    return
+  fi
+  # Build the native dependency graph, including MCP's fixture declarations.
+  run_with_validation_budget 900 pnpm exec turbo run build --filter=@mastra/agent-builder... --concurrency=2
+  agent_builder_prerequisites_built=true
+}
+
 server_prerequisites_built=false
 ensure_server_prerequisites() {
   if [[ "$server_prerequisites_built" == true ]]; then
     return
   fi
 
-  run_with_validation_budget 900 pnpm --filter ./packages/memory --fail-if-no-match build:lib
-  run_with_validation_budget 900 pnpm --filter ./packages/agent-builder --fail-if-no-match build
+  ensure_agent_builder_prerequisites
   run_with_validation_budget 900 pnpm --filter ./packages/server --fail-if-no-match build:lib
   server_prerequisites_built=true
 }
@@ -11935,6 +12424,25 @@ if workspace_changed packages/_internal-core; then
   run_with_validation_budget 600 pnpm --dir packages/_internal-core typecheck
 fi
 
+if [[ "$types_builder_changed" == true ]]; then
+  # This private build tool has no package scripts. Check its two owned JS
+  # sources with native tools; build:core above consumes the real declarations
+  # and the queued generator regression exercises both source boundaries.
+  run_with_validation_budget 120 node --check packages/_types-builder/src/index.js
+  run_with_validation_budget 120 node --check packages/_types-builder/src/replace-types.js
+  run_with_validation_budget 300 pnpm exec oxlint packages/_types-builder/src/index.js packages/_types-builder/src/replace-types.js
+fi
+
+if workspace_changed packages/agent-builder; then
+  ensure_agent_builder_prerequisites
+  # The workflow extracts this helper beside the validator from the same
+  # trusted revision, so a source PR cannot replace its own archive checker.
+  run_with_validation_budget 300 pnpm exec node "$PACKED_DECLARATION_CHECK" --package packages/agent-builder
+  run_with_validation_budget 600 pnpm --filter ./packages/agent-builder --fail-if-no-match check
+  run_with_validation_budget 600 pnpm --filter ./packages/agent-builder --fail-if-no-match check:fixtures
+  run_with_validation_budget 600 pnpm --filter ./packages/agent-builder --fail-if-no-match lint
+fi
+
 if workspace_changed packages/server; then
   ensure_server_prerequisites
   run_with_validation_budget 600 pnpm --filter ./packages/server --fail-if-no-match exec tsc --noEmit
@@ -11961,7 +12469,8 @@ if workspace_changed packages/codemod; then
   run_with_validation_budget 600 pnpm --filter ./packages/codemod --fail-if-no-match lint
 fi
 
-if grep -Eq '^(scripts/(commonjs-tsc-fixer\.(js|test\.ts)|tsconfig\.json|vitest\.config\.ts)|vitest\.config\.ts)$' "$changed_files"; then
+if [[ "$types_builder_changed" == true ]] ||
+  grep -Eq '^(scripts/(commonjs-tsc-fixer\.(js|test\.ts)|tsconfig\.json|vitest\.config\.ts)|vitest\.config\.ts)$' "$changed_files"; then
   # scripts/tsconfig.json includes the root vitest.config.ts, so this also
   # type-checks root Vitest config changes.
   run_with_validation_budget 600 pnpm exec tsc --project scripts/tsconfig.json --noEmit
@@ -12349,8 +12858,16 @@ function exportDeclarationHasRuntimeValue(node) {
   return node.exportClause.elements.some(element => !element.isTypeOnly);
 }
 
-function runtimeModuleSpecifiers(file, source, computedSpecifiers) {
+function runtimeModuleSpecifiers(file, source, computedSpecifiers, runtimeOccurrences) {
   const specifiers = new Set();
+  const addSpecifier = (specifier, node) => {
+    specifiers.add(specifier);
+    if (runtimeOccurrences) {
+      const occurrences = runtimeOccurrences.get(specifier) ?? [];
+      occurrences.push(node);
+      runtimeOccurrences.set(specifier, occurrences);
+    }
+  };
   const parsed = sourceFile(file, source);
   const visit = node => {
     if (
@@ -12358,14 +12875,14 @@ function runtimeModuleSpecifiers(file, source, computedSpecifiers) {
       importDeclarationHasRuntimeValue(node) &&
       ts.isStringLiteralLike(node.moduleSpecifier)
     ) {
-      specifiers.add(node.moduleSpecifier.text);
+      addSpecifier(node.moduleSpecifier.text, node);
     } else if (
       ts.isExportDeclaration(node) &&
       exportDeclarationHasRuntimeValue(node) &&
       node.moduleSpecifier &&
       ts.isStringLiteralLike(node.moduleSpecifier)
     ) {
-      specifiers.add(node.moduleSpecifier.text);
+      addSpecifier(node.moduleSpecifier.text, node);
     } else if (
       ts.isImportEqualsDeclaration(node) &&
       !node.isTypeOnly &&
@@ -12373,14 +12890,14 @@ function runtimeModuleSpecifiers(file, source, computedSpecifiers) {
       node.moduleReference.expression &&
       ts.isStringLiteralLike(node.moduleReference.expression)
     ) {
-      specifiers.add(node.moduleReference.expression.text);
+      addSpecifier(node.moduleReference.expression.text, node);
     } else if (
       ts.isCallExpression(node) &&
       (node.expression.kind === ts.SyntaxKind.ImportKeyword ||
         (ts.isIdentifier(node.expression) && node.expression.text === 'require'))
     ) {
       if (node.arguments.length >= 1 && ts.isStringLiteralLike(node.arguments[0])) {
-        specifiers.add(node.arguments[0].text);
+        addSpecifier(node.arguments[0].text, node);
       } else if (computedSpecifiers) {
         // A computed specifier hides the loaded module from this literal-only
         // scan, so the caller must fail closed instead of trusting the graph.
@@ -12536,7 +13053,20 @@ function unsupportedModuleReason(specifier) {
   return undefined;
 }
 
-function approvedExactExternalSpecifier(specifier) {
+function approvedExactExternalSpecifier(specifier, importer, occurrences) {
+  // Tool Builder's owning SDK supplies this schema constructor. Every runtime
+  // occurrence must retain the reviewed named import, including repeated uses
+  // of the same module through another import or loader expression.
+  if (specifier === '@internal/ai-v6' &&
+    repositoryPath(importer) === 'packages/core/src/tools/tool-builder/builder.ts') {
+    return Boolean(occurrences?.length && occurrences.every(node => {
+      if (!ts.isImportDeclaration(node)) return false;
+      const clause = node.importClause;
+      return clause && !clause.name && clause.namedBindings && ts.isNamedImports(clause.namedBindings) &&
+        clause.namedBindings.elements.every(element =>
+          element.isTypeOnly || (element.propertyName ?? element.name).text === 'jsonSchema');
+    }));
+  }
   const bareSpecifier = specifier.startsWith('node:') ? specifier.slice('node:'.length) : specifier;
   return (
     specifier === 'vitest' ||
@@ -12651,7 +13181,8 @@ function unsupportedRuntimeReasons(file, source) {
   const baseSource = readBaseSource(file);
   const baseSpecifiers = baseSource ? runtimeModuleSpecifiers(file, baseSource) : new Set();
   const computedSpecifiers = new Set();
-  for (const specifier of runtimeModuleSpecifiers(file, source, computedSpecifiers)) {
+  const runtimeOccurrences = new Map();
+  for (const specifier of runtimeModuleSpecifiers(file, source, computedSpecifiers, runtimeOccurrences)) {
     const reason = unsupportedModuleReason(specifier);
     // A banned specifier that already existed in this file at the trusted
     // base commit is part of the reviewed production surface (e.g. a server
@@ -12661,11 +13192,15 @@ function unsupportedRuntimeReasons(file, source) {
     if (reason && !(baseSource !== undefined && baseSpecifiers.has(specifier))) {
       reasons.add(`module ${reason}`);
     }
+    // The Tool Builder approval names one export, so it remains scoped after
+    // that import reaches the trusted base.
     if (
       exactTestEntries.has(entryFile) &&
       !specifier.startsWith('.') &&
-      (!wasReachableFromExactTest || !baseSpecifiers.has(specifier)) &&
-      !approvedExactExternalSpecifier(specifier)
+      (!wasReachableFromExactTest || !baseSpecifiers.has(specifier) ||
+        (specifier === '@internal/ai-v6' &&
+          repositoryPath(file) === 'packages/core/src/tools/tool-builder/builder.ts')) &&
+      !approvedExactExternalSpecifier(specifier, file, runtimeOccurrences.get(specifier))
     ) {
       reasons.add(`unreviewed external module ${specifier}`);
     }
