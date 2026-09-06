@@ -90,21 +90,10 @@ export function createAgenticExecutionWorkflow<Tools extends ToolSet = ToolSet, 
     ...rest,
   });
 
-  const isTaskCompleteStep = createIsTaskCompleteStep({
-    models,
-    _internal,
-    ...rest,
-  });
+  const evented = process.env.MASTRA_EVENTED_EXECUTION === 'true';
+  const createWorkflow = evented ? createEventedWorkflow : createDirectWorkflow;
 
-  const goalStep = createGoalStep({
-    models,
-    _internal,
-    ...rest,
-  });
-
-  const createWorkflow = process.env.MASTRA_EVENTED_EXECUTION === 'true' ? createEventedWorkflow : createDirectWorkflow;
-
-  return createWorkflow({
+  const workflow = createWorkflow({
     id: AGENTIC_EXECUTION_WORKFLOW_ID,
     inputSchema: llmIterationOutputSchema,
     outputSchema: llmIterationOutputSchema,
@@ -176,8 +165,18 @@ export function createAgenticExecutionWorkflow<Tools extends ToolSet = ToolSet, 
     .foreach(toolCallStep, toolCallForeachOptions)
     .then(llmMappingStep)
     .then(backgroundTaskCheckStep)
-    .then(signalDrainStep)
-    .then(isTaskCompleteStep)
-    .then(goalStep)
-    .commit();
+    .then(signalDrainStep);
+
+  // Omit only absent capabilities: supplied configuration may change between
+  // iterations, even when it initially has no scorers or active goal.
+  // Evented recovery requires the retained graph to match exactly, including
+  // when a caller first supplies completion configuration on approval resume.
+  if (evented || rest.isTaskComplete !== undefined) {
+    workflow.then(createIsTaskCompleteStep({ models, _internal, ...rest }));
+  }
+  if (evented || rest.goal !== undefined) {
+    workflow.then(createGoalStep({ models, _internal, ...rest }));
+  }
+
+  return workflow.commit();
 }
