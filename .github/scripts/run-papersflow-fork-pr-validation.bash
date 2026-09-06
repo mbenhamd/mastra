@@ -3986,7 +3986,7 @@ NODE
   (
     cd "$fixture_repo"
     BASE_SHA="$package_contract_dependency_base_sha" HEAD_SHA="$package_contract_base_sha" \
-      bash "$validator_path" --classify-install
+      GITHUB_OUTPUT= bash "$validator_path" --classify-install
   ) > "$output" 2>&1
   assert_contains 'lane=standard' "$output"
   : > "$command_log"
@@ -4109,7 +4109,8 @@ NODE
     output="$test_root/package-contract-$rejected_case-admission.log"
     if (
       cd "$fixture_repo"
-      BASE_SHA="$package_contract_dependency_base_sha" HEAD_SHA="$head_sha" bash "$validator_path" --classify-install
+      BASE_SHA="$package_contract_dependency_base_sha" HEAD_SHA="$head_sha" \
+        GITHUB_OUTPUT= bash "$validator_path" --classify-install
     ) > "$output" 2>&1; then
       echo "Unsupported fixture $rejected_case drift passed install admission." >&2
       exit 1
