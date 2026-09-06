@@ -161,10 +161,10 @@ pf4051_config() {
   PF4051_BASE_REF="${PAPERSFLOW_PF4051_BASE_REF:-main}"
   PF4051_PENDING_MERGE_COMMIT='PENDING_PF4051_MERGE_COMMIT'
   PF4051_PENDING_REVIEWED_TREE='PENDING_PF4051_REVIEWED_TREE'
-  PF4051_MERGE_COMMIT="${PAPERSFLOW_PF4051_MERGE_COMMIT:-618e58f778ac1b957e31bc081cc626d11fe463fd}"
+  PF4051_MERGE_COMMIT="${PAPERSFLOW_PF4051_MERGE_COMMIT:-42d716fa33b3d9994c6872cd65ee38b3453c1bf1}"
   PF4051_FORK_PARENT="${PAPERSFLOW_PF4051_FORK_PARENT:-d375f2062852b94079179b115733e0f2ff32e188}"
   PF4051_UPSTREAM_PARENT="${PAPERSFLOW_PF4051_UPSTREAM_PARENT:-cd887998ad38666b39eebcfaa6425b98e2a9e1c5}"
-  PF4051_REVIEWED_TREE="${PAPERSFLOW_PF4051_REVIEWED_TREE:-8a3c9ca0fb746ef285bdd98c4f139584096e0ae3}"
+  PF4051_REVIEWED_TREE="${PAPERSFLOW_PF4051_REVIEWED_TREE:-8c1ff302212b6d87286d78f3fb1ef09f88fef5f4}"
   PF4051_TRUSTED_MAIN="${PAPERSFLOW_PF4051_TRUSTED_MAIN:-6a1bc91e152c2462dd078b27ed191064a3d1a8f9}"
   PF4051_NATIVE_POLICY="${PAPERSFLOW_PF4051_NATIVE_POLICY:-d6a1eccb09186968d8e372900fe4d52c01d8af26}"
   readonly \
@@ -2690,6 +2690,7 @@ run_pf4051_admission_self_tests() (
   local reviewed_head reviewed_tree protected_base forged_tree forged_head
   local reversed_head extra_parent octopus_head non_merge_head output
   local trusted_main native_policy mock_bin command_log preservation_command
+  local web_install_line web_check_line web_test_line
 
   script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
   test_root="$(mktemp -d)"
@@ -2904,7 +2905,8 @@ if [[ "$*" == '--dir stores/pg '* &&
   echo 'PF-4051 PostgreSQL selection ignored the explicit native fixture endpoint.' >&2
   exit 32
 fi
-if [[ "${MOCK_FAIL_PF4051_SELECTION:-0}" == 1 && "$*" == *'read/write pools'* ]]; then
+if [[ "${MOCK_FAIL_PF4051_SELECTION:-0}" == 1 &&
+  "$*" == '--dir mastracode/web install --frozen-lockfile --ignore-scripts' ]]; then
   exit 29
 fi
 SH
@@ -2942,12 +2944,21 @@ SH
   grep -Fq -- 'src/server/handlers/a2a-memory.test.ts' "$command_log"
   grep -Fq -- 'TranscriptSender.msw.test.tsx' "$command_log"
   grep -Fq -- 'experiment-item-route.msw.test.tsx' "$command_log"
+  web_install_line="$(grep -nFx -- '--dir mastracode/web install --frozen-lockfile --ignore-scripts' "$command_log" | cut -d: -f1)"
+  web_check_line="$(grep -nFx -- '--dir mastracode/web check' "$command_log" | cut -d: -f1)"
+  web_test_line="$(grep -nFx -- '--dir mastracode/web exec vitest run --reporter=dot src/mastra/index.test.ts' "$command_log" | cut -d: -f1)"
+  (( web_install_line < web_check_line && web_install_line < web_test_line ))
   output="$test_root/validation-failure.log"
+  : > "$command_log"
   if run_fixture_validation MOCK_FAIL_PF4051_SELECTION=1 > "$output" 2>&1; then
-    echo 'PF-4051 selected PostgreSQL regression failure was swallowed.' >&2
+    echo 'PF-4051 standalone Web install failure was swallowed.' >&2
     return 1
   else
     [[ "$?" == 29 ]]
+  fi
+  if grep -Eq -- '^--dir mastracode/web (check|exec vitest run)' "$command_log"; then
+    echo 'PF-4051 ran Web validation after its standalone install failed.' >&2
+    return 1
   fi
   if grep -Fq 'workspace build/lint and selected reconciliation validation passed' "$output"; then
     echo 'PF-4051 reported completed validation after a selected suite failed.' >&2
@@ -9164,6 +9175,8 @@ run_pf4051_upstream_sync_validation() {
   run_with_validation_budget 600 pnpm --dir packages/playground lint
   run_with_validation_budget 600 pnpm --dir mastracode/factory-ui typecheck
   run_with_validation_budget 600 pnpm --dir mastracode/factory check
+  # Web has its own pnpm root and lockfile, outside the monorepo install.
+  run_with_validation_budget 600 pnpm --dir mastracode/web install --frozen-lockfile --ignore-scripts
   run_with_validation_budget 600 pnpm --dir mastracode/web check
   run_with_validation_budget 900 \
     pnpm --dir packages/core exec vitest run --reporter=dot \
