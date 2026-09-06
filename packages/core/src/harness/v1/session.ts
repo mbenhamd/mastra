@@ -16726,20 +16726,22 @@ export class Session {
     // `spawn_subagent` is conditional on subagent types being configured; the
     // plan-task tools are always available. Both close over this session so they
     // act on the calling session only (§6.4 ownership rule).
+    const builtins: ToolsInput = {};
     if (mode.harnessBuiltins !== 'exclude') {
-      const builtins: ToolsInput = {};
       const spawn = createSpawnSubagentTool(this);
       if (spawn) builtins[SPAWN_SUBAGENT_TOOL_ID] = spawn;
       // Plan-task tools (§5.1k / §6.4 — TM-3). The only model-facing mutation path
       // for the durable HarnessPlanTask tree; each write routes through this
       // session under its lease.
       Object.assign(builtins, createPlanTaskTools(this));
-      if (this._record.origin === 'subagent-tool') {
-        builtins[HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID] = createSubagentOutcomeReportTool();
-      }
-      if (Object.keys(builtins).length > 0) {
-        toolsets['harness:builtin'] = builtins;
-      }
+    }
+    // Child completion requires this terminal envelope even when the mode
+    // excludes optional mutation and delegation builtins.
+    if (this._record.origin === 'subagent-tool') {
+      builtins[HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID] = createSubagentOutcomeReportTool();
+    }
+    if (Object.keys(builtins).length > 0) {
+      toolsets['harness:builtin'] = builtins;
     }
 
     return {
