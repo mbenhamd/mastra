@@ -30,6 +30,28 @@ function buildCoreTool(
 }
 
 describe('CoreToolBuilder - Schema Compatibility in Validation', () => {
+  it('preserves asynchronous validation through the native v6 schema wrapper', async () => {
+    const tool = {
+      id: 'async-validation-tool',
+      description: 'Tool with an asynchronous Zod 4 refinement',
+      inputSchema: z.object({ token: z.string() }).refine(async input => input.token === 'accepted'),
+      execute: async (input: { token: string }) => input,
+    } as ToolAction<any, any>;
+    const built = buildCoreTool(tool, 'async-validation-tool', {
+      provider: 'test-provider',
+      modelId: 'test-model',
+      specificationVersion: 'v4',
+      supportsStructuredOutputs: false,
+    });
+
+    const nativeValidation = (built.parameters as { validate: (input: unknown) => Promise<unknown> }).validate;
+    await expect(nativeValidation({ token: 'accepted' })).resolves.toMatchObject({
+      success: true,
+      value: { token: 'accepted' },
+    });
+    await expect(nativeValidation({ token: 'rejected' })).resolves.toMatchObject({ success: false });
+  });
+
   it('createTool execute path skips author-schema re-validation after CoreToolBuilder compat validation', async () => {
     const execute = vi.fn(async ({ text }: { text: string }) => ({ success: true, text }));
     const shortTextTool = createTool({

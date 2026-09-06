@@ -1,7 +1,8 @@
-import { generateObject, generateText, Output, streamObject, streamText } from '@internal/ai-sdk-v4';
+import { generateObject, generateText, jsonSchema, Output, streamObject, streamText } from '@internal/ai-sdk-v4';
 import type {
   CoreMessage,
   LanguageModelV1 as LanguageModel,
+  Schema,
   StreamObjectOnFinishCallback,
   StreamTextOnFinishCallback,
 } from '@internal/ai-sdk-v4';
@@ -13,9 +14,9 @@ import {
   MetaSchemaCompatLayer,
   OpenAIReasoningSchemaCompatLayer,
   OpenAISchemaCompatLayer,
-  jsonSchema,
+  isZodType,
 } from '@mastra/schema-compat';
-import type { JSONSchema7, Schema } from '@mastra/schema-compat';
+import type { JSONSchema7 } from '@mastra/schema-compat';
 import type { z } from 'zod/v4';
 import type { MastraPrimitives } from '../../action';
 import { MastraBase } from '../../base';
@@ -26,7 +27,7 @@ import { executeWithContext, executeWithContextSync } from '../../observability/
 import { toStandardSchema, standardSchemaToJSONSchema, isStandardSchemaWithJSON } from '../../schema';
 import type { ZodSchema } from '../../schema';
 import { convertV4Usage } from '../../stream/aisdk/v4/usage';
-import { delay, isZodType } from '../../utils';
+import { delay } from '../../utils';
 import { isZodArray, getZodDef } from '../../utils/zod-utils';
 
 import type {
@@ -111,11 +112,12 @@ export class MastraLLMV1 extends MastraBase {
     }
 
     // "Type instantiation is excessively deep" error from complex ZodSchema generic inference
-    return applyCompatLayer({
+    const compatibleSchema = applyCompatLayer({
       schema: schema as any,
       compatLayers: schemaCompatLayers,
       mode: 'aiSdkSchema',
     });
+    return jsonSchema(compatibleSchema.jsonSchema, { validate: compatibleSchema.validate });
   }
 
   async __text<Tools extends ToolSet, Z extends ZodSchema | JSONSchema7 | undefined>({
@@ -172,7 +174,7 @@ export class MastraLLMV1 extends MastraBase {
       for (const tool of Object.values(tools)) {
         if (tool.parameters) {
           if ('validate' in tool.parameters) {
-            tool.parameters = tool.parameters;
+            tool.parameters = jsonSchema(tool.parameters.jsonSchema, { validate: tool.parameters.validate });
           } else if (isStandardSchemaWithJSON(tool.parameters)) {
             tool.parameters = jsonSchema(standardSchemaToJSONSchema(tool.parameters));
           } else {
@@ -557,7 +559,7 @@ export class MastraLLMV1 extends MastraBase {
       for (const tool of Object.values(tools)) {
         if (tool.parameters) {
           if ('validate' in tool.parameters) {
-            tool.parameters = tool.parameters;
+            tool.parameters = jsonSchema(tool.parameters.jsonSchema, { validate: tool.parameters.validate });
           } else if (isStandardSchemaWithJSON(tool.parameters)) {
             tool.parameters = jsonSchema(standardSchemaToJSONSchema(tool.parameters));
           } else {
