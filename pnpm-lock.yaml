@@ -4289,6 +4289,9 @@ importers:
       '@mastra/core':
         specifier: workspace:*
         version: link:../core
+      '@mastra/mcp':
+        specifier: workspace:*
+        version: link:../mcp
       '@types/node':
         specifier: 22.19.15
         version: 22.19.15

@@ -72,6 +72,22 @@ async function pathExists(file) {
   }
 }
 
+function declarationCandidatesForRuntimePath(runtimePath) {
+  if (runtimePath.endsWith('.mjs')) {
+    return [runtimePath.slice(0, -4) + '.d.mts'];
+  }
+
+  if (runtimePath.endsWith('.cjs')) {
+    return [runtimePath.slice(0, -4) + '.d.cts'];
+  }
+
+  if (runtimePath.endsWith('.js')) {
+    return [runtimePath.slice(0, -3) + '.d.ts'];
+  }
+
+  return [];
+}
+
 function getModuleSpecifiers(sourceFile) {
   const moduleSpecifiers = [];
 
@@ -109,9 +125,7 @@ async function resolveRelativeDeclaration(moduleSpecifier, fromFile) {
   if (moduleSpecifier.endsWith('.d.ts') || moduleSpecifier.endsWith('.d.cts') || moduleSpecifier.endsWith('.d.mts')) {
     candidates.push(resolvedSpecifier);
   } else if (moduleSpecifier.endsWith('.js') || moduleSpecifier.endsWith('.mjs') || moduleSpecifier.endsWith('.cjs')) {
-    candidates.push(resolvedSpecifier.replace(/\.(mjs|cjs|js)$/, '.d.ts'));
-    candidates.push(resolvedSpecifier.replace(/\.(mjs|cjs|js)$/, '.d.mts'));
-    candidates.push(resolvedSpecifier.replace(/\.(mjs|cjs|js)$/, '.d.cts'));
+    candidates.push(...declarationCandidatesForRuntimePath(resolvedSpecifier));
   } else if (extname(moduleSpecifier)) {
     candidates.push(resolvedSpecifier);
   } else {
@@ -222,11 +236,7 @@ async function replaceBundledReferences(file, rootDir, bundledPackages, visited,
     let sourceTypesPath = join(sourcePkgRootPath, typesFile);
 
     if (/\.(mjs|cjs|js)$/.test(typesFile)) {
-      const declarationCandidates = [
-        sourceTypesPath.replace(/\.(mjs|cjs|js)$/, '.d.ts'),
-        sourceTypesPath.replace(/\.(mjs|cjs|js)$/, '.d.mts'),
-        sourceTypesPath.replace(/\.(mjs|cjs|js)$/, '.d.cts'),
-      ];
+      const declarationCandidates = declarationCandidatesForRuntimePath(sourceTypesPath);
 
       for (const candidate of declarationCandidates) {
         if (await pathExists(candidate)) {
