@@ -1,6 +1,7 @@
 import type { BadgeVariant } from '@mastra/playground-ui/components/Badge';
-import type { FactoryRuleStage } from '@mastra/factory/rules/types';
 import { FACTORY_RULE_STAGES } from '@mastra/factory/rules/types';
+
+export type BoardStageId = (typeof FACTORY_RULE_STAGES)[number];
 
 const BOARD_STAGE_LABELS = {
   intake: 'Intake',
@@ -10,9 +11,7 @@ const BOARD_STAGE_LABELS = {
   review: 'Review',
   done: 'Done',
   canceled: 'Canceled',
-} satisfies Record<FactoryRuleStage, string>;
-
-export type BoardStageId = FactoryRuleStage;
+} satisfies Record<BoardStageId, string>;
 
 export interface BoardStage {
   id: BoardStageId;

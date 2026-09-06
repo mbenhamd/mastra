@@ -15,7 +15,6 @@ import type { BoardKind } from '../boardStages';
 import { createWorkItemComment } from '../services/comments';
 import { inferredParentWorkItemId } from '../services/relationships';
 import type { WorkItem } from '../services/workItems';
-import type { BoardStageId } from '../stages';
 
 /**
  * Column order, stated here rather than inherited from the list endpoint: a
@@ -107,7 +106,7 @@ export function useBoardItems({
       });
   };
 
-  const handleDrop = (payload: DragPayload, toStage: BoardStageId, cause = 'board_drag') => {
+  const handleDrop = (payload: DragPayload, toStage: string, cause = 'board_drag') => {
     if (payload.kind === 'work-item') {
       if (payload.fromStage === toStage) return;
       move(payload.id, toStage, { cause });

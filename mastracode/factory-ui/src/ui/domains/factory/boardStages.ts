@@ -1,4 +1,4 @@
-import type { FactoryRuleBoard, FactoryRuleStage } from '@mastra/factory/rules/types';
+import type { FactoryRuleBoard } from '@mastra/factory/rules/types';
 
 import type { WorkItem } from './services/workItems';
 import { BOARD_STAGES, stageLabel, stageOrder } from './stages';
@@ -14,7 +14,7 @@ const REVIEW_BOARD_STAGE_VISIBILITY = {
   review: true,
   done: true,
   canceled: true,
-} satisfies Record<FactoryRuleStage, boolean>;
+} satisfies Record<BoardStageId, boolean>;
 
 const REVIEW_BOARD_STAGES: ReadonlyArray<BoardStage> = BOARD_STAGES.flatMap(stage => {
   if (!REVIEW_BOARD_STAGE_VISIBILITY[stage.id]) return [];

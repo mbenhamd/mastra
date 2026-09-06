@@ -265,6 +265,7 @@ export type ProviderModelsMap = {
     'THUDM/GLM-Z1-9B-0414',
     'TheDrummer/Anubis-70B-v1',
     'TheDrummer/Anubis-70B-v1.1',
+    'TheDrummer/Artemis-v1.1',
     'TheDrummer/Cydonia-24B-v2',
     'TheDrummer/Cydonia-24B-v4',
     'TheDrummer/Cydonia-24B-v4.1',
