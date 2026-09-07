@@ -3650,6 +3650,9 @@ case "${1:-}" in
 esac
 
 run_validator_self_tests() {
+  # Synthetic cases own PR metadata even when invoked by an exact-pin source PR.
+  local -x HEAD_REPOSITORY=mbenhamd/mastra HEAD_REF=feature/fork-validator-fixture
+  local -x BASE_REF=main PR_NUMBER=999
   local validator_path
   local test_root
   local fixture_repo
