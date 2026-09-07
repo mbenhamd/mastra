@@ -90,21 +90,10 @@ export function createAgenticExecutionWorkflow<Tools extends ToolSet = ToolSet, 
     ...rest,
   });
 
-  const isTaskCompleteStep = createIsTaskCompleteStep({
-    models,
-    _internal,
-    ...rest,
-  });
+  const isEvented = process.env.MASTRA_EVENTED_EXECUTION === 'true';
+  const createWorkflow = isEvented ? createEventedWorkflow : createDirectWorkflow;
 
-  const goalStep = createGoalStep({
-    models,
-    _internal,
-    ...rest,
-  });
-
-  const createWorkflow = process.env.MASTRA_EVENTED_EXECUTION === 'true' ? createEventedWorkflow : createDirectWorkflow;
-
-  return createWorkflow({
+  const workflow = createWorkflow({
     id: AGENTIC_EXECUTION_WORKFLOW_ID,
     inputSchema: llmIterationOutputSchema,
     outputSchema: llmIterationOutputSchema,
@@ -176,8 +165,16 @@ export function createAgenticExecutionWorkflow<Tools extends ToolSet = ToolSet, 
     .foreach(toolCallStep, toolCallForeachOptions)
     .then(llmMappingStep)
     .then(backgroundTaskCheckStep)
-    .then(signalDrainStep)
-    .then(isTaskCompleteStep)
-    .then(goalStep)
-    .commit();
+    .then(signalDrainStep);
+
+  // Evented recovery requires the retained and current graph fingerprints to
+  // match. Direct runs can omit stages whose captured configuration is absent.
+  if (isEvented || rest.isTaskComplete !== undefined) {
+    workflow.then(createIsTaskCompleteStep({ models, _internal, ...rest }));
+  }
+  if (isEvented || rest.goal !== undefined) {
+    workflow.then(createGoalStep({ models, _internal, ...rest }));
+  }
+
+  return workflow.commit();
 }
