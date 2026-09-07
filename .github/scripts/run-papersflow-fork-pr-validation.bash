@@ -157,14 +157,14 @@ verify_pf3553_reviewed_surface() (
 
 pf4051_config() {
   PF4051_HEAD_REPOSITORY="${PAPERSFLOW_PF4051_HEAD_REPOSITORY:-mbenhamd/mastra}"
-  PF4051_HEAD_REF="${PAPERSFLOW_PF4051_HEAD_REF:-feature/pf-4051-mastra-upstream-sync-c773a9ba-r2}"
+  PF4051_HEAD_REF="${PAPERSFLOW_PF4051_HEAD_REF:-feature/pf-4051-mastra-upstream-sync-2de367c9-r3}"
   PF4051_BASE_REF="${PAPERSFLOW_PF4051_BASE_REF:-main}"
   PF4051_PENDING_MERGE_COMMIT='PENDING_PF4051_MERGE_COMMIT'
   PF4051_PENDING_REVIEWED_TREE='PENDING_PF4051_REVIEWED_TREE'
-  PF4051_MERGE_COMMIT="${PAPERSFLOW_PF4051_MERGE_COMMIT:-8937eaa5263c9ac0a8615db2efed2045bbf0145d}"
+  PF4051_MERGE_COMMIT="${PAPERSFLOW_PF4051_MERGE_COMMIT:-fc3cee0470f7e8f2dff5b97d5fba5a7bd9b35e88}"
   PF4051_FORK_PARENT="${PAPERSFLOW_PF4051_FORK_PARENT:-0769ef2c773d11244c88739cad27da0189e4e89a}"
-  PF4051_UPSTREAM_PARENT="${PAPERSFLOW_PF4051_UPSTREAM_PARENT:-c773a9ba601047606dcd81c961ffc5ebb8ef07a0}"
-  PF4051_REVIEWED_TREE="${PAPERSFLOW_PF4051_REVIEWED_TREE:-44cc9f9293a7a3611293f713268ec60d1764ff4e}"
+  PF4051_UPSTREAM_PARENT="${PAPERSFLOW_PF4051_UPSTREAM_PARENT:-2de367c9399c5fe51ea1db2d5821107591f7a7b4}"
+  PF4051_REVIEWED_TREE="${PAPERSFLOW_PF4051_REVIEWED_TREE:-a8b4a647b2b00bea3157b26b584244600918ba20}"
   PF4051_TRUSTED_MAIN="${PAPERSFLOW_PF4051_TRUSTED_MAIN:-44c71b236991ac05778e27b7634321be8779ca75}"
   readonly \
     PF4051_TRUSTED_MAIN \
@@ -2797,7 +2797,7 @@ EOF
         GITHUB_OUTPUT= \
         BASE_SHA="$protected_base" HEAD_SHA="$fixture_head" PR_NUMBER=999 \
         HEAD_REPOSITORY=mbenhamd/mastra \
-        HEAD_REF=feature/pf-4051-mastra-upstream-sync-c773a9ba-r2 \
+        HEAD_REF=feature/pf-4051-mastra-upstream-sync-2de367c9-r3 \
         BASE_REF=main \
         PAPERSFLOW_PF4051_MERGE_COMMIT="$reviewed_head" \
         PAPERSFLOW_PF4051_FORK_PARENT="$fork_parent" \
@@ -2915,7 +2915,7 @@ SH
         POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=32791 \
         BASE_SHA="$protected_base" HEAD_SHA="$reviewed_head" \
         HEAD_REPOSITORY=mbenhamd/mastra \
-        HEAD_REF=feature/pf-4051-mastra-upstream-sync-c773a9ba-r2 BASE_REF=main \
+        HEAD_REF=feature/pf-4051-mastra-upstream-sync-2de367c9-r3 BASE_REF=main \
         PAPERSFLOW_PF4051_MERGE_COMMIT="$reviewed_head" \
         PAPERSFLOW_PF4051_FORK_PARENT="$fork_parent" \
         PAPERSFLOW_PF4051_UPSTREAM_PARENT="$upstream_parent" \
@@ -2943,11 +2943,17 @@ SH
   grep -Fq -- 'src/loop/test-utils/aimock/scenarios/optional-stages-mutable.scenario.test.ts' "$command_log"
   grep -Fxq -- '--dir server-adapters/hono exec vitest run --reporter=dot src/__tests__/hono-adapter.test.ts -t should strip mastra__resourceId|should strip reserved keys' "$command_log"
   grep -Fxq -- 'run test:mastracode' "$command_log"
+  grep -Fxq -- '--dir pubsub/redis-streams exec vitest run --reporter=dot src/connection-and-cleanup.test.ts src/pubsub-ack-audit.test.ts' "$command_log"
   grep -Fq -- 'src/auth-seam.test.ts' "$command_log"
   grep -Fq -- 'src/session/org-seed-fail-open.test.ts src/session/memory-settings-hydration.test.ts' "$command_log"
   grep -Fq -- 'src/server/handlers/a2a-memory.test.ts' "$command_log"
   grep -Fq -- 'TranscriptSender.msw.test.tsx' "$command_log"
   grep -Fq -- 'experiment-item-route.msw.test.tsx' "$command_log"
+  grep -Fq -- 'src/domains/traces/components/__tests__/no-traces-info.test.tsx' "$command_log"
+  grep -Fq -- 'src/pages/agent-builder/__tests__/empty-collections.test.tsx' "$command_log"
+  grep -Fq -- 'src/domains/experiments/components/__tests__/rerun-experiment-button.msw.test.tsx' "$command_log"
+  grep -Fq -- 'src/pages/experiments/__tests__/experiments-compare.msw.test.tsx' "$command_log"
+  grep -Fq -- 'src/pages/experiments/__tests__/experiments-run.msw.test.tsx' "$command_log"
   web_install_line="$(grep -nFx -- '--dir mastracode/web install --frozen-lockfile --ignore-scripts' "$command_log" | cut -d: -f1)"
   web_check_line="$(grep -nFx -- '--dir mastracode/web check' "$command_log" | cut -d: -f1)"
   web_test_line="$(grep -nFx -- '--dir mastracode/web exec vitest run --reporter=dot src/mastra/index.test.ts' "$command_log" | cut -d: -f1)"
@@ -9284,12 +9290,17 @@ run_pf4051_upstream_sync_validation() {
     pnpm --dir packages/rag exec vitest run --reporter=dot src/document/transformers/character.test.ts
   run_with_validation_budget 600 \
     pnpm --dir packages/playground-ui exec vitest run --reporter=dot \
+      src/domains/traces/components/__tests__/no-traces-info.test.tsx \
       src/ds/components/Combobox/combobox.test.tsx \
       src/ds/components/Section/section.test.tsx \
       src/ds/components/SettingsLayout/settings-layout.test.tsx \
       src/ds/components/ai/tool-call/tool-call.test.tsx
   run_with_validation_budget 600 \
     pnpm --dir packages/playground exec vitest run --reporter=dot \
+      src/pages/agent-builder/__tests__/empty-collections.test.tsx \
+      src/domains/experiments/components/__tests__/rerun-experiment-button.msw.test.tsx \
+      src/pages/experiments/__tests__/experiments-compare.msw.test.tsx \
+      src/pages/experiments/__tests__/experiments-run.msw.test.tsx \
       src/domains/experiments/__tests__/experiment-item-route.msw.test.tsx
   run_with_validation_budget 900 \
     pnpm --dir mastracode/factory-ui exec vitest run --reporter=dot \
