@@ -6,6 +6,10 @@ const apiSchemaManifest = buildApiSchemaManifest();
 const routeKeys = apiSchemaManifest.routes.map(route => `${route.method} ${route.path}`);
 
 describe('apiSchemaManifest', () => {
+  it('preserves the complete manifest through response schema validation', () => {
+    expect(apiSchemaManifestResponseSchema.parse(apiSchemaManifest)).toEqual(apiSchemaManifest);
+  });
+
   it('includes route contracts required by the mastra api command tree', () => {
     expect(routeKeys).toEqual(
       expect.arrayContaining([

@@ -1,94 +1,155 @@
 import { execFile } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-import { expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
+import { generateTypes } from '../packages/_types-builder/src/index.js';
 
 const run = promisify(execFile);
-const generatorUrl = new URL('../packages/_types-builder/src/index.js', import.meta.url);
-const nodeModules = fileURLToPath(new URL('../node_modules', import.meta.url));
+const fixtures: string[] = [];
+const typesBuilderRoot = fileURLToPath(new URL('../packages/_types-builder/', import.meta.url));
 
-it('preserves native module resolution in generated declarations', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'types-builder-resolution-'));
-  try {
-    const fixtureNodeModules = join(root, 'node_modules');
-    await mkdir(fixtureNodeModules);
-    for (const name of ['.bin', 'typescript']) {
-      await symlink(
-        join(nodeModules, name),
-        join(fixtureNodeModules, name),
-        process.platform === 'win32' ? 'junction' : 'dir',
-      );
-    }
-    const dependency = join(fixtureNodeModules, 'types-builder-dependency');
-    await mkdir(dependency);
-    await writeFile(
-      join(dependency, 'package.json'),
-      JSON.stringify({ name: 'types-builder-dependency', version: '1.0.0', exports: './index.d.ts' }),
+async function writeFixtureFile(root: string, file: string, contents: string) {
+  const filePath = join(root, file);
+  await mkdir(dirname(filePath), { recursive: true });
+  await writeFile(filePath, contents);
+}
+
+async function createFixture() {
+  const root = await mkdtemp(join(tmpdir(), 'types-builder-'));
+  fixtures.push(root);
+
+  await writeFixtureFile(
+    root,
+    'package.json',
+    JSON.stringify({ name: '@fixture/consumer', type: 'module', dependencies: { '@fixture/bundle': '1.0.0' } }),
+  );
+  await writeFixtureFile(
+    root,
+    'tsconfig.build.json',
+    JSON.stringify({
+      compilerOptions: {
+        declaration: true,
+        emitDeclarationOnly: true,
+        outDir: 'dist',
+        rootDir: 'src',
+        module: 'ESNext',
+        moduleResolution: 'Bundler',
+        target: 'ES2022',
+        strict: true,
+      },
+      include: ['src/**/*.ts'],
+    }),
+  );
+  await writeFixtureFile(
+    root,
+    'src/index.ts',
+    [
+      "import type { FileSentinel } from './collision';",
+      "import type { FileSentinel as ExplicitFileSentinel } from './collision.js';",
+      "import type { DirectorySentinel } from './directory';",
+      "import type { ESM_SENTINEL } from '@fixture/bundle/esm';",
+      "import type { CJS_SENTINEL } from '@fixture/bundle/cjs';",
+      "import type { JS_SENTINEL } from '@fixture/bundle/js';",
+      'export type Result = FileSentinel & ExplicitFileSentinel & DirectorySentinel & ESM_SENTINEL & CJS_SENTINEL & JS_SENTINEL;',
+    ].join('\n'),
+  );
+  await writeFixtureFile(root, 'src/collision.ts', 'export type FileSentinel = { source: "file" };\n');
+  await writeFixtureFile(root, 'src/collision/index.ts', 'export type FileSentinel = { source: "directory" };\n');
+  await writeFixtureFile(root, 'src/directory/index.ts', 'export type DirectorySentinel = { directory: "index" };\n');
+
+  const bundleRoot = join(root, 'node_modules/@fixture/bundle');
+  await writeFixtureFile(
+    bundleRoot,
+    'package.json',
+    JSON.stringify({
+      name: '@fixture/bundle',
+      version: '1.0.0',
+      type: 'module',
+      exports: {
+        '.': { types: './dist/esm.mjs', import: './dist/esm.mjs', require: './dist/cjs.cjs' },
+        './esm': { types: './dist/esm.mjs', import: './dist/esm.mjs', require: './dist/esm.cjs' },
+        './cjs': { types: './dist/cjs.cjs', import: './dist/cjs.mjs', require: './dist/cjs.cjs' },
+        './js': { types: './dist/script.js', import: './dist/script.js' },
+      },
+    }),
+  );
+  await writeFixtureFile(bundleRoot, 'dist/esm.mjs', '');
+  await writeFixtureFile(bundleRoot, 'dist/cjs.cjs', '');
+  await writeFixtureFile(bundleRoot, 'dist/script.js', '');
+  await writeFixtureFile(bundleRoot, 'dist/script.d.ts', 'export type JS_SENTINEL = { js: "ts" };\n');
+  await writeFixtureFile(bundleRoot, 'dist/script.d.cts', 'export type JS_SENTINEL = { js: "wrong-cts" };\n');
+  await writeFixtureFile(
+    bundleRoot,
+    'dist/esm.d.mts',
+    'import type { ESM_LEAF } from "./leaf.mjs";\nexport type ESM_SENTINEL = { esm: ESM_LEAF["value"] };\n',
+  );
+  await writeFixtureFile(bundleRoot, 'dist/esm.d.ts', 'export type ESM_SENTINEL = { esm: "wrong-ts" };\n');
+  await writeFixtureFile(
+    bundleRoot,
+    'dist/cjs.d.cts',
+    'import type { CJS_LEAF } from "./leaf.cjs";\nexport type CJS_SENTINEL = { cjs: CJS_LEAF["value"] };\n',
+  );
+  await writeFixtureFile(bundleRoot, 'dist/cjs.d.ts', 'export type CJS_SENTINEL = { cjs: "wrong-ts" };\n');
+  await writeFixtureFile(bundleRoot, 'dist/leaf.mjs', '');
+  await writeFixtureFile(bundleRoot, 'dist/leaf.cjs', '');
+  await writeFixtureFile(bundleRoot, 'dist/leaf.d.mts', 'export type ESM_LEAF = { value: "mts" };\n');
+  await writeFixtureFile(bundleRoot, 'dist/leaf.d.cts', 'export type CJS_LEAF = { value: "cts" };\n');
+  await writeFixtureFile(bundleRoot, 'dist/leaf.d.ts', 'export type ESM_LEAF = { value: "wrong-ts" };\n');
+
+  const binDir = join(root, 'node_modules/.bin');
+  await mkdir(binDir, { recursive: true });
+  await symlink(join(process.cwd(), 'node_modules/.bin/tsc'), join(binDir, 'tsc'));
+  return root;
+}
+
+afterEach(async () => {
+  await Promise.all(fixtures.splice(0).map(fixture => rm(fixture, { recursive: true, force: true })));
+});
+
+describe('types-builder declaration resolution', () => {
+  it('generates file-first imports and preserves bundled ESM/CJS declaration identity', async () => {
+    const root = await createFixture();
+
+    await generateTypes(root, new Set(['@fixture/bundle']));
+
+    const generated = await readFile(join(root, 'dist/index.d.ts'), 'utf8');
+    expect(generated).toContain("from './collision.js'");
+    expect(generated.match(/from '\.\/collision\.js'/g)).toHaveLength(2);
+    expect(generated).not.toContain("from './collision/index.js'");
+    expect(generated).toContain("from './directory/index.js'");
+    expect(generated).toContain('_types/@fixture_bundle/dist/esm.d.mts');
+    expect(generated).toContain('_types/@fixture_bundle/dist/cjs.d.cts');
+    expect(generated).toContain('_types/@fixture_bundle/dist/script.d.ts');
+    await expect(readFile(join(root, 'dist/_types/@fixture_bundle/dist/esm.d.mts'), 'utf8')).resolves.toContain(
+      './leaf.mjs',
     );
-    await writeFile(
-      join(dependency, 'index.d.ts'),
-      "export type { CommonJs } from './common.cjs';\nexport type { ModuleJs } from './module.mjs';\nexport type { ScriptJs } from './script.js';\n",
+    await expect(readFile(join(root, 'dist/_types/@fixture_bundle/dist/cjs.d.cts'), 'utf8')).resolves.toContain(
+      './leaf.cjs',
     );
-    for (const [file, declaration] of [
-      ['common.d.cts', "export type CommonJs = 'commonjs';\n"],
-      ['common.d.ts', "export type CommonJs = 'wrong';\n"],
-      ['module.d.mts', "export type ModuleJs = 'module';\n"],
-      ['module.d.ts', "export type ModuleJs = 'wrong';\n"],
-      ['script.d.ts', "export type ScriptJs = 'script';\n"],
-      ['script.d.cts', "export type ScriptJs = 'wrong';\n"],
-    ] as const) {
-      await writeFile(join(dependency, file), declaration);
-    }
-    await mkdir(join(root, 'src', 'utils'), { recursive: true });
-    await mkdir(join(root, 'src', 'directory'), { recursive: true });
-    await writeFile(join(root, 'package.json'), JSON.stringify({ name: 'types-builder-fixture', type: 'module' }));
-    await writeFile(
-      join(root, 'tsconfig.build.json'),
+    await rm(join(root, 'node_modules/@fixture/bundle'), { recursive: true, force: true });
+
+    await writeFixtureFile(
+      root,
+      'consumer.ts',
+      [
+        "import type { Result } from './dist/index.js';",
+        'const result: Result = { source: "file", directory: "index", esm: "mts", cjs: "cts", js: "ts" };',
+        'void result;',
+      ].join('\n'),
+    );
+    await writeFixtureFile(
+      root,
+      'tsconfig.consumer.json',
       JSON.stringify({
-        compilerOptions: {
-          target: 'ES2022',
-          module: 'ESNext',
-          moduleResolution: 'Bundler',
-          strict: true,
-          types: [],
-          declaration: true,
-          emitDeclarationOnly: true,
-          noEmitOnError: true,
-          rootDir: 'src',
-          outDir: 'dist',
-        },
-        include: ['src'],
+        compilerOptions: { module: 'NodeNext', moduleResolution: 'NodeNext', target: 'ES2022', strict: true },
+        include: ['consumer.ts'],
       }),
     );
-    await writeFile(
-      join(root, 'src', 'index.ts'),
-      "export type { FileValue } from './utils';\nexport type { DirectoryValue } from './directory';\nexport type { CommonJs, ModuleJs, ScriptJs } from 'types-builder-dependency';\n",
-    );
-    await writeFile(join(root, 'src', 'utils.ts'), "export type FileValue = 'file';\n");
-    await writeFile(join(root, 'src', 'utils', 'index.ts'), "export type FileValue = 'wrong-directory';\n");
-    await writeFile(join(root, 'src', 'directory', 'index.ts'), "export type DirectoryValue = 'directory';\n");
-
-    await run(
-      process.execPath,
-      [
-        '--input-type=module',
-        '--eval',
-        `import { generateTypes } from ${JSON.stringify(generatorUrl.href)}; await generateTypes(${JSON.stringify(root)}, new Set(['types-builder-dependency']));`,
-      ],
-      { cwd: root, env: { ...process.env, npm_config_offline: 'true' } },
-    );
-
-    const declarations = await readFile(join(root, 'dist', 'index.d.ts'), 'utf8');
-    expect(declarations).toContain("from './utils.js'");
-    expect(declarations).toContain("from './directory/index.js'");
-    const embedded = join(root, 'dist', '_types', 'types-builder-dependency');
-    expect(await readFile(join(embedded, 'common.d.cts'), 'utf8')).toContain("CommonJs = 'commonjs'");
-    expect(await readFile(join(embedded, 'module.d.mts'), 'utf8')).toContain("ModuleJs = 'module'");
-    expect(await readFile(join(embedded, 'script.d.ts'), 'utf8')).toContain("ScriptJs = 'script'");
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-}, 30_000);
+    await run(join(process.cwd(), 'node_modules/.bin/tsc'), ['-p', 'tsconfig.consumer.json', '--noEmit'], {
+      cwd: root,
+    });
+  });
+});
