@@ -157,18 +157,17 @@ verify_pf3553_reviewed_surface() (
 
 pf4051_config() {
   PF4051_HEAD_REPOSITORY="${PAPERSFLOW_PF4051_HEAD_REPOSITORY:-mbenhamd/mastra}"
-  PF4051_HEAD_REF="${PAPERSFLOW_PF4051_HEAD_REF:-feature/pf-4051-mastra-upstream-sync-cd887998}"
+  PF4051_HEAD_REF="${PAPERSFLOW_PF4051_HEAD_REF:-feature/pf-4051-mastra-upstream-sync-c773a9ba}"
   PF4051_BASE_REF="${PAPERSFLOW_PF4051_BASE_REF:-main}"
   PF4051_PENDING_MERGE_COMMIT='PENDING_PF4051_MERGE_COMMIT'
   PF4051_PENDING_REVIEWED_TREE='PENDING_PF4051_REVIEWED_TREE'
-  PF4051_MERGE_COMMIT="${PAPERSFLOW_PF4051_MERGE_COMMIT:-b1f886a7aa01424a738b5d380399dd72e236865d}"
-  PF4051_FORK_PARENT="${PAPERSFLOW_PF4051_FORK_PARENT:-d375f2062852b94079179b115733e0f2ff32e188}"
-  PF4051_UPSTREAM_PARENT="${PAPERSFLOW_PF4051_UPSTREAM_PARENT:-cd887998ad38666b39eebcfaa6425b98e2a9e1c5}"
-  PF4051_REVIEWED_TREE="${PAPERSFLOW_PF4051_REVIEWED_TREE:-cd75dfccac437d7498d87b1dac70d267234906cc}"
-  PF4051_TRUSTED_MAIN="${PAPERSFLOW_PF4051_TRUSTED_MAIN:-6a1bc91e152c2462dd078b27ed191064a3d1a8f9}"
-  PF4051_NATIVE_POLICY="${PAPERSFLOW_PF4051_NATIVE_POLICY:-d6a1eccb09186968d8e372900fe4d52c01d8af26}"
+  PF4051_MERGE_COMMIT="${PAPERSFLOW_PF4051_MERGE_COMMIT:-81330a30212c702f586627c7d28a94bbddf5b7a0}"
+  PF4051_FORK_PARENT="${PAPERSFLOW_PF4051_FORK_PARENT:-6171c7c35695c312bd9b71a74e6ff27c195218b8}"
+  PF4051_UPSTREAM_PARENT="${PAPERSFLOW_PF4051_UPSTREAM_PARENT:-c773a9ba601047606dcd81c961ffc5ebb8ef07a0}"
+  PF4051_REVIEWED_TREE="${PAPERSFLOW_PF4051_REVIEWED_TREE:-0cde3f1e8b38d9c4c8d648e8b9c42ad7ec523b1e}"
+  PF4051_TRUSTED_MAIN="${PAPERSFLOW_PF4051_TRUSTED_MAIN:-09ee6fd3598a042e6e2ed2ed2ca295a79c3d42c3}"
   readonly \
-    PF4051_TRUSTED_MAIN PF4051_NATIVE_POLICY \
+    PF4051_TRUSTED_MAIN \
     PF4051_HEAD_REPOSITORY PF4051_HEAD_REF PF4051_BASE_REF PF4051_MERGE_COMMIT \
     PF4051_FORK_PARENT PF4051_UPSTREAM_PARENT PF4051_REVIEWED_TREE \
     PF4051_PENDING_MERGE_COMMIT PF4051_PENDING_REVIEWED_TREE
@@ -464,7 +463,7 @@ verify_pf4051_reviewed_merge() (
   : "${BASE_SHA:?BASE_SHA is required}"
   : "${HEAD_SHA:?HEAD_SHA is required}"
 
-  local merge_topology actual_tree protected_merge_bases expected_merge_bases trusted_parent
+  local merge_topology actual_tree protected_merge_bases
 
   if [[ "$PF4051_MERGE_COMMIT" == "$PF4051_PENDING_MERGE_COMMIT" || \
     "$PF4051_REVIEWED_TREE" == "$PF4051_PENDING_REVIEWED_TREE" ]]; then
@@ -495,21 +494,17 @@ verify_pf4051_reviewed_merge() (
     return 1
   fi
 
-  # The CI prerequisite combines reviewed main and PR #391 while the source
-  # merge retains its separate pending implementation parent. Admit only the
-  # exact shared pair, never an additional source advance on protected main.
-  for trusted_parent in "$PF4051_TRUSTED_MAIN" "$PF4051_NATIVE_POLICY"; do
-    if ! git merge-base --is-ancestor "$trusted_parent" "$BASE_SHA" ||
-      ! git merge-base --is-ancestor "$trusted_parent" "$PF4051_FORK_PARENT"; then
-      echo 'PF-4051 protected base or source parent lacks the reviewed trusted ancestry.' >&2
-      return 1
-    fi
-  done
-  expected_merge_bases="$(printf '%s\n' "$PF4051_TRUSTED_MAIN" "$PF4051_NATIVE_POLICY" | LC_ALL=C sort)"
-  protected_merge_bases="$(git merge-base --all "$BASE_SHA" "$HEAD_SHA" | LC_ALL=C sort)"
-  if [[ "$protected_merge_bases" != "$expected_merge_bases" ]]; then
+  # Both the CI prerequisite and source parent include the landed native
+  # contracts. Admit only that exact shared main commit, never extra ancestry.
+  if ! git merge-base --is-ancestor "$PF4051_TRUSTED_MAIN" "$BASE_SHA" ||
+    ! git merge-base --is-ancestor "$PF4051_TRUSTED_MAIN" "$PF4051_FORK_PARENT"; then
+    echo 'PF-4051 protected base or source parent lacks the reviewed trusted ancestry.' >&2
+    return 1
+  fi
+  protected_merge_bases="$(git merge-base --all "$BASE_SHA" "$HEAD_SHA")"
+  if [[ "$protected_merge_bases" != "$PF4051_TRUSTED_MAIN" ]]; then
     echo 'PF-4051 protected base and reviewed head do not have the exact reviewed intersection.' >&2
-    echo "expected: $expected_merge_bases" >&2
+    echo "expected: $PF4051_TRUSTED_MAIN" >&2
     echo "actual:   $protected_merge_bases" >&2
     return 1
   fi
@@ -1212,8 +1207,8 @@ classify_install_lane() (
     sort -u > "$manifest_changes"
 
   # PF-4051 is frozen to one reviewed merge commit, tree, branch, repository,
-  # and source-parent pair. The consolidated prerequisite preserves the exact
-  # reviewed main/native-policy intersection with the separately frozen source.
+  # and source-parent pair. The consolidated prerequisite and frozen source
+  # must meet exactly at the reviewed main commit containing native contracts.
   pf4051_config
   if [[ "${HEAD_REPOSITORY:-}" == "$PF4051_HEAD_REPOSITORY" && \
     "${HEAD_REF:-}" == "$PF4051_HEAD_REF" && "${BASE_REF:-}" == "$PF4051_BASE_REF" ]]; then
@@ -2689,7 +2684,7 @@ run_pf4051_admission_self_tests() (
   local script_path test_root fixture_repo common_sha fork_parent upstream_parent
   local reviewed_head reviewed_tree protected_base forged_tree forged_head
   local reversed_head extra_parent octopus_head non_merge_head output
-  local trusted_main native_policy mock_bin command_log preservation_command
+  local trusted_main extra_shared_parent unapproved_base mock_bin command_log preservation_command
   local web_install_line web_check_line web_test_line
 
   script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
@@ -2751,13 +2746,13 @@ EOF
   git -C "$fixture_repo" add main.txt
   git -C "$fixture_repo" commit -q -m 'reviewed main'
   trusted_main="$(git -C "$fixture_repo" rev-parse HEAD)"
-  git -C "$fixture_repo" switch -q -c native-policy "$common_sha"
-  printf 'native policy\n' > "$fixture_repo/native-policy.txt"
-  git -C "$fixture_repo" add native-policy.txt
-  git -C "$fixture_repo" commit -q -m 'reviewed native policy'
-  native_policy="$(git -C "$fixture_repo" rev-parse HEAD)"
+  git -C "$fixture_repo" switch -q -c extra-shared "$common_sha"
+  printf 'extra shared ancestry\n' > "$fixture_repo/extra-shared.txt"
+  git -C "$fixture_repo" add extra-shared.txt
+  git -C "$fixture_repo" commit -q -m 'independent source ancestry'
+  extra_shared_parent="$(git -C "$fixture_repo" rev-parse HEAD)"
   git -C "$fixture_repo" switch -q main
-  git -C "$fixture_repo" merge -q --no-ff native-policy -m 'source combines reviewed ancestry'
+  git -C "$fixture_repo" merge -q --no-ff extra-shared -m 'source combines independent ancestry'
   printf 'fork work\n' > "$fixture_repo/fork.txt"
   git -C "$fixture_repo" add fork.txt
   git -C "$fixture_repo" commit -q -m fork
@@ -2766,13 +2761,15 @@ EOF
   reviewed_head="$(git -C "$fixture_repo" rev-parse HEAD)"
   reviewed_tree="$(git -C "$fixture_repo" rev-parse "$reviewed_head^{tree}")"
 
-  git -C "$fixture_repo" switch -q -c protected-base "$native_policy"
-  git -C "$fixture_repo" merge -q --no-ff "$trusted_main" -m 'consolidated CI prerequisite'
+  git -C "$fixture_repo" switch -q -c protected-base "$trusted_main"
   mkdir -p "$fixture_repo/.github"
   printf 'trusted policy advance\n' > "$fixture_repo/.github/policy.txt"
   git -C "$fixture_repo" add .github/policy.txt
   git -C "$fixture_repo" commit -q -m 'advance protected policy'
   protected_base="$(git -C "$fixture_repo" rev-parse HEAD)"
+
+  git -C "$fixture_repo" merge -q --no-ff "$extra_shared_parent" -m 'unapproved extra shared ancestry'
+  unapproved_base="$(git -C "$fixture_repo" rev-parse HEAD)"
 
   git -C "$fixture_repo" switch -q --detach "$reviewed_head"
   printf 'not reviewed\n' > "$fixture_repo/forged.txt"
@@ -2800,14 +2797,13 @@ EOF
         GITHUB_OUTPUT= \
         BASE_SHA="$protected_base" HEAD_SHA="$fixture_head" PR_NUMBER=999 \
         HEAD_REPOSITORY=mbenhamd/mastra \
-        HEAD_REF=feature/pf-4051-mastra-upstream-sync-cd887998 \
+        HEAD_REF=feature/pf-4051-mastra-upstream-sync-c773a9ba \
         BASE_REF=main \
         PAPERSFLOW_PF4051_MERGE_COMMIT="$reviewed_head" \
         PAPERSFLOW_PF4051_FORK_PARENT="$fork_parent" \
         PAPERSFLOW_PF4051_UPSTREAM_PARENT="$upstream_parent" \
         PAPERSFLOW_PF4051_REVIEWED_TREE="$reviewed_tree" \
         PAPERSFLOW_PF4051_TRUSTED_MAIN="$trusted_main" \
-        PAPERSFLOW_PF4051_NATIVE_POLICY="$native_policy" \
         "$@" bash "$script_path" --classify-install
     ) > "$fixture_output" 2>&1
   }
@@ -2880,7 +2876,7 @@ EOF
   grep -Fq 'do not have the exact reviewed intersection' "$output"
 
   output="$test_root/unapproved-intersection.log"
-  if run_fixture_admission "$reviewed_head" "$output" BASE_SHA="$fork_parent"; then
+  if run_fixture_admission "$reviewed_head" "$output" BASE_SHA="$unapproved_base"; then
     echo 'PF-4051 additional shared source history unexpectedly passed admission.' >&2
     return 1
   fi
@@ -2919,13 +2915,12 @@ SH
         POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=32791 \
         BASE_SHA="$protected_base" HEAD_SHA="$reviewed_head" \
         HEAD_REPOSITORY=mbenhamd/mastra \
-        HEAD_REF=feature/pf-4051-mastra-upstream-sync-cd887998 BASE_REF=main \
+        HEAD_REF=feature/pf-4051-mastra-upstream-sync-c773a9ba BASE_REF=main \
         PAPERSFLOW_PF4051_MERGE_COMMIT="$reviewed_head" \
         PAPERSFLOW_PF4051_FORK_PARENT="$fork_parent" \
         PAPERSFLOW_PF4051_UPSTREAM_PARENT="$upstream_parent" \
         PAPERSFLOW_PF4051_REVIEWED_TREE="$reviewed_tree" \
         PAPERSFLOW_PF4051_TRUSTED_MAIN="$trusted_main" \
-        PAPERSFLOW_PF4051_NATIVE_POLICY="$native_policy" \
         "$@" bash "$script_path" --validate-pf4051-upstream-sync
     )
   }
@@ -9034,7 +9029,7 @@ run_upstream_sync_validation() {
   rm -f "$admission_output"
 
   if [[ "$expected_lane" == pf4051-upstream-sync ]]; then
-    # Exact admission already checked the separate trusted intersection pair.
+    # Exact admission already checked the trusted shared main commit.
     # Whitespace belongs to the current upstream delta from its source parent.
     merge_base_sha="$(git rev-parse "$HEAD_SHA^1")"
   else
