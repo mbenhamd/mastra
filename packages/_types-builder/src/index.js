@@ -11,6 +11,14 @@ const importSpecifierRegex =
   /(?:import|export)\s+(?:type\s+)?(?:[^'\"]*?\s+from\s+)?['\"]([^'\"]+)['\"]|import\(\s*['\"]([^'\"]+)['\"]\s*\)/gm;
 const nodeBuiltinModules = new Set([...builtinModules, ...builtinModules.map(moduleName => `node:${moduleName}`)]);
 
+function hasDeclarationSibling(filePath) {
+  try {
+    return statSync(`${filePath}.d.ts`).isFile();
+  } catch {
+    return false;
+  }
+}
+
 function isNodeBuiltinModuleSpecifier(moduleSpecifier) {
   for (const moduleName of nodeBuiltinModules) {
     if (moduleSpecifier === moduleName || moduleSpecifier.startsWith(`${moduleName}/`)) {
@@ -198,16 +206,18 @@ export async function generateTypes(rootDir, bundledPackages = new Set()) {
       let code = (await fs.readFile(fullPath)).toString();
 
       code = code.replace(rgxFrom, (_, p) => {
-        if (!(p.startsWith('./') || p.startsWith('../')) || p.endsWith('.js') || /\.d\.(ts|mts|cts)$/.test(p)) {
+        if (!(p.startsWith('./') || p.startsWith('../')) || /\.(js|mjs|cjs)$/.test(p) || /\.d\.(ts|mts|cts)$/.test(p)) {
           return `'${p}'`;
         }
 
         modified = true;
 
-        // if the import is a directory, append /index.js to it, else just add .js
+        // Prefer a declaration file sibling to a directory. TypeScript resolves a
+        // file before a directory for extensionless imports, and the generated
+        // runtime specifier must retain that choice.
         try {
-          // console.log('statfsSync', path.join(path.dirname(fullPath), p));
-          if (statSync(path.join(path.dirname(fullPath), p)).isDirectory()) {
+          const resolvedPath = path.join(path.dirname(fullPath), p);
+          if (!hasDeclarationSibling(resolvedPath) && statSync(resolvedPath).isDirectory()) {
             return `'${p}/index.js'`;
           }
         } catch {

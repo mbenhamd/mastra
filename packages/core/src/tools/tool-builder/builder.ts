@@ -1,3 +1,4 @@
+import { jsonSchema } from '@internal/ai-v6';
 import type { Schema } from '@internal/ai-v6';
 import type { ProviderDefinedTool, ToolExecutionOptions } from '@internal/external-types';
 import {
@@ -9,7 +10,6 @@ import {
   MetaSchemaCompatLayer,
   applyCompatLayer,
   convertZodSchemaToAISDKSchema,
-  jsonSchema,
 } from '@mastra/schema-compat';
 import type { SchemaCompatLayer } from '@mastra/schema-compat';
 import type { JSONSchema7Definition } from 'json-schema';
@@ -1191,10 +1191,13 @@ export class CoreToolBuilder extends MastraBase {
           },
         );
       } else {
-        processedInputSchema = applyCompatLayer({
+        const compatSchema = applyCompatLayer({
           schema: originalSchema,
           compatLayers: schemaCompatLayers,
           mode: 'aiSdkSchema',
+        });
+        processedInputSchema = jsonSchema(compatSchema.jsonSchema, {
+          validate: compatSchema.validate,
         });
       }
     }
