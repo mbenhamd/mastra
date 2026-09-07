@@ -81,6 +81,7 @@ import type {
 import { validateTemplate } from './mapping-template';
 import { derivePredicateLabel, evaluatePredicate } from './predicate';
 import type { Predicate } from './predicate';
+import { claimWorkflowResume } from './resume-claim';
 import type {
   ConditionFunction,
   ExecuteFunction,
@@ -5230,7 +5231,7 @@ export class Run<
    * Throws `WORKFLOW_RESUME_ALREADY_CLAIMED` when another caller already claimed this
    * suspension, so losing callers never enter the execution engine.
    */
-  async #claimResume({
+  protected async claimResume({
     workflowsStore,
     snapshot,
     executionGeneration,
@@ -5239,96 +5240,14 @@ export class Run<
     snapshot: WorkflowRunState;
     executionGeneration: string;
   }): Promise<void> {
-    if (!workflowsStore) {
-      return;
-    }
-
-    // The claim is a persisted state transition, so a workflow that opts out of persisting
-    // `running` snapshots cannot be claimed: writing one anyway would leave the stored snapshot
-    // in a state the caller explicitly asked us never to write.
-    const persistencePredicate =
-      this.executionEngine.getRunPersistenceOverride(this.runId) ?? this.executionEngine.options.shouldPersistSnapshot;
-    const persistsRunningState = persistencePredicate({
-      workflowStatus: 'running',
-      stepResults: (snapshot.context ?? {}) as Record<string, StepResult<any, any, any, any>>,
-    });
-
-    if (!persistsRunningState) {
-      // Workflows that acknowledged the trade-off (internal agent loops that
-      // exclude `running` snapshots to avoid write amplification) opt out of
-      // the per-resume warning: it fires on every resume and is not actionable.
-      if (!this.executionEngine.options.allowUnclaimedResumes) {
-        this.#mastra
-          ?.getLogger()
-          ?.warn(
-            `[Workflow ${this.workflowId}] shouldPersistSnapshot excludes the "running" status, so concurrent resume() calls for run ${this.runId} cannot be de-duplicated. Concurrent resumes may execute downstream steps more than once.`,
-          );
-      }
-      return;
-    }
-
-    // Stores that report no concurrent-update support cannot honor the compare-and-set: some of
-    // them (Cloudflare D1/KV/DO, ClickHouse, LanceDB) do not implement `updateWorkflowState` at all
-    // and throw. Claiming is an optimization over the pre-existing behaviour, so a store that
-    // cannot claim keeps resuming exactly as it did before rather than failing the resume.
-    if (!workflowsStore.supportsConcurrentUpdates()) {
-      this.#mastra
-        ?.getLogger()
-        ?.warn(
-          `[Workflow ${this.workflowId}] The configured workflow storage does not support concurrent updates, so concurrent resume() calls for run ${this.runId} cannot be de-duplicated atomically. Concurrent resumes may execute downstream steps more than once.`,
-        );
-      return;
-    }
-
-    const claimed = await workflowsStore.updateWorkflowState({
-      workflowName: this.workflowId,
+    await claimWorkflowResume({
+      workflowsStore,
+      snapshot,
+      executionGeneration,
+      workflowId: this.workflowId,
       runId: this.runId,
-      // Stamp the claim with the lifecycle attempt this resume will produce. The
-      // ordinary-resume persistence fence (PF-2216) admits a completing write only
-      // when it can identify the exact claim that produced it, so a bare `running`
-      // status would make the final suspension write read as stale and be dropped.
-      opts: {
-        status: 'running',
-        expectedStatus: 'suspended',
-        expectedExecutionGeneration: executionGeneration,
-        expectedLifecycleResumeAttempt: snapshot.lifecycleResumeAttempt ?? 0,
-        lifecycleResumeAttempt: (snapshot.lifecycleResumeAttempt ?? 0) + 1,
-      },
-    });
-
-    if (claimed) {
-      return;
-    }
-
-    // The compare-and-set found a different suspension coordinate. Re-read so
-    // the error reports the state the run actually landed in.
-    const current = await workflowsStore.loadWorkflowSnapshot({
-      workflowName: this.workflowId,
-      runId: this.runId,
-    });
-
-    if (!current) {
-      throw new Error('No snapshot found for this workflow run: ' + this.workflowId + ' ' + this.runId);
-    }
-
-    throw new MastraError({
-      id: 'WORKFLOW_RESUME_ALREADY_CLAIMED',
-      domain: ErrorDomain.MASTRA_WORKFLOW,
-      category: ErrorCategory.USER,
-      text:
-        `This suspended workflow run was already resumed by another caller. Workflow "${this.workflowId}" run "${this.runId}" ` +
-        `changed before this resume could claim it. ` +
-        `Only one resume() call may continue a given suspension; re-read the run state before resuming again.`,
-      details: {
-        workflowId: this.workflowId,
-        runId: this.runId,
-        expectedStatus: 'suspended',
-        actualStatus: current.status ?? 'unknown',
-        expectedExecutionGeneration: executionGeneration,
-        actualExecutionGeneration: current.executionGeneration ?? 'unknown',
-        expectedLifecycleResumeAttempt: snapshot.lifecycleResumeAttempt ?? 0,
-        actualLifecycleResumeAttempt: current.lifecycleResumeAttempt ?? 0,
-      },
+      logger: this.#mastra?.getLogger(),
+      allowUnclaimedResumes: this.executionEngine.options.allowUnclaimedResumes,
     });
   }
 
@@ -5549,7 +5468,7 @@ export class Run<
     // The compare-and-set is executed inside the store's own critical section, so exactly one
     // caller flips `suspended -> running` and every other caller loses and throws below.
     try {
-      await this.#claimResume({ workflowsStore, snapshot, executionGeneration: loadedExecutionGeneration });
+      await this.claimResume({ workflowsStore, snapshot, executionGeneration: loadedExecutionGeneration });
     } catch (error) {
       workflowSpan?.error({ error: getErrorFromUnknown(error), endSpan: true });
       throw error;
@@ -5560,63 +5479,9 @@ export class Run<
     this.workflowRunStatus = 'running';
     this.workflowRunSpan = workflowSpan;
 
-    const releaseClaimIfUnused = async () => {
-      // Only roll the claim back when the engine never reached its first step persist, which is
-      // the only state where re-resuming is guaranteed not to duplicate work. That first persist
-      // writes the engine's own status and clears `suspendedPaths`, so a snapshot that is still
-      // `running` with the pre-claim `suspendedPaths` proves nothing downstream ran. Anything
-      // else is left alone: a stuck `running` run is strictly safer than silently re-arming a
-      // suspension whose downstream steps already fired.
-      try {
-        const current = await workflowsStore?.loadWorkflowSnapshot({
-          workflowName: this.workflowId,
-          runId: this.runId,
-        });
-
-        const claimedPaths = Object.keys(snapshot.suspendedPaths ?? {});
-        const currentPaths = Object.keys(current?.suspendedPaths ?? {});
-        const claimedStepIds = Object.keys(snapshot.context ?? {});
-        const currentStepIds = Object.keys(current?.context ?? {});
-        const resumedStepId = steps?.[0] ?? '';
-        const resumedStepResult = current?.context?.[resumedStepId] as { status?: string } | undefined;
-
-        // Every one of these must still look exactly as it did at claim time. The status alone
-        // is not enough evidence: the engine deliberately suppresses `running` step persists
-        // while the last persisted status is `suspended`, so a run that failed midway can still
-        // read back as `running`.
-        const engineNeverStarted =
-          current?.status === 'running' &&
-          currentPaths.length === claimedPaths.length &&
-          claimedPaths.every(path => currentPaths.includes(path)) &&
-          currentStepIds.length === claimedStepIds.length &&
-          claimedStepIds.every(stepId => currentStepIds.includes(stepId)) &&
-          resumedStepResult?.status === 'suspended';
-
-        if (!engineNeverStarted) {
-          return;
-        }
-
-        await workflowsStore?.updateWorkflowState({
-          workflowName: this.workflowId,
-          runId: this.runId,
-          // Roll the stamped attempt back with the status: an unused claim must not
-          // leave a consumed attempt number behind, or the next resume's completing
-          // write would fail the PF-2216 identity check.
-          opts: {
-            status: 'suspended',
-            expectedStatus: 'running',
-            expectedExecutionGeneration: executionGeneration,
-            expectedLifecycleResumeAttempt: lifecycleResumeAttempt,
-            lifecycleResumeAttempt: snapshot.lifecycleResumeAttempt ?? 0,
-          },
-        });
-      } catch (releaseError) {
-        this.#mastra
-          ?.getLogger()
-          ?.warn(`[Workflow ${this.workflowId}] Failed to release resume claim for run ${this.runId}`, releaseError);
-      }
-    };
-
+    // A rejected engine execution does not prove that no external effect ran.
+    // Keep the durable claim consumed rather than infer rollback safety from
+    // checkpoint payloads whose persistence policy may suppress progress.
     const executionResultPromise = this.#withActiveExecution(executionGeneration, () =>
       this.executionEngine.execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({
         workflowId: this.workflowId,
@@ -5651,20 +5516,15 @@ export class Run<
         commitTerminalStatus: status => this.commitTerminalStatus(executionGeneration, status, lifecycleResumeAttempt),
         isCancellationAdmitted: this.isCancellationAdmitted,
       }),
-    )
-      .then(result => {
-        if (this.isCurrentLifecycleAttempt(executionGeneration, lifecycleResumeAttempt)) {
-          this.workflowRunStatus = result.status;
-          if (!params.isVNext && result.status !== 'suspended') this.closeStreamAction?.().catch(() => {});
-        }
-        result.traceId = traceId;
-        result.spanId = spanId;
-        return result;
-      })
-      .catch(async error => {
-        await releaseClaimIfUnused();
-        throw error;
-      });
+    ).then(result => {
+      if (this.isCurrentLifecycleAttempt(executionGeneration, lifecycleResumeAttempt)) {
+        this.workflowRunStatus = result.status;
+        if (!params.isVNext && result.status !== 'suspended') this.closeStreamAction?.().catch(() => {});
+      }
+      result.traceId = traceId;
+      result.spanId = spanId;
+      return result;
+    });
 
     this.executionResults = executionResultPromise;
 
