@@ -147,6 +147,7 @@ export class RedisStreamsPubSub extends PubSub implements LeaseProvider {
   #subscriptions: Map<string, Subscription> = new Map();
   #cbIds: WeakMap<EventCallback, string> = new WeakMap();
   #pendingPublishes: Set<Promise<unknown>> = new Set();
+  #pendingTopicClears: Map<string, Promise<void>> = new Map();
   // `localOnly` publishes bypass Redis entirely so values carrying live
   // methods (e.g. `MastraModelOutput` returned from an evented agent run via
   // `workflows-finish`) survive intact. Mirrors the same contract honored by
@@ -374,6 +375,7 @@ export class RedisStreamsPubSub extends PubSub implements LeaseProvider {
       isGrouped,
       groupAnchor,
       lastId: undefined,
+      clearGeneration: 0,
       readClient,
       stopped: false,
       loop: undefined,
@@ -603,15 +605,23 @@ export class RedisStreamsPubSub extends PubSub implements LeaseProvider {
   async clearTopicOrThrow(topic: string): Promise<void> {
     if (this.#closed) throw new Error('redis-streams: cannot clear a topic after close');
     await this.#ensureWriterConnected();
-    await this.#writeClient.del(this.#streamKey(topic));
-    // Redis stream IDs can restart below the last delivered ID after DEL.
-    // Attached subscribers therefore recover this known-new stream from its
-    // beginning instead of anchoring past newly published entries.
-    for (const sub of this.#subscriptions.values()) {
-      if (sub.topic === topic) {
-        sub.lastId = undefined;
-        sub.groupAnchor = '0';
+    const clear = this.#writeClient.del(this.#streamKey(topic)).then(() => {
+      // Redis stream IDs can restart below the last delivered ID after DEL.
+      // Attached subscribers therefore recover this known-new stream from its
+      // beginning instead of anchoring past newly published entries.
+      for (const sub of this.#subscriptions.values()) {
+        if (sub.topic === topic) {
+          sub.clearGeneration++;
+          sub.lastId = undefined;
+          sub.groupAnchor = '0';
+        }
       }
+    });
+    this.#pendingTopicClears.set(topic, clear);
+    try {
+      await clear;
+    } finally {
+      if (this.#pendingTopicClears.get(topic) === clear) this.#pendingTopicClears.delete(topic);
     }
   }
 
@@ -768,6 +778,7 @@ export class RedisStreamsPubSub extends PubSub implements LeaseProvider {
 
   async #runReadLoop(sub: Subscription): Promise<void> {
     while (!sub.stopped) {
+      const clearGeneration = sub.clearGeneration;
       let result;
       try {
         result = await sub.readClient.xReadGroup(sub.group, sub.consumer, [{ key: sub.streamKey, id: '>' }], {
@@ -783,11 +794,15 @@ export class RedisStreamsPubSub extends PubSub implements LeaseProvider {
           // returns NOGROUP immediately, ignoring BLOCK, so without recovery
           // this loop busy-retries forever and the subscriber goes permanently
           // deaf — a later publish recreates the stream but not the group.
-          // Recreate the group after the last delivered stream entry so events
-          // published during recovery remain visible. Before the first delivery,
-          // preserve the subscription's original earliest/latest anchor.
-          const recoveryAnchor = sub.lastId ?? sub.groupAnchor;
           try {
+            // The reader can receive NOGROUP before the writer receives DEL's
+            // reply. Wait for a local clear to reset its cursor before using it.
+            // A failed clear keeps the checkpoint and reports its own error.
+            await this.#pendingTopicClears.get(sub.topic)?.catch(() => undefined);
+            if (sub.stopped) return;
+            // Group-only deletion keeps the last delivered entry, or the
+            // original earliest/latest anchor before the first delivery.
+            const recoveryAnchor = sub.lastId ?? sub.groupAnchor;
             if (this.#streamIdleTtlMs > 0) {
               // MKSTREAM recreates an (empty) stream key, so the TTL must be
               // stamped in the same MULTI — a detached PEXPIRE that fails or is
@@ -833,7 +848,9 @@ export class RedisStreamsPubSub extends PubSub implements LeaseProvider {
       for (const stream of result) {
         for (const entry of stream.messages) {
           if (sub.stopped) return;
-          sub.lastId = entry.id;
+          // A reply already read from a deleted stream can arrive after the
+          // cursor reset. Deliver it without restoring that old checkpoint.
+          if (sub.clearGeneration === clearGeneration) sub.lastId = entry.id;
           await this.#deliverMessage(sub, entry.id, entry.message);
         }
       }
@@ -1013,6 +1030,7 @@ interface Subscription {
   isGrouped: boolean;
   groupAnchor: '0' | '$';
   lastId: string | undefined;
+  clearGeneration: number;
   readClient: RedisClientType;
   stopped: boolean;
   loop: Promise<void> | undefined;

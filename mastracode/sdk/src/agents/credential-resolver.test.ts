@@ -1,5 +1,10 @@
-import { RequestContext } from '@mastra/core/request-context';
+import { EventEmitterPubSub } from '@mastra/core/events';
+import { Mastra } from '@mastra/core/mastra';
+import { MASTRA_AUTH_ORGANIZATION_KEY, RequestContext } from '@mastra/core/request-context';
+import { MockStore } from '@mastra/core/storage';
+import { createStep, createWorkflow } from '@mastra/core/workflows/evented';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { z } from 'zod/v4';
 import type { AuthCredential, CredentialStore } from '../auth/types.js';
 import {
   hasCredentialStoreProvider,
@@ -161,6 +166,146 @@ describe('credential store provider registry', () => {
     const ctx = new RequestContext();
     ctx.set('user', { session: { activeOrganizationId: 7 }, user: { id: 'prov_5' } });
     expect(resolveTenantFromRequestContext(ctx)).toBeUndefined();
+  });
+});
+
+describe('evented workflow tenant authority', () => {
+  async function createTenantWorkflow() {
+    const storage = new MockStore();
+    const seen: Array<ReturnType<typeof resolveTenantFromRequestContext>> = [];
+    const schema = z.object({ value: z.string() });
+    const observe = createStep({
+      id: 'observe-tenant',
+      inputSchema: schema,
+      outputSchema: schema,
+      execute: async ({ inputData, requestContext }) => {
+        seen.push(resolveTenantFromRequestContext(requestContext));
+        requestContext.set('stepNote', { keep: true });
+        return inputData;
+      },
+    });
+    const child = createWorkflow({ id: 'tenant-child', inputSchema: schema, outputSchema: schema })
+      .then(observe)
+      .commit();
+    const pause = createStep({
+      id: 'pause-tenant',
+      inputSchema: schema,
+      outputSchema: schema,
+      suspendSchema: z.object({ waiting: z.boolean() }),
+      resumeSchema: z.object({ approved: z.boolean() }),
+      execute: async ({ inputData, requestContext, resumeData, suspend }) => {
+        seen.push(resolveTenantFromRequestContext(requestContext));
+        if (!resumeData?.approved) await suspend({ waiting: true });
+        return inputData;
+      },
+    });
+    const workflow = createWorkflow({ id: 'tenant-workflow', inputSchema: schema, outputSchema: schema })
+      .dowhile(child, async ({ iterationCount }) => iterationCount < 2)
+      .then(pause)
+      .commit();
+    const mastra = new Mastra({
+      logger: false,
+      storage,
+      pubsub: new EventEmitterPubSub(),
+      workflows: { [workflow.id]: workflow },
+    });
+    const store = await storage.getStore('workflows');
+    const persist = vi.spyOn(store, 'persistWorkflowSnapshot');
+    await mastra.startWorkers();
+    const run = await workflow.createRun();
+    const requestContext = new RequestContext();
+    requestContext.set('user', { id: 'user_1', organizationId: 'org_1' });
+    requestContext.set(MASTRA_AUTH_ORGANIZATION_KEY, { userId: 'user_1', organizationId: 'org_2' });
+    requestContext.set('workflowNote', { keep: ['original'] });
+    return { mastra, workflow, run, store, persist, requestContext, seen };
+  }
+
+  it('keeps selected organization live through nested loops without persisting it, then uses fresh resume selection', async () => {
+    const { mastra, workflow, run, store, persist, requestContext, seen } = await createTenantWorkflow();
+    try {
+      expect(await run.start({ inputData: { value: 'ok' }, requestContext })).toMatchObject({ status: 'suspended' });
+      const suspended = await store.loadWorkflowSnapshot({ workflowName: workflow.id, runId: run.runId });
+      const freshContext = new RequestContext();
+      freshContext.set('user', { id: 'user_1', organizationId: 'org_1' });
+      freshContext.set(MASTRA_AUTH_ORGANIZATION_KEY, { userId: 'user_1', organizationId: 'org_3' });
+      expect(await run.resume({ resumeData: { approved: true }, requestContext: freshContext })).toMatchObject({
+        status: 'success',
+        result: { value: 'ok' },
+      });
+      expect(seen).toEqual([
+        { userId: 'user_1', orgId: 'org_2' },
+        { userId: 'user_1', orgId: 'org_2' },
+        { userId: 'user_1', orgId: 'org_2' },
+        { userId: 'user_1', orgId: 'org_3' },
+      ]);
+      expect(suspended?.requestContext).toMatchObject({
+        user: { id: 'user_1', organizationId: 'org_1' },
+        workflowNote: { keep: ['original'] },
+        stepNote: { keep: true },
+      });
+      expect(suspended?.requestContext).not.toHaveProperty(MASTRA_AUTH_ORGANIZATION_KEY);
+      const completed = await store.loadWorkflowSnapshot({ workflowName: workflow.id, runId: run.runId });
+      expect(completed?.requestContext).toMatchObject({ workflowNote: { keep: ['original'] } });
+      expect(completed?.requestContext).not.toHaveProperty(MASTRA_AUTH_ORGANIZATION_KEY);
+      const children = await store.listWorkflowRuns({ workflowName: 'tenant-child' });
+      expect(children.total).toBe(2);
+      for (const child of children.runs) {
+        const snapshot = await store.loadWorkflowSnapshot({ workflowName: 'tenant-child', runId: child.runId });
+        expect(snapshot?.requestContext).toMatchObject({ stepNote: { keep: true } });
+        expect(snapshot?.requestContext).not.toHaveProperty(MASTRA_AUTH_ORGANIZATION_KEY);
+      }
+      for (const [{ snapshot }] of persist.mock.calls) {
+        expect(snapshot.requestContext ?? {}).not.toHaveProperty(MASTRA_AUTH_ORGANIZATION_KEY);
+      }
+      expect(requestContext.get(MASTRA_AUTH_ORGANIZATION_KEY)).toEqual({
+        userId: 'user_1',
+        organizationId: 'org_2',
+      });
+    } finally {
+      await mastra.shutdown();
+    }
+  });
+
+  it('does not recover a saved organization selection when an async run resumes without one', async () => {
+    const { mastra, workflow, run, store, persist, requestContext, seen } = await createTenantWorkflow();
+    try {
+      await run.startAsync({ inputData: { value: 'ok' }, requestContext });
+      await vi.waitFor(async () => {
+        expect(await store.loadWorkflowSnapshot({ workflowName: workflow.id, runId: run.runId })).toMatchObject({
+          status: 'suspended',
+        });
+      });
+      const suspended = await store.loadWorkflowSnapshot({ workflowName: workflow.id, runId: run.runId });
+      const initial = persist.mock.calls.find(
+        ([args]) => args.runId === run.runId && args.snapshot.status === 'running',
+      )?.[0].snapshot;
+      // A retained snapshot from before the exclusion must not supply fresh authority.
+      await store.persistWorkflowSnapshot({
+        workflowName: workflow.id,
+        runId: run.runId,
+        snapshot: {
+          ...suspended!,
+          requestContext: {
+            ...suspended?.requestContext,
+            [MASTRA_AUTH_ORGANIZATION_KEY]: { userId: 'user_1', organizationId: 'org_2' },
+          },
+        },
+      });
+      const freshContext = new RequestContext();
+      freshContext.set('user', { id: 'user_1', organizationId: 'org_1' });
+      const resumed = await workflow.createRun({ runId: run.runId });
+      expect(await resumed.resume({ resumeData: { approved: true }, requestContext: freshContext })).toMatchObject({
+        status: 'success',
+        result: { value: 'ok' },
+      });
+      expect(seen.at(-1)).toEqual({ userId: 'user_1', orgId: 'org_1' });
+      expect(initial?.requestContext).toMatchObject({ workflowNote: { keep: ['original'] } });
+      expect(initial?.requestContext).not.toHaveProperty(MASTRA_AUTH_ORGANIZATION_KEY);
+      expect(suspended?.requestContext).not.toHaveProperty(MASTRA_AUTH_ORGANIZATION_KEY);
+      expect(freshContext.has(MASTRA_AUTH_ORGANIZATION_KEY)).toBe(false);
+    } finally {
+      await mastra.shutdown();
+    }
   });
 });
 

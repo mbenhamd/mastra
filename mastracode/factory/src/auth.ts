@@ -1,6 +1,6 @@
 import { MastraAuthWorkos } from '@mastra/auth-workos';
 import type { MessageAuthor } from '@mastra/core/agent-controller';
-import { MASTRA_MESSAGE_AUTHOR_KEY } from '@mastra/core/request-context';
+import { MASTRA_AUTH_ORGANIZATION_KEY, MASTRA_MESSAGE_AUTHOR_KEY } from '@mastra/core/request-context';
 import {
   registerApiRoute,
   isAuthHttpHandler,
@@ -15,6 +15,8 @@ import type { Context, Hono } from 'hono';
 import type { RouteAuth } from './routes/route.js';
 import { actorFromAuthUser } from './storage/domains/comments/actor.js';
 import { timedAboveThreshold } from './timing.js';
+
+const ORGANIZATION_ID_HEADER = 'X-Mastra-Organization-Id';
 
 /**
  * Provider-neutral factory auth gating for the MastraCode web server.
@@ -56,6 +58,8 @@ export interface FactoryAuthUser {
    * isolated building instances. Absent for personal (no-org) accounts.
    */
   organizationId?: string;
+  /** Organization ids proven by the provider's authenticated membership response. */
+  organizationMembershipIds?: string[];
 }
 
 /**
@@ -128,12 +132,29 @@ export function getFactoryAuthUser(c: Context): FactoryAuthUser | undefined {
  * {@link FactoryAuthUser} therefore yields `undefined` for both the id and the
  * org under better-auth, which reads as "this session belongs to somebody else"
  * at every ownership check. Normalize on the way in instead.
+ * A membership-validated organization selection survives reauthentication
+ * separately from the provider result, but only for the same stable user.
  */
 export function getFactoryAuthUserFromContext(
   requestContext: { get: (key: string) => unknown } | undefined,
 ): FactoryAuthUser | undefined {
   if (!requestContext || typeof requestContext.get !== 'function') return undefined;
-  return toFactoryAuthUser(requestContext.get('user')) ?? undefined;
+  const user = toFactoryAuthUser(requestContext.get('user'));
+  if (!user) return undefined;
+  const selected = requestContext.get(MASTRA_AUTH_ORGANIZATION_KEY);
+  if (selected === undefined) return user;
+  if (!selected || typeof selected !== 'object') return undefined;
+  const { userId, organizationId } = selected as { userId?: unknown; organizationId?: unknown };
+  if (
+    typeof userId !== 'string' ||
+    !userId ||
+    userId !== getFactoryAuthUserId(user) ||
+    typeof organizationId !== 'string' ||
+    !organizationId
+  ) {
+    return undefined;
+  }
+  return { ...user, organizationId };
 }
 
 /** Resolve the stable user id from an authenticated user shape. */
@@ -230,10 +251,23 @@ function toFactoryAuthUser(result: unknown): FactoryAuthUser | null {
     name?: unknown;
     avatarUrl?: unknown;
     organizationId?: unknown;
+    memberships?: unknown;
+    memberOrgIds?: unknown;
   };
   const id = typeof flat.id === 'string' ? flat.id : undefined;
   const workosId = typeof flat.workosId === 'string' ? flat.workosId : undefined;
   if (!id && !workosId) return null;
+  const membershipOrganizationIds = Array.isArray(flat.memberships)
+    ? flat.memberships.flatMap(membership => {
+        if (!membership || typeof membership !== 'object') return [];
+        const organizationId = (membership as { organizationId?: unknown }).organizationId;
+        return typeof organizationId === 'string' ? [organizationId] : [];
+      })
+    : [];
+  const memberOrgIds = Array.isArray(flat.memberOrgIds)
+    ? flat.memberOrgIds.filter((organizationId): organizationId is string => typeof organizationId === 'string')
+    : [];
+  const organizationMembershipIds = [...new Set([...membershipOrganizationIds, ...memberOrgIds])];
   return {
     id,
     workosId,
@@ -241,6 +275,7 @@ function toFactoryAuthUser(result: unknown): FactoryAuthUser | null {
     name: typeof flat.name === 'string' ? flat.name : undefined,
     avatarUrl: typeof flat.avatarUrl === 'string' ? flat.avatarUrl : undefined,
     organizationId: typeof flat.organizationId === 'string' ? flat.organizationId : undefined,
+    organizationMembershipIds,
   };
 }
 
@@ -280,6 +315,13 @@ async function ensureUserOrg(provider: IMastraAuthProvider, user: FactoryAuthUse
   } catch {
     // Best-effort: the user stays no-org until a later request succeeds.
   }
+}
+
+function selectRequestedOrganization(user: FactoryAuthUser, requestedOrganizationId: string): boolean {
+  if (user.organizationId === requestedOrganizationId) return true;
+  if (!user.organizationMembershipIds?.includes(requestedOrganizationId)) return false;
+  user.organizationId = requestedOrganizationId;
+  return true;
 }
 
 /**
@@ -807,9 +849,25 @@ export function createFactoryAuthGate(provider: IMastraAuthProvider) {
     );
 
     if (user) {
-      // Bootstrap a personal org for no-org accounts so the org id resolves on
-      // this request (see ensureFactoryAuthUser for the rationale).
-      await ensureUserOrg(provider, user);
+      const requestedOrganizationId = token ? c.req.header(ORGANIZATION_ID_HEADER)?.trim() : undefined;
+      if (requestedOrganizationId) {
+        if (!selectRequestedOrganization(user, requestedOrganizationId)) {
+          return c.json({ error: 'organization_forbidden' }, 403);
+        }
+        const userId = getFactoryAuthUserId(user);
+        if (!userId) return c.json({ error: 'unauthorized' }, 401);
+        c.get('requestContext')?.set(
+          MASTRA_AUTH_ORGANIZATION_KEY,
+          Object.freeze({
+            userId,
+            organizationId: requestedOrganizationId,
+          }),
+        );
+      } else {
+        // Bootstrap a personal org for no-org accounts so the org id resolves on
+        // this request (see ensureFactoryAuthUser for the rationale).
+        await ensureUserOrg(provider, user);
+      }
       c.set(FACTORY_AUTH_USER_KEY, user);
       const requestContext = c.get('requestContext');
       requestContext?.set('user', user);

@@ -18,6 +18,8 @@ export const MASTRA_USER_ROLES_KEY = 'mastra__userRoles';
 
 export const MASTRA_AUTH_TOKEN_KEY = 'mastra__authToken';
 
+export const MASTRA_AUTH_ORGANIZATION_KEY = 'mastra__authOrganization';
+
 export const MASTRA_IS_STUDIO_KEY = 'mastra__isStudio';
 
 /**
@@ -58,6 +60,7 @@ const RESERVED_CONTEXT_KEYS = new Set([
   MASTRA_USER_PERMISSIONS_KEY,
   MASTRA_USER_ROLES_KEY,
   MASTRA_AUTH_TOKEN_KEY,
+  MASTRA_AUTH_ORGANIZATION_KEY,
   MASTRA_IS_STUDIO_KEY,
   MASTRA_AUTH_MODE_KEY,
   // Delegation stores a live memory instance here. A body-supplied value would

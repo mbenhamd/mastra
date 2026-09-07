@@ -51,6 +51,14 @@ export const MASTRA_VERSIONS_KEY = 'mastra__versions';
 export const MASTRA_AUTH_TOKEN_KEY = 'mastra__authToken';
 
 /**
+ * Organization selected by trusted authentication middleware after membership
+ * validation: `{ userId, organizationId }`. Consumers must match `userId` to
+ * the current authenticated principal. This does not replace provider claims
+ * or the separate `organizationId` used for knowledge scope.
+ */
+export const MASTRA_AUTH_ORGANIZATION_KEY = 'mastra__authOrganization';
+
+/**
  * Reserved key carrying a delegating agent's `MastraMemory` into a delegated
  * run, so a sub-agent without its own memory can persist that run's transcript
  * without the shared sub-agent instance being modified. The value is

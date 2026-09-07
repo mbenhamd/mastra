@@ -1,14 +1,20 @@
-import { MASTRA_MESSAGE_AUTHOR_KEY, RequestContext } from '@mastra/core/request-context';
+import { resolveTenantFromRequestContext } from '@mastra/code-sdk/agents/credential-resolver';
+import { Mastra } from '@mastra/core/mastra';
+import { MASTRA_AUTH_ORGANIZATION_KEY, MASTRA_MESSAGE_AUTHOR_KEY, RequestContext } from '@mastra/core/request-context';
 import { Hono } from 'hono';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { coreAuthMiddleware, MASTRA_USER_KEY } from '../../../packages/server/src/server/auth/helpers.js';
 
 import {
   getFactoryAuthOrgId,
   getFactoryAuthUser,
+  getFactoryAuthUserFromContext,
   getFactoryAuthUserId,
   mountFactoryAuth,
   factoryAuthTenant,
 } from './auth.js';
+import { readRequestContextOrgId } from './session/org-seed.js';
 
 // Mock @mastra/auth-workos so the tests exercise the gating/routing logic in
 // this module without constructing a real WorkOS client. `authenticateToken`'s
@@ -373,6 +379,167 @@ describe('mountFactoryAuth gate (enabled)', () => {
       name: 'user@example.com',
       avatarUrl: 'https://avatars.example/user.png',
     });
+  });
+
+  it('selects a requested bearer organization proven by provider memberships', async () => {
+    mockAuthenticate.mockResolvedValue({
+      workosId: 'user_123',
+      memberships: [
+        { id: 'membership_1', organizationId: 'org_1' },
+        { id: 'membership_2', organizationId: 'org_2' },
+      ],
+    });
+    const app = new Hono();
+    mountFactoryAuth(app, { redirectUri: 'http://localhost:4111/auth/callback' });
+    app.get('/web/whoami', c => c.json(factoryAuthTenant(c)));
+
+    const res = await app.request('/web/whoami', {
+      headers: {
+        Accept: 'application/json',
+        Authorization: 'Bearer cli-token',
+        'X-Mastra-Organization-Id': 'org_2',
+      },
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ orgId: 'org_2', userId: 'user_123' });
+    expect(mockEnsureOrganization).not.toHaveBeenCalled();
+  });
+
+  it('selects a requested bearer organization proven by Studio membership ids', async () => {
+    mockAuthenticate.mockResolvedValue({
+      id: 'user_123',
+      organizationId: 'org_1',
+      memberOrgIds: ['org_1', 'org_2'],
+    });
+    const app = new Hono();
+    mountFactoryAuth(app, { redirectUri: 'http://localhost:4111/auth/callback' });
+    app.get('/web/whoami', c => c.json(factoryAuthTenant(c)));
+
+    const res = await app.request('/web/whoami', {
+      headers: {
+        Accept: 'application/json',
+        Authorization: 'Bearer cli-token',
+        'X-Mastra-Organization-Id': 'org_2',
+      },
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ orgId: 'org_2', userId: 'user_123' });
+    expect(mockEnsureOrganization).not.toHaveBeenCalled();
+  });
+
+  it('preserves the selected organization across core route authentication without changing provider claims', async () => {
+    const providerUser = {
+      id: 'user_123',
+      workosId: 'user_123',
+      organizationId: 'org_1',
+      organizationMembershipId: 'membership_1',
+      roles: ['member'],
+      memberships: [
+        { id: 'membership_1', organizationId: 'org_1' },
+        { id: 'membership_2', organizationId: 'org_2' },
+      ],
+    };
+    const provider = {
+      name: 'test',
+      authenticateToken: vi.fn(async () => providerUser),
+      authorizeUser: vi.fn(async (user: unknown) => user === providerUser),
+    };
+    const mastra = new Mastra({ server: { auth: provider } });
+    const requestContext = new RequestContext();
+    const app = new Hono();
+    app.use('*', async (c, next) => {
+      c.set('requestContext' as never, requestContext as never);
+      await next();
+    });
+    mountFactoryAuth(app, { provider });
+    app.get('/api/agent-controller/factory/sessions/session_2', async c => {
+      const primedTenant = factoryAuthTenant(c);
+      const result = await coreAuthMiddleware({
+        path: c.req.path,
+        method: c.req.method,
+        getHeader: name => c.req.header(name),
+        mastra,
+        authConfig: provider,
+        requestContext,
+        rawRequest: c.req.raw,
+        token: 'cli-token',
+        requiresAuth: true,
+        buildAuthorizeContext: () => c,
+      });
+      expect(result.action).toBe('next');
+      return c.json({
+        primedTenant,
+        factoryOrganization: getFactoryAuthUserFromContext(requestContext)?.organizationId,
+        credentialTenant: resolveTenantFromRequestContext(requestContext),
+        sessionOrganization: readRequestContextOrgId(requestContext),
+      });
+    });
+
+    const res = await app.request('/api/agent-controller/factory/sessions/session_2', {
+      headers: { Authorization: 'Bearer cli-token', 'X-Mastra-Organization-Id': 'org_2' },
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      primedTenant: { orgId: 'org_2', userId: 'user_123' },
+      factoryOrganization: 'org_2',
+      credentialTenant: { orgId: 'org_2', userId: 'user_123' },
+      sessionOrganization: 'org_2',
+    });
+    expect(provider.authenticateToken).toHaveBeenCalledTimes(2);
+    expect(provider.authorizeUser).toHaveBeenCalledTimes(1);
+    expect(provider.authorizeUser.mock.calls[0]![0]).toBe(providerUser);
+    expect(requestContext.get('user')).toBe(providerUser);
+    expect(requestContext.get(MASTRA_USER_KEY)).toBe(providerUser);
+    expect(providerUser.organizationId).toBe('org_1');
+    expect(providerUser.organizationMembershipId).toBe('membership_1');
+    expect(providerUser.roles).toEqual(['member']);
+  });
+
+  it('rejects a requested bearer organization not present in provider memberships', async () => {
+    mockAuthenticate.mockResolvedValue({
+      workosId: 'user_123',
+      memberships: [{ id: 'membership_1', organizationId: 'org_1' }],
+    });
+    const { app } = buildApp();
+
+    const res = await app.request('/web/projects', {
+      headers: {
+        Accept: 'application/json',
+        Authorization: 'Bearer cli-token',
+        'X-Mastra-Organization-Id': 'org_other',
+      },
+    });
+
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: 'organization_forbidden' });
+    expect(mockEnsureOrganization).not.toHaveBeenCalled();
+  });
+
+  it('refuses a selected organization bound to a different authenticated user', () => {
+    const requestContext = new RequestContext();
+    requestContext.set('user', { id: 'user_2', organizationId: 'org_1' });
+    requestContext.set(MASTRA_AUTH_ORGANIZATION_KEY, { userId: 'user_1', organizationId: 'org_2' });
+
+    expect(getFactoryAuthUserFromContext(requestContext)).toBeUndefined();
+    expect(resolveTenantFromRequestContext(requestContext)).toBeUndefined();
+    expect(readRequestContextOrgId(requestContext)).toBeUndefined();
+  });
+
+  it('does not let an organization header change cookie-authenticated tenancy', async () => {
+    mockAuthenticate.mockResolvedValue({ workosId: 'user_123', organizationId: 'org_cookie' });
+    const app = new Hono();
+    mountFactoryAuth(app, { redirectUri: 'http://localhost:4111/auth/callback' });
+    app.get('/web/whoami', c => c.json(factoryAuthTenant(c)));
+
+    const res = await app.request('/web/whoami', {
+      headers: { Accept: 'application/json', 'X-Mastra-Organization-Id': 'org_other' },
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ orgId: 'org_cookie', userId: 'user_123' });
   });
 });
 

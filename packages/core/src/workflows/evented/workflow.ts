@@ -100,7 +100,7 @@ import type { AgentStepOptions, RunWithRawInput } from '../workflow';
 import { watchWorkflowLifecycleEvents } from '../workflow-lifecycle';
 import { EventedExecutionEngine } from './execution-engine';
 import { isEventedForeachSuspensionResult } from './foreach-suspension';
-import { isTripwireChunk, createTripWireFromChunk, getTextDeltaFromChunk } from './helpers';
+import { getPersistedRequestContext, isTripwireChunk, createTripWireFromChunk, getTextDeltaFromChunk } from './helpers';
 import type { TripwireChunk } from './helpers';
 import { assertEventedResumeLabelName, normalizeEventedResumeLabels } from './resume-label';
 import { WorkflowEventProcessor } from './workflow-event-processor';
@@ -2114,7 +2114,7 @@ export class EventedRun<
       status: 'running',
       value: {},
       context: inputDataToUse != null ? ({ input: inputDataToUse } as any) : ({} as any),
-      requestContext: requestContext.toJSON(),
+      requestContext: getPersistedRequestContext(requestContext.toJSON()),
       activePaths: [],
       activeStepsPath: {},
       suspendedPaths: {},
@@ -2283,7 +2283,7 @@ export class EventedRun<
       status: 'running',
       value: {},
       context: inputDataToUse != null ? ({ input: inputDataToUse } as any) : ({} as any),
-      requestContext: requestContext.toJSON(),
+      requestContext: getPersistedRequestContext(requestContext.toJSON()),
       activePaths: [],
       activeStepsPath: {},
       suspendedPaths: {},
@@ -2721,7 +2721,7 @@ export class EventedRun<
 
     const resumePath = snapshot.suspendedPaths?.[steps[0]!] as any;
     // Start with the snapshot's request context (old values)
-    const requestContextObj = snapshot.requestContext ?? {};
+    const requestContextObj = getPersistedRequestContext(snapshot.requestContext ?? {});
     const requestContext = new RequestContext();
 
     // First, set values from the snapshot
