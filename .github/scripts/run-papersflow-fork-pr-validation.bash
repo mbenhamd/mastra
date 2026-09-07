@@ -161,15 +161,16 @@ pf4051_config() {
   PF4051_BASE_REF="${PAPERSFLOW_PF4051_BASE_REF:-main}"
   PF4051_PENDING_MERGE_COMMIT='PENDING_PF4051_MERGE_COMMIT'
   PF4051_PENDING_REVIEWED_TREE='PENDING_PF4051_REVIEWED_TREE'
-  PF4051_MERGE_COMMIT="${PAPERSFLOW_PF4051_MERGE_COMMIT:-77d715045a7b65d1f7865d831bcfb462f5c73da1}"
-  PF4051_FORK_PARENT="${PAPERSFLOW_PF4051_FORK_PARENT:-0769ef2c773d11244c88739cad27da0189e4e89a}"
+  PF4051_MERGE_COMMIT="${PAPERSFLOW_PF4051_MERGE_COMMIT:-5e8601144e8e3c22ede2df09b8017c1ee82e2b32}"
+  PF4051_FORK_PARENT="${PAPERSFLOW_PF4051_FORK_PARENT:-77d715045a7b65d1f7865d831bcfb462f5c73da1}"
+  PF4051_MAIN_PARENT="${PAPERSFLOW_PF4051_MAIN_PARENT:-a8e355ef13657fff26becc026c98df06007b96e9}"
   PF4051_UPSTREAM_PARENT="${PAPERSFLOW_PF4051_UPSTREAM_PARENT:-2de367c9399c5fe51ea1db2d5821107591f7a7b4}"
-  PF4051_REVIEWED_TREE="${PAPERSFLOW_PF4051_REVIEWED_TREE:-a3a8c4e1d9e1098e23493a38fb3e8c59dd601ead}"
-  PF4051_TRUSTED_MAIN="${PAPERSFLOW_PF4051_TRUSTED_MAIN:-44c71b236991ac05778e27b7634321be8779ca75}"
+  PF4051_REVIEWED_TREE="${PAPERSFLOW_PF4051_REVIEWED_TREE:-b54055dfbc6187656e8cd90b5e7e3bf087c08929}"
+  PF4051_TRUSTED_MAIN="${PAPERSFLOW_PF4051_TRUSTED_MAIN:-a8e355ef13657fff26becc026c98df06007b96e9}"
   readonly \
     PF4051_TRUSTED_MAIN \
     PF4051_HEAD_REPOSITORY PF4051_HEAD_REF PF4051_BASE_REF PF4051_MERGE_COMMIT \
-    PF4051_FORK_PARENT PF4051_UPSTREAM_PARENT PF4051_REVIEWED_TREE \
+    PF4051_FORK_PARENT PF4051_MAIN_PARENT PF4051_UPSTREAM_PARENT PF4051_REVIEWED_TREE \
     PF4051_PENDING_MERGE_COMMIT PF4051_PENDING_REVIEWED_TREE
 }
 
@@ -479,9 +480,9 @@ verify_pf4051_reviewed_merge() (
   fi
 
   merge_topology="$(git rev-list --parents -n 1 "$HEAD_SHA")"
-  if [[ "$merge_topology" != "$HEAD_SHA $PF4051_FORK_PARENT $PF4051_UPSTREAM_PARENT" ]]; then
-    echo 'PF-4051 head is not the exact reviewed two-parent upstream merge topology.' >&2
-    echo "expected: $HEAD_SHA $PF4051_FORK_PARENT $PF4051_UPSTREAM_PARENT" >&2
+  if [[ "$merge_topology" != "$HEAD_SHA $PF4051_FORK_PARENT $PF4051_MAIN_PARENT" ]]; then
+    echo 'PF-4051 head is not the exact reviewed two-parent reconciliation merge topology.' >&2
+    echo "expected: $HEAD_SHA $PF4051_FORK_PARENT $PF4051_MAIN_PARENT" >&2
     echo "actual:   $merge_topology" >&2
     return 1
   fi
@@ -494,11 +495,11 @@ verify_pf4051_reviewed_merge() (
     return 1
   fi
 
-  # Both the CI prerequisite and source parent include the landed native
-  # contracts. Admit only that exact shared main commit, never extra ancestry.
+  # The source reconciles the frozen upstream sync with the landed fork main.
+  # A later CI-only prerequisite shares exactly that main, never extra ancestry.
   if ! git merge-base --is-ancestor "$PF4051_TRUSTED_MAIN" "$BASE_SHA" ||
-    ! git merge-base --is-ancestor "$PF4051_TRUSTED_MAIN" "$PF4051_FORK_PARENT"; then
-    echo 'PF-4051 protected base or source parent lacks the reviewed trusted ancestry.' >&2
+    ! git merge-base --is-ancestor "$PF4051_TRUSTED_MAIN" "$PF4051_MAIN_PARENT"; then
+    echo 'PF-4051 protected base or main parent lacks the reviewed trusted ancestry.' >&2
     return 1
   fi
   protected_merge_bases="$(git merge-base --all "$BASE_SHA" "$HEAD_SHA")"
@@ -508,8 +509,8 @@ verify_pf4051_reviewed_merge() (
     echo "actual:   $protected_merge_bases" >&2
     return 1
   fi
-  if ! git merge-base --is-ancestor "$PF4051_UPSTREAM_PARENT" "$HEAD_SHA"; then
-    echo 'PF-4051 head does not contain the reviewed official upstream parent.' >&2
+  if ! git merge-base --is-ancestor "$PF4051_UPSTREAM_PARENT" "$PF4051_FORK_PARENT"; then
+    echo 'PF-4051 source parent does not contain the reviewed official upstream parent.' >&2
     return 1
   fi
 )
@@ -2751,13 +2752,14 @@ EOF
   git -C "$fixture_repo" add extra-shared.txt
   git -C "$fixture_repo" commit -q -m 'independent source ancestry'
   extra_shared_parent="$(git -C "$fixture_repo" rev-parse HEAD)"
-  git -C "$fixture_repo" switch -q main
+  git -C "$fixture_repo" switch -q -c fork "$common_sha"
   git -C "$fixture_repo" merge -q --no-ff extra-shared -m 'source combines independent ancestry'
   printf 'fork work\n' > "$fixture_repo/fork.txt"
   git -C "$fixture_repo" add fork.txt
   git -C "$fixture_repo" commit -q -m fork
-  fork_parent="$(git -C "$fixture_repo" rev-parse HEAD)"
   git -C "$fixture_repo" merge -q --no-ff upstream -m 'reviewed upstream merge'
+  fork_parent="$(git -C "$fixture_repo" rev-parse HEAD)"
+  git -C "$fixture_repo" merge -q --no-ff "$trusted_main" -m 'reconcile landed main'
   reviewed_head="$(git -C "$fixture_repo" rev-parse HEAD)"
   reviewed_tree="$(git -C "$fixture_repo" rev-parse "$reviewed_head^{tree}")"
 
@@ -2777,13 +2779,13 @@ EOF
   forged_tree="$(git -C "$fixture_repo" write-tree)"
   git -C "$fixture_repo" reset -q --hard "$reviewed_head"
   forged_head="$(printf 'forged tree\n' | git -C "$fixture_repo" commit-tree \
-    "$forged_tree" -p "$fork_parent" -p "$upstream_parent")"
+    "$forged_tree" -p "$fork_parent" -p "$trusted_main")"
   reversed_head="$(printf 'reversed parents\n' | git -C "$fixture_repo" commit-tree \
-    "$reviewed_tree" -p "$upstream_parent" -p "$fork_parent")"
+    "$reviewed_tree" -p "$trusted_main" -p "$fork_parent")"
   extra_parent="$(printf 'extra parent\n' | git -C "$fixture_repo" commit-tree \
     "$common_sha^{tree}" -p "$common_sha")"
   octopus_head="$(printf 'octopus merge\n' | git -C "$fixture_repo" commit-tree \
-    "$reviewed_tree" -p "$fork_parent" -p "$upstream_parent" -p "$extra_parent")"
+    "$reviewed_tree" -p "$fork_parent" -p "$trusted_main" -p "$extra_parent")"
   non_merge_head="$(printf 'not a merge\n' | git -C "$fixture_repo" commit-tree \
     "$reviewed_tree" -p "$fork_parent")"
 
@@ -2801,6 +2803,7 @@ EOF
         BASE_REF=main \
         PAPERSFLOW_PF4051_MERGE_COMMIT="$reviewed_head" \
         PAPERSFLOW_PF4051_FORK_PARENT="$fork_parent" \
+        PAPERSFLOW_PF4051_MAIN_PARENT="$trusted_main" \
         PAPERSFLOW_PF4051_UPSTREAM_PARENT="$upstream_parent" \
         PAPERSFLOW_PF4051_REVIEWED_TREE="$reviewed_tree" \
         PAPERSFLOW_PF4051_TRUSTED_MAIN="$trusted_main" \
@@ -2835,7 +2838,7 @@ EOF
     echo 'PF-4051 reversed parent order unexpectedly passed admission.' >&2
     return 1
   fi
-  grep -Fq 'not the exact reviewed two-parent upstream merge topology' "$output"
+  grep -Fq 'not the exact reviewed two-parent reconciliation merge topology' "$output"
 
   output="$test_root/octopus.log"
   if run_fixture_admission "$octopus_head" "$output" \
@@ -2843,7 +2846,7 @@ EOF
     echo 'PF-4051 octopus merge unexpectedly passed admission.' >&2
     return 1
   fi
-  grep -Fq 'not the exact reviewed two-parent upstream merge topology' "$output"
+  grep -Fq 'not the exact reviewed two-parent reconciliation merge topology' "$output"
 
   output="$test_root/non-merge.log"
   if run_fixture_admission "$non_merge_head" "$output" \
@@ -2851,7 +2854,7 @@ EOF
     echo 'PF-4051 non-merge head unexpectedly passed admission.' >&2
     return 1
   fi
-  grep -Fq 'not the exact reviewed two-parent upstream merge topology' "$output"
+  grep -Fq 'not the exact reviewed two-parent reconciliation merge topology' "$output"
 
   output="$test_root/wrong-head.log"
   if run_fixture_admission "$reviewed_head" "$output" \
@@ -2881,6 +2884,14 @@ EOF
     return 1
   fi
   grep -Fq 'do not have the exact reviewed intersection' "$output"
+
+  output="$test_root/upstream-outside-source-parent.log"
+  if run_fixture_admission "$reviewed_head" "$output" \
+    PAPERSFLOW_PF4051_UPSTREAM_PARENT="$trusted_main"; then
+    echo 'PF-4051 upstream provenance outside the reviewed source parent unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'source parent does not contain the reviewed official upstream parent' "$output"
 
   output="$test_root/wrong-metadata.log"
   if run_fixture_admission "$reviewed_head" "$output" HEAD_REF=feature/not-pf-4051; then
@@ -2918,6 +2929,7 @@ SH
         HEAD_REF=feature/pf-4051-mastra-upstream-sync-2de367c9-r4 BASE_REF=main \
         PAPERSFLOW_PF4051_MERGE_COMMIT="$reviewed_head" \
         PAPERSFLOW_PF4051_FORK_PARENT="$fork_parent" \
+        PAPERSFLOW_PF4051_MAIN_PARENT="$trusted_main" \
         PAPERSFLOW_PF4051_UPSTREAM_PARENT="$upstream_parent" \
         PAPERSFLOW_PF4051_REVIEWED_TREE="$reviewed_tree" \
         PAPERSFLOW_PF4051_TRUSTED_MAIN="$trusted_main" \
