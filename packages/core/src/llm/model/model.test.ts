@@ -1,5 +1,6 @@
 import type { CoreMessage } from '@internal/ai-sdk-v4';
 import { MockLanguageModelV1 } from '@internal/ai-sdk-v4/test';
+import { jsonSchema as v6JsonSchema } from '@internal/ai-v6';
 import type { JSONSchema7 } from 'json-schema';
 import { describe, it, expect, vi } from 'vitest';
 import { z } from 'zod/v4';
@@ -78,6 +79,89 @@ describe('MastraLLM', () => {
     it('should initialize with both model and mastra', () => {
       expect(aisdkObject).toBeDefined();
     });
+  });
+
+  it.each(['generate', 'stream'] as const)('preserves native v6 tool validation for %s', async mode => {
+    const run = async (count: number) => {
+      const validationError = new Error('A positive count is required');
+      const validate = vi.fn((value: unknown) => {
+        const count = (value as { count?: unknown })?.count;
+        return typeof count === 'number' && count > 0
+          ? { success: true as const, value: { count: count * 2 } }
+          : { success: false as const, error: validationError };
+      });
+      const parameters = v6JsonSchema<{ count: number }>(
+        { type: 'object', properties: { count: { type: 'number' } }, required: ['count'] },
+        { validate },
+      );
+      const execute = vi.fn(async (input: { count: number }) => input);
+      const toolCall = {
+        toolCallType: 'function' as const,
+        toolCallId: 'count-call',
+        toolName: 'counter',
+        args: JSON.stringify({ count }),
+      };
+      const model = new MockLanguageModelV1({
+        doGenerate: async () => ({
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          finishReason: 'tool-calls' as const,
+          usage: { promptTokens: 1, completionTokens: 1 },
+          toolCalls: [toolCall],
+        }),
+        doStream: async () => ({
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          stream: new ReadableStream({
+            start(controller) {
+              controller.enqueue({ type: 'tool-call', ...toolCall });
+              controller.enqueue({
+                type: 'finish',
+                finishReason: 'tool-calls' as const,
+                usage: { promptTokens: 1, completionTokens: 1 },
+              });
+              controller.close();
+            },
+          }),
+        }),
+      });
+      const llm = new MastraLLMV1({ model });
+      const tools = { counter: { parameters, execute } };
+      const options = {
+        messages: [{ role: 'user' as const, content: 'count' }],
+        tools,
+        maxSteps: 1,
+        maxRetries: 0,
+        requestContext,
+        tracingContext,
+      } as any;
+
+      if (mode === 'generate') {
+        if (count > 0) {
+          await llm.__text(options);
+          expect(execute).toHaveBeenCalledWith({ count: count * 2 }, expect.anything());
+        } else {
+          await expect(llm.__text(options)).rejects.toThrow('A positive count is required');
+        }
+      } else {
+        const result = llm.__stream(options);
+        const chunks: unknown[] = [];
+        for await (const chunk of result.fullStream) chunks.push(chunk);
+        if (count > 0) expect(execute).toHaveBeenCalledWith({ count: count * 2 }, expect.anything());
+        else
+          expect(chunks).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({
+                type: 'error',
+                error: expect.objectContaining({ message: expect.stringContaining('A positive count is required') }),
+              }),
+            ]),
+          );
+      }
+      expect(validate).toHaveBeenCalledTimes(1);
+      if (count <= 0) expect(execute).not.toHaveBeenCalled();
+    };
+
+    await run(2);
+    await run(-1);
   });
 
   describe('generate', () => {
