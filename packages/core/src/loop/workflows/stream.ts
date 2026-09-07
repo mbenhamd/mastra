@@ -349,25 +349,31 @@ export function workflowLoopStream<Tools extends ToolSet = ToolSet, OUTPUT = und
           });
         }
 
-        try {
-          await agenticLoopWorkflow.deleteWorkflowRunById(runId);
-        } catch (error) {
-          rest.logger?.warn('Failed to delete agentic-loop snapshot after terminal state', { runId, error });
-        }
-        for (const executionRunId of executionRunIds) {
-          try {
-            await workflowsStore?.deleteWorkflowRunById({
-              runId: executionRunId,
-              workflowName: AGENTIC_EXECUTION_WORKFLOW_ID,
-            });
-          } catch (error) {
-            rest.logger?.warn('Failed to delete nested agent execution snapshot after terminal state', {
-              runId,
-              executionRunId,
-              error,
-            });
-          }
-        }
+        // The exact snapshot targets are independent, but every deletion must
+        // settle before terminal completion passes this cleanup barrier.
+        await Promise.all([
+          (async () => {
+            try {
+              await agenticLoopWorkflow.deleteWorkflowRunById(runId);
+            } catch (error) {
+              rest.logger?.warn('Failed to delete agentic-loop snapshot after terminal state', { runId, error });
+            }
+          })(),
+          ...Array.from(executionRunIds, async executionRunId => {
+            try {
+              await workflowsStore?.deleteWorkflowRunById({
+                runId: executionRunId,
+                workflowName: AGENTIC_EXECUTION_WORKFLOW_ID,
+              });
+            } catch (error) {
+              rest.logger?.warn('Failed to delete nested agent execution snapshot after terminal state', {
+                runId,
+                executionRunId,
+                error,
+              });
+            }
+          }),
+        ]);
       };
 
       // Keep the run-scoped registration alive only when the run suspends — a
