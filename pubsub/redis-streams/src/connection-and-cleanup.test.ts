@@ -3,9 +3,11 @@ import net from 'node:net';
 import type { Event, EventCallback } from '@mastra/core/events';
 import { createClient } from 'redis';
 import type { RedisClientType } from 'redis';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { getFreePort, REDIS_URL } from '../test-fixtures/harness';
 import { RedisStreamsPubSub } from './index';
+
+vi.mock('redis', { spy: true });
 
 function makeEvent(overrides: Partial<Omit<Event, 'id' | 'createdAt'>> = {}): Omit<Event, 'id' | 'createdAt'> {
   return {
@@ -194,6 +196,32 @@ describe('RedisStreamsPubSub connection resilience and topic cleanup', () => {
     }, 20_000);
 
     it('preserves a latest subscriber position when recovering after deletion', async () => {
+      const redis = await vi.importActual<typeof import('redis')>('redis');
+      const writer = redis.createClient({ url: REDIS_URL });
+      const reader = redis.createClient({ url: REDIS_URL });
+      let sawNoGroup!: () => void;
+      const noGroup = new Promise<void>(resolve => {
+        sawNoGroup = resolve;
+      });
+      const readGroup = reader.xReadGroup.bind(reader);
+      vi.spyOn(reader, 'xReadGroup').mockImplementation(async (...args) => {
+        try {
+          return await readGroup(...args);
+        } catch (err) {
+          if (err instanceof Error && err.message.includes('NOGROUP')) sawNoGroup();
+          throw err;
+        }
+      });
+      const del = writer.del.bind(writer);
+      vi.spyOn(writer, 'del').mockImplementationOnce(async (...args) => {
+        const result = await del(...args);
+        // Redis notifies the blocked reader independently of the DEL reply.
+        // Let the read loop handle that real NOGROUP before releasing DEL.
+        await noGroup;
+        await Promise.resolve();
+        return result;
+      });
+      vi.mocked(createClient).mockReturnValueOnce(writer).mockReturnValueOnce(reader);
       const ps = createPubSub();
       const topic = `clear-latest-${randomUUID()}`;
       const received: number[] = [];
@@ -207,12 +235,67 @@ describe('RedisStreamsPubSub connection resilience and topic cleanup', () => {
         { startFrom: 'latest' },
       );
 
+      const inspector = await createInspector();
+      // A recreated stream may generate an ID below the old checkpoint (for
+      // example, after a clock rollback). Force that ordering without sleeps.
+      await inspector.xSetId(`mastra:topic:${topic}`, `${Date.now() + 60_000}-0`);
       await ps.publish(topic, makeEvent({ data: { n: 1 } }));
       await expect.poll(() => received, { timeout: 5000 }).toEqual([1]);
 
       await ps.clearTopic(topic);
       await ps.publish(topic, makeEvent({ data: { n: 2 } }));
       await expect.poll(() => received, { timeout: 5000 }).toEqual([1, 2]);
+    }, 20_000);
+
+    it('preserves the recovery cursor when a pre-deletion read completes after cleanup', async () => {
+      const redis = await vi.importActual<typeof import('redis')>('redis');
+      const writer = redis.createClient({ url: REDIS_URL });
+      const reader = redis.createClient({ url: REDIS_URL });
+      let sawMessage!: () => void;
+      const messageRead = new Promise<void>(resolve => {
+        sawMessage = resolve;
+      });
+      let releaseMessage!: () => void;
+      const deliverMessage = new Promise<void>(resolve => {
+        releaseMessage = resolve;
+      });
+      const readGroup = reader.xReadGroup.bind(reader);
+      vi.spyOn(reader, 'xReadGroup').mockImplementation(async (...args) => {
+        const result = await readGroup(...args);
+        if (result?.some(stream => stream.messages.length > 0)) {
+          sawMessage();
+          await deliverMessage;
+        }
+        return result;
+      });
+      vi.mocked(createClient).mockReturnValueOnce(writer).mockReturnValueOnce(reader);
+      const ps = createPubSub();
+      const topic = `clear-pending-read-${randomUUID()}`;
+      const received: number[] = [];
+      try {
+        await ps.publish(topic, makeEvent({ data: { n: 0 } }));
+        await ps.subscribe(
+          topic,
+          (event, ack) => {
+            received.push((event.data as { n: number }).n);
+            void ack?.();
+          },
+          { startFrom: 'latest' },
+        );
+        const inspector = await createInspector();
+        await inspector.xSetId(`mastra:topic:${topic}`, `${Date.now() + 60_000}-0`);
+        await ps.publish(topic, makeEvent({ data: { n: 1 } }));
+        await messageRead;
+
+        // Keep the successful old-stream reply in flight until cleanup has
+        // reset the cursor and the replacement stream contains a lower ID.
+        await ps.clearTopic(topic);
+        await ps.publish(topic, makeEvent({ data: { n: 2 } }));
+        releaseMessage();
+        await expect.poll(() => received, { timeout: 5000 }).toEqual([1, 2]);
+      } finally {
+        releaseMessage();
+      }
     }, 20_000);
   });
 

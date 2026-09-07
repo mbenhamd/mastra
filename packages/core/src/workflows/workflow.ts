@@ -49,6 +49,7 @@ import {
 } from '../processors/span-payload';
 import { ProcessorStepOutputSchema, ProcessorStepInputSchema } from '../processors/step-schema';
 import type { ProcessorStepInput, ProcessorStepOutput } from '../processors/step-schema';
+import { MASTRA_AUTH_ORGANIZATION_KEY } from '../request-context';
 import { getRequestContextInputValues } from '../request-context/input-source';
 import { standardSchemaToJSONSchema, toStandardSchema } from '../schema';
 import type { InferPublicSchema, InferStandardSchemaOutput, PublicSchema, StandardSchemaWithJSON } from '../schema';
@@ -5389,7 +5390,7 @@ export class Run<
     const requestContextToUse = params.requestContext ?? new RequestContext();
 
     Object.entries(snapshot?.requestContext ?? {}).forEach(([key, value]) => {
-      if (!(requestContextToUse as RequestContext).has(key)) {
+      if (key !== MASTRA_AUTH_ORGANIZATION_KEY && !(requestContextToUse as RequestContext).has(key)) {
         (requestContextToUse as RequestContext).set(key, value);
       }
     });
@@ -5619,7 +5620,7 @@ export class Run<
 
     const requestContextToUse = requestContext ?? new RequestContext();
     for (const [key, value] of Object.entries(snapshot.requestContext ?? {})) {
-      if (!(requestContextToUse as RequestContext).has(key)) {
+      if (key !== MASTRA_AUTH_ORGANIZATION_KEY && !(requestContextToUse as RequestContext).has(key)) {
         (requestContextToUse as RequestContext).set(key, value);
       }
     }
@@ -5777,7 +5778,7 @@ export class Run<
 
     const requestContextToUse = requestContext ?? new RequestContext();
     for (const [key, value] of Object.entries(snapshot.requestContext ?? {})) {
-      if (!(requestContextToUse as RequestContext).has(key)) {
+      if (key !== MASTRA_AUTH_ORGANIZATION_KEY && !(requestContextToUse as RequestContext).has(key)) {
         (requestContextToUse as RequestContext).set(key, value);
       }
     }

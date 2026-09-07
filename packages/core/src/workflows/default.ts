@@ -7,7 +7,7 @@ import { getErrorFromUnknown } from '../error/utils.js';
 import type { PubSub } from '../events/pubsub';
 import type { ObservabilityContext, Span, SpanType, TracingPolicy } from '../observability';
 import { createObservabilityContext, resolveExportedSpanId } from '../observability';
-import { MASTRA_AUTH_TOKEN_KEY } from '../request-context';
+import { MASTRA_AUTH_ORGANIZATION_KEY, MASTRA_AUTH_TOKEN_KEY } from '../request-context';
 import type { PersistWorkflowStepUpdateResult } from '../storage/types';
 import { deepEqual } from '../utils/deep-equal';
 import type { ExecutionGraph } from './execution-engine';
@@ -737,9 +737,9 @@ export class DefaultExecutionEngine extends ExecutionEngine {
         obj[key] = value;
       });
     }
-    // Never persist the framework-managed bearer token in durable snapshots.
-    // A resumed authenticated request supplies its own fresh live token.
+    // Authentication belongs to the live request, not a durable snapshot.
     delete obj[MASTRA_AUTH_TOKEN_KEY];
+    delete obj[MASTRA_AUTH_ORGANIZATION_KEY];
     return obj;
   }
 

@@ -355,7 +355,7 @@ describe('PostgresStore pinned init drain', () => {
     expect(connect).toHaveBeenCalledOnce();
     expect(checkouts[0]?.queries).toHaveLength(5);
     expect(checkouts[0]?.queries.filter(sql => sql.includes('pg_catalog.pg_tables'))).toHaveLength(1);
-    expect(checkouts[0]?.queries.filter(sql => sql.includes('pg_catalog.pg_attribute'))).toHaveLength(1);
+    expect(checkouts[0]?.queries.filter(sql => sql.includes('pg_catalog.pg_attribute a ON'))).toHaveLength(1);
     expect(checkouts[0]?.queries.filter(sql => sql.includes('pg_catalog.pg_index'))).toHaveLength(1);
     expect(checkouts[0]?.queries.slice(-2)).toEqual(['DOMAIN_ONE', 'DOMAIN_TWO']);
     expect(checkouts[0]?.release).toHaveBeenCalledOnce();

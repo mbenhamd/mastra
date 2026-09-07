@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { EventEmitterPubSub } from '../../../events/event-emitter';
 import { Mastra } from '../../../mastra';
+import { createEmptyWorkflowSnapshot } from '../../../storage/workflow-snapshot';
 import { emitStepResultEvents } from '../../handlers/step';
 import { WorkflowEventProcessor } from '.';
 
@@ -41,6 +42,18 @@ describe('workflow bail lifecycle projection', () => {
   it('closes an evented-engine bailed step before successful workflow completion', async () => {
     const pubsub = new EventEmitterPubSub();
     const mastra = new Mastra({ logger: false, pubsub, workflows: {} as any });
+    const workflowsStore = (await mastra.getStorage()!.getStore('workflows'))!;
+    // EventedRun persists this active lineage before dispatching a step.
+    await workflowsStore.persistWorkflowSnapshot({
+      workflowName: 'workflow',
+      runId: 'evented-bail-run',
+      snapshot: {
+        ...createEmptyWorkflowSnapshot('evented-bail-run'),
+        status: 'running',
+        executionGeneration: 'evented-bail-generation',
+        lifecycleResumeAttempt: 0,
+      },
+    });
     const published: any[] = [];
     vi.spyOn(pubsub, 'publish').mockImplementation(async (_topic, event) => {
       published.push(event);

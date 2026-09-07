@@ -112,12 +112,12 @@ export class MastraLLMV1 extends MastraBase {
     }
 
     // "Type instantiation is excessively deep" error from complex ZodSchema generic inference
-    const compatibleSchema = applyCompatLayer({
+    const processedSchema = applyCompatLayer({
       schema: schema as any,
       compatLayers: schemaCompatLayers,
       mode: 'aiSdkSchema',
     });
-    return jsonSchema(compatibleSchema.jsonSchema, { validate: compatibleSchema.validate });
+    return jsonSchema(processedSchema.jsonSchema, { validate: processedSchema.validate });
   }
 
   async __text<Tools extends ToolSet, Z extends ZodSchema | JSONSchema7 | undefined>({

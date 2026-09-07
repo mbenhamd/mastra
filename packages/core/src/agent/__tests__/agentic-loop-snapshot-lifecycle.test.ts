@@ -9,23 +9,28 @@
  */
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
+import { createScorer } from '../../evals';
+import * as executionWorkflows from '../../loop/workflows/agentic-execution';
+import { createGoalStep } from '../../loop/workflows/agentic-execution/goal-step';
+import { createIsTaskCompleteStep } from '../../loop/workflows/agentic-execution/is-task-complete-step';
 import { Mastra } from '../../mastra';
 import { InMemoryStore } from '../../storage';
 import { createTool } from '../../tools';
 import type { WorkflowRunState } from '../../workflows';
 import { Agent } from '../agent';
+import type { IsTaskCompleteConfig } from '../agent.types';
 import { convertArrayToReadableStream, MockLanguageModelV2 } from './mock-model';
 
 const mockFindUser = vi.fn().mockImplementation(async (data: { name: string }) => {
   return { name: data.name, email: 'dero@mail.com' };
 });
 
-function createFindUserTool() {
+function createFindUserTool(requireApproval = true) {
   return createTool({
     id: 'Find user tool',
     description: 'Returns the name and email of a user',
     inputSchema: z.object({ name: z.string() }),
-    requireApproval: true,
+    requireApproval,
     execute: async input => {
       return mockFindUser(input);
     },
@@ -150,7 +155,17 @@ describe.each([
     // snapshot without relying on this in-memory state.
     expect(mastra.__getRunScope(stream.runId)).toBeDefined();
 
-    const resumeStream = await agent.approveToolCall({ runId: stream.runId, toolCallId });
+    const score = vi.fn(() => 1);
+    const scorer = createScorer({
+      id: 'resume-completion-scorer',
+      name: 'Resume completion scorer',
+      description: 'Accepts the completed user lookup after approval.',
+    }).generateScore(score);
+    const resumeStream = await agent.approveToolCall({
+      runId: stream.runId,
+      toolCallId,
+      isTaskComplete: { scorers: [scorer] },
+    });
     for await (const _chunk of resumeStream.fullStream) {
       // consume
     }
@@ -159,6 +174,8 @@ describe.each([
     // "suspended" agentic-loop row nor the nested executionWorkflow row.
     const afterResume = (await workflowsStore.listWorkflowRuns({})).runs;
     expect(afterResume).toHaveLength(0);
+    expect(await resumeStream.text).toBe('User found');
+    expect(score).toHaveBeenCalledTimes(1);
     // And the per-run scope is released — proving the refcounted register/
     // unregister pair fires correctly across suspend → resume → terminal.
     expect(mastra.__getRunScope(stream.runId)).toBeUndefined();
@@ -290,10 +307,20 @@ describe.each([
       storage: new InMemoryStore(),
     });
     const workflowsStore = (await mastra.getStorage()!.getStore('workflows'))!;
+    const loadSnapshot = vi.spyOn(workflowsStore, 'loadWorkflowSnapshot');
 
     const stream = await agent.stream('hi');
     for await (const _chunk of stream.fullStream) {
       // consume
+    }
+    const snapshotReads = loadSnapshot.mock.calls.length;
+    loadSnapshot.mockRestore();
+
+    expect(await stream.text).toBe('hello');
+    if (!evented) {
+      // The two absent capabilities must not each add a pair of authoritative
+      // snapshot reads to this ordinary single-response execution.
+      expect(snapshotReads).toBe(19);
     }
 
     // Previously the nested executionWorkflow row leaked as a permanent
@@ -303,6 +330,103 @@ describe.each([
     // No suspend, terminal success — scope must be released by the finally
     // block in workflowLoopStream (keepRegisteredForResume = false).
     expect(mastra.__getRunScope(stream.runId)).toBeUndefined();
+  }, 30000);
+
+  it('keeps supplied completion configuration active when scorers are added between iterations', async () => {
+    const score = vi.fn(() => 1);
+    const scorer = createScorer({
+      id: 'completion-scorer',
+      name: 'Completion scorer',
+      description: 'Accepts the completed user lookup.',
+    }).generateScore(score);
+    const isTaskComplete: IsTaskCompleteConfig = { scorers: [] };
+    const agent = new Agent({
+      id: 'scored-agent',
+      name: 'Scored Agent',
+      instructions: 'You find users.',
+      model: createMockModel(),
+      tools: { findUserTool: createFindUserTool(false) },
+    });
+    const mastra = new Mastra({ agents: { agent }, logger: false, storage: new InMemoryStore() });
+    const workflowsStore = (await mastra.getStorage()!.getStore('workflows'))!;
+    const toolCallsBefore = mockFindUser.mock.calls.length;
+    const stream = await agent.stream('Find the user with name - Dero Israel', {
+      isTaskComplete,
+      onIterationComplete: ({ iteration }) => {
+        if (iteration === 1) isTaskComplete.scorers!.push(scorer);
+      },
+    });
+    const completionResults: Array<{ iteration: number; passed: boolean }> = [];
+    for await (const chunk of stream.fullStream) {
+      if (chunk.type === 'is-task-complete') {
+        completionResults.push({ iteration: chunk.payload.iteration, passed: chunk.payload.passed });
+      }
+    }
+
+    expect(await stream.text).toBe('User found');
+    expect(mockFindUser.mock.calls.length - toolCallsBefore).toBe(1);
+    expect(score).toHaveBeenCalledTimes(1);
+    expect(completionResults).toEqual([{ iteration: 2, passed: true }]);
+    expect((await workflowsStore.listWorkflowRuns({})).runs).toHaveLength(0);
+  }, 30000);
+
+  it('resumes a previous eight-entry approval snapshot with the current engine graph', async () => {
+    const createExecutionWorkflow = executionWorkflows.createAgenticExecutionWorkflow;
+    const graphSizes: number[] = [];
+    const buildWorkflow = vi.spyOn(executionWorkflows, 'createAgenticExecutionWorkflow').mockImplementation(params => {
+      const workflow = createExecutionWorkflow(params);
+      if (graphSizes.length === 0) {
+        // Recreate the previous native graph for the initial suspended run.
+        // Resume uses the real current factory with no topology modification.
+        if (!workflow.steps.isTaskCompleteStep) workflow.then(createIsTaskCompleteStep(params));
+        if (!workflow.steps.goalStep) workflow.then(createGoalStep(params));
+        workflow.commit();
+      }
+      graphSizes.push(workflow.stepGraph.length);
+      return workflow;
+    });
+
+    try {
+      const model = createMockModel();
+      const modelStream = vi.spyOn(model, 'doStream');
+      const agent = new Agent({
+        id: 'previous-graph-agent',
+        name: 'Previous Graph Agent',
+        instructions: 'You find users.',
+        model,
+        tools: { findUserTool: createFindUserTool() },
+      });
+      const mastra = new Mastra({ agents: { agent }, logger: false, storage: new InMemoryStore() });
+      const workflowsStore = (await mastra.getStorage()!.getStore('workflows'))!;
+      const toolCallsBefore = mockFindUser.mock.calls.length;
+      const stream = await agent.stream('Find the user with name - Dero Israel');
+      let toolCallId = '';
+      for await (const chunk of stream.fullStream) {
+        if (chunk.type === 'tool-call-approval') toolCallId = chunk.payload.toolCallId;
+      }
+      expect(toolCallId).toBeTruthy();
+      const suspendedRun = (await workflowsStore.listWorkflowRuns({})).runs.find(
+        row => row.workflowName === 'executionWorkflow',
+      )!;
+      const snapshot =
+        typeof suspendedRun.snapshot === 'string' ? JSON.parse(suspendedRun.snapshot) : suspendedRun.snapshot;
+      expect(snapshot.serializedStepGraph).toHaveLength(8);
+      expect(snapshot.suspendedPaths.toolCallStep[0]).toBe(2);
+
+      const resumed = await agent.approveToolCall({ runId: stream.runId, toolCallId });
+      for await (const _chunk of resumed.fullStream) {
+        // consume
+      }
+
+      expect(await resumed.text).toBe('User found');
+      expect(modelStream).toHaveBeenCalledTimes(2);
+      expect(mockFindUser.mock.calls.length - toolCallsBefore).toBe(1);
+      expect((await workflowsStore.listWorkflowRuns({})).runs).toHaveLength(0);
+      expect(mastra.__getRunScope(stream.runId)).toBeUndefined();
+      expect(graphSizes).toEqual([8, evented ? 8 : 6]);
+    } finally {
+      buildWorkflow.mockRestore();
+    }
   }, 30000);
 
   it('deletes all snapshot rows after a declined tool call completes the run', async () => {

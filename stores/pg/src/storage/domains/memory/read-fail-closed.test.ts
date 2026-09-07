@@ -415,13 +415,13 @@ describe('MemoryPG list read failures', () => {
     expect(byId.messages).toHaveLength(1);
 
     const byThread = await new MemoryPG({
-      client: new ReadDbClient({ oneResults: [{ count: '1' }], manyResults: [[messageRow]] }),
+      client: new ReadDbClient({ manyResults: [[{ ...messageRow, __total: '1' }]] }),
     }).listMessages({ threadId: 'thread-1' });
     expect(byThread.messages).toHaveLength(1);
     expect(byThread.total).toBe(1);
 
     const byResource = await new MemoryPG({
-      client: new ReadDbClient({ oneResults: [{ count: '1' }], manyResults: [[messageRow]] }),
+      client: new ReadDbClient({ manyResults: [[{ ...messageRow, __total: '1' }]] }),
     }).listMessagesByResourceId({ resourceId: 'resource-1' });
     expect(byResource.messages).toHaveLength(1);
     expect(byResource.total).toBe(1);

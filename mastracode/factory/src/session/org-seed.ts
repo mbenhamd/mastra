@@ -15,6 +15,9 @@
  * why the unresolved case needs its own explicit marker.
  */
 
+import { MASTRA_AUTH_ORGANIZATION_KEY } from '@mastra/core/request-context';
+import { getFactoryAuthUserFromContext } from '../auth.js';
+
 /**
  * Session-state fields org seeding writes. The index signatures mirror
  * `MastraCodeState` so a concrete `Session.state.set(Partial<MastraCodeState>)`
@@ -47,6 +50,9 @@ export interface OrgBearingRequestContext {
 /** Read the tenant org off a request context's `user` key, if there is one. */
 export function readRequestContextOrgId(requestContext: OrgBearingRequestContext | undefined): string | undefined {
   if (!requestContext) return undefined;
+  if (requestContext.get(MASTRA_AUTH_ORGANIZATION_KEY) !== undefined) {
+    return getFactoryAuthUserFromContext(requestContext)?.organizationId;
+  }
   const user = requestContext.get('user');
   if (!user || typeof user !== 'object') return undefined;
   const orgId = (user as { organizationId?: unknown }).organizationId;

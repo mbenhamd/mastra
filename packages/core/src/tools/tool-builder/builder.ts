@@ -1196,9 +1196,7 @@ export class CoreToolBuilder extends MastraBase {
           compatLayers: schemaCompatLayers,
           mode: 'aiSdkSchema',
         });
-        processedInputSchema = jsonSchema(compatSchema.jsonSchema, {
-          validate: compatSchema.validate,
-        });
+        processedInputSchema = jsonSchema(compatSchema.jsonSchema, { validate: compatSchema.validate });
       }
     }
 

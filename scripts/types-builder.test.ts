@@ -49,13 +49,16 @@ async function createFixture() {
     [
       "import type { FileSentinel } from './collision';",
       "import type { FileSentinel as ExplicitFileSentinel } from './collision.js';",
+      "import type { DirectorySentinel } from './directory';",
       "import type { ESM_SENTINEL } from '@fixture/bundle/esm';",
       "import type { CJS_SENTINEL } from '@fixture/bundle/cjs';",
-      'export type Result = FileSentinel & ExplicitFileSentinel & ESM_SENTINEL & CJS_SENTINEL;',
+      "import type { JS_SENTINEL } from '@fixture/bundle/js';",
+      'export type Result = FileSentinel & ExplicitFileSentinel & DirectorySentinel & ESM_SENTINEL & CJS_SENTINEL & JS_SENTINEL;',
     ].join('\n'),
   );
   await writeFixtureFile(root, 'src/collision.ts', 'export type FileSentinel = { source: "file" };\n');
   await writeFixtureFile(root, 'src/collision/index.ts', 'export type FileSentinel = { source: "directory" };\n');
+  await writeFixtureFile(root, 'src/directory/index.ts', 'export type DirectorySentinel = { directory: "index" };\n');
 
   const bundleRoot = join(root, 'node_modules/@fixture/bundle');
   await writeFixtureFile(
@@ -69,11 +72,15 @@ async function createFixture() {
         '.': { types: './dist/esm.mjs', import: './dist/esm.mjs', require: './dist/cjs.cjs' },
         './esm': { types: './dist/esm.mjs', import: './dist/esm.mjs', require: './dist/esm.cjs' },
         './cjs': { types: './dist/cjs.cjs', import: './dist/cjs.mjs', require: './dist/cjs.cjs' },
+        './js': { types: './dist/script.js', import: './dist/script.js' },
       },
     }),
   );
   await writeFixtureFile(bundleRoot, 'dist/esm.mjs', '');
   await writeFixtureFile(bundleRoot, 'dist/cjs.cjs', '');
+  await writeFixtureFile(bundleRoot, 'dist/script.js', '');
+  await writeFixtureFile(bundleRoot, 'dist/script.d.ts', 'export type JS_SENTINEL = { js: "ts" };\n');
+  await writeFixtureFile(bundleRoot, 'dist/script.d.cts', 'export type JS_SENTINEL = { js: "wrong-cts" };\n');
   await writeFixtureFile(
     bundleRoot,
     'dist/esm.d.mts',
@@ -112,8 +119,10 @@ describe('types-builder declaration resolution', () => {
     expect(generated).toContain("from './collision.js'");
     expect(generated.match(/from '\.\/collision\.js'/g)).toHaveLength(2);
     expect(generated).not.toContain("from './collision/index.js'");
+    expect(generated).toContain("from './directory/index.js'");
     expect(generated).toContain('_types/@fixture_bundle/dist/esm.d.mts');
     expect(generated).toContain('_types/@fixture_bundle/dist/cjs.d.cts');
+    expect(generated).toContain('_types/@fixture_bundle/dist/script.d.ts');
     await expect(readFile(join(root, 'dist/_types/@fixture_bundle/dist/esm.d.mts'), 'utf8')).resolves.toContain(
       './leaf.mjs',
     );
@@ -127,7 +136,7 @@ describe('types-builder declaration resolution', () => {
       'consumer.ts',
       [
         "import type { Result } from './dist/index.js';",
-        'const result: Result = { source: "file", esm: "mts", cjs: "cts" };',
+        'const result: Result = { source: "file", directory: "index", esm: "mts", cjs: "cts", js: "ts" };',
         'void result;',
       ].join('\n'),
     );

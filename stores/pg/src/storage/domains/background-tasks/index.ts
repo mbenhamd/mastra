@@ -92,8 +92,8 @@ export class BackgroundTasksPG extends BackgroundTasksStorage {
 
   constructor(config: PgDomainConfig) {
     super();
-    const { client, schemaName, skipDefaultIndexes, indexes } = resolvePgConfig(config);
-    this.#db = new PgDB({ client, schemaName, skipDefaultIndexes });
+    const { client, readClient, schemaName, skipDefaultIndexes, indexes } = resolvePgConfig(config);
+    this.#db = new PgDB({ client, readClient, schemaName, skipDefaultIndexes });
     this.#schema = schemaName || 'public';
     this.#skipDefaultIndexes = skipDefaultIndexes;
     this.#indexes = indexes?.filter(idx => (BackgroundTasksPG.MANAGED_TABLES as readonly string[]).includes(idx.table));
@@ -381,7 +381,8 @@ export class BackgroundTasksPG extends BackgroundTasksStorage {
 
     const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
 
-    // Count total matching rows (before pagination)
+    // Recovery and queue draining consume this list, so both queries must see
+    // current writer state rather than omit work behind a lagging replica.
     const countResult = await this.#db.client.oneOrNone<{ count: string }>(
       `SELECT COUNT(*) as count FROM ${table} ${where}`,
       params.slice(0, paramIdx - 1),
@@ -459,6 +460,7 @@ export class BackgroundTasksPG extends BackgroundTasksStorage {
 
   async getRunningCount(): Promise<number> {
     const table = getTableName(getSchemaName(this.#schema));
+    // Admission limits must include tasks already running on the writer.
     const result = await this.#db.client.oneOrNone<{ count: string }>(
       `SELECT COUNT(*) FROM ${table} WHERE "status" = 'running'`,
     );

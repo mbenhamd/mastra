@@ -16150,7 +16150,9 @@ export class Session {
 
   /** Same as `_completeQueuedTurn` but rejects the resolver with `err`. */
   private async _failQueuedTurn(itemId: string, err: unknown): Promise<void> {
-    if (this.isClosed) {
+    // Eviction rejects local waiters and leaves durable queued work for its next
+    // owner. Failure cleanup must not write through the lost lease.
+    if (this.isClosed || this._state === 'evicted') {
       const resolver = this._queueResolvers.get(itemId);
       if (resolver) {
         this._queueResolvers.delete(itemId);
@@ -16160,34 +16162,45 @@ export class Session {
     }
     const now = Date.now();
     let completedResult: AgentResult | undefined;
-    await this._flushUpdate(prev => {
-      const receipt = prev.queueAdmissionReceipts?.[itemId];
-      if (receipt?.status === 'completed') {
-        completedResult = receipt.result as AgentResult | undefined;
+    try {
+      await this._flushUpdate(prev => {
+        const receipt = prev.queueAdmissionReceipts?.[itemId];
+        if (receipt?.status === 'completed') {
+          completedResult = receipt.result as AgentResult | undefined;
+          return {
+            ...prev,
+            pendingQueue: (prev.pendingQueue ?? []).filter(x => x.id !== itemId),
+          };
+        }
         return {
           ...prev,
           pendingQueue: (prev.pendingQueue ?? []).filter(x => x.id !== itemId),
-        };
-      }
-      return {
-        ...prev,
-        pendingQueue: (prev.pendingQueue ?? []).filter(x => x.id !== itemId),
-        ...(receipt
-          ? {
-              queueAdmissionReceipts: {
-                ...(prev.queueAdmissionReceipts ?? {}),
-                [itemId]: {
-                  ...receipt,
-                  status: 'failed',
-                  error: projectHarnessPublicError(err),
-                  failedAt: receipt.failedAt ?? now,
-                  updatedAt: now,
+          ...(receipt
+            ? {
+                queueAdmissionReceipts: {
+                  ...(prev.queueAdmissionReceipts ?? {}),
+                  [itemId]: {
+                    ...receipt,
+                    status: 'failed',
+                    error: projectHarnessPublicError(err),
+                    failedAt: receipt.failedAt ?? now,
+                    updatedAt: now,
+                  },
                 },
-              },
-            }
-          : {}),
-      };
-    });
+              }
+            : {}),
+        };
+      });
+    } catch (flushError) {
+      // The cleanup write may itself discover lease loss and evict this handle.
+      if (
+        this.lifecycleState === 'evicted' &&
+        (flushError instanceof HarnessSessionLockedError || flushError instanceof HarnessSessionClosedError)
+      ) {
+        return;
+      }
+      throw flushError;
+    }
     this._currentQueuedItemId = undefined;
     this._currentQueuedItemSource = undefined;
     // §10.2 OperationEvent — a late failure may race a completion that already

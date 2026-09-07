@@ -607,8 +607,10 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
               // here and settled once the attempt survives `step-finish` (or at
               // stream end, whichever comes first). Without processors no retry is
               // possible, so resolve immediately and keep the existing timing.
+              // Runner allocation is phase-specific; output-step processors can
+              // reject the attempt even when this wrapper has no runner.
               // Only resolve if not already rejected by validation error
-              if (!self.processorRunner && self.#delayedPromises.object.status.type === 'pending') {
+              if (!self.#options.outputProcessors?.length && self.#delayedPromises.object.status.type === 'pending') {
                 self.#delayedPromises.object.resolve(chunk.object);
               }
               break;
