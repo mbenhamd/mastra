@@ -395,7 +395,12 @@ describe('WorkflowEventProcessor terminal recovery evidence', () => {
       await workflows.persistWorkflowSnapshot({
         workflowName: 'child',
         runId,
-        snapshot: { ...createEmptyWorkflowSnapshot(runId), status: 'running' },
+        snapshot: {
+          ...createEmptyWorkflowSnapshot(runId),
+          status: 'running',
+          executionGeneration: `test-generation:child:${runId}`,
+          lifecycleResumeAttempt: 0,
+        },
       });
       const args = terminalArgs(runId, status, finalState);
 
