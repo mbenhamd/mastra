@@ -157,15 +157,15 @@ verify_pf3553_reviewed_surface() (
 
 pf4051_config() {
   PF4051_HEAD_REPOSITORY="${PAPERSFLOW_PF4051_HEAD_REPOSITORY:-mbenhamd/mastra}"
-  PF4051_HEAD_REF="${PAPERSFLOW_PF4051_HEAD_REF:-feature/pf-4051-mastra-upstream-sync-c773a9ba}"
+  PF4051_HEAD_REF="${PAPERSFLOW_PF4051_HEAD_REF:-feature/pf-4051-mastra-upstream-sync-c773a9ba-r2}"
   PF4051_BASE_REF="${PAPERSFLOW_PF4051_BASE_REF:-main}"
   PF4051_PENDING_MERGE_COMMIT='PENDING_PF4051_MERGE_COMMIT'
   PF4051_PENDING_REVIEWED_TREE='PENDING_PF4051_REVIEWED_TREE'
-  PF4051_MERGE_COMMIT="${PAPERSFLOW_PF4051_MERGE_COMMIT:-81330a30212c702f586627c7d28a94bbddf5b7a0}"
-  PF4051_FORK_PARENT="${PAPERSFLOW_PF4051_FORK_PARENT:-6171c7c35695c312bd9b71a74e6ff27c195218b8}"
+  PF4051_MERGE_COMMIT="${PAPERSFLOW_PF4051_MERGE_COMMIT:-8937eaa5263c9ac0a8615db2efed2045bbf0145d}"
+  PF4051_FORK_PARENT="${PAPERSFLOW_PF4051_FORK_PARENT:-0769ef2c773d11244c88739cad27da0189e4e89a}"
   PF4051_UPSTREAM_PARENT="${PAPERSFLOW_PF4051_UPSTREAM_PARENT:-c773a9ba601047606dcd81c961ffc5ebb8ef07a0}"
-  PF4051_REVIEWED_TREE="${PAPERSFLOW_PF4051_REVIEWED_TREE:-0cde3f1e8b38d9c4c8d648e8b9c42ad7ec523b1e}"
-  PF4051_TRUSTED_MAIN="${PAPERSFLOW_PF4051_TRUSTED_MAIN:-09ee6fd3598a042e6e2ed2ed2ca295a79c3d42c3}"
+  PF4051_REVIEWED_TREE="${PAPERSFLOW_PF4051_REVIEWED_TREE:-44cc9f9293a7a3611293f713268ec60d1764ff4e}"
+  PF4051_TRUSTED_MAIN="${PAPERSFLOW_PF4051_TRUSTED_MAIN:-44c71b236991ac05778e27b7634321be8779ca75}"
   readonly \
     PF4051_TRUSTED_MAIN \
     PF4051_HEAD_REPOSITORY PF4051_HEAD_REF PF4051_BASE_REF PF4051_MERGE_COMMIT \
@@ -2797,7 +2797,7 @@ EOF
         GITHUB_OUTPUT= \
         BASE_SHA="$protected_base" HEAD_SHA="$fixture_head" PR_NUMBER=999 \
         HEAD_REPOSITORY=mbenhamd/mastra \
-        HEAD_REF=feature/pf-4051-mastra-upstream-sync-c773a9ba \
+        HEAD_REF=feature/pf-4051-mastra-upstream-sync-c773a9ba-r2 \
         BASE_REF=main \
         PAPERSFLOW_PF4051_MERGE_COMMIT="$reviewed_head" \
         PAPERSFLOW_PF4051_FORK_PARENT="$fork_parent" \
@@ -2915,7 +2915,7 @@ SH
         POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=32791 \
         BASE_SHA="$protected_base" HEAD_SHA="$reviewed_head" \
         HEAD_REPOSITORY=mbenhamd/mastra \
-        HEAD_REF=feature/pf-4051-mastra-upstream-sync-c773a9ba BASE_REF=main \
+        HEAD_REF=feature/pf-4051-mastra-upstream-sync-c773a9ba-r2 BASE_REF=main \
         PAPERSFLOW_PF4051_MERGE_COMMIT="$reviewed_head" \
         PAPERSFLOW_PF4051_FORK_PARENT="$fork_parent" \
         PAPERSFLOW_PF4051_UPSTREAM_PARENT="$upstream_parent" \
@@ -2936,6 +2936,15 @@ SH
   grep -Fq -- 'src/agent/durable/step-start-chunk-shape.test.ts' "$command_log"
   grep -Fq -- 'src/agent/agent-processor.test.ts' "$command_log"
   grep -Fq -- 'src/processors/runner.test.ts' "$command_log"
+  grep -Fq -- 'src/workflows/default.test.ts' "$command_log"
+  grep -Fq -- 'src/loop/test-utils/aimock/scenarios/optional-agent-stages.scenario.test.ts' "$command_log"
+  grep -Fq -- 'src/loop/test-utils/aimock/scenarios/optional-stages-approval.scenario.test.ts' "$command_log"
+  grep -Fq -- 'src/loop/test-utils/aimock/scenarios/optional-stages-cancellation.scenario.test.ts' "$command_log"
+  grep -Fq -- 'src/loop/test-utils/aimock/scenarios/optional-stages-mutable.scenario.test.ts' "$command_log"
+  grep -Fxq -- '--dir server-adapters/hono exec vitest run --reporter=dot src/__tests__/hono-adapter.test.ts -t should strip mastra__resourceId|should strip reserved keys' "$command_log"
+  grep -Fxq -- 'run test:mastracode' "$command_log"
+  grep -Fq -- 'src/auth-seam.test.ts' "$command_log"
+  grep -Fq -- 'src/session/org-seed-fail-open.test.ts src/session/memory-settings-hydration.test.ts' "$command_log"
   grep -Fq -- 'src/server/handlers/a2a-memory.test.ts' "$command_log"
   grep -Fq -- 'TranscriptSender.msw.test.tsx' "$command_log"
   grep -Fq -- 'experiment-item-route.msw.test.tsx' "$command_log"
@@ -9190,10 +9199,15 @@ run_pf4051_upstream_sync_validation() {
   run_with_validation_budget 600 \
     pnpm --dir packages/core exec vitest run --reporter=dot \
       src/storage/workflow-snapshot.test.ts \
+      src/workflows/default.test.ts \
       src/workflows/dynamic/validate/index.test.ts \
       src/mastra/add-dynamic-workflows-bundle.test.ts \
       src/workflows/scheduler/definition-hash.test.ts \
       src/loop/workflows/prune-snapshot.test.ts \
+      src/loop/test-utils/aimock/scenarios/optional-agent-stages.scenario.test.ts \
+      src/loop/test-utils/aimock/scenarios/optional-stages-approval.scenario.test.ts \
+      src/loop/test-utils/aimock/scenarios/optional-stages-cancellation.scenario.test.ts \
+      src/loop/test-utils/aimock/scenarios/optional-stages-mutable.scenario.test.ts \
       src/loop/test-utils/aimock/scenarios/evented-sequential-approval.scenario.test.ts
   run_with_validation_budget 600 \
     pnpm --dir stores/convex exec vitest run --reporter=dot src/server/storage.test.ts
@@ -9263,6 +9277,10 @@ run_pf4051_upstream_sync_validation() {
       src/server/a2a/tasks.test.ts src/server/handlers/a2a-memory.test.ts \
       src/server/handlers/a2a.test.ts src/server/server-adapter/api-schema-manifest.test.ts
   run_with_validation_budget 600 \
+    pnpm --dir server-adapters/hono exec vitest run --reporter=dot \
+      src/__tests__/hono-adapter.test.ts \
+      -t 'should strip mastra__resourceId|should strip reserved keys'
+  run_with_validation_budget 600 \
     pnpm --dir packages/rag exec vitest run --reporter=dot src/document/transformers/character.test.ts
   run_with_validation_budget 600 \
     pnpm --dir packages/playground-ui exec vitest run --reporter=dot \
@@ -9287,8 +9305,9 @@ run_pf4051_upstream_sync_validation() {
       src/ui/domains/workspaces/services/__tests__/sessionFilters.test.ts
   run_with_validation_budget 900 \
     pnpm --dir mastracode/factory exec vitest run --reporter=dot \
-      src/auth.test.ts src/boards/registry.test.ts src/boards/transition-policy.test.ts \
+      src/auth.test.ts src/auth-seam.test.ts src/boards/registry.test.ts src/boards/transition-policy.test.ts \
       src/factory.test.ts src/workspace.test.ts src/routes/work-items.test.ts \
+      src/session/org-seed-fail-open.test.ts src/session/memory-settings-hydration.test.ts \
       src/integrations/github/default-rules.test.ts src/integrations/github/integration.test.ts \
       src/integrations/github/rules.test.ts src/integrations/issue-reconciler.test.ts \
       src/integrations/linear/default-rules.test.ts src/integrations/linear/integration.test.ts \
