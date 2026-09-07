@@ -202,8 +202,10 @@ describe('workflowLoopStream', () => {
     });
 
     const chunks: ChunkType[] = [];
+    let ended = false;
     const consume = (async () => {
       for await (const chunk of stream) chunks.push(chunk);
+      ended = true;
     })();
     try {
       await vi.waitFor(() => expect(lookupSpy).toHaveBeenCalledOnce());
@@ -217,15 +219,21 @@ describe('workflowLoopStream', () => {
         [{ workflowName: 'executionWorkflow', runId: nestedRunId }],
       ]);
       expect(chunks.some(chunk => chunk.type === 'finish')).toBe(false);
+      expect(ended).toBe(false);
       childDeletions.resolve();
       await vi.waitFor(async () => {
         expect(await getRun({ workflowName: 'executionWorkflow', runId: nestedRunId })).toBeNull();
       });
       expect(chunks.some(chunk => chunk.type === 'finish')).toBe(false);
+      expect(ended).toBe(false);
       parentDeletion.resolve();
       await consume;
       expect(chunks.filter(chunk => chunk.type === 'finish')).toHaveLength(1);
       expect(chunks.some(chunk => chunk.type === 'error')).toBe(false);
+      expect(ended).toBe(true);
+      expect(lookupSpy).toHaveBeenCalledExactlyOnceWith({ runId, workflowName: 'agentic-loop' });
+      expect(deleteAgenticLoopRun).toHaveBeenCalledExactlyOnceWith(runId);
+      expect(deleteWorkflowRunById).toHaveBeenCalledTimes(2);
     } finally {
       lookup.resolve();
       parentDeletion.resolve();
@@ -275,8 +283,10 @@ describe('workflowLoopStream', () => {
       methodType: 'stream',
     });
     const chunks: ChunkType[] = [];
+    let ended = false;
     const consume = (async () => {
       for await (const chunk of stream) chunks.push(chunk);
+      ended = true;
     })();
     try {
       await vi.waitFor(() => expect(deleteWorkflowRunById).toHaveBeenCalledTimes(2));
@@ -295,10 +305,14 @@ describe('workflowLoopStream', () => {
         error: childError,
       });
       expect(chunks.some(chunk => chunk.type === 'finish')).toBe(false);
+      expect(ended).toBe(false);
       remainingChild.resolve();
       await consume;
       expect(chunks.filter(chunk => chunk.type === 'finish')).toHaveLength(1);
       expect(chunks.some(chunk => chunk.type === 'error')).toBe(false);
+      expect(ended).toBe(true);
+      expect(deleteAgenticLoopRun).toHaveBeenCalledExactlyOnceWith(runId);
+      expect(deleteWorkflowRunById).toHaveBeenCalledTimes(2);
     } finally {
       remainingChild.resolve();
       await consume;

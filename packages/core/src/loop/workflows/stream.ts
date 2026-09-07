@@ -349,6 +349,8 @@ export function workflowLoopStream<Tools extends ToolSet = ToolSet, OUTPUT = und
           });
         }
 
+        // The exact snapshot targets are independent, but every deletion must
+        // settle before terminal completion passes this cleanup barrier.
         await Promise.all([
           (async () => {
             try {
