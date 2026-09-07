@@ -3693,6 +3693,12 @@ export class Run<
   #lifecycleResumeAttempt = 0;
   #lifecycleStepStates: WorkflowStepLifecycleStateMap = {};
   #activeExecutionGenerations = new Map<string, number>();
+  #admittedCancellation?: { executionGeneration: string; lifecycleResumeAttempt: number };
+  #pendingCancellations = new Set<{
+    executionGeneration?: string;
+    lifecycleResumeAttempt: number;
+    settled: Promise<void>;
+  }>();
   #committedTerminalStatus?: {
     executionGeneration: WorkflowExecutionGeneration;
     status: WorkflowRunStatus;
@@ -3849,6 +3855,7 @@ export class Run<
   /** @internal Replace execution-scoped cancellation state for a fresh lineage. */
   protected resetAbortController(): void {
     this.#abortController = new AbortController();
+    this.#admittedCancellation = undefined;
   }
 
   /** @internal Establish a fresh lifecycle lineage for start, restart, or time travel. */
@@ -4077,8 +4084,7 @@ export class Run<
         snapshot.status === 'canceled' ||
         snapshot.status === 'tripwire' ||
         snapshot.status === 'bailed' ||
-        snapshot.status === 'skipped') &&
-      !this.hasActiveLifecycleExecution(snapshot.executionGeneration)
+        snapshot.status === 'skipped')
     ) {
       this.workflowRunStatus = snapshot.status;
       return;
@@ -4094,29 +4100,86 @@ export class Run<
       }
     }
 
-    // No await may occur between this final ownership check and aborting. The
-    // engine's synchronous terminal commit and cancellation therefore have a
-    // single deterministic winner.
-    if (this.restoreCommittedTerminalStatus()) return;
+    const cancellationController = this.abortController;
+    const cancellationSpan = this.workflowRunSpan;
+    const localGeneration = this.#executionGeneration;
+    const localResumeAttempt = this.#lifecycleResumeAttempt;
+    const isCurrentExecution = () =>
+      this.#abortController === cancellationController &&
+      this.#executionGeneration === localGeneration &&
+      this.#lifecycleResumeAttempt === localResumeAttempt;
+
+    if (workflowsStore) {
+      const concurrentCas = workflowsStore.supportsConcurrentUpdates();
+      let settleCancellation = () => {};
+      const pendingCancellation = {
+        executionGeneration: reservedExecutionGeneration,
+        lifecycleResumeAttempt: snapshot?.lifecycleResumeAttempt ?? this.#lifecycleResumeAttempt,
+        settled: new Promise<void>(resolve => {
+          settleCancellation = resolve;
+        }),
+      };
+      if (concurrentCas) this.#pendingCancellations.add(pendingCancellation);
+      try {
+        let canceled: WorkflowRunState | undefined;
+        try {
+          canceled = await workflowsStore.updateWorkflowState({
+            workflowName: this.workflowId,
+            runId: this.runId,
+            opts: {
+              status: 'canceled',
+              ...(concurrentCas
+                ? {
+                    expectedStatus: snapshot?.status ?? ['pending', 'running', 'suspended', 'paused', 'waiting'],
+                    expectedExecutionGeneration: requireWorkflowExecutionGeneration(
+                      reservedExecutionGeneration,
+                      `Workflow cancellation ${this.workflowId}/${this.runId}`,
+                    ),
+                    expectedLifecycleResumeAttempt: snapshot?.lifecycleResumeAttempt ?? this.#lifecycleResumeAttempt,
+                  }
+                : {}),
+            },
+          });
+        } catch (error) {
+          // Stop local work on storage failure, but do not publish an uncommitted
+          // cancellation as a durable terminal outcome.
+          cancellationController.abort();
+          if (isCurrentExecution()) this.workflowRunStatus = 'canceled';
+          cancellationSpan?.endTree({ attributes: { status: 'canceled' } });
+          throw error;
+        }
+        if (!isCurrentExecution()) return;
+        if (concurrentCas && !canceled) {
+          const current = await workflowsStore.loadWorkflowSnapshot({
+            workflowName: this.workflowId,
+            runId: this.runId,
+          });
+          if (current && isCurrentExecution()) this.workflowRunStatus = current.status;
+          return;
+        }
+        if (concurrentCas && canceled?.executionGeneration) {
+          this.#admittedCancellation = {
+            executionGeneration: canceled.executionGeneration,
+            lifecycleResumeAttempt: canceled.lifecycleResumeAttempt ?? 0,
+          };
+        }
+      } finally {
+        settleCancellation();
+        this.#pendingCancellations.delete(pendingCancellation);
+      }
+    }
+
+    // Durable cancellation already won its storage transition. Without storage,
+    // the engine's synchronous terminal commit remains the ownership boundary.
+    if (!workflowsStore && this.restoreCommittedTerminalStatus()) return;
 
     // Abort any running execution and update in-memory status
-    this.abortController.abort();
+    cancellationController.abort();
     this.workflowRunStatus = 'canceled';
 
     // A step may ignore abortSignal and never unwind through the engine, so
     // cancellation closes the entire workflow span tree eagerly.
-    this.workflowRunSpan?.endTree({ attributes: { status: 'canceled' } });
-
-    // Persist cancellation before best-effort lifecycle delivery. The local
-    // abort remains set if this write fails, but cancel() must reject rather
-    // than advertise a terminal state that another process cannot observe.
-    await workflowsStore?.updateWorkflowState({
-      workflowName: this.workflowId,
-      runId: this.runId,
-      opts: {
-        status: 'canceled',
-      },
-    });
+    cancellationSpan?.endTree({ attributes: { status: 'canceled' } });
 
     const executionGeneration = reservedExecutionGeneration ?? this.#executionGeneration;
     const resumeAttempt = snapshot?.lifecycleResumeAttempt ?? this.#lifecycleResumeAttempt;
@@ -4169,7 +4232,16 @@ export class Run<
     return lifecycleExecution;
   }
 
-  private commitTerminalStatus(executionGeneration: WorkflowExecutionGeneration, status: WorkflowRunStatus): void {
+  private isCurrentLifecycleAttempt(executionGeneration: string, lifecycleResumeAttempt: number): boolean {
+    return this.#executionGeneration === executionGeneration && this.#lifecycleResumeAttempt === lifecycleResumeAttempt;
+  }
+
+  private commitTerminalStatus(
+    executionGeneration: WorkflowExecutionGeneration,
+    status: WorkflowRunStatus,
+    lifecycleResumeAttempt: number,
+  ): void {
+    if (!this.isCurrentLifecycleAttempt(executionGeneration, lifecycleResumeAttempt)) return;
     const committed = this.#committedTerminalStatus;
     if (committed && committed.executionGeneration === executionGeneration && committed.status !== status) {
       throw new Error(
@@ -4186,6 +4258,25 @@ export class Run<
     this.workflowRunStatus = committed.status;
     return true;
   }
+
+  private isCancellationAdmitted = async (
+    executionGeneration: string,
+    lifecycleResumeAttempt: number,
+  ): Promise<boolean> => {
+    await Promise.all(
+      [...this.#pendingCancellations]
+        .filter(
+          pending =>
+            pending.executionGeneration === executionGeneration &&
+            pending.lifecycleResumeAttempt === lifecycleResumeAttempt,
+        )
+        .map(pending => pending.settled),
+    );
+    return (
+      this.#admittedCancellation?.executionGeneration === executionGeneration &&
+      this.#admittedCancellation.lifecycleResumeAttempt === lifecycleResumeAttempt
+    );
+  };
 
   private assertDurableLifecycleOperation(operation: 'resume' | 'restart' | 'time travel'): void {
     if (this.transientExecution) {
@@ -4420,14 +4511,25 @@ export class Run<
           format,
           outputOptions,
           perStep,
-          commitTerminalStatus: status => this.commitTerminalStatus(lifecycleExecution.executionGeneration, status),
+          commitTerminalStatus: status =>
+            this.commitTerminalStatus(
+              lifecycleExecution.executionGeneration,
+              status,
+              lifecycleExecution.lifecycleResumeAttempt,
+            ),
+          isCancellationAdmitted: this.isCancellationAdmitted,
         }),
       );
 
-      if (result.status !== 'suspended') {
-        this.cleanup?.();
+      if (
+        this.isCurrentLifecycleAttempt(
+          lifecycleExecution.executionGeneration,
+          lifecycleExecution.lifecycleResumeAttempt,
+        )
+      ) {
+        if (result.status !== 'suspended') this.cleanup?.();
+        this.workflowRunStatus = result.status;
       }
-      this.workflowRunStatus = result.status;
 
       result.traceId = traceId;
       result.spanId = spanId;
@@ -5546,13 +5648,14 @@ export class Run<
         outputOptions: params.outputOptions,
         outputWriter: params.outputWriter,
         perStep: params.perStep,
-        commitTerminalStatus: status => this.commitTerminalStatus(executionGeneration, status),
+        commitTerminalStatus: status => this.commitTerminalStatus(executionGeneration, status, lifecycleResumeAttempt),
+        isCancellationAdmitted: this.isCancellationAdmitted,
       }),
     )
       .then(result => {
-        this.workflowRunStatus = result.status;
-        if (!params.isVNext && result.status !== 'suspended') {
-          this.closeStreamAction?.().catch(() => {});
+        if (this.isCurrentLifecycleAttempt(executionGeneration, lifecycleResumeAttempt)) {
+          this.workflowRunStatus = result.status;
+          if (!params.isVNext && result.status !== 'suspended') this.closeStreamAction?.().catch(() => {});
         }
         result.traceId = traceId;
         result.spanId = spanId;
@@ -5705,11 +5808,20 @@ export class Run<
         abortController: this.abortController,
         outputWriter,
         workflowSpan,
-        commitTerminalStatus: status => this.commitTerminalStatus(lifecycleExecution.executionGeneration, status),
+        commitTerminalStatus: status =>
+          this.commitTerminalStatus(
+            lifecycleExecution.executionGeneration,
+            status,
+            lifecycleExecution.lifecycleResumeAttempt,
+          ),
+        isCancellationAdmitted: this.isCancellationAdmitted,
       }),
     );
 
-    if (result.status !== 'suspended') {
+    if (
+      result.status !== 'suspended' &&
+      this.isCurrentLifecycleAttempt(lifecycleExecution.executionGeneration, lifecycleExecution.lifecycleResumeAttempt)
+    ) {
       this.cleanup?.();
     }
 
@@ -5858,11 +5970,20 @@ export class Run<
         workflowSpan,
         outputOptions,
         perStep,
-        commitTerminalStatus: status => this.commitTerminalStatus(lifecycleExecution.executionGeneration, status),
+        commitTerminalStatus: status =>
+          this.commitTerminalStatus(
+            lifecycleExecution.executionGeneration,
+            status,
+            lifecycleExecution.lifecycleResumeAttempt,
+          ),
+        isCancellationAdmitted: this.isCancellationAdmitted,
       }),
     );
 
-    if (result.status !== 'suspended') {
+    if (
+      result.status !== 'suspended' &&
+      this.isCurrentLifecycleAttempt(lifecycleExecution.executionGeneration, lifecycleExecution.lifecycleResumeAttempt)
+    ) {
       this.cleanup?.();
     }
 

@@ -259,5 +259,7 @@ export abstract class ExecutionEngine extends MastraBase {
      * replace the status represented by `workflow.finished`.
      */
     commitTerminalStatus?: (status: WorkflowRunStatus) => void;
+    /** Process-local proof that Run.cancel won the exact durable cancellation transition. */
+    isCancellationAdmitted?: (executionGeneration: string, lifecycleResumeAttempt: number) => Promise<boolean>;
   }): Promise<TOutput>;
 }

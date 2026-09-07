@@ -4,6 +4,7 @@ import type { SerializedError } from '../../error';
 import type { PubSub } from '../../events/pubsub';
 import { resolveObservabilityContext } from '../../observability';
 import type { ObservabilityContext } from '../../observability';
+import type { PersistWorkflowStepUpdateResult } from '../../storage/types';
 import type { DefaultExecutionEngine } from '../default';
 import { workflowLifecycleEventsAreSuppressed } from '../lifecycle-events';
 import type {
@@ -164,7 +165,7 @@ export interface PersistStepUpdateParams {
 export async function persistStepUpdate(
   engine: DefaultExecutionEngine,
   params: PersistStepUpdateParams,
-): Promise<void> {
+): Promise<PersistWorkflowStepUpdateResult | void> {
   const {
     workflowId,
     runId,
@@ -189,7 +190,7 @@ export async function persistStepUpdate(
 
   const operationId = `workflow.${workflowId}.run.${runId}.path.${JSON.stringify(executionContext.executionPath)}.stepUpdate${phase ? `.${phase}` : ''}`;
 
-  await engine.wrapDurableOperation(operationId, async () => {
+  return engine.wrapDurableOperation(operationId, async () => {
     // A run-scoped override (e.g. the transient per-chunk runs of a workflow used as an
     // agent output processor, #19605) wins over the workflow-wide option.
     const persistencePredicate = engine.getRunPersistenceOverride(runId) ?? engine.options?.shouldPersistSnapshot;
@@ -310,6 +311,7 @@ export async function persistStepUpdate(
     if (persisted?.status === 'persisted') {
       engine.setLastPersistedStatus(runId, workflowStatus);
     }
+    return persisted;
   });
 }
 

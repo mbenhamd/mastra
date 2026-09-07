@@ -2859,8 +2859,7 @@ export class EventedRun<
         snapshot.status === 'canceled' ||
         snapshot.status === 'tripwire' ||
         snapshot.status === 'bailed' ||
-        snapshot.status === 'skipped') &&
-      !this.hasActiveLifecycleExecution(snapshot.executionGeneration)
+        snapshot.status === 'skipped')
     ) {
       this.workflowRunStatus = snapshot.status;
       return;
@@ -2868,34 +2867,59 @@ export class EventedRun<
 
     // Reserve pending-run lifecycle identity before changing status. The abort
     // handler needs this exact generation even when execution never started.
-    await this.getLifecycleExecutionIdentity();
+    const { executionGeneration } = await this.getLifecycleExecutionIdentity();
+    const cancellationController = this.abortController;
+    const cancellationSpan = this.workflowRunSpan;
 
     // Let the event processor observe the admitted nonterminal snapshot before
     // applying the local fallback update. Persisting `canceled` first would make
     // its monotonic terminal guard correctly discard this new cancellation.
     const dispatched = await this.dispatchCancelEvent();
+    if (this.abortController !== cancellationController) return;
 
     // Successful publication may only mean "enqueued" on a remote transport.
     // Keep the admitted nonterminal snapshot intact for the worker's monotonic
     // generation/status guard. Use a direct status fallback only when dispatch
     // itself failed and there is no worker that can observe the cancellation.
     if (!dispatched) {
-      await workflowsStore?.updateWorkflowState({
-        workflowName: this.workflowId,
-        runId: this.runId,
-        opts: {
-          status: 'canceled',
-        },
-      });
+      const concurrentCas = workflowsStore?.supportsConcurrentUpdates() ?? false;
+      let canceled: WorkflowRunState | undefined;
+      try {
+        canceled = await workflowsStore?.updateWorkflowState({
+          workflowName: this.workflowId,
+          runId: this.runId,
+          opts: {
+            status: 'canceled',
+            ...(concurrentCas
+              ? {
+                  expectedStatus: snapshot?.status ?? ['pending', 'running', 'suspended', 'paused', 'waiting'],
+                  expectedExecutionGeneration: snapshot?.executionGeneration ?? executionGeneration,
+                  expectedLifecycleResumeAttempt: snapshot?.lifecycleResumeAttempt ?? 0,
+                }
+              : {}),
+          },
+        });
+      } catch (error) {
+        cancellationSpan?.endTree({ attributes: { status: 'canceled' } });
+        if (this.abortController === cancellationController) this.workflowRunStatus = 'canceled';
+        cancellationController.abort();
+        throw error;
+      }
+      if (this.abortController !== cancellationController) return;
+      if (workflowsStore && concurrentCas && !canceled) {
+        const current = await workflowsStore.loadWorkflowSnapshot({ workflowName: this.workflowId, runId: this.runId });
+        if (current && this.abortController === cancellationController) this.workflowRunStatus = current.status;
+        return;
+      }
     }
 
     // End the whole span tree now: a step that ignores abortSignal keeps running, so the
     // execution engine may never unwind and no span in the tree would otherwise be ended.
-    this.workflowRunSpan?.endTree({ attributes: { status: 'canceled' } });
+    cancellationSpan?.endTree({ attributes: { status: 'canceled' } });
 
     // Trigger abort signal - the abort handler will publish the workflow.cancel event
     // This ensures consistent behavior whether cancel() or abort() is called
     this.workflowRunStatus = 'canceled';
-    this.abortController.abort();
+    cancellationController.abort();
   }
 }
