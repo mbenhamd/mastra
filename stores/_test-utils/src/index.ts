@@ -11,3 +11,5 @@ export * from './index-config';
 export * from './composite-tests';
 export * from './domains/memory/resource-deletion';
 export * from './domains/workflows/atomic-resume';
+export * from './domains/workflows/terminalization';
+export * from './domains/workflows/terminal-parent';
