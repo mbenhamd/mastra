@@ -944,13 +944,19 @@ describe('explicitly transient workflow lifecycle reads', () => {
     const update = vi.spyOn(workflowsStore, 'updateWorkflowState').mockRejectedValueOnce(new Error('storage offline'));
     const publish = vi.spyOn(pubsub, 'publish');
     const run = await workflow.createRun({ runId: 'durable-cancel-write-failure', pubsub });
+    const identity = await run.getLifecycleExecutionIdentity();
 
     await expect(run.cancel()).rejects.toThrow('storage offline');
 
     expect(update).toHaveBeenCalledWith({
       workflowName: workflow.id,
       runId: run.runId,
-      opts: { status: 'canceled' },
+      opts: {
+        status: 'canceled',
+        expectedStatus: 'pending',
+        expectedExecutionGeneration: identity.executionGeneration,
+        expectedLifecycleResumeAttempt: 0,
+      },
     });
     expect(run.abortController.signal.aborted).toBe(true);
     expect(run.workflowRunStatus).toBe('canceled');

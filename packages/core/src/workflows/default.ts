@@ -8,6 +8,7 @@ import type { PubSub } from '../events/pubsub';
 import type { ObservabilityContext, Span, SpanType, TracingPolicy } from '../observability';
 import { createObservabilityContext, resolveExportedSpanId } from '../observability';
 import { MASTRA_AUTH_ORGANIZATION_KEY, MASTRA_AUTH_TOKEN_KEY } from '../request-context';
+import type { PersistWorkflowStepUpdateResult } from '../storage/types';
 import { deepEqual } from '../utils/deep-equal';
 import type { ExecutionGraph } from './execution-engine';
 import { ExecutionEngine } from './execution-engine';
@@ -38,6 +39,7 @@ import type { ConditionFunction, ConditionFunctionParams, Step } from './step';
 import { createMappingStep, createStepFromAgent, createStepFromTool } from './step-factories';
 import type {
   FormattedWorkflowResult,
+  WorkflowRunState,
   DefaultEngineType,
   EntryExecutionResult,
   ExecutionContext,
@@ -831,6 +833,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
     };
     perStep?: boolean;
     commitTerminalStatus?: (status: WorkflowRunStatus) => void;
+    isCancellationAdmitted?: (executionGeneration: string, lifecycleResumeAttempt: number) => Promise<boolean>;
     /** Trace IDs for creating child spans in durable execution */
     tracingIds?: {
       traceId: string;
@@ -933,7 +936,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
     let currentRequestContext = params.requestContext;
     for (let i = startIdx; i < steps.length; i++) {
       if (params.abortController.signal.aborted) {
-        await this.persistStepUpdate({
+        const terminalWrite = await this.persistStepUpdate({
           workflowId,
           runId,
           resourceId,
@@ -961,6 +964,23 @@ export class DefaultExecutionEngine extends ExecutionEngine {
           requestContext: currentRequestContext,
           phase: 'workflow-canceled',
         });
+
+        const rejected = await this.resolveRejectedTerminalWrite(
+          terminalWrite,
+          { workflowId, runId, executionGeneration, lifecycleResumeAttempt },
+          terminalWrite?.status === 'finalized'
+            ? ((await params.isCancellationAdmitted?.(executionGeneration, lifecycleResumeAttempt)) ?? false)
+            : false,
+          { pubsub: params.pubsub, includeState: params.outputOptions?.includeState },
+        );
+        if (rejected) {
+          workflowSpan?.end({ attributes: { status: rejected.status } });
+          this.clearLastPersistedStatus(runId);
+          return {
+            ...rejected,
+            runId,
+          } as unknown as TOutput;
+        }
 
         workflowSpan?.end({
           attributes: {
@@ -1079,19 +1099,25 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       const authoritativeDisposition = params.transientExecution
         ? undefined
         : await this.getAuthoritativeExecutionDisposition({ workflowId, runId, executionGeneration });
-      if (authoritativeDisposition) {
+      if (
+        authoritativeDisposition &&
+        !(
+          authoritativeDisposition === 'canceled' &&
+          (await params.isCancellationAdmitted?.(executionGeneration, lifecycleResumeAttempt))
+        )
+      ) {
         // A terminal transition (or a newer generation) completed while user
         // code was still awaiting. The owner already published its terminal
         // lifecycle sequence, so return the durable outcome without appending
         // duplicate step/workflow events after workflow.finished.
-        const authoritativeStatus = authoritativeDisposition === 'superseded' ? 'canceled' : authoritativeDisposition;
-        const authoritativeResult = (await this.fmtReturnValue(
-          params.pubsub,
-          stepResults,
-          { ...lastOutput.result, status: authoritativeStatus },
-          undefined,
-          stepExecutionPath,
-        )) as any;
+        const authoritativeTerminal = await this.resolveRejectedTerminalWrite(
+          { status: 'stale_execution' },
+          executionContext,
+          false,
+          { pubsub: params.pubsub, includeState: params.outputOptions?.includeState },
+        );
+        const authoritativeStatus = authoritativeTerminal!.status;
+        const authoritativeResult = authoritativeTerminal!;
         if (authoritativeStatus === 'failed' || authoritativeStatus === 'tripwire') {
           workflowSpan?.error({
             error: authoritativeResult.error ?? new Error(`Workflow ended with status ${authoritativeStatus}`),
@@ -1106,8 +1132,8 @@ export class DefaultExecutionEngine extends ExecutionEngine {
         this.clearLastPersistedStatus(runId);
         return {
           ...authoritativeResult,
-          ...(params.outputOptions?.includeState ? { state: lastState } : {}),
-        };
+          runId,
+        } as unknown as TOutput;
       }
 
       // if step result is not success, stop and return
@@ -1140,7 +1166,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
             : {};
 
         if (!executionContext.transientExecution) {
-          await this.persistStepUpdate({
+          const terminalWrite = await this.persistStepUpdate({
             workflowId,
             runId,
             resourceId,
@@ -1154,6 +1180,22 @@ export class DefaultExecutionEngine extends ExecutionEngine {
             tracingContext: persistTracingContext,
             phase: 'workflow-terminal',
           });
+          const rejected =
+            result.status === 'suspended' || result.status === 'paused'
+              ? undefined
+              : await this.resolveRejectedTerminalWrite(
+                  terminalWrite,
+                  executionContext,
+                  terminalWrite?.status === 'finalized'
+                    ? ((await params.isCancellationAdmitted?.(executionGeneration, lifecycleResumeAttempt)) ?? false)
+                    : false,
+                  { pubsub: params.pubsub, includeState: params.outputOptions?.includeState },
+                );
+          if (rejected) {
+            workflowSpan?.end({ attributes: { status: rejected.status } });
+            this.clearLastPersistedStatus(runId);
+            return { ...rejected, runId } as unknown as TOutput;
+          }
         }
 
         if (
@@ -1355,7 +1397,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       stepExecutionPath,
     )) as any;
     if (!lastExecutionContext!.transientExecution) {
-      await this.persistStepUpdate({
+      const terminalWrite = await this.persistStepUpdate({
         workflowId,
         runId,
         resourceId,
@@ -1368,6 +1410,19 @@ export class DefaultExecutionEngine extends ExecutionEngine {
         requestContext: currentRequestContext,
         phase: 'workflow-terminal',
       });
+      const rejected = await this.resolveRejectedTerminalWrite(
+        terminalWrite,
+        lastExecutionContext!,
+        terminalWrite?.status === 'finalized'
+          ? ((await params.isCancellationAdmitted?.(executionGeneration, lifecycleResumeAttempt)) ?? false)
+          : false,
+        { pubsub: params.pubsub, includeState: params.outputOptions?.includeState },
+      );
+      if (rejected) {
+        workflowSpan?.end({ attributes: { status: rejected.status } });
+        this.clearLastPersistedStatus(runId);
+        return { ...rejected, runId } as unknown as TOutput;
+      }
     }
 
     if (
@@ -1548,8 +1603,63 @@ export class DefaultExecutionEngine extends ExecutionEngine {
     return executeForeachHandler(this, params);
   }
 
-  async persistStepUpdate(params: PersistStepUpdateParams): Promise<void> {
+  async persistStepUpdate(params: PersistStepUpdateParams): Promise<PersistWorkflowStepUpdateResult | void> {
     return persistStepUpdateHandler(this, params);
+  }
+
+  private async resolveRejectedTerminalWrite(
+    outcome: PersistWorkflowStepUpdateResult | void,
+    context: Pick<ExecutionContext, 'workflowId' | 'runId' | 'executionGeneration' | 'lifecycleResumeAttempt'>,
+    cancellationAdmitted: boolean,
+    options: { pubsub: PubSub; includeState?: boolean },
+  ): Promise<
+    | (Omit<FormattedWorkflowResult, 'status'> & { status: WorkflowRunStatus; state?: WorkflowRunState['value'] })
+    | undefined
+  > {
+    if (!outcome || outcome.status === 'persisted') return;
+    const store = await this.mastra?.getStorage()?.getStore('workflows');
+    const snapshot = await store?.loadWorkflowSnapshot({ workflowName: context.workflowId, runId: context.runId });
+    if (
+      !snapshot ||
+      snapshot.executionGeneration !== context.executionGeneration ||
+      (snapshot.lifecycleResumeAttempt ?? 0) !== context.lifecycleResumeAttempt
+    ) {
+      return { status: 'canceled', steps: {}, input: undefined, stepExecutionPath: [] };
+    }
+    const terminal = ['success', 'failed', 'canceled', 'tripwire', 'bailed', 'skipped'].includes(snapshot.status);
+    // A previous step write can have committed this execution's own terminal
+    // snapshot. Local Run.cancel() also leaves publication to its active engine.
+    if (
+      outcome.status === 'finalized' &&
+      terminal &&
+      (this.getLastPersistedStatus(context.runId) === snapshot.status ||
+        (cancellationAdmitted && snapshot.status === 'canceled'))
+    ) {
+      return;
+    }
+    if (!terminal) return { status: 'canceled', steps: {}, input: undefined, stepExecutionPath: [] };
+    const lastStepId = snapshot.stepExecutionPath?.at(-1);
+    const lastStep = lastStepId ? snapshot.context[lastStepId] : undefined;
+    const formatted = await this.fmtReturnValue<FormattedWorkflowResult>(
+      options.pubsub,
+      snapshot.context,
+      {
+        ...lastStep,
+        status: snapshot.status === 'tripwire' ? 'failed' : snapshot.status,
+        output: snapshot.result,
+        error: snapshot.error,
+      } as StepResult<any, any, any, any>,
+      snapshot.error,
+      snapshot.stepExecutionPath,
+    );
+    return {
+      ...formatted,
+      status: snapshot.status,
+      result: snapshot.result,
+      error: snapshot.error,
+      ...(snapshot.tripwire ? { tripwire: snapshot.tripwire } : {}),
+      ...(options.includeState ? { state: snapshot.value } : {}),
+    };
   }
 
   async executeEntry(params: ExecuteEntryParams): Promise<EntryExecutionResult> {

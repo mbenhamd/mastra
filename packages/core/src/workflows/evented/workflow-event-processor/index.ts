@@ -883,9 +883,6 @@ export class WorkflowEventProcessor extends EventProcessor {
   }
 
   protected async processWorkflowCancel({ workflowId, runId, prevResult, ...args }: ProcessorArgs) {
-    // Cancel this workflow and all nested child workflows
-    this.cancelRunAndChildren(runId);
-
     const workflowsStore = await this.mastra.getStorage()?.getStore('workflows');
     const currentState = await workflowsStore?.loadWorkflowSnapshot({
       workflowName: workflowId,
@@ -917,6 +914,7 @@ export class WorkflowEventProcessor extends EventProcessor {
       currentState?.executionGeneration === executionGeneration
         ? (currentState.lifecycleStepStates ?? lifecycleStepStates)
         : lifecycleStepStates;
+    const activeStepIdentities: Array<{ stepId: string; stepCallId: string; stepAttempt: number }> = [];
     for (const [activeStepId, executionPath] of Object.entries(activeStepsPath ?? {})) {
       const identity = resolvePersistedActiveStepLifecycleIdentity({
         workflow: args.workflow,
@@ -929,20 +927,7 @@ export class WorkflowEventProcessor extends EventProcessor {
         stepResult: currentState?.context?.[activeStepId],
       });
       if (!identity) continue;
-      await publishWorkflowLifecycleEvent({
-        pubsub: this.mastra.pubsub,
-        workflowId,
-        runId,
-        executionGeneration,
-        event: { type: 'step.canceled', ...identity },
-      });
-      await publishWorkflowLifecycleEvent({
-        pubsub: this.mastra.pubsub,
-        workflowId,
-        runId,
-        executionGeneration,
-        event: { type: 'step.finished', ...identity, status: 'canceled' },
-      });
+      activeStepIdentities.push(identity);
     }
 
     //call end workflow with status of canceled to indicate the workflow was canceled
@@ -956,6 +941,27 @@ export class WorkflowEventProcessor extends EventProcessor {
         lifecycleStepStates,
       },
       'canceled',
+      async () => {
+        // Cancellation step events must follow terminal admission. A losing
+        // cancellation must not close steps or publish any terminal effects.
+        this.cancelRunAndChildren(runId);
+        for (const identity of activeStepIdentities) {
+          await publishWorkflowLifecycleEvent({
+            pubsub: this.mastra.pubsub,
+            workflowId,
+            runId,
+            executionGeneration,
+            event: { type: 'step.canceled', ...identity },
+          });
+          await publishWorkflowLifecycleEvent({
+            pubsub: this.mastra.pubsub,
+            workflowId,
+            runId,
+            executionGeneration,
+            event: { type: 'step.finished', ...identity, status: 'canceled' },
+          });
+        }
+      },
     );
   }
 
@@ -1419,7 +1425,11 @@ export class WorkflowEventProcessor extends EventProcessor {
     });
   }
 
-  protected async endWorkflow(args: ProcessorArgs, status: 'success' | 'failed' | 'canceled' | 'paused' = 'success') {
+  protected async endWorkflow(
+    args: ProcessorArgs,
+    status: 'success' | 'failed' | 'canceled' | 'paused' = 'success',
+    afterTerminalAdmission?: () => Promise<void>,
+  ) {
     const {
       workflowId,
       runId,
@@ -1455,9 +1465,8 @@ export class WorkflowEventProcessor extends EventProcessor {
     ) {
       // A different generation or an already-terminal transition owns this
       // run now. Do not let a delayed step/end delivery replace that outcome
-      // or publish a contradictory lifecycle terminal. This is a final
-      // read-fence; storage-level compare-and-set remains the cross-process
-      // ownership boundary tracked separately.
+      // or publish a contradictory lifecycle terminal. The guarded update
+      // below also rejects transitions that race this observation.
       this.mastra.getLogger()?.debug?.('Evented workflow finish lost durable terminal ownership', {
         workflowId,
         runId,
@@ -1476,8 +1485,11 @@ export class WorkflowEventProcessor extends EventProcessor {
         workflowStatus: finalStatus,
       }) ?? true;
 
-    if (shouldPersist) {
-      await workflowsStore?.updateWorkflowState({
+    let terminalAdmission = true;
+    const concurrentCas = workflowsStore?.supportsConcurrentUpdates() ?? false;
+
+    if (shouldPersist && workflowsStore) {
+      const updated = await workflowsStore.updateWorkflowState({
         workflowName: workflowId,
         runId,
         opts: {
@@ -1489,9 +1501,17 @@ export class WorkflowEventProcessor extends EventProcessor {
           ...(finalStatus === 'paused' || !exactFinalStateEnabled ? {} : { finalState }),
           activePaths: executionPath,
           activeStepsPath: activeStepsPath,
+          ...(concurrentCas
+            ? {
+                expectedStatus: [...Array.from(WorkflowEventProcessor.TERMINALIZABLE_RUN_STATUSES), 'paused'],
+                expectedExecutionGeneration: executionGeneration,
+                expectedLifecycleResumeAttempt: lifecycleResumeAttempt,
+              }
+            : {}),
         },
       });
-    } else if (finalStatus !== 'paused') {
+      terminalAdmission = !concurrentCas || updated !== undefined;
+    } else if (!shouldPersist && finalStatus !== 'paused') {
       // The run reached a terminal state its workflow opted not to persist
       // (e.g. the durable agentic loop, the internal `executionWorkflow`
       // inside `agentic-loop`, or the notification dispatcher). A row may
@@ -1507,7 +1527,23 @@ export class WorkflowEventProcessor extends EventProcessor {
       } catch (e) {
         this.mastra.getLogger()?.warn('Failed to clean up workflow snapshot', { workflowId, runId, error: e });
       }
+      // Storage has no atomic compare-and-delete contract. This branch keeps
+      // the historical opt-out cleanup behavior; concurrent ownership cannot
+      // be claimed from the delete result.
+      terminalAdmission = true;
     }
+
+    if (!terminalAdmission) {
+      this.mastra.getLogger()?.debug?.('Evented workflow terminal admission lost', {
+        workflowId,
+        runId,
+        requestedStatus: finalStatus,
+        executionGeneration,
+      });
+      return;
+    }
+
+    await afterTerminalAdmission?.();
 
     if (perStep) {
       await this.mastra.pubsub.publish(`workflow.events.v2.${runId}`, {
@@ -1825,11 +1861,12 @@ export class WorkflowEventProcessor extends EventProcessor {
     // Extract final state from stepResults or args
     const finalState = resolveCurrentState({ stepResults, state });
 
-    // Clean up abort controller and parent-child tracking
-    this.cleanupRun(runId);
-
     const workflowsStore = await this.mastra.getStorage()?.getStore('workflows');
     const exactFinalStateEnabled = workflowsStore?.getWorkflowTerminalizationCapabilities().recoveryVersion === 1;
+    const executionGeneration = requireWorkflowExecutionGeneration(
+      args.executionGeneration,
+      `Evented workflow failure ${workflowId}/${runId}`,
+    );
 
     // Check shouldPersistSnapshot option - default to true if not specified
     const shouldPersist =
@@ -1838,8 +1875,10 @@ export class WorkflowEventProcessor extends EventProcessor {
         workflowStatus: 'failed',
       }) ?? true;
 
-    if (shouldPersist) {
-      await workflowsStore?.updateWorkflowState({
+    let terminalAdmission = true;
+    const concurrentCas = workflowsStore?.supportsConcurrentUpdates() ?? false;
+    if (shouldPersist && workflowsStore) {
+      const updated = await workflowsStore.updateWorkflowState({
         workflowName: workflowId,
         runId,
         opts: {
@@ -1848,9 +1887,17 @@ export class WorkflowEventProcessor extends EventProcessor {
           ...(exactFinalStateEnabled ? { finalState } : {}),
           activePaths: executionPath,
           activeStepsPath: activeStepsPath,
+          ...(concurrentCas
+            ? {
+                expectedStatus: [...Array.from(WorkflowEventProcessor.TERMINALIZABLE_RUN_STATUSES), 'paused'],
+                expectedExecutionGeneration: executionGeneration,
+                expectedLifecycleResumeAttempt: args.lifecycleResumeAttempt ?? 0,
+              }
+            : {}),
         },
       });
-    } else {
+      terminalAdmission = !concurrentCas || updated !== undefined;
+    } else if (!shouldPersist) {
       // Mirrors endWorkflow: a run whose workflow opted out of persisting the
       // terminal 'failed' status would otherwise leak its earlier-phase
       // ('running'/'pending'/'suspended') snapshot row forever (issue #22209).
@@ -1860,17 +1907,28 @@ export class WorkflowEventProcessor extends EventProcessor {
       } catch (e) {
         this.mastra.getLogger()?.warn('Failed to clean up workflow snapshot', { workflowId, runId, error: e });
       }
+      // There is no atomic compare-and-delete contract. Preserve this legacy
+      // opt-out cleanup branch without claiming concurrent ownership.
+      terminalAdmission = true;
     }
+
+    if (!terminalAdmission) {
+      this.mastra.getLogger()?.debug?.('Evented workflow failure lost durable terminal admission', {
+        workflowId,
+        runId,
+        executionGeneration,
+      });
+      return;
+    }
+
+    // Terminal ownership is admitted before cleanup or publication.
+    this.cleanupRun(runId);
 
     // 'failed' is terminal: the run stops writing to its watch topic. Arm
     // cleanup only after the terminal snapshot update (or nested-row delete)
     // completes, so a short test delay or slow store can't make the timer read
     // the previous active status and incorrectly skip deletion.
-    this.scheduleRunTopicCleanup(
-      workflowId,
-      runId,
-      requireWorkflowExecutionGeneration(args.executionGeneration, `Evented workflow cleanup ${workflowId}/${runId}`),
-    );
+    this.scheduleRunTopicCleanup(workflowId, runId, executionGeneration);
 
     // handle nested workflow
     if (parentWorkflow) {
@@ -1899,10 +1957,6 @@ export class WorkflowEventProcessor extends EventProcessor {
       });
     }
 
-    const executionGeneration = requireWorkflowExecutionGeneration(
-      args.executionGeneration,
-      `Evented workflow failure ${workflowId}/${runId}`,
-    );
     const workflowError = (prevResult as { error?: unknown }).error;
     await publishWorkflowLifecycleEvent({
       pubsub: this.mastra.pubsub,
