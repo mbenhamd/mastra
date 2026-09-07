@@ -33,6 +33,7 @@ async function persistRunStatus(mastra: Mastra, status: string, executionGenerat
       value: {},
       runId: 'run-1',
       executionGeneration,
+      lifecycleResumeAttempt: 0,
     } as any,
   });
 }
@@ -87,6 +88,7 @@ describe('WorkflowEventProcessor per-run topic cleanup', () => {
 
   it('clears the workflow.events.v2 topic after workflow.fail', async () => {
     const { mastra, processor, clearTopicSpy } = setup(10);
+    await persistRunStatus(mastra, 'running', baseArgs.executionGeneration);
 
     await processor.callProcessWorkflowFail({
       ...baseArgs,
@@ -222,7 +224,8 @@ describe('WorkflowEventProcessor per-run topic cleanup', () => {
   it('proceeds with deletion when the persisted status is terminal', async () => {
     const { mastra, processor, clearTopicSpy } = setup(10);
 
-    await persistRunStatus(mastra, 'failed');
+    // The failure handler commits the terminal status before arming cleanup.
+    await persistRunStatus(mastra, 'running', baseArgs.executionGeneration);
     await processor.callProcessWorkflowFail({
       ...baseArgs,
       prevResult: { status: 'failed', error: 'boom' },
