@@ -51,6 +51,14 @@ export const MASTRA_VERSIONS_KEY = 'mastra__versions';
 export const MASTRA_AUTH_TOKEN_KEY = 'mastra__authToken';
 
 /**
+ * Organization selected by trusted authentication middleware after membership
+ * validation: `{ userId, organizationId }`. Consumers must match `userId` to
+ * the current authenticated principal. This does not replace provider claims
+ * or the separate `organizationId` used for knowledge scope.
+ */
+export const MASTRA_AUTH_ORGANIZATION_KEY = 'mastra__authOrganization';
+
+/**
  * Reserved key carrying a delegating agent's `MastraMemory` into a delegated
  * run, so a sub-agent without its own memory can persist that run's transcript
  * without the shared sub-agent instance being modified. The value is
@@ -61,6 +69,20 @@ export const MASTRA_AUTH_TOKEN_KEY = 'mastra__authToken';
  * nested delegated runs. Internal to delegation — do not set it yourself.
  */
 export const MASTRA_INHERITED_MEMORY_KEY = 'mastra__inheritedMemory';
+
+/**
+ * Reserved key naming who sent a user message: `{ id, name?, avatarUrl? }`.
+ * Set by the host that authenticated the request; the agent-controller copies
+ * it onto the sent message as `providerMetadata.mastra.author` so a shared
+ * thread can show who wrote what.
+ *
+ * @example
+ * ```typescript
+ * // In your auth middleware:
+ * requestContext.setRaw(MASTRA_MESSAGE_AUTHOR_KEY, { id: user.id, name: user.name, avatarUrl: user.avatarUrl });
+ * ```
+ */
+export const MASTRA_MESSAGE_AUTHOR_KEY = 'mastra__messageAuthor';
 
 const SPAN_CONTEXT_MAX_KEYS = 100;
 const SPAN_CONTEXT_MAX_STRING_BYTES = 2_048;

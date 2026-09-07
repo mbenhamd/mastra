@@ -12,6 +12,7 @@
  * the existing global behavior unchanged.
  */
 
+import { MASTRA_AUTH_ORGANIZATION_KEY } from '@mastra/core/request-context';
 import type { RequestContext } from '@mastra/core/request-context';
 import type { CredentialStore } from '../auth/types.js';
 
@@ -122,12 +123,21 @@ export function resolveTenantFromRequestContext(requestContext?: RequestContext)
   // cannot share code across the package boundary, so they must agree by rule.
   const wrapped = Boolean(raw.user && typeof raw.user === 'object' && raw.session && typeof raw.session === 'object');
   const user = wrapped ? (raw.user as RequestContextUser) : raw;
-  const orgId = wrapped ? raw.session?.activeOrganizationId : user.organizationId;
+  let orgId = wrapped ? raw.session?.activeOrganizationId : user.organizationId;
   const userId = user.workosId ?? user.id;
   // The slot holds whatever the provider returned, so the declared string
   // types are hopes, not guarantees. A non-string id must refuse the tenant
   // (fail closed), not flow onward as a mistyped key.
   if (typeof userId !== 'string' || !userId) return undefined;
+  const selected = requestContext?.get(MASTRA_AUTH_ORGANIZATION_KEY);
+  if (selected !== undefined) {
+    if (!selected || typeof selected !== 'object') return undefined;
+    const selection = selected as { userId?: unknown; organizationId?: unknown };
+    if (selection.userId !== userId || typeof selection.organizationId !== 'string' || !selection.organizationId) {
+      return undefined;
+    }
+    orgId = selection.organizationId;
+  }
   if (orgId !== undefined && typeof orgId !== 'string') return undefined;
   // Only an exact `true` flips precedence — anything else keeps user > org.
   // Server code stamps the flag on the stashed value itself, so read it from

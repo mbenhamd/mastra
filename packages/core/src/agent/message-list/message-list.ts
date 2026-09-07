@@ -43,7 +43,7 @@ import type {
   SerializedMessageListState,
 } from './state';
 import type { AIV5Type, AIV5ResponseMessage, AIV6Type, MessageInput, MessageListInput } from './types';
-import { ensureGeminiCompatibleMessages } from './utils/provider-compat';
+import { dropCrossProviderExecutedParts, ensureGeminiCompatibleMessages } from './utils/provider-compat';
 import { dedupeResponseProviderItemParts } from './utils/response-item-metadata';
 import { stampPart } from './utils/stamp-part';
 
@@ -681,6 +681,12 @@ export class MessageList {
           downloadConcurrency?: number;
           downloadRetries?: number;
           supportedUrls?: Record<string, RegExp[]>;
+          /**
+           * Provider this prompt is being sent to. Lets conversion drop stored
+           * provider-executed tool results a different provider produced.
+           * @see https://github.com/mastra-ai/mastra/issues/23082
+           */
+          targetProvider?: string;
         } = {
           downloadConcurrency: 10,
           downloadRetries: 3,
@@ -800,6 +806,8 @@ export class MessageList {
           });
         }
 
+        messages = dropCrossProviderExecutedParts(messages, this.messages, options.targetProvider, this.logger);
+
         messages = ensureGeminiCompatibleMessages(messages, this.logger);
 
         // PF-2279: a declined-suspension resume can leave the same Responses
@@ -822,6 +830,7 @@ export class MessageList {
         downloadConcurrency?: number;
         downloadRetries?: number;
         supportedUrls?: Record<string, RegExp[]>;
+        targetProvider?: string;
       }): Promise<LanguageModelV2Prompt> => aiV5PromptToAIV6Prompt(await this.all.aiV5.llmPrompt(options)),
     },
     aiV7: {
@@ -833,6 +842,7 @@ export class MessageList {
         downloadConcurrency?: number;
         downloadRetries?: number;
         supportedUrls?: Record<string, RegExp[]>;
+        targetProvider?: string;
       }): Promise<LanguageModelV2Prompt> => aiV5PromptToAIV7Prompt(await this.all.aiV5.llmPrompt(options)),
     },
 

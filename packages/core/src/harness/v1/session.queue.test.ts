@@ -30,6 +30,7 @@ import {
   HarnessQueueFullDroppedError,
   HarnessQueueFullError,
   HarnessSessionDeletedError,
+  HarnessSessionLockedError,
   HarnessValidationError,
 } from './errors';
 import type { HarnessEvent } from './events';
@@ -1859,6 +1860,98 @@ describe('Session.queue() — drains after message()', () => {
     expect(manual.text).toBe('manual');
     expect(queued.text).toBe('queued');
     expect(agent.streamCalls.map(c => extractSignalContents(c.messages))).toEqual(['manual call', 'queued call']);
+  });
+
+  it('settles the background drain after lease eviction without discarding durable queued work', async () => {
+    const { harness, agent, storage } = setupHarness();
+    let release!: () => void;
+    const holdUntil = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    agent.enqueueRun({ finishReason: 'stop', text: 'queued reply', holdUntil });
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    const drain = vi.spyOn(session as unknown as { _maybeDrainQueue(): Promise<void> }, '_maybeDrainQueue');
+    const queued = session.queue({ content: 'survive lease loss' });
+    const queuedSettled = queued.then(
+      value => ({ ok: true as const, value }),
+      err => ({ ok: false as const, err }),
+    );
+
+    try {
+      await vi.waitFor(() => expect(agent.streamCalls).toHaveLength(1));
+      const drainSettled = Promise.all(drain.mock.results.map(result => result.value)).then(
+        () => ({ ok: true as const }),
+        err => ({ ok: false as const, err }),
+      );
+      const before = (await storage.loadSession({ sessionId: session.id }))!;
+      await storage.releaseSessionLease({ sessionId: session.id, ownerId: harness.ownerId });
+      await storage.acquireSessionLease({ sessionId: session.id, ownerId: 'other-process', ttlMs: 30_000 });
+
+      await expect(session.extendLease({ ttlMs: 60_000 })).rejects.toBeInstanceOf(HarnessSessionLockedError);
+
+      expect(session.lifecycleState).toBe('evicted');
+      await expect(queuedSettled).resolves.toMatchObject({ ok: false, err: expect.any(HarnessValidationError) });
+      await expect(drainSettled).resolves.toEqual({ ok: true });
+      const after = (await storage.loadSession({ sessionId: session.id }))!;
+      expect(after.pendingQueue).toEqual(before.pendingQueue);
+      expect(after.queueAdmissionReceipts).toEqual(before.queueAdmissionReceipts);
+    } finally {
+      release();
+      await harness.shutdown();
+    }
+  });
+
+  it('settles the background drain when its failure cleanup discovers lease loss', async () => {
+    const { harness, agent, storage } = setupHarness();
+    vi.spyOn(agent, 'sendSignal').mockImplementationOnce(() => {
+      throw new Error('queued dispatch failed');
+    });
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    const drain = vi.spyOn(session as unknown as { _maybeDrainQueue(): Promise<void> }, '_maybeDrainQueue');
+    let cleanupStarted!: () => void;
+    const cleanupEntered = new Promise<void>(resolve => {
+      cleanupStarted = resolve;
+    });
+    let release!: () => void;
+    const cleanupGate = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    const saveSession = storage.saveSession.bind(storage);
+    vi.spyOn(storage, 'saveSession').mockImplementation(async (record, options) => {
+      if (Object.values(record.queueAdmissionReceipts ?? {}).some(receipt => receipt.status === 'failed')) {
+        cleanupStarted();
+        await cleanupGate;
+      }
+      return saveSession(record, options);
+    });
+    const queued = session.queue({ content: 'survive cleanup lease loss' });
+    const queuedSettled = queued.then(
+      value => ({ ok: true as const, value }),
+      err => ({ ok: false as const, err }),
+    );
+
+    try {
+      await cleanupEntered;
+      const drainSettled = Promise.all(drain.mock.results.map(result => result.value)).then(
+        () => ({ ok: true as const }),
+        err => ({ ok: false as const, err }),
+      );
+      expect(session.lifecycleState).toBe('live');
+      const before = (await storage.loadSession({ sessionId: session.id }))!;
+      await storage.releaseSessionLease({ sessionId: session.id, ownerId: harness.ownerId });
+      await storage.acquireSessionLease({ sessionId: session.id, ownerId: 'other-process', ttlMs: 30_000 });
+      release();
+
+      await expect(queuedSettled).resolves.toMatchObject({ ok: false, err: expect.any(HarnessValidationError) });
+      expect(session.lifecycleState).toBe('evicted');
+      await expect(drainSettled).resolves.toEqual({ ok: true });
+      const after = (await storage.loadSession({ sessionId: session.id }))!;
+      expect(after.pendingQueue).toEqual(before.pendingQueue);
+      expect(after.queueAdmissionReceipts).toEqual(before.queueAdmissionReceipts);
+    } finally {
+      release();
+      await harness.shutdown();
+    }
   });
 });
 

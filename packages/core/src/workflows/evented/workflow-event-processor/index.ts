@@ -46,7 +46,7 @@ import {
   resolveForeachConcurrency,
   validateStepResumeData,
 } from '../../utils';
-import { resolveCurrentState } from '../helpers';
+import { getPersistedRequestContext, resolveCurrentState } from '../helpers';
 import { createEventedResumeLabels, mergeEventedResumeLabels, normalizeEventedResumeLabels } from '../resume-label';
 import { StepExecutor } from '../step-executor';
 import {
@@ -1224,7 +1224,7 @@ export class WorkflowEventProcessor extends EventProcessor {
           expectedChildGraphFingerprint: createWorkflowTerminalGraphFingerprint(serializedStepGraph),
           forEachIndex: parentForEachIndex,
           result: parentResult,
-          requestContext,
+          requestContext: getPersistedRequestContext(requestContext),
           recoveryAncestry,
           ...(initialWorkflowSnapshotToPersist
             ? {
@@ -1293,7 +1293,7 @@ export class WorkflowEventProcessor extends EventProcessor {
           nestedRunId: runId,
           forEachIndex: parentForEachIndex,
           result: parentResult,
-          requestContext,
+          requestContext: getPersistedRequestContext(requestContext),
         });
         if (ownership.status === 'unsupported') {
           await workflowsStore.updateWorkflowResults({
@@ -1301,7 +1301,7 @@ export class WorkflowEventProcessor extends EventProcessor {
             runId: parentWorkflow.runId,
             stepId: parentWorkflow.stepId,
             result: { ...parentResult, metadata: nestedRunMetadata },
-            requestContext,
+            requestContext: getPersistedRequestContext(requestContext),
           });
         } else if (ownership.status !== 'bound' && ownership.status !== 'already_bound') {
           throw new MastraError({
@@ -3545,7 +3545,7 @@ export class WorkflowEventProcessor extends EventProcessor {
           runId,
           stepId: '__state',
           result: currentState as any,
-          requestContext,
+          requestContext: getPersistedRequestContext(requestContext),
         });
         const suspendTracingContext = this.resolveSuspendTracingContext(runId);
         await workflowsStore?.updateWorkflowState({
@@ -3809,7 +3809,7 @@ export class WorkflowEventProcessor extends EventProcessor {
             runId,
             stepId: getEntryId(step.step),
             result: bailedResult as any,
-            requestContext,
+            requestContext: getPersistedRequestContext(requestContext),
           });
 
           // End workflow with bail result
@@ -3916,7 +3916,7 @@ export class WorkflowEventProcessor extends EventProcessor {
         runId,
         stepId: getEntryId(step.step),
         result: storageResult ?? newResult,
-        requestContext,
+        requestContext: getPersistedRequestContext(requestContext),
       });
 
       // Persist (and thread forward) any state changes made inside the foreach body.
@@ -3931,7 +3931,7 @@ export class WorkflowEventProcessor extends EventProcessor {
           runId,
           stepId: '__state',
           result: currentState as any,
-          requestContext,
+          requestContext: getPersistedRequestContext(requestContext),
         });
       }
 
@@ -4174,7 +4174,7 @@ export class WorkflowEventProcessor extends EventProcessor {
             runId,
             stepId: getEntryId(step.step),
             result: foreachSuspendResult as any,
-            requestContext,
+            requestContext: getPersistedRequestContext(requestContext),
           });
 
           // Check shouldPersistSnapshot option - default to true if not specified
@@ -4191,7 +4191,7 @@ export class WorkflowEventProcessor extends EventProcessor {
               runId,
               stepId: '__state',
               result: currentState as any,
-              requestContext,
+              requestContext: getPersistedRequestContext(requestContext),
             });
 
             const suspendTracingContext = this.resolveSuspendTracingContext(runId);
@@ -4298,7 +4298,7 @@ export class WorkflowEventProcessor extends EventProcessor {
         runId,
         stepId,
         result: storedResult,
-        requestContext,
+        requestContext: getPersistedRequestContext(requestContext),
       });
 
       // When the Mastra has no storage configured, workflowsStore is undefined
@@ -4437,7 +4437,7 @@ export class WorkflowEventProcessor extends EventProcessor {
           runId,
           stepId: '__state',
           result: currentState as any,
-          requestContext,
+          requestContext: getPersistedRequestContext(requestContext),
         });
 
         const suspendTracingContext = this.resolveSuspendTracingContext(runId);

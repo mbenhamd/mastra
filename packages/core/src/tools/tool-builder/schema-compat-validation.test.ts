@@ -2,6 +2,7 @@ import { AnthropicSchemaCompatLayer, isStandardSchemaWithJSON } from '@mastra/sc
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
 import { RequestContext } from '../../request-context';
+import type { StandardSchemaWithJSON } from '../../schema';
 import { createTool } from '../tool';
 import type { ToolAction } from '../types';
 import { validateToolInput } from '../validation';
@@ -30,6 +31,31 @@ function buildCoreTool(
 }
 
 describe('CoreToolBuilder - Schema Compatibility in Validation', () => {
+  it('preserves async validation results in the native tool input schema', async () => {
+    const inputSchema: StandardSchemaWithJSON = {
+      '~standard': {
+        version: 1,
+        vendor: 'async-validation-test',
+        validate: async value =>
+          typeof value === 'string' ? { value: value.trim() } : { issues: [{ message: 'Expected a string' }] },
+        jsonSchema: {
+          input: () => ({ type: 'string' }),
+          output: () => ({ type: 'string' }),
+        },
+      },
+    };
+    const schema = new CoreToolBuilder({
+      originalTool: { id: 'async-validator', description: 'Validates asynchronously', inputSchema },
+      options: { name: 'async-validator' },
+    }).buildV5().inputSchema;
+
+    if (typeof schema !== 'object' || schema === null || !('validate' in schema) || !schema.validate) {
+      throw new Error('Expected a native schema with validation');
+    }
+    expect(await schema.validate(' value ')).toEqual({ success: true, value: 'value' });
+    expect(await schema.validate(42)).toEqual({ success: false, error: new Error('Expected a string') });
+  });
+
   it('preserves asynchronous validation through the native v6 schema wrapper', async () => {
     const tool = {
       id: 'async-validation-tool',

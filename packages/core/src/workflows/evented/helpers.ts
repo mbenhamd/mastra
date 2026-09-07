@@ -3,6 +3,15 @@
  */
 
 import { TripWire } from '../../agent/trip-wire';
+import { MASTRA_AUTH_ORGANIZATION_KEY } from '../../request-context';
+
+/** Keep authenticated selection live in events, but never recover it from a stored context. */
+export function getPersistedRequestContext(requestContext: Record<string, any>): Record<string, any> {
+  if (!requestContext || !Object.hasOwn(requestContext, MASTRA_AUTH_ORGANIZATION_KEY)) return requestContext;
+  const persisted = { ...requestContext };
+  delete persisted[MASTRA_AUTH_ORGANIZATION_KEY];
+  return persisted;
+}
 
 /**
  * Interface for tripwire chunks in the stream.

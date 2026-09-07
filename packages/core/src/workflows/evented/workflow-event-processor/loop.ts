@@ -4,7 +4,7 @@ import type { PubSub } from '../../../events';
 import type { Mastra } from '../../../mastra';
 import { getEntryId, getEntryWorkflow } from '../../step-entry';
 import { resolveForeachConcurrency } from '../../utils';
-import { resolveCurrentState } from '../helpers';
+import { getPersistedRequestContext, resolveCurrentState } from '../helpers';
 import type { StepExecutor } from '../step-executor';
 import { createPendingMarker } from '../types';
 import {
@@ -153,7 +153,7 @@ export async function processWorkflowLoop(
       runId,
       stepId: getEntryId(step.step),
       result: nextIterationResult,
-      requestContext,
+      requestContext: getPersistedRequestContext(requestContext),
     });
   };
 
@@ -473,7 +473,7 @@ export async function processWorkflowForEach(
           ...currentResult,
           output: updatedOutput,
         } as any,
-        requestContext,
+        requestContext: getPersistedRequestContext(requestContext),
       });
 
       // Check if inner step is a nested workflow
@@ -558,7 +558,7 @@ export async function processWorkflowForEach(
       runId,
       stepId,
       result: currentResult,
-      requestContext,
+      requestContext: getPersistedRequestContext(requestContext),
     });
     stepResults[stepId] = currentResult;
   }
@@ -585,7 +585,7 @@ export async function processWorkflowForEach(
         runId,
         stepId,
         result: { ...currentResult, output: updatedOutput } as any,
-        requestContext,
+        requestContext: getPersistedRequestContext(requestContext),
       });
 
       const isNestedWorkflow = getEntryWorkflow(step.step) !== null;
@@ -643,7 +643,7 @@ export async function processWorkflowForEach(
         runId,
         stepId: getEntryId(step.step),
         result,
-        requestContext,
+        requestContext: getPersistedRequestContext(requestContext),
       });
       stepResults[getEntryId(step.step)] = result as StepResult<any, any, any, any>;
     } else if (result) {
@@ -657,7 +657,7 @@ export async function processWorkflowForEach(
         runId,
         stepId: getEntryId(step.step),
         result: { ...result, suspendPayload: undefined, suspendOutput: undefined } as any,
-        requestContext,
+        requestContext: getPersistedRequestContext(requestContext),
       });
       stepResults[getEntryId(step.step)] = result as any;
     }
@@ -711,7 +711,7 @@ export async function processWorkflowForEach(
         startedAt: Date.now(),
         payload: (prevResult as any)?.output,
       } as any,
-      requestContext,
+      requestContext: getPersistedRequestContext(requestContext),
     });
 
     // Check if inner step is a nested workflow - only then extract individual items
@@ -764,7 +764,7 @@ export async function processWorkflowForEach(
       startedAt: Date.now(),
       payload: (prevResult as any)?.output,
     } as any,
-    requestContext,
+    requestContext: getPersistedRequestContext(requestContext),
   });
 
   // For nested workflows, extract individual item since they receive prevResult directly

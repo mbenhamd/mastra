@@ -84,6 +84,8 @@ describe('apiSchemaManifest', () => {
   });
 
   it('converts path, query, and body route schemas to JSON Schema', () => {
+    expect(apiSchemaManifestResponseSchema.parse(apiSchemaManifest)).toEqual(apiSchemaManifest);
+
     const getAgent = apiSchemaManifest.routes.find(
       route => route.method === 'GET' && route.path === '/agents/:agentId',
     );

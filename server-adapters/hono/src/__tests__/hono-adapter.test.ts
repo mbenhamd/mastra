@@ -1414,6 +1414,7 @@ describe('Hono Server Adapter', () => {
         handler: async ({ requestContext }) => {
           return {
             resourceId: requestContext?.get('mastra__resourceId') ?? null,
+            selectedOrganization: requestContext?.get('mastra__authOrganization') ?? null,
             isStudio: requestContext?.get(MASTRA_IS_STUDIO_KEY) ?? null,
             customKey: requestContext?.get('myKey') ?? null,
           };
@@ -1430,6 +1431,7 @@ describe('Hono Server Adapter', () => {
           body: JSON.stringify({
             requestContext: {
               mastra__resourceId: 'injected-victim-id',
+              mastra__authOrganization: { userId: 'attacker', organizationId: 'victim-org' },
               [MASTRA_IS_STUDIO_KEY]: true,
               myKey: 'safe-value',
             },
@@ -1440,6 +1442,7 @@ describe('Hono Server Adapter', () => {
       expect(response.status).toBe(200);
       const data = await response.json();
       expect(data.resourceId).toBeNull();
+      expect(data.selectedOrganization).toBeNull();
       expect(data.isStudio).toBeNull();
       expect(data.customKey).toBe('safe-value');
     });
@@ -1497,6 +1500,7 @@ describe('Hono Server Adapter', () => {
         handler: async ({ requestContext }) => {
           return {
             resourceId: requestContext?.get('mastra__resourceId') ?? null,
+            selectedOrganization: requestContext?.get('mastra__authOrganization') ?? null,
             threadId: requestContext?.get('mastra__threadId') ?? null,
             isStudio: requestContext?.get(MASTRA_IS_STUDIO_KEY) ?? null,
             customKey: requestContext?.get('myKey') ?? null,
@@ -1509,6 +1513,7 @@ describe('Hono Server Adapter', () => {
 
       const queryContext = JSON.stringify({
         mastra__resourceId: 'injected-victim-id',
+        mastra__authOrganization: { userId: 'attacker', organizationId: 'victim-org' },
         mastra__threadId: 'injected-thread-id',
         [MASTRA_IS_STUDIO_KEY]: true,
         myKey: 'safe-value',
@@ -1523,6 +1528,7 @@ describe('Hono Server Adapter', () => {
       expect(response.status).toBe(200);
       const data = await response.json();
       expect(data.resourceId).toBeNull();
+      expect(data.selectedOrganization).toBeNull();
       expect(data.threadId).toBeNull();
       expect(data.isStudio).toBeNull();
       expect(data.customKey).toBe('safe-value');

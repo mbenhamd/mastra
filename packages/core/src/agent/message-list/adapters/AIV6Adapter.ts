@@ -381,23 +381,22 @@ export class AIV6Adapter {
     const legacyV6OnlyToolCallIds = new Set(legacyV6OnlyToolInvocations.map(invocation => invocation.toolCallId));
 
     for (const part of dbParts) {
-      parts.push(
+      const uiPart =
         part.type === 'tool-invocation' && isDowngradedV4Denial(part.toolInvocation)
           ? AIV6Adapter.toUIPart({
               ...part,
               toolInvocation: { ...part.toolInvocation, state: 'output-denied' },
             })
-          : AIV6Adapter.toUIPart(part),
-      );
+          : AIV6Adapter.toUIPart(part);
+      if (uiPart) parts.push(uiPart);
     }
 
     for (const toolInvocation of legacyV6OnlyToolInvocations) {
-      parts.push(
-        AIV6Adapter.toUIPart({
-          type: 'tool-invocation',
-          toolInvocation,
-        }),
-      );
+      const uiPart = AIV6Adapter.toUIPart({
+        type: 'tool-invocation',
+        toolInvocation,
+      });
+      if (uiPart) parts.push(uiPart);
     }
 
     if (!hasToolInvocationParts || !hasReasoningParts || !hasFileParts || !hasTextParts) {
@@ -599,7 +598,7 @@ export class AIV6Adapter {
     };
   }
 
-  private static toUIPart(part: MastraMessagePart): AIV6Type.UIMessage['parts'][number] {
+  private static toUIPart(part: MastraMessagePart): AIV6Type.UIMessage['parts'][number] | undefined {
     if (part.type === 'tool-invocation') {
       const base = withOptionalFields(
         {
@@ -732,17 +731,20 @@ export class AIV6Adapter {
       ) as AIV6Type.UIMessage['parts'][number];
     }
 
-    return AIV6Adapter.toUIPartFromV5(
-      AIV5Adapter.toUIMessage({
-        id: 'tmp',
-        role: 'assistant',
-        createdAt: new Date(),
-        content: {
-          format: 2,
-          parts: [part],
-        },
-      }).parts[0]!,
-    );
+    const v5Part = AIV5Adapter.toUIMessage({
+      id: 'tmp',
+      role: 'assistant',
+      createdAt: new Date(),
+      content: {
+        format: 2,
+        parts: [part],
+      },
+    }).parts[0];
+
+    // The v5 bridge legitimately omits some parts (e.g. reasoning with no text and no
+    // details, which streaming emits before the first reasoning delta arrives).
+    // Signal "no part" instead of dereferencing undefined.
+    return v5Part ? AIV6Adapter.toUIPartFromV5(v5Part) : undefined;
   }
 
   private static toUIPartFromV5(part: AIV5Type.UIMessage['parts'][number]): AIV6Type.UIMessage['parts'][number] {

@@ -1,9 +1,11 @@
 import { randomUUID } from 'node:crypto';
 
 import type {
+  ChannelAdapterConfig,
   ChannelHandler,
   ChannelHandlerContext,
   ChannelHandlers,
+  ChannelSessionResolve,
   ChannelSessionStart,
   ResolveResourceId,
   ResolveThreadId,
@@ -388,6 +390,24 @@ export function createChannelResourceIdResolver(deps: SlackChannelDeps): Resolve
  */
 export const resolveChannelThreadId: ResolveThreadId = ({ resourceId, defaultThreadId }) =>
   resourceId.startsWith('channel:') ? defaultThreadId : resourceId;
+
+/** Create channel sessions with their Factory ownership present in initial controller state. */
+export function createChannelSessionResolver(deps: SlackChannelDeps): ChannelSessionResolve {
+  const { sourceControl } = deps;
+  return async ({ controller, thread, requestContext }) => {
+    const owner =
+      sourceControl && !thread.resourceId.startsWith('channel:')
+        ? await resolveFactoryProjectForSession({ sourceControl, sessionId: thread.resourceId })
+        : null;
+    return controller.createSession({
+      id: thread.resourceId,
+      ownerId: controller.id,
+      resourceId: thread.resourceId,
+      requestContext,
+      ...(owner ? { tags: { factoryProjectId: owner.factoryProjectId } } : {}),
+    });
+  };
+}
 
 /**
  * Apply the factory's configuration to a Slack-created session the first time
@@ -779,10 +799,21 @@ export function createSlackChannelsConfig(deps: SlackChannelDeps & { slack: Slac
   // Per HTTP attempt, not per call: the WebClient's own retry policy still
   // waits out a 429. Without it a dead socket hangs a post forever.
   const adapter = createSlackAdapter({ ...deps.slack, webClientOptions: { timeout: SLACK_REQUEST_TIMEOUT_MS } });
-  const slack =
-    deps.adapterOptions?.streaming === false
-      ? { adapter, ...deps.adapterOptions }
-      : { adapter, ...deps.adapterOptions, streaming: deps.adapterOptions?.streaming ?? true };
+  const { cards, formatToolCall, ...adapterOptions } = deps.adapterOptions ?? {};
+  // Core keeps legacy renderers exclusive with toolDisplay, which takes precedence.
+  const slack: ChannelAdapterConfig =
+    adapterOptions.toolDisplay === undefined
+      ? {
+          adapter,
+          ...adapterOptions,
+          streaming: adapterOptions.streaming ?? true,
+          toolDisplay: undefined,
+          cards,
+          formatToolCall,
+        }
+      : adapterOptions.streaming === false
+        ? { adapter, ...adapterOptions }
+        : { adapter, ...adapterOptions, streaming: adapterOptions.streaming ?? true };
 
   return {
     adapters: { slack },
@@ -791,6 +822,7 @@ export function createSlackChannelsConfig(deps: SlackChannelDeps & { slack: Slac
     // resourceId, which is what makes the controller session repo-backed.
     resolveResourceId: createChannelResourceIdResolver(deps),
     resolveThreadId: resolveChannelThreadId,
+    resolveSession: createChannelSessionResolver(deps),
     // Those sessions are created by the channel machinery, not the web kickoff,
     // so this is where they pick up the factory's configuration.
     onSessionStart: createChannelSessionStartHook(deps),

@@ -231,6 +231,7 @@ type StreamState = {
   toolPartById: Map<string, number>;
   /** Response ids offered by `step-start` — an id binds to at most one display message. */
   offeredResponseIds: Set<string>;
+  completedToolPrelude: boolean;
   /**
    * Set when a stream ends on a non-success finish reason (e.g. `content-filter`,
    * `error`, `length`). Carries the user-facing message so the run finalizes
@@ -342,6 +343,7 @@ export class SessionRunEngine {
     state.textContentById.clear();
     state.thinkingContentById.clear();
     state.toolPartById.clear();
+    state.completedToolPrelude = false;
   }
 
   createStreamState(): StreamState {
@@ -352,6 +354,7 @@ export class SessionRunEngine {
       thinkingContentById: new Map<string, { index: number; text: string }>(),
       toolPartById: new Map<string, number>(),
       offeredResponseIds: new Set<string>(),
+      completedToolPrelude: false,
     };
   }
 
@@ -522,7 +525,18 @@ export class SessionRunEngine {
         // An emitted id never changes, and an id binds to one message only.
         const messageId = getString(getPayload(chunk).messageId);
         if (!messageId || state.offeredResponseIds.has(messageId)) break;
-        if (state.offeredResponseIds.size > 0) this.finishCurrentMessageAndRotate(state);
+        // A resumed tool can finish before the first model step starts. Seal
+        // that tool-only prelude without changing its already observable id.
+        if (
+          state.offeredResponseIds.size > 0 ||
+          (state.completedToolPrelude &&
+            state.currentMessage.content.parts.every(
+              part => part.type === 'tool-invocation' && part.toolInvocation.state === 'result',
+            ))
+        ) {
+          this.finishCurrentMessageAndRotate(state);
+        }
+        state.completedToolPrelude = false;
         state.offeredResponseIds.add(messageId);
         if (!this.hasCurrentMessageContent(state)) {
           state.currentMessage.id = messageId;
@@ -835,6 +849,12 @@ export class SessionRunEngine {
       }
 
       case 'step-finish': {
+        state.completedToolPrelude =
+          state.offeredResponseIds.size === 0 &&
+          this.hasCurrentMessageContent(state) &&
+          state.currentMessage.content.parts.every(
+            part => part.type === 'tool-invocation' && part.toolInvocation.state === 'result',
+          );
         const usage = getRecord(getPayload(chunk).output)?.usage;
         const usageRecord = getRecord(usage);
         if (usageRecord) {

@@ -1,8 +1,10 @@
 import type { CoreMessage } from '@internal/ai-sdk-v4';
+import { zodSchema } from '@internal/ai-sdk-v4';
 import { MockLanguageModelV1 } from '@internal/ai-sdk-v4/test';
-import { jsonSchema as v6JsonSchema } from '@internal/ai-v6';
+import { jsonSchema as jsonSchemaV6 } from '@internal/ai-v6';
 import type { JSONSchema7 } from 'json-schema';
 import { describe, it, expect, vi } from 'vitest';
+import { z as z3 } from 'zod/v3';
 import { z } from 'zod/v4';
 import { RequestContext } from '../../request-context';
 import { MockProvider } from '../../test-utils/llm-mock';
@@ -90,7 +92,7 @@ describe('MastraLLM', () => {
           ? { success: true as const, value: { count: count * 2 } }
           : { success: false as const, error: validationError };
       });
-      const parameters = v6JsonSchema<{ count: number }>(
+      const parameters = jsonSchemaV6<{ count: number }>(
         { type: 'object', properties: { count: { type: 'number' } }, required: ['count'] },
         { validate },
       );
@@ -411,10 +413,17 @@ describe('MastraLLM', () => {
 
     it('should handle pre-converted tools', async () => {
       const messages: CoreMessage[] = [{ role: 'user', content: 'test message' }];
+      const sourceSchema = zodSchema(z3.object({ test: z3.string() }));
+      const tools = {
+        testTool: {
+          ...mockTools.testTool,
+          parameters: jsonSchemaV6(sourceSchema.jsonSchema, { validate: sourceSchema.validate }),
+        },
+      };
 
       await aisdkText.__text({
         messages,
-        tools: mockTools,
+        tools,
         temperature: 0.7,
         maxSteps: 5,
         requestContext,
@@ -422,6 +431,12 @@ describe('MastraLLM', () => {
       });
 
       expect(generateSpy).toHaveBeenCalled();
+      expect(Reflect.get(tools.testTool.parameters, Symbol.for('vercel.ai.validator'))).toBe(true);
+      expect(await tools.testTool.parameters.validate?.({ test: 'value' })).toEqual({
+        success: true,
+        value: { test: 'value' },
+      });
+      expect(await tools.testTool.parameters.validate?.({ test: 42 })).toMatchObject({ success: false });
     });
 
     it('should handle onStepFinish callback', async () => {
@@ -536,10 +551,17 @@ describe('MastraLLM', () => {
 
     it('should handle pre-converted tools', async () => {
       const messages: CoreMessage[] = [{ role: 'user', content: 'test message' }];
+      const sourceSchema = zodSchema(z3.object({ test: z3.string() }));
+      const tools = {
+        testTool: {
+          ...mockTools.testTool,
+          parameters: jsonSchemaV6(sourceSchema.jsonSchema, { validate: sourceSchema.validate }),
+        },
+      };
 
       await aisdkText.__stream({
         messages,
-        tools: mockTools,
+        tools,
         temperature: 0.7,
         maxSteps: 5,
         requestContext,
@@ -547,6 +569,12 @@ describe('MastraLLM', () => {
       });
 
       expect(streamSpy).toHaveBeenCalled();
+      expect(Reflect.get(tools.testTool.parameters, Symbol.for('vercel.ai.validator'))).toBe(true);
+      expect(await tools.testTool.parameters.validate?.({ test: 'value' })).toEqual({
+        success: true,
+        value: { test: 'value' },
+      });
+      expect(await tools.testTool.parameters.validate?.({ test: 42 })).toMatchObject({ success: false });
     });
 
     it('should handle callbacks', async () => {
