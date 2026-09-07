@@ -90,8 +90,8 @@ export function createAgenticExecutionWorkflow<Tools extends ToolSet = ToolSet, 
     ...rest,
   });
 
-  const evented = process.env.MASTRA_EVENTED_EXECUTION === 'true';
-  const createWorkflow = evented ? createEventedWorkflow : createDirectWorkflow;
+  const isEvented = process.env.MASTRA_EVENTED_EXECUTION === 'true';
+  const createWorkflow = isEvented ? createEventedWorkflow : createDirectWorkflow;
 
   const workflow = createWorkflow({
     id: AGENTIC_EXECUTION_WORKFLOW_ID,
@@ -167,14 +167,12 @@ export function createAgenticExecutionWorkflow<Tools extends ToolSet = ToolSet, 
     .then(backgroundTaskCheckStep)
     .then(signalDrainStep);
 
-  // Omit only absent capabilities: supplied configuration may change between
-  // iterations, even when it initially has no scorers or active goal.
-  // Evented recovery requires the retained graph to match exactly, including
-  // when a caller first supplies completion configuration on approval resume.
-  if (evented || rest.isTaskComplete !== undefined) {
+  // Evented recovery requires the retained and current graph fingerprints to
+  // match. Direct runs can omit stages whose captured configuration is absent.
+  if (isEvented || rest.isTaskComplete !== undefined) {
     workflow.then(createIsTaskCompleteStep({ models, _internal, ...rest }));
   }
-  if (evented || rest.goal !== undefined) {
+  if (isEvented || rest.goal !== undefined) {
     workflow.then(createGoalStep({ models, _internal, ...rest }));
   }
 
