@@ -1339,6 +1339,35 @@ export class WorkflowEventProcessor extends EventProcessor {
       }
     }
 
+    const guardedResume =
+      lifecycleStartKind === 'resume' && !parentWorkflow && workflowsStore?.supportsConcurrentUpdates();
+    if (guardedResume && workflowsStore) {
+      // The publisher already claimed this suspension. Recheck that exact claim
+      // after parent admission and never replace its snapshot with an unguarded
+      // running payload: cancellation may have committed while dispatch waited.
+      const currentClaim = await workflowsStore.updateWorkflowState({
+        workflowName: workflow.id,
+        runId,
+        opts: {
+          status: 'running',
+          expectedStatus: 'running',
+          expectedExecutionGeneration: executionGeneration,
+          expectedLifecycleResumeAttempt: lifecycleResumeAttempt,
+          ...(shouldInitializeSnapshot
+            ? {
+                activePaths: [],
+                suspendedPaths: {},
+                resumeLabels: {},
+                waitingPaths: {},
+                activeStepsPath: {},
+                lifecycleStepStates,
+              }
+            : {}),
+        },
+      });
+      if (!currentClaim) return;
+    }
+
     // The run is now admitted (or readmitted through time travel/restart), so
     // cancel any terminal-topic cleanup before the first new watch event is
     // published. Delaying this until after durable parent admission keeps a
@@ -1374,7 +1403,7 @@ export class WorkflowEventProcessor extends EventProcessor {
             },
     });
 
-    if (shouldInitializeSnapshot && workflowsStore && !childSnapshotEnsuredByAdmission) {
+    if (shouldInitializeSnapshot && workflowsStore && !childSnapshotEnsuredByAdmission && !guardedResume) {
       await workflowsStore.persistWorkflowSnapshot({
         workflowName: workflow.id,
         runId,

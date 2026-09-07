@@ -798,12 +798,9 @@ export interface WorkflowOptions {
   }) => boolean;
 
   /**
-   * Acknowledges that `resume()` calls for this workflow cannot be de-duplicated
-   * via the persisted resume claim (for example because `shouldPersistSnapshot`
-   * excludes the `running` status), and suppresses the per-resume warning.
-   *
-   * Set by internal workflows that intentionally trade resume de-duplication
-   * for reduced snapshot writes and serialize their own resumes.
+   * Suppresses the warning when storage cannot atomically claim resumes.
+   * Concurrent-update stores always claim ownership independently of snapshot
+   * persistence, even when this option is true.
    */
   allowUnclaimedResumes?: boolean;
 

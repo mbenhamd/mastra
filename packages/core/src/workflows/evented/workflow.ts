@@ -88,7 +88,7 @@ import type {
   WorkflowLifecycleWatchOptions,
 } from '../../workflows/types';
 import { PUBSUB_SYMBOL, STREAM_FORMAT_SYMBOL, TRANSIENT_EXECUTION_SYMBOL } from '../constants';
-import { createWorkflowExecutionGeneration } from '../lifecycle-events';
+import { createWorkflowExecutionGeneration, requireWorkflowExecutionGeneration } from '../lifecycle-events';
 import { validateCron } from '../scheduler/cron';
 import type { WorkflowScheduleConfig } from '../scheduler/types';
 import { getEntryId } from '../step-entry';
@@ -1727,6 +1727,7 @@ export function createWorkflow<
       shouldPersistSnapshot:
         params.options?.shouldPersistSnapshot ?? (params.type === 'processor' ? () => false : () => true),
       pruneSnapshot: params.options?.pruneSnapshot,
+      allowUnclaimedResumes: params.options?.allowUnclaimedResumes,
       tracingPolicy: params.options?.tracingPolicy,
       onStart: params.options?.onStart,
       onFinish: params.options?.onFinish,
@@ -2746,6 +2747,11 @@ export class EventedRun<
 
     // Extract state from snapshot - could be in context.__state or in value
     const resumeState = (snapshot?.context as any)?.__state ?? snapshot?.value ?? {};
+    const executionGeneration = requireWorkflowExecutionGeneration(
+      snapshot.executionGeneration,
+      `Workflow run ${this.workflowId}/${this.runId}`,
+    );
+    await this.claimResume({ workflowsStore, snapshot, executionGeneration });
     const lifecycleExecution = this.restoreLifecycleExecution(snapshot);
     this.workflowRunStatus = 'running';
 

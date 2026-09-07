@@ -229,7 +229,11 @@ If `forEachIndex` is omitted, every suspended iteration of the step is resumed w
 
 ## Concurrent resume calls
 
-Only one `resume()` call can continue a suspension. Before it runs anything, `resume()` atomically claims the run by moving its stored status from `suspended` to `running`. If another caller already claimed it, this call throws `WORKFLOW_RESUME_ALREADY_CLAIMED` and executes no steps, so downstream steps and their side effects run once per suspension.
+On storage adapters that support concurrent updates, only one `resume()` call can continue a suspension. Both default and evented workflows claim the run before dispatching work. The claim requires a suspended run at the expected execution generation and resume attempt.
+
+The claim moves the stored status from `suspended` to `running` even when `shouldPersistSnapshot` excludes running snapshots. It retains the suspended payload.
+
+If another caller already claimed the suspension, this call throws `WORKFLOW_RESUME_ALREADY_CLAIMED` and executes no steps.
 
 This matters whenever a resume can be triggered more than once, such as an approval button pressed twice or a retried webhook. It also applies when several server instances react to the same event.
 
@@ -248,7 +252,9 @@ Over HTTP, a losing resume returns `409 Conflict`.
 
 :::note
 
-The claim is enforced atomically by storage adapters that report `supportsConcurrentUpdates()`. Adapters without atomic read-modify-write support (such as ClickHouse, Cloudflare D1, Cloudflare KV, Cloudflare Durable Objects, LanceDB, and Redis) can't enforce it, and the claim is also skipped when `shouldPersistSnapshot` excludes the `running` status.
+The claim is enforced atomically by storage adapters that report `supportsConcurrentUpdates()`. Adapters without this capability retain best-effort behavior, so concurrent resumes can still overlap.
+
+If execution fails after claiming a suspension, the claim remains consumed. The retained payload can't prove that execution never began, so retrying doesn't automatically release the claim or repeat its side effects. This also applies to failures before the first step when storage has no evidence that retrying is safe.
 
 :::
 

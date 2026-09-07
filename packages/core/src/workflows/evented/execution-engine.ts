@@ -1,4 +1,5 @@
 import type { RequestContext } from '../../di';
+import { ErrorCategory, ErrorDomain, MastraError } from '../../error';
 import type { PubSub } from '../../events/pubsub';
 import type { Event } from '../../events/types';
 import type { Mastra } from '../../mastra';
@@ -107,10 +108,8 @@ export class EventedExecutionEngine extends ExecutionEngine {
     // Set up promise that will resolve when workflow finishes
     // CRITICAL: Must subscribe BEFORE publishing events to avoid race condition
     let resolveResult!: (data: any) => void;
-    let rejectResult!: (error: any) => void;
-    const resultPromise = new Promise<any>((resolve, reject) => {
+    const resultPromise = new Promise<any>(resolve => {
       resolveResult = resolve;
-      rejectResult = reject;
     });
 
     const finishCb = async (event: Event, ack?: () => Promise<void>) => {
@@ -141,8 +140,50 @@ export class EventedExecutionEngine extends ExecutionEngine {
       throw err;
     }
 
-    // NOW safe to publish - listener is guaranteed to be registered
-    // Wrap in try/catch to ensure proper cleanup and rejection on errors
+    // NOW safe to publish - listener is guaranteed to be registered. Validate a
+    // claimed resume outside the publish catch so the fail-closed path does not
+    // reject resultPromise, which has no consumer when no event is dispatched.
+    if (params.resume) {
+      try {
+        const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
+        if (workflowsStore?.supportsConcurrentUpdates()) {
+          const current = await workflowsStore.loadWorkflowSnapshot({
+            workflowName: params.workflowId,
+            runId: params.runId,
+          });
+          const claimed =
+            current?.status === 'running' &&
+            current.executionGeneration === executionGeneration &&
+            (current.lifecycleResumeAttempt ?? 0) === lifecycleResumeAttempt;
+          if (!claimed) {
+            throw new MastraError({
+              id: 'WORKFLOW_RESUME_ALREADY_CLAIMED',
+              domain: ErrorDomain.MASTRA_WORKFLOW,
+              category: ErrorCategory.USER,
+              text:
+                `This suspended workflow run was already resumed by another caller. Workflow "${params.workflowId}" run "${params.runId}" ` +
+                `changed before this resume could dispatch. ` +
+                `Only one resume() call may continue a given suspension; re-read the run state before resuming again.`,
+              details: {
+                workflowId: params.workflowId,
+                runId: params.runId,
+                expectedStatus: 'running',
+                actualStatus: current?.status ?? 'unknown',
+                expectedExecutionGeneration: executionGeneration,
+                actualExecutionGeneration: current?.executionGeneration ?? 'unknown',
+                expectedLifecycleResumeAttempt: lifecycleResumeAttempt,
+                actualLifecycleResumeAttempt: current?.lifecycleResumeAttempt ?? 0,
+              },
+            });
+          }
+        }
+      } catch (err) {
+        await pubsub.unsubscribe('workflows-finish', finishCb);
+        throw err;
+      }
+    }
+
+    // Wrap publishing in try/catch to ensure proper cleanup and rejection on errors.
     try {
       if (params.resume) {
         const prevStepId = getStepId(this.resolveWorkflow(params.workflowId, params.runId), params.resume.resumePath);
@@ -241,9 +282,8 @@ export class EventedExecutionEngine extends ExecutionEngine {
         });
       }
     } catch (err) {
-      // Clean up subscription and reject the promise on error
+      // Clean up the subscription; execute() propagates the publish error.
       await pubsub.unsubscribe('workflows-finish', finishCb);
-      rejectResult(err);
       throw err;
     }
 
