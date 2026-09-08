@@ -81,11 +81,11 @@ await session.respondToToolApproval({
 })
 ```
 
-`editedArgs` is a shallow JSON object patch. Omitted fields retain their original values; nested objects and arrays replace the corresponding value in full. The merged input must pass the tool's input validator before execution. Edits don't change permission policy or the selected approval scope.
+`editedArgs` is a shallow JSON object patch. Omitted fields retain their original values. Nested objects and arrays replace the corresponding value in full. The merged input must pass the tool's input validator before execution. Edits don't change permission policy or the selected approval scope.
 
 Edits require `approved: true`. They aren't supported for durable agents, delegated agent or workflow tools, or approval requests raised inside a running tool. Resume-control fields can't be edited. Unsupported or invalid edits fail without executing the tool.
 
-For retries, reuse the same `responseId` and complete response. Exact retries are idempotent; changing `editedArgs` under an existing response ID produces a conflict. Queued and restored responses retain the patch, and a tool that suspends again retains its approved input.
+For retries, reuse the same `responseId` and complete response. Exact retries are idempotent. Changing `editedArgs` under an existing response ID produces a conflict. Queued and restored responses retain the patch, and a tool that suspends again retains its approved input.
 
 See the [session API reference](/reference/harness/session#tool-approvals) for response options.
 

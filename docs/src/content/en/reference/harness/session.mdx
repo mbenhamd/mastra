@@ -110,7 +110,7 @@ Send a user-message signal to the active thread. If a run is active, the signal 
 
 Without `admissionId`, `signal()` preserves its optimistic boundary and returns the native routing decision on the first await tick. With `admissionId`, it first persists a reservation and claims dispatch ownership. It then waits for native or broker acceptance and durably records that acceptance. A live competing dispatcher waits for the claim. An expired dispatcher may recover it.
 
-If native acceptance remains ambiguous for 30 seconds, or the caller aborts while waiting for it, the call rejects and stops renewing its dispatch claim. The durable row remains recoverable instead of being marked failed. After that claim expires, retry the same `admissionId` and payload: the retry acquires a new dispatch attempt while retaining the original signal and run IDs. The native runtime doesn't reuse a still-pending acknowledgement from the expired attempt. Stable signal-ID deduplication still prevents an already-accepted same-payload signal from being appended twice. A conflicting payload with the same `admissionId` continues to reject before dispatch.
+If native acceptance remains ambiguous for 30 seconds, or the caller aborts while waiting for it, the call rejects and stops renewing its dispatch claim. The durable row remains recoverable instead of being marked failed. After that claim expires, retry the same `admissionId` and payload. This acquires a new dispatch attempt with the original signal and run IDs, without reusing a still-pending acknowledgement from the expired attempt. Stable signal-ID deduplication still prevents an already-accepted same-payload signal from being appended twice. A conflicting payload with the same `admissionId` continues to reject before dispatch.
 
 ```typescript
 const session = await harness.session({ resourceId: 'project-xyz' })
@@ -124,7 +124,7 @@ const result = await handle.result
 
 An exact admitted retry returns the original signal and run identity. Idle recovery always reuses the deterministic idle run ID. Accepted active delivery is pinned to the original active run and fails explicitly if that run disappears. It's never rerouted to a new cold run.
 
-Durable admission evidence records whether the operation came from `message()` or `signal()`. This keeps signal dispatch fencing isolated from normal message settlement across process restarts. Older admitted signal rows are migrated only when they already contain dispatch state or use the stable `harness-channel-signal-` identity; a run ID by itself isn't treated as evidence that the row is a signal.
+Durable admission evidence records whether the operation came from `message()` or `signal()`. This keeps signal dispatch fencing isolated from normal message settlement across process restarts. Older admitted signal rows are migrated only when they already contain dispatch state or use the stable `harness-channel-signal-` identity. A run ID by itself isn't treated as evidence that the row is a signal.
 
 `admissionId` provides a stable at-least-once execution identity, not exactly-once side effects. After a crash or lost acknowledgement, recovery may repeat provider or tool work under the same run ID. External effects still need their own idempotency keys when exactly-once behavior matters.
 
@@ -161,11 +161,11 @@ const grants = harness.session.getGrants()
 
 #### `respondToToolApproval({ approved, editedArgs?, reason?, approvalScope?, ...generation })`
 
-Respond to a pending tool approval. `approved: false` declines execution; `reason` provides an optional explanation. `approvalScope` is `'once'` by default, or `'always'` to grant the pending tool for the rest of the session. The latter requires `approved: true`.
+Respond to a pending tool approval. `approved: false` declines execution. Use `reason` to provide an optional explanation. `approvalScope` is `'once'` by default, or `'always'` to grant the pending tool for the rest of the session. The latter requires `approved: true`.
 
-`editedArgs` is an optional shallow JSON object patch for regular agent tool-gate approvals. The merged input must pass the tool's native input validator. Durable agents, delegated tools, and approvals raised inside tool execution reject edits. See [edit inputs before approval](/docs/harness/tool-approvals#edit-inputs-before-approval) for merge and validation behavior.
+`editedArgs` is an optional shallow JSON object patch for regular agent tool-gate approvals. The merged input must pass the tool's native input validator. Durable agents reject edits. This restriction also applies to delegated tools and approvals raised inside tool execution. See [edit inputs before approval](/docs/harness/tool-approvals#edit-inputs-before-approval) for merge and validation behavior.
 
-Include `responseId`, `itemId`, `runId`, `toolCallId`, and `pendingRequestedAt` to bind the response to the displayed pending generation and receive an inbox receipt. Reuse that complete response for an idempotent retry; a different patch under the same response ID conflicts.
+Include `responseId`, `itemId`, `runId`, `toolCallId`, and `pendingRequestedAt` to bind the response to the displayed pending generation and receive an inbox receipt. Reuse that complete response for an idempotent retry. A different patch under the same response ID conflicts.
 
 ```typescript
 const pending = session.getRecord().pendingResume!
@@ -616,7 +616,7 @@ const state = harness.session.state.get()
 
 ### `session.state.set(updates)`
 
-Merge a partial update into the state. Updates are queued so concurrent calls apply in order, validated against the schema, and emit `state_changed` with the changed keys.
+Merge a partial update into the state. The write queue applies concurrent calls in order after schema validation. State changes emit `state_changed` with the changed keys.
 
 ```typescript
 await harness.session.state.set({ yolo: true })
@@ -624,7 +624,7 @@ await harness.session.state.set({ yolo: true })
 
 ### `session.state.update(updater)`
 
-Run an updater against the current snapshot and apply its result atomically within the write queue. Use this for read-modify-write changes that must see the latest state. The updater returns `updates` to merge, optional `events` to emit, and a `result` value that `update()` resolves to.
+Run an updater against the current snapshot and apply its result atomically within the write queue. Use this for read-modify-write changes that must see the latest state. The updater returns `updates` to merge and may include `events` to emit. Its `result` field becomes the resolved value of `update()`.
 
 ```typescript
 const added = await harness.session.state.update(current => ({
