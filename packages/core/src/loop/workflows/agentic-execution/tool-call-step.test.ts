@@ -57,6 +57,22 @@ describe('createToolCallStep background task resume with falsy payload', () => {
     vi.restoreAllMocks();
   });
 
+  const makeBackgroundSuspendData = () => ({
+    toolCallResume: {
+      version: 1,
+      originRunId: 'current-run',
+      stepId: 'toolCallStep',
+      type: 'suspension',
+      toolCallId: 'call-1',
+      toolName: 'background-tool',
+      identityDigest: createToolCallIdentityDigest({
+        toolCallId: 'call-1',
+        toolName: 'background-tool',
+        args: { query: 'customers' },
+      }),
+    },
+  });
+
   const runBackgroundResume = async (resumeData: unknown) => {
     const controller = { enqueue: vi.fn() };
     const streamState = { serialize: vi.fn().mockReturnValue('serialized-state') };
@@ -93,6 +109,7 @@ describe('createToolCallStep background task resume with falsy payload', () => {
     await toolCallStep.execute(
       makeBaseExecuteParams(vi.fn(), {
         resumeData,
+        suspendData: makeBackgroundSuspendData(),
         inputData: { toolCallId: 'call-1', toolName: 'background-tool', args: { query: 'customers' } },
       }),
     );
@@ -147,6 +164,7 @@ describe('createToolCallStep background task resume with falsy payload', () => {
     await toolCallStep.execute(
       makeBaseExecuteParams(vi.fn(), {
         resumeData,
+        suspendData: makeBackgroundSuspendData(),
         inputData: { toolCallId: 'call-1', toolName: 'background-tool', args: { query: 'customers' } },
       }),
     );
@@ -222,6 +240,7 @@ describe('createToolCallStep background task resume with falsy payload', () => {
     await toolCallStep.execute(
       makeBaseExecuteParams(vi.fn(), {
         resumeData: false,
+        suspendData: makeBackgroundSuspendData(),
         inputData: { toolCallId: 'call-1', toolName: 'background-tool', args: { query: 'customers' } },
       }),
     );
