@@ -642,11 +642,16 @@ export const harnessInboxResponseBodySchema = z.discriminatedUnion('kind', [
     .object({
       kind: z.literal('tool-approval'),
       approved: z.boolean(),
+      editedArgs: jsonRecordSchema.optional(),
       reason: z.string().optional(),
       approvalScope: z.enum(['once', 'always']).optional(),
       ...harnessInboxResponseGenerationShape,
     })
     .strict()
+    .refine(value => value.editedArgs === undefined || value.approved, {
+      message: 'editedArgs requires approved: true',
+      path: ['editedArgs'],
+    })
     .refine(value => value.approvalScope !== 'always' || value.approved, {
       message: 'approvalScope "always" requires approved: true',
       path: ['approvalScope'],

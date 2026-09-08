@@ -769,6 +769,7 @@ describe('Session — respondToToolApproval / Suspension / Question / PlanApprov
       ...pendingResponseIdentity(pending),
       responseId: 'allow-always-response',
       approved: true,
+      editedArgs: { cmd: 'pwd' },
       approvalScope: 'always' as const,
     };
     const first = await session.respondToToolApproval(response);
@@ -783,6 +784,10 @@ describe('Session — respondToToolApproval / Suspension / Question / PlanApprov
     });
     expect(events).toEqual(['shell']);
     expect(agent.resumeCalls).toHaveLength(1);
+    expect(agent.resumeCalls[0]!.resumeData).toEqual({ approved: true, editedArgs: { cmd: 'pwd' } });
+    await expect(session.respondToToolApproval({ ...response, editedArgs: { cmd: 'whoami' } })).rejects.toThrow();
+    expect(agent.resumeCalls).toHaveLength(1);
+    await harness.shutdown();
   });
 
   it('lets Stop cancel execution after admission while retaining the committed allow-always policy grant', async () => {
@@ -852,6 +857,9 @@ describe('Session — respondToToolApproval / Suspension / Question / PlanApprov
     );
     expect(session.permissions.getGrants().tools).toEqual([]);
     expect(session.getRecord().pendingResume).toBeDefined();
+    await expect(session.respondToToolApproval({ approved: false, editedArgs: { cmd: 'pwd' } })).rejects.toBeInstanceOf(
+      HarnessValidationError,
+    );
     expect(agent.resumeCalls).toHaveLength(0);
   });
 

@@ -159,14 +159,25 @@ const grants = harness.session.getGrants()
 
 ### Tool approvals
 
-#### `respondToToolApproval({ decision, requestContext? })`
+#### `respondToToolApproval({ approved, editedArgs?, reason?, approvalScope?, ...generation })`
 
-Respond to a pending tool approval request, raised by a `tool_approval_required` event. Pass `always_allow_category` to also grant the tool's whole category for the rest of the session.
+Respond to a pending tool approval. `approved: false` declines execution; `reason` provides an optional explanation. `approvalScope` is `'once'` by default, or `'always'` to grant the pending tool for the rest of the session. The latter requires `approved: true`.
+
+`editedArgs` is an optional shallow JSON object patch for regular agent tool-gate approvals. The merged input must pass the tool's native input validator. Durable agents, delegated tools, and approvals raised inside tool execution reject edits. See [edit inputs before approval](/docs/harness/tool-approvals#edit-inputs-before-approval) for merge and validation behavior.
+
+Include `responseId`, `itemId`, `runId`, `toolCallId`, and `pendingRequestedAt` to bind the response to the displayed pending generation and receive an inbox receipt. Reuse that complete response for an idempotent retry; a different patch under the same response ID conflicts.
 
 ```typescript
-harness.session.respondToToolApproval({ decision: 'approve' })
-harness.session.respondToToolApproval({ decision: 'decline' })
-harness.session.respondToToolApproval({ decision: 'always_allow_category' })
+const pending = session.getRecord().pendingResume!
+await session.respondToToolApproval({
+  itemId: pending.itemId ?? pending.toolCallId,
+  responseId: crypto.randomUUID(),
+  runId: pending.runId,
+  toolCallId: pending.toolCallId,
+  pendingRequestedAt: pending.requestedAt,
+  approved: true,
+  editedArgs: { query: 'reviewed search query' },
+})
 ```
 
 ### Run control

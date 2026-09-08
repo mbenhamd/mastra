@@ -394,6 +394,7 @@ describe('Harness Resource', () => {
       itemId: 'approval-item',
       responseId: 'approval-item-response',
       approved: true,
+      editedArgs: { query: 'reviewed query' },
       approvalScope: 'once',
       ...generation,
     });
@@ -433,6 +434,7 @@ describe('Harness Resource', () => {
           kind: 'tool-approval',
           responseId: 'approval-item-response',
           approved: true,
+          editedArgs: { query: 'reviewed query' },
           approvalScope: 'once',
           ...generation,
         }),

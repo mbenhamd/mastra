@@ -839,6 +839,135 @@ describe('createToolCallStep tool approval workflow', () => {
     vi.restoreAllMocks();
   });
 
+  it('executes validated edited approval arguments and preserves them through snapshot re-suspension', async () => {
+    const originalArgs = { param: 'test', limit: 3, nested: { left: 1, right: 2 } };
+    const editedArgs = { param: 'edited value', nested: { left: 9 } };
+    const approvedArgs = { ...originalArgs, ...editedArgs };
+    const execute = vi.fn(async (args, context) => {
+      if (!context.resumeData) await context.suspend({ reason: 'more input' });
+      return args;
+    });
+    const builtTool = new CoreToolBuilder({
+      originalTool: {
+        id: 'test-tool',
+        description: 'Test edited approval',
+        requireApproval: true,
+        inputSchema: z
+          .object({
+            param: z
+              .string()
+              .min(1)
+              .transform(value => `${value}!`),
+            limit: z.number(),
+            nested: z.object({ left: z.number(), right: z.number().optional() }),
+          })
+          .strict(),
+        execute,
+      } as any,
+      options: {
+        name: 'test-tool',
+        description: 'Test edited approval',
+        requestContext: new RequestContext(),
+        logger: { debug: vi.fn(), warn: vi.fn(), error: vi.fn(), trackException: vi.fn() } as any,
+      },
+    }).build();
+    const step = createToolCallStep({
+      tools: { 'test-tool': builtTool },
+      messageList,
+      controller,
+      runId: 'test-run',
+      streamState,
+    } as any);
+    const inputData = { ...makeInputData(), args: originalArgs };
+    const suspendData = makeSuspendData();
+    suspendData.toolCallResume.identityDigest = createToolCallIdentityDigest(inputData);
+    const persistSnapshot = vi.fn().mockResolvedValue(undefined);
+    await step.execute(
+      makeExecuteParams({
+        inputData,
+        resumeData: { approved: true, editedArgs },
+        suspendData,
+        suspend: persistSnapshot,
+      }),
+    );
+
+    expect(execute).toHaveBeenCalledOnce();
+    expect(execute.mock.calls[0]![0]).toEqual({ ...approvedArgs, param: 'edited value!' });
+    const snapshot = JSON.parse(JSON.stringify(persistSnapshot.mock.calls[0]![0]));
+    expect(snapshot.toolCallResume).toMatchObject({
+      identityDigest: createToolCallIdentityDigest({ ...inputData, args: approvedArgs }),
+      approval: { id: 'test-call-id', approved: true },
+    });
+    expect(
+      controller.enqueue.mock.calls.find(([chunk]) => chunk.type === 'tool-call-suspended')![0].payload,
+    ).not.toHaveProperty('approvedArgs');
+    // Workflow snapshots retain the original step input; the verified envelope
+    // restores the approved arguments when the tool suspends a second time.
+    const result = await step.execute(
+      makeExecuteParams({ inputData, resumeData: { answer: 'continue' }, suspendData: snapshot }),
+    );
+    expect(execute).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({
+      args: approvedArgs,
+      result: { ...approvedArgs, param: 'edited value!' },
+      approval: { approved: true },
+    });
+    expect(originalArgs).toEqual({ param: 'test', limit: 3, nested: { left: 1, right: 2 } });
+  });
+
+  it('rejects invalid or unsupported edited approvals before tool side effects', async () => {
+    const execute = vi.fn(async args => args);
+    const builtTool = new CoreToolBuilder({
+      originalTool: createTool({
+        id: 'test-tool',
+        description: 'Strict tool',
+        requireApproval: true,
+        inputSchema: z.object({ param: z.string().min(1) }).strict(),
+        execute,
+      }),
+      options: {
+        name: 'test-tool',
+        description: 'Strict tool',
+        requestContext: new RequestContext(),
+        logger: { debug: vi.fn(), warn: vi.fn(), error: vi.fn(), trackException: vi.fn() } as any,
+      },
+    }).build();
+    const step = createToolCallStep({
+      tools: { 'test-tool': builtTool },
+      messageList,
+      controller,
+      runId: 'test-run',
+      streamState,
+    } as any);
+    for (const [resumeData, suspendData] of [
+      [{ approved: true, editedArgs: { unexpected: 'no' } }, makeSuspendData()],
+      [{ approved: false, editedArgs: { param: 'changed' } }, makeSuspendData()],
+      [{ approved: true, editedArgs: { resumeData: { approved: true } } }, makeSuspendData()],
+      [{ approved: true, editedArgs: { param: 'changed' } }, makeSuspendData('approval', 'tool-execution')],
+      [
+        { approved: true, editedArgs: { param: 'changed' } },
+        { ...makeSuspendData(), suspendedToolRunId: 'delegate-run' },
+      ],
+      [
+        { approved: true, editedArgs: { param: 'changed' } },
+        { toolCallResume: { ...makeSuspendData().toolCallResume, identityDigest: 'tampered' } },
+      ],
+    ]) {
+      const result = await step.execute(makeExecuteParams({ resumeData, suspendData }));
+      expect(result.error ?? result.result?.error).toBeTruthy();
+    }
+    const unvalidated = await toolCallStep.execute(
+      makeExecuteParams({
+        resumeData: { approved: true, editedArgs: { param: 'changed' } },
+        suspendData: makeSuspendData(),
+      }),
+    );
+    expect(unvalidated.error.message).toBe('Edited approval arguments require a tool input validator');
+    expectNoToolExecution();
+    expect(execute).not.toHaveBeenCalled();
+    expect(suspend).not.toHaveBeenCalled();
+  });
+
   it('returns invalid input to the model before asking for approval', async () => {
     const validationError = {
       error: true,

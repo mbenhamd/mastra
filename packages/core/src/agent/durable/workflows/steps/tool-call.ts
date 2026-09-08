@@ -935,6 +935,16 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
         };
       }
 
+      if (isApprovalResume && approvalDecision?.editedArgs !== undefined) {
+        return {
+          ...typedInput,
+          error: {
+            name: 'DurableResumeValidationError',
+            message: 'Edited approval arguments are not supported by durable agents',
+          },
+        };
+      }
+
       const resumeTarget = metadataToolCallId !== toolCallId ? { resumeTargetToolCallId: metadataToolCallId } : {};
 
       if (hasValidApprovalDecision && approvalDecision.approved === false) {

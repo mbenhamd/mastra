@@ -72,6 +72,7 @@ export type InboxResponseBody =
   | (InboxResponseGeneration & {
       kind: 'tool-approval';
       approved: boolean;
+      editedArgs?: JsonObject;
       reason?: string;
       approvalScope?: 'once' | 'always';
     })
@@ -381,6 +382,7 @@ export class RemoteSession extends BaseResource {
     options: InboxResponseGeneration & {
       itemId: string;
       approved: boolean;
+      editedArgs?: JsonObject;
       reason?: string;
       approvalScope?: 'once' | 'always';
     },

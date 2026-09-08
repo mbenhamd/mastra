@@ -1474,7 +1474,7 @@ describe('Harness v1 real-agent E2E — S3 approval suspend/resume', () => {
       const eventsAtSuspend = events.length;
 
       // Approve → real resumeStream runs the approved tool + post-approval turn.
-      await session.respondToToolApproval({ approved: true });
+      await session.respondToToolApproval({ approved: true, editedArgs: { name: 'Reviewed User' } });
 
       await waitFor(
         () => events.some(e => e.type === 'agent_end' && (e as any).finishReason === 'complete'),
@@ -1504,7 +1504,7 @@ describe('Harness v1 real-agent E2E — S3 approval suspend/resume', () => {
       expect(postResumeToolEnd!.toolName).toBe('findUser');
       expect(postResumeToolEnd!.toolCallId).toBe('call-approve');
       expect(postResumeToolEnd!.isError).toBe(false);
-      expect(postResumeToolEnd!.output).toEqual({ name: 'Dero Israel', email: 'dero@mail.com' });
+      expect(postResumeToolEnd!.output).toEqual({ name: 'Reviewed User', email: 'dero@mail.com' });
 
       // The post-approval model text surfaced as live `text_delta`s.
       const postResumeText = (postResumeEvents.filter(e => e.type === 'text_delta') as Array<{ delta: string }>)
