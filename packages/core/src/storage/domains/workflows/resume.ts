@@ -7,6 +7,7 @@ import type {
   WorkflowResumeResultReceiptV1,
   WorkflowRunState,
 } from '../../../workflows';
+import type { WorkflowLifecycleEvent } from '../../../workflows/lifecycle-events';
 import type {
   AdmitWorkflowResumeInput,
   AdmitWorkflowResumeResult,
@@ -21,6 +22,8 @@ import type {
 } from '../../types';
 
 export const WORKFLOW_RESUME_RESULT_RECEIPT_MAX_BYTES = 8 * 1024 * 1024;
+/** Bounded canonical lifecycle events retained on a fenced snapshot. */
+export const WORKFLOW_LIFECYCLE_OUTBOX_LIMIT = 32;
 
 type MaterializeSnapshot = (snapshot: WorkflowRunState) => WorkflowRunState;
 
@@ -53,6 +56,7 @@ const WORKFLOW_STATE_RUNTIME_KEYS = new Set([
   'tripwire',
   'stepExecutionPath',
   'tracingContext',
+  'lifecycleOutbox',
 ]);
 
 function fail(reason: string): never {
@@ -443,15 +447,20 @@ export function persistWorkflowStepUpdateRecord(
     return { status: 'invalid_snapshot' };
   }
 
+  const acceptedEvents = acceptedLifecycleEvents(input.lifecycleEvents);
+
   if (!existing && input.expectedResumeOperationHash !== undefined) {
     return { status: 'missing_run' };
   }
   if (!existing) {
-    return { status: 'persisted', snapshot: proposed };
+    return persistedStepUpdate(proposed, acceptedEvents, undefined);
   }
 
   if (existing.resumeResultReceipt || TERMINAL_STATUSES.has(existing.status)) {
-    return { status: 'finalized' };
+    return {
+      status: 'finalized',
+      disposition: TERMINAL_STATUSES.has(existing.status) ? existing.status : 'superseded',
+    };
   }
   if (input.expectedResumeOperationHash !== undefined) {
     const checkpoint = existing.resumeCheckpoint
@@ -473,7 +482,7 @@ export function persistWorkflowStepUpdateRecord(
     existing.executionGeneration !== undefined &&
     existing.executionGeneration !== input.expectedExecutionGeneration
   ) {
-    return { status: 'stale_execution' };
+    return { status: 'stale_execution', disposition: 'superseded' };
   }
   const isUnadmittedOrdinaryResume =
     input.expectedResumeOperationHash === undefined &&
@@ -531,7 +540,29 @@ export function persistWorkflowStepUpdateRecord(
     resumeResultReceipt: existing.resumeResultReceipt,
     resumeRollbackReceipt: existing.resumeRollbackReceipt,
   });
-  return { status: 'persisted', snapshot };
+  return persistedStepUpdate(snapshot, acceptedEvents, existing.lifecycleOutbox);
+}
+
+function acceptedLifecycleEvents(events: WorkflowLifecycleEvent[] | undefined): WorkflowLifecycleEvent[] | undefined {
+  if (!events || events.length === 0) return undefined;
+  return events.slice(-WORKFLOW_LIFECYCLE_OUTBOX_LIMIT);
+}
+
+function persistedStepUpdate(
+  snapshot: WorkflowRunState,
+  acceptedEvents: WorkflowLifecycleEvent[] | undefined,
+  existingOutbox: WorkflowLifecycleEvent[] | undefined,
+): InternalResumeMutationResult<PersistWorkflowStepUpdateResult> {
+  const lifecycleOutbox = acceptedEvents
+    ? [...(existingOutbox ?? []), ...acceptedEvents].slice(-WORKFLOW_LIFECYCLE_OUTBOX_LIMIT)
+    : existingOutbox;
+  const nextSnapshot = lifecycleOutbox && lifecycleOutbox.length > 0 ? { ...snapshot, lifecycleOutbox } : snapshot;
+  return {
+    status: 'persisted',
+    snapshot: nextSnapshot,
+    ...(acceptedEvents ? { acceptedEvents } : {}),
+    ...(TERMINAL_STATUSES.has(nextSnapshot.status) ? { disposition: nextSnapshot.status } : {}),
+  };
 }
 
 function materializeRollbackReceipt(value: unknown): WorkflowResumeRollbackReceiptV1 | undefined {

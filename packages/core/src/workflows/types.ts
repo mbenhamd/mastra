@@ -16,7 +16,11 @@ import type { ChunkType, WorkflowStreamEvent } from '../stream/types';
 import type { Tool, ToolExecutionContext } from '../tools';
 import type { DynamicArgument } from '../types';
 import type { ExecutionEngine } from './execution-engine';
-import type { WorkflowExecutionGeneration, WorkflowLifecycleEnvelope } from './lifecycle-events';
+import type {
+  WorkflowExecutionGeneration,
+  WorkflowLifecycleEnvelope,
+  WorkflowLifecycleEvent,
+} from './lifecycle-events';
 import type { Predicate } from './predicate';
 import type { WorkflowScheduleInput } from './scheduler/types';
 import type { ConditionFunction, ExecuteFunction, ExecuteFunctionParams, LoopConditionFunction, Step } from './step';
@@ -673,6 +677,12 @@ export interface WorkflowRunState {
    * as children of the original suspended span.
    */
   tracingContext?: WorkflowStateTracingContext;
+  /**
+   * Bounded canonical lifecycle events accepted with a fenced step mutation.
+   * The engine publishes the mutation's `acceptedEvents`; this copy is durable
+   * evidence only and is not an observer-authorization source.
+   */
+  lifecycleOutbox?: WorkflowLifecycleEvent[];
 }
 
 /**
@@ -1643,6 +1653,8 @@ export type EntryExecutionResult = {
   mutableContext: MutableContext;
   /** Serialized requestContext — only set by engines where `requiresDurableContextSerialization()` is true. */
   requestContext?: Record<string, any>;
+  /** Outcome of the entry-result snapshot write, when persistence ran. */
+  persistOutcome?: import('../storage/types').PersistWorkflowStepUpdateResult | void;
 };
 
 // =============================================================================

@@ -1096,9 +1096,14 @@ export class DefaultExecutionEngine extends ExecutionEngine {
         currentRequestContext = this.deserializeRequestContext(lastOutput.requestContext);
       }
 
+      const persistOutcome = lastOutput.persistOutcome as PersistWorkflowStepUpdateResult | void | undefined;
       const authoritativeDisposition = params.transientExecution
         ? undefined
-        : await this.getAuthoritativeExecutionDisposition({ workflowId, runId, executionGeneration });
+        : persistOutcome && persistOutcome.status === 'persisted'
+          ? undefined
+          : persistOutcome && persistOutcome.status !== 'persisted'
+            ? (persistOutcome.disposition ?? 'canceled')
+            : await this.getAuthoritativeExecutionDisposition({ workflowId, runId, executionGeneration });
       if (
         authoritativeDisposition &&
         !(
@@ -1111,7 +1116,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
         // lifecycle sequence, so return the durable outcome without appending
         // duplicate step/workflow events after workflow.finished.
         const authoritativeTerminal = await this.resolveRejectedTerminalWrite(
-          { status: 'stale_execution' },
+          persistOutcome && persistOutcome.status !== 'persisted' ? persistOutcome : { status: 'stale_execution' },
           executionContext,
           false,
           { pubsub: params.pubsub, includeState: params.outputOptions?.includeState },
@@ -1165,8 +1170,9 @@ export class DefaultExecutionEngine extends ExecutionEngine {
               }
             : {};
 
+        let terminalWrite: PersistWorkflowStepUpdateResult | void;
         if (!executionContext.transientExecution) {
-          const terminalWrite = await this.persistStepUpdate({
+          terminalWrite = await this.persistStepUpdate({
             workflowId,
             runId,
             resourceId,
@@ -1201,6 +1207,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
         if (
           params.abortController.signal.aborted ||
           (!params.transientExecution &&
+            terminalWrite?.status !== 'persisted' &&
             (await this.isAuthoritativelyCanceled({ workflowId, runId, executionGeneration })))
         ) {
           result = { ...result, status: 'canceled', result: undefined, error: undefined };
@@ -1396,8 +1403,9 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       undefined,
       stepExecutionPath,
     )) as any;
+    let terminalWrite: PersistWorkflowStepUpdateResult | void;
     if (!lastExecutionContext!.transientExecution) {
-      const terminalWrite = await this.persistStepUpdate({
+      terminalWrite = await this.persistStepUpdate({
         workflowId,
         runId,
         resourceId,
@@ -1427,7 +1435,9 @@ export class DefaultExecutionEngine extends ExecutionEngine {
 
     if (
       params.abortController.signal.aborted ||
-      (!params.transientExecution && (await this.isAuthoritativelyCanceled({ workflowId, runId, executionGeneration })))
+      (!params.transientExecution &&
+        terminalWrite?.status !== 'persisted' &&
+        (await this.isAuthoritativelyCanceled({ workflowId, runId, executionGeneration })))
     ) {
       result = { ...result, status: 'canceled', result: undefined, error: undefined };
     }

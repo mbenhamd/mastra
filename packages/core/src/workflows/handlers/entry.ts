@@ -7,6 +7,7 @@ import type { ObservabilityContext } from '../../observability';
 import type { PersistWorkflowStepUpdateResult } from '../../storage/types';
 import type { DefaultExecutionEngine } from '../default';
 import { workflowLifecycleEventsAreSuppressed } from '../lifecycle-events';
+import type { WorkflowLifecycleEvent } from '../lifecycle-events';
 import type {
   EntryExecutionResult,
   ExecutionContext,
@@ -160,6 +161,8 @@ export interface PersistStepUpdateParams {
    * compatibility with external callers.
    */
   phase?: string;
+  /** Canonical lifecycle events that must commit with this snapshot or not at all. */
+  lifecycleEvents?: WorkflowLifecycleEvent[];
 }
 
 export async function persistStepUpdate(
@@ -179,6 +182,7 @@ export async function persistStepUpdate(
     requestContext,
     tracingContext,
     phase,
+    lifecycleEvents,
   } = params;
 
   // A transient run is a per-execution decision. The workflow-level callback
@@ -236,6 +240,7 @@ export async function persistStepUpdate(
       timestamp: Date.now(),
       // Persist tracing context for span continuity on resume
       tracingContext,
+      ...(lifecycleEvents && lifecycleEvents.length > 0 ? { lifecycleOutbox: lifecycleEvents } : {}),
     };
 
     const workflowsStore = await engine.mastra?.getStorage()?.getStore('workflows');
@@ -260,15 +265,22 @@ export async function persistStepUpdate(
       const authoritativeSnapshot = await workflowsStore.loadWorkflowSnapshot({ workflowName: workflowId, runId });
       if (
         authoritativeSnapshot &&
-        (authoritativeSnapshot.executionGeneration !== executionContext.executionGeneration ||
-          authoritativeSnapshot.status === 'success' ||
+        authoritativeSnapshot.executionGeneration !== executionContext.executionGeneration &&
+        authoritativeSnapshot.executionGeneration !== undefined &&
+        executionContext.executionGeneration !== undefined
+      ) {
+        return { status: 'stale_execution', disposition: 'superseded' };
+      }
+      if (
+        authoritativeSnapshot &&
+        (authoritativeSnapshot.status === 'success' ||
           authoritativeSnapshot.status === 'failed' ||
           authoritativeSnapshot.status === 'canceled' ||
           authoritativeSnapshot.status === 'tripwire' ||
           authoritativeSnapshot.status === 'bailed' ||
           authoritativeSnapshot.status === 'skipped')
       ) {
-        return;
+        return { status: 'finalized', disposition: authoritativeSnapshot.status };
       }
       const authoritativeMetadata = authoritativeSnapshot
         ? Object.fromEntries(Object.entries(authoritativeSnapshot).filter(([key]) => !(key in snapshotToPersist)))
@@ -290,7 +302,10 @@ export async function persistStepUpdate(
         },
       });
       engine.setLastPersistedStatus(runId, workflowStatus);
-      return;
+      return {
+        status: 'persisted',
+        ...(lifecycleEvents && lifecycleEvents.length > 0 ? { acceptedEvents: lifecycleEvents } : {}),
+      };
     }
 
     const persisted = await workflowsStore?.persistWorkflowStepUpdate({
@@ -301,6 +316,7 @@ export async function persistStepUpdate(
       expectedExecutionGeneration: executionContext.executionGeneration,
       expectedLifecycleResumeAttempt: executionContext.lifecycleResumeAttempt,
       snapshot: snapshotToPersist,
+      lifecycleEvents,
     });
     if (persisted?.status === 'unsupported') {
       throw new Error(`Workflow storage for ${workflowId}/${runId} does not support fenced workflow step updates`);
@@ -932,8 +948,9 @@ export async function executeEntry(
     execResults = { ...execResults, status: 'canceled' };
   }
 
+  let persistOutcome: PersistWorkflowStepUpdateResult | void = undefined;
   if (!executionContext.transientExecution) {
-    await engine.persistStepUpdate({
+    persistOutcome = await engine.persistStepUpdate({
       workflowId,
       runId,
       resourceId,
@@ -944,9 +961,16 @@ export async function executeEntry(
       requestContext,
       phase: 'entry-result',
     });
+    if (persistOutcome && persistOutcome.status !== 'persisted') {
+      execResults = { ...execResults, status: 'canceled', endedAt: Date.now() };
+    }
   }
 
-  if (!suppressLifecycleEvents && execResults.status === 'canceled') {
+  if (
+    !suppressLifecycleEvents &&
+    execResults.status === 'canceled' &&
+    !(persistOutcome && persistOutcome.status !== 'persisted')
+  ) {
     await publishStepEvent(engine, pubsub, `workflow.events.v2.${runId}`, {
       type: 'watch',
       runId,
@@ -957,6 +981,7 @@ export async function executeEntry(
   return {
     result: execResults,
     stepResults,
+    persistOutcome,
     mutableContext: engine.buildMutableContext(executionContext),
     // Serialize requestContext only for engines that restore it from serialized
     // results (Inngest memoization). The default engine keeps the original

@@ -50,11 +50,12 @@ function makeFakeMastra(
       const outcome = persistWorkflowStepUpdateRecord(store.snapshot ?? undefined, args, value =>
         structuredClone(value),
       );
-      if (outcome.status === 'persisted' && outcome.snapshot) {
+      const { snapshot, ...result } = outcome;
+      if (outcome.status === 'persisted' && snapshot) {
         store.calls.push(args);
-        store.snapshot = outcome.snapshot;
+        store.snapshot = snapshot;
       }
-      return { status: outcome.status };
+      return result;
     }) as any,
   };
   const mastra = {
@@ -423,6 +424,41 @@ describe('persistStepUpdate — suspended overwrite guard', () => {
     expect(store.calls).toHaveLength(0);
     expect(store.legacyCalls.map(call => call.snapshot.status)).toEqual(['pending', 'running']);
     expect(store.snapshot).toMatchObject({ status: 'running' });
+  });
+
+  it('returns a terminal disposition instead of overwriting a legacy snapshot', async () => {
+    ({ engine, store } = makeEngine(() => true, {}));
+    store.snapshot = {
+      runId: 'run-1',
+      status: 'success',
+      value: { remote: true },
+      context: {},
+      activePaths: [],
+      activeStepsPath: {},
+      suspendedPaths: {},
+      resumeLabels: {},
+      waitingPaths: {},
+      serializedStepGraph: [],
+      timestamp: 1,
+      executionGeneration: 'wfeg:generation',
+    } as WorkflowRunState;
+
+    const outcome = await engine.persistStepUpdate({
+      workflowId: 'wf',
+      runId: 'run-1',
+      resourceId: 'resource-1',
+      stepResults: {},
+      serializedStepGraph: [],
+      executionContext: baseExecutionContext({
+        runId: 'run-1',
+        executionGeneration: 'wfeg:generation',
+      }),
+      workflowStatus: 'running',
+      requestContext: new RequestContext(),
+    });
+
+    expect(outcome).toMatchObject({ status: 'finalized', disposition: 'success' });
+    expect(store.legacyCalls).toHaveLength(0);
   });
 
   it('fails closed for a resumed write when atomic resume lacks fenced step updates', async () => {

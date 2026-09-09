@@ -21,6 +21,7 @@ import type {
   WorkflowTerminalizationPhase,
   WorkflowTerminalizationRecord,
 } from '../workflows';
+import type { WorkflowLifecycleEvent } from '../workflows/lifecycle-events';
 import type { WorkflowTerminalParentContinuationContract } from '../workflows/terminal-continuation';
 import type {
   WorkflowTerminalRecoveryAncestryV1,
@@ -83,6 +84,11 @@ export interface PersistWorkflowStepUpdateInput {
   expectedExecutionGeneration?: string;
   expectedLifecycleResumeAttempt?: number;
   snapshot: WorkflowRunState;
+  /**
+   * Canonical lifecycle events that must commit with this snapshot or not at
+   * all. A terminal or superseded row rejects them atomically.
+   */
+  lifecycleEvents?: WorkflowLifecycleEvent[];
 }
 
 export type PersistWorkflowStepUpdateResult = {
@@ -94,6 +100,13 @@ export type PersistWorkflowStepUpdateResult = {
     | 'missing_run'
     | 'invalid_snapshot'
     | 'unsupported';
+  /**
+   * Authoritative execution status observed when the mutation did not accept
+   * this write. `superseded` means a newer generation owns the run.
+   */
+  disposition?: WorkflowRunStatus | 'superseded';
+  /** Events accepted in the same storage transaction as a persisted snapshot. */
+  acceptedEvents?: WorkflowLifecycleEvent[];
 };
 
 interface WorkflowResumeFenceInput {
