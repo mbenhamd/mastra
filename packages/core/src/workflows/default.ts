@@ -1170,7 +1170,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
               }
             : {};
 
-        let terminalWrite: PersistWorkflowStepUpdateResult | void;
+        let terminalWrite: PersistWorkflowStepUpdateResult | void = undefined;
         if (!executionContext.transientExecution) {
           terminalWrite = await this.persistStepUpdate({
             workflowId,
@@ -1403,7 +1403,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       undefined,
       stepExecutionPath,
     )) as any;
-    let terminalWrite: PersistWorkflowStepUpdateResult | void;
+    let terminalWrite: PersistWorkflowStepUpdateResult | void = undefined;
     if (!lastExecutionContext!.transientExecution) {
       terminalWrite = await this.persistStepUpdate({
         workflowId,
