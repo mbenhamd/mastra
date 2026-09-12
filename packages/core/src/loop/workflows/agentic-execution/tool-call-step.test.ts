@@ -860,12 +860,16 @@ describe('createToolCallStep tool approval workflow', () => {
     vi.restoreAllMocks();
   });
 
-  it('executes validated edited approval arguments and preserves them through re-suspension', async () => {
+  const runEditedApprovalResumeCase = async (transform: 'redacted' | 'safe') => {
     const originalArgs = { param: 'test', limit: 3, nested: { left: 1, right: 2 }, suspendData: 'business input' };
-    const editedArgs = { param: 'edited value', nested: { left: 9 }, _background: { enabled: false } };
+    const editedArgs =
+      transform === 'redacted'
+        ? { param: 'edited value', nested: { left: 9 }, _background: { enabled: false } }
+        : { param: 'edited value', nested: { left: 9 } };
     const approvedArgs = { ...originalArgs, ...editedArgs };
     const executionArgs = { ...originalArgs, param: 'edited value!', nested: { left: 9 } };
-    const transcriptArgs = { param: '[redacted]' };
+    const transcriptArgs = transform === 'redacted' ? { param: '[redacted]' } : approvedArgs;
+    const transcriptIsRedacted = transform === 'redacted';
     const originalIdentityDigest = createToolCallIdentityDigest({
       toolCallId: 'test-call-id',
       toolName: 'test-tool',
@@ -1044,35 +1048,48 @@ describe('createToolCallStep tool approval workflow', () => {
         suspend: persistSnapshot,
       }),
     );
-    expect(editedApprovalResumeLoader).toHaveBeenCalledOnce();
-    expect(editedApprovalResumeLoader).toHaveBeenCalledWith(
-      expect.objectContaining({
-        runId: 'test-run',
-        originRunId: 'test-run',
-        toolCallId: inputData.toolCallId,
-        toolName: inputData.toolName,
-        identityDigest: approvedIdentityDigest,
-      }),
-    );
+    if (transcriptIsRedacted) {
+      expect(editedApprovalResumeLoader).toHaveBeenCalledOnce();
+      expect(editedApprovalResumeLoader).toHaveBeenCalledWith(
+        expect.objectContaining({
+          runId: 'test-run',
+          originRunId: 'test-run',
+          toolCallId: inputData.toolCallId,
+          toolName: inputData.toolName,
+          identityDigest: approvedIdentityDigest,
+        }),
+      );
+    } else {
+      expect(editedApprovalResumeLoader).not.toHaveBeenCalled();
+    }
     expect(recalledResult).toMatchObject({
       args: approvedArgs,
       result: executionArgs,
       approval: { approved: true },
+      approvedArgs,
     });
     const secondSnapshot = JSON.parse(JSON.stringify(persistSnapshot.mock.calls.at(-1)![0]));
     expect(secondSnapshot.toolCallResume).toMatchObject({
       originRunId: 'cold-resume-run',
       identityDigest: approvedIdentityDigest,
-      approvalInputIdentityDigest: transcriptIdentityDigest,
-      approvedArgs,
+      ...(transcriptIsRedacted
+        ? {
+            approvalInputIdentityDigest: transcriptIdentityDigest,
+            approvedArgs,
+          }
+        : {}),
     });
     expect(recalledMetadata.suspendedTools[inputData.toolCallId]).toMatchObject({
       originRunId: 'cold-resume-run',
       runId: 'cold-resume-run',
       identityDigest: approvedIdentityDigest,
       resumeIdentityDigest: transcriptIdentityDigest,
-      approvalInputIdentityDigest: transcriptIdentityDigest,
-      approvedArgs,
+      ...(transcriptIsRedacted
+        ? {
+            approvalInputIdentityDigest: transcriptIdentityDigest,
+            approvedArgs,
+          }
+        : {}),
     });
     // Persisted transcript metadata retains the new suspension identity and ownership
     // coordinates while filtering the canonical approval fields.
@@ -1082,21 +1099,25 @@ describe('createToolCallStep tool approval workflow', () => {
       makeExecuteParams({
         inputData: {
           ...inputData,
+          toolCallId: 'provider-repeat-call',
           args: {
             ...transcriptArgs,
-            resumeData: { answer: 'continue after second suspension' },
+            resumeData: { answer: 'stale provider answer' },
             suspendedToolCallId: inputData.toolCallId,
+            suspendedToolRunId: 'test-run',
           },
         },
+        resumeData: { answer: 'authoritative workflow answer' },
         suspendData: secondSnapshot,
       }),
     );
-    expect(editedApprovalResumeLoader).toHaveBeenCalledOnce();
+    expect(editedApprovalResumeLoader).toHaveBeenCalledTimes(transcriptIsRedacted ? 1 : 0);
     expect(recalledResumeResult).toMatchObject({
       args: approvedArgs,
       result: executionArgs,
       approval: { approved: true },
     });
+    expect(execute.mock.calls.at(-1)?.[1].resumeData).toEqual({ answer: 'authoritative workflow answer' });
     expect(execute).toHaveBeenCalledTimes(5);
     expect(originalArgs).toEqual({
       param: 'test',
@@ -1104,7 +1125,17 @@ describe('createToolCallStep tool approval workflow', () => {
       nested: { left: 1, right: 2 },
       suspendData: 'business input',
     });
-  });
+  };
+
+  it.each([
+    { label: 'redacted transcript', transform: 'redacted' as const },
+    { label: 'safe unchanged transcript', transform: 'safe' as const },
+  ])(
+    'executes validated edited approval arguments and preserves them through re-suspension ($label)',
+    async ({ transform }) => {
+      await runEditedApprovalResumeCase(transform);
+    },
+  );
 
   it('rejects invalid or unsupported edited approvals before tool side effects', async () => {
     const execute = vi.fn(async args => args);

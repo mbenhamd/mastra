@@ -131,6 +131,23 @@ describe('MessageList.updateToolInvocation', () => {
       if (state === 'output-error') {
         expect(msg.content.toolInvocations?.[0]).toMatchObject({ errorText: 'archive failed' });
       }
+
+      // A terminal correction must keep the legacy and structured projections in sync.
+      messageList.updateToolInvocation({
+        type: 'tool-invocation',
+        toolInvocation: {
+          state: 'output-denied',
+          toolCallId: 'tc-approved',
+          toolName: 'archive-project',
+          args: approvedArgs,
+          approval: { id: 'tc-approved', approved: false },
+        },
+      });
+      expect(msg.content.toolInvocations?.[0]).toEqual(
+        (messageList.get.all.db()[0]?.content.parts?.[0] as any).toolInvocation,
+      );
+      expect(msg.content.toolInvocations?.[0]).not.toHaveProperty('result');
+      expect(msg.content.toolInvocations?.[0]).not.toHaveProperty('errorText');
     },
   );
 

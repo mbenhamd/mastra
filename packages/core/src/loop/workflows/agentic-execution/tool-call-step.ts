@@ -739,7 +739,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           return undefined;
         };
         let storedResumeMetadata = resumeData !== undefined ? getStoredResumeMetadata(metadataToolCallId) : undefined;
-        const hasSuspendedToolRunIdMismatch =
+        let hasSuspendedToolRunIdMismatch =
           suppliedSuspendedToolRunId !== undefined &&
           storedResumeMetadata?.runId !== undefined &&
           suppliedSuspendedToolRunId !== storedResumeMetadata.runId;
@@ -883,6 +883,19 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           : undefined;
         const hasKnownAuthoritativeResumeType =
           authoritativeResumeType === 'approval' || authoritativeResumeType === 'suspension';
+        const hasAuthoritativeWorkflowResumeData =
+          workflowResumeData !== undefined &&
+          authoritativeIdentityMatches &&
+          hasKnownAuthoritativeResumeType &&
+          !(resumeDataFromArgs === null && suppliedSuspendedToolRunId !== undefined);
+        if (hasAuthoritativeWorkflowResumeData) {
+          // A validated workflow snapshot is the resume boundary. Provider-replayed args can
+          // retain an older resume payload and suspended-run coordinate; preserve the mapped
+          // tool call identity, but let the boundary payload win and clear that stale mismatch.
+          resumeData = workflowResumeData;
+          isModelAuthoredResumeData = false;
+          hasSuspendedToolRunIdMismatch = false;
+        }
         const effectiveResumeType = hasAuthoritativeResumeEnvelope
           ? hasKnownAuthoritativeResumeType
             ? authoritativeResumeType
@@ -1003,6 +1016,22 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           });
           expectedResumeIdentity = { ...expectedResumeIdentity, identityDigest: expectedIdentityDigest };
           inputData = { ...inputData, args: structuredClone(args) };
+        }
+        if (
+          verifiedApprovedArgs === undefined &&
+          !isAgentTool &&
+          !isWorkflowTool &&
+          isKnownSuspensionResume &&
+          persistedApprovalGrant !== undefined &&
+          storedResumeMetadata?.identityMatch === 'canonical' &&
+          args !== null &&
+          typeof args === 'object' &&
+          !Array.isArray(args)
+        ) {
+          // Canonical args are already authenticated by the suspension identity and persisted
+          // approval grant. Keep a detached copy only for result/persistence consumers; do not
+          // turn this provenance marker into resume authorization or a new approval envelope.
+          verifiedApprovedArgs = structuredClone(args);
         }
         const resumeTarget =
           metadataToolCallId !== inputData.toolCallId ? { resumeTargetToolCallId: metadataToolCallId } : {};

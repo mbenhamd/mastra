@@ -386,7 +386,7 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
           error?: unknown;
           providerMetadata?: Record<string, unknown>;
         },
-        phase: 'output-available' | 'error' | 'approval',
+        phase: 'input-available' | 'output-available' | 'error' | 'approval',
       ): Promise<ChunkType<OUTPUT>> {
         const stepTools = readScoped(scopeCtx, STEP_TOOLS_KEY, 'stepTools') as ToolSet | undefined;
         const tool =
@@ -411,19 +411,22 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
           source,
           rest.logger,
         );
-        const transform = await transformToolPayloadForTargets(
-          {
-            phase,
-            toolName: toolCall.toolName,
-            toolCallId: toolCall.toolCallId,
-            input: toolCall.args,
-            output: toolCall.result,
-            error: toolCall.error,
-            providerMetadata: toolCall.providerMetadata,
-          },
-          source,
-          rest.logger,
-        );
+        const transform =
+          phase === 'input-available'
+            ? undefined
+            : await transformToolPayloadForTargets(
+                {
+                  phase,
+                  toolName: toolCall.toolName,
+                  toolCallId: toolCall.toolCallId,
+                  input: toolCall.args,
+                  output: toolCall.result,
+                  error: toolCall.error,
+                  providerMetadata: toolCall.providerMetadata,
+                },
+                source,
+                rest.logger,
+              );
 
         return withToolPayloadTransformMetadata(withToolPayloadTransformMetadata(chunk, inputTransform), transform);
       }
@@ -432,7 +435,10 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
       // pending HITL/deferred tool call (which would otherwise suspend or stall the loop).
       const isDeniedApproval = (toolCall: { approval?: { approved?: boolean } }) =>
         toolCall?.approval?.approved === false;
-      const persistDeniedApproval = (toolCall: z.infer<typeof toolCallOutputSchema>) => {
+      const persistDeniedApproval = (
+        toolCall: z.infer<typeof toolCallOutputSchema>,
+        providerMetadata?: ProviderMetadata,
+      ) => {
         const deniedToolCallId = toolCall.resumeTargetToolCallId ?? toolCall.toolCallId;
         const hasVerifiedApprovedArgs = toolCall.approvedArgs !== undefined;
         const deniedPart = {
@@ -448,6 +454,7 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
               reason: toolCall.approval!.reason,
             },
           },
+          ...(providerMetadata !== undefined ? { providerMetadata } : {}),
         };
 
         const updated = hasVerifiedApprovedArgs
@@ -479,6 +486,7 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
               args: toolCall.args,
               result: toolCall.approval?.reason ?? 'Tool call was not approved by the user',
             },
+            ...(providerMetadata !== undefined ? { providerMetadata } : {}),
           } as const;
           if (!rest.messageList.updateToolInvocation(syntheticResultPart)) {
             // Normalized/provider-shaped history may omit the current invocation too. Store a
@@ -496,27 +504,36 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
         }
       };
       const processDeniedApproval = async (toolCall: z.infer<typeof toolCallOutputSchema>) => {
-        // Keep the recalled message in the approval-specific `output-denied` state, while
-        // retaining the existing public stream contract that exposes a denial in toolResults.
-        // Persist first so a later pending-HITL bail can never strand the approval decision.
-        persistDeniedApproval(toolCall);
-
         const result = toolCall.approval?.reason ?? 'Tool call was not approved by the user';
         // This is a compatibility result, not tool output. Do not invoke toModelOutput or
         // tool-payload output transforms that legitimately expect the tool's output schema.
-        const chunk: ChunkType<OUTPUT> = {
-          type: 'tool-result',
-          runId: rest.runId,
-          from: ChunkFrom.AGENT,
-          payload: {
-            args: toolCall.args,
-            toolCallId: toolCall.toolCallId,
-            toolName: toolCall.toolName,
-            result,
-            providerMetadata: toolCall.providerMetadata as ProviderMetadata | undefined,
-            providerExecuted: toolCall.providerExecuted,
+        const chunk = await transformToolChunk(
+          {
+            type: 'tool-result',
+            runId: rest.runId,
+            from: ChunkFrom.AGENT,
+            payload: {
+              args: toolCall.args,
+              toolCallId: toolCall.toolCallId,
+              toolName: toolCall.toolName,
+              result,
+              providerMetadata: toolCall.providerMetadata as ProviderMetadata | undefined,
+              providerExecuted: toolCall.providerExecuted,
+            },
           },
-        };
+          toolCall,
+          'input-available',
+        );
+        // Keep the recalled message in the approval-specific `output-denied` state, while
+        // retaining the existing public stream contract that exposes a denial in toolResults.
+        // Compute the input-only transform first so the same transcript redaction metadata is
+        // persisted on both denial parts before either the chunk is enqueued or the step bails.
+        const providerMetadata = withToolPayloadTransformProviderMetadata(
+          (chunk as { payload: { providerMetadata?: ProviderMetadata } }).payload.providerMetadata,
+          chunk.metadata,
+        ) as ProviderMetadata | undefined;
+        persistDeniedApproval(toolCall, providerMetadata);
+
         const processed = await processAndEnqueueChunk(chunk, terminalResolutionState);
         if (processed) await rest.options?.onChunk?.(processed);
       };

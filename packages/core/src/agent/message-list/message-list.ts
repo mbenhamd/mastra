@@ -1527,21 +1527,16 @@ export class MessageList {
         inputPart.toolInvocation.state === 'output-denied')
     ) {
       const resolvedInvocation = inputPart.toolInvocation;
-      msg.content.toolInvocations = msg.content.toolInvocations.map(invocation =>
-        invocation.toolCallId === priorToolCallId
-          ? {
-              ...invocation,
-              toolCallId: resolvedInvocation.toolCallId,
-              state: resolvedInvocation.state,
-              args: persistedArgs,
-              ...(resolvedInvocation.state === 'result'
-                ? { result: resolvedInvocation.result }
-                : resolvedInvocation.state === 'output-error'
-                  ? { errorText: resolvedInvocation.errorText }
-                  : { approval: resolvedInvocation.approval }),
-            }
-          : invocation,
-      );
+      msg.content.toolInvocations = msg.content.toolInvocations.map(invocation => {
+        if (invocation.toolCallId !== priorToolCallId) return invocation;
+        const {
+          result: _priorResult,
+          errorText: _priorErrorText,
+          approval: _priorApproval,
+          ...priorInvocation
+        } = invocation as typeof invocation & { result?: unknown; errorText?: unknown; approval?: unknown };
+        return { ...priorInvocation, ...resolvedInvocation, args: persistedArgs };
+      });
     }
 
     // Move the message to the response source so it gets
