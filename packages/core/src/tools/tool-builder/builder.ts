@@ -74,7 +74,12 @@ import {
 export type ToolToConvert = VercelTool | ToolAction<any, any, any> | VercelToolV5 | ProviderDefinedTool;
 export type LogType = 'tool' | 'toolset' | 'client-tool';
 
+const schemasWithoutNativeInputValidation = new WeakSet<object>();
+
 function resolveNativeInputValidationSchema(schema: unknown): StandardSchemaWithJSON | undefined {
+  if ((typeof schema === 'object' && schema !== null) || typeof schema === 'function') {
+    if (schemasWithoutNativeInputValidation.has(schema)) return undefined;
+  }
   if (isStandardSchemaWithJSON(schema)) {
     if (schema['~standard'].vendor === 'ai-sdk') {
       const getSchema = (schema as { getSchema?: unknown }).getSchema;
@@ -256,6 +261,7 @@ function buildJsonOverrideSchema(
   splicedJsonSchema: JSONSchema7Definition,
   injectedKeys: readonly string[],
 ): StandardSchemaWithJSON {
+  const hasOriginalNativeInputValidation = resolveNativeInputValidationSchema(originalSchema) !== undefined;
   const fallback = toStandardSchema(splicedJsonSchema as any);
   const original = originalSchema as { '~standard'?: { validate?: (v: unknown) => any } } | undefined;
   const originalValidate = original?.['~standard']?.validate?.bind(original['~standard']);
@@ -339,7 +345,7 @@ function buildJsonOverrideSchema(
     );
   };
 
-  return {
+  const augmentedSchema = {
     '~standard': {
       version: 1,
       vendor: 'mastra-json-override',
@@ -347,17 +353,18 @@ function buildJsonOverrideSchema(
       jsonSchema: fallback['~standard'].jsonSchema,
     },
   } as StandardSchemaWithJSON;
+
+  if (!hasOriginalNativeInputValidation) {
+    schemasWithoutNativeInputValidation.add(augmentedSchema);
+  }
+
+  return augmentedSchema;
 }
 
 export class CoreToolBuilder extends MastraBase {
   private originalTool: ToolToConvert;
   private options: ToolOptions;
   private logType?: LogType;
-  // `undefined` means no schema augmentation was needed; `false` records that an
-  // augmented schema was inspected and had no author validator. This keeps the
-  // latter state from being mistaken for the augmented wrapper's fallback validator
-  // while retaining the augmented schema for runtime validation.
-  private originalNativeInputValidationSchemaAvailable?: boolean;
 
   private bindFGAResourceId<T extends object>(tool: T): T {
     return bindBuiltToolFGAResourceId(
@@ -408,8 +415,6 @@ export class CoreToolBuilder extends MastraBase {
         if (!schema) {
           schema = z.object({});
         }
-        this.originalNativeInputValidationSchemaAvailable = resolveNativeInputValidationSchema(schema) !== undefined;
-
         // Preferred path: when the user's input schema is a Zod v4 ZodObject
         // (the common case for tools authored with `zod` / `zod/v4`), keep using
         // `.extend()`. This preserves the exact JSON Schema shape that existing
@@ -1186,10 +1191,7 @@ export class CoreToolBuilder extends MastraBase {
     // unions/intersections can carry constraints that are not editable approval
     // objects, but still need native preflight validation before compatibility
     // layers rewrite their JSON Schema.
-    const approvalInputValidationSchema =
-      this.originalNativeInputValidationSchemaAvailable === false
-        ? undefined
-        : resolveNativeInputValidationSchema(originalSchema);
+    const approvalInputValidationSchema = resolveNativeInputValidationSchema(originalSchema);
     const approvalInputEditing = resolveApprovalInputEditing(approvalInputValidationSchema);
     const inputValidationSchema = this.buildCompatValidationSchema(originalSchema, schemaCompatLayers);
     let processedInputSchema: Schema | undefined;

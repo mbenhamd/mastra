@@ -45,13 +45,18 @@ describe('CoreToolBuilder - Schema Compatibility in Validation', () => {
       execute: async (input: { note: string }) => input,
     });
 
-    const built = new CoreToolBuilder({
-      originalTool: tool,
-      options: { name: 'raw-json-schema-tool', requestContext: new RequestContext(), requireApproval: true },
-      autoResumeSuspendedTools: true,
-    }).build();
+    const build = () =>
+      new CoreToolBuilder({
+        originalTool: tool,
+        options: { name: 'raw-json-schema-tool', requestContext: new RequestContext(), requireApproval: true },
+        autoResumeSuspendedTools: true,
+      }).build();
 
-    expect(built.approvalInputEditing).toBeUndefined();
+    const firstBuilt = build();
+    const secondBuilt = build();
+
+    expect(firstBuilt.approvalInputEditing).toBeUndefined();
+    expect(secondBuilt.approvalInputEditing).toBeUndefined();
   });
 
   it('preserves async validation results in the native tool input schema', async () => {
