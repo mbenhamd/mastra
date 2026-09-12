@@ -1,3 +1,4 @@
+import { jsonSchema as aiSdkJsonSchema } from '@internal/ai-v6';
 import { AnthropicSchemaCompatLayer, isStandardSchemaWithJSON } from '@mastra/schema-compat';
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
@@ -31,6 +32,28 @@ function buildCoreTool(
 }
 
 describe('CoreToolBuilder - Schema Compatibility in Validation', () => {
+  it('does not enable edited approvals for an AI SDK JSON schema without a validator after resume augmentation', async () => {
+    const tool = createTool({
+      id: 'raw-json-schema-tool',
+      description: 'Raw JSON schema tool',
+      inputSchema: aiSdkJsonSchema<{ note: string }>({
+        type: 'object',
+        properties: { note: { type: 'string' } },
+        required: ['note'],
+        additionalProperties: false,
+      }),
+      execute: async (input: { note: string }) => input,
+    });
+
+    const built = new CoreToolBuilder({
+      originalTool: tool,
+      options: { name: 'raw-json-schema-tool', requestContext: new RequestContext(), requireApproval: true },
+      autoResumeSuspendedTools: true,
+    }).build();
+
+    expect(built.approvalInputEditing).toBeUndefined();
+  });
+
   it('preserves async validation results in the native tool input schema', async () => {
     const inputSchema: StandardSchemaWithJSON = {
       '~standard': {

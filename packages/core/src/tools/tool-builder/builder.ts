@@ -353,6 +353,11 @@ export class CoreToolBuilder extends MastraBase {
   private originalTool: ToolToConvert;
   private options: ToolOptions;
   private logType?: LogType;
+  // `undefined` means no schema augmentation was needed; `false` records that an
+  // augmented schema was inspected and had no author validator. This keeps the
+  // latter state from being mistaken for the augmented wrapper's fallback validator
+  // while retaining the augmented schema for runtime validation.
+  private originalNativeInputValidationSchemaAvailable?: boolean;
 
   private bindFGAResourceId<T extends object>(tool: T): T {
     return bindBuiltToolFGAResourceId(
@@ -403,6 +408,7 @@ export class CoreToolBuilder extends MastraBase {
         if (!schema) {
           schema = z.object({});
         }
+        this.originalNativeInputValidationSchemaAvailable = resolveNativeInputValidationSchema(schema) !== undefined;
 
         // Preferred path: when the user's input schema is a Zod v4 ZodObject
         // (the common case for tools authored with `zod` / `zod/v4`), keep using
@@ -1180,7 +1186,10 @@ export class CoreToolBuilder extends MastraBase {
     // unions/intersections can carry constraints that are not editable approval
     // objects, but still need native preflight validation before compatibility
     // layers rewrite their JSON Schema.
-    const approvalInputValidationSchema = resolveNativeInputValidationSchema(originalSchema);
+    const approvalInputValidationSchema =
+      this.originalNativeInputValidationSchemaAvailable === false
+        ? undefined
+        : resolveNativeInputValidationSchema(originalSchema);
     const approvalInputEditing = resolveApprovalInputEditing(approvalInputValidationSchema);
     const inputValidationSchema = this.buildCompatValidationSchema(originalSchema, schemaCompatLayers);
     let processedInputSchema: Schema | undefined;
