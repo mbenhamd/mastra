@@ -443,6 +443,85 @@ describe('step-result lifecycle fence', () => {
     }
   });
 
+  it('isolates state roots across concurrent nested foreach iterations', async () => {
+    const storage = new MockStore();
+    const pubsub = new EventEmitterPubSub();
+    const firstPublicationStarted = Promise.withResolvers<void>();
+    const releaseFirstPublication = Promise.withResolvers<void>();
+    const secondIterationSuspended = Promise.withResolvers<void>();
+    let secondIterationState: number | undefined;
+    let secondSuspendPayload: unknown;
+    const publish = pubsub.publish.bind(pubsub);
+    const publishSpy = vi.spyOn(pubsub, 'publish').mockImplementation(async (...args) => {
+      const event = args[1].data?.event;
+      if (
+        args[1].data?.workflowId === 'pf-3750-foreach-child' &&
+        event?.type === 'step.completed' &&
+        event.stepId === 'update' &&
+        event.output === 0
+      ) {
+        firstPublicationStarted.resolve();
+        await releaseFirstPublication.promise;
+      }
+      return publish(...args);
+    });
+    const stateSchema = z.object({ count: z.number() });
+    const update = createStep({
+      id: 'update',
+      inputSchema: z.number(),
+      outputSchema: z.number(),
+      stateSchema,
+      suspendSchema: stateSchema,
+      execute: async ({ inputData, state, setState, suspend }) => {
+        if (inputData === 0) {
+          await setState({ count: 1 });
+          return 0;
+        }
+
+        await firstPublicationStarted.promise;
+        secondIterationState = state.count;
+        const count = state.count + 1;
+        await setState({ count });
+        await suspend({ count });
+        secondSuspendPayload = { count };
+        secondIterationSuspended.resolve();
+        return 1;
+      },
+    });
+    const child = createWorkflow({
+      id: 'pf-3750-foreach-child',
+      inputSchema: z.number(),
+      outputSchema: z.number(),
+      options: { sharePubsub: true },
+    })
+      .then(update)
+      .commit();
+    const parent = createWorkflow({
+      id: 'pf-3750-foreach-state-fence',
+      inputSchema: z.array(z.number()),
+      outputSchema: z.array(z.number()),
+      stateSchema,
+    })
+      .foreach(child, { concurrency: 2 })
+      .commit();
+    const mastra = new Mastra({ logger: false, storage, pubsub, workflows: { [parent.id]: parent } });
+    const run = await parent.createRun();
+
+    try {
+      const execution = run.start({ inputData: [0, 1], initialState: { count: 0 } });
+      await secondIterationSuspended.promise;
+      expect(secondIterationState).toBe(0);
+      expect(secondSuspendPayload).toEqual({ count: 1 });
+
+      releaseFirstPublication.resolve();
+      await expect(execution).resolves.toMatchObject({ status: 'suspended' });
+    } finally {
+      releaseFirstPublication.resolve();
+      await mastra.shutdown();
+      publishSpy.mockRestore();
+    }
+  });
+
   it('retains state and closes lifecycle events across fresh-engine ordinary resumes', async () => {
     const storage = new MockStore();
     const pubsub = new EventEmitterPubSub();
