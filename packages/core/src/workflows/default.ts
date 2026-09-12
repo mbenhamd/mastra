@@ -1640,14 +1640,20 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       // A failed write must release the per-run queue so a later write can
       // still make progress and report its own outcome.
       .catch(() => undefined)
-      .then(() =>
-        persistStepUpdateHandler(this, {
+      .then(() => {
+        // Sample all snapshot roots at the serialized boundary. PostgreSQL and
+        // other adapters may await before materializing the supplied snapshot,
+        // so the state root must detach alongside the step-results map.
+        const executionContext = {
+          ...params.executionContext,
+          state: { ...params.executionContext.state },
+        };
+        return persistStepUpdateHandler(this, {
           ...params,
-          // Sample sibling progress at the serialized boundary and detach the
-          // snapshot root from the live execution map before pruning/storage.
+          executionContext,
           stepResults: { ...params.stepResults },
-        }),
-      );
+        });
+      });
     this.pendingStepUpdatesByRun.set(params.runId, pending);
 
     try {

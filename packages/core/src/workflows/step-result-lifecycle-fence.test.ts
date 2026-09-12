@@ -152,6 +152,7 @@ describe('step-result lifecycle fence', () => {
     const siblingFinishedLocally = Promise.withResolvers<void>();
     const siblingPersisted = Promise.withResolvers<void>();
     const releaseFailurePublication = Promise.withResolvers<void>();
+    let failedSnapshotValue: Record<string, unknown> | undefined;
     const publish = pubsub.publish.bind(pubsub);
     const publishSpy = vi.spyOn(pubsub, 'publish').mockImplementation(async (...args) => {
       if (args[1].data?.event?.type === 'step.failed') {
@@ -163,6 +164,7 @@ describe('step-result lifecycle fence', () => {
     const persistWorkflowStepUpdate = workflowsStore!.persistWorkflowStepUpdate.bind(workflowsStore);
     const persistSpy = vi.spyOn(workflowsStore!, 'persistWorkflowStepUpdate').mockImplementation(async input => {
       if (input.lifecycleEvents?.some(event => event.type === 'step.failed' && event.stepId === 'fails')) {
+        failedSnapshotValue = input.snapshot.value as Record<string, unknown>;
         failedStepWriteStarted.resolve();
         await releaseFailedStepWrite.promise;
       }
@@ -213,6 +215,7 @@ describe('step-result lifecycle fence', () => {
       const execution = run.start({ inputData: { value: 'input' }, initialState: { count: 0 } });
       await failedStepWriteStarted.promise;
       await siblingFinishedLocally.promise;
+      expect(failedSnapshotValue).toMatchObject({ count: 0 });
       releaseFailedStepWrite.resolve();
       await siblingPersisted.promise;
       const intermediate = await workflowsStore!.loadWorkflowSnapshot({ workflowName: workflow.id, runId: run.runId });

@@ -324,9 +324,15 @@ export async function executeStep(
 
   // Check if this is a nested workflow that requires special handling
   if (engine.isNestedWorkflowStep(step)) {
+    // The shared map records this invocation as running before the platform
+    // hook runs. Preserve the suspended parent result for engines that inspect
+    // the map to recover the nested run id and resume path.
+    const nestedStepResults = priorSuspendedStepResult
+      ? { ...stepResults, [step.id]: priorSuspendedStepResult }
+      : stepResults;
     const workflowResult = await engine.executeWorkflowStep({
       step,
-      stepResults,
+      stepResults: nestedStepResults,
       executionContext,
       resume,
       timeTravel,
