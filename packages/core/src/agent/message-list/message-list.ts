@@ -1522,7 +1522,9 @@ export class MessageList {
     // normal result and an approval denial resolve the original invocation.
     if (
       Array.isArray(msg.content.toolInvocations) &&
-      (inputPart.toolInvocation.state === 'result' || inputPart.toolInvocation.state === 'output-denied')
+      (inputPart.toolInvocation.state === 'result' ||
+        inputPart.toolInvocation.state === 'output-error' ||
+        inputPart.toolInvocation.state === 'output-denied')
     ) {
       const resolvedInvocation = inputPart.toolInvocation;
       msg.content.toolInvocations = msg.content.toolInvocations.map(invocation =>
@@ -1534,7 +1536,9 @@ export class MessageList {
               args: persistedArgs,
               ...(resolvedInvocation.state === 'result'
                 ? { result: resolvedInvocation.result }
-                : { approval: resolvedInvocation.approval }),
+                : resolvedInvocation.state === 'output-error'
+                  ? { errorText: resolvedInvocation.errorText }
+                  : { approval: resolvedInvocation.approval }),
             }
           : invocation,
       );

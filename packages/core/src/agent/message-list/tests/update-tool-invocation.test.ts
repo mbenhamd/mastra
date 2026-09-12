@@ -81,51 +81,58 @@ describe('MessageList.updateToolInvocation', () => {
     expect(part.toolInvocation.args).toEqual({ topic: 'TypeScript history', detail: true });
   });
 
-  it('should persist user-approved edited args in structured and legacy invocations', () => {
-    const messageList = new MessageList();
-    const originalArgs = { operation: 'archive', projectId: 'old' };
-    const approvedArgs = { operation: 'archive', projectId: 'reviewed' };
-    const msg = makeAssistantMessage([
-      {
-        type: 'tool-invocation',
-        toolInvocation: {
+  it.each(['result', 'output-error'] as const)(
+    'should persist user-approved edited args in structured and legacy %s invocations',
+    state => {
+      const messageList = new MessageList();
+      const originalArgs = { operation: 'archive', projectId: 'old' };
+      const approvedArgs = { operation: 'archive', projectId: 'reviewed' };
+      const msg = makeAssistantMessage([
+        {
+          type: 'tool-invocation',
+          toolInvocation: {
+            state: 'call',
+            toolCallId: 'tc-approved',
+            toolName: 'archive-project',
+            args: originalArgs,
+          },
+        },
+      ]);
+      msg.content.toolInvocations = [
+        {
           state: 'call',
           toolCallId: 'tc-approved',
           toolName: 'archive-project',
           args: originalArgs,
         },
-      },
-    ]);
-    msg.content.toolInvocations = [
-      {
-        state: 'call',
-        toolCallId: 'tc-approved',
-        toolName: 'archive-project',
-        args: originalArgs,
-      },
-    ];
-    messageList.add(msg, 'response');
+      ];
+      messageList.add(msg, 'response');
 
-    const updated = messageList.updateToolInvocation(
-      {
-        type: 'tool-invocation',
-        toolInvocation: {
-          state: 'result',
-          toolCallId: 'tc-approved',
-          toolName: 'archive-project',
-          args: approvedArgs,
-          result: { archived: true },
-          approval: { id: 'tc-approved', approved: true },
+      const updated = messageList.updateToolInvocation(
+        {
+          type: 'tool-invocation',
+          toolInvocation: {
+            state,
+            toolCallId: 'tc-approved',
+            toolName: 'archive-project',
+            args: approvedArgs,
+            ...(state === 'result' ? { result: { archived: true } } : { errorText: 'archive failed' }),
+            approval: { id: 'tc-approved', approved: true },
+          },
         },
-      },
-      undefined,
-      { replaceArgs: true },
-    );
+        undefined,
+        { replaceArgs: true },
+      );
 
-    expect(updated).toBe(true);
-    expect((messageList.get.all.db()[0]?.content.parts?.[0] as any).toolInvocation.args).toEqual(approvedArgs);
-    expect(msg.content.toolInvocations?.[0]?.args).toEqual(approvedArgs);
-  });
+      expect(updated).toBe(true);
+      expect((messageList.get.all.db()[0]?.content.parts?.[0] as any).toolInvocation.args).toEqual(approvedArgs);
+      expect(msg.content.toolInvocations?.[0]?.args).toEqual(approvedArgs);
+      expect(msg.content.toolInvocations?.[0]?.state).toBe(state);
+      if (state === 'output-error') {
+        expect(msg.content.toolInvocations?.[0]).toMatchObject({ errorText: 'archive failed' });
+      }
+    },
+  );
 
   it('should keep a legacy toolInvocations entry in sync with its structured part', () => {
     const messageList = new MessageList();

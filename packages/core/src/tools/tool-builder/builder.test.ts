@@ -524,7 +524,7 @@ describe('MCP Tool Tracing', () => {
   });
 
   describe('requireApproval Handling', () => {
-    it('exposes the runtime input validator without executing the tool', () => {
+    it('exposes the runtime input validator without executing the tool', async () => {
       const execute = vi.fn(async (input: { value: string }) => input);
       const testTool = createTool({
         id: 'approval-preflight-tool',
@@ -541,13 +541,13 @@ describe('MCP Tool Tracing', () => {
         },
       }).build();
 
-      expect(builtTool.validateInput?.({ value: 42 })).toMatchObject({
+      expect(await builtTool.validateInput?.({ value: 42 })).toMatchObject({
         error: {
           error: true,
           message: expect.stringContaining('approval-preflight-tool'),
         },
       });
-      expect(builtTool.validateInput?.({ value: ' valid ' })).toEqual({
+      expect(await builtTool.validateInput?.({ value: ' valid ' })).toEqual({
         data: { value: 'valid' },
       });
       expect(execute).not.toHaveBeenCalled();

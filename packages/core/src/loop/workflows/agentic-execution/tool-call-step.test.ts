@@ -861,9 +861,10 @@ describe('createToolCallStep tool approval workflow', () => {
   });
 
   it('executes validated edited approval arguments and preserves them through re-suspension', async () => {
-    const originalArgs = { param: 'test', limit: 3, nested: { left: 1, right: 2 } };
-    const editedArgs = { param: 'edited value', nested: { left: 9 } };
+    const originalArgs = { param: 'test', limit: 3, nested: { left: 1, right: 2 }, suspendData: 'business input' };
+    const editedArgs = { param: 'edited value', nested: { left: 9 }, _background: { enabled: false } };
     const approvedArgs = { ...originalArgs, ...editedArgs };
+    const executionArgs = { ...originalArgs, param: 'edited value!', nested: { left: 9 } };
     const transcriptArgs = { param: '[redacted]' };
     vi.spyOn(toolPayloadTransform, 'transformToolPayloadForTargets').mockImplementation(async context =>
       context.phase === 'input-available'
@@ -887,6 +888,8 @@ describe('createToolCallStep tool approval workflow', () => {
               .transform(value => `${value}!`),
             limit: z.number(),
             nested: z.object({ left: z.number(), right: z.number().optional() }),
+            suspendData: z.string(),
+            _background: z.object({ enabled: z.boolean() }).optional(),
           })
           .strict(),
         execute,
@@ -929,7 +932,7 @@ describe('createToolCallStep tool approval workflow', () => {
     expect(firstResult).toBeDefined();
 
     expect(execute).toHaveBeenCalledOnce();
-    expect(execute.mock.calls[0]![0]).toEqual({ ...approvedArgs, param: 'edited value!' });
+    expect(execute.mock.calls[0]![0]).toEqual(executionArgs);
     const snapshot = JSON.parse(JSON.stringify(persistSnapshot.mock.calls[0]![0]));
     expect(snapshot.toolCallResume).toMatchObject({
       identityDigest: createToolCallIdentityDigest({ ...inputData, args: approvedArgs }),
@@ -957,7 +960,7 @@ describe('createToolCallStep tool approval workflow', () => {
     expect(execute).toHaveBeenCalledTimes(2);
     expect(snapshotResult).toMatchObject({
       args: approvedArgs,
-      result: { ...approvedArgs, param: 'edited value!' },
+      result: executionArgs,
       approval: { approved: true },
     });
     const result = await step.execute(
@@ -975,10 +978,15 @@ describe('createToolCallStep tool approval workflow', () => {
     expect(execute).toHaveBeenCalledTimes(3);
     expect(result).toMatchObject({
       args: approvedArgs,
-      result: { ...approvedArgs, param: 'edited value!' },
+      result: executionArgs,
       approval: { approved: true },
     });
-    expect(originalArgs).toEqual({ param: 'test', limit: 3, nested: { left: 1, right: 2 } });
+    expect(originalArgs).toEqual({
+      param: 'test',
+      limit: 3,
+      nested: { left: 1, right: 2 },
+      suspendData: 'business input',
+    });
   });
 
   it('rejects invalid or unsupported edited approvals before tool side effects', async () => {
@@ -1015,6 +1023,7 @@ describe('createToolCallStep tool approval workflow', () => {
       },
     };
     (messageList.get.all.db as Mock).mockReturnValue?.([pendingApprovalMessage]);
+    const initialPendingApprovals = structuredClone(pendingApprovalMessage.content.metadata.pendingToolApprovals);
     if (!('mock' in messageList.get.all.db)) {
       messageList.get.all.db = () => [pendingApprovalMessage] as any;
     }
@@ -1059,6 +1068,16 @@ describe('createToolCallStep tool approval workflow', () => {
       }),
     );
     expect(unvalidated.error.message).toBe('Edited approval arguments require a tool input validator');
+    pendingApprovalMessage.content.metadata.pendingToolApprovals = initialPendingApprovals;
+    builtTool.validateInput = vi.fn().mockRejectedValue(new Error('native validation rejected'));
+    const rejected = await step.execute(
+      makeExecuteParams({
+        resumeData: { approved: true, editedArgs: { param: 'changed' } },
+        suspendData: makeSuspendData(),
+      }),
+    );
+    expect(rejected.error).toMatchObject({ message: 'native validation rejected' });
+    expect(pendingApprovalMessage.content.metadata.pendingToolApprovals).toBeUndefined();
     expectNoToolExecution();
     expect(execute).not.toHaveBeenCalled();
     expect(suspend).not.toHaveBeenCalled();

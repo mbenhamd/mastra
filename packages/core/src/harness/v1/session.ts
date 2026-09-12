@@ -12169,10 +12169,11 @@ export class Session {
   async respondToToolApproval(
     opts: ToolApprovalDecision & InboxResponseOptions,
   ): Promise<AgentResult | InboxResponseResult> {
-    if (
-      opts.editedArgs !== undefined &&
-      !parseToolApprovalDecision({ approved: opts.approved, editedArgs: opts.editedArgs })
-    ) {
+    const approvalDecision =
+      opts.editedArgs !== undefined
+        ? parseToolApprovalDecision({ approved: opts.approved, editedArgs: opts.editedArgs })
+        : undefined;
+    if (opts.editedArgs !== undefined && !approvalDecision) {
       throw new HarnessValidationError(
         'respond[tool-approval].editedArgs',
         'editedArgs requires an approved decision and a JSON object',
@@ -12183,7 +12184,7 @@ export class Session {
       compactJsonObject({
         approved: opts.approved,
         reason: opts.reason,
-        editedArgs: opts.editedArgs,
+        editedArgs: approvalDecision?.editedArgs,
       }),
       opts,
     );

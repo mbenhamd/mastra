@@ -752,7 +752,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
         const hasApprovedArgsEnvelope =
           approvedArgsEnvelope?.approvedArgs !== undefined &&
           typeof approvedArgsEnvelope.approvalInputIdentityDigest === 'string' &&
-          parseToolApprovalDecision({ approved: true, editedArgs: approvedArgsEnvelope.approvedArgs }) !== undefined &&
+          toolApprovalEditedArgsSchema.safeParse(approvedArgsEnvelope.approvedArgs).success &&
           createToolCallIdentityDigest({
             toolCallId: metadataToolCallId,
             toolName: inputData.toolName,
@@ -766,7 +766,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           storedResumeMetadata?.type === 'suspension' &&
           storedResumeMetadata.approvedArgs !== undefined &&
           typeof storedResumeMetadata.approvalInputIdentityDigest === 'string' &&
-          parseToolApprovalDecision({ approved: true, editedArgs: storedResumeMetadata.approvedArgs }) !== undefined &&
+          toolApprovalEditedArgsSchema.safeParse(storedResumeMetadata.approvedArgs).success &&
           createToolCallIdentityDigest({
             toolCallId: metadataToolCallId,
             toolName: inputData.toolName,
@@ -987,9 +987,13 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
             return { ...inputData, error: new Error('Edited approval arguments require object tool input') };
           }
           const editedArgs = { ...baseArgs, ...approvalDecision.editedArgs };
-          const validation = await validateInput(editedArgs);
-          if (validation.error !== undefined) {
+          let validation;
+          try {
+            validation = await validateInput(editedArgs);
+          } finally {
             await removeToolMetadata(metadataToolCallId, inputData.toolName, 'approval');
+          }
+          if (validation.error !== undefined) {
             return {
               ...inputData,
               ...resumeTarget,
@@ -1425,7 +1429,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
               addToolMetadata({
                 toolCallId: metadataToolCallId,
                 toolName: inputData.toolName,
-                args,
+                args: approvedArgsResume?.approvedArgs ?? args,
                 suspendPayload,
                 suspendedToolRunId: options?.runId,
                 type: 'suspension',
