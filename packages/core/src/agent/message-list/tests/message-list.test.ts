@@ -3371,6 +3371,54 @@ describe('MessageList', () => {
 
         expect(v2Messages[0].content.metadata).toEqual(metadata);
       });
+
+      it('should omit private approval fields from V4 UI metadata', () => {
+        const metadata = {
+          suspendedTools: {
+            'call-suspended': {
+              toolCallId: 'call-suspended',
+              args: { documentId: 'public-document' },
+              approvedArgs: { documentId: 'private-approved-document' },
+              approvalInputIdentityDigest: 'private-suspended-digest',
+            },
+          },
+          pendingToolApprovals: {
+            'call-approval': {
+              toolCallId: 'call-approval',
+              args: { documentId: 'approval-document' },
+              approvedArgs: { documentId: 'private-approved-approval-document' },
+              approvalInputIdentityDigest: 'private-approval-digest',
+            },
+          },
+        };
+        const dbMessage: MastraDBMessage = {
+          id: 'v4-private-approval-metadata',
+          role: 'assistant',
+          content: {
+            format: 2,
+            parts: [{ type: 'text', text: 'Waiting for approval.' }],
+            metadata,
+          },
+          createdAt: new Date(),
+          threadId,
+          resourceId,
+        };
+
+        const list = new MessageList({ threadId, resourceId }).add(dbMessage, 'response');
+        const uiMetadata = list.get.all.ui()[0]?.metadata as Record<string, any>;
+
+        expect(uiMetadata.suspendedTools['call-suspended']).toMatchObject({
+          args: { documentId: 'public-document' },
+        });
+        expect(uiMetadata.suspendedTools['call-suspended']).not.toHaveProperty('approvedArgs');
+        expect(uiMetadata.suspendedTools['call-suspended']).not.toHaveProperty('approvalInputIdentityDigest');
+        expect(uiMetadata.pendingToolApprovals['call-approval']).toMatchObject({
+          args: { documentId: 'approval-document' },
+        });
+        expect(uiMetadata.pendingToolApprovals['call-approval']).not.toHaveProperty('approvedArgs');
+        expect(uiMetadata.pendingToolApprovals['call-approval']).not.toHaveProperty('approvalInputIdentityDigest');
+        expect(list.get.all.db()[0]?.content.metadata).toEqual(metadata);
+      });
     });
 
     describe('UIMessage metadata extraction', () => {

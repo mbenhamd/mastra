@@ -10,8 +10,6 @@ import { DefaultStepResult } from '../../../stream/aisdk/v5/output-helpers';
 import type { ChunkType, ProviderMetadata } from '../../../stream/types';
 import { ChunkFrom } from '../../../stream/types';
 import {
-  getTransformedToolPayload,
-  hasTransformedToolPayload,
   toolPayloadTransformAllowsTerminalToolResult,
   transformToolPayloadForTargets,
   withToolPayloadTransformMetadata,
@@ -436,13 +434,14 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
         toolCall?.approval?.approved === false;
       const persistDeniedApproval = (toolCall: z.infer<typeof toolCallOutputSchema>) => {
         const deniedToolCallId = toolCall.resumeTargetToolCallId ?? toolCall.toolCallId;
+        const hasVerifiedApprovedArgs = toolCall.approvedArgs !== undefined;
         const deniedPart = {
           type: 'tool-invocation' as const,
           toolInvocation: {
             state: 'output-denied' as const,
             toolCallId: deniedToolCallId,
             toolName: sanitizeToolName(toolCall.toolName),
-            args: toolCall.args,
+            args: hasVerifiedApprovedArgs ? toolCall.approvedArgs : toolCall.args,
             approval: {
               id: toolCall.approval!.id,
               approved: false,
@@ -451,7 +450,10 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
           },
         };
 
-        if (!rest.messageList.updateToolInvocation(deniedPart)) {
+        const updated = hasVerifiedApprovedArgs
+          ? rest.messageList.updateToolInvocation(deniedPart, undefined, { replaceArgs: true })
+          : rest.messageList.updateToolInvocation(deniedPart);
+        if (!updated) {
           // A recalled or provider-shaped history can be missing the original call part. Retain
           // the resolved denial as a response instead of silently dropping the user decision.
           rest.messageList.add(
@@ -543,21 +545,13 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
         };
         const resolvedToolCallId = toolCall.resumeTargetToolCallId ?? toolCall.toolCallId;
         const hasVerifiedApprovedArgs = toolCall.approvedArgs !== undefined;
-        const transcriptInputTransform = getTransformedToolPayload(
-          resolvedPart.providerMetadata,
-          'transcript',
-          'input-available',
-        );
-        const persistedApprovedArgs = hasTransformedToolPayload(transcriptInputTransform)
-          ? transcriptInputTransform.transformed
-          : toolCall.approvedArgs;
         persistPart(
           {
             ...resolvedPart,
             toolInvocation: {
               ...resolvedPart.toolInvocation,
               toolCallId: resolvedToolCallId,
-              ...(hasVerifiedApprovedArgs ? { args: persistedApprovedArgs } : {}),
+              ...(hasVerifiedApprovedArgs ? { args: toolCall.approvedArgs } : {}),
             },
           },
           hasVerifiedApprovedArgs,

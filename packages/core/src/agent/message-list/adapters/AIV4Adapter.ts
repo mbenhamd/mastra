@@ -151,6 +151,35 @@ function toSignalDataPart(message: MastraDBMessage, contents: string): MastraMes
   } as MastraMessagePart;
 }
 
+function stripPrivateToolStateMetadata(metadata: Record<string, unknown> | undefined) {
+  if (!metadata) return undefined;
+
+  const sanitizedMetadata = { ...metadata };
+  for (const key of ['suspendedTools', 'pendingToolApprovals'] as const) {
+    const stateMetadata = metadata[key];
+    if (!stateMetadata || typeof stateMetadata !== 'object' || Array.isArray(stateMetadata)) {
+      continue;
+    }
+
+    sanitizedMetadata[key] = Object.fromEntries(
+      Object.entries(stateMetadata).map(([toolCallId, stateData]) => {
+        if (!stateData || typeof stateData !== 'object' || Array.isArray(stateData)) {
+          return [toolCallId, stateData];
+        }
+
+        const {
+          approvedArgs: _approvedArgs,
+          approvalInputIdentityDigest: _approvalInputIdentityDigest,
+          ...publicStateData
+        } = stateData as Record<string, unknown>;
+        return [toolCallId, publicStateData];
+      }),
+    );
+  }
+
+  return sanitizedMetadata;
+}
+
 // Re-export for backward compatibility
 export type { UIMessageWithMetadata };
 
@@ -177,6 +206,7 @@ export class AIV4Adapter {
       .experimental_attachments
       ? [...m.content.experimental_attachments]
       : [];
+    const metadata = stripPrivateToolStateMetadata(m.content.metadata);
     const contentString =
       typeof m.content.content === `string` && m.content.content !== ''
         ? m.content.content
@@ -322,8 +352,8 @@ export class AIV4Adapter {
         experimental_attachments: experimentalAttachments,
       };
       // Preserve metadata if present
-      if (m.content.metadata) {
-        uiMessage.metadata = m.content.metadata;
+      if (metadata) {
+        uiMessage.metadata = metadata;
       }
       return uiMessage;
     } else if (m.role === `assistant`) {
@@ -355,8 +385,8 @@ export class AIV4Adapter {
             : undefined,
       };
       // Preserve metadata if present
-      if (m.content.metadata) {
-        uiMessage.metadata = m.content.metadata;
+      if (metadata) {
+        uiMessage.metadata = metadata;
       }
       return uiMessage;
     }
@@ -370,8 +400,8 @@ export class AIV4Adapter {
       experimental_attachments: experimentalAttachments,
     };
     // Preserve metadata if present
-    if (m.content.metadata) {
-      uiMessage.metadata = m.content.metadata;
+    if (metadata) {
+      uiMessage.metadata = metadata;
     }
     return uiMessage;
   }

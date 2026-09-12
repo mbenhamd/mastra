@@ -587,6 +587,11 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           toolName: inputData.toolName,
           args: identityArgs,
         });
+        // Keep the digest for the arguments supplied to this workflow execution separate
+        // from the canonical approved arguments restored below. A new suspension created
+        // by an auto-resume must bind to those supplied arguments; an authoritative snapshot
+        // replay keeps the digest carried by that snapshot.
+        const workflowInputIdentityDigest = expectedIdentityDigest;
         let expectedResumeIdentity = {
           version: 1,
           originRunId: runId,
@@ -759,6 +764,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           resumeData !== undefined &&
           storedResumeMetadata?.type === 'suspension' &&
           storedResumeMetadata.identityMatches === true &&
+          storedResumeMetadata.identityMatch === 'resume' &&
           hasEditedApprovalMarker &&
           storedResumeMetadata.canonicalArgs === undefined &&
           storedResumeMetadata.approvedArgs === undefined &&
@@ -983,7 +989,9 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           identityArgs = structuredClone(args);
           verifiedApprovedArgs = structuredClone(args);
           approvedArgsResume = {
-            approvalInputIdentityDigest: storedResumeMetadata!.approvalInputIdentityDigest!,
+            // This branch is a new suspension after an auto-resume. Bind its next resume
+            // envelope to the input that initiated this execution, which may be transcript-redacted.
+            approvalInputIdentityDigest: workflowInputIdentityDigest,
             approvedArgs: structuredClone(args),
           };
           expectedIdentityDigest = createToolCallIdentityDigest({
@@ -1012,6 +1020,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
             // Keep the provider's current call ID so its invocation receives a result, and carry
             // the original pending call separately so persistence can mark that approval denied.
             ...resumeTarget,
+            ...(verifiedApprovedArgs ? { approvedArgs: structuredClone(verifiedApprovedArgs) } : {}),
             approval: {
               id: metadataToolCallId,
               approved: false,
