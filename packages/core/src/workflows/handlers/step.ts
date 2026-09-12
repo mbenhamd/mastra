@@ -219,13 +219,6 @@ export async function executeStep(
     ...(iterationCount ? { metadata: { iterationCount } } : {}),
   };
 
-  if (step.component === 'WORKFLOW' && executionContext.foreachIndex !== undefined) {
-    // A nested foreach iteration gets its own state root. Without this,
-    // child steps that merge state in place can mutate a sibling iteration's
-    // state before the foreach result is applied by the parent.
-    executionContext.state = { ...executionContext.state };
-  }
-
   executionContext.activeStepsPath[step.id] = executionContext.executionPath;
 
   const stepSpan = await engine.createStepSpan({

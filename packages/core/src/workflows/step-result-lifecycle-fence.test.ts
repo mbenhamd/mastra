@@ -443,7 +443,7 @@ describe('step-result lifecycle fence', () => {
     }
   });
 
-  it('isolates state roots across concurrent nested foreach iterations', async () => {
+  it('retains shared state across delayed nested foreach publication', async () => {
     const storage = new MockStore();
     const pubsub = new EventEmitterPubSub();
     const firstPublicationStarted = Promise.withResolvers<void>();
@@ -508,15 +508,97 @@ describe('step-result lifecycle fence', () => {
     const run = await parent.createRun();
 
     try {
-      const execution = run.start({ inputData: [0, 1], initialState: { count: 0 } });
+      const execution = run.start({
+        inputData: [0, 1],
+        initialState: { count: 0 },
+        outputOptions: { includeState: true },
+      });
       await secondIterationSuspended.promise;
-      expect(secondIterationState).toBe(0);
-      expect(secondSuspendPayload).toEqual({ count: 1 });
+      expect(secondIterationState).toBe(1);
+      expect(secondSuspendPayload).toEqual({ count: 2 });
 
       releaseFirstPublication.resolve();
-      await expect(execution).resolves.toMatchObject({ status: 'suspended' });
+      const result = await execution;
+      expect(result).toMatchObject({ status: 'suspended', state: { count: 2 } });
+      const workflowsStore = await storage.getStore('workflows');
+      const snapshot = await workflowsStore?.loadWorkflowSnapshot({
+        workflowName: parent.id,
+        runId: run.runId,
+      });
+      expect(snapshot?.value).toMatchObject({ count: 2 });
     } finally {
       releaseFirstPublication.resolve();
+      await mastra.shutdown();
+      publishSpy.mockRestore();
+    }
+  });
+
+  it('keeps a shared state update when a later nested foreach iteration is a no-op', async () => {
+    const storage = new MockStore();
+    const pubsub = new EventEmitterPubSub();
+    const secondIterationStarted = Promise.withResolvers<void>();
+    const firstIterationApplied = Promise.withResolvers<void>();
+    let secondIterationState: number | undefined;
+    const publish = pubsub.publish.bind(pubsub);
+    const publishSpy = vi.spyOn(pubsub, 'publish').mockImplementation(async (...args) => {
+      const event = args[1].data;
+      if (event?.type === 'workflow-step-progress' && event.payload?.currentIndex === 0) {
+        firstIterationApplied.resolve();
+      }
+      return publish(...args);
+    });
+    const stateSchema = z.object({ count: z.number() });
+    const update = createStep({
+      id: 'update',
+      inputSchema: z.number(),
+      outputSchema: z.number(),
+      stateSchema,
+      execute: async ({ inputData, state, setState }) => {
+        if (inputData === 0) {
+          await secondIterationStarted.promise;
+          await setState({ count: 1 });
+        } else {
+          secondIterationStarted.resolve();
+          await firstIterationApplied.promise;
+          secondIterationState = state.count;
+        }
+        return inputData;
+      },
+    });
+    const child = createWorkflow({
+      id: 'pf-3750-foreach-shared-state-child',
+      inputSchema: z.number(),
+      outputSchema: z.number(),
+    })
+      .then(update)
+      .commit();
+    const parent = createWorkflow({
+      id: 'pf-3750-foreach-shared-state-parent',
+      inputSchema: z.array(z.number()),
+      outputSchema: z.array(z.number()),
+      stateSchema,
+    })
+      .foreach(child, { concurrency: 2 })
+      .commit();
+    const mastra = new Mastra({ logger: false, storage, pubsub, workflows: { [parent.id]: parent } });
+    const run = await parent.createRun();
+
+    try {
+      const result = await run.start({
+        inputData: [0, 1],
+        initialState: { count: 0 },
+        outputOptions: { includeState: true },
+      });
+      const workflowsStore = await storage.getStore('workflows');
+      const snapshot = await workflowsStore?.loadWorkflowSnapshot({
+        workflowName: parent.id,
+        runId: run.runId,
+      });
+
+      expect(secondIterationState).toBe(1);
+      expect(result).toMatchObject({ status: 'success', result: [0, 1], state: { count: 1 } });
+      expect(snapshot?.value).toMatchObject({ count: 1 });
+    } finally {
       await mastra.shutdown();
       publishSpy.mockRestore();
     }
