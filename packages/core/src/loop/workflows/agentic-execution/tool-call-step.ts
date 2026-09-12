@@ -40,6 +40,7 @@ import {
   AGENT_BACKGROUND_CONFIG_KEY,
   BACKGROUND_TASK_MANAGER_CONFIG_KEY,
   BACKGROUND_TASK_MANAGER_KEY,
+  EDITED_APPROVAL_RESUME_LOADER_KEY,
   GENERATE_ID_KEY,
   MEMORY_CONFIG_KEY,
   MEMORY_KEY,
@@ -678,8 +679,13 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
             // the delegate's inner suspended run under `delegatedRunId`. Resume
             // validation and the wrapper handoff both need the inner run, so
             // surface it here (mirrors auto-resume-system-message).
-            runId: typeof storedRecord?.delegatedRunId === 'string' ? storedRecord.delegatedRunId : storedRecord?.runId,
-            originRunId: storedRecord?.originRunId,
+            runId:
+              typeof storedRecord?.delegatedRunId === 'string'
+                ? storedRecord.delegatedRunId
+                : typeof storedRecord?.runId === 'string'
+                  ? storedRecord.runId
+                  : undefined,
+            originRunId: typeof storedRecord?.originRunId === 'string' ? storedRecord.originRunId : undefined,
             identityDigest: typeof storedRecord?.identityDigest === 'string' ? storedRecord.identityDigest : undefined,
             identityMatches: identityMatch !== undefined,
             identityMatch,
@@ -727,7 +733,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           }
           return undefined;
         };
-        const storedResumeMetadata = resumeData !== undefined ? getStoredResumeMetadata(metadataToolCallId) : undefined;
+        let storedResumeMetadata = resumeData !== undefined ? getStoredResumeMetadata(metadataToolCallId) : undefined;
         const hasSuspendedToolRunIdMismatch =
           suppliedSuspendedToolRunId !== undefined &&
           storedResumeMetadata?.runId !== undefined &&
@@ -739,6 +745,57 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
             ? (suspendData as Record<string, unknown>).toolCallResume
             : undefined;
         const hasAuthoritativeResumeEnvelope = authoritativeResumeEnvelope !== undefined;
+        const editedApprovalResumeLoader = readScoped(
+          scopeCtx,
+          EDITED_APPROVAL_RESUME_LOADER_KEY,
+          'editedApprovalResumeLoader',
+        );
+        const hasEditedApprovalMarker =
+          storedResumeMetadata?.approval !== undefined || storedResumeMetadata?.approvalSource === 'tool-gate';
+        const needsEditedApprovalResumeRecovery =
+          !hasAuthoritativeResumeEnvelope &&
+          !isAgentTool &&
+          !isWorkflowTool &&
+          resumeData !== undefined &&
+          storedResumeMetadata?.type === 'suspension' &&
+          storedResumeMetadata.identityMatches === true &&
+          hasEditedApprovalMarker &&
+          storedResumeMetadata.canonicalArgs === undefined &&
+          storedResumeMetadata.approvedArgs === undefined &&
+          typeof storedResumeMetadata.runId === 'string' &&
+          typeof storedResumeMetadata.originRunId === 'string' &&
+          typeof storedResumeMetadata.identityDigest === 'string';
+        if (
+          needsEditedApprovalResumeRecovery &&
+          editedApprovalResumeLoader &&
+          storedResumeMetadata &&
+          typeof storedResumeMetadata.runId === 'string' &&
+          typeof storedResumeMetadata.originRunId === 'string' &&
+          typeof storedResumeMetadata.identityDigest === 'string'
+        ) {
+          const recovered = await editedApprovalResumeLoader({
+            runId: storedResumeMetadata.runId,
+            originRunId: storedResumeMetadata.originRunId,
+            toolCallId: metadataToolCallId,
+            toolName: inputData.toolName,
+            identityDigest: storedResumeMetadata.identityDigest,
+            requestContext,
+            threadId: readScoped(scopeCtx, THREAD_ID_KEY, 'threadId'),
+            resourceId: readScoped(scopeCtx, RESOURCE_ID_KEY, 'resourceId'),
+            actor,
+          });
+          if (recovered) {
+            // Keep the secret snapshot data local to this execution. Recalled
+            // transcript metadata is intentionally redacted and must not be
+            // repopulated with private approval arguments.
+            storedResumeMetadata = {
+              ...storedResumeMetadata,
+              canonicalArgs: recovered.approvedArgs,
+              approvedArgs: recovered.approvedArgs,
+              approvalInputIdentityDigest: recovered.approvalInputIdentityDigest,
+            };
+          }
+        }
         // A tool that suspends after an edited approval retains both the original
         // workflow-input identity and the approved arguments. Authenticate the
         // original input before restoring those arguments from the snapshot.
@@ -880,7 +937,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
             : undefined;
         const needsCanonicalArgsRestore = storedResumeMetadata?.identityMatch === 'resume';
         const isCanonicalArgsUnavailable =
-          needsCanonicalArgsRestore && storedResumeMetadata.canonicalArgs === undefined;
+          needsCanonicalArgsRestore && storedResumeMetadata?.canonicalArgs === undefined;
         const hasInvalidResumeData =
           resumeData !== undefined &&
           (hasResumeIdentityMismatch ||
@@ -899,7 +956,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
         }
 
         if (needsCanonicalArgsRestore) {
-          args = structuredClone(storedResumeMetadata.canonicalArgs);
+          args = structuredClone(storedResumeMetadata!.canonicalArgs);
           expectedIdentityDigest = createToolCallIdentityDigest({
             toolCallId: metadataToolCallId,
             toolName: inputData.toolName,

@@ -74,26 +74,35 @@ import {
 export type ToolToConvert = VercelTool | ToolAction<any, any, any> | VercelToolV5 | ProviderDefinedTool;
 export type LogType = 'tool' | 'toolset' | 'client-tool';
 
-function resolveApprovalInputEditing(schema: unknown): 'object' | undefined {
+function resolveNativeInputValidationSchema(schema: unknown): StandardSchemaWithJSON | undefined {
   if (isStandardSchemaWithJSON(schema)) {
     if (schema['~standard'].vendor === 'ai-sdk') {
-      const wrappedSchema =
-        typeof (schema as { getSchema?: unknown }).getSchema === 'function'
-          ? (schema as unknown as { getSchema: () => Schema }).getSchema()
-          : schema;
-      if (typeof (wrappedSchema as { validate?: unknown }).validate !== 'function') return undefined;
+      const getSchema = (schema as { getSchema?: unknown }).getSchema;
+      if (typeof getSchema === 'function') {
+        const wrappedSchema = (schema as unknown as { getSchema: () => Schema }).getSchema();
+        if (typeof (wrappedSchema as { validate?: unknown }).validate !== 'function') return undefined;
+      }
     }
-    return standardSchemaToJSONSchema(schema, { io: 'input' }).type === 'object' ? 'object' : undefined;
+    return schema;
   }
   if (
     schema &&
     typeof schema === 'object' &&
     typeof (schema as { validate?: unknown }).validate === 'function' &&
-    (schema as { jsonSchema?: { type?: unknown } }).jsonSchema?.type === 'object'
+    typeof (schema as { jsonSchema?: unknown }).jsonSchema === 'object'
   ) {
-    return 'object';
+    return toStandardSchema(schema as any);
   }
   return undefined;
+}
+
+function resolveApprovalInputEditing(
+  nativeInputValidationSchema: StandardSchemaWithJSON | undefined,
+): 'object' | undefined {
+  if (!nativeInputValidationSchema) return undefined;
+  return standardSchemaToJSONSchema(nativeInputValidationSchema, { io: 'input' }).type === 'object'
+    ? 'object'
+    : undefined;
 }
 
 function serializeResumeSchema(schema: unknown): string | undefined {
@@ -1167,11 +1176,12 @@ export class CoreToolBuilder extends MastraBase {
     }
 
     const originalSchema = this.getParameters();
-    const approvalInputEditing = resolveApprovalInputEditing(originalSchema);
-    // Raw AI SDK schemas expose their validator outside Standard Schema. Wrap
-    // eligible approval schemas so preflight, edited-argument validation, and
-    // edited-argument validation invoke the native author validator.
-    const approvalInputValidationSchema = approvalInputEditing ? toStandardSchema(originalSchema) : undefined;
+    // Keep native author validation separate from approval editing eligibility:
+    // unions/intersections can carry constraints that are not editable approval
+    // objects, but still need native preflight validation before compatibility
+    // layers rewrite their JSON Schema.
+    const approvalInputValidationSchema = resolveNativeInputValidationSchema(originalSchema);
+    const approvalInputEditing = resolveApprovalInputEditing(approvalInputValidationSchema);
     const inputValidationSchema = this.buildCompatValidationSchema(originalSchema, schemaCompatLayers);
     let processedInputSchema: Schema | undefined;
 

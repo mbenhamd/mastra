@@ -23,6 +23,7 @@ import type { MastraMemory, MemoryConfigInternal } from '../memory';
 import type { StreamTransportRef } from '../stream/types';
 import type { ToolHooks, ToolPayloadTransformPolicy } from '../tools';
 import type { Workspace } from '../workspace/workspace';
+import type { AgenticLoopEditedApprovalResumeLoader } from './types';
 
 // --- Identity / clock injectors --------------------------------------------
 
@@ -64,6 +65,9 @@ export const SKIP_BG_TASK_WAIT_KEY = createRunScopeKey<boolean>('loop:skipBgTask
 export const DRAIN_PENDING_SIGNALS_KEY =
   createRunScopeKey<(runId: string, scope?: 'pending' | 'pre-run') => CreatedAgentSignal[]>('loop:drainPendingSignals');
 export const INITIAL_SIGNAL_ECHOES_KEY = createRunScopeKey<CreatedAgentSignal[]>('loop:initialSignalEchoes');
+export const EDITED_APPROVAL_RESUME_LOADER_KEY = createRunScopeKey<AgenticLoopEditedApprovalResumeLoader>(
+  'loop:editedApprovalResumeLoader',
+);
 
 // --- Tool payload transform ------------------------------------------------
 

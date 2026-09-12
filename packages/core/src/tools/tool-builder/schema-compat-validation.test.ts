@@ -598,6 +598,32 @@ describe('CoreToolBuilder - Schema Compatibility in Validation', () => {
     });
   });
 
+  it('keeps native validation for union constraints when Haiku rewrites the LLM schema', async () => {
+    const inputSchema = z.union([z.object({ text: z.string().min(20) }), z.object({ count: z.number() })]);
+    const execute = vi.fn(async (input: unknown) => ({ success: true, input }));
+    const tool: ToolAction<any, any> = {
+      id: 'union-min-tool',
+      description: 'Validates union branches',
+      inputSchema,
+      execute,
+    };
+
+    const coreTool = buildCoreTool(tool, 'union-min-tool', haikuModelConfig);
+    const shortInput = { text: 'Short text' };
+
+    await expect(coreTool.validateInput?.(shortInput)).resolves.toMatchObject({
+      error: { error: true },
+    });
+
+    const executeResult = await coreTool.execute?.(shortInput, {
+      abortSignal: new AbortController().signal,
+      toolCallId: 'union-min-call',
+      messages: [],
+    });
+    expect(executeResult).toEqual({ success: true, input: shortInput });
+    expect(execute).toHaveBeenCalledWith(shortInput, expect.any(Object));
+  });
+
   it('should handle OpenAI o3 reasoning model converting optional to nullable (working memory bug)', async () => {
     // This reproduces the exact bug reported by the user with updateWorkingMemory tool
     // OpenAI o3 converts .optional() to .nullable(), then sends null, but validation

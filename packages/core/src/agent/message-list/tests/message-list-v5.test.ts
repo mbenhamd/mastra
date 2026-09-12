@@ -2478,6 +2478,23 @@ describe('MessageList V5 Support', () => {
           },
         },
       };
+      const pendingToolApproval = {
+        toolCallId: 'call-approval-transform',
+        toolName: 'approveReview',
+        args: { documentId: 'approval-doc-123' },
+        type: 'approval',
+        approvedArgs: { documentId: 'private-approved-approval-document' },
+        approvalInputIdentityDigest: 'private-approval-digest',
+        metadata: {
+          mastra: {
+            toolPayloadTransform: {
+              display: {
+                approval: { transformed: { documentId: 'redacted display approval' } },
+              },
+            },
+          },
+        },
+      };
       const suspendedTool = {
         toolCallId: 'call-suspend-transform',
         toolName: 'waitForReview',
@@ -2509,6 +2526,9 @@ describe('MessageList V5 Support', () => {
               suspendedTools: {
                 'call-suspend-transform': suspendedTool,
               },
+              pendingToolApprovals: {
+                'call-approval-transform': pendingToolApproval,
+              },
             },
           },
         },
@@ -2518,8 +2538,49 @@ describe('MessageList V5 Support', () => {
       const uiSuspendedPart = list.get.all.aiV5
         .ui()[0]!
         .parts.find(part => part.type === 'data-tool-call-suspended') as any;
+      const uiMessage = list.get.all.aiV5.ui()[0]! as any;
       expect(uiSuspendedPart.data.args).toEqual({ documentId: 'doc-123' });
+      expect(uiSuspendedPart.data).not.toHaveProperty('approvedArgs');
+      expect(uiSuspendedPart.data).not.toHaveProperty('approvalInputIdentityDigest');
       expect(uiSuspendedPart.data.suspendPayload).toEqual({ reason: 'redacted display suspension' });
+      expect(uiMessage.metadata.suspendedTools['call-suspend-transform']).toMatchObject({
+        args: { documentId: 'doc-123' },
+        suspendPayload: { reason: 'redacted display suspension' },
+      });
+      expect(uiMessage.metadata.suspendedTools['call-suspend-transform']).not.toHaveProperty('approvedArgs');
+      expect(uiMessage.metadata.suspendedTools['call-suspend-transform']).not.toHaveProperty(
+        'approvalInputIdentityDigest',
+      );
+      expect(uiMessage.metadata.pendingToolApprovals['call-approval-transform']).toMatchObject({
+        args: { documentId: 'redacted display approval' },
+      });
+      expect(uiMessage.metadata.pendingToolApprovals['call-approval-transform']).not.toHaveProperty('approvedArgs');
+      expect(uiMessage.metadata.pendingToolApprovals['call-approval-transform']).not.toHaveProperty(
+        'approvalInputIdentityDigest',
+      );
+
+      const untransformedUIMessage = AIV5Adapter.toUIMessage(list.get.all.db()[0]!, {
+        transformToolPayloads: false,
+      }) as any;
+      expect(untransformedUIMessage.metadata.suspendedTools['call-suspend-transform']).toMatchObject({
+        args: { documentId: 'doc-123' },
+        suspendPayload: { reason: 'contains private review context' },
+      });
+      expect(untransformedUIMessage.metadata.pendingToolApprovals['call-approval-transform']).toMatchObject({
+        args: { documentId: 'approval-doc-123' },
+      });
+      expect(untransformedUIMessage.metadata.suspendedTools['call-suspend-transform']).not.toHaveProperty(
+        'approvedArgs',
+      );
+      expect(untransformedUIMessage.metadata.suspendedTools['call-suspend-transform']).not.toHaveProperty(
+        'approvalInputIdentityDigest',
+      );
+      expect(untransformedUIMessage.metadata.pendingToolApprovals['call-approval-transform']).not.toHaveProperty(
+        'approvedArgs',
+      );
+      expect(untransformedUIMessage.metadata.pendingToolApprovals['call-approval-transform']).not.toHaveProperty(
+        'approvalInputIdentityDigest',
+      );
 
       const drainedMessage = list.drainUnsavedMessages()[0]!;
       const drainedSuspendedPart = drainedMessage.content.parts!.find(
@@ -2536,6 +2597,8 @@ describe('MessageList V5 Support', () => {
       expect((drainedMessage.content.metadata!.suspendedTools as any)['call-suspend-transform']).not.toHaveProperty(
         'approvedArgs',
       );
+      expect(suspendedTool).toHaveProperty('approvedArgs');
+      expect(pendingToolApproval).toHaveProperty('approvedArgs');
     });
 
     it('should preserve modelOutput metadata across db to model to db conversion', () => {

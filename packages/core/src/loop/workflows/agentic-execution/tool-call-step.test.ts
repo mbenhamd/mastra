@@ -901,23 +901,26 @@ describe('createToolCallStep tool approval workflow', () => {
         logger: { debug: vi.fn(), warn: vi.fn(), error: vi.fn(), trackException: vi.fn() } as any,
       },
     }).build();
+    const persistedMessageList = new MessageList({ threadId: 'test-thread', resourceId: 'test-resource' });
     const step = createToolCallStep({
       tools: { 'test-tool': builtTool },
-      messageList,
+      messageList: persistedMessageList,
       controller,
       runId: 'test-run',
       streamState,
     } as any);
     const inputData = { ...makeInputData(), args: originalArgs };
     const persistedSuspensionMessage = {
+      id: 'response-1',
       role: 'assistant',
+      createdAt: new Date(),
       content: {
+        format: 2,
         metadata: {} as Record<string, any>,
         parts: [{ type: 'tool-invocation', toolInvocation: inputData }],
       },
     };
-    messageList.get.all.db = () => [persistedSuspensionMessage] as any;
-    messageList.get.response.db = () => [persistedSuspensionMessage] as any;
+    persistedMessageList.add(persistedSuspensionMessage as any, 'response');
     const suspendData = makeSuspendData();
     suspendData.toolCallResume.identityDigest = createToolCallIdentityDigest(inputData);
     const persistSnapshot = vi.fn().mockResolvedValue(undefined);
@@ -944,7 +947,8 @@ describe('createToolCallStep tool approval workflow', () => {
     // Auto-resume reconstructs the next call from persisted message metadata,
     // so that path must restore the same approved arguments and provenance.
     const approvedIdentityDigest = createToolCallIdentityDigest({ ...inputData, args: approvedArgs });
-    expect(persistedSuspensionMessage.content.metadata.suspendedTools[inputData.toolCallId]).toMatchObject({
+    const persistedMetadata = persistedMessageList.get.all.db()[0]!.content.metadata as Record<string, any>;
+    expect(persistedMetadata.suspendedTools[inputData.toolCallId]).toMatchObject({
       identityDigest: approvedIdentityDigest,
       approvalInputIdentityDigest: createToolCallIdentityDigest(inputData),
       approvedArgs,
@@ -981,6 +985,60 @@ describe('createToolCallStep tool approval workflow', () => {
       result: executionArgs,
       approval: { approved: true },
     });
+    const recalledMessageList = new MessageList({ threadId: 'test-thread', resourceId: 'test-resource' }).deserialize(
+      persistedMessageList.serialize(),
+    );
+    const recalledMessage = recalledMessageList.get.all.db()[0]!;
+    const recalledMetadata = recalledMessage.content.metadata as Record<string, any>;
+    delete recalledMetadata.suspendedTools[inputData.toolCallId].approvedArgs;
+    delete recalledMetadata.suspendedTools[inputData.toolCallId].approvalInputIdentityDigest;
+    const recalledInvocation = recalledMessage.content.parts?.find(
+      part => part.type === 'tool-invocation' && part.toolInvocation.toolCallId === inputData.toolCallId,
+    );
+    if (recalledInvocation?.type === 'tool-invocation') {
+      recalledInvocation.toolInvocation.args = transcriptArgs;
+    }
+    const editedApprovalResumeLoader = vi.fn().mockResolvedValue({
+      approvedArgs,
+      approvalInputIdentityDigest: createToolCallIdentityDigest(inputData),
+    });
+    const recalledStep = createToolCallStep({
+      tools: { 'test-tool': builtTool },
+      messageList: recalledMessageList,
+      controller,
+      runId: 'test-run',
+      streamState,
+      _internal: { editedApprovalResumeLoader },
+    } as any);
+    const recalledResult = await recalledStep.execute(
+      makeExecuteParams({
+        inputData: {
+          ...inputData,
+          args: {
+            ...transcriptArgs,
+            resumeData: { answer: 'continue after cold recall' },
+            suspendedToolCallId: inputData.toolCallId,
+          },
+        },
+      }),
+    );
+    expect(editedApprovalResumeLoader).toHaveBeenCalledOnce();
+    expect(editedApprovalResumeLoader).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runId: 'test-run',
+        originRunId: 'test-run',
+        toolCallId: inputData.toolCallId,
+        toolName: inputData.toolName,
+        identityDigest: approvedIdentityDigest,
+      }),
+    );
+    expect(recalledResult).toMatchObject({
+      args: approvedArgs,
+      result: executionArgs,
+      approval: { approved: true },
+    });
+    expect(recalledMetadata.suspendedTools[inputData.toolCallId]).not.toHaveProperty('approvedArgs');
+    expect(recalledMetadata.suspendedTools[inputData.toolCallId]).not.toHaveProperty('approvalInputIdentityDigest');
     expect(originalArgs).toEqual({
       param: 'test',
       limit: 3,

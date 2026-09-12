@@ -114,7 +114,10 @@ export function buildAutoResumeSystemMessageSuffix(
   // parentRunId is internal bookkeeping for channel resume routing; the model
   // only needs runId (as suspendedToolRunId). Omitting it keeps the prompt
   // byte-identical to existing LLM recordings.
-  const toolsForPrompt = resumableTools.map(({ parentRunId: _parentRunId, ...rest }) => rest);
+  const toolsForPrompt = resumableTools.map(
+    ({ parentRunId: _parentRunId, approvedArgs: _approvedArgs, approvalInputIdentityDigest: _inputDigest, ...rest }) =>
+      rest,
+  );
   return `\n\nAnalyse the suspended tools: ${JSON.stringify(toolsForPrompt)}, using the messages available to you and the resumeSchema of each suspended tool, find the tool whose resumeData you can construct properly.
                       resumeData can not be an empty object nor null/undefined.
                       When you find that and call that tool, add the resumeData to the tool call arguments/input.
