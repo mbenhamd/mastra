@@ -50,11 +50,12 @@ function makeFakeMastra(
       const outcome = persistWorkflowStepUpdateRecord(store.snapshot ?? undefined, args, value =>
         structuredClone(value),
       );
-      if (outcome.status === 'persisted' && outcome.snapshot) {
+      const { snapshot, ...result } = outcome;
+      if (outcome.status === 'persisted' && snapshot) {
         store.calls.push(args);
-        store.snapshot = outcome.snapshot;
+        store.snapshot = snapshot;
       }
-      return { status: outcome.status };
+      return result;
     }) as any,
   };
   const mastra = {
@@ -68,6 +69,7 @@ function makeFakeMastra(
 function makeEngine(
   shouldPersistSnapshot: (params: { workflowStatus: WorkflowRunStatus }) => boolean,
   capabilities?: WorkflowResumeCapabilities,
+  pruneSnapshot?: (params: { snapshot: WorkflowRunState; workflowStatus: WorkflowRunStatus }) => WorkflowRunState,
 ) {
   const { mastra, store } = makeFakeMastra(capabilities);
   const engine = new DefaultExecutionEngine({
@@ -75,6 +77,7 @@ function makeEngine(
     options: {
       validateInputs: false,
       shouldPersistSnapshot: shouldPersistSnapshot as any,
+      pruneSnapshot,
     },
   });
   return { engine, store };
@@ -423,6 +426,133 @@ describe('persistStepUpdate — suspended overwrite guard', () => {
     expect(store.calls).toHaveLength(0);
     expect(store.legacyCalls.map(call => call.snapshot.status)).toEqual(['pending', 'running']);
     expect(store.snapshot).toMatchObject({ status: 'running' });
+
+    for (const stepId of ['first', 'second']) {
+      await engine.persistStepUpdate({
+        workflowId: 'wf',
+        runId: 'run-1',
+        resourceId: 'resource-1',
+        stepResults: { [stepId]: { status: 'success', output: { stepId } } },
+        serializedStepGraph: [],
+        executionContext: baseExecutionContext({ runId: 'run-1' }),
+        workflowStatus: 'running',
+        requestContext: new RequestContext(),
+        lifecycleEvents: [
+          {
+            type: 'step.completed',
+            stepId,
+            stepCallId: `wfsc:${stepId}`,
+            stepAttempt: 1,
+            output: { stepId },
+          },
+        ],
+      });
+    }
+    expect(store.snapshot?.lifecycleOutbox?.map(event => ('stepId' in event ? event.stepId : undefined))).toEqual([
+      'first',
+      'second',
+    ]);
+  });
+
+  it('applies independent lifecycle redaction before legacy adapter persistence', async () => {
+    for (const redact of ['context', 'context-in-place', 'cloned-context', 'event', 'event-in-place'] as const) {
+      ({ engine, store } = makeEngine(
+        () => true,
+        {},
+        ({ snapshot }) => {
+          if (redact === 'context') {
+            return { ...snapshot, context: { completed: { status: 'success' } } };
+          }
+          if (redact === 'context-in-place') {
+            delete (snapshot.context.completed as { output?: unknown }).output;
+            return snapshot;
+          }
+          if (redact === 'cloned-context') {
+            const cloned = structuredClone(snapshot);
+            delete (cloned.context.completed as { output?: unknown }).output;
+            return cloned;
+          }
+          if (redact === 'event-in-place') {
+            for (const event of snapshot.lifecycleOutbox ?? []) {
+              if (event.type === 'step.completed') delete event.output;
+            }
+            return snapshot;
+          }
+          return {
+            ...snapshot,
+            lifecycleOutbox: snapshot.lifecycleOutbox?.map(event =>
+              event.type === 'step.completed' ? { ...event, output: { redacted: true } } : event,
+            ),
+          };
+        },
+      ));
+
+      const outcome = await engine.persistStepUpdate({
+        workflowId: 'wf',
+        runId: 'run-1',
+        resourceId: 'resource-1',
+        stepResults: { completed: { status: 'success', output: { secret: true } } },
+        serializedStepGraph: [],
+        executionContext: baseExecutionContext({
+          executionGeneration: 'wfeg:generation',
+          lifecycleStepStates: { completed: { stepCallId: 'wfsc:completed', stepAttempt: 1 } },
+        }),
+        workflowStatus: 'running',
+        requestContext: new RequestContext(),
+        lifecycleEvents: [
+          {
+            type: 'step.completed',
+            stepId: 'completed',
+            stepCallId: 'wfsc:completed',
+            stepAttempt: 1,
+            output: { secret: true },
+          },
+        ],
+      });
+      const expectedOutput = redact === 'event' ? { redacted: true } : undefined;
+
+      expect(outcome?.acceptedEvents).toEqual([
+        expect.objectContaining({ type: 'step.completed', output: expectedOutput }),
+      ]);
+      expect(store.legacyCalls[0]?.snapshot.lifecycleOutbox).toEqual([
+        expect.objectContaining({ type: 'step.completed', output: expectedOutput }),
+      ]);
+    }
+  });
+
+  it('returns a terminal disposition instead of overwriting a legacy snapshot', async () => {
+    ({ engine, store } = makeEngine(() => true, {}));
+    store.snapshot = {
+      runId: 'run-1',
+      status: 'success',
+      value: { remote: true },
+      context: {},
+      activePaths: [],
+      activeStepsPath: {},
+      suspendedPaths: {},
+      resumeLabels: {},
+      waitingPaths: {},
+      serializedStepGraph: [],
+      timestamp: 1,
+      executionGeneration: 'wfeg:generation',
+    } as WorkflowRunState;
+
+    const outcome = await engine.persistStepUpdate({
+      workflowId: 'wf',
+      runId: 'run-1',
+      resourceId: 'resource-1',
+      stepResults: {},
+      serializedStepGraph: [],
+      executionContext: baseExecutionContext({
+        runId: 'run-1',
+        executionGeneration: 'wfeg:generation',
+      }),
+      workflowStatus: 'running',
+      requestContext: new RequestContext(),
+    });
+
+    expect(outcome).toMatchObject({ status: 'finalized', disposition: 'success' });
+    expect(store.legacyCalls).toHaveLength(0);
   });
 
   it('fails closed for a resumed write when atomic resume lacks fenced step updates', async () => {

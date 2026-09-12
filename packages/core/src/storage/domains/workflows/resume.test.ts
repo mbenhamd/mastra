@@ -113,7 +113,7 @@ describe('atomic workflow resume records', () => {
         },
         materialize,
       ),
-    ).toEqual({ status: 'stale_execution' });
+    ).toMatchObject({ status: 'stale_execution' });
 
     for (const lineage of [
       { expected: undefined, existing: existing.executionGeneration, proposed: undefined },
@@ -136,7 +136,7 @@ describe('atomic workflow resume records', () => {
           },
           materialize,
         ),
-      ).toEqual({ status: 'stale_execution' });
+      ).toMatchObject({ status: 'stale_execution' });
     }
 
     for (const attempts of [
@@ -157,7 +157,7 @@ describe('atomic workflow resume records', () => {
           },
           materialize,
         ),
-      ).toEqual({ status: 'stale_execution' });
+      ).toMatchObject({ status: 'stale_execution' });
     }
 
     const persisted = persistWorkflowStepUpdateRecord(
@@ -197,7 +197,7 @@ describe('atomic workflow resume records', () => {
         },
         materialize,
       ),
-    ).toEqual({ status: 'stale_execution' });
+    ).toMatchObject({ status: 'stale_execution' });
 
     expect(
       persistWorkflowStepUpdateRecord(
@@ -213,7 +213,7 @@ describe('atomic workflow resume records', () => {
         },
         materialize,
       ),
-    ).toEqual({ status: 'stale_execution' });
+    ).toMatchObject({ status: 'stale_execution' });
 
     const admission = admissionInput();
     const admitted = admitWorkflowResumeRecord(existing, admission, 10, materialize);
@@ -231,7 +231,67 @@ describe('atomic workflow resume records', () => {
         },
         materialize,
       ),
-    ).toEqual({ status: 'stale_execution' });
+    ).toMatchObject({ status: 'stale_execution' });
+  });
+
+  it('commits lifecycle events with a persisted step and rejects them on a terminal snapshot', () => {
+    const existing = {
+      ...suspendedSnapshot(),
+      status: 'running' as const,
+      lifecycleResumeAttempt: 0,
+    };
+    const event = {
+      type: 'step.completed' as const,
+      stepId: 'wait',
+      stepCallId: 'wfsc:wait-1',
+      stepAttempt: 1,
+      output: { ok: true },
+    };
+    const persisted = persistWorkflowStepUpdateRecord(
+      existing,
+      {
+        workflowName: 'workflow-1',
+        runId: existing.runId,
+        resourceId: existing.resourceId,
+        expectedExecutionGeneration: existing.executionGeneration,
+        snapshot: { ...existing, context: { ...existing.context, wait: { status: 'success', output: { ok: true } } } },
+        lifecycleEvents: [event],
+      },
+      materialize,
+    );
+    expect(persisted.status).toBe('persisted');
+    expect(persisted.acceptedEvents).toEqual([event]);
+    expect(persisted.snapshot?.lifecycleOutbox).toEqual([event]);
+
+    const pruned = persistWorkflowStepUpdateRecord(
+      persisted.snapshot,
+      {
+        workflowName: 'workflow-1',
+        runId: existing.runId,
+        resourceId: existing.resourceId,
+        expectedExecutionGeneration: existing.executionGeneration,
+        snapshot: { ...persisted.snapshot!, lifecycleOutbox: undefined },
+        retainExistingLifecycleOutbox: false,
+      },
+      materialize,
+    );
+    expect(pruned.status).toBe('persisted');
+    expect(pruned.snapshot?.lifecycleOutbox).toBeUndefined();
+
+    const terminal = persistWorkflowStepUpdateRecord(
+      { ...existing, status: 'success' },
+      {
+        workflowName: 'workflow-1',
+        runId: existing.runId,
+        expectedExecutionGeneration: existing.executionGeneration,
+        snapshot: existing,
+        lifecycleEvents: [event],
+      },
+      materialize,
+    );
+    expect(terminal).toMatchObject({ status: 'finalized', disposition: 'success' });
+    expect(terminal.acceptedEvents).toBeUndefined();
+    expect(terminal.snapshot).toBeUndefined();
   });
 
   it('keeps operation identity strict when storage snapshots support rich values', () => {
