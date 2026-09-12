@@ -9,7 +9,7 @@ import { createStep, createWorkflow } from './index';
 const ioSchema = z.object({ value: z.string() });
 
 describe('step-result lifecycle fence', () => {
-  it('completes a 3-step fenced run without skipping post-persist cancellation checks', async () => {
+  it('retains start, publication, and post-entry authority checks until lifecycle delivery is ordered', async () => {
     const storage = new MockStore();
     const pubsub = new EventEmitterPubSub();
     const workflow = createWorkflow({
@@ -52,26 +52,126 @@ describe('step-result lifecycle fence', () => {
 
       expect(result.status).toBe('success');
       expect(result.result).toEqual({ value: 'ok' });
-      expect(authority).toHaveBeenCalled();
+      expect(authority).toHaveBeenCalledTimes(9);
     } finally {
       await mastra.shutdown();
       authority.mockRestore();
     }
   });
 
+  it.each(['start', 'step-result', 'entry-result'])(
+    'reconciles remote cancellation during a %s acknowledgement',
+    async phase => {
+      const storage = new MockStore();
+      const pubsub = new EventEmitterPubSub();
+      const publish = vi.spyOn(pubsub, 'publish');
+      const firstStep = vi.fn(async ({ inputData }) => inputData);
+      const nextStep = vi.fn(async ({ inputData }) => inputData);
+      const makeWorkflow = () =>
+        createWorkflow({
+          id: 'pf-3750-delayed-ack',
+          inputSchema: ioSchema,
+          outputSchema: ioSchema,
+        })
+          .then(
+            createStep({
+              id: 'first',
+              inputSchema: ioSchema,
+              outputSchema: ioSchema,
+              execute: firstStep,
+            }),
+          )
+          .then(
+            createStep({
+              id: 'next',
+              inputSchema: ioSchema,
+              outputSchema: ioSchema,
+              execute: nextStep,
+            }),
+          )
+          .commit();
+      const workflow = makeWorkflow();
+      const remoteWorkflow = makeWorkflow();
+      const mastra = new Mastra({ logger: false, storage, pubsub, workflows: { [workflow.id]: workflow } });
+      const remoteMastra = new Mastra({
+        logger: false,
+        storage,
+        pubsub,
+        workflows: { [remoteWorkflow.id]: remoteWorkflow },
+      });
+      const acknowledged = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const persist = DefaultExecutionEngine.prototype.persistStepUpdate;
+      const persistSpy = vi
+        .spyOn(DefaultExecutionEngine.prototype, 'persistStepUpdate')
+        .mockImplementation(async function (params) {
+          const outcome = await persist.call(this, params);
+          if (params.phase === phase && params.executionContext.executionPath[0] === 0) {
+            acknowledged.resolve();
+            await release.promise;
+          }
+          return outcome;
+        });
+      try {
+        const run = await workflow.createRun();
+        const execution = run.start({ inputData: { value: 'input' } });
+        await acknowledged.promise;
+        const remoteRun = await remoteWorkflow.createRun({ runId: run.runId });
+        await remoteRun.cancel();
+        release.resolve();
+        await expect(execution).resolves.toMatchObject({ status: 'canceled' });
+        expect(nextStep).not.toHaveBeenCalled();
+        if (phase === 'start') expect(firstStep).not.toHaveBeenCalled();
+        const events = publish.mock.calls.map(([, event]) => event.data?.event);
+        const terminal = events.findIndex(event => event?.type === 'workflow.finished');
+        expect(terminal).toBeGreaterThanOrEqual(0);
+        expect(
+          events
+            .slice(terminal + 1)
+            .filter(
+              event =>
+                event?.type === 'step.started' || event?.type === 'step.completed' || event?.type === 'step.finished',
+            ),
+        ).toEqual([]);
+      } finally {
+        release.resolve();
+        persistSpy.mockRestore();
+        publish.mockRestore();
+        await mastra.shutdown();
+        await remoteMastra.shutdown();
+      }
+    },
+  );
+
   it('retains a complete parallel failure snapshot and a serialized lifecycle error', async () => {
     const storage = new MockStore();
     const pubsub = new EventEmitterPubSub();
-    const failedStepPersisted = Promise.withResolvers<void>();
+    const failedStepWriteStarted = Promise.withResolvers<void>();
+    const releaseFailedStepWrite = Promise.withResolvers<void>();
+    const siblingEntered = Promise.withResolvers<void>();
+    const siblingFinishedLocally = Promise.withResolvers<void>();
+    const siblingPersisted = Promise.withResolvers<void>();
+    const releaseFailurePublication = Promise.withResolvers<void>();
+    const publish = pubsub.publish.bind(pubsub);
+    const publishSpy = vi.spyOn(pubsub, 'publish').mockImplementation(async (...args) => {
+      if (args[1].data?.event?.type === 'step.failed') {
+        await releaseFailurePublication.promise;
+      }
+      return publish(...args);
+    });
     const workflowsStore = await storage.getStore('workflows');
     const persistWorkflowStepUpdate = workflowsStore!.persistWorkflowStepUpdate.bind(workflowsStore);
     const persistSpy = vi.spyOn(workflowsStore!, 'persistWorkflowStepUpdate').mockImplementation(async input => {
+      if (input.lifecycleEvents?.some(event => event.type === 'step.failed' && event.stepId === 'fails')) {
+        failedStepWriteStarted.resolve();
+        await releaseFailedStepWrite.promise;
+      }
       const outcome = await persistWorkflowStepUpdate(input);
       if (
         outcome.status === 'persisted' &&
-        input.lifecycleEvents?.some(event => event.type === 'step.failed' && event.stepId === 'fails')
+        input.lifecycleEvents?.some(event => event.type === 'step.completed' && event.stepId === 'sibling')
       ) {
-        failedStepPersisted.resolve();
+        siblingPersisted.resolve();
       }
       return outcome;
     });
@@ -80,6 +180,7 @@ describe('step-result lifecycle fence', () => {
       inputSchema: ioSchema,
       outputSchema: ioSchema,
       execute: async () => {
+        await siblingEntered.promise;
         throw new Error('fenced failure');
       },
     });
@@ -87,8 +188,12 @@ describe('step-result lifecycle fence', () => {
       id: 'sibling',
       inputSchema: ioSchema,
       outputSchema: ioSchema,
-      execute: async () => {
-        await failedStepPersisted.promise;
+      stateSchema: z.object({ count: z.number() }),
+      execute: async ({ setState }) => {
+        siblingEntered.resolve();
+        await failedStepWriteStarted.promise;
+        await setState({ count: 1 });
+        siblingFinishedLocally.resolve();
         return { value: 'sibling' };
       },
     });
@@ -105,7 +210,19 @@ describe('step-result lifecycle fence', () => {
     const run = await workflow.createRun();
 
     try {
-      const result = await run.start({ inputData: { value: 'input' } });
+      const execution = run.start({ inputData: { value: 'input' }, initialState: { count: 0 } });
+      await failedStepWriteStarted.promise;
+      await siblingFinishedLocally.promise;
+      releaseFailedStepWrite.resolve();
+      await siblingPersisted.promise;
+      const intermediate = await workflowsStore!.loadWorkflowSnapshot({ workflowName: workflow.id, runId: run.runId });
+      expect(intermediate?.context).toMatchObject({
+        fails: { status: 'failed', error: { message: 'fenced failure' } },
+        sibling: { status: 'success', output: { value: 'sibling' } },
+      });
+      expect(intermediate?.value).toMatchObject({ count: 1 });
+      releaseFailurePublication.resolve();
+      const result = await execution;
       expect(result.status).toBe('failed');
       expect(result.error).toMatchObject({ message: 'fenced failure' });
 
@@ -114,6 +231,7 @@ describe('step-result lifecycle fence', () => {
         fails: { status: 'failed' },
         sibling: { status: 'success', output: { value: 'sibling' } },
       });
+      expect(snapshot?.value).toMatchObject({ count: 1 });
       expect(snapshot?.error).toMatchObject({ message: 'fenced failure' });
       const jsonOutbox = JSON.parse(JSON.stringify(snapshot?.lifecycleOutbox));
       expect(jsonOutbox).toEqual(
@@ -125,8 +243,11 @@ describe('step-result lifecycle fence', () => {
         ]),
       );
     } finally {
+      releaseFailedStepWrite.resolve();
+      releaseFailurePublication.resolve();
       await mastra.shutdown();
       persistSpy.mockRestore();
+      publishSpy.mockRestore();
     }
   });
 
@@ -160,7 +281,7 @@ describe('step-result lifecycle fence', () => {
         id: 'pf-3750-fresh-resume',
         inputSchema: ioSchema,
         outputSchema: ioSchema,
-        stateSchema: ioSchema,
+        stateSchema: ioSchema.extend({ retained: z.string() }),
       })
         .then(approval)
         .commit();
@@ -176,7 +297,7 @@ describe('step-result lifecycle fence', () => {
 
     try {
       await expect(
-        firstRun.start({ inputData: { value: 'input' }, initialState: { value: 'initial' } }),
+        firstRun.start({ inputData: { value: 'input' }, initialState: { value: 'initial', retained: 'keep' } }),
       ).resolves.toMatchObject({ status: 'suspended' });
       await firstMastra.shutdown();
 
@@ -198,7 +319,7 @@ describe('step-result lifecycle fence', () => {
           workflowName: secondWorkflow.id,
           runId: secondRun.runId,
         });
-        expect(suspendedAgain).toMatchObject({ status: 'suspended', value: { value: 'updated' } });
+        expect(suspendedAgain).toMatchObject({ status: 'suspended', value: { value: 'updated', retained: 'keep' } });
       } finally {
         await secondMastra.shutdown();
       }
@@ -222,7 +343,7 @@ describe('step-result lifecycle fence', () => {
           workflowName: finalWorkflow.id,
           runId: finalRun.runId,
         });
-        expect(finalSnapshot).toMatchObject({ status: 'success', value: { value: 'updated' } });
+        expect(finalSnapshot).toMatchObject({ status: 'success', value: { value: 'updated', retained: 'keep' } });
         const finalStepEvents = publish.mock.calls
           .map(([, event]) => event.data?.event)
           .filter(event => event?.stepId === 'approval');
@@ -277,7 +398,7 @@ describe('step-result lifecycle fence', () => {
     }
   });
 
-  it('honors lifecycle pruning with a status-only fenced adapter', async () => {
+  it('honors lifecycle pruning on ordinary resume with a status-only fenced adapter', async () => {
     const storage = new MockStore();
     const pubsub = new EventEmitterPubSub();
     const publish = vi.spyOn(pubsub, 'publish');
@@ -291,7 +412,13 @@ describe('step-result lifecycle fence', () => {
       id: 'status-only-failure',
       inputSchema: ioSchema,
       outputSchema: ioSchema,
-      execute: async () => {
+      suspendSchema: z.object({}),
+      resumeSchema: ioSchema,
+      execute: async ({ inputData, resumeData, suspend }) => {
+        if (!resumeData) {
+          await suspend({});
+          return inputData;
+        }
         throw new Error('status-only failure');
       },
     });
@@ -313,9 +440,14 @@ describe('step-result lifecycle fence', () => {
 
     try {
       await expect(run.start({ inputData: { value: 'input' } })).resolves.toMatchObject({
-        status: 'failed',
-        error: expect.objectContaining({ message: 'status-only failure' }),
+        status: 'suspended',
       });
+      await expect(run.resume({ step: 'status-only-failure', resumeData: { value: 'resume' } })).resolves.toMatchObject(
+        {
+          status: 'failed',
+          error: expect.objectContaining({ message: 'status-only failure' }),
+        },
+      );
       const snapshot = await workflowsStore.loadWorkflowSnapshot({ workflowName: workflow.id, runId: run.runId });
       expect(snapshot).toMatchObject({ status: 'failed', error: { message: 'status-only failure' } });
       expect(snapshot?.lifecycleOutbox).toBeUndefined();

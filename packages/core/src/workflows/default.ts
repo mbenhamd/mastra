@@ -99,6 +99,13 @@ export class DefaultExecutionEngine extends ExecutionEngine {
    */
   protected lastPersistedStatusByRun = new Map<string, WorkflowRunStatus>();
 
+  /**
+   * Serializes snapshot capture and persistence for each run without
+   * serializing unrelated runs. The entry is removed by persistStepUpdate
+   * after the queued write settles, including rejected writes.
+   */
+  private pendingStepUpdatesByRun = new Map<string, Promise<PersistWorkflowStepUpdateResult | void>>();
+
   /** Returns the last status persisted for a given run in this process, if any. */
   getLastPersistedStatus(runId: string): WorkflowRunStatus | undefined {
     return this.lastPersistedStatusByRun.get(runId);
@@ -154,6 +161,11 @@ export class DefaultExecutionEngine extends ExecutionEngine {
     executionGeneration: string;
   }): Promise<boolean> {
     return (await this.getAuthoritativeExecutionDisposition(params)) === 'canceled';
+  }
+
+  private async shouldReconcilePersistedTerminal(): Promise<boolean> {
+    const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
+    return workflowsStore?.getWorkflowResumeCapabilities()?.fencedStepUpdateVersion !== 1;
   }
 
   /**
@@ -1099,7 +1111,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       const persistOutcome = lastOutput.persistOutcome as PersistWorkflowStepUpdateResult | void | undefined;
       const authoritativeDisposition = params.transientExecution
         ? undefined
-        : persistOutcome && persistOutcome.status !== 'persisted' && persistOutcome.status
+        : persistOutcome && persistOutcome.status !== 'persisted'
           ? (persistOutcome.disposition ?? 'canceled')
           : await this.getAuthoritativeExecutionDisposition({ workflowId, runId, executionGeneration });
       if (
@@ -1203,10 +1215,12 @@ export class DefaultExecutionEngine extends ExecutionEngine {
           }
         }
 
+        const shouldCheckTerminalAuthority =
+          !params.transientExecution &&
+          (terminalWrite?.status !== 'persisted' || (await this.shouldReconcilePersistedTerminal()));
         if (
           params.abortController.signal.aborted ||
-          (!params.transientExecution &&
-            terminalWrite?.status !== 'persisted' &&
+          (shouldCheckTerminalAuthority &&
             (await this.isAuthoritativelyCanceled({ workflowId, runId, executionGeneration })))
         ) {
           result = { ...result, status: 'canceled', result: undefined, error: undefined };
@@ -1432,10 +1446,12 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       }
     }
 
+    const shouldCheckTerminalAuthority =
+      !params.transientExecution &&
+      (terminalWrite?.status !== 'persisted' || (await this.shouldReconcilePersistedTerminal()));
     if (
       params.abortController.signal.aborted ||
-      (!params.transientExecution &&
-        terminalWrite?.status !== 'persisted' &&
+      (shouldCheckTerminalAuthority &&
         (await this.isAuthoritativelyCanceled({ workflowId, runId, executionGeneration })))
     ) {
       result = { ...result, status: 'canceled', result: undefined, error: undefined };
@@ -1613,7 +1629,34 @@ export class DefaultExecutionEngine extends ExecutionEngine {
   }
 
   async persistStepUpdate(params: PersistStepUpdateParams): Promise<PersistWorkflowStepUpdateResult | void> {
-    return persistStepUpdateHandler(this, params);
+    // Transient executions never persist. Keep this path outside the queue so
+    // they retain the existing no-storage fast path.
+    if (params.executionContext.transientExecution) {
+      return persistStepUpdateHandler(this, params);
+    }
+
+    const previous = this.pendingStepUpdatesByRun.get(params.runId);
+    const pending = (previous ?? Promise.resolve())
+      // A failed write must release the per-run queue so a later write can
+      // still make progress and report its own outcome.
+      .catch(() => undefined)
+      .then(() =>
+        persistStepUpdateHandler(this, {
+          ...params,
+          // Sample sibling progress at the serialized boundary and detach the
+          // snapshot root from the live execution map before pruning/storage.
+          stepResults: { ...params.stepResults },
+        }),
+      );
+    this.pendingStepUpdatesByRun.set(params.runId, pending);
+
+    try {
+      return await pending;
+    } finally {
+      if (this.pendingStepUpdatesByRun.get(params.runId) === pending) {
+        this.pendingStepUpdatesByRun.delete(params.runId);
+      }
+    }
   }
 
   private async resolveRejectedTerminalWrite(

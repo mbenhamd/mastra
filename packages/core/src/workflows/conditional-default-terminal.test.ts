@@ -494,9 +494,10 @@ it('keeps overlapping durable cancellations joined to the active cancellation ad
   };
   const originalLoad = workflowsStore.loadWorkflowSnapshot.bind(workflowsStore);
   let snapshotsRead = 0;
+  let cancellationsStarted = false;
   const load = vi.spyOn(workflowsStore, 'loadWorkflowSnapshot').mockImplementation(async args => {
     const snapshot = await originalLoad(args);
-    if (snapshot?.status === 'running' && snapshotsRead < 2) {
+    if (cancellationsStarted && snapshot?.status === 'running' && snapshotsRead < 2) {
       snapshotsRead++;
       if (snapshotsRead === 2) bothSnapshotsRead.resolve();
       await releaseSnapshots.promise;
@@ -513,6 +514,7 @@ it('keeps overlapping durable cancellations joined to the active cancellation ad
   try {
     const started = run.start({ inputData: {} });
     await entered.promise;
+    cancellationsStarted = true;
     const cancelOne = run.cancel();
     const cancelTwo = run.cancel();
     await bothSnapshotsRead.promise;

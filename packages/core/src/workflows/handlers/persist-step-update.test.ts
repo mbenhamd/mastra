@@ -455,7 +455,16 @@ describe('persistStepUpdate — suspended overwrite guard', () => {
   });
 
   it('applies independent lifecycle redaction before legacy adapter persistence', async () => {
-    for (const redact of ['context', 'context-in-place', 'cloned-context', 'event', 'event-in-place'] as const) {
+    for (const redact of [
+      'context',
+      'context-in-place',
+      'cloned-context',
+      'json-context',
+      'partial-context',
+      'partial-event-in-place',
+      'event',
+      'event-in-place',
+    ] as const) {
       ({ engine, store } = makeEngine(
         () => true,
         {},
@@ -472,9 +481,31 @@ describe('persistStepUpdate — suspended overwrite guard', () => {
             delete (cloned.context.completed as { output?: unknown }).output;
             return cloned;
           }
+          if (redact === 'json-context') {
+            const cloned = JSON.parse(JSON.stringify(snapshot));
+            delete cloned.context.completed.output;
+            return cloned;
+          }
+          if (redact === 'partial-context') {
+            const cloned = structuredClone(snapshot);
+            const output = cloned.context.completed.output;
+            delete output.secret;
+            delete output.diagnostic.cause;
+            return cloned;
+          }
           if (redact === 'event-in-place') {
             for (const event of snapshot.lifecycleOutbox ?? []) {
               if (event.type === 'step.completed') delete event.output;
+            }
+            return snapshot;
+          }
+          if (redact === 'partial-event-in-place') {
+            for (const event of snapshot.lifecycleOutbox ?? []) {
+              if (event.type === 'step.completed') {
+                const output = event.output as { secret?: boolean; diagnostic: Error };
+                delete output.secret;
+                delete output.diagnostic.cause;
+              }
             }
             return snapshot;
           }
@@ -487,11 +518,18 @@ describe('persistStepUpdate — suspended overwrite guard', () => {
         },
       ));
 
+      const date = new Date('2026-01-01T00:00:00.000Z');
+      const payload = {
+        secret: true,
+        diagnostic: new Error('public error', { cause: new Error('private cause') }),
+        firstDate: date,
+        secondDate: date,
+      };
       const outcome = await engine.persistStepUpdate({
         workflowId: 'wf',
         runId: 'run-1',
         resourceId: 'resource-1',
-        stepResults: { completed: { status: 'success', output: { secret: true } } },
+        stepResults: { completed: { status: 'success', output: payload } },
         serializedStepGraph: [],
         executionContext: baseExecutionContext({
           executionGeneration: 'wfeg:generation',
@@ -505,11 +543,16 @@ describe('persistStepUpdate — suspended overwrite guard', () => {
             stepId: 'completed',
             stepCallId: 'wfsc:completed',
             stepAttempt: 1,
-            output: { secret: true },
+            output: payload,
           },
         ],
       });
-      const expectedOutput = redact === 'event' ? { redacted: true } : undefined;
+      const expectedOutput =
+        redact === 'event'
+          ? { redacted: true }
+          : redact === 'partial-context' || redact === 'partial-event-in-place'
+            ? expect.objectContaining({ diagnostic: expect.any(Error), firstDate: date, secondDate: date })
+            : undefined;
 
       expect(outcome?.acceptedEvents).toEqual([
         expect.objectContaining({ type: 'step.completed', output: expectedOutput }),
@@ -517,6 +560,18 @@ describe('persistStepUpdate — suspended overwrite guard', () => {
       expect(store.legacyCalls[0]?.snapshot.lifecycleOutbox).toEqual([
         expect.objectContaining({ type: 'step.completed', output: expectedOutput }),
       ]);
+      expect(payload.secret).toBe(true);
+      expect(payload.diagnostic.cause).toMatchObject({ message: 'private cause' });
+      if (redact === 'partial-context' || redact === 'partial-event-in-place') {
+        const event = outcome?.acceptedEvents?.[0];
+        expect(event?.type).toBe('step.completed');
+        if (event?.type !== 'step.completed') throw new Error('missing completion');
+        expect(event.output).not.toHaveProperty('secret');
+        expect(event.output).not.toHaveProperty('diagnostic.cause');
+      }
+      if (redact === 'context' || redact === 'context-in-place' || redact === 'cloned-context') {
+        expect(store.legacyCalls[0]?.snapshot.context.completed.output).toBeUndefined();
+      }
     }
   });
 

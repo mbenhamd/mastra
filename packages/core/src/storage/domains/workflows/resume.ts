@@ -447,6 +447,11 @@ export function persistWorkflowStepUpdateRecord(
     return { status: 'invalid_snapshot' };
   }
 
+  if (input.retainExistingLifecycleOutbox === false) {
+    const { lifecycleOutbox: _discardedOutbox, ...snapshotWithoutOutbox } = proposed;
+    proposed = snapshotWithoutOutbox;
+  }
+
   const acceptedEvents = acceptedLifecycleEvents(input.lifecycleEvents);
 
   if (!existing && input.expectedResumeOperationHash !== undefined) {
