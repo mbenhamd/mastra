@@ -1099,11 +1099,9 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       const persistOutcome = lastOutput.persistOutcome as PersistWorkflowStepUpdateResult | void | undefined;
       const authoritativeDisposition = params.transientExecution
         ? undefined
-        : persistOutcome && persistOutcome.status === 'persisted'
-          ? undefined
-          : persistOutcome && persistOutcome.status !== 'persisted'
-            ? (persistOutcome.disposition ?? 'canceled')
-            : await this.getAuthoritativeExecutionDisposition({ workflowId, runId, executionGeneration });
+        : persistOutcome && persistOutcome.status !== 'persisted' && persistOutcome.status
+          ? (persistOutcome.disposition ?? 'canceled')
+          : await this.getAuthoritativeExecutionDisposition({ workflowId, runId, executionGeneration });
       if (
         authoritativeDisposition &&
         !(

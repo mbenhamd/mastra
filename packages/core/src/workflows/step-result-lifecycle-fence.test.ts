@@ -9,7 +9,7 @@ import { createStep, createWorkflow } from './index';
 const ioSchema = z.object({ value: z.string() });
 
 describe('step-result lifecycle fence', () => {
-  it('does not poll snapshots after a fenced step persist on a 3-step run', async () => {
+  it('completes a 3-step fenced run without skipping post-persist cancellation checks', async () => {
     const storage = new MockStore();
     const pubsub = new EventEmitterPubSub();
     const workflow = createWorkflow({
@@ -52,7 +52,7 @@ describe('step-result lifecycle fence', () => {
 
       expect(result.status).toBe('success');
       expect(result.result).toEqual({ value: 'ok' });
-      expect(authority).not.toHaveBeenCalled();
+      expect(authority).toHaveBeenCalled();
     } finally {
       await mastra.shutdown();
       authority.mockRestore();

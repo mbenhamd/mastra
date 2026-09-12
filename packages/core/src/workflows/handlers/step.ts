@@ -233,6 +233,40 @@ export async function executeStep(
 
   if (!suppressLifecycleEvents) {
     lifecycleStepState.stepAttempt += 1;
+  }
+
+  if (!executionContext.transientExecution) {
+    const startPersist = await engine.persistStepUpdate({
+      workflowId,
+      runId,
+      resourceId,
+      serializedStepGraph,
+      stepResults: {
+        ...stepResults,
+        [step.id]: stepInfo,
+      } as Record<string, StepResult<any, any, any, any>>,
+      executionContext,
+      workflowStatus: 'running',
+      requestContext,
+      phase: 'start',
+    });
+    if (startPersist && startPersist.status !== 'persisted' && startPersist.status !== 'protected_state') {
+      delete executionContext.activeStepsPath[step.id];
+      const canceledStepResult = {
+        ...omitPriorCompletionFields(stepInfo),
+        status: 'canceled',
+        endedAt: Date.now(),
+      } as unknown as StepResult<any, any, any, any>;
+      return {
+        result: canceledStepResult,
+        stepResults: { [step.id]: canceledStepResult },
+        mutableContext: engine.buildMutableContext(executionContext),
+        requestContext: engine.serializeRequestContext(requestContext),
+      };
+    }
+  }
+
+  if (!suppressLifecycleEvents) {
     await engine.onStepExecutionStart({
       step,
       inputData,
@@ -263,23 +297,6 @@ export async function executeStep(
             stepAttempt: lifecycleStepState.stepAttempt,
             input: inputData,
           },
-    });
-  }
-
-  if (!executionContext.transientExecution) {
-    await engine.persistStepUpdate({
-      workflowId,
-      runId,
-      resourceId,
-      serializedStepGraph,
-      stepResults: {
-        ...stepResults,
-        [step.id]: stepInfo,
-      } as Record<string, StepResult<any, any, any, any>>,
-      executionContext,
-      workflowStatus: 'running',
-      requestContext,
-      phase: 'start',
     });
   }
 
@@ -1048,6 +1065,16 @@ async function persistThenPublishStepResult(params: {
       return true;
     }
     if (outcome?.status === 'persisted') {
+      const executionGeneration = requireWorkflowExecutionGeneration(
+        params.executionContext.executionGeneration,
+        `Workflow step result ${params.workflowId}/${params.runId}/${params.stepId}`,
+      );
+      const disposition = await params.engine.getAuthoritativeExecutionDisposition({
+        workflowId: params.workflowId,
+        runId: params.runId,
+        executionGeneration,
+      });
+      if (disposition) return true;
       canonicalEventsForPublication = outcome.acceptedEvents ?? [];
     }
   }
