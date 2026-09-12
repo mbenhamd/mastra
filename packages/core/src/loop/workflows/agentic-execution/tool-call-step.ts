@@ -941,7 +941,9 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                 ? storedResumeMetadata.approval
                 : undefined
             : undefined;
-        const needsCanonicalArgsRestore = storedResumeMetadata?.identityMatch === 'resume';
+        const needsCanonicalArgsRestore =
+          storedResumeMetadata?.identityMatch === 'resume' &&
+          !(authoritativeIdentityMatches && hasApprovedArgsEnvelope);
         const isCanonicalArgsUnavailable =
           needsCanonicalArgsRestore && storedResumeMetadata?.canonicalArgs === undefined;
         const hasInvalidResumeData =

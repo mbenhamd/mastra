@@ -1066,9 +1066,18 @@ describe('createToolCallStep tool approval workflow', () => {
       approvalInputIdentityDigest: transcriptIdentityDigest,
       approvedArgs,
     });
-    // The follow-up resume is authenticated by the persisted workflow snapshot even when
-    // the recalled transcript no longer has a matching suspended-tools entry.
-    delete recalledMetadata.suspendedTools[inputData.toolCallId];
+    expect(recalledMetadata.suspendedTools[inputData.toolCallId]).toMatchObject({
+      originRunId: 'cold-resume-run',
+      runId: 'cold-resume-run',
+      identityDigest: approvedIdentityDigest,
+      resumeIdentityDigest: transcriptIdentityDigest,
+      approvalInputIdentityDigest: transcriptIdentityDigest,
+      approvedArgs,
+    });
+    // Persisted transcript metadata retains the new suspension identity and ownership
+    // coordinates while filtering the canonical approval fields.
+    delete recalledMetadata.suspendedTools[inputData.toolCallId].approvedArgs;
+    delete recalledMetadata.suspendedTools[inputData.toolCallId].approvalInputIdentityDigest;
     const recalledResumeResult = await recalledStep.execute(
       makeExecuteParams({
         inputData: {
