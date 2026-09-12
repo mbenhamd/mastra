@@ -1086,7 +1086,7 @@ export class MessageList {
     const transformedMessages = this.messages
       .filter(message => trackedMessages.has(message))
       .map(message => {
-        const transformedMessage = this.transformMessageForTranscript(message);
+        const transformedMessage = MessageList.transformMessageForTranscript(message);
         // Keep an immutable baseline even when the caller requests live message
         // objects. `commit()` must not acknowledge a newer merge into the same
         // object merely because an older storage write completed successfully.
@@ -1110,7 +1110,8 @@ export class MessageList {
             const capturedMessage = capturedMessages.get(message);
             if (
               !currentMessages.has(message) ||
-              (capturedMessage !== undefined && deepEqual(this.transformMessageForTranscript(message), capturedMessage))
+              (capturedMessage !== undefined &&
+                deepEqual(MessageList.transformMessageForTranscript(message), capturedMessage))
             ) {
               sourceMessages.delete(message);
             }
@@ -1128,7 +1129,7 @@ export class MessageList {
     return snapshot.messages;
   }
 
-  private transformToolStateDataForTranscript(data: unknown, phase: 'approval' | 'suspend'): unknown {
+  private static transformToolStateDataForTranscript(data: unknown, phase: 'approval' | 'suspend'): unknown {
     if (!data || typeof data !== 'object') {
       return data;
     }
@@ -1166,7 +1167,8 @@ export class MessageList {
     };
   }
 
-  private transformMessageForTranscript(message: MastraDBMessage): MastraDBMessage {
+  /** @internal Applies the canonical privacy projection used for persisted transcripts. */
+  public static transformMessageForTranscript(message: MastraDBMessage): MastraDBMessage {
     if (message.content?.format !== 2 || !message.content.parts) {
       return message;
     }
@@ -1226,7 +1228,7 @@ export class MessageList {
         changed = true;
         return {
           ...part,
-          data: this.transformToolStateDataForTranscript(
+          data: MessageList.transformToolStateDataForTranscript(
             part.data,
             part.type === 'data-tool-call-suspended' ? 'suspend' : 'approval',
           ),
@@ -1271,7 +1273,7 @@ export class MessageList {
         metadata[key] = Object.fromEntries(
           Object.entries(toolStates as Record<string, unknown>).map(([toolName, state]) => [
             toolName,
-            this.transformToolStateDataForTranscript(state, phase),
+            MessageList.transformToolStateDataForTranscript(state, phase),
           ]),
         );
       }
