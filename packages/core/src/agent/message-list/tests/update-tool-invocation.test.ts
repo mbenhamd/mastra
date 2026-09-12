@@ -71,6 +71,7 @@ describe('MessageList.updateToolInvocation', () => {
         toolName: 'lookup',
         args: {}, // result part may have empty or different args
         result: { details: 'some info' },
+        approval: { id: 'tc-1', approved: true },
       },
     });
 
@@ -78,6 +79,52 @@ describe('MessageList.updateToolInvocation', () => {
 
     const part = messageList.get.all.db()[0]?.content?.parts?.[0] as any;
     expect(part.toolInvocation.args).toEqual({ topic: 'TypeScript history', detail: true });
+  });
+
+  it('should persist user-approved edited args in structured and legacy invocations', () => {
+    const messageList = new MessageList();
+    const originalArgs = { operation: 'archive', projectId: 'old' };
+    const approvedArgs = { operation: 'archive', projectId: 'reviewed' };
+    const msg = makeAssistantMessage([
+      {
+        type: 'tool-invocation',
+        toolInvocation: {
+          state: 'call',
+          toolCallId: 'tc-approved',
+          toolName: 'archive-project',
+          args: originalArgs,
+        },
+      },
+    ]);
+    msg.content.toolInvocations = [
+      {
+        state: 'call',
+        toolCallId: 'tc-approved',
+        toolName: 'archive-project',
+        args: originalArgs,
+      },
+    ];
+    messageList.add(msg, 'response');
+
+    const updated = messageList.updateToolInvocation(
+      {
+        type: 'tool-invocation',
+        toolInvocation: {
+          state: 'result',
+          toolCallId: 'tc-approved',
+          toolName: 'archive-project',
+          args: approvedArgs,
+          result: { archived: true },
+          approval: { id: 'tc-approved', approved: true },
+        },
+      },
+      undefined,
+      { replaceArgs: true },
+    );
+
+    expect(updated).toBe(true);
+    expect((messageList.get.all.db()[0]?.content.parts?.[0] as any).toolInvocation.args).toEqual(approvedArgs);
+    expect(msg.content.toolInvocations?.[0]?.args).toEqual(approvedArgs);
   });
 
   it('should keep a legacy toolInvocations entry in sync with its structured part', () => {

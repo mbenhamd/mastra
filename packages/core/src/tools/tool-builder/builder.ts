@@ -62,6 +62,7 @@ import {
   isToolValidationError,
   ToolSchemaValidationError,
   validateToolInput,
+  validateToolInputAsync,
   validateToolOutput,
   validateToolSuspendData,
 } from '../validation';
@@ -72,6 +73,28 @@ import {
  */
 export type ToolToConvert = VercelTool | ToolAction<any, any, any> | VercelToolV5 | ProviderDefinedTool;
 export type LogType = 'tool' | 'toolset' | 'client-tool';
+
+function resolveApprovalInputEditing(schema: unknown): 'object' | undefined {
+  if (isStandardSchemaWithJSON(schema)) {
+    if (schema['~standard'].vendor === 'ai-sdk') {
+      const wrappedSchema =
+        typeof (schema as { getSchema?: unknown }).getSchema === 'function'
+          ? (schema as unknown as { getSchema: () => Schema }).getSchema()
+          : schema;
+      if (typeof (wrappedSchema as { validate?: unknown }).validate !== 'function') return undefined;
+    }
+    return standardSchemaToJSONSchema(schema, { io: 'input' }).type === 'object' ? 'object' : undefined;
+  }
+  if (
+    schema &&
+    typeof schema === 'object' &&
+    typeof (schema as { validate?: unknown }).validate === 'function' &&
+    (schema as { jsonSchema?: { type?: unknown } }).jsonSchema?.type === 'object'
+  ) {
+    return 'object';
+  }
+  return undefined;
+}
 
 function serializeResumeSchema(schema: unknown): string | undefined {
   if (!schema) return undefined;
@@ -983,7 +1006,7 @@ export class CoreToolBuilder extends MastraBase {
 
         const parameters = inputValidationSchema ?? this.getParameters();
         if (!isResuming) {
-          const { data, error } = validateToolInput(
+          const { data, error } = await validateToolInputAsync(
             parameters as StandardSchemaWithJSON | undefined,
             args,
             options.name,
@@ -1006,7 +1029,7 @@ export class CoreToolBuilder extends MastraBase {
           // would throw on the resumed leg even though the initial leg passed. Reuse
           // the same normalization pipeline; on validation error keep the raw args so
           // delegated resumes with extra control fields behave exactly as before.
-          const { data, error } = validateToolInput(parameters, args, options.name);
+          const { data, error } = await validateToolInputAsync(parameters, args, options.name);
           if (error === undefined) {
             args = data;
           }
@@ -1144,6 +1167,11 @@ export class CoreToolBuilder extends MastraBase {
     }
 
     const originalSchema = this.getParameters();
+    const approvalInputEditing = resolveApprovalInputEditing(originalSchema);
+    // Raw AI SDK schemas expose their validator outside Standard Schema. Wrap
+    // eligible approval schemas so preflight, edited-argument validation, and
+    // edited-argument validation invoke the native author validator.
+    const approvalInputValidationSchema = approvalInputEditing ? toStandardSchema(originalSchema) : undefined;
     const inputValidationSchema = this.buildCompatValidationSchema(originalSchema, schemaCompatLayers);
     let processedInputSchema: Schema | undefined;
 
@@ -1264,13 +1292,21 @@ export class CoreToolBuilder extends MastraBase {
       // validator separately. The agent loop uses this to keep schema-invalid
       // calls out of a user-facing approval queue; execute() still performs
       // authoritative validation immediately before side effects.
-      validateInput: (params: unknown) => validateToolInput(this.getParameters(), params, this.options.name),
+      validateInput: (params: unknown) =>
+        approvalInputValidationSchema
+          ? validateToolInputAsync(approvalInputValidationSchema, params, this.options.name)
+          : validateToolInput(inputValidationSchema ?? this.getParameters(), params, this.options.name),
+      approvalInputEditing,
       execute: this.originalTool.execute
         ? this.createExecute(
             this.originalTool,
             { ...this.options, description: this.originalTool.description },
             this.logType,
-            inputValidationSchema,
+            // Raw AI SDK schemas can carry an async validator even when no
+            // compatibility schema is built. Execution must apply that same
+            // author validator so defaults/transforms accepted by approval
+            // preflight reach the tool implementation.
+            inputValidationSchema ?? approvalInputValidationSchema,
           )
         : undefined,
     };

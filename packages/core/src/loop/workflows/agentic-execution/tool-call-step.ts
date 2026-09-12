@@ -68,6 +68,8 @@ type AddToolMetadataOptions = {
   suspendedToolRunId?: string;
   approval?: ToolApprovalGrant;
   approvalSource?: 'tool-gate' | 'tool-execution';
+  approvalInputIdentityDigest?: string;
+  approvedArgs?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
 } & (
   | {
@@ -250,6 +252,8 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
         suspendedToolRunId,
         approval,
         approvalSource,
+        approvalInputIdentityDigest,
+        approvedArgs,
         metadata: toolStateTransformMetadata,
       }: AddToolMetadataOptions) => {
         const metadataKey = type === 'suspension' ? 'suspendedTools' : 'pendingToolApprovals';
@@ -287,6 +291,8 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           ...(suspendedToolRunId && suspendedToolRunId !== runId ? { delegatedRunId: suspendedToolRunId } : {}),
           ...(approval ? { approval } : {}),
           ...(approvalSource ? { approvalSource } : {}),
+          ...(approvalInputIdentityDigest ? { approvalInputIdentityDigest } : {}),
+          ...(approvedArgs ? { approvedArgs } : {}),
           ...(type === 'suspension' ? { suspendPayload: transformedSuspendPayload } : {}),
           resumeSchema,
           ...(toolStateTransformMetadata ? { metadata: toolStateTransformMetadata } : {}),
@@ -523,6 +529,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
       }
 
       let approvalGrant: { approval: ToolApprovalGrant } | undefined;
+      let verifiedApprovedArgs: Record<string, unknown> | undefined;
       let resumeTargetToolCallId: string | undefined;
       let resumedFromSuspension = false;
 
@@ -640,6 +647,11 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
             structuredArgs,
             legacyArgs,
             Object.hasOwn(record, 'args') ? record.args : undefined,
+            // Edited approvals retain their canonical arguments separately when
+            // transcript transforms redact the visible invocation and metadata
+            // `args`. The identity digest authenticates this candidate exactly as
+            // it does the ordinary structured/legacy candidates above.
+            Object.hasOwn(record, 'approvedArgs') ? record.approvedArgs : undefined,
           ].filter(candidate => candidate !== undefined);
           return candidates.find(
             candidate =>
@@ -668,6 +680,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
             // surface it here (mirrors auto-resume-system-message).
             runId: typeof storedRecord?.delegatedRunId === 'string' ? storedRecord.delegatedRunId : storedRecord?.runId,
             originRunId: storedRecord?.originRunId,
+            identityDigest: typeof storedRecord?.identityDigest === 'string' ? storedRecord.identityDigest : undefined,
             identityMatches: identityMatch !== undefined,
             identityMatch,
             canonicalArgs: storedRecord ? getStoredCanonicalArgs(message, storedRecord) : undefined,
@@ -676,6 +689,11 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
               storedRecord?.approvalSource === 'tool-gate' || storedRecord?.approvalSource === 'tool-execution'
                 ? storedRecord.approvalSource
                 : undefined,
+            approvalInputIdentityDigest:
+              typeof storedRecord?.approvalInputIdentityDigest === 'string'
+                ? storedRecord.approvalInputIdentityDigest
+                : undefined,
+            approvedArgs: storedRecord?.approvedArgs,
           };
         };
         const getStoredResumeMetadata = (toolCallId: string) => {
@@ -740,6 +758,20 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
             toolName: inputData.toolName,
             args: approvedArgsEnvelope.approvedArgs,
           }) === approvedArgsEnvelope.identityDigest;
+        const hasStoredApprovedArgsFields =
+          storedResumeMetadata?.approvedArgs !== undefined ||
+          storedResumeMetadata?.approvalInputIdentityDigest !== undefined;
+        const hasStoredApprovedArgs =
+          !hasAuthoritativeResumeEnvelope &&
+          storedResumeMetadata?.type === 'suspension' &&
+          storedResumeMetadata.approvedArgs !== undefined &&
+          typeof storedResumeMetadata.approvalInputIdentityDigest === 'string' &&
+          parseToolApprovalDecision({ approved: true, editedArgs: storedResumeMetadata.approvedArgs }) !== undefined &&
+          createToolCallIdentityDigest({
+            toolCallId: metadataToolCallId,
+            toolName: inputData.toolName,
+            args: storedResumeMetadata.approvedArgs,
+          }) === storedResumeMetadata.identityDigest;
         const authoritativeIdentityMatches =
           hasAuthoritativeResumeEnvelope &&
           (matchesExpectedResumeIdentity(authoritativeResumeEnvelope) ||
@@ -822,6 +854,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           ((approvedArgsEnvelope?.approvedArgs !== undefined ||
             approvedArgsEnvelope?.approvalInputIdentityDigest !== undefined) &&
             !hasApprovedArgsEnvelope) ||
+          (!hasAuthoritativeResumeEnvelope && hasStoredApprovedArgsFields && !hasStoredApprovedArgs) ||
           (hasAuthoritativeResumeEnvelope && (!authoritativeIdentityMatches || !hasKnownAuthoritativeResumeType)) ||
           (!hasAuthoritativeResumeEnvelope && storedResumeMetadata?.identityMatches === false);
         const isKnownApprovalResume =
@@ -880,11 +913,27 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
         if (authoritativeIdentityMatches && hasApprovedArgsEnvelope) {
           args = structuredClone(approvedArgsEnvelope.approvedArgs);
           identityArgs = structuredClone(args);
+          verifiedApprovedArgs = structuredClone(args);
           approvedArgsResume = {
             approvalInputIdentityDigest: approvedArgsEnvelope.approvalInputIdentityDigest as string,
             approvedArgs: structuredClone(args),
           };
           expectedIdentityDigest = approvedArgsEnvelope.identityDigest as string;
+          expectedResumeIdentity = { ...expectedResumeIdentity, identityDigest: expectedIdentityDigest };
+          inputData = { ...inputData, args: structuredClone(args) };
+        } else if (hasStoredApprovedArgs) {
+          args = structuredClone(storedResumeMetadata!.approvedArgs);
+          identityArgs = structuredClone(args);
+          verifiedApprovedArgs = structuredClone(args);
+          approvedArgsResume = {
+            approvalInputIdentityDigest: storedResumeMetadata!.approvalInputIdentityDigest!,
+            approvedArgs: structuredClone(args),
+          };
+          expectedIdentityDigest = createToolCallIdentityDigest({
+            toolCallId: metadataToolCallId,
+            toolName: inputData.toolName,
+            args,
+          });
           expectedResumeIdentity = { ...expectedResumeIdentity, identityDigest: expectedIdentityDigest };
           inputData = { ...inputData, args: structuredClone(args) };
         }
@@ -916,30 +965,34 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
 
         const validateInput = (
           tool as {
-            validateInput?: (params: unknown) => { data?: unknown; error?: unknown };
+            validateInput?: (
+              params: unknown,
+            ) => { data?: unknown; error?: unknown } | Promise<{ data?: unknown; error?: unknown }>;
           }
         ).validateInput;
-        if (approvalDecision?.editedArgs !== undefined) {
-          if (
-            !isApprovalResumeData ||
-            effectiveApprovalSource !== 'tool-gate' ||
-            isDelegatedApprovalResume ||
-            isAgentTool ||
-            isWorkflowTool
-          ) {
+        const supportsEditedApprovalArgs =
+          !isAgentTool &&
+          !isWorkflowTool &&
+          (tool as { approvalInputEditing?: unknown }).approvalInputEditing === 'object' &&
+          typeof validateInput === 'function';
+        if (effectiveResumeType === 'approval' && approvalDecision?.editedArgs !== undefined) {
+          if (effectiveApprovalSource !== 'tool-gate' || isDelegatedApprovalResume || isAgentTool || isWorkflowTool) {
             return { ...inputData, error: new Error('Edited approval arguments require a regular tool-gate approval') };
           }
-          if (!args || typeof args !== 'object' || Array.isArray(args)) {
-            return { ...inputData, error: new Error('Edited approval arguments require object tool input') };
-          }
-          if (typeof validateInput !== 'function') {
+          if (!supportsEditedApprovalArgs) {
             return { ...inputData, error: new Error('Edited approval arguments require a tool input validator') };
           }
-          const editedArgs = { ...args, ...approvalDecision.editedArgs };
-          const validation = validateInput(editedArgs);
+          const baseArgs = args == null ? {} : args;
+          if (typeof baseArgs !== 'object' || Array.isArray(baseArgs)) {
+            return { ...inputData, error: new Error('Edited approval arguments require object tool input') };
+          }
+          const editedArgs = { ...baseArgs, ...approvalDecision.editedArgs };
+          const validation = await validateInput(editedArgs);
           if (validation.error !== undefined) {
+            await removeToolMetadata(metadataToolCallId, inputData.toolName, 'approval');
             return {
               ...inputData,
+              ...resumeTarget,
               result:
                 validation.error instanceof Error
                   ? serializeToolError(validation.error)
@@ -961,6 +1014,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
             approvalInputIdentityDigest: approvedArgsResume?.approvalInputIdentityDigest ?? originalIdentityDigest,
             approvedArgs: structuredClone(args),
           };
+          verifiedApprovedArgs = structuredClone(args);
           inputData = { ...inputData, args: structuredClone(args) };
         }
 
@@ -1042,7 +1096,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
         // authority and do not reuse transformed data here: transforms are not
         // guaranteed to be idempotent.
         if (toolRequiresApproval && resumeData === undefined && typeof validateInput === 'function') {
-          const preflightValidation = validateInput(args);
+          const preflightValidation = await validateInput(args);
           if (preflightValidation.error !== undefined) {
             return {
               result:
@@ -1099,7 +1153,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
         });
         const approvalSchema = toStandardSchema(approvalInputSchema);
         const toolGateApprovalSchema = toStandardSchema(
-          !isAgentTool && !isWorkflowTool && typeof validateInput === 'function'
+          supportsEditedApprovalArgs
             ? approvalInputSchema.extend({
                 editedArgs: toolApprovalEditedArgsSchema.optional().describe('Shallow JSON input patch'),
               })
@@ -1376,6 +1430,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                 suspendedToolRunId: options?.runId,
                 type: 'suspension',
                 approval: approvalGrant?.approval,
+                ...(approvedArgsResume ?? {}),
                 resumeSchema: options?.resumeSchema,
                 metadata: suspensionChunk.metadata,
               });
@@ -1836,7 +1891,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                           : { state: 'result' as const, result }),
                         toolCallId: params.toolCallId,
                         toolName: params.toolName,
-                        args,
+                        args: verifiedApprovedArgs ?? args,
                         // Preserve the approval decision for an approved approval-gated tool that
                         // ran in the background so it round-trips on recall, matching the sync path
                         // and the "started" placeholder above.
@@ -1854,6 +1909,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                         },
                       },
                     },
+                    verifiedApprovedArgs ? { replaceArgs: true } : undefined,
                   );
 
                   // Fallback: no matching tool-invocation was found in the
@@ -1956,6 +2012,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                 ...inputData,
                 ...resumeTarget,
                 ...(approvalGrant ?? {}),
+                ...(verifiedApprovedArgs ? { approvedArgs: verifiedApprovedArgs } : {}),
               };
             }
 
@@ -1998,6 +2055,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                 ...inputData,
                 ...resumeTarget,
                 ...(approvalGrant ?? {}),
+                ...(verifiedApprovedArgs ? { approvedArgs: verifiedApprovedArgs } : {}),
               };
             }
             // fallbackToSync: concurrency limit hit, fall through to synchronous execution
@@ -2027,6 +2085,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           ...resumeTarget,
           ...(resumedFromSuspension ? { resumedFromSuspension: true as const } : {}),
           ...(approvalGrant ?? {}),
+          ...(verifiedApprovedArgs ? { approvedArgs: verifiedApprovedArgs } : {}),
         };
       } catch (error) {
         // Re-throw FGA authorization errors instead of swallowing them
@@ -2058,6 +2117,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           ...(resumeTargetToolCallId ? { resumeTargetToolCallId } : {}),
           ...(resumedFromSuspension ? { resumedFromSuspension: true as const } : {}),
           ...(approvalGrant ?? {}),
+          ...(verifiedApprovedArgs ? { approvedArgs: verifiedApprovedArgs } : {}),
         };
       }
     },

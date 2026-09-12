@@ -2,7 +2,7 @@
 '@mastra/core': minor
 ---
 
-Added optional `editedArgs` patches to regular tool-gate approvals, with input validation and replay-safe approved arguments.
+Users can now revise pending regular tool input with optional `editedArgs`. Invalid edits do not execute, and retries reuse the approved input.
 
 Before:
 

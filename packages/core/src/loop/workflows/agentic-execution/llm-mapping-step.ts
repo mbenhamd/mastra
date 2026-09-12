@@ -10,6 +10,8 @@ import { DefaultStepResult } from '../../../stream/aisdk/v5/output-helpers';
 import type { ChunkType, ProviderMetadata } from '../../../stream/types';
 import { ChunkFrom } from '../../../stream/types';
 import {
+  getTransformedToolPayload,
+  hasTransformedToolPayload,
   toolPayloadTransformAllowsTerminalToolResult,
   transformToolPayloadForTargets,
   withToolPayloadTransformMetadata,
@@ -520,8 +522,14 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
         toolCall: z.infer<typeof toolCallOutputSchema>,
         resolvedPart: Parameters<typeof rest.messageList.updateToolInvocation>[0],
       ) => {
-        const persistPart = (part: Parameters<typeof rest.messageList.updateToolInvocation>[0]) => {
-          if (!rest.messageList.updateToolInvocation(part)) {
+        const persistPart = (
+          part: Parameters<typeof rest.messageList.updateToolInvocation>[0],
+          replaceArgs = false,
+        ) => {
+          const updated = replaceArgs
+            ? rest.messageList.updateToolInvocation(part, undefined, { replaceArgs: true })
+            : rest.messageList.updateToolInvocation(part);
+          if (!updated) {
             rest.messageList.add(
               {
                 id: _internal?.generateId?.() ?? crypto.randomUUID(),
@@ -534,13 +542,26 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
           }
         };
         const resolvedToolCallId = toolCall.resumeTargetToolCallId ?? toolCall.toolCallId;
-        persistPart({
-          ...resolvedPart,
-          toolInvocation: {
-            ...resolvedPart.toolInvocation,
-            toolCallId: resolvedToolCallId,
+        const hasVerifiedApprovedArgs = toolCall.approvedArgs !== undefined;
+        const transcriptInputTransform = getTransformedToolPayload(
+          resolvedPart.providerMetadata,
+          'transcript',
+          'input-available',
+        );
+        const persistedApprovedArgs = hasTransformedToolPayload(transcriptInputTransform)
+          ? transcriptInputTransform.transformed
+          : toolCall.approvedArgs;
+        persistPart(
+          {
+            ...resolvedPart,
+            toolInvocation: {
+              ...resolvedPart.toolInvocation,
+              toolCallId: resolvedToolCallId,
+              ...(hasVerifiedApprovedArgs ? { args: persistedApprovedArgs } : {}),
+            },
           },
-        });
+          hasVerifiedApprovedArgs,
+        );
 
         if (resolvedToolCallId !== toolCall.toolCallId) {
           const { approval: _approval, ...syntheticInvocation } = resolvedPart.toolInvocation;

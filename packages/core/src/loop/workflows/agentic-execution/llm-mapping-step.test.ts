@@ -290,7 +290,7 @@ describe('createLLMMappingStep HITL behavior', () => {
     expect(result.stepResult.isContinued).toBe(false);
   });
 
-  it('should enqueue tool-output-denied when a requireApproval tool is declined (#20880)', async () => {
+  it('should persist output-denied and enqueue the compatible tool result when approval is declined (#20880)', async () => {
     const inputData: ToolCallOutput[] = [
       {
         toolCallId: 'call-denied',
@@ -320,11 +320,11 @@ describe('createLLMMappingStep HITL behavior', () => {
     );
     expect(controller.enqueue).toHaveBeenCalledWith(
       expect.objectContaining({
-        type: 'tool-output-denied',
+        type: 'tool-result',
         payload: expect.objectContaining({
           toolCallId: 'call-denied',
           toolName: 'sensitive-op',
-          approval: expect.objectContaining({ approved: false }),
+          result: 'Tool call was not approved by the user',
         }),
       }),
     );
@@ -1086,8 +1086,18 @@ describe('createLLMMappingStep tool execution error self-recovery (issue #9815)'
         resumeTargetToolCallId: 'original-pending-call',
         toolName: 'sensitiveTool',
         args: { operation: 'delete' },
+        approvedArgs: { operation: 'archive' },
         result: { deleted: true },
         approval: { id: 'original-pending-call', approved: true, reason: 'Reviewed' },
+        providerMetadata: {
+          mastra: {
+            toolPayloadTransform: {
+              transcript: {
+                'input-available': { transformed: { operation: 'redacted' } },
+              },
+            },
+          },
+        },
       },
     ];
 
@@ -1099,10 +1109,13 @@ describe('createLLMMappingStep tool execution error self-recovery (issue #9815)'
         toolInvocation: expect.objectContaining({
           state: 'result',
           toolCallId: 'original-pending-call',
+          args: { operation: 'redacted' },
           result: { deleted: true },
           approval: { id: 'original-pending-call', approved: true, reason: 'Reviewed' },
         }),
       }),
+      undefined,
+      { replaceArgs: true },
     );
     expect(messageList.updateToolInvocation).toHaveBeenNthCalledWith(
       2,
@@ -1190,7 +1203,7 @@ describe('createLLMMappingStep tool execution error self-recovery (issue #9815)'
     expect(messageList.updateToolInvocation).toHaveBeenCalledWith(
       expect.objectContaining({
         toolInvocation: expect.objectContaining({
-          state: 'result',
+          state: 'output-error',
           toolCallId: 'call-approved',
           approval,
         }),

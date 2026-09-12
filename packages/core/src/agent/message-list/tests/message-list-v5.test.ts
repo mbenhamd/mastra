@@ -2472,6 +2472,7 @@ describe('MessageList V5 Support', () => {
               suspend: { transformed: { reason: 'redacted display suspension' } },
             },
             transcript: {
+              'input-available': { transformed: { documentId: 'redacted transcript document' } },
               suspend: { transformed: { reason: 'redacted transcript suspension' } },
             },
           },
@@ -2484,6 +2485,8 @@ describe('MessageList V5 Support', () => {
         type: 'suspension',
         runId: 'run-suspend-transform',
         suspendPayload: { reason: 'contains private review context' },
+        approvalInputIdentityDigest: 'private-approval-input-digest',
+        approvedArgs: { documentId: 'private-approved-document' },
         metadata: transformMetadata,
       };
 
@@ -2522,12 +2525,17 @@ describe('MessageList V5 Support', () => {
       const drainedSuspendedPart = drainedMessage.content.parts!.find(
         part => part.type === 'data-tool-call-suspended',
       ) as any;
-      expect(drainedSuspendedPart.data.args).toEqual({ documentId: 'doc-123' });
+      expect(drainedSuspendedPart.data.args).toEqual({ documentId: 'redacted transcript document' });
+      expect(drainedSuspendedPart.data).not.toHaveProperty('approvedArgs');
+      expect(drainedSuspendedPart.data).not.toHaveProperty('approvalInputIdentityDigest');
       expect(drainedSuspendedPart.data.suspendPayload).toEqual({ reason: 'redacted transcript suspension' });
       expect((drainedMessage.content.metadata!.suspendedTools as any)['call-suspend-transform']).toMatchObject({
-        args: { documentId: 'doc-123' },
+        args: { documentId: 'redacted transcript document' },
         suspendPayload: { reason: 'redacted transcript suspension' },
       });
+      expect((drainedMessage.content.metadata!.suspendedTools as any)['call-suspend-transform']).not.toHaveProperty(
+        'approvedArgs',
+      );
     });
 
     it('should preserve modelOutput metadata across db to model to db conversion', () => {

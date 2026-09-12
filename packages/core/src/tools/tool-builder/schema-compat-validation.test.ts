@@ -57,11 +57,12 @@ describe('CoreToolBuilder - Schema Compatibility in Validation', () => {
   });
 
   it('preserves asynchronous validation through the native v6 schema wrapper', async () => {
+    const execute = vi.fn(async (input: { token: string }) => input);
     const tool = {
       id: 'async-validation-tool',
       description: 'Tool with an asynchronous Zod 4 refinement',
       inputSchema: z.object({ token: z.string() }).refine(async input => input.token === 'accepted'),
-      execute: async (input: { token: string }) => input,
+      execute,
     } as ToolAction<any, any>;
     const built = buildCoreTool(tool, 'async-validation-tool', {
       provider: 'test-provider',
@@ -76,6 +77,17 @@ describe('CoreToolBuilder - Schema Compatibility in Validation', () => {
       value: { token: 'accepted' },
     });
     await expect(nativeValidation({ token: 'rejected' })).resolves.toMatchObject({ success: false });
+    await expect(built.validateInput?.({ token: 'accepted' })).resolves.toMatchObject({
+      data: { token: 'accepted' },
+    });
+    await expect(built.validateInput?.({ token: 'rejected' })).resolves.toMatchObject({ error: { error: true } });
+    await expect(
+      built.execute?.(
+        { token: 'accepted' },
+        { abortSignal: new AbortController().signal, toolCallId: 'async-call', messages: [] },
+      ),
+    ).resolves.toEqual({ token: 'accepted' });
+    expect(execute).toHaveBeenCalledWith({ token: 'accepted' }, expect.any(Object));
   });
 
   it('createTool execute path skips author-schema re-validation after CoreToolBuilder compat validation', async () => {
@@ -90,6 +102,9 @@ describe('CoreToolBuilder - Schema Compatibility in Validation', () => {
     });
 
     const coreTool = buildCoreTool(shortTextTool, 'shortTextTool', haikuModelConfig);
+    await expect(coreTool.validateInput?.({ text: 'Short text' })).resolves.toMatchObject({
+      error: { error: true },
+    });
     const executeResult = await coreTool.execute?.(
       { text: 'Short text' },
       {
@@ -183,6 +198,8 @@ describe('CoreToolBuilder - Schema Compatibility in Validation', () => {
       specificationVersion: 'v4',
       supportsStructuredOutputs: true,
     });
+
+    await expect(coreTool.validateInput?.({ a: 'x', b: null })).resolves.toEqual({ data: { a: 'x' } });
 
     const executeResult = await coreTool.execute?.(
       { a: 'x' },

@@ -213,6 +213,8 @@ export const toolCallOutputSchema = toolCallInputSchema.extend({
       reason: z.string().optional(),
     })
     .optional(),
+  /** Verified untransformed arguments explicitly accepted through edited approval. */
+  approvedArgs: z.record(z.string(), z.any()).optional(),
   // Preserve general suspension provenance through workflow serialization so
   // a resumed result can never be mistaken for an uninterrupted terminal tool.
   resumedFromSuspension: z.literal(true).optional(),

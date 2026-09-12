@@ -1149,10 +1149,19 @@ export class MessageList {
           : undefined;
     const transformedSuspendPayload =
       phase === 'suspend' && hasTransformedToolPayload(phaseTransform) ? phaseTransform.transformed : undefined;
+    const hasTranscriptInputTransform =
+      phase === 'approval'
+        ? hasTransformedToolPayload(phaseTransform) || hasTransformedToolPayload(inputTransform)
+        : hasTransformedToolPayload(inputTransform);
+    const transcriptStateData = hasTranscriptInputTransform
+      ? Object.fromEntries(
+          Object.entries(stateData).filter(([key]) => key !== 'approvedArgs' && key !== 'approvalInputIdentityDigest'),
+        )
+      : stateData;
 
     return {
-      ...stateData,
-      ...(transformedArgs !== undefined ? { args: transformedArgs } : {}),
+      ...transcriptStateData,
+      ...(hasTranscriptInputTransform ? { args: transformedArgs } : {}),
       ...(transformedSuspendPayload !== undefined ? { suspendPayload: transformedSuspendPayload } : {}),
     };
   }
@@ -1301,6 +1310,8 @@ export class MessageList {
   /**
    * Replace a tool-invocation part matching the given toolCallId with the
    * provided result part. Walks backwards through messages to find the match.
+   * Original arguments are retained unless the caller explicitly identifies a
+   * verified edited-approval value with `options.replaceArgs`.
    * If the message was already persisted (e.g. as a memory message), it is
    * moved to the response source so it will be re-saved.
    *
@@ -1309,6 +1320,7 @@ export class MessageList {
   public updateToolInvocation(
     inputPart: Extract<MastraMessagePart, { type: 'tool-invocation' }>,
     metadata?: Record<string, unknown>,
+    options?: { replaceArgs?: boolean },
   ): boolean {
     if (!inputPart.toolInvocation?.toolCallId) {
       return false;
@@ -1324,7 +1336,7 @@ export class MessageList {
       for (let i = 0; i < msg.content.parts.length; i++) {
         const part = msg.content.parts[i];
         if (part?.type === 'tool-invocation' && part.toolInvocation?.toolCallId === toolCallId) {
-          this.mergeToolResultIntoPart(msg, i, inputPart, metadata);
+          this.mergeToolResultIntoPart(msg, i, inputPart, metadata, undefined, options?.replaceArgs);
           return true;
         }
       }
@@ -1357,7 +1369,7 @@ export class MessageList {
           // resynced from its old key (it still holds the original id).
           const previousToolCallId = candidate.toolInvocation.toolCallId;
           candidate.toolInvocation.toolCallId = toolCallId;
-          this.mergeToolResultIntoPart(msg, i, inputPart, metadata, previousToolCallId);
+          this.mergeToolResultIntoPart(msg, i, inputPart, metadata, previousToolCallId, options?.replaceArgs);
           return true;
         }
       }
@@ -1422,6 +1434,7 @@ export class MessageList {
     inputPart: Extract<MastraMessagePart, { type: 'tool-invocation' }>,
     metadata?: Record<string, unknown>,
     previousToolCallId?: string,
+    replaceArgs = false,
   ): void {
     const part = msg.content.parts![i] as Extract<MastraMessagePart, { type: 'tool-invocation' }>;
     // The legacy `content.toolInvocations` array (AIV4) is keyed by the id the
@@ -1433,6 +1446,7 @@ export class MessageList {
       providerExecuted?: boolean;
       providerMetadata?: unknown;
     };
+    const persistedArgs = replaceArgs ? inputPart.toolInvocation.args : part.toolInvocation.args;
 
     // `providerMetadata` is a two-level map — provider namespace -> key -> value —
     // so merging it must also be two levels deep. A one-level merge let a caller
@@ -1477,7 +1491,7 @@ export class MessageList {
       ...inputPart,
       toolInvocation: {
         ...inputPart.toolInvocation,
-        args: part.toolInvocation.args,
+        args: persistedArgs,
       },
       // Preserve providerExecuted from original call if not in result
       ...(originalPart.providerExecuted !== undefined && inputPartWithMeta.providerExecuted === undefined
@@ -1504,20 +1518,23 @@ export class MessageList {
     };
 
     // Keep the legacy AIV4 `content.toolInvocations` array in sync so a later
-    // transformMessageForTranscript() can still map this part back: carry over
-    // the result and the (possibly reconciled) toolCallId, matching the entry by
-    // the id it held before reconciliation. Spread the legacy entry first to
-    // preserve its type, then override only the fields that change here.
-    if (Array.isArray(msg.content.toolInvocations) && inputPart.toolInvocation.state === 'result') {
-      const resultInvocation = inputPart.toolInvocation;
+    // transformMessageForTranscript() can still map this part back. Both a
+    // normal result and an approval denial resolve the original invocation.
+    if (
+      Array.isArray(msg.content.toolInvocations) &&
+      (inputPart.toolInvocation.state === 'result' || inputPart.toolInvocation.state === 'output-denied')
+    ) {
+      const resolvedInvocation = inputPart.toolInvocation;
       msg.content.toolInvocations = msg.content.toolInvocations.map(invocation =>
         invocation.toolCallId === priorToolCallId
           ? {
               ...invocation,
-              toolCallId: resultInvocation.toolCallId,
-              state: 'result' as const,
-              args: part.toolInvocation.args,
-              result: resultInvocation.result,
+              toolCallId: resolvedInvocation.toolCallId,
+              state: resolvedInvocation.state,
+              args: persistedArgs,
+              ...(resolvedInvocation.state === 'result'
+                ? { result: resolvedInvocation.result }
+                : { approval: resolvedInvocation.approval }),
             }
           : invocation,
       );

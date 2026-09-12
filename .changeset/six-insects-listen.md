@@ -2,7 +2,7 @@
 '@mastra/client-js': minor
 ---
 
-Added typed `editedArgs` input to Harness tool-approval helpers and generated route types.
+Harness clients can now revise pending tool input with typed `editedArgs`. Invalid edits do not execute.
 
 Before:
 
