@@ -254,6 +254,195 @@ describe('step-result lifecycle fence', () => {
     }
   });
 
+  it('retains the latest shared state when a parallel publication is delayed', async () => {
+    const storage = new MockStore();
+    const pubsub = new EventEmitterPubSub();
+    const aPublicationStarted = Promise.withResolvers<void>();
+    const releaseAPublication = Promise.withResolvers<void>();
+    const bPersisted = Promise.withResolvers<void>();
+    const publish = pubsub.publish.bind(pubsub);
+    const publishSpy = vi.spyOn(pubsub, 'publish').mockImplementation(async (...args) => {
+      if (args[1].data?.event?.type === 'step.completed' && args[1].data.event.stepId === 'a') {
+        aPublicationStarted.resolve();
+        await releaseAPublication.promise;
+      }
+      return publish(...args);
+    });
+    const workflowsStore = await storage.getStore('workflows');
+    const persistWorkflowStepUpdate = workflowsStore!.persistWorkflowStepUpdate.bind(workflowsStore);
+    const persistSpy = vi.spyOn(workflowsStore!, 'persistWorkflowStepUpdate').mockImplementation(async input => {
+      const outcome = await persistWorkflowStepUpdate(input);
+      if (
+        outcome?.status === 'persisted' &&
+        input.lifecycleEvents?.some(event => event.type === 'step.suspended' && event.stepId === 'b')
+      ) {
+        bPersisted.resolve();
+      }
+      return outcome;
+    });
+    const stateSchema = z.object({ count: z.number() });
+    const a = createStep({
+      id: 'a',
+      inputSchema: z.object({}),
+      outputSchema: z.number(),
+      stateSchema,
+      execute: async ({ setState }) => {
+        await setState({ count: 1 });
+        return 1;
+      },
+    });
+    const b = createStep({
+      id: 'b',
+      inputSchema: z.object({}),
+      outputSchema: z.number(),
+      stateSchema,
+      suspendSchema: stateSchema,
+      resumeSchema: stateSchema,
+      execute: async ({ state, resumeData, setState, suspend }) => {
+        if (resumeData) return resumeData.count;
+        await aPublicationStarted.promise;
+        const count = state.count + 1;
+        await setState({ count });
+        await suspend({ count });
+        return count;
+      },
+    });
+    const workflow = createWorkflow({
+      id: 'pf-3750-parallel-state-fence',
+      inputSchema: z.object({}),
+      outputSchema: z.any(),
+      stateSchema,
+    })
+      .parallel([a, b])
+      .commit();
+    const mastra = new Mastra({ logger: false, storage, pubsub, workflows: { [workflow.id]: workflow } });
+    const run = await workflow.createRun();
+
+    try {
+      const execution = run.start({ inputData: {}, initialState: { count: 0 }, outputOptions: { includeState: true } });
+      await aPublicationStarted.promise;
+      await bPersisted.promise;
+
+      const intermediate = await workflowsStore!.loadWorkflowSnapshot({
+        workflowName: workflow.id,
+        runId: run.runId,
+      });
+      expect(intermediate).toMatchObject({ status: 'running', value: { count: 2 } });
+      expect(intermediate?.context?.b).toMatchObject({ status: 'suspended', suspendPayload: { count: 2 } });
+
+      releaseAPublication.resolve();
+      await expect(execution).resolves.toMatchObject({ status: 'suspended', state: { count: 2 } });
+
+      const suspended = await workflowsStore!.loadWorkflowSnapshot({
+        workflowName: workflow.id,
+        runId: run.runId,
+      });
+      expect(suspended).toMatchObject({ status: 'suspended', value: { count: 2 } });
+      expect(suspended?.context?.b).toMatchObject({ status: 'suspended', suspendPayload: { count: 2 } });
+
+      await expect(
+        run.resume({ step: 'b', resumeData: { count: 2 }, outputOptions: { includeState: true } }),
+      ).resolves.toMatchObject({ status: 'success', state: { count: 2 } });
+    } finally {
+      releaseAPublication.resolve();
+      await mastra.shutdown();
+      persistSpy.mockRestore();
+      publishSpy.mockRestore();
+    }
+  });
+
+  it('merges platform nested state before exposing a completed parallel branch', async () => {
+    const storage = new MockStore();
+    const pubsub = new EventEmitterPubSub();
+    const nestedPublicationStarted = Promise.withResolvers<void>();
+    const releaseNestedPublication = Promise.withResolvers<void>();
+    const siblingPersisted = Promise.withResolvers<void>();
+    let siblingSnapshotState: unknown;
+    const publish = pubsub.publish.bind(pubsub);
+    const publishSpy = vi.spyOn(pubsub, 'publish').mockImplementation(async (...args) => {
+      if (args[1].data?.event?.type === 'step.completed' && args[1].data.event.stepId === 'platform-child') {
+        nestedPublicationStarted.resolve();
+        await releaseNestedPublication.promise;
+      }
+      return publish(...args);
+    });
+    const workflowsStore = await storage.getStore('workflows');
+    const persistWorkflowStepUpdate = workflowsStore!.persistWorkflowStepUpdate.bind(workflowsStore);
+    const persistSpy = vi.spyOn(workflowsStore!, 'persistWorkflowStepUpdate').mockImplementation(async input => {
+      const outcome = await persistWorkflowStepUpdate(input);
+      if (
+        outcome?.status === 'persisted' &&
+        input.lifecycleEvents?.some(event => event.type === 'step.completed' && event.stepId === 'sibling')
+      ) {
+        siblingSnapshotState = input.snapshot.value;
+        siblingPersisted.resolve();
+      }
+      return outcome;
+    });
+    const stateSchema = z.object({ nestedCount: z.number() });
+    const childStep = createStep({
+      id: 'platform-child-step',
+      inputSchema: ioSchema,
+      outputSchema: ioSchema,
+      execute: async ({ inputData }) => inputData,
+    });
+    const nestedWorkflow = createWorkflow({
+      id: 'platform-child',
+      inputSchema: ioSchema,
+      outputSchema: ioSchema,
+      stateSchema,
+    })
+      .then(childStep)
+      .commit();
+    const sibling = createStep({
+      id: 'sibling',
+      inputSchema: ioSchema,
+      outputSchema: ioSchema,
+      execute: async ({ inputData }) => {
+        await nestedPublicationStarted.promise;
+        return inputData;
+      },
+    });
+    const workflow = createWorkflow({
+      id: 'pf-3750-platform-state-fence',
+      inputSchema: ioSchema,
+      outputSchema: z.any(),
+      stateSchema,
+    })
+      .parallel([nestedWorkflow, sibling])
+      .commit();
+    const mastra = new Mastra({ logger: false, storage, pubsub, workflows: { [workflow.id]: workflow } });
+    const engine = (workflow as any).executionEngine as DefaultExecutionEngine;
+    const nestedCheck = vi
+      .spyOn(engine, 'isNestedWorkflowStep')
+      .mockImplementation(step => (step as any).component === 'WORKFLOW');
+    const nestedInvocation = vi
+      .spyOn(engine, 'executeWorkflowStep')
+      .mockImplementation(async ({ executionContext }) => {
+        executionContext.state = { ...executionContext.state, nestedCount: executionContext.state.nestedCount + 1 };
+        return { status: 'success', output: { value: 'nested' }, endedAt: Date.now() };
+      });
+    const run = await workflow.createRun();
+
+    try {
+      const execution = run.start({ inputData: { value: 'input' }, initialState: { nestedCount: 0 } });
+      await nestedPublicationStarted.promise;
+      await siblingPersisted.promise;
+      expect(siblingSnapshotState).toMatchObject({ nestedCount: 1 });
+
+      releaseNestedPublication.resolve();
+      await expect(execution).resolves.toMatchObject({ status: 'success' });
+      expect(nestedInvocation).toHaveBeenCalledOnce();
+    } finally {
+      releaseNestedPublication.resolve();
+      await mastra.shutdown();
+      nestedInvocation.mockRestore();
+      nestedCheck.mockRestore();
+      persistSpy.mockRestore();
+      publishSpy.mockRestore();
+    }
+  });
+
   it('retains state and closes lifecycle events across fresh-engine ordinary resumes', async () => {
     const storage = new MockStore();
     const pubsub = new EventEmitterPubSub();

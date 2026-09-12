@@ -330,6 +330,7 @@ export async function executeStep(
     const nestedStepResults = priorSuspendedStepResult
       ? { ...stepResults, [step.id]: priorSuspendedStepResult }
       : stepResults;
+    const sharedState = executionContext.foreachIndex === undefined ? executionContext.state : undefined;
     const workflowResult = await engine.executeWorkflowStep({
       step,
       stepResults: nestedStepResults,
@@ -351,6 +352,14 @@ export async function executeStep(
 
     // If executeWorkflowStep returns a result, wrap it in StepExecutionResult
     if (workflowResult !== null) {
+      if (sharedState) {
+        // Platform hooks may replace the branch state with the nested result's
+        // state. Merge it into the shared root before the completed result is
+        // persisted, so a sibling cannot observe completion with stale state.
+        Object.assign(sharedState, executionContext.state);
+        executionContext.state = sharedState;
+      }
+
       // End the step span with the nested workflow result
       if (stepSpan) {
         if (workflowResult.status === 'failed') {
@@ -785,9 +794,12 @@ export async function executeStep(
     stepResults: { [step.id]: stepResult },
     mutableContext: engine.buildMutableContext({
       ...executionContext,
-      state: stepRetryResult.ok
-        ? (stepRetryResult.result.contextMutations.stateUpdate ?? executionContext.state)
-        : executionContext.state,
+      state:
+        executionContext.foreachIndex === undefined
+          ? executionContext.state
+          : stepRetryResult.ok
+            ? (stepRetryResult.result.contextMutations.stateUpdate ?? executionContext.state)
+            : executionContext.state,
     }),
     // Serialize requestContext only for engines that restore it from
     // serialized results (Inngest memoization); the default engine keeps
