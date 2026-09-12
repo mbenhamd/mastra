@@ -1121,24 +1121,25 @@ export class DefaultExecutionEngine extends ExecutionEngine {
           false,
           { pubsub: params.pubsub, includeState: params.outputOptions?.includeState },
         );
-        const authoritativeStatus = authoritativeTerminal!.status;
-        const authoritativeResult = authoritativeTerminal!;
-        if (authoritativeStatus === 'failed' || authoritativeStatus === 'tripwire') {
-          workflowSpan?.error({
-            error: authoritativeResult.error ?? new Error(`Workflow ended with status ${authoritativeStatus}`),
-            attributes: { status: authoritativeStatus },
-          });
-        } else {
-          workflowSpan?.end({
-            output: authoritativeResult.result,
-            attributes: { status: authoritativeStatus },
-          });
+        if (authoritativeTerminal) {
+          const authoritativeStatus = authoritativeTerminal.status;
+          if (authoritativeStatus === 'failed' || authoritativeStatus === 'tripwire') {
+            workflowSpan?.error({
+              error: authoritativeTerminal.error ?? new Error(`Workflow ended with status ${authoritativeStatus}`),
+              attributes: { status: authoritativeStatus },
+            });
+          } else {
+            workflowSpan?.end({
+              output: authoritativeTerminal.result,
+              attributes: { status: authoritativeStatus },
+            });
+          }
+          this.clearLastPersistedStatus(runId);
+          return {
+            ...authoritativeTerminal,
+            runId,
+          } as unknown as TOutput;
         }
-        this.clearLastPersistedStatus(runId);
-        return {
-          ...authoritativeResult,
-          runId,
-        } as unknown as TOutput;
       }
 
       // if step result is not success, stop and return

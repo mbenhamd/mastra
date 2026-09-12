@@ -263,6 +263,21 @@ describe('atomic workflow resume records', () => {
     expect(persisted.acceptedEvents).toEqual([event]);
     expect(persisted.snapshot?.lifecycleOutbox).toEqual([event]);
 
+    const pruned = persistWorkflowStepUpdateRecord(
+      persisted.snapshot,
+      {
+        workflowName: 'workflow-1',
+        runId: existing.runId,
+        resourceId: existing.resourceId,
+        expectedExecutionGeneration: existing.executionGeneration,
+        snapshot: { ...persisted.snapshot!, lifecycleOutbox: undefined },
+        retainExistingLifecycleOutbox: false,
+      },
+      materialize,
+    );
+    expect(pruned.status).toBe('persisted');
+    expect(pruned.snapshot?.lifecycleOutbox).toBeUndefined();
+
     const terminal = persistWorkflowStepUpdateRecord(
       { ...existing, status: 'success' },
       {

@@ -1,12 +1,14 @@
 import type { ActorSignal } from '../../auth/ee';
 import type { RequestContext } from '../../di';
+import { getErrorFromUnknown } from '../../error';
 import type { SerializedError } from '../../error';
 import type { PubSub } from '../../events/pubsub';
 import { resolveObservabilityContext } from '../../observability';
 import type { ObservabilityContext } from '../../observability';
+import { WORKFLOW_LIFECYCLE_OUTBOX_LIMIT } from '../../storage/domains/workflows/resume';
 import type { PersistWorkflowStepUpdateResult } from '../../storage/types';
 import type { DefaultExecutionEngine } from '../default';
-import { workflowLifecycleEventsAreSuppressed } from '../lifecycle-events';
+import { requireWorkflowExecutionGeneration, workflowLifecycleEventsAreSuppressed } from '../lifecycle-events';
 import type { WorkflowLifecycleEvent } from '../lifecycle-events';
 import type {
   EntryExecutionResult,
@@ -29,6 +31,239 @@ function publishStepEvent(
   ...args: Parameters<PubSub['publish']>
 ): Promise<void> {
   return engine.options.emitStepEvents === false ? Promise.resolve() : pubsub.publish(...args);
+}
+
+type LifecyclePayloadKey = 'output' | 'suspendPayload' | 'error';
+
+type LifecyclePayloadBaseline = {
+  type: WorkflowLifecycleEvent['type'];
+  stepId: string;
+  stepCallId: string;
+  stepAttempt: number;
+  payloadKey: LifecyclePayloadKey;
+  eventHasPayload: boolean;
+  eventPayload: unknown;
+  contextHasPayload: boolean;
+  contextPayload: unknown;
+};
+
+function cloneLifecyclePayload(value: unknown, seen: WeakMap<object, object> = new WeakMap()): unknown {
+  if (value === null || typeof value !== 'object') return value;
+
+  const prior = seen.get(value);
+  if (prior) return prior;
+
+  if (value instanceof Date) return new Date(value.getTime());
+  if (value instanceof RegExp) return new RegExp(value.source, value.flags);
+  if (value instanceof URL) return new URL(value.href);
+  if (value instanceof ArrayBuffer) return value.slice(0);
+  if (ArrayBuffer.isView(value)) {
+    const buffer = new ArrayBuffer(value.byteLength);
+    new Uint8Array(buffer).set(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
+    if (value instanceof DataView) return new DataView(buffer);
+    const View = value.constructor as new (buffer: ArrayBuffer) => ArrayBufferView;
+    return new View(buffer);
+  }
+  if (value instanceof Map) {
+    const clone = new Map();
+    seen.set(value, clone);
+    for (const [key, entryValue] of value) {
+      clone.set(cloneLifecyclePayload(key, seen), cloneLifecyclePayload(entryValue, seen));
+    }
+    return clone;
+  }
+  if (value instanceof Set) {
+    const clone = new Set();
+    seen.set(value, clone);
+    for (const entryValue of value) clone.add(cloneLifecyclePayload(entryValue, seen));
+    return clone;
+  }
+  if (value instanceof Error) {
+    const clone = Object.create(Object.getPrototypeOf(value)) as Error & Record<string, unknown>;
+    seen.set(value, clone);
+    clone.name = value.name;
+    clone.message = value.message;
+    clone.stack = value.stack;
+    for (const key of Object.keys(value)) {
+      clone[key] = cloneLifecyclePayload((value as unknown as Record<string, unknown>)[key], seen);
+    }
+    return clone;
+  }
+  if (Array.isArray(value)) {
+    const clone: unknown[] = [];
+    seen.set(value, clone);
+    for (const entryValue of value) clone.push(cloneLifecyclePayload(entryValue, seen));
+    return clone;
+  }
+
+  const clone = Object.create(Object.getPrototypeOf(value)) as Record<string, unknown>;
+  seen.set(value, clone);
+  for (const key of Object.keys(value)) {
+    clone[key] = cloneLifecyclePayload((value as Record<string, unknown>)[key], seen);
+  }
+  return clone;
+}
+
+function lifecyclePayloadKey(event: WorkflowLifecycleEvent): LifecyclePayloadKey | undefined {
+  if (event.type === 'step.completed') return 'output';
+  if (event.type === 'step.suspended') return 'suspendPayload';
+  if (event.type === 'step.failed') return 'error';
+  return undefined;
+}
+
+function captureLifecyclePayloadBaseline(snapshot: WorkflowRunState): LifecyclePayloadBaseline[] {
+  return (snapshot.lifecycleOutbox ?? []).flatMap(event => {
+    if (!('stepId' in event)) return [];
+    const payloadKey = lifecyclePayloadKey(event);
+    if (!payloadKey) return [];
+    const eventRecord = event as unknown as Record<string, unknown>;
+    const stepResult = snapshot.context?.[event.stepId] as Record<string, unknown> | undefined;
+    return [
+      {
+        type: event.type,
+        stepId: event.stepId,
+        stepCallId: event.stepCallId,
+        stepAttempt: event.stepAttempt,
+        payloadKey,
+        eventHasPayload: Object.hasOwn(event, payloadKey),
+        eventPayload: cloneLifecyclePayload(eventRecord[payloadKey]),
+        contextHasPayload: stepResult ? Object.hasOwn(stepResult, payloadKey) : false,
+        contextPayload: cloneLifecyclePayload(stepResult?.[payloadKey]),
+      },
+    ];
+  });
+}
+
+function lifecyclePayloadEquals(left: unknown, right: unknown, seen: WeakMap<object, object> = new WeakMap()): boolean {
+  if (Object.is(left, right)) return true;
+  if (left === null || right === null || typeof left !== 'object' || typeof right !== 'object') return false;
+
+  const prior = seen.get(left);
+  if (prior) return prior === right;
+  seen.set(left, right);
+
+  if (left instanceof Date || right instanceof Date) {
+    return left instanceof Date && right instanceof Date && left.getTime() === right.getTime();
+  }
+  if (left instanceof RegExp || right instanceof RegExp) {
+    return (
+      left instanceof RegExp && right instanceof RegExp && left.source === right.source && left.flags === right.flags
+    );
+  }
+  if (left instanceof URL || right instanceof URL) {
+    return left instanceof URL && right instanceof URL && left.href === right.href;
+  }
+  if (left instanceof Map || right instanceof Map) {
+    if (!(left instanceof Map) || !(right instanceof Map) || left.size !== right.size) return false;
+    const leftEntries = [...left.entries()];
+    const rightEntries = [...right.entries()];
+    return leftEntries.every(
+      ([key, value], index) =>
+        lifecyclePayloadEquals(key, rightEntries[index]?.[0], seen) &&
+        lifecyclePayloadEquals(value, rightEntries[index]?.[1], seen),
+    );
+  }
+  if (left instanceof Set || right instanceof Set) {
+    if (!(left instanceof Set) || !(right instanceof Set) || left.size !== right.size) return false;
+    const rightValues = [...right.values()];
+    return [...left.values()].every((value, index) => lifecyclePayloadEquals(value, rightValues[index], seen));
+  }
+  if (left instanceof ArrayBuffer || right instanceof ArrayBuffer) {
+    if (!(left instanceof ArrayBuffer) || !(right instanceof ArrayBuffer) || left.byteLength !== right.byteLength) {
+      return false;
+    }
+    return new Uint8Array(left).every((value, index) => value === new Uint8Array(right)[index]);
+  }
+  if (ArrayBuffer.isView(left) || ArrayBuffer.isView(right)) {
+    if (!ArrayBuffer.isView(left) || !ArrayBuffer.isView(right) || left.byteLength !== right.byteLength) return false;
+    const leftBytes = new Uint8Array(left.buffer, left.byteOffset, left.byteLength);
+    const rightBytes = new Uint8Array(right.buffer, right.byteOffset, right.byteLength);
+    return leftBytes.every((value, index) => value === rightBytes[index]);
+  }
+  if (left instanceof Error || right instanceof Error) {
+    if (!(left instanceof Error) || !(right instanceof Error)) return false;
+    if (left.name !== right.name || left.message !== right.message || left.stack !== right.stack) return false;
+  }
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return (
+      Array.isArray(left) &&
+      Array.isArray(right) &&
+      left.length === right.length &&
+      left.every((value, index) => lifecyclePayloadEquals(value, right[index], seen))
+    );
+  }
+
+  const leftRecord = left as Record<string, unknown>;
+  const rightRecord = right as Record<string, unknown>;
+  const leftPrototype = Object.getPrototypeOf(left);
+  const rightPrototype = Object.getPrototypeOf(right);
+  const supportedRecordPrototype = (prototype: object | null) => prototype === null || prototype === Object.prototype;
+  if (
+    leftPrototype !== rightPrototype &&
+    (!supportedRecordPrototype(leftPrototype) || !supportedRecordPrototype(rightPrototype))
+  ) {
+    return false;
+  }
+  const leftKeys = Object.keys(leftRecord);
+  const rightKeys = Object.keys(rightRecord);
+  return (
+    leftKeys.length === rightKeys.length &&
+    leftKeys.every(
+      key => Object.hasOwn(rightRecord, key) && lifecyclePayloadEquals(leftRecord[key], rightRecord[key], seen),
+    )
+  );
+}
+
+function getPrunedLifecycleEvents(
+  snapshot: WorkflowRunState,
+  baseline: LifecyclePayloadBaseline[],
+): WorkflowLifecycleEvent[] | undefined {
+  if (!snapshot.lifecycleOutbox?.length) return undefined;
+  return snapshot.lifecycleOutbox.map(event => {
+    if (!('stepId' in event)) return event;
+    const stepResult = snapshot.context?.[event.stepId] as Record<string, unknown> | undefined;
+    const prunedPayload = (key: LifecyclePayloadKey) => {
+      const original = baseline.find(
+        candidate =>
+          candidate.type === event.type &&
+          candidate.stepId === event.stepId &&
+          candidate.stepCallId === event.stepCallId &&
+          candidate.stepAttempt === event.stepAttempt &&
+          candidate.payloadKey === key,
+      );
+      const eventRecord = event as unknown as Record<string, unknown>;
+      const eventHasPayload = Object.hasOwn(event, key);
+      const contextHasPayload = stepResult ? Object.hasOwn(stepResult, key) : false;
+      const eventWasExplicitlyPruned =
+        !original ||
+        eventHasPayload !== original.eventHasPayload ||
+        !lifecyclePayloadEquals(eventRecord[key], original.eventPayload);
+      if (eventWasExplicitlyPruned) return eventHasPayload ? eventRecord[key] : undefined;
+      const contextWasExplicitlyPruned =
+        contextHasPayload !== original.contextHasPayload ||
+        !lifecyclePayloadEquals(stepResult?.[key], original.contextPayload);
+      if (contextWasExplicitlyPruned) return contextHasPayload ? stepResult?.[key] : undefined;
+      return eventHasPayload ? eventRecord[key] : undefined;
+    };
+    if (event.type === 'step.completed') {
+      const { output: _output, ...identity } = event;
+      return { ...identity, output: prunedPayload('output') };
+    }
+    if (event.type === 'step.suspended') {
+      const { suspendPayload: _suspendPayload, ...identity } = event;
+      return { ...identity, suspendPayload: prunedPayload('suspendPayload') };
+    }
+    if (event.type === 'step.failed') {
+      const { error: _error, ...identity } = event;
+      const prunedError = prunedPayload('error');
+      const error =
+        prunedError instanceof Error
+          ? getErrorFromUnknown(prunedError, { serializeStack: false }).toJSON()
+          : prunedError;
+      return { ...identity, error };
+    }
+    return event;
+  });
 }
 
 /**
@@ -244,9 +479,20 @@ export async function persistStepUpdate(
     };
 
     const workflowsStore = await engine.mastra?.getStorage()?.getStore('workflows');
+    const lifecyclePayloadBaseline = engine.options?.pruneSnapshot ? captureLifecyclePayloadBaseline(snapshot) : [];
     const snapshotToPersist = engine.options?.pruneSnapshot
       ? engine.options.pruneSnapshot({ snapshot, workflowStatus })
       : snapshot;
+    const prunedLifecycleEvents = engine.options?.pruneSnapshot
+      ? getPrunedLifecycleEvents(snapshotToPersist, lifecyclePayloadBaseline)
+      : lifecycleEvents;
+    const snapshotForPersistence = (() => {
+      if (!lifecycleEvents?.length) return snapshotToPersist;
+      const { lifecycleOutbox: _lifecycleOutbox, ...withoutUnprunedOutbox } = snapshotToPersist;
+      return prunedLifecycleEvents?.length
+        ? { ...withoutUnprunedOutbox, lifecycleOutbox: prunedLifecycleEvents }
+        : withoutUnprunedOutbox;
+    })();
 
     const resumeCapabilities = workflowsStore?.getWorkflowResumeCapabilities();
     if (
@@ -283,14 +529,26 @@ export async function persistStepUpdate(
         return { status: 'finalized', disposition: authoritativeSnapshot.status };
       }
       const authoritativeMetadata = authoritativeSnapshot
-        ? Object.fromEntries(Object.entries(authoritativeSnapshot).filter(([key]) => !(key in snapshotToPersist)))
+        ? Object.fromEntries(
+            Object.entries(authoritativeSnapshot).filter(
+              ([key]) =>
+                !(key in snapshotForPersistence) && (!engine.options?.pruneSnapshot || key !== 'lifecycleOutbox'),
+            ),
+          )
         : {};
+      const legacyLifecycleOutbox = engine.options?.pruneSnapshot
+        ? prunedLifecycleEvents
+        : prunedLifecycleEvents?.length
+          ? [...(authoritativeSnapshot?.lifecycleOutbox ?? []), ...prunedLifecycleEvents].slice(
+              -WORKFLOW_LIFECYCLE_OUTBOX_LIMIT,
+            )
+          : authoritativeSnapshot?.lifecycleOutbox;
       await workflowsStore.persistWorkflowSnapshot({
         workflowName: workflowId,
         runId,
         resourceId,
         snapshot: {
-          ...snapshotToPersist,
+          ...snapshotForPersistence,
           ...authoritativeMetadata,
           resourceId: authoritativeSnapshot?.resourceId ?? resourceId,
           resumeCheckpoint: authoritativeSnapshot?.resumeCheckpoint,
@@ -299,12 +557,13 @@ export async function persistStepUpdate(
           executionGeneration: snapshot.executionGeneration,
           lifecycleResumeAttempt: snapshot.lifecycleResumeAttempt,
           lifecycleStepStates: snapshot.lifecycleStepStates,
+          ...(lifecycleEvents?.length ? { lifecycleOutbox: legacyLifecycleOutbox } : {}),
         },
       });
       engine.setLastPersistedStatus(runId, workflowStatus);
       return {
         status: 'persisted',
-        ...(lifecycleEvents && lifecycleEvents.length > 0 ? { acceptedEvents: lifecycleEvents } : {}),
+        ...(lifecycleEvents?.length ? { acceptedEvents: prunedLifecycleEvents ?? [] } : {}),
       };
     }
 
@@ -315,8 +574,9 @@ export async function persistStepUpdate(
       expectedResumeOperationHash: executionContext.resumeOperationHash,
       expectedExecutionGeneration: executionContext.executionGeneration,
       expectedLifecycleResumeAttempt: executionContext.lifecycleResumeAttempt,
-      snapshot: snapshotToPersist,
-      lifecycleEvents,
+      snapshot: snapshotForPersistence,
+      lifecycleEvents: prunedLifecycleEvents,
+      retainExistingLifecycleOutbox: engine.options?.pruneSnapshot === undefined,
     });
     if (persisted?.status === 'unsupported') {
       throw new Error(`Workflow storage for ${workflowId}/${runId} does not support fenced workflow step updates`);
@@ -326,6 +586,9 @@ export async function persistStepUpdate(
     }
     if (persisted?.status === 'persisted') {
       engine.setLastPersistedStatus(runId, workflowStatus);
+      if (lifecycleEvents?.length && persisted.acceptedEvents === undefined) {
+        return { ...persisted, acceptedEvents: prunedLifecycleEvents ?? [] };
+      }
     }
     return persisted;
   });
@@ -950,6 +1213,11 @@ export async function executeEntry(
 
   let persistOutcome: PersistWorkflowStepUpdateResult | void = undefined;
   if (!executionContext.transientExecution) {
+    const isCompositeChild = executionContext.foreachIndex !== undefined || executionContext.executionPath.length > 1;
+    const workflowStatus =
+      !isCompositeChild && (execResults.status === 'suspended' || execResults.status === 'paused')
+        ? execResults.status
+        : 'running';
     persistOutcome = await engine.persistStepUpdate({
       workflowId,
       runId,
@@ -957,11 +1225,37 @@ export async function executeEntry(
       serializedStepGraph,
       stepResults,
       executionContext,
-      workflowStatus: execResults.status === 'success' ? 'running' : execResults.status,
+      workflowStatus,
       requestContext,
       phase: 'entry-result',
     });
-    if (persistOutcome && persistOutcome.status !== 'persisted') {
+    if (persistOutcome?.status === 'protected_state' && workflowStatus === 'running') {
+      const executionGeneration = requireWorkflowExecutionGeneration(
+        executionContext.executionGeneration,
+        `Workflow entry ${workflowId}/${runId}`,
+      );
+      const disposition = await engine.getAuthoritativeExecutionDisposition({
+        workflowId,
+        runId,
+        executionGeneration,
+      });
+      if (!disposition) persistOutcome = undefined;
+    }
+    const matchesLocallyPersistedResult = engine.getLastPersistedStatus(runId) === workflowStatus;
+    const repeatsLocalTerminal =
+      persistOutcome?.status === 'finalized' &&
+      (persistOutcome.disposition === undefined || persistOutcome.disposition === workflowStatus);
+    const repeatsLocalResumeResult =
+      persistOutcome?.status === 'stale_execution' &&
+      persistOutcome.disposition === undefined &&
+      (workflowStatus === 'suspended' || workflowStatus === 'paused');
+    if (matchesLocallyPersistedResult && (repeatsLocalTerminal || repeatsLocalResumeResult)) {
+      // A single-step entry persists once in executeStep and again here. The
+      // fence rejects that second write after the first one has already saved
+      // this engine's terminal or resumed-suspend result. It is not a remote
+      // disposition and must not turn the local result into cancellation.
+      persistOutcome = undefined;
+    } else if (persistOutcome && persistOutcome.status !== 'persisted') {
       execResults = { ...execResults, status: 'canceled', endedAt: Date.now() };
     }
   }

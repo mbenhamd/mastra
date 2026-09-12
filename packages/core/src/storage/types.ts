@@ -89,6 +89,12 @@ export interface PersistWorkflowStepUpdateInput {
    * all. A terminal or superseded row rejects them atomically.
    */
   lifecycleEvents?: WorkflowLifecycleEvent[];
+  /**
+   * Retain previously committed lifecycle evidence when appending this update.
+   * Snapshot-pruning callers disable retention so older payloads cannot bypass
+   * the current pruning policy.
+   */
+  retainExistingLifecycleOutbox?: boolean;
 }
 
 export type PersistWorkflowStepUpdateResult = {

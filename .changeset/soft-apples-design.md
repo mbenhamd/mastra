@@ -2,4 +2,4 @@
 '@mastra/core': patch
 ---
 
-Added an atomic workflow step-result fence so lifecycle events commit with the snapshot or not at all. [PF-3750]
+Fixed workflow lifecycle events so they publish only after the matching step result is saved. [PF-3750]

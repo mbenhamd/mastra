@@ -540,7 +540,11 @@ export function persistWorkflowStepUpdateRecord(
     resumeResultReceipt: existing.resumeResultReceipt,
     resumeRollbackReceipt: existing.resumeRollbackReceipt,
   });
-  return persistedStepUpdate(snapshot, acceptedEvents, existing.lifecycleOutbox);
+  return persistedStepUpdate(
+    snapshot,
+    acceptedEvents,
+    input.retainExistingLifecycleOutbox === false ? undefined : existing.lifecycleOutbox,
+  );
 }
 
 function acceptedLifecycleEvents(events: WorkflowLifecycleEvent[] | undefined): WorkflowLifecycleEvent[] | undefined {

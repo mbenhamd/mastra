@@ -11,6 +11,7 @@ import {
   wrapMastra,
   createObservabilityContext,
   resolveObservabilityContext,
+  resolveExportedSpanId,
 } from '../../observability';
 import type { ObservabilityContext, Span } from '../../observability';
 import { executeWithContext } from '../../observability/utils';
@@ -228,6 +229,7 @@ export async function executeStep(
     },
     executionContext,
   });
+  const persistenceTracingSpan = stepSpan ?? observabilityContext.tracingContext.currentSpan;
 
   if (!suppressLifecycleEvents) {
     lifecycleStepState.stepAttempt += 1;
@@ -346,6 +348,14 @@ export async function executeStep(
         stepResults,
         executionContext,
         requestContext,
+        tracingContext:
+          stepResult.status === 'suspended' && persistenceTracingSpan
+            ? {
+                traceId: persistenceTracingSpan.traceId,
+                spanId: resolveExportedSpanId(persistenceTracingSpan),
+                parentSpanId: persistenceTracingSpan.getParentSpanId(),
+              }
+            : undefined,
         stepId: step.id,
         stepCallId,
         stepAttempt: lifecycleStepState.stepAttempt,
@@ -647,6 +657,10 @@ export async function executeStep(
     }
   }
 
+  if (stepRetryResult.ok && stepRetryResult.result.contextMutations.stateUpdate != null) {
+    executionContext.state = stepRetryResult.result.contextMutations.stateUpdate;
+  }
+
   delete executionContext.activeStepsPath[step.id];
 
   if (abortController.signal.aborted) {
@@ -666,6 +680,14 @@ export async function executeStep(
     stepResults,
     executionContext,
     requestContext,
+    tracingContext:
+      stepResultForFence.status === 'suspended' && persistenceTracingSpan
+        ? {
+            traceId: persistenceTracingSpan.traceId,
+            spanId: resolveExportedSpanId(persistenceTracingSpan),
+            parentSpanId: persistenceTracingSpan.getParentSpanId(),
+          }
+        : undefined,
     stepId: step.id,
     stepCallId,
     stepAttempt: lifecycleStepState.stepAttempt,
@@ -810,6 +832,8 @@ export async function emitStepResultEvents(params: {
   runId: string;
   /** Preserve historical watch suppression while still emitting canonical lifecycle events. */
   emitLegacy?: boolean;
+  /** Canonical events accepted with the fenced snapshot. An empty array suppresses them. */
+  canonicalEvents?: WorkflowLifecycleEvent[];
 }): Promise<void> {
   const {
     stepId,
@@ -821,6 +845,7 @@ export async function emitStepResultEvents(params: {
     pubsub,
     runId,
     emitLegacy = true,
+    canonicalEvents,
   } = params;
   const lifecycleStatus = (execResults as any).status === 'bailed' ? ('success' as const) : execResults.status;
   const payloadBase = stepCallId
@@ -835,7 +860,11 @@ export async function emitStepResultEvents(params: {
         data: { type: 'workflow-step-suspended', payload: { ...payloadBase, ...execResults } },
       });
     }
-    if (stepCallId && stepAttempt && workflowId && executionGeneration) {
+    if (canonicalEvents !== undefined && workflowId && executionGeneration) {
+      for (const event of canonicalEvents) {
+        await publishWorkflowLifecycleEvent({ pubsub, workflowId, runId, executionGeneration, event });
+      }
+    } else if (stepCallId && stepAttempt && workflowId && executionGeneration) {
       await publishWorkflowLifecycleEvent({
         pubsub,
         workflowId,
@@ -866,7 +895,11 @@ export async function emitStepResultEvents(params: {
         },
       });
     }
-    if (stepCallId && stepAttempt && workflowId && executionGeneration) {
+    if (canonicalEvents !== undefined && workflowId && executionGeneration) {
+      for (const event of canonicalEvents) {
+        await publishWorkflowLifecycleEvent({ pubsub, workflowId, runId, executionGeneration, event });
+      }
+    } else if (stepCallId && stepAttempt && workflowId && executionGeneration) {
       const identity = { stepId, stepCallId, stepAttempt };
       if (lifecycleStatus === 'success') {
         await publishWorkflowLifecycleEvent({
@@ -932,7 +965,10 @@ function collectStepResultLifecycleEvents(params: {
   if (lifecycleStatus === 'success') {
     events.push({ type: 'step.completed', ...identity, output: (execResults as { output?: unknown }).output });
   } else if (lifecycleStatus === 'failed') {
-    events.push({ type: 'step.failed', ...identity, error: (execResults as { error?: unknown }).error });
+    const rawError = (execResults as { error?: unknown }).error;
+    const persistedError =
+      rawError instanceof Error ? getErrorFromUnknown(rawError, { serializeStack: false }).toJSON() : rawError;
+    events.push({ type: 'step.failed', ...identity, error: persistedError });
   } else if (lifecycleStatus === 'canceled') {
     events.push({ type: 'step.canceled', ...identity });
   }
@@ -955,6 +991,11 @@ async function persistThenPublishStepResult(params: {
   stepResults: Record<string, StepResult<any, any, any, any>>;
   executionContext: ExecutionContext;
   requestContext: ExecuteStepParams['requestContext'];
+  tracingContext?: {
+    traceId?: string;
+    spanId?: string;
+    parentSpanId?: string;
+  };
   stepId: string;
   stepCallId?: string;
   stepAttempt?: number;
@@ -966,6 +1007,12 @@ async function persistThenPublishStepResult(params: {
   phase: string;
 }): Promise<boolean> {
   const lifecycleEvents = collectStepResultLifecycleEvents(params);
+  let canonicalEventsForPublication: WorkflowLifecycleEvent[] | undefined;
+  const isCompositeChild =
+    params.executionContext.foreachIndex !== undefined || params.executionContext.executionPath.length > 1;
+  const stepStatus = params.execResults.status as WorkflowRunStatus;
+  const workflowStatus =
+    !isCompositeChild && (stepStatus === 'suspended' || stepStatus === 'paused') ? stepStatus : 'running';
   if (!params.executionContext.transientExecution) {
     const outcome: PersistWorkflowStepUpdateResult | void = await params.engine.persistStepUpdate({
       workflowId: params.workflowId,
@@ -977,14 +1024,31 @@ async function persistThenPublishStepResult(params: {
         [params.stepId]: params.execResults,
       },
       executionContext: params.executionContext,
-      workflowStatus:
-        params.execResults.status === 'success' ? 'running' : (params.execResults.status as WorkflowRunStatus),
+      workflowStatus,
       requestContext: params.requestContext,
+      tracingContext: params.tracingContext,
       lifecycleEvents,
       phase: params.phase,
     });
-    if (outcome && outcome.status !== 'persisted') {
+    const needsAuthorityFallback = !outcome || (outcome.status === 'protected_state' && workflowStatus === 'running');
+    if (needsAuthorityFallback) {
+      const executionGeneration = requireWorkflowExecutionGeneration(
+        params.executionContext.executionGeneration,
+        `Workflow step result ${params.workflowId}/${params.runId}/${params.stepId}`,
+      );
+      const disposition = await params.engine.getAuthoritativeExecutionDisposition({
+        workflowId: params.workflowId,
+        runId: params.runId,
+        executionGeneration,
+      });
+      if (disposition) return true;
+    }
+    const isProtectedIntermediateWrite = outcome?.status === 'protected_state' && workflowStatus === 'running';
+    if (outcome && outcome.status !== 'persisted' && !isProtectedIntermediateWrite) {
       return true;
+    }
+    if (outcome?.status === 'persisted') {
+      canonicalEventsForPublication = outcome.acceptedEvents ?? [];
     }
   }
 
@@ -1005,6 +1069,7 @@ async function persistThenPublishStepResult(params: {
       pubsub: params.pubsub,
       runId: params.runId,
       emitLegacy: params.emitLegacy,
+      canonicalEvents: canonicalEventsForPublication,
     });
   });
   if (params.deferLifecycleResult) {
