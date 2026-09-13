@@ -1188,22 +1188,41 @@ describe('createToolCallStep tool approval workflow', () => {
       },
     } as any);
     const invalidCases = [
-      [{ approved: true, editedArgs: { unexpected: 'no' } }, makeSuspendData()],
-      [{ approved: false, editedArgs: { param: 'changed' } }, makeSuspendData()],
-      [{ approved: true, editedArgs: { resumeData: { approved: true } } }, makeSuspendData()],
-      [{ approved: true, editedArgs: { param: 'changed' } }, makeSuspendData('approval', 'tool-execution')],
+      [
+        { approved: true, editedArgs: { unexpected: 'no' } },
+        makeSuspendData(),
+        'Tool input validation failed for test-tool.',
+      ],
+      [
+        { approved: false, editedArgs: { param: 'changed' } },
+        makeSuspendData(),
+        'Tool resume evidence did not match the suspended tool call',
+      ],
+      [
+        { approved: true, editedArgs: { resumeData: { approved: true } } },
+        makeSuspendData(),
+        'Tool resume evidence did not match the suspended tool call',
+      ],
+      [
+        { approved: true, editedArgs: { param: 'changed' } },
+        makeSuspendData('approval', 'tool-execution'),
+        'Edited approval arguments require a regular tool-gate approval',
+      ],
       [
         { approved: true, editedArgs: { param: 'changed' } },
         { ...makeSuspendData(), suspendedToolRunId: 'delegate-run' },
+        'Edited approval arguments require a regular tool-gate approval',
       ],
       [
         { approved: true, editedArgs: { param: 'changed' } },
         { toolCallResume: { ...makeSuspendData().toolCallResume, identityDigest: 'tampered' } },
+        'Tool resume evidence did not match the suspended tool call',
       ],
     ] as const;
-    for (const [index, [resumeData, suspendData]] of invalidCases.entries()) {
+    for (const [index, [resumeData, suspendData, expectedMessage]] of invalidCases.entries()) {
       const result = await step.execute(makeExecuteParams({ resumeData, suspendData }));
-      expect(result.error ?? result.result?.error).toBeTruthy();
+      expect(result.error ?? result.result).toMatchObject({ message: expect.stringContaining(expectedMessage) });
+      expect(execute).not.toHaveBeenCalled();
       if (index === 0) {
         expect(pendingApprovalMessage.content.metadata.pendingToolApprovals).toBeUndefined();
         expect(flushMessages).toHaveBeenCalledOnce();

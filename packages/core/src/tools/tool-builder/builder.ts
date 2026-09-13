@@ -261,10 +261,12 @@ function buildJsonOverrideSchema(
   splicedJsonSchema: JSONSchema7Definition,
   injectedKeys: readonly string[],
 ): StandardSchemaWithJSON {
-  const hasOriginalNativeInputValidation = resolveNativeInputValidationSchema(originalSchema) !== undefined;
+  const nativeInputValidationSchema = resolveNativeInputValidationSchema(originalSchema);
+  const hasOriginalNativeInputValidation = nativeInputValidationSchema !== undefined;
   const fallback = toStandardSchema(splicedJsonSchema as any);
-  const original = originalSchema as { '~standard'?: { validate?: (v: unknown) => any } } | undefined;
-  const originalValidate = original?.['~standard']?.validate?.bind(original['~standard']);
+  const originalValidate = nativeInputValidationSchema?.['~standard']?.validate?.bind(
+    nativeInputValidationSchema['~standard'],
+  );
 
   // Standard Schema for *just* the injected override fields, so we can validate
   // malformed override payloads (e.g. `_background: { enabled: "yes" }`) before

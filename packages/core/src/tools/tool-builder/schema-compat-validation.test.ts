@@ -59,6 +59,55 @@ describe('CoreToolBuilder - Schema Compatibility in Validation', () => {
     expect(secondBuilt.approvalInputEditing).toBeUndefined();
   });
 
+  it('preserves async AI SDK validation through resume augmentation', async () => {
+    const execute = vi.fn(async (input: { note: string }) => input);
+    const inputSchema = aiSdkJsonSchema<{ note: string }>(
+      {
+        type: 'object',
+        properties: { note: { type: 'string' } },
+        required: ['note'],
+        additionalProperties: false,
+      },
+      {
+        validate: (async (value: unknown) => {
+          const note = (value as { note?: unknown })?.note;
+          if (typeof note !== 'string' || note === 'reject') {
+            return { success: false, error: new Error('Rejected note') };
+          }
+          return { success: true, value: { note: note.trim().toUpperCase() } };
+        }) as any,
+      },
+    );
+    const tool: ToolAction<any, any> = {
+      id: 'raw-async-validator-tool',
+      description: 'Raw AI SDK schema with async validation',
+      inputSchema,
+    };
+
+    const builder = new CoreToolBuilder({
+      originalTool: tool,
+      options: { name: 'raw-async-validator-tool', requestContext: new RequestContext() },
+      autoResumeSuspendedTools: true,
+    });
+    tool.execute = execute;
+    const built = builder.build();
+
+    await expect(
+      built.execute?.(
+        { note: ' accepted ' },
+        { abortSignal: new AbortController().signal, toolCallId: 'async-native-valid', messages: [] },
+      ),
+    ).resolves.toEqual({ note: 'ACCEPTED' });
+    await expect(
+      built.execute?.(
+        { note: 'reject' },
+        { abortSignal: new AbortController().signal, toolCallId: 'async-native-invalid', messages: [] },
+      ),
+    ).resolves.toMatchObject({ error: true });
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(execute).toHaveBeenCalledWith({ note: 'ACCEPTED' }, expect.any(Object));
+  });
+
   it('preserves async validation results in the native tool input schema', async () => {
     const inputSchema: StandardSchemaWithJSON = {
       '~standard': {

@@ -151,6 +151,19 @@ function toSignalDataPart(message: MastraDBMessage, contents: string): MastraMes
   } as MastraMessagePart;
 }
 
+function stripPrivateToolStateData(data: unknown) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    return data;
+  }
+
+  const {
+    approvedArgs: _approvedArgs,
+    approvalInputIdentityDigest: _approvalInputIdentityDigest,
+    ...publicStateData
+  } = data as Record<string, unknown>;
+  return publicStateData;
+}
+
 function stripPrivateToolStateMetadata(metadata: Record<string, unknown> | undefined) {
   if (!metadata) return undefined;
 
@@ -163,16 +176,7 @@ function stripPrivateToolStateMetadata(metadata: Record<string, unknown> | undef
 
     sanitizedMetadata[key] = Object.fromEntries(
       Object.entries(stateMetadata).map(([toolCallId, stateData]) => {
-        if (!stateData || typeof stateData !== 'object' || Array.isArray(stateData)) {
-          return [toolCallId, stateData];
-        }
-
-        const {
-          approvedArgs: _approvedArgs,
-          approvalInputIdentityDigest: _approvalInputIdentityDigest,
-          ...publicStateData
-        } = stateData as Record<string, unknown>;
-        return [toolCallId, publicStateData];
+        return [toolCallId, stripPrivateToolStateData(stateData)];
       }),
     );
   }
@@ -325,6 +329,11 @@ export class AIV4Adapter {
               toolInvocation,
             });
           }
+        } else if (part.type === 'data-tool-call-suspended' || part.type === 'data-tool-call-approval') {
+          parts.push({
+            ...part,
+            data: stripPrivateToolStateData(part.data),
+          });
         } else {
           parts.push(part);
         }

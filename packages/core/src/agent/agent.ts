@@ -225,6 +225,7 @@ import {
 import { TripWire } from './trip-wire';
 import type {
   AgentConfig,
+  AgentMemoryOption,
   AgentDurableOption,
   AgentGenerateOptions,
   AgentNotificationConfig,
@@ -407,6 +408,17 @@ function isReadOnlyMemoryExecution(memory: AgentExecutionOptions<any>['memory'])
 type AgentSnapshotMemoryInfo = {
   threadId?: string;
   resourceId?: string;
+};
+
+// Resume ownership can be checked with a resource alone when the caller's
+// run scope has no thread. Keep the public AgentMemoryOption contract intact;
+// this narrower private shape is only used by the ownership guards.
+type AgenticLoopResumeMemoryOption = Omit<AgentMemoryOption, 'thread'> & {
+  thread?: AgentMemoryOption['thread'];
+};
+
+type AgenticLoopResumeOwnershipOptions = {
+  memory?: AgenticLoopResumeMemoryOption;
 };
 
 /**
@@ -7784,7 +7796,7 @@ export class Agent<
     waitForToolCallId?: string;
     rowOwnership?: {
       requestContext?: RequestContext;
-      options?: AgentExecutionOptionsBase<any>;
+      options?: AgenticLoopResumeOwnershipOptions;
     };
   }) {
     const effectiveMastra = this.#mastra ?? (await this.#getOrCreateEphemeralMastra());
@@ -7869,7 +7881,7 @@ export class Agent<
 
   #getResumeCallerResourceId(
     requestContext: RequestContext | undefined,
-    options: AgentExecutionOptionsBase<any> | undefined,
+    options: AgenticLoopResumeOwnershipOptions | undefined,
     { trustMemoryResource = true }: { trustMemoryResource?: boolean } = {},
   ): string | undefined {
     const contextResourceId = requestContext?.get(MASTRA_RESOURCE_ID_KEY);
@@ -7898,7 +7910,7 @@ export class Agent<
     runThreadId?: string;
     snapshot?: any;
     requestContext?: RequestContext;
-    options?: AgentExecutionOptionsBase<any>;
+    options?: AgenticLoopResumeOwnershipOptions;
   }): void {
     const hasFga = Boolean(this.#mastra?.getServer()?.fga);
     const callerResourceId = this.#getResumeCallerResourceId(requestContext, options, {
@@ -8068,7 +8080,7 @@ export class Agent<
     runResourceId?: string;
     snapshot: any;
     requestContext?: RequestContext;
-    options?: AgentExecutionOptionsBase<any>;
+    options?: AgenticLoopResumeOwnershipOptions;
   }): { threadId?: string; resourceId?: string } | undefined {
     const snapshotMemoryInfo = this.#getAgenticLoopSnapshotMemoryInfo(snapshot);
     if (snapshotMemoryInfo === null) {
@@ -8290,9 +8302,9 @@ export class Agent<
     request: Parameters<AgenticLoopEditedApprovalResumeLoader>[0],
   ): Promise<Awaited<ReturnType<AgenticLoopEditedApprovalResumeLoader>>> {
     const memory =
-      request.threadId !== undefined
+      request.threadId !== undefined || request.resourceId !== undefined
         ? {
-            thread: request.threadId,
+            ...(request.threadId !== undefined ? { thread: request.threadId } : {}),
             ...(request.resourceId !== undefined ? { resource: request.resourceId } : {}),
           }
         : undefined;
@@ -8528,7 +8540,7 @@ export class Agent<
     snapshotMemoryInfo,
   }: {
     requestContext?: RequestContext;
-    memory?: AgentExecutionOptionsBase<any>['memory'];
+    memory?: AgenticLoopResumeMemoryOption;
     snapshotMemoryInfo?: AgentSnapshotMemoryInfo;
   }): string | undefined {
     const resourceIdFromContext = requestContext?.get(MASTRA_RESOURCE_ID_KEY) as string | undefined;
@@ -8551,7 +8563,7 @@ export class Agent<
     actor,
   }: {
     requestContext?: RequestContext;
-    memory?: AgentExecutionOptionsBase<any>['memory'];
+    memory?: AgenticLoopResumeMemoryOption;
     runId?: string;
     snapshotMemoryInfo?: AgentSnapshotMemoryInfo;
     agentId?: string;

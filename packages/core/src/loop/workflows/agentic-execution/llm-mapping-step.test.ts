@@ -1029,7 +1029,7 @@ describe('createLLMMappingStep tool execution error self-recovery (issue #9815)'
         toolCallId: 'provider-resume-call',
         resumeTargetToolCallId: 'original-pending-call',
         toolName: 'sensitiveTool',
-        args: { token: 'PRIVATE-APPROVED-TOKEN' },
+        args: { token: 'PRIVATE-ORIGINAL-TOKEN' },
         approvedArgs: { token: 'PRIVATE-APPROVED-TOKEN' },
         approval: { id: 'approval-original', approved: false, reason: 'Not safe' },
       },
@@ -1079,7 +1079,7 @@ describe('createLLMMappingStep tool execution error self-recovery (issue #9815)'
           toolInvocation: expect.objectContaining({
             state: 'result',
             toolCallId: 'provider-resume-call',
-            args: { token: 'PRIVATE-APPROVED-TOKEN' },
+            args: { token: 'PRIVATE-ORIGINAL-TOKEN' },
             result: 'Not safe',
           }),
         }),
@@ -1115,7 +1115,7 @@ describe('createLLMMappingStep tool execution error self-recovery (issue #9815)'
     expect(publicToolResultChunk).toMatchObject({
       type: 'tool-result',
       payload: {
-        args: { token: 'PRIVATE-APPROVED-TOKEN' },
+        args: { token: 'PRIVATE-ORIGINAL-TOKEN' },
         toolCallId: 'provider-resume-call',
         result: 'Not safe',
       },
@@ -1132,13 +1132,13 @@ describe('createLLMMappingStep tool execution error self-recovery (issue #9815)'
     expect(displayInputTransform).toHaveBeenCalledWith(
       expect.objectContaining({
         phase: 'input-available',
-        input: { token: 'PRIVATE-APPROVED-TOKEN' },
+        input: { token: 'PRIVATE-ORIGINAL-TOKEN' },
       }),
     );
     expect(transcriptInputTransform).toHaveBeenCalledWith(
       expect.objectContaining({
         phase: 'input-available',
-        input: { token: 'PRIVATE-APPROVED-TOKEN' },
+        input: { token: 'PRIVATE-ORIGINAL-TOKEN' },
       }),
     );
     expect(displayOutputTransform).not.toHaveBeenCalled();
