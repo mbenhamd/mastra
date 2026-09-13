@@ -15,6 +15,18 @@ import type { Step } from './step';
 import type { FormattedWorkflowResult, StepResult } from './types';
 import { createStep } from './workflow';
 
+class Counter {
+  #value: number;
+
+  constructor(value: number) {
+    this.#value = value;
+  }
+
+  read() {
+    return this.#value;
+  }
+}
+
 class TestableExecutionEngine extends DefaultExecutionEngine {
   async fmtReturnValuePublic(
     pubsub: PubSub,
@@ -2054,4 +2066,67 @@ describe('DefaultExecutionEngine workflow state representation', () => {
       }
     },
   );
+
+  it.each([false, true])('preserves %s Counter state through sequential setState', async frozen => {
+    const initial = frozen ? Object.freeze(new Counter(1)) : new Counter(1);
+    const update = new Counter(2);
+    const storage = new MockStore();
+    const workflowsStore = await storage.getStore('workflows');
+    const persistedStates: unknown[] = [];
+    const persistWorkflowStepUpdate = workflowsStore!.persistWorkflowStepUpdate.bind(workflowsStore);
+    const persistSpy = vi.spyOn(workflowsStore!, 'persistWorkflowStepUpdate').mockImplementation(async input => {
+      await new Promise(resolve => setTimeout(resolve, 0));
+      persistedStates.push(input.snapshot.value);
+      return persistWorkflowStepUpdate(input);
+    });
+    const first = createStep({
+      id: 'first-counter',
+      inputSchema: z.number(),
+      outputSchema: z.number(),
+      execute: async ({ setState }) => {
+        await setState(update);
+        return 0;
+      },
+    });
+    let observedState: unknown;
+    const second = createStep({
+      id: 'second-counter',
+      inputSchema: z.number(),
+      outputSchema: z.number(),
+      execute: async ({ state }) => {
+        observedState = state;
+        return state.read();
+      },
+    });
+    const workflow = createWorkflow({
+      id: `counter-state-${frozen}`,
+      inputSchema: z.number(),
+      outputSchema: z.number(),
+    })
+      .then(first)
+      .then(second)
+      .commit();
+    const mastra = new Mastra({ logger: false, storage, workflows: { [workflow.id]: workflow } });
+
+    try {
+      const run = await workflow.createRun();
+      const result = await run.start({
+        inputData: 0,
+        initialState: initial,
+        outputOptions: { includeState: true },
+      });
+
+      expect(result.status).toBe('success');
+      expect(persistedStates[0]).toBe(initial);
+      expect(persistedStates[0]).toBeInstanceOf(Counter);
+      expect(persistedStates).toContain(update);
+      expect((persistedStates[1] as Counter).read()).toBe(2);
+      expect((observedState as Counter).read()).toBe(2);
+      expect((result.state as Counter).read()).toBe(2);
+      expect(result.result).toBe(2);
+    } finally {
+      persistSpy.mockRestore();
+      await mastra.shutdown();
+    }
+  });
 });
