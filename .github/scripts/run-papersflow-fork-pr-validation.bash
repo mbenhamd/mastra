@@ -181,14 +181,22 @@ pf4163_config() {
   PF4163_PENDING_MERGE_COMMIT='PENDING_PF4163_MERGE_COMMIT'
   PF4163_PENDING_FORK_PARENT='PENDING_PF4163_FORK_PARENT'
   PF4163_PENDING_REVIEWED_TREE='PENDING_PF4163_REVIEWED_TREE'
+  PF4163_PENDING_CORRECTION_HEAD='PENDING_PF4163_CORRECTION_HEAD'
+  PF4163_PENDING_CORRECTION_TREE='PENDING_PF4163_CORRECTION_TREE'
+  # S is the reviewed source merge. R is pinned only after its ordinary
+  # correction commit and tree have completed review.
   PF4163_MERGE_COMMIT="${PAPERSFLOW_PF4163_MERGE_COMMIT:-d82d954d4f0cf863b9e5a2634122eb5c2d904efc}"
   PF4163_FORK_PARENT="${PAPERSFLOW_PF4163_FORK_PARENT:-207efdbf9920909d9444709849791d0a6d42fdfd}"
   PF4163_UPSTREAM_PARENT="${PAPERSFLOW_PF4163_UPSTREAM_PARENT:-23c232d780afe4fca07f7729f2d698cc15bb1d20}"
   PF4163_REVIEWED_TREE="${PAPERSFLOW_PF4163_REVIEWED_TREE:-4840e0ce8c48c9b85c1fd23beab43125877001a6}"
+  PF4163_CORRECTION_HEAD="${PAPERSFLOW_PF4163_CORRECTION_HEAD:-b298af9673713b64da4c87c5192fd324bd2035fc}"
+  PF4163_CORRECTION_TREE="${PAPERSFLOW_PF4163_CORRECTION_TREE:-18619ba2efff2305f3f25142fdfb877297a2cf61}"
   readonly \
     PF4163_HEAD_REPOSITORY PF4163_HEAD_REF PF4163_BASE_REF \
     PF4163_MERGE_COMMIT PF4163_FORK_PARENT PF4163_UPSTREAM_PARENT PF4163_REVIEWED_TREE \
-    PF4163_PENDING_MERGE_COMMIT PF4163_PENDING_FORK_PARENT PF4163_PENDING_REVIEWED_TREE
+    PF4163_CORRECTION_HEAD PF4163_CORRECTION_TREE \
+    PF4163_PENDING_MERGE_COMMIT PF4163_PENDING_FORK_PARENT PF4163_PENDING_REVIEWED_TREE \
+    PF4163_PENDING_CORRECTION_HEAD PF4163_PENDING_CORRECTION_TREE
 }
 
 pf4163_install_allowlist() {
@@ -686,54 +694,74 @@ verify_pf4163_reviewed_merge() (
   : "${BASE_SHA:?BASE_SHA is required}"
   : "${HEAD_SHA:?HEAD_SHA is required}"
 
-  local merge_topology actual_tree protected_merge_bases
+  local correction_topology actual_correction_tree source_topology actual_source_tree
+  local protected_merge_bases
 
   if [[ "$PF4163_MERGE_COMMIT" == "$PF4163_PENDING_MERGE_COMMIT" || \
     "$PF4163_FORK_PARENT" == "$PF4163_PENDING_FORK_PARENT" || \
-    "$PF4163_REVIEWED_TREE" == "$PF4163_PENDING_REVIEWED_TREE" ]]; then
+    "$PF4163_REVIEWED_TREE" == "$PF4163_PENDING_REVIEWED_TREE" || \
+    "$PF4163_CORRECTION_HEAD" == "$PF4163_PENDING_CORRECTION_HEAD" || \
+    "$PF4163_CORRECTION_TREE" == "$PF4163_PENDING_CORRECTION_TREE" ]]; then
     echo 'PF-4163 exact-sync admission pins are pending; refusing admission.' >&2
     return 1
   fi
 
-  if [[ "$HEAD_SHA" != "$PF4163_MERGE_COMMIT" ]]; then
-    echo 'PF-4163 head is not the exact reviewed merge commit.' >&2
-    echo "expected: $PF4163_MERGE_COMMIT" >&2
+  if [[ "$HEAD_SHA" != "$PF4163_CORRECTION_HEAD" ]]; then
+    echo 'PF-4163 head is not the exact reviewed correction commit.' >&2
+    echo "expected: $PF4163_CORRECTION_HEAD" >&2
     echo "actual:   $HEAD_SHA" >&2
     return 1
   fi
 
-  merge_topology="$(git rev-list --parents -n 1 "$HEAD_SHA")"
-  if [[ "$merge_topology" != "$HEAD_SHA $PF4163_FORK_PARENT $PF4163_UPSTREAM_PARENT" ]]; then
-    echo 'PF-4163 head is not the exact reviewed two-parent upstream merge topology.' >&2
-    echo "expected: $HEAD_SHA $PF4163_FORK_PARENT $PF4163_UPSTREAM_PARENT" >&2
-    echo "actual:   $merge_topology" >&2
+  correction_topology="$(git rev-list --parents -n 1 "$HEAD_SHA")"
+  if [[ "$correction_topology" != "$HEAD_SHA $PF4163_MERGE_COMMIT" ]]; then
+    echo 'PF-4163 correction head is not the exact reviewed single-parent correction atop the source merge.' >&2
+    echo "expected: $HEAD_SHA $PF4163_MERGE_COMMIT" >&2
+    echo "actual:   $correction_topology" >&2
     return 1
   fi
 
-  actual_tree="$(git rev-parse "$HEAD_SHA^{tree}")"
-  if [[ "$actual_tree" != "$PF4163_REVIEWED_TREE" ]]; then
-    echo 'PF-4163 head tree does not match the reviewed merge tree.' >&2
+  actual_correction_tree="$(git rev-parse "$HEAD_SHA^{tree}")"
+  if [[ "$actual_correction_tree" != "$PF4163_CORRECTION_TREE" ]]; then
+    echo 'PF-4163 correction head tree does not match the reviewed correction tree.' >&2
+    echo "expected: $PF4163_CORRECTION_TREE" >&2
+    echo "actual:   $actual_correction_tree" >&2
+    return 1
+  fi
+
+  source_topology="$(git rev-list --parents -n 1 "$PF4163_MERGE_COMMIT")"
+  if [[ "$source_topology" != "$PF4163_MERGE_COMMIT $PF4163_FORK_PARENT $PF4163_UPSTREAM_PARENT" ]]; then
+    echo 'PF-4163 source merge is not the exact reviewed two-parent upstream merge topology.' >&2
+    echo "expected: $PF4163_MERGE_COMMIT $PF4163_FORK_PARENT $PF4163_UPSTREAM_PARENT" >&2
+    echo "actual:   $source_topology" >&2
+    return 1
+  fi
+
+  actual_source_tree="$(git rev-parse "$PF4163_MERGE_COMMIT^{tree}")"
+  if [[ "$actual_source_tree" != "$PF4163_REVIEWED_TREE" ]]; then
+    echo 'PF-4163 source merge tree does not match the reviewed source merge tree.' >&2
     echo "expected: $PF4163_REVIEWED_TREE" >&2
-    echo "actual:   $actual_tree" >&2
+    echo "actual:   $actual_source_tree" >&2
     return 1
   fi
 
-  # The source reconciles the exact fork main F with the reviewed official
-  # upstream parent. A later CI-only protected-base advance C is accepted only
-  # when C and the source merge S still meet exactly at F.
+  # The source merge reconciles the exact fork main F with the reviewed official
+  # upstream parent. The correction is one ordinary commit directly atop S.
+  # A later CI-only protected-base advance C is accepted only when C and S
+  # still meet exactly at F.
   if ! git merge-base --is-ancestor "$PF4163_FORK_PARENT" "$BASE_SHA"; then
     echo 'PF-4163 protected base does not descend from the reviewed fork parent.' >&2
     return 1
   fi
-  protected_merge_bases="$(git merge-base --all "$BASE_SHA" "$HEAD_SHA")"
+  protected_merge_bases="$(git merge-base --all "$BASE_SHA" "$PF4163_MERGE_COMMIT")"
   if [[ "$protected_merge_bases" != "$PF4163_FORK_PARENT" ]]; then
-    echo 'PF-4163 protected base and reviewed head no longer meet at the reviewed fork parent.' >&2
+    echo 'PF-4163 protected base and source merge no longer meet at the reviewed fork parent.' >&2
     echo "expected: $PF4163_FORK_PARENT" >&2
     echo "actual:   $protected_merge_bases" >&2
     return 1
   fi
-  if ! git merge-base --is-ancestor "$PF4163_UPSTREAM_PARENT" "$HEAD_SHA"; then
-    echo 'PF-4163 head does not contain the reviewed official upstream parent.' >&2
+  if ! git merge-base --is-ancestor "$PF4163_UPSTREAM_PARENT" "$PF4163_MERGE_COMMIT"; then
+    echo 'PF-4163 source merge does not contain the reviewed official upstream parent.' >&2
     return 1
   fi
 
@@ -1432,17 +1460,18 @@ classify_install_lane() (
     packages/_types-builder/package.json packages/agent-builder/package.json |
     sort -u > "$manifest_changes"
 
-  # PF-4163 is frozen to one reviewed two-parent merge S(F,U), its reviewed
-  # tree, source branch, repository, and upstream parent. The protected-base
-  # advance C may contain CI policy only, but must meet S exactly at F. Its
-  # install graph is frozen to the complete reviewed 115-path manifest,
-  # workspace, lockfile, config, and patch surface; the six manually resolved
-  # graph files are a separately recorded provenance subset.
+  # PF-4163 is frozen to one reviewed source merge S(F,U), its source tree,
+  # and one exact correction R directly atop S, alongside the source branch,
+  # repository, and upstream parent. The protected-base advance C may contain
+  # CI policy only, but must meet S exactly at F. Its install graph is frozen
+  # to the complete reviewed 115-path manifest, workspace, lockfile, config,
+  # and patch surface; the six manually resolved graph files are a separately
+  # recorded provenance subset.
   pf4163_config
   if [[ "${HEAD_REPOSITORY:-}" == "$PF4163_HEAD_REPOSITORY" && \
     "${HEAD_REF:-}" == "$PF4163_HEAD_REF" && "${BASE_REF:-}" == "$PF4163_BASE_REF" ]]; then
     verify_pf4163_reviewed_merge
-    echo 'PF-4163 exact two-parent upstream merge, reviewed tree, ancestry, and install allowlist accepted from trusted base policy.'
+    echo 'PF-4163 exact correction atop reviewed source merge, source topology/tree, ancestry, and install allowlist accepted from trusted base policy.'
     emit_validation_lane pf4163-upstream-sync
     return
   fi
@@ -3388,9 +3417,16 @@ run_pf3375_admission_self_tests() (
 
 run_pf4163_admission_self_tests() (
   local script_path test_root fixture_repo common_sha fork_parent upstream_parent
-  local reviewed_head reviewed_tree protected_base extra_intersection_base
-  local forged_tree forged_head reversed_head extra_parent octopus_head non_merge_head
-  local wrong_graph_tree wrong_graph_head nested_graph_tree nested_graph_head
+  local source_merge source_tree correction_head correction_tree
+  local protected_base extra_intersection_base
+  local forged_correction_tree forged_correction_head
+  local unreviewed_descendant_tree unreviewed_descendant_head
+  local wrong_parent_head extra_parent_head
+  local reversed_source_merge reversed_source_correction
+  local extra_source_parent octopus_source_merge octopus_source_correction
+  local non_merge_source_merge non_merge_source_correction
+  local altered_source_tree altered_source_merge altered_source_correction altered_correction_tree
+  local wrong_graph_tree wrong_graph_correction_head nested_graph_tree nested_graph_correction_head
   local output path
 
   script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
@@ -3436,8 +3472,8 @@ run_pf4163_admission_self_tests() (
   git -C "$fixture_repo" commit -q -m fork
   fork_parent="$(git -C "$fixture_repo" rev-parse HEAD)"
   git -C "$fixture_repo" merge -q --no-ff upstream -m 'reviewed upstream merge'
-  reviewed_head="$(git -C "$fixture_repo" rev-parse HEAD)"
-  reviewed_tree="$(git -C "$fixture_repo" rev-parse "$reviewed_head^{tree}")"
+  source_merge="$(git -C "$fixture_repo" rev-parse HEAD)"
+  source_tree="$(git -C "$fixture_repo" rev-parse "$source_merge^{tree}")"
 
   git -C "$fixture_repo" switch -q -c protected-base "$fork_parent"
   mkdir -p "$fixture_repo/.github"
@@ -3446,36 +3482,79 @@ run_pf4163_admission_self_tests() (
   git -C "$fixture_repo" commit -q -m 'advance protected policy'
   protected_base="$(git -C "$fixture_repo" rev-parse HEAD)"
   extra_intersection_base="$(printf 'extra merge base\n' | git -C "$fixture_repo" commit-tree \
-    "$reviewed_tree" -p "$protected_base" -p "$upstream_parent")"
+    "$source_tree" -p "$protected_base" -p "$upstream_parent")"
 
-  git -C "$fixture_repo" switch -q --detach "$reviewed_head"
+  git -C "$fixture_repo" switch -q --detach "$source_merge"
+  printf 'reviewed correction\n' > "$fixture_repo/correction.txt"
+  git -C "$fixture_repo" add correction.txt
+  correction_tree="$(git -C "$fixture_repo" write-tree)"
+  git -C "$fixture_repo" reset -q --hard "$source_merge"
+  correction_head="$(printf 'reviewed correction\n' | git -C "$fixture_repo" commit-tree \
+    "$correction_tree" -p "$source_merge")"
+
   printf 'not reviewed\n' > "$fixture_repo/forged.txt"
   git -C "$fixture_repo" add forged.txt
-  forged_tree="$(git -C "$fixture_repo" write-tree)"
-  git -C "$fixture_repo" reset -q --hard "$reviewed_head"
-  forged_head="$(printf 'forged tree\n' | git -C "$fixture_repo" commit-tree \
-    "$forged_tree" -p "$fork_parent" -p "$upstream_parent")"
-  reversed_head="$(printf 'reversed parents\n' | git -C "$fixture_repo" commit-tree \
-    "$reviewed_tree" -p "$upstream_parent" -p "$fork_parent")"
-  extra_parent="$(printf 'extra parent\n' | git -C "$fixture_repo" commit-tree \
+  forged_correction_tree="$(git -C "$fixture_repo" write-tree)"
+  git -C "$fixture_repo" reset -q --hard "$source_merge"
+  forged_correction_head="$(printf 'forged correction tree\n' | git -C "$fixture_repo" commit-tree \
+    "$forged_correction_tree" -p "$source_merge")"
+
+  git -C "$fixture_repo" switch -q --detach "$correction_head"
+  printf 'unreviewed descendant\n' > "$fixture_repo/unreviewed.txt"
+  git -C "$fixture_repo" add unreviewed.txt
+  unreviewed_descendant_tree="$(git -C "$fixture_repo" write-tree)"
+  git -C "$fixture_repo" reset -q --hard "$correction_head"
+  unreviewed_descendant_head="$(printf 'unreviewed descendant\n' | git -C "$fixture_repo" commit-tree \
+    "$unreviewed_descendant_tree" -p "$correction_head")"
+
+  wrong_parent_head="$(printf 'wrong correction parent\n' | git -C "$fixture_repo" commit-tree \
+    "$correction_tree" -p "$upstream_parent")"
+  extra_parent_head="$(printf 'extra correction parent\n' | git -C "$fixture_repo" commit-tree \
+    "$correction_tree" -p "$source_merge" -p "$common_sha")"
+
+  reversed_source_merge="$(printf 'reversed source parents\n' | git -C "$fixture_repo" commit-tree \
+    "$source_tree" -p "$upstream_parent" -p "$fork_parent")"
+  reversed_source_correction="$(printf 'correction atop reversed source\n' | git -C "$fixture_repo" commit-tree \
+    "$correction_tree" -p "$reversed_source_merge")"
+  extra_source_parent="$(printf 'extra source parent\n' | git -C "$fixture_repo" commit-tree \
     "$common_sha^{tree}" -p "$common_sha")"
-  octopus_head="$(printf 'octopus merge\n' | git -C "$fixture_repo" commit-tree \
-    "$reviewed_tree" -p "$fork_parent" -p "$upstream_parent" -p "$extra_parent")"
-  non_merge_head="$(printf 'not a merge\n' | git -C "$fixture_repo" commit-tree \
-    "$reviewed_tree" -p "$fork_parent")"
+  octopus_source_merge="$(printf 'octopus source merge\n' | git -C "$fixture_repo" commit-tree \
+    "$source_tree" -p "$fork_parent" -p "$upstream_parent" -p "$extra_source_parent")"
+  octopus_source_correction="$(printf 'correction atop octopus source\n' | git -C "$fixture_repo" commit-tree \
+    "$correction_tree" -p "$octopus_source_merge")"
+  non_merge_source_merge="$(printf 'non-merge source\n' | git -C "$fixture_repo" commit-tree \
+    "$source_tree" -p "$fork_parent")"
+  non_merge_source_correction="$(printf 'correction atop non-merge source\n' | git -C "$fixture_repo" commit-tree \
+    "$correction_tree" -p "$non_merge_source_merge")"
+
+  printf 'altered source merge\n' > "$fixture_repo/altered-source.txt"
+  git -C "$fixture_repo" add altered-source.txt
+  altered_source_tree="$(git -C "$fixture_repo" write-tree)"
+  git -C "$fixture_repo" reset -q --hard "$source_merge"
+  altered_source_merge="$(printf 'altered source merge tree\n' | git -C "$fixture_repo" commit-tree \
+    "$altered_source_tree" -p "$fork_parent" -p "$upstream_parent")"
+  git -C "$fixture_repo" switch -q --detach "$altered_source_merge"
+  printf 'altered correction\n' > "$fixture_repo/altered-correction.txt"
+  git -C "$fixture_repo" add altered-correction.txt
+  altered_correction_tree="$(git -C "$fixture_repo" write-tree)"
+  git -C "$fixture_repo" reset -q --hard "$altered_source_merge"
+  altered_source_correction="$(printf 'correction atop altered source\n' | git -C "$fixture_repo" commit-tree \
+    "$altered_correction_tree" -p "$altered_source_merge")"
+
+  git -C "$fixture_repo" switch -q --detach "$source_merge"
   printf '{"name":"unreviewed-fixture"}\n' > "$fixture_repo/package.json"
   git -C "$fixture_repo" add package.json
   wrong_graph_tree="$(git -C "$fixture_repo" write-tree)"
-  git -C "$fixture_repo" reset -q --hard "$reviewed_head"
-  wrong_graph_head="$(printf 'unreviewed dependency graph\n' | git -C "$fixture_repo" commit-tree \
-    "$wrong_graph_tree" -p "$fork_parent" -p "$upstream_parent")"
+  git -C "$fixture_repo" reset -q --hard "$source_merge"
+  wrong_graph_correction_head="$(printf 'unreviewed dependency graph\n' | git -C "$fixture_repo" commit-tree \
+    "$wrong_graph_tree" -p "$source_merge")"
   mkdir -p "$fixture_repo/packages/unlisted"
   printf '{"name":"unlisted-fixture"}\n' > "$fixture_repo/packages/unlisted/package.json"
   git -C "$fixture_repo" add packages/unlisted/package.json
   nested_graph_tree="$(git -C "$fixture_repo" write-tree)"
-  git -C "$fixture_repo" reset -q --hard "$reviewed_head"
-  nested_graph_head="$(printf 'unlisted nested dependency graph\n' | git -C "$fixture_repo" commit-tree \
-    "$nested_graph_tree" -p "$fork_parent" -p "$upstream_parent")"
+  git -C "$fixture_repo" reset -q --hard "$source_merge"
+  nested_graph_correction_head="$(printf 'unlisted nested dependency graph\n' | git -C "$fixture_repo" commit-tree \
+    "$nested_graph_tree" -p "$source_merge")"
 
   run_fixture_admission() {
     local fixture_head="$1"
@@ -3489,20 +3568,22 @@ run_pf4163_admission_self_tests() (
         HEAD_REPOSITORY=mbenhamd/mastra \
         HEAD_REF=feature/pf-4163-mastra-upstream-sync-23c232d7 \
         BASE_REF=main \
-        PAPERSFLOW_PF4163_MERGE_COMMIT="$reviewed_head" \
+        PAPERSFLOW_PF4163_MERGE_COMMIT="$source_merge" \
         PAPERSFLOW_PF4163_FORK_PARENT="$fork_parent" \
         PAPERSFLOW_PF4163_UPSTREAM_PARENT="$upstream_parent" \
-        PAPERSFLOW_PF4163_REVIEWED_TREE="$reviewed_tree" \
+        PAPERSFLOW_PF4163_REVIEWED_TREE="$source_tree" \
+        PAPERSFLOW_PF4163_CORRECTION_HEAD="$correction_head" \
+        PAPERSFLOW_PF4163_CORRECTION_TREE="$correction_tree" \
         "$@" bash "$script_path" --classify-install
     ) > "$fixture_output" 2>&1
   }
 
   output="$test_root/approved.log"
-  run_fixture_admission "$reviewed_head" "$output"
+  run_fixture_admission "$correction_head" "$output"
   grep -Fxq 'lane=pf4163-upstream-sync' "$output"
 
-  output="$test_root/pending-pins.log"
-  if run_fixture_admission "$reviewed_head" "$output" \
+  output="$test_root/pending-merge-pin.log"
+  if run_fixture_admission "$correction_head" "$output" \
     PAPERSFLOW_PF4163_MERGE_COMMIT=PENDING_PF4163_MERGE_COMMIT; then
     echo 'PF-4163 pending merge pin unexpectedly passed admission.' >&2
     return 1
@@ -3510,7 +3591,7 @@ run_pf4163_admission_self_tests() (
   grep -Fq 'exact-sync admission pins are pending' "$output"
 
   output="$test_root/pending-fork-parent.log"
-  if run_fixture_admission "$reviewed_head" "$output" \
+  if run_fixture_admission "$correction_head" "$output" \
     PAPERSFLOW_PF4163_FORK_PARENT=PENDING_PF4163_FORK_PARENT; then
     echo 'PF-4163 pending fork-parent pin unexpectedly passed admission.' >&2
     return 1
@@ -3518,93 +3599,145 @@ run_pf4163_admission_self_tests() (
   grep -Fq 'exact-sync admission pins are pending' "$output"
 
   output="$test_root/pending-reviewed-tree.log"
-  if run_fixture_admission "$reviewed_head" "$output" \
+  if run_fixture_admission "$correction_head" "$output" \
     PAPERSFLOW_PF4163_REVIEWED_TREE=PENDING_PF4163_REVIEWED_TREE; then
     echo 'PF-4163 pending reviewed-tree pin unexpectedly passed admission.' >&2
     return 1
   fi
   grep -Fq 'exact-sync admission pins are pending' "$output"
 
+  output="$test_root/pending-correction-head.log"
+  if run_fixture_admission "$correction_head" "$output" \
+    PAPERSFLOW_PF4163_CORRECTION_HEAD=PENDING_PF4163_CORRECTION_HEAD; then
+    echo 'PF-4163 pending correction-head pin unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'exact-sync admission pins are pending' "$output"
+
+  output="$test_root/pending-correction-tree.log"
+  if run_fixture_admission "$correction_head" "$output" \
+    PAPERSFLOW_PF4163_CORRECTION_TREE=PENDING_PF4163_CORRECTION_TREE; then
+    echo 'PF-4163 pending correction-tree pin unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'exact-sync admission pins are pending' "$output"
+
   output="$test_root/wrong-sha.log"
-  if run_fixture_admission "$reviewed_head" "$output" \
-    PAPERSFLOW_PF4163_MERGE_COMMIT="$fork_parent"; then
-    echo 'PF-4163 head with a wrong reviewed SHA unexpectedly passed admission.' >&2
+  if run_fixture_admission "$correction_head" "$output" \
+    PAPERSFLOW_PF4163_CORRECTION_HEAD="$source_merge"; then
+    echo 'PF-4163 head with a wrong reviewed correction SHA unexpectedly passed admission.' >&2
     return 1
   fi
-  grep -Fq 'head is not the exact reviewed merge commit' "$output"
+  grep -Fq 'head is not the exact reviewed correction commit' "$output"
 
-  output="$test_root/forged-tree.log"
-  if run_fixture_admission "$forged_head" "$output" \
-    PAPERSFLOW_PF4163_MERGE_COMMIT="$forged_head"; then
-    echo 'PF-4163 forged tree with the reviewed parents unexpectedly passed admission.' >&2
+  output="$test_root/unreviewed-descendant.log"
+  if run_fixture_admission "$unreviewed_descendant_head" "$output"; then
+    echo 'PF-4163 unreviewed correction descendant unexpectedly passed admission.' >&2
     return 1
   fi
-  grep -Fq 'head tree does not match the reviewed merge tree' "$output"
+  grep -Fq 'head is not the exact reviewed correction commit' "$output"
 
-  output="$test_root/reversed-parents.log"
-  if run_fixture_admission "$reversed_head" "$output" \
-    PAPERSFLOW_PF4163_MERGE_COMMIT="$reversed_head"; then
-    echo 'PF-4163 reversed parent order unexpectedly passed admission.' >&2
+  output="$test_root/forged-correction-tree.log"
+  if run_fixture_admission "$forged_correction_head" "$output" \
+    PAPERSFLOW_PF4163_CORRECTION_HEAD="$forged_correction_head"; then
+    echo 'PF-4163 forged correction tree unexpectedly passed admission.' >&2
     return 1
   fi
-  grep -Fq 'not the exact reviewed two-parent upstream merge topology' "$output"
+  grep -Fq 'correction head tree does not match the reviewed correction tree' "$output"
 
-  output="$test_root/octopus.log"
-  if run_fixture_admission "$octopus_head" "$output" \
-    PAPERSFLOW_PF4163_MERGE_COMMIT="$octopus_head"; then
-    echo 'PF-4163 octopus merge unexpectedly passed admission.' >&2
+  output="$test_root/wrong-correction-parent.log"
+  if run_fixture_admission "$wrong_parent_head" "$output" \
+    PAPERSFLOW_PF4163_CORRECTION_HEAD="$wrong_parent_head"; then
+    echo 'PF-4163 correction with a wrong parent unexpectedly passed admission.' >&2
     return 1
   fi
-  grep -Fq 'not the exact reviewed two-parent upstream merge topology' "$output"
+  grep -Fq 'single-parent correction atop the source merge' "$output"
 
-  output="$test_root/non-merge.log"
-  if run_fixture_admission "$non_merge_head" "$output" \
-    PAPERSFLOW_PF4163_MERGE_COMMIT="$non_merge_head"; then
-    echo 'PF-4163 non-merge head unexpectedly passed admission.' >&2
+  output="$test_root/extra-correction-parent.log"
+  if run_fixture_admission "$extra_parent_head" "$output" \
+    PAPERSFLOW_PF4163_CORRECTION_HEAD="$extra_parent_head"; then
+    echo 'PF-4163 correction with an extra parent unexpectedly passed admission.' >&2
     return 1
   fi
-  grep -Fq 'not the exact reviewed two-parent upstream merge topology' "$output"
+  grep -Fq 'single-parent correction atop the source merge' "$output"
+
+  output="$test_root/reversed-source-parents.log"
+  if run_fixture_admission "$reversed_source_correction" "$output" \
+    PAPERSFLOW_PF4163_MERGE_COMMIT="$reversed_source_merge" \
+    PAPERSFLOW_PF4163_CORRECTION_HEAD="$reversed_source_correction"; then
+    echo 'PF-4163 reversed source parent order unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'source merge is not the exact reviewed two-parent upstream merge topology' "$output"
+
+  output="$test_root/octopus-source.log"
+  if run_fixture_admission "$octopus_source_correction" "$output" \
+    PAPERSFLOW_PF4163_MERGE_COMMIT="$octopus_source_merge" \
+    PAPERSFLOW_PF4163_CORRECTION_HEAD="$octopus_source_correction"; then
+    echo 'PF-4163 octopus source merge unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'source merge is not the exact reviewed two-parent upstream merge topology' "$output"
+
+  output="$test_root/non-merge-source.log"
+  if run_fixture_admission "$non_merge_source_correction" "$output" \
+    PAPERSFLOW_PF4163_MERGE_COMMIT="$non_merge_source_merge" \
+    PAPERSFLOW_PF4163_CORRECTION_HEAD="$non_merge_source_correction"; then
+    echo 'PF-4163 non-merge source unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'source merge is not the exact reviewed two-parent upstream merge topology' "$output"
+
+  output="$test_root/altered-source-merge.log"
+  if run_fixture_admission "$altered_source_correction" "$output" \
+    PAPERSFLOW_PF4163_MERGE_COMMIT="$altered_source_merge" \
+    PAPERSFLOW_PF4163_CORRECTION_HEAD="$altered_source_correction" \
+    PAPERSFLOW_PF4163_CORRECTION_TREE="$altered_correction_tree"; then
+    echo 'PF-4163 altered source merge unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'source merge tree does not match the reviewed source merge tree' "$output"
 
   output="$test_root/untrusted-base.log"
-  if run_fixture_admission "$reviewed_head" "$output" BASE_SHA="$common_sha"; then
+  if run_fixture_admission "$correction_head" "$output" BASE_SHA="$common_sha"; then
     echo 'PF-4163 base outside the reviewed fork lineage unexpectedly passed admission.' >&2
     return 1
   fi
   grep -Fq 'protected base does not descend from the reviewed fork parent' "$output"
 
-  output="$test_root/base-contained-in-head.log"
-  if run_fixture_admission "$reviewed_head" "$output" BASE_SHA="$reviewed_head"; then
-    echo 'PF-4163 base/head intersection beyond the reviewed fork parent unexpectedly passed admission.' >&2
+  output="$test_root/base-contained-in-correction.log"
+  if run_fixture_admission "$correction_head" "$output" BASE_SHA="$correction_head"; then
+    echo 'PF-4163 base containing the reviewed correction unexpectedly passed admission.' >&2
     return 1
   fi
   grep -Fq 'no longer meet at the reviewed fork parent' "$output"
 
   output="$test_root/extra-best-merge-base.log"
-  if run_fixture_admission "$reviewed_head" "$output" BASE_SHA="$extra_intersection_base"; then
+  if run_fixture_admission "$correction_head" "$output" BASE_SHA="$extra_intersection_base"; then
     echo 'PF-4163 extra best protected-base intersection unexpectedly passed admission.' >&2
     return 1
   fi
   grep -Fq 'no longer meet at the reviewed fork parent' "$output"
 
   output="$test_root/unapproved-install-path.log"
-  if run_fixture_admission "$wrong_graph_head" "$output" \
-    PAPERSFLOW_PF4163_MERGE_COMMIT="$wrong_graph_head" \
-    PAPERSFLOW_PF4163_REVIEWED_TREE="$wrong_graph_tree"; then
+  if run_fixture_admission "$wrong_graph_correction_head" "$output" \
+    PAPERSFLOW_PF4163_CORRECTION_HEAD="$wrong_graph_correction_head" \
+    PAPERSFLOW_PF4163_CORRECTION_TREE="$wrong_graph_tree"; then
     echo 'PF-4163 unapproved dependency-graph path unexpectedly passed admission.' >&2
     return 1
   fi
   grep -Fq 'outside the frozen install allowlist' "$output"
 
   output="$test_root/unapproved-nested-install-path.log"
-  if run_fixture_admission "$nested_graph_head" "$output" \
-    PAPERSFLOW_PF4163_MERGE_COMMIT="$nested_graph_head" \
-    PAPERSFLOW_PF4163_REVIEWED_TREE="$nested_graph_tree"; then
+  if run_fixture_admission "$nested_graph_correction_head" "$output" \
+    PAPERSFLOW_PF4163_CORRECTION_HEAD="$nested_graph_correction_head" \
+    PAPERSFLOW_PF4163_CORRECTION_TREE="$nested_graph_tree"; then
     echo 'PF-4163 unapproved nested dependency-graph path unexpectedly passed admission.' >&2
     return 1
   fi
   grep -Fq 'outside the frozen install allowlist' "$output"
 
-  echo 'PF-4163 pending-pin, exact-commit, topology, tree, ancestry, and frozen-install admission fixtures passed.'
+  echo 'PF-4163 pending-pin, exact-correction, source topology/tree, ancestry, and frozen-install admission fixtures passed.'
 )
 
 run_pf3020_admission_self_tests() (
@@ -9863,6 +9996,23 @@ run_pf4163_upstream_sync_validation() {
     pnpm --filter ./server-adapters/fastify --fail-if-no-match build
   run_with_validation_budget 900 \
     pnpm --filter ./server-adapters/fastify --fail-if-no-match test
+
+  echo 'Running native PF-4163 correction Core and CLI validation.'
+  # The focused CLI deploy test imports the native deployer and logger package
+  # exports. Build those exports (and the deployer's bundled Hono adapter)
+  # after the generic lane has built Core and Server.
+  run_with_validation_budget 900 \
+    pnpm --filter ./server-adapters/hono --fail-if-no-match build
+  run_with_validation_budget 900 \
+    pnpm --filter ./packages/deployer --fail-if-no-match build:lib
+  run_with_validation_budget 900 \
+    pnpm --filter ./packages/loggers --fail-if-no-match build:lib
+  run_with_validation_budget 900 \
+    pnpm --dir packages/core exec vitest run --reporter=dot \
+      src/agent/__tests__/agent-signals.test.ts
+  run_with_validation_budget 900 \
+    pnpm --dir packages/cli exec vitest run --reporter=dot \
+      src/commands/deploy/index.test.ts
 }
 
 run_pf3020_upstream_sync_validation() {
