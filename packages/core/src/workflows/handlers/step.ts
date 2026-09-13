@@ -53,7 +53,14 @@ import { prepareStepSnapshot } from './entry';
 import type { PersistStepUpdateParams } from './entry';
 
 function isRecordState(value: unknown): value is Record<string, any> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    !Array.isArray(value) &&
+    !(value instanceof Date) &&
+    !(value instanceof Map) &&
+    !(value instanceof Set)
+  );
 }
 
 export interface ExecuteStepParams extends ObservabilityContext {

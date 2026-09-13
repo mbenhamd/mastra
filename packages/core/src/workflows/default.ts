@@ -65,6 +65,7 @@ export type { ExecutionContext } from './types';
 
 function normalizeStateRoot<TState>(state: TState): TState {
   if (state === null || typeof state !== 'object') return state;
+  if (state instanceof Date || state instanceof Map || state instanceof Set) return state;
 
   const descriptors = Object.getOwnPropertyDescriptors(state);
   const isMergeable =
@@ -78,7 +79,11 @@ function normalizeStateRoot<TState>(state: TState): TState {
 
 function copyStateRoot<TState>(state: TState): TState {
   if (state === null || typeof state !== 'object') return state;
-  return (Array.isArray(state) ? state.slice() : { ...state }) as TState;
+  if (Array.isArray(state)) return state.slice() as TState;
+  if (state instanceof Date) return new Date(state.getTime()) as TState;
+  if (state instanceof Map) return new Map(state) as TState;
+  if (state instanceof Set) return new Set(state) as TState;
+  return { ...state } as TState;
 }
 
 /** Params for the per-type execute methods: the same context `executeStep` takes,

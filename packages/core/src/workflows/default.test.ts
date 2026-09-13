@@ -1964,6 +1964,27 @@ describe('DefaultExecutionEngine workflow state representation', () => {
   it.each([
     { kind: 'array', schema: z.array(z.number()), initial: [1, 2], update: [3], expected: [3] },
     { kind: 'number', schema: z.number(), initial: 1, update: 2, expected: 2 },
+    {
+      kind: 'date',
+      schema: z.date(),
+      initial: Object.freeze(new Date('2020-01-01')),
+      update: new Date('2021-01-01'),
+      expected: new Date('2021-01-01'),
+    },
+    {
+      kind: 'map',
+      schema: z.map(z.string(), z.number()),
+      initial: new Map([['old', 1]]),
+      update: new Map([['new', 2]]),
+      expected: new Map([['new', 2]]),
+    },
+    {
+      kind: 'set',
+      schema: z.set(z.number()),
+      initial: new Set([1]),
+      update: new Set([2]),
+      expected: new Set([2]),
+    },
   ] as const)(
     'preserves $kind state through delayed persistence',
     async ({ kind, schema, initial, update, expected }) => {
@@ -2021,9 +2042,11 @@ describe('DefaultExecutionEngine workflow state representation', () => {
         expect(result.state).toEqual(expected);
         const snapshot = await workflowsStore!.loadWorkflowSnapshot({ workflowName: workflow.id, runId: run.runId });
         expect(snapshot?.value).toEqual(expected);
+        if (kind !== 'number') {
+          expect(persistedStates[0]).not.toBe(firstStepState);
+        }
         if (kind === 'array') {
           expect(persistedStates.every(state => Array.isArray(state))).toBe(true);
-          expect(persistedStates[0]).not.toBe(firstStepState);
         }
       } finally {
         persistSpy.mockRestore();
