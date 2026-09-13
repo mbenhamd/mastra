@@ -304,7 +304,9 @@ describe('workflow run cancellation tracing', () => {
       const deaf = endedSpans().find(span => span.name === "workflow step: 'deaf'");
       expect(deaf?.attributes).toMatchObject({ status: 'canceled' });
     } finally {
-      await mastra.stopWorkers();
+      // deafStep ignores cancellation, so there is nothing for the worker
+      // drain to wait on; skip it instead of burning the default budget.
+      await mastra.stopWorkers({ drainTimeout: 0 });
     }
   });
 
@@ -323,7 +325,9 @@ describe('workflow run cancellation tracing', () => {
       expectSingleEndPerSpan();
       expectParentsPresent();
     } finally {
-      await mastra.stopWorkers();
+      // deafStep ignores cancellation, so there is nothing for the worker
+      // drain to wait on; skip it instead of burning the default budget.
+      await mastra.stopWorkers({ drainTimeout: 0 });
     }
   });
 });

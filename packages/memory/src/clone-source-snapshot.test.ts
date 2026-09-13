@@ -59,11 +59,11 @@ describe('Memory clone source ownership snapshots', () => {
 
     const cloneEntered = deferred();
     const continueClone = deferred();
-    const cloneThread = memoryStore.cloneThread.bind(memoryStore);
-    vi.spyOn(memoryStore, 'cloneThread').mockImplementation(async args => {
+    const copyThread = memoryStore.copyThread.bind(memoryStore);
+    vi.spyOn(memoryStore, 'copyThread').mockImplementation(async args => {
       cloneEntered.resolve();
       await continueClone.promise;
-      return cloneThread(args);
+      return copyThread(args);
     });
 
     const clonePromise = memory.cloneThread({
@@ -103,13 +103,13 @@ describe('Memory clone source ownership snapshots', () => {
     const memoryStore = await getMemoryStore(memory);
     await memory.createThread({ threadId: 'unsafe-source', resourceId: 'source-resource' });
     Object.defineProperty(memoryStore, 'supportsThreadCloneSourceSnapshot', { value: false });
-    const cloneThread = vi.spyOn(memoryStore, 'cloneThread');
+    const copyThread = vi.spyOn(memoryStore, 'copyThread');
 
     await expect(
       memory.cloneThread({ sourceThreadId: 'unsafe-source', newThreadId: 'must-not-exist' }),
     ).rejects.toThrow('cannot atomically snapshot source ownership');
 
-    expect(cloneThread).not.toHaveBeenCalled();
+    expect(copyThread).not.toHaveBeenCalled();
     await expect(memoryStore.getThreadById({ threadId: 'must-not-exist' })).resolves.toBeNull();
   });
 
@@ -135,16 +135,16 @@ describe('Memory clone source ownership snapshots', () => {
     const memory = new Memory({ storage: new InMemoryStore() });
     const memoryStore = await getMemoryStore(memory);
     await memory.createThread({ threadId: 'invalid-output-source', resourceId: 'source-resource' });
-    const cloneThread = memoryStore.cloneThread.bind(memoryStore);
-    vi.spyOn(memoryStore, 'cloneThread').mockImplementation(async args => {
-      const result = await cloneThread(args);
+    const copyThread = memoryStore.copyThread.bind(memoryStore);
+    vi.spyOn(memoryStore, 'copyThread').mockImplementation(async args => {
+      const result = await copyThread(args);
       delete result.sourceResourceId;
       return result;
     });
 
     await expect(
       memory.cloneThread({ sourceThreadId: 'invalid-output-source', newThreadId: 'invalid-output-clone' }),
-    ).rejects.toThrow('cloneThread did not return sourceResourceId');
+    ).rejects.toThrow('copyThread did not return sourceResourceId');
 
     await expect(memoryStore.getThreadById({ threadId: 'invalid-output-clone' })).resolves.toBeNull();
   });

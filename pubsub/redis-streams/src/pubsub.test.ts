@@ -505,13 +505,16 @@ describe('RedisStreamsPubSub', () => {
       };
       await consumerB.subscribe(topic, cbB, { group: groupName });
 
-      // Wait for autoclaim to fire (idleMs=500, intervalMs=250 + a margin).
+      // Wait for the reclaim loop to fire (idleMs=500, intervalMs=250 + a margin).
       await waitFor(() => seenB.length >= 1, { timeoutMs: 6000 });
       expect(seenB[0]!.type).toBe('sticky');
       expect(seenB[0]!.id).toBe(seenA[0]!.id);
       expect(seenB[0]!.deliveryAttempt).toBe(2);
       await new Promise(r => setTimeout(r, 300));
       expect(settledGroupEvents).toHaveLength(1);
+      // A's own reclaim loop must not have handed the entry back to A: that
+      // would reset the idle clock and starve B forever.
+      expect(seenA).toHaveLength(1);
     });
 
     it('counts repeated crash reclaims and drops the entry after the delivery cap', async () => {

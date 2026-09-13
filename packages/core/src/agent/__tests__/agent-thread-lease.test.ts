@@ -217,12 +217,17 @@ describe('registerRun thread lease', () => {
       await iterator.next();
       await waitForCondition(() => pubsub.publishedTypes.includes('run-suspended'));
       expect(originRuntime.getThreadState({ threadId, resourceId }, pubsub)).toBe('active');
-      expect(pubsub.owners.get(key)).toBe(runId);
+      const originOwner = pubsub.owners.get(key);
+      expect(originOwner).toMatch(/^mastra-thread-owner:/);
+      expect(JSON.parse(originOwner!.slice('mastra-thread-owner:'.length))[0]).toBe(runId);
 
       let now = Date.now();
       dateNow = vi.spyOn(Date, 'now').mockImplementation(() => now);
+      // A cross-instance resume gets a fresh nonce after the origin lease has
+      // expired; model that expiry before the successor attempts acquisition.
+      pubsub.owners.delete(key);
       const resumedFinished = new Promise<void>(() => {});
-      await resumeRuntime.registerRun(
+      const resumedRegistration = resumeRuntime.registerRun(
         agent,
         {
           runId,
@@ -233,11 +238,16 @@ describe('registerRun thread lease', () => {
         { memory: { thread: threadId, resource: resourceId }, resumeData: { approved: true } } as any,
         pubsub,
       );
-      expect(pubsub.owners.get(key)).toBe(runId);
+      void resumedRegistration?.catch(() => {});
+      await waitForCondition(() => pubsub.owners.get(key) !== undefined);
+      const resumedOwner = pubsub.owners.get(key);
+      expect(resumedOwner).toMatch(/^mastra-thread-owner:/);
+      expect(JSON.parse(resumedOwner!.slice('mastra-thread-owner:'.length))[0]).toBe(runId);
+      expect(resumedOwner).not.toBe(originOwner);
 
       const publishedBeforeSweep = pubsub.publishedTypes.length;
       now += Mastra.INTERNAL_WORKFLOW_TTL_MS + 1;
-      await originRuntime.registerRun(
+      const sweepRegistration = originRuntime.registerRun(
         { id: 'sweep-trigger-agent' } as Agent<any, any, any, any>,
         {
           runId: 'sweep-trigger-run',
@@ -248,10 +258,11 @@ describe('registerRun thread lease', () => {
         { memory: { thread: 'sweep-trigger-thread', resource: resourceId } } as any,
         pubsub,
       );
+      void sweepRegistration?.catch(() => {});
       await pubsub.flush();
 
-      expect(pubsub.releaseCalls).not.toContainEqual({ key, owner: runId });
-      expect(pubsub.owners.get(key)).toBe(runId);
+      expect(pubsub.releaseCalls).not.toContainEqual({ key, owner: resumedOwner });
+      expect(pubsub.owners.get(key)).toBe(resumedOwner);
       expect(pubsub.publishedTypes.slice(publishedBeforeSweep)).not.toContain('run-completed');
     } finally {
       subscription.unsubscribe();
@@ -316,12 +327,14 @@ describe('registerRun thread lease', () => {
     expect(pubsub.owners.get(key)).toBeUndefined();
 
     const second = await register('strict-rollback-run-2');
-    expect(pubsub.owners.get(key)).toBe('strict-rollback-run-2');
+    const secondOwner = pubsub.owners.get(key);
+    expect(secondOwner).toMatch(/^mastra-thread-owner:/);
+    expect(JSON.parse(secondOwner!.slice('mastra-thread-owner:'.length))[0]).toBe('strict-rollback-run-2');
     expect(runtime.getThreadState({ threadId, resourceId }, pubsub)).toBe('active');
     await second.rollback({ releaseLease: false });
     expect(runtime.getThreadState({ threadId, resourceId }, pubsub)).toBe('idle');
-    expect(pubsub.owners.get(key)).toBe('strict-rollback-run-2');
-    await pubsub.releaseLease(key, 'strict-rollback-run-2');
+    expect(pubsub.owners.get(key)).toBe(secondOwner);
+    await pubsub.releaseLease(key, secondOwner!);
   });
 
   it('rolls strict registration back and releases its lease when publishing fails', async () => {

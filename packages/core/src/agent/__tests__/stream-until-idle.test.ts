@@ -1,6 +1,7 @@
 import { convertArrayToReadableStream, MockLanguageModelV2 } from '@internal/ai-sdk-v5/test';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { z } from 'zod';
+import { buildContinuationOpts } from '../../loop/shared/stream-until-idle-helpers';
 import { Mastra } from '../../mastra';
 import { MockMemory } from '../../memory';
 import { RequestContext } from '../../request-context';
@@ -82,6 +83,23 @@ async function drain(stream: ReadableStream<any>): Promise<any[]> {
 
 describe('Agent.streamUntilIdle', () => {
   const storage = new MockStore();
+
+  it('passes completion directives as execution-only system context', () => {
+    const options = buildContinuationOpts({}, undefined, [
+      {
+        type: 'background-task-completed',
+        payload: { taskId: 'task-1', toolCallId: 'call-1', toolName: 'view' },
+      },
+    ]);
+
+    expect(options.context).toEqual([
+      {
+        role: 'system',
+        content:
+          'IMPORTANT: These tool calls ran as background tasks. Their authoritative results may now look like ordinary tool results after reconciliation; do not reinterpret them as foreground calls. IMPORTANT: The following tool-call IDs completed successfully: call-1 (view), background task task-1. Their results are now in the conversation. Do not call the same tool again — the result is already available.',
+      },
+    ]);
+  });
 
   let mastra: Mastra;
 
@@ -386,6 +404,70 @@ describe('Agent.streamUntilIdle', () => {
     expect(memoryResolverCalls).toBe(1);
     expect(getCallCount()).toBe(1);
   });
+
+  it.each([false, true])(
+    'preserves signal exclusions across background continuations (excluded: %s)',
+    async excluded => {
+      const memory = new MockMemory();
+      const { model, getCallCount } = makeScriptedModel([
+        textResponse('first response'),
+        textResponse('continuation response'),
+      ]);
+
+      const agent = new Agent({
+        id: 'signal-exclusions',
+        name: 'signal-exclusions',
+        instructions: 'test',
+        model,
+        memory,
+        inputProcessors: [
+          {
+            id: 'continuation-reminder',
+            processInputStep: async ({ sendSignal }) => {
+              await sendSignal({ type: 'reactive', contents: 'every turn reminder' });
+            },
+          },
+        ],
+      });
+      mastra.addAgent(agent, agent.id);
+
+      const bgManager = mastra.backgroundTaskManager!;
+      const publishEvent = (type: string, taskId: string) =>
+        (bgManager as any).publishLifecycleEvent(type, {
+          id: taskId,
+          toolName: 'dummy',
+          toolCallId: taskId,
+          runId: 'run-1',
+          agentId: agent.id,
+          threadId: 'signal-exclusions-thread',
+          resourceId: 'user-1',
+          status: type.split('.')[1],
+          result: {},
+          retryCount: 0,
+          maxRetries: 0,
+          timeoutMs: 1000,
+          createdAt: new Date(),
+          args: {},
+        });
+
+      const outer = await agent.streamUntilIdle('hi', {
+        memory: { thread: 'signal-exclusions-thread', resource: 'user-1' },
+        hideSignals: excluded ? ['system-reminder'] : [],
+      });
+
+      await publishEvent('task.running', 'task-1');
+      await new Promise(resolve => setTimeout(resolve, 50));
+      await publishEvent('task.completed', 'task-1');
+
+      const chunks = await drain(outer.fullStream as ReadableStream<any>);
+      expect(chunks.filter(chunk => chunk.type === 'data-signal')).toHaveLength(excluded ? 0 : 2);
+      expect(chunks.filter(chunk => chunk.type === 'text-delta').map(chunk => chunk.payload.text)).toEqual([
+        'first response',
+        'continuation response',
+      ]);
+      expect(getCallCount()).toBe(2);
+    },
+  );
 
   it('serializes continuations (only one inner stream at a time)', async () => {
     const memory = new MockMemory();

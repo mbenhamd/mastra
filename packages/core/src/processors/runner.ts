@@ -23,12 +23,14 @@ import {
 import type { ObservabilityContext, ProcessorSpanType, Span } from '../observability';
 import { createExactJsonMeasurementSnapshot } from '../observability/content-free-measurement';
 import type { ProcessorRunAttributes, TracingContext } from '../observability/types';
-import type { RequestContext } from '../request-context';
+import { executeWithContext } from '../observability/utils';
+import { RequestContext } from '../request-context';
 import type { ChunkType } from '../stream';
 import type { MastraModelOutput } from '../stream/base/output';
 import type { LanguageModelUsage, ProviderMetadata } from '../stream/types';
 import { deepEqual } from '../utils';
 import { PROCESSOR_EXECUTION_SYMBOL } from '../workflows/constants';
+import type { OutputWriter } from '../workflows/types';
 import {
   isProcessorWorkflow,
   processorWorkflowRequiresDurableExecution,
@@ -1072,13 +1074,37 @@ export class ProcessorRunner {
     writer?: ProcessorStreamWriter,
     abortSignal?: AbortSignal,
   ): Promise<ProcessorStepOutput> {
-    // The stream phase runs the whole workflow once per streamed chunk, with the full
+    // Explicit workflows run once per streamed chunk, with the full
     // accumulated `streamParts` as input. Persisting a snapshot (and tracing a public
     // span) for every one of those transient runs makes a stream of n chunks cost O(n²)
     // in storage writes and serialized payload (#19605). Internal processor workflows
     // built by the agent already opt out via their workflow options (#17344); a
     // user-supplied processor workflow keeps the persisting defaults, so the opt-out is
     // applied per run here — leaving the same workflow's standalone runs untouched.
+    const isPerChunkPhase = input.phase === 'outputStream';
+
+    const inputData = {
+      ...input,
+      processorStates: this.processorStates,
+      abortSignal,
+      agent: this.agent,
+    };
+    const outputWriter: OutputWriter | undefined = writer
+      ? (chunk, options) => writer.custom(chunk, options)
+      : undefined;
+    if (isPerChunkPhase && workflow.__executeOutputStream) {
+      const execute = workflow.__executeOutputStream;
+      return executeWithContext({
+        span: observabilityContext?.tracingContext?.currentSpan,
+        fn: () =>
+          execute({
+            inputData,
+            ...observabilityContext,
+            requestContext: requestContext ?? new RequestContext(),
+            outputWriter,
+          }),
+      });
+    }
     // Create a run and start the workflow
     // Processor inputs contain process-local objects (MessageList, AbortSignal,
     // state Maps) and have no resume surface. Run default-engine custom
@@ -1096,19 +1122,10 @@ export class ProcessorRunner {
         : await workflow.createRun()
       : await workflow.createRun({ [PROCESSOR_EXECUTION_SYMBOL]: true, ...perChunkTracingOptions });
     const result = await run.start({
-      // Cast to allow processorStates/abortSignal - passed through to workflow processor steps
-      // but not part of the official ProcessorStepOutput schema
-      inputData: {
-        ...input,
-        // Pass the processorStates map so workflow processor steps can access their state
-        processorStates: this.processorStates,
-        // Pass abortSignal so processors can cancel in-flight work
-        abortSignal,
-        agent: this.agent,
-      } as ProcessorStepOutput,
+      inputData,
       ...observabilityContext,
       requestContext,
-      outputWriter: writer ? chunk => writer.custom(chunk) : undefined,
+      outputWriter,
     });
 
     // Check for tripwire status - this means a processor in the workflow called abort()
@@ -1984,6 +2001,7 @@ export class ProcessorRunner {
             messages: processableMessages,
             messageList,
             stepNumber,
+            runId: args.runId,
             steps,
             systemMessages: currentSystemMessages,
             rotateResponseMessageId: args.rotateResponseMessageId
@@ -2059,6 +2077,7 @@ export class ProcessorRunner {
 
       const inputData = {
         messages: processableMessages,
+        runId: args.runId,
         stepNumber,
         steps,
         messageId: stepInput.messageId,

@@ -103,7 +103,292 @@ describe('BackgroundTaskManager', () => {
     await backgroundTasksStore?.dangerouslyClearAll();
   });
 
+  describe('shared-storage ownership', () => {
+    it('releases resume reservations on publish failure and tolerates worker-start failure', async () => {
+      const local = await makeLocalManager({
+        enabled: true,
+        globalConcurrency: 1,
+        perAgentConcurrency: 1,
+        recoverStaleTasksOnStart: false,
+      });
+      const execute = vi.fn(async (_args, opts) => {
+        if (!opts.resumeData) return opts.suspend({ waiting: true });
+        return opts.resumeData;
+      });
+      try {
+        const { task } = await local.mgr.enqueue(
+          { toolName: 'agent-helper', toolCallId: 'suspend', args: {}, agentId: 'parent', runId: 'suspend' },
+          ctx(execute),
+        );
+        await vi.waitFor(async () => expect((await local.mgr.getTask(task.id))?.status).toBe('suspended'));
+        vi.spyOn(local.isolatedPubsub, 'publish').mockRejectedValueOnce(new Error('resume publish failed'));
+        await expect(local.mgr.resume(task.id, { ok: true })).rejects.toThrow('resume publish failed');
+        expect((await local.mgr.getTask(task.id))?.status).toBe('suspended');
+        const { task: next } = await local.mgr.enqueue(
+          { toolName: 'agent-helper', toolCallId: 'next', args: {}, agentId: 'parent', runId: 'next' },
+          ctx(async () => 'next'),
+        );
+        await vi.waitFor(async () => expect((await local.mgr.getTask(next.id))?.status).toBe('completed'));
+        vi.spyOn(local.localMastra, '__ensureExecutionWorkersStarted').mockRejectedValueOnce(
+          new Error('startup failed'),
+        );
+        await local.mgr.resume(task.id, { ok: true });
+        await vi.waitFor(async () =>
+          expect(await local.mgr.getTask(task.id)).toMatchObject({ status: 'completed', result: { ok: true } }),
+        );
+        expect(execute).toHaveBeenCalledTimes(2);
+      } finally {
+        await local.cleanup();
+      }
+    });
+
+    it('leaves another live manager’s running and queued invocation contexts untouched', async () => {
+      const config = { enabled: true, globalConcurrency: 1, perAgentConcurrency: 1, recoverStaleTasksOnStart: false };
+      const origin = await makeLocalManager(config);
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => {
+        release = resolve;
+      });
+      const first = vi.fn(async () => {
+        await gate;
+        return 'request-A';
+      });
+      const second = vi.fn(async () => 'request-B');
+      let remote: Awaited<ReturnType<typeof makeLocalManager>> | undefined;
+      try {
+        const { task: running } = await origin.mgr.enqueue(
+          { toolName: 'agent-helper', toolCallId: 'a', args: {}, agentId: 'parent', runId: 'a' },
+          ctx(first),
+        );
+        await vi.waitFor(async () => expect((await origin.mgr.getTask(running.id))?.status).toBe('running'));
+        const { task: queued } = await origin.mgr.enqueue(
+          { toolName: 'agent-helper', toolCallId: 'b', args: {}, agentId: 'parent', runId: 'b' },
+          ctx(second),
+        );
+        remote = await makeLocalManager(config);
+        const remoteExecute = vi.fn(async () => 'remote');
+        const { task: remoteTask } = await remote.mgr.enqueue(
+          { toolName: 'agent-helper', toolCallId: 'c', args: {}, agentId: 'parent', runId: 'c' },
+          ctx(remoteExecute),
+        );
+        await vi.waitFor(async () => expect((await remote!.mgr.getTask(remoteTask.id))?.status).toBe('completed'));
+        expect((await origin.mgr.getTask(running.id))?.status).toBe('running');
+        expect((await origin.mgr.getTask(queued.id))?.status).toBe('pending');
+        expect(second).not.toHaveBeenCalled();
+        release();
+        await vi.waitFor(async () => {
+          expect(await origin.mgr.getTask(running.id)).toMatchObject({ status: 'completed', result: 'request-A' });
+          expect(await origin.mgr.getTask(queued.id)).toMatchObject({ status: 'completed', result: 'request-B' });
+        });
+        expect(first).toHaveBeenCalledTimes(1);
+        expect(second).toHaveBeenCalledTimes(1);
+        expect(remoteExecute).toHaveBeenCalledTimes(1);
+      } finally {
+        release();
+        await origin.cleanup();
+        await remote?.cleanup();
+      }
+    });
+
+    it('preserves a claimed invocation when publication reports failure after delivery', async () => {
+      const local = await makeLocalManager({
+        enabled: true,
+        globalConcurrency: 1,
+        perAgentConcurrency: 1,
+        recoverStaleTasksOnStart: false,
+      });
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => {
+        release = resolve;
+      });
+      let started!: () => void;
+      const executing = new Promise<void>(resolve => {
+        started = resolve;
+      });
+      const publish = local.isolatedPubsub.publish.bind(local.isolatedPubsub);
+      vi.spyOn(local.isolatedPubsub, 'publish').mockImplementationOnce(async (...args) => {
+        await publish(...args);
+        await executing;
+        throw new Error('acknowledgement lost');
+      });
+      try {
+        await expect(
+          local.mgr.enqueue(
+            { toolName: 'agent-helper', toolCallId: 'claimed', args: {}, agentId: 'parent', runId: 'claimed' },
+            ctx(async () => {
+              started();
+              await gate;
+              return 'claimed';
+            }),
+          ),
+        ).rejects.toThrow('acknowledgement lost');
+        const { task: queued } = await local.mgr.enqueue(
+          { toolName: 'agent-helper', toolCallId: 'queued', args: {}, agentId: 'parent', runId: 'queued' },
+          ctx(async () => 'queued'),
+        );
+        expect((await local.mgr.getTask(queued.id))?.status).toBe('pending');
+        release();
+        await vi.waitFor(async () => {
+          expect((await local.mgr.listTasks({ runId: 'claimed' })).tasks[0]).toMatchObject({
+            status: 'completed',
+            result: 'claimed',
+          });
+          expect(await local.mgr.getTask(queued.id)).toMatchObject({ status: 'completed', result: 'queued' });
+        });
+      } finally {
+        release();
+        await local.cleanup();
+      }
+    });
+
+    it('cleans up an invocation when dispatch publication rejects and allows the next enqueue', async () => {
+      const local = await makeLocalManager({
+        enabled: true,
+        globalConcurrency: 1,
+        perAgentConcurrency: 1,
+        recoverStaleTasksOnStart: false,
+      });
+      const execute = vi.fn(async () => 'next');
+      const deregister = vi.spyOn(local.mgr, 'deregisterTaskContext');
+      const publish = vi.spyOn(local.isolatedPubsub, 'publish').mockRejectedValueOnce(new Error('publish failed'));
+      try {
+        await expect(
+          local.mgr.enqueue(
+            { toolName: 'agent-helper', toolCallId: 'failed', args: {}, agentId: 'parent', runId: 'failed' },
+            ctx(execute),
+          ),
+        ).rejects.toThrow('publish failed');
+        const { tasks } = await local.mgr.listTasks({ runId: 'failed' });
+        expect(tasks).toHaveLength(1);
+        expect(tasks[0]?.status).toBe('failed');
+        expect(deregister).toHaveBeenCalledWith(tasks[0]!.id);
+        const { task } = await local.mgr.enqueue(
+          { toolName: 'agent-helper', toolCallId: 'next', args: {}, agentId: 'parent', runId: 'next' },
+          ctx(execute),
+        );
+        await vi.waitFor(async () => expect((await local.mgr.getTask(task.id))?.status).toBe('completed'));
+        expect(execute).toHaveBeenCalledTimes(1);
+      } finally {
+        publish.mockRestore();
+        await local.cleanup();
+      }
+    });
+  });
+
   describe('enqueue and execute', () => {
+    it.each([false, true])(
+      'registers invocation context before a committed create resolves (%s)',
+      async completeBeforeCreateResolves => {
+        const local = await makeLocalManager({
+          enabled: true,
+          globalConcurrency: 1,
+          perAgentConcurrency: 1,
+          recoverStaleTasksOnStart: false,
+        });
+        const backgroundTasksStore = await testStorage.getStore('backgroundTasks');
+        const originalCreateTask = backgroundTasksStore!.createTask.bind(backgroundTasksStore);
+        let taskId!: string;
+        let releaseCreate!: () => void;
+        const createGate = new Promise<void>(resolve => {
+          releaseCreate = resolve;
+        });
+        let rowCommitted!: () => void;
+        const committed = new Promise<void>(resolve => {
+          rowCommitted = resolve;
+        });
+        const createTask = vi.spyOn(backgroundTasksStore!, 'createTask').mockImplementation(async task => {
+          if (!taskId) taskId = task.id;
+          await originalCreateTask(task);
+          rowCommitted();
+          await createGate;
+        });
+        let releaseExecution!: () => void;
+        const executionGate = new Promise<void>(resolve => {
+          releaseExecution = resolve;
+        });
+        const execute = vi.fn(async () => {
+          await executionGate;
+          return 'recovered';
+        });
+        const nextExecute = vi.fn().mockResolvedValue('next');
+        let enqueuePromise: ReturnType<typeof local.mgr.enqueue> | undefined;
+        let recoveryPromise: Promise<unknown> | undefined;
+        let nextTaskId: string | undefined;
+
+        try {
+          enqueuePromise = local.mgr.enqueue(
+            {
+              toolName: 'recovery-tool',
+              toolCallId: 'create-in-flight',
+              args: {},
+              agentId: 'a1',
+              runId: 'create-in-flight',
+            },
+            ctx(execute),
+          );
+          await committed;
+
+          recoveryPromise = (local.mgr as any).recoverStaleTasks();
+          await vi.waitFor(() => expect(execute).toHaveBeenCalledTimes(1));
+          expect(local.mgr.taskContexts.has(taskId)).toBe(true);
+
+          if (completeBeforeCreateResolves) {
+            releaseExecution();
+            await vi.waitFor(async () =>
+              expect(await local.mgr.getTask(taskId)).toMatchObject({ status: 'completed', result: 'recovered' }),
+            );
+            await vi.waitFor(() => expect((local.mgr as any).localReservations.has(taskId)).toBe(false));
+          }
+          releaseCreate();
+          await enqueuePromise;
+          if (!completeBeforeCreateResolves) {
+            const { task: next } = await local.mgr.enqueue(
+              {
+                toolName: 'next-after-recovery',
+                toolCallId: 'next-after-recovery',
+                args: {},
+                agentId: 'a1',
+                runId: 'next-after-recovery',
+              },
+              ctx(nextExecute),
+            );
+            nextTaskId = next.id;
+            expect(nextExecute).not.toHaveBeenCalled();
+            expect(await local.mgr.getTask(next.id)).toMatchObject({ status: 'pending' });
+            releaseExecution();
+          }
+          await vi.waitFor(async () =>
+            expect(await local.mgr.getTask(taskId)).toMatchObject({ status: 'completed', result: 'recovered' }),
+          );
+          if (completeBeforeCreateResolves) {
+            const { task: next } = await local.mgr.enqueue(
+              {
+                toolName: 'next-after-recovery',
+                toolCallId: 'next-after-recovery',
+                args: {},
+                agentId: 'a1',
+                runId: 'next-after-recovery',
+              },
+              ctx(nextExecute),
+            );
+            nextTaskId = next.id;
+          }
+          await vi.waitFor(async () =>
+            expect(await local.mgr.getTask(nextTaskId!)).toMatchObject({ status: 'completed', result: 'next' }),
+          );
+          expect(nextExecute).toHaveBeenCalledTimes(1);
+          await recoveryPromise;
+        } finally {
+          releaseCreate();
+          releaseExecution();
+          await enqueuePromise?.catch(() => {});
+          await recoveryPromise?.catch(() => {});
+          createTask.mockRestore();
+          await local.cleanup();
+        }
+      },
+    );
+
     it('enqueues a task, executes it, and completes', async () => {
       const executeFn = vi.fn().mockResolvedValue({ data: 'hello' });
 
@@ -341,6 +626,25 @@ describe('BackgroundTaskManager', () => {
       expect((await manager.getTask(bgTask.task.id))?.status).toBe('cancelled');
     });
 
+    it('stops waiting when the caller aborts', async () => {
+      const bgTask = createBackgroundTask(manager, {
+        toolName: 'tool',
+        toolCallId: 'call-1',
+        args: {},
+        agentId: 'a1',
+        runId: 'run-1',
+        context: ctx(vi.fn(() => new Promise(() => {}))),
+      });
+      const abortController = new AbortController();
+
+      await bgTask.dispatch();
+      const waiting = bgTask.waitForCompletion({ abortSignal: abortController.signal });
+      abortController.abort(new Error('request aborted'));
+
+      await expect(waiting).rejects.toThrow('request aborted');
+      await bgTask.cancel();
+    });
+
     it('throws if cancel/wait called before dispatch', async () => {
       const bgTask = createBackgroundTask(manager, {
         toolName: 'tool',
@@ -353,6 +657,31 @@ describe('BackgroundTaskManager', () => {
 
       await expect(bgTask.cancel()).rejects.toThrow('not been dispatched');
       await expect(bgTask.waitForCompletion()).rejects.toThrow('not been dispatched');
+    });
+
+    it('can wait for suspension when explicitly requested', async () => {
+      const executeFn = vi.fn(async (_args: any, opts: any) => {
+        await opts.suspend({ awaiting: 'approval' });
+      });
+      const bgTask = createBackgroundTask(manager, {
+        toolName: 'suspending-tool',
+        toolCallId: 'call-suspended-wait',
+        args: {},
+        agentId: 'a1',
+        runId: 'run-suspended-wait',
+        context: ctx(executeFn),
+      });
+
+      await bgTask.dispatch();
+      await vi.waitFor(async () => expect((await manager.getTask(bgTask.task.id))?.status).toBe('suspended'));
+
+      await expect(bgTask.waitForCompletion({ timeoutMs: 25 })).rejects.toThrow(
+        'Timed out waiting for background task',
+      );
+      await expect(bgTask.waitForCompletion({ includeSuspended: true })).resolves.toMatchObject({
+        status: 'suspended',
+        suspendPayload: { awaiting: 'approval' },
+      });
     });
   });
 
@@ -437,6 +766,67 @@ describe('BackgroundTaskManager', () => {
       resolvers.forEach(r => r());
     });
 
+    it('does not let abandoned shared running rows block process-affine tasks', async () => {
+      const backgroundTasksStore = await testStorage.getStore('backgroundTasks');
+      for (let i = 0; i < 3; i++) {
+        await backgroundTasksStore!.createTask({
+          id: `abandoned-${i}`,
+          status: 'running',
+          toolName: 'remote-tool',
+          toolCallId: `remote-call-${i}`,
+          args: {},
+          agentId: 'remote-agent',
+          runId: `remote-run-${i}`,
+          retryCount: 0,
+          maxRetries: 0,
+          timeoutMs: 5000,
+          createdAt: new Date(),
+          startedAt: new Date(),
+        });
+      }
+
+      const executeFn = vi.fn().mockResolvedValue('local-result');
+      const { task } = await manager.enqueue(
+        { toolName: 'local-tool', toolCallId: 'local-call', args: {}, agentId: 'local-agent', runId: 'local-run' },
+        ctx(executeFn),
+      );
+
+      await tick();
+      expect((await manager.getTask(task.id))?.status).toBe('completed');
+      expect(executeFn).toHaveBeenCalledOnce();
+    });
+
+    it('continues to apply persisted concurrency limits to portable tasks', async () => {
+      const backgroundTasksStore = await testStorage.getStore('backgroundTasks');
+      for (let i = 0; i < 3; i++) {
+        await backgroundTasksStore!.createTask({
+          id: `portable-blocker-${i}`,
+          status: 'running',
+          toolName: 'remote-tool',
+          toolCallId: `remote-call-${i}`,
+          args: {},
+          agentId: 'remote-agent',
+          runId: `remote-run-${i}`,
+          retryCount: 0,
+          maxRetries: 0,
+          timeoutMs: 5000,
+          createdAt: new Date(),
+          startedAt: new Date(),
+        });
+      }
+
+      const { task } = await manager.enqueue({
+        toolName: 'portable-tool',
+        toolCallId: 'portable-call',
+        args: {},
+        agentId: 'portable-agent',
+        runId: 'portable-run',
+      });
+
+      await tick();
+      expect((await manager.getTask(task.id))?.status).toBe('pending');
+    });
+
     it('backpressure reject throws on limit', async () => {
       const { mgr: rejectManager, cleanup } = await makeLocalManager({
         enabled: true,
@@ -500,6 +890,45 @@ describe('BackgroundTaskManager', () => {
 
       resolver();
       await cleanup();
+    });
+
+    it('falls back an awaited nested task while retaining the ancestor reservation', async () => {
+      const { mgr: nestedManager, cleanup } = await makeLocalManager({
+        enabled: true,
+        globalConcurrency: 1,
+        perAgentConcurrency: 1,
+        backpressure: 'queue',
+        recoverStaleTasksOnStart: false,
+      });
+      const childExecute = vi.fn().mockResolvedValue('child-result');
+      const parentExecute = vi.fn(async () => {
+        const child = await nestedManager.enqueue(
+          { toolName: 'child-tool', toolCallId: 'nested-child', args: {}, agentId: 'agent', runId: 'nested-run' },
+          {
+            awaited: true,
+            executor: { execute: childExecute },
+          },
+        );
+        expect(child.fallbackToSync).toBe(true);
+        expect(await nestedManager.getTask(child.task.id)).toBeNull();
+        return 'parent-result';
+      });
+
+      try {
+        const { task: parent } = await nestedManager.enqueue(
+          { toolName: 'parent-tool', toolCallId: 'nested-parent', args: {}, agentId: 'agent', runId: 'nested-run' },
+          ctx(parentExecute),
+        );
+
+        await expect(nestedManager.waitForNextTask([parent.id], { timeoutMs: 2000 })).resolves.toMatchObject({
+          status: 'completed',
+          result: 'parent-result',
+        });
+        expect(childExecute).not.toHaveBeenCalled();
+        expect(parentExecute).toHaveBeenCalledOnce();
+      } finally {
+        await cleanup();
+      }
     });
   });
 
@@ -769,6 +1198,66 @@ describe('BackgroundTaskManager', () => {
       await cleanup();
     });
 
+    it('invokes onTaskCancelled callback', async () => {
+      const onCancelled = vi.fn();
+      const { mgr, cleanup } = await makeLocalManager({ enabled: true, onTaskCancelled: onCancelled });
+      const executeFn = vi.fn().mockImplementation(
+        (_args: any, opts: { abortSignal: AbortSignal }) =>
+          new Promise((_resolve, reject) => {
+            opts.abortSignal.addEventListener('abort', () => reject(new Error('Task cancelled')));
+          }),
+      );
+
+      try {
+        const { task } = await mgr.enqueue(
+          { toolName: 'tool', toolCallId: 'c1', args: {}, agentId: 'a1', runId: 'run-1' },
+          ctx(executeFn),
+        );
+        await tick();
+
+        await mgr.cancel(task.id);
+        await tick();
+
+        expect(onCancelled).toHaveBeenCalledTimes(1);
+        expect(onCancelled.mock.calls[0]![0].status).toBe('cancelled');
+      } finally {
+        await cleanup();
+      }
+    });
+
+    it('continues cancellation when onTaskCancelled rejects', async () => {
+      const callbackError = new Error('callback failed');
+      const onCancelled = vi.fn().mockRejectedValue(callbackError);
+      const { mgr, cleanup, localMastra } = await makeLocalManager({ enabled: true, onTaskCancelled: onCancelled });
+      const warn = vi.spyOn(localMastra.getLogger(), 'warn');
+      const executeFn = vi.fn().mockImplementation(
+        (_args: any, opts: { abortSignal: AbortSignal }) =>
+          new Promise((_resolve, reject) => {
+            opts.abortSignal.addEventListener('abort', () => reject(new Error('Task cancelled')));
+          }),
+      );
+
+      try {
+        const { task } = await mgr.enqueue(
+          { toolName: 'tool', toolCallId: 'c1', args: {}, agentId: 'a1', runId: 'run-1' },
+          ctx(executeFn),
+        );
+        await tick();
+
+        await expect(mgr.cancel(task.id)).resolves.toBeUndefined();
+        await tick();
+
+        expect(onCancelled).toHaveBeenCalledOnce();
+        expect(warn).toHaveBeenCalledWith(
+          `background-task cancellation callback failed for ${task.id}:`,
+          callbackError,
+        );
+        expect(mgr.taskContexts.has(task.id)).toBe(false);
+      } finally {
+        await cleanup();
+      }
+    });
+
     it('invokes per-task onComplete callback', async () => {
       const onComplete = vi.fn();
       const executeFn = vi.fn().mockResolvedValue('ok');
@@ -952,6 +1441,517 @@ describe('BackgroundTaskManager', () => {
       expect(executeFn).toHaveBeenCalledTimes(2);
     });
 
+    it('waits for resume admission before observing a later suspension', async () => {
+      let releaseResume!: () => void;
+      const resumeDelivery = new Promise<void>(resolve => {
+        releaseResume = resolve;
+      });
+      const originalPublish = pubsub.publish.bind(pubsub);
+      const publish = vi.spyOn(pubsub, 'publish').mockImplementation(async (topic, event, options) => {
+        if (event.type === 'task.resume') await resumeDelivery;
+        return originalPublish(topic, event, options);
+      });
+      const executeFn = vi.fn(async (_args: any, opts: any) => {
+        if (!opts.resumeData) {
+          await opts.suspend({ checkpoint: 'first' });
+          return undefined;
+        }
+        await opts.suspend({ checkpoint: 'second' });
+        return undefined;
+      });
+
+      try {
+        const { task } = await manager.enqueue(
+          { toolName: 'checkpoint-tool', toolCallId: 'cres-delayed', args: {}, agentId: 'a1', runId: 'r-delayed' },
+          ctx(executeFn),
+        );
+        await vi.waitFor(async () =>
+          expect(await manager.getTask(task.id)).toMatchObject({
+            status: 'suspended',
+            suspendPayload: { checkpoint: 'first' },
+          }),
+        );
+
+        const resumePromise = manager.resume(task.id, { approved: true }, { waitForAdmission: true });
+        await vi.waitFor(() => expect(publish.mock.calls.some(([, event]) => event.type === 'task.resume')).toBe(true));
+
+        let resumeSettled = false;
+        void resumePromise.then(() => {
+          resumeSettled = true;
+        });
+        await tick(10);
+        expect(resumeSettled).toBe(false);
+
+        releaseResume();
+        await resumePromise;
+
+        const observed = await manager.waitForNextTask([task.id], { includeSuspended: true, timeoutMs: 2000 });
+        expect(observed).toMatchObject({
+          status: 'suspended',
+          suspendPayload: { checkpoint: 'second' },
+        });
+        expect(executeFn).toHaveBeenCalledTimes(2);
+      } finally {
+        releaseResume();
+      }
+    });
+
+    it('rejects an aborted awaited resume before delayed publication settles', async () => {
+      let releaseResume!: () => void;
+      const resumeDelivery = new Promise<void>(resolve => {
+        releaseResume = resolve;
+      });
+      const originalPublish = pubsub.publish.bind(pubsub);
+      const publish = vi.spyOn(pubsub, 'publish').mockImplementation(async (topic, event, options) => {
+        if (event.type === 'task.resume') await resumeDelivery;
+        return originalPublish(topic, event, options);
+      });
+      const executeFn = vi.fn(async (_args: any, opts: any) => {
+        if (!opts.resumeData) {
+          await opts.suspend({ checkpoint: 'first' });
+          return undefined;
+        }
+        return 'resumed';
+      });
+      const bgTask = createBackgroundTask(manager, {
+        toolName: 'checkpoint-tool',
+        toolCallId: 'cres-abort-delayed',
+        args: {},
+        agentId: 'a1',
+        runId: 'r-abort-delayed',
+        context: ctx(executeFn),
+      });
+      let resumePromise: Promise<unknown> | undefined;
+
+      try {
+        const { task } = await bgTask.dispatch();
+        await vi.waitFor(async () =>
+          expect(await manager.getTask(task.id)).toMatchObject({
+            status: 'suspended',
+            suspendPayload: { checkpoint: 'first' },
+          }),
+        );
+
+        const abortController = new AbortController();
+        resumePromise = bgTask.resume(
+          { approved: true },
+          { waitForAdmission: true, abortSignal: abortController.signal },
+        );
+        await vi.waitFor(() => expect(publish.mock.calls.some(([, event]) => event.type === 'task.resume')).toBe(true));
+
+        abortController.abort(new Error('resume admission aborted'));
+        const outcome = await Promise.race([
+          resumePromise.then(
+            () => ({ kind: 'resolved' as const }),
+            error => ({ kind: 'rejected' as const, error }),
+          ),
+          tick(100).then(() => ({ kind: 'timed-out' as const })),
+        ]);
+        expect(outcome.kind).toBe('rejected');
+        if (outcome.kind === 'rejected') expect(outcome.error).toMatchObject({ message: 'resume admission aborted' });
+        expect(manager.taskContexts.has(task.id)).toBe(true);
+        expect((manager as any).localReservations.has(task.id)).toBe(true);
+
+        releaseResume();
+        await vi.waitFor(async () =>
+          expect(await manager.getTask(task.id)).toMatchObject({ status: 'completed', result: 'resumed' }),
+        );
+        expect(executeFn).toHaveBeenCalledTimes(2);
+      } finally {
+        releaseResume();
+        await resumePromise?.catch(() => {});
+      }
+    });
+
+    it('releases an unused resume reservation when a publication fails after caller abort', async () => {
+      const local = await makeLocalManager({
+        enabled: true,
+        globalConcurrency: 1,
+        perAgentConcurrency: 1,
+        recoverStaleTasksOnStart: false,
+      });
+      let releasePublication!: () => void;
+      const publicationGate = new Promise<void>(resolve => {
+        releasePublication = resolve;
+      });
+      const originalPublish = local.isolatedPubsub.publish.bind(local.isolatedPubsub);
+      const publish = vi.spyOn(local.isolatedPubsub, 'publish').mockImplementation(async (topic, event, options) => {
+        if (event.type === 'task.resume') {
+          await publicationGate;
+          throw new Error('late resume publication failed');
+        }
+        return originalPublish(topic, event, options);
+      });
+      const execute = vi.fn(async (_args: any, opts: any) => {
+        if (!opts.resumeData) {
+          await opts.suspend({ checkpoint: 'first' });
+          return undefined;
+        }
+        return 'resumed';
+      });
+      const bgTask = createBackgroundTask(local.mgr, {
+        toolName: 'checkpoint-tool',
+        toolCallId: 'late-failed-resume',
+        args: {},
+        agentId: 'a1',
+        runId: 'late-failed-resume',
+        context: ctx(execute),
+      });
+      let resumePromise: Promise<unknown> | undefined;
+
+      try {
+        const { task } = await bgTask.dispatch();
+        await vi.waitFor(async () =>
+          expect(await local.mgr.getTask(task.id)).toMatchObject({
+            status: 'suspended',
+            suspendPayload: { checkpoint: 'first' },
+          }),
+        );
+
+        const abortController = new AbortController();
+        resumePromise = bgTask.resume(
+          { approved: true },
+          { waitForAdmission: true, abortSignal: abortController.signal },
+        );
+        await vi.waitFor(() => expect(publish.mock.calls.some(([, event]) => event.type === 'task.resume')).toBe(true));
+        abortController.abort(new Error('resume admission aborted'));
+        await expect(resumePromise).rejects.toMatchObject({ message: 'resume admission aborted' });
+        expect(local.mgr.taskContexts.has(task.id)).toBe(true);
+        expect((local.mgr as any).localReservations.has(task.id)).toBe(true);
+
+        const { task: next } = await local.mgr.enqueue(
+          {
+            toolName: 'agent-helper',
+            toolCallId: 'late-failed-next',
+            args: {},
+            agentId: 'a1',
+            runId: 'late-failed-next',
+          },
+          ctx(async () => 'next'),
+        );
+        expect(await local.mgr.getTask(next.id)).toMatchObject({ status: 'pending' });
+
+        releasePublication();
+        await vi.waitFor(() => {
+          expect(local.mgr.taskContexts.has(task.id)).toBe(true);
+          expect((local.mgr as any).localReservations.has(task.id)).toBe(false);
+        });
+
+        await vi.waitFor(async () =>
+          expect(await local.mgr.getTask(next.id)).toMatchObject({ status: 'completed', result: 'next' }),
+        );
+        expect(execute).toHaveBeenCalledTimes(1);
+      } finally {
+        releasePublication();
+        await resumePromise?.catch(() => {});
+        publish.mockRestore();
+        await local.cleanup();
+      }
+    });
+
+    it('rejects an awaited resume before a gated failed-publication cleanup read settles', async () => {
+      const local = await makeLocalManager({
+        enabled: true,
+        globalConcurrency: 1,
+        perAgentConcurrency: 1,
+        recoverStaleTasksOnStart: false,
+      });
+      const backgroundTasksStore = await testStorage.getStore('backgroundTasks');
+      const originalGetTask = backgroundTasksStore!.getTask.bind(backgroundTasksStore);
+      let getTaskCalls = 0;
+      let releaseCleanupRead!: () => void;
+      const cleanupRead = new Promise<void>(resolve => {
+        releaseCleanupRead = resolve;
+      });
+      let gateCleanupRead = false;
+      const getTask = vi.spyOn(backgroundTasksStore!, 'getTask').mockImplementation(async taskId => {
+        getTaskCalls++;
+        if (gateCleanupRead && getTaskCalls === 2) await cleanupRead;
+        return originalGetTask(taskId);
+      });
+      const originalPublish = local.isolatedPubsub.publish.bind(local.isolatedPubsub);
+      const publish = vi.spyOn(local.isolatedPubsub, 'publish').mockImplementation(async (topic, event, options) => {
+        if (event.type === 'task.resume') throw new Error('immediate resume publication failed');
+        return originalPublish(topic, event, options);
+      });
+      const execute = vi.fn(async (_args: any, opts: any) => {
+        if (!opts.resumeData) {
+          await opts.suspend({ checkpoint: 'first' });
+          return undefined;
+        }
+        return 'resumed';
+      });
+      const bgTask = createBackgroundTask(local.mgr, {
+        toolName: 'checkpoint-tool',
+        toolCallId: 'gated-failed-resume',
+        args: {},
+        agentId: 'a1',
+        runId: 'gated-failed-resume',
+        context: ctx(execute),
+      });
+      let resumePromise: Promise<unknown> | undefined;
+
+      try {
+        const { task } = await bgTask.dispatch();
+        await vi.waitFor(async () =>
+          expect(await local.mgr.getTask(task.id)).toMatchObject({
+            status: 'suspended',
+            suspendPayload: { checkpoint: 'first' },
+          }),
+        );
+        getTaskCalls = 0;
+        gateCleanupRead = true;
+
+        resumePromise = bgTask.resume({ approved: true }, { waitForAdmission: true });
+        void resumePromise.catch(() => {});
+        await vi.waitFor(() => expect(getTaskCalls).toBe(2));
+        const { task: next } = await local.mgr.enqueue(
+          {
+            toolName: 'agent-helper',
+            toolCallId: 'gated-failed-next',
+            args: {},
+            agentId: 'a1',
+            runId: 'gated-failed-next',
+          },
+          ctx(async () => 'next'),
+        );
+        expect((local.mgr as any).localPendingTaskIds.has(next.id)).toBe(true);
+
+        const outcome = await Promise.race([
+          resumePromise.then(
+            () => ({ kind: 'resolved' as const }),
+            error => ({ kind: 'rejected' as const, error }),
+          ),
+          tick(100).then(() => ({ kind: 'timed-out' as const })),
+        ]);
+        expect(outcome.kind).toBe('rejected');
+        if (outcome.kind === 'rejected') {
+          expect(outcome.error).toMatchObject({ message: 'immediate resume publication failed' });
+        }
+        expect(getTaskCalls).toBe(2);
+        expect(local.mgr.taskContexts.has(task.id)).toBe(true);
+        expect((local.mgr as any).localReservations.has(task.id)).toBe(true);
+
+        releaseCleanupRead();
+        await resumePromise.catch(() => {});
+        await vi.waitFor(async () =>
+          expect(await local.mgr.getTask(next.id)).toMatchObject({ status: 'completed', result: 'next' }),
+        );
+      } finally {
+        releaseCleanupRead();
+        await resumePromise?.catch(() => {});
+        getTask.mockRestore();
+        publish.mockRestore();
+        await local.cleanup();
+      }
+    });
+
+    it('retains a default resume ownership marker while an opt-in publication fails', async () => {
+      const local = await makeLocalManager({
+        enabled: true,
+        globalConcurrency: 1,
+        perAgentConcurrency: 1,
+        recoverStaleTasksOnStart: false,
+      });
+      let releaseFirstPublication!: () => void;
+      const firstPublicationGate = new Promise<void>(resolve => {
+        releaseFirstPublication = resolve;
+      });
+      let releaseSecondPublication!: () => void;
+      const secondPublicationGate = new Promise<void>(resolve => {
+        releaseSecondPublication = resolve;
+      });
+      let resumePublishCount = 0;
+      const originalPublish = local.isolatedPubsub.publish.bind(local.isolatedPubsub);
+      const publish = vi.spyOn(local.isolatedPubsub, 'publish').mockImplementation(async (topic, event, options) => {
+        if (event.type === 'task.resume') {
+          resumePublishCount++;
+          if (resumePublishCount === 1) {
+            await firstPublicationGate;
+            throw new Error('older opt-in publication failed');
+          }
+          await secondPublicationGate;
+        }
+        return originalPublish(topic, event, options);
+      });
+      const execute = vi.fn(async (_args: any, opts: any) => {
+        if (!opts.resumeData) {
+          await opts.suspend({ checkpoint: 'first' });
+          return undefined;
+        }
+        return 'resumed';
+      });
+      const bgTask = createBackgroundTask(local.mgr, {
+        toolName: 'checkpoint-tool',
+        toolCallId: 'mixed-resume-ownership',
+        args: {},
+        agentId: 'a1',
+        runId: 'mixed-resume-ownership',
+        context: ctx(execute),
+      });
+      let firstResume: Promise<unknown> | undefined;
+      let secondResume: Promise<unknown> | undefined;
+
+      try {
+        const { task } = await bgTask.dispatch();
+        await vi.waitFor(async () =>
+          expect(await local.mgr.getTask(task.id)).toMatchObject({
+            status: 'suspended',
+            suspendPayload: { checkpoint: 'first' },
+          }),
+        );
+
+        const abortController = new AbortController();
+        firstResume = bgTask.resume(
+          { approved: 'older' },
+          { waitForAdmission: true, abortSignal: abortController.signal },
+        );
+        void firstResume.catch(() => {});
+        await vi.waitFor(() => expect(resumePublishCount).toBe(1));
+        abortController.abort(new Error('older caller aborted'));
+        await expect(firstResume).rejects.toMatchObject({ message: 'older caller aborted' });
+
+        const olderTracker = [...(local.mgr as any).resumeAdmissionWaiters.get(task.id)][0];
+
+        secondResume = bgTask.resume({ approved: 'newer' });
+        void secondResume.catch(() => {});
+        await vi.waitFor(() => expect(resumePublishCount).toBe(2));
+
+        releaseFirstPublication();
+        await vi.waitFor(() => expect(olderTracker.failureCleanupPromise).toBeDefined());
+        await olderTracker.failureCleanupPromise;
+        expect((local.mgr as any).localReservations.has(task.id)).toBe(true);
+
+        releaseSecondPublication();
+        await secondResume;
+        await vi.waitFor(async () =>
+          expect(await local.mgr.getTask(task.id)).toMatchObject({ status: 'completed', result: 'resumed' }),
+        );
+        expect(execute).toHaveBeenCalledTimes(2);
+      } finally {
+        releaseFirstPublication();
+        releaseSecondPublication();
+        await firstResume?.catch(() => {});
+        await secondResume?.catch(() => {});
+        publish.mockRestore();
+        await local.cleanup();
+      }
+    });
+
+    it('preserves an admitted resume reservation when publication fails after delivery', async () => {
+      const local = await makeLocalManager({
+        enabled: true,
+        globalConcurrency: 1,
+        perAgentConcurrency: 1,
+        recoverStaleTasksOnStart: false,
+      });
+      let releaseExecution!: () => void;
+      const executionGate = new Promise<void>(resolve => {
+        releaseExecution = resolve;
+      });
+      let resumedExecution!: () => void;
+      const resumed = new Promise<void>(resolve => {
+        resumedExecution = resolve;
+      });
+      const originalPublish = local.isolatedPubsub.publish.bind(local.isolatedPubsub);
+      const publish = vi.spyOn(local.isolatedPubsub, 'publish').mockImplementation(async (topic, event, options) => {
+        if (event.type === 'task.resume') {
+          await originalPublish(topic, event, options);
+          await resumed;
+          throw new Error('late acknowledged resume publication failed');
+        }
+        return originalPublish(topic, event, options);
+      });
+      const execute = vi.fn(async (_args: any, opts: any) => {
+        if (!opts.resumeData) {
+          await opts.suspend({ checkpoint: 'first' });
+          return undefined;
+        }
+        resumedExecution();
+        await executionGate;
+        return 'resumed';
+      });
+      let resumePromise: Promise<unknown> | undefined;
+
+      try {
+        const { task } = await local.mgr.enqueue(
+          {
+            toolName: 'checkpoint-tool',
+            toolCallId: 'late-admitted-resume',
+            args: {},
+            agentId: 'a1',
+            runId: 'late-admitted-resume',
+          },
+          ctx(execute),
+        );
+        await vi.waitFor(async () =>
+          expect(await local.mgr.getTask(task.id)).toMatchObject({
+            status: 'suspended',
+            suspendPayload: { checkpoint: 'first' },
+          }),
+        );
+
+        resumePromise = local.mgr.resume(task.id, { approved: true }, { waitForAdmission: true });
+        await resumed;
+        await expect(resumePromise).rejects.toThrow('late acknowledged resume publication failed');
+        expect(await local.mgr.getTask(task.id)).toMatchObject({ status: 'running' });
+        expect(local.mgr.taskContexts.has(task.id)).toBe(true);
+        expect((local.mgr as any).localReservations.has(task.id)).toBe(true);
+
+        releaseExecution();
+        await vi.waitFor(async () =>
+          expect(await local.mgr.getTask(task.id)).toMatchObject({ status: 'completed', result: 'resumed' }),
+        );
+        await vi.waitFor(() => {
+          expect(local.mgr.taskContexts.has(task.id)).toBe(false);
+          expect((local.mgr as any).localReservations.has(task.id)).toBe(false);
+        });
+      } finally {
+        releaseExecution();
+        await resumePromise?.catch(() => {});
+        publish.mockRestore();
+        await local.cleanup();
+      }
+    });
+
+    it('resumes an agent-as-tool delegation whose runId is only in suspendOptions', async () => {
+      // Mirrors the real agent-as-tool suspend: the nested sub-agent runId is
+      // passed via `suspendOptions.runId` (with `isAgentSuspend: true`) and is
+      // absent from the suspend payload. The resume path must still restore it
+      // into `args.suspendedToolRunId`.
+      const executeFn = vi.fn(async (args, opts: any) => {
+        if (!opts.resumeData) {
+          await opts.suspend({ awaiting: 'approval' }, { runId: 'delegated-run-id', isAgentSuspend: true });
+          return undefined;
+        }
+        return {
+          approvedBy: (opts.resumeData as { user: string }).user,
+          suspendedToolRunId: args.suspendedToolRunId,
+        };
+      });
+
+      const { task } = await manager.enqueue(
+        { toolName: 't', toolCallId: 'cres-agent', args: {}, agentId: 'a1', runId: 'r4' },
+        ctx(executeFn),
+      );
+      await tick(200);
+
+      const suspended = await manager.getTask(task.id);
+      expect(suspended?.status).toBe('suspended');
+      // The user-facing suspend payload must stay clean — no runId leaked in.
+      expect(suspended?.suspendPayload).toEqual({ awaiting: 'approval' });
+      expect(executeFn.mock.calls[0]?.[0]).not.toHaveProperty('suspendedToolRunId');
+
+      await manager.resume(task.id, { user: 'alice' });
+      await tick(200);
+
+      const completed = await manager.getTask(task.id);
+      expect(completed?.status).toBe('completed');
+      expect(completed?.result).toEqual({ approvedBy: 'alice', suspendedToolRunId: 'delegated-run-id' });
+      expect(executeFn.mock.calls[1]?.[0]).toMatchObject({ suspendedToolRunId: 'delegated-run-id' });
+      expect(executeFn).toHaveBeenCalledTimes(2);
+    });
+
     it('emits background-task-resumed on the stream when resumed', async () => {
       const executeFn = vi.fn(async (_args, opts: any) => {
         if (!opts.resumeData) {
@@ -1055,6 +2055,44 @@ describe('BackgroundTaskManager', () => {
   });
 
   describe('recovery on startup', () => {
+    it('leaves running tasks untouched when startup recovery is disabled', async () => {
+      const seedStorage = new MockStore();
+      const bgStore = await seedStorage.getStore('backgroundTasks');
+      const startedAt = new Date(Date.now() - 60_000);
+      await bgStore!.createTask({
+        id: 'live-elsewhere',
+        status: 'running',
+        toolName: 't',
+        toolCallId: 'c',
+        args: {},
+        agentId: 'a',
+        runId: 'r',
+        retryCount: 0,
+        maxRetries: 0,
+        timeoutMs: 5000,
+        createdAt: new Date(),
+        startedAt,
+      });
+
+      const local = new Mastra({
+        logger: false,
+        storage: seedStorage,
+        backgroundTasks: { enabled: true, recoverStaleTasksOnStart: false },
+      });
+      await local.startWorkers();
+
+      try {
+        await tick(150);
+        await expect(local.backgroundTaskManager!.getTask('live-elsewhere')).resolves.toMatchObject({
+          status: 'running',
+          startedAt,
+        });
+      } finally {
+        await local.backgroundTaskManager?.shutdown();
+        await local.stopWorkers();
+      }
+    });
+
     it('recovers stale running tasks with retries available', async () => {
       // Pre-seed storage with a task in 'running' status as if a previous
       // process crashed mid-execution. A fresh manager.init() should flip
@@ -1279,6 +2317,469 @@ describe('BackgroundTaskManager', () => {
         });
       } finally {
         listTasks.mockRestore();
+        vi.useRealTimers();
+      }
+    });
+
+    it('retries a committed invocation after transient recovery publication failure', async () => {
+      vi.useFakeTimers();
+      const seedStorage = new MockStore();
+      const bgStore = await seedStorage.getStore('backgroundTasks');
+      const localMastra = new Mastra({ logger: false, storage: seedStorage });
+      await localMastra.startWorkers();
+      const isolatedPubsub = new EventEmitterPubSub();
+      const mgr = new BackgroundTaskManager({
+        enabled: true,
+        globalConcurrency: 1,
+        perAgentConcurrency: 1,
+        recoverStaleTasksOnStart: false,
+      });
+      mgr.__registerMastra(localMastra);
+      await mgr.init(isolatedPubsub);
+
+      const originalCreateTask = bgStore!.createTask.bind(bgStore);
+      let taskId!: string;
+      let failCreate = true;
+      const createTask = vi.spyOn(bgStore!, 'createTask').mockImplementation(async task => {
+        await originalCreateTask(task);
+        if (failCreate) {
+          taskId = task.id;
+          failCreate = false;
+          throw new Error('create acknowledgement lost');
+        }
+      });
+      const originalPublish = isolatedPubsub.publish.bind(isolatedPubsub);
+      let failPublish = true;
+      const publish = vi.spyOn(isolatedPubsub, 'publish').mockImplementation(async (topic, event, options) => {
+        if (event.type === 'task.dispatch' && failPublish) {
+          failPublish = false;
+          throw new Error('temporary recovery publication failure');
+        }
+        return originalPublish(topic, event, options);
+      });
+      const execute = vi.fn().mockResolvedValue('recovered');
+
+      try {
+        await expect(
+          mgr.enqueue(
+            {
+              toolName: 'recovery-publication',
+              toolCallId: 'recovery-publication',
+              args: {},
+              agentId: 'a1',
+              runId: 'recovery-publication',
+            },
+            ctx(execute),
+          ),
+        ).rejects.toThrow('create acknowledgement lost');
+        expect(await bgStore!.getTask(taskId)).toMatchObject({ status: 'pending' });
+        expect(mgr.taskContexts.has(taskId)).toBe(true);
+
+        await (mgr as any).recoverStaleTasks();
+
+        expect(await bgStore!.getTask(taskId)).toMatchObject({ status: 'pending' });
+        expect((mgr as any).localReservations.has(taskId)).toBe(true);
+        expect((mgr as any).recoveryTimer).toBeDefined();
+        expect(execute).not.toHaveBeenCalled();
+
+        await vi.advanceTimersByTimeAsync(60_000);
+        await vi.waitFor(async () =>
+          expect(await mgr.getTask(taskId)).toMatchObject({ status: 'completed', result: 'recovered' }),
+        );
+        expect(execute).toHaveBeenCalledTimes(1);
+      } finally {
+        createTask.mockRestore();
+        publish.mockRestore();
+        await mgr.shutdown();
+        await isolatedPubsub.close();
+        await localMastra.stopWorkers();
+        vi.useRealTimers();
+      }
+    });
+
+    it('does not redispatch a suspended invocation from a stale recovery snapshot', async () => {
+      const local = await makeLocalManager({
+        enabled: true,
+        globalConcurrency: 1,
+        perAgentConcurrency: 1,
+        recoverStaleTasksOnStart: false,
+      });
+      const backgroundTasksStore = await testStorage.getStore('backgroundTasks');
+      const originalCreateTask = backgroundTasksStore!.createTask.bind(backgroundTasksStore);
+      let taskId!: string;
+      let releaseCreate!: () => void;
+      const createGate = new Promise<void>(resolve => {
+        releaseCreate = resolve;
+      });
+      let rowCommitted!: () => void;
+      const committed = new Promise<void>(resolve => {
+        rowCommitted = resolve;
+      });
+      const createTask = vi.spyOn(backgroundTasksStore!, 'createTask').mockImplementation(async task => {
+        const isFirstCreate = !taskId;
+        if (isFirstCreate) taskId = task.id;
+        await originalCreateTask(task);
+        if (isFirstCreate) {
+          rowCommitted();
+          await createGate;
+        }
+      });
+      const originalListTasks = backgroundTasksStore!.listTasks.bind(backgroundTasksStore);
+      let releasePendingSnapshot!: () => void;
+      const pendingSnapshotGate = new Promise<void>(resolve => {
+        releasePendingSnapshot = resolve;
+      });
+      let pendingSnapshotStarted!: () => void;
+      const pendingSnapshot = new Promise<void>(resolve => {
+        pendingSnapshotStarted = resolve;
+      });
+      let gatePendingList = true;
+      const listTasks = vi.spyOn(backgroundTasksStore!, 'listTasks').mockImplementation(async filter => {
+        const result = await originalListTasks(filter);
+        if (gatePendingList && filter.status === 'pending') {
+          gatePendingList = false;
+          pendingSnapshotStarted();
+          await pendingSnapshotGate;
+        }
+        return result;
+      });
+      const execution = vi.fn(async (_args: any, opts: any) => {
+        await opts.suspend({ checkpoint: 'recovery-snapshot' });
+        return 'ignored-after-suspend';
+      });
+      let enqueuePromise: ReturnType<typeof local.mgr.enqueue> | undefined;
+      let recoveryPromise: Promise<unknown> | undefined;
+
+      try {
+        enqueuePromise = local.mgr.enqueue(
+          {
+            toolName: 'recovery-snapshot',
+            toolCallId: 'recovery-snapshot',
+            args: {},
+            agentId: 'a1',
+            runId: 'recovery-snapshot',
+          },
+          ctx(execution),
+        );
+        await committed;
+        recoveryPromise = (local.mgr as any).recoverStaleTasks();
+        await pendingSnapshot;
+
+        releaseCreate();
+        await enqueuePromise;
+        await vi.waitFor(async () =>
+          expect(await local.mgr.getTask(taskId)).toMatchObject({
+            status: 'suspended',
+            suspendPayload: { checkpoint: 'recovery-snapshot' },
+          }),
+        );
+        await vi.waitFor(() => {
+          expect((local.mgr as any).localReservations.has(taskId)).toBe(false);
+          expect(local.mgr.taskContexts.has(taskId)).toBe(true);
+        });
+
+        releasePendingSnapshot();
+        await recoveryPromise;
+
+        const nextExecute = vi.fn().mockResolvedValue('next');
+        const { task: next } = await local.mgr.enqueue(
+          {
+            toolName: 'after-recovery-snapshot',
+            toolCallId: 'after-recovery-snapshot',
+            args: {},
+            agentId: 'a1',
+            runId: 'after-recovery-snapshot',
+          },
+          ctx(nextExecute),
+        );
+        await vi.waitFor(async () =>
+          expect(await local.mgr.getTask(next.id)).toMatchObject({ status: 'completed', result: 'next' }),
+        );
+        expect(nextExecute).toHaveBeenCalledTimes(1);
+      } finally {
+        releaseCreate();
+        releasePendingSnapshot();
+        await enqueuePromise?.catch(() => {});
+        await recoveryPromise?.catch(() => {});
+        createTask.mockRestore();
+        listTasks.mockRestore();
+        await local.cleanup();
+      }
+    });
+
+    it.each([true, false])('does not reacquire a %s queue entry after a stale drain read', async secondSuspends => {
+      const local = await makeLocalManager({
+        enabled: true,
+        globalConcurrency: 1,
+        perAgentConcurrency: 1,
+        recoverStaleTasksOnStart: false,
+      });
+      const backgroundTasksStore = await testStorage.getStore('backgroundTasks');
+      const originalGetTask = backgroundTasksStore!.getTask.bind(backgroundTasksStore);
+      let queuedTaskId!: string;
+      let readStarted!: () => void;
+      const pendingReadStarted = new Promise<void>(resolve => {
+        readStarted = resolve;
+      });
+      let releaseRead!: () => void;
+      const pendingReadGate = new Promise<void>(resolve => {
+        releaseRead = resolve;
+      });
+      let gatePendingRead = true;
+      const getTask = vi.spyOn(backgroundTasksStore!, 'getTask').mockImplementation(async taskId => {
+        const task = await originalGetTask(taskId);
+        if (gatePendingRead && taskId === queuedTaskId && task?.status === 'pending') {
+          gatePendingRead = false;
+          readStarted();
+          await pendingReadGate;
+        }
+        return task;
+      });
+      const originalPublish = local.isolatedPubsub.publish.bind(local.isolatedPubsub);
+      let dispatchPublishes = 0;
+      const publish = vi.spyOn(local.isolatedPubsub, 'publish').mockImplementation(async (topic, event, options) => {
+        if (event.type === 'task.dispatch' && event.data.taskId === queuedTaskId) {
+          dispatchPublishes++;
+          if (!secondSuspends && dispatchPublishes === 2) throw new Error('stale drain publication failed');
+        }
+        return originalPublish(topic, event, options);
+      });
+      let releaseFirst!: () => void;
+      const firstGate = new Promise<void>(resolve => {
+        releaseFirst = resolve;
+      });
+      const firstExecute = vi.fn(async () => {
+        await firstGate;
+        return 'first';
+      });
+      let secondStarted!: () => void;
+      const secondStartedPromise = new Promise<void>(resolve => {
+        secondStarted = resolve;
+      });
+      let releaseSecond!: () => void;
+      const secondGate = new Promise<void>(resolve => {
+        releaseSecond = resolve;
+      });
+      const secondExecute = vi.fn(async (_args: any, opts: any) => {
+        secondStarted();
+        if (secondSuspends) {
+          await opts.suspend({ checkpoint: 'drain-read' });
+          return 'ignored-after-suspend';
+        }
+        await secondGate;
+        return 'second';
+      });
+      let recoveryPromise: Promise<unknown> | undefined;
+
+      try {
+        const { task: first } = await local.mgr.enqueue(
+          { toolName: 'drain-first', toolCallId: 'drain-first', args: {}, agentId: 'a1', runId: 'drain-first' },
+          ctx(firstExecute),
+        );
+        await vi.waitFor(() => expect((local.mgr as any).activeAbortControllers.has(first.id)).toBe(true));
+        const { task: queued } = await local.mgr.enqueue(
+          { toolName: 'drain-second', toolCallId: 'drain-second', args: {}, agentId: 'a1', runId: 'drain-second' },
+          ctx(secondExecute),
+        );
+        queuedTaskId = queued.id;
+
+        releaseFirst();
+        await pendingReadStarted;
+        await vi.waitFor(async () =>
+          expect(await local.mgr.getTask(first.id)).toMatchObject({ status: 'completed', result: 'first' }),
+        );
+        await vi.waitFor(() => expect((local.mgr as any).localReservations.has(first.id)).toBe(false));
+
+        recoveryPromise = (local.mgr as any).recoverStaleTasks();
+        await secondStartedPromise;
+        if (secondSuspends) {
+          await vi.waitFor(async () =>
+            expect(await local.mgr.getTask(queued.id)).toMatchObject({
+              status: 'suspended',
+              suspendPayload: { checkpoint: 'drain-read' },
+            }),
+          );
+          await vi.waitFor(() => expect((local.mgr as any).localReservations.has(queued.id)).toBe(false));
+        } else {
+          await vi.waitFor(async () => expect(await local.mgr.getTask(queued.id)).toMatchObject({ status: 'running' }));
+          expect((local.mgr as any).localReservations.has(queued.id)).toBe(true);
+        }
+
+        releaseRead();
+        await recoveryPromise;
+        await vi.waitFor(() => expect((local.mgr as any).drainingPending).toBe(false));
+        expect(dispatchPublishes).toBe(1);
+
+        const thirdExecute = vi.fn().mockResolvedValue('third');
+        const { task: third } = await local.mgr.enqueue(
+          { toolName: 'drain-third', toolCallId: 'drain-third', args: {}, agentId: 'a1', runId: 'drain-third' },
+          ctx(thirdExecute),
+        );
+        if (secondSuspends) {
+          await vi.waitFor(async () =>
+            expect(await local.mgr.getTask(third.id)).toMatchObject({ status: 'completed', result: 'third' }),
+          );
+        } else {
+          expect(await local.mgr.getTask(third.id)).toMatchObject({ status: 'pending' });
+          expect(thirdExecute).not.toHaveBeenCalled();
+          releaseSecond();
+          await vi.waitFor(async () =>
+            expect(await local.mgr.getTask(queued.id)).toMatchObject({ status: 'completed', result: 'second' }),
+          );
+          await vi.waitFor(async () =>
+            expect(await local.mgr.getTask(third.id)).toMatchObject({ status: 'completed', result: 'third' }),
+          );
+        }
+        expect(thirdExecute).toHaveBeenCalledTimes(1);
+      } finally {
+        releaseFirst();
+        releaseSecond();
+        releaseRead();
+        await recoveryPromise?.catch(() => {});
+        publish.mockRestore();
+        getTask.mockRestore();
+        await local.cleanup();
+      }
+    });
+
+    it('keeps a retry scheduled when a recovered queued dispatch loses its worker read', async () => {
+      vi.useFakeTimers();
+      const local = await makeLocalManager({
+        enabled: true,
+        globalConcurrency: 1,
+        perAgentConcurrency: 1,
+        recoverStaleTasksOnStart: false,
+      });
+      const backgroundTasksStore = await testStorage.getStore('backgroundTasks');
+      await backgroundTasksStore!.createTask({
+        id: 'foreign-unexpired-v11',
+        status: 'running',
+        toolName: 'foreign-running',
+        toolCallId: 'foreign-running',
+        args: {},
+        agentId: 'foreign-agent',
+        runId: 'foreign-running',
+        retryCount: 0,
+        maxRetries: 0,
+        timeoutMs: 3_600_000,
+        createdAt: new Date(),
+        startedAt: new Date(),
+      });
+      const originalGetTask = backgroundTasksStore!.getTask.bind(backgroundTasksStore);
+      let queuedTaskId!: string;
+      let drainReadStarted!: () => void;
+      const drainRead = new Promise<void>(resolve => {
+        drainReadStarted = resolve;
+      });
+      let releaseDrainRead!: () => void;
+      const drainReadGate = new Promise<void>(resolve => {
+        releaseDrainRead = resolve;
+      });
+      let gatePendingRead = true;
+      let failNextQueuedRead = false;
+      let failedQueuedRead!: () => void;
+      const queuedReadFailed = new Promise<void>(resolve => {
+        failedQueuedRead = resolve;
+      });
+      const getTask = vi.spyOn(backgroundTasksStore!, 'getTask').mockImplementation(async taskId => {
+        const task = await originalGetTask(taskId);
+        if (taskId === queuedTaskId && gatePendingRead && task?.status === 'pending') {
+          gatePendingRead = false;
+          drainReadStarted();
+          await drainReadGate;
+        } else if (taskId === queuedTaskId && failNextQueuedRead) {
+          failNextQueuedRead = false;
+          failedQueuedRead();
+          throw new Error('transient worker task read failed');
+        }
+        return task;
+      });
+      let releaseFirst!: () => void;
+      const firstGate = new Promise<void>(resolve => {
+        releaseFirst = resolve;
+      });
+      let firstStarted!: () => void;
+      const firstStartedPromise = new Promise<void>(resolve => {
+        firstStarted = resolve;
+      });
+      const firstExecute = vi.fn(async () => {
+        firstStarted();
+        await firstGate;
+        return 'first';
+      });
+      const secondExecute = vi.fn().mockResolvedValue('second');
+      const thirdExecute = vi.fn().mockResolvedValue('third');
+      let recoveryPromise: Promise<unknown> | undefined;
+
+      try {
+        const { task: first } = await local.mgr.enqueue(
+          {
+            toolName: 'recovery-first',
+            toolCallId: 'recovery-first',
+            args: {},
+            agentId: 'a1',
+            runId: 'recovery-first',
+          },
+          ctx(firstExecute),
+        );
+        await firstStartedPromise;
+        const { task: queued } = await local.mgr.enqueue(
+          {
+            toolName: 'recovery-second',
+            toolCallId: 'recovery-second',
+            args: {},
+            agentId: 'a1',
+            runId: 'recovery-second',
+          },
+          ctx(secondExecute),
+        );
+        queuedTaskId = queued.id;
+
+        releaseFirst();
+        await drainRead;
+        await vi.waitFor(() => expect((local.mgr as any).localReservations.has(first.id)).toBe(false));
+
+        failNextQueuedRead = true;
+        recoveryPromise = (local.mgr as any).recoverStaleTasks();
+        await queuedReadFailed;
+        releaseDrainRead();
+        await recoveryPromise;
+        await vi.waitFor(() => expect((local.mgr as any).drainingPending).toBe(false));
+
+        expect(await local.mgr.getTask(queued.id)).toMatchObject({ status: 'pending' });
+        expect((local.mgr as any).localReservations.has(queued.id)).toBe(true);
+        expect((local.mgr as any).localPendingTaskIds.has(queued.id)).toBe(false);
+        expect((local.mgr as any).recoveryTimer).toBeDefined();
+        expect(secondExecute).not.toHaveBeenCalled();
+
+        const { task: third } = await local.mgr.enqueue(
+          {
+            toolName: 'recovery-third',
+            toolCallId: 'recovery-third',
+            args: {},
+            agentId: 'a1',
+            runId: 'recovery-third',
+          },
+          ctx(thirdExecute),
+        );
+        expect(await local.mgr.getTask(third.id)).toMatchObject({ status: 'pending' });
+        expect(thirdExecute).not.toHaveBeenCalled();
+
+        await vi.advanceTimersByTimeAsync(60_000);
+        await vi.waitFor(async () =>
+          expect(await local.mgr.getTask(queued.id)).toMatchObject({ status: 'completed', result: 'second' }),
+        );
+        await vi.waitFor(async () =>
+          expect(await local.mgr.getTask(third.id)).toMatchObject({ status: 'completed', result: 'third' }),
+        );
+        expect(secondExecute).toHaveBeenCalledTimes(1);
+        expect(thirdExecute).toHaveBeenCalledTimes(1);
+      } finally {
+        releaseFirst();
+        releaseDrainRead();
+        await recoveryPromise?.catch(() => {});
+        getTask.mockRestore();
+        await local.cleanup();
         vi.useRealTimers();
       }
     });
@@ -1716,6 +3217,37 @@ describe('BackgroundTaskManager', () => {
       });
 
       // Complete the task — should get live completion event
+      resolver('late-result');
+      await tick();
+
+      const live = await reader.read();
+      expect(live.value).toMatchObject({
+        type: 'background-task-completed',
+        payload: { toolName: 'tool', result: 'late-result' },
+      });
+
+      abortController.abort();
+    });
+
+    it('can subscribe to live events without importing existing running tasks', async () => {
+      let resolver!: (val: string) => void;
+      await manager.enqueue(
+        { toolName: 'tool', toolCallId: 'c1', args: {}, agentId: 'a1', runId: 'run-1' },
+        ctx(
+          vi.fn().mockImplementation(
+            () =>
+              new Promise<string>(resolve => {
+                resolver = resolve;
+              }),
+          ),
+        ),
+      );
+      await tick();
+
+      const abortController = new AbortController();
+      const stream = manager.stream({ abortSignal: abortController.signal, includeExisting: false });
+      const reader = stream.getReader();
+
       resolver('late-result');
       await tick();
 

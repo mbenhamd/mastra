@@ -986,6 +986,10 @@ async function mockWorkflowRun(workflow: Workflow) {
       status: 'success',
     } as any);
 
+    // Cancellation routes call this lifecycle method directly. Keep the
+    // shared fixture's run surface aligned with the current WorkflowRun API.
+    vi.spyOn(run, 'cancel').mockResolvedValue(undefined);
+
     return run;
   });
 }
@@ -1373,6 +1377,40 @@ function getRouteSpecificPathDefaults(route: ServerRoute): {
   // so each request needs a fresh runId instead of the shared 'test-run'.
   if (routePath === '/workflows/:workflowId/stream' || routePath === '/agent-builder/:actionId/stream') {
     return { query: { runId: `test-run-${randomUUID()}` } };
+  }
+
+  // Dynamic workflow upserts need semantically valid JSON schemas and an agent
+  // graph whose input/output shapes line up with those schemas. The generic
+  // Zod-record generator intentionally produces arbitrary record values, which
+  // are valid transport values but not valid dynamic-workflow definitions.
+  if (routePath === '/dynamic/workflows') {
+    return {
+      body: {
+        id: 'test-dynamic-workflow-request',
+        inputSchema: {
+          type: 'object',
+          properties: { prompt: { type: 'string' } },
+          required: ['prompt'],
+        },
+        outputSchema: {
+          type: 'object',
+          properties: { text: { type: 'string' } },
+          required: ['text'],
+        },
+        graph: [
+          {
+            type: 'agent',
+            id: 'test-agent-step',
+            agentId: 'test-agent',
+            outputSchema: {
+              type: 'object',
+              properties: { text: { type: 'string' } },
+              required: ['text'],
+            },
+          },
+        ],
+      },
+    };
   }
 
   return {};

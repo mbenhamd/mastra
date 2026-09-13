@@ -1498,6 +1498,7 @@ export class AgentChannels {
       typingGate,
       formatError: adapterConfig?.formatError,
       textFormat: adapterConfig?.textFormat,
+      onAbort: adapterConfig?.onAbort,
       approvalContext,
     };
   }

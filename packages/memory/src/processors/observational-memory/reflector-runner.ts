@@ -53,12 +53,15 @@ import { createTemporaryOmMemoryContext } from './temporary-memory';
 import { getMaxThreshold } from './thresholds';
 import type { TokenCounter } from './token-counter';
 import { withOmTracingSpan } from './tracing';
+import { applyTextTransform } from './transform-hooks';
 import type {
   ObservationDebugEvent,
   ObservationMarkerConfig,
   ObservationModelContext,
   ObserveHookUsage,
   ObserveHooks,
+  ObserveTransformHooks,
+  ObserveTrigger,
   ReflectionCommittedContext,
   ResolvedObservationConfig,
   ResolvedReflectionConfig,
@@ -213,6 +216,7 @@ export class ReflectorRunner {
   private readonly getCompressionStartLevel: (requestContext?: RequestContext) => Promise<CompressionLevel>;
   private readonly memory?: Memory;
   private readonly onReflectionCommitted?: (context: ReflectionCommittedContext) => Promise<void>;
+  private readonly hooks?: ObserveTransformHooks;
   private mastra?: Mastra;
 
   /**
@@ -255,6 +259,7 @@ export class ReflectorRunner {
     mastra?: Mastra;
     memory?: Memory;
     onReflectionCommitted?: (context: ReflectionCommittedContext) => Promise<void>;
+    hooks?: ObserveTransformHooks;
   }) {
     this.reflectionConfig = opts.reflectionConfig;
     this.observationConfig = opts.observationConfig;
@@ -270,6 +275,7 @@ export class ReflectorRunner {
     this.mastra = opts.mastra;
     this.memory = opts.memory;
     this.onReflectionCommitted = opts.onReflectionCommitted;
+    this.hooks = opts.hooks;
   }
 
   __registerMastra(mastra: Mastra): void {
@@ -648,6 +654,7 @@ export class ReflectorRunner {
     priorExtractedValues?: Record<string, unknown>,
     mainAgent?: ProcessorContext['agent'],
     sendSignal?: ProcessorContext['sendSignal'],
+    trigger?: ObserveTrigger,
   ): void {
     const bufferKey = this.buffering.getReflectionBufferKey(lockKey);
 
@@ -682,6 +689,7 @@ export class ReflectorRunner {
           priorExtractedValues,
           mainAgent,
           sendSignal,
+          trigger,
         );
       } catch (error) {
         reflectionError = error instanceof Error ? error : new Error(String(error));
@@ -692,7 +700,7 @@ export class ReflectorRunner {
               operationType: 'reflection',
               startedAt: new Date().toISOString(),
               tokensAttempted: observationTokens,
-              error: reflectionError.message,
+              error,
               recordId: record.id,
               threadId: record.threadId ?? '',
             });
@@ -746,6 +754,7 @@ export class ReflectorRunner {
     priorExtractedValues?: Record<string, unknown>,
     mainAgent?: ProcessorContext['agent'],
     sendSignal?: ProcessorContext['sendSignal'],
+    trigger?: ObserveTrigger,
   ): Promise<
     | {
         usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
@@ -772,7 +781,19 @@ export class ReflectorRunner {
     const linesToReflect =
       avgTokensPerLine > 0 ? Math.min(Math.floor(activationPointTokens / avgTokensPerLine), totalLines) : totalLines;
 
-    const activeObservations = allLines.slice(0, linesToReflect).join('\n');
+    const hookContext = {
+      threadId: currentRecord.threadId ?? undefined,
+      resourceId: currentRecord.resourceId ?? undefined,
+      trigger,
+    };
+    // Only the text handed to the reflector is transformed; line-count
+    // bookkeeping stays based on the untransformed slice.
+    const activeObservations = await applyTextTransform(
+      this.hooks,
+      'beforeReflection',
+      allLines.slice(0, linesToReflect).join('\n'),
+      hookContext,
+    );
     const reflectedObservationLineCount = linesToReflect;
     const sliceTokenEstimate = Math.round(avgTokensPerLine * linesToReflect);
     const compressionTarget = Math.round(sliceTokenEstimate * 0.75);
@@ -820,6 +841,12 @@ export class ReflectorRunner {
         threadId,
         resourceId: currentRecord.resourceId ?? undefined,
       },
+    );
+    reflectResult.observations = await applyTextTransform(
+      this.hooks,
+      'afterReflection',
+      reflectResult.observations,
+      hookContext,
     );
 
     await persistThreadExtractedValues(
@@ -1074,6 +1101,8 @@ export class ReflectorRunner {
     messageList?: MessageList;
     currentModel?: ObservationModelContext;
     reflectionHooks?: Pick<ObserveHooks, 'onReflectionStart' | 'onReflectionEnd'>;
+    /** Which pipeline path initiated this cycle; forwarded to transform hooks. */
+    trigger?: ObserveTrigger;
     requestContext?: RequestContext;
     observabilityContext?: ObservabilityContext;
     lastActivityAt?: number;
@@ -1089,6 +1118,7 @@ export class ReflectorRunner {
       messageList,
       currentModel,
       reflectionHooks,
+      trigger,
       requestContext,
       observabilityContext,
       lastActivityAt,
@@ -1134,6 +1164,7 @@ export class ReflectorRunner {
           priorExtractedValues,
           mainAgent,
           sendSignal,
+          trigger,
         );
       }
     }
@@ -1241,6 +1272,7 @@ export class ReflectorRunner {
           priorExtractedValues,
           mainAgent,
           sendSignal,
+          trigger,
         );
         return;
       }
@@ -1323,8 +1355,13 @@ export class ReflectorRunner {
       }
 
       const compressionStartLevel = await this.getCompressionStartLevel(requestContext);
+      const hookContext = {
+        threadId: requestedThreadId ?? record.threadId ?? undefined,
+        resourceId: record.resourceId ?? undefined,
+        trigger,
+      };
       const reflectResult = await this.call(
-        record.activeObservations,
+        await applyTextTransform(this.hooks, 'beforeReflection', record.activeObservations, hookContext),
         undefined,
         streamContext,
         reflectThreshold,
@@ -1342,6 +1379,12 @@ export class ReflectorRunner {
           threadId,
           resourceId: record.resourceId ?? undefined,
         },
+      );
+      reflectResult.observations = await applyTextTransform(
+        this.hooks,
+        'afterReflection',
+        reflectResult.observations,
+        hookContext,
       );
       reflectionUsage = reflectResult.usage;
       reflectionProviderMetadata = reflectResult.providerMetadata;
@@ -1422,7 +1465,7 @@ export class ReflectorRunner {
           operationType: 'reflection',
           startedAt: streamContext.startedAt,
           tokensAttempted: observationTokens,
-          error: error instanceof Error ? error.message : String(error),
+          error,
           recordId: record.id,
           threadId,
         });

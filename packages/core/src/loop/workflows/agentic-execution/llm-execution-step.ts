@@ -3,7 +3,7 @@ import { isProxy } from 'node:util/types';
 import { isAbortError } from '@ai-sdk/provider-utils-v6';
 import type { LanguageModelV2Usage } from '@ai-sdk/provider-v5';
 import { APICallError } from '@internal/ai-sdk-v5';
-import type { CallSettings, StepResult, ToolChoice, ToolSet } from '@internal/ai-sdk-v5';
+import type { StepResult, ToolChoice, ToolSet } from '@internal/ai-sdk-v5';
 import type { StructuredOutputOptions } from '../../../agent';
 import { enforceChannelToolFence, readChannelToolFence } from '../../../agent/channel-tool-fence';
 import { AGENT_RESPONSE_RECOVERY_STEP } from '../../../agent/merge-execution-options';
@@ -24,6 +24,7 @@ import { TripWire } from '../../../agent/trip-wire';
 import { isSupportedLanguageModel, supportedLanguageModelSpecifications } from '../../../agent/utils';
 import { ErrorCategory, ErrorDomain, MastraError } from '../../../error';
 import { getErrorFromUnknown } from '../../../error/utils.js';
+import type { MastraModelSettings } from '../../../llm/model/model-settings';
 import { mergeProviderOptions } from '../../../llm/model/provider-options';
 import { ModelRouterLanguageModel } from '../../../llm/model/router';
 import { resolveResponseModelId } from '../../../llm/model/server-side-fallback';
@@ -90,6 +91,7 @@ import {
   MEMORY_KEY,
   RESOURCE_ID_KEY,
   STEP_ACTIVE_TOOLS_KEY,
+  STEP_MODEL_MESSAGES_KEY,
   STEP_TOOLS_KEY,
   STEP_WORKSPACE_KEY,
   THREAD_ID_KEY,
@@ -1531,7 +1533,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
           toolChoice?: ToolChoice<TOOLS> | undefined;
           activeTools?: (keyof TOOLS)[] | undefined;
           providerOptions?: SharedProviderOptions | undefined;
-          modelSettings?: Omit<CallSettings, 'abortSignal'> | undefined;
+          modelSettings?: MastraModelSettings | undefined;
           structuredOutput?: StructuredOutputOptions<OUTPUT>;
           workspace?: Workspace;
         } = {
@@ -1995,6 +1997,23 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
           Array.isArray(currentStep.activeTools) &&
           currentStep.activeTools.length === 0;
 
+        const omContinuation = messageList.get.all.db().find(message => message.id === 'om-continuation');
+        const omContinuationText = omContinuation?.content.parts
+          .filter(part => part.type === 'text')
+          .map(part => part.text)
+          .join('');
+        const delegationMessages = omContinuationText
+          ? inputMessages.filter(message => {
+              if (message.role !== 'user' || !Array.isArray(message.content)) return true;
+              const text = message.content
+                .filter(part => part.type === 'text')
+                .map(part => part.text)
+                .join('');
+              return text !== omContinuationText;
+            })
+          : inputMessages;
+        writeScoped(scopeCtx, STEP_MODEL_MESSAGES_KEY, 'stepModelMessages', delegationMessages);
+
         if (cachedResponse) {
           // Short-circuit: replay cached chunks instead of calling the model.
           // Output processors are skipped on cache hit because the cached
@@ -2040,6 +2059,10 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
             parameters: {
               ...currentStep.modelSettings,
               ...modelConfig.modelSettings,
+              timeout:
+                currentStep.modelSettings?.timeout || modelConfig.modelSettings?.timeout
+                  ? { ...currentStep.modelSettings?.timeout, ...modelConfig.modelSettings?.timeout }
+                  : undefined,
             } as Record<string, unknown> | undefined,
             providerOptions: currentStep.providerOptions as Record<string, unknown> | undefined,
             availableTools: getStepAvailableToolNames(
@@ -2068,6 +2091,10 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                 modelSettings: {
                   ...currentStep.modelSettings,
                   ...modelConfig.modelSettings,
+                  timeout:
+                    currentStep.modelSettings?.timeout || modelConfig.modelSettings?.timeout
+                      ? { ...currentStep.modelSettings?.timeout, ...modelConfig.modelSettings?.timeout }
+                      : undefined,
                   maxRetries: responseRecoveryStep
                     ? 0
                     : modelConfig.maxRetriesConfigured
@@ -2879,6 +2906,34 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
         }
       }
 
+      // A truncated generation only continues when every local tool call is
+      // complete enough to execute. Partial JSON must stop rather than replaying
+      // the same request until maxSteps; complete tool calls can execute and let
+      // the next iteration consume their results. Provider errors and content
+      // filtering always stop, while `stop` may still accompany valid tool calls.
+      const localToolCalls = (toolCalls ?? []).filter(tc => !tc.providerExecuted);
+      const hasCompleteLocalToolCalls =
+        localToolCalls.length > 0 && localToolCalls.every(tc => localToolCallPayloadIsComplete(tc));
+      const hasPendingToolCalls =
+        localToolCalls.length > 0 &&
+        finishReason !== 'error' &&
+        finishReason !== 'content-filter' &&
+        (finishReason !== 'length' || hasCompleteLocalToolCalls);
+      const shouldContinue =
+        !responseRecoveryStep &&
+        !providerViolatedToolFence &&
+        (shouldRetry ||
+          (!tripwireTriggered && (hasPendingToolCalls || !TERMINAL_FINISH_REASONS.includes(finishReason))));
+
+      // Fail abandoned provider calls before creating snapshots so persisted history
+      // cannot retain pending calls after a terminal error. Only target this step's IDs.
+      if (runState.state.hasErrored && !shouldContinue && !shouldRetry) {
+        const providerToolCallIds = toolCalls.filter(tc => tc.providerExecuted === true).map(tc => tc.toolCallId);
+        if (providerToolCallIds.length > 0) {
+          messageList.addOutputErrorsToProviderToolCalls(outputStream.messageId, providerToolCallIds);
+        }
+      }
+
       const steps = inputData.output?.steps || [];
       // StepContentExtractor uses one-based step numbers. `steps.length` is the
       // number of already-completed steps because the current result is pushed
@@ -2951,26 +3006,8 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
       // - OR finishReason indicates more work (e.g., tool-use)
       // Provider-executed tools (e.g. web_search) are handled server-side — the response already
       // contains both the tool execution and the text output, so no additional loop iteration is needed.
-      //
-      // NOTE: truncated (`length`) generations must not retry the same request
-      // (issue #15717). A *complete* local tool payload on a length finish is
-      // different: the tool can execute and the next iteration consumes the
-      // result. Incomplete/truncated tool JSON still stops the loop.
-      // `error` and `content-filter` must never be overridden. `stop` is
-      // intentionally allowed — some models return stop alongside tool calls.
-      const localToolCalls = (toolCalls ?? []).filter(tc => !tc.providerExecuted);
-      const hasCompleteLocalToolCalls =
-        localToolCalls.length > 0 && localToolCalls.every(tc => localToolCallPayloadIsComplete(tc));
-      const hasPendingToolCalls =
-        localToolCalls.length > 0 &&
-        finishReason !== 'error' &&
-        finishReason !== 'content-filter' &&
-        (finishReason !== 'length' || hasCompleteLocalToolCalls);
-      const shouldContinue =
-        !responseRecoveryStep &&
-        !providerViolatedToolFence &&
-        (shouldRetry ||
-          (!tripwireTriggered && (hasPendingToolCalls || !TERMINAL_FINISH_REASONS.includes(finishReason))));
+      // The shouldContinue/hasPendingToolCalls decision is computed above so reconciliation can run
+      // before the returned snapshots are built.
 
       // On terminal exit, materialize spans for provider tool calls whose result never arrived.
       // On retry (shouldRetry), pending calls from the rejected attempt must also be flushed —

@@ -142,6 +142,19 @@ export function createDurableLLMMappingStep() {
         );
       };
 
+      // A pending client-side / HITL call: no result, no error, not provider-executed and
+      // not a resolved denial. The client answers it on a follow-up request, so it must
+      // stay in `call` state, must not appear as a tool result anywhere, and must end the
+      // turn — the durable counterpart of the non-durable llm-mapping-step's
+      // `hasPendingHITL` (issue #23295). A resolved server tool may legitimately return
+      // `undefined`, so the tool-call step marks successful server execution explicitly.
+      const isPendingClientCall = (toolResult: (typeof toolResults)[number]) =>
+        toolResult.result === undefined &&
+        !toolResult.error &&
+        !toolResult.providerExecuted &&
+        !isDeniedApproval(toolResult) &&
+        !toolResult.serverExecuted;
+
       // 2. Add tool results to message list
       // Look up tools from the in-process registry for toModelOutput support
       const registryModel = registryEntry?.model as { __metadataOnly?: boolean } | undefined;
@@ -173,7 +186,7 @@ export function createDurableLLMMappingStep() {
         | undefined;
       if (llmOutput.stepSpanData) {
         try {
-          const observability = (mastra as Mastra | undefined)?.observability?.getSelectedInstance({ requestContext });
+          const observability = mastra?.observability?.getSelectedInstance({ requestContext });
           stepSpan = observability?.rebuildSpan(llmOutput.stepSpanData as ExportedSpan<SpanType.MODEL_STEP>);
         } catch {
           // Span bookkeeping must never break the merge step.
@@ -228,15 +241,19 @@ export function createDurableLLMMappingStep() {
             continue;
           }
 
+          // Recording a pending call as a `result` would overwrite the invocation with an
+          // undefined value and feed the model a fabricated tool output on the next turn.
+          if (isPendingClientCall(toolResult)) {
+            continue;
+          }
+
           const result = toolResult.error ? toolResult.error.message : toolResult.result;
 
           // Compute toModelOutput for successful tool results (Bug 9 parity).
           // Start from the existing providerMetadata so it's preserved even when
           // toModelOutput is absent or fails — otherwise provider-executed tools
           // or tools without a mapper lose their metadata.
-          let providerMetadata: Record<string, unknown> | undefined = toolResult.providerMetadata as
-            | Record<string, unknown>
-            | undefined;
+          let providerMetadata: Record<string, unknown> | undefined = toolResult.providerMetadata;
           if (
             !toolResult.error &&
             toolResult.result != null &&
@@ -280,7 +297,7 @@ export function createDurableLLMMappingStep() {
               } catch (err) {
                 mappingSpan?.error({ error: err as Error, endSpan: true });
                 // toModelOutput errors are non-fatal — the tool result is still usable
-                (mastra as Mastra | undefined)
+                mastra
                   ?.getLogger?.()
                   ?.warn?.(`[DurableAgent] toModelOutput failed for tool "${toolResult.toolName}": ${err}`);
               }
@@ -338,7 +355,10 @@ export function createDurableLLMMappingStep() {
       // self-correct. This matches the regular agent's behaviour where both
       // ToolNotFoundError and generic tool execution errors are recoverable.
       const hasToolErrors = toolResults.some(r => r.error !== undefined);
-      const isContinued = hasToolErrors ? true : llmOutput.stepResult.isContinued;
+      // A pending client call ends the turn so the client can answer it. Without this the
+      // loop re-invoked the model on a result nobody produced.
+      const hasPendingHITL = toolResults.some(isPendingClientCall);
+      const isContinued = hasPendingHITL ? false : hasToolErrors ? true : llmOutput.stepResult.isContinued;
 
       // Check if any delegation hook called ctx.bail(). The bail flag is
       // communicated via requestContext because Zod output validation strips
@@ -396,6 +416,7 @@ export function createDurableLLMMappingStep() {
           });
         }
         for (const tr of toolResults ?? []) {
+          if (isPendingClientCall(tr)) continue;
           stepContent.push({
             type: 'tool-result',
             toolCallId: tr.toolCallId,
@@ -408,6 +429,10 @@ export function createDurableLLMMappingStep() {
           ...deferredChunk,
           payload: {
             ...deferredChunk.payload,
+            stepResult: {
+              ...deferredChunk.payload?.stepResult,
+              isContinued,
+            },
             _durableStepContent: stepContent,
             ...(terminalToolResult ? { terminalToolResult } : {}),
           },
@@ -466,9 +491,7 @@ export function createDurableLLMMappingStep() {
           });
         } catch (error) {
           // Span bookkeeping must never break the merge step.
-          (mastra as Mastra | undefined)
-            ?.getLogger?.()
-            ?.warn?.(`[DurableAgent] Failed to close model_step span: ${error}`);
+          mastra?.getLogger?.()?.warn?.(`[DurableAgent] Failed to close model_step span: ${error}`);
         }
       }
 

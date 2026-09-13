@@ -420,7 +420,7 @@ const agent = new Agent({
   id: "custom-agent",
   name: "custom-agent",
   model: {
-    url: "https://${DATABRICKS_HOST}/ai-gateway/mlflow/v1",
+    url: `https://${DATABRICKS_HOST}/ai-gateway/mlflow/v1`,
     id: "databricks/databricks-claude-haiku-4-5",
     apiKey: process.env.DATABRICKS_TOKEN,
     headers: {
@@ -444,5 +444,4 @@ const agent = new Agent({
   }
 });
 ```
-
 

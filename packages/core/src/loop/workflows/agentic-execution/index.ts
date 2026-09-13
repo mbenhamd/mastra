@@ -13,11 +13,7 @@ import { createIsTaskCompleteStep } from './is-task-complete-step';
 import { createLLMExecutionStep } from './llm-execution-step';
 import { createLLMMappingStep } from './llm-mapping-step';
 import { createSignalDrainStep } from './signal-drain-step';
-import {
-  normalizeToolCallConcurrency,
-  resolveCalledBatchToolCallConcurrency,
-  resolveToolCallConcurrency,
-} from './tool-call-concurrency';
+import { normalizeToolCallConcurrency, resolveToolCallConcurrency } from './tool-call-concurrency';
 import type { ToolCallForeachOptions } from './tool-call-concurrency';
 import { createToolCallStep } from './tool-call-step';
 
@@ -136,28 +132,20 @@ export function createAgenticExecutionWorkflow<Tools extends ToolSet = ToolSet, 
         // called. A registered approval/suspending tool that the model did not
         // call this step still forces sequential execution.
         //
-        // Opt-in ('called'): resolve from the tools the model actually called
-        // this step — see resolveCalledBatchToolCallConcurrency for the safety
-        // argument. A pure-safe batch parallelizes even while an approval/suspend
-        // tool stays registered; a batch that calls one still serializes; run-wide
-        // requireToolApproval still forces sequential.
-        const stepTools = ((_internal?.stepTools as Tools | undefined) ?? rest.tools) as Tools | undefined;
-        toolCallForeachOptions.concurrency =
-          toolCallConcurrencyStrategy === 'called'
-            ? resolveCalledBatchToolCallConcurrency({
-                toolCalls,
-                requireToolApproval: rest.requireToolApproval,
-                tools: stepTools,
-                permissionPolicy,
-                configuredConcurrency: configuredToolCallConcurrency,
-              })
-            : resolveToolCallConcurrency({
-                requireToolApproval: rest.requireToolApproval,
-                tools: stepTools,
-                activeTools: _internal?.stepActiveTools as string[] | undefined,
-                permissionPolicy,
-                configuredConcurrency: configuredToolCallConcurrency,
-              });
+        // Opt-in ('called') strategy: resolve from the tools the model actually
+        // called this step. A pure-safe batch parallelizes even while an
+        // approval/suspend tool stays registered; a batch that calls one still
+        // serializes; run-wide requireToolApproval still forces sequential.
+        const stepActiveTools = _internal?.stepActiveTools;
+        toolCallForeachOptions.concurrency = resolveToolCallConcurrency({
+          requireToolApproval: rest.requireToolApproval,
+          tools: (_internal?.stepTools as Tools | undefined) ?? rest.tools,
+          activeTools: stepActiveTools,
+          permissionPolicy,
+          configuredConcurrency: configuredToolCallConcurrency,
+          strategy: toolCallConcurrencyStrategy,
+          calledToolNames: toolCalls.map(toolCall => toolCall.toolName),
+        });
         return toolCalls;
       },
       { id: 'map-tool-calls' },

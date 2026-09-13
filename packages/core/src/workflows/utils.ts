@@ -531,6 +531,7 @@ export const createTimeTravelExecutionParams = (params: {
         endedAt: isCompleteStatus ? (stepContext?.endedAt ?? Date.now()) : undefined,
         suspendedAt: stepContext?.suspendedAt,
         resumedAt: stepContext?.resumedAt,
+        metadata: stepContext?.metadata,
       };
       const execPathLengthToUse = perStep ? executionPath.length : currentExecPathLength;
       if (

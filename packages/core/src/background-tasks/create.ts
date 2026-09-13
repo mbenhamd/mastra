@@ -1,5 +1,7 @@
+import { isBackgroundTaskResumePublishedError } from './manager';
 import type { BackgroundTaskManager } from './manager';
 import type {
+  BackgroundTaskResumeOptions,
   BackgroundTaskHandle,
   CheckIfRunningPayload,
   CheckIfSuspendedPayload,
@@ -94,9 +96,19 @@ export function createBackgroundTask(
       return false;
     },
 
-    async resume(resumeData?: unknown) {
+    async resume(resumeData?: unknown, resumeOptions?: BackgroundTaskResumeOptions) {
       if (!taskId) throw new Error('Task has not been dispatched yet');
-      return manager.resume(taskId, resumeData);
+      manager.registerTaskContext(taskId, context);
+      try {
+        return resumeOptions
+          ? await manager.resume(taskId, resumeData, resumeOptions)
+          : await manager.resume(taskId, resumeData);
+      } catch (error) {
+        if (!isBackgroundTaskResumePublishedError(error)) {
+          manager.deregisterTaskContext(taskId);
+        }
+        throw error;
+      }
     },
 
     async restart() {

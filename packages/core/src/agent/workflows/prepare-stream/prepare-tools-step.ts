@@ -67,6 +67,7 @@ export function createPrepareToolsStep<OUTPUT = undefined>({
         delegation: options.delegation,
         pubsub: options._pubsub,
         backgroundTaskEnabled,
+        backgroundTaskPolicy: options.backgroundTaskPolicy,
         inputProcessors: options.inputProcessors,
         ...(processorResumeMessages !== undefined ? { processorMessages: processorResumeMessages } : {}),
         hooks: options.hooks,

@@ -246,6 +246,11 @@ export interface SerializableDurableOptions {
   skipBgTaskWait?: boolean;
   /** When true, background tasks are disabled for this run (the registry will not receive a BackgroundTaskManager). */
   disableBackgroundTasks?: boolean;
+  /** Execution-scoped background dispatch policy for delegated agents. */
+  backgroundTaskPolicy?: {
+    allowToolDispatch: boolean;
+    allowDelegationDispatch: boolean;
+  };
   /** Tracing options forwarded to the agent/model spans (metadata, tags, requestContextKeys, parentSpanId, hideInput/hideOutput, traceId). */
   tracingOptions?: TracingOptions;
   /**
@@ -442,6 +447,8 @@ export interface DurableToolCallOutput extends DurableToolCallInput {
   resumeTargetToolCallId?: string;
   /** Result from tool execution */
   result?: unknown;
+  /** Whether the result came from a successful server-side tool execution. */
+  serverExecuted?: boolean;
   /** Whether toModelOutput was evaluated before the result crossed the durable boundary */
   modelOutputComputed?: boolean;
   /** Error if tool execution failed */

@@ -1,6 +1,7 @@
 import { z } from 'zod';
-import type { SuspendOptions } from '../workflows';
+import { InternalSpans } from '../observability';
 import { createStep, createWorkflow } from '../workflows';
+import type { SuspendOptions } from '../workflows';
 import type { BackgroundTaskManager } from './manager';
 import { BACKGROUND_TASK_SHUTDOWN_ABORT_MESSAGE } from './shutdown';
 import type { BackgroundTaskStatus } from './types';
@@ -28,11 +29,11 @@ const WORKFLOW_STATUS_TO_PERSIST = ['suspended', 'pending', 'paused', 'waiting']
  * Builds the per-task workflow that owns executor + retries.
  *
  * Uses the standard (default) execution engine so the workflow runs entirely
- * in-process on whatever host calls `run.start()`. This is critical for
- * distributed deployments where the background-task worker must
- * execute tools locally — routing through the evented pipeline would send
- * step execution to the orchestration worker / API, which don't have the
- * internal workflow or task contexts registered.
+ * in-process on whichever background-task worker calls `run.start()`. This is
+ * critical for distributed deployments: routing through the evented pipeline
+ * would introduce another competing-consumer hop that could move execution to
+ * an orchestration worker or API process without the internal workflow or
+ * invocation-bound task context registered.
  *
  * A single `run-attempt` step is the `dountil` body. It invokes the executor,
  * persists the outcome, advances retry bookkeeping, and returns whether the
@@ -237,17 +238,32 @@ export function buildBackgroundTaskWorkflow(manager: BackgroundTaskManager) {
           args.suspendedToolRunId = suspendedToolRunId;
         }
 
-        attemptResult = await executor.execute(args, {
-          abortSignal: abortController.signal,
-          onProgress,
-          suspend: wrappedSuspend,
-          // On resume the runtime populates `resumeData`; undefined on
-          // the initial run.
-          resumeData,
-        });
+        attemptResult = await manager.runWithTaskExecutionContext(taskId, task.agentId, () =>
+          executor.execute(args, {
+            abortSignal: abortController.signal,
+            onProgress,
+            suspend: wrappedSuspend,
+            // On resume the runtime populates `resumeData`; undefined on
+            // the initial run.
+            resumeData,
+          }),
+        );
 
         if (pendingSuspend) {
-          return suspend(pendingSuspend.data, pendingSuspend.suspendOptions as SuspendOptions);
+          // Agent-as-tool delegations carry the nested sub-agent's runId in
+          // `suspendOptions.runId` (with `isAgentSuspend: true`), never in the
+          // suspend payload. The resume path above restores it from the step's
+          // persisted `suspendData.suspendedToolRunId`, so bridge it into the
+          // engine suspend data here. Keep the user-facing `suspendPayload`
+          // stored above untouched — this only augments the internal snapshot.
+          const opts = pendingSuspend.suspendOptions;
+          const agentRunId = opts?.isAgentSuspend && typeof opts.runId === 'string' ? opts.runId : undefined;
+          const engineData = !agentRunId
+            ? pendingSuspend.data
+            : pendingSuspend.data && typeof pendingSuspend.data === 'object'
+              ? { ...(pendingSuspend.data as Record<string, unknown>), suspendedToolRunId: agentRunId }
+              : { suspendedToolRunId: agentRunId };
+          return suspend(engineData, opts as SuspendOptions);
         }
 
         if (wasShutdownAbort()) {
@@ -258,7 +274,7 @@ export function buildBackgroundTaskWorkflow(manager: BackgroundTaskManager) {
         }
       } catch (error: any) {
         const currentTask = await storage.getTask(taskId);
-        if (!currentTask || (currentTask.status as BackgroundTaskStatus) === 'cancelled') {
+        if (!currentTask || currentTask.status === 'cancelled') {
           manager.deregisterTaskContext(taskId);
           outcome = 'cancelled';
         } else if (wasShutdownAbort()) {
@@ -298,6 +314,7 @@ export function buildBackgroundTaskWorkflow(manager: BackgroundTaskManager) {
     steps: [runAttemptStep],
     options: {
       shouldPersistSnapshot: ({ workflowStatus }) => WORKFLOW_STATUS_TO_PERSIST.includes(workflowStatus),
+      tracingPolicy: { internal: InternalSpans.WORKFLOW },
     },
   })
     .dountil(runAttemptStep, async ({ inputData }) => inputData?.done === true)

@@ -86,6 +86,10 @@ export interface ExecuteStepParams extends ObservabilityContext {
   perStep?: boolean;
   /** @internal Let foreach release its queue slot before awaiting canonical result delivery. */
   deferLifecycleResult?: (emission: Promise<void>) => void;
+  /** Authored graph entry description to attach to the step span (e.g. mapping steps) */
+  entryDescription?: string;
+  /** Authored graph entry metadata to attach to the step span (e.g. mapping steps) */
+  entryMetadata?: Record<string, any>;
 }
 
 export async function executeStep(
@@ -114,6 +118,8 @@ export async function executeStep(
     iterationCount,
     perStep,
     deferLifecycleResult,
+    entryDescription,
+    entryMetadata,
     ...rest
   } = params;
   const skipEmits = skipEmitsParam || engine.options.emitStepEvents === false;
@@ -237,6 +243,12 @@ export async function executeStep(
       entityType: EntityType.WORKFLOW_STEP,
       entityId: step.id,
       input: inputData,
+      ...((entryDescription || entryMetadata) && {
+        attributes: {
+          ...(entryDescription ? { entryDescription } : {}),
+          ...(entryMetadata ? { entryMetadata } : {}),
+        },
+      }),
       tracingPolicy: engine.options?.tracingPolicy,
       requestContext,
     },

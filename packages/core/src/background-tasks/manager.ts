@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import type { Mastra } from '..';
 import type { PubSub } from '../events/pubsub';
@@ -6,6 +7,7 @@ import { BACKGROUND_TASK_SHUTDOWN_ABORT_MESSAGE } from './shutdown';
 import type {
   BackgroundTask,
   BackgroundTaskManagerConfig,
+  BackgroundTaskResumeOptions,
   BackgroundTaskStatus,
   EnqueueResult,
   TaskContext,
@@ -26,6 +28,56 @@ const SHUTDOWN_GRACE_PERIOD_MS = 5_000;
 const isTerminalBackgroundTaskStatus = (status: BackgroundTaskStatus) =>
   status === 'completed' || status === 'failed' || status === 'cancelled' || status === 'timed_out';
 
+type ExecutionAncestryFrame = Readonly<{
+  taskId: string;
+  agentId: string;
+}>;
+type ExecutionAncestry = readonly ExecutionAncestryFrame[];
+
+type ResumeAdmissionWaiter = {
+  taskId: string;
+  eventId: string;
+  context: TaskContext;
+  reservationAgentId?: string;
+  admitted: boolean;
+  superseded: boolean;
+  admissionSettled: boolean;
+  callerSettled: boolean;
+  publicationSettled: boolean;
+  failureCleanupComplete: boolean;
+  promise: Promise<void>;
+  resolve: () => void;
+  reject: (reason?: unknown) => void;
+  failureCleanupPromise?: Promise<void>;
+};
+
+type InFlightEnqueueAdmission = {
+  taskId: string;
+  admitted: boolean;
+};
+
+class BackgroundTaskResumeAdmissionError extends Error {
+  readonly cause: unknown;
+
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause));
+    this.name = 'BackgroundTaskResumeAdmissionError';
+    this.cause = cause;
+  }
+}
+
+export const isBackgroundTaskResumePublishedError = (error: unknown): boolean =>
+  error instanceof BackgroundTaskResumeAdmissionError;
+
+const markResumeAdmissionPublished = (error: unknown): Error =>
+  error instanceof BackgroundTaskResumeAdmissionError ? error : new BackgroundTaskResumeAdmissionError(error);
+
+const freezeExecutionAncestry = (ancestry: readonly ExecutionAncestryFrame[]): ExecutionAncestry =>
+  Object.freeze(ancestry.map(frame => Object.freeze({ taskId: frame.taskId, agentId: frame.agentId })));
+
+const isWaitComplete = (task: BackgroundTask | null, includeSuspended = false): task is BackgroundTask =>
+  Boolean(task && (isTerminalBackgroundTaskStatus(task.status) || (includeSuspended && task.status === 'suspended')));
+
 const createUnrecoverableTaskError = (task: BackgroundTask): { message: string } => ({
   message:
     `Background task "${task.id}" for tool "${task.toolName}" could not be recovered after restart because ` +
@@ -35,8 +87,13 @@ const createUnrecoverableTaskError = (task: BackgroundTask): { message: string }
 
 export class BackgroundTaskManager {
   private pubsub!: PubSub;
+  private readonly workerId = randomUUID();
+  private readonly processAffineDispatchTopic = `${TOPIC_DISPATCH}:${this.workerId}`;
   config: Required<
-    Pick<BackgroundTaskManagerConfig, 'globalConcurrency' | 'perAgentConcurrency' | 'backpressure' | 'defaultTimeoutMs'>
+    Pick<
+      BackgroundTaskManagerConfig,
+      'globalConcurrency' | 'perAgentConcurrency' | 'backpressure' | 'defaultTimeoutMs' | 'recoverStaleTasksOnStart'
+    >
   > &
     BackgroundTaskManagerConfig;
 
@@ -53,19 +110,41 @@ export class BackgroundTaskManager {
   // visible — a remote worker resolves the tool by name instead.
   private staticExecutors: Map<string, ToolExecutor> = new Map();
 
+  // The current task ancestry is process-local execution context. It is never
+  // persisted: the task-id map below retains it only while an invocation-bound
+  // task can resume in this manager.
+  private readonly executionAncestry = new AsyncLocalStorage<ExecutionAncestry>();
+  private taskAncestries = new Map<string, ExecutionAncestry>();
+
   // Track active AbortControllers for running tasks (for cancellation + timeout)
   /** @internal — read by the workflow-engine step bodies in workflow.ts */
   activeAbortControllers: Map<string, AbortController> = new Map();
 
+  // Process-affine executors are runtime closures and cannot participate in
+  // storage-wide concurrency accounting without persisted ownership/leases.
+  // Keep their admission and queue ownership local to the manager that owns
+  // the closure so abandoned rows from another process cannot block them.
+  // TODO: Replace this POC boundary with persisted ownership, leases,
+  // heartbeats, atomic claims, and fenced terminal writes before treating
+  // process-affine work as recoverable across worker crashes.
+  private localReservations = new Map<string, string>();
+  private localPendingTaskIds = new Set<string>();
+  private localReleaseEpoch = 0;
+  private taskReleaseEpochs = new Map<string, number>();
+  private inFlightEnqueueAdmissions = new Map<string, InFlightEnqueueAdmission>();
+  private drainingPending = false;
+
   // Pubsub callbacks (kept for unsubscribe)
   private workerCallback?: EventCallback;
   private resultCallback?: EventCallback;
+  private resumeAdmissionWaiters = new Map<string, Set<ResumeAdmissionWaiter>>();
 
   private shuttingDown = false;
 
   // Cleanup interval handle
   private cleanupInterval?: ReturnType<typeof setInterval>;
   private recoveryTimer?: ReturnType<typeof setTimeout>;
+  private recoveryTimerAt?: number;
 
   // Tracks the in-flight `init(pubsub)` so consumers can await readiness.
   // Mastra fires init as fire-and-forget in `#ensureBackgroundTaskManager`,
@@ -87,11 +166,12 @@ export class BackgroundTaskManager {
 
   constructor(config: BackgroundTaskManagerConfig = { enabled: false }) {
     this.config = {
+      ...config,
       globalConcurrency: config.globalConcurrency ?? 10,
       perAgentConcurrency: config.perAgentConcurrency ?? 5,
       backpressure: config.backpressure ?? 'queue',
       defaultTimeoutMs: config.defaultTimeoutMs ?? 300_000,
-      ...config,
+      recoverStaleTasksOnStart: config.recoverStaleTasksOnStart ?? true,
     };
   }
 
@@ -130,7 +210,12 @@ export class BackgroundTaskManager {
     // to receive completion/failure notifications for dispatched tasks.
     this.resultCallback = async (event: Event, ack?: () => Promise<void>) => {
       if (event.type === 'task.completed' || event.type === 'task.failed') {
-        await this.handleResult(event);
+        try {
+          await this.handleResult(event);
+        } finally {
+          await ack?.();
+        }
+        return;
       } else if (event.type === 'task.cancelled') {
         this.handleCancel(event);
       }
@@ -148,7 +233,12 @@ export class BackgroundTaskManager {
         if (event.type === 'task.dispatch' || event.type === 'task.restart') {
           handled = await this.handleDispatch(event);
         } else if (event.type === 'task.resume') {
-          handled = await this.handleResume(event);
+          try {
+            handled = await this.handleResume(event);
+          } catch (error) {
+            this.rejectResumeAdmission(event.data.taskId, event.id, error);
+            throw error;
+          }
         } else if (event.type === 'task.cancel') {
           this.handleCancel(event);
         }
@@ -182,8 +272,13 @@ export class BackgroundTaskManager {
       }
 
       await this.pubsub.subscribe(TOPIC_DISPATCH, this.workerCallback, { group: WORKER_GROUP });
+      await this.pubsub.subscribe(this.processAffineDispatchTopic, this.workerCallback);
+
       if (this.shuttingDown) {
-        await this.#releaseLateInitSubscriptions([[TOPIC_DISPATCH, this.workerCallback]]);
+        await this.#releaseLateInitSubscriptions([
+          [TOPIC_DISPATCH, this.workerCallback],
+          [this.processAffineDispatchTopic, this.workerCallback],
+        ]);
         return;
       }
     }
@@ -191,9 +286,12 @@ export class BackgroundTaskManager {
     await this.pubsub.subscribe(TOPIC_RESULT, this.resultCallback);
     if (this.shuttingDown) {
       // Producer mode never registers a worker callback, so only include the
-      // dispatch subscription when it actually exists.
+      // dispatch subscriptions when they actually exist.
       const lateSubscriptions: Array<[string, EventCallback]> = [];
-      if (this.workerCallback) lateSubscriptions.push([TOPIC_DISPATCH, this.workerCallback]);
+      if (this.workerCallback) {
+        lateSubscriptions.push([TOPIC_DISPATCH, this.workerCallback]);
+        lateSubscriptions.push([this.processAffineDispatchTopic, this.workerCallback]);
+      }
       lateSubscriptions.push([TOPIC_RESULT, this.resultCallback]);
       await this.#releaseLateInitSubscriptions(lateSubscriptions);
       return;
@@ -201,14 +299,13 @@ export class BackgroundTaskManager {
 
     if (this.shuttingDown) return;
 
-    if (!isProducerOnly) {
+    if (!isProducerOnly && this.config.recoverStaleTasksOnStart) {
       // Recover stale tasks from a previous process — only workers should
       // attempt recovery since they own execution.
       await this.recoverStaleTasks();
     }
 
     if (this.shuttingDown) return;
-
     // Start periodic cleanup if configured
     const cleanupConfig = this.config.cleanup;
     if (cleanupConfig && !this.shuttingDown) {
@@ -234,6 +331,34 @@ export class BackgroundTaskManager {
    */
   deregisterTaskContext(taskId: string): void {
     this.taskContexts.delete(taskId);
+    this.taskAncestries.delete(taskId);
+    this.taskReleaseEpochs.delete(taskId);
+  }
+
+  private async cleanupFailedEnqueueRegistration(
+    storage: Awaited<ReturnType<BackgroundTaskManager['getStorage']>>,
+    taskId: string,
+    capturedAncestry: ExecutionAncestry,
+    context?: TaskContext,
+  ): Promise<void> {
+    try {
+      if (await storage.getTask(taskId)) return;
+      if (this.taskAncestries.get(taskId) !== capturedAncestry) return;
+      if (context ? this.taskContexts.get(taskId) !== context : this.taskContexts.has(taskId)) return;
+      if (this.localReservations.has(taskId) || this.activeAbortControllers.has(taskId)) return;
+
+      if (context) this.deregisterTaskContext(taskId);
+      else this.taskAncestries.delete(taskId);
+    } catch {
+      // A storage read failure leaves the registration in place so a committed
+      // row or a later recovery can still find its invocation-bound executor.
+    }
+  }
+
+  /** @internal — wraps a native task executor with its captured ancestry. */
+  runWithTaskExecutionContext<T>(taskId: string, agentId: string, execute: () => Promise<T>): Promise<T> {
+    const ancestry = this.taskAncestries.get(taskId) ?? [];
+    return this.executionAncestry.run(freezeExecutionAncestry([...ancestry, { taskId, agentId }]), execute);
   }
 
   /** @internal — called by the workflow step immediately before executor invocation. */
@@ -306,6 +431,11 @@ export class BackgroundTaskManager {
       throw new Error('BackgroundTaskManager is shutting down, cannot enqueue new tasks');
     }
 
+    // Capture before the first asynchronous storage/pubsub boundary. The
+    // workflow later reconstructs the current task context from this map when
+    // it invokes the native executor.
+    const capturedAncestry = freezeExecutionAncestry(this.executionAncestry.getStore() ?? []);
+
     // Mastra fires `init` as fire-and-forget. If a caller hits enqueue
     // before init completes, the dispatch publish fires before the worker
     // subscribes and the event is dropped (or, worse, lands on a worker
@@ -331,40 +461,101 @@ export class BackgroundTaskManager {
       timeoutMs: payload.timeoutMs ?? this.config.defaultTimeoutMs,
       createdAt: new Date(),
     };
+    const storage = await this.getStorage();
+    if (this.shuttingDown) {
+      throw new Error('BackgroundTaskManager is shutting down, cannot enqueue new tasks');
+    }
 
-    // Register per-task context if provided
+    this.taskAncestries.set(task.id, capturedAncestry);
+
+    // Register per-task context before the row is committed so a worker that
+    // observes the row during a slow create can still resolve the invocation
+    // bound executor.
     if (context) {
       this.registerTaskContext(task.id, context);
     }
 
-    const storage = await this.getStorage();
+    const enqueueAdmission: InFlightEnqueueAdmission = { taskId: task.id, admitted: false };
+    this.inFlightEnqueueAdmissions.set(task.id, enqueueAdmission);
+    try {
+      await storage.createTask(task);
+    } catch (error) {
+      // Storage adapters may have committed the row before rejecting. Return
+      // the adapter's original error promptly and clean up only after an
+      // authoritative absence check.
+      void this.cleanupFailedEnqueueRegistration(storage, task.id, capturedAncestry, context);
+      throw error;
+    } finally {
+      if (this.inFlightEnqueueAdmissions.get(task.id) === enqueueAdmission) {
+        this.inFlightEnqueueAdmissions.delete(task.id);
+      }
+    }
     if (this.shuttingDown) {
-      this.deregisterTaskContext(task.id);
+      // Preserve the established enqueue rejection once shutdown begins. A
+      // recovery worker may already own this row, so only an unclaimed create
+      // can be rolled back safely here.
+      if (!enqueueAdmission.admitted) {
+        await storage.deleteTask(task.id);
+        this.deregisterTaskContext(task.id);
+      }
       throw new Error('BackgroundTaskManager is shutting down, cannot enqueue new tasks');
     }
-
-    await storage.createTask(task);
-    if (this.shuttingDown) {
-      this.deregisterTaskContext(task.id);
-      await storage.deleteTask(task.id);
-      throw new Error('BackgroundTaskManager is shutting down, cannot enqueue new tasks');
+    if (enqueueAdmission.admitted) {
+      return { task };
     }
 
-    const canRun = await this.checkConcurrency(task.agentId);
+    const isProcessAffine = Boolean(context);
+    const canRun = isProcessAffine ? this.reserveLocalSlot(task) : await this.checkConcurrency(task.agentId);
+
     if (this.shuttingDown) {
+      this.releaseLocalSlot(task.id);
       this.deregisterTaskContext(task.id);
       await storage.deleteTask(task.id);
       throw new Error('BackgroundTaskManager is shutting down, cannot enqueue new tasks');
     }
 
     if (canRun) {
-      const dispatched = await this.dispatch(task);
-      if (!dispatched) {
-        this.deregisterTaskContext(task.id);
-        await storage.deleteTask(task.id);
-        throw new Error('BackgroundTaskManager is shutting down, cannot enqueue new tasks');
+      try {
+        const dispatched = await this.dispatch(task);
+        if (!dispatched) {
+          this.releaseLocalSlot(task.id);
+          this.deregisterTaskContext(task.id);
+          await storage.deleteTask(task.id);
+          throw new Error('BackgroundTaskManager is shutting down, cannot enqueue new tasks');
+        }
+      } catch (error) {
+        const failed = await storage.updateTask(
+          task.id,
+          {
+            status: 'failed',
+            error: { message: error instanceof Error ? error.message : String(error) },
+            completedAt: new Date(),
+          },
+          { expectedStatus: 'pending' },
+        );
+        if (failed) {
+          this.releaseLocalSlot(task.id);
+          this.deregisterTaskContext(task.id);
+          void this.drainPending();
+        }
+        throw error;
       }
       return { task };
+    }
+
+    // A queued awaited child cannot make progress while one of its actual
+    // ancestors owns the saturated local reservation. Drop the temporary
+    // row and let the caller run the same tool inline, preserving the
+    // ancestor's reservation. Unrelated queued work and capacity available
+    // for a nested dispatch retain their existing behavior.
+    if (
+      this.config.backpressure === 'queue' &&
+      context?.awaited &&
+      this.isAwaitedNestedDispatchBlockedByAncestor(task)
+    ) {
+      this.deregisterTaskContext(task.id);
+      await storage.deleteTask(task.id);
+      return { task, fallbackToSync: true };
     }
 
     // Backpressure
@@ -381,7 +572,10 @@ export class BackgroundTaskManager {
 
       case 'queue':
       default:
-        // Task stays pending in storage, will be dispatched when a slot opens
+        // Queue ownership stays local. A persisted pending row does not carry
+        // enough information to distinguish an invocation-bound closure from
+        // a portable static executor in another process.
+        this.localPendingTaskIds.add(task.id);
         return { task };
     }
   }
@@ -405,6 +599,7 @@ export class BackgroundTaskManager {
       }
 
       const previousStatus = task.status;
+      const isProcessAffine = this.taskContexts.has(taskId);
       const cancelled = await storage.updateTask(
         taskId,
         { status: 'cancelled', completedAt: new Date() },
@@ -414,6 +609,13 @@ export class BackgroundTaskManager {
         task = await storage.getTask(taskId);
         if (!task) return;
         continue;
+      }
+
+      this.rejectResumeAdmissions(taskId, new Error(`Background task ${taskId} was cancelled before resume admission`));
+
+      if (previousStatus === 'pending') {
+        this.localPendingTaskIds.delete(taskId);
+        this.releaseLocalSlot(taskId);
       }
 
       if (previousStatus === 'running') {
@@ -440,12 +642,22 @@ export class BackgroundTaskManager {
       }
 
       const cancelledTask = await storage.getTask(taskId);
-      if (cancelledTask) await this.publishLifecycleEvent('task.cancelled', cancelledTask);
+      if (cancelledTask) {
+        await this.publishLifecycleEvent('task.cancelled', cancelledTask);
+        try {
+          await this.config.onTaskCancelled?.(cancelledTask);
+        } catch (error) {
+          this.#mastra
+            ?.getLogger?.()
+            ?.warn(`background-task cancellation callback failed for ${taskId}:`, error as any);
+        }
+      }
       this.deregisterTaskContext(taskId);
 
       if (previousStatus === 'running') {
-        // Also publish cancel on dispatch topic for distributed worker abort
-        await this.pubsub.publish(TOPIC_DISPATCH, {
+        // Route cancellation to the same process that owns an invocation-bound executor.
+        const dispatchTopic = isProcessAffine ? this.processAffineDispatchTopic : TOPIC_DISPATCH;
+        await this.pubsub.publish(dispatchTopic, {
           type: 'task.cancel',
           data: { taskId },
           runId: taskId,
@@ -464,7 +676,7 @@ export class BackgroundTaskManager {
    * `resumeData` is forwarded to the tool's `execute` options on the
    * resumed run.
    */
-  async resume(taskId: string, resumeData?: unknown): Promise<BackgroundTask> {
+  async resume(taskId: string, resumeData?: unknown, options?: BackgroundTaskResumeOptions): Promise<BackgroundTask> {
     if (this.shuttingDown) {
       throw new Error('BackgroundTaskManager is shutting down, cannot resume tasks');
     }
@@ -493,8 +705,13 @@ export class BackgroundTaskManager {
       throw new Error(`Cannot resume task in status '${task.status}' (expected 'suspended')`);
     }
 
-    const canRun = await this.checkConcurrency(task.agentId);
+    const isProcessAffine = this.taskContexts.has(taskId);
+    if (options?.waitForAdmission && !isProcessAffine) {
+      throw new Error('waitForAdmission is only supported for process-affine background tasks');
+    }
+    const canRun = isProcessAffine ? this.reserveLocalSlot(task) : await this.checkConcurrency(task.agentId);
     if (this.shuttingDown) {
+      this.releaseLocalSlot(taskId);
       throw new Error('BackgroundTaskManager is shutting down, cannot resume tasks');
     }
     if (!canRun) {
@@ -512,15 +729,74 @@ export class BackgroundTaskManager {
       throw new Error('BackgroundTaskManager is shutting down, cannot resume tasks');
     }
 
-    // Hand off to the worker subscriber. `task.resume` rides the same
-    // `TOPIC_DISPATCH` + `WORKER_GROUP` exactly-once channel as
-    // `task.dispatch`, so any worker (including a different process from
-    // the one that suspended the task) can pick it up.
-    await this.pubsub.publish(TOPIC_DISPATCH, {
-      type: 'task.resume',
+    // Resume invocation-bound executors on their owning manager. A task
+    // without local context remains portable through the shared worker group.
+    const dispatchTopic = isProcessAffine ? this.processAffineDispatchTopic : TOPIC_DISPATCH;
+    if (options?.waitForAdmission && options.abortSignal?.aborted) {
+      this.releaseLocalSlot(taskId);
+      throw options.abortSignal.reason ?? new Error('Background task resume admission aborted');
+    }
+    const resumeEvent = {
+      id: randomUUID(),
+      type: 'task.resume' as const,
       data: { taskId, resumeData },
       runId: taskId,
-    });
+    };
+    const resumeAdmission = isProcessAffine
+      ? this.waitForResumeAdmission(
+          taskId,
+          resumeEvent.id,
+          task.timeoutMs,
+          options?.waitForAdmission ? options.abortSignal : undefined,
+          options?.waitForAdmission ?? false,
+        )
+      : undefined;
+    const publicationState: {
+      status: 'pending' | 'fulfilled' | 'rejected';
+      error?: unknown;
+    } = { status: 'pending' };
+    let publicationPromise: Promise<void>;
+    try {
+      publicationPromise = this.pubsub.publish(dispatchTopic, resumeEvent).then(
+        () => {
+          publicationState.status = 'fulfilled';
+          if (resumeAdmission) this.markResumePublicationSettled(resumeAdmission);
+        },
+        error => {
+          publicationState.status = 'rejected';
+          publicationState.error = error;
+          if (resumeAdmission) this.markResumePublicationSettled(resumeAdmission, error, true);
+          throw error;
+        },
+      );
+    } catch (error) {
+      publicationState.status = 'rejected';
+      publicationState.error = error;
+      if (resumeAdmission) this.markResumePublicationSettled(resumeAdmission, error, true);
+      publicationPromise = Promise.reject(error);
+    }
+    if (!resumeAdmission || !options?.waitForAdmission) {
+      try {
+        await publicationPromise;
+      } catch (error) {
+        throw resumeAdmission ? markResumeAdmissionPublished(publicationState.error ?? error) : error;
+      }
+      return task;
+    }
+
+    void resumeAdmission.promise.catch(() => {});
+
+    try {
+      await Promise.all([publicationPromise, resumeAdmission.promise]);
+    } catch (error) {
+      if (publicationState.status === 'rejected' && !resumeAdmission.admitted && !resumeAdmission.superseded) {
+        throw markResumeAdmissionPublished(publicationState.error ?? error);
+      }
+
+      throw markResumeAdmissionPublished(
+        resumeAdmission.admitted || resumeAdmission.superseded ? (publicationState.error ?? error) : error,
+      );
+    }
 
     return task;
   }
@@ -555,7 +831,8 @@ export class BackgroundTaskManager {
       this.registerTaskContext(task.id, context);
     }
 
-    const canRun = await this.checkConcurrency(task.agentId);
+    const isProcessAffine = this.taskContexts.has(taskId);
+    const canRun = isProcessAffine ? this.reserveLocalSlot(task) : await this.checkConcurrency(task.agentId);
     if (!canRun) {
       // Restart sits outside the queue/fallback-sync paths — there's no
       // synchronous caller to fall back to, and silently leaving the task
@@ -564,7 +841,12 @@ export class BackgroundTaskManager {
       throw new Error(`Concurrency limit reached, cannot restart task "${taskId}" — retry once a slot is available`);
     }
 
-    await this.dispatch(task, true);
+    try {
+      await this.dispatch(task, true);
+    } catch (error) {
+      if (isProcessAffine) this.releaseLocalSlot(taskId);
+      throw error;
+    }
 
     return task;
   }
@@ -611,41 +893,60 @@ export class BackgroundTaskManager {
       timeoutMs?: number;
       onProgress?: (elapsedMs: number) => void;
       progressIntervalMs?: number;
+      abortSignal?: AbortSignal;
+      includeSuspended?: boolean;
     },
   ): Promise<BackgroundTask> {
     const storage = await this.getStorage();
 
     for (const id of taskIds) {
       const task = await storage.getTask(id);
-      if (task && isTerminalBackgroundTaskStatus(task.status)) {
+      if (isWaitComplete(task, options?.includeSuspended)) {
         return task;
       }
     }
 
     return new Promise((resolve, reject) => {
       const startTime = Date.now();
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      let progressInterval: ReturnType<typeof setInterval> | undefined;
+      let pollInterval: ReturnType<typeof setInterval> | undefined;
 
-      const timeout = options?.timeoutMs
+      const cleanup = () => {
+        if (pollInterval) clearInterval(pollInterval);
+        if (timeout !== undefined) clearTimeout(timeout);
+        if (progressInterval) clearInterval(progressInterval);
+        options?.abortSignal?.removeEventListener('abort', handleAbort);
+      };
+      const handleAbort = () => {
+        cleanup();
+        reject(options?.abortSignal?.reason ?? new Error('Background task wait aborted'));
+      };
+
+      if (options?.abortSignal?.aborted) {
+        handleAbort();
+        return;
+      }
+      options?.abortSignal?.addEventListener('abort', handleAbort, { once: true });
+
+      timeout = options?.timeoutMs
         ? setTimeout(() => {
-            clearInterval(pollInterval);
-            if (progressInterval) clearInterval(progressInterval);
+            cleanup();
             reject(new Error('Timed out waiting for background task'));
           }, options.timeoutMs)
         : undefined;
 
-      const progressInterval = options?.onProgress
+      progressInterval = options?.onProgress
         ? setInterval(() => {
             options.onProgress!(Date.now() - startTime);
           }, options.progressIntervalMs ?? 3000)
         : undefined;
 
-      const pollInterval = setInterval(async () => {
+      pollInterval = setInterval(async () => {
         for (const id of taskIds) {
           const task = await storage.getTask(id);
-          if (task && isTerminalBackgroundTaskStatus(task.status)) {
-            clearInterval(pollInterval);
-            if (timeout) clearTimeout(timeout);
-            if (progressInterval) clearInterval(progressInterval);
+          if (isWaitComplete(task, options?.includeSuspended)) {
+            cleanup();
             resolve(task);
             return;
           }
@@ -679,10 +980,11 @@ export class BackgroundTaskManager {
     resourceId?: string;
     taskId?: string;
     abortSignal?: AbortSignal;
+    includeExisting?: boolean;
   }): ReadableStream<Record<string, unknown>> {
     const manager = this;
     const pubsub = this.pubsub;
-    const { agentId, runId, threadId, resourceId, abortSignal, taskId } = options ?? {};
+    const { agentId, runId, threadId, resourceId, abortSignal, taskId, includeExisting = true } = options ?? {};
 
     const EVENT_STATUS_MAP: Record<string, BackgroundTaskStatus> = {
       'task.running': 'running',
@@ -766,18 +1068,24 @@ export class BackgroundTaskManager {
           }
         };
 
-        void pubsub.subscribe(TOPIC_RESULT, handler);
+        await pubsub.subscribe(TOPIC_RESULT, handler);
 
-        abortSignal?.addEventListener('abort', () => {
+        const close = () => {
           void pubsub.unsubscribe(TOPIC_RESULT, handler);
           try {
             controller.close();
           } catch {
             // Already closed
           }
-        });
+        };
+        if (abortSignal?.aborted) {
+          close();
+          return;
+        }
+        abortSignal?.addEventListener('abort', close, { once: true });
 
         // 2. Emit snapshot of existing in-flight tasks (running + suspended).
+        if (!includeExisting) return;
         try {
           const storage = await manager.getStorage();
           if (taskId) {
@@ -832,15 +1140,23 @@ export class BackgroundTaskManager {
     });
   }
 
-  shutdown(): Promise<void> {
+  /**
+   * @param options.deadline - Absolute wall-clock deadline (ms since epoch) to
+   *   bound teardown by. `Mastra.shutdown()` passes the deadline shared with
+   *   its workflow drain so the two do not stack. Defaults to
+   *   `SHUTDOWN_GRACE_PERIOD_MS` from now when called standalone.
+   */
+  shutdown(options?: { deadline?: number }): Promise<void> {
     if (this.shutdownPromise) return this.shutdownPromise;
     this.shuttingDown = true;
-    this.shutdownDeadline = Date.now() + SHUTDOWN_GRACE_PERIOD_MS;
+    this.shutdownDeadline = options?.deadline ?? Date.now() + SHUTDOWN_GRACE_PERIOD_MS;
     this.shutdownPromise = this.#shutdown();
     return this.shutdownPromise;
   }
 
   async #shutdown(): Promise<void> {
+    this.rejectAllResumeAdmissions(new Error('BackgroundTaskManager is shutting down, cannot resume tasks'));
+
     // Stop an already-running cleanup loop immediately. Init may still be in
     // flight and install one later, so repeat this check after awaiting it.
     if (this.cleanupInterval) {
@@ -887,10 +1203,14 @@ export class BackgroundTaskManager {
     if (this.recoveryTimer) {
       clearTimeout(this.recoveryTimer);
       this.recoveryTimer = undefined;
+      this.recoveryTimerAt = undefined;
     }
 
     const subscriptions: Array<[string, EventCallback]> = [];
-    if (this.workerCallback) subscriptions.push([TOPIC_DISPATCH, this.workerCallback]);
+    if (this.workerCallback) {
+      subscriptions.push([TOPIC_DISPATCH, this.workerCallback]);
+      subscriptions.push([this.processAffineDispatchTopic, this.workerCallback]);
+    }
     if (this.resultCallback) subscriptions.push([TOPIC_RESULT, this.resultCallback]);
     const unsubscribeResults = await this.#waitForShutdownStep(
       'background task subscription cleanup',
@@ -913,6 +1233,11 @@ export class BackgroundTaskManager {
     this.#abortActiveControllers();
 
     this.taskContexts.clear();
+    this.taskAncestries.clear();
+    this.localReservations.clear();
+    this.localPendingTaskIds.clear();
+    this.taskReleaseEpochs.clear();
+    this.inFlightEnqueueAdmissions.clear();
     this.staticExecutors.clear();
     if (this.initPromise) {
       await this.#waitForShutdownStep('background task pubsub flush', this.pubsub.flush());
@@ -945,11 +1270,7 @@ export class BackgroundTaskManager {
     const remainingMs = this.#remainingShutdownBudgetMs();
     if (remainingMs <= 0) {
       void promise.catch(() => {});
-      this.#mastra
-        ?.getLogger?.()
-        ?.warn(
-          `${description} left running in the background: the ${SHUTDOWN_GRACE_PERIOD_MS}ms shutdown budget is spent`,
-        );
+      this.#mastra?.getLogger?.()?.warn(`${description} left running in the background: the shutdown budget is spent`);
       return undefined;
     }
 
@@ -972,9 +1293,7 @@ export class BackgroundTaskManager {
     if (outcome.status === 'timed-out') {
       this.#mastra
         ?.getLogger?.()
-        ?.warn(
-          `${description} exhausted the remaining ${remainingMs}ms of the ${SHUTDOWN_GRACE_PERIOD_MS}ms graceful shutdown budget`,
-        );
+        ?.warn(`${description} exhausted the remaining ${remainingMs}ms of the graceful shutdown budget`);
       return undefined;
     }
     return outcome.value;
@@ -1030,10 +1349,12 @@ export class BackgroundTaskManager {
     if (this.shuttingDown) return false;
     await this.#ensureExecutionWorkersStarted();
     if (this.shuttingDown) return false;
-    // Publish `task.dispatch` on `TOPIC_DISPATCH` with `WORKER_GROUP`, so
-    // exactly one worker handles the task. `handleDispatch` flips the
-    // task to running and starts the per-task workflow run.
-    await this.pubsub.publish(TOPIC_DISPATCH, {
+
+    // Invocation-bound executors are closures owned by this manager and cannot
+    // run in another process. Static executors remain portable and use the
+    // shared competing-consumer topic.
+    const dispatchTopic = this.taskContexts.has(task.id) ? this.processAffineDispatchTopic : TOPIC_DISPATCH;
+    await this.pubsub.publish(dispatchTopic, {
       type: 'task.dispatch',
       data: {
         taskId: task.id,
@@ -1071,10 +1392,12 @@ export class BackgroundTaskManager {
 
     const task = await storage.getTask(taskId);
     if (this.shuttingDown) {
+      this.releaseLocalSlot(taskId);
       this.deregisterTaskContext(taskId);
       return false;
     }
-    if (!task) {
+    if (!task || task.status === 'cancelled') {
+      this.releaseLocalSlot(taskId);
       this.deregisterTaskContext(taskId);
       return true;
     }
@@ -1126,6 +1449,13 @@ export class BackgroundTaskManager {
       return true;
     }
 
+    // A recovery dispatch may claim a row while the original enqueue is
+    // still awaiting its storage create promise. Let that authoritative
+    // claim own execution so the enqueue continuation does not reserve and
+    // dispatch the same task a second time.
+    const enqueueAdmission = this.inFlightEnqueueAdmissions.get(taskId);
+    if (enqueueAdmission) enqueueAdmission.admitted = true;
+
     // Publish running lifecycle event (fan-out, for stream consumers)
     const runningTask = await storage.getTask(taskId);
     if (this.shuttingDown) {
@@ -1142,7 +1472,26 @@ export class BackgroundTaskManager {
     // Fire-and-forget the workflow run; the workflow step body owns
     // executor invocation, retries, and suspend/resume. The local
     // execution hook still runs here so callers see `onExecution` fire.
-    if (this.#mastra) {
+    if (!this.#mastra) {
+      this.releaseLocalSlot(taskId);
+      const markedFailed = await storage.updateTask(
+        taskId,
+        {
+          status: 'failed',
+          error: { message: 'Mastra is not registered with this background task manager' },
+          completedAt: new Date(),
+        },
+        { expectedStatus: 'running' },
+      );
+      if (markedFailed) {
+        const failedTask = await storage.getTask(taskId);
+        if (failedTask?.status === 'failed') await this.publishLifecycleEvent('task.failed', failedTask);
+      }
+      void this.drainPending();
+      return true;
+    }
+
+    try {
       if (runningTask) void this.runLocalExecutionHook(runningTask);
       const workflow = this.#mastra.__getInternalWorkflow(BACKGROUND_TASK_WORKFLOW_ID);
       const prevWorkflowRun = await workflow.getWorkflowRunById(taskId, { withNestedWorkflows: false });
@@ -1186,9 +1535,25 @@ export class BackgroundTaskManager {
             ?.error(`background-task workflow ${shouldRestart ? 'restart' : 'start'} failed for ${taskId}:`, err);
         })
         .finally(() => {
-          // Free the concurrency slot once the run terminates.
+          this.releaseLocalSlot(taskId);
           void this.drainPending();
         });
+    } catch (error) {
+      this.releaseLocalSlot(taskId);
+      const markedFailed = await storage.updateTask(
+        taskId,
+        {
+          status: 'failed',
+          error: { message: error instanceof Error ? error.message : String(error) },
+          completedAt: new Date(),
+        },
+        { expectedStatus: 'running' },
+      );
+      if (markedFailed) {
+        const failedTask = await storage.getTask(taskId);
+        if (failedTask?.status === 'failed') await this.publishLifecycleEvent('task.failed', failedTask);
+      }
+      void this.drainPending();
     }
 
     return true;
@@ -1215,6 +1580,13 @@ export class BackgroundTaskManager {
       // Either gone or already resumed/cancelled by another worker. Drop the
       // event silently — the worker group ensures exactly-once delivery, but
       // the task may have moved on between publish and pickup.
+      if (!task) {
+        this.rejectResumeAdmission(taskId, event.id, new Error(`Task not found: ${taskId}`));
+      } else {
+        this.resolveResumeAdmission(taskId, event.id);
+      }
+      this.releaseLocalSlot(taskId);
+      void this.drainPending();
       return true;
     }
 
@@ -1241,12 +1613,23 @@ export class BackgroundTaskManager {
       },
       { expectedStatus: 'suspended' },
     );
-    if (!resumed) return true;
+    if (!resumed) {
+      const latestTask = await storage.getTask(taskId);
+      if (!latestTask) {
+        this.rejectResumeAdmission(taskId, event.id, new Error(`Task not found: ${taskId}`));
+      } else if (latestTask.status !== 'suspended') {
+        this.resolveResumeAdmission(taskId, event.id);
+      }
+      this.releaseLocalSlot(taskId);
+      void this.drainPending();
+      return true;
+    }
     const resumedTask = await storage.getTask(taskId);
     if (this.shuttingDown) {
       await restoreSuspended();
       return false;
     }
+    this.resolveResumeAdmission(taskId, event.id);
     if (resumedTask) {
       await this.publishLifecycleEvent('task.resumed', resumedTask);
     }
@@ -1255,7 +1638,11 @@ export class BackgroundTaskManager {
       return false;
     }
 
-    if (!this.#mastra) return true;
+    if (!this.#mastra) {
+      this.releaseLocalSlot(taskId);
+      void this.drainPending();
+      return true;
+    }
     const workflow = this.#mastra.__getInternalWorkflow(BACKGROUND_TASK_WORKFLOW_ID);
     // `createRun({ runId })` reattaches to the existing snapshot when given a
     // stable runId — we don't want a fresh run.
@@ -1275,7 +1662,7 @@ export class BackgroundTaskManager {
         this.#mastra?.getLogger?.()?.error(`background-task workflow resume failed for ${taskId}:`, err);
       })
       .finally(() => {
-        // Mirror dispatch's drain — resuming frees a slot when it terminates.
+        this.releaseLocalSlot(taskId);
         void this.drainPending();
       });
     return true;
@@ -1430,10 +1817,12 @@ export class BackgroundTaskManager {
     const storage = await this.getStorage();
     const task = await storage.getTask(taskId);
 
-    if (task?.completedAt) {
-      // Look up per-task hooks
-      const ctx = this.taskContexts.get(taskId);
+    if (!task?.completedAt) return;
 
+    // Look up per-task hooks
+    const ctx = this.taskContexts.get(taskId);
+
+    try {
       if (event.type === 'task.completed') {
         ctx?.onChunk?.({
           type: 'background-task-completed',
@@ -1462,9 +1851,18 @@ export class BackgroundTaskManager {
           startedAt: task.startedAt!,
         });
 
-        if (task) {
-          await Promise.all([ctx?.onComplete?.(task), this.config.onTaskComplete?.(task)]);
-        }
+        await Promise.all([
+          ctx?.onComplete?.(task),
+          (async () => {
+            try {
+              await this.config.onTaskComplete?.(task);
+            } catch (error) {
+              this.#mastra
+                ?.getLogger?.()
+                ?.warn(`background-task completion callback failed for ${taskId}:`, error as any);
+            }
+          })(),
+        ]);
       }
 
       if (event.type === 'task.failed') {
@@ -1495,13 +1893,23 @@ export class BackgroundTaskManager {
           startedAt: task.startedAt!,
         });
 
-        if (task) {
-          await Promise.all([ctx?.onFailed?.(task), this.config.onTaskFailed?.(task)]);
-        }
+        await Promise.all([
+          ctx?.onFailed?.(task),
+          (async () => {
+            try {
+              await this.config.onTaskFailed?.(task);
+            } catch (error) {
+              this.#mastra?.getLogger?.()?.warn(`background-task failure callback failed for ${taskId}:`, error as any);
+            }
+          })(),
+        ]);
       }
-
-      // Clean up context after terminal result
+    } finally {
+      // Clean up context after terminal result and admit the next task owned
+      // by this manager. Portable tasks may have completed on another process,
+      // so the result fan-out is the origin manager's queue-drain signal.
       this.deregisterTaskContext(taskId);
+      void this.drainPending();
     }
   }
 
@@ -1509,6 +1917,7 @@ export class BackgroundTaskManager {
     if (this.shuttingDown) return;
 
     const { taskId } = event.data;
+    this.rejectResumeAdmissions(taskId, new Error(`Background task ${taskId} was cancelled before resume admission`));
     const controller = this.activeAbortControllers.get(taskId);
     if (controller) {
       controller.abort(new Error('Task cancelled'));
@@ -1552,6 +1961,236 @@ export class BackgroundTaskManager {
     });
   }
 
+  private reserveLocalSlot(task: Pick<BackgroundTask, 'id' | 'agentId'>): boolean {
+    if (this.localReservations.has(task.id)) return true;
+    if (this.localReservations.size >= this.config.globalConcurrency) return false;
+
+    let agentRunning = 0;
+    for (const agentId of this.localReservations.values()) {
+      if (agentId === task.agentId) agentRunning++;
+    }
+    if (agentRunning >= this.config.perAgentConcurrency) return false;
+
+    this.localReservations.set(task.id, task.agentId);
+    return true;
+  }
+
+  private releaseLocalSlot(taskId: string): void {
+    if (this.localReservations.delete(taskId) && this.taskContexts.has(taskId)) {
+      this.taskReleaseEpochs.set(taskId, ++this.localReleaseEpoch);
+    }
+  }
+
+  private waitForResumeAdmission(
+    taskId: string,
+    eventId: string,
+    timeoutMs: number,
+    abortSignal?: AbortSignal,
+    waitForCaller = true,
+  ): ResumeAdmissionWaiter {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    let onAbort: (() => void) | undefined;
+    let resolvePromise = () => {};
+    let rejectPromise = (_reason?: unknown) => {};
+    const promise = waitForCaller
+      ? new Promise<void>((resolve, reject) => {
+          resolvePromise = resolve;
+          rejectPromise = reject;
+        })
+      : Promise.resolve();
+    const waiter = {} as ResumeAdmissionWaiter;
+    const settleCaller = (reason?: unknown, rejected = false) => {
+      if (waiter.callerSettled) {
+        this.finalizeResumeAdmissionWaiter(waiter);
+        return;
+      }
+      waiter.callerSettled = true;
+      if (timeout !== undefined) clearTimeout(timeout);
+      if (onAbort) abortSignal?.removeEventListener('abort', onAbort);
+      if (rejected) rejectPromise(reason);
+      else resolvePromise();
+      this.finalizeResumeAdmissionWaiter(waiter);
+    };
+
+    Object.assign(waiter, {
+      taskId,
+      eventId,
+      context: this.taskContexts.get(taskId)!,
+      reservationAgentId: this.localReservations.get(taskId),
+      admitted: false,
+      superseded: false,
+      admissionSettled: false,
+      callerSettled: !waitForCaller,
+      publicationSettled: false,
+      failureCleanupComplete: true,
+      promise,
+      resolve: () => {
+        if (waiter.superseded) return;
+        waiter.admissionSettled = true;
+        waiter.admitted = true;
+        this.supersedeOtherResumeAdmissions(waiter);
+        settleCaller(undefined, false);
+      },
+      reject: (reason?: unknown) => {
+        if (waiter.admitted) return;
+        settleCaller(reason, true);
+      },
+    } satisfies ResumeAdmissionWaiter);
+
+    const waiters = this.resumeAdmissionWaiters.get(taskId) ?? new Set<ResumeAdmissionWaiter>();
+    waiters.add(waiter);
+    this.resumeAdmissionWaiters.set(taskId, waiters);
+
+    if (waitForCaller) {
+      onAbort = () => waiter.reject(abortSignal?.reason ?? new Error('Background task resume admission aborted'));
+      abortSignal?.addEventListener('abort', onAbort, { once: true });
+      if (abortSignal?.aborted) {
+        onAbort();
+      } else {
+        timeout = setTimeout(
+          () => waiter.reject(new Error(`Timed out waiting for background task "${taskId}" resume admission`)),
+          Math.max(0, timeoutMs),
+        );
+      }
+    }
+
+    return waiter;
+  }
+
+  private finalizeResumeAdmissionWaiter(waiter: ResumeAdmissionWaiter): void {
+    if (
+      !waiter.admissionSettled ||
+      !waiter.callerSettled ||
+      !waiter.publicationSettled ||
+      !waiter.failureCleanupComplete
+    ) {
+      return;
+    }
+    const taskWaiters = this.resumeAdmissionWaiters.get(waiter.taskId);
+    if (!taskWaiters) return;
+    taskWaiters.delete(waiter);
+    if (taskWaiters.size === 0) this.resumeAdmissionWaiters.delete(waiter.taskId);
+  }
+
+  private supersedeOtherResumeAdmissions(waiter: ResumeAdmissionWaiter): void {
+    this.supersedeResumeAdmissionsForEvent(waiter.taskId, waiter.eventId);
+  }
+
+  private supersedeResumeAdmissionsForEvent(taskId: string, eventId: string): void {
+    const waiters = this.resumeAdmissionWaiters.get(taskId);
+    if (!waiters) return;
+    for (const other of [...waiters]) {
+      if (other.eventId === eventId || other.admitted || other.superseded) continue;
+      other.superseded = true;
+      other.admissionSettled = true;
+      other.reject(new Error(`Background task "${taskId}" resume was superseded`));
+    }
+  }
+
+  private markResumePublicationSettled(waiter: ResumeAdmissionWaiter, error?: unknown, failed = false): void {
+    if (waiter.publicationSettled) return;
+    waiter.publicationSettled = true;
+    if (failed) {
+      waiter.admissionSettled = true;
+      waiter.failureCleanupComplete = false;
+      waiter.failureCleanupPromise = this.cleanupFailedResumeAdmission(waiter).finally(() => {
+        waiter.failureCleanupComplete = true;
+        this.finalizeResumeAdmissionWaiter(waiter);
+      });
+      waiter.reject(error);
+      return;
+    }
+    this.finalizeResumeAdmissionWaiter(waiter);
+  }
+
+  private async cleanupFailedResumeAdmission(waiter: ResumeAdmissionWaiter): Promise<void> {
+    if (waiter.admitted || waiter.superseded || this.shuttingDown) return;
+    try {
+      const storage = await this.getStorage();
+      const task = await storage.getTask(waiter.taskId);
+      if (!task || task.id !== waiter.taskId || task.status !== 'suspended') return;
+
+      // Re-check every process-local owner after the storage read. A newer
+      // resume may have replaced the context or reservation while the read was
+      // in flight, and an older failed publication must not tear it down.
+      if (this.taskContexts.get(waiter.taskId) !== waiter.context) return;
+      if (this.localReservations.get(waiter.taskId) !== waiter.reservationAgentId) return;
+      const waiters = this.resumeAdmissionWaiters.get(waiter.taskId);
+      if (
+        [...(waiters ?? [])].some(
+          other => other !== waiter && !other.admitted && !other.superseded && !other.admissionSettled,
+        )
+      ) {
+        return;
+      }
+      if (waiter.admitted || waiter.superseded) return;
+
+      this.releaseLocalSlot(waiter.taskId);
+      void this.drainPending();
+    } catch {
+      // An unavailable storage identity leaves ownership uncertain. The next
+      // lifecycle event or shutdown will perform the authoritative cleanup.
+    }
+  }
+
+  private resolveResumeAdmission(taskId: string, eventId: string): void {
+    this.supersedeResumeAdmissionsForEvent(taskId, eventId);
+    const waiters = this.resumeAdmissionWaiters.get(taskId);
+    if (!waiters) return;
+    for (const waiter of [...waiters]) {
+      if (waiter.eventId === eventId) {
+        waiter.admissionSettled = true;
+        waiter.resolve();
+      }
+    }
+  }
+
+  private rejectResumeAdmission(taskId: string, eventId: string, reason: unknown): void {
+    const waiters = this.resumeAdmissionWaiters.get(taskId);
+    if (!waiters) return;
+    for (const waiter of [...waiters]) {
+      if (waiter.eventId === eventId) {
+        waiter.admissionSettled = true;
+        waiter.reject(reason);
+      }
+    }
+  }
+
+  private rejectResumeAdmissions(taskId: string, reason: unknown): void {
+    const waiters = this.resumeAdmissionWaiters.get(taskId);
+    if (!waiters) return;
+    for (const waiter of [...waiters]) {
+      waiter.admissionSettled = true;
+      waiter.reject(reason);
+    }
+  }
+
+  private rejectAllResumeAdmissions(reason: unknown): void {
+    const waiters = this.resumeAdmissionWaiters;
+    this.resumeAdmissionWaiters = new Map();
+    for (const taskWaiters of waiters.values()) {
+      for (const waiter of taskWaiters) waiter.reject(reason);
+    }
+  }
+
+  private isAwaitedNestedDispatchBlockedByAncestor(task: Pick<BackgroundTask, 'id' | 'agentId'>): boolean {
+    const ancestry = this.taskAncestries.get(task.id);
+    if (!ancestry || ancestry.length === 0) return false;
+
+    const activeAncestors = ancestry.filter(frame => this.localReservations.has(frame.taskId));
+    if (activeAncestors.length === 0) return false;
+
+    if (this.localReservations.size >= this.config.globalConcurrency) return true;
+
+    const agentRunning = [...this.localReservations.values()].filter(agentId => agentId === task.agentId).length;
+    return (
+      agentRunning >= this.config.perAgentConcurrency &&
+      activeAncestors.some(
+        frame => frame.agentId === task.agentId && this.localReservations.get(frame.taskId) === task.agentId,
+      )
+    );
+  }
+
   private async checkConcurrency(agentId: string): Promise<boolean> {
     const storage = await this.getStorage();
     const globalRunning = await storage.getRunningCount();
@@ -1568,20 +2207,51 @@ export class BackgroundTaskManager {
   }
 
   private async drainPending(): Promise<void> {
-    if (this.shuttingDown) return;
+    if (this.drainingPending || this.shuttingDown) return;
+    this.drainingPending = true;
 
-    const storage = await this.getStorage();
-    const { tasks: pending } = await storage.listTasks({
-      status: 'pending',
-      orderBy: 'createdAt',
-      orderDirection: 'asc',
-    });
+    try {
+      const storage = await this.getStorage();
+      for (const taskId of [...this.localPendingTaskIds]) {
+        if (this.shuttingDown) return;
+        const pendingReleaseEpoch = this.localReleaseEpoch;
+        const task = await storage.getTask(taskId);
+        if (!task || task.status !== 'pending') {
+          this.localPendingTaskIds.delete(taskId);
+          continue;
+        }
 
-    for (const task of pending) {
-      if (this.shuttingDown) return;
-      if (await this.checkConcurrency(task.agentId)) {
-        await this.dispatch(task);
+        const isProcessAffine = this.taskContexts.has(taskId);
+        if (
+          isProcessAffine &&
+          ((this.taskReleaseEpochs.get(taskId) ?? 0) > pendingReleaseEpoch || this.localReservations.has(taskId))
+        ) {
+          this.localPendingTaskIds.delete(taskId);
+          const nowMs = Date.now();
+          this.scheduleRecovery(nowMs + RECOVERY_ERROR_RETRY_MS, nowMs);
+          continue;
+        }
+        const canRun = isProcessAffine ? this.reserveLocalSlot(task) : await this.checkConcurrency(task.agentId);
+        if (!canRun) continue;
+
+        this.localPendingTaskIds.delete(taskId);
+        try {
+          if (!(await this.dispatch(task))) {
+            this.releaseLocalSlot(taskId);
+            this.localPendingTaskIds.add(taskId);
+            return;
+          }
+        } catch (error) {
+          if (isProcessAffine) this.releaseLocalSlot(taskId);
+          this.localPendingTaskIds.add(taskId);
+          this.#mastra?.getLogger?.()?.warn(`background-task dispatch failed while draining ${taskId}:`, error as any);
+          return;
+        }
       }
+    } catch (error) {
+      this.#mastra?.getLogger?.()?.warn('background-task queue drain failed:', error as any);
+    } finally {
+      this.drainingPending = false;
     }
   }
 
@@ -1595,6 +2265,7 @@ export class BackgroundTaskManager {
       if (this.recoveryTimer) {
         clearTimeout(this.recoveryTimer);
         this.recoveryTimer = undefined;
+        this.recoveryTimerAt = undefined;
       }
 
       const storage = await this.getStorage();
@@ -1633,6 +2304,9 @@ export class BackgroundTaskManager {
         }
       }
 
+      // A suspended or completed invocation can retain its context after
+      // releasing a slot, invalidating a pending snapshot captured earlier.
+      const pendingReleaseEpoch = this.localReleaseEpoch;
       const { tasks: pendingTasks } = await storage.listTasks({
         status: 'pending',
         orderBy: 'createdAt',
@@ -1641,8 +2315,19 @@ export class BackgroundTaskManager {
       for (const task of pendingTasks) {
         if (this.shuttingDown) return;
         if (!this.canResolveTaskExecutor(task)) continue;
-        if (await this.checkConcurrency(task.agentId)) {
+        const isProcessAffine = this.taskContexts.has(task.id);
+        // Do not reclaim capacity for a stale snapshot after that context
+        // already released its earlier reservation.
+        if (isProcessAffine && (this.taskReleaseEpochs.get(task.id) ?? 0) > pendingReleaseEpoch) {
+          const retryAt = Date.now() + RECOVERY_ERROR_RETRY_MS;
+          nextRecoveryAt = Math.min(nextRecoveryAt ?? retryAt, retryAt);
+          continue;
+        }
+        const canRun = isProcessAffine ? this.reserveLocalSlot(task) : await this.checkConcurrency(task.agentId);
+        if (canRun) {
           await this.dispatch(task);
+        } else {
+          this.localPendingTaskIds.add(task.id);
         }
       }
     } catch (error) {
@@ -1652,17 +2337,20 @@ export class BackgroundTaskManager {
       }
       nextRecoveryAt = Date.now() + RECOVERY_ERROR_RETRY_MS;
     } finally {
-      if (!this.recoveryTimer) {
-        this.scheduleRecovery(nextRecoveryAt, Date.now());
-      }
+      this.scheduleRecovery(nextRecoveryAt, Date.now());
     }
   }
 
   private scheduleRecovery(retryAt: number | undefined, nowMs: number): void {
     if (this.shuttingDown || retryAt === undefined) return;
     const delayMs = Math.min(Math.max(retryAt - nowMs, 0), 2_147_483_647);
+    const scheduledAt = nowMs + delayMs;
+    if (this.recoveryTimer && this.recoveryTimerAt !== undefined && this.recoveryTimerAt <= scheduledAt) return;
+    if (this.recoveryTimer) clearTimeout(this.recoveryTimer);
+    this.recoveryTimerAt = scheduledAt;
     this.recoveryTimer = setTimeout(() => {
       this.recoveryTimer = undefined;
+      this.recoveryTimerAt = undefined;
       void this.recoverStaleTasks();
     }, delayMs);
   }
