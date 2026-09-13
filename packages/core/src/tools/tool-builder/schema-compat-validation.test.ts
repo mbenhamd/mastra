@@ -34,6 +34,7 @@ function buildCoreTool(
 
 describe('CoreToolBuilder - Schema Compatibility in Validation', () => {
   it('does not enable edited approvals for an AI SDK JSON schema without a validator after resume augmentation', async () => {
+    const execute = vi.fn(async (input: { note: string }) => input);
     const tool = createTool({
       id: 'raw-json-schema-tool',
       description: 'Raw JSON schema tool',
@@ -43,7 +44,7 @@ describe('CoreToolBuilder - Schema Compatibility in Validation', () => {
         required: ['note'],
         additionalProperties: false,
       }),
-      execute: async (input: { note: string }) => input,
+      execute,
     });
 
     const build = () =>
@@ -58,6 +59,26 @@ describe('CoreToolBuilder - Schema Compatibility in Validation', () => {
 
     expect(firstBuilt.approvalInputEditing).toBeUndefined();
     expect(secondBuilt.approvalInputEditing).toBeUndefined();
+
+    await expect(
+      firstBuilt.execute?.(
+        { note: 'ok' },
+        { abortSignal: new AbortController().signal, toolCallId: 'raw-json-schema-valid', messages: [] },
+      ),
+    ).resolves.toEqual({ note: 'ok' });
+    await expect(
+      firstBuilt.execute?.(
+        {},
+        { abortSignal: new AbortController().signal, toolCallId: 'raw-json-schema-missing', messages: [] },
+      ),
+    ).resolves.toMatchObject({ error: true });
+    await expect(
+      secondBuilt.execute?.(
+        { note: 42 },
+        { abortSignal: new AbortController().signal, toolCallId: 'raw-json-schema-wrong-type', messages: [] },
+      ),
+    ).resolves.toMatchObject({ error: true });
+    expect(execute).toHaveBeenCalledTimes(1);
   });
 
   it('preserves async AI SDK validation through resume augmentation', async () => {
@@ -120,28 +141,47 @@ describe('CoreToolBuilder - Schema Compatibility in Validation', () => {
       inputSchema,
     };
 
-    const builder = new CoreToolBuilder({
-      originalTool: tool,
-      options: { name: 'raw-zod-v3-validator-tool', requestContext: new RequestContext() },
-      autoResumeSuspendedTools: true,
-    });
+    const createBuilder = () =>
+      new CoreToolBuilder({
+        originalTool: tool,
+        options: { name: 'raw-zod-v3-validator-tool', requestContext: new RequestContext() },
+        autoResumeSuspendedTools: true,
+      });
+    const firstBuilder = createBuilder();
     tool.execute = execute;
-    const built = builder.build();
+    const firstBuilt = firstBuilder.build();
+    tool.execute = undefined;
+    const secondBuilder = createBuilder();
+    tool.execute = execute;
+    const secondBuilt = secondBuilder.build();
 
     await expect(
-      built.execute?.(
+      firstBuilt.execute?.(
         { note: ' accepted ' },
         { abortSignal: new AbortController().signal, toolCallId: 'zod-v3-valid', messages: [] },
       ),
     ).resolves.toEqual({ note: 'ACCEPTED' });
     await expect(
-      built.execute?.(
+      firstBuilt.execute?.(
         { note: ' reject ' },
         { abortSignal: new AbortController().signal, toolCallId: 'zod-v3-invalid', messages: [] },
       ),
     ).resolves.toMatchObject({ error: true });
-    expect(execute).toHaveBeenCalledTimes(1);
-    expect(execute).toHaveBeenCalledWith({ note: 'ACCEPTED' }, expect.any(Object));
+    await expect(
+      secondBuilt.execute?.(
+        { note: ' accepted ' },
+        { abortSignal: new AbortController().signal, toolCallId: 'zod-v3-repeat-valid', messages: [] },
+      ),
+    ).resolves.toEqual({ note: 'ACCEPTED' });
+    await expect(
+      secondBuilt.execute?.(
+        { note: ' reject ' },
+        { abortSignal: new AbortController().signal, toolCallId: 'zod-v3-repeat-invalid', messages: [] },
+      ),
+    ).resolves.toMatchObject({ error: true });
+    expect(execute).toHaveBeenCalledTimes(2);
+    expect(execute).toHaveBeenNthCalledWith(1, { note: 'ACCEPTED' }, expect.any(Object));
+    expect(execute).toHaveBeenNthCalledWith(2, { note: 'ACCEPTED' }, expect.any(Object));
   });
 
   it('preserves async validation results in the native tool input schema', async () => {
