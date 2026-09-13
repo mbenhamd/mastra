@@ -1255,13 +1255,17 @@ export class AgentThreadStreamRuntime {
 
       void resolvedPubSub
         .subscribe(replyTopic, onReply)
-        .then(() =>
-          resolvedPubSub.publish(AGENT_THREAD_PEER_DISCOVERY_TOPIC, {
+        .then(async () => {
+          if (settled) {
+            await resolvedPubSub.unsubscribe(replyTopic, onReply).catch(() => {});
+            return;
+          }
+          return resolvedPubSub.publish(AGENT_THREAD_PEER_DISCOVERY_TOPIC, {
             type: 'thread-peer-request',
             runId: requestId,
             data: { type: 'thread-peer-request', requestId, replyTopic, sourceId: this.#getSourceId() },
-          }),
-        )
+          });
+        })
         .catch(() => finish());
     });
 
@@ -1558,8 +1562,12 @@ export class AgentThreadStreamRuntime {
 
       void pubsub
         .subscribe(replyTopic, onReply)
-        .then(() =>
-          this.#publishAndWait(pubsub, key, {
+        .then(async () => {
+          if (settled) {
+            await pubsub.unsubscribe(replyTopic, onReply).catch(() => {});
+            return;
+          }
+          return this.#publishAndWait(pubsub, key, {
             type: 'idle-signal-enqueued',
             runId,
             signal: this.#serializeSignal(signal),
@@ -1568,8 +1576,8 @@ export class AgentThreadStreamRuntime {
             replyTopic,
             targetSourceId,
             timeoutMs: AGENT_THREAD_OWNER_ACCEPTANCE_TIMEOUT_MS,
-          }),
-        )
+          });
+        })
         .catch(error => finish({ error: getErrorFromUnknown(error) }));
     });
   }
@@ -1630,13 +1638,17 @@ export class AgentThreadStreamRuntime {
 
       void pubsub
         .subscribe(replyTopic, onReply)
-        .then(() =>
-          pubsub.publish(AGENT_THREAD_OWNER_DISCOVERY_TOPIC, {
+        .then(async () => {
+          if (settled) {
+            await pubsub.unsubscribe(replyTopic, onReply).catch(() => {});
+            return;
+          }
+          return pubsub.publish(AGENT_THREAD_OWNER_DISCOVERY_TOPIC, {
             type: 'thread-owner-request',
             runId: requestId,
             data: { type: 'thread-owner-request', key, requestId, replyTopic, sourceId: this.#getSourceId() },
-          }),
-        )
+          });
+        })
         .catch(() => finish());
     });
   }

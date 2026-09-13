@@ -179,7 +179,7 @@ jobs:
   readme-check:
     name: Validate package READMEs
     needs: changes
-    runs-on: starsling-ubuntu-24.04
+    runs-on: ${{ (github.repository == 'mastra-ai/mastra' && github.event.pull_request.head.repo.full_name == github.repository) && 'starsling-ubuntu-24.04' || 'ubuntu-24.04' }}
     timeout-minutes: 10
     if: needs.changes.outputs.has_readme_inputs == 'true' && github.repository == 'mastra-ai/mastra'
     permissions:

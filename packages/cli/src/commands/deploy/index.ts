@@ -13,7 +13,7 @@ import { execSync } from 'node:child_process';
 import { createWriteStream } from 'node:fs';
 import { mkdir, rm, stat, access, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import * as p from '@clack/prompts';
 import { coreFeatures } from '@mastra/core/features';
 import { ZipArchive } from 'archiver';
@@ -194,7 +194,7 @@ export async function resolveWorkersDeployMode(input: {
   autoAccept: boolean;
   promptConfirm: (message: string) => Promise<boolean | symbol>;
   isCancel: (value: unknown) => value is symbol;
-}): Promise<WorkersDeployMode> {
+}): Promise<WorkersDeployMode | 'cancelled'> {
   if (input.workersOption === 'in-process') return 'in-process';
   // No enabled workers in the build → nothing to provision, mode is
   // irrelevant (an explicit `--workers dedicated` gets a warning at the
@@ -215,7 +215,7 @@ export async function resolveWorkersDeployMode(input: {
   const answer = await input.promptConfirm(
     'Provision a dedicated workers service? (recommended — otherwise background tasks run in-process inside the API server container)',
   );
-  if (input.isCancel(answer)) return 'dedicated';
+  if (input.isCancel(answer)) return 'cancelled';
   return answer === false ? 'in-process' : 'dedicated';
 }
 
@@ -1597,8 +1597,7 @@ async function runUnifiedDeploy(dir: string | undefined, opts: DeployOptions) {
   if (!envFile && /^[a-zA-Z0-9._-]+$/.test(envName) && !envName.includes('..')) {
     const envNameFile = `.env.${envName}`;
     const candidate = resolve(targetDir, envNameFile);
-    const targetPrefix = resolve(targetDir) + '/';
-    if (candidate.startsWith(targetPrefix)) {
+    if (dirname(candidate) === resolve(targetDir)) {
       try {
         await access(candidate);
         envFile = envNameFile;
@@ -1750,7 +1749,7 @@ async function runUnifiedDeploy(dir: string | undefined, opts: DeployOptions) {
   const redisRequirementMet = hasWorkersRedisRequirement(deploymentEnv, managedEnvVarNames);
   let workersMode: WorkersDeployMode;
   try {
-    workersMode = await resolveWorkersDeployMode({
+    const workersOutcome = await resolveWorkersDeployMode({
       workersEnabled,
       redisRequirementMet,
       environmentHasWorkerService,
@@ -1759,6 +1758,11 @@ async function runUnifiedDeploy(dir: string | undefined, opts: DeployOptions) {
       promptConfirm: message => p.confirm({ message, initialValue: true }),
       isCancel: (value): value is symbol => p.isCancel(value),
     });
+    if (workersOutcome === 'cancelled') {
+      p.cancel('Deploy cancelled.');
+      process.exit(0);
+    }
+    workersMode = workersOutcome;
   } catch (error) {
     if (error instanceof WorkersRedisRequirementError) {
       p.cancel(error.message);

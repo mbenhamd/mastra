@@ -207,6 +207,79 @@ class RetainedAsyncCallbackPubSub extends PubSub {
   }
 }
 
+class DelayedRegistrationPubSub extends RetainedAsyncCallbackPubSub {
+  readonly published: Array<{ topic: string; event: any }> = [];
+  #activeSubscriptions = new Map<string, Set<EventCallback>>();
+  #nextDelayedSubscription:
+    | {
+        matches: (topic: string) => boolean;
+        gate: Promise<void>;
+        markStarted: () => void;
+        markRegistered: () => void;
+        barrier: { started: Promise<void>; registered: Promise<void>; release: () => void; topic?: string };
+      }
+    | undefined;
+
+  delayNextSubscription(matches: (topic: string) => boolean) {
+    let release!: () => void;
+    let markStarted!: () => void;
+    let markRegistered!: () => void;
+    const barrier = {
+      started: new Promise<void>(resolve => {
+        markStarted = resolve;
+      }),
+      registered: new Promise<void>(resolve => {
+        markRegistered = resolve;
+      }),
+      release: () => release(),
+      topic: undefined as string | undefined,
+    };
+    const gate = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    this.#nextDelayedSubscription = { matches, gate, markStarted, markRegistered, barrier };
+    return barrier;
+  }
+
+  activeSubscriptionCount(topic: string): number {
+    return this.#activeSubscriptions.get(topic)?.size ?? 0;
+  }
+
+  override async publish(topic: string, event: any): Promise<void> {
+    this.published.push({ topic, event });
+    await super.publish(topic, event);
+  }
+
+  override async subscribe(topic: string, cb: EventCallback, options?: SubscribeOptions): Promise<void> {
+    const delayed = this.#nextDelayedSubscription;
+    if (delayed?.matches(topic)) {
+      this.#nextDelayedSubscription = undefined;
+      delayed.barrier.topic = topic;
+      delayed.markStarted();
+      await delayed.gate;
+      try {
+        await super.subscribe(topic, cb, options);
+        const callbacks = this.#activeSubscriptions.get(topic) ?? new Set<EventCallback>();
+        callbacks.add(cb);
+        this.#activeSubscriptions.set(topic, callbacks);
+      } finally {
+        delayed.markRegistered();
+      }
+      return;
+    }
+
+    await super.subscribe(topic, cb, options);
+    const callbacks = this.#activeSubscriptions.get(topic) ?? new Set<EventCallback>();
+    callbacks.add(cb);
+    this.#activeSubscriptions.set(topic, callbacks);
+  }
+
+  override async unsubscribe(topic: string, cb: EventCallback): Promise<void> {
+    this.#activeSubscriptions.get(topic)?.delete(cb);
+    await super.unsubscribe(topic, cb);
+  }
+}
+
 class ControlledLeasePubSub extends RetainedAsyncCallbackPubSub implements LeaseProvider {
   owners = new Map<string, string>();
   publishedData: any[] = [];
@@ -3583,6 +3656,59 @@ describe('Agent signals', () => {
     claim.unsubscribe();
   });
 
+  it('does not enqueue a signal after the acceptance subscription times out before registration', async () => {
+    vi.useFakeTimers();
+    const pubsub = new DelayedRegistrationPubSub();
+    const ownerRuntime = new AgentThreadStreamRuntime();
+    const senderRuntime = new AgentThreadStreamRuntime();
+    const ownerStream = vi.fn(async () => ({}));
+    const ownerAgent = { id: 'late-acceptance-owner', stream: ownerStream } as unknown as Agent;
+    const senderAgent = { id: 'late-acceptance-sender' } as unknown as Agent;
+    const ownerClaimPromise = ownerRuntime.claimThreadOwnership(
+      ownerAgent,
+      { resourceId: 'late-acceptance-user', threadId: 'late-acceptance-thread', peer: false },
+      pubsub,
+    );
+    let claim: { claimed: boolean; unsubscribe: () => void } | undefined;
+    const barrier = pubsub.delayNextSubscription(topic => topic.includes('.idle-acceptance.'));
+
+    try {
+      await vi.advanceTimersByTimeAsync(100);
+      claim = await ownerClaimPromise;
+      expect(claim.claimed).toBe(true);
+
+      const signalResult = senderRuntime.sendSignal(
+        senderAgent,
+        { type: 'user-message', contents: 'late acceptance' },
+        {
+          resourceId: 'late-acceptance-user',
+          threadId: 'late-acceptance-thread',
+          ifIdle: { behavior: 'wake', requireClaimedOwner: true },
+        },
+        pubsub,
+      );
+
+      await vi.advanceTimersByTimeAsync(100);
+      await barrier.started;
+      await vi.advanceTimersByTimeAsync(5_000);
+      await expect(signalResult.accepted).rejects.toThrow('Claimed thread owner did not accept signal');
+
+      barrier.release();
+      await barrier.registered;
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(pubsub.published.some(({ event }) => event.data?.type === 'idle-signal-enqueued')).toBe(false);
+      expect(pubsub.activeSubscriptionCount(barrier.topic!)).toBe(0);
+      expect(ownerStream).not.toHaveBeenCalled();
+    } finally {
+      barrier.release();
+      if (barrier.topic) await barrier.registered;
+      claim?.unsubscribe();
+      vi.useRealTimers();
+    }
+  });
+
   it.each([true, false])('clears a %s claimed-owner pre-stream failure for retry', async local => {
     const pubsub = new ControlledLeasePubSub();
     const ownerRuntime = local ? agentThreadStreamRuntime : new AgentThreadStreamRuntime();
@@ -4377,6 +4503,31 @@ describe('Agent signals', () => {
     ).resolves.toEqual([]);
   });
 
+  it('does not publish peer discovery after a timed-out subscription registers late', async () => {
+    vi.useFakeTimers();
+    const pubsub = new DelayedRegistrationPubSub();
+    const barrier = pubsub.delayNextSubscription(topic => topic.startsWith('agent.thread-peer-discovery.'));
+    const discovery = new AgentThreadStreamRuntime().discoverThreadPeers({ timeoutMs: 10 }, pubsub);
+
+    try {
+      await barrier.started;
+      await vi.advanceTimersByTimeAsync(10);
+      await expect(discovery).resolves.toEqual([]);
+
+      barrier.release();
+      await barrier.registered;
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(pubsub.published.some(({ event }) => event.data?.type === 'thread-peer-request')).toBe(false);
+      expect(pubsub.activeSubscriptionCount(barrier.topic!)).toBe(0);
+    } finally {
+      barrier.release();
+      if (barrier.topic) await barrier.registered;
+      vi.useRealTimers();
+    }
+  });
+
   it('rejects an idle wake that requires an unavailable claimed owner', async () => {
     const pubsub = new EventEmitterPubSub();
     const agent = new Agent({
@@ -4400,6 +4551,44 @@ describe('Agent signals', () => {
     expect(
       agent.getActiveThreadRunId({ resourceId: 'required-owner-resource', threadId: 'required-owner-thread' }),
     ).toBe(undefined);
+  });
+
+  it('does not publish owner discovery after a timed-out subscription registers late', async () => {
+    vi.useFakeTimers();
+    const pubsub = new DelayedRegistrationPubSub();
+    const barrier = pubsub.delayNextSubscription(topic => topic.startsWith('agent.thread-owner-discovery.'));
+    const runtime = new AgentThreadStreamRuntime();
+    const agent = { id: 'late-owner-discovery-agent' } as unknown as Agent;
+    let claim: { claimed: boolean; unsubscribe: () => void } | undefined;
+    const claimPromise = runtime.claimThreadOwnership(
+      agent,
+      {
+        resourceId: 'late-owner-discovery-user',
+        threadId: 'late-owner-discovery-thread',
+        peer: false,
+      },
+      pubsub,
+    );
+
+    try {
+      await barrier.started;
+      await vi.advanceTimersByTimeAsync(100);
+      claim = await claimPromise;
+      expect(claim.claimed).toBe(true);
+
+      barrier.release();
+      await barrier.registered;
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(pubsub.published.some(({ event }) => event.data?.type === 'thread-owner-request')).toBe(false);
+      expect(pubsub.activeSubscriptionCount(barrier.topic!)).toBe(0);
+    } finally {
+      barrier.release();
+      if (barrier.topic) await barrier.registered;
+      claim?.unsubscribe();
+      vi.useRealTimers();
+    }
   });
 
   it('rejects every concurrent idle wake when claimed-owner discovery times out', async () => {

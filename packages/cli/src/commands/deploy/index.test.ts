@@ -733,9 +733,9 @@ describe('resolveWorkersDeployMode', () => {
     expect(mode).toBe('dedicated');
   });
 
-  it('treats a cancelled prompt as the safe default (dedicated)', async () => {
+  it('returns cancellation when the user cancels the prompt', async () => {
     const promptConfirm = vi.fn().mockResolvedValue(CANCEL_SYMBOL);
     const mode = await resolveWorkersDeployMode({ ...base, promptConfirm });
-    expect(mode).toBe('dedicated');
+    expect(mode).toBe('cancelled');
   });
 });
