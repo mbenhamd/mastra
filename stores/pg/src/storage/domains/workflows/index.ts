@@ -115,6 +115,7 @@ import type {
   StorageListWorkflowRunsInput,
   WorkflowRun,
   WorkflowRuns,
+  WorkflowExecutionState,
   CreateIndexOptions,
   WorkflowTerminalContinuationPlanRecord,
   WorkflowTerminalizationCapabilities,
@@ -150,6 +151,9 @@ import { PG_UNSAFE_JSON_UNICODE_ESCAPE_PATTERN, sanitizeJsonForPg } from '../../
 import { getSchemaSnapshot } from '../../db/schema-snapshot';
 import type { SchemaCheckConstraint } from '../../db/schema-snapshot';
 import { runPrune, resolveTargets } from '../../retention';
+
+const PG_UNSAFE_JSON_UNICODE_ESCAPE_PATTERN_WITHOUT_CAPTURES = String.raw`(?<!\\)(?:\\\\)*(?:\\u[Dd][89AaBb][0-9A-Fa-f]{2}\\u[Dd][CcDdEeFf][0-9A-Fa-f]{2}|\\u(?:0000|[Dd][89A-Fa-f][0-9A-Fa-f]{2}))`;
+const PG_UNSAFE_WORKFLOW_AUTHORITY_KEY_PATTERN = String.raw`"([^"]*)(${PG_UNSAFE_JSON_UNICODE_ESCAPE_PATTERN_WITHOUT_CAPTURES})(status|executionGeneration)"([[:space:]]*:)`;
 
 class CorruptWorkflowTerminalSnapshotRecordError extends TypeError {
   constructor() {
@@ -3808,7 +3812,33 @@ export class WorkflowsPG extends WorkflowsStorage {
   }
 
   private sanitizedWorkflowSnapshotStatusExpression(columnReference: string): string {
-    return `regexp_replace((${columnReference}::json)::text, '${PG_UNSAFE_JSON_UNICODE_ESCAPE_PATTERN}', E'\\\\1\\\\2', 'g')::jsonb->>'status'`;
+    return `${this.sanitizedWorkflowSnapshotJsonbExpression(columnReference)}->>'status'`;
+  }
+
+  private workflowSnapshotJsonbExpression(snapshotColumnType: string, columnReference: string): string {
+    if (snapshotColumnType === 'jsonb') return columnReference;
+    if (snapshotColumnType === 'json' || snapshotColumnType === 'text') {
+      return this.sanitizedWorkflowSnapshotJsonbExpression(columnReference);
+    }
+    throw new TypeError(
+      `Workflow parent revision migration does not support snapshot column type ${snapshotColumnType || 'missing'}`,
+    );
+  }
+
+  private workflowExecutionSnapshotJsonbExpression(snapshotColumnType: string, columnReference: string): string {
+    if (snapshotColumnType === 'jsonb') return columnReference;
+    if (snapshotColumnType === 'json' || snapshotColumnType === 'text') {
+      const jsonText = `(${columnReference}::json)::text`;
+      const protectedAuthorityKeys = `regexp_replace(${jsonText}, '${PG_UNSAFE_WORKFLOW_AUTHORITY_KEY_PATTERN}', E'"\\\\1__mastra_unsafe_\\\\3"\\\\4', 'g')`;
+      return `regexp_replace(${protectedAuthorityKeys}, '${PG_UNSAFE_JSON_UNICODE_ESCAPE_PATTERN}', E'\\\\1\\\\2', 'g')::jsonb`;
+    }
+    throw new TypeError(
+      `Workflow parent revision migration does not support snapshot column type ${snapshotColumnType || 'missing'}`,
+    );
+  }
+
+  private sanitizedWorkflowSnapshotJsonbExpression(columnReference: string): string {
+    return `regexp_replace((${columnReference}::json)::text, '${PG_UNSAFE_JSON_UNICODE_ESCAPE_PATTERN}', E'\\\\1\\\\2', 'g')::jsonb`;
   }
 
   private requireSupportedWorkflowSnapshotColumnType(snapshotColumnType: string | null): WorkflowSnapshotColumnType {
@@ -5011,6 +5041,79 @@ export class WorkflowsPG extends WorkflowsStorage {
           id: createStorageErrorId('PG', 'LOAD_WORKFLOW_SNAPSHOT', 'FAILED'),
           domain: ErrorDomain.STORAGE,
           category: ErrorCategory.THIRD_PARTY,
+        },
+        error,
+      );
+    }
+  }
+
+  async getWorkflowExecutionState({
+    workflowName,
+    runId,
+  }: {
+    workflowName: string;
+    runId: string;
+  }): Promise<WorkflowExecutionState | null> {
+    try {
+      const snapshotColumnType = await this.resolveWorkflowSnapshotColumnType(this.#db.client);
+      const snapshotJson = this.workflowExecutionSnapshotJsonbExpression(snapshotColumnType, 'snapshot.snapshot');
+      const decodeSnapshotString = snapshotColumnType === 'json' || snapshotColumnType === 'jsonb';
+      const decodedSnapshot = decodeSnapshotString
+        ? `CASE
+             WHEN jsonb_typeof(stored_snapshot.snapshot) = 'string'
+               THEN (stored_snapshot.snapshot #>> '{}')::jsonb
+             ELSE stored_snapshot.snapshot
+           END`
+        : 'stored_snapshot.snapshot';
+      const snapshotType = 'jsonb_typeof(decoded_snapshot.snapshot)';
+      const snapshotScalar = `(decoded_snapshot.snapshot #>> '{}')`;
+      const snapshotIsFalsy = `(
+        decoded_snapshot.snapshot IS NULL
+        OR ${snapshotType} = 'null'
+        OR (${snapshotType} = 'boolean' AND ${snapshotScalar} = 'false')
+        OR CASE WHEN ${snapshotType} = 'number' THEN ${snapshotScalar}::numeric = 0 ELSE false END
+        OR (${snapshotType} = 'string' AND ${snapshotScalar} = '')
+      )`;
+      const snapshotHasStatus = `${snapshotType} = 'object' AND decoded_snapshot.snapshot->'status' IS NOT NULL`;
+      const snapshotHasExecutionGeneration = `${snapshotType} = 'object' AND decoded_snapshot.snapshot->'executionGeneration' IS NOT NULL`;
+      const row = await this.#db.client.oneOrNone<{
+        snapshot_is_falsy: boolean;
+        status: unknown;
+        status_present: boolean;
+        execution_generation: unknown;
+        execution_generation_present: boolean;
+      }>(
+        `WITH stored_snapshot AS (
+           SELECT ${snapshotJson} AS snapshot
+           FROM ${this.workflowSnapshotTableName()} AS snapshot
+           WHERE workflow_name = $1 AND run_id = $2
+           OFFSET 0
+         ), decoded_snapshot AS (
+           SELECT ${decodedSnapshot} AS snapshot
+           FROM stored_snapshot
+           OFFSET 0
+         )
+         SELECT ${snapshotIsFalsy} AS snapshot_is_falsy,
+                CASE WHEN ${snapshotHasStatus} THEN decoded_snapshot.snapshot->'status' END AS status,
+                ${snapshotHasStatus} AS status_present,
+                CASE WHEN ${snapshotHasExecutionGeneration} THEN decoded_snapshot.snapshot->'executionGeneration' END AS execution_generation,
+                ${snapshotHasExecutionGeneration} AS execution_generation_present
+         FROM decoded_snapshot`,
+        [workflowName, runId],
+      );
+      if (!row || row.snapshot_is_falsy) return null;
+
+      return {
+        status: row.status_present ? row.status : undefined,
+        ...(row.execution_generation_present ? { executionGeneration: row.execution_generation } : {}),
+      } as WorkflowExecutionState;
+    } catch (error) {
+      throw new MastraError(
+        {
+          id: createStorageErrorId('PG', 'GET_WORKFLOW_EXECUTION_STATE', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: { workflowName, runId },
         },
         error,
       );
