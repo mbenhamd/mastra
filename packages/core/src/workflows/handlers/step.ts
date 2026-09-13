@@ -49,6 +49,14 @@ import {
   validateStepStateData,
   validateStepRequestContext,
 } from '../utils';
+import { prepareStepSnapshot } from './entry';
+import type { PersistStepUpdateParams } from './entry';
+
+function isRecordState(value: unknown): value is Record<string, any> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
 
 export interface ExecuteStepParams extends ObservabilityContext {
   workflowId: string;
@@ -176,9 +184,14 @@ export async function executeStep(
     isResume = true;
   }
 
+  // Capture the result before recording this invocation as running. Resumed
+  // nested workflows need the suspended metadata after the shared map is
+  // updated for the serialized start write.
+  const priorStepResult = stepResults[step.id];
+  const priorSuspendedStepResult = priorStepResult?.status === 'suspended' ? priorStepResult : undefined;
+
   // Extract suspend data if this step was previously suspended
-  let suspendDataToUse =
-    stepResults[step.id]?.status === 'suspended' ? stepResults[step.id]?.suspendPayload : undefined;
+  let suspendDataToUse = priorSuspendedStepResult?.suspendPayload;
 
   // A suspended foreach step's step-level suspendPayload only carries the FIRST suspended
   // iteration's payload. When resuming a specific iteration, use that iteration's own payload
@@ -236,27 +249,42 @@ export async function executeStep(
   }
 
   if (!executionContext.transientExecution) {
+    // Ordinary branches share progress until the serialized write boundary.
+    // Foreach iterations retain separate results because they share a step id.
+    const startStepResults =
+      executionContext.foreachIndex === undefined ? stepResults : { ...stepResults, [step.id]: stepInfo };
+    if (executionContext.foreachIndex === undefined) {
+      stepResults[step.id] = stepInfo as StepResult<any, any, any, any>;
+    }
     const startPersist = await engine.persistStepUpdate({
       workflowId,
       runId,
       resourceId,
       serializedStepGraph,
-      stepResults: {
-        ...stepResults,
-        [step.id]: stepInfo,
-      } as Record<string, StepResult<any, any, any, any>>,
+      stepResults: startStepResults as Record<string, StepResult<any, any, any, any>>,
       executionContext,
       workflowStatus: 'running',
       requestContext,
       phase: 'start',
     });
-    if (startPersist && startPersist.status !== 'persisted' && startPersist.status !== 'protected_state') {
+    // A start write can be acknowledged after another worker cancels the run.
+    // Recheck before emitting the start event or entering user step code.
+    const startDisposition =
+      startPersist && startPersist.status !== 'persisted' && startPersist.status !== 'protected_state'
+        ? (startPersist.disposition ?? 'canceled')
+        : await engine.getAuthoritativeExecutionDisposition({ workflowId, runId, executionGeneration });
+    if (startDisposition) {
       delete executionContext.activeStepsPath[step.id];
       const canceledStepResult = {
         ...omitPriorCompletionFields(stepInfo),
         status: 'canceled',
         endedAt: Date.now(),
       } as unknown as StepResult<any, any, any, any>;
+      await engine.endStepSpan({
+        span: stepSpan,
+        operationId: `workflow.${workflowId}.run.${runId}.step.${step.id}.span.end`,
+        endOptions: { attributes: { status: 'canceled' } },
+      });
       return {
         result: canceledStepResult,
         stepResults: { [step.id]: canceledStepResult },
@@ -302,9 +330,16 @@ export async function executeStep(
 
   // Check if this is a nested workflow that requires special handling
   if (engine.isNestedWorkflowStep(step)) {
+    // The shared map records this invocation as running before the platform
+    // hook runs. Preserve the suspended parent result for engines that inspect
+    // the map to recover the nested run id and resume path.
+    const nestedStepResults = priorSuspendedStepResult
+      ? { ...stepResults, [step.id]: priorSuspendedStepResult }
+      : stepResults;
+    const sharedState = executionContext.foreachIndex === undefined ? executionContext.state : undefined;
     const workflowResult = await engine.executeWorkflowStep({
       step,
-      stepResults,
+      stepResults: nestedStepResults,
       executionContext,
       resume,
       timeTravel,
@@ -323,6 +358,14 @@ export async function executeStep(
 
     // If executeWorkflowStep returns a result, wrap it in StepExecutionResult
     if (workflowResult !== null) {
+      if (isRecordState(sharedState) && isRecordState(executionContext.state)) {
+        // Platform hooks may replace the branch state with the nested result's
+        // state. Merge it into the shared root before the completed result is
+        // persisted, so a sibling cannot observe completion with stale state.
+        Object.assign(sharedState, executionContext.state);
+        executionContext.state = sharedState;
+      }
+
       // End the step span with the nested workflow result
       if (stepSpan) {
         if (workflowResult.status === 'failed') {
@@ -552,16 +595,15 @@ export async function executeStep(
         },
         // Only pass resume data if this step was actually suspended before
         // This prevents pending nested workflows from trying to resume instead of start
-        resume:
-          stepResults[step.id]?.status === 'suspended'
-            ? {
-                steps: resume?.steps?.slice(1) || [],
-                resumePayload: resume?.resumePayload,
-                runId: stepResults[step.id]?.suspendPayload?.__workflow_meta?.runId,
-                label: resume?.label,
-                forEachIndex: resume?.forEachIndex,
-              }
-            : undefined,
+        resume: priorSuspendedStepResult
+          ? {
+              steps: resume?.steps?.slice(1) || [],
+              resumePayload: resume?.resumePayload,
+              runId: priorSuspendedStepResult.suspendPayload?.__workflow_meta?.runId,
+              label: resume?.label,
+              forEachIndex: resume?.forEachIndex,
+            }
+          : undefined,
         // Only pass restart data if this step is part of activeStepsPath
         // This prevents pending nested workflows from trying to restart instead of start
         restart: !!restart?.activeStepsPath?.[step.id],
@@ -675,7 +717,24 @@ export async function executeStep(
   }
 
   if (stepRetryResult.ok && stepRetryResult.result.contextMutations.stateUpdate != null) {
-    executionContext.state = stepRetryResult.result.contextMutations.stateUpdate;
+    const stateUpdate = stepRetryResult.result.contextMutations.stateUpdate;
+    if (executionContext.foreachIndex === undefined) {
+      // Parallel branches share the engine-owned state object. Merge the
+      // update in place before the result enters the persistence queue so a
+      // sibling cannot snapshot stale state alongside newer step results.
+      if (isRecordState(executionContext.state) && isRecordState(stateUpdate)) {
+        Object.assign(executionContext.state, stateUpdate);
+      } else {
+        executionContext.state = stateUpdate;
+      }
+    } else {
+      // Foreach iterations retain their isolated state update until the
+      // iteration result is applied by the parent control-flow handler.
+      executionContext.state =
+        isRecordState(executionContext.state) && isRecordState(stateUpdate)
+          ? { ...executionContext.state, ...stateUpdate }
+          : stateUpdate;
+    }
   }
 
   delete executionContext.activeStepsPath[step.id];
@@ -749,9 +808,12 @@ export async function executeStep(
     stepResults: { [step.id]: stepResult },
     mutableContext: engine.buildMutableContext({
       ...executionContext,
-      state: stepRetryResult.ok
-        ? (stepRetryResult.result.contextMutations.stateUpdate ?? executionContext.state)
-        : executionContext.state,
+      state:
+        executionContext.foreachIndex === undefined
+          ? executionContext.state
+          : stepRetryResult.ok
+            ? (stepRetryResult.result.contextMutations.stateUpdate ?? executionContext.state)
+            : executionContext.state,
     }),
     // Serialize requestContext only for engines that restore it from
     // serialized results (Inngest memoization); the default engine keeps
@@ -1023,6 +1085,12 @@ async function persistThenPublishStepResult(params: {
   deferLifecycleResult?: (emission: Promise<void>) => void;
   phase: string;
 }): Promise<boolean> {
+  // Sibling branches share this map. Record the local result before awaiting
+  // persistence/publication so a sibling cannot overwrite it with "running".
+  // Foreach iterations share one step id and retain their aggregate separately.
+  if (params.executionContext.foreachIndex === undefined) {
+    params.stepResults[params.stepId] = params.execResults;
+  }
   const lifecycleEvents = collectStepResultLifecycleEvents(params);
   let canonicalEventsForPublication: WorkflowLifecycleEvent[] | undefined;
   const isCompositeChild =
@@ -1031,23 +1099,30 @@ async function persistThenPublishStepResult(params: {
   const workflowStatus =
     !isCompositeChild && (stepStatus === 'suspended' || stepStatus === 'paused') ? stepStatus : 'running';
   if (!params.executionContext.transientExecution) {
-    const outcome: PersistWorkflowStepUpdateResult | void = await params.engine.persistStepUpdate({
+    const persistenceParams: PersistStepUpdateParams = {
       workflowId: params.workflowId,
       runId: params.runId,
       resourceId: params.resourceId,
       serializedStepGraph: params.serializedStepGraph,
-      stepResults: {
-        ...params.stepResults,
-        [params.stepId]: params.execResults,
-      },
+      stepResults:
+        params.executionContext.foreachIndex === undefined
+          ? params.stepResults
+          : { ...params.stepResults, [params.stepId]: params.execResults },
       executionContext: params.executionContext,
       workflowStatus,
       requestContext: params.requestContext,
       tracingContext: params.tracingContext,
       lifecycleEvents,
       phase: params.phase,
-    });
-    const needsAuthorityFallback = !outcome || (outcome.status === 'protected_state' && workflowStatus === 'running');
+    };
+    const outcome: PersistWorkflowStepUpdateResult | void = await params.engine.persistStepUpdate(persistenceParams);
+    // An accepted write can be acknowledged after a remote cancellation has
+    // already published its terminal event. Keep the publication-time check
+    // until storage and delivery share an ordered lifecycle authority.
+    const needsAuthorityFallback =
+      !outcome ||
+      outcome.status === 'persisted' ||
+      (outcome.status === 'protected_state' && workflowStatus === 'running');
     if (needsAuthorityFallback) {
       const executionGeneration = requireWorkflowExecutionGeneration(
         params.executionContext.executionGeneration,
@@ -1065,17 +1140,9 @@ async function persistThenPublishStepResult(params: {
       return true;
     }
     if (outcome?.status === 'persisted') {
-      const executionGeneration = requireWorkflowExecutionGeneration(
-        params.executionContext.executionGeneration,
-        `Workflow step result ${params.workflowId}/${params.runId}/${params.stepId}`,
-      );
-      const disposition = await params.engine.getAuthoritativeExecutionDisposition({
-        workflowId: params.workflowId,
-        runId: params.runId,
-        executionGeneration,
-      });
-      if (disposition) return true;
       canonicalEventsForPublication = outcome.acceptedEvents ?? [];
+    } else if (params.engine.options?.pruneSnapshot) {
+      canonicalEventsForPublication = prepareStepSnapshot(params.engine, persistenceParams).prunedLifecycleEvents ?? [];
     }
   }
 

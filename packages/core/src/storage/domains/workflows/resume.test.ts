@@ -270,7 +270,7 @@ describe('atomic workflow resume records', () => {
         runId: existing.runId,
         resourceId: existing.resourceId,
         expectedExecutionGeneration: existing.executionGeneration,
-        snapshot: { ...persisted.snapshot!, lifecycleOutbox: undefined },
+        snapshot: persisted.snapshot!,
         retainExistingLifecycleOutbox: false,
       },
       materialize,

@@ -63,6 +63,34 @@ import { abortableSleep, getSingleStepEntryId, omitPriorCompletionFields } from 
 // Re-export ExecutionContext for backwards compatibility
 export type { ExecutionContext } from './types';
 
+function normalizeStateRoot<TState>(state: TState): TState {
+  if (state === null || typeof state !== 'object') return state;
+  if (state instanceof Date || state instanceof Map || state instanceof Set) return state;
+  if (!Array.isArray(state)) {
+    const prototype = Object.getPrototypeOf(state);
+    if (prototype !== Object.prototype && prototype !== null) return state;
+  }
+
+  const descriptors = Object.getOwnPropertyDescriptors(state);
+  const isMergeable =
+    Object.isExtensible(state) &&
+    Object.values(descriptors).every(descriptor => 'value' in descriptor && descriptor.writable);
+  if (isMergeable) return state;
+
+  const mutableState = Array.isArray(state) ? [] : Object.create(Object.getPrototypeOf(state));
+  return Object.assign(mutableState, state) as TState;
+}
+
+function copyStateRoot<TState>(state: TState): TState {
+  if (state === null || typeof state !== 'object') return state;
+  if (Array.isArray(state)) return state.slice() as TState;
+  if (state instanceof Date) return new Date(state.getTime()) as TState;
+  if (state instanceof Map) return new Map(state) as TState;
+  if (state instanceof Set) return new Set(state) as TState;
+  const prototype = Object.getPrototypeOf(state);
+  return prototype === Object.prototype || prototype === null ? ({ ...state } as TState) : state;
+}
+
 /** Params for the per-type execute methods: the same context `executeStep` takes,
  * with the declarative graph entry instead of a pre-built `step`. */
 export type ExecuteAgentParams = Omit<ExecuteStepParams, 'step'> & {
@@ -98,6 +126,13 @@ export class DefaultExecutionEngine extends ExecutionEngine {
    * recovery relies on.
    */
   protected lastPersistedStatusByRun = new Map<string, WorkflowRunStatus>();
+
+  /**
+   * Serializes snapshot capture and persistence for each run without
+   * serializing unrelated runs. The entry is removed by persistStepUpdate
+   * after the queued write settles, including rejected writes.
+   */
+  private pendingStepUpdatesByRun = new Map<string, Promise<PersistWorkflowStepUpdateResult | void>>();
 
   /** Returns the last status persisted for a given run in this process, if any. */
   getLastPersistedStatus(runId: string): WorkflowRunStatus | undefined {
@@ -154,6 +189,11 @@ export class DefaultExecutionEngine extends ExecutionEngine {
     executionGeneration: string;
   }): Promise<boolean> {
     return (await this.getAuthoritativeExecutionDisposition(params)) === 'canceled';
+  }
+
+  private async shouldReconcilePersistedTerminal(): Promise<boolean> {
+    const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
+    return workflowsStore?.getWorkflowResumeCapabilities()?.fencedStepUpdateVersion !== 1;
   }
 
   /**
@@ -931,7 +971,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
     let stepExecutionPath: string[] =
       timeTravel?.stepExecutionPath || restart?.stepExecutionPath || resume?.stepExecutionPath || [];
     let lastOutput: any;
-    let lastState: Record<string, any> = timeTravel?.state ?? restart?.state ?? initialState ?? {};
+    let lastState: Record<string, any> = normalizeStateRoot(timeTravel?.state ?? restart?.state ?? initialState ?? {});
     let lastExecutionContext: ExecutionContext | undefined;
     let currentRequestContext = params.requestContext;
     for (let i = startIdx; i < steps.length; i++) {
@@ -1099,7 +1139,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       const persistOutcome = lastOutput.persistOutcome as PersistWorkflowStepUpdateResult | void | undefined;
       const authoritativeDisposition = params.transientExecution
         ? undefined
-        : persistOutcome && persistOutcome.status !== 'persisted' && persistOutcome.status
+        : persistOutcome && persistOutcome.status !== 'persisted'
           ? (persistOutcome.disposition ?? 'canceled')
           : await this.getAuthoritativeExecutionDisposition({ workflowId, runId, executionGeneration });
       if (
@@ -1203,10 +1243,12 @@ export class DefaultExecutionEngine extends ExecutionEngine {
           }
         }
 
+        const shouldCheckTerminalAuthority =
+          !params.transientExecution &&
+          (terminalWrite?.status !== 'persisted' || (await this.shouldReconcilePersistedTerminal()));
         if (
           params.abortController.signal.aborted ||
-          (!params.transientExecution &&
-            terminalWrite?.status !== 'persisted' &&
+          (shouldCheckTerminalAuthority &&
             (await this.isAuthoritativelyCanceled({ workflowId, runId, executionGeneration })))
         ) {
           result = { ...result, status: 'canceled', result: undefined, error: undefined };
@@ -1432,10 +1474,12 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       }
     }
 
+    const shouldCheckTerminalAuthority =
+      !params.transientExecution &&
+      (terminalWrite?.status !== 'persisted' || (await this.shouldReconcilePersistedTerminal()));
     if (
       params.abortController.signal.aborted ||
-      (!params.transientExecution &&
-        terminalWrite?.status !== 'persisted' &&
+      (shouldCheckTerminalAuthority &&
         (await this.isAuthoritativelyCanceled({ workflowId, runId, executionGeneration })))
     ) {
       result = { ...result, status: 'canceled', result: undefined, error: undefined };
@@ -1613,7 +1657,40 @@ export class DefaultExecutionEngine extends ExecutionEngine {
   }
 
   async persistStepUpdate(params: PersistStepUpdateParams): Promise<PersistWorkflowStepUpdateResult | void> {
-    return persistStepUpdateHandler(this, params);
+    // Transient executions never persist. Keep this path outside the queue so
+    // they retain the existing no-storage fast path.
+    if (params.executionContext.transientExecution) {
+      return persistStepUpdateHandler(this, params);
+    }
+
+    const previous = this.pendingStepUpdatesByRun.get(params.runId);
+    const pending = (previous ?? Promise.resolve())
+      // A failed write must release the per-run queue so a later write can
+      // still make progress and report its own outcome.
+      .catch(() => undefined)
+      .then(() => {
+        // Sample all snapshot roots at the serialized boundary. PostgreSQL and
+        // other adapters may await before materializing the supplied snapshot,
+        // so the state root must detach alongside the step-results map.
+        const executionContext = {
+          ...params.executionContext,
+          state: copyStateRoot(params.executionContext.state),
+        };
+        return persistStepUpdateHandler(this, {
+          ...params,
+          executionContext,
+          stepResults: { ...params.stepResults },
+        });
+      });
+    this.pendingStepUpdatesByRun.set(params.runId, pending);
+
+    try {
+      return await pending;
+    } finally {
+      if (this.pendingStepUpdatesByRun.get(params.runId) === pending) {
+        this.pendingStepUpdatesByRun.delete(params.runId);
+      }
+    }
   }
 
   private async resolveRejectedTerminalWrite(

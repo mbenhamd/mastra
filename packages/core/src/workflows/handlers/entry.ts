@@ -53,16 +53,20 @@ function cloneLifecyclePayload(value: unknown, seen: WeakMap<object, object> = n
   const prior = seen.get(value);
   if (prior) return prior;
 
-  if (value instanceof Date) return new Date(value.getTime());
-  if (value instanceof RegExp) return new RegExp(value.source, value.flags);
-  if (value instanceof URL) return new URL(value.href);
-  if (value instanceof ArrayBuffer) return value.slice(0);
+  const retainClone = (clone: object) => {
+    seen.set(value, clone);
+    return clone;
+  };
+  if (value instanceof Date) return retainClone(new Date(value.getTime()));
+  if (value instanceof RegExp) return retainClone(new RegExp(value.source, value.flags));
+  if (value instanceof URL) return retainClone(new URL(value.href));
+  if (value instanceof ArrayBuffer) return retainClone(value.slice(0));
   if (ArrayBuffer.isView(value)) {
     const buffer = new ArrayBuffer(value.byteLength);
     new Uint8Array(buffer).set(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
-    if (value instanceof DataView) return new DataView(buffer);
+    if (value instanceof DataView) return retainClone(new DataView(buffer));
     const View = value.constructor as new (buffer: ArrayBuffer) => ArrayBufferView;
-    return new View(buffer);
+    return retainClone(new View(buffer));
   }
   if (value instanceof Map) {
     const clone = new Map();
@@ -79,13 +83,31 @@ function cloneLifecyclePayload(value: unknown, seen: WeakMap<object, object> = n
     return clone;
   }
   if (value instanceof Error) {
-    const clone = Object.create(Object.getPrototypeOf(value)) as Error & Record<string, unknown>;
+    const clone = new Error() as Error & Record<string, unknown>;
+    delete clone.stack;
+    Object.setPrototypeOf(clone, Object.getPrototypeOf(value));
     seen.set(value, clone);
-    clone.name = value.name;
-    clone.message = value.message;
-    clone.stack = value.stack;
-    for (const key of Object.keys(value)) {
-      clone[key] = cloneLifecyclePayload((value as unknown as Record<string, unknown>)[key], seen);
+    for (const key of Reflect.ownKeys(value)) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor) continue;
+      if (key === 'stack') {
+        // Node's native Error stack accessor produces a new stack for the clone.
+        // Materialize this one property so the original stack remains stable.
+        Object.defineProperty(clone, key, {
+          configurable: descriptor.configurable,
+          enumerable: descriptor.enumerable,
+          writable: true,
+          value: cloneLifecyclePayload(Reflect.get(value, key), seen),
+        });
+      } else if ('value' in descriptor) {
+        Object.defineProperty(clone, key, {
+          ...descriptor,
+          value: cloneLifecyclePayload(descriptor.value, seen),
+          writable: true,
+        });
+      } else {
+        Object.defineProperty(clone, key, descriptor);
+      }
     }
     return clone;
   }
@@ -99,9 +121,41 @@ function cloneLifecyclePayload(value: unknown, seen: WeakMap<object, object> = n
   const clone = Object.create(Object.getPrototypeOf(value)) as Record<string, unknown>;
   seen.set(value, clone);
   for (const key of Object.keys(value)) {
-    clone[key] = cloneLifecyclePayload((value as Record<string, unknown>)[key], seen);
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor) continue;
+    if ('value' in descriptor) {
+      Object.defineProperty(clone, key, {
+        configurable: true,
+        enumerable: true,
+        writable: true,
+        value: cloneLifecyclePayload(descriptor.value, seen),
+      });
+    } else {
+      Object.defineProperty(clone, key, descriptor);
+    }
   }
   return clone;
+}
+
+function getErrorPropertyDescriptor(error: Error, key: 'name' | 'message'): PropertyDescriptor | undefined {
+  let target: object | null = error;
+  while (target) {
+    const descriptor = Object.getOwnPropertyDescriptor(target, key);
+    if (descriptor) return descriptor;
+    target = Object.getPrototypeOf(target);
+  }
+  return undefined;
+}
+
+function errorPropertyDescriptorsEqual(
+  left: PropertyDescriptor | undefined,
+  right: PropertyDescriptor | undefined,
+): boolean {
+  if (!left || !right) return left === right;
+  if ('value' in left || 'value' in right) {
+    return 'value' in left && 'value' in right && Object.is(left.value, right.value);
+  }
+  return left.get === right.get && left.set === right.set;
 }
 
 function lifecyclePayloadKey(event: WorkflowLifecycleEvent): LifecyclePayloadKey | undefined {
@@ -182,7 +236,42 @@ function lifecyclePayloadEquals(left: unknown, right: unknown, seen: WeakMap<obj
   }
   if (left instanceof Error || right instanceof Error) {
     if (!(left instanceof Error) || !(right instanceof Error)) return false;
-    if (left.name !== right.name || left.message !== right.message || left.stack !== right.stack) return false;
+    if (Object.getPrototypeOf(left) !== Object.getPrototypeOf(right)) return false;
+    if (
+      !errorPropertyDescriptorsEqual(
+        getErrorPropertyDescriptor(left, 'name'),
+        getErrorPropertyDescriptor(right, 'name'),
+      ) ||
+      !errorPropertyDescriptorsEqual(
+        getErrorPropertyDescriptor(left, 'message'),
+        getErrorPropertyDescriptor(right, 'message'),
+      ) ||
+      Reflect.get(left, 'stack') !== Reflect.get(right, 'stack')
+    ) {
+      return false;
+    }
+
+    const leftKeys = Reflect.ownKeys(left);
+    const rightKeys = Reflect.ownKeys(right);
+    if (leftKeys.length !== rightKeys.length || leftKeys.some(key => !rightKeys.includes(key))) return false;
+    return leftKeys.every(key => {
+      const leftDescriptor = Object.getOwnPropertyDescriptor(left, key);
+      const rightDescriptor = Object.getOwnPropertyDescriptor(right, key);
+      if (!leftDescriptor || !rightDescriptor) return false;
+      if (leftDescriptor.enumerable !== rightDescriptor.enumerable) return false;
+      // The clone intentionally materializes the native stack accessor. Its
+      // value was compared above, so the descriptor representation is not
+      // evidence that lifecycle data changed.
+      if (key === 'stack') return true;
+      if ('value' in leftDescriptor || 'value' in rightDescriptor) {
+        return (
+          'value' in leftDescriptor &&
+          'value' in rightDescriptor &&
+          lifecyclePayloadEquals(leftDescriptor.value, rightDescriptor.value, seen)
+        );
+      }
+      return leftDescriptor.get === rightDescriptor.get && leftDescriptor.set === rightDescriptor.set;
+    });
   }
   if (Array.isArray(left) || Array.isArray(right)) {
     return (
@@ -234,15 +323,22 @@ function getPrunedLifecycleEvents(
       const eventRecord = event as unknown as Record<string, unknown>;
       const eventHasPayload = Object.hasOwn(event, key);
       const contextHasPayload = stepResult ? Object.hasOwn(stepResult, key) : false;
+      if (!original) return eventHasPayload ? eventRecord[key] : undefined;
       const eventWasExplicitlyPruned =
-        !original ||
         eventHasPayload !== original.eventHasPayload ||
         !lifecyclePayloadEquals(eventRecord[key], original.eventPayload);
-      if (eventWasExplicitlyPruned) return eventHasPayload ? eventRecord[key] : undefined;
       const contextWasExplicitlyPruned =
         contextHasPayload !== original.contextHasPayload ||
         !lifecyclePayloadEquals(stepResult?.[key], original.contextPayload);
-      if (contextWasExplicitlyPruned) return contextHasPayload ? stepResult?.[key] : undefined;
+      if (contextWasExplicitlyPruned) {
+        // A copied/serialized outbox can change representation without being
+        // redacted. It must never restore data removed from the step context.
+        // If both projections were changed differently, omit the payload:
+        // neither projection is evidence that the other's removed data is safe.
+        if (eventWasExplicitlyPruned && !lifecyclePayloadEquals(eventRecord[key], stepResult?.[key])) return undefined;
+        return contextHasPayload ? stepResult?.[key] : undefined;
+      }
+      if (eventWasExplicitlyPruned) return eventHasPayload ? eventRecord[key] : undefined;
       return eventHasPayload ? eventRecord[key] : undefined;
     };
     if (event.type === 'step.completed') {
@@ -400,6 +496,63 @@ export interface PersistStepUpdateParams {
   lifecycleEvents?: WorkflowLifecycleEvent[];
 }
 
+export function prepareStepSnapshot(engine: DefaultExecutionEngine, params: PersistStepUpdateParams) {
+  const {
+    runId,
+    executionContext,
+    workflowStatus,
+    stepResults,
+    serializedStepGraph,
+    result,
+    error,
+    requestContext,
+    tracingContext,
+    lifecycleEvents,
+  } = params;
+  const requestContextObj = engine.serializeRequestContext(requestContext);
+
+  const snapshot: WorkflowRunState = {
+    runId,
+    executionGeneration: executionContext.executionGeneration,
+    lifecycleResumeAttempt: executionContext.lifecycleResumeAttempt,
+    lifecycleStepStates: executionContext.lifecycleStepStates,
+    status: workflowStatus,
+    value: executionContext.state,
+    context: stepResults as any,
+    activePaths: executionContext.executionPath,
+    stepExecutionPath: executionContext.stepExecutionPath,
+    activeStepsPath: executionContext.activeStepsPath,
+    serializedStepGraph,
+    suspendedPaths: executionContext.suspendedPaths,
+    waitingPaths: {},
+    resumeLabels: executionContext.resumeLabels,
+    result,
+    error,
+    requestContext: requestContextObj,
+    timestamp: Date.now(),
+    // Persist tracing context for span continuity on resume
+    tracingContext,
+    ...(lifecycleEvents && lifecycleEvents.length > 0 ? { lifecycleOutbox: lifecycleEvents } : {}),
+  };
+
+  const lifecyclePayloadBaseline = engine.options?.pruneSnapshot ? captureLifecyclePayloadBaseline(snapshot) : [];
+  const snapshotToPersist = engine.options?.pruneSnapshot
+    ? engine.options.pruneSnapshot({ snapshot: cloneLifecyclePayload(snapshot) as WorkflowRunState, workflowStatus })
+    : snapshot;
+  const prunedLifecycleEvents = engine.options?.pruneSnapshot
+    ? getPrunedLifecycleEvents(snapshotToPersist, lifecyclePayloadBaseline)
+    : lifecycleEvents;
+  const snapshotForPersistence = (() => {
+    if (!lifecycleEvents?.length) return snapshotToPersist;
+    const { lifecycleOutbox: _lifecycleOutbox, ...withoutUnprunedOutbox } = snapshotToPersist;
+    return prunedLifecycleEvents?.length
+      ? { ...withoutUnprunedOutbox, lifecycleOutbox: prunedLifecycleEvents }
+      : withoutUnprunedOutbox;
+  })();
+
+  return { snapshot, snapshotForPersistence, prunedLifecycleEvents };
+}
+
 export async function persistStepUpdate(
   engine: DefaultExecutionEngine,
   params: PersistStepUpdateParams,
@@ -452,48 +605,8 @@ export async function persistStepUpdate(
       }
     }
 
-    const requestContextObj = engine.serializeRequestContext(requestContext);
-
-    const snapshot: WorkflowRunState = {
-      runId,
-      executionGeneration: executionContext.executionGeneration,
-      lifecycleResumeAttempt: executionContext.lifecycleResumeAttempt,
-      lifecycleStepStates: executionContext.lifecycleStepStates,
-      status: workflowStatus,
-      value: executionContext.state,
-      context: stepResults as any,
-      activePaths: executionContext.executionPath,
-      stepExecutionPath: executionContext.stepExecutionPath,
-      activeStepsPath: executionContext.activeStepsPath,
-      serializedStepGraph,
-      suspendedPaths: executionContext.suspendedPaths,
-      waitingPaths: {},
-      resumeLabels: executionContext.resumeLabels,
-      result,
-      error,
-      requestContext: requestContextObj,
-      timestamp: Date.now(),
-      // Persist tracing context for span continuity on resume
-      tracingContext,
-      ...(lifecycleEvents && lifecycleEvents.length > 0 ? { lifecycleOutbox: lifecycleEvents } : {}),
-    };
-
+    const { snapshot, snapshotForPersistence, prunedLifecycleEvents } = prepareStepSnapshot(engine, params);
     const workflowsStore = await engine.mastra?.getStorage()?.getStore('workflows');
-    const lifecyclePayloadBaseline = engine.options?.pruneSnapshot ? captureLifecyclePayloadBaseline(snapshot) : [];
-    const snapshotToPersist = engine.options?.pruneSnapshot
-      ? engine.options.pruneSnapshot({ snapshot, workflowStatus })
-      : snapshot;
-    const prunedLifecycleEvents = engine.options?.pruneSnapshot
-      ? getPrunedLifecycleEvents(snapshotToPersist, lifecyclePayloadBaseline)
-      : lifecycleEvents;
-    const snapshotForPersistence = (() => {
-      if (!lifecycleEvents?.length) return snapshotToPersist;
-      const { lifecycleOutbox: _lifecycleOutbox, ...withoutUnprunedOutbox } = snapshotToPersist;
-      return prunedLifecycleEvents?.length
-        ? { ...withoutUnprunedOutbox, lifecycleOutbox: prunedLifecycleEvents }
-        : withoutUnprunedOutbox;
-    })();
-
     const resumeCapabilities = workflowsStore?.getWorkflowResumeCapabilities();
     if (
       workflowsStore &&
