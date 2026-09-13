@@ -604,6 +604,59 @@ describe('step-result lifecycle fence', () => {
     }
   });
 
+  it.each([
+    ['frozen', () => Object.freeze({ count: 0 })],
+    ['sealed', () => Object.seal({ count: 0 })],
+    [
+      'non-writable',
+      () => {
+        const state = { count: 0 };
+        Object.defineProperty(state, 'count', { configurable: true, enumerable: true, value: 0, writable: false });
+        return state;
+      },
+    ],
+    [
+      'accessor',
+      () => {
+        const state = {} as { count: number };
+        Object.defineProperty(state, 'count', { configurable: true, enumerable: true, get: () => 0 });
+        return state;
+      },
+    ],
+  ] as const)('normalizes a non-mergeable %s initial state root before setState', async (_shape, createState) => {
+    const storage = new MockStore();
+    const pubsub = new EventEmitterPubSub();
+    const workflow = createWorkflow({
+      id: `pf-3750-mutable-state-${_shape}`,
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+    })
+      .then(
+        createStep({
+          id: 'update',
+          inputSchema: z.object({}),
+          outputSchema: z.object({}),
+          execute: async ({ setState }) => {
+            await setState({ count: 1 });
+            return {};
+          },
+        }),
+      )
+      .commit();
+    const mastra = new Mastra({ logger: false, storage, pubsub, workflows: { [workflow.id]: workflow } });
+    const run = await workflow.createRun();
+    const initialState = createState();
+
+    try {
+      await expect(
+        run.start({ inputData: {}, initialState, outputOptions: { includeState: true } }),
+      ).resolves.toMatchObject({ status: 'success', state: { count: 1 } });
+      expect(initialState.count).toBe(0);
+    } finally {
+      await mastra.shutdown();
+    }
+  });
+
   it('retains state and closes lifecycle events across fresh-engine ordinary resumes', async () => {
     const storage = new MockStore();
     const pubsub = new EventEmitterPubSub();

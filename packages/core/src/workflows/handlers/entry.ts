@@ -87,14 +87,27 @@ function cloneLifecyclePayload(value: unknown, seen: WeakMap<object, object> = n
     delete clone.stack;
     Object.setPrototypeOf(clone, Object.getPrototypeOf(value));
     seen.set(value, clone);
-    for (const key of Object.getOwnPropertyNames(value)) {
-      const descriptor = Object.getOwnPropertyDescriptor(value, key)!;
-      Object.defineProperty(clone, key, {
-        configurable: descriptor.configurable,
-        enumerable: descriptor.enumerable,
-        writable: true,
-        value: cloneLifecyclePayload(Reflect.get(value, key), seen),
-      });
+    for (const key of Reflect.ownKeys(value)) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor) continue;
+      if (key === 'stack') {
+        // Node's native Error stack accessor produces a new stack for the clone.
+        // Materialize this one property so the original stack remains stable.
+        Object.defineProperty(clone, key, {
+          configurable: descriptor.configurable,
+          enumerable: descriptor.enumerable,
+          writable: true,
+          value: cloneLifecyclePayload(Reflect.get(value, key), seen),
+        });
+      } else if ('value' in descriptor) {
+        Object.defineProperty(clone, key, {
+          ...descriptor,
+          value: cloneLifecyclePayload(descriptor.value, seen),
+          writable: true,
+        });
+      } else {
+        Object.defineProperty(clone, key, descriptor);
+      }
     }
     return clone;
   }
@@ -111,6 +124,27 @@ function cloneLifecyclePayload(value: unknown, seen: WeakMap<object, object> = n
     clone[key] = cloneLifecyclePayload((value as Record<string, unknown>)[key], seen);
   }
   return clone;
+}
+
+function getErrorPropertyDescriptor(error: Error, key: 'name' | 'message'): PropertyDescriptor | undefined {
+  let target: object | null = error;
+  while (target) {
+    const descriptor = Object.getOwnPropertyDescriptor(target, key);
+    if (descriptor) return descriptor;
+    target = Object.getPrototypeOf(target);
+  }
+  return undefined;
+}
+
+function errorPropertyDescriptorsEqual(
+  left: PropertyDescriptor | undefined,
+  right: PropertyDescriptor | undefined,
+): boolean {
+  if (!left || !right) return left === right;
+  if ('value' in left || 'value' in right) {
+    return 'value' in left && 'value' in right && Object.is(left.value, right.value);
+  }
+  return left.get === right.get && left.set === right.set;
 }
 
 function lifecyclePayloadKey(event: WorkflowLifecycleEvent): LifecyclePayloadKey | undefined {
@@ -191,9 +225,41 @@ function lifecyclePayloadEquals(left: unknown, right: unknown, seen: WeakMap<obj
   }
   if (left instanceof Error || right instanceof Error) {
     if (!(left instanceof Error) || !(right instanceof Error)) return false;
-    if (left.name !== right.name || left.message !== right.message || left.stack !== right.stack) return false;
-    if (Object.hasOwn(left, 'cause') !== Object.hasOwn(right, 'cause')) return false;
-    if (!lifecyclePayloadEquals(left.cause, right.cause, seen)) return false;
+    if (Object.getPrototypeOf(left) !== Object.getPrototypeOf(right)) return false;
+    if (
+      !errorPropertyDescriptorsEqual(
+        getErrorPropertyDescriptor(left, 'name'),
+        getErrorPropertyDescriptor(right, 'name'),
+      ) ||
+      !errorPropertyDescriptorsEqual(
+        getErrorPropertyDescriptor(left, 'message'),
+        getErrorPropertyDescriptor(right, 'message'),
+      ) ||
+      Reflect.get(left, 'stack') !== Reflect.get(right, 'stack')
+    ) {
+      return false;
+    }
+
+    const leftKeys = Reflect.ownKeys(left);
+    const rightKeys = Reflect.ownKeys(right);
+    if (leftKeys.length !== rightKeys.length || leftKeys.some(key => !rightKeys.includes(key))) return false;
+    return leftKeys.every(key => {
+      const leftDescriptor = Object.getOwnPropertyDescriptor(left, key);
+      const rightDescriptor = Object.getOwnPropertyDescriptor(right, key);
+      if (!leftDescriptor || !rightDescriptor) return false;
+      // The clone intentionally materializes the native stack accessor. Its
+      // value was compared above, so the descriptor representation is not
+      // evidence that lifecycle data changed.
+      if (key === 'stack') return true;
+      if ('value' in leftDescriptor || 'value' in rightDescriptor) {
+        return (
+          'value' in leftDescriptor &&
+          'value' in rightDescriptor &&
+          lifecyclePayloadEquals(leftDescriptor.value, rightDescriptor.value, seen)
+        );
+      }
+      return leftDescriptor.get === rightDescriptor.get && leftDescriptor.set === rightDescriptor.set;
+    });
   }
   if (Array.isArray(left) || Array.isArray(right)) {
     return (

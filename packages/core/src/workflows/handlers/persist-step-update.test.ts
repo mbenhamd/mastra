@@ -575,6 +575,140 @@ describe('persistStepUpdate — suspended overwrite guard', () => {
     }
   });
 
+  it('does not invoke a non-enumerable Error getter while pruning lifecycle payloads', async () => {
+    const cause = new Error('private cause');
+    const causeStack = cause.stack;
+    const diagnostic = new Error('public error', { cause });
+    const diagnosticStack = diagnostic.stack;
+    let getterCalls = 0;
+    Object.defineProperty(diagnostic, 'privateDetail', {
+      configurable: true,
+      enumerable: false,
+      get() {
+        getterCalls += 1;
+        throw new Error('private detail accessed');
+      },
+    });
+
+    ({ engine, store } = makeEngine(
+      () => true,
+      {},
+      ({ snapshot }) => {
+        const output = snapshot.context.completed.output as { diagnostic: Error };
+        delete (output.diagnostic as Error & Record<string, unknown>).privateDetail;
+        return snapshot;
+      },
+    ));
+
+    const payload = { diagnostic };
+    const outcome = await engine.persistStepUpdate({
+      workflowId: 'wf',
+      runId: 'run-1',
+      resourceId: 'resource-1',
+      stepResults: { completed: { status: 'success', output: payload } },
+      serializedStepGraph: [],
+      executionContext: baseExecutionContext({
+        executionGeneration: 'wfeg:generation',
+        lifecycleStepStates: { completed: { stepCallId: 'wfsc:completed', stepAttempt: 1 } },
+      }),
+      workflowStatus: 'running',
+      requestContext: new RequestContext(),
+      lifecycleEvents: [
+        {
+          type: 'step.completed',
+          stepId: 'completed',
+          stepCallId: 'wfsc:completed',
+          stepAttempt: 1,
+          output: payload,
+        },
+      ],
+    });
+
+    expect(getterCalls).toBe(0);
+    expect(diagnostic.stack).toBe(diagnosticStack);
+    expect(diagnostic.cause).toBe(cause);
+    expect(cause.stack).toBe(causeStack);
+    const acceptedEvent = outcome?.acceptedEvents?.[0];
+    if (acceptedEvent?.type !== 'step.completed') throw new Error('missing completion');
+    const acceptedDiagnostic = (acceptedEvent.output as { diagnostic: Error }).diagnostic;
+    expect(acceptedDiagnostic.stack).toBe(diagnosticStack);
+    expect(acceptedDiagnostic.cause).not.toBe(cause);
+    expect(acceptedDiagnostic.cause).toBeInstanceOf(Error);
+    expect(acceptedDiagnostic.cause?.stack).toBe(causeStack);
+    expect(Object.hasOwn(acceptedDiagnostic, 'privateDetail')).toBe(false);
+  });
+
+  it('does not restore a redacted non-enumerable Error property into accepted lifecycle events', async () => {
+    const privateDetail = 'privateDetail';
+    const cause = new Error('private cause');
+    const causeStack = cause.stack;
+    const diagnostic = new Error('public error', { cause });
+    const diagnosticStack = diagnostic.stack;
+    Object.defineProperty(diagnostic, privateDetail, {
+      configurable: true,
+      enumerable: false,
+      value: 'private',
+      writable: true,
+    });
+
+    ({ engine, store } = makeEngine(
+      () => true,
+      {},
+      ({ snapshot }) => {
+        const completed = snapshot.context.completed as { output: Record<string, unknown> };
+        const sourceDiagnostic = completed.output.diagnostic as Error;
+        const redactedDiagnostic = Object.create(Object.getPrototypeOf(sourceDiagnostic)) as Error &
+          Record<PropertyKey, unknown>;
+        Object.defineProperties(redactedDiagnostic, Object.getOwnPropertyDescriptors(sourceDiagnostic));
+        delete redactedDiagnostic[privateDetail];
+        return {
+          ...snapshot,
+          context: {
+            ...snapshot.context,
+            completed: {
+              ...completed,
+              output: { ...completed.output, diagnostic: redactedDiagnostic },
+            },
+          },
+        };
+      },
+    ));
+
+    const payload = { canonical: 'unchanged', diagnostic };
+    const outcome = await engine.persistStepUpdate({
+      workflowId: 'wf',
+      runId: 'run-1',
+      resourceId: 'resource-1',
+      stepResults: { completed: { status: 'success', output: payload } },
+      serializedStepGraph: [],
+      executionContext: baseExecutionContext({
+        executionGeneration: 'wfeg:generation',
+        lifecycleStepStates: { completed: { stepCallId: 'wfsc:completed', stepAttempt: 1 } },
+      }),
+      workflowStatus: 'running',
+      requestContext: new RequestContext(),
+      lifecycleEvents: [
+        {
+          type: 'step.completed',
+          stepId: 'completed',
+          stepCallId: 'wfsc:completed',
+          stepAttempt: 1,
+          output: payload,
+        },
+      ],
+    });
+
+    const acceptedEvent = outcome?.acceptedEvents?.[0];
+    if (acceptedEvent?.type !== 'step.completed') throw new Error('missing completion');
+    const acceptedOutput = acceptedEvent.output as { canonical: string; diagnostic: Error };
+    expect(acceptedOutput.canonical).toBe('unchanged');
+    expect(Object.hasOwn(acceptedOutput.diagnostic, privateDetail)).toBe(false);
+    expect(diagnostic.stack).toBe(diagnosticStack);
+    expect(diagnostic.cause).toBe(cause);
+    expect(cause.stack).toBe(causeStack);
+    expect(Object.hasOwn(diagnostic, privateDetail)).toBe(true);
+  });
+
   it('returns a terminal disposition instead of overwriting a legacy snapshot', async () => {
     ({ engine, store } = makeEngine(() => true, {}));
     store.snapshot = {

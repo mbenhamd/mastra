@@ -63,6 +63,19 @@ import { abortableSleep, getSingleStepEntryId, omitPriorCompletionFields } from 
 // Re-export ExecutionContext for backwards compatibility
 export type { ExecutionContext } from './types';
 
+function normalizeStateRoot<TState>(state: TState): TState {
+  if (state === null || typeof state !== 'object') return state;
+
+  const descriptors = Object.getOwnPropertyDescriptors(state);
+  const isMergeable =
+    Object.isExtensible(state) &&
+    Object.values(descriptors).every(descriptor => 'value' in descriptor && descriptor.writable);
+  if (isMergeable) return state;
+
+  const mutableState = Array.isArray(state) ? [] : Object.create(Object.getPrototypeOf(state));
+  return Object.assign(mutableState, state) as TState;
+}
+
 /** Params for the per-type execute methods: the same context `executeStep` takes,
  * with the declarative graph entry instead of a pre-built `step`. */
 export type ExecuteAgentParams = Omit<ExecuteStepParams, 'step'> & {
@@ -943,7 +956,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
     let stepExecutionPath: string[] =
       timeTravel?.stepExecutionPath || restart?.stepExecutionPath || resume?.stepExecutionPath || [];
     let lastOutput: any;
-    let lastState: Record<string, any> = timeTravel?.state ?? restart?.state ?? initialState ?? {};
+    let lastState: Record<string, any> = normalizeStateRoot(timeTravel?.state ?? restart?.state ?? initialState ?? {});
     let lastExecutionContext: ExecutionContext | undefined;
     let currentRequestContext = params.requestContext;
     for (let i = startIdx; i < steps.length; i++) {
