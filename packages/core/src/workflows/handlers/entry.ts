@@ -121,7 +121,18 @@ function cloneLifecyclePayload(value: unknown, seen: WeakMap<object, object> = n
   const clone = Object.create(Object.getPrototypeOf(value)) as Record<string, unknown>;
   seen.set(value, clone);
   for (const key of Object.keys(value)) {
-    clone[key] = cloneLifecyclePayload((value as Record<string, unknown>)[key], seen);
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor) continue;
+    if ('value' in descriptor) {
+      Object.defineProperty(clone, key, {
+        configurable: true,
+        enumerable: true,
+        writable: true,
+        value: cloneLifecyclePayload(descriptor.value, seen),
+      });
+    } else {
+      Object.defineProperty(clone, key, descriptor);
+    }
   }
   return clone;
 }

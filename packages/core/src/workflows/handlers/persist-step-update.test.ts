@@ -576,7 +576,7 @@ describe('persistStepUpdate — suspended overwrite guard', () => {
     }
   });
 
-  it('does not invoke a non-enumerable Error getter while pruning lifecycle payloads', async () => {
+  it('does not invoke Error or ordinary getters while pruning lifecycle payloads', async () => {
     const cause = new Error('private cause');
     const causeStack = cause.stack;
     const diagnostic = new Error('public error', { cause });
@@ -590,6 +590,17 @@ describe('persistStepUpdate — suspended overwrite guard', () => {
         throw new Error('private detail accessed');
       },
     });
+    const input = {};
+    let inputGetterCalls = 0;
+    const inputGetter = () => {
+      inputGetterCalls += 1;
+      throw new Error('private input accessed');
+    };
+    Object.defineProperty(input, 'privateInput', {
+      configurable: true,
+      enumerable: true,
+      get: inputGetter,
+    });
 
     ({ engine, store } = makeEngine(
       () => true,
@@ -597,6 +608,7 @@ describe('persistStepUpdate — suspended overwrite guard', () => {
       ({ snapshot }) => {
         const output = snapshot.context.completed.output as { diagnostic: Error };
         delete (output.diagnostic as Error & Record<string, unknown>).privateDetail;
+        delete snapshot.context.input.privateInput;
         return snapshot;
       },
     ));
@@ -606,7 +618,7 @@ describe('persistStepUpdate — suspended overwrite guard', () => {
       workflowId: 'wf',
       runId: 'run-1',
       resourceId: 'resource-1',
-      stepResults: { completed: { status: 'success', output: payload } },
+      stepResults: { input, completed: { status: 'success', output: payload } },
       serializedStepGraph: [],
       executionContext: baseExecutionContext({
         executionGeneration: 'wfeg:generation',
@@ -626,6 +638,7 @@ describe('persistStepUpdate — suspended overwrite guard', () => {
     });
 
     expect(getterCalls).toBe(0);
+    expect(inputGetterCalls).toBe(0);
     expect(diagnostic.stack).toBe(diagnosticStack);
     expect(diagnostic.cause).toBe(cause);
     expect(cause.stack).toBe(causeStack);
@@ -637,6 +650,11 @@ describe('persistStepUpdate — suspended overwrite guard', () => {
     expect(acceptedDiagnostic.cause).toBeInstanceOf(Error);
     expect(acceptedDiagnostic.cause?.stack).toBe(causeStack);
     expect(Object.hasOwn(acceptedDiagnostic, 'privateDetail')).toBe(false);
+    expect(Object.hasOwn(store.legacyCalls[0]!.snapshot.context.input, 'privateInput')).toBe(false);
+    expect(Object.getOwnPropertyDescriptor(input, 'privateInput')).toMatchObject({
+      enumerable: true,
+      get: inputGetter,
+    });
   });
 
   it.each(['delete', 'enumerability'] as const)(

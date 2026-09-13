@@ -52,6 +52,10 @@ import {
 import { prepareStepSnapshot } from './entry';
 import type { PersistStepUpdateParams } from './entry';
 
+function isRecordState(value: unknown): value is Record<string, any> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
 export interface ExecuteStepParams extends ObservabilityContext {
   workflowId: string;
   runId: string;
@@ -352,7 +356,7 @@ export async function executeStep(
 
     // If executeWorkflowStep returns a result, wrap it in StepExecutionResult
     if (workflowResult !== null) {
-      if (sharedState) {
+      if (isRecordState(sharedState) && isRecordState(executionContext.state)) {
         // Platform hooks may replace the branch state with the nested result's
         // state. Merge it into the shared root before the completed result is
         // persisted, so a sibling cannot observe completion with stale state.
@@ -711,15 +715,23 @@ export async function executeStep(
   }
 
   if (stepRetryResult.ok && stepRetryResult.result.contextMutations.stateUpdate != null) {
+    const stateUpdate = stepRetryResult.result.contextMutations.stateUpdate;
     if (executionContext.foreachIndex === undefined) {
       // Parallel branches share the engine-owned state object. Merge the
       // update in place before the result enters the persistence queue so a
       // sibling cannot snapshot stale state alongside newer step results.
-      Object.assign(executionContext.state, stepRetryResult.result.contextMutations.stateUpdate);
+      if (isRecordState(executionContext.state) && isRecordState(stateUpdate)) {
+        Object.assign(executionContext.state, stateUpdate);
+      } else {
+        executionContext.state = stateUpdate;
+      }
     } else {
       // Foreach iterations retain their isolated state update until the
       // iteration result is applied by the parent control-flow handler.
-      executionContext.state = { ...executionContext.state, ...stepRetryResult.result.contextMutations.stateUpdate };
+      executionContext.state =
+        isRecordState(executionContext.state) && isRecordState(stateUpdate)
+          ? { ...executionContext.state, ...stateUpdate }
+          : stateUpdate;
     }
   }
 

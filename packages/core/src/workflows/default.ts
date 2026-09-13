@@ -76,6 +76,11 @@ function normalizeStateRoot<TState>(state: TState): TState {
   return Object.assign(mutableState, state) as TState;
 }
 
+function copyStateRoot<TState>(state: TState): TState {
+  if (state === null || typeof state !== 'object') return state;
+  return (Array.isArray(state) ? state.slice() : { ...state }) as TState;
+}
+
 /** Params for the per-type execute methods: the same context `executeStep` takes,
  * with the declarative graph entry instead of a pre-built `step`. */
 export type ExecuteAgentParams = Omit<ExecuteStepParams, 'step'> & {
@@ -1659,7 +1664,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
         // so the state root must detach alongside the step-results map.
         const executionContext = {
           ...params.executionContext,
-          state: { ...params.executionContext.state },
+          state: copyStateRoot(params.executionContext.state),
         };
         return persistStepUpdateHandler(this, {
           ...params,
