@@ -174,6 +174,150 @@ pf4051_config() {
     PF4051_PENDING_MERGE_COMMIT PF4051_PENDING_REVIEWED_TREE
 }
 
+pf4163_config() {
+  PF4163_HEAD_REPOSITORY="${PAPERSFLOW_PF4163_HEAD_REPOSITORY:-mbenhamd/mastra}"
+  PF4163_HEAD_REF="${PAPERSFLOW_PF4163_HEAD_REF:-feature/pf-4163-mastra-upstream-sync-23c232d7}"
+  PF4163_BASE_REF="${PAPERSFLOW_PF4163_BASE_REF:-main}"
+  PF4163_PENDING_MERGE_COMMIT='PENDING_PF4163_MERGE_COMMIT'
+  PF4163_PENDING_FORK_PARENT='PENDING_PF4163_FORK_PARENT'
+  PF4163_PENDING_REVIEWED_TREE='PENDING_PF4163_REVIEWED_TREE'
+  PF4163_MERGE_COMMIT="${PAPERSFLOW_PF4163_MERGE_COMMIT:-d82d954d4f0cf863b9e5a2634122eb5c2d904efc}"
+  PF4163_FORK_PARENT="${PAPERSFLOW_PF4163_FORK_PARENT:-207efdbf9920909d9444709849791d0a6d42fdfd}"
+  PF4163_UPSTREAM_PARENT="${PAPERSFLOW_PF4163_UPSTREAM_PARENT:-23c232d780afe4fca07f7729f2d698cc15bb1d20}"
+  PF4163_REVIEWED_TREE="${PAPERSFLOW_PF4163_REVIEWED_TREE:-4840e0ce8c48c9b85c1fd23beab43125877001a6}"
+  readonly \
+    PF4163_HEAD_REPOSITORY PF4163_HEAD_REF PF4163_BASE_REF \
+    PF4163_MERGE_COMMIT PF4163_FORK_PARENT PF4163_UPSTREAM_PARENT PF4163_REVIEWED_TREE \
+    PF4163_PENDING_MERGE_COMMIT PF4163_PENDING_FORK_PARENT PF4163_PENDING_REVIEWED_TREE
+}
+
+pf4163_install_allowlist() {
+  # This is the complete frozen install-path surface generated from the
+  # reviewed F...S source diff, using recursive native Git pathspecs. The
+  # six manually resolved graph files are recorded separately in the source
+  # provenance manifest and are a subset of this 115-path surface.
+  # Source surface: F=207efdbf9920909d9444709849791d0a6d42fdfd,
+  # S=d82d954d4f0cf863b9e5a2634122eb5c2d904efc,
+  # list SHA-256=37b646e8c8516937d26ea892fa77eadc3ac0e586238240da45c8a027f8bda4dc.
+  cat <<'EOF'
+auth/studio/package.json
+browser/_test-utils/package.json
+browser/agent-browser/package.json
+browser/firecrawl/package.json
+browser/stagehand/package.json
+client-sdks/ai-sdk/package.json
+client-sdks/client-js/package.json
+client-sdks/react/package.json
+deployers/cloud/package.json
+deployers/cloudflare/package.json
+deployers/netlify/package.json
+deployers/sandbox/package.json
+deployers/vercel/package.json
+docs/package.json
+e2e-tests/experiment-worker/package.json
+e2e-tests/experiment-worker/pnpm-lock.yaml
+e2e-tests/workspace-compat/package.json
+explorations/longmemeval/package.json
+integrations/livekit/package.json
+integrations/opencode/package.json
+mastracode/factory/package.json
+mastracode/mastra-factory/package.json
+mastracode/sdk/package.json
+mastracode/tui/package.json
+mastracode/web/package.json
+observability/_examples/otel-bridge/agent-hub/package.json
+observability/_examples/otel-bridge/agent-hub/pnpm-lock.yaml
+observability/_examples/otel-bridge/agent-hub/pnpm-workspace.yaml
+observability/arize/package.json
+observability/arthur/package.json
+observability/braintrust/package.json
+observability/datadog/package.json
+observability/deepeval/package.json
+observability/laminar/package.json
+observability/langfuse/package.json
+observability/langsmith/package.json
+observability/mastra/package.json
+observability/otel-bridge/package.json
+observability/otel-exporter/package.json
+observability/posthog/package.json
+observability/sentry/package.json
+packages/_changeset-cli/package.json
+packages/_config/package.json
+packages/_external-types/package.json
+packages/_internals/auth/package.json
+packages/_internals/voice/package.json
+packages/_internals/workspace/package.json
+packages/_llm-recorder/package.json
+packages/_test-utils/package.json
+packages/_types-builder/package.json
+packages/_vendored/ai_v4/package.json
+packages/_vendored/ai_v5/package.json
+packages/_vendored/ai_v6/package.json
+packages/_vendored/ai_v7/package.json
+packages/agent-builder/package.json
+packages/cli/package.json
+packages/core/package.json
+packages/create-mastra/package.json
+packages/deployer/package.json
+packages/editor/package.json
+packages/evals/package.json
+packages/loggers/package.json
+packages/mcp-docs-server/package.json
+packages/mcp/package.json
+packages/memory/package.json
+packages/playground-ui/package.json
+packages/playground/package.json
+packages/rag/package.json
+packages/schema-compat/package.json
+packages/server/package.json
+pnpm-lock.yaml
+pnpm-workspace.yaml
+pubsub/redis-streams/package.json
+pubsub/valkey-streams/package.json
+server-adapters/elysia/package.json
+server-adapters/express/package.json
+server-adapters/fastify/package.json
+server-adapters/hono/package.json
+server-adapters/koa/package.json
+server-adapters/nestjs/package.json
+server-adapters/next/package.json
+server-adapters/tanstack-start/package.json
+stores/_test-utils/package.json
+stores/clickhouse/package.json
+stores/convex/package.json
+stores/dsql/package.json
+stores/duckdb/package.json
+stores/elasticsearch/package.json
+stores/libsql/package.json
+stores/mongodb/package.json
+stores/mssql/package.json
+stores/mysql/package.json
+stores/oracledb/package.json
+stores/pg/package.json
+stores/redis/package.json
+stores/spanner/package.json
+stores/turso/package.json
+stores/upstash/package.json
+stores/valkey/package.json
+voice/google-gemini-live-api/package.json
+voice/openai-realtime-api/package.json
+voice/xai-realtime-api/package.json
+workflows/inngest/package.json
+workflows/temporal/package.json
+workspaces/_test-utils/package.json
+workspaces/archil/package.json
+workspaces/blaxel/package.json
+workspaces/cloudflare-sandbox/package.json
+workspaces/daytona/package.json
+workspaces/docker/package.json
+workspaces/e2b-desktop/package.json
+workspaces/e2b/package.json
+workspaces/platform-workspace/package.json
+workspaces/s3/package.json
+workspaces/vercel/package.json
+EOF
+}
+
 pf3375_config() {
   PF3375_HEAD_REPOSITORY="${PAPERSFLOW_PF3375_HEAD_REPOSITORY:-mbenhamd/mastra}"
   PF3375_HEAD_REF="${PAPERSFLOW_PF3375_HEAD_REF:-feature/pf-3375-mastra-upstream-sync-372b1a71}"
@@ -513,6 +657,87 @@ verify_pf4051_reviewed_merge() (
     echo 'PF-4051 source parent does not contain the reviewed official upstream parent.' >&2
     return 1
   fi
+)
+
+verify_pf4163_install_allowlist() (
+  : "${BASE_SHA:?BASE_SHA is required}"
+  : "${HEAD_SHA:?HEAD_SHA is required}"
+
+  local expected_paths actual_paths
+  expected_paths="$(mktemp)"
+  actual_paths="$(mktemp)"
+  trap 'rm -f "$expected_paths" "$actual_paths"' EXIT
+
+  pf4163_install_allowlist | sort -u > "$expected_paths"
+  git diff --no-renames --name-only "${BASE_SHA}...${HEAD_SHA}" -- \
+    .npmrc .pnpmfile.cjs pnpmfile.cjs package.json pnpm-workspace.yaml pnpm-lock.yaml patches \
+    ':(glob)**/.npmrc' ':(glob)**/.pnpmfile.cjs' ':(glob)**/pnpmfile.cjs' \
+    ':(glob)**/package.json' ':(glob)**/pnpm-workspace.yaml' \
+    ':(glob)**/pnpm-lock.yaml' ':(glob)**/patches/**' |
+    sort -u > "$actual_paths"
+  if ! cmp -s "$expected_paths" "$actual_paths"; then
+    echo 'PF-4163 changed dependency-graph paths outside the frozen install allowlist:' >&2
+    diff -u "$expected_paths" "$actual_paths" >&2 || true
+    return 1
+  fi
+)
+
+verify_pf4163_reviewed_merge() (
+  : "${BASE_SHA:?BASE_SHA is required}"
+  : "${HEAD_SHA:?HEAD_SHA is required}"
+
+  local merge_topology actual_tree protected_merge_bases
+
+  if [[ "$PF4163_MERGE_COMMIT" == "$PF4163_PENDING_MERGE_COMMIT" || \
+    "$PF4163_FORK_PARENT" == "$PF4163_PENDING_FORK_PARENT" || \
+    "$PF4163_REVIEWED_TREE" == "$PF4163_PENDING_REVIEWED_TREE" ]]; then
+    echo 'PF-4163 exact-sync admission pins are pending; refusing admission.' >&2
+    return 1
+  fi
+
+  if [[ "$HEAD_SHA" != "$PF4163_MERGE_COMMIT" ]]; then
+    echo 'PF-4163 head is not the exact reviewed merge commit.' >&2
+    echo "expected: $PF4163_MERGE_COMMIT" >&2
+    echo "actual:   $HEAD_SHA" >&2
+    return 1
+  fi
+
+  merge_topology="$(git rev-list --parents -n 1 "$HEAD_SHA")"
+  if [[ "$merge_topology" != "$HEAD_SHA $PF4163_FORK_PARENT $PF4163_UPSTREAM_PARENT" ]]; then
+    echo 'PF-4163 head is not the exact reviewed two-parent upstream merge topology.' >&2
+    echo "expected: $HEAD_SHA $PF4163_FORK_PARENT $PF4163_UPSTREAM_PARENT" >&2
+    echo "actual:   $merge_topology" >&2
+    return 1
+  fi
+
+  actual_tree="$(git rev-parse "$HEAD_SHA^{tree}")"
+  if [[ "$actual_tree" != "$PF4163_REVIEWED_TREE" ]]; then
+    echo 'PF-4163 head tree does not match the reviewed merge tree.' >&2
+    echo "expected: $PF4163_REVIEWED_TREE" >&2
+    echo "actual:   $actual_tree" >&2
+    return 1
+  fi
+
+  # The source reconciles the exact fork main F with the reviewed official
+  # upstream parent. A later CI-only protected-base advance C is accepted only
+  # when C and the source merge S still meet exactly at F.
+  if ! git merge-base --is-ancestor "$PF4163_FORK_PARENT" "$BASE_SHA"; then
+    echo 'PF-4163 protected base does not descend from the reviewed fork parent.' >&2
+    return 1
+  fi
+  protected_merge_bases="$(git merge-base --all "$BASE_SHA" "$HEAD_SHA")"
+  if [[ "$protected_merge_bases" != "$PF4163_FORK_PARENT" ]]; then
+    echo 'PF-4163 protected base and reviewed head no longer meet at the reviewed fork parent.' >&2
+    echo "expected: $PF4163_FORK_PARENT" >&2
+    echo "actual:   $protected_merge_bases" >&2
+    return 1
+  fi
+  if ! git merge-base --is-ancestor "$PF4163_UPSTREAM_PARENT" "$HEAD_SHA"; then
+    echo 'PF-4163 head does not contain the reviewed official upstream parent.' >&2
+    return 1
+  fi
+
+  verify_pf4163_install_allowlist
 )
 
 verify_pf3375_reviewed_merge() (
@@ -1206,6 +1431,21 @@ classify_install_lane() (
     patches packages/server/package.json server-adapters/fastify/package.json \
     packages/_types-builder/package.json packages/agent-builder/package.json |
     sort -u > "$manifest_changes"
+
+  # PF-4163 is frozen to one reviewed two-parent merge S(F,U), its reviewed
+  # tree, source branch, repository, and upstream parent. The protected-base
+  # advance C may contain CI policy only, but must meet S exactly at F. Its
+  # install graph is frozen to the complete reviewed 115-path manifest,
+  # workspace, lockfile, config, and patch surface; the six manually resolved
+  # graph files are a separately recorded provenance subset.
+  pf4163_config
+  if [[ "${HEAD_REPOSITORY:-}" == "$PF4163_HEAD_REPOSITORY" && \
+    "${HEAD_REF:-}" == "$PF4163_HEAD_REF" && "${BASE_REF:-}" == "$PF4163_BASE_REF" ]]; then
+    verify_pf4163_reviewed_merge
+    echo 'PF-4163 exact two-parent upstream merge, reviewed tree, ancestry, and install allowlist accepted from trusted base policy.'
+    emit_validation_lane pf4163-upstream-sync
+    return
+  fi
 
   # PF-4051 is frozen to one reviewed merge commit, tree, branch, repository,
   # and source-parent pair. The consolidated prerequisite and frozen source
@@ -3146,6 +3386,227 @@ run_pf3375_admission_self_tests() (
   echo 'PF-3375 exact-commit, topology, tree, ancestry, and metadata admission fixtures passed.'
 )
 
+run_pf4163_admission_self_tests() (
+  local script_path test_root fixture_repo common_sha fork_parent upstream_parent
+  local reviewed_head reviewed_tree protected_base extra_intersection_base
+  local forged_tree forged_head reversed_head extra_parent octopus_head non_merge_head
+  local wrong_graph_tree wrong_graph_head nested_graph_tree nested_graph_head
+  local output path
+
+  script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+  test_root="$(mktemp -d)"
+  fixture_repo="$test_root/repo"
+  pf4163_fixture_cleanup() {
+    local status=$?
+    trap - EXIT
+    if (( status != 0 )); then
+      echo 'PF-4163 admission fixture failed; captured classifier output follows:' >&2
+      find "$test_root" -maxdepth 1 -type f -name '*.log' -print -exec sed -n '1,240p' {} \; >&2 || true
+    fi
+    rm -rf -- "$test_root"
+    exit "$status"
+  }
+  trap pf4163_fixture_cleanup EXIT
+  mkdir -p "$fixture_repo"
+
+  git -C "$fixture_repo" init -q -b main
+  git -C "$fixture_repo" config user.email validator@example.invalid
+  git -C "$fixture_repo" config user.name 'PF-4163 admission fixture'
+  printf '{"name":"fixture","version":"1.0.0"}\n' > "$fixture_repo/package.json"
+  while IFS= read -r path; do
+    mkdir -p "$fixture_repo/$(dirname "$path")"
+    printf 'fork dependency graph\n' > "$fixture_repo/$path"
+  done < <(pf4163_install_allowlist)
+  git -C "$fixture_repo" add .
+  git -C "$fixture_repo" commit -q -m common
+  common_sha="$(git -C "$fixture_repo" rev-parse HEAD)"
+
+  git -C "$fixture_repo" switch -q -c upstream
+  while IFS= read -r path; do
+    printf 'reviewed upstream dependency graph\n' > "$fixture_repo/$path"
+  done < <(pf4163_install_allowlist)
+  printf 'official upstream\n' > "$fixture_repo/upstream.txt"
+  git -C "$fixture_repo" add .
+  git -C "$fixture_repo" commit -q -m upstream
+  upstream_parent="$(git -C "$fixture_repo" rev-parse HEAD)"
+
+  git -C "$fixture_repo" switch -q main
+  printf 'fork work\n' > "$fixture_repo/fork.txt"
+  git -C "$fixture_repo" add fork.txt
+  git -C "$fixture_repo" commit -q -m fork
+  fork_parent="$(git -C "$fixture_repo" rev-parse HEAD)"
+  git -C "$fixture_repo" merge -q --no-ff upstream -m 'reviewed upstream merge'
+  reviewed_head="$(git -C "$fixture_repo" rev-parse HEAD)"
+  reviewed_tree="$(git -C "$fixture_repo" rev-parse "$reviewed_head^{tree}")"
+
+  git -C "$fixture_repo" switch -q -c protected-base "$fork_parent"
+  mkdir -p "$fixture_repo/.github"
+  printf 'trusted policy advance\n' > "$fixture_repo/.github/policy.txt"
+  git -C "$fixture_repo" add .github/policy.txt
+  git -C "$fixture_repo" commit -q -m 'advance protected policy'
+  protected_base="$(git -C "$fixture_repo" rev-parse HEAD)"
+  extra_intersection_base="$(printf 'extra merge base\n' | git -C "$fixture_repo" commit-tree \
+    "$reviewed_tree" -p "$protected_base" -p "$upstream_parent")"
+
+  git -C "$fixture_repo" switch -q --detach "$reviewed_head"
+  printf 'not reviewed\n' > "$fixture_repo/forged.txt"
+  git -C "$fixture_repo" add forged.txt
+  forged_tree="$(git -C "$fixture_repo" write-tree)"
+  git -C "$fixture_repo" reset -q --hard "$reviewed_head"
+  forged_head="$(printf 'forged tree\n' | git -C "$fixture_repo" commit-tree \
+    "$forged_tree" -p "$fork_parent" -p "$upstream_parent")"
+  reversed_head="$(printf 'reversed parents\n' | git -C "$fixture_repo" commit-tree \
+    "$reviewed_tree" -p "$upstream_parent" -p "$fork_parent")"
+  extra_parent="$(printf 'extra parent\n' | git -C "$fixture_repo" commit-tree \
+    "$common_sha^{tree}" -p "$common_sha")"
+  octopus_head="$(printf 'octopus merge\n' | git -C "$fixture_repo" commit-tree \
+    "$reviewed_tree" -p "$fork_parent" -p "$upstream_parent" -p "$extra_parent")"
+  non_merge_head="$(printf 'not a merge\n' | git -C "$fixture_repo" commit-tree \
+    "$reviewed_tree" -p "$fork_parent")"
+  printf '{"name":"unreviewed-fixture"}\n' > "$fixture_repo/package.json"
+  git -C "$fixture_repo" add package.json
+  wrong_graph_tree="$(git -C "$fixture_repo" write-tree)"
+  git -C "$fixture_repo" reset -q --hard "$reviewed_head"
+  wrong_graph_head="$(printf 'unreviewed dependency graph\n' | git -C "$fixture_repo" commit-tree \
+    "$wrong_graph_tree" -p "$fork_parent" -p "$upstream_parent")"
+  mkdir -p "$fixture_repo/packages/unlisted"
+  printf '{"name":"unlisted-fixture"}\n' > "$fixture_repo/packages/unlisted/package.json"
+  git -C "$fixture_repo" add packages/unlisted/package.json
+  nested_graph_tree="$(git -C "$fixture_repo" write-tree)"
+  git -C "$fixture_repo" reset -q --hard "$reviewed_head"
+  nested_graph_head="$(printf 'unlisted nested dependency graph\n' | git -C "$fixture_repo" commit-tree \
+    "$nested_graph_tree" -p "$fork_parent" -p "$upstream_parent")"
+
+  run_fixture_admission() {
+    local fixture_head="$1"
+    local fixture_output="$2"
+    shift 2
+    (
+      cd "$fixture_repo"
+      env \
+        GITHUB_OUTPUT= \
+        BASE_SHA="$protected_base" HEAD_SHA="$fixture_head" PR_NUMBER=999 \
+        HEAD_REPOSITORY=mbenhamd/mastra \
+        HEAD_REF=feature/pf-4163-mastra-upstream-sync-23c232d7 \
+        BASE_REF=main \
+        PAPERSFLOW_PF4163_MERGE_COMMIT="$reviewed_head" \
+        PAPERSFLOW_PF4163_FORK_PARENT="$fork_parent" \
+        PAPERSFLOW_PF4163_UPSTREAM_PARENT="$upstream_parent" \
+        PAPERSFLOW_PF4163_REVIEWED_TREE="$reviewed_tree" \
+        "$@" bash "$script_path" --classify-install
+    ) > "$fixture_output" 2>&1
+  }
+
+  output="$test_root/approved.log"
+  run_fixture_admission "$reviewed_head" "$output"
+  grep -Fxq 'lane=pf4163-upstream-sync' "$output"
+
+  output="$test_root/pending-pins.log"
+  if run_fixture_admission "$reviewed_head" "$output" \
+    PAPERSFLOW_PF4163_MERGE_COMMIT=PENDING_PF4163_MERGE_COMMIT; then
+    echo 'PF-4163 pending merge pin unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'exact-sync admission pins are pending' "$output"
+
+  output="$test_root/pending-fork-parent.log"
+  if run_fixture_admission "$reviewed_head" "$output" \
+    PAPERSFLOW_PF4163_FORK_PARENT=PENDING_PF4163_FORK_PARENT; then
+    echo 'PF-4163 pending fork-parent pin unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'exact-sync admission pins are pending' "$output"
+
+  output="$test_root/pending-reviewed-tree.log"
+  if run_fixture_admission "$reviewed_head" "$output" \
+    PAPERSFLOW_PF4163_REVIEWED_TREE=PENDING_PF4163_REVIEWED_TREE; then
+    echo 'PF-4163 pending reviewed-tree pin unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'exact-sync admission pins are pending' "$output"
+
+  output="$test_root/wrong-sha.log"
+  if run_fixture_admission "$reviewed_head" "$output" \
+    PAPERSFLOW_PF4163_MERGE_COMMIT="$fork_parent"; then
+    echo 'PF-4163 head with a wrong reviewed SHA unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'head is not the exact reviewed merge commit' "$output"
+
+  output="$test_root/forged-tree.log"
+  if run_fixture_admission "$forged_head" "$output" \
+    PAPERSFLOW_PF4163_MERGE_COMMIT="$forged_head"; then
+    echo 'PF-4163 forged tree with the reviewed parents unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'head tree does not match the reviewed merge tree' "$output"
+
+  output="$test_root/reversed-parents.log"
+  if run_fixture_admission "$reversed_head" "$output" \
+    PAPERSFLOW_PF4163_MERGE_COMMIT="$reversed_head"; then
+    echo 'PF-4163 reversed parent order unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'not the exact reviewed two-parent upstream merge topology' "$output"
+
+  output="$test_root/octopus.log"
+  if run_fixture_admission "$octopus_head" "$output" \
+    PAPERSFLOW_PF4163_MERGE_COMMIT="$octopus_head"; then
+    echo 'PF-4163 octopus merge unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'not the exact reviewed two-parent upstream merge topology' "$output"
+
+  output="$test_root/non-merge.log"
+  if run_fixture_admission "$non_merge_head" "$output" \
+    PAPERSFLOW_PF4163_MERGE_COMMIT="$non_merge_head"; then
+    echo 'PF-4163 non-merge head unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'not the exact reviewed two-parent upstream merge topology' "$output"
+
+  output="$test_root/untrusted-base.log"
+  if run_fixture_admission "$reviewed_head" "$output" BASE_SHA="$common_sha"; then
+    echo 'PF-4163 base outside the reviewed fork lineage unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'protected base does not descend from the reviewed fork parent' "$output"
+
+  output="$test_root/base-contained-in-head.log"
+  if run_fixture_admission "$reviewed_head" "$output" BASE_SHA="$reviewed_head"; then
+    echo 'PF-4163 base/head intersection beyond the reviewed fork parent unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'no longer meet at the reviewed fork parent' "$output"
+
+  output="$test_root/extra-best-merge-base.log"
+  if run_fixture_admission "$reviewed_head" "$output" BASE_SHA="$extra_intersection_base"; then
+    echo 'PF-4163 extra best protected-base intersection unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'no longer meet at the reviewed fork parent' "$output"
+
+  output="$test_root/unapproved-install-path.log"
+  if run_fixture_admission "$wrong_graph_head" "$output" \
+    PAPERSFLOW_PF4163_MERGE_COMMIT="$wrong_graph_head" \
+    PAPERSFLOW_PF4163_REVIEWED_TREE="$wrong_graph_tree"; then
+    echo 'PF-4163 unapproved dependency-graph path unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'outside the frozen install allowlist' "$output"
+
+  output="$test_root/unapproved-nested-install-path.log"
+  if run_fixture_admission "$nested_graph_head" "$output" \
+    PAPERSFLOW_PF4163_MERGE_COMMIT="$nested_graph_head" \
+    PAPERSFLOW_PF4163_REVIEWED_TREE="$nested_graph_tree"; then
+    echo 'PF-4163 unapproved nested dependency-graph path unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'outside the frozen install allowlist' "$output"
+
+  echo 'PF-4163 pending-pin, exact-commit, topology, tree, ancestry, and frozen-install admission fixtures passed.'
+)
+
 run_pf3020_admission_self_tests() (
   local script_path test_root fixture_repo common_sha fork_parent upstream_parent
   local reviewed_head reviewed_tree protected_base forged_tree forged_head
@@ -3641,6 +4102,10 @@ case "${1:-}" in
     ;;
   --self-test-pf3375-upstream-sync)
     run_pf3375_admission_self_tests
+    exit
+    ;;
+  --self-test-pf4163-upstream-sync)
+    run_pf4163_admission_self_tests
     exit
     ;;
   --self-test-pf3020-upstream-sync)
@@ -9119,6 +9584,8 @@ EOF
   run_with_validation_budget 600 pnpm --filter @mastra/vercel --fail-if-no-match lint
   if [[ "$expected_lane" == pf4051-upstream-sync ]]; then
     run_with_validation_budget 600 pnpm run check:core-imports packages/server
+  elif [[ "$expected_lane" == pf4163-upstream-sync ]]; then
+    run_standard_server_core_imports_check 600 --filter @mastra/server --fail-if-no-match
   else
     run_with_validation_budget 600 pnpm --filter @mastra/server --fail-if-no-match check:core-imports
   fi
@@ -9128,7 +9595,8 @@ EOF
   if ! git diff --exit-code "$HEAD_SHA" -- \
     client-sdks/client-js/src/route-types.generated.ts \
     packages/cli/src/commands/api/route-metadata.generated.ts \
-    packages/core/src/auth/ee/interfaces/permissions.generated.ts; then
+    packages/core/src/auth/ee/interfaces/permissions.generated.ts \
+    packages/_internals/auth/src/ee/interfaces/permissions.generated.ts; then
     echo "$issue_key generated route or permission artifacts are stale." >&2
     return 1
   fi
@@ -9381,6 +9849,20 @@ run_pf3375_upstream_sync_validation() {
       src/pubsub-ack-audit.test.ts
 
   echo 'PF-3375 complete workspace and durable-runtime validation passed.'
+}
+
+run_pf4163_upstream_sync_validation() {
+  run_upstream_sync_validation pf4163-upstream-sync PF-4163
+
+  echo 'Running native PF-4163 Agent Builder and Fastify package validation.'
+  run_with_validation_budget 600 \
+    pnpm --filter ./packages/agent-builder --fail-if-no-match check
+  run_with_validation_budget 900 \
+    pnpm --filter ./packages/agent-builder --fail-if-no-match test
+  run_with_validation_budget 900 \
+    pnpm --filter ./server-adapters/fastify --fail-if-no-match build
+  run_with_validation_budget 900 \
+    pnpm --filter ./server-adapters/fastify --fail-if-no-match test
 }
 
 run_pf3020_upstream_sync_validation() {
@@ -9778,6 +10260,26 @@ run_pf2045_incoming_validation() {
   echo 'PF-2045 reviewed incoming runtime validation passed.'
 }
 
+run_standard_server_core_imports_check() {
+  local maximum_seconds="$1"
+  shift
+  local root_owns_check
+
+  # Read ownership as data; do not load a PR's check script to select its lane.
+  root_owns_check="$(node - "$VALIDATOR_REPOSITORY_ROOT/package.json" <<'NODE'
+const fs = require('node:fs');
+const manifest = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+process.stdout.write(String(Object.hasOwn(manifest.scripts ?? {}, 'check:core-imports')));
+NODE
+)" || return
+
+  if [[ "$root_owns_check" == true ]]; then
+    run_with_validation_budget "$maximum_seconds" pnpm run check:core-imports packages/server
+  else
+    run_with_validation_budget "$maximum_seconds" pnpm "$@" check:core-imports
+  fi
+}
+
 run_pf2045_upstream_sync_validation() {
   run_upstream_sync_validation pf2045-upstream-sync PF-2045
   run_pf2045_incoming_validation
@@ -9810,6 +10312,10 @@ case "${1:-}" in
     ;;
   --validate-pf3375-upstream-sync)
     run_pf3375_upstream_sync_validation
+    exit
+    ;;
+  --validate-pf4163-upstream-sync)
+    run_pf4163_upstream_sync_validation
     exit
     ;;
   --validate-pf3020-upstream-sync)
@@ -12470,25 +12976,6 @@ if grep -Fxq 'client-sdks/client-js/src/index.ts' "$changed_files"; then
   check_client_index_entrypoint_contract
 fi
 
-run_standard_server_core_imports_check() {
-  local maximum_seconds="$1"
-  shift
-  local root_owns_check
-
-  # Read ownership as data; do not load a PR's check script to select its lane.
-  root_owns_check="$(node - "$VALIDATOR_REPOSITORY_ROOT/package.json" <<'NODE'
-const fs = require('node:fs');
-const manifest = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
-process.stdout.write(String(Object.hasOwn(manifest.scripts ?? {}, 'check:core-imports')));
-NODE
-)" || return
-
-  if [[ "$root_owns_check" == true ]]; then
-    run_with_validation_budget "$maximum_seconds" pnpm run check:core-imports packages/server
-  else
-    run_with_validation_budget "$maximum_seconds" pnpm "$@" check:core-imports
-  fi
-}
 
 agent_builder_prerequisites_built=false
 ensure_agent_builder_prerequisites() {

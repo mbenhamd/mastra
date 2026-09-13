@@ -88,6 +88,21 @@ jobs:
           script_path=".github/scripts/run-papersflow-fork-pr-validation.bash"
           trusted_script="${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash"
           /usr/bin/git show "${BASE_SHA}:${script_path}" > "$trusted_script"
+
+          pf4163_policy_script="${RUNNER_TEMP}/pf4163-policy-self-test.bash"
+          if grep -Fq -- '--self-test-pf4163-upstream-sync' "$trusted_script"; then
+            cp "$trusted_script" "$pf4163_policy_script"
+          elif [[ "$HEAD_REPOSITORY" == "$GITHUB_REPOSITORY" && \
+            "$HEAD_REF" == 'ci/pf-4163-upstream-sync-validation' && \
+            "$BASE_REF" == 'main' ]]; then
+            echo 'Bootstrapping the PF-4163 exact-merge fixtures from this same-repository policy PR.'
+            /usr/bin/git show "${HEAD_SHA}:${script_path}" > "$pf4163_policy_script"
+          else
+            echo 'The trusted base does not contain the PF-4163 admission fixtures.' >&2
+            exit 1
+          fi
+          /bin/bash "$pf4163_policy_script" --self-test-pf4163-upstream-sync
+
           if grep -Fq -- '--classify-install' "$trusted_script"; then
             /bin/bash "$trusted_script" --classify-install
           else
@@ -125,6 +140,7 @@ jobs:
             "$VALIDATION_LANE" == 'pf3020-upstream-sync' || \
             "$VALIDATION_LANE" == 'pf4051-upstream-sync' || \
             "$VALIDATION_LANE" == 'pf3375-upstream-sync' || \
+            "$VALIDATION_LANE" == 'pf4163-upstream-sync' || \
             "$VALIDATION_LANE" == 'pf2576-upstream-sync' || \
             "$VALIDATION_LANE" == 'pf2045-upstream-sync' ]]; then
             # Nested workspace manifests are part of the reconciled source
@@ -427,6 +443,10 @@ jobs:
             pf3375-upstream-sync)
               /bin/bash "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash" \
                 --validate-pf3375-upstream-sync
+              ;;
+            pf4163-upstream-sync)
+              /bin/bash "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash" \
+                --validate-pf4163-upstream-sync
               ;;
             pf4051-upstream-sync)
               /bin/bash "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash" \
