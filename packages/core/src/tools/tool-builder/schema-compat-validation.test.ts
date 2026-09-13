@@ -1,6 +1,7 @@
 import { jsonSchema as aiSdkJsonSchema } from '@internal/ai-v6';
 import { AnthropicSchemaCompatLayer, isStandardSchemaWithJSON } from '@mastra/schema-compat';
 import { describe, expect, it, vi } from 'vitest';
+import { z as z3 } from 'zod/v3';
 import { z } from 'zod/v4';
 import { RequestContext } from '../../request-context';
 import type { StandardSchemaWithJSON } from '../../schema';
@@ -102,6 +103,41 @@ describe('CoreToolBuilder - Schema Compatibility in Validation', () => {
       built.execute?.(
         { note: 'reject' },
         { abortSignal: new AbortController().signal, toolCallId: 'async-native-invalid', messages: [] },
+      ),
+    ).resolves.toMatchObject({ error: true });
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(execute).toHaveBeenCalledWith({ note: 'ACCEPTED' }, expect.any(Object));
+  });
+
+  it('preserves raw Zod v3 transforms and refinements through resume augmentation', async () => {
+    const execute = vi.fn(async (input: { note: string }) => input);
+    const inputSchema = z3
+      .object({ note: z3.string().transform(value => value.trim().toUpperCase()) })
+      .refine(value => value.note !== 'REJECT', 'Rejected note');
+    const tool: ToolAction<any, any> = {
+      id: 'raw-zod-v3-validator-tool',
+      description: 'Raw Zod v3 schema with transform and refinement',
+      inputSchema,
+    };
+
+    const builder = new CoreToolBuilder({
+      originalTool: tool,
+      options: { name: 'raw-zod-v3-validator-tool', requestContext: new RequestContext() },
+      autoResumeSuspendedTools: true,
+    });
+    tool.execute = execute;
+    const built = builder.build();
+
+    await expect(
+      built.execute?.(
+        { note: ' accepted ' },
+        { abortSignal: new AbortController().signal, toolCallId: 'zod-v3-valid', messages: [] },
+      ),
+    ).resolves.toEqual({ note: 'ACCEPTED' });
+    await expect(
+      built.execute?.(
+        { note: ' reject ' },
+        { abortSignal: new AbortController().signal, toolCallId: 'zod-v3-invalid', messages: [] },
       ),
     ).resolves.toMatchObject({ error: true });
     expect(execute).toHaveBeenCalledTimes(1);
