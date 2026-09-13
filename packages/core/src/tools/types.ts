@@ -478,7 +478,11 @@ export type CoreTool = {
   outputSchema?: FlexibleSchema<any> | Schema;
   execute?: (params: any, options: MastraToolInvocationOptions) => Promise<any>;
   /** @internal Runtime input preflight used before an approval-gated call is shown to a user. */
-  validateInput?: (params: unknown) => { data?: unknown; error?: unknown };
+  validateInput?: (
+    params: unknown,
+  ) => { data?: unknown; error?: unknown } | Promise<{ data?: unknown; error?: unknown }>;
+  /** @internal Present only for object input schemas with an executable Standard Schema validator. */
+  approvalInputEditing?: 'object';
   /** @internal Stable binding used to reject changed tool implementations during durable recovery. */
   recoveryFingerprint?: string;
   /**

@@ -810,6 +810,75 @@ describe('MessageHistory', () => {
       });
     });
 
+    it('applies the transcript projection to direct persistence without mutating the source message', async () => {
+      const mockStorage = {
+        saveMessages: vi.fn().mockResolvedValue(undefined),
+        getThreadById: vi.fn().mockResolvedValue({
+          id: 'thread-1',
+          title: 'Test Thread',
+          metadata: {},
+        }),
+      } as unknown as MemoryStorage;
+      const processor = new MessageHistory({ storage: mockStorage });
+      const suspendedTool = {
+        toolCallId: 'call-private',
+        toolName: 'requestApproval',
+        args: { documentId: 'RAW_TOOL_ARGS' },
+        approvedArgs: { documentId: 'PRIVATE_APPROVED_ARGS' },
+        approvalInputIdentityDigest: 'PRIVATE_APPROVAL_DIGEST',
+        suspendPayload: { reason: 'RAW_SUSPENSION_PAYLOAD' },
+        metadata: {
+          mastra: {
+            toolPayloadTransform: {
+              transcript: {
+                'input-available': { transformed: { documentId: 'PUBLIC_TOOL_ARGS' } },
+                suspend: { transformed: { reason: 'PUBLIC_SUSPENSION_PAYLOAD' } },
+              },
+            },
+          },
+        },
+      };
+      const message: MastraDBMessage = {
+        id: 'msg-private-suspension',
+        role: 'assistant',
+        createdAt: new Date('2024-01-01T00:00:01Z'),
+        content: {
+          format: 2,
+          parts: [{ type: 'data-tool-call-suspended', data: suspendedTool } as any],
+          metadata: {
+            suspendedTools: {
+              'call-private': structuredClone(suspendedTool),
+            },
+          },
+        },
+      };
+      const sourceBefore = structuredClone(message);
+
+      await processor.persistMessages({ messages: [message], threadId: 'thread-1' });
+
+      expect(message).toEqual(sourceBefore);
+      const savedMessages = (mockStorage.saveMessages as any).mock.calls[0][0].messages as MastraDBMessage[];
+      const savedSuspendedPart = savedMessages[0]!.content.parts[0] as any;
+      const savedSuspendedMetadata = (savedMessages[0]!.content.metadata!.suspendedTools as any)['call-private'];
+      expect(savedSuspendedPart.data).toMatchObject({
+        args: { documentId: 'PUBLIC_TOOL_ARGS' },
+        suspendPayload: { reason: 'PUBLIC_SUSPENSION_PAYLOAD' },
+      });
+      expect(savedSuspendedMetadata).toMatchObject({
+        args: { documentId: 'PUBLIC_TOOL_ARGS' },
+        suspendPayload: { reason: 'PUBLIC_SUSPENSION_PAYLOAD' },
+      });
+      expect(savedSuspendedPart.data).not.toHaveProperty('approvedArgs');
+      expect(savedSuspendedPart.data).not.toHaveProperty('approvalInputIdentityDigest');
+      expect(savedSuspendedMetadata).not.toHaveProperty('approvedArgs');
+      expect(savedSuspendedMetadata).not.toHaveProperty('approvalInputIdentityDigest');
+      const serialized = JSON.stringify(savedMessages);
+      expect(serialized).not.toContain('RAW_TOOL_ARGS');
+      expect(serialized).not.toContain('PRIVATE_APPROVED_ARGS');
+      expect(serialized).not.toContain('PRIVATE_APPROVAL_DIGEST');
+      expect(serialized).not.toContain('RAW_SUSPENSION_PAYLOAD');
+    });
+
     it('should drop transient signals but keep normal signals when persisting', async () => {
       const mockStorage = {
         saveMessages: vi.fn().mockResolvedValue(undefined),

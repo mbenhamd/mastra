@@ -1126,11 +1126,12 @@ describe('Session.queue() — suspension', () => {
     expect(agentA.streamCalls).toHaveLength(0);
 
     agentB.enqueueRun({ finishReason: 'stop', runId: 'mode-b-run', text: 'done from mode b' });
-    await session.respondToToolApproval({ approved: true });
+    await session.respondToToolApproval({ approved: true, editedArgs: { cmd: 'pwd' } });
     const result = await queued;
 
     expect(result.text).toBe('done from mode b');
     expect(agentB.resumeCalls).toHaveLength(1);
+    expect(agentB.resumeCalls[0]!.resumeData).toEqual({ approved: true, editedArgs: { cmd: 'pwd' } });
     expect(agentA.resumeCalls).toHaveLength(0);
     expect(session.getRecord().pendingResume).toBeUndefined();
     await session.close();
@@ -1217,10 +1218,11 @@ describe('Session.queue() — suspension', () => {
     });
     const replaySession = await replayHarness.session({ sessionId });
 
-    const result = await replaySession.respondToToolApproval({ approved: true });
+    const result = await replaySession.respondToToolApproval({ approved: true, editedArgs: { cmd: 'pwd' } });
 
     expect(result.text).toBe('resumed on mode b');
     expect(agentB.resumeCalls).toHaveLength(1);
+    expect(agentB.resumeCalls[0]!.resumeData).toEqual({ approved: true, editedArgs: { cmd: 'pwd' } });
     expect(agentA.resumeCalls).toHaveLength(0);
     expect(replaySession.getRecord().pendingResume).toBeUndefined();
     expect(replaySession.getRecord().queueAdmissionReceipts?.[queuedItemId]).toMatchObject({

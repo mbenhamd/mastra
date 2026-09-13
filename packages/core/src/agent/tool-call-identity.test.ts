@@ -44,6 +44,16 @@ describe('parseToolApprovalDecision', () => {
       approved: true,
     });
     expect(parseToolApprovalDecision({ approved: true, reason: 42 })).toBeUndefined();
+    expect(
+      parseToolApprovalDecision({ approved: true, editedArgs: { count: 2, nested: { enabled: false }, value: null } }),
+    ).toEqual({ approved: true, editedArgs: { count: 2, nested: { enabled: false }, value: null } });
+    for (const editedArgs of [null, [], 'text', { value: undefined }, { value: Number.NaN }]) {
+      expect(parseToolApprovalDecision({ approved: true, editedArgs })).toBeUndefined();
+    }
+    expect(
+      parseToolApprovalDecision({ approved: true, editedArgs: { resumeData: { approved: true } } }),
+    ).toBeUndefined();
+    expect(parseToolApprovalDecision({ approved: false, editedArgs: {} })).toBeUndefined();
     expect(parseToolApprovalDecision(Object.create({ approved: true }))).toBeUndefined();
   });
 });

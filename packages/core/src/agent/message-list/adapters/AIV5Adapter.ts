@@ -181,14 +181,18 @@ function getDisplayTransform(
 }
 
 function transformToolStateDataForDisplay(data: unknown, phase: 'approval' | 'suspend', enabled = true): unknown {
-  if (!enabled) {
-    return data;
-  }
   if (!data || typeof data !== 'object') {
     return data;
   }
 
-  const stateData = data as Record<string, unknown>;
+  const {
+    approvedArgs: _approvedArgs,
+    approvalInputIdentityDigest: _approvalInputIdentityDigest,
+    ...stateData
+  } = data as Record<string, unknown>;
+  if (!enabled) {
+    return stateData;
+  }
   const metadata = stateData.metadata ?? stateData.providerMetadata;
   const argsTransform = getTransformedToolPayload(metadata, 'display', phase);
   const inputTransform = getTransformedToolPayload(metadata, 'display', 'input-available');
@@ -210,6 +214,25 @@ function transformToolStateDataForDisplay(data: unknown, phase: 'approval' | 'su
     ...(transformedArgs !== undefined ? { args: transformedArgs } : {}),
     ...(transformedSuspendPayload !== undefined ? { suspendPayload: transformedSuspendPayload } : {}),
   };
+}
+
+function transformToolStateMetadataForDisplay(
+  metadata: Record<string, unknown>,
+  key: 'suspendedTools' | 'pendingToolApprovals',
+  phase: 'approval' | 'suspend',
+  enabled: boolean,
+) {
+  const stateMetadata = metadata[key];
+  if (!stateMetadata || typeof stateMetadata !== 'object' || Array.isArray(stateMetadata)) {
+    return;
+  }
+
+  metadata[key] = Object.fromEntries(
+    Object.entries(stateMetadata).map(([toolCallId, stateData]) => [
+      toolCallId,
+      transformToolStateDataForDisplay(stateData, phase, enabled),
+    ]),
+  );
 }
 
 export interface AIV5AdapterContext {
@@ -247,6 +270,9 @@ export class AIV5Adapter {
     if (dbMsg.content.providerMetadata) {
       metadata.providerMetadata = dbMsg.content.providerMetadata;
     }
+
+    transformToolStateMetadataForDisplay(metadata, 'suspendedTools', 'suspend', transformToolPayloads);
+    transformToolStateMetadataForDisplay(metadata, 'pendingToolApprovals', 'approval', transformToolPayloads);
 
     if (dbMsg.role === 'signal' && !isUserMessageSignal) {
       return {

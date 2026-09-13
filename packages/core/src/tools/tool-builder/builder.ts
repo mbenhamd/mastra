@@ -62,6 +62,7 @@ import {
   isToolValidationError,
   ToolSchemaValidationError,
   validateToolInput,
+  validateToolInputAsync,
   validateToolOutput,
   validateToolSuspendData,
 } from '../validation';
@@ -72,6 +73,42 @@ import {
  */
 export type ToolToConvert = VercelTool | ToolAction<any, any, any> | VercelToolV5 | ProviderDefinedTool;
 export type LogType = 'tool' | 'toolset' | 'client-tool';
+
+const schemasWithoutNativeInputValidation = new WeakSet<object>();
+
+function resolveNativeInputValidationSchema(schema: unknown): StandardSchemaWithJSON | undefined {
+  if ((typeof schema === 'object' && schema !== null) || typeof schema === 'function') {
+    if (schemasWithoutNativeInputValidation.has(schema)) return undefined;
+  }
+  if (isStandardSchemaWithJSON(schema)) {
+    if (schema['~standard'].vendor === 'ai-sdk') {
+      const getSchema = (schema as { getSchema?: unknown }).getSchema;
+      if (typeof getSchema === 'function') {
+        const wrappedSchema = (schema as unknown as { getSchema: () => Schema }).getSchema();
+        if (typeof (wrappedSchema as { validate?: unknown }).validate !== 'function') return undefined;
+      }
+    }
+    return schema;
+  }
+  if (
+    schema &&
+    typeof schema === 'object' &&
+    typeof (schema as { validate?: unknown }).validate === 'function' &&
+    typeof (schema as { jsonSchema?: unknown }).jsonSchema === 'object'
+  ) {
+    return toStandardSchema(schema as any);
+  }
+  return undefined;
+}
+
+function resolveApprovalInputEditing(
+  nativeInputValidationSchema: StandardSchemaWithJSON | undefined,
+): 'object' | undefined {
+  if (!nativeInputValidationSchema) return undefined;
+  return standardSchemaToJSONSchema(nativeInputValidationSchema, { io: 'input' }).type === 'object'
+    ? 'object'
+    : undefined;
+}
 
 function serializeResumeSchema(schema: unknown): string | undefined {
   if (!schema) return undefined;
@@ -224,9 +261,17 @@ function buildJsonOverrideSchema(
   splicedJsonSchema: JSONSchema7Definition,
   injectedKeys: readonly string[],
 ): StandardSchemaWithJSON {
+  const nativeInputValidationSchema = resolveNativeInputValidationSchema(originalSchema);
+  const hasOriginalNativeInputValidation = nativeInputValidationSchema !== undefined;
   const fallback = toStandardSchema(splicedJsonSchema as any);
   const original = originalSchema as { '~standard'?: { validate?: (v: unknown) => any } } | undefined;
-  const originalValidate = original?.['~standard']?.validate?.bind(original['~standard']);
+  const canUseOriginalNativeInputValidation =
+    !isStandardSchemaWithJSON(originalSchema) ||
+    (((typeof originalSchema === 'object' && originalSchema !== null) || typeof originalSchema === 'function') &&
+      schemasWithoutNativeInputValidation.has(originalSchema));
+  const originalValidate =
+    nativeInputValidationSchema?.['~standard']?.validate?.bind(nativeInputValidationSchema['~standard']) ??
+    (canUseOriginalNativeInputValidation ? original?.['~standard']?.validate?.bind(original['~standard']) : undefined);
 
   // Standard Schema for *just* the injected override fields, so we can validate
   // malformed override payloads (e.g. `_background: { enabled: "yes" }`) before
@@ -307,7 +352,7 @@ function buildJsonOverrideSchema(
     );
   };
 
-  return {
+  const augmentedSchema = {
     '~standard': {
       version: 1,
       vendor: 'mastra-json-override',
@@ -315,6 +360,12 @@ function buildJsonOverrideSchema(
       jsonSchema: fallback['~standard'].jsonSchema,
     },
   } as StandardSchemaWithJSON;
+
+  if (!hasOriginalNativeInputValidation) {
+    schemasWithoutNativeInputValidation.add(augmentedSchema);
+  }
+
+  return augmentedSchema;
 }
 
 export class CoreToolBuilder extends MastraBase {
@@ -371,7 +422,6 @@ export class CoreToolBuilder extends MastraBase {
         if (!schema) {
           schema = z.object({});
         }
-
         // Preferred path: when the user's input schema is a Zod v4 ZodObject
         // (the common case for tools authored with `zod` / `zod/v4`), keep using
         // `.extend()`. This preserves the exact JSON Schema shape that existing
@@ -983,7 +1033,7 @@ export class CoreToolBuilder extends MastraBase {
 
         const parameters = inputValidationSchema ?? this.getParameters();
         if (!isResuming) {
-          const { data, error } = validateToolInput(
+          const { data, error } = await validateToolInputAsync(
             parameters as StandardSchemaWithJSON | undefined,
             args,
             options.name,
@@ -1006,7 +1056,7 @@ export class CoreToolBuilder extends MastraBase {
           // would throw on the resumed leg even though the initial leg passed. Reuse
           // the same normalization pipeline; on validation error keep the raw args so
           // delegated resumes with extra control fields behave exactly as before.
-          const { data, error } = validateToolInput(parameters, args, options.name);
+          const { data, error } = await validateToolInputAsync(parameters, args, options.name);
           if (error === undefined) {
             args = data;
           }
@@ -1144,6 +1194,12 @@ export class CoreToolBuilder extends MastraBase {
     }
 
     const originalSchema = this.getParameters();
+    // Keep native author validation separate from approval editing eligibility:
+    // unions/intersections can carry constraints that are not editable approval
+    // objects, but still need native preflight validation before compatibility
+    // layers rewrite their JSON Schema.
+    const approvalInputValidationSchema = resolveNativeInputValidationSchema(originalSchema);
+    const approvalInputEditing = resolveApprovalInputEditing(approvalInputValidationSchema);
     const inputValidationSchema = this.buildCompatValidationSchema(originalSchema, schemaCompatLayers);
     let processedInputSchema: Schema | undefined;
 
@@ -1264,13 +1320,21 @@ export class CoreToolBuilder extends MastraBase {
       // validator separately. The agent loop uses this to keep schema-invalid
       // calls out of a user-facing approval queue; execute() still performs
       // authoritative validation immediately before side effects.
-      validateInput: (params: unknown) => validateToolInput(this.getParameters(), params, this.options.name),
+      validateInput: (params: unknown) =>
+        approvalInputValidationSchema
+          ? validateToolInputAsync(approvalInputValidationSchema, params, this.options.name)
+          : validateToolInput(inputValidationSchema ?? this.getParameters(), params, this.options.name),
+      approvalInputEditing,
       execute: this.originalTool.execute
         ? this.createExecute(
             this.originalTool,
             { ...this.options, description: this.originalTool.description },
             this.logType,
-            inputValidationSchema,
+            // Raw AI SDK schemas can carry an async validator even when no
+            // compatibility schema is built. Execution must apply that same
+            // author validator so defaults/transforms accepted by approval
+            // preflight reach the tool implementation.
+            inputValidationSchema ?? approvalInputValidationSchema,
           )
         : undefined,
     };

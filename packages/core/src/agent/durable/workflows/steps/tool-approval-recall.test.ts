@@ -470,6 +470,17 @@ describe('issue #17218 (durable engine): tool-call step records the approval dec
     },
   );
 
+  it('rejects edited approval arguments on the unsupported durable execution lane', async () => {
+    const execute = vi.fn().mockResolvedValue('should not execute');
+    setupRegistry(execute);
+    const result = await runToolCallStep({ approved: true, editedArgs: { query: 'changed' } });
+    expect(result.error).toMatchObject({
+      name: 'DurableResumeValidationError',
+      message: 'Edited approval arguments are not supported by durable agents',
+    });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
   it('approve returns the tool result tagged with approval { approved: true }', async () => {
     const execute = vi.fn().mockResolvedValue(TOOL_RESULT);
     setupRegistry(execute);

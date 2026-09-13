@@ -17,6 +17,7 @@ import {
   BACKGROUND_TASK_MANAGER_KEY,
   CURRENT_DATE_KEY,
   DRAIN_PENDING_SIGNALS_KEY,
+  EDITED_APPROVAL_RESUME_LOADER_KEY,
   GENERATE_ID_KEY,
   INITIAL_SIGNAL_ECHOES_KEY,
   MEMORY_CONFIG_KEY,
@@ -63,6 +64,11 @@ export function hydrateRunScopeFromInternal(mastra: Mastra, runId: string, inter
   if (internal.skipBgTaskWait !== undefined) scope.set(SKIP_BG_TASK_WAIT_KEY, internal.skipBgTaskWait);
   if (internal.drainPendingSignals) scope.set(DRAIN_PENDING_SIGNALS_KEY, internal.drainPendingSignals);
   if (internal.initialSignalEchoes) scope.set(INITIAL_SIGNAL_ECHOES_KEY, internal.initialSignalEchoes);
+  if (internal.editedApprovalResumeLoader) {
+    scope.set(EDITED_APPROVAL_RESUME_LOADER_KEY, internal.editedApprovalResumeLoader);
+  } else {
+    scope.delete(EDITED_APPROVAL_RESUME_LOADER_KEY);
+  }
   if (internal.toolPayloadTransform) scope.set(TOOL_PAYLOAD_TRANSFORM_KEY, internal.toolPayloadTransform);
   // Hooks are execution-segment scoped. A same-process resume can reuse the
   // run scope, so absence here must clear the prior segment's closures instead

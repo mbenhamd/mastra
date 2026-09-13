@@ -1383,6 +1383,128 @@ describe('Agent FGA checks', () => {
       ).rejects.toMatchObject({ id: 'AGENT_RESUME_OWNER_MISMATCH' });
     });
 
+    it('should reject edited approval recovery from a snapshot owned by another agent', async () => {
+      const fgaProvider = createMockFGAProvider(true);
+      const snapshot = {
+        status: 'suspended',
+        resumeLabels: {
+          'edited-call': { stepId: 'suspendedStep' },
+        },
+        context: {
+          suspendedStep: {
+            status: 'suspended',
+            suspendPayload: {
+              __agentId: 'foreign-agent',
+              __streamState: {
+                messageList: {
+                  memoryInfo: { threadId: 'thread-a', resourceId: 'resource-a' },
+                },
+              },
+              toolCallSuspended: { reason: 'more input' },
+              toolCallResume: {
+                version: 1,
+                originRunId: 'suspended-run-id',
+                stepId: 'toolCallStep',
+                type: 'suspension',
+                toolCallId: 'edited-call',
+                toolName: 'test-tool',
+                identityDigest: 'approved-digest',
+                approvedArgs: { value: 'private' },
+                approvalInputIdentityDigest: 'original-digest',
+              },
+            },
+          },
+        },
+      };
+      const { getStorage } = createWorkflowRunStorage({ resourceId: 'resource-a', snapshot });
+      const mastra = createMockMastra(fgaProvider, getStorage);
+      const agent = new Agent({ id: 'test-agent', name: 'test-agent', instructions: 'test', model: {} as any });
+      (agent as any).__registerMastra(mastra);
+
+      const requestContext = new RequestContext();
+      requestContext.set('user', { id: 'user-1' });
+      requestContext.set(MASTRA_RESOURCE_ID_KEY, 'resource-a');
+
+      await expect(
+        agent.__getAgenticLoopEditedApprovalResume({
+          runId: 'suspended-run-id',
+          originRunId: 'suspended-run-id',
+          toolCallId: 'edited-call',
+          toolName: 'test-tool',
+          identityDigest: 'approved-digest',
+          requestContext,
+          threadId: 'thread-a',
+          resourceId: 'resource-a',
+        }),
+      ).rejects.toMatchObject({ id: 'AGENT_RESUME_AGENT_MISMATCH' });
+    });
+
+    it('should preserve resource-only edited approval ownership checks', async () => {
+      const snapshot = {
+        status: 'suspended',
+        resumeLabels: {
+          'edited-call': { stepId: 'suspendedStep' },
+        },
+        context: {
+          suspendedStep: {
+            status: 'suspended',
+            suspendPayload: {
+              __agentId: 'test-agent',
+              __streamState: {
+                messageList: {
+                  memoryInfo: { threadId: 'thread-a', resourceId: 'resource-a' },
+                },
+              },
+              toolCallSuspended: { reason: 'more input' },
+              toolCallResume: {
+                version: 1,
+                originRunId: 'suspended-run-id',
+                stepId: 'toolCallStep',
+                type: 'suspension',
+                toolCallId: 'edited-call',
+                toolName: 'test-tool',
+                identityDigest: 'approved-digest',
+                approvedArgs: { value: 'private' },
+                approvalInputIdentityDigest: 'original-digest',
+              },
+            },
+          },
+        },
+      };
+      const { getStorage } = createWorkflowRunStorage({ resourceId: 'resource-a', snapshot });
+      const mastra = createMockMastra(undefined, getStorage);
+      const agent = new Agent({ id: 'test-agent', name: 'test-agent', instructions: 'test', model: {} as any });
+      (agent as any).__registerMastra(mastra);
+      const requestContext = new RequestContext();
+
+      await expect(
+        agent.__getAgenticLoopEditedApprovalResume({
+          runId: 'suspended-run-id',
+          originRunId: 'suspended-run-id',
+          toolCallId: 'edited-call',
+          toolName: 'test-tool',
+          identityDigest: 'approved-digest',
+          requestContext,
+          resourceId: 'resource-a',
+        }),
+      ).resolves.toEqual({
+        approvedArgs: { value: 'private' },
+        approvalInputIdentityDigest: 'original-digest',
+      });
+
+      await expect(
+        agent.__getAgenticLoopEditedApprovalResume({
+          runId: 'suspended-run-id',
+          originRunId: 'suspended-run-id',
+          toolCallId: 'edited-call',
+          toolName: 'test-tool',
+          identityDigest: 'approved-digest',
+          requestContext,
+          resourceId: 'resource-b',
+        }),
+      ).rejects.toMatchObject({ id: 'AGENT_RESUME_OWNER_MISMATCH' });
+    });
+
     it('should fail closed when FGA is configured and caller resource is missing for an owned run', async () => {
       const fgaProvider = createMockFGAProvider(true);
       const { getStorage } = createWorkflowRunStorage({ resourceId: 'resource-b' });

@@ -1,10 +1,12 @@
 import type { ToolSet } from '@internal/ai-sdk-v5';
+import { jsonSchema } from '@internal/ai-v6';
 import { describe, it, beforeEach, afterEach, expect, vi } from 'vitest';
 import type { Mock } from 'vitest';
 import { z } from 'zod/v4';
 import { MessageList } from '../../../agent/message-list';
 import { createToolCallIdentityDigest } from '../../../agent/tool-call-identity';
 import { RequestContext } from '../../../request-context';
+import { toStandardSchema } from '../../../schema';
 import { ChunkFrom } from '../../../stream/types';
 import { createTool } from '../../../tools';
 import * as toolPayloadTransform from '../../../tools/payload-transform';
@@ -57,6 +59,22 @@ describe('createToolCallStep background task resume with falsy payload', () => {
     vi.restoreAllMocks();
   });
 
+  const makeBackgroundSuspendData = () => ({
+    toolCallResume: {
+      version: 1,
+      originRunId: 'current-run',
+      stepId: 'toolCallStep',
+      type: 'suspension',
+      toolCallId: 'call-1',
+      toolName: 'background-tool',
+      identityDigest: createToolCallIdentityDigest({
+        toolCallId: 'call-1',
+        toolName: 'background-tool',
+        args: { query: 'customers' },
+      }),
+    },
+  });
+
   const runBackgroundResume = async (resumeData: unknown) => {
     const controller = { enqueue: vi.fn() };
     const streamState = { serialize: vi.fn().mockReturnValue('serialized-state') };
@@ -93,6 +111,7 @@ describe('createToolCallStep background task resume with falsy payload', () => {
     await toolCallStep.execute(
       makeBaseExecuteParams(vi.fn(), {
         resumeData,
+        suspendData: makeBackgroundSuspendData(),
         inputData: { toolCallId: 'call-1', toolName: 'background-tool', args: { query: 'customers' } },
       }),
     );
@@ -147,6 +166,7 @@ describe('createToolCallStep background task resume with falsy payload', () => {
     await toolCallStep.execute(
       makeBaseExecuteParams(vi.fn(), {
         resumeData,
+        suspendData: makeBackgroundSuspendData(),
         inputData: { toolCallId: 'call-1', toolName: 'background-tool', args: { query: 'customers' } },
       }),
     );
@@ -222,6 +242,7 @@ describe('createToolCallStep background task resume with falsy payload', () => {
     await toolCallStep.execute(
       makeBaseExecuteParams(vi.fn(), {
         resumeData: false,
+        suspendData: makeBackgroundSuspendData(),
         inputData: { toolCallId: 'call-1', toolName: 'background-tool', args: { query: 'customers' } },
       }),
     );
@@ -839,6 +860,396 @@ describe('createToolCallStep tool approval workflow', () => {
     vi.restoreAllMocks();
   });
 
+  const runEditedApprovalResumeCase = async (transform: 'redacted' | 'safe') => {
+    const originalArgs = { param: 'test', limit: 3, nested: { left: 1, right: 2 }, suspendData: 'business input' };
+    const editedArgs =
+      transform === 'redacted'
+        ? { param: 'edited value', nested: { left: 9 }, _background: { enabled: false } }
+        : { param: 'edited value', nested: { left: 9 } };
+    const approvedArgs = { ...originalArgs, ...editedArgs };
+    const executionArgs = { ...originalArgs, param: 'edited value!', nested: { left: 9 } };
+    const transcriptArgs = transform === 'redacted' ? { param: '[redacted]' } : approvedArgs;
+    const transcriptIsRedacted = transform === 'redacted';
+    const originalIdentityDigest = createToolCallIdentityDigest({
+      toolCallId: 'test-call-id',
+      toolName: 'test-tool',
+      args: originalArgs,
+    });
+    const approvedIdentityDigest = createToolCallIdentityDigest({
+      toolCallId: 'test-call-id',
+      toolName: 'test-tool',
+      args: approvedArgs,
+    });
+    const transcriptIdentityDigest = createToolCallIdentityDigest({
+      toolCallId: 'test-call-id',
+      toolName: 'test-tool',
+      args: transcriptArgs,
+    });
+    let resuspendColdResume = false;
+    vi.spyOn(toolPayloadTransform, 'transformToolPayloadForTargets').mockImplementation(async context =>
+      context.phase === 'input-available'
+        ? ({ transcript: { 'input-available': { transformed: transcriptArgs } } } as any)
+        : undefined,
+    );
+    const execute = vi.fn(async (args, context) => {
+      if (!context.resumeData || resuspendColdResume) {
+        resuspendColdResume = false;
+        await context.suspend({ reason: 'more input' });
+      }
+      return args;
+    });
+    const builtTool = new CoreToolBuilder({
+      originalTool: {
+        id: 'test-tool',
+        description: 'Test edited approval',
+        requireApproval: true,
+        inputSchema: z
+          .object({
+            param: z
+              .string()
+              .min(1)
+              .transform(value => `${value}!`),
+            limit: z.number(),
+            nested: z.object({ left: z.number(), right: z.number().optional() }),
+            suspendData: z.string(),
+            _background: z.object({ enabled: z.boolean() }).optional(),
+          })
+          .strict(),
+        execute,
+      } as any,
+      options: {
+        name: 'test-tool',
+        description: 'Test edited approval',
+        requestContext: new RequestContext(),
+        logger: { debug: vi.fn(), warn: vi.fn(), error: vi.fn(), trackException: vi.fn() } as any,
+      },
+    }).build();
+    const persistedMessageList = new MessageList({ threadId: 'test-thread', resourceId: 'test-resource' });
+    const step = createToolCallStep({
+      tools: { 'test-tool': builtTool },
+      messageList: persistedMessageList,
+      controller,
+      runId: 'test-run',
+      streamState,
+    } as any);
+    const inputData = { ...makeInputData(), args: originalArgs };
+    const persistedSuspensionMessage = {
+      id: 'response-1',
+      role: 'assistant',
+      createdAt: new Date(),
+      content: {
+        format: 2,
+        metadata: {} as Record<string, any>,
+        parts: [{ type: 'tool-invocation', toolInvocation: inputData }],
+      },
+    };
+    persistedMessageList.add(persistedSuspensionMessage as any, 'response');
+    const suspendData = makeSuspendData();
+    suspendData.toolCallResume.identityDigest = originalIdentityDigest;
+    const persistSnapshot = vi.fn().mockResolvedValue(undefined);
+    const firstResult = await step.execute(
+      makeExecuteParams({
+        inputData,
+        resumeData: { approved: true, editedArgs },
+        suspendData,
+        suspend: persistSnapshot,
+      }),
+    );
+    expect(firstResult).toBeDefined();
+
+    expect(execute).toHaveBeenCalledOnce();
+    expect(execute.mock.calls[0]![0]).toEqual(executionArgs);
+    const snapshot = JSON.parse(JSON.stringify(persistSnapshot.mock.calls[0]![0]));
+    expect(snapshot.toolCallResume).toMatchObject({
+      identityDigest: approvedIdentityDigest,
+      approval: { id: 'test-call-id', approved: true },
+    });
+    expect(
+      controller.enqueue.mock.calls.find(([chunk]) => chunk.type === 'tool-call-suspended')![0].payload,
+    ).not.toHaveProperty('approvedArgs');
+    // Auto-resume reconstructs the next call from persisted message metadata,
+    // so that path must restore the same approved arguments and provenance.
+    const persistedMetadata = persistedMessageList.get.all.db()[0]!.content.metadata as Record<string, any>;
+    expect(persistedMetadata.suspendedTools[inputData.toolCallId]).toMatchObject({
+      identityDigest: approvedIdentityDigest,
+      approvalInputIdentityDigest: originalIdentityDigest,
+      approvedArgs,
+      args: transcriptArgs,
+    });
+    const snapshotResult = await step.execute(
+      makeExecuteParams({
+        inputData,
+        resumeData: { answer: 'continue from snapshot' },
+        suspendData: snapshot,
+      }),
+    );
+    expect(execute).toHaveBeenCalledTimes(2);
+    expect(snapshotResult).toMatchObject({
+      args: approvedArgs,
+      result: executionArgs,
+      approval: { approved: true },
+    });
+    const result = await step.execute(
+      makeExecuteParams({
+        inputData: {
+          ...inputData,
+          args: {
+            ...transcriptArgs,
+            resumeData: { answer: 'continue' },
+            suspendedToolCallId: inputData.toolCallId,
+          },
+        },
+      }),
+    );
+    expect(execute).toHaveBeenCalledTimes(3);
+    expect(result).toMatchObject({
+      args: approvedArgs,
+      result: executionArgs,
+      approval: { approved: true },
+    });
+    const recalledMessageList = new MessageList({ threadId: 'test-thread', resourceId: 'test-resource' }).deserialize(
+      persistedMessageList.serialize(),
+    );
+    const recalledMessage = recalledMessageList.get.all.db()[0]!;
+    const recalledMetadata = recalledMessage.content.metadata as Record<string, any>;
+    delete recalledMetadata.suspendedTools[inputData.toolCallId].approvedArgs;
+    delete recalledMetadata.suspendedTools[inputData.toolCallId].approvalInputIdentityDigest;
+    const recalledInvocation = recalledMessage.content.parts?.find(
+      part => part.type === 'tool-invocation' && part.toolInvocation.toolCallId === inputData.toolCallId,
+    );
+    if (recalledInvocation?.type === 'tool-invocation') {
+      recalledInvocation.toolInvocation.args = transcriptArgs;
+    }
+    const editedApprovalResumeLoader = vi.fn().mockResolvedValue({
+      approvedArgs,
+      approvalInputIdentityDigest: originalIdentityDigest,
+    });
+    const recalledStep = createToolCallStep({
+      tools: { 'test-tool': builtTool },
+      messageList: recalledMessageList,
+      controller,
+      runId: 'cold-resume-run',
+      streamState,
+      _internal: { editedApprovalResumeLoader },
+    } as any);
+    expect(recalledMetadata.suspendedTools[inputData.toolCallId]).not.toHaveProperty('approvedArgs');
+    expect(recalledMetadata.suspendedTools[inputData.toolCallId]).not.toHaveProperty('approvalInputIdentityDigest');
+    resuspendColdResume = true;
+    const recalledResult = await recalledStep.execute(
+      makeExecuteParams({
+        inputData: {
+          ...inputData,
+          args: {
+            ...transcriptArgs,
+            resumeData: { answer: 'continue after cold recall' },
+            suspendedToolCallId: inputData.toolCallId,
+          },
+        },
+        suspend: persistSnapshot,
+      }),
+    );
+    if (transcriptIsRedacted) {
+      expect(editedApprovalResumeLoader).toHaveBeenCalledOnce();
+      expect(editedApprovalResumeLoader).toHaveBeenCalledWith(
+        expect.objectContaining({
+          runId: 'test-run',
+          originRunId: 'test-run',
+          toolCallId: inputData.toolCallId,
+          toolName: inputData.toolName,
+          identityDigest: approvedIdentityDigest,
+        }),
+      );
+    } else {
+      expect(editedApprovalResumeLoader).not.toHaveBeenCalled();
+    }
+    expect(recalledResult).toMatchObject({
+      args: approvedArgs,
+      result: executionArgs,
+      approval: { approved: true },
+      approvedArgs,
+    });
+    const secondSnapshot = JSON.parse(JSON.stringify(persistSnapshot.mock.calls.at(-1)![0]));
+    expect(secondSnapshot.toolCallResume).toMatchObject({
+      originRunId: 'cold-resume-run',
+      identityDigest: approvedIdentityDigest,
+      ...(transcriptIsRedacted
+        ? {
+            approvalInputIdentityDigest: transcriptIdentityDigest,
+            approvedArgs,
+          }
+        : {}),
+    });
+    expect(recalledMetadata.suspendedTools[inputData.toolCallId]).toMatchObject({
+      originRunId: 'cold-resume-run',
+      runId: 'cold-resume-run',
+      identityDigest: approvedIdentityDigest,
+      resumeIdentityDigest: transcriptIdentityDigest,
+      ...(transcriptIsRedacted
+        ? {
+            approvalInputIdentityDigest: transcriptIdentityDigest,
+            approvedArgs,
+          }
+        : {}),
+    });
+    // Persisted transcript metadata retains the new suspension identity and ownership
+    // coordinates while filtering the canonical approval fields.
+    delete recalledMetadata.suspendedTools[inputData.toolCallId].approvedArgs;
+    delete recalledMetadata.suspendedTools[inputData.toolCallId].approvalInputIdentityDigest;
+    const recalledResumeResult = await recalledStep.execute(
+      makeExecuteParams({
+        inputData: {
+          ...inputData,
+          toolCallId: 'provider-repeat-call',
+          args: {
+            ...transcriptArgs,
+            resumeData: { answer: 'stale provider answer' },
+            suspendedToolCallId: inputData.toolCallId,
+            suspendedToolRunId: 'test-run',
+          },
+        },
+        resumeData: { answer: 'authoritative workflow answer' },
+        suspendData: secondSnapshot,
+      }),
+    );
+    expect(editedApprovalResumeLoader).toHaveBeenCalledTimes(transcriptIsRedacted ? 1 : 0);
+    expect(recalledResumeResult).toMatchObject({
+      args: approvedArgs,
+      result: executionArgs,
+      approval: { approved: true },
+    });
+    expect(execute.mock.calls.at(-1)?.[1].resumeData).toEqual({ answer: 'authoritative workflow answer' });
+    expect(execute).toHaveBeenCalledTimes(5);
+    expect(originalArgs).toEqual({
+      param: 'test',
+      limit: 3,
+      nested: { left: 1, right: 2 },
+      suspendData: 'business input',
+    });
+  };
+
+  it.each([
+    { label: 'redacted transcript', transform: 'redacted' as const },
+    { label: 'safe unchanged transcript', transform: 'safe' as const },
+  ])(
+    'executes validated edited approval arguments and preserves them through re-suspension ($label)',
+    async ({ transform }) => {
+      await runEditedApprovalResumeCase(transform);
+    },
+  );
+
+  it('rejects invalid or unsupported edited approvals before tool side effects', async () => {
+    const execute = vi.fn(async args => args);
+    const builtTool = new CoreToolBuilder({
+      originalTool: createTool({
+        id: 'test-tool',
+        description: 'Strict tool',
+        requireApproval: true,
+        inputSchema: z.object({ param: z.string().min(1) }).strict(),
+        execute,
+      }),
+      options: {
+        name: 'test-tool',
+        description: 'Strict tool',
+        requestContext: new RequestContext(),
+        logger: { debug: vi.fn(), warn: vi.fn(), error: vi.fn(), trackException: vi.fn() } as any,
+      },
+    }).build();
+    const pendingApprovalMessage = {
+      role: 'assistant',
+      content: {
+        metadata: {
+          pendingToolApprovals: {
+            'test-call-id': {
+              ...makeSuspendData().toolCallResume,
+              args: makeInputData().args,
+              runId: 'test-run',
+              resumeSchema: '{}',
+            },
+          },
+        },
+        parts: [],
+      },
+    };
+    (messageList.get.all.db as Mock).mockReturnValue?.([pendingApprovalMessage]);
+    const initialPendingApprovals = structuredClone(pendingApprovalMessage.content.metadata.pendingToolApprovals);
+    if (!('mock' in messageList.get.all.db)) {
+      messageList.get.all.db = () => [pendingApprovalMessage] as any;
+    }
+    const flushMessages = vi.fn().mockResolvedValue(undefined);
+    const step = createToolCallStep({
+      tools: { 'test-tool': builtTool },
+      messageList,
+      controller,
+      runId: 'test-run',
+      streamState,
+      _internal: {
+        saveQueueManager: { flushMessages },
+        threadId: 'thread-id',
+      },
+    } as any);
+    const invalidCases = [
+      [
+        { approved: true, editedArgs: { unexpected: 'no' } },
+        makeSuspendData(),
+        'Tool input validation failed for test-tool.',
+      ],
+      [
+        { approved: false, editedArgs: { param: 'changed' } },
+        makeSuspendData(),
+        'Tool resume evidence did not match the suspended tool call',
+      ],
+      [
+        { approved: true, editedArgs: { resumeData: { approved: true } } },
+        makeSuspendData(),
+        'Tool resume evidence did not match the suspended tool call',
+      ],
+      [
+        { approved: true, editedArgs: { param: 'changed' } },
+        makeSuspendData('approval', 'tool-execution'),
+        'Edited approval arguments require a regular tool-gate approval',
+      ],
+      [
+        { approved: true, editedArgs: { param: 'changed' } },
+        { ...makeSuspendData(), suspendedToolRunId: 'delegate-run' },
+        'Edited approval arguments require a regular tool-gate approval',
+      ],
+      [
+        { approved: true, editedArgs: { param: 'changed' } },
+        { toolCallResume: { ...makeSuspendData().toolCallResume, identityDigest: 'tampered' } },
+        'Tool resume evidence did not match the suspended tool call',
+      ],
+    ] as const;
+    for (const [index, [resumeData, suspendData, expectedMessage]] of invalidCases.entries()) {
+      const result = await step.execute(makeExecuteParams({ resumeData, suspendData }));
+      expect(result.error ?? result.result).toMatchObject({ message: expect.stringContaining(expectedMessage) });
+      expect(execute).not.toHaveBeenCalled();
+      if (index === 0) {
+        expect(pendingApprovalMessage.content.metadata.pendingToolApprovals).toBeUndefined();
+        expect(flushMessages).toHaveBeenCalledOnce();
+      }
+    }
+    const unvalidated = await toolCallStep.execute(
+      makeExecuteParams({
+        resumeData: { approved: true, editedArgs: { param: 'changed' } },
+        suspendData: makeSuspendData(),
+      }),
+    );
+    expect(unvalidated.error.message).toBe('Edited approval arguments require a tool input validator');
+    pendingApprovalMessage.content.metadata.pendingToolApprovals = initialPendingApprovals;
+    builtTool.validateInput = vi.fn().mockRejectedValue(new Error('native validation rejected'));
+    const rejected = await step.execute(
+      makeExecuteParams({
+        resumeData: { approved: true, editedArgs: { param: 'changed' } },
+        suspendData: makeSuspendData(),
+      }),
+    );
+    expect(rejected.error).toMatchObject({ message: 'native validation rejected' });
+    expect(pendingApprovalMessage.content.metadata.pendingToolApprovals).toBeUndefined();
+    expectNoToolExecution();
+    expect(execute).not.toHaveBeenCalled();
+    expect(suspend).not.toHaveBeenCalled();
+  });
+
   it('returns invalid input to the model before asking for approval', async () => {
     const validationError = {
       error: true,
@@ -1304,9 +1715,17 @@ describe('createToolCallStep tool approval workflow', () => {
     });
   });
 
-  it('should handle declined tool calls without executing the tool', async () => {
+  it('should preserve edited arguments when a later in-tool approval is declined', async () => {
     const inputData = makeInputData();
     const resumeData = { approved: false };
+    const approvedArgs = { param: 'edited' };
+    const suspendData = makeSuspendData('approval', 'tool-execution');
+    suspendData.toolCallResume = {
+      ...suspendData.toolCallResume,
+      identityDigest: createToolCallIdentityDigest({ ...inputData, args: approvedArgs }),
+      approvalInputIdentityDigest: createToolCallIdentityDigest(inputData),
+      approvedArgs,
+    };
     const beforeToolCall = vi.fn();
     const afterToolCall = vi.fn();
     const hookedTools = wrapToolsWithHooks(
@@ -1323,14 +1742,14 @@ describe('createToolCallStep tool approval workflow', () => {
       streamState,
     } as any);
 
-    const result = await hookedToolCallStep.execute(
-      makeExecuteParams({ inputData, resumeData, suspendData: makeSuspendData() }),
-    );
+    const result = await hookedToolCallStep.execute(makeExecuteParams({ inputData, resumeData, suspendData }));
 
-    // A declined approval returns the decision (not a `result` string) so it persists as
-    // `output-denied` with the approval object; the reason carries the existing message.
+    // The verified marker lets persistence replace the original invocation args with the
+    // edited args that were approved before the tool requested this later approval.
     expect(result).toEqual({
       ...inputData,
+      args: approvedArgs,
+      approvedArgs,
       approval: {
         id: inputData.toolCallId,
         approved: false,
@@ -2394,7 +2813,7 @@ describe('createToolCallStep tool approval workflow', () => {
     tools['test-tool'].requireApproval = false;
     tools['test-tool'].execute.mockResolvedValue(toolResult);
     const inputData = makeInputData();
-    const resumeData = { approved: false };
+    const resumeData = { approved: true, editedArgs: { text: 'generic suspension payload' } };
 
     const result = await toolCallStep.execute(
       makeExecuteParams({ inputData, resumeData, suspendData: makeSuspendData('suspension') }),
@@ -2782,6 +3201,82 @@ describe('createToolCallStep tool approval workflow', () => {
     const resumeSchema = JSON.parse(approvalChunk.payload.resumeSchema);
     expect(resumeSchema.properties.reason).toBeDefined();
     expect(resumeSchema.required).toEqual(['approved']);
+  });
+
+  it('advertises edited arguments only for validated object schemas', async () => {
+    const approvalSchemaFor = async (inputSchema: any, args: unknown) => {
+      const execute = vi.fn();
+      const builtTool = new CoreToolBuilder({
+        originalTool: {
+          id: 'test-tool',
+          description: 'Approval schema tool',
+          inputSchema,
+          execute,
+        } as any,
+        options: {
+          name: 'test-tool',
+          description: 'Approval schema tool',
+          requestContext: new RequestContext(),
+          logger: { debug: vi.fn(), warn: vi.fn(), error: vi.fn(), trackException: vi.fn() } as any,
+        },
+      }).build();
+      const step = createToolCallStep({
+        tools: { 'test-tool': builtTool },
+        messageList,
+        controller,
+        requireToolApproval: true,
+        runId: 'test-run',
+        streamState,
+      } as any);
+
+      controller.enqueue.mockClear();
+      suspend.mockResolvedValueOnce('suspended');
+      await step.execute(makeExecuteParams({ inputData: { ...makeInputData(), args } }));
+      const approvalChunk = controller.enqueue.mock.calls
+        .map(([chunk]: [any]) => chunk)
+        .find((chunk: any) => chunk?.type === 'tool-call-approval');
+      expect(approvalChunk).toBeDefined();
+      return { resumeSchema: JSON.parse(approvalChunk.payload.resumeSchema), builtTool, execute };
+    };
+
+    const { resumeSchema: primitiveSchema } = await approvalSchemaFor(z.string(), 'review me');
+    expect(primitiveSchema.properties).not.toHaveProperty('editedArgs');
+
+    const { resumeSchema: optionalObjectSchema } = await approvalSchemaFor(
+      z.object({ note: z.string().optional() }),
+      null,
+    );
+    expect(optionalObjectSchema.properties.editedArgs).toBeDefined();
+
+    const { resumeSchema: unvalidatedJsonSchema } = await approvalSchemaFor(
+      { type: 'object', properties: { note: { type: 'string' } } },
+      { note: 'review me' },
+    );
+    expect(unvalidatedJsonSchema.properties).not.toHaveProperty('editedArgs');
+
+    const { resumeSchema: passThroughAiSdkSchema } = await approvalSchemaFor(
+      toStandardSchema(jsonSchema({ type: 'object', properties: { note: { type: 'string' } } })),
+      { note: 'review me' },
+    );
+    expect(passThroughAiSdkSchema.properties).not.toHaveProperty('editedArgs');
+
+    const validate = vi.fn((value: unknown) =>
+      typeof (value as { note?: unknown })?.note === 'string'
+        ? { success: true as const, value: { note: (value as { note: string }).note.trim() } }
+        : { success: false as const, error: new Error('note must be a string') },
+    );
+    const validatedAiSdk = await approvalSchemaFor(
+      jsonSchema({ type: 'object', properties: { note: { type: 'string' } } }, { validate }),
+      { note: 'review me' },
+    );
+    expect(validatedAiSdk.resumeSchema.properties.editedArgs).toBeDefined();
+    const validation = await (validatedAiSdk.builtTool as any).validateInput({ note: 42 });
+    expect(validation.error).toBeTruthy();
+    const executionResult = await validatedAiSdk.builtTool.execute?.({ note: 42 } as any, {} as any);
+    expect(executionResult).toMatchObject({ error: true });
+    expect(validatedAiSdk.execute).not.toHaveBeenCalled();
+    await validatedAiSdk.builtTool.execute?.({ note: '  reviewed  ' } as any, {} as any);
+    expect(validatedAiSdk.execute).toHaveBeenCalledWith({ note: 'reviewed' }, expect.any(Object));
   });
 
   it('declines without a live requireToolApproval policy when suspendData marks approval (#20470)', async () => {

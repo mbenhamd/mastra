@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Mock } from 'vitest';
 import { z } from 'zod/v4';
-import type { MessageList } from '../../../agent/message-list';
+import { MessageList } from '../../../agent/message-list';
 import { RequestContext } from '../../../request-context';
 import { DefaultStepResult } from '../../../stream/aisdk/v5/output-helpers';
 import { ToolStream } from '../../../tools/stream';
@@ -26,6 +26,7 @@ type ToolCallOutput = {
   providerMetadata?: Record<string, any>;
   providerExecuted?: boolean;
   resumeTargetToolCallId?: string;
+  approvedArgs?: Record<string, any>;
   approval?: { id: string; approved: boolean; reason?: string };
 };
 
@@ -290,7 +291,7 @@ describe('createLLMMappingStep HITL behavior', () => {
     expect(result.stepResult.isContinued).toBe(false);
   });
 
-  it('should enqueue tool-output-denied when a requireApproval tool is declined (#20880)', async () => {
+  it('should persist output-denied and enqueue the compatible tool result when approval is declined (#20880)', async () => {
     const inputData: ToolCallOutput[] = [
       {
         toolCallId: 'call-denied',
@@ -320,11 +321,11 @@ describe('createLLMMappingStep HITL behavior', () => {
     );
     expect(controller.enqueue).toHaveBeenCalledWith(
       expect.objectContaining({
-        type: 'tool-output-denied',
+        type: 'tool-result',
         payload: expect.objectContaining({
           toolCallId: 'call-denied',
           toolName: 'sensitive-op',
-          approval: expect.objectContaining({ approved: false }),
+          result: 'Tool call was not approved by the user',
         }),
       }),
     );
@@ -994,13 +995,31 @@ describe('createLLMMappingStep tool execution error self-recovery (issue #9815)'
     const toModelOutput = vi.fn(() => {
       throw new Error('must not map a denial as tool output');
     });
+    const displayInputTransform = vi.fn(() => ({ token: '[redacted]' }));
+    const displayOutputTransform = vi.fn(() => ({ result: '[redacted]' }));
+    const transcriptInputTransform = vi.fn(() => ({ token: '[redacted]' }));
+    messageList = new MessageList({ threadId: 'test-thread', resourceId: 'test-resource' });
+    const updateToolInvocation = vi.spyOn(messageList, 'updateToolInvocation');
     llmMappingStep = createLLMMappingStep(
       {
         models: {} as any,
         controller,
         messageList,
         runId: 'test-run',
-        tools: { sensitiveTool: { toModelOutput } },
+        tools: {
+          sensitiveTool: {
+            toModelOutput,
+            transform: {
+              display: {
+                input: displayInputTransform,
+                output: displayOutputTransform,
+              },
+              transcript: {
+                input: transcriptInputTransform,
+              },
+            },
+          },
+        },
         _internal: { generateId: () => 'test-message-id' },
       } as any,
       llmExecutionStep,
@@ -1010,23 +1029,29 @@ describe('createLLMMappingStep tool execution error self-recovery (issue #9815)'
         toolCallId: 'provider-resume-call',
         resumeTargetToolCallId: 'original-pending-call',
         toolName: 'sensitiveTool',
-        args: { operation: 'delete' },
+        args: { token: 'PRIVATE-ORIGINAL-TOKEN' },
+        approvedArgs: { token: 'PRIVATE-APPROVED-TOKEN' },
         approval: { id: 'approval-original', approved: false, reason: 'Not safe' },
       },
     ];
 
     await llmMappingStep.execute(createExecuteParams(inputData));
 
-    expect(messageList.updateToolInvocation).toHaveBeenCalledWith(
+    expect(updateToolInvocation).toHaveBeenNthCalledWith(
+      1,
       expect.objectContaining({
         toolInvocation: expect.objectContaining({
           state: 'output-denied',
           toolCallId: 'original-pending-call',
+          args: { token: 'PRIVATE-APPROVED-TOKEN' },
           approval: { id: 'approval-original', approved: false, reason: 'Not safe' },
         }),
       }),
+      undefined,
+      { replaceArgs: true },
     );
-    expect(messageList.updateToolInvocation).toHaveBeenCalledWith(
+    expect(updateToolInvocation).toHaveBeenNthCalledWith(
+      2,
       expect.objectContaining({
         toolInvocation: expect.objectContaining({
           state: 'result',
@@ -1035,76 +1060,166 @@ describe('createLLMMappingStep tool execution error self-recovery (issue #9815)'
         }),
       }),
     );
-    expect(messageList.add).toHaveBeenCalledWith(
-      expect.objectContaining({
-        content: expect.objectContaining({
-          parts: [
-            expect.objectContaining({
-              toolInvocation: expect.objectContaining({
-                state: 'output-denied',
-                toolCallId: 'original-pending-call',
-                approval: { id: 'approval-original', approved: false, reason: 'Not safe' },
-              }),
-            }),
-          ],
+
+    const liveToolParts = messageList.get.all
+      .db()
+      .flatMap(message => message.content.parts ?? [])
+      .filter(part => part.type === 'tool-invocation');
+    expect(liveToolParts).toHaveLength(2);
+    expect(liveToolParts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          toolInvocation: expect.objectContaining({
+            state: 'output-denied',
+            toolCallId: 'original-pending-call',
+            args: { token: 'PRIVATE-APPROVED-TOKEN' },
+          }),
         }),
-      }),
-      'response',
-    );
-    expect(messageList.add).toHaveBeenCalledWith(
-      expect.objectContaining({
-        content: expect.objectContaining({
-          parts: [
-            expect.objectContaining({
-              toolInvocation: expect.objectContaining({
-                state: 'result',
-                toolCallId: 'provider-resume-call',
-                result: 'Not safe',
-              }),
-            }),
-          ],
+        expect.objectContaining({
+          toolInvocation: expect.objectContaining({
+            state: 'result',
+            toolCallId: 'provider-resume-call',
+            args: { token: 'PRIVATE-ORIGINAL-TOKEN' },
+            result: 'Not safe',
+          }),
         }),
-      }),
-      'response',
+      ]),
     );
-    expect(messageList.add).toHaveBeenCalledTimes(2);
+
+    const serializedToolParts = messageList
+      .drainUnsavedMessages()
+      .flatMap(message => message.content.parts ?? [])
+      .filter(part => part.type === 'tool-invocation');
+    expect(serializedToolParts).toHaveLength(2);
+    expect(serializedToolParts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          toolInvocation: expect.objectContaining({
+            state: 'output-denied',
+            toolCallId: 'original-pending-call',
+            args: { token: '[redacted]' },
+          }),
+        }),
+        expect.objectContaining({
+          toolInvocation: expect.objectContaining({
+            state: 'result',
+            toolCallId: 'provider-resume-call',
+            args: { token: '[redacted]' },
+            result: 'Not safe',
+          }),
+        }),
+      ]),
+    );
     expect(controller.enqueue).toHaveBeenCalledTimes(1);
-    expect(controller.enqueue).toHaveBeenCalledWith(
+    const publicToolResultChunk = controller.enqueue.mock.calls[0]?.[0];
+    expect(publicToolResultChunk).toMatchObject({
+      type: 'tool-result',
+      payload: {
+        args: { token: 'PRIVATE-ORIGINAL-TOKEN' },
+        toolCallId: 'provider-resume-call',
+        result: 'Not safe',
+      },
+      metadata: {
+        mastra: {
+          toolPayloadTransform: {
+            display: {
+              'input-available': { transformed: { token: '[redacted]' } },
+            },
+          },
+        },
+      },
+    });
+    expect(displayInputTransform).toHaveBeenCalledWith(
       expect.objectContaining({
-        type: 'tool-result',
-        payload: expect.objectContaining({ toolCallId: 'provider-resume-call', result: 'Not safe' }),
+        phase: 'input-available',
+        input: { token: 'PRIVATE-ORIGINAL-TOKEN' },
       }),
     );
+    expect(transcriptInputTransform).toHaveBeenCalledWith(
+      expect.objectContaining({
+        phase: 'input-available',
+        input: { token: 'PRIVATE-ORIGINAL-TOKEN' },
+      }),
+    );
+    expect(displayOutputTransform).not.toHaveBeenCalled();
     expect(toModelOutput).not.toHaveBeenCalled();
   });
 
   it('should persist an approved model resume on both the original and synthetic calls', async () => {
-    (messageList.updateToolInvocation as Mock).mockReturnValue(true);
+    messageList = new MessageList({ threadId: 'test-thread', resourceId: 'test-resource' });
+    messageList.add(
+      {
+        id: 'original-message',
+        role: 'assistant',
+        createdAt: new Date(),
+        content: {
+          format: 2,
+          parts: [
+            {
+              type: 'tool-invocation',
+              toolInvocation: {
+                state: 'call',
+                toolCallId: 'original-pending-call',
+                toolName: 'sensitiveTool',
+                args: { operation: 'delete' },
+              },
+            },
+          ],
+        },
+      },
+      'response',
+    );
+    const updateToolInvocation = vi.spyOn(messageList, 'updateToolInvocation');
+    llmMappingStep = createLLMMappingStep(
+      {
+        models: {} as any,
+        controller,
+        messageList,
+        runId: 'test-run',
+        _internal: {
+          generateId: () => 'test-message-id',
+        },
+      } as any,
+      llmExecutionStep,
+    );
     const inputData: ToolCallOutput[] = [
       {
         toolCallId: 'provider-resume-call',
         resumeTargetToolCallId: 'original-pending-call',
         toolName: 'sensitiveTool',
         args: { operation: 'delete' },
+        approvedArgs: { operation: 'archive' },
         result: { deleted: true },
         approval: { id: 'original-pending-call', approved: true, reason: 'Reviewed' },
+        providerMetadata: {
+          mastra: {
+            toolPayloadTransform: {
+              transcript: {
+                'input-available': { transformed: { operation: 'redacted' } },
+              },
+            },
+          },
+        },
       },
     ];
 
     await llmMappingStep.execute(createExecuteParams(inputData));
 
-    expect(messageList.updateToolInvocation).toHaveBeenNthCalledWith(
+    expect(updateToolInvocation).toHaveBeenNthCalledWith(
       1,
       expect.objectContaining({
         toolInvocation: expect.objectContaining({
           state: 'result',
           toolCallId: 'original-pending-call',
+          args: { operation: 'archive' },
           result: { deleted: true },
           approval: { id: 'original-pending-call', approved: true, reason: 'Reviewed' },
         }),
       }),
+      undefined,
+      { replaceArgs: true },
     );
-    expect(messageList.updateToolInvocation).toHaveBeenNthCalledWith(
+    expect(updateToolInvocation).toHaveBeenNthCalledWith(
       2,
       expect.objectContaining({
         toolInvocation: expect.objectContaining({
@@ -1114,7 +1229,31 @@ describe('createLLMMappingStep tool execution error self-recovery (issue #9815)'
         }),
       }),
     );
-    expect((messageList.updateToolInvocation as Mock).mock.calls[1]?.[0].toolInvocation).not.toHaveProperty('approval');
+    expect(updateToolInvocation.mock.calls[1]?.[0].toolInvocation).not.toHaveProperty('approval');
+
+    const liveToolPart = messageList.get.all
+      .db()
+      .flatMap(message => message.content.parts ?? [])
+      .find(part => part.type === 'tool-invocation' && part.toolInvocation?.toolCallId === 'original-pending-call');
+    expect(liveToolPart).toMatchObject({
+      type: 'tool-invocation',
+      toolInvocation: {
+        state: 'result',
+        args: { operation: 'archive' },
+      },
+    });
+
+    const serializedToolPart = messageList
+      .drainUnsavedMessages()
+      .flatMap(message => message.content.parts ?? [])
+      .find(part => part.type === 'tool-invocation' && part.toolInvocation?.toolCallId === 'original-pending-call');
+    expect(serializedToolPart).toMatchObject({
+      type: 'tool-invocation',
+      toolInvocation: {
+        state: 'result',
+        args: { operation: 'redacted' },
+      },
+    });
     expect(controller.enqueue).toHaveBeenCalledWith(
       expect.objectContaining({
         type: 'tool-result',
@@ -1190,7 +1329,7 @@ describe('createLLMMappingStep tool execution error self-recovery (issue #9815)'
     expect(messageList.updateToolInvocation).toHaveBeenCalledWith(
       expect.objectContaining({
         toolInvocation: expect.objectContaining({
-          state: 'result',
+          state: 'output-error',
           toolCallId: 'call-approved',
           approval,
         }),

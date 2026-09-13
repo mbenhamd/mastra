@@ -935,6 +935,16 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
         };
       }
 
+      if (isApprovalResume && approvalDecision?.editedArgs !== undefined) {
+        return {
+          ...typedInput,
+          error: {
+            name: 'DurableResumeValidationError',
+            message: 'Edited approval arguments are not supported by durable agents',
+          },
+        };
+      }
+
       const resumeTarget = metadataToolCallId !== toolCallId ? { resumeTargetToolCallId: metadataToolCallId } : {};
 
       if (hasValidApprovalDecision && approvalDecision.approved === false) {
@@ -1096,7 +1106,7 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
       // immediately before side effects; transformed preflight data is not
       // reused because schema transforms need not be idempotent.
       if (requiresApproval && !isAuthenticatedResume && typeof tool.validateInput === 'function') {
-        const preflightValidation = tool.validateInput(args);
+        const preflightValidation = await tool.validateInput(args);
         if (preflightValidation.error !== undefined) {
           return {
             ...typedInput,

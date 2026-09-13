@@ -222,6 +222,7 @@ type HarnessLike = {
       toolCallId: string;
       pendingRequestedAt: number;
       approved: boolean;
+      editedArgs?: Record<string, unknown>;
       reason?: string;
       approvalScope?: 'once' | 'always';
     }): Promise<InboxResponseResult>;
@@ -2834,6 +2835,7 @@ export const RESPOND_HARNESS_INBOX_ROUTE = createRoute({
         toolCallId: string;
         pendingRequestedAt: number;
         approved?: boolean;
+        editedArgs?: Record<string, unknown>;
         reason?: string;
         approvalScope?: 'once' | 'always';
         resumeData?: unknown;
@@ -2853,6 +2855,7 @@ export const RESPOND_HARNESS_INBOX_ROUTE = createRoute({
             toolCallId: body.toolCallId,
             pendingRequestedAt: body.pendingRequestedAt,
             approved: body.approved!,
+            ...(body.editedArgs !== undefined ? { editedArgs: body.editedArgs } : {}),
             ...(body.reason !== undefined ? { reason: body.reason } : {}),
             ...(body.approvalScope !== undefined ? { approvalScope: body.approvalScope } : {}),
           });

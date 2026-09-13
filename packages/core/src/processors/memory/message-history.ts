@@ -1,5 +1,5 @@
 import type { OutputResult, Processor, ProcessorSpanPhase } from '..';
-import type { MastraDBMessage, MessageList } from '../../agent';
+import { MessageList, type MastraDBMessage } from '../../agent/message-list';
 import { isTransientSignalMessage } from '../../agent/signals';
 import { materializeTerminalToolResult } from '../../loop/shared/terminal-tool-result';
 import { parseMemoryRequestContext } from '../../memory';
@@ -324,21 +324,22 @@ export class MessageHistory implements Processor {
       })
       .filter((m): m is NonNullable<typeof m> => Boolean(m));
 
-    if (this.persistence?.mode === 'final-turn') {
-      return this.projectFinalTurnForPersistence(filteredMessages, this.persistence);
-    }
+    const persistedMessages =
+      this.persistence?.mode === 'final-turn'
+        ? this.projectFinalTurnForPersistence(filteredMessages, this.persistence)
+        : this.toolCallFilter === undefined
+          ? filteredMessages
+          : filterToolCallMessages(
+              filteredMessages,
+              {
+                ...this.toolCallFilter,
+                maxModelOutputBytes: this.toolCallFilter.maxModelOutputBytes ?? DEFAULT_PERSISTED_MODEL_OUTPUT_BYTES,
+              },
+              new Set(),
+              { stripMessageProviderMetadata: true },
+            );
 
-    return this.toolCallFilter === undefined
-      ? filteredMessages
-      : filterToolCallMessages(
-          filteredMessages,
-          {
-            ...this.toolCallFilter,
-            maxModelOutputBytes: this.toolCallFilter.maxModelOutputBytes ?? DEFAULT_PERSISTED_MODEL_OUTPUT_BYTES,
-          },
-          new Set(),
-          { stripMessageProviderMetadata: true },
-        );
+    return persistedMessages.map(MessageList.transformMessageForTranscript);
   }
 
   private projectFinalTurnForPersistence(

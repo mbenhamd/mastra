@@ -131,6 +131,10 @@ export function createStreamStep<OUTPUT = undefined>({
           skipBgTaskWait,
           drainPendingSignals,
           initialSignalEchoes: loopOptions.initialSignalEchoes,
+          editedApprovalResumeLoader:
+            typeof capabilities.agent.__getAgenticLoopEditedApprovalResume === 'function'
+              ? capabilities.agent.__getAgenticLoopEditedApprovalResume.bind(capabilities.agent)
+              : undefined,
         },
         agentId,
         agentVersionId,

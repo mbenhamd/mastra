@@ -13961,6 +13961,11 @@ export type PostHarnessNameSessionsSessionIdInboxItemId_Body =
   | {
       kind: 'tool-approval';
       approved: boolean;
+      editedArgs?:
+        | {
+            [key: string]: Shared_Auxiliary_875;
+          }
+        | undefined;
       reason?: string | undefined;
       approvalScope?: ('once' | 'always') | undefined;
       responseId: string;

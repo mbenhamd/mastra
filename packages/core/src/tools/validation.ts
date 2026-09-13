@@ -83,6 +83,22 @@ function safeValidate<T>(
   return result as { value: T } | { issues: readonly StandardSchemaIssue[] };
 }
 
+async function safeValidateAsync<T>(
+  schema: StandardSchemaWithJSON<T>,
+  data: unknown,
+): Promise<{ value: T } | { issues: readonly StandardSchemaIssue[] }> {
+  let result;
+  try {
+    result = await schema['~standard'].validate(data);
+  } catch {
+    throw new ToolSchemaValidationError();
+  }
+  if ('issues' in result && Array.isArray(result.issues) && result.issues.length > 0) {
+    return { issues: result.issues as readonly StandardSchemaIssue[] };
+  }
+  return result as { value: T } | { issues: readonly StandardSchemaIssue[] };
+}
+
 /**
  * Formatted validation errors structure.
  * Contains `errors` array for messages at this level, and `fields` for nested field errors.
@@ -520,6 +536,82 @@ export function validateToolInput<T = unknown>(
   toolId?: string,
 ): { data: T; error?: undefined } | { data?: undefined; error: ValidationError<T> } {
   return runSchemaValidationBoundary(() => validateToolInputUnsafe(schema, input, toolId));
+}
+
+/**
+ * Validates tool input with the same normalization as `validateToolInput`, while
+ * also supporting Standard Schema validators that return promises.
+ */
+export async function validateToolInputAsync<T = unknown>(
+  schema: StandardSchemaWithJSON<T> | undefined,
+  input: unknown,
+  toolId?: string,
+): Promise<{ data: T; error?: undefined } | { data?: undefined; error: ValidationError<T> }> {
+  try {
+    if (!schema || !('~standard' in schema)) return { data: input as T };
+    schema = toStandardSchema(schema);
+
+    let normalizedInput = normalizeNullishInput(schema, input);
+    normalizedInput = convertUndefinedToNull(normalizedInput);
+    const validation = await safeValidateAsync(schema, normalizedInput);
+    if ('value' in validation) return { data: validation.value };
+
+    const coercedInput = coerceStringifiedJsonValues(schema, normalizedInput);
+    if (coercedInput !== normalizedInput) {
+      const coercedValidation = await safeValidateAsync(schema, coercedInput);
+      if ('value' in coercedValidation) return { data: coercedValidation.value };
+    }
+
+    const failingNullPaths = new Set(
+      validation.issues
+        .filter(issue => {
+          if (!issue.path || issue.path.length === 0) return false;
+          const value = getValueAtPath(normalizedInput, issue.path);
+          return value === null || value === undefined;
+        })
+        .map(issue => issue.path?.map(p => (typeof p === 'object' && 'key' in p ? String(p.key) : String(p))).join('.'))
+        .filter((path): path is string => Boolean(path)),
+    );
+    const strippedInput =
+      failingNullPaths.size > 0 ? stripNullishValuesAtPaths(input, failingNullPaths) : stripNullishValues(input);
+    const normalizedStripped = normalizeNullishInput(schema, strippedInput);
+    const retryValidation = await safeValidateAsync(schema, normalizedStripped);
+    if ('value' in retryValidation) return { data: retryValidation.value };
+
+    const promptJsonSchema = standardSchemaToJSONSchema(schema, { io: 'input' });
+    const schemaExpectsPrompt =
+      promptJsonSchema.type === 'object' &&
+      promptJsonSchema.properties != null &&
+      'prompt' in promptJsonSchema.properties;
+    if (
+      schemaExpectsPrompt &&
+      normalizedInput != null &&
+      typeof normalizedInput === 'object' &&
+      !Array.isArray(normalizedInput)
+    ) {
+      const obj = normalizedInput as Record<string, unknown>;
+      if (obj.prompt == null) {
+        const alias = [obj.query, obj.message, obj.input].find((value): value is string => typeof value === 'string');
+        if (alias !== undefined) {
+          const promptValidation = await safeValidateAsync(schema, { ...obj, prompt: alias });
+          if ('value' in promptValidation) return { data: promptValidation.value };
+        }
+      }
+    }
+
+    const errorMessages = validation.issues
+      .map(issue => `- ${issue.path?.map(path => getPathKey(path)).join('.') || 'root'}: ${issue.message}`)
+      .join('\n');
+    return {
+      error: markToolValidationError<T>({
+        error: true,
+        message: `Tool input validation failed${toolId ? ` for ${toolId}` : ''}. Please fix the following errors and try again:\n${errorMessages}\n\nProvided arguments: ${truncateForLogging(input)}`,
+        validationErrors: buildFormattedErrors<T>(validation.issues),
+      }),
+    };
+  } catch {
+    throw new ToolSchemaValidationError();
+  }
 }
 
 function validateToolInputUnsafe<T = unknown>(

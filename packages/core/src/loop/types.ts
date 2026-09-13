@@ -89,6 +89,30 @@ export type GoalLoopConfig = GoalConfig;
 export type ReasoningLevel = NonNullable<LanguageModelV4CallOptions['reasoning']>;
 
 /**
+ * Private recovery callback for an edited approval that was redacted from the
+ * recalled transcript. The callback is populated by the owning Agent and
+ * reads only its agentic-loop snapshot after the tool-call step has proved
+ * that a real suspension resume needs the missing fields.
+ */
+export type AgenticLoopEditedApprovalResumeLoader = (request: {
+  runId: string;
+  originRunId: string;
+  toolCallId: string;
+  toolName: string;
+  identityDigest: string;
+  requestContext?: RequestContext;
+  threadId?: string;
+  resourceId?: string;
+  actor?: ActorSignal;
+}) => Promise<
+  | {
+      approvedArgs: Record<string, unknown>;
+      approvalInputIdentityDigest: string;
+    }
+  | undefined
+>;
+
+/**
  * Bootstrap bag for run-scoped runtime state passed into `loop()`.
  *
  * Historically every agentic-execution and agentic-loop step closed over this
@@ -160,6 +184,12 @@ export type StreamInternal = {
   // stream data-part echoes before the first model step.
   /** @deprecated Use `runScope.get(INITIAL_SIGNAL_ECHOES_KEY)` from `loop/run-scope-keys`. */
   initialSignalEchoes?: CreatedAgentSignal[];
+  /**
+   * Loads private edited-approval arguments for a cold auto-resume when the
+   * recalled transcript intentionally omitted them.
+   * @internal
+   */
+  editedApprovalResumeLoader?: AgenticLoopEditedApprovalResumeLoader;
 };
 
 export type PrepareStepResult<TOOLS extends ToolSet = ToolSet> = {

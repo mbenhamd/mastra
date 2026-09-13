@@ -148,13 +148,15 @@ describe('buildAutoResumeSystemMessageSuffix', () => {
     expect(suffix).not.toContain('chargeCard');
   });
 
-  it('omits parentRunId from the serialized suspended tools', () => {
+  it('omits private execution metadata from the serialized suspended tools', () => {
     const suffix = buildAutoResumeSystemMessageSuffix([
       {
         toolName: 'fooTool',
         runId: 'sub-run',
         parentRunId: 'parent-run',
         toolCallId: 'call-1',
+        approvedArgs: { secret: 'private-approved-input' },
+        approvalInputIdentityDigest: 'private-input-digest',
       },
     ]);
     expect(suffix).not.toBeNull();
@@ -162,6 +164,10 @@ describe('buildAutoResumeSystemMessageSuffix', () => {
     expect(suffix!).toContain('"toolName":"fooTool"');
     expect(suffix!).not.toContain('parentRunId');
     expect(suffix!).not.toContain('parent-run');
+    expect(suffix!).not.toContain('approvedArgs');
+    expect(suffix!).not.toContain('private-approved-input');
+    expect(suffix!).not.toContain('approvalInputIdentityDigest');
+    expect(suffix!).not.toContain('private-input-digest');
   });
 });
 

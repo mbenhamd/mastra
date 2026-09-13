@@ -46,6 +46,8 @@ import {
   AgentThreadSignalAdmissionError,
   isAgentThreadOutputDrainTeardownError,
 } from '../../agent/thread-stream-runtime';
+import { parseToolApprovalDecision } from '../../agent/tool-call-identity';
+import type { ToolApprovalDecision } from '../../agent/tool-call-identity';
 import { TOOL_PERMISSION_POLICY_KEY, TOOL_PERMISSION_POLICY_STABLE_KEY } from '../../agent/tool-permission-prefilter';
 import {
   captureSuspendedToolSurfaceFenceLease,
@@ -12159,23 +12161,30 @@ export class Session {
   // -------------------------------------------------------------------------
 
   /** Resume a pending tool-approval. `approved: false` rejects the call. */
+  async respondToToolApproval(opts: ToolApprovalDecision & InboxReceiptResponseOptions): Promise<InboxResponseResult>;
+  async respondToToolApproval(opts: ToolApprovalDecision & LegacyInboxResponseOptions): Promise<AgentResult>;
   async respondToToolApproval(
-    opts: { approved: boolean; reason?: string } & InboxReceiptResponseOptions,
-  ): Promise<InboxResponseResult>;
-  async respondToToolApproval(
-    opts: { approved: boolean; reason?: string } & LegacyInboxResponseOptions,
-  ): Promise<AgentResult>;
-  async respondToToolApproval(
-    opts: { approved: boolean; reason?: string } & InboxResponseOptions,
+    opts: ToolApprovalDecision & InboxResponseOptions,
   ): Promise<AgentResult | InboxResponseResult>;
   async respondToToolApproval(
-    opts: { approved: boolean; reason?: string } & InboxResponseOptions,
+    opts: ToolApprovalDecision & InboxResponseOptions,
   ): Promise<AgentResult | InboxResponseResult> {
+    const approvalDecision =
+      opts.editedArgs !== undefined
+        ? parseToolApprovalDecision({ approved: opts.approved, editedArgs: opts.editedArgs })
+        : undefined;
+    if (opts.editedArgs !== undefined && !approvalDecision) {
+      throw new HarnessValidationError(
+        'respond[tool-approval].editedArgs',
+        'editedArgs requires an approved decision and a JSON object',
+      );
+    }
     return this._resume(
       'tool-approval',
       compactJsonObject({
         approved: opts.approved,
         reason: opts.reason,
+        editedArgs: approvalDecision?.editedArgs,
       }),
       opts,
     );

@@ -1,5 +1,7 @@
+import { jsonSchema as aiSdkJsonSchema } from '@internal/ai-v6';
 import { AnthropicSchemaCompatLayer, isStandardSchemaWithJSON } from '@mastra/schema-compat';
 import { describe, expect, it, vi } from 'vitest';
+import { z as z3 } from 'zod/v3';
 import { z } from 'zod/v4';
 import { RequestContext } from '../../request-context';
 import type { StandardSchemaWithJSON } from '../../schema';
@@ -31,6 +33,157 @@ function buildCoreTool(
 }
 
 describe('CoreToolBuilder - Schema Compatibility in Validation', () => {
+  it('does not enable edited approvals for an AI SDK JSON schema without a validator after resume augmentation', async () => {
+    const execute = vi.fn(async (input: { note: string }) => input);
+    const tool = createTool({
+      id: 'raw-json-schema-tool',
+      description: 'Raw JSON schema tool',
+      inputSchema: aiSdkJsonSchema<{ note: string }>({
+        type: 'object',
+        properties: { note: { type: 'string' } },
+        required: ['note'],
+        additionalProperties: false,
+      }),
+      execute,
+    });
+
+    const build = () =>
+      new CoreToolBuilder({
+        originalTool: tool,
+        options: { name: 'raw-json-schema-tool', requestContext: new RequestContext(), requireApproval: true },
+        autoResumeSuspendedTools: true,
+      }).build();
+
+    const firstBuilt = build();
+    const secondBuilt = build();
+
+    expect(firstBuilt.approvalInputEditing).toBeUndefined();
+    expect(secondBuilt.approvalInputEditing).toBeUndefined();
+
+    await expect(
+      firstBuilt.execute?.(
+        { note: 'ok' },
+        { abortSignal: new AbortController().signal, toolCallId: 'raw-json-schema-valid', messages: [] },
+      ),
+    ).resolves.toEqual({ note: 'ok' });
+    await expect(
+      firstBuilt.execute?.(
+        {},
+        { abortSignal: new AbortController().signal, toolCallId: 'raw-json-schema-missing', messages: [] },
+      ),
+    ).resolves.toMatchObject({ error: true });
+    await expect(
+      secondBuilt.execute?.(
+        { note: 42 },
+        { abortSignal: new AbortController().signal, toolCallId: 'raw-json-schema-wrong-type', messages: [] },
+      ),
+    ).resolves.toMatchObject({ error: true });
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves async AI SDK validation through resume augmentation', async () => {
+    const execute = vi.fn(async (input: { note: string }) => input);
+    const inputSchema = aiSdkJsonSchema<{ note: string }>(
+      {
+        type: 'object',
+        properties: { note: { type: 'string' } },
+        required: ['note'],
+        additionalProperties: false,
+      },
+      {
+        validate: (async (value: unknown) => {
+          const note = (value as { note?: unknown })?.note;
+          if (typeof note !== 'string' || note === 'reject') {
+            return { success: false, error: new Error('Rejected note') };
+          }
+          return { success: true, value: { note: note.trim().toUpperCase() } };
+        }) as any,
+      },
+    );
+    const tool: ToolAction<any, any> = {
+      id: 'raw-async-validator-tool',
+      description: 'Raw AI SDK schema with async validation',
+      inputSchema,
+    };
+
+    const builder = new CoreToolBuilder({
+      originalTool: tool,
+      options: { name: 'raw-async-validator-tool', requestContext: new RequestContext() },
+      autoResumeSuspendedTools: true,
+    });
+    tool.execute = execute;
+    const built = builder.build();
+
+    await expect(
+      built.execute?.(
+        { note: ' accepted ' },
+        { abortSignal: new AbortController().signal, toolCallId: 'async-native-valid', messages: [] },
+      ),
+    ).resolves.toEqual({ note: 'ACCEPTED' });
+    await expect(
+      built.execute?.(
+        { note: 'reject' },
+        { abortSignal: new AbortController().signal, toolCallId: 'async-native-invalid', messages: [] },
+      ),
+    ).resolves.toMatchObject({ error: true });
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(execute).toHaveBeenCalledWith({ note: 'ACCEPTED' }, expect.any(Object));
+  });
+
+  it('preserves raw Zod v3 transforms and refinements through resume augmentation', async () => {
+    const execute = vi.fn(async (input: { note: string }) => input);
+    const inputSchema = z3
+      .object({ note: z3.string().transform(value => value.trim().toUpperCase()) })
+      .refine(value => value.note !== 'REJECT', 'Rejected note');
+    const tool: ToolAction<any, any> = {
+      id: 'raw-zod-v3-validator-tool',
+      description: 'Raw Zod v3 schema with transform and refinement',
+      inputSchema,
+    };
+
+    const createBuilder = () =>
+      new CoreToolBuilder({
+        originalTool: tool,
+        options: { name: 'raw-zod-v3-validator-tool', requestContext: new RequestContext() },
+        autoResumeSuspendedTools: true,
+      });
+    const firstBuilder = createBuilder();
+    tool.execute = execute;
+    const firstBuilt = firstBuilder.build();
+    tool.execute = undefined;
+    const secondBuilder = createBuilder();
+    tool.execute = execute;
+    const secondBuilt = secondBuilder.build();
+
+    await expect(
+      firstBuilt.execute?.(
+        { note: ' accepted ' },
+        { abortSignal: new AbortController().signal, toolCallId: 'zod-v3-valid', messages: [] },
+      ),
+    ).resolves.toEqual({ note: 'ACCEPTED' });
+    await expect(
+      firstBuilt.execute?.(
+        { note: ' reject ' },
+        { abortSignal: new AbortController().signal, toolCallId: 'zod-v3-invalid', messages: [] },
+      ),
+    ).resolves.toMatchObject({ error: true });
+    await expect(
+      secondBuilt.execute?.(
+        { note: ' accepted ' },
+        { abortSignal: new AbortController().signal, toolCallId: 'zod-v3-repeat-valid', messages: [] },
+      ),
+    ).resolves.toEqual({ note: 'ACCEPTED' });
+    await expect(
+      secondBuilt.execute?.(
+        { note: ' reject ' },
+        { abortSignal: new AbortController().signal, toolCallId: 'zod-v3-repeat-invalid', messages: [] },
+      ),
+    ).resolves.toMatchObject({ error: true });
+    expect(execute).toHaveBeenCalledTimes(2);
+    expect(execute).toHaveBeenNthCalledWith(1, { note: 'ACCEPTED' }, expect.any(Object));
+    expect(execute).toHaveBeenNthCalledWith(2, { note: 'ACCEPTED' }, expect.any(Object));
+  });
+
   it('preserves async validation results in the native tool input schema', async () => {
     const inputSchema: StandardSchemaWithJSON = {
       '~standard': {
@@ -57,11 +210,12 @@ describe('CoreToolBuilder - Schema Compatibility in Validation', () => {
   });
 
   it('preserves asynchronous validation through the native v6 schema wrapper', async () => {
+    const execute = vi.fn(async (input: { token: string }) => input);
     const tool = {
       id: 'async-validation-tool',
       description: 'Tool with an asynchronous Zod 4 refinement',
       inputSchema: z.object({ token: z.string() }).refine(async input => input.token === 'accepted'),
-      execute: async (input: { token: string }) => input,
+      execute,
     } as ToolAction<any, any>;
     const built = buildCoreTool(tool, 'async-validation-tool', {
       provider: 'test-provider',
@@ -76,6 +230,17 @@ describe('CoreToolBuilder - Schema Compatibility in Validation', () => {
       value: { token: 'accepted' },
     });
     await expect(nativeValidation({ token: 'rejected' })).resolves.toMatchObject({ success: false });
+    await expect(built.validateInput?.({ token: 'accepted' })).resolves.toMatchObject({
+      data: { token: 'accepted' },
+    });
+    await expect(built.validateInput?.({ token: 'rejected' })).resolves.toMatchObject({ error: { error: true } });
+    await expect(
+      built.execute?.(
+        { token: 'accepted' },
+        { abortSignal: new AbortController().signal, toolCallId: 'async-call', messages: [] },
+      ),
+    ).resolves.toEqual({ token: 'accepted' });
+    expect(execute).toHaveBeenCalledWith({ token: 'accepted' }, expect.any(Object));
   });
 
   it('createTool execute path skips author-schema re-validation after CoreToolBuilder compat validation', async () => {
@@ -90,6 +255,9 @@ describe('CoreToolBuilder - Schema Compatibility in Validation', () => {
     });
 
     const coreTool = buildCoreTool(shortTextTool, 'shortTextTool', haikuModelConfig);
+    await expect(coreTool.validateInput?.({ text: 'Short text' })).resolves.toMatchObject({
+      error: { error: true },
+    });
     const executeResult = await coreTool.execute?.(
       { text: 'Short text' },
       {
@@ -183,6 +351,8 @@ describe('CoreToolBuilder - Schema Compatibility in Validation', () => {
       specificationVersion: 'v4',
       supportsStructuredOutputs: true,
     });
+
+    await expect(coreTool.validateInput?.({ a: 'x', b: null })).resolves.toEqual({ data: { a: 'x' } });
 
     const executeResult = await coreTool.execute?.(
       { a: 'x' },
@@ -579,6 +749,32 @@ describe('CoreToolBuilder - Schema Compatibility in Validation', () => {
       success: true,
       text: shortText,
     });
+  });
+
+  it('keeps native validation for union constraints when Haiku rewrites the LLM schema', async () => {
+    const inputSchema = z.union([z.object({ text: z.string().min(20) }), z.object({ count: z.number() })]);
+    const execute = vi.fn(async (input: unknown) => ({ success: true, input }));
+    const tool: ToolAction<any, any> = {
+      id: 'union-min-tool',
+      description: 'Validates union branches',
+      inputSchema,
+      execute,
+    };
+
+    const coreTool = buildCoreTool(tool, 'union-min-tool', haikuModelConfig);
+    const shortInput = { text: 'Short text' };
+
+    await expect(coreTool.validateInput?.(shortInput)).resolves.toMatchObject({
+      error: { error: true },
+    });
+
+    const executeResult = await coreTool.execute?.(shortInput, {
+      abortSignal: new AbortController().signal,
+      toolCallId: 'union-min-call',
+      messages: [],
+    });
+    expect(executeResult).toEqual({ success: true, input: shortInput });
+    expect(execute).toHaveBeenCalledWith(shortInput, expect.any(Object));
   });
 
   it('should handle OpenAI o3 reasoning model converting optional to nullable (working memory bug)', async () => {

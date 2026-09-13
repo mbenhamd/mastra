@@ -42,6 +42,7 @@ import { ModelRouterLanguageModel } from '../llm/model/router';
 import type { MastraLanguageModel, MastraLegacyLanguageModel, MastraModelConfig } from '../llm/model/shared.types';
 import { RegisteredLogger } from '../logger';
 import { networkLoop } from '../loop/network';
+import type { AgenticLoopEditedApprovalResumeLoader } from '../loop/types';
 // `Mastra` is imported type-only here: a runtime import would create an ESM
 // init cycle (agent → mastra → agent/durable → agent) that breaks
 // `class DurableAgent extends Agent` with a TDZ error. The constructor is read
@@ -224,6 +225,7 @@ import {
 import { TripWire } from './trip-wire';
 import type {
   AgentConfig,
+  AgentMemoryOption,
   AgentDurableOption,
   AgentGenerateOptions,
   AgentNotificationConfig,
@@ -406,6 +408,17 @@ function isReadOnlyMemoryExecution(memory: AgentExecutionOptions<any>['memory'])
 type AgentSnapshotMemoryInfo = {
   threadId?: string;
   resourceId?: string;
+};
+
+// Resume ownership can be checked with a resource alone when the caller's
+// run scope has no thread. Keep the public AgentMemoryOption contract intact;
+// this narrower private shape is only used by the ownership guards.
+type AgenticLoopResumeMemoryOption = Omit<AgentMemoryOption, 'thread'> & {
+  thread?: AgentMemoryOption['thread'];
+};
+
+type AgenticLoopResumeOwnershipOptions = {
+  memory?: AgenticLoopResumeMemoryOption;
 };
 
 /**
@@ -7783,7 +7796,7 @@ export class Agent<
     waitForToolCallId?: string;
     rowOwnership?: {
       requestContext?: RequestContext;
-      options?: AgentExecutionOptionsBase<any>;
+      options?: AgenticLoopResumeOwnershipOptions;
     };
   }) {
     const effectiveMastra = this.#mastra ?? (await this.#getOrCreateEphemeralMastra());
@@ -7868,7 +7881,7 @@ export class Agent<
 
   #getResumeCallerResourceId(
     requestContext: RequestContext | undefined,
-    options: AgentExecutionOptionsBase<any> | undefined,
+    options: AgenticLoopResumeOwnershipOptions | undefined,
     { trustMemoryResource = true }: { trustMemoryResource?: boolean } = {},
   ): string | undefined {
     const contextResourceId = requestContext?.get(MASTRA_RESOURCE_ID_KEY);
@@ -7897,7 +7910,7 @@ export class Agent<
     runThreadId?: string;
     snapshot?: any;
     requestContext?: RequestContext;
-    options?: AgentExecutionOptionsBase<any>;
+    options?: AgenticLoopResumeOwnershipOptions;
   }): void {
     const hasFga = Boolean(this.#mastra?.getServer()?.fga);
     const callerResourceId = this.#getResumeCallerResourceId(requestContext, options, {
@@ -8067,7 +8080,7 @@ export class Agent<
     runResourceId?: string;
     snapshot: any;
     requestContext?: RequestContext;
-    options?: AgentExecutionOptionsBase<any>;
+    options?: AgenticLoopResumeOwnershipOptions;
   }): { threadId?: string; resourceId?: string } | undefined {
     const snapshotMemoryInfo = this.#getAgenticLoopSnapshotMemoryInfo(snapshot);
     if (snapshotMemoryInfo === null) {
@@ -8278,6 +8291,91 @@ export class Agent<
     }
   }
 
+  /**
+   * Load edited approval arguments from the private suspended agentic-loop
+   * snapshot. Recalled transcript metadata may intentionally redact these
+   * fields, so this helper is only called by the cold auto-resume path after
+   * the tool-call step has authenticated that recovery is necessary.
+   * @internal
+   */
+  async __getAgenticLoopEditedApprovalResume(
+    request: Parameters<AgenticLoopEditedApprovalResumeLoader>[0],
+  ): Promise<Awaited<ReturnType<AgenticLoopEditedApprovalResumeLoader>>> {
+    const memory =
+      request.threadId !== undefined || request.resourceId !== undefined
+        ? {
+            ...(request.threadId !== undefined ? { thread: request.threadId } : {}),
+            ...(request.resourceId !== undefined ? { resource: request.resourceId } : {}),
+          }
+        : undefined;
+
+    await this.requireAgentExecutionFGA({
+      requestContext: request.requestContext,
+      memory,
+      runId: request.runId,
+      actor: request.actor,
+    });
+
+    const { resourceId: runResourceId, snapshot } = await this.#loadAgenticLoopSnapshotOrThrow({
+      runId: request.runId,
+      method: 'editedApprovalResume',
+      waitForToolCallId: request.toolCallId,
+      rowOwnership: {
+        requestContext: request.requestContext,
+        options: { memory },
+      },
+    });
+
+    this.#verifyAgenticLoopResumeSnapshot({
+      method: 'editedApprovalResume',
+      runId: request.runId,
+      runResourceId,
+      snapshot,
+      requestContext: request.requestContext,
+      options: { memory },
+    });
+    this.#assertAgenticLoopSuspendedToolCall(snapshot, request.runId, request.toolCallId);
+
+    const snapshotForScan = snapshot as any;
+    const matches: {
+      approvedArgs: Record<string, unknown>;
+      approvalInputIdentityDigest: string;
+    }[] = [];
+    for (const stepKey in snapshotForScan?.context) {
+      const step = snapshotForScan?.context[stepKey];
+      if (step?.status !== 'suspended' || !step.suspendPayload) continue;
+
+      const foreachIterations = this.#getSuspendedForeachIterations(step.suspendPayload);
+      const payloads =
+        foreachIterations.length > 0
+          ? foreachIterations.map(iteration => iteration.suspendPayload)
+          : [step.suspendPayload];
+      for (const payload of payloads) {
+        const toolCallResume = payload?.toolCallResume;
+        if (!toolCallResume || typeof toolCallResume !== 'object' || Array.isArray(toolCallResume)) continue;
+        if (
+          toolCallResume.type !== 'suspension' ||
+          toolCallResume.identityDigest !== request.identityDigest ||
+          toolCallResume.originRunId !== request.originRunId ||
+          toolCallResume.toolCallId !== request.toolCallId ||
+          toolCallResume.toolName !== request.toolName ||
+          !Object.hasOwn(toolCallResume, 'approvedArgs') ||
+          !Object.hasOwn(toolCallResume, 'approvalInputIdentityDigest') ||
+          typeof toolCallResume.approvalInputIdentityDigest !== 'string'
+        ) {
+          continue;
+        }
+
+        matches.push({
+          approvedArgs: structuredClone(toolCallResume.approvedArgs) as Record<string, unknown>,
+          approvalInputIdentityDigest: toolCallResume.approvalInputIdentityDigest,
+        });
+      }
+    }
+
+    return matches.length === 1 ? matches[0] : undefined;
+  }
+
   #getAgenticLoopSnapshotToolSurfaceFence(existingSnapshot: any): readonly string[] | undefined {
     for (const key in existingSnapshot?.context) {
       const step = existingSnapshot?.context[key];
@@ -8442,7 +8540,7 @@ export class Agent<
     snapshotMemoryInfo,
   }: {
     requestContext?: RequestContext;
-    memory?: AgentExecutionOptionsBase<any>['memory'];
+    memory?: AgenticLoopResumeMemoryOption;
     snapshotMemoryInfo?: AgentSnapshotMemoryInfo;
   }): string | undefined {
     const resourceIdFromContext = requestContext?.get(MASTRA_RESOURCE_ID_KEY) as string | undefined;
@@ -8465,7 +8563,7 @@ export class Agent<
     actor,
   }: {
     requestContext?: RequestContext;
-    memory?: AgentExecutionOptionsBase<any>['memory'];
+    memory?: AgenticLoopResumeMemoryOption;
     runId?: string;
     snapshotMemoryInfo?: AgentSnapshotMemoryInfo;
     agentId?: string;

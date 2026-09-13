@@ -1086,7 +1086,7 @@ export class MessageList {
     const transformedMessages = this.messages
       .filter(message => trackedMessages.has(message))
       .map(message => {
-        const transformedMessage = this.transformMessageForTranscript(message);
+        const transformedMessage = MessageList.transformMessageForTranscript(message);
         // Keep an immutable baseline even when the caller requests live message
         // objects. `commit()` must not acknowledge a newer merge into the same
         // object merely because an older storage write completed successfully.
@@ -1110,7 +1110,8 @@ export class MessageList {
             const capturedMessage = capturedMessages.get(message);
             if (
               !currentMessages.has(message) ||
-              (capturedMessage !== undefined && deepEqual(this.transformMessageForTranscript(message), capturedMessage))
+              (capturedMessage !== undefined &&
+                deepEqual(MessageList.transformMessageForTranscript(message), capturedMessage))
             ) {
               sourceMessages.delete(message);
             }
@@ -1128,7 +1129,7 @@ export class MessageList {
     return snapshot.messages;
   }
 
-  private transformToolStateDataForTranscript(data: unknown, phase: 'approval' | 'suspend'): unknown {
+  private static transformToolStateDataForTranscript(data: unknown, phase: 'approval' | 'suspend'): unknown {
     if (!data || typeof data !== 'object') {
       return data;
     }
@@ -1149,15 +1150,25 @@ export class MessageList {
           : undefined;
     const transformedSuspendPayload =
       phase === 'suspend' && hasTransformedToolPayload(phaseTransform) ? phaseTransform.transformed : undefined;
+    const hasTranscriptInputTransform =
+      phase === 'approval'
+        ? hasTransformedToolPayload(phaseTransform) || hasTransformedToolPayload(inputTransform)
+        : hasTransformedToolPayload(inputTransform);
+    const transcriptStateData = hasTranscriptInputTransform
+      ? Object.fromEntries(
+          Object.entries(stateData).filter(([key]) => key !== 'approvedArgs' && key !== 'approvalInputIdentityDigest'),
+        )
+      : stateData;
 
     return {
-      ...stateData,
-      ...(transformedArgs !== undefined ? { args: transformedArgs } : {}),
+      ...transcriptStateData,
+      ...(hasTranscriptInputTransform ? { args: transformedArgs } : {}),
       ...(transformedSuspendPayload !== undefined ? { suspendPayload: transformedSuspendPayload } : {}),
     };
   }
 
-  private transformMessageForTranscript(message: MastraDBMessage): MastraDBMessage {
+  /** @internal Applies the canonical privacy projection used for persisted transcripts. */
+  public static transformMessageForTranscript(message: MastraDBMessage): MastraDBMessage {
     if (message.content?.format !== 2 || !message.content.parts) {
       return message;
     }
@@ -1217,7 +1228,7 @@ export class MessageList {
         changed = true;
         return {
           ...part,
-          data: this.transformToolStateDataForTranscript(
+          data: MessageList.transformToolStateDataForTranscript(
             part.data,
             part.type === 'data-tool-call-suspended' ? 'suspend' : 'approval',
           ),
@@ -1262,7 +1273,7 @@ export class MessageList {
         metadata[key] = Object.fromEntries(
           Object.entries(toolStates as Record<string, unknown>).map(([toolName, state]) => [
             toolName,
-            this.transformToolStateDataForTranscript(state, phase),
+            MessageList.transformToolStateDataForTranscript(state, phase),
           ]),
         );
       }
@@ -1301,6 +1312,8 @@ export class MessageList {
   /**
    * Replace a tool-invocation part matching the given toolCallId with the
    * provided result part. Walks backwards through messages to find the match.
+   * Original arguments are retained unless the caller explicitly identifies a
+   * verified edited-approval value with `options.replaceArgs`.
    * If the message was already persisted (e.g. as a memory message), it is
    * moved to the response source so it will be re-saved.
    *
@@ -1309,6 +1322,7 @@ export class MessageList {
   public updateToolInvocation(
     inputPart: Extract<MastraMessagePart, { type: 'tool-invocation' }>,
     metadata?: Record<string, unknown>,
+    options?: { replaceArgs?: boolean },
   ): boolean {
     if (!inputPart.toolInvocation?.toolCallId) {
       return false;
@@ -1324,7 +1338,7 @@ export class MessageList {
       for (let i = 0; i < msg.content.parts.length; i++) {
         const part = msg.content.parts[i];
         if (part?.type === 'tool-invocation' && part.toolInvocation?.toolCallId === toolCallId) {
-          this.mergeToolResultIntoPart(msg, i, inputPart, metadata);
+          this.mergeToolResultIntoPart(msg, i, inputPart, metadata, undefined, options?.replaceArgs);
           return true;
         }
       }
@@ -1357,7 +1371,7 @@ export class MessageList {
           // resynced from its old key (it still holds the original id).
           const previousToolCallId = candidate.toolInvocation.toolCallId;
           candidate.toolInvocation.toolCallId = toolCallId;
-          this.mergeToolResultIntoPart(msg, i, inputPart, metadata, previousToolCallId);
+          this.mergeToolResultIntoPart(msg, i, inputPart, metadata, previousToolCallId, options?.replaceArgs);
           return true;
         }
       }
@@ -1422,6 +1436,7 @@ export class MessageList {
     inputPart: Extract<MastraMessagePart, { type: 'tool-invocation' }>,
     metadata?: Record<string, unknown>,
     previousToolCallId?: string,
+    replaceArgs = false,
   ): void {
     const part = msg.content.parts![i] as Extract<MastraMessagePart, { type: 'tool-invocation' }>;
     // The legacy `content.toolInvocations` array (AIV4) is keyed by the id the
@@ -1433,6 +1448,7 @@ export class MessageList {
       providerExecuted?: boolean;
       providerMetadata?: unknown;
     };
+    const persistedArgs = replaceArgs ? inputPart.toolInvocation.args : part.toolInvocation.args;
 
     // `providerMetadata` is a two-level map — provider namespace -> key -> value —
     // so merging it must also be two levels deep. A one-level merge let a caller
@@ -1477,7 +1493,7 @@ export class MessageList {
       ...inputPart,
       toolInvocation: {
         ...inputPart.toolInvocation,
-        args: part.toolInvocation.args,
+        args: persistedArgs,
       },
       // Preserve providerExecuted from original call if not in result
       ...(originalPart.providerExecuted !== undefined && inputPartWithMeta.providerExecuted === undefined
@@ -1504,23 +1520,25 @@ export class MessageList {
     };
 
     // Keep the legacy AIV4 `content.toolInvocations` array in sync so a later
-    // transformMessageForTranscript() can still map this part back: carry over
-    // the result and the (possibly reconciled) toolCallId, matching the entry by
-    // the id it held before reconciliation. Spread the legacy entry first to
-    // preserve its type, then override only the fields that change here.
-    if (Array.isArray(msg.content.toolInvocations) && inputPart.toolInvocation.state === 'result') {
-      const resultInvocation = inputPart.toolInvocation;
-      msg.content.toolInvocations = msg.content.toolInvocations.map(invocation =>
-        invocation.toolCallId === priorToolCallId
-          ? {
-              ...invocation,
-              toolCallId: resultInvocation.toolCallId,
-              state: 'result' as const,
-              args: part.toolInvocation.args,
-              result: resultInvocation.result,
-            }
-          : invocation,
-      );
+    // transformMessageForTranscript() can still map this part back. Both a
+    // normal result and an approval denial resolve the original invocation.
+    if (
+      Array.isArray(msg.content.toolInvocations) &&
+      (inputPart.toolInvocation.state === 'result' ||
+        inputPart.toolInvocation.state === 'output-error' ||
+        inputPart.toolInvocation.state === 'output-denied')
+    ) {
+      const resolvedInvocation = inputPart.toolInvocation;
+      msg.content.toolInvocations = msg.content.toolInvocations.map(invocation => {
+        if (invocation.toolCallId !== priorToolCallId) return invocation;
+        const {
+          result: _priorResult,
+          errorText: _priorErrorText,
+          approval: _priorApproval,
+          ...priorInvocation
+        } = invocation as typeof invocation & { result?: unknown; errorText?: unknown; approval?: unknown };
+        return { ...priorInvocation, ...resolvedInvocation, args: persistedArgs };
+      });
     }
 
     // Move the message to the response source so it gets

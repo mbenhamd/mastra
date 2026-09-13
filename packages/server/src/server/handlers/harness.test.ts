@@ -2860,6 +2860,22 @@ describe('Harness server routes', () => {
       responseId: 'response-1',
       duplicate: false,
     };
+    const editedResponse = {
+      kind: 'tool-approval',
+      approved: true,
+      editedArgs: { query: 'reviewed query' },
+      ...inboxGeneration,
+      responseId: 'response-1',
+    };
+    expect(RESPOND_HARNESS_INBOX_ROUTE.bodySchema!.parse(editedResponse)).toMatchObject({
+      editedArgs: editedResponse.editedArgs,
+    });
+    expect(RESPOND_HARNESS_INBOX_ROUTE.bodySchema!.safeParse({ ...editedResponse, approved: false }).success).toBe(
+      false,
+    );
+    expect(RESPOND_HARNESS_INBOX_ROUTE.bodySchema!.safeParse({ ...editedResponse, editedArgs: null }).success).toBe(
+      false,
+    );
     const session = { respondToToolApproval: vi.fn(async () => response) };
     const harness = { session: vi.fn(async () => session) };
     const mastra = { getHarness: vi.fn(() => harness) };
@@ -2875,6 +2891,7 @@ describe('Harness server routes', () => {
             kind: 'tool-approval',
             approved: true,
             approvalScope: 'always',
+            editedArgs: { query: 'reviewed query' },
             ...inboxGeneration,
             responseId: 'response-1',
           },
@@ -2887,6 +2904,7 @@ describe('Harness server routes', () => {
       responseId: 'response-1',
       approved: true,
       approvalScope: 'always',
+      editedArgs: { query: 'reviewed query' },
     });
   });
 

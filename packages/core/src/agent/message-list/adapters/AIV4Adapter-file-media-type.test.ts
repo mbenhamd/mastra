@@ -35,4 +35,50 @@ describe('AIV4Adapter.toUIMessage — v5-shaped file parts (mediaType)', () => {
     expect(attachment!.contentType).toBe('application/pdf');
     expect(attachment!.url).toBe('data:application/pdf;base64,JVBERi0xLjQ=');
   });
+
+  it('strips private tool state from metadata and extended parts without mutating the source', () => {
+    const suspendedTool = {
+      toolCallId: 'call-private',
+      toolName: 'requestApproval',
+      args: { documentId: 'PUBLIC_ARGS' },
+      approvedArgs: { documentId: 'PRIVATE_APPROVED_ARGS' },
+      approvalInputIdentityDigest: 'PRIVATE_APPROVAL_DIGEST',
+      suspendPayload: { reason: 'PUBLIC_SUSPENSION_PAYLOAD' },
+    };
+    const message: MastraDBMessage = {
+      id: 'm-private-tool-state',
+      role: 'assistant',
+      createdAt: new Date('2024-01-01'),
+      content: {
+        format: 2,
+        parts: [{ type: 'data-tool-call-suspended', data: suspendedTool } as any],
+        metadata: {
+          suspendedTools: {
+            'call-private': structuredClone(suspendedTool),
+          },
+        },
+      },
+    };
+    const sourceBefore = structuredClone(message);
+
+    const uiMessage = AIV4Adapter.toUIMessage(message);
+    const suspendedPart = uiMessage.parts.find((part: any) => part.type === 'data-tool-call-suspended') as any;
+    const suspendedMetadata = (uiMessage.metadata as any)?.suspendedTools?.['call-private'];
+
+    expect(suspendedPart.data).toMatchObject({
+      toolCallId: 'call-private',
+      args: { documentId: 'PUBLIC_ARGS' },
+      suspendPayload: { reason: 'PUBLIC_SUSPENSION_PAYLOAD' },
+    });
+    expect(suspendedPart.data).not.toHaveProperty('approvedArgs');
+    expect(suspendedPart.data).not.toHaveProperty('approvalInputIdentityDigest');
+    expect(suspendedMetadata).toMatchObject({
+      toolCallId: 'call-private',
+      args: { documentId: 'PUBLIC_ARGS' },
+      suspendPayload: { reason: 'PUBLIC_SUSPENSION_PAYLOAD' },
+    });
+    expect(suspendedMetadata).not.toHaveProperty('approvedArgs');
+    expect(suspendedMetadata).not.toHaveProperty('approvalInputIdentityDigest');
+    expect(message).toEqual(sourceBefore);
+  });
 });
