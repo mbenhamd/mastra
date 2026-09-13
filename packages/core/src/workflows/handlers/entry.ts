@@ -247,6 +247,7 @@ function lifecyclePayloadEquals(left: unknown, right: unknown, seen: WeakMap<obj
       const leftDescriptor = Object.getOwnPropertyDescriptor(left, key);
       const rightDescriptor = Object.getOwnPropertyDescriptor(right, key);
       if (!leftDescriptor || !rightDescriptor) return false;
+      if (leftDescriptor.enumerable !== rightDescriptor.enumerable) return false;
       // The clone intentionally materializes the native stack accessor. Its
       // value was compared above, so the descriptor representation is not
       // evidence that lifecycle data changed.
