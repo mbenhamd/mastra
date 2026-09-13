@@ -1,6 +1,8 @@
+import { execSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { readFile, rm, stat, writeFile } from 'node:fs/promises';
-import { dirname, join, posix } from 'node:path';
+import { dirname, join, posix, relative } from 'node:path';
 import { MastraBundler } from '@mastra/core/bundler';
 import { MastraError, ErrorDomain, ErrorCategory } from '@mastra/core/error';
 import type { Config } from '@mastra/core/mastra';
@@ -14,7 +16,7 @@ import { createBundler as createBundlerUtil, getInputOptions } from '../build/bu
 import { getBundlerOptions } from '../build/bundlerOptions';
 import type { BundlerOptions, ExternalDependencyInfo } from '../build/types';
 import type { BundlerPlatform } from '../build/utils';
-import { getPackageName, isBareModuleSpecifier, slash } from '../build/utils';
+import { getPackageName, isBareModuleSpecifier, shouldSkipInstall, slash } from '../build/utils';
 import { createChildProcessLogger } from '../deploy/log.js';
 import { DepsService } from '../services/deps';
 import { FileService } from '../services/fs';
@@ -282,6 +284,11 @@ export const applySourceDependencyRange = (
   return { ...dependencyInfo, version: declared };
 };
 
+function toolIdForEntry(relativeEntryFile: string): string {
+  const digest = createHash('sha256').update(relativeEntryFile).digest('hex');
+  return `${digest.slice(0, 8)}-${digest.slice(8, 12)}-${digest.slice(12, 16)}-${digest.slice(16, 20)}-${digest.slice(20, 32)}`;
+}
+
 export abstract class Bundler extends MastraBundler {
   protected analyzeOutputDir = '.build';
   protected outputDir = 'output';
@@ -505,6 +512,7 @@ export abstract class Bundler extends MastraBundler {
     toolsPaths: (string | string[])[],
     { enableSourcemap, enableMinify, enableEsmShim, externals }: BundlerOptions,
     additionalEntries: Record<string, string>,
+    toolProjectRoot: string,
   ) {
     const { workspaceRoot } = await getWorkspaceInformation({ mastraEntryFile });
     const closestPkgJson = pkg.up({ cwd: dirname(mastraEntryFile) });
@@ -526,7 +534,7 @@ export abstract class Bundler extends MastraBundler {
         externalsPreset: externals === true,
       },
     );
-    const toolsInputOptions = await this.listToolsInputOptions(toolsPaths);
+    const toolsInputOptions = await this.listToolsInputOptions(toolsPaths, toolProjectRoot);
     const entryInputs: Record<string, string> = {};
     const virtualEntries: Record<string, string> = {};
     const entries = { index: serverFile, ...additionalEntries };
@@ -577,8 +585,8 @@ export abstract class Bundler extends MastraBundler {
     return [...toolsPaths, defaultPaths];
   }
 
-  async listToolsInputOptions(toolsPaths: (string | string[])[]) {
-    const inputs: Record<string, string> = {};
+  async listToolsInputOptions(toolsPaths: (string | string[])[], projectRoot: string = process.cwd()) {
+    const entries = new Map<string, string>();
 
     for (const toolPath of toolsPaths) {
       const expandedPaths = await glob(toolPath, {
@@ -601,17 +609,20 @@ export abstract class Bundler extends MastraBundler {
             continue;
           }
 
-          const uniqueToolID = crypto.randomUUID();
-          // Normalize Windows paths to forward slashes for consistent handling
           const normalizedEntryFile = entryFile.replaceAll('\\', '/');
-          inputs[`tools/${uniqueToolID}`] = normalizedEntryFile;
+          const relativeEntryFile = relative(projectRoot, entryFile).replaceAll('\\', '/');
+          entries.set(relativeEntryFile, normalizedEntryFile);
         } else {
           this.logger.warn('Tool path does not exist, skipping', { path });
         }
       }
     }
 
-    return inputs;
+    return Object.fromEntries(
+      [...entries.entries()]
+        .sort(([first], [second]) => (first < second ? -1 : first > second ? 1 : 0))
+        .map(([relativeEntryFile, entryFile]) => [`tools/${toolIdForEntry(relativeEntryFile)}`, entryFile]),
+    );
   }
 
   protected async _bundle(
@@ -643,7 +654,7 @@ export abstract class Bundler extends MastraBundler {
 
     let analyzedBundleInfo;
     try {
-      const resolvedToolsPaths = await this.listToolsInputOptions(toolsPaths);
+      const resolvedToolsPaths = await this.listToolsInputOptions(toolsPaths, projectRoot);
       analyzedBundleInfo = await analyzeBundle(
         [serverFile, ...Object.values(additionalEntries), ...Object.values(resolvedToolsPaths)],
         mastraEntryFile,
@@ -733,6 +744,7 @@ export abstract class Bundler extends MastraBundler {
         toolsPaths,
         internalBundlerOptions,
         additionalEntries,
+        projectRoot,
       );
 
       const bundler = await this.createBundler(
@@ -794,18 +806,22 @@ export const tools = [${toolsExports.join(', ')}]`,
 
       this.logger.info('Done copying .npmrc file');
 
-      this.logger.info('Installing dependencies');
-      await this.installDependencies(outputDirectory, projectRoot, transitiveWorkspaceDependencies.resolutions);
-      this.logger.info('Done installing dependencies');
-
-      if (Object.keys(transitiveWorkspaceDependencies.resolutions).length === 0) {
-        this.logger.info('Generating package-lock.json for deploy');
-        await this.generateNpmLockfile(join(outputDirectory, this.outputDir));
-        this.logger.info('Done generating package-lock.json');
+      if (shouldSkipInstall()) {
+        this.logger.info('Skipping dependency installation (MASTRA_BUILD_SKIP_INSTALL set)');
       } else {
-        this.logger.warn(
-          'Skipping package-lock.json generation because the output contains packed workspace dependencies',
-        );
+        this.logger.info('Installing dependencies');
+        await this.installDependencies(outputDirectory, projectRoot, transitiveWorkspaceDependencies.resolutions);
+        this.logger.info('Done installing dependencies');
+
+        if (Object.keys(transitiveWorkspaceDependencies.resolutions).length === 0) {
+          this.logger.info('Generating package-lock.json for deploy');
+          await this.generateNpmLockfile(join(outputDirectory, this.outputDir));
+          this.logger.info('Done generating package-lock.json');
+        } else {
+          this.logger.warn(
+            'Skipping package-lock.json generation because the output contains packed workspace dependencies',
+          );
+        }
       }
     } catch (error) {
       if (
@@ -828,8 +844,8 @@ export const tools = [${toolsExports.join(', ')}]`,
     }
   }
 
-  async lint(_entryFile: string, _outputDirectory: string, toolsPaths: (string | string[])[]): Promise<void> {
-    const toolsInputOptions = await this.listToolsInputOptions(toolsPaths);
+  async lint(_entryFile: string, outputDirectory: string, toolsPaths: (string | string[])[]): Promise<void> {
+    const toolsInputOptions = await this.listToolsInputOptions(toolsPaths, dirname(outputDirectory));
     const toolsLength = Object.keys(toolsInputOptions).length;
     if (toolsLength > 0) {
       this.logger.info('Found tools', { count: toolsLength });

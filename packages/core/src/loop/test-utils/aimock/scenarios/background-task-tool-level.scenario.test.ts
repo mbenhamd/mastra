@@ -1,8 +1,8 @@
 import { stepCountIs } from '@internal/ai-sdk-v5';
-import { it, expect } from 'vitest';
+import { it, expect, vi } from 'vitest';
 import { z } from 'zod';
 import { createTool } from '../../../../tools';
-import { runLoopScenario, useLoopScenarioAimock, describeForAllEngines } from '../aimock-scenario';
+import { createSharedAgent, runLoopScenario, useLoopScenarioAimock, describeForAllEngines } from '../aimock-scenario';
 
 /**
  * Tests tool-level background task opt-in.
@@ -71,3 +71,99 @@ describeForAllEngines('background-task-tool-level scenario', engine => {
     expect(toolResultChunk?.payload?.toolName).toBe('background-work');
   });
 });
+
+describeForAllEngines(
+  'background-task-tool-level suspend/resume scenario',
+  engine => {
+    const getMock = useLoopScenarioAimock();
+
+    it('suspends an awaited task at a checkpoint and resumes it with the checkpoint data', async () => {
+      let executions = 0;
+      let resumedCheckpoint: string | undefined;
+      const checkpointTool = createTool({
+        id: 'background-checkpoint',
+        description: 'Runs work that waits at a checkpoint for approval',
+        inputSchema: z.object({ topic: z.string() }),
+        outputSchema: z.object({ summary: z.string() }),
+        background: { enabled: true },
+        execute: async ({ topic }, options) => {
+          executions++;
+          const context = options as
+            | {
+                agent?: {
+                  suspend?: (data?: unknown) => Promise<void>;
+                  resumeData?: { checkpoint?: string };
+                };
+              }
+            | undefined;
+          if (!context?.agent?.resumeData) {
+            await context?.agent?.suspend?.({ checkpoint: 'analyst-review', topic });
+            return { summary: '' };
+          }
+          resumedCheckpoint = context.agent.resumeData.checkpoint;
+          return { summary: `${topic}:${resumedCheckpoint}` };
+        },
+      });
+
+      const shared = await createSharedAgent(getMock(), {
+        tools: { 'background-checkpoint': checkpointTool },
+        agentBackgroundTasks: { tools: { 'background-checkpoint': true } },
+        backgroundTasks: { enabled: true },
+        engine,
+      });
+
+      const { output, chunks, mastra } = await runLoopScenario({
+        engine,
+        llm: getMock(),
+        sharedAgent: shared,
+        prompt: 'Run the checkpoint work for papers',
+        collectChunks: true,
+        fixtures: llm => {
+          llm.on(
+            { endpoint: 'chat', sequenceIndex: 0 },
+            {
+              toolCalls: [
+                {
+                  id: 'call-checkpoint',
+                  name: 'background-checkpoint',
+                  arguments: { topic: 'papers', _background: { disposition: 'awaited' } },
+                },
+              ],
+            },
+          );
+          llm.on(
+            { endpoint: 'chat', sequenceIndex: 1 },
+            {
+              content: 'The checkpoint work is approved and complete.',
+            },
+          );
+        },
+      });
+
+      const suspended = chunks?.find(c => c.type === 'tool-call-suspended');
+      const started = chunks?.find(c => c.type === 'background-task-started');
+      expect(suspended).toBeDefined();
+      expect(started).toBeDefined();
+      expect((suspended as any)?.payload?.suspendPayload).toMatchObject({ checkpoint: 'analyst-review' });
+      expect(executions).toBe(1);
+      expect(resumedCheckpoint).toBeUndefined();
+      const backgroundManager = mastra?.backgroundTaskManager;
+      const taskId = (started as any)?.payload?.taskId;
+      await vi.waitFor(async () =>
+        expect(await backgroundManager?.getTask(taskId)).toMatchObject({ status: 'suspended' }),
+      );
+
+      const resumed = await shared.agent.resumeStream({ checkpoint: 'approved' }, { runId: output.runId });
+      for await (const _chunk of resumed.fullStream) {
+        // Drain the resumed stream so the background task and reconciliation finish.
+      }
+
+      const toolResults = await resumed.toolResults;
+      expect(executions).toBe(2);
+      expect(resumedCheckpoint).toBe('approved');
+      const result = toolResults?.find((chunk: any) => chunk.payload?.toolName === 'background-checkpoint');
+      expect(result?.payload?.result).toEqual({ summary: 'papers:approved' });
+    });
+  },
+  { skip: ['durable'] },
+);

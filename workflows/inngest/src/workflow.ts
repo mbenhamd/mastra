@@ -566,6 +566,7 @@ export class InngestWorkflow<
           executionGeneration: suppliedExecutionGeneration,
           lifecycleResumeAttempt: suppliedLifecycleResumeAttempt,
           lifecycleStepStates: suppliedLifecycleStepStates,
+          parentStream,
           nestedWorkflowOutputMode: requestedNestedWorkflowOutputMode,
         } = event.data;
         const nestedWorkflowOutputMode = resolveNestedWorkflowOutputMode(requestedNestedWorkflowOutputMode);
@@ -839,7 +840,7 @@ export class InngestWorkflow<
           return span?.exportSpan();
         });
 
-        const engine = new InngestExecutionEngine(this.#mastra, step, attempt, this.options);
+        const engine = new InngestExecutionEngine(this.#mastra, step, attempt, this.options, parentStream);
 
         // `step.run` memoizes lifecycle resolution across retries. Re-read the
         // authoritative snapshot outside that memoized step immediately before
@@ -965,6 +966,15 @@ export class InngestWorkflow<
               } catch (err) {
                 this.logger.debug?.('Failed to publish watch event:', err);
               }
+              // Nested functions have workflow-local channels; send writer chunks
+              // directly to the outermost run without forwarding lifecycle events.
+              if (parentStream) {
+                try {
+                  await defaultPubsub.publishWorkflowWatchTo(parentStream.workflowId, parentStream.runId, chunk);
+                } catch (err) {
+                  this.logger.debug?.('Failed to publish parent watch event:', err);
+                }
+              }
             },
           });
         } catch (executionError) {
@@ -1052,7 +1062,12 @@ export class InngestWorkflow<
               result.status === 'failed'
                 ? getErrorFromUnknown(result.error, { serializeStack: true }).toJSON()
                 : undefined;
-            const snapshotContext = toSnapshotContext(result.steps);
+            // `fmtReturnValue` removes internal nested-run metadata from the
+            // public result. Restore only the current step's canonical child
+            // identity from the interim snapshot before replacing it with the
+            // terminal snapshot; user metadata and all other result fields
+            // still come from the cleaned result.
+            const snapshotContext = toSnapshotContext(result.steps, existingSnapshot?.context);
             const finalLifecycleExecution = {
               ...lifecycleExecution,
               lifecycleStepStates: existingSnapshot?.lifecycleStepStates ?? lifecycleExecution.lifecycleStepStates,
@@ -1095,7 +1110,7 @@ export class InngestWorkflow<
             const workflowResult: WorkflowResumeResultDataV1 = {
               status: result.status,
               input: inputData,
-              steps: snapshotContext,
+              steps: toSnapshotContext(result.steps),
               state: result.state ?? executionInitialState ?? {},
               ...(result.status === 'success' ? { result: result.result } : {}),
               ...(serializedError ? { error: serializedError } : {}),
@@ -1244,11 +1259,36 @@ export class InngestWorkflow<
 
 /**
  * Converts runtime step results to the serialized context shape expected by WorkflowRunState.
- * StepResult is a structural subset of SerializedStepResult (widening), so no data
- * transformation is needed — this bridges the generic type mismatch at the persistence boundary.
+ * StepResult is a structural subset of SerializedStepResult (widening), so this only
+ * restores the internal child identity that public result formatting deliberately removes.
  */
-function toSnapshotContext(steps: Record<string, StepResult<any, any, any, any>>): WorkflowRunState['context'] {
-  return steps as unknown as WorkflowRunState['context'];
+function toSnapshotContext(
+  steps: Record<string, StepResult<any, any, any, any>>,
+  existingContext?: WorkflowRunState['context'],
+): WorkflowRunState['context'] {
+  const snapshotContext = { ...steps } as unknown as WorkflowRunState['context'];
+  if (!existingContext) return snapshotContext;
+
+  for (const [stepId, stepResult] of Object.entries(steps)) {
+    if (stepId === 'input' || !stepResult || typeof stepResult !== 'object' || Array.isArray(stepResult)) continue;
+
+    const existingStep = existingContext[stepId];
+    if (!existingStep || typeof existingStep !== 'object' || Array.isArray(existingStep)) continue;
+
+    const nestedRunId = (existingStep as any).metadata?.nestedRunId;
+    if (typeof nestedRunId !== 'string') continue;
+
+    const metadata = (stepResult as any).metadata;
+    snapshotContext[stepId] = {
+      ...stepResult,
+      metadata: {
+        ...(metadata && typeof metadata === 'object' && !Array.isArray(metadata) ? metadata : {}),
+        nestedRunId,
+      },
+    } as WorkflowRunState['context'][string];
+  }
+
+  return snapshotContext;
 }
 
 /**

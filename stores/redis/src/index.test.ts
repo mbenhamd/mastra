@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { RedisServerCache, upstashPreset, nodeRedisPreset } from './index';
+import { RedisServerCache, upstashPreset, nodeRedisPreset, LIST_PUSH_INDEXED_SCRIPT } from './index';
 import type { RedisClient } from './index';
 
 // Create a mock Redis client
@@ -159,6 +159,73 @@ describe('RedisServerCache', () => {
       expect(mockClient.incr).toHaveBeenCalledWith('mastra:cache:counter');
       expect(mockClient.expire).not.toHaveBeenCalled();
       expect(result).toBe(1);
+    });
+  });
+
+  describe('listPushIndexed', () => {
+    it('runs one Lua script instead of INCR/EXPIRE/RPUSH/EXPIRE', async () => {
+      mockClient.eval.mockResolvedValue(4);
+
+      const index = await cache.listPushIndexed('events', 'events:counter', { type: 'chunk', data: { a: 1 } });
+
+      expect(index).toBe(4);
+      expect(mockClient.eval).toHaveBeenCalledTimes(1);
+      expect(mockClient.eval).toHaveBeenCalledWith(
+        LIST_PUSH_INDEXED_SCRIPT,
+        2,
+        'mastra:cache:events',
+        'mastra:cache:events:counter',
+        '{"type":"chunk","data":{"a":1}}',
+        '300',
+      );
+      expect(mockClient.incr).not.toHaveBeenCalled();
+      expect(mockClient.rpush).not.toHaveBeenCalled();
+      expect(mockClient.expire).not.toHaveBeenCalled();
+    });
+
+    it('strips a pre-existing index from the value and passes ttl 0 through', async () => {
+      const noTtlCache = new RedisServerCache({ client: mockClient }, { ttlSeconds: 0 });
+      mockClient.eval.mockResolvedValue('0');
+
+      const index = await noTtlCache.listPushIndexed('events', 'events:counter', { index: 99, type: 'x' });
+
+      expect(index).toBe(0);
+      expect(mockClient.eval.mock.calls[0]!.slice(4)).toEqual(['{"type":"x"}', '0']);
+    });
+
+    it('falls back to increment + listPush when the client has no eval', async () => {
+      const { eval: _eval, ...clientWithoutEval } = mockClient;
+      const fallbackCache = new RedisServerCache({ client: clientWithoutEval as RedisClient });
+      mockClient.incr.mockResolvedValue(3);
+      mockClient.rpush.mockResolvedValue(3);
+
+      const index = await fallbackCache.listPushIndexed('events', 'events:counter', { type: 'x' });
+
+      expect(index).toBe(2);
+      expect(mockClient.incr).toHaveBeenCalledWith('mastra:cache:events:counter');
+      expect(mockClient.rpush).toHaveBeenCalledWith('mastra:cache:events', '{"type":"x","index":2}');
+      expect(mockClient.expire).toHaveBeenCalledTimes(2);
+    });
+
+    it('permanently falls back after a CROSSSLOT rejection (Redis Cluster)', async () => {
+      mockClient.eval.mockRejectedValue(new Error("CROSSSLOT Keys in request don't hash to the same slot"));
+      mockClient.incr.mockResolvedValue(1);
+      mockClient.rpush.mockResolvedValue(1);
+
+      expect(await cache.listPushIndexed('events', 'events:counter', { type: 'x' })).toBe(0);
+      expect(mockClient.eval).toHaveBeenCalledTimes(1);
+      expect(mockClient.rpush).toHaveBeenCalledWith('mastra:cache:events', '{"type":"x","index":0}');
+
+      mockClient.incr.mockResolvedValue(2);
+      expect(await cache.listPushIndexed('events', 'events:counter', { type: 'y' })).toBe(1);
+      // No second eval attempt once scripting is known to be unusable
+      expect(mockClient.eval).toHaveBeenCalledTimes(1);
+    });
+
+    it('rethrows non-CROSSSLOT script errors', async () => {
+      mockClient.eval.mockRejectedValue(new Error('connection lost'));
+      await expect(cache.listPushIndexed('events', 'events:counter', { type: 'x' })).rejects.toThrow('connection lost');
+      expect(mockClient.incr).not.toHaveBeenCalled();
     });
   });
 
@@ -324,6 +391,19 @@ describe('RedisServerCache', () => {
         ['{}', '1000', '2', expect.any(String)],
       );
     });
+
+    it('should use upstash-style eval(script, keys, args)', async () => {
+      const upstashCache = new RedisServerCache({ client: mockClient }, upstashPreset);
+      mockClient.eval.mockResolvedValue(0);
+
+      await upstashCache.listPushIndexed('events', 'events:counter', { type: 'x' });
+
+      expect(mockClient.eval).toHaveBeenCalledWith(
+        LIST_PUSH_INDEXED_SCRIPT,
+        ['mastra:cache:events', 'mastra:cache:events:counter'],
+        ['{"type":"x"}', '300'],
+      );
+    });
   });
 
   describe('nodeRedisPreset', () => {
@@ -394,6 +474,18 @@ describe('RedisServerCache', () => {
       expect(nodeMock.eval).toHaveBeenCalledWith(expect.any(String), {
         keys: ['mastra:cache:events'],
         arguments: ['{}', '1000', '2', expect.any(String)],
+      });
+    });
+
+    it('should use node-redis-style eval(script, { keys, arguments })', async () => {
+      const nodeCache = new RedisServerCache({ client: mockClient }, nodeRedisPreset);
+      mockClient.eval.mockResolvedValue(0);
+
+      await nodeCache.listPushIndexed('events', 'events:counter', { type: 'x' });
+
+      expect(mockClient.eval).toHaveBeenCalledWith(LIST_PUSH_INDEXED_SCRIPT, {
+        keys: ['mastra:cache:events', 'mastra:cache:events:counter'],
+        arguments: ['{"type":"x"}', '300'],
       });
     });
   });

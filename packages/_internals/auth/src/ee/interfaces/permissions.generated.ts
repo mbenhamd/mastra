@@ -207,6 +207,8 @@ export const PERMISSION_PATTERNS = {
   'dynamic-workflows:write': 'dynamic-workflows:write',
   /** View embedders */
   'embedders:read': 'embedders:read',
+  /** Delete experiments */
+  'experiments:delete': 'experiments:delete',
   /** View experiments */
   'experiments:read': 'experiments:read',
   /** Delete harness */
@@ -235,6 +237,8 @@ export const PERMISSION_PATTERNS = {
   'memory:read': 'memory:read',
   /** Create and modify memory and threads */
   'memory:write': 'memory:write',
+  /** Delete traces and spans */
+  'observability:delete': 'observability:delete',
   /** View traces and spans */
   'observability:read': 'observability:read',
   /** Create and modify traces and spans */
@@ -388,6 +392,7 @@ export const PERMISSIONS = [
   'dynamic-workflows:read',
   'dynamic-workflows:write',
   'embedders:read',
+  'experiments:delete',
   'experiments:read',
   'harness:delete',
   'harness:execute',
@@ -402,6 +407,7 @@ export const PERMISSIONS = [
   'memory:execute',
   'memory:read',
   'memory:write',
+  'observability:delete',
   'observability:read',
   'observability:write',
   'processor-providers:read',
@@ -519,6 +525,8 @@ export const MastraFGAPermissions = {
   DYNAMIC_WORKFLOWS_WRITE: 'dynamic-workflows:write',
   /** View embedders */
   EMBEDDERS_READ: 'embedders:read',
+  /** Delete experiments */
+  EXPERIMENTS_DELETE: 'experiments:delete',
   /** View experiments */
   EXPERIMENTS_READ: 'experiments:read',
   /** Delete harness */
@@ -547,6 +555,8 @@ export const MastraFGAPermissions = {
   MEMORY_READ: 'memory:read',
   /** Create and modify memory and threads */
   MEMORY_WRITE: 'memory:write',
+  /** Delete traces and spans */
+  OBSERVABILITY_DELETE: 'observability:delete',
   /** View traces and spans */
   OBSERVABILITY_READ: 'observability:read',
   /** Create and modify traces and spans */

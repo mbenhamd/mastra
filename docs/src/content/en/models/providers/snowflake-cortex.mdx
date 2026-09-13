@@ -360,7 +360,7 @@ const agent = new Agent({
   id: "custom-agent",
   name: "custom-agent",
   model: {
-    url: "https://${SNOWFLAKE_ACCOUNT}.snowflakecomputing.com/api/v2/cortex/v1",
+    url: `https://${SNOWFLAKE_ACCOUNT}.snowflakecomputing.com/api/v2/cortex/v1`,
     id: "snowflake-cortex/claude-fable-5",
     apiKey: process.env.SNOWFLAKE_CORTEX_PAT,
     headers: {
@@ -384,5 +384,4 @@ const agent = new Agent({
   }
 });
 ```
-
 

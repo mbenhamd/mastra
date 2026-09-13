@@ -874,8 +874,8 @@ describe('Harness v1 — construction', () => {
     pubsub.releaseSubscribes();
     await shutdown;
 
-    expect(pubsub.subscribeCalls).toEqual(['background-tasks', 'background-tasks-result']);
-    expect(pubsub.unsubscribeCalls).toEqual(['background-tasks', 'background-tasks-result']);
+    expect(pubsub.subscribeCalls).toEqual(['background-tasks', expect.stringMatching(/^background-tasks:/)]);
+    expect(pubsub.unsubscribeCalls).toEqual(expect.arrayContaining(pubsub.subscribeCalls));
     expect(pubsub.publishCalls).toEqual([]);
   });
 

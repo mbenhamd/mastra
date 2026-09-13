@@ -1200,15 +1200,6 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
 
     const config: { skipBodyParse?: boolean } | undefined = route.skipBodyParse ? { skipBodyParse: true } : undefined;
     const bodyLimit = maxSize;
-    const bodyLimitErrorHandler =
-      route.maxBodySize !== undefined
-        ? (error: Error & { code?: string }, _request: FastifyRequest, reply: FastifyReply) => {
-            if (error.code === 'FST_ERR_CTP_BODY_TOO_LARGE') {
-              return reply.status(413).send({ error: 'Request body too large' });
-            }
-            throw error;
-          }
-        : undefined;
 
     // Handle ALL method by registering for each HTTP method
     // Fastify doesn't support 'ALL' method natively like Express
@@ -1224,7 +1215,6 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
             handler,
             config,
             ...(bodyLimit !== undefined ? { bodyLimit } : {}),
-            errorHandler: bodyLimitErrorHandler,
           });
         } catch (err) {
           // Skip duplicate route errors - can happen if route is registered multiple times.
@@ -1244,7 +1234,6 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
         handler,
         config,
         ...(bodyLimit !== undefined ? { bodyLimit } : {}),
-        errorHandler: bodyLimitErrorHandler,
       });
     }
   }

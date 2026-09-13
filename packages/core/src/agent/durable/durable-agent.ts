@@ -40,7 +40,7 @@ import { stableStringify } from '../message-list/cache/stable-stringify';
 import { SaveQueueManager } from '../save-queue';
 import { AgentThreadLeaseConflictError, agentThreadStreamRuntime } from '../thread-stream-runtime';
 import type { AgentThreadRunRegistration } from '../thread-stream-runtime';
-import type { AgentMemoryOption, AgentModelManagerConfig, AgentSubscribeToThreadOptions, ToolsInput } from '../types';
+import type { AgentMemoryOption, AgentModelManagerConfig, AgentThreadIdentityOptions, ToolsInput } from '../types';
 import { isSupportedLanguageModel } from '../utils';
 
 import { publishAbortRequest } from './abort-transport';
@@ -227,6 +227,8 @@ const LIST_ACTIVE_RUNS_STORAGE_BATCH_SIZE = 100;
  * Options for DurableAgent.stream()
  */
 export interface DurableAgentStreamOptions<OUTPUT = undefined> {
+  /** Signal chunks to hide from this caller's stream. Does not affect generated results. */
+  hideSignals?: AgentExecutionOptions<OUTPUT>['hideSignals'];
   /** Custom instructions that override the agent's default instructions for this execution */
   instructions?: AgentExecutionOptions<OUTPUT>['instructions'];
   /** Additional context messages to provide to the agent */
@@ -303,6 +305,8 @@ export interface DurableAgentStreamOptions<OUTPUT = undefined> {
   system?: AgentExecutionOptions<OUTPUT>['system'];
   /** When true, background tasks are disabled for this run. */
   disableBackgroundTasks?: AgentExecutionOptions<OUTPUT>['disableBackgroundTasks'];
+  /** Execution-scoped background dispatch policy for delegated agents. */
+  backgroundTaskPolicy?: AgentExecutionOptions<OUTPUT>['backgroundTaskPolicy'];
   /** Tracing options forwarded to the agent/model spans. */
   tracingOptions?: AgentExecutionOptions<OUTPUT>['tracingOptions'];
   /** Per-call actor signal forwarded to FGA checks and tool execution. */
@@ -498,6 +502,18 @@ export interface DurableAgentConfig<
    * from a trusted provider after restart.
    */
   durableRequestContextKeys?: readonly string[];
+
+  /**
+   * Per-topic opt-out of the replay cache.
+   *
+   * Return `false` to publish a topic straight through to the underlying
+   * PubSub without recording it in the cache. Subscribers of that topic then
+   * receive live events only and cannot resume from an offset. Use this to
+   * trade replay for minimum publish latency on hot topics when the cache is
+   * remote (e.g. cross-region Redis). Run-local topics are always excluded,
+   * regardless of this option.
+   */
+  shouldCache?: (topic: string) => boolean;
 }
 
 /**
@@ -715,6 +731,9 @@ export class DurableAgent<
   /** Explicit application context allowlist for durable serialization. */
   readonly #durableRequestContextKeys: readonly string[];
 
+  /** User-supplied per-topic cache policy (see DurableAgentConfig.shouldCache) */
+  readonly #shouldCache: ((topic: string) => boolean) | undefined;
+
   /**
    * Create a new DurableAgent that wraps an existing Agent
    */
@@ -728,6 +747,7 @@ export class DurableAgent<
       maxSteps,
       cleanupTimeoutMs,
       durableRequestContextKeys,
+      shouldCache,
     } = config;
 
     // Use provided id/name or fall back to agent.id/agent.name
@@ -756,6 +776,7 @@ export class DurableAgent<
     this.#cacheConfig = cache;
     this.#cleanupTimeoutMs = cleanupTimeoutMs ?? 30_000;
     this.#durableRequestContextKeys = Object.freeze([...(durableRequestContextKeys ?? [])]);
+    this.#shouldCache = shouldCache;
   }
 
   // ===========================================================================
@@ -1469,6 +1490,13 @@ export class DurableAgent<
       // the existing instance instead of double-wrapping.
       this.#cachingPubsub = this.#innerPubsub;
       this.#resolvedCache = this.#cacheConfig ?? this.#mastra?.serverCache ?? null;
+      if (this.#shouldCache) {
+        // The existing wrapper owns the caching policy; a per-agent filter
+        // cannot be applied without double-wrapping, so it is ignored.
+        this.logger.warn(
+          `[DurableAgent:${this.id}] 'shouldCache' is ignored because the configured pubsub is already a CachingPubSub. Pass 'shouldCache' to that CachingPubSub instead.`,
+        );
+      }
     } else {
       // Resolve cache: user-provided > mastra's cache > default InMemoryServerCache
       const resolvedCache = this.#cacheConfig ?? this.#mastra?.serverCache ?? new InMemoryServerCache();
@@ -1479,8 +1507,9 @@ export class DurableAgent<
       // declared here instead. Without it, per-run `workflow.events.v2.*` watch
       // events (cumulative step results, often megabytes) are RPUSHed into a
       // shared store that no other instance can ever read from (issue #20646).
+      const userShouldCache = this.#shouldCache;
       this.#cachingPubsub = new CachingPubSub(this.#innerPubsub, resolvedCache, {
-        shouldCache: topic => !isRunLocalTopic(topic),
+        shouldCache: topic => !isRunLocalTopic(topic) && (userShouldCache?.(topic) ?? true),
       });
     }
   }
@@ -1870,6 +1899,7 @@ export class DurableAgent<
       maxSteps: this.#maxSteps,
       cleanupTimeoutMs: this.#cleanupTimeoutMs,
       durableRequestContextKeys: this.#durableRequestContextKeys,
+      shouldCache: this.#shouldCache,
     });
 
     // Preserve runtime state set after construction (mastra registration and the
@@ -2005,8 +2035,29 @@ export class DurableAgent<
     await emitErrorEvent(this.pubsub, runId, error);
   }
 
-  /** Abort the durable execution currently holding a thread lease. */
-  abortThreadStream(options: AgentSubscribeToThreadOptions): boolean {
+  /**
+   * `emitError` for fire-and-forget call sites. A pubsub that is already
+   * closing (for example during shutdown) must not turn a run's own failure
+   * into an unhandledRejection.
+   */
+  protected emitErrorInBackground(runId: string, error: Error): void {
+    this.emitError(runId, error).catch(publishError => {
+      this.logger.warn(`Failed to publish error event for run ${runId}`, { runId, error: publishError });
+    });
+  }
+
+  /**
+   * Abort the thread's active run.
+   *
+   * The base implementation flips the run's prepared `AbortController`, which a
+   * durable run never has: its controller lives on this agent's run registry,
+   * and the steps reading it may execute in another process. Without the abort
+   * request below, aborting a thread whose active run is durable records an
+   * intent nothing reads and lets the run stream on.
+   */
+  abortThreadStream(options: AgentThreadIdentityOptions): boolean {
+    // Resolve the run before the base call: aborting releases the thread lease,
+    // after which the thread no longer has an active run to look up.
     const runId = agentThreadStreamRuntime.getActiveThreadRunId(options, this.getPubSub());
     const registryEntry = runId ? (this.#runRegistry.get(runId) ?? getGlobalRunRegistryEntry(runId)) : undefined;
     if (registryEntry && registryEntry.agentId !== this.id) return false;
@@ -3608,6 +3659,7 @@ export class DurableAgent<
       // value ({ continue, feedback }). The pubsub ITERATION_COMPLETE event
       // still fires for external observability subscribers.
       closeOnSuspend: (options as any)?.[CLOSE_ON_SUSPEND] === true,
+      hideSignals: options?.hideSignals,
       structuredOutput: registryEntry.structuredOutput as any,
       outputProcessors: registryEntry.outputProcessors,
       requestContext: registryEntry.requestContext,
@@ -3695,7 +3747,7 @@ export class DurableAgent<
         }
       })
       .catch(error => {
-        void this.emitError(runId, error);
+        this.emitErrorInBackground(runId, error);
       });
     const trackedEntry = globalRunRegistry.get(runId);
     if (trackedEntry) {
@@ -4155,6 +4207,7 @@ export class DurableAgent<
       offset: resumeOffset,
       onChunk: resolvedOptions.onChunk,
       experimentalTransform: resolvedOptions.experimentalTransform,
+      hideSignals: resolvedOptions.hideSignals,
       onStepFinish: resolvedOptions.onStepFinish,
       onFinish: resolvedOptions.onFinish,
       onStreamFinished: scheduleAutoCleanup,
@@ -4197,6 +4250,7 @@ export class DurableAgent<
         const activeEntry = entry;
         const pinnedEntry = pinGlobalRunRegistryEntry(runId);
         if (pinnedEntry !== activeEntry) this.#throwRunIdConflict(runId);
+        let result;
         try {
           const run = await workflow.createRun({
             runId,
@@ -4214,7 +4268,7 @@ export class DurableAgent<
             });
           }
           try {
-            await run.resume({
+            result = await run.resume({
               resumeData,
               label: resumeLabel,
               requestContext: resumeRequestContext,
@@ -4229,9 +4283,15 @@ export class DurableAgent<
         } finally {
           unpinGlobalRunRegistryEntry(runId, activeEntry.runtimeBindingId);
         }
+        if (result?.status === 'failed') {
+          const error = new Error((result as any).error?.message || 'Workflow resume failed');
+          this.emitErrorInBackground(runId, error);
+        }
+        // The workflow onFinish hook owns terminal snapshot cleanup for
+        // start, resume, and recovery, including failed terminals.
       })
       .catch(error => {
-        void this.emitError(runId, error);
+        this.emitErrorInBackground(runId, error);
       });
     const trackedResumeEntry = getBoundRunRegistryEntry(runId, runtimeBindingId);
     if (trackedResumeEntry) {
@@ -4800,7 +4860,7 @@ export class DurableAgent<
         }
       })
       .catch(error => {
-        void this.emitError(runId, error);
+        this.emitErrorInBackground(runId, error);
       });
     const trackedEntry = globalRunRegistry.get(runId);
     if (trackedEntry) {

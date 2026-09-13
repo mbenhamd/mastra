@@ -91,7 +91,14 @@ import {
   HarnessWakeupWorker,
   HarnessChannelOutboxWorker,
 } from '../worker';
-import type { HarnessWakeupWorkerConfig, HarnessChannelOutboxWorkerConfig, MastraWorker, WorkerDeps } from '../worker';
+import type {
+  HarnessWakeupWorkerConfig,
+  HarnessChannelOutboxWorkerConfig,
+  MastraWorker,
+  WorkerDeps,
+  WorkerStopOptions,
+} from '../worker';
+import { assertDrainTimeout } from '../worker/drain-timeout';
 import type { AnyWorkflow, Workflow } from '../workflows';
 import { normalizeWorkflowBuilderDefinition } from '../workflows/builder';
 import type { WorkflowBuilderDefinitionInput } from '../workflows/builder';
@@ -740,6 +747,23 @@ export interface MastraRecoveryConfig {
   durableAgents?: 'auto' | 'off';
 }
 
+export interface WorkersConfigSection {
+  enabled: boolean;
+  [key: string]: unknown;
+}
+
+export interface WorkersConfig {
+  version: 1;
+  orchestration: WorkersConfigSection;
+  scheduler: WorkersConfigSection;
+  backgroundTasks: WorkersConfigSection;
+  custom: string[];
+}
+
+function serializableWorkerConfig<T extends object>(config: T | undefined): Record<string, unknown> {
+  return JSON.parse(JSON.stringify(config ?? {})) as Record<string, unknown>;
+}
+
 /**
  * The central orchestrator for Mastra applications, managing agents, workflows, storage, logging, observability, and more.
  *
@@ -789,7 +813,33 @@ const attachedLoggerOwners = new WeakMap<object, unknown>();
  */
 const SCHEDULER_WAKE_TOPIC = 'scheduler';
 const SCHEDULER_WAKE_EVENT = 'scheduler.wake';
+// Default budget shutdown() gives in-flight evented workflow runs (and
+// stopWorkers() gives in-flight push events) before tearing down pubsub.
+// Mirrors BackgroundTaskManager's grace period and the deployer's
+// `server.drainTimeout` default.
+const DEFAULT_SHUTDOWN_DRAIN_TIMEOUT_MS = 5_000;
 
+/**
+ * Registers and coordinates agents, workflows, storage, and other Mastra services.
+ *
+ * @example
+ * `yourAgent` is an agent you have already configured.
+ * ```typescript
+ * import { Mastra } from '@mastra/core/mastra';
+ *
+ * const mastra = new Mastra({
+ *   agents: { assistant: yourAgent },
+ * });
+ * ```
+ *
+ * @see For documentation bundled with your installed package, locate
+ * `@mastra/core/package.json` with your project's resolver or package-manager
+ * tooling, then read `dist/docs/SKILL.md` from that package root and follow its
+ * reference links. Use package-manager tools for virtual or archived packages.
+ *
+ * @see [Mastra documentation](https://mastra.ai/reference/core/mastra-class)
+ * if packaged docs are unavailable.
+ */
 export class Mastra<
   TAgents extends Record<string, Agent<any>> = Record<string, Agent<any>>,
   TWorkflows extends Record<string, AnyWorkflow> = Record<string, AnyWorkflow>,
@@ -967,6 +1017,14 @@ export class Mastra<
   // unsubscribe it cleanly during stopWorkers().
   #pushSubscription?: PushWorkflowSubscription;
   #pushSubscriptionStartPromise?: Promise<PushWorkflowSubscription | undefined>;
+  // handleWorkflowEvent() calls started by the push subscription that have not
+  // settled yet. stopWorkers() waits for these (bounded) after unsubscribing so
+  // a step mid-execution is not abandoned by teardown.
+  #inFlightPushEvents = new Set<Promise<unknown>>();
+  // Result promises of evented workflow runs started through this instance
+  // (see EventedExecutionEngine.execute). shutdown() drains these before it
+  // tears down the pubsub subscriptions they need in order to make progress.
+  #activeEventedRuns = new Set<Promise<unknown>>();
   // Tracks (topic, listener) pairs registered against the pubsub on behalf of
   // user-defined event listeners during startWorkers(). Used to make
   // startWorkers()/stopWorkers() idempotent — a second startWorkers() call
@@ -1118,6 +1176,27 @@ export class Mastra<
 
   getWorker<T extends MastraWorker>(name: string): T | undefined {
     return this.#workers.find(w => w.name === name) as T | undefined;
+  }
+
+  /** Returns a serializable snapshot of this instance's active worker configuration. */
+  getWorkerConfig(): WorkersConfig {
+    const runningWorkerNames = new Set(this.#workers.filter(worker => worker.isRunning).map(worker => worker.name));
+
+    return {
+      version: 1,
+      orchestration: { enabled: runningWorkerNames.has('orchestration') },
+      scheduler: {
+        ...serializableWorkerConfig(this.#schedulerConfig),
+        enabled: runningWorkerNames.has('scheduler'),
+      },
+      backgroundTasks: {
+        ...serializableWorkerConfig(this.#backgroundTaskConfig),
+        enabled: runningWorkerNames.has('backgroundTasks'),
+      },
+      custom: [...runningWorkerNames]
+        .filter(name => !['orchestration', 'scheduler', 'backgroundTasks'].includes(name))
+        .sort(),
+    };
   }
 
   get backgroundTaskManager() {
@@ -4143,6 +4222,23 @@ export class Mastra<
   }
 
   /**
+   * Track an in-flight evented workflow run owned by this instance so
+   * {@link shutdown} can let it settle before tearing down pubsub. Returns a
+   * release function the caller must invoke once the run has settled.
+   *
+   * @internal
+   */
+  __trackEventedRun(execution: Promise<unknown>): () => void {
+    // Tracking must never turn a run's rejection into an unhandledRejection;
+    // the caller still observes the original promise.
+    execution.catch(() => {});
+    this.#activeEventedRuns.add(execution);
+    return () => {
+      this.#activeEventedRuns.delete(execution);
+    };
+  }
+
+  /**
    * Register a workflow under an internal-only registry.
    *
    * - Without `runId`: stored at the bare `${id}` slot. Used by single-instance
@@ -6320,7 +6416,10 @@ export class Mastra<
       // silently clobbering.
       const ownershipKey = inner.__observabilityAttachmentKey?.() ?? inner;
       const previousOwner = attachedLoggerOwners.get(ownershipKey);
-      if (previousOwner && previousOwner !== this) {
+      // Only warn when export is active: re-attaching clobbers the export
+      // target only when loggerOptions.export is enabled. With export disabled
+      // there is nothing to clobber, so the warning would be a false positive.
+      if (previousOwner && previousOwner !== this && this.#loggerAdapterOptions.export) {
         try {
           inner.warn(
             'This logger instance is already wired to another Mastra instance; re-attaching. ' +
@@ -7616,7 +7715,7 @@ export class Mastra<
         return;
       }
 
-      void this.handleWorkflowEvent(event)
+      const inFlight = this.handleWorkflowEvent(event)
         .then(result => {
           if (result.ok) {
             if (ack) {
@@ -7647,6 +7746,8 @@ export class Mastra<
           }
         })
         .catch(error => this.#logger?.error?.('Unhandled error in workflow event push subscription', error));
+      this.#inFlightPushEvents.add(inFlight);
+      void inFlight.finally(() => this.#inFlightPushEvents.delete(inFlight));
     };
     const subscription: PushWorkflowSubscription = { topic: 'workflows', cb, subscribed: false };
     this.#pushSubscription = subscription;
@@ -7805,16 +7906,26 @@ export class Mastra<
 
   /**
    * Stop all running workers and unsubscribe event listeners.
+   *
+   * Workflow events already being processed are given up to
+   * `options.drainTimeout` milliseconds (default 5000) to finish before the
+   * pubsub is flushed.
    */
-  public async stopWorkers(): Promise<void> {
-    // Block lazy scheduling/execution starts before entering the serialized,
-    // timeout-bounded shutdown path below.
+  public async stopWorkers(options?: WorkerStopOptions): Promise<void> {
+    const drainTimeout = assertDrainTimeout(options?.drainTimeout ?? DEFAULT_SHUTDOWN_DRAIN_TIMEOUT_MS, 'stopWorkers');
+    // One deadline for the whole call. Each worker's transport drain and the
+    // push-event drain below typically wait on the same stuck step, so giving
+    // each phase the full budget would multiply the worst-case stop time.
+    const deadline = Date.now() + drainTimeout;
+    // Block new lazy starts immediately. Runtime signals that arrive during
+    // teardown still set their request flags, so a later startWorkers() can
+    // honor them, but they must not resurrect workers behind a stopped instance.
     this.#workersStarted = false;
     if (this.#workersStopPromise) {
       return this.#workersStopPromise;
     }
 
-    const stop = this.#stopWorkers();
+    const stop = this.#stopWorkers(deadline);
     this.#workersStopPromise = stop;
     try {
       await stop;
@@ -7825,7 +7936,8 @@ export class Mastra<
     }
   }
 
-  async #stopWorkers(): Promise<void> {
+  async #stopWorkers(deadline: number): Promise<void> {
+    const remaining = () => Math.max(0, deadline - Date.now());
     this.#workersStarted = false;
     this.#executionWorkersStarted = false;
     this.#workerLifecycleGeneration += 1;
@@ -7840,14 +7952,17 @@ export class Mastra<
             reason => ({ status: 'rejected' as const, reason }),
           ),
           new Promise<{ status: 'timed-out'; reason: Error }>(resolve => {
-            executionWorkersStartTimeout = setTimeout(() => {
-              resolve({
-                status: 'timed-out',
-                reason: new Error(
-                  `Timed out waiting for execution worker startup during shutdown after ${PENDING_WORKER_START_SHUTDOWN_TIMEOUT_MS}ms`,
-                ),
-              });
-            }, PENDING_WORKER_START_SHUTDOWN_TIMEOUT_MS);
+            executionWorkersStartTimeout = setTimeout(
+              () => {
+                resolve({
+                  status: 'timed-out',
+                  reason: new Error(
+                    `Timed out waiting for execution worker startup during shutdown after ${PENDING_WORKER_START_SHUTDOWN_TIMEOUT_MS}ms`,
+                  ),
+                });
+              },
+              Math.min(PENDING_WORKER_START_SHUTDOWN_TIMEOUT_MS, remaining()),
+            );
           }),
         ]).finally(() => {
           if (executionWorkersStartTimeout) {
@@ -7876,15 +7991,18 @@ export class Mastra<
             reason => ({ status: 'rejected' as const, reason, start }),
           ),
           new Promise<{ status: 'timed-out'; reason: Error; start: PendingWorkerStart }>(resolve => {
-            timeout = setTimeout(() => {
-              resolve({
-                status: 'timed-out',
-                reason: new Error(
-                  `Timed out waiting for worker "${start.worker.name}" startup during shutdown after ${PENDING_WORKER_START_SHUTDOWN_TIMEOUT_MS}ms`,
-                ),
-                start,
-              });
-            }, PENDING_WORKER_START_SHUTDOWN_TIMEOUT_MS);
+            timeout = setTimeout(
+              () => {
+                resolve({
+                  status: 'timed-out',
+                  reason: new Error(
+                    `Timed out waiting for worker "${start.worker.name}" startup during shutdown after ${PENDING_WORKER_START_SHUTDOWN_TIMEOUT_MS}ms`,
+                  ),
+                  start,
+                });
+              },
+              Math.min(PENDING_WORKER_START_SHUTDOWN_TIMEOUT_MS, remaining()),
+            );
           }),
         ]);
       } finally {
@@ -7898,7 +8016,7 @@ export class Mastra<
         async () => {
           if (this.#latestWorkerStartTokens.get(start.worker) === start.token && start.worker.isRunning) {
             try {
-              await start.worker.stop();
+              await start.worker.stop({ drainTimeout: 0 });
               if (this.#latestWorkerStartTokens.get(start.worker) === start.token) {
                 this.#latestWorkerStartTokens.delete(start.worker);
                 this.#latestWorkerStartLifecycleGenerations.delete(start.worker);
@@ -7939,7 +8057,7 @@ export class Mastra<
         if (worker.isRunning && !stopAttemptedWorkers.has(worker)) {
           stopAttemptedWorkers.add(worker);
           try {
-            await worker.stop();
+            await worker.stop({ drainTimeout: remaining() });
             this.#latestWorkerStartTokens.delete(worker);
             this.#latestWorkerStartLifecycleGenerations.delete(worker);
           } catch (error) {
@@ -7983,6 +8101,16 @@ export class Mastra<
         recordStopError('Failed to unsubscribe workflow push subscription', error);
       }
     }
+    // Events already handed to handleWorkflowEvent() keep running after the
+    // unsubscribe; wait for them so a step mid-execution finishes (or publishes
+    // its next event) before pubsub is flushed and storage closed.
+    if (this.#inFlightPushEvents.size > 0) {
+      await this.#awaitBounded(
+        Promise.allSettled([...this.#inFlightPushEvents]),
+        remaining(),
+        `${this.#inFlightPushEvents.size} in-flight workflow event(s)`,
+      );
+    }
 
     // Unsubscribe only the (topic, listener) pairs we actually registered in
     // startWorkers() — keeps stopWorkers() symmetric with startWorkers() and
@@ -8015,6 +8143,31 @@ export class Mastra<
     this.#executionWorkersStarted = false;
     if (hasStopError) {
       throw stopError;
+    }
+  }
+
+  /**
+   * Await an already-started promise for at most `timeoutMs`. Returns its value
+   * when it settles in time, or `undefined` after logging a warning when the
+   * budget is exhausted — the work keeps running in the background so teardown
+   * stays best-effort but bounded.
+   */
+  async #awaitBounded<T>(promise: Promise<T>, timeoutMs: number, description: string): Promise<T | undefined> {
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const outcome = await Promise.race([
+        promise.then(value => ({ timedOut: false as const, value })),
+        new Promise<{ timedOut: true }>(resolve => {
+          timeoutHandle = setTimeout(() => resolve({ timedOut: true }), timeoutMs);
+        }),
+      ]);
+      if (outcome.timedOut) {
+        this.#logger?.warn(`Shutdown drain timed out after ${timeoutMs}ms; abandoning ${description}`);
+        return undefined;
+      }
+      return outcome.value;
+    } finally {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
     }
   }
 
@@ -8316,14 +8469,21 @@ export class Mastra<
    *   process.exit(0);
    * });
    * ```
+   *
+   * In-flight evented workflow runs (including durable agent runs) started
+   * through this instance are given up to `drainTimeout` milliseconds
+   * (default 5000) to reach a terminal or suspended state before workers and
+   * pubsub subscriptions are torn down. Runs that do not settle within the
+   * window are abandoned with a warning.
    */
-  async shutdown(): Promise<void> {
+  async shutdown(options?: { drainTimeout?: number }): Promise<void> {
+    const drainTimeout = assertDrainTimeout(options?.drainTimeout ?? DEFAULT_SHUTDOWN_DRAIN_TIMEOUT_MS, 'shutdown');
     this.#shutdownStarted = true;
     if (this.#shutdownPromise) {
       return this.#shutdownPromise;
     }
 
-    const shutdown = this.#shutdown();
+    const shutdown = this.#shutdown(Date.now() + drainTimeout);
     this.#shutdownPromise = shutdown;
     try {
       await shutdown;
@@ -8335,25 +8495,47 @@ export class Mastra<
     }
   }
 
-  async #shutdown(): Promise<void> {
-    // Global scorer hooks must be released before awaited teardown can fail.
+  async #shutdown(deadline: number): Promise<void> {
     this.__unregisterHooks();
     this.#lifecycleState = 'stopping';
-    let stopWorkersError: unknown;
-    let hasStopWorkersError = false;
-    try {
-      // SchedulerWorker is stopped as part of stopWorkers().
-      await this.stopWorkers();
-    } catch (error) {
-      stopWorkersError = error;
-      hasStopWorkersError = true;
-      this.#logger?.error('Failed to stop workers', error);
+    // Evented workflow runs (plain and durable-agent) only progress while the
+    // `workflows` subscriptions below are alive, so let them settle first.
+    // Durable workflows may also still be persisting their next terminal or
+    // suspended snapshot; storage stays open until after this drain either way.
+    // Workers stay up during this drain, so a run can still be started while
+    // we wait (an in-flight request handler, a scheduler tick, a step that
+    // starts another run). Re-snapshot until nothing is left or the deadline
+    // passes rather than gating new runs, which would turn those callers into
+    // errors mid-shutdown.
+    // Each promise is awaited at most once: the durable-agent registry can keep
+    // returning a settled execution, which would otherwise spin this loop.
+    const awaited = new Set<Promise<unknown>>();
+    for (;;) {
+      const pendingRuns = [...this.#activeEventedRuns, ...getActiveDurableAgentWorkflowExecutions(this)].filter(
+        run => !awaited.has(run),
+      );
+      if (pendingRuns.length === 0) break;
+      pendingRuns.forEach(run => awaited.add(run));
+      const drained = await this.#awaitBounded(
+        Promise.allSettled(pendingRuns),
+        Math.max(0, deadline - Date.now()),
+        `${pendingRuns.length} in-flight evented workflow run(s)`,
+      );
+      if (!drained) break;
+      drained.forEach(result => {
+        if (result.status === 'rejected') {
+          this.#logger?.error('Evented workflow run failed during shutdown', {
+            error: result.reason,
+          });
+        }
+      });
     }
+
     let backgroundTaskShutdownError: unknown;
     let hasBackgroundTaskShutdownError = false;
     if (this.#backgroundTaskManager) {
       try {
-        await this.#backgroundTaskManager.shutdown();
+        await this.#backgroundTaskManager.shutdown({ deadline });
       } catch (error) {
         backgroundTaskShutdownError = error;
         hasBackgroundTaskShutdownError = true;
@@ -8361,16 +8543,16 @@ export class Mastra<
       }
     }
 
-    // Durable workflows may still be persisting their next terminal or suspended
-    // snapshot. Keep storage and other shared resources alive until they settle.
-    const durableExecutionResults = await Promise.allSettled(getActiveDurableAgentWorkflowExecutions(this));
-    durableExecutionResults.forEach(result => {
-      if (result.status === 'rejected') {
-        this.#logger?.error('Durable agent execution failed during shutdown', {
-          error: result.reason,
-        });
-      }
-    });
+    let stopWorkersError: unknown;
+    let hasStopWorkersError = false;
+    try {
+      // SchedulerWorker is stopped as part of stopWorkers().
+      await this.stopWorkers({ drainTimeout: Math.max(0, deadline - Date.now()) });
+    } catch (error) {
+      stopWorkersError = error;
+      hasStopWorkersError = true;
+      this.#logger?.error('Failed to stop workers', error);
+    }
 
     // Stop — don't destroy — registered workspaces. Remote sandboxes
     // suspend/pause and stay resumable across process restarts, and

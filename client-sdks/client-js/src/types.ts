@@ -105,6 +105,9 @@ type RequestContextOptions = {
 type GeneratedRequest<T> = OptionalizeUndefined<T>;
 type GeneratedResponse<T extends RouteKey> = Serialized<RouteResponse<T>>;
 
+export type ListFeedbackResponse = GeneratedResponse<'GET /observability/feedback'>;
+export type FeedbackItem = ListFeedbackResponse['feedback'][number];
+
 export interface ClientOptions {
   /** Base URL for API requests */
   baseUrl: string;
@@ -845,6 +848,11 @@ export type CloneMemoryThreadResponse = {
   thread: StorageThreadType;
   clonedMessages: MastraDBMessage[];
 };
+
+export type TransferMemoryThreadParams = GeneratedRequest<
+  Body<'POST /memory/threads/:threadId/transfer'> & QueryParams<'POST /memory/threads/:threadId/transfer'>
+> &
+  RequestContextOptions;
 
 export type GetLogsParams = GeneratedRequest<QueryParams<'GET /logs'>>;
 
@@ -3071,6 +3079,7 @@ export interface DatasetItemVersionResponse {
   expectedTrajectory?: unknown;
   toolMocks?: DatasetItemToolMock[];
   scorerIds?: string[];
+  requestContext?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
   validTo: number | null;
   isDeleted: boolean;

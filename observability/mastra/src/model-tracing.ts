@@ -18,7 +18,6 @@ import { RequestContext } from '@mastra/core/di';
 import { coreFeatures } from '@mastra/core/features';
 import { SpanType } from '@mastra/core/observability';
 import type {
-  Span,
   EndGenerationOptions,
   EndSpanOptions,
   ErrorSpanOptions,
@@ -28,6 +27,8 @@ import type {
   PreparedModelRequestAggregateMetrics,
   PreparedModelRequestMetrics,
   ProviderUsageMeasurementState,
+  ModelStepInput,
+  Span,
   TracingContext,
   UpdateSpanOptions,
   UsageStats,
@@ -49,7 +50,7 @@ function supportsModelInference(): boolean {
 
 import { extractUsageMetrics } from './usage';
 
-type StepInputPreview = Array<{ role: string; content: string }> | Record<string, unknown> | string | undefined;
+type StepInputPreview = ModelStepInput | undefined;
 
 /** Observability must never become part of provider or processor control flow. */
 function runSpanOperation<T>(operation: () => T): T | undefined {

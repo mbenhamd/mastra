@@ -209,6 +209,21 @@ export class InngestPubSub extends PubSub {
     this.realtimeSubscribe = realtimeSubscribe;
   }
 
+  async publishWorkflowWatchTo(workflowId: string, runId: string, data: unknown): Promise<void> {
+    const payload = decodeEvent(
+      {
+        type: 'watch',
+        id: crypto.randomUUID(),
+        runId,
+        data,
+        createdAt: new Date(),
+        deliveryAttempt: 1,
+      },
+      false,
+    );
+    await this.inngest.realtime.publish(buildTopicRef(`workflow:${workflowId}:${runId}`, 'watch'), payload);
+  }
+
   /**
    * Publish an event to Inngest's realtime system.
    *

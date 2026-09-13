@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { ActorSignal } from '@mastra/core/auth/ee';
 import type { RequestContext } from '@mastra/core/di';
 import { getErrorFromUnknown, MastraNonRetryableError } from '@mastra/core/error';
@@ -23,11 +23,44 @@ import type {
 } from '@mastra/core/workflows';
 import type { Inngest, BaseContext } from 'inngest';
 import { NonRetriableError, StepError } from 'inngest';
+import type { NestedWorkflowResult } from './nested-workflow-output';
 import { NESTED_WORKFLOW_OUTPUT_MODE } from './nested-workflow-output';
 import { inngestWorkflowResumeOperationHash } from './resume-operation';
 import { InngestWorkflow } from './workflow';
 
 const RESUMED_CHILD_TERMINAL_STATUSES = new Set(['success', 'failed', 'canceled', 'tripwire', 'bailed', 'skipped']);
+const NESTED_WORKFLOW_RUN_ID_NAMESPACE = 'inngest-nested-workflow-run-v1';
+
+function deriveNestedWorkflowRunId({
+  workflowId,
+  parentRunId,
+  stepId,
+  executionPath,
+  foreachIndex,
+  loopIterationCount,
+  executionGeneration,
+}: {
+  workflowId: string;
+  parentRunId: string;
+  stepId: string;
+  executionPath: number[];
+  foreachIndex?: number;
+  loopIterationCount?: number;
+  executionGeneration?: string;
+}): string {
+  const identity = [
+    NESTED_WORKFLOW_RUN_ID_NAMESPACE,
+    workflowId,
+    parentRunId,
+    stepId,
+    executionPath,
+    foreachIndex ?? null,
+    loopIterationCount ?? null,
+    executionGeneration ?? null,
+  ];
+
+  return `nested-${createHash('sha256').update(JSON.stringify(identity)).digest('hex')}`;
+}
 
 function isNonRetryableStepFailure(error: unknown): boolean {
   if (error instanceof MastraNonRetryableError || error instanceof NonRetriableError) {
@@ -73,6 +106,7 @@ export class InngestExecutionEngine extends DefaultExecutionEngine {
     inngestStep: BaseContext<Inngest>['step'],
     inngestAttempts: number = 0,
     options: ExecutionEngineOptions,
+    private parentStream?: { workflowId: string; runId: string },
   ) {
     super({ mastra, options });
     this.inngestStep = inngestStep;
@@ -322,6 +356,7 @@ export class InngestExecutionEngine extends DefaultExecutionEngine {
       input?: unknown;
       entityType?: string;
       entityId?: string;
+      attributes?: Record<string, unknown>;
       tracingPolicy?: any;
     };
     executionContext: ExecutionContext;
@@ -538,6 +573,10 @@ export class InngestExecutionEngine extends DefaultExecutionEngine {
         }
       : undefined;
 
+    const parentStream = this.parentStream ?? {
+      workflowId: executionContext.workflowId,
+      runId: executionContext.runId,
+    };
     const resumeStepId = resume?.steps?.[0];
     const resumeStepResult = resumeStepId ? stepResults[resumeStepId] : undefined;
     const resumeStepIsSuspended = resumeStepResult?.status === 'suspended';
@@ -547,6 +586,30 @@ export class InngestExecutionEngine extends DefaultExecutionEngine {
     let runId: string;
 
     const isTimeTravel = !!(timeTravel && timeTravel.steps?.length > 1 && timeTravel.steps[0] === step.id);
+
+    // Fresh nested runs use a deterministic, bounded child ID so replay passes
+    // address the same child snapshot. The parent run ID remains part of the
+    // identity, so recursive nested calls carry their ancestry through the
+    // authoritative child run ID in the trigger data.
+    // Capture the caller's metadata before invoking the nested workflow. The
+    // core step handler shallow-merges this result over the caller step, so
+    // returning only nested metadata would otherwise lose loop occurrence
+    // state (and any other caller-owned metadata) while the child runs.
+    const parentStepMetadata = { ...(stepResults[step.id]?.metadata ?? {}) };
+    const loopIterationCount = parentStepMetadata.iterationCount;
+    const derivedNestedRunId = deriveNestedWorkflowRunId({
+      workflowId: executionContext.workflowId,
+      parentRunId: executionContext.runId,
+      stepId: step.id,
+      executionPath: executionContext.executionPath,
+      foreachIndex: executionContext.foreachIndex,
+      loopIterationCount,
+      executionGeneration: executionContext.executionGeneration,
+    });
+    const nestedRunIdMetadata = stepResults[step.id]?.metadata?.nestedRunId;
+    const timeTravelSourceRunId =
+      stepResults[step.id]?.suspendPayload?.__workflow_meta?.runId ??
+      (typeof nestedRunIdMetadata === 'string' ? nestedRunIdMetadata : undefined);
 
     try {
       const workflowsStoreForResume =
@@ -598,7 +661,9 @@ export class InngestExecutionEngine extends DefaultExecutionEngine {
             : snapshot.status === 'suspended'
               ? snapshot
               : undefined;
-        if (!resumeSource && !retainedReceipt) {
+        const replayOnly =
+          !resumeSource && !retainedReceipt && RESUMED_CHILD_TERMINAL_STATUSES.has(snapshot.status as string);
+        if (!resumeSource && !retainedReceipt && !replayOnly) {
           throw new NonRetriableError(
             `Cannot resume nested workflow run ${step.id}/${runId}: workflow run is not suspended`,
           );
@@ -639,7 +704,27 @@ export class InngestExecutionEngine extends DefaultExecutionEngine {
           });
 
         let exactReceiptReplay = false;
-        if (retainedReceipt) {
+        if (replayOnly) {
+          const invokeResp = (await this.inngestStep.invoke(`workflow.${executionContext.workflowId}.step.${step.id}`, {
+            function: step.getFunction(),
+            data: {
+              inputData,
+              initialState: executionContext.state ?? {},
+              requestContext: forwardedRequestContext,
+              parentStream,
+              runId,
+              outputOptions,
+              nestedWorkflowOutputMode: NESTED_WORKFLOW_OUTPUT_MODE.COMPACT,
+              perStep,
+              tracingOptions: nestedTracingContext,
+              actor,
+            },
+          })) as any;
+          result = invokeResp.result;
+          runId = invokeResp.runId;
+          executionContext.state = invokeResp.result.state;
+          exactReceiptReplay = true;
+        } else if (retainedReceipt) {
           const replaySteps =
             requestedNestedResumeSteps.length > 0
               ? requestedNestedResumeSteps
@@ -712,6 +797,7 @@ export class InngestExecutionEngine extends DefaultExecutionEngine {
                 inputData,
                 resourceId,
                 requestContext: forwardedRequestContext,
+                parentStream,
                 runId: runId,
                 resume: {
                   runId: runId,
@@ -723,6 +809,7 @@ export class InngestExecutionEngine extends DefaultExecutionEngine {
                 resumeOperationHash,
                 parentExecution,
                 outputOptions,
+                nestedWorkflowOutputMode: NESTED_WORKFLOW_OUTPUT_MODE.COMPACT,
                 perStep,
                 tracingOptions: nestedTracingContext,
                 actor,
@@ -776,7 +863,7 @@ export class InngestExecutionEngine extends DefaultExecutionEngine {
         const workflowsStoreForTimeTravel = await this.mastra?.getStorage()?.getStore('workflows');
         const snapshot: any = (await workflowsStoreForTimeTravel?.loadWorkflowSnapshot({
           workflowName: step.id,
-          runId: executionContext.runId,
+          runId: timeTravelSourceRunId ?? derivedNestedRunId,
         })) ?? { context: {} };
         const timeTravelParams = createTimeTravelExecutionParams({
           steps: timeTravel.steps.slice(1),
@@ -793,7 +880,8 @@ export class InngestExecutionEngine extends DefaultExecutionEngine {
             timeTravel: timeTravelParams,
             initialState: executionContext.state ?? {},
             requestContext: forwardedRequestContext,
-            runId: executionContext.runId,
+            parentStream,
+            runId: derivedNestedRunId,
             outputOptions: { includeState: true, includeResumeLabels: true },
             nestedWorkflowOutputMode: NESTED_WORKFLOW_OUTPUT_MODE.COMPACT,
             perStep,
@@ -809,13 +897,16 @@ export class InngestExecutionEngine extends DefaultExecutionEngine {
         // event against `data.runId` on the trigger, so a nested run invoked
         // without one cannot be cancelled by id — and it would take the
         // unnamed-run branch, warning about advice the caller cannot act on.
-        const nestedRunId = randomUUID();
+        // Derived (not random) so every replay pass addresses the same child
+        // snapshot — see `derivedNestedRunId` above.
+        const nestedRunId = derivedNestedRunId;
         const invokeResp = (await this.inngestStep.invoke(`workflow.${executionContext.workflowId}.step.${step.id}`, {
           function: step.getFunction(),
           data: {
             inputData,
             initialState: executionContext.state ?? {},
             requestContext: forwardedRequestContext,
+            parentStream,
             runId: nestedRunId,
             outputOptions: { includeState: true, includeResumeLabels: true },
             nestedWorkflowOutputMode: NESTED_WORKFLOW_OUTPUT_MODE.COMPACT,
@@ -845,6 +936,12 @@ export class InngestExecutionEngine extends DefaultExecutionEngine {
         // workflow result so cancellation and resume stay scoped to it.
         runId = failedResult.runId || randomUUID();
       } else {
+        // Log before flattening: Error objects don't survive snapshot
+        // serialization (JSON.stringify(new Error('x')) is `{}`), so without
+        // this the real cause never surfaces past "Workflow failed".
+        this.logger?.error(
+          `Nested workflow step ${step.id} failed: ` + (e instanceof Error ? (e.stack ?? e.message) : String(e)),
+        );
         // Fallback: if we can't get the result from error, construct a basic failed result
         runId = runId! || randomUUID();
         result = {
@@ -1027,6 +1124,11 @@ export class InngestExecutionEngine extends DefaultExecutionEngine {
     Object.assign(executionContext, res.executionContext);
     return {
       ...res.result,
+      metadata: {
+        ...((res.result as StepResult<any, any, any, any>).metadata ?? {}),
+        ...parentStepMetadata,
+        nestedRunId: runId,
+      },
       startedAt,
       payload: inputData,
       resumedAt: resume?.steps[0] === step.id ? startedAt : undefined,

@@ -358,6 +358,7 @@ describe('MCP Tool Tracing', () => {
           toolCallId: 'test-call-id',
           mcpServer: 'filesystem-server',
           serverVersion: '1.2.0',
+          toolType: 'tool',
           toolDescription: 'List files in a directory',
           toolCallId: 'test-call-id',
         },
@@ -468,6 +469,7 @@ describe('MCP Tool Tracing', () => {
       toolCallId: 'test-call-id',
       mcpServer: 'my-mcp-server',
       serverVersion: undefined,
+      toolType: 'tool',
       toolDescription: 'Read a resource',
       toolCallId: 'test-call-id',
     });

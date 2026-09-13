@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { MastraReactProvider } from '@mastra/react';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { cleanup, fireEvent, render as renderUI, screen, waitFor, within } from '@testing-library/react';
 import { http } from 'msw';
 import { setupServer } from 'msw/node';
 import type { ReactNode } from 'react';
@@ -11,6 +12,15 @@ import type { TraceDataPanelViewProps } from '../trace-data-panel-view';
 import { deepTraceFixture, nestedSpanFixture, rootSpanFixture } from './fixtures/trace-data-panel-view';
 import { installHighlightApi } from '@/test/highlight-api';
 import type { HighlightApiHarness } from '@/test/highlight-api';
+
+let queryClient: QueryClient;
+beforeEach(() => {
+  queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+});
+const render = (ui: ReactNode) =>
+  renderUI(ui, {
+    wrapper: ({ children }) => <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>,
+  });
 
 const baseProps: TraceDataPanelViewProps = {
   traceId: 'trace-1',
@@ -27,6 +37,7 @@ Element.prototype.scrollIntoView = scrollIntoView;
 
 afterEach(() => {
   cleanup();
+  queryClient.clear();
   scrollIntoView.mockClear();
 });
 
@@ -321,8 +332,9 @@ describe('TraceDataPanelView — the header', () => {
   it('names the trace by a shortened id in the side panel', () => {
     render(<TraceDataPanelView {...baseProps} traceId="0123456789abcdef0123" />);
 
-    expect(screen.getByText(/# 0123456789ab/)).toBeTruthy();
-    expect(screen.queryByText(/0123456789abcdef0123/)).toBeNull();
+    const heading = screen.getByRole('heading', { name: /^Trace 0123456789ab…/ });
+    expect(heading.textContent).not.toContain('#');
+    expect(screen.queryByText('0123456789abcdef0123')).toBeNull();
   });
 
   it('drops the trace id, and every side-panel control, on the trace page', () => {
@@ -331,7 +343,7 @@ describe('TraceDataPanelView — the header', () => {
     );
 
     expect(screen.getByText('Trace Timeline')).toBeTruthy();
-    expect(screen.queryByText(/# trace-1/)).toBeNull();
+    expect(screen.queryByRole('heading', { name: /trace-1/ })).toBeNull();
     expect(screen.queryByRole('button', { name: /previous trace/i })).toBeNull();
     expect(screen.queryByRole('button', { name: /collapse panel/i })).toBeNull();
     openTraceActions();
@@ -367,7 +379,7 @@ describe('TraceDataPanelView — the header', () => {
 
     expect(screen.queryByText('agent run')).toBeNull();
     // The header stays, so the panel can be expanded again.
-    expect(screen.getByText(/# trace-1/)).toBeTruthy();
+    expect(screen.getByRole('heading', { name: /trace-1/ })).toBeTruthy();
   });
 
   it('offers trace-to-trace navigation as soon as either direction exists', () => {
@@ -960,10 +972,17 @@ describe('TraceDataPanelView — trace feedback tab', () => {
     expect(screen.getByText('feedback for trace-1')).toBeTruthy();
   });
 
-  it('shows the badge count in the Feedback tab label', () => {
-    render(<TraceDataPanelView {...baseProps} feedbackTabSlot={() => null} feedbackTabBadge={2} />);
+  it('renders the feedback tab badge inside the Feedback tab label', () => {
+    render(
+      <TraceDataPanelView
+        {...baseProps}
+        feedbackTabSlot={() => null}
+        feedbackTabBadge={<span data-testid="feedback-badge" />}
+      />,
+    );
 
-    expect(screen.getByRole('tab', { name: /feedback \(2\)/i })).toBeTruthy();
+    const tab = screen.getByRole('tab', { name: /^feedback/i });
+    expect(within(tab).getByTestId('feedback-badge')).toBeTruthy();
   });
 
   it('renders no tabs when neither slot is provided', () => {

@@ -62,8 +62,11 @@ afterEach(() => {
 });
 
 describe('durable tool-call provider-tool fallback', () => {
-  it('resolves a provider-defined tool by its model-facing name', async () => {
-    const executeMock = vi.fn().mockResolvedValue({ snippet: 'result' });
+  it.each([
+    { label: 'a value', expectedResult: { snippet: 'result' } },
+    { label: 'undefined', expectedResult: undefined },
+  ])('resolves a provider-defined tool by its model-facing name when it returns $label', async ({ expectedResult }) => {
+    const executeMock = vi.fn().mockResolvedValue(expectedResult);
     // Provider-defined tool: JS key `webSearch`, model-facing id `openai.web_search`
     // The LLM emits `web_search`, which doesn't match the JS key.
     globalRunRegistry.set(RUN_ID, {
@@ -95,7 +98,8 @@ describe('durable tool-call provider-tool fallback', () => {
 
     expect(executeMock).toHaveBeenCalledTimes(1);
     expect(result.error).toBeUndefined();
-    expect(result.result).toEqual({ snippet: 'result' });
+    expect(result.result).toEqual(expectedResult);
+    expect(result.serverExecuted).toBe(true);
   });
 
   it('falls back to resolveTool() against the Mastra-wide registry when not in run registry', async () => {
@@ -133,6 +137,7 @@ describe('durable tool-call provider-tool fallback', () => {
     expect(executeMock).toHaveBeenCalledTimes(1);
     expect(result.error).toBeUndefined();
     expect(result.result).toEqual({ ok: true });
+    expect(result.serverExecuted).toBe(true);
   });
 
   it('never falls back to an unwrapped Mastra-wide tool for a policy-bound run', async () => {
@@ -214,42 +219,49 @@ describe('durable tool-call provider-tool fallback', () => {
     await expect(execution).rejects.toMatchObject({ id: 'DURABLE_AGENT_TOOL_HOOK_POLICY_UNAVAILABLE' });
   });
 
-  it('falls back to a Mastra-wide provider tool when run registry and resolveTool miss', async () => {
-    const executeMock = vi.fn().mockResolvedValue({ snippet: 'web-result' });
-    const mastraTools = {
-      webSearch: {
-        type: 'provider-defined',
-        id: 'openai.web_search',
-        execute: executeMock,
-      },
-    };
-    vi.mocked(resolveRuntime.resolveTool).mockReturnValueOnce(undefined as any);
+  it.each([
+    { label: 'a value', expectedResult: { snippet: 'web-result' } },
+    { label: 'undefined', expectedResult: undefined },
+  ])(
+    'falls back to a Mastra-wide provider tool when run registry and resolveTool miss and it returns $label',
+    async ({ expectedResult }) => {
+      const executeMock = vi.fn().mockResolvedValue(expectedResult);
+      const mastraTools = {
+        webSearch: {
+          type: 'provider-defined',
+          id: 'openai.web_search',
+          execute: executeMock,
+        },
+      };
+      vi.mocked(resolveRuntime.resolveTool).mockReturnValueOnce(undefined as any);
 
-    globalRunRegistry.set(RUN_ID, {
-      runtimeBindingId: RUNTIME_BINDING_ID,
-      tools: {},
-      model: {} as any,
-    } as any);
+      globalRunRegistry.set(RUN_ID, {
+        runtimeBindingId: RUNTIME_BINDING_ID,
+        tools: {},
+        model: {} as any,
+      } as any);
 
-    const step = createDurableToolCallStep();
-    const result = await (step as any).execute({
-      inputData: {
-        toolCallId: 'call-provider-mastra',
-        toolName: 'web_search',
-        args: { query: 'mastra' },
-      },
-      mastra: { getLogger: () => undefined, listTools: () => mastraTools },
-      suspend: vi.fn(),
-      resumeData: undefined,
-      requestContext: new Map(),
-      getInitData: () => makeInitData(),
-      [PUBSUB_SYMBOL]: mockPubsub(),
-    });
+      const step = createDurableToolCallStep();
+      const result = await (step as any).execute({
+        inputData: {
+          toolCallId: 'call-provider-mastra',
+          toolName: 'web_search',
+          args: { query: 'mastra' },
+        },
+        mastra: { getLogger: () => undefined, listTools: () => mastraTools },
+        suspend: vi.fn(),
+        resumeData: undefined,
+        requestContext: new Map(),
+        getInitData: () => makeInitData(),
+        [PUBSUB_SYMBOL]: mockPubsub(),
+      });
 
-    expect(executeMock).toHaveBeenCalledTimes(1);
-    expect(result.error).toBeUndefined();
-    expect(result.result).toEqual({ snippet: 'web-result' });
-  });
+      expect(executeMock).toHaveBeenCalledTimes(1);
+      expect(result.error).toBeUndefined();
+      expect(result.result).toEqual(expectedResult);
+      expect(result.serverExecuted).toBe(true);
+    },
+  );
 
   it('still emits ToolNotFoundError when no provider tool matches', async () => {
     globalRunRegistry.set(RUN_ID, {

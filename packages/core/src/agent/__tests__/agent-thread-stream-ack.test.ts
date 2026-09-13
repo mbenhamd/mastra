@@ -179,7 +179,8 @@ describe('thread stream subscriber acknowledgements', () => {
   it('acks every event the remote-run waiter inspects before unsubscribing', async () => {
     const runtime = new AgentThreadStreamRuntime();
     const pubsub = new AckTrackingPubSub();
-    pubsub.owners.set(key, 'remote-run');
+    const leaseOwner = `mastra-thread-owner:${JSON.stringify(['remote-run', 'remote-source', 'attempt'])}`;
+    pubsub.owners.set(key, leaseOwner);
 
     // Seed the runtime's view of the thread with a remote run that has no local
     // record, which is what routes the waiter through #waitForRemoteRunToFinish.
@@ -187,7 +188,7 @@ describe('thread stream subscriber acknowledgements', () => {
     await pubsub.publish(topic, {
       type: 'agent.thread-stream',
       runId: 'remote-run',
-      data: { type: 'run-registered', runId: 'remote-run', streamId: 'remote-stream', streamSeq: 1 },
+      data: { type: 'run-registered', runId: 'remote-run', streamId: 'remote-stream', streamSeq: 1, leaseOwner },
     });
     seeder.unsubscribe();
 
@@ -208,6 +209,7 @@ describe('thread stream subscriber acknowledgements', () => {
         runId: 'remote-run',
         streamId: 'remote-stream',
         sourceId: 'other-process',
+        leaseOwner,
         part: { type: 'text-delta', payload: { text: 'hi' } },
       },
     });
@@ -215,7 +217,7 @@ describe('thread stream subscriber acknowledgements', () => {
     await pubsub.publish(topic, {
       type: 'agent.thread-stream',
       runId: 'remote-run',
-      data: { type: 'run-completed', runId: 'remote-run', streamId: 'remote-stream' },
+      data: { type: 'run-completed', runId: 'remote-run', streamId: 'remote-stream', leaseOwner },
     });
 
     await waiting;

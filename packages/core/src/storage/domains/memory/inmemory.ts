@@ -12,7 +12,7 @@ import type {
   StorageListThreadsInput,
   StorageListThreadsOutput,
   StorageCloneThreadInput,
-  StorageCloneThreadOutput,
+  StorageCopyThreadOutput,
   StorageRollbackThreadCloneInput,
   StorageRollbackThreadCloneResult,
   StorageObservationalMemoryCloneReceipt,
@@ -1448,7 +1448,7 @@ export class InMemoryMemory extends MemoryStorage {
     observationalMemoryRecordIds?.push(...erasedRecordIds);
   }
 
-  async cloneThread(args: StorageCloneThreadInput): Promise<StorageCloneThreadOutput> {
+  async copyThread(args: StorageCloneThreadInput): Promise<StorageCopyThreadOutput> {
     const { sourceThreadId, newThreadId: providedThreadId, resourceId, title, metadata, options } = args;
 
     // Get the source thread
@@ -1524,17 +1524,14 @@ export class InMemoryMemory extends MemoryStorage {
       const storedThread = cloneThreadBoundary(newThread, true);
       this.db.threads.set(newThreadId, storedThread);
 
-      // Clone messages with new IDs
-      const clonedMessages: MastraDBMessage[] = [];
+      // Copy raw storage rows under new IDs; payloads are never parsed here.
       const messageIdMap: Record<string, string> = {};
       const targetResourceId = resourceId || sourceResourceId;
       for (const sourceMsg of sourceMessages) {
         const newMessageId = crypto.randomUUID();
         messageIdMap[sourceMsg.id] = newMessageId;
-        const parsedContent = safelyParseJSON(sourceMsg.content);
 
-        // Create storage message
-        const newStorageMessage: StorageMessageType = {
+        this.db.messages.set(newMessageId, {
           id: newMessageId,
           thread_id: newThreadId,
           content: sourceMsg.content,
@@ -1542,26 +1539,12 @@ export class InMemoryMemory extends MemoryStorage {
           type: sourceMsg.type,
           createdAt: new Date(sourceMsg.createdAt),
           resourceId: targetResourceId,
-        };
-
-        this.db.messages.set(newMessageId, newStorageMessage);
-
-        // Create MastraDBMessage for return
-        clonedMessages.push({
-          id: newMessageId,
-          threadId: newThreadId,
-          content: parsedContent,
-          role: sourceMsg.role as MastraDBMessage['role'],
-          type: sourceMsg.type,
-          createdAt: new Date(sourceMsg.createdAt),
-          resourceId: targetResourceId,
         });
       }
 
-      const clonedMessageIds = clonedMessages.map(message => message.id);
+      const clonedMessageIds = Object.values(messageIdMap);
       return {
         thread: cloneThreadBoundary(storedThread, true),
-        clonedMessages,
         messageIdMap,
         sourceResourceId,
         rollbackReceipt: {

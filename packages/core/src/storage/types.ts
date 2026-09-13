@@ -683,6 +683,16 @@ type StorageListMessagesOptions = {
     metadata?: StorageMetadataFilter;
   };
   orderBy?: StorageOrderBy<'createdAt'>;
+  /**
+   * Whether to compute the total count of matching messages.
+   *
+   * Defaults to `true` to preserve Studio pagination, which relies on `total`.
+   * Callers that only need a bounded window of recent messages (e.g. agent
+   * last-N reads) can pass `false` so the store skips the `COUNT(*)` work and
+   * derives `hasMore` from a single extra row. When `false`, `total` is not a
+   * reliable count and should not be used for pagination math.
+   */
+  includeTotal?: boolean;
 };
 
 /**
@@ -818,27 +828,34 @@ export type StorageCloneThreadInput = {
 };
 
 /**
- * Output from cloning a thread
+ * Output from copying a thread. Message payloads are copied inside the store and
+ * never returned; only the id mapping is produced.
  */
-export type StorageCloneThreadOutput = {
-  /** The newly created cloned thread */
+export type StorageCopyThreadOutput = {
+  /** The newly created thread */
   thread: StorageThreadType;
-  /** The messages that were copied to the new thread */
-  clonedMessages: MastraDBMessage[];
-  /** Map from source message IDs to cloned message IDs (used for OM remapping) */
+  /** Map from source message IDs to copied message IDs (used for OM remapping) */
   messageIdMap?: Record<string, string>;
   /**
    * Resource that owned the source thread in the same atomic snapshot used to
-   * create the clone. Required when the adapter advertises
+   * create the copy. Required when the adapter advertises
    * `supportsThreadCloneSourceSnapshot`.
    */
   sourceResourceId?: string;
   /**
-   * Storage-issued ownership proof for conditional post-clone rollback.
+   * Storage-issued ownership proof for conditional post-copy rollback.
    *
    * @internal The token is opaque outside the adapter that issued it.
    */
   rollbackReceipt?: StorageThreadCloneRollbackReceipt;
+};
+
+/**
+ * Output from cloning a thread
+ */
+export type StorageCloneThreadOutput = StorageCopyThreadOutput & {
+  /** The messages that were copied to the new thread */
+  clonedMessages: MastraDBMessage[];
 };
 
 /** @internal Storage-owned proof identifying one physical cloned-thread generation. */
@@ -3378,12 +3395,12 @@ export interface DatasetItem {
   input: unknown;
   groundTruth?: unknown;
   expectedTrajectory?: unknown;
-  toolMocks?: DatasetItemToolMock[];
-  unmockedToolPolicy?: DatasetUnmockedToolPolicy;
-  scorerIds?: string[];
-  requestContext?: Record<string, unknown>;
-  metadata?: Record<string, unknown>;
-  source?: DatasetItemSource;
+  toolMocks?: DatasetItemToolMock[] | null;
+  unmockedToolPolicy?: DatasetUnmockedToolPolicy | null;
+  scorerIds?: string[] | null;
+  requestContext?: Record<string, unknown> | null;
+  metadata?: Record<string, unknown> | null;
+  source?: DatasetItemSource | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -3403,12 +3420,12 @@ export interface DatasetItemRow {
   input: unknown;
   groundTruth?: unknown;
   expectedTrajectory?: unknown;
-  toolMocks?: DatasetItemToolMock[];
-  unmockedToolPolicy?: DatasetUnmockedToolPolicy;
-  scorerIds?: string[];
-  requestContext?: Record<string, unknown>;
-  metadata?: Record<string, unknown>;
-  source?: DatasetItemSource;
+  toolMocks?: DatasetItemToolMock[] | null;
+  unmockedToolPolicy?: DatasetUnmockedToolPolicy | null;
+  scorerIds?: string[] | null;
+  requestContext?: Record<string, unknown> | null;
+  metadata?: Record<string, unknown> | null;
+  source?: DatasetItemSource | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -3566,6 +3583,17 @@ export interface DatasetItemIdentityConflictDetail {
  * tenancy read-scope for the parent dataset; see {@link AddDatasetItemInput.filters}.
  */
 export interface DeleteDatasetItemInput {
+  id: string;
+  datasetId: string;
+  filters?: DatasetTenancyFilters;
+}
+
+/**
+ * Permanently scrubs user-supplied content from every SCD-2 row for an item
+ * and from experiment results that reference it, while retaining identity and
+ * versioning skeletons for referential integrity and reproducibility.
+ */
+export interface PurgeDatasetItemInput {
   id: string;
   datasetId: string;
   filters?: DatasetTenancyFilters;
@@ -3977,6 +4005,8 @@ export interface ListExperimentResultsInput {
   experimentId: string;
   traceId?: string;
   status?: ExperimentResultStatus;
+  /** Return only results that have *all* of these tags. Empty/undefined disables the filter. */
+  tags?: string[];
   /** Multi-tenant scoping filters. See {@link ExperimentTenancyFilters}. */
   filters?: ExperimentTenancyFilters;
   pagination: StoragePagination;

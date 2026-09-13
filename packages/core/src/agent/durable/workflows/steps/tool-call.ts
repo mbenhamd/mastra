@@ -82,6 +82,7 @@ const durableToolCallInputSchema = z.object({
 const durableToolCallOutputSchema = durableToolCallInputSchema.extend({
   resumeTargetToolCallId: z.string().optional(),
   result: z.any().optional(),
+  serverExecuted: z.boolean().optional(),
   modelOutputComputed: z.boolean().optional(),
   error: z
     .object({
@@ -1896,6 +1897,7 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
           ...resumeTarget,
           providerMetadata,
           result,
+          ...(!wasSuspended ? { serverExecuted: true } : {}),
           modelOutputComputed,
           ...(delegationBailed ? { delegationBailed: true } : {}),
           ...(isResumingFromSuspension ? { resumedFromSuspension: true as const } : {}),

@@ -11,7 +11,7 @@ import { createSlackChannelsConfig } from './slack.js';
 function ctxWith(overrides: Record<string, unknown> = {}) {
   return {
     storage: { channelIdentity: {}, projects: {}, memorySettings: {}, ...overrides },
-    rules: { workItems: {} },
+    runtime: { workItems: {} },
   } as any;
 }
 

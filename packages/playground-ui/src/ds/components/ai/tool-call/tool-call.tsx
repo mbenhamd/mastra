@@ -230,7 +230,7 @@ export const ToolCallMono = ({ copyText, className, children, ...props }: ToolCa
   <div className="group/block relative max-w-full min-w-0">
     <pre
       className={cn(
-        'm-0 max-h-60 max-w-full overflow-auto rounded-md bg-neutral6/5 px-3 py-2 font-mono text-xs leading-normal break-words whitespace-pre-wrap',
+        'm-0 max-h-60 max-w-full overflow-auto rounded-md bg-neutral6/5 px-3 py-2 font-mono text-ui-sm break-words whitespace-pre-wrap',
         className,
       )}
       {...props}
@@ -244,6 +244,14 @@ export const ToolCallMono = ({ copyText, className, children, ...props }: ToolCa
       className="absolute top-1 right-1 opacity-0 transition-opacity group-hover/block:opacity-100 focus-visible:opacity-100"
     />
   </div>
+);
+
+/** A shell command as the body shows it: `$` in the margin, the copy takes the command alone. */
+export const ToolCallCommand = ({ command }: { command: string }) => (
+  <ToolCallMono copyText={command} className="text-icon5">
+    <span className="text-icon3 select-none">$ </span>
+    {command}
+  </ToolCallMono>
 );
 
 export type { ToolCallStatus };

@@ -384,7 +384,7 @@ const agent = new Agent({
   id: "custom-agent",
   name: "custom-agent",
   model: {
-    url: "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1",
+    url: `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1`,
     id: "cloudflare-workers-ai/@cf/aisingapore/gemma-sea-lion-v4-27b-it",
     apiKey: process.env.CLOUDFLARE_API_KEY,
     headers: {
@@ -408,5 +408,4 @@ const agent = new Agent({
   }
 });
 ```
-
 

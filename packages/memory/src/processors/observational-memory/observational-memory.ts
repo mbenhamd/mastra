@@ -268,6 +268,7 @@ import {
 } from './thresholds';
 import { TokenCounter } from './token-counter';
 import type { TokenCounterModelContext } from './token-counter';
+import { applyTextTransform } from './transform-hooks';
 import type {
   DataOmStatusPart,
   ObservationDebugEvent,
@@ -276,6 +277,7 @@ import type {
   ObserveHookContext,
   ObserveHookUsage,
   ObserveHooks,
+  ObserveLifecycleHooks,
   ObserveTrigger,
   ResolvedObservationConfig,
   ResolvedReflectionConfig,
@@ -627,7 +629,9 @@ export class ObservationalMemory {
       previousObserverTokens: config.observation?.previousObserverTokens ?? 2000,
       instruction: config.observation?.instruction,
       threadTitle: config.observation?.threadTitle ?? false,
-      observeAttachments: config.observation?.observeAttachments ?? true,
+      observeAttachments: config.observation?.observeAttachments ?? [
+        ...OBSERVATIONAL_MEMORY_DEFAULTS.observation.observeAttachments,
+      ],
       extractors: composeObservationExtractors({
         threadTitle: config.observation?.threadTitle ?? false,
         extract: config.observation?.extract,
@@ -687,6 +691,7 @@ export class ObservationalMemory {
       tokenCounter: this.tokenCounter,
       mastra: config.mastra,
       memory: this.memory,
+      hooks: this.hooks,
     });
 
     this.buffering = new BufferingCoordinator({
@@ -710,6 +715,7 @@ export class ObservationalMemory {
       mastra: config.mastra,
       memory: this.memory,
       onReflectionCommitted: config.onReflectionCommitted,
+      hooks: this.hooks,
     });
 
     // Validate buffer configuration
@@ -2346,6 +2352,7 @@ ${formattedMessages}
           writer,
           requestContext,
           observabilityContext,
+          trigger: 'async-buffer',
         }).run(),
     );
 
@@ -3338,6 +3345,7 @@ ${formattedMessages}
             requestContext,
             currentModel: opts.currentModel,
             observabilityContext,
+            trigger: 'async-buffer',
           }).run(),
       );
 
@@ -3645,16 +3653,16 @@ ${formattedMessages}
    * @internal
    */
   composeHooks(
-    callHooks: ObserveHooks | undefined,
+    callHooks: ObserveLifecycleHooks | undefined,
     context: ObserveHookContext,
     execution: 'configured' | 'non-blocking' = 'configured',
-  ): ObserveHooks | undefined {
+  ): ObserveLifecycleHooks | undefined {
     const configHooks = this.hooks;
     if (!configHooks) return callHooks;
     if (!callHooks && !Object.keys(configHooks).length) return undefined;
 
     const shouldAwaitConfig = execution === 'configured' && this.hookExecution === 'await';
-    const invokeConfigHook = async (name: keyof ObserveHooks, arg: unknown) => {
+    const invokeConfigHook = async (name: keyof ObserveLifecycleHooks, arg: unknown) => {
       const hook = configHooks[name] as ((arg?: unknown) => void | Promise<void>) | undefined;
       if (!hook) return;
       if (shouldAwaitConfig) {
@@ -3752,7 +3760,7 @@ ${formattedMessages}
     messages?: MastraDBMessage[];
     /** Live MessageList for the in-flight turn — lets markers land on the pending assistant message. */
     messageList?: MessageList;
-    hooks?: ObserveHooks;
+    hooks?: ObserveLifecycleHooks;
     /** Which pipeline path initiated this cycle; defaults to 'manual'. */
     trigger?: ObserveTrigger;
     agent?: ProcessorContext['agent'];
@@ -3768,7 +3776,8 @@ ${formattedMessages}
   }> {
     const { threadId, resourceId, messages, requestContext } = opts;
     const lockKey = this.buffering.getLockKey(threadId, resourceId);
-    const hooks = this.composeHooks(opts.hooks, { threadId, resourceId, trigger: opts.trigger ?? 'manual' });
+    const trigger = opts.trigger ?? 'manual';
+    const hooks = this.composeHooks(opts.hooks, { threadId, resourceId, trigger });
     const reflectionHooks = hooks
       ? { onReflectionStart: hooks.onReflectionStart, onReflectionEnd: hooks.onReflectionEnd }
       : undefined;
@@ -3812,6 +3821,7 @@ ${formattedMessages}
           messages: unobservedMessages,
           messageList: opts.messageList,
           reflectionHooks,
+          trigger,
           agent: opts.agent,
           sendSignal: opts.sendSignal,
           sendStateSignal: opts.sendStateSignal,
@@ -3895,7 +3905,8 @@ ${formattedMessages}
     await this.storage.setReflectingFlag(record.id, true);
     registerOp(record.id, 'reflecting');
 
-    const hooks = this.composeHooks(undefined, { threadId, resourceId, trigger: 'manual' });
+    const hookContext: ObserveHookContext = { threadId, resourceId, trigger: 'manual' };
+    const hooks = this.composeHooks(undefined, hookContext);
     let reflectionUsage: ObserveHookUsage | undefined;
     let reflectionProviderMetadata: ProviderMetadata | undefined;
     let reflectionError: Error | undefined;
@@ -3915,7 +3926,7 @@ ${formattedMessages}
       const priorExtractedValues = getPriorExtractedValues(previousOmMetadata, this.reflectionConfig.extractors);
       const reflectThreshold = getMaxThreshold(this.getEffectiveReflectionTokens(record));
       const reflectResult = await this.reflector.call(
-        record.activeObservations,
+        await applyTextTransform(this.hooks, 'beforeReflection', record.activeObservations, hookContext),
         prompt,
         undefined,
         reflectThreshold,
@@ -3933,6 +3944,12 @@ ${formattedMessages}
           threadId,
           resourceId: record.resourceId ?? resourceId,
         },
+      );
+      reflectResult.observations = await applyTextTransform(
+        this.hooks,
+        'afterReflection',
+        reflectResult.observations,
+        hookContext,
       );
       const reflectionTokenCount = this.tokenCounter.countObservations(reflectResult.observations);
 
