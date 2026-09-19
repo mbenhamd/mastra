@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 
 import { createSampleSessionRecord } from '@internal/storage-test-utils';
 import {
+  TABLE_HARNESS_SESSION_PROJECTION_FENCES,
   TABLE_HARNESS_SESSION_PROJECTION_INTENTS,
   TABLE_HARNESS_SESSION_PROJECTION_PRESSURE,
 } from '@mastra/core/storage';
@@ -21,6 +22,7 @@ describe('HarnessPG native session record projection', () => {
     enabledDomains: ['harness'],
     sessionRecordProjection: {
       enabled: true,
+      maxAttempts: 1,
       maxPendingIntents: 20,
     },
   });
@@ -262,5 +264,105 @@ describe('HarnessPG native session record projection', () => {
       ['default'],
     );
     expect(pressure).toEqual({ pending_intents: '0', pending_bytes: '0' });
+  });
+
+  it('preserves an active final claim and dead-letters it after expiry', async () => {
+    const harness = store.stores.harness!;
+    const session = createSampleSessionRecord({
+      id: 'projection-crash-expiry',
+      resourceId: 'resource-crash-expiry',
+      threadId: 'thread-crash-expiry',
+    });
+    await harness.createOrLoadActiveSession(session, {
+      initialLease: { ownerId: 'owner-crash', ttlMs: 60_000 },
+    });
+    const claimNow = Date.now();
+    const [claimed] = await harness.claimSessionRecordProjectionIntents({
+      claimId: 'crash-final-claim',
+      limit: 1,
+      now: claimNow,
+      claimTtlMs: 10,
+    });
+    expect(claimed).toMatchObject({ attempts: 1, status: 'claimed' });
+
+    await expect(
+      harness.claimSessionRecordProjectionIntents({
+        claimId: 'crash-too-early',
+        limit: 1,
+        now: claimNow + 5,
+        claimTtlMs: 10,
+      }),
+    ).resolves.toEqual([]);
+    await expect(harness.getSessionRecordProjectionQueuePressure({ sessionId: session.id })).resolves.toMatchObject({
+      pendingIntents: 1,
+      pendingBytes: expect.any(Number),
+    });
+
+    await expect(
+      harness.claimSessionRecordProjectionIntents({
+        claimId: 'crash-recovery',
+        limit: 1,
+        now: claimNow + 11,
+        claimTtlMs: 10,
+      }),
+    ).resolves.toEqual([]);
+    const intent = await store.db.one<{ status: string; attempts: string }>(
+      `SELECT status, attempts::text AS attempts
+       FROM "${schemaName}"."${TABLE_HARNESS_SESSION_PROJECTION_INTENTS}"
+       WHERE session_id = $1`,
+      [session.id],
+    );
+    expect(intent).toEqual({ status: 'dead', attempts: '1' });
+    await expect(harness.getSessionRecordProjectionQueuePressure({ sessionId: session.id })).resolves.toMatchObject({
+      pendingIntents: 0,
+      pendingBytes: 0,
+    });
+  });
+
+  it('locks the active session before checking its projection fence', async () => {
+    const harness = store.stores.harness!;
+    const session = createSampleSessionRecord({
+      id: 'projection-open-save-race',
+      resourceId: 'resource-open-save-race',
+      threadId: 'thread-open-save-race',
+    });
+    await harness.createOrLoadActiveSession(session, {
+      initialLease: { ownerId: 'owner-open-save', ttlMs: 60_000 },
+    });
+
+    const client = await store.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `UPDATE "${schemaName}"."mastra_harness_sessions"
+         SET version = 2
+         WHERE harness_name = $1 AND id = $2`,
+        ['default', session.id],
+      );
+      await client.query(
+        `SELECT session_id
+         FROM "${schemaName}"."${TABLE_HARNESS_SESSION_PROJECTION_FENCES}"
+         WHERE harness_name = $1 AND session_id = $2
+         FOR UPDATE`,
+        ['default', session.id],
+      );
+
+      const loadPromise = harness.createOrLoadActiveSession(session, {
+        initialLease: { ownerId: 'owner-open-save', ttlMs: 60_000 },
+      });
+      await new Promise(resolve => setTimeout(resolve, 25));
+      await client.query(
+        `UPDATE "${schemaName}"."${TABLE_HARNESS_SESSION_PROJECTION_FENCES}"
+         SET revision = 2, updated_at = $1
+         WHERE harness_name = $2 AND session_id = $3`,
+        [Date.now(), 'default', session.id],
+      );
+      await client.query('COMMIT');
+
+      await expect(loadPromise).resolves.toMatchObject({ created: false, version: 2 });
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
   });
 });

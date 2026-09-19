@@ -643,9 +643,14 @@ export class InMemoryHarness extends HarnessStorage {
     for (const candidate of candidates) {
       const current = this.db.harnessSessionRecordProjectionIntents.get(candidate.id);
       if (!current || current.status === 'applied' || current.status === 'dead') continue;
+      if (current.status === 'claimed' && (current.claimExpiresAt ?? 0) > input.now) continue;
       if (current.attempts >= this.sessionRecordProjection.maxAttempts) {
         current.status = 'dead';
         current.deadAt = input.now;
+        current.failedAt = input.now;
+        current.claimId = undefined;
+        current.claimExpiresAt = undefined;
+        current.nextAttemptAt = undefined;
         current.updatedAt = input.now;
         current.lastError = { code: 'session_projection.max_attempts', message: 'Maximum projection attempts reached' };
         continue;
@@ -661,7 +666,6 @@ export class InMemoryHarness extends HarnessStorage {
         continue;
       }
       if (hasProjectionPredecessor(this.db.harnessSessionRecordProjectionIntents, current)) continue;
-      if (current.status === 'claimed' && (current.claimExpiresAt ?? 0) > input.now) continue;
       if (
         (current.status === 'pending' || current.status === 'failed') &&
         (current.nextAttemptAt ?? current.createdAt) > input.now
