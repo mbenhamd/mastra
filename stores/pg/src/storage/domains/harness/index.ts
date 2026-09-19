@@ -559,6 +559,7 @@ function harnessIndexDefs(schemaPrefix: string): CreateIndexOptions[] {
       name: harnessIndexName(schemaPrefix, 'idx_harness_session_projection_order'),
       table: TABLE_HARNESS_SESSION_PROJECTION_INTENTS,
       columns: ['harness_name', 'session_id', 'session_incarnation', 'revision'],
+      unique: true,
     },
   ];
 }
