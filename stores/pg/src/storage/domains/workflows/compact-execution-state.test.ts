@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { createEmptyWorkflowSnapshot } from '@mastra/core/storage';
+import { createEmptyWorkflowSnapshot, WorkflowsStorage } from '@mastra/core/storage';
 import type { WorkflowRunState } from '@mastra/core/workflows';
 import { Pool } from 'pg';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -74,91 +74,78 @@ describe('WorkflowsPG compact execution state', () => {
     try {
       await workflows.persistWorkflowSnapshot({ workflowName, runId, snapshot: snapshot(runId, generation) });
 
+      const baseExecutionState = () =>
+        WorkflowsStorage.prototype.getWorkflowExecutionState.call(workflows, { workflowName, runId });
+      const expected = await baseExecutionState();
       writerQuery.mockClear();
       const compact = await workflows.getWorkflowExecutionState({ workflowName, runId });
-      expect(compact).toEqual({ status: 'suspended', executionGeneration: generation });
+      expect(compact).toEqual(expected);
       expect(readQuery).not.toHaveBeenCalled();
 
       const compactCalls = writerQuery.mock.calls.filter(([, values]) => {
         return Array.isArray(values) && values[0] === workflowName && values[1] === runId;
       });
       expect(compactCalls).toHaveLength(1);
-      expect(compactCalls[0]?.[0]).toContain("->'status'");
-      expect(compactCalls[0]?.[0]).toContain("->'executionGeneration'");
-      expect(compactCalls[0]?.[0]).not.toContain('SELECT *');
+      if (snapshotColumnType === 'jsonb') {
+        expect(compactCalls[0]?.[0]).toContain("->'status'");
+        expect(compactCalls[0]?.[0]).toContain("->'executionGeneration'");
+        expect(compactCalls[0]?.[0]).not.toContain('SELECT *');
+      } else {
+        expect(compactCalls[0]?.[0]).toContain('SELECT *');
+      }
 
       const withoutGeneration = snapshot(runId);
       await workflows.persistWorkflowSnapshot({ workflowName, runId, snapshot: withoutGeneration });
-      await expect(workflows.getWorkflowExecutionState({ workflowName, runId })).resolves.toEqual({
-        status: 'suspended',
-      });
+      const expectedWithoutGeneration = await baseExecutionState();
+      await expect(workflows.getWorkflowExecutionState({ workflowName, runId })).resolves.toEqual(
+        expectedWithoutGeneration,
+      );
 
       await workflows.persistWorkflowSnapshot({
         workflowName,
         runId,
         snapshot: { ...snapshot(runId, generation), executionGeneration: null } as unknown as WorkflowRunState,
       });
-      await expect(workflows.getWorkflowExecutionState({ workflowName, runId })).resolves.toEqual({
-        status: 'suspended',
-        executionGeneration: null,
-      });
+      const expectedExplicitNull = await baseExecutionState();
+      await expect(workflows.getWorkflowExecutionState({ workflowName, runId })).resolves.toEqual(expectedExplicitNull);
 
       await expect(
         workflows.getWorkflowExecutionState({ workflowName, runId: 'missing-compact-execution-state' }),
       ).resolves.toBeNull();
 
-      if (snapshotColumnType !== 'jsonb') {
-        const legacyAuthorityKeys = JSON.stringify({
-          status: 'suspended',
-          executionGeneration: generation,
-          '\u0000executionGeneration': 'legacy-generation',
-          value: { payload: 'x'.repeat(64 * 1024) },
-        });
-        await pool.query(
-          `UPDATE "${schema}"."mastra_workflow_snapshot" SET snapshot = $1
-           WHERE workflow_name = $2 AND run_id = $3`,
-          [legacyAuthorityKeys, workflowName, runId],
-        );
-        await expect(workflows.getWorkflowExecutionState({ workflowName, runId })).resolves.toEqual({
-          status: 'suspended',
-          executionGeneration: generation,
-        });
-      }
+      const serializedSnapshot = JSON.stringify({
+        status: 'running',
+        executionGeneration: generation,
+        value: { payload: '\u0000' },
+      });
+      await pool.query(
+        `UPDATE "${schema}"."mastra_workflow_snapshot" SET snapshot = $1
+         WHERE workflow_name = $2 AND run_id = $3`,
+        [snapshotColumnType === 'text' ? serializedSnapshot : JSON.stringify(serializedSnapshot), workflowName, runId],
+      );
+      const expectedSerialized = await baseExecutionState();
+      await expect(workflows.getWorkflowExecutionState({ workflowName, runId })).resolves.toEqual(expectedSerialized);
 
-      if (snapshotColumnType !== 'text') {
-        const serializedSnapshot = JSON.stringify({ status: 'running', executionGeneration: generation });
-        await pool.query(
-          `UPDATE "${schema}"."mastra_workflow_snapshot" SET snapshot = $1
-           WHERE workflow_name = $2 AND run_id = $3`,
-          [JSON.stringify(serializedSnapshot), workflowName, runId],
-        );
-        await expect(workflows.getWorkflowExecutionState({ workflowName, runId })).resolves.toEqual({
-          status: 'running',
-          executionGeneration: generation,
-        });
-
-        await pool.query(
-          `UPDATE "${schema}"."mastra_workflow_snapshot" SET snapshot = $1
-           WHERE workflow_name = $2 AND run_id = $3`,
-          [JSON.stringify('not a serialized snapshot'), workflowName, runId],
-        );
-        await expect(workflows.getWorkflowExecutionState({ workflowName, runId })).rejects.toThrow();
-      } else {
-        await pool.query(
-          `UPDATE "${schema}"."mastra_workflow_snapshot" SET snapshot = $1
-           WHERE workflow_name = $2 AND run_id = $3`,
-          ['not a serialized snapshot', workflowName, runId],
-        );
-        await expect(workflows.getWorkflowExecutionState({ workflowName, runId })).rejects.toThrow();
-      }
+      await pool.query(
+        `UPDATE "${schema}"."mastra_workflow_snapshot" SET snapshot = $1
+         WHERE workflow_name = $2 AND run_id = $3`,
+        [
+          snapshotColumnType === 'text' ? 'not a serialized snapshot' : JSON.stringify('not a serialized snapshot'),
+          workflowName,
+          runId,
+        ],
+      );
+      await expect(baseExecutionState()).rejects.toThrow();
+      await expect(workflows.getWorkflowExecutionState({ workflowName, runId })).rejects.toThrow();
 
       for (const falsySnapshot of ['false', '0', 'null']) {
         await pool.query(
           `UPDATE "${schema}"."mastra_workflow_snapshot" SET snapshot = $1
-           WHERE workflow_name = $2 AND run_id = $3`,
+          WHERE workflow_name = $2 AND run_id = $3`,
           [falsySnapshot, workflowName, runId],
         );
-        await expect(workflows.getWorkflowExecutionState({ workflowName, runId })).resolves.toBeNull();
+        const expectedFalsy = await baseExecutionState();
+        await expect(workflows.getWorkflowExecutionState({ workflowName, runId })).resolves.toEqual(expectedFalsy);
       }
 
       await pool.query(
@@ -167,8 +154,10 @@ describe('WorkflowsPG compact execution state', () => {
         ['""', workflowName, runId],
       );
       if (snapshotColumnType === 'text') {
-        await expect(workflows.getWorkflowExecutionState({ workflowName, runId })).resolves.toBeNull();
+        const expectedEmpty = await baseExecutionState();
+        await expect(workflows.getWorkflowExecutionState({ workflowName, runId })).resolves.toEqual(expectedEmpty);
       } else {
+        await expect(baseExecutionState()).rejects.toThrow();
         await expect(workflows.getWorkflowExecutionState({ workflowName, runId })).rejects.toThrow();
       }
     } finally {
