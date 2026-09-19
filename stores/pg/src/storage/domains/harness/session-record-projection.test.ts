@@ -266,6 +266,97 @@ describe('HarnessPG native session record projection', () => {
     expect(pressure).toEqual({ pending_intents: '0', pending_bytes: '0' });
   });
 
+  it('does not hold projection pressure while deleting an attachment referenced by another save', async () => {
+    const harness = store.stores.harness!;
+    const sessionA = createSampleSessionRecord({
+      id: 'projection-attachment-delete-a',
+      resourceId: 'resource-attachment-delete-a',
+      threadId: 'thread-attachment-delete-a',
+    });
+    const sessionB = createSampleSessionRecord({
+      id: 'projection-attachment-delete-b',
+      resourceId: 'resource-attachment-delete-b',
+      threadId: 'thread-attachment-delete-b',
+    });
+    await harness.createOrLoadActiveSession(sessionA, {
+      initialLease: { ownerId: 'owner-a', ttlMs: 60_000 },
+    });
+    await harness.createOrLoadActiveSession(sessionB, {
+      initialLease: { ownerId: 'owner-b', ttlMs: 60_000 },
+    });
+    await harness.saveAttachment({
+      sessionId: sessionA.id,
+      attachmentId: 'attachment-race',
+      name: 'race.txt',
+      mimeType: 'text/plain',
+      source: 'inline',
+      data: new TextEncoder().encode('race'),
+    });
+    const loadedB = await harness.loadSession({ sessionId: sessionB.id });
+    if (!loadedB) throw new Error('expected attachment race session');
+
+    let releaseAttachment!: () => void;
+    const attachmentGate = new Promise<void>(resolve => {
+      releaseAttachment = resolve;
+    });
+    let attachmentLocked!: () => void;
+    const attachmentLockObserved = new Promise<void>(resolve => {
+      attachmentLocked = resolve;
+    });
+    const originalConnect = store.db.connect;
+    const connect = originalConnect.bind(store.db);
+    (store.db as any).connect = async () => {
+      const client = await connect();
+      const query = client.query.bind(client);
+      return new Proxy(client, {
+        get(target, property, receiver) {
+          if (property === 'query') {
+            return async (sql: unknown, args?: unknown[]) => {
+              const result = await query(sql as any, args as any);
+              if (
+                typeof sql === 'string' &&
+                sql.includes('FOR KEY SHARE') &&
+                sql.includes('mastra_harness_attachments')
+              ) {
+                attachmentLocked();
+                await attachmentGate;
+              }
+              return result;
+            };
+          }
+          if (property === 'release') return client.release.bind(client);
+          return Reflect.get(target, property, receiver);
+        },
+      });
+    };
+
+    try {
+      const save = harness.saveSessionWithAttachmentReferences(
+        { ...loadedB, lastActivityAt: loadedB.lastActivityAt + 1 },
+        { ownerId: 'owner-b', ifVersion: loadedB.version },
+        [{ sessionId: sessionA.id, attachmentId: 'attachment-race', source: 'current_run', sourceId: 'race-run' }],
+      );
+      await attachmentLockObserved;
+      const deletion = harness.deleteSession({ sessionId: sessionA.id, ifVersion: 1 });
+      await new Promise(resolve => setTimeout(resolve, 100));
+      releaseAttachment();
+      const outcomes = await Promise.race([
+        Promise.allSettled([save, deletion]),
+        new Promise<never>((_, reject) => {
+          const timer = setTimeout(() => reject(new Error('attachment/delete race timed out')), 10_000);
+          timer.unref?.();
+        }),
+      ]);
+      expect(outcomes).toEqual([
+        { status: 'fulfilled', value: { version: loadedB.version + 1 } },
+        { status: 'fulfilled', value: undefined },
+      ]);
+    } finally {
+      releaseAttachment();
+      (store.db as any).connect = originalConnect;
+    }
+  });
+
   it('preserves an active final claim and dead-letters it after expiry', async () => {
     const harness = store.stores.harness!;
     const session = createSampleSessionRecord({
