@@ -1552,7 +1552,10 @@ export class HarnessPG extends HarnessStorage {
    * fence -> intent -> pressure order while keeping the namespace lock short.
    */
   async #reserveProjectionCapacityTx(tx: PgHarnessClient, intent: HarnessSessionRecordProjectionIntent): Promise<void> {
-    if (intent.payloadBytes > this.sessionRecordProjection.maxPendingBytes) {
+    if (
+      intent.payloadBytes > this.sessionRecordProjection.maxPendingBytes ||
+      this.sessionRecordProjection.maxPendingIntents < 1
+    ) {
       throw new HarnessStorageSessionProjectionBackpressureError(0, 0);
     }
     const result = await tx.execute({
