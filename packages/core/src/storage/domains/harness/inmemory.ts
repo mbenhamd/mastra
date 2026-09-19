@@ -26,6 +26,7 @@ import {
   HarnessStorageSessionProjectionBackpressureError,
   HarnessStorageSessionProjectionClaimConflictError,
   HarnessStorageSessionProjectionIncarnationError,
+  HarnessStorageSessionProjectionIdentityError,
   HarnessStorageThreadDeleteFenceConflictError,
   HarnessStorageVersionConflictError,
   HarnessStorageWakeupClaimConflictError,
@@ -839,6 +840,12 @@ export class InMemoryHarness extends HarnessStorage {
       this.assertProjectionIncarnation(existing);
       if (record.sessionIncarnation !== undefined && record.sessionIncarnation !== existing.sessionIncarnation) {
         throw new HarnessStorageSessionProjectionIncarnationError(record.id);
+      }
+      if (record.resourceId !== existing.resourceId) {
+        throw new HarnessStorageSessionProjectionIdentityError(record.id, 'resourceId');
+      }
+      if (record.threadId !== existing.threadId) {
+        throw new HarnessStorageSessionProjectionIdentityError(record.id, 'threadId');
       }
       return existing.sessionIncarnation;
     }

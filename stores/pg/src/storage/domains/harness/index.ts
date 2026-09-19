@@ -24,6 +24,7 @@ import {
   HarnessStorageSessionProjectionBackpressureError,
   HarnessStorageSessionProjectionClaimConflictError,
   HarnessStorageSessionProjectionIncarnationError,
+  HarnessStorageSessionProjectionIdentityError,
   HarnessStorageThreadDeleteFenceConflictError,
   HarnessStorageVersionConflictError,
   HarnessStorageWakeupClaimConflictError,
@@ -1327,6 +1328,12 @@ export class HarnessPG extends HarnessStorage {
 
   async #saveSessionWithProjection(record: SessionRecord, opts: SaveSessionOptions): Promise<SaveSessionResult> {
     const harnessName = this.#resolveHarnessName(opts.harnessName ?? record.harnessName);
+    if (opts.ifVersion === 0) {
+      await this.#renewLocalThreadDeleteFence(record.threadId);
+      if (this.#localThreadDeleteFences.has(record.threadId)) {
+        throw new HarnessStorageThreadDeleteFenceConflictError(record.threadId);
+      }
+    }
     const tx = await this.#client.transaction('write');
     try {
       const now = Date.now();
@@ -1376,6 +1383,12 @@ export class HarnessPG extends HarnessStorage {
       const sessionIncarnation = requirePgProjectionIncarnation(existing);
       if (record.sessionIncarnation !== undefined && record.sessionIncarnation !== sessionIncarnation) {
         throw new HarnessStorageSessionProjectionIncarnationError(record.id);
+      }
+      if (record.resourceId !== existing.resourceId) {
+        throw new HarnessStorageSessionProjectionIdentityError(record.id, 'resourceId');
+      }
+      if (record.threadId !== existing.threadId) {
+        throw new HarnessStorageSessionProjectionIdentityError(record.id, 'threadId');
       }
       const nextVersion = opts.ifVersion + 1;
       const namespacedRecord: SessionRecord = { ...record, harnessName, sessionIncarnation };
@@ -1451,6 +1464,12 @@ export class HarnessPG extends HarnessStorage {
       const sessionIncarnation = requirePgProjectionIncarnation(existing);
       if (record.sessionIncarnation !== undefined && record.sessionIncarnation !== sessionIncarnation) {
         throw new HarnessStorageSessionProjectionIncarnationError(record.id);
+      }
+      if (record.resourceId !== existing.resourceId) {
+        throw new HarnessStorageSessionProjectionIdentityError(record.id, 'resourceId');
+      }
+      if (record.threadId !== existing.threadId) {
+        throw new HarnessStorageSessionProjectionIdentityError(record.id, 'threadId');
       }
       const nextVersion = opts.ifVersion + 1;
       const namespacedRecord: SessionRecord = { ...record, harnessName, sessionIncarnation };
@@ -2079,7 +2098,9 @@ export class HarnessPG extends HarnessStorage {
       // save that references one of these attachments may hold a key-share
       // lock while reserving its own projection capacity; releasing here
       // avoids a pressure-before-attachment cycle.
-      for (const [namespace, capacity] of retiredProjectionCapacity) {
+      for (const [namespace, capacity] of [...retiredProjectionCapacity.entries()].sort(([left], [right]) =>
+        left < right ? -1 : left > right ? 1 : 0,
+      )) {
         await this.#releaseProjectionCapacityValuesTx(
           tx,
           namespace,
