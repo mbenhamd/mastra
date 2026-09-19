@@ -1,25 +1,33 @@
+import { ErrorCategory } from '@mastra/core/error';
 import { TABLE_PROMPT_BLOCKS, TABLE_PROMPT_BLOCK_VERSIONS, TABLE_SCHEMAS } from '@mastra/core/storage';
 import type { StorageColumn } from '@mastra/core/storage';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { DbClient, QueryResult } from '../client';
+import { AgentsPG } from '../domains/agents';
+import { DatasetsPG } from '../domains/datasets';
 import { ExperimentsPG } from '../domains/experiments';
 import { MemoryPG } from '../domains/memory';
 import { PromptBlocksPG } from '../domains/prompt-blocks';
 import { WorkflowDefinitionsPG } from '../domains/workflow-definitions';
+import { WorkflowsPG } from '../domains/workflows';
 import { PgDB, resolvePgConfig } from '.';
 
 const TABLE = 'mastra_threads' as const;
 
 type ExternalCatalog = {
   columns?: string[];
+  primaryKeyColumns?: string[];
   indexes?: string[];
 };
 
 function createClient(catalog: ExternalCatalog = {}) {
   const catalogQueries: string[] = [];
   const ddlQueries: string[] = [];
-  const tableRows = (catalog.columns ?? []).map(column_name => ({ column_name }));
+  const tableRows = (catalog.columns ?? []).map(column_name => ({
+    column_name,
+    primary_key_columns: catalog.primaryKeyColumns ?? [],
+  }));
   const indexRows = (catalog.indexes ?? []).map(index_name => ({ index_name }));
 
   const manyOrNone = vi.fn(async (query: string) => {
@@ -112,8 +120,43 @@ describe('PgDB external schema mode', () => {
       id: 'MASTRA_STORAGE_PG_CREATE_TABLE_FAILED',
     });
 
-    tableRows.push({ column_name: 'id' }, { column_name: 'createdAt' }, { column_name: 'createdAtZ' });
+    tableRows.push(
+      { column_name: 'id', primary_key_columns: [] },
+      { column_name: 'createdAt', primary_key_columns: [] },
+      { column_name: 'createdAtZ', primary_key_columns: [] },
+    );
     await expect(db.createTable({ tableName: TABLE, schema: TABLE_SCHEMA })).resolves.toBeUndefined();
+    expect(ddlQueries).toEqual([]);
+  });
+
+  it.each([
+    {
+      description: 'a required composite primary key',
+      schema: {
+        id: { type: 'text', nullable: false },
+        version: { type: 'integer', nullable: false },
+      } satisfies Record<string, StorageColumn>,
+      compositePrimaryKey: ['id', 'version'],
+    },
+    {
+      description: 'a declared primary key column',
+      schema: {
+        id: { type: 'text', nullable: false, primaryKey: true },
+      } satisfies Record<string, StorageColumn>,
+      compositePrimaryKey: undefined,
+    },
+  ])('rejects a table missing $description before issuing DDL', async ({ schema, compositePrimaryKey }) => {
+    const { client, catalogQueries, ddlQueries } = createClient({
+      columns: Object.keys(schema),
+      primaryKeyColumns: [],
+    });
+    const db = new PgDB({ client, schemaName: 'external_schema', disableInit: true });
+
+    await expect(db.createTable({ tableName: TABLE, schema, compositePrimaryKey })).rejects.toMatchObject({
+      id: 'MASTRA_STORAGE_PG_CREATE_TABLE_FAILED',
+      cause: expect.objectContaining({ message: expect.stringContaining('primary key') }),
+    });
+    expect(catalogQueries.filter(query => query.includes('pg_catalog.pg_attribute'))).toHaveLength(1);
     expect(ddlQueries).toEqual([]);
   });
 
@@ -183,7 +226,10 @@ describe('PgDB external schema mode', () => {
         ...(column.type === 'timestamp' ? [`${columnName}Z`] : []),
       ]),
     );
-    const { client, ddlQueries } = createClient({ columns: [...new Set(columns)] });
+    const { client, ddlQueries } = createClient({
+      columns: [...new Set(columns)],
+      primaryKeyColumns: ['id'],
+    });
     const domain = new PromptBlocksPG({ client, schemaName: 'external_schema', disableInit: true });
 
     await expect(domain.init()).rejects.toMatchObject({
@@ -191,6 +237,21 @@ describe('PgDB external schema mode', () => {
       cause: expect.objectContaining({ message: expect.stringContaining('missing required index') }),
     });
     expect(ddlQueries).toEqual([]);
+  });
+
+  it('validates direct external domain initialization without issuing DDL', async () => {
+    for (const createDomain of [
+      (client: DbClient) => new AgentsPG({ client, schemaName: 'external_schema', disableInit: true }),
+      (client: DbClient) => new DatasetsPG({ client, schemaName: 'external_schema', disableInit: true }),
+      (client: DbClient) => new WorkflowsPG({ client, schemaName: 'external_schema', disableInit: true }),
+    ]) {
+      const { client, ddlQueries } = createClient();
+      await expect(createDomain(client).init()).rejects.toMatchObject({
+        id: 'MASTRA_STORAGE_PG_CREATE_TABLE_FAILED',
+        cause: expect.objectContaining({ message: expect.stringContaining('missing required table') }),
+      });
+      expect(ddlQueries).toEqual([]);
+    }
   });
 
   it('propagates disableInit through standalone domain configuration', () => {
@@ -233,6 +294,32 @@ describe('PgDB external schema mode', () => {
       vi.unstubAllEnvs();
     }
 
+    expect(ddlQueries).toEqual([]);
+  });
+
+  it('rejects explicit spans migration when disableInit is set', async () => {
+    const { client, ddlQueries } = createClient();
+    const db = new PgDB({ client, disableInit: true });
+
+    await expect(db.migrateSpans()).rejects.toMatchObject({
+      id: 'MASTRA_STORAGE_PG_SCHEMA_DDL_DISABLED',
+      category: ErrorCategory.USER,
+    });
+    expect(ddlQueries).toEqual([]);
+  });
+
+  it('preserves the user error when direct schema DDL is disabled', async () => {
+    const { client, ddlQueries } = createClient();
+    const db = new PgDB({ client, disableInit: true });
+
+    await expect(db.dropTable({ tableName: TABLE })).rejects.toMatchObject({
+      id: 'MASTRA_STORAGE_PG_SCHEMA_DDL_DISABLED',
+      category: ErrorCategory.USER,
+    });
+    await expect(db.dropIndex('external_threads_idx')).rejects.toMatchObject({
+      id: 'MASTRA_STORAGE_PG_SCHEMA_DDL_DISABLED',
+      category: ErrorCategory.USER,
+    });
     expect(ddlQueries).toEqual([]);
   });
 });

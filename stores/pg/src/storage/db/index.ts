@@ -474,7 +474,10 @@ export class PgDB extends MastraBase {
    * operations DML-only; missing or failed checks are discarded so a completed
    * external migration can be observed on a later attempt.
    */
-  private externalSchemaTableCache = new Map<string, Promise<{ exists: boolean; columns: Set<string> }>>();
+  private externalSchemaTableCache = new Map<
+    string,
+    Promise<{ exists: boolean; columns: Set<string>; primaryKeyColumns: string[] }>
+  >();
   private externalSchemaIndexCache: Promise<Set<string>> | null = null;
 
   constructor(config: PgDBInternalConfig) {
@@ -526,14 +529,31 @@ export class PgDB extends MastraBase {
     return this.disableInit === true || process.env.MASTRA_DISABLE_STORAGE_INIT === 'true';
   }
 
-  private async getExternalSchemaTable(tableName: TABLE_NAMES): Promise<{ exists: boolean; columns: Set<string> }> {
+  private async getExternalSchemaTable(tableName: TABLE_NAMES): Promise<{
+    exists: boolean;
+    columns: Set<string>;
+    primaryKeyColumns: string[];
+  }> {
     const cached = this.externalSchemaTableCache.get(tableName);
     if (cached) return cached;
 
     const schemaName = this.schemaName || 'public';
     const query = this.client
-      .manyOrNone<{ column_name: string }>(
-        `SELECT attribute_row.attname AS column_name
+      .manyOrNone<{ column_name: string; primary_key_columns: string[] }>(
+        `SELECT attribute_row.attname AS column_name,
+                ARRAY(
+                  SELECT primary_column.attname::text
+                  FROM pg_catalog.pg_index AS primary_index
+                  CROSS JOIN LATERAL unnest(primary_index.indkey)
+                    WITH ORDINALITY AS key_column(attnum, ordinal_position)
+                  JOIN pg_catalog.pg_attribute AS primary_column
+                    ON primary_column.attrelid = primary_index.indrelid
+                   AND primary_column.attnum = key_column.attnum
+                  WHERE primary_index.indrelid = relation_row.oid
+                    AND primary_index.indisprimary
+                    AND key_column.ordinal_position <= primary_index.indnkeyatts
+                  ORDER BY key_column.ordinal_position
+                ) AS primary_key_columns
            FROM pg_catalog.pg_class AS relation_row
            JOIN pg_catalog.pg_namespace AS namespace_row
              ON namespace_row.oid = relation_row.relnamespace
@@ -546,7 +566,11 @@ export class PgDB extends MastraBase {
             AND NOT attribute_row.attisdropped`,
         [schemaName, tableName],
       )
-      .then(rows => ({ exists: rows.length > 0, columns: new Set(rows.map(row => row.column_name)) }));
+      .then(rows => ({
+        exists: rows.length > 0,
+        columns: new Set(rows.map(row => row.column_name)),
+        primaryKeyColumns: rows[0]?.primary_key_columns ?? [],
+      }));
 
     this.externalSchemaTableCache.set(tableName, query);
     try {
@@ -594,9 +618,16 @@ export class PgDB extends MastraBase {
   private async validateExternalSchemaTable(
     tableName: TABLE_NAMES,
     schema: Record<string, StorageColumn>,
+    compositePrimaryKey?: string[],
   ): Promise<void> {
     const actual = await this.getExternalSchemaTable(tableName);
     const requiredColumns = new Set<string>();
+    const requiredPrimaryKeyColumns = (
+      compositePrimaryKey ??
+      Object.entries(schema)
+        .filter(([, columnDef]) => columnDef.primaryKey)
+        .map(([columnName]) => columnName)
+    ).map(columnName => parseSqlIdentifier(columnName, 'column name'));
     for (const [columnName, columnDef] of Object.entries(schema)) {
       const parsedColumnName = parseSqlIdentifier(columnName, 'column name');
       requiredColumns.add(parsedColumnName);
@@ -625,6 +656,22 @@ export class PgDB extends MastraBase {
         })} is missing required columns: ${missingColumns.join(', ')}`,
       );
     }
+
+    if (
+      requiredPrimaryKeyColumns.length > 0 &&
+      (actual.primaryKeyColumns.length !== requiredPrimaryKeyColumns.length ||
+        actual.primaryKeyColumns.some((columnName, index) => columnName !== requiredPrimaryKeyColumns[index]))
+    ) {
+      this.externalSchemaTableCache.delete(tableName);
+      const expected = requiredPrimaryKeyColumns.join(', ');
+      const actualPrimaryKey = actual.primaryKeyColumns.join(', ');
+      throw new Error(
+        `PostgreSQL external schema table ${getTableName({
+          indexName: tableName,
+          schemaName: getSchemaName(this.schemaName),
+        })} has an incompatible primary key; expected (${expected}) but found (${actualPrimaryKey})`,
+      );
+    }
   }
 
   private async validateExternalSchemaIndex(indexName: string): Promise<void> {
@@ -645,9 +692,13 @@ export class PgDB extends MastraBase {
 
   private assertSchemaDdlAllowed(operation: string, allowEnvironment = false): void {
     if (this.disableInit === true || (!allowEnvironment && process.env.MASTRA_DISABLE_STORAGE_INIT === 'true')) {
-      throw new Error(
-        `PostgreSQL schema DDL is disabled in external-schema mode; ${operation} requires an externally managed migration`,
-      );
+      throw new MastraError({
+        id: createStorageErrorId('PG', 'SCHEMA_DDL', 'DISABLED'),
+        domain: ErrorDomain.STORAGE,
+        category: ErrorCategory.USER,
+        text: `PostgreSQL schema DDL is disabled in external-schema mode; ${operation} requires an externally managed migration`,
+        details: { operation },
+      });
     }
   }
 
@@ -1103,7 +1154,7 @@ export class PgDB extends MastraBase {
   }): Promise<void> {
     try {
       if (this.isExternalSchemaMode()) {
-        await this.validateExternalSchemaTable(tableName, schema);
+        await this.validateExternalSchemaTable(tableName, schema, compositePrimaryKey);
         return;
       }
 
@@ -1759,6 +1810,7 @@ export class PgDB extends MastraBase {
       const tableNameWithSchema = getTableName({ indexName: tableName, schemaName });
       await this.client.none(`DROP TABLE IF EXISTS ${tableNameWithSchema}`);
     } catch (error) {
+      if (error instanceof MastraError) throw error;
       throw new MastraError(
         {
           id: createStorageErrorId('PG', 'DROP_TABLE', 'FAILED'),
@@ -1938,6 +1990,7 @@ export class PgDB extends MastraBase {
       await this.client.none(sql);
       snapshot?.indexes.delete(indexName);
     } catch (error) {
+      if (error instanceof MastraError) throw error;
       throw new MastraError(
         {
           id: createStorageErrorId('PG', 'INDEX_DROP', 'FAILED'),

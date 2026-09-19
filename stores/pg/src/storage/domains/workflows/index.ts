@@ -4305,11 +4305,18 @@ export class WorkflowsPG extends WorkflowsStorage {
   }
 
   async init(): Promise<void> {
-    // Composite stores can invoke an explicitly supplied domain initializer even
-    // when the domain owns an externally managed schema. Keep that path
-    // read-only: PostgresStore.init() already skips the whole domain set, but
-    // this guard also covers direct WorkflowsPG and composite overrides.
-    if (this.#db.isExternalSchemaMode()) return;
+    if (this.#db.isExternalSchemaMode()) {
+      // Validate the snapshot table and indexes without running the terminal
+      // table migrations below. The store-level initializer already skips
+      // this path; this covers direct and composite overrides.
+      await this.#db.createTable({
+        tableName: TABLE_WORKFLOW_SNAPSHOT,
+        schema: TABLE_SCHEMAS[TABLE_WORKFLOW_SNAPSHOT],
+      });
+      await this.createDefaultIndexes();
+      await this.createCustomIndexes();
+      return;
+    }
 
     await this.#db.createTable({ tableName: TABLE_WORKFLOW_SNAPSHOT, schema: TABLE_SCHEMAS[TABLE_WORKFLOW_SNAPSHOT] });
     await this.#db.client.none(WorkflowsPG.getTerminalizationTableDDL(this.#schema));

@@ -100,9 +100,21 @@ export class DatasetsPG extends DatasetsStorage {
   }
 
   async init(): Promise<void> {
-    // This initializer has a raw ALTER migration below; keep external-schema
-    // mode read-only when a composite store initializes the domain directly.
-    if (this.#db.isExternalSchemaMode()) return;
+    if (this.#db.isExternalSchemaMode()) {
+      // Validate tables and indexes without running the raw ALTER migrations
+      // below. The store-level initializer already skips this path; this
+      // covers direct and composite overrides.
+      await this.#db.createTable({ tableName: TABLE_DATASETS, schema: DATASETS_SCHEMA });
+      await this.#db.createTable({
+        tableName: TABLE_DATASET_ITEMS,
+        schema: DATASET_ITEMS_SCHEMA,
+        compositePrimaryKey: TABLE_CONFIGS[TABLE_DATASET_ITEMS]?.compositePrimaryKey,
+      });
+      await this.#db.createTable({ tableName: TABLE_DATASET_VERSIONS, schema: DATASET_VERSIONS_SCHEMA });
+      await this.createDefaultIndexes();
+      await this.createCustomIndexes();
+      return;
+    }
 
     await this.#db.createTable({ tableName: TABLE_DATASETS, schema: DATASETS_SCHEMA });
     await this.#db.createTable({

@@ -89,9 +89,16 @@ export class AgentsPG extends AgentsStorage {
   }
 
   async init(): Promise<void> {
-    // Legacy migrations issue raw DDL; an externally managed schema must be
-    // initialized only by the privileged migration process.
-    if (this.#db.isExternalSchemaMode()) return;
+    if (this.#db.isExternalSchemaMode()) {
+      // Validate the current schema and indexes without running the legacy
+      // migration or cleanup statements below. The store-level initializer
+      // already skips this path; this covers direct and composite overrides.
+      await this.#db.createTable({ tableName: TABLE_AGENTS, schema: TABLE_SCHEMAS[TABLE_AGENTS] });
+      await this.#db.createTable({ tableName: TABLE_AGENT_VERSIONS, schema: TABLE_SCHEMAS[TABLE_AGENT_VERSIONS] });
+      await this.createDefaultIndexes();
+      await this.createCustomIndexes();
+      return;
+    }
 
     // Migrate from legacy schemas before creating tables
     await this.#migrateFromLegacySchema();

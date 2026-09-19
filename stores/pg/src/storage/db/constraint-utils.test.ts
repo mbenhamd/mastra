@@ -102,6 +102,7 @@ describe('truncateIdentifierWithHash', () => {
     const second = `${'s'.repeat(59)}_idx_second`;
 
     expect(truncateIdentifierWithHash(short)).toBe(short);
+    expect(truncateIdentifierWithHash(first)).toBe(`${'s'.repeat(54)}_f4ecf79f`);
     expect(truncateIdentifierWithHash(first)).not.toBe(truncateIdentifierWithHash(second));
     expect(Buffer.byteLength(truncateIdentifierWithHash(first))).toBeLessThanOrEqual(POSTGRES_IDENTIFIER_MAX_LENGTH);
   });
