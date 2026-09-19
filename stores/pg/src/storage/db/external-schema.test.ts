@@ -1,5 +1,5 @@
 import { ErrorCategory } from '@mastra/core/error';
-import { TABLE_PROMPT_BLOCKS, TABLE_PROMPT_BLOCK_VERSIONS, TABLE_SCHEMAS } from '@mastra/core/storage';
+import { TABLE_PROMPT_BLOCKS, TABLE_PROMPT_BLOCK_VERSIONS, TABLE_SCHEMAS, TABLE_SPANS } from '@mastra/core/storage';
 import type { StorageColumn } from '@mastra/core/storage';
 import { describe, expect, it, vi } from 'vitest';
 
@@ -69,6 +69,11 @@ function createClient(catalog: ExternalCatalog = {}) {
 const TABLE_SCHEMA: Record<string, StorageColumn> = {
   id: { type: 'text', nullable: false },
   createdAt: { type: 'timestamp', nullable: false },
+};
+
+const SPAN_SCHEMA: Record<string, StorageColumn> = {
+  traceId: { type: 'text', nullable: false },
+  spanId: { type: 'text', nullable: false },
 };
 
 describe('PgDB external schema mode', () => {
@@ -160,6 +165,20 @@ describe('PgDB external schema mode', () => {
     expect(ddlQueries).toEqual([]);
   });
 
+  it('requires the spans conflict primary key even when the schema has no primaryKey flags', async () => {
+    const { client, ddlQueries } = createClient({
+      columns: Object.keys(SPAN_SCHEMA),
+      primaryKeyColumns: [],
+    });
+    const db = new PgDB({ client, schemaName: 'external_schema', disableInit: true });
+
+    await expect(db.createTable({ tableName: TABLE_SPANS, schema: SPAN_SCHEMA })).rejects.toMatchObject({
+      id: 'MASTRA_STORAGE_PG_CREATE_TABLE_FAILED',
+      cause: expect.objectContaining({ message: expect.stringContaining('primary key') }),
+    });
+    expect(ddlQueries).toEqual([]);
+  });
+
   it('refreshes a cached index miss after an external migration repairs it', async () => {
     const { client, ddlQueries, indexRows } = createClient();
     const db = new PgDB({ client, schemaName: 'external_schema', disableInit: true });
@@ -194,9 +213,11 @@ describe('PgDB external schema mode', () => {
   it('exports indexes required by read-only workflow and experiment initialization', () => {
     const workflowDDL = WorkflowDefinitionsPG.getExportDDL('external_schema').join('\n');
     const experimentDDL = ExperimentsPG.getExportDDL('external_schema').join('\n');
+    const datasetDDL = DatasetsPG.getExportDDL('external_schema').join('\n');
 
     expect(workflowDDL).toContain('"external_schema_idx_workflow_definitions_status"');
     expect(experimentDDL).toContain('"idx_experiments_datasetid"');
+    expect(datasetDDL).toContain('"idx_dataset_items_dataset_validto"');
   });
 
   it('bounds schema-prefixed workflow-definition index names for PostgreSQL exports', () => {

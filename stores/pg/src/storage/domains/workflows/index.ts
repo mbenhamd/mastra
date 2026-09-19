@@ -4309,6 +4309,7 @@ export class WorkflowsPG extends WorkflowsStorage {
       // Validate the snapshot table and indexes without running the terminal
       // table migrations below. The store-level initializer already skips
       // this path; this covers direct and composite overrides.
+      await this.#db.validateExternalSchemaTables(WorkflowsPG.MANAGED_TABLES);
       await this.#db.createTable({
         tableName: TABLE_WORKFLOW_SNAPSHOT,
         schema: TABLE_SCHEMAS[TABLE_WORKFLOW_SNAPSHOT],

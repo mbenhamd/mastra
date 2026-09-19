@@ -42,7 +42,7 @@ import type {
   DatasetTenancyFilters,
 } from '@mastra/core/storage';
 import type { TxClient } from '../../client';
-import { PgDB, resolvePgConfig, generateTableSQL } from '../../db';
+import { PgDB, resolvePgConfig, generateIndexSQL, generateTableSQL } from '../../db';
 import type { DbClient, PgDomainConfig } from '../../db';
 import { getTableName, getSchemaName, tenancyWhere } from '../utils';
 
@@ -64,6 +64,54 @@ function parseStoredJSON<T>(value: unknown): T {
 
 function parseOptionalJSON<T>(value: unknown, emptyValue: null | undefined): T | null | undefined {
   return value === null || value === undefined ? emptyValue : parseStoredJSON<T>(value);
+}
+
+function getDatasetDefaultIndexDefinitions(): CreateIndexOptions[] {
+  return [
+    { name: 'idx_dataset_items_dataset_validto', table: TABLE_DATASET_ITEMS, columns: ['datasetId', 'validTo'] },
+    {
+      name: 'idx_dataset_items_dataset_version',
+      table: TABLE_DATASET_ITEMS,
+      columns: ['datasetId', 'datasetVersion'],
+    },
+    {
+      name: 'idx_dataset_items_external_id_history',
+      table: TABLE_DATASET_ITEMS,
+      columns: ['datasetId', 'externalId', 'datasetVersion'],
+    },
+    {
+      name: 'idx_dataset_items_dataset_validto_deleted',
+      table: TABLE_DATASET_ITEMS,
+      columns: ['datasetId', 'validTo', 'isDeleted'],
+    },
+    {
+      name: 'idx_dataset_versions_dataset_version',
+      table: TABLE_DATASET_VERSIONS,
+      columns: ['datasetId', 'version'],
+    },
+    {
+      name: 'idx_dataset_versions_dataset_version_unique',
+      table: TABLE_DATASET_VERSIONS,
+      columns: ['datasetId', 'version'],
+      unique: true,
+    },
+    // Tenancy: leading-tenant indexes for multi-tenant scans (parity with observability storage).
+    {
+      name: 'idx_datasets_org_project',
+      table: TABLE_DATASETS,
+      columns: ['organizationId', 'projectId'],
+    },
+    {
+      name: 'idx_datasets_candidate',
+      table: TABLE_DATASETS,
+      columns: ['candidateKey', 'candidateId'],
+    },
+    {
+      name: 'idx_dataset_items_org_project',
+      table: TABLE_DATASET_ITEMS,
+      columns: ['organizationId', 'projectId'],
+    },
+  ];
 }
 
 export class DatasetsPG extends DatasetsStorage {
@@ -95,6 +143,9 @@ export class DatasetsPG extends DatasetsStorage {
           includeAllConstraints: true,
         }),
       );
+    }
+    for (const index of getDatasetDefaultIndexDefinitions()) {
+      statements.push(generateIndexSQL(index, schemaName));
     }
     return statements;
   }
@@ -160,51 +211,7 @@ export class DatasetsPG extends DatasetsStorage {
   }
 
   getDefaultIndexDefinitions(): CreateIndexOptions[] {
-    return [
-      { name: 'idx_dataset_items_dataset_validto', table: TABLE_DATASET_ITEMS, columns: ['datasetId', 'validTo'] },
-      {
-        name: 'idx_dataset_items_dataset_version',
-        table: TABLE_DATASET_ITEMS,
-        columns: ['datasetId', 'datasetVersion'],
-      },
-      {
-        name: 'idx_dataset_items_external_id_history',
-        table: TABLE_DATASET_ITEMS,
-        columns: ['datasetId', 'externalId', 'datasetVersion'],
-      },
-      {
-        name: 'idx_dataset_items_dataset_validto_deleted',
-        table: TABLE_DATASET_ITEMS,
-        columns: ['datasetId', 'validTo', 'isDeleted'],
-      },
-      {
-        name: 'idx_dataset_versions_dataset_version',
-        table: TABLE_DATASET_VERSIONS,
-        columns: ['datasetId', 'version'],
-      },
-      {
-        name: 'idx_dataset_versions_dataset_version_unique',
-        table: TABLE_DATASET_VERSIONS,
-        columns: ['datasetId', 'version'],
-        unique: true,
-      },
-      // Tenancy: leading-tenant indexes for multi-tenant scans (parity with observability storage).
-      {
-        name: 'idx_datasets_org_project',
-        table: TABLE_DATASETS,
-        columns: ['organizationId', 'projectId'],
-      },
-      {
-        name: 'idx_datasets_candidate',
-        table: TABLE_DATASETS,
-        columns: ['candidateKey', 'candidateId'],
-      },
-      {
-        name: 'idx_dataset_items_org_project',
-        table: TABLE_DATASET_ITEMS,
-        columns: ['organizationId', 'projectId'],
-      },
-    ];
+    return getDatasetDefaultIndexDefinitions();
   }
 
   async createDefaultIndexes(): Promise<void> {

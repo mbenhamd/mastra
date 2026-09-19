@@ -354,4 +354,32 @@ describe('PostgresStore externally managed schema mode', () => {
       await runtime.close().catch(() => {});
     }
   }, 180_000);
+
+  it('rejects direct workflow init when a managed terminal table is missing', async () => {
+    const schema = schemaName!;
+    const role = roleName!;
+    const password = rolePassword!;
+    const workflowPool = new Pool({
+      ...(TEST_CONFIG as any),
+      user: role,
+      password,
+      max: 1,
+    });
+    const workflows = new WorkflowsPG({ pool: workflowPool, schemaName: schema, disableInit: true });
+
+    try {
+      await adminPool.query(
+        `DROP TABLE ${quoteIdentifier(schema)}.${quoteIdentifier('mastra_workflow_terminal_snapshots_v2')}`,
+      );
+      const statements = await captureStatements(async () => {
+        await expect(workflows.init()).rejects.toMatchObject({
+          id: 'MASTRA_STORAGE_PG_CREATE_TABLE_FAILED',
+          cause: expect.objectContaining({ message: expect.stringContaining('missing required table') }),
+        });
+      });
+      expect(statements.filter(statement => WRITE_DDL.test(statement))).toEqual([]);
+    } finally {
+      await workflowPool.end();
+    }
+  }, 180_000);
 });

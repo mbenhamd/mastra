@@ -529,7 +529,7 @@ export class PgDB extends MastraBase {
     return this.disableInit === true || process.env.MASTRA_DISABLE_STORAGE_INIT === 'true';
   }
 
-  private async getExternalSchemaTable(tableName: TABLE_NAMES): Promise<{
+  private async getExternalSchemaTable(tableName: string): Promise<{
     exists: boolean;
     columns: Set<string>;
     primaryKeyColumns: string[];
@@ -583,6 +583,33 @@ export class PgDB extends MastraBase {
     }
   }
 
+  /**
+   * Checks the presence of raw-DDL tables owned by a domain without attempting
+   * to reproduce their full constraint definitions in PgDB.
+   */
+  async validateExternalSchemaTables(tableNames: readonly string[]): Promise<void> {
+    for (const tableName of tableNames) {
+      const actual = await this.getExternalSchemaTable(tableName);
+      if (actual.exists) continue;
+
+      this.externalSchemaTableCache.delete(tableName);
+      throw new MastraError(
+        {
+          id: createStorageErrorId('PG', 'CREATE_TABLE', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: { tableName },
+        },
+        new Error(
+          `PostgreSQL external schema is missing required table ${getTableName({
+            indexName: tableName as TABLE_NAMES,
+            schemaName: getSchemaName(this.schemaName),
+          })}`,
+        ),
+      );
+    }
+  }
+
   private async getExternalSchemaIndexes(): Promise<Set<string>> {
     const cached = this.externalSchemaIndexCache;
     if (cached) return cached;
@@ -628,6 +655,12 @@ export class PgDB extends MastraBase {
         .filter(([, columnDef]) => columnDef.primaryKey)
         .map(([columnName]) => columnName)
     ).map(columnName => parseSqlIdentifier(columnName, 'column name'));
+    if (tableName === TABLE_SPANS && requiredPrimaryKeyColumns.length === 0) {
+      requiredPrimaryKeyColumns.push(
+        parseSqlIdentifier('traceId', 'column name'),
+        parseSqlIdentifier('spanId', 'column name'),
+      );
+    }
     for (const [columnName, columnDef] of Object.entries(schema)) {
       const parsedColumnName = parseSqlIdentifier(columnName, 'column name');
       requiredColumns.add(parsedColumnName);
