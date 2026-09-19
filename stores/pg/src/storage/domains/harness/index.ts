@@ -1757,7 +1757,8 @@ export class HarnessPG extends HarnessStorage {
         sql: `SELECT * FROM ${TABLE_HARNESS_SESSIONS}
               WHERE harness_name = ? AND resource_id = ? AND thread_id = ?
               ORDER BY last_activity_at DESC
-              LIMIT 1`,
+              LIMIT 1
+              FOR UPDATE`,
         args: [harnessName, record.resourceId, record.threadId],
       });
       const activeRow = active.rows[0];
@@ -2085,7 +2086,8 @@ export class HarnessPG extends HarnessStorage {
     const namespace = this.#resolveHarnessName(input.harnessName);
     const tx = await this.#client.transaction('write');
     try {
-      const claimConditions = [
+      const maxAttempts = this.sessionRecordProjection.maxAttempts;
+      const commonClaimConditions = [
         'i.harness_name = ?',
         'f.harness_name = i.harness_name',
         'f.session_id = i.session_id',
@@ -2093,10 +2095,12 @@ export class HarnessPG extends HarnessStorage {
         'f.session_incarnation = i.session_incarnation',
         'f.resource_id = i.resource_id',
         'f.thread_id = i.thread_id',
+      ];
+      const normalClaimConditions = [
+        `i.attempts < ${maxAttempts}`,
         'i.status IN (?, ?, ?)',
         '(i.status <> ? OR i.claim_expires_at <= ?)',
         '(i.status NOT IN (?, ?) OR i.next_attempt_at IS NULL OR i.next_attempt_at <= ?)',
-        'i.attempts < ?',
         `NOT EXISTS (
            SELECT 1 FROM ${TABLE_HARNESS_SESSION_PROJECTION_INTENTS} predecessor
            WHERE predecessor.harness_name = i.harness_name
@@ -2105,6 +2109,15 @@ export class HarnessPG extends HarnessStorage {
              AND predecessor.revision < i.revision
              AND predecessor.status IN (?, ?, ?)
          )`,
+      ];
+      const exhaustedClaimConditions = [
+        `i.attempts >= ${maxAttempts}`,
+        'i.status IN (?, ?, ?)',
+        '(i.status <> ? OR i.claim_expires_at <= ?)',
+      ];
+      const claimConditions = [
+        ...commonClaimConditions,
+        `((${normalClaimConditions.join(' AND ')}) OR (${exhaustedClaimConditions.join(' AND ')}))`,
       ];
       const claimArgs: (string | number)[] = [
         namespace,
@@ -2116,10 +2129,14 @@ export class HarnessPG extends HarnessStorage {
         'pending',
         'failed',
         input.now,
-        this.sessionRecordProjection.maxAttempts,
         'pending',
         'claimed',
         'failed',
+        'pending',
+        'claimed',
+        'failed',
+        'claimed',
+        input.now,
       ];
       if (input.resourceId !== undefined) {
         claimConditions.push('i.resource_id = ?');
@@ -2153,26 +2170,9 @@ export class HarnessPG extends HarnessStorage {
       }
 
       const updateConditions = [
-        'i.harness_name = ?',
+        ...commonClaimConditions,
         `i.id IN (${candidateIds.map(() => '?').join(', ')})`,
-        'f.harness_name = i.harness_name',
-        'f.session_id = i.session_id',
-        "f.state = 'active'",
-        'f.session_incarnation = i.session_incarnation',
-        'f.resource_id = i.resource_id',
-        'f.thread_id = i.thread_id',
-        'i.status IN (?, ?, ?)',
-        '(i.status <> ? OR i.claim_expires_at <= ?)',
-        '(i.status NOT IN (?, ?) OR i.next_attempt_at IS NULL OR i.next_attempt_at <= ?)',
-        'i.attempts < ?',
-        `NOT EXISTS (
-           SELECT 1 FROM ${TABLE_HARNESS_SESSION_PROJECTION_INTENTS} predecessor
-           WHERE predecessor.harness_name = i.harness_name
-             AND predecessor.session_id = i.session_id
-             AND predecessor.session_incarnation = i.session_incarnation
-             AND predecessor.revision < i.revision
-             AND predecessor.status IN (?, ?, ?)
-         )`,
+        `((${normalClaimConditions.join(' AND ')}) OR (${exhaustedClaimConditions.join(' AND ')}))`,
       ];
       const updateArgs: (string | number)[] = [
         namespace,
@@ -2185,10 +2185,14 @@ export class HarnessPG extends HarnessStorage {
         'pending',
         'failed',
         input.now,
-        this.sessionRecordProjection.maxAttempts,
         'pending',
         'claimed',
         'failed',
+        'pending',
+        'claimed',
+        'failed',
+        'claimed',
+        input.now,
       ];
       if (input.resourceId !== undefined) {
         updateConditions.push('i.resource_id = ?');
@@ -2200,17 +2204,48 @@ export class HarnessPG extends HarnessStorage {
       }
       const claimedRows = await tx.execute({
         sql: `UPDATE ${TABLE_HARNESS_SESSION_PROJECTION_INTENTS} i
-              SET status = ?, attempts = attempts + 1, claim_id = ?, claim_expires_at = ?, updated_at = ?
+              SET status = CASE WHEN i.attempts >= ${maxAttempts} THEN ? ELSE ? END,
+                  attempts = CASE WHEN i.attempts >= ${maxAttempts} THEN i.attempts ELSE i.attempts + 1 END,
+                  claim_id = CASE WHEN i.attempts >= ${maxAttempts} THEN NULL ELSE ? END,
+                  claim_expires_at = CASE WHEN i.attempts >= ${maxAttempts} THEN NULL ELSE CAST(? AS bigint) END,
+                  dead_at = CASE WHEN i.attempts >= ${maxAttempts} THEN CAST(? AS bigint) ELSE i.dead_at END,
+                  failed_at = CASE WHEN i.attempts >= ${maxAttempts} THEN CAST(? AS bigint) ELSE i.failed_at END,
+                  next_attempt_at = CASE WHEN i.attempts >= ${maxAttempts} THEN NULL ELSE i.next_attempt_at END,
+                  last_error = CASE WHEN i.attempts >= ${maxAttempts} THEN CAST(? AS jsonb) ELSE i.last_error END,
+                  updated_at = ?
               FROM ${TABLE_HARNESS_SESSION_PROJECTION_FENCES} f
               WHERE ${updateConditions.join(' AND ')}
               RETURNING i.*`,
-        args: ['claimed', input.claimId, input.now + input.claimTtlMs, input.now, ...updateArgs],
+        args: [
+          'dead',
+          'claimed',
+          input.claimId,
+          input.now + input.claimTtlMs,
+          input.now,
+          input.now,
+          JSON.stringify({ code: 'session_projection.max_attempts', message: 'Maximum projection attempts reached' }),
+          input.now,
+          ...updateArgs,
+        ],
       });
+      const updatedIntents = (claimedRows.rows as Record<string, unknown>[]).map(row => rowToProjectionIntent(row));
+      const deadIntents = updatedIntents.filter(intent => intent.status === 'dead');
+      if (deadIntents.length > 0) {
+        await this.#releaseProjectionCapacityValuesTx(
+          tx,
+          namespace,
+          deadIntents.length,
+          deadIntents.reduce((total, intent) => total + intent.payloadBytes, 0),
+          input.now,
+        );
+      }
       const claimedById = new Map(
-        (claimedRows.rows as Record<string, unknown>[]).map(row => {
-          const intent = rowToProjectionIntent(row);
-          return [intent.id, { ...intent, status: 'claimed' as const }] as const;
-        }),
+        updatedIntents
+          .filter(
+            (intent): intent is HarnessSessionRecordProjectionIntent & { status: 'claimed' } =>
+              intent.status === 'claimed',
+          )
+          .map(intent => [intent.id, intent] as const),
       );
       const claimed = candidateIds.flatMap(id => {
         const intent = claimedById.get(id);
