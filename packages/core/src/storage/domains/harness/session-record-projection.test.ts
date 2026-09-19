@@ -6,6 +6,7 @@ import type { SessionRecord } from './types';
 import {
   HarnessStorageSessionProjectionClaimConflictError,
   HarnessStorageSessionProjectionIncarnationError,
+  HarnessStorageSessionProjectionIdentityError,
   InMemoryHarness,
 } from './index';
 
@@ -281,6 +282,23 @@ describe('native session record projection', () => {
         claimTtlMs: 10_000,
       }),
     ).resolves.toHaveLength(1);
+  });
+
+  it('rejects resource and thread retargeting within a projection incarnation', async () => {
+    const storage = new InMemoryHarness({
+      db: new InMemoryDB(),
+      sessionRecordProjection: { enabled: true, maxPendingIntents: 10 },
+    });
+    await storage.saveSession(sampleSession(), { ownerId: 'owner-1', ifVersion: 0 });
+    const existing = await storage.loadSession({ sessionId: 'session-1' });
+    if (!existing) throw new Error('expected projected session');
+
+    await expect(
+      storage.saveSession({ ...existing, threadId: 'retargeted-thread' }, { ownerId: 'owner-1', ifVersion: 1 }),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionProjectionIdentityError);
+    await expect(
+      storage.saveSession({ ...existing, resourceId: 'retargeted-resource' }, { ownerId: 'owner-1', ifVersion: 1 }),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionProjectionIdentityError);
   });
 });
 

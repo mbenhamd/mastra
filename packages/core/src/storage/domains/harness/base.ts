@@ -482,6 +482,17 @@ export class HarnessStorageSessionProjectionIncarnationError extends HarnessStor
   }
 }
 
+export class HarnessStorageSessionProjectionIdentityError extends HarnessStorageDomainError {
+  readonly name = 'HarnessStorageSessionProjectionIdentityError';
+  readonly code = 'harness.storage.session_record_projection_identity_invalid' as const;
+  constructor(
+    public readonly sessionId: string,
+    public readonly field: 'resourceId' | 'threadId',
+  ) {
+    super(`Session "${sessionId}" cannot change its projection ${field} within one incarnation`);
+  }
+}
+
 export class HarnessStorageSessionProjectionClaimConflictError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageSessionProjectionClaimConflictError';
   readonly code = 'harness.storage.session_record_projection_claim_conflict' as const;

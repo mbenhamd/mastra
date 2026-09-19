@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto';
 
 import { createSampleSessionRecord } from '@internal/storage-test-utils';
 import {
+  HarnessStorageSessionProjectionIdentityError,
+  HarnessStorageThreadDeleteFenceConflictError,
   TABLE_HARNESS_SESSION_PROJECTION_FENCES,
   TABLE_HARNESS_SESSION_PROJECTION_INTENTS,
   TABLE_HARNESS_SESSION_PROJECTION_PRESSURE,
@@ -57,6 +59,56 @@ describe('HarnessPG native session record projection', () => {
     );
     expect(sessions.count).toBe('0');
     expect(intents.count).toBe('0');
+  });
+
+  it('rejects projection identity retargeting on both session save paths', async () => {
+    const harness = store.stores.harness!;
+    const session = createSampleSessionRecord({
+      id: 'projection-identity-guard',
+      resourceId: 'projection-identity-resource',
+      threadId: 'projection-identity-thread',
+    });
+    await harness.saveSession(session, { ownerId: 'owner-identity', ifVersion: 0 });
+    const existing = await harness.loadSession({ sessionId: session.id });
+    if (!existing) throw new Error('expected projected session');
+
+    await expect(
+      harness.saveSession(
+        { ...existing, threadId: 'retargeted-thread' },
+        { ownerId: 'owner-identity', ifVersion: existing.version },
+      ),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionProjectionIdentityError);
+    await expect(
+      harness.saveSessionWithAttachmentReferences(
+        { ...existing, resourceId: 'retargeted-resource' },
+        { ownerId: 'owner-identity', ifVersion: existing.version },
+        [],
+      ),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionProjectionIdentityError);
+    await expect(harness.loadSession({ sessionId: session.id })).resolves.toMatchObject({ version: 1 });
+  });
+
+  it('preserves the local deletion-fence guard for projected inserts', async () => {
+    const harness = store.stores.harness!;
+    const session = createSampleSessionRecord({
+      id: 'projection-local-delete-fence',
+      resourceId: 'projection-local-delete-resource',
+      threadId: 'projection-local-delete-thread',
+    });
+    await harness.withThreadDeleteFence(
+      { threadId: session.threadId, ownerId: 'owner-delete', ttlMs: 30_000 },
+      async () => {
+        const originalNow = Date.now();
+        const clock = vi.spyOn(Date, 'now').mockReturnValue(originalNow + 60_000);
+        try {
+          await expect(harness.saveSession(session, { ownerId: 'owner-new', ifVersion: 0 })).rejects.toBeInstanceOf(
+            HarnessStorageThreadDeleteFenceConflictError,
+          );
+        } finally {
+          clock.mockRestore();
+        }
+      },
+    );
   });
 
   it('serializes CAS revisions, fences deletion, and mints a new incarnation on recreation', async () => {
