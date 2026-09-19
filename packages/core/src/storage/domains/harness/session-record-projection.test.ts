@@ -3,7 +3,11 @@ import { describe, expect, it } from 'vitest';
 import { InMemoryDB } from '../inmemory-db';
 import { buildHarnessSessionRecordPostImage } from './session-record-projection';
 import type { SessionRecord } from './types';
-import { HarnessStorageSessionProjectionIncarnationError, InMemoryHarness } from './index';
+import {
+  HarnessStorageSessionProjectionClaimConflictError,
+  HarnessStorageSessionProjectionIncarnationError,
+  InMemoryHarness,
+} from './index';
 
 describe('native session record projection', () => {
   it('keeps the post-image bounded and delivers revisions in order across recreation', async () => {
@@ -137,6 +141,9 @@ describe('native session record projection', () => {
     expect(() =>
       buildHarnessSessionRecordPostImage(sampleSession({ lastActivityAt: Number.NaN }), { maxPayloadBytes: 64 * 1024 }),
     ).toThrow(RangeError);
+    expect(
+      buildHarnessSessionRecordPostImage(sampleSession({ modelId: '' }), { maxPayloadBytes: 64 * 1024 }).payload,
+    ).toMatchObject({ modelId: '' });
 
     const db = new InMemoryDB();
     const projectedStorage = new InMemoryHarness({
@@ -166,6 +173,114 @@ describe('native session record projection', () => {
     await expect(projected.deleteSession({ sessionId: existing.id })).rejects.toBeInstanceOf(
       HarnessStorageSessionProjectionIncarnationError,
     );
+  });
+
+  it('keeps claim acknowledgements within the requested harness namespace', async () => {
+    const db = new InMemoryDB();
+    const defaultStorage = new InMemoryHarness({
+      db,
+      harnessName: 'default',
+      sessionRecordProjection: { enabled: true, maxPendingIntents: 10 },
+    });
+    const otherStorage = new InMemoryHarness({
+      db,
+      harnessName: 'other',
+      sessionRecordProjection: { enabled: true, maxPendingIntents: 10 },
+    });
+    const created = await defaultStorage.createOrLoadActiveSession(sampleSession(), {
+      initialLease: { ownerId: 'owner-1', ttlMs: 60_000 },
+    });
+    const claimed = await defaultStorage.claimSessionRecordProjectionIntents({
+      claimId: 'claim-1',
+      limit: 1,
+      now: Date.now(),
+      claimTtlMs: 10_000,
+    });
+    const intent = claimed[0];
+    if (!intent) throw new Error('expected a projection intent');
+
+    await expect(
+      otherStorage.ackSessionRecordProjection({
+        operationId: intent.operationId,
+        sessionId: created.record.id,
+        sessionIncarnation: created.record.sessionIncarnation!,
+        revision: intent.revision,
+        payloadDigest: intent.payloadDigest,
+        claimId: 'claim-1',
+        acknowledgedAt: Date.now(),
+      }),
+    ).rejects.toThrow(HarnessStorageSessionProjectionClaimConflictError);
+    await expect(
+      defaultStorage.ackSessionRecordProjection({
+        operationId: intent.operationId,
+        sessionId: created.record.id,
+        sessionIncarnation: created.record.sessionIncarnation!,
+        revision: intent.revision,
+        payloadDigest: intent.payloadDigest,
+        claimId: 'claim-1',
+        acknowledgedAt: Date.now(),
+      }),
+    ).resolves.toMatchObject({ status: 'applied' });
+  });
+
+  it('fences every deleted session before cleanup can yield to recreation', async () => {
+    const db = new InMemoryDB();
+    const storage = new InMemoryHarness({
+      db,
+      sessionRecordProjection: { enabled: true, maxPendingIntents: 10 },
+    });
+    await storage.saveSession(sampleSession({ id: 'session-a', threadId: 'thread-a' }), {
+      ownerId: 'owner-a',
+      ifVersion: 0,
+    });
+    await storage.saveSession(sampleSession({ id: 'session-b', threadId: 'thread-b' }), {
+      ownerId: 'owner-b',
+      ifVersion: 0,
+    });
+    const beforeDelete = await storage.loadSession({ sessionId: 'session-b' });
+    const oldIncarnation = beforeDelete?.sessionIncarnation;
+    expect(oldIncarnation).toBeTruthy();
+
+    let enteredCleanup!: () => void;
+    const cleanupEntered = new Promise<void>(resolve => {
+      enteredCleanup = resolve;
+    });
+    let releaseCleanup!: () => void;
+    const cleanupGate = new Promise<void>(resolve => {
+      releaseCleanup = resolve;
+    });
+    const deleteAttachmentsForSession = storage.deleteAttachmentsForSession.bind(storage);
+    storage.deleteAttachmentsForSession = async input => {
+      if (input.sessionId === 'session-a') {
+        enteredCleanup();
+        await cleanupGate;
+      }
+      await deleteAttachmentsForSession(input);
+    };
+
+    const deletion = storage.deleteSessions({
+      sessions: [{ sessionId: 'session-a' }, { sessionId: 'session-b' }],
+    });
+    await cleanupEntered;
+    await storage.saveSession(sampleSession({ id: 'session-b', threadId: 'thread-b' }), {
+      ownerId: 'owner-b-recreated',
+      ifVersion: 0,
+    });
+    releaseCleanup();
+    await deletion;
+
+    const loaded = await storage.loadSession({ sessionId: 'session-b' });
+    expect(loaded?.sessionIncarnation).toBeTruthy();
+    expect(loaded?.sessionIncarnation).not.toBe(oldIncarnation);
+    await expect(
+      storage.claimSessionRecordProjectionIntents({
+        sessionId: 'session-b',
+        claimId: 'claim-recreated',
+        limit: 1,
+        now: Date.now(),
+        claimTtlMs: 10_000,
+      }),
+    ).resolves.toHaveLength(1);
   });
 });
 

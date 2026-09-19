@@ -85,7 +85,9 @@ export function buildHarnessSessionRecordPostImage(
     resourceId: boundedId(record.resourceId),
     ...(record.parentSessionId !== undefined ? { parentSessionId: boundedId(record.parentSessionId) } : {}),
     modeId: boundedId(record.modeId),
-    modelId: boundedId(record.modelId),
+    // A session may be created before a model override is selected; preserve
+    // the existing empty model configuration instead of manufacturing an ID.
+    modelId: boundedText(record.modelId, MAX_HARNESS_SESSION_RECORD_PROJECTION_ID_CHARS),
     createdAt: record.createdAt,
     lastActivityAt: record.lastActivityAt,
     lifecycle: sessionLifecycle(record),
@@ -210,7 +212,7 @@ function projectCurrentRun(run: NonNullable<SessionRecord['currentRun']>): Harne
     runId: boundedId(run.runId),
     status: run.status,
     modeId: boundedId(run.modeId),
-    modelId: boundedId(run.modelId),
+    modelId: boundedText(run.modelId, MAX_HARNESS_SESSION_RECORD_PROJECTION_ID_CHARS),
     startedAt: run.startedAt,
     updatedAt: run.updatedAt,
     ...(run.terminalAt !== undefined ? { terminalAt: run.terminalAt } : {}),

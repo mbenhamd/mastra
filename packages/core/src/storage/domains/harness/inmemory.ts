@@ -600,6 +600,9 @@ export class InMemoryHarness extends HarnessStorage {
           };
         }
       }
+    }
+
+    for (const { namespace, sessionId, record } of existingSessions.values()) {
       await this.cleanupDeletedSession({
         namespace,
         sessionId,
@@ -688,7 +691,8 @@ export class InMemoryHarness extends HarnessStorage {
   ): Promise<{ claimExpiresAt: number; storageNow: number }> {
     this.assertProjectionEnabled();
     assertProjectionRenewInput(input);
-    const intent = this.findProjectionIntent(input.operationId);
+    const namespace = resolveHarnessName(input.harnessName, this.harnessName);
+    const intent = this.findProjectionIntent(input.operationId, namespace);
     this.assertProjectionIntentIdentity(
       intent,
       input.sessionId,
@@ -712,7 +716,8 @@ export class InMemoryHarness extends HarnessStorage {
   async ackSessionRecordProjection(input: AckSessionRecordProjectionInput): Promise<AckSessionRecordProjectionResult> {
     this.assertProjectionEnabled();
     assertProjectionAckInput(input);
-    const intent = this.findProjectionIntent(input.operationId);
+    const namespace = resolveHarnessName(input.harnessName, this.harnessName);
+    const intent = this.findProjectionIntent(input.operationId, namespace);
     this.assertProjectionIntentIdentity(
       intent,
       input.sessionId,
@@ -749,7 +754,8 @@ export class InMemoryHarness extends HarnessStorage {
   ): Promise<HarnessSessionRecordProjectionIntent> {
     this.assertProjectionEnabled();
     assertProjectionFailInput(input);
-    const intent = this.findProjectionIntent(input.operationId);
+    const namespace = resolveHarnessName(input.harnessName, this.harnessName);
+    const intent = this.findProjectionIntent(input.operationId, namespace);
     this.assertProjectionIntentIdentity(
       intent,
       input.sessionId,
@@ -908,9 +914,11 @@ export class InMemoryHarness extends HarnessStorage {
     }
   }
 
-  private findProjectionIntent(operationId: string): HarnessSessionRecordProjectionIntent {
+  private findProjectionIntent(operationId: string, harnessName: string): HarnessSessionRecordProjectionIntent {
     const intent = this.db.harnessSessionRecordProjectionIntents.get(operationId);
-    if (!intent) throw new HarnessStorageSessionProjectionClaimConflictError(operationId);
+    if (!intent || intent.harnessName !== harnessName) {
+      throw new HarnessStorageSessionProjectionClaimConflictError(operationId);
+    }
     return intent;
   }
 

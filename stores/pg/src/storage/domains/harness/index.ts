@@ -1618,7 +1618,7 @@ export class HarnessPG extends HarnessStorage {
     sessionId: string,
     sessionIncarnation: string,
     updatedAt: number,
-  ): Promise<void> {
+  ): Promise<{ pendingIntents: number; pendingBytes: number }> {
     const result = await tx.execute({
       sql: `UPDATE ${TABLE_HARNESS_SESSION_PROJECTION_INTENTS}
             SET status = ?, dead_at = ?, failed_at = ?, claim_id = NULL, claim_expires_at = NULL,
@@ -1644,7 +1644,7 @@ export class HarnessPG extends HarnessStorage {
       (total, row) => total + Number((row as Record<string, unknown>).payload_bytes ?? 0),
       0,
     );
-    await this.#releaseProjectionCapacityValuesTx(tx, harnessName, result.rows.length, pendingBytes, updatedAt);
+    return { pendingIntents: result.rows.length, pendingBytes };
   }
 
   async #upsertProjectionFenceTx(tx: PgHarnessClient, fence: HarnessSessionRecordProjectionFence): Promise<void> {
@@ -1986,6 +1986,7 @@ export class HarnessPG extends HarnessStorage {
         });
       }
 
+      const retiredProjectionCapacity = new Map<string, { pendingIntents: number; pendingBytes: number }>();
       for (const {
         namespace,
         sessionId,
@@ -1994,8 +1995,9 @@ export class HarnessPG extends HarnessStorage {
         version,
         sessionIncarnation,
       } of deleteCandidates.values()) {
+        let retired: { pendingIntents: number; pendingBytes: number } | undefined;
         if (this.sessionRecordProjection.enabled && sessionIncarnation !== undefined) {
-          await this.#retireProjectionIntentsTx(tx, namespace, sessionId, sessionIncarnation, Date.now());
+          retired = await this.#retireProjectionIntentsTx(tx, namespace, sessionId, sessionIncarnation, Date.now());
         }
         const result = await tx.execute({
           sql: `DELETE FROM ${TABLE_HARNESS_SESSIONS}
@@ -2065,6 +2067,26 @@ export class HarnessPG extends HarnessStorage {
                   )`,
           args: [namespace, sessionId],
         });
+        if (retired !== undefined) {
+          const previous = retiredProjectionCapacity.get(namespace) ?? { pendingIntents: 0, pendingBytes: 0 };
+          previous.pendingIntents += retired.pendingIntents;
+          previous.pendingBytes += retired.pendingBytes;
+          retiredProjectionCapacity.set(namespace, previous);
+        }
+      }
+
+      // Keep the pressure row lock after attachment cleanup. A concurrent
+      // save that references one of these attachments may hold a key-share
+      // lock while reserving its own projection capacity; releasing here
+      // avoids a pressure-before-attachment cycle.
+      for (const [namespace, capacity] of retiredProjectionCapacity) {
+        await this.#releaseProjectionCapacityValuesTx(
+          tx,
+          namespace,
+          capacity.pendingIntents,
+          capacity.pendingBytes,
+          Date.now(),
+        );
       }
 
       await tx.commit();
