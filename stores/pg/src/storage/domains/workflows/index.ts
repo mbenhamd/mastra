@@ -5032,17 +5032,17 @@ export class WorkflowsPG extends WorkflowsStorage {
       }
       const row = await this.#db.client.oneOrNone<{
         snapshot_type: string | null;
-        status: unknown;
+        status_json: string | null;
         status_present: boolean;
-        execution_generation: unknown;
+        execution_generation_json: string | null;
         execution_generation_present: boolean;
       }>(
         `SELECT jsonb_typeof(snapshot.snapshot) AS snapshot_type,
                 CASE WHEN jsonb_typeof(snapshot.snapshot) = 'object' AND snapshot.snapshot ? 'status'
-                  THEN snapshot.snapshot->'status' END AS status,
+                  THEN (snapshot.snapshot->'status')::text END AS status_json,
                 jsonb_typeof(snapshot.snapshot) = 'object' AND snapshot.snapshot ? 'status' AS status_present,
                 CASE WHEN jsonb_typeof(snapshot.snapshot) = 'object' AND snapshot.snapshot ? 'executionGeneration'
-                  THEN snapshot.snapshot->'executionGeneration' END AS execution_generation,
+                  THEN (snapshot.snapshot->'executionGeneration')::text END AS execution_generation_json,
                 jsonb_typeof(snapshot.snapshot) = 'object' AND snapshot.snapshot ? 'executionGeneration' AS execution_generation_present
          FROM ${this.workflowSnapshotTableName()} AS snapshot
          WHERE workflow_name = $1 AND run_id = $2`,
@@ -5053,9 +5053,12 @@ export class WorkflowsPG extends WorkflowsStorage {
         return super.getWorkflowExecutionState({ workflowName, runId });
       }
 
+      const parseProjectedJson = (value: string | null): unknown => (value === null ? null : JSON.parse(value));
       return {
-        status: row.status_present ? row.status : undefined,
-        ...(row.execution_generation_present ? { executionGeneration: row.execution_generation } : {}),
+        status: row.status_present ? parseProjectedJson(row.status_json) : undefined,
+        ...(row.execution_generation_present
+          ? { executionGeneration: parseProjectedJson(row.execution_generation_json) }
+          : {}),
       } as WorkflowExecutionState;
     } catch (error) {
       throw new MastraError(

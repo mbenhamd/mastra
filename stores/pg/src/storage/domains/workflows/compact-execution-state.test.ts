@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { createEmptyWorkflowSnapshot, WorkflowsStorage } from '@mastra/core/storage';
 import type { WorkflowRunState } from '@mastra/core/workflows';
-import { Pool } from 'pg';
+import { Pool, types } from 'pg';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { WorkflowsPG } from '.';
 
@@ -15,6 +15,12 @@ const connection = {
 
 const SNAPSHOT_COLUMN_TYPES = ['jsonb', 'json', 'text'] as const;
 type SnapshotColumnType = (typeof SNAPSHOT_COLUMN_TYPES)[number];
+
+const rawJsonbTypes = {
+  getTypeParser(oid: number, format?: 'text' | 'binary') {
+    return oid === 3802 ? (value: string) => value : types.getTypeParser(oid, format);
+  },
+};
 
 describe('WorkflowsPG compact execution state', () => {
   const pool = new Pool(connection);
@@ -163,6 +169,32 @@ describe('WorkflowsPG compact execution state', () => {
     } finally {
       writerQuery.mockRestore();
       readQuery.mockRestore();
+    }
+  });
+
+  it('preserves compact values when a configured pool returns raw JSONB text', async () => {
+    const schema = await createSchema('jsonb');
+    const rawJsonbPool = new Pool({ ...connection, types: rawJsonbTypes });
+    const initializer = new WorkflowsPG({ pool, schemaName: schema, skipDefaultIndexes: true });
+    const workflows = new WorkflowsPG({ pool: rawJsonbPool, schemaName: schema, skipDefaultIndexes: true });
+    const workflowName = 'compact-state-raw-jsonb';
+    const runId = randomUUID();
+
+    try {
+      await initializer.init();
+      await workflows.persistWorkflowSnapshot({
+        workflowName,
+        runId,
+        snapshot: snapshot(runId, 'wfeg:pf4240:raw-jsonb'),
+      });
+
+      const expected = await WorkflowsStorage.prototype.getWorkflowExecutionState.call(workflows, {
+        workflowName,
+        runId,
+      });
+      await expect(workflows.getWorkflowExecutionState({ workflowName, runId })).resolves.toEqual(expected);
+    } finally {
+      await rawJsonbPool.end();
     }
   });
 
