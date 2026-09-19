@@ -9,7 +9,7 @@ import {
   TABLE_THREADS,
 } from '@mastra/core/storage';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { buildConstraintName } from '../db/constraint-utils';
+import { truncateIdentifierWithHash } from '../db/constraint-utils';
 import { HarnessPG } from '../domains/harness';
 import { MemoryPG } from '../domains/memory';
 import { ObservabilityPG } from '../domains/observability';
@@ -230,10 +230,7 @@ describe('PostgresStore Domain Performance Indexes', () => {
 
       const indexName = ddl.match(/CREATE INDEX IF NOT EXISTS "([^"]+)" ON [^\n]*snapshot ->> 'status'/)?.[1];
       expect(indexName).toBe(
-        buildConstraintName({
-          baseName: 'mastra_workflow_snapshot_name_status_createdat_idx',
-          schemaName: longSchema,
-        }),
+        truncateIdentifierWithHash(`${longSchema}_mastra_workflow_snapshot_name_status_createdat_idx`),
       );
       expect(Buffer.byteLength(indexName!, 'utf-8')).toBeLessThanOrEqual(63);
     });

@@ -39,8 +39,8 @@ export class AgentsPG extends AgentsStorage {
 
   constructor(config: PgDomainConfig) {
     super();
-    const { client, readClient, schemaName, skipDefaultIndexes, indexes } = resolvePgConfig(config);
-    this.#db = new PgDB({ client, readClient, schemaName, skipDefaultIndexes });
+    const { client, readClient, schemaName, disableInit, skipDefaultIndexes, indexes } = resolvePgConfig(config);
+    this.#db = new PgDB({ client, readClient, schemaName, disableInit, skipDefaultIndexes });
     this.#schema = schemaName || 'public';
     this.#skipDefaultIndexes = skipDefaultIndexes;
     // Filter indexes to only those for tables managed by this domain
@@ -89,6 +89,10 @@ export class AgentsPG extends AgentsStorage {
   }
 
   async init(): Promise<void> {
+    // Legacy migrations issue raw DDL; an externally managed schema must be
+    // initialized only by the privileged migration process.
+    if (this.#db.isExternalSchemaMode()) return;
+
     // Migrate from legacy schemas before creating tables
     await this.#migrateFromLegacySchema();
     await this.#migrateVersionsSchema();
@@ -345,6 +349,7 @@ export class AgentsPG extends AgentsStorage {
       try {
         await this.#db.createIndex(indexDef);
       } catch (error) {
+        if (this.#db.isExternalSchemaMode()) throw error;
         // Log but continue - indexes are performance optimizations
         this.logger?.warn?.(`Failed to create custom index ${indexDef.name}:`, error);
       }

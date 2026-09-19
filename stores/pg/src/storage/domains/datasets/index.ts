@@ -76,8 +76,8 @@ export class DatasetsPG extends DatasetsStorage {
 
   constructor(config: PgDomainConfig) {
     super();
-    const { client, readClient, schemaName, skipDefaultIndexes, indexes } = resolvePgConfig(config);
-    this.#db = new PgDB({ client, readClient, schemaName, skipDefaultIndexes });
+    const { client, readClient, schemaName, disableInit, skipDefaultIndexes, indexes } = resolvePgConfig(config);
+    this.#db = new PgDB({ client, readClient, schemaName, disableInit, skipDefaultIndexes });
     this.#schema = schemaName || 'public';
     this.#skipDefaultIndexes = skipDefaultIndexes;
     this.#indexes = indexes?.filter(idx => (DatasetsPG.MANAGED_TABLES as readonly string[]).includes(idx.table));
@@ -100,6 +100,10 @@ export class DatasetsPG extends DatasetsStorage {
   }
 
   async init(): Promise<void> {
+    // This initializer has a raw ALTER migration below; keep external-schema
+    // mode read-only when a composite store initializes the domain directly.
+    if (this.#db.isExternalSchemaMode()) return;
+
     await this.#db.createTable({ tableName: TABLE_DATASETS, schema: DATASETS_SCHEMA });
     await this.#db.createTable({
       tableName: TABLE_DATASET_ITEMS,
@@ -197,6 +201,7 @@ export class DatasetsPG extends DatasetsStorage {
       try {
         await this.#db.createIndex(indexDef);
       } catch (error) {
+        if (this.#db.isExternalSchemaMode()) throw error;
         this.logger?.warn?.(`Failed to create default index ${indexDef.name}:`, error);
       }
     }
@@ -208,6 +213,7 @@ export class DatasetsPG extends DatasetsStorage {
       try {
         await this.#db.createIndex(indexDef);
       } catch (error) {
+        if (this.#db.isExternalSchemaMode()) throw error;
         this.logger?.warn?.(`Failed to create custom index ${indexDef.name}:`, error);
       }
     }
