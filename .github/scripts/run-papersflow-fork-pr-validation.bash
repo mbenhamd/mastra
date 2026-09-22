@@ -9705,6 +9705,26 @@ NODE
   head_sha="$(
     cd "$fixture_repo"
     git reset -q --hard "$base_sha"
+    printf '%s\n' 'export const clickhouseTableSetupMarker = "ddl-builder-head";' \
+      >> stores/clickhouse/src/storage/db/index.ts
+    git add .
+    git commit -q -m 'clickhouse ddl builder source change'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/clickhouse-ddl-builder-success.log"
+  run_fixture "$head_sha" "$output"
+  assert_contains 'Forcing PF-2044 owned suites to run for source-only changes:' "$output"
+  assert_contains 'stores/clickhouse/src/storage/db/index.test.ts' "$output"
+  assert_contains '--filter ./stores/clickhouse --fail-if-no-match exec tsc --noEmit' "$command_log"
+  assert_contains '--filter ./stores/clickhouse --fail-if-no-match build:lib' "$command_log"
+  assert_contains '--filter ./stores/clickhouse --fail-if-no-match lint' "$command_log"
+  assert_contains '--dir stores/clickhouse exec vitest run' "$command_log"
+  assert_contains 'src/storage/db/index.test.ts' "$command_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
     printf '%s\n' 'export type CloudflareRecordTypes = { head: true };' \
       > stores/cloudflare/src/kv/storage/types.ts
     git add .
@@ -13251,10 +13271,11 @@ while IFS= read -r file; do
     pubsub/redis-streams/src/index.ts)
       queue_owned_workspace_test "$file" pubsub/redis-streams/src/pubsub.test.ts
       ;;
-    stores/clickhouse/src/storage/db/utils.ts)
+    stores/clickhouse/src/storage/db/index.ts | stores/clickhouse/src/storage/db/utils.ts)
       # TABLE_ENGINES is an exhaustive Record<TABLE_NAMES, ...> consumed by the
       # DDL builder in db/index.ts; the fully mocked client suite exercises
-      # that emission in-process and needs no ClickHouse service.
+      # both that emission and the table setup path in-process and needs no
+      # ClickHouse service.
       queue_owned_workspace_test "$file" stores/clickhouse/src/storage/db/index.test.ts
       ;;
     stores/cloudflare/src/kv/storage/types.ts)
