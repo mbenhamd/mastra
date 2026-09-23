@@ -2,8 +2,11 @@ import { randomUUID } from 'node:crypto';
 
 import { createSampleMessageV2, createSampleResource, createSampleSessionRecord } from '@internal/storage-test-utils';
 import {
+  TABLE_HARNESS_MESSAGE_RESULTS,
   TABLE_HARNESS_OPERATION_TOMBSTONES,
   TABLE_HARNESS_SESSIONS,
+  TABLE_HARNESS_SESSION_PROJECTION_INTENTS,
+  TABLE_HARNESS_TERMINAL_INTENTS,
   TABLE_HARNESS_WAKEUPS,
   TABLE_MESSAGES,
   TABLE_OBSERVATIONAL_MEMORY,
@@ -254,6 +257,75 @@ describe('exportExecutionClosure', () => {
     ).rejects.toThrow(/not found/i);
   });
 
+  it('pins the export when a pending message result has an in-flight dispatch', async () => {
+    const { s, schemaName } = await store('dispatch');
+    await seedClosure(s, schemaName, 'd1');
+    const now = Date.now();
+    // A `dispatching`/`accepted` marker means the provider may already have
+    // executed — the runtime never auto-replays those states, so the closure
+    // pins instead of importing an unrecoverable dispatch as complete.
+    await s.db.none(
+      `INSERT INTO "${schemaName}"."${TABLE_HARNESS_MESSAGE_RESULTS}"
+         (id, harness_name, session_id, resource_id, thread_id, signal_id, run_id,
+          operation_kind, status, dispatch, created_at, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12)`,
+      [
+        `mr-${randomUUID()}`,
+        HARNESS,
+        'd1',
+        'resource-d1',
+        'thread-d1',
+        'sig-inflight',
+        'run-inflight',
+        'signal',
+        'pending',
+        JSON.stringify({
+          state: 'dispatching',
+          attemptId: 'attempt-1',
+          claimExpiresAt: now + 30_000,
+          delivery: 'idle',
+          runId: 'run-inflight',
+        }),
+        now,
+        now,
+      ],
+    );
+    // A provably undispatched reservation re-drives safely — it must not pin.
+    await s.db.none(
+      `INSERT INTO "${schemaName}"."${TABLE_HARNESS_MESSAGE_RESULTS}"
+         (id, harness_name, session_id, resource_id, thread_id, signal_id,
+          operation_kind, status, dispatch, created_at, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11)`,
+      [
+        `mr-${randomUUID()}`,
+        HARNESS,
+        'd1',
+        'resource-d1',
+        'thread-d1',
+        'sig-reserved',
+        'signal',
+        'pending',
+        JSON.stringify({ state: 'reserved' }),
+        now,
+        now,
+      ],
+    );
+
+    const { manifest } = await exportExecutionClosure(s.db, { harnessName: HARNESS, sessionId: 'd1' }, { schemaName });
+    expect(manifest.completeness).toBe('pinned');
+    expect(manifest.pins).toEqual([
+      expect.objectContaining({
+        reason: 'in-flight-dispatch',
+        detail: expect.objectContaining({
+          sessionId: 'd1',
+          signalId: 'sig-inflight',
+          runId: 'run-inflight',
+          dispatchState: 'dispatching',
+        }),
+      }),
+    ]);
+  });
+
   it('keeps fence and authority rows in the payload with their roles recorded', async () => {
     const { s, schemaName } = await store('roles');
     await seedClosure(s, schemaName, 's5');
@@ -412,6 +484,199 @@ describe('importExecutionClosure', () => {
     );
     expect(row.session_incarnation).toBe(first.incarnations.rs2);
     expect(second.incarnations.rs2).toBe(first.incarnations.rs2);
+  });
+
+  it('restages a pending session-record projection intent for imported sessions', async () => {
+    const src = await store('proj-src');
+    const dst = await store('proj-dst');
+    await seedClosure(src.s, src.schemaName, 'pj1');
+
+    const exported = await exportExecutionClosure(
+      src.s.db,
+      { harnessName: HARNESS, sessionId: 'pj1' },
+      { schemaName: src.schemaName },
+    );
+    const result = await importExecutionClosure(dst.s.db, exported, { schemaName: dst.schemaName });
+    expect(result.status).toBe('imported');
+
+    // The imported projection fence triggers a deterministic restage: one
+    // pending intent per fenced session, keyed to the persisted session row.
+    // A restage that derived its timestamp from a column sessions do not have
+    // would silently stage nothing.
+    expect(result.inserted[TABLE_HARNESS_SESSION_PROJECTION_INTENTS]).toBe(2);
+    const intents = await dst.s.db.manyOrNone<Record<string, unknown>>(
+      `SELECT * FROM "${dst.schemaName}"."${TABLE_HARNESS_SESSION_PROJECTION_INTENTS}" ORDER BY session_id`,
+    );
+    expect(intents).toHaveLength(2);
+    const sessions = await dst.s.db.manyOrNone<Record<string, unknown>>(
+      `SELECT id, version, last_activity_at FROM "${dst.schemaName}"."${TABLE_HARNESS_SESSIONS}" ORDER BY id`,
+    );
+    for (const [i, session] of sessions.entries()) {
+      expect(intents[i]!.session_id).toBe(session.id);
+      expect(intents[i]!.status).toBe('pending');
+      expect(intents[i]!.revision).toBe(Number(session.version));
+      expect(intents[i]!.created_at).toBe(String(session.last_activity_at));
+    }
+  });
+
+  it('preserves a positive terminalization claim generation while clearing live claim fields', async () => {
+    const src = await store('claim-src');
+    const dst = await store('claim-dst');
+    const { runId } = await seedClosure(src.s, src.schemaName, 'cl1');
+    const now = Date.now();
+    await src.s.db.none(
+      `INSERT INTO "${src.schemaName}"."mastra_workflow_terminalizations"
+         (workflow_name, run_id, version, event_key, terminal_status, phase,
+          owner_id, claim_token, claim_generation, lease_expires_at,
+          created_at, updated_at, completed_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+      [
+        'test-workflow',
+        runId,
+        1,
+        'evt-1',
+        'success',
+        'terminalization_pending',
+        'src-owner',
+        'src-token',
+        3,
+        now + 60_000,
+        now,
+        now,
+        null,
+      ],
+    );
+    // `persistWorkflowSnapshot` already created the run's parent-revision row.
+
+    const exported = await exportExecutionClosure(
+      src.s.db,
+      { harnessName: HARNESS, sessionId: 'cl1' },
+      { schemaName: src.schemaName },
+    );
+    const result = await importExecutionClosure(dst.s.db, exported, { schemaName: dst.schemaName });
+    expect(result.status).toBe('imported');
+
+    const row = await dst.s.db.one<Record<string, unknown>>(
+      `SELECT * FROM "${dst.schemaName}"."mastra_workflow_terminalizations"
+       WHERE workflow_name = 'test-workflow' AND run_id = $1`,
+      [runId],
+    );
+    // Live claim fields are cleared; the monotonic fencing generation is
+    // preserved — the workflow decoder rejects claim_generation <= 0.
+    expect(row.owner_id).toBeNull();
+    expect(row.claim_token).toBeNull();
+    expect(row.lease_expires_at).toBeNull();
+    expect(row.claim_generation).toBe('3');
+    expect(row.phase).toBe('terminalization_pending');
+
+    // The imported record is readable and reclaimable: a fresh claimant
+    // increments the preserved generation instead of failing to decode.
+    const claim = await dst.s.stores.workflows!.claimWorkflowTerminalization({
+      workflowName: 'test-workflow',
+      runId,
+      eventKey: 'evt-1',
+      terminalStatus: 'success',
+      ownerId: 'dst-owner',
+      leaseMs: 60_000,
+    });
+    expect(claim).toMatchObject({ status: 'acquired', record: { claimGeneration: 4 } });
+
+    // A retry after the claim converges — claim columns are lifecycle state.
+    const second = await importExecutionClosure(dst.s.db, exported, { schemaName: dst.schemaName });
+    expect(second.status).toBe('imported');
+  });
+
+  it('converges when a retry meets rows advanced by destination workers', async () => {
+    const src = await store('adv-src');
+    const dst = await store('adv-dst');
+    await seedClosure(src.s, src.schemaName, 'adv1');
+    const now = Date.now();
+    const srcSession = await src.s.db.one<{ session_incarnation: string }>(
+      `SELECT session_incarnation FROM "${src.schemaName}"."${TABLE_HARNESS_SESSIONS}" WHERE id = 'adv1'`,
+    );
+    // One live terminal intent travels in the closure as fence evidence.
+    await src.s.db.none(
+      `INSERT INTO "${src.schemaName}"."${TABLE_HARNESS_TERMINAL_INTENTS}"
+         (id, admission_id, admission_hash, harness_name, session_id, resource_id, thread_id,
+          session_incarnation, grant_key, grant_generation, signal_id, run_id, revision,
+          finalizer_id, finalizer_version, terminal_result_json, projection_json, payload_bytes,
+          status, attempts, claim_id, claim_expires_at, next_attempt_at, last_error_json,
+          created_at, updated_at, acked_at, dead_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28)`,
+      [
+        'intent-adv1',
+        'adm-adv1',
+        'hash-adv1',
+        HARNESS,
+        'adv1',
+        'resource-adv1',
+        'thread-adv1',
+        srcSession.session_incarnation,
+        'grant-adv1',
+        1,
+        'sig-adv1',
+        'run-adv1',
+        1,
+        'finalizer-1',
+        'v1',
+        '{}',
+        '{}',
+        16,
+        'pending',
+        0,
+        null,
+        null,
+        null,
+        null,
+        now,
+        now,
+        null,
+        null,
+      ],
+    );
+
+    const exported = await exportExecutionClosure(
+      src.s.db,
+      { harnessName: HARNESS, sessionId: 'adv1' },
+      { schemaName: src.schemaName },
+    );
+    const first = await importExecutionClosure(dst.s.db, exported, { schemaName: dst.schemaName });
+    expect(first.status).toBe('imported');
+
+    // Between the first commit and a lost-ack retry, destination workers
+    // advance the imported rows: the intent is claimed and the session is
+    // saved at a newer version (which also stages the next projection intent
+    // and bumps its fence revision).
+    await dst.s.db.none(
+      `UPDATE "${dst.schemaName}"."${TABLE_HARNESS_TERMINAL_INTENTS}"
+       SET status = 'claimed', claim_id = 'worker-1', claim_expires_at = $1,
+           next_attempt_at = $1, updated_at = $1
+       WHERE id = 'intent-adv1'`,
+      [now + 30_000],
+    );
+    const harness = dst.s.stores.harness!;
+    const loaded = await harness.loadSession({ harnessName: HARNESS, sessionId: 'adv1' });
+    await harness.saveSession(
+      { ...loaded!, tokenUsage: { promptTokens: 5, completionTokens: 5, totalTokens: 10 } },
+      { ifVersion: loaded!.version },
+    );
+
+    const second = await importExecutionClosure(dst.s.db, exported, { schemaName: dst.schemaName });
+    expect(second.status).toBe('imported');
+    expect(second.incarnations.adv1).toBe(first.incarnations.adv1);
+    expect(second.skipped[TABLE_HARNESS_SESSIONS]).toBe(2);
+    expect(second.skipped[TABLE_HARNESS_TERMINAL_INTENTS]).toBe(1);
+
+    // The worker's claim and session advance were never overwritten.
+    const intent = await dst.s.db.one<Record<string, unknown>>(
+      `SELECT status, claim_id FROM "${dst.schemaName}"."${TABLE_HARNESS_TERMINAL_INTENTS}" WHERE id = 'intent-adv1'`,
+    );
+    expect(intent.status).toBe('claimed');
+    expect(intent.claim_id).toBe('worker-1');
+    const session = await dst.s.db.one<{ version: number }>(
+      `SELECT version FROM "${dst.schemaName}"."${TABLE_HARNESS_SESSIONS}" WHERE id = 'adv1'`,
+    );
+    expect(Number(session.version)).toBe(2);
   });
 
   it('fails closed on a tampered payload and writes nothing', async () => {

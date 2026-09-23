@@ -7,15 +7,23 @@ import {
   OBSERVATIONAL_MEMORY_TABLE_SCHEMA,
   TABLE_CONFIGS,
   TABLE_HARNESS_ATTACHMENTS,
+  TABLE_HARNESS_ATTACHMENT_REFERENCES,
+  TABLE_HARNESS_CHANNEL_ACTION_RECEIPTS,
+  TABLE_HARNESS_MESSAGE_RESULTS,
+  TABLE_HARNESS_PLAN_TASKS,
   TABLE_HARNESS_SESSIONS,
   TABLE_HARNESS_SESSION_PROJECTION_FENCES,
   TABLE_HARNESS_SESSION_PROJECTION_INTENTS,
   TABLE_HARNESS_SESSION_PROJECTION_PRESSURE,
+  TABLE_HARNESS_TERMINAL_ADMISSIONS,
   TABLE_HARNESS_TERMINAL_INTENTS,
   TABLE_HARNESS_TERMINAL_PRESSURE,
+  TABLE_HARNESS_WORKSPACE_ACTIONS,
+  TABLE_OBSERVATIONAL_MEMORY,
   TABLE_RESOURCES,
   TABLE_SCHEMAS,
   TABLE_THREADS,
+  TABLE_THREAD_STATE,
   TABLE_WORKFLOW_SNAPSHOT,
   TABLE_WORKFLOW_SNAPSHOT_HANDOFF,
   buildExecutionClosureManifest,
@@ -199,6 +207,191 @@ const PRIMARY_KEY_OVERRIDES: Record<string, readonly string[]> = {
   mastra_workflow_parent_revisions: ['workflow_name', 'run_id'],
 };
 
+/**
+ * Lifecycle columns a destination worker may legitimately advance between a
+ * committed import and a lost-ack retry — claim/apply/ack transitions on the
+ * same row. A retry that meets the row it imported earlier must converge:
+ * identity and payload columns still compare canonically, so the same row's
+ * forward progress is accepted while a foreign row colliding on the primary
+ * key still fails closed. Tables whose rows are immutable once written
+ * (tombstones, session events, run summaries, terminal lineage evidence) are
+ * deliberately absent — any difference there remains a real conflict.
+ */
+const ADVANCEABLE_COLUMNS: Partial<Record<ExecutionClosureTableName, ReadonlySet<string>>> = {
+  // Terminal worker lifecycle: pending -> claimed -> acked/dead.
+  [TABLE_HARNESS_TERMINAL_INTENTS]: new Set([
+    'status',
+    'attempts',
+    'claim_id',
+    'claim_expires_at',
+    'next_attempt_at',
+    'last_error_json',
+    'updated_at',
+    'acked_at',
+    'dead_at',
+  ]),
+  // Terminal admission lifecycle: pending -> committed/cancelled.
+  [TABLE_HARNESS_TERMINAL_ADMISSIONS]: new Set([
+    'status',
+    'terminal_result_json',
+    'projection_json',
+    'revision',
+    'updated_at',
+  ]),
+  // Projection pipeline lifecycle: pending -> claimed -> applied/failed/dead.
+  // Applies to the intents the importer itself restages — payload intent rows
+  // are `authority` and never reach this comparison. `created_at` is
+  // advanceable too: the intent id is a sha256 over the session identity and
+  // payload digest, so a worker-staged row at the same revision is provably
+  // the same intent even though its staging timestamp differs.
+  [TABLE_HARNESS_SESSION_PROJECTION_INTENTS]: new Set([
+    'status',
+    'attempts',
+    'claim_id',
+    'claim_expires_at',
+    'next_attempt_at',
+    'applied_at',
+    'failed_at',
+    'dead_at',
+    'last_error',
+    'created_at',
+    'updated_at',
+  ]),
+  // The projection fence tracks the applied revision as the pipeline advances.
+  [TABLE_HARNESS_SESSION_PROJECTION_FENCES]: new Set(['revision', 'state', 'updated_at']),
+  // Message/signal evidence settles in place (pending -> completed/failed)
+  // and a duplicate retry can still stamp run/dispatch/model fields.
+  [TABLE_HARNESS_MESSAGE_RESULTS]: new Set([
+    'status',
+    'run_id',
+    'mode_id',
+    'model_id',
+    'result',
+    'error',
+    'dispatch',
+    'updated_at',
+  ]),
+  // Channel action receipts move through their own claim/apply lifecycle.
+  [TABLE_HARNESS_CHANNEL_ACTION_RECEIPTS]: new Set([
+    'status',
+    'conflict_reason',
+    'attempts',
+    'claim_id',
+    'claim_expires_at',
+    'next_attempt_at',
+    'accepted_at',
+    'applied_at',
+    'failed_at',
+    'dead_at',
+    'result',
+    'last_error',
+    'updated_at',
+  ]),
+  // A resumed run rewrites its canonical snapshot in place.
+  [TABLE_WORKFLOW_SNAPSHOT]: new Set(['snapshot', 'updatedAt', 'updatedAtZ']),
+  // A terminalizing run's owner/claim/phase columns advance as the claim
+  // progresses; `claim_generation` is preserved on import so a live claim
+  // legitimately differs on retry.
+  mastra_workflow_terminalizations: new Set([
+    'phase',
+    'owner_id',
+    'claim_token',
+    'claim_generation',
+    'lease_expires_at',
+    'updated_at',
+    'completed_at',
+  ]),
+  // Destination consumers advance receipt application/dispatch state.
+  mastra_workflow_terminal_destination_receipts_v2: new Set([
+    'application_state',
+    'dispatch_state',
+    'updated_at',
+    'applied_at',
+    'dispatch_pending_at',
+    'destination_applied_at',
+    'quarantined_at',
+  ]),
+  // The parent revision generation/terminal marker moves forward on commit.
+  mastra_workflow_parent_revisions: new Set(['generation', 'terminal_status', 'updated_at']),
+  // A resumed session touches its thread and mutable session-scoped state.
+  [TABLE_THREADS]: new Set(['title', 'metadata', 'updatedAt', 'updatedAtZ']),
+  [TABLE_THREAD_STATE]: new Set(['value', 'updatedAt', 'updatedAtZ']),
+  // Plan tasks and workspace actions are mutable work/audit rows.
+  [TABLE_HARNESS_PLAN_TASKS]: new Set([
+    'status',
+    'status_source',
+    'content',
+    'active_form',
+    'priority',
+    'blocked_by',
+    'metadata',
+    'updated_at',
+    'started_at',
+    'completed_at',
+    'version',
+    'order',
+  ]),
+  [TABLE_HARNESS_WORKSPACE_ACTIONS]: new Set(['result']),
+  // Attachment byte identity settles through pending put operations.
+  [TABLE_HARNESS_ATTACHMENTS]: new Set(['blob_ref', 'data_b64', 'put_operation_id', 'session_incarnation']),
+  [TABLE_HARNESS_ATTACHMENT_REFERENCES]: new Set(['retained_until', 'session_incarnation']),
+  // Observational memory advances continuously while the session runs — only
+  // the row's identity/binding columns are stable across a retry.
+  [TABLE_OBSERVATIONAL_MEMORY]: new Set([
+    'activeObservations',
+    'activeObservationsPendingUpdate',
+    'generationCount',
+    'lastObservedAt',
+    'lastObservedAtZ',
+    'lastReflectionAt',
+    'lastReflectionAtZ',
+    'pendingMessageTokens',
+    'totalTokensObserved',
+    'observationTokenCount',
+    'isObserving',
+    'isReflecting',
+    'observedMessageIds',
+    'observedTimezone',
+    'bufferedObservations',
+    'bufferedObservationTokens',
+    'bufferedMessageIds',
+    'bufferedReflection',
+    'bufferedReflectionTokens',
+    'bufferedReflectionInputTokens',
+    'reflectedObservationLineCount',
+    'bufferedObservationChunks',
+    'isBufferingObservation',
+    'isBufferingReflection',
+    'lastBufferedAtTokens',
+    'lastBufferedAtTime',
+    'lastBufferedAtTimeZ',
+    'metadata',
+    'updatedAt',
+    'updatedAtZ',
+  ]),
+};
+
+/**
+ * Session columns that anchor the row's creation identity. A stored session
+ * may differ in every other column and still be the imported row advanced by
+ * a destination worker — provided its version moved strictly forward. A row
+ * whose stored version is not ahead is compared strictly instead, so a stale
+ * or diverged row stays a conflict.
+ */
+const SESSION_IDENTITY_COLUMNS: ReadonlySet<string> = new Set([
+  'harness_name',
+  'id',
+  'resource_id',
+  'thread_id',
+  'parent_session_id',
+  'origin',
+  'subagent_depth',
+  'subagent_type_id',
+  'subagent_tool_allowlist_scoped',
+  'owns_thread',
+  'created_at',
+]);
+
 const columnSchemaCache = new Map<string, Record<string, { type?: string; primaryKey?: boolean }> | undefined>();
 function columnSchemaFor(table: ExecutionClosureTableName) {
   if (!columnSchemaCache.has(table)) {
@@ -278,6 +471,21 @@ function rowsMatchExcept(
     if (excluded.has(key)) continue;
     storedProjection[key] = stored[key];
     appliedProjection[key] = applied[key];
+  }
+  return canonicalClosureRow(storedProjection) === canonicalClosureRow(appliedProjection);
+}
+
+/** Canonical comparison over a named column subset only. */
+function columnsMatchOn(
+  stored: Record<string, unknown>,
+  applied: Record<string, unknown>,
+  columns: ReadonlySet<string>,
+): boolean {
+  const storedProjection: Record<string, unknown> = {};
+  const appliedProjection: Record<string, unknown> = {};
+  for (const column of columns) {
+    storedProjection[column] = stored[column];
+    appliedProjection[column] = applied[column];
   }
   return canonicalClosureRow(storedProjection) === canonicalClosureRow(appliedProjection);
 }
@@ -683,6 +891,35 @@ export async function exportExecutionClosure(
       }
     }
 
+    // A pending message-result whose dispatch marker is `dispatching` or
+    // `accepted` means provider side effects may already have executed — the
+    // runtime deliberately never auto-replays those states, so the imported
+    // row would wait forever for a live run that only exists on the source.
+    // The same ambiguity applies to a legacy pending row carrying a run id
+    // with no dispatch marker (treated as accepted-equivalent). `reserved`
+    // and marker-less pending rows are provably undispatched and re-drive
+    // safely, so only the ambiguous states pin the closure.
+    for (const row of rows[TABLE_HARNESS_MESSAGE_RESULTS] ?? []) {
+      if (row.status !== 'pending') continue;
+      const dispatch = parseJsonResilient(row.dispatch) as { state?: unknown } | undefined;
+      const dispatchState = typeof dispatch?.state === 'string' ? dispatch.state : undefined;
+      const ambiguous =
+        dispatchState === 'dispatching' ||
+        dispatchState === 'accepted' ||
+        (dispatchState === undefined && typeof row.run_id === 'string' && row.run_id.length > 0);
+      if (ambiguous) {
+        pins.push({
+          reason: 'in-flight-dispatch',
+          detail: {
+            sessionId: row.session_id,
+            signalId: row.signal_id,
+            ...(typeof row.run_id === 'string' && row.run_id.length > 0 ? { runId: row.run_id } : {}),
+            dispatchState: dispatchState ?? 'accepted',
+          },
+        });
+      }
+    }
+
     const manifest = buildExecutionClosureManifest({
       key,
       source: { store: 'pg', schemaName: options?.schemaName ?? 'public' },
@@ -724,6 +961,34 @@ function assertRowHarnessName(
   }
 }
 
+/**
+ * BIGINT columns of the run-pair workflow terminal tables. Their DDL lives in
+ * this package (not `TABLE_SCHEMAS`), so the bigint normalization below cannot
+ * reach them through `columnSchemaFor`.
+ */
+const WORKFLOW_TERMINAL_BIGINT_COLUMNS: Record<string, ReadonlySet<string>> = {
+  mastra_workflow_terminalizations: new Set([
+    'claim_generation',
+    'lease_expires_at',
+    'created_at',
+    'updated_at',
+    'completed_at',
+  ]),
+  mastra_workflow_terminal_effects_v2: new Set(['created_at']),
+  mastra_workflow_terminal_destination_receipts_v2: new Set([
+    'created_at',
+    'updated_at',
+    'applied_at',
+    'dispatch_pending_at',
+    'destination_applied_at',
+    'quarantined_at',
+  ]),
+  mastra_workflow_terminal_continuation_plans_v2: new Set(['created_at']),
+  mastra_workflow_terminal_snapshots_v2: new Set(['created_at']),
+  mastra_workflow_terminal_recovery_ancestries: new Set(['created_at']),
+  mastra_workflow_parent_revisions: new Set(['generation', 'updated_at']),
+};
+
 /** Columns stripped of live authority before a row is applied. */
 function applyImportTransforms(
   tableName: ExecutionClosureTableName,
@@ -733,7 +998,22 @@ function applyImportTransforms(
   const spec = EXECUTION_CLOSURE_TABLES[tableName]!;
   const applied: Record<string, unknown> = { ...row };
   for (const column of spec.clearOnImport ?? []) {
-    applied[column] = column === 'claim_generation' ? 0 : null;
+    applied[column] = null;
+  }
+  // The pg driver returns int8 as text, so an exported payload already carries
+  // bigint values as strings. A hand-built payload may carry them as numbers —
+  // normalize so the canonical read-back comparison on a retry sees the same
+  // value the driver returns ('5' === '5', not 5 !== '5').
+  const schema = columnSchemaFor(tableName);
+  if (schema) {
+    for (const [column, def] of Object.entries(schema)) {
+      if (def?.type === 'bigint' && typeof applied[column] === 'number') {
+        applied[column] = String(applied[column]);
+      }
+    }
+  }
+  for (const column of WORKFLOW_TERMINAL_BIGINT_COLUMNS[tableName] ?? []) {
+    if (typeof applied[column] === 'number') applied[column] = String(applied[column]);
   }
   const requeue = spec.requeueOnImport;
   if (requeue && requeue.from.includes(applied[requeue.statusColumn] as string)) {
@@ -824,6 +1104,16 @@ async function insertClosureRow(
         )
       : [];
   if (stored.length === 1 && rowsMatch(stored[0]!, applied)) return 'skipped';
+  // A lost-ack retry can meet the row it imported after a destination worker
+  // already advanced it — claimed or settled an intent, applied a restaged
+  // projection intent, delivered a receipt. Identity and payload columns must
+  // still match canonically; only the registered lifecycle columns may
+  // differ, so the same row's forward progress converges while a foreign row
+  // still fails closed.
+  const advanceable = ADVANCEABLE_COLUMNS[tableName];
+  if (advanceable !== undefined && stored.length === 1 && rowsMatchExcept(stored[0]!, applied, advanceable)) {
+    return 'skipped';
+  }
   throw closureError(
     'IMPORT_EXECUTION_CLOSURE',
     'DESTINATION_ROW_CONFLICT',
@@ -848,7 +1138,9 @@ async function insertClosureRow(
  *   `lease_expires_at` are cleared, so an old lease or in-flight callback
  *   under the exported incarnation is fenced by the runtime;
  * - a destination row that already exists must equal the row this import
- *   would write, otherwise the transaction aborts instead of silently
+ *   would write — or be that same row legitimately advanced by a destination
+ *   worker (claimed/acked/settled lifecycle columns on a strictly newer
+ *   session version) — otherwise the transaction aborts instead of silently
  *   merging a foreign row into the closure;
  * - `authority` rows (wakeups, outbox, inbox, tokens, bindings, thread-delete
  *   leases, projection intents, pending attachment operations, pressure
@@ -942,7 +1234,16 @@ export async function importExecutionClosure(
         // A pre-existing row must be this import's earlier result (or a
         // legacy row carrying identical content): the incarnation itself is
         // the only field the import is allowed to rewrite.
-        if (!rowsMatchExcept(stored, base, incarnationExcluded)) {
+        const identical = rowsMatchExcept(stored, base, incarnationExcluded);
+        // A lost-ack retry can instead meet the session after a destination
+        // worker advanced it — the same creation identity at a strictly newer
+        // version. The stored row is the newer truth, so the retry converges
+        // and restages from it; a regressed or diverged row stays a conflict.
+        const advanced =
+          !identical &&
+          Number(stored.version) > Number(base.version) &&
+          columnsMatchOn(stored, base, SESSION_IDENTITY_COLUMNS);
+        if (!identical && !advanced) {
           throw closureError(
             'IMPORT_EXECUTION_CLOSURE',
             'DESTINATION_ROW_CONFLICT',
@@ -966,7 +1267,9 @@ export async function importExecutionClosure(
           stored.session_incarnation = incarnation;
         }
         incarnations[sessionId] = incarnation;
-        appliedSessionRows.set(sessionId, { ...base, session_incarnation: incarnation });
+        // Restage from the row actually persisted — for an advanced session
+        // that is the stored row, not the older payload image.
+        appliedSessionRows.set(sessionId, stored);
         skipped[TABLE_HARNESS_SESSIONS]! += 1;
         continue;
       }
@@ -995,14 +1298,21 @@ export async function importExecutionClosure(
         [harnessName, sessionId],
       );
       const storedWinner = winner[0];
+      const winnerIsImport =
+        storedWinner !== undefined &&
+        (rowsMatchExcept(storedWinner, base, incarnationExcluded) ||
+          // Same raced-import case as the pre-locked path above: the winner
+          // can be the closure's own session row after a destination worker
+          // already advanced it.
+          (Number(storedWinner.version) > Number(base.version) &&
+            columnsMatchOn(storedWinner, base, SESSION_IDENTITY_COLUMNS)));
       if (
-        storedWinner &&
-        rowsMatchExcept(storedWinner, base, incarnationExcluded) &&
+        winnerIsImport &&
         typeof storedWinner.session_incarnation === 'string' &&
         storedWinner.session_incarnation.length > 0
       ) {
         incarnations[sessionId] = storedWinner.session_incarnation;
-        appliedSessionRows.set(sessionId, { ...base, session_incarnation: storedWinner.session_incarnation });
+        appliedSessionRows.set(sessionId, storedWinner);
         skipped[TABLE_HARNESS_SESSIONS]! += 1;
         continue;
       }
@@ -1133,13 +1443,14 @@ export async function importExecutionClosure(
         let intent;
         try {
           // The staged row must be deterministic across retries: its
-          // createdAt is the imported session's own updated_at — a wall-clock
-          // timestamp would make a re-import read back a different row and
-          // misreport the retry as a foreign conflict.
+          // createdAt is the persisted session's own last_activity_at — a
+          // wall-clock timestamp would make a re-import read back a different
+          // row and misreport the retry as a foreign conflict. (Session rows
+          // carry created_at/last_activity_at, never an updated_at.)
           intent = buildHarnessSessionRecordProjectionIntent(rowToSession(appliedRow), {
             sessionIncarnation: incarnations[sessionId]!,
             revision: Number(appliedRow.version),
-            createdAt: Number(appliedRow.updated_at),
+            createdAt: Number(appliedRow.last_activity_at),
             maxPayloadBytes: DEFAULT_HARNESS_SESSION_RECORD_PROJECTION_MAX_PAYLOAD_BYTES,
           });
         } catch (error) {

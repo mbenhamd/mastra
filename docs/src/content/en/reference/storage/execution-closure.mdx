@@ -12,9 +12,9 @@ An execution closure is a fenced, versioned export of one harness session subtre
 
 The unit is "fenced" because it separates durable state and evidence from live execution authority:
 
-- **`state` rows** (sessions, threads, messages, snapshots, terminalizations) are restored verbatim.
-- **`fence` rows** (tombstones, terminal intents and admissions, delete fences, receipts) are restored as evidence, rebound to the destination session incarnation, and have stale claims/leases cleared so an old in-flight callback cannot revive.
-- **`authority` rows** (wakeups, outbox/inbox, channel bindings, projection intents, pressure counters) are exported for completeness but never restored; the destination runtime re-establishes its own.
+- **`state` rows** (sessions, threads, messages, snapshots, terminalizations) keep their persisted content, except that live authority is stripped: session `owner_id`/`lease_expires_at` and terminalization `owner_id`/`claim_token`/`lease_expires_at` are cleared, while the terminalization's positive `claim_generation` is preserved as the fencing counter a new claimant increments. A pending workflow snapshot handoff is materialized as canonical snapshot state rather than restored as a live fence.
+- **`fence` rows** (tombstones, terminal intents and admissions, projection fences, channel action receipts, destination receipts) are restored as evidence, rebound to the destination session incarnation, and have stale claims/leases cleared so an old in-flight callback cannot revive; claimed terminal intents are requeued to `pending` so a destination worker can claim them.
+- **`authority` rows** (wakeups, outbox/inbox, channel bindings, action tokens, thread-delete fences, attachment operations, projection intents, workflow snapshot handoffs, pressure counters) are exported for completeness but never restored; pending session-record projection work is instead restaged deterministically from the imported session rows, and terminal/projection pressure counters are rebuilt from the live rows actually restored.
 - **`shared-resource` rows** are restored only when absent, so an archive cannot overwrite a live shared row.
 
 Every imported session row receives a `session_incarnation` minted or adopted at the destination, so source-era grants, leases, and callbacks are fenced by the runtime rather than replayed.
@@ -56,14 +56,14 @@ Verification fails closed on: unsupported manifest format/version, unknown or mi
 
 On apply:
 
-- A session row that already exists must match the imported row (except `session_incarnation`); the persisted incarnation is reused — including after a concurrent import — so `result.incarnations` always reflects the value actually stored.
-- Any other `state`/`fence` row that already exists must equal the imported row canonically, or the transaction aborts with `DESTINATION_ROW_CONFLICT` instead of silently merging a foreign row.
+- A session row that already exists must match the imported row (except `session_incarnation`) — or be that same session legitimately advanced by destination workers at a strictly newer `version` with identical creation identity; the persisted incarnation is reused — including after a concurrent import — so `result.incarnations` always reflects the value actually stored.
+- Any other `state`/`fence` row that already exists must equal the imported row canonically, or differ only in the lifecycle columns a destination worker advances (claim/ack/settle fields, applied projection intents, receipt delivery state). Anything else aborts the transaction with `DESTINATION_ROW_CONFLICT` instead of silently merging a foreign row.
 - `authority` rows are counted in `skipped` and never inserted.
 - Imported terminal intents lose stale claim fields and are requeued to `pending`; workflow handoff fences are materialized as snapshot evidence rather than restored; pending session-record projection work is restaged deterministically; terminal/projection pressure counters are rebuilt from the restored live rows.
 
 Returns: `Promise<ExecutionClosureImportResult>` — `{ status, incarnations, inserted, skipped, pins }`. `status` is `'imported'` for a complete unit or `'pinned'` when the manifest recorded pins; `inserted`/`skipped` count rows written and rows already present (or never restored) per table.
 
-Re-importing the same payload converges: every row is already present, nothing duplicates, and the returned incarnations are the ones persisted by the first import.
+Re-importing the same payload converges while the destination has not diverged the imported rows: rows already present are skipped, nothing duplicates, and the returned incarnations are the ones persisted by the first import. Convergence also holds when a destination worker merely advanced an imported row through its normal lifecycle — claiming or settling a terminal intent, applying a restaged projection intent, or saving the session at a newer version. A `DESTINATION_ROW_CONFLICT` after a successful first import means the unit is already present and the destination row has since diverged in a way that is not a valid lifecycle successor — the import aborts rather than overwriting foreign data.
 
 ## Availability
 

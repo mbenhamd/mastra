@@ -219,12 +219,16 @@ export const EXECUTION_CLOSURE_TABLES: Partial<Record<ExecutionClosureTableName,
   // as evidence; the importer materializes its snapshot as canonical state.
   [TABLE_WORKFLOW_SNAPSHOT_HANDOFF]: { role: 'authority', scope: [], runPairScope: runPair },
   // The terminalization row holds the run's terminal record AND live claim
-  // fields; claim columns clear on import so the new incarnation re-claims.
+  // fields; the owner/token/lease clear on import so the new incarnation
+  // re-claims. `claim_generation` is NOT cleared: it is the monotonic fencing
+  // counter a claimant increments, and the workflow decoder rejects a
+  // generation of 0 — preserving the positive source generation keeps the
+  // imported record readable and safely reclaimable.
   mastra_workflow_terminalizations: {
     role: 'state',
     scope: [],
     runPairScope: runPair,
-    clearOnImport: ['owner_id', 'claim_token', 'claim_generation', 'lease_expires_at'],
+    clearOnImport: ['owner_id', 'claim_token', 'lease_expires_at'],
   },
   mastra_workflow_terminal_effects_v2: { role: 'state', scope: [], runPairScope: runPair },
   // Destination receipts are idempotency evidence: restoring them prevents an
