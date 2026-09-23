@@ -817,6 +817,19 @@ export class WorkflowEventProcessor extends EventProcessor {
   }
 
   /**
+   * Returns true when an `updateWorkflowResults` write fell back to the `{}`
+   * missing-record result: no snapshot row exists for this run. Transient
+   * nested executions legitimately have no persisted row, so a subsequent
+   * `updateWorkflowState` returning `undefined` on that path is the ordinary
+   * persistence opt-out — not a stale generation — and must not halt the
+   * handler. Top-level evented runs always persist their initial record in
+   * `EventedRun.start`, so a missing row there means the run was deleted.
+   */
+  #isMissingRecordResult(result: UpdateWorkflowResultsResult | undefined): boolean {
+    return result !== undefined && !isStaleExecutionResult(result) && Object.keys(result).length === 0;
+  }
+
+  /**
    * Stale-build fence for scheduled fires (#19169).
    *
    * A `workflow.start` published by the scheduler carries no step graph —
@@ -3611,8 +3624,14 @@ export class WorkflowEventProcessor extends EventProcessor {
           },
         });
         // A guard miss (or a run record already gone) means the reopened
-        // lifetime owns the row — stop before pruning or publishing.
-        if (workflowsStore !== undefined && suspendedState === undefined) {
+        // lifetime owns the row — stop before pruning or publishing. A `{}`
+        // result write means no row ever existed: only transient nested runs
+        // legitimately take that persistence opt-out, so they continue.
+        if (
+          workflowsStore !== undefined &&
+          suspendedState === undefined &&
+          !(parentWorkflow !== undefined && this.#isMissingRecordResult(stateWrite))
+        ) {
           return;
         }
         const pruned = await this.pruneAndRepersistSnapshot({
@@ -4321,7 +4340,14 @@ export class WorkflowEventProcessor extends EventProcessor {
                 ...(suspendTracingContext ? { tracingContext: suspendTracingContext } : {}),
               },
             });
-            if (workflowsStore !== undefined && suspendedState === undefined) {
+            // `undefined` conflates a stale-generation CAS miss with a
+            // missing row; the `{}` result-write fallback proves the row was
+            // never persisted, which is legitimate only for nested runs.
+            if (
+              workflowsStore !== undefined &&
+              suspendedState === undefined &&
+              !(parentWorkflow !== undefined && this.#isMissingRecordResult(foreachStateWrite))
+            ) {
               return;
             }
             const pruned = await this.pruneAndRepersistSnapshot({
@@ -4594,7 +4620,14 @@ export class WorkflowEventProcessor extends EventProcessor {
             ...(suspendTracingContext ? { tracingContext: suspendTracingContext } : {}),
           },
         });
-        if (workflowsStore !== undefined && suspendedState === undefined) {
+        // Same missing-row discrimination: `undefined` is a stale CAS miss
+        // for persisted runs, but the ordinary opt-out when a transient
+        // nested run's result write already fell back to `{}`.
+        if (
+          workflowsStore !== undefined &&
+          suspendedState === undefined &&
+          !(parentWorkflow !== undefined && this.#isMissingRecordResult(suspendStateWrite))
+        ) {
           return;
         }
         const pruned = await this.pruneAndRepersistSnapshot({

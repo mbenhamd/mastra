@@ -657,4 +657,100 @@ describe('updateWorkflowResults executionGeneration forwarding', () => {
     expect(engineEvents).not.toContain('workflow.suspend');
     await expect(workflowsStore.loadWorkflowSnapshot({ workflowName: workflow.id, runId })).resolves.toBeNull();
   });
+
+  it('publishes workflow.suspend for a transient nested run whose guarded state write finds no row', async () => {
+    const storage = new MockStore();
+    const pubsub = new EventEmitterPubSub();
+    const suspendingStep = createStep({
+      id: 'transient-suspend-step',
+      inputSchema: z.object({}),
+      suspendSchema: z.object({ reason: z.string() }),
+      outputSchema: z.object({ value: z.string() }),
+      execute: async () => ({ value: 'done' }),
+    });
+    const workflow = createWorkflow({
+      id: `transient-suspend-${Math.random().toString(36).slice(2)}`,
+      inputSchema: z.object({}),
+      outputSchema: z.object({ value: z.string() }),
+      steps: [suspendingStep],
+    })
+      .then(suspendingStep)
+      .commit();
+    const outerWorkflow = createWorkflow({
+      id: `transient-outer-${Math.random().toString(36).slice(2)}`,
+      inputSchema: z.object({}),
+      outputSchema: z.object({ value: z.string() }),
+      steps: [workflow],
+    })
+      .then(workflow)
+      .commit();
+    const mastra = new Mastra({
+      logger: false,
+      storage,
+      pubsub,
+      workflows: { [workflow.id]: workflow, [outerWorkflow.id]: outerWorkflow },
+    });
+    const workflowsStore = (await storage.getStore('workflows'))!;
+
+    // The nested run is transient: no snapshot row exists, so updateWorkflowResults
+    // answers the {} missing-record fallback and updateWorkflowState finds no row.
+    const runId = `run-${Math.random().toString(36).slice(2)}`;
+    const resultWrites = vi.spyOn(workflowsStore, 'updateWorkflowResults');
+    const stateUpdates = vi.spyOn(workflowsStore, 'updateWorkflowState');
+    const engineEvents: string[] = [];
+    const publish = pubsub.publish.bind(pubsub);
+    vi.spyOn(pubsub, 'publish').mockImplementation(async (topic, event) => {
+      if (topic === 'workflows') engineEvents.push((event as { type: string }).type);
+      return publish(topic, event);
+    });
+
+    const processor = new WorkflowEventProcessor({ mastra });
+    const handled = await processor.handle({
+      type: 'workflow.step.end',
+      id: 'evt-transient-suspend',
+      runId,
+      createdAt: new Date(),
+      data: {
+        workflowId: workflow.id,
+        runId,
+        executionGeneration: 'wfeg:transient-nested',
+        executionPath: [0],
+        prevResult: {
+          status: 'suspended',
+          output: undefined,
+          payload: {},
+          startedAt: 1,
+          suspendPayload: { reason: 'waiting' },
+        },
+        stepResults: {},
+        activeStepsPath: {},
+        resumeSteps: [],
+        requestContext: {},
+        lifecycleStepStates: {},
+        parentWorkflow: {
+          workflowId: outerWorkflow.id,
+          runId: 'outer-run',
+          executionGeneration: 'wfeg:outer',
+          lifecycleResumeAttempt: 0,
+          lifecycleStepStates: {},
+          executionPath: [0],
+          resume: false,
+          stepResults: {},
+          stepId: 'nested-workflow-step',
+          stepGraph: [],
+          activeStepsPath: {},
+          resumeSteps: [],
+          resumeData: undefined,
+          input: {},
+          shouldPersistSnapshot: false,
+        },
+      },
+    });
+
+    expect(handled).toEqual({ ok: true });
+    const stateWrite = resultWrites.mock.calls.find(([args]) => (args as { stepId?: string }).stepId === '__state');
+    expect(stateWrite).toBeTruthy();
+    expect(stateUpdates).toHaveBeenCalled();
+    expect(engineEvents).toContain('workflow.suspend');
+  });
 });
