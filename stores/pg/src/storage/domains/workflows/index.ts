@@ -7,6 +7,7 @@ import {
   TABLE_WORKFLOW_SNAPSHOT_HANDOFF,
   TABLE_SCHEMAS,
   matchesExpectedWorkflowState,
+  STALE_EXECUTION_RESULT,
   WorkflowsStorage,
   applyWorkflowTerminalParentContinuationPatch,
   copyWorkflowTerminalParentContinuationContract,
@@ -120,6 +121,7 @@ import type {
   ReleaseWorkflowTerminalizationResult,
   RollbackWorkflowResumeInput,
   RollbackWorkflowResumeResult,
+  UpdateWorkflowResultsResult,
   UpdateWorkflowStateOptions,
   StorageListWorkflowRunsInput,
   WorkflowRun,
@@ -5471,7 +5473,7 @@ export class WorkflowsPG extends WorkflowsStorage {
     result: StepResult<any, any, any, any>;
     requestContext: Record<string, any>;
     executionGeneration?: string;
-  }): Promise<Record<string, StepResult<any, any, any, any>>> {
+  }): Promise<UpdateWorkflowResultsResult> {
     try {
       // Use a transaction with row-level locking to ensure atomicity
       return await this.#db.client.tx(async t => {
@@ -5515,16 +5517,19 @@ export class WorkflowsPG extends WorkflowsStorage {
         // Compare-and-set guard before any merge: a delayed result write from
         // a deleted execution lifetime must not merge into the snapshot a
         // reopened lifetime installed under the same runId (PF-4385 tombstone
-        // reopen). A missing row also fails a supplied generation — a writer
-        // that declares a lineage never resurrects a deleted run. Mirrors the
-        // updateWorkflowState guard below.
+        // reopen). An existing row owned by another generation resolves to the
+        // stale sentinel so the caller stops instead of advancing with an
+        // inline result; a missing row keeps the `{}` missing-record fallback —
+        // a lineage-carrying write never resurrects a deleted run, but runs
+        // that opted out of snapshot persistence legitimately write without a
+        // row. Mirrors the updateWorkflowState guard below.
         if (
           !matchesExpectedWorkflowState(snapshot, {
             expectedExecutionGeneration: executionGeneration,
           })
         ) {
           await this.deleteProvisionalWorkflowParentRevision(t, workflowName, runId, revision.created);
-          return {};
+          return existingSnapshotResult ? STALE_EXECUTION_RESULT : {};
         }
 
         // Merge the new step result using element-wise array merging

@@ -7,6 +7,7 @@ import {
   MAX_WORKFLOW_TERMINAL_CONTINUATION_DATA_NODES,
 } from '../../../workflows/terminal-continuation';
 import { InMemoryStore } from '../../mock';
+import { isStaleExecutionResult } from '../../types';
 import type { AdmitWorkflowNestedRunInput } from '../../types';
 import { createEmptyWorkflowSnapshot } from '../../workflow-snapshot';
 import { InMemoryDB } from '../inmemory-db';
@@ -1076,6 +1077,7 @@ describe('WorkflowsInMemory terminalization journal', () => {
       result,
       requestContext: {},
     });
+    if (isStaleExecutionResult(context)) throw new Error('expected merged step results');
     context.nested.output = { caller: 'mutated' };
     await expect(fixture.workflows.loadWorkflowSnapshot(fixture.parent)).resolves.toMatchObject({
       context: { nested: { output: { stored: true } } },

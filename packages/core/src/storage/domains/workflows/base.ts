@@ -45,6 +45,7 @@ import type {
   RollbackWorkflowResumeResult,
   ReleaseWorkflowTerminalizationInput,
   ReleaseWorkflowTerminalizationResult,
+  UpdateWorkflowResultsResult,
   UpdateWorkflowStateOptions,
   WorkflowRun,
   WorkflowRuns,
@@ -256,7 +257,7 @@ export abstract class WorkflowsStorage extends StorageDomain {
     result: StepResult<any, any, any, any>;
     requestContext: Record<string, any>;
     executionGeneration?: string;
-  }): Promise<Record<string, StepResult<any, any, any, any>>>;
+  }): Promise<UpdateWorkflowResultsResult>;
 
   abstract updateWorkflowState({
     workflowName,

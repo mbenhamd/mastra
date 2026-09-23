@@ -9,7 +9,7 @@ import {
   createConfigValidationTests,
   createDomainDirectTests,
 } from '@internal/storage-test-utils';
-import { TABLE_AGENTS, TraceStatus } from '@mastra/core/storage';
+import { isStaleExecutionResult, TABLE_AGENTS, TraceStatus } from '@mastra/core/storage';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { SpannerDB } from './db';
@@ -2249,6 +2249,7 @@ if (ENABLE_TESTS) {
             result: { status: 'success', output: { hello: 'world' } } as any,
             requestContext: { trace: 'abc' },
           });
+          if (isStaleExecutionResult(merged)) throw new Error('expected merged step results');
           expect(merged['step-X']?.status).toBe('success');
           const loaded = await workflows.loadWorkflowSnapshot({ workflowName, runId });
           expect(loaded?.requestContext).toEqual({ trace: 'abc' });

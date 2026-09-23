@@ -83,8 +83,9 @@ import type {
   ListWorkflowSnapshotHandoffsInput,
   ListWorkflowSnapshotHandoffsResult,
   WorkflowExecutionState,
+  UpdateWorkflowResultsResult,
 } from '../../types';
-import { matchesExpectedWorkflowState } from '../../types';
+import { STALE_EXECUTION_RESULT, matchesExpectedWorkflowState } from '../../types';
 import {
   createEmptyWorkflowSnapshot,
   mergeWorkflowStepResult,
@@ -2216,7 +2217,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     result: StepResult<any, any, any, any>;
     requestContext: Record<string, any>;
     executionGeneration?: string;
-  }): Promise<Record<string, StepResult<any, any, any, any>>> {
+  }): Promise<UpdateWorkflowResultsResult> {
     const key = this.getWorkflowKey(workflowName, runId);
     for (let attempt = 1; ; attempt++) {
       const run = this.db.workflows.get(key);
@@ -2249,13 +2250,15 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       // Compare-and-set guards run before any merge: a delayed result write
       // from a deleted execution lifetime must not merge into the snapshot a
       // reopened lifetime installed under the same runId (PF-4385 tombstone
-      // reopen). Mirrors the updateWorkflowState guard below.
+      // reopen). The stale sentinel — not the `{}` missing-record fallback —
+      // tells the caller its execution lifetime ended so it stops rather than
+      // advancing with an inline result. Mirrors the updateWorkflowState guard.
       if (
         !matchesExpectedWorkflowState(working, {
           expectedExecutionGeneration: executionGeneration,
         })
       ) {
-        return {};
+        return STALE_EXECUTION_RESULT;
       }
 
       mergeWorkflowStepResult({ snapshot: working, stepId, result, requestContext });

@@ -1,5 +1,10 @@
 import { randomUUID } from 'node:crypto';
-import { InMemoryDB, WorkflowsInMemory, createEmptyWorkflowSnapshot } from '@mastra/core/storage';
+import {
+  InMemoryDB,
+  STALE_EXECUTION_RESULT,
+  WorkflowsInMemory,
+  createEmptyWorkflowSnapshot,
+} from '@mastra/core/storage';
 import { Pool } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { WorkflowsPG } from '.';
@@ -9,7 +14,10 @@ import { WorkflowsPG } from '.';
 // under the same runId. updateWorkflowResults fences the caller-supplied
 // executionGeneration against the stored snapshot inside the row lock before
 // any merge; a write that carries no generation keeps the legacy unguarded
-// behavior. Cases run against both adapters to pin cross-adapter parity.
+// behavior. The fence resolves to the STALE_EXECUTION_RESULT sentinel —
+// distinct from the `{}` missing-record fallback — so the evented processor
+// can stop a stale handler instead of advancing with an inline result.
+// Cases run against both adapters to pin cross-adapter parity.
 describe('WorkflowsPG updateWorkflowResults executionGeneration fence', () => {
   const pool = new Pool({
     host: process.env.POSTGRES_HOST || '127.0.0.1',
@@ -93,7 +101,7 @@ describe('WorkflowsPG updateWorkflowResults executionGeneration fence', () => {
             requestContext: {},
             executionGeneration: 'wfeg:lifetime-a',
           }),
-        ).resolves.toEqual({});
+        ).resolves.toBe(STALE_EXECUTION_RESULT);
 
         await expect(store.loadWorkflowSnapshot({ workflowName, runId })).resolves.toMatchObject({
           executionGeneration: 'wfeg:lifetime-b',
@@ -124,7 +132,7 @@ describe('WorkflowsPG updateWorkflowResults executionGeneration fence', () => {
             requestContext: {},
             executionGeneration: 'wfeg:lifetime-a',
           }),
-        ).resolves.toEqual({});
+        ).resolves.toBe(STALE_EXECUTION_RESULT);
         await expect(store.loadWorkflowSnapshot({ workflowName, runId })).resolves.toMatchObject({
           context: {},
         });
