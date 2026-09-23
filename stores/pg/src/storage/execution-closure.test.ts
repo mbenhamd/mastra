@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 
 import { createSampleMessageV2, createSampleResource, createSampleSessionRecord } from '@internal/storage-test-utils';
 import {
+  TABLE_HARNESS_ATTACHMENTS,
   TABLE_HARNESS_MESSAGE_RESULTS,
   TABLE_HARNESS_OPERATION_TOMBSTONES,
   TABLE_HARNESS_SESSIONS,
@@ -13,6 +14,7 @@ import {
   TABLE_RESOURCES,
   TABLE_THREADS,
   TABLE_WORKFLOW_SNAPSHOT,
+  TABLE_WORKFLOW_SNAPSHOT_HANDOFF,
   verifyExecutionClosurePayload,
 } from '@mastra/core/storage';
 import { afterAll, describe, expect, it, vi } from 'vitest';
@@ -322,6 +324,109 @@ describe('exportExecutionClosure', () => {
           runId: 'run-inflight',
           dispatchState: 'dispatching',
         }),
+      }),
+    ]);
+  });
+
+  it('counts a snapshot handoff as parent-run evidence instead of pinning the export', async () => {
+    const { s, schemaName } = await store('handoffparent');
+    const { runId } = await seedClosure(s, schemaName, 'hp1');
+    const now = Date.now();
+    const parentRun = 'run-hp1-parent';
+    // A terminal effect on the exported run references a parent run outside
+    // the session's own run set.
+    await s.db.none(
+      `INSERT INTO "${schemaName}"."mastra_workflow_terminal_effects_v2"
+         (workflow_name, run_id, effect_kind, version, effect_key, source_event_key,
+          terminal_status, parent_workflow_name, parent_run_id, parent_step_id,
+          parent_execution_path, recovery_envelope_hash, retained_record_hash,
+          resource_id, payload_hash, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+      [
+        'test-workflow',
+        runId,
+        'destination',
+        1,
+        'effect-1',
+        'evt-1',
+        'success',
+        'test-workflow',
+        parentRun,
+        'step-1',
+        '[]',
+        'envelope-hash',
+        'record-hash',
+        null,
+        'payload-hash',
+        now,
+      ],
+    );
+    // The parent run's snapshot lives only in a snapshot handoff — the
+    // importer materializes it as canonical state, so the closure is complete
+    // even though no mastra_workflow_snapshot row exists for the parent.
+    await s.db.none(
+      `INSERT INTO "${schemaName}"."${TABLE_WORKFLOW_SNAPSHOT_HANDOFF}"
+         (workflow_name, run_id, version, status, resource_id, snapshot,
+          mutation_fence, created_at, updated_at, completed_at)
+       VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9,$10)`,
+      [
+        'test-workflow',
+        parentRun,
+        1,
+        'pending',
+        null,
+        JSON.stringify({ runId: parentRun, status: 'success', timestamp: now }),
+        `fence-${parentRun}`,
+        now,
+        now,
+        null,
+      ],
+    );
+
+    const { manifest, rows } = await exportExecutionClosure(
+      s.db,
+      { harnessName: HARNESS, sessionId: 'hp1' },
+      { schemaName },
+    );
+    expect(rows[TABLE_WORKFLOW_SNAPSHOT_HANDOFF]!.length).toBe(1);
+    expect(manifest.pins.filter(p => p.reason === 'workflow-parent-run-missing')).toEqual([]);
+  });
+
+  it('pins the export when a blob-backed attachment retains inline bytes', async () => {
+    const { s, schemaName } = await store('blobattachment');
+    await seedClosure(s, schemaName, 'ba1');
+    const now = Date.now();
+    // Both a source blob_ref and retained legacy data_b64: loadAttachment
+    // never reads data_b64 — it resolves bytes through the destination byte
+    // owner with blob_ref — and import neither uploads the inline bytes nor
+    // rewrites the reference, so the pin cannot be suppressed by inline data.
+    await s.db.none(
+      `INSERT INTO "${schemaName}"."${TABLE_HARNESS_ATTACHMENTS}"
+         (harness_name, session_id, attachment_id, name, mime_type, size_bytes,
+          sha256, source, created_at, data_b64, session_incarnation, blob_ref)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+      [
+        HARNESS,
+        'ba1',
+        'att-1',
+        'file.bin',
+        'application/octet-stream',
+        4,
+        'deadbeef',
+        'preupload',
+        now,
+        'aGk=',
+        'inc-ba1',
+        'blob://source/att-1',
+      ],
+    );
+
+    const { manifest } = await exportExecutionClosure(s.db, { harnessName: HARNESS, sessionId: 'ba1' }, { schemaName });
+    expect(manifest.completeness).toBe('pinned');
+    expect(manifest.pins).toEqual([
+      expect.objectContaining({
+        reason: 'attachment-bytes-external',
+        detail: expect.objectContaining({ sessionId: 'ba1', attachmentId: 'att-1' }),
       }),
     ]);
   });

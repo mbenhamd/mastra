@@ -707,6 +707,73 @@ describe('native chat terminal handoff', () => {
     ).resolves.toBeNull();
   });
 
+  it('conflicts a second grant admitted to the same session run', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB(), terminalHandoff: { enabled: true } });
+    await storage.saveSession(session(), { ownerId: 'owner-1', ifVersion: 0 });
+    const first = admission();
+    await expect(storage.admitTerminalHandoff(first)).resolves.toMatchObject({ status: 'created' });
+
+    // A different grant aiming at the same (session, incarnation, run) —
+    // recovery resolves admissions by that tuple, so a second row would make
+    // the first-match probe nondeterministic.
+    const second = {
+      ...admission(),
+      admissionId: 'admission-2',
+      admissionHash: 'admission-hash-2',
+      signalId: 'signal-2',
+      executionGrant: { key: 'grant-2', generation: 1 },
+    };
+    await expect(storage.admitTerminalHandoff(second)).resolves.toMatchObject({
+      status: 'conflict',
+      admission: expect.objectContaining({ admissionId: first.admissionId, runId: first.runId }),
+    });
+    await expect(
+      storage.loadTerminalAdmissionByRun({
+        harnessName: first.harnessName,
+        sessionId: first.sessionId,
+        runId: first.runId,
+        sessionIncarnation: first.sessionIncarnation,
+      }),
+    ).resolves.toMatchObject({ admissionId: first.admissionId });
+  });
+
+  it('rejects a terminal result bound to a different run before writing any rows', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB(), terminalHandoff: { enabled: true } });
+    await storage.saveSession(session(), { ownerId: 'owner-1', ifVersion: 0 });
+    const input = admission();
+    await storage.writeMessageResultEvidence(pendingEvidence(input));
+    await storage.admitTerminalHandoff(input);
+
+    // The intent's top-level runId comes from the admission; a result naming
+    // another run would persist two disagreeing run identities.
+    await expect(
+      storage.commitTerminalHandoff({
+        admission: input,
+        resultEvidence: { ...pendingEvidence(input), status: 'completed', result: { text: 'done' }, updatedAt: 3_000 },
+        terminalResult: { status: 'completed', runId: 'run-other', completedAt: 3_000 },
+        projection: { projectionKind: 'chat.summary', projectionId: 'summary-1', payload: {} },
+      }),
+    ).rejects.toBeInstanceOf(HarnessTerminalHandoffValidationError);
+
+    // The admission is untouched — a correctly bound retry still commits.
+    await expect(
+      storage.loadPendingTerminalAdmission({
+        harnessName: input.harnessName,
+        sessionId: input.sessionId,
+        runId: input.runId,
+        sessionIncarnation: input.sessionIncarnation,
+      }),
+    ).resolves.toMatchObject({ status: 'pending' });
+    await expect(
+      storage.commitTerminalHandoff({
+        admission: input,
+        resultEvidence: { ...pendingEvidence(input), status: 'completed', result: { text: 'done' }, updatedAt: 3_000 },
+        terminalResult: { status: 'completed', runId: input.runId, completedAt: 3_000 },
+        projection: { projectionKind: 'chat.summary', projectionId: 'summary-1', payload: {} },
+      }),
+    ).resolves.toMatchObject({ status: 'committed' });
+  });
+
   it('preserves completed canonical evidence when a retried commit finds no intent row', async () => {
     const db = new InMemoryDB();
     const storage = new InMemoryHarness({ db, terminalHandoff: { enabled: true } });

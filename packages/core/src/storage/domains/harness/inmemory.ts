@@ -1531,6 +1531,19 @@ export class InMemoryHarness extends HarnessStorage {
     if (grantWinner) {
       return { status: 'conflict', admission: cloneHarnessTerminal(grantWinner) };
     }
+    // Recovery resolves a run's admission by (session, incarnation, run) —
+    // admitting a second grant to the same run would make that first-match
+    // probe nondeterministic, so the run binds to at most one admission.
+    const runWinner = [...this.db.harnessTerminalAdmissions.values()].find(
+      candidate =>
+        candidate.harnessName === namespace &&
+        candidate.sessionId === admission.sessionId &&
+        candidate.sessionIncarnation === admission.sessionIncarnation &&
+        candidate.runId === admission.runId,
+    );
+    if (runWinner) {
+      return { status: 'conflict', admission: cloneHarnessTerminal(runWinner) };
+    }
     this.db.harnessTerminalAdmissions.set(admission.id, cloneHarnessTerminal(admission));
     return { status: 'created', admission: cloneHarnessTerminal(admission) };
   }
@@ -1632,6 +1645,12 @@ export class InMemoryHarness extends HarnessStorage {
     const evidenceKey = messageEvidenceKey(namespace, stored.sessionId, stored.signalId);
     const currentEvidence = this.db.harnessMessageResultEvidence.get(evidenceKey);
     const terminalResult = canonicalHarnessTerminalResult(input.terminalResult);
+    // The intent's top-level runId comes from the admission row — a result
+    // naming a different run would persist two disagreeing run identities and
+    // let delivery or reconciliation attribute the outcome to the wrong run.
+    if (terminalResult.runId !== stored.runId) {
+      throw new HarnessTerminalHandoffValidationError('terminalResult.runId', 'must match the admitted run');
+    }
     const projection = prepareHarnessTerminalProjection(input.projection, this.terminalHandoff.maxPayloadBytes);
     const intentId = harnessTerminalIntentId(stored.id);
     const existingIntent = this.db.harnessTerminalIntents.get(intentId);

@@ -291,6 +291,64 @@ describe('HarnessPG native terminal handoff', () => {
     expect(await rowCount(TABLE_HARNESS_TERMINAL_ADMISSIONS)).toBe(1);
   });
 
+  it('conflicts a second grant admitted to the same session run', async () => {
+    const session = await createNativeSession(harness(), 'session-run-admit');
+    const first = admissionFor(session, 'run-admit-a');
+    // A different grant aiming at the same (session, incarnation, run) —
+    // recovery resolves admissions by that tuple, so two rows would make the
+    // LIMIT 1 probe nondeterministic.
+    const second = { ...admissionFor(session, 'run-admit-b'), runId: first.runId };
+    await harness().writeMessageResultEvidence(pendingEvidence(first));
+    await harness().writeMessageResultEvidence(pendingEvidence(second));
+
+    await expect(harness().admitTerminalHandoff(first)).resolves.toMatchObject({ status: 'created' });
+    await expect(harness().admitTerminalHandoff(second)).resolves.toMatchObject({
+      status: 'conflict',
+      admission: expect.objectContaining({ admissionId: first.admissionId, runId: first.runId }),
+    });
+    expect(await rowCount(TABLE_HARNESS_TERMINAL_ADMISSIONS)).toBe(1);
+
+    // The run still resolves deterministically to the first admission.
+    await expect(
+      harness().loadTerminalAdmissionByRun({
+        harnessName: HARNESS,
+        sessionId: session.id,
+        sessionIncarnation: session.sessionIncarnation!,
+        runId: first.runId,
+      }),
+    ).resolves.toMatchObject({ admissionId: first.admissionId });
+  });
+
+  it('rejects a terminal result bound to a different run before writing any rows', async () => {
+    const session = await createNativeSession(harness(), 'session-run-result');
+    const input = admissionFor(session, 'run-result');
+    await harness().writeMessageResultEvidence(pendingEvidence(input));
+    await harness().admitTerminalHandoff(input);
+
+    // The intent's top-level runId comes from the admission; a result naming
+    // another run would persist two disagreeing run identities.
+    await expect(
+      harness().commitTerminalHandoff({
+        ...commitInput(input, 'run-result'),
+        terminalResult: { status: 'completed', runId: 'run-other', completedAt: Date.now() },
+      }),
+    ).rejects.toBeInstanceOf(HarnessTerminalHandoffValidationError);
+    expect(await rowCount(TABLE_HARNESS_TERMINAL_INTENTS)).toBe(0);
+
+    // The admission is untouched — a correctly bound retry still commits.
+    await expect(
+      harness().loadPendingTerminalAdmission({
+        harnessName: HARNESS,
+        sessionId: session.id,
+        sessionIncarnation: session.sessionIncarnation!,
+        runId: input.runId,
+      }),
+    ).resolves.toMatchObject({ status: 'pending' });
+    await expect(harness().commitTerminalHandoff(commitInput(input, 'run-result'))).resolves.toMatchObject({
+      status: 'committed',
+    });
+  });
+
   it('keeps an absent-row cancellation tombstone that fences late admission and commit', async () => {
     const session = await createNativeSession(harness(), 'session-tombstone');
     const input = admissionFor(session, 'tombstone');

@@ -835,6 +835,14 @@ export async function exportExecutionClosure(
         .map(row => pairKeyOf(row.workflow_name, row.run_id))
         .filter((pair): pair is string => pair !== undefined),
     );
+    // A snapshot-handoff row carries the run's complete snapshot itself —
+    // import materializes it as canonical state rather than restoring the
+    // fence — so a handoff-backed pair proves the parent run just as an
+    // exported canonical snapshot row does.
+    for (const row of rows[TABLE_WORKFLOW_SNAPSHOT_HANDOFF] ?? []) {
+      const pair = pairKeyOf(row.workflow_name, row.run_id);
+      if (pair) snapshotPairs.add(pair);
+    }
     for (const pair of referencedParentPairs) {
       if (snapshotPairs.has(pair)) continue;
       const [workflowName, runId] = splitPairKey(pair);
@@ -875,15 +883,17 @@ export async function exportExecutionClosure(
       }
     }
 
-    // Attachment rows that reference externally-owned bytes (`blob_ref`)
-    // without carrying `data_b64` in the closure are metadata without bytes:
-    // the destination byte owner cannot necessarily resolve the source
-    // provider's reference, so the closure pins rather than importing an
-    // apparently complete but unusable attachment.
+    // Attachment rows that reference externally-owned bytes (`blob_ref`) are
+    // metadata without usable bytes at the destination: `loadAttachment`
+    // resolves bytes through the destination byte owner with the stored
+    // reference and incarnation — it never reads `data_b64` — and import
+    // neither uploads retained inline bytes nor rewrites the reference, so a
+    // destination without the shared source provider loses the bytes either
+    // way. Pin every blob-backed attachment rather than claiming an
+    // apparently complete but unloadable row.
     for (const row of rows[TABLE_HARNESS_ATTACHMENTS] ?? []) {
       const hasExternalRef = typeof row.blob_ref === 'string' && row.blob_ref.length > 0;
-      const hasInlineBytes = typeof row.data_b64 === 'string' && row.data_b64.length > 0;
-      if (hasExternalRef && !hasInlineBytes) {
+      if (hasExternalRef) {
         pins.push({
           reason: 'attachment-bytes-external',
           detail: { sessionId: row.session_id, attachmentId: row.attachment_id },

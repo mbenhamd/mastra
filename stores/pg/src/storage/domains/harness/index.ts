@@ -681,12 +681,16 @@ function harnessIndexDefs(schemaPrefix: string): CreateIndexOptions[] {
       unique: true,
     },
     {
-      // loadPendingTerminalAdmission probes (session, run) on every suspended
-      // resume; fenceTerminalHandoffsForSession/deleteSessions sweep by the
-      // (harness_name, session_id) prefix.
-      name: harnessIndexName(schemaPrefix, 'idx_harness_terminal_admissions_session'),
+      // loadPendingTerminalAdmission/loadTerminalAdmissionByRun resolve
+      // (session, incarnation, run) on every suspended resume and recovery —
+      // the run identity binds to at most one admission, so the unique index
+      // makes that probe deterministic; fenceTerminalHandoffsForSession and
+      // deleteSessions sweeps still use the (harness_name, session_id)
+      // prefix.
+      name: harnessIndexName(schemaPrefix, 'idx_harness_terminal_admissions_run'),
       table: TABLE_HARNESS_TERMINAL_ADMISSIONS,
-      columns: ['harness_name', 'session_id', 'run_id'],
+      columns: ['harness_name', 'session_id', 'session_incarnation', 'run_id'],
+      unique: true,
     },
     {
       // claimTerminalIntents scans claimable rows by (harness_name, status) and
@@ -4801,6 +4805,25 @@ export class HarnessPG extends HarnessStorage {
         };
       }
 
+      // Recovery resolves a run's admission by (session, incarnation, run) —
+      // a second grant admitted to the same run would make that LIMIT 1 probe
+      // nondeterministic, so the run binds to at most one admission. The
+      // unique index is the enforcement under a race; this probe reports the
+      // winner as a conflict for the common sequential case.
+      const runWinner = await tx.execute({
+        sql: `SELECT * FROM ${TABLE_HARNESS_TERMINAL_ADMISSIONS}
+              WHERE harness_name = ? AND session_id = ? AND session_incarnation = ? AND run_id = ?
+              LIMIT 1 FOR UPDATE`,
+        args: [harnessName, admission.sessionId, admission.sessionIncarnation, admission.runId],
+      });
+      if (runWinner.rows[0]) {
+        await tx.commit();
+        return {
+          status: 'conflict',
+          admission: rowToHarnessTerminalAdmission(runWinner.rows[0] as Record<string, unknown>),
+        };
+      }
+
       await tx.execute({
         sql: `INSERT INTO ${TABLE_HARNESS_TERMINAL_ADMISSIONS}
               (id, harness_name, session_id, resource_id, thread_id, session_incarnation,
@@ -4959,6 +4982,14 @@ export class HarnessPG extends HarnessStorage {
       // incarnation moves. Fencing it would rewrite the durable outcome.
       if (stored.status !== 'committed' && !sessionIncarnationMatches) {
         throw new HarnessTerminalHandoffFencedError(admissionInput.sessionId);
+      }
+
+      // The intent's top-level runId comes from the admission row — a result
+      // naming a different run would persist two disagreeing run identities
+      // and let delivery or reconciliation attribute the terminal outcome to
+      // the wrong execution.
+      if (terminalResult.runId !== stored.runId) {
+        throw new HarnessTerminalHandoffValidationError('terminalResult.runId', 'must match the admitted run');
       }
 
       // The intent is locked before evidence so a committed replay can still
@@ -8855,7 +8886,7 @@ export class HarnessPG extends HarnessStorage {
       }
       await this.#createDefaultIndexes([
         'idx_harness_terminal_admissions_grant',
-        'idx_harness_terminal_admissions_session',
+        'idx_harness_terminal_admissions_run',
         'idx_harness_terminal_intents_claim',
         'idx_harness_terminal_intents_order',
       ]);
