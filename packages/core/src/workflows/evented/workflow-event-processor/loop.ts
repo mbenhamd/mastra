@@ -2,6 +2,8 @@ import type { StepFlowEntry, StepResult } from '../..';
 import { RequestContext } from '../../../di';
 import type { PubSub } from '../../../events';
 import type { Mastra } from '../../../mastra';
+import { isStaleExecutionResult } from '../../../storage/types';
+import type { UpdateWorkflowResultsResult } from '../../../storage/types';
 import { getEntryId, getEntryWorkflow } from '../../step-entry';
 import { resolveForeachConcurrency } from '../../utils';
 import { getPersistedRequestContext, resolveCurrentState } from '../helpers';
@@ -148,7 +150,7 @@ export async function processWorkflowLoop(
   };
   const persistNextIteration = async () => {
     const workflowsStore = await mastra.getStorage()?.getStore('workflows');
-    await workflowsStore?.updateWorkflowResults({
+    const write = await workflowsStore?.updateWorkflowResults({
       workflowName: workflowId,
       runId,
       stepId: getEntryId(step.step),
@@ -156,18 +158,36 @@ export async function processWorkflowLoop(
       requestContext: getPersistedRequestContext(requestContext),
       executionGeneration: lifecycleExecution.executionGeneration,
     });
+    return isStaleExecutionResult(write);
   };
+
+  // A fenced (stale-lifetime) write means this loop's run moved to a different
+  // execution generation: stop before publishing the next iteration event.
+  const logStaleWrite = () =>
+    mastra
+      .getLogger()
+      ?.debug?.('WorkflowEventProcessor: stopping stale-lifetime loop handler after fenced result write', {
+        workflowId,
+        runId,
+        stepId: getEntryId(step.step),
+      });
 
   if (step.loopType === 'dountil') {
     if (loopCondition) {
       await pubsub.publish('workflows', { type: 'workflow.step.end', runId, data: loopEndData });
     } else {
-      await persistNextIteration();
+      if (await persistNextIteration()) {
+        logStaleWrite();
+        return;
+      }
       await pubsub.publish('workflows', { type: 'workflow.step.run', runId, data: loopAgainData });
     }
   } else {
     if (loopCondition) {
-      await persistNextIteration();
+      if (await persistNextIteration()) {
+        logStaleWrite();
+        return;
+      }
       await pubsub.publish('workflows', { type: 'workflow.step.run', runId, data: loopAgainData });
     } else {
       await pubsub.publish('workflows', { type: 'workflow.step.end', runId, data: loopEndData });
@@ -210,6 +230,22 @@ export async function processWorkflowForEach(
 ) {
   const lifecycleExecution = { executionGeneration, lifecycleResumeAttempt, lifecycleStepStates };
   const reqContext = new RequestContext(Object.entries(requestContext ?? {}) as any);
+
+  // A fenced (stale-lifetime) write means this foreach's run moved to a
+  // different execution generation: stop before advancing stepResults or
+  // publishing further iteration events. Distinct from the `{}` missing-record
+  // fallback, which keeps the inline result.
+  const stopOnStaleWrite = (write: UpdateWorkflowResultsResult | undefined, stepId: string): boolean => {
+    if (!isStaleExecutionResult(write)) return false;
+    mastra
+      .getLogger()
+      ?.debug?.('WorkflowEventProcessor: stopping stale-lifetime foreach handler after fenced result write', {
+        workflowId,
+        runId,
+        stepId,
+      });
+    return true;
+  };
 
   // Get current state from stepResults or passed state
   const currentState = resolveCurrentState({ stepResults, state });
@@ -466,7 +502,7 @@ export async function processWorkflowForEach(
         updatedOutput[suspIdx] = createPendingMarker() as any;
       }
 
-      await workflowsStore?.updateWorkflowResults({
+      const resumeWrite = await workflowsStore?.updateWorkflowResults({
         workflowName: workflowId,
         runId,
         stepId: getEntryId(step.step),
@@ -477,6 +513,7 @@ export async function processWorkflowForEach(
         requestContext: getPersistedRequestContext(requestContext),
         executionGeneration: lifecycleExecution.executionGeneration,
       });
+      if (stopOnStaleWrite(resumeWrite, getEntryId(step.step))) return;
 
       // Check if inner step is a nested workflow
       const isNestedWorkflow = getEntryWorkflow(step.step) !== null;
@@ -555,7 +592,7 @@ export async function processWorkflowForEach(
         : ({ [FOREACH_QUEUED]: true } as { [FOREACH_QUEUED]: true });
     });
 
-    await workflowsStore?.updateWorkflowResults({
+    const restoreWrite = await workflowsStore?.updateWorkflowResults({
       workflowName: workflowId,
       runId,
       stepId,
@@ -563,6 +600,7 @@ export async function processWorkflowForEach(
       requestContext: getPersistedRequestContext(requestContext),
       executionGeneration: lifecycleExecution.executionGeneration,
     });
+    if (stopOnStaleWrite(restoreWrite, stepId)) return;
     stepResults[stepId] = currentResult;
   }
 
@@ -583,7 +621,7 @@ export async function processWorkflowForEach(
       for (const index of indicesToRun) {
         updatedOutput[index] = createPendingMarker() as any;
       }
-      await workflowsStore?.updateWorkflowResults({
+      const queueWrite = await workflowsStore?.updateWorkflowResults({
         workflowName: workflowId,
         runId,
         stepId,
@@ -591,6 +629,7 @@ export async function processWorkflowForEach(
         requestContext: getPersistedRequestContext(requestContext),
         executionGeneration: lifecycleExecution.executionGeneration,
       });
+      if (stopOnStaleWrite(queueWrite, stepId)) return;
 
       const isNestedWorkflow = getEntryWorkflow(step.step) !== null;
       for (const index of indicesToRun) {
@@ -642,7 +681,7 @@ export async function processWorkflowForEach(
         endedAt: Date.now(),
         payload: (prevResult as any)?.output,
       };
-      await workflowsStore?.updateWorkflowResults({
+      const emptyWrite = await workflowsStore?.updateWorkflowResults({
         workflowName: workflowId,
         runId,
         stepId: getEntryId(step.step),
@@ -650,6 +689,7 @@ export async function processWorkflowForEach(
         requestContext: getPersistedRequestContext(requestContext),
         executionGeneration: lifecycleExecution.executionGeneration,
       });
+      if (stopOnStaleWrite(emptyWrite, getEntryId(step.step))) return;
       stepResults[getEntryId(step.step)] = result as StepResult<any, any, any, any>;
     } else if (result) {
       // A completed foreach must not carry the aggregate suspension envelope
@@ -657,7 +697,7 @@ export async function processWorkflowForEach(
       // per-iteration suspend payloads are no longer live.
       const { suspendPayload: _suspendPayload, suspendOutput: _suspendOutput, ...completedResult } = result as any;
       result = completedResult;
-      await workflowsStore?.updateWorkflowResults({
+      const completedWrite = await workflowsStore?.updateWorkflowResults({
         workflowName: workflowId,
         runId,
         stepId: getEntryId(step.step),
@@ -665,6 +705,7 @@ export async function processWorkflowForEach(
         requestContext: getPersistedRequestContext(requestContext),
         executionGeneration: lifecycleExecution.executionGeneration,
       });
+      if (stopOnStaleWrite(completedWrite, getEntryId(step.step))) return;
       stepResults[getEntryId(step.step)] = result as any;
     }
 
@@ -707,7 +748,7 @@ export async function processWorkflowForEach(
     const concurrency = Math.min(resolvedConcurrency, targetLen);
     const dummyResult = Array.from({ length: concurrency }, () => null);
 
-    await workflowsStore?.updateWorkflowResults({
+    const kickoffWrite = await workflowsStore?.updateWorkflowResults({
       workflowName: workflowId,
       runId,
       stepId: getEntryId(step.step),
@@ -720,6 +761,7 @@ export async function processWorkflowForEach(
       requestContext: getPersistedRequestContext(requestContext),
       executionGeneration: lifecycleExecution.executionGeneration,
     });
+    if (stopOnStaleWrite(kickoffWrite, getEntryId(step.step))) return;
 
     // Check if inner step is a nested workflow - only then extract individual items
     // Regular steps use foreachIdx in step executor for item extraction
@@ -761,7 +803,7 @@ export async function processWorkflowForEach(
   }
 
   (currentResult as any).output.push(null);
-  await workflowsStore?.updateWorkflowResults({
+  const iterWrite = await workflowsStore?.updateWorkflowResults({
     workflowName: workflowId,
     runId,
     stepId: getEntryId(step.step),
@@ -774,6 +816,7 @@ export async function processWorkflowForEach(
     requestContext: getPersistedRequestContext(requestContext),
     executionGeneration: lifecycleExecution.executionGeneration,
   });
+  if (stopOnStaleWrite(iterWrite, getEntryId(step.step))) return;
 
   // For nested workflows, extract individual item since they receive prevResult directly
   // For regular steps, step executor handles extraction via foreachIdx

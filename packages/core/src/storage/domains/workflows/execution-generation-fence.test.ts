@@ -1,12 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import type { WorkflowRunState } from '../../../workflows';
 import { InMemoryStore } from '../../mock';
+import { STALE_EXECUTION_RESULT } from '../../types';
 
 // PF-4385 tombstone reopen: a delayed result write from a deleted execution
 // lifetime must not merge into the snapshot a reopened lifetime installed
 // under the same runId. updateWorkflowResults fences the caller-supplied
 // executionGeneration against the stored snapshot before any merge; a write
-// that carries no generation keeps the legacy unguarded behavior.
+// that carries no generation keeps the legacy unguarded behavior. The fence
+// resolves to the STALE_EXECUTION_RESULT sentinel — distinct from the `{}`
+// missing-record fallback — so the evented processor can stop a stale
+// handler instead of advancing with an inline result.
 const makeSnapshot = (runId: string, executionGeneration?: string): WorkflowRunState =>
   ({
     runId,
@@ -80,7 +84,7 @@ describe('WorkflowsInMemory updateWorkflowResults executionGeneration fence', ()
         requestContext: {},
         executionGeneration: 'wfeg:lifetime-a',
       }),
-    ).resolves.toEqual({});
+    ).resolves.toBe(STALE_EXECUTION_RESULT);
 
     await expect(workflows.loadWorkflowSnapshot({ workflowName, runId })).resolves.toMatchObject({
       executionGeneration: 'wfeg:lifetime-b',
@@ -104,10 +108,29 @@ describe('WorkflowsInMemory updateWorkflowResults executionGeneration fence', ()
         requestContext: {},
         executionGeneration: 'wfeg:lifetime-a',
       }),
-    ).resolves.toEqual({});
+    ).resolves.toBe(STALE_EXECUTION_RESULT);
     await expect(workflows.loadWorkflowSnapshot({ workflowName, runId })).resolves.toMatchObject({
       context: {},
     });
+  });
+
+  it('keeps the {} missing-record fallback when no run exists', async () => {
+    const store = new InMemoryStore();
+    const workflows = (await store.getStore('workflows'))!;
+    // A missing run record is not a stale-lifetime rejection — it is the
+    // normal fallback for opted-out persistence and stays `{}` even when the
+    // write carries a generation.
+    await expect(
+      workflows.updateWorkflowResults({
+        workflowName: 'wf',
+        runId: 'run-missing',
+        stepId: 'step-1',
+        result: result({ data: 'stale' }),
+        requestContext: {},
+        executionGeneration: 'wfeg:lifetime-a',
+      }),
+    ).resolves.toEqual({});
+    await expect(workflows.loadWorkflowSnapshot({ workflowName: 'wf', runId: 'run-missing' })).resolves.toBeNull();
   });
 
   it('keeps unguarded merges for writes that carry no execution generation', async () => {

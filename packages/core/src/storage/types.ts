@@ -3236,6 +3236,41 @@ export function matchesExpectedWorkflowState(
   );
 }
 
+/**
+ * Sentinel resolved by `updateWorkflowResults` when the write was fenced by an
+ * execution-generation mismatch: the stored snapshot belongs to a different
+ * execution lifetime than the caller's (a deletion-tombstone reopen, PF-4385).
+ *
+ * Deliberately distinct from the `{}` "no run record" fallback — a missing
+ * record is a normal condition (e.g. `shouldPersistSnapshot` opt-outs still
+ * write with a generation), while an existing snapshot owned by a different
+ * generation means the caller's execution lifetime is stale and its handler
+ * must stop instead of advancing with an inline result or publishing events.
+ */
+export const STALE_EXECUTION_RESULT = { staleExecution: true } as const;
+
+/**
+ * `updateWorkflowResults` resolution: the merged step-result record, `{}` when
+ * no run record exists for the write to merge into, or
+ * `STALE_EXECUTION_RESULT` when an existing snapshot rejected the write on
+ * lineage grounds. The sentinel member is additive — adapters that do not
+ * compare generations keep resolving to the plain record.
+ */
+export type UpdateWorkflowResultsResult =
+  | Record<string, StepResult<any, any, any, any>>
+  | typeof STALE_EXECUTION_RESULT;
+
+/**
+ * Type guard for the `STALE_EXECUTION_RESULT` sentinel. Identity comparison
+ * keeps the check unambiguous — a merged record can never collide with the
+ * frozen marker object.
+ */
+export function isStaleExecutionResult(
+  result: UpdateWorkflowResultsResult | undefined,
+): result is typeof STALE_EXECUTION_RESULT {
+  return result === STALE_EXECUTION_RESULT;
+}
+
 function unwrapSchema(schema: z.ZodTypeAny): { base: z.ZodTypeAny; nullable: boolean } {
   let current = schema;
   let nullable = false;

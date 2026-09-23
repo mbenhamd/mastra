@@ -4,7 +4,9 @@ import { EventEmitterPubSub } from '../../../events/event-emitter';
 import { Mastra } from '../../../mastra';
 import type { WorkflowsStorage } from '../../../storage/domains/workflows/base';
 import { MockStore } from '../../../storage/mock';
+import { STALE_EXECUTION_RESULT } from '../../../storage/types';
 import { createStep, createWorkflow } from '../../evented';
+import { WorkflowEventProcessor } from '.';
 
 /**
  * PF-4387: every `updateWorkflowResults` callsite must forward the run's
@@ -272,5 +274,79 @@ describe('updateWorkflowResults executionGeneration forwarding', () => {
     } finally {
       await mastra.shutdown();
     }
+  });
+
+  it('stops a fenced stale-lifetime write before advancing stepResults or publishing engine events', async () => {
+    const storage = new MockStore();
+    const pubsub = new EventEmitterPubSub();
+    const step = createStep({
+      id: 'fenced-step',
+      inputSchema: z.object({}),
+      outputSchema: z.object({ value: z.string() }),
+      execute: async () => ({ value: 'done' }),
+    });
+    const workflow = createWorkflow({
+      id: `stale-stop-${Math.random().toString(36).slice(2)}`,
+      inputSchema: z.object({}),
+      outputSchema: z.object({ value: z.string() }),
+    })
+      .then(step)
+      .commit();
+    const mastra = new Mastra({ logger: false, storage, pubsub, workflows: { [workflow.id]: workflow } });
+    const workflowsStore = (await storage.getStore('workflows'))!;
+
+    // A real run stamps the snapshot's execution generation, so dispatch does
+    // not skip the event — the fence below is what rejects the write.
+    const runId = `run-${Math.random().toString(36).slice(2)}`;
+    await workflow.createRun({ runId });
+    const pending = (await workflowsStore.loadWorkflowSnapshot({ workflowName: workflow.id, runId }))!;
+    const generation = pending.executionGeneration!;
+    expect(generation).toBeTruthy();
+
+    // Answer every result write the way an adapter guarding a reopened
+    // lifetime does: the stored snapshot belongs to a different generation.
+    const resultWrites = vi.spyOn(workflowsStore, 'updateWorkflowResults').mockResolvedValue(STALE_EXECUTION_RESULT);
+    const engineEvents: string[] = [];
+    const publish = pubsub.publish.bind(pubsub);
+    vi.spyOn(pubsub, 'publish').mockImplementation(async (topic, event) => {
+      if (topic === 'workflows') engineEvents.push((event as { type: string }).type);
+      return publish(topic, event);
+    });
+
+    const processor = new WorkflowEventProcessor({ mastra });
+    const handled = await processor.handle({
+      type: 'workflow.step.end',
+      id: 'evt-stale-write',
+      runId,
+      createdAt: new Date(),
+      data: {
+        workflowId: workflow.id,
+        runId,
+        executionGeneration: generation,
+        executionPath: [0],
+        prevResult: {
+          status: 'success',
+          output: { value: 'done' },
+          payload: {},
+          startedAt: 1,
+          endedAt: 2,
+        },
+        stepResults: {},
+        activeStepsPath: {},
+        resumeSteps: [],
+        requestContext: {},
+        lifecycleStepStates: {},
+      },
+    });
+
+    // The handler reached the write (dispatch did not skip it), acknowledged
+    // the event, and stopped: no engine-advancing publish and nothing merged.
+    expect(resultWrites).toHaveBeenCalledTimes(1);
+    expect(handled).toEqual({ ok: true });
+    expect(engineEvents).toEqual([]);
+    await expect(workflowsStore.loadWorkflowSnapshot({ workflowName: workflow.id, runId })).resolves.toMatchObject({
+      executionGeneration: generation,
+      context: {},
+    });
   });
 });
