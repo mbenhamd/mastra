@@ -1160,6 +1160,9 @@ export const TABLE_SCHEMAS: Record<TABLE_NAMES, Record<string, StorageColumn>> =
     attempts: { type: 'integer', nullable: false },
     claim_id: { type: 'text', nullable: true },
     claim_expires_at: { type: 'bigint', nullable: true },
+    // Which consumer owns the live claim — ack/fail/renew bind to it so a
+    // caller holding a stale claim id cannot settle another consumer's lease.
+    consumer_id: { type: 'text', nullable: true },
     next_attempt_at: { type: 'bigint', nullable: true },
     last_error_json: { type: 'text', nullable: true },
     created_at: { type: 'bigint', nullable: false },

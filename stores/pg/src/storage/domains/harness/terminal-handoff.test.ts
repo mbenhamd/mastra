@@ -713,6 +713,43 @@ describe('HarnessPG native terminal handoff', () => {
     expect(replay.status).toBe('duplicate');
   });
 
+  it('binds claim settlement to the consumer that minted the claim', async () => {
+    const session = await createNativeSession(harness(), 'session-consumer');
+    const input = admissionFor(session, 'consumer');
+    await harness().writeMessageResultEvidence(pendingEvidence(input));
+    await harness().admitTerminalHandoff(input);
+    await harness().commitTerminalHandoff(commitInput(input, 'consumer'));
+
+    const t0 = Date.now();
+    const claimed = await claimFirst(harness(), 'worker-a', t0);
+    expect(claimed.consumerId).toBe('worker-a');
+
+    // The claim id is durable evidence a stale caller can replay — but the
+    // lease belongs to the consumer that minted it, so the same claim id
+    // under another consumer cannot renew, ack, or fail the intent.
+    await expect(
+      harness().ackTerminalIntent({ ...claimIdentityOf(claimed, 'worker-b'), now: t0 + 10 }),
+    ).rejects.toBeInstanceOf(HarnessTerminalHandoffClaimConflictError);
+    await expect(
+      harness().renewTerminalIntent({ ...claimIdentityOf(claimed, 'worker-b'), now: t0 + 10, leaseMs: 5_000 }),
+    ).rejects.toBeInstanceOf(HarnessTerminalHandoffClaimConflictError);
+    await expect(
+      harness().failTerminalIntent({
+        ...claimIdentityOf(claimed, 'worker-b'),
+        error: { code: 'x', message: 'x' },
+        now: t0 + 10,
+      }),
+    ).rejects.toBeInstanceOf(HarnessTerminalHandoffClaimConflictError);
+
+    // The owning consumer still settles, and the claim clears its consumer.
+    const acked = await harness().ackTerminalIntent({
+      ...claimIdentityOf(claimed, 'worker-a'),
+      now: t0 + 20,
+    });
+    expect(acked.status).toBe('acked');
+    expect(acked.intent.consumerId).toBeUndefined();
+  });
+
   it('requeues a failed claim with backoff and dead-letters at maxAttempts', async () => {
     const session = await createNativeSession(harness(), 'session-retry');
     const input = admissionFor(session, 'retry');

@@ -67,6 +67,12 @@ export interface BuildExecutionClosureManifestInput {
   threadIds: string[];
   runIds: string[];
   resourceIds: string[];
+  /** Channel ids the exported channel bindings actually own. */
+  channelIds?: string[];
+  /** Encoded `encodeThreadStateScope` keys covered by the closure. */
+  threadStateKeys?: string[];
+  /** `(workflow_name, run_id)` pairs in scope for run-pair keyed tables. */
+  runPairs?: { workflowName: string; runId: string }[];
   rows: Partial<Record<ExecutionClosureTableName, Record<string, unknown>[]>>;
   pins: ExecutionClosurePin[];
 }
@@ -102,6 +108,15 @@ export function buildExecutionClosureManifest(input: BuildExecutionClosureManife
     threadIds: sortUnique(input.threadIds),
     runIds: sortUnique(input.runIds),
     resourceIds: sortUnique(input.resourceIds),
+    channelIds: sortUnique(input.channelIds ?? []),
+    threadStateKeys: sortUnique(input.threadStateKeys ?? []),
+    runPairs: (input.runPairs ?? [])
+      .map(pair => ({ workflowName: pair.workflowName, runId: pair.runId }))
+      .sort((a, b) => {
+        const left = `${a.workflowName}${a.runId}`;
+        const right = `${b.workflowName}${b.runId}`;
+        return left < right ? -1 : left > right ? 1 : 0;
+      }),
     tables,
     completeness: input.pins.length === 0 ? 'complete' : 'pinned',
     pins: input.pins,
@@ -122,8 +137,9 @@ export interface VerifyExecutionClosureResult {
  *
  * The manifest is not authenticated, so the verifier rejects manifests the
  * builder cannot produce: duplicate or missing table entries, a `complete`
- * completeness that still carries pins, and `sessionIds` that do not match
- * the exported session rows.
+ * completeness that still carries pins, `sessionIds` that do not match the
+ * exported session rows, and payload rows whose scope bindings name ids the
+ * manifest never declared.
  */
 export function verifyExecutionClosurePayload(
   manifest: ExecutionClosureManifest,
@@ -177,6 +193,57 @@ export function verifyExecutionClosurePayload(
   const sortJoin = (ids: string[]) => [...new Set(ids)].sort().join('\x00');
   if (sortJoin(payloadSessionIds) !== sortJoin(manifest.sessionIds)) {
     mismatches.push('manifest sessionIds do not match the exported session rows');
+  }
+
+  // The declared id sets are the row-level scope contract: a payload row whose
+  // binding column names an id outside the declared set is data the exporter
+  // never claimed — the digest alone cannot reject it because a hand-built
+  // manifest can recompute digests over forged rows. Each registered table is
+  // checked with the same OR/`when` semantics the exporter applies, and
+  // run-pair keyed tables bind against the declared (workflow_name, run_id)
+  // pairs rather than bare run ids.
+  const dimensionSets = {
+    session: new Set(manifest.sessionIds),
+    thread: new Set(manifest.threadIds),
+    run: new Set(manifest.runIds),
+    resource: new Set(manifest.resourceIds),
+    channel: new Set(manifest.channelIds ?? []),
+    threadState: new Set(manifest.threadStateKeys ?? []),
+  };
+  // NUL joins the pair so distinct (workflow_name, run_id) boundaries cannot
+  // collide (`['ab','c']` vs `['a','bc']`); the exporter uses the same
+  // separator and Postgres text cannot carry NUL, so real values never do.
+  const runPairSet = new Set((manifest.runPairs ?? []).map(pair => `${pair.workflowName}\u0000${pair.runId}`));
+  for (const [table, spec] of Object.entries(EXECUTION_CLOSURE_TABLES)) {
+    if (!spec) continue;
+    const tableRows = rows[table as ExecutionClosureTableName] ?? [];
+    if (tableRows.length === 0) continue;
+    if (spec.runPairScope) {
+      const { workflowNameColumn, runIdColumn } = spec.runPairScope;
+      for (const row of tableRows) {
+        const workflowName = row[workflowNameColumn];
+        const runId = row[runIdColumn];
+        if (
+          typeof workflowName !== 'string' ||
+          typeof runId !== 'string' ||
+          !runPairSet.has(`${workflowName}\u0000${runId}`)
+        ) {
+          mismatches.push(`row in ${table} binds a run pair outside the declared closure scope`);
+        }
+      }
+      continue;
+    }
+    if (spec.scope.length === 0) continue; // harness-scoped rows carry no row-level binding
+    for (const row of tableRows) {
+      const inScope = spec.scope.some(filter => {
+        if (filter.when && row[filter.when.column] !== filter.when.equals) return false;
+        const value = row[filter.column];
+        return typeof value === 'string' && dimensionSets[filter.dimension].has(value);
+      });
+      if (!inScope) {
+        mismatches.push(`row in ${table} is outside the declared closure scope`);
+      }
+    }
   }
 
   for (const entry of manifest.tables) {

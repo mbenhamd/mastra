@@ -560,6 +560,11 @@ export class PostgresStore extends MastraCompositeStore {
     return importExecutionClosure(this.#db, payload, {
       schemaName: this.schema,
       maxProjectionPayloadBytes: this.#projectionMaxPayloadBytes,
+      // Capability is the configured feature, not table presence: a store
+      // whose terminal handoff/projection is disabled cannot claim the live
+      // work a closure may carry, so the importer pins rather than strands it.
+      terminalHandoffEnabled: this.stores.harness?.supportsTerminalHandoff === true,
+      projectionEnabled: this.stores.harness?.supportsSessionRecordProjection === true,
     });
   }
 

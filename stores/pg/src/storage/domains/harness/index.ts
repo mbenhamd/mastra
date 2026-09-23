@@ -899,6 +899,14 @@ export class HarnessPG extends HarnessStorage {
       schema: TABLE_SCHEMAS[TABLE_HARNESS_TERMINAL_INTENTS],
       compositePrimaryKey: TABLE_CONFIGS[TABLE_HARNESS_TERMINAL_INTENTS]?.compositePrimaryKey,
     });
+    // `consumer_id` binds a live claim to its owning consumer; upgrade
+    // pre-existing tables eagerly so closure import and claim settlement can
+    // write it before any terminal operation runs the lazy ensure path.
+    await this.#db.alterTable({
+      tableName: TABLE_HARNESS_TERMINAL_INTENTS,
+      schema: TABLE_SCHEMAS[TABLE_HARNESS_TERMINAL_INTENTS],
+      ifNotExists: ['consumer_id'],
+    });
     await this.#db.createTable({
       tableName: TABLE_HARNESS_TERMINAL_PRESSURE,
       schema: TABLE_SCHEMAS[TABLE_HARNESS_TERMINAL_PRESSURE],
@@ -5362,7 +5370,8 @@ export class HarnessPG extends HarnessStorage {
         if (current.attempts >= this.terminalHandoff.maxAttempts) {
           await tx.execute({
             sql: `UPDATE ${TABLE_HARNESS_TERMINAL_INTENTS}
-                  SET status = 'dead', dead_at = ?, claim_id = NULL, claim_expires_at = NULL, updated_at = ?
+                  SET status = 'dead', dead_at = ?, claim_id = NULL, claim_expires_at = NULL,
+                      consumer_id = NULL, updated_at = ?
                   WHERE id = ?`,
             args: [now, now, current.id],
           });
@@ -5376,15 +5385,16 @@ export class HarnessPG extends HarnessStorage {
           attempts: current.attempts + 1,
           claimId,
           claimExpiresAt: now + leaseMs,
+          consumerId: input.consumerId,
           nextAttemptAt: undefined,
           updatedAt: now,
         };
         await tx.execute({
           sql: `UPDATE ${TABLE_HARNESS_TERMINAL_INTENTS}
                 SET status = 'claimed', attempts = ?, claim_id = ?, claim_expires_at = ?,
-                    next_attempt_at = NULL, last_error_json = NULL, updated_at = ?
+                    consumer_id = ?, next_attempt_at = NULL, last_error_json = NULL, updated_at = ?
                 WHERE id = ? AND status IN ('pending', 'failed', 'claimed')`,
-          args: [updated.attempts, claimId, updated.claimExpiresAt, now, current.id],
+          args: [updated.attempts, claimId, updated.claimExpiresAt, input.consumerId, now, current.id],
         });
         claimed.push(updated);
         if (claimed.length >= input.limit) break;
@@ -5417,6 +5427,7 @@ export class HarnessPG extends HarnessStorage {
       if (
         current.status !== 'claimed' ||
         current.claimId !== input.claimId ||
+        current.consumerId !== input.consumerId ||
         current.claimExpiresAt === undefined ||
         current.claimExpiresAt <= now
       ) {
@@ -5457,6 +5468,7 @@ export class HarnessPG extends HarnessStorage {
       if (
         current.status !== 'claimed' ||
         current.claimId !== input.claimId ||
+        current.consumerId !== input.consumerId ||
         current.claimExpiresAt === undefined ||
         current.claimExpiresAt <= now
       ) {
@@ -5465,7 +5477,7 @@ export class HarnessPG extends HarnessStorage {
       await tx.execute({
         sql: `UPDATE ${
           TABLE_HARNESS_TERMINAL_INTENTS
-        } SET status = 'acked', acked_at = ?, claim_id = NULL, claim_expires_at = NULL, updated_at = ? WHERE id = ?`,
+        } SET status = 'acked', acked_at = ?, claim_id = NULL, claim_expires_at = NULL, consumer_id = NULL, updated_at = ? WHERE id = ?`,
         args: [now, now, input.intentId],
       });
       await this.#adjustTerminalPressure(tx, current.harnessName, -1, -current.projection.payloadBytes, now);
@@ -5478,6 +5490,7 @@ export class HarnessPG extends HarnessStorage {
           ackedAt: now,
           claimId: undefined,
           claimExpiresAt: undefined,
+          consumerId: undefined,
           updatedAt: now,
         },
       };
@@ -5507,6 +5520,7 @@ export class HarnessPG extends HarnessStorage {
       if (
         current.status !== 'claimed' ||
         current.claimId !== input.claimId ||
+        current.consumerId !== input.consumerId ||
         current.claimExpiresAt === undefined ||
         current.claimExpiresAt <= now
       ) {
@@ -5517,7 +5531,7 @@ export class HarnessPG extends HarnessStorage {
       await tx.execute({
         sql: `UPDATE ${TABLE_HARNESS_TERMINAL_INTENTS}
               SET status = ?, dead_at = ?, next_attempt_at = ?, last_error_json = ?,
-                  claim_id = NULL, claim_expires_at = NULL, updated_at = ?
+                  claim_id = NULL, claim_expires_at = NULL, consumer_id = NULL, updated_at = ?
               WHERE id = ?`,
         args: [
           terminal ? 'dead' : 'failed',
@@ -5542,6 +5556,7 @@ export class HarnessPG extends HarnessStorage {
           lastError: input.error,
           claimId: undefined,
           claimExpiresAt: undefined,
+          consumerId: undefined,
           updatedAt: now,
         },
       };
@@ -5598,7 +5613,7 @@ export class HarnessPG extends HarnessStorage {
       });
       const fencedRows = await tx.execute({
         sql: `UPDATE ${TABLE_HARNESS_TERMINAL_INTENTS}
-              SET status = 'fenced', claim_id = NULL, claim_expires_at = NULL, updated_at = ?
+              SET status = 'fenced', claim_id = NULL, claim_expires_at = NULL, consumer_id = NULL, updated_at = ?
               WHERE ${predicates.join(' AND ')}
               RETURNING payload_bytes`,
         args: [now, ...args],
@@ -8887,6 +8902,13 @@ export class HarnessPG extends HarnessStorage {
           compositePrimaryKey: config?.compositePrimaryKey,
         });
       }
+      // `consumer_id` binds a live claim to its owning consumer; older tables
+      // gain it lazily so pre-upgrade rows keep NULL until re-claimed.
+      await this.#db.alterTable({
+        tableName: TABLE_HARNESS_TERMINAL_INTENTS,
+        schema: TABLE_SCHEMAS[TABLE_HARNESS_TERMINAL_INTENTS],
+        ifNotExists: ['consumer_id'],
+      });
       await this.#createDefaultIndexes([
         'idx_harness_terminal_admissions_grant',
         'idx_harness_terminal_admissions_run',
@@ -11275,6 +11297,7 @@ function rowToHarnessTerminalIntent(row: Record<string, unknown>): HarnessTermin
     attempts: Number(row.attempts),
     ...(row.claim_id == null ? {} : { claimId: String(row.claim_id) }),
     ...(row.claim_expires_at == null ? {} : { claimExpiresAt: Number(row.claim_expires_at) }),
+    ...(row.consumer_id == null ? {} : { consumerId: String(row.consumer_id) }),
     ...(row.next_attempt_at == null ? {} : { nextAttemptAt: Number(row.next_attempt_at) }),
     ...(lastError === undefined ? {} : { lastError }),
     createdAt: Number(row.created_at),

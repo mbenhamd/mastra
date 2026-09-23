@@ -11,7 +11,9 @@ import {
   TABLE_HARNESS_ATTACHMENT_OPERATIONS,
   TABLE_HARNESS_ATTACHMENT_REFERENCES,
   TABLE_HARNESS_CHANNEL_ACTION_RECEIPTS,
+  TABLE_HARNESS_CHANNEL_ACTION_TOKENS,
   TABLE_HARNESS_CHANNEL_BINDINGS,
+  TABLE_HARNESS_CHANNEL_INBOX,
   TABLE_HARNESS_CHANNEL_OUTBOX,
   TABLE_HARNESS_MESSAGE_RESULTS,
   TABLE_HARNESS_PLAN_TASKS,
@@ -22,6 +24,7 @@ import {
   TABLE_HARNESS_TERMINAL_ADMISSIONS,
   TABLE_HARNESS_TERMINAL_INTENTS,
   TABLE_HARNESS_TERMINAL_PRESSURE,
+  TABLE_HARNESS_WAKEUPS,
   TABLE_HARNESS_WORKSPACE_ACTIONS,
   TABLE_OBSERVATIONAL_MEMORY,
   TABLE_RESOURCES,
@@ -230,6 +233,7 @@ const ADVANCEABLE_COLUMNS: Partial<Record<ExecutionClosureTableName, ReadonlySet
     'attempts',
     'claim_id',
     'claim_expires_at',
+    'consumer_id',
     'next_attempt_at',
     'last_error_json',
     'updated_at',
@@ -309,6 +313,56 @@ const ADVANCEABLE_COLUMNS: Partial<Record<ExecutionClosureTableName, ReadonlySet
     'last_error',
     'updated_at',
   ]),
+  // Channel inbox rows are claimable inbound work plus the dedup receipt:
+  // a destination worker admits, accepts, queues, retries, or dead-letters
+  // the restored row — including rebinding it to the imported session/run —
+  // while identity/payload columns stay fixed.
+  [TABLE_HARNESS_CHANNEL_INBOX]: new Set([
+    'status',
+    'delivery',
+    'mode',
+    'model',
+    'attempts',
+    'claim_id',
+    'claim_expires_at',
+    'next_attempt_at',
+    'admission_hash',
+    'binding_id',
+    'resource_id',
+    'thread_id',
+    'session_id',
+    'run_id',
+    'signal_id',
+    'queued_item_id',
+    'admitted_at',
+    'accepted_at',
+    'queued_at',
+    'failed_at',
+    'dead_at',
+    'last_error',
+    'updated_at',
+  ]),
+  // Wakeups are claimable work for the migrated session: a destination
+  // worker claims, queues, completes, retries, or dead-letters the row.
+  [TABLE_HARNESS_WAKEUPS]: new Set([
+    'status',
+    'attempts',
+    'missed_count',
+    'claim_id',
+    'claim_expires_at',
+    'claimed_at',
+    'next_attempt_at',
+    'queued_item_id',
+    'run_id',
+    'signal_id',
+    'queued_at',
+    'completed_at',
+    'failed_at',
+    'dead_at',
+    'result',
+    'last_error',
+    'updated_at',
+  ]),
   // A resumed run rewrites its canonical snapshot in place.
   [TABLE_WORKFLOW_SNAPSHOT]: new Set(['snapshot', 'updatedAt', 'updatedAtZ']),
   // A terminalizing run's owner/claim/phase columns advance as the claim
@@ -356,6 +410,9 @@ const ADVANCEABLE_COLUMNS: Partial<Record<ExecutionClosureTableName, ReadonlySet
   [TABLE_HARNESS_WORKSPACE_ACTIONS]: new Set(['result']),
   // A background task the destination task manager re-drives or settles:
   // status, attempts, and the result/suspension fields are its lifecycle.
+  // The `*Z` timestamptz twins advance alongside their timestamp columns —
+  // the PG updater writes both forms together, and a driver-level difference
+  // in which twin is present must not read back as a foreign row.
   [TABLE_BACKGROUND_TASKS]: new Set([
     'status',
     'result',
@@ -363,8 +420,11 @@ const ADVANCEABLE_COLUMNS: Partial<Record<ExecutionClosureTableName, ReadonlySet
     'suspend_payload',
     'retry_count',
     'startedAt',
+    'startedAtZ',
     'suspendedAt',
+    'suspendedAtZ',
     'completedAt',
+    'completedAtZ',
   ]),
   // Attachment byte identity settles through pending put operations.
   [TABLE_HARNESS_ATTACHMENTS]: new Set(['blob_ref', 'data_b64', 'put_operation_id', 'session_incarnation']),
@@ -782,6 +842,11 @@ export async function exportExecutionClosure(
     for (const [table, spec] of Object.entries(EXECUTION_CLOSURE_TABLES)) {
       const tableName = table as ExecutionClosureTableName;
       if (tableName === TABLE_HARNESS_SESSIONS || spec!.runPairScope) continue;
+      // Background tasks scope by run_id, and the run dimension is still being
+      // collected from the rows read in this pass — the table is read after
+      // the run-id collection below so a task bound only to a run discovered
+      // on a message-result/wakeup row is not silently dropped.
+      if (tableName === TABLE_BACKGROUND_TASKS) continue;
       rows[tableName] = tablePresent(tableName)
         ? await readClosureTable(t, tableName, schemaName, key.harnessName, dims)
         : [];
@@ -810,6 +875,11 @@ export async function exportExecutionClosure(
         if (typeof row.run_id === 'string') dims.run.add(row.run_id);
       }
     }
+    // Tasks bind by their owning run (or the subtree's thread) — read them
+    // only now that the run dimension is fully populated.
+    rows[TABLE_BACKGROUND_TASKS] = tablePresent(TABLE_BACKGROUND_TASKS)
+      ? await readClosureTable(t, TABLE_BACKGROUND_TASKS, schemaName, key.harnessName, dims)
+      : [];
 
     // --- Workflow run-pair discovery. Every run-pair table is probed by
     // run_id, then rows bind to their exact (workflow_name, run_id) pair. A
@@ -902,6 +972,14 @@ export async function exportExecutionClosure(
       const pair = pairKeyOf(row.workflow_name, row.run_id);
       if (pair) snapshotPairs.add(pair);
     }
+    // A durable-agent run's durable snapshot may live in the workflow-native
+    // snapshot store instead of the canonical snapshot table — either source
+    // proves the pair, and both travel when present so the destination keeps
+    // the latest valid state.
+    for (const row of rows.mastra_workflow_terminal_snapshots_v2 ?? []) {
+      const pair = pairKeyOf(row.workflow_name, row.run_id);
+      if (pair) snapshotPairs.add(pair);
+    }
     for (const pair of referencedParentPairs) {
       if (snapshotPairs.has(pair)) continue;
       const [workflowName, runId] = splitPairKey(pair);
@@ -920,6 +998,12 @@ export async function exportExecutionClosure(
     // current/suspended run exactly like a canonical snapshot row does.
     const snapshotRunIds = new Set((rows[TABLE_WORKFLOW_SNAPSHOT] ?? []).map(r => r.run_id));
     for (const row of rows[TABLE_WORKFLOW_SNAPSHOT_HANDOFF] ?? []) {
+      snapshotRunIds.add(row.run_id);
+    }
+    // Same durable-agent duality as the parent-pair check above: a run whose
+    // snapshot lives in the workflow-native store satisfies the current-run
+    // requirement.
+    for (const row of rows.mastra_workflow_terminal_snapshots_v2 ?? []) {
       snapshotRunIds.add(row.run_id);
     }
     for (const row of sessionRows) {
@@ -1028,6 +1112,50 @@ export async function exportExecutionClosure(
       }
     }
 
+    // A session row still held under a live lease means a source worker owns
+    // it: the subtree can keep mutating after this snapshot, so the exported
+    // unit is already stale on arrival while the source retains authority.
+    // There is no export-time fence that stops that writer, so the closure
+    // pins instead of silently split-braining the session.
+    const exportObservedAt = Date.now();
+    for (const row of sessionRows) {
+      const leaseExpiresAt =
+        row.lease_expires_at instanceof Date ? row.lease_expires_at.getTime() : Number(row.lease_expires_at);
+      const leaseActive =
+        typeof row.owner_id === 'string' &&
+        row.owner_id.length > 0 &&
+        row.lease_expires_at != null &&
+        Number.isFinite(leaseExpiresAt) &&
+        leaseExpiresAt > exportObservedAt;
+      if (leaseActive) {
+        pins.push({
+          reason: 'session-lease-active',
+          detail: { sessionId: row.id, ownerId: row.owner_id, leaseExpiresAt: leaseExpiresAt },
+        });
+      }
+    }
+
+    // An active action token binds external provider callbacks into this
+    // session's channel execution — the token is exported as evidence only
+    // (channel bindings are `authority`), so a suspended interaction whose
+    // token outlives the migration can never complete at the destination.
+    // Pin until the token is revoked or expires rather than reporting the
+    // unit complete over a dead callback contract.
+    for (const row of rows[TABLE_HARNESS_CHANNEL_ACTION_TOKENS] ?? []) {
+      if (row.revoked_at != null) continue;
+      const expiresAt = row.expires_at == null ? null : Number(row.expires_at);
+      if (expiresAt !== null && !(expiresAt > exportObservedAt)) continue;
+      pins.push({
+        reason: 'channel-action-token-active',
+        detail: {
+          owningSessionId: row.owning_session_id,
+          actionTokenId: row.action_token_id,
+          kind: row.kind,
+          bindingId: row.binding_id,
+        },
+      });
+    }
+
     const manifest = buildExecutionClosureManifest({
       key,
       source: { store: 'pg', schemaName: options?.schemaName ?? 'public' },
@@ -1036,6 +1164,12 @@ export async function exportExecutionClosure(
       threadIds: [...dims.thread],
       runIds: [...dims.run],
       resourceIds: [...dims.resource],
+      channelIds: [...dims.channel],
+      threadStateKeys: [...dims.threadState],
+      runPairs: [...runPairs].map(pair => {
+        const [workflowName, runId] = splitPairKey(pair);
+        return { workflowName, runId };
+      }),
       rows,
       pins,
     });
@@ -1052,6 +1186,23 @@ export interface ImportExecutionClosureOptions {
    * projection work for sessions exported under a larger configured bound.
    */
   maxProjectionPayloadBytes?: number;
+  /**
+   * Whether the destination store has native terminal handoff enabled. A
+   * closure carrying live terminal intents is pinned when the destination
+   * cannot claim them — table presence alone is not capability, and a live
+   * intent restored where no worker can ever run is silently stranded work.
+   * Callers that omit the flag get the permissive default so the standalone
+   * helper keeps importing evidence-shaped payloads.
+   */
+  terminalHandoffEnabled?: boolean;
+  /**
+   * Whether the destination store has session-record projection enabled.
+   * Active projection fences still import as evidence, but the deterministic
+   * restage only runs when the destination can actually apply the intents —
+   * otherwise each fenced session is pinned instead of being reported
+   * imported with a permanently stale read model.
+   */
+  projectionEnabled?: boolean;
 }
 
 const LIVE_TERMINAL_INTENT_STATUSES = new Set(['pending', 'claimed', 'failed']);
@@ -1109,6 +1260,7 @@ function applyImportTransforms(
   tableName: ExecutionClosureTableName,
   row: Record<string, unknown>,
   incarnations: Record<string, string>,
+  sourceIncarnations: Record<string, string>,
 ): Record<string, unknown> {
   const spec = EXECUTION_CLOSURE_TABLES[tableName]!;
   const applied: Record<string, unknown> = { ...row };
@@ -1136,7 +1288,16 @@ function applyImportTransforms(
   }
   if (spec.role === 'fence') {
     const sessionId = applied.session_id;
-    if (typeof sessionId === 'string' && typeof applied.session_incarnation === 'string') {
+    // Only a row stamped with the incarnation the source actually exported is
+    // rebound to the destination incarnation. A fence row left behind by an
+    // older incarnation keeps its own stamp — the destination's fencing rules
+    // treat it as dead evidence, and rewriting it would revive a historical
+    // epoch as if it were current.
+    if (
+      typeof sessionId === 'string' &&
+      typeof applied.session_incarnation === 'string' &&
+      applied.session_incarnation === sourceIncarnations[sessionId]
+    ) {
       const destination = incarnations[sessionId];
       if (destination) applied.session_incarnation = destination;
     }
@@ -1227,6 +1388,22 @@ async function insertClosureRow(
   // still fails closed.
   const advanceable = ADVANCEABLE_COLUMNS[tableName];
   if (advanceable !== undefined && stored.length === 1 && rowsMatchExcept(stored[0]!, applied, advanceable)) {
+    // The parent-revision row is a monotonic fence: its generation only moves
+    // forward under the destination's own writers, so a stored row whose
+    // generation regressed below the imported value is not a valid successor —
+    // it is a foreign row that happens to share the registered lifecycle
+    // columns, and it must fail closed rather than be adopted.
+    if (
+      tableName === 'mastra_workflow_parent_revisions' &&
+      Number(stored[0]!.generation) < Number(applied.generation)
+    ) {
+      throw closureError(
+        'IMPORT_EXECUTION_CLOSURE',
+        'DESTINATION_ROW_CONFLICT',
+        `Execution closure row for ${tableName} conflicts with a different destination row`,
+        { tableName, primaryKey: pk.join(', ') },
+      );
+    }
     return 'skipped';
   }
   throw closureError(
@@ -1334,7 +1511,13 @@ export async function importExecutionClosure(
 
     const incarnations: Record<string, string> = {};
     const appliedSessionRows = new Map<string, Record<string, unknown>>();
-    const incarnationExcluded = new Set([incarnationColumn]);
+    // The incarnation is rewritten by every import, and owner/lease are live
+    // authority fields: a destination worker may hold or renew a lease on the
+    // imported session without touching `version`, so a retry that still
+    // compares the lease columns would misreport a live lease as a foreign
+    // row. The columns still clear on the initial insert — this exclusion is
+    // for the read-back comparison only.
+    const sessionRetryExcluded = new Set([incarnationColumn, 'owner_id', 'lease_expires_at']);
 
     for (const sessionId of manifest.sessionIds) {
       const sourceRow = sessionById.get(sessionId);
@@ -1346,14 +1529,14 @@ export async function importExecutionClosure(
           { sessionId },
         );
       }
-      const base = applyImportTransforms(TABLE_HARNESS_SESSIONS, sourceRow, incarnations);
+      const base = applyImportTransforms(TABLE_HARNESS_SESSIONS, sourceRow, incarnations, manifest.incarnations);
       assertRowHarnessName(TABLE_HARNESS_SESSIONS, base, harnessName);
       const stored = existingById.get(sessionId);
       if (stored) {
         // A pre-existing row must be this import's earlier result (or a
         // legacy row carrying identical content): the incarnation itself is
         // the only field the import is allowed to rewrite.
-        const identical = rowsMatchExcept(stored, base, incarnationExcluded);
+        const identical = rowsMatchExcept(stored, base, sessionRetryExcluded);
         // A lost-ack retry can instead meet the session after a destination
         // worker advanced it — the same creation identity at a strictly newer
         // version. The stored row is the newer truth, so the retry converges
@@ -1419,7 +1602,7 @@ export async function importExecutionClosure(
       const storedWinner = winner[0];
       const winnerIsImport =
         storedWinner !== undefined &&
-        (rowsMatchExcept(storedWinner, base, incarnationExcluded) ||
+        (rowsMatchExcept(storedWinner, base, sessionRetryExcluded) ||
           // Same raced-import case as the pre-locked path above: the winner
           // can be the closure's own session row after a destination worker
           // already advanced it.
@@ -1453,6 +1636,7 @@ export async function importExecutionClosure(
     }
 
     const liveTerminalIntents: Record<string, unknown>[] = [];
+    const terminalHandoffEnabled = options?.terminalHandoffEnabled ?? true;
 
     for (const [table, spec] of Object.entries(EXECUTION_CLOSURE_TABLES)) {
       const tableName = table as ExecutionClosureTableName;
@@ -1479,7 +1663,7 @@ export async function importExecutionClosure(
             continue;
           }
         }
-        const applied = applyImportTransforms(tableName, row, incarnations);
+        const applied = applyImportTransforms(tableName, row, incarnations, manifest.incarnations);
         assertRowHarnessName(tableName, applied, harnessName);
         const outcome = await insertClosureRow(t, tableName, schemaName, applied, {
           verifyConflict: s.role !== 'shared-resource',
@@ -1491,6 +1675,15 @@ export async function importExecutionClosure(
             LIVE_TERMINAL_INTENT_STATUSES.has(String(applied.status))
           ) {
             liveTerminalIntents.push(applied);
+            // The intent still restores as fence evidence, but a destination
+            // with terminal handoff disabled can never claim it — pin so the
+            // unit is not reported imported over silently stranded work.
+            if (!terminalHandoffEnabled) {
+              importPins.push({
+                reason: 'terminal-handoff-disabled',
+                detail: { sessionId: applied.session_id, intentId: applied.id, status: String(applied.status) },
+              });
+            }
           }
         } else {
           skipped[tableName]! += 1;
@@ -1544,16 +1737,35 @@ export async function importExecutionClosure(
     // plus a fresh intent at the session's current revision lets the
     // destination claim the projection instead of leaving the migrated
     // session stale in the read model.
+    const activeFenceSessions = new Set(
+      (rows[TABLE_HARNESS_SESSION_PROJECTION_FENCES] ?? [])
+        .filter(row => row.state === 'active')
+        .map(row => String(row.session_id)),
+    );
+    const projectionEnabled = options?.projectionEnabled ?? true;
     const projectionTablesPresent =
       tablePresent(TABLE_HARNESS_SESSION_PROJECTION_INTENTS) &&
       tablePresent(TABLE_HARNESS_SESSION_PROJECTION_FENCES) &&
       tablePresent(TABLE_HARNESS_SESSION_PROJECTION_PRESSURE);
-    if (projectionTablesPresent) {
-      const activeFenceSessions = new Set(
-        (rows[TABLE_HARNESS_SESSION_PROJECTION_FENCES] ?? [])
-          .filter(row => row.state === 'active')
-          .map(row => String(row.session_id)),
-      );
+    if (activeFenceSessions.size > 0 && !(projectionEnabled && projectionTablesPresent)) {
+      // Table presence is not capability, and neither is the reverse: a
+      // destination whose projection recovery path is disabled — or whose
+      // schema lacks the intent/pressure tables a restage needs — would
+      // leave restaged work unclaimed forever (or never stage it at all).
+      // The fence rows still imported as evidence — pin each fenced session
+      // rather than reporting the unit imported with a permanently stale
+      // read model.
+      const reason = projectionEnabled
+        ? 'session-record-projection-tables-missing'
+        : 'session-record-projection-disabled';
+      for (const sessionId of activeFenceSessions) {
+        importPins.push({
+          reason,
+          detail: { sessionId },
+        });
+      }
+    }
+    if (projectionEnabled && projectionTablesPresent) {
       const maxPayloadBytes =
         options?.maxProjectionPayloadBytes ?? DEFAULT_HARNESS_SESSION_RECORD_PROJECTION_MAX_PAYLOAD_BYTES;
       let staged = 0;

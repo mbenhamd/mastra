@@ -41,7 +41,7 @@ export function isPlainJsonObject(value: object): value is Record<string, unknow
  * numbers, `-0`, sparse arrays, and any non-plain / non-JSON value. Object properties whose value
  * is `undefined` are dropped (matching `JSON.stringify`).
  */
-export function assertJsonValue(value: unknown, path = 'value'): JsonValue {
+export function assertJsonValue(value: unknown, path = 'value', ancestors?: Set<object>): JsonValue {
   if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
   if (typeof value === 'number') {
     if (!Number.isFinite(value) || Object.is(value, -0)) {
@@ -49,22 +49,34 @@ export function assertJsonValue(value: unknown, path = 'value'): JsonValue {
     }
     return value;
   }
-  if (Array.isArray(value)) {
-    const out: JsonValue[] = [];
-    for (let index = 0; index < value.length; index += 1) {
-      if (!(index in value)) throw new HarnessValidationError(`${path}[${index}]`, 'sparse arrays are not allowed');
-      out.push(assertJsonValue(value[index], `${path}[${index}]`));
-    }
-    return out;
+  // `structuredClone` admits cyclic graphs, so a cyclic caller input reaches
+  // here unharmed — without the ancestor check the recursion never bottoms
+  // out and the failure is a stack overflow, not the typed validation error.
+  const seen = ancestors ?? new Set<object>();
+  if (typeof value === 'object' && value !== null) {
+    if (seen.has(value)) throw new HarnessValidationError(path, 'cyclic structures are not allowed');
+    seen.add(value);
   }
-  if (typeof value === 'object' && value !== null && isPlainJsonObject(value)) {
-    const out: Record<string, JsonValue> = {};
-    for (const [key, entry] of Object.entries(value)) {
-      if (entry !== undefined) out[key] = assertJsonValue(entry, `${path}.${key}`);
+  try {
+    if (Array.isArray(value)) {
+      const out: JsonValue[] = [];
+      for (let index = 0; index < value.length; index += 1) {
+        if (!(index in value)) throw new HarnessValidationError(`${path}[${index}]`, 'sparse arrays are not allowed');
+        out.push(assertJsonValue(value[index], `${path}[${index}]`, seen));
+      }
+      return out;
     }
-    return out;
+    if (typeof value === 'object' && value !== null && isPlainJsonObject(value)) {
+      const out: Record<string, JsonValue> = {};
+      for (const [key, entry] of Object.entries(value)) {
+        if (entry !== undefined) out[key] = assertJsonValue(entry, `${path}.${key}`, seen);
+      }
+      return out;
+    }
+    throw new HarnessValidationError(path, 'must be JSON-serializable for admission hashing');
+  } finally {
+    if (typeof value === 'object' && value !== null) seen.delete(value);
   }
-  throw new HarnessValidationError(path, 'must be JSON-serializable for admission hashing');
 }
 
 /** Deterministic canonical-JSON string: sorted object keys, ordered arrays, `JSON.stringify` scalars. */

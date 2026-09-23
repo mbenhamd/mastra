@@ -69,6 +69,7 @@ import {
   prepareHarnessTerminalAdmission,
   prepareHarnessTerminalProjection,
   terminalClaimId,
+  validateHarnessTerminalExecutionGrant,
   validateHarnessTerminalIdentity,
 } from './terminal-handoff';
 import type {
@@ -1783,6 +1784,16 @@ export class InMemoryHarness extends HarnessStorage {
   async cancelTerminalHandoff(input: HarnessTerminalCancelInput): Promise<HarnessTerminalCancelReceipt> {
     this.assertTerminalHandoffEnabled();
     const namespace = resolveHarnessName(input.harnessName, this.harnessName);
+    // Same contract as the PG path: the grant and the claimed admission
+    // identity must be structurally valid before a tombstone is recorded —
+    // a malformed cancel must not mint fencing evidence.
+    validateHarnessTerminalExecutionGrant(input.executionGrant);
+    if (!input.sessionId || !input.sessionIncarnation || !input.admissionId || !input.admissionHash) {
+      throw new HarnessTerminalHandoffValidationError(
+        'cancel',
+        'session, incarnation, and admission identity are required',
+      );
+    }
     const now = input.cancelledAt ?? Date.now();
     if (!Number.isSafeInteger(now) || now < 0)
       throw new HarnessTerminalHandoffValidationError('cancelledAt', 'must be a non-negative safe integer');
@@ -1892,12 +1903,14 @@ export class InMemoryHarness extends HarnessStorage {
         this.adjustTerminalPressure(current.harnessName, -1, -current.projection.payloadBytes);
         current.status = 'dead';
         current.deadAt = now;
+        current.consumerId = undefined;
         current.updatedAt = now;
         continue;
       }
       current.status = 'claimed';
       current.claimId = terminalClaimId();
       current.claimExpiresAt = now + leaseMs;
+      current.consumerId = input.consumerId;
       // Reclaiming a failed intent must drop the stale retry schedule and
       // error so the new claim starts clean, matching the PG claim UPDATE.
       current.nextAttemptAt = undefined;
@@ -1942,6 +1955,7 @@ export class InMemoryHarness extends HarnessStorage {
     current.ackedAt = now;
     current.claimId = undefined;
     current.claimExpiresAt = undefined;
+    current.consumerId = undefined;
     current.updatedAt = current.ackedAt;
     return { status: 'acked', intent: cloneHarnessTerminal(current) };
   }
@@ -1960,6 +1974,7 @@ export class InMemoryHarness extends HarnessStorage {
     current.lastError = cloneHarnessTerminal(input.error);
     current.claimId = undefined;
     current.claimExpiresAt = undefined;
+    current.consumerId = undefined;
     current.updatedAt = now;
     if (current.attempts >= this.terminalHandoff.maxAttempts) {
       this.adjustTerminalPressure(current.harnessName, -1, -current.projection.payloadBytes);
@@ -2019,6 +2034,7 @@ export class InMemoryHarness extends HarnessStorage {
         intent.status = 'fenced';
         intent.claimId = undefined;
         intent.claimExpiresAt = undefined;
+        intent.consumerId = undefined;
         intent.updatedAt = now;
       }
     }
@@ -2088,6 +2104,9 @@ export class InMemoryHarness extends HarnessStorage {
     if (
       current.status !== 'claimed' ||
       current.claimId !== input.claimId ||
+      // The claim is bound to the consumer that minted it — a caller holding
+      // a stale claim id under another consumer must not settle this lease.
+      current.consumerId !== input.consumerId ||
       current.claimExpiresAt === undefined ||
       current.claimExpiresAt <= now
     ) {

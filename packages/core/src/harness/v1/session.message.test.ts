@@ -19,6 +19,7 @@ import {
   HarnessStorageAdmissionConflictError,
   HarnessStorageVersionConflictError,
   HarnessTerminalHandoffUnsupportedError,
+  HarnessTerminalHandoffValidationError,
   harnessTerminalAdmissionId,
   harnessTerminalIntentId,
 } from '../../storage/domains/harness';
@@ -432,6 +433,47 @@ describe('Session.message() — default path', () => {
     });
     expect(intent).toBeDefined();
     await expect(session.lookupMessageResult(intent!.signalId)).resolves.toMatchObject({ status: 'completed' });
+  });
+
+  it('rejects a cyclic terminal admission seed with a typed validation error before dispatch', async () => {
+    const storage = new InMemoryHarness({
+      db: new InMemoryDB(),
+      terminalHandoff: { enabled: true },
+    });
+    const agent = new MockAgent({ id: 'default' });
+    const { harness } = setupHarness({
+      agents: { default: agent },
+      sessions: {
+        storage,
+        terminalHandoff: {
+          finalizer: {
+            id: 'doxa.chat',
+            version: '2026-09-20',
+            finalize: async () => ({
+              projectionKind: 'chat.summary',
+              projectionId: 'response-1',
+              payload: {},
+            }),
+          },
+        },
+      },
+    });
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    // `structuredClone` admits cyclic graphs — without bounded-JSON validation
+    // at the boundary the canonical hashers would overflow the stack instead
+    // of reporting a terminal validation failure.
+    const cyclic: Record<string, unknown> = { v: 1 };
+    cyclic.self = cyclic;
+    await expect(
+      session.message({
+        content: 'native terminal',
+        admissionId: 'cyclic-seed',
+        executionAuthorityGrant: { key: 'usage-claim-cyclic', generation: 1 },
+        terminalAdmissionSeed: cyclic as never,
+      }),
+    ).rejects.toBeInstanceOf(HarnessTerminalHandoffValidationError);
+    // The failure precedes provider dispatch — no run, no evidence.
+    expect(agent.streamCalls).toHaveLength(0);
   });
 
   it('holds a live duplicate behind the durable terminal commit barrier', async () => {

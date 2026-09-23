@@ -5,7 +5,9 @@ import {
   TABLE_BACKGROUND_TASKS,
   TABLE_HARNESS_ATTACHMENTS,
   TABLE_HARNESS_ATTACHMENT_OPERATIONS,
+  TABLE_HARNESS_CHANNEL_ACTION_TOKENS,
   TABLE_HARNESS_CHANNEL_BINDINGS,
+  TABLE_HARNESS_CHANNEL_INBOX,
   TABLE_HARNESS_CHANNEL_OUTBOX,
   TABLE_HARNESS_MESSAGE_RESULTS,
   TABLE_HARNESS_OPERATION_TOMBSTONES,
@@ -21,6 +23,7 @@ import {
   TABLE_THREAD_STATE,
   TABLE_WORKFLOW_SNAPSHOT,
   TABLE_WORKFLOW_SNAPSHOT_HANDOFF,
+  buildExecutionClosureManifest,
   encodeThreadStateScope,
   verifyExecutionClosurePayload,
 } from '@mastra/core/storage';
@@ -442,8 +445,9 @@ describe('exportExecutionClosure', () => {
     const { s, schemaName } = await store('roles');
     await seedClosure(s, schemaName, 's5');
 
-    // Seed one fence row (operation tombstone) and one authority row (wakeup)
-    // directly — the export must carry them as evidence, not drop them.
+    // Seed one fence row (operation tombstone) and one requeued fence row
+    // (wakeup) directly — the export must carry them as evidence, not drop
+    // them.
     await s.db.none(
       `INSERT INTO "${schemaName}"."${TABLE_HARNESS_OPERATION_TOMBSTONES}" (id, harness_name, session_id, kind, resource_id, thread_id, terminal_at, compacted_at, expires_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
       [
@@ -486,7 +490,9 @@ describe('exportExecutionClosure', () => {
     const byTable = Object.fromEntries(manifest.tables.map(t => [t.table, t]));
     expect(byTable[TABLE_HARNESS_OPERATION_TOMBSTONES]!.role).toBe('fence');
     expect(byTable[TABLE_HARNESS_OPERATION_TOMBSTONES]!.rowCount).toBe(1);
-    expect(byTable[TABLE_HARNESS_WAKEUPS]!.role).toBe('authority');
+    // Wakeups are durable session work — `fence`, not `authority`: a live
+    // claim requeues on import instead of being dropped with the schedule.
+    expect(byTable[TABLE_HARNESS_WAKEUPS]!.role).toBe('fence');
     expect(byTable[TABLE_HARNESS_WAKEUPS]!.rowCount).toBe(1);
     expect(byTable[TABLE_OBSERVATIONAL_MEMORY]!.role).toBe('state');
     expect(byTable[TABLE_RESOURCES]!.role).toBe('shared-resource');
@@ -742,6 +748,103 @@ describe('exportExecutionClosure', () => {
     const tasks = rows[TABLE_BACKGROUND_TASKS] ?? [];
     expect(tasks.map(r => r.id)).toEqual(['task-live']);
     expect(verifyExecutionClosurePayload(manifest, rows).ok).toBe(true);
+  });
+
+  it('pins the export while a source session holds a live lease', async () => {
+    const { s, schemaName } = await store('lease');
+    await seedClosure(s, schemaName, 'ls1');
+    // A live owner/lease means a source worker still owns the subtree: the
+    // snapshot is stale on arrival, so the closure pins rather than
+    // split-brain the session across stores.
+    await s.db.none(
+      `UPDATE "${schemaName}"."${TABLE_HARNESS_SESSIONS}"
+       SET owner_id = 'src-worker', lease_expires_at = $1 WHERE id = 'ls1'`,
+      [Date.now() + 60_000],
+    );
+
+    const { manifest } = await exportExecutionClosure(s.db, { harnessName: HARNESS, sessionId: 'ls1' }, { schemaName });
+    expect(manifest.completeness).toBe('pinned');
+    expect(manifest.pins).toEqual([
+      expect.objectContaining({
+        reason: 'session-lease-active',
+        detail: expect.objectContaining({ sessionId: 'ls1', ownerId: 'src-worker' }),
+      }),
+    ]);
+  });
+
+  it('does not pin on an expired lease', async () => {
+    const { s, schemaName } = await store('leaseexpired');
+    await seedClosure(s, schemaName, 'le1');
+    await s.db.none(
+      `UPDATE "${schemaName}"."${TABLE_HARNESS_SESSIONS}"
+       SET owner_id = 'src-worker', lease_expires_at = $1 WHERE id = 'le1'`,
+      [Date.now() - 1_000],
+    );
+
+    const { manifest } = await exportExecutionClosure(s.db, { harnessName: HARNESS, sessionId: 'le1' }, { schemaName });
+    expect(manifest.pins.filter(p => p.reason === 'session-lease-active')).toEqual([]);
+  });
+
+  it('pins the export while an unrevoked channel action token is live', async () => {
+    const { s, schemaName } = await store('token');
+    const { resourceId } = await seedClosure(s, schemaName, 'tk1');
+    const now = Date.now();
+    const insertToken = (id: string, expiresAt: number | null, revokedAt: number | null) =>
+      s.db.none(
+        `INSERT INTO "${schemaName}"."${TABLE_HARNESS_CHANNEL_ACTION_TOKENS}"
+           (action_token_id, harness_name, channel_id, provider_id, resource_id,
+            owning_session_id, item_id, kind, binding_id, binding_generation,
+            run_id, pending_requested_at, audience, metadata_hash, transport_hash,
+            key_id, expires_at, revoked_at, revoked_reason, created_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14,$15,$16,$17,$18,$19,$20,$21)`,
+        [
+          id,
+          HARNESS,
+          'chan-1',
+          'provider-1',
+          resourceId,
+          'tk1',
+          `item-${id}`,
+          'approval',
+          'bind-1',
+          1,
+          'run-tk1',
+          now - 5_000,
+          JSON.stringify({ mode: 'default' }),
+          'meta-hash',
+          `transport-hash-${id}`,
+          null,
+          expiresAt,
+          revokedAt,
+          revokedAt === null ? null : 'revoked',
+          now,
+          now,
+        ],
+      );
+    // An unexpired token binds live provider callbacks into this session —
+    // the migrated session could never settle them, so the unit pins.
+    await insertToken('token-live', now + 60_000, null);
+    // A token with no expiry is live until revoked — it pins too.
+    await insertToken('token-open', null, null);
+    // Expired and revoked tokens are settled evidence — they must not pin.
+    await insertToken('token-expired', now - 60_000, null);
+    await insertToken('token-revoked', null, now - 1_000);
+
+    const { manifest } = await exportExecutionClosure(s.db, { harnessName: HARNESS, sessionId: 'tk1' }, { schemaName });
+    expect(manifest.completeness).toBe('pinned');
+    expect(manifest.pins).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          reason: 'channel-action-token-active',
+          detail: expect.objectContaining({ owningSessionId: 'tk1', actionTokenId: 'token-live' }),
+        }),
+        expect.objectContaining({
+          reason: 'channel-action-token-active',
+          detail: expect.objectContaining({ owningSessionId: 'tk1', actionTokenId: 'token-open' }),
+        }),
+      ]),
+    );
+    expect(manifest.pins).toHaveLength(2);
   });
 });
 
@@ -1070,30 +1173,109 @@ describe('importExecutionClosure', () => {
     expect(count.n).toBe('0');
   });
 
-  it('never restores authority rows — wakeups stay absent after import', async () => {
+  it('restores unsettled wakeup work — a live claim requeues claim-free', async () => {
+    const src = await store('wake-src');
+    const dst = await store('wake-dst');
+    const { threadId, resourceId } = await seedClosure(src.s, src.schemaName, 'wk1');
+    const now = Date.now();
+    const insertWakeup = (id: string, status: string, extra: Record<string, unknown>) =>
+      src.s.db.none(
+        `INSERT INTO "${src.schemaName}"."${TABLE_HARNESS_WAKEUPS}"
+           (id, harness_name, source, source_id, fire_id, idempotency_key,
+            payload_hash, admission_id, session_id, resource_id, thread_id,
+            due_at, status, attempts, claim_id, claim_expires_at, claimed_at,
+            next_attempt_at, missed_count, content, attachments, created_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
+        [
+          id,
+          HARNESS,
+          'timer',
+          'timer-1',
+          `fire-${id}`,
+          `idem-${id}`,
+          'hash-1',
+          `adm-${id}`,
+          'wk1',
+          resourceId,
+          threadId,
+          now + 60_000,
+          status,
+          extra.attempts ?? 0,
+          extra.claim_id ?? null,
+          extra.claim_expires_at ?? null,
+          extra.claimed_at ?? null,
+          extra.next_attempt_at ?? null,
+          extra.missed_count ?? null,
+          'wakeup',
+          '[]',
+          now,
+          now,
+        ],
+      );
+    // A mid-delivery claim is a source lease no destination worker can renew:
+    // the row requeues as `due` with claim metadata cleared instead of
+    // parking behind a lease that expires unreaped.
+    await insertWakeup('wake-claimed', 'claimed', {
+      attempts: 1,
+      claim_id: 'src-worker',
+      claim_expires_at: now + 30_000,
+      claimed_at: now - 5_000,
+      missed_count: 2,
+    });
+    // A settled row is durable evidence and must also survive the move.
+    await insertWakeup('wake-done', 'completed', {});
+
+    const exported = await exportExecutionClosure(
+      src.s.db,
+      { harnessName: HARNESS, sessionId: 'wk1' },
+      { schemaName: src.schemaName },
+    );
+    expect((exported.rows[TABLE_HARNESS_WAKEUPS] ?? []).map(r => r.id).sort()).toEqual(['wake-claimed', 'wake-done']);
+
+    const result = await importExecutionClosure(dst.s.db, exported, { schemaName: dst.schemaName });
+    expect(result.status).toBe('imported');
+    expect(result.inserted[TABLE_HARNESS_WAKEUPS]).toBe(2);
+
+    const restored = await dst.s.db.manyOrNone<Record<string, unknown>>(
+      `SELECT id, status, claim_id, claim_expires_at, claimed_at, missed_count
+       FROM "${dst.schemaName}"."${TABLE_HARNESS_WAKEUPS}" ORDER BY id`,
+    );
+    const claimed = restored.find(r => r.id === 'wake-claimed')!;
+    expect(claimed.status).toBe('due');
+    expect(claimed.claim_id).toBeNull();
+    expect(claimed.claim_expires_at).toBeNull();
+    expect(claimed.claimed_at).toBeNull();
+    const done = restored.find(r => r.id === 'wake-done')!;
+    expect(done.status).toBe('completed');
+  });
+
+  it('never restores authority rows — channel bindings stay absent after import', async () => {
     const src = await store('auth-src');
     const dst = await store('auth-dst');
-    await seedClosure(src.s, src.schemaName, 'rs4');
+    const { threadId, resourceId } = await seedClosure(src.s, src.schemaName, 'rs4');
     const now = Date.now();
     await src.s.db.none(
-      `INSERT INTO "${src.schemaName}"."${TABLE_HARNESS_WAKEUPS}" (id, harness_name, source, source_id, fire_id, idempotency_key, payload_hash, admission_id, session_id, resource_id, thread_id, due_at, status, attempts, content, attachments, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
+      `INSERT INTO "${src.schemaName}"."${TABLE_HARNESS_CHANNEL_BINDINGS}"
+         (id, harness_name, channel_id, provider_id, status, platform,
+          external_tenant_id, external_channel_id, external_thread_id,
+          resource_id, thread_id, session_id, mode, generation,
+          created_at, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
       [
-        `wake-${randomUUID()}`,
+        `bind-${randomUUID()}`,
         HARNESS,
-        'timer',
-        'timer-1',
-        'fire-1',
-        `idem-${randomUUID()}`,
-        'hash-1',
-        `adm-${randomUUID()}`,
+        'chan-rs4',
+        'provider-1',
+        'active',
+        'test',
+        'tenant',
+        'ext-chan',
+        'ext-thread',
+        resourceId,
+        threadId,
         'rs4',
-        'resource-rs4',
-        'thread-rs4',
-        now + 60_000,
-        'pending',
-        0,
-        'wakeup',
-        '[]',
+        'default',
+        1,
         now,
         now,
       ],
@@ -1104,13 +1286,14 @@ describe('importExecutionClosure', () => {
       { harnessName: HARNESS, sessionId: 'rs4' },
       { schemaName: src.schemaName },
     );
-    expect(exported.manifest.tables.find(t => t.table === TABLE_HARNESS_WAKEUPS)!.rowCount).toBe(1);
+    expect(exported.manifest.tables.find(t => t.table === TABLE_HARNESS_CHANNEL_BINDINGS)!.rowCount).toBe(1);
 
     const result = await importExecutionClosure(dst.s.db, exported, { schemaName: dst.schemaName });
-    // Exported as evidence; skipped on import — no stale delivery authority.
-    expect(result.skipped[TABLE_HARNESS_WAKEUPS]).toBe(1);
+    // Exported as evidence; skipped on import — the fresh incarnation
+    // re-establishes its own bindings instead of reviving stale routing.
+    expect(result.skipped[TABLE_HARNESS_CHANNEL_BINDINGS]).toBe(1);
     const count = await dst.s.db.one<{ n: string }>(
-      `SELECT count(*)::text AS n FROM "${dst.schemaName}"."${TABLE_HARNESS_WAKEUPS}"`,
+      `SELECT count(*)::text AS n FROM "${dst.schemaName}"."${TABLE_HARNESS_CHANNEL_BINDINGS}"`,
     );
     expect(count.n).toBe('0');
   });
@@ -1328,5 +1511,383 @@ describe('importExecutionClosure', () => {
     const wide = await importExecutionClosure(dst2.s.db, exported, { schemaName: dst2.schemaName });
     expect(wide.status).toBe('imported');
     expect(wide.inserted[TABLE_HARNESS_SESSION_PROJECTION_INTENTS]).toBe(2);
+  });
+
+  it('restores unsettled channel inbox rows — claims clear, mid-delivery rows requeue', async () => {
+    const src = await store('inbox-src');
+    const dst = await store('inbox-dst');
+    const { threadId, resourceId } = await seedClosure(src.s, src.schemaName, 'in1');
+    const now = Date.now();
+    const insertInbox = (id: string, status: string, extra: Record<string, unknown>) =>
+      src.s.db.none(
+        `INSERT INTO "${src.schemaName}"."${TABLE_HARNESS_CHANNEL_INBOX}"
+           (id, harness_name, channel_id, provider_id, idempotency_key, payload_hash,
+            admission_id, binding_id, resource_id, thread_id, session_id,
+            external_message_id, received_at, updated_at, status, attempts,
+            claim_id, claim_expires_at, request_context, content, attachments)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19::jsonb,$20,$21::jsonb)`,
+        [
+          id,
+          HARNESS,
+          'chan-1',
+          'provider-1',
+          `idem-${id}`,
+          'hash-1',
+          `adm-${id}`,
+          'bind-1',
+          resourceId,
+          threadId,
+          'in1',
+          `ext-${id}`,
+          now - 10_000,
+          now,
+          status,
+          extra.attempts ?? 0,
+          extra.claim_id ?? null,
+          extra.claim_expires_at ?? null,
+          '{}',
+          'inbound',
+          '[]',
+        ],
+      );
+    // Mid-delivery on the source: the claim/lease is source authority, so the
+    // row requeues as claimable `received` work instead of parking behind a
+    // lease no destination worker can renew.
+    await insertInbox('in-claimed', 'claimed', {
+      attempts: 1,
+      claim_id: 'src-worker',
+      claim_expires_at: now + 30_000,
+    });
+    // Retryable failure is recovery work the destination re-drives.
+    await insertInbox('in-failed', 'failed', { attempts: 2 });
+    // A terminal row is the idempotency receipt for a provider redelivery.
+    await insertInbox('in-accepted', 'accepted', {});
+
+    const exported = await exportExecutionClosure(
+      src.s.db,
+      { harnessName: HARNESS, sessionId: 'in1' },
+      { schemaName: src.schemaName },
+    );
+    expect((exported.rows[TABLE_HARNESS_CHANNEL_INBOX] ?? []).map(r => r.id).sort()).toEqual([
+      'in-accepted',
+      'in-claimed',
+      'in-failed',
+    ]);
+
+    const result = await importExecutionClosure(dst.s.db, exported, { schemaName: dst.schemaName });
+    expect(result.status).toBe('imported');
+    expect(result.inserted[TABLE_HARNESS_CHANNEL_INBOX]).toBe(3);
+
+    const restored = await dst.s.db.manyOrNone<Record<string, unknown>>(
+      `SELECT id, status, claim_id, claim_expires_at FROM "${dst.schemaName}"."${TABLE_HARNESS_CHANNEL_INBOX}" ORDER BY id`,
+    );
+    const claimed = restored.find(r => r.id === 'in-claimed')!;
+    expect(claimed.status).toBe('received');
+    expect(claimed.claim_id).toBeNull();
+    expect(claimed.claim_expires_at).toBeNull();
+    expect(restored.find(r => r.id === 'in-failed')!.status).toBe('failed');
+    expect(restored.find(r => r.id === 'in-accepted')!.status).toBe('accepted');
+  });
+
+  it('pins the import when the destination has terminal handoff disabled', async () => {
+    const src = await store('nodest-src');
+    const dst = await store('nodest-dst');
+    await seedClosure(src.s, src.schemaName, 'nh1');
+    const now = Date.now();
+    const srcSession = await src.s.db.one<{ session_incarnation: string }>(
+      `SELECT session_incarnation FROM "${src.schemaName}"."${TABLE_HARNESS_SESSIONS}" WHERE id = 'nh1'`,
+    );
+    // A live intent travels in the closure as fence evidence — a destination
+    // that cannot claim it must pin rather than report the unit imported.
+    await src.s.db.none(
+      `INSERT INTO "${src.schemaName}"."${TABLE_HARNESS_TERMINAL_INTENTS}"
+         (id, admission_id, admission_hash, harness_name, session_id, resource_id, thread_id,
+          session_incarnation, grant_key, grant_generation, signal_id, run_id, revision,
+          finalizer_id, finalizer_version, terminal_result_json, projection_json, payload_bytes,
+          status, attempts, claim_id, claim_expires_at, consumer_id, next_attempt_at, last_error_json,
+          created_at, updated_at, acked_at, dead_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29)`,
+      [
+        'intent-nh1',
+        'adm-nh1',
+        'hash-nh1',
+        HARNESS,
+        'nh1',
+        'resource-nh1',
+        'thread-nh1',
+        srcSession.session_incarnation,
+        'grant-nh1',
+        1,
+        'sig-nh1',
+        'run-nh1',
+        1,
+        'finalizer-1',
+        'v1',
+        '{}',
+        '{}',
+        16,
+        'claimed',
+        1,
+        'src-worker',
+        now + 30_000,
+        'src-consumer',
+        null,
+        null,
+        now,
+        now,
+        null,
+        null,
+      ],
+    );
+
+    const exported = await exportExecutionClosure(
+      src.s.db,
+      { harnessName: HARNESS, sessionId: 'nh1' },
+      { schemaName: src.schemaName },
+    );
+    const result = await importExecutionClosure(dst.s.db, exported, {
+      schemaName: dst.schemaName,
+      terminalHandoffEnabled: false,
+    });
+    expect(result.status).toBe('pinned');
+    expect(result.pins).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          reason: 'terminal-handoff-disabled',
+          detail: expect.objectContaining({ sessionId: 'nh1', intentId: 'intent-nh1' }),
+        }),
+      ]),
+    );
+    // The intent still restored as requeued fence evidence — the pin reports
+    // capability, not a dropped row.
+    const intent = await dst.s.db.one<Record<string, unknown>>(
+      `SELECT status, claim_id, consumer_id FROM "${dst.schemaName}"."${TABLE_HARNESS_TERMINAL_INTENTS}" WHERE id = 'intent-nh1'`,
+    );
+    expect(intent.status).toBe('pending');
+    expect(intent.claim_id).toBeNull();
+    expect(intent.consumer_id).toBeNull();
+
+    // With handoff enabled the same closure imports clean.
+    const dst2 = await store('nodest-dst2');
+    const enabled = await importExecutionClosure(dst2.s.db, exported, {
+      schemaName: dst2.schemaName,
+      terminalHandoffEnabled: true,
+    });
+    expect(enabled.status).toBe('imported');
+  });
+
+  it('pins the import when session-record projection is disabled at the destination', async () => {
+    const src = await store('noproj-src');
+    const dst = await store('noproj-dst');
+    await seedClosure(src.s, src.schemaName, 'np1');
+    const exported = await exportExecutionClosure(
+      src.s.db,
+      { harnessName: HARNESS, sessionId: 'np1' },
+      { schemaName: src.schemaName },
+    );
+    // The seeded sessions carry active projection fences — a destination
+    // whose projection domain is off could never apply a restaged intent, so
+    // each fenced session pins instead of going silently stale.
+    const result = await importExecutionClosure(dst.s.db, exported, {
+      schemaName: dst.schemaName,
+      projectionEnabled: false,
+    });
+    expect(result.status).toBe('pinned');
+    expect(result.pins).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          reason: 'session-record-projection-disabled',
+          detail: expect.objectContaining({ sessionId: 'np1' }),
+        }),
+        expect.objectContaining({
+          reason: 'session-record-projection-disabled',
+          detail: expect.objectContaining({ sessionId: 'np1-child' }),
+        }),
+      ]),
+    );
+    const intents = await dst.s.db.one<{ n: string }>(
+      `SELECT count(*)::text AS n FROM "${dst.schemaName}"."${TABLE_HARNESS_SESSION_PROJECTION_INTENTS}"`,
+    );
+    expect(intents.n).toBe('0');
+  });
+
+  it('keeps a historical incarnation stamp on fence rows instead of reviving it', async () => {
+    const src = await store('hist-src');
+    const dst = await store('hist-dst');
+    await seedClosure(src.s, src.schemaName, 'hi1');
+    const now = Date.now();
+    const srcSession = await src.s.db.one<{ session_incarnation: string }>(
+      `SELECT session_incarnation FROM "${src.schemaName}"."${TABLE_HARNESS_SESSIONS}" WHERE id = 'hi1'`,
+    );
+    const insertIntent = (id: string, incarnation: string) =>
+      src.s.db.none(
+        `INSERT INTO "${src.schemaName}"."${TABLE_HARNESS_TERMINAL_INTENTS}"
+           (id, admission_id, admission_hash, harness_name, session_id, resource_id, thread_id,
+            session_incarnation, grant_key, grant_generation, signal_id, run_id, revision,
+            finalizer_id, finalizer_version, terminal_result_json, projection_json, payload_bytes,
+            status, attempts, created_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`,
+        [
+          id,
+          `adm-${id}`,
+          `hash-${id}`,
+          HARNESS,
+          'hi1',
+          'resource-hi1',
+          'thread-hi1',
+          incarnation,
+          `grant-${id}`,
+          1,
+          `sig-${id}`,
+          'run-hi1',
+          1,
+          'finalizer-1',
+          'v1',
+          '{}',
+          '{}',
+          16,
+          'dead',
+          0,
+          now,
+          now,
+        ],
+      );
+    // Only the row stamped with the incarnation the source exported rebinds
+    // to the destination incarnation — a row left behind by an older
+    // incarnation keeps its stamp as dead evidence.
+    await insertIntent('intent-current', srcSession.session_incarnation);
+    await insertIntent('intent-historical', 'incarnation-superseded');
+
+    const exported = await exportExecutionClosure(
+      src.s.db,
+      { harnessName: HARNESS, sessionId: 'hi1' },
+      { schemaName: src.schemaName },
+    );
+    const result = await importExecutionClosure(dst.s.db, exported, { schemaName: dst.schemaName });
+    expect(result.status).toBe('imported');
+
+    const restored = await dst.s.db.manyOrNone<{ id: string; session_incarnation: string }>(
+      `SELECT id, session_incarnation FROM "${dst.schemaName}"."${TABLE_HARNESS_TERMINAL_INTENTS}" ORDER BY id`,
+    );
+    const current = restored.find(r => r.id === 'intent-current')!;
+    expect(current.session_incarnation).toBe(result.incarnations.hi1);
+    const historical = restored.find(r => r.id === 'intent-historical')!;
+    expect(historical.session_incarnation).toBe('incarnation-superseded');
+  });
+
+  it('fails a retry when the destination parent-revision regressed below the imported generation', async () => {
+    const src = await store('rev-src');
+    const dst = await store('rev-dst');
+    const { runId } = await seedClosure(src.s, src.schemaName, 'pr1');
+    const exported = await exportExecutionClosure(
+      src.s.db,
+      { harnessName: HARNESS, sessionId: 'pr1' },
+      { schemaName: src.schemaName },
+    );
+    const first = await importExecutionClosure(dst.s.db, exported, { schemaName: dst.schemaName });
+    expect(first.status).toBe('imported');
+
+    // A foreign row can collide on the parent-revision PK while differing
+    // only in registered lifecycle columns — a stored generation below the
+    // imported one is not a valid successor and must fail closed.
+    await dst.s.db.none(
+      `UPDATE "${dst.schemaName}"."mastra_workflow_parent_revisions"
+       SET generation = generation - 1
+       WHERE workflow_name = 'test-workflow' AND run_id = $1 AND generation >= 1`,
+      [runId],
+    );
+    await expect(importExecutionClosure(dst.s.db, exported, { schemaName: dst.schemaName })).rejects.toThrow(
+      /conflicts with a different destination row/i,
+    );
+
+    // Forward progress is still a valid successor: restore the generation
+    // ahead of the imported row and the retry converges again.
+    await dst.s.db.none(
+      `UPDATE "${dst.schemaName}"."mastra_workflow_parent_revisions"
+       SET generation = generation + 5
+       WHERE workflow_name = 'test-workflow' AND run_id = $1`,
+      [runId],
+    );
+    const converged = await importExecutionClosure(dst.s.db, exported, { schemaName: dst.schemaName });
+    expect(converged.status).toBe('imported');
+  });
+
+  it('converges when a destination worker only renewed the imported session lease', async () => {
+    const src = await store('lease-src');
+    const dst = await store('lease-dst');
+    await seedClosure(src.s, src.schemaName, 'lr1');
+    const exported = await exportExecutionClosure(
+      src.s.db,
+      { harnessName: HARNESS, sessionId: 'lr1' },
+      { schemaName: src.schemaName },
+    );
+    const first = await importExecutionClosure(dst.s.db, exported, { schemaName: dst.schemaName });
+    expect(first.status).toBe('imported');
+
+    // A lease acquisition/renewal touches owner_id + lease_expires_at without
+    // advancing version — a retry must read it as the same row, not a foreign
+    // conflict.
+    await dst.s.db.none(
+      `UPDATE "${dst.schemaName}"."${TABLE_HARNESS_SESSIONS}"
+       SET owner_id = 'dst-worker', lease_expires_at = $1 WHERE id = 'lr1'`,
+      [Date.now() + 60_000],
+    );
+    const second = await importExecutionClosure(dst.s.db, exported, { schemaName: dst.schemaName });
+    expect(second.status).toBe('imported');
+    expect(second.incarnations.lr1).toBe(first.incarnations.lr1);
+    expect(second.skipped[TABLE_HARNESS_SESSIONS]).toBe(2);
+
+    // The destination's live lease was never rewritten by the retry.
+    const row = await dst.s.db.one<{ owner_id: string }>(
+      `SELECT owner_id FROM "${dst.schemaName}"."${TABLE_HARNESS_SESSIONS}" WHERE id = 'lr1'`,
+    );
+    expect(row.owner_id).toBe('dst-worker');
+  });
+
+  it('rejects a payload whose rows bind ids outside the declared closure scope', async () => {
+    const src = await store('scope-src');
+    const dst = await store('scope-dst');
+    await seedClosure(src.s, src.schemaName, 'sc1');
+    const exported = await exportExecutionClosure(
+      src.s.db,
+      { harnessName: HARNESS, sessionId: 'sc1' },
+      { schemaName: src.schemaName },
+    );
+
+    // Forge a row bound to a thread the manifest never declared — the digest
+    // alone cannot reject it because a hand-built manifest can recompute
+    // digests over forged rows, so the verifier checks every payload row's
+    // scope columns against the declared id sets.
+    const forgedMessage = {
+      ...(exported.rows[TABLE_MESSAGES]![0] as Record<string, unknown>),
+      id: `forged-${randomUUID()}`,
+      thread_id: 'thread-never-exported',
+    };
+    const forgedRows = {
+      ...exported.rows,
+      [TABLE_MESSAGES]: [...(exported.rows[TABLE_MESSAGES] ?? []), forgedMessage],
+    };
+    const forgedManifest = buildExecutionClosureManifest({
+      key: exported.manifest.key,
+      sessionIds: exported.manifest.sessionIds,
+      incarnations: exported.manifest.incarnations,
+      threadIds: exported.manifest.threadIds,
+      runIds: exported.manifest.runIds,
+      resourceIds: exported.manifest.resourceIds,
+      channelIds: exported.manifest.channelIds,
+      threadStateKeys: exported.manifest.threadStateKeys,
+      runPairs: exported.manifest.runPairs,
+      rows: forgedRows,
+      pins: exported.manifest.pins,
+    });
+
+    const verified = verifyExecutionClosurePayload(forgedManifest, forgedRows);
+    expect(verified.ok).toBe(false);
+    expect(verified.mismatches).toEqual(
+      expect.arrayContaining([expect.stringContaining('outside the declared closure scope')]),
+    );
+    await expect(
+      importExecutionClosure(dst.s.db, { manifest: forgedManifest, rows: forgedRows }, { schemaName: dst.schemaName }),
+    ).rejects.toThrow(/manifest verification/i);
   });
 });

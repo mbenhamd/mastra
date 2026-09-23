@@ -46,9 +46,9 @@ export interface ExecutionClosureKey {
  *   live authority (tombstones, terminal intents/admissions, delete fences,
  *   projection fences, destination receipts).
  * - `authority` — rows exported as evidence but never restored. Execution
- *   authority (claims, leases, wakeup/delivery schedules, channel bindings/
- *   tokens/outbox, pending attachment/projection work) is re-allocated by the
- *   runtime after import, so stale callbacks and paid attempts cannot revive.
+ *   authority (claims, leases, delivery schedules, channel bindings/tokens,
+ *   pending attachment/projection work) is re-allocated by the runtime after
+ *   import, so stale callbacks and paid attempts cannot revive.
  * - `shared-resource` — shared rows (resource working memory) restored only
  *   when absent so an old archive cannot overwrite current owner controls.
  */
@@ -97,6 +97,25 @@ export interface ExecutionClosureManifest {
   threadIds: string[];
   runIds: string[];
   resourceIds: string[];
+  /**
+   * Channel ids inside the closure (from the exported channel bindings).
+   * Recorded so the verifier can reject a payload row scoped to a channel the
+   * export never claimed — a row-level scope check `harness_name` cannot give.
+   */
+  channelIds?: string[];
+  /**
+   * Encoded `encodeThreadStateScope` keys covered by the closure. Thread-state
+   * rows address threads through this encoded column, so the verifier checks
+   * payload rows against it rather than against raw `threadIds`.
+   */
+  threadStateKeys?: string[];
+  /**
+   * `(workflow_name, run_id)` pairs in scope for run-pair keyed tables
+   * (snapshots, terminalizations, lifecycle/handoff rows). The export unions
+   * session runs with the run pairs those runs reference, so the payload may
+   * legitimately contain run ids outside `runIds` — the pair is the scope.
+   */
+  runPairs?: { workflowName: string; runId: string }[];
   /** Every exported table, sorted by table name. */
   tables: ExecutionClosureTableDigest[];
   /** `pinned` when unknown ancestry/ownership pinned the unit during export. */

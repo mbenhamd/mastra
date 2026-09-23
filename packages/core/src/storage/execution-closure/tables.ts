@@ -161,11 +161,13 @@ export const EXECUTION_CLOSURE_TABLES: Partial<Record<ExecutionClosureTableName,
   [TABLE_HARNESS_TERMINAL_ADMISSIONS]: fence([sessionScope]),
   // Terminal intents carry live delivery state: a `claimed` row's source
   // claim/lease is meaningless on the destination, so the claim fields clear
-  // and the row is re-queued as `pending`. Settled rows (acked/dead/fenced)
+  // and the row is re-queued as `pending`. `consumer_id` clears too — it
+  // records which destination worker owns the live claim, and a source-era
+  // consumer id is meaningless on import. Settled rows (acked/dead/fenced)
   // stay durable evidence. The claim scan does not consult the session
   // incarnation, so without the requeue a stale claim could stall delivery
   // for the full source lease.
-  [TABLE_HARNESS_TERMINAL_INTENTS]: fence([sessionScope], false, ['claim_id', 'claim_expires_at'], {
+  [TABLE_HARNESS_TERMINAL_INTENTS]: fence([sessionScope], false, ['claim_id', 'claim_expires_at', 'consumer_id'], {
     statusColumn: 'status',
     from: ['claimed'],
     to: 'pending',
@@ -189,7 +191,20 @@ export const EXECUTION_CLOSURE_TABLES: Partial<Record<ExecutionClosureTableName,
   [TABLE_HARNESS_SESSION_PROJECTION_PRESSURE]: authority([], true),
 
   // --- Channel queues/signals: receipts stay readable, delivery authority resets ---
-  [TABLE_HARNESS_CHANNEL_INBOX]: authority([sessionScope, threadScope()]),
+  // Inbox rows are durable inbound work plus the idempotency receipt for what
+  // already landed: `received`/`admitted`/`failed` rows are claimable
+  // recovery states the destination redrives, and `accepted`/`queued`/`dead`
+  // rows are the dedup evidence a provider redelivery resolves against —
+  // dropping either breaks exactly-once delivery across migration. A source
+  // claim/lease is meaningless on the destination, so claim fields clear and
+  // a `claimed` row requeues as `received` — the claim scan only claims
+  // `received`/`admitted`/`failed`, so a verbatim `claimed` restore would
+  // park the row behind a lease no destination worker can renew.
+  [TABLE_HARNESS_CHANNEL_INBOX]: fence([sessionScope, threadScope()], false, ['claim_id', 'claim_expires_at'], {
+    statusColumn: 'status',
+    from: ['claimed'],
+    to: 'received',
+  }),
   [TABLE_HARNESS_CHANNEL_BINDINGS]: authority([sessionScope, threadScope()]),
   [TABLE_HARNESS_CHANNEL_ACTION_TOKENS]: authority([{ column: 'owning_session_id', dimension: 'session' }]),
   // Action receipts are the durable idempotency ledger for action tokens —
@@ -215,7 +230,19 @@ export const EXECUTION_CLOSURE_TABLES: Partial<Record<ExecutionClosureTableName,
     ['claim_id', 'claim_expires_at'],
     { statusColumn: 'status', from: ['claimed'], to: 'pending' },
   ),
-  [TABLE_HARNESS_WAKEUPS]: authority([sessionScope]),
+  // Wakeups are durable work for the migrated session itself: `due`/`failed`
+  // rows are claimable recovery states and `claimed` rows are mid-delivery —
+  // dropping them strands scheduled work the session still owes, and a
+  // verbatim `claimed` import would park the row behind a source lease no
+  // destination worker can renew. Terminal rows (queued/completed/dead) stay
+  // as evidence. Claim fields clear (claimed_at included — the state machine
+  // treats it as claim metadata that only a `claimed` row may carry) and a
+  // `claimed` row requeues as `due`.
+  [TABLE_HARNESS_WAKEUPS]: fence([sessionScope], false, ['claim_id', 'claim_expires_at', 'claimed_at'], {
+    statusColumn: 'status',
+    from: ['claimed'],
+    to: 'due',
+  }),
   // Provider callback bindings are provider-scoped shared routing state —
   // exported as evidence; a fresh incarnation re-establishes its own and an
   // import never revives stale routing. The rows bind through `channel_id`

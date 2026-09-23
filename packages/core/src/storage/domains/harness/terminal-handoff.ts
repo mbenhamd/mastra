@@ -166,6 +166,8 @@ export interface HarnessTerminalIntent extends HarnessTerminalIdentity {
   attempts: number;
   claimId?: string;
   claimExpiresAt?: number;
+  /** Which consumer holds the live claim; ack/fail/renew identities must match it. */
+  consumerId?: string;
   nextAttemptAt?: number;
   lastError?: HarnessTerminalError;
   createdAt: number;
@@ -516,7 +518,13 @@ function sortJson(value: JsonValue): JsonValue {
   return value;
 }
 
-function assertJsonValue(value: unknown, path: string, depth = 0): asserts value is JsonValue {
+/**
+ * Bounded-JSON validation for terminal-handoff payloads: plain objects and
+ * arrays only, finite numbers, bounded key length and nesting depth. A cyclic
+ * graph exhausts the depth bound here rather than overflowing the recursive
+ * canonical hashers that consume the value afterwards.
+ */
+export function assertJsonValue(value: unknown, path: string, depth = 0): asserts value is JsonValue {
   if (depth > MAX_HARNESS_TERMINAL_JSON_DEPTH) {
     throw new HarnessTerminalHandoffValidationError(path, `exceeds ${MAX_HARNESS_TERMINAL_JSON_DEPTH} nesting levels`);
   }
