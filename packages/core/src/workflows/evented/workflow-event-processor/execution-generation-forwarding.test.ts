@@ -349,4 +349,158 @@ describe('updateWorkflowResults executionGeneration forwarding', () => {
       context: {},
     });
   });
+
+  it('gates step lifecycle publications on the persisted execution generation', async () => {
+    const storage = new MockStore();
+    const pubsub = new EventEmitterPubSub();
+    const step = createStep({
+      id: 'gated-step',
+      inputSchema: z.object({}),
+      outputSchema: z.object({ value: z.string() }),
+      execute: async () => ({ value: 'done' }),
+    });
+    const workflow = createWorkflow({
+      id: `stale-publish-${Math.random().toString(36).slice(2)}`,
+      inputSchema: z.object({}),
+      outputSchema: z.object({ value: z.string() }),
+    })
+      .then(step)
+      .commit();
+    const mastra = new Mastra({ logger: false, storage, pubsub, workflows: { [workflow.id]: workflow } });
+    const workflowsStore = (await storage.getStore('workflows'))!;
+
+    // A real run stamps the snapshot with the reopened lifetime's generation;
+    // the arriving step-end event still carries the deleted lifetime's.
+    const runId = `run-${Math.random().toString(36).slice(2)}`;
+    await workflow.createRun({ runId });
+    const pending = (await workflowsStore.loadWorkflowSnapshot({ workflowName: workflow.id, runId }))!;
+    const reopenedGeneration = pending.executionGeneration!;
+    expect(reopenedGeneration).toBeTruthy();
+
+    const resultWrites = vi.spyOn(workflowsStore, 'updateWorkflowResults');
+    const lifecycleEvents: string[] = [];
+    const engineEvents: string[] = [];
+    const publish = pubsub.publish.bind(pubsub);
+    vi.spyOn(pubsub, 'publish').mockImplementation(async (topic, event) => {
+      const type = (event as { type: string }).type;
+      if (type === 'workflow.lifecycle') lifecycleEvents.push(type);
+      if (topic === 'workflows') engineEvents.push(type);
+      return publish(topic, event);
+    });
+
+    const processor = new WorkflowEventProcessor({ mastra });
+    const handled = await processor.handle({
+      type: 'workflow.step.end',
+      id: 'evt-stale-publish',
+      runId,
+      createdAt: new Date(),
+      data: {
+        workflowId: workflow.id,
+        runId,
+        executionGeneration: 'wfeg:deleted-lifetime',
+        executionPath: [0],
+        prevResult: {
+          status: 'success',
+          output: { value: 'done' },
+          payload: {},
+          startedAt: 1,
+          endedAt: 2,
+        },
+        stepResults: {},
+        activeStepsPath: {},
+        resumeSteps: [],
+        requestContext: {},
+        lifecycleStepStates: {},
+      },
+    });
+
+    // The stale delivery stopped before any lifecycle or engine event — no
+    // step.completed/step.finished for a step the reopened run never ran —
+    // and never reached a result write at all.
+    expect(handled).toEqual({ ok: true });
+    expect(resultWrites).not.toHaveBeenCalled();
+    expect(lifecycleEvents).toEqual([]);
+    expect(engineEvents).toEqual([]);
+  });
+
+  it('stops the suspension flow when the guarded state update rejects a stale generation', async () => {
+    const storage = new MockStore();
+    const pubsub = new EventEmitterPubSub();
+    const suspendingStep = createStep({
+      id: 'guarded-suspend-step',
+      inputSchema: z.object({}),
+      suspendSchema: z.object({ reason: z.string() }),
+      outputSchema: z.object({ value: z.string() }),
+      execute: async () => ({ value: 'done' }),
+    });
+    const workflow = createWorkflow({
+      id: `stale-suspend-${Math.random().toString(36).slice(2)}`,
+      inputSchema: z.object({}),
+      outputSchema: z.object({ value: z.string() }),
+    })
+      .then(suspendingStep)
+      .commit();
+    const mastra = new Mastra({ logger: false, storage, pubsub, workflows: { [workflow.id]: workflow } });
+    const workflowsStore = (await storage.getStore('workflows'))!;
+
+    const runId = `run-${Math.random().toString(36).slice(2)}`;
+    await workflow.createRun({ runId });
+    const pending = (await workflowsStore.loadWorkflowSnapshot({ workflowName: workflow.id, runId }))!;
+    const generation = pending.executionGeneration!;
+    expect(generation).toBeTruthy();
+
+    // Answer the state CAS the way a reopened-lifetime adapter does: the
+    // persisted generation moved, so the guard rejects the update.
+    const stateUpdates = vi.spyOn(workflowsStore, 'updateWorkflowState').mockResolvedValue(undefined);
+    const engineEvents: string[] = [];
+    const publish = pubsub.publish.bind(pubsub);
+    vi.spyOn(pubsub, 'publish').mockImplementation(async (topic, event) => {
+      if (topic === 'workflows') engineEvents.push((event as { type: string }).type);
+      return publish(topic, event);
+    });
+
+    const processor = new WorkflowEventProcessor({ mastra });
+    const handled = await processor.handle({
+      type: 'workflow.step.end',
+      id: 'evt-stale-suspend',
+      runId,
+      createdAt: new Date(),
+      data: {
+        workflowId: workflow.id,
+        runId,
+        executionGeneration: generation,
+        executionPath: [0],
+        prevResult: {
+          status: 'suspended',
+          output: undefined,
+          payload: {},
+          startedAt: 1,
+          suspendPayload: { reason: 'waiting' },
+        },
+        stepResults: {},
+        activeStepsPath: {},
+        resumeSteps: [],
+        requestContext: {},
+        lifecycleStepStates: {},
+      },
+    });
+
+    // The suspension state write ran under the same CAS the result writes
+    // carry, and its rejection stopped the flow before workflow.suspend could
+    // publish for the stale lifetime.
+    expect(handled).toEqual({ ok: true });
+    expect(stateUpdates).toHaveBeenCalled();
+    const suspensionUpdate = stateUpdates.mock.calls.find(
+      ([args]) => (args as { opts?: { status?: string } }).opts?.status === 'suspended',
+    );
+    expect(suspensionUpdate).toBeTruthy();
+    expect(
+      (
+        suspensionUpdate![0] as {
+          opts: { expectedExecutionGeneration?: string };
+        }
+      ).opts.expectedExecutionGeneration,
+    ).toBe(generation);
+    expect(engineEvents).not.toContain('workflow.suspend');
+  });
 });

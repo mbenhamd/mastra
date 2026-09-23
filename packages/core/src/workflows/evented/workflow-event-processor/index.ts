@@ -3582,18 +3582,27 @@ export class WorkflowEventProcessor extends EventProcessor {
           return;
         }
         const suspendTracingContext = this.resolveSuspendTracingContext(runId);
-        await workflowsStore?.updateWorkflowState({
+        const suspendedState = await workflowsStore?.updateWorkflowState({
           workflowName: workflowId,
           runId,
           opts: {
             status: 'suspended',
             ...lifecycleExecution,
+            // CAS against the same generation the result write above was
+            // fenced on: a delete+reopen between them must not let this stale
+            // suspension overwrite the reopened run's state.
+            expectedExecutionGeneration: lifecycleExecution.executionGeneration,
             result: { status: 'suspended' } as any,
             suspendedPaths,
             resumeLabels,
             ...(suspendTracingContext ? { tracingContext: suspendTracingContext } : {}),
           },
         });
+        // A guard miss (or a run record already gone) means the reopened
+        // lifetime owns the row — stop before pruning or publishing.
+        if (workflowsStore !== undefined && suspendedState === undefined) {
+          return;
+        }
         await this.pruneAndRepersistSnapshot({ workflow, workflowId, runId });
       }
       await this.mastra.pubsub.publish('workflows', {
@@ -3749,6 +3758,28 @@ export class WorkflowEventProcessor extends EventProcessor {
     const workflowsStore = await this.mastra.getStorage()?.getStore('workflows');
 
     if (isExecutableStep(step)) {
+      // Lifecycle events describe durable completion: emitting them before the
+      // fenced result writes below lets a stale-lifetime handler announce a
+      // step the reopened run never executed. Gate the publications on the
+      // same generation the writes CAS against — a persisted generation that
+      // already moved on means every later fenced write would be rejected, so
+      // this delivery stops before publishing anything. Snapshots that cannot
+      // prove a generation (missing row, pre-generation storage) keep the
+      // legacy ordering; the write fences below still halt the race window.
+      if (workflowsStore !== undefined && executionGeneration !== undefined) {
+        const fenceSnapshot = await workflowsStore.loadWorkflowSnapshot({
+          workflowName: workflowId,
+          runId,
+        });
+        if (
+          fenceSnapshot !== null &&
+          fenceSnapshot !== undefined &&
+          fenceSnapshot.executionGeneration !== undefined &&
+          fenceSnapshot.executionGeneration !== executionGeneration
+        ) {
+          return;
+        }
+      }
       const { state: lifecycleStepState } = getOrCreateWorkflowStepLifecycleState({
         workflowId,
         runId,
@@ -4255,12 +4286,15 @@ export class WorkflowEventProcessor extends EventProcessor {
             }
 
             const suspendTracingContext = this.resolveSuspendTracingContext(runId);
-            await workflowsStore?.updateWorkflowState({
+            const suspendedState = await workflowsStore?.updateWorkflowState({
               workflowName: workflowId,
               runId,
               opts: {
                 status: 'suspended',
                 ...lifecycleExecution,
+                // Same stale-generation guard as the fenced result writes: a
+                // reopen between them must not inherit this suspension.
+                expectedExecutionGeneration: lifecycleExecution.executionGeneration,
                 result: foreachSuspendResult,
                 suspendedPaths,
                 resumeLabels: suspension.resumeLabels,
@@ -4269,6 +4303,9 @@ export class WorkflowEventProcessor extends EventProcessor {
                 ...(suspendTracingContext ? { tracingContext: suspendTracingContext } : {}),
               },
             });
+            if (workflowsStore !== undefined && suspendedState === undefined) {
+              return;
+            }
             await this.pruneAndRepersistSnapshot({ workflow, workflowId, runId });
           }
 
@@ -4512,12 +4549,15 @@ export class WorkflowEventProcessor extends EventProcessor {
         }
 
         const suspendTracingContext = this.resolveSuspendTracingContext(runId);
-        await workflowsStore?.updateWorkflowState({
+        const suspendedState = await workflowsStore?.updateWorkflowState({
           workflowName: workflowId,
           runId,
           opts: {
             status: 'suspended',
             ...lifecycleExecution,
+            // CAS against the generation the result writes above were fenced
+            // on — a reopen between them must not inherit this suspension.
+            expectedExecutionGeneration: lifecycleExecution.executionGeneration,
             result: prevResult,
             suspendedPaths,
             resumeLabels,
@@ -4526,6 +4566,9 @@ export class WorkflowEventProcessor extends EventProcessor {
             ...(suspendTracingContext ? { tracingContext: suspendTracingContext } : {}),
           },
         });
+        if (workflowsStore !== undefined && suspendedState === undefined) {
+          return;
+        }
         await this.pruneAndRepersistSnapshot({ workflow, workflowId, runId });
       }
 
