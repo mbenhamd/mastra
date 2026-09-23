@@ -6,6 +6,15 @@ import type { UpdateWorkflowStateOptions } from '../storage/types';
 import { createWorkflow } from './create';
 import { createStep } from './workflow';
 
+const getOrCreateSpanMock = vi.fn();
+vi.mock('../observability', async importOriginal => {
+  const actual = await importOriginal<typeof import('../observability')>();
+  return {
+    ...actual,
+    getOrCreateSpan: (...args: any[]) => getOrCreateSpanMock(...args) ?? (actual.getOrCreateSpan as any)(...args),
+  };
+});
+
 /**
  * Restart and time travel mint a fresh lifecycle generation, so on stores that
  * fence the row's lifetime discriminator their ownership claim must name the
@@ -191,6 +200,149 @@ describe('restart lifecycle claim', () => {
     expect(claim).not.toHaveProperty('expectedExecutionGeneration');
     expect(claim).not.toHaveProperty('expectedLifecycleResumeAttempt');
     expect(claim).not.toHaveProperty('expectedStatus');
+    await mastra.shutdown();
+  });
+
+  /**
+   * A step that suspends on its first execution and succeeds on re-execution,
+   * so the winning restart/time travel ends `success` — distinguishable from
+   * the `suspended` in-memory status the shared Run handle held before the race.
+   */
+  function createOnceSuspendedWorkflow() {
+    let workExecutions = 0;
+
+    const workStep = createStep({
+      id: 'work',
+      inputSchema: z.object({ item: z.string() }),
+      outputSchema: z.object({ done: z.boolean() }),
+      suspendSchema: z.object({ reason: z.string() }),
+      execute: async ({ suspend }) => {
+        workExecutions++;
+        if (workExecutions === 1) {
+          await suspend({ reason: 'pause once' });
+          return { done: false };
+        }
+        return { done: true };
+      },
+    });
+
+    const workflow = createWorkflow({
+      id: 'restart-race-wf',
+      inputSchema: z.object({ item: z.string() }),
+      outputSchema: z.object({ done: z.boolean() }),
+      steps: [workStep],
+      options: { validateInputs: false },
+    })
+      .then(workStep)
+      .commit();
+
+    return { workflow, getWorkExecutions: () => workExecutions };
+  }
+
+  it('keeps the winning generation on the shared run when two restarts race', async () => {
+    getOrCreateSpanMock.mockReset();
+    const storage = new MockStore();
+    const { workflow, getWorkExecutions } = createOnceSuspendedWorkflow();
+    const mastra = new Mastra({
+      storage,
+      workflows: { 'restart-race-wf': workflow },
+      logger: false,
+    });
+
+    const run = await workflow.createRun();
+    const started = await run.start({ inputData: { item: 'widget' } });
+    expect(started.status).toBe('suspended');
+    expect(run.workflowRunStatus).toBe('suspended');
+
+    const workflowsStore = await storage.getStore('workflows');
+    const suspended = await workflowsStore.loadWorkflowSnapshot({
+      workflowName: 'restart-race-wf',
+      runId: run.runId,
+    });
+    // The stranded `running` shape a recovery sweep restarts: both callers read
+    // the same generation before either compare-and-set lands.
+    await workflowsStore.persistWorkflowSnapshot({
+      workflowName: 'restart-race-wf',
+      runId: run.runId,
+      snapshot: {
+        ...suspended!,
+        status: 'running',
+        suspendedPaths: {},
+        activePaths: [0],
+        activeStepsPath: { work: [0] },
+      },
+    });
+
+    const losingSpanError = vi.fn();
+    // The second workflow-run span belongs to the losing caller: the first
+    // restart() reaches getOrCreateSpan first in this interleaving.
+    getOrCreateSpanMock.mockReturnValueOnce(undefined).mockReturnValueOnce({
+      id: 'losing-restart-span',
+      externalTraceId: 'losing-restart-trace',
+      error: losingSpanError,
+    });
+
+    const settled = await Promise.allSettled([run.restart(), run.restart()]);
+    const fulfilled = settled.filter(
+      (outcome): outcome is PromiseFulfilledResult<Awaited<ReturnType<typeof run.restart>>> =>
+        outcome.status === 'fulfilled',
+    );
+    const rejected = settled.filter((outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected');
+
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect((rejected[0]!.reason as { id?: string }).id).toBe('WORKFLOW_RESTART_NOT_CLAIMED');
+    expect(fulfilled[0]!.value.status).toBe('success');
+
+    // The loser never entered the engine: one original suspend plus the
+    // winner's re-execution, never a losing pass.
+    expect(getWorkExecutions()).toBe(2);
+
+    // The losing candidate must not overwrite the winning lineage on this
+    // shared Run handle — the winner's terminal commit still lands on it.
+    expect(run.workflowRunStatus).toBe('success');
+
+    // The claim loss is traced on the losing workflow span, which ends with it.
+    expect(losingSpanError).toHaveBeenCalledTimes(1);
+    const spanError = losingSpanError.mock.calls[0]?.[0] as { error?: { id?: string }; endSpan?: boolean } | undefined;
+    expect(spanError?.error?.id).toBe('WORKFLOW_RESTART_NOT_CLAIMED');
+    expect(spanError?.endSpan).toBe(true);
+
+    const stored = await workflowsStore.loadWorkflowSnapshot({
+      workflowName: 'restart-race-wf',
+      runId: run.runId,
+    });
+    expect(stored?.status).toBe('success');
+    await mastra.shutdown();
+  });
+
+  it('keeps the winning generation on the shared run when two time travels race', async () => {
+    const storage = new MockStore();
+    const { workflow, getWorkExecutions } = createOnceSuspendedWorkflow();
+    const mastra = new Mastra({
+      storage,
+      workflows: { 'restart-race-wf': workflow },
+      logger: false,
+    });
+
+    const run = await workflow.createRun();
+    const started = await run.start({ inputData: { item: 'widget' } });
+    expect(started.status).toBe('suspended');
+    expect(run.workflowRunStatus).toBe('suspended');
+
+    const settled = await Promise.allSettled([run.timeTravel({ step: 'work' }), run.timeTravel({ step: 'work' })]);
+    const fulfilled = settled.filter(
+      (outcome): outcome is PromiseFulfilledResult<Awaited<ReturnType<typeof run.timeTravel>>> =>
+        outcome.status === 'fulfilled',
+    );
+    const rejected = settled.filter((outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected');
+
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect((rejected[0]!.reason as { id?: string }).id).toBe('WORKFLOW_RESTART_NOT_CLAIMED');
+    expect(fulfilled[0]!.value.status).toBe('success');
+    expect(getWorkExecutions()).toBe(2);
+    expect(run.workflowRunStatus).toBe('success');
     await mastra.shutdown();
   });
 });

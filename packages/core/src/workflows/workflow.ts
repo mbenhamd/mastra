@@ -3928,23 +3928,50 @@ export class Run<
     this.#admittedCancellation = undefined;
   }
 
+  /**
+   * @internal Mint a fresh lifecycle identity without mutating this shared Run
+   * handle. Restart and time travel build the candidate first and adopt it only
+   * after their storage claim succeeds, so a losing caller never overwrites the
+   * winning generation's lineage.
+   */
+  protected createLifecycleExecution(): {
+    executionGeneration: WorkflowExecutionGeneration;
+    lifecycleResumeAttempt: number;
+    lifecycleStepStates: WorkflowStepLifecycleStateMap;
+  } {
+    return {
+      executionGeneration: createWorkflowExecutionGeneration(),
+      lifecycleResumeAttempt: 0,
+      lifecycleStepStates: {},
+    };
+  }
+
+  /**
+   * @internal Adopt a lifecycle lineage on this shared Run handle, replacing
+   * execution-scoped cancellation and uncommitted terminal state. Only a caller
+   * that owns the lineage — or needs no durable claim — may invoke this.
+   */
+  protected adoptLifecycleExecution(lifecycleExecution: {
+    executionGeneration: WorkflowExecutionGeneration;
+    lifecycleResumeAttempt: number;
+    lifecycleStepStates: WorkflowStepLifecycleStateMap;
+  }): void {
+    this.resetAbortController();
+    this.#committedTerminalStatus = undefined;
+    this.#executionGeneration = lifecycleExecution.executionGeneration;
+    this.#lifecycleResumeAttempt = lifecycleExecution.lifecycleResumeAttempt;
+    this.#lifecycleStepStates = lifecycleExecution.lifecycleStepStates;
+  }
+
   /** @internal Establish a fresh lifecycle lineage for start, restart, or time travel. */
   protected beginLifecycleExecution(): {
     executionGeneration: WorkflowExecutionGeneration;
     lifecycleResumeAttempt: number;
     lifecycleStepStates: WorkflowStepLifecycleStateMap;
   } {
-    this.resetAbortController();
-    this.#committedTerminalStatus = undefined;
-    const executionGeneration = createWorkflowExecutionGeneration();
-    this.#executionGeneration = executionGeneration;
-    this.#lifecycleResumeAttempt = 0;
-    this.#lifecycleStepStates = {};
-    return {
-      executionGeneration,
-      lifecycleResumeAttempt: this.#lifecycleResumeAttempt,
-      lifecycleStepStates: this.#lifecycleStepStates,
-    };
+    const lifecycleExecution = this.createLifecycleExecution();
+    this.adoptLifecycleExecution(lifecycleExecution);
+    return lifecycleExecution;
   }
 
   /** @internal Reuse a lineage reserved by a pre-start lifecycle subscriber. */
@@ -5738,16 +5765,28 @@ export class Run<
       mastra: this.#mastra,
     });
 
-    this.workflowRunSpan = workflowSpan;
     const traceId = workflowSpan?.externalTraceId;
     const spanId = workflowSpan?.id;
 
-    const lifecycleExecution = this.beginLifecycleExecution();
-    await this.claimRestartLifecycleExecution({
-      workflowsStore,
-      snapshot,
-      lifecycleExecution,
-    });
+    // Mint the candidate lineage without mutating this shared Run handle: a
+    // restart that loses the claim must leave the winning generation's
+    // identity, abort controller, and run span untouched. The candidate is
+    // adopted only after the compare-and-set succeeds — the same claim-first
+    // ordering _resume uses for its suspension claim.
+    const lifecycleExecution = this.createLifecycleExecution();
+    try {
+      await this.claimRestartLifecycleExecution({
+        workflowsStore,
+        snapshot,
+        lifecycleExecution,
+      });
+    } catch (error) {
+      workflowSpan?.error({ error: getErrorFromUnknown(error), endSpan: true });
+      throw error;
+    }
+
+    this.adoptLifecycleExecution(lifecycleExecution);
+    this.workflowRunSpan = workflowSpan;
 
     const result = await this.#withActiveExecution(lifecycleExecution.executionGeneration, () =>
       this.executionEngine.execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({
@@ -5898,16 +5937,28 @@ export class Run<
       mastra: this.#mastra,
     });
 
-    this.workflowRunSpan = workflowSpan;
     const traceId = workflowSpan?.externalTraceId;
     const spanId = workflowSpan?.id;
 
-    const lifecycleExecution = this.beginLifecycleExecution();
-    await this.claimRestartLifecycleExecution({
-      workflowsStore,
-      snapshot,
-      lifecycleExecution,
-    });
+    // Mint the candidate lineage without mutating this shared Run handle: a
+    // time travel that loses the claim must leave the winning generation's
+    // identity, abort controller, and run span untouched. The candidate is
+    // adopted only after the compare-and-set succeeds — the same claim-first
+    // ordering _resume uses for its suspension claim.
+    const lifecycleExecution = this.createLifecycleExecution();
+    try {
+      await this.claimRestartLifecycleExecution({
+        workflowsStore,
+        snapshot,
+        lifecycleExecution,
+      });
+    } catch (error) {
+      workflowSpan?.error({ error: getErrorFromUnknown(error), endSpan: true });
+      throw error;
+    }
+
+    this.adoptLifecycleExecution(lifecycleExecution);
+    this.workflowRunSpan = workflowSpan;
 
     const result = await this.#withActiveExecution(lifecycleExecution.executionGeneration, () =>
       this.executionEngine.execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({

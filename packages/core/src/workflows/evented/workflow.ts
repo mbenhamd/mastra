@@ -89,6 +89,7 @@ import type {
 } from '../../workflows/types';
 import { PUBSUB_SYMBOL, STREAM_FORMAT_SYMBOL, TRANSIENT_EXECUTION_SYMBOL } from '../constants';
 import { createWorkflowExecutionGeneration, requireWorkflowExecutionGeneration } from '../lifecycle-events';
+import type { WorkflowExecutionGeneration, WorkflowStepLifecycleStateMap } from '../lifecycle-events';
 import { validateCron } from '../scheduler/cron';
 import type { WorkflowScheduleConfig } from '../scheduler/types';
 import { getEntryId } from '../step-entry';
@@ -1969,16 +1970,19 @@ export class EventedRun<
     this.setupAbortHandler();
   }
 
-  protected override beginLifecycleExecution() {
+  protected override adoptLifecycleExecution(lifecycleExecution: {
+    executionGeneration: WorkflowExecutionGeneration;
+    lifecycleResumeAttempt: number;
+    lifecycleStepStates: WorkflowStepLifecycleStateMap;
+  }) {
     // Restart/time-travel creates a new execution lineage on the same Run
     // handle. Cancellation state is lineage-scoped too: an already-aborted
     // controller and a memoized cancel dispatch from the previous generation
     // must never leak into the new one.
     this.detachAbortHandler();
     this.cancelDispatchPromise = undefined;
-    const lifecycleExecution = super.beginLifecycleExecution();
+    super.adoptLifecycleExecution(lifecycleExecution);
     this.setupAbortHandler();
-    return lifecycleExecution;
   }
 
   /**
