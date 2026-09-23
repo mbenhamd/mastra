@@ -18,6 +18,7 @@ import { ErrorCategory, ErrorDomain, MastraError } from '../../error';
 import {
   HarnessStorageAdmissionConflictError,
   HarnessStorageVersionConflictError,
+  HarnessTerminalHandoffUnsupportedError,
   harnessTerminalAdmissionId,
   harnessTerminalIntentId,
 } from '../../storage/domains/harness';
@@ -784,6 +785,50 @@ describe('Session.message() — default path', () => {
 
     releaseRun();
     await expect(first).resolves.toMatchObject({ text: 'first done' });
+  });
+
+  it('rejects a terminal admission before the pending reservation when storage loses handoff support', async () => {
+    const storage = new InMemoryHarness({
+      db: new InMemoryDB(),
+      terminalHandoff: { enabled: true },
+      sessionRecordProjection: { enabled: true },
+    });
+    const { harness, agent } = setupHarness({
+      agents: { default: new MockAgent({ id: 'default', defaultOutput: { text: 'done' } }) },
+      sessions: {
+        storage,
+        terminalHandoff: {
+          finalizer: {
+            id: 'doxa.chat',
+            version: '2026-09-20',
+            finalize: async () => ({
+              projectionKind: 'chat.summary',
+              projectionId: 'response-1',
+              payload: {},
+            }),
+          },
+        },
+      },
+    });
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    // `supportsTerminalHandoff` is a per-call adapter capability, not a
+    // construction-time constant: an adapter may legitimately flip it (a store
+    // built without the terminal tables, a fenced migration target). The
+    // unsupported verdict must land before the durable pending reservation is
+    // written, or the evidence row strands unsettleable.
+    vi.spyOn(storage, 'supportsTerminalHandoff', 'get').mockReturnValue(false);
+    const writeSpy = vi.spyOn(storage, 'writeMessageResultEvidence');
+
+    await expect(
+      session.message({
+        content: 'unsupported',
+        admissionId: 'unsupported-admission',
+        executionAuthorityGrant: { key: 'usage-claim-unsupported', generation: 1 },
+        terminalAdmissionSeed: { v: 1 },
+      }),
+    ).rejects.toBeInstanceOf(HarnessTerminalHandoffUnsupportedError);
+    expect(writeSpy).not.toHaveBeenCalled();
+    expect(agent.streamCalls).toHaveLength(0);
   });
 
   it('replays the durable receipt to a settled retry’s terminal observer', async () => {

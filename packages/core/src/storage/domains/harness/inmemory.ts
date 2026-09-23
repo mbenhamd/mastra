@@ -1657,17 +1657,13 @@ export class InMemoryHarness extends HarnessStorage {
     if (stored.status === 'committed') {
       // A committed replay must still resolve to `duplicate` after the
       // message-result evidence row is compacted or deleted — the persisted
-      // intent is itself durable proof of the committed outcome. Evidence is
-      // compared only when it still exists.
-      if (!existingIntent || !sameTerminalIntentValue(existingIntent, terminalResult, projection)) {
-        throw new HarnessTerminalHandoffIdentityConflictError(stored.executionGrant.key);
-      }
-      if (
-        currentEvidence &&
-        (!sameMessageEvidenceIdentity(currentEvidence, resultEvidence) ||
-          currentEvidence.status !== 'completed' ||
-          stableJsonString(currentEvidence.result) !== stableJsonString(resultEvidence.result))
-      ) {
+      // intent is itself durable proof of the committed outcome. Every
+      // durable identity field already matched above, so the only remaining
+      // divergence a racing committer can carry is in the finalizer's own
+      // payload bytes (a nondeterministic winner-vs-loser difference, never a
+      // different operation): replay the sealed receipt rather than reporting
+      // an identity conflict. A missing intent is corruption, not a race.
+      if (!existingIntent) {
         throw new HarnessTerminalHandoffIdentityConflictError(stored.executionGrant.key);
       }
       return {

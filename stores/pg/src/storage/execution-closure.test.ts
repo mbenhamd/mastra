@@ -2,9 +2,14 @@ import { randomUUID } from 'node:crypto';
 
 import { createSampleMessageV2, createSampleResource, createSampleSessionRecord } from '@internal/storage-test-utils';
 import {
+  TABLE_BACKGROUND_TASKS,
   TABLE_HARNESS_ATTACHMENTS,
+  TABLE_HARNESS_ATTACHMENT_OPERATIONS,
+  TABLE_HARNESS_CHANNEL_BINDINGS,
+  TABLE_HARNESS_CHANNEL_OUTBOX,
   TABLE_HARNESS_MESSAGE_RESULTS,
   TABLE_HARNESS_OPERATION_TOMBSTONES,
+  TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS,
   TABLE_HARNESS_SESSIONS,
   TABLE_HARNESS_SESSION_PROJECTION_INTENTS,
   TABLE_HARNESS_TERMINAL_INTENTS,
@@ -13,8 +18,10 @@ import {
   TABLE_OBSERVATIONAL_MEMORY,
   TABLE_RESOURCES,
   TABLE_THREADS,
+  TABLE_THREAD_STATE,
   TABLE_WORKFLOW_SNAPSHOT,
   TABLE_WORKFLOW_SNAPSHOT_HANDOFF,
+  encodeThreadStateScope,
   verifyExecutionClosurePayload,
 } from '@mastra/core/storage';
 import { afterAll, describe, expect, it, vi } from 'vitest';
@@ -32,7 +39,7 @@ function closureStore(id: string, schemaName: string) {
     ...TEST_CONFIG,
     id,
     schemaName,
-    enabledDomains: ['harness', 'memory', 'workflows', 'threadState'],
+    enabledDomains: ['harness', 'memory', 'workflows', 'threadState', 'backgroundTasks'],
     sessionRecordProjection: { enabled: true },
   });
 }
@@ -484,6 +491,258 @@ describe('exportExecutionClosure', () => {
     expect(byTable[TABLE_OBSERVATIONAL_MEMORY]!.role).toBe('state');
     expect(byTable[TABLE_RESOURCES]!.role).toBe('shared-resource');
   });
+
+  it('scopes provider callback bindings to closure channels instead of leaking harness-wide routing', async () => {
+    const { s, schemaName } = await store('callbacks');
+    const { threadId, resourceId } = await seedClosure(s, schemaName, 'cb1');
+    const now = Date.now();
+    const insertBinding = (id: string, channelId: string, sessionId: string, bindingThreadId: string) =>
+      s.db.none(
+        `INSERT INTO "${schemaName}"."${TABLE_HARNESS_CHANNEL_BINDINGS}"
+           (id, harness_name, channel_id, provider_id, status, platform,
+            external_tenant_id, external_channel_id, external_thread_id,
+            resource_id, thread_id, session_id, mode, generation,
+            created_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+        [
+          id,
+          HARNESS,
+          channelId,
+          'provider-1',
+          'active',
+          'test',
+          'tenant',
+          `ext-${channelId}`,
+          'ext-thread',
+          resourceId,
+          bindingThreadId,
+          sessionId,
+          'default',
+          1,
+          now,
+          now,
+        ],
+      );
+    const insertCallback = (id: string, channelId: string) =>
+      s.db.none(
+        `INSERT INTO "${schemaName}"."${TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS}"
+           (id, provider_id, selector_kind, selector_value, harness_name, channel_id,
+            origin, status, created_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10)`,
+        [
+          id,
+          'provider-1',
+          'channel',
+          channelId,
+          HARNESS,
+          channelId,
+          JSON.stringify({ sessionId: 'origin-session' }),
+          'active',
+          now,
+          now,
+        ],
+      );
+    // The closure's channel: its callback binding is legitimate evidence.
+    await insertBinding(`bind-${randomUUID()}`, 'chan-own', 'cb1', threadId);
+    await insertCallback('cb-own', 'chan-own');
+    // A foreign channel in the same harness namespace: its routing metadata
+    // (selectors, origin, last_error) must not ride along in the payload.
+    await insertBinding(`bind-${randomUUID()}`, 'chan-foreign', 'other-session', 'thread-foreign');
+    await insertCallback('cb-foreign', 'chan-foreign');
+
+    const { manifest, rows } = await exportExecutionClosure(
+      s.db,
+      { harnessName: HARNESS, sessionId: 'cb1' },
+      { schemaName },
+    );
+    const callbacks = rows[TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS] ?? [];
+    expect(callbacks.map(r => r.id)).toEqual(['cb-own']);
+    const bindings = rows[TABLE_HARNESS_CHANNEL_BINDINGS] ?? [];
+    expect(bindings.map(r => r.channel_id)).toEqual(['chan-own']);
+    expect(verifyExecutionClosurePayload(manifest, rows).ok).toBe(true);
+  });
+
+  it('satisfies a session current run whose snapshot exists only as a handoff row', async () => {
+    const { s, schemaName } = await store('currenthandoff');
+    const { runId } = await seedClosure(s, schemaName, 'ch1');
+    const now = Date.now();
+    // The session's current run has no canonical snapshot row — its durable
+    // snapshot travels only in a handoff, which the importer materializes as
+    // canonical state. Completeness must count it or a self-contained
+    // closure pins falsely.
+    await s.db.none(`DELETE FROM "${schemaName}"."${TABLE_WORKFLOW_SNAPSHOT}" WHERE run_id = $1`, [runId]);
+    await s.db.none(
+      `INSERT INTO "${schemaName}"."${TABLE_WORKFLOW_SNAPSHOT_HANDOFF}"
+         (workflow_name, run_id, version, status, resource_id, snapshot,
+          mutation_fence, created_at, updated_at, completed_at)
+       VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9,$10)`,
+      [
+        'test-workflow',
+        runId,
+        1,
+        'pending',
+        null,
+        JSON.stringify({ runId, status: 'success', timestamp: now }),
+        `fence-${runId}`,
+        now,
+        now,
+        null,
+      ],
+    );
+
+    const { manifest, rows } = await exportExecutionClosure(
+      s.db,
+      { harnessName: HARNESS, sessionId: 'ch1' },
+      { schemaName },
+    );
+    expect(rows[TABLE_WORKFLOW_SNAPSHOT_HANDOFF]!.length).toBe(1);
+    expect(manifest.pins.filter(p => p.reason === 'current-run-without-snapshot')).toEqual([]);
+    expect(manifest.completeness).toBe('complete');
+  });
+
+  it('pins the export when an attachment retains only inline bytes', async () => {
+    const { s, schemaName } = await store('inlineattachment');
+    await seedClosure(s, schemaName, 'ia1');
+    const now = Date.now();
+    // A legacy inline-only row: no blob_ref, so `loadAttachment` can never
+    // resolve bytes (it requires blob_ref + session_incarnation) and import
+    // neither uploads the inline bytes nor mints a reference.
+    await s.db.none(
+      `INSERT INTO "${schemaName}"."${TABLE_HARNESS_ATTACHMENTS}"
+         (harness_name, session_id, attachment_id, name, mime_type, size_bytes,
+          sha256, source, created_at, data_b64, session_incarnation, blob_ref)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+      [
+        HARNESS,
+        'ia1',
+        'att-inline',
+        'file.bin',
+        'application/octet-stream',
+        4,
+        'deadbeef',
+        'preupload',
+        now,
+        'aGk=',
+        'inc-ia1',
+        null,
+      ],
+    );
+
+    const { manifest } = await exportExecutionClosure(s.db, { harnessName: HARNESS, sessionId: 'ia1' }, { schemaName });
+    expect(manifest.completeness).toBe('pinned');
+    expect(manifest.pins).toEqual([
+      expect.objectContaining({
+        reason: 'attachment-bytes-inline',
+        detail: expect.objectContaining({ sessionId: 'ia1', attachmentId: 'att-inline' }),
+      }),
+    ]);
+  });
+
+  it('pins the export while an attachment byte-owner operation is unsettled', async () => {
+    const { s, schemaName } = await store('opspending');
+    await seedClosure(s, schemaName, 'op1');
+    const now = Date.now();
+    const insertOperation = (id: string, kind: string, status: string) =>
+      s.db.none(
+        `INSERT INTO "${schemaName}"."${TABLE_HARNESS_ATTACHMENT_OPERATIONS}"
+           (id, harness_name, session_id, attachment_id, session_incarnation,
+            kind, status, size_bytes, sha256, attempts, created_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+        [id, HARNESS, 'op1', `att-${id}`, 'inc-op1', kind, status, 4, 'deadbeef', 0, now, now],
+      );
+    // An in-flight PUT is the only durable proof of byte-owner work; a settled
+    // DELETE is closed history that must not pin.
+    await insertOperation('op-put', 'put', 'pending');
+    await insertOperation('op-del', 'delete', 'completed');
+
+    const { manifest } = await exportExecutionClosure(s.db, { harnessName: HARNESS, sessionId: 'op1' }, { schemaName });
+    expect(manifest.completeness).toBe('pinned');
+    expect(manifest.pins).toEqual([
+      expect.objectContaining({
+        reason: 'attachment-operation-unsettled',
+        detail: expect.objectContaining({
+          sessionId: 'op1',
+          operationId: 'op-put',
+          kind: 'put',
+          status: 'pending',
+        }),
+      }),
+    ]);
+  });
+
+  it('exports thread state stored under the encoded scope key', async () => {
+    const { s, schemaName } = await store('threadstate');
+    const { threadId, resourceId } = await seedClosure(s, schemaName, 'ts1');
+    const now = new Date();
+    // The physical `threadId` column stores `encodeThreadStateScope` output —
+    // filtering by the raw thread id would silently drop every state row.
+    const encoded = encodeThreadStateScope({ resourceId, threadId });
+    const insertState = (physicalKey: string, type: string, value: unknown) =>
+      s.db.none(
+        `INSERT INTO "${schemaName}"."${TABLE_THREAD_STATE}"
+           ("threadId", type, value, "createdAt", "updatedAt")
+         VALUES ($1,$2,$3::jsonb,$4,$5)`,
+        [physicalKey, type, JSON.stringify(value), now, now],
+      );
+    await insertState(encoded, 'task', { items: ['a'] });
+    await insertState(encoded, 'goal', { objective: 'ship' });
+    await insertState(encodeThreadStateScope({ resourceId, threadId: 'thread-foreign' }), 'task', { items: [] });
+
+    const { manifest, rows } = await exportExecutionClosure(
+      s.db,
+      { harnessName: HARNESS, sessionId: 'ts1' },
+      { schemaName },
+    );
+    const states = rows[TABLE_THREAD_STATE] ?? [];
+    expect(states.map(r => r.type).sort()).toEqual(['goal', 'task']);
+    expect(states.every(r => r.threadId === encoded)).toBe(true);
+    expect(verifyExecutionClosurePayload(manifest, rows).ok).toBe(true);
+  });
+
+  it('exports a live background task bound to the closure run', async () => {
+    const { s, schemaName } = await store('tasks');
+    const { threadId, resourceId, runId } = await seedClosure(s, schemaName, 'bt1');
+    const now = new Date();
+    const insertTask = (id: string, status: string, taskRunId: string, taskThreadId: string) =>
+      s.db.none(
+        `INSERT INTO "${schemaName}"."${TABLE_BACKGROUND_TASKS}"
+           (id, tool_call_id, tool_name, agent_id, run_id, thread_id, resource_id,
+            status, args, retry_count, max_retries, timeout_ms,
+            "createdAt", "startedAt", "suspendedAt")
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11,$12,$13,$14,$15)`,
+        [
+          id,
+          `tc-${id}`,
+          'tool-1',
+          'agent-1',
+          taskRunId,
+          taskThreadId,
+          resourceId,
+          status,
+          '{}',
+          0,
+          3,
+          30_000,
+          now,
+          now,
+          status === 'suspended' ? now : null,
+        ],
+      );
+    // A suspended task on the session's run is recoverable execution state —
+    // it must travel with the closure, not strand on the source.
+    await insertTask('task-live', 'suspended', runId, threadId);
+    // A foreign run/task must not leak into the payload.
+    await insertTask('task-foreign', 'suspended', 'run-foreign', 'thread-foreign');
+
+    const { manifest, rows } = await exportExecutionClosure(
+      s.db,
+      { harnessName: HARNESS, sessionId: 'bt1' },
+      { schemaName },
+    );
+    const tasks = rows[TABLE_BACKGROUND_TASKS] ?? [];
+    expect(tasks.map(r => r.id)).toEqual(['task-live']);
+    expect(verifyExecutionClosurePayload(manifest, rows).ok).toBe(true);
+  });
 });
 
 /** Sessions-table digest differs across a round trip (fresh incarnation +
@@ -906,5 +1165,168 @@ describe('importExecutionClosure', () => {
     expect(result.status).toBe('pinned');
     expect(result.pins).toEqual(exported.manifest.pins);
     expect(result.inserted[TABLE_HARNESS_SESSIONS]).toBe(1);
+  });
+
+  it('restores outbox rows — terminal receipts preserved, claimed work requeued claim-free', async () => {
+    const src = await store('outbox-src');
+    const dst = await store('outbox-dst');
+    const { threadId, resourceId } = await seedClosure(src.s, src.schemaName, 'ob1');
+    const now = Date.now();
+    const insertOutbox = (id: string, status: string, extra: Record<string, unknown>) =>
+      src.s.db.none(
+        `INSERT INTO "${src.schemaName}"."${TABLE_HARNESS_CHANNEL_OUTBOX}"
+           (id, harness_name, channel_id, provider_id, binding_id, binding_generation,
+            idempotency_key, payload_hash, resource_id, thread_id, session_id,
+            target, kind, operation_kind, payload, delivery_semantics,
+            status, attempts, claim_id, claim_expires_at, sent_at,
+            provider_message_id, created_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13,$14,$15::jsonb,$16,$17,$18,$19,$20,$21,$22,$23,$24)`,
+        [
+          id,
+          HARNESS,
+          'chan-1',
+          'provider-1',
+          'bind-1',
+          1,
+          `idem-${id}`,
+          'hash-1',
+          resourceId,
+          threadId,
+          'ob1',
+          JSON.stringify({ channel: 'chan-1' }),
+          'message',
+          'send',
+          JSON.stringify({ text: 'hi' }),
+          'at-least-once',
+          status,
+          extra.attempts ?? 0,
+          extra.claim_id ?? null,
+          extra.claim_expires_at ?? null,
+          extra.sent_at ?? null,
+          extra.provider_message_id ?? null,
+          now,
+          now,
+        ],
+      );
+    // A claimed row is live work mid-delivery: the stale source claim is
+    // meaningless on the destination, so the row requeues as pending.
+    await insertOutbox('ob-claimed', 'claimed', {
+      attempts: 2,
+      claim_id: 'src-worker',
+      claim_expires_at: now + 30_000,
+    });
+    // A sent row is the idempotency receipt: losing it would let a re-enqueued
+    // effect repeat a provider-visible action.
+    await insertOutbox('ob-sent', 'sent', { sent_at: now - 1000, provider_message_id: 'pm-1' });
+
+    const exported = await exportExecutionClosure(
+      src.s.db,
+      { harnessName: HARNESS, sessionId: 'ob1' },
+      { schemaName: src.schemaName },
+    );
+    expect((exported.rows[TABLE_HARNESS_CHANNEL_OUTBOX] ?? []).map(r => r.id).sort()).toEqual([
+      'ob-claimed',
+      'ob-sent',
+    ]);
+
+    const result = await importExecutionClosure(dst.s.db, exported, { schemaName: dst.schemaName });
+    expect(result.status).toBe('imported');
+    expect(result.inserted[TABLE_HARNESS_CHANNEL_OUTBOX]).toBe(2);
+
+    const restored = await dst.s.db.manyOrNone<Record<string, unknown>>(
+      `SELECT id, status, claim_id, claim_expires_at, provider_message_id, sent_at
+       FROM "${dst.schemaName}"."${TABLE_HARNESS_CHANNEL_OUTBOX}" ORDER BY id`,
+    );
+    const claimed = restored.find(r => r.id === 'ob-claimed')!;
+    expect(claimed.status).toBe('pending');
+    expect(claimed.claim_id).toBeNull();
+    expect(claimed.claim_expires_at).toBeNull();
+    const sent = restored.find(r => r.id === 'ob-sent')!;
+    expect(sent.status).toBe('sent');
+    expect(sent.provider_message_id).toBe('pm-1');
+    expect(sent.sent_at).not.toBeNull();
+  });
+
+  it('restores a suspended background task the destination manager can re-drive', async () => {
+    const src = await store('task-src');
+    const dst = await store('task-dst');
+    const { threadId, resourceId, runId } = await seedClosure(src.s, src.schemaName, 'bt2');
+    const now = new Date();
+    await src.s.db.none(
+      `INSERT INTO "${src.schemaName}"."${TABLE_BACKGROUND_TASKS}"
+         (id, tool_call_id, tool_name, agent_id, run_id, thread_id, resource_id,
+          status, args, suspend_payload, retry_count, max_retries, timeout_ms,
+          "createdAt", "startedAt", "suspendedAt")
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb,$11,$12,$13,$14,$15,$16)`,
+      [
+        'task-1',
+        'tc-1',
+        'tool-1',
+        'agent-1',
+        runId,
+        threadId,
+        resourceId,
+        'suspended',
+        '{}',
+        JSON.stringify({ approval: 'needed' }),
+        1,
+        3,
+        30_000,
+        now,
+        now,
+        now,
+      ],
+    );
+
+    const exported = await exportExecutionClosure(
+      src.s.db,
+      { harnessName: HARNESS, sessionId: 'bt2' },
+      { schemaName: src.schemaName },
+    );
+    const result = await importExecutionClosure(dst.s.db, exported, { schemaName: dst.schemaName });
+    expect(result.status).toBe('imported');
+    expect(result.inserted[TABLE_BACKGROUND_TASKS]).toBe(1);
+
+    const task = await dst.s.db.one<Record<string, unknown>>(
+      `SELECT id, status, suspend_payload, run_id FROM "${dst.schemaName}"."${TABLE_BACKGROUND_TASKS}" WHERE id = 'task-1'`,
+    );
+    expect(task.status).toBe('suspended');
+    expect(task.run_id).toBe(runId);
+    expect(task.suspend_payload).toMatchObject({ approval: 'needed' });
+  });
+
+  it('pins the import when a restaged projection intent exceeds the destination bound', async () => {
+    const src = await store('oversize-src');
+    const dst = await store('oversize-dst');
+    await seedClosure(src.s, src.schemaName, 'ov1');
+    const exported = await exportExecutionClosure(
+      src.s.db,
+      { harnessName: HARNESS, sessionId: 'ov1' },
+      { schemaName: src.schemaName },
+    );
+
+    // The exported active fences restage post-images built under the source's
+    // bound — a destination configured tighter could never build them either,
+    // so the import pins the session instead of reporting the unit imported
+    // while the read model silently misses a revision.
+    const result = await importExecutionClosure(dst.s.db, exported, {
+      schemaName: dst.schemaName,
+      maxProjectionPayloadBytes: 1,
+    });
+    expect(result.status).toBe('pinned');
+    expect(result.pins).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          reason: 'projection-restage-exceeds-bound',
+          detail: expect.objectContaining({ sessionId: 'ov1' }),
+        }),
+      ]),
+    );
+
+    // Under a bound that can hold the post-image the same closure imports.
+    const dst2 = await store('oversize-dst2');
+    const wide = await importExecutionClosure(dst2.s.db, exported, { schemaName: dst2.schemaName });
+    expect(wide.status).toBe('imported');
+    expect(wide.inserted[TABLE_HARNESS_SESSION_PROJECTION_INTENTS]).toBe(2);
   });
 });

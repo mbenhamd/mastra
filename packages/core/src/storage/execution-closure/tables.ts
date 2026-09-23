@@ -1,4 +1,5 @@
 import {
+  TABLE_BACKGROUND_TASKS,
   TABLE_HARNESS_ATTACHMENTS,
   TABLE_HARNESS_ATTACHMENT_OPERATIONS,
   TABLE_HARNESS_ATTACHMENT_REFERENCES,
@@ -36,10 +37,20 @@ import type { ExecutionClosureTableName, ExecutionClosureTableRole } from './typ
 
 /**
  * Dimension a row binds to the closure through. `session`/`thread`/`run`/
- * `resource` name the id set collected at export; `harness` is the namespace
- * itself (global per-harness rows).
+ * `resource`/`channel` name the id set collected at export; `harness` is the
+ * namespace itself (global per-harness rows). `threadState` is not an id set:
+ * the thread-state store encodes its `(resourceId, threadId)` pair into the
+ * physical `threadId` column via `encodeThreadStateScope`, so the dimension
+ * carries the encoded scope keys the column actually stores.
  */
-export type ExecutionClosureScopeDimension = 'session' | 'thread' | 'run' | 'resource' | 'harness';
+export type ExecutionClosureScopeDimension =
+  | 'session'
+  | 'thread'
+  | 'run'
+  | 'resource'
+  | 'channel'
+  | 'threadState'
+  | 'harness';
 
 export interface ExecutionClosureScopeFilter {
   column: string;
@@ -137,6 +148,13 @@ export const EXECUTION_CLOSURE_TABLES: Partial<Record<ExecutionClosureTableName,
   [TABLE_HARNESS_WORKSPACE_ACTIONS]: state([sessionScope]),
   [TABLE_HARNESS_ATTACHMENTS]: state([sessionScope]),
   [TABLE_HARNESS_ATTACHMENT_REFERENCES]: state([sessionScope]),
+  // Attachment operations are the only durable reconciliation record for
+  // external byte-owner PUT/DELETE work: a `pending`/`uploaded`/`unknown`/
+  // `cleanup_pending`/`claimed` row may already have moved bytes at the byte
+  // owner, and a `delete` row is the sole proof they must be reclaimed. The
+  // rows stay `authority` evidence — the destination cannot reconcile
+  // source-side byte-owner state — but the exporter pins the closure while
+  // any operation is unsettled instead of declaring the unit complete.
   [TABLE_HARNESS_ATTACHMENT_OPERATIONS]: authority([sessionScope]),
 
   // --- Terminal handoff + operation fences: exported for audit, never revived ---
@@ -184,17 +202,37 @@ export const EXECUTION_CLOSURE_TABLES: Partial<Record<ExecutionClosureTableName,
     'claim_expires_at',
     'next_attempt_at',
   ]),
-  [TABLE_HARNESS_CHANNEL_OUTBOX]: authority([sessionScope, { column: 'owning_session_id', dimension: 'session' }]),
+  // The outbox row is both the durable work item for an unsettled delivery
+  // AND the idempotency receipt for a terminal one: dropping `sent`/`dead`
+  // rows would let a re-enqueued effect repeat a provider-visible action the
+  // source already performed, while dropping `pending`/`failed` rows loses
+  // work the migrated session still owes. Live claim fields clear on import
+  // and a `claimed` row requeues as `pending` — a source claim/lease is
+  // meaningless on the destination; settled rows stay durable evidence.
+  [TABLE_HARNESS_CHANNEL_OUTBOX]: fence(
+    [sessionScope, { column: 'owning_session_id', dimension: 'session' }],
+    false,
+    ['claim_id', 'claim_expires_at'],
+    { statusColumn: 'status', from: ['claimed'], to: 'pending' },
+  ),
   [TABLE_HARNESS_WAKEUPS]: authority([sessionScope]),
   // Provider callback bindings are provider-scoped shared routing state —
   // exported as evidence; a fresh incarnation re-establishes its own and an
-  // import never revives stale routing.
-  [TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS]: authority([], true),
+  // import never revives stale routing. The rows bind through `channel_id`
+  // to the channels the exported channel bindings actually own: an
+  // unscoped harness read would pull every routing row in the namespace,
+  // leaking unrelated channels' selector/origin/error metadata into the
+  // payload.
+  [TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS]: authority([{ column: 'channel_id', dimension: 'channel' }]),
 
   // --- Memory/OM closure ---
   [TABLE_THREADS]: state([{ column: 'id', dimension: 'thread' }]),
   [TABLE_MESSAGES]: state([threadScope()]),
-  [TABLE_THREAD_STATE]: state([threadScope('threadId')]),
+  // The physical `threadId` column stores `encodeThreadStateScope` output
+  // (`v1:<resource-length>:<resource><thread>`), not the raw thread id — the
+  // exporter fills the `threadState` dimension with the encoded keys of the
+  // closure's (resource, thread) pairs.
+  [TABLE_THREAD_STATE]: state([{ column: 'threadId', dimension: 'threadState' }]),
   // OM rows carry both a `scope` discriminator and both id columns — a
   // thread-scoped row still stores its owning resourceId. Unguarded OR scope
   // would pull every thread-scoped row sharing the resource, so each
@@ -204,6 +242,20 @@ export const EXECUTION_CLOSURE_TABLES: Partial<Record<ExecutionClosureTableName,
     { column: 'resourceId', dimension: 'resource', when: { column: 'scope', equals: 'resource' } },
   ]),
   [TABLE_RESOURCES]: { role: 'shared-resource', scope: [{ column: 'id', dimension: 'resource' }] },
+
+  // --- Agent background tasks ---
+  // A live task (`pending`/`running`/`suspended`) is recoverable execution
+  // state the destination's task manager is built to re-drive: pending rows
+  // dispatch, suspended rows park for resume, and `running` rows reconcile
+  // through the same stale-task recovery a source crash would trigger —
+  // so the rows transfer verbatim rather than pinning the unit. Terminal
+  // rows stay as task history. Tasks bind by their owning run or the
+  // subtree's thread; `resource_id` alone is too broad (a resource hosts
+  // many sessions on different threads).
+  [TABLE_BACKGROUND_TASKS]: state([
+    { column: 'run_id', dimension: 'run' },
+    { column: 'thread_id', dimension: 'thread' },
+  ]),
 
   // --- Workflow snapshots + terminal lineage ---
   // Definitions are deploy-time catalog rows, not execution state — the

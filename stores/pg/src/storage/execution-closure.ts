@@ -5,10 +5,14 @@ import {
   DEFAULT_HARNESS_SESSION_RECORD_PROJECTION_MAX_PAYLOAD_BYTES,
   EXECUTION_CLOSURE_TABLES,
   OBSERVATIONAL_MEMORY_TABLE_SCHEMA,
+  TABLE_BACKGROUND_TASKS,
   TABLE_CONFIGS,
   TABLE_HARNESS_ATTACHMENTS,
+  TABLE_HARNESS_ATTACHMENT_OPERATIONS,
   TABLE_HARNESS_ATTACHMENT_REFERENCES,
   TABLE_HARNESS_CHANNEL_ACTION_RECEIPTS,
+  TABLE_HARNESS_CHANNEL_BINDINGS,
+  TABLE_HARNESS_CHANNEL_OUTBOX,
   TABLE_HARNESS_MESSAGE_RESULTS,
   TABLE_HARNESS_PLAN_TASKS,
   TABLE_HARNESS_SESSIONS,
@@ -30,6 +34,7 @@ import {
   buildHarnessSessionRecordProjectionIntent,
   canonicalClosureRow,
   createStorageErrorId,
+  encodeThreadStateScope,
   verifyExecutionClosurePayload,
 } from '@mastra/core/storage';
 import type {
@@ -37,6 +42,7 @@ import type {
   ExecutionClosureKey,
   ExecutionClosurePayload,
   ExecutionClosurePin,
+  ExecutionClosureScopeDimension,
   ExecutionClosureTableName,
 } from '@mastra/core/storage';
 import { parseSqlIdentifier } from '@mastra/core/utils';
@@ -49,7 +55,7 @@ export interface ExportExecutionClosureOptions {
   schemaName?: string;
 }
 
-type Dimension = 'session' | 'thread' | 'run' | 'resource';
+type Dimension = Exclude<ExecutionClosureScopeDimension, 'harness'>;
 type DimensionSets = Record<Dimension, Set<string>>;
 
 function tableSql(table: ExecutionClosureTableName, schemaName?: string) {
@@ -271,6 +277,22 @@ const ADVANCEABLE_COLUMNS: Partial<Record<ExecutionClosureTableName, ReadonlySet
     'dispatch',
     'updated_at',
   ]),
+  // Channel outbox rows settle through the delivery lifecycle: a destination
+  // worker claims, sends, retries, or dead-letters the requeued row.
+  [TABLE_HARNESS_CHANNEL_OUTBOX]: new Set([
+    'status',
+    'attempts',
+    'claim_id',
+    'claim_expires_at',
+    'next_attempt_at',
+    'sent_at',
+    'failed_at',
+    'dead_at',
+    'provider_message_id',
+    'provider_receipt',
+    'last_error',
+    'updated_at',
+  ]),
   // Channel action receipts move through their own claim/apply lifecycle.
   [TABLE_HARNESS_CHANNEL_ACTION_RECEIPTS]: new Set([
     'status',
@@ -332,6 +354,18 @@ const ADVANCEABLE_COLUMNS: Partial<Record<ExecutionClosureTableName, ReadonlySet
     'order',
   ]),
   [TABLE_HARNESS_WORKSPACE_ACTIONS]: new Set(['result']),
+  // A background task the destination task manager re-drives or settles:
+  // status, attempts, and the result/suspension fields are its lifecycle.
+  [TABLE_BACKGROUND_TASKS]: new Set([
+    'status',
+    'result',
+    'error',
+    'suspend_payload',
+    'retry_count',
+    'startedAt',
+    'suspendedAt',
+    'completedAt',
+  ]),
   // Attachment byte identity settles through pending put operations.
   [TABLE_HARNESS_ATTACHMENTS]: new Set(['blob_ref', 'data_b64', 'put_operation_id', 'session_incarnation']),
   [TABLE_HARNESS_ATTACHMENT_REFERENCES]: new Set(['retained_until', 'session_incarnation']),
@@ -692,6 +726,8 @@ export async function exportExecutionClosure(
       thread: new Set(),
       run: new Set(),
       resource: new Set(),
+      channel: new Set(),
+      threadState: new Set(),
     };
     const incarnations: Record<string, string> = {};
     const pins: ExecutionClosurePin[] = [];
@@ -713,6 +749,12 @@ export async function exportExecutionClosure(
       incarnations[id] = typeof row.session_incarnation === 'string' ? row.session_incarnation : '';
       if (typeof row.thread_id === 'string') dims.thread.add(row.thread_id);
       if (typeof row.resource_id === 'string') dims.resource.add(row.resource_id);
+      // The thread-state store encodes its physical key from the
+      // (resourceId, threadId) pair — the same pair the session's runtime
+      // memory context addresses (`memory: { thread, resource }`).
+      if (typeof row.thread_id === 'string' && typeof row.resource_id === 'string') {
+        dims.threadState.add(encodeThreadStateScope({ resourceId: row.resource_id, threadId: row.thread_id }));
+      }
       const currentRun = parseJsonResilient(row.current_run) as { runId?: unknown } | undefined;
       collectSessionRun(id, currentRun?.runId);
       const pendingResume = parseJsonResilient(row.pending_resume) as { runId?: unknown } | undefined;
@@ -743,6 +785,23 @@ export async function exportExecutionClosure(
       rows[tableName] = tablePresent(tableName)
         ? await readClosureTable(t, tableName, schemaName, key.harnessName, dims)
         : [];
+      // Two dimensions are fed by rows just read, and the registry orders
+      // their consumers after their sources: channel bindings carry the
+      // `channel_id` set provider callback bindings scope through, and the
+      // exported thread rows contribute their own (resourceId, threadId)
+      // encoded scope keys alongside the session-derived ones.
+      if (tableName === TABLE_HARNESS_CHANNEL_BINDINGS) {
+        for (const row of rows[tableName] ?? []) {
+          if (typeof row.channel_id === 'string') dims.channel.add(row.channel_id);
+        }
+      }
+      if (tableName === TABLE_THREADS) {
+        for (const row of rows[tableName] ?? []) {
+          if (typeof row.id === 'string' && typeof row.resourceId === 'string') {
+            dims.threadState.add(encodeThreadStateScope({ resourceId: row.resourceId, threadId: row.id }));
+          }
+        }
+      }
     }
 
     // --- Run ids: session refs plus every run_id column already read.
@@ -856,7 +915,13 @@ export async function exportExecutionClosure(
     // silently exporting a broken continuation.
     const threadRows = new Set((rows[TABLE_THREADS] ?? []).map(r => r.id));
     const resourceRows = new Set((rows[TABLE_RESOURCES] ?? []).map(r => r.id));
+    // A snapshot-handoff row carries the run's complete snapshot and is
+    // materialized as canonical state on import — it satisfies a session's
+    // current/suspended run exactly like a canonical snapshot row does.
     const snapshotRunIds = new Set((rows[TABLE_WORKFLOW_SNAPSHOT] ?? []).map(r => r.run_id));
+    for (const row of rows[TABLE_WORKFLOW_SNAPSHOT_HANDOFF] ?? []) {
+      snapshotRunIds.add(row.run_id);
+    }
     for (const row of sessionRows) {
       const threadId = row.thread_id;
       if (typeof threadId === 'string' && !threadRows.has(threadId)) {
@@ -898,7 +963,40 @@ export async function exportExecutionClosure(
           reason: 'attachment-bytes-external',
           detail: { sessionId: row.session_id, attachmentId: row.attachment_id },
         });
+        continue;
       }
+      // A legacy row holding only inline `data_b64` bytes has no transferable
+      // byte identity: `loadAttachment` never reads `data_b64` — it requires
+      // `blob_ref` + `session_incarnation` — and import neither uploads the
+      // inline bytes nor mints a reference, so the destination can never load
+      // it. Pin rather than declare the closure complete over dead bytes.
+      const hasInlineBytes = typeof row.data_b64 === 'string' && row.data_b64.length > 0;
+      if (hasInlineBytes) {
+        pins.push({
+          reason: 'attachment-bytes-inline',
+          detail: { sessionId: row.session_id, attachmentId: row.attachment_id },
+        });
+      }
+    }
+
+    // An unsettled attachment operation is the only durable record of a byte
+    // owner PUT/DELETE still in flight at export time — a `put` may already
+    // have moved bytes, a `delete` is the sole proof they must be reclaimed,
+    // and the destination cannot reconcile either because the byte-owner
+    // scope is the source's. `completed`/`cleaned` rows are settled history;
+    // anything else pins the unit instead of dropping the ledger silently.
+    for (const row of rows[TABLE_HARNESS_ATTACHMENT_OPERATIONS] ?? []) {
+      if (row.status === 'completed' || row.status === 'cleaned') continue;
+      pins.push({
+        reason: 'attachment-operation-unsettled',
+        detail: {
+          sessionId: row.session_id,
+          attachmentId: row.attachment_id,
+          operationId: row.id,
+          kind: row.kind,
+          status: row.status,
+        },
+      });
     }
 
     // A pending message-result whose dispatch marker is `dispatching` or
@@ -947,6 +1045,13 @@ export async function exportExecutionClosure(
 
 export interface ImportExecutionClosureOptions {
   schemaName?: string;
+  /**
+   * The destination store's `sessionRecordProjection.maxPayloadBytes` bound.
+   * Restaged projection intents are built against the same limit the
+   * destination runtime uses — a hard-coded default would silently drop
+   * projection work for sessions exported under a larger configured bound.
+   */
+  maxProjectionPayloadBytes?: number;
 }
 
 const LIVE_TERMINAL_INTENT_STATUSES = new Set(['pending', 'claimed', 'failed']);
@@ -1152,13 +1257,14 @@ async function insertClosureRow(
  *   worker (claimed/acked/settled lifecycle columns on a strictly newer
  *   session version) — otherwise the transaction aborts instead of silently
  *   merging a foreign row into the closure;
- * - `authority` rows (wakeups, outbox, inbox, tokens, bindings, thread-delete
- *   leases, projection intents, pending attachment operations, pressure
- *   counters) are counted as skipped — the runtime re-establishes its own;
+ * - `authority` rows (wakeups, inbox, tokens, bindings, thread-delete
+ *   leases, projection intents, attachment operations, pressure counters)
+ *   are counted as skipped — the runtime re-establishes its own;
  * - `fence` rows are rewritten onto the destination session incarnation so
  *   tombstones and paid attempts still apply to the session that was stored;
- * - live terminal intents and channel receipts lose their stale source claim
- *   so a destination worker can claim them under a fresh claim id;
+ * - live terminal intents, channel receipts, and channel outbox rows lose
+ *   their stale source claim so a destination worker can claim them under a
+ *   fresh claim id, while terminal outbox rows stay as idempotency evidence;
  * - pending session-record projection work is restaged from the imported
  *   session rows, and the terminal/projection pressure counters are rebuilt
  *   from the live rows actually restored;
@@ -1204,6 +1310,9 @@ export async function importExecutionClosure(
 
     const inserted: Record<string, number> = {};
     const skipped: Record<string, number> = {};
+    // Pins the manifest did not carry but this import discovered — projection
+    // work the destination's configured bounds cannot stage.
+    const importPins: ExecutionClosurePin[] = [];
     for (const tableName of tableNames) {
       inserted[tableName] = 0;
       skipped[tableName] = 0;
@@ -1445,8 +1554,11 @@ export async function importExecutionClosure(
           .filter(row => row.state === 'active')
           .map(row => String(row.session_id)),
       );
+      const maxPayloadBytes =
+        options?.maxProjectionPayloadBytes ?? DEFAULT_HARNESS_SESSION_RECORD_PROJECTION_MAX_PAYLOAD_BYTES;
       let staged = 0;
       let stagedBytes = 0;
+      const unstagedSessions: string[] = [];
       for (const sessionId of activeFenceSessions) {
         const appliedRow = appliedSessionRows.get(sessionId);
         if (!appliedRow) continue;
@@ -1461,12 +1573,16 @@ export async function importExecutionClosure(
             sessionIncarnation: incarnations[sessionId]!,
             revision: Number(appliedRow.version),
             createdAt: Number(appliedRow.last_activity_at),
-            maxPayloadBytes: DEFAULT_HARNESS_SESSION_RECORD_PROJECTION_MAX_PAYLOAD_BYTES,
+            maxPayloadBytes,
           });
         } catch (error) {
-          // An oversized post-image could never have been built by the runtime
-          // either — skip staging rather than failing the import.
-          if (error instanceof RangeError) continue;
+          // A post-image the destination's configured bound cannot hold could
+          // never be built by its runtime either — pin the import rather than
+          // reporting the unit imported while the read model stays stale.
+          if (error instanceof RangeError) {
+            unstagedSessions.push(sessionId);
+            continue;
+          }
           throw error;
         }
         // bigint columns are passed as strings so the row the read-back
@@ -1517,14 +1633,24 @@ export async function importExecutionClosure(
           [harnessName, staged, stagedBytes, Date.now()],
         );
       }
+      // Sessions whose post-image exceeds the destination's configured bound
+      // could never be projected by its runtime either — surface them as
+      // pins so the import does not report the unit imported while the read
+      // model silently misses a revision.
+      for (const sessionId of unstagedSessions) {
+        importPins.push({
+          reason: 'projection-restage-exceeds-bound',
+          detail: { sessionId, maxPayloadBytes },
+        });
+      }
     }
 
     return {
-      status: manifest.completeness === 'complete' ? 'imported' : 'pinned',
+      status: manifest.completeness === 'complete' && importPins.length === 0 ? 'imported' : 'pinned',
       incarnations,
       inserted,
       skipped,
-      pins: manifest.pins,
+      pins: [...manifest.pins, ...importPins],
     };
   });
 }

@@ -254,12 +254,25 @@ describe('HarnessPG native terminal handoff', () => {
     expect(await rowCount(TABLE_HARNESS_TERMINAL_INTENTS)).toBe(1);
     await expect(harness().getTerminalQueuePressure({ harnessName: HARNESS })).resolves.toEqual(pressure);
 
-    // A mutated replay under the same grant is an identity conflict, not a
-    // silent overwrite of the committed winner.
+    // A raced committer whose finalizer bytes diverge from the sealed winner
+    // is still the same operation — every durable identity field matched — so
+    // the durable receipt replays instead of reporting an identity conflict.
+    // (Cross-process finalizers are nondeterministic: terminalResult's
+    // caller-side completedAt alone differs per committer.)
+    const raced = await harness().commitTerminalHandoff({
+      ...args,
+      projection: { projectionKind: 'chat.summary', projectionId: 'summary-commit', payload: { text: 'other' } },
+    });
+    expect(raced.status).toBe('duplicate');
+    expect(raced.intent?.id).toBe(committed.intent!.id);
+    await expect(harness().getTerminalQueuePressure({ harnessName: HARNESS })).resolves.toEqual(pressure);
+
+    // A replay that mutates a durable identity field under the same grant is
+    // a conflict, not a race artifact — the sealed winner is never rewritten.
     await expect(
       harness().commitTerminalHandoff({
         ...args,
-        projection: { projectionKind: 'chat.summary', projectionId: 'summary-commit', payload: { text: 'other' } },
+        resultEvidence: { ...args.resultEvidence, admissionHash: 'hash-other' },
       }),
     ).rejects.toBeInstanceOf(HarnessTerminalHandoffIdentityConflictError);
   });
@@ -1157,14 +1170,25 @@ describe('HarnessPG native terminal handoff', () => {
     expect(replay.status).toBe('duplicate');
     expect(replay.intent?.id).toBe(committed.intent!.id);
 
-    // A genuinely different result still conflicts — normalization must not
-    // widen the equality.
+    // A raced committer whose result payload differs from the sealed winner
+    // replays the durable receipt — same admission, grant, signal, and run —
+    // rather than reporting an identity conflict. The durable identity fields
+    // still gate the replay: mutating one conflicts instead of overwriting.
+    const raced = await harness().commitTerminalHandoff({
+      ...args,
+      resultEvidence: {
+        ...args.resultEvidence,
+        result: { text: 'provider output date', generatedAt: new Date('2026-09-21T12:00:00.000Z') },
+      },
+    });
+    expect(raced.status).toBe('duplicate');
+    expect(raced.intent?.id).toBe(committed.intent!.id);
     await expect(
       harness().commitTerminalHandoff({
         ...args,
         resultEvidence: {
           ...args.resultEvidence,
-          result: { text: 'provider output date', generatedAt: new Date('2026-09-21T12:00:00.000Z') },
+          signalId: 'signal-other',
         },
       }),
     ).rejects.toBeInstanceOf(HarnessTerminalHandoffIdentityConflictError);

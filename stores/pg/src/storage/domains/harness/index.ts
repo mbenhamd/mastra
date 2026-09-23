@@ -5035,17 +5035,14 @@ export class HarnessPG extends HarnessStorage {
       }
 
       if (stored.status === 'committed') {
-        if (!existingIntent || !sameHarnessTerminalIntent(existingIntent, terminalResult, projection)) {
-          throw new HarnessTerminalHandoffIdentityConflictError(stored.executionGrant.key);
-        }
-        // Evidence is compactable evidence, not authority: when it survives it
-        // must still match, but its absence cannot demote a committed outcome.
-        if (
-          currentEvidence &&
-          (!sameMessageEvidenceIdentity(currentEvidence, resultEvidence) ||
-            currentEvidence.status !== 'completed' ||
-            stableJsonString(currentEvidence.result) !== stableJsonString(persistedJsonValue(resultEvidence.result)))
-        ) {
+        // A committed outcome is sealed, and every identity field already
+        // matched above — the only remaining divergence a racing committer can
+        // carry is in the finalizer's own payload bytes (a nondeterministic
+        // winner-vs-loser difference, never a different operation). Replay
+        // the durable receipt rather than reporting an identity conflict.
+        // The intent is the durable receipt: a committed admission wrote one
+        // in the same transaction, so its absence is corruption, not a race.
+        if (!existingIntent) {
           throw new HarnessTerminalHandoffIdentityConflictError(stored.executionGrant.key);
         }
         await tx.commit();

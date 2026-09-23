@@ -1,6 +1,10 @@
 import type { ConnectionOptions } from 'node:tls';
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
-import { createStorageErrorId, MastraCompositeStore } from '@mastra/core/storage';
+import {
+  createStorageErrorId,
+  MastraCompositeStore,
+  normalizeHarnessSessionRecordProjectionConfig,
+} from '@mastra/core/storage';
 import type {
   ExecutionClosureImportResult,
   ExecutionClosureKey,
@@ -251,6 +255,8 @@ export class PostgresStore extends MastraCompositeStore {
   #readDb: DbClient;
   #ownsWritePool: boolean;
   #writePoolClosed: boolean = false;
+  /** Destination bound projection restaging must satisfy on closure import. */
+  #projectionMaxPayloadBytes: number;
   private schema: string;
   private isInitialized: boolean = false;
   // Caches the in-flight init() so concurrent callers share one initialization
@@ -269,6 +275,9 @@ export class PostgresStore extends MastraCompositeStore {
       super({ id: config.id, name: 'PostgresStore', disableInit: config.disableInit, retention: config.retention });
       // Validate schema name to prevent SQL injection
       this.schema = parseSqlIdentifier(config.schemaName || 'public', 'schema name');
+      this.#projectionMaxPayloadBytes = normalizeHarnessSessionRecordProjectionConfig(
+        config.sessionRecordProjection,
+      ).maxPayloadBytes;
 
       if (isPoolConfig(config)) {
         this.#writePool = config.pool;
@@ -548,7 +557,10 @@ export class PostgresStore extends MastraCompositeStore {
    * See `importExecutionClosure` for the verification/fresh-authority contract.
    */
   async importExecutionClosure(payload: ExecutionClosurePayload): Promise<ExecutionClosureImportResult> {
-    return importExecutionClosure(this.#db, payload, { schemaName: this.schema });
+    return importExecutionClosure(this.#db, payload, {
+      schemaName: this.schema,
+      maxProjectionPayloadBytes: this.#projectionMaxPayloadBytes,
+    });
   }
 
   /**

@@ -7844,7 +7844,7 @@ export class Session {
       opts.terminalAdmissionSeed !== undefined ||
       opts.onTerminalCommit !== undefined ||
       opts.onTerminalCommitError !== undefined;
-    if (terminalRequested && this._terminalFinalizer === undefined) {
+    if (terminalRequested && (this._terminalFinalizer === undefined || !this._storage.supportsTerminalHandoff)) {
       throw new HarnessTerminalHandoffUnsupportedError();
     }
     const terminalIdentity = terminalRequested
