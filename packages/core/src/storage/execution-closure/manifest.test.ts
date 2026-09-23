@@ -78,6 +78,16 @@ describe('buildExecutionClosureManifest + verifyExecutionClosurePayload', () => 
     const verified = verifyExecutionClosurePayload(manifest, rows);
     expect(verified.mismatches).toEqual([]);
     expect(verified.ok).toBe(true);
+
+    const fenceTable = Object.entries(EXECUTION_CLOSURE_TABLES).find(([, spec]) => spec?.role === 'fence')?.[0];
+    expect(fenceTable).toBeDefined();
+    const omitted = {
+      ...manifest,
+      tables: manifest.tables.filter(entry => entry.table !== fenceTable),
+    };
+    const missingFence = verifyExecutionClosurePayload(omitted, rows);
+    expect(missingFence.ok).toBe(false);
+    expect(missingFence.mismatches.some(item => item.includes(`omits fence table ${fenceTable}`))).toBe(true);
   });
 
   it('marks the unit pinned when pins are present', () => {

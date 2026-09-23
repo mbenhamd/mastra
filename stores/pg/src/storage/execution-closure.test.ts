@@ -397,7 +397,8 @@ describe('importExecutionClosure', () => {
     expect(first.status).toBe('imported');
     expect(second.status).toBe('imported');
     // Lost-acknowledgement retry: every row already present -> nothing inserted,
-    // nothing duplicated, fresh incarnations allocated but never observed.
+    // nothing duplicated. The returned incarnation is the one stored by the
+    // first commit, not a new id that was never written.
     expect(second.inserted[TABLE_HARNESS_SESSIONS]).toBe(0);
     expect(second.skipped[TABLE_HARNESS_SESSIONS]).toBe(2);
     expect(second.inserted[TABLE_MESSAGES]).toBe(0);
@@ -406,12 +407,11 @@ describe('importExecutionClosure', () => {
       `SELECT count(*)::text AS n FROM "${dst.schemaName}"."${TABLE_HARNESS_SESSIONS}"`,
     );
     expect(count.n).toBe('2');
-    // The committed incarnation is the first import's, not the retry's.
     const row = await dst.s.db.one<{ session_incarnation: string }>(
       `SELECT session_incarnation FROM "${dst.schemaName}"."${TABLE_HARNESS_SESSIONS}" WHERE id = 'rs2'`,
     );
     expect(row.session_incarnation).toBe(first.incarnations.rs2);
-    expect(row.session_incarnation).not.toBe(second.incarnations.rs2);
+    expect(second.incarnations.rs2).toBe(first.incarnations.rs2);
   });
 
   it('fails closed on a tampered payload and writes nothing', async () => {

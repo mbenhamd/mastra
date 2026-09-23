@@ -517,6 +517,10 @@ function assertJsonValue(value: unknown, path: string, depth = 0): asserts value
     return;
   }
   if (typeof value === 'object') {
+    const proto = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== null) {
+      throw new HarnessTerminalHandoffValidationError(path, 'must be a plain JSON object');
+    }
     for (const [key, entry] of Object.entries(value)) {
       if (key.length > MAX_HARNESS_TERMINAL_ID_CHARS) {
         throw new HarnessTerminalHandoffValidationError(

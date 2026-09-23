@@ -143,6 +143,11 @@ export function verifyExecutionClosurePayload(
       mismatches.push(`payload carries rows for table ${table} absent from the manifest`);
     }
   }
+  for (const [table, spec] of Object.entries(EXECUTION_CLOSURE_TABLES)) {
+    if (spec?.role === 'fence' && !listed.has(table as ExecutionClosureTableName)) {
+      mismatches.push(`manifest omits fence table ${table}`);
+    }
+  }
 
   for (const entry of manifest.tables) {
     const spec = EXECUTION_CLOSURE_TABLES[entry.table];

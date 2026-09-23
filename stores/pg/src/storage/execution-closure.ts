@@ -243,8 +243,8 @@ export interface ImportExecutionClosureOptions {
  * - `authority` rows (wakeups, outbox, inbox, tokens, bindings, claims,
  *   projection intents, pending attachment operations, pressure counters) are
  *   counted as skipped — the post-import runtime re-establishes its own;
- * - `fence` rows install verbatim so paid attempts, terminal intents,
- *   tombstones, and delete fences still prevent resurrection;
+ * - `fence` rows are rewritten onto the destination session incarnation so
+ *   tombstones and paid attempts still apply to the session that was stored;
  * - `shared-resource` rows insert only when absent — an archive can never
  *   overwrite a live shared resource row.
  */
@@ -273,8 +273,18 @@ export async function importExecutionClosure(
     // so a retried import of the same payload converges only when the first
     // attempt actually committed.
     const incarnations: Record<string, string> = {};
+    const existingSessions = manifest.sessionIds.length
+      ? await t.any<{ id: string; session_incarnation: string | null }>(
+          `SELECT id, session_incarnation FROM ${tableSql(TABLE_HARNESS_SESSIONS, schemaName)} WHERE id = ANY($1::text[])`,
+          [manifest.sessionIds],
+        )
+      : [];
+    const storedIncarnation = new Map(
+      existingSessions.map(row => [row.id, row.session_incarnation] as const),
+    );
     for (const sessionId of manifest.sessionIds) {
-      incarnations[sessionId] = randomUUID();
+      const stored = storedIncarnation.get(sessionId);
+      incarnations[sessionId] = typeof stored === 'string' && stored.length > 0 ? stored : randomUUID();
     }
 
     const inserted: Record<string, number> = {};
@@ -298,6 +308,13 @@ export async function importExecutionClosure(
         }
         if (tableName === TABLE_HARNESS_SESSIONS) {
           applied['session_incarnation'] = incarnations[row.id as string] ?? null;
+        }
+        if (spec!.role === 'fence') {
+          const sessionId = applied.session_id;
+          if (typeof sessionId === 'string' && typeof applied.session_incarnation === 'string') {
+            const destination = incarnations[sessionId];
+            if (destination) applied.session_incarnation = destination;
+          }
         }
 
         const columns = Object.keys(applied);
