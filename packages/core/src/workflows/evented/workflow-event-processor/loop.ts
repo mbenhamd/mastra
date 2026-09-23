@@ -30,6 +30,26 @@ export function isQueuedForeachIteration(value: unknown): value is { [FOREACH_QU
   );
 }
 
+/**
+ * Returns true when an `updateWorkflowResults` write fell back to the `{}`
+ * missing-record result: no snapshot row exists for the run. Only a nested
+ * run whose parent explicitly opted out of persistence
+ * (`parentWorkflow.shouldPersistSnapshot === false`) may continue on that
+ * path — for a top-level run the initial row always exists and for a durable
+ * child it should too, so `{}` there means the row was deleted mid-flight and
+ * the handler must stop before publishing further iteration events.
+ */
+function isMissingRecordResult(write: UpdateWorkflowResultsResult | undefined): boolean {
+  return write !== undefined && !isStaleExecutionResult(write) && Object.keys(write).length === 0;
+}
+
+function isDeletedRunResultWrite(
+  write: UpdateWorkflowResultsResult | undefined,
+  parentWorkflow: ProcessorArgs['parentWorkflow'],
+): boolean {
+  return isMissingRecordResult(write) && parentWorkflow?.shouldPersistSnapshot !== false;
+}
+
 export async function processWorkflowLoop(
   {
     workflowId,
@@ -158,7 +178,7 @@ export async function processWorkflowLoop(
       requestContext: getPersistedRequestContext(requestContext),
       executionGeneration: lifecycleExecution.executionGeneration,
     });
-    return isStaleExecutionResult(write);
+    return isStaleExecutionResult(write) || isDeletedRunResultWrite(write, parentWorkflow);
   };
 
   // A fenced (stale-lifetime) write means this loop's run moved to a different
@@ -233,10 +253,11 @@ export async function processWorkflowForEach(
 
   // A fenced (stale-lifetime) write means this foreach's run moved to a
   // different execution generation: stop before advancing stepResults or
-  // publishing further iteration events. Distinct from the `{}` missing-record
-  // fallback, which keeps the inline result.
+  // publishing further iteration events. A `{}` missing-record write means
+  // the row was deleted mid-flight — also terminal unless the run is a nested
+  // execution whose parent explicitly opted out of persistence.
   const stopOnStaleWrite = (write: UpdateWorkflowResultsResult | undefined, stepId: string): boolean => {
-    if (!isStaleExecutionResult(write)) return false;
+    if (!isStaleExecutionResult(write) && !isDeletedRunResultWrite(write, parentWorkflow)) return false;
     mastra
       .getLogger()
       ?.debug?.('WorkflowEventProcessor: stopping stale-lifetime foreach handler after fenced result write', {

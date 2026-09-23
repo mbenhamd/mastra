@@ -49,6 +49,21 @@ export class WorkflowStaleSnapshotPersistError extends TypeError {
   }
 }
 
+/**
+ * Matches the stale-persist rejection across `@mastra/core` module instances:
+ * a CJS-loaded store adapter and an ESM consumer can resolve separate copies
+ * of the class, defeating `instanceof`. The stable `code` field is the
+ * cross-instance discriminator.
+ */
+export function isWorkflowStaleSnapshotPersistError(error: unknown): error is WorkflowStaleSnapshotPersistError {
+  return (
+    error instanceof WorkflowStaleSnapshotPersistError ||
+    (typeof error === 'object' &&
+      error !== null &&
+      (error as { code?: unknown }).code === 'WORKFLOW_SNAPSHOT_PERSIST_STALE_GENERATION')
+  );
+}
+
 function sortCanonicalJson(value: unknown): unknown {
   if (value === null || typeof value !== 'object') return value;
   if (Array.isArray(value)) return value.map(sortCanonicalJson);

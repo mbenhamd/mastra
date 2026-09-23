@@ -9,7 +9,7 @@ import { resolveExportedSpanId } from '../../../observability';
 import { RequestContext } from '../../../request-context/';
 import { STALE_EXECUTION_RESULT, isStaleExecutionResult } from '../../../storage/types';
 import type { GetWorkflowRunTerminalStatusResult, UpdateWorkflowResultsResult } from '../../../storage/types';
-import { WorkflowStaleSnapshotPersistError } from '../../../storage/workflow-snapshot-handoff';
+import { isWorkflowStaleSnapshotPersistError } from '../../../storage/workflow-snapshot-handoff';
 import type { StepExecutionStrategy } from '../../../worker/types';
 import { getEntryId, getEntryRetries, getEntrySchemas, getEntryWorkflow } from '../../../workflows/step-entry';
 import type {
@@ -764,7 +764,7 @@ export class WorkflowEventProcessor extends EventProcessor {
       });
       return true;
     } catch (error) {
-      if (error instanceof WorkflowStaleSnapshotPersistError) {
+      if (isWorkflowStaleSnapshotPersistError(error)) {
         // The re-persist CAS lost to a delete/reopen between the snapshot read
         // and the write: the reopened lifetime owns the row now, so this
         // handler must stop rather than publish the stale suspension.
@@ -3625,12 +3625,13 @@ export class WorkflowEventProcessor extends EventProcessor {
         });
         // A guard miss (or a run record already gone) means the reopened
         // lifetime owns the row — stop before pruning or publishing. A `{}`
-        // result write means no row ever existed: only transient nested runs
-        // legitimately take that persistence opt-out, so they continue.
+        // result write means no row ever existed: only nested runs that
+        // explicitly opted out of persistence legitimately take that path —
+        // a durable child whose row disappeared stops here as well.
         if (
           workflowsStore !== undefined &&
           suspendedState === undefined &&
-          !(parentWorkflow !== undefined && this.#isMissingRecordResult(stateWrite))
+          !(parentWorkflow?.shouldPersistSnapshot === false && this.#isMissingRecordResult(stateWrite))
         ) {
           return;
         }
@@ -3794,6 +3795,7 @@ export class WorkflowEventProcessor extends EventProcessor {
     // Cache workflows store to avoid redundant async calls
     const workflowsStore = await this.mastra.getStorage()?.getStore('workflows');
 
+    let publishStepLifecycle: (() => Promise<void>) | undefined;
     if (isExecutableStep(step)) {
       // Lifecycle events describe durable completion: emitting them before the
       // fenced result writes below lets a stale-lifetime handler announce a
@@ -3837,45 +3839,52 @@ export class WorkflowEventProcessor extends EventProcessor {
         stepAttempt: lifecycleStepState.stepAttempt,
       };
 
-      if (prevResult.status === 'suspended') {
-        await publishWorkflowLifecycleEvent({
-          pubsub: this.mastra.pubsub,
-          workflowId,
-          runId,
-          executionGeneration,
-          event: { type: 'step.suspended', ...identity, suspendPayload: prevResult.suspendPayload },
-        });
-      } else if (prevResult.status === 'failed') {
-        await publishWorkflowLifecycleEvent({
-          pubsub: this.mastra.pubsub,
-          workflowId,
-          runId,
-          executionGeneration,
-          event: { type: 'step.failed', ...identity, error: prevResult.error },
-        });
-        await publishWorkflowLifecycleEvent({
-          pubsub: this.mastra.pubsub,
-          workflowId,
-          runId,
-          executionGeneration,
-          event: { type: 'step.finished', ...identity, status: 'failed' },
-        });
-      } else if (prevResult.status === 'success' || (prevResult as any).status === 'bailed') {
-        await publishWorkflowLifecycleEvent({
-          pubsub: this.mastra.pubsub,
-          workflowId,
-          runId,
-          executionGeneration,
-          event: { type: 'step.completed', ...identity, output: (prevResult as any).output },
-        });
-        await publishWorkflowLifecycleEvent({
-          pubsub: this.mastra.pubsub,
-          workflowId,
-          runId,
-          executionGeneration,
-          event: { type: 'step.finished', ...identity, status: 'success' },
-        });
-      }
+      // Deferred until the step's generation-fenced result write lands: the
+      // preflight above is only a read, so a delete/reopen between it and the
+      // CAS write would otherwise still announce completion for a step the
+      // reopened lifetime never executed. Invoke this only after a fenced
+      // write succeeds (or legitimately falls back to `{}`/no-store).
+      publishStepLifecycle = async () => {
+        if (prevResult.status === 'suspended') {
+          await publishWorkflowLifecycleEvent({
+            pubsub: this.mastra.pubsub,
+            workflowId,
+            runId,
+            executionGeneration,
+            event: { type: 'step.suspended', ...identity, suspendPayload: prevResult.suspendPayload },
+          });
+        } else if (prevResult.status === 'failed') {
+          await publishWorkflowLifecycleEvent({
+            pubsub: this.mastra.pubsub,
+            workflowId,
+            runId,
+            executionGeneration,
+            event: { type: 'step.failed', ...identity, error: prevResult.error },
+          });
+          await publishWorkflowLifecycleEvent({
+            pubsub: this.mastra.pubsub,
+            workflowId,
+            runId,
+            executionGeneration,
+            event: { type: 'step.finished', ...identity, status: 'failed' },
+          });
+        } else if (prevResult.status === 'success' || (prevResult as any).status === 'bailed') {
+          await publishWorkflowLifecycleEvent({
+            pubsub: this.mastra.pubsub,
+            workflowId,
+            runId,
+            executionGeneration,
+            event: { type: 'step.completed', ...identity, output: (prevResult as any).output },
+          });
+          await publishWorkflowLifecycleEvent({
+            pubsub: this.mastra.pubsub,
+            workflowId,
+            runId,
+            executionGeneration,
+            event: { type: 'step.finished', ...identity, status: 'success' },
+          });
+        }
+      };
     }
 
     if (step.type === 'foreach') {
@@ -3917,6 +3926,10 @@ export class WorkflowEventProcessor extends EventProcessor {
           if (this.#isStaleResultWrite(bailWrite, { workflowId: workflow.id, runId, stepId: getEntryId(step.step) })) {
             return;
           }
+          if (this.#isMissingRecordResult(bailWrite) && parentWorkflow?.shouldPersistSnapshot !== false) {
+            return;
+          }
+          await publishStepLifecycle?.();
 
           // End workflow with bail result
           return this.endWorkflow({
@@ -4028,6 +4041,12 @@ export class WorkflowEventProcessor extends EventProcessor {
       if (this.#isStaleResultWrite(newStepResults, { workflowId: workflow.id, runId, stepId: getEntryId(step.step) })) {
         return;
       }
+      // Same missing-row halt as the ordinary step path below: only a nested
+      // run that explicitly opted out of persistence may continue on `{}` —
+      // for any other run the row was deleted and iteration events must stop.
+      if (this.#isMissingRecordResult(newStepResults) && parentWorkflow?.shouldPersistSnapshot !== false) {
+        return;
+      }
 
       // Persist (and thread forward) any state changes made inside the foreach body.
       // Each iteration is a separate event in the evented engine, so unless we write
@@ -4047,7 +4066,14 @@ export class WorkflowEventProcessor extends EventProcessor {
         if (this.#isStaleResultWrite(stateWrite, { workflowId: workflow.id, runId, stepId: '__state' })) {
           return;
         }
+        if (this.#isMissingRecordResult(stateWrite) && parentWorkflow?.shouldPersistSnapshot !== false) {
+          return;
+        }
       }
+
+      // The step's fenced result write landed (or legitimately fell back) —
+      // lifecycle events may now announce it durably.
+      await publishStepLifecycle?.();
 
       // Same fallback as the regular step path: when no run record was
       // persisted (shouldPersistSnapshot opted out of running) the store
@@ -4300,6 +4326,9 @@ export class WorkflowEventProcessor extends EventProcessor {
           ) {
             return;
           }
+          if (this.#isMissingRecordResult(foreachSuspendWrite) && parentWorkflow?.shouldPersistSnapshot !== false) {
+            return;
+          }
 
           // Check shouldPersistSnapshot option - default to true if not specified
           const shouldPersist =
@@ -4342,11 +4371,12 @@ export class WorkflowEventProcessor extends EventProcessor {
             });
             // `undefined` conflates a stale-generation CAS miss with a
             // missing row; the `{}` result-write fallback proves the row was
-            // never persisted, which is legitimate only for nested runs.
+            // never persisted, which is legitimate only for nested runs that
+            // explicitly opted out of persistence.
             if (
               workflowsStore !== undefined &&
               suspendedState === undefined &&
-              !(parentWorkflow !== undefined && this.#isMissingRecordResult(foreachStateWrite))
+              !(parentWorkflow?.shouldPersistSnapshot === false && this.#isMissingRecordResult(foreachStateWrite))
             ) {
               return;
             }
@@ -4463,13 +4493,17 @@ export class WorkflowEventProcessor extends EventProcessor {
       // shouldPersistSnapshot), so `{}` means deleteWorkflowRunById removed
       // this lifetime — stop instead of advancing a deleted run's events.
       if (!newStepResults || Object.keys(newStepResults).length === 0) {
-        if (newStepResults !== undefined && parentWorkflow === undefined) {
+        if (newStepResults !== undefined && parentWorkflow?.shouldPersistSnapshot !== false) {
           return;
         }
         stepResults = { ...(stepResults ?? {}), [stepId]: storedResult };
       } else {
         stepResults = newStepResults;
       }
+
+      // The step's fenced result write landed (or legitimately fell back) —
+      // lifecycle events may now announce it durably.
+      await publishStepLifecycle?.();
     }
 
     // Update stepResults with current state
@@ -4621,12 +4655,12 @@ export class WorkflowEventProcessor extends EventProcessor {
           },
         });
         // Same missing-row discrimination: `undefined` is a stale CAS miss
-        // for persisted runs, but the ordinary opt-out when a transient
-        // nested run's result write already fell back to `{}`.
+        // for persisted runs, but the ordinary opt-out when a nested run that
+        // explicitly opted out of persistence fell back to `{}`.
         if (
           workflowsStore !== undefined &&
           suspendedState === undefined &&
-          !(parentWorkflow !== undefined && this.#isMissingRecordResult(suspendStateWrite))
+          !(parentWorkflow?.shouldPersistSnapshot === false && this.#isMissingRecordResult(suspendStateWrite))
         ) {
           return;
         }

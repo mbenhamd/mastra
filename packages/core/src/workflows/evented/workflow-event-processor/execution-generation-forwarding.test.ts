@@ -753,4 +753,319 @@ describe('updateWorkflowResults executionGeneration forwarding', () => {
     expect(stateUpdates).toHaveBeenCalled();
     expect(engineEvents).toContain('workflow.suspend');
   });
+
+  it('holds step lifecycle publications until the fenced result write lands', async () => {
+    const storage = new MockStore();
+    const pubsub = new EventEmitterPubSub();
+    const step = createStep({
+      id: 'post-cas-publish-step',
+      inputSchema: z.object({}),
+      outputSchema: z.object({ value: z.string() }),
+      execute: async () => ({ value: 'done' }),
+    });
+    const workflow = createWorkflow({
+      id: `post-cas-publish-${Math.random().toString(36).slice(2)}`,
+      inputSchema: z.object({}),
+      outputSchema: z.object({ value: z.string() }),
+    })
+      .then(step)
+      .commit();
+    const mastra = new Mastra({ logger: false, storage, pubsub, workflows: { [workflow.id]: workflow } });
+    const workflowsStore = (await storage.getStore('workflows'))!;
+
+    const runId = `run-${Math.random().toString(36).slice(2)}`;
+    await workflow.createRun({ runId });
+    const pending = (await workflowsStore.loadWorkflowSnapshot({ workflowName: workflow.id, runId }))!;
+    const generation = pending.executionGeneration!;
+    expect(generation).toBeTruthy();
+
+    // The projection preflight passes (the event's generation still matches),
+    // but the reopen lands before the result write: the fenced write rejects
+    // and no lifecycle event may have announced the step beforehand.
+    const resultWrites = vi.spyOn(workflowsStore, 'updateWorkflowResults').mockResolvedValue(STALE_EXECUTION_RESULT);
+    const lifecycleEvents: string[] = [];
+    const engineEvents: string[] = [];
+    const publish = pubsub.publish.bind(pubsub);
+    vi.spyOn(pubsub, 'publish').mockImplementation(async (topic, event) => {
+      const type = (event as { type: string }).type;
+      if (type === 'workflow.lifecycle') lifecycleEvents.push(type);
+      if (topic === 'workflows') engineEvents.push(type);
+      return publish(topic, event);
+    });
+
+    const processor = new WorkflowEventProcessor({ mastra });
+    const handled = await processor.handle({
+      type: 'workflow.step.end',
+      id: 'evt-post-cas-publish',
+      runId,
+      createdAt: new Date(),
+      data: {
+        workflowId: workflow.id,
+        runId,
+        executionGeneration: generation,
+        executionPath: [0],
+        prevResult: {
+          status: 'success',
+          output: { value: 'done' },
+          payload: {},
+          startedAt: 1,
+          endedAt: 2,
+        },
+        stepResults: {},
+        activeStepsPath: {},
+        resumeSteps: [],
+        requestContext: {},
+        lifecycleStepStates: {},
+      },
+    });
+
+    expect(handled).toEqual({ ok: true });
+    expect(resultWrites).toHaveBeenCalledTimes(1);
+    expect(lifecycleEvents).toEqual([]);
+    expect(engineEvents).toEqual([]);
+  });
+
+  it('stops a top-level foreach delivery when the run row was deleted', async () => {
+    const storage = new MockStore();
+    const pubsub = new EventEmitterPubSub();
+    const body = createStep({
+      id: 'deleted-foreach-body',
+      inputSchema: z.number(),
+      outputSchema: z.number(),
+      execute: async ({ inputData }) => inputData * 2,
+    });
+    const workflow = createWorkflow({
+      id: `deleted-foreach-${Math.random().toString(36).slice(2)}`,
+      inputSchema: z.array(z.number()),
+      outputSchema: z.array(z.number()),
+    })
+      .foreach(body)
+      .commit();
+    const mastra = new Mastra({ logger: false, storage, pubsub, workflows: { [workflow.id]: workflow } });
+    const workflowsStore = (await storage.getStore('workflows'))!;
+
+    const runId = `run-${Math.random().toString(36).slice(2)}`;
+    await workflow.createRun({ runId });
+    const pending = (await workflowsStore.loadWorkflowSnapshot({ workflowName: workflow.id, runId }))!;
+    const generation = pending.executionGeneration!;
+    expect(generation).toBeTruthy();
+
+    // The delayed iteration completion arrives after the run row was deleted:
+    // the store can only answer `{}`, which is terminal for a top-level run.
+    await workflowsStore.deleteWorkflowRunById({ workflowName: workflow.id, runId });
+
+    const engineEvents: string[] = [];
+    const publish = pubsub.publish.bind(pubsub);
+    vi.spyOn(pubsub, 'publish').mockImplementation(async (topic, event) => {
+      if (topic === 'workflows') engineEvents.push((event as { type: string }).type);
+      return publish(topic, event);
+    });
+
+    const processor = new WorkflowEventProcessor({ mastra });
+    const handled = await processor.handle({
+      type: 'workflow.step.end',
+      id: 'evt-deleted-foreach',
+      runId,
+      createdAt: new Date(),
+      data: {
+        workflowId: workflow.id,
+        runId,
+        executionGeneration: generation,
+        executionPath: [0, 0],
+        prevResult: {
+          status: 'success',
+          output: 2,
+          payload: 1,
+          startedAt: 1,
+          endedAt: 2,
+        },
+        stepResults: {},
+        activeStepsPath: {},
+        resumeSteps: [],
+        requestContext: {},
+        lifecycleStepStates: {},
+      },
+    });
+
+    // The `{}` result write halted the handler before it could publish
+    // another iteration's step.run/step.end for the deleted run.
+    expect(handled).toEqual({ ok: true });
+    expect(engineEvents).not.toContain('workflow.step.run');
+    expect(engineEvents).not.toContain('workflow.step.end');
+  });
+
+  it('stops a durable nested run whose row is missing instead of publishing its suspension', async () => {
+    const storage = new MockStore();
+    const pubsub = new EventEmitterPubSub();
+    const suspendingStep = createStep({
+      id: 'durable-suspend-step',
+      inputSchema: z.object({}),
+      suspendSchema: z.object({ reason: z.string() }),
+      outputSchema: z.object({ value: z.string() }),
+      execute: async () => ({ value: 'done' }),
+    });
+    const workflow = createWorkflow({
+      id: `durable-suspend-${Math.random().toString(36).slice(2)}`,
+      inputSchema: z.object({}),
+      outputSchema: z.object({ value: z.string() }),
+      steps: [suspendingStep],
+    })
+      .then(suspendingStep)
+      .commit();
+    const outerWorkflow = createWorkflow({
+      id: `durable-outer-${Math.random().toString(36).slice(2)}`,
+      inputSchema: z.object({}),
+      outputSchema: z.object({ value: z.string() }),
+      steps: [workflow],
+    })
+      .then(workflow)
+      .commit();
+    const mastra = new Mastra({
+      logger: false,
+      storage,
+      pubsub,
+      workflows: { [workflow.id]: workflow, [outerWorkflow.id]: outerWorkflow },
+    });
+    const workflowsStore = (await storage.getStore('workflows'))!;
+
+    // The child is durable (no shouldPersistSnapshot opt-out): its snapshot
+    // row existed and was deleted before this delayed delivery arrived, so
+    // the store answers the same `{}` a transient run legitimately produces.
+    const runId = `run-${Math.random().toString(36).slice(2)}`;
+    await workflow.createRun({ runId });
+    await workflowsStore.deleteWorkflowRunById({ workflowName: workflow.id, runId });
+
+    const engineEvents: string[] = [];
+    const publish = pubsub.publish.bind(pubsub);
+    vi.spyOn(pubsub, 'publish').mockImplementation(async (topic, event) => {
+      if (topic === 'workflows') engineEvents.push((event as { type: string }).type);
+      return publish(topic, event);
+    });
+
+    const processor = new WorkflowEventProcessor({ mastra });
+    const handled = await processor.handle({
+      type: 'workflow.step.end',
+      id: 'evt-durable-suspend',
+      runId,
+      createdAt: new Date(),
+      data: {
+        workflowId: workflow.id,
+        runId,
+        executionGeneration: 'wfeg:durable-nested',
+        executionPath: [0],
+        prevResult: {
+          status: 'suspended',
+          output: undefined,
+          payload: {},
+          startedAt: 1,
+          suspendPayload: { reason: 'waiting' },
+        },
+        stepResults: {},
+        activeStepsPath: {},
+        resumeSteps: [],
+        requestContext: {},
+        lifecycleStepStates: {},
+        parentWorkflow: {
+          workflowId: outerWorkflow.id,
+          runId: 'outer-run',
+          executionGeneration: 'wfeg:outer',
+          lifecycleResumeAttempt: 0,
+          lifecycleStepStates: {},
+          executionPath: [0],
+          resume: false,
+          stepResults: {},
+          stepId: 'nested-workflow-step',
+          stepGraph: [],
+          activeStepsPath: {},
+          resumeSteps: [],
+          resumeData: undefined,
+          input: {},
+          shouldPersistSnapshot: true,
+        },
+      },
+    });
+
+    // A durable child's missing row is a deletion, not a persistence opt-out:
+    // no workflow.suspend may be published or forwarded to the parent.
+    expect(handled).toEqual({ ok: true });
+    expect(engineEvents).not.toContain('workflow.suspend');
+  });
+
+  it('halts the suspension flow on a stale-persist rejection from a foreign core instance', async () => {
+    const storage = new MockStore();
+    const pubsub = new EventEmitterPubSub();
+    const suspendingStep = createStep({
+      id: 'foreign-stale-step',
+      inputSchema: z.object({}),
+      suspendSchema: z.object({ reason: z.string() }),
+      outputSchema: z.object({ value: z.string() }),
+      execute: async () => ({ value: 'done' }),
+    });
+    const workflow = createWorkflow({
+      id: `foreign-stale-${Math.random().toString(36).slice(2)}`,
+      inputSchema: z.object({}),
+      outputSchema: z.object({ value: z.string() }),
+      options: {
+        pruneSnapshot: ({ snapshot }) => {
+          const { serializedStepGraph: _graph, ...pruned } = snapshot;
+          return pruned;
+        },
+      },
+    })
+      .then(suspendingStep)
+      .commit();
+    const mastra = new Mastra({ logger: false, storage, pubsub, workflows: { [workflow.id]: workflow } });
+    const workflowsStore = (await storage.getStore('workflows'))!;
+
+    const runId = `run-${Math.random().toString(36).slice(2)}`;
+    await workflow.createRun({ runId });
+    const pending = (await workflowsStore.loadWorkflowSnapshot({ workflowName: workflow.id, runId }))!;
+    const generation = pending.executionGeneration!;
+    expect(generation).toBeTruthy();
+
+    // A store adapter built against a second @mastra/core instance rejects
+    // the guarded re-persist with its own copy of the error class: instanceof
+    // fails here, but the stable code still marks the CAS rejection.
+    const staleError = Object.assign(new TypeError('stale persist'), {
+      code: 'WORKFLOW_SNAPSHOT_PERSIST_STALE_GENERATION',
+      workflowName: workflow.id,
+      runId,
+    });
+    vi.spyOn(workflowsStore, 'persistWorkflowSnapshot').mockRejectedValue(staleError);
+    const engineEvents: string[] = [];
+    const publish = pubsub.publish.bind(pubsub);
+    vi.spyOn(pubsub, 'publish').mockImplementation(async (topic, event) => {
+      if (topic === 'workflows') engineEvents.push((event as { type: string }).type);
+      return publish(topic, event);
+    });
+
+    const processor = new WorkflowEventProcessor({ mastra });
+    const handled = await processor.handle({
+      type: 'workflow.step.end',
+      id: 'evt-foreign-stale',
+      runId,
+      createdAt: new Date(),
+      data: {
+        workflowId: workflow.id,
+        runId,
+        executionGeneration: generation,
+        executionPath: [0],
+        prevResult: {
+          status: 'suspended',
+          output: undefined,
+          payload: {},
+          startedAt: 1,
+          suspendPayload: { reason: 'waiting' },
+        },
+        stepResults: {},
+        activeStepsPath: {},
+        resumeSteps: [],
+        requestContext: {},
+        lifecycleStepStates: {},
+      },
+    });
+
+    expect(handled).toEqual({ ok: true });
+    expect(engineEvents).not.toContain('workflow.suspend');
+  });
 });

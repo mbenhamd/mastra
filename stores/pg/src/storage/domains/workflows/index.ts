@@ -4166,6 +4166,18 @@ export class WorkflowsPG extends WorkflowsStorage {
     return `regexp_replace((${columnReference}::json)::text, '${PG_UNSAFE_JSON_UNICODE_ESCAPE_PATTERN}', E'\\\\1\\\\2', 'g')::jsonb->>'status'`;
   }
 
+  private workflowSnapshotGenerationExpression(snapshotColumnType: string, columnReference: string): string {
+    if (snapshotColumnType === 'jsonb' || snapshotColumnType === 'json') {
+      return `${columnReference}->>'executionGeneration'`;
+    }
+    if (snapshotColumnType === 'text') {
+      return `regexp_replace((${columnReference}::json)::text, '${PG_UNSAFE_JSON_UNICODE_ESCAPE_PATTERN}', E'\\\\1\\\\2', 'g')::jsonb->>'executionGeneration'`;
+    }
+    throw new TypeError(
+      `Workflow snapshot persist does not support snapshot column type ${snapshotColumnType || 'missing'}`,
+    );
+  }
+
   private requireSupportedWorkflowSnapshotColumnType(snapshotColumnType: string | null): WorkflowSnapshotColumnType {
     if (snapshotColumnType === 'jsonb' || snapshotColumnType === 'json' || snapshotColumnType === 'text') {
       return snapshotColumnType;
@@ -5725,8 +5737,15 @@ export class WorkflowsPG extends WorkflowsStorage {
       await this.#db.client.tx(async t => {
         const revision = await this.lockWorkflowParentRevisionForSnapshotUpsert(t, workflowName, runId);
         await this.assertWorkflowSnapshotHandoffAvailable(t, workflowName, runId);
+        // `->>` exists only for json/jsonb; legacy text snapshots need the
+        // same sanitized cast the status expressions use, or every persist —
+        // guarded or not — fails on "operator does not exist".
+        const generationExpression = this.workflowSnapshotGenerationExpression(
+          await this.resolveWorkflowSnapshotColumnType(t),
+          'snapshot',
+        );
         const existingSnapshot = await t.oneOrNone<{ exists: boolean; generation: string | null }>(
-          `SELECT TRUE AS exists, snapshot->>'executionGeneration' AS generation
+          `SELECT TRUE AS exists, ${generationExpression} AS generation
            FROM ${this.workflowSnapshotTableName()}
            WHERE workflow_name = $1 AND run_id = $2 FOR UPDATE`,
           [workflowName, runId],
