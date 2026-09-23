@@ -550,6 +550,45 @@ describe('native chat terminal handoff', () => {
     });
   });
 
+  it('mints and persists an incarnation when a legacy row is loaded or updated', async () => {
+    const db = new InMemoryDB();
+    // A store written before terminal handoff existed: no incarnation is minted.
+    const legacy = new InMemoryHarness({ db, terminalHandoff: { enabled: false } });
+    await legacy.saveSession(session({ sessionIncarnation: undefined }), { ownerId: 'owner-1', ifVersion: 0 });
+    expect(
+      (await legacy.loadSession({ harnessName: 'default', sessionId: 'session-1' }))?.sessionIncarnation,
+    ).toBeUndefined();
+
+    // Enabling terminal handoff repairs the legacy row on first load; the mint
+    // is persisted so every later reader sees the same winner.
+    const enabled = new InMemoryHarness({ db, terminalHandoff: { enabled: true } });
+    const loaded = await enabled.loadSession({ harnessName: 'default', sessionId: 'session-1' });
+    expect(loaded?.sessionIncarnation).toEqual(expect.any(String));
+    await expect(enabled.loadSession({ harnessName: 'default', sessionId: 'session-1' })).resolves.toMatchObject({
+      sessionIncarnation: loaded!.sessionIncarnation,
+    });
+    await expect(
+      enabled.loadSessionByThread({ harnessName: 'default', threadId: 'thread-1', resourceId: 'resource-1' }),
+    ).resolves.toMatchObject({ sessionIncarnation: loaded!.sessionIncarnation });
+
+    // An update that omits the incarnation keeps the minted fence.
+    await enabled.saveSession(session({ sessionIncarnation: undefined }), { ownerId: 'owner-1', ifVersion: 1 });
+    await expect(enabled.loadSession({ harnessName: 'default', sessionId: 'session-1' })).resolves.toMatchObject({
+      sessionIncarnation: loaded!.sessionIncarnation,
+    });
+  });
+
+  it('mints an incarnation on the first update of a legacy row before any load repairs it', async () => {
+    const db = new InMemoryDB();
+    const legacy = new InMemoryHarness({ db, terminalHandoff: { enabled: false } });
+    await legacy.saveSession(session({ sessionIncarnation: undefined }), { ownerId: 'owner-1', ifVersion: 0 });
+
+    const enabled = new InMemoryHarness({ db, terminalHandoff: { enabled: true } });
+    await enabled.saveSession(session({ sessionIncarnation: undefined }), { ownerId: 'owner-1', ifVersion: 1 });
+    const upgraded = await enabled.loadSession({ harnessName: 'default', sessionId: 'session-1' });
+    expect(upgraded?.sessionIncarnation).toEqual(expect.any(String));
+  });
+
   it('binds a grant generation to one admission across sessions', async () => {
     const storage = new InMemoryHarness({ db: new InMemoryDB(), terminalHandoff: { enabled: true } });
     await storage.saveSession(session(), { ownerId: 'owner-1', ifVersion: 0 });

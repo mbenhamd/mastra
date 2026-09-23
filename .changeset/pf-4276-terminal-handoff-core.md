@@ -4,7 +4,7 @@
 
 Hardened Harness v1 terminal handoff admission, settlement, and recovery.
 
-- Terminal admission probes are scoped by session incarnation so a recreated session cannot resolve a previous incarnation's grant, and session incarnations are minted whenever terminal handoff is enabled.
+- Terminal admission probes are scoped by session incarnation so a recreated session cannot resolve a previous incarnation's grant, session incarnations are minted whenever terminal handoff is enabled, and a session stored before incarnations existed is repaired with a persisted incarnation on first load or update.
 - A grant generation now binds to a single admission across the harness; cancellation resolves the grant-wide winner before tombstoning, and delivery intents are namespaced by the durable admission identity.
 - Duplicate and re-admission envelopes that carry a cancelled or fenced stored row surface the durable outcome instead of dispatching the provider; a duplicate waiting on durable evidence surfaces a cancellation or fencing tombstone promptly.
 - Live duplicates wait behind the durable commit barrier, concurrent terminal committers share a single settlement attempt, and a settlement retry converging with the winner no longer emits a duplicate `agent_end`.

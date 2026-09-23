@@ -811,7 +811,7 @@ describe('HarnessPG native terminal handoff', () => {
     }
   });
 
-  it('mints an incarnation when an update upgrades a legacy NULL-incarnation row', async () => {
+  it('mints an incarnation when a legacy NULL-incarnation row is loaded or updated', async () => {
     const terminalOnly = terminalStore('pg-harness-terminal-legacy-store', schemaName, {}, { enabled: false });
     await terminalOnly.init();
     try {
@@ -822,12 +822,46 @@ describe('HarnessPG native terminal handoff', () => {
         `UPDATE "${schemaName}"."${TABLE_HARNESS_SESSIONS}" SET session_incarnation = NULL WHERE id = $1`,
         [session.id],
       );
+      // Loading repairs the legacy row and returns the persisted incarnation.
       const legacy = await th.loadSession({ harnessName: HARNESS, sessionId: session.id });
-      expect(legacy?.sessionIncarnation).toBeUndefined();
+      expect(legacy?.sessionIncarnation).toEqual(expect.any(String));
+      // The mint is persisted once: every later reader sees the same winner.
+      const reread = await th.loadSession({ harnessName: HARNESS, sessionId: session.id });
+      expect(reread?.sessionIncarnation).toBe(legacy?.sessionIncarnation);
+      const byThread = await th.loadSessionByThread({
+        harnessName: HARNESS,
+        threadId: session.threadId,
+        resourceId: session.resourceId,
+      });
+      expect(byThread?.sessionIncarnation).toBe(legacy?.sessionIncarnation);
 
+      // An update that omits the incarnation keeps the minted fence.
       await th.saveSession(
         { ...legacy!, sessionIncarnation: undefined },
         { ownerId: legacy!.ownerId, ifVersion: legacy!.version },
+      );
+      const reloaded = await th.loadSession({ harnessName: HARNESS, sessionId: session.id });
+      expect(reloaded?.sessionIncarnation).toBe(legacy?.sessionIncarnation);
+    } finally {
+      await terminalOnly.close();
+    }
+  });
+
+  it('mints an incarnation on the first update of a legacy row before any load repairs it', async () => {
+    const terminalOnly = terminalStore('pg-harness-terminal-legacy-save-store', schemaName, {}, { enabled: false });
+    await terminalOnly.init();
+    try {
+      const th = terminalOnly.stores.harness!;
+      const session = await createNativeSession(th, 'legacy-save-session');
+      // Simulate a row written before terminal handoff existed, observed by a
+      // caller record that also lacks the incarnation.
+      await terminalOnly.db.none(
+        `UPDATE "${schemaName}"."${TABLE_HARNESS_SESSIONS}" SET session_incarnation = NULL WHERE id = $1`,
+        [session.id],
+      );
+      await th.saveSession(
+        { ...session, sessionIncarnation: undefined },
+        { ownerId: session.ownerId, ifVersion: session.version },
       );
       const upgraded = await th.loadSession({ harnessName: HARNESS, sessionId: session.id });
       expect(upgraded?.sessionIncarnation).toEqual(expect.any(String));
@@ -1103,6 +1137,7 @@ describe('HarnessPG native terminal handoff', () => {
           harnessName: HARNESS,
           sessionId: input.sessionId,
           runId: input.runId,
+          sessionIncarnation: input.sessionIncarnation,
         }),
       ).rejects.toBeInstanceOf(expected);
       await expect(
@@ -1110,6 +1145,7 @@ describe('HarnessPG native terminal handoff', () => {
           harnessName: HARNESS,
           sessionId: input.sessionId,
           runId: input.runId,
+          sessionIncarnation: input.sessionIncarnation,
         }),
       ).rejects.toBeInstanceOf(expected);
       await expect(disabled.commitTerminalHandoff(commitInput(input, 'disabled'))).rejects.toBeInstanceOf(expected);

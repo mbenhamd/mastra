@@ -239,7 +239,9 @@ export class InMemoryHarness extends HarnessStorage {
     const record = this.db.harnessSessions.get(
       sessionKey(resolveHarnessName(harnessName, this.harnessName), sessionId),
     );
-    return record ? cloneSessionRecord(record) : null;
+    if (!record) return null;
+    this.repairSessionIncarnation(record);
+    return cloneSessionRecord(record);
   }
 
   async loadSessionByThread({
@@ -262,7 +264,22 @@ export class InMemoryHarness extends HarnessStorage {
         candidate = record;
       }
     }
-    return candidate ? cloneSessionRecord(candidate) : null;
+    if (!candidate) return null;
+    this.repairSessionIncarnation(candidate);
+    return cloneSessionRecord(candidate);
+  }
+
+  /**
+   * In-memory equivalent of the PG legacy-row repair: a record stored before
+   * `sessionIncarnation` existed mints one on first load under an
+   * incarnation-scoped feature so terminal fencing can be adopted without
+   * recreating the session. The mint mutates the stored record before the
+   * clone so every later reader sees the same persisted value.
+   */
+  private repairSessionIncarnation(record: SessionRecord): void {
+    if (!this.sessionRecordProjection.enabled && !this.terminalHandoff.enabled) return;
+    if (record.sessionIncarnation !== undefined && record.sessionIncarnation.length > 0) return;
+    record.sessionIncarnation = randomUUID();
   }
 
   async listSessions({
@@ -529,6 +546,10 @@ export class InMemoryHarness extends HarnessStorage {
       // the (harnessName, resourceId, threadId) key. Return it as the current
       // owner so the caller reopens it (closed) or fails new work (closing)
       // rather than creating a second active owner behind it.
+      // Reopening a legacy row goes through the same repair as a load, so the
+      // returned record carries the persisted incarnation the PG adapter
+      // mints inside `loadSessionByThread`.
+      this.repairSessionIncarnation(existing);
       if (this.sessionRecordProjection.enabled) {
         this.assertProjectionIncarnation(existing);
         this.assertProjectionFence(existing, 'active', existing.version);
@@ -904,9 +925,11 @@ export class InMemoryHarness extends HarnessStorage {
     if (!this.sessionRecordProjection.enabled) {
       if (!this.terminalHandoff.enabled) return record.sessionIncarnation;
       // Terminal handoff owns its incarnation fence without requiring the
-      // session-record projection feature: mint on create, preserve on update.
-      if (existing === undefined) return record.sessionIncarnation ?? randomUUID();
-      return existing.sessionIncarnation ?? record.sessionIncarnation;
+      // session-record projection feature: mint on create, preserve on update,
+      // and mint on the first update of a legacy row that predates
+      // incarnations. `||` treats a stored '' the same as a missing value.
+      if (existing === undefined) return record.sessionIncarnation || randomUUID();
+      return existing.sessionIncarnation || record.sessionIncarnation || randomUUID();
     }
     if (existing !== undefined) {
       this.assertProjectionIncarnation(existing);

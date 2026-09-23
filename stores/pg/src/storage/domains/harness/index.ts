@@ -218,13 +218,7 @@ type PgHarnessTx = PgHarnessClient & { closed: boolean; commit(): Promise<void>;
 type HarnessAttachmentOperationKind = 'put' | 'delete';
 const HARNESS_ATTACHMENT_PUT_ABANDONMENT_DELAY_MS = 60_000;
 type HarnessAttachmentOperationStatus =
-  | 'pending'
-  | 'uploaded'
-  | 'unknown'
-  | 'cleanup_pending'
-  | 'claimed'
-  | 'completed'
-  | 'cleaned';
+  'pending' | 'uploaded' | 'unknown' | 'cleanup_pending' | 'claimed' | 'completed' | 'cleaned';
 type PgAttachmentOperation = {
   id: string;
   harnessName: string;
@@ -1083,6 +1077,42 @@ export class HarnessPG extends HarnessStorage {
   // Session records
   // -------------------------------------------------------------------------
 
+  /**
+   * `session_incarnation` scopes terminal fencing, attachment byte ownership,
+   * and the session-record projection, so a row needs one whenever any of
+   * those features is enabled — the same gate the create paths mint under.
+   */
+  #requiresSessionIncarnation(): boolean {
+    return (
+      this.sessionRecordProjection.enabled || this.#attachmentByteOwner !== undefined || this.terminalHandoff.enabled
+    );
+  }
+
+  /**
+   * Repair a legacy row written before `session_incarnation` existed. The
+   * conditional UPDATE installs exactly one winner under concurrency; a loser
+   * re-reads the stored value, so every caller converges on the persisted
+   * incarnation instead of fencing on an unpersisted mint.
+   */
+  async #ensureSessionIncarnation(namespace: string, sessionId: string): Promise<string | undefined> {
+    const minted = randomUUID();
+    const updated = await this.#client.execute({
+      sql: `UPDATE ${TABLE_HARNESS_SESSIONS}
+            SET session_incarnation = ?
+            WHERE harness_name = ? AND id = ?
+              AND (session_incarnation IS NULL OR session_incarnation = '')`,
+      args: [minted, namespace, sessionId],
+    });
+    if (updated.rowsAffected > 0) return minted;
+    const reread = await this.#client.execute({
+      sql: `SELECT session_incarnation FROM ${TABLE_HARNESS_SESSIONS}
+            WHERE harness_name = ? AND id = ?`,
+      args: [namespace, sessionId],
+    });
+    const stored = reread.rows[0]?.session_incarnation;
+    return stored == null || String(stored).length === 0 ? undefined : String(stored);
+  }
+
   async loadSession({
     sessionId,
     harnessName,
@@ -1096,7 +1126,15 @@ export class HarnessPG extends HarnessStorage {
       args: [namespace, sessionId],
     });
     const row = result.rows[0];
-    return row ? rowToSession(row as Record<string, unknown>) : null;
+    if (!row) return null;
+    const record = rowToSession(row as Record<string, unknown>);
+    if (
+      (record.sessionIncarnation === undefined || record.sessionIncarnation.length === 0) &&
+      this.#requiresSessionIncarnation()
+    ) {
+      record.sessionIncarnation = await this.#ensureSessionIncarnation(namespace, sessionId);
+    }
+    return record;
   }
 
   async loadSessionByThread({
@@ -1122,7 +1160,15 @@ export class HarnessPG extends HarnessStorage {
       args: [namespace, threadId, resourceId],
     });
     const row = result.rows[0];
-    return row ? rowToSession(row as Record<string, unknown>) : null;
+    if (!row) return null;
+    const record = rowToSession(row as Record<string, unknown>);
+    if (
+      (record.sessionIncarnation === undefined || record.sessionIncarnation.length === 0) &&
+      this.#requiresSessionIncarnation()
+    ) {
+      record.sessionIncarnation = await this.#ensureSessionIncarnation(namespace, record.id);
+    }
+    return record;
   }
 
   async listSessions({
@@ -1512,6 +1558,11 @@ export class HarnessPG extends HarnessStorage {
 
     const harnessName = this.#resolveHarnessName(opts.harnessName ?? record.harnessName);
     const namespacedRecord: SessionRecord = { ...record, harnessName };
+    if (this.terminalHandoff.enabled && namespacedRecord.sessionIncarnation === undefined) {
+      // Same legacy-row upgrade as `saveSession`: the COALESCE set clause keeps
+      // a stored winner, so a mint here only fills a NULL/'' incarnation.
+      namespacedRecord.sessionIncarnation = randomUUID();
+    }
     const nextVersion = opts.ifVersion + 1;
     const cols = sessionColumnValues(namespacedRecord, nextVersion);
     const updateNames = cols.names.filter(
