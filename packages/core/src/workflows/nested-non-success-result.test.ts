@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
+import { MastraNonRetryableError } from '../error';
 import { Mastra } from '../mastra';
 import { MockStore } from '../storage/mock';
 import { createWorkflow } from './create';
@@ -21,11 +22,18 @@ describe('nested workflow non-success resolution', () => {
   // also keeps behavior truthful if a wrapper ever outlives its test — with no
   // stub armed every call falls through to the real implementation.
   const realStart = Run.prototype.start;
-  let stubbed: { workflowId: string; result: unknown } | null = null;
+  let stubbed: {
+    workflowId: string;
+    result: unknown;
+    calls: number;
+    onStart?: (run: Run<any, any, any, any, any>) => void;
+  } | null = null;
 
   beforeEach(() => {
     vi.spyOn(Run.prototype, 'start').mockImplementation(function (this: Run<any, any, any, any, any>, args: any) {
       if (stubbed && this.workflowId === stubbed.workflowId) {
+        stubbed.calls++;
+        stubbed.onStart?.(this);
         return Promise.resolve(stubbed.result as any);
       }
       return realStart.call(this, args);
@@ -45,8 +53,13 @@ describe('nested workflow non-success resolution', () => {
       execute,
     });
 
-  function stubNestedRunResult(workflowId: string, result: unknown) {
-    stubbed = { workflowId, result };
+  function stubNestedRunResult(
+    workflowId: string,
+    result: unknown,
+    onStart?: (run: Run<any, any, any, any, any>) => void,
+  ) {
+    stubbed = { workflowId, result, calls: 0, onStart };
+    return stubbed;
   }
 
   function buildParent(nested: ReturnType<typeof createWorkflow>, afterStep: ReturnType<typeof noopStep>) {
@@ -61,8 +74,8 @@ describe('nested workflow non-success resolution', () => {
       .commit();
   }
 
-  it.each(['canceled', 'suspended'] as const)(
-    'fails the step truthfully when the nested run resolves %s',
+  it.each(['canceled', 'suspended', 'paused'] as const)(
+    'fails the step truthfully when the nested run resolves %s outside per-step execution',
     async status => {
       const afterExecute = vi.fn().mockResolvedValue({});
       const nested = createWorkflow({
@@ -152,6 +165,84 @@ describe('nested workflow non-success resolution', () => {
     const result = await run.start({ inputData: {} });
 
     expect(result.status).toBe('canceled');
+  });
+
+  it('does not retry a nested run canceled with the parent run', async () => {
+    const afterExecute = vi.fn().mockResolvedValue({});
+    const nested = createWorkflow({
+      id: 'nested-workflow',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+      options: { validateInputs: false },
+    })
+      .then(noopStep('nested-step'))
+      .commit();
+    const parent = createWorkflow({
+      id: 'parent-workflow',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+      retryConfig: { attempts: 3, delay: 0 },
+      options: { validateInputs: false },
+    })
+      .then(nested as any)
+      .then(noopStep('after-nested', afterExecute))
+      .commit();
+
+    new Mastra({ logger: false, workflows: { 'parent-workflow': parent, 'nested-workflow': nested } });
+
+    const run = await parent.createRun();
+    const stub = stubNestedRunResult('nested-workflow', { status: 'canceled', steps: {} }, () => {
+      // Abort the parent while the nested run is in flight — the engine
+      // resolves the nested run 'canceled' alongside it.
+      run.abortController.abort();
+    });
+    const result = await run.start({ inputData: {} });
+
+    expect(result.status).toBe('canceled');
+    expect(result.steps['nested-workflow']?.status).toBe('canceled');
+    // The cancellation failure is non-retryable: each retry would launch a
+    // fresh nested run against a parent that is already tearing down.
+    expect(stub.calls).toBe(1);
+    expect(afterExecute).not.toHaveBeenCalled();
+  });
+
+  it('does not retry a nested run failed by a non-retryable loop condition', async () => {
+    const bodyExecute = vi.fn().mockResolvedValue({});
+    const condition = vi.fn(async () => {
+      throw new MastraNonRetryableError('permanent condition failure');
+    });
+    const nested = createWorkflow({
+      id: 'nested-workflow',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+      options: { validateInputs: false },
+    })
+      .dowhile(noopStep('loop-body', bodyExecute), condition)
+      .commit();
+    const parent = createWorkflow({
+      id: 'parent-workflow',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+      retryConfig: { attempts: 3, delay: 0 },
+      options: { validateInputs: false },
+    })
+      .then(nested as any)
+      .commit();
+
+    new Mastra({ logger: false, workflows: { 'parent-workflow': parent, 'nested-workflow': nested } });
+
+    const run = await parent.createRun();
+    const result = await run.start({ inputData: {} });
+
+    expect(result.status).toBe('failed');
+    // The failed loop step keeps the nonRetryable marker, so the parent
+    // refuses to rerun the whole child graph — a retryable failure would
+    // re-evaluate the condition on every retry attempt.
+    expect(condition).toHaveBeenCalledTimes(1);
+    expect(bodyExecute).toHaveBeenCalledTimes(1);
+    const nestedStepResult = result.steps['nested-workflow'];
+    expect(nestedStepResult?.status).toBe('failed');
+    expect((nestedStepResult as { nonRetryable?: boolean })?.nonRetryable).toBe(true);
   });
 
   it('propagates a per-step paused nested run instead of failing it', async () => {

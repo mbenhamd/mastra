@@ -3414,9 +3414,21 @@ export class Workflow<
       return undefined;
     }
 
-    // Every other status (canceled, paused without perStep, suspended with no
-    // propagatable step, or an engine-specific status like bailed on a
-    // snapshot re-read)
+    // WorkflowResult's union does not declare 'canceled' — the engine still
+    // produces it at runtime when the run is canceled alongside its parent.
+    if ((res.status as WorkflowRunStatus) === 'canceled' && abortSignal.aborted) {
+      // The parent run's abort signal canceled the nested run alongside it;
+      // the step handler records this step 'canceled'. Retry would launch a
+      // fresh nested run against a parent that is already tearing down, so
+      // fail non-retryably.
+      throw new MastraNonRetryableError(
+        `Nested workflow run '${run.runId}' for workflow '${this.id}' was canceled with the parent run`,
+      );
+    }
+
+    // Every other status (canceled without an aborted parent, paused without
+    // perStep, suspended with no propagatable step, or an engine-specific
+    // status like bailed on a snapshot re-read)
     // yields no step output. Returning undefined here previously let the
     // parent miscast the nested run as { status: 'success', output:
     // undefined } — the agentic dowhile then crashed inside consumeStream

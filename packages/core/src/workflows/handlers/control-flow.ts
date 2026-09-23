@@ -4,7 +4,7 @@ import type { done as DoneCallback } from 'fastq';
 import { TripWire } from '../../agent/trip-wire';
 import type { ActorSignal } from '../../auth/ee';
 import type { RequestContext } from '../../di';
-import { MastraError, ErrorDomain, ErrorCategory, getErrorFromUnknown } from '../../error';
+import { MastraError, MastraNonRetryableError, ErrorDomain, ErrorCategory, getErrorFromUnknown } from '../../error';
 import type { PubSub } from '../../events/pubsub';
 import { SpanType, createObservabilityContext, resolveObservabilityContext } from '../../observability';
 import type { ObservabilityContext } from '../../observability';
@@ -917,6 +917,11 @@ export async function executeLoop(
       return {
         status: 'failed',
         error: errorObj,
+        // Mirror executeStepWithRetry: a MastraNonRetryableError from the
+        // condition is a permanent failure. Keep the marker so a parent
+        // nested-workflow execute() rethrows non-retryably instead of
+        // rerunning the whole child graph.
+        ...(errorObj instanceof MastraNonRetryableError ? { nonRetryable: true as const } : {}),
         ...(errorObj instanceof TripWire ? { tripwire: errorObj } : {}),
         endedAt: Date.now(),
       } as StepResult<any, any, any, any>;
