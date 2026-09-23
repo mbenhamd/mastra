@@ -545,8 +545,9 @@ export class PostgresStore extends MastraCompositeStore {
 
   /**
    * Export one harness session subtree as a versioned execution-closure
-   * payload under a single REPEATABLE READ snapshot. See
-   * `exportExecutionClosure` for the manifest/pin contract.
+   * payload under a single REPEATABLE READ snapshot. A `complete` unit also
+   * retires the exported incarnation on the source inside the same
+   * transaction. See `exportExecutionClosure` for the manifest/pin contract.
    */
   async exportExecutionClosure(key: ExecutionClosureKey): Promise<ExecutionClosurePayload> {
     return exportExecutionClosure(this.#db, key, { schemaName: this.schema });

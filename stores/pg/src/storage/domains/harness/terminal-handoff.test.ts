@@ -955,6 +955,54 @@ describe('HarnessPG native terminal handoff', () => {
     }
   });
 
+  it('repairs a legacy NULL-incarnation row on the create-or-load rehydration path', async () => {
+    const terminalOnly = terminalStore(
+      'pg-harness-terminal-legacy-create-load-store',
+      schemaName,
+      {},
+      { enabled: false },
+    );
+    await terminalOnly.init();
+    try {
+      const th = terminalOnly.stores.harness!;
+      const session = await createNativeSession(th, 'legacy-create-load-session');
+      // Simulate a row written before terminal handoff existed.
+      await terminalOnly.db.none(
+        `UPDATE "${schemaName}"."${TABLE_HARNESS_SESSIONS}" SET session_incarnation = NULL WHERE id = $1`,
+        [session.id],
+      );
+
+      // The Harness.sessions.create(...) rehydration path resolves the
+      // existing owner by (resource, thread) — it must repair the legacy row
+      // before returning, or every terminal message fences in
+      // _prepareTerminalIdentity.
+      const rehydrated = await th.createOrLoadActiveSession(
+        createSampleSessionRecord({
+          id: 'legacy-create-load-other',
+          harnessName: HARNESS,
+          resourceId: session.resourceId,
+          threadId: session.threadId,
+        }),
+        { initialLease: { ownerId: 'owner-other', ttlMs: 60_000 } },
+      );
+      expect(rehydrated.created).toBe(false);
+      expect(rehydrated.record.id).toBe(session.id);
+      expect(rehydrated.record.sessionIncarnation).toEqual(expect.any(String));
+
+      // The mint is persisted once: a fresh load sees the same winner.
+      const reread = await th.loadSession({ harnessName: HARNESS, sessionId: session.id });
+      expect(reread?.sessionIncarnation).toBe(rehydrated.record.sessionIncarnation);
+
+      // Terminal handoff works on the repaired identity — the admission the
+      // hydrated record drives is created, not fenced.
+      const input = admissionFor(reread!, 'legacy-create-load');
+      await th.writeMessageResultEvidence(pendingEvidence(input));
+      await expect(th.admitTerminalHandoff(input)).resolves.toMatchObject({ status: 'created' });
+    } finally {
+      await terminalOnly.close();
+    }
+  });
+
   it('mints an incarnation on the first update of a legacy row before any load repairs it', async () => {
     const terminalOnly = terminalStore('pg-harness-terminal-legacy-save-store', schemaName, {}, { enabled: false });
     await terminalOnly.init();

@@ -846,6 +846,61 @@ describe('exportExecutionClosure', () => {
     );
     expect(manifest.pins).toHaveLength(2);
   });
+
+  it('retires the exported incarnation on the source when the closure is complete', async () => {
+    const { s, schemaName } = await store('fenceretire');
+    await seedClosure(s, schemaName, 'fr1');
+    const before = await s.db.one<{ session_incarnation: string; version: number }>(
+      `SELECT session_incarnation, version FROM "${schemaName}"."${TABLE_HARNESS_SESSIONS}" WHERE id = 'fr1'`,
+    );
+
+    const { manifest } = await exportExecutionClosure(s.db, { harnessName: HARNESS, sessionId: 'fr1' }, { schemaName });
+    expect(manifest.completeness).toBe('complete');
+    // The manifest still describes the exported (pre-rotation) epoch — its
+    // incarnation is what the importer rebinds fence rows away from.
+    expect(manifest.incarnations.fr1).toBe(before.session_incarnation);
+
+    const after = await s.db.one<{ session_incarnation: string; version: number }>(
+      `SELECT session_incarnation, version FROM "${schemaName}"."${TABLE_HARNESS_SESSIONS}" WHERE id = 'fr1'`,
+    );
+    // The exported epoch is retired atomically with the snapshot: a worker
+    // that acquires a fresh lease on the idle row can no longer execute
+    // under the exported incarnation, and a stale `ifVersion` save
+    // conflicts. The lease columns are untouched — the fence is the
+    // incarnation, not a fabricated owner.
+    expect(after.session_incarnation).not.toBe(before.session_incarnation);
+    expect(after.session_incarnation).toMatch(/^[0-9a-f-]{36}$/);
+    expect(after.version).toBe(before.version + 1);
+  });
+
+  it('leaves the source incarnation untouched when the closure is pinned', async () => {
+    const { s, schemaName } = await store('fencepin');
+    const harness = s.stores.harness!;
+    await harness.saveSession(
+      createSampleSessionRecord({
+        id: 'fp1',
+        harnessName: HARNESS,
+        resourceId: 'resource-fp1',
+        threadId: 'ghost-thread',
+      }),
+      { ifVersion: 0 },
+    );
+    const before = await s.db.one<{ session_incarnation: string; version: number }>(
+      `SELECT session_incarnation, version FROM "${schemaName}"."${TABLE_HARNESS_SESSIONS}" WHERE id = 'fp1'`,
+    );
+
+    const { manifest } = await exportExecutionClosure(s.db, { harnessName: HARNESS, sessionId: 'fp1' }, { schemaName });
+    expect(manifest.completeness).toBe('pinned');
+
+    // A pinned unit is not a migration boundary — the caller resolves the
+    // pins and re-exports, so the live incarnation must survive untouched
+    // for the next export's fence rows to rebind.
+    const after = await s.db.one<{ session_incarnation: string; version: number }>(
+      `SELECT session_incarnation, version FROM "${schemaName}"."${TABLE_HARNESS_SESSIONS}" WHERE id = 'fp1'`,
+    );
+    expect(after.session_incarnation).toBe(before.session_incarnation);
+    expect(after.version).toBe(before.version);
+  });
 });
 
 /** Sessions-table digest differs across a round trip (fresh incarnation +

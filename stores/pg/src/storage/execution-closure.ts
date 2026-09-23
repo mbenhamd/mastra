@@ -734,6 +734,12 @@ function parentPairsOf(table: ExecutionClosureTableName, row: Record<string, unk
  * Historical IDs are preserved verbatim; re-allocating execution authority is
  * the importer's job, not the exporter's.
  *
+ * A `complete` unit also retires the exported epoch on the source inside the
+ * same transaction — `session_incarnation` rotates and `version` advances on
+ * every exported session — so an idle source session cannot be re-leased and
+ * keep executing under the incarnation the closure just exported. A pinned
+ * unit writes nothing: the caller resolves the pins and re-exports.
+ *
  * Tables legitimately absent because their storage domain was disabled read
  * as empty sets. Unknown ancestry/ownership does not abort the export — it
  * records a pin so the unit can never be imported as `complete`.
@@ -1115,8 +1121,9 @@ export async function exportExecutionClosure(
     // A session row still held under a live lease means a source worker owns
     // it: the subtree can keep mutating after this snapshot, so the exported
     // unit is already stale on arrival while the source retains authority.
-    // There is no export-time fence that stops that writer, so the closure
-    // pins instead of silently split-braining the session.
+    // The incarnation retirement below only fences idle sessions — it cannot
+    // stop a worker already mid-write — so the closure pins instead of
+    // silently split-braining the session.
     const exportObservedAt = Date.now();
     for (const row of sessionRows) {
       const leaseExpiresAt =
@@ -1154,6 +1161,35 @@ export async function exportExecutionClosure(
           bindingId: row.binding_id,
         },
       });
+    }
+
+    // A `complete` manifest must still be fenced after commit: every read
+    // above is a snapshot read, and `acquireSessionLease` accepts any idle
+    // row — without a durable write a source worker could take a fresh
+    // lease the moment the export returns and keep executing the exported
+    // run under the exported incarnation (the destination's fresh
+    // incarnation fences nothing on the source), splitting the session's
+    // storage/provider effects across both stores. When the unit is
+    // complete, retire the exported epoch inside this transaction: rotate
+    // every exported session's `session_incarnation` and advance `version`,
+    // so work still bound to the exported incarnation — a suspended run's
+    // terminal identity, attachment byte ownership, projection claims, a
+    // stale `ifVersion` save — fences at the storage layer. REPEATABLE READ
+    // turns a concurrent post-snapshot write to a session row (a new lease,
+    // a racing export) into a serialization failure, so the export fails
+    // closed rather than reporting `complete` over a session that resumed
+    // mid-export. A pinned unit leaves the source untouched: the caller
+    // resolves the pins and re-exports, and the still-live incarnation keeps
+    // the closure's fence rows rebindable on the next import.
+    if (pins.length === 0) {
+      const rotated = sessionIds.map(() => randomUUID());
+      await t.none(
+        `UPDATE ${sessionsTable} AS s
+         SET session_incarnation = r.incarnation, version = s.version + 1
+         FROM (SELECT unnest($1::text[]) AS id, unnest($2::text[]) AS incarnation) AS r
+         WHERE s.harness_name = $3 AND s.id = r.id`,
+        [sessionIds, rotated, key.harnessName],
+      );
     }
 
     const manifest = buildExecutionClosureManifest({

@@ -218,13 +218,7 @@ type PgHarnessTx = PgHarnessClient & { closed: boolean; commit(): Promise<void>;
 type HarnessAttachmentOperationKind = 'put' | 'delete';
 const HARNESS_ATTACHMENT_PUT_ABANDONMENT_DELAY_MS = 60_000;
 type HarnessAttachmentOperationStatus =
-  | 'pending'
-  | 'uploaded'
-  | 'unknown'
-  | 'cleanup_pending'
-  | 'claimed'
-  | 'completed'
-  | 'cleaned';
+  'pending' | 'uploaded' | 'unknown' | 'cleanup_pending' | 'claimed' | 'completed' | 'cleaned';
 type PgAttachmentOperation = {
   id: string;
   harnessName: string;
@@ -2159,6 +2153,17 @@ export class HarnessPG extends HarnessStorage {
         }
         await tx.commit();
         const existing = rowToSession(activeRow as Record<string, unknown>);
+        // The same legacy repair loadSession/loadSessionByThread run: a row
+        // written before `session_incarnation` existed must mint one before
+        // the hydrated record returns, or every terminal message fences in
+        // `_prepareTerminalIdentity`. Runs after commit so the conditional
+        // UPDATE never contends with the FOR UPDATE lock this tx held.
+        if (
+          (existing.sessionIncarnation === undefined || existing.sessionIncarnation.length === 0) &&
+          this.#requiresSessionIncarnation()
+        ) {
+          existing.sessionIncarnation = await this.#ensureSessionIncarnation(harnessName, existing.id);
+        }
         return {
           record: existing,
           created: false,
