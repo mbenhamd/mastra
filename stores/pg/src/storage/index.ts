@@ -1,7 +1,12 @@
 import type { ConnectionOptions } from 'node:tls';
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
 import { createStorageErrorId, MastraCompositeStore } from '@mastra/core/storage';
-import type { StorageDomains } from '@mastra/core/storage';
+import type {
+  ExecutionClosureImportResult,
+  ExecutionClosureKey,
+  ExecutionClosurePayload,
+  StorageDomains,
+} from '@mastra/core/storage';
 import { parseSqlIdentifier } from '@mastra/core/utils';
 import { Pool } from 'pg';
 import {
@@ -45,6 +50,7 @@ import { ToolProviderConnectionsPG } from './domains/tool-provider-connections';
 import { WorkflowDefinitionsPG } from './domains/workflow-definitions';
 import { WorkflowsPG } from './domains/workflows';
 import { WorkspacesPG } from './domains/workspaces';
+import { exportExecutionClosure, importExecutionClosure } from './execution-closure';
 
 /** Default maximum number of connections in the pool */
 const DEFAULT_MAX_CONNECTIONS = 20;
@@ -526,6 +532,23 @@ export class PostgresStore extends MastraCompositeStore {
   /** The underlying reader pg.Pool, falling back to the writer pool when unset. */
   public get readPool(): Pool {
     return this.#readPool;
+  }
+
+  /**
+   * Export one harness session subtree as a versioned execution-closure
+   * payload under a single REPEATABLE READ snapshot. See
+   * `exportExecutionClosure` for the manifest/pin contract.
+   */
+  async exportExecutionClosure(key: ExecutionClosureKey): Promise<ExecutionClosurePayload> {
+    return exportExecutionClosure(this.#db, key, { schemaName: this.schema });
+  }
+
+  /**
+   * Stage and apply an exported execution closure into this store's schema.
+   * See `importExecutionClosure` for the verification/fresh-authority contract.
+   */
+  async importExecutionClosure(payload: ExecutionClosurePayload): Promise<ExecutionClosureImportResult> {
+    return importExecutionClosure(this.#db, payload, { schemaName: this.schema });
   }
 
   /**
