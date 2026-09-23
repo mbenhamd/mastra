@@ -218,7 +218,13 @@ type PgHarnessTx = PgHarnessClient & { closed: boolean; commit(): Promise<void>;
 type HarnessAttachmentOperationKind = 'put' | 'delete';
 const HARNESS_ATTACHMENT_PUT_ABANDONMENT_DELAY_MS = 60_000;
 type HarnessAttachmentOperationStatus =
-  'pending' | 'uploaded' | 'unknown' | 'cleanup_pending' | 'claimed' | 'completed' | 'cleaned';
+  | 'pending'
+  | 'uploaded'
+  | 'unknown'
+  | 'cleanup_pending'
+  | 'claimed'
+  | 'completed'
+  | 'cleaned';
 type PgAttachmentOperation = {
   id: string;
   harnessName: string;
