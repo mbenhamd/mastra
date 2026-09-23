@@ -90,6 +90,30 @@ function splitPairKey(pair: string): [workflowName: string, runId: string] {
 /** Scalar-shaped details bag accepted by {@link MastraError}. */
 type ClosureErrorDetails = Record<string, null | boolean | number | string>;
 
+/**
+ * Tombstone authority a `complete` export stamps onto the rows it leaves
+ * behind: exported sessions take it as `owner_id` and exported live outbox
+ * rows take it as `claim_id`, each with `EXPORTED_FENCE_EXPIRES_AT` as the
+ * expiry. The U+001F prefix cannot collide with a runtime-generated owner or
+ * claim id (the same convention the channel-binding external-id sentinel
+ * uses), and the far-future expiry makes the row read as permanently claimed
+ * to every lease/claim predicate — `acquireSessionLease`, lease renewals, the
+ * save paths, and `claimChannelOutbox` all refuse it with no special case.
+ * Only the owner can release or renew a claim, and no worker ever holds this
+ * id, so the fence is durable: the exported epoch can never resume on the
+ * source.
+ */
+export const EXPORTED_FENCE_AUTHORITY = '\x1f__mastra_execution_closure_exported__';
+/**
+ * Far-future expiry for {@link EXPORTED_FENCE_AUTHORITY} rows — the largest
+ * timestamp `Date` can represent (~275,760 years out), so no TTL ever reaches
+ * it while conflict errors that format it via `new Date(...)` stay valid.
+ */
+export const EXPORTED_FENCE_EXPIRES_AT = 8_640_000_000_000_000;
+
+/** Outbox statuses a dispatcher can still pick up — the ones export must fence. */
+const LIVE_OUTBOX_STATUSES = new Set(['pending', 'failed', 'claimed']);
+
 function closureError(operation: string, reason: string, text: string, details: ClosureErrorDetails): MastraError {
   return new MastraError({
     id: createStorageErrorId('PG', operation, reason),
@@ -735,10 +759,13 @@ function parentPairsOf(table: ExecutionClosureTableName, row: Record<string, unk
  * the importer's job, not the exporter's.
  *
  * A `complete` unit also retires the exported epoch on the source inside the
- * same transaction — `session_incarnation` rotates and `version` advances on
- * every exported session — so an idle source session cannot be re-leased and
- * keep executing under the incarnation the closure just exported. A pinned
- * unit writes nothing: the caller resolves the pins and re-exports.
+ * same transaction — every exported session's `session_incarnation` rotates
+ * and `version` advances, its lease is stamped with a tombstone authority no
+ * worker can hold or release, `closed_at` lands the terminal marker, and the
+ * pending-resume discovery scalar clears — so an idle source session can
+ * neither be re-leased nor reopened, and exported live channel-outbox rows
+ * take a tombstone claim so only the destination's copies can dispatch. A
+ * pinned unit writes nothing: the caller resolves the pins and re-exports.
  *
  * Tables legitimately absent because their storage domain was disabled read
  * as empty sets. Unknown ancestry/ownership does not abort the export — it
@@ -1121,11 +1148,23 @@ export async function exportExecutionClosure(
     // A session row still held under a live lease means a source worker owns
     // it: the subtree can keep mutating after this snapshot, so the exported
     // unit is already stale on arrival while the source retains authority.
-    // The incarnation retirement below only fences idle sessions — it cannot
-    // stop a worker already mid-write — so the closure pins instead of
-    // silently split-braining the session.
+    // The retirement below only fences idle sessions — it cannot stop a
+    // worker already mid-write — so the closure pins instead of silently
+    // split-braining the session.
     const exportObservedAt = Date.now();
     for (const row of sessionRows) {
+      // A row still stamped with the tombstone owner was already handed off
+      // by an earlier `complete` export: re-exporting it as `complete` would
+      // hand the same unit to a second destination while the first migrated
+      // copy may already be live. Pin so the caller reconciles against the
+      // stored manifest instead of minting a competing one.
+      if (row.owner_id === EXPORTED_FENCE_AUTHORITY) {
+        pins.push({
+          reason: 'session-already-exported',
+          detail: { sessionId: row.id },
+        });
+        continue;
+      }
       const leaseExpiresAt =
         row.lease_expires_at instanceof Date ? row.lease_expires_at.getTime() : Number(row.lease_expires_at);
       const leaseActive =
@@ -1170,26 +1209,65 @@ export async function exportExecutionClosure(
     // run under the exported incarnation (the destination's fresh
     // incarnation fences nothing on the source), splitting the session's
     // storage/provider effects across both stores. When the unit is
-    // complete, retire the exported epoch inside this transaction: rotate
-    // every exported session's `session_incarnation` and advance `version`,
-    // so work still bound to the exported incarnation — a suspended run's
-    // terminal identity, attachment byte ownership, projection claims, a
-    // stale `ifVersion` save — fences at the storage layer. REPEATABLE READ
-    // turns a concurrent post-snapshot write to a session row (a new lease,
-    // a racing export) into a serialization failure, so the export fails
-    // closed rather than reporting `complete` over a session that resumed
-    // mid-export. A pinned unit leaves the source untouched: the caller
-    // resolves the pins and re-exports, and the still-live incarnation keeps
-    // the closure's fence rows rebindable on the next import.
+    // complete, retire the exported epoch inside this transaction on every
+    // exported session:
+    // - `session_incarnation` rotates and `version` advances, so work still
+    //   bound to the exported incarnation — a suspended run's terminal
+    //   identity, attachment byte ownership, projection claims, a stale
+    //   `ifVersion` save — fences at the storage layer;
+    // - `owner_id`/`lease_expires_at` take the tombstone authority, a
+    //   permanent lease no worker can hold, renew, or release, so
+    //   `acquireSessionLease`, lease renewals, and every save path refuse
+    //   the row (incarnation rotation alone only fenced incarnation-bound
+    //   writes — a fresh lease could still adopt the rotated incarnation
+    //   and resume the session);
+    // - `closed_at` lands the terminal marker, so active-session scans skip
+    //   the tombstone and child admission rejects under a migrated parent;
+    // - `pending_resume_expires_at` clears, keeping the due-interaction
+    //   scan from surfacing a session that can never resume here.
+    // REPEATABLE READ turns a concurrent post-snapshot write to a session
+    // row (a new lease, a racing export) into a serialization failure, so
+    // the export fails closed rather than reporting `complete` over a
+    // session that resumed mid-export. A pinned unit leaves the source
+    // untouched: the caller resolves the pins and re-exports, and the
+    // still-live incarnation keeps the closure's fence rows rebindable on
+    // the next import.
     if (pins.length === 0) {
       const rotated = sessionIds.map(() => randomUUID());
       await t.none(
         `UPDATE ${sessionsTable} AS s
-         SET session_incarnation = r.incarnation, version = s.version + 1
+         SET session_incarnation = r.incarnation,
+             version = s.version + 1,
+             owner_id = $3,
+             lease_expires_at = $4,
+             closed_at = COALESCE(s.closed_at, $5),
+             pending_resume_expires_at = NULL
          FROM (SELECT unnest($1::text[]) AS id, unnest($2::text[]) AS incarnation) AS r
-         WHERE s.harness_name = $3 AND s.id = r.id`,
-        [sessionIds, rotated, key.harnessName],
+         WHERE s.harness_name = $6 AND s.id = r.id`,
+        [sessionIds, rotated, EXPORTED_FENCE_AUTHORITY, EXPORTED_FENCE_EXPIRES_AT, exportObservedAt, key.harnessName],
       );
+
+      // Exported outbox rows in a claimable state face the same split-brain:
+      // `claimChannelOutbox` filters by status and claim timing, never the
+      // session incarnation, so a live source row and its imported
+      // destination copy would both dispatch — two stores sending the same
+      // provider-visible message with idempotency ledgers that cannot
+      // dedupe each other. Stamp the tombstone claim on every exported
+      // live row so only the destination's copy can ever send. Settled
+      // rows (`sent`/`dead`) are already terminal evidence and stay
+      // untouched.
+      const liveOutboxIds = (rows[TABLE_HARNESS_CHANNEL_OUTBOX] ?? [])
+        .filter(row => typeof row.id === 'string' && LIVE_OUTBOX_STATUSES.has(String(row.status)))
+        .map(row => String(row.id));
+      if (liveOutboxIds.length > 0) {
+        await t.none(
+          `UPDATE ${tableSql(TABLE_HARNESS_CHANNEL_OUTBOX, schemaName)}
+           SET claim_id = $2, claim_expires_at = $3, updated_at = $4
+           WHERE harness_name = $1 AND id = ANY($5::text[])
+             AND status IN ('pending', 'failed', 'claimed')`,
+          [key.harnessName, EXPORTED_FENCE_AUTHORITY, EXPORTED_FENCE_EXPIRES_AT, exportObservedAt, liveOutboxIds],
+        );
+      }
     }
 
     const manifest = buildExecutionClosureManifest({

@@ -2,6 +2,9 @@ import { randomUUID } from 'node:crypto';
 
 import { createSampleMessageV2, createSampleResource, createSampleSessionRecord } from '@internal/storage-test-utils';
 import {
+  HarnessStorageLeaseConflictError,
+  HarnessStorageParentSessionUnavailableError,
+  HarnessStorageSessionProjectionIncarnationError,
   TABLE_BACKGROUND_TASKS,
   TABLE_HARNESS_ATTACHMENTS,
   TABLE_HARNESS_ATTACHMENT_OPERATIONS,
@@ -30,7 +33,12 @@ import {
 import { afterAll, describe, expect, it, vi } from 'vitest';
 
 import { PostgresStore } from '..';
-import { exportExecutionClosure, importExecutionClosure } from './execution-closure';
+import {
+  EXPORTED_FENCE_AUTHORITY,
+  EXPORTED_FENCE_EXPIRES_AT,
+  exportExecutionClosure,
+  importExecutionClosure,
+} from './execution-closure';
 import { TEST_CONFIG } from './test-utils';
 
 vi.setConfig({ testTimeout: 60_000, hookTimeout: 60_000 });
@@ -860,17 +868,29 @@ describe('exportExecutionClosure', () => {
     // incarnation is what the importer rebinds fence rows away from.
     expect(manifest.incarnations.fr1).toBe(before.session_incarnation);
 
-    const after = await s.db.one<{ session_incarnation: string; version: number }>(
-      `SELECT session_incarnation, version FROM "${schemaName}"."${TABLE_HARNESS_SESSIONS}" WHERE id = 'fr1'`,
+    const after = await s.db.one<{
+      session_incarnation: string;
+      version: number;
+      owner_id: string | null;
+      lease_expires_at: string | null;
+      closed_at: string | null;
+      pending_resume_expires_at: string | null;
+    }>(
+      `SELECT session_incarnation, version, owner_id, lease_expires_at, closed_at, pending_resume_expires_at
+       FROM "${schemaName}"."${TABLE_HARNESS_SESSIONS}" WHERE id = 'fr1'`,
     );
-    // The exported epoch is retired atomically with the snapshot: a worker
-    // that acquires a fresh lease on the idle row can no longer execute
-    // under the exported incarnation, and a stale `ifVersion` save
-    // conflicts. The lease columns are untouched — the fence is the
-    // incarnation, not a fabricated owner.
+    // The exported epoch is retired atomically with the snapshot: the
+    // rotated incarnation fences incarnation-bound work, while the
+    // tombstone lease and the closed marker make the row itself refuse
+    // every fresh lease, reopen, renewal, and save — not just the writes
+    // bound to the exported incarnation.
     expect(after.session_incarnation).not.toBe(before.session_incarnation);
     expect(after.session_incarnation).toMatch(/^[0-9a-f-]{36}$/);
     expect(after.version).toBe(before.version + 1);
+    expect(after.owner_id).toBe(EXPORTED_FENCE_AUTHORITY);
+    expect(Number(after.lease_expires_at)).toBe(EXPORTED_FENCE_EXPIRES_AT);
+    expect(after.closed_at).not.toBeNull();
+    expect(after.pending_resume_expires_at).toBeNull();
   });
 
   it('leaves the source incarnation untouched when the closure is pinned', async () => {
@@ -900,6 +920,218 @@ describe('exportExecutionClosure', () => {
     );
     expect(after.session_incarnation).toBe(before.session_incarnation);
     expect(after.version).toBe(before.version);
+  });
+
+  it('refuses every fresh source authority on the exported session after a complete export', async () => {
+    const { s, schemaName } = await store('sessionfence');
+    const { threadId, resourceId } = await seedClosure(s, schemaName, 'sf1');
+    const harness = s.stores.harness!;
+    const before = await harness.loadSession({ harnessName: HARNESS, sessionId: 'sf1' });
+
+    const { manifest } = await exportExecutionClosure(s.db, { harnessName: HARNESS, sessionId: 'sf1' }, { schemaName });
+    expect(manifest.completeness).toBe('complete');
+
+    // The tombstone lease is permanent and the terminal marker is set — the
+    // row reads as migrated evidence, not a resumable session.
+    const tombstone = await harness.loadSession({ harnessName: HARNESS, sessionId: 'sf1' });
+    expect(tombstone?.ownerId).toBe(EXPORTED_FENCE_AUTHORITY);
+    expect(tombstone?.leaseExpiresAt).toBe(EXPORTED_FENCE_EXPIRES_AT);
+    expect(tombstone?.closedAt).toEqual(expect.any(Number));
+    expect(tombstone?.version).toBe(before!.version + 1);
+
+    // A fresh worker cannot lease, renew, or quietly release the tombstone.
+    await expect(
+      harness.acquireSessionLease({ harnessName: HARNESS, sessionId: 'sf1', ownerId: 'w2', ttlMs: 60_000 }),
+    ).rejects.toBeInstanceOf(HarnessStorageLeaseConflictError);
+    await expect(
+      harness.renewSessionLease({ harnessName: HARNESS, sessionId: 'sf1', ownerId: 'w2', ttlMs: 60_000 }),
+    ).rejects.toBeInstanceOf(HarnessStorageLeaseConflictError);
+    await expect(
+      harness.releaseSessionLease({ harnessName: HARNESS, sessionId: 'sf1', ownerId: 'w2' }),
+    ).resolves.toBeUndefined();
+    expect((await harness.loadSession({ harnessName: HARNESS, sessionId: 'sf1' }))?.ownerId).toBe(
+      EXPORTED_FENCE_AUTHORITY,
+    );
+
+    // A save carrying the rotated incarnation's current version still hits
+    // the tombstone lease — acceptance cannot resume on the source.
+    await expect(
+      harness.saveSession(
+        { ...tombstone!, lastActivityAt: Date.now() },
+        { ifVersion: tombstone!.version, ownerId: 'w2' },
+      ),
+    ).rejects.toBeInstanceOf(HarnessStorageLeaseConflictError);
+
+    // Admission on the owning thread still resolves to the tombstone
+    // record — and with the session's incarnation rotated, its exported-epoch
+    // projection fence fails closed before a record is even returned. On a
+    // projection-disabled store the same resolution would hand the closed
+    // record to the harness reopen path, which then dies on the refused
+    // lease above.
+    const rehydrated = await harness.loadSessionByThread({ harnessName: HARNESS, resourceId, threadId });
+    expect(rehydrated?.id).toBe('sf1');
+    expect(rehydrated?.closedAt).toEqual(expect.any(Number));
+    await expect(
+      harness.createOrLoadActiveSession(
+        createSampleSessionRecord({
+          id: 'sf1-replacement',
+          harnessName: HARNESS,
+          resourceId,
+          threadId,
+        }),
+        { initialLease: { ownerId: 'w2', ttlMs: 60_000 } },
+      ),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionProjectionIncarnationError);
+
+    // A child session cannot be admitted under a migrated parent.
+    await expect(
+      harness.createOrLoadActiveSession(
+        createSampleSessionRecord({
+          id: 'sf1-newchild',
+          harnessName: HARNESS,
+          resourceId,
+          threadId: 'thread-sf1-newchild',
+          parentSessionId: 'sf1',
+        }),
+        { initialLease: { ownerId: 'w2', ttlMs: 60_000 } },
+      ),
+    ).rejects.toBeInstanceOf(HarnessStorageParentSessionUnavailableError);
+
+    // Active scans hide the tombstone; it stays readable as closed evidence.
+    expect(await harness.listSessions({ resourceId })).toEqual([]);
+    expect((await harness.listSessions({ resourceId, includeClosed: true })).map(r => r.id).sort()).toEqual([
+      'sf1',
+      'sf1-child',
+    ]);
+
+    // Re-exporting an already-retired session pins instead of handing the
+    // same unit to a second destination.
+    const again = await exportExecutionClosure(s.db, { harnessName: HARNESS, sessionId: 'sf1' }, { schemaName });
+    expect(again.manifest.completeness).toBe('pinned');
+    expect(again.manifest.pins).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ reason: 'session-already-exported', detail: { sessionId: 'sf1' } }),
+        expect.objectContaining({ reason: 'session-already-exported', detail: { sessionId: 'sf1-child' } }),
+      ]),
+    );
+    expect(again.manifest.pins).toHaveLength(2);
+  });
+
+  it('fences source outbox rows at export while the imported copies stay claimable', async () => {
+    const src = await store('obsrc');
+    const dst = await store('obdst');
+    const { threadId, resourceId } = await seedClosure(src.s, src.schemaName, 'ob1');
+    const harness = src.s.stores.harness!;
+    const dstHarness = dst.s.stores.harness!;
+    const now = Date.now();
+    const insertOutbox = (id: string, status: string, sessionId: string) =>
+      src.s.db.none(
+        `INSERT INTO "${src.schemaName}"."${TABLE_HARNESS_CHANNEL_OUTBOX}"
+           (id, harness_name, channel_id, provider_id, binding_id, binding_generation,
+            idempotency_key, payload_hash, resource_id, thread_id, session_id, owning_session_id,
+            target, kind, operation_kind, payload, delivery_semantics, status, attempts,
+            claim_id, claim_expires_at, next_attempt_at, sent_at, dead_at, created_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14,$15,$16::jsonb,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)`,
+        [
+          id,
+          HARNESS,
+          `chan-${id}`,
+          'provider-1',
+          `bind-${id}`,
+          1,
+          `idem-${id}`,
+          `ph-${id}`,
+          resourceId,
+          threadId,
+          sessionId,
+          sessionId,
+          JSON.stringify({
+            platform: 'test',
+            externalTenantId: 'tenant',
+            externalChannelId: 'channel',
+            externalThreadId: 'thread-ext',
+          }),
+          'assistant-message',
+          'message-create',
+          JSON.stringify({ text: `hello ${id}` }),
+          'native-idempotency',
+          status,
+          0,
+          status === 'claimed' ? 'src-claim' : null,
+          status === 'claimed' ? now + 60_000 : null,
+          status === 'failed' ? now - 1_000 : null,
+          status === 'sent' ? now - 1_000 : null,
+          status === 'dead' ? now - 1_000 : null,
+          now,
+          now,
+        ],
+      );
+    await insertOutbox('ob-pending', 'pending', 'ob1');
+    await insertOutbox('ob-failed', 'failed', 'ob1');
+    await insertOutbox('ob-claimed', 'claimed', 'ob1');
+    await insertOutbox('ob-sent', 'sent', 'ob1');
+    await insertOutbox('ob-dead', 'dead', 'ob1');
+    // A foreign session's live row is outside the closure — it must stay
+    // claimable on the source.
+    await insertOutbox('ob-foreign', 'pending', 'other-session');
+
+    const exported = await exportExecutionClosure(
+      src.s.db,
+      { harnessName: HARNESS, sessionId: 'ob1' },
+      { schemaName: src.schemaName },
+    );
+    expect(exported.manifest.completeness).toBe('complete');
+    expect((exported.rows[TABLE_HARNESS_CHANNEL_OUTBOX] ?? []).map(r => r.id).sort()).toEqual([
+      'ob-claimed',
+      'ob-dead',
+      'ob-failed',
+      'ob-pending',
+      'ob-sent',
+    ]);
+
+    // Source side: every exported live row carries the tombstone claim, so
+    // only the foreign row can still be picked up — the exported work can
+    // never dispatch a provider-visible send from here again.
+    const srcClaims = await harness.claimChannelOutbox({
+      harnessName: HARNESS,
+      claimId: 'src-claim-2',
+      limit: 10,
+      now: Date.now(),
+      claimTtlMs: 60_000,
+    });
+    expect(srcClaims.map(i => i.id)).toEqual(['ob-foreign']);
+    const fenced = await src.s.db.manyOrNone<Record<string, unknown>>(
+      `SELECT id, status, claim_id FROM "${src.schemaName}"."${TABLE_HARNESS_CHANNEL_OUTBOX}"
+       WHERE id = ANY($1::text[]) ORDER BY id`,
+      [['ob-pending', 'ob-failed', 'ob-claimed']],
+    );
+    for (const row of fenced) {
+      expect(row.claim_id).toBe(EXPORTED_FENCE_AUTHORITY);
+    }
+    // Settled rows stay untouched as delivery evidence.
+    const settled = await src.s.db.manyOrNone<Record<string, unknown>>(
+      `SELECT id, status, claim_id FROM "${src.schemaName}"."${TABLE_HARNESS_CHANNEL_OUTBOX}"
+       WHERE id = ANY($1::text[]) ORDER BY id`,
+      [['ob-sent', 'ob-dead']],
+    );
+    expect(settled.map(r => [r.status, r.claim_id ?? null])).toEqual([
+      ['dead', null],
+      ['sent', null],
+    ]);
+
+    // Destination side: the imported copies restored from the manifest are
+    // claimable — `pending`/`failed` as-is, `claimed` requeued — while
+    // settled rows stay evidence.
+    const result = await importExecutionClosure(dst.s.db, exported, { schemaName: dst.schemaName });
+    expect(result.status).toBe('imported');
+    const dstClaims = await dstHarness.claimChannelOutbox({
+      harnessName: HARNESS,
+      claimId: 'dst-claim-1',
+      limit: 10,
+      now: Date.now(),
+      claimTtlMs: 60_000,
+    });
+    expect(dstClaims.map(i => i.id).sort()).toEqual(['ob-claimed', 'ob-failed', 'ob-pending']);
   });
 });
 

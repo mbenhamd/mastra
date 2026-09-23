@@ -139,7 +139,10 @@ export const EXECUTION_CLOSURE_TABLES: Partial<Record<ExecutionClosureTableName,
   // --- Harness session subtree ---
   // Live lease/owner fields clear on import: the restored session arrives
   // dormant with a fresh session_incarnation allocated by the importer, so an
-  // unexpired old lease can never carry authority across the boundary.
+  // unexpired old lease can never carry authority across the boundary. On a
+  // `complete` export the SOURCE row is retired in the same transaction — a
+  // tombstone owner/lease, `closed_at`, a rotated incarnation, and a version
+  // bump — so no source worker can lease, reopen, or save it again.
   [TABLE_HARNESS_SESSIONS]: state([{ column: 'id', dimension: 'session' }], false, ['owner_id', 'lease_expires_at']),
   [TABLE_HARNESS_SESSION_EVENTS]: state([sessionScope]),
   [TABLE_HARNESS_MESSAGE_RESULTS]: state([sessionScope]),
@@ -223,7 +226,12 @@ export const EXECUTION_CLOSURE_TABLES: Partial<Record<ExecutionClosureTableName,
   // source already performed, while dropping `pending`/`failed` rows loses
   // work the migrated session still owes. Live claim fields clear on import
   // and a `claimed` row requeues as `pending` — a source claim/lease is
-  // meaningless on the destination; settled rows stay durable evidence.
+  // meaningless on the destination; settled rows stay durable evidence. The
+  // claim scan filters by status/claim timing, never the session
+  // incarnation, so a `complete` export also stamps a tombstone claim on the
+  // SOURCE rows it leaves behind — otherwise both stores could dispatch the
+  // same provider-visible delivery and their separate idempotency ledgers
+  // could never dedupe each other.
   [TABLE_HARNESS_CHANNEL_OUTBOX]: fence(
     [sessionScope, { column: 'owning_session_id', dimension: 'session' }],
     false,
