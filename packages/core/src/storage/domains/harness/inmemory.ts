@@ -1608,6 +1608,32 @@ export class InMemoryHarness extends HarnessStorage {
     }
     const evidenceKey = messageEvidenceKey(namespace, stored.sessionId, stored.signalId);
     const currentEvidence = this.db.harnessMessageResultEvidence.get(evidenceKey);
+    const terminalResult = canonicalHarnessTerminalResult(input.terminalResult);
+    const projection = prepareHarnessTerminalProjection(input.projection, this.terminalHandoff.maxPayloadBytes);
+    const intentId = harnessTerminalIntentId(stored.id);
+    const existingIntent = this.db.harnessTerminalIntents.get(intentId);
+    if (stored.status === 'committed') {
+      // A committed replay must still resolve to `duplicate` after the
+      // message-result evidence row is compacted or deleted — the persisted
+      // intent is itself durable proof of the committed outcome. Evidence is
+      // compared only when it still exists.
+      if (!existingIntent || !sameTerminalIntentValue(existingIntent, terminalResult, projection)) {
+        throw new HarnessTerminalHandoffIdentityConflictError(stored.executionGrant.key);
+      }
+      if (
+        currentEvidence &&
+        (!sameMessageEvidenceIdentity(currentEvidence, resultEvidence) ||
+          currentEvidence.status !== 'completed' ||
+          stableJsonString(currentEvidence.result) !== stableJsonString(resultEvidence.result))
+      ) {
+        throw new HarnessTerminalHandoffIdentityConflictError(stored.executionGrant.key);
+      }
+      return {
+        status: 'duplicate',
+        admission: cloneHarnessTerminal(stored),
+        intent: cloneHarnessTerminal(existingIntent),
+      };
+    }
     if (!currentEvidence) {
       throw new HarnessTerminalHandoffValidationError(
         'resultEvidence',
@@ -1619,25 +1645,6 @@ export class InMemoryHarness extends HarnessStorage {
     }
     if (currentEvidence.status === 'failed') {
       throw new HarnessTerminalHandoffIdentityConflictError(stored.executionGrant.key);
-    }
-    const terminalResult = canonicalHarnessTerminalResult(input.terminalResult);
-    const projection = prepareHarnessTerminalProjection(input.projection, this.terminalHandoff.maxPayloadBytes);
-    const intentId = harnessTerminalIntentId(stored.id);
-    const existingIntent = this.db.harnessTerminalIntents.get(intentId);
-    if (stored.status === 'committed') {
-      if (
-        !existingIntent ||
-        !sameTerminalIntentValue(existingIntent, terminalResult, projection) ||
-        currentEvidence.status !== 'completed' ||
-        stableJsonString(currentEvidence.result) !== stableJsonString(resultEvidence.result)
-      ) {
-        throw new HarnessTerminalHandoffIdentityConflictError(stored.executionGrant.key);
-      }
-      return {
-        status: 'duplicate',
-        admission: cloneHarnessTerminal(stored),
-        intent: cloneHarnessTerminal(existingIntent),
-      };
     }
     if (existingIntent) {
       if (!sameTerminalIntentValue(existingIntent, terminalResult, projection)) {
@@ -1823,9 +1830,14 @@ export class InMemoryHarness extends HarnessStorage {
       throw new HarnessTerminalHandoffValidationError('claim', 'clock and lease must be positive safe integers');
     }
     const claimed: HarnessTerminalIntent[] = [];
+    // Claim order is wall-clock creation first: `revision` is only scoped to
+    // (harness, session, incarnation), so sorting by it globally would let a
+    // new session's revision-1 intent starve an older session's backlog. The
+    // per-session ordering guarantee itself is enforced separately by
+    // `hasEarlierUnsettledTerminalIntent`.
     const candidates = [...this.db.harnessTerminalIntents.values()]
       .filter(intent => intent.harnessName === namespace)
-      .sort((a, b) => a.revision - b.revision || a.id.localeCompare(b.id));
+      .sort((a, b) => a.createdAt - b.createdAt || a.revision - b.revision || a.id.localeCompare(b.id));
     for (const current of candidates) {
       if (claimed.length >= input.limit) break;
       if (current.status === 'claimed' && (current.claimExpiresAt ?? 0) > now) continue;
@@ -1848,6 +1860,10 @@ export class InMemoryHarness extends HarnessStorage {
       current.status = 'claimed';
       current.claimId = terminalClaimId();
       current.claimExpiresAt = now + leaseMs;
+      // Reclaiming a failed intent must drop the stale retry schedule and
+      // error so the new claim starts clean, matching the PG claim UPDATE.
+      current.nextAttemptAt = undefined;
+      current.lastError = undefined;
       current.attempts += 1;
       current.updatedAt = now;
       claimed.push(cloneHarnessTerminal(current));
@@ -1859,9 +1875,15 @@ export class InMemoryHarness extends HarnessStorage {
     input: HarnessTerminalClaimIdentity & { leaseMs?: number },
   ): Promise<HarnessTerminalRenewReceipt> {
     this.assertTerminalHandoffEnabled();
-    const current = this.requireTerminalClaim(input);
     const now = input.now ?? Date.now();
     const leaseMs = input.leaseMs ?? this.terminalHandoff.claimLeaseMs;
+    if (!Number.isSafeInteger(now) || now < 0) {
+      throw new HarnessTerminalHandoffValidationError('now', 'must be a non-negative safe integer');
+    }
+    if (!Number.isSafeInteger(leaseMs) || leaseMs <= 0) {
+      throw new HarnessTerminalHandoffValidationError('leaseMs', 'must be a positive safe integer');
+    }
+    const current = this.requireTerminalClaim(input);
     current.claimExpiresAt = now + leaseMs;
     current.updatedAt = now;
     return { status: 'renewed', intent: cloneHarnessTerminal(current) };
@@ -1869,13 +1891,17 @@ export class InMemoryHarness extends HarnessStorage {
 
   async ackTerminalIntent(input: HarnessTerminalClaimIdentity): Promise<HarnessTerminalAckReceipt> {
     this.assertTerminalHandoffEnabled();
+    const now = input.now ?? Date.now();
+    if (!Number.isSafeInteger(now) || now < 0) {
+      throw new HarnessTerminalHandoffValidationError('now', 'must be a non-negative safe integer');
+    }
     const current = this.requireTerminalIdentity(input);
     if (current.status === 'fenced') return { status: 'fenced', intent: cloneHarnessTerminal(current) };
     if (current.status === 'acked') return { status: 'duplicate', intent: cloneHarnessTerminal(current) };
     this.requireTerminalClaim(input);
     this.adjustTerminalPressure(current.harnessName, -1, -current.projection.payloadBytes);
     current.status = 'acked';
-    current.ackedAt = input.now ?? Date.now();
+    current.ackedAt = now;
     current.claimId = undefined;
     current.claimExpiresAt = undefined;
     current.updatedAt = current.ackedAt;
@@ -1886,10 +1912,13 @@ export class InMemoryHarness extends HarnessStorage {
     input: HarnessTerminalClaimIdentity & { error: HarnessTerminalError },
   ): Promise<HarnessTerminalFailReceipt> {
     this.assertTerminalHandoffEnabled();
+    const now = input.now ?? Date.now();
+    if (!Number.isSafeInteger(now) || now < 0) {
+      throw new HarnessTerminalHandoffValidationError('now', 'must be a non-negative safe integer');
+    }
     const current = this.requireTerminalIdentity(input);
     if (current.status === 'fenced') return { status: 'fenced', intent: cloneHarnessTerminal(current) };
     this.requireTerminalClaim(input);
-    const now = input.now ?? Date.now();
     current.lastError = cloneHarnessTerminal(input.error);
     current.claimId = undefined;
     current.claimExpiresAt = undefined;
@@ -4574,7 +4603,7 @@ function resolveHarnessName(input: string | undefined, fallback: string): string
 // ---------------------------------------------------------------------------
 
 function planTaskKey(harnessName: string, sessionId: string, taskId: string): string {
-  return `${harnessName} ${sessionId} ${taskId}`;
+  return `${harnessName}\u0000${sessionId}\u0000${taskId}`;
 }
 
 function clonePlanTask(task: HarnessPlanTask): HarnessPlanTask {

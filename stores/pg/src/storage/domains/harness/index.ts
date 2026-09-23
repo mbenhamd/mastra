@@ -4807,7 +4807,16 @@ export class HarnessPG extends HarnessStorage {
             WHERE id = ? AND harness_name = ? LIMIT 1`,
       args: [id, harnessName],
     });
-    return result.rows[0] ? rowToHarnessTerminalAdmission(result.rows[0] as Record<string, unknown>) : null;
+    const row = result.rows[0];
+    if (!row) return null;
+    const admission = rowToHarnessTerminalAdmission(row as Record<string, unknown>);
+    // The caller-supplied admission id is part of the durable identity: a
+    // row found by grant that carries a different admission id is a
+    // conflicting replay, not a load miss.
+    if (admission.admissionId !== input.admissionId) {
+      throw new HarnessTerminalHandoffIdentityConflictError(input.executionGrant.key);
+    }
+    return admission;
   }
 
   async loadPendingTerminalAdmission(
@@ -4901,18 +4910,29 @@ export class HarnessPG extends HarnessStorage {
         throw new HarnessTerminalHandoffFencedError(admissionInput.sessionId);
       }
 
+      // The intent is locked before evidence so a committed replay can still
+      // resolve to `duplicate` after the message-result evidence row has been
+      // compacted or deleted — the persisted intent is itself durable proof of
+      // the committed outcome.
+      const intentRow = await tx.execute({
+        sql: `SELECT * FROM ${TABLE_HARNESS_TERMINAL_INTENTS} WHERE id = ? LIMIT 1 FOR UPDATE`,
+        args: [intentId],
+      });
+      const existingIntent = intentRow.rows[0]
+        ? rowToHarnessTerminalIntent(intentRow.rows[0] as Record<string, unknown>)
+        : undefined;
+
       const evidenceRow = await tx.execute({
         sql: `SELECT * FROM ${TABLE_HARNESS_MESSAGE_RESULTS} WHERE id = ? LIMIT 1 FOR UPDATE`,
         args: [evidenceId],
       });
-      if (!evidenceRow.rows[0]) {
-        throw new HarnessTerminalHandoffValidationError(
-          'resultEvidence',
-          'canonical pending message-result evidence is missing',
-        );
-      }
-      const currentEvidence = rowToMessageResultEvidence(evidenceRow.rows[0] as Record<string, unknown>);
+      const currentEvidence = evidenceRow.rows[0]
+        ? rowToMessageResultEvidence(evidenceRow.rows[0] as Record<string, unknown>)
+        : undefined;
       const resultEvidence = { ...input.resultEvidence, harnessName };
+      // The replay must always claim the durable identity the admission
+      // recorded; only the evidence-row comparisons are conditional on the
+      // evidence still existing.
       if (
         resultEvidence.status !== 'completed' ||
         resultEvidence.signalId !== stored.signalId ||
@@ -4921,23 +4941,43 @@ export class HarnessPG extends HarnessStorage {
         resultEvidence.resourceId !== stored.resourceId ||
         resultEvidence.threadId !== stored.threadId ||
         resultEvidence.admissionId !== stored.admissionId ||
-        resultEvidence.admissionHash !== stored.admissionHash ||
-        !sameMessageEvidenceIdentity(currentEvidence, resultEvidence)
+        resultEvidence.admissionHash !== stored.admissionHash
       ) {
+        throw new HarnessTerminalHandoffIdentityConflictError(stored.executionGrant.key);
+      }
+
+      if (stored.status === 'committed') {
+        if (!existingIntent || !sameHarnessTerminalIntent(existingIntent, terminalResult, projection)) {
+          throw new HarnessTerminalHandoffIdentityConflictError(stored.executionGrant.key);
+        }
+        // Evidence is compactable evidence, not authority: when it survives it
+        // must still match, but its absence cannot demote a committed outcome.
+        if (
+          currentEvidence &&
+          (!sameMessageEvidenceIdentity(currentEvidence, resultEvidence) ||
+            currentEvidence.status !== 'completed' ||
+            stableJsonString(currentEvidence.result) !== stableJsonString(persistedJsonValue(resultEvidence.result)))
+        ) {
+          throw new HarnessTerminalHandoffIdentityConflictError(stored.executionGrant.key);
+        }
+        await tx.commit();
+        return { status: 'duplicate', admission: stored, intent: existingIntent };
+      }
+
+      if (!currentEvidence) {
+        throw new HarnessTerminalHandoffValidationError(
+          'resultEvidence',
+          'canonical pending message-result evidence is missing',
+        );
+      }
+      if (!sameMessageEvidenceIdentity(currentEvidence, resultEvidence)) {
         throw new HarnessTerminalHandoffIdentityConflictError(stored.executionGrant.key);
       }
       if (currentEvidence.status === 'failed') {
         throw new HarnessTerminalHandoffIdentityConflictError(stored.executionGrant.key);
       }
 
-      const intentRow = await tx.execute({
-        sql: `SELECT * FROM ${TABLE_HARNESS_TERMINAL_INTENTS} WHERE id = ? LIMIT 1 FOR UPDATE`,
-        args: [intentId],
-      });
-      const existingIntent = intentRow.rows[0]
-        ? rowToHarnessTerminalIntent(intentRow.rows[0] as Record<string, unknown>)
-        : undefined;
-      if (tombstone.rows[0] && stored.status !== 'committed') {
+      if (tombstone.rows[0]) {
         await tx.execute({
           sql: `UPDATE ${TABLE_HARNESS_TERMINAL_ADMISSIONS} SET status = 'cancelled', updated_at = ? WHERE id = ?`,
           args: [Date.now(), admissionId],
@@ -4946,18 +4986,6 @@ export class HarnessPG extends HarnessStorage {
         return { status: 'cancelled', admission: { ...stored, status: 'cancelled' } };
       }
 
-      if (stored.status === 'committed') {
-        if (
-          !existingIntent ||
-          !sameHarnessTerminalIntent(existingIntent, terminalResult, projection) ||
-          currentEvidence.status !== 'completed' ||
-          stableJsonString(currentEvidence.result) !== stableJsonString(persistedJsonValue(resultEvidence.result))
-        ) {
-          throw new HarnessTerminalHandoffIdentityConflictError(stored.executionGrant.key);
-        }
-        await tx.commit();
-        return { status: 'duplicate', admission: stored, intent: existingIntent };
-      }
       if (existingIntent && !sameHarnessTerminalIntent(existingIntent, terminalResult, projection)) {
         throw new HarnessTerminalHandoffIdentityConflictError(stored.executionGrant.key);
       }
@@ -5239,7 +5267,7 @@ export class HarnessPG extends HarnessStorage {
                     AND earlier.revision < candidate.revision
                     AND earlier.status NOT IN ('acked', 'dead', 'fenced')
                 )
-              ORDER BY candidate.revision ASC, candidate.id ASC
+              ORDER BY candidate.created_at ASC, candidate.revision ASC, candidate.id ASC
               LIMIT ? FOR UPDATE SKIP LOCKED`,
         args: [harnessName, now, now, input.limit],
       });
@@ -9454,7 +9482,7 @@ const CHANNEL_BINDING_COLUMN_NAMES = [
 // shared CHANNEL_BINDING_EXTERNAL_ID_SENTINEL (the single source of truth in
 // @mastra/core) and the LibSQL sibling — keep the value in exact sync so the
 // persisted encoding matches the harness channel id-derivation.
-const CHANNEL_BINDING_EXTERNAL_ID_SENTINEL = '__mastra_missing_external_id__';
+const CHANNEL_BINDING_EXTERNAL_ID_SENTINEL = '\x1f__mastra_missing_external_id__';
 
 function normalizeChannelBindingExternalId(value: string | undefined): string {
   return value ?? CHANNEL_BINDING_EXTERNAL_ID_SENTINEL;
@@ -10245,7 +10273,7 @@ function rowToChannelOutboxItem(row: Record<string, unknown>): ChannelOutboxItem
   };
 }
 
-function rowToSession(row: Record<string, unknown>): SessionRecord {
+export function rowToSession(row: Record<string, unknown>): SessionRecord {
   return {
     harnessName: String(row.harness_name ?? 'default'),
     id: String(row.id),

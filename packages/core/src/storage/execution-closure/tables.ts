@@ -41,6 +41,19 @@ import type { ExecutionClosureTableName, ExecutionClosureTableRole } from './typ
  */
 export type ExecutionClosureScopeDimension = 'session' | 'thread' | 'run' | 'resource' | 'harness';
 
+export interface ExecutionClosureScopeFilter {
+  column: string;
+  dimension: Exclude<ExecutionClosureScopeDimension, 'harness'>;
+  /**
+   * Optional row-level guard: the filter only applies when
+   * `row[when.column] === when.equals`. A row can carry foreign ids in a
+   * scoped column (a thread-scoped observational-memory row also stores its
+   * owning resource id), so the scope discriminator must choose which
+   * predicate applies.
+   */
+  when?: { column: string; equals: string };
+}
+
 export interface ExecutionClosureTableSpec {
   role: ExecutionClosureTableRole;
   /**
@@ -48,7 +61,13 @@ export interface ExecutionClosureTableSpec {
    * (column -> dimension) value is a member. An empty list with
    * `harnessScoped` means the row is bound by `harness_name` alone.
    */
-  scope: { column: string; dimension: Exclude<ExecutionClosureScopeDimension, 'harness'> }[];
+  scope: ExecutionClosureScopeFilter[];
+  /**
+   * Composite (workflow_name, run_id) binding. Run ids are only unique within
+   * a workflow, so run-scoped workflow rows match exported (name, run) pairs —
+   * never the run id alone.
+   */
+  runPairScope?: { workflowNameColumn: string; runIdColumn: string };
   /** Bound only by `harness_name` (global per-harness rows like pressure). */
   harnessScoped?: boolean;
   /**
@@ -57,6 +76,14 @@ export interface ExecutionClosureTableSpec {
    * importer clears them so the runtime allocates fresh claims.
    */
   clearOnImport?: readonly string[];
+  /**
+   * Live delivery rows whose stale source claim must not gate re-delivery:
+   * rows with `statusColumn` in `from` are imported as `to`. Combined with
+   * `clearOnImport` on the claim columns, a migrated intent becomes claimable
+   * under a fresh destination claim instead of waiting out a source lease
+   * that no destination worker can renew.
+   */
+  requeueOnImport?: { statusColumn: string; from: readonly string[]; to: string };
 }
 
 const sessionScope = { column: 'session_id', dimension: 'session' as const };
@@ -72,16 +99,24 @@ const state = (
   harnessScoped,
   clearOnImport,
 });
-const fence = (scope: ExecutionClosureTableSpec['scope'], harnessScoped = false) => ({
+const fence = (
+  scope: ExecutionClosureTableSpec['scope'],
+  harnessScoped = false,
+  clearOnImport?: readonly string[],
+  requeueOnImport?: ExecutionClosureTableSpec['requeueOnImport'],
+) => ({
   role: 'fence' as const,
   scope,
   harnessScoped,
+  clearOnImport,
+  requeueOnImport,
 });
 const authority = (scope: ExecutionClosureTableSpec['scope'], harnessScoped = false) => ({
   role: 'authority' as const,
   scope,
   harnessScoped,
 });
+const runPair = { workflowNameColumn: 'workflow_name', runIdColumn: 'run_id' } as const;
 
 /**
  * The closed world of tables that make up a continuation closure. Every
@@ -106,14 +141,29 @@ export const EXECUTION_CLOSURE_TABLES: Partial<Record<ExecutionClosureTableName,
 
   // --- Terminal handoff + operation fences: exported for audit, never revived ---
   [TABLE_HARNESS_TERMINAL_ADMISSIONS]: fence([sessionScope]),
-  [TABLE_HARNESS_TERMINAL_INTENTS]: fence([sessionScope]),
+  // Terminal intents carry live delivery state: a `claimed` row's source
+  // claim/lease is meaningless on the destination, so the claim fields clear
+  // and the row is re-queued as `pending`. Settled rows (acked/dead/fenced)
+  // stay durable evidence. The claim scan does not consult the session
+  // incarnation, so without the requeue a stale claim could stall delivery
+  // for the full source lease.
+  [TABLE_HARNESS_TERMINAL_INTENTS]: fence([sessionScope], false, ['claim_id', 'claim_expires_at'], {
+    statusColumn: 'status',
+    from: ['claimed'],
+    to: 'pending',
+  }),
   [TABLE_HARNESS_TERMINAL_TOMBSTONES]: fence([sessionScope]),
   // Pressure rows are live per-harness coordination counters, not session
   // history — exported as evidence under `authority` so an import never
-  // overwrites current counters.
+  // overwrites current counters. The importer rebuilds the destination
+  // counter from the live intents it actually restores.
   [TABLE_HARNESS_TERMINAL_PRESSURE]: authority([], true),
   [TABLE_HARNESS_OPERATION_TOMBSTONES]: fence([sessionScope]),
-  [TABLE_HARNESS_THREAD_DELETE_FENCES]: fence([threadScope('thread_id')]),
+  // Thread-delete fence rows are a live lease (owner_id + lease_id +
+  // renewable expires_at), not durable deletion evidence: restoring one
+  // would recreate a source worker's lease that no destination worker owns
+  // or renews, blocking session admission on that thread until expiry.
+  [TABLE_HARNESS_THREAD_DELETE_FENCES]: authority([threadScope('thread_id')]),
   // Projection intents are pending application work — execution authority,
   // not evidence. The post-import runtime rebuilds them from restored state.
   [TABLE_HARNESS_SESSION_PROJECTION_INTENTS]: authority([sessionScope]),
@@ -124,7 +174,16 @@ export const EXECUTION_CLOSURE_TABLES: Partial<Record<ExecutionClosureTableName,
   [TABLE_HARNESS_CHANNEL_INBOX]: authority([sessionScope, threadScope()]),
   [TABLE_HARNESS_CHANNEL_BINDINGS]: authority([sessionScope, threadScope()]),
   [TABLE_HARNESS_CHANNEL_ACTION_TOKENS]: authority([{ column: 'owning_session_id', dimension: 'session' }]),
-  [TABLE_HARNESS_CHANNEL_ACTION_RECEIPTS]: authority([{ column: 'owning_session_id', dimension: 'session' }]),
+  // Action receipts are the durable idempotency ledger for action tokens —
+  // `applied`/`conflict`/`dead` outcomes must survive migration or a provider
+  // redelivery re-applies the action. They still carry a live claim while a
+  // delivery is in flight, so claim/retry fields clear on import; cleared
+  // claim fields already make a live receipt claimable again.
+  [TABLE_HARNESS_CHANNEL_ACTION_RECEIPTS]: fence([{ column: 'owning_session_id', dimension: 'session' }], false, [
+    'claim_id',
+    'claim_expires_at',
+    'next_attempt_at',
+  ]),
   [TABLE_HARNESS_CHANNEL_OUTBOX]: authority([sessionScope, { column: 'owning_session_id', dimension: 'session' }]),
   [TABLE_HARNESS_WAKEUPS]: authority([sessionScope]),
   // Provider callback bindings are provider-scoped shared routing state —
@@ -136,33 +195,47 @@ export const EXECUTION_CLOSURE_TABLES: Partial<Record<ExecutionClosureTableName,
   [TABLE_THREADS]: state([{ column: 'id', dimension: 'thread' }]),
   [TABLE_MESSAGES]: state([threadScope()]),
   [TABLE_THREAD_STATE]: state([threadScope('threadId')]),
-  [TABLE_OBSERVATIONAL_MEMORY]: state([threadScope('threadId'), { column: 'resourceId', dimension: 'resource' }]),
+  // OM rows carry both a `scope` discriminator and both id columns — a
+  // thread-scoped row still stores its owning resourceId. Unguarded OR scope
+  // would pull every thread-scoped row sharing the resource, so each
+  // predicate applies only to rows of its declared scope.
+  [TABLE_OBSERVATIONAL_MEMORY]: state([
+    { column: 'threadId', dimension: 'thread', when: { column: 'scope', equals: 'thread' } },
+    { column: 'resourceId', dimension: 'resource', when: { column: 'scope', equals: 'resource' } },
+  ]),
   [TABLE_RESOURCES]: { role: 'shared-resource', scope: [{ column: 'id', dimension: 'resource' }] },
 
   // --- Workflow snapshots + terminal lineage ---
   // Definitions are deploy-time catalog rows, not execution state — the
   // snapshot carries `serialized_step_graph` for replay, so the closure binds
-  // the run-scoped tables only.
-  [TABLE_WORKFLOW_SNAPSHOT]: state([{ column: 'run_id', dimension: 'run' }]),
-  [TABLE_WORKFLOW_SNAPSHOT_HANDOFF]: state([{ column: 'run_id', dimension: 'run' }]),
+  // the run-scoped tables only. Workflow identity is the composite
+  // (workflow_name, run_id): a bare run_id can collide across workflows, so
+  // every workflow table binds through `runPairScope` and the exporter pins
+  // run ids it cannot attribute to a single workflow.
+  [TABLE_WORKFLOW_SNAPSHOT]: { role: 'state', scope: [], runPairScope: runPair },
+  // The snapshot handoff is the run's live mutation fence — canonical
+  // snapshot writes reject while ANY handoff row exists, so restoring one
+  // would make the imported run permanently unwritable. The exporter keeps it
+  // as evidence; the importer materializes its snapshot as canonical state.
+  [TABLE_WORKFLOW_SNAPSHOT_HANDOFF]: { role: 'authority', scope: [], runPairScope: runPair },
   // The terminalization row holds the run's terminal record AND live claim
   // fields; claim columns clear on import so the new incarnation re-claims.
-  mastra_workflow_terminalizations: state([{ column: 'run_id', dimension: 'run' }], false, [
-    'owner_id',
-    'claim_token',
-    'claim_generation',
-    'lease_expires_at',
-  ]),
-  mastra_workflow_terminal_effects_v2: state([{ column: 'run_id', dimension: 'run' }]),
+  mastra_workflow_terminalizations: {
+    role: 'state',
+    scope: [],
+    runPairScope: runPair,
+    clearOnImport: ['owner_id', 'claim_token', 'claim_generation', 'lease_expires_at'],
+  },
+  mastra_workflow_terminal_effects_v2: { role: 'state', scope: [], runPairScope: runPair },
   // Destination receipts are idempotency evidence: restoring them prevents an
   // effect from being re-delivered; dropping them would invite a paid-attempt
   // replay. Continuation plans FK-reference receipts and effects, so receipts
   // must register (and therefore import) before plans.
-  mastra_workflow_terminal_destination_receipts_v2: fence([{ column: 'run_id', dimension: 'run' }]),
-  mastra_workflow_terminal_continuation_plans_v2: state([{ column: 'run_id', dimension: 'run' }]),
-  mastra_workflow_terminal_snapshots_v2: state([{ column: 'run_id', dimension: 'run' }]),
-  mastra_workflow_terminal_recovery_ancestries: state([{ column: 'run_id', dimension: 'run' }]),
-  mastra_workflow_parent_revisions: state([{ column: 'run_id', dimension: 'run' }]),
+  mastra_workflow_terminal_destination_receipts_v2: { role: 'fence', scope: [], runPairScope: runPair },
+  mastra_workflow_terminal_continuation_plans_v2: { role: 'state', scope: [], runPairScope: runPair },
+  mastra_workflow_terminal_snapshots_v2: { role: 'state', scope: [], runPairScope: runPair },
+  mastra_workflow_terminal_recovery_ancestries: { role: 'state', scope: [], runPairScope: runPair },
+  mastra_workflow_parent_revisions: { role: 'state', scope: [], runPairScope: runPair },
   // `mastra_workflow_schema_migrations` /
   // `mastra_workflow_parent_revision_migration_epoch` are global migration
   // infrastructure, not per-run state — deliberately outside the closure.

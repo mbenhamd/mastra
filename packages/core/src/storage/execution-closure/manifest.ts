@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 
 import { stableStringify } from '../../agent/message-list/cache/stable-stringify';
+import { TABLE_HARNESS_SESSIONS } from '../constants';
 import { EXECUTION_CLOSURE_TABLES } from './tables';
 import type {
   ExecutionClosureKey,
@@ -115,8 +116,14 @@ export interface VerifyExecutionClosureResult {
 
 /**
  * Verify an exported payload against its manifest: registered table coverage,
- * per-table row counts and digests. Import calls this before staging; a
- * corrupt or incomplete payload fails closed instead of staging partial data.
+ * per-table row counts and digests, plus the builder invariants the manifest
+ * cannot disclaim. Import calls this before staging; a corrupt, incomplete,
+ * or hand-built payload fails closed instead of staging partial data.
+ *
+ * The manifest is not authenticated, so the verifier rejects manifests the
+ * builder cannot produce: duplicate or missing table entries, a `complete`
+ * completeness that still carries pins, and `sessionIds` that do not match
+ * the exported session rows.
  */
 export function verifyExecutionClosurePayload(
   manifest: ExecutionClosureManifest,
@@ -133,6 +140,9 @@ export function verifyExecutionClosurePayload(
 
   const registered = new Set(Object.keys(EXECUTION_CLOSURE_TABLES));
   const listed = new Set(manifest.tables.map(t => t.table));
+  if (listed.size !== manifest.tables.length) {
+    mismatches.push('manifest lists a table more than once');
+  }
   for (const table of listed) {
     if (!registered.has(table)) {
       mismatches.push(`manifest lists unregistered table ${table}`);
@@ -143,11 +153,30 @@ export function verifyExecutionClosurePayload(
       mismatches.push(`payload carries rows for table ${table} absent from the manifest`);
     }
   }
-  for (const [table, spec] of Object.entries(EXECUTION_CLOSURE_TABLES)) {
-    if (listed.has(table as ExecutionClosureTableName)) continue;
-    if (manifest.completeness === 'complete' || spec?.role === 'fence') {
-      mismatches.push(`manifest omits ${spec?.role === 'fence' ? 'fence ' : 'registered '}table ${table}`);
+  // The builder emits every registered table (empty tables included), so an
+  // omitted entry means the manifest was not built by this exporter — a
+  // missing read must never masquerade as an empty table.
+  for (const table of Object.keys(EXECUTION_CLOSURE_TABLES)) {
+    if (!listed.has(table as ExecutionClosureTableName)) {
+      mismatches.push(`manifest omits registered table ${table}`);
     }
+  }
+
+  const expectedCompleteness = manifest.pins.length === 0 ? 'complete' : 'pinned';
+  if (manifest.completeness !== expectedCompleteness) {
+    mismatches.push(
+      `manifest completeness ${JSON.stringify(manifest.completeness)} does not match ${manifest.pins.length} pin(s)`,
+    );
+  }
+
+  // `sessionIds` is the import's authority-fence contract: every imported
+  // session row must appear there so it receives the destination incarnation.
+  const payloadSessionIds = (rows[TABLE_HARNESS_SESSIONS] ?? [])
+    .map(row => row.id)
+    .filter((id): id is string => typeof id === 'string');
+  const sortJoin = (ids: string[]) => [...new Set(ids)].sort().join('\x00');
+  if (sortJoin(payloadSessionIds) !== sortJoin(manifest.sessionIds)) {
+    mismatches.push('manifest sessionIds do not match the exported session rows');
   }
 
   for (const entry of manifest.tables) {

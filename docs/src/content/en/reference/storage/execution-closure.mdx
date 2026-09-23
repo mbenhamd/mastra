@@ -1,0 +1,70 @@
+---
+title: 'Reference: Execution closure | Storage'
+description: 'Fenced export/import of a harness session subtree for migration and recovery on @mastra/pg.'
+packages:
+  - '@mastra/core'
+  - '@mastra/pg'
+---
+
+# Execution closure
+
+An execution closure is a fenced, versioned export of one harness session subtree: a root session and every descendant reached through `parent_session_id`, plus the memory, observational-memory, workflow, and terminal-handoff rows that belong to it. Export and import are implemented by `PostgresStore` and are intended for migration and disaster recovery, not routine replication.
+
+The unit is "fenced" because it separates durable state and evidence from live execution authority:
+
+- **`state` rows** (sessions, threads, messages, snapshots, terminalizations) are restored verbatim.
+- **`fence` rows** (tombstones, terminal intents and admissions, delete fences, receipts) are restored as evidence, rebound to the destination session incarnation, and have stale claims/leases cleared so an old in-flight callback cannot revive.
+- **`authority` rows** (wakeups, outbox/inbox, channel bindings, projection intents, pressure counters) are exported for completeness but never restored; the destination runtime re-establishes its own.
+- **`shared-resource` rows** are restored only when absent, so an archive cannot overwrite a live shared row.
+
+Every imported session row receives a `session_incarnation` minted or adopted at the destination, so source-era grants, leases, and callbacks are fenced by the runtime rather than replayed.
+
+## Usage
+
+```typescript
+import { PostgresStore } from '@mastra/pg';
+
+const source = new PostgresStore({ id: 'source', connectionString: SOURCE_URL });
+const destination = new PostgresStore({ id: 'dest', connectionString: DEST_URL });
+
+const payload = await source.exportExecutionClosure({
+  harnessName: 'default',
+  sessionId: 'session-to-migrate',
+});
+
+const result = await destination.importExecutionClosure(payload);
+// result.status === 'imported' | 'pinned'
+```
+
+Export runs under a single `REPEATABLE READ` transaction, so the closure is a consistent snapshot; import runs inside one transaction, so a failure writes nothing and a lost acknowledgement can simply re-import.
+
+## `exportExecutionClosure(key)`
+
+Exports the session subtree rooted at `key.sessionId` in the `key.harnessName` namespace.
+
+Returns: `Promise<ExecutionClosurePayload>` — `{ manifest, rows }`. `manifest` records the format version, closure key, provenance, sorted `sessionIds`, per-session `incarnations` captured at export, scoped `threadIds`/`runIds`/`resourceIds`, a `sha256:` digest for every registered closure table, `completeness`, and `pins`.
+
+When the exporter cannot prove the unit is complete — for example the root session's parent lies outside the subtree, a session references a missing thread, or attachment bytes are owned externally — it still exports but records `completeness: 'pinned'` and the reasons in `pins`.
+
+Throws a `MastraError` when the root session does not exist.
+
+## `importExecutionClosure(payload)`
+
+Verifies the payload against its manifest before staging a single row, then applies it in one transaction.
+
+Verification fails closed on: unsupported manifest format/version, unknown or missing registered tables, duplicate table entries, row-count or digest mismatches, `sessionIds` inconsistent with the exported session rows, rows carrying a foreign `harness_name`, and payload row columns outside each table's registered schema.
+
+On apply:
+
+- A session row that already exists must match the imported row (except `session_incarnation`); the persisted incarnation is reused — including after a concurrent import — so `result.incarnations` always reflects the value actually stored.
+- Any other `state`/`fence` row that already exists must equal the imported row canonically, or the transaction aborts with `DESTINATION_ROW_CONFLICT` instead of silently merging a foreign row.
+- `authority` rows are counted in `skipped` and never inserted.
+- Imported terminal intents lose stale claim fields and are requeued to `pending`; workflow handoff fences are materialized as snapshot evidence rather than restored; pending session-record projection work is restaged deterministically; terminal/projection pressure counters are rebuilt from the restored live rows.
+
+Returns: `Promise<ExecutionClosureImportResult>` — `{ status, incarnations, inserted, skipped, pins }`. `status` is `'imported'` for a complete unit or `'pinned'` when the manifest recorded pins; `inserted`/`skipped` count rows written and rows already present (or never restored) per table.
+
+Re-importing the same payload converges: every row is already present, nothing duplicates, and the returned incarnations are the ones persisted by the first import.
+
+## Availability
+
+`exportExecutionClosure`/`importExecutionClosure` are `PostgresStore` methods on `@mastra/pg`. The manifest, registry, and payload types are exported from `@mastra/core/storage`. Tables belonging to disabled storage domains are tolerated as absent only when they carry zero rows; a payload that contains rows for a missing table fails with `MISSING_TABLE`.

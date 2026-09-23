@@ -79,6 +79,7 @@ import {
   HarnessTerminalHandoffCancelledError,
   HarnessTerminalHandoffFencedError,
   HarnessTerminalHandoffIdentityConflictError,
+  boundHarnessTerminalError,
   harnessTerminalIntentId,
   HarnessTerminalHandoffUnsupportedError,
   HarnessTerminalHandoffValidationError,
@@ -10088,7 +10089,9 @@ export class Session {
       ...(finishReason !== undefined ? { finishReason } : {}),
       completedAt: Date.now(),
       ...(endReason === 'error'
-        ? { error: projectHarnessPublicError(full.error ?? new Error('agent run failed')) }
+        ? {
+            error: boundHarnessTerminalError(projectHarnessPublicError(full.error ?? new Error('agent run failed'))),
+          }
         : {}),
     };
     // The admitted finalizer identity is durable — a deployment that

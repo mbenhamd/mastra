@@ -826,6 +826,7 @@ const sidebars = {
       items: [
         { type: 'doc', id: 'storage/overview', label: 'Overview' },
         { type: 'doc', id: 'storage/composite', label: 'Composite Storage' },
+        { type: 'doc', id: 'storage/execution-closure', label: 'Execution Closure' },
         { type: 'doc', id: 'storage/retention', label: 'Retention (prune)' },
         { type: 'doc', id: 'storage/turso', label: 'Turso Storage' },
       ],
@@ -1021,6 +1022,6 @@ const sidebars = {
       ],
     },
   ],
-}
+};
 
-export default sidebars
+export default sidebars;

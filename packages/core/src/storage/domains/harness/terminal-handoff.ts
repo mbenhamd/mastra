@@ -486,6 +486,19 @@ export function canonicalHarnessTerminalResult(result: HarnessTerminalResult): H
   return cloneHarnessTerminal(result);
 }
 
+/**
+ * Bounds a projected public terminal error to the canonical id-character
+ * ceiling before it reaches `canonicalHarnessTerminalResult`. Recognized
+ * harness errors carry constructed messages of arbitrary length; left
+ * unbounded, the canonicalization gate would reject the commit and strand the
+ * admission pending forever. The error code is preserved verbatim — only the
+ * message is truncated.
+ */
+export function boundHarnessTerminalError<T extends { code: string; message: string }>(error: T): T {
+  if (error.message.length <= MAX_HARNESS_TERMINAL_ID_CHARS) return error;
+  return { ...error, message: error.message.slice(0, MAX_HARNESS_TERMINAL_ID_CHARS) };
+}
+
 export function canonicalJson(value: JsonValue): string {
   assertJsonValue(value, 'value');
   return JSON.stringify(sortJson(value));

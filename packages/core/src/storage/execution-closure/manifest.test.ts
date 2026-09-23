@@ -3,11 +3,14 @@ import { describe, expect, it } from 'vitest';
 import { TABLE_HARNESS_SESSIONS, TABLE_MESSAGES, TABLE_THREADS } from '../constants';
 import { buildExecutionClosureManifest, digestClosureRows, verifyExecutionClosurePayload } from './manifest';
 import { EXECUTION_CLOSURE_TABLES } from './tables';
-import type { ExecutionClosureKey } from './types';
+import type { ExecutionClosureKey, ExecutionClosurePin } from './types';
 
 const KEY: ExecutionClosureKey = { harnessName: 'default', sessionId: 's1' };
 
-function manifestFor(rows: Parameters<typeof buildExecutionClosureManifest>[0]['rows'], pins = []) {
+function manifestFor(
+  rows: Parameters<typeof buildExecutionClosureManifest>[0]['rows'],
+  pins: ExecutionClosurePin[] = [],
+) {
   return buildExecutionClosureManifest({
     key: KEY,
     sessionIds: ['s1'],
@@ -87,7 +90,48 @@ describe('buildExecutionClosureManifest + verifyExecutionClosurePayload', () => 
     };
     const missingFence = verifyExecutionClosurePayload(omitted, rows);
     expect(missingFence.ok).toBe(false);
-    expect(missingFence.mismatches.some(item => item.includes(`omits fence table ${fenceTable}`))).toBe(true);
+    expect(missingFence.mismatches.some(item => item.includes(`omits registered table ${fenceTable}`))).toBe(true);
+  });
+
+  it('rejects manifests the builder cannot produce', () => {
+    const rows = { [TABLE_HARNESS_SESSIONS]: [{ id: 's1', harness_name: 'default' }] };
+    const manifest = manifestFor(rows);
+
+    // A registered table omitted from the manifest cannot pass even when the
+    // manifest marks the unit incomplete — a missing read is not an empty set.
+    const droppedTable = manifest.tables.find(entry => entry.table === TABLE_MESSAGES)!;
+    const omittedTable = {
+      ...manifest,
+      tables: manifest.tables.filter(entry => entry.table !== TABLE_MESSAGES),
+      completeness: 'pinned' as const,
+      pins: [{ reason: 'omitted', detail: { table: droppedTable.table } }],
+    };
+    expect(verifyExecutionClosurePayload(omittedTable, rows).ok).toBe(false);
+
+    // Duplicate table entries are not builder output.
+    const duplicated = { ...manifest, tables: [...manifest.tables, manifest.tables[0]!] };
+    const duplicateResult = verifyExecutionClosurePayload(duplicated, rows);
+    expect(duplicateResult.ok).toBe(false);
+    expect(duplicateResult.mismatches.some(item => item.includes('more than once'))).toBe(true);
+
+    // `complete` cannot carry pins — import would report a pinned unit as
+    // imported.
+    const pinnedButComplete = {
+      ...manifest,
+      completeness: 'complete' as const,
+      pins: [{ reason: 'session-thread-missing', detail: { threadId: 't9' } }],
+    };
+    const completenessResult = verifyExecutionClosurePayload(pinnedButComplete, rows);
+    expect(completenessResult.ok).toBe(false);
+    expect(completenessResult.mismatches.some(item => item.includes('completeness'))).toBe(true);
+
+    // sessionIds must equal the exported session rows: a transported manifest
+    // that drops an id would otherwise import that session with no fresh
+    // incarnation while reporting success.
+    const missingSessionId = { ...manifest, sessionIds: [] };
+    const sessionIdResult = verifyExecutionClosurePayload(missingSessionId, rows);
+    expect(sessionIdResult.ok).toBe(false);
+    expect(sessionIdResult.mismatches.some(item => item.includes('sessionIds'))).toBe(true);
   });
 
   it('marks the unit pinned when pins are present', () => {
