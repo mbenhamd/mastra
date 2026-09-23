@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { WorkflowRunState } from '../../../workflows';
 import { InMemoryStore } from '../../mock';
 import { STALE_EXECUTION_RESULT } from '../../types';
+import { WorkflowStaleSnapshotPersistError } from '../../workflow-snapshot-handoff';
 
 // PF-4385 tombstone reopen: a delayed result write from a deleted execution
 // lifetime must not merge into the snapshot a reopened lifetime installed
@@ -158,5 +159,107 @@ describe('WorkflowsInMemory updateWorkflowResults executionGeneration fence', ()
         'step-1': expect.objectContaining({ status: 'success', output: { data: 'legacy' } }),
       });
     }
+  });
+});
+
+// Generation-guarded persistWorkflowSnapshot (PF-4387): callers that merge
+// and re-persist a full snapshot (e.g. the pruneSnapshot re-persist) CAS the
+// write against the generation they fenced on, so a delete/reopen between
+// the read and the write cannot be overwritten by the stale lifetime's row.
+describe('WorkflowsInMemory persistWorkflowSnapshot expectedExecutionGeneration fence', () => {
+  it('persists when the stored snapshot carries the expected generation', async () => {
+    const store = new InMemoryStore();
+    const workflows = (await store.getStore('workflows'))!;
+    const workflowName = 'wf';
+    const runId = 'run-guarded';
+    await workflows.persistWorkflowSnapshot({
+      workflowName,
+      runId,
+      snapshot: makeSnapshot(runId, 'wfeg:lifetime-a'),
+    });
+
+    await expect(
+      workflows.persistWorkflowSnapshot({
+        workflowName,
+        runId,
+        snapshot: { ...makeSnapshot(runId, 'wfeg:lifetime-a'), status: 'suspended' },
+        expectedExecutionGeneration: 'wfeg:lifetime-a',
+      }),
+    ).resolves.toBeUndefined();
+    await expect(workflows.loadWorkflowSnapshot({ workflowName, runId })).resolves.toMatchObject({
+      status: 'suspended',
+    });
+  });
+
+  it('rejects the persist against a reopened generation and keeps the live row', async () => {
+    const store = new InMemoryStore();
+    const workflows = (await store.getStore('workflows'))!;
+    const workflowName = 'wf';
+    const runId = 'run-reopened';
+    // Lifetime B owns the row; a delayed re-persist still carrying A's
+    // generation must not overwrite it.
+    await workflows.persistWorkflowSnapshot({
+      workflowName,
+      runId,
+      snapshot: makeSnapshot(runId, 'wfeg:lifetime-b'),
+    });
+
+    await expect(
+      workflows.persistWorkflowSnapshot({
+        workflowName,
+        runId,
+        snapshot: makeSnapshot(runId, 'wfeg:lifetime-a'),
+        expectedExecutionGeneration: 'wfeg:lifetime-a',
+      }),
+    ).rejects.toBeInstanceOf(WorkflowStaleSnapshotPersistError);
+    await expect(workflows.loadWorkflowSnapshot({ workflowName, runId })).resolves.toMatchObject({
+      executionGeneration: 'wfeg:lifetime-b',
+    });
+  });
+
+  it('rejects the persist when the run row was deleted instead of resurrecting it', async () => {
+    const store = new InMemoryStore();
+    const workflows = (await store.getStore('workflows'))!;
+    const workflowName = 'wf';
+    const runId = 'run-deleted';
+    await workflows.persistWorkflowSnapshot({
+      workflowName,
+      runId,
+      snapshot: makeSnapshot(runId, 'wfeg:lifetime-a'),
+    });
+    await workflows.deleteWorkflowRunById({ workflowName, runId });
+
+    await expect(
+      workflows.persistWorkflowSnapshot({
+        workflowName,
+        runId,
+        snapshot: makeSnapshot(runId, 'wfeg:lifetime-a'),
+        expectedExecutionGeneration: 'wfeg:lifetime-a',
+      }),
+    ).rejects.toBeInstanceOf(WorkflowStaleSnapshotPersistError);
+    await expect(workflows.loadWorkflowSnapshot({ workflowName, runId })).resolves.toBeNull();
+  });
+
+  it('keeps unguarded persists for callers that pass no generation', async () => {
+    const store = new InMemoryStore();
+    const workflows = (await store.getStore('workflows'))!;
+    const workflowName = 'wf';
+    const runId = 'run-unguarded';
+    await workflows.persistWorkflowSnapshot({
+      workflowName,
+      runId,
+      snapshot: makeSnapshot(runId, 'wfeg:lifetime-b'),
+    });
+
+    await expect(
+      workflows.persistWorkflowSnapshot({
+        workflowName,
+        runId,
+        snapshot: makeSnapshot(runId, 'wfeg:lifetime-a'),
+      }),
+    ).resolves.toBeUndefined();
+    await expect(workflows.loadWorkflowSnapshot({ workflowName, runId })).resolves.toMatchObject({
+      executionGeneration: 'wfeg:lifetime-a',
+    });
   });
 });

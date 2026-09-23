@@ -67,6 +67,7 @@ import {
   persistWorkflowStepUpdateRecord,
   rollbackWorkflowResumeRecord,
   WorkflowSnapshotHandoffFenceError,
+  WorkflowStaleSnapshotPersistError,
   materializeWorkflowSnapshotHandoffSnapshot,
   pinWorkflowCasGuardValue,
   validateWorkflowSnapshotHandoffFence,
@@ -5704,6 +5705,7 @@ export class WorkflowsPG extends WorkflowsStorage {
     snapshot,
     createdAt,
     updatedAt,
+    expectedExecutionGeneration,
   }: {
     workflowName: string;
     runId: string;
@@ -5711,6 +5713,7 @@ export class WorkflowsPG extends WorkflowsStorage {
     snapshot: WorkflowRunState;
     createdAt?: Date;
     updatedAt?: Date;
+    expectedExecutionGeneration?: string;
   }): Promise<void> {
     validateWorkflowSnapshotHandoffIdentity(workflowName, runId, resourceId);
     try {
@@ -5722,11 +5725,22 @@ export class WorkflowsPG extends WorkflowsStorage {
       await this.#db.client.tx(async t => {
         const revision = await this.lockWorkflowParentRevisionForSnapshotUpsert(t, workflowName, runId);
         await this.assertWorkflowSnapshotHandoffAvailable(t, workflowName, runId);
-        const existingSnapshot = await t.oneOrNone<{ exists: boolean }>(
-          `SELECT TRUE AS exists FROM ${this.workflowSnapshotTableName()}
+        const existingSnapshot = await t.oneOrNone<{ exists: boolean; generation: string | null }>(
+          `SELECT TRUE AS exists, snapshot->>'executionGeneration' AS generation
+           FROM ${this.workflowSnapshotTableName()}
            WHERE workflow_name = $1 AND run_id = $2 FOR UPDATE`,
           [workflowName, runId],
         );
+        // A generation-guarded persist must not resurrect a deleted run or
+        // overwrite the reopened lifetime's row: the FOR UPDATE read makes
+        // this a compare-and-set inside the upsert transaction, so it fails
+        // closed on a missing record as well as on a generation mismatch.
+        if (
+          expectedExecutionGeneration !== undefined &&
+          (existingSnapshot === null || existingSnapshot.generation !== expectedExecutionGeneration)
+        ) {
+          throw new WorkflowStaleSnapshotPersistError({ workflowName, runId });
+        }
         if (revision.created && existingSnapshot) {
           throw new TypeError('Workflow snapshot is missing parent revision evidence');
         }
@@ -5751,6 +5765,7 @@ export class WorkflowsPG extends WorkflowsStorage {
       });
     } catch (error) {
       if (error instanceof WorkflowSnapshotHandoffFenceError) throw error;
+      if (error instanceof WorkflowStaleSnapshotPersistError) throw error;
       throw new MastraError(
         {
           id: createStorageErrorId('PG', 'PERSIST_WORKFLOW_SNAPSHOT', 'FAILED'),

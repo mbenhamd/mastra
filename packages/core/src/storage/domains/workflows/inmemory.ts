@@ -93,6 +93,7 @@ import {
 } from '../../workflow-snapshot';
 import {
   WorkflowSnapshotHandoffFenceError,
+  WorkflowStaleSnapshotPersistError,
   compareWorkflowSnapshotHandoffCursors,
   materializeWorkflowSnapshotHandoffSnapshot,
   pinWorkflowCasGuardValue,
@@ -2396,6 +2397,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     snapshot,
     createdAt,
     updatedAt,
+    expectedExecutionGeneration,
   }: {
     workflowName: string;
     runId: string;
@@ -2403,6 +2405,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     snapshot: WorkflowRunState;
     createdAt?: Date;
     updatedAt?: Date;
+    expectedExecutionGeneration?: string;
   }): Promise<void> {
     validateWorkflowSnapshotHandoffIdentity(workflowName, runId, resourceId);
     const key = this.getWorkflowKey(workflowName, runId);
@@ -2410,6 +2413,20 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     for (let attempt = 1; ; attempt++) {
       const existing = this.db.workflows.get(key);
       this.assertWorkflowSnapshotHandoffAvailable(workflowName, runId);
+      // A generation-guarded persist must not resurrect a deleted run or
+      // overwrite the reopened lifetime's row: the guard fails closed on a
+      // missing record as well as on a generation mismatch.
+      if (expectedExecutionGeneration !== undefined) {
+        const storedSnapshot =
+          existing?.snapshot === undefined
+            ? undefined
+            : typeof existing.snapshot === 'string'
+              ? (JSON.parse(existing.snapshot) as WorkflowRunState)
+              : existing.snapshot;
+        if (storedSnapshot?.executionGeneration !== expectedExecutionGeneration) {
+          throw new WorkflowStaleSnapshotPersistError({ workflowName, runId });
+        }
+      }
       // Cloning the caller snapshot can invoke toJSON/getters that reenter
       // this map; restart if a reentrant write changed the row so a persisted
       // snapshot never silently overwrites a newer record.

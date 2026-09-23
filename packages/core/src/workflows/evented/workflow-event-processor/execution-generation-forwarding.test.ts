@@ -503,4 +503,158 @@ describe('updateWorkflowResults executionGeneration forwarding', () => {
     ).toBe(generation);
     expect(engineEvents).not.toContain('workflow.suspend');
   });
+
+  it('stops a top-level step-end when the run row was deleted instead of advancing it', async () => {
+    const storage = new MockStore();
+    const pubsub = new EventEmitterPubSub();
+    const step = createStep({
+      id: 'deleted-run-step',
+      inputSchema: z.object({}),
+      outputSchema: z.object({ value: z.string() }),
+      execute: async () => ({ value: 'done' }),
+    });
+    const workflow = createWorkflow({
+      id: `deleted-run-${Math.random().toString(36).slice(2)}`,
+      inputSchema: z.object({}),
+      outputSchema: z.object({ value: z.string() }),
+    })
+      .then(step)
+      .commit();
+    const mastra = new Mastra({ logger: false, storage, pubsub, workflows: { [workflow.id]: workflow } });
+    const workflowsStore = (await storage.getStore('workflows'))!;
+
+    const runId = `run-${Math.random().toString(36).slice(2)}`;
+    await workflow.createRun({ runId });
+    const pending = (await workflowsStore.loadWorkflowSnapshot({ workflowName: workflow.id, runId }))!;
+    const generation = pending.executionGeneration!;
+    expect(generation).toBeTruthy();
+
+    // The delayed step-end arrives after the run row was deleted but before
+    // any replacement exists — the store can only answer `{}`.
+    await workflowsStore.deleteWorkflowRunById({ workflowName: workflow.id, runId });
+
+    const engineEvents: string[] = [];
+    const publish = pubsub.publish.bind(pubsub);
+    vi.spyOn(pubsub, 'publish').mockImplementation(async (topic, event) => {
+      if (topic === 'workflows') engineEvents.push((event as { type: string }).type);
+      return publish(topic, event);
+    });
+
+    const processor = new WorkflowEventProcessor({ mastra });
+    const handled = await processor.handle({
+      type: 'workflow.step.end',
+      id: 'evt-deleted-run',
+      runId,
+      createdAt: new Date(),
+      data: {
+        workflowId: workflow.id,
+        runId,
+        executionGeneration: generation,
+        executionPath: [0],
+        prevResult: {
+          status: 'success',
+          output: { value: 'done' },
+          payload: {},
+          startedAt: 1,
+          endedAt: 2,
+        },
+        stepResults: {},
+        activeStepsPath: {},
+        resumeSteps: [],
+        requestContext: {},
+        lifecycleStepStates: {},
+      },
+    });
+
+    // A top-level evented run always persists its initial row, so the `{}`
+    // response means this lifetime was deleted: the handler stops rather than
+    // publishing workflow.step.run for a run that no longer exists.
+    expect(handled).toEqual({ ok: true });
+    expect(engineEvents).not.toContain('workflow.step.run');
+  });
+
+  it('halts the suspension flow when the prune re-persist loses the generation CAS', async () => {
+    const storage = new MockStore();
+    const pubsub = new EventEmitterPubSub();
+    const suspendingStep = createStep({
+      id: 'pruned-suspend-step',
+      inputSchema: z.object({}),
+      suspendSchema: z.object({ reason: z.string() }),
+      outputSchema: z.object({ value: z.string() }),
+      execute: async () => ({ value: 'done' }),
+    });
+    const workflow = createWorkflow({
+      id: `pruned-suspend-${Math.random().toString(36).slice(2)}`,
+      inputSchema: z.object({}),
+      outputSchema: z.object({ value: z.string() }),
+      options: {
+        pruneSnapshot: ({ snapshot }) => {
+          const { serializedStepGraph: _graph, ...pruned } = snapshot;
+          return pruned;
+        },
+      },
+    })
+      .then(suspendingStep)
+      .commit();
+    const mastra = new Mastra({ logger: false, storage, pubsub, workflows: { [workflow.id]: workflow } });
+    const workflowsStore = (await storage.getStore('workflows'))!;
+
+    const runId = `run-${Math.random().toString(36).slice(2)}`;
+    await workflow.createRun({ runId });
+    const pending = (await workflowsStore.loadWorkflowSnapshot({ workflowName: workflow.id, runId }))!;
+    const generation = pending.executionGeneration!;
+    expect(generation).toBeTruthy();
+
+    // Simulate the reopen landing between the prune's snapshot read and its
+    // re-persist: the guarded write must be rejected and the handler must
+    // stop before publishing the stale suspension.
+    const persistWorkflowSnapshot = workflowsStore.persistWorkflowSnapshot.bind(workflowsStore);
+    const persistSpy = vi.spyOn(workflowsStore, 'persistWorkflowSnapshot').mockImplementation(async args => {
+      if (args.expectedExecutionGeneration !== undefined) {
+        await workflowsStore.deleteWorkflowRunById({ workflowName: args.workflowName, runId: args.runId });
+      }
+      return persistWorkflowSnapshot(args);
+    });
+    const engineEvents: string[] = [];
+    const publish = pubsub.publish.bind(pubsub);
+    vi.spyOn(pubsub, 'publish').mockImplementation(async (topic, event) => {
+      if (topic === 'workflows') engineEvents.push((event as { type: string }).type);
+      return publish(topic, event);
+    });
+
+    const processor = new WorkflowEventProcessor({ mastra });
+    const handled = await processor.handle({
+      type: 'workflow.step.end',
+      id: 'evt-prune-race',
+      runId,
+      createdAt: new Date(),
+      data: {
+        workflowId: workflow.id,
+        runId,
+        executionGeneration: generation,
+        executionPath: [0],
+        prevResult: {
+          status: 'suspended',
+          output: undefined,
+          payload: {},
+          startedAt: 1,
+          suspendPayload: { reason: 'waiting' },
+        },
+        stepResults: {},
+        activeStepsPath: {},
+        resumeSteps: [],
+        requestContext: {},
+        lifecycleStepStates: {},
+      },
+    });
+
+    expect(handled).toEqual({ ok: true });
+    const guardedPersist = persistSpy.mock.calls.find(([args]) => args.expectedExecutionGeneration !== undefined);
+    expect(guardedPersist).toBeTruthy();
+    expect(guardedPersist![0].expectedExecutionGeneration).toBe(generation);
+    // The CAS rejected the stale re-persist, the reopened/absent row was not
+    // overwritten, and no stale suspension was published.
+    expect(engineEvents).not.toContain('workflow.suspend');
+    await expect(workflowsStore.loadWorkflowSnapshot({ workflowName: workflow.id, runId })).resolves.toBeNull();
+  });
 });

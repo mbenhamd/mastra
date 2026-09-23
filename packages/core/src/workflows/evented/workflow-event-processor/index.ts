@@ -9,6 +9,7 @@ import { resolveExportedSpanId } from '../../../observability';
 import { RequestContext } from '../../../request-context/';
 import { STALE_EXECUTION_RESULT, isStaleExecutionResult } from '../../../storage/types';
 import type { GetWorkflowRunTerminalStatusResult, UpdateWorkflowResultsResult } from '../../../storage/types';
+import { WorkflowStaleSnapshotPersistError } from '../../../storage/workflow-snapshot-handoff';
 import type { StepExecutionStrategy } from '../../../worker/types';
 import { getEntryId, getEntryRetries, getEntrySchemas, getEntryWorkflow } from '../../../workflows/step-entry';
 import type {
@@ -733,19 +734,21 @@ export class WorkflowEventProcessor extends EventProcessor {
     workflow,
     workflowId,
     runId,
+    expectedExecutionGeneration,
   }: {
     workflow: Workflow | undefined;
     workflowId: string;
     runId: string;
-  }): Promise<void> {
+    expectedExecutionGeneration?: string;
+  }): Promise<boolean> {
     const pruneSnapshot = workflow?.options?.pruneSnapshot;
-    if (!pruneSnapshot) return;
+    if (!pruneSnapshot) return true;
     try {
       const workflowsStore = await this.mastra.getStorage()?.getStore('workflows');
-      if (!workflowsStore) return;
+      if (!workflowsStore) return true;
       const run = await workflowsStore.getWorkflowRunById({ runId, workflowName: workflowId });
       const snapshot = run?.snapshot;
-      if (!snapshot || typeof snapshot === 'string') return;
+      if (!snapshot || typeof snapshot === 'string') return true;
       const pruned = pruneSnapshot({ snapshot, workflowStatus: snapshot.status });
       await workflowsStore.persistWorkflowSnapshot({
         workflowName: workflowId,
@@ -757,10 +760,19 @@ export class WorkflowEventProcessor extends EventProcessor {
           lifecycleResumeAttempt: snapshot.lifecycleResumeAttempt,
           lifecycleStepStates: snapshot.lifecycleStepStates,
         },
+        expectedExecutionGeneration,
       });
+      return true;
     } catch (error) {
+      if (error instanceof WorkflowStaleSnapshotPersistError) {
+        // The re-persist CAS lost to a delete/reopen between the snapshot read
+        // and the write: the reopened lifetime owns the row now, so this
+        // handler must stop rather than publish the stale suspension.
+        return false;
+      }
       // Pruning is a size optimization — never fail the suspension over it.
       this.mastra.getLogger()?.warn?.(`Failed to prune workflow snapshot for run ${runId}: ${error}`);
+      return true;
     }
   }
 
@@ -3603,7 +3615,13 @@ export class WorkflowEventProcessor extends EventProcessor {
         if (workflowsStore !== undefined && suspendedState === undefined) {
           return;
         }
-        await this.pruneAndRepersistSnapshot({ workflow, workflowId, runId });
+        const pruned = await this.pruneAndRepersistSnapshot({
+          workflow,
+          workflowId,
+          runId,
+          expectedExecutionGeneration: lifecycleExecution.executionGeneration,
+        });
+        if (!pruned) return;
       }
       await this.mastra.pubsub.publish('workflows', {
         type: 'workflow.suspend',
@@ -3767,15 +3785,15 @@ export class WorkflowEventProcessor extends EventProcessor {
       // prove a generation (missing row, pre-generation storage) keep the
       // legacy ordering; the write fences below still halt the race window.
       if (workflowsStore !== undefined && executionGeneration !== undefined) {
-        const fenceSnapshot = await workflowsStore.loadWorkflowSnapshot({
+        const fenceState = await workflowsStore.getWorkflowExecutionState({
           workflowName: workflowId,
           runId,
         });
         if (
-          fenceSnapshot !== null &&
-          fenceSnapshot !== undefined &&
-          fenceSnapshot.executionGeneration !== undefined &&
-          fenceSnapshot.executionGeneration !== executionGeneration
+          fenceState !== null &&
+          fenceState !== undefined &&
+          fenceState.executionGeneration !== undefined &&
+          fenceState.executionGeneration !== executionGeneration
         ) {
           return;
         }
@@ -4306,7 +4324,13 @@ export class WorkflowEventProcessor extends EventProcessor {
             if (workflowsStore !== undefined && suspendedState === undefined) {
               return;
             }
-            await this.pruneAndRepersistSnapshot({ workflow, workflowId, runId });
+            const pruned = await this.pruneAndRepersistSnapshot({
+              workflow,
+              workflowId,
+              runId,
+              expectedExecutionGeneration: lifecycleExecution.executionGeneration,
+            });
+            if (!pruned) return;
           }
 
           await this.mastra.pubsub.publish('workflows', {
@@ -4406,12 +4430,16 @@ export class WorkflowEventProcessor extends EventProcessor {
       }
 
       // When the Mastra has no storage configured, workflowsStore is undefined
-      // and updateWorkflowResults returns undefined. When it has storage but no
-      // run record yet (shouldPersistSnapshot skipped the initial running
-      // snapshot), it returns `{}`. In both cases the event payload is the
-      // source of truth — merge prevResult into the inline stepResults instead
-      // of treating it as a hard early-return.
+      // and updateWorkflowResults returns undefined. A nested run whose parent
+      // declared it transient may also legitimately have no row, so `{}` keeps
+      // the inline result there. For a top-level evented run the initial row
+      // always exists (EventedRun.start persists it regardless of
+      // shouldPersistSnapshot), so `{}` means deleteWorkflowRunById removed
+      // this lifetime — stop instead of advancing a deleted run's events.
       if (!newStepResults || Object.keys(newStepResults).length === 0) {
+        if (newStepResults !== undefined && parentWorkflow === undefined) {
+          return;
+        }
         stepResults = { ...(stepResults ?? {}), [stepId]: storedResult };
       } else {
         stepResults = newStepResults;
@@ -4569,7 +4597,13 @@ export class WorkflowEventProcessor extends EventProcessor {
         if (workflowsStore !== undefined && suspendedState === undefined) {
           return;
         }
-        await this.pruneAndRepersistSnapshot({ workflow, workflowId, runId });
+        const pruned = await this.pruneAndRepersistSnapshot({
+          workflow,
+          workflowId,
+          runId,
+          expectedExecutionGeneration: lifecycleExecution.executionGeneration,
+        });
+        if (!pruned) return;
       }
 
       await this.mastra.pubsub.publish('workflows', {
