@@ -3261,14 +3261,18 @@ export type UpdateWorkflowResultsResult =
   | typeof STALE_EXECUTION_RESULT;
 
 /**
- * Type guard for the `STALE_EXECUTION_RESULT` sentinel. Identity comparison
- * keeps the check unambiguous — a merged record can never collide with the
- * frozen marker object.
+ * Type guard for the `STALE_EXECUTION_RESULT` sentinel. Structural rather
+ * than identity comparison: a storage adapter and the evented processor can
+ * resolve separate `@mastra/core` module instances (ESM app + CJS store, or
+ * duplicate installs), in which case the sentinel objects differ even though
+ * the marker is the same.
  */
 export function isStaleExecutionResult(
   result: UpdateWorkflowResultsResult | undefined,
 ): result is typeof STALE_EXECUTION_RESULT {
-  return result === STALE_EXECUTION_RESULT;
+  return (
+    typeof result === 'object' && result !== null && (result as { staleExecution?: unknown }).staleExecution === true
+  );
 }
 
 function unwrapSchema(schema: z.ZodTypeAny): { base: z.ZodTypeAny; nullable: boolean } {
