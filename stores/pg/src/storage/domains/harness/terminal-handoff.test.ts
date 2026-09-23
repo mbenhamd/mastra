@@ -8,6 +8,7 @@ import {
   HarnessTerminalHandoffUnsupportedError,
   HarnessTerminalHandoffValidationError,
   TABLE_HARNESS_SESSION_PROJECTION_FENCES,
+  TABLE_HARNESS_SESSIONS,
   TABLE_HARNESS_SESSION_PROJECTION_INTENTS,
   TABLE_HARNESS_SESSION_PROJECTION_PRESSURE,
   TABLE_HARNESS_TERMINAL_ADMISSIONS,
@@ -805,6 +806,39 @@ describe('HarnessPG native terminal handoff', () => {
       expect(await optionalRowCount(TABLE_HARNESS_SESSION_PROJECTION_INTENTS)).toBe(0);
       expect(await optionalRowCount(TABLE_HARNESS_SESSION_PROJECTION_FENCES)).toBe(0);
       expect(await optionalRowCount(TABLE_HARNESS_SESSION_PROJECTION_PRESSURE)).toBe(0);
+    } finally {
+      await terminalOnly.close();
+    }
+  });
+
+  it('mints an incarnation when an update upgrades a legacy NULL-incarnation row', async () => {
+    const terminalOnly = terminalStore('pg-harness-terminal-legacy-store', schemaName, {}, { enabled: false });
+    await terminalOnly.init();
+    try {
+      const th = terminalOnly.stores.harness!;
+      const session = await createNativeSession(th, 'legacy-upgrade-session');
+      // Simulate a row written before terminal handoff existed.
+      await terminalOnly.db.none(
+        `UPDATE "${schemaName}"."${TABLE_HARNESS_SESSIONS}" SET session_incarnation = NULL WHERE id = $1`,
+        [session.id],
+      );
+      const legacy = await th.loadSession({ harnessName: HARNESS, sessionId: session.id });
+      expect(legacy?.sessionIncarnation).toBeUndefined();
+
+      await th.saveSession(
+        { ...legacy!, sessionIncarnation: undefined },
+        { ownerId: legacy!.ownerId, ifVersion: legacy!.version },
+      );
+      const upgraded = await th.loadSession({ harnessName: HARNESS, sessionId: session.id });
+      expect(upgraded?.sessionIncarnation).toEqual(expect.any(String));
+
+      // A later update that omits the incarnation keeps the minted fence.
+      await th.saveSession(
+        { ...upgraded!, sessionIncarnation: undefined },
+        { ownerId: upgraded!.ownerId, ifVersion: upgraded!.version },
+      );
+      const reloaded = await th.loadSession({ harnessName: HARNESS, sessionId: session.id });
+      expect(reloaded?.sessionIncarnation).toBe(upgraded?.sessionIncarnation);
     } finally {
       await terminalOnly.close();
     }

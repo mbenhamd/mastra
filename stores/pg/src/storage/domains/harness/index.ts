@@ -1392,11 +1392,11 @@ export class HarnessPG extends HarnessStorage {
     }
     const harnessName = this.#resolveHarnessName(opts.harnessName ?? record.harnessName);
     const namespacedRecord: SessionRecord = { ...record, harnessName };
-    if (
-      opts.ifVersion === 0 &&
-      (this.#attachmentByteOwner !== undefined || this.terminalHandoff.enabled) &&
-      namespacedRecord.sessionIncarnation === undefined
-    ) {
+    const mintsIncarnation =
+      opts.ifVersion === 0
+        ? this.#attachmentByteOwner !== undefined || this.terminalHandoff.enabled
+        : this.terminalHandoff.enabled;
+    if (mintsIncarnation && namespacedRecord.sessionIncarnation === undefined) {
       namespacedRecord.sessionIncarnation = randomUUID();
     }
     const nextVersion = opts.ifVersion + 1;
