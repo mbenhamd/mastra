@@ -279,12 +279,22 @@ export async function importExecutionClosure(
           [manifest.sessionIds],
         )
       : [];
-    const storedIncarnation = new Map(
-      existingSessions.map(row => [row.id, row.session_incarnation] as const),
-    );
+    const storedIncarnation = new Map(existingSessions.map(row => [row.id, row.session_incarnation] as const));
     for (const sessionId of manifest.sessionIds) {
       const stored = storedIncarnation.get(sessionId);
-      incarnations[sessionId] = typeof stored === 'string' && stored.length > 0 ? stored : randomUUID();
+      if (typeof stored === 'string' && stored.length > 0) {
+        incarnations[sessionId] = stored;
+        continue;
+      }
+      incarnations[sessionId] = randomUUID();
+      if (storedIncarnation.has(sessionId)) {
+        await t.none(
+          `UPDATE ${tableSql(TABLE_HARNESS_SESSIONS, schemaName)}
+           SET session_incarnation = $1
+           WHERE id = $2 AND (session_incarnation IS NULL OR session_incarnation = '')`,
+          [incarnations[sessionId], sessionId],
+        );
+      }
     }
 
     const inserted: Record<string, number> = {};
@@ -304,7 +314,7 @@ export async function importExecutionClosure(
       for (const row of tableRows) {
         const applied: Record<string, unknown> = { ...row };
         for (const column of spec!.clearOnImport ?? []) {
-          applied[column] = null;
+          applied[column] = column === 'claim_generation' ? 0 : null;
         }
         if (tableName === TABLE_HARNESS_SESSIONS) {
           applied['session_incarnation'] = incarnations[row.id as string] ?? null;

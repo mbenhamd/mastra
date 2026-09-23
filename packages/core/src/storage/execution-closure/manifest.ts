@@ -144,8 +144,9 @@ export function verifyExecutionClosurePayload(
     }
   }
   for (const [table, spec] of Object.entries(EXECUTION_CLOSURE_TABLES)) {
-    if (spec?.role === 'fence' && !listed.has(table as ExecutionClosureTableName)) {
-      mismatches.push(`manifest omits fence table ${table}`);
+    if (listed.has(table as ExecutionClosureTableName)) continue;
+    if (manifest.completeness === 'complete' || spec?.role === 'fence') {
+      mismatches.push(`manifest omits ${spec?.role === 'fence' ? 'fence ' : 'registered '}table ${table}`);
     }
   }
 
