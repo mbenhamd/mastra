@@ -15379,6 +15379,75 @@ probe();
 NODE
 }
 
+# The serverless-redis-http proxy accepts TCP connections before its Redis
+# backend is usable — it only connects when a command arrives. A bare socket
+# probe can therefore report availability for a suite that cannot actually run;
+# require an authenticated PING through the proxy instead.
+require_upstash_service() {
+  local service_name="upstash-serverless-redis-http"
+  local host="$1"
+  local port="$2"
+
+  if [[ -n "${MOCK_SERVICE_LOG:-}" ]]; then
+    printf '%s %s:%s\n' "$service_name" "$host" "$port" >> "$MOCK_SERVICE_LOG"
+    if [[ "${MOCK_UNAVAILABLE_SERVICE:-}" == "$service_name" ]]; then
+      echo "Required ${service_name} test service is unavailable at ${host}:${port}." >&2
+      return 1
+    fi
+    return
+  fi
+
+  node - "$service_name" "$host" "$port" <<'NODE'
+const http = require('node:http');
+
+const [serviceName, host, rawPort] = process.argv.slice(2);
+const port = Number(rawPort);
+const deadline = Date.now() + 20_000;
+
+function probe() {
+  let settled = false;
+  const finish = success => {
+    if (settled) return;
+    settled = true;
+    if (success) process.exit(0);
+    if (Date.now() >= deadline) {
+      console.error(`Required ${serviceName} test service is unavailable at ${host}:${port}.`);
+      process.exit(1);
+    }
+    setTimeout(probe, 500);
+  };
+  const request = http.request(
+    {
+      headers: {
+        Authorization: 'Bearer test_token',
+        'Content-Type': 'application/json',
+      },
+      host,
+      method: 'POST',
+      path: '/',
+      port,
+      timeout: 1_000,
+    },
+    response => {
+      let body = '';
+      response.on('data', chunk => (body += chunk));
+      response.on('end', () =>
+        finish(response.statusCode === 200 && body.includes('PONG')),
+      );
+    },
+  );
+  request.once('timeout', () => {
+    request.destroy();
+    finish(false);
+  });
+  request.once('error', () => finish(false));
+  request.end(JSON.stringify(['ping']));
+}
+
+probe();
+NODE
+}
+
 # A service-backed test is never treated as coverage merely because Vitest can
 # be invoked. Prove the exact disposable endpoint is reachable before running
 # any package command that might retry, skip, or hang when infrastructure is
@@ -15395,7 +15464,7 @@ if grep -Eq '^stores/mongodb/.*\.(test|spec)\.' "$changed_tests"; then
   require_test_service mongodb 127.0.0.1 27017
 fi
 if grep -Eq '^stores/upstash/.*\.(test|spec)\.' "$changed_tests"; then
-  require_test_service upstash-serverless-redis-http 127.0.0.1 8079
+  require_upstash_service 127.0.0.1 8079
 fi
 if grep -Fxq 'pubsub/google-cloud-pubsub/src/group.test.ts' "$changed_tests"; then
   require_test_service google-cloud-pubsub-emulator 127.0.0.1 8085
