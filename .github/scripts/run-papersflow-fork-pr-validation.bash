@@ -15217,7 +15217,8 @@ if (( ${#detected_tests[@]} > 0 )); then
       "$file" != packages/cli/src/services/service.deps.integration.test.ts && \
       "$file" != packages/codemod/src/lib/transform.integration.test.ts && \
       "$file" != packages/deployer/src/deploy/log.integration.test.ts && \
-      "$file" != stores/pg/* && "$file" != stores/redis/* ]]; then
+      "$file" != stores/pg/* && "$file" != stores/redis/* && \
+      "$file" != stores/mongodb/* && "$file" != stores/upstash/* ]]; then
       printf '%s\n' "$file" >> "$unsupported_tests"
     elif [[ "$file" == stores/clickhouse/src/storage/db/index.test.ts || \
       "$file" == stores/cloudflare/src/kv/storage/db/index.test.ts || \
