@@ -69,6 +69,7 @@ import {
   prepareHarnessTerminalAdmission,
   prepareHarnessTerminalProjection,
   terminalClaimId,
+  validateHarnessTerminalExecutionGrant,
   validateHarnessTerminalIdentity,
 } from './terminal-handoff';
 import type {
@@ -239,7 +240,9 @@ export class InMemoryHarness extends HarnessStorage {
     const record = this.db.harnessSessions.get(
       sessionKey(resolveHarnessName(harnessName, this.harnessName), sessionId),
     );
-    return record ? cloneSessionRecord(record) : null;
+    if (!record) return null;
+    this.repairSessionIncarnation(record);
+    return cloneSessionRecord(record);
   }
 
   async loadSessionByThread({
@@ -262,7 +265,22 @@ export class InMemoryHarness extends HarnessStorage {
         candidate = record;
       }
     }
-    return candidate ? cloneSessionRecord(candidate) : null;
+    if (!candidate) return null;
+    this.repairSessionIncarnation(candidate);
+    return cloneSessionRecord(candidate);
+  }
+
+  /**
+   * In-memory equivalent of the PG legacy-row repair: a record stored before
+   * `sessionIncarnation` existed mints one on first load under an
+   * incarnation-scoped feature so terminal fencing can be adopted without
+   * recreating the session. The mint mutates the stored record before the
+   * clone so every later reader sees the same persisted value.
+   */
+  private repairSessionIncarnation(record: SessionRecord): void {
+    if (!this.sessionRecordProjection.enabled && !this.terminalHandoff.enabled) return;
+    if (record.sessionIncarnation !== undefined && record.sessionIncarnation.length > 0) return;
+    record.sessionIncarnation = randomUUID();
   }
 
   async listSessions({
@@ -529,6 +547,10 @@ export class InMemoryHarness extends HarnessStorage {
       // the (harnessName, resourceId, threadId) key. Return it as the current
       // owner so the caller reopens it (closed) or fails new work (closing)
       // rather than creating a second active owner behind it.
+      // Reopening a legacy row goes through the same repair as a load, so the
+      // returned record carries the persisted incarnation the PG adapter
+      // mints inside `loadSessionByThread`.
+      this.repairSessionIncarnation(existing);
       if (this.sessionRecordProjection.enabled) {
         this.assertProjectionIncarnation(existing);
         this.assertProjectionFence(existing, 'active', existing.version);
@@ -904,9 +926,11 @@ export class InMemoryHarness extends HarnessStorage {
     if (!this.sessionRecordProjection.enabled) {
       if (!this.terminalHandoff.enabled) return record.sessionIncarnation;
       // Terminal handoff owns its incarnation fence without requiring the
-      // session-record projection feature: mint on create, preserve on update.
-      if (existing === undefined) return record.sessionIncarnation ?? randomUUID();
-      return existing.sessionIncarnation ?? record.sessionIncarnation;
+      // session-record projection feature: mint on create, preserve on update,
+      // and mint on the first update of a legacy row that predates
+      // incarnations. `||` treats a stored '' the same as a missing value.
+      if (existing === undefined) return record.sessionIncarnation || randomUUID();
+      return existing.sessionIncarnation || record.sessionIncarnation || randomUUID();
     }
     if (existing !== undefined) {
       this.assertProjectionIncarnation(existing);
@@ -1518,6 +1542,19 @@ export class InMemoryHarness extends HarnessStorage {
     if (grantWinner) {
       return { status: 'conflict', admission: cloneHarnessTerminal(grantWinner) };
     }
+    // Recovery resolves a run's admission by (session, incarnation, run) —
+    // admitting a second grant to the same run would make that first-match
+    // probe nondeterministic, so the run binds to at most one admission.
+    const runWinner = [...this.db.harnessTerminalAdmissions.values()].find(
+      candidate =>
+        candidate.harnessName === namespace &&
+        candidate.sessionId === admission.sessionId &&
+        candidate.sessionIncarnation === admission.sessionIncarnation &&
+        candidate.runId === admission.runId,
+    );
+    if (runWinner) {
+      return { status: 'conflict', admission: cloneHarnessTerminal(runWinner) };
+    }
     this.db.harnessTerminalAdmissions.set(admission.id, cloneHarnessTerminal(admission));
     return { status: 'created', admission: cloneHarnessTerminal(admission) };
   }
@@ -1618,6 +1655,34 @@ export class InMemoryHarness extends HarnessStorage {
     }
     const evidenceKey = messageEvidenceKey(namespace, stored.sessionId, stored.signalId);
     const currentEvidence = this.db.harnessMessageResultEvidence.get(evidenceKey);
+    const terminalResult = canonicalHarnessTerminalResult(input.terminalResult);
+    // The intent's top-level runId comes from the admission row — a result
+    // naming a different run would persist two disagreeing run identities and
+    // let delivery or reconciliation attribute the outcome to the wrong run.
+    if (terminalResult.runId !== stored.runId) {
+      throw new HarnessTerminalHandoffValidationError('terminalResult.runId', 'must match the admitted run');
+    }
+    const projection = prepareHarnessTerminalProjection(input.projection, this.terminalHandoff.maxPayloadBytes);
+    const intentId = harnessTerminalIntentId(stored.id);
+    const existingIntent = this.db.harnessTerminalIntents.get(intentId);
+    if (stored.status === 'committed') {
+      // A committed replay must still resolve to `duplicate` after the
+      // message-result evidence row is compacted or deleted — the persisted
+      // intent is itself durable proof of the committed outcome. Every
+      // durable identity field already matched above, so the only remaining
+      // divergence a racing committer can carry is in the finalizer's own
+      // payload bytes (a nondeterministic winner-vs-loser difference, never a
+      // different operation): replay the sealed receipt rather than reporting
+      // an identity conflict. A missing intent is corruption, not a race.
+      if (!existingIntent) {
+        throw new HarnessTerminalHandoffIdentityConflictError(stored.executionGrant.key);
+      }
+      return {
+        status: 'duplicate',
+        admission: cloneHarnessTerminal(stored),
+        intent: cloneHarnessTerminal(existingIntent),
+      };
+    }
     if (!currentEvidence) {
       throw new HarnessTerminalHandoffValidationError(
         'resultEvidence',
@@ -1629,25 +1694,6 @@ export class InMemoryHarness extends HarnessStorage {
     }
     if (currentEvidence.status === 'failed') {
       throw new HarnessTerminalHandoffIdentityConflictError(stored.executionGrant.key);
-    }
-    const terminalResult = canonicalHarnessTerminalResult(input.terminalResult);
-    const projection = prepareHarnessTerminalProjection(input.projection, this.terminalHandoff.maxPayloadBytes);
-    const intentId = harnessTerminalIntentId(stored.id);
-    const existingIntent = this.db.harnessTerminalIntents.get(intentId);
-    if (stored.status === 'committed') {
-      if (
-        !existingIntent ||
-        !sameTerminalIntentValue(existingIntent, terminalResult, projection) ||
-        currentEvidence.status !== 'completed' ||
-        stableJsonString(currentEvidence.result) !== stableJsonString(resultEvidence.result)
-      ) {
-        throw new HarnessTerminalHandoffIdentityConflictError(stored.executionGrant.key);
-      }
-      return {
-        status: 'duplicate',
-        admission: cloneHarnessTerminal(stored),
-        intent: cloneHarnessTerminal(existingIntent),
-      };
     }
     if (existingIntent) {
       if (!sameTerminalIntentValue(existingIntent, terminalResult, projection)) {
@@ -1748,6 +1794,16 @@ export class InMemoryHarness extends HarnessStorage {
   async cancelTerminalHandoff(input: HarnessTerminalCancelInput): Promise<HarnessTerminalCancelReceipt> {
     this.assertTerminalHandoffEnabled();
     const namespace = resolveHarnessName(input.harnessName, this.harnessName);
+    // Same contract as the PG path: the grant and the claimed admission
+    // identity must be structurally valid before a tombstone is recorded —
+    // a malformed cancel must not mint fencing evidence.
+    validateHarnessTerminalExecutionGrant(input.executionGrant);
+    if (!input.sessionId || !input.sessionIncarnation || !input.admissionId || !input.admissionHash) {
+      throw new HarnessTerminalHandoffValidationError(
+        'cancel',
+        'session, incarnation, and admission identity are required',
+      );
+    }
     const now = input.cancelledAt ?? Date.now();
     if (!Number.isSafeInteger(now) || now < 0)
       throw new HarnessTerminalHandoffValidationError('cancelledAt', 'must be a non-negative safe integer');
@@ -1833,9 +1889,14 @@ export class InMemoryHarness extends HarnessStorage {
       throw new HarnessTerminalHandoffValidationError('claim', 'clock and lease must be positive safe integers');
     }
     const claimed: HarnessTerminalIntent[] = [];
+    // Claim order is wall-clock creation first: `revision` is only scoped to
+    // (harness, session, incarnation), so sorting by it globally would let a
+    // new session's revision-1 intent starve an older session's backlog. The
+    // per-session ordering guarantee itself is enforced separately by
+    // `hasEarlierUnsettledTerminalIntent`.
     const candidates = [...this.db.harnessTerminalIntents.values()]
       .filter(intent => intent.harnessName === namespace)
-      .sort((a, b) => a.revision - b.revision || a.id.localeCompare(b.id));
+      .sort((a, b) => a.createdAt - b.createdAt || a.revision - b.revision || a.id.localeCompare(b.id));
     for (const current of candidates) {
       if (claimed.length >= input.limit) break;
       if (current.status === 'claimed' && (current.claimExpiresAt ?? 0) > now) continue;
@@ -1852,12 +1913,18 @@ export class InMemoryHarness extends HarnessStorage {
         this.adjustTerminalPressure(current.harnessName, -1, -current.projection.payloadBytes);
         current.status = 'dead';
         current.deadAt = now;
+        current.consumerId = undefined;
         current.updatedAt = now;
         continue;
       }
       current.status = 'claimed';
       current.claimId = terminalClaimId();
       current.claimExpiresAt = now + leaseMs;
+      current.consumerId = input.consumerId;
+      // Reclaiming a failed intent must drop the stale retry schedule and
+      // error so the new claim starts clean, matching the PG claim UPDATE.
+      current.nextAttemptAt = undefined;
+      current.lastError = undefined;
       current.attempts += 1;
       current.updatedAt = now;
       claimed.push(cloneHarnessTerminal(current));
@@ -1869,9 +1936,15 @@ export class InMemoryHarness extends HarnessStorage {
     input: HarnessTerminalClaimIdentity & { leaseMs?: number },
   ): Promise<HarnessTerminalRenewReceipt> {
     this.assertTerminalHandoffEnabled();
-    const current = this.requireTerminalClaim(input);
     const now = input.now ?? Date.now();
     const leaseMs = input.leaseMs ?? this.terminalHandoff.claimLeaseMs;
+    if (!Number.isSafeInteger(now) || now < 0) {
+      throw new HarnessTerminalHandoffValidationError('now', 'must be a non-negative safe integer');
+    }
+    if (!Number.isSafeInteger(leaseMs) || leaseMs <= 0) {
+      throw new HarnessTerminalHandoffValidationError('leaseMs', 'must be a positive safe integer');
+    }
+    const current = this.requireTerminalClaim(input);
     current.claimExpiresAt = now + leaseMs;
     current.updatedAt = now;
     return { status: 'renewed', intent: cloneHarnessTerminal(current) };
@@ -1879,15 +1952,20 @@ export class InMemoryHarness extends HarnessStorage {
 
   async ackTerminalIntent(input: HarnessTerminalClaimIdentity): Promise<HarnessTerminalAckReceipt> {
     this.assertTerminalHandoffEnabled();
+    const now = input.now ?? Date.now();
+    if (!Number.isSafeInteger(now) || now < 0) {
+      throw new HarnessTerminalHandoffValidationError('now', 'must be a non-negative safe integer');
+    }
     const current = this.requireTerminalIdentity(input);
     if (current.status === 'fenced') return { status: 'fenced', intent: cloneHarnessTerminal(current) };
     if (current.status === 'acked') return { status: 'duplicate', intent: cloneHarnessTerminal(current) };
     this.requireTerminalClaim(input);
     this.adjustTerminalPressure(current.harnessName, -1, -current.projection.payloadBytes);
     current.status = 'acked';
-    current.ackedAt = input.now ?? Date.now();
+    current.ackedAt = now;
     current.claimId = undefined;
     current.claimExpiresAt = undefined;
+    current.consumerId = undefined;
     current.updatedAt = current.ackedAt;
     return { status: 'acked', intent: cloneHarnessTerminal(current) };
   }
@@ -1896,13 +1974,17 @@ export class InMemoryHarness extends HarnessStorage {
     input: HarnessTerminalClaimIdentity & { error: HarnessTerminalError },
   ): Promise<HarnessTerminalFailReceipt> {
     this.assertTerminalHandoffEnabled();
+    const now = input.now ?? Date.now();
+    if (!Number.isSafeInteger(now) || now < 0) {
+      throw new HarnessTerminalHandoffValidationError('now', 'must be a non-negative safe integer');
+    }
     const current = this.requireTerminalIdentity(input);
     if (current.status === 'fenced') return { status: 'fenced', intent: cloneHarnessTerminal(current) };
     this.requireTerminalClaim(input);
-    const now = input.now ?? Date.now();
     current.lastError = cloneHarnessTerminal(input.error);
     current.claimId = undefined;
     current.claimExpiresAt = undefined;
+    current.consumerId = undefined;
     current.updatedAt = now;
     if (current.attempts >= this.terminalHandoff.maxAttempts) {
       this.adjustTerminalPressure(current.harnessName, -1, -current.projection.payloadBytes);
@@ -1984,6 +2066,7 @@ export class InMemoryHarness extends HarnessStorage {
         intent.status = 'fenced';
         intent.claimId = undefined;
         intent.claimExpiresAt = undefined;
+        intent.consumerId = undefined;
         intent.updatedAt = now;
       }
     }
@@ -2074,6 +2157,9 @@ export class InMemoryHarness extends HarnessStorage {
     if (
       current.status !== 'claimed' ||
       current.claimId !== input.claimId ||
+      // The claim is bound to the consumer that minted it — a caller holding
+      // a stale claim id under another consumer must not settle this lease.
+      current.consumerId !== input.consumerId ||
       current.claimExpiresAt === undefined ||
       current.claimExpiresAt <= now
     ) {
@@ -4641,7 +4727,7 @@ function resolveHarnessName(input: string | undefined, fallback: string): string
 // ---------------------------------------------------------------------------
 
 function planTaskKey(harnessName: string, sessionId: string, taskId: string): string {
-  return `${harnessName} ${sessionId} ${taskId}`;
+  return `${harnessName}\u0000${sessionId}\u0000${taskId}`;
 }
 
 function clonePlanTask(task: HarnessPlanTask): HarnessPlanTask {

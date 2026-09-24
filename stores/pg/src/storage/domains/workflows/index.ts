@@ -7,6 +7,7 @@ import {
   TABLE_WORKFLOW_SNAPSHOT_HANDOFF,
   TABLE_SCHEMAS,
   matchesExpectedWorkflowState,
+  STALE_EXECUTION_RESULT,
   WorkflowsStorage,
   applyWorkflowTerminalParentContinuationPatch,
   copyWorkflowTerminalParentContinuationContract,
@@ -66,6 +67,7 @@ import {
   persistWorkflowStepUpdateRecord,
   rollbackWorkflowResumeRecord,
   WorkflowSnapshotHandoffFenceError,
+  WorkflowStaleSnapshotPersistError,
   materializeWorkflowSnapshotHandoffSnapshot,
   pinWorkflowCasGuardValue,
   validateWorkflowSnapshotHandoffFence,
@@ -120,6 +122,7 @@ import type {
   ReleaseWorkflowTerminalizationResult,
   RollbackWorkflowResumeInput,
   RollbackWorkflowResumeResult,
+  UpdateWorkflowResultsResult,
   UpdateWorkflowStateOptions,
   StorageListWorkflowRunsInput,
   WorkflowRun,
@@ -4163,6 +4166,18 @@ export class WorkflowsPG extends WorkflowsStorage {
     return `regexp_replace((${columnReference}::json)::text, '${PG_UNSAFE_JSON_UNICODE_ESCAPE_PATTERN}', E'\\\\1\\\\2', 'g')::jsonb->>'status'`;
   }
 
+  private workflowSnapshotGenerationExpression(snapshotColumnType: string, columnReference: string): string {
+    if (snapshotColumnType === 'jsonb' || snapshotColumnType === 'json') {
+      return `${columnReference}->>'executionGeneration'`;
+    }
+    if (snapshotColumnType === 'text') {
+      return `regexp_replace((${columnReference}::json)::text, '${PG_UNSAFE_JSON_UNICODE_ESCAPE_PATTERN}', E'\\\\1\\\\2', 'g')::jsonb->>'executionGeneration'`;
+    }
+    throw new TypeError(
+      `Workflow snapshot persist does not support snapshot column type ${snapshotColumnType || 'missing'}`,
+    );
+  }
+
   private requireSupportedWorkflowSnapshotColumnType(snapshotColumnType: string | null): WorkflowSnapshotColumnType {
     if (snapshotColumnType === 'jsonb' || snapshotColumnType === 'json' || snapshotColumnType === 'text') {
       return snapshotColumnType;
@@ -5471,7 +5486,7 @@ export class WorkflowsPG extends WorkflowsStorage {
     result: StepResult<any, any, any, any>;
     requestContext: Record<string, any>;
     executionGeneration?: string;
-  }): Promise<Record<string, StepResult<any, any, any, any>>> {
+  }): Promise<UpdateWorkflowResultsResult> {
     try {
       // Use a transaction with row-level locking to ensure atomicity
       return await this.#db.client.tx(async t => {
@@ -5515,16 +5530,19 @@ export class WorkflowsPG extends WorkflowsStorage {
         // Compare-and-set guard before any merge: a delayed result write from
         // a deleted execution lifetime must not merge into the snapshot a
         // reopened lifetime installed under the same runId (PF-4385 tombstone
-        // reopen). A missing row also fails a supplied generation — a writer
-        // that declares a lineage never resurrects a deleted run. Mirrors the
-        // updateWorkflowState guard below.
+        // reopen). An existing row owned by another generation resolves to the
+        // stale sentinel so the caller stops instead of advancing with an
+        // inline result; a missing row keeps the `{}` missing-record fallback —
+        // a lineage-carrying write never resurrects a deleted run, but runs
+        // that opted out of snapshot persistence legitimately write without a
+        // row. Mirrors the updateWorkflowState guard below.
         if (
           !matchesExpectedWorkflowState(snapshot, {
             expectedExecutionGeneration: executionGeneration,
           })
         ) {
           await this.deleteProvisionalWorkflowParentRevision(t, workflowName, runId, revision.created);
-          return {};
+          return existingSnapshotResult ? STALE_EXECUTION_RESULT : {};
         }
 
         // Merge the new step result using element-wise array merging
@@ -5699,6 +5717,7 @@ export class WorkflowsPG extends WorkflowsStorage {
     snapshot,
     createdAt,
     updatedAt,
+    expectedExecutionGeneration,
   }: {
     workflowName: string;
     runId: string;
@@ -5706,6 +5725,7 @@ export class WorkflowsPG extends WorkflowsStorage {
     snapshot: WorkflowRunState;
     createdAt?: Date;
     updatedAt?: Date;
+    expectedExecutionGeneration?: string;
   }): Promise<void> {
     validateWorkflowSnapshotHandoffIdentity(workflowName, runId, resourceId);
     try {
@@ -5717,11 +5737,29 @@ export class WorkflowsPG extends WorkflowsStorage {
       await this.#db.client.tx(async t => {
         const revision = await this.lockWorkflowParentRevisionForSnapshotUpsert(t, workflowName, runId);
         await this.assertWorkflowSnapshotHandoffAvailable(t, workflowName, runId);
-        const existingSnapshot = await t.oneOrNone<{ exists: boolean }>(
-          `SELECT TRUE AS exists FROM ${this.workflowSnapshotTableName()}
+        // `->>` exists only for json/jsonb; legacy text snapshots need the
+        // same sanitized cast the status expressions use, or every persist —
+        // guarded or not — fails on "operator does not exist".
+        const generationExpression = this.workflowSnapshotGenerationExpression(
+          await this.resolveWorkflowSnapshotColumnType(t),
+          'snapshot',
+        );
+        const existingSnapshot = await t.oneOrNone<{ exists: boolean; generation: string | null }>(
+          `SELECT TRUE AS exists, ${generationExpression} AS generation
+           FROM ${this.workflowSnapshotTableName()}
            WHERE workflow_name = $1 AND run_id = $2 FOR UPDATE`,
           [workflowName, runId],
         );
+        // A generation-guarded persist must not resurrect a deleted run or
+        // overwrite the reopened lifetime's row: the FOR UPDATE read makes
+        // this a compare-and-set inside the upsert transaction, so it fails
+        // closed on a missing record as well as on a generation mismatch.
+        if (
+          expectedExecutionGeneration !== undefined &&
+          (existingSnapshot === null || existingSnapshot.generation !== expectedExecutionGeneration)
+        ) {
+          throw new WorkflowStaleSnapshotPersistError({ workflowName, runId });
+        }
         if (revision.created && existingSnapshot) {
           throw new TypeError('Workflow snapshot is missing parent revision evidence');
         }
@@ -5746,6 +5784,7 @@ export class WorkflowsPG extends WorkflowsStorage {
       });
     } catch (error) {
       if (error instanceof WorkflowSnapshotHandoffFenceError) throw error;
+      if (error instanceof WorkflowStaleSnapshotPersistError) throw error;
       throw new MastraError(
         {
           id: createStorageErrorId('PG', 'PERSIST_WORKFLOW_SNAPSHOT', 'FAILED'),

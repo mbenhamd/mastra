@@ -167,6 +167,7 @@ describe('evented loop iterationCount', () => {
     const workflowsStore = {
       updateWorkflowResults,
       updateWorkflowState: vi.fn(),
+      getWorkflowExecutionState: vi.fn(async () => null),
     };
     const mastra = {
       pubsub: {

@@ -207,9 +207,10 @@ describe('PostgresStore Domain Performance Indexes', () => {
         unique: true,
       });
       expect(indexes).toContainEqual({
-        name: 'test_schema_idx_harness_terminal_admissions_session',
+        name: 'test_schema_idx_harness_terminal_admissions_run',
         table: TABLE_HARNESS_TERMINAL_ADMISSIONS,
-        columns: ['harness_name', 'session_id', 'run_id'],
+        columns: ['harness_name', 'session_id', 'session_incarnation', 'run_id'],
+        unique: true,
       });
       expect(indexes).toContainEqual({
         name: 'test_schema_idx_harness_terminal_intents_claim',

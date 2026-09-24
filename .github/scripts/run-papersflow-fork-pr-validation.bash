@@ -4335,6 +4335,8 @@ run_validator_self_tests() {
     "$fixture_repo/stores/libsql/src/storage/domains/harness" \
     "$fixture_repo/stores/libsql/src/storage/domains/workflows" \
     "$fixture_repo/stores/libsql/src/storage" \
+    "$fixture_repo/stores/mongodb/src/storage/domains/workflows" \
+    "$fixture_repo/stores/upstash/src/storage/domains/workflows" \
     "$fixture_repo/stores/pg/src/storage/domains/workflows" \
     "$fixture_repo/stores/pg/src/storage/domains/memory" \
     "$fixture_repo/stores/pg/src/storage/db" \
@@ -4584,6 +4586,21 @@ run_validator_self_tests() {
     printf '%s\n' 'export const convexServerCache = true;' > stores/convex/src/server/cache.ts
     printf '%s\n' "import { it } from 'vitest';" "it('convex server cache', () => {});" \
       > stores/convex/src/server/cache.test.ts
+    printf '%s\n' 'export const convexServerStorage = true;' > stores/convex/src/server/storage.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('convex server storage', () => {});" \
+      > stores/convex/src/server/storage.test.ts
+    printf '%s\n' '{}' > stores/mongodb/package.json
+    printf '%s\n' 'export default {};' > stores/mongodb/vitest.config.ts
+    printf '%s\n' 'export const mongoWorkflows = true;' \
+      > stores/mongodb/src/storage/domains/workflows/index.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('mongodb storage', () => {});" \
+      > stores/mongodb/src/storage/index.test.ts
+    printf '%s\n' '{}' > stores/upstash/package.json
+    printf '%s\n' 'export default {};' > stores/upstash/vitest.config.ts
+    printf '%s\n' 'export const upstashWorkflows = true;' \
+      > stores/upstash/src/storage/domains/workflows/index.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('upstash storage', () => {});" \
+      > stores/upstash/src/storage/index.test.ts
     printf '%s\n' '{}' > stores/_test-utils/package.json
     printf '%s\n' 'export const harnessConformance = true;' \
       > stores/_test-utils/src/domains/harness/index.ts
@@ -9835,6 +9852,96 @@ NODE
     exit 1
   fi
 
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'export const mongoWorkflows = "guarded";' \
+      > stores/mongodb/src/storage/domains/workflows/index.ts
+    git add .
+    git commit -q -m 'mongodb workflow guard source-only change'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  : > "$service_log"
+  output="$test_root/mongodb-owned-source-success.log"
+  if ! run_fixture "$head_sha" "$output"; then
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'Forcing PF-2044 owned suites to run for source-only changes:' "$output"
+  assert_contains 'stores/mongodb/src/storage/index.test.ts' "$output"
+  assert_contains '--filter ./stores/mongodb --fail-if-no-match exec tsc --noEmit' "$command_log"
+  assert_contains '--filter ./stores/mongodb --fail-if-no-match build:lib' "$command_log"
+  assert_contains '--filter ./stores/mongodb --fail-if-no-match lint' "$command_log"
+  assert_contains 'mongodb 127.0.0.1:27017' "$service_log"
+  assert_contains '--dir stores/mongodb exec vitest run' "$command_log"
+  assert_contains 'src/storage/index.test.ts' "$command_log"
+
+  : > "$command_log"
+  : > "$service_log"
+  output="$test_root/mongodb-missing-service-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output" MOCK_UNAVAILABLE_SERVICE=mongodb
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'MongoDB fixture unexpectedly passed without its service.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'Required mongodb test service is unavailable at 127.0.0.1:27017.' "$output"
+  if grep -Fq -- '--dir stores/mongodb exec vitest run' "$command_log"; then
+    echo 'MongoDB fixture ran its suite without the service probe.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'export const upstashWorkflows = "guarded";' \
+      > stores/upstash/src/storage/domains/workflows/index.ts
+    git add .
+    git commit -q -m 'upstash workflow guard source-only change'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  : > "$service_log"
+  output="$test_root/upstash-owned-source-success.log"
+  if ! run_fixture "$head_sha" "$output"; then
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'Forcing PF-2044 owned suites to run for source-only changes:' "$output"
+  assert_contains 'stores/upstash/src/storage/index.test.ts' "$output"
+  assert_contains '--filter ./stores/upstash --fail-if-no-match exec tsc --noEmit' "$command_log"
+  assert_contains '--filter ./stores/upstash --fail-if-no-match build:lib' "$command_log"
+  assert_contains '--filter ./stores/upstash --fail-if-no-match lint' "$command_log"
+  assert_contains 'upstash-serverless-redis-http 127.0.0.1:8079' "$service_log"
+  assert_contains '--dir stores/upstash exec vitest run' "$command_log"
+  assert_contains 'src/storage/index.test.ts' "$command_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'export const convexServerStorage = "guarded";' \
+      > stores/convex/src/server/storage.ts
+    git add .
+    git commit -q -m 'convex server storage source-only change'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  : > "$service_log"
+  output="$test_root/convex-server-storage-success.log"
+  if ! run_fixture "$head_sha" "$output"; then
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'Forcing PF-2044 owned suites to run for source-only changes:' "$output"
+  assert_contains 'stores/convex/src/server/storage.test.ts' "$output"
+  assert_contains '--dir stores/convex exec vitest run' "$command_log"
+  assert_contains 'src/server/storage.test.ts' "$command_log"
+
   echo 'PapersFlow fork validator fixtures passed.'
 }
 
@@ -12644,7 +12751,7 @@ while IFS= read -r workspace; do
     continue
   fi
   case "$workspace" in
-    auth/okta | browser/stagehand | packages/_internal-core | packages/_types-builder | packages/agent-builder | packages/cli | packages/codemod | packages/core | packages/deployer | packages/mcp | packages/memory | packages/server | client-sdks/ai-sdk | client-sdks/client-js | stores/_test-utils | stores/clickhouse | stores/cloudflare | stores/convex | stores/libsql | stores/pg | stores/redis | mastracode | mastracode/sdk | mastracode/tui | pubsub/google-cloud-pubsub | pubsub/redis-streams | workflows/inngest | workflows/temporal | observability/mastra | docs) ;;
+    auth/okta | browser/stagehand | packages/_internal-core | packages/_types-builder | packages/agent-builder | packages/cli | packages/codemod | packages/core | packages/deployer | packages/mcp | packages/memory | packages/server | client-sdks/ai-sdk | client-sdks/client-js | stores/_test-utils | stores/clickhouse | stores/cloudflare | stores/convex | stores/libsql | stores/mongodb | stores/pg | stores/redis | stores/upstash | mastracode | mastracode/sdk | mastracode/tui | pubsub/google-cloud-pubsub | pubsub/redis-streams | workflows/inngest | workflows/temporal | observability/mastra | docs) ;;
     server-adapters/fastify)
       if [[ "$pf3553_selected_route_exports" == false ]]; then
         printf '%s\n' "$workspace" >> "$unsupported_workspaces"
@@ -13257,6 +13364,7 @@ while IFS= read -r file; do
         stores/cloudflare/src/kv/storage/db/index.test.ts | \
         stores/convex/src/cache/index.test.ts | \
         stores/convex/src/server/cache.test.ts | \
+        stores/convex/src/server/storage.test.ts | \
         stores/libsql/src/storage/index.test.ts | \
         stores/libsql/src/storage/domains/harness/index.test.ts | \
         stores/libsql/src/storage/domains/thread-state/index.test.ts | \
@@ -13313,6 +13421,9 @@ while IFS= read -r file; do
       ;;
     stores/convex/src/server/cache.ts)
       queue_owned_workspace_test "$file" stores/convex/src/server/cache.test.ts
+      ;;
+    stores/convex/src/server/storage.ts)
+      queue_owned_workspace_test "$file" stores/convex/src/server/storage.test.ts
       ;;
     stores/libsql/src/storage/domains/thread-state/index.ts)
       queue_owned_workspace_test "$file" stores/libsql/src/storage/domains/thread-state/index.test.ts
@@ -13375,10 +13486,11 @@ while IFS= read -r file; do
   esac
 done < "$changed_files"
 
-# Existing PostgreSQL and Redis validation already owns their service-backed
-# workspaces broadly. These exact PF-2026/PF-2007 production paths additionally
-# force the regressions that prove the newly introduced behavior, so a later
-# source-only conflict resolution cannot silently degrade to compile coverage.
+# Existing PostgreSQL, Redis, MongoDB, and Upstash validation already owns
+# their service-backed workspaces broadly. These exact PF-2026/PF-2007/PF-4395
+# production paths additionally force the regressions that prove the newly
+# introduced behavior, so a later source-only conflict resolution cannot
+# silently degrade to compile coverage.
 while IFS= read -r file; do
   case "$file" in
     stores/pg/src/storage/domains/thread-state/index.ts | stores/pg/src/storage/index.ts)
@@ -13387,6 +13499,12 @@ while IFS= read -r file; do
     stores/redis/src/cache.ts)
       queue_owned_workspace_test "$file" stores/redis/src/index.test.ts
       queue_owned_workspace_test "$file" stores/redis/src/integration.test.ts
+      ;;
+    stores/mongodb/src/storage/domains/workflows/index.ts)
+      queue_owned_workspace_test "$file" stores/mongodb/src/storage/index.test.ts
+      ;;
+    stores/upstash/src/storage/domains/workflows/index.ts)
+      queue_owned_workspace_test "$file" stores/upstash/src/storage/index.test.ts
       ;;
   esac
 done < "$changed_files"
@@ -14127,6 +14245,18 @@ if workspace_changed stores/libsql; then
   run_with_validation_budget 600 pnpm --filter ./stores/libsql --fail-if-no-match exec tsc --noEmit
   run_with_validation_budget 900 pnpm --filter ./stores/libsql --fail-if-no-match build:lib
   run_with_validation_budget 600 pnpm --filter ./stores/libsql --fail-if-no-match lint
+fi
+
+if workspace_changed stores/mongodb; then
+  run_with_validation_budget 600 pnpm --filter ./stores/mongodb --fail-if-no-match exec tsc --noEmit
+  run_with_validation_budget 900 pnpm --filter ./stores/mongodb --fail-if-no-match build:lib
+  run_with_validation_budget 600 pnpm --filter ./stores/mongodb --fail-if-no-match lint
+fi
+
+if workspace_changed stores/upstash; then
+  run_with_validation_budget 600 pnpm --filter ./stores/upstash --fail-if-no-match exec tsc --noEmit
+  run_with_validation_budget 900 pnpm --filter ./stores/upstash --fail-if-no-match build:lib
+  run_with_validation_budget 600 pnpm --filter ./stores/upstash --fail-if-no-match lint
 fi
 
 if workspace_changed pubsub/google-cloud-pubsub; then
@@ -15087,19 +15217,22 @@ if (( ${#detected_tests[@]} > 0 )); then
       "$file" != packages/cli/src/services/service.deps.integration.test.ts && \
       "$file" != packages/codemod/src/lib/transform.integration.test.ts && \
       "$file" != packages/deployer/src/deploy/log.integration.test.ts && \
-      "$file" != stores/pg/* && "$file" != stores/redis/* ]]; then
+      "$file" != stores/pg/* && "$file" != stores/redis/* && \
+      "$file" != stores/mongodb/* && "$file" != stores/upstash/* ]]; then
       printf '%s\n' "$file" >> "$unsupported_tests"
     elif [[ "$file" == stores/clickhouse/src/storage/db/index.test.ts || \
       "$file" == stores/cloudflare/src/kv/storage/db/index.test.ts || \
       "$file" == stores/convex/src/cache/index.test.ts || \
       "$file" == stores/convex/src/server/cache.test.ts || \
+      "$file" == stores/convex/src/server/storage.test.ts || \
       "$file" == stores/libsql/src/storage/index.test.ts || \
       "$file" == stores/libsql/src/storage/domains/harness/index.test.ts || \
       "$file" == stores/libsql/src/storage/domains/thread-state/index.test.ts || \
       "$file" == stores/libsql/src/storage/domains/workflows/atomic-resume.test.ts ]]; then
       printf '%s\n' "$file" >> "$changed_tests"
     elif [[ "$file" == stores/* && "$file" != stores/_test-utils/* && \
-      "$file" != stores/pg/* && "$file" != stores/redis/* ]]; then
+      "$file" != stores/pg/* && "$file" != stores/redis/* && \
+      "$file" != stores/mongodb/* && "$file" != stores/upstash/* ]]; then
       printf '%s\n' "$file" >> "$unsupported_tests"
     elif [[ "$file" == "$PG_PERFORMANCE_INDEX_UNIT_TEST" ]]; then
       printf '%s\n' "$file" >> "$changed_tests"
@@ -15246,6 +15379,85 @@ probe();
 NODE
 }
 
+# The serverless-redis-http proxy accepts TCP connections before its Redis
+# backend is usable — it only connects when a command arrives. A bare socket
+# probe can therefore report availability for a suite that cannot actually run;
+# require an authenticated PING through the proxy instead.
+require_upstash_service() {
+  local service_name="upstash-serverless-redis-http"
+  local host="$1"
+  local port="$2"
+
+  if [[ -n "${MOCK_SERVICE_LOG:-}" ]]; then
+    printf '%s %s:%s\n' "$service_name" "$host" "$port" >> "$MOCK_SERVICE_LOG"
+    if [[ "${MOCK_UNAVAILABLE_SERVICE:-}" == "$service_name" ]]; then
+      echo "Required ${service_name} test service is unavailable at ${host}:${port}." >&2
+      return 1
+    fi
+    return
+  fi
+
+  node - "$service_name" "$host" "$port" <<'NODE'
+const http = require('node:http');
+
+const [serviceName, host, rawPort] = process.argv.slice(2);
+const port = Number(rawPort);
+const deadline = Date.now() + 20_000;
+
+function probe() {
+  let settled = false;
+  let deadlineTimer;
+  const finish = success => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(deadlineTimer);
+    if (success) process.exit(0);
+    if (Date.now() >= deadline) {
+      console.error(`Required ${serviceName} test service is unavailable at ${host}:${port}.`);
+      process.exit(1);
+    }
+    setTimeout(probe, 500);
+  };
+  const request = http.request(
+    {
+      headers: {
+        Authorization: 'Bearer test_token',
+        'Content-Type': 'application/json',
+      },
+      host,
+      method: 'POST',
+      path: '/',
+      port,
+      timeout: 1_000,
+    },
+    response => {
+      let body = '';
+      response.once('error', () => finish(false));
+      response.on('data', chunk => (body += chunk));
+      response.on('end', () =>
+        finish(response.statusCode === 200 && body.includes('PONG')),
+      );
+    },
+  );
+  request.once('timeout', () => {
+    request.destroy();
+    finish(false);
+  });
+  request.once('error', () => finish(false));
+  // The request timeout only fires on socket inactivity; a proxy that trickles
+  // data without ending the response would keep the probe alive past the
+  // retry deadline. Bound each attempt absolutely instead.
+  deadlineTimer = setTimeout(() => {
+    request.destroy();
+    finish(false);
+  }, Math.max(0, deadline - Date.now()));
+  request.end(JSON.stringify(['ping']));
+}
+
+probe();
+NODE
+}
+
 # A service-backed test is never treated as coverage merely because Vitest can
 # be invoked. Prove the exact disposable endpoint is reachable before running
 # any package command that might retry, skip, or hang when infrastructure is
@@ -15257,6 +15469,12 @@ if grep -Eq '^stores/pg/.*\.(test|spec)\.' "$changed_tests"; then
 fi
 if grep -Eq '^stores/redis/.*\.(test|spec)\.' "$changed_tests"; then
   require_test_service redis-store 127.0.0.1 6380
+fi
+if grep -Eq '^stores/mongodb/.*\.(test|spec)\.' "$changed_tests"; then
+  require_test_service mongodb 127.0.0.1 27017
+fi
+if grep -Eq '^stores/upstash/.*\.(test|spec)\.' "$changed_tests"; then
+  require_upstash_service 127.0.0.1 8079
 fi
 if grep -Fxq 'pubsub/google-cloud-pubsub/src/group.test.ts' "$changed_tests"; then
   require_test_service google-cloud-pubsub-emulator 127.0.0.1 8085

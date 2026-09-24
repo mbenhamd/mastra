@@ -35,6 +35,7 @@ function makeHarness() {
       persisted = structuredClone(opts.lifecycleStepStates);
       return undefined;
     },
+    getWorkflowExecutionState: async () => null,
   } as any;
   return {
     published,

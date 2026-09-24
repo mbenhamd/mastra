@@ -550,6 +550,45 @@ describe('native chat terminal handoff', () => {
     });
   });
 
+  it('mints and persists an incarnation when a legacy row is loaded or updated', async () => {
+    const db = new InMemoryDB();
+    // A store written before terminal handoff existed: no incarnation is minted.
+    const legacy = new InMemoryHarness({ db, terminalHandoff: { enabled: false } });
+    await legacy.saveSession(session({ sessionIncarnation: undefined }), { ownerId: 'owner-1', ifVersion: 0 });
+    expect(
+      (await legacy.loadSession({ harnessName: 'default', sessionId: 'session-1' }))?.sessionIncarnation,
+    ).toBeUndefined();
+
+    // Enabling terminal handoff repairs the legacy row on first load; the mint
+    // is persisted so every later reader sees the same winner.
+    const enabled = new InMemoryHarness({ db, terminalHandoff: { enabled: true } });
+    const loaded = await enabled.loadSession({ harnessName: 'default', sessionId: 'session-1' });
+    expect(loaded?.sessionIncarnation).toEqual(expect.any(String));
+    await expect(enabled.loadSession({ harnessName: 'default', sessionId: 'session-1' })).resolves.toMatchObject({
+      sessionIncarnation: loaded!.sessionIncarnation,
+    });
+    await expect(
+      enabled.loadSessionByThread({ harnessName: 'default', threadId: 'thread-1', resourceId: 'resource-1' }),
+    ).resolves.toMatchObject({ sessionIncarnation: loaded!.sessionIncarnation });
+
+    // An update that omits the incarnation keeps the minted fence.
+    await enabled.saveSession(session({ sessionIncarnation: undefined }), { ownerId: 'owner-1', ifVersion: 1 });
+    await expect(enabled.loadSession({ harnessName: 'default', sessionId: 'session-1' })).resolves.toMatchObject({
+      sessionIncarnation: loaded!.sessionIncarnation,
+    });
+  });
+
+  it('mints an incarnation on the first update of a legacy row before any load repairs it', async () => {
+    const db = new InMemoryDB();
+    const legacy = new InMemoryHarness({ db, terminalHandoff: { enabled: false } });
+    await legacy.saveSession(session({ sessionIncarnation: undefined }), { ownerId: 'owner-1', ifVersion: 0 });
+
+    const enabled = new InMemoryHarness({ db, terminalHandoff: { enabled: true } });
+    await enabled.saveSession(session({ sessionIncarnation: undefined }), { ownerId: 'owner-1', ifVersion: 1 });
+    const upgraded = await enabled.loadSession({ harnessName: 'default', sessionId: 'session-1' });
+    expect(upgraded?.sessionIncarnation).toEqual(expect.any(String));
+  });
+
   it('binds a grant generation to one admission across sessions', async () => {
     const storage = new InMemoryHarness({ db: new InMemoryDB(), terminalHandoff: { enabled: true } });
     await storage.saveSession(session(), { ownerId: 'owner-1', ifVersion: 0 });
@@ -666,6 +705,73 @@ describe('native chat terminal handoff', () => {
     await expect(
       storage.loadPendingTerminalAdmission({ ...byRun, sessionIncarnation: 'incarnation-2' }),
     ).resolves.toBeNull();
+  });
+
+  it('conflicts a second grant admitted to the same session run', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB(), terminalHandoff: { enabled: true } });
+    await storage.saveSession(session(), { ownerId: 'owner-1', ifVersion: 0 });
+    const first = admission();
+    await expect(storage.admitTerminalHandoff(first)).resolves.toMatchObject({ status: 'created' });
+
+    // A different grant aiming at the same (session, incarnation, run) —
+    // recovery resolves admissions by that tuple, so a second row would make
+    // the first-match probe nondeterministic.
+    const second = {
+      ...admission(),
+      admissionId: 'admission-2',
+      admissionHash: 'admission-hash-2',
+      signalId: 'signal-2',
+      executionGrant: { key: 'grant-2', generation: 1 },
+    };
+    await expect(storage.admitTerminalHandoff(second)).resolves.toMatchObject({
+      status: 'conflict',
+      admission: expect.objectContaining({ admissionId: first.admissionId, runId: first.runId }),
+    });
+    await expect(
+      storage.loadTerminalAdmissionByRun({
+        harnessName: first.harnessName,
+        sessionId: first.sessionId,
+        runId: first.runId,
+        sessionIncarnation: first.sessionIncarnation,
+      }),
+    ).resolves.toMatchObject({ admissionId: first.admissionId });
+  });
+
+  it('rejects a terminal result bound to a different run before writing any rows', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB(), terminalHandoff: { enabled: true } });
+    await storage.saveSession(session(), { ownerId: 'owner-1', ifVersion: 0 });
+    const input = admission();
+    await storage.writeMessageResultEvidence(pendingEvidence(input));
+    await storage.admitTerminalHandoff(input);
+
+    // The intent's top-level runId comes from the admission; a result naming
+    // another run would persist two disagreeing run identities.
+    await expect(
+      storage.commitTerminalHandoff({
+        admission: input,
+        resultEvidence: { ...pendingEvidence(input), status: 'completed', result: { text: 'done' }, updatedAt: 3_000 },
+        terminalResult: { status: 'completed', runId: 'run-other', completedAt: 3_000 },
+        projection: { projectionKind: 'chat.summary', projectionId: 'summary-1', payload: {} },
+      }),
+    ).rejects.toBeInstanceOf(HarnessTerminalHandoffValidationError);
+
+    // The admission is untouched — a correctly bound retry still commits.
+    await expect(
+      storage.loadPendingTerminalAdmission({
+        harnessName: input.harnessName,
+        sessionId: input.sessionId,
+        runId: input.runId,
+        sessionIncarnation: input.sessionIncarnation,
+      }),
+    ).resolves.toMatchObject({ status: 'pending' });
+    await expect(
+      storage.commitTerminalHandoff({
+        admission: input,
+        resultEvidence: { ...pendingEvidence(input), status: 'completed', result: { text: 'done' }, updatedAt: 3_000 },
+        terminalResult: { status: 'completed', runId: input.runId, completedAt: 3_000 },
+        projection: { projectionKind: 'chat.summary', projectionId: 'summary-1', payload: {} },
+      }),
+    ).resolves.toMatchObject({ status: 'committed' });
   });
 
   it('preserves completed canonical evidence when a retried commit finds no intent row', async () => {
@@ -954,5 +1060,106 @@ describe('native chat terminal handoff', () => {
 
     const enabled = new InMemoryHarness({ db: new InMemoryDB(), terminalHandoff: { enabled: true } });
     expect(enabled.supportsTerminalHandoff).toBe(true);
+  });
+
+  it('binds claim settlement to the claiming consumer', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB(), terminalHandoff: { enabled: true } });
+    await storage.saveSession(session(), { ownerId: 'owner-1', ifVersion: 0 });
+    const input = admission();
+    await storage.writeMessageResultEvidence(pendingEvidence(input));
+    await storage.admitTerminalHandoff(input);
+    await storage.commitTerminalHandoff({
+      admission: input,
+      resultEvidence: { ...pendingEvidence(input), status: 'completed', result: { text: 'done' }, updatedAt: 3_000 },
+      terminalResult: { status: 'completed', runId: input.runId, completedAt: 3_000 },
+      projection: { projectionKind: 'chat.summary', projectionId: 'summary-1', payload: { text: 'done' } },
+    });
+    const claimed = (
+      await storage.claimTerminalIntents({
+        harnessName: input.harnessName,
+        consumerId: 'worker-a',
+        limit: 1,
+        now: 4_000,
+        leaseMs: 10_000,
+      })
+    ).intents[0]!;
+
+    // A caller holding the live claim id under a different consumer must not
+    // settle the lease — the claim is bound to the consumer that minted it.
+    const foreignIdentity = {
+      harnessName: input.harnessName,
+      intentId: claimed.id,
+      sessionId: claimed.sessionId,
+      sessionIncarnation: claimed.sessionIncarnation,
+      revision: claimed.revision,
+      payloadHash: claimed.projection.payloadHash,
+      claimId: claimed.claimId!,
+      consumerId: 'worker-b',
+      now: 4_500,
+    };
+    await expect(storage.ackTerminalIntent(foreignIdentity)).rejects.toBeInstanceOf(
+      HarnessTerminalHandoffClaimConflictError,
+    );
+    await expect(storage.renewTerminalIntent({ ...foreignIdentity, leaseMs: 10_000 })).rejects.toBeInstanceOf(
+      HarnessTerminalHandoffClaimConflictError,
+    );
+    await expect(
+      storage.failTerminalIntent({ ...foreignIdentity, error: { code: 'x', message: 'x' } }),
+    ).rejects.toBeInstanceOf(HarnessTerminalHandoffClaimConflictError);
+
+    // The owning consumer settles normally.
+    await expect(storage.ackTerminalIntent({ ...foreignIdentity, consumerId: 'worker-a' })).resolves.toMatchObject({
+      status: 'acked',
+    });
+  });
+
+  it('rejects a cancel whose admission identity does not match the grant-bound admission', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB(), terminalHandoff: { enabled: true } });
+    await storage.saveSession(session(), { ownerId: 'owner-1', ifVersion: 0 });
+    const input = admission();
+    await storage.writeMessageResultEvidence(pendingEvidence(input));
+    await storage.admitTerminalHandoff(input);
+
+    const cancel = {
+      harnessName: input.harnessName,
+      sessionId: input.sessionId,
+      sessionIncarnation: input.sessionIncarnation,
+      admissionId: input.admissionId,
+      admissionHash: input.admissionHash,
+      executionGrant: input.executionGrant,
+      reason: { code: 'cancelled', message: 'stop' },
+      cancelledAt: 2_100,
+    };
+    // A grant binds exactly one admission — a cancel naming a different
+    // admission/session/incarnation under the same grant is a conflict, not
+    // a fence to mint.
+    await expect(storage.cancelTerminalHandoff({ ...cancel, admissionId: 'admission-foreign' })).rejects.toBeInstanceOf(
+      HarnessTerminalHandoffIdentityConflictError,
+    );
+    await expect(storage.cancelTerminalHandoff({ ...cancel, admissionHash: 'hash-foreign' })).rejects.toBeInstanceOf(
+      HarnessTerminalHandoffIdentityConflictError,
+    );
+    await expect(storage.cancelTerminalHandoff({ ...cancel, sessionId: 'session-foreign' })).rejects.toBeInstanceOf(
+      HarnessTerminalHandoffIdentityConflictError,
+    );
+    await expect(
+      storage.cancelTerminalHandoff({ ...cancel, sessionIncarnation: 'incarnation-foreign' }),
+    ).rejects.toBeInstanceOf(HarnessTerminalHandoffIdentityConflictError);
+
+    // A malformed cancel must not mint fencing evidence either.
+    await expect(storage.cancelTerminalHandoff({ ...cancel, admissionId: '' })).rejects.toBeInstanceOf(
+      HarnessTerminalHandoffValidationError,
+    );
+    await expect(
+      storage.cancelTerminalHandoff({
+        ...cancel,
+        executionGrant: { key: '', generation: 1 },
+      }),
+    ).rejects.toBeInstanceOf(HarnessTerminalHandoffValidationError);
+
+    // No tombstone was written by the rejected cancels — the matching cancel
+    // still creates the fence (not a `duplicate` against phantom evidence).
+    await expect(storage.cancelTerminalHandoff(cancel)).resolves.toMatchObject({ status: 'cancelled' });
+    await expect(storage.cancelTerminalHandoff(cancel)).resolves.toMatchObject({ status: 'duplicate' });
   });
 });

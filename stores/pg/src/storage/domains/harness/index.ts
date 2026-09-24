@@ -689,12 +689,16 @@ function harnessIndexDefs(schemaPrefix: string): CreateIndexOptions[] {
       unique: true,
     },
     {
-      // loadPendingTerminalAdmission probes (session, run) on every suspended
-      // resume; fenceTerminalHandoffsForSession/deleteSessions sweep by the
-      // (harness_name, session_id) prefix.
-      name: harnessIndexName(schemaPrefix, 'idx_harness_terminal_admissions_session'),
+      // loadPendingTerminalAdmission/loadTerminalAdmissionByRun resolve
+      // (session, incarnation, run) on every suspended resume and recovery —
+      // the run identity binds to at most one admission, so the unique index
+      // makes that probe deterministic; fenceTerminalHandoffsForSession and
+      // deleteSessions sweeps still use the (harness_name, session_id)
+      // prefix.
+      name: harnessIndexName(schemaPrefix, 'idx_harness_terminal_admissions_run'),
       table: TABLE_HARNESS_TERMINAL_ADMISSIONS,
-      columns: ['harness_name', 'session_id', 'run_id'],
+      columns: ['harness_name', 'session_id', 'session_incarnation', 'run_id'],
+      unique: true,
     },
     {
       // claimTerminalIntents scans claimable rows by (harness_name, status) and
@@ -898,6 +902,14 @@ export class HarnessPG extends HarnessStorage {
       schema: TABLE_SCHEMAS[TABLE_HARNESS_TERMINAL_INTENTS],
       compositePrimaryKey: TABLE_CONFIGS[TABLE_HARNESS_TERMINAL_INTENTS]?.compositePrimaryKey,
     });
+    // `consumer_id` binds a live claim to its owning consumer; upgrade
+    // pre-existing tables eagerly so closure import and claim settlement can
+    // write it before any terminal operation runs the lazy ensure path.
+    await this.#db.alterTable({
+      tableName: TABLE_HARNESS_TERMINAL_INTENTS,
+      schema: TABLE_SCHEMAS[TABLE_HARNESS_TERMINAL_INTENTS],
+      ifNotExists: ['consumer_id'],
+    });
     await this.#db.createTable({
       tableName: TABLE_HARNESS_TERMINAL_PRESSURE,
       schema: TABLE_SCHEMAS[TABLE_HARNESS_TERMINAL_PRESSURE],
@@ -1092,6 +1104,42 @@ export class HarnessPG extends HarnessStorage {
   // Session records
   // -------------------------------------------------------------------------
 
+  /**
+   * `session_incarnation` scopes terminal fencing, attachment byte ownership,
+   * and the session-record projection, so a row needs one whenever any of
+   * those features is enabled — the same gate the create paths mint under.
+   */
+  #requiresSessionIncarnation(): boolean {
+    return (
+      this.sessionRecordProjection.enabled || this.#attachmentByteOwner !== undefined || this.terminalHandoff.enabled
+    );
+  }
+
+  /**
+   * Repair a legacy row written before `session_incarnation` existed. The
+   * conditional UPDATE installs exactly one winner under concurrency; a loser
+   * re-reads the stored value, so every caller converges on the persisted
+   * incarnation instead of fencing on an unpersisted mint.
+   */
+  async #ensureSessionIncarnation(namespace: string, sessionId: string): Promise<string | undefined> {
+    const minted = randomUUID();
+    const updated = await this.#client.execute({
+      sql: `UPDATE ${TABLE_HARNESS_SESSIONS}
+            SET session_incarnation = ?
+            WHERE harness_name = ? AND id = ?
+              AND (session_incarnation IS NULL OR session_incarnation = '')`,
+      args: [minted, namespace, sessionId],
+    });
+    if (updated.rowsAffected > 0) return minted;
+    const reread = await this.#client.execute({
+      sql: `SELECT session_incarnation FROM ${TABLE_HARNESS_SESSIONS}
+            WHERE harness_name = ? AND id = ?`,
+      args: [namespace, sessionId],
+    });
+    const stored = reread.rows[0]?.session_incarnation;
+    return stored == null || String(stored).length === 0 ? undefined : String(stored);
+  }
+
   async loadSession({
     sessionId,
     harnessName,
@@ -1105,7 +1153,15 @@ export class HarnessPG extends HarnessStorage {
       args: [namespace, sessionId],
     });
     const row = result.rows[0];
-    return row ? rowToSession(row as Record<string, unknown>) : null;
+    if (!row) return null;
+    const record = rowToSession(row as Record<string, unknown>);
+    if (
+      (record.sessionIncarnation === undefined || record.sessionIncarnation.length === 0) &&
+      this.#requiresSessionIncarnation()
+    ) {
+      record.sessionIncarnation = await this.#ensureSessionIncarnation(namespace, sessionId);
+    }
+    return record;
   }
 
   async loadSessionByThread({
@@ -1131,7 +1187,15 @@ export class HarnessPG extends HarnessStorage {
       args: [namespace, threadId, resourceId],
     });
     const row = result.rows[0];
-    return row ? rowToSession(row as Record<string, unknown>) : null;
+    if (!row) return null;
+    const record = rowToSession(row as Record<string, unknown>);
+    if (
+      (record.sessionIncarnation === undefined || record.sessionIncarnation.length === 0) &&
+      this.#requiresSessionIncarnation()
+    ) {
+      record.sessionIncarnation = await this.#ensureSessionIncarnation(namespace, record.id);
+    }
+    return record;
   }
 
   async listSessions({
@@ -1401,11 +1465,11 @@ export class HarnessPG extends HarnessStorage {
     }
     const harnessName = this.#resolveHarnessName(opts.harnessName ?? record.harnessName);
     const namespacedRecord: SessionRecord = { ...record, harnessName };
-    if (
-      opts.ifVersion === 0 &&
-      (this.#attachmentByteOwner !== undefined || this.terminalHandoff.enabled) &&
-      namespacedRecord.sessionIncarnation === undefined
-    ) {
+    const mintsIncarnation =
+      opts.ifVersion === 0
+        ? this.#attachmentByteOwner !== undefined || this.terminalHandoff.enabled
+        : this.terminalHandoff.enabled;
+    if (mintsIncarnation && namespacedRecord.sessionIncarnation === undefined) {
       namespacedRecord.sessionIncarnation = randomUUID();
     }
     const nextVersion = opts.ifVersion + 1;
@@ -1521,6 +1585,11 @@ export class HarnessPG extends HarnessStorage {
 
     const harnessName = this.#resolveHarnessName(opts.harnessName ?? record.harnessName);
     const namespacedRecord: SessionRecord = { ...record, harnessName };
+    if (this.terminalHandoff.enabled && namespacedRecord.sessionIncarnation === undefined) {
+      // Same legacy-row upgrade as `saveSession`: the COALESCE set clause keeps
+      // a stored winner, so a mint here only fills a NULL/'' incarnation.
+      namespacedRecord.sessionIncarnation = randomUUID();
+    }
     const nextVersion = opts.ifVersion + 1;
     const cols = sessionColumnValues(namespacedRecord, nextVersion);
     const updateNames = cols.names.filter(
@@ -2099,6 +2168,17 @@ export class HarnessPG extends HarnessStorage {
         }
         await tx.commit();
         const existing = rowToSession(activeRow as Record<string, unknown>);
+        // The same legacy repair loadSession/loadSessionByThread run: a row
+        // written before `session_incarnation` existed must mint one before
+        // the hydrated record returns, or every terminal message fences in
+        // `_prepareTerminalIdentity`. Runs after commit so the conditional
+        // UPDATE never contends with the FOR UPDATE lock this tx held.
+        if (
+          (existing.sessionIncarnation === undefined || existing.sessionIncarnation.length === 0) &&
+          this.#requiresSessionIncarnation()
+        ) {
+          existing.sessionIncarnation = await this.#ensureSessionIncarnation(harnessName, existing.id);
+        }
         return {
           record: existing,
           created: false,
@@ -4801,6 +4881,25 @@ export class HarnessPG extends HarnessStorage {
         };
       }
 
+      // Recovery resolves a run's admission by (session, incarnation, run) —
+      // a second grant admitted to the same run would make that LIMIT 1 probe
+      // nondeterministic, so the run binds to at most one admission. The
+      // unique index is the enforcement under a race; this probe reports the
+      // winner as a conflict for the common sequential case.
+      const runWinner = await tx.execute({
+        sql: `SELECT * FROM ${TABLE_HARNESS_TERMINAL_ADMISSIONS}
+              WHERE harness_name = ? AND session_id = ? AND session_incarnation = ? AND run_id = ?
+              LIMIT 1 FOR UPDATE`,
+        args: [harnessName, admission.sessionId, admission.sessionIncarnation, admission.runId],
+      });
+      if (runWinner.rows[0]) {
+        await tx.commit();
+        return {
+          status: 'conflict',
+          admission: rowToHarnessTerminalAdmission(runWinner.rows[0] as Record<string, unknown>),
+        };
+      }
+
       await tx.execute({
         sql: `INSERT INTO ${TABLE_HARNESS_TERMINAL_ADMISSIONS}
               (id, harness_name, session_id, resource_id, thread_id, session_incarnation,
@@ -4858,7 +4957,16 @@ export class HarnessPG extends HarnessStorage {
             WHERE id = ? AND harness_name = ? LIMIT 1`,
       args: [id, harnessName],
     });
-    return result.rows[0] ? rowToHarnessTerminalAdmission(result.rows[0] as Record<string, unknown>) : null;
+    const row = result.rows[0];
+    if (!row) return null;
+    const admission = rowToHarnessTerminalAdmission(row as Record<string, unknown>);
+    // The caller-supplied admission id is part of the durable identity: a
+    // row found by grant that carries a different admission id is a
+    // conflicting replay, not a load miss.
+    if (admission.admissionId !== input.admissionId) {
+      throw new HarnessTerminalHandoffIdentityConflictError(input.executionGrant.key);
+    }
+    return admission;
   }
 
   async loadPendingTerminalAdmission(
@@ -4952,18 +5060,37 @@ export class HarnessPG extends HarnessStorage {
         throw new HarnessTerminalHandoffFencedError(admissionInput.sessionId);
       }
 
+      // The intent's top-level runId comes from the admission row — a result
+      // naming a different run would persist two disagreeing run identities
+      // and let delivery or reconciliation attribute the terminal outcome to
+      // the wrong execution.
+      if (terminalResult.runId !== stored.runId) {
+        throw new HarnessTerminalHandoffValidationError('terminalResult.runId', 'must match the admitted run');
+      }
+
+      // The intent is locked before evidence so a committed replay can still
+      // resolve to `duplicate` after the message-result evidence row has been
+      // compacted or deleted — the persisted intent is itself durable proof of
+      // the committed outcome.
+      const intentRow = await tx.execute({
+        sql: `SELECT * FROM ${TABLE_HARNESS_TERMINAL_INTENTS} WHERE id = ? LIMIT 1 FOR UPDATE`,
+        args: [intentId],
+      });
+      const existingIntent = intentRow.rows[0]
+        ? rowToHarnessTerminalIntent(intentRow.rows[0] as Record<string, unknown>)
+        : undefined;
+
       const evidenceRow = await tx.execute({
         sql: `SELECT * FROM ${TABLE_HARNESS_MESSAGE_RESULTS} WHERE id = ? LIMIT 1 FOR UPDATE`,
         args: [evidenceId],
       });
-      if (!evidenceRow.rows[0]) {
-        throw new HarnessTerminalHandoffValidationError(
-          'resultEvidence',
-          'canonical pending message-result evidence is missing',
-        );
-      }
-      const currentEvidence = rowToMessageResultEvidence(evidenceRow.rows[0] as Record<string, unknown>);
+      const currentEvidence = evidenceRow.rows[0]
+        ? rowToMessageResultEvidence(evidenceRow.rows[0] as Record<string, unknown>)
+        : undefined;
       const resultEvidence = { ...input.resultEvidence, harnessName };
+      // The replay must always claim the durable identity the admission
+      // recorded; only the evidence-row comparisons are conditional on the
+      // evidence still existing.
       if (
         resultEvidence.status !== 'completed' ||
         resultEvidence.signalId !== stored.signalId ||
@@ -4972,23 +5099,40 @@ export class HarnessPG extends HarnessStorage {
         resultEvidence.resourceId !== stored.resourceId ||
         resultEvidence.threadId !== stored.threadId ||
         resultEvidence.admissionId !== stored.admissionId ||
-        resultEvidence.admissionHash !== stored.admissionHash ||
-        !sameMessageEvidenceIdentity(currentEvidence, resultEvidence)
+        resultEvidence.admissionHash !== stored.admissionHash
       ) {
+        throw new HarnessTerminalHandoffIdentityConflictError(stored.executionGrant.key);
+      }
+
+      if (stored.status === 'committed') {
+        // A committed outcome is sealed, and every identity field already
+        // matched above — the only remaining divergence a racing committer can
+        // carry is in the finalizer's own payload bytes (a nondeterministic
+        // winner-vs-loser difference, never a different operation). Replay
+        // the durable receipt rather than reporting an identity conflict.
+        // The intent is the durable receipt: a committed admission wrote one
+        // in the same transaction, so its absence is corruption, not a race.
+        if (!existingIntent) {
+          throw new HarnessTerminalHandoffIdentityConflictError(stored.executionGrant.key);
+        }
+        await tx.commit();
+        return { status: 'duplicate', admission: stored, intent: existingIntent };
+      }
+
+      if (!currentEvidence) {
+        throw new HarnessTerminalHandoffValidationError(
+          'resultEvidence',
+          'canonical pending message-result evidence is missing',
+        );
+      }
+      if (!sameMessageEvidenceIdentity(currentEvidence, resultEvidence)) {
         throw new HarnessTerminalHandoffIdentityConflictError(stored.executionGrant.key);
       }
       if (currentEvidence.status === 'failed') {
         throw new HarnessTerminalHandoffIdentityConflictError(stored.executionGrant.key);
       }
 
-      const intentRow = await tx.execute({
-        sql: `SELECT * FROM ${TABLE_HARNESS_TERMINAL_INTENTS} WHERE id = ? LIMIT 1 FOR UPDATE`,
-        args: [intentId],
-      });
-      const existingIntent = intentRow.rows[0]
-        ? rowToHarnessTerminalIntent(intentRow.rows[0] as Record<string, unknown>)
-        : undefined;
-      if (tombstone.rows[0] && stored.status !== 'committed') {
+      if (tombstone.rows[0]) {
         await tx.execute({
           sql: `UPDATE ${TABLE_HARNESS_TERMINAL_ADMISSIONS} SET status = 'cancelled', updated_at = ? WHERE id = ?`,
           args: [Date.now(), admissionId],
@@ -4997,18 +5141,6 @@ export class HarnessPG extends HarnessStorage {
         return { status: 'cancelled', admission: { ...stored, status: 'cancelled' } };
       }
 
-      if (stored.status === 'committed') {
-        if (
-          !existingIntent ||
-          !sameHarnessTerminalIntent(existingIntent, terminalResult, projection) ||
-          currentEvidence.status !== 'completed' ||
-          stableJsonString(currentEvidence.result) !== stableJsonString(persistedJsonValue(resultEvidence.result))
-        ) {
-          throw new HarnessTerminalHandoffIdentityConflictError(stored.executionGrant.key);
-        }
-        await tx.commit();
-        return { status: 'duplicate', admission: stored, intent: existingIntent };
-      }
       if (existingIntent && !sameHarnessTerminalIntent(existingIntent, terminalResult, projection)) {
         throw new HarnessTerminalHandoffIdentityConflictError(stored.executionGrant.key);
       }
@@ -5290,7 +5422,7 @@ export class HarnessPG extends HarnessStorage {
                     AND earlier.revision < candidate.revision
                     AND earlier.status NOT IN ('acked', 'dead', 'fenced')
                 )
-              ORDER BY candidate.revision ASC, candidate.id ASC
+              ORDER BY candidate.created_at ASC, candidate.revision ASC, candidate.id ASC
               LIMIT ? FOR UPDATE SKIP LOCKED`,
         args: [harnessName, now, now, input.limit],
       });
@@ -5300,7 +5432,8 @@ export class HarnessPG extends HarnessStorage {
         if (current.attempts >= this.terminalHandoff.maxAttempts) {
           await tx.execute({
             sql: `UPDATE ${TABLE_HARNESS_TERMINAL_INTENTS}
-                  SET status = 'dead', dead_at = ?, claim_id = NULL, claim_expires_at = NULL, updated_at = ?
+                  SET status = 'dead', dead_at = ?, claim_id = NULL, claim_expires_at = NULL,
+                      consumer_id = NULL, updated_at = ?
                   WHERE id = ?`,
             args: [now, now, current.id],
           });
@@ -5314,15 +5447,16 @@ export class HarnessPG extends HarnessStorage {
           attempts: current.attempts + 1,
           claimId,
           claimExpiresAt: now + leaseMs,
+          consumerId: input.consumerId,
           nextAttemptAt: undefined,
           updatedAt: now,
         };
         await tx.execute({
           sql: `UPDATE ${TABLE_HARNESS_TERMINAL_INTENTS}
                 SET status = 'claimed', attempts = ?, claim_id = ?, claim_expires_at = ?,
-                    next_attempt_at = NULL, last_error_json = NULL, updated_at = ?
+                    consumer_id = ?, next_attempt_at = NULL, last_error_json = NULL, updated_at = ?
                 WHERE id = ? AND status IN ('pending', 'failed', 'claimed')`,
-          args: [updated.attempts, claimId, updated.claimExpiresAt, now, current.id],
+          args: [updated.attempts, claimId, updated.claimExpiresAt, input.consumerId, now, current.id],
         });
         claimed.push(updated);
         if (claimed.length >= input.limit) break;
@@ -5355,6 +5489,7 @@ export class HarnessPG extends HarnessStorage {
       if (
         current.status !== 'claimed' ||
         current.claimId !== input.claimId ||
+        current.consumerId !== input.consumerId ||
         current.claimExpiresAt === undefined ||
         current.claimExpiresAt <= now
       ) {
@@ -5395,6 +5530,7 @@ export class HarnessPG extends HarnessStorage {
       if (
         current.status !== 'claimed' ||
         current.claimId !== input.claimId ||
+        current.consumerId !== input.consumerId ||
         current.claimExpiresAt === undefined ||
         current.claimExpiresAt <= now
       ) {
@@ -5403,7 +5539,7 @@ export class HarnessPG extends HarnessStorage {
       await tx.execute({
         sql: `UPDATE ${
           TABLE_HARNESS_TERMINAL_INTENTS
-        } SET status = 'acked', acked_at = ?, claim_id = NULL, claim_expires_at = NULL, updated_at = ? WHERE id = ?`,
+        } SET status = 'acked', acked_at = ?, claim_id = NULL, claim_expires_at = NULL, consumer_id = NULL, updated_at = ? WHERE id = ?`,
         args: [now, now, input.intentId],
       });
       await this.#adjustTerminalPressure(tx, current.harnessName, -1, -current.projection.payloadBytes, now);
@@ -5416,6 +5552,7 @@ export class HarnessPG extends HarnessStorage {
           ackedAt: now,
           claimId: undefined,
           claimExpiresAt: undefined,
+          consumerId: undefined,
           updatedAt: now,
         },
       };
@@ -5445,6 +5582,7 @@ export class HarnessPG extends HarnessStorage {
       if (
         current.status !== 'claimed' ||
         current.claimId !== input.claimId ||
+        current.consumerId !== input.consumerId ||
         current.claimExpiresAt === undefined ||
         current.claimExpiresAt <= now
       ) {
@@ -5455,7 +5593,7 @@ export class HarnessPG extends HarnessStorage {
       await tx.execute({
         sql: `UPDATE ${TABLE_HARNESS_TERMINAL_INTENTS}
               SET status = ?, dead_at = ?, next_attempt_at = ?, last_error_json = ?,
-                  claim_id = NULL, claim_expires_at = NULL, updated_at = ?
+                  claim_id = NULL, claim_expires_at = NULL, consumer_id = NULL, updated_at = ?
               WHERE id = ?`,
         args: [
           terminal ? 'dead' : 'failed',
@@ -5480,6 +5618,7 @@ export class HarnessPG extends HarnessStorage {
           lastError: input.error,
           claimId: undefined,
           claimExpiresAt: undefined,
+          consumerId: undefined,
           updatedAt: now,
         },
       };
@@ -5570,7 +5709,7 @@ export class HarnessPG extends HarnessStorage {
       });
       const fencedRows = await tx.execute({
         sql: `UPDATE ${TABLE_HARNESS_TERMINAL_INTENTS}
-              SET status = 'fenced', claim_id = NULL, claim_expires_at = NULL, updated_at = ?
+              SET status = 'fenced', claim_id = NULL, claim_expires_at = NULL, consumer_id = NULL, updated_at = ?
               WHERE ${predicates.join(' AND ')}
               RETURNING payload_bytes`,
         args: [now, ...args],
@@ -8895,9 +9034,16 @@ export class HarnessPG extends HarnessStorage {
           compositePrimaryKey: config?.compositePrimaryKey,
         });
       }
+      // `consumer_id` binds a live claim to its owning consumer; older tables
+      // gain it lazily so pre-upgrade rows keep NULL until re-claimed.
+      await this.#db.alterTable({
+        tableName: TABLE_HARNESS_TERMINAL_INTENTS,
+        schema: TABLE_SCHEMAS[TABLE_HARNESS_TERMINAL_INTENTS],
+        ifNotExists: ['consumer_id'],
+      });
       await this.#createDefaultIndexes([
         'idx_harness_terminal_admissions_grant',
-        'idx_harness_terminal_admissions_session',
+        'idx_harness_terminal_admissions_run',
         'idx_harness_terminal_intents_claim',
         'idx_harness_terminal_intents_order',
       ]);
@@ -9575,7 +9721,7 @@ const CHANNEL_BINDING_COLUMN_NAMES = [
 // shared CHANNEL_BINDING_EXTERNAL_ID_SENTINEL (the single source of truth in
 // @mastra/core) and the LibSQL sibling — keep the value in exact sync so the
 // persisted encoding matches the harness channel id-derivation.
-const CHANNEL_BINDING_EXTERNAL_ID_SENTINEL = '__mastra_missing_external_id__';
+const CHANNEL_BINDING_EXTERNAL_ID_SENTINEL = '\x1f__mastra_missing_external_id__';
 
 function normalizeChannelBindingExternalId(value: string | undefined): string {
   return value ?? CHANNEL_BINDING_EXTERNAL_ID_SENTINEL;
@@ -10366,7 +10512,7 @@ function rowToChannelOutboxItem(row: Record<string, unknown>): ChannelOutboxItem
   };
 }
 
-function rowToSession(row: Record<string, unknown>): SessionRecord {
+export function rowToSession(row: Record<string, unknown>): SessionRecord {
   return {
     harnessName: String(row.harness_name ?? 'default'),
     id: String(row.id),
@@ -11283,6 +11429,7 @@ function rowToHarnessTerminalIntent(row: Record<string, unknown>): HarnessTermin
     attempts: Number(row.attempts),
     ...(row.claim_id == null ? {} : { claimId: String(row.claim_id) }),
     ...(row.claim_expires_at == null ? {} : { claimExpiresAt: Number(row.claim_expires_at) }),
+    ...(row.consumer_id == null ? {} : { consumerId: String(row.consumer_id) }),
     ...(row.next_attempt_at == null ? {} : { nextAttemptAt: Number(row.next_attempt_at) }),
     ...(lastError === undefined ? {} : { lastError }),
     createdAt: Number(row.created_at),
