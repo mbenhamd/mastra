@@ -182,6 +182,56 @@ describe('restart lifecycle claim', () => {
     await mastra.shutdown();
   });
 
+  it('stands down when a second claimant supersedes the claim before adoption', async () => {
+    const { mastra, run, workflowsStore, getDownstreamExecutions } = await strandedRun();
+    const original = workflowsStore.updateWorkflowState.bind(workflowsStore);
+    let superseded = false;
+    vi.spyOn(workflowsStore, 'updateWorkflowState').mockImplementation(async args => {
+      const updated = await original(args);
+      // After this run's claim compare-and-set installs its generation, a
+      // second claimant claims the row under its own generation before the
+      // first caller re-reads it for adoption — the pre-adoption ownership
+      // check must reject the superseded lineage rather than execute it.
+      if (
+        !superseded &&
+        updated &&
+        args.opts.status === 'running' &&
+        typeof args.opts.executionGeneration === 'string' &&
+        args.opts.expectedExecutionGeneration !== undefined
+      ) {
+        superseded = true;
+        await original({
+          workflowName: args.workflowName,
+          runId: args.runId,
+          opts: {
+            status: 'running',
+            executionGeneration: 'superseding-generation',
+            expectedStatus: 'running',
+            expectedExecutionGeneration: args.opts.executionGeneration,
+            expectedLifecycleResumeAttempt: args.opts.lifecycleResumeAttempt ?? 0,
+          },
+        });
+      }
+      return updated;
+    });
+
+    const rejected = await run.restart().then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    expect(rejected).toBeInstanceOf(Error);
+    expect((rejected as { id?: string }).id).toBe('WORKFLOW_RESTART_NOT_CLAIMED');
+    expect(getDownstreamExecutions()).toBe(0);
+
+    const stored = await workflowsStore.loadWorkflowSnapshot({
+      workflowName: 'restart-claim-wf',
+      runId: run.runId,
+    });
+    expect(stored?.executionGeneration).toBe('superseding-generation');
+    expect(stored?.status).toBe('running');
+    await mastra.shutdown();
+  });
+
   it('claims unconditionally when the store cannot compare-and-set', async () => {
     const { mastra, run, workflowsStore } = await strandedRun();
     vi.spyOn(workflowsStore, 'supportsConcurrentUpdates').mockReturnValue(false);

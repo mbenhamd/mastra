@@ -190,7 +190,15 @@ export class EventedExecutionEngine extends ExecutionEngine {
 
     // Wrap publishing in try/catch to ensure proper cleanup and rejection on errors.
     try {
-      if (params.resume) {
+      if (params.abortController.signal.aborted) {
+        // A cancellation admitted between the restart/time-travel claim and
+        // the lineage adoption already aborted this controller. The durable
+        // record is canceled, so the processor drops the start event and no
+        // finish event could ever arrive — resolve the canceled outcome
+        // locally instead of waiting on workflows-finish.
+        await pubsub.unsubscribe('workflows-finish', finishCb);
+        resolveResult({ prevResult: { status: 'canceled' }, stepResults: {}, state: {} });
+      } else if (params.resume) {
         const prevStepId = getStepId(this.resolveWorkflow(params.workflowId, params.runId), params.resume.resumePath);
         const prevResult = params.resume.stepResults[prevStepId ?? 'input'];
         // Extract state from stepResults.__state or use initialState
@@ -361,7 +369,10 @@ export class EventedExecutionEngine extends ExecutionEngine {
         steps: cleanStepResults,
         state: finalState,
       };
-    } else if (resultData.prevResult.status === 'paused' || params.perStep) {
+    } else if (
+      resultData.prevResult.status === 'paused' ||
+      (params.perStep && resultData.prevResult.status !== 'canceled')
+    ) {
       callbackArg = {
         status: 'paused',
         steps: cleanStepResults,
@@ -428,7 +439,10 @@ export class EventedExecutionEngine extends ExecutionEngine {
           steps: callbackArg.steps,
         } as TOutput;
       }
-    } else if (resultData.prevResult.status === 'paused' || params.perStep) {
+    } else if (
+      resultData.prevResult.status === 'paused' ||
+      (params.perStep && resultData.prevResult.status !== 'canceled')
+    ) {
       result = {
         status: 'paused',
         steps: callbackArg.steps,

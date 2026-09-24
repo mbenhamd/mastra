@@ -61,7 +61,49 @@ export async function claimWorkflowRestart({
   if (!concurrentCas || claimed) return;
 
   const current = await workflowsStore.loadWorkflowSnapshot({ workflowName: workflowId, runId });
-  throw new MastraError({
+  throw workflowRestartNotClaimedError({
+    workflowId,
+    runId,
+    expected: {
+      status: snapshot.status ?? 'unknown',
+      executionGeneration: snapshot.executionGeneration ?? 'absent',
+      lifecycleResumeAttempt: snapshot.lifecycleResumeAttempt ?? 'unknown',
+    },
+    actual: {
+      status: current?.status ?? 'missing',
+      executionGeneration: current?.executionGeneration ?? 'missing',
+      lifecycleResumeAttempt: current?.lifecycleResumeAttempt ?? 'missing',
+    },
+  });
+}
+
+/**
+ * The claim-loss error shared by the compare-and-set guard and the
+ * pre-adoption re-read. Both detect the durable row moving to another
+ * generation before the caller could adopt its minted lineage: the CAS loses
+ * outright, or a second claimant supersedes the freshly claimed `running`
+ * record while the first is still between claim and adoption.
+ */
+export function workflowRestartNotClaimedError({
+  workflowId,
+  runId,
+  expected,
+  actual,
+}: {
+  workflowId: string;
+  runId: string;
+  expected: {
+    status: string;
+    executionGeneration: string;
+    lifecycleResumeAttempt: number | string;
+  };
+  actual: {
+    status: string;
+    executionGeneration: string;
+    lifecycleResumeAttempt: number | string;
+  };
+}): MastraError {
+  return new MastraError({
     id: 'WORKFLOW_RESTART_NOT_CLAIMED',
     domain: ErrorDomain.MASTRA_WORKFLOW,
     category: ErrorCategory.USER,
@@ -72,12 +114,12 @@ export async function claimWorkflowRestart({
     details: {
       workflowId,
       runId,
-      expectedStatus: snapshot.status ?? 'unknown',
-      actualStatus: current?.status ?? 'missing',
-      expectedExecutionGeneration: snapshot.executionGeneration ?? 'absent',
-      actualExecutionGeneration: current?.executionGeneration ?? 'missing',
-      expectedLifecycleResumeAttempt: snapshot.lifecycleResumeAttempt ?? 'unknown',
-      actualLifecycleResumeAttempt: current?.lifecycleResumeAttempt ?? 'missing',
+      expectedStatus: expected.status,
+      actualStatus: actual.status,
+      expectedExecutionGeneration: expected.executionGeneration,
+      actualExecutionGeneration: actual.executionGeneration,
+      expectedLifecycleResumeAttempt: expected.lifecycleResumeAttempt,
+      actualLifecycleResumeAttempt: actual.lifecycleResumeAttempt,
     },
   });
 }
