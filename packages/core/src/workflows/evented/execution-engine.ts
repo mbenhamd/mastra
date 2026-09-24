@@ -369,7 +369,10 @@ export class EventedExecutionEngine extends ExecutionEngine {
         steps: cleanStepResults,
         state: finalState,
       };
-    } else if (resultData.prevResult.status === 'paused' || params.perStep) {
+    } else if (
+      resultData.prevResult.status === 'paused' ||
+      (params.perStep && resultData.prevResult.status !== 'canceled')
+    ) {
       callbackArg = {
         status: 'paused',
         steps: cleanStepResults,
@@ -436,7 +439,10 @@ export class EventedExecutionEngine extends ExecutionEngine {
           steps: callbackArg.steps,
         } as TOutput;
       }
-    } else if (resultData.prevResult.status === 'paused' || params.perStep) {
+    } else if (
+      resultData.prevResult.status === 'paused' ||
+      (params.perStep && resultData.prevResult.status !== 'canceled')
+    ) {
       result = {
         status: 'paused',
         steps: callbackArg.steps,

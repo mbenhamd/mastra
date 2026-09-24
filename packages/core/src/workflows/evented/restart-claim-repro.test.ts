@@ -125,4 +125,89 @@ describe('evented restart claim cancel repro', () => {
     expect(republished).toBe(true);
     await mastra.shutdown();
   }, 30000);
+
+  it('cancel admitted mid-claim resolves as canceled — not paused — under perStep', async () => {
+    let workExecutions = 0;
+    const workStep = createStep({
+      id: 'work',
+      inputSchema: z.object({ item: z.string() }),
+      outputSchema: z.object({ done: z.boolean() }),
+      suspendSchema: z.object({ reason: z.string() }),
+      execute: async ({ suspend }) => {
+        workExecutions++;
+        if (workExecutions === 1) {
+          await suspend({ reason: 'pause once' });
+          return { done: false };
+        }
+        return { done: true };
+      },
+    });
+    const workflow = createWorkflow({
+      id: 'evented-timetravel-perstep-cancel-wf',
+      inputSchema: z.object({ item: z.string() }),
+      outputSchema: z.object({ done: z.boolean() }),
+      steps: [workStep],
+      options: { validateInputs: false },
+    })
+      .then(workStep)
+      .commit();
+
+    const storage = new MockStore();
+    const pubsub = new EventEmitterPubSub();
+    const mastra = new Mastra({
+      storage,
+      pubsub,
+      workflows: { 'evented-timetravel-perstep-cancel-wf': workflow },
+      logger: false,
+    });
+    await mastra.startWorkers();
+
+    const run = await workflow.createRun();
+    const started = await run.start({ inputData: { item: 'widget' } });
+    expect(started.status).toBe('suspended');
+
+    const workflowsStore = await storage.getStore('workflows');
+
+    // Record a durable cancellation while the timeTravel claim is in flight:
+    // after the claim CAS installs the generation, flip the row to canceled
+    // against that same generation so adoption observes an aborted controller.
+    const originalUpdate = workflowsStore.updateWorkflowState.bind(workflowsStore);
+    let cancelWritten = false;
+    vi.spyOn(workflowsStore, 'updateWorkflowState').mockImplementation(async args => {
+      const updated = await originalUpdate(args);
+      if (
+        !cancelWritten &&
+        updated &&
+        args.opts.status === 'running' &&
+        typeof args.opts.executionGeneration === 'string'
+      ) {
+        cancelWritten = true;
+        await originalUpdate({
+          workflowName: args.workflowName,
+          runId: args.runId,
+          opts: {
+            status: 'canceled',
+            expectedStatus: 'running',
+            expectedExecutionGeneration: args.opts.executionGeneration,
+            expectedLifecycleResumeAttempt: args.opts.lifecycleResumeAttempt ?? 0,
+          },
+        });
+      }
+      return updated;
+    });
+
+    let hangTimeout: ReturnType<typeof setTimeout> | undefined;
+    const result = await Promise.race([
+      run.timeTravel({ step: 'work', perStep: true }),
+      new Promise((_, reject) => {
+        hangTimeout = setTimeout(() => reject(new Error('TIMEOUT: timeTravel hung')), 10000);
+      }),
+    ]);
+    clearTimeout(hangTimeout);
+
+    // perStep must not reclassify the durable canceled outcome as paused:
+    // storage records canceled, so the caller must see canceled.
+    expect((result as { status: string }).status).toBe('canceled');
+    await mastra.shutdown();
+  }, 30000);
 });
