@@ -2885,15 +2885,23 @@ export class WorkflowEventProcessor extends EventProcessor {
             storedResult && typeof storedResult === 'object' && 'status' in storedResult
               ? storedResult
               : snapshot.status === 'success'
-                ? ({ status: 'success', output: snapshot.result, endedAt: snapshot.timestamp } as const)
-                : ({
+                ? {
+                    status: 'success',
+                    output: snapshot.result,
+                    payload: undefined,
+                    startedAt: snapshot.timestamp,
+                    endedAt: snapshot.timestamp,
+                  }
+                : {
                     status: 'failed',
                     error: snapshot.tripwire
                       ? new Error(snapshot.tripwire.reason)
                       : getErrorFromUnknown(snapshot.error, { serializeStack: false }),
+                    payload: undefined,
+                    startedAt: snapshot.timestamp,
                     endedAt: snapshot.timestamp,
                     ...(snapshot.tripwire ? { tripwire: snapshot.tripwire } : {}),
-                  } as const);
+                  };
 
           await this.mastra.pubsub.publish('workflows', {
             type: 'workflow.step.end',
