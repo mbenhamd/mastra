@@ -2950,6 +2950,73 @@ export class WorkflowEventProcessor extends EventProcessor {
             runId: nestedRunId,
           })) ?? ({ context: {} } as WorkflowRunState);
 
+        // A nested branch can be durably terminal while the parent's
+        // activeStepsPath still lists it as active after a crash. Re-dispatching
+        // a restart for that child throws "was not active" and fails the whole
+        // parent restart. Treat the terminal snapshot as authoritative and
+        // synthesize the child's step completion into the parent instead —
+        // mirroring the default engine's terminal-reuse guard (issue #20225).
+        if (snapshot.status === 'success' || snapshot.status === 'failed' || snapshot.status === 'tripwire') {
+          // Evented persistence stores the normalized step-result envelope
+          // ({status, output|error}) as snapshot.result, so it can be replayed
+          // to the parent as-is. Fall back to synthesizing one when the stored
+          // result is missing or not envelope-shaped.
+          const storedResult = snapshot.result as StepResult<any, any, any, any> | undefined;
+          const terminalStepResult: StepResult<any, any, any, any> =
+            storedResult && typeof storedResult === 'object' && 'status' in storedResult
+              ? storedResult
+              : snapshot.status === 'success'
+                ? {
+                    status: 'success',
+                    output: snapshot.result,
+                    payload: undefined,
+                    startedAt: snapshot.timestamp,
+                    endedAt: snapshot.timestamp,
+                  }
+                : {
+                    status: 'failed',
+                    error: snapshot.tripwire
+                      ? new Error(snapshot.tripwire.reason)
+                      : getErrorFromUnknown(snapshot.error, { serializeStack: false }),
+                    payload: undefined,
+                    startedAt: snapshot.timestamp,
+                    endedAt: snapshot.timestamp,
+                    ...(snapshot.tripwire ? { tripwire: snapshot.tripwire } : {}),
+                  };
+
+          await this.mastra.pubsub.publish('workflows', {
+            type: 'workflow.step.end',
+            runId,
+            data: {
+              ...lifecycleExecution,
+              parentWorkflow,
+              workflowId,
+              runId,
+              executionPath,
+              resumeSteps,
+              stepResults,
+              prevResult: terminalStepResult,
+              resumeData,
+              activeStepsPath,
+              requestContext,
+              timeTravel,
+              restart,
+              perStep,
+              // The live child-completion path publishes the nested run's
+              // resolved state (finalState) — processWorkflowStepEnd prefers
+              // the passed state when parentContext is set. Passing the
+              // parent's pre-child currentState here would drop the child's
+              // terminal setState() updates on evented restart.
+              state: snapshot.value ?? currentState,
+              outputOptions,
+              forEachIndex,
+              nestedRunId,
+              parentContext: { workflowId, input: prevResult },
+            },
+          });
+          return;
+        }
+
         const restartParams = createRestartExecutionParams({ snapshot, graph: nestedWorkflow.buildExecutionGraph() });
 
         const nestedPrevStepId = getStepId(nestedWorkflow, snapshot.activePaths);
