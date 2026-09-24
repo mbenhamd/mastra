@@ -1983,6 +1983,18 @@ export class EventedRun<
     this.cancelDispatchPromise = undefined;
     super.adoptLifecycleExecution(lifecycleExecution);
     this.setupAbortHandler();
+    // super.adoptLifecycleExecution() may install a fresh controller and abort
+    // it immediately when a cancellation was admitted between the claim and
+    // this adoption. An already-aborted signal never fires the handler just
+    // installed above, so dispatch the workflow.cancel event explicitly —
+    // otherwise the admitted cancellation is silently lost for this lineage.
+    // The event carries the adopted tuple rather than a durable re-read: if
+    // another claimant supersedes this lineage before the dispatch lands, the
+    // processor's stale-generation check drops the event instead of canceling
+    // the winning generation.
+    if (this.abortController.signal.aborted) {
+      void this.dispatchCancelEvent(lifecycleExecution);
+    }
   }
 
   /**
@@ -2011,17 +2023,22 @@ export class EventedRun<
     this.abortHandlerInstalled = false;
   }
 
-  private dispatchCancelEvent(): Promise<boolean> {
+  private dispatchCancelEvent(lifecycleExecution?: {
+    executionGeneration: WorkflowExecutionGeneration;
+    lifecycleResumeAttempt: number;
+    lifecycleStepStates: WorkflowStepLifecycleStateMap;
+  }): Promise<boolean> {
     if (!this.cancelDispatchPromise) {
-      this.cancelDispatchPromise = this.getLifecycleExecutionTuple()
+      const tuple = lifecycleExecution ? Promise.resolve(lifecycleExecution) : this.getLifecycleExecutionTuple();
+      this.cancelDispatchPromise = tuple
         .then(async identity => {
           if (!this.mastra?.pubsub) return false;
           await this.mastra?.pubsub.publish('workflows', {
             type: 'workflow.cancel',
             runId: this.runId,
             data: {
-              workflowId: identity.workflowId,
-              runId: identity.runId,
+              workflowId: this.workflowId,
+              runId: this.runId,
               executionGeneration: identity.executionGeneration,
               lifecycleResumeAttempt: identity.lifecycleResumeAttempt,
               lifecycleStepStates: identity.lifecycleStepStates,

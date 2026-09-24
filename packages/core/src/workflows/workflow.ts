@@ -88,7 +88,7 @@ import type {
 import { validateTemplate } from './mapping-template';
 import { derivePredicateLabel, evaluatePredicate } from './predicate';
 import type { Predicate } from './predicate';
-import { claimWorkflowRestart } from './restart-claim';
+import { claimWorkflowRestart, workflowRestartNotClaimedError } from './restart-claim';
 import { claimWorkflowResume } from './resume-claim';
 import type {
   ConditionFunction,
@@ -5437,7 +5437,12 @@ export class Run<
         )
         .map(pending => pending.settled),
     );
+    // On fenced stores the pre-adoption re-read doubles as an ownership check,
+    // so a locally admitted cancellation cannot skip it: a second claimant can
+    // still supersede the row after that cancellation landed.
+    const concurrentCas = workflowsStore?.supportsConcurrentUpdates() ?? false;
     if (
+      !concurrentCas &&
       this.#admittedCancellation?.executionGeneration === executionGeneration &&
       this.#admittedCancellation.lifecycleResumeAttempt === lifecycleResumeAttempt
     ) {
@@ -5449,6 +5454,29 @@ export class Run<
     });
     if (claimed?.status === 'canceled' && claimed.executionGeneration === executionGeneration) {
       this.#admittedCancellation = { executionGeneration, lifecycleResumeAttempt };
+      return;
+    }
+    // The claim installed `running` under the candidate generation, so any
+    // re-read that no longer matches means a second claimant compare-and-set
+    // the freshly written record between the claim and this adoption.
+    // Adopting the superseded lineage would run two generations of the same
+    // run at once; stand down as a lost claim instead.
+    if (concurrentCas && (claimed?.status !== 'running' || claimed.executionGeneration !== executionGeneration)) {
+      throw workflowRestartNotClaimedError({
+        workflowId: this.workflowId,
+        runId: this.runId,
+        expected: {
+          status: 'running',
+          executionGeneration,
+          lifecycleResumeAttempt,
+        },
+        actual: {
+          status: claimed?.status ?? 'missing',
+          executionGeneration: claimed?.executionGeneration ?? 'missing',
+          // getWorkflowExecutionState projects only status and generation.
+          lifecycleResumeAttempt: 'unknown',
+        },
+      });
     }
   }
 

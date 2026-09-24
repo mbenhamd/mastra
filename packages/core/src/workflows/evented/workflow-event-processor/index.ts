@@ -1505,6 +1505,33 @@ export class WorkflowEventProcessor extends EventProcessor {
         currentExecutionGeneration: authoritativeState.executionGeneration,
         incomingExecutionGeneration: executionGeneration,
       });
+      // When the durable terminal IS the requested outcome on this same
+      // lineage — e.g. a cancellation admitted mid-claim before the adopting
+      // run's own cancel event arrives — no finish event was ever published
+      // for it (the row was written by a direct state update, not through
+      // here). Awaiting executions subscribe to workflows-finish by
+      // runId/workflowId alone, so republish the same workflow.end payload;
+      // without it restart()/timeTravel() hang on a run that is already
+      // durably terminal. A terminal written through this method always
+      // persists its result, so a matching result means the finish event was
+      // already published — republishing then would duplicate the terminal
+      // sequence for a delayed or duplicated delivery.
+      if (
+        authoritativeState.executionGeneration === executionGeneration &&
+        authoritativeState.status === finalStatus &&
+        (authoritativeState.result as { status?: string } | undefined)?.status !== finalStatus
+      ) {
+        await this.mastra.pubsub.publish('workflows-finish', {
+          type: 'workflow.end',
+          runId,
+          data: {
+            ...args,
+            prevResult: normalizedPrevResult,
+            workflow: undefined,
+            state: resolveCurrentState({ stepResults, state }),
+          },
+        });
+      }
       return;
     }
     const finalState = resolveCurrentState({ stepResults, state });
@@ -4938,10 +4965,19 @@ export class WorkflowEventProcessor extends EventProcessor {
     // Cancellation is monotonic. A delayed or duplicated cancel delivery must
     // never rewrite a success/failure outcome (or emit a contradictory
     // terminal lifecycle event) after the run has already completed.
+    //
+    // An already-canceled row is the exception: the durable cancellation may
+    // have been recorded by a direct state update (another process, or a
+    // cancel that landed mid-claim before this run adopted the lineage), so
+    // no workflow.end was ever published for it. Letting the event through to
+    // endWorkflow republishes the finish event that awaiting executions —
+    // restart()/timeTravel() callers subscribed on workflows-finish — need to
+    // resolve, and endWorkflow suppresses every other combination itself.
     if (
       type === 'workflow.cancel' &&
       currentState &&
-      WorkflowEventProcessor.TERMINAL_CHILD_RUN_STATUSES.has(currentState.status)
+      WorkflowEventProcessor.TERMINAL_CHILD_RUN_STATUSES.has(currentState.status) &&
+      currentState.status !== 'canceled'
     ) {
       return false;
     }
