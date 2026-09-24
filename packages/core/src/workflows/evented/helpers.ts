@@ -13,11 +13,20 @@ import type { ParentWorkflow } from './workflow-event-processor';
  * that makes an `{}` write result survivable. Top-level evented runs always
  * persist their initial record in `EventedRun.start`, so a missing row there
  * means deletion. A nested run's row exists only when the CHILD's own
- * `shouldPersistSnapshot` opted in: `parentWorkflow.shouldPersistSnapshot`
+ * `shouldPersistSnapshot` opted in at admission: `parentWorkflow.shouldPersistSnapshot`
  * describes the parent's snapshot, not this run's, so consulting it would
  * abandon transient children of durable parents (their first completed step
  * would halt without advancing, hanging the parent) and would let deleted
  * durable children of transient parents fall through as if opted out.
+ *
+ * Admission evaluates the predicate at two phases, so the check must mirror
+ * both: the nested dispatcher evaluates it as `pending` to decide the
+ * `initializeSnapshot` flag, and `processWorkflowStart` re-evaluates it as
+ * `running` (`shouldInitializeSnapshot = pred('running') || initializeSnapshot`).
+ * Re-evaluating only `running` misclassifies phase-dependent predicates such
+ * as `({ workflowStatus }) => workflowStatus !== 'running'` — those create a
+ * durable `pending` row at admission yet read as opted-out here, so a
+ * subsequently deleted row would fall through as intentional.
  */
 export function runExpectsPersistedRow(
   workflow: Workflow,
@@ -25,11 +34,11 @@ export function runExpectsPersistedRow(
   stepResults: Record<string, StepResult<any, any, any, any>> | undefined,
 ): boolean {
   if (parentWorkflow === undefined) return true;
+  const shouldPersistSnapshot = workflow.options?.shouldPersistSnapshot;
+  if (!shouldPersistSnapshot) return true;
   return (
-    workflow.options?.shouldPersistSnapshot?.({
-      stepResults: stepResults ?? {},
-      workflowStatus: 'running',
-    }) ?? true
+    shouldPersistSnapshot({ stepResults: {}, workflowStatus: 'pending' }) ||
+    shouldPersistSnapshot({ stepResults: stepResults ?? {}, workflowStatus: 'running' })
   );
 }
 

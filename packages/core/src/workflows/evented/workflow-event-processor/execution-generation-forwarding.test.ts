@@ -1080,4 +1080,108 @@ describe('updateWorkflowResults executionGeneration forwarding', () => {
     expect(handled).toEqual({ ok: true });
     expect(engineEvents).not.toContain('workflow.suspend');
   });
+
+  it('halts for a phase-dependent durable child whose admitted row was deleted', async () => {
+    const storage = new MockStore();
+    const pubsub = new EventEmitterPubSub();
+    const suspendingStep = createStep({
+      id: 'phase-dependent-step',
+      inputSchema: z.object({}),
+      suspendSchema: z.object({ reason: z.string() }),
+      outputSchema: z.object({ value: z.string() }),
+      execute: async () => ({ value: 'done' }),
+    });
+    // Phase-dependent persistence: the nested dispatcher evaluates this as
+    // 'pending' (true -> initializeSnapshot -> a durable 'pending' row is
+    // admitted) while a 'running' re-evaluation alone would read as opted
+    // out. The missing-row decision must mirror the full admission decision,
+    // not just the running-phase predicate.
+    const workflow = createWorkflow({
+      id: `phase-dependent-${Math.random().toString(36).slice(2)}`,
+      inputSchema: z.object({}),
+      outputSchema: z.object({ value: z.string() }),
+      steps: [suspendingStep],
+      options: {
+        shouldPersistSnapshot: ({ workflowStatus }) => workflowStatus !== 'running',
+      },
+    })
+      .then(suspendingStep)
+      .commit();
+    const outerWorkflow = createWorkflow({
+      id: `phase-outer-${Math.random().toString(36).slice(2)}`,
+      inputSchema: z.object({}),
+      outputSchema: z.object({ value: z.string() }),
+      steps: [workflow],
+    })
+      .then(workflow)
+      .commit();
+    const mastra = new Mastra({
+      logger: false,
+      storage,
+      pubsub,
+      workflows: { [workflow.id]: workflow, [outerWorkflow.id]: outerWorkflow },
+    });
+    const workflowsStore = (await storage.getStore('workflows'))!;
+
+    // Admission created the durable 'pending' row (predicate true at
+    // 'pending'); it was deleted before this delayed delivery arrived.
+    const runId = `run-${Math.random().toString(36).slice(2)}`;
+    await workflow.createRun({ runId });
+    await workflowsStore.deleteWorkflowRunById({ workflowName: workflow.id, runId });
+
+    const engineEvents: string[] = [];
+    const publish = pubsub.publish.bind(pubsub);
+    vi.spyOn(pubsub, 'publish').mockImplementation(async (topic, event) => {
+      if (topic === 'workflows') engineEvents.push((event as { type: string }).type);
+      return publish(topic, event);
+    });
+
+    const processor = new WorkflowEventProcessor({ mastra });
+    const handled = await processor.handle({
+      type: 'workflow.step.end',
+      id: 'evt-phase-dependent-suspend',
+      runId,
+      createdAt: new Date(),
+      data: {
+        workflowId: workflow.id,
+        runId,
+        executionGeneration: 'wfeg:phase-dependent',
+        executionPath: [0],
+        prevResult: {
+          status: 'suspended',
+          output: undefined,
+          payload: {},
+          startedAt: 1,
+          suspendPayload: { reason: 'waiting' },
+        },
+        stepResults: {},
+        activeStepsPath: {},
+        resumeSteps: [],
+        requestContext: {},
+        lifecycleStepStates: {},
+        parentWorkflow: {
+          workflowId: outerWorkflow.id,
+          runId: 'outer-run',
+          executionGeneration: 'wfeg:outer',
+          lifecycleResumeAttempt: 0,
+          lifecycleStepStates: {},
+          executionPath: [0],
+          resume: false,
+          stepResults: {},
+          stepId: 'nested-workflow-step',
+          stepGraph: [],
+          activeStepsPath: {},
+          resumeSteps: [],
+          resumeData: undefined,
+          input: {},
+          shouldPersistSnapshot: true,
+        },
+      },
+    });
+
+    // The deleted row was a durable admitted row, not a transient opt-out:
+    // no workflow.suspend may be published or forwarded to the parent.
+    expect(handled).toEqual({ ok: true });
+    expect(engineEvents).not.toContain('workflow.suspend');
+  });
 });
